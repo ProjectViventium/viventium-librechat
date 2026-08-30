@@ -564,9 +564,7 @@ describe('processAgentFileUpload', () => {
         width: 10,
         height: 10,
       });
-      mergeFileConfig.mockReturnValue(
-        makeFileConfig({ ocrSupportedMimeTypes: ['image/jpeg'] }),
-      );
+      mergeFileConfig.mockReturnValue(makeFileConfig({ ocrSupportedMimeTypes: ['image/jpeg'] }));
       getStrategyFunctions.mockReturnValueOnce({ handleFileUpload });
       const req = makeReq({
         mimetype: 'image/jpeg',

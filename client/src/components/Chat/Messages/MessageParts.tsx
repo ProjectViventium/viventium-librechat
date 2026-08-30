@@ -1,6 +1,7 @@
 import React, { useMemo } from 'react';
 import { useAtomValue } from 'jotai';
 import { useRecoilValue } from 'recoil';
+import type { TMessageContentParts } from 'librechat-data-provider';
 import type { TMessageProps, TMessageIcon } from '~/common';
 import { useMessageHelpers, useLocalize, useAttachments, useContentMetadata } from '~/hooks';
 import MessageIcon from '~/components/Chat/Messages/MessageIcon';
@@ -12,6 +13,12 @@ import HoverButtons from './HoverButtons';
 import SubRow from './SubRow';
 import { cn, getMessageAriaLabel } from '~/utils';
 import store from '~/store';
+
+type ViventiumMessage = NonNullable<TMessageProps['message']> & {
+  __viventiumCortexParts?: Array<TMessageContentParts | undefined>;
+  agent_id?: string;
+  agentId?: string;
+};
 
 export default function Message(props: TMessageProps) {
   const localize = useLocalize();
@@ -31,7 +38,7 @@ export default function Message(props: TMessageProps) {
     handleScroll,
     conversation,
     isSubmitting,
-    latestMessage,
+    latestMessageId,
     handleContinue,
     copyToClipboard,
     regenerateMessage,
@@ -44,8 +51,8 @@ export default function Message(props: TMessageProps) {
    * Purpose: Surface background cortex parts attached to messages.
    * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-messageparts-cortex
    */
-  const cortexParts = (message as unknown as { __viventiumCortexParts?: unknown })
-    ?.__viventiumCortexParts;
+  const viventiumMessage = message as ViventiumMessage | undefined;
+  const cortexParts = viventiumMessage?.__viventiumCortexParts;
   /* VIVENTIUM END */
 
   const name = useMemo(() => {
@@ -155,14 +162,11 @@ export default function Message(props: TMessageProps) {
                     isSubmitting={isSubmitting}
                     searchResults={searchResults}
                     messageId={message.messageId}
-                    messageAgentId={
-                      (message as unknown as { agent_id?: string; agentId?: string }).agent_id ||
-                      (message as unknown as { agent_id?: string; agentId?: string }).agentId
-                    }
+                    messageAgentId={viventiumMessage?.agent_id || viventiumMessage?.agentId}
                     setSiblingIdx={setSiblingIdx}
                     isCreatedByUser={message.isCreatedByUser}
                     conversationId={conversation?.conversationId}
-                    isLatestMessage={messageId === latestMessage?.messageId}
+                    isLatestMessage={messageId === latestMessageId}
                     cortexParts={cortexParts}
                     content={message.content}
                     fallbackText={message.text}
@@ -188,7 +192,7 @@ export default function Message(props: TMessageProps) {
                       regenerate={() => regenerateMessage()}
                       copyToClipboard={copyToClipboard}
                       handleContinue={handleContinue}
-                      latestMessage={latestMessage}
+                      latestMessageId={latestMessageId}
                       isLast={isLast}
                     />
                   </SubRow>

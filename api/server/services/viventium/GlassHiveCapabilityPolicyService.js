@@ -218,8 +218,16 @@ function helperToolDefinitions() {
     {
       name: 'capabilities_list',
       description:
-        'List the connected MCP capability servers and currently re-exported tools available to this GlassHive worker run.',
-      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        'Discover connected capabilities without loading every provider schema. Call with no arguments to list servers, then call with one server name to page through compact tool identities. Use capability_describe for one exact schema and capability_invoke to call it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          server: { type: 'string', description: 'Optional exact server name to enumerate.' },
+          cursor: { type: 'string', description: 'Opaque cursor returned by the prior page.' },
+          limit: { type: 'integer', minimum: 1, maximum: 50, default: 50 },
+        },
+        additionalProperties: false,
+      },
       annotations: mcpToolAnnotations({ access: 'read', openWorldDefault: false }),
     },
     {
@@ -239,7 +247,7 @@ function helperToolDefinitions() {
     {
       name: 'capability_invoke',
       description:
-        'Escape hatch for invoking an allowed underlying MCP tool by server/tool name. Prefer native re-exported broker tools when listed.',
+        'Invoke one allowed underlying MCP tool by exact server/tool name after compact discovery. Use capability_describe first when its argument schema is not already known. A successful write is a real external effect: finish discovery first, make the intended effect once, and never create a replacement with a new invocation_id after success; use a provider update capability or report the blocker instead.',
       inputSchema: {
         type: 'object',
         required: ['server', 'tool', 'arguments'],
@@ -261,7 +269,7 @@ function getToolPolicy(policy, toolName, tool = {}) {
   if (explicit) {
     return {
       access: explicit.access || policy?.defaultToolAccess || 'none',
-      confirmation: explicit.confirmation || 'none',
+      confirmation: explicit.confirmation || 'inherit',
       description: explicit.description || '',
     };
   }
@@ -272,7 +280,7 @@ function getToolPolicy(policy, toolName, tool = {}) {
   }
   return {
     access,
-    confirmation: 'none',
+    confirmation: 'inherit',
     description: '',
   };
 }
@@ -302,7 +310,12 @@ function evaluateToolCallPolicy({
   if (toolPolicy.access === 'write' && policy.writePolicy === 'deny') {
     return { allowed: false, reason: 'write_denied', toolPolicy };
   }
-  if (toolPolicy.access === 'write' && policy.writePolicy === 'confirm' && !confirmed) {
+  if (
+    toolPolicy.access === 'write' &&
+    policy.writePolicy === 'confirm' &&
+    toolPolicy.confirmation !== 'none' &&
+    !confirmed
+  ) {
     return { allowed: false, reason: 'write_requires_host_confirmation', toolPolicy };
   }
   return { allowed: true, reason: 'allowed', toolPolicy };

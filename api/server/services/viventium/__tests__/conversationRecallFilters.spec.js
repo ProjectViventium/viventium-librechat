@@ -1,5 +1,6 @@
 const {
   buildRecallDerivedParentIdSet,
+  filterSupersededLogicalTurnRevisions,
   isConversationRecallFileId,
   messageUsesConversationRecallSearch,
   shouldSkipRecallMessage,
@@ -146,5 +147,67 @@ describe('conversationRecallFilters', () => {
         isCreatedByUser: true,
       }),
     ).toBe(true);
+  });
+
+  test('keeps a visible scheduled assistant result recallable but not saved-memory eligible', () => {
+    expect(
+      shouldSkipRecallMessage({
+        message: {
+          messageId: 'scheduled_result',
+          isCreatedByUser: false,
+          metadata: {
+            viventium: {
+              memoryEligible: false,
+              recallEligible: true,
+              interactionContext: { actor_kind: 'system', origin: 'scheduler' },
+            },
+          },
+        },
+        messageText: 'The scheduled review found one actionable issue.',
+        isCreatedByUser: false,
+      }),
+    ).toBe(false);
+  });
+
+  test('keeps the trusted scheduler envelope excluded from recall and saved memory', () => {
+    expect(
+      shouldSkipRecallMessage({
+        message: {
+          messageId: 'scheduled_envelope',
+          isCreatedByUser: true,
+          metadata: {
+            viventium: {
+              visibility: 'internal',
+              memoryEligible: false,
+              recallEligible: false,
+              interactionContext: { actor_kind: 'system', origin: 'scheduler' },
+            },
+          },
+        },
+        messageText: 'Private scheduler execution envelope.',
+        isCreatedByUser: true,
+      }),
+    ).toBe(true);
+  });
+
+  test('keeps only the highest accepted revision of each logical turn', () => {
+    const logical = (id, revision) => ({
+      viventium: { interactionContext: { logical_turn_id: id, revision } },
+    });
+    const messages = [
+      { messageId: 'turn-a-r1-user', metadata: logical('turn-a', 1) },
+      { messageId: 'turn-a-r1-assistant', metadata: logical('turn-a', 1) },
+      { messageId: 'turn-a-r2-user', metadata: logical('turn-a', 2) },
+      { messageId: 'turn-a-r2-assistant', metadata: logical('turn-a', 2) },
+      { messageId: 'ordinary-without-logical-turn' },
+      { messageId: 'turn-b-r1', logical_turn_id: 'turn-b', revision: 1 },
+    ];
+
+    expect(filterSupersededLogicalTurnRevisions(messages).map((item) => item.messageId)).toEqual([
+      'turn-a-r2-user',
+      'turn-a-r2-assistant',
+      'ordinary-without-logical-turn',
+      'turn-b-r1',
+    ]);
   });
 });

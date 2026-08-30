@@ -191,10 +191,24 @@ router.get('/chat/stream/:streamId', async (req, res) => {
  * @returns { activeJobIds: string[] }
  */
 router.get('/chat/active', async (req, res) => {
+  /* === VIVENTIUM START ===
+   * Feature: Exact resumable-stream liveness.
+   * Purpose: Preserve conversation IDs for existing navigation consumers and expose exact stream
+   *          identities for terminal reconciliation when one conversation has overlapping runs.
+   */
+  if (GenerationJobManager.getActiveStreamsForUser) {
+    const activeStreams = await GenerationJobManager.getActiveStreamsForUser(req.user.id);
+    return res.json({
+      activeJobIds: [...new Set(activeStreams.map(({ conversationId }) => conversationId))],
+      activeStreams,
+    });
+  }
+
   const activeJobIds = GenerationJobManager.getActiveConversationIdsForUser
     ? await GenerationJobManager.getActiveConversationIdsForUser(req.user.id)
     : await GenerationJobManager.getActiveJobIdsForUser(req.user.id);
-  res.json({ activeJobIds });
+  return res.json({ activeJobIds });
+  /* === VIVENTIUM END === */
 });
 
 /**

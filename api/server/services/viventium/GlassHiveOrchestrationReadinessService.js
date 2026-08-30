@@ -22,8 +22,7 @@ const { promptLayerIntegritySnapshot } = require('./promptFrameTelemetry');
 
 configureOrchestrationReadiness({
   logger,
-  getSourceOrderCapabilities: (...args) =>
-    GenerationJobManager.getSourceOrderCapabilities(...args),
+  getSourceOrderCapabilities: (...args) => GenerationJobManager.getSourceOrderCapabilities(...args),
   findUser,
   getAgent,
   checkPermission,

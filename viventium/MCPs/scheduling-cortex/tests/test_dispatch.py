@@ -26,11 +26,110 @@ class DispatchWorkbenchTests(unittest.TestCase):
         os.environ['WPR_MODEL_HOST_CODEX_CLI'] = 'gpt-managed-test'
         os.environ['WPR_CODEX_CLI_REASONING_EFFORT'] = 'xhigh'
         os.environ['SCHEDULER_LIBRECHAT_SECRET'] = 'scheduler-secret'
+        os.environ['WPR_MODEL_CLAUDE_CODE'] = 'claude-managed-test'
+        os.environ['WPR_CLAUDE_CODE_EFFORT'] = 'max'
 
     def tearDown(self):
         os.environ.pop('WPR_CODEX_CLI_REASONING_EFFORT', None)
         os.environ.pop('WPR_MODEL_HOST_CODEX_CLI', None)
         os.environ.pop('SCHEDULER_LIBRECHAT_SECRET', None)
+        os.environ.pop('WPR_CLAUDE_CODE_EFFORT', None)
+        os.environ.pop('WPR_MODEL_CLAUDE_CODE', None)
+
+    @staticmethod
+    def worker_response(worker_id, execution_mode, profile='codex-cli', model='gpt-managed-test'):
+        return {
+            'worker_id': worker_id,
+            'execution_mode': execution_mode,
+            'profile': profile,
+            'model': model,
+        }
+
+    def test_nested_fastapi_error_preserves_parallel_isolation_classification(self):
+        payload = {
+            'detail': {
+                'code': 'parallel_execution_isolation_required',
+                'message': 'Host mission roots require isolated execution.',
+                'reason': 'host_mission',
+            }
+        }
+        error = HTTPError(
+            'http://127.0.0.1:8766/v1/projects/project-1/workers/find-or-resume',
+            409,
+            'Conflict',
+            {},
+            BytesIO(json.dumps(payload).encode('utf-8')),
+        )
+
+        parsed = dispatch._format_http_error('POST', error.url, error)
+
+        self.assertEqual(parsed.failure_class, 'parallel_execution_isolation_required')
+        self.assertEqual(parsed.detail, 'Host mission roots require isolated execution.')
+        self.assertEqual(parsed.reason, 'host_mission')
+        self.assertIn('parallel_execution_isolation_required', str(parsed))
+
+    def test_parallel_isolation_conflict_recovers_even_with_a_host_workspace_root(self):
+        error = dispatch.HttpJsonError(
+            'isolated execution required',
+            status=409,
+            method='POST',
+            path='/v1/projects/project-1/workers/find-or-resume',
+            failure_class='parallel_execution_isolation_required',
+        )
+
+        self.assertTrue(
+            dispatch._can_recover_workbench_host_dependency_to_docker(
+                error,
+                execution_mode='host',
+                workspace_root='/private/host/workspace',
+                artifact_contract={
+                    'kind': 'periphery_pair',
+                    'module_id': 'health_context',
+                },
+            )
+        )
+
+    def test_parallel_isolation_conflict_does_not_recover_an_unregistered_contract(self):
+        error = dispatch.HttpJsonError(
+            'isolated execution required',
+            status=409,
+            method='POST',
+            path='/v1/projects/project-1/workers/find-or-resume',
+            failure_class='parallel_execution_isolation_required',
+        )
+
+        self.assertFalse(
+            dispatch._can_recover_workbench_host_dependency_to_docker(
+                error,
+                execution_mode='host',
+                workspace_root='/private/host/workspace',
+                artifact_contract=None,
+            )
+        )
+        self.assertFalse(
+            dispatch._can_recover_workbench_host_dependency_to_docker(
+                error,
+                execution_mode='host',
+                workspace_root='/private/host/workspace',
+                artifact_contract={'kind': 'periphery_pair'},
+                memory_write_mode='propose',
+            )
+        )
+
+    def test_glasshive_execution_mode_fails_closed_on_unknown_value(self):
+        with self.assertRaisesRegex(RuntimeError, 'Unsupported GlassHive execution mode'):
+            dispatch._glasshive_execution_mode({'execution_mode': 'workstation-ish'})
+
+    def test_isolated_workbench_text_rebases_only_the_declared_private_folder(self):
+        rendered = (
+            '<local.viventium.my_folder>\n/private/user/my_folder\n'
+            '</local.viventium.my_folder>\nWrite under /private/user/my_folder/periphery.'
+        )
+
+        rebased = dispatch._isolated_workbench_text(rendered, '/private/user/my_folder')
+
+        self.assertNotIn('/private/user/my_folder', rebased)
+        self.assertIn('artifacts/periphery', rebased)
 
     def test_glasshive_bootstrap_normalizes_legacy_max_codex_effort(self):
         bundle = dispatch._glasshive_bootstrap_bundle(
@@ -81,6 +180,49 @@ class DispatchWorkbenchTests(unittest.TestCase):
         self.assertEqual(bundle['env']['WPR_CODEX_CLI_REASONING_EFFORT'], 'xhigh')
         self.assertEqual(bundle['env']['WPR_CODEX_CLI_IGNORE_USER_CONFIG'], 'true')
 
+    def test_glasshive_docker_bootstrap_requests_exact_server_authority(self):
+        bundle = dispatch._glasshive_bootstrap_bundle(
+            {'id': 'task-1', 'user_id': 'user-1', 'prompt': 'Synthetic prompt'},
+            {
+                'execution_profile': 'codex-cli',
+                'execution_model': 'gpt-managed-test',
+                'reasoning_effort': 'xhigh',
+                'fallback_worker_profile': 'claude-code',
+                'fallback_worker_model': 'claude-managed-test',
+                'fallback_reasoning_effort': 'max',
+            },
+            'run-1',
+            execution_mode='docker',
+        )
+
+        self.assertEqual(
+            bundle['viventium_execution_authority_request'],
+            {
+                'version': 1,
+                'kind': 'prompt_workbench_scheduled',
+                'execution_mode': 'docker',
+                'primary': {
+                    'worker_profile': 'codex-cli',
+                    'model': 'gpt-managed-test',
+                    'reasoning_effort': 'xhigh',
+                },
+                'fallback': {
+                    'worker_profile': 'claude-code',
+                    'model': 'claude-managed-test',
+                    'reasoning_effort': 'max',
+                },
+            },
+        )
+        self.assertEqual(
+            bundle['env'],
+            {
+                'WPR_CODEX_CLI_REASONING_EFFORT': 'xhigh',
+                'WPR_CLAUDE_CODE_EFFORT': 'max',
+            },
+        )
+        self.assertNotIn('execution_policy', bundle)
+        self.assertNotIn('viventium_launch_authority', bundle)
+
     def test_glasshive_bootstrap_uses_persisted_tuple_when_compiled_policy_is_absent(self):
         os.environ.pop('WPR_MODEL_HOST_CODEX_CLI', None)
         os.environ.pop('WPR_MODEL_CODEX_CLI', None)
@@ -114,6 +256,10 @@ class DispatchWorkbenchTests(unittest.TestCase):
             'user_id': 'user-1',
             'prompt': 'Template {{memory.current}}',
             'next_run_at': dispatched_at,
+            '_scheduled_prompt_run_id': 'preclaimed-run',
+            '_scheduled_prompt_occurrence_key': 'schedule:occurrence-1',
+            '_scheduled_prompt_trigger_kind': 'scheduled',
+            '_scheduled_prompt_trigger_source': 'scheduler_loop',
             'metadata': {},
         }
         wb = {'definition_id': 'definition-1'}
@@ -121,14 +267,23 @@ class DispatchWorkbenchTests(unittest.TestCase):
             'id': 'definition-1',
             'user_id': 'user-1',
             'prompt_text': 'Template {{memory.current}}',
-            'metadata': {},
+            'metadata': {
+                'execution': {
+                    'fallback_worker_profile': 'claude-code',
+                    'fallback_worker_model': 'claude-managed-test',
+                    'fallback_reasoning_effort': 'max',
+                }
+            },
         }
         storage = MagicMock()
         storage.get_scheduled_prompt_definition.return_value = definition
         storage.latest_scheduled_prompt_version.return_value = None
         storage.update_task.return_value = {
-            **task,
+            'id': task['id'],
+            'user_id': task['user_id'],
+            'prompt': task['prompt'],
             'next_run_at': persisted_next_run,
+            'metadata': task['metadata'],
         }
         renderer = MagicMock()
         renderer.render_variables.return_value = {
@@ -143,6 +298,217 @@ class DispatchWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(refreshed_task['next_run_at'], dispatched_at)
         self.assertEqual(refreshed_task['prompt'], 'Template rendered now')
+        self.assertEqual(refreshed_task['_scheduled_prompt_run_id'], 'preclaimed-run')
+        self.assertEqual(
+            refreshed_task['_scheduled_prompt_occurrence_key'],
+            'schedule:occurrence-1',
+        )
+        self.assertEqual(refreshed_task['_scheduled_prompt_trigger_kind'], 'scheduled')
+        self.assertEqual(refreshed_task['_scheduled_prompt_trigger_source'], 'scheduler_loop')
+        self.assertEqual(
+            refreshed_task['metadata']['workbench_scheduled_prompt'][
+                'fallback_worker_profile'
+            ],
+            'claude-code',
+        )
+        self.assertEqual(
+            refreshed_task['metadata']['workbench_scheduled_prompt'][
+                'fallback_worker_model'
+            ],
+            'claude-managed-test',
+        )
+        self.assertEqual(
+            refreshed_task['metadata']['workbench_scheduled_prompt'][
+                'fallback_reasoning_effort'
+            ],
+            'max',
+        )
+
+    def test_glasshive_scheduled_dispatch_fails_closed_if_refresh_drops_preclaim(self):
+        task = {
+            'id': 'task-1',
+            'user_id': 'user-1',
+            'prompt': 'Template {{memory.current}}',
+            'next_run_at': '2026-08-11T07:00:00Z',
+            '_scheduled_prompt_run_id': 'preclaimed-run',
+            '_scheduled_prompt_occurrence_key': 'schedule:occurrence-1',
+            '_scheduled_prompt_trigger_kind': 'scheduled',
+            '_scheduled_prompt_trigger_source': 'scheduler_loop',
+            'metadata': {'workbench_scheduled_prompt': {'definition_id': 'definition-1'}},
+        }
+        refreshed_task = {
+            key: value for key, value in task.items() if not key.startswith('_scheduled_prompt_')
+        }
+        wb = task['metadata']['workbench_scheduled_prompt']
+        storage = MagicMock()
+
+        with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_refresh_workbench_rendered_prompt', return_value=(refreshed_task, wb)
+        ), patch.object(dispatch, '_glasshive_callback_secret', return_value='secret'), patch.object(
+            dispatch, '_write_private_run_detail', return_value='private://detail'
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'scheduled preclaim'):
+                dispatch._dispatch_glasshive_task(task)
+
+        storage.create_scheduled_prompt_run.assert_not_called()
+        storage.update_scheduled_prompt_run.assert_not_called()
+
+    def test_templated_glasshive_dispatch_reuses_preclaim_after_persisted_refresh(self):
+        task = {
+            'id': 'task-1',
+            'user_id': 'user-1',
+            'prompt': 'Template {{memory.current}}',
+            'next_run_at': '2026-08-11T07:00:00Z',
+            '_scheduled_prompt_run_id': 'preclaimed-run',
+            '_scheduled_prompt_occurrence_key': 'schedule:occurrence-1',
+            '_scheduled_prompt_trigger_kind': 'scheduled',
+            '_scheduled_prompt_trigger_source': 'scheduler_loop',
+            'metadata': {'workbench_scheduled_prompt': {'definition_id': 'definition-1'}},
+        }
+        definition = {
+            'id': 'definition-1',
+            'user_id': 'user-1',
+            'prompt_text': 'Template {{memory.current}}',
+            'metadata': {},
+        }
+        storage = MagicMock()
+        storage.get_scheduled_prompt_definition.return_value = definition
+        storage.latest_scheduled_prompt_version.return_value = None
+        storage.update_task.return_value = {
+            'id': task['id'],
+            'user_id': task['user_id'],
+            'prompt': task['prompt'],
+            'next_run_at': '2026-08-12T07:00:00Z',
+            'metadata': task['metadata'],
+        }
+        renderer = MagicMock()
+        renderer.render_variables.return_value = {
+            'rendered': 'Template rendered now',
+            'renderedHash': 'rendered-hash',
+            'variableSnapshotJson': '{}',
+            'variableSnapshotHash': 'snapshot-hash',
+        }
+
+        with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_import_workbench_scheduled_prompts', return_value=renderer
+        ), patch.object(dispatch, '_glasshive_callback_secret', return_value='secret'), patch.object(
+            dispatch, '_write_private_run_detail', return_value='private://detail'
+        ), patch.dict(os.environ, {'SCHEDULER_GLASSHIVE_DISABLE_DISPATCH': '1'}, clear=False):
+            result = dispatch._dispatch_glasshive_task(task)
+
+        self.assertEqual(result['scheduled_prompt_run_id'], 'preclaimed-run')
+        storage.create_scheduled_prompt_run.assert_not_called()
+        dispatching = next(
+            call.args[1]
+            for call in storage.update_scheduled_prompt_run.call_args_list
+            if call.args[1].get('status') == 'dispatching'
+        )
+        self.assertEqual(
+            dispatching['execution_snapshot']['dispatch_idempotency_key'],
+            'schedule:occurrence-1',
+        )
+        self.assertEqual(dispatching['trigger_kind'], 'scheduled')
+        self.assertEqual(dispatching['trigger_source'], 'scheduler_loop')
+
+    def test_glasshive_dispatch_updates_preclaimed_run_instead_of_creating_a_second_row(self):
+        task = {
+            'id': 'task-1',
+            'user_id': 'user-1',
+            'prompt': 'Synthetic prompt',
+            'next_run_at': '2026-08-10T12:00:00Z',
+            '_scheduled_prompt_run_id': 'preclaimed-run',
+            'metadata': {'workbench_scheduled_prompt': {'definition_id': 'definition-1'}},
+        }
+        wb = task['metadata']['workbench_scheduled_prompt']
+        storage = MagicMock()
+
+        with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_refresh_workbench_rendered_prompt', return_value=(task, wb)
+        ), patch.object(dispatch, '_glasshive_callback_secret', return_value='secret'), patch.object(
+            dispatch, '_write_private_run_detail', return_value='private://detail'
+        ), patch.dict(os.environ, {'SCHEDULER_GLASSHIVE_DISABLE_DISPATCH': '1'}, clear=False):
+            result = dispatch._dispatch_glasshive_task(task)
+
+        storage.create_scheduled_prompt_run.assert_not_called()
+        self.assertTrue(
+            any(
+                call.args[0] == 'preclaimed-run' and call.args[1].get('status') == 'dispatching'
+                for call in storage.update_scheduled_prompt_run.call_args_list
+            )
+        )
+        self.assertEqual(result['scheduled_prompt_run_id'], 'preclaimed-run')
+        dispatching = next(
+            call.args[1]
+            for call in storage.update_scheduled_prompt_run.call_args_list
+            if call.args[1].get('status') == 'dispatching'
+        )
+        self.assertEqual(dispatching['execution_snapshot']['executor'], 'glasshive_host')
+        self.assertEqual(dispatching['execution_snapshot']['reasoning_effort'], 'xhigh')
+        self.assertEqual(result['execution']['executor'], 'glasshive_host')
+
+    def test_glasshive_execution_audits_declared_registered_source_prompt_id(self):
+        task = {
+            'id': 'task-1',
+            'user_id': 'user-1',
+            'prompt': 'Synthetic prompt',
+            'next_run_at': '2026-08-10T12:00:00Z',
+            '_scheduled_prompt_run_id': 'preclaimed-run',
+            'metadata': {
+                'workbench_scheduled_prompt': {
+                    'definition_id': 'definition-1',
+                    'source_prompt_id': 'scheduler.consciousness_continuity_opportunity',
+                },
+            },
+        }
+        wb = task['metadata']['workbench_scheduled_prompt']
+        storage = MagicMock()
+
+        with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_refresh_workbench_rendered_prompt', return_value=(task, wb)
+        ), patch.object(dispatch, '_glasshive_callback_secret', return_value='secret'), patch.object(
+            dispatch, '_write_private_run_detail', return_value='private://detail'
+        ), patch.dict(os.environ, {'SCHEDULER_GLASSHIVE_DISABLE_DISPATCH': '1'}, clear=False):
+            result = dispatch._dispatch_glasshive_task(task)
+
+        self.assertEqual(
+            result['execution']['source_prompt_id'],
+            'scheduler.consciousness_continuity_opportunity',
+        )
+
+    def test_glasshive_assign_lost_response_reconciles_without_second_assignment(self):
+        task = {
+            'id': 'task-1',
+            'user_id': 'user-1',
+            'prompt': 'Synthetic prompt',
+            'next_run_at': '2026-08-10T12:00:00Z',
+            '_scheduled_prompt_run_id': 'preclaimed-run',
+            '_scheduled_prompt_occurrence_key': 'occurrence-key-1',
+            'metadata': {'workbench_scheduled_prompt': {'definition_id': 'definition-1'}},
+        }
+        wb = task['metadata']['workbench_scheduled_prompt']
+        storage = MagicMock()
+
+        def post(url, _payload, _headers, _timeout):
+            if url.endswith('/find-or-resume'):
+                return self.worker_response('worker-1', 'host')
+            if url.endswith('/assign'):
+                raise URLError('response lost after accept')
+            raise AssertionError(url)
+
+        with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_refresh_workbench_rendered_prompt', return_value=(task, wb)
+        ), patch.object(dispatch, '_glasshive_callback_secret', return_value='secret'), patch.object(
+            dispatch, '_write_private_run_detail', return_value='private://detail'
+        ), patch.object(dispatch, '_ensure_glasshive_project', return_value='project-1'), patch.object(
+            dispatch, '_post_json', side_effect=post
+        ) as post_json, patch.object(
+            dispatch, '_get_json', return_value={'run_id': 'glasshive-run-1'}
+        ) as reconcile:
+            result = dispatch._dispatch_glasshive_task(task)
+
+        self.assertEqual(result['glasshive_run_id'], 'glasshive-run-1')
+        self.assertEqual(sum(call.args[0].endswith('/assign') for call in post_json.call_args_list), 1)
+        self.assertIn('occurrence-key-1', reconcile.call_args.args[0])
 
     def test_glasshive_dispatch_delegates_just_in_time_capabilities_without_credentials(self):
         storage = MagicMock()
@@ -158,7 +524,7 @@ class DispatchWorkbenchTests(unittest.TestCase):
             if url.endswith('/workers/find-or-resume'):
                 calls.append('worker')
                 worker_payloads.append(payload)
-                return {'worker_id': 'worker-1'}
+                return self.worker_response('worker-1', 'host')
             if url.endswith('/assign'):
                 calls.append('assign')
                 return {'run_id': 'glasshive-run-1'}
@@ -244,65 +610,279 @@ class DispatchWorkbenchTests(unittest.TestCase):
         self.assertEqual(failed_update['status'], 'failed')
         self.assertEqual(failed_update['error_class'], 'connected_account_action_required')
 
-    def test_glasshive_dispatch_host_recovery_remains_credential_free(self):
-        storage = MagicMock()
-        storage.get_scheduled_prompt_definition.return_value = {
-            'id': 'definition-1',
-            'prompt_text': 'Synthetic prompt',
-            'metadata': {},
-        }
-        calls = []
-        worker_payloads = []
-
-        def fake_post(url, payload, _headers, _timeout):
-            if url.endswith('/workers/find-or-resume'):
-                mode = payload['execution_mode']
-                calls.append(f'worker:{mode}')
-                worker_payloads.append(payload)
-                if mode == 'host':
-                    raise dispatch.HttpJsonError(
-                        'host unavailable',
-                        status=503,
-                        method='POST',
-                        path='/workers/find-or-resume',
-                        failure_class='runtime_dependency_missing',
-                    )
-                return {'worker_id': 'worker-1'}
-            if url.endswith('/assign'):
-                calls.append('assign')
-                return {'run_id': 'glasshive-run-1'}
-            raise AssertionError(url)
-
+    def test_parallel_isolation_conflict_retries_in_docker_with_rebased_artifacts(self):
+        host_root = '/private/user/workspace'
         task = {
             'id': 'task-1',
             'user_id': 'user-1',
-            'prompt': 'Synthetic prompt',
+            'prompt': f'Write under {host_root}/periphery/health_context.',
+            'next_run_at': '2026-08-19T10:15:00Z',
+            '_scheduled_prompt_run_id': 'scheduled-run-1',
+            '_scheduled_prompt_occurrence_key': 'occurrence-key-1',
             'metadata': {
                 'workbench_scheduled_prompt': {
                     'definition_id': 'definition-1',
-                    'execution_profile': 'codex-cli',
+                    'template_id': 'workbench_daily_health_context_v1',
+                    'workspace_root': '/private/host/repository',
+                    'my_folder': host_root,
                     'execution_mode': 'host',
+                    'fallback_worker_profile': 'claude-code',
+                    'fallback_worker_model': 'claude-managed-test',
+                    'fallback_reasoning_effort': 'max',
                 }
             },
         }
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
-            os.environ,
-            {
-                'VIVENTIUM_PRIVATE_USER_DATA_DIR': temp_dir,
-                'SCHEDULER_LIBRECHAT_SECRET': 'scheduler-secret',
-                'SCHEDULING_GLASSHIVE_CALLBACK_SECRET': 'callback-secret',
-            },
-        ), patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+        wb = task['metadata']['workbench_scheduled_prompt']
+        storage = MagicMock()
+        post_payloads = []
+
+        def post(url, payload, _headers, _timeout):
+            post_payloads.append((url, payload))
+            if url.endswith('/find-or-resume') and payload['execution_mode'] == 'host':
+                self.assertNotIn('fallback_worker_profile', payload)
+                self.assertNotIn(
+                    'viventium_execution_authority_request',
+                    payload['bootstrap_bundle'],
+                )
+                raise dispatch.HttpJsonError(
+                    'isolated execution required',
+                    status=409,
+                    method='POST',
+                    path='/v1/projects/project-1/workers/find-or-resume',
+                    failure_class='parallel_execution_isolation_required',
+                )
+            if url.endswith('/find-or-resume'):
+                self.assertEqual(payload['execution_mode'], 'docker')
+                self.assertEqual(payload['workspace_root'], '')
+                self.assertNotIn('fallback_worker_profile', payload)
+                self.assertEqual(
+                    payload['bootstrap_bundle'][
+                        'viventium_execution_authority_request'
+                    ],
+                    {
+                        'version': 1,
+                        'kind': 'prompt_workbench_scheduled',
+                        'execution_mode': 'docker',
+                        'primary': {
+                            'worker_profile': 'codex-cli',
+                            'model': 'gpt-managed-test',
+                            'reasoning_effort': 'xhigh',
+                        },
+                        'fallback': {
+                            'worker_profile': 'claude-code',
+                            'model': 'claude-managed-test',
+                            'reasoning_effort': 'max',
+                        },
+                    },
+                )
+                self.assertNotIn('execution_policy', payload['bootstrap_bundle'])
+                self.assertNotIn('viventium_launch_authority', payload['bootstrap_bundle'])
+                rendered = payload['bootstrap_bundle']['files'][0]['content']
+                self.assertNotIn(host_root, rendered)
+                self.assertIn('artifacts/periphery/health_context', rendered)
+                return self.worker_response('worker-docker', 'docker')
+            if url.endswith('/assign'):
+                self.assertNotIn(host_root, payload['instruction'])
+                self.assertIn('relative `artifacts/` root', payload['instruction'])
+                return {'run_id': 'glasshive-run-1'}
+            raise AssertionError(url)
+
+        with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_refresh_workbench_rendered_prompt', return_value=(task, wb)
+        ), patch.object(dispatch, '_glasshive_callback_secret', return_value='secret'), patch.object(
+            dispatch, '_write_private_run_detail', return_value='/private/detail.json'
+        ), patch.object(
+            dispatch, '_patch_private_run_detail', return_value=True
+        ) as patch_detail, patch.object(
             dispatch, '_ensure_glasshive_project', return_value='project-1'
-        ), patch.object(dispatch, '_post_json', side_effect=fake_post):
-            dispatch._dispatch_glasshive_task(task)
+        ), patch.object(dispatch, '_post_json', side_effect=post):
+            result = dispatch._dispatch_glasshive_task(task)
 
         self.assertEqual(
-            calls,
-            ['worker:host', 'worker:docker', 'assign'],
+            result['delivery']['reason'], 'glasshive_runtime_recovered_run_queued'
         )
-        for payload in worker_payloads:
-            self.assertNotIn('GLASSHIVE_CAPABILITY_BROKER_TOKEN', json.dumps(payload))
+        self.assertEqual(len([url for url, _ in post_payloads if url.endswith('/find-or-resume')]), 2)
+        recovery = patch_detail.call_args.args[1]['runtime_recovery']
+        self.assertEqual(recovery['reason_class'], 'parallel_execution_isolation_required')
+        self.assertEqual(recovery['artifact_return']['module_id'], 'health_context')
+        queued = next(
+            call.args[1]
+            for call in storage.update_scheduled_prompt_run.call_args_list
+            if call.args[1].get('status') == 'queued'
+        )
+        self.assertEqual(queued['execution_snapshot']['effective_execution_mode'], 'docker')
+        self.assertEqual(result['execution']['effective_execution_mode'], 'docker')
+        self.assertEqual(
+            result['execution']['runtime_recovery']['reason_class'],
+            'parallel_execution_isolation_required',
+        )
+
+    def test_assign_time_parallel_isolation_conflict_rebinds_before_docker_retry(self):
+        host_root = '/private/user/workspace'
+        task = {
+            'id': 'task-1',
+            'user_id': 'user-1',
+            'prompt': f'Write under {host_root}/periphery/health_context.',
+            'next_run_at': '2026-08-19T10:15:00Z',
+            '_scheduled_prompt_run_id': 'scheduled-run-1',
+            '_scheduled_prompt_occurrence_key': 'occurrence-key-1',
+            'metadata': {
+                'workbench_scheduled_prompt': {
+                    'definition_id': 'definition-1',
+                    'template_id': 'workbench_daily_health_context_v1',
+                    'workspace_root': '/private/host/repository',
+                    'my_folder': host_root,
+                    'execution_mode': 'host',
+                    'fallback_worker_profile': 'claude-code',
+                    'fallback_worker_model': 'claude-managed-test',
+                    'fallback_reasoning_effort': 'max',
+                }
+            },
+        }
+        wb = task['metadata']['workbench_scheduled_prompt']
+        storage = MagicMock()
+        workers = []
+
+        def post(url, payload, _headers, _timeout):
+            if url.endswith('/find-or-resume'):
+                worker_id = (
+                    'worker-docker'
+                    if payload['execution_mode'] == 'docker'
+                    else 'worker-host'
+                )
+                workers.append(worker_id)
+                if payload['execution_mode'] == 'docker':
+                    self.assertNotIn('fallback_worker_profile', payload)
+                    self.assertEqual(
+                        payload['bootstrap_bundle'][
+                            'viventium_execution_authority_request'
+                        ]['fallback'],
+                        {
+                            'worker_profile': 'claude-code',
+                            'model': 'claude-managed-test',
+                            'reasoning_effort': 'max',
+                        },
+                    )
+                return self.worker_response(
+                    worker_id,
+                    'docker' if worker_id == 'worker-docker' else 'host',
+                )
+            if url.endswith('/workers/worker-host/assign'):
+                raise dispatch.HttpJsonError(
+                    'isolated execution required',
+                    status=409,
+                    method='POST',
+                    path='/v1/workers/worker-host/assign',
+                    failure_class='parallel_execution_isolation_required',
+                )
+            if url.endswith('/workers/worker-docker/assign'):
+                self.assertIn('relative `artifacts/` root', payload['instruction'])
+                raise URLError('response lost after recovered assignment accepted')
+            raise AssertionError(url)
+
+        with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_refresh_workbench_rendered_prompt', return_value=(task, wb)
+        ), patch.object(dispatch, '_glasshive_callback_secret', return_value='secret'), patch.object(
+            dispatch, '_write_private_run_detail', return_value='/private/detail.json'
+        ), patch.object(
+            dispatch, '_patch_private_run_detail', return_value=True
+        ), patch.object(
+            dispatch, '_ensure_glasshive_project', return_value='project-1'
+        ), patch.object(dispatch, '_post_json', side_effect=post), patch.object(
+            dispatch, '_get_json', return_value={'run_id': 'glasshive-run-1'}
+        ) as reconcile:
+            result = dispatch._dispatch_glasshive_task(task)
+
+        self.assertEqual(workers, ['worker-host', 'worker-docker'])
+        bindings = [
+            call.args[1].get('glasshive_worker_id')
+            for call in storage.update_scheduled_prompt_run.call_args_list
+            if call.args[1].get('glasshive_worker_id')
+        ]
+        self.assertEqual(bindings[:2], ['worker-host', 'worker-docker'])
+        self.assertEqual(result['execution']['effective_execution_mode'], 'docker')
+        self.assertIn('worker-docker', reconcile.call_args.args[0])
+
+    def test_declared_docker_mode_uses_one_artifact_contract_for_bootstrap_and_assignment(self):
+        host_root = '/private/user/workspace'
+        task = {
+            'id': 'task-1',
+            'user_id': 'user-1',
+            'prompt': f'Write under {host_root}/periphery/health_context.',
+            'next_run_at': '2026-08-19T10:15:00Z',
+            '_scheduled_prompt_run_id': 'scheduled-run-1',
+            'metadata': {
+                'workbench_scheduled_prompt': {
+                    'definition_id': 'definition-1',
+                    'template_id': 'workbench_daily_health_context_v1',
+                    'my_folder': host_root,
+                    'execution_mode': 'docker',
+                    'memory_write_mode': 'off',
+                    'fallback_worker_profile': 'claude-code',
+                    'fallback_worker_model': 'claude-managed-test',
+                    'fallback_reasoning_effort': 'max',
+                }
+            },
+        }
+        wb = task['metadata']['workbench_scheduled_prompt']
+        storage = MagicMock()
+
+        def post(url, payload, _headers, _timeout):
+            if url.endswith('/find-or-resume'):
+                rendered = payload['bootstrap_bundle']['files'][0]['content']
+                self.assertNotIn(host_root, rendered)
+                self.assertIn('artifacts/periphery/health_context', rendered)
+                self.assertNotIn('fallback_worker_profile', payload)
+                self.assertEqual(
+                    payload['bootstrap_bundle'][
+                        'viventium_execution_authority_request'
+                    ]['fallback'],
+                    {
+                        'worker_profile': 'claude-code',
+                        'model': 'claude-managed-test',
+                        'reasoning_effort': 'max',
+                    },
+                )
+                self.assertNotIn('execution_policy', payload['bootstrap_bundle'])
+                self.assertNotIn('viventium_launch_authority', payload['bootstrap_bundle'])
+                return self.worker_response('worker-docker', 'docker')
+            if url.endswith('/assign'):
+                self.assertNotIn(host_root, payload['instruction'])
+                self.assertIn('relative `artifacts/` root', payload['instruction'])
+                return {'run_id': 'glasshive-run-1'}
+            raise AssertionError(url)
+
+        with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_refresh_workbench_rendered_prompt', return_value=(task, wb)
+        ), patch.object(dispatch, '_glasshive_callback_secret', return_value='secret'), patch.object(
+            dispatch, '_write_private_run_detail', return_value='/private/detail.json'
+        ) as private_writer, patch.object(
+            dispatch, '_ensure_glasshive_project', return_value='project-1'
+        ), patch.object(dispatch, '_post_json', side_effect=post):
+            result = dispatch._dispatch_glasshive_task(task)
+
+        detail = private_writer.call_args.args[1]
+        self.assertEqual(detail['artifact_return']['module_id'], 'health_context')
+        self.assertEqual(result['delivery']['reason'], 'glasshive_isolated_run_queued')
+        self.assertEqual(result['execution']['effective_execution_mode'], 'docker')
+        self.assertNotIn('runtime_recovery', result['execution'])
+
+    def test_workbench_worker_tuple_mismatch_fails_closed(self):
+        expected = {
+            'profile': 'codex-cli',
+            'model': 'gpt-managed-test',
+            'execution_mode': 'docker',
+        }
+
+        for worker in (
+            {'worker_id': 'worker-missing'},
+            self.worker_response('worker-profile', 'docker', profile='claude-code'),
+            self.worker_response('worker-model', 'docker', model='wrong-model'),
+            self.worker_response('worker-mode', 'host'),
+        ):
+            with self.subTest(worker=worker):
+                with self.assertRaisesRegex(RuntimeError, 'tuple mismatch'):
+                    dispatch._verify_workbench_worker_tuple(worker, expected)
 
 
 class DispatchTelegramTests(unittest.TestCase):
@@ -356,6 +936,39 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertEqual(post_json.call_count, 1)
         self.assertIn('occurrence-core-1', reconcile.call_args.args[0])
         self.assertEqual(post_json.call_args.args[1]['idempotencyKey'], 'occurrence-core-1')
+
+    def test_scheduler_generation_keeps_logical_turn_from_chat_accept_response(self):
+        task = {
+            'id': 'task-logical-turn',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'synthetic prompt',
+            'channel': ['librechat', 'telegram'],
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+        with patch.object(
+            dispatch,
+            '_post_json',
+            return_value={
+                'streamId': 'stream-1',
+                'conversationId': 'conversation-1',
+                'logical_turn_id': 'turn-from-accept',
+                'revision': 4,
+            },
+        ), patch.object(
+            dispatch,
+            '_stream_scheduler_response',
+            return_value=('canonical', 'message-1', '', {}),
+        ), patch.object(
+            dispatch,
+            '_poll_scheduler_followup',
+            return_value={'followup_text': '', 'canonical_text': '', 'canonical_text_source': ''},
+        ):
+            result = dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'new')
+
+        self.assertEqual(result['logical_turn_id'], 'turn-from-accept')
+        self.assertEqual(result['revision'], 4)
 
     def test_resolve_telegram_identity_uses_metadata(self):
         task = {
@@ -741,6 +1354,14 @@ class DispatchTelegramTests(unittest.TestCase):
             'next_run_at': '2026-06-15T15:00:00Z',
             'metadata': {
                 'source_prompt_id': 'scheduler.consciousness_continuity_opportunity',
+                'recurrence_state_v1': {
+                    'version': 1,
+                    'last_run_at': '2026-06-14T15:00:00Z',
+                    'outcome': 'sent',
+                    'reason': 'delivered',
+                    'result_excerpt': 'Yesterday was clear.',
+                    'result_sha256': 'a' * 64,
+                },
             },
         }
         seen_payloads = []
@@ -781,22 +1402,128 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertEqual(payload['scheduledDueAt'], '2026-06-15T15:00:00Z')
         self.assertEqual(payload['schedulerRunContext']['scheduled_due_local_date'], 'Monday, June 15, 2026')
         self.assertEqual(payload['schedulerRunContext']['scheduled_due_local_date_iso'], '2026-06-15')
-        self.assertEqual(payload['model'], 'gpt-5.6-sol')
-        self.assertEqual(payload['reasoning_effort'], 'xhigh')
+        self.assertNotIn('model', payload)
+        self.assertNotIn('reasoning_effort', payload)
         self.assertEqual(
-            payload['scheduledAgentExecution'],
-            {
-                'provider': 'openai',
-                'model': 'gpt-5.6-sol',
-                'reasoning_effort': 'xhigh',
-            },
+            payload['sourcePromptId'],
+            'scheduler.consciousness_continuity_opportunity',
         )
+        self.assertNotIn('scheduledAgentExecution', payload)
         self.assertIn('Scheduled Run Context (Deterministic)', payload['text'])
-        self.assertEqual(result['execution']['model'], 'gpt-5.6-sol')
-        self.assertEqual(result['execution']['reasoning_effort'], 'xhigh')
+        self.assertEqual(payload['titleText'], 'prepare morning briefing')
+        self.assertEqual(payload['recurrenceState']['version'], 1)
+        self.assertEqual(payload['recurrenceState']['result_excerpt'], 'Yesterday was clear.')
+        self.assertNotIn(dispatch.BREW_PROMPT_MARKER, payload['titleText'])
+        self.assertNotIn('model', result['execution'])
+        self.assertNotIn('reasoning_effort', result['execution'])
+        self.assertEqual(
+            result['execution']['source_prompt_id'],
+            'scheduler.consciousness_continuity_opportunity',
+        )
         self.assertEqual(result['date_guard']['final']['status'], 'passed')
 
-    def test_scheduled_agent_execution_rejects_an_incomplete_tuple(self):
+    def test_run_scheduler_generation_projects_structured_qa_provenance(self):
+        task = {
+            'id': 'task-qa',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'synthetic QA schedule',
+            'channel': 'librechat',
+            'conversation_policy': 'new',
+            '_scheduled_prompt_run_id': 'run-qa-123',
+            'metadata': {'qa_disposable': True},
+        }
+        seen_payloads = []
+
+        def fake_post(_url, payload, _headers, _timeout_s):
+            seen_payloads.append(payload)
+            return {'streamId': 'stream-qa', 'conversationId': 'conv-qa'}
+
+        with patch.object(dispatch, '_post_json', side_effect=fake_post), patch.object(
+            dispatch,
+            '_get_json',
+            return_value={'externalWork': {}},
+        ), patch.object(
+            dispatch,
+            '_stream_scheduler_response',
+            return_value=('QA completed.', 'msg-qa', ''),
+        ), patch.object(
+            dispatch,
+            '_poll_scheduler_followup',
+            return_value={'followup_text': '', 'canonical_text': ''},
+        ):
+            dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'new')
+
+        self.assertTrue(seen_payloads[0]['viventiumQaRun'])
+        self.assertEqual(seen_payloads[0]['viventiumQaRunId'], 'run-qa-123')
+
+        task['metadata'] = {}
+        seen_payloads.clear()
+        with patch.object(dispatch, '_post_json', side_effect=fake_post), patch.object(
+            dispatch,
+            '_get_json',
+            return_value={'externalWork': {}},
+        ), patch.object(
+            dispatch,
+            '_stream_scheduler_response',
+            return_value=('Normal completed.', 'msg-normal', ''),
+        ), patch.object(
+            dispatch,
+            '_poll_scheduler_followup',
+            return_value={'followup_text': '', 'canonical_text': ''},
+        ):
+            dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'new')
+
+        self.assertNotIn('viventiumQaRun', seen_payloads[0])
+        self.assertNotIn('viventiumQaRunId', seen_payloads[0])
+
+    def test_run_scheduler_generation_projects_channel_contract_and_reads_external_work(self):
+        task = {
+            'id': 'task-external-work',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'delegate a synthetic long mission',
+            'channel': ['telegram', 'librechat'],
+            'conversation_policy': 'new',
+            '_scheduled_prompt_occurrence_key': 'schedule:occurrence-external',
+            'metadata': None,
+        }
+        seen_payloads = []
+
+        def fake_post(_url, payload, _headers, _timeout_s):
+            seen_payloads.append(payload)
+            return {'streamId': 'stream-external', 'conversationId': 'conv-external'}
+
+        with patch.object(dispatch, '_post_json', side_effect=fake_post), patch.object(
+            dispatch,
+            '_stream_scheduler_response',
+            return_value=('Mission accepted.', 'msg-external', ''),
+        ), patch.object(
+            dispatch,
+            '_poll_scheduler_followup',
+            return_value={'followup_text': '', 'canonical_text': ''},
+        ), patch.object(
+            dispatch,
+            '_get_json',
+            return_value={
+                'state': 'accepted',
+                'externalWork': {
+                    'requiredTotal': 1,
+                    'requiredTerminal': 0,
+                    'allRequiredTerminal': False,
+                    'state': 'waiting_external',
+                },
+            },
+        ) as reconcile:
+            result = dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'new')
+
+        self.assertEqual(seen_payloads[0]['deliveryChannels'], ['telegram', 'librechat'])
+        self.assertEqual(seen_payloads[0]['idempotencyKey'], 'schedule:occurrence-external')
+        self.assertIn('/api/viventium/scheduler/dispatches/', reconcile.call_args.args[0])
+        self.assertEqual(result['external_work']['state'], 'waiting_external')
+        self.assertEqual(result['external_work']['requiredTotal'], 1)
+
+    def test_legacy_scheduled_agent_environment_cannot_override_main_agent(self):
         with patch.dict(
             os.environ,
             {
@@ -806,33 +1533,7 @@ class DispatchTelegramTests(unittest.TestCase):
             },
             clear=False,
         ):
-            with self.assertRaisesRegex(
-                RuntimeError,
-                'requires provider, model, and reasoning effort',
-            ):
-                dispatch._scheduled_agent_execution()
-
-    # === VIVENTIUM START === Scheduler/provider effort parity regression coverage.
-    def test_scheduled_agent_execution_accepts_declared_extended_efforts(self):
-        for effort in ("max", "ultra"):
-            with self.subTest(effort=effort), patch.dict(
-                os.environ,
-                {
-                    "VIVENTIUM_SCHEDULED_AGENT_PROVIDER": "glasshive-harness",
-                    "VIVENTIUM_SCHEDULED_AGENT_MODEL": "codex-cli:gpt-5.6-sol",
-                    "VIVENTIUM_SCHEDULED_AGENT_REASONING_EFFORT": effort,
-                },
-                clear=False,
-            ):
-                self.assertEqual(
-                    dispatch._scheduled_agent_execution(),
-                    {
-                        "provider": "glasshive-harness",
-                        "model": "codex-cli:gpt-5.6-sol",
-                        "reasoning_effort": effort,
-                    },
-                )
-    # === VIVENTIUM END ===
+            self.assertFalse(hasattr(dispatch, '_scheduled_agent_execution'))
 
     def test_run_scheduler_generation_omits_execution_when_policy_is_unset(self):
         task = {
@@ -962,6 +1663,145 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertEqual(followup_text, '')
         self.assertNotIn('linger=', seen['url'])
         self.assertIn('/api/viventium/scheduler/stream/stream-final', seen['url'])
+
+    def test_scheduler_stream_preserves_safe_structured_generation_failure(self):
+        def fake_payloads(_url, _headers, _timeout_s):
+            yield json.dumps(
+                {
+                    'final': True,
+                    'responseMessage': {
+                        'messageId': 'msg-provider-error',
+                        'text': '',
+                        'content': [
+                            {
+                                'type': 'error',
+                                'error': 'Bearer synthetic-private-provider-detail',
+                                'error_class': 'provider_unauthorized',
+                                'failure_retryable': False,
+                            }
+                        ],
+                    },
+                }
+            )
+
+        with patch.object(dispatch, '_iter_sse_payloads', side_effect=fake_payloads):
+            result = dispatch._stream_scheduler_response(
+                'http://localhost:3080',
+                'stream-provider-error',
+                'user_1',
+                'secret',
+                120,
+                return_metadata=True,
+            )
+
+        self.assertEqual(result[:3], ('', 'msg-provider-error', ''))
+        self.assertEqual(
+            result[3].get('generation_failure'),
+            {'error_class': 'provider_unauthorized', 'failure_retryable': False},
+        )
+        self.assertNotIn('synthetic-private-provider-detail', str(result))
+
+    def test_scheduled_failure_notice_never_claims_an_unscheduled_retry(self):
+        notice = dispatch._scheduled_generation_failure_notice(
+            'provider_rate_limited',
+            False,
+        )
+
+        self.assertIn('no automatic retry is scheduled', notice)
+        self.assertNotIn('remain available for retry', notice)
+
+        missing_auth = dispatch._scheduled_generation_failure_notice(
+            'provider_auth_missing',
+            False,
+            'terminal_action_required',
+        )
+        self.assertIn('provider connection is missing', missing_auth)
+        self.assertIn('action is required', missing_auth)
+
+        self.assertIn(
+            'will retry automatically',
+            dispatch._scheduled_generation_failure_notice(
+                'provider_rate_limited',
+                True,
+                'retry_scheduled',
+            ),
+        )
+        self.assertIn(
+            'next scheduled occurrence remains',
+            dispatch._scheduled_generation_failure_notice(
+                'provider_rate_limited',
+                True,
+                'next_occurrence_only',
+            ),
+        )
+
+    def test_one_time_retry_transition_and_notice_share_the_exact_retry_time(self):
+        task = {
+            'id': 'task-retry-time',
+            'schedule': {'type': 'once', 'at': '2026-08-20T14:00:00Z', 'timezone': 'UTC'},
+            'metadata': {},
+            '_scheduled_prompt_attempted_at': '2026-08-20T14:00:00Z',
+            '_scheduled_prompt_retry_delay_s': 300,
+        }
+
+        transition = dispatch.resolve_scheduled_failure_transition(
+            task,
+            'provider_rate_limited',
+            True,
+        )
+        notice = dispatch._scheduled_generation_failure_notice(
+            'provider_rate_limited',
+            transition['retryable'],
+            transition['retry_disposition'],
+            transition.get('next_attempt_at'),
+        )
+
+        self.assertEqual(transition['next_attempt_at'], '2026-08-20T14:05:00Z')
+        self.assertIn('2026-08-20T14:05:00Z', notice)
+
+    def test_run_scheduler_generation_returns_structured_provider_failure_without_polling(self):
+        task = {
+            'id': 'task-provider-error',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'perform required external work',
+            'channel': ['librechat', 'telegram'],
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+
+        with patch.object(
+            dispatch,
+            '_post_json',
+            return_value={'streamId': 'stream-provider-error', 'conversationId': 'conv-provider-error'},
+        ), patch.object(
+            dispatch,
+            '_stream_scheduler_response',
+            return_value=(
+                '',
+                'msg-provider-error',
+                '',
+                {'generation_failure': {'error_class': 'provider_unauthorized'}},
+            ),
+        ), patch.object(dispatch, '_poll_scheduler_followup') as poll, patch.object(
+            dispatch,
+            '_get_json',
+            return_value={'externalWork': {}},
+        ):
+            result = dispatch._run_scheduler_generation(
+                task,
+                'http://localhost:3080',
+                10,
+                'new',
+            )
+
+        self.assertEqual(
+            result.get('generation_failure'),
+            {'error_class': 'provider_unauthorized'},
+        )
+        self.assertEqual(result.get('conversation_id'), 'conv-provider-error')
+        self.assertEqual(result.get('response_message_id'), 'msg-provider-error')
+        poll.assert_not_called()
 
     def test_scheduled_generation_default_stream_window_supports_xhigh_runs(self):
         task = {
@@ -1312,6 +2152,35 @@ class DispatchTelegramTests(unittest.TestCase):
             self.assertEqual(mock_tg.call_count, 1)
             self.assertEqual(result.get('conversation_id'), 'lc-1')
 
+    def test_dispatch_task_uses_compiled_librechat_origin_when_scheduler_url_is_unset(self):
+        task = {
+            'id': 'task-compiled-origin',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'hello',
+            'channel': ['librechat'],
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+
+        with patch.dict(
+            os.environ,
+            {'VIVENTIUM_LIBRECHAT_ORIGIN': 'http://127.0.0.1:3180/'},
+            clear=True,
+        ), patch.object(
+            dispatch,
+            '_run_scheduler_generation',
+            return_value={
+                'conversation_id': 'lc-compiled-origin',
+                'response_message_id': 'msg-compiled-origin',
+                'final_text': 'hello there',
+                'followup_text': '',
+            },
+        ) as mock_run:
+            dispatch.dispatch_task(task)
+
+        self.assertEqual(mock_run.call_args.args[1], 'http://127.0.0.1:3180')
+
     def test_dispatch_task_fan_out_for_channel_list(self):
         task = {
             'id': 'task-5',
@@ -1362,21 +2231,28 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertNotIn("**", rendered)
         self.assertIn("<b>Daily Inbox Check</b>", rendered)
 
-    def test_send_telegram_message_fallbacks_to_plain_text(self):
+    def test_render_telegram_markdown_preserves_intraword_underscores(self):
+        text = "SAME_CONTINUITY_OK snake_case A__B__C"
+        rendered = dispatch.render_telegram_markdown(text)
+        self.assertEqual(rendered, text)
+
+    def test_render_telegram_markdown_keeps_delimited_underscore_emphasis(self):
+        rendered = dispatch.render_telegram_markdown("Use _italic_ and __bold__ here")
+        self.assertEqual(rendered, "Use <i>italic</i> and <b>bold</b> here")
+
+    def test_send_telegram_message_does_not_retry_after_ambiguous_transport_error(self):
         payloads = []
 
         def fake_post(_url, payload, _headers, _timeout_s):
             payloads.append(dict(payload))
-            if len(payloads) == 1:
-                raise RuntimeError("parse entities")
-            return {}
+            raise RuntimeError("response lost after accept")
 
         with patch.object(dispatch, '_post_json', side_effect=fake_post):
-            dispatch._send_telegram_message('tg-1', '**Bold**', 10)
+            with self.assertRaisesRegex(RuntimeError, 'response lost after accept'):
+                dispatch._send_telegram_message('tg-1', '**Bold**', 10)
 
         self.assertEqual(payloads[0].get('parse_mode'), 'HTML')
-        self.assertNotIn('parse_mode', payloads[1])
-        self.assertNotIn('<b>', payloads[1].get('text', ''))
+        self.assertEqual(len(payloads), 1)
     # === VIVENTIUM NOTE ===
 
     # === VIVENTIUM NOTE ===
@@ -1397,6 +2273,145 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertNotIn('parse_mode', payloads[1])
         self.assertNotIn('<b>', payloads[1].get('text', ''))
     # === VIVENTIUM NOTE ===
+
+    def test_send_telegram_message_returns_durable_telegram_id(self):
+        with patch.object(
+            dispatch,
+            '_post_json',
+            return_value={'ok': True, 'result': {'message_id': 91}},
+        ):
+            self.assertEqual(dispatch._send_telegram_message('tg-1', 'hello', 10), '91')
+
+    def test_scheduler_delivery_ack_includes_every_telegram_chunk(self):
+        captured = {}
+
+        def fake_post(url, payload, headers, timeout_s):
+            captured.update(url=url, payload=payload, headers=headers, timeout_s=timeout_s)
+            return {'acknowledged': True}
+
+        with patch.dict(
+            os.environ,
+            {'VIVENTIUM_TELEGRAM_INTERACTION_ADAPTER_SECRET': 'adapter-secret'},
+            clear=False,
+        ), patch.object(dispatch, '_post_json', side_effect=fake_post):
+            status = dispatch._ack_scheduler_telegram_delivery(
+                base_url='http://localhost:3080',
+                logical_turn_id='turn-1',
+                revision=2,
+                telegram_chat_id='chat-1',
+                telegram_message_ids=['90', '91'],
+                timeout_s=15,
+                schedule_id='schedule-1',
+                schedule_run_id='run-1',
+            )
+
+        self.assertEqual(status, 'recorded')
+        self.assertEqual(
+            captured['payload']['presentation_refs'],
+            ['telegram:chat-1:90', 'telegram:chat-1:91'],
+        )
+        self.assertEqual(captured['payload']['presentation_ref'], 'telegram:chat-1:91')
+        self.assertEqual(captured['payload']['source_kind'], 'schedule_result')
+        self.assertEqual(captured['payload']['schedule_id'], 'schedule-1')
+        self.assertEqual(captured['payload']['schedule_run_id'], 'run-1')
+
+    def test_scheduled_telegram_delivery_reuses_receipt_without_resending(self):
+        task = {
+            'id': 'schedule-1',
+            '_scheduled_prompt_run_id': 'run-1',
+            '_scheduled_prompt_occurrence_key': 'occurrence-1',
+        }
+        visibility = dispatch._prepare_generated_visibility(task, 'already delivered', '')
+        storage = MagicMock()
+        storage.claim_scheduled_prompt_delivery.return_value = {
+            'claimed': False,
+            'reason': 'already_sent',
+            'delivery_key': 'delivery-1',
+            'delivery': {'state': 'sent', 'message_id': '91'},
+        }
+
+        with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch,
+            '_resolve_telegram_identity',
+            return_value=('tg-1', 'chat-1', {'voice_responses_enabled': False}),
+        ), patch.object(dispatch, '_send_telegram_voice_or_text') as send:
+            detail = dispatch._deliver_telegram_generated_text(
+                task,
+                'http://localhost:3080',
+                10,
+                None,
+                visibility,
+            )
+
+        send.assert_not_called()
+        self.assertEqual(detail['outcome'], 'sent')
+        self.assertEqual(detail['telegram_message_ids'], ['91'])
+        self.assertEqual(detail['delivery_receipt_state'], 'confirmed')
+
+    def test_scheduled_telegram_delivery_stops_on_ambiguous_prior_send(self):
+        task = {
+            'id': 'schedule-2',
+            '_scheduled_prompt_run_id': 'run-2',
+            '_scheduled_prompt_occurrence_key': 'occurrence-2',
+        }
+        visibility = dispatch._prepare_generated_visibility(task, 'possibly delivered', '')
+        storage = MagicMock()
+        storage.claim_scheduled_prompt_delivery.return_value = {
+            'claimed': False,
+            'reason': 'delivery_unknown',
+            'delivery_key': 'delivery-2',
+            'delivery': {'state': 'delivery_unknown', 'message_id': None},
+        }
+
+        with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch,
+            '_resolve_telegram_identity',
+            return_value=('tg-1', 'chat-1', {'voice_responses_enabled': False}),
+        ), patch.object(dispatch, '_send_telegram_voice_or_text') as send:
+            detail = dispatch._deliver_telegram_generated_text(
+                task,
+                'http://localhost:3080',
+                10,
+                None,
+                visibility,
+            )
+
+        send.assert_not_called()
+        self.assertEqual(detail['outcome'], 'delivery_unknown')
+        self.assertEqual(detail['reason'], 'telegram_delivery_ambiguous')
+        self.assertEqual(detail['delivery_receipt_state'], 'unknown')
+
+    def test_scheduled_telegram_send_without_receipt_is_marked_unknown(self):
+        task = {
+            'id': 'schedule-3',
+            '_scheduled_prompt_run_id': 'run-3',
+            '_scheduled_prompt_occurrence_key': 'occurrence-3',
+        }
+        visibility = dispatch._prepare_generated_visibility(task, 'send this', '')
+        storage = MagicMock()
+        storage.claim_scheduled_prompt_delivery.return_value = {
+            'claimed': True,
+            'reason': 'claimed',
+            'delivery_key': 'delivery-3',
+            'delivery': {'state': 'claimed'},
+        }
+
+        with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch,
+            '_resolve_telegram_identity',
+            return_value=('tg-1', 'chat-1', {'voice_responses_enabled': False}),
+        ), patch.object(dispatch, '_send_telegram_voice_or_text', return_value=None):
+            detail = dispatch._deliver_telegram_generated_text(
+                task,
+                'http://localhost:3080',
+                10,
+                None,
+                visibility,
+            )
+
+        storage.mark_scheduled_prompt_delivery_unknown.assert_called_once()
+        self.assertEqual(detail['outcome'], 'delivery_unknown')
+        self.assertEqual(detail['delivery_receipt_state'], 'unknown')
 
     # === VIVENTIUM NOTE ===
     # Feature: Scheduler Telegram path must strip internal recall/tool artifacts.
@@ -2132,6 +3147,187 @@ class DispatchBestEffortFanoutTests(unittest.TestCase):
         os.environ.pop('SCHEDULER_LIBRECHAT_SECRET', None)
         os.environ.pop('SCHEDULER_TELEGRAM_SECRET', None)
         os.environ.pop('SCHEDULER_TELEGRAM_BOT_TOKEN', None)
+
+    def test_structured_generation_failure_notifies_telegram_and_stays_failed(self):
+        task = {
+            'id': 'task-provider-failure-fanout',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'perform required external work',
+            'channel': ['librechat', 'telegram'],
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+        captured_visibility = {}
+
+        def deliver(_task, _base_url, _timeout_s, _message_id, visibility):
+            captured_visibility.update(visibility)
+            return {
+                'channel': 'telegram',
+                'outcome': 'sent',
+                'reason': 'delivered',
+                'generated_text': visibility.get('generated_text'),
+            }
+
+        with patch.object(
+            dispatch,
+            '_run_scheduler_generation',
+            return_value={
+                'conversation_id': 'conv-provider-failure',
+                'response_message_id': 'msg-provider-failure',
+                'generation_failure': {'error_class': 'provider_unauthorized'},
+                'execution': {'provider': 'openai', 'model': 'synthetic-model'},
+            },
+        ), patch.object(
+            dispatch,
+            '_deliver_telegram_generated_text',
+            side_effect=deliver,
+        ):
+            result = dispatch.dispatch_task(task)
+
+        self.assertEqual(result['delivery']['outcome'], 'failed')
+        self.assertEqual(result['delivery']['reason'], 'provider_unauthorized')
+        self.assertEqual(result['generation_failure']['error_class'], 'provider_unauthorized')
+        self.assertFalse(result['generation_failure']['failure_retryable'])
+        self.assertEqual(
+            result['generation_failure']['transition']['retry_disposition'],
+            'next_occurrence_only',
+        )
+        self.assertEqual(result['delivery']['channels']['librechat']['outcome'], 'failed')
+        self.assertEqual(result['delivery']['channels']['telegram']['outcome'], 'sent')
+        self.assertEqual(result['delivery']['channels']['telegram']['reason'], 'action_required')
+        self.assertIn('Reconnect it in Settings', captured_visibility['final_text'])
+        self.assertNotIn('synthetic-private', str(result))
+
+    def test_pre_generation_exception_uses_the_same_failure_notice_contract(self):
+        task = {
+            'id': 'task-pre-generation-failure',
+            'user_id': 'user_1',
+            'agent_id': 'agent-missing',
+            'prompt': 'perform required external work',
+            'channel': ['telegram'],
+            'conversation_policy': 'new',
+            'schedule': {'type': 'interval', 'interval': {'every': 1, 'unit': 'hour'}},
+            'metadata': {},
+        }
+
+        with patch.object(
+            dispatch,
+            '_deliver_telegram_generated_text',
+            return_value={'channel': 'telegram', 'outcome': 'sent', 'reason': 'delivered'},
+        ) as deliver:
+            result = dispatch.scheduled_failure_result(task, 'RuntimeError')
+
+        deliver.assert_called_once()
+        self.assertEqual(result['generation_failure']['error_class'], 'completion_error')
+        self.assertEqual(
+            result['generation_failure']['transition']['retry_disposition'],
+            'next_occurrence_only',
+        )
+        self.assertEqual(result['delivery']['channels']['telegram']['outcome'], 'sent')
+        self.assertIn('next scheduled occurrence remains', result['delivery']['generated_text'])
+        self.assertEqual(
+            result['generation_failure']['transition']['reported_failure_classes'],
+            ['completion_error'],
+        )
+
+    def test_legacy_error_without_delivery_receipt_does_not_suppress_first_notice(self):
+        task = {
+            'id': 'task-legacy-unreported-failure',
+            'user_id': 'user_1',
+            'agent_id': 'agent-missing',
+            'prompt': 'perform required external work',
+            'channel': ['telegram'],
+            'conversation_policy': 'new',
+            'schedule': {'type': 'interval', 'interval': {'every': 1, 'unit': 'hour'}},
+            'last_status': 'error',
+            'last_error': 'completion_error',
+            'metadata': {},
+        }
+
+        with patch.object(
+            dispatch,
+            '_deliver_telegram_generated_text',
+            return_value={'channel': 'telegram', 'outcome': 'sent', 'reason': 'delivered'},
+        ) as deliver:
+            result = dispatch.scheduled_failure_result(task, 'RuntimeError')
+
+        deliver.assert_called_once()
+        self.assertFalse(
+            result['generation_failure']['transition']['already_reported_in_health_epoch']
+        )
+        self.assertEqual(
+            result['generation_failure']['transition']['reported_failure_classes'],
+            ['completion_error'],
+        )
+
+    def test_failed_failure_notice_delivery_is_not_marked_reported(self):
+        task = {
+            'id': 'task-failure-notice-delivery-failed',
+            'user_id': 'user_1',
+            'agent_id': 'agent-missing',
+            'prompt': 'perform required external work',
+            'channel': ['telegram'],
+            'conversation_policy': 'new',
+            'schedule': {'type': 'interval', 'interval': {'every': 1, 'unit': 'hour'}},
+            'metadata': {},
+        }
+
+        with patch.object(
+            dispatch,
+            '_deliver_telegram_generated_text',
+            side_effect=RuntimeError('synthetic delivery failure'),
+        ):
+            result = dispatch.scheduled_failure_result(task, 'RuntimeError')
+
+        self.assertEqual(result['delivery']['channels']['telegram']['outcome'], 'failed')
+        self.assertEqual(
+            result['generation_failure']['transition']['reported_failure_classes'],
+            [],
+        )
+
+    def test_repeated_same_root_generation_failure_coalesces_telegram_notice(self):
+        task = {
+            'id': 'task-provider-failure-repeat',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'perform required external work',
+            'channel': ['telegram'],
+            'conversation_policy': 'new',
+            'schedule': {'type': 'cron', 'expression': '0 * * * *'},
+            'last_status': 'error',
+            'last_error': 'provider_rate_limited',
+            'metadata': {
+                'scheduled_failure_state_v1': {
+                    'version': 1,
+                    'error_class': 'provider_rate_limited',
+                    'health_epoch': 'health-epoch-1',
+                    'consecutive_count': 1,
+                    'same_root_count': 1,
+                    'reported_failure_classes': ['provider_rate_limited'],
+                },
+            },
+        }
+
+        with patch.object(
+            dispatch,
+            '_run_scheduler_generation',
+            return_value={
+                'conversation_id': 'conv-provider-failure',
+                'response_message_id': 'msg-provider-failure',
+                'generation_failure': {
+                    'error_class': 'provider_rate_limited',
+                    'failure_retryable': True,
+                },
+            },
+        ), patch.object(dispatch, '_deliver_telegram_generated_text') as deliver:
+            result = dispatch.dispatch_task(task)
+
+        deliver.assert_not_called()
+        telegram = result['delivery']['channels']['telegram']
+        self.assertEqual(telegram['outcome'], 'suppressed')
+        self.assertEqual(telegram['reason'], 'same_root_already_reported')
+        self.assertIsNone(result['delivery']['generated_text'])
 
     def test_partial_success_telegram_fails_librechat_succeeds(self):
         task = {

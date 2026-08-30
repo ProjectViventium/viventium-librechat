@@ -18,6 +18,11 @@ const path = require('path');
 const crypto = require('crypto');
 const childProcess = require('child_process');
 
+if (require.main === module) {
+  process.env.USE_REDIS = 'false';
+  process.env.USE_REDIS_STREAMS = 'false';
+}
+
 require('module-alias')({ base: path.resolve(__dirname, '..', 'api') });
 
 const yaml = require('js-yaml');
@@ -2649,32 +2654,24 @@ function configuredProviders() {
     .filter(Boolean);
 }
 
-function configuredModelFallbacks() {
-  const configured = parseModelFallbacks(process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_FALLBACKS);
-  return configured.length ? configured : DEFAULT_MEMORY_HARDENING_MODEL_FALLBACKS;
-}
-
-function explicitModelFallbacksConfigured() {
-  return Boolean(String(process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_FALLBACKS || '').trim());
-}
-
-function defaultFallbackAllowedProviders(primary) {
-  const providers = new Set(configuredProviders());
-  const primaryProvider = normalizeProvider(primary?.provider);
-  if (primaryProvider) providers.add(primaryProvider);
-  return providers;
+function configuredModelFallbacks(primary) {
+  const configuredValue = String(
+    process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_FALLBACKS || '',
+  ).trim();
+  if (configuredValue) return parseModelFallbacks(configuredValue);
+  return primary ? [] : DEFAULT_MEMORY_HARDENING_MODEL_FALLBACKS.slice(0, 1);
 }
 
 function withResolvedCandidates(primary, extra = []) {
-  const fallbackCandidates = configuredModelFallbacks();
-  const allowedProviders = defaultFallbackAllowedProviders(primary);
-  const filteredFallbacks =
-    explicitModelFallbacksConfigured() || allowedProviders.size === 0
-      ? fallbackCandidates
-      : fallbackCandidates.filter((candidate) => allowedProviders.has(candidate.provider));
-  const candidates = uniqueModelCandidates([primary, ...extra, ...filteredFallbacks]);
+  const candidates = uniqueModelCandidates([
+    ...(primary ? [primary] : []),
+    ...extra,
+    ...configuredModelFallbacks(primary),
+  ]);
   const selected =
-    normalizeModelCandidate(primary, primary?.source || 'selected') || candidates[0] || null;
+    (primary ? normalizeModelCandidate(primary, primary.source || 'selected') : null) ||
+    candidates[0] ||
+    null;
   if (!selected) return { provider: '', model: '', effort: '', candidates: [] };
   return { ...selected, candidates };
 }
@@ -2758,6 +2755,13 @@ function classifyModelCallFailure(error) {
     )
   ) {
     return 'model_auth_error';
+  }
+  if (
+    /usage (?:limit|cap)(?: reached| exceeded)?|quota (?:is )?(?:exhausted|reached|exceeded)|insufficient[_\s-]?quota|credits? exhausted/i.test(
+      message,
+    )
+  ) {
+    return 'model_usage_limit';
   }
   if (/rate limit|too many requests|429/i.test(message)) return 'model_rate_limited';
   if (/overloaded|overload|529|capacity/i.test(message)) return 'model_overloaded';

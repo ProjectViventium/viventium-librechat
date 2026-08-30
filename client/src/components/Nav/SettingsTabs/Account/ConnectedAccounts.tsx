@@ -63,6 +63,13 @@ type CredentialPolicyLoadState = 'loading' | 'ready' | 'unavailable';
 const KEY_POLL_INTERVAL_MS = 1200;
 const KEY_POLL_TIMEOUT_MS = 90_000;
 
+export function connectedAccountPlatformFallbackAvailable(
+  endpointFallbackAvailable: boolean,
+  connectedAccountRequired: boolean,
+): boolean {
+  return endpointFallbackAvailable && !connectedAccountRequired;
+}
+
 function isProviderSlug(value: unknown): value is ProviderSlug {
   return value === 'openai' || value === 'anthropic';
 }
@@ -855,6 +862,10 @@ function ConnectedAccounts() {
           const credentialPolicyState = provider.oauth
             ? credentialPolicyStates[provider.slug]
             : undefined;
+          const effectivePlatformFallbackAvailable = connectedAccountPlatformFallbackAvailable(
+            provider.platformFallbackAvailable,
+            credentialPolicy === 'personal_required',
+          );
           const personalOnlyUnavailable =
             provider.oauth &&
             !connectedAccountsEnabled &&
@@ -883,7 +894,7 @@ function ConnectedAccounts() {
                         {statusText}
                       </p>
                       <p className="text-xs text-text-secondary">
-                        {getSourceLine(isConnected, provider.platformFallbackAvailable)}
+                        {getSourceLine(isConnected, effectivePlatformFallbackAvailable)}
                       </p>
                     </>
                   )}

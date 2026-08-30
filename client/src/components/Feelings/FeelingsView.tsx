@@ -1,19 +1,21 @@
-/* eslint-disable i18next/no-literal-string -- Viventium's locked Feelings instrument owns this exact product copy. */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, RotateCcw, X } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { Dialog, DialogPanel, DialogTitle } from '@headlessui/react';
 import type {
   FeelingBandId,
   FeelingBandDefinition,
   FeelingLevelId,
+  FeelingReactionCause,
   FeelingTrailEntry,
   UpdateFeelingBand,
 } from 'librechat-data-provider';
+import type { TranslationKeys } from '~/hooks';
 import {
   MAX_FEELING_RANGE_PROMPT_CHARS,
   VISIBLE_FEELING_TRAIL_LIMIT,
 } from 'librechat-data-provider';
+import ViventiumLogoIcon from '~/components/Endpoints/ViventiumLogoIcon';
 import {
   useDeleteFeelingsMutation,
   useFeelingsQuery,
@@ -21,45 +23,68 @@ import {
   useUpdateFeelingBandMutation,
   useUpdateFeelingsProfileMutation,
 } from '~/data-provider';
+import { useLocalize } from '~/hooks';
 import './feelings.css';
 
 const FUTURE_BANDS = [
-  'Distress / pain',
-  'Anger / assertion',
-  'Disgust / aversion',
-  'Trust / security',
-  'Guilt / shame',
-  'Confidence / control',
-];
+  'com_ui_feelings_future_distress',
+  'com_ui_feelings_future_anger',
+  'com_ui_feelings_future_disgust',
+  'com_ui_feelings_future_trust',
+  'com_ui_feelings_future_guilt',
+  'com_ui_feelings_future_confidence',
+] as const satisfies TranslationKeys[];
 
 const RETURN_SPEEDS = [
-  { value: 10, label: 'Very fast · 10 min' },
-  { value: 20, label: 'Fast · 20 min' },
-  { value: 45, label: 'Medium · 45 min' },
-  { value: 90, label: 'Slow · 90 min' },
-  { value: 240, label: 'Very slow · 4 hr' },
-  { value: 480, label: 'Long · 8 hr' },
-  { value: 1440, label: 'Enduring · 24 hr' },
-];
+  { value: 10, label: 'com_ui_feelings_speed_very_fast' },
+  { value: 20, label: 'com_ui_feelings_speed_fast' },
+  { value: 45, label: 'com_ui_feelings_speed_medium' },
+  { value: 90, label: 'com_ui_feelings_speed_slow' },
+  { value: 240, label: 'com_ui_feelings_speed_very_slow' },
+  { value: 480, label: 'com_ui_feelings_speed_long' },
+  { value: 1440, label: 'com_ui_feelings_speed_enduring' },
+] as const satisfies Array<{ value: number; label: TranslationKeys }>;
 
-const REACTION_CAUSE_LABELS: Record<string, string> = {
-  playful_exchange: 'Playful exchange',
-  connection_bid: 'Pull toward connection',
-  care_signal: 'A moment calling for care',
-  progress: 'Progress',
-  setback: 'A setback',
-  new_information: 'Something new',
-  uncertainty: 'Uncertainty',
-  risk_or_boundary: 'Risk or boundary',
-  fatigue: 'Strain or fatigue',
-  conflict: 'Friction or conflict',
-  praise: 'Recognition',
-  loss: 'Loss',
-  surprise: 'Surprise',
-  other: 'The moment',
-  manual_adjustment: 'You adjusted it',
-  reset_to_nature: 'Reset to Nature',
+const REACTION_CAUSE_LABELS: Record<FeelingReactionCause, TranslationKeys> = {
+  playful_exchange: 'com_ui_feelings_cause_playful_exchange',
+  connection_bid: 'com_ui_feelings_cause_connection_bid',
+  care_signal: 'com_ui_feelings_cause_care_signal',
+  progress: 'com_ui_feelings_cause_progress',
+  setback: 'com_ui_feelings_cause_setback',
+  new_information: 'com_ui_feelings_cause_new_information',
+  uncertainty: 'com_ui_feelings_cause_uncertainty',
+  risk_or_boundary: 'com_ui_feelings_cause_risk_or_boundary',
+  fatigue: 'com_ui_feelings_cause_fatigue',
+  conflict: 'com_ui_feelings_cause_conflict',
+  praise: 'com_ui_feelings_cause_praise',
+  loss: 'com_ui_feelings_cause_loss',
+  surprise: 'com_ui_feelings_cause_surprise',
+  other: 'com_ui_feelings_cause_other',
+  manual_adjustment: 'com_ui_feelings_cause_manual_adjustment',
+  reset_to_nature: 'com_ui_feelings_cause_reset_to_nature',
 };
+
+const TRAIL_VERB_LABELS = {
+  up: {
+    slight: 'com_ui_feelings_trail_rose_slightly',
+    clear: 'com_ui_feelings_trail_rose_clearly',
+    strong: 'com_ui_feelings_trail_rose_strongly',
+  },
+  down: {
+    slight: 'com_ui_feelings_trail_fell_slightly',
+    clear: 'com_ui_feelings_trail_fell_clearly',
+    strong: 'com_ui_feelings_trail_fell_strongly',
+  },
+} as const satisfies Record<
+  FeelingTrailEntry['direction'],
+  Record<FeelingTrailEntry['strength'], TranslationKeys>
+>;
+
+const TRAIL_SOURCE_LABELS = {
+  user_turn: 'com_ui_feelings_trail_source_user',
+  manual: 'com_ui_feelings_trail_source_manual',
+  reset: 'com_ui_feelings_trail_source_reset',
+} as const satisfies Record<FeelingTrailEntry['sourceType'], TranslationKeys>;
 
 const RANGE_COMMIT_KEYS = new Set([
   'ArrowUp',
@@ -80,37 +105,73 @@ function feelingLevel(definition: FeelingBandDefinition, value: number) {
   return definition.levels[Math.min(4, Math.floor(Math.max(0, Math.min(100, value)) / 20))];
 }
 
-function halfLifeLabel(minutes: number) {
-  if (minutes < 60) return `${minutes} min half-life`;
-  if (minutes % 1440 === 0) return `${minutes / 1440} day half-life`;
-  if (minutes % 60 === 0) return `${minutes / 60} hr half-life`;
-  return `${minutes} min half-life`;
+function halfLifeLabel(minutes: number, localize: ReturnType<typeof useLocalize>, short = false) {
+  if (minutes % 1440 === 0) {
+    return localize(short ? 'com_ui_feelings_duration_days' : 'com_ui_feelings_half_life_days', {
+      0: minutes / 1440,
+    });
+  }
+  if (minutes >= 60 && minutes % 60 === 0) {
+    return localize(short ? 'com_ui_feelings_duration_hours' : 'com_ui_feelings_half_life_hours', {
+      0: minutes / 60,
+    });
+  }
+  return localize(
+    short ? 'com_ui_feelings_duration_minutes' : 'com_ui_feelings_half_life_minutes',
+    {
+      0: minutes,
+    },
+  );
 }
 
-function deltaLabel(current: number, baseline: number) {
+function deltaLabel(current: number, baseline: number, localize: ReturnType<typeof useLocalize>) {
   const delta = Math.round(current - baseline);
-  if (Math.abs(delta) < 1) return 'at nature';
-  return `${Math.abs(delta)} ${delta > 0 ? 'above' : 'below'} nature`;
+  if (Math.abs(delta) < 1) return localize('com_ui_feelings_at_nature');
+  return localize(delta > 0 ? 'com_ui_feelings_above_nature' : 'com_ui_feelings_below_nature', {
+    0: Math.abs(delta),
+  });
 }
 
-function trailVerb(direction: 'up' | 'down', strength: 'slight' | 'clear' | 'strong') {
-  const strengthWord =
-    strength === 'slight' ? 'slightly' : strength === 'clear' ? 'clearly' : 'strongly';
-  return `${direction === 'up' ? 'rose' : 'fell'} ${strengthWord}`;
+function trailVerb(
+  direction: FeelingTrailEntry['direction'],
+  strength: FeelingTrailEntry['strength'],
+  localize: ReturnType<typeof useLocalize>,
+) {
+  return localize(TRAIL_VERB_LABELS[direction][strength]);
 }
 
 function clamp(value: number) {
   return Math.max(0, Math.min(100, Math.round(value)));
 }
 
-function innerStateAge(generatedAt: string) {
+function innerStateAge(generatedAt: string, localize: ReturnType<typeof useLocalize>) {
   const elapsedMs = Math.max(0, Date.now() - new Date(generatedAt).getTime());
   const minutes = Math.floor(elapsedMs / 60000);
-  if (minutes < 1) return 'formed just now';
-  if (minutes < 60) return `formed ${minutes}m ago`;
+  if (minutes < 1) return localize('com_ui_feelings_formed_now');
+  if (minutes < 60) return localize('com_ui_feelings_formed_minutes', { 0: minutes });
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `formed ${hours}h ago`;
-  return `formed ${Math.floor(hours / 24)}d ago`;
+  if (hours < 24) return localize('com_ui_feelings_formed_hours', { 0: hours });
+  return localize('com_ui_feelings_formed_days', { 0: Math.floor(hours / 24) });
+}
+
+type FeelingRequestError = {
+  code?: string;
+  status?: number;
+  response?: {
+    status?: number;
+    data?: { code?: string; error?: { code?: string } };
+  };
+};
+
+function feelingRequestFailure(error: unknown) {
+  if (!error || typeof error !== 'object') {
+    return { status: undefined, code: undefined };
+  }
+  const failure = error as FeelingRequestError;
+  return {
+    status: failure.response?.status ?? failure.status,
+    code: failure.response?.data?.error?.code ?? failure.response?.data?.code ?? failure.code,
+  };
 }
 
 function motionValues(trail: FeelingTrailEntry[], bandId: FeelingBandId, current: number) {
@@ -173,7 +234,9 @@ function FeelingMotionTrail({
 }
 
 export default function FeelingsView() {
+  const location = useLocation();
   const navigate = useNavigate();
+  const localize = useLocalize();
   const feelings = useFeelingsQuery();
   const profileMutation = useUpdateFeelingsProfileMutation();
   const bandMutation = useUpdateFeelingBandMutation();
@@ -208,6 +271,12 @@ export default function FeelingsView() {
   const lastAnimatedTrailRef = useRef('');
   const rangePromptDraftRef = useRef(rangePromptDraft);
   const rangePromptSyncRef = useRef({ key: '', saved: '' });
+  const reactionInstructionRef = useRef(reactionInstruction);
+  const activationModeRef = useRef(activationMode);
+  const reactionSyncRef = useRef({
+    instruction: '',
+    activationMode: 'always' as typeof activationMode,
+  });
   const mutationPending =
     profileMutation.isLoading ||
     bandMutation.isLoading ||
@@ -215,6 +284,8 @@ export default function FeelingsView() {
     deleteMutation.isLoading;
   draggingBandIdRef.current = draggingBandId;
   rangePromptDraftRef.current = rangePromptDraft;
+  reactionInstructionRef.current = reactionInstruction;
+  activationModeRef.current = activationMode;
   const bandSyncSignature = state
     ? definitions
         .map((band) => {
@@ -303,11 +374,20 @@ export default function FeelingsView() {
 
   useEffect(() => {
     if (!state) return;
-    setReactionInstruction(
-      state.reactionInstruction || feelings.data?.config.reaction.defaultInstruction || '',
-    );
-    setActivationMode(state.reactionActivationMode);
-  }, [feelings.data?.config.reaction.defaultInstruction, state]);
+    const savedInstruction =
+      state.reactionInstruction || feelings.data?.config.reaction.defaultInstruction || '';
+    const previous = reactionSyncRef.current;
+    if (!drawerOpen || reactionInstructionRef.current === previous.instruction) {
+      setReactionInstruction(savedInstruction);
+    }
+    if (!drawerOpen || activationModeRef.current === previous.activationMode) {
+      setActivationMode(state.reactionActivationMode);
+    }
+    reactionSyncRef.current = {
+      instruction: savedInstruction,
+      activationMode: state.reactionActivationMode,
+    };
+  }, [drawerOpen, feelings.data?.config.reaction.defaultInstruction, state]);
 
   useEffect(() => {
     if (!drawerOpen) return;
@@ -321,14 +401,47 @@ export default function FeelingsView() {
     [definitions, state?.bands],
   );
 
-  async function runMutation(task: () => Promise<unknown>, success: string) {
+  function returnToChat() {
+    if (location.key !== 'default' || Number(window.history.state?.idx ?? 0) > 0) {
+      navigate(-1);
+      return;
+    }
+    navigate('/c/new', { replace: true });
+  }
+
+  async function runMutation(task: () => Promise<unknown>, success: string): Promise<boolean> {
     setNotice('');
     try {
       await task();
       setNotice(success);
-    } catch (_error) {
-      setNotice('Feelings changed elsewhere. The latest state has been reloaded.');
-      await feelings.refetch();
+      return true;
+    } catch (error) {
+      const failure = feelingRequestFailure(error);
+      if (failure.status === 409 && failure.code === 'FEELINGS_VERSION_CONFLICT') {
+        setNotice(localize('com_ui_feelings_error_conflict'));
+        await feelings.refetch();
+        return false;
+      }
+      if (failure.status === 401 || failure.status === 403) {
+        setNotice(localize('com_ui_feelings_error_forbidden'));
+        return false;
+      }
+      if (failure.status === 422 || failure.code === 'FEELINGS_VALIDATION_ERROR') {
+        setNotice(localize('com_ui_feelings_error_validation'));
+        return false;
+      }
+      if (
+        failure.status == null ||
+        failure.status >= 500 ||
+        failure.status === 408 ||
+        failure.status === 429 ||
+        failure.code === 'FEELINGS_UNAVAILABLE'
+      ) {
+        setNotice(localize('com_ui_feelings_error_unavailable'));
+        return false;
+      }
+      setNotice(localize('com_ui_feelings_error_save'));
+      return false;
     }
   }
 
@@ -407,7 +520,12 @@ export default function FeelingsView() {
       const bandName = definitions.find((item) => item.id === bandId)?.name ?? bandId;
       void runMutation(
         () => updateBandById(bandId, { [field]: nextValue }),
-        field === 'current' ? `${bandName} moved.` : `${bandName} nature changed.`,
+        localize(
+          field === 'current'
+            ? 'com_ui_feelings_band_moved'
+            : 'com_ui_feelings_band_nature_changed',
+          { 0: bandName },
+        ),
       );
     };
     const onCancel = () => {
@@ -447,7 +565,10 @@ export default function FeelingsView() {
     const bandName = definitions.find((item) => item.id === bandId)?.name ?? bandId;
     void runMutation(
       () => updateBandById(bandId, { [field]: preview }),
-      field === 'current' ? `${bandName} moved.` : `${bandName} nature changed.`,
+      localize(
+        field === 'current' ? 'com_ui_feelings_band_moved' : 'com_ui_feelings_band_nature_changed',
+        { 0: bandName },
+      ),
     );
   }
 
@@ -455,17 +576,24 @@ export default function FeelingsView() {
     return (
       <main className="feelings-view feelings-loading" aria-busy="true">
         <div className="feelings-orb" />
-        <span>Reading Viventium’s inner state…</span>
+        <span>{localize('com_ui_feelings_loading')}</span>
       </main>
     );
   }
 
   if (feelings.isError || !payload || !state || !definition || !selectedBand) {
+    const failure = feelingRequestFailure(feelings.error);
+    const message =
+      failure.status === 401 || failure.status === 403
+        ? 'com_ui_feelings_error_view_forbidden'
+        : failure.status != null && failure.status >= 500
+          ? 'com_ui_feelings_error_load_unavailable'
+          : 'com_ui_feelings_load_error';
     return (
       <main className="feelings-view feelings-loading">
-        <strong>Feelings could not be loaded.</strong>
+        <strong>{localize(message)}</strong>
         <button type="button" onClick={() => feelings.refetch()}>
-          Try again
+          {localize('com_ui_retry')}
         </button>
       </main>
     );
@@ -474,9 +602,9 @@ export default function FeelingsView() {
   if (!payload.config.available || !state.available) {
     return (
       <main className="feelings-view feelings-loading">
-        <strong>Feelings are not available in this Viventium configuration.</strong>
-        <button type="button" onClick={() => navigate('/c/new')}>
-          Return to chat
+        <strong>{localize('com_ui_feelings_configuration_unavailable')}</strong>
+        <button type="button" onClick={returnToChat}>
+          {localize('com_ui_back_to_chat')}
         </button>
       </main>
     );
@@ -490,14 +618,19 @@ export default function FeelingsView() {
   const health = state.reactionHealth;
   const healthLabel =
     health.status === 'running'
-      ? 'Reacting now'
+      ? localize('com_ui_feelings_health_running')
       : health.status === 'healthy'
-        ? `Ready · ${health.lastDurationMs ?? 0} ms last reaction`
+        ? localize('com_ui_feelings_health_ready', { 0: health.lastDurationMs ?? 0 })
         : health.status === 'degraded'
-          ? `Needs attention · ${health.lastErrorClass || 'reaction failed'}${health.lastErrorDetail ? ` · ${health.lastErrorDetail}` : ''}`
+          ? localize('com_ui_feelings_health_attention', {
+              0: health.lastErrorClass || localize('com_ui_feelings_health_reaction_failed'),
+              1: health.lastErrorDetail ? ` · ${health.lastErrorDetail}` : '',
+            })
           : health.status === 'skipped'
-            ? `Ready · last skipped (${health.lastSkipReason || 'not needed'})`
-            : 'Ready · waiting for the first reaction';
+            ? localize('com_ui_feelings_health_skipped', {
+                0: health.lastSkipReason || localize('com_ui_feelings_health_skip_not_needed'),
+              })
+            : localize('com_ui_feelings_health_waiting');
 
   return (
     <main className="feelings-view" style={selectedColorStyle}>
@@ -505,37 +638,40 @@ export default function FeelingsView() {
         <header className="feelings-topbar">
           <div className="feelings-brand">
             <button
-              className="feelings-back"
+              className="feelings-back min-h-6 min-w-6"
               type="button"
-              onClick={() => navigate('/c/new')}
-              aria-label="Back to chat"
+              onClick={returnToChat}
+              aria-label={localize('com_ui_back_to_chat')}
             >
-              <ArrowLeft size={16} />
+              <ArrowLeft size={16} aria-hidden="true" />
             </button>
-            <div className="feelings-brand-mark" aria-hidden="true" />
+            <ViventiumLogoIcon
+              className="feelings-brand-mark"
+              alt={localize('com_ui_logo', { 0: 'Viventium' })}
+            />
             <div>
-              <p>Viventium · Feelings</p>
-              <span>live inner state</span>
+              <p>{localize('com_ui_feelings_brand')}</p>
+              <span>{localize('com_ui_feelings_brand_description')}</span>
             </div>
           </div>
           <div className="feelings-actions">
             <button className="feelings-utility" type="button" onClick={() => setDrawerOpen(true)}>
-              Reaction Cortex
+              {localize('com_ui_feelings_reaction_cortex')}
             </button>
             <button
               className="feelings-utility reset-label"
               type="button"
-              aria-label="Reset state"
+              aria-label={localize('com_ui_feelings_reset_state')}
               disabled={mutationPending}
               onClick={() =>
                 void runMutation(
                   () => resetMutation.mutateAsync(state.version),
-                  'Returned every feeling to nature.',
+                  localize('com_ui_feelings_reset_complete'),
                 )
               }
             >
               <RotateCcw size={14} aria-hidden="true" />
-              <span>Reset state</span>
+              <span>{localize('com_ui_feelings_reset_state')}</span>
             </button>
             <button
               className="feelings-master-toggle"
@@ -546,11 +682,17 @@ export default function FeelingsView() {
               onClick={() =>
                 void runMutation(
                   () => updateProfile({ enabled: !state.enabled }),
-                  state.enabled ? 'Feelings are off.' : 'Feelings are awake.',
+                  localize(
+                    state.enabled
+                      ? 'com_ui_feelings_disabled_notice'
+                      : 'com_ui_feelings_enabled_notice',
+                  ),
                 )
               }
             >
-              <span>{state.enabled ? 'Feelings on' : 'Enable Feelings'}</span>
+              <span>
+                {localize(state.enabled ? 'com_ui_feelings_enabled' : 'com_ui_feelings_enable')}
+              </span>
               <i className="feelings-switch" aria-hidden="true" />
             </button>
           </div>
@@ -566,9 +708,9 @@ export default function FeelingsView() {
           <section className="feelings-primary" aria-labelledby="feelings-title">
             <div className="feelings-heading">
               <div>
-                <p className="feelings-kicker">Inner state</p>
-                <h1 id="feelings-title">Feeling spectrum</h1>
-                <p>Current feeling is the live signal. Nature is the resting line it returns to.</p>
+                <p className="feelings-kicker">{localize('com_ui_feelings_inner_state')}</p>
+                <h1 id="feelings-title">{localize('com_ui_feelings_spectrum')}</h1>
+                <p>{localize('com_ui_feelings_spectrum_description')}</p>
               </div>
               <div className="feelings-live-readout">
                 <span className={health.status === 'degraded' ? 'is-degraded' : ''} />
@@ -579,23 +721,25 @@ export default function FeelingsView() {
             {state.enabled && (
               <section className="feelings-inner-state" aria-live="polite">
                 <div>
-                  <span>Inner state · in Viv’s own words</span>
+                  <span>{localize('com_ui_feelings_own_words')}</span>
                   {state.innerState && (
                     <time dateTime={state.innerState.generatedAt}>
-                      Last felt sense · {innerStateAge(state.innerState.generatedAt)}
+                      {localize('com_ui_feelings_last_felt_sense', {
+                        0: innerStateAge(state.innerState.generatedAt, localize),
+                      })}
                     </time>
                   )}
                 </div>
-                <p>
-                  {state.innerState?.text ||
-                    'The next reaction will put this state into Viv’s own words.'}
-                </p>
+                <p>{state.innerState?.text || localize('com_ui_feelings_waiting_for_reaction')}</p>
               </section>
             )}
 
             <div className={`feelings-instrument ${state.enabled ? '' : 'is-off'}`}>
               <div className="feelings-heartbeat" aria-hidden="true" />
-              <div className="feelings-spectrum" aria-label={`${definitions.length} feeling bands`}>
+              <div
+                className="feelings-spectrum"
+                aria-label={localize('com_ui_feelings_band_count', { 0: definitions.length })}
+              >
                 {definitions.map((bandDefinition) => {
                   const band = state.bands[bandDefinition.id];
                   const preview = laneDrafts[bandDefinition.id];
@@ -615,13 +759,21 @@ export default function FeelingsView() {
                         type="button"
                         onClick={() => setSelectedId(bandDefinition.id)}
                         aria-pressed={selected}
-                        aria-label={`Select ${bandDefinition.name}: now ${current}, nature ${baseline}`}
+                        aria-label={localize('com_ui_feelings_band_select', {
+                          0: bandDefinition.name,
+                          1: current,
+                          2: baseline,
+                        })}
                       >
                         <i className="feelings-band-signal" aria-hidden="true" />
                         <span className="feelings-lane-name">{bandDefinition.name}</span>
                         <span className="feelings-lane-values">
-                          <b>NOW {current}</b>
-                          <i>NATURE {baseline}</i>
+                          <b>
+                            {localize('com_ui_feelings_now')} {current}
+                          </b>
+                          <i>
+                            {localize('com_ui_feelings_nature')} {baseline}
+                          </i>
                         </span>
                       </button>
                       <span className="feelings-pole feelings-pole-high">
@@ -654,11 +806,16 @@ export default function FeelingsView() {
                           style={{ bottom: `${baseline}%` }}
                           type="button"
                           role="slider"
-                          aria-label={`${bandDefinition.name} nature`}
+                          aria-label={localize('com_ui_feelings_band_nature', {
+                            0: bandDefinition.name,
+                          })}
                           aria-valuemin={0}
                           aria-valuemax={100}
                           aria-valuenow={baseline}
-                          aria-valuetext={`Nature: ${baseline}, toward ${bandDefinition.highLabel}`}
+                          aria-valuetext={localize('com_ui_feelings_nature_value', {
+                            0: baseline,
+                            1: bandDefinition.highLabel,
+                          })}
                           onPointerDown={(event) =>
                             beginLaneDrag(event, bandDefinition.id, 'baseline')
                           }
@@ -666,14 +823,18 @@ export default function FeelingsView() {
                             moveLaneWithKeyboard(event, bandDefinition.id, 'baseline', baseline)
                           }
                         >
-                          <span>N</span>
+                          <span aria-hidden="true">
+                            {localize('com_ui_feelings_nature').slice(0, 1)}
+                          </span>
                         </button>
                         <button
                           className="feelings-current-marker"
                           style={{ bottom: `${current}%` }}
                           type="button"
                           role="slider"
-                          aria-label={`${bandDefinition.name} current feeling`}
+                          aria-label={localize('com_ui_feelings_band_current', {
+                            0: bandDefinition.name,
+                          })}
                           aria-valuemin={0}
                           aria-valuemax={100}
                           aria-valuenow={current}
@@ -693,9 +854,11 @@ export default function FeelingsView() {
                       </span>
                       <div className="feelings-lane-footer">
                         <span className="feelings-word">
-                          {band.enabled ? feelingWord(bandDefinition, current) : 'not felt'}
+                          {band.enabled
+                            ? feelingWord(bandDefinition, current)
+                            : localize('com_ui_feelings_not_felt')}
                         </span>
-                        <span>{halfLifeLabel(band.halfLifeMinutes).replace(' half-life', '')}</span>
+                        <span>{halfLifeLabel(band.halfLifeMinutes, localize, true)}</span>
                       </div>
                     </article>
                   );
@@ -705,24 +868,21 @@ export default function FeelingsView() {
                 <div>
                   <span>
                     <i className="legend-current" />
-                    Current feeling
+                    {localize('com_ui_feelings_current')}
                   </span>
                   <span>
                     <i className="legend-nature" />
-                    Nature / resting line
+                    {localize('com_ui_feelings_nature_resting_line')}
                   </span>
                 </div>
-                <span>Drag either marker · arrows adjust · Shift + arrows moves 5</span>
+                <span>{localize('com_ui_feelings_marker_help')}</span>
               </div>
               {!state.enabled && (
                 <div className="feelings-off-overlay">
                   <div className="feelings-off-message">
                     <div className="feelings-off-orb" aria-hidden="true" />
-                    <strong>Feelings are off</strong>
-                    <span>
-                      No feeling state exists in Viventium’s prompt while off. The spectrum keeps
-                      returning toward nature.
-                    </span>
+                    <strong>{localize('com_ui_feelings_off')}</strong>
+                    <span>{localize('com_ui_feelings_off_description')}</span>
                   </div>
                 </div>
               )}
@@ -731,28 +891,33 @@ export default function FeelingsView() {
             <div className="feelings-state-details">
               <section className="feelings-capsule" aria-labelledby="capsule-title">
                 <div>
-                  <h3 id="capsule-title">What Viv feels</h3>
+                  <h3 id="capsule-title">{localize('com_ui_feelings_capsule')}</h3>
                   <span>
-                    {activeBands} of {definitions.length} felt
+                    {localize('com_ui_feelings_felt_count', {
+                      0: activeBands,
+                      1: definitions.length,
+                    })}
                   </span>
                 </div>
                 {state.capsule ? (
                   <pre>{state.capsule}</pre>
                 ) : (
-                  <p>No feeling-state block exists while Feelings are off.</p>
+                  <p>{localize('com_ui_feelings_capsule_empty')}</p>
                 )}
               </section>
 
               <section className="feelings-trail" aria-labelledby="trail-title">
                 <div>
                   <div>
-                    <h3 id="trail-title">Reaction trail</h3>
-                    <p>What moved the state · message text is not stored</p>
+                    <h3 id="trail-title">{localize('com_ui_feelings_reaction_trail')}</h3>
+                    <p>{localize('com_ui_feelings_reaction_trail_description')}</p>
                   </div>
-                  <span>last 10</span>
+                  <span>
+                    {localize('com_ui_feelings_trail_limit', { 0: VISIBLE_FEELING_TRAIL_LIMIT })}
+                  </span>
                 </div>
                 <div className="feelings-trail-list">
-                  {state.trail.length === 0 && <p>No reactions yet.</p>}
+                  {state.trail.length === 0 && <p>{localize('com_ui_feelings_trail_empty')}</p>}
                   {[...state.trail]
                     .slice(-VISIBLE_FEELING_TRAIL_LIMIT)
                     .reverse()
@@ -773,18 +938,20 @@ export default function FeelingsView() {
                           </time>
                           <div>
                             <em>
-                              {REACTION_CAUSE_LABELS[entry.cause] ||
-                                (entry.sourceType === 'user_turn'
-                                  ? 'The user moment'
-                                  : 'Manual change')}
+                              {localize(
+                                REACTION_CAUSE_LABELS[entry.cause] ||
+                                  (entry.sourceType === 'user_turn'
+                                    ? 'com_ui_feelings_trail_user_moment'
+                                    : 'com_ui_feelings_trail_manual_change'),
+                              )}
                             </em>
                             <strong>
                               {entryDefinition?.name || entry.band}{' '}
-                              {trailVerb(entry.direction, entry.strength)}
+                              {trailVerb(entry.direction, entry.strength, localize)}
                             </strong>
                             <span>
                               {Math.round(entry.before)} → {Math.round(entry.after)} ·{' '}
-                              {entry.sourceType.replace('_', ' ')}
+                              {localize(TRAIL_SOURCE_LABELS[entry.sourceType])}
                             </span>
                           </div>
                         </div>
@@ -796,22 +963,27 @@ export default function FeelingsView() {
 
             <details className="feelings-research">
               <summary>
-                <span>Future feeling research · visible here, never injected</span>
-                <span>{FUTURE_BANDS.length} inactive bands</span>
+                <span>{localize('com_ui_feelings_research')}</span>
+                <span>
+                  {localize('com_ui_feelings_research_count', { 0: FUTURE_BANDS.length })}
+                </span>
               </summary>
               <div>
                 {FUTURE_BANDS.map((band) => (
-                  <span key={band}>{band}</span>
+                  <span key={band}>{localize(band)}</span>
                 ))}
               </div>
             </details>
           </section>
 
-          <aside className="feelings-inspector" aria-label="Selected feeling controls">
+          <aside
+            className="feelings-inspector"
+            aria-label={localize('com_ui_feelings_selected_controls')}
+          >
             <div className="feelings-inspector-header">
               <div>
                 <div className="feelings-selected-signal" aria-hidden="true" />
-                <p className="feelings-kicker">Selected feeling</p>
+                <p className="feelings-kicker">{localize('com_ui_feelings_selected')}</p>
                 <h2>{definition.name}</h2>
                 <p>{definition.description}</p>
               </div>
@@ -824,13 +996,16 @@ export default function FeelingsView() {
                 onClick={() =>
                   void runMutation(
                     () => updateBand({ enabled: !selectedBand.enabled }),
-                    selectedBand.enabled
-                      ? `${definition.name} is no longer felt.`
-                      : `${definition.name} is felt again.`,
+                    localize(
+                      selectedBand.enabled
+                        ? 'com_ui_feelings_band_disabled'
+                        : 'com_ui_feelings_band_enabled',
+                      { 0: definition.name },
+                    ),
                   )
                 }
               >
-                <span>Felt</span>
+                <span>{localize('com_ui_feelings_felt')}</span>
                 <i className="feelings-switch" aria-hidden="true" />
               </button>
             </div>
@@ -838,15 +1013,18 @@ export default function FeelingsView() {
             <div className="feelings-felt-readout">
               <div>
                 <strong>{feelingWord(definition, draftCurrent)}</strong>
-                <span>{deltaLabel(draftCurrent, draftBaseline)}</span>
+                <span>{deltaLabel(draftCurrent, draftBaseline, localize)}</span>
               </div>
-              <div className="feelings-state-compare" aria-label="Current and Nature values">
+              <div
+                className="feelings-state-compare"
+                aria-label={localize('com_ui_feelings_comparison')}
+              >
                 <span className="is-current">
-                  <i>NOW</i>
+                  <i>{localize('com_ui_feelings_now')}</i>
                   <b>{draftCurrent}</b>
                 </span>
                 <span className="is-nature">
-                  <i>NATURE</i>
+                  <i>{localize('com_ui_feelings_nature')}</i>
                   <b>{draftBaseline}</b>
                 </span>
               </div>
@@ -855,13 +1033,13 @@ export default function FeelingsView() {
             <div className="feelings-control is-current">
               <label htmlFor="feeling-current">
                 <span>
-                  <i>NOW</i> Current feeling
+                  <i>{localize('com_ui_feelings_now')}</i> {localize('com_ui_feelings_current')}
                 </span>
                 <output>{draftCurrent}</output>
               </label>
               <input
                 id="feeling-current"
-                aria-label="Current feeling"
+                aria-label={localize('com_ui_feelings_current')}
                 aria-valuetext={`${feelingWord(definition, draftCurrent)}, ${draftCurrent}; ${definition.lowLabel} to ${definition.highLabel}`}
                 type="range"
                 min="0"
@@ -872,14 +1050,14 @@ export default function FeelingsView() {
                 onPointerUp={() =>
                   void runMutation(
                     () => updateBand({ current: draftCurrent }),
-                    `${definition.name} moved.`,
+                    localize('com_ui_feelings_band_moved', { 0: definition.name }),
                   )
                 }
                 onKeyUp={(event) => {
                   if (!RANGE_COMMIT_KEYS.has(event.key)) return;
                   void runMutation(
                     () => updateBand({ current: draftCurrent }),
-                    `${definition.name} moved.`,
+                    localize('com_ui_feelings_band_moved', { 0: definition.name }),
                   );
                 }}
               />
@@ -892,13 +1070,14 @@ export default function FeelingsView() {
             <div className="feelings-control is-nature">
               <label htmlFor="feeling-nature">
                 <span>
-                  <i>NATURE</i> Resting point
+                  <i>{localize('com_ui_feelings_nature')}</i>{' '}
+                  {localize('com_ui_feelings_resting_point')}
                 </span>
                 <output>{draftBaseline}</output>
               </label>
               <input
                 id="feeling-nature"
-                aria-label="Nature / resting point"
+                aria-label={localize('com_ui_feelings_nature_resting_point')}
                 aria-valuetext={`${feelingWord(definition, draftBaseline)}, ${draftBaseline}; ${definition.lowLabel} to ${definition.highLabel}`}
                 className="is-nature"
                 type="range"
@@ -910,14 +1089,14 @@ export default function FeelingsView() {
                 onPointerUp={() =>
                   void runMutation(
                     () => updateBand({ baseline: draftBaseline }),
-                    `${definition.name} nature changed.`,
+                    localize('com_ui_feelings_band_nature_changed', { 0: definition.name }),
                   )
                 }
                 onKeyUp={(event) => {
                   if (!RANGE_COMMIT_KEYS.has(event.key)) return;
                   void runMutation(
                     () => updateBand({ baseline: draftBaseline }),
-                    `${definition.name} nature changed.`,
+                    localize('com_ui_feelings_band_nature_changed', { 0: definition.name }),
                   );
                 }}
               />
@@ -929,12 +1108,12 @@ export default function FeelingsView() {
 
             <div className="feelings-control">
               <label htmlFor="feeling-return">
-                <span>Return speed</span>
-                <output>{halfLifeLabel(draftHalfLife)}</output>
+                <span>{localize('com_ui_feelings_return_speed')}</span>
+                <output>{halfLifeLabel(draftHalfLife, localize)}</output>
               </label>
               <select
                 id="feeling-return"
-                aria-label="Return speed"
+                aria-label={localize('com_ui_feelings_return_speed')}
                 value={draftHalfLife}
                 disabled={mutationPending}
                 onChange={(event) => {
@@ -942,16 +1121,16 @@ export default function FeelingsView() {
                   setDraftHalfLife(next);
                   void runMutation(
                     () => updateBand({ halfLifeMinutes: next }),
-                    `${definition.name} return speed changed.`,
+                    localize('com_ui_feelings_return_speed_changed', { 0: definition.name }),
                   );
                 }}
               >
                 {!RETURN_SPEEDS.some((speed) => speed.value === draftHalfLife) && (
-                  <option value={draftHalfLife}>{halfLifeLabel(draftHalfLife)}</option>
+                  <option value={draftHalfLife}>{halfLifeLabel(draftHalfLife, localize)}</option>
                 )}
                 {RETURN_SPEEDS.map((speed) => (
                   <option key={speed.value} value={speed.value}>
-                    {speed.label}
+                    {localize(speed.label)}
                   </option>
                 ))}
               </select>
@@ -960,15 +1139,19 @@ export default function FeelingsView() {
             <section className="feelings-range-editor" aria-labelledby="range-editor-title">
               <div className="feelings-range-heading">
                 <div>
-                  <h3 id="range-editor-title">Feeling ranges</h3>
-                  <p>Shape how each depth is felt. Only the current range reaches Viv.</p>
+                  <h3 id="range-editor-title">{localize('com_ui_feelings_ranges')}</h3>
+                  <p>{localize('com_ui_feelings_ranges_description')}</p>
                 </div>
-                <span>{state.rangePromptOverrideCount} customized</span>
+                <span>
+                  {localize('com_ui_feelings_ranges_customized', {
+                    0: state.rangePromptOverrideCount,
+                  })}
+                </span>
               </div>
               <div
                 className="feelings-range-tabs"
                 role="tablist"
-                aria-label={`${definition.name} feeling ranges`}
+                aria-label={localize('com_ui_feelings_band_ranges', { 0: definition.name })}
               >
                 {definition.levels.map((level, levelIndex) => {
                   const isActive = level.id === activeLevel.id;
@@ -986,7 +1169,13 @@ export default function FeelingsView() {
                       aria-selected={isSelected}
                       aria-controls={`feeling-range-panel-${definition.id}-${level.id}`}
                       tabIndex={isSelected ? 0 : -1}
-                      aria-label={`${level.min}–${level.max}: ${level.word}${isActive ? ', current range' : ''}${isCustomized ? ', customized' : ''}`}
+                      aria-label={localize('com_ui_feelings_range_label', {
+                        0: level.min,
+                        1: level.max,
+                        2: level.word,
+                        3: isActive ? localize('com_ui_feelings_current_range') : '',
+                        4: isCustomized ? localize('com_ui_feelings_customized_range') : '',
+                      })}
                       onClick={() => setSelectedRangeLevelId(level.id)}
                       onKeyDown={(event) => {
                         const lastIndex = definition.levels.length - 1;
@@ -1016,8 +1205,8 @@ export default function FeelingsView() {
                       </i>
                       <strong>{level.word}</strong>
                       <span>
-                        {isActive && <b>NOW</b>}
-                        {isCustomized && <b>CUSTOM</b>}
+                        {isActive && <b>{localize('com_ui_feelings_now')}</b>}
+                        {isCustomized && <b>{localize('com_ui_feelings_custom')}</b>}
                       </span>
                     </button>
                   );
@@ -1030,23 +1219,27 @@ export default function FeelingsView() {
                 aria-labelledby={`feeling-range-tab-${definition.id}-${selectedRangeLevel.id}`}
               >
                 <div className="feelings-range-default">
-                  <span>Default felt cause</span>
+                  <span>{localize('com_ui_feelings_range_default')}</span>
                   <p>{selectedRangeLevel.instruction}</p>
                 </div>
                 <label className="feelings-range-addition" htmlFor="feeling-range-addition">
-                  <span>Your optional addition</span>
+                  <span>{localize('com_ui_feelings_range_addition')}</span>
                   <textarea
                     id="feeling-range-addition"
-                    aria-label={`Your added feeling for ${selectedRangeLevel.word}`}
+                    aria-label={localize('com_ui_feelings_range_added_for', {
+                      0: selectedRangeLevel.word,
+                    })}
                     maxLength={MAX_FEELING_RANGE_PROMPT_CHARS}
                     value={rangePromptDraft}
-                    placeholder="Add a more personal felt pull for this range…"
+                    placeholder={localize('com_ui_feelings_range_placeholder')}
                     disabled={mutationPending}
                     onChange={(event) => setRangePromptDraft(event.target.value)}
                   />
                   <small>
-                    Added after the default · {rangePromptDraft.length}/
-                    {MAX_FEELING_RANGE_PROMPT_CHARS}
+                    {localize('com_ui_feelings_range_limit', {
+                      0: rangePromptDraft.length,
+                      1: MAX_FEELING_RANGE_PROMPT_CHARS,
+                    })}
                   </small>
                 </label>
                 <div className="feelings-range-actions">
@@ -1062,11 +1255,14 @@ export default function FeelingsView() {
                               instruction: null,
                             },
                           }),
-                        `${definition.name} ${selectedRangeLevel.word} restored.`,
+                        localize('com_ui_feelings_range_restored', {
+                          0: definition.name,
+                          1: selectedRangeLevel.word,
+                        }),
                       )
                     }
                   >
-                    Restore default range feeling
+                    {localize('com_ui_feelings_range_restore')}
                   </button>
                   <button
                     className="is-primary"
@@ -1085,11 +1281,14 @@ export default function FeelingsView() {
                               instruction: rangePromptDraft.trim(),
                             },
                           }),
-                        `${definition.name} ${selectedRangeLevel.word} customized.`,
+                        localize('com_ui_feelings_range_saved', {
+                          0: definition.name,
+                          1: selectedRangeLevel.word,
+                        }),
                       )
                     }
                   >
-                    Save range feeling
+                    {localize('com_ui_feelings_range_save')}
                   </button>
                 </div>
               </div>
@@ -1102,25 +1301,22 @@ export default function FeelingsView() {
         <button
           className="feelings-drawer-backdrop is-visible"
           type="button"
-          aria-label="Close Reaction Cortex"
+          aria-label={localize('com_ui_feelings_reaction_close')}
           onClick={() => setDrawerOpen(false)}
         />
         <DialogPanel className="feelings-drawer is-open">
           <div className="feelings-drawer-header">
             <div>
-              <p className="feelings-kicker">Subconscious writer</p>
+              <p className="feelings-kicker">{localize('com_ui_feelings_reaction_subconscious')}</p>
               <DialogTitle as="h2" id="reaction-title">
-                Emotional Reaction Cortex
+                {localize('com_ui_feelings_reaction_cortex_title')}
               </DialogTitle>
-              <p>
-                It reacts after the visible reply and moves the next state. It never delays the
-                reply.
-              </p>
+              <p>{localize('com_ui_feelings_reaction_description')}</p>
             </div>
             <button
               type="button"
               onClick={() => setDrawerOpen(false)}
-              aria-label="Close Reaction Cortex"
+              aria-label={localize('com_ui_feelings_reaction_close')}
             >
               <X size={18} />
             </button>
@@ -1130,25 +1326,39 @@ export default function FeelingsView() {
             <div>
               <strong>{healthLabel}</strong>
               <small>
-                Primary: {health.requestedModel || payload.config.reaction.model} ·{' '}
-                {payload.config.reaction.fast ? 'Fast' : payload.config.reaction.serviceTier}
+                {localize('com_ui_feelings_reaction_primary', {
+                  0: health.requestedModel || payload.config.reaction.model,
+                  1: payload.config.reaction.fast
+                    ? localize('com_ui_feelings_fast')
+                    : payload.config.reaction.serviceTier,
+                })}
                 {payload.config.reaction.fallbackProvider !== 'none' &&
                   payload.config.reaction.fallbackModel && (
                     <>
                       <br />
-                      Fallback: {payload.config.reaction.fallbackModel}
+                      {localize('com_ui_feelings_reaction_fallback', {
+                        0: payload.config.reaction.fallbackModel,
+                      })}
                     </>
                   )}
                 {health.lastUsedModel && (
                   <>
                     <br />
-                    Last route: {health.lastUsedModel}
-                    {health.lastUsedServiceTier ? ` · ${health.lastUsedServiceTier}` : ''}
+                    {health.lastUsedServiceTier
+                      ? localize('com_ui_feelings_reaction_last_route', {
+                          0: health.lastUsedModel,
+                          1: health.lastUsedServiceTier,
+                        })
+                      : localize('com_ui_feelings_reaction_last_route_without_tier', {
+                          0: health.lastUsedModel,
+                        })}
                     {health.lastFallbackUsed
-                      ? ` · fallback${
+                      ? ` · ${
                           health.lastPrimaryErrorClass
-                            ? ` after ${health.lastPrimaryErrorClass.replaceAll('_', ' ')}`
-                            : ''
+                            ? localize('com_ui_feelings_reaction_fallback_after', {
+                                0: health.lastPrimaryErrorClass.replaceAll('_', ' '),
+                              })
+                            : localize('com_ui_feelings_reaction_fallback_used')
                         }`
                       : ''}
                   </>
@@ -1157,36 +1367,41 @@ export default function FeelingsView() {
             </div>
           </div>
           <div className="feelings-drawer-field">
-            <label htmlFor="reaction-activation">When should it activate?</label>
+            <label htmlFor="reaction-activation">
+              {localize('com_ui_feelings_reaction_activation')}
+            </label>
             <select
               id="reaction-activation"
               value={activationMode}
               onChange={(event) => setActivationMode(event.target.value as typeof activationMode)}
             >
-              <option value="always">Always · default</option>
-              <option value="classified">Only when the moment could move a feeling</option>
-              <option value="disabled">Never</option>
+              <option value="always">{localize('com_ui_feelings_reaction_always')}</option>
+              <option value="classified">{localize('com_ui_feelings_reaction_classified')}</option>
+              <option value="disabled">{localize('com_ui_feelings_reaction_disabled')}</option>
             </select>
           </div>
           <div className="feelings-drawer-field">
-            <label htmlFor="reaction-instruction">How should the subconscious react?</label>
+            <label htmlFor="reaction-instruction">
+              {localize('com_ui_feelings_reaction_instruction')}
+            </label>
             <textarea
               id="reaction-instruction"
               value={reactionInstruction}
               onChange={(event) => setReactionInstruction(event.target.value)}
             />
-            <p>
-              This belongs to the Reaction Cortex only. It is not added to Viventium’s speaking
-              prompt.
-            </p>
+            <p>{localize('com_ui_feelings_reaction_instruction_description')}</p>
           </div>
           <div className="feelings-drawer-field">
-            <span className="feelings-kicker">Context it receives</span>
+            <span className="feelings-kicker">{localize('com_ui_feelings_reaction_context')}</span>
             <ul>
-              <li>current state</li>
-              <li>band natures</li>
-              <li>last 10 changes</li>
-              <li>latest stimulus</li>
+              <li>{localize('com_ui_feelings_reaction_context_state')}</li>
+              <li>{localize('com_ui_feelings_reaction_context_natures')}</li>
+              <li>
+                {localize('com_ui_feelings_reaction_context_changes', {
+                  0: VISIBLE_FEELING_TRAIL_LIMIT,
+                })}
+              </li>
+              <li>{localize('com_ui_feelings_reaction_context_stimulus')}</li>
             </ul>
           </div>
           <div className="feelings-drawer-actions">
@@ -1195,16 +1410,16 @@ export default function FeelingsView() {
               className="is-danger"
               disabled={mutationPending}
               onClick={() => {
-                if (!window.confirm('Turn off Feelings and permanently erase its saved state?')) {
+                if (!window.confirm(localize('com_ui_feelings_erase_confirmation'))) {
                   return;
                 }
                 void runMutation(async () => {
                   await deleteMutation.mutateAsync(state.version);
                   setDrawerOpen(false);
-                }, 'Feelings were turned off and erased.');
+                }, localize('com_ui_feelings_erased'));
               }}
             >
-              Turn off & erase
+              {localize('com_ui_feelings_erase')}
             </button>
             <button
               type="button"
@@ -1212,7 +1427,7 @@ export default function FeelingsView() {
                 setReactionInstruction(feelings.data.config.reaction.defaultInstruction)
               }
             >
-              <RotateCcw size={14} /> Restore wording
+              <RotateCcw size={14} /> {localize('com_ui_feelings_restore_wording')}
             </button>
             <button
               className="is-primary"
@@ -1225,11 +1440,13 @@ export default function FeelingsView() {
                       reactionInstruction: reactionInstruction.trim(),
                       reactionActivationMode: activationMode,
                     }),
-                  'Reaction Cortex updated.',
-                ).then(() => setDrawerOpen(false))
+                  localize('com_ui_feelings_reaction_saved'),
+                ).then((saved) => {
+                  if (saved) setDrawerOpen(false);
+                })
               }
             >
-              Done
+              {localize('com_ui_done')}
             </button>
           </div>
         </DialogPanel>

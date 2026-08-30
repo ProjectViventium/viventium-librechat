@@ -8,19 +8,25 @@ const {
 describe('sourceComponentStartAgentIds', () => {
   test('preserves ordinary DAG entrypoints', () => {
     expect(
-      sourceComponentStartAgentIds(['researcher', 'reviewer', 'writer'], [
-        { from: 'researcher', to: 'reviewer' },
-        { from: 'reviewer', to: 'writer' },
-      ]),
+      sourceComponentStartAgentIds(
+        ['researcher', 'reviewer', 'writer'],
+        [
+          { from: 'researcher', to: 'reviewer' },
+          { from: 'reviewer', to: 'writer' },
+        ],
+      ),
     ).toEqual(['researcher']);
   });
 
   test('starts the primary handoff cycle and an unconnected added conversation', () => {
     expect(
-      sourceComponentStartAgentIds(['main', 'specialist', 'main____1'], [
-        { from: 'main', to: 'specialist' },
-        { from: 'specialist', to: 'main' },
-      ]),
+      sourceComponentStartAgentIds(
+        ['main', 'specialist', 'main____1'],
+        [
+          { from: 'main', to: 'specialist' },
+          { from: 'specialist', to: 'main' },
+        ],
+      ),
     ).toEqual(['main', 'main____1']);
   });
 
@@ -36,7 +42,9 @@ test('patch installs the source-component starts on a compatible graph runtime',
     this.computed = true;
   };
 
-  expect(installLibreChatAgentsGraphStartPatch({ MultiAgentGraph: FakeMultiAgentGraph })).toBe(true);
+  expect(installLibreChatAgentsGraphStartPatch({ MultiAgentGraph: FakeMultiAgentGraph })).toBe(
+    true,
+  );
   const graph = new FakeMultiAgentGraph();
   graph.agentContexts = new Map([
     ['main', {}],

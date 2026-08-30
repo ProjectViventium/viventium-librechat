@@ -21,8 +21,7 @@ module.exports = createGlassHiveTerminalCallbackOutboxService({
   ResultModel: GlassHiveTerminalCallbackResult,
   OutboxModel: ViventiumGlassHiveCallbackEffectOutbox,
   fenceAcceptedOperation: fenceGlassHiveTerminalCallbackAcceptedOperation,
-  acquireAcceptedOperationEffectLease:
-    acquireGlassHiveTerminalCallbackAcceptedOperationEffectLease,
+  acquireAcceptedOperationEffectLease: acquireGlassHiveTerminalCallbackAcceptedOperationEffectLease,
   fenceEffectTransaction: fenceGlassHiveTerminalCallbackEffectTransaction,
   releaseEffectLease: releaseGlassHiveTerminalCallbackEffectLease,
   runTransaction: runGlassHiveTerminalCallbackTransaction,

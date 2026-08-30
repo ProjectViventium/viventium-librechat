@@ -13,9 +13,22 @@ import type {
   LogicalTurnClaim,
   InteractionDeliveryAck,
   DeliveryAcknowledgementResult,
+  DeliveryAcknowledgementBindingResult,
+  SourceOrderObservation,
+  SourceOrderObservationResult,
+  CortexPresentationBinding,
 } from '~/stream/interfaces/IJobStore';
 
+function sourceOrderScopeDigest(sourceOrderScope: string): string {
+  return createHash('sha256')
+    .update(`viventium.source-order.v1\0${sourceOrderScope}`)
+    .digest('hex');
+}
+
 function logicalTurnScopeDigest(userId: string, interactionContext: InteractionContext): string {
+  if (interactionContext.source_order_scope) {
+    return sourceOrderScopeDigest(interactionContext.source_order_scope);
+  }
   return createHash('sha256')
     .update(
       [
@@ -26,6 +39,10 @@ function logicalTurnScopeDigest(userId: string, interactionContext: InteractionC
       ].join('\u0000'),
     )
     .digest('hex');
+}
+
+function logicalTurnScopeDigestFromKey(key: string): string | null {
+  return /^stream:logical:\{([a-f0-9]{64})\}$/.exec(key)?.[1] ?? null;
 }
 
 /**
@@ -41,6 +58,8 @@ function logicalTurnScopeDigest(userId: string, interactionContext: InteractionC
 const KEYS = {
   /** Job metadata: stream:{streamId}:job */
   job: (streamId: string) => `stream:{${streamId}}:job`,
+  /** Durable first-claim ownership, co-slotted with the job. */
+  streamOwner: (streamId: string) => `stream:{${streamId}}:owner`,
   /** Chunk stream (Redis Streams): stream:{streamId}:chunks */
   chunks: (streamId: string) => `stream:{${streamId}}:chunks`,
   /** Run steps: stream:{streamId}:runsteps */
@@ -52,6 +71,16 @@ const KEYS = {
   /** Atomic logical-turn claim state, deliberately separate from stream payload storage. */
   logicalTurn: (userId: string, interactionContext: InteractionContext) => {
     const scope = logicalTurnScopeDigest(userId, interactionContext);
+    return `stream:logical:{${scope}}`;
+  },
+  /** Source watermark co-slots with its logical turn for atomic presentation fencing. */
+  sourceOrder: (sourceOrderScope: string) => {
+    const scope = sourceOrderScopeDigest(sourceOrderScope);
+    return `stream:source-order:{${scope}}`;
+  },
+  sourceOrderFromScopeDigest: (scopeDigest: string) => `stream:source-order:{${scopeDigest}}`,
+  logicalTurnFromSourceOrderScope: (sourceOrderScope: string) => {
+    const scope = sourceOrderScopeDigest(sourceOrderScope);
     return `stream:logical:{${scope}}`;
   },
   /** New logical IDs carry only the irreversible scope digest needed for atomic owner lookup. */
@@ -83,6 +112,8 @@ const DEFAULT_TTL = {
   chunksAfterComplete: 0,
   /** TTL for run steps after completion (0 = delete immediately) */
   runStepsAfterComplete: 0,
+  /** TTL for inactive source watermarks (5 minutes). */
+  sourceOrder: 300,
 };
 
 /**
@@ -115,9 +146,13 @@ export interface RedisJobStoreOptions {
   chunksAfterCompleteTtl?: number;
   /** TTL for run steps after completion in seconds (default: 0 = delete immediately) */
   runStepsAfterCompleteTtl?: number;
+  /** TTL for inactive source-order watermarks in seconds (default: 300). */
+  sourceOrderTtl?: number;
 }
 
 export class RedisJobStore implements IJobStore {
+  readonly sourceOrderDurability = 'durable' as const;
+
   private redis: Redis | Cluster;
   private cleanupInterval: NodeJS.Timeout | null = null;
   private ttl: typeof DEFAULT_TTL;
@@ -149,6 +184,7 @@ export class RedisJobStore implements IJobStore {
       running: options?.runningTtl ?? DEFAULT_TTL.running,
       chunksAfterComplete: options?.chunksAfterCompleteTtl ?? DEFAULT_TTL.chunksAfterComplete,
       runStepsAfterComplete: options?.runStepsAfterCompleteTtl ?? DEFAULT_TTL.runStepsAfterComplete,
+      sourceOrder: Math.max(1, options?.sourceOrderTtl ?? DEFAULT_TTL.sourceOrder),
     };
     // Detect cluster mode using ioredis's isCluster property
     this.isCluster = (redis as Cluster).isCluster === true;
@@ -210,6 +246,47 @@ export class RedisJobStore implements IJobStore {
 
     logger.debug(`[RedisJobStore] Created job: ${streamId}`);
     return job;
+  }
+
+  async observeSourceOrder(
+    observation: SourceOrderObservation,
+  ): Promise<SourceOrderObservationResult> {
+    const result = (await this.redis.eval(
+      `local requested = tonumber(ARGV[1])
+       local current = tonumber(redis.call('HGET', KEYS[1], 'latestSourceSequence') or '-1')
+       local observed_at = redis.call('HGET', KEYS[1], 'sourceOrderObservedAt') or ''
+       local stale = current > requested
+       if requested > current then
+         local server_time = redis.call('TIME')
+         observed_at = tostring(
+           tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
+         )
+         current = requested
+         redis.call('HSET', KEYS[1],
+           'latestSourceSequence', tostring(current),
+           'sourceOrderObservedAt', observed_at)
+       end
+       local target_ttl = tonumber(ARGV[2])
+       if redis.call('HGET', KEYS[2], 'active') == '1' then
+         target_ttl = math.max(target_ttl, tonumber(ARGV[3]))
+       end
+       local current_ttl = redis.call('TTL', KEYS[1])
+       if current_ttl < target_ttl then
+         redis.call('EXPIRE', KEYS[1], target_ttl)
+       end
+       return {tostring(current), observed_at, stale and '1' or '0'}`,
+      2,
+      KEYS.sourceOrder(observation.source_order_scope),
+      KEYS.logicalTurnFromSourceOrderScope(observation.source_order_scope),
+      observation.source_sequence,
+      this.ttl.sourceOrder,
+      this.ttl.running,
+    )) as [string, string, string];
+    return {
+      latest_source_sequence: Number(result[0]),
+      observed_at: Number(result[1]),
+      stale: result[2] === '1',
+    };
   }
 
   async claimLogicalTurn(
@@ -441,7 +518,13 @@ export class RedisJobStore implements IJobStore {
     if (!ownerScopeKey) {
       return { status: 'not_found' };
     }
-    const encoded = JSON.stringify(acknowledgement);
+    const scopeDigest = logicalTurnScopeDigestFromKey(ownerScopeKey);
+    const sourceOrderKey = scopeDigest
+      ? KEYS.sourceOrderFromScopeDigest(scopeDigest)
+      : ownerScopeKey;
+    const recordedInput = { ...acknowledgement };
+    delete recordedInput.presentation_committed_at;
+    const encoded = JSON.stringify(recordedInput);
     const result = (await this.redis.eval(
       `if redis.call('HGET', KEYS[1], 'logicalTurnId') ~= ARGV[1] then
          return {'not_found', ''}
@@ -459,25 +542,46 @@ export class RedisJobStore implements IJobStore {
        if owner_stream_id == '' then
          return {'stale_revision', ''}
        end
-       if requested_revision < current_revision and ARGV[4] == 'committed' then
-         return {'stale_revision', ''}
-       end
        local ack_key = 'deliveryAck:' .. ARGV[1] .. ':' .. ARGV[2]
+       local ack_input_key = 'deliveryAckInput:' .. ARGV[1] .. ':' .. ARGV[2]
        local existing = redis.call('HGET', KEYS[1], ack_key)
        if existing then
-         if existing == ARGV[3] then
+         local existing_input = redis.call('HGET', KEYS[1], ack_input_key)
+         if existing_input == ARGV[3] or (not existing_input and existing == ARGV[3]) then
            return {'recorded', existing, owner_stream_id}
          end
          return {'conflict', existing}
        end
-       redis.call('HSET', KEYS[1], ack_key, ARGV[3])
+       if requested_revision < current_revision and ARGV[4] == 'committed' then
+         return {'stale_revision', ''}
+       end
+       if ARGV[4] == 'committed' or ARGV[4] == 'committed_effect' then
+         local source_sequence = tonumber(redis.call(
+           'HGET', KEYS[1], 'sourceSequenceForRevision:' .. tostring(requested_revision)
+         ) or '')
+         local latest_source_sequence = tonumber(
+           redis.call('HGET', KEYS[2], 'latestSourceSequence') or ''
+         )
+         if source_sequence and latest_source_sequence and latest_source_sequence > source_sequence then
+           return {'stale_source_order', '', owner_stream_id}
+         end
+       end
+       local recorded = ARGV[3]
+       if ARGV[4] == 'committed' or ARGV[4] == 'committed_effect' then
+         local server_time = redis.call('TIME')
+         local decoded = cjson.decode(ARGV[3])
+         decoded.presentation_committed_at = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
+         recorded = cjson.encode(decoded)
+       end
+       redis.call('HSET', KEYS[1], ack_key, recorded, ack_input_key, ARGV[3])
        if requested_revision == current_revision and (ARGV[4] == 'committed' or ARGV[4] == 'failed') then
          redis.call('HSET', KEYS[1], 'active', '0')
        end
        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
-       return {'recorded_new', ARGV[3], owner_stream_id}`,
-      1,
+       return {'recorded_new', recorded, owner_stream_id}`,
+      2,
       ownerScopeKey,
+      sourceOrderKey,
       acknowledgement.logical_turn_id,
       acknowledgement.revision,
       encoded,
@@ -485,7 +589,12 @@ export class RedisJobStore implements IJobStore {
       this.ttl.completed,
     )) as [string, string, string];
 
-    if (result[0] === 'not_found' || result[0] === 'stale_revision' || result[0] === 'conflict') {
+    if (
+      result[0] === 'not_found' ||
+      result[0] === 'stale_revision' ||
+      result[0] === 'stale_source_order' ||
+      result[0] === 'conflict'
+    ) {
       return { status: result[0] };
     }
     if (!KEYS.logicalTurnFromId(acknowledgement.logical_turn_id)) {
@@ -566,6 +675,129 @@ export class RedisJobStore implements IJobStore {
         await pipeline.exec();
       }
     }
+  }
+
+  /** Atomically bind one exact Cortex presentation generation to its durable stream job. */
+  async bindCortexPresentation(
+    streamId: string,
+    binding: CortexPresentationBinding,
+  ): Promise<boolean> {
+    const result = await this.redis.eval(
+      `if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+       local current_json = redis.call('HGET', KEYS[1], 'cortexPresentation')
+       if current_json then
+         local current = cjson.decode(current_json)
+         local incoming = cjson.decode(ARGV[1])
+         if incoming.revision < current.revision or incoming.generation < current.generation then
+           return 0
+         end
+         if incoming.revision == current.revision and incoming.generation == current.generation then
+           if incoming.ownerId ~= current.ownerId or
+              incoming.messageId ~= current.messageId or
+              incoming.parentMessageId ~= current.parentMessageId or
+              incoming.claimToken ~= current.claimToken or
+              incoming.presentationLeaseToken ~= current.presentationLeaseToken or
+              cjson.encode(incoming.deliveryIds) ~= cjson.encode(current.deliveryIds) or
+              cjson.encode(incoming.deliveryReceipts) ~= cjson.encode(current.deliveryReceipts) then
+             return 0
+           end
+           return 1
+         end
+       end
+       redis.call('HSET', KEYS[1], 'cortexPresentation', ARGV[1])
+       return 1`,
+      1,
+      KEYS.job(streamId),
+      JSON.stringify(binding),
+    );
+    return Number(result) === 1;
+  }
+
+  /** Compare-and-bind an acknowledgement to the expected Cortex generation. */
+  async bindDeliveryAcknowledgement(
+    streamId: string,
+    acknowledgement: InteractionDeliveryAck,
+    expectedCortexPresentation: CortexPresentationBinding | null,
+  ): Promise<DeliveryAcknowledgementBindingResult> {
+    const acknowledgementInput = { ...acknowledgement };
+    delete acknowledgementInput.presentation_committed_at;
+    const result = (await this.redis.eval(
+      `if redis.call('EXISTS', KEYS[1]) == 0 then return {'not_found', '', '', '0'} end
+       if ARGV[2] == '' then
+         redis.call('HSET', KEYS[1], 'deliveryAcknowledgement', ARGV[1])
+         return {'recorded', '', ARGV[1], '0'}
+       end
+       local current_json = redis.call('HGET', KEYS[1], 'cortexPresentation')
+       if not current_json then return {'retryable_conflict', '', '', '0'} end
+       local current = cjson.decode(current_json)
+       local expected = cjson.decode(ARGV[2])
+       if current.ownerId ~= expected.ownerId or
+          current.messageId ~= expected.messageId or
+          current.parentMessageId ~= expected.parentMessageId or
+          current.revision ~= expected.revision or
+          current.generation ~= expected.generation or
+          current.boundAt ~= expected.boundAt or
+          current.claimToken ~= expected.claimToken or
+          current.presentationLeaseToken ~= expected.presentationLeaseToken or
+          cjson.encode(current.deliveryIds) ~= cjson.encode(expected.deliveryIds) or
+          cjson.encode(current.deliveryReceipts) ~= cjson.encode(expected.deliveryReceipts) then
+         return {'retryable_conflict', '', '', '0'}
+       end
+       local existing = redis.call('HGET', KEYS[1], 'cortexDeliveryAcknowledgement')
+       local existing_binding = redis.call(
+         'HGET', KEYS[1], 'cortexDeliveryAcknowledgementPresentation'
+       )
+       if existing or existing_binding then
+         if not existing or not existing_binding then
+           return {'retryable_conflict', '', '', '0'}
+         end
+         local existing_input = redis.call(
+           'HGET', KEYS[1], 'cortexDeliveryAcknowledgementInput'
+         )
+         if existing_binding == current_json then
+           if existing_input == ARGV[3] then
+             return {'recorded', current_json, existing, '1'}
+           end
+           return {'conflict', '', '', '0'}
+         end
+         if existing_input == ARGV[3] then
+           redis.call(
+             'HSET', KEYS[1], 'cortexDeliveryAcknowledgementPresentation', current_json
+           )
+           return {'recorded', current_json, existing, '1'}
+         end
+       end
+       local server_time = redis.call('TIME')
+       local recorded = cjson.decode(ARGV[3])
+       recorded.presentation_committed_at = tonumber(server_time[1]) * 1000 +
+         math.floor(tonumber(server_time[2]) / 1000)
+       local recorded_json = cjson.encode(recorded)
+       redis.call(
+         'HSET', KEYS[1],
+         'cortexDeliveryAcknowledgement', recorded_json,
+         'cortexDeliveryAcknowledgementInput', ARGV[3],
+         'cortexDeliveryAcknowledgementPresentation', current_json
+       )
+       return {'recorded_new', current_json, recorded_json, '0'}`,
+      1,
+      KEYS.job(streamId),
+      JSON.stringify(acknowledgement),
+      expectedCortexPresentation ? JSON.stringify(expectedCortexPresentation) : '',
+      JSON.stringify(acknowledgementInput),
+    )) as [string, string, string, string];
+    if (!['recorded', 'recorded_new'].includes(result[0])) {
+      return {
+        status: result[0] as 'not_found' | 'conflict' | 'retryable_conflict',
+      };
+    }
+    return {
+      status: 'recorded',
+      ...(result[2] ? { acknowledgement: JSON.parse(result[2]) as InteractionDeliveryAck } : {}),
+      idempotent: result[3] === '1',
+      ...(result[1]
+        ? { cortexPresentation: JSON.parse(result[1]) as CortexPresentationBinding }
+        : {}),
+    };
   }
 
   async deleteJob(streamId: string): Promise<void> {
@@ -939,7 +1171,22 @@ export class RedisJobStore implements IJobStore {
     const pipeline = this.redis.pipeline();
     pipeline.xadd(key, '*', 'event', JSON.stringify(event));
     pipeline.expire(key, this.ttl.running);
-    await pipeline.exec();
+    pipeline.expire(KEYS.streamOwner(streamId), this.ttl.running);
+    const results = await pipeline.exec();
+    if (!results || results.length !== 3) {
+      throw new Error('Redis appendChunk pipeline failed: incomplete command results');
+    }
+    const failedCommand = results.findIndex(([error]) => error != null);
+    if (failedCommand >= 0) {
+      const commandNames = ['XADD', 'chunk EXPIRE', 'owner EXPIRE'];
+      throw new Error(
+        `Redis appendChunk pipeline failed: ${commandNames[failedCommand]} command error`,
+        { cause: results[failedCommand][0] },
+      );
+    }
+    if (typeof results[0][1] !== 'string' || !results[0][1]) {
+      throw new Error('Redis appendChunk pipeline failed: XADD returned no stream entry ID');
+    }
   }
 
   /**
@@ -1219,7 +1466,15 @@ export class RedisJobStore implements IJobStore {
       deliveryAcknowledgement: data.deliveryAcknowledgement
         ? JSON.parse(data.deliveryAcknowledgement)
         : undefined,
+      cortexDeliveryAcknowledgement: data.cortexDeliveryAcknowledgement
+        ? JSON.parse(data.cortexDeliveryAcknowledgement)
+        : undefined,
+      cortexDeliveryAcknowledgementPresentation: data.cortexDeliveryAcknowledgementPresentation
+        ? JSON.parse(data.cortexDeliveryAcknowledgementPresentation)
+        : undefined,
       generationCompleted: data.generationCompleted === '1',
+      clientPresentation: data.clientPresentation ? JSON.parse(data.clientPresentation) : undefined,
+      cortexPresentation: data.cortexPresentation ? JSON.parse(data.cortexPresentation) : undefined,
     };
   }
 }

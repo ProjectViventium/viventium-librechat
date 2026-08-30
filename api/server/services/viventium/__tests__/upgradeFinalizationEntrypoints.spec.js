@@ -38,4 +38,18 @@ describe('Viventium API finalization entrypoint contracts', () => {
     expect(clusteredSource).toContain('restartDelayMs');
     expect(clusteredSource).toContain('setTimeout(() => {');
   });
+
+  test.each([
+    ['standard', standardSource],
+    ['clustered', clusteredSource],
+  ])('%s startup initializes stream persistence before opening traffic', (_name, source) => {
+    const admissionFactory = source.indexOf('const admitTraffic = () => app.listen(');
+    const admissionHelper = source.indexOf('await initializeStreamServicesBeforeTraffic({');
+
+    expect(source).toContain('initializeStreamServicesBeforeTraffic,');
+    expect(admissionFactory).toBeGreaterThanOrEqual(0);
+    expect(admissionHelper).toBeGreaterThan(admissionFactory);
+    expect(source.match(/app\.listen\(/g)).toHaveLength(1);
+    expect(source).not.toContain('GenerationJobManager.initialize();');
+  });
 });

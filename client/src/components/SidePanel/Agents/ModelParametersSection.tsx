@@ -32,6 +32,15 @@ type ModelParametersSectionProps = {
   excludedParameterKeys?: Array<keyof AgentModelParameters>;
 };
 
+export function filterExcludedModelParameters<T extends Pick<SettingDefinition, 'key'>>(
+  parameters: T[],
+  excludedParameterKeys: Array<keyof AgentModelParameters>,
+): T[] {
+  return parameters.filter(
+    (parameter) => !excludedParameterKeys.includes(parameter.key as keyof AgentModelParameters),
+  );
+}
+
 export default function ModelParametersSection({
   fieldName,
   provider,
@@ -70,14 +79,17 @@ export default function ModelParametersSection({
     const overriddenParamsMap = keyBy(overriddenParams, 'key');
 
     /* === VIVENTIUM START === Capability-filter Anthropic effort choices by selected model. === */
-    return defaultParams
-      .filter((param) => param != null)
-      .map((param) => (overriddenParamsMap[param.key] as SettingDefinition) ?? param)
-      .map((param) =>
-        withModelCompatibleOptions(param, overriddenEndpointKey, model, { persistReset: false }),
-      );
+    return filterExcludedModelParameters(
+      defaultParams
+        .filter((param) => param != null)
+        .map((param) => (overriddenParamsMap[param.key] as SettingDefinition) ?? param)
+        .map((param) =>
+          withModelCompatibleOptions(param, overriddenEndpointKey, model, { persistReset: false }),
+        ),
+      excludedParameterKeys,
+    );
     /* === VIVENTIUM END === */
-  }, [endpointType, endpointsConfig, model, provider]);
+  }, [endpointType, endpointsConfig, excludedParameterKeys, model, provider]);
 
   const setOption = (optionKey: keyof AgentModelParameters) => (value: AgentParameterValue) => {
     setValue(`${fieldName}.${optionKey}` as never, value as never);

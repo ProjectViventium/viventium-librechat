@@ -182,7 +182,7 @@ class GenerationJobManagerClass {
    * Initialize the job manager with periodic cleanup.
    * Call this once at application startup.
    */
-  initialize(): void {
+  async initialize(): Promise<void> {
     /* === VIVENTIUM START ===
      * Purpose: Preserve idempotent initialization while lifecycle state owns
      * the fail-closed reconfiguration boundary.
@@ -192,7 +192,7 @@ class GenerationJobManagerClass {
     }
     /* === VIVENTIUM END === */
 
-    this.jobStore.initialize();
+    await this.jobStore.initialize();
 
     this.cleanupInterval = setInterval(() => {
       void this.cleanup().catch((error) => {
@@ -235,9 +235,7 @@ class GenerationJobManagerClass {
      * asynchronous teardown is still draining the old generation.
      */
     if (this.lifecycleState !== 'configurable' && this.lifecycleState !== 'destroyed') {
-      throw new Error(
-        '[GenerationJobManager] Destroy the active manager before reconfiguring services',
-      );
+      throw new Error('Generation stream manager is unavailable');
     }
 
     this._jobStore = services.jobStore;

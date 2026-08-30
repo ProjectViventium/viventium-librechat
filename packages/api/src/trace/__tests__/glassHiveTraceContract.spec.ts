@@ -29,6 +29,12 @@ const ownerId = 'owner-synthetic-1';
 const originRef = 'ghi_0123456789abcdef0123456789abcdef';
 const workRef = 'work_synthetic_1';
 const runRef = 'run_synthetic_1';
+const glassHiveRoot = resolve(__dirname, '../../../../../../GlassHive');
+const liveGlassHiveProducerTest = existsSync(
+  resolve(glassHiveRoot, 'runtime_phase1/tests/test_account_api.py'),
+)
+  ? test
+  : test.skip;
 
 interface FileFingerprint {
   mtimeMs: number;
@@ -343,7 +349,6 @@ function readGlassHiveProducerDetail(): {
     emittedKeySetDigest: string;
   };
 } {
-  const glassHiveRoot = resolve(__dirname, '../../../../../../GlassHive');
   const tempDir = mkdtempSync(resolve(tmpdir(), 'viventium-trace-contract-'));
   const outputPath = resolve(tempDir, 'producer-detail.json');
   try {
@@ -385,7 +390,6 @@ function readGlassHiveSupersededProducerDetail(): {
   runRef: string;
   detail: unknown;
 } {
-  const glassHiveRoot = resolve(__dirname, '../../../../../../GlassHive');
   const harnessPath = resolve(__dirname, 'harnesses/glass_hive_superseded_producer.py');
   const tempDir = mkdtempSync(resolve(tmpdir(), 'viventium-superseded-contract-'));
   const outputPath = resolve(tempDir, 'producer-detail.json');
@@ -411,7 +415,6 @@ function readGlassHivePreRuntimeProducerDetail(): {
   runRef: string;
   detail: unknown;
 } {
-  const glassHiveRoot = resolve(__dirname, '../../../../../../GlassHive');
   const tempDir = mkdtempSync(resolve(tmpdir(), 'viventium-pre-runtime-contract-'));
   const outputPath = resolve(tempDir, 'producer-detail.json');
   try {
@@ -466,7 +469,9 @@ function producerFieldPathsDigest(value: unknown): string {
     .digest('hex')}`;
 }
 
-test('accepts the exact sanitized detail emitted by the real GlassHive producer path', () => {
+liveGlassHiveProducerTest(
+  'accepts the exact sanitized detail emitted by the real GlassHive producer path',
+  () => {
   const handoff = readGlassHiveProducerDetail();
 
   expect(
@@ -475,27 +480,37 @@ test('accepts the exact sanitized detail emitted by the real GlassHive producer 
       runRef: handoff.runRef,
       detail: handoff.detail,
     }),
-  ).toEqual([]);
-}, 120_000);
+    ).toEqual([]);
+  },
+  120_000,
+);
 
-test('canonical fixture has the exact recursive field shape emitted by GlassHive', () => {
-  const handoff = readGlassHiveProducerDetail();
+liveGlassHiveProducerTest(
+  'canonical fixture has the exact recursive field shape emitted by GlassHive',
+  () => {
+    const handoff = readGlassHiveProducerDetail();
 
-  expect(producerFieldPaths(v2Fixture())).toEqual(producerFieldPaths(handoff.detail));
-}, 120_000);
+    expect(producerFieldPaths(v2Fixture())).toEqual(producerFieldPaths(handoff.detail));
+  },
+  120_000,
+);
 
-test('golden producer fixture pins schema, source identity, and emitted key-set drift', () => {
-  const handoff = readGlassHiveProducerDetail();
+liveGlassHiveProducerTest(
+  'golden producer fixture pins schema, source identity, and emitted key-set drift',
+  () => {
+    const handoff = readGlassHiveProducerDetail();
 
-  expect(handoff.contract).toEqual({
-    contractVersion: 1,
-    schemaDigest: GLASSHIVE_WORK_TRACE_SCHEMA_DIGEST,
-    producerSourceIdentity: GLASSHIVE_WORK_TRACE_PRODUCER_SOURCE_IDENTITY,
-    emittedKeySetDigest: GLASSHIVE_WORK_TRACE_EMITTED_KEY_SET_DIGEST,
-  });
-  expect(handoff.contract.emittedKeySetDigest).toBe(producerFieldPathsDigest(handoff.detail));
-  expect(handoff.contract.emittedKeySetDigest).toBe(producerFieldPathsDigest(v2Fixture()));
-}, 120_000);
+    expect(handoff.contract).toEqual({
+      contractVersion: 1,
+      schemaDigest: GLASSHIVE_WORK_TRACE_SCHEMA_DIGEST,
+      producerSourceIdentity: GLASSHIVE_WORK_TRACE_PRODUCER_SOURCE_IDENTITY,
+      emittedKeySetDigest: GLASSHIVE_WORK_TRACE_EMITTED_KEY_SET_DIGEST,
+    });
+    expect(handoff.contract.emittedKeySetDigest).toBe(producerFieldPathsDigest(handoff.detail));
+    expect(handoff.contract.emittedKeySetDigest).toBe(producerFieldPathsDigest(v2Fixture()));
+  },
+  120_000,
+);
 
 test('accepts V2 runtime and authorization facts without calling a runtime start a provider request', () => {
   const detail = v2Fixture();
@@ -547,33 +562,41 @@ test('rejects an untyped or invalid worker resource reservation', () => {
   }
 });
 
-test('accepts real GlassHive pending then superseded then HTTP-accepted history', () => {
-  const handoff = readGlassHiveSupersededProducerDetail();
+liveGlassHiveProducerTest(
+  'accepts real GlassHive pending then superseded then HTTP-accepted history',
+  () => {
+    const handoff = readGlassHiveSupersededProducerDetail();
 
-  expect(producerFieldPaths(handoff.detail)).toEqual(producerFieldPaths(v2Fixture()));
-  expect(
-    (handoff.detail as MutableDetailFixture).callbackDeliveries?.map((item) => item.status),
-  ).toEqual(['pending', 'pending', 'superseded', 'pending', 'delivering', 'http_accepted']);
-  expect(
-    validateGlassHiveWorkDetailTrace({
-      workRef: handoff.workRef,
-      runRef: handoff.runRef,
-      detail: handoff.detail,
-    }),
-  ).toEqual([]);
-}, 120_000);
+    expect(producerFieldPaths(handoff.detail)).toEqual(producerFieldPaths(v2Fixture()));
+    expect(
+      (handoff.detail as MutableDetailFixture).callbackDeliveries?.map((item) => item.status),
+    ).toEqual(['pending', 'pending', 'superseded', 'pending', 'delivering', 'http_accepted']);
+    expect(
+      validateGlassHiveWorkDetailTrace({
+        workRef: handoff.workRef,
+        runRef: handoff.runRef,
+        detail: handoff.detail,
+      }),
+    ).toEqual([]);
+  },
+  120_000,
+);
 
-test('accepts exact pre-runtime Stop detail emitted by the real GlassHive producer path', () => {
-  const handoff = readGlassHivePreRuntimeProducerDetail();
+liveGlassHiveProducerTest(
+  'accepts exact pre-runtime Stop detail emitted by the real GlassHive producer path',
+  () => {
+    const handoff = readGlassHivePreRuntimeProducerDetail();
 
-  expect(
-    validateGlassHiveWorkDetailTrace({
-      workRef: handoff.workRef,
-      runRef: handoff.runRef,
-      detail: handoff.detail,
-    }),
-  ).toEqual([]);
-}, 120_000);
+    expect(
+      validateGlassHiveWorkDetailTrace({
+        workRef: handoff.workRef,
+        runRef: handoff.runRef,
+        detail: handoff.detail,
+      }),
+    ).toEqual([]);
+  },
+  120_000,
+);
 
 function inFlightFixture(): MutableDetailFixture {
   const value = fixture();

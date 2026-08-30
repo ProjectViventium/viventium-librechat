@@ -54,24 +54,24 @@ jest.mock('mongoose', () => {
     ...actual,
     connection: {
       ...actual.connection,
-    collection: (name) => {
-      if (name === 'viventium_glasshive_callback_bindings') {
-        return {
-          findOne: (...args) => mockBindingFindOne(...args),
-          updateOne: (...args) => mockBindingUpdateOne(...args),
-        };
-      }
-      if (name === 'viventium_external_work') {
-        return {
-          find: (...args) => mockExternalFind(...args),
-          findOne: (...args) => mockExternalFindOne(...args),
-          findOneAndUpdate: (...args) => mockExternalFindOneAndUpdate(...args),
-          updateOne: (...args) => mockExternalUpdateOne(...args),
-        };
-      }
-      throw new Error(`Unexpected collection ${name}`);
+      collection: (name) => {
+        if (name === 'viventium_glasshive_callback_bindings') {
+          return {
+            findOne: (...args) => mockBindingFindOne(...args),
+            updateOne: (...args) => mockBindingUpdateOne(...args),
+          };
+        }
+        if (name === 'viventium_external_work') {
+          return {
+            find: (...args) => mockExternalFind(...args),
+            findOne: (...args) => mockExternalFindOne(...args),
+            findOneAndUpdate: (...args) => mockExternalFindOneAndUpdate(...args),
+            updateOne: (...args) => mockExternalUpdateOne(...args),
+          };
+        }
+        throw new Error(`Unexpected collection ${name}`);
+      },
     },
-  },
   };
 });
 

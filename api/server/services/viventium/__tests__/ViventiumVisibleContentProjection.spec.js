@@ -12,13 +12,8 @@ describe('ViventiumVisibleContentProjection', () => {
       { type: 'text', text: 'Added answer.', agentId: 'agent-main____1', groupId: 1 },
     ];
 
-    expect(visibleTextSegmentsFromContentParts(content)).toEqual([
-      'Base answer.',
-      'Added answer.',
-    ]);
-    expect(projectVisibleTextFromContentParts(content)).toBe(
-      'Base answer.\n\nAdded answer.',
-    );
+    expect(visibleTextSegmentsFromContentParts(content)).toEqual(['Base answer.', 'Added answer.']);
+    expect(projectVisibleTextFromContentParts(content)).toBe('Base answer.\n\nAdded answer.');
   });
 
   test('keeps separate Main invocations separated across an internal handoff', () => {

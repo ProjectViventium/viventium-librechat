@@ -216,6 +216,14 @@ export async function initializeOpenAI({
     proxy: PROXY ?? undefined,
     reverseProxyUrl: baseURL || undefined,
     streaming: true,
+    nativeProviderRequestAccepted: (receipt) => {
+      const callback = (
+        req as BaseInitializeParams['req'] & {
+          _viventiumRecordNativeProviderRequestAccepted?: (value: typeof receipt) => void;
+        }
+      )._viventiumRecordNativeProviderRequestAccepted;
+      callback?.(receipt);
+    },
   };
 
   /* === VIVENTIUM START ===

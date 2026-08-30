@@ -466,30 +466,52 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
       }
 
       const destination = await MemoryEntry.findOne({ userId, key: newKey }).lean();
-      if (destination) {
+      if (destination && !destination.deletedAt) {
         return {
           ok: false,
           conflict: true,
-          conflictReason: 'target_key_reserved',
           currentRevision: Number(destination.__v ?? 0),
         };
       }
-      const nextRevision = Number(expectedRevision) + 1;
+      const nextRevision =
+        Math.max(Number(expectedRevision), destination ? Number(destination.__v ?? 0) : -1) + 1;
       const destinationUpdatedAt = new Date();
       let activatedDestination;
       try {
-        activatedDestination = await MemoryEntry.findOneAndUpdate(
-          { _id: new Types.ObjectId(), userId, key: newKey },
-          {
-            $setOnInsert: {
-              value,
-              tokenCount,
-              updated_at: destinationUpdatedAt,
-              __v: nextRevision,
+        if (destination?.deletedAt) {
+          const destinationRevision = Number(destination.__v ?? 0);
+          const destinationRevisionFilter =
+            destinationRevision === 0
+              ? { $or: [{ __v: 0 }, { __v: { $exists: false } }] }
+              : { __v: destinationRevision };
+          activatedDestination = await MemoryEntry.findOneAndUpdate(
+            {
+              _id: destination._id,
+              userId,
+              key: newKey,
+              deletedAt: { $ne: null },
+              ...destinationRevisionFilter,
             },
-          },
-          { upsert: true, new: true, setDefaultsOnInsert: true },
-        );
+            {
+              $set: { value, tokenCount, updated_at: destinationUpdatedAt, __v: nextRevision },
+              $unset: { deletedAt: 1 },
+            },
+            { new: true },
+          );
+        } else {
+          activatedDestination = await MemoryEntry.findOneAndUpdate(
+            { _id: new Types.ObjectId(), userId, key: newKey },
+            {
+              $setOnInsert: {
+                value,
+                tokenCount,
+                updated_at: destinationUpdatedAt,
+                __v: nextRevision,
+              },
+            },
+            { upsert: true, new: true, setDefaultsOnInsert: true },
+          );
+        }
       } catch (error) {
         if ((error as { code?: number })?.code === 11000) {
           return { ok: false, conflict: true };

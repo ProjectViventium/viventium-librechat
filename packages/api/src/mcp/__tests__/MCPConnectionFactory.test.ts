@@ -307,6 +307,47 @@ describe('MCPConnectionFactory', () => {
       );
     });
 
+    it('should report OAuth unavailable without creating a flow for a non-interactive caller', async () => {
+      const basicOptions = {
+        serverName: 'test-server',
+        serverConfig: {
+          ...mockServerConfig,
+          url: 'https://api.example.com',
+          type: 'sse' as const,
+        } as t.SSEOptions,
+      };
+      const oauthOptions: t.OAuthConnectionOptions = {
+        useOAuth: true,
+        user: mockUser,
+        flowManager: mockFlowManager,
+        returnOnOAuth: true,
+        suppressOAuthFlow: true,
+        oauthStart: jest.fn(),
+      };
+
+      mockConnectionInstance.isConnected.mockResolvedValue(false);
+      let oauthRequiredHandler: (data: Record<string, unknown>) => Promise<void>;
+      mockConnectionInstance.on.mockImplementation((event, handler) => {
+        if (event === 'oauthRequired') {
+          oauthRequiredHandler = handler as (data: Record<string, unknown>) => Promise<void>;
+        }
+        return mockConnectionInstance;
+      });
+
+      await expect(MCPConnectionFactory.create(basicOptions, oauthOptions)).rejects.toThrow();
+      await oauthRequiredHandler!({ serverUrl: 'https://api.example.com' });
+
+      expect(mockMCPOAuthHandler.initiateOAuthFlow).not.toHaveBeenCalled();
+      expect(mockFlowManager.createFlow).not.toHaveBeenCalled();
+      expect(oauthOptions.oauthStart).not.toHaveBeenCalled();
+      expect(mockConnectionInstance.emit).toHaveBeenCalledWith(
+        'oauthFailed',
+        expect.objectContaining({
+          message: 'OAuth authorization unavailable for non-interactive request',
+        }),
+      );
+    });
+
     it('should delete existing flow before creating new OAuth flow to prevent stale codeVerifier', async () => {
       const basicOptions = {
         serverName: 'test-server',

@@ -44,6 +44,7 @@ export class MCPConnectionFactory {
    * Purpose: Fail with a typed reconnect requirement before creating OAuth flow state.
    */
   protected readonly allowOAuthInitiation: boolean;
+  protected readonly suppressOAuthFlow: boolean;
   /* === VIVENTIUM END === */
   protected readonly connectionTimeout?: number;
 
@@ -202,6 +203,7 @@ export class MCPConnectionFactory {
     this.useSSRFProtection = basic.useSSRFProtection === true;
     this.connectionTimeout = oauth?.connectionTimeout;
     this.allowOAuthInitiation = oauth?.allowOAuthInitiation !== false;
+    this.suppressOAuthFlow = oauth?.suppressOAuthFlow === true;
     this.logPrefix = oauth?.user
       ? `[MCP][${basic.serverName}][${oauth.user.id}]`
       : `[MCP][${basic.serverName}]`;
@@ -365,6 +367,13 @@ export class MCPConnectionFactory {
        * Purpose: Voice/background hot paths may validate or refresh stored credentials, but must
        * never create an OAuth redirect flow that no user can complete from that turn.
        */
+      if (this.suppressOAuthFlow) {
+        connection.emit(
+          'oauthFailed',
+          new Error('OAuth authorization unavailable for non-interactive request'),
+        );
+        return;
+      }
       if (!this.allowOAuthInitiation) {
         connection.emit('oauthFailed', new Error('OAuth reconnection required'));
         return;

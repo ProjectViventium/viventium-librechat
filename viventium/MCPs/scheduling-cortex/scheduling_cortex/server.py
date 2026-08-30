@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -46,7 +46,7 @@ from .glasshive_workspace_schedules import (
     GlassHiveWorkspaceScheduleService,
     WorkspaceScheduleError,
 )
-from .storage import ScheduleStorage, StorageConfig
+from .storage import ScheduleStorage, StorageConfig, scheduled_prompt_stale_seconds
 from .utils import to_utc_iso
 
 DEFAULT_PORT = 7010
@@ -55,16 +55,50 @@ HEADER_AGENT_ID = "x-viventium-agent-id"
 
 logger = logging.getLogger(__name__)
 
+ISOLATED_ARTIFACT_RETRYABLE_ERRORS = {
+    "isolated_artifact_pair_missing",
+    "isolated_artifact_listing_truncated",
+    "isolated_artifact_import_failed",
+    "isolated_artifact_import_context_missing",
+}
+
+
+def _glasshive_callback_reconciliation_allowed(run: dict[str, Any], event: str) -> bool:
+    """Allow signed late completion to repair only synthetic terminal failures."""
+
+    current_status = str(run.get("status") or "queued")
+    if current_status not in {"completed", "failed"}:
+        return True
+    error_class = str(run.get("error_class") or "")
+    return current_status == "failed" and event == "run.completed" and (
+        error_class == "stale_run_reconciled"
+        or error_class in ISOLATED_ARTIFACT_RETRYABLE_ERRORS
+    )
+
 
 def _glasshive_callback_lifecycle(
-    run: dict[str, Any], event: str, payload: dict[str, Any], now: str
+    run: dict[str, Any],
+    event: str,
+    payload: dict[str, Any],
+    now: str,
+    *,
+    authoritative_terminal: bool = False,
 ) -> tuple[str, str, Optional[str], Optional[str]]:
     """Apply monotonic callback state so late transport events cannot reopen terminal work."""
 
     current_status = str(run.get("status") or "queued")
     current_disposition = str(run.get("disposition") or "running")
-    if current_status in {"completed", "failed"}:
-        return current_status, current_disposition, run.get("completed_at"), run.get("error_class")
+    if (
+        current_status in {"completed", "failed"}
+        and not authoritative_terminal
+        and not _glasshive_callback_reconciliation_allowed(run, event)
+    ):
+        return (
+            current_status,
+            current_disposition,
+            run.get("completed_at"),
+            run.get("error_class"),
+        )
     if event == "run.completed":
         return "completed", "delivered", now, None
     if event in {"run.failed", "run.cancelled", "run.interrupted"}:
@@ -86,10 +120,10 @@ def _glasshive_callback_lifecycle(
             run.get("completed_at"),
             run.get("error_class") if status != "queued" else None,
         )
-    if event == "run.waiting_on_capacity":
-        return "queued", "running", None, None
-    if event in {"run.started", "run.requeued"}:
-        return "running", "running", run.get("completed_at"), None
+    if event in {"run.waiting_on_capacity", "run.requeued"}:
+        return "queued", "running", run.get("completed_at"), None
+    if event == "run.started":
+        return "running", "running", run.get("completed_at"), run.get("error_class")
     return current_status, current_disposition, run.get("completed_at"), run.get("error_class")
 
 
@@ -170,6 +204,12 @@ What it does:
 - Create, update, delete, list, search, inspect, and preview schedules.
 - Run schedules later through the configured Viventium agent and channels.
 - Track last delivery state, including sent, suppressed, failed, and generated text summaries.
+
+Execution ownership:
+
+- executor="viventium_agent" always reloads the persisted Main Agent configuration from Agent Builder at run time, including its configured fallback. The schedule does not own or override provider, model, reasoning effort, GlassHive options, tools, or fallback policy.
+- glasshive_host is a separate explicit Workbench executor with its own declared worker profile. Use it only when the schedule is intentionally a Workbench-hosted automation, not as an alias for the Viventium Main Agent.
+- Never copy a Main Agent model into schedule metadata or infer execution policy from prompt text, task names, agent names, or user identity.
 
 When to use:
 
@@ -642,8 +682,22 @@ def _external_work_callback_updates(
     execution["external_work"] = canonical
     updates: dict[str, Any] = {"execution_snapshot": execution, "updated_at": now}
     if required_total > 0 and not all_required_terminal:
+        lease_owner = str(run.get("lease_owner") or "").strip()
+        lease_updates: dict[str, Any] = {}
+        if lease_owner:
+            now_dt = datetime.fromisoformat(str(now).replace("Z", "+00:00"))
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=timezone.utc)
+            lease_updates = {
+                "lease_owner": lease_owner,
+                "lease_until": (
+                    now_dt.astimezone(timezone.utc)
+                    + timedelta(seconds=scheduled_prompt_stale_seconds())
+                ).isoformat().replace("+00:00", "Z"),
+            }
         return {
             **updates,
+            **lease_updates,
             "status": "waiting_external",
             "disposition": "running",
             "completed_at": None,
@@ -1101,6 +1155,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
 
         now = _now_iso()
         terminal_before_callback = str(run.get("status") or "") in {"completed", "failed"}
+        callback_reconciliation_allowed = _glasshive_callback_reconciliation_allowed(run, event)
         status, disposition, completed_at, error_class = _glasshive_callback_lifecycle(
             run, event, payload, now
         )
@@ -1141,7 +1196,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             else None,
         }
 
-        if not terminal_before_callback:
+        if not terminal_before_callback or callback_reconciliation_allowed:
             storage.update_scheduled_prompt_run(
                 str(run["run_id"]),
                 {
@@ -1391,6 +1446,8 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
                 "prompt, schedule, optional channel, conversation_policy, active, metadata. "
                 "schedule.type is required; for one-time work use "
                 "{'type': 'once', 'run_at': '<ISO datetime>', 'timezone': '<IANA timezone>'}. "
+                "Use viventium_agent for ordinary schedules; glasshive_host is reserved for "
+                "Prompt Workbench-owned schedules. "
                 "user_id, agent_id, and created_by are auto-injected when omitted."
             ),
             returns="success, full task object, and creation message.",
@@ -1408,6 +1465,13 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     def schedule_create(args: CreateScheduleArgs) -> Dict[str, Any]:
         now = datetime.now(timezone.utc)
         schedule = args.schedule.model_dump()
+        if args.executor == "glasshive_host" and not isinstance(
+            (args.metadata or {}).get("workbench_scheduled_prompt"), dict
+        ):
+            raise ValueError(
+                "glasshive_host is reserved for Prompt Workbench schedules; "
+                "use viventium_agent for an ordinary scheduled request"
+            )
         user_id = _resolve_user_id(args.user_id)
         agent_id = _resolve_agent_id(args.agent_id)
         request_agent_id = _resolve_request_agent_id(fallback=agent_id)
@@ -1616,8 +1680,9 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             schedule = args.schedule.model_dump()
 
         now = datetime.now(timezone.utc)
-        next_run = compute_next_run(schedule, now, None) if schedule else None
-        if schedule and schedule.get("type") == "once" and not next_run:
+        must_validate_future = args.schedule is not None or args.active is True
+        next_run = compute_next_run(schedule, now, None) if schedule and must_validate_future else None
+        if must_validate_future and schedule and schedule.get("type") == "once" and not next_run:
             run_at = schedule.get("run_at") if isinstance(schedule, dict) else None
             raise ValueError(
                 f"run_at {run_at} must be in the future (now: {to_utc_iso(now)})"

@@ -170,6 +170,7 @@ function createMocks(overrides?: {
 
   const req = {
     user: { id: 'user-1' },
+    body: { messageId: 'current-user-turn' },
     config: {},
   } as unknown as ServerRequest;
 
@@ -853,7 +854,11 @@ describe('initializeAgent — conversation recall resources', () => {
     );
 
     expect(db.getFiles).toHaveBeenCalledTimes(1);
-    expect(db.getLatestRecallEligibleMessageCreatedAt).toHaveBeenCalledWith({ user: 'user-1' });
+    expect(db.getLatestRecallEligibleMessageCreatedAt).toHaveBeenCalledWith({
+      user: 'user-1',
+      excludeMessageId: 'current-user-turn',
+      excludeParentMessageId: 'current-user-turn',
+    });
     expect(result.tool_resources?.file_search?.files).toEqual(
       expect.arrayContaining([
         expect.objectContaining({

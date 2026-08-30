@@ -10,8 +10,7 @@ const mockEnsureExternalWorkIndexes = jest.fn();
 
 jest.mock('../GlassHiveCallbackBindingService', () => ({
   reconcileKnownExternalWorkHints: (...args) => mockReconcileKnownExternalWorkHints(...args),
-  reconcileUnknownGlassHiveLaunches: (...args) =>
-    mockReconcileUnknownGlassHiveLaunches(...args),
+  reconcileUnknownGlassHiveLaunches: (...args) => mockReconcileUnknownGlassHiveLaunches(...args),
 }));
 
 jest.mock('../GlassHiveCallbackDeliveryService', () => ({
@@ -38,7 +37,11 @@ describe('GlassHiveLaunchReconciliationService', () => {
     jest.useFakeTimers();
     stopGlassHiveLaunchReconciliationForTests();
     delete process.env.VIVENTIUM_GLASSHIVE_LAUNCH_RECONCILIATION_INTERVAL_MS;
-    mockReconcileUnknownGlassHiveLaunches.mockResolvedValue({ scanned: 0, repaired: 0, pending: 0 });
+    mockReconcileUnknownGlassHiveLaunches.mockResolvedValue({
+      scanned: 0,
+      repaired: 0,
+      pending: 0,
+    });
     mockReconcileKnownExternalWorkHints.mockResolvedValue({ scanned: 0, updatedOwners: 0 });
     mockReconcileUnresolvedDeliveries.mockResolvedValue({ scanned: 0, repaired: 0, pending: 0 });
     mockReconcileDeliveryProjections.mockResolvedValue({ scanned: 0, projected: 0, pending: 0 });

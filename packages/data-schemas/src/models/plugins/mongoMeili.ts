@@ -91,6 +91,7 @@ const meiliEnabled =
 function isViventiumMeiliOptOut(doc: unknown): boolean {
   const row = doc as {
     expiredAt?: unknown;
+    deletedAt?: unknown;
     metadata?: {
       viventium?: {
         type?: unknown;
@@ -103,6 +104,7 @@ function isViventiumMeiliOptOut(doc: unknown): boolean {
   const metadata = row?.metadata?.viventium;
   return (
     !_.isNil(row?.expiredAt) ||
+    !_.isNil(row?.deletedAt) ||
     (metadata?.type === 'listen_only_transcript' && metadata?.mode === 'listen_only') ||
     metadata?.type === 'voice_ambient_transcript' ||
     metadata?.qaRun === true ||
@@ -112,6 +114,7 @@ function isViventiumMeiliOptOut(doc: unknown): boolean {
 
 const getMeiliEligibleQuery = (): FilterQuery<unknown> => ({
   expiredAt: null,
+  deletedAt: null,
   'metadata.viventium.type': {
     $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
   },
@@ -903,7 +906,7 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
       return next();
     }
 
-    if (doc.unfinished) {
+    if (!doc || doc.unfinished) {
       return next();
     }
 

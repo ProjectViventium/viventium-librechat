@@ -247,6 +247,14 @@ export async function initializeAnthropic({
   const clientOptions: AnthropicConfigOptions = {
     proxy: PROXY ?? undefined,
     reverseProxyUrl: ANTHROPIC_REVERSE_PROXY ?? undefined,
+    nativeProviderRequestAccepted: (receipt) => {
+      const callback = (
+        req as BaseInitializeParams['req'] & {
+          _viventiumRecordNativeProviderRequestAccepted?: (value: typeof receipt) => void;
+        }
+      )._viventiumRecordNativeProviderRequestAccepted;
+      callback?.(receipt);
+    },
     ...(userValues?.oauthType ? { oauthType: userValues.oauthType } : {}),
     ...(userValues?.oauthProvider ? { oauthProvider: userValues.oauthProvider } : {}),
     ...(userValues?.oauthProvider === 'anthropic' && userValues?.oauthType === 'subscription'

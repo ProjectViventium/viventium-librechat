@@ -8,6 +8,7 @@ import re
 import calendar
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -29,6 +30,10 @@ from .models import AVAILABLE_CHANNELS, DEFAULT_DELIVERY_CHANNELS
 from .glasshive_assertions import ASSERTION_HEADER, mint_workspace_run_assertion
 from .storage import ScheduleStorage, StorageConfig
 from .utils import ensure_timezone, parse_iso, to_utc_iso
+from .workbench_artifacts import (
+    isolated_periphery_contract,
+    rebase_isolated_workbench_text,
+)
 # === VIVENTIUM END ===
 
 # === VIVENTIUM NOTE ===
@@ -201,6 +206,348 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+# Structured provider failures are the only classes the scheduler may persist or fan out.
+# Raw provider error prose can contain credentials, request bodies, or private prompts.
+SCHEDULED_RUNTIME_PROVIDER_FAILURE_RETRYABILITY = {
+    "provider_auth_projection_unavailable": False,
+    "provider_content_filter": False,
+    "provider_context_limit_exceeded": False,
+    "provider_request_rejected": False,
+    "provider_response_failed": True,
+    "provider_unavailable": True,
+}
+SCHEDULED_RUNTIME_FAILURE_RETRYABILITY = {
+    **SCHEDULED_RUNTIME_PROVIDER_FAILURE_RETRYABILITY,
+    "connected_account_action_required": False,
+    "glasshive_runtime_unavailable": True,
+    "glasshive_worker_quota_exceeded": False,
+    "host_capacity": True,
+    "orphaned_user_not_found": False,
+    "parallel_execution_isolation_required": False,
+    "runtime_dependency_missing": False,
+    "runtime_io_failed": True,
+    "runtime_sandbox_unavailable": True,
+    "scheduler_gateway_unavailable": True,
+    "unsupported_runtime_configuration": False,
+}
+SCHEDULED_PROVIDER_ROUTE_DECISIONS = frozenset(
+    {
+        "fallback_selected",
+        "fallback_unavailable",
+        "primary_selected",
+        "skipped_unhealthy",
+        "waiting_primary_health",
+    }
+)
+
+_SCHEDULED_FAILURE_CONTRACT_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "source_of_truth"
+    / "scheduled_failure_contract.v1.json"
+)
+with _SCHEDULED_FAILURE_CONTRACT_PATH.open("r", encoding="utf-8") as _failure_contract_file:
+    SCHEDULED_FAILURE_CONTRACT = json.load(_failure_contract_file)
+SCHEDULED_GENERATION_FAILURE_CLASSES = frozenset(
+    {
+        *(SCHEDULED_FAILURE_CONTRACT.get("classes") or {}),
+        *SCHEDULED_RUNTIME_FAILURE_RETRYABILITY,
+    }
+)
+
+
+def resolve_scheduled_failure_transition(
+    task: Dict[str, Any],
+    error_class: Any,
+    failure_retryable: Optional[bool] = None,
+) -> Dict[str, Any]:
+    normalized = normalized_scheduled_generation_failure_class(error_class)
+    class_contract = (SCHEDULED_FAILURE_CONTRACT.get("classes") or {}).get(normalized) or {}
+    retryable = (
+        failure_retryable
+        if isinstance(failure_retryable, bool)
+        else bool(
+            class_contract.get(
+                "retryable",
+                SCHEDULED_RUNTIME_FAILURE_RETRYABILITY.get(normalized, False),
+            )
+        )
+    )
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    prior = (
+        metadata.get("scheduled_failure_state_v1")
+        if isinstance(metadata.get("scheduled_failure_state_v1"), dict)
+        else {}
+    )
+    same_health_epoch = str(task.get("last_status") or "").strip().lower() == "error"
+    prior_reported = {
+        normalized_scheduled_generation_failure_class(value)
+        for value in (prior.get("reported_failure_classes") or [])
+    } if same_health_epoch else set()
+    prior_consecutive = int(prior.get("consecutive_count") or 0) if same_health_epoch else 0
+    prior_same_root = (
+        int(prior.get("same_root_count") or 0)
+        if same_health_epoch and prior.get("error_class") == normalized
+        else 0
+    )
+    consecutive_count = prior_consecutive + 1
+    same_root_count = prior_same_root + 1
+    schedule_type = str((task.get("schedule") or {}).get("type") or "").strip().lower()
+    max_once_attempts = max(1, int(SCHEDULED_FAILURE_CONTRACT.get("one_time_max_attempts") or 3))
+    if normalized == "orphaned_user_not_found":
+        retry_disposition = "terminal_action_required"
+    elif schedule_type == "once":
+        retry_disposition = (
+            "retry_scheduled"
+            if retryable and consecutive_count < max_once_attempts
+            else "terminal_action_required"
+        )
+    else:
+        retry_disposition = "next_occurrence_only"
+    health_epoch = str(prior.get("health_epoch") or "").strip() if same_health_epoch else ""
+    if not health_epoch:
+        health_epoch = str(task.get("_scheduled_prompt_run_id") or task.get("last_run_at") or "failure")
+    # A prior error is not evidence that its user-visible notice was delivered. The
+    # delivery owner adds the current class only after Telegram confirms delivery.
+    reported = sorted(prior_reported)
+    next_attempt_at = None
+    if retry_disposition == "retry_scheduled":
+        try:
+            attempted_at = parse_iso(
+                str(task.get("_scheduled_prompt_attempted_at") or ""),
+                ensure_timezone("UTC"),
+            )
+        except (TypeError, ValueError):
+            attempted_at = None
+        try:
+            retry_delay_s = max(1, int(task.get("_scheduled_prompt_retry_delay_s") or 0))
+        except (TypeError, ValueError):
+            retry_delay_s = 0
+        if attempted_at is not None and retry_delay_s > 0:
+            next_attempt_at = to_utc_iso(attempted_at + timedelta(seconds=retry_delay_s))
+    return {
+        "version": 1,
+        "error_class": normalized,
+        "retryable": retryable,
+        "retry_disposition": retry_disposition,
+        "coalescing_key": f"{task.get('id') or 'schedule'}:{health_epoch}:{normalized}",
+        "health_epoch": health_epoch,
+        "consecutive_count": consecutive_count,
+        "same_root_count": same_root_count,
+        "reported_failure_classes": reported,
+        "already_reported_in_health_epoch": normalized in prior_reported,
+        **({"next_attempt_at": next_attempt_at} if next_attempt_at else {}),
+    }
+
+
+def normalized_scheduled_generation_failure_class(value: Any) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in SCHEDULED_GENERATION_FAILURE_CLASSES:
+        return candidate
+    return "completion_error"
+
+
+def _extract_scheduled_generation_failure(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not payload.get("final"):
+        return None
+    response = payload.get("responseMessage")
+    if not isinstance(response, dict):
+        return None
+    content = response.get("content")
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return None
+    for part in reversed(content):
+        if not isinstance(part, dict) or str(part.get("type") or "").strip() != "error":
+            continue
+        error_class = normalized_scheduled_generation_failure_class(
+            part.get("error_class") or part.get("errorClass") or part.get("error_code")
+        )
+        retryable = _http_payload_retryable(part)
+        if retryable is None:
+            retryable = _http_payload_retryable(response)
+        return {
+            "error_class": error_class,
+            **({"failure_retryable": retryable} if retryable is not None else {}),
+        }
+    return None
+
+
+def _scheduled_generation_failure_notice(
+    error_class: Any,
+    failure_retryable: Optional[bool] = None,
+    retry_disposition: str = "no_retry",
+    next_attempt_at: Any = None,
+) -> str:
+    normalized = normalized_scheduled_generation_failure_class(error_class)
+    retry_time = str(next_attempt_at or "").strip()
+    terminal_suffix = {
+        "retry_scheduled": (
+            f" This one-time occurrence will retry automatically at {retry_time}."
+            if retry_time
+            else " This one-time occurrence will retry automatically."
+        ),
+        "next_occurrence_only": " This occurrence ended; the next scheduled occurrence remains.",
+        "paused": " This schedule is paused.",
+        "terminal_action_required": " This occurrence ended; action is required before it can run again.",
+    }.get(
+        retry_disposition,
+        " This occurrence ended; no automatic retry is scheduled."
+        if failure_retryable is not True
+        else " This occurrence ended; retry it after the provider recovers.",
+    )
+    messages = {
+        "provider_auth_projection_unavailable": (
+            "Scheduled work could not start because the configured model account "
+            "could not be made available to its worker. Reconnect the account and retry."
+        ),
+        "provider_auth_missing": (
+            "Scheduled work could not start because the model provider connection is missing. "
+            "Connect it in Settings > Account > Connected Accounts."
+        ),
+        "provider_unauthorized": (
+            "Scheduled work could not start because the model provider connection needs "
+            "attention. Reconnect it in Settings > Account > Connected Accounts."
+        ),
+        "provider_connected_account_reconnect_required": (
+            "Scheduled work could not start because a connected model provider needs to be "
+            "reconnected in Settings > Account > Connected Accounts."
+        ),
+        "provider_access_denied": (
+            "Scheduled work could not start because the model provider denied access. Check "
+            "the selected model and account permissions."
+        ),
+        "provider_quota_exhausted": (
+            "Scheduled work could not start because the model provider quota is exhausted. "
+            "Restore quota before another run."
+        ),
+        "provider_rate_limited": (
+            "Scheduled work was rate-limited by the model provider."
+        ),
+        "provider_request_rejected": (
+            "Scheduled work was rejected by the configured model provider. Check "
+            "the selected provider, model, and request settings."
+        ),
+        "provider_response_failed": (
+            "Scheduled work ended because the configured model provider did not "
+            "complete its response."
+        ),
+        "provider_unavailable": (
+            "Scheduled work could not run because the configured model provider "
+            "is temporarily unavailable."
+        ),
+        "provider_response_deadline_exceeded": (
+            "Scheduled work exceeded the model response deadline."
+        ),
+        "provider_timeout": (
+            "Scheduled work timed out while contacting the model provider."
+        ),
+        "timeout": (
+            "Scheduled work timed out before completion."
+        ),
+        "context_length_exceeded": (
+            "Scheduled work was too large for the selected model context. Shorten the task or "
+            "choose a compatible model."
+        ),
+        "provider_context_limit_exceeded": (
+            "Scheduled work was too large for the configured model context. "
+            "Reduce the request context before retrying."
+        ),
+        "provider_content_filter": (
+            "Scheduled work was stopped by the configured model provider's "
+            "content filter. Review the request before retrying."
+        ),
+        "glasshive_runtime_unavailable": (
+            "Scheduled work could not start because its worker runtime was unavailable."
+        ),
+        "glasshive_worker_quota_exceeded": (
+            "Scheduled work could not start because the available worker capacity is full."
+        ),
+        "host_capacity": (
+            "Scheduled work could not start because the worker host had no available capacity."
+        ),
+        "orphaned_user_not_found": (
+            "This schedule stopped because its owner account no longer exists."
+        ),
+        "parallel_execution_isolation_required": (
+            "Scheduled work requires an authorized isolated execution environment."
+        ),
+        "runtime_dependency_missing": (
+            "Scheduled work could not start because a required worker dependency is unavailable."
+        ),
+        "runtime_io_failed": (
+            "Scheduled work stopped because the worker runtime could not complete an input or output operation."
+        ),
+        "runtime_sandbox_unavailable": (
+            "Scheduled work could not start because its isolated worker environment was unavailable."
+        ),
+        "scheduler_gateway_unavailable": (
+            "Scheduled work could not start because the local conversation service was unavailable."
+        ),
+        "unsupported_runtime_configuration": (
+            "Scheduled work could not start because its worker configuration is unsupported."
+        ),
+    }
+    message = messages.get(
+        normalized,
+        "Scheduled work could not be completed by the model provider.",
+    )
+    return f"{message}{terminal_suffix}"
+
+
+# === VIVENTIUM START ===
+# Feature: Preserve scheduler-private occurrence identity across persisted Workbench refreshes.
+_SCHEDULED_PROMPT_RUNTIME_FIELDS = (
+    "_scheduled_prompt_run_id",
+    "_scheduled_prompt_occurrence_key",
+    "_scheduled_prompt_trigger_kind",
+    "_scheduled_prompt_trigger_source",
+)
+
+
+def _scheduled_prompt_runtime_context(task: Dict[str, Any]) -> Dict[str, Any]:
+    return {field: task[field] for field in _SCHEDULED_PROMPT_RUNTIME_FIELDS if field in task}
+
+
+def _restore_scheduled_prompt_runtime_context(
+    persisted_task: Dict[str, Any],
+    runtime_task: Dict[str, Any],
+) -> Dict[str, Any]:
+    restored = dict(persisted_task)
+    for field in _SCHEDULED_PROMPT_RUNTIME_FIELDS:
+        restored.pop(field, None)
+    restored.update(_scheduled_prompt_runtime_context(runtime_task))
+    return restored
+
+
+def _scheduled_preclaim_context(
+    task: Dict[str, Any],
+    *,
+    required: bool = False,
+) -> Optional[Dict[str, str]]:
+    context = {
+        field: str(task.get(field) or "").strip()
+        for field in _SCHEDULED_PROMPT_RUNTIME_FIELDS
+    }
+    has_scheduler_trigger = (
+        context["_scheduled_prompt_trigger_kind"] == "scheduled"
+        or context["_scheduled_prompt_trigger_source"] == "scheduler_loop"
+    )
+    if not required and not has_scheduler_trigger:
+        return None
+    if (
+        context["_scheduled_prompt_run_id"]
+        and context["_scheduled_prompt_occurrence_key"]
+        and context["_scheduled_prompt_trigger_kind"] == "scheduled"
+        and context["_scheduled_prompt_trigger_source"] == "scheduler_loop"
+    ):
+        return context
+    raise RuntimeError(
+        "scheduled preclaim context is incomplete; refusing an unkeyed GlassHive dispatch"
+    )
+# === VIVENTIUM END ===
+
+
 def _declared_scheduler_source_prompt_id(task: Dict[str, Any]) -> Optional[str]:
     """Expose recognized structured prompt provenance without activating a policy."""
 
@@ -242,9 +589,17 @@ _FENCED_CODE_RE = re.compile(r"```(\w*)\n([\s\S]*?)```", re.MULTILINE)
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
 _LINK_RE = re.compile(r"!?\[([^\]]*)\]\(([^)]+)\)")
 _BOLD_ASTERISK_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
-_BOLD_UNDERSCORE_RE = re.compile(r"__(.+?)__", re.DOTALL)
+# Underscore emphasis follows the CommonMark intraword rule: underscores inside
+# identifiers such as SAME_CONTINUITY_OK are literal characters, not markup.
+_BOLD_UNDERSCORE_RE = re.compile(
+    r"(?<![\w_])__(?![_\s])(.+?)(?<![_\s])__(?![\w_])",
+    re.DOTALL,
+)
 _ITALIC_ASTERISK_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")
-_ITALIC_UNDERSCORE_RE = re.compile(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)")
+_ITALIC_UNDERSCORE_RE = re.compile(
+    r"(?<![\w_])_(?![_\s])(.+?)(?<![_\s])_(?![\w_])",
+    re.DOTALL,
+)
 _STRIKETHROUGH_RE = re.compile(r"~~(.+?)~~")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 _BLOCKQUOTE_RE = re.compile(r"^>\s?(.*)$", re.MULTILINE)
@@ -403,6 +758,76 @@ class HttpJsonError(RuntimeError):
         self.failure_retryable = failure_retryable
 
 
+def scheduled_exception_failure(task: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
+    """Classify trusted exception structure without inspecting provider or prompt prose."""
+
+    executor = str(task.get("executor") or "viventium_agent").strip()
+    payload = getattr(exc, "payload", None)
+    payload = payload if isinstance(payload, dict) else {}
+    declared_class = str(getattr(exc, "failure_class", "") or "").strip().lower()
+    declared_reason = str(getattr(exc, "reason", "") or "").strip().lower()
+    if (
+        isinstance(exc, HttpJsonError)
+        and exc.status == 404
+        and str(exc.path or "").strip().lower()
+        == "/api/viventium/scheduler/chat"
+        and "user_not_found" in {declared_class, declared_reason}
+    ):
+        failure_class = "orphaned_user_not_found"
+    elif declared_class in SCHEDULED_GENERATION_FAILURE_CLASSES:
+        failure_class = declared_class
+    elif isinstance(exc, urllib.error.URLError):
+        failure_class = (
+            "glasshive_runtime_unavailable"
+            if executor == "glasshive_host"
+            else "scheduler_gateway_unavailable"
+        )
+    elif isinstance(exc, TimeoutError):
+        failure_class = "timeout"
+    elif isinstance(exc, HttpJsonError) and exc.status in {502, 503, 504}:
+        failure_class = (
+            "glasshive_runtime_unavailable"
+            if executor == "glasshive_host"
+            else "scheduler_gateway_unavailable"
+        )
+    else:
+        failure_class = normalized_scheduled_generation_failure_class(declared_class)
+
+    retryable = getattr(exc, "failure_retryable", None)
+    if not isinstance(retryable, bool):
+        retryable = _http_payload_retryable(payload)
+    failure: Dict[str, Any] = {"error_class": failure_class}
+    if isinstance(retryable, bool):
+        failure["failure_retryable"] = retryable
+
+    route_decision = str(payload.get("provider_route_decision") or "").strip()
+    if route_decision in SCHEDULED_PROVIDER_ROUTE_DECISIONS:
+        failure["provider_route_decision"] = route_decision
+    return failure
+
+
+def _scheduled_channel_exception_failure(
+    task: Dict[str, Any], exc: Exception
+) -> Dict[str, Any]:
+    failure = scheduled_exception_failure(task, exc)
+    error_class = failure["error_class"]
+    if error_class == "completion_error":
+        return {
+            "outcome": "failed",
+            "reason": "channel_dispatch_failed",
+            "error_class": type(exc).__name__,
+        }
+    transition = resolve_scheduled_failure_transition(
+        task, error_class, failure.get("failure_retryable")
+    )
+    return {
+        "outcome": "failed",
+        "reason": error_class,
+        "error_class": error_class,
+        "failure_retryable": transition["retryable"],
+    }
+
+
 def _http_payload_text(payload: Dict[str, Any], *keys: str) -> str:
     for key in keys:
         value = payload.get(key)
@@ -455,10 +880,23 @@ def _format_http_error(method: str, url: str, error: urllib.error.HTTPError) -> 
         else:
             if isinstance(parsed_payload, dict):
                 payload = parsed_payload
-                detail = _http_payload_text(payload, "detail", "message", "error")
-                failure_class = _http_payload_text(payload, "failure_class")
-                reason = _http_payload_text(payload, "reason", "status")
+                nested_detail = (
+                    payload.get("detail")
+                    if isinstance(payload.get("detail"), dict)
+                    else {}
+                )
+                detail = _http_payload_text(
+                    nested_detail, "message", "detail", "error"
+                ) or _http_payload_text(payload, "detail", "message", "error")
+                failure_class = _http_payload_text(
+                    payload, "failure_class"
+                ) or _http_payload_text(nested_detail, "failure_class", "code")
+                reason = _http_payload_text(
+                    payload, "reason", "status"
+                ) or _http_payload_text(nested_detail, "reason", "status")
                 failure_retryable = _http_payload_retryable(payload)
+                if failure_retryable is None:
+                    failure_retryable = _http_payload_retryable(nested_detail)
                 error_message = detail or _http_payload_text(payload, "error") or error_message
             else:
                 error_message = body_text
@@ -1441,6 +1879,89 @@ def _stream_telegram_response(
 
 # === VIVENTIUM NOTE ===
 # Feature: Canonical scheduler-run stream capture for single-run multi-channel dispatch.
+def _scheduled_execution_receipt(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    def safe_value(candidate: Dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            raw = candidate.get(key)
+            if not isinstance(raw, str):
+                continue
+            value = raw.strip()
+            if value and len(value) <= 256 and all(ord(char) >= 32 for char in value):
+                return value
+        return ""
+
+    def server_authored_execution(value: Any) -> bool:
+        return bool(
+            isinstance(value, dict)
+            and type(value.get("version")) is int
+            and value.get("version") == 1
+            and safe_value(value, "provider")
+            and safe_value(value, "model")
+            and isinstance(value.get("fallbackUsed"), bool)
+        )
+
+    receipt: Dict[str, Any] = {}
+    candidates = [
+        value
+        for key in ("execution_receipt", "executionReceipt")
+        if isinstance(value := payload.get(key), dict)
+    ]
+    viventium = payload.get("viventium")
+    if isinstance(viventium, dict) and server_authored_execution(
+        scheduled_execution := viventium.get("scheduledExecution")
+    ):
+        candidates.append(scheduled_execution)
+    execution = payload.get("execution")
+    if isinstance(execution, dict) and (
+        server_authored_execution(execution)
+        or any(
+            key in execution
+            for key in (
+                "effective_model",
+                "effectiveModel",
+                "effective_reasoning_effort",
+                "effectiveReasoningEffort",
+            )
+        )
+    ):
+        candidates.append(execution)
+
+    for candidate in candidates:
+        model = safe_value(candidate, "effective_model", "effectiveModel", "model")
+        effort = safe_value(
+            candidate,
+            "effective_reasoning_effort",
+            "effectiveReasoningEffort",
+            "reasoning_effort",
+            "reasoningEffort",
+        )
+        provider = safe_value(candidate, "effective_provider", "effectiveProvider", "provider")
+        route_decision = safe_value(candidate, "provider_route_decision", "providerRouteDecision")
+        fallback_used = candidate.get("fallbackUsed", candidate.get("fallback_used"))
+        fallback_reason = safe_value(candidate, "fallbackReason", "fallback_reason")
+        if model:
+            receipt["effective_model"] = model
+        if effort:
+            receipt["effective_reasoning_effort"] = effort
+        if provider:
+            receipt["provider"] = provider
+        if route_decision in SCHEDULED_PROVIDER_ROUTE_DECISIONS:
+            receipt["provider_route_decision"] = route_decision
+        if isinstance(fallback_used, bool):
+            receipt["fallback_used"] = fallback_used
+            if (
+                fallback_used
+                and fallback_reason
+                and normalized_scheduled_generation_failure_class(fallback_reason)
+                == fallback_reason
+            ):
+                receipt["fallback_reason"] = fallback_reason
+    return receipt
+
+
 def _stream_scheduler_response(
     base_url: str,
     stream_id: str,
@@ -1466,13 +1987,52 @@ def _stream_scheduler_response(
         if not isinstance(payload, dict):
             continue
         if "error" in payload:
-            raise RuntimeError(payload.get("error") or "Scheduler stream error")
+            declared_error_class = (
+                payload.get("error_class")
+                or payload.get("errorClass")
+                or payload.get("failure_class")
+                or payload.get("failureClass")
+                or payload.get("error_code")
+                or payload.get("code")
+            )
+            if not declared_error_class:
+                raise RuntimeError(payload.get("error") or "Scheduler stream error")
+            failure_retryable = _http_payload_retryable(payload)
+            stream_metadata["generation_failure"] = {
+                "error_class": normalized_scheduled_generation_failure_class(
+                    declared_error_class
+                ),
+                **(
+                    {"failure_retryable": failure_retryable}
+                    if failure_retryable is not None
+                    else {}
+                ),
+            }
+            if not payload.get("final"):
+                continue
         if (
             payload.get("superseded") is True
             or payload.get("disposition") == "superseded"
             or payload.get("state") == "superseded"
         ):
             stream_metadata["superseded"] = True
+        generation_failure = _extract_scheduled_generation_failure(payload)
+        if generation_failure is not None:
+            stream_metadata["generation_failure"] = generation_failure
+        response_message = payload.get("responseMessage")
+        response_metadata = (
+            response_message.get("metadata")
+            if isinstance(response_message, dict)
+            else None
+        )
+        if payload.get("final") is True:
+            for candidate in (payload, response_message, response_metadata):
+                execution_receipt = _scheduled_execution_receipt(candidate)
+                if execution_receipt:
+                    stream_metadata["execution_receipt"] = {
+                        **stream_metadata.get("execution_receipt", {}),
+                        **execution_receipt,
+                    }
         for field in ("logical_turn_id", "revision"):
             if payload.get(field) is not None:
                 stream_metadata[field] = payload[field]
@@ -1525,32 +2085,11 @@ def _poll_scheduler_followup(
     )
 
 
-def _scheduled_agent_execution() -> Dict[str, str]:
-    provider = str(os.getenv("VIVENTIUM_SCHEDULED_AGENT_PROVIDER") or "").strip().lower()
-    model = str(os.getenv("VIVENTIUM_SCHEDULED_AGENT_MODEL") or "").strip()
-    effort = str(
-        os.getenv("VIVENTIUM_SCHEDULED_AGENT_REASONING_EFFORT") or ""
-    ).strip().lower()
-    if not provider and not model and not effort:
-        return {}
-    if not provider or not model or not effort:
-        raise RuntimeError(
-            "Scheduled-agent automation requires provider, model, and reasoning effort"
-        )
-    # === VIVENTIUM START === Keep scheduler transport aligned with capability-declared efforts.
-    if effort not in {
-        "none",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max",
-        "ultra",
-    }:
-        raise RuntimeError(f"Unsupported scheduled-agent reasoning effort: {effort}")
-    # === VIVENTIUM END ===
-    return {"provider": provider, "model": model, "reasoning_effort": effort}
+def _scheduled_conversation_title_source(task: Dict[str, Any]) -> str:
+    source = str(task.get("prompt") or "").strip()
+    if not source or _looks_like_scheduled_self_prompt(source):
+        return "Scheduled Background Processing"
+    return source[:2000]
 
 
 def _run_scheduler_generation(
@@ -1571,31 +2110,60 @@ def _run_scheduler_generation(
 
     schedule = task.get("schedule") or {}
     run_context = _build_scheduled_run_context(task)
-    execution = _scheduled_agent_execution()
     source_prompt_id = _declared_scheduler_source_prompt_id(task)
     idempotency_key = str(
         task.get("_scheduled_prompt_occurrence_key")
         or task.get("_scheduled_prompt_run_id")
         or ""
     ).strip()
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    recurrence_state = metadata.get("recurrence_state_v1")
+    bounded_recurrence_state: Dict[str, Any] = {}
+    if isinstance(recurrence_state, dict) and recurrence_state.get("version") == 1:
+        result_sha256 = str(recurrence_state.get("result_sha256") or "").strip().lower()
+        bounded_recurrence_state = {
+            "version": 1,
+            "last_run_at": str(recurrence_state.get("last_run_at") or "")[:40],
+            "outcome": str(recurrence_state.get("outcome") or "")[:40],
+            "reason": str(recurrence_state.get("reason") or "")[:160],
+            "result_excerpt": str(recurrence_state.get("result_excerpt") or "")[:2000],
+            "result_sha256": result_sha256 if re.fullmatch(r"[a-f0-9]{64}", result_sha256) else "",
+            "conversation_id": str(recurrence_state.get("conversation_id") or "")[:256],
+            "occurrence_count": max(0, int(recurrence_state.get("occurrence_count") or 0)),
+        }
     payload = {
         "userId": task.get("user_id"),
         "agentId": task.get("agent_id"),
         "text": _compose_prompt(task, run_context=run_context),
+        # The execution prompt includes the private scheduler envelope. Give the gateway a
+        # separate, bounded task source for user-visible conversation-title generation.
+        "titleText": _scheduled_conversation_title_source(task),
         "conversationId": conversation_id,
         "scheduleId": task.get("id"),
+        "scheduleRunId": task.get("_scheduled_prompt_run_id"),
         "clientTimezone": schedule.get("timezone") or "UTC",
         "clientTimestamp": run_context.get("run_started_at_utc"),
         "scheduledDueAt": run_context.get("scheduled_due_at_utc"),
         "schedulerRunContext": run_context,
+        "deliveryChannels": _normalize_dispatch_channels(task.get("channel")),
+        **({"recurrenceState": bounded_recurrence_state} if bounded_recurrence_state else {}),
     }
+    # QA provenance is explicit scheduler-owned metadata. Never infer it from a task title or
+    # prompt. Real scheduled work stays eligible for Main continuity; disposable harness runs do
+    # not enter owner recall, memory, or continuity.
+    if metadata.get("qa_disposable") is True:
+        qa_run_id = str(
+            task.get("_scheduled_prompt_run_id")
+            or idempotency_key
+            or task.get("id")
+            or ""
+        ).strip()
+        payload["viventiumQaRun"] = True
+        if qa_run_id:
+            payload["viventiumQaRunId"] = qa_run_id[:128]
     if idempotency_key:
         payload["idempotencyKey"] = idempotency_key
         payload["source_event_id"] = idempotency_key
-    if execution:
-        payload["model"] = execution["model"]
-        payload["reasoning_effort"] = execution["reasoning_effort"]
-        payload["scheduledAgentExecution"] = execution
     if source_prompt_id:
         payload["sourcePromptId"] = source_prompt_id
     headers = {
@@ -1625,9 +2193,9 @@ def _run_scheduler_generation(
     stream_id = response.get("streamId") or response.get("stream_id")
     if not stream_id:
         raise RuntimeError("Scheduler dispatch missing streamId")
-    # Scheduled Main uses the governed high-reasoning route and can legitimately need more than
-    # the old two-minute interactive ceiling. Keep the wait below the scheduler's 15-minute lease;
-    # the bounded worker pool prevents one long generation from blocking other schedules.
+    # Scheduled Main may inherit a long-running Agent Builder route. Keep the wait below the
+    # scheduler's 15-minute lease; the bounded worker pool prevents one long generation from
+    # blocking other schedules.
     stream_timeout_s = int(os.getenv("SCHEDULER_STREAM_TIMEOUT_S", "600"))
     try:
         streamed = _stream_scheduler_response(
@@ -1662,7 +2230,57 @@ def _run_scheduler_generation(
         raise
     final_text, response_message_id, followup_text = streamed[:3]
     stream_metadata = streamed[3] if len(streamed) > 3 and isinstance(streamed[3], dict) else {}
+    # Acceptance identifies the intended route, not the completed attempt: Main may still
+    # select its configured fallback. Only a producer-issued stream receipt is effective.
+    execution_receipt = _scheduled_execution_receipt(stream_metadata)
+    # The accept response owns the logical-turn receipt. Stream metadata repeats it for
+    # response-loss reconciliation, but a normal successful stream must not erase it.
+    if stream_metadata.get("logical_turn_id") is None:
+        stream_metadata["logical_turn_id"] = response.get("logical_turn_id")
+    if stream_metadata.get("revision") is None:
+        stream_metadata["revision"] = response.get("revision")
     resolved_conversation_id = _extract_conversation_id(response, conversation_id)
+    generation_failure = (
+        stream_metadata.get("generation_failure")
+        if isinstance(stream_metadata.get("generation_failure"), dict)
+        else None
+    )
+    if generation_failure is not None:
+        error_class = normalized_scheduled_generation_failure_class(
+            generation_failure.get("error_class")
+        )
+        failure_retryable = generation_failure.get("failure_retryable")
+        external_work: Dict[str, Any] = {}
+        if idempotency_key:
+            reconcile_url = (
+                f"{base_url}/api/viventium/scheduler/dispatches/"
+                f"{urllib.parse.quote(idempotency_key, safe='')}?"
+                f"{urllib.parse.urlencode({'userId': str(task.get('user_id') or '')})}"
+            )
+            reconciled = _get_json(reconcile_url, headers, timeout_s)
+            if isinstance(reconciled.get("externalWork"), dict):
+                external_work = dict(reconciled["externalWork"])
+        return {
+            "conversation_id": resolved_conversation_id,
+            "response_message_id": response_message_id or None,
+            "final_text": "",
+            "followup_text": "",
+            "generation_failure": {
+                "error_class": error_class,
+                **(
+                    {"failure_retryable": failure_retryable}
+                    if isinstance(failure_retryable, bool)
+                    else {}
+                ),
+            },
+            "logical_turn_id": stream_metadata.get("logical_turn_id"),
+            "revision": stream_metadata.get("revision"),
+            "external_work": external_work,
+            "execution": {
+                **execution_receipt,
+                **({"source_prompt_id": source_prompt_id} if source_prompt_id else {}),
+            },
+        }
     polled_state = {"followup_text": "", "canonical_text": "", "canonical_text_source": ""}
     final_text_source = "stream_final" if str(final_text or "").strip() else ""
     final_text_fallback_reason = ""
@@ -1707,6 +2325,17 @@ def _run_scheduler_generation(
         run_context,
     )
 
+    external_work: Dict[str, Any] = {}
+    if idempotency_key:
+        reconcile_url = (
+            f"{base_url}/api/viventium/scheduler/dispatches/"
+            f"{urllib.parse.quote(idempotency_key, safe='')}?"
+            f"{urllib.parse.urlencode({'userId': str(task.get('user_id') or '')})}"
+        )
+        reconciled = _get_json(reconcile_url, headers, timeout_s)
+        if isinstance(reconciled.get("externalWork"), dict):
+            external_work = dict(reconciled["externalWork"])
+
     return {
         "conversation_id": resolved_conversation_id,
         "response_message_id": response_message_id or None,
@@ -1718,7 +2347,15 @@ def _run_scheduler_generation(
         "followup_text_fallback_reason": followup_text_fallback_reason,
         "suppressed_fallback_reason": suppressed_fallback_reason,
         "date_guard": date_guard,
-        "execution": execution,
+        "superseded": bool(stream_metadata.get("superseded")),
+        "disposition": "superseded" if stream_metadata.get("superseded") else "",
+        "logical_turn_id": stream_metadata.get("logical_turn_id"),
+        "revision": stream_metadata.get("revision"),
+        "external_work": external_work,
+        "execution": {
+            **execution_receipt,
+            **({"source_prompt_id": source_prompt_id} if source_prompt_id else {}),
+        },
     }
 
 
@@ -1801,12 +2438,22 @@ def _split_telegram_message(text: str, limit: int = 4000) -> list[str]:
     return parts
 
 
-def _send_telegram_message(chat_id: str, text: str, timeout_s: int) -> None:
+def _telegram_message_id(response: Any) -> Optional[str]:
+    if not isinstance(response, dict) or response.get("ok") is False:
+        return None
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return None
+    message_id = str(result.get("message_id") or "").strip()
+    return message_id or None
+
+
+def _send_telegram_message(chat_id: str, text: str, timeout_s: int) -> Optional[str]:
     token = _get_telegram_bot_token()
     if not token:
         raise RuntimeError("SCHEDULER_TELEGRAM_BOT_TOKEN or BOT_TOKEN is required for Telegram delivery")
     if not text:
-        return
+        return None
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     headers = {"Content-Type": "application/json"}
     rendered = render_telegram_markdown(text)
@@ -1818,27 +2465,23 @@ def _send_telegram_message(chat_id: str, text: str, timeout_s: int) -> None:
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    try:
-        response = _post_json(url, payload, headers, timeout_s)
-        # === VIVENTIUM NOTE ===
-        # Feature: Detect Telegram ok=false responses and fallback to plain text.
-        if isinstance(response, dict) and response.get("ok") is False:
-            description = str(response.get("description") or "")
-            logger.warning("Telegram send failed (ok=false): %s", description)
-            if "parse" in description.lower():
-                payload.pop("parse_mode", None)
-                payload["text"] = _strip_html_tags(rendered) or _strip_markdown(_sanitize_telegram_text(text))
-                _post_json(url, payload, headers, timeout_s)
-                return
-            raise RuntimeError(description or "Telegram send failed")
-        # === VIVENTIUM NOTE ===
-    except Exception:
-        payload.pop("parse_mode", None)
-        payload["text"] = _strip_html_tags(rendered) or _strip_markdown(_sanitize_telegram_text(text))
-        _post_json(url, payload, headers, timeout_s)
+    response = _post_json(url, payload, headers, timeout_s)
+    # === VIVENTIUM NOTE ===
+    # Feature: Retry only Telegram's explicit parse rejection. A transport exception can
+    # mean Telegram accepted the first send and its response was lost; retrying would spam.
+    if isinstance(response, dict) and response.get("ok") is False:
+        description = str(response.get("description") or "")
+        logger.warning("Telegram send failed (ok=false): %s", description)
+        if "parse" in description.lower():
+            payload.pop("parse_mode", None)
+            payload["text"] = _strip_html_tags(rendered) or _strip_markdown(_sanitize_telegram_text(text))
+            return _telegram_message_id(_post_json(url, payload, headers, timeout_s))
+        raise RuntimeError(description or "Telegram send failed")
+    # === VIVENTIUM NOTE ===
+    return _telegram_message_id(response)
 
 
-def _send_telegram_audio(chat_id: str, audio_bytes: bytes, timeout_s: int) -> None:
+def _send_telegram_audio(chat_id: str, audio_bytes: bytes, timeout_s: int) -> Optional[str]:
     token = _get_telegram_bot_token()
     if not token:
         raise RuntimeError("SCHEDULER_TELEGRAM_BOT_TOKEN or BOT_TOKEN is required for Telegram delivery")
@@ -1860,7 +2503,12 @@ def _send_telegram_audio(chat_id: str, audio_bytes: bytes, timeout_s: int) -> No
     )
     if isinstance(response, dict) and response.get("ok") is False:
         description = str(response.get("description") or "")
-        raise RuntimeError(description or "Telegram sendAudio failed")
+        raise TelegramDefiniteRejection(description or "Telegram sendAudio failed")
+    return _telegram_message_id(response)
+
+
+class TelegramDefiniteRejection(RuntimeError):
+    """Telegram explicitly rejected a request, so a fallback cannot duplicate it."""
 
 
 def _send_telegram_voice_or_text(
@@ -1868,23 +2516,20 @@ def _send_telegram_voice_or_text(
     text: str,
     timeout_s: int,
     voice_preferences: Dict[str, bool],
-) -> bool:
+) -> Optional[str]:
     if not text:
-        return False
+        return None
     if not _should_send_scheduler_voice(text, voice_preferences):
-        _send_telegram_message(chat_id, text, timeout_s)
-        return False
+        return _send_telegram_message(chat_id, text, timeout_s)
 
     audio_bytes = _synthesize_tts(text, timeout_s)
     if audio_bytes:
         try:
-            _send_telegram_audio(chat_id, audio_bytes, timeout_s)
-            return True
-        except Exception as exc:
+            return _send_telegram_audio(chat_id, audio_bytes, timeout_s)
+        except TelegramDefiniteRejection as exc:
             logger.warning("Telegram sendAudio failed, falling back to text: %s", exc)
 
-    _send_telegram_message(chat_id, text, timeout_s)
-    return False
+    return _send_telegram_message(chat_id, text, timeout_s)
 
 
 def _resolve_conversation_id(task: Dict[str, Any]) -> str:
@@ -2250,6 +2895,8 @@ def _glasshive_base_url() -> str:
     return (
         os.getenv("GLASSHIVE_RUNTIME_URL")
         or os.getenv("WPR_API_URL")
+        or os.getenv("GLASSHIVE_RUNTIME_BASE_URL")
+        or os.getenv("WPR_MCP_BASE_URL")
         or "http://127.0.0.1:8766"
     ).rstrip("/")
 
@@ -2434,9 +3081,27 @@ def _refresh_workbench_rendered_prompt(
     reasoning_effort = str(
         execution_metadata.get("reasoning_effort") or wb.get("reasoning_effort") or ""
     ).strip()
-    if execution_profile == "codex-cli":
-        execution_model = _workbench_codex_model(execution_model)
-        reasoning_effort = _workbench_codex_reasoning_effort(reasoning_effort)
+    execution_model = _glasshive_profile_model(execution_profile, execution_model)
+    reasoning_effort = _glasshive_profile_reasoning_effort(
+        execution_profile, reasoning_effort
+    )
+    fallback_worker_route = _glasshive_fallback_worker_route(
+        {
+            "execution_profile": execution_profile,
+            "fallback_worker_profile": execution_metadata.get(
+                "fallback_worker_profile"
+            )
+            or wb.get("fallback_worker_profile"),
+            "fallback_worker_model": execution_metadata.get(
+                "fallback_worker_model"
+            )
+            or wb.get("fallback_worker_model"),
+            "fallback_reasoning_effort": execution_metadata.get(
+                "fallback_reasoning_effort"
+            )
+            or wb.get("fallback_reasoning_effort"),
+        }
+    )
 
     patched_wb.update(
         {
@@ -2465,6 +3130,15 @@ def _refresh_workbench_rendered_prompt(
             "workspace_root": execution_metadata.get("workspace_root") or wb.get("workspace_root"),
         }
     )
+    for field in (
+        "fallback_worker_profile",
+        "fallback_worker_model",
+        "fallback_reasoning_effort",
+    ):
+        if field in fallback_worker_route:
+            patched_wb[field] = fallback_worker_route[field]
+        else:
+            patched_wb.pop(field, None)
     persisted_wb = dict(patched_wb)
     persisted_wb.pop("variable_snapshot_json", None)
     persisted_wb.pop("periphery_snapshot_json", None)
@@ -2483,7 +3157,7 @@ def _refresh_workbench_rendered_prompt(
     runtime_metadata = dict(patched_metadata)
     runtime_metadata["workbench_scheduled_prompt"] = patched_wb
     if updated_task:
-        patched_task = dict(updated_task)
+        patched_task = _restore_scheduled_prompt_runtime_context(updated_task, task)
         patched_task["next_run_at"] = dispatched_occurrence
         patched_task["prompt"] = rendered
         patched_task["metadata"] = runtime_metadata
@@ -2496,12 +3170,45 @@ def _refresh_workbench_rendered_prompt(
 
 def _write_private_run_detail(run_id: str, payload: Dict[str, Any]) -> str:
     path = _private_workbench_run_dir() / f"{run_id}.json"
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    _replace_private_run_detail(path, payload)
     return str(path)
+
+
+def _replace_private_run_detail(path: Path, payload: Dict[str, Any]) -> None:
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix=f".{path.name}.",
+        dir=str(path.parent),
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _patch_private_run_detail(path_value: str, updates: Dict[str, Any]) -> bool:
+    path = Path(str(path_value or "")).expanduser()
+    if not path_value or not path.exists():
+        return False
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        current = {}
+    if not isinstance(current, dict):
+        current = {}
+    current.update(updates)
+    _replace_private_run_detail(path, current)
+    return True
 
 
 _LOCAL_PATH_RE = re.compile(r"(?:/Users|/home|/private/var|/var/folders)/[^\s`'\"<>]+")
@@ -2522,9 +3229,14 @@ def _safe_result_summary(text: Any, limit: int = 2000) -> str:
     return value[: limit - 1].rstrip() + "..."
 
 
-def _scheduled_prompt_error_class(exc: Exception) -> str:
-    if isinstance(exc, HttpJsonError) and (exc.failure_class or exc.reason):
-        return _safe_result_summary(exc.failure_class or exc.reason, limit=128)
+def _scheduled_prompt_error_class(exc: Exception, task: Optional[Dict[str, Any]] = None) -> str:
+    if task is not None:
+        return str(scheduled_exception_failure(task, exc)["error_class"])
+    if isinstance(exc, HttpJsonError) and exc.failure_class:
+        candidate = _safe_result_summary(exc.failure_class, limit=128)
+        if re.fullmatch(r"[a-z0-9_.:-]{1,128}", candidate):
+            return candidate
+        return "glasshive_http_error"
     return exc.__class__.__name__
 
 
@@ -2532,8 +3244,91 @@ def _glasshive_execution_profile(wb: Dict[str, Any]) -> str:
     return str(wb.get("execution_profile") or "codex-cli").strip() or "codex-cli"
 
 
+_GLASSHIVE_WORKER_PROFILES = {"codex-cli", "claude-code", "openclaw-general"}
+
+
+def _glasshive_fallback_worker_profile(wb: Dict[str, Any]) -> str:
+    primary_profile = _glasshive_execution_profile(wb)
+    fallback_profile = str(wb.get("fallback_worker_profile") or "").strip()
+    if (
+        fallback_profile not in _GLASSHIVE_WORKER_PROFILES
+        or fallback_profile == primary_profile
+    ):
+        return ""
+    return fallback_profile
+
+
+def _glasshive_profile_model(profile: str, value: Any = None) -> str:
+    clean_profile = str(profile or "").strip()
+    if clean_profile == "codex-cli":
+        return _workbench_codex_model(value)
+    if clean_profile == "claude-code":
+        return str(os.getenv("WPR_MODEL_CLAUDE_CODE") or value or "").strip()
+    return str(value or "").strip()
+
+
+def _glasshive_profile_reasoning_effort(profile: str, value: Any = None) -> str:
+    clean_profile = str(profile or "").strip()
+    if clean_profile == "codex-cli":
+        return _workbench_codex_reasoning_effort(value)
+    if clean_profile == "claude-code":
+        configured = str(os.getenv("WPR_CLAUDE_CODE_EFFORT") or "").strip().lower()
+        if configured in {"default", "max"}:
+            return configured
+        requested = str(value or "").strip().lower()
+        return requested if requested in {"default", "max"} else ""
+    return str(value or "").strip().lower()
+
+
+def _glasshive_fallback_worker_route(wb: Dict[str, Any]) -> Dict[str, str]:
+    fallback_profile = _glasshive_fallback_worker_profile(wb)
+    if not fallback_profile:
+        return {}
+    fallback_model = _glasshive_profile_model(
+        fallback_profile, wb.get("fallback_worker_model")
+    )
+    fallback_effort = _glasshive_profile_reasoning_effort(
+        fallback_profile, wb.get("fallback_reasoning_effort")
+    )
+    if not fallback_model or not fallback_effort:
+        raise RuntimeError(
+            "Prompt Workbench fallback automation requires an exact model and reasoning effort"
+        )
+    return {
+        "fallback_worker_profile": fallback_profile,
+        "fallback_worker_model": fallback_model,
+        "fallback_reasoning_effort": fallback_effort,
+    }
+
+
+def _glasshive_execution_model(wb: Dict[str, Any]) -> str:
+    profile = _glasshive_execution_profile(wb)
+    return _glasshive_profile_model(profile, wb.get("execution_model"))
+
+
+def _verify_workbench_worker_tuple(
+    worker: Dict[str, Any], expected: Dict[str, str]
+) -> None:
+    mismatches = {
+        field: {
+            "expected": str(expected.get(field) or ""),
+            "actual": str(worker.get(field) or ""),
+        }
+        for field in ("profile", "model", "execution_mode")
+        if str(worker.get(field) or "") != str(expected.get(field) or "")
+    }
+    if mismatches:
+        fields = ", ".join(sorted(mismatches))
+        raise RuntimeError(
+            f"GlassHive Workbench worker tuple mismatch for: {fields}"
+        )
+
+
 def _glasshive_execution_mode(wb: Dict[str, Any]) -> str:
-    return str(wb.get("execution_mode") or "host").strip() or "host"
+    mode = str(wb.get("execution_mode") or "host").strip().lower() or "host"
+    if mode not in {"host", "docker"}:
+        raise RuntimeError(f"Unsupported GlassHive execution mode: {mode}")
+    return mode
 
 
 def _glasshive_execution_backend(wb: Dict[str, Any]) -> str:
@@ -2566,22 +3361,42 @@ def _can_recover_workbench_host_dependency_to_docker(
     *,
     execution_mode: str,
     workspace_root: str,
+    artifact_contract: Dict[str, Any] | None = None,
+    memory_write_mode: str = "off",
+    my_folder: str = "",
 ) -> bool:
     if not isinstance(exc, HttpJsonError):
         return False
-    if exc.failure_class != "runtime_dependency_missing":
+    if exc.failure_class not in {
+        "runtime_dependency_missing",
+        "parallel_execution_isolation_required",
+    }:
         return False
     if execution_mode != "host":
         return False
-    if workspace_root:
+    if exc.failure_class == "runtime_dependency_missing" and workspace_root:
         return False
-    return True
+    has_supported_artifact_return = bool(artifact_contract) and memory_write_mode == "off"
+    if exc.failure_class == "parallel_execution_isolation_required":
+        return has_supported_artifact_return
+    # The established dependency-missing fallback may still return the worker's final report for
+    # a custom memory-off prompt. Memory proposal/apply modes remain on the host because their
+    # governed writeback contract is not available inside an isolated workspace.
+    return memory_write_mode == "off"
 
 
-def _glasshive_instruction(task: Dict[str, Any], wb: Dict[str, Any]) -> str:
+def _isolated_workbench_text(text: Any, my_folder: Any) -> str:
+    return rebase_isolated_workbench_text(text, my_folder)
+
+
+def _glasshive_instruction(
+    task: Dict[str, Any], wb: Dict[str, Any], *, isolated_artifacts: bool = False
+) -> str:
     memory_mode = str(wb.get("memory_write_mode") or "off").strip()
     my_folder = str(wb.get("my_folder") or "").strip()
     rendered = str(task.get("prompt") or "").strip()
+    if isolated_artifacts:
+        rendered = _isolated_workbench_text(rendered, my_folder)
     governance = [
         "You are executing a Prompt Workbench scheduled prompt through GlassHive.",
         "Use the rendered prompt and provided snapshot files as the source of truth.",
@@ -2591,7 +3406,11 @@ def _glasshive_instruction(task: Dict[str, Any], wb: Dict[str, Any]) -> str:
         "If memory write mode is propose, write governed memory proposals only.",
         "If memory write mode is apply_governed, write structured proposals; Scheduling Cortex/Workbench applies them through governed Viventium/LibreChat memory methods. Never direct-write memory collections.",
     ]
-    if my_folder:
+    if isolated_artifacts:
+        governance.append(
+            "This run is isolated. Write declared user-facing artifacts under the relative `artifacts/` root; Scheduling Cortex validates and imports supported artifact contracts after completion."
+        )
+    elif my_folder:
         governance.append(f"Private scratchpad folder: {my_folder}")
         governance.append(
             "For memory proposals, write UTF-8 JSON under that folder named memory-proposals-yyyymmddHHmm.json with an actions array of set/delete objects."
@@ -2600,20 +3419,44 @@ def _glasshive_instruction(task: Dict[str, Any], wb: Dict[str, Any]) -> str:
     return "\n".join(governance).strip() + "\n\n" + rendered + "\n"
 
 
-def _glasshive_bootstrap_bundle(task: Dict[str, Any], wb: Dict[str, Any], run_id: str) -> Dict[str, Any]:
+def _glasshive_bootstrap_bundle(
+    task: Dict[str, Any],
+    wb: Dict[str, Any],
+    run_id: str,
+    *,
+    isolated_artifacts: bool = False,
+    execution_mode: str = "host",
+) -> Dict[str, Any]:
     rendered = str(task.get("prompt") or "")
+    if isolated_artifacts:
+        rendered = _isolated_workbench_text(rendered, wb.get("my_folder"))
     snapshot_json = str(wb.get("variable_snapshot_json") or "{}")
     execution_profile = str(wb.get("execution_profile") or "codex-cli").strip()
-    execution_model = _workbench_codex_model(wb.get("execution_model"))
-    reasoning_effort = _workbench_codex_reasoning_effort(wb.get("reasoning_effort"))
-    if execution_profile == "codex-cli" and not execution_model:
+    execution_model = _glasshive_profile_model(
+        execution_profile, wb.get("execution_model")
+    )
+    reasoning_effort = _glasshive_profile_reasoning_effort(
+        execution_profile, wb.get("reasoning_effort")
+    )
+    if not execution_model:
+        if execution_profile == "codex-cli":
+            raise RuntimeError(
+                "Prompt Workbench Codex automation requires "
+                "WPR_MODEL_HOST_CODEX_CLI or execution_model"
+            )
         raise RuntimeError(
-            "Prompt Workbench Codex automation requires WPR_MODEL_HOST_CODEX_CLI or execution_model"
+            "Prompt Workbench automation requires an exact configured execution model"
         )
-    if execution_profile == "codex-cli" and not reasoning_effort:
+    if not reasoning_effort:
+        if execution_profile == "codex-cli":
+            raise RuntimeError(
+                "Prompt Workbench Codex automation requires "
+                "WPR_CODEX_CLI_REASONING_EFFORT or reasoning_effort"
+            )
         raise RuntimeError(
-            "Prompt Workbench Codex automation requires WPR_CODEX_CLI_REASONING_EFFORT or reasoning_effort"
+            "Prompt Workbench automation requires an exact configured reasoning effort"
         )
+    fallback_worker_route = _glasshive_fallback_worker_route(wb)
     callbacks = {
         "events_webhook_url": _glasshive_callback_url(),
         "hmac_secret": _glasshive_callback_secret(),
@@ -2672,7 +3515,12 @@ def _glasshive_bootstrap_bundle(task: Dict[str, Any], wb: Dict[str, Any], run_id
                     "- Execute the rendered prompt.\n"
                     "- Use `work-log.md` for private notes.\n"
                     "- Write text files as UTF-8. If browser-checking markdown, serve it through `python3 scheduled-prompt/utf8_static_server.py` so the browser receives an explicit UTF-8 charset.\n"
-                    "- If you produce memory changes, write `memory-proposals-yyyymmddHHmm.json` in my_folder with `{ \"actions\": [{ \"action\": \"set\", \"key\": \"context\", \"value\": \"...\", \"reason\": \"...\" }] }`.\n"
+                    + (
+                        "- This isolated run may only return the declared supported artifact contract; do not create memory proposals.\n"
+                        if isolated_artifacts
+                        else "- If you produce memory changes, write `memory-proposals-yyyymmddHHmm.json` in my_folder with `{ \"actions\": [{ \"action\": \"set\", \"key\": \"context\", \"value\": \"...\", \"reason\": \"...\" }] }`.\n"
+                    )
+                    +
                     "- End with `FINAL REPORT:` containing outcome, artifacts, blockers, and next decision.\n"
                 ),
             },
@@ -2689,14 +3537,32 @@ def _glasshive_bootstrap_bundle(task: Dict[str, Any], wb: Dict[str, Any], run_id
             },
         ]
     )
+    clean_execution_mode = str(execution_mode or "host").strip().lower()
     bootstrap_env: Dict[str, str] = {}
-    if execution_profile == "codex-cli":
+    if clean_execution_mode == "host" and execution_profile == "codex-cli":
         bootstrap_env = {
             "WPR_MODEL_HOST_CODEX_CLI": execution_model,
             "WPR_CODEX_CLI_REASONING_EFFORT": reasoning_effort,
             "WPR_CODEX_CLI_IGNORE_USER_CONFIG": "true",
         }
-    return {
+    if clean_execution_mode == "docker":
+        primary_effort_env = (
+            "WPR_CODEX_CLI_REASONING_EFFORT"
+            if execution_profile == "codex-cli"
+            else "WPR_CLAUDE_CODE_EFFORT"
+        )
+        bootstrap_env[primary_effort_env] = reasoning_effort
+        fallback_profile = fallback_worker_route.get("fallback_worker_profile")
+        if fallback_profile:
+            fallback_effort_env = (
+                "WPR_CODEX_CLI_REASONING_EFFORT"
+                if fallback_profile == "codex-cli"
+                else "WPR_CLAUDE_CODE_EFFORT"
+            )
+            bootstrap_env[fallback_effort_env] = fallback_worker_route[
+                "fallback_reasoning_effort"
+            ]
+    bundle = {
         "callbacks": callbacks,
         "env": bootstrap_env,
         "agents_md": (
@@ -2709,6 +3575,33 @@ def _glasshive_bootstrap_bundle(task: Dict[str, Any], wb: Dict[str, Any], run_id
         ),
         "files": projected_files,
     }
+    if clean_execution_mode == "docker":
+        bundle["viventium_execution_authority_request"] = {
+            "version": 1,
+            "kind": "prompt_workbench_scheduled",
+            "execution_mode": "docker",
+            "primary": {
+                "worker_profile": execution_profile,
+                "model": execution_model,
+                "reasoning_effort": reasoning_effort,
+            },
+            **(
+                {
+                    "fallback": {
+                        "worker_profile": fallback_worker_route[
+                            "fallback_worker_profile"
+                        ],
+                        "model": fallback_worker_route["fallback_worker_model"],
+                        "reasoning_effort": fallback_worker_route[
+                            "fallback_reasoning_effort"
+                        ],
+                    }
+                }
+                if fallback_worker_route
+                else {}
+            ),
+        }
+    return bundle
 
 
 def _ensure_glasshive_project(storage: ScheduleStorage, task: Dict[str, Any], wb: Dict[str, Any]) -> str:
@@ -2790,12 +3683,29 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
     if not _glasshive_callback_secret():
         raise RuntimeError("SCHEDULING_GLASSHIVE_CALLBACK_SECRET is required for signed GlassHive callbacks")
 
-    trigger_kind = str(task.get("_scheduled_prompt_trigger_kind") or "unknown")
-    trigger_source = str(task.get("_scheduled_prompt_trigger_source") or "unverified_caller")
+    expected_preclaim = _scheduled_preclaim_context(task)
     storage = _scheduler_storage()
     task, wb = _refresh_workbench_rendered_prompt(storage, task, wb)
+    if expected_preclaim is not None:
+        refreshed_preclaim = _scheduled_preclaim_context(task, required=True)
+        if refreshed_preclaim != expected_preclaim:
+            raise RuntimeError(
+                "scheduled preclaim context changed during Workbench refresh; "
+                "refusing an unkeyed GlassHive dispatch"
+            )
+    trigger_kind = str(task.get("_scheduled_prompt_trigger_kind") or "unknown")
+    trigger_source = str(task.get("_scheduled_prompt_trigger_source") or "unverified_caller")
     now = datetime.now(timezone.utc)
     now_iso = to_utc_iso(now)
+    execution_mode = _glasshive_execution_mode(wb)
+    memory_write_mode = str(wb.get("memory_write_mode") or "off").strip() or "off"
+    my_folder = str(wb.get("my_folder") or "").strip()
+    supported_artifact_contract = isolated_periphery_contract(wb.get("template_id"))
+    artifact_return_contract = (
+        supported_artifact_contract
+        if execution_mode == "docker" and memory_write_mode == "off"
+        else None
+    )
     execution_snapshot = {
         "executor": "glasshive_host",
         "dispatch_idempotency_key": str(
@@ -2803,17 +3713,21 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             or task.get("_scheduled_prompt_run_id")
             or ""
         ),
-        "model": _workbench_codex_model(wb.get("execution_model")),
-        "reasoning_effort": _workbench_codex_reasoning_effort(wb.get("reasoning_effort")),
+        "model": _glasshive_execution_model(wb),
+        "reasoning_effort": _glasshive_profile_reasoning_effort(
+            _glasshive_execution_profile(wb), wb.get("reasoning_effort")
+        ),
         "profile": _glasshive_execution_profile(wb),
         "backend": _glasshive_execution_backend(wb),
-        "execution_mode": _glasshive_execution_mode(wb),
+        "execution_mode": execution_mode,
         **(
             {"source_prompt_id": source_prompt_id}
             if (source_prompt_id := _declared_scheduler_source_prompt_id(task))
             else {}
         ),
     }
+    fallback_worker_route = _glasshive_fallback_worker_route(wb)
+    execution_snapshot.update(fallback_worker_route)
     preclaimed_run_id = str(task.get("_scheduled_prompt_run_id") or "").strip()
     run_id = preclaimed_run_id or f"sp_run_{uuid.uuid4().hex}"
     rendered_text = str(task.get("prompt") or "")
@@ -2826,6 +3740,7 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "task_id": task.get("id"),
             "definition_id": wb.get("definition_id"),
             "version_id": wb.get("version_id"),
+            "template_id": wb.get("template_id"),
             "created_at": now_iso,
             "user_id": str(task.get("user_id") or ""),
             "memory_write_mode": wb.get("memory_write_mode") or "off",
@@ -2835,6 +3750,11 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "periphery_snapshot_ref": wb.get("periphery_snapshot_ref"),
             "trigger_kind": trigger_kind,
             "trigger_source": trigger_source,
+            **(
+                {"artifact_return": artifact_return_contract}
+                if artifact_return_contract
+                else {}
+            ),
         },
     )
     run_record = {
@@ -2896,6 +3816,11 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     try:
+        if execution_mode == "docker" and my_folder and not artifact_return_contract:
+            raise RuntimeError(
+                "Isolated Workbench execution requires a declared artifact return contract "
+                "and memory_write_mode=off when a private host folder is configured"
+            )
         base_url = _glasshive_base_url()
         timeout_s = int(os.getenv("SCHEDULER_GLASSHIVE_HTTP_TIMEOUT_S", "20"))
         execution_profile = _glasshive_execution_profile(wb)
@@ -2905,7 +3830,7 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
         if str(wb.get("glasshive_worker_strategy") or "same_worker").strip() == "new_worker_each_run":
             alias = f"{alias}-{run_id[-8:]}"
         workspace_root = str(wb.get("workspace_root") or "").strip()
-        base_bootstrap_bundle = _glasshive_bootstrap_bundle(task, wb, run_id)
+        isolated_artifacts = bool(artifact_return_contract)
         worker_payload = {
             "owner_id": str(task.get("user_id") or "workbench"),
             "name": str(wb.get("title") or "Workbench Scheduled Prompt"),
@@ -2916,10 +3841,70 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "alias": alias,
             "workspace_root": workspace_root,
             "bootstrap_profile": "prompt-workbench-scheduled-v1",
-            "bootstrap_bundle": base_bootstrap_bundle,
+            "bootstrap_bundle": _glasshive_bootstrap_bundle(
+                task,
+                wb,
+                run_id,
+                isolated_artifacts=isolated_artifacts,
+                execution_mode=execution_mode,
+            ),
         }
         runtime_recovery: Dict[str, Any] | None = None
         find_or_resume_url = f"{base_url}/v1/projects/{urllib.parse.quote(project_id)}/workers/find-or-resume"
+
+        def recover_worker_to_docker(exc: HttpJsonError) -> Dict[str, Any]:
+            nonlocal artifact_return_contract, execution_mode, isolated_artifacts
+            nonlocal runtime_recovery, worker_payload, workspace_root
+            if not _can_recover_workbench_host_dependency_to_docker(
+                exc,
+                execution_mode=execution_mode,
+                workspace_root=workspace_root,
+                artifact_contract=supported_artifact_contract,
+                memory_write_mode=memory_write_mode,
+                my_folder=my_folder,
+            ):
+                raise exc
+            artifact_return_contract = (
+                supported_artifact_contract if memory_write_mode == "off" else None
+            )
+            isolated_artifacts = bool(artifact_return_contract)
+            runtime_recovery = {
+                "from_execution_mode": "host",
+                "to_execution_mode": "docker",
+                "reason_class": exc.failure_class,
+                "artifact_return": artifact_return_contract,
+            }
+            worker_payload = dict(worker_payload)
+            worker_payload["execution_mode"] = "docker"
+            worker_payload["workspace_root"] = ""
+            worker_payload["bootstrap_bundle"] = _glasshive_bootstrap_bundle(
+                task,
+                wb,
+                run_id,
+                isolated_artifacts=isolated_artifacts,
+                execution_mode="docker",
+            )
+            detail_updates: Dict[str, Any] = {"runtime_recovery": runtime_recovery}
+            if artifact_return_contract:
+                detail_updates["artifact_return"] = artifact_return_contract
+            recovery_recorded = _patch_private_run_detail(
+                private_detail_path,
+                detail_updates,
+            )
+            if not recovery_recorded:
+                raise RuntimeError(
+                    "Isolated Workbench recovery could not persist its private artifact contract"
+                )
+            recovered = _post_json(
+                find_or_resume_url,
+                worker_payload,
+                _glasshive_headers(),
+                timeout_s,
+            )
+            execution_mode = "docker"
+            workspace_root = ""
+            return recovered
+
         try:
             worker = _post_json(
                 find_or_resume_url,
@@ -2928,32 +3913,15 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 timeout_s,
             )
         except HttpJsonError as exc:
-            if not _can_recover_workbench_host_dependency_to_docker(
-                exc,
-                execution_mode=execution_mode,
-                workspace_root=workspace_root,
-            ):
-                raise
-            runtime_recovery = {
-                "from_execution_mode": "host",
-                "to_execution_mode": "docker",
-                "reason_class": exc.failure_class,
-            }
-            worker_payload = dict(worker_payload)
-            worker_payload["execution_mode"] = "docker"
-            execution_mode = "docker"
-            _patch_private_run_detail(
-                private_detail_path,
-                {
-                    "glasshive_capability_recovery": runtime_recovery,
-                },
-            )
-            worker = _post_json(
-                find_or_resume_url,
-                worker_payload,
-                _glasshive_headers(),
-                timeout_s,
-            )
+            worker = recover_worker_to_docker(exc)
+        _verify_workbench_worker_tuple(
+            worker,
+            {
+                "profile": execution_profile,
+                "model": str(execution_snapshot.get("model") or ""),
+                "execution_mode": execution_mode,
+            },
+        )
         worker_id = str(worker.get("worker_id") or "").strip()
         if not worker_id:
             raise RuntimeError("GlassHive worker find-or-resume did not return worker_id")
@@ -2962,32 +3930,88 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             or task.get("_scheduled_prompt_run_id")
             or run_id
         ).strip()
-        assign_url = f"{base_url}/v1/workers/{urllib.parse.quote(worker_id)}/assign"
-        assign_headers = _glasshive_headers()
-        assign_headers["X-GlassHive-Idempotency-Key"] = dispatch_key
-        try:
-            run = _post_json(
-                assign_url,
-                {"instruction": _glasshive_instruction(task, wb)},
-                assign_headers,
-                timeout_s,
-            )
-        except (urllib.error.URLError, TimeoutError):
-            reconcile_url = (
-                f"{base_url}/v1/workers/{urllib.parse.quote(worker_id)}/"
-                f"assignments/by-idempotency/{urllib.parse.quote(dispatch_key, safe='')}"
-            )
-            try:
-                run = _get_json(reconcile_url, assign_headers, timeout_s)
-            except HttpJsonError as error:
-                if error.status != 404:
-                    raise
-                run = _post_json(
-                    assign_url,
-                    {"instruction": _glasshive_instruction(task, wb)},
-                    assign_headers,
-                    timeout_s,
+        def assignment_request() -> tuple[str, Dict[str, str], Dict[str, Any]]:
+            url = f"{base_url}/v1/workers/{urllib.parse.quote(worker_id)}/assign"
+            headers = _glasshive_headers()
+            headers["X-GlassHive-Idempotency-Key"] = dispatch_key
+            payload = {
+                "instruction": _glasshive_instruction(
+                    task,
+                    wb,
+                    isolated_artifacts=isolated_artifacts,
                 )
+            }
+            return url, headers, payload
+
+        def assign_with_reconciliation() -> Dict[str, Any]:
+            assign_url, assign_headers, assign_payload = assignment_request()
+            try:
+                return _post_json(
+                    assign_url, assign_payload, assign_headers, timeout_s
+                )
+            except (urllib.error.URLError, TimeoutError):
+                reconcile_url = (
+                    f"{base_url}/v1/workers/{urllib.parse.quote(worker_id)}/"
+                    "assignments/by-idempotency/"
+                    f"{urllib.parse.quote(dispatch_key, safe='')}"
+                )
+                try:
+                    return _get_json(reconcile_url, assign_headers, timeout_s)
+                except HttpJsonError as error:
+                    if error.status != 404:
+                        raise
+                    return _post_json(
+                        assign_url, assign_payload, assign_headers, timeout_s
+                    )
+
+        effective_execution_snapshot = {
+            **execution_snapshot,
+            "effective_execution_mode": execution_mode,
+            **({"runtime_recovery": runtime_recovery} if runtime_recovery else {}),
+        }
+        # Bind the worker before assignment. GlassHive may emit a signed queued/started callback
+        # immediately after accepting the POST, and the callback must never race this identity.
+        storage.update_scheduled_prompt_run(
+            run_id,
+            {
+                "status": "dispatching",
+                "glasshive_project_id": project_id,
+                "glasshive_worker_id": worker_id,
+                "execution_snapshot": effective_execution_snapshot,
+                "updated_at": to_utc_iso(datetime.now(timezone.utc)),
+            },
+        )
+        try:
+            run = assign_with_reconciliation()
+        except HttpJsonError as exc:
+            worker = recover_worker_to_docker(exc)
+            _verify_workbench_worker_tuple(
+                worker,
+                {
+                    "profile": execution_profile,
+                    "model": str(execution_snapshot.get("model") or ""),
+                    "execution_mode": execution_mode,
+                },
+            )
+            worker_id = str(worker.get("worker_id") or "").strip()
+            if not worker_id:
+                raise RuntimeError("GlassHive recovery did not return worker_id")
+            effective_execution_snapshot = {
+                **execution_snapshot,
+                "effective_execution_mode": execution_mode,
+                "runtime_recovery": runtime_recovery,
+            }
+            storage.update_scheduled_prompt_run(
+                run_id,
+                {
+                    "status": "dispatching",
+                    "glasshive_project_id": project_id,
+                    "glasshive_worker_id": worker_id,
+                    "execution_snapshot": effective_execution_snapshot,
+                    "updated_at": to_utc_iso(datetime.now(timezone.utc)),
+                },
+            )
+            run = assign_with_reconciliation()
         glasshive_run_id = str(run.get("run_id") or "").strip()
         if not glasshive_run_id:
             raise RuntimeError("GlassHive assign did not return run_id")
@@ -3000,14 +4024,23 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 "glasshive_run_id": glasshive_run_id,
                 "result_summary": "GlassHive run queued after host runtime recovery to docker."
                 if runtime_recovery
-                else "GlassHive host run queued.",
+                else (
+                    "GlassHive isolated run queued."
+                    if execution_mode == "docker"
+                    else "GlassHive host run queued."
+                ),
+                "execution_snapshot": effective_execution_snapshot,
                 "updated_at": to_utc_iso(datetime.now(timezone.utc)),
             },
         )
         delivery_reason = (
             "glasshive_runtime_recovered_run_queued"
             if runtime_recovery
-            else "glasshive_host_run_queued"
+            else (
+                "glasshive_isolated_run_queued"
+                if execution_mode == "docker"
+                else "glasshive_host_run_queued"
+            )
         )
         return {
             "delivery": {
@@ -3026,16 +4059,26 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             },
             "scheduled_prompt_run_id": run_id,
             "glasshive_run_id": glasshive_run_id,
-            "execution": execution_snapshot,
+            "execution": effective_execution_snapshot,
         }
     except Exception as exc:
+        failure = scheduled_exception_failure(task, exc)
+        failure_snapshot = {
+            **execution_snapshot,
+            **(
+                {"provider_route_decision": failure["provider_route_decision"]}
+                if failure.get("provider_route_decision")
+                else {}
+            ),
+        }
         storage.update_scheduled_prompt_run(
             run_id,
             {
                 "status": "failed",
                 "completed_at": to_utc_iso(datetime.now(timezone.utc)),
-                "error_class": _scheduled_prompt_error_class(exc),
+                "error_class": _scheduled_prompt_error_class(exc, task),
                 "result_summary": _safe_result_summary(str(exc)),
+                "execution_snapshot": failure_snapshot,
                 "updated_at": to_utc_iso(datetime.now(timezone.utc)),
             },
         )
@@ -3369,6 +4412,62 @@ def _build_librechat_delivery_detail(visibility: Dict[str, Any]) -> Dict[str, An
     return detail
 
 
+def _ack_scheduler_telegram_delivery(
+    *,
+    base_url: str,
+    logical_turn_id: Any,
+    revision: Any,
+    telegram_chat_id: Any,
+    telegram_message_ids: Any,
+    timeout_s: int,
+    schedule_id: Any = None,
+    schedule_run_id: Any = None,
+) -> str:
+    adapter_secret = str(os.getenv("VIVENTIUM_TELEGRAM_INTERACTION_ADAPTER_SECRET") or "").strip()
+    turn_id = str(logical_turn_id or "").strip()
+    chat_id = str(telegram_chat_id or "").strip()
+    message_ids = [
+        str(value).strip()
+        for value in (telegram_message_ids if isinstance(telegram_message_ids, list) else [])
+        if str(value).strip()
+    ]
+    try:
+        normalized_revision = int(revision)
+    except (TypeError, ValueError):
+        return "unavailable"
+    if not adapter_secret or not turn_id or not chat_id or not message_ids:
+        return "unavailable"
+    refs = [f"telegram:{chat_id}:{message_id}" for message_id in message_ids]
+    payload = {
+        "logical_turn_id": turn_id,
+        "revision": normalized_revision,
+        "state": "committed",
+        "presentation_ref": refs[-1],
+        "presentation_refs": refs,
+        "source_kind": "schedule_result",
+    }
+    normalized_schedule_id = str(schedule_id or "").strip()
+    normalized_schedule_run_id = str(schedule_run_id or "").strip()
+    if normalized_schedule_id:
+        payload["schedule_id"] = normalized_schedule_id
+    if normalized_schedule_run_id:
+        payload["schedule_run_id"] = normalized_schedule_run_id
+    response = _post_json(
+        f"{base_url.rstrip('/')}/api/viventium/interactions/delivery-ack",
+        payload,
+        {
+            "Content-Type": "application/json",
+            "x-viventium-adapter-secret": adapter_secret,
+        },
+        min(max(1, timeout_s), 10),
+    )
+    return (
+        "recorded"
+        if isinstance(response, dict) and response.get("acknowledged") is True
+        else str((response or {}).get("error") or "unavailable")
+    )
+
+
 def _deliver_telegram_generated_text(
     task: Dict[str, Any],
     base_url: str,
@@ -3383,6 +4482,9 @@ def _deliver_telegram_generated_text(
     telegram_user_id = None
     telegram_chat_id = None
     voice_preferences: Dict[str, Any] = {}
+    telegram_message_ids: list[str] = []
+    delivery_receipt_state = "not_applicable"
+    delivery_unknown_reason = ""
     if final_text or followup_text:
         telegram_user_id, telegram_chat_id, voice_preferences = _resolve_telegram_identity(
             task,
@@ -3394,28 +4496,110 @@ def _deliver_telegram_generated_text(
         if not telegram_chat_id:
             raise RuntimeError("telegram_chat_id is required for Telegram dispatch")
 
-    if final_text:
-        for part in _split_telegram_message(final_text):
-            _send_telegram_voice_or_text(
+    parts = _split_telegram_message(final_text) + _split_telegram_message(followup_text)
+    run_id = str(task.get("_scheduled_prompt_run_id") or "").strip()
+    occurrence_key = str(task.get("_scheduled_prompt_occurrence_key") or "").strip()
+    if run_id and parts and not _get_telegram_bot_token():
+        raise RuntimeError(
+            "SCHEDULER_TELEGRAM_BOT_TOKEN or BOT_TOKEN is required for Telegram delivery"
+        )
+    delivery_storage = _scheduler_storage() if run_id and parts else None
+    delivery_lease_owner = f"telegram:{uuid.uuid4().hex}"
+    for part_index, part in enumerate(parts):
+        delivery_key = ""
+        if delivery_storage is not None:
+            payload_hash = _sha256_prefix(
+                json.dumps(
+                    {
+                        "chat_id": str(telegram_chat_id),
+                        "text": part,
+                        "voice_preferences": voice_preferences,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                length=64,
+            )
+            claim = delivery_storage.claim_scheduled_prompt_delivery(
+                run_id=run_id,
+                occurrence_key=occurrence_key or None,
+                channel="telegram",
+                part_index=part_index,
+                payload_hash=payload_hash,
+                lease_owner=delivery_lease_owner,
+                now=to_utc_iso(datetime.now(timezone.utc)),
+                lease_seconds=max(30, send_timeout_s + 15),
+            )
+            delivery_key = str(claim.get("delivery_key") or "")
+            if not claim.get("claimed"):
+                persisted = claim.get("delivery") if isinstance(claim.get("delivery"), dict) else {}
+                persisted_message_id = str(persisted.get("message_id") or "").strip()
+                if claim.get("reason") == "already_sent" and persisted_message_id:
+                    telegram_message_ids.append(persisted_message_id)
+                    delivery_receipt_state = "confirmed"
+                    continue
+                delivery_receipt_state = "unknown"
+                delivery_unknown_reason = str(claim.get("reason") or "delivery_unknown")
+                break
+        try:
+            sent_message_id = _send_telegram_voice_or_text(
                 str(telegram_chat_id),
                 part,
                 send_timeout_s,
                 voice_preferences,
             )
-
-    if followup_text:
-        for part in _split_telegram_message(followup_text):
-            _send_telegram_voice_or_text(
-                str(telegram_chat_id),
-                part,
-                send_timeout_s,
-                voice_preferences,
+        except Exception as exc:
+            if delivery_storage is not None and delivery_key:
+                delivery_storage.mark_scheduled_prompt_delivery_unknown(
+                    delivery_key=delivery_key,
+                    lease_owner=delivery_lease_owner,
+                    now=to_utc_iso(datetime.now(timezone.utc)),
+                    error_class=type(exc).__name__,
+                )
+                delivery_receipt_state = "unknown"
+                delivery_unknown_reason = "transport_response_missing"
+                break
+            raise
+        normalized_message_id = (
+            str(sent_message_id).strip()
+            if isinstance(sent_message_id, (str, int)) and str(sent_message_id).strip()
+            else ""
+        )
+        if not normalized_message_id:
+            if delivery_storage is not None and delivery_key:
+                delivery_storage.mark_scheduled_prompt_delivery_unknown(
+                    delivery_key=delivery_key,
+                    lease_owner=delivery_lease_owner,
+                    now=to_utc_iso(datetime.now(timezone.utc)),
+                    error_class="telegram_receipt_missing",
+                )
+                delivery_receipt_state = "unknown"
+                delivery_unknown_reason = "telegram_receipt_missing"
+                break
+            continue
+        if delivery_storage is not None and delivery_key:
+            completed = delivery_storage.complete_scheduled_prompt_delivery(
+                delivery_key=delivery_key,
+                lease_owner=delivery_lease_owner,
+                message_id=normalized_message_id,
+                now=to_utc_iso(datetime.now(timezone.utc)),
             )
+            persisted = (
+                completed.get("delivery")
+                if isinstance(completed.get("delivery"), dict)
+                else {}
+            )
+            if not completed.get("updated") and str(persisted.get("state") or "") != "sent":
+                delivery_receipt_state = "unknown"
+                delivery_unknown_reason = "receipt_commit_conflict"
+                break
+        telegram_message_ids.append(normalized_message_id)
+        delivery_receipt_state = "confirmed"
 
     raw_final_text = visibility.get("raw_final_text") or ""
     raw_followup_text = visibility.get("raw_followup_text") or ""
-    sent_final = bool(final_text)
-    sent_followup = bool(followup_text)
+    sent_final = bool(final_text) and delivery_receipt_state != "unknown"
+    sent_followup = bool(followup_text) and delivery_receipt_state != "unknown"
 
     def _suppressed_marker(raw_text: str, suppress_reason: str) -> Optional[str]:
         cleaned_raw = raw_text.strip() if isinstance(raw_text, str) else ""
@@ -3425,7 +4609,10 @@ def _deliver_telegram_generated_text(
             return cleaned_raw
         return None
 
-    if sent_final or sent_followup:
+    if delivery_receipt_state == "unknown":
+        outcome = "delivery_unknown"
+        reason = "telegram_delivery_ambiguous"
+    elif sent_final or sent_followup:
         if visibility.get("fallback_delivered"):
             outcome = "fallback_delivered"
             reason = _fallback_reason(visibility.get("fallback_reason"))
@@ -3457,7 +4644,14 @@ def _deliver_telegram_generated_text(
         "final_text_source": visibility.get("final_text_source") or "",
         "followup_text_source": visibility.get("followup_text_source") or "",
         "fallback_delivered": bool(visibility.get("fallback_delivered")),
+        "delivery_receipt_state": delivery_receipt_state,
     }
+    if delivery_unknown_reason:
+        detail["delivery_unknown_reason"] = delivery_unknown_reason
+    if telegram_chat_id:
+        detail["telegram_chat_id"] = str(telegram_chat_id)
+    if telegram_message_ids:
+        detail["telegram_message_ids"] = telegram_message_ids
     late_delivery = visibility.get("late_delivery")
     if isinstance(late_delivery, dict):
         detail["late_delivery"] = late_delivery
@@ -3465,6 +4659,119 @@ def _deliver_telegram_generated_text(
     if isinstance(date_guard, dict) and date_guard:
         detail["date_guard"] = date_guard
     return detail
+
+
+def scheduled_failure_result(
+    task: Dict[str, Any],
+    error_class: Any,
+    failure_retryable: Optional[bool] = None,
+    generation_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Close every scheduler failure through the same user-visible transition contract."""
+    generation = generation_result if isinstance(generation_result, dict) else {}
+    normalized = normalized_scheduled_generation_failure_class(error_class)
+    transition = resolve_scheduled_failure_transition(task, normalized, failure_retryable)
+    notice = _scheduled_generation_failure_notice(
+        normalized,
+        transition["retryable"],
+        transition["retry_disposition"],
+        transition.get("next_attempt_at"),
+    )
+    channels = _normalize_dispatch_channels(task.get("channel"))
+    base_url = (
+        os.getenv("SCHEDULER_LIBRECHAT_URL")
+        or os.getenv("VIVENTIUM_LIBRECHAT_ORIGIN")
+        or "http://localhost:3080"
+    ).rstrip("/")
+    timeout_s = int(os.getenv("SCHEDULER_HTTP_TIMEOUT_S", "15"))
+    failure_channels: Dict[str, Dict[str, Any]] = {}
+    channel_errors: Dict[str, Dict[str, Any]] = {}
+    if "librechat" in channels:
+        failure_channels["librechat"] = {
+            "channel": "librechat",
+            "outcome": "failed",
+            "reason": normalized,
+            "generated_text": None,
+            "response_message_id": generation.get("response_message_id"),
+        }
+    if "telegram" in channels:
+        if transition["already_reported_in_health_epoch"]:
+            failure_channels["telegram"] = {
+                "channel": "telegram",
+                "outcome": "suppressed",
+                "reason": "same_root_already_reported",
+                "generated_text": None,
+            }
+        else:
+            try:
+                visibility = _prepare_generated_visibility(task, notice, "")
+                telegram_detail = _deliver_telegram_generated_text(
+                    task,
+                    base_url,
+                    timeout_s,
+                    generation.get("response_message_id"),
+                    visibility,
+                )
+                telegram_detail["delivery_ack_status"] = _ack_scheduler_telegram_delivery(
+                    base_url=base_url,
+                    logical_turn_id=generation.get("logical_turn_id"),
+                    revision=generation.get("revision"),
+                    telegram_chat_id=telegram_detail.get("telegram_chat_id"),
+                    telegram_message_ids=telegram_detail.get("telegram_message_ids"),
+                    schedule_id=task.get("id"),
+                    schedule_run_id=task.get("_scheduled_prompt_run_id"),
+                    timeout_s=timeout_s,
+                )
+                telegram_detail["reason"] = "action_required"
+                failure_channels["telegram"] = telegram_detail
+                if telegram_detail.get("outcome") in {"sent", "fallback_delivered"}:
+                    transition["reported_failure_classes"] = sorted(
+                        set(transition.get("reported_failure_classes") or []) | {normalized}
+                    )
+            except Exception as exc:
+                channel_errors["telegram"] = _scheduled_channel_exception_failure(task, exc)
+                failure_channels["telegram"] = channel_errors["telegram"]
+                logger.warning(
+                    "[scheduling-cortex] Failure notice delivery failed: "
+                    "channel=%s task_id=%s error_class=%s",
+                    "telegram",
+                    task.get("id") or "unknown",
+                    channel_errors["telegram"]["error_class"],
+                )
+    if "workbench" in channels:
+        failure_channels["workbench"] = {
+            "channel": "workbench",
+            "outcome": "failed",
+            "reason": normalized,
+            "generated_text": None,
+        }
+    response: Dict[str, Any] = {
+        "conversation_id": generation.get("conversation_id"),
+        "response_message_id": generation.get("response_message_id"),
+        "generation_failure": {
+            "error_class": normalized,
+            "failure_retryable": transition["retryable"],
+            "transition": transition,
+        },
+        "delivery": {
+            "outcome": "failed",
+            "reason": normalized,
+            "generated_text": (
+                notice
+                if failure_channels.get("telegram", {}).get("outcome")
+                in {"sent", "fallback_delivered"}
+                else None
+            ),
+            "channels": failure_channels,
+        },
+    }
+    if channel_errors:
+        response["channel_errors"] = channel_errors
+    for key in ("execution", "external_work"):
+        value = generation.get(key)
+        if isinstance(value, dict) and value:
+            response[key] = value
+    return response
 
 
 def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -3487,14 +4794,34 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
     # keeps generated-vs-delivered ledgers truthful across channels.
     channels = _normalize_dispatch_channels(task.get("channel"))
     # === VIVENTIUM NOTE ===
-    base_url = os.getenv("SCHEDULER_LIBRECHAT_URL", "http://localhost:3080").rstrip("/")
+    base_url = (
+        os.getenv("SCHEDULER_LIBRECHAT_URL")
+        or os.getenv("VIVENTIUM_LIBRECHAT_ORIGIN")
+        or "http://localhost:3080"
+    ).rstrip("/")
     timeout_s = int(os.getenv("SCHEDULER_HTTP_TIMEOUT_S", "15"))
     conversation_id = _resolve_conversation_id(task)
 
     channel_results: Dict[str, Dict[str, Any]] = {}
-    errors: Dict[str, Dict[str, str]] = {}
+    errors: Dict[str, Dict[str, Any]] = {}
     generation_result = _run_scheduler_generation(task, base_url, timeout_s, conversation_id)
     resolved_conversation_id = generation_result.get("conversation_id")
+    generation_failure = (
+        generation_result.get("generation_failure")
+        if isinstance(generation_result.get("generation_failure"), dict)
+        else None
+    )
+    if generation_failure is not None:
+        error_class = normalized_scheduled_generation_failure_class(
+            generation_failure.get("error_class")
+        )
+        failure_retryable = generation_failure.get("failure_retryable")
+        return scheduled_failure_result(
+            task,
+            error_class,
+            failure_retryable if isinstance(failure_retryable, bool) else None,
+            generation_result,
+        )
     if generation_result.get("superseded") or generation_result.get("disposition") == "superseded":
         superseded_channels = {
             channel: {"outcome": "superseded", "reason": "newer_stable_turn"}
@@ -3532,28 +4859,35 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
     if "telegram" in channels:
         try:
+            telegram_detail = _deliver_telegram_generated_text(
+                task,
+                base_url,
+                timeout_s,
+                generation_result.get("response_message_id"),
+                visibility,
+            )
+            telegram_detail["delivery_ack_status"] = _ack_scheduler_telegram_delivery(
+                base_url=base_url,
+                logical_turn_id=generation_result.get("logical_turn_id"),
+                revision=generation_result.get("revision"),
+                telegram_chat_id=telegram_detail.get("telegram_chat_id"),
+                telegram_message_ids=telegram_detail.get("telegram_message_ids"),
+                schedule_id=task.get("id"),
+                schedule_run_id=task.get("_scheduled_prompt_run_id"),
+                timeout_s=timeout_s,
+            )
             channel_results["telegram"] = {
                 "conversation_id": resolved_conversation_id,
-                "delivery": _deliver_telegram_generated_text(
-                    task,
-                    base_url,
-                    timeout_s,
-                    generation_result.get("response_message_id"),
-                    visibility,
-                ),
+                "delivery": telegram_detail,
             }
         except Exception as exc:
-            errors["telegram"] = {
-                "outcome": "failed",
-                "reason": "channel_dispatch_failed",
-                "error_class": type(exc).__name__,
-            }
+            errors["telegram"] = _scheduled_channel_exception_failure(task, exc)
             logger.warning(
                 "[scheduling-cortex] Channel dispatch failed (best-effort continues): "
-                "channel=%s task_id=%s error=%s",
+                "channel=%s task_id=%s error_class=%s",
                 "telegram",
                 task.get("id") or "unknown",
-                exc,
+                errors["telegram"]["error_class"],
             )
 
     if "workbench" in channels:
@@ -3591,6 +4925,7 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
     saw_sent = False
     saw_fallback_delivered = False
     saw_audit_only = False
+    saw_delivery_unknown = False
     suppress_reasons: list[str] = []
     fallback_reasons: list[str] = []
     saw_non_failed = False
@@ -3615,6 +4950,9 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
             elif outcome == "audit_only":
                 saw_audit_only = True
                 saw_non_failed = True
+            elif outcome == "delivery_unknown":
+                saw_delivery_unknown = True
+                saw_non_failed = True
             elif outcome:
                 saw_non_failed = True
             if not generated_text:
@@ -3628,6 +4966,9 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
     elif saw_fallback_delivered:
         delivery_outcome = "fallback_delivered"
         delivery_reason = "; ".join(fallback_reasons) if fallback_reasons else "deferred_fallback"
+    elif saw_delivery_unknown:
+        delivery_outcome = "delivery_unknown"
+        delivery_reason = "telegram_delivery_ambiguous"
     elif saw_audit_only:
         delivery_outcome = "audit_only"
         delivery_reason = "workbench_channel_is_audit_only"

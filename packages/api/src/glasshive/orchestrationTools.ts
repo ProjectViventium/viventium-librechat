@@ -4,7 +4,7 @@
  * the typed package while /api only wires the broker and logger.
  * === VIVENTIUM END === */
 
-import { tool } from '@langchain/core/tools';
+import { tool } from '@librechat/agents/langchain/tools';
 import { z } from 'zod';
 import {
   ACTIVE_WORK_ACTION_DESCRIPTION,

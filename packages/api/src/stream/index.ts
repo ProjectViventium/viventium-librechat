@@ -22,6 +22,7 @@ export type {
 
 export { createStreamServices } from './createStreamServices';
 export type { StreamServicesConfig, StreamServices } from './createStreamServices';
+export { initializeStreamServicesBeforeTraffic } from './initializeStreamServicesBeforeTraffic';
 
 // Implementations (for advanced use cases)
 export { InMemoryJobStore } from './implementations/InMemoryJobStore';

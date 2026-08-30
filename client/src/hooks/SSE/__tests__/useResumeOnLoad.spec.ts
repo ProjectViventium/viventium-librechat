@@ -164,10 +164,7 @@ describe('buildSubmissionFromResumeState', () => {
     expect(
       projection.visibleMessages.find((item) => item.messageId === 'server-response')?.content,
     ).toEqual([{ type: ContentTypes.TEXT, text: 'Latest streamed output' }]);
-    expect(finalMessages.map((item) => item.messageId)).toEqual([
-      'server-user',
-      'server-response',
-    ]);
+    expect(finalMessages.map((item) => item.messageId)).toEqual(['server-user', 'server-response']);
   });
 
   it('collapses mixed optimistic and authoritative pairs to one authoritative pair', () => {

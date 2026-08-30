@@ -1,11 +1,7 @@
 const crypto = require('crypto');
 const express = require('express');
 const Redis = require('ioredis');
-const {
-  GenerationJobManager,
-  RedisEventTransport,
-  RedisJobStore,
-} = require('@librechat/api');
+const { GenerationJobManager, RedisEventTransport, RedisJobStore } = require('@librechat/api');
 
 const mockMessageUpdateOne = jest.fn();
 const mockRecordTelegramTransportReceipt = jest.fn();
@@ -137,9 +133,9 @@ function createRedisServices(redisUri) {
   };
 }
 
-const redisTest = process.env.REDIS_URI ? test : test.skip;
+const redisDescribe = process.env.REDIS_URI ? describe : describe.skip;
 
-describe('Telegram Cortex delivery acknowledgement after Redis restart', () => {
+redisDescribe('Telegram Cortex delivery acknowledgement after Redis restart', () => {
   afterEach(async () => {
     delete process.env.VIVENTIUM_TELEGRAM_INTERACTION_ADAPTER_SECRET;
     await GenerationJobManager.destroy();
@@ -148,7 +144,7 @@ describe('Telegram Cortex delivery acknowledgement after Redis restart', () => {
     }
   });
 
-  redisTest('accepts the second and third exact acknowledgement as one durable no-op', async () => {
+  test('accepts the second and third exact acknowledgement as one durable no-op', async () => {
     const redisUri = process.env.REDIS_URI;
     const suffix = Date.now().toString(16);
     const streamId = `cortex-route-restart-${suffix}`;
@@ -207,11 +203,7 @@ describe('Telegram Cortex delivery acknowledgement after Redis restart', () => {
     await GenerationJobManager.destroy();
     GenerationJobManager.configure(createRedisServices(redisUri));
     await GenerationJobManager.initialize();
-    const createdJob = await GenerationJobManager.createJob(
-      streamId,
-      'owner-a',
-      'conversation-a',
-      {
+    const createdJob = await GenerationJobManager.createJob(streamId, 'owner-a', 'conversation-a', {
       interactionContext: {
         actor_kind: 'external_user',
         origin: 'interactive',
@@ -224,8 +216,7 @@ describe('Telegram Cortex delivery acknowledgement after Redis restart', () => {
         source_sequence: 1,
       },
       deliveryPolicy: { commit_authority: 'external_adapter' },
-      },
-    );
+    });
     await GenerationJobManager.updateMetadata(streamId, { responseMessageId: 'parent-a' });
     await GenerationJobManager.bindCortexPresentation(streamId, {
       ownerId: 'owner-a',

@@ -133,11 +133,17 @@ function requestDigest(request) {
   } catch {
     serialized = '[unserializable]';
   }
-  return crypto.createHash('sha256').update(serialized || '').digest('hex');
+  return crypto
+    .createHash('sha256')
+    .update(serialized || '')
+    .digest('hex');
 }
 
 function sha256Text(value) {
-  return crypto.createHash('sha256').update(String(value || ''), 'utf8').digest('hex');
+  return crypto
+    .createHash('sha256')
+    .update(String(value || ''), 'utf8')
+    .digest('hex');
 }
 
 function validGlassHiveAuthorityReceipt(receipt, instructionAuthority, expectedCapsuleCount) {
@@ -559,8 +565,7 @@ function markMainToolEnd(req, metadata = {}, { nowMs = Date.now(), toolInvocatio
       candidateTools.forEach((candidate, candidateIndex) => {
         if (
           candidate.attempt.invocationId === attempt.invocationId &&
-          (suppliedToolIdHash === 'none' ||
-            candidate.suppliedToolIdHash === suppliedToolIdHash)
+          (suppliedToolIdHash === 'none' || candidate.suppliedToolIdHash === suppliedToolIdHash)
         ) {
           candidates.push({
             candidate,

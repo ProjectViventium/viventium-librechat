@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scheduling_cortex.dispatch import HttpJsonError
+from scheduling_cortex.dispatch import HttpJsonError, scheduled_exception_failure
 from scheduling_cortex.models import ScheduleRule
 from scheduling_cortex.scheduler import (
     SchedulerEngine,
@@ -36,12 +36,13 @@ def _seed_task(
     created_source: str = "agent",
     metadata: dict | None = None,
     next_run_at: str = "2026-02-13T19:00:00Z",
+    prompt: str = "Daily reflection",
 ) -> dict:
     task = {
         "id": task_id,
         "user_id": "user-1",
         "agent_id": "agent-1",
-        "prompt": "Daily reflection",
+        "prompt": prompt,
         "schedule": schedule or {"type": "daily", "time": "09:00", "timezone": "UTC"},
         "channel": "telegram",
         "conversation_policy": "same",
@@ -247,7 +248,11 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
             for index in range(3):
-                _seed_task(storage, f"task-pool-{index}")
+                _seed_task(
+                    storage,
+                    f"task-pool-{index}",
+                    prompt=f"Daily reflection {index}",
+                )
             engine = SchedulerEngine(
                 storage,
                 poll_interval_s=30,
@@ -341,6 +346,178 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
             self.assertEqual(runs[0]["channel_outcomes"]["telegram"]["outcome"], "sent")
             self.assertEqual(runs[0]["interaction_ref"], "conversation:conversation-synthetic")
 
+    def test_required_tool_launched_missions_hold_occurrence_and_lease_while_waiting_external(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ",
+            {"SCHEDULING_STALE_PROMPT_RUN_SECONDS": ""},
+        ):
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(storage, "task-agent-external")
+            engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+            now = datetime(2026, 2, 13, 19, 0, tzinfo=timezone.utc)
+
+            with patch(
+                "scheduling_cortex.scheduler.dispatch_task",
+                return_value={
+                    "conversation_id": "conversation-synthetic",
+                    "delivery": {
+                        "outcome": "sent",
+                        "reason": "acknowledged",
+                        "channels": {"librechat": {"outcome": "sent"}},
+                    },
+                    "external_work": {
+                        "requiredTotal": 2,
+                        "requiredTerminal": 1,
+                        "allRequiredTerminal": False,
+                        "state": "waiting_external",
+                    },
+                },
+            ):
+                engine._process_task(task, now)
+
+            run = storage.list_scheduled_prompt_runs(task_id="task-agent-external")[0]
+            self.assertEqual(run["status"], "waiting_external")
+            self.assertEqual(run["disposition"], "running")
+            self.assertIsNone(run["completed_at"])
+            self.assertIsNotNone(run["lease_owner"])
+            self.assertIsNotNone(run["lease_until"])
+            self.assertEqual(run["execution_snapshot"]["external_work"]["requiredTotal"], 2)
+            lease_until = datetime.fromisoformat(run["lease_until"].replace("Z", "+00:00"))
+            heartbeat_at = datetime.fromisoformat(run["updated_at"].replace("Z", "+00:00"))
+            self.assertEqual((lease_until - heartbeat_at).total_seconds(), 24 * 60 * 60)
+
+    def test_restart_never_replays_dispatched_same_day_catch_up_occurrence(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ",
+            {"SCHEDULING_STALE_PROMPT_RUN_SECONDS": ""},
+        ):
+            db_path = str(Path(tmpdir) / "schedules.db")
+            storage = ScheduleStorage(StorageConfig(db_path=db_path))
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            due_at = now - timedelta(hours=2)
+            due_iso = due_at.isoformat().replace("+00:00", "Z")
+            next_due = (due_at + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+            task = _seed_task(
+                storage,
+                "task-dispatched-catch-up",
+                schedule={"type": "daily", "time": due_at.strftime("%H:%M"), "timezone": "UTC"},
+                metadata={"misfire_policy": {"mode": "catch_up", "max_late_s": 43200}},
+                next_run_at=next_due,
+            )
+            storage.update_task(
+                task["user_id"],
+                task["id"],
+                {"executor": "glasshive_host", "last_status": "running"},
+            )
+            claimed = storage.claim_scheduled_prompt_occurrence(
+                task_id=task["id"],
+                user_id=task["user_id"],
+                executor="glasshive_host",
+                due_at=due_iso,
+                lease_owner="scheduler:abandoned",
+                now=due_iso,
+                lease_seconds=24 * 60 * 60,
+            )
+            storage.update_scheduled_prompt_run(
+                claimed["run"]["run_id"],
+                {
+                    "status": "running",
+                    "glasshive_run_id": "worker-run-dispatched",
+                    "updated_at": due_iso,
+                },
+            )
+
+            restarted = ScheduleStorage(StorageConfig(db_path=db_path))
+            engine = SchedulerEngine(
+                restarted,
+                poll_interval_s=30,
+                misfire_grace_s=900,
+                retry_delay_s=300,
+            )
+            with patch("scheduling_cortex.scheduler.dispatch_task") as dispatch:
+                engine._tick()
+            engine.stop()
+
+            dispatch.assert_not_called()
+            run = restarted.get_scheduled_prompt_run(claimed["run"]["run_id"])
+            parent = restarted.get_task(task["user_id"], task["id"])
+            self.assertEqual(run["status"], "running")
+            self.assertIsNone(run["error_class"])
+            self.assertEqual(parent["last_status"], "running")
+            self.assertEqual(parent["next_run_at"], next_due)
+            self.assertEqual(len(restarted.list_scheduled_prompt_runs(task_id=task["id"])), 1)
+
+    def test_manual_overlap_defers_and_then_runs_the_automatic_occurrence_past_grace(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(storage, "task-deferred-overlap")
+            engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+            manual_at = "2026-02-13T18:59:50Z"
+            storage.claim_manual_scheduled_prompt_run(
+                {
+                    "run_id": "manual-overlap",
+                    "task_id": "task-deferred-overlap",
+                    "user_id": task["user_id"],
+                    "due_at": manual_at,
+                    "started_at": manual_at,
+                    "status": "running",
+                    "executor": "viventium_agent",
+                    "trigger_kind": "manual",
+                    "trigger_source": "workbench_manual",
+                    "occurrence_key": "manual-overlap",
+                    "disposition": "running",
+                    "created_at": manual_at,
+                    "updated_at": manual_at,
+                },
+                lease_owner="workbench:manual-overlap",
+                now=manual_at,
+                lease_seconds=60,
+            )
+
+            with patch("scheduling_cortex.scheduler.dispatch_task") as mock_dispatch:
+                engine._process_task(task, datetime(2026, 2, 13, 19, 0, tzinfo=timezone.utc))
+                mock_dispatch.assert_not_called()
+
+            deferred_task = storage.get_task(task["user_id"], task["id"])
+            marker = deferred_task["metadata"]["scheduler_deferred_occurrence_v1"]
+            self.assertEqual(marker["due_at"], "2026-02-13T19:00:00Z")
+            self.assertEqual(marker["blocker_run_id"], "manual-overlap")
+
+            storage.update_scheduled_prompt_run(
+                "manual-overlap",
+                {
+                    "status": "completed",
+                    "disposition": "silent",
+                    "completed_at": "2026-02-13T19:16:00Z",
+                    "updated_at": "2026-02-13T19:16:00Z",
+                },
+            )
+            with patch(
+                "scheduling_cortex.scheduler.dispatch_task",
+                return_value={
+                    "delivery": {
+                        "outcome": "sent",
+                        "reason": "delivered",
+                        "channels": {"telegram": {"outcome": "sent"}},
+                    }
+                },
+            ) as mock_dispatch:
+                engine._process_task(
+                    deferred_task,
+                    datetime(2026, 2, 13, 19, 16, tzinfo=timezone.utc),
+                )
+
+            mock_dispatch.assert_called_once()
+            updated_task = storage.get_task(task["user_id"], task["id"])
+            self.assertNotIn("scheduler_deferred_occurrence_v1", updated_task["metadata"])
+            scheduled_runs = [
+                run
+                for run in storage.list_scheduled_prompt_runs(task_id=task["id"])
+                if run["trigger_kind"] == "scheduled"
+            ]
+            self.assertEqual(len(scheduled_runs), 1)
+            self.assertEqual(scheduled_runs[0]["status"], "completed")
+
     def test_occurrence_persists_dispatch_intent_and_forwards_deterministic_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
@@ -374,21 +551,217 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
             engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
             now = datetime(2026, 2, 13, 19, 0, tzinfo=timezone.utc)
 
+            failure_result = {
+                "generation_failure": {
+                    "error_class": "completion_error",
+                    "failure_retryable": True,
+                    "transition": {
+                        "retry_disposition": "next_occurrence_only",
+                        "retryable": True,
+                    },
+                },
+                "delivery": {
+                    "outcome": "failed",
+                    "reason": "completion_error",
+                    "generated_text": None,
+                    "channels": {"telegram": {"outcome": "sent"}},
+                },
+            }
             with patch(
                 "scheduling_cortex.scheduler.dispatch_task",
                 side_effect=RuntimeError("Bearer synthetic-private-value"),
-            ):
+            ), patch(
+                "scheduling_cortex.scheduler.scheduled_failure_result",
+                return_value=failure_result,
+            ) as close_failure:
                 engine._process_task(task, now)
 
             run = storage.list_scheduled_prompt_runs(task_id="task-private-failure")[0]
             self.assertEqual(run["status"], "failed")
-            self.assertEqual(run["error_class"], "RuntimeError")
-            self.assertEqual(run["result_summary"], "Dispatch failed (RuntimeError).")
+            self.assertEqual(run["error_class"], "completion_error")
+            self.assertEqual(
+                run["result_summary"],
+                "Scheduled generation failed (completion_error).",
+            )
             self.assertNotIn("synthetic-private-value", run["result_summary"])
             self.assertIsNone(run["lease_until"])
+            close_failure.assert_called_once()
+
+    def test_user_not_found_occurrence_closes_the_orphaned_schedule(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(storage, "task-orphaned-owner-route")
+            engine = SchedulerEngine(
+                storage,
+                poll_interval_s=30,
+                misfire_grace_s=900,
+                retry_delay_s=300,
+            )
+            now = datetime(2026, 2, 13, 19, 0, tzinfo=timezone.utc)
+
+            with patch(
+                "scheduling_cortex.scheduler.dispatch_task",
+                side_effect=HttpJsonError(
+                    "synthetic private HTTP detail",
+                    status=404,
+                    method="POST",
+                    path="/api/viventium/scheduler/chat",
+                    reason="user_not_found",
+                ),
+            ):
+                engine._process_task(task, now)
+
+            run = storage.list_scheduled_prompt_runs(task_id=task["id"])[0]
+            self.assertEqual(run["status"], "failed")
+            self.assertEqual(run["error_class"], "orphaned_user_not_found")
+            self.assertEqual(
+                run["result_summary"],
+                "Scheduled generation failed (orphaned_user_not_found).",
+            )
+            self.assertNotIn("private HTTP detail", run["result_summary"])
+
+            updated = storage.get_task(task["user_id"], task["id"])
+            self.assertEqual(updated["active"], 0)
+            self.assertIsNone(updated["next_run_at"])
+            self.assertEqual(updated["last_error"], "orphaned_user_not_found")
+            self.assertEqual(updated["last_delivery_reason"], "orphaned_user_not_found")
+            self.assertEqual(
+                updated["metadata"]["scheduled_failure_state_v1"]["retry_disposition"],
+                "terminal_action_required",
+            )
+
+    def test_orphaned_user_classification_requires_exact_scheduler_404_route(self):
+        task = {"executor": "viventium_agent"}
+        adjacent_errors = (
+            HttpJsonError(
+                "same reason on another endpoint",
+                status=404,
+                method="POST",
+                path="/api/viventium/agents/chat",
+                reason="user_not_found",
+            ),
+            HttpJsonError(
+                "same route without a not-found status",
+                status=409,
+                method="POST",
+                path="/api/viventium/scheduler/chat",
+                failure_class="user_not_found",
+            ),
+        )
+
+        for error in adjacent_errors:
+            with self.subTest(status=error.status, path=error.path):
+                self.assertEqual(
+                    scheduled_exception_failure(task, error)["error_class"],
+                    "completion_error",
+                )
+
+    def test_structured_terminal_provider_failure_stops_one_time_retry_loop(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(
+                storage,
+                "task-provider-unauthorized",
+                schedule={"type": "once", "at": "2026-02-13T19:00:00Z", "timezone": "UTC"},
+            )
+            engine = SchedulerEngine(
+                storage,
+                poll_interval_s=30,
+                misfire_grace_s=900,
+                retry_delay_s=300,
+            )
+            now = datetime(2026, 2, 13, 19, 0, tzinfo=timezone.utc)
+
+            with patch(
+                "scheduling_cortex.scheduler.dispatch_task",
+                return_value={
+                    "conversation_id": "conversation-provider-error",
+                    "response_message_id": "message-provider-error",
+                    "generation_failure": {"error_class": "provider_unauthorized"},
+                    "delivery": {
+                        "outcome": "failed",
+                        "reason": "provider_unauthorized",
+                        "generated_text": None,
+                        "channels": {
+                            "librechat": {
+                                "outcome": "failed",
+                                "reason": "provider_unauthorized",
+                            },
+                            "telegram": {
+                                "outcome": "sent",
+                                "reason": "action_required",
+                            },
+                        },
+                    },
+                },
+            ):
+                engine._process_task(task, now)
+
+            run = storage.list_scheduled_prompt_runs(task_id=task["id"])[0]
+            self.assertEqual(run["status"], "failed")
+            self.assertEqual(run["disposition"], "failed")
+            self.assertEqual(run["error_class"], "provider_unauthorized")
+            self.assertEqual(
+                run["result_summary"],
+                "Scheduled generation failed (provider_unauthorized).",
+            )
+            self.assertEqual(run["interaction_ref"], "conversation:conversation-provider-error")
+            self.assertEqual(run["channel_outcomes"]["telegram"]["outcome"], "sent")
+
+            updated = storage.get_task(task["user_id"], task["id"])
+            self.assertEqual(updated["last_status"], "error")
+            self.assertEqual(updated["last_error"], "provider_unauthorized")
+            self.assertEqual(updated["last_delivery_outcome"], "failed")
+            self.assertEqual(updated["last_delivery_reason"], "provider_unauthorized")
+            self.assertEqual(updated["active"], 0)
+            self.assertIsNone(updated["next_run_at"])
+            self.assertEqual(
+                updated["metadata"]["scheduled_failure_state_v1"]["retry_disposition"],
+                "terminal_action_required",
+            )
+
+    def test_retryable_one_time_failure_stops_after_the_closed_contract_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(
+                storage,
+                "task-rate-limited",
+                schedule={"type": "once", "at": "2026-02-13T19:00:00Z", "timezone": "UTC"},
+            )
+            engine = SchedulerEngine(
+                storage,
+                poll_interval_s=30,
+                misfire_grace_s=900,
+                retry_delay_s=300,
+            )
+            result = {
+                "generation_failure": {
+                    "error_class": "provider_rate_limited",
+                    "failure_retryable": True,
+                },
+                "delivery": {"outcome": "failed", "reason": "provider_rate_limited"},
+            }
+            now = datetime(2026, 2, 13, 19, 0, tzinfo=timezone.utc)
+
+            for attempt in range(1, 4):
+                engine._update_after_generation_failure(task, now, result)
+                task = storage.get_task("user-1", "task-rate-limited")
+                state = task["metadata"]["scheduled_failure_state_v1"]
+                self.assertEqual(state["consecutive_count"], attempt)
+                if attempt < 3:
+                    self.assertEqual(state["retry_disposition"], "retry_scheduled")
+                    self.assertEqual(task["active"], 1)
+                    self.assertIsNotNone(task["next_run_at"])
+                else:
+                    self.assertEqual(state["retry_disposition"], "terminal_action_required")
+                    self.assertEqual(task["active"], 0)
+                    self.assertIsNone(task["next_run_at"])
 
     def test_glasshive_occurrence_reuses_claimed_row_and_remains_queued(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ",
+            {"SCHEDULING_STALE_PROMPT_RUN_SECONDS": ""},
+        ):
             storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
             task = _seed_task(storage, "task-glasshive")
             storage.update_task("user-1", "task-glasshive", {"executor": "glasshive_host"})
@@ -417,6 +790,9 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
             self.assertEqual(runs[0]["disposition"], "running")
             self.assertEqual(runs[0]["interaction_ref"], "glasshive:glasshive-synthetic")
             self.assertIsNotNone(runs[0]["lease_until"])
+            lease_until = datetime.fromisoformat(runs[0]["lease_until"].replace("Z", "+00:00"))
+            heartbeat_at = datetime.fromisoformat(runs[0]["updated_at"].replace("Z", "+00:00"))
+            self.assertEqual((lease_until - heartbeat_at).total_seconds(), 15 * 60)
 
     def test_scheduler_maps_silence_and_partial_delivery_to_public_dispositions(self):
         cases = (
@@ -549,6 +925,12 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
             self.assertEqual(updated.get("last_delivery_outcome"), "suppressed")
             self.assertEqual(updated.get("last_delivery_reason"), "telegram:nta")
             self.assertEqual(updated.get("last_generated_text"), "{NTA}")
+            recurrence = updated.get("metadata", {}).get("recurrence_state_v1", {})
+            self.assertEqual(recurrence.get("version"), 1)
+            self.assertEqual(recurrence.get("outcome"), "suppressed")
+            self.assertEqual(recurrence.get("reason"), "telegram:nta")
+            self.assertEqual(recurrence.get("result_excerpt"), "{NTA}")
+            self.assertEqual(len(recurrence.get("result_sha256", "")), 64)
             self.assertEqual(updated.get("last_delivery", {}).get("channels", {}).get("telegram", {}).get("reason"), "nta")
 
     def test_update_after_success_keeps_any_scheduled_suppression_silent(self):

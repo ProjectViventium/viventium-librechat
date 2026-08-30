@@ -78,7 +78,7 @@ describe('RedisEventTransport subscription lifecycle', () => {
     const published = publisher.publish.mock.calls[0][1] as string;
     subscriber.emit('message', 'stream:{reasoned-abort}:events', published);
 
-    expect(JSON.parse(published)).toEqual({ type: 'abort', data: 'user_cancelled' });
+    expect(JSON.parse(published)).toEqual({ type: 'abort', reason: 'user_cancelled' });
     expect(onAbort).toHaveBeenCalledWith('user_cancelled');
     await transport.destroy();
   });

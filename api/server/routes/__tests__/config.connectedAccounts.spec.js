@@ -11,7 +11,7 @@ jest.mock('~/server/services/viventium/registrationGate', () => ({
   isBrowserRegistrationOpen: jest.fn(),
 }));
 jest.mock('~/server/services/viventium/ViventiumOrchestrationMode', () => ({
-  parallelWorkDeploymentAvailable: jest.fn().mockReturnValue(false),
+  parallelWorkDeploymentAvailableAsync: jest.fn().mockResolvedValue(false),
 }));
 jest.mock('~/server/services/viventium/cortexFollowupGrace', () => ({
   getCortexFollowupGraceSeconds: jest.fn().mockReturnValue(0),

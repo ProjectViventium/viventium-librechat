@@ -111,6 +111,30 @@ describe('initializeAnthropic', () => {
     );
   });
 
+  it('keeps the native request receipt callback request-scoped until inference', async () => {
+    const params = createParams();
+    const receiptSink = jest.fn();
+    (
+      params.req as BaseInitializeParams['req'] & {
+        _viventiumRecordNativeProviderRequestAccepted?: (value: unknown) => void;
+      }
+    )._viventiumRecordNativeProviderRequestAccepted = receiptSink;
+
+    await initializeAnthropic(params);
+    const options = mockGetLLMConfig.mock.calls[0]?.[1] as {
+      nativeProviderRequestAccepted?: (value: unknown) => void;
+    };
+    const receipt = {
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+      status: 200,
+      request: { system: 'synthetic' },
+    };
+    options.nativeProviderRequestAccepted?.(receipt);
+
+    expect(receiptSink).toHaveBeenCalledWith(receipt);
+  });
+
   it('should use authToken field for Anthropic OAuth credentials', async () => {
     process.env.ANTHROPIC_API_KEY = 'user_provided';
     const params = createParams({

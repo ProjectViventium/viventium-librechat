@@ -21,8 +21,7 @@ const {
   memoryDiagnostics,
   performStartupChecks,
   handleJsonParseError,
-  GenerationJobManager,
-  createStreamServices,
+  initializeStreamServicesBeforeTraffic,
   initializeFileStorage,
   startSandpackBundlerServer,
   resolveSandpackBundlerServerConfig,
@@ -339,7 +338,7 @@ const startServer = async () => {
    * Feature: Process-private native API transport.
    * Purpose: A private Unix socket binds this server instance to its owning native proxy.
    */
-  const server = app.listen(...apiListenTarget.args, async (err) => {
+  const onServerListening = async (err) => {
     if (err) {
       logger.error('Failed to start server:', err);
       process.exit(1);
@@ -400,10 +399,7 @@ const startServer = async () => {
         }, staleCortexRecoveryIntervalMs).unref?.();
       }
 
-      // Configure stream services (auto-detects Redis from USE_REDIS env var)
-      const streamServices = createStreamServices();
-      GenerationJobManager.configure(streamServices);
-      GenerationJobManager.initialize();
+      // Stream persistence is fully initialized before the listener opens.
       upgradeFinalization.recordCompleted('generation-runtime-ready');
       upgradeFinalization.markReady();
     } catch (startupError) {
@@ -425,7 +421,11 @@ const startServer = async () => {
     if (inspectFlags || isEnabled(process.env.MEM_DIAG)) {
       memoryDiagnostics.start();
     }
-  });
+  };
+  const admitTraffic = () => app.listen(...apiListenTarget.args, onServerListening);
+  const server = quiescedApiStartup
+    ? admitTraffic()
+    : await initializeStreamServicesBeforeTraffic({ admitTraffic });
   registerLocalQaServiceAck(server);
 };
 

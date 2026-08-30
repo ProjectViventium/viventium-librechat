@@ -162,6 +162,34 @@ describe('Meilisearch Mongoose plugin', () => {
     expect(mockAddDocuments).not.toHaveBeenCalled();
   });
 
+  test('saving a tombstoned message does NOT index w/ meilisearch', async () => {
+    await createMessageModel(mongoose).create({
+      messageId: new mongoose.Types.ObjectId(),
+      conversationId: new mongoose.Types.ObjectId(),
+      user: new mongoose.Types.ObjectId(),
+      isCreatedByUser: true,
+      deletedAt: new Date(),
+    });
+
+    expect(mockAddDocuments).not.toHaveBeenCalled();
+    expect(mockUpdateDocuments).not.toHaveBeenCalled();
+  });
+
+  test('a missing findOneAndUpdate result does not invoke a Meili update', async () => {
+    const messageModel = createMessageModel(mongoose);
+
+    await expect(
+      messageModel.findOneAndUpdate(
+        { messageId: new mongoose.Types.ObjectId().toString() },
+        { $set: { text: 'No matching message.' } },
+        { new: true },
+      ),
+    ).resolves.toBeNull();
+
+    expect(mockAddDocuments).not.toHaveBeenCalled();
+    expect(mockUpdateDocuments).not.toHaveBeenCalled();
+  });
+
   test('making an indexed message ineligible removes its existing Meili document', async () => {
     const messageModel = createMessageModel(mongoose);
     const messageId = new mongoose.Types.ObjectId().toString();

@@ -285,10 +285,7 @@ router.post('/delivery-ack', async (req, res) => {
                 adapterSurface,
                 parsed.cortexPresentation,
               )
-            : GenerationJobManager.acknowledgeDelivery(
-                parsed.acknowledgement,
-                adapterSurface,
-              ));
+            : GenerationJobManager.acknowledgeDelivery(parsed.acknowledgement, adapterSurface));
     if (result.status === 'stale_revision' && parsed.acknowledgement.state === 'committed') {
       result = await GenerationJobManager.acknowledgeDurableEffectDelivery(
         parsed.acknowledgement,

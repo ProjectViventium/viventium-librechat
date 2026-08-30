@@ -545,7 +545,6 @@ const TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const LOCAL_BATCH_LOCKS = new WeakMap<CortexDeliveryModel, Map<string, Promise<void>>>();
 const TRANSACTION_SUPPORT = new WeakMap<CortexDeliveryModel, boolean>();
 const PROCESS_RUNTIME_EPOCH = `boot_${crypto.randomUUID()}`;
-const PROCESS_RUNTIME_SLOT = resolveCortexRuntimeSlotIdentity();
 
 function normalizeText(value: unknown): string {
   return String(value || '')
@@ -1455,14 +1454,14 @@ export function createCortexInsightDeliveryService({
   mongooseInstance = mongoose,
   now = () => new Date(),
   randomUUID = () => crypto.randomUUID(),
-  runtimeSlot = PROCESS_RUNTIME_SLOT,
+  runtimeSlot = '',
   runtimeEpoch = PROCESS_RUNTIME_EPOCH,
   afterStandaloneMutation = null,
   afterStandaloneRecordWrite = null,
   consumeFault = async () => null,
 }: CortexInsightDeliveryServiceOptions) {
   if (!DeliveryModel) throw new Error('cortex_insight_delivery_model_unavailable');
-  const normalizedRuntimeSlot = normalizeText(runtimeSlot) || PROCESS_RUNTIME_SLOT;
+  const normalizedRuntimeSlot = normalizeText(runtimeSlot) || resolveCortexRuntimeSlotIdentity();
   const normalizedRuntimeEpoch = normalizeText(runtimeEpoch) || PROCESS_RUNTIME_EPOCH;
 
   function recoveryEligibilityFilter(checkedAt: Date): DataRecord {

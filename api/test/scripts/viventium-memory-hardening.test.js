@@ -495,6 +495,33 @@ describe('viventium-memory-hardening', () => {
     });
   });
 
+  test('scheduled post-call hardening suppresses duplicate model runs inside its cooldown', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-hardening-cooldown-'));
+    const finishedAt = new Date('2026-08-09T12:00:00.000Z');
+    fs.writeFileSync(
+      path.join(tempDir, 'last-model-apply.public.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        status: 'applied',
+        finished_at: finishedAt.toISOString(),
+      }),
+    );
+    const options = { mode: 'apply', minApplyIntervalSeconds: 300 };
+
+    expect(
+      modelApplyCooldownDecision(options, { stateDir: tempDir }, new Date('2026-08-09T12:04:59Z')),
+    ).toMatchObject({
+      allowed: false,
+      reason: 'maintenance_cooldown',
+      nextAllowedAt: '2026-08-09T12:05:00.000Z',
+    });
+    expect(
+      modelApplyCooldownDecision(options, { stateDir: tempDir }, new Date('2026-08-09T12:05:00Z')),
+    ).toMatchObject({ allowed: true, reason: null });
+
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
   test('uses only a durable final classification after ephemeral session and sidecar evidence expires', async () => {
     const segment = (actorTrust, attribution = 'verified') => ({
       version: 1,
@@ -4744,29 +4771,24 @@ describe('viventium-memory-hardening', () => {
         model: 'gpt-5.5',
         effort: 'high',
       });
-      expect(resolveProvider({ provider: 'openai' }).candidates).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ provider: 'openai', model: 'gpt-5.6-luna', effort: 'medium' }),
-        ]),
-      );
+      expect(resolveProvider({ provider: 'openai' }).candidates).toEqual([
+        expect.objectContaining({ provider: 'openai', model: 'gpt-5.5', effort: 'high' }),
+      ]);
     } finally {
       process.env = oldEnv;
     }
   });
 
-  test('default model fallbacks stay inside configured provider boundary unless explicitly overridden', () => {
+  test('default model selection changes only through explicitly configured fallbacks', () => {
     const oldEnv = { ...process.env };
     process.env.VIVENTIUM_PRIMARY_PROVIDER = 'anthropic';
     process.env.VIVENTIUM_SECONDARY_PROVIDER = '';
     process.env.VIVENTIUM_MEMORY_HARDENING_PROVIDER = 'anthropic';
     process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_FALLBACKS = '';
     try {
-      expect(resolveProvider({}).candidates).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ provider: 'anthropic', model: 'claude-opus-5' }),
-          expect.objectContaining({ provider: 'anthropic', model: 'opus' }),
-        ]),
-      );
+      expect(resolveProvider({}).candidates).toEqual([
+        expect.objectContaining({ provider: 'anthropic', model: 'claude-opus-5', effort: 'xhigh' }),
+      ]);
       expect(resolveProvider({}).candidates).toEqual(
         expect.not.arrayContaining([expect.objectContaining({ provider: 'openai' })]),
       );
@@ -4795,6 +4817,11 @@ describe('viventium-memory-hardening', () => {
     ]);
     expect(classifyModelCallFailure(new Error('529 overloaded'))).toBe('model_overloaded');
     expect(classifyModelCallFailure(new Error('401 invalid_api_key'))).toBe('model_auth_error');
+    expect(
+      ['insufficient_quota', 'usage limit reached', 'credits exhausted'].map((message) =>
+        classifyModelCallFailure(new Error(message)),
+      ),
+    ).toEqual(['model_usage_limit', 'model_usage_limit', 'model_usage_limit']);
     expect(
       classifyModelCallFailure(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' })),
     ).toBe('model_call_timeout');

@@ -472,12 +472,16 @@ function normalizeString(value, fallback = 'unknown') {
  * typed fallback reason. Raw provider errors never enter prompt telemetry or public evidence.
  * === VIVENTIUM END === */
 function normalizeRouteEffort(value) {
-  const normalized = String(value || '').trim().toLowerCase();
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase();
   return /^[a-z0-9][a-z0-9._:-]{0,31}$/.test(normalized) ? normalized : 'missing';
 }
 
 function normalizeFallbackReason(value, fallbackUsed) {
-  const normalized = String(value || '').trim().toLowerCase();
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase();
   if (fallbackUsed !== true) {
     return normalized && normalized !== 'none' ? 'missing' : 'none';
   }

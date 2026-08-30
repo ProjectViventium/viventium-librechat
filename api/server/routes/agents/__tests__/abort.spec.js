@@ -191,7 +191,7 @@ describe('Agent Abort Endpoint', () => {
         );
       });
 
-      it('should reject aborting a job whose main response is already complete', async () => {
+      it('should not call abort for a job whose main response is already complete', async () => {
         const jobStreamId = 'test-stream-complete';
 
         mockGenerationJobManager.getJob.mockResolvedValue({

@@ -1,4 +1,5 @@
 const { z } = require('zod');
+const mongoose = require('mongoose');
 const { logger } = require('@librechat/data-schemas');
 const { createTempChatExpirationDate } = require('@librechat/api');
 const { Message } = require('~/db/models');
@@ -14,14 +15,169 @@ const {
 const {
   buildRecallDerivedParentIdSet,
 } = require('~/server/services/viventium/conversationRecallFilters');
+const {
+  projectVisibleTextFromContentParts,
+  visibleTextSegmentsFromContentParts,
+} = require('~/server/services/viventium/ViventiumVisibleContentProjection');
 /* === VIVENTIUM END === */
 
 const idSchema = z.string().uuid();
 const TEXT_CONTENT_TYPE = 'text';
 const CORTEX_CONTENT_TYPES = new Set(['cortex_activation', 'cortex_brewing', 'cortex_insight']);
+const PRIVATE_MESSAGE_CONTENT_FIELD = 'cortex_delivery_feeling_snapshot';
+const hasPrivateMessageContentPathSegment = (key) =>
+  typeof key === 'string' && key.split('.').includes(PRIVATE_MESSAGE_CONTENT_FIELD);
 const PLACEHOLDER_RESPONSE_PATTERNS = [
   /^(generation in progress|generation interrupted before completion)\.?$/i,
 ];
+
+/* === VIVENTIUM START ===
+ * Feature: Private Feelings receipt storage guard.
+ * Purpose: Message content is copied before persistence and the private structured delivery
+ * receipt is removed at every Message write boundary. Normal content and caller inputs remain
+ * unchanged.
+ * === VIVENTIUM END === */
+function sanitizePrivateMessageContent(value, ancestors = new WeakSet()) {
+  if (value == null || typeof value !== 'object') {
+    return value;
+  }
+  if (ancestors.has(value)) {
+    return undefined;
+  }
+
+  if (value instanceof Date || Buffer.isBuffer(value) || value instanceof mongoose.Types.ObjectId) {
+    return value;
+  }
+
+  ancestors.add(value);
+  try {
+    if (value instanceof Map) {
+      return sanitizePrivateMessageContent(Object.fromEntries(value), ancestors);
+    }
+    if (typeof value.toObject === 'function') {
+      return sanitizePrivateMessageContent(value.toObject({ flattenMaps: true }), ancestors);
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => sanitizePrivateMessageContent(entry, ancestors));
+    }
+
+    const sanitized = {};
+    for (const key of Object.keys(value)) {
+      if (hasPrivateMessageContentPathSegment(key) || key === '_bsontype') {
+        continue;
+      }
+      try {
+        const nestedValue = sanitizePrivateMessageContent(value[key], ancestors);
+        if (nestedValue !== undefined) {
+          sanitized[key] = nestedValue;
+        }
+      } catch {
+        continue;
+      }
+    }
+    return sanitized;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function sanitizeMessageForPersistence(message) {
+  if (!message || typeof message !== 'object') {
+    return message;
+  }
+  const sanitizedMessage = { ...message };
+  if (Object.hasOwn(message, 'content')) {
+    sanitizedMessage.content = sanitizePrivateMessageContent(message.content);
+  }
+
+  for (const key of Object.keys(sanitizedMessage)) {
+    if (
+      key.startsWith('$') &&
+      sanitizedMessage[key] != null &&
+      typeof sanitizedMessage[key] === 'object' &&
+      !Array.isArray(sanitizedMessage[key])
+    ) {
+      const sanitizedOperator = {};
+      for (const [path, value] of Object.entries(sanitizedMessage[key])) {
+        const pathSegments = path.split('.');
+        if (
+          key === '$rename' &&
+          (hasPrivateMessageContentPathSegment(path) || hasPrivateMessageContentPathSegment(value))
+        ) {
+          continue;
+        } else if (pathSegments[0] !== 'content') {
+          sanitizedOperator[path] = value;
+        } else if (key === '$unset') {
+          sanitizedOperator[path] = value;
+        } else if (!hasPrivateMessageContentPathSegment(path)) {
+          sanitizedOperator[path] = sanitizePrivateMessageContent(value);
+        }
+      }
+      sanitizedMessage[key] = sanitizedOperator;
+      continue;
+    }
+    const pathSegments = key.split('.');
+    if (pathSegments[0] !== 'content' || pathSegments.length === 1) {
+      continue;
+    }
+    if (hasPrivateMessageContentPathSegment(key)) {
+      delete sanitizedMessage[key];
+    } else {
+      sanitizedMessage[key] = sanitizePrivateMessageContent(sanitizedMessage[key]);
+    }
+  }
+  return sanitizedMessage;
+}
+
+function containsPendingLegacyCortexRecovery(value, ancestors = new WeakSet()) {
+  if (value == null || typeof value !== 'object' || ancestors.has(value)) {
+    return false;
+  }
+  ancestors.add(value);
+  try {
+    if (value instanceof Map) {
+      return containsPendingLegacyCortexRecovery(Object.fromEntries(value), ancestors);
+    }
+    if (typeof value.toObject === 'function') {
+      return containsPendingLegacyCortexRecovery(value.toObject({ flattenMaps: true }), ancestors);
+    }
+    if (Array.isArray(value)) {
+      return value.some((entry) => containsPendingLegacyCortexRecovery(entry, ancestors));
+    }
+
+    const keys = Object.keys(value);
+    if (
+      value.cortex_delivery_acceptance === 'retryable' &&
+      keys.some(hasPrivateMessageContentPathSegment)
+    ) {
+      return true;
+    }
+    return keys.some((key) => containsPendingLegacyCortexRecovery(value[key], ancestors));
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function rejectsPendingLegacyRecoveryReplacement(update) {
+  if (!update || typeof update !== 'object') {
+    return false;
+  }
+  if (Object.hasOwn(update, 'content') && containsPendingLegacyCortexRecovery(update.content)) {
+    return true;
+  }
+  return Object.keys(update).some((operator) => {
+    if (!operator.startsWith('$')) {
+      return false;
+    }
+    const values = update[operator];
+    return (
+      values != null &&
+      typeof values === 'object' &&
+      Object.hasOwn(values, 'content') &&
+      containsPendingLegacyCortexRecovery(values.content)
+    );
+  });
+}
 
 function isPlaceholderAssistantText(text) {
   const lines = String(text || '')
@@ -46,25 +202,27 @@ function shouldSkipConversationRecallSync(req) {
 }
 
 function textFromContentParts(content) {
-  if (!Array.isArray(content)) {
-    return '';
+  return projectVisibleTextFromContentParts(content, { trim: true });
+}
+
+function shouldPreferStructuredContentText(message) {
+  const contentSegments = visibleTextSegmentsFromContentParts(message?.content);
+  if (contentSegments.length <= 1) {
+    return false;
   }
-  return content
-    .filter((part) => part && part.type === TEXT_CONTENT_TYPE)
-    .map((part) => {
-      if (typeof part.text === 'string') {
-        return part.text;
-      }
-      if (typeof part.text?.value === 'string') {
-        return part.text.value;
-      }
-      return '';
-    })
-    .join('')
-    .trim();
+  const directText = typeof message?.text === 'string' ? message.text.trim() : '';
+  return (
+    directText === '' ||
+    isPlaceholderAssistantText(directText) ||
+    directText === contentSegments.join('').trim()
+  );
 }
 
 function visibleMessageText(message) {
+  if (shouldPreferStructuredContentText(message)) {
+    const contentText = projectVisibleTextFromContentParts(message.content, { trim: true });
+    return isPlaceholderAssistantText(contentText) ? '' : contentText;
+  }
   const directText = typeof message?.text === 'string' ? message.text.trim() : '';
   if (directText && !isPlaceholderAssistantText(directText)) {
     return directText;
@@ -85,6 +243,9 @@ function visibleMessageText(message) {
 function shouldMirrorContentTextToMessageText(update) {
   if (!update || update.isCreatedByUser === true || !Array.isArray(update.content)) {
     return false;
+  }
+  if (shouldPreferStructuredContentText(update)) {
+    return true;
   }
   const incomingText = typeof update.text === 'string' ? update.text.trim() : '';
   return incomingText === '' || isPlaceholderAssistantText(incomingText);
@@ -179,19 +340,23 @@ async function saveMessage(req, params, metadata) {
     throw new Error('User not authenticated');
   }
 
-  const validConvoId = idSchema.safeParse(params.conversationId);
+  const sanitizedParams = sanitizeMessageForPersistence(params);
+  const validConvoId = idSchema.safeParse(sanitizedParams.conversationId);
   if (!validConvoId.success) {
-    logger.warn(`Invalid conversation ID: ${params.conversationId}`);
-    logger.info(`---\`saveMessage\` context: ${metadata?.context}`);
-    logger.info(`---Invalid conversation ID Params: ${JSON.stringify(params, null, 2)}`);
+    logger.warn('[Message] Rejected message write', {
+      code: 'invalid_conversation_id',
+      conversationIdType: typeof sanitizedParams.conversationId,
+      hasMessageId: Boolean(sanitizedParams.messageId || sanitizedParams.newMessageId),
+      hasContent: Object.hasOwn(sanitizedParams, 'content'),
+    });
     return;
   }
 
   try {
     let update = {
-      ...params,
+      ...sanitizedParams,
       user: req.user.id,
-      messageId: params.newMessageId || params.messageId,
+      messageId: sanitizedParams.newMessageId || sanitizedParams.messageId,
     };
 
     if (req?.body?.isTemporary) {
@@ -316,21 +481,21 @@ async function saveMessage(req, params, metadata) {
         }
 
         // If we can't find it (unlikely but possible in race conditions)
-        return {
+        return sanitizeMessageForPersistence({
           ...params,
           messageId: params.messageId,
           user: req.user.id,
-        };
+        });
       } catch (findError) {
         // If the findOne also fails, log it but don't crash
         logger.warn(
           `Could not retrieve existing message with ID ${params.messageId}: ${findError.message}`,
         );
-        return {
+        return sanitizeMessageForPersistence({
           ...params,
           messageId: params.messageId,
           user: req.user.id,
-        };
+        });
       }
     }
 
@@ -350,14 +515,17 @@ async function saveMessage(req, params, metadata) {
  */
 async function bulkSaveMessages(messages, overrideTimestamp = false) {
   try {
-    const bulkOps = messages.map((message) => ({
-      updateOne: {
-        filter: { messageId: message.messageId },
-        update: message,
-        timestamps: !overrideTimestamp,
-        upsert: true,
-      },
-    }));
+    const bulkOps = messages.map((message) => {
+      const sanitizedMessage = sanitizeMessageForPersistence(message);
+      return {
+        updateOne: {
+          filter: { messageId: message.messageId },
+          update: sanitizedMessage,
+          timestamps: !overrideTimestamp,
+          upsert: true,
+        },
+      };
+    });
     const result = await Message.bulkWrite(bulkOps);
     return result;
   } catch (err) {
@@ -391,14 +559,14 @@ async function recordMessage({
 }) {
   try {
     // No parsing of convoId as may use threadId
-    const message = {
+    const message = sanitizeMessageForPersistence({
       user,
       endpoint,
       messageId,
       conversationId,
       parentMessageId,
       ...rest,
-    };
+    });
 
     const savedMessage = await Message.findOneAndUpdate({ user, messageId }, message, {
       upsert: true,
@@ -477,7 +645,13 @@ async function updateMessageText(req, { messageId, text }) {
  */
 async function updateMessage(req, message, metadata) {
   try {
-    const { messageId, ...update } = message;
+    const { messageId, ...rawUpdate } = message;
+    if (rejectsPendingLegacyRecoveryReplacement(rawUpdate)) {
+      const error = new Error('Pending cortex recovery content requires a targeted update');
+      error.code = 'pending_cortex_recovery_full_content_update_forbidden';
+      throw error;
+    }
+    const update = sanitizeMessageForPersistence(rawUpdate);
     const options = {
       new: true,
     };
@@ -586,12 +760,110 @@ async function getMessages(filter, select) {
 }
 
 /* === VIVENTIUM START ===
+ * Feature: Bounded ancestor-branch retrieval for durable mission context.
+ * Purpose: A GlassHive launch needs the exact relevant chat branch, not every message in a large
+ * or forked conversation. Keep the query owner-scoped, index-led by messageId, and hard-bounded.
+ * === VIVENTIUM END === */
+const MESSAGE_ANCESTOR_MAX_LIMIT = 64;
+
+function boundedAncestorCount(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 32;
+  return Math.max(1, Math.min(Math.floor(parsed), MESSAGE_ANCESTOR_MAX_LIMIT));
+}
+
+function buildMessageAncestorBranchPipeline({
+  user,
+  conversationId,
+  messageId,
+  maxAncestors = 32,
+}) {
+  const ancestorLimit = boundedAncestorCount(maxAncestors);
+  const projectedCurrent = {
+    messageId: '$messageId',
+    parentMessageId: '$parentMessageId',
+    sender: '$sender',
+    isCreatedByUser: '$isCreatedByUser',
+    text: '$text',
+    content: '$content',
+    unfinished: '$unfinished',
+    error: '$error',
+    metadata: '$metadata',
+    ancestorDepth: { $literal: -1 },
+  };
+  const projectedAncestor = {
+    messageId: '$$message.messageId',
+    parentMessageId: '$$message.parentMessageId',
+    sender: '$$message.sender',
+    isCreatedByUser: '$$message.isCreatedByUser',
+    text: '$$message.text',
+    content: '$$message.content',
+    unfinished: '$$message.unfinished',
+    error: '$$message.error',
+    metadata: '$$message.metadata',
+    ancestorDepth: '$$message.ancestorDepth',
+  };
+  return [
+    { $match: { user, conversationId, messageId } },
+    { $limit: 1 },
+    {
+      $graphLookup: {
+        from: Message.collection.name,
+        startWith: '$parentMessageId',
+        connectFromField: 'parentMessageId',
+        connectToField: 'messageId',
+        as: 'ancestors',
+        depthField: 'ancestorDepth',
+        maxDepth: ancestorLimit - 1,
+        restrictSearchWithMatch: { user, conversationId },
+      },
+    },
+    {
+      $project: {
+        _id: 0,
+        current: projectedCurrent,
+        ancestors: {
+          $map: {
+            input: '$ancestors',
+            as: 'message',
+            in: projectedAncestor,
+          },
+        },
+      },
+    },
+  ];
+}
+
+async function getMessageAncestorBranch({ user, conversationId, messageId, maxAncestors = 32 }) {
+  if (!user || !conversationId || !messageId) return [];
+  const ancestorLimit = boundedAncestorCount(maxAncestors);
+  try {
+    const [result] = await Message.aggregate(
+      buildMessageAncestorBranchPipeline({ user, conversationId, messageId, maxAncestors }),
+    );
+    if (!result?.current) return [];
+    return [result.current, ...(Array.isArray(result.ancestors) ? result.ancestors : [])]
+      .sort((left, right) => Number(left.ancestorDepth) - Number(right.ancestorDepth))
+      .slice(0, ancestorLimit + 1)
+      .map(({ ancestorDepth: _ancestorDepth, ...message }) => message);
+  } catch (err) {
+    logger.error('Error getting bounded message ancestor branch:', err);
+    throw err;
+  }
+}
+
+/* === VIVENTIUM START ===
  * Feature: Recall freshness timestamp helper.
  * Purpose: Let runtime attachment logic compare a recall corpus timestamp against the newest
  * recall-eligible message instead of blindly trusting stale vector state.
  * Added: 2026-04-08
  * === VIVENTIUM END === */
-async function getLatestRecallEligibleMessageCreatedAt({ user, scanLimit = 200 }) {
+async function getLatestRecallEligibleMessageCreatedAt({
+  user,
+  scanLimit = 200,
+  excludeMessageId = null,
+  excludeParentMessageId = null,
+}) {
   try {
     if (!user) {
       return null;
@@ -599,6 +871,7 @@ async function getLatestRecallEligibleMessageCreatedAt({ user, scanLimit = 200 }
 
     const messages = await Message.find({
       user,
+      ...(excludeMessageId ? { messageId: { $ne: String(excludeMessageId) } } : {}),
       unfinished: { $ne: true },
       error: { $ne: true },
       $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
@@ -614,6 +887,15 @@ async function getLatestRecallEligibleMessageCreatedAt({ user, scanLimit = 200 }
 
     for (let index = 0; index < messages.length; index += 1) {
       const message = messages[index];
+      if (excludeMessageId && String(message?.messageId || '') === String(excludeMessageId)) {
+        continue;
+      }
+      if (
+        excludeParentMessageId &&
+        String(message?.parentMessageId || '') === String(excludeParentMessageId)
+      ) {
+        continue;
+      }
       const messageText = getConversationRecallMessageText(message);
       if (
         shouldSkipFromRecallCorpus({
@@ -681,6 +963,7 @@ module.exports = {
   updateMessage,
   deleteMessagesSince,
   getMessages,
+  getMessageAncestorBranch,
   getLatestRecallEligibleMessageCreatedAt,
   getMessage,
   deleteMessages,
@@ -692,5 +975,10 @@ module.exports = {
     shouldMirrorContentTextToMessageText,
     mirrorContentTextToMessageText,
     shouldSkipConversationRecallSync,
+    sanitizePrivateMessageContent,
+    sanitizeMessageForPersistence,
+    containsPendingLegacyCortexRecovery,
+    rejectsPendingLegacyRecoveryReplacement,
+    buildMessageAncestorBranchPipeline,
   },
 };

@@ -4,7 +4,7 @@
  * wires owner-scoped GlassHive adapters.
  * === VIVENTIUM END === */
 
-import { tool } from '@langchain/core/tools';
+import { tool } from '@librechat/agents/langchain/tools';
 import { z } from 'zod';
 import { TOOL_EFFECT_CLASSES, toolEffectMetadata } from '../tools/toolEffectMetadata';
 import {

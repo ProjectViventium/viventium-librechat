@@ -44,8 +44,8 @@ jest.mock('@librechat/data-schemas', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
-    ...jest.requireActual('@librechat/api'),
-    fenceGlassHiveTerminalCallbackAcceptedOperation: jest.fn().mockResolvedValue(true),
+  ...jest.requireActual('@librechat/api'),
+  fenceGlassHiveTerminalCallbackAcceptedOperation: jest.fn().mockResolvedValue(true),
 }));
 
 jest.mock('~/models', () => ({

@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import type { FeelingTrailEntry } from 'librechat-data-provider';
 import FeelingsView from './FeelingsView';
 
@@ -9,6 +9,14 @@ const mockMutateBand = jest.fn();
 const mockMutateReset = jest.fn();
 const mockMutateDelete = jest.fn();
 const mockRefetch = jest.fn();
+const mockLocalize = jest.fn((key: string, values?: Record<string, string | number>) => {
+  const translations = jest.requireActual<Record<string, string>>('~/locales/en/translation.json');
+  let text = translations[key] ?? key;
+  Object.entries(values ?? {}).forEach(([name, value]) => {
+    text = text.replaceAll(`{{${name}}}`, String(value));
+  });
+  return text;
+});
 
 const definitions = [
   ['energy', 'Energy', 56, 240, ['depleted', 'subdued', 'steady', 'energized', 'electric']],
@@ -165,6 +173,11 @@ function response(enabled = false) {
 }
 
 let mockQueryData = response(false);
+let mockQueryOverrides: {
+  isLoading?: boolean;
+  isError?: boolean;
+  error?: { response?: { status?: number; data?: { error?: { code?: string } } } };
+} = {};
 
 jest.mock('~/data-provider', () => ({
   useFeelingsQuery: () => ({
@@ -172,11 +185,16 @@ jest.mock('~/data-provider', () => ({
     isLoading: false,
     isError: false,
     refetch: mockRefetch,
+    ...mockQueryOverrides,
   }),
   useUpdateFeelingsProfileMutation: () => ({ mutateAsync: mockMutateProfile, isLoading: false }),
   useUpdateFeelingBandMutation: () => ({ mutateAsync: mockMutateBand, isLoading: false }),
   useResetFeelingsMutation: () => ({ mutateAsync: mockMutateReset, isLoading: false }),
   useDeleteFeelingsMutation: () => ({ mutateAsync: mockMutateDelete, isLoading: false }),
+}));
+
+jest.mock('~/hooks', () => ({
+  useLocalize: () => mockLocalize,
 }));
 
 function renderView() {
@@ -187,13 +205,199 @@ function renderView() {
   );
 }
 
+function CurrentRoute() {
+  const { pathname, search, hash } = useLocation();
+  return <output data-testid="current-route">{`${pathname}${search}${hash}`}</output>;
+}
+
 describe('FeelingsView', () => {
   beforeEach(() => {
+    jest.clearAllMocks();
     mockQueryData = response(false);
+    mockQueryOverrides = {};
     mockMutateProfile.mockResolvedValue(mockQueryData);
     mockMutateBand.mockResolvedValue(mockQueryData);
     mockMutateReset.mockResolvedValue(mockQueryData);
     mockMutateDelete.mockResolvedValue({ deleted: true });
+  });
+
+  test.each([
+    {
+      description: 'an existing chat conversation',
+      origin: '/c/conversation-origin?panel=controls#message-7',
+      available: true,
+    },
+    {
+      description: 'the exact originating account route',
+      origin: '/settings/account?tab=health#connected-accounts',
+      available: true,
+    },
+    {
+      description: 'an existing chat when Feelings is unavailable',
+      origin: '/c/conversation-unavailable?panel=controls#message-8',
+      available: false,
+    },
+  ])('returns to $description without creating a conversation', async ({ origin, available }) => {
+    const user = userEvent.setup();
+    mockQueryData.config.available = available;
+    mockQueryData.state.available = available;
+
+    render(
+      <MemoryRouter initialEntries={[origin, '/feelings']} initialIndex={1}>
+        <FeelingsView />
+        <CurrentRoute />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId('current-route')).toHaveTextContent('/feelings');
+    await user.click(screen.getByRole('button', { name: /back to chat/i }));
+
+    expect(screen.getByTestId('current-route')).toHaveTextContent(origin);
+    expect(screen.getByTestId('current-route')).not.toHaveTextContent('/c/new');
+  });
+
+  test.each([true, false])(
+    'uses the safe in-app chat landing when Feelings is opened directly (available: %s)',
+    async (available) => {
+      const user = userEvent.setup();
+      mockQueryData.config.available = available;
+      mockQueryData.state.available = available;
+
+      render(
+        <MemoryRouter initialEntries={['/feelings']}>
+          <FeelingsView />
+          <CurrentRoute />
+        </MemoryRouter>,
+      );
+
+      await user.click(screen.getByRole('button', { name: /back to chat/i }));
+
+      expect(screen.getByTestId('current-route')).toHaveTextContent('/c/new');
+    },
+  );
+
+  test('uses the existing theme-aware Viventium brand mark', () => {
+    renderView();
+
+    expect(screen.getByRole('img', { name: 'Viventium Logo' })).toHaveAttribute(
+      'src',
+      '/assets/logo.svg',
+    );
+  });
+
+  test.each([
+    {
+      status: 409,
+      code: 'FEELINGS_VERSION_CONFLICT',
+      message: 'Feelings changed elsewhere. The latest state has been reloaded.',
+      shouldRefetch: true,
+    },
+    {
+      status: 403,
+      code: 'FORBIDDEN',
+      message: 'You do not have permission to change Feelings.',
+      shouldRefetch: false,
+    },
+    {
+      status: 422,
+      code: 'FEELINGS_VALIDATION_ERROR',
+      message: 'This Feelings change is invalid. Review your changes and try again.',
+      shouldRefetch: false,
+    },
+    {
+      status: 503,
+      code: 'FEELINGS_UNAVAILABLE',
+      message: 'Feelings is temporarily unavailable. Your changes were not saved.',
+      shouldRefetch: false,
+    },
+  ])(
+    'classifies a $status save failure truthfully without inventing a conflict',
+    async ({ status, code, message, shouldRefetch }) => {
+      const user = userEvent.setup();
+      mockMutateReset.mockRejectedValueOnce({
+        response: { status, data: { error: { code } } },
+      });
+      renderView();
+
+      await user.click(screen.getByRole('button', { name: 'Reset state' }));
+
+      expect(await screen.findByText(message)).toBeVisible();
+      if (shouldRefetch) {
+        expect(mockRefetch).toHaveBeenCalledTimes(1);
+      } else {
+        expect(mockRefetch).not.toHaveBeenCalled();
+        expect(
+          screen.queryByText('Feelings changed elsewhere. The latest state has been reloaded.'),
+        ).not.toBeInTheDocument();
+      }
+    },
+  );
+
+  test('preserves the open Reaction editor and both unsaved values after a rejected save', async () => {
+    const user = userEvent.setup();
+    mockQueryData = response(true);
+    mockMutateProfile.mockRejectedValueOnce({
+      response: { status: 503, data: { error: { code: 'FEELINGS_UNAVAILABLE' } } },
+    });
+    renderView();
+
+    await user.click(screen.getByRole('button', { name: 'Reaction Cortex' }));
+    const instruction = screen.getByLabelText('How should the subconscious react?');
+    await user.clear(instruction);
+    await user.type(instruction, 'Keep this unfinished reaction instruction.');
+    await user.selectOptions(screen.getByLabelText('When should it activate?'), 'classified');
+    await user.click(screen.getByRole('button', { name: 'Done' }));
+
+    expect(
+      await screen.findByText('Feelings is temporarily unavailable. Your changes were not saved.'),
+    ).toBeVisible();
+    expect(screen.getByRole('dialog', { name: 'Emotional Reaction Cortex' })).toBeVisible();
+    expect(instruction).toHaveValue('Keep this unfinished reaction instruction.');
+    expect(screen.getByLabelText('When should it activate?')).toHaveValue('classified');
+    expect(mockRefetch).not.toHaveBeenCalled();
+  });
+
+  test('preserves an unsaved Reaction editor when a concurrent poll refresh changes saved values', async () => {
+    const user = userEvent.setup();
+    mockQueryData = response(true);
+    const view = renderView();
+
+    await user.click(screen.getByRole('button', { name: 'Reaction Cortex' }));
+    const instruction = screen.getByLabelText('How should the subconscious react?');
+    await user.clear(instruction);
+    await user.type(instruction, 'Keep my current local wording.');
+    await user.selectOptions(screen.getByLabelText('When should it activate?'), 'disabled');
+
+    mockQueryData = response(true);
+    mockQueryData.state.reactionInstruction = 'A concurrent saved instruction.';
+    mockQueryData.state.reactionActivationMode = 'classified';
+    view.rerender(
+      <MemoryRouter initialEntries={['/feelings']}>
+        <FeelingsView />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(instruction).toHaveValue('Keep my current local wording.'));
+    expect(screen.getByLabelText('When should it activate?')).toHaveValue('disabled');
+  });
+
+  test('localizes the visible Reaction route and fallback labels', async () => {
+    const user = userEvent.setup();
+    renderView();
+
+    await user.click(screen.getByRole('button', { name: 'Reaction Cortex' }));
+
+    expect(mockLocalize).toHaveBeenCalledWith('com_ui_feelings_reaction_primary', {
+      0: 'gpt-5.6-terra',
+      1: 'Fast',
+    });
+    expect(mockLocalize).toHaveBeenCalledWith('com_ui_feelings_reaction_fallback', {
+      0: 'claude-opus-5',
+    });
+    expect(mockLocalize).toHaveBeenCalledWith('com_ui_feelings_reaction_last_route', {
+      0: 'gpt-5.6-terra',
+      1: 'priority',
+    });
   });
 
   test('renders the locked off-state instrument with no prompt capsule', () => {

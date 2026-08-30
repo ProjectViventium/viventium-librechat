@@ -192,6 +192,8 @@ export interface OAuthConnectionOptions {
    * interactive OAuth flow when the credential is rejected.
    */
   allowOAuthInitiation?: boolean;
+  /** Prevent an unattended caller from starting an interactive OAuth flow. */
+  suppressOAuthFlow?: boolean;
   /* === VIVENTIUM END === */
   connectionTimeout?: number;
 }

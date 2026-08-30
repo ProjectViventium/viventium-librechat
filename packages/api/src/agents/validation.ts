@@ -135,10 +135,26 @@ export const activationConfigSchema = z
     }
   });
 
+export const cortexResultEvidencePolicySchema = z
+  .object({
+    visible_insight_requires: z
+      .array(
+        z
+          .object({
+            tool: z.string().trim().min(1),
+            receipt: z.literal('non_empty_sources'),
+          })
+          .strict(),
+      )
+      .min(1),
+  })
+  .strict();
+
 /** Background cortex schema - an agent with its activation config */
 export const backgroundCortexSchema = z.object({
   agent_id: z.string(),
   activation: activationConfigSchema,
+  result_evidence: cortexResultEvidencePolicySchema.optional(),
 });
 /* === VIVENTIUM END === */
 /* === VIVENTIUM START === GlassHive core Agent provider */
@@ -149,6 +165,19 @@ export const glassHiveOptionsSchema = z
       path: z.string().optional(),
     }),
     access: z.enum(['full', 'workspace']),
+    fallback_model: z.string().optional(),
+    fallback_reasoning_effort: z.string().optional(),
+    orchestration: z
+      .object({
+        parallel_available: z.boolean(),
+        default_mode: z.enum(['focused', 'parallel']),
+        worker_profile: z.enum(['codex-cli', 'claude-code', 'openclaw-general']).optional(),
+        fallback_worker_profile: z
+          .enum(['codex-cli', 'claude-code', 'openclaw-general'])
+          .optional(),
+      })
+      .strict()
+      .optional(),
   })
   .superRefine((value, ctx) => {
     const customPath = value.workspace.path?.trim() ?? '';
@@ -188,6 +217,7 @@ export const agentBaseSchema = z.object({
   edges: z.array(graphEdgeSchema).optional(),
   end_after_tools: z.boolean().optional(),
   hide_sequential_outputs: z.boolean().optional(),
+  presentation_policy: z.enum(['primary_final']).optional(),
   artifacts: z.string().optional(),
   recursion_limit: z.number().optional(),
   conversation_starters: z.array(z.string()).optional(),
@@ -303,6 +333,14 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
     glasshive_options?: {
       workspace: { mode: 'life' | 'custom'; path?: string };
       access: 'full' | 'workspace';
+      fallback_model?: string;
+      fallback_reasoning_effort?: string;
+      orchestration?: {
+        parallel_available: boolean;
+        default_mode: 'focused' | 'parallel';
+        worker_profile?: string;
+        fallback_worker_profile?: string;
+      };
     };
   };
   const rejectCapabilityTarget = (
@@ -427,9 +465,16 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
         return;
       }
       const activationConfig = activation as {
+        enabled?: boolean;
+        mode?: 'classified' | 'always' | 'disabled';
         provider?: unknown;
         fallbacks?: Array<{ provider?: unknown }>;
       };
+      const activationMode =
+        activationConfig.enabled === false ? 'disabled' : (activationConfig.mode ?? 'classified');
+      if (activationMode !== 'classified') {
+        return;
+      }
       rejectCapabilityTarget(activationConfig.provider, 'activation_classifier', [
         'background_cortices',
         cortexIndex,
@@ -535,6 +580,74 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
     modelParameters.reasoning_effort = effort;
   }
   next.model_parameters = modelParameters;
+  const fallbackModel = String(next.glasshive_options?.fallback_model ?? '').trim();
+  if (fallbackModel) {
+    if (capability.serial_model_fallback !== true) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: ['glasshive_options', 'fallback_model'],
+          message: `Provider ${provider} does not support serial model fallback`,
+        },
+      ]);
+    }
+    const fallbackMetadata = capability.models?.find((candidate) => candidate.id === fallbackModel);
+    if (!fallbackMetadata) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: ['glasshive_options', 'fallback_model'],
+          message: `Unsupported GlassHive fallback model ${fallbackModel}`,
+        },
+      ]);
+    }
+    if (fallbackModel === model) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: ['glasshive_options', 'fallback_model'],
+          message: 'GlassHive fallback model must differ from the primary model',
+        },
+      ]);
+    }
+    const fallbackEffort = String(
+      next.glasshive_options?.fallback_reasoning_effort ?? fallbackMetadata.recommendedEffort ?? '',
+    ).trim();
+    if (fallbackEffort && !(fallbackMetadata.effortChoices ?? []).includes(fallbackEffort)) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: ['glasshive_options', 'fallback_reasoning_effort'],
+          message: `Unsupported reasoning effort for fallback model ${fallbackModel}`,
+        },
+      ]);
+    }
+    const glassHiveOptions = next.glasshive_options;
+    if (!glassHiveOptions) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: ['glasshive_options'],
+          message: `Provider ${provider} requires GlassHive options for serial model fallback`,
+        },
+      ]);
+    }
+    next.glasshive_options = {
+      workspace: glassHiveOptions.workspace,
+      access: glassHiveOptions.access,
+      fallback_model: fallbackModel,
+      ...(fallbackEffort ? { fallback_reasoning_effort: fallbackEffort } : {}),
+      ...(glassHiveOptions.orchestration ? { orchestration: glassHiveOptions.orchestration } : {}),
+    };
+  } else if (next.glasshive_options) {
+    next.glasshive_options = {
+      workspace: next.glasshive_options.workspace,
+      access: next.glasshive_options.access,
+      ...(next.glasshive_options.orchestration
+        ? { orchestration: next.glasshive_options.orchestration }
+        : {}),
+    };
+  }
   return next;
 }
 

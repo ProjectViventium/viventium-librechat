@@ -52,6 +52,22 @@ describe('key methods', () => {
     });
   });
 
+  test('reports a provider-rejected connected account as disconnected', async () => {
+    lean.mockResolvedValue({ value: 'encrypted-value' });
+    mockDecrypt.mockResolvedValue(
+      JSON.stringify({
+        oauthProvider: 'anthropic',
+        oauthType: 'subscription',
+        oauthReconnectRequired: true,
+      }),
+    );
+    const methods = createKeyMethods(mongoose);
+
+    await expect(
+      methods.getUserKeyExpiry({ userId: 'user-1', name: 'anthropic' }),
+    ).resolves.toEqual({ expiresAt: null });
+  });
+
   test('reports a missing key as disconnected without attempting decryption', async () => {
     lean.mockResolvedValue(null);
     const methods = createKeyMethods(mongoose);

@@ -97,6 +97,7 @@ const AGENT_FIELDS = [
   'recursion_limit',
   'end_after_tools',
   'hide_sequential_outputs',
+  'presentation_policy',
   'support_contact',
   'background_cortices',
   'voice_llm_model',

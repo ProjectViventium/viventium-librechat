@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import { apiBaseUrl, request } from 'librechat-data-provider';
 import { Button, Spinner, useToastContext } from '@librechat/client';
+import type { TranslationKeys } from '~/hooks';
 import { NotificationSeverity } from '~/common';
 import { useLocalize } from '~/hooks';
 
@@ -35,6 +36,7 @@ type WhoopStatus = {
     export: Record<string, { status?: string | null }>;
   };
   latestApiRun?: WhoopRun | null;
+  latestSuccessfulApiRun?: WhoopRun | null;
   latestExportRun?: WhoopRun | null;
   manualEvidence: { itemCount: number; latestAt?: string | null };
   schedule: { state?: string | null; configured: boolean; loaded: boolean };
@@ -137,10 +139,16 @@ function WhoopConnection() {
   }, [shouldPoll, status?.state]);
 
   const authorizationDegraded = status?.authorizationRecoveryRequired === true;
+  const providerUnavailable = Object.values(status?.coverage.api ?? {}).some((row) =>
+    ['provider_unavailable', 'blocked_by_provider_unavailable'].includes(row.status ?? ''),
+  );
 
   const issueMessageKey = useMemo(() => {
-    const code = authorizationDegraded ? 'authorization_failed' : status?.onboarding?.errorCode;
-    const known: Record<string, string> = {
+    if (authorizationDegraded) {
+      return 'com_ui_whoop_error_authorization_reconnect';
+    }
+    const code = providerUnavailable ? 'provider_unavailable' : status?.onboarding?.errorCode;
+    const known: Record<string, TranslationKeys> = {
       authorization_failed: 'com_ui_whoop_error_authorization_failed',
       history_import_failed: 'com_ui_whoop_error_history_import_failed',
       history_partial: 'com_ui_whoop_error_history_partial',
@@ -149,9 +157,12 @@ function WhoopConnection() {
       provider_unavailable: 'com_ui_whoop_error_provider_unavailable',
     };
     return (code && known[code]) || 'com_ui_whoop_error_general';
-  }, [authorizationDegraded, status?.onboarding?.errorCode]);
+  }, [authorizationDegraded, providerUnavailable, status?.onboarding?.errorCode]);
 
   const stateLabel = useMemo(() => {
+    if (!status) {
+      return localize(statusError ? 'com_ui_unavailable' : 'com_ui_whoop_loading');
+    }
     switch (status?.state) {
       case 'connected':
         return localize('com_ui_whoop_connected');
@@ -169,7 +180,7 @@ function WhoopConnection() {
       default:
         return localize('com_ui_whoop_not_connected');
     }
-  }, [localize, status?.state]);
+  }, [localize, status, statusError]);
 
   const showFailure = useCallback(() => {
     showToast({
@@ -201,7 +212,7 @@ function WhoopConnection() {
           redirectUri,
         });
       }
-      const result = await request.post<{ authorizationUrl?: string }>(
+      const result: { authorizationUrl?: string } = await request.post(
         `${apiBaseUrl()}/api/viventium/health/whoop/authorize`,
         {},
       );
@@ -335,7 +346,13 @@ function WhoopConnection() {
     [localize, operation, refreshStatus, showFailure, showToast],
   );
 
-  const itemCount = status?.latestApiRun?.itemCount;
+  const resourceItemCounts = Object.values(status?.coverage.api ?? {})
+    .map((row) => row.items)
+    .filter((value): value is number => typeof value === 'number');
+  const itemCount =
+    resourceItemCounts.length > 0
+      ? resourceItemCounts.reduce((total, value) => total + value, 0)
+      : (status?.latestSuccessfulApiRun?.itemCount ?? status?.latestApiRun?.itemCount);
   const canStartAuthorization =
     status?.clientConfigured === true &&
     (authorizationDegraded ||
@@ -365,7 +382,11 @@ function WhoopConnection() {
         </span>
       </div>
 
-      {!status && !statusError && <Spinner className="icon-sm" />}
+      {!status && !statusError && (
+        <div role="status" aria-label={localize('com_ui_whoop_loading')}>
+          <Spinner className="icon-sm" />
+        </div>
+      )}
       {statusError && (
         <div className="flex items-center justify-between gap-3 rounded-lg bg-surface-secondary p-3">
           <p className="text-xs text-text-secondary">
@@ -417,7 +438,7 @@ function WhoopConnection() {
                 <p className="mt-1 text-xs text-text-secondary">
                   {localize('com_ui_whoop_setup_description')}{' '}
                   <a
-                    className="text-primary underline"
+                    className="inline-flex min-h-6 items-center rounded-sm text-primary underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-black focus-visible:ring-offset-2 dark:focus-visible:ring-white"
                     href="https://developer.whoop.com/"
                     target="_blank"
                     rel="noreferrer"

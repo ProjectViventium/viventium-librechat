@@ -30,6 +30,7 @@ const mockGenerationJobManager = {
 };
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: {
     debug: jest.fn(),
     info: jest.fn(),
@@ -39,6 +40,7 @@ jest.mock('@librechat/data-schemas', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   sendEvent: jest.fn(),
   getViolationInfo: jest.fn(() => ({ score: 0 })),
   GenerationJobManager: mockGenerationJobManager,
@@ -268,6 +270,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
             },
             deliveryPolicy: { commit_authority: 'server' },
             memoryEligible: false,
+            recallEligible: true,
             interactionContext: {
               actor_kind: 'system',
               origin: 'scheduler',

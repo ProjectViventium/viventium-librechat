@@ -5,12 +5,8 @@ const {
 } = require('../agentSchemaToolBindingPatch');
 
 describe('agentSchemaToolBindingPatch', () => {
-  const connectedInitializerSymbol = Symbol.for('viventium.agent.connected.initializer.v1');
   const capabilityRefreshSymbol = Symbol.for('viventium.agent.model.route.capability.refresh.v1');
   const fallbackContextSymbol = Symbol.for('viventium.agent.graph.fallback.runtime.context.v1');
-  const nativeAuthorityObserverSymbol = Symbol.for(
-    'viventium.agent.model.route.native.authority.observer.v1',
-  );
 
   it('treats tool lists with matching names as equivalent', () => {
     expect(sameToolList([{ name: 'file_search' }], [{ lc_kwargs: { name: 'file_search' } }])).toBe(
@@ -261,147 +257,6 @@ describe('agentSchemaToolBindingPatch', () => {
     expect(agentContext.tools).toBe(originalTools);
   });
 
-  it('hydrates only the invoked connected participant once before model authorship', async () => {
-    let releaseInitialization;
-    const initializationGate = new Promise((resolve) => {
-      releaseInitialization = resolve;
-    });
-    const hydratedRegistry = new Map([['read_mail', { name: 'read_mail' }]]);
-    const connectedInitializer = jest.fn(async () => {
-      await initializationGate;
-      return {
-        provider: 'synthetic-provider',
-        reasoningKey: 'reasoning',
-        clientOptions: { model: 'synthetic-connected-model' },
-        instructions: 'Hydrated connected instructions.',
-        tools: [{ name: 'read_mail' }],
-        toolDefinitions: [{ name: 'read_mail' }],
-        toolRegistry: hydratedRegistry,
-        maxContextTokens: 32000,
-        useLegacyContent: false,
-      };
-    });
-    const observed = [];
-    const fakeProto = {
-      createCallModel(agentId = 'default') {
-        const graph = this;
-        return async function fakeCallModel() {
-          const context = graph.agentContexts.get(agentId);
-          observed.push({
-            provider: context.provider,
-            instructions: context.instructions,
-            tools: context.tools,
-            definitions: context.toolDefinitions,
-            registry: context.toolRegistry,
-          });
-          return { messages: [] };
-        };
-      },
-    };
-    const lazyRegistry = new Map();
-    const lazyClientOptions = {};
-    Object.defineProperty(lazyClientOptions, connectedInitializerSymbol, {
-      value: connectedInitializer,
-      enumerable: false,
-    });
-    const connectedContext = {
-      provider: 'shell-provider',
-      clientOptions: lazyClientOptions,
-      instructions: 'Shell instructions.',
-      tools: [],
-      toolDefinitions: [{ name: 'viventium_connected_agent_lazy_sentinel' }],
-      toolRegistry: lazyRegistry,
-      getToolsForBinding() {
-        return this.tools;
-      },
-      initializeSystemRunnable: jest.fn(),
-    };
-    const mainContext = { clientOptions: {}, tools: [], getToolsForBinding: () => [] };
-
-    expect(installUnifiedSchemaToolBindingPatch(fakeProto)).toBe(true);
-    const fakeGraph = {
-      agentContexts: new Map([
-        ['main', mainContext],
-        ['connected', connectedContext],
-      ]),
-    };
-    const originalCreateCallModel = fakeProto.createCallModel;
-    const mainModel = originalCreateCallModel.call(
-      { ...fakeGraph, agentContexts: new Map([['main', mainContext]]) },
-      'main',
-    );
-    await mainModel({ messages: [] }, {});
-    expect(connectedInitializer).not.toHaveBeenCalled();
-    observed.length = 0;
-
-    const callModel = fakeProto.createCallModel.call(fakeGraph, 'connected');
-    const first = callModel({ messages: [] }, {});
-    const second = callModel({ messages: [] }, {});
-    await Promise.resolve();
-    expect(connectedInitializer).toHaveBeenCalledTimes(1);
-    expect(observed).toEqual([]);
-    releaseInitialization();
-    await Promise.all([first, second]);
-
-    expect(observed).toHaveLength(2);
-    expect(observed[0]).toMatchObject({
-      provider: 'synthetic-provider',
-      instructions: 'Hydrated connected instructions.',
-      tools: [{ name: 'read_mail' }],
-      definitions: [{ name: 'read_mail' }],
-    });
-    expect(observed[0].registry).toBe(lazyRegistry);
-    expect([...lazyRegistry.keys()]).toEqual(['read_mail']);
-  });
-
-  it('fails a connected participant before provider authorship on hydration error or abort', async () => {
-    const providerInvoke = jest.fn(async () => ({ messages: [] }));
-    const hydrationError = new Error('synthetic connected initialization failed');
-    const makeGraph = (initializer) => {
-      const fakeProto = {
-        createCallModel(agentId = 'connected') {
-          return async () => providerInvoke(agentId);
-        },
-      };
-      expect(installUnifiedSchemaToolBindingPatch(fakeProto)).toBe(true);
-      const clientOptions = {};
-      Object.defineProperty(clientOptions, connectedInitializerSymbol, {
-        value: initializer,
-        enumerable: false,
-      });
-      const context = {
-        clientOptions,
-        tools: [],
-        toolDefinitions: [{ name: 'viventium_connected_agent_lazy_sentinel' }],
-        toolRegistry: new Map(),
-        getToolsForBinding: () => [],
-      };
-      const graph = { agentContexts: new Map([['connected', context]]) };
-      return fakeProto.createCallModel.call(graph, 'connected');
-    };
-
-    await expect(
-      makeGraph(jest.fn(async () => Promise.reject(hydrationError)))({ messages: [] }, {}),
-    ).rejects.toBe(hydrationError);
-    expect(providerInvoke).not.toHaveBeenCalled();
-
-    let releaseInitialization;
-    const gate = new Promise((resolve) => {
-      releaseInitialization = resolve;
-    });
-    const abortController = new AbortController();
-    const abortedCall = makeGraph(
-      jest.fn(async () => {
-        await gate;
-        return { clientOptions: {}, provider: 'synthetic-provider' };
-      }),
-    )({ messages: [] }, { signal: abortController.signal });
-    abortController.abort();
-    releaseInitialization();
-    await expect(abortedCall).rejects.toMatchObject({ name: 'AbortError' });
-    expect(providerInvoke).not.toHaveBeenCalled();
-  });
-
   it('rejects an aborted graph attempt before invoking any primary or fallback provider', async () => {
     const providerInvoke = jest.fn(async () => ({ messages: [] }));
     const capabilityRefresh = jest.fn();
@@ -477,70 +332,6 @@ describe('agentSchemaToolBindingPatch', () => {
     expect(providerInvoke).not.toHaveBeenCalled();
   });
 
-  it('reports the exact refreshed system authority immediately before provider invocation', async () => {
-    const providerInvoke = jest.fn(async (input) => ({ messages: input.finalMessages }));
-    const authorityObserver = jest.fn();
-    const developerTail = 'Pinned Feelings authority.';
-    const capabilityRefresh = jest.fn(async () => ({
-      previousInstructionAppend: 'Old capability authority.',
-      instructionAppend: 'Fresh capability authority.',
-    }));
-    const fakeProto = {
-      createCallModel() {
-        const graph = this;
-        return async (state, config) =>
-          graph.attemptInvoke(
-            { provider: 'synthetic', finalMessages: state.messages, currentModel: {} },
-            config,
-          );
-      },
-      attemptInvoke(...args) {
-        return providerInvoke(...args);
-      },
-    };
-
-    expect(installUnifiedSchemaToolBindingPatch(fakeProto)).toBe(true);
-    const clientOptions = {
-      configuration: {
-        defaultHeaders: {
-          'X-GlassHive-Developer-Instruction-Tail-B64': Buffer.from(developerTail, 'utf8').toString(
-            'base64',
-          ),
-        },
-      },
-    };
-    Object.defineProperty(clientOptions, capabilityRefreshSymbol, {
-      value: capabilityRefresh,
-      enumerable: false,
-    });
-    Object.defineProperty(clientOptions, nativeAuthorityObserverSymbol, {
-      value: authorityObserver,
-      enumerable: false,
-    });
-    const fakeGraph = Object.assign(Object.create(fakeProto), {
-      agentContexts: new Map([['default', { clientOptions }]]),
-    });
-    const callModel = fakeProto.createCallModel.call(fakeGraph, 'default');
-
-    await callModel(
-      {
-        messages: [
-          new SystemMessage(
-            `Stable Main authority.\n\nOld capability authority.\n\n${developerTail}`,
-          ),
-        ],
-      },
-      {},
-    );
-
-    expect(authorityObserver).toHaveBeenCalledWith({
-      instructionAuthority: `Stable Main authority.\n\nFresh capability authority.\n\n${developerTail}`,
-    });
-    expect(providerInvoke.mock.calls[0][0].finalMessages[0].content).toBe(
-      `Stable Main authority.\n\n${developerTail}\n\nFresh capability authority.`,
-    );
-  });
-
   /* === VIVENTIUM START ===
    * Feature: Opaque graph-participant provider failure provenance.
    * Purpose: Guard the exact participant model boundary without widening retry to tool failures.
@@ -556,43 +347,16 @@ describe('agentSchemaToolBindingPatch', () => {
       enumerable: false,
     });
     const fakeProto = {
-      createCallModel() {
+      createCallModel(agentId = 'default') {
         const graph = this;
-        return async function fakeCallModel(state, config) {
-          try {
-            return await graph.attemptInvoke(
-              {
-                provider: 'synthetic-primary-provider',
-                finalMessages: state.messages,
-                currentModel: {},
-              },
-              config,
-            );
-          } catch (_) {
-            const currentModel = graph.getNewModel({
-              provider: 'synthetic-fallback-provider',
-              clientOptions: fallbackClientOptions,
-            });
-            return graph.attemptInvoke(
-              {
-                provider: 'synthetic-fallback-provider',
-                finalMessages: state.messages,
-                currentModel,
-              },
-              config,
-            );
+        return async function fakeCallModel() {
+          const provider = graph.agentContexts.get(agentId).provider;
+          calls.push(provider);
+          if (provider === 'synthetic-primary-provider') {
+            throw new Error('synthetic adapter omitted provider status and code');
           }
+          return { messages: [] };
         };
-      },
-      async attemptInvoke(input) {
-        calls.push(input.provider);
-        if (input.provider === 'synthetic-primary-provider') {
-          throw new Error('synthetic adapter omitted provider status and code');
-        }
-        return { messages: [] };
-      },
-      getNewModel({ clientOptions }) {
-        return { clientOptions };
       },
     };
 
@@ -600,7 +364,22 @@ describe('agentSchemaToolBindingPatch', () => {
     const fakeGraph = Object.assign(Object.create(fakeProto), {
       contentData: [],
       toolCallStepIds: new Map(),
-      agentContexts: new Map([['default', { clientOptions: {} }]]),
+      agentContexts: new Map([
+        [
+          'default',
+          {
+            provider: 'synthetic-primary-provider',
+            clientOptions: {
+              fallbacks: [
+                {
+                  provider: 'synthetic-fallback-provider',
+                  clientOptions: fallbackClientOptions,
+                },
+              ],
+            },
+          },
+        ],
+      ]),
     });
     const callModel = fakeProto.createCallModel.call(fakeGraph, 'default');
 

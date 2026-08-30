@@ -2116,7 +2116,11 @@ function observeGenerationEvent(taskId, generationEvent) {
   }
   const data =
     generationEvent?.data && typeof generationEvent.data === 'object' ? generationEvent.data : {};
-  const ownerEventId = safeText(data.id || data.runId || data.eventId, 160);
+  const toolResult = data?.result && typeof data.result === 'object' ? data.result : null;
+  const ownerEventId = safeText(
+    data.id || data.runId || data.eventId || toolResult?.id || toolResult?.tool_call?.id,
+    160,
+  );
   const observedKey = ownerEventId
     ? [eventType, ownerEventId, safeText(data.status, 80)].join(':')
     : '';
@@ -2134,9 +2138,9 @@ function observeGenerationEvent(taskId, generationEvent) {
     const toolCalls = Array.isArray(data?.stepDetails?.tool_calls)
       ? data.stepDetails.tool_calls
       : [];
-    const toolName = toolCalls
-      .map((call) => safeText(call?.function?.name || call?.name, 160))
-      .find(Boolean);
+    const toolName =
+      toolCalls.map((call) => safeText(call?.function?.name || call?.name, 160)).find(Boolean) ||
+      safeText(toolResult?.tool_call?.name, 160);
     return nextEvent(task, {
       type: 'progress',
       phase: eventType === 'on_run_step_completed' ? 'tool_completed' : 'tool',

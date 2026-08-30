@@ -7,6 +7,7 @@ const mockGetSourceOrderCapabilities = jest.fn();
 const mockLoggerWarn = jest.fn();
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: { warn: (...args) => mockLoggerWarn(...args) },
 }));
 

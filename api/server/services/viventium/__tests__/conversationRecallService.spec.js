@@ -26,45 +26,46 @@ const mockWriteFile = jest.fn();
 const mockUnlink = jest.fn();
 const mockDeferAfterCommit = jest.fn();
 
-jest.mock(
+const mockActualDataSchemas = { ...jest.requireActual('@librechat/data-schemas') };
+const mockActualDataProvider = { ...jest.requireActual('librechat-data-provider') };
+const mockActualFs = { ...jest.requireActual('fs') };
+const mockVisibleContentProjection = jest.requireActual('../ViventiumVisibleContentProjection');
+
+jest.doMock(
   '@librechat/data-schemas',
-  () => {
-    const actualDataSchemas = jest.requireActual('@librechat/data-schemas');
-    return {
-      ...actualDataSchemas,
-      logger: {
-        error: jest.fn(),
-        warn: jest.fn(),
-        info: jest.fn(),
-        debug: jest.fn(),
-      },
-    };
-  },
+  () => ({
+    ...mockActualDataSchemas,
+    logger: {
+      error: jest.fn(),
+      warn: jest.fn(),
+      info: jest.fn(),
+      debug: jest.fn(),
+    },
+  }),
   { virtual: true },
 );
 
-jest.mock('fs', () => {
-  const actualFs = jest.requireActual('fs');
+jest.doMock('fs', () => {
   return {
-    ...actualFs,
+    ...mockActualFs,
     promises: {
-      ...actualFs.promises,
+      ...mockActualFs.promises,
       writeFile: (...args) => mockWriteFile(...args),
       unlink: (...args) => mockUnlink(...args),
     },
   };
 });
 
-jest.mock('~/server/services/Files/VectorDB/crud', () => ({
+jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
   uploadVectors: (...args) => mockUploadVectors(...args),
   deleteVectors: (...args) => mockDeleteVectors(...args),
 }));
 
-jest.mock('../GlassHiveTerminalCallbackTransaction', () => ({
+jest.doMock('../GlassHiveTerminalCallbackTransaction', () => ({
   deferGlassHiveTerminalCallbackAfterCommit: (...args) => mockDeferAfterCommit(...args),
 }));
 
-jest.mock('~/db/models', () => ({
+jest.doMock('~/db/models', () => ({
   Agent: {
     findOne: (...args) => mockAgentFindOne(...args),
     find: jest.fn(),
@@ -87,8 +88,8 @@ jest.mock('~/db/models', () => ({
   },
 }));
 
-jest.mock('librechat-data-provider', () => ({
-  ...jest.requireActual('librechat-data-provider'),
+jest.doMock('librechat-data-provider', () => ({
+  ...mockActualDataProvider,
   FileContext: {
     conversation_recall: 'conversation_recall',
   },
@@ -118,6 +119,19 @@ jest.mock('librechat-data-provider', () => ({
     return filename.slice(prefix.length, -'.txt'.length) || null;
   },
 }));
+
+jest.doMock('../ViventiumVisibleContentProjection', () => mockVisibleContentProjection);
+
+afterAll(() => {
+  jest.dontMock('@librechat/data-schemas');
+  jest.dontMock('fs');
+  jest.dontMock('~/server/services/Files/VectorDB/crud');
+  jest.dontMock('../GlassHiveTerminalCallbackTransaction');
+  jest.dontMock('~/db/models');
+  jest.dontMock('librechat-data-provider');
+  jest.dontMock('../ViventiumVisibleContentProjection');
+  jest.resetModules();
+});
 
 function queryResult(result) {
   return {

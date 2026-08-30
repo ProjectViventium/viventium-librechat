@@ -239,7 +239,6 @@ function dispatch(app, req, res) {
 
 describe('/api/viventium/glasshive/callback', () => {
   beforeEach(() => {
-    jest.resetModules();
     mockSaveMessage = jest.fn().mockResolvedValue({});
     mockUpdateMessage = jest.fn().mockResolvedValue({});
     mockDeleteMessages = jest.fn().mockResolvedValue({ deletedCount: 1 });

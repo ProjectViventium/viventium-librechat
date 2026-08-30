@@ -32,6 +32,26 @@ export interface OpenAIConfigOptions {
     apiKey: string;
     headers?: Record<string, string>;
   }>;
+  /** Report only a provider-accepted native request to request-scoped Viventium telemetry. */
+  nativeProviderRequestAccepted?: (receipt: {
+    provider: 'openai' | 'glasshive';
+    model: string;
+    status: number;
+    request?: Record<string, unknown>;
+    instructionAuthority?: string;
+    nativeRequestSha256?: string;
+    authorityReceipt?: {
+      protocol: string;
+      run_id: string;
+      runtime: string;
+      model: string;
+      authority_sha256: string;
+      authority_chars: number;
+      feeling_capsule_count: number;
+      placement: string;
+      materialized: boolean;
+    };
+  }) => void;
   /* === VIVENTIUM END === */
 }
 

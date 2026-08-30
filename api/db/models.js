@@ -47,6 +47,16 @@ const createViventiumGatewayIngressEvent = require('./viventiumGatewayIngressEve
  * Added: 2026-05-06
  * === VIVENTIUM END === */
 const createViventiumGlassHiveCallbackDelivery = require('./viventiumGlassHiveCallbackDelivery');
+const createViventiumGlassHiveCallbackEffectOutbox = require('./viventiumGlassHiveCallbackEffectOutbox');
+/* === VIVENTIUM START === Durable cortex insight delivery ledger. === VIVENTIUM END === */
+const createViventiumCortexInsightDelivery = require('./viventiumCortexInsightDelivery');
+/* === VIVENTIUM START === Provider-neutral accepted Main continuity state. === VIVENTIUM END === */
+const createViventiumMainContinuityState = require('./viventiumMainContinuityState');
+/* === VIVENTIUM START === Append-only orchestration trace ledger. === VIVENTIUM END === */
+const createViventiumOrchestrationTraceEvent = require('./viventiumOrchestrationTraceEvent');
+/* === VIVENTIUM START === Owner-bound personal-account cleanup receipt ledger. === */
+const createViventiumPersonalAccountCleanupReceipt = require('./viventiumPersonalAccountCleanupReceipt');
+/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
  * Feature: Viventium persistence models (Telegram + voice + gateway)
@@ -68,5 +78,10 @@ module.exports = {
   ViventiumTelegramIngressEvent: createViventiumTelegramIngressEvent(mongoose),
   ViventiumGatewayIngressEvent: createViventiumGatewayIngressEvent(mongoose),
   ViventiumGlassHiveCallbackDelivery: createViventiumGlassHiveCallbackDelivery(mongoose),
+  ViventiumGlassHiveCallbackEffectOutbox: createViventiumGlassHiveCallbackEffectOutbox(mongoose),
+  ViventiumCortexInsightDelivery: createViventiumCortexInsightDelivery(mongoose),
+  ViventiumMainContinuityState: createViventiumMainContinuityState(mongoose),
+  ViventiumOrchestrationTraceEvent: createViventiumOrchestrationTraceEvent(mongoose),
+  ViventiumPersonalAccountCleanupReceipt: createViventiumPersonalAccountCleanupReceipt(mongoose),
 };
 /* === VIVENTIUM END === */

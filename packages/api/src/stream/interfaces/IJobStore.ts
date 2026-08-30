@@ -389,8 +389,12 @@ export interface IEventTransport {
     },
   ): { unsubscribe: () => void; ready?: Promise<void> };
 
-  /** Publish a chunk event - returns Promise in Redis mode for ordered delivery */
-  emitChunk(streamId: string, event: unknown): void | Promise<void>;
+  /** Publish a chunk event and report whether the transport accepted it. */
+  emitChunk(
+    streamId: string,
+    event: unknown,
+    options?: EventTransportEmitOptions,
+  ): EventTransportPublishReceipt | void | Promise<EventTransportPublishReceipt | void>;
 
   /** Publish a done event - returns Promise in Redis mode for ordered delivery */
   emitDone(streamId: string, event: unknown): void | Promise<void>;
@@ -429,11 +433,26 @@ export interface IEventTransport {
   syncReorderBuffer?(streamId: string): void;
 
   /** Cleanup transport resources for a specific stream */
-  cleanup(streamId: string): void;
+  cleanup(streamId: string): void | Promise<void>;
 
   /** Get all tracked stream IDs (for orphan cleanup) */
   getTrackedStreamIds(): string[];
 
   /** Destroy all transport resources */
   destroy(): void | Promise<void>;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Exact Web presentation receipts.
+ * Purpose: Require proof that a presentation handler accepted the exact event when durable replay is unavailable.
+ * === VIVENTIUM END === */
+export interface EventTransportEmitOptions {
+  requirePresentationAcknowledgement?: boolean;
+  presentationAcknowledgementTimeoutMs?: number;
+}
+
+export interface EventTransportPublishReceipt {
+  published: boolean;
+  subscriberCount: number;
+  presentationAcknowledged?: boolean;
 }

@@ -622,7 +622,18 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
   const isImage = file.mimetype.startsWith('image');
   let fileInfoMetadata;
   const entity_id = messageAttachment === true ? undefined : agent_id;
-  const basePath = mime.getType(file.originalname)?.startsWith('image') ? 'images' : 'uploads';
+  /* === VIVENTIUM START ===
+   * Feature: Durable bridge-image handoff.
+   * Purpose: Telegram injects images directly into Main's vision message, but background workers
+   * need an owner-scoped durable source. Store that trusted bridge copy under uploads so GlassHive
+   * can resolve it through the existing signed bootstrap-source contract.
+   * === VIVENTIUM END === */
+  const durableBridgeImage = isImage && req._viventiumBridgeDurableMissionAttachment === true;
+  const basePath = durableBridgeImage
+    ? 'uploads'
+    : mime.getType(file.originalname)?.startsWith('image')
+      ? 'images'
+      : 'uploads';
   const fileConfig = mergeFileConfig(appConfig.fileConfig);
   const supportsOCRExtraction = fileConfig.checkType(
     file.mimetype,
@@ -652,6 +663,8 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
    *   Google/OpenRouter audio-video uploads.
    *
    * Behavior:
+   * - A trusted bridge image is already present as a bounded vision part. Preserve one raw,
+   *   owner-scoped copy for durable worker handoff instead of misrouting it through OCR.
    * - If a message attachment matches LibreChat's native "Upload to Provider" contract for the
    *   active endpoint/provider, preserve the normal raw attachment path so downstream client logic
    *   can encode it for the provider.
@@ -663,41 +676,50 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
   const supportsContextExtraction =
     supportsOCRExtraction || shouldUseDocumentParser || shouldUseSTT || shouldUseDirectText;
   if (messageAttachment && !resolvedToolResource) {
-    const { currentProvider, endpointType, useResponsesApi } =
-      await resolveMessageAttachmentSurface({
-        req,
+    if (durableBridgeImage) {
+      logger.debug('[processAgentFileUpload] Preserving trusted bridge image for worker handoff', {
         agent_id,
-      });
-    const providerNativeAttachment = isProviderNativeMessageAttachment({
-      mimetype: file.mimetype,
-      endpointType,
-      currentProvider,
-      useResponsesApi,
-    });
-
-    if (providerNativeAttachment) {
-      logger.debug('[processAgentFileUpload] Preserving provider-native message attachment', {
-        agent_id,
-        endpointType,
-        currentProvider,
-        file_id,
-        mimetype: file.mimetype,
-        originalname: file.originalname,
-      });
-    } else if (supportsContextExtraction) {
-      resolvedToolResource = EToolResources.context;
-      logger.debug('[processAgentFileUpload] Auto-promoted message attachment to context', {
-        agent_id,
-        endpointType,
-        currentProvider,
         file_id,
         mimetype: file.mimetype,
         originalname: file.originalname,
       });
     } else {
-      throw new Error(
-        `Unsupported message attachment type ${file.mimetype}. This file can't be sent provider-natively or extracted as readable text on this surface.`,
-      );
+      const { currentProvider, endpointType, useResponsesApi } =
+        await resolveMessageAttachmentSurface({
+          req,
+          agent_id,
+        });
+      const providerNativeAttachment = isProviderNativeMessageAttachment({
+        mimetype: file.mimetype,
+        endpointType,
+        currentProvider,
+        useResponsesApi,
+      });
+
+      if (providerNativeAttachment) {
+        logger.debug('[processAgentFileUpload] Preserving provider-native message attachment', {
+          agent_id,
+          endpointType,
+          currentProvider,
+          file_id,
+          mimetype: file.mimetype,
+          originalname: file.originalname,
+        });
+      } else if (supportsContextExtraction) {
+        resolvedToolResource = EToolResources.context;
+        logger.debug('[processAgentFileUpload] Auto-promoted message attachment to context', {
+          agent_id,
+          endpointType,
+          currentProvider,
+          file_id,
+          mimetype: file.mimetype,
+          originalname: file.originalname,
+        });
+      } else {
+        throw new Error(
+          `Unsupported message attachment type ${file.mimetype}. This file can't be sent provider-natively or extracted as readable text on this surface.`,
+        );
+      }
     }
   }
 
@@ -946,7 +968,7 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
     });
   }
 
-  if (isImage) {
+  if (isImage && !durableBridgeImage) {
     const result = await processImageFile({
       req,
       file,

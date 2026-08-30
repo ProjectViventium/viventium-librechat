@@ -41,6 +41,11 @@ const {
   getStaleCortexRecoveryIntervalMs,
   recoverStaleCortexMessages,
 } = require('./services/viventium/staleCortexMessageRecovery');
+/* === VIVENTIUM START ===
+ * Feature: Fail-closed local-QA service startup acknowledgement.
+ */
+const { registerLocalQaServiceAck } = require('./services/viventium/localQaServiceAck');
+/* === VIVENTIUM END === */
 const staticCache = require('./utils/staticCache');
 const noIndex = require('./middleware/noIndex');
 const { seedDatabase } = require('~/models');
@@ -334,7 +339,7 @@ const startServer = async () => {
    * Feature: Process-private native API transport.
    * Purpose: A private Unix socket binds this server instance to its owning native proxy.
    */
-  app.listen(...apiListenTarget.args, async (err) => {
+  const server = app.listen(...apiListenTarget.args, async (err) => {
     if (err) {
       logger.error('Failed to start server:', err);
       process.exit(1);
@@ -421,6 +426,7 @@ const startServer = async () => {
       memoryDiagnostics.start();
     }
   });
+  registerLocalQaServiceAck(server);
 };
 
 startServer().catch((startupError) => {

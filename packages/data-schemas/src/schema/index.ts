@@ -26,6 +26,17 @@ export { default as userSchema } from './user';
 export { default as memorySchema } from './memory';
 export { default as feelingStateSchema } from './feelingState';
 export { default as groupSchema } from './group';
+export { default as localQaCortexFaultControlSchema } from './localQaCortexFaultControl';
+export { default as localQaVoiceClassifierFaultControlSchema } from './localQaVoiceClassifierFaultControl';
+/* === VIVENTIUM START === GlassHive callback persistence === */
+export { default as glassHiveTerminalCallbackResultSchema } from './glassHiveTerminalCallbackResult';
+export { default as glassHiveCallbackEffectOutboxSchema } from './glassHiveCallbackEffectOutbox';
+export { default as mainContinuityStateSchema } from './mainContinuityState';
+export { createViventiumCortexFeelingSnapshotSchema } from './cortexFeelingSnapshot';
+export { default as cortexInsightDeliverySchema } from './cortexInsightDelivery';
+export { default as orchestrationTraceEventSchema } from './orchestrationTraceEvent';
+export { createViventiumPersonalAccountCleanupReceiptSchema } from './personalAccountCleanupReceipt';
+/* === VIVENTIUM END === */
 /* === VIVENTIUM START === Channel-neutral messaging === */
 export { default as channelConnectionSchema } from './channelConnection';
 export { default as channelThreadSchema } from './channelThread';

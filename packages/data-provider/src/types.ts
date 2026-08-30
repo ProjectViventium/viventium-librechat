@@ -127,6 +127,10 @@ export type TPayload = Partial<TMessage> &
     editedContent?: TEditedContent | null;
     /** Added conversation for multi-convo feature */
     addedConvo?: TConversation;
+    /* === VIVENTIUM START === Exact optimistic-to-authoritative resume identity. === */
+    /** Client-only assistant placeholder ID; distinct from the server authoring response ID. */
+    viventiumClientResponseMessageId?: string;
+    /* === VIVENTIUM END === */
   };
 
 export type TEditedContent =
@@ -402,8 +406,7 @@ export type TConfig = {
 };
 
 export type TEndpointsConfig =
-  | Record<EModelEndpoint | string, TConfig | null | undefined>
-  | undefined;
+  Record<EModelEndpoint | string, TConfig | null | undefined> | undefined;
 
 export type TModelsConfig = Record<string, string[]>;
 

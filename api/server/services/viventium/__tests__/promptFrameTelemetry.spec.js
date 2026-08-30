@@ -3,6 +3,7 @@
  * Added: 2026-05-07
  * === VIVENTIUM END === */
 
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -23,6 +24,11 @@ const {
   normalizeLayersToContract,
   normalizeMCPInstructionSources,
   buildPromptFrame,
+  buildPromptFrameRequestIdentityHash,
+  buildPromptFrameRouteTelemetry,
+  buildPromptFrameTraceTelemetry,
+  promptLayerIntegritySnapshot,
+  resetPromptLayerIntegrityForTests,
   logPromptFrame,
   writePromptFrameFile,
   flushPromptFrameFileWrites,
@@ -41,12 +47,50 @@ describe('promptFrameTelemetry', () => {
   };
 
   afterEach(() => {
+    resetPromptLayerIntegrityForTests();
     Object.entries(originalEnv).forEach(([key, value]) => {
       if (value == null) {
         delete process.env[key];
       } else {
         process.env[key] = value;
       }
+    });
+  });
+
+  test('tracks unknown prompt layers locally without storing prompt text', () => {
+    expect(promptLayerIntegritySnapshot()).toEqual({
+      contractVersion: 1,
+      unknownLayerNames: [],
+    });
+
+    buildPromptFrame({
+      promptFamily: 'main_runtime',
+      layers: {
+        main_context_snapshot: 'private current-turn text',
+        future_unregistered_layer: 'private unknown text',
+      },
+    });
+
+    const snapshot = promptLayerIntegritySnapshot();
+    expect(snapshot).toEqual({
+      contractVersion: 1,
+      unknownLayerNames: ['future_unregistered_layer'],
+    });
+    expect(JSON.stringify(snapshot)).not.toContain('private');
+  });
+
+  test('registers both Workbench surface prompt producers', () => {
+    buildPromptFrame({
+      promptFamily: 'main_runtime',
+      layers: {
+        workbench_text: 'interactive Workbench instructions',
+        scheduled_canonical_output: 'scheduled canonical output instructions',
+      },
+    });
+
+    expect(promptLayerIntegritySnapshot()).toEqual({
+      contractVersion: 1,
+      unknownLayerNames: [],
     });
   });
 
@@ -154,16 +198,26 @@ describe('promptFrameTelemetry', () => {
       primary_final_instructions: 'main text',
       instructions_before_surface_injection: 'pre surface text',
       primary_run_instructions: 'run text',
+      viventium_user_fact_guard: 'fact guard',
+      background_cortex_runtime_card_guard: 'cortex card guard',
       no_response_instructions: 'nta text',
       formatted_input_messages: [{ role: 'user', content: 'message context' }],
       telegram_text: 'surface text',
       telegram_audio_output: 'telegram audio expression text',
+      telegram_reply_context: 'reply identity',
+      voice_gateway_insight_instructions: 'voice insight',
+      active_work_context: 'active work',
+      rapid_source_selection: 'source selection',
+      main_continuity: 'continuity',
+      main_context_snapshot: 'snapshot digest',
+      recurrence_state: 'recurrence',
       activation_prompt: 'activate',
       cortex_instructions: 'execute',
       productivity_runtime_instructions: 'productivity runtime',
       file_context: 'file evidence',
       cortex_output_rules: 'output rules',
       recent_response: 'already said',
+      user_request: 'current request',
       unexpected_local_key: 'private shape',
     });
 
@@ -171,16 +225,23 @@ describe('promptFrameTelemetry', () => {
     expect(normalized.layers.main_instructions).toContain('main text');
     expect(normalized.layers.main_instructions).toContain('pre surface text');
     expect(normalized.layers.main_instructions).toContain('run text');
+    expect(normalized.layers.main_instructions).toContain('fact guard');
+    expect(normalized.layers.main_instructions).toContain('cortex card guard');
     expect(normalized.layers.global_no_response).toContain('nta text');
     expect(normalized.layers.background_context).toContain('message context');
     expect(normalized.layers.background_context).toContain('file evidence');
+    expect(normalized.layers.background_context).toContain('active work');
+    expect(normalized.layers.background_context).toContain('snapshot digest');
     expect(normalized.layers.surface_prompt).toContain('surface text');
     expect(normalized.layers.surface_prompt).toContain('telegram audio expression text');
+    expect(normalized.layers.surface_prompt).toContain('reply identity');
+    expect(normalized.layers.surface_prompt).toContain('voice insight');
     expect(normalized.layers.cortex_activation).toContain('activate');
     expect(normalized.layers.cortex_execution).toContain('execute');
     expect(normalized.layers.cortex_execution).toContain('productivity runtime');
     expect(normalized.layers.cortex_execution).toContain('output rules');
     expect(normalized.layers.followup).toContain('already said');
+    expect(normalized.layers.followup).toContain('current request');
     expect(normalized.unknown_layer_names).toEqual(['unexpected_local_key']);
 
     const frame = buildPromptFrame({
@@ -274,6 +335,7 @@ describe('promptFrameTelemetry', () => {
   test('logging can be disabled and never mutates frame shape', () => {
     const logger = {
       info: jest.fn(),
+      debug: jest.fn(),
     };
     const frame = buildPromptFrame({
       promptFamily: 'test',
@@ -285,69 +347,269 @@ describe('promptFrameTelemetry', () => {
     process.env[LOG_ENV] = '0';
     expect(logPromptFrame(logger, frame)).toBe(false);
     expect(logger.info).not.toHaveBeenCalled();
+    expect(logger.debug).not.toHaveBeenCalled();
 
     process.env[LOG_ENV] = '1';
     expect(logPromptFrame(logger, frame)).toBe(true);
-    expect(logger.info).toHaveBeenCalledTimes(2);
+    expect(logger.info).toHaveBeenCalledTimes(1);
+    expect(logger.debug).toHaveBeenCalledTimes(1);
     expect(logger.info.mock.calls[0][0]).not.toContain('hello');
-    expect(logger.info.mock.calls[1][0]).not.toContain('hello');
+    expect(logger.debug.mock.calls[0].join(' ')).not.toContain('hello');
   });
 
-  test('normal logger emits a bounded public-safe route sink before the full frame', () => {
-    const logger = { info: jest.fn() };
+  test.each([
+    ['Main', 'agent_viventium_main_synthetic'],
+    ['specialist', 'agent_viventium_specialist_synthetic'],
+  ])('binds the actual %s agent to public-safe provider-frame telemetry', (_kind, agentId) => {
+    const expectedAgentIdHash = crypto
+      .createHash('sha256')
+      .update(agentId)
+      .digest('hex')
+      .slice(0, 16);
+    const frame = buildPromptFrame({
+      promptFamily: 'main_run_create',
+      provider: 'synthetic-provider',
+      model: 'synthetic-model',
+      agentId,
+      layers: { main_instructions: 'private prompt content' },
+    });
+    const route = buildPromptFrameRouteTelemetry(frame);
+
+    expect(frame.agent_id_hash).toBe(expectedAgentIdHash);
+    expect(route.a).toBe(expectedAgentIdHash);
+    expect(JSON.stringify(frame)).not.toContain(agentId);
+    expect(JSON.stringify(route)).not.toContain(agentId);
+    expect(JSON.stringify(route)).not.toContain('private prompt content');
+  });
+
+  test('binds prompt frames to the exact authenticated owner and trusted source event', () => {
+    const ownerId = 'private-owner-id';
+    const interactionContext = {
+      surface: 'telegram',
+      source_event_id: 'private-source-event-id',
+    };
+    const expected = crypto
+      .createHash('sha256')
+      .update(
+        [
+          'viventium.prompt-frame-request.v1',
+          ownerId,
+          interactionContext.surface,
+          interactionContext.source_event_id,
+        ].join('\0'),
+      )
+      .digest('hex')
+      .slice(0, 16);
+
+    const frame = buildPromptFrame({
+      promptFamily: 'main_run_create',
+      surface: 'telegram',
+      provider: 'synthetic-provider',
+      model: 'synthetic-model',
+      requestIdentity: { ownerId, interactionContext },
+    });
+    const route = buildPromptFrameRouteTelemetry(frame);
+
+    expect(buildPromptFrameRequestIdentityHash({ ownerId, interactionContext })).toBe(expected);
+    expect(frame.request_identity_hash).toBe(expected);
+    expect(route.q).toBe(expected);
+    expect(route.s).toBe('telegram');
+    expect(JSON.stringify(frame)).not.toContain(ownerId);
+    expect(JSON.stringify(frame)).not.toContain(interactionContext.source_event_id);
+    expect(JSON.stringify(route)).not.toContain(ownerId);
+    expect(JSON.stringify(route)).not.toContain(interactionContext.source_event_id);
+  });
+
+  test('does not invent request identity without both authenticated owner and trusted source', () => {
+    expect(
+      buildPromptFrameRequestIdentityHash({
+        ownerId: '',
+        interactionContext: { surface: 'telegram', source_event_id: 'source-event' },
+      }),
+    ).toBe('missing');
+    expect(
+      buildPromptFrameRequestIdentityHash({
+        ownerId: 'owner-id',
+        interactionContext: { surface: 'telegram', source_event_id: '' },
+      }),
+    ).toBe('missing');
+  });
+
+  test('does not invent an executed agent from missing, short, or conflicting identities', () => {
+    const missing = buildPromptFrame({ promptFamily: 'main_run_create' });
+    const short = buildPromptFrame({
+      promptFamily: 'cortex_execution',
+      decisionState: { agent_id_hash: hashString('agent_synthetic', 12) },
+    });
+    const conflicting = buildPromptFrame({
+      promptFamily: 'main_run_create',
+      agentId: 'agent_actual_synthetic',
+      decisionState: { agent_id_hash: hashString('agent_other_synthetic') },
+    });
+
+    expect(missing.agent_id_hash).toBe('missing');
+    expect(short.agent_id_hash).toBe('missing');
+    expect(conflicting.agent_id_hash).toBe('missing');
+    expect(buildPromptFrameRouteTelemetry(missing).a).toBe('missing');
+    expect(buildPromptFrameRouteTelemetry(short).a).toBe('missing');
+    expect(buildPromptFrameRouteTelemetry(conflicting).a).toBe('missing');
+  });
+
+  test('accepts only a complete existing trusted decision-state agent hash', () => {
+    const agentIdHash = hashString('agent_synthetic_background');
+    const frame = buildPromptFrame({
+      promptFamily: 'cortex_execution',
+      decisionState: { agent_id_hash: agentIdHash },
+    });
+
+    expect(frame.agent_id_hash).toBe(agentIdHash);
+    expect(buildPromptFrameRouteTelemetry(frame).a).toBe(agentIdHash);
+  });
+
+  test('normal logger emits bounded route and strict trace metadata only', () => {
+    const logger = { info: jest.fn(), debug: jest.fn() };
     process.env[LOG_ENV] = '1';
     const frame = buildPromptFrame({
       promptFamily: 'main_run_create',
       surface: 'web',
+      requestedProvider: 'glasshive-harness',
+      requestedModel: 'codex-cli:synthetic-model',
+      requestedEffort: 'medium',
       provider: 'glasshive-harness',
       model: 'codex-cli:synthetic-model',
+      reasoningEffort: 'medium',
       layers: { main_instructions: 'private prompt text'.repeat(500) },
     });
 
     expect(logPromptFrame(logger, frame)).toBe(true);
-    expect(logger.info).toHaveBeenCalledTimes(2);
+    expect(logger.info).toHaveBeenCalledTimes(1);
+    expect(logger.debug).toHaveBeenCalledTimes(1);
     const routeLine = logger.info.mock.calls[0][0];
     expect(routeLine).toMatch(/^\[PromptFrameRouteTelemetry\] /);
-    expect(routeLine.length).toBeLessThan(125);
+    expect(routeLine.length).toBeLessThanOrEqual(256);
     expect(routeLine).not.toContain('glasshive-harness');
     expect(routeLine).not.toContain('synthetic-model');
     expect(routeLine).not.toContain('private prompt text');
     const route = JSON.parse(routeLine.replace(/^\[PromptFrameRouteTelemetry\] /, ''));
-    expect(route).toEqual({
-      v: 1,
-      f: 'main_run_create',
-      p: hashString('glasshive-harness'),
-      m: hashString('codex-cli:synthetic-model'),
-    });
-    expect(logger.info.mock.calls[1][0]).toMatch(/^\[PromptFrameTelemetry\] /);
+    expect(route).toEqual([
+      2,
+      'main_run_create',
+      'web',
+      hashString('glasshive-harness'),
+      hashString('codex-cli:synthetic-model'),
+      'medium',
+      hashString('glasshive-harness'),
+      hashString('codex-cli:synthetic-model'),
+      'medium',
+      0,
+      'none',
+      'missing',
+      'missing',
+    ]);
+    const traceLine = logger.debug.mock.calls[0].join(' ');
+    expect(traceLine).toMatch(/^\[PromptFrameTraceTelemetry\] /);
+    expect(Buffer.byteLength(traceLine)).toBeLessThanOrEqual(8192);
+    const trace = JSON.parse(traceLine.replace(/^\[PromptFrameTraceTelemetry\] /, ''));
+    expect(trace).toEqual(
+      buildPromptFrameTraceTelemetry(frame, { now: () => new Date(trace.time) }),
+    );
+    expect(trace.provider).toBe(`h${hashString('glasshive-harness')}`);
+    expect(trace.model).toBe(`h${hashString('codex-cli:synthetic-model')}`);
+    expect(trace.requested_effort).toBe('medium');
+    expect(trace.effective_effort).toBe('medium');
+    expect(trace.fallback_used).toBe(false);
+    expect(trace.fallback_reason).toBe('none');
+    expect(trace.layer_tokens.main_instructions).toBeGreaterThan(0);
   });
 
-  test('normal logger omits local debug prompt layers even when debug mode is enabled', () => {
+  test('emits only typed fallback lineage and fails missing effort closed', () => {
+    const valid = buildPromptFrame({
+      promptFamily: 'main_run_create',
+      requestedProvider: 'synthetic-primary-provider',
+      requestedModel: 'synthetic-primary-model',
+      requestedEffort: 'medium',
+      provider: 'synthetic-fallback-provider',
+      model: 'synthetic-fallback-model',
+      reasoningEffort: 'high',
+      fallbackUsed: true,
+      fallbackReason: 'provider_timeout',
+    });
+    const missing = buildPromptFrame({
+      promptFamily: 'main_run_create',
+      provider: 'synthetic-provider',
+      model: 'synthetic-model',
+      fallbackUsed: true,
+      fallbackReason: 'raw private provider message',
+    });
+
+    expect(valid.requested_effort).toBe('medium');
+    expect(valid.effective_effort).toBe('high');
+    expect(valid.fallback_reason).toBe('provider_timeout');
+    expect(buildPromptFrameRouteTelemetry(valid)).toMatchObject({
+      v: 2,
+      re: 'medium',
+      ee: 'high',
+      fu: true,
+      fr: 'provider_timeout',
+    });
+    expect(missing.requested_effort).toBe('missing');
+    expect(missing.effective_effort).toBe('missing');
+    expect(missing.fallback_reason).toBe('missing');
+    expect(JSON.stringify(missing)).not.toContain('raw private provider message');
+  });
+
+  test('normal logger rejects unknown fields and hashes all allowed string metadata', () => {
     const logger = {
       info: jest.fn(),
+      debug: jest.fn(),
     };
     process.env[DEBUG_ENV] = '1';
     process.env[DEBUG_LOCAL_ENV] = '1';
     process.env[LOG_ENV] = '1';
 
     const frame = buildPromptFrame({
-      promptFamily: 'test',
+      promptFamily: 'main_runtime',
+      surface: 'web',
       layers: {
         main_instructions: 'private prompt text',
       },
+      flags: { input_mode: 'private input mode', private_note: 'private flag text' },
+      decisionState: {
+        status: 'private status text',
+        reason_code: 'private reason text',
+        private_note: 'private decision text',
+      },
     });
+    frame.raw_transcript = 'private transcript text';
 
     expect(frame.debug_redacted_layers.main_instructions).toContain('private prompt text');
     expect(logPromptFrame(logger, frame)).toBe(true);
-    expect(logger.info.mock.calls[1][0]).not.toContain('debug_redacted_layers');
-    expect(logger.info.mock.calls[1][0]).not.toContain('private prompt text');
+    const traceLine = logger.debug.mock.calls[0].join(' ');
+    for (const privateText of [
+      'debug_redacted_layers',
+      'private prompt text',
+      'private input mode',
+      'private flag text',
+      'private status text',
+      'private reason text',
+      'private decision text',
+      'private transcript text',
+      'private_note',
+      'raw_transcript',
+    ]) {
+      expect(traceLine).not.toContain(privateText);
+    }
+    const trace = JSON.parse(traceLine.replace(/^\[PromptFrameTraceTelemetry\] /, ''));
+    expect(trace.flags.input_mode_hash).toBe(hashString('private input mode'));
+    expect(trace.decision.status_hash).toBe(hashString('private status text'));
+    expect(trace.decision.reason_code_hash).toBe(hashString('private reason text'));
   });
 
   test('token estimate is monotonic with prompt size', () => {
     expect(estimatePromptTokens('abcd')).toBeLessThan(estimatePromptTokens('abcd'.repeat(10)));
   });
 
-  test('local file logging writes private JSONL outside normal logger path', async () => {
+  test('legacy direct file logging remains disabled even when explicitly requested', async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-prompt-observability-'));
     process.env[FILE_LOG_ENV] = '1';
     process.env[OBSERVABILITY_DIR_ENV] = tempDir;
@@ -361,17 +623,9 @@ describe('promptFrameTelemetry', () => {
       },
     });
 
-    expect(writePromptFrameFile(frame)).toBe(true);
+    expect(writePromptFrameFile(frame)).toBe(false);
     await expect(flushPromptFrameFileWrites()).resolves.toBe(true);
-
-    const frameLogRoot = path.join(tempDir, 'frame-logs');
-    const files = fs
-      .readdirSync(frameLogRoot, { recursive: true })
-      .filter((name) => String(name).endsWith('.jsonl'));
-    expect(files.length).toBe(1);
-    const logText = fs.readFileSync(path.join(frameLogRoot, files[0]), 'utf8');
-    expect(logText).toContain('"event":"viventium.prompt_frame"');
-    expect(logText).not.toContain('/' + 'Users' + '/');
+    expect(fs.readdirSync(tempDir)).toEqual([]);
   });
 
   test('local file logging refuses CI mode', () => {

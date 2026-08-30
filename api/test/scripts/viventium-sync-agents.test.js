@@ -817,6 +817,34 @@ describe('viventium-sync-agents args', () => {
     ]);
   });
 
+  test('compareBundlesByAgent protects graph presentation and sequential-output drift', () => {
+    const diff = compareBundlesByAgent({
+      leftBundle: {
+        mainAgent: {
+          id: 'main',
+          end_after_tools: false,
+          hide_sequential_outputs: false,
+          presentation_policy: { mode: 'intermediate' },
+        },
+      },
+      rightBundle: {
+        mainAgent: {
+          id: 'main',
+          end_after_tools: true,
+          hide_sequential_outputs: true,
+          presentation_policy: { mode: 'final_only' },
+        },
+      },
+    });
+
+    expect(diff.diffs).toEqual([
+      expect.objectContaining({
+        id: 'main',
+        changedFields: ['end_after_tools', 'hide_sequential_outputs', 'presentation_policy'],
+      }),
+    ]);
+  });
+
   test('compareBundlesByAgent ignores background cortex metadata noise when activation matches', () => {
     const diff = compareBundlesByAgent({
       leftBundle: {

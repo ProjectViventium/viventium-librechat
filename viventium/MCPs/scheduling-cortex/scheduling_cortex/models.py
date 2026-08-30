@@ -174,8 +174,9 @@ class CreateScheduleArgs(BaseModel):
     executor: ExecutorLiteral = Field(
         "viventium_agent",
         description=(
-            "Runtime executor. Existing conversational schedules use 'viventium_agent'; "
-            "Prompt Workbench scheduled prompts use 'glasshive_host'."
+            "Runtime executor. 'viventium_agent' inherits the persisted Main Agent route and "
+            "fallback from Agent Builder at run time. 'glasshive_host' is reserved for schedules "
+            "created by Prompt Workbench with trusted workbench_scheduled_prompt metadata."
         ),
     )
     conversation_policy: Literal["new", "same"] = Field(
@@ -250,7 +251,10 @@ class UpdateScheduleArgs(BaseModel):
     )
     executor: Optional[ExecutorLiteral] = Field(
         None,
-        description="Optional executor override: 'viventium_agent' | 'glasshive_host'",
+        description=(
+            "Optional executor override. Use 'viventium_agent' for ordinary schedules; "
+            "'glasshive_host' is reserved for Prompt Workbench-owned schedules."
+        ),
     )
     conversation_policy: Optional[Literal["new", "same"]] = Field(
         None,

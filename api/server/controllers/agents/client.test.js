@@ -1279,11 +1279,21 @@ describe('background cortex runtime card guard', () => {
       'Runtime may display background-cortex status/result cards',
     );
     expect(agent.instructions).toContain(
-      'Do not offer to start, spin up, launch, or run background agents/cortices',
-    );
-    expect(agent.instructions).toContain(
       'Do not say a specific background agent/cortex ran, is running, activated, completed, or checked the issue unless it appears in the current turn',
     );
+    expect(agent.instructions).toContain(
+      'A background-cortex card is not a durable mission receipt',
+    );
+    expect(agent.instructions).toContain(
+      'Only acknowledge durable background work after its delegation tool returns a work receipt',
+    );
+    expect(agent.instructions).toContain(
+      'A request to run multiple independent objectives concurrently or in parallel while Main remains available counts as a durable background mission',
+    );
+    expect(agent.instructions).toContain(
+      'Never claim that Workers finished or that artifacts, downloads, files, or browser windows exist or opened without current-turn delivery evidence',
+    );
+    expect(agent.instructions).not.toContain('treat that work as already runtime-owned');
 
     const afterFirstInjection = agent.instructions;
     expect(AgentClient.ensureBackgroundCortexRuntimeCardGuard(agent)).toBe(false);

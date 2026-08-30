@@ -23,6 +23,9 @@ const {
 } = require('~/server/services/viventium/cortexFallbackText');
 const { resolveConfiguredHoldTexts } = require('~/server/services/viventium/brewingHold');
 const { isRuntimeHoldTextPart } = require('~/server/services/viventium/runtimeHoldText');
+const {
+  getCortexInsightDeliveriesForParent,
+} = require('~/server/services/viventium/CortexInsightDeliveryService');
 
 const CORTEX_TYPES = new Set([
   ContentTypes.CORTEX_ACTIVATION,
@@ -307,11 +310,32 @@ async function getCortexMessageState({ userId, messageId, conversationId, schedu
   }
 
   const cortexParts = extractCortexParts(message.content);
-  let followUp = await getFollowUpMessageForParent({
-    userId,
-    conversationId: message.conversationId,
-    parentMessageId: message.messageId,
-  });
+  /* === VIVENTIUM START ===
+   * Feature: Durable cortex insight delivery state projection.
+   * Purpose: Every polling surface sees the same owner-scoped persistence outcome.
+   * === VIVENTIUM END === */
+  const [resolvedFollowUp, insightDeliveries] = await Promise.all([
+    getFollowUpMessageForParent({
+      userId,
+      conversationId: message.conversationId,
+      parentMessageId: message.messageId,
+    }),
+    getCortexInsightDeliveriesForParent({
+      ownerId: userId,
+      parentMessageId: message.messageId,
+    }),
+  ]);
+  let followUp = resolvedFollowUp;
+  const insightDeliverySummary = (Array.isArray(insightDeliveries) ? insightDeliveries : []).reduce(
+    (summary, delivery) => {
+      summary.total += 1;
+      if (Object.prototype.hasOwnProperty.call(summary, delivery?.status)) {
+        summary[delivery.status] += 1;
+      }
+      return summary;
+    },
+    { total: 0, pending: 0, claimed: 0, sent: 0, dropped: 0 },
+  );
 
   let canonicalText = extractCanonicalMessageText(message);
   if (followUp?.messageId === message.messageId) {
@@ -335,6 +359,8 @@ async function getCortexMessageState({ userId, messageId, conversationId, schedu
     cortexParts,
     followUp,
     followUpDecision: getFollowUpDecisionForMessage(message),
+    insightDeliveries: Array.isArray(insightDeliveries) ? insightDeliveries : [],
+    insightDeliverySummary,
     canonicalText,
     canonicalTextSource: canonicalState.canonicalTextSource,
     canonicalTextFallbackReason: canonicalState.canonicalTextFallbackReason,

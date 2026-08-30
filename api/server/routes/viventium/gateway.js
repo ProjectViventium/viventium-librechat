@@ -1167,8 +1167,11 @@ router.get('/stream/:streamId', gatewayAuth, async (req, res) => {
     });
   }
 
-  if (job.metadata?.userId && job.metadata.userId !== userId) {
-    return res.status(403).json({ error: 'Unauthorized' });
+  if (!userId || job.metadata?.userId !== userId) {
+    return res.status(404).json({
+      error: 'Stream not found',
+      message: 'The generation job does not exist or has expired.',
+    });
   }
 
   res.setHeader('Content-Encoding', 'identity');

@@ -1,5 +1,9 @@
 import mongoose, { Schema } from 'mongoose';
 import type { IMessage } from '~/types/message';
+import {
+  applyPersonalAccountCleanupVisibility,
+  personalAccountCleanupTombstoneSchema,
+} from './personalAccountCleanupTombstone';
 
 const messageSchema: Schema<IMessage> = new Schema(
   {
@@ -144,9 +148,24 @@ const messageSchema: Schema<IMessage> = new Schema(
       type: Boolean,
       default: undefined,
     },
+    /* === VIVENTIUM START === Retained, owner-bound synthetic-QA cleanup tombstone. === */
+    deletedAt: {
+      type: Date,
+      default: undefined,
+      index: true,
+    },
+    cleanupTombstone: {
+      type: personalAccountCleanupTombstoneSchema,
+      default: undefined,
+    },
+    /* === VIVENTIUM END === */
   },
   { timestamps: true },
 );
+
+/* === VIVENTIUM START === Tombstones are internal CAS state, never ordinary message history. === */
+applyPersonalAccountCleanupVisibility(messageSchema);
+/* === VIVENTIUM END === */
 
 messageSchema.index({ expiredAt: 1 }, { expireAfterSeconds: 0 });
 messageSchema.index({ createdAt: 1 });

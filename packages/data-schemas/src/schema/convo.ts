@@ -1,6 +1,10 @@
 import { Schema } from 'mongoose';
 import { conversationPreset } from './defaults';
 import { IConversation } from '~/types';
+import {
+  applyPersonalAccountCleanupVisibility,
+  personalAccountCleanupTombstoneSchema,
+} from './personalAccountCleanupTombstone';
 
 const convoSchema: Schema<IConversation> = new Schema(
   {
@@ -37,9 +41,24 @@ const convoSchema: Schema<IConversation> = new Schema(
     expiredAt: {
       type: Date,
     },
+    /* === VIVENTIUM START === Retained, owner-bound synthetic-QA cleanup tombstone. === */
+    deletedAt: {
+      type: Date,
+      default: undefined,
+      index: true,
+    },
+    cleanupTombstone: {
+      type: personalAccountCleanupTombstoneSchema,
+      default: undefined,
+    },
+    /* === VIVENTIUM END === */
   },
   { timestamps: true },
 );
+
+/* === VIVENTIUM START === Tombstones are internal CAS state, never ordinary conversation history. === */
+applyPersonalAccountCleanupVisibility(convoSchema);
+/* === VIVENTIUM END === */
 
 convoSchema.index({ expiredAt: 1 }, { expireAfterSeconds: 0 });
 convoSchema.index({ createdAt: 1, updatedAt: 1 });

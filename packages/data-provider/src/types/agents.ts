@@ -212,6 +212,15 @@ export namespace Agents {
     aggregatedContent?: MessageContentComplex[];
     userMessage?: UserMessageMeta;
     responseMessageId?: string;
+    /* === VIVENTIUM START === Exact optimistic-to-authoritative resume identity. === */
+    /** Exact admission-time client placeholders for optimistic-to-authoritative projection. */
+    clientPresentation?: {
+      mode: 'append' | 'regenerate';
+      userMessageId: string;
+      responseMessageId: string;
+      targetUserMessageId: string;
+    };
+    /* === VIVENTIUM END === */
     conversationId?: string;
     sender?: string;
   }

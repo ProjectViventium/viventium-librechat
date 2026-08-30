@@ -507,6 +507,104 @@ describe('processAgentFileUpload', () => {
       );
     });
 
+    /* === VIVENTIUM START ===
+     * Feature: Parallel Work attachment continuity.
+     * Purpose: Prove trusted bridge images retain owner scope without a redundant conversion copy.
+     */
+    test('stores trusted bridge images under owner-scoped uploads without a redundant image copy', async () => {
+      const { createFile } = require('~/models');
+      const { resizeAndConvert } = require('~/server/services/Files/images');
+      const handleFileUpload = jest.fn().mockResolvedValue({
+        bytes: 128,
+        filename: 'photo.png',
+        filepath: '/uploads/user-123/file-uuid-123__photo.png',
+        width: 10,
+        height: 10,
+      });
+      mergeFileConfig.mockReturnValue(makeFileConfig());
+      getStrategyFunctions.mockReturnValueOnce({ handleFileUpload });
+      const req = makeReq({ mimetype: 'image/png', ocrConfig: null });
+      req.file.originalname = 'photo.png';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      req._viventiumBridgeDurableMissionAttachment = true;
+
+      await processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: makeMetadata({
+          agent_id: 'agent-abc',
+          tool_resource: undefined,
+          message_file: true,
+        }),
+      });
+
+      expect(handleFileUpload).toHaveBeenCalledWith(
+        expect.objectContaining({ basePath: 'uploads', file_id: 'file-uuid-123' }),
+      );
+      expect(resizeAndConvert).not.toHaveBeenCalled();
+      expect(createFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          filepath: '/uploads/user-123/file-uuid-123__photo.png',
+          filename: 'photo.png',
+          type: 'image/png',
+          context: 'message_attachment',
+        }),
+        true,
+      );
+    });
+
+    test('stores trusted bridge JPEGs raw for GlassHive instead of sending them to the document parser', async () => {
+      const { createFile } = require('~/models');
+      const { resizeAndConvert } = require('~/server/services/Files/images');
+      const handleFileUpload = jest.fn().mockResolvedValue({
+        bytes: 128,
+        filename: 'photo.jpg',
+        filepath: '/uploads/user-123/file-uuid-123__photo.jpg',
+        width: 10,
+        height: 10,
+      });
+      mergeFileConfig.mockReturnValue(
+        makeFileConfig({ ocrSupportedMimeTypes: ['image/jpeg'] }),
+      );
+      getStrategyFunctions.mockReturnValueOnce({ handleFileUpload });
+      const req = makeReq({
+        mimetype: 'image/jpeg',
+        ocrConfig: { strategy: FileSources.document_parser },
+      });
+      req.file.originalname = 'photo.jpg';
+      req.body.endpoint = 'agents';
+      req.body.endpointType = 'agents';
+      req._viventiumBridgeDurableMissionAttachment = true;
+
+      await processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: makeMetadata({
+          agent_id: 'agent-abc',
+          tool_resource: undefined,
+          message_file: true,
+        }),
+      });
+
+      expect(handleFileUpload).toHaveBeenCalledWith(
+        expect.objectContaining({ basePath: 'uploads', file_id: 'file-uuid-123' }),
+      );
+      expect(getAgent).not.toHaveBeenCalled();
+      expect(checkCapability).not.toHaveBeenCalledWith(expect.anything(), AgentCapabilities.ocr);
+      expect(resizeAndConvert).not.toHaveBeenCalled();
+      expect(createFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          filepath: '/uploads/user-123/file-uuid-123__photo.jpg',
+          filename: 'photo.jpg',
+          type: 'image/jpeg',
+          context: 'message_attachment',
+        }),
+        true,
+      );
+    });
+    /* === VIVENTIUM END === */
+
     test('preserves Bedrock-native markdown message attachments on the raw upload path', async () => {
       const { createFile } = require('~/models');
       const { parseText } = require('@librechat/api');

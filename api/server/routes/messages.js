@@ -36,17 +36,90 @@ router.use(requireJwtAuth);
  * Feature: Tool-call snapshot cleanup
  * Purpose:
  * - Keep stale partial tool-call snapshots out of user-visible message payloads.
- * - This is read-side normalization only; the shared sanitizer also runs on final agent persistence.
+ * - Remove private Feelings delivery receipts from every public message response, including legacy
+ *   malformed and nested content.
+ * - Tool cleanup is read-side normalization; privacy cleanup also covers mutation responses.
  * Added: 2026-04-29
  * === VIVENTIUM END === */
-const sanitizeMessageForRead = (message) => {
-  const normalizedMessage = normalizeHistoricalVoiceMessageForRead(message);
-  if (!normalizedMessage || !Array.isArray(normalizedMessage.content)) {
-    return normalizedMessage;
+const PRIVATE_MESSAGE_CONTENT_FIELD = 'cortex_delivery_feeling_snapshot';
+const PRIVATE_CORTEX_DELIVERY_FIELDS = new Set([
+  'cortex_delivery_acceptance',
+  'cortex_delivery_surface',
+  'cortex_delivery_stream_id',
+  'cortex_delivery_message_revision',
+  'cortex_graph_result_hash',
+]);
+const hasPrivateMessageContentPathSegment = (key) =>
+  typeof key === 'string' && key.split('.').includes(PRIVATE_MESSAGE_CONTENT_FIELD);
+
+const sanitizePublicMessageContent = (value, ancestors = new WeakSet()) => {
+  if (value == null || typeof value !== 'object') {
+    return value;
+  }
+  if (ancestors.has(value)) {
+    return undefined;
+  }
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.map((entry) => sanitizePublicMessageContent(entry, ancestors));
+    }
+
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      if (typeof value.toJSON !== 'function') {
+        return undefined;
+      }
+      return sanitizePublicMessageContent(value.toJSON(), ancestors);
+    }
+
+    const publicValue = {};
+    const isUnacceptedCortexPart = value.cortex_delivery_acceptance === 'retryable';
+    for (const key of Object.keys(value)) {
+      if (
+        hasPrivateMessageContentPathSegment(key) ||
+        PRIVATE_CORTEX_DELIVERY_FIELDS.has(key) ||
+        (isUnacceptedCortexPart && key === 'insight')
+      ) {
+        continue;
+      }
+      try {
+        const nestedValue = sanitizePublicMessageContent(value[key], ancestors);
+        if (nestedValue !== undefined) {
+          publicValue[key] = nestedValue;
+        }
+      } catch {
+        continue;
+      }
+    }
+    return publicValue;
+  } catch {
+    return undefined;
+  } finally {
+    ancestors.delete(value);
+  }
+};
+
+const sanitizeMessageForPublicResponse = (message) => {
+  if (!message || typeof message !== 'object' || !Object.hasOwn(message, 'content')) {
+    return message;
   }
   return {
-    ...normalizedMessage,
-    content: filterMalformedContentParts(normalizedMessage.content),
+    ...message,
+    content: sanitizePublicMessageContent(message.content),
+  };
+};
+
+const sanitizeMessageForRead = (message) => {
+  const normalizedMessage = normalizeHistoricalVoiceMessageForRead(message);
+  const publicMessage = sanitizeMessageForPublicResponse(normalizedMessage);
+  if (!publicMessage || !Array.isArray(publicMessage.content)) {
+    return publicMessage;
+  }
+  return {
+    ...publicMessage,
+    content: filterMalformedContentParts(publicMessage.content),
   };
 };
 
@@ -230,7 +303,7 @@ router.post('/branch', async (req, res) => {
       return res.status(500).json({ error: 'Failed to save branch message' });
     }
 
-    res.status(201).json(savedMessage);
+    res.status(201).json(sanitizeMessageForPublicResponse(savedMessage));
   } catch (error) {
     logger.error('Error creating branch message:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -291,23 +364,24 @@ router.post('/artifact/:messageId', async (req, res) => {
       return res.status(400).json({ error: 'Original content not found in target artifact' });
     }
 
-    const savedMessage = await saveMessage(
+    const targetPath =
+      targetArtifact.source === 'content' ? `content.${targetArtifact.partIndex}.text` : 'text';
+    const savedMessage = await updateMessage(
       req,
       {
         messageId,
-        conversationId: message.conversationId,
-        text: message.text,
-        content: message.content,
-        user: req.user.id,
+        [targetPath]: updatedText,
       },
       { context: 'POST /api/messages/artifact/:messageId' },
     );
 
-    res.status(200).json({
-      conversationId: savedMessage.conversationId,
-      content: savedMessage.content,
-      text: savedMessage.text,
-    });
+    res.status(200).json(
+      sanitizeMessageForPublicResponse({
+        conversationId: savedMessage.conversationId,
+        content: savedMessage.content,
+        text: savedMessage.text,
+      }),
+    );
   } catch (error) {
     logger.error('Error editing artifact:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -331,14 +405,14 @@ router.post('/:conversationId', validateMessageReq, async (req, res) => {
     const message = req.body;
     const savedMessage = await saveMessage(
       req,
-      { ...message, user: req.user.id },
+      sanitizeMessageForPublicResponse({ ...message, user: req.user.id }),
       { context: 'POST /api/messages/:conversationId' },
     );
     if (!savedMessage) {
       return res.status(400).json({ error: 'Message not saved' });
     }
     await saveConvo(req, savedMessage, { context: 'POST /api/messages/:conversationId' });
-    res.status(201).json(savedMessage);
+    res.status(201).json(sanitizeMessageForPublicResponse(savedMessage));
   } catch (error) {
     logger.error('Error saving message:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -367,7 +441,7 @@ router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) =
     if (index === undefined) {
       const tokenCount = await countTokens(text, model);
       const result = await updateMessage(req, { messageId, text, tokenCount });
-      return res.status(200).json(result);
+      return res.status(200).json(sanitizeMessageForPublicResponse(result));
     }
 
     if (typeof index !== 'number' || index < 0) {
@@ -404,8 +478,13 @@ router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) =
       tokenCount = Math.max(0, tokenCount - oldTokenCount) + newTokenCount;
     }
 
-    const result = await updateMessage(req, { messageId, content: updatedContent, tokenCount });
-    return res.status(200).json(result);
+    const targetedUpdate = {
+      messageId,
+      [`content.${index}.${currentPartType}`]: text,
+      tokenCount,
+    };
+    const result = await updateMessage(req, targetedUpdate);
+    return res.status(200).json(sanitizeMessageForPublicResponse(result));
   } catch (error) {
     logger.error('Error updating message:', error);
     res.status(500).json({ error: 'Internal server error' });

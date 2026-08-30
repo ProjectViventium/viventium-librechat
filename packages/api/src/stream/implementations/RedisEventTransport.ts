@@ -1,6 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import type { Redis, Cluster } from 'ioredis';
 import { logger } from '@librechat/data-schemas';
-import type { IEventTransport } from '~/stream/interfaces/IJobStore';
+import type {
+  EventTransportEmitOptions,
+  EventTransportPublishReceipt,
+  IEventTransport,
+} from '~/stream/interfaces/IJobStore';
 
 /**
  * Redis key prefixes for pub/sub channels
@@ -8,6 +13,8 @@ import type { IEventTransport } from '~/stream/interfaces/IJobStore';
 const CHANNELS = {
   /** Main event channel: stream:{streamId}:events (hash tag for cluster compatibility) */
   events: (streamId: string) => `stream:{${streamId}}:events`,
+  presentationAck: (streamId: string, receiptId: string) =>
+    `stream:{${streamId}}:presentation-ack:${receiptId}`,
 };
 
 /**
@@ -27,6 +34,7 @@ interface PubSubMessage {
   data?: unknown;
   error?: string;
   reason?: string;
+  presentationReceiptId?: string;
 }
 
 /**
@@ -48,6 +56,7 @@ const REORDER_TIMEOUT_MS = 500;
 const MAX_BUFFER_SIZE = 100;
 /** Max time to wait for a Redis subscriber connection to become usable. */
 const SUBSCRIBER_READY_TIMEOUT_MS = 10_000;
+const DEFAULT_PRESENTATION_ACK_TIMEOUT_MS = 500;
 
 /**
  * Subscriber state for a stream
@@ -64,9 +73,15 @@ interface StreamSubscribers {
   >;
   allSubscribersLeftCallbacks: Array<() => void>;
   /** Abort callbacks - called when abort signal is received from any replica */
-  abortCallbacks: Array<(reason?: 'user_cancelled') => void>;
+  abortCallbacks: Array<(reason?: string) => void>;
   /** Reorder buffer for handling out-of-order delivery in Redis Cluster */
   reorderBuffer: ReorderBuffer;
+}
+
+interface PendingPresentationAcknowledgement {
+  streamId: string;
+  timeout: ReturnType<typeof setTimeout>;
+  resolve: (acknowledged: boolean) => void;
 }
 
 /**
@@ -185,6 +200,10 @@ export class RedisEventTransport implements IEventTransport {
   private subscriberIdCounter = 0;
   /** Sequence counters per stream for publishing (ensures ordered delivery in cluster mode) */
   private sequenceCounters = new Map<string, number>();
+  private pendingPresentationAcknowledgements = new Map<
+    string,
+    PendingPresentationAcknowledgement
+  >();
 
   /* === VIVENTIUM START ===
    * Purpose: Centralize stream-state construction so reconnect preservation,
@@ -211,7 +230,13 @@ export class RedisEventTransport implements IEventTransport {
   private hasChannelDemand(channel: string): boolean {
     const match = channel.match(/^stream:\{([^}]+)\}:events$/);
     const state = match ? this.streams.get(match[1]) : undefined;
-    return state ? this.hasStreamDemand(state) : false;
+    if (state) {
+      return this.hasStreamDemand(state);
+    }
+    const acknowledgementMatch = channel.match(/^stream:\{([^}]+)\}:presentation-ack:([^:]+)$/);
+    return acknowledgementMatch
+      ? this.pendingPresentationAcknowledgements.has(acknowledgementMatch[2])
+      : false;
   }
 
   /**
@@ -585,6 +610,12 @@ export class RedisEventTransport implements IEventTransport {
    * Handle incoming pub/sub message with reordering support for Redis Cluster
    */
   private handleMessage(channel: string, message: string): void {
+    const presentationAckMatch = channel.match(/^stream:\{([^}]+)\}:presentation-ack:([^:]+)$/);
+    if (presentationAckMatch) {
+      const [, streamId, receiptId] = presentationAckMatch;
+      this.resolvePresentationAcknowledgement(streamId, receiptId, true);
+      return;
+    }
     const match = channel.match(/^stream:\{([^}]+)\}:events$/);
     if (!match) {
       return;
@@ -607,7 +638,7 @@ export class RedisEventTransport implements IEventTransport {
       ) {
         this.handleTerminalEvent(streamId, streamState, parsed);
       } else {
-        this.deliverMessage(streamState, parsed);
+        this.deliverMessage(streamId, streamState, parsed);
       }
     } catch (err) {
       logger.error(`[RedisEventTransport] Failed to parse message:`, err);
@@ -634,7 +665,7 @@ export class RedisEventTransport implements IEventTransport {
     }
 
     if (seq === buffer.nextSeq) {
-      this.deliverMessage(streamState, message);
+      this.deliverMessage(streamId, streamState, message);
       buffer.nextSeq++;
       this.flushPendingMessages(streamId, streamState);
     } else {
@@ -656,7 +687,7 @@ export class RedisEventTransport implements IEventTransport {
     const seq = message.seq!;
 
     if (seq === buffer.nextSeq) {
-      this.deliverMessage(streamState, message);
+      this.deliverMessage(streamId, streamState, message);
       buffer.nextSeq++;
 
       this.flushPendingMessages(streamId, streamState);
@@ -683,7 +714,7 @@ export class RedisEventTransport implements IEventTransport {
     while (buffer.pending.has(buffer.nextSeq)) {
       const message = buffer.pending.get(buffer.nextSeq)!;
       buffer.pending.delete(buffer.nextSeq);
-      this.deliverMessage(streamState, message);
+      this.deliverMessage(streamId, streamState, message);
       buffer.nextSeq++;
     }
 
@@ -718,7 +749,7 @@ export class RedisEventTransport implements IEventTransport {
     for (const seq of sortedSeqs) {
       const message = buffer.pending.get(seq)!;
       buffer.pending.delete(seq);
-      this.deliverMessage(streamState, message);
+      this.deliverMessage(streamId, streamState, message);
     }
 
     buffer.nextSeq = sortedSeqs[sortedSeqs.length - 1] + 1;
@@ -744,32 +775,86 @@ export class RedisEventTransport implements IEventTransport {
   }
 
   /** Deliver a message to all handlers */
-  private deliverMessage(streamState: StreamSubscribers, message: PubSubMessage): void {
+  private deliverMessage(
+    streamId: string,
+    streamState: StreamSubscribers,
+    message: PubSubMessage,
+  ): void {
+    let acceptedPresentationHandlers = 0;
     for (const [, handlers] of streamState.handlers) {
-      switch (message.type) {
-        case EventTypes.CHUNK:
-          handlers.onChunk(message.data);
-          break;
-        case EventTypes.DONE:
-          handlers.onDone?.(message.data);
-          break;
-        case EventTypes.ERROR:
-          handlers.onError?.(message.error ?? 'Unknown error');
-          break;
-        case EventTypes.ABORT:
-          break;
+      try {
+        switch (message.type) {
+          case EventTypes.CHUNK:
+            handlers.onChunk(message.data);
+            acceptedPresentationHandlers += 1;
+            break;
+          case EventTypes.DONE:
+            handlers.onDone?.(message.data);
+            break;
+          case EventTypes.ERROR:
+            handlers.onError?.(message.error ?? 'Unknown error');
+            break;
+          case EventTypes.ABORT:
+            break;
+        }
+      } catch (error) {
+        logger.error('[RedisEventTransport] Event handler rejected a stream event', error);
       }
+    }
+
+    if (
+      message.type === EventTypes.CHUNK &&
+      message.presentationReceiptId &&
+      acceptedPresentationHandlers > 0
+    ) {
+      void this.publisher
+        .publish(
+          CHANNELS.presentationAck(streamId, message.presentationReceiptId),
+          message.presentationReceiptId,
+        )
+        .catch((error) => {
+          logger.error('[RedisEventTransport] Failed to acknowledge presentation handler', error);
+        });
     }
 
     if (message.type === EventTypes.ABORT) {
       for (const callback of streamState.abortCallbacks) {
         try {
-          callback(message.data === 'user_cancelled' ? 'user_cancelled' : undefined);
+          callback(
+            message.reason ?? (message.data === 'user_cancelled' ? 'user_cancelled' : undefined),
+          );
         } catch (err) {
           logger.error(`[RedisEventTransport] Error in abort callback:`, err);
         }
       }
     }
+  }
+
+  private createPresentationAcknowledgementWaiter(
+    streamId: string,
+    receiptId: string,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const timeout = setTimeout(() => {
+        this.resolvePresentationAcknowledgement(streamId, receiptId, false);
+      }, timeoutMs);
+      this.pendingPresentationAcknowledgements.set(receiptId, { streamId, timeout, resolve });
+    });
+  }
+
+  private resolvePresentationAcknowledgement(
+    streamId: string,
+    receiptId: string,
+    acknowledged: boolean,
+  ): void {
+    const pending = this.pendingPresentationAcknowledgements.get(receiptId);
+    if (!pending || pending.streamId !== streamId) {
+      return;
+    }
+    clearTimeout(pending.timeout);
+    this.pendingPresentationAcknowledgements.delete(receiptId);
+    pending.resolve(acknowledged);
   }
 
   /**
@@ -871,15 +956,61 @@ export class RedisEventTransport implements IEventTransport {
    * Publish a chunk event to all subscribers across all instances.
    * Includes sequence number for ordered delivery in Redis Cluster mode.
    */
-  async emitChunk(streamId: string, event: unknown): Promise<void> {
+  async emitChunk(
+    streamId: string,
+    event: unknown,
+    options: EventTransportEmitOptions = {},
+  ): Promise<EventTransportPublishReceipt> {
     const channel = CHANNELS.events(streamId);
     const seq = this.getNextSequence(streamId);
-    const message: PubSubMessage = { type: EventTypes.CHUNK, seq, data: event };
+    const requirePresentationAcknowledgement = options.requirePresentationAcknowledgement === true;
+    const presentationReceiptId = requirePresentationAcknowledgement ? randomUUID() : '';
+    const presentationAckChannel = presentationReceiptId
+      ? CHANNELS.presentationAck(streamId, presentationReceiptId)
+      : '';
+    const message: PubSubMessage = {
+      type: EventTypes.CHUNK,
+      seq,
+      data: event,
+      ...(presentationReceiptId ? { presentationReceiptId } : {}),
+    };
+    let acknowledgementPromise: Promise<boolean> | null = null;
 
     try {
-      await this.publisher.publish(channel, JSON.stringify(message));
+      if (presentationAckChannel) {
+        acknowledgementPromise = this.createPresentationAcknowledgementWaiter(
+          streamId,
+          presentationReceiptId,
+          Math.max(
+            50,
+            Number(options.presentationAcknowledgementTimeoutMs) ||
+              DEFAULT_PRESENTATION_ACK_TIMEOUT_MS,
+          ),
+        );
+        await this.ensureChannelSubscribed(presentationAckChannel);
+      }
+      const subscriberCount = await this.publisher.publish(channel, JSON.stringify(message));
+      const normalizedSubscriberCount = Math.max(0, Number(subscriberCount) || 0);
+      const presentationAcknowledged = acknowledgementPromise
+        ? normalizedSubscriberCount > 0 && (await acknowledgementPromise)
+        : undefined;
+      return {
+        published: true,
+        subscriberCount: normalizedSubscriberCount,
+        ...(requirePresentationAcknowledgement ? { presentationAcknowledged } : {}),
+      };
     } catch (err) {
       logger.error(`[RedisEventTransport] Failed to publish chunk:`, err);
+      return {
+        published: false,
+        subscriberCount: 0,
+        ...(requirePresentationAcknowledgement ? { presentationAcknowledged: false } : {}),
+      };
+    } finally {
+      if (presentationReceiptId) {
+        this.resolvePresentationAcknowledgement(streamId, presentationReceiptId, false);
+        void this.queueChannelUnsubscribe(presentationAckChannel);
+      }
     }
   }
 
@@ -987,11 +1118,11 @@ export class RedisEventTransport implements IEventTransport {
    * This enables cross-replica abort: when a user aborts on Replica B,
    * the generating Replica A receives the signal and stops.
    */
-  emitAbort(streamId: string, reason?: 'user_cancelled'): Promise<void> {
+  emitAbort(streamId: string, reason?: string): Promise<void> {
     const channel = CHANNELS.events(streamId);
     const message: PubSubMessage = {
       type: EventTypes.ABORT,
-      data: reason === 'user_cancelled' ? reason : undefined,
+      reason,
     };
 
     return this.publisher.publish(channel, JSON.stringify(message)).then(
@@ -1010,7 +1141,7 @@ export class RedisEventTransport implements IEventTransport {
    * @param streamId - The stream identifier
    * @param callback - Called when abort signal is received
    */
-  onAbort(streamId: string, callback: (reason?: 'user_cancelled') => void): Promise<void> {
+  onAbort(streamId: string, callback: (reason?: string) => void): Promise<void> {
     const channel = CHANNELS.events(streamId);
     let state = this.streams.get(streamId);
 
@@ -1042,7 +1173,7 @@ export class RedisEventTransport implements IEventTransport {
   /**
    * Cleanup resources for a specific stream.
    */
-  cleanup(streamId: string): void {
+  cleanup(streamId: string): Promise<void> {
     const channel = CHANNELS.events(streamId);
     const state = this.streams.get(streamId);
 
@@ -1062,13 +1193,20 @@ export class RedisEventTransport implements IEventTransport {
     // Reset sequence counter for this stream
     this.resetSequence(streamId);
 
+    for (const [receiptId, pending] of this.pendingPresentationAcknowledgements) {
+      if (pending.streamId === streamId) {
+        this.resolvePresentationAcknowledgement(streamId, receiptId, false);
+      }
+    }
+
     /* === VIVENTIUM START ===
      * Purpose: Unsubscribe only after any in-flight subscribe acknowledgement,
      * and make a future subscription wait for this transition to complete.
      * === VIVENTIUM END === */
-    void this.queueChannelUnsubscribe(channel);
+    const unsubscribe = this.queueChannelUnsubscribe(channel);
 
     this.streams.delete(streamId);
+    return unsubscribe;
   }
 
   /**
@@ -1118,6 +1256,9 @@ export class RedisEventTransport implements IEventTransport {
     this.subscribedChannels.clear();
     this.subscriptionReady.clear();
     this.subscriptionTransitions.clear();
+    for (const [receiptId, pending] of this.pendingPresentationAcknowledgements) {
+      this.resolvePresentationAcknowledgement(pending.streamId, receiptId, false);
+    }
     this.deferredUnsubscribeCancellations.clear();
     this.streams.clear();
     this.sequenceCounters.clear();

@@ -35,3 +35,14 @@ export * from './group';
 export * from './web';
 /* MCP Servers */
 export * from './mcp';
+export * from './localQaCortexFaultControl';
+export * from './localQaVoiceClassifierFaultControl';
+/* === VIVENTIUM START === Durable GlassHive terminal-result receiver CAS === */
+export * from './glassHiveTerminalCallbackResult';
+export * from './glassHiveCallbackEffectOutbox';
+export * from './mainContinuityState';
+export * from './cortexFeelingSnapshot';
+export * from './cortexInsightDelivery';
+export * from './orchestrationTraceEvent';
+export * from './personalAccountCleanupReceipt';
+/* === VIVENTIUM END === */

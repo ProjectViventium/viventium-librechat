@@ -1,4 +1,5 @@
 import { ProxyAgent } from 'undici';
+import { createHash } from 'node:crypto';
 import { Providers } from '@librechat/agents';
 import { KnownEndpoints, EModelEndpoint } from 'librechat-data-provider';
 import type * as t from '~/types';
@@ -97,6 +98,178 @@ function extractInstructionsFromResponseInput(input: unknown): string | undefine
   }
 
   return instructionParts.length > 0 ? instructionParts.join('\n\n') : undefined;
+}
+
+function headersForRequest(input: string | URL | Request, init?: RequestInit): Headers {
+  const headers = new Headers(input instanceof Request ? input.headers : undefined);
+  new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
+  return headers;
+}
+
+function glassHiveDeveloperAuthority(
+  payload: Record<string, unknown>,
+  headers: Headers,
+): string {
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  const instructionParts: string[] = [];
+  const seen = new Set<string>();
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue;
+    const record = message as Record<string, unknown>;
+    const role = String(record.role || '').trim().toLowerCase();
+    if (role !== 'system' && role !== 'developer') continue;
+    const text = extractInstructionText(record.content)?.trim() ?? '';
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    instructionParts.push(text);
+  }
+  const snapshot = instructionParts.join('\n\n');
+  let tail = '';
+  const encodedTail = String(headers.get('x-glasshive-developer-instruction-tail-b64') || '').trim();
+  if (encodedTail) {
+    try {
+      tail = Buffer.from(encodedTail, 'base64').toString('utf8').trim();
+    } catch {
+      tail = '';
+    }
+  }
+  if (!tail) {
+    const metadata = payload.metadata;
+    if (metadata && typeof metadata === 'object') {
+      tail = String(
+        (metadata as Record<string, unknown>).developer_instruction_tail || '',
+      ).trim();
+    }
+  }
+  if (!tail || !snapshot.includes(tail)) return snapshot;
+  const withoutTail = snapshot
+    .split(tail)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join('\n\n');
+  return [withoutTail, tail].filter(Boolean).join('\n\n');
+}
+
+function createGlassHiveNativeReceiptFetch(
+  baseFetch: Fetch,
+  nativeProviderRequestAccepted: NonNullable<
+    t.OpenAIConfigOptions['nativeProviderRequestAccepted']
+  >,
+): Fetch {
+  return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const requestUrl = getRequestUrl(input);
+    const method = init?.method?.toUpperCase() ?? (input instanceof Request ? input.method : 'GET');
+    const headers = headersForRequest(input, init);
+    const isGlassHiveRequest =
+      method === 'POST' && /\/chat\/completions(?:[/?#]|$)/i.test(requestUrl);
+    if (!isGlassHiveRequest) return baseFetch(input, init);
+
+    let requestBody = '';
+    if (typeof init?.body === 'string') {
+      requestBody = init.body;
+    } else if (input instanceof Request) {
+      try {
+        requestBody = await input.clone().text();
+      } catch {
+        requestBody = '';
+      }
+    }
+    let requestPayload: Record<string, unknown> = {};
+    try {
+      requestPayload = JSON.parse(requestBody) as Record<string, unknown>;
+    } catch {
+      requestPayload = {};
+    }
+    const instructionAuthority = glassHiveDeveloperAuthority(requestPayload, headers);
+    const nativeRequestSha256 = createHash('sha256').update(requestBody, 'utf8').digest('hex');
+    const response = await baseFetch(input, init);
+    if (!response.ok) return response;
+
+    let emitted = false;
+    const inspectPayload = (value: unknown) => {
+      if (emitted || !value || typeof value !== 'object') return;
+      const glasshive = (value as Record<string, unknown>).glasshive;
+      if (!glasshive || typeof glasshive !== 'object') return;
+      const authorityReceipt = (glasshive as Record<string, unknown>)
+        .native_provider_authority_receipt;
+      if (!authorityReceipt || typeof authorityReceipt !== 'object') return;
+      emitted = true;
+      const receipt = authorityReceipt as NonNullable<
+        Parameters<typeof nativeProviderRequestAccepted>[0]['authorityReceipt']
+      >;
+      try {
+        nativeProviderRequestAccepted({
+          provider: 'glasshive',
+          model: String(receipt.model || requestPayload.model || ''),
+          status: response.status,
+          instructionAuthority,
+          nativeRequestSha256,
+          authorityReceipt: receipt,
+        });
+      } catch {
+        // Telemetry must never alter provider output or fallback behavior.
+      }
+    };
+
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    if (!contentType.includes('text/event-stream') || !response.body) {
+      try {
+        inspectPayload(await response.clone().json());
+      } catch {
+        // A successful non-JSON response has no structured GlassHive receipt.
+      }
+      return response;
+    }
+
+    const decoder = new TextDecoder();
+    let pending = '';
+    const inspectLines = (flush = false) => {
+      let newlineIndex = pending.indexOf('\n');
+      while (newlineIndex >= 0) {
+        const line = pending.slice(0, newlineIndex).trim();
+        pending = pending.slice(newlineIndex + 1);
+        if (line.startsWith('data:')) {
+          const data = line.slice('data:'.length).trim();
+          if (data && data !== '[DONE]') {
+            try {
+              inspectPayload(JSON.parse(data));
+            } catch {
+              // Preserve malformed provider data for the owning OpenAI parser.
+            }
+          }
+        }
+        newlineIndex = pending.indexOf('\n');
+      }
+      if (flush && pending.trim().startsWith('data:')) {
+        const data = pending.trim().slice('data:'.length).trim();
+        if (data && data !== '[DONE]') {
+          try {
+            inspectPayload(JSON.parse(data));
+          } catch {
+            // Preserve malformed provider data for the owning OpenAI parser.
+          }
+        }
+      }
+    };
+    const monitoredBody = response.body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          controller.enqueue(chunk);
+          pending += decoder.decode(chunk, { stream: true });
+          inspectLines();
+        },
+        flush() {
+          pending += decoder.decode();
+          inspectLines(true);
+        },
+      }),
+    );
+    return new Response(monitoredBody, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  };
 }
 
 function cloneCodexEventItem(item: Record<string, unknown>): Record<string, unknown> {
@@ -416,6 +589,7 @@ function ensureCodexReasoningEncryptedContentInclude(payload: Record<string, unk
 function createCodexResponsesFetch(
   baseFetch: Fetch,
   connectedAccountAuthRefresh?: t.OpenAIConfigOptions['connectedAccountAuthRefresh'],
+  nativeProviderRequestAccepted?: t.OpenAIConfigOptions['nativeProviderRequestAccepted'],
 ): Fetch {
   return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const requestUrl = getRequestUrl(input);
@@ -434,6 +608,7 @@ function createCodexResponsesFetch(
     let removedItemReferenceCount = 0;
     let removedReasoningReferenceCount = 0;
     let removedInstructionMessageCount = 0;
+    let normalizedRequestPayload: Record<string, unknown> | null = null;
 
     if (isResponsesRequest && typeof init?.body === 'string' && init.body.trim().length > 0) {
       try {
@@ -482,6 +657,7 @@ function createCodexResponsesFetch(
           ...init,
           body: JSON.stringify(payload),
         };
+        normalizedRequestPayload = payload;
       } catch {
         // If payload parsing fails, preserve original request body.
       }
@@ -514,6 +690,19 @@ function createCodexResponsesFetch(
       }
     }
     /* === VIVENTIUM END === */
+
+    if (isResponsesRequest && response.ok && normalizedRequestPayload) {
+      try {
+        nativeProviderRequestAccepted?.({
+          provider: 'openai',
+          model: String(normalizedRequestPayload.model || ''),
+          status: response.status,
+          request: normalizedRequestPayload,
+        });
+      } catch {
+        // Telemetry must never alter provider output or fallback behavior.
+      }
+    }
 
     if (isResponsesRequest && originalStream === false && response.ok) {
       const rawBody = await response.text();
@@ -765,12 +954,25 @@ export function getOpenAIConfig(
    * Purpose: Apply Codex-compatible request/response normalization only for Codex base URLs
    * so other OpenAI-compatible providers remain unaffected.
    * === VIVENTIUM END === */
+  let configuredFetch = (configOptions.fetch as Fetch | undefined) ?? (fetch as Fetch);
+  let customFetchInstalled = configOptions.fetch != null;
   if (isCodexResponsesBaseURL(configOptions.baseURL)) {
-    const baseFetch = (configOptions.fetch as Fetch | undefined) ?? (fetch as Fetch);
-    configOptions.fetch = createCodexResponsesFetch(
-      baseFetch,
+    configuredFetch = createCodexResponsesFetch(
+      configuredFetch,
       options.connectedAccountAuthRefresh,
+      options.nativeProviderRequestAccepted,
     );
+    customFetchInstalled = true;
+  }
+  if (options.nativeProviderRequestAccepted) {
+    configuredFetch = createGlassHiveNativeReceiptFetch(
+      configuredFetch,
+      options.nativeProviderRequestAccepted,
+    );
+    customFetchInstalled = true;
+  }
+  if (customFetchInstalled) {
+    configOptions.fetch = configuredFetch;
   }
 
   const result: t.OpenAIConfigResult = {

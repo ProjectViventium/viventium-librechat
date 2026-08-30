@@ -1,5 +1,6 @@
 import type { Document } from 'mongoose';
 import type { TFeedbackRating, TFeedbackTag } from 'librechat-data-provider';
+import type { IPersonalAccountCleanupTombstone } from './personalAccountCleanupTombstone';
 
 // @ts-ignore
 export interface IMessage extends Document {
@@ -43,4 +44,8 @@ export interface IMessage extends Document {
   expiredAt?: Date;
   createdAt?: Date;
   updatedAt?: Date;
+  /* === VIVENTIUM START === Retained synthetic-QA cleanup CAS state. === */
+  deletedAt?: Date;
+  cleanupTombstone?: IPersonalAccountCleanupTombstone;
+  /* === VIVENTIUM END === */
 }

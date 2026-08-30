@@ -9,8 +9,12 @@ import { Tools } from 'librechat-data-provider';
 jest.mock('~/hooks', () => ({
   useLocalize: () => (key: string) => {
     const translations: Record<string, string> = {
+      com_ui_memory: 'Memory',
       com_ui_memory_updated: 'Updated saved memory',
       com_ui_memory_error: 'Memory Error',
+      com_ui_unavailable: 'Unavailable',
+      com_ui_reconnect: 'Reconnect',
+      com_ui_provider: 'Provider',
     };
     return translations[key] || key;
   },
@@ -43,6 +47,38 @@ describe('MemoryArtifacts', () => {
             : 'test value',
       } as MemoryArtifact,
     }) as TAttachment;
+
+  const createMemoryHealthAttachment = (
+    status: 'degraded' | 'recovered',
+    reason: string = 'auth',
+    message: string = 'Untrusted server-supplied English detail.',
+  ): TAttachment => {
+    let errorType = 'provider_auth';
+    if (status === 'recovered') {
+      errorType = 'writer_recovered';
+    } else if (reason === 'quota') {
+      errorType = 'provider_quota_exhausted';
+    }
+    return {
+      type: Tools.memory,
+      [Tools.memory]: {
+        type: 'error',
+        key: 'system',
+        value: JSON.stringify({
+          errorType,
+          message: status === 'degraded' ? message : undefined,
+          healthState: {
+            kind: 'memory_writer_health',
+            status,
+            reason,
+            provider: 'openAI',
+            model: 'gpt-memory-primary',
+            cooldownUntil: '2026-08-26T12:00:00.000Z',
+          },
+        }),
+      } as MemoryArtifact,
+    } as TAttachment;
+  };
 
   describe('Error State Handling', () => {
     test('displays error styling when memory artifacts contain errors', () => {
@@ -90,6 +126,109 @@ describe('MemoryArtifacts', () => {
 
       expect(screen.getByText('Updated saved memory')).toBeInTheDocument();
       expect(screen.queryByText('Memory Error')).not.toBeInTheDocument();
+    });
+
+    test('displays typed cooldown degradation as an unavailable notice instead of an error', () => {
+      render(<MemoryArtifacts attachments={[createMemoryHealthAttachment('degraded')]} />);
+
+      const button = screen.getByRole('button', { name: 'Memory · Unavailable' });
+      expect(button).toHaveClass('text-text-warning');
+      expect(button).not.toHaveClass('text-red-500');
+      expect(screen.queryByText('Memory Error')).not.toBeInTheDocument();
+
+      fireEvent.click(button);
+      expect(screen.getByText('Reconnect Memory')).toBeInTheDocument();
+      expect(
+        screen.queryByText('Untrusted server-supplied English detail.'),
+      ).not.toBeInTheDocument();
+    });
+
+    test('uses localized reason-code copy for quota degradation', () => {
+      render(<MemoryArtifacts attachments={[createMemoryHealthAttachment('degraded', 'quota')]} />);
+
+      const button = screen.getByRole('button', { name: 'Memory · Unavailable' });
+      fireEvent.click(button);
+
+      expect(screen.getByText('Provider · Unavailable')).toBeInTheDocument();
+      expect(
+        screen.queryByText('Untrusted server-supplied English detail.'),
+      ).not.toBeInTheDocument();
+    });
+
+    test('keeps an unknown health reason on the genuine error path', () => {
+      render(
+        <MemoryArtifacts
+          attachments={[createMemoryHealthAttachment('degraded', 'unvalidated_reason')]}
+        />,
+      );
+
+      const button = screen.getByRole('button', { name: 'Memory Error' });
+      expect(button).toHaveClass('text-red-500');
+      expect(screen.queryByText('Memory · Unavailable')).not.toBeInTheDocument();
+    });
+
+    test('keeps a mismatched typed health error on the genuine error path', () => {
+      const attachment = createMemoryHealthAttachment('degraded', 'quota');
+      const artifact = attachment[Tools.memory] as MemoryArtifact;
+      const details = JSON.parse(String(artifact.value));
+      details.healthState.errorType = 'insufficient_quota';
+      artifact.value = JSON.stringify(details);
+
+      render(<MemoryArtifacts attachments={[attachment]} />);
+
+      const button = screen.getByRole('button', { name: 'Memory Error' });
+      expect(button).toHaveClass('text-red-500');
+      expect(screen.queryByText('Memory · Unavailable')).not.toBeInTheDocument();
+    });
+
+    test('keeps an unrelated authentication error artifact on the genuine error path', () => {
+      const attachment = createMemoryHealthAttachment('degraded', 'auth');
+      const artifact = attachment[Tools.memory] as MemoryArtifact;
+      const details = JSON.parse(String(artifact.value));
+      details.errorType = 'revision_conflict';
+      artifact.value = JSON.stringify(details);
+
+      render(<MemoryArtifacts attachments={[attachment]} />);
+
+      expect(screen.getByRole('button', { name: 'Memory Error' })).toHaveClass('text-red-500');
+      expect(screen.queryByText('Memory · Unavailable')).not.toBeInTheDocument();
+    });
+
+    test('displays a typed writer recovery as a normal saved-memory transition', () => {
+      render(<MemoryArtifacts attachments={[createMemoryHealthAttachment('recovered')]} />);
+
+      const button = screen.getByRole('button', { name: 'Updated saved memory' });
+      expect(button).toHaveClass('text-text-secondary-alt');
+      expect(button).not.toHaveClass('text-red-500');
+      expect(screen.queryByText('Memory Error')).not.toBeInTheDocument();
+
+      fireEvent.click(button);
+      expect(screen.getByTestId('memory-health-recovered')).toHaveTextContent(
+        'Updated saved memory',
+      );
+    });
+
+    test('keeps an incomplete health payload on the genuine error path', () => {
+      const attachment = {
+        type: Tools.memory,
+        [Tools.memory]: {
+          type: 'error',
+          key: 'system',
+          value: JSON.stringify({
+            errorType: 'provider_auth',
+            healthState: {
+              kind: 'memory_writer_health',
+              status: 'degraded',
+            },
+          }),
+        } as MemoryArtifact,
+      } as TAttachment;
+
+      render(<MemoryArtifacts attachments={[attachment]} />);
+
+      const button = screen.getByRole('button', { name: 'Memory Error' });
+      expect(button).toHaveClass('text-red-500');
+      expect(screen.queryByText('Memory · Unavailable')).not.toBeInTheDocument();
     });
   });
 

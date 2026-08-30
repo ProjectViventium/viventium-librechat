@@ -598,6 +598,68 @@ def build_health_payload(storage: ScheduleStorage) -> Dict[str, Any]:
     }
 
 
+EXTERNAL_WORK_TERMINAL_CALLBACK_CONTRACT = "glasshive_terminal_result_v1"
+
+
+def _external_work_terminal_flag(summary: dict[str, Any]) -> bool:
+    if "allRequiredTerminal" in summary:
+        value = summary["allRequiredTerminal"]
+    elif "all_required_terminal" in summary:
+        value = summary["all_required_terminal"]
+    else:
+        raise ValueError("missing_all_required_terminal")
+    if type(value) is not bool:
+        raise ValueError("invalid_all_required_terminal")
+    return value
+
+
+def _external_work_callback_updates(
+    run: dict[str, Any], summary: dict[str, Any], now: str
+) -> dict[str, Any]:
+    def count(camel: str, snake: str) -> int:
+        try:
+            return max(0, int(summary.get(camel) or summary.get(snake) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    required_total = count("requiredTotal", "required_total")
+    required_terminal = count("requiredTerminal", "required_terminal")
+    required_failed = count("requiredFailed", "required_failed")
+    all_required_terminal = _external_work_terminal_flag(summary)
+    canonical = {
+        "requiredTotal": required_total,
+        "requiredTerminal": required_terminal,
+        "requiredFailed": required_failed,
+        "allRequiredTerminal": all_required_terminal,
+        "state": str(summary.get("state") or "").strip()
+        or ("completed" if all_required_terminal else "waiting_external"),
+    }
+    execution = (
+        dict(run.get("execution_snapshot"))
+        if isinstance(run.get("execution_snapshot"), dict)
+        else {}
+    )
+    execution["external_work"] = canonical
+    updates: dict[str, Any] = {"execution_snapshot": execution, "updated_at": now}
+    if required_total > 0 and not all_required_terminal:
+        return {
+            **updates,
+            "status": "waiting_external",
+            "disposition": "running",
+            "completed_at": None,
+            "error_class": None,
+        }
+    if required_total > 0:
+        return {
+            **updates,
+            "status": "failed" if required_failed else "completed",
+            "disposition": "failed" if required_failed else "delivered",
+            "completed_at": now,
+            "error_class": "required_external_work_failed" if required_failed else None,
+        }
+    return updates
+
+
 def build_server(storage: ScheduleStorage) -> FastMCP:
     mcp = FastMCP(name="scheduling-cortex", instructions=SCHEDULING_CORTEX_INSTRUCTIONS)
     glasshive_workspace_schedules = GlassHiveWorkspaceScheduleService(storage)
@@ -607,6 +669,233 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     async def health(_: Request) -> Response:
         return JSONResponse(build_health_payload(storage))
     # VIVENTIUM NOTE
+
+    @mcp.custom_route("/internal/scheduled-prompts/external-work-callback", methods=["POST"])
+    async def external_work_callback(request: Request) -> Response:
+        expected_secret = str(
+            os.getenv("VIVENTIUM_SCHEDULER_SECRET")
+            or os.getenv("SCHEDULER_LIBRECHAT_SECRET")
+            or ""
+        ).strip()
+        provided_secret = str(
+            request.headers.get("x-viventium-scheduler-secret", "")
+        ).strip()
+        if not expected_secret or not hmac.compare_digest(provided_secret, expected_secret):
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_scheduler_secret"},
+                status_code=401,
+            )
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_json"}, status_code=400
+            )
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_payload"}, status_code=400
+            )
+        callback_contract = str(payload.get("callback_contract") or "").strip()
+        header_contract = str(
+            request.headers.get("x-viventium-callback-contract", "")
+        ).strip()
+        body_identity = any(
+            field in payload for field in ("callback_id", "result_revision", "result_digest")
+        )
+        header_identity = any(
+            request.headers.get(header)
+            for header in (
+                "x-viventium-callback-id",
+                "x-viventium-result-revision",
+                "x-viventium-result-digest",
+            )
+        )
+        terminal_sender = bool(callback_contract or header_contract or body_identity or header_identity)
+        if terminal_sender and (
+            callback_contract != EXTERNAL_WORK_TERMINAL_CALLBACK_CONTRACT
+            or header_contract != EXTERNAL_WORK_TERMINAL_CALLBACK_CONTRACT
+        ):
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_terminal_contract"},
+                status_code=400,
+            )
+        callback_id = str(payload.get("callback_id") or "").strip()
+        result_digest = str(payload.get("result_digest") or "").strip()
+        result_revision = payload.get("result_revision")
+        if terminal_sender and (
+            not callback_id
+            or not result_digest
+            or not isinstance(result_revision, int)
+            or isinstance(result_revision, bool)
+            or str(request.headers.get("x-viventium-callback-id", "")).strip()
+            != callback_id
+            or str(request.headers.get("x-viventium-result-digest", "")).strip()
+            != result_digest
+            or str(request.headers.get("x-viventium-result-revision", "")).strip()
+            != str(result_revision)
+        ):
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_terminal_identity"},
+                status_code=400,
+            )
+        occurrence_key = str(payload.get("occurrence_key") or "").strip()
+        user_id = str(payload.get("user_id") or "").strip()
+        if not occurrence_key or not user_id:
+            return JSONResponse(
+                {"status": "error", "reason": "missing_occurrence_owner"},
+                status_code=400,
+            )
+        run = storage.get_scheduled_prompt_run_by_occurrence_key(occurrence_key)
+        if not run:
+            return JSONResponse(
+                {"status": "error", "reason": "unknown_occurrence"}, status_code=404
+            )
+        if str(run.get("user_id") or "") != user_id:
+            return JSONResponse(
+                {"status": "error", "reason": "owner_mismatch"}, status_code=403
+            )
+        try:
+            all_required_terminal = _external_work_terminal_flag(payload)
+        except ValueError as error:
+            return JSONResponse(
+                {"status": "error", "reason": str(error)}, status_code=400
+            )
+        source = str(payload.get("source") or "").strip().lower()
+        event = str(payload.get("event") or "").strip().lower()
+        state = str(payload.get("state") or "").strip().lower()
+        terminal_intent = bool(
+            event in {"run.completed", "run.failed", "run.cancelled"}
+            or state in {"completed", "failed", "cancelled"}
+            or all_required_terminal
+        )
+        glasshive_source = bool(
+            source in {"glasshive", "glasshive_host"}
+            or str(run.get("executor") or "").strip().lower() == "glasshive_host"
+        )
+        if terminal_intent and glasshive_source and not terminal_sender:
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_terminal_identity"},
+                status_code=400,
+            )
+
+        if not terminal_sender:
+            if terminal_intent or glasshive_source:
+                return JSONResponse(
+                    {"status": "error", "reason": "legacy_callback_not_allowed"},
+                    status_code=400,
+                )
+            updates = _external_work_callback_updates(
+                run, payload, datetime.now(timezone.utc).isoformat()
+            )
+            applied = storage.update_scheduled_prompt_run_if_current(
+                str(run["run_id"]),
+                updates,
+                expected_status=str(run.get("status") or ""),
+                expected_error_class=run.get("error_class"),
+            )
+            if not applied.get("updated"):
+                return JSONResponse(
+                    {"status": "error", "reason": "legacy_callback_superseded"},
+                    status_code=409,
+                )
+            return JSONResponse(
+                {
+                    "status": "http_accepted",
+                    "run_id": str(run["run_id"]),
+                    "occurrence_status": (applied.get("run") or {}).get("status"),
+                    "callback_status": "legacy_accepted",
+                }
+            )
+
+        try:
+            decision = storage.accept_scheduled_terminal_callback_result(
+                owner_id=user_id,
+                work_id=str(run["run_id"]),
+                payload=payload,
+                callback_contract=EXTERNAL_WORK_TERMINAL_CALLBACK_CONTRACT,
+            )
+        except ValueError:
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_terminal_identity"},
+                status_code=400,
+            )
+
+        def terminal_response(status_code: int, persisted: bool) -> JSONResponse:
+            return JSONResponse(
+                {
+                    "status": "http_accepted" if status_code < 300 else "error",
+                    "run_id": str(run["run_id"]),
+                    "occurrence_status": run.get("status"),
+                    "callback_persisted": persisted,
+                    "callback_status": str(decision.get("callback_status") or ""),
+                    "callback_id": str(decision.get("callback_id") or ""),
+                    "result_revision": decision.get("result_revision"),
+                    "result_digest": str(decision.get("result_digest") or ""),
+                    "current_result_revision": decision.get("current_result_revision"),
+                    "current_result_digest": str(decision.get("current_result_digest") or ""),
+                    "current_callback_id": str(decision.get("current_callback_id") or ""),
+                },
+                status_code=status_code,
+            )
+
+        callback_status = str(decision.get("callback_status") or "")
+        if callback_status in {"superseded", "conflict"}:
+            return terminal_response(409, False)
+        if callback_status == "effects_in_progress":
+            return terminal_response(425, False)
+        if callback_status == "idempotent":
+            return terminal_response(200, False)
+        effect_lease = storage.claim_scheduled_terminal_callback_effect(
+            owner_id=user_id,
+            work_id=str(run["run_id"]),
+            result_revision=int(decision["result_revision"]),
+            result_digest=str(decision["result_digest"]),
+        )
+        if not effect_lease.get("claimed"):
+            return terminal_response(425, False)
+        lease_token = str(effect_lease["lease_token"])
+        if not storage.scheduled_terminal_callback_effect_is_current(
+            owner_id=user_id,
+            work_id=str(run["run_id"]),
+            result_revision=int(decision["result_revision"]),
+            result_digest=str(decision["result_digest"]),
+            lease_token=lease_token,
+        ):
+            return terminal_response(409, False)
+        updates = _external_work_callback_updates(
+            run, payload, datetime.now(timezone.utc).isoformat()
+        )
+        applied = storage.update_scheduled_prompt_run_if_current(
+            str(run["run_id"]),
+            updates,
+            expected_status=str(run.get("status") or ""),
+            expected_error_class=run.get("error_class"),
+        )
+        if not applied.get("updated"):
+            storage.release_scheduled_terminal_callback_effect(
+                owner_id=user_id,
+                work_id=str(run["run_id"]),
+                result_revision=int(decision["result_revision"]),
+                result_digest=str(decision["result_digest"]),
+                lease_token=lease_token,
+            )
+            return JSONResponse(
+                {"status": "error", "reason": "callback_effect_not_persisted"},
+                status_code=503,
+            )
+        if not storage.complete_scheduled_terminal_callback_effect(
+            owner_id=user_id,
+            work_id=str(run["run_id"]),
+            result_revision=int(decision["result_revision"]),
+            result_digest=str(decision["result_digest"]),
+            lease_token=lease_token,
+        ):
+            return JSONResponse(
+                {"status": "error", "reason": "callback_effect_lost"}, status_code=503
+            )
+        decision = {**decision, "callback_status": "accepted"}
+        run = applied.get("run") or run
+        return terminal_response(200, True)
 
     # === VIVENTIUM START ===
     # Feature: Signed GlassHive completion callback for Workbench scheduled prompts.

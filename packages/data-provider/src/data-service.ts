@@ -1177,6 +1177,8 @@ export function getDomainServerBaseUrl(): string {
 /* Active Jobs */
 export interface ActiveJobsResponse {
   activeJobIds: string[];
+  /** Exact running streams; activeJobIds remains the deduplicated conversation projection. */
+  activeStreams?: Array<{ streamId: string; conversationId: string }>;
 }
 
 export const getActiveJobs = (): Promise<ActiveJobsResponse> => {

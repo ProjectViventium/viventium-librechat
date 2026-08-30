@@ -20,6 +20,40 @@ import { processMCPEnv } from '~/utils/env';
 
 type ServerInstructionConfig = t.ParsedServerConfig & {
   viventiumTrustedServerInstructions?: unknown;
+  /* === VIVENTIUM START ===
+   * Feature: Authenticated trusted MCP instruction fetch.
+   * Purpose: Mark first-party servers whose instruction handshake requires the current request
+   * identity instead of an unauthenticated app-level probe.
+   * === VIVENTIUM END === */
+  viventiumRequestContext?: unknown;
+};
+
+/* === VIVENTIUM START ===
+ * Feature: Authenticated trusted MCP instruction fetch.
+ * Purpose: Carry only the existing authenticated user/body projection into a temporary trusted
+ * server-instruction connection. The MCP service still validates its normal auth boundary.
+ * === VIVENTIUM END === */
+type ServerInstructionRequestContext = {
+  user?: IUser;
+  body?: RequestBody;
+};
+
+type MCPCallToolOptions = {
+  user?: IUser;
+  serverName: string;
+  toolName: string;
+  provider: t.Provider;
+  toolArguments?: Record<string, unknown>;
+  options?: RequestOptions;
+  requestBody?: RequestBody;
+  tokenMethods?: TokenMethods;
+  customUserVars?: Record<string, string>;
+  flowManager: FlowStateManager<MCPOAuthTokens | null>;
+  oauthStart?: (authURL: string) => Promise<void>;
+  oauthEnd?: () => Promise<void>;
+  graphTokenResolver?: GraphTokenResolver;
+  /** Preserve the authenticated MCP result envelope for a trusted internal classifier. */
+  returnRawResponse?: boolean;
 };
 
 function sanitizeMCPManagerErrorForLog(error: unknown): {
@@ -83,6 +117,21 @@ function serverInstructionCacheKey(serverName: string, config: t.ParsedServerCon
 
 function allowsServerInstructionFetch(config: t.ParsedServerConfig): boolean {
   return (config as ServerInstructionConfig).viventiumTrustedServerInstructions === true;
+}
+
+function requiresServerInstructionRequestContext(config: t.ParsedServerConfig): boolean {
+  return (config as ServerInstructionConfig).viventiumRequestContext === true;
+}
+
+function serverInstructionScopedCacheKey(
+  serverName: string,
+  config: t.ParsedServerConfig,
+  requestContext?: ServerInstructionRequestContext,
+): string {
+  const contextOwner = requiresServerInstructionRequestContext(config)
+    ? String(requestContext?.user?.id || '')
+    : '';
+  return `${serverInstructionCacheKey(serverName, config)}:${contextOwner}`;
 }
 
 const DEFAULT_SERVER_INSTRUCTION_FETCH_TIMEOUT_MS = 1500;
@@ -332,6 +381,7 @@ export class MCPManager extends UserConnectionManager {
    */
   private async getInstructionsWithSources(
     serverNames?: string[],
+    requestContext?: ServerInstructionRequestContext,
   ): Promise<{ instructions: Record<string, string>; sources: Record<string, string> }> {
     const instructions: Record<string, string> = {};
     const sources: Record<string, string> = {};
@@ -341,7 +391,9 @@ export class MCPManager extends UserConnectionManager {
     const resolvedServers = await Promise.all(
       Object.entries(configs)
         .filter(([serverName]) => !requestedServers || requestedServers.has(serverName))
-        .map(([serverName, config]) => this.resolveInstructionsForServer(serverName, config)),
+        .map(([serverName, config]) =>
+          this.resolveInstructionsForServer(serverName, config, requestContext),
+        ),
     );
     for (const resolved of resolvedServers) {
       sources[resolved.serverName] = resolved.source;
@@ -362,6 +414,7 @@ export class MCPManager extends UserConnectionManager {
   private async resolveInstructionsForServer(
     serverName: string,
     config: t.ParsedServerConfig,
+    requestContext?: ServerInstructionRequestContext,
   ): Promise<{ serverName: string; instruction?: string; source: string }> {
     if (typeof config.serverInstructions === 'string') {
       const trimmedInstructions = config.serverInstructions.trim();
@@ -375,9 +428,18 @@ export class MCPManager extends UserConnectionManager {
       return { serverName, source: 'missing' };
     }
 
+    /* === VIVENTIUM START ===
+     * Feature: Authenticated trusted MCP instruction fetch.
+     * Purpose: Never turn a missing request identity into an OAuth retry loop.
+     * === VIVENTIUM END === */
+    if (requiresServerInstructionRequestContext(config) && !requestContext?.user?.id) {
+      return { serverName, source: 'request_context_unavailable' };
+    }
+
     const serverProvidedInstructions = await this.fetchServerProvidedInstructions(
       serverName,
       config,
+      requestContext,
     );
     if (serverProvidedInstructions) {
       return { serverName, instruction: serverProvidedInstructions, source: 'server_fetched' };
@@ -396,6 +458,7 @@ export class MCPManager extends UserConnectionManager {
   private async fetchServerProvidedInstructions(
     serverName: string,
     config: t.ParsedServerConfig,
+    requestContext?: ServerInstructionRequestContext,
   ): Promise<string | null> {
     if (!allowsServerInstructionFetch(config)) {
       logger.warn(
@@ -404,7 +467,7 @@ export class MCPManager extends UserConnectionManager {
       return null;
     }
 
-    const cacheKey = serverInstructionCacheKey(serverName, config);
+    const cacheKey = serverInstructionScopedCacheKey(serverName, config, requestContext);
     const cachedInstructions = this.serverInstructionCache.get(cacheKey);
     if (cachedInstructions) {
       return cachedInstructions;
@@ -434,6 +497,7 @@ export class MCPManager extends UserConnectionManager {
       serverName,
       config,
       serverInstructionFetchTimeoutMs(),
+      requestContext,
     );
     this.pendingServerInstructionFetches.set(cacheKey, fetchPromise);
     try {
@@ -454,13 +518,25 @@ export class MCPManager extends UserConnectionManager {
     serverName: string,
     config: t.ParsedServerConfig,
     timeoutMs = serverInstructionFetchTimeoutMs(),
+    requestContext?: ServerInstructionRequestContext,
   ): Promise<string | null> {
     let connection: MCPConnection | undefined;
     let timedOut = false;
     try {
+      /* === VIVENTIUM START ===
+       * Feature: Authenticated trusted MCP instruction fetch.
+       * Purpose: Resolve the same bounded user/body placeholders used by actual MCP tool calls
+       * before opening the temporary instruction connection.
+       * === VIVENTIUM END === */
+      const resolvedConfig = processMCPEnv({
+        options: config,
+        user: requestContext?.user,
+        body: requestContext?.body,
+        dbSourced: Boolean(config.dbId),
+      });
       const createConnectionPromise = MCPConnectionFactory.create({
         serverName,
-        serverConfig: config,
+        serverConfig: resolvedConfig,
         dbSourced: !!config.dbId,
         useSSRFProtection: MCPServersRegistry.getInstance().shouldEnableSSRFProtection(),
       }).then(async (createdConnection) => {
@@ -492,7 +568,7 @@ export class MCPManager extends UserConnectionManager {
       const serverProvidedInstructions = connection.client.getInstructions();
       if (typeof serverProvidedInstructions === 'string' && serverProvidedInstructions.trim()) {
         this.serverInstructionCache.set(
-          serverInstructionCacheKey(serverName, config),
+          serverInstructionScopedCacheKey(serverName, config, requestContext),
           serverProvidedInstructions,
         );
         return serverProvidedInstructions;
@@ -529,17 +605,24 @@ export class MCPManager extends UserConnectionManager {
    * @param serverNames Optional array of server names to include. If not provided, includes all servers.
    * @returns Formatted instructions string ready for context injection
    */
-  public async formatInstructionsForContext(serverNames?: string[]): Promise<string> {
-    const { text } = await this.formatInstructionsForContextWithMetadata(serverNames);
+  public async formatInstructionsForContext(
+    serverNames?: string[],
+    requestContext?: ServerInstructionRequestContext,
+  ): Promise<string> {
+    const { text } = await this.formatInstructionsForContextWithMetadata(
+      serverNames,
+      requestContext,
+    );
     return text;
   }
 
   public async formatInstructionsForContextWithMetadata(
     serverNames?: string[],
+    requestContext?: ServerInstructionRequestContext,
   ): Promise<{ text: string; sources: Record<string, string> }> {
     /** Instructions for specified servers or all stored instructions */
     const { instructions: instructionsToInclude, sources } =
-      await this.getInstructionsWithSources(serverNames);
+      await this.getInstructionsWithSources(serverNames, requestContext);
 
     if (Object.keys(instructionsToInclude).length === 0) {
       return { text: '', sources };
@@ -573,6 +656,16 @@ Please follow these instructions when using tools from the respective MCP server
    *   When provided and the server config contains `{{LIBRECHAT_GRAPH_ACCESS_TOKEN}}` placeholders,
    *   they will be resolved to actual Graph API tokens before the tool call.
    */
+  callTool(
+    options: MCPCallToolOptions & { returnRawResponse: true },
+  ): Promise<t.MCPToolCallResponse>;
+
+  callTool(
+    options: MCPCallToolOptions & { returnRawResponse?: false | undefined },
+  ): Promise<t.FormattedToolResponse>;
+
+  callTool(options: MCPCallToolOptions): Promise<t.FormattedToolResponse | t.MCPToolCallResponse>;
+
   async callTool({
     user,
     serverName,
@@ -587,21 +680,8 @@ Please follow these instructions when using tools from the respective MCP server
     oauthEnd,
     customUserVars,
     graphTokenResolver,
-  }: {
-    user?: IUser;
-    serverName: string;
-    toolName: string;
-    provider: t.Provider;
-    toolArguments?: Record<string, unknown>;
-    options?: RequestOptions;
-    requestBody?: RequestBody;
-    tokenMethods?: TokenMethods;
-    customUserVars?: Record<string, string>;
-    flowManager: FlowStateManager<MCPOAuthTokens | null>;
-    oauthStart?: (authURL: string) => Promise<void>;
-    oauthEnd?: () => Promise<void>;
-    graphTokenResolver?: GraphTokenResolver;
-  }): Promise<t.FormattedToolResponse> {
+    returnRawResponse,
+  }: MCPCallToolOptions): Promise<t.FormattedToolResponse | t.MCPToolCallResponse> {
     /** User-specific connection */
     let connection: MCPConnection | undefined;
     const userId = user?.id;
@@ -671,6 +751,9 @@ Please follow these instructions when using tools from the respective MCP server
         this.updateUserLastActivity(userId);
       }
       this.checkIdleConnections();
+      if (returnRawResponse === true) {
+        return result as t.MCPToolCallResponse;
+      }
       return formatToolContent(result as t.MCPToolCallResponse, provider);
     } catch (error) {
       // Log with context and re-throw or handle as needed

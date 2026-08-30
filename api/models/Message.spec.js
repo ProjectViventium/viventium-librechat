@@ -1,6 +1,6 @@
 const mongoose = require('mongoose');
 const { v4: uuidv4 } = require('uuid');
-const { messageSchema } = require('@librechat/data-schemas');
+const { logger, messageSchema } = require('@librechat/data-schemas');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 
 const mockScheduleConversationRecallSync = jest.fn();
@@ -16,6 +16,7 @@ jest.mock('~/server/services/viventium/conversationRecallService', () => {
 const {
   saveMessage,
   getMessages,
+  getMessageAncestorBranch,
   getLatestRecallEligibleMessageCreatedAt,
   updateMessage,
   deleteMessages,
@@ -23,6 +24,7 @@ const {
   updateMessageText,
   deleteMessagesSince,
   recordMessage,
+  __testables: { buildMessageAncestorBranchPipeline },
 } = require('./Message');
 
 jest.mock('~/server/services/Config/app');
@@ -31,6 +33,33 @@ jest.mock('~/server/services/Config/app');
  * @type {import('mongoose').Model<import('@librechat/data-schemas').IMessage>}
  */
 let Message;
+
+const PRIVATE_FEELING_FIELD = 'cortex_delivery_feeling_snapshot';
+
+function privateFeelingContent(canary) {
+  return [
+    {
+      type: 'text',
+      text: 'Visible public text.',
+      metadata: {
+        publicLabel: 'preserved',
+        nested: {
+          keep: 'public',
+          [PRIVATE_FEELING_FIELD]: {
+            capsule: canary,
+            snapshotHash: 'a'.repeat(64),
+          },
+        },
+      },
+    },
+  ];
+}
+
+function expectPrivateFeelingAbsent(value, canary) {
+  const serialized = JSON.stringify(value);
+  expect(serialized).not.toContain(PRIVATE_FEELING_FIELD);
+  expect(serialized).not.toContain(canary);
+}
 
 describe('Message Operations', () => {
   let mongoServer;
@@ -89,15 +118,215 @@ describe('Message Operations', () => {
       });
     });
 
+    it('strips private Feelings receipts before save without mutating visible content', async () => {
+      const content = privateFeelingContent('PRIVATE_SYNTHETIC_SAVE_CANARY');
+      Object.freeze(content[0].metadata.nested[PRIVATE_FEELING_FIELD]);
+      Object.freeze(content[0].metadata.nested);
+      Object.freeze(content[0].metadata);
+      Object.freeze(content[0]);
+      Object.freeze(content);
+
+      await saveMessage(mockReq, {
+        ...mockMessageData,
+        content,
+        isCreatedByUser: false,
+      });
+
+      const savedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' }).lean();
+      expectPrivateFeelingAbsent(savedMessage.content, 'PRIVATE_SYNTHETIC_SAVE_CANARY');
+      expect(savedMessage.content[0]).toMatchObject({
+        type: 'text',
+        text: 'Visible public text.',
+        metadata: { publicLabel: 'preserved', nested: { keep: 'public' } },
+      });
+      expect(content[0].metadata.nested[PRIVATE_FEELING_FIELD].capsule).toBe(
+        'PRIVATE_SYNTHETIC_SAVE_CANARY',
+      );
+      expectPrivateFeelingAbsent(
+        mockScheduleConversationRecallSync.mock.calls,
+        'PRIVATE_SYNTHETIC_SAVE_CANARY',
+      );
+    });
+
+    it('strips dotted content keys containing the exact private Feelings path segment', async () => {
+      await saveMessage(mockReq, {
+        ...mockMessageData,
+        content: [
+          {
+            type: 'text',
+            text: 'Visible dotted-key content.',
+            'metadata.cortex_delivery_feeling_snapshot': {
+              capsule: 'PRIVATE_SYNTHETIC_DOTTED_MODEL_CANARY',
+            },
+            'metadata.cortex_delivery_feeling_snapshot_public': 'preserved-near-match',
+          },
+        ],
+      });
+
+      const savedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' }).lean();
+      expect(savedMessage.content[0]).not.toHaveProperty(
+        'metadata.cortex_delivery_feeling_snapshot',
+      );
+      expect(JSON.stringify(savedMessage.content)).not.toContain(
+        'PRIVATE_SYNTHETIC_DOTTED_MODEL_CANARY',
+      );
+      expect(savedMessage.content[0]['metadata.cortex_delivery_feeling_snapshot_public']).toBe(
+        'preserved-near-match',
+      );
+      expect(savedMessage.content[0].text).toBe('Visible dotted-key content.');
+    });
+
     it('should throw an error for unauthenticated user', async () => {
       mockReq.user = null;
       await expect(saveMessage(mockReq, mockMessageData)).rejects.toThrow('User not authenticated');
     });
 
     it('should handle invalid conversation ID gracefully', async () => {
-      mockMessageData.conversationId = 'invalid-id';
-      const result = await saveMessage(mockReq, mockMessageData);
-      expect(result).toBeUndefined();
+      const infoSpy = jest.spyOn(logger, 'info').mockImplementation(() => {});
+      try {
+        mockMessageData.conversationId = 'invalid-id';
+        mockMessageData.content = privateFeelingContent('PRIVATE_SYNTHETIC_INVALID_ID_CANARY');
+        const result = await saveMessage(mockReq, mockMessageData);
+        expect(result).toBeUndefined();
+        expectPrivateFeelingAbsent(infoSpy.mock.calls, 'PRIVATE_SYNTHETIC_INVALID_ID_CANARY');
+      } finally {
+        infoSpy.mockRestore();
+      }
+    });
+
+    it('logs only bounded structural facts for an invalid conversation ID', async () => {
+      const infoSpy = jest.spyOn(logger, 'info').mockImplementation(() => {});
+      const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => {});
+      const invalidConversationId = 'invalid-owner@example.test-private-conversation';
+      const privateInsight = 'PRIVATE_SYNTHETIC_INVALID_ID_INSIGHT';
+      const privateCapsule = 'PRIVATE_SYNTHETIC_INVALID_ID_CAPSULE';
+      try {
+        await saveMessage(
+          mockReq,
+          {
+            ...mockMessageData,
+            conversationId: invalidConversationId,
+            text: privateInsight,
+            content: [
+              {
+                type: 'cortex_insight',
+                insight: privateInsight,
+                cortex_delivery_feeling_snapshot: { capsule: privateCapsule },
+              },
+            ],
+          },
+          { context: 'PRIVATE_SYNTHETIC_INVALID_CONTEXT' },
+        );
+
+        const diagnostics = JSON.stringify([...warnSpy.mock.calls, ...infoSpy.mock.calls]);
+        expect(diagnostics).toContain('invalid_conversation_id');
+        expect(diagnostics).not.toContain(invalidConversationId);
+        expect(diagnostics).not.toContain('owner@example.test');
+        expect(diagnostics).not.toContain(privateInsight);
+        expect(diagnostics).not.toContain(privateCapsule);
+        expect(diagnostics).not.toContain('PRIVATE_SYNTHETIC_INVALID_CONTEXT');
+        expect(diagnostics).not.toContain('cortex_insight');
+      } finally {
+        infoSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('strips private Feelings receipts from serializable non-plain content objects', async () => {
+      class SerializableContentPart {
+        constructor() {
+          this.type = 'text';
+          this.text = 'Visible class content.';
+          this.metadata = new Map([
+            ['keep', 'public'],
+            [PRIVATE_FEELING_FIELD, { capsule: 'PRIVATE_SYNTHETIC_NON_PLAIN_CANARY' }],
+          ]);
+        }
+      }
+
+      await saveMessage(mockReq, {
+        ...mockMessageData,
+        content: [new SerializableContentPart()],
+        isCreatedByUser: false,
+      });
+
+      const savedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' }).lean();
+      expectPrivateFeelingAbsent(savedMessage.content, 'PRIVATE_SYNTHETIC_NON_PLAIN_CANARY');
+      expect(savedMessage.content[0]).toMatchObject({
+        type: 'text',
+        text: 'Visible class content.',
+        metadata: { keep: 'public' },
+      });
+    });
+
+    it('does not trust a plain content object that spoofs BSON metadata', async () => {
+      await saveMessage(mockReq, {
+        ...mockMessageData,
+        content: [
+          {
+            _bsontype: 'ObjectId',
+            type: 'text',
+            text: 'Visible spoof-resistant content.',
+            [PRIVATE_FEELING_FIELD]: {
+              capsule: 'PRIVATE_SYNTHETIC_BSON_SPOOF_CANARY',
+            },
+          },
+        ],
+      });
+
+      const savedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' }).lean();
+      expectPrivateFeelingAbsent(savedMessage.content, 'PRIVATE_SYNTHETIC_BSON_SPOOF_CANARY');
+      expect(savedMessage.content[0].text).toBe('Visible spoof-resistant content.');
+    });
+
+    it('does not trust a custom content object that spoofs an ObjectId', async () => {
+      class ObjectIdSpoof {
+        constructor() {
+          this._bsontype = 'ObjectId';
+          this.type = 'text';
+          this.text = 'Visible custom-object content.';
+          this[PRIVATE_FEELING_FIELD] = {
+            capsule: 'PRIVATE_SYNTHETIC_CUSTOM_BSON_SPOOF_CANARY',
+          };
+        }
+
+        toHexString() {
+          return 'a'.repeat(24);
+        }
+      }
+
+      await saveMessage(mockReq, {
+        ...mockMessageData,
+        content: [new ObjectIdSpoof()],
+      });
+
+      const savedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' }).lean();
+      expectPrivateFeelingAbsent(
+        savedMessage.content,
+        'PRIVATE_SYNTHETIC_CUSTOM_BSON_SPOOF_CANARY',
+      );
+      expect(savedMessage.content[0].text).toBe('Visible custom-object content.');
+    });
+
+    it('preserves an authentic ObjectId in normal public content metadata', async () => {
+      const referenceId = new mongoose.Types.ObjectId();
+
+      await saveMessage(mockReq, {
+        ...mockMessageData,
+        content: [
+          {
+            type: 'text',
+            text: 'Visible ObjectId-backed content.',
+            metadata: { referenceId },
+          },
+        ],
+      });
+
+      const savedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' }).lean();
+      expect(savedMessage.content[0].metadata.referenceId).toBeInstanceOf(mongoose.Types.ObjectId);
+      expect(savedMessage.content[0].metadata.referenceId.toHexString()).toBe(
+        referenceId.toHexString(),
+      );
     });
 
     it('should mirror assistant visible content text into the legacy text field', async () => {
@@ -121,6 +350,43 @@ describe('Message Operations', () => {
 
       expect(savedMessage.text).toBe('Visible assistant answer.');
       expect(savedMessage.text).not.toContain('private reasoning');
+    });
+
+    it('should preserve structural boundaries between multiple visible assistant parts', async () => {
+      const result = await saveMessage(mockReq, {
+        messageId: 'assistant-parallel-content-text',
+        conversationId: uuidv4(),
+        text: 'Base answer.Added answer.',
+        isCreatedByUser: false,
+        content: [
+          { type: 'text', text: 'Base answer.', agentId: 'agent-main', groupId: 1 },
+          { type: 'text', text: 'Added answer.', agentId: 'agent-main____1', groupId: 1 },
+        ],
+      });
+
+      expect(result.text).toBe('Base answer.\n\nAdded answer.');
+
+      const savedMessage = await Message.findOne({
+        messageId: 'assistant-parallel-content-text',
+        user: 'user123',
+      }).lean();
+
+      expect(savedMessage.text).toBe('Base answer.\n\nAdded answer.');
+    });
+
+    it('should preserve an explicitly different sanitized text across multiple content parts', async () => {
+      const result = await saveMessage(mockReq, {
+        messageId: 'assistant-sanitized-multi-content-text',
+        conversationId: uuidv4(),
+        text: 'Sanitized visible answer.',
+        isCreatedByUser: false,
+        content: [
+          { type: 'text', text: '<voice>First raw part.</voice>' },
+          { type: 'text', text: '<voice>Second raw part.</voice>' },
+        ],
+      });
+
+      expect(result.text).toBe('Sanitized visible answer.');
     });
 
     it('should preserve existing assistant text when content text is only a placeholder', async () => {
@@ -197,6 +463,151 @@ describe('Message Operations', () => {
         userId: 'user123',
         conversationId: mockMessageData.conversationId,
       });
+    });
+
+    it('strips private Feelings receipts before structured content updates', async () => {
+      await saveMessage(mockReq, mockMessageData);
+      const content = privateFeelingContent('PRIVATE_SYNTHETIC_UPDATE_CANARY');
+
+      await updateMessage(mockReq, { messageId: 'msg123', content });
+
+      const updatedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' }).lean();
+      expectPrivateFeelingAbsent(updatedMessage.content, 'PRIVATE_SYNTHETIC_UPDATE_CANARY');
+      expect(updatedMessage.content[0].metadata.nested.keep).toBe('public');
+      expect(content[0].metadata.nested[PRIVATE_FEELING_FIELD].capsule).toBe(
+        'PRIVATE_SYNTHETIC_UPDATE_CANARY',
+      );
+    });
+
+    it('fails closed instead of replacing pending legacy recovery content', async () => {
+      const pendingContent = [
+        { type: 'text', text: 'Original visible text.' },
+        {
+          type: 'cortex_insight',
+          insight: 'PRIVATE_SYNTHETIC_PENDING_MODEL_INSIGHT',
+          cortex_delivery_acceptance: 'retryable',
+          cortex_delivery_surface: 'web',
+          cortex_delivery_stream_id: 'PRIVATE_SYNTHETIC_PENDING_MODEL_STREAM',
+          cortex_delivery_message_revision: 11,
+          cortex_graph_result_hash: 'f'.repeat(64),
+          [PRIVATE_FEELING_FIELD]: {
+            capsule: 'PRIVATE_SYNTHETIC_PENDING_MODEL_CAPSULE',
+            snapshotHash: 'a'.repeat(64),
+          },
+        },
+      ];
+      await Message.create({ ...mockMessageData, content: pendingContent });
+
+      await expect(
+        updateMessage(mockReq, {
+          messageId: 'msg123',
+          content: [{ type: 'text', text: 'Unrelated replacement.' }, pendingContent[1]],
+        }),
+      ).rejects.toMatchObject({
+        code: 'pending_cortex_recovery_full_content_update_forbidden',
+      });
+
+      const unchanged = await Message.findOne({ messageId: 'msg123', user: 'user123' }).lean();
+      expect(unchanged.content[0].text).toBe('Original visible text.');
+      expect(JSON.stringify(unchanged.content)).toContain(
+        'PRIVATE_SYNTHETIC_PENDING_MODEL_INSIGHT',
+      );
+      expect(JSON.stringify(unchanged.content)).toContain(
+        'PRIVATE_SYNTHETIC_PENDING_MODEL_CAPSULE',
+      );
+    });
+
+    it('strips private Feelings receipts from operator and dotted content updates', async () => {
+      await saveMessage(mockReq, {
+        ...mockMessageData,
+        content: [{ type: 'text', text: 'Original.' }],
+      });
+
+      await updateMessage(mockReq, {
+        messageId: 'msg123',
+        $set: {
+          'content.0.text': 'Updated through an operator.',
+          'content.0.metadata.keep': 'public',
+          [`content.0.metadata.${PRIVATE_FEELING_FIELD}`]: {
+            capsule: 'PRIVATE_SYNTHETIC_OPERATOR_CANARY',
+          },
+        },
+      });
+
+      const updatedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' }).lean();
+      expectPrivateFeelingAbsent(updatedMessage.content, 'PRIVATE_SYNTHETIC_OPERATOR_CANARY');
+      expect(updatedMessage.content[0]).toMatchObject({
+        text: 'Updated through an operator.',
+        metadata: { keep: 'public' },
+      });
+    });
+
+    it('strips private Feelings receipts from null-prototype operator payloads', async () => {
+      await saveMessage(mockReq, {
+        ...mockMessageData,
+        content: [{ type: 'text', text: 'Original null-prototype content.' }],
+      });
+      const operatorPayload = Object.create(null);
+      operatorPayload['content.0.text'] = 'Updated safely.';
+      operatorPayload[`content.0.metadata.${PRIVATE_FEELING_FIELD}`] = {
+        capsule: 'PRIVATE_SYNTHETIC_NULL_PROTOTYPE_CANARY',
+      };
+
+      await updateMessage(mockReq, { messageId: 'msg123', $set: operatorPayload });
+
+      const updatedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' }).lean();
+      expectPrivateFeelingAbsent(updatedMessage.content, 'PRIVATE_SYNTHETIC_NULL_PROTOTYPE_CANARY');
+      expect(updatedMessage.content[0].text).toBe('Updated safely.');
+    });
+
+    it('allows an operator update to remove a legacy private Feelings receipt', async () => {
+      await Message.create({
+        ...mockMessageData,
+        content: [
+          {
+            type: 'text',
+            text: 'Legacy visible text.',
+            metadata: {
+              [PRIVATE_FEELING_FIELD]: {
+                capsule: 'PRIVATE_SYNTHETIC_LEGACY_CLEANUP_CANARY',
+              },
+            },
+          },
+        ],
+      });
+
+      await updateMessage(mockReq, {
+        messageId: 'msg123',
+        $unset: { [`content.0.metadata.${PRIVATE_FEELING_FIELD}`]: 1 },
+      });
+
+      const updatedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' }).lean();
+      expectPrivateFeelingAbsent(updatedMessage.content, 'PRIVATE_SYNTHETIC_LEGACY_CLEANUP_CANARY');
+      expect(updatedMessage.content[0].text).toBe('Legacy visible text.');
+    });
+
+    it('blocks operator renames that would create or move a private Feelings field', async () => {
+      await saveMessage(mockReq, {
+        ...mockMessageData,
+        content: [
+          {
+            type: 'text',
+            text: 'Visible rename-safe text.',
+            metadata: { publicValue: 'preserved' },
+          },
+        ],
+      });
+
+      await updateMessage(mockReq, {
+        messageId: 'msg123',
+        $rename: {
+          'content.0.metadata.publicValue': `content.0.metadata.${PRIVATE_FEELING_FIELD}`,
+        },
+      });
+
+      const updatedMessage = await Message.findOne({ messageId: 'msg123', user: 'user123' }).lean();
+      expect(updatedMessage.content[0].metadata.publicValue).toBe('preserved');
+      expect(JSON.stringify(updatedMessage.content)).not.toContain(PRIVATE_FEELING_FIELD);
     });
 
     it('can override immutable timestamps for callback anchor repair', async () => {
@@ -311,6 +722,71 @@ describe('Message Operations', () => {
     });
   });
 
+  /* === VIVENTIUM START ===
+   * Feature: Bounded GlassHive conversation-context projection.
+   * Purpose: Prove delegation preparation follows one indexed ancestor branch instead of loading
+   * and sorting an entire large conversation in application memory.
+   * === VIVENTIUM END === */
+  describe('getMessageAncestorBranch', () => {
+    it('uses one bounded graph query and ignores a large unrelated branch', async () => {
+      const conversationId = uuidv4();
+      const branch = Array.from({ length: 48 }, (_, index) => ({
+        user: 'user123',
+        conversationId,
+        messageId: `relevant-${index}`,
+        parentMessageId: index > 0 ? `relevant-${index - 1}` : 'root',
+        text: `Relevant ${index}`,
+        isCreatedByUser: index % 2 === 0,
+      }));
+      const unrelated = Array.from({ length: 2000 }, (_, index) => ({
+        user: 'user123',
+        conversationId,
+        messageId: `unrelated-${index}`,
+        parentMessageId: 'root',
+        text: `Unrelated ${index}`,
+        isCreatedByUser: index % 2 === 0,
+      }));
+      await Message.insertMany([...branch, ...unrelated]);
+
+      const startedAt = performance.now();
+      const messages = await getMessageAncestorBranch({
+        user: 'user123',
+        conversationId,
+        messageId: 'relevant-47',
+        maxAncestors: 32,
+      });
+      const elapsedMs = performance.now() - startedAt;
+      const pipeline = buildMessageAncestorBranchPipeline({
+        user: 'user123',
+        conversationId,
+        messageId: 'relevant-47',
+        maxAncestors: 32,
+      });
+
+      expect(pipeline[0]).toEqual({
+        $match: { user: 'user123', conversationId, messageId: 'relevant-47' },
+      });
+      expect(pipeline).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ $sort: expect.anything() })]),
+      );
+      expect(pipeline.find((stage) => stage.$graphLookup)?.$graphLookup).toEqual(
+        expect.objectContaining({
+          from: Message.collection.name,
+          connectFromField: 'parentMessageId',
+          connectToField: 'messageId',
+          maxDepth: 31,
+          restrictSearchWithMatch: { user: 'user123', conversationId },
+        }),
+      );
+      expect(messages).toHaveLength(33);
+      expect(messages.map((message) => message.messageId)).toEqual(
+        Array.from({ length: 33 }, (_, index) => `relevant-${47 - index}`),
+      );
+      expect(messages.some((message) => message.messageId.startsWith('unrelated-'))).toBe(false);
+      expect(elapsedMs).toBeLessThan(1000);
+    });
+  });
+
   describe('recordMessage', () => {
     it('schedules conversation recall sync for direct recordMessage writes', async () => {
       const conversationId = uuidv4();
@@ -330,9 +806,72 @@ describe('Message Operations', () => {
         conversationId,
       });
     });
+
+    it('strips private Feelings receipts before direct record writes', async () => {
+      const conversationId = uuidv4();
+      const content = privateFeelingContent('PRIVATE_SYNTHETIC_RECORD_CANARY');
+
+      await recordMessage({
+        user: 'user123',
+        endpoint: 'agents',
+        messageId: 'recorded-private-receipt',
+        conversationId,
+        content,
+        isCreatedByUser: false,
+      });
+
+      const savedMessage = await Message.findOne({
+        messageId: 'recorded-private-receipt',
+        user: 'user123',
+      }).lean();
+      expectPrivateFeelingAbsent(savedMessage.content, 'PRIVATE_SYNTHETIC_RECORD_CANARY');
+      expect(savedMessage.content[0].metadata.publicLabel).toBe('preserved');
+      expect(content[0].metadata.nested[PRIVATE_FEELING_FIELD]).toBeDefined();
+    });
   });
 
   describe('getLatestRecallEligibleMessageCreatedAt', () => {
+    it('excludes the current live user turn from vector-corpus freshness', async () => {
+      await Message.create([
+        {
+          user: 'user123',
+          messageId: 'previous-user-turn',
+          conversationId: 'freshness-conversation',
+          isCreatedByUser: true,
+          text: 'Earlier accepted context.',
+          createdAt: new Date('2026-04-09T16:25:23.880Z'),
+          updatedAt: new Date('2026-04-09T16:25:23.880Z'),
+        },
+        {
+          user: 'user123',
+          messageId: 'current-user-turn',
+          conversationId: 'freshness-conversation',
+          isCreatedByUser: true,
+          text: 'Current live question already present in the foreground transcript.',
+          createdAt: new Date('2026-04-09T17:26:43.153Z'),
+          updatedAt: new Date('2026-04-09T17:26:43.153Z'),
+        },
+        {
+          user: 'user123',
+          messageId: 'current-assistant-turn',
+          parentMessageId: 'current-user-turn',
+          conversationId: 'freshness-conversation',
+          isCreatedByUser: false,
+          text: 'An in-flight response that is not part of the prior recall corpus yet.',
+          createdAt: new Date('2026-04-09T17:26:44.153Z'),
+          updatedAt: new Date('2026-04-09T17:26:44.153Z'),
+        },
+      ]);
+
+      const result = await getLatestRecallEligibleMessageCreatedAt({
+        user: 'user123',
+        excludeMessageId: 'current-user-turn',
+        excludeParentMessageId: 'current-user-turn',
+      });
+
+      expect(new Date(result).toISOString()).toBe('2026-04-09T16:25:23.880Z');
+    });
+
     it('skips assistant recall-echo replies when computing freshness eligibility', async () => {
       await Message.create([
         {
@@ -804,6 +1343,26 @@ describe('Message Operations', () => {
 
       expect(bulk1.expiredAt).toBeDefined();
       expect(bulk2.expiredAt).toBeNull();
+    });
+
+    it('strips private Feelings receipts from bulk message writes', async () => {
+      const content = privateFeelingContent('PRIVATE_SYNTHETIC_BULK_CANARY');
+      const messages = [
+        {
+          messageId: 'bulk-private-receipt',
+          conversationId: uuidv4(),
+          text: 'Visible public text.',
+          content,
+          user: 'user123',
+        },
+      ];
+
+      await bulkSaveMessages(messages);
+
+      const savedMessage = await Message.findOne({ messageId: 'bulk-private-receipt' }).lean();
+      expectPrivateFeelingAbsent(savedMessage.content, 'PRIVATE_SYNTHETIC_BULK_CANARY');
+      expect(savedMessage.content[0].metadata.nested.keep).toBe('public');
+      expect(messages[0].content[0].metadata.nested[PRIVATE_FEELING_FIELD]).toBeDefined();
     });
   });
 

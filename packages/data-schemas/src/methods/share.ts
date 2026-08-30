@@ -41,6 +41,67 @@ function anonymizeConvo(conversation: Partial<t.IConversation> & Partial<t.IShar
   return newConvo;
 }
 
+const PRIVATE_MESSAGE_CONTENT_FIELD = 'cortex_delivery_feeling_snapshot';
+const PRIVATE_CORTEX_DELIVERY_FIELDS = new Set([
+  'cortex_delivery_acceptance',
+  'cortex_delivery_surface',
+  'cortex_delivery_stream_id',
+  'cortex_delivery_message_revision',
+  'cortex_graph_result_hash',
+]);
+const hasPrivateMessageContentPathSegment = (key: string) =>
+  key.split('.').includes(PRIVATE_MESSAGE_CONTENT_FIELD);
+
+function sanitizePublicMessageContent(value: unknown, ancestors = new WeakSet<object>()): unknown {
+  if (value == null || typeof value !== 'object') return value;
+  if (ancestors.has(value)) return undefined;
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.map((entry) => sanitizePublicMessageContent(entry, ancestors));
+    }
+
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      const toJSON = (value as { toJSON?: () => unknown }).toJSON;
+      if (typeof toJSON !== 'function') return undefined;
+      return sanitizePublicMessageContent(toJSON.call(value), ancestors);
+    }
+
+    const publicValue: Record<string, unknown> = {};
+    const isUnacceptedCortexPart =
+      (value as Record<string, unknown>).cortex_delivery_acceptance === 'retryable';
+    for (const key of Object.keys(value)) {
+      if (
+        hasPrivateMessageContentPathSegment(key) ||
+        PRIVATE_CORTEX_DELIVERY_FIELDS.has(key) ||
+        (isUnacceptedCortexPart && key === 'insight')
+      ) {
+        continue;
+      }
+      try {
+        const nestedValue = sanitizePublicMessageContent(
+          (value as Record<string, unknown>)[key],
+          ancestors,
+        );
+        if (nestedValue !== undefined) publicValue[key] = nestedValue;
+      } catch {
+        continue;
+      }
+    }
+    return publicValue;
+  } catch {
+    return undefined;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function publicMessageContent(content: t.IMessage['content']): t.IMessage['content'] {
+  return sanitizePublicMessageContent(content) as t.IMessage['content'];
+}
+
 function anonymizeMessages(messages: t.IMessage[], newConvoId: string): t.IMessage[] {
   if (!Array.isArray(messages)) {
     return [];
@@ -78,6 +139,7 @@ function anonymizeMessages(messages: t.IMessage[], newConvoId: string): t.IMessa
         ? anonymizeAssistantId(message.model)
         : message.model,
       attachments: anonymizedAttachments,
+      content: publicMessageContent(message.content),
     } as t.IMessage;
   });
 }

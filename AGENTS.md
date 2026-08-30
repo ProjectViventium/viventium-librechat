@@ -17,35 +17,43 @@ The source code for `@librechat/agents` is managed as a separate local component
 
 ---
 
-## Viventium QA Overlay
+## Viventium Integration Overlay
 
-- Follow the root Viventium `AGENTS.md` and `qa/README.md` before claiming user-visible completion.
-- Jest and mocked hook tests are focused supporting evidence, not acceptance for browser-visible
-  behavior.
-- Browser-visible behavior requires a real browser/user-path pass: user action, visible result,
-  expanded/detail state when relevant, refresh or persistence check when relevant, backend/log/DB
-  confirmation, and final wording that does not contradict the UI.
-- Full-view evidence must tie feature -> requirement -> use case -> QA case -> expected result ->
-  actual evidence -> remaining gap. Inspect owning code, docs and nested docs, scripts/harnesses,
-  logs, DB/state/persistence, generated or shipped artifacts, parent pins, and installed/runtime
-  artifacts when those surfaces apply.
-- Start from the full Viventium feature inventory and natural user use cases, not from a single UI
-  symptom. Use the root `docs/requirements_and_learnings/45_Runtime_Feature_QA_Map.md`,
-  `qa/feature-user-use-case-checklist.md`, and the owning `qa/<feature>/cases.md` to enumerate happy
-  path, first-run/empty state, missing auth/config, degraded dependency, retry/recovery,
-  interruption/cancel/update, persistence/reload/restart, cross-surface parity, generated/shipped
-  artifact verification, and public/private safety.
-- Treat that list as a checklist. Every applicable item must be exercised like a user on the real
-  surface and marked `PASS`, `FAIL`, `BLOCKED`, or `PARTIAL` with evidence.
-- If the real user path cannot be run, mark the result `BLOCKED` or `PARTIAL`. Supporting evidence
-  cannot replace required user-path evidence.
-- For Web Search, never collapse provider failures into no-results wording. Classify provider
-  unavailable, timeout, rate limit, auth/config missing, request rejected, unsupported configuration,
-  and missing local Docker-backed prerequisites separately, then use browser/computer/local
-  delegation fallback for named-entity/contact/date/current-fact lookups when available.
-- For GlassHive/local-delegation tool results, do not force or quote canned acknowledgement text.
-  Preserve the user's exact target and success condition, inspect the returned delegation audit when
-  present, and keep worker/run/project plumbing hidden unless diagnostics were requested.
+- This is a separate git and instruction root. When this checkout lives under Viventium and
+  `../../AGENTS.md` exists, read it before Viventium-specific work; it owns shared scope, safety,
+  delivery, and QA rules. Do not duplicate those rules here.
+- Wrap Viventium changes to upstream code with `VIVENTIUM START` / `VIVENTIUM END` and a short
+  rationale. Keep the fork diff small and upstream-mergeable.
+- A source change here is not shipped until this component commit, the parent
+  `components.lock.json` pin, compiled/prebuilt artifacts, and installed/runtime artifacts agree
+  where applicable.
+- For browser-visible Viventium behavior, Jest and mocked hooks are supporting evidence; follow the
+  parent real-browser acceptance contract.
+
+### Agent Sync Safety
+
+- Before any user-level agent push, run
+  `scripts/viventium-sync-agents.js compare --env=<env>` and inspect:
+  - A: current live user-level agent config
+  - B: tracked source-of-truth bundle
+  - C: current repo/source-of-truth edits not reflected in live
+- Treat live user edits to instructions, conversation starters, tools, model/provider, and
+  background cortex config as protected state. Present material A/B/C drift before applying it.
+- Dry-run first and use the narrowest mode. For prompt changes, use `--prompts-only`.
+- If capability availability changed, inspect adjacent runtime/scaffold config such as
+  `viventium/source_of_truth/<env>.librechat.yaml`; `interface.webSearch` can disable behavior even
+  when the agent tool remains configured.
+- Non-dry-run pushes fail closed while reviewed drift remains. Use `--compare-reviewed` only after
+  the drift was presented and intentionally accepted.
+- After sync, verify that the target runtime reloaded the intended data.
+
+### GlassHive Host Brokerage
+
+- Host-side orchestration here applies the parent faithful-courier contract. Preserve the user's
+  target and success condition; pass factual files, capabilities, and tool results without choosing
+  the worker's provider, account, tool, artifact, rubric, or workflow.
+- Keep acknowledgements in the host's own voice. Let observable worker callbacks carry progress and
+  results; do not expose internal worker, run, or project plumbing unless diagnostics were requested.
 
 ---
 

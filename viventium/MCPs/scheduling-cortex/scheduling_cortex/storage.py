@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -251,6 +252,41 @@ class ScheduleStorage:
             """
         )
         self._ensure_scheduled_prompt_run_columns(conn)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_terminal_callback_results (
+              owner_id TEXT NOT NULL,
+              work_id TEXT NOT NULL,
+              callback_id TEXT NOT NULL,
+              result_revision INTEGER NOT NULL,
+              result_digest TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              effect_state TEXT NOT NULL CHECK (
+                effect_state IN ('pending', 'applying', 'committed')
+              ),
+              effect_lease_token TEXT NOT NULL DEFAULT '',
+              effect_lease_until TEXT,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (owner_id, work_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_terminal_callback_attempts (
+              attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              owner_id TEXT NOT NULL,
+              work_id TEXT NOT NULL,
+              callback_id TEXT NOT NULL,
+              result_revision INTEGER NOT NULL,
+              result_digest TEXT NOT NULL,
+              status TEXT NOT NULL,
+              current_result_revision INTEGER NOT NULL,
+              current_result_digest TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )
+            """
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scheduled_prompt_definitions_user ON scheduled_prompt_definitions(user_id)"
         )
@@ -1386,6 +1422,429 @@ class ScheduleStorage:
         self._sync_to_mirror()
         return self.get_scheduled_prompt_run(run_id)
 
+    def update_scheduled_prompt_run_if_current(
+        self,
+        run_id: str,
+        updates: Dict[str, Any],
+        *,
+        expected_status: str,
+        expected_error_class: Optional[str],
+    ) -> Dict[str, Any]:
+        payload = dict(updates)
+        if "execution_snapshot" in payload:
+            payload["execution_snapshot_json"] = self._json_or_none(
+                payload.pop("execution_snapshot")
+            )
+        if "channel_outcomes" in payload:
+            payload["channel_outcomes_json"] = self._json_or_none(
+                payload.pop("channel_outcomes")
+            )
+        if str(payload.get("status") or "") in {
+            "completed",
+            "failed",
+            "cancelled",
+            "missed",
+        }:
+            payload["lease_owner"] = None
+            payload["lease_until"] = None
+        updated = False
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            current_matches = bool(
+                current is not None
+                and str(current["status"] or "") == str(expected_status or "")
+                and current["error_class"] == expected_error_class
+            )
+            if current_matches and payload:
+                assignments = ", ".join(f"{key} = ?" for key in payload)
+                conn.execute(
+                    f"UPDATE scheduled_prompt_runs SET {assignments} WHERE run_id = ?",
+                    list(payload.values()) + [run_id],
+                )
+                updated = True
+            row = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            conn.execute("COMMIT")
+        if updated:
+            self._sync_to_mirror()
+        return {"updated": updated, "run": self._row_to_scheduled_prompt_run(row)}
+
+    @staticmethod
+    def _parse_terminal_instant(value: Any) -> Optional[datetime]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _scheduled_terminal_callback_identity(
+        *,
+        owner_id: str,
+        work_id: str,
+        payload: Dict[str, Any],
+        callback_contract: str,
+    ) -> Dict[str, Any]:
+        clean_owner = str(owner_id or "").strip()
+        clean_work = str(work_id or "").strip()
+        if (
+            not clean_owner
+            or not clean_work
+            or len(clean_owner) > 512
+            or len(clean_work) > 512
+            or any(ord(character) < 33 for character in clean_owner + clean_work)
+            or not isinstance(payload, dict)
+        ):
+            raise ValueError("Terminal callback owner/work scope is invalid")
+        if callback_contract == "glasshive_terminal_result_v1":
+            supplied_owner = str(payload.get("user_id") or "").strip()
+            occurrence_key = str(payload.get("occurrence_key") or "").strip()
+            callback_id = str(payload.get("callback_id") or "").strip()
+            result_digest = str(payload.get("result_digest") or "").strip()
+            result_revision = payload.get("result_revision")
+            if (
+                str(payload.get("callback_contract") or "").strip() != callback_contract
+                or supplied_owner != clean_owner
+                or not occurrence_key
+                or re.fullmatch(r"cb_terminal_[0-9a-f]{64}", callback_id) is None
+                or not isinstance(result_revision, int)
+                or isinstance(result_revision, bool)
+                or not 1 <= result_revision <= 9_223_372_036_854_775_807
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", result_digest) is None
+            ):
+                raise ValueError("Terminal callback result identity is invalid")
+        else:
+            supplied_owner = str(payload.get("user_id") or "").strip()
+            supplied_message_id = str(payload.get("message_id") or "").strip()
+            supplied_run_id = str(payload.get("scheduled_prompt_run_id") or "").strip()
+            supplied_work = supplied_run_id or supplied_message_id
+            event = str(payload.get("event") or "").strip()
+            result_state = str(payload.get("result_state") or "").strip()
+            expected_state = {
+                "run.completed": "completed",
+                "run.failed": "failed",
+                "run.cancelled": "cancelled",
+                "run.interrupted": "cancelled",
+            }.get(event)
+            callback_id = str(payload.get("callback_id") or "").strip()
+            run_id = str(payload.get("run_id") or "").strip()
+            ended_at = str(payload.get("result_ended_at") or "").strip()
+            result_digest = str(payload.get("result_digest") or "").strip()
+            result_revision = payload.get("result_revision")
+            attempt_value = payload.get("attempt_number")
+            attempt_number = 0 if attempt_value is None else attempt_value
+            valid_attempt = (
+                attempt_number == 0
+                or isinstance(attempt_number, int)
+                and not isinstance(attempt_number, bool)
+                and 1 <= attempt_number <= 9_223_372_036_854_775_807
+            )
+            if (
+                supplied_owner != clean_owner
+                or supplied_work != clean_work
+                or supplied_message_id and supplied_message_id != clean_work
+                or supplied_run_id and supplied_run_id != clean_work
+                or expected_state is None
+                or result_state != expected_state
+                or not run_id
+                or not ended_at
+                or not valid_attempt
+                or not isinstance(result_revision, int)
+                or isinstance(result_revision, bool)
+                or not 1 <= result_revision <= 9_223_372_036_854_775_807
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", result_digest) is None
+            ):
+                raise ValueError("Terminal callback result identity is invalid")
+            material = ":".join(
+                (
+                    run_id,
+                    result_state,
+                    ended_at,
+                    str(attempt_number),
+                    str(result_revision),
+                    result_digest,
+                )
+            )
+            expected_callback_id = "cb_terminal_" + hashlib.sha256(
+                material.encode("utf-8")
+            ).hexdigest()
+            if callback_id != expected_callback_id:
+                raise ValueError("Terminal callback result identity is invalid")
+        return {
+            "owner_id": clean_owner,
+            "work_id": clean_work,
+            "callback_id": callback_id,
+            "result_revision": result_revision,
+            "result_digest": result_digest,
+            "payload_json": json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+        }
+
+    def accept_scheduled_terminal_callback_result(
+        self,
+        *,
+        owner_id: str,
+        work_id: str,
+        payload: Dict[str, Any],
+        callback_contract: str = "",
+    ) -> Dict[str, Any]:
+        identity = self._scheduled_terminal_callback_identity(
+            owner_id=owner_id,
+            work_id=work_id,
+            payload=payload,
+            callback_contract=str(callback_contract or "").strip(),
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT * FROM scheduled_terminal_callback_results WHERE owner_id = ? AND work_id = ?",
+                (identity["owner_id"], identity["work_id"]),
+            ).fetchone()
+            current_revision = int(current["result_revision"] or 0) if current else 0
+            lease_until = (
+                self._parse_terminal_instant(current["effect_lease_until"])
+                if current
+                else None
+            )
+            effects_in_progress = bool(
+                current
+                and str(current["effect_state"] or "") == "applying"
+                and lease_until is not None
+                and lease_until > datetime.now(timezone.utc)
+            )
+            if current and identity["result_revision"] > current_revision and effects_in_progress:
+                status = "effects_in_progress"
+            elif current is None or identity["result_revision"] > current_revision:
+                status = "accepted"
+                conn.execute(
+                    """
+                    INSERT INTO scheduled_terminal_callback_results (
+                      owner_id, work_id, callback_id, result_revision, result_digest,
+                      payload_json, effect_state, effect_lease_token, effect_lease_until, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?)
+                    ON CONFLICT(owner_id, work_id) DO UPDATE SET
+                      callback_id = excluded.callback_id,
+                      result_revision = excluded.result_revision,
+                      result_digest = excluded.result_digest,
+                      payload_json = excluded.payload_json,
+                      effect_state = 'pending', effect_lease_token = '',
+                      effect_lease_until = NULL, updated_at = excluded.updated_at
+                    WHERE excluded.result_revision > scheduled_terminal_callback_results.result_revision
+                    """,
+                    (
+                        identity["owner_id"], identity["work_id"], identity["callback_id"],
+                        identity["result_revision"], identity["result_digest"],
+                        identity["payload_json"], now,
+                    ),
+                )
+            elif identity["result_revision"] < current_revision:
+                status = "superseded"
+            elif (
+                identity["callback_id"] != str(current["callback_id"] or "")
+                or identity["result_digest"] != str(current["result_digest"] or "")
+            ):
+                status = "conflict"
+            elif str(current["effect_state"] or "") == "committed":
+                status = "idempotent"
+            else:
+                status = "replay_pending"
+            current = conn.execute(
+                "SELECT * FROM scheduled_terminal_callback_results WHERE owner_id = ? AND work_id = ?",
+                (identity["owner_id"], identity["work_id"]),
+            ).fetchone()
+            if current is None:
+                conn.execute("ROLLBACK")
+                raise RuntimeError("Terminal callback receiver CAS did not persist")
+            current_revision = int(current["result_revision"] or 0)
+            current_digest = str(current["result_digest"] or "")
+            conn.execute(
+                """
+                INSERT INTO scheduled_terminal_callback_attempts (
+                  owner_id, work_id, callback_id, result_revision, result_digest,
+                  status, current_result_revision, current_result_digest, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    identity["owner_id"], identity["work_id"], identity["callback_id"],
+                    identity["result_revision"], identity["result_digest"], status,
+                    current_revision, current_digest, now,
+                ),
+            )
+            conn.execute("COMMIT")
+        self._sync_to_mirror()
+        return {
+            "http_status": 425 if status == "effects_in_progress" else 200
+            if status in {"accepted", "idempotent", "replay_pending"} else 409,
+            "callback_status": status,
+            "callback_id": identity["callback_id"],
+            "result_revision": identity["result_revision"],
+            "result_digest": identity["result_digest"],
+            "current_result_revision": current_revision,
+            "current_result_digest": current_digest,
+            "current_callback_id": str(current["callback_id"] or ""),
+        }
+
+    def claim_scheduled_terminal_callback_effect(
+        self,
+        *,
+        owner_id: str,
+        work_id: str,
+        result_revision: int,
+        result_digest: str,
+        lease_seconds: int = 60,
+    ) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        lease_until = (now + timedelta(seconds=max(1, lease_seconds))).isoformat()
+        lease_token = "receiver_" + uuid.uuid4().hex
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM scheduled_terminal_callback_results WHERE owner_id = ? AND work_id = ?",
+                (str(owner_id), str(work_id)),
+            ).fetchone()
+            current_lease_until = (
+                self._parse_terminal_instant(row["effect_lease_until"]) if row else None
+            )
+            lease_expired = bool(
+                row and str(row["effect_state"] or "") == "applying"
+                and (current_lease_until is None or current_lease_until <= now)
+            )
+            exact = bool(
+                row and int(row["result_revision"] or 0) == result_revision
+                and str(row["result_digest"] or "") == str(result_digest)
+            )
+            claimed = False
+            if exact and (str(row["effect_state"] or "") == "pending" or lease_expired):
+                cursor = conn.execute(
+                    """
+                    UPDATE scheduled_terminal_callback_results
+                    SET effect_state = 'applying', effect_lease_token = ?,
+                        effect_lease_until = ?, updated_at = ?
+                    WHERE owner_id = ? AND work_id = ? AND result_revision = ?
+                      AND result_digest = ? AND effect_state != 'committed'
+                    """,
+                    (lease_token, lease_until, now.isoformat(), str(owner_id), str(work_id),
+                     result_revision, str(result_digest)),
+                )
+                claimed = cursor.rowcount == 1
+            conn.execute("COMMIT")
+        if claimed:
+            self._sync_to_mirror()
+        return {"claimed": claimed, "lease_token": lease_token if claimed else ""}
+
+    def scheduled_terminal_callback_effect_is_current(
+        self,
+        *,
+        owner_id: str,
+        work_id: str,
+        result_revision: int,
+        result_digest: str,
+        lease_token: str,
+    ) -> bool:
+        now = datetime.now(timezone.utc)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduled_terminal_callback_results WHERE owner_id = ? AND work_id = ?",
+                (str(owner_id), str(work_id)),
+            ).fetchone()
+        lease_until = self._parse_terminal_instant(row["effect_lease_until"]) if row else None
+        return bool(
+            row and int(row["result_revision"] or 0) == result_revision
+            and str(row["result_digest"] or "") == str(result_digest)
+            and str(row["effect_state"] or "") == "applying"
+            and hmac.compare_digest(str(row["effect_lease_token"] or ""), str(lease_token or ""))
+            and lease_until is not None and lease_until > now
+        )
+
+    def complete_scheduled_terminal_callback_effect(
+        self,
+        *,
+        owner_id: str,
+        work_id: str,
+        result_revision: int,
+        result_digest: str,
+        lease_token: str,
+    ) -> bool:
+        now_value = datetime.now(timezone.utc)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM scheduled_terminal_callback_results WHERE owner_id = ? AND work_id = ?",
+                (str(owner_id), str(work_id)),
+            ).fetchone()
+            lease_until = self._parse_terminal_instant(row["effect_lease_until"]) if row else None
+            exact = bool(
+                row and int(row["result_revision"] or 0) == result_revision
+                and str(row["result_digest"] or "") == str(result_digest)
+                and str(row["effect_state"] or "") == "applying"
+                and hmac.compare_digest(str(row["effect_lease_token"] or ""), str(lease_token or ""))
+                and lease_until is not None and lease_until > now_value
+            )
+            cursor = conn.execute(
+                """
+                UPDATE scheduled_terminal_callback_results
+                SET effect_state = 'committed', effect_lease_token = '',
+                    effect_lease_until = NULL, updated_at = ?
+                WHERE owner_id = ? AND work_id = ? AND result_revision = ?
+                  AND result_digest = ? AND effect_state = 'applying' AND effect_lease_token = ?
+                """,
+                (now_value.isoformat(), str(owner_id), str(work_id), result_revision,
+                 str(result_digest), str(lease_token)),
+            ) if exact else None
+            conn.execute("COMMIT")
+        changed = bool(cursor is not None and cursor.rowcount == 1)
+        if changed:
+            self._sync_to_mirror()
+        return changed
+
+    def release_scheduled_terminal_callback_effect(
+        self,
+        *,
+        owner_id: str,
+        work_id: str,
+        result_revision: int,
+        result_digest: str,
+        lease_token: str,
+    ) -> bool:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE scheduled_terminal_callback_results
+                SET effect_state = 'pending', effect_lease_token = '',
+                    effect_lease_until = NULL, updated_at = ?
+                WHERE owner_id = ? AND work_id = ? AND result_revision = ?
+                  AND result_digest = ? AND effect_state = 'applying' AND effect_lease_token = ?
+                """,
+                (datetime.now(timezone.utc).isoformat(), str(owner_id), str(work_id),
+                 result_revision, str(result_digest), str(lease_token)),
+            )
+            conn.execute("COMMIT")
+        if cursor.rowcount:
+            self._sync_to_mirror()
+        return cursor.rowcount == 1
+
+    def get_scheduled_terminal_callback_result(
+        self, *, owner_id: str, work_id: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduled_terminal_callback_results WHERE owner_id = ? AND work_id = ?",
+                (str(owner_id), str(work_id)),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def link_scheduled_prompt_glasshive_run(
         self,
         run_id: str,
@@ -1436,6 +1895,16 @@ class ScheduleStorage:
             row = conn.execute(
                 "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
                 (run_id,),
+            ).fetchone()
+        return self._row_to_scheduled_prompt_run(row)
+
+    def get_scheduled_prompt_run_by_occurrence_key(
+        self, occurrence_key: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE occurrence_key = ?",
+                (occurrence_key,),
             ).fetchone()
         return self._row_to_scheduled_prompt_run(row)
 

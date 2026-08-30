@@ -8,14 +8,62 @@
  * === VIVENTIUM END === */
 
 const crypto = require('crypto');
-const { logger } = require('@librechat/data-schemas');
-const { ViventiumGlassHiveCallbackDelivery } = require('~/db/models');
+const { createGlassHiveCallbackDeliveryDispatchService } = require('@librechat/api');
+const {
+  acquireGlassHiveTerminalCallbackAcceptedOperationEffectLease,
+  fenceGlassHiveTerminalCallbackEffectTransaction,
+  logger,
+  releaseGlassHiveTerminalCallbackEffectLease,
+  renewGlassHiveTerminalCallbackEffectLease,
+} = require('@librechat/data-schemas');
+const {
+  GlassHiveTerminalCallbackResult,
+  ViventiumGlassHiveCallbackDelivery,
+} = require('~/db/models');
+const {
+  runGlassHiveTerminalCallbackTransaction,
+} = require('./GlassHiveTerminalCallbackTransaction');
 
 const DELIVERY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_LEASE_MS = 10 * 60 * 1000;
 const DEFAULT_LIMIT = 10;
 const DEFAULT_MAX_RETRIES = 8;
 const MAX_LAST_ERROR_LENGTH = 2000;
+
+const callbackDeliveryDispatch = createGlassHiveCallbackDeliveryDispatchService({
+  DeliveryModel: ViventiumGlassHiveCallbackDelivery,
+  resultExists: async (filter) => Boolean(await GlassHiveTerminalCallbackResult.exists(filter)),
+  acquireEffectLease: ({ reference, now, leaseDurationMs, session }) =>
+    acquireGlassHiveTerminalCallbackAcceptedOperationEffectLease({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      reference,
+      now,
+      leaseDurationMs,
+      session,
+    }),
+  renewEffectLease: ({ lease, now, leaseDurationMs, session }) =>
+    renewGlassHiveTerminalCallbackEffectLease({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      lease,
+      now,
+      leaseDurationMs,
+      session,
+    }),
+  fenceEffectTransaction: ({ lease, now, session }) =>
+    fenceGlassHiveTerminalCallbackEffectTransaction({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      lease,
+      now,
+      session,
+    }),
+  releaseEffectLease: ({ lease, session }) =>
+    releaseGlassHiveTerminalCallbackEffectLease({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      lease,
+      session,
+    }),
+  runTransaction: runGlassHiveTerminalCallbackTransaction,
+});
 
 function nowDate() {
   return new Date();
@@ -38,12 +86,22 @@ function deliveryIdFor(deliveryKey) {
   return `ghcd_${digest}`;
 }
 
-function deliveryKeyFor({ surface, callbackId, callbackKey, callbackMessageId, event }) {
+function deliveryKeyFor({
+  ownerId = '',
+  originRef = '',
+  surface,
+  callbackId,
+  callbackKey,
+  callbackMessageId,
+  event,
+}) {
   const stableId =
     normalizeText(callbackId) ||
     normalizeText(callbackKey) ||
     `${normalizeText(callbackMessageId)}:${normalizeText(event)}`;
-  return `${normalizeText(surface)}:${stableId}`;
+  return [normalizeText(ownerId), normalizeText(originRef), normalizeText(surface), stableId]
+    .filter(Boolean)
+    .join(':');
 }
 
 function retryDelayMs(retryCount) {
@@ -92,29 +150,103 @@ function shouldEnqueueSurface(body = {}) {
   return false;
 }
 
-async function enqueueGlassHiveCallbackDelivery({ body, message, text, fullText }) {
-  const surface = surfaceFromBody(body);
-  if (!message || !shouldEnqueueSurface(body)) {
-    return null;
+function externalDestinations(body = {}, deliveryContext = {}) {
+  const trusted = (
+    Array.isArray(deliveryContext.destinations) ? deliveryContext.destinations : []
+  ).filter((destination) =>
+    ['telegram', 'voice'].includes(normalizeText(destination?.surface).toLowerCase()),
+  );
+  if (trusted.length > 0) return trusted;
+  if (!shouldEnqueueSurface(body)) return [];
+  return [
+    {
+      surface: surfaceFromBody(body),
+      telegramChatId: normalizeText(body.telegram_chat_id),
+      telegramUserId: normalizeText(body.telegram_user_id),
+      telegramMessageId: normalizeText(body.telegram_message_id),
+      voiceCallSessionId: normalizeText(body.voice_call_session_id),
+      voiceRequestId: normalizeText(body.voice_request_id),
+    },
+  ];
+}
+
+function destinationResolved(destination = {}) {
+  const surface = normalizeText(destination.surface).toLowerCase();
+  if (surface === 'telegram') {
+    return Boolean(
+      normalizeText(destination.telegramChatId) || normalizeText(destination.telegramUserId),
+    );
+  }
+  return surface === 'voice' && Boolean(normalizeText(destination.voiceCallSessionId));
+}
+
+function shouldDispatchNeutralStatus(body = {}) {
+  return [
+    'main.followup',
+    'run.failed',
+    'run.cancelled',
+    'run.interrupted',
+    'checkpoint.ready',
+    'takeover.requested',
+    'run.needs_input',
+    'run.blocked',
+  ].includes(normalizeText(body.event));
+}
+
+function terminalCallbackFields(effectFence) {
+  const resultKey = normalizeText(effectFence?.resultKey);
+  const acceptedOperationId = normalizeText(effectFence?.acceptedOperationId);
+  const callbackId = normalizeText(effectFence?.callbackId);
+  const resultDigest = normalizeText(effectFence?.resultDigest);
+  const resultRevision = Number(effectFence?.resultRevision);
+  const generation = Number(effectFence?.acceptedOperationGeneration ?? effectFence?.generation);
+  if (
+    !/^ghtr_[a-f0-9]{64}$/.test(resultKey) ||
+    !/^[a-f0-9]{32}$/.test(acceptedOperationId) ||
+    !/^cb_terminal_[a-f0-9]{64}$/.test(callbackId) ||
+    !/^sha256:[a-f0-9]{64}$/.test(resultDigest) ||
+    !Number.isSafeInteger(resultRevision) ||
+    resultRevision < 1 ||
+    !Number.isSafeInteger(generation) ||
+    generation < 1
+  ) {
+    return {};
+  }
+  return {
+    terminalCallbackResultKey: resultKey,
+    terminalCallbackAcceptedOperationId: acceptedOperationId,
+    terminalCallbackId: callbackId,
+    terminalCallbackResultDigest: resultDigest,
+    terminalCallbackResultRevision: resultRevision,
+    terminalCallbackEffectGeneration: generation,
+  };
+}
+
+async function enqueueGlassHiveCallbackDelivery({
+  body,
+  message,
+  text,
+  fullText,
+  deliveryContext = {},
+  suppress = false,
+  effectFence,
+  effectSession,
+}) {
+  const destinations = externalDestinations(body, deliveryContext);
+  const summary = { configured: destinations.length, enqueued: 0, unresolved: 0, deliveries: [] };
+  if (!message || destinations.length === 0) return summary;
+  if (!suppress && deliveryContext?.destinations && !shouldDispatchNeutralStatus(body)) {
+    return { ...summary, deferredToMain: true };
   }
   const callbackMessageId = normalizeText(message.messageId);
-  const userId = normalizeText(body.user_id);
-  const conversationId = normalizeText(body.conversation_id);
+  const userId = normalizeText(deliveryContext.ownerId || body.user_id);
+  const conversationId = normalizeText(deliveryContext.conversationId || body.conversation_id);
   const event = normalizeText(body.event);
-  if (!callbackMessageId || !userId || !conversationId || !event) {
-    return null;
-  }
+  if (!callbackMessageId || !userId || !conversationId || !event) return summary;
 
   const callbackId = normalizeText(body.callback_id);
   const callbackKey = normalizeText(message?.metadata?.viventium?.callbackKey);
-  const deliveryKey = deliveryKeyFor({
-    surface,
-    callbackId,
-    callbackKey,
-    callbackMessageId,
-    event,
-  });
-  const deliveryId = deliveryIdFor(deliveryKey);
+  const originRef = normalizeText(deliveryContext.originRef || body.origin_ref);
   const now = nowDate();
   const expiresAt = new Date(now.getTime() + DELIVERY_RETENTION_MS);
   const preview = normalizeText(text || message.text);
@@ -122,53 +254,88 @@ async function enqueueGlassHiveCallbackDelivery({ body, message, text, fullText 
   // fall back to raw callback payload text here, because that can contain local
   // paths or other machine-private details that should never enter the ledger.
   const completeText = normalizeText(fullText || preview);
+  const callbackFenceFields = terminalCallbackFields(effectFence);
 
-  try {
-    const updated = await ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
-      { deliveryKey },
-      {
-        $setOnInsert: {
-          deliveryKey,
-          deliveryId,
-          callbackId,
-          callbackKey,
-          callbackMessageId,
-          userId,
-          conversationId,
-          requestedParentMessageId: normalizeText(body.parent_message_id),
-          anchorMessageId: normalizeText(body.message_id),
-          surface,
-          event,
-          workerId: normalizeText(body.worker_id),
-          runId: normalizeText(body.run_id),
-          status: 'pending',
-          telegramChatId: normalizeText(body.telegram_chat_id),
-          telegramUserId: normalizeText(body.telegram_user_id),
-          telegramMessageId: normalizeText(body.telegram_message_id),
-          voiceCallSessionId: normalizeText(body.voice_call_session_id),
-          voiceRequestId: normalizeText(body.voice_request_id),
-          retryCount: 0,
-          nextAttemptAt: now,
-        },
-        $set: {
-          text: preview,
-          fullText: completeText && completeText !== preview ? completeText : '',
-          expiresAt,
-        },
-      },
-      { new: true, upsert: true, setDefaultsOnInsert: true },
-    ).lean();
-    logger.info(
-      '[VIVENTIUM][glasshive-delivery] enqueued surface=%s delivery=%s event=%s',
+  for (const destination of destinations) {
+    const surface = normalizeText(destination.surface).toLowerCase();
+    const resolved = destinationResolved(destination);
+    const deliveryKey = deliveryKeyFor({
+      ownerId: userId,
+      originRef,
       surface,
-      deliveryId,
+      callbackId,
+      callbackKey,
+      callbackMessageId,
       event,
-    );
-    return updated;
-  } catch (err) {
-    logger.warn('[VIVENTIUM][glasshive-delivery] enqueue failed:', err);
-    throw err;
+    });
+    const deliveryId = deliveryIdFor(deliveryKey);
+    try {
+      const updated = await ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
+        { deliveryKey },
+        {
+          $setOnInsert: {
+            deliveryKey,
+            deliveryId,
+            callbackId,
+            callbackKey,
+            callbackMessageId,
+            originRef,
+            workRef: normalizeText(deliveryContext.workRef || body.work_ref),
+            userId,
+            conversationId,
+            requestedParentMessageId: normalizeText(
+              deliveryContext.requestedParentMessageId || body.parent_message_id,
+            ),
+            anchorMessageId: normalizeText(deliveryContext.anchorMessageId || body.message_id),
+            surface,
+            event,
+            workerId: normalizeText(body.worker_id),
+            runId: normalizeText(body.run_id),
+            status: resolved ? (suppress ? 'suppressed' : 'pending') : 'unresolved',
+            ...(resolved && suppress ? { suppressedAt: now } : {}),
+            telegramChatId: normalizeText(destination.telegramChatId),
+            telegramUserId: normalizeText(destination.telegramUserId),
+            telegramMessageId: normalizeText(destination.telegramMessageId),
+            voiceCallSessionId: normalizeText(destination.voiceCallSessionId),
+            voiceRequestId: normalizeText(destination.voiceRequestId),
+            retryCount: 0,
+            nextAttemptAt: resolved && !suppress ? now : null,
+            unresolvedReason: resolved
+              ? ''
+              : normalizeText(destination.unresolvedReason || `${surface}_target_unresolved`).slice(
+                  0,
+                  240,
+                ),
+            ...callbackFenceFields,
+          },
+          $set: {
+            text: preview,
+            fullText: completeText && completeText !== preview ? completeText : '',
+            expiresAt,
+          },
+        },
+        {
+          new: true,
+          upsert: true,
+          setDefaultsOnInsert: true,
+          ...(effectSession ? { session: effectSession } : {}),
+        },
+      ).lean();
+      if (updated?.status === 'unresolved') summary.unresolved += 1;
+      else summary.enqueued += 1;
+      summary.deliveries.push(updated);
+      logger.info(
+        '[VIVENTIUM][glasshive-delivery] enqueued surface=%s delivery=%s event=%s',
+        surface,
+        deliveryId,
+        event,
+      );
+    } catch (err) {
+      logger.warn('[VIVENTIUM][glasshive-delivery] enqueue failed:', err);
+      throw err;
+    }
   }
+  return summary;
 }
 
 function claimFilter({ surface, callbackId, userId, voiceCallSessionId, now, maxRetries }) {
@@ -283,9 +450,22 @@ function deliveryConstraintFilter({ deliveryId, claimId, userId = '', voiceCallS
 async function markGlassHiveCallbackDeliverySent({
   deliveryId,
   claimId,
+  dispatchPermit = null,
   userId = '',
   voiceCallSessionId = '',
+  telegramMessageIds = [],
 }) {
+  const fenced = await callbackDeliveryDispatch.settleGlassHiveCallbackDeliverySent({
+    deliveryId,
+    claimId,
+    dispatchPermit,
+    userId,
+    voiceCallSessionId,
+    telegramMessageIds,
+  });
+  if (fenced.handled) {
+    return toDispatchPayload(fenced.row);
+  }
   const now = nowDate();
   const doc = await ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
     deliveryConstraintFilter({ deliveryId, claimId, userId, voiceCallSessionId }),
@@ -409,12 +589,18 @@ async function deliveryBacklogSummary({ surface = '', olderThanMs = 5 * 60 * 100
 }
 
 module.exports = {
+  authorizeGlassHiveCallbackDeliveryDispatch:
+    callbackDeliveryDispatch.authorizeGlassHiveCallbackDeliveryDispatch,
   enqueueGlassHiveCallbackDelivery,
   claimPendingGlassHiveCallbackDeliveries,
   markGlassHiveCallbackDeliverySent,
   markGlassHiveCallbackDeliveryFailed,
   markGlassHiveCallbackDeliverySuppressed,
   deliveryBacklogSummary,
+  releaseGlassHiveCallbackDeliveryDispatch:
+    callbackDeliveryDispatch.releaseGlassHiveCallbackDeliveryDispatch,
+  renewGlassHiveCallbackDeliveryDispatch:
+    callbackDeliveryDispatch.renewGlassHiveCallbackDeliveryDispatch,
   toDispatchPayload,
   redactDeliveryError,
 };

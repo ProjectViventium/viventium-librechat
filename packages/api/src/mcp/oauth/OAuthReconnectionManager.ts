@@ -131,6 +131,12 @@ export class OAuthReconnectionManager {
         connectionTimeout: config?.initTimeout ?? DEFAULT_CONNECTION_TIMEOUT_MS,
         // don't trigger OAuth flow during reconnection
         returnOnOAuth: true,
+        /* === VIVENTIUM START ===
+         * Feature: Interactive MCP OAuth flow ownership.
+         * Purpose: Automatic reconnect may refresh stored credentials, but it cannot
+         * replace an in-progress browser authorization flow with an unseen client.
+         * === VIVENTIUM END === */
+        allowOAuthInitiation: false,
       });
 
       if (connection && (await connection.isConnected())) {

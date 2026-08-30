@@ -225,6 +225,18 @@ function buildFallbackAgent(agent, assignment, capability = {}) {
     assignment.parametersField,
   );
 
+  /* === VIVENTIUM START ===
+   * Feature: Outer-fallback / provider-internal-fallback separation.
+   * Purpose: The Agent Builder fallback reuses the primary Agent's workspace declaration, but it
+   * must not inherit GlassHive's optional serial fallback target. Once Claude is the outer fallback
+   * model, retaining `fallback_model: claude-code:opus` makes validation reject the route as a
+   * same-model provider fallback before Claude can start.
+   * Added: 2026-08-17
+   * === VIVENTIUM END === */
+  const glassHiveOptions = clonePlainObject(agent.glasshive_options);
+  delete glassHiveOptions.fallback_model;
+  delete glassHiveOptions.fallback_reasoning_effort;
+
   return {
     ...agent,
     provider: assignment.provider,
@@ -235,6 +247,9 @@ function buildFallbackAgent(agent, assignment, capability = {}) {
       assignment.provider,
       capability,
     ),
+    ...(Object.keys(glassHiveOptions).length > 0
+      ? { glasshive_options: glassHiveOptions }
+      : { glasshive_options: undefined }),
   };
 }
 
@@ -300,7 +315,10 @@ function isRecoverableFallbackErrorClass(value) {
   return [
     'provider_rate_limited',
     'provider_quota_exhausted',
+    'provider_quota_or_billing',
+    'provider_response_failed',
     'provider_temporarily_unavailable',
+    'provider_auth_missing',
     'recoverable_provider_error',
     'provider_unauthorized',
     'provider_access_denied',
@@ -357,6 +375,20 @@ function isRecoverableProviderErrorText(text, { allowToolOrMcpText = false } = {
     lowered.includes('rate-limited') ||
     lowered.includes('rate limited') ||
     lowered.includes('too many requests') ||
+    /* === VIVENTIUM START ===
+     * Feature: Provider quota/credit exhaustion recoverability.
+     * Purpose: Exhausted provider credit is recoverable through the configured fallback route, the
+     * same as a rate limit or outage. Keep the text path aligned with `provider_quota_exhausted`
+     * so an unstructured prose failure still reaches the fallback.
+     * Added: 2026-08-17
+     * === VIVENTIUM END === */
+    lowered.includes('insufficient_quota') ||
+    lowered.includes('billing_hard_limit_reached') ||
+    lowered.includes('exceeded your current quota') ||
+    lowered.includes('check your plan and billing') ||
+    lowered.includes('credit balance is too low') ||
+    lowered.includes('insufficient credit') ||
+    lowered.includes('out of credit') ||
     lowered.includes('status=429') ||
     lowered.includes('status 429') ||
     lowered.includes('"status":429') ||
@@ -474,6 +506,47 @@ function structuredFallbackErrorClasses(error) {
     .filter(Boolean);
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Opaque graph-participant provider failure provenance.
+ * Purpose: A model adapter can lose status/code metadata while still throwing from the exact model
+ * invocation boundary. Mark only that boundary as a recoverable provider response; structured
+ * cancellation, policy, tool, schema, and HTTP dispositions remain authoritative.
+ * Added: 2026-08-18
+ */
+function markOpaqueProviderAttemptFailure(error) {
+  const chain = getStructuredFallbackErrorChain(error);
+  if (chain.length === 0) {
+    return error;
+  }
+  const hasStructuredDisposition =
+    structuredFallbackErrorClasses(error).length > 0 ||
+    chain.some(
+      (item) =>
+        item.name === 'AbortError' ||
+        item.viventiumCompletionPhase ||
+        item.viventiumConnectedAccountReconnectRequired === true ||
+        item.viventiumRecoverableProviderError === true ||
+        item.viventiumNonRetryableProviderError === true ||
+        [item.status, item.statusCode, item.errorStatus, item.error_status].some((candidate) => {
+          const status = Number(candidate);
+          return Number.isFinite(status) && status > 0;
+        }),
+    );
+  if (hasStructuredDisposition) {
+    return error;
+  }
+  try {
+    error.viventiumCompletionPhase = 'provider_response';
+    return error;
+  } catch {
+    const marked = new Error('Model provider response failed');
+    marked.viventiumCompletionPhase = 'provider_response';
+    marked.cause = error;
+    return marked;
+  }
+}
+/* === VIVENTIUM END === */
+
 function isRecoverableProviderFallbackError(error) {
   const chain = getStructuredFallbackErrorChain(error);
   if (chain.length === 0) {
@@ -494,6 +567,7 @@ function isRecoverableProviderFallbackError(error) {
   if (
     chain.some(
       (item) =>
+        item.viventiumCompletionPhase === 'provider_response' ||
         item.viventiumConnectedAccountReconnectRequired === true ||
         item.viventiumRecoverableProviderError === true,
     ) ||
@@ -679,6 +753,7 @@ module.exports = {
   isAbortOrTimeoutErrorText,
   isRecoverableProviderErrorText,
   isNonRetryableFallbackErrorClass,
+  markOpaqueProviderAttemptFailure,
   isRecoverableProviderFallbackError,
   isRecoverableProviderInitializationError,
   initializePrimaryAgentWithFallback,

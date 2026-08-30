@@ -20,10 +20,25 @@
 
 const crypto = require('crypto');
 const express = require('express');
-const { GenerationJobManager } = require('@librechat/api');
+const { HumanMessage } = require('@langchain/core/messages');
+const {
+  canonicalVoiceOwnerUtterance,
+  canonicalVoiceSessionMode,
+  GenerationJobManager,
+  createMongooseVoiceClassifierFaultControlStore,
+  createVoiceClassifierFaultControlManager,
+  createVoiceEngagementAuthorityService,
+  createVoiceEngagementClassifierService,
+  matchesCanonicalVoiceOwnerUtterance,
+} = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { SystemRoles } = require('librechat-data-provider');
-const { Conversation, Message, ViventiumVoiceIngressEvent } = require('~/db/models');
+const {
+  Conversation,
+  LocalQaVoiceClassifierFaultControl,
+  Message,
+  ViventiumVoiceIngressEvent,
+} = require('~/db/models');
 const {
   configMiddleware,
   validateConvoAccess,
@@ -36,7 +51,10 @@ const {
   abandonVoiceSessionClaim,
   assertCallSessionSecret,
   assertCallBrowserCapability,
+  createVoiceEngagementAttestation,
   claimVoiceSession,
+  getCallSession,
+  getCallSessionVoiceSettings,
   heartbeatCallSession,
   markVoiceSessionReady,
   reportVoiceSessionFailure,
@@ -44,7 +62,10 @@ const {
   claimOrReplaceCallSessionConversationId,
   materializeCallSessionConversationId,
   updateCallSessionConversationId,
+  verifyVoiceEngagementAttestation,
 } = require('~/server/services/viventium/CallSessionService');
+const { checkCortexActivation } = require('~/server/services/BackgroundCortexService');
+const { buildWingModeInstructions } = require('~/server/services/viventium/surfacePrompts');
 const { getUserById, saveMessage } = require('~/models');
 const {
   getCompletedCortexInsightsForMessage,
@@ -123,6 +144,114 @@ const {
 const {
   requireVoiceAgentAccess,
 } = require('~/server/services/viventium/VoiceAgentAuthorizationService');
+const {
+  currentVoiceOrchestrationTraceBinding,
+  recordVoiceOrchestrationTrace,
+  recordVoiceOrchestrationTraceBestEffort,
+} = require('~/server/services/viventium/VoiceOrchestrationTraceService');
+
+const voiceEngagementAuthority = createVoiceEngagementAuthorityService({
+  getCallSession,
+  listSpeakerSegments,
+  voiceTurnAuthority,
+  verifyVoiceEngagementAttestation,
+});
+const {
+  exactVoiceEngagementAuthority,
+  finalizedOwnerSpeakerAuthority,
+  latestPersistedVoiceTurnAuthority,
+} = voiceEngagementAuthority;
+
+let voiceClassifierFaultControlManager;
+
+function getVoiceClassifierFaultControlManager() {
+  if (!voiceClassifierFaultControlManager) {
+    voiceClassifierFaultControlManager = createVoiceClassifierFaultControlManager({
+      store: createMongooseVoiceClassifierFaultControlStore(LocalQaVoiceClassifierFaultControl),
+      // Core never arms this control. The parent-only CLI owns synthetic-owner verification.
+      verifySyntheticOwner: async () => false,
+    });
+  }
+  return voiceClassifierFaultControlManager;
+}
+
+const voiceEngagementClassifier = createVoiceEngagementClassifierService({
+  ...voiceEngagementAuthority,
+  canonicalVoiceOwnerUtterance,
+  canonicalVoiceSessionMode,
+  createVoiceEngagementAttestation,
+  getCallSessionVoiceSettings,
+  listSpeakerSegments,
+  logger,
+  matchesCanonicalVoiceOwnerUtterance,
+  now: Date.now,
+  recordVoiceOrchestrationTrace,
+  recordVoiceOrchestrationTraceBestEffort,
+  runVoiceClassifierFaultControl: (...args) => getVoiceClassifierFaultControlManager().run(...args),
+  getVoiceClassifierFaultControlContext: () => {
+    const runtimeBinding = currentVoiceOrchestrationTraceBinding();
+    return {
+      sessionRef: String(process.env.VIVENTIUM_LOCAL_QA_SESSION_REF || '').trim(),
+      candidateDigest: runtimeBinding.candidateDigest,
+      componentArtifactDigest: String(
+        process.env.VIVENTIUM_LOCAL_QA_COMPONENT_ARTIFACT_DIGEST || '',
+      ).trim(),
+      installedArtifactDigest: runtimeBinding.installedArtifactDigest,
+      runtimeOwnerBindingHash: runtimeBinding.runtimeOwnerBindingHash,
+    };
+  },
+  runSemanticClassification: async ({
+    provider,
+    model,
+    utterance,
+    callSessionId,
+    turnId,
+    timeoutMs,
+    requestContext: req,
+  }) => {
+    const backgroundCortices = req?.config?.viventium?.background_cortices || {};
+    const classifierRequest = {
+      ...req,
+      config: {
+        ...(req?.config || {}),
+        viventium: {
+          ...(req?.config?.viventium || {}),
+          background_cortices: {
+            ...backgroundCortices,
+            activation_policy: { enabled: false },
+            activation_subject_rule: { enabled: true, prompt: { promptRef: 'surface.wing' } },
+          },
+        },
+      },
+      body: {
+        text: utterance,
+        files: [],
+        viventiumSurface: 'voice',
+        viventiumInputMode: 'voice_call',
+        viventiumActorTrust: 'owner_participant',
+        viventiumCanAuthorizeSideEffects: false,
+        suppressBackgroundCortices: true,
+      },
+    };
+    return checkCortexActivation({
+      cortexConfig: {
+        agent_id: 'viventium_voice_wing_engagement',
+        activation: {
+          enabled: true,
+          prompt: buildWingModeInstructions(),
+          provider,
+          model,
+          max_history: 1,
+          cooldown_ms: 0,
+        },
+      },
+      messages: [new HumanMessage(utterance)],
+      runId: `voice-engagement:${callSessionId}:${turnId}`,
+      req: classifierRequest,
+      timeoutMs,
+    });
+  },
+});
 
 function parseBoolEnv(name, fallback) {
   const raw = process.env[name];
@@ -1603,6 +1732,59 @@ async function voiceSessionCapabilityAuth(req, res, next) {
   }
 }
 
+/* === VIVENTIUM START === Thin HTTP adapters for typed Wing engagement authority. === VIVENTIUM END === */
+router.post(
+  '/engagement/classify',
+  voiceSessionCapabilityAuth,
+  requireVoiceAgentAccess,
+  timedConfigMiddleware,
+  async (req, res) => {
+    const result = await voiceEngagementClassifier.classify({
+      body: req.body,
+      query: req.query,
+      session: req.viventiumCallSession,
+      user: req.user,
+      requestContext: req,
+    });
+    return res.status(result.status).json(result.body);
+  },
+);
+
+router.post('/engagement/verify', voiceAuth, async (req, res) => {
+  try {
+    if (Object.keys(req.query || {}).length > 0) {
+      return res.status(403).json({
+        code: 'voice_engagement_not_authorized',
+        message: 'This voice turn cannot authorize an action.',
+        retryable: false,
+      });
+    }
+    const verified = await voiceEngagementAuthority.verifyPersistedVoiceEngagement({
+      body: req.body,
+      session: req.viventiumCallSession,
+      userId: req.user?.id,
+    });
+    if (!verified) {
+      return res.status(403).json({
+        code: 'voice_engagement_not_authorized',
+        message: 'This voice turn cannot authorize an action.',
+        retryable: false,
+      });
+    }
+    return res.json(verified);
+  } catch {
+    logger.warn('[VIVENTIUM][voice/engagement] gateway verification unavailable', {
+      code: 'gateway_verification_unavailable',
+    });
+    return res.status(503).json({
+      code: 'voice_engagement_unavailable',
+      message: 'The voice engagement check could not complete.',
+      retryable: true,
+    });
+  }
+});
+/* === VIVENTIUM END === */
+
 /* === VIVENTIUM START ===
  * Feature: gateway dynamic call-mode state
  * Purpose: Let the connected worker observe atomic Call/Wing/Listen-Only switches without
@@ -1959,6 +2141,7 @@ router.post(
   async (req, _res, next) => {
     req.viventiumVoiceIngressReceivedAtMs = Date.now();
     const session = req.viventiumCallSession;
+    const callMode = canonicalVoiceSessionMode(session);
     const incoming = req.body ?? {};
     const text = typeof incoming.text === 'string' ? incoming.text : '';
     const speakInsights = incoming.speakInsights === true;
@@ -2000,11 +2183,33 @@ router.post(
         segments: speakerPersistence.effectiveSegments,
       });
     }
-    const authority = voiceTurnAuthority(currentSegments, {
+    const latestEffectiveSegments = new Map();
+    for (const segment of speakerPersistence.effectiveSegments || []) {
+      if (!segment?.segmentId) {
+        continue;
+      }
+      const existing = latestEffectiveSegments.get(segment.segmentId);
+      if (!existing || Number(segment.revision || 0) >= Number(existing.revision || 0)) {
+        latestEffectiveSegments.set(segment.segmentId, segment);
+      }
+    }
+    const authoritativeSegments = currentSegments
+      .map((segment) => latestEffectiveSegments.get(segment.segmentId))
+      .filter(Boolean);
+    const speakerAuthorityComplete = authoritativeSegments.length === currentSegments.length;
+    const authority = voiceTurnAuthority(speakerAuthorityComplete ? authoritativeSegments : [], {
       speakerAttributionState: session?.speakerAttributionState,
       sharedTrackSids: session?.sharedTrackSids,
       sharedParticipantIdentities: session?.sharedParticipantIdentities,
     });
+    const finalizedOwnerAuthority =
+      speakerAuthorityComplete && finalizedOwnerSpeakerAuthority(authoritativeSegments, session);
+    const directWingEngagement =
+      callMode === 'wing' &&
+      speakerAuthorityComplete &&
+      exactVoiceEngagementAuthority(incoming.voiceEngagement, session, authoritativeSegments, text);
+    const canAuthorizeSideEffects =
+      finalizedOwnerAuthority && (callMode !== 'wing' || directWingEngagement);
     logVoiceRouteStage(
       req,
       'voice_chat_session_ready',
@@ -2101,6 +2306,7 @@ router.post(
       viventiumInteractionContext: _untrustedViventiumInteractionContext,
       adapterCapabilities: _untrustedAdapterCapabilities,
       adapter_capabilities: _untrustedAdapterCapabilitiesSnake,
+      voiceEngagement: _untrustedVoiceEngagement,
       ...safeIncoming
     } = incoming;
     req.body = {
@@ -2112,13 +2318,17 @@ router.post(
       conversationId,
       parentMessageId,
       agent_id: session.agentId,
-      speakerSegments: currentSegments,
+      speakerSegments: authoritativeSegments,
       speakerLabel:
-        currentSegments.length > 0 ? legacySpeakerLabel(currentSegments) : incoming.speakerLabel,
+        authoritativeSegments.length > 0
+          ? legacySpeakerLabel(authoritativeSegments)
+          : incoming.speakerLabel,
+      viventiumCallSessionId: session.callSessionId,
       viventiumDeferVoiceMemory: true,
       viventiumActorTrust: authority.actorTrust,
-      viventiumCanAuthorizeSideEffects: authority.canAuthorizeSideEffects,
+      viventiumCanAuthorizeSideEffects: canAuthorizeSideEffects,
       viventiumAmbientContext: ambientContext,
+      ...(directWingEngagement ? { voiceEngagement: incoming.voiceEngagement } : {}),
     };
     logVoiceRouteStage(
       req,
@@ -2141,8 +2351,17 @@ router.post(
      * voiceAuth has already bound the request to the call-session user, and conversationId is
      * server-resolved from that session, so no browser-supplied conversation target is trusted.
      * === VIVENTIUM END === */
-    if (session?.listenOnlyModeEnabled === true) {
+    if (callMode === 'listen_only') {
       return handleListenOnlyVoiceTurn({ req, res: _res, session });
+    }
+
+    /* === VIVENTIUM START ===
+     * Feature: Passive Wing mutation barrier
+     * Purpose: An owner voice alone is not action consent. No controller, tool, cortex, memory,
+     * task, or external side effect can start without a signed direct-address model decision.
+     * === VIVENTIUM END === */
+    if (callMode === 'wing' && !directWingEngagement) {
+      return _res.json({ status: 'wing_passive', wingPassive: true });
     }
 
     // If this is an insight delivery request, inject the insight prompt as instructions
@@ -2159,7 +2378,7 @@ router.post(
   async (req, res, next) => {
     // If this call session began from a "new" conversation, capture the real conversationId
     // returned by ResumableAgentController and update the session store.
-    const session = req.viventiumCallSession;
+    let session = req.viventiumCallSession;
 
     const coalesceStartAt = voiceLatencyNow();
     const coalescedTurn = await coalesceVoiceTurn({
@@ -2221,7 +2440,149 @@ router.post(
         sharedParticipantIdentities: session?.sharedParticipantIdentities,
       });
       req.body.viventiumActorTrust = mergedAuthority.actorTrust;
-      req.body.viventiumCanAuthorizeSideEffects = mergedAuthority.canAuthorizeSideEffects;
+      req.body.viventiumCanAuthorizeSideEffects =
+        finalizedOwnerSpeakerAuthority(coalescedTurn.mergedSpeakerSegments, session) &&
+        (canonicalVoiceSessionMode(session) !== 'wing' ||
+          exactVoiceEngagementAuthority(
+            req.body.voiceEngagement,
+            session,
+            coalescedTurn.mergedSpeakerSegments,
+            req.body.text,
+          ));
+    }
+
+    const denyIfVoiceActionAuthorityChanged = async () => {
+      let current;
+      try {
+        current = await latestPersistedVoiceTurnAuthority({
+          session,
+          userId: req.user?.id,
+          expectedSegments: req.body?.speakerSegments,
+        });
+      } catch (error) {
+        req.body.viventiumCanAuthorizeSideEffects = false;
+        logger.warn('[VIVENTIUM][voice/chat] current action authority unavailable', {
+          callSessionId: session?.callSessionId,
+          error: error?.name || 'unknown',
+        });
+        res.status(503).json({
+          code: 'voice_turn_authority_unavailable',
+          message: 'Voice turn authority is temporarily unavailable.',
+          retryable: true,
+        });
+        return true;
+      }
+      if (!current) {
+        req.body.viventiumCanAuthorizeSideEffects = false;
+        res.status(403).json({
+          code: 'voice_turn_authority_unavailable',
+          message: 'This voice turn is no longer authorized.',
+          retryable: false,
+        });
+        return true;
+      }
+
+      session = current.session;
+      req.viventiumCallSession = session;
+      const currentMode = canonicalVoiceSessionMode(session);
+      if (Array.isArray(req.body?.speakerSegments) && req.body.speakerSegments.length > 0) {
+        req.body.speakerSegments = current.segments;
+        req.body.speakerLabel = legacySpeakerLabel(current.segments);
+      }
+      const authority = voiceTurnAuthority(current.segments, {
+        speakerAttributionState: session?.speakerAttributionState,
+        sharedTrackSids: session?.sharedTrackSids,
+        sharedParticipantIdentities: session?.sharedParticipantIdentities,
+      });
+      req.body.viventiumActorTrust = authority.actorTrust;
+      req.body.viventiumCanAuthorizeSideEffects =
+        current.complete &&
+        finalizedOwnerSpeakerAuthority(current.segments, session) &&
+        (currentMode !== 'wing' ||
+          exactVoiceEngagementAuthority(
+            req.body.voiceEngagement,
+            session,
+            current.segments,
+            req.body.text,
+          ));
+
+      if (currentMode === 'listen_only') {
+        req.body.viventiumCanAuthorizeSideEffects = false;
+        await handleListenOnlyVoiceTurn({ req, res, session });
+        return true;
+      }
+      if (
+        !current.complete ||
+        (currentMode === 'wing' && req.body.viventiumCanAuthorizeSideEffects !== true)
+      ) {
+        req.body.viventiumCanAuthorizeSideEffects = false;
+        res.json({ status: 'wing_passive', wingPassive: true });
+        return true;
+      }
+      return false;
+    };
+
+    if (await denyIfVoiceActionAuthorityChanged()) {
+      return;
+    }
+
+    if (canonicalVoiceSessionMode(session) === 'wing') {
+      if (
+        req.body.viventiumCanAuthorizeSideEffects !== true ||
+        !exactVoiceEngagementAuthority(
+          req.body.voiceEngagement,
+          session,
+          req.body.speakerSegments,
+          req.body.text,
+        )
+      ) {
+        return res.json({ status: 'wing_passive', wingPassive: true });
+      }
+
+      const engagement = req.body.voiceEngagement;
+      const expiresAtMs = Number(engagement?.expiresAtMs);
+      if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
+        req.body.viventiumCanAuthorizeSideEffects = false;
+        return res.json({ status: 'wing_passive', wingPassive: true });
+      }
+      const authorityDigest = crypto
+        .createHash('sha256')
+        .update(`${session.callSessionId}\u0000${engagement.turnId}`)
+        .digest('hex');
+      try {
+        await ViventiumVoiceIngressEvent.create({
+          dedupeKey: `wing-authority:${authorityDigest}`,
+          callSessionId: session.callSessionId,
+          userId: req.user.id,
+          conversationId: req.body.conversationId || '',
+          parentMessageId: req.body.parentMessageId || '',
+          requestId: engagement.turnId,
+          status: 'wing_authorized',
+          segments: [],
+          expiresAt: new Date(expiresAtMs),
+        });
+      } catch (error) {
+        req.body.viventiumCanAuthorizeSideEffects = false;
+        if (isMongoDuplicateKeyError(error)) {
+          return res.json({
+            status: 'wing_passive',
+            wingPassive: true,
+            engagementReplayed: true,
+          });
+        }
+        logger.warn('[VIVENTIUM][voice/chat] Wing authority ledger unavailable', {
+          callSessionId: session.callSessionId,
+          code: 'voice_engagement_unavailable',
+        });
+        return res.status(503).json({
+          code: 'voice_engagement_unavailable',
+          message: 'Voice engagement authorization is temporarily unavailable.',
+          retryable: true,
+        });
+      }
+      if (await denyIfVoiceActionAuthorityChanged()) {
+        return;
+      }
     }
 
     logger.info(

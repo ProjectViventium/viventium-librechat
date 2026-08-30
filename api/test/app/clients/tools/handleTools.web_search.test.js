@@ -43,5 +43,31 @@ describe('handleTools - web_search', () => {
     expect(typeof ctx).toBe('string');
     expect(ctx).toContain('Current Date & Time:');
     expect(ctx).not.toContain('{{iso_datetime}}');
+    expect(ctx).toMatch(/Current Date & Time: .+\n\n\*\*Execute immediately without preface\.\*\*/);
+  });
+
+  test('keeps invocation-fresh time out of stable tool authority for a native conversation session', async () => {
+    process.env.SERPER_API_KEY = process.env.SERPER_API_KEY || 'test-key';
+
+    const req = {
+      body: {},
+      headers: {},
+      user: { id: 'test-user' },
+      viventiumTimeContextDelivery: 'per_turn_header',
+    };
+
+    const { toolContextMap } = await loadTools({
+      user: 'test-user',
+      tools: [Tools.web_search],
+      webSearch: {
+        searchProvider: 'serper',
+        serperApiKey: 'test-key',
+      },
+      options: { req },
+    });
+
+    const ctx = toolContextMap[Tools.web_search];
+    expect(ctx).not.toContain('Current Date & Time:');
+    expect(ctx).toContain('Execute immediately without preface.');
   });
 });

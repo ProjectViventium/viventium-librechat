@@ -14,16 +14,16 @@ on:
         default: 'Manual publish requested'
 
 permissions:
-  id-token: write  # Required for OIDC trusted publishing
+  id-token: write # Required for OIDC trusted publishing
   contents: read
 
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
-    environment: publish  # Must match npm trusted publisher config
+    environment: publish # Must match npm trusted publisher config
     steps:
       - uses: actions/checkout@v4
-      
+
       # VIVENTIUM START — exact release toolchain.
       - name: Use Node.js 24.16.0
         uses: actions/setup-node@v4
@@ -31,35 +31,33 @@ jobs:
           node-version: '24.16.0'
           registry-url: 'https://registry.npmjs.org'
       # VIVENTIUM END
-      
+
       - name: Update npm for OIDC support
         run: npm install -g npm@11.13.0 # Exact project package-manager contract; supports provenance
-        
+
       - name: Install client dependencies
         run: cd packages/client && npm ci
-        
+
       - name: Build client
         run: cd packages/client && npm run build
-        
-      - name: Check version change
+
+      - name: Check exact published version
         id: check
         working-directory: packages/client
         run: |
+          set -euo pipefail
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
           PACKAGE_VERSION=$(node -p "require('./package.json').version")
-          PUBLISHED_VERSION=$(npm view @librechat/client version 2>/dev/null || echo "0.0.0")
-          if [ "$PACKAGE_VERSION" = "$PUBLISHED_VERSION" ]; then
-            echo "No version change, skipping publish"
-            echo "skip=true" >> $GITHUB_OUTPUT
-          else
-            echo "Version changed, proceeding with publish"
-            echo "skip=false" >> $GITHUB_OUTPUT
-          fi
-            
+          VERSIONS_FILE="${RUNNER_TEMP}/npm-published-versions.json"
+          npm view "$PACKAGE_NAME" versions --json > "$VERSIONS_FILE"
+          node ../../scripts/npm-exact-version-publish-guard.cjs \
+            "$PACKAGE_NAME" "$PACKAGE_VERSION" "$VERSIONS_FILE"
+
       - name: Pack package
         if: steps.check.outputs.skip != 'true'
         working-directory: packages/client
         run: npm pack
-        
+
       - name: Publish
         if: steps.check.outputs.skip != 'true'
         working-directory: packages/client

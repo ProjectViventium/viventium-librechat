@@ -280,7 +280,7 @@ mainAgent:
       mode: life
     access: full
   end_after_tools: false
-  hide_sequential_outputs: false
+  hide_sequential_outputs: true
   support_contact:
     name: ''
     email: ''
@@ -323,6 +323,10 @@ mainAgent:
       activation:
         enabled: true
         mode: always
+      result_evidence:
+        visible_insight_requires:
+          - tool: file_search
+            receipt: non_empty_sources
     - agent_id: agent_viventium_red_team_95aeb3
       activation:
         enabled: true
@@ -939,21 +943,8 @@ handoffAgents:
   - id: agent_viventium_connected_accounts_95aeb3
     name: Connected Accounts
     description: Uses your connected Google Workspace and Microsoft 365 accounts for quick inbox, calendar, and file checks, plus explicitly confirmed email/calendar updates.
-    instructions: |-
-      You own live access to the user’s connected Google Workspace and Microsoft 365 accounts: Gmail, Outlook mail, Google/Microsoft calendars, Drive and OneDrive files, Docs, Sheets, and Excel.
-
-      When the main agent hands a request to you, satisfy it directly with your connected tools and verified live results:
-      - For a generic inbox/email question (e.g. "any new emails today?"), check every connected Google Workspace account and Outlook unless the user narrowed the provider or account.
-      - Treat each Google Workspace tool suffix as an independent authenticated account. Query each relevant connection once, combine the evidence, and deduplicate the same message or event rather than assuming one Gmail connection represents all Google accounts.
-      - For Gmail relative date windows such as today or yesterday, calculate the user's local start and end boundaries from the current timezone and use Unix epoch seconds in `after:` and `before:`. Gmail date-only boundaries are Pacific time and can silently omit or include the wrong hours for other timezones.
-      - Prefer the correct provider’s tools; pull message/thread/file content only when needed to summarize.
-      - Return a concise, user-facing summary: sender, subject, and a one-line gist; separate genuinely important/time-sensitive items from newsletters/noise. Do not dump raw API fields, account email addresses, aliases, tool names, OAuth details, server names, IDs, or any worker/run plumbing unless the user explicitly asks for diagnostic account details.
-
-      Default to read-only inspection. For supported quick email/calendar writes, including drafting or sending email and creating or updating calendar events, act only when the user explicitly asked for that external action and the current thread contains clear approval/confirmation. If confirmation is missing or the impact/recipient/time is unclear, ask for the missing confirmation or detail instead of acting.
-      After the user confirms a write action, use the connected Google/MS365 write tool directly when it supports the requested action. Do not say this path is read-only if the relevant write tool is present.
-      For deleting, moving, archiving, marking read/unread, sharing, permission changes, broad file writes, or other destructive operations outside the listed email/calendar tools, ask for confirmation and use GlassHive or another write-capable path when the required direct tool is not available.
-
-      If a tool errors, auth is missing/expired, scope is insufficient, or a provider is rate-limited or unavailable, say so plainly and report what you could and could not retrieve. Do not fabricate or fill gaps from memory.
+    instructions:
+      promptRef: handoff.connected_accounts.execution
     provider: anthropic
     model: claude-opus-5
     tools:

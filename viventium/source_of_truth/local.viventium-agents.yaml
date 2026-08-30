@@ -29,38 +29,9 @@ config:
           - server: glasshive-workers-projects
             owns: persistent workers, project runs, browser/desktop/local computer execution, worker status, and completion reports
             tool_names:
-              - sys__server__sys_mcp_glasshive-workers-projects
-              - projects_list_mcp_glasshive-workers-projects
-              - project_create_mcp_glasshive-workers-projects
               - worker_delegate_once_mcp_glasshive-workers-projects
-              - workspace_launch_mcp_glasshive-workers-projects
-              - workspace_schedule_mcp_glasshive-workers-projects
-              - workspace_status_mcp_glasshive-workers-projects
-              - workspace_wait_mcp_glasshive-workers-projects
-              - workspace_continue_mcp_glasshive-workers-projects
-              - workspace_artifacts_mcp_glasshive-workers-projects
-              - workspace_artifact_download_mcp_glasshive-workers-projects
-              - workspace_preferences_get_mcp_glasshive-workers-projects
-              - workspace_preferences_set_mcp_glasshive-workers-projects
-              - project_get_mcp_glasshive-workers-projects
-              - project_runs_mcp_glasshive-workers-projects
-              - project_events_mcp_glasshive-workers-projects
-              - workers_list_mcp_glasshive-workers-projects
-              - worker_create_mcp_glasshive-workers-projects
-              - worker_find_or_resume_mcp_glasshive-workers-projects
-              - worker_get_mcp_glasshive-workers-projects
-              - worker_live_mcp_glasshive-workers-projects
-              - worker_run_mcp_glasshive-workers-projects
-              - worker_schedule_mcp_glasshive-workers-projects
-              - worker_schedules_mcp_glasshive-workers-projects
-              - worker_message_mcp_glasshive-workers-projects
-              - worker_pause_mcp_glasshive-workers-projects
-              - worker_resume_mcp_glasshive-workers-projects
-              - worker_interrupt_mcp_glasshive-workers-projects
-              - worker_terminate_mcp_glasshive-workers-projects
-              - worker_desktop_action_mcp_glasshive-workers-projects
-              - worker_takeover_mcp_glasshive-workers-projects
-              - metrics_summary_mcp_glasshive-workers-projects
+              - active_work_list
+              - active_work_action
           - server: scheduling-cortex
             owns: reminders, scheduled follow-ups, same-conversation wakeups, delayed status checks, and schedule management
             tool_names:
@@ -171,106 +142,14 @@ mainAgent:
     - health_list_records_mcp_viventium-health
     - health_read_image_mcp_viventium-health
     - health_read_record_mcp_viventium-health
-    - sys__server__sys_mcp_glasshive-workers-projects
-    - projects_list_mcp_glasshive-workers-projects
-    - project_create_mcp_glasshive-workers-projects
-    - workspace_preferences_get_mcp_glasshive-workers-projects
-    - workspace_preferences_set_mcp_glasshive-workers-projects
-    - project_get_mcp_glasshive-workers-projects
     - worker_delegate_once_mcp_glasshive-workers-projects
-    - workspace_launch_mcp_glasshive-workers-projects
-    - workspace_schedule_mcp_glasshive-workers-projects
-    - project_runs_mcp_glasshive-workers-projects
-    - project_events_mcp_glasshive-workers-projects
-    - workers_list_mcp_glasshive-workers-projects
-    - worker_create_mcp_glasshive-workers-projects
-    - worker_find_or_resume_mcp_glasshive-workers-projects
-    - worker_get_mcp_glasshive-workers-projects
-    - worker_live_mcp_glasshive-workers-projects
-    - worker_run_mcp_glasshive-workers-projects
-    - worker_schedule_mcp_glasshive-workers-projects
-    - worker_schedules_mcp_glasshive-workers-projects
-    - worker_message_mcp_glasshive-workers-projects
-    - worker_pause_mcp_glasshive-workers-projects
-    - worker_resume_mcp_glasshive-workers-projects
-    - worker_interrupt_mcp_glasshive-workers-projects
-    - worker_terminate_mcp_glasshive-workers-projects
-    - worker_desktop_action_mcp_glasshive-workers-projects
-    - worker_takeover_mcp_glasshive-workers-projects
-    - run_get_mcp_glasshive-workers-projects
-    - workspace_status_mcp_glasshive-workers-projects
-    - workspace_wait_mcp_glasshive-workers-projects
-    - workspace_continue_mcp_glasshive-workers-projects
-    - workspace_artifacts_mcp_glasshive-workers-projects
-    - workspace_artifact_download_mcp_glasshive-workers-projects
-    - metrics_summary_mcp_glasshive-workers-projects
+    - active_work_list
+    - active_work_action
     - file_search
     - web_search
   tool_options:
-    projects_list_mcp_glasshive-workers-projects:
-      defer_loading: true
-    project_create_mcp_glasshive-workers-projects:
-      defer_loading: true
-    workspace_preferences_get_mcp_glasshive-workers-projects:
-      defer_loading: true
-    workspace_preferences_set_mcp_glasshive-workers-projects:
-      defer_loading: true
-    project_get_mcp_glasshive-workers-projects:
-      defer_loading: true
     worker_delegate_once_mcp_glasshive-workers-projects:
-      defer_loading: true
-    workspace_launch_mcp_glasshive-workers-projects:
       defer_loading: false
-    workspace_schedule_mcp_glasshive-workers-projects:
-      defer_loading: true
-    project_runs_mcp_glasshive-workers-projects:
-      defer_loading: true
-    project_events_mcp_glasshive-workers-projects:
-      defer_loading: true
-    workers_list_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_create_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_find_or_resume_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_get_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_live_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_run_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_schedule_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_schedules_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_message_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_pause_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_resume_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_interrupt_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_terminate_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_desktop_action_mcp_glasshive-workers-projects:
-      defer_loading: true
-    worker_takeover_mcp_glasshive-workers-projects:
-      defer_loading: true
-    run_get_mcp_glasshive-workers-projects:
-      defer_loading: true
-    workspace_status_mcp_glasshive-workers-projects:
-      defer_loading: false
-    workspace_wait_mcp_glasshive-workers-projects:
-      defer_loading: false
-    workspace_continue_mcp_glasshive-workers-projects:
-      defer_loading: true
-    workspace_artifacts_mcp_glasshive-workers-projects:
-      defer_loading: true
-    workspace_artifact_download_mcp_glasshive-workers-projects:
-      defer_loading: true
-    metrics_summary_mcp_glasshive-workers-projects:
-      defer_loading: true
   tool_kwargs: []
   model_parameters:
     model: codex-cli:gpt-5.6-sol
@@ -279,6 +158,11 @@ mainAgent:
     workspace:
       mode: life
     access: full
+    orchestration:
+      parallel_available: true
+      default_mode: focused
+      worker_profile: codex-cli
+      fallback_worker_profile: claude-code
   end_after_tools: false
   hide_sequential_outputs: true
   support_contact:

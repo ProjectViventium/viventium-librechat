@@ -28,6 +28,7 @@ SCHEDULED_RUN_CONTEXT_CONTRACT_LINE = (
 # Feature: Multi-channel dispatch support.
 from .models import AVAILABLE_CHANNELS, DEFAULT_DELIVERY_CHANNELS
 from .glasshive_assertions import ASSERTION_HEADER, mint_workspace_run_assertion
+from .scheduled_failure_contract import load_scheduled_failure_contract
 from .storage import ScheduleStorage, StorageConfig
 from .utils import ensure_timezone, parse_iso, to_utc_iso
 from .workbench_artifacts import (
@@ -240,13 +241,7 @@ SCHEDULED_PROVIDER_ROUTE_DECISIONS = frozenset(
     }
 )
 
-_SCHEDULED_FAILURE_CONTRACT_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "source_of_truth"
-    / "scheduled_failure_contract.v1.json"
-)
-with _SCHEDULED_FAILURE_CONTRACT_PATH.open("r", encoding="utf-8") as _failure_contract_file:
-    SCHEDULED_FAILURE_CONTRACT = json.load(_failure_contract_file)
+SCHEDULED_FAILURE_CONTRACT = load_scheduled_failure_contract()
 SCHEDULED_GENERATION_FAILURE_CLASSES = frozenset(
     {
         *(SCHEDULED_FAILURE_CONTRACT.get("classes") or {}),

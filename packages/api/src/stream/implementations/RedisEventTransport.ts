@@ -991,12 +991,18 @@ export class RedisEventTransport implements IEventTransport {
       }
       const subscriberCount = await this.publisher.publish(channel, JSON.stringify(message));
       const normalizedSubscriberCount = Math.max(0, Number(subscriberCount) || 0);
+      /* Redis Cluster's PUBLISH count is local to the routed node and can be
+       * zero even when another node delivers the event. The receipt channel is
+       * the authoritative proof that a presentation handler accepted it. */
       const presentationAcknowledged = acknowledgementPromise
-        ? normalizedSubscriberCount > 0 && (await acknowledgementPromise)
+        ? await acknowledgementPromise
         : undefined;
+      const effectiveSubscriberCount = presentationAcknowledged
+        ? Math.max(1, normalizedSubscriberCount)
+        : normalizedSubscriberCount;
       return {
         published: true,
-        subscriberCount: normalizedSubscriberCount,
+        subscriberCount: effectiveSubscriberCount,
         ...(requirePresentationAcknowledgement ? { presentationAcknowledged } : {}),
       };
     } catch (err) {

@@ -398,8 +398,11 @@ export function createMemoryMaintenancePlan({
     'Pruned operational residue and overlong evidence from signals',
     (entry) => compactSignalsValue(entry.value, now, keyLimits?.signals),
   );
-  applyAllowedTransform('drafts', 'Compressed drafts into a compact project index', (entry) =>
-    compactDraftsValue(entry.value, now, keyLimits?.drafts),
+  applyAllowedTransform(
+    'drafts',
+    'Compressed drafts into a compact project index',
+    (entry) => compactDraftsValue(entry.value, now, keyLimits?.drafts),
+    hasStaleActiveDrafts,
   );
   applyAllowedTransform(
     'world',

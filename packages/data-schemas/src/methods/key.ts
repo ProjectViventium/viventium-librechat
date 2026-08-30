@@ -89,7 +89,15 @@ export function createKeyMethods(mongoose: typeof import('mongoose')) {
      * Purpose: Row presence is not connectivity when the active runtime cannot decrypt the value.
      */
     try {
-      await decrypt(keyValue.value ?? '');
+      const decryptedValue = await decrypt(keyValue.value ?? '');
+      try {
+        const parsedValue = JSON.parse(decryptedValue) as { oauthReconnectRequired?: unknown };
+        if (parsedValue?.oauthReconnectRequired === true) {
+          return { expiresAt: null };
+        }
+      } catch {
+        // Plain user keys and older non-JSON values remain valid after successful decryption.
+      }
     } catch {
       logger.warn('[getUserKeyExpiry] Stored user key is unreadable; reporting disconnected', {
         name,

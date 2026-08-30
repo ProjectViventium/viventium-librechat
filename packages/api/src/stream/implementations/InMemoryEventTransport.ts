@@ -1,6 +1,11 @@
 import { EventEmitter } from 'events';
 import { logger } from '@librechat/data-schemas';
-import type { IEventTransport } from '../interfaces/IJobStore';
+import type {
+  EventTransportEmitOptions,
+  EventTransportPublishReceipt,
+  IEventTransport,
+} from '../interfaces/IJobStore';
+import { streamLogRef } from '../logPrivacy';
 
 interface StreamState {
   emitter: EventEmitter;
@@ -44,7 +49,7 @@ export class InMemoryEventTransport implements IEventTransport {
     state.emitter.on('error', errorHandler);
 
     logger.debug(
-      `[InMemoryEventTransport] subscribe ${streamId}: listeners=${state.emitter.listenerCount('chunk')}`,
+      `[InMemoryEventTransport] subscribe ${streamLogRef(streamId)} listeners=${state.emitter.listenerCount('chunk')}`,
     );
 
     return {
@@ -69,9 +74,21 @@ export class InMemoryEventTransport implements IEventTransport {
     };
   }
 
-  emitChunk(streamId: string, event: unknown): void {
+  emitChunk(
+    streamId: string,
+    event: unknown,
+    options: EventTransportEmitOptions = {},
+  ): EventTransportPublishReceipt {
     const state = this.streams.get(streamId);
-    state?.emitter.emit('chunk', event);
+    const subscriberCount = state?.emitter.listenerCount('chunk') ?? 0;
+    const published = state?.emitter.emit('chunk', event) === true;
+    return {
+      published,
+      subscriberCount,
+      ...(options.requirePresentationAcknowledgement
+        ? { presentationAcknowledged: published && subscriberCount > 0 }
+        : {}),
+    };
   }
 
   emitDone(streamId: string, event: unknown): void {
@@ -104,7 +121,9 @@ export class InMemoryEventTransport implements IEventTransport {
   isFirstSubscriber(streamId: string): boolean {
     const state = this.streams.get(streamId);
     const count = state?.emitter.listenerCount('chunk') ?? 0;
-    logger.debug(`[InMemoryEventTransport] isFirstSubscriber ${streamId}: count=${count}`);
+    logger.debug(
+      `[InMemoryEventTransport] isFirstSubscriber ${streamLogRef(streamId)} count=${count}`,
+    );
     return count === 1;
   }
 

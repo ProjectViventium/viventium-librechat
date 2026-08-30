@@ -18,12 +18,15 @@ let mockSubscribe;
 let mockBuildScheduledGlassHiveCapabilityBundle;
 let mockRevokeScheduledGlassHiveCapabilityGrant;
 let mockAbortJob;
+let mockGetCortexInsightDeliveriesForParent;
 let mockDeleteSchedulerPlaceholder;
 let mockUpdateSchedulerConversation;
 let lastParentMessageId = null;
 let lastSpec = null;
 let lastAgentId = null;
 let lastScheduledAgentExecution = null;
+let lastSchedulerRequest = null;
+let lastSchedulerTitleHandler = null;
 let agentControllerCalls = 0;
 const mockSchedulerDispatchIntents = new Map();
 
@@ -76,14 +79,19 @@ jest.mock('~/server/middleware', () => ({
   buildEndpointOption: (_req, _res, next) => next(),
 }));
 
-jest.mock('~/server/controllers/agents/request', () => (req, res) => {
-  agentControllerCalls += 1;
-  lastParentMessageId = req.body.parentMessageId;
-  lastSpec = req.body.spec;
-  lastAgentId = req.body.agent_id;
-  lastScheduledAgentExecution = req.viventiumScheduledAgentExecution ?? null;
-  res.json({ streamId: 'stream_1', conversationId: req.body.conversationId || 'new' });
-});
+jest.mock(
+  '~/server/controllers/agents/request',
+  () => (req, res, _next, _initialize, titleHandler) => {
+    agentControllerCalls += 1;
+    lastSchedulerRequest = req;
+    lastSchedulerTitleHandler = titleHandler;
+    lastParentMessageId = req.body.parentMessageId;
+    lastSpec = req.body.spec;
+    lastAgentId = req.body.agent_id;
+    lastScheduledAgentExecution = req.viventiumScheduledAgentExecution ?? null;
+    res.json({ streamId: 'stream_1', conversationId: req.body.conversationId || 'new' });
+  },
+);
 
 jest.mock('mongoose', () => {
   const mongoose = jest.requireActual('mongoose');
@@ -151,6 +159,36 @@ jest.mock('@librechat/api', () => ({
 jest.mock('~/server/services/TelegramLinkService', () => ({
   resolveTelegramMappingByUserId: (...args) => mockResolveTelegramMappingByUserId(...args),
 }));
+
+jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => ({
+  getCortexInsightDeliveriesForParent: (...args) =>
+    mockGetCortexInsightDeliveriesForParent(...args),
+}));
+
+jest.mock('~/server/services/viventium/interactionContext', () => ({
+  createSchedulerInteractionContext: (context) => context,
+  setTrustedInteractionContext: (req, context) => {
+    req._viventiumInteractionContext = context;
+  },
+}));
+
+jest.mock('~/server/services/viventium/noResponseTag', () => {
+  const noResponseTag = '{NTA}';
+  const noResponseOnly = /^\s*\{\s*NTA\s*\}\s*$/i;
+  const trailingNta = /\s*\{\s*NTA\s*\}\s*$/i;
+  const isNoResponseOnly = (text) => typeof text === 'string' && noResponseOnly.test(text);
+  return {
+    NO_RESPONSE_TAG: noResponseTag,
+    isNoResponseOnly,
+    isNoResponseTag: isNoResponseOnly,
+    normalizeNoResponseText: (text) =>
+      isNoResponseOnly(text) ? noResponseTag : typeof text === 'string' ? text : '',
+    stripTrailingNTA: (text) =>
+      typeof text === 'string' && !isNoResponseOnly(text)
+        ? text.replace(trailingNta, '').trimEnd()
+        : text,
+  };
+});
 
 jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () => ({
   buildScheduledGlassHiveCapabilityBundle: (...args) =>
@@ -471,6 +509,32 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
     await dispatch(app, req, res);
     expect(res.statusCode).toBe(404);
   });
+
+  test('does not log private upstream details when Telegram mapping fails', async () => {
+    const privateDetail = 'synthetic-scheduler-log-secret-never-publish';
+    mockResolveTelegramMappingByUserId = jest.fn().mockRejectedValue(
+      Object.assign(new Error('Upstream rejected ' + privateDetail), {
+        code: 'provider_unauthorized',
+        status: 401,
+        response: { body: privateDetail },
+      }),
+    );
+    const schedulerRouter = require('../scheduler');
+    const { logger } = require('@librechat/data-schemas');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/telegram/resolve',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: { userId: 'user_1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(500);
+    expect(JSON.stringify(logger.error.mock.calls)).toContain('provider_unauthorized');
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain(privateDetail);
+  });
 });
 
 describe('/api/viventium/scheduler/chat', () => {
@@ -482,6 +546,8 @@ describe('/api/viventium/scheduler/chat', () => {
     lastSpec = null;
     lastAgentId = null;
     lastScheduledAgentExecution = null;
+    lastSchedulerRequest = null;
+    lastSchedulerTitleHandler = null;
     mockGetUserById = jest.fn().mockResolvedValue({ _id: 'user_1', role: 'USER' });
     mockGetMessage = jest.fn().mockResolvedValue(null);
     mockGetMessages = jest.fn().mockResolvedValue([]);
@@ -523,6 +589,37 @@ describe('/api/viventium/scheduler/chat', () => {
     expect(lastParentMessageId).toBe(Constants.NO_PARENT);
     expect(lastSpec).toBe('viventium');
     expect(lastAgentId).toBe('agent_test');
+  });
+
+  test('keeps internal scheduler execution envelopes out of the visible conversation title', async () => {
+    const addTitle = require('~/server/services/Endpoints/agents/title');
+    addTitle.mockClear();
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        text: '<!--viv_internal:brew_begin--> ## Background Processing',
+        titleText: 'Review the synthetic renewal reminder',
+        conversationId: 'new',
+        agentId: 'agent_test',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+    await lastSchedulerTitleHandler(lastSchedulerRequest, {
+      text: req.body.text,
+      response: { conversationId: 'conversation-1' },
+      client: {},
+    });
+
+    expect(addTitle).toHaveBeenCalledWith(
+      lastSchedulerRequest,
+      expect.objectContaining({ text: 'Review the synthetic renewal reminder' }),
+    );
   });
 
   test('authenticated scheduler request carries a validated per-run model tuple', async () => {
@@ -870,6 +967,7 @@ describe('/api/viventium/scheduler/cortex', () => {
     mockGetJob = jest.fn().mockResolvedValue({ metadata: { userId: 'user_1' } });
     mockGetResumeState = jest.fn().mockResolvedValue(null);
     mockSubscribe = jest.fn().mockResolvedValue({ unsubscribe: jest.fn() });
+    mockGetCortexInsightDeliveriesForParent = jest.fn().mockResolvedValue([]);
     process.env.VIVENTIUM_SCHEDULER_SECRET = 'scheduler_secret';
   });
 

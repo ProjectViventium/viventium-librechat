@@ -12,6 +12,7 @@ process.env.JWT_REFRESH_SECRET = 'test';
 process.env.CREDS_KEY = 'test';
 process.env.CREDS_IV = 'test';
 process.env.ALLOW_EMAIL_LOGIN = 'true';
+process.env.VIVENTIUM_RUNTIME_SLOT_ID ||= `jest-runtime-slot-${process.env.JEST_WORKER_ID || '0'}`;
 
 // Set global test timeout high enough for cold MongoMemoryServer startups in full-suite runs.
 // Individual tests can still override this lower when they need tighter bounds.

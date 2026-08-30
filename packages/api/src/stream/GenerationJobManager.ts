@@ -13,6 +13,8 @@ import type {
   InteractionDeliveryAck,
   DeliveryAcknowledgementResult,
   InteractionDeliveryPolicy,
+  CortexPresentationBinding,
+  CortexPresentationFenceReceipt,
 } from './interfaces/IJobStore';
 import type * as t from '~/types';
 import { InMemoryEventTransport } from './implementations/InMemoryEventTransport';
@@ -36,6 +38,94 @@ export interface CreateGenerationJobOptions {
   interactionContext?: InteractionContext;
   adapterCapabilities?: AdapterCapabilities;
   deliveryPolicy?: InteractionDeliveryPolicy;
+}
+
+function normalizeCortexPresentationReceipt(
+  receipt: CortexPresentationFenceReceipt,
+): CortexPresentationFenceReceipt | null {
+  const ownerId = String(receipt?.ownerId || '').trim();
+  const messageId = String(receipt?.messageId || '').trim();
+  const parentMessageId = String(receipt?.parentMessageId || '').trim();
+  const revision = Number(receipt?.revision);
+  const generation = Number(receipt?.generation);
+  const claimToken = String(receipt?.claimToken || '').trim();
+  const presentationLeaseToken = String(receipt?.presentationLeaseToken || '').trim();
+  const deliveryIds = [
+    ...new Set(
+      (Array.isArray(receipt?.deliveryIds) ? receipt.deliveryIds : [])
+        .map((deliveryId) => String(deliveryId || '').trim())
+        .filter(Boolean),
+    ),
+  ].sort();
+  const deliveryReceipts = (
+    Array.isArray(receipt?.deliveryReceipts) ? receipt.deliveryReceipts : []
+  )
+    .map((deliveryReceipt) => ({
+      deliveryId: String(deliveryReceipt?.deliveryId || '').trim(),
+      graphResultHash: String(deliveryReceipt?.graphResultHash || '')
+        .trim()
+        .toLowerCase(),
+    }))
+    .sort((left, right) => left.deliveryId.localeCompare(right.deliveryId));
+  if (
+    !ownerId ||
+    !messageId ||
+    !parentMessageId ||
+    !Number.isSafeInteger(revision) ||
+    revision < 1 ||
+    !Number.isSafeInteger(generation) ||
+    generation < 1 ||
+    !claimToken ||
+    !presentationLeaseToken ||
+    deliveryIds.length < 1 ||
+    deliveryReceipts.length !== deliveryIds.length ||
+    deliveryReceipts.some(
+      (deliveryReceipt, index) =>
+        deliveryReceipt.deliveryId !== deliveryIds[index] ||
+        !/^[a-f0-9]{64}$/.test(deliveryReceipt.graphResultHash),
+    )
+  ) {
+    return null;
+  }
+  return {
+    ownerId,
+    messageId,
+    parentMessageId,
+    revision,
+    generation,
+    deliveryIds,
+    deliveryReceipts,
+    claimToken,
+    presentationLeaseToken,
+  };
+}
+
+function cortexPresentationMatchesReceipt(
+  binding: CortexPresentationBinding | undefined,
+  receipt: CortexPresentationFenceReceipt,
+): binding is CortexPresentationBinding {
+  const normalized = normalizeCortexPresentationReceipt(receipt);
+  return Boolean(
+    binding &&
+    normalized &&
+    binding.ownerId === normalized.ownerId &&
+    binding.messageId === normalized.messageId &&
+    binding.parentMessageId === normalized.parentMessageId &&
+    binding.revision === normalized.revision &&
+    binding.generation === normalized.generation &&
+    binding.claimToken === normalized.claimToken &&
+    binding.presentationLeaseToken === normalized.presentationLeaseToken &&
+    binding.deliveryIds.length === normalized.deliveryIds.length &&
+    binding.deliveryIds.every(
+      (deliveryId, index) => deliveryId === normalized.deliveryIds[index],
+    ) &&
+    binding.deliveryReceipts.length === normalized.deliveryReceipts.length &&
+    binding.deliveryReceipts.every(
+      (storedReceipt, index) =>
+        storedReceipt.deliveryId === normalized.deliveryReceipts[index].deliveryId &&
+        storedReceipt.graphResultHash === normalized.deliveryReceipts[index].graphResultHash,
+    ),
+  );
 }
 
 /**
@@ -182,7 +272,7 @@ class GenerationJobManagerClass {
    * Initialize the job manager with periodic cleanup.
    * Call this once at application startup.
    */
-  initialize(): void {
+  async initialize(): Promise<void> {
     /* === VIVENTIUM START ===
      * Purpose: Preserve idempotent initialization while lifecycle state owns
      * the fail-closed reconfiguration boundary.
@@ -192,7 +282,7 @@ class GenerationJobManagerClass {
     }
     /* === VIVENTIUM END === */
 
-    this.jobStore.initialize();
+    await this.jobStore.initialize();
 
     this.cleanupInterval = setInterval(() => {
       void this.cleanup().catch((error) => {
@@ -235,9 +325,7 @@ class GenerationJobManagerClass {
      * asynchronous teardown is still draining the old generation.
      */
     if (this.lifecycleState !== 'configurable' && this.lifecycleState !== 'destroyed') {
-      throw new Error(
-        '[GenerationJobManager] Destroy the active manager before reconfiguring services',
-      );
+      throw new Error('Generation stream manager is unavailable');
     }
 
     this._jobStore = services.jobStore;
@@ -268,17 +356,92 @@ class GenerationJobManagerClass {
     return this.jobStore;
   }
 
+  /** Bind only an exact current-owner Cortex presentation receipt to a stream job. */
+  async bindCortexPresentation(
+    streamId: string,
+    receipt: CortexPresentationFenceReceipt,
+  ): Promise<CortexPresentationBinding | null> {
+    const services = this.captureServices();
+    const normalized = normalizeCortexPresentationReceipt(receipt);
+    if (!normalized) {
+      return null;
+    }
+    const {
+      ownerId,
+      messageId,
+      parentMessageId,
+      revision,
+      generation,
+      deliveryIds,
+      deliveryReceipts,
+      claimToken,
+      presentationLeaseToken,
+    } = normalized;
+
+    const ownerJob = await services.jobStore.getJob(streamId);
+    this.assertServiceGeneration(services.generation);
+    if (
+      !ownerJob ||
+      ownerJob.userId !== ownerId ||
+      ownerJob.responseMessageId !== parentMessageId
+    ) {
+      return null;
+    }
+    const binding: CortexPresentationBinding = {
+      ownerId,
+      messageId,
+      parentMessageId,
+      revision,
+      generation,
+      deliveryIds,
+      deliveryReceipts,
+      claimToken,
+      presentationLeaseToken,
+      boundAt: Date.now(),
+    };
+    const bound = await services.jobStore.bindCortexPresentation(streamId, binding);
+    this.assertServiceGeneration(services.generation);
+    if (!bound) {
+      return null;
+    }
+    const stored = await services.jobStore.getJob(streamId);
+    this.assertServiceGeneration(services.generation);
+    const storedBinding = stored?.cortexPresentation;
+    if (
+      !storedBinding ||
+      storedBinding.ownerId !== ownerId ||
+      storedBinding.messageId !== messageId ||
+      storedBinding.parentMessageId !== parentMessageId ||
+      storedBinding.revision !== revision ||
+      storedBinding.generation !== generation ||
+      storedBinding.claimToken !== claimToken ||
+      storedBinding.presentationLeaseToken !== presentationLeaseToken ||
+      storedBinding.deliveryIds.length !== deliveryIds.length ||
+      storedBinding.deliveryIds.some((deliveryId, index) => deliveryId !== deliveryIds[index]) ||
+      storedBinding.deliveryReceipts.length !== deliveryReceipts.length ||
+      storedBinding.deliveryReceipts.some(
+        (storedReceipt, index) =>
+          storedReceipt.deliveryId !== deliveryReceipts[index].deliveryId ||
+          storedReceipt.graphResultHash !== deliveryReceipts[index].graphResultHash,
+      )
+    ) {
+      return null;
+    }
+    return storedBinding;
+  }
+
   /** Persist an adapter's terminal presentation outcome against server-held turn ownership. */
   async acknowledgeDelivery(
     acknowledgement: InteractionDeliveryAck,
     adapterSurface: 'telegram' | 'voice',
+    cortexPresentationReceipt?: CortexPresentationFenceReceipt,
   ): Promise<DeliveryAcknowledgementResult> {
     const ownerStreamId = await this.jobStore.resolveDeliveryOwner(
       acknowledgement.logical_turn_id,
       acknowledgement.revision,
     );
     const ownerJob = ownerStreamId ? await this.jobStore.getJob(ownerStreamId) : null;
-    if (!ownerJob) {
+    if (!ownerStreamId || !ownerJob) {
       return { status: 'not_found' };
     }
     if (
@@ -287,36 +450,74 @@ class GenerationJobManagerClass {
     ) {
       return { status: 'conflict' };
     }
-    return this.recordDeliveryAcknowledgement(acknowledgement);
+    let cortexPresentation: CortexPresentationBinding | null = null;
+    if (cortexPresentationReceipt) {
+      if (
+        !cortexPresentationMatchesReceipt(ownerJob.cortexPresentation, cortexPresentationReceipt)
+      ) {
+        return { status: 'retryable_conflict' };
+      }
+      cortexPresentation = ownerJob.cortexPresentation;
+    }
+    return this.recordDeliveryAcknowledgement(acknowledgement, cortexPresentation, ownerStreamId);
   }
 
   private async recordDeliveryAcknowledgement(
     acknowledgement: InteractionDeliveryAck,
+    expectedCortexPresentation: CortexPresentationBinding | null = null,
+    expectedOwnerStreamId?: string,
   ): Promise<DeliveryAcknowledgementResult> {
-    const result = await this.jobStore.acknowledgeDelivery(acknowledgement);
-    if (result.status !== 'recorded' || !result.ownerStreamId) {
+    const result = expectedCortexPresentation
+      ? await this.jobStore.bindDeliveryAcknowledgement(
+          expectedOwnerStreamId || '',
+          acknowledgement,
+          expectedCortexPresentation,
+        )
+      : await this.jobStore.acknowledgeDelivery(acknowledgement);
+    const ownerStreamId = result.ownerStreamId || expectedOwnerStreamId;
+    if (result.status !== 'recorded' || !ownerStreamId) {
       return result;
     }
-    const ownerJob = await this.jobStore.getJob(result.ownerStreamId);
+    const recordedAcknowledgement = result.acknowledgement;
+    const cortexPresentation =
+      'cortexPresentation' in result ? result.cortexPresentation : undefined;
+    const idempotent = result.idempotent === true;
+    if (expectedCortexPresentation && !cortexPresentation) {
+      return { status: 'retryable_conflict' };
+    }
+    const ownerJob = await this.jobStore.getJob(ownerStreamId);
     const presentation = ownerJob
       ? {
           userId: ownerJob.userId,
           conversationId: ownerJob.conversationId,
           responseMessageId: ownerJob.responseMessageId,
           interactionContext: ownerJob.interactionContext,
+          ...(cortexPresentation ? { cortexPresentation } : {}),
         }
       : undefined;
-    await this.jobStore.updateJob(result.ownerStreamId, {
-      deliveryAcknowledgement: result.acknowledgement,
+    await this.jobStore.updateJob(ownerStreamId, {
+      deliveryAcknowledgement: recordedAcknowledgement,
+      ...(cortexPresentation
+        ? {
+            cortexDeliveryAcknowledgement: recordedAcknowledgement,
+            cortexDeliveryAcknowledgementPresentation: cortexPresentation,
+          }
+        : {}),
     });
-    const job = await this.jobStore.getJob(result.ownerStreamId);
+    const job = await this.jobStore.getJob(ownerStreamId);
     if (acknowledgement.state === 'committed' && job?.generationCompleted === true) {
       await this.finalizeCompletedJob(
-        result.ownerStreamId,
+        ownerStreamId,
         job.deliveryPolicy?.commit_authority === 'external_adapter',
       );
     }
-    return { ...result, presentation };
+    return {
+      ...result,
+      ownerStreamId,
+      acknowledgement: recordedAcknowledgement,
+      idempotent,
+      presentation,
+    };
   }
 
   /** Server-owned commit point used only after canonical persistence and successful final emit. */
@@ -648,6 +849,7 @@ class GenerationJobManagerClass {
         deliveryPolicy: jobData.deliveryPolicy,
         deliveryAcknowledgement: jobData.deliveryAcknowledgement,
         generationCompleted: jobData.generationCompleted,
+        cortexPresentation: jobData.cortexPresentation,
       },
       readyPromise: runtime.readyPromise,
       resolveReady: runtime.resolveReady,

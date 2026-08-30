@@ -38,6 +38,8 @@ export const genTitleQueryKey = (conversationId: string) => ['genTitle', convers
 /** Response type for active jobs query */
 export interface ActiveJobsResponse {
   activeJobIds: string[];
+  /** Exact running streams; activeJobIds remains the deduplicated conversation projection. */
+  activeStreams?: Array<{ streamId: string; conversationId: string }>;
 }
 
 /** Module-level queue for title generation (survives re-renders).

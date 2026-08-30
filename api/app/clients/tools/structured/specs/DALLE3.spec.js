@@ -5,6 +5,7 @@ const DALLE3 = require('../DALLE3');
 jest.mock('openai');
 jest.mock('@librechat/data-schemas', () => {
   return {
+    ...jest.requireActual('@librechat/data-schemas'),
     logger: {
       info: jest.fn(),
       warn: jest.fn(),

@@ -3,6 +3,7 @@ import type { Agents } from 'librechat-data-provider';
 import type { ServerSentEvent } from '~/types';
 import type {
   AdapterCapabilities,
+  CortexPresentationBinding,
   InteractionContext,
   InteractionDeliveryAck,
   InteractionDeliveryPolicy,
@@ -30,6 +31,7 @@ export interface GenerationJobMetadata {
   deliveryPolicy?: InteractionDeliveryPolicy;
   deliveryAcknowledgement?: InteractionDeliveryAck;
   generationCompleted?: boolean;
+  cortexPresentation?: CortexPresentationBinding;
   /** Viventium voice-call session that owns this generation, when applicable */
   voiceCallSessionId?: string;
 }

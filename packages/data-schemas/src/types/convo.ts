@@ -1,4 +1,5 @@
 import type { Document, Types } from 'mongoose';
+import type { IPersonalAccountCleanupTombstone } from './personalAccountCleanupTombstone';
 
 // @ts-ignore
 export interface IConversation extends Document {
@@ -56,4 +57,8 @@ export interface IConversation extends Document {
   expiredAt?: Date;
   createdAt?: Date;
   updatedAt?: Date;
+  /* === VIVENTIUM START === Retained synthetic-QA cleanup CAS state. === */
+  deletedAt?: Date;
+  cleanupTombstone?: IPersonalAccountCleanupTombstone;
+  /* === VIVENTIUM END === */
 }

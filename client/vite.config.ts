@@ -152,6 +152,7 @@ export default defineConfig(({ command, mode }) => {
           ],
           globIgnores: ['images/**/*', '**/*.map', 'index.html'],
           maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
+          navigateFallback: null,
           navigateFallbackDenylist: [/^\/oauth/, /^\/api/],
         },
         includeAssets: [],

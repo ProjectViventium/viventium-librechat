@@ -65,6 +65,24 @@ const {
 const router = express.Router();
 const SCHEDULER_SECRET_HEADER = 'x-viventium-scheduler-secret';
 const SCHEDULER_DISPATCH_COLLECTION = 'viventium_scheduler_dispatch_intents';
+const SCHEDULER_FALLBACK_TITLE_SOURCE = 'Scheduled Background Processing';
+
+/* === VIVENTIUM START ===
+ * Feature: Public-safe scheduler conversation titles.
+ * Purpose: The model execution text contains a private scheduler envelope. Title generation must
+ * receive the separately couriered task source, never that internal control prompt.
+ * === VIVENTIUM END === */
+function schedulerTitleSource(value) {
+  const source = typeof value === 'string' ? value.trim() : '';
+  return source ? source.slice(0, 2000) : SCHEDULER_FALLBACK_TITLE_SOURCE;
+}
+
+function addSchedulerTitle(req, args) {
+  return addTitle(req, {
+    ...args,
+    text: req.viventiumSchedulerTitleSource || SCHEDULER_FALLBACK_TITLE_SOURCE,
+  });
+}
 
 function normalizeSchedulerIdempotencyKey(value) {
   const key = typeof value === 'string' ? value.trim() : '';
@@ -107,10 +125,158 @@ function writeSseEvent(res, eventName, payload) {
   if (res.writableEnded) {
     return;
   }
-  res.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+  res.write(`event: ${eventName}\ndata: ${JSON.stringify(schedulerSafeEvent(payload))}\n\n`);
   if (typeof res.flush === 'function') {
     res.flush();
   }
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Private scheduled-provider failure reporting.
+ * Purpose: Preserve typed actionable failure truth without exposing upstream bodies or credentials.
+ * === VIVENTIUM END === */
+const SCHEDULER_PUBLIC_FAILURES = Object.freeze({
+  provider_quota_exhausted: 'The selected model provider quota is exhausted.',
+  provider_rate_limited: 'The model provider rate-limited this request.',
+  provider_unauthorized: 'The model provider credentials were rejected.',
+  provider_access_denied: 'The model provider denied access to this request.',
+  provider_auth_missing: 'The configured model provider authentication is unavailable.',
+  provider_response_failed: 'The model provider could not complete this request.',
+  provider_response_deadline_exceeded: 'The model provider response exceeded its deadline.',
+  provider_temporarily_unavailable: 'The model provider is temporarily unavailable.',
+  completion_error: 'The scheduled model response could not be completed.',
+});
+
+const SCHEDULER_PRIVATE_EVENT_FIELDS = new Set([
+  'access_token',
+  'accesstoken',
+  'api_key',
+  'api-key',
+  'apikey',
+  'authorization',
+  'bearer_token',
+  'bearertoken',
+  'client_secret',
+  'clientsecret',
+  'cookie',
+  'credentials',
+  'id_token',
+  'idtoken',
+  'password',
+  'private_key',
+  'privatekey',
+  'proxy-authorization',
+  'refresh_token',
+  'refreshtoken',
+  'secret',
+  'session_token',
+  'sessiontoken',
+  'set-cookie',
+  'token',
+  'x-api-key',
+  'x-auth-token',
+]);
+
+const SCHEDULER_FAILURE_EVENT_FIELDS = new Set([
+  'error',
+  'failure',
+  'last_error',
+  'lasterror',
+  'provider_error',
+  'provider_failure',
+  'providererror',
+  'providerfailure',
+]);
+
+function schedulerSafeFailure(error) {
+  const details = error && typeof error === 'object' ? error : {};
+  const declaredClass = [
+    details.error_class,
+    details.failure_class,
+    details.code,
+    details.cause?.errorClass,
+  ].find((value) => typeof value === 'string' && Object.hasOwn(SCHEDULER_PUBLIC_FAILURES, value));
+  const status = Number(details.status ?? details.statusCode);
+  const statusClass =
+    status === 401
+      ? 'provider_unauthorized'
+      : status === 403
+        ? 'provider_access_denied'
+        : status === 429
+          ? 'provider_rate_limited'
+          : '';
+  const errorClass = declaredClass || statusClass || 'completion_error';
+  return {
+    error: SCHEDULER_PUBLIC_FAILURES[errorClass],
+    error_class: errorClass,
+  };
+}
+
+function schedulerSafeEvent(event) {
+  if (Array.isArray(event)) {
+    return event.map(schedulerSafeEvent);
+  }
+  if (!event || typeof event !== 'object') {
+    return event;
+  }
+
+  const isPublicFailure =
+    typeof event.error === 'string' &&
+    Object.hasOwn(SCHEDULER_PUBLIC_FAILURES, event.error_class) &&
+    event.error === SCHEDULER_PUBLIC_FAILURES[event.error_class];
+  if (event.type === 'error' || isPublicFailure) {
+    return {
+      ...(event.type === 'error' ? { type: 'error' } : {}),
+      ...schedulerSafeFailure(event),
+      ...(typeof event.failure_retryable === 'boolean'
+        ? { failure_retryable: event.failure_retryable }
+        : {}),
+      ...(Number.isInteger(event.failure_contract_version)
+        ? { failure_contract_version: event.failure_contract_version }
+        : {}),
+    };
+  }
+
+  const safeEvent = {};
+  for (const [field, value] of Object.entries(event)) {
+    const normalizedField = field.toLowerCase();
+    if (SCHEDULER_PRIVATE_EVENT_FIELDS.has(normalizedField)) {
+      continue;
+    }
+    if (SCHEDULER_FAILURE_EVENT_FIELDS.has(normalizedField) && value) {
+      safeEvent[field] = schedulerSafeFailure(
+        typeof value === 'object' ? value : { ...event, error: value },
+      );
+      continue;
+    }
+    safeEvent[field] = schedulerSafeEvent(value);
+  }
+  return safeEvent;
+}
+
+function schedulerFinalFailure(event) {
+  const errorPart = Array.isArray(event?.responseMessage?.content)
+    ? event.responseMessage.content.find((part) => part?.type === 'error')
+    : null;
+  const error = extractFinalError(event) || String(errorPart?.error || '').trim();
+  if (!error) {
+    return null;
+  }
+
+  const publicFailure = schedulerSafeFailure({
+    error_class:
+      errorPart?.error_class || event?.error?.error_class || event?.error?.failure_class || '',
+    status: event?.error?.status,
+  });
+  return {
+    ...publicFailure,
+    ...(typeof errorPart?.failure_retryable === 'boolean'
+      ? { failure_retryable: errorPart.failure_retryable }
+      : {}),
+    ...(Number.isInteger(errorPart?.failure_contract_version)
+      ? { failure_contract_version: errorPart.failure_contract_version }
+      : {}),
+  };
 }
 
 function getSchedulerUserId(req = {}) {
@@ -333,6 +499,8 @@ router.post(
     const sanitizedIncoming = { ...incoming };
     delete sanitizedIncoming.interactionContext;
     delete sanitizedIncoming.viventiumInteractionContext;
+    delete sanitizedIncoming.titleText;
+    req.viventiumSchedulerTitleSource = schedulerTitleSource(incoming.titleText);
     let scheduledAgentExecution;
     try {
       scheduledAgentExecution = normalizeScheduledAgentExecution(
@@ -506,7 +674,7 @@ router.post(
   validateConvoAccess,
   buildEndpointOption,
   async (req, res, next) => {
-    const result = await AgentController(req, res, next, initializeClient, addTitle);
+    const result = await AgentController(req, res, next, initializeClient, addSchedulerTitle);
     if (req.viventiumSchedulerDispatchDocumentId) {
       await schedulerDispatchCollection().updateOne(
         { _id: req.viventiumSchedulerDispatchDocumentId },
@@ -623,7 +791,10 @@ router.post('/telegram/resolve', schedulerAuth, async (req, res) => {
       },
     });
   } catch (err) {
-    logger.error('[VIVENTIUM][scheduler/telegram] Failed to resolve mapping:', err);
+    logger.error(
+      '[VIVENTIUM][scheduler/telegram] Failed to resolve mapping',
+      schedulerSafeFailure(err),
+    );
     return res.status(500).json({ error: 'Failed to resolve Telegram mapping' });
   }
 });
@@ -731,7 +902,7 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
     },
     (error) => {
       if (!res.writableEnded) {
-        writeSseEvent(res, 'error', { error: String(error || 'Stream error') });
+        writeSseEvent(res, 'error', schedulerSafeFailure(error));
         endStream();
       }
     },
@@ -745,7 +916,11 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
         error,
       );
       if (!res.writableEnded) {
-        writeSseEvent(res, 'error', { error: 'Stream connection unavailable' });
+        writeSseEvent(
+          res,
+          'error',
+          schedulerSafeFailure({ code: 'provider_temporarily_unavailable' }),
+        );
         endStream();
       }
     }
@@ -758,7 +933,11 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
       return;
     }
     if (!res.writableEnded) {
-      writeSseEvent(res, 'error', { error: 'Failed to subscribe to stream' });
+      writeSseEvent(
+        res,
+        'error',
+        schedulerSafeFailure({ code: 'provider_temporarily_unavailable' }),
+      );
       endStream();
     }
     return;
@@ -868,9 +1047,9 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
           return;
         }
 
-        const finalError = extractFinalError(event);
-        if (finalError) {
-          writeSseEvent(res, 'error', { error: finalError });
+        const finalFailure = schedulerFinalFailure(event);
+        if (finalFailure) {
+          writeSseEvent(res, 'error', finalFailure);
         }
 
         const finalText = extractFinalResponseText(event);
@@ -900,7 +1079,7 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
       },
       (error) => {
         if (!res.writableEnded) {
-          writeSseEvent(res, 'error', { error: String(error || 'Stream error') });
+          writeSseEvent(res, 'error', schedulerSafeFailure(error));
           res.end();
         }
       },
@@ -913,7 +1092,11 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
     res.removeListener('close', onRequestClose);
     logger.error(`[VIVENTIUM][SchedulerEvents] subscription readiness failed: ${streamId}`, error);
     if (!res.writableEnded) {
-      writeSseEvent(res, 'error', { error: 'Stream connection unavailable' });
+      writeSseEvent(
+        res,
+        'error',
+        schedulerSafeFailure({ code: 'provider_temporarily_unavailable' }),
+      );
       res.end();
     }
     return;
@@ -925,7 +1108,11 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
       return;
     }
     if (!res.writableEnded) {
-      writeSseEvent(res, 'error', { error: 'Failed to subscribe to stream' });
+      writeSseEvent(
+        res,
+        'error',
+        schedulerSafeFailure({ code: 'provider_temporarily_unavailable' }),
+      );
       res.end();
     }
     return;
@@ -964,7 +1151,10 @@ router.get('/cortex/:messageId', schedulerAuth, async (req, res) => {
 
     return res.json(state);
   } catch (err) {
-    logger.error('[VIVENTIUM][scheduler/cortex] Failed to load cortex data:', err);
+    logger.error(
+      '[VIVENTIUM][scheduler/cortex] Failed to load cortex data',
+      schedulerSafeFailure(err),
+    );
     return res.status(500).json({ error: 'Failed to load cortex data' });
   }
 });

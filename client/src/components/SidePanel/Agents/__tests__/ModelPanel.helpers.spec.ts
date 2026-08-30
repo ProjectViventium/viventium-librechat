@@ -6,6 +6,21 @@ import {
   resolveAgentModelForProvider,
   shouldDefaultOpenAIGPT56AgentToResponses,
 } from '../modelSelection';
+import { filterExcludedModelParameters } from '../ModelParametersSection';
+
+describe('filterExcludedModelParameters', () => {
+  it('removes parameters owned by a dedicated control without changing the remaining order', () => {
+    const parameters = [
+      { key: 'temperature', component: 'slider', default: 1 },
+      { key: 'reasoning_effort', component: 'select', default: 'medium' },
+      { key: 'top_p', component: 'slider', default: 1 },
+    ];
+
+    expect(
+      filterExcludedModelParameters(parameters, ['reasoning_effort']).map(({ key }) => key),
+    ).toEqual(['temperature', 'top_p']);
+  });
+});
 
 describe('resolveCapabilityEffort', () => {
   const modelCapability = {

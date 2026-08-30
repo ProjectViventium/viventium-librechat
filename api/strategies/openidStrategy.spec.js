@@ -30,7 +30,7 @@ jest.mock('~/models', () => ({
   updateUser: jest.fn(),
 }));
 jest.mock('@librechat/data-schemas', () => ({
-  ...jest.requireActual('@librechat/api'),
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: {
     info: jest.fn(),
     warn: jest.fn(),

@@ -7,6 +7,9 @@ const { getAppConfig } = require('~/server/services/Config/app');
 const { getProjectByName } = require('~/models/Project');
 const { getLogStores } = require('~/cache');
 const { isBrowserRegistrationOpen } = require('~/server/services/viventium/registrationGate');
+const {
+  parallelWorkDeploymentAvailableAsync,
+} = require('~/server/services/viventium/ViventiumOrchestrationMode');
 // VIVENTIUM START
 // Purpose: Project the account-setup capability without requiring a provider secret sentinel.
 const {
@@ -42,6 +45,26 @@ const viventiumGlassHiveFollowupTimeoutS =
   Number.isFinite(glasshiveFollowupTimeoutS) && glasshiveFollowupTimeoutS > 0
     ? glasshiveFollowupTimeoutS
     : 600;
+
+const connectedAccountRequired = (...values) =>
+  values.some(
+    (value) =>
+      String(value || '')
+        .trim()
+        .toLowerCase() === 'connected_account',
+  );
+
+const connectedAccountAuthRequirements = () => ({
+  viventiumOpenAIConnectedAccountRequired: connectedAccountRequired(
+    process.env.VIVENTIUM_OPENAI_AUTH_MODE,
+    process.env.VIVENTIUM_PRIMARY_AUTH_MODE,
+  ),
+  viventiumAnthropicConnectedAccountRequired: connectedAccountRequired(
+    process.env.VIVENTIUM_ANTHROPIC_AUTH_MODE,
+    process.env.VIVENTIUM_PRIMARY_AUTH_MODE,
+    process.env.VIVENTIUM_SECONDARY_AUTH_MODE,
+  ),
+});
 // VIVENTIUM END
 
 router.get('/', async function (req, res) {
@@ -51,7 +74,11 @@ router.get('/', async function (req, res) {
   const cachedStartupConfig =
     bootstrapRegistrationOnce === true ? null : await cache.get(CacheKeys.STARTUP_CONFIG);
   if (cachedStartupConfig) {
-    res.send(cachedStartupConfig);
+    res.send({
+      ...cachedStartupConfig,
+      viventiumParallelWorkAvailable: await parallelWorkDeploymentAvailableAsync(),
+      ...connectedAccountAuthRequirements(),
+    });
     return;
   }
 
@@ -126,6 +153,7 @@ router.get('/', async function (req, res) {
        * Purpose: Gate the novice-facing OpenAI/Anthropic credential setup surface.
        * === VIVENTIUM END === */
       viventiumConnectedAccountsEnabled: isConnectedAccountsCapabilityEnabled(),
+      ...connectedAccountAuthRequirements(),
       /* === VIVENTIUM START ===
        * Feature: Per-user credential policy visibility.
        * Purpose: A saved personal-only policy remains enforceable and reversible even when the
@@ -177,6 +205,11 @@ router.get('/', async function (req, res) {
       viventiumFeelingsAvailable:
         process.env.VIVENTIUM_FEELINGS_AVAILABLE == null ||
         isEnabled(process.env.VIVENTIUM_FEELINGS_AVAILABLE),
+      /* === VIVENTIUM START ===
+       * Feature: Parallel work staged availability.
+       * Purpose: Keep every product control dark until durable runtime admission gates pass.
+       * === VIVENTIUM END === */
+      viventiumParallelWorkAvailable: await parallelWorkDeploymentAvailableAsync(),
       /* === VIVENTIUM START ===
        * Feature: Background follow-up browser-listening parity.
        * Purpose: Bound Web query refreshes with the same compiled window as Phase B surfaces.

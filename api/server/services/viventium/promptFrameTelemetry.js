@@ -18,11 +18,29 @@ const DEBUG_LOCAL_ENV = 'VIVENTIUM_PROMPT_FRAME_DEBUG_LOCAL';
 const DEBUG_CHAR_LIMIT_ENV = 'VIVENTIUM_PROMPT_FRAME_DEBUG_CHAR_LIMIT';
 const FILE_LOG_ENV = 'VIVENTIUM_PROMPT_FRAME_FILE_LOG';
 const OBSERVABILITY_DIR_ENV = 'VIVENTIUM_PROMPT_OBSERVABILITY_DIR';
-const FILE_LOG_MAX_PENDING_ENV = 'VIVENTIUM_PROMPT_FRAME_FILE_LOG_MAX_PENDING';
 
 const DEFAULT_HASH_LENGTH = 16;
 const DEFAULT_DEBUG_CHAR_LIMIT = 2000;
 const MAX_DEBUG_CHAR_LIMIT = 250_000;
+const MAX_TRACE_LOG_BYTES = 8192;
+const PROMPT_FRAME_FALLBACK_REASONS = new Set([
+  'none',
+  'provider_access_denied',
+  'provider_auth_missing',
+  'provider_connected_account_reconnect_required',
+  'provider_error',
+  'provider_invalid_response',
+  'provider_network',
+  'provider_quota_exhausted',
+  'provider_quota_or_billing',
+  'provider_rate_limited',
+  'provider_response_deadline_exceeded',
+  'provider_response_failed',
+  'provider_server_error',
+  'provider_temporarily_unavailable',
+  'provider_timeout',
+  'provider_unauthorized',
+]);
 const NON_VOICE_BRACKET_MARKERS = new Set([
   'email',
   'local_path',
@@ -61,6 +79,8 @@ const PROMPT_FRAME_LAYER_ALIASES = Object.freeze({
   instructions_before_surface_injection: 'main_instructions',
   primary_run_instructions: 'main_instructions',
   additional_run_instructions: 'main_instructions',
+  viventium_user_fact_guard: 'main_instructions',
+  background_cortex_runtime_card_guard: 'main_instructions',
   global_no_response: 'global_no_response',
   no_response: 'global_no_response',
   no_response_instructions: 'global_no_response',
@@ -80,7 +100,11 @@ const PROMPT_FRAME_LAYER_ALIASES = Object.freeze({
   wing_mode: 'surface_prompt',
   telegram_text: 'surface_prompt',
   telegram_audio_output: 'surface_prompt',
+  telegram_reply_context: 'surface_prompt',
+  voice_gateway_insight_instructions: 'surface_prompt',
   web_text: 'surface_prompt',
+  workbench_text: 'surface_prompt',
+  scheduled_canonical_output: 'surface_prompt',
   playground_text: 'surface_prompt',
   mcp_server_instructions: 'mcp_server_instructions',
   tool_schemas: 'tool_schemas',
@@ -91,6 +115,11 @@ const PROMPT_FRAME_LAYER_ALIASES = Object.freeze({
   file_context: 'background_context',
   formatted_input_messages: 'background_context',
   background_context: 'background_context',
+  active_work_context: 'background_context',
+  rapid_source_selection: 'background_context',
+  main_continuity: 'background_context',
+  main_context_snapshot: 'background_context',
+  recurrence_state: 'background_context',
   activation_system: 'cortex_activation',
   activation_prompt: 'cortex_activation',
   activation_context: 'cortex_activation',
@@ -106,12 +135,88 @@ const PROMPT_FRAME_LAYER_ALIASES = Object.freeze({
   phase_b_followup: 'followup',
   recent_response: 'followup',
   continuation_context: 'followup',
+  user_request: 'followup',
   time_context: 'time_context',
   unknown: 'unknown',
 });
 
 const fileHashCache = new Map();
-let pendingFileWrites = 0;
+const observedUnknownPromptLayerNames = new Set();
+const PROMPT_TRACE_FAMILIES = new Set([
+  'main_assembly',
+  'main_runtime',
+  'main_run_create',
+  'cortex_activation',
+  'cortex_execution',
+  'phase_b_followup',
+]);
+const PROMPT_TRACE_SURFACES = new Set([
+  'web',
+  'telegram',
+  'voice',
+  'workbench',
+  'scheduler',
+  'playground',
+]);
+const PROMPT_TRACE_AUTH_CLASSES = new Set(['user_runtime', 'connected_account_runtime']);
+const PROMPT_TRACE_FLAG_BOOLEAN_KEYS = new Set([
+  'voice_mode',
+  'wing_mode',
+  'listen_only',
+  'primary_response_mode',
+  'has_abort_signal',
+  'productivity_context_isolated',
+  'has_request_files',
+  'no_response_injected',
+  'use_voice_model',
+  'ephemeral_agent',
+  'telegram_surface',
+  'playground_surface',
+  'has_user_mcp_auth_map',
+  'background_cortices_enabled',
+  'tool_cortex_hold_wanted',
+]);
+const PROMPT_TRACE_FLAG_NUMBER_KEYS = new Set([
+  'agent_count',
+  'tool_count',
+  'activated_cortex_count',
+]);
+const PROMPT_TRACE_FLAG_STRING_KEYS = new Set(['input_mode']);
+const PROMPT_TRACE_DECISION_BOOLEAN_KEYS = new Set([
+  'should_respond',
+  'should_follow_up',
+  'no_response',
+  'tool_cortex_hold_wanted',
+]);
+const PROMPT_TRACE_DECISION_NUMBER_KEYS = new Set([
+  'confidence',
+  'activation_count',
+  'activated_count',
+  'visible_insight_count',
+  'silent_count',
+  'error_count',
+  'raw_insight_count',
+  'deduped_insight_count',
+]);
+const PROMPT_TRACE_DECISION_STRING_KEYS = new Set(['status', 'decision', 'reason_code']);
+const PROMPT_TRACE_SOURCE_HASH_KEYS = new Set([
+  'agent_source',
+  'librechat_source',
+  'compiled_runtime_config',
+  'live_installed_runtime_config',
+  'compiler_version',
+]);
+
+function promptLayerIntegritySnapshot() {
+  return Object.freeze({
+    contractVersion: 1,
+    unknownLayerNames: Object.freeze([...observedUnknownPromptLayerNames].sort().slice(0, 128)),
+  });
+}
+
+function resetPromptLayerIntegrityForTests() {
+  observedUnknownPromptLayerNames.clear();
+}
 
 function resolveLibreChatRoot() {
   return path.resolve(__dirname, '..', '..', '..', '..');
@@ -361,6 +466,30 @@ function normalizeString(value, fallback = 'unknown') {
   return trimmed || fallback;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Fail-closed prompt-frame execution lineage.
+ * Purpose: Carry an exact requested/effective provider-model-effort triple and only a bounded,
+ * typed fallback reason. Raw provider errors never enter prompt telemetry or public evidence.
+ * === VIVENTIUM END === */
+function normalizeRouteEffort(value) {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase();
+  return /^[a-z0-9][a-z0-9._:-]{0,31}$/.test(normalized) ? normalized : 'missing';
+}
+
+function normalizeFallbackReason(value, fallbackUsed) {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase();
+  if (fallbackUsed !== true) {
+    return normalized && normalized !== 'none' ? 'missing' : 'none';
+  }
+  return normalized !== 'none' && PROMPT_FRAME_FALLBACK_REASONS.has(normalized)
+    ? normalized
+    : 'missing';
+}
+
 function normalizeFlags(flags = {}) {
   if (!flags || typeof flags !== 'object') {
     return {};
@@ -429,11 +558,52 @@ function buildDebugLayers(layers = {}) {
   }, {});
 }
 
+function resolvePromptFrameAgentHash(agentId, decisionState) {
+  const actualAgentId = typeof agentId === 'string' ? agentId.trim() : '';
+  const decisionHash =
+    typeof decisionState?.agent_id_hash === 'string'
+      ? decisionState.agent_id_hash.trim().toLowerCase()
+      : '';
+  const completeDecisionHash = /^[0-9a-f]{16}$/.test(decisionHash);
+
+  if (!actualAgentId) {
+    return completeDecisionHash ? decisionHash : 'missing';
+  }
+
+  const actualHash = hashString(actualAgentId);
+  if (decisionHash && !actualHash.startsWith(decisionHash)) {
+    return 'missing';
+  }
+  return actualHash;
+}
+
+function buildPromptFrameRequestIdentityHash({ ownerId, interactionContext } = {}) {
+  const normalizedOwnerId = String(ownerId || '').trim();
+  const surface = String(interactionContext?.surface || '')
+    .trim()
+    .toLowerCase();
+  const sourceEventId = String(interactionContext?.source_event_id || '').trim();
+  if (!normalizedOwnerId || !surface || !sourceEventId) {
+    return 'missing';
+  }
+  return hashString(
+    ['viventium.prompt-frame-request.v1', normalizedOwnerId, surface, sourceEventId].join('\0'),
+  );
+}
+
 function buildPromptFrame({
   promptFamily,
   surface,
+  requestedProvider,
+  requestedModel,
+  requestedEffort,
   provider,
   model,
+  reasoningEffort,
+  fallbackUsed = false,
+  fallbackReason = '',
+  agentId,
+  requestIdentity,
   authClass = 'unknown',
   layers = {},
   sourceHashes = {},
@@ -444,6 +614,9 @@ function buildPromptFrame({
   voiceText = '',
 } = {}) {
   const normalizedContract = normalizeLayersToContract(layers);
+  for (const layerName of normalizedContract.unknown_layer_names) {
+    observedUnknownPromptLayerNames.add(layerName);
+  }
   const layerSummary = summarizeLayers(normalizedContract.layers);
   const sourceFileHashes = summarizePromptSourceFiles(promptSourceFiles);
   const normalizedSourceHashes =
@@ -483,8 +656,18 @@ function buildPromptFrame({
     layer_contract_version: 1,
     prompt_family: normalizeString(promptFamily, 'unknown'),
     surface: normalizeString(surface, 'unknown'),
+    requested_provider: normalizeString(requestedProvider ?? provider, 'missing'),
+    requested_model: normalizeString(requestedModel ?? model, 'missing'),
+    requested_effort: normalizeRouteEffort(requestedEffort ?? reasoningEffort),
     provider: normalizeString(provider, 'unknown'),
     model: normalizeString(model, 'unknown'),
+    effective_provider: normalizeString(provider, 'missing'),
+    effective_model: normalizeString(model, 'missing'),
+    effective_effort: normalizeRouteEffort(reasoningEffort),
+    fallback_used: fallbackUsed === true,
+    fallback_reason: normalizeFallbackReason(fallbackReason, fallbackUsed === true),
+    agent_id_hash: resolvePromptFrameAgentHash(agentId, decisionState),
+    request_identity_hash: buildPromptFrameRequestIdentityHash(requestIdentity),
     auth_class: normalizeString(authClass, 'unknown'),
     layer_token_estimates: layerSummary.token_estimates,
     layer_char_counts: layerSummary.char_counts,
@@ -516,50 +699,12 @@ function resolvePromptObservabilityDir() {
   return path.join(privateRoot, 'prompt-observability');
 }
 
-function shouldWritePromptFrameFile() {
-  if (process.env[FILE_LOG_ENV] !== '1') {
-    return false;
-  }
-  if (process.env.CI === 'true' || process.env.NODE_ENV === 'production') {
-    return false;
-  }
+function writePromptFrameFile() {
+  return false;
+}
+
+async function flushPromptFrameFileWrites() {
   return true;
-}
-
-function maxPendingFileWrites() {
-  const parsed = parseInt(String(process.env[FILE_LOG_MAX_PENDING_ENV] || ''), 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 256;
-}
-
-function writePromptFrameFile(frame) {
-  if (!shouldWritePromptFrameFile() || !frame || typeof frame !== 'object') {
-    return false;
-  }
-  if (pendingFileWrites >= maxPendingFileWrites()) {
-    return false;
-  }
-
-  const day = new Date().toISOString().slice(0, 10);
-  const dir = path.join(resolvePromptObservabilityDir(), 'frame-logs', day);
-  const filePath = path.join(dir, `prompt-frames-${process.pid}.jsonl`);
-  const line = `${JSON.stringify(frame)}\n`;
-  pendingFileWrites += 1;
-  fs.promises
-    .mkdir(dir, { recursive: true, mode: 0o700 })
-    .then(() => fs.promises.appendFile(filePath, line, { encoding: 'utf8', mode: 0o600 }))
-    .catch(() => undefined)
-    .finally(() => {
-      pendingFileWrites = Math.max(0, pendingFileWrites - 1);
-    });
-  return true;
-}
-
-async function flushPromptFrameFileWrites({ timeoutMs = 1000 } = {}) {
-  const deadline = Date.now() + timeoutMs;
-  while (pendingFileWrites > 0 && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  return pendingFileWrites === 0;
 }
 
 /* === VIVENTIUM START ===
@@ -579,12 +724,200 @@ function routeIdentityHash(value) {
 }
 
 function buildPromptFrameRouteTelemetry(frame) {
+  const observedAgentIdHash = String(frame?.agent_id_hash || '');
+  const requestIdentityHash = String(frame?.request_identity_hash || '');
   return {
-    v: 1,
+    v: 2,
     f: compactRouteLabel(frame?.prompt_family, 'unknown'),
-    p: routeIdentityHash(frame?.provider),
-    m: routeIdentityHash(frame?.model),
+    s: compactRouteLabel(frame?.surface, 'unknown'),
+    rp: routeIdentityHash(frame?.requested_provider),
+    rm: routeIdentityHash(frame?.requested_model),
+    re: normalizeRouteEffort(frame?.requested_effort),
+    ep: routeIdentityHash(frame?.effective_provider ?? frame?.provider),
+    em: routeIdentityHash(frame?.effective_model ?? frame?.model),
+    ee: normalizeRouteEffort(frame?.effective_effort),
+    fu: frame?.fallback_used === true,
+    fr: normalizeFallbackReason(frame?.fallback_reason, frame?.fallback_used === true),
+    a: /^[0-9a-f]{16}$/.test(observedAgentIdHash) ? observedAgentIdHash : 'missing',
+    q: /^[0-9a-f]{16}$/.test(requestIdentityHash) ? requestIdentityHash : 'missing',
   };
+}
+
+function serializePromptFrameRouteTelemetry(frame) {
+  const route = buildPromptFrameRouteTelemetry(frame);
+  return JSON.stringify([
+    route.v,
+    route.f,
+    route.s,
+    route.rp,
+    route.rm,
+    route.re,
+    route.ep,
+    route.em,
+    route.ee,
+    route.fu ? 1 : 0,
+    route.fr,
+    route.a,
+    route.q,
+  ]);
+}
+
+function traceCategory(value, allowedValues) {
+  const normalized = String(value || '').trim();
+  return allowedValues.has(normalized) ? normalized : 'unknown';
+}
+
+function traceIdentityHash(value) {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase();
+  return /^[0-9a-f]{16}$/.test(normalized) ? normalized : 'missing';
+}
+
+function traceSourceHash(value) {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase();
+  return /^(?:[0-9a-f]{8,64}|missing)$/.test(normalized) ? normalized : 'missing';
+}
+
+function boundedTraceNumber(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return Math.max(0, Math.min(Math.round(value * 1_000_000) / 1_000_000, 1_000_000_000));
+}
+
+function traceScalarProjection(value, booleanKeys, numberKeys, stringKeys) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  const projection = {};
+  for (const key of booleanKeys) {
+    if (typeof value[key] === 'boolean') {
+      projection[key] = value[key];
+    }
+  }
+  for (const key of numberKeys) {
+    const bounded = boundedTraceNumber(value[key]);
+    if (bounded !== undefined) {
+      projection[key] = bounded;
+    }
+  }
+  for (const key of stringKeys) {
+    if (typeof value[key] === 'string' && value[key].trim()) {
+      projection[`${key}_hash`] = hashString(value[key]);
+    }
+  }
+  return projection;
+}
+
+function traceLayerNumbers(values) {
+  const input = values && typeof values === 'object' ? values : {};
+  return PROMPT_FRAME_LAYERS.reduce((projection, layerName) => {
+    projection[layerName] = boundedTraceNumber(input[layerName]) ?? 0;
+    return projection;
+  }, {});
+}
+
+function traceLayerHashes(values) {
+  const input = values && typeof values === 'object' ? values : {};
+  return PROMPT_FRAME_LAYERS.reduce((projection, layerName) => {
+    const normalized = String(input[layerName] || '')
+      .trim()
+      .toLowerCase();
+    projection[layerName] = /^(?:[0-9a-f]{16}|none)$/.test(normalized) ? normalized : 'missing';
+    return projection;
+  }, {});
+}
+
+function traceSourceHashes(values) {
+  const input = values && typeof values === 'object' ? values : {};
+  const projection = {};
+  for (const key of PROMPT_TRACE_SOURCE_HASH_KEYS) {
+    projection[key] = traceSourceHash(input[key]);
+  }
+  return projection;
+}
+
+function traceMcpInstructionCounts(values) {
+  const counts = { server_fetched: 0, config_inline: 0, missing: 0 };
+  if (!values || typeof values !== 'object' || Array.isArray(values)) {
+    return counts;
+  }
+  for (const value of Object.values(values)) {
+    const key = ['server_fetched', 'config_inline'].includes(value) ? value : 'missing';
+    counts[key] += 1;
+  }
+  return counts;
+}
+
+function traceVoiceMarkerCounts(values) {
+  const input = values && typeof values === 'object' ? values : {};
+  return ['break_tags', 'prosody_tags', 'say_as_tags', 'emotion_tags', 'total'].reduce(
+    (projection, key) => {
+      projection[key] = boundedTraceNumber(input[key]) ?? 0;
+      return projection;
+    },
+    {},
+  );
+}
+
+function buildPromptFrameTraceTelemetry(frame, { now = () => new Date() } = {}) {
+  const observedAt = now();
+  const timestamp =
+    observedAt instanceof Date ? observedAt.toISOString() : new Date(0).toISOString();
+  const unknownLayers = Array.isArray(frame?.unknown_layer_names)
+    ? frame.unknown_layer_names.filter((value) => typeof value === 'string').slice(0, 128)
+    : [];
+  return {
+    version: 2,
+    time: timestamp,
+    family: traceCategory(frame?.prompt_family, PROMPT_TRACE_FAMILIES),
+    surface: traceCategory(frame?.surface, PROMPT_TRACE_SURFACES),
+    requested_provider: `h${routeIdentityHash(frame?.requested_provider)}`,
+    requested_model: `h${routeIdentityHash(frame?.requested_model)}`,
+    requested_effort: normalizeRouteEffort(frame?.requested_effort),
+    provider: `h${routeIdentityHash(frame?.effective_provider ?? frame?.provider)}`,
+    model: `h${routeIdentityHash(frame?.effective_model ?? frame?.model)}`,
+    effective_effort: normalizeRouteEffort(frame?.effective_effort),
+    fallback_used: frame?.fallback_used === true,
+    fallback_reason: normalizeFallbackReason(frame?.fallback_reason, frame?.fallback_used === true),
+    agent_id_hash: traceIdentityHash(frame?.agent_id_hash),
+    request_identity_hash: traceIdentityHash(frame?.request_identity_hash),
+    auth_class: traceCategory(frame?.auth_class, PROMPT_TRACE_AUTH_CLASSES),
+    layer_tokens: traceLayerNumbers(frame?.layer_token_estimates),
+    layer_hashes: traceLayerHashes(frame?.layer_hashes),
+    source_hashes: traceSourceHashes(frame?.source_hashes),
+    flags: traceScalarProjection(
+      frame?.flags,
+      PROMPT_TRACE_FLAG_BOOLEAN_KEYS,
+      PROMPT_TRACE_FLAG_NUMBER_KEYS,
+      PROMPT_TRACE_FLAG_STRING_KEYS,
+    ),
+    decision: traceScalarProjection(
+      frame?.decision_state,
+      PROMPT_TRACE_DECISION_BOOLEAN_KEYS,
+      PROMPT_TRACE_DECISION_NUMBER_KEYS,
+      PROMPT_TRACE_DECISION_STRING_KEYS,
+    ),
+    mcp_instruction_source_counts: traceMcpInstructionCounts(frame?.mcp_instruction_sources),
+    voice_provider_control_marker_counts: traceVoiceMarkerCounts(
+      frame?.voice_provider_control_marker_counts,
+    ),
+    unknown_layer_count: unknownLayers.length,
+    unknown_layer_set_hash: unknownLayers.length
+      ? hashString([...unknownLayers].sort().join('\0'))
+      : 'none',
+  };
+}
+
+function serializePromptFrameTraceTelemetry(frame) {
+  const serialized = JSON.stringify(buildPromptFrameTraceTelemetry(frame));
+  if (Buffer.byteLength(serialized) > MAX_TRACE_LOG_BYTES) {
+    throw new Error('prompt_frame_trace_projection_overflow');
+  }
+  return serialized;
 }
 /* === VIVENTIUM END === */
 
@@ -600,23 +933,27 @@ function logPromptFrame(targetLogger, frame) {
   }
   let wrote = writePromptFrameFile(frame);
   try {
-    const log =
+    const logRoute =
       targetLogger && typeof targetLogger.info === 'function'
         ? targetLogger.info.bind(targetLogger)
         : null;
-    if (!log) {
+    const logTrace =
+      targetLogger && typeof targetLogger.debug === 'function'
+        ? targetLogger.debug.bind(targetLogger)
+        : null;
+    if (!logRoute || !logTrace) {
       return wrote;
     }
-    const publicLogFrame = { ...frame };
-    delete publicLogFrame.debug_redacted_layers;
     /* === VIVENTIUM START ===
-     * The normal Winston text formatter truncates the full prompt-frame JSON. Emit the route
-     * identity through a second bounded, metadata-only sink so QA can prove the provider/model
-     * that actually completed a comparison without exposing either raw value.
+     * The normal Winston info formatter truncates messages. Keep the compact route on info, then
+     * pass the strict trace JSON as debug metadata; the existing debug formatter preserves that
+     * second argument in the same rotated Core log without opening another production file sink.
      */
-    log(`[PromptFrameRouteTelemetry] ${JSON.stringify(buildPromptFrameRouteTelemetry(frame))}`);
+    const routeTelemetry = serializePromptFrameRouteTelemetry(frame);
+    const traceTelemetry = serializePromptFrameTraceTelemetry(frame);
+    logRoute(`[PromptFrameRouteTelemetry] ${routeTelemetry}`);
+    logTrace('[PromptFrameTraceTelemetry]', traceTelemetry);
     /* === VIVENTIUM END === */
-    log(`[PromptFrameTelemetry] ${JSON.stringify(publicLogFrame)}`);
     wrote = true;
   } catch (_error) {
     return wrote;
@@ -640,8 +977,14 @@ module.exports = {
   normalizeLayersToContract,
   normalizeMCPInstructionSources,
   buildPromptFrame,
+  buildPromptFrameRequestIdentityHash,
+  normalizeFallbackReason,
+  normalizeRouteEffort,
+  promptLayerIntegritySnapshot,
+  resetPromptLayerIntegrityForTests,
   /* === VIVENTIUM START: Export bounded route telemetry for regression tests. === */
   buildPromptFrameRouteTelemetry,
+  buildPromptFrameTraceTelemetry,
   /* === VIVENTIUM END === */
   logPromptFrame,
   resolvePromptObservabilityDir,

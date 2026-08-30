@@ -217,6 +217,7 @@ describe('OAuthReconnectionManager', () => {
         forceNew: false,
         connectionTimeout: 5000,
         returnOnOAuth: true,
+        allowOAuthInitiation: false,
       });
 
       // Verify successful reconnection cleared the states

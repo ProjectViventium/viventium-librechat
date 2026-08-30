@@ -1,4 +1,5 @@
 import { AnthropicEffort } from 'librechat-data-provider';
+import Anthropic from '@anthropic-ai/sdk';
 import type * as t from '~/types';
 import {
   ANTHROPIC_OAUTH_SYSTEM_TEXT,
@@ -121,6 +122,45 @@ describe('getLLMConfig', () => {
     expect(oauthClient?.apiKey).toBeNull();
     expect(oauthClient?.authToken).toBe('oauth-access-token');
     expect(oauthClientHeaders?.['anthropic-beta']).toContain('oauth-2025-04-20');
+  });
+
+  it('reports the exact normalized native Anthropic request after provider acceptance', async () => {
+    const create = jest
+      .spyOn(Anthropic.Messages.prototype, 'create')
+      .mockReturnValue(Promise.resolve({ id: 'synthetic-provider-response' }) as never);
+    const nativeProviderRequestAccepted = jest.fn();
+
+    try {
+      const result = getLLMConfig('oauth-access-token', {
+        modelOptions: {},
+        oauthType: 'subscription',
+        oauthProvider: 'anthropic',
+        nativeProviderRequestAccepted,
+      });
+      const oauthClient = result.llmConfig.createClient?.({ apiKey: 'ignored' });
+      await oauthClient?.messages.create({
+        model: 'claude-opus-5',
+        max_tokens: 256,
+        stream: false,
+        system: 'exact final Main instructions',
+        messages: [{ role: 'user', content: 'hello' }],
+      });
+
+      expect(nativeProviderRequestAccepted).toHaveBeenCalledTimes(1);
+      expect(nativeProviderRequestAccepted).toHaveBeenCalledWith({
+        provider: 'anthropic',
+        model: 'claude-opus-5',
+        status: 200,
+        request: expect.objectContaining({
+          system: [
+            { type: 'text', text: ANTHROPIC_OAUTH_SYSTEM_TEXT },
+            { type: 'text', text: 'exact final Main instructions' },
+          ],
+        }),
+      });
+    } finally {
+      create.mockRestore();
+    }
   });
 
   it('should route inference-time OAuth failures through the connected-account callback', async () => {

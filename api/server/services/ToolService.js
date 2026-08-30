@@ -94,8 +94,23 @@ const {
   stripOAuthPendingMcpTools,
 } = require('~/server/services/viventium/mcpOAuthPolicy');
 const { filterMCPToolsForAudience } = require('~/server/services/viventium/mcpAudiencePolicy');
+const {
+  isConversationOrchestrationTool,
+} = require('~/server/services/viventium/GlassHiveConversationOrchestration');
+const {
+  effectiveOrchestrationMode,
+  parallelWorkClaimStateAsync,
+} = require('~/server/services/viventium/ViventiumOrchestrationMode');
+const {
+  appendGlassHiveMainOrchestrationFacade,
+  availableGlassHiveMainOrchestrationTools,
+} = require('~/app/clients/tools/util/glassHiveOrchestrationTools');
 // === VIVENTIUM END ===
 const VIVENTIUM_GLASSHIVE_MCP_SERVER_NAME = 'glasshive-workers-projects';
+const DEFAULT_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS = 15_000;
+const MIN_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS = 25;
+const MAX_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS = 30_000;
+const PARALLEL_WORK_AUTHORITY_TIMEOUT = Symbol('parallel_work_authority_timeout');
 /* === VIVENTIUM START ===
  * Feature: Voice/MCP latency guardrails.
  * Purpose: Avoid repeating OAuth-pending MCP probes on every voice/fallback init
@@ -113,6 +128,85 @@ const parseBoundedPositiveInt = (value, fallback, max) => {
   }
   return Math.min(parsed, max);
 };
+
+function parallelWorkTurnAuthorityTimeoutMs() {
+  const parsed = Number.parseInt(
+    String(process.env.VIVENTIUM_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS || ''),
+    10,
+  );
+  if (!Number.isFinite(parsed)) return DEFAULT_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS;
+  return Math.min(
+    MAX_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS,
+    Math.max(MIN_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS, parsed),
+  );
+}
+
+function hasParallelWorkTools(agent) {
+  return (agent?.tools || []).some(
+    (toolName) => typeof toolName === 'string' && isConversationOrchestrationTool(toolName),
+  );
+}
+
+function pinParallelWorkTurnUnavailable(req) {
+  if (typeof req?._viventiumParallelWorkTurnAvailable !== 'boolean') {
+    req._viventiumParallelWorkTurnAvailable = false;
+  }
+  return req._viventiumParallelWorkTurnAvailable;
+}
+
+function startParallelWorkTurnAuthority(req, agent) {
+  if (!req || typeof req !== 'object' || !hasParallelWorkTools(agent)) {
+    return Promise.resolve(false);
+  }
+  if (typeof req._viventiumParallelWorkTurnAvailable === 'boolean') {
+    return Promise.resolve(req._viventiumParallelWorkTurnAvailable);
+  }
+  if (req._viventiumParallelWorkTurnAuthorityPromise) {
+    return req._viventiumParallelWorkTurnAuthorityPromise;
+  }
+
+  const ownerId = String(req.user?.id || req.user?._id || '').trim();
+  if (!ownerId || effectiveOrchestrationMode(req.user, { available: true }) !== 'parallel') {
+    const unavailable = Promise.resolve(pinParallelWorkTurnUnavailable(req));
+    req._viventiumParallelWorkTurnAuthorityPromise = unavailable;
+    return unavailable;
+  }
+
+  let timeout;
+  const timeoutPromise = new Promise((resolve) => {
+    timeout = setTimeout(
+      () => resolve(PARALLEL_WORK_AUTHORITY_TIMEOUT),
+      parallelWorkTurnAuthorityTimeoutMs(),
+    );
+    timeout.unref?.();
+  });
+  const claimPromise = Promise.resolve().then(() => parallelWorkClaimStateAsync(ownerId));
+  const authority = Promise.race([claimPromise, timeoutPromise])
+    .then((claimState) => {
+      if (typeof req._viventiumParallelWorkTurnAvailable === 'boolean') {
+        return req._viventiumParallelWorkTurnAvailable;
+      }
+      if (claimState === PARALLEL_WORK_AUTHORITY_TIMEOUT) {
+        logger.warn('[VIVENTIUM][parallel-work] Turn authority timed out before tool discovery');
+        return pinParallelWorkTurnUnavailable(req);
+      }
+      if (!claimState || claimState.available !== true) {
+        return pinParallelWorkTurnUnavailable(req);
+      }
+      req._viventiumParallelWorkTurnClaim = claimState;
+      req._viventiumParallelWorkTurnAvailable = true;
+      return true;
+    })
+    .catch((error) => {
+      logger.warn('[VIVENTIUM][parallel-work] Turn authority unavailable before tool discovery', {
+        errorClass: String(error?.message || 'parallel_work_turn_authority_failed').slice(0, 120),
+      });
+      return pinParallelWorkTurnUnavailable(req);
+    })
+    .finally(() => clearTimeout(timeout));
+  req._viventiumParallelWorkTurnAuthorityPromise = authority;
+  return authority;
+}
 
 const getMcpOAuthPendingMemoTtlMs = () =>
   parseBoundedPositiveInt(
@@ -588,6 +682,23 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
   const checkCapability = (capability) => enabledCapabilities.has(capability);
   const areToolsEnabled = checkCapability(AgentCapabilities.tools);
   const deferredToolsEnabled = checkCapability(AgentCapabilities.deferred_tools);
+  /* === VIVENTIUM START ===
+   * Feature: Rollback-safe Main orchestration definitions.
+   * Purpose: Readiness gates new delegation, while a trusted known-work hint preserves only
+   * list/action definitions for existing missions across direct, voice, and native providers.
+   * === VIVENTIUM END === */
+  const requestedOrchestrationTools = (agent.tools || []).filter(isConversationOrchestrationTool);
+  if (areToolsEnabled && requestedOrchestrationTools.length > 0) {
+    await startParallelWorkTurnAuthority(req, agent);
+  }
+  const availableMainOrchestrationTools = areToolsEnabled
+    ? availableGlassHiveMainOrchestrationTools(agent, requestedOrchestrationTools, {
+        user: req.user,
+        turnAvailable: req._viventiumParallelWorkTurnAvailable,
+        req,
+      })
+    : [];
+  const exposeMainOrchestration = availableMainOrchestrationTools.length > 0;
 
   /* === VIVENTIUM START ===
    * Security: Apply server-declared request audiences before definition discovery or process
@@ -600,6 +711,8 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     reqUser: req.user,
   });
   const filteredTools = audienceEligibleTools.filter((tool) => {
+    // Raw peer-spawn MCP is never provider-visible. The server-owned facade is appended below.
+    if (isConversationOrchestrationTool(tool)) return false;
     if (tool === Tools.file_search) {
       return checkCapability(AgentCapabilities.file_search);
     }
@@ -615,7 +728,7 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     return true;
   });
 
-  if (!filteredTools || filteredTools.length === 0) {
+  if ((!filteredTools || filteredTools.length === 0) && !exposeMainOrchestration) {
     return { toolDefinitions: [] };
   }
 
@@ -932,6 +1045,14 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     },
   );
 
+  if (exposeMainOrchestration) {
+    ({ toolDefinitions, toolRegistry } = appendGlassHiveMainOrchestrationFacade({
+      toolDefinitions,
+      toolRegistry,
+      requestedTools: availableMainOrchestrationTools,
+    }));
+  }
+
   if (pendingOAuthServers.size > 0 && (res || streamId)) {
     const serverNames = Array.from(pendingOAuthServers);
     const oauthDecision = getMcpOAuthWaitDecision(req, pendingOAuthServers, {
@@ -1034,6 +1155,13 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
         toolDefinitions = reloadResult.toolDefinitions;
         toolRegistry = reloadResult.toolRegistry;
         hasDeferredTools = reloadResult.hasDeferredTools;
+        if (exposeMainOrchestration) {
+          ({ toolDefinitions, toolRegistry } = appendGlassHiveMainOrchestrationFacade({
+            toolDefinitions,
+            toolRegistry,
+            requestedTools: availableMainOrchestrationTools,
+          }));
+        }
       }
     }
   }
@@ -1769,5 +1897,7 @@ module.exports = {
     writeMcpOAuthPendingMemo,
     clearMcpOAuthPendingMemo,
     getMcpOAuthPendingMemoTtlMs,
+    startParallelWorkTurnAuthority,
   },
+  startParallelWorkTurnAuthority,
 };

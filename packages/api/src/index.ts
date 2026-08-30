@@ -52,6 +52,36 @@ export * from './web';
 export * from './cache';
 /* Stream */
 export * from './stream';
+/* === VIVENTIUM START === Shared structured-content projection === */
+export * from './content/visibleContentProjection';
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START === GlassHive typed contracts === */
+export * from './glasshive';
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START === Public-safe runtime diagnostics === */
+export * from './logging';
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START === Typed orchestration trace contracts === */
+export * from './trace';
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START === Core voice authority contracts === */
+export * from './voice';
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START === Local-QA fault control contracts === */
+export * from './localQa';
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START === Cortex delivery state-machine contracts === */
+export * from './cortex';
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START === Scheduled execution contracts === */
+export * from './scheduling';
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START === Personal-account cleanup persistence === */
+export * from './cleanup';
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START === Provider-neutral Main continuity. === */
+export * from './continuity';
+/* === VIVENTIUM END === */
 /* === VIVENTIUM START === Isolated local Sandpack runtime === */
 export * from './runtime/sandpackBundlerServer';
 /* === VIVENTIUM END === */

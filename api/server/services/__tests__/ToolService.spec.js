@@ -1,11 +1,94 @@
 const { AgentCapabilities, defaultAgentCapabilities } = require('librechat-data-provider');
 
+const mockEffectiveOrchestrationMode = jest.fn();
+const mockParallelWorkClaimStateAsync = jest.fn();
+
+jest.mock('~/server/services/viventium/ViventiumOrchestrationMode', () => ({
+  effectiveOrchestrationMode: (...args) => mockEffectiveOrchestrationMode(...args),
+  parallelWorkClaimStateAsync: (...args) => mockParallelWorkClaimStateAsync(...args),
+}));
+
+const { __testables } = require('../ToolService');
+
 /**
  * Tests for ToolService capability checking logic.
  * The actual loadAgentTools function has many dependencies, so we test
  * the capability checking logic in isolation.
  */
 describe('ToolService - Capability Checking', () => {
+  describe('Parallel Work turn authority', () => {
+    const orchestrationAgent = {
+      tools: ['worker_delegate_once_mcp_glasshive-workers-projects'],
+    };
+    const originalTimeout = process.env.VIVENTIUM_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      mockEffectiveOrchestrationMode.mockReturnValue('parallel');
+      delete process.env.VIVENTIUM_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS;
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+      if (originalTimeout === undefined) {
+        delete process.env.VIVENTIUM_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS;
+      } else {
+        process.env.VIVENTIUM_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS = originalTimeout;
+      }
+    });
+
+    test('pins and reuses one exact async claim before orchestration tool discovery', async () => {
+      const claimState = { available: true, label: 'PRE-GATE / NOT READY', blockers: [] };
+      mockParallelWorkClaimStateAsync.mockResolvedValue(claimState);
+      const req = { user: { id: 'owner-1', personalization: { orchestration_mode: 'parallel' } } };
+
+      const first = __testables.startParallelWorkTurnAuthority(req, orchestrationAgent);
+      const second = __testables.startParallelWorkTurnAuthority(req, orchestrationAgent);
+
+      expect(first).toBe(second);
+      await expect(first).resolves.toBe(true);
+      expect(mockParallelWorkClaimStateAsync).toHaveBeenCalledTimes(1);
+      expect(mockParallelWorkClaimStateAsync).toHaveBeenCalledWith('owner-1');
+      expect(req._viventiumParallelWorkTurnAvailable).toBe(true);
+      expect(req._viventiumParallelWorkTurnClaim).toBe(claimState);
+    });
+
+    test('pins false on timeout and ignores a late true result', async () => {
+      jest.useFakeTimers();
+      process.env.VIVENTIUM_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS = '25';
+      let resolveClaim;
+      mockParallelWorkClaimStateAsync.mockReturnValue(
+        new Promise((resolve) => {
+          resolveClaim = resolve;
+        }),
+      );
+      const req = { user: { id: 'owner-1', personalization: { orchestration_mode: 'parallel' } } };
+
+      const decision = __testables.startParallelWorkTurnAuthority(req, orchestrationAgent);
+      await jest.advanceTimersByTimeAsync(25);
+
+      await expect(decision).resolves.toBe(false);
+      expect(req._viventiumParallelWorkTurnAvailable).toBe(false);
+      expect(req._viventiumParallelWorkTurnClaim).toBeUndefined();
+      resolveClaim({ available: true, label: 'PRE-GATE / NOT READY', blockers: [] });
+      await Promise.resolve();
+      expect(req._viventiumParallelWorkTurnAvailable).toBe(false);
+      expect(req._viventiumParallelWorkTurnClaim).toBeUndefined();
+    });
+
+    test('keeps focused requests fast and fail closed without validating release authority', async () => {
+      mockEffectiveOrchestrationMode.mockReturnValue('focused');
+      const req = { user: { id: 'owner-1', personalization: { orchestration_mode: 'focused' } } };
+
+      await expect(
+        __testables.startParallelWorkTurnAuthority(req, orchestrationAgent),
+      ).resolves.toBe(false);
+
+      expect(mockParallelWorkClaimStateAsync).not.toHaveBeenCalled();
+      expect(req._viventiumParallelWorkTurnAvailable).toBe(false);
+    });
+  });
+
   describe('checkCapability logic', () => {
     /**
      * Simulates the checkCapability function from loadAgentTools

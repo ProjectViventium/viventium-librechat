@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useRef } from 'react';
 /* === VIVENTIUM START ===
  * Feature: Feelings discovery in ordinary chat controls.
  * Purpose: Reuse the existing route and design-system icon from the right-side navigation.
@@ -10,6 +10,7 @@ import {
   Bookmark,
   Settings2,
   HeartPulse,
+  ListTodo,
   ArrowRightToLine,
   MessageSquareQuote,
 } from 'lucide-react';
@@ -33,10 +34,22 @@ import Parameters from '~/components/SidePanel/Parameters/Panel';
 import { MemoryPanel } from '~/components/SidePanel/Memories';
 import FilesPanel from '~/components/SidePanel/Files/Panel';
 /* === VIVENTIUM START ===
+ * Feature: Active work in the Control Panel.
+ * Purpose: Keep live mission status and controls beside the conversation instead of in Account settings.
+ */
+import ActiveWorkPanel from '~/components/SidePanel/ActiveWork/ActiveWorkPanel';
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START ===
  * Feature: Feelings discovery in ordinary chat controls.
  * Purpose: Keep navigation availability aligned with the compiled startup-config gate.
  */
 import { useGetStartupConfig } from '~/data-provider';
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START ===
+ * Feature: Active work in the Control Panel.
+ * Purpose: Keep the entry dark when unavailable while preserving access to durable existing work.
+ */
+import { useOrchestrationPreferenceQuery } from '~/data-provider/ViventiumOrchestration';
 /* === VIVENTIUM END === */
 import { useHasAccess, useMCPServerManager } from '~/hooks';
 
@@ -62,6 +75,23 @@ export default function useSideNavLinks({
   const navigate = useNavigate();
   const { data: startupConfig } = useGetStartupConfig();
   const feelingsAvailable = startupConfig?.viventiumFeelingsAvailable !== false;
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
+   * Feature: Active work in the Control Panel.
+   * Purpose: A disabled admission gate must not hide work that already exists. Once revealed,
+   * retain the entry for this mounted session so dismissing the final item does not move the nav.
+   */
+  const parallelWorkAvailable =
+    (startupConfig as { viventiumParallelWorkAvailable?: boolean } | undefined)
+      ?.viventiumParallelWorkAvailable === true;
+  const orchestrationPreference = useOrchestrationPreferenceQuery({
+    enabled: !parallelWorkAvailable,
+  });
+  const activeWorkWasVisible = useRef(false);
+  if (parallelWorkAvailable || orchestrationPreference.data?.hasKnownWork === true) {
+    activeWorkWasVisible.current = true;
+  }
+  const showActiveWork = activeWorkWasVisible.current;
   /* === VIVENTIUM END === */
   const hasAccessToPrompts = useHasAccess({
     permissionType: PermissionTypes.PROMPTS,
@@ -132,6 +162,21 @@ export default function useSideNavLinks({
         Component: AgentPanelSwitch,
       });
     }
+
+    /* === VIVENTIUM START ===
+     * Feature: Active work in the Control Panel.
+     * Purpose: Existing work must stay reachable even when new Parallel admission is unavailable.
+     */
+    if (showActiveWork) {
+      links.push({
+        title: 'com_ui_parallel_work_active',
+        label: '',
+        icon: ListTodo,
+        id: 'active-work',
+        Component: ActiveWorkPanel,
+      });
+    }
+    /* === VIVENTIUM END === */
 
     if (hasAccessToPrompts) {
       links.push({
@@ -230,6 +275,7 @@ export default function useSideNavLinks({
     hasAccessToAgents,
     hasAccessToCreateAgents,
     hasAccessToPrompts,
+    showActiveWork,
     feelingsAvailable,
     navigate,
     hasAccessToMemories,

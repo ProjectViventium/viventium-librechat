@@ -11,10 +11,19 @@ jest.mock('@librechat/data-schemas', () => ({
 }));
 
 const mockSet = jest.fn();
+const mockRecordVoiceOrchestrationTraceBestEffort = jest.fn();
+const mockGetTrustedInteractionContext = jest.fn();
 
 jest.mock('~/cache/getLogStores', () => jest.fn(() => ({ set: mockSet })));
 jest.mock('~/models', () => ({
   saveConvo: jest.fn(),
+}));
+jest.mock('~/server/services/viventium/interactionContext', () => ({
+  getTrustedInteractionContext: (...args) => mockGetTrustedInteractionContext(...args),
+}));
+jest.mock('~/server/services/viventium/VoiceOrchestrationTraceService', () => ({
+  recordVoiceOrchestrationTraceBestEffort: (...args) =>
+    mockRecordVoiceOrchestrationTraceBestEffort(...args),
 }));
 
 const addTitle = require('./title');
@@ -24,6 +33,44 @@ const { saveConvo } = require('~/models');
 describe('agents addTitle', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockGetTrustedInteractionContext.mockReturnValue(null);
+    mockRecordVoiceOrchestrationTraceBestEffort.mockResolvedValue({ sequence: 1 });
+  });
+
+  it('records a real generated title for the exact Voice turn without title text', async () => {
+    const req = {
+      user: { id: 'user-voice-1' },
+      body: { voiceMode: true, viventiumCallSessionId: 'call-voice-1' },
+    };
+    mockGetTrustedInteractionContext.mockReturnValue({
+      surface: 'voice',
+      logical_turn_id: 'turn-voice-1',
+    });
+    const client = {
+      titleConvo: jest.fn().mockResolvedValue('Private generated title'),
+      options: {},
+    };
+
+    await addTitle(req, {
+      text: 'private user title seed',
+      response: { conversationId: 'convo-voice-1' },
+      client,
+    });
+
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledWith({
+      ownerId: 'user-voice-1',
+      callSessionId: 'call-voice-1',
+      turnId: 'turn-voice-1',
+      eventRef: 'convo-voice-1',
+      stage: 'title_model.completed',
+      facts: { effectCount: 1 },
+    });
+    expect(JSON.stringify(mockRecordVoiceOrchestrationTraceBestEffort.mock.calls)).not.toContain(
+      'Private generated title',
+    );
+    expect(JSON.stringify(mockRecordVoiceOrchestrationTraceBestEffort.mock.calls)).not.toContain(
+      'private user title seed',
+    );
   });
 
   it('uses a fallback title when async title generation fails', async () => {
@@ -52,6 +99,7 @@ describe('agents addTitle', () => {
       },
       { context: 'api/server/services/Endpoints/agents/title.js' },
     );
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });
 
   it('uses a fallback title when no title is returned', async () => {
@@ -83,5 +131,6 @@ describe('agents addTitle', () => {
       },
       { context: 'api/server/services/Endpoints/agents/title.js', noUpsert: true },
     );
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });
 });

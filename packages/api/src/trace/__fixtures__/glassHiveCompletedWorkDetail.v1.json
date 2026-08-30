@@ -1,0 +1,252 @@
+{
+  "workRef": "work_synthetic_1",
+  "title": "Synthetic completed work",
+  "statusSummary": "Completed",
+  "provider": "codex",
+  "originSurface": "telegram",
+  "nativeTeam": null,
+  "delivery": {
+    "state": "pending",
+    "unreadTerminal": true
+  },
+  "createdAt": "2026-08-22T01:00:01.000Z",
+  "updatedAt": "2026-08-22T01:00:06.000Z",
+  "actions": ["dismiss"],
+  "queue": {
+    "firstQueuedAt": "2026-08-22T01:00:01.000Z",
+    "waitStartedAt": "2026-08-22T01:00:01.000Z",
+    "waitOpen": false,
+    "generation": 1,
+    "closedAt": "2026-08-22T01:00:04.000Z",
+    "durationSeconds": 3,
+    "lastBlocker": {
+      "class": "admission_pending"
+    },
+    "callbackState": "unknown"
+  },
+  "runRef": "run_sha256:31c7ab224ea37b31d7ee20d3c86b698f4accc215ac08afa90b70c80471cece7b",
+  "state": "completed",
+  "executionMode": "docker",
+  "resourceClass": "standard",
+  "resourceReservation": {
+    "memoryBytes": 3221225472
+  },
+  "lifecycle": {
+    "attemptNumber": 1,
+    "queuedAt": "2026-08-22T01:00:01.000Z",
+    "claimedAt": "2026-08-22T01:00:02.000Z",
+    "admittedAt": "2026-08-22T01:00:03.000Z",
+    "runtimeInvokedAt": "2026-08-22T01:00:04.000Z",
+    "startedAt": "2026-08-22T01:00:05.000Z",
+    "endedAt": "2026-08-22T01:00:06.000Z"
+  },
+  "attemptHistory": [
+    {
+      "attemptNumber": 1,
+      "state": "completed",
+      "claimedAt": "2026-08-22T01:00:02.000Z",
+      "admittedAt": "2026-08-22T01:00:03.000Z",
+      "runtimeInvokedAt": "2026-08-22T01:00:04.000Z",
+      "endedAt": "2026-08-22T01:00:06.000Z",
+      "terminalReason": "completed",
+      "providerHealthObservedLastFailedAt": null,
+      "providerHealthObservedGeneration": null
+    }
+  ],
+  "attemptHistoryOverflowCount": 0,
+  "capacityAttempts": [
+    {
+      "sequence": 1,
+      "class": "worker_launch",
+      "available": {
+        "childProcesses": 3,
+        "threads": 4,
+        "memoryBytes": 8589934592,
+        "diskBytes": 21474836480
+      },
+      "required": {
+        "childProcesses": 1,
+        "threads": 1,
+        "memoryBytes": 5368709120,
+        "diskBytes": 1073741824
+      },
+      "shortage": {
+        "childProcesses": 0,
+        "threads": 0,
+        "memoryBytes": 0,
+        "diskBytes": 0
+      },
+      "reservation": {
+        "childProcesses": 1,
+        "threads": 1,
+        "memoryBytes": 5368709120,
+        "diskBytes": 1073741824
+      },
+      "nextRetryAt": null,
+      "observedAt": "2026-08-22T01:00:02.500Z"
+    }
+  ],
+  "capacityAttemptOverflowCount": 0,
+  "callbackDeliveries": [
+    {
+      "callbackRef": "callback_sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "callbackRevision": 1,
+      "ledgerSequence": 1,
+      "previousEventSha256": null,
+      "eventSha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "attemptNumber": null,
+      "event": "run.queued",
+      "status": "pending",
+      "attempts": 0,
+      "createdAt": "2026-08-22T01:00:01.100Z",
+      "updatedAt": "2026-08-22T01:00:01.100Z",
+      "acceptedAt": null,
+      "payloadSha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "resultRevision": 0,
+      "resultDigest": null,
+      "deliveryGeneration": 0,
+      "authoritySha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+    },
+    {
+      "callbackRef": "callback_sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "callbackRevision": 1,
+      "ledgerSequence": 2,
+      "previousEventSha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "eventSha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "attemptNumber": 1,
+      "event": "run.completed",
+      "status": "pending",
+      "attempts": 0,
+      "createdAt": "2026-08-22T01:00:07.000Z",
+      "updatedAt": "2026-08-22T01:00:07.000Z",
+      "acceptedAt": null,
+      "payloadSha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+      "resultRevision": 0,
+      "resultDigest": null,
+      "deliveryGeneration": 0,
+      "authoritySha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+    },
+    {
+      "callbackRef": "callback_sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "callbackRevision": 2,
+      "ledgerSequence": 3,
+      "previousEventSha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "eventSha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "attemptNumber": 1,
+      "event": "run.completed",
+      "status": "delivering",
+      "attempts": 0,
+      "createdAt": "2026-08-22T01:00:07.000Z",
+      "updatedAt": "2026-08-22T01:00:07.500Z",
+      "acceptedAt": null,
+      "payloadSha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+      "resultRevision": 0,
+      "resultDigest": null,
+      "deliveryGeneration": 1,
+      "authoritySha256": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+    },
+    {
+      "callbackRef": "callback_sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "callbackRevision": 3,
+      "ledgerSequence": 4,
+      "previousEventSha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "eventSha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "attemptNumber": 1,
+      "event": "run.completed",
+      "status": "http_accepted",
+      "attempts": 1,
+      "createdAt": "2026-08-22T01:00:07.000Z",
+      "updatedAt": "2026-08-22T01:00:08.000Z",
+      "acceptedAt": "2026-08-22T01:00:08.000Z",
+      "payloadSha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+      "resultRevision": 0,
+      "resultDigest": null,
+      "deliveryGeneration": 1,
+      "authoritySha256": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+    }
+  ],
+  "callbackDeliveryOverflowCount": 0,
+  "artifactHistory": [
+    {
+      "artifactRefs": {
+        "available": true,
+        "refs": [
+          {
+            "artifactRef": "artifact_sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "kind": "html",
+            "state": "ready",
+            "sizeBytes": 128
+          }
+        ],
+        "overflowCount": 0
+      },
+      "observedAt": "2026-08-22T01:00:08.500Z"
+    }
+  ],
+  "artifactHistoryOverflowCount": 0,
+  "historyPage": {
+    "cursor": null,
+    "nextCursor": null,
+    "limit": 16,
+    "total": 7,
+    "showing": 7,
+    "overflowCount": 0
+  },
+  "viewRef": "/w/ghr_synthetic_1",
+  "traceability": {
+    "origin": {
+      "originRef": "origin_sha256:1a6568d01d6107ad91e51e38c54674ff863edd59c63e20ac923bd60df2790f86",
+      "sourceEventRef": null,
+      "sourceRevision": 1,
+      "surface": "telegram"
+    },
+    "promptLayers": {
+      "contractVersion": 1,
+      "producerScope": "glasshive.worker_prompt_registry",
+      "layerNames": [
+        "agents_md",
+        "claude_md",
+        "codex_md",
+        "developer_instructions",
+        "glasshive_worker_project_contract",
+        "harness_prompt",
+        "mcp_server_instructions",
+        "project_definition",
+        "run_instruction",
+        "system_instructions",
+        "tool_schemas",
+        "viventium_feeling_state"
+      ],
+      "unknownLayerNames": []
+    },
+    "providerAttempts": [
+      {
+        "attemptNumber": 1,
+        "model": "stub/codex-cli",
+        "profile": "codex-cli",
+        "providerAttemptRef": "provider_attempt_sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "runtime": "codex-cli",
+        "runtimeInvokedAt": "2026-08-22T01:00:04.000Z"
+      }
+    ],
+    "integrity": {
+      "algorithm": "sha256-chain-v1",
+      "eventCount": 12,
+      "headSha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  },
+  "artifactRefs": {
+    "available": true,
+    "refs": [
+      {
+        "artifactRef": "artifact_sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "kind": "html",
+        "state": "ready",
+        "sizeBytes": 128
+      }
+    ],
+    "overflowCount": 0
+  }
+}

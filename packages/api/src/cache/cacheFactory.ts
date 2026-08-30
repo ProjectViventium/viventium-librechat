@@ -6,6 +6,7 @@
  */
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const KeyvRedis = require('@keyv/redis').default as typeof import('@keyv/redis').default;
+import type { RedisClientConnectionType } from '@keyv/redis';
 import { Keyv } from 'keyv';
 import createMemoryStore from 'memorystore';
 import { RedisStore } from 'rate-limit-redis';
@@ -29,7 +30,7 @@ import { batchDeleteKeys, scanKeys } from './redisUtils';
 export const standardCache = (namespace: string, ttl?: number, fallbackStore?: object): Keyv => {
   if (keyvRedisClient && !cacheConfig.FORCED_IN_MEMORY_CACHE_NAMESPACES?.includes(namespace)) {
     try {
-      const keyvRedis = new KeyvRedis(keyvRedisClient);
+      const keyvRedis = new KeyvRedis(keyvRedisClient as RedisClientConnectionType);
       const cache = new Keyv(keyvRedis, { namespace, ttl });
       keyvRedis.namespace = cacheConfig.REDIS_KEY_PREFIX;
       keyvRedis.keyPrefixSeparator = cacheConfig.GLOBAL_PREFIX_SEPARATOR;

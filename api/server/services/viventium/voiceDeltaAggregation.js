@@ -80,27 +80,169 @@ function extractVisibleTextFromContentParts(contentParts) {
     .join('');
 }
 
-function appendTextToContentParts(contentParts, text) {
+function appendTextToContentParts(contentParts, text, contentMeta = {}) {
   if (!Array.isArray(contentParts) || typeof text !== 'string' || !text) {
     return false;
+  }
+  const agentId = typeof contentMeta?.agentId === 'string' ? contentMeta.agentId : '';
+  const groupId = contentMeta?.groupId;
+  const sourceStepId =
+    typeof contentMeta?.sourceStepId === 'string' ? contentMeta.sourceStepId : '';
+  if (agentId && sourceStepId) {
+    for (let index = contentParts.length - 1; index >= 0; index -= 1) {
+      const part = contentParts[index];
+      if (
+        !part ||
+        part.type !== ContentTypes.TEXT ||
+        part.viventiumUnownedVisible !== true ||
+        part.viventiumSourceStepId !== sourceStepId
+      ) {
+        continue;
+      }
+      const rest = { ...part };
+      delete rest.viventiumUnownedVisible;
+      contentParts[index] = {
+        ...rest,
+        text: `${typeof part.text === 'string' ? part.text : ''}${text}`,
+        agentId,
+        ...(groupId != null ? { groupId } : {}),
+        viventiumSourceStepId: sourceStepId,
+      };
+      return true;
+    }
   }
   for (let index = contentParts.length - 1; index >= 0; index -= 1) {
     const part = contentParts[index];
     if (!part || part.type !== ContentTypes.TEXT) {
       continue;
     }
+    if (agentId && part.agentId !== agentId) {
+      continue;
+    }
+    if (groupId != null && part.groupId !== groupId) {
+      continue;
+    }
+    if (sourceStepId && part.viventiumSourceStepId !== sourceStepId) {
+      continue;
+    }
     const current = typeof part.text === 'string' ? part.text : '';
     contentParts[index] = {
       ...part,
       text: `${current}${text}`,
+      ...(sourceStepId ? { viventiumSourceStepId: sourceStepId } : {}),
     };
     return true;
   }
   contentParts.push({
     type: ContentTypes.TEXT,
     text,
+    ...(agentId ? { agentId } : {}),
+    ...(groupId != null ? { groupId } : {}),
+    ...(sourceStepId ? { viventiumSourceStepId: sourceStepId } : {}),
   });
   return true;
+}
+
+function appendUnownedVisibleText(contentParts, text, contentMeta = {}) {
+  if (!Array.isArray(contentParts) || typeof text !== 'string' || !text) {
+    return false;
+  }
+  const groupId = contentMeta?.groupId;
+  const sourceStepId =
+    typeof contentMeta?.sourceStepId === 'string' ? contentMeta.sourceStepId : '';
+  for (let index = contentParts.length - 1; index >= 0; index -= 1) {
+    const part = contentParts[index];
+    if (
+      part?.type !== ContentTypes.TEXT ||
+      part?.viventiumUnownedVisible !== true ||
+      (sourceStepId
+        ? part.viventiumSourceStepId !== sourceStepId
+        : index !== contentParts.length - 1 ||
+          part.viventiumSourceStepId ||
+          (part.groupId ?? null) !== (groupId ?? null))
+    ) {
+      continue;
+    }
+    contentParts[index] = {
+      ...part,
+      text: `${typeof part.text === 'string' ? part.text : ''}${text}`,
+    };
+    return true;
+  }
+  contentParts.push({
+    type: ContentTypes.TEXT,
+    text,
+    ...(groupId != null ? { groupId } : {}),
+    ...(sourceStepId ? { viventiumSourceStepId: sourceStepId } : {}),
+    viventiumUnownedVisible: true,
+  });
+  return true;
+}
+
+function isTextPartForContentMeta(part, contentMeta = {}) {
+  if (!part || part.type !== ContentTypes.TEXT) {
+    return false;
+  }
+  const agentId = typeof contentMeta?.agentId === 'string' ? contentMeta.agentId : '';
+  if (!agentId || part.agentId !== agentId) {
+    return false;
+  }
+  const groupId = contentMeta?.groupId;
+  return groupId == null || part.groupId === groupId;
+}
+
+function pinLatestTextPartToSourceStep(contentParts, contentMeta = {}) {
+  if (!Array.isArray(contentParts)) {
+    return false;
+  }
+  const sourceStepId =
+    typeof contentMeta?.sourceStepId === 'string' ? contentMeta.sourceStepId : '';
+  if (!sourceStepId) {
+    return false;
+  }
+  for (let index = contentParts.length - 1; index >= 0; index -= 1) {
+    const part = contentParts[index];
+    if (!isTextPartForContentMeta(part, contentMeta)) {
+      continue;
+    }
+    if (part.viventiumSourceStepId && part.viventiumSourceStepId !== sourceStepId) {
+      continue;
+    }
+    contentParts[index] = {
+      ...part,
+      viventiumSourceStepId: sourceStepId,
+    };
+    return true;
+  }
+  return false;
+}
+
+function textForContentMeta(contentParts, contentMeta) {
+  if (!Array.isArray(contentParts)) {
+    return '';
+  }
+  return contentParts
+    .filter((part) => isTextPartForContentMeta(part, contentMeta))
+    .map((part) => (typeof part.text === 'string' ? part.text : ''))
+    .join('');
+}
+
+function otherTextPartitionSignature(contentParts, contentMeta) {
+  if (!Array.isArray(contentParts)) {
+    return '[]';
+  }
+  return JSON.stringify(
+    contentParts
+      .filter(
+        (part) =>
+          part && part.type === ContentTypes.TEXT && !isTextPartForContentMeta(part, contentMeta),
+      )
+      .map((part) => ({
+        agentId: part.agentId ?? null,
+        groupId: part.groupId ?? null,
+        text: typeof part.text === 'string' ? part.text : '',
+      })),
+  );
 }
 
 function isNoResponseMarkerProgression(previous, incoming) {
@@ -225,7 +367,15 @@ function createMessageDeltaBoundaryNormalizer({ mode = 'incremental' } = {}) {
   };
 }
 
-function repairMissedVisibleMessageDelta({ contentParts, event, data, beforeText, afterText }) {
+function repairMissedVisibleMessageDelta({
+  contentParts,
+  beforeContentParts,
+  event,
+  data,
+  beforeText,
+  afterText,
+  contentMeta,
+}) {
   if (event !== 'on_message_delta') {
     return false;
   }
@@ -233,10 +383,53 @@ function repairMissedVisibleMessageDelta({ contentParts, event, data, beforeText
   if (!deltaText) {
     return false;
   }
+  const agentId = typeof contentMeta?.agentId === 'string' ? contentMeta.agentId : '';
+  const beforeTextParts = Array.isArray(beforeContentParts)
+    ? beforeContentParts.filter((part) => part?.type === ContentTypes.TEXT)
+    : [];
+  const beforeAgentIds = new Set(
+    beforeTextParts
+      .map((part) => part?.agentId)
+      .filter((value) => typeof value === 'string' && value),
+  );
+  const hasStructuredParallelPartition =
+    beforeTextParts.some((part) => part?.groupId != null) || beforeAgentIds.size > 1;
+  if (!agentId && contentMeta?.unownedVisible === true && Array.isArray(beforeContentParts)) {
+    // A delta emitted before its run-step has no trustworthy participant owner. Replace any raw
+    // aggregator guess with an explicit unowned partition so final pruning keeps the visible text
+    // without attributing it to whichever participant happened to be last.
+    contentParts.splice(0, contentParts.length, ...beforeContentParts);
+    return appendUnownedVisibleText(contentParts, deltaText, contentMeta);
+  }
+  if (!agentId && Array.isArray(beforeContentParts) && hasStructuredParallelPartition) {
+    // Never attribute a visible delta to whichever parallel participant happens to be last when
+    // the stream did not provide a structured owner. Restore this event boundary and retain the
+    // text as explicitly unowned so persistence stays truthful and no participant is corrupted.
+    contentParts.splice(0, contentParts.length, ...beforeContentParts);
+    return appendUnownedVisibleText(contentParts, deltaText, contentMeta);
+  }
+  if (agentId && Array.isArray(beforeContentParts)) {
+    const beforeTargetText = textForContentMeta(beforeContentParts, contentMeta);
+    const afterTargetText = textForContentMeta(contentParts, contentMeta);
+    const targetAdvancedExactly = afterTargetText === `${beforeTargetText}${deltaText}`;
+    const otherPartitionsUnchanged =
+      otherTextPartitionSignature(beforeContentParts, contentMeta) ===
+      otherTextPartitionSignature(contentParts, contentMeta);
+    if (targetAdvancedExactly && otherPartitionsUnchanged) {
+      pinLatestTextPartToSourceStep(contentParts, contentMeta);
+      return false;
+    }
+
+    // A visible parallel delta can arrive before the upstream run-step map is ready, or the raw
+    // aggregator can advance a different participant partition. Restore only this event boundary
+    // and apply the already-normalized delta to its structured owner.
+    contentParts.splice(0, contentParts.length, ...beforeContentParts);
+    return appendTextToContentParts(contentParts, deltaText, contentMeta);
+  }
   if (typeof beforeText === 'string' && typeof afterText === 'string' && afterText !== beforeText) {
     return false;
   }
-  return appendTextToContentParts(contentParts, deltaText);
+  return appendTextToContentParts(contentParts, deltaText, contentMeta);
 }
 
 function collapseRecoveredVisibleTextDuplicate({ contentParts, recoveredText }) {

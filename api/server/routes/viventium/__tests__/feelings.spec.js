@@ -31,7 +31,7 @@ const snapshot = {
   version: 0,
   asOf: '2026-07-09T12:00:00.000Z',
   capsule: '',
-  snapshotHash: 'synthetic-hash',
+  snapshotHash: 'a'.repeat(64),
   reactionInstruction: 'React naturally.',
   reactionActivationMode: 'always',
   innerState: null,
@@ -114,7 +114,7 @@ describe('/api/viventium/feelings', () => {
   test('returns the authenticated user snapshot and approved definitions', async () => {
     const response = await request(createApp()).get('/api/viventium/feelings').expect(200);
 
-    expect(response.body.state.snapshotHash).toBe('synthetic-hash');
+    expect(response.body.state.snapshotHash).toBe('a'.repeat(64));
     expect(response.body.definitions.map((item) => item.id)).toEqual(
       definitions.map((item) => item.id),
     );

@@ -1,6 +1,26 @@
 import { MCPOptionsSchema, MCPServerUserInputSchema } from './mcp';
 
 describe('MCP Viventium server-managed fields', () => {
+  test('accepts a reviewed local-owner audience in full MCP options', () => {
+    const parsed = MCPOptionsSchema.parse({
+      type: 'streamable-http',
+      url: 'https://mcp.example.com/mcp',
+      viventiumAccess: { audience: 'local_owner' },
+    });
+
+    expect(parsed.viventiumAccess).toEqual({ audience: 'local_owner' });
+  });
+
+  test('omits the Viventium audience from user-created MCP server input', () => {
+    const parsed = MCPServerUserInputSchema.parse({
+      type: 'streamable-http',
+      url: 'https://mcp.example.com/mcp',
+      viventiumAccess: { audience: 'local_owner' },
+    });
+
+    expect('viventiumAccess' in parsed).toBe(false);
+  });
+
   test('accepts trusted OAuth connection-group metadata in full MCP options', () => {
     const parsed = MCPOptionsSchema.parse({
       type: 'streamable-http',

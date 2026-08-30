@@ -2,7 +2,7 @@
 id: mcp.scheduling_cortex.server
 owner_layer: viventium_mcp
 target: scheduling-cortex MCP server runtime instructions
-version: 9
+version: 10
 status: active
 safety_class: public_product
 required_context: []
@@ -16,6 +16,12 @@ What it does:
 - Create, update, delete, list, search, inspect, and preview schedules.
 - Run schedules later through the configured Viventium agent and channels.
 - Track last delivery state, including sent, suppressed, failed, and generated text summaries.
+
+Execution ownership:
+
+- executor="viventium_agent" always reloads the persisted Main Agent configuration from Agent Builder at run time, including its configured fallback. The schedule does not own or override provider, model, reasoning effort, GlassHive options, tools, or fallback policy.
+- glasshive_host is a separate explicit Workbench executor with its own declared worker profile. Use it only when the schedule is intentionally a Workbench-hosted automation, not as an alias for the Viventium Main Agent.
+- Never copy a Main Agent model into schedule metadata or infer execution policy from prompt text, task names, agent names, or user identity.
 
 When to use:
 

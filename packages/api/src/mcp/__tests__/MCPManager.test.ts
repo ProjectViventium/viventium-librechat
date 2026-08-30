@@ -9,6 +9,7 @@ import { ConnectionsRepository } from '~/mcp/ConnectionsRepository';
 import { MCPConnection } from '~/mcp/connection';
 import { MCPManager } from '~/mcp/MCPManager';
 import * as graphUtils from '~/utils/graph';
+import { processMCPEnv } from '~/utils/env';
 
 // Mock external dependencies
 jest.mock('@librechat/data-schemas', () => ({
@@ -455,6 +456,78 @@ describe('MCPManager', () => {
         glasshive: 'config_inline',
         missingInstructions: 'missing',
       });
+    });
+
+    it('fetches trusted request-scoped server instructions with the authenticated user context', async () => {
+      const mockConnection = {
+        client: {
+          getInstructions: jest.fn().mockReturnValue('Authenticated GlassHive instructions.'),
+        },
+        disconnect: jest.fn().mockResolvedValue(undefined),
+      };
+      (MCPConnectionFactory.create as jest.Mock).mockResolvedValue(mockConnection);
+      (processMCPEnv as jest.Mock).mockImplementationOnce(({ options, user, body }) => ({
+        ...options,
+        headers: {
+          'X-Viventium-User-Id': user?.id || '',
+          'X-Viventium-Conversation-Id': body?.conversationId || '',
+        },
+      }));
+      (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({
+        glasshive: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:8767/mcp',
+          startup: false,
+          serverInstructions: true,
+          viventiumTrustedServerInstructions: true,
+          viventiumRequestContext: true,
+          headers: {
+            'X-Viventium-User-Id': '{{LIBRECHAT_USER_ID}}',
+            'X-Viventium-Conversation-Id': '{{LIBRECHAT_BODY_CONVERSATIONID}}',
+          },
+        },
+      });
+
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+      const result = await manager.formatInstructionsForContextWithMetadata(['glasshive'], {
+        user: { id: 'authenticated-user' } as IUser,
+        body: { conversationId: 'conversation-1' },
+      });
+
+      expect(result.text).toContain('Authenticated GlassHive instructions.');
+      expect(result.sources).toEqual({ glasshive: 'server_fetched' });
+      expect(MCPConnectionFactory.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          serverName: 'glasshive',
+          serverConfig: expect.objectContaining({
+            headers: {
+              'X-Viventium-User-Id': 'authenticated-user',
+              'X-Viventium-Conversation-Id': 'conversation-1',
+            },
+          }),
+        }),
+      );
+    });
+
+    it('does not open a trusted request-scoped instruction connection without an authenticated user', async () => {
+      (mockRegistryInstance.getAllServerConfigs as jest.Mock).mockResolvedValue({
+        glasshive: {
+          type: 'streamable-http',
+          url: 'http://127.0.0.1:8767/mcp',
+          startup: false,
+          serverInstructions: true,
+          viventiumTrustedServerInstructions: true,
+          viventiumRequestContext: true,
+          headers: { 'X-Viventium-User-Id': '{{LIBRECHAT_USER_ID}}' },
+        },
+      });
+
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+      const result = await manager.formatInstructionsForContextWithMetadata(['glasshive']);
+
+      expect(result.text).toBe('');
+      expect(result.sources).toEqual({ glasshive: 'request_context_unavailable' });
+      expect(MCPConnectionFactory.create).not.toHaveBeenCalled();
     });
 
     it('should not fetch server-provided instructions for servers excluded by filter', async () => {
@@ -1123,6 +1196,74 @@ describe('MCPManager', () => {
           Authorization: 'Bearer static-token',
         }),
       );
+    });
+
+    it('returns the raw MCP result only for an explicit trusted classifier request', async () => {
+      const serverConfig: t.SSEOptions = {
+        type: 'sse',
+        url: 'https://api.example.com',
+      };
+      const rawResult = {
+        content: [{ type: 'text' as const, text: '{"status":"blocked"}' }],
+        structuredContent: {
+          status: 'blocked',
+          failure_class: 'runtime_dependency_missing',
+          failure_retryable: false,
+        },
+        isError: false,
+      };
+      (mockConnection.client.request as jest.Mock).mockResolvedValueOnce(rawResult);
+      mockAppConnections({
+        get: jest.fn().mockResolvedValue(mockConnection),
+      });
+      (mockRegistryInstance.getServerConfig as jest.Mock).mockResolvedValue(serverConfig);
+      (graphUtils.preProcessGraphTokens as jest.Mock).mockImplementation(
+        async (options) => options,
+      );
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+
+      const result = await manager.callTool({
+        user: mockUser as IUser,
+        serverName,
+        toolName: 'test_tool',
+        provider: 'openai',
+        flowManager: mockFlowManager as unknown as Parameters<
+          typeof manager.callTool
+        >[0]['flowManager'],
+        returnRawResponse: true,
+      });
+
+      expect(result).toEqual(rawResult);
+    });
+
+    it('keeps provider formatting as the default MCP result contract', async () => {
+      const serverConfig: t.SSEOptions = {
+        type: 'sse',
+        url: 'https://api.example.com',
+      };
+      const rawResult = {
+        content: [{ type: 'text' as const, text: 'Provider-formatted result' }],
+        structuredContent: { status: 'dispatched', work_ref: 'gh-work-hidden' },
+        isError: false,
+      };
+      (mockConnection.client.request as jest.Mock).mockResolvedValueOnce(rawResult);
+      mockAppConnections({
+        get: jest.fn().mockResolvedValue(mockConnection),
+      });
+      (mockRegistryInstance.getServerConfig as jest.Mock).mockResolvedValue(serverConfig);
+      const manager = await MCPManager.createInstance(newMCPServersConfig());
+
+      const result = await manager.callTool({
+        user: mockUser as IUser,
+        serverName,
+        toolName: 'test_tool',
+        provider: 'openai',
+        flowManager: mockFlowManager as unknown as Parameters<
+          typeof manager.callTool
+        >[0]['flowManager'],
+      });
+
+      expect(result).toEqual([[{ type: 'text', text: 'Provider-formatted result' }], undefined]);
     });
   });
 

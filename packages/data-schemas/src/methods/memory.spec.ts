@@ -229,6 +229,7 @@ describe('Memory Methods', () => {
 
       expect(result).toEqual(expect.objectContaining({ ok: true, revision: 1 }));
       expect(await MemoryEntry.countDocuments({ userId })).toBe(2);
+      expect(await MemoryEntry.countDocuments({ userId, deletedAt: null })).toBe(1);
       expect(await MemoryEntry.findOne({ userId, key: 'context_archive' }).lean()).toEqual(
         expect.objectContaining({ key: 'context_archive', value: 'Archived', __v: 1 }),
       );
@@ -281,7 +282,7 @@ describe('Memory Methods', () => {
       );
     });
 
-    it('identifies a hidden tombstone target without changing the source or tombstone', async () => {
+    it('reuses a deleted target key without leaving it permanently poisoned', async () => {
       const userId = new mongoose.Types.ObjectId();
       const source = await MemoryEntry.create({
         userId,
@@ -292,36 +293,64 @@ describe('Memory Methods', () => {
       const target = await MemoryEntry.create({
         userId,
         key: 'context_archive',
-        value: 'Deleted target',
+        value: 'Old target',
         tokenCount: 1,
       });
-      const deletedAt = new Date('2026-07-19T12:00:00.000Z');
-      await MemoryEntry.updateOne(
-        { _id: target._id },
-        { $set: { value: '', tokenCount: 0, deletedAt } },
-      );
+      await memoryMethods.deleteMemory({
+        userId,
+        key: 'context_archive',
+        expectedRevision: Number(target.__v ?? 0),
+      });
 
       const result = await memoryMethods.renameMemory({
         userId,
         key: 'context',
         newKey: 'context_archive',
         value: 'Replacement',
-        tokenCount: 1,
+        tokenCount: 2,
         expectedRevision: Number(source.__v ?? 0),
       });
 
-      expect(result).toEqual(
-        expect.objectContaining({
-          ok: false,
-          conflict: true,
-          conflictReason: 'target_key_reserved',
-        }),
+      expect(result).toEqual(expect.objectContaining({ ok: true, revision: 2 }));
+      expect(await MemoryEntry.countDocuments({ userId })).toBe(2);
+      expect(await MemoryEntry.countDocuments({ userId, deletedAt: null })).toBe(1);
+      expect(await MemoryEntry.findOne({ userId, key: 'context_archive' }).lean()).toEqual(
+        expect.objectContaining({ value: 'Replacement', tokenCount: 2, __v: 2 }),
       );
       expect(await MemoryEntry.findOne({ userId, key: 'context' }).lean()).toEqual(
-        expect.objectContaining({ value: 'Source', __v: 0 }),
+        expect.objectContaining({ value: '', tokenCount: 0, __v: 1 }),
       );
-      expect(await MemoryEntry.findOne({ userId, key: 'context_archive' }).lean()).toEqual(
-        expect.objectContaining({ deletedAt, __v: 0 }),
+    });
+
+    it('keeps the source generation tombstoned so a stale tab cannot recreate it', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const source = await MemoryEntry.create({
+        userId,
+        key: 'context',
+        value: 'Source',
+        tokenCount: 1,
+      });
+
+      const renamed = await memoryMethods.renameMemory({
+        userId,
+        key: 'context',
+        newKey: 'context_archive',
+        value: 'Archived',
+        tokenCount: 1,
+        expectedRevision: Number(source.__v ?? 0),
+      });
+      const staleSet = await memoryMethods.setMemory({
+        userId,
+        key: 'context',
+        value: 'Stale resurrection',
+        tokenCount: 2,
+        expectedRevision: Number(source.__v ?? 0),
+      });
+
+      expect(renamed).toEqual(expect.objectContaining({ ok: true }));
+      expect(staleSet).toEqual(expect.objectContaining({ ok: false, conflict: true }));
+      expect(await MemoryEntry.findOne({ userId, key: 'context' }).lean()).toEqual(
+        expect.objectContaining({ value: '', __v: 1 }),
       );
     });
   });

@@ -73,6 +73,15 @@ const agentSchema = new Schema<IAgent>(
     hide_sequential_outputs: {
       type: Boolean,
     },
+    /* === VIVENTIUM START ===
+     * Feature: Typed multi-agent presentation ownership.
+     * Purpose: Persist the reviewed primary-final policy instead of inferring it from graph order.
+     * === VIVENTIUM END === */
+    presentation_policy: {
+      type: String,
+      enum: ['primary_final'],
+      default: undefined,
+    },
     end_after_tools: {
       type: Boolean,
     },
@@ -172,6 +181,12 @@ const agentSchema = new Schema<IAgent>(
       //     confidence_threshold?: number, // required only for classified mode, 0.0-1.0
       //     cooldown_ms?: number,     // required only for classified mode
       //     max_history?: number,     // required only for classified mode
+      //   }
+      //   result_evidence?: {
+      //     visible_insight_requires: Array<{
+      //       tool: string,
+      //       receipt: "non_empty_sources",
+      //     }>,
       //   }
       // }
     },

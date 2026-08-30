@@ -4,6 +4,10 @@ const { CacheKeys } = require('librechat-data-provider');
 const getLogStores = require('~/cache/getLogStores');
 const { saveConvo } = require('~/models');
 const buildFallbackTitle = require('~/server/utils/buildFallbackTitle');
+const { getTrustedInteractionContext } = require('~/server/services/viventium/interactionContext');
+const {
+  recordVoiceOrchestrationTraceBestEffort,
+} = require('~/server/services/viventium/VoiceOrchestrationTraceService');
 
 /**
  * Add title to conversation in a way that avoids memory retention
@@ -48,6 +52,7 @@ const addTitle = async (req, { text, response, client }) => {
     }
 
     let title = await titlePromise;
+    const modelGeneratedTitle = Boolean(title);
     if (!abortController.signal.aborted) {
       abortController.abort();
     }
@@ -58,6 +63,25 @@ const addTitle = async (req, { text, response, client }) => {
     if (!title) {
       logger.debug(`[${key}] No title generated, using fallback title`);
       title = fallbackTitle;
+    }
+
+    const interaction = getTrustedInteractionContext(req);
+    if (
+      modelGeneratedTitle &&
+      req?.body?.voiceMode === true &&
+      req?.body?.viventiumCallSessionId &&
+      interaction?.surface === 'voice' &&
+      interaction?.logical_turn_id &&
+      response?.conversationId
+    ) {
+      await recordVoiceOrchestrationTraceBestEffort({
+        ownerId: req.user?.id,
+        callSessionId: req.body.viventiumCallSessionId,
+        turnId: interaction.logical_turn_id,
+        eventRef: response.conversationId,
+        stage: 'title_model.completed',
+        facts: { effectCount: 1 },
+      });
     }
 
     await titleCache.set(key, title, 120000);

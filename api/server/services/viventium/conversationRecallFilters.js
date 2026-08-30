@@ -1,7 +1,6 @@
 'use strict';
 
 const {
-  isListenOnlyTranscriptMessage,
   isPassiveVoiceTranscriptMessage,
 } = require('~/server/services/viventium/listenOnlyTranscript');
 
@@ -54,6 +53,18 @@ function messageUsesConversationRecallSearch(message) {
   return getFileSearchSources(message).some((source) => isConversationRecallFileId(source?.fileId));
 }
 
+function getConversationRecallEligibilityFilter() {
+  return {
+    $nor: [
+      { 'metadata.viventium.recallEligible': false },
+      {
+        'metadata.viventium.memoryEligible': false,
+        'metadata.viventium.recallEligible': { $ne: true },
+      },
+    ],
+  };
+}
+
 function buildRecallDerivedParentIdSet(messages = []) {
   const parentIds = new Set();
   for (const message of Array.isArray(messages) ? messages : []) {
@@ -68,6 +79,37 @@ function buildRecallDerivedParentIdSet(messages = []) {
     parentIds.add(parentMessageId);
   }
   return parentIds;
+}
+
+function logicalTurnRevision(message) {
+  const interaction = message?.metadata?.viventium?.interactionContext;
+  const logicalTurnId = String(
+    interaction?.logical_turn_id || message?.logical_turn_id || '',
+  ).trim();
+  const revision = Number(interaction?.revision ?? message?.revision);
+  if (!logicalTurnId || !Number.isSafeInteger(revision) || revision < 1) return null;
+  return { logicalTurnId, revision };
+}
+
+/**
+ * Keep both sides of the highest accepted revision and discard older provisional revisions.
+ * Messages without trusted logical-turn metadata remain unchanged.
+ */
+function filterSupersededLogicalTurnRevisions(messages = []) {
+  const input = Array.isArray(messages) ? messages : [];
+  const highestRevisionByTurn = new Map();
+  for (const message of input) {
+    const logical = logicalTurnRevision(message);
+    if (!logical) continue;
+    highestRevisionByTurn.set(
+      logical.logicalTurnId,
+      Math.max(highestRevisionByTurn.get(logical.logicalTurnId) || 0, logical.revision),
+    );
+  }
+  return input.filter((message) => {
+    const logical = logicalTurnRevision(message);
+    return !logical || highestRevisionByTurn.get(logical.logicalTurnId) === logical.revision;
+  });
 }
 
 function isAssistantLowSignalText(messageText) {
@@ -92,7 +134,8 @@ function shouldSkipRecallMessage({
   if (!cleaned) {
     return true;
   }
-  if (message?.metadata?.viventium?.interactionContext?.origin === 'scheduler') {
+  const viventiumMetadata = message?.metadata?.viventium;
+  if (viventiumMetadata?.visibility === 'internal') {
     return true;
   }
   if (INTERNAL_CONTROL_TEXT_REGEX.test(cleaned)) {
@@ -108,17 +151,9 @@ function shouldSkipRecallMessage({
    * QA and explicitly ineligible rows must stay out of every recall path, including source rescue.
    * === VIVENTIUM END === */
   if (
-    message?.metadata?.viventium?.memoryEligible === false ||
-    message?.metadata?.viventium?.qaRun === true
-  ) {
-    return true;
-  }
-  /* === VIVENTIUM START ===
-   * QA and explicitly ineligible rows must stay out of every recall path, including source rescue.
-   * === VIVENTIUM END === */
-  if (
-    message?.metadata?.viventium?.memoryEligible === false ||
-    message?.metadata?.viventium?.qaRun === true
+    viventiumMetadata?.recallEligible === false ||
+    (viventiumMetadata?.memoryEligible === false && viventiumMetadata?.recallEligible !== true) ||
+    viventiumMetadata?.qaRun === true
   ) {
     return true;
   }
@@ -140,8 +175,10 @@ function shouldSkipRecallMessage({
 module.exports = {
   buildRecallDerivedParentIdSet,
   cleanupText,
+  filterSupersededLogicalTurnRevisions,
+  getConversationRecallEligibilityFilter,
   getFileSearchSources,
-  isListenOnlyTranscriptMessage,
+  isPassiveVoiceTranscriptMessage,
   isAssistantLowSignalText,
   isAssistantMemoryDisclaimer,
   isConversationRecallFileId,

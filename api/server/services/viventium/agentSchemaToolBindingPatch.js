@@ -19,7 +19,10 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const { SystemMessage } = require('@langchain/core/messages');
 const { logger } = require('@librechat/data-schemas');
 const { StandardGraph } = require('@librechat/agents');
-const { isRecoverableProviderFallbackError } = require('./agentLlmFallback');
+const {
+  isRecoverableProviderFallbackError,
+  markOpaqueProviderAttemptFailure,
+} = require('./agentLlmFallback');
 
 const PATCH_FLAG = Symbol.for('viventium.agent.schema.tool.binding.patch.v7');
 const SCOPED_TOOLS_FLAG = Symbol.for('viventium.agent.schema.tool.binding.accessor.v1');
@@ -450,15 +453,20 @@ async function invokeModernFallbackPolicy({
   try {
     return await originalCallModel(primaryState, config);
   } catch (primaryError) {
+    const primaryAuthored = hasNewAuthoringEvidence(graph, primaryAuthoringBefore);
+    const classifiedPrimaryError =
+      config?.signal?.aborted === true || primaryAuthored
+        ? primaryError
+        : markOpaqueProviderAttemptFailure(primaryError);
     if (
       config?.signal?.aborted === true ||
-      hasNewAuthoringEvidence(graph, primaryAuthoringBefore) ||
-      !isRecoverableProviderFallbackError(primaryError)
+      primaryAuthored ||
+      !isRecoverableProviderFallbackError(classifiedPrimaryError)
     ) {
-      throw config?.signal?.aborted === true ? createGraphAbortError() : primaryError;
+      throw config?.signal?.aborted === true ? createGraphAbortError() : classifiedPrimaryError;
     }
 
-    let lastError = primaryError;
+    let lastError = classifiedPrimaryError;
     for (let index = 0; index < fallbacks.length; index += 1) {
       if (config?.signal?.aborted === true) {
         throw createGraphAbortError();
@@ -492,13 +500,20 @@ async function invokeModernFallbackPolicy({
         recordGraphFallbackRecovery(graph, runtimeContext);
         return result;
       } catch (fallbackError) {
-        lastError = fallbackError;
+        const fallbackAuthored = hasNewAuthoringEvidence(graph, fallbackAuthoringBefore);
+        const classifiedFallbackError =
+          config?.signal?.aborted === true || fallbackAuthored
+            ? fallbackError
+            : markOpaqueProviderAttemptFailure(fallbackError);
+        lastError = classifiedFallbackError;
         if (
           config?.signal?.aborted === true ||
-          hasNewAuthoringEvidence(graph, fallbackAuthoringBefore) ||
-          !isRecoverableProviderFallbackError(fallbackError)
+          fallbackAuthored ||
+          !isRecoverableProviderFallbackError(classifiedFallbackError)
         ) {
-          throw config?.signal?.aborted === true ? createGraphAbortError() : fallbackError;
+          throw config?.signal?.aborted === true
+            ? createGraphAbortError()
+            : classifiedFallbackError;
         }
       }
     }
@@ -558,13 +573,17 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
         }
         return result;
       } catch (error) {
+        const attemptAuthored = hasNewAuthoringEvidence(this, authoringBefore);
+        const classifiedError =
+          config?.signal?.aborted === true || attemptAuthored
+            ? error
+            : markOpaqueProviderAttemptFailure(error);
         if (policy && attemptIndex === 0) {
-          const primaryAuthored = hasNewAuthoringEvidence(this, authoringBefore);
-          if (primaryAuthored || !isRecoverableProviderFallbackError(error)) {
-            policy.blockedError = error;
+          if (attemptAuthored || !isRecoverableProviderFallbackError(classifiedError)) {
+            policy.blockedError = classifiedError;
           }
         }
-        throw error;
+        throw classifiedError;
       }
     };
   }

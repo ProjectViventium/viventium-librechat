@@ -19,6 +19,9 @@ jest.mock('librechat-data-provider', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  attachInteractionContextMetadata: (_req, message) => message,
+  getTrustedInteractionContext: () => null,
+  isInternalOrigin: () => false,
   resolveEffectiveDeliveryDisposition: ({ audioEligible, legacySkipVoice, captured }) => {
     if (legacySkipVoice) {
       return {

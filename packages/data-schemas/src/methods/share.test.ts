@@ -257,6 +257,189 @@ describe('Share Methods', () => {
   });
 
   describe('getSharedMessages', () => {
+    test('removes exact private path segments from complex public-share content', async () => {
+      class SerializableSharePart {
+        toJSON() {
+          return {
+            type: 'text',
+            text: 'Serializable public content.',
+            'metadata.cortex_delivery_feeling_snapshot': {
+              capsule: 'PRIVATE_SYNTHETIC_SERIALIZABLE_DOTTED_SHARE_CANARY',
+            },
+            'metadata.cortex_delivery_feeling_snapshot_public': 'preserved-near-match',
+          };
+        }
+      }
+      const cyclicPart: Record<string, unknown> = {
+        type: 'text',
+        text: 'Cyclic public content.',
+        'operator.cortex_delivery_feeling_snapshot': {
+          capsule: 'PRIVATE_SYNTHETIC_CYCLIC_DOTTED_SHARE_CANARY',
+        },
+      };
+      cyclicPart.self = cyclicPart;
+      const shareId = `share_${nanoid()}`;
+      const findOneSpy = jest.spyOn(SharedLink, 'findOne').mockReturnValue({
+        populate: () => ({
+          select: () => ({
+            lean: async () => ({
+              shareId,
+              conversationId: 'complex-share-conversation',
+              isPublic: true,
+              messages: [
+                {
+                  messageId: 'complex-share-message',
+                  conversationId: 'complex-share-conversation',
+                  parentMessageId: Constants.NO_PARENT,
+                  content: [
+                    {
+                      type: 'text',
+                      text: 'Normal public content.',
+                      'metadata.cortex_delivery_feeling_snapshot': {
+                        capsule: 'PRIVATE_SYNTHETIC_DOTTED_SHARE_CANARY',
+                      },
+                      'metadata.cortex_delivery_feeling_snapshot_public': 'normal-near-match',
+                      $set: {
+                        'content.0.cortex_delivery_feeling_snapshot': {
+                          capsule: 'PRIVATE_SYNTHETIC_OPERATOR_SHARE_CANARY',
+                        },
+                        publicValue: 'operator-public-value',
+                      },
+                    },
+                    new SerializableSharePart(),
+                    cyclicPart,
+                  ],
+                },
+              ],
+            }),
+          }),
+        }),
+      } as never);
+      try {
+        const result = await shareMethods.getSharedMessages(shareId);
+        const serialized = JSON.stringify(result);
+        expect(serialized).not.toContain('PRIVATE_SYNTHETIC_DOTTED_SHARE_CANARY');
+        expect(serialized).not.toContain('PRIVATE_SYNTHETIC_OPERATOR_SHARE_CANARY');
+        expect(serialized).not.toContain('PRIVATE_SYNTHETIC_SERIALIZABLE_DOTTED_SHARE_CANARY');
+        expect(serialized).not.toContain('PRIVATE_SYNTHETIC_CYCLIC_DOTTED_SHARE_CANARY');
+        expect(serialized).toContain('Normal public content.');
+        expect(serialized).toContain('Serializable public content.');
+        expect(serialized).toContain('Cyclic public content.');
+        expect(serialized).toContain('normal-near-match');
+        expect(serialized).toContain('preserved-near-match');
+        expect(serialized).toContain('operator-public-value');
+      } finally {
+        findOneSpy.mockRestore();
+      }
+    });
+
+    test('redacts legacy unaccepted cortex insight and delivery identity from a public share', async () => {
+      const shareId = `share_${nanoid()}`;
+      const findOneSpy = jest.spyOn(SharedLink, 'findOne').mockReturnValue({
+        populate: () => ({
+          select: () => ({
+            lean: async () => ({
+              shareId,
+              conversationId: 'legacy-unaccepted-share-conversation',
+              isPublic: true,
+              messages: [
+                {
+                  messageId: 'legacy-unaccepted-share-message',
+                  conversationId: 'legacy-unaccepted-share-conversation',
+                  parentMessageId: Constants.NO_PARENT,
+                  content: [
+                    {
+                      type: 'cortex_insight',
+                      insight: 'PRIVATE_SYNTHETIC_UNACCEPTED_SHARE_INSIGHT',
+                      cortex_delivery_acceptance: 'retryable',
+                      cortex_delivery_surface: 'web',
+                      cortex_delivery_stream_id: 'PRIVATE_SYNTHETIC_SHARE_STREAM_ID',
+                      cortex_delivery_message_revision: 9,
+                      cortex_graph_result_hash: 'c'.repeat(64),
+                      cortex_delivery_acceptance_public: 'preserved-near-match',
+                    },
+                    {
+                      type: 'cortex_insight',
+                      insight: 'Accepted shared insight.',
+                      cortex_delivery_acceptance: 'accepted',
+                    },
+                    { type: 'cortex_insight', insight: 'Normal shared insight.' },
+                  ],
+                },
+              ],
+            }),
+          }),
+        }),
+      } as never);
+      try {
+        const result = await shareMethods.getSharedMessages(shareId);
+        const parts = result?.messages[0].content as Array<Record<string, unknown>>;
+        expect(parts[0]).not.toHaveProperty('insight');
+        expect(parts[0]).not.toHaveProperty('cortex_delivery_acceptance');
+        expect(parts[0]).not.toHaveProperty('cortex_delivery_surface');
+        expect(parts[0]).not.toHaveProperty('cortex_delivery_stream_id');
+        expect(parts[0]).not.toHaveProperty('cortex_delivery_message_revision');
+        expect(parts[0]).not.toHaveProperty('cortex_graph_result_hash');
+        expect(parts[0].cortex_delivery_acceptance_public).toBe('preserved-near-match');
+        expect(parts[1].insight).toBe('Accepted shared insight.');
+        expect(parts[2].insight).toBe('Normal shared insight.');
+        expect(JSON.stringify(result)).not.toContain('PRIVATE_SYNTHETIC_UNACCEPTED_SHARE_INSIGHT');
+        expect(JSON.stringify(result)).not.toContain('PRIVATE_SYNTHETIC_SHARE_STREAM_ID');
+      } finally {
+        findOneSpy.mockRestore();
+      }
+    });
+
+    test('keeps a migrated legacy insight while redacting private delivery identity from a public share', async () => {
+      const shareId = `share_${nanoid()}`;
+      const findOneSpy = jest.spyOn(SharedLink, 'findOne').mockReturnValue({
+        populate: () => ({
+          select: () => ({
+            lean: async () => ({
+              shareId,
+              conversationId: 'migrated-share-conversation',
+              isPublic: true,
+              messages: [
+                {
+                  messageId: 'migrated-share-message',
+                  conversationId: 'migrated-share-conversation',
+                  parentMessageId: Constants.NO_PARENT,
+                  content: [
+                    {
+                      type: 'cortex_insight',
+                      insight: 'Migrated shared insight.',
+                      cortex_delivery_acceptance: 'ledger',
+                      cortex_delivery_surface: 'web',
+                      cortex_delivery_stream_id: 'PRIVATE_SYNTHETIC_MIGRATED_SHARE_STREAM_ID',
+                      cortex_delivery_message_revision: 10,
+                      cortex_graph_result_hash: 'e'.repeat(64),
+                      cortex_delivery_acceptance_public: 'preserved-near-match',
+                      cortex_delivery_stream_id_public: 'preserved-near-match',
+                    },
+                  ],
+                },
+              ],
+            }),
+          }),
+        }),
+      } as never);
+      try {
+        const result = await shareMethods.getSharedMessages(shareId);
+        const migrated = result?.messages[0].content?.[0] as Record<string, unknown>;
+        expect(migrated.insight).toBe('Migrated shared insight.');
+        expect(migrated).not.toHaveProperty('cortex_delivery_acceptance');
+        expect(migrated).not.toHaveProperty('cortex_delivery_surface');
+        expect(migrated).not.toHaveProperty('cortex_delivery_stream_id');
+        expect(migrated).not.toHaveProperty('cortex_delivery_message_revision');
+        expect(migrated).not.toHaveProperty('cortex_graph_result_hash');
+        expect(migrated.cortex_delivery_acceptance_public).toBe('preserved-near-match');
+        expect(migrated.cortex_delivery_stream_id_public).toBe('preserved-near-match');
+        expect(JSON.stringify(result)).not.toContain('PRIVATE_SYNTHETIC_MIGRATED_SHARE_STREAM_ID');
+      } finally {
+        findOneSpy.mockRestore();
+      }
+    });
+
     test('should retrieve and anonymize shared messages', async () => {
       const userId = new mongoose.Types.ObjectId().toString();
       const conversationId = `conv_${nanoid()}`;
@@ -282,6 +465,48 @@ describe('Share Methods', () => {
           parentMessageId: Constants.NO_PARENT,
         },
       ]);
+      await Message.collection.updateOne(
+        { messageId: messages[0].messageId },
+        {
+          $set: {
+            content: {
+              type: 'text',
+              text: 'Hello',
+              envelope: {
+                cortex_delivery_feeling_snapshot: {
+                  capsule: 'PRIVATE_SYNTHETIC_NON_ARRAY_SHARE_EXPORT_CANARY',
+                },
+              },
+            },
+          },
+        },
+      );
+      await Message.collection.updateOne(
+        { messageId: messages[1].messageId },
+        {
+          $set: {
+            content: [
+              {
+                type: 'cortex_insight',
+                insight: 'Synthetic visible insight.',
+                cortex_delivery_feeling_snapshot: {
+                  capsule: 'PRIVATE_SYNTHETIC_SHARE_CANARY',
+                  snapshotHash: 'a'.repeat(64),
+                },
+                exportEnvelope: {
+                  nested: [
+                    {
+                      cortex_delivery_feeling_snapshot: {
+                        capsule: 'PRIVATE_SYNTHETIC_NESTED_SHARE_EXPORT_CANARY',
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+      );
 
       // Create shared link
       await SharedLink.create({
@@ -295,6 +520,13 @@ describe('Share Methods', () => {
 
       const result = await shareMethods.getSharedMessages(shareId);
 
+      const storedPrivateReceipt = await Message.findById(messages[1]._id).lean();
+      expect(JSON.stringify(storedPrivateReceipt)).toContain('PRIVATE_SYNTHETIC_SHARE_CANARY');
+      const storedMalformedPrivateReceipt = await Message.findById(messages[0]._id).lean();
+      expect(JSON.stringify(storedMalformedPrivateReceipt)).toContain(
+        'PRIVATE_SYNTHETIC_NON_ARRAY_SHARE_EXPORT_CANARY',
+      );
+
       expect(result).toBeDefined();
       expect(result?.shareId).toBe(shareId);
       expect(result?.conversationId).not.toBe(conversationId); // Should be anonymized
@@ -307,6 +539,22 @@ describe('Share Methods', () => {
         expect(msg.conversationId).toBe(result.conversationId);
         expect(msg.user).toBeUndefined(); // User should be removed
       });
+      expect(JSON.stringify(result)).not.toContain('PRIVATE_SYNTHETIC_SHARE_CANARY');
+      expect(JSON.stringify(result)).not.toContain('PRIVATE_SYNTHETIC_NESTED_SHARE_EXPORT_CANARY');
+      expect(JSON.stringify(result)).not.toContain(
+        'PRIVATE_SYNTHETIC_NON_ARRAY_SHARE_EXPORT_CANARY',
+      );
+      const sharedCortexPart = result?.messages
+        .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+        .find(
+          (part) =>
+            part != null &&
+            typeof part === 'object' &&
+            'type' in part &&
+            part.type === 'cortex_insight',
+        );
+      expect(sharedCortexPart).toBeDefined();
+      expect(sharedCortexPart).not.toHaveProperty('cortex_delivery_feeling_snapshot');
     });
 
     test('should return null for non-public share', async () => {

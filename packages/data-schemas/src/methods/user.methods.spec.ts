@@ -561,6 +561,125 @@ describe('User Methods - Database Tests', () => {
     });
   });
 
+  describe('updateUserViventiumOrchestrationPreferences', () => {
+    test('leaves orchestration unset so the declared agent default remains authoritative', async () => {
+      const user = await User.create({
+        name: 'Focused User',
+        email: 'focused-orchestration@example.com',
+        provider: 'local',
+      });
+
+      expect(user.personalization?.orchestration_mode).toBeUndefined();
+    });
+
+    test('persists parallel mode without replacing unrelated preferences', async () => {
+      const user = await User.create({
+        name: 'Parallel User',
+        email: 'parallel-orchestration@example.com',
+        provider: 'local',
+        personalization: { memories: false, conversation_recall: true },
+      });
+
+      const updated = await methods.updateUserViventiumOrchestrationPreferences(
+        user._id?.toString() || '',
+        { mode: 'parallel' },
+      );
+
+      expect(updated?.personalization).toMatchObject({
+        memories: false,
+        conversation_recall: true,
+        orchestration_mode: 'parallel',
+      });
+    });
+
+    test('returns null for a missing user', async () => {
+      const fakeId = new mongoose.Types.ObjectId();
+      await expect(
+        methods.updateUserViventiumOrchestrationPreferences(fakeId.toString(), {
+          mode: 'parallel',
+        }),
+      ).resolves.toBeNull();
+    });
+
+    test('atomically publishes positive work and advances the durable epoch', async () => {
+      const user = await User.create({
+        name: 'Durable Work User',
+        email: 'durable-work@example.com',
+        provider: 'local',
+        personalization: { orchestration_mode: 'focused' },
+      });
+      const userId = user._id?.toString() || '';
+
+      await expect(methods.getUserParallelWorkKnownEpoch(userId)).resolves.toBe(0);
+      await expect(
+        Promise.all(Array.from({ length: 8 }, () => methods.markUserParallelWorkKnown(userId))),
+      ).resolves.toEqual(Array(8).fill(true));
+      await expect(User.findById(userId).lean()).resolves.toMatchObject({
+        personalization: {
+          orchestration_mode: 'focused',
+          parallel_work_known: true,
+          parallel_work_known_epoch: 8,
+        },
+      });
+    });
+
+    test('rejects an unfenced negative preference write', async () => {
+      const user = await User.create({
+        name: 'Legacy Work API User',
+        email: 'legacy-work-api@example.com',
+        provider: 'local',
+      });
+      const userId = user._id?.toString() || '';
+
+      await expect(
+        methods.updateUserViventiumOrchestrationPreferences(userId, { knownWork: true }),
+      ).resolves.toMatchObject({
+        personalization: { parallel_work_known: true, parallel_work_known_epoch: 1 },
+      });
+      await expect(
+        methods.updateUserViventiumOrchestrationPreferences(userId, { knownWork: false }),
+      ).rejects.toThrow('parallel_work_known_clear_requires_epoch');
+    });
+
+    test('treats a legacy missing epoch as zero for one atomic clear', async () => {
+      const user = await User.create({
+        name: 'Legacy Durable Work User',
+        email: 'legacy-durable-work@example.com',
+        provider: 'local',
+        personalization: { parallel_work_known: true },
+      });
+      const userId = user._id?.toString() || '';
+      await User.collection.updateOne(
+        { _id: user._id },
+        { $unset: { 'personalization.parallel_work_known_epoch': '' } },
+      );
+
+      await expect(methods.getUserParallelWorkKnownEpoch(userId)).resolves.toBe(0);
+      await expect(methods.clearUserParallelWorkKnownIfEpoch(userId, 0)).resolves.toBe(true);
+      await expect(User.findById(userId).lean()).resolves.toMatchObject({
+        personalization: { parallel_work_known: false },
+      });
+    });
+
+    test('rejects an old empty observation after another process advances the epoch', async () => {
+      const user = await User.create({
+        name: 'Concurrent Durable Work User',
+        email: 'concurrent-durable-work@example.com',
+        provider: 'local',
+      });
+      const userId = user._id?.toString() || '';
+      const capturedEpoch = await methods.getUserParallelWorkKnownEpoch(userId);
+
+      await expect(methods.markUserParallelWorkKnown(userId)).resolves.toBe(true);
+      await expect(
+        methods.clearUserParallelWorkKnownIfEpoch(userId, capturedEpoch ?? -1),
+      ).resolves.toBe(false);
+      await expect(User.findById(userId).lean()).resolves.toMatchObject({
+        personalization: { parallel_work_known: true, parallel_work_known_epoch: 1 },
+      });
+    });
+  });
+
   describe('Email Normalization Edge Cases', () => {
     test('should handle email with multiple spaces', async () => {
       await User.create({

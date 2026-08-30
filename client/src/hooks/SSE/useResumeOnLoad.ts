@@ -1,71 +1,54 @@
 import { useEffect, useRef } from 'react';
 import { useSetRecoilState, useRecoilValue } from 'recoil';
-import { Constants, tMessageSchema, isAssistantsEndpoint } from 'librechat-data-provider';
+/* === VIVENTIUM START ===
+ * Feature: Exact optimistic-to-authoritative resume identity.
+ * Purpose: Publish the exact projected pair to the canonical query cache before reconnect.
+ */
+import { useQueryClient } from '@tanstack/react-query';
+import { QueryKeys } from 'librechat-data-provider';
+/* === VIVENTIUM END === */
+import { Constants, isAssistantsEndpoint } from 'librechat-data-provider';
 import type { TMessage, TConversation, TSubmission, Agents } from 'librechat-data-provider';
 import { useActiveJobs, useStreamStatus } from '~/data-provider';
 import store from '~/store';
+/* === VIVENTIUM START === Exact optimistic-to-authoritative resume identity. === */
+import { projectResumeMessages, type ResumeMessageProjection } from './resumeMessageProjection';
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Exact optimistic-to-authoritative resume identity. === */
+export function hasAuthoritativeResumePair(resumeState?: Agents.ResumeState): boolean {
+  const presentation = resumeState?.clientPresentation;
+  return Boolean(
+    resumeState?.userMessage?.messageId?.trim() &&
+    resumeState.responseMessageId?.trim() &&
+    (presentation?.mode === 'append' || presentation?.mode === 'regenerate') &&
+    presentation.userMessageId?.trim() &&
+    presentation.responseMessageId?.trim() &&
+    presentation.targetUserMessageId?.trim(),
+  );
+}
+/* === VIVENTIUM END === */
 
 /**
  * Build a submission object from resume state for reconnected streams.
  * This provides the minimum data needed for useResumableSSE to subscribe.
  */
-function buildSubmissionFromResumeState(
+/* === VIVENTIUM START ===
+ * Feature: Exact optimistic-to-authoritative resume identity.
+ * Purpose: FINAL history excludes the rebound active pair, so its authoritative server pair is
+ *          appended once instead of becoming a second conversation branch.
+ */
+export function buildSubmissionFromResumeState(
   resumeState: Agents.ResumeState,
   streamId: string,
   messages: TMessage[],
   conversationId: string,
-): TSubmission {
-  const userMessageData = resumeState.userMessage;
-  const responseMessageId =
-    resumeState.responseMessageId ?? `${userMessageData?.messageId ?? 'resume'}_`;
-
-  // Try to find existing user message in the messages array (from database)
-  const existingUserMessage = messages.find(
-    (m) => m.isCreatedByUser && m.messageId === userMessageData?.messageId,
-  );
-
-  // Try to find existing response message in the messages array (from database)
-  const existingResponseMessage = messages.find(
-    (m) =>
-      !m.isCreatedByUser &&
-      (m.messageId === responseMessageId || m.parentMessageId === userMessageData?.messageId),
-  );
-
-  // Create or use existing user message
-  const userMessage: TMessage =
-    existingUserMessage ??
-    (userMessageData
-      ? (tMessageSchema.parse({
-          messageId: userMessageData.messageId,
-          parentMessageId: userMessageData.parentMessageId ?? Constants.NO_PARENT,
-          conversationId: userMessageData.conversationId ?? conversationId,
-          text: userMessageData.text ?? '',
-          isCreatedByUser: true,
-          role: 'user',
-        }) as TMessage)
-      : (messages[messages.length - 2] ??
-        ({
-          messageId: 'resume_user_msg',
-          conversationId,
-          text: '',
-          isCreatedByUser: true,
-        } as TMessage)));
-
-  // ALWAYS use aggregatedContent from resumeState - it has the latest content from the running job.
-  // DB content may be stale (saved at disconnect, but generation continued).
-  const initialResponse: TMessage = {
-    messageId: existingResponseMessage?.messageId ?? responseMessageId,
-    parentMessageId: existingResponseMessage?.parentMessageId ?? userMessage.messageId,
+  projection: ResumeMessageProjection = projectResumeMessages(
+    resumeState,
+    messages,
     conversationId,
-    text: '',
-    // aggregatedContent is authoritative - it reflects actual job state
-    content: (resumeState.aggregatedContent as TMessage['content']) ?? [],
-    isCreatedByUser: false,
-    role: 'assistant',
-    sender: existingResponseMessage?.sender ?? resumeState.sender,
-    model: existingResponseMessage?.model,
-  } as TMessage;
-
+  ),
+): TSubmission {
   const conversation: TConversation = {
     conversationId,
     title: 'Resumed Chat',
@@ -73,17 +56,18 @@ function buildSubmissionFromResumeState(
   } as TConversation;
 
   return {
-    messages,
-    userMessage,
-    initialResponse,
+    messages: projection.historyMessages,
+    userMessage: projection.userMessage,
+    initialResponse: projection.responseMessage,
     conversation,
-    isRegenerate: false,
+    isRegenerate: resumeState.clientPresentation?.mode === 'regenerate',
     isTemporary: false,
     endpointOption: {},
     // Signal to useResumableSSE to subscribe to existing stream instead of starting new
     resumeStreamId: streamId,
   } as TSubmission & { resumeStreamId: string };
 }
+/* === VIVENTIUM END === */
 
 /**
  * Hook to resume streaming if navigating to a conversation with active generation.
@@ -102,6 +86,9 @@ export default function useResumeOnLoad(
   runIndex = 0,
   messagesLoaded = true,
 ) {
+  /* === VIVENTIUM START === Exact optimistic-to-authoritative resume identity. === */
+  const queryClient = useQueryClient();
+  /* === VIVENTIUM END === */
   const setSubmission = useSetRecoilState(store.submissionByIndex(runIndex));
   const currentSubmission = useRecoilValue(store.submissionByIndex(runIndex));
   const currentConversation = useRecoilValue(store.conversationByIndex(runIndex));
@@ -111,6 +98,9 @@ export default function useResumeOnLoad(
   const resumableEnabled = !isAssistantsEndpoint(actualEndpoint);
   // Track conversations we've already processed (either resumed or skipped)
   const processedConvoRef = useRef<string | null>(null);
+  /* === VIVENTIUM START === Exact optimistic-to-authoritative resume identity. === */
+  const identityRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /* === VIVENTIUM END === */
 
   // Check for active stream when conversation changes
   // Allow check if no submission OR submission is for a different conversation (stale)
@@ -125,7 +115,11 @@ export default function useResumeOnLoad(
     conversationId !== Constants.NEW_CONVO &&
     processedConvoRef.current !== conversationId; // Don't re-check processed convos
 
-  const { data: streamStatus, isSuccess } = useStreamStatus(conversationId, shouldCheck);
+  const {
+    data: streamStatus,
+    isSuccess,
+    refetch: refetchStreamStatus,
+  } = useStreamStatus(conversationId, shouldCheck);
   const { data: activeJobsData, isSuccess: activeJobsReady } = useActiveJobs(resumableEnabled);
 
   useEffect(() => {
@@ -208,25 +202,60 @@ export default function useResumeOnLoad(
       return;
     }
 
+    /* === VIVENTIUM START ===
+     * Feature: Exact optimistic-to-authoritative resume identity.
+     * Purpose: A job is admitted before onStart persists server message IDs. Poll without marking
+     *          the conversation processed; guessing here creates a second visible branch.
+     */
+    if (!hasAuthoritativeResumePair(streamStatus.resumeState)) {
+      if (!identityRetryRef.current) {
+        identityRetryRef.current = setTimeout(() => {
+          identityRetryRef.current = null;
+          void refetchStreamStatus();
+        }, 250);
+      }
+      return;
+    }
+    if (identityRetryRef.current) {
+      clearTimeout(identityRetryRef.current);
+      identityRetryRef.current = null;
+    }
+    /* === VIVENTIUM END === */
+
     // Mark as processed NOW - we verified there's an active job and will create submission
     processedConvoRef.current = conversationId;
 
     console.log('[ResumeOnLoad] Found active job, creating submission...', {
       streamId: streamStatus.streamId,
       status: streamStatus.status,
-      resumeState: streamStatus.resumeState,
+      hasResumeState: streamStatus.resumeState != null,
+      runStepCount: streamStatus.resumeState?.runSteps?.length ?? 0,
+      aggregatedContentCount: streamStatus.resumeState?.aggregatedContent?.length ?? 0,
+      hasClientPresentation: Boolean(streamStatus.resumeState?.clientPresentation),
+      hasUserMessage: Boolean(streamStatus.resumeState?.userMessage?.messageId),
+      hasResponseMessageId: Boolean(streamStatus.resumeState?.responseMessageId),
     });
 
     const messages = getMessages() || [];
 
     // Build submission from resume state if available
     if (streamStatus.resumeState) {
+      /* === VIVENTIUM START === Exact optimistic-to-authoritative resume identity. === */
+      const projection = projectResumeMessages(streamStatus.resumeState, messages, conversationId);
       const submission = buildSubmissionFromResumeState(
         streamStatus.resumeState,
         streamStatus.streamId,
         messages,
         conversationId,
+        projection,
       );
+      if (projection.projectedActivePair) {
+        queryClient.setQueryData<TMessage[]>(
+          [QueryKeys.messages, conversationId],
+          projection.visibleMessages,
+        );
+      }
+      /* === VIVENTIUM END === */
       setSubmission(submission);
     } else {
       // Minimal submission without resume state
@@ -261,7 +290,9 @@ export default function useResumeOnLoad(
     activeJobsReady,
     isSuccess,
     streamStatus,
+    refetchStreamStatus,
     getMessages,
+    queryClient,
     setSubmission,
   ]);
 
@@ -275,5 +306,18 @@ export default function useResumeOnLoad(
       });
       processedConvoRef.current = null;
     }
+    if (identityRetryRef.current) {
+      clearTimeout(identityRetryRef.current);
+      identityRetryRef.current = null;
+    }
   }, [conversationId]);
+
+  useEffect(
+    () => () => {
+      if (identityRetryRef.current) {
+        clearTimeout(identityRetryRef.current);
+      }
+    },
+    [],
+  );
 }

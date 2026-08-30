@@ -174,6 +174,16 @@ describe('WHOOP health command boundary', () => {
       granted_scopes: [],
       coverage: { api: {}, export: {} },
       latest_api_run: null,
+      latest_successful_api_run: {
+        started_at: '2026-08-10T11:00:00Z',
+        finished_at: '2026-08-10T11:01:00Z',
+        status: 'complete',
+        resources: ['cycles'],
+        resource_results: { cycles: 'complete' },
+        resource_item_counts: { cycles: 4 },
+        item_count: 4,
+        injected_private_field: '/private/run/path',
+      },
       latest_export_run: null,
       manual_evidence: { item_count: 2, latest_at: '2026-08-10T12:00:00Z' },
       schedule: { state: 'not_configured', configured: false, loaded: false },
@@ -189,6 +199,17 @@ describe('WHOOP health command boundary', () => {
 
     expect(result.state).toBe('setup_required');
     expect(result.authorizationRecoveryRequired).toBe(true);
+    expect(result.latestSuccessfulApiRun).toEqual({
+      startedAt: '2026-08-10T11:00:00Z',
+      finishedAt: '2026-08-10T11:01:00Z',
+      status: 'complete',
+      requestedStart: null,
+      requestedEnd: null,
+      resources: ['cycles'],
+      resourceResults: { cycles: 'complete' },
+      resourceItemCounts: { cycles: 4 },
+      itemCount: 4,
+    });
     expect(result.manualEvidence).toEqual({ itemCount: 2, latestAt: '2026-08-10T12:00:00Z' });
     expect(JSON.stringify(result)).not.toContain('injected_private_field');
     expect(JSON.stringify(result)).not.toContain('/private/path');

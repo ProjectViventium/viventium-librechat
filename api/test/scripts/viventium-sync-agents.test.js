@@ -225,7 +225,7 @@ describe('viventium-sync-agents args', () => {
     ]);
   });
 
-  test('GlassHive MCP prompt tells models to use namespaced callable tool ids', () => {
+  test('GlassHive MCP prompt keeps concise host-owned callable-tool guidance', () => {
     const resolved = resolvePromptRefs({
       instructions: {
         promptRef: 'mcp.glasshive_workers.server',
@@ -233,15 +233,16 @@ describe('viventium-sync-agents args', () => {
     });
 
     expect(resolved.instructions).toContain(
-      'exact GlassHive tool id exposed by the host application',
+      "Use the one GlassHive tool whose action matches the user's request",
     );
-    expect(resolved.instructions).toContain('workspace_launch_mcp_glasshive-workers-projects');
-    expect(resolved.instructions).toContain('not in the available tool list');
-    expect(resolved.instructions).toContain('Do not shorten, summarize, paraphrase, or water down');
+    expect(resolved.instructions).toContain('For a fresh delegated task, use workspace_launch');
+    expect(resolved.instructions).toContain('never enumerate or summarize the tool catalog');
     expect(resolved.instructions).toContain(
-      'Preserve host-side GlassHive orchestration requirements as context',
+      "Preserve the user's goal, constraints, files, and context",
     );
-    expect(resolved.instructions).toContain('not by the worker running inside the workspace');
+    expect(resolved.instructions).toContain('Use the exact callable tool id shown by the host');
+    expect(resolved.instructions).toContain('{{glasshive_worker_capability_summary}}');
+    expect(resolved.instructions).toContain('{{glasshive_worker_execution_instruction}}');
   });
 
   test('buildUpdateData keeps GlassHive and voice parameter bags in model-config-only mode', () => {
@@ -813,6 +814,34 @@ describe('viventium-sync-agents args', () => {
       expect.objectContaining({
         id: 'main',
         changedFields: ['recursion_limit', 'edges'],
+      }),
+    ]);
+  });
+
+  test('compareBundlesByAgent protects graph presentation and sequential-output drift', () => {
+    const diff = compareBundlesByAgent({
+      leftBundle: {
+        mainAgent: {
+          id: 'main',
+          end_after_tools: false,
+          hide_sequential_outputs: false,
+          presentation_policy: { mode: 'intermediate' },
+        },
+      },
+      rightBundle: {
+        mainAgent: {
+          id: 'main',
+          end_after_tools: true,
+          hide_sequential_outputs: true,
+          presentation_policy: { mode: 'final_only' },
+        },
+      },
+    });
+
+    expect(diff.diffs).toEqual([
+      expect.objectContaining({
+        id: 'main',
+        changedFields: ['end_after_tools', 'hide_sequential_outputs', 'presentation_policy'],
       }),
     ]);
   });

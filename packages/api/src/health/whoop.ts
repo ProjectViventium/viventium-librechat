@@ -407,6 +407,7 @@ export async function getWhoopStatus(runner: HealthCommandRunner = defaultRunner
       : [],
     coverage: { api: sanitizedApi, export: sanitizedExport },
     latestApiRun: sanitizeRun(payload.latest_api_run),
+    latestSuccessfulApiRun: sanitizeRun(payload.latest_successful_api_run),
     latestExportRun: sanitizeRun(payload.latest_export_run),
     manualEvidence: {
       itemCount: safeInteger(manualEvidence.item_count) ?? 0,

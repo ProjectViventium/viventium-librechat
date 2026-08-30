@@ -2,7 +2,7 @@
 id: surface.voice.provider.cartesia
 owner_layer: viventium_surface
 target: surface.voice.provider.cartesia
-version: 2
+version: 3
 status: active
 safety_class: public_product
 required_context:

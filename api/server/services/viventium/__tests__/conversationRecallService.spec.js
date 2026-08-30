@@ -24,10 +24,17 @@ const mockFileDeleteOne = jest.fn();
 
 const mockWriteFile = jest.fn();
 const mockUnlink = jest.fn();
+const mockDeferAfterCommit = jest.fn();
 
-jest.mock(
+const mockActualDataSchemas = { ...jest.requireActual('@librechat/data-schemas') };
+const mockActualDataProvider = { ...jest.requireActual('librechat-data-provider') };
+const mockActualFs = { ...jest.requireActual('fs') };
+const mockVisibleContentProjection = jest.requireActual('../ViventiumVisibleContentProjection');
+
+jest.doMock(
   '@librechat/data-schemas',
   () => ({
+    ...mockActualDataSchemas,
     logger: {
       error: jest.fn(),
       warn: jest.fn(),
@@ -38,24 +45,27 @@ jest.mock(
   { virtual: true },
 );
 
-jest.mock('fs', () => {
-  const actualFs = jest.requireActual('fs');
+jest.doMock('fs', () => {
   return {
-    ...actualFs,
+    ...mockActualFs,
     promises: {
-      ...actualFs.promises,
+      ...mockActualFs.promises,
       writeFile: (...args) => mockWriteFile(...args),
       unlink: (...args) => mockUnlink(...args),
     },
   };
 });
 
-jest.mock('~/server/services/Files/VectorDB/crud', () => ({
+jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
   uploadVectors: (...args) => mockUploadVectors(...args),
   deleteVectors: (...args) => mockDeleteVectors(...args),
 }));
 
-jest.mock('~/db/models', () => ({
+jest.doMock('../GlassHiveTerminalCallbackTransaction', () => ({
+  deferGlassHiveTerminalCallbackAfterCommit: (...args) => mockDeferAfterCommit(...args),
+}));
+
+jest.doMock('~/db/models', () => ({
   Agent: {
     findOne: (...args) => mockAgentFindOne(...args),
     find: jest.fn(),
@@ -78,8 +88,8 @@ jest.mock('~/db/models', () => ({
   },
 }));
 
-jest.mock('librechat-data-provider', () => ({
-  ...jest.requireActual('librechat-data-provider'),
+jest.doMock('librechat-data-provider', () => ({
+  ...mockActualDataProvider,
   FileContext: {
     conversation_recall: 'conversation_recall',
   },
@@ -109,6 +119,19 @@ jest.mock('librechat-data-provider', () => ({
     return filename.slice(prefix.length, -'.txt'.length) || null;
   },
 }));
+
+jest.doMock('../ViventiumVisibleContentProjection', () => mockVisibleContentProjection);
+
+afterAll(() => {
+  jest.dontMock('@librechat/data-schemas');
+  jest.dontMock('fs');
+  jest.dontMock('~/server/services/Files/VectorDB/crud');
+  jest.dontMock('../GlassHiveTerminalCallbackTransaction');
+  jest.dontMock('~/db/models');
+  jest.dontMock('librechat-data-provider');
+  jest.dontMock('../ViventiumVisibleContentProjection');
+  jest.resetModules();
+});
 
 function queryResult(result) {
   return {
@@ -151,10 +174,39 @@ describe('conversationRecallService', () => {
     mockDeleteVectors.mockResolvedValue(undefined);
     mockFileDeleteOne.mockResolvedValue({ deletedCount: 1 });
     mockFileFindOne.mockReturnValue(queryResult(null));
+    mockDeferAfterCommit.mockReturnValue(false);
   });
 
   afterEach(() => {
     jest.useRealTimers();
+  });
+
+  test('getMessageText preserves boundaries between multiple visible assistant parts', () => {
+    const service = require('../conversationRecallService');
+
+    expect(
+      service.getMessageText({
+        text: 'Base answer.Added answer.',
+        content: [
+          { type: 'text', text: 'Base answer.', agentId: 'agent-main', groupId: 1 },
+          { type: 'text', text: 'Added answer.', agentId: 'agent-main____1', groupId: 1 },
+        ],
+      }),
+    ).toBe('Base answer. Added answer.');
+  });
+
+  test('getMessageText preserves an explicitly different sanitized assistant text', () => {
+    const service = require('../conversationRecallService');
+
+    expect(
+      service.getMessageText({
+        text: 'Sanitized visible answer.',
+        content: [
+          { type: 'text', text: '<voice>First raw part.</voice>' },
+          { type: 'text', text: '<voice>Second raw part.</voice>' },
+        ],
+      }),
+    ).toBe('Sanitized visible answer.');
   });
 
   test('refreshConversationRecallForUser upserts all-conversations corpus when global recall is enabled', async () => {
@@ -191,7 +243,13 @@ describe('conversationRecallService', () => {
 
     expect(mockMessageFind).toHaveBeenCalledWith(
       expect.objectContaining({
-        'metadata.viventium.memoryEligible': { $ne: false },
+        $nor: [
+          { 'metadata.viventium.recallEligible': false },
+          {
+            'metadata.viventium.memoryEligible': false,
+            'metadata.viventium.recallEligible': { $ne: true },
+          },
+        ],
         'metadata.viventium.qaRun': { $ne: true },
         $or: [{ expiredAt: { $exists: false } }, { expiredAt: null }],
       }),
@@ -209,6 +267,56 @@ describe('conversationRecallService', () => {
       expect.any(Object),
       { upsert: true, new: true },
     );
+  });
+
+  test('indexes a visible scheduled result while excluding its trusted internal envelope', async () => {
+    mockUserFindById.mockReturnValue(
+      queryResult({ personalization: { conversation_recall: true } }),
+    );
+    mockMessageFind.mockReturnValue(
+      queryResult([
+        {
+          messageId: 'scheduled-result',
+          conversationId: 'scheduled-conversation',
+          createdAt: '2026-08-21T10:01:00.000Z',
+          isCreatedByUser: false,
+          sender: 'assistant',
+          text: 'Visible scheduled result evidence.',
+          metadata: {
+            viventium: {
+              memoryEligible: false,
+              recallEligible: true,
+              interactionContext: { actor_kind: 'system', origin: 'scheduler' },
+            },
+          },
+        },
+        {
+          messageId: 'scheduled-envelope',
+          conversationId: 'scheduled-conversation',
+          createdAt: '2026-08-21T10:00:00.000Z',
+          isCreatedByUser: true,
+          text: 'Private scheduler envelope evidence.',
+          metadata: {
+            viventium: {
+              visibility: 'internal',
+              memoryEligible: false,
+              recallEligible: false,
+              interactionContext: { actor_kind: 'system', origin: 'scheduler' },
+            },
+          },
+        },
+      ]),
+    );
+    mockConversationFind.mockReturnValue(queryResult([]));
+    mockFileFind.mockReturnValue(queryResult([]));
+    mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'file_all' }));
+
+    const service = require('../conversationRecallService');
+    await service.refreshConversationRecallForUser({ userId: 'user_1' });
+
+    const corpus = String(mockWriteFile.mock.calls[0][1]);
+    expect(corpus).toContain('Visible scheduled result evidence.');
+    expect(corpus).not.toContain('Private scheduler envelope evidence.');
   });
 
   test('indexes the complete bounded user turn when assistant turns use a smaller clip limit', async () => {
@@ -1344,6 +1452,59 @@ describe('conversationRecallService', () => {
     expect(mockMessageFind).toHaveBeenCalledTimes(1);
   });
 
+  test('defers proactive sync until callback commit and schedules nothing after abort', async () => {
+    jest.useFakeTimers();
+    const afterCommit = [];
+    mockDeferAfterCommit.mockImplementation((operation) => {
+      afterCommit.push(operation);
+      return true;
+    });
+    mockUserFindById.mockReturnValue(
+      queryResult({
+        personalization: { conversation_recall: true },
+      }),
+    );
+    mockConversationFind.mockReturnValue(queryResult([]));
+    mockMessageFind.mockReturnValue(
+      queryResult([
+        {
+          conversationId: 'conv_committed',
+          createdAt: '2026-08-28T03:39:30.000Z',
+          isCreatedByUser: false,
+          text: 'Committed callback follow-up.',
+        },
+      ]),
+    );
+    mockFileFind.mockReturnValue(queryResult([]));
+    mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'file_all' }));
+
+    const service = require('../conversationRecallService');
+    service.scheduleConversationRecallSync({
+      userId: 'user_1',
+      conversationId: 'conv_committed',
+    });
+
+    expect(afterCommit).toHaveLength(1);
+    expect(jest.getTimerCount()).toBe(0);
+    expect(mockMessageFind).not.toHaveBeenCalled();
+
+    await afterCommit[0]();
+    await jest.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+
+    expect(mockMessageFind).toHaveBeenCalledTimes(1);
+
+    service.scheduleConversationRecallSync({
+      userId: 'user_1',
+      conversationId: 'conv_aborted',
+    });
+    expect(afterCommit).toHaveLength(2);
+    expect(jest.getTimerCount()).toBe(0);
+
+    await jest.runOnlyPendingTimersAsync();
+    expect(mockMessageFind).toHaveBeenCalledTimes(1);
+  });
+
   test('applies cooldown after transient sync failure', async () => {
     jest.useFakeTimers();
 
@@ -1492,5 +1653,96 @@ describe('conversationRecallService', () => {
 
     await jest.advanceTimersByTimeAsync(60);
     expect(mockUploadVectors).toHaveBeenCalledTimes(2);
+  });
+
+  test('cleanup rebuild returns a content-free receipt bound to current recall artifacts', async () => {
+    mockUserFindById.mockReturnValue(
+      queryResult({ personalization: { conversation_recall: true } }),
+    );
+    mockMessageFind.mockReturnValue(
+      queryResult([
+        {
+          conversationId: 'conversation-cleanup-1',
+          createdAt: '2026-08-25T16:00:00.000Z',
+          isCreatedByUser: true,
+          text: 'private source text must not enter the receipt',
+        },
+      ]),
+    );
+    mockConversationFind.mockReturnValue(queryResult([]));
+    mockFileFind.mockReturnValueOnce(queryResult([])).mockReturnValueOnce(
+      queryResult([
+        {
+          file_id: 'conversation_recall:user_1:all',
+          embedded: true,
+          metadata: {
+            conversationRecallSourceDigest: 'a'.repeat(64),
+            conversationRecallUploadedDigest: 'b'.repeat(64),
+            conversationRecallUsedReducedUploadWindow: true,
+          },
+        },
+      ]),
+    );
+    mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'file_all' }));
+
+    const service = require('../conversationRecallService');
+    const receipt = await service.reconcileConversationRecallForCleanup({
+      userId: 'user_1',
+      operationId: 'cleanup-operation-1',
+      targetSetSha256: 'c'.repeat(64),
+    });
+
+    expect(receipt).toEqual({
+      status: 'verified',
+      receiptSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      artifactCount: 1,
+    });
+    expect(JSON.stringify(receipt)).not.toMatch(/user_1|conversation-cleanup|private source/);
+  });
+
+  test('cleanup delayed verification fails when current recall state differs from its receipt', async () => {
+    const currentFile = (digest) =>
+      queryResult([
+        {
+          file_id: 'conversation_recall:user_1:all',
+          embedded: true,
+          metadata: {
+            conversationRecallSourceDigest: digest,
+            conversationRecallUploadedDigest: digest,
+            conversationRecallUsedReducedUploadWindow: false,
+          },
+        },
+      ]);
+    mockFileFind.mockReturnValueOnce(currentFile('a'.repeat(64)));
+    const service = require('../conversationRecallService');
+    const initial = await service.inspectConversationRecallCleanupReceipt({
+      userId: 'user_1',
+      operationId: 'cleanup-operation-1',
+      targetSetSha256: 'c'.repeat(64),
+    });
+    mockFileFind.mockReturnValueOnce(currentFile('b'.repeat(64)));
+
+    await expect(
+      service.verifyConversationRecallCleanupReceipt({
+        userId: 'user_1',
+        operationId: 'cleanup-operation-1',
+        targetSetSha256: 'c'.repeat(64),
+        expectedReceiptSha256: initial.receiptSha256,
+      }),
+    ).resolves.toEqual({ verified: false });
+  });
+
+  test('cleanup recall reconciliation fails closed when vector infrastructure is unavailable', async () => {
+    delete process.env.RAG_API_URL;
+    const service = require('../conversationRecallService');
+
+    await expect(
+      service.reconcileConversationRecallForCleanup({
+        userId: 'user_1',
+        operationId: 'cleanup-operation-1',
+        targetSetSha256: 'c'.repeat(64),
+      }),
+    ).rejects.toThrow('cleanup_recall_infrastructure_unavailable');
+    expect(mockFileFind).not.toHaveBeenCalled();
   });
 });

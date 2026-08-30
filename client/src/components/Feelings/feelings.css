@@ -1,15 +1,15 @@
 .feelings-view {
-  --feelings-canvas: #080a0a;
-  --feelings-surface: #0d1010;
-  --feelings-raised: #121615;
-  --feelings-ink: #f4f5f2;
-  --feelings-muted: #929a98;
-  --feelings-quiet: #858e8b;
-  --feelings-line: rgba(221, 231, 226, 0.12);
-  --feelings-line-strong: rgba(221, 231, 226, 0.22);
-  --feelings-mint: #7bf0ca;
-  --feelings-live: #ffb44d;
-  --feelings-danger: #ff816f;
+  --feelings-canvas: var(--surface-primary);
+  --feelings-surface: var(--surface-secondary);
+  --feelings-raised: var(--surface-tertiary);
+  --feelings-ink: var(--text-primary);
+  --feelings-muted: var(--text-secondary);
+  --feelings-quiet: var(--text-tertiary);
+  --feelings-line: var(--border-light);
+  --feelings-line-strong: var(--border-medium);
+  --feelings-mint: var(--text-primary);
+  --feelings-live: var(--text-secondary);
+  --feelings-danger: var(--text-destructive);
   --feelings-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
   min-width: 0;
   min-height: 100%;
@@ -18,7 +18,11 @@
   inset: 0;
   overflow: auto;
   background:
-    radial-gradient(circle at 38% -12%, rgba(95, 131, 119, 0.12), transparent 32rem),
+    radial-gradient(
+      circle at 38% -12%,
+      color-mix(in srgb, var(--feelings-ink) 5%, transparent),
+      transparent 32rem
+    ),
     var(--feelings-canvas);
   color: var(--feelings-ink);
   font-family:
@@ -84,38 +88,20 @@
   margin-top: 2px;
   color: var(--feelings-muted);
   font-family: var(--feelings-mono);
-  font-size: 10px;
+  font-size: 12px;
   letter-spacing: 0.11em;
   text-transform: uppercase;
 }
 .feelings-brand-mark {
-  position: relative;
   width: 34px;
   height: 34px;
   flex: 0 0 34px;
-  border: 1px solid rgba(123, 240, 202, 0.55);
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(123, 240, 202, 0.18), transparent 62%);
-}
-.feelings-brand-mark::before {
-  position: absolute;
-  inset: 6px;
-  border: 1px solid rgba(123, 240, 202, 0.24);
-  border-radius: 50%;
-  content: '';
-}
-.feelings-brand-mark::after {
-  position: absolute;
-  inset: 13px;
-  border-radius: 50%;
-  background: var(--feelings-mint);
-  box-shadow: 0 0 14px rgba(123, 240, 202, 0.8);
-  content: '';
+  object-fit: contain;
 }
 .feelings-back {
   display: grid;
-  width: 32px;
-  height: 32px;
+  width: 44px;
+  height: 44px;
   place-items: center;
   border: 1px solid var(--feelings-line) !important;
   border-radius: 8px;
@@ -133,18 +119,18 @@
   gap: 10px;
 }
 .feelings-utility {
-  min-height: 38px;
+  min-height: 44px;
   padding: 0 13px;
   border: 1px solid var(--feelings-line) !important;
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.025);
-  color: #cbd0ce;
+  background: var(--feelings-surface);
+  color: var(--feelings-muted);
   font-size: 12px !important;
   cursor: pointer;
 }
 .feelings-utility:hover {
   border-color: var(--feelings-line-strong) !important;
-  background: rgba(255, 255, 255, 0.055);
+  background: var(--feelings-raised);
   color: var(--feelings-ink);
 }
 .reset-label {
@@ -162,7 +148,7 @@
   cursor: pointer;
 }
 .feelings-master-toggle {
-  min-height: 42px;
+  min-height: 44px;
   padding: 0 2px 0 10px;
   font-size: 13px !important;
 }
@@ -173,7 +159,7 @@
   height: 25px;
   border: 1px solid var(--feelings-line-strong);
   border-radius: 999px;
-  background: #1a1e1d;
+  background: var(--feelings-raised);
   transition: 180ms ease;
 }
 .feelings-switch::after {
@@ -183,18 +169,18 @@
   width: 17px;
   height: 17px;
   border-radius: 50%;
-  background: #9da4a2;
+  background: var(--feelings-muted);
   content: '';
   transition: 180ms ease;
 }
 [aria-checked='true'] > .feelings-switch {
-  border-color: rgba(123, 240, 202, 0.48);
-  background: rgba(123, 240, 202, 0.14);
+  border-color: var(--feelings-line-strong);
+  background: color-mix(in srgb, var(--feelings-ink) 12%, var(--feelings-surface));
 }
 [aria-checked='true'] > .feelings-switch::after {
   transform: translateX(21px);
   background: var(--feelings-mint);
-  box-shadow: 0 0 13px rgba(123, 240, 202, 0.66);
+  box-shadow: none;
 }
 .feelings-view button:disabled,
 .feelings-view input:disabled,
@@ -210,11 +196,11 @@
   width: fit-content;
   margin: 10px auto -34px;
   padding: 8px 12px;
-  border: 1px solid rgba(123, 240, 202, 0.24);
+  border: 1px solid var(--feelings-line-strong);
   border-radius: 999px;
-  background: rgba(12, 15, 14, 0.92);
-  color: #cfe8df;
-  font-size: 11px;
+  background: var(--feelings-surface);
+  color: var(--feelings-ink);
+  font-size: 13px;
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.25);
 }
 .feelings-workspace {
@@ -235,7 +221,7 @@
   margin: 0 0 6px !important;
   color: var(--feelings-quiet) !important;
   font-family: var(--feelings-mono);
-  font-size: 10px !important;
+  font-size: 12px !important;
   letter-spacing: 0.12em;
   text-transform: uppercase;
 }
@@ -264,7 +250,7 @@
   gap: 8px;
   color: var(--feelings-quiet);
   font-family: var(--feelings-mono);
-  font-size: 9px;
+  font-size: 12px;
   text-align: right;
 }
 .feelings-inner-state {
@@ -275,9 +261,13 @@
   margin: 18px 0 14px;
   padding: 13px 16px 14px 18px;
   overflow: hidden;
-  border-top: 1px solid rgba(123, 240, 202, 0.18);
-  border-bottom: 1px solid rgba(123, 240, 202, 0.1);
-  background: linear-gradient(90deg, rgba(123, 240, 202, 0.055), transparent 72%);
+  border-top: 1px solid var(--feelings-line);
+  border-bottom: 1px solid var(--feelings-line);
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--feelings-ink) 5%, transparent),
+    transparent 72%
+  );
 }
 .feelings-inner-state::before {
   position: absolute;
@@ -286,7 +276,7 @@
   left: 0;
   width: 2px;
   background: var(--feelings-live);
-  box-shadow: 0 0 14px rgba(123, 240, 202, 0.7);
+  box-shadow: none;
   content: '';
 }
 .feelings-inner-state > div {
@@ -296,18 +286,18 @@
   gap: 16px;
   color: var(--feelings-quiet);
   font-family: var(--feelings-mono);
-  font-size: 9px;
+  font-size: 12px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 .feelings-inner-state time {
-  color: rgba(221, 231, 226, 0.42);
+  color: var(--feelings-quiet);
   letter-spacing: 0.035em;
 }
 .feelings-inner-state p {
   max-width: 900px;
   margin: 0;
-  color: rgba(239, 246, 242, 0.94);
+  color: var(--feelings-ink);
   font-size: clamp(15px, 1.55vw, 20px);
   font-weight: 420;
   line-height: 1.4;
@@ -320,11 +310,11 @@
   flex: 0 0 auto;
   border-radius: 50%;
   background: var(--feelings-mint);
-  box-shadow: 0 0 10px rgba(123, 240, 202, 0.6);
+  box-shadow: none;
 }
 .feelings-live-readout > span.is-degraded {
   background: var(--feelings-danger);
-  box-shadow: 0 0 10px rgba(255, 129, 111, 0.6);
+  box-shadow: none;
 }
 
 .feelings-instrument {
@@ -334,7 +324,7 @@
   overflow: hidden;
   border: 1px solid var(--feelings-line);
   border-radius: 14px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent 28%), #0b0e0d;
+  background: var(--feelings-surface);
 }
 .feelings-heartbeat {
   position: absolute;
@@ -344,7 +334,7 @@
   left: 10%;
   height: 1px;
   opacity: 0.72;
-  background: linear-gradient(90deg, transparent, rgba(123, 240, 202, 0.62), transparent);
+  background: linear-gradient(90deg, transparent, var(--feelings-line-strong), transparent);
   animation: feelings-heartbeat 4s ease-in-out infinite;
 }
 @keyframes feelings-heartbeat {
@@ -374,7 +364,7 @@
   align-items: center;
   justify-items: center;
   padding: 0 7px;
-  border-right: 1px solid rgba(221, 231, 226, 0.075) !important;
+  border-right: 1px solid var(--feelings-line) !important;
   background: transparent;
 }
 .feelings-lane:last-child {
@@ -424,6 +414,7 @@
   display: grid;
   width: 100%;
   min-width: 0;
+  min-height: 44px;
   justify-items: center;
   padding: 2px 2px 4px;
   background: transparent;
@@ -440,8 +431,8 @@
 .feelings-lane-name {
   max-width: 100%;
   overflow: hidden;
-  color: #b7bdbb;
-  font-size: 10px;
+  color: var(--feelings-muted);
+  font-size: 12px;
   font-weight: 620;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -451,11 +442,11 @@
 }
 .feelings-lane-values {
   display: flex;
-  gap: 7px;
+  gap: 5px;
   margin-top: 5px;
   color: var(--feelings-quiet);
   font-family: var(--feelings-mono);
-  font-size: 7px;
+  font-size: 11px;
   font-style: normal;
   white-space: nowrap;
 }
@@ -470,8 +461,8 @@
 .feelings-pole {
   max-width: 88px;
   overflow: hidden;
-  color: #7c8582;
-  font-size: 8px;
+  color: var(--feelings-muted);
+  font-size: 11px;
   line-height: 1;
   text-align: center;
   text-overflow: ellipsis;
@@ -480,7 +471,7 @@
 }
 .feelings-pole-high::before,
 .feelings-pole-low::before {
-  color: #4c5552;
+  color: var(--feelings-quiet);
   font-family: var(--feelings-mono);
 }
 .feelings-pole-high::before {
@@ -494,10 +485,9 @@
   width: 46px;
   height: 100%;
   min-height: 325px;
-  border: 1px solid rgba(221, 231, 226, 0.09);
+  border: 1px solid var(--feelings-line);
   border-radius: 9px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.024), rgba(255, 255, 255, 0.007)), #090c0b;
+  background: var(--feelings-canvas);
   touch-action: none;
 }
 .feelings-grid-lines {
@@ -508,8 +498,8 @@
     to bottom,
     transparent 0,
     transparent calc(20% - 1px),
-    rgba(221, 231, 226, 0.08) calc(20% - 1px),
-    rgba(221, 231, 226, 0.08) 20%
+    var(--feelings-line) calc(20% - 1px),
+    var(--feelings-line) 20%
   );
 }
 .feelings-current-fill {
@@ -522,8 +512,8 @@
   border-radius: 5px 5px 7px 7px;
   background: linear-gradient(
     to top,
-    color-mix(in srgb, var(--band-color) 44%, #08100d),
-    color-mix(in srgb, var(--band-color) 78%, #d7fff1)
+    color-mix(in srgb, var(--band-color) 44%, var(--feelings-canvas)),
+    color-mix(in srgb, var(--band-color) 78%, var(--feelings-ink))
   );
   box-shadow: 0 -14px 28px color-mix(in srgb, var(--band-color) 16%, transparent);
   opacity: 0.5;
@@ -588,22 +578,22 @@
   z-index: 2;
   right: -4px;
   left: 0;
-  border-top: 1px dashed rgba(255, 180, 77, 0.66);
+  border-top: 1px dashed var(--feelings-live);
   pointer-events: none;
   transition: bottom 1050ms cubic-bezier(0.16, 0.84, 0.22, 1);
 }
 .feelings-nature-marker {
   position: absolute;
   z-index: 4;
-  right: -8px;
-  width: 16px;
-  height: 16px;
-  margin-bottom: -8px;
-  border: 1px solid rgba(255, 180, 77, 0.8);
+  right: -12px;
+  width: 24px;
+  height: 24px;
+  margin-bottom: -12px;
+  border: 1px solid var(--feelings-live);
   border-radius: 3px !important;
-  background: #17130d;
+  background: var(--feelings-canvas);
   transform: rotate(45deg);
-  box-shadow: 0 0 8px rgba(255, 180, 77, 0.22);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--feelings-live) 22%, transparent);
   cursor: ns-resize;
   transition:
     bottom 1050ms cubic-bezier(0.16, 0.84, 0.22, 1),
@@ -619,32 +609,43 @@
   display: block;
   color: var(--feelings-live);
   font-family: var(--feelings-mono);
-  font-size: 8px;
+  font-size: 12px;
   transform: rotate(-45deg);
 }
 .feelings-current-marker {
   position: absolute;
   z-index: 5;
-  left: 4px;
-  width: 36px;
-  height: 9px;
-  margin-bottom: -4px;
-  border: 1px solid rgba(255, 255, 255, 0.8) !important;
+  left: 2px;
+  width: 40px;
+  height: 24px;
+  margin-bottom: -12px;
+  border: 0 !important;
   border-radius: 5px !important;
-  background: var(--band-color);
-  box-shadow: 0 0 13px color-mix(in srgb, var(--band-color) 65%, transparent);
+  background: transparent;
   cursor: ns-resize;
   transition:
     bottom 1050ms cubic-bezier(0.16, 0.84, 0.22, 1),
     box-shadow 180ms ease;
 }
+.feelings-current-marker::after {
+  position: absolute;
+  top: 8px;
+  right: 0;
+  left: 0;
+  height: 8px;
+  border: 1px solid var(--feelings-ink);
+  border-radius: 5px;
+  background: var(--band-color);
+  box-shadow: 0 0 13px color-mix(in srgb, var(--band-color) 65%, transparent);
+  content: '';
+}
 .feelings-current-marker b {
   position: absolute;
   right: 0;
-  bottom: 13px;
+  bottom: 22px;
   color: var(--band-color);
   font-family: var(--feelings-mono);
-  font-size: 8px;
+  font-size: 12px;
   font-weight: 600;
 }
 .feelings-lane.is-reacting .feelings-current-marker {
@@ -669,13 +670,13 @@
   margin-top: 4px;
   color: var(--feelings-quiet);
   font-family: var(--feelings-mono);
-  font-size: 7px;
+  font-size: 11px;
   text-transform: uppercase;
 }
 .feelings-word {
   max-width: 88px;
-  color: #d7dcda;
-  font-size: 10px;
+  color: var(--feelings-ink);
+  font-size: 12px;
   line-height: 1.25;
   text-align: center;
 }
@@ -691,7 +692,7 @@
   padding: 0 18px;
   border-top: 1px solid var(--feelings-line);
   color: var(--feelings-quiet);
-  font-size: 9px;
+  font-size: 12px;
 }
 .feelings-legend > div {
   display: flex;
@@ -706,7 +707,7 @@
   width: 17px;
   height: 3px;
   border-radius: 99px;
-  background: #aab2af;
+  background: var(--feelings-muted);
 }
 .legend-nature {
   width: 9px;
@@ -721,7 +722,7 @@
   inset: 0;
   display: grid;
   place-items: center;
-  background: rgba(8, 10, 10, 0.76);
+  background: color-mix(in srgb, var(--feelings-canvas) 82%, transparent);
   backdrop-filter: blur(4px);
 }
 .feelings-off-message {
@@ -739,23 +740,27 @@
 .feelings-off-message span {
   margin-top: 7px;
   color: var(--feelings-muted);
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.5;
 }
 .feelings-off-orb {
   width: 38px;
   height: 38px;
-  border: 1px solid rgba(123, 240, 202, 0.28);
+  border: 1px solid var(--feelings-line-strong);
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(123, 240, 202, 0.25), transparent 60%);
-  box-shadow: 0 0 24px rgba(123, 240, 202, 0.12);
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--feelings-ink) 16%, transparent),
+    transparent 60%
+  );
+  box-shadow: none;
 }
 
 .feelings-research {
   margin-top: 14px;
   border: 1px solid var(--feelings-line);
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.012);
+  background: var(--feelings-surface);
 }
 .feelings-research summary {
   display: flex;
@@ -765,7 +770,7 @@
   gap: 12px;
   padding: 0 14px;
   color: var(--feelings-muted);
-  font-size: 10px;
+  font-size: 12px;
   cursor: pointer;
   list-style: none;
 }
@@ -775,7 +780,7 @@
 .feelings-research summary span:last-child {
   color: var(--feelings-quiet);
   font-family: var(--feelings-mono);
-  font-size: 9px;
+  font-size: 12px;
 }
 .feelings-research > div {
   display: grid;
@@ -788,7 +793,7 @@
   border: 1px dashed var(--feelings-line);
   border-radius: 7px;
   color: var(--feelings-quiet);
-  font-size: 9px;
+  font-size: 12px;
   text-align: center;
 }
 
@@ -803,7 +808,7 @@
   padding: 17px;
   border: 1px solid var(--feelings-line);
   border-radius: 11px;
-  background: rgba(255, 255, 255, 0.012);
+  background: var(--feelings-surface);
 }
 
 .feelings-inspector-header {
@@ -833,8 +838,8 @@
   line-height: 1.45;
 }
 .feelings-band-toggle {
-  min-height: 30px;
-  font-size: 10px !important;
+  min-height: 44px;
+  font-size: 12px !important;
 }
 .feelings-band-toggle .feelings-switch {
   width: 37px;
@@ -865,7 +870,7 @@
   margin-top: 4px;
   color: var(--feelings-muted);
   font-family: var(--feelings-mono);
-  font-size: 10px;
+  font-size: 12px;
 }
 .feelings-state-compare {
   display: inline-grid;
@@ -873,7 +878,7 @@
   overflow: hidden;
   border: 1px solid var(--feelings-line);
   border-radius: 8px;
-  background: #080a0a;
+  background: var(--feelings-canvas);
 }
 .feelings-state-compare > span {
   display: grid;
@@ -886,7 +891,7 @@
 }
 .feelings-state-compare i {
   font-family: var(--feelings-mono);
-  font-size: 7px;
+  font-size: 11px;
   font-style: normal;
   letter-spacing: 0.08em;
 }
@@ -914,7 +919,7 @@
   gap: 12px;
   margin-bottom: 10px;
   color: var(--feelings-muted);
-  font-size: 11px;
+  font-size: 13px;
 }
 .feelings-control label i {
   display: inline-block;
@@ -924,7 +929,7 @@
   border: 1px solid var(--feelings-line);
   border-radius: 4px;
   font-family: var(--feelings-mono);
-  font-size: 7px;
+  font-size: 11px;
   font-style: normal;
   letter-spacing: 0.08em;
   text-align: center;
@@ -935,26 +940,27 @@
 }
 .feelings-control.is-nature label i {
   border-style: dashed;
-  border-color: rgba(255, 180, 77, 0.4);
+  border-color: var(--feelings-line-strong);
   color: var(--feelings-live);
 }
 .feelings-control output {
   color: var(--feelings-ink);
   font-family: var(--feelings-mono);
-  font-size: 11px;
+  font-size: 12px;
 }
 .feelings-control input[type='range'] {
   width: 100%;
-  height: 4px;
+  height: 24px;
   margin: 7px 0;
   appearance: none;
   border-radius: 999px;
-  background: #252a29;
+  background: linear-gradient(var(--feelings-line-strong), var(--feelings-line-strong)) center /
+    100% 4px no-repeat;
   accent-color: var(--selected-color);
 }
 .feelings-control input[type='range']::-webkit-slider-thumb {
-  width: 15px;
-  height: 15px;
+  width: 24px;
+  height: 24px;
   appearance: none;
   border: 2px solid var(--feelings-canvas);
   border-radius: 50%;
@@ -968,7 +974,7 @@
   background: var(--feelings-live);
   box-shadow:
     0 0 0 1px var(--feelings-line-strong),
-    0 0 8px rgba(255, 180, 77, 0.28);
+    0 0 8px color-mix(in srgb, var(--feelings-live) 28%, transparent);
   transform: rotate(45deg);
 }
 .feelings-control-poles {
@@ -976,7 +982,7 @@
   justify-content: space-between;
   margin-top: 3px;
   color: var(--feelings-quiet);
-  font-size: 8px;
+  font-size: 12px;
 }
 .feelings-control-poles span:last-child {
   text-align: right;
@@ -984,13 +990,13 @@
 .feelings-control select,
 .feelings-drawer select {
   width: 100%;
-  min-height: 38px;
+  min-height: 44px;
   padding: 0 10px;
   border: 1px solid var(--feelings-line);
   border-radius: 8px;
   background: var(--feelings-raised);
   color: var(--feelings-ink);
-  font-size: 11px;
+  font-size: 13px;
 }
 .feelings-range-editor {
   margin-top: 20px;
@@ -1005,7 +1011,7 @@
 }
 .feelings-range-heading h3 {
   margin: 0;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 620;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -1013,14 +1019,14 @@
 .feelings-range-heading p {
   margin: 5px 0 0;
   color: var(--feelings-quiet);
-  font-size: 9px;
+  font-size: 12px;
   line-height: 1.45;
 }
 .feelings-range-heading > span {
   flex: 0 0 auto;
   color: var(--feelings-quiet);
   font-family: var(--feelings-mono);
-  font-size: 8px;
+  font-size: 11px;
 }
 .feelings-range-tabs {
   display: grid;
@@ -1038,14 +1044,14 @@
   padding: 6px 3px;
   border: 1px solid var(--feelings-line) !important;
   border-radius: 7px;
-  background: #090c0b;
+  background: var(--feelings-canvas);
   color: var(--feelings-quiet);
   cursor: pointer;
 }
 .feelings-range-tabs button:hover,
 .feelings-range-tabs button.is-selected {
   border-color: color-mix(in srgb, var(--selected-color) 42%, transparent) !important;
-  background: color-mix(in srgb, var(--selected-color) 7%, #090c0b);
+  background: color-mix(in srgb, var(--selected-color) 7%, var(--feelings-canvas));
 }
 .feelings-range-tabs button.is-active::after {
   position: absolute;
@@ -1060,15 +1066,15 @@
 }
 .feelings-range-tabs i {
   font-family: var(--feelings-mono);
-  font-size: 7px;
+  font-size: 11px;
   font-style: normal;
 }
 .feelings-range-tabs strong {
   max-width: 100%;
   overflow: hidden;
   margin-top: 4px;
-  color: #c5cbc8;
-  font-size: 8px;
+  color: var(--feelings-ink);
+  font-size: 11px;
   font-weight: 520;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1076,14 +1082,14 @@
 .feelings-range-tabs span {
   display: flex;
   min-width: 0;
-  min-height: 8px;
+  min-height: 12px;
   align-items: center;
   justify-content: center;
   gap: 3px;
   margin-top: 3px;
   color: var(--selected-color);
   font-family: var(--feelings-mono);
-  font-size: 8px;
+  font-size: 11px;
   letter-spacing: 0.08em;
 }
 .feelings-range-tabs span b {
@@ -1102,14 +1108,14 @@
 .feelings-range-addition > span {
   color: var(--feelings-quiet);
   font-family: var(--feelings-mono);
-  font-size: 7px;
+  font-size: 11px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 .feelings-range-default p {
   margin: 6px 0 0;
-  color: #d3d8d5;
-  font-size: 10px;
+  color: var(--feelings-ink);
+  font-size: 13px;
   line-height: 1.5;
 }
 .feelings-range-addition {
@@ -1124,9 +1130,9 @@
   padding: 10px;
   border: 1px solid var(--feelings-line);
   border-radius: 8px;
-  background: #080a0a;
-  color: #d4d9d6;
-  font-size: 10px;
+  background: var(--feelings-canvas);
+  color: var(--feelings-ink);
+  font-size: 13px;
   line-height: 1.5;
 }
 .feelings-range-addition small {
@@ -1134,7 +1140,7 @@
   margin-top: 5px;
   color: var(--feelings-quiet);
   font-family: var(--feelings-mono);
-  font-size: 7px;
+  font-size: 11px;
   text-align: right;
 }
 .feelings-range-actions {
@@ -1144,13 +1150,13 @@
   margin-top: 10px;
 }
 .feelings-range-actions button {
-  min-height: 34px;
+  min-height: 44px;
   padding: 0 10px;
   border: 1px solid var(--feelings-line) !important;
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.02);
-  color: #bec5c2;
-  font-size: 8px !important;
+  background: var(--feelings-surface);
+  color: var(--feelings-muted);
+  font-size: 12px !important;
   cursor: pointer;
 }
 .feelings-range-actions button.is-primary {
@@ -1177,7 +1183,7 @@
 .feelings-capsule h3,
 .feelings-trail h3 {
   margin: 0;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 620;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -1186,12 +1192,12 @@
 .feelings-trail > div:first-child span {
   color: var(--feelings-quiet);
   font-family: var(--feelings-mono);
-  font-size: 9px;
+  font-size: 11px;
 }
 .feelings-trail > div:first-child > div p {
   margin: 4px 0 0;
   color: var(--feelings-quiet);
-  font-size: 8px;
+  font-size: 12px;
 }
 .feelings-capsule pre {
   min-height: 148px;
@@ -1200,10 +1206,10 @@
   padding: 14px;
   border: 1px solid var(--feelings-line);
   border-radius: 10px;
-  background: #070909;
-  color: #c9cfcc;
+  background: var(--feelings-canvas);
+  color: var(--feelings-ink);
   font-family: var(--feelings-mono);
-  font-size: 9px;
+  font-size: 12px;
   line-height: 1.55;
   white-space: pre-wrap;
 }
@@ -1215,9 +1221,9 @@
   padding: 14px;
   border: 1px solid var(--feelings-line);
   border-radius: 10px;
-  background: #070909;
+  background: var(--feelings-canvas);
   color: var(--feelings-quiet);
-  font-size: 10px;
+  font-size: 12px;
   font-style: italic;
   text-align: center;
 }
@@ -1231,7 +1237,7 @@
 .feelings-trail-list > p {
   padding: 15px 0;
   color: var(--feelings-quiet);
-  font-size: 10px;
+  font-size: 12px;
 }
 .feelings-trail-entry {
   display: grid;
@@ -1243,13 +1249,13 @@
 .feelings-trail-entry time {
   color: var(--feelings-quiet);
   font-family: var(--feelings-mono);
-  font-size: 9px;
+  font-size: 11px;
 }
 .feelings-trail-entry strong {
   display: block;
   overflow: hidden;
-  color: #cbd0ce;
-  font-size: 10px;
+  color: var(--feelings-ink);
+  font-size: 12px;
   font-weight: 520;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1260,11 +1266,11 @@
   overflow: hidden;
   margin-bottom: 4px;
   padding: 3px 6px;
-  border: 1px solid rgba(123, 240, 202, 0.16);
+  border: 1px solid var(--feelings-line);
   border-radius: 999px;
-  background: rgba(123, 240, 202, 0.05);
-  color: #b9d8cd;
-  font-size: 8px;
+  background: var(--feelings-raised);
+  color: var(--feelings-muted);
+  font-size: 11px;
   font-style: normal;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1273,7 +1279,7 @@
   display: block;
   margin-top: 3px;
   color: var(--feelings-quiet);
-  font-size: 9px;
+  font-size: 11px;
 }
 
 .feelings-drawer-root {
@@ -1304,7 +1310,7 @@
   overflow-y: auto;
   padding: 24px 24px 96px;
   border-left: 1px solid var(--feelings-line-strong);
-  background: rgba(12, 15, 14, 0.99);
+  background: var(--feelings-surface);
   box-shadow: -24px 0 70px rgba(0, 0, 0, 0.42);
   transform: translateX(102%);
   transition: transform 240ms cubic-bezier(0.22, 0.8, 0.22, 1);
@@ -1329,14 +1335,14 @@
 .feelings-drawer-header p:last-child {
   margin: 6px 0 0;
   color: var(--feelings-muted);
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.45;
 }
 .feelings-drawer-header button {
   display: grid;
-  width: 34px;
-  height: 34px;
-  flex: 0 0 34px;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
   place-items: center;
   border: 1px solid var(--feelings-line) !important;
   border-radius: 8px;
@@ -1357,16 +1363,16 @@
   flex: 0 0 auto;
   border-radius: 50%;
   background: var(--feelings-mint);
-  box-shadow: 0 0 10px rgba(123, 240, 202, 0.6);
+  box-shadow: none;
 }
 .feelings-drawer-status.is-degraded > span {
   background: var(--feelings-danger);
-  box-shadow: 0 0 10px rgba(255, 129, 111, 0.6);
+  box-shadow: none;
 }
 .feelings-drawer-status strong {
   display: block;
   color: var(--feelings-muted);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 500;
 }
 .feelings-drawer-status small {
@@ -1374,7 +1380,7 @@
   margin-top: 3px;
   color: var(--feelings-quiet);
   font-family: var(--feelings-mono);
-  font-size: 9px;
+  font-size: 12px;
 }
 .feelings-drawer-field {
   padding-top: 22px;
@@ -1382,7 +1388,7 @@
 .feelings-drawer-field label {
   display: block;
   margin-bottom: 9px;
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 600;
 }
 .feelings-drawer-field textarea {
@@ -1392,15 +1398,15 @@
   padding: 13px;
   border: 1px solid var(--feelings-line);
   border-radius: 10px;
-  background: #080a0a;
-  color: #cfd4d1;
-  font-size: 12px;
+  background: var(--feelings-canvas);
+  color: var(--feelings-ink);
+  font-size: 13px;
   line-height: 1.55;
 }
 .feelings-drawer-field > p {
   margin: 9px 0 0;
   color: var(--feelings-quiet);
-  font-size: 10px;
+  font-size: 12px;
   line-height: 1.5;
 }
 .feelings-drawer-field ul {
@@ -1417,7 +1423,7 @@
   border-radius: 8px;
   color: var(--feelings-muted);
   font-family: var(--feelings-mono);
-  font-size: 9px;
+  font-size: 12px;
 }
 .feelings-drawer-actions {
   position: fixed;
@@ -1435,20 +1441,20 @@
 }
 .feelings-drawer-actions button {
   display: inline-flex;
-  min-height: 36px;
+  min-height: 44px;
   align-items: center;
   gap: 6px;
   padding: 0 12px;
   border: 1px solid var(--feelings-line) !important;
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.025);
-  color: #cbd0ce;
-  font-size: 10px !important;
+  background: var(--feelings-raised);
+  color: var(--feelings-muted);
+  font-size: 12px !important;
   cursor: pointer;
 }
 .feelings-drawer-actions button.is-primary {
-  border-color: rgba(123, 240, 202, 0.35) !important;
-  background: rgba(123, 240, 202, 0.11);
+  border-color: var(--feelings-line-strong) !important;
+  background: var(--feelings-raised);
   color: var(--feelings-mint);
 }
 .feelings-drawer-actions button.is-danger {
@@ -1465,7 +1471,7 @@
   color: var(--feelings-muted);
 }
 .feelings-loading button {
-  min-height: 38px;
+  min-height: 44px;
   padding: 0 14px;
   border: 1px solid var(--feelings-line) !important;
   border-radius: 9px;
@@ -1475,10 +1481,14 @@
 .feelings-orb {
   width: 34px;
   height: 34px;
-  border: 1px solid rgba(123, 240, 202, 0.5);
+  border: 1px solid var(--feelings-line-strong);
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(123, 240, 202, 0.24), transparent 65%);
-  box-shadow: 0 0 18px rgba(123, 240, 202, 0.22);
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--feelings-ink) 18%, transparent),
+    transparent 65%
+  );
+  box-shadow: none;
   animation: feelings-heartbeat 1.5s ease-in-out infinite;
 }
 
@@ -1535,10 +1545,11 @@
 @media (max-width: 620px) {
   .feelings-topbar {
     align-items: flex-start;
+    flex-wrap: wrap;
     padding-bottom: 13px;
   }
   .reset-label {
-    width: 38px;
+    width: 44px;
     justify-content: center;
     padding: 0;
   }
@@ -1557,17 +1568,10 @@
     overflow: hidden;
     clip: rect(0, 0, 0, 0);
   }
-  .feelings-utility {
-    width: 58px;
-    overflow: hidden;
-    padding: 0;
-    font-size: 0 !important;
-  }
-  .feelings-utility:not(.reset-label)::after {
-    content: 'Cortex';
-    font-family: var(--feelings-mono);
-    font-size: 9px;
-    letter-spacing: 0.04em;
+  .feelings-utility:not(.reset-label) {
+    width: auto;
+    padding: 0 10px;
+    font-size: 12px;
   }
   .feelings-heading {
     align-items: flex-start;
@@ -1592,7 +1596,7 @@
   }
   .feelings-lane {
     grid-template-rows: 58px 22px 250px 22px 52px;
-    border-bottom: 1px solid rgba(221, 231, 226, 0.075) !important;
+    border-bottom: 1px solid var(--feelings-line) !important;
   }
   .feelings-lane:nth-child(2n) {
     border-right: 0 !important;

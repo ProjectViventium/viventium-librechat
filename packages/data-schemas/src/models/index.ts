@@ -28,6 +28,15 @@ import { createFeelingStateModel } from './feelingState';
 import { createAccessRoleModel } from './accessRole';
 import { createAclEntryModel } from './aclEntry';
 import { createGroupModel } from './group';
+import { createLocalQaCortexFaultControlModel } from './localQaCortexFaultControl';
+import { createLocalQaVoiceClassifierFaultControlModel } from './localQaVoiceClassifierFaultControl';
+/* === VIVENTIUM START === GlassHive callback persistence === */
+import { createGlassHiveTerminalCallbackResultModel } from './glassHiveTerminalCallbackResult';
+import { createViventiumGlassHiveCallbackEffectOutboxModel } from './glassHiveCallbackEffectOutbox';
+import { createViventiumMainContinuityStateModel } from './mainContinuityState';
+import { createViventiumCortexInsightDeliveryModel } from './cortexInsightDelivery';
+import { createViventiumOrchestrationTraceEventModel } from './orchestrationTraceEvent';
+/* === VIVENTIUM END === */
 /* === VIVENTIUM START ===
  * Feature: Channel-neutral messaging persistence.
  * Purpose: Export typed models while preserving legacy Gateway model names/collections.
@@ -78,6 +87,14 @@ export function createModels(mongoose: typeof import('mongoose')) {
     AccessRole: createAccessRoleModel(mongoose),
     AclEntry: createAclEntryModel(mongoose),
     Group: createGroupModel(mongoose),
+    LocalQaCortexFaultControl: createLocalQaCortexFaultControlModel(mongoose),
+    LocalQaVoiceClassifierFaultControl: createLocalQaVoiceClassifierFaultControlModel(mongoose),
+    GlassHiveTerminalCallbackResult: createGlassHiveTerminalCallbackResultModel(mongoose),
+    ViventiumGlassHiveCallbackEffectOutbox:
+      createViventiumGlassHiveCallbackEffectOutboxModel(mongoose),
+    ViventiumMainContinuityState: createViventiumMainContinuityStateModel(mongoose),
+    ViventiumCortexInsightDelivery: createViventiumCortexInsightDeliveryModel(mongoose),
+    ViventiumOrchestrationTraceEvent: createViventiumOrchestrationTraceEventModel(mongoose),
     ChannelConnection: createChannelConnectionModel(mongoose),
     ChannelThread: createChannelThreadModel(mongoose),
     GatewayUserMapping: createGatewayUserMappingModel(mongoose),

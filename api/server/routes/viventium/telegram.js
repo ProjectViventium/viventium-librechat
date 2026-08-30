@@ -73,10 +73,14 @@ const {
   getGlassHiveCallbackStateForMessage,
 } = require('~/server/services/viventium/GlassHiveCallbackMessageService');
 const {
+  authorizeGlassHiveCallbackDeliveryDispatch,
   claimPendingGlassHiveCallbackDeliveries,
   markGlassHiveCallbackDeliverySent,
   markGlassHiveCallbackDeliveryFailed,
   markGlassHiveCallbackDeliverySuppressed,
+  markGlassHiveCallbackDeliveryUnknown,
+  releaseGlassHiveCallbackDeliveryDispatch,
+  renewGlassHiveCallbackDeliveryDispatch,
   deliveryBacklogSummary,
 } = require('~/server/services/viventium/GlassHiveCallbackDeliveryService');
 const {
@@ -1616,6 +1620,73 @@ router.post('/glasshive/deliveries/claim', telegramBridgeAuth, async (req, res) 
   }
 });
 
+router.post('/glasshive/deliveries/:deliveryId/authorize', telegramBridgeAuth, async (req, res) => {
+  const deliveryId = String(req.params?.deliveryId || '').trim();
+  const claimId = String(req.body?.claimId || '').trim();
+  if (!deliveryId || !claimId) {
+    return res.status(400).json({ error: 'deliveryId and claimId are required' });
+  }
+  try {
+    const permit = await authorizeGlassHiveCallbackDeliveryDispatch({
+      deliveryId,
+      claimId,
+      leaseMs: req.body?.leaseMs,
+    });
+    if (!permit) return res.status(409).json({ error: 'delivery_dispatch_not_authorized' });
+    return res.json({ permit });
+  } catch (error) {
+    logger.warn('[VIVENTIUM][telegram/glasshive-delivery] Authorization failed', {
+      code: String(error?.code || error?.name || 'authorization_failed').slice(0, 120),
+    });
+    return res.status(500).json({ error: 'Failed to authorize GlassHive delivery' });
+  }
+});
+
+router.post('/glasshive/deliveries/:deliveryId/renew', telegramBridgeAuth, async (req, res) => {
+  const deliveryId = String(req.params?.deliveryId || '').trim();
+  const claimId = String(req.body?.claimId || '').trim();
+  if (!deliveryId || !claimId || !req.body?.dispatchPermit) {
+    return res.status(400).json({ error: 'deliveryId, claimId, and dispatchPermit are required' });
+  }
+  try {
+    const permit = await renewGlassHiveCallbackDeliveryDispatch({
+      deliveryId,
+      claimId,
+      dispatchPermit: req.body.dispatchPermit,
+      leaseMs: req.body?.leaseMs,
+    });
+    if (!permit) return res.status(409).json({ error: 'delivery_dispatch_not_authorized' });
+    return res.json({ permit });
+  } catch (error) {
+    logger.warn('[VIVENTIUM][telegram/glasshive-delivery] Permit renewal failed', {
+      code: String(error?.code || error?.name || 'permit_renewal_failed').slice(0, 120),
+    });
+    return res.status(500).json({ error: 'Failed to renew GlassHive delivery authorization' });
+  }
+});
+
+router.post('/glasshive/deliveries/:deliveryId/release', telegramBridgeAuth, async (req, res) => {
+  const deliveryId = String(req.params?.deliveryId || '').trim();
+  const claimId = String(req.body?.claimId || '').trim();
+  if (!deliveryId || !claimId || !req.body?.dispatchPermit) {
+    return res.status(400).json({ error: 'deliveryId, claimId, and dispatchPermit are required' });
+  }
+  try {
+    const released = await releaseGlassHiveCallbackDeliveryDispatch({
+      deliveryId,
+      claimId,
+      dispatchPermit: req.body.dispatchPermit,
+    });
+    if (!released) return res.status(409).json({ error: 'delivery_dispatch_not_authorized' });
+    return res.json({ released: true });
+  } catch (error) {
+    logger.warn('[VIVENTIUM][telegram/glasshive-delivery] Permit release failed', {
+      code: String(error?.code || error?.name || 'permit_release_failed').slice(0, 120),
+    });
+    return res.status(500).json({ error: 'Failed to release GlassHive delivery authorization' });
+  }
+});
+
 router.post('/glasshive/deliveries/:deliveryId/status', telegramBridgeAuth, async (req, res) => {
   const deliveryId = String(req.params?.deliveryId || '').trim();
   const claimId = String(req.body?.claimId || '').trim();
@@ -1623,10 +1694,20 @@ router.post('/glasshive/deliveries/:deliveryId/status', telegramBridgeAuth, asyn
   if (!deliveryId || !claimId) {
     return res.status(400).json({ error: 'deliveryId and claimId are required' });
   }
+  if (status === 'delivery_unknown' && !req.body?.dispatchPermit) {
+    return res.status(400).json({ error: 'dispatchPermit is required for delivery_unknown' });
+  }
   try {
     let delivery = null;
     if (status === 'sent') {
-      delivery = await markGlassHiveCallbackDeliverySent({ deliveryId, claimId });
+      delivery = await markGlassHiveCallbackDeliverySent({
+        deliveryId,
+        claimId,
+        ...(req.body?.dispatchPermit ? { dispatchPermit: req.body.dispatchPermit } : {}),
+        ...(Array.isArray(req.body?.telegramMessageIds)
+          ? { telegramMessageIds: req.body.telegramMessageIds }
+          : {}),
+      });
     } else if (status === 'failed') {
       delivery = await markGlassHiveCallbackDeliveryFailed({
         deliveryId,
@@ -1638,6 +1719,13 @@ router.post('/glasshive/deliveries/:deliveryId/status', telegramBridgeAuth, asyn
         deliveryId,
         claimId,
         reason: req.body?.reason || '',
+      });
+    } else if (status === 'delivery_unknown') {
+      delivery = await markGlassHiveCallbackDeliveryUnknown({
+        deliveryId,
+        claimId,
+        dispatchPermit: req.body.dispatchPermit,
+        reason: req.body?.reason || 'telegram_receipt_missing',
       });
     } else {
       return res.status(400).json({ error: 'Unsupported delivery status' });

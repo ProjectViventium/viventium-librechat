@@ -15,6 +15,10 @@ export interface InteractionContext {
   logical_turn_id?: string;
   revision: number;
   source_event_id: string;
+  /** Trusted monotonic source order; never inferred from an opaque event ID. */
+  source_sequence?: number;
+  /** Opaque SHA-256 scope for the authenticated owner and source conversation. */
+  source_order_scope?: string;
 }
 
 export interface InteractionAdapterCapabilities {
@@ -28,6 +32,24 @@ export interface InteractionDeliveryPolicy {
   commit_authority: 'server' | 'external_adapter';
 }
 
+export interface ClientPresentation {
+  mode: 'append' | 'regenerate';
+  userMessageId: string;
+  responseMessageId: string;
+  targetUserMessageId: string;
+}
+
+export interface SourceOrderObservation {
+  source_order_scope: string;
+  source_sequence: number;
+}
+
+export interface SourceOrderObservationResult {
+  latest_source_sequence: number;
+  observed_at: number;
+  stale: boolean;
+}
+
 export interface LogicalTurnClaim {
   status: 'claimed' | 'duplicate';
   streamId: string;
@@ -35,17 +57,43 @@ export interface LogicalTurnClaim {
   supersededStreamIds: string[];
 }
 
-export type DeliveryAcknowledgementState = 'committed' | 'partial_removed' | 'failed';
+export type DeliveryAcknowledgementState =
+  'committed' | 'committed_effect' | 'partial_removed' | 'failed';
 
 export interface InteractionDeliveryAck {
   logical_turn_id: string;
   revision: number;
   state: DeliveryAcknowledgementState;
   presentation_ref?: string;
+  presentation_committed_at?: number;
 }
 
+export interface CortexPresentationBinding {
+  ownerId: string;
+  messageId: string;
+  parentMessageId: string;
+  revision: number;
+  generation: number;
+  deliveryIds: string[];
+  deliveryReceipts: Array<{
+    deliveryId: string;
+    graphResultHash: string;
+  }>;
+  claimToken: string;
+  presentationLeaseToken: string;
+  boundAt: number;
+}
+
+export type CortexPresentationFenceReceipt = Omit<CortexPresentationBinding, 'boundAt'>;
+
 export interface DeliveryAcknowledgementResult {
-  status: 'recorded' | 'not_found' | 'stale_revision' | 'conflict';
+  status:
+    | 'recorded'
+    | 'not_found'
+    | 'stale_revision'
+    | 'stale_source_order'
+    | 'conflict'
+    | 'retryable_conflict';
   acknowledgement?: InteractionDeliveryAck;
   idempotent?: boolean;
   /** Internal server-held owner; never accepted from or exposed as client authority. */
@@ -56,7 +104,22 @@ export interface DeliveryAcknowledgementResult {
     conversationId?: string;
     responseMessageId?: string;
     interactionContext?: InteractionContext;
+    cortexPresentation?: CortexPresentationBinding;
   };
+}
+
+export interface DeliveryAcknowledgementBindingResult {
+  status:
+    | 'recorded'
+    | 'not_found'
+    | 'stale_revision'
+    | 'stale_source_order'
+    | 'conflict'
+    | 'retryable_conflict';
+  acknowledgement?: InteractionDeliveryAck;
+  idempotent?: boolean;
+  ownerStreamId?: string;
+  cortexPresentation?: CortexPresentationBinding;
 }
 
 /**
@@ -101,7 +164,11 @@ export interface SerializableJobData {
   adapterCapabilities?: AdapterCapabilities;
   deliveryPolicy?: InteractionDeliveryPolicy;
   deliveryAcknowledgement?: InteractionDeliveryAck;
+  cortexDeliveryAcknowledgement?: InteractionDeliveryAck;
+  cortexDeliveryAcknowledgementPresentation?: CortexPresentationBinding;
   generationCompleted?: boolean;
+  clientPresentation?: ClientPresentation;
+  cortexPresentation?: CortexPresentationBinding;
 }
 
 /**
@@ -194,6 +261,8 @@ export interface ResumeState {
  * This consolidates job metadata + content state into a single interface.
  */
 export interface IJobStore {
+  readonly sourceOrderDurability?: 'process' | 'durable';
+
   /** Initialize the store (e.g., connect to Redis, start cleanup intervals) */
   initialize(): Promise<void>;
 
@@ -204,6 +273,9 @@ export interface IJobStore {
     conversationId?: string,
     initialData?: Partial<SerializableJobData>,
   ): Promise<SerializableJobData>;
+
+  /** Advance or read the trusted source watermark before presentation. */
+  observeSourceOrder?(observation: SourceOrderObservation): Promise<SourceOrderObservationResult>;
 
   /** Atomically claim a revision, or return the first stream for a duplicate source event. */
   claimLogicalTurn(
@@ -237,6 +309,14 @@ export interface IJobStore {
   acknowledgeDelivery(
     acknowledgement: InteractionDeliveryAck,
   ): Promise<DeliveryAcknowledgementResult>;
+
+  bindCortexPresentation(streamId: string, binding: CortexPresentationBinding): Promise<boolean>;
+
+  bindDeliveryAcknowledgement(
+    streamId: string,
+    acknowledgement: InteractionDeliveryAck,
+    expectedCortexPresentation: CortexPresentationBinding | null,
+  ): Promise<DeliveryAcknowledgementBindingResult>;
 
   /** Get a job by streamId (streamId === conversationId) */
   getJob(streamId: string): Promise<SerializableJobData | null>;
@@ -389,8 +469,12 @@ export interface IEventTransport {
     },
   ): { unsubscribe: () => void; ready?: Promise<void> };
 
-  /** Publish a chunk event - returns Promise in Redis mode for ordered delivery */
-  emitChunk(streamId: string, event: unknown): void | Promise<void>;
+  /** Publish a chunk event and report whether the transport accepted it. */
+  emitChunk(
+    streamId: string,
+    event: unknown,
+    options?: EventTransportEmitOptions,
+  ): EventTransportPublishReceipt | void | Promise<EventTransportPublishReceipt | void>;
 
   /** Publish a done event - returns Promise in Redis mode for ordered delivery */
   emitDone(streamId: string, event: unknown): void | Promise<void>;
@@ -429,11 +513,26 @@ export interface IEventTransport {
   syncReorderBuffer?(streamId: string): void;
 
   /** Cleanup transport resources for a specific stream */
-  cleanup(streamId: string): void;
+  cleanup(streamId: string): void | Promise<void>;
 
   /** Get all tracked stream IDs (for orphan cleanup) */
   getTrackedStreamIds(): string[];
 
   /** Destroy all transport resources */
   destroy(): void | Promise<void>;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Exact Web presentation receipts.
+ * Purpose: Require proof that a presentation handler accepted the exact event when durable replay is unavailable.
+ * === VIVENTIUM END === */
+export interface EventTransportEmitOptions {
+  requirePresentationAcknowledgement?: boolean;
+  presentationAcknowledgementTimeoutMs?: number;
+}
+
+export interface EventTransportPublishReceipt {
+  published: boolean;
+  subscriberCount: number;
+  presentationAcknowledged?: boolean;
 }

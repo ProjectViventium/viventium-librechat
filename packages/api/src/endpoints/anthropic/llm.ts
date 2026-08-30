@@ -311,6 +311,7 @@ async function handleAnthropicConnectedAccountAuthFailure(
 function wrapAnthropicOAuthClient(
   client: Anthropic,
   connectedAccountAuthFailure?: (error: unknown) => Promise<void>,
+  nativeProviderRequestAccepted?: AnthropicConfigOptions['nativeProviderRequestAccepted'],
 ): Anthropic {
   const originalCreate: AnthropicMessagesCreate = client.messages.create.bind(client.messages);
   const wrappedCreate: AnthropicMessagesCreate = ((request, requestOptions) => {
@@ -326,8 +327,24 @@ function wrapAnthropicOAuthClient(
       );
     }
 
-    return originalCreate(normalizedRequest, requestOptions).catch((error: unknown) =>
-      handleAnthropicConnectedAccountAuthFailure(error, connectedAccountAuthFailure),
+    return originalCreate(normalizedRequest, requestOptions).then(
+      (response) => {
+        try {
+          nativeProviderRequestAccepted?.({
+            provider: 'anthropic',
+            model: String(
+              (normalizedRequest as unknown as Record<string, unknown>).model || '',
+            ),
+            status: 200,
+            request: normalizedRequest as unknown as Record<string, unknown>,
+          });
+        } catch {
+          // Telemetry must never alter provider output or fallback behavior.
+        }
+        return response;
+      },
+      (error: unknown) =>
+        handleAnthropicConnectedAccountAuthFailure(error, connectedAccountAuthFailure),
     );
   }) as AnthropicMessagesCreate;
 
@@ -424,6 +441,7 @@ function getLLMConfig(
     // Direct API configuration
     if (oauthToken) {
       const connectedAccountAuthFailure = options.connectedAccountAuthFailure;
+      const nativeProviderRequestAccepted = options.nativeProviderRequestAccepted;
       requestOptions.clientOptions = {
         ...(requestOptions.clientOptions ?? {}),
         authToken: apiKey,
@@ -448,6 +466,7 @@ function getLLMConfig(
             authToken: apiKey,
           }),
           connectedAccountAuthFailure,
+          nativeProviderRequestAccepted,
         );
       };
       requestOptions.clientOptions.defaultHeaders = mergeDefaultHeaders(

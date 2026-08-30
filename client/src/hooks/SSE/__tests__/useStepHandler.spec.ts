@@ -725,6 +725,49 @@ describe('useStepHandler', () => {
   });
 
   describe('on_cortex_followup event', () => {
+    const createFollowupEvent = (data: {
+      runId: string;
+      messageId: string;
+      parentMessageId: string;
+      text: string;
+      revision: number;
+      presentationGeneration: number;
+      presentationClaimToken: string;
+      presentationParentMessageId: string;
+      cortexCount?: number;
+      targetSurface?: string;
+    }): Parameters<ReturnType<typeof useStepHandler>['stepHandler']>[0] => ({
+      event: 'on_cortex_followup',
+      data,
+    });
+
+    it('ignores a Telegram-only follow-up presentation', () => {
+      const responseMessage = createResponseMessage();
+      mockGetMessages.mockReturnValue([responseMessage]);
+
+      const { result } = renderHook(() => useStepHandler(createHookParams()));
+      const submission = createSubmission();
+
+      act(() => {
+        result.current.stepHandler(
+          createFollowupEvent({
+            runId: 'response-msg-1',
+            messageId: 'followup-telegram-only',
+            parentMessageId: 'response-msg-1',
+            text: 'Telegram-only continuation',
+            revision: 1,
+            presentationGeneration: 1,
+            presentationClaimToken: 'claim-1',
+            presentationParentMessageId: 'response-msg-1',
+            targetSurface: 'telegram',
+          }),
+          submission,
+        );
+      });
+
+      expect(mockSetMessages).not.toHaveBeenCalled();
+    });
+
     it('appends a follow-up assistant message with cortex metadata', () => {
       const responseMessage = createResponseMessage();
       mockGetMessages.mockReturnValue([responseMessage]);
@@ -734,16 +777,17 @@ describe('useStepHandler', () => {
 
       act(() => {
         result.current.stepHandler(
-          {
-            event: 'on_cortex_followup',
-            data: {
-              runId: 'response-msg-1',
-              messageId: 'followup-1',
-              parentMessageId: 'response-msg-1',
-              text: 'Background continuation',
-              cortexCount: 2,
-            },
-          },
+          createFollowupEvent({
+            runId: 'response-msg-1',
+            messageId: 'followup-1',
+            parentMessageId: 'response-msg-1',
+            text: 'Background continuation',
+            cortexCount: 2,
+            revision: 1,
+            presentationGeneration: 1,
+            presentationClaimToken: 'claim-1',
+            presentationParentMessageId: 'response-msg-1',
+          }),
           submission,
         );
       });
@@ -760,6 +804,10 @@ describe('useStepHandler', () => {
             type: 'cortex_followup',
             parentRunId: 'response-msg-1',
             cortexCount: 2,
+            messageRevision: 1,
+            cortexPresentationGeneration: 1,
+            cortexPresentationClaimToken: 'claim-1',
+            cortexPresentationParentMessageId: 'response-msg-1',
           },
         },
       });
@@ -780,16 +828,17 @@ describe('useStepHandler', () => {
 
       act(() => {
         result.current.stepHandler(
-          {
-            event: 'on_cortex_followup',
-            data: {
-              runId: 'response-msg-1',
-              messageId: 'followup-1',
-              parentMessageId: 'response-msg-1',
-              text: 'Updated follow-up text',
-              cortexCount: 3,
-            },
-          },
+          createFollowupEvent({
+            runId: 'response-msg-1',
+            messageId: 'followup-1',
+            parentMessageId: 'response-msg-1',
+            text: 'Updated follow-up text',
+            cortexCount: 3,
+            revision: 2,
+            presentationGeneration: 2,
+            presentationClaimToken: 'claim-2',
+            presentationParentMessageId: 'response-msg-1',
+          }),
           submission,
         );
       });
@@ -814,22 +863,25 @@ describe('useStepHandler', () => {
 
       act(() => {
         result.current.stepHandler(
-          {
-            event: 'on_cortex_followup',
-            data: {
-              runId: 'response-msg-1',
-              messageId: 'response-msg-1',
-              parentMessageId: 'response-msg-1',
-              text: 'Final resolved answer',
-              cortexCount: 1,
-            },
-          },
+          createFollowupEvent({
+            runId: 'response-msg-1',
+            messageId: 'response-msg-1',
+            parentMessageId: 'response-msg-1',
+            text: 'Final resolved answer',
+            cortexCount: 1,
+            revision: 2,
+            presentationGeneration: 1,
+            presentationClaimToken: 'claim-promoted',
+            presentationParentMessageId: 'response-msg-1',
+          }),
           submission,
         );
       });
 
       const updatedMessages = mockSetMessages.mock.calls[mockSetMessages.mock.calls.length - 1][0];
-      const updatedResponse = updatedMessages.find((m: TMessage) => m.messageId === 'response-msg-1');
+      const updatedResponse = updatedMessages.find(
+        (m: TMessage) => m.messageId === 'response-msg-1',
+      );
       expect(updatedResponse).toMatchObject({
         messageId: 'response-msg-1',
         parentMessageId: 'user-msg-1',
@@ -847,16 +899,54 @@ describe('useStepHandler', () => {
 
       act(() => {
         result.current.stepHandler(
-          {
-            event: 'on_cortex_followup',
-            data: {
-              runId: 'response-msg-1',
-              messageId: 'followup-1',
-              parentMessageId: 'response-msg-1',
-              text: '   ',
-            },
-          },
+          createFollowupEvent({
+            runId: 'response-msg-1',
+            messageId: 'followup-1',
+            parentMessageId: 'response-msg-1',
+            text: '   ',
+            revision: 1,
+            presentationGeneration: 1,
+            presentationClaimToken: 'claim-empty',
+            presentationParentMessageId: 'response-msg-1',
+          }),
           submission,
+        );
+      });
+
+      expect(mockSetMessages).not.toHaveBeenCalled();
+    });
+
+    it('rejects a stale generation and claim token after reload or replay', () => {
+      const current = createResponseMessage({
+        messageId: 'followup-1',
+        parentMessageId: 'response-msg-1',
+        text: 'Current visible insight',
+        metadata: {
+          viventium: {
+            type: 'cortex_followup',
+            cortexPresentationParentMessageId: 'response-msg-1',
+            messageRevision: 2,
+            cortexPresentationGeneration: 2,
+            cortexPresentationClaimToken: 'claim-new',
+          },
+        } as any,
+      });
+      mockGetMessages.mockReturnValue([createResponseMessage(), current]);
+      const { result } = renderHook(() => useStepHandler(createHookParams()));
+
+      act(() => {
+        result.current.stepHandler(
+          createFollowupEvent({
+            runId: 'response-msg-1',
+            messageId: 'followup-1',
+            parentMessageId: 'response-msg-1',
+            presentationParentMessageId: 'response-msg-1',
+            text: 'Stale replayed insight',
+            revision: 2,
+            presentationGeneration: 1,
+            presentationClaimToken: 'claim-old',
+          }),
+          createSubmission(),
         );
       });
 

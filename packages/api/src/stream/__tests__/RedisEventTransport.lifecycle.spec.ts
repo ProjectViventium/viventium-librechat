@@ -68,6 +68,39 @@ function createSubscriber(initialStatus: string = 'ready') {
 }
 
 describe('RedisEventTransport subscription lifecycle', () => {
+  test('uses the handler acknowledgement when Redis Cluster publish reports zero local subscribers', async () => {
+    const { publisher, subscriber } = createSubscriber();
+    publisher.publish.mockImplementation(async (channel: string, message: string) => {
+      subscriber.emit('message', channel, message);
+      return 0;
+    });
+    const transport = new RedisEventTransport(publisher as never, subscriber as never);
+    const received: unknown[] = [];
+    const subscription = transport.subscribe('cluster-presentation', {
+      onChunk: (event) => received.push(event),
+    });
+    await subscription.ready;
+
+    await expect(
+      transport.emitChunk(
+        'cluster-presentation',
+        { exact: 'presentation' },
+        {
+          requirePresentationAcknowledgement: true,
+          presentationAcknowledgementTimeoutMs: 250,
+        },
+      ),
+    ).resolves.toEqual({
+      published: true,
+      subscriberCount: 1,
+      presentationAcknowledged: true,
+    });
+    expect(received).toEqual([{ exact: 'presentation' }]);
+
+    subscription.unsubscribe();
+    await transport.destroy();
+  });
+
   test('carries only explicit user-cancellation intent across Redis abort delivery', async () => {
     const { publisher, subscriber } = createSubscriber();
     const transport = new RedisEventTransport(publisher as never, subscriber as never);
@@ -78,7 +111,7 @@ describe('RedisEventTransport subscription lifecycle', () => {
     const published = publisher.publish.mock.calls[0][1] as string;
     subscriber.emit('message', 'stream:{reasoned-abort}:events', published);
 
-    expect(JSON.parse(published)).toEqual({ type: 'abort', data: 'user_cancelled' });
+    expect(JSON.parse(published)).toEqual({ type: 'abort', reason: 'user_cancelled' });
     expect(onAbort).toHaveBeenCalledWith('user_cancelled');
     await transport.destroy();
   });

@@ -183,6 +183,8 @@ export interface InitializeAgentDbMethods extends EndpointDbMethods {
   /** Get the newest recall-eligible message timestamp for a user */
   getLatestRecallEligibleMessageCreatedAt?: (params: {
     user: string;
+    excludeMessageId?: string | null;
+    excludeParentMessageId?: string | null;
   }) => Promise<Date | string | null>;
 }
 
@@ -482,7 +484,13 @@ export async function initializeAgent(
       let recallFreshness: ReturnType<typeof evaluateConversationRecallCorpusFreshness> | undefined;
       if (conversationRecallScope === 'all' && db.getLatestRecallEligibleMessageCreatedAt) {
         const latestRecallEligibleMessageCreatedAt =
-          await db.getLatestRecallEligibleMessageCreatedAt({ user: req.user.id });
+          await db.getLatestRecallEligibleMessageCreatedAt({
+            user: req.user.id,
+            excludeMessageId:
+              typeof req.body?.messageId === 'string' ? req.body.messageId : null,
+            excludeParentMessageId:
+              typeof req.body?.messageId === 'string' ? req.body.messageId : null,
+          });
         recallFreshness = evaluateConversationRecallCorpusFreshness({
           recallFiles: conversationRecallFiles,
           latestMessageCreatedAt: latestRecallEligibleMessageCreatedAt,

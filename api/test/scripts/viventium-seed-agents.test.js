@@ -46,7 +46,6 @@ const {
   auditHermeticArtifact,
   stableSerialize: stableSerializeHistory,
 } = require('../../../scripts/viventium-generate-managed-agent-migrations');
-
 describe('viventium-seed-agents', () => {
   test('ships a bounded Connected Accounts consult that returns to Main for final synthesis', () => {
     const bundle = yaml.load(

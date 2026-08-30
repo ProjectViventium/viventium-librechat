@@ -100,6 +100,30 @@ describe('initializeOpenAI', () => {
     );
   });
 
+  it('keeps the native request receipt callback request-scoped until inference', async () => {
+    const params = createParams();
+    const receiptSink = jest.fn();
+    (
+      params.req as BaseInitializeParams['req'] & {
+        _viventiumRecordNativeProviderRequestAccepted?: (value: unknown) => void;
+      }
+    )._viventiumRecordNativeProviderRequestAccepted = receiptSink;
+
+    await initializeOpenAI(params);
+    const options = mockGetOpenAIConfig.mock.calls[0]?.[1] as {
+      nativeProviderRequestAccepted?: (value: unknown) => void;
+    };
+    const receipt = {
+      provider: 'openai',
+      model: 'gpt-5.6-sol',
+      status: 200,
+      request: { instructions: 'synthetic' },
+    };
+    options.nativeProviderRequestAccepted?.(receipt);
+
+    expect(receiptSink).toHaveBeenCalledWith(receipt);
+  });
+
   it('should enable responses API and pass oauth headers for OpenAI subscription auth', async () => {
     const params = createParams({
       dbOverrides: {

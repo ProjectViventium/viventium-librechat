@@ -1,11 +1,19 @@
 import { Tools, replaceSpecialVars } from 'librechat-data-provider';
 
 /** Builds the web search tool context with citation format instructions. */
-export function buildWebSearchContext(): string {
-  return `# \`${Tools.web_search}\`:
-Current Date & Time: ${replaceSpecialVars({ text: '{{iso_datetime}}' })}
-
-**Execute immediately without preface.** After search, provide a brief summary addressing the query directly, then structure your response with clear Markdown formatting (## headers, lists, tables). Cite sources properly, tailor tone to query type, and provide comprehensive details.
+export function buildWebSearchContext({
+  includeCurrentTime = true,
+}: { includeCurrentTime?: boolean } = {}): string {
+  /* === VIVENTIUM START ===
+   * Feature: Stable native-session tool authority.
+   * Purpose: Native conversation providers receive volatile time through the invocation-fresh
+   * turn header, so their durable tool authority must omit it. Direct providers keep the exact
+   * existing context by default.
+   * === VIVENTIUM END === */
+  const header = includeCurrentTime
+    ? `# \`${Tools.web_search}\`:\nCurrent Date & Time: ${replaceSpecialVars({ text: '{{iso_datetime}}' })}\n\n`
+    : `# \`${Tools.web_search}\`:\n\n`;
+  return `${header}**Execute immediately without preface.** After search, provide a brief summary addressing the query directly, then structure your response with clear Markdown formatting (## headers, lists, tables). Cite sources properly, tailor tone to query type, and provide comprehensive details.
 
 **CITATION FORMAT - UNICODE ESCAPE SEQUENCES ONLY:**
 Use these EXACT escape sequences (copy verbatim): \\ue202 (before each anchor), \\ue200 (group start), \\ue201 (group end), \\ue203 (highlight start), \\ue204 (highlight end)

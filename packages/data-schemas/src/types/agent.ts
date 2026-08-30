@@ -27,7 +27,7 @@ export interface IActivationConfig {
   /** Model to use for activation detection (e.g., "gpt-4o-mini") */
   model?: string;
   /** Provider for the activation model (e.g., "openai") */
-  provider: string;
+  provider?: string;
   /** Ordered recovery routes for activation detection */
   fallbacks?: Array<{ provider: string; model: string }>;
   /** Whether an exhausted detector route should be surfaced to the user */
@@ -53,6 +53,13 @@ export interface IBackgroundCortex {
   agent_id: string;
   /** Activation configuration for this cortex (specific to this main agent) */
   activation: IActivationConfig;
+  /** Structural proof required before this cortex may expose a visible result. */
+  result_evidence?: {
+    visible_insight_requires: Array<{
+      tool: string;
+      receipt: 'non_empty_sources';
+    }>;
+  };
 }
 /* === VIVENTIUM END === */
 export interface IAgent extends Omit<Document, 'model'> {
@@ -71,6 +78,14 @@ export interface IAgent extends Omit<Document, 'model'> {
   glasshive_options?: {
     workspace: { mode: 'life' | 'custom'; path?: string };
     access: 'full' | 'workspace';
+    fallback_model?: string;
+    fallback_reasoning_effort?: string;
+    orchestration?: {
+      parallel_available: boolean;
+      default_mode: 'focused' | 'parallel';
+      worker_profile?: 'codex-cli' | 'claude-code' | 'openclaw-general';
+      fallback_worker_profile?: 'codex-cli' | 'claude-code' | 'openclaw-general';
+    };
   };
   /* === VIVENTIUM END === */
   artifacts?: string;
@@ -82,6 +97,7 @@ export interface IAgent extends Omit<Document, 'model'> {
   author: Types.ObjectId;
   authorName?: string;
   hide_sequential_outputs?: boolean;
+  presentation_policy?: 'primary_final';
   end_after_tools?: boolean;
   /** @deprecated Use edges instead */
   agent_ids?: string[];

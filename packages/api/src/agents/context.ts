@@ -1,6 +1,13 @@
 import { Constants } from 'librechat-data-provider';
 import { DynamicStructuredTool } from '@librechat/agents/langchain/tools';
 import type { Agent, TEphemeralAgent } from 'librechat-data-provider';
+/* === VIVENTIUM START ===
+ * Feature: Authenticated trusted MCP instruction fetch.
+ * Purpose: The current request identity is transport context for trusted server instructions; it
+ * is not appended to agent text or used for routing.
+ * === VIVENTIUM END === */
+import type { IUser } from '@librechat/data-schemas';
+import type { RequestBody } from '~/types';
 import type { LCTool } from '@librechat/agents';
 import type { Logger } from 'winston';
 import type { MCPManager } from '~/mcp/MCPManager';
@@ -65,12 +72,16 @@ export async function getMCPInstructionsForServers(
   mcpServers: string[],
   mcpManager: MCPManager,
   logger?: Logger,
+  requestContext?: { user?: IUser; body?: RequestBody },
 ): Promise<string> {
   if (!mcpServers.length) {
     return '';
   }
   try {
-    const mcpInstructions = await mcpManager.formatInstructionsForContext(mcpServers);
+    /* === VIVENTIUM START === Authenticated trusted MCP instruction fetch. === VIVENTIUM END === */
+    const mcpInstructions = requestContext
+      ? await mcpManager.formatInstructionsForContext(mcpServers, requestContext)
+      : await mcpManager.formatInstructionsForContext(mcpServers);
     if (mcpInstructions && logger) {
       logger.debug('[AgentContext] Fetched MCP instructions for servers:', mcpServers);
     }
@@ -87,6 +98,7 @@ async function getMCPInstructionsWithSourcesForServers(
   mcpServers: string[],
   mcpManager: MCPManager,
   logger?: Logger,
+  requestContext?: { user?: IUser; body?: RequestBody },
 ): Promise<{ text: string; sources: Record<string, string> }> {
   if (!mcpServers.length) {
     return { text: '', sources: {} };
@@ -95,17 +107,26 @@ async function getMCPInstructionsWithSourcesForServers(
     mcpManager as unknown as {
       formatInstructionsForContextWithMetadata?: (
         serverNames?: string[],
+        requestContext?: { user?: IUser; body?: RequestBody },
       ) => Promise<{ text: string; sources: Record<string, string> }>;
     }
   ).formatInstructionsForContextWithMetadata;
 
   if (typeof maybeMetadataFormatter !== 'function') {
-    const text = await getMCPInstructionsForServers(mcpServers, mcpManager, logger);
+    const text = await getMCPInstructionsForServers(
+      mcpServers,
+      mcpManager,
+      logger,
+      requestContext,
+    );
     return { text, sources: {} };
   }
 
   try {
-    const result = await maybeMetadataFormatter.call(mcpManager, mcpServers);
+    /* === VIVENTIUM START === Authenticated trusted MCP instruction fetch. === VIVENTIUM END === */
+    const result = requestContext
+      ? await maybeMetadataFormatter.call(mcpManager, mcpServers, requestContext)
+      : await maybeMetadataFormatter.call(mcpManager, mcpServers);
     const text = result?.text || '';
     if (text && logger) {
       logger.debug('[AgentContext] Fetched MCP instructions for servers:', mcpServers);
@@ -177,6 +198,7 @@ export async function applyContextToAgent({
   dynamicTailContext,
   agentId,
   logger,
+  requestContext,
 }: {
   agent: AgentWithTools;
   sharedRunContext: string;
@@ -185,13 +207,19 @@ export async function applyContextToAgent({
   dynamicTailContext?: string;
   agentId?: string;
   logger?: Logger;
+  requestContext?: { user?: IUser; body?: RequestBody };
 }): Promise<void> {
   const baseInstructions = agent.instructions || '';
 
   try {
     const mcpServers = ephemeralAgent?.mcp?.length ? ephemeralAgent.mcp : extractMCPServers(agent);
     const { text: mcpInstructions, sources: mcpInstructionSources } =
-      await getMCPInstructionsWithSourcesForServers(mcpServers, mcpManager, logger);
+      await getMCPInstructionsWithSourcesForServers(
+        mcpServers,
+        mcpManager,
+        logger,
+        requestContext,
+      );
     agent.viventiumMCPInstructionSources = mcpInstructionSources;
 
     agent.instructions = buildAgentInstructions({

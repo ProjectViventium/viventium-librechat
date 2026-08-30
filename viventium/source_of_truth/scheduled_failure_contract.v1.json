@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "one_time_max_attempts": 3,
+  "auto_pause_consecutive_failures": null,
+  "classes": {
+    "activation_provider_unavailable": { "retryable": true },
+    "completion_error": { "retryable": true },
+    "conversation_capability_grant_required": { "retryable": false },
+    "conversation_session_authority_conflict": { "retryable": true },
+    "context_length_exceeded": { "retryable": false },
+    "provider_access_denied": { "retryable": false },
+    "provider_auth_missing": { "retryable": false },
+    "provider_connected_account_reconnect_required": { "retryable": false },
+    "provider_quota_exhausted": { "retryable": false },
+    "provider_rate_limited": { "retryable": true },
+    "provider_response_deadline_exceeded": { "retryable": true },
+    "provider_temporarily_unavailable": { "retryable": true },
+    "provider_timeout": { "retryable": true },
+    "provider_unauthorized": { "retryable": false },
+    "recoverable_provider_error": { "retryable": true },
+    "timeout": { "retryable": true }
+  },
+  "retry_dispositions": [
+    "retry_scheduled",
+    "next_occurrence_only",
+    "paused",
+    "terminal_action_required",
+    "no_retry"
+  ]
+}

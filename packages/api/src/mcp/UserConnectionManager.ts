@@ -71,6 +71,7 @@ export abstract class UserConnectionManager {
     signal,
     returnOnOAuth = false,
     allowOAuthInitiation = true,
+    suppressOAuthFlow = false,
     connectionTimeout,
     serverConfig: providedConfig,
   }: {
@@ -120,7 +121,7 @@ export abstract class UserConnectionManager {
      */
     if (
       connection &&
-      !allowOAuthInitiation &&
+      (!allowOAuthInitiation || suppressOAuthFlow) &&
       this.connectionAllowsOAuthInitiation.get(connection) !== false
     ) {
       logger.info(
@@ -209,6 +210,7 @@ export abstract class UserConnectionManager {
           oauthEnd: oauthEnd,
           returnOnOAuth: returnOnOAuth,
           allowOAuthInitiation: allowOAuthInitiation,
+          suppressOAuthFlow: suppressOAuthFlow,
           requestBody: requestBody,
           connectionTimeout: connectionTimeout,
         },
@@ -222,7 +224,10 @@ export abstract class UserConnectionManager {
         this.userConnections.set(userId, new Map());
       }
       this.userConnections.get(userId)?.set(serverName, connection);
-      this.connectionAllowsOAuthInitiation.set(connection, allowOAuthInitiation);
+      this.connectionAllowsOAuthInitiation.set(
+        connection,
+        allowOAuthInitiation && !suppressOAuthFlow,
+      );
 
       logger.info(`[MCP][User: ${userId}][${serverName}] Connection successfully established`);
       // Update timestamp on creation

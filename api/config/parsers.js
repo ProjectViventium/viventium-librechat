@@ -82,6 +82,14 @@ const truncateLongStrings = (value, length = 100) => {
   return value;
 };
 
+const escapeLogLineBreaks = (value) =>
+  String(value)
+    .replaceAll('\\', '\\\\')
+    .replaceAll('\r', '\\r')
+    .replaceAll('\n', '\\n')
+    .replaceAll('\u2028', '\\u2028')
+    .replaceAll('\u2029', '\\u2029');
+
 /**
  * An array mapping function that truncates long strings (objects converted to JSON strings).
  * @param {any} item - The item to be condensed.
@@ -119,7 +127,10 @@ const debugTraverse = winston.format.printf(({ level, message, timestamp, ...met
     return `${timestamp} ${level}: ${JSON.stringify(message)}`;
   }
 
-  let msg = `${timestamp} ${level}: ${truncateLongStrings(message?.trim(), DEBUG_MESSAGE_LENGTH)}`;
+  let msg = `${timestamp} ${level}: ${truncateLongStrings(
+    escapeLogLineBreaks(message?.trim()),
+    DEBUG_MESSAGE_LENGTH,
+  )}`;
   try {
     if (level !== 'debug') {
       return msg;
@@ -141,7 +152,7 @@ const debugTraverse = winston.format.printf(({ level, message, timestamp, ...met
     }
 
     if (typeof debugValue !== 'object') {
-      return (msg += ` ${debugValue}`);
+      return (msg += ` ${escapeLogLineBreaks(debugValue)}`);
     }
 
     msg += '\n{';

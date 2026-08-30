@@ -332,6 +332,62 @@ describe('agentSchemaToolBindingPatch', () => {
     expect(providerInvoke).not.toHaveBeenCalled();
   });
 
+  /* === VIVENTIUM START ===
+   * Feature: Opaque graph-participant provider failure provenance.
+   * Purpose: Guard the exact participant model boundary without widening retry to tool failures.
+   */
+  it('retries an opaque error caught at the exact participant model boundary', async () => {
+    const calls = [];
+    const fallbackClientOptions = { model: 'synthetic-fallback' };
+    Object.defineProperty(fallbackClientOptions, fallbackContextSymbol, {
+      value: Object.freeze({
+        provider: 'synthetic-fallback-provider',
+        model: 'synthetic-fallback',
+      }),
+      enumerable: false,
+    });
+    const fakeProto = {
+      createCallModel(agentId = 'default') {
+        const graph = this;
+        return async function fakeCallModel() {
+          const provider = graph.agentContexts.get(agentId).provider;
+          calls.push(provider);
+          if (provider === 'synthetic-primary-provider') {
+            throw new Error('synthetic adapter omitted provider status and code');
+          }
+          return { messages: [] };
+        };
+      },
+    };
+
+    expect(installUnifiedSchemaToolBindingPatch(fakeProto)).toBe(true);
+    const fakeGraph = Object.assign(Object.create(fakeProto), {
+      contentData: [],
+      toolCallStepIds: new Map(),
+      agentContexts: new Map([
+        [
+          'default',
+          {
+            provider: 'synthetic-primary-provider',
+            clientOptions: {
+              fallbacks: [
+                {
+                  provider: 'synthetic-fallback-provider',
+                  clientOptions: fallbackClientOptions,
+                },
+              ],
+            },
+          },
+        ],
+      ]),
+    });
+    const callModel = fakeProto.createCallModel.call(fakeGraph, 'default');
+
+    await expect(callModel({ messages: [] }, {})).resolves.toEqual({ messages: [] });
+    expect(calls).toEqual(['synthetic-primary-provider', 'synthetic-fallback-provider']);
+  });
+  /* === VIVENTIUM END === */
+
   it.each([
     {
       label: 'fresh fallback authority',

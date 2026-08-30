@@ -115,6 +115,428 @@ describe('voiceDeltaAggregation', () => {
     expect(extractVisibleTextFromContentParts(contentParts)).toBe('Already visible answer.');
   });
 
+  test('marks an ownerless first visible delta so final pruning cannot discard it', () => {
+    const contentParts = [{ type: ContentTypes.TEXT, text: 'Already visible answer.' }];
+
+    const repaired = repairMissedVisibleMessageDelta({
+      contentParts,
+      beforeContentParts: [],
+      event: 'on_message_delta',
+      data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'Already visible answer.' }] } },
+      beforeText: '',
+      afterText: 'Already visible answer.',
+      contentMeta: { unownedVisible: true },
+    });
+
+    expect(repaired).toBe(true);
+    expect(contentParts).toEqual([
+      {
+        type: ContentTypes.TEXT,
+        text: 'Already visible answer.',
+        viventiumUnownedVisible: true,
+      },
+    ]);
+  });
+
+  test('reclaims an early ownerless fragment when the same run step later gains an owner', () => {
+    const contentParts = [];
+    const firstMeta = {
+      unownedVisible: true,
+      sourceStepId: 'step-late-owner',
+    };
+
+    expect(
+      repairMissedVisibleMessageDelta({
+        contentParts,
+        beforeContentParts: [],
+        event: 'on_message_delta',
+        data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'Yes' }] } },
+        beforeText: '',
+        afterText: '',
+        contentMeta: firstMeta,
+      }),
+    ).toBe(true);
+
+    const beforeSecond = contentParts.map((part) => ({ ...part }));
+    expect(
+      repairMissedVisibleMessageDelta({
+        contentParts,
+        beforeContentParts: beforeSecond,
+        event: 'on_message_delta',
+        data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'terday at 6pm.' }] } },
+        beforeText: 'Yes',
+        afterText: 'Yes',
+        contentMeta: {
+          agentId: 'agent-main',
+          groupId: 1,
+          sourceStepId: 'step-late-owner',
+        },
+      }),
+    ).toBe(true);
+
+    expect(contentParts).toEqual([
+      {
+        type: ContentTypes.TEXT,
+        text: 'Yesterday at 6pm.',
+        agentId: 'agent-main',
+        groupId: 1,
+        viventiumSourceStepId: 'step-late-owner',
+      },
+    ]);
+  });
+
+  test('keeps a split no-response marker contiguous when its owner arrives late', () => {
+    const contentParts = [];
+    repairMissedVisibleMessageDelta({
+      contentParts,
+      beforeContentParts: [],
+      event: 'on_message_delta',
+      data: { delta: { content: [{ type: ContentTypes.TEXT, text: '{NT' }] } },
+      beforeText: '',
+      afterText: '',
+      contentMeta: {
+        unownedVisible: true,
+        sourceStepId: 'step-nta',
+      },
+    });
+
+    repairMissedVisibleMessageDelta({
+      contentParts,
+      beforeContentParts: contentParts.map((part) => ({ ...part })),
+      event: 'on_message_delta',
+      data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'A}' }] } },
+      beforeText: '{NT',
+      afterText: '{NT',
+      contentMeta: {
+        agentId: 'agent-main',
+        groupId: 1,
+        sourceStepId: 'step-nta',
+      },
+    });
+
+    expect(extractVisibleTextFromContentParts(contentParts)).toBe('{NTA}');
+    expect(contentParts).toHaveLength(1);
+  });
+
+  test('coalesces interleaved early fragments by source step before their owners arrive', () => {
+    const contentParts = [];
+    const appendEarly = (text, sourceStepId) =>
+      repairMissedVisibleMessageDelta({
+        contentParts,
+        beforeContentParts: contentParts.map((part) => ({ ...part })),
+        event: 'on_message_delta',
+        data: { delta: { content: [{ type: ContentTypes.TEXT, text }] } },
+        beforeText: extractVisibleTextFromContentParts(contentParts),
+        afterText: extractVisibleTextFromContentParts(contentParts),
+        contentMeta: { unownedVisible: true, sourceStepId },
+      });
+
+    expect(appendEarly('Yes', 'step-a')).toBe(true);
+    expect(appendEarly('Second participant here.', 'step-b')).toBe(true);
+    expect(appendEarly('terday at 6pm.', 'step-a')).toBe(true);
+
+    expect(contentParts).toEqual([
+      {
+        type: ContentTypes.TEXT,
+        text: 'Yesterday at 6pm.',
+        viventiumSourceStepId: 'step-a',
+        viventiumUnownedVisible: true,
+      },
+      {
+        type: ContentTypes.TEXT,
+        text: 'Second participant here.',
+        viventiumSourceStepId: 'step-b',
+        viventiumUnownedVisible: true,
+      },
+    ]);
+  });
+
+  test('keeps an interleaved early no-response marker contiguous by source step', () => {
+    const contentParts = [];
+    const appendEarly = (text, sourceStepId) =>
+      repairMissedVisibleMessageDelta({
+        contentParts,
+        beforeContentParts: contentParts.map((part) => ({ ...part })),
+        event: 'on_message_delta',
+        data: { delta: { content: [{ type: ContentTypes.TEXT, text }] } },
+        beforeText: extractVisibleTextFromContentParts(contentParts),
+        afterText: extractVisibleTextFromContentParts(contentParts),
+        contentMeta: { unownedVisible: true, sourceStepId },
+      });
+
+    appendEarly('{NT', 'step-nta');
+    appendEarly('Second participant here.', 'step-b');
+    appendEarly('A}', 'step-nta');
+
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: '{NTA}',
+      viventiumSourceStepId: 'step-nta',
+      viventiumUnownedVisible: true,
+    });
+  });
+
+  test('keeps distinct Main invocation steps separate even when agent and group match', () => {
+    const beforeContentParts = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Pre-handoff.',
+        agentId: 'agent-main',
+        groupId: 1,
+      },
+    ];
+    const contentParts = beforeContentParts.map((part) => ({ ...part }));
+
+    expect(
+      repairMissedVisibleMessageDelta({
+        contentParts,
+        beforeContentParts,
+        event: 'on_message_delta',
+        data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'Post-handoff.' }] } },
+        beforeText: 'Pre-handoff.',
+        afterText: 'Pre-handoff.',
+        contentMeta: {
+          agentId: 'agent-main',
+          groupId: 1,
+          sourceStepId: 'step-post-handoff',
+        },
+      }),
+    ).toBe(true);
+
+    expect(contentParts).toEqual([
+      beforeContentParts[0],
+      {
+        type: ContentTypes.TEXT,
+        text: 'Post-handoff.',
+        agentId: 'agent-main',
+        groupId: 1,
+        viventiumSourceStepId: 'step-post-handoff',
+      },
+    ]);
+  });
+
+  test('pins the source step on an owned delta that upstream aggregated correctly', () => {
+    const beforeContentParts = [];
+    const contentParts = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'First invocation.',
+        agentId: 'agent-main',
+        groupId: 1,
+      },
+    ];
+
+    expect(
+      repairMissedVisibleMessageDelta({
+        contentParts,
+        beforeContentParts,
+        event: 'on_message_delta',
+        data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'First invocation.' }] } },
+        beforeText: '',
+        afterText: 'First invocation.',
+        contentMeta: {
+          agentId: 'agent-main',
+          groupId: 1,
+          sourceStepId: 'step-first-invocation',
+        },
+      }),
+    ).toBe(false);
+
+    expect(contentParts[0]).toEqual(
+      expect.objectContaining({ viventiumSourceStepId: 'step-first-invocation' }),
+    );
+  });
+
+  /* === VIVENTIUM START ===
+   * Regression: MC-045 must exercise the exact-advance branch with realistic interleaving.
+   */
+  test('pins real-shaped interleaved A/B/A deltas when upstream advances each target exactly', () => {
+    const contentParts = [];
+    const advanceExactly = ({ agentId, sourceStepId, deltaText }) => {
+      const beforeContentParts = contentParts.map((part) => ({ ...part }));
+      const existingIndex = contentParts.findIndex((part) => part.agentId === agentId);
+      if (existingIndex >= 0) {
+        contentParts[existingIndex] = {
+          ...contentParts[existingIndex],
+          text: `${contentParts[existingIndex].text}${deltaText}`,
+        };
+      } else {
+        contentParts.push({
+          type: ContentTypes.TEXT,
+          text: deltaText,
+          agentId,
+          groupId: 1,
+        });
+      }
+
+      return repairMissedVisibleMessageDelta({
+        contentParts,
+        beforeContentParts,
+        event: 'on_message_delta',
+        data: { delta: { content: [{ type: ContentTypes.TEXT, text: deltaText }] } },
+        beforeText: extractVisibleTextFromContentParts(beforeContentParts),
+        afterText: extractVisibleTextFromContentParts(contentParts),
+        contentMeta: { agentId, groupId: 1, sourceStepId },
+      });
+    };
+
+    expect(
+      advanceExactly({
+        agentId: 'agent-primary',
+        sourceStepId: 'step-a',
+        deltaText: 'Primary starts. ',
+      }),
+    ).toBe(false);
+    expect(
+      advanceExactly({
+        agentId: 'agent-primary____1',
+        sourceStepId: 'step-b',
+        deltaText: 'Parallel answer.',
+      }),
+    ).toBe(false);
+    expect(
+      advanceExactly({
+        agentId: 'agent-primary',
+        sourceStepId: 'step-a',
+        deltaText: 'Primary finishes.',
+      }),
+    ).toBe(false);
+
+    expect(contentParts).toEqual([
+      {
+        type: ContentTypes.TEXT,
+        text: 'Primary starts. Primary finishes.',
+        agentId: 'agent-primary',
+        groupId: 1,
+        viventiumSourceStepId: 'step-a',
+      },
+      {
+        type: ContentTypes.TEXT,
+        text: 'Parallel answer.',
+        agentId: 'agent-primary____1',
+        groupId: 1,
+        viventiumSourceStepId: 'step-b',
+      },
+    ]);
+  });
+  /* === VIVENTIUM END === */
+
+  test('keeps missed parallel-agent deltas in separate structured content parts', () => {
+    const contentParts = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Base answer.',
+        agentId: 'agent-main',
+        groupId: 1,
+      },
+    ];
+
+    const repaired = repairMissedVisibleMessageDelta({
+      contentParts,
+      event: 'on_message_delta',
+      data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'Added answer.' }] } },
+      beforeText: 'Base answer.',
+      afterText: 'Base answer.',
+      contentMeta: { agentId: 'agent-main____1', groupId: 1 },
+    });
+
+    expect(repaired).toBe(true);
+    expect(contentParts).toEqual([
+      expect.objectContaining({
+        text: 'Base answer.',
+        agentId: 'agent-main',
+        groupId: 1,
+      }),
+      expect.objectContaining({
+        text: 'Added answer.',
+        agentId: 'agent-main____1',
+        groupId: 1,
+      }),
+    ]);
+  });
+
+  test('repairs a parallel delta that the upstream aggregator appended to another agent part', () => {
+    const beforeContentParts = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Base answer.',
+        agentId: 'agent-main',
+        groupId: 1,
+      },
+    ];
+    const contentParts = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Base answer.Added answer.',
+        agentId: 'agent-main',
+        groupId: 1,
+      },
+    ];
+
+    const repaired = repairMissedVisibleMessageDelta({
+      contentParts,
+      beforeContentParts,
+      event: 'on_message_delta',
+      data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'Added answer.' }] } },
+      beforeText: 'Base answer.',
+      afterText: 'Base answer.Added answer.',
+      contentMeta: { agentId: 'agent-main____1', groupId: 1 },
+    });
+
+    expect(repaired).toBe(true);
+    expect(contentParts).toEqual([
+      expect.objectContaining({
+        text: 'Base answer.',
+        agentId: 'agent-main',
+        groupId: 1,
+      }),
+      expect.objectContaining({
+        text: 'Added answer.',
+        agentId: 'agent-main____1',
+        groupId: 1,
+      }),
+    ]);
+  });
+
+  test('never appends an unowned visible delta to an existing parallel participant', () => {
+    const beforeContentParts = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Base answer.',
+        agentId: 'agent-main',
+        groupId: 1,
+      },
+    ];
+    const contentParts = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Base answer.Added answer.',
+        agentId: 'agent-main',
+        groupId: 1,
+      },
+    ];
+
+    const repaired = repairMissedVisibleMessageDelta({
+      contentParts,
+      beforeContentParts,
+      event: 'on_message_delta',
+      data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'Added answer.' }] } },
+      beforeText: 'Base answer.',
+      afterText: 'Base answer.Added answer.',
+      contentMeta: {},
+    });
+
+    expect(repaired).toBe(true);
+    expect(contentParts).toEqual([
+      beforeContentParts[0],
+      {
+        type: ContentTypes.TEXT,
+        text: 'Added answer.',
+        viventiumUnownedVisible: true,
+      },
+    ]);
+  });
+
   test('does not duplicate text when upstream aggregation already advanced', () => {
     const contentParts = [{ type: ContentTypes.TEXT, text: 'I hear you.' }];
 

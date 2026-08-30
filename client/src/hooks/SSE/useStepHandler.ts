@@ -615,14 +615,65 @@ export default function useStepHandler({
           conversationId?: string;
           cortexCount?: number;
           text?: string;
+          revision?: number;
+          presentationGeneration?: number;
+          presentationClaimToken?: string;
+          presentationParentMessageId?: string;
+          targetSurface?: string;
         };
 
+        if (followUp.targetSurface === 'telegram') {
+          return;
+        }
+
         const followUpText = typeof followUp.text === 'string' ? followUp.text.trim() : '';
-        if (!followUp.messageId || followUpText.length === 0) {
+        const revision = Number(followUp.revision);
+        const presentationGeneration = Number(followUp.presentationGeneration);
+        const presentationClaimToken = String(followUp.presentationClaimToken || '').trim();
+        const presentationParentMessageId = String(
+          followUp.presentationParentMessageId || followUp.parentMessageId || followUp.runId || '',
+        ).trim();
+        if (
+          !followUp.messageId ||
+          followUpText.length === 0 ||
+          !Number.isSafeInteger(revision) ||
+          revision < 1 ||
+          !Number.isSafeInteger(presentationGeneration) ||
+          presentationGeneration < 1 ||
+          !presentationClaimToken ||
+          !presentationParentMessageId
+        ) {
           return;
         }
 
         const currentMessages = getMessages() || messages;
+        const currentPresentations = currentMessages.filter((message) => {
+          const viventium = (
+            (message as Record<string, unknown>).metadata as Record<string, unknown>
+          )?.viventium as Record<string, unknown> | undefined;
+          return (
+            message.messageId === followUp.messageId ||
+            String(viventium?.cortexPresentationParentMessageId || '') ===
+              presentationParentMessageId
+          );
+        });
+        const stalePresentation = currentPresentations.some((message) => {
+          const viventium = (
+            (message as Record<string, unknown>).metadata as Record<string, unknown>
+          )?.viventium as Record<string, unknown> | undefined;
+          const currentRevision = Number(viventium?.messageRevision) || 0;
+          const currentGeneration = Number(viventium?.cortexPresentationGeneration) || 0;
+          const currentClaimToken = String(viventium?.cortexPresentationClaimToken || '').trim();
+          return (
+            revision < currentRevision ||
+            presentationGeneration < currentGeneration ||
+            (revision === currentRevision &&
+              presentationGeneration === currentGeneration &&
+              currentClaimToken !== '' &&
+              currentClaimToken !== presentationClaimToken)
+          );
+        });
+        if (stalePresentation) return;
         const existingIdx = currentMessages.findIndex((m) => m.messageId === followUp.messageId);
         const fallbackConversationId =
           currentMessages[currentMessages.length - 1]?.conversationId ?? userMessage.conversationId;
@@ -655,6 +706,10 @@ export default function useStepHandler({
                 type: 'cortex_followup',
                 parentRunId: followUp.runId,
                 cortexCount: followUp.cortexCount,
+                messageRevision: revision,
+                cortexPresentationGeneration: presentationGeneration,
+                cortexPresentationClaimToken: presentationClaimToken,
+                cortexPresentationParentMessageId: presentationParentMessageId,
               },
             },
           };
@@ -675,6 +730,10 @@ export default function useStepHandler({
               type: 'cortex_followup',
               parentRunId: followUp.runId,
               cortexCount: followUp.cortexCount,
+              messageRevision: revision,
+              cortexPresentationGeneration: presentationGeneration,
+              cortexPresentationClaimToken: presentationClaimToken,
+              cortexPresentationParentMessageId: presentationParentMessageId,
             },
           },
         } as TMessage;

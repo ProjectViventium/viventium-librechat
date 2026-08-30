@@ -4,6 +4,8 @@ import type {
   BalanceConfig,
   CreateUserRequest,
   UserDeleteResult,
+  ViventiumOrchestrationMode,
+  ViventiumOrchestrationPreferences,
   ViventiumVoiceRouteState,
 } from '~/types';
 import { signPayload } from '~/crypto';
@@ -283,6 +285,97 @@ export function createUserMethods(mongoose: typeof import('mongoose')) {
     ).lean()) as IUser | null;
   }
 
+  /* === VIVENTIUM START === Account-wide Parallel Work preference and durable known-work fence. === VIVENTIUM END === */
+  async function updateUserViventiumOrchestrationPreferences(
+    userId: string,
+    viventiumOrchestrationPreferences: ViventiumOrchestrationPreferences,
+  ): Promise<IUser | null> {
+    const User = mongoose.models.User;
+    const user = await User.findById(userId);
+    if (!user) {
+      return null;
+    }
+
+    if (
+      !('mode' in viventiumOrchestrationPreferences) &&
+      !('knownWork' in viventiumOrchestrationPreferences)
+    ) {
+      return (await User.findById(userId).lean()) as IUser | null;
+    }
+
+    const updateSet: Record<string, ViventiumOrchestrationMode | boolean> = {};
+    if (viventiumOrchestrationPreferences.mode) {
+      updateSet['personalization.orchestration_mode'] = viventiumOrchestrationPreferences.mode;
+    }
+    if (typeof viventiumOrchestrationPreferences.knownWork === 'boolean') {
+      if (!viventiumOrchestrationPreferences.knownWork) {
+        throw new Error('parallel_work_known_clear_requires_epoch');
+      }
+      updateSet['personalization.parallel_work_known'] = true;
+    }
+
+    return (await User.findByIdAndUpdate(
+      userId,
+      {
+        $set: updateSet,
+        ...(viventiumOrchestrationPreferences.knownWork === true
+          ? { $inc: { 'personalization.parallel_work_known_epoch': 1 } }
+          : {}),
+      },
+      { new: true, runValidators: true },
+    ).lean()) as IUser | null;
+  }
+
+  async function getUserParallelWorkKnownEpoch(userId: string): Promise<number | null> {
+    const User = mongoose.models.User;
+    const user = (await User.findById(userId)
+      .select('personalization.parallel_work_known_epoch')
+      .lean()) as IUser | null;
+    if (!user) {
+      return null;
+    }
+    const epoch = user.personalization?.parallel_work_known_epoch;
+    return Number.isSafeInteger(epoch) && Number(epoch) >= 0 ? Number(epoch) : 0;
+  }
+
+  async function markUserParallelWorkKnown(userId: string): Promise<boolean> {
+    const User = mongoose.models.User;
+    const result = await User.updateOne(
+      { _id: userId },
+      {
+        $set: { 'personalization.parallel_work_known': true },
+        $inc: { 'personalization.parallel_work_known_epoch': 1 },
+      },
+      { runValidators: true },
+    );
+    return result.matchedCount === 1;
+  }
+
+  async function clearUserParallelWorkKnownIfEpoch(
+    userId: string,
+    expectedEpoch: number,
+  ): Promise<boolean> {
+    if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch < 0) {
+      throw new Error('parallel_work_known_epoch_invalid');
+    }
+    const User = mongoose.models.User;
+    const epochFilter =
+      expectedEpoch === 0
+        ? {
+            $or: [
+              { 'personalization.parallel_work_known_epoch': 0 },
+              { 'personalization.parallel_work_known_epoch': { $exists: false } },
+            ],
+          }
+        : { 'personalization.parallel_work_known_epoch': expectedEpoch };
+    const result = await User.updateOne(
+      { _id: userId, ...epochFilter },
+      { $set: { 'personalization.parallel_work_known': false } },
+      { runValidators: true },
+    );
+    return result.matchedCount === 1;
+  }
+
   /**
    * Search for users by pattern matching on name, email, or username (case-insensitive)
    * @param searchPattern - The pattern to search for
@@ -402,6 +495,10 @@ export function createUserMethods(mongoose: typeof import('mongoose')) {
     toggleUserMemories,
     updateUserPersonalization,
     updateUserViventiumVoicePreferences,
+    updateUserViventiumOrchestrationPreferences,
+    getUserParallelWorkKnownEpoch,
+    markUserParallelWorkKnown,
+    clearUserParallelWorkKnownIfEpoch,
   };
 }
 

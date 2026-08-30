@@ -80,6 +80,40 @@ describe('/api/viventium/health/whoop', () => {
     expect(hidden.body).toEqual({ error: 'whoop_not_enabled' });
   });
 
+  test('is reachable through the product Viventium router', async () => {
+    const unrelatedRoutes = [
+      'calls',
+      'voice',
+      'telegram',
+      'scheduler',
+      'interactions',
+      'gateway',
+      'telegram_link',
+      'registration',
+      'credits',
+      'auth',
+      'skyvern',
+      'glasshive',
+      'glasshiveCapabilities',
+      'glasshiveInference',
+      'promptWorkbench',
+      'feelings',
+      'channels',
+      'orchestration',
+      'orchestrationTrace',
+      'personalAccountCleanup',
+    ];
+    for (const route of unrelatedRoutes) {
+      jest.doMock(`../${route}`, () => require('express').Router());
+    }
+    const app = express();
+    app.use(express.json({ limit: '32kb' }));
+    app.use('/api/viventium', require('../index'));
+
+    await request(app).get('/api/viventium/health/whoop/status').expect(200);
+    expect(mockGetWhoopStatus).toHaveBeenCalledTimes(1);
+  });
+
   test('protects host-owner health state behind admin authorization', async () => {
     mockCheckAdmin.mockImplementation((_req, res) =>
       res.status(403).json({ message: 'Forbidden' }),

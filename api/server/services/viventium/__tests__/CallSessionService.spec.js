@@ -30,6 +30,8 @@ const {
   getDispatchStatus,
   assertVoiceGatewayAuth,
   assertCallBrowserCapability,
+  createVoiceEngagementAttestation,
+  verifyVoiceEngagementAttestation,
 } = require('../CallSessionService');
 const { persistSpeakerSessionState } = require('../SpeakerSegmentService');
 
@@ -116,6 +118,139 @@ describe('CallSessionService', () => {
     });
     expect(fetched).not.toHaveProperty('browserCapability');
     expect(fetched).not.toHaveProperty('browserCapabilityHash');
+  });
+
+  test('voice engagement attestation binds the owner, session, exact turn, decision, and final segments', () => {
+    const nowMs = 1787659200000;
+    const utterance = 'Please launch the requested worker.';
+    const attestation = createVoiceEngagementAttestation({
+      callSessionId: 'call_owner_1',
+      turnId: 'turn_000004',
+      participantIdentity: 'owner-participant',
+      segmentIds: ['segment_000004'],
+      directlyAddressed: true,
+      revision: 2,
+      utterance,
+      nowMs,
+    });
+
+    expect(Object.keys(attestation)).toHaveLength(11);
+    expect(attestation).toMatchObject({
+      version: 1,
+      callSessionId: 'call_owner_1',
+      turnId: 'turn_000004',
+      participantIdentity: 'owner-participant',
+      segmentIds: ['segment_000004'],
+      directlyAddressed: true,
+      source: 'semantic_model',
+      revision: 2,
+    });
+    expect(attestation.expiresAtMs - attestation.issuedAtMs).toBe(30_000);
+    expect(attestation.attestation).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(attestation).not.toHaveProperty('utterance');
+    expect(attestation).not.toHaveProperty('utteranceDigest');
+    expect(verifyVoiceEngagementAttestation(attestation, { nowMs: nowMs + 1, utterance })).toBe(
+      true,
+    );
+
+    for (const forged of [
+      { ...attestation, callSessionId: 'another_call' },
+      { ...attestation, turnId: 'turn_000005' },
+      { ...attestation, participantIdentity: 'guest-participant' },
+      { ...attestation, segmentIds: ['another_segment'] },
+      { ...attestation, directlyAddressed: false },
+      { ...attestation, source: 'browser' },
+      { ...attestation, revision: attestation.revision + 1 },
+      { ...attestation, attestation: 'A'.repeat(43) },
+    ]) {
+      expect(verifyVoiceEngagementAttestation(forged, { nowMs: nowMs + 1, utterance })).toBe(false);
+    }
+    expect(
+      verifyVoiceEngagementAttestation(attestation, {
+        nowMs: attestation.expiresAtMs,
+        utterance,
+      }),
+    ).toBe(false);
+  });
+
+  test('voice engagement attestation also authenticates a negative semantic decision', () => {
+    const nowMs = 1787659200000;
+    const utterance = 'A private ambient statement.';
+    const attestation = createVoiceEngagementAttestation({
+      callSessionId: 'call_owner_1',
+      turnId: 'turn_000006',
+      participantIdentity: 'owner-participant',
+      segmentIds: ['segment_000006'],
+      directlyAddressed: false,
+      revision: 1,
+      utterance,
+      nowMs,
+    });
+
+    expect(attestation.directlyAddressed).toBe(false);
+    expect(verifyVoiceEngagementAttestation(attestation, { nowMs: nowMs + 1, utterance })).toBe(
+      true,
+    );
+  });
+
+  test('a gateway transport-secret holder cannot forge a directly addressed owner decision', () => {
+    const nowMs = 1787659200000;
+    const utterance = 'A private ambient statement.';
+    const original = createVoiceEngagementAttestation({
+      callSessionId: 'call_owner_1',
+      turnId: 'turn_000007',
+      participantIdentity: 'owner-participant',
+      segmentIds: ['segment_000007'],
+      directlyAddressed: false,
+      revision: 1,
+      utterance,
+      nowMs,
+    });
+    const forged = { ...original, directlyAddressed: true };
+    const signedValues = [
+      forged.version,
+      forged.callSessionId,
+      forged.turnId,
+      forged.participantIdentity,
+      forged.segmentIds,
+      forged.directlyAddressed,
+      forged.source,
+      forged.revision,
+      forged.issuedAtMs,
+      forged.expiresAtMs,
+      crypto.createHash('sha256').update(utterance, 'utf8').digest('base64url'),
+    ];
+    forged.attestation = crypto
+      .createHmac('sha256', process.env.VIVENTIUM_CALL_SESSION_SECRET)
+      .update(JSON.stringify(signedValues))
+      .digest('base64url');
+
+    expect(verifyVoiceEngagementAttestation(forged, { nowMs: nowMs + 1, utterance })).toBe(false);
+  });
+
+  test('owner approval is signed over the exact canonical spoken utterance', () => {
+    const nowMs = 1787659200000;
+    const utterance = 'Please describe the current worker status.';
+    const attestation = createVoiceEngagementAttestation({
+      callSessionId: 'call_owner_1',
+      turnId: 'turn_000008',
+      participantIdentity: 'owner-participant',
+      segmentIds: ['segment_000008'],
+      directlyAddressed: true,
+      revision: 1,
+      utterance,
+      nowMs,
+    });
+
+    expect(verifyVoiceEngagementAttestation(attestation, { nowMs: nowMs + 1, utterance })).toBe(
+      true,
+    );
+    expect(
+      verifyVoiceEngagementAttestation(attestation, {
+        nowMs: nowMs + 1,
+        utterance: 'Please create an unrelated external reminder.',
+      }),
+    ).toBe(false);
   });
 
   test('dual-reads scoped track state while preserving legacy scalar fail-closed state', async () => {

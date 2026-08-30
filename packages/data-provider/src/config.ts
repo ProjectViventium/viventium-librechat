@@ -322,10 +322,26 @@ export const agentProviderCapabilitySchema = z.object({
   serial_model_fallback: z.boolean().default(false),
   workspace_binding: z.boolean().default(false),
   conversation_session: z.boolean().default(false),
+  /* === VIVENTIUM START ===
+   * Feature: Explicit conversation-provider continuity contracts.
+   * Purpose: Keep time transport, visible-message usage accounting, context admission, persistent
+   * authority, and replay ownership independent instead of inferring all five from session support.
+   * === VIVENTIUM END === */
+  time_context_delivery: z.enum(['developer', 'per_turn_header']).default('developer'),
+  usage_accounting_scope: z
+    .enum(['provider_request', 'visible_message_local'])
+    .default('provider_request'),
+  context_protocol: z.enum(['legacy', 'main_context_v1']).default('legacy'),
+  native_session_authority: z.enum(['none', 'stable_authority_v1']).default('none'),
+  replay_protocol: z
+    .enum(['legacy_message_count', 'replay_decision_v1'])
+    .default('legacy_message_count'),
   native_tools: z.boolean().default(false),
   worker_native_tools: z.boolean().default(false),
   host_tools_transport: z.enum(['broker_mcp']).optional(),
   host_tools: z.array(z.string()).optional().default([]),
+  /** Core-owned top-level orchestration facades for an authenticated conversation orchestrator. */
+  conversation_orchestration_tools: z.array(z.string()).default([]),
   activity_stream: z.boolean().default(false),
   responses_api: z.boolean().default(false),
   messaging_delivery_disposition: z.boolean().default(false),
@@ -913,6 +929,8 @@ export type TStartupConfig = {
   viventiumHealthWhoopEnabled?: boolean;
   /** Operator-level Feelings instrument availability. */
   viventiumFeelingsAvailable?: boolean;
+  /** Dark-release gate for account-wide Parallel work controls and automatic delegation. */
+  viventiumParallelWorkAvailable?: boolean;
   /* === VIVENTIUM START ===
    * Feature: Background follow-up browser-listening parity.
    * Purpose: Expose the canonical Phase B listening window without making it an execution deadline.
@@ -1131,6 +1149,16 @@ export const memorySchema = z.object({
         model: z.string(),
         instructions: z.string().optional(),
         model_parameters: z.record(z.any()).optional(),
+        /* === VIVENTIUM START ===
+         * Preserve an explicitly authorized, foundation-provider-only saved-memory fallback.
+         * === VIVENTIUM END === */
+        fallback: z
+          .object({
+            provider: z.enum(['openai', 'anthropic']),
+            model: z.string().trim().min(1),
+          })
+          .strict()
+          .optional(),
       }),
     ])
     .optional(),

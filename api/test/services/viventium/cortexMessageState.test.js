@@ -1,6 +1,7 @@
 let mockGetMessage;
 let mockGetMessages;
 let mockGetAgent;
+let mockGetCortexInsightDeliveries;
 
 jest.mock('~/models', () => ({
   getMessage: (...args) => mockGetMessage(...args),
@@ -11,12 +12,17 @@ jest.mock('~/models/Agent', () => ({
   getAgent: (...args) => mockGetAgent(...args),
 }));
 
+jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => ({
+  getCortexInsightDeliveriesForParent: (...args) => mockGetCortexInsightDeliveries(...args),
+}));
+
 describe('cortexMessageState', () => {
   beforeEach(() => {
     jest.resetModules();
     mockGetMessage = jest.fn();
     mockGetMessages = jest.fn();
     mockGetAgent = jest.fn().mockResolvedValue(null);
+    mockGetCortexInsightDeliveries = jest.fn().mockResolvedValue([]);
   });
 
   test('returns clean follow-up text with structured Telegram delivery metadata', async () => {

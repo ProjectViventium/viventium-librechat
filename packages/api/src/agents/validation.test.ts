@@ -2,10 +2,66 @@ import { ErrorTypes } from 'librechat-data-provider';
 import type { Agent, TModelsConfig } from 'librechat-data-provider';
 import type { Request, Response } from 'express';
 import {
+  activationConfigSchema,
   agentBaseSchema,
   applyAgentProviderCapabilityDefaults,
+  cortexResultEvidencePolicySchema,
   validateAgentModel,
 } from './validation';
+
+describe('background cortex activation mode validation', () => {
+  it.each(['always', 'disabled'] as const)(
+    'accepts %s mode without classifier-only fields',
+    (mode) => {
+      expect(activationConfigSchema.parse({ enabled: true, mode })).toEqual({
+        enabled: true,
+        mode,
+      });
+    },
+  );
+
+  it('keeps absent mode backward-compatible with classified activation', () => {
+    expect(() =>
+      activationConfigSchema.parse({
+        enabled: true,
+        provider: 'openai',
+        model: 'gpt-5.4',
+        prompt: 'Classify this turn.',
+        confidence_threshold: 0.7,
+        cooldown_ms: 0,
+        max_history: 5,
+      }),
+    ).not.toThrow();
+  });
+
+  it('rejects unknown modes and classified activation without classifier configuration', () => {
+    expect(() => activationConfigSchema.parse({ enabled: true, mode: 'sometimes' })).toThrow();
+    expect(() => activationConfigSchema.parse({ enabled: true, mode: 'classified' })).toThrow(
+      'Classifier provider is required',
+    );
+  });
+});
+
+describe('background cortex result evidence validation', () => {
+  it('accepts a typed non-empty source receipt requirement', () => {
+    expect(
+      cortexResultEvidencePolicySchema.parse({
+        visible_insight_requires: [{ tool: 'file_search', receipt: 'non_empty_sources' }],
+      }),
+    ).toEqual({
+      visible_insight_requires: [{ tool: 'file_search', receipt: 'non_empty_sources' }],
+    });
+  });
+
+  it.each([
+    {},
+    { visible_insight_requires: [] },
+    { visible_insight_requires: [{ tool: '', receipt: 'non_empty_sources' }] },
+    { visible_insight_requires: [{ tool: 'file_search', receipt: 'caller_asserted' }] },
+  ])('rejects an absent, empty, or self-asserted result evidence policy', (policy) => {
+    expect(() => cortexResultEvidencePolicySchema.parse(policy)).toThrow();
+  });
+});
 
 const providerRegistry = {
   'harness-provider': {
@@ -13,6 +69,7 @@ const providerRegistry = {
     workspace_binding: true,
     reviewed_mcp_projection: 'deferred' as const,
     responses_api: false,
+    serial_model_fallback: true,
     default_access: 'full' as const,
     allow_full_access: true,
     models: [
@@ -20,6 +77,11 @@ const providerRegistry = {
         id: 'native:model-a',
         effortChoices: ['low', 'medium'],
         recommendedEffort: 'medium',
+      },
+      {
+        id: 'native:model-b',
+        effortChoices: ['high', 'max'],
+        recommendedEffort: 'max',
       },
     ],
   },
@@ -74,6 +136,58 @@ describe('applyAgentProviderCapabilityDefaults', () => {
     };
 
     expect(applyAgentProviderCapabilityDefaults(selection, providerRegistry)).toEqual(selection);
+  });
+
+  it('validates and preserves a provider-internal serial fallback', () => {
+    const selection = {
+      provider: 'harness-provider',
+      model: 'native:model-a',
+      glasshive_options: {
+        workspace: { mode: 'life' as const },
+        access: 'full' as const,
+        fallback_model: 'native:model-b',
+      },
+    };
+
+    expect(applyAgentProviderCapabilityDefaults(selection, providerRegistry)).toMatchObject({
+      glasshive_options: {
+        fallback_model: 'native:model-b',
+        fallback_reasoning_effort: 'max',
+      },
+    });
+    expect(() =>
+      applyAgentProviderCapabilityDefaults(
+        {
+          ...selection,
+          glasshive_options: { ...selection.glasshive_options, fallback_model: 'native:missing' },
+        },
+        providerRegistry,
+      ),
+    ).toThrow('Unsupported GlassHive fallback model');
+  });
+
+  it('preserves the provider-independent parallel-work declaration', () => {
+    const selection = {
+      provider: 'harness-provider',
+      model: 'native:model-a',
+      glasshive_options: {
+        workspace: { mode: 'life' as const },
+        access: 'full' as const,
+        orchestration: {
+          parallel_available: true,
+          default_mode: 'focused' as const,
+          worker_profile: 'codex-cli' as const,
+          fallback_worker_profile: 'claude-code' as const,
+        },
+      },
+    };
+
+    expect(applyAgentProviderCapabilityDefaults(selection, providerRegistry)).toMatchObject({
+      glasshive_options: { orchestration: selection.glasshive_options.orchestration },
+    });
+    expect(agentBaseSchema.parse(selection)).toMatchObject({
+      glasshive_options: { orchestration: selection.glasshive_options.orchestration },
+    });
   });
 
   it('uses a registry-owned safer workspace default and rejects disallowed full access', () => {

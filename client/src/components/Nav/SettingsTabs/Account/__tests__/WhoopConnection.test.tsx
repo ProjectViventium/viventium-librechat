@@ -32,6 +32,7 @@ const setupStatus = {
   grantedScopes: [],
   coverage: { api: {}, export: {} },
   latestApiRun: null,
+  latestSuccessfulApiRun: null,
   latestExportRun: null,
   manualEvidence: { itemCount: 0, latestAt: null },
   schedule: { state: 'not_configured', configured: false, loaded: false },
@@ -72,6 +73,11 @@ const connectedStatus = {
     finishedAt: '2026-08-10T12:00:00Z',
     itemCount: 51,
   },
+  latestSuccessfulApiRun: {
+    status: 'complete',
+    finishedAt: '2026-08-10T12:00:00Z',
+    itemCount: 51,
+  },
   manualEvidence: { itemCount: 2, latestAt: '2026-08-10T12:00:00Z' },
   schedule: { state: 'active', configured: true, loaded: true },
 };
@@ -85,6 +91,37 @@ describe('WHOOP connection card', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     (useToastContext as jest.Mock).mockReturnValue({ showToast });
+  });
+
+  test('shows an honest loading state before the first WHOOP status is known', async () => {
+    let resolveStatus: ((value: typeof connectedStatus) => void) | undefined;
+    mockGet.mockReturnValueOnce(
+      new Promise<typeof connectedStatus>((resolve) => {
+        resolveStatus = resolve;
+      }) as never,
+    );
+
+    render(<WhoopConnection />);
+
+    expect(screen.getByText('com_ui_whoop_loading')).toBeVisible();
+    expect(screen.queryByText('com_ui_whoop_not_connected')).not.toBeInTheDocument();
+    expect(screen.getByTestId('spinner')).toBeInTheDocument();
+
+    await act(async () => resolveStatus?.(connectedStatus));
+
+    expect(screen.getByText('com_ui_whoop_connected')).toBeVisible();
+    expect(screen.queryByText('com_ui_whoop_loading')).not.toBeInTheDocument();
+  });
+
+  test('keeps an unavailable WHOOP status distinct from a confirmed disconnected account', async () => {
+    mockGet.mockRejectedValueOnce(new Error('Service unavailable'));
+
+    render(<WhoopConnection />);
+
+    expect(await screen.findByText('com_ui_whoop_status_unavailable')).toBeVisible();
+    expect(screen.getByText('com_ui_unavailable')).toBeVisible();
+    expect(screen.queryByText('com_ui_whoop_not_connected')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'com_ui_retry' })).toBeVisible();
   });
 
   test('uses one save-and-connect action, all documented scopes, and manual callback recovery', async () => {
@@ -197,7 +234,12 @@ describe('WHOOP connection card', () => {
           api: Object.fromEntries(
             Object.keys(connectedStatus.coverage.api).map((resource) => [
               resource,
-              { status: recoveryStatus, items: 0 },
+              {
+                ...connectedStatus.coverage.api[
+                  resource as keyof typeof connectedStatus.coverage.api
+                ],
+                status: recoveryStatus,
+              },
             ]),
           ),
         },
@@ -211,11 +253,58 @@ describe('WHOOP connection card', () => {
       render(<WhoopConnection />);
 
       expect(
-        await screen.findByText('com_ui_whoop_error_authorization_failed'),
+        await screen.findByText('com_ui_whoop_error_authorization_reconnect'),
       ).toBeInTheDocument();
+      expect(screen.getByText('51')).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'com_ui_whoop_connect' })).toBeInTheDocument();
     },
   );
+
+  test('does not offer reconnect for a transient provider outage', async () => {
+    mockGet.mockResolvedValue({
+      ...connectedStatus,
+      state: 'degraded',
+      authorizationRecoveryRequired: false,
+      onboarding: null,
+      coverage: {
+        ...connectedStatus.coverage,
+        api: {
+          ...connectedStatus.coverage.api,
+          cycles: { status: 'provider_unavailable', items: 15 },
+          recovery: { status: 'blocked_by_provider_unavailable', items: 14 },
+        },
+      },
+    } as never);
+
+    render(<WhoopConnection />);
+
+    expect(await screen.findByText('com_ui_whoop_error_provider_unavailable')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'com_ui_whoop_connect' })).not.toBeInTheDocument();
+  });
+
+  test('totals the newest successful count independently for each resource family', async () => {
+    mockGet.mockResolvedValue({
+      ...connectedStatus,
+      state: 'degraded',
+      authorizationRecoveryRequired: true,
+      latestSuccessfulApiRun: { status: 'partial', itemCount: 43 },
+      coverage: {
+        ...connectedStatus.coverage,
+        api: {
+          cycles: { status: 'complete', items: 43 },
+          recovery: { status: 'authorization_refresh_failed', items: 40 },
+          sleep: { status: 'blocked_by_authorization_failure', items: 39 },
+          workout: { status: 'blocked_by_authorization_failure', items: 12 },
+          profile: { status: 'blocked_by_authorization_failure', items: 1 },
+          body_measurement: { status: 'blocked_by_authorization_failure', items: 1 },
+        },
+      },
+    } as never);
+
+    render(<WhoopConnection />);
+
+    expect(await screen.findByText('136')).toBeInTheDocument();
+  });
 
   test('keeps one-click reconnect available when a migrated grant has no API run yet', async () => {
     mockGet.mockResolvedValue({

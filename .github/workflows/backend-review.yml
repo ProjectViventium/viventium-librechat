@@ -162,7 +162,13 @@ jobs:
           fi
 
   test-api:
-    name: 'Tests: api'
+    # VIVENTIUM START — bound full-suite Jest memory without skipping API coverage.
+    name: 'Tests: api (${{ matrix.shard }})'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['1/2', '2/2']
+    # VIVENTIUM END
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -187,6 +193,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24.16.0'
+      # VIVENTIUM END
+
+      # VIVENTIUM START — the scheduler integration contract executes its frozen Python runtime.
+      - name: Install uv 0.9.5
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.9.5'
       # VIVENTIUM END
 
       - name: Restore node_modules cache
@@ -232,7 +245,9 @@ jobs:
         run: cp api/test/.env.test.example api/test/.env.test
 
       - name: Run unit tests
-        run: cd api && npm run test:ci
+        # VIVENTIUM START — run one disjoint half and recycle idle workers before heap retention can exhaust CI.
+        run: cd api && npm run test:ci -- --shard=${{ matrix.shard }} --workerIdleMemoryLimit=1GB
+        # VIVENTIUM END
 
   test-data-provider:
     name: 'Tests: data-provider'

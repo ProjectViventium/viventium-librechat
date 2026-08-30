@@ -172,6 +172,28 @@ jest.mock('@librechat/api', () => ({
   isEnabled: () => false,
 }));
 
+jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => ({
+  getCortexInsightDeliveriesForParent: jest.fn().mockResolvedValue([]),
+}));
+
+jest.mock('~/server/services/viventium/noResponseTag', () => {
+  const noResponseTag = '{NTA}';
+  const noResponseOnly = /^\s*\{\s*NTA\s*\}\s*$/i;
+  const trailingNta = /\s*\{\s*NTA\s*\}\s*$/i;
+  const isNoResponseOnly = (text) => typeof text === 'string' && noResponseOnly.test(text);
+  return {
+    NO_RESPONSE_TAG: noResponseTag,
+    isNoResponseOnly,
+    isNoResponseTag: isNoResponseOnly,
+    normalizeNoResponseText: (text) =>
+      isNoResponseOnly(text) ? noResponseTag : typeof text === 'string' ? text : '',
+    stripTrailingNTA: (text) =>
+      typeof text === 'string' && !isNoResponseOnly(text)
+        ? text.replace(trailingNta, '').trimEnd()
+        : text,
+  };
+});
+
 jest.mock('~/db/models', () => ({
   User: {
     findOne: jest.fn(),
@@ -1498,6 +1520,35 @@ describe('/api/viventium/gateway', () => {
     expect(res.statusCode).toBe(409);
     expect(res.body).toEqual({ error: 'channel_binding_changed' });
     expect(res.write).not.toHaveBeenCalled();
+    expect(mockSubscribe).not.toHaveBeenCalled();
+  });
+
+  test("GET stream does not reveal another owner's stream existence", async () => {
+    mockGetJob.mockResolvedValueOnce({ metadata: { userId: 'other-owner' } });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const query = { channel: 'discord', accountId: 'acct-1', externalUserId: 'ext-1' };
+    const headers = signedGatewayHeaders({
+      secret: 'gateway_secret',
+      method: 'GET',
+      path: '/api/viventium/gateway/stream/foreign-stream',
+      body: {},
+    });
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/gateway/stream/foreign-stream?channel=discord&accountId=acct-1&externalUserId=ext-1',
+      headers,
+      query,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toEqual({
+      error: 'Stream not found',
+      message: 'The generation job does not exist or has expired.',
+    });
     expect(mockSubscribe).not.toHaveBeenCalled();
   });
 

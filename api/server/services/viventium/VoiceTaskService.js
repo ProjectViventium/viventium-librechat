@@ -7,6 +7,11 @@
 const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
 const { ViventiumVoiceTask, ViventiumVoiceTaskSuppression } = require('~/db/models');
+const {
+  currentGlassHiveTerminalCallbackTransaction,
+  deferGlassHiveTerminalCallbackAfterAbort,
+  deferGlassHiveTerminalCallbackAfterCommit,
+} = require('./GlassHiveTerminalCallbackTransaction');
 
 const TERMINAL_STATES = new Set([
   'completed',
@@ -298,8 +303,13 @@ function scheduleTaskPersistenceDrain() {
 
 function queueTaskPersistence(task) {
   if (!task || !persistenceAvailable(ViventiumVoiceTask)) return Promise.resolve();
+  pendingTaskPersistence.set(task.taskId, taskPersistenceEntry(task));
+  return scheduleTaskPersistenceDrain();
+}
+
+function taskPersistenceEntry(task) {
   const payload = serializeTask(task);
-  pendingTaskPersistence.set(task.taskId, {
+  return {
     taskId: task.taskId,
     callSessionId: task.callSessionId,
     userId: task.userId,
@@ -307,8 +317,7 @@ function queueTaskPersistence(task) {
     sequence: task.sequence,
     payload,
     expiresAt: new Date(task.expiresAtMs),
-  });
-  return scheduleTaskPersistenceDrain();
+  };
 }
 
 async function flushVoiceTaskPersistence() {
@@ -959,20 +968,61 @@ function nextEvent(task, fields) {
 }
 
 function publishTaskEvent(task, event) {
-  for (const listener of subscribers.get(task.taskId) || []) {
-    listener(event);
-  }
-  for (const listener of callSubscribers.get(task.callSessionId) || []) {
-    try {
-      listener(event);
-    } catch {
-      logger.warn('[VIVENTIUM][VoiceTask] call_subscriber_delivery_failed', {
-        callSessionId: task.callSessionId,
-        taskId: task.taskId,
-      });
+  const publish = () => {
+    for (const listener of subscribers.get(task.taskId) || []) {
+      try {
+        listener(event);
+      } catch {
+        logger.warn('[VIVENTIUM][VoiceTask] task_subscriber_delivery_failed', {
+          callSessionId: task.callSessionId,
+          taskId: task.taskId,
+          eventSequence: event.sequence,
+          durableReplayAvailable: true,
+        });
+      }
     }
+    for (const listener of callSubscribers.get(task.callSessionId) || []) {
+      try {
+        listener(event);
+      } catch {
+        logger.warn('[VIVENTIUM][VoiceTask] call_subscriber_delivery_failed', {
+          callSessionId: task.callSessionId,
+          taskId: task.taskId,
+        });
+      }
+    }
+  };
+  const deferred = deferGlassHiveTerminalCallbackAfterCommit(publish);
+  if (!deferred) {
+    publish();
+    void queueTaskPersistence(task);
   }
-  void queueTaskPersistence(task);
+}
+
+async function runVoiceTaskTerminalCallbackMutation(taskId, operation) {
+  const task = tasks.get(String(taskId || ''));
+  if (!task || typeof operation !== 'function') return null;
+  if (!currentGlassHiveTerminalCallbackTransaction()) return operation();
+
+  const snapshot = serializeTask(task);
+  const adapterKey = ownerAdapterKey(task.owner?.kind, task.taskId);
+  const adapter = adapterKey ? ownerAdapters.get(adapterKey) : undefined;
+  const tombstone = suppressionTombstones.get(task.taskId);
+  deferGlassHiveTerminalCallbackAfterAbort(() => {
+    const restored = restoreTask(snapshot);
+    if (restored) tasks.set(restored.taskId, restored);
+    if (adapterKey) {
+      if (adapter) ownerAdapters.set(adapterKey, adapter);
+      else ownerAdapters.delete(adapterKey);
+    }
+    if (tombstone) suppressionTombstones.set(task.taskId, tombstone);
+    else suppressionTombstones.delete(task.taskId);
+  });
+  const result = await operation();
+  if (persistenceAvailable(ViventiumVoiceTask)) {
+    await persistVoiceTaskBatch([taskPersistenceEntry(task)]);
+  }
+  return result;
 }
 
 function createVoiceTask({
@@ -2066,7 +2116,11 @@ function observeGenerationEvent(taskId, generationEvent) {
   }
   const data =
     generationEvent?.data && typeof generationEvent.data === 'object' ? generationEvent.data : {};
-  const ownerEventId = safeText(data.id || data.runId || data.eventId, 160);
+  const toolResult = data?.result && typeof data.result === 'object' ? data.result : null;
+  const ownerEventId = safeText(
+    data.id || data.runId || data.eventId || toolResult?.id || toolResult?.tool_call?.id,
+    160,
+  );
   const observedKey = ownerEventId
     ? [eventType, ownerEventId, safeText(data.status, 80)].join(':')
     : '';
@@ -2084,9 +2138,9 @@ function observeGenerationEvent(taskId, generationEvent) {
     const toolCalls = Array.isArray(data?.stepDetails?.tool_calls)
       ? data.stepDetails.tool_calls
       : [];
-    const toolName = toolCalls
-      .map((call) => safeText(call?.function?.name || call?.name, 160))
-      .find(Boolean);
+    const toolName =
+      toolCalls.map((call) => safeText(call?.function?.name || call?.name, 160)).find(Boolean) ||
+      safeText(toolResult?.tool_call?.name, 160);
     return nextEvent(task, {
       type: 'progress',
       phase: eventType === 'on_run_step_completed' ? 'tool_completed' : 'tool',
@@ -2746,6 +2800,7 @@ module.exports = {
   requestVoiceTaskOwnerCancellation,
   resetVoiceTasksForTests,
   retryVoiceTask,
+  runVoiceTaskTerminalCallbackMutation,
   setVoiceTaskOwnerCapabilities,
   submitVoiceTaskInput,
   settleVoiceTaskCancellation,

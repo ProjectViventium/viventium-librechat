@@ -18,10 +18,13 @@ export type {
   InteractionDeliveryAck,
   DeliveryAcknowledgementResult,
   DeliveryAcknowledgementState,
+  CortexPresentationBinding,
+  CortexPresentationFenceReceipt,
 } from './interfaces/IJobStore';
 
 export { createStreamServices } from './createStreamServices';
 export type { StreamServicesConfig, StreamServices } from './createStreamServices';
+export { initializeStreamServicesBeforeTraffic } from './initializeStreamServicesBeforeTraffic';
 
 // Implementations (for advanced use cases)
 export { InMemoryJobStore } from './implementations/InMemoryJobStore';

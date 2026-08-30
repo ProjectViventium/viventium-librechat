@@ -57,6 +57,11 @@ const feelings = require('./feelings');
 /* === VIVENTIUM START === Connected Channels administration === */
 const channels = require('./channels');
 /* === VIVENTIUM END === */
+/* === VIVENTIUM START === Account-wide Parallel Work and owner-scoped trace routes. === */
+const orchestration = require('./orchestration');
+const orchestrationTrace = require('./orchestrationTrace');
+const personalAccountCleanup = require('./personalAccountCleanup');
+/* === VIVENTIUM END === */
 
 const router = express.Router();
 
@@ -81,5 +86,8 @@ router.use('/prompt-workbench', promptWorkbench);
 router.use('/health/whoop', healthWhoop);
 router.use('/feelings', feelings);
 router.use('/channels', channels);
+router.use('/orchestration-traces', orchestrationTrace);
+router.use('/personal-account-cleanup', personalAccountCleanup);
+router.use('/orchestration', orchestration);
 
 module.exports = router;

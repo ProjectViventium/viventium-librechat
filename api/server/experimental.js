@@ -18,8 +18,7 @@ const {
   ErrorController,
   performStartupChecks,
   handleJsonParseError,
-  GenerationJobManager,
-  createStreamServices,
+  initializeStreamServicesBeforeTraffic,
   initializeFileStorage,
 } = require('@librechat/api');
 const { connectDb, indexSync } = require('~/db');
@@ -434,7 +433,7 @@ if (cluster.isMaster) {
     app.use(ErrorController);
 
     /** Start listening on shared port (cluster will distribute connections) */
-    app.listen(port, host, async (err) => {
+    const onServerListening = async (err) => {
       if (err) {
         logger.error(`Worker ${process.pid} failed to start server:`, err);
         process.exit(1);
@@ -474,9 +473,7 @@ if (cluster.isMaster) {
             logger.error('[staleCortexMessageRecovery] Startup recovery failed:', error);
           });
         }
-        const streamServices = createStreamServices();
-        GenerationJobManager.configure(streamServices);
-        GenerationJobManager.initialize();
+        // Stream persistence is fully initialized before the listener opens.
         upgradeFinalization.recordCompleted('generation-runtime-ready');
         upgradeFinalization.markReady();
       } catch (startupError) {
@@ -496,7 +493,13 @@ if (cluster.isMaster) {
         return;
       }
       /* === VIVENTIUM END === */
-    });
+    };
+    const admitTraffic = () => app.listen(port, host, onServerListening);
+    if (quiescedApiStartup) {
+      admitTraffic();
+    } else {
+      await initializeStreamServicesBeforeTraffic({ admitTraffic });
+    }
 
     /** Handle inter-process messages from master */
     process.on('message', async (msg) => {

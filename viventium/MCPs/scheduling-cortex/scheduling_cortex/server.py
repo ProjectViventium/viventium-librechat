@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -46,7 +46,7 @@ from .glasshive_workspace_schedules import (
     GlassHiveWorkspaceScheduleService,
     WorkspaceScheduleError,
 )
-from .storage import ScheduleStorage, StorageConfig
+from .storage import ScheduleStorage, StorageConfig, scheduled_prompt_stale_seconds
 from .utils import to_utc_iso
 
 DEFAULT_PORT = 7010
@@ -55,16 +55,50 @@ HEADER_AGENT_ID = "x-viventium-agent-id"
 
 logger = logging.getLogger(__name__)
 
+ISOLATED_ARTIFACT_RETRYABLE_ERRORS = {
+    "isolated_artifact_pair_missing",
+    "isolated_artifact_listing_truncated",
+    "isolated_artifact_import_failed",
+    "isolated_artifact_import_context_missing",
+}
+
+
+def _glasshive_callback_reconciliation_allowed(run: dict[str, Any], event: str) -> bool:
+    """Allow signed late completion to repair only synthetic terminal failures."""
+
+    current_status = str(run.get("status") or "queued")
+    if current_status not in {"completed", "failed"}:
+        return True
+    error_class = str(run.get("error_class") or "")
+    return current_status == "failed" and event == "run.completed" and (
+        error_class == "stale_run_reconciled"
+        or error_class in ISOLATED_ARTIFACT_RETRYABLE_ERRORS
+    )
+
 
 def _glasshive_callback_lifecycle(
-    run: dict[str, Any], event: str, payload: dict[str, Any], now: str
+    run: dict[str, Any],
+    event: str,
+    payload: dict[str, Any],
+    now: str,
+    *,
+    authoritative_terminal: bool = False,
 ) -> tuple[str, str, Optional[str], Optional[str]]:
     """Apply monotonic callback state so late transport events cannot reopen terminal work."""
 
     current_status = str(run.get("status") or "queued")
     current_disposition = str(run.get("disposition") or "running")
-    if current_status in {"completed", "failed"}:
-        return current_status, current_disposition, run.get("completed_at"), run.get("error_class")
+    if (
+        current_status in {"completed", "failed"}
+        and not authoritative_terminal
+        and not _glasshive_callback_reconciliation_allowed(run, event)
+    ):
+        return (
+            current_status,
+            current_disposition,
+            run.get("completed_at"),
+            run.get("error_class"),
+        )
     if event == "run.completed":
         return "completed", "delivered", now, None
     if event in {"run.failed", "run.cancelled", "run.interrupted"}:
@@ -86,10 +120,10 @@ def _glasshive_callback_lifecycle(
             run.get("completed_at"),
             run.get("error_class") if status != "queued" else None,
         )
-    if event == "run.waiting_on_capacity":
-        return "queued", "running", None, None
-    if event in {"run.started", "run.requeued"}:
-        return "running", "running", run.get("completed_at"), None
+    if event in {"run.waiting_on_capacity", "run.requeued"}:
+        return "queued", "running", run.get("completed_at"), None
+    if event == "run.started":
+        return "running", "running", run.get("completed_at"), run.get("error_class")
     return current_status, current_disposition, run.get("completed_at"), run.get("error_class")
 
 
@@ -170,6 +204,12 @@ What it does:
 - Create, update, delete, list, search, inspect, and preview schedules.
 - Run schedules later through the configured Viventium agent and channels.
 - Track last delivery state, including sent, suppressed, failed, and generated text summaries.
+
+Execution ownership:
+
+- executor="viventium_agent" always reloads the persisted Main Agent configuration from Agent Builder at run time, including its configured fallback. The schedule does not own or override provider, model, reasoning effort, GlassHive options, tools, or fallback policy.
+- glasshive_host is a separate explicit Workbench executor with its own declared worker profile. Use it only when the schedule is intentionally a Workbench-hosted automation, not as an alias for the Viventium Main Agent.
+- Never copy a Main Agent model into schedule metadata or infer execution policy from prompt text, task names, agent names, or user identity.
 
 When to use:
 
@@ -598,6 +638,82 @@ def build_health_payload(storage: ScheduleStorage) -> Dict[str, Any]:
     }
 
 
+EXTERNAL_WORK_TERMINAL_CALLBACK_CONTRACT = "glasshive_terminal_result_v1"
+
+
+def _external_work_terminal_flag(summary: dict[str, Any]) -> bool:
+    if "allRequiredTerminal" in summary:
+        value = summary["allRequiredTerminal"]
+    elif "all_required_terminal" in summary:
+        value = summary["all_required_terminal"]
+    else:
+        raise ValueError("missing_all_required_terminal")
+    if type(value) is not bool:
+        raise ValueError("invalid_all_required_terminal")
+    return value
+
+
+def _external_work_callback_updates(
+    run: dict[str, Any], summary: dict[str, Any], now: str
+) -> dict[str, Any]:
+    def count(camel: str, snake: str) -> int:
+        try:
+            return max(0, int(summary.get(camel) or summary.get(snake) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    required_total = count("requiredTotal", "required_total")
+    required_terminal = count("requiredTerminal", "required_terminal")
+    required_failed = count("requiredFailed", "required_failed")
+    all_required_terminal = _external_work_terminal_flag(summary)
+    canonical = {
+        "requiredTotal": required_total,
+        "requiredTerminal": required_terminal,
+        "requiredFailed": required_failed,
+        "allRequiredTerminal": all_required_terminal,
+        "state": str(summary.get("state") or "").strip()
+        or ("completed" if all_required_terminal else "waiting_external"),
+    }
+    execution = (
+        dict(run.get("execution_snapshot"))
+        if isinstance(run.get("execution_snapshot"), dict)
+        else {}
+    )
+    execution["external_work"] = canonical
+    updates: dict[str, Any] = {"execution_snapshot": execution, "updated_at": now}
+    if required_total > 0 and not all_required_terminal:
+        lease_owner = str(run.get("lease_owner") or "").strip()
+        lease_updates: dict[str, Any] = {}
+        if lease_owner:
+            now_dt = datetime.fromisoformat(str(now).replace("Z", "+00:00"))
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=timezone.utc)
+            lease_updates = {
+                "lease_owner": lease_owner,
+                "lease_until": (
+                    now_dt.astimezone(timezone.utc)
+                    + timedelta(seconds=scheduled_prompt_stale_seconds())
+                ).isoformat().replace("+00:00", "Z"),
+            }
+        return {
+            **updates,
+            **lease_updates,
+            "status": "waiting_external",
+            "disposition": "running",
+            "completed_at": None,
+            "error_class": None,
+        }
+    if required_total > 0:
+        return {
+            **updates,
+            "status": "failed" if required_failed else "completed",
+            "disposition": "failed" if required_failed else "delivered",
+            "completed_at": now,
+            "error_class": "required_external_work_failed" if required_failed else None,
+        }
+    return updates
+
+
 def build_server(storage: ScheduleStorage) -> FastMCP:
     mcp = FastMCP(name="scheduling-cortex", instructions=SCHEDULING_CORTEX_INSTRUCTIONS)
     glasshive_workspace_schedules = GlassHiveWorkspaceScheduleService(storage)
@@ -607,6 +723,233 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     async def health(_: Request) -> Response:
         return JSONResponse(build_health_payload(storage))
     # VIVENTIUM NOTE
+
+    @mcp.custom_route("/internal/scheduled-prompts/external-work-callback", methods=["POST"])
+    async def external_work_callback(request: Request) -> Response:
+        expected_secret = str(
+            os.getenv("VIVENTIUM_SCHEDULER_SECRET")
+            or os.getenv("SCHEDULER_LIBRECHAT_SECRET")
+            or ""
+        ).strip()
+        provided_secret = str(
+            request.headers.get("x-viventium-scheduler-secret", "")
+        ).strip()
+        if not expected_secret or not hmac.compare_digest(provided_secret, expected_secret):
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_scheduler_secret"},
+                status_code=401,
+            )
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_json"}, status_code=400
+            )
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_payload"}, status_code=400
+            )
+        callback_contract = str(payload.get("callback_contract") or "").strip()
+        header_contract = str(
+            request.headers.get("x-viventium-callback-contract", "")
+        ).strip()
+        body_identity = any(
+            field in payload for field in ("callback_id", "result_revision", "result_digest")
+        )
+        header_identity = any(
+            request.headers.get(header)
+            for header in (
+                "x-viventium-callback-id",
+                "x-viventium-result-revision",
+                "x-viventium-result-digest",
+            )
+        )
+        terminal_sender = bool(callback_contract or header_contract or body_identity or header_identity)
+        if terminal_sender and (
+            callback_contract != EXTERNAL_WORK_TERMINAL_CALLBACK_CONTRACT
+            or header_contract != EXTERNAL_WORK_TERMINAL_CALLBACK_CONTRACT
+        ):
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_terminal_contract"},
+                status_code=400,
+            )
+        callback_id = str(payload.get("callback_id") or "").strip()
+        result_digest = str(payload.get("result_digest") or "").strip()
+        result_revision = payload.get("result_revision")
+        if terminal_sender and (
+            not callback_id
+            or not result_digest
+            or not isinstance(result_revision, int)
+            or isinstance(result_revision, bool)
+            or str(request.headers.get("x-viventium-callback-id", "")).strip()
+            != callback_id
+            or str(request.headers.get("x-viventium-result-digest", "")).strip()
+            != result_digest
+            or str(request.headers.get("x-viventium-result-revision", "")).strip()
+            != str(result_revision)
+        ):
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_terminal_identity"},
+                status_code=400,
+            )
+        occurrence_key = str(payload.get("occurrence_key") or "").strip()
+        user_id = str(payload.get("user_id") or "").strip()
+        if not occurrence_key or not user_id:
+            return JSONResponse(
+                {"status": "error", "reason": "missing_occurrence_owner"},
+                status_code=400,
+            )
+        run = storage.get_scheduled_prompt_run_by_occurrence_key(occurrence_key)
+        if not run:
+            return JSONResponse(
+                {"status": "error", "reason": "unknown_occurrence"}, status_code=404
+            )
+        if str(run.get("user_id") or "") != user_id:
+            return JSONResponse(
+                {"status": "error", "reason": "owner_mismatch"}, status_code=403
+            )
+        try:
+            all_required_terminal = _external_work_terminal_flag(payload)
+        except ValueError as error:
+            return JSONResponse(
+                {"status": "error", "reason": str(error)}, status_code=400
+            )
+        source = str(payload.get("source") or "").strip().lower()
+        event = str(payload.get("event") or "").strip().lower()
+        state = str(payload.get("state") or "").strip().lower()
+        terminal_intent = bool(
+            event in {"run.completed", "run.failed", "run.cancelled"}
+            or state in {"completed", "failed", "cancelled"}
+            or all_required_terminal
+        )
+        glasshive_source = bool(
+            source in {"glasshive", "glasshive_host"}
+            or str(run.get("executor") or "").strip().lower() == "glasshive_host"
+        )
+        if terminal_intent and glasshive_source and not terminal_sender:
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_terminal_identity"},
+                status_code=400,
+            )
+
+        if not terminal_sender:
+            if terminal_intent or glasshive_source:
+                return JSONResponse(
+                    {"status": "error", "reason": "legacy_callback_not_allowed"},
+                    status_code=400,
+                )
+            updates = _external_work_callback_updates(
+                run, payload, datetime.now(timezone.utc).isoformat()
+            )
+            applied = storage.update_scheduled_prompt_run_if_current(
+                str(run["run_id"]),
+                updates,
+                expected_status=str(run.get("status") or ""),
+                expected_error_class=run.get("error_class"),
+            )
+            if not applied.get("updated"):
+                return JSONResponse(
+                    {"status": "error", "reason": "legacy_callback_superseded"},
+                    status_code=409,
+                )
+            return JSONResponse(
+                {
+                    "status": "http_accepted",
+                    "run_id": str(run["run_id"]),
+                    "occurrence_status": (applied.get("run") or {}).get("status"),
+                    "callback_status": "legacy_accepted",
+                }
+            )
+
+        try:
+            decision = storage.accept_scheduled_terminal_callback_result(
+                owner_id=user_id,
+                work_id=str(run["run_id"]),
+                payload=payload,
+                callback_contract=EXTERNAL_WORK_TERMINAL_CALLBACK_CONTRACT,
+            )
+        except ValueError:
+            return JSONResponse(
+                {"status": "error", "reason": "invalid_terminal_identity"},
+                status_code=400,
+            )
+
+        def terminal_response(status_code: int, persisted: bool) -> JSONResponse:
+            return JSONResponse(
+                {
+                    "status": "http_accepted" if status_code < 300 else "error",
+                    "run_id": str(run["run_id"]),
+                    "occurrence_status": run.get("status"),
+                    "callback_persisted": persisted,
+                    "callback_status": str(decision.get("callback_status") or ""),
+                    "callback_id": str(decision.get("callback_id") or ""),
+                    "result_revision": decision.get("result_revision"),
+                    "result_digest": str(decision.get("result_digest") or ""),
+                    "current_result_revision": decision.get("current_result_revision"),
+                    "current_result_digest": str(decision.get("current_result_digest") or ""),
+                    "current_callback_id": str(decision.get("current_callback_id") or ""),
+                },
+                status_code=status_code,
+            )
+
+        callback_status = str(decision.get("callback_status") or "")
+        if callback_status in {"superseded", "conflict"}:
+            return terminal_response(409, False)
+        if callback_status == "effects_in_progress":
+            return terminal_response(425, False)
+        if callback_status == "idempotent":
+            return terminal_response(200, False)
+        effect_lease = storage.claim_scheduled_terminal_callback_effect(
+            owner_id=user_id,
+            work_id=str(run["run_id"]),
+            result_revision=int(decision["result_revision"]),
+            result_digest=str(decision["result_digest"]),
+        )
+        if not effect_lease.get("claimed"):
+            return terminal_response(425, False)
+        lease_token = str(effect_lease["lease_token"])
+        if not storage.scheduled_terminal_callback_effect_is_current(
+            owner_id=user_id,
+            work_id=str(run["run_id"]),
+            result_revision=int(decision["result_revision"]),
+            result_digest=str(decision["result_digest"]),
+            lease_token=lease_token,
+        ):
+            return terminal_response(409, False)
+        updates = _external_work_callback_updates(
+            run, payload, datetime.now(timezone.utc).isoformat()
+        )
+        applied = storage.update_scheduled_prompt_run_if_current(
+            str(run["run_id"]),
+            updates,
+            expected_status=str(run.get("status") or ""),
+            expected_error_class=run.get("error_class"),
+        )
+        if not applied.get("updated"):
+            storage.release_scheduled_terminal_callback_effect(
+                owner_id=user_id,
+                work_id=str(run["run_id"]),
+                result_revision=int(decision["result_revision"]),
+                result_digest=str(decision["result_digest"]),
+                lease_token=lease_token,
+            )
+            return JSONResponse(
+                {"status": "error", "reason": "callback_effect_not_persisted"},
+                status_code=503,
+            )
+        if not storage.complete_scheduled_terminal_callback_effect(
+            owner_id=user_id,
+            work_id=str(run["run_id"]),
+            result_revision=int(decision["result_revision"]),
+            result_digest=str(decision["result_digest"]),
+            lease_token=lease_token,
+        ):
+            return JSONResponse(
+                {"status": "error", "reason": "callback_effect_lost"}, status_code=503
+            )
+        decision = {**decision, "callback_status": "accepted"}
+        run = applied.get("run") or run
+        return terminal_response(200, True)
 
     # === VIVENTIUM START ===
     # Feature: Signed GlassHive completion callback for Workbench scheduled prompts.
@@ -812,6 +1155,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
 
         now = _now_iso()
         terminal_before_callback = str(run.get("status") or "") in {"completed", "failed"}
+        callback_reconciliation_allowed = _glasshive_callback_reconciliation_allowed(run, event)
         status, disposition, completed_at, error_class = _glasshive_callback_lifecycle(
             run, event, payload, now
         )
@@ -852,7 +1196,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             else None,
         }
 
-        if not terminal_before_callback:
+        if not terminal_before_callback or callback_reconciliation_allowed:
             storage.update_scheduled_prompt_run(
                 str(run["run_id"]),
                 {
@@ -1102,6 +1446,8 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
                 "prompt, schedule, optional channel, conversation_policy, active, metadata. "
                 "schedule.type is required; for one-time work use "
                 "{'type': 'once', 'run_at': '<ISO datetime>', 'timezone': '<IANA timezone>'}. "
+                "Use viventium_agent for ordinary schedules; glasshive_host is reserved for "
+                "Prompt Workbench-owned schedules. "
                 "user_id, agent_id, and created_by are auto-injected when omitted."
             ),
             returns="success, full task object, and creation message.",
@@ -1119,6 +1465,13 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     def schedule_create(args: CreateScheduleArgs) -> Dict[str, Any]:
         now = datetime.now(timezone.utc)
         schedule = args.schedule.model_dump()
+        if args.executor == "glasshive_host" and not isinstance(
+            (args.metadata or {}).get("workbench_scheduled_prompt"), dict
+        ):
+            raise ValueError(
+                "glasshive_host is reserved for Prompt Workbench schedules; "
+                "use viventium_agent for an ordinary scheduled request"
+            )
         user_id = _resolve_user_id(args.user_id)
         agent_id = _resolve_agent_id(args.agent_id)
         request_agent_id = _resolve_request_agent_id(fallback=agent_id)
@@ -1327,8 +1680,9 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             schedule = args.schedule.model_dump()
 
         now = datetime.now(timezone.utc)
-        next_run = compute_next_run(schedule, now, None) if schedule else None
-        if schedule and schedule.get("type") == "once" and not next_run:
+        must_validate_future = args.schedule is not None or args.active is True
+        next_run = compute_next_run(schedule, now, None) if schedule and must_validate_future else None
+        if must_validate_future and schedule and schedule.get("type") == "once" and not next_run:
             run_at = schedule.get("run_at") if isinstance(schedule, dict) else None
             raise ValueError(
                 f"run_at {run_at} must be in the future (now: {to_utc_iso(now)})"

@@ -31,9 +31,18 @@ const { Agent, Conversation, File, Message, User } = require('~/db/models');
 const {
   buildRecallDerivedParentIdSet,
   cleanupText,
+  filterSupersededLogicalTurnRevisions,
+  getConversationRecallEligibilityFilter,
   messageUsesConversationRecallSearch,
   shouldSkipRecallMessage,
 } = require('./conversationRecallFilters');
+const {
+  projectVisibleTextFromContentParts,
+  visibleTextSegmentsFromContentParts,
+} = require('./ViventiumVisibleContentProjection');
+const {
+  deferGlassHiveTerminalCallbackAfterCommit,
+} = require('./GlassHiveTerminalCallbackTransaction');
 
 const timers = new Map();
 const pendingConversationSyncByUser = new Map();
@@ -455,7 +464,15 @@ function getMessageText(message) {
     return '';
   }
 
+  const visibleContentSegments = visibleTextSegmentsFromContentParts(message.content);
   const text = cleanupText(message.text);
+  if (visibleContentSegments.length > 1) {
+    const collapsedContentText = cleanupText(visibleContentSegments.join(''));
+    if (!text || text === collapsedContentText) {
+      return cleanupText(projectVisibleTextFromContentParts(message.content));
+    }
+  }
+
   if (text) {
     return text;
   }
@@ -628,7 +645,7 @@ async function buildConversationRecallCorpus({ userId, agentId }) {
       $nin: ['listen_only_transcript', 'voice_ambient_transcript'],
     },
     'metadata.viventium.mode': { $ne: 'listen_only' },
-    'metadata.viventium.memoryEligible': { $ne: false },
+    ...getConversationRecallEligibilityFilter(),
     'metadata.viventium.qaRun': { $ne: true },
     unfinished: { $ne: true },
     error: { $ne: true },
@@ -655,7 +672,9 @@ async function buildConversationRecallCorpus({ userId, agentId }) {
   }
 
   rawMessages.reverse();
-  const orderedMessages = orderRecallMessagesParentFirst(rawMessages);
+  const orderedMessages = orderRecallMessagesParentFirst(
+    filterSupersededLogicalTurnRevisions(rawMessages),
+  );
 
   const recallDerivedParentIds = buildRecallDerivedParentIdSet(orderedMessages);
   const segments = [];
@@ -1134,6 +1153,119 @@ async function refreshConversationRecallForUser({ userId, agentId }) {
   }
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Owner-bound synthetic-QA cleanup recall receipts.
+ * Purpose: Rebuild the normal owner recall artifacts, then bind the exact derived state to a
+ * content-free digest that can be checked again during a delayed cleanup sweep.
+ * === VIVENTIUM END === */
+const CLEANUP_HASH = /^[a-f0-9]{64}$/;
+const CLEANUP_SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
+
+function cleanupCanonicalValue(value) {
+  if (value == null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (Array.isArray(value)) return value.map(cleanupCanonicalValue);
+  if (typeof value === 'object') {
+    return Object.keys(value)
+      .sort()
+      .reduce((result, key) => {
+        if (value[key] !== undefined) result[key] = cleanupCanonicalValue(value[key]);
+        return result;
+      }, {});
+  }
+  return String(value);
+}
+
+function cleanupSha256(value) {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(cleanupCanonicalValue(value)), 'utf8')
+    .digest('hex');
+}
+
+function cleanupTextSha256(value) {
+  return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
+}
+
+function validateCleanupRecallIdentity({ userId, operationId, targetSetSha256 }) {
+  for (const [label, value] of [
+    ['owner', userId],
+    ['operation', operationId],
+  ]) {
+    if (!CLEANUP_SAFE_ID.test(String(value || ''))) {
+      throw new Error(`cleanup_recall_${label}_invalid`);
+    }
+  }
+  if (!CLEANUP_HASH.test(String(targetSetSha256 || ''))) {
+    throw new Error('cleanup_recall_target_set_invalid');
+  }
+}
+
+async function inspectConversationRecallCleanupReceipt({ userId, operationId, targetSetSha256 }) {
+  validateCleanupRecallIdentity({ userId, operationId, targetSetSha256 });
+  const files = await File.find({
+    user: userId,
+    context: FileContext.conversation_recall,
+  })
+    .select('file_id embedded metadata')
+    .sort({ file_id: 1 })
+    .lean();
+  const artifactBindings = files.map((file) => {
+    const sourceDigest = String(
+      file?.metadata?.conversationRecallSourceDigest ||
+        file?.metadata?.conversationRecallDigest ||
+        '',
+    );
+    const uploadedDigest = String(file?.metadata?.conversationRecallUploadedDigest || '');
+    if (
+      !file?.file_id ||
+      file.embedded !== true ||
+      !CLEANUP_HASH.test(sourceDigest) ||
+      !CLEANUP_HASH.test(uploadedDigest)
+    ) {
+      throw new Error('cleanup_recall_artifact_unverified');
+    }
+    return {
+      fileIdSha256: cleanupSha256(String(file.file_id)),
+      sourceDigest,
+      uploadedDigest,
+      reducedUpload: file?.metadata?.conversationRecallUsedReducedUploadWindow === true,
+    };
+  });
+  return {
+    status: 'verified',
+    receiptSha256: cleanupSha256({
+      contractVersion: 1,
+      ownerScopeHash: `sha256:${cleanupTextSha256(userId)}`,
+      operationId,
+      targetSetSha256,
+      artifactBindings,
+    }),
+    artifactCount: artifactBindings.length,
+  };
+}
+
+async function reconcileConversationRecallForCleanup(identity) {
+  validateCleanupRecallIdentity(identity);
+  if (!isConversationRecallInfraEnabled()) {
+    throw new Error('cleanup_recall_infrastructure_unavailable');
+  }
+  await refreshConversationRecallForUser({ userId: identity.userId });
+  return inspectConversationRecallCleanupReceipt(identity);
+}
+
+async function verifyConversationRecallCleanupReceipt({ expectedReceiptSha256, ...identity }) {
+  if (!CLEANUP_HASH.test(String(expectedReceiptSha256 || ''))) {
+    throw new Error('cleanup_recall_receipt_invalid');
+  }
+  const current = await inspectConversationRecallCleanupReceipt(identity);
+  const expected = Buffer.from(expectedReceiptSha256, 'utf8');
+  const actual = Buffer.from(current.receiptSha256, 'utf8');
+  return {
+    verified: expected.length === actual.length && crypto.timingSafeEqual(expected, actual),
+  };
+}
+
 async function syncConversationRecallForConversation({ userId, conversationId }) {
   if (!isConversationRecallInfraEnabled() || !conversationId) {
     return;
@@ -1254,8 +1386,11 @@ function scheduleConversationRecallSync({ userId, conversationId }) {
     return;
   }
 
-  enqueueConversationSync({ userId, conversationId });
-  scheduleTask(getSyncKey(userId), () => runQueuedConversationSync(userId));
+  const schedule = () => {
+    enqueueConversationSync({ userId, conversationId });
+    scheduleTask(getSyncKey(userId), () => runQueuedConversationSync(userId));
+  };
+  if (!deferGlassHiveTerminalCallbackAfterCommit(schedule)) schedule();
 }
 
 function scheduleConversationRecallRefresh({ userId, agentId }) {
@@ -1275,5 +1410,8 @@ module.exports = {
   shouldSkipFromRecallCorpus,
   orderRecallMessagesParentFirst,
   refreshConversationRecallForUser,
+  inspectConversationRecallCleanupReceipt,
+  reconcileConversationRecallForCleanup,
+  verifyConversationRecallCleanupReceipt,
   syncConversationRecallForConversation,
 };

@@ -742,6 +742,144 @@ describe('getOpenAIConfig', () => {
     }
   });
 
+  it('reports the exact normalized native Codex request only after provider acceptance', async () => {
+    const originalFetch = globalThis.fetch;
+    const mockFetch = jest.fn().mockResolvedValue(new Response('accepted', { status: 200 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    const nativeProviderRequestAccepted = jest.fn();
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, {
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+        nativeProviderRequestAccepted,
+      });
+      await result.configOptions?.fetch?.('https://chatgpt.com/backend-api/codex/responses', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'gpt-5.6-sol',
+          instructions: 'exact final Main instructions',
+          input: [{ type: 'message', role: 'user', content: 'hello' }],
+          stream: true,
+        }),
+      });
+
+      expect(nativeProviderRequestAccepted).toHaveBeenCalledTimes(1);
+      expect(nativeProviderRequestAccepted).toHaveBeenCalledWith({
+        provider: 'openai',
+        model: 'gpt-5.6-sol',
+        status: 200,
+        request: expect.objectContaining({
+          instructions: 'exact final Main instructions',
+          store: false,
+          stream: true,
+        }),
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('does not report a native Codex request when the provider rejects it', async () => {
+    const originalFetch = globalThis.fetch;
+    const mockFetch = jest.fn().mockResolvedValue(new Response('limited', { status: 429 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    const nativeProviderRequestAccepted = jest.fn();
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, {
+        reverseProxyUrl: 'https://chatgpt.com/backend-api/codex',
+        nativeProviderRequestAccepted,
+      });
+      await result.configOptions?.fetch?.('https://chatgpt.com/backend-api/codex/responses', {
+        method: 'POST',
+        body: JSON.stringify({ model: 'gpt-5.6-sol', input: [], stream: true }),
+      });
+      expect(nativeProviderRequestAccepted).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('reports a strict GlassHive native-authority receipt when SDK default headers are not visible to fetch', async () => {
+    const originalFetch = globalThis.fetch;
+    const instructions = [
+      'Exact final Main instructions.',
+      '<viventium_feeling_state>steady</viventium_feeling_state>',
+    ].join('\n\n');
+    const authoritySha256 = require('crypto')
+      .createHash('sha256')
+      .update(instructions, 'utf8')
+      .digest('hex');
+    const terminal = {
+      id: 'request-synthetic',
+      object: 'chat.completion.chunk',
+      model: 'codex-cli:gpt-5.6-sol',
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      glasshive: {
+        native_provider_authority_receipt: {
+          protocol: 'glasshive.native_provider_authority_receipt.v1',
+          run_id: 'run-synthetic',
+          runtime: 'codex-cli',
+          model: 'gpt-5.6-terra',
+          authority_sha256: authoritySha256,
+          authority_chars: Array.from(instructions).length,
+          feeling_capsule_count: 1,
+          placement: 'codex_developer_instructions',
+          materialized: true,
+        },
+      },
+    };
+    const body = [
+      'data: ' + JSON.stringify({ choices: [{ delta: { content: 'ok' } }] }),
+      'data: ' + JSON.stringify(terminal),
+      'data: [DONE]',
+      '',
+    ].join('\n\n');
+    const mockFetch = jest.fn().mockResolvedValue(
+      new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    );
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    const nativeProviderRequestAccepted = jest.fn();
+
+    try {
+      const result = getOpenAIConfig(mockApiKey, { nativeProviderRequestAccepted });
+      const response = await result.configOptions?.fetch?.(
+        'http://127.0.0.1:8766/v1/chat/completions',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            model: 'codex-cli:gpt-5.6-sol',
+            stream: true,
+            messages: [
+              { role: 'system', content: instructions },
+              { role: 'user', content: 'private user text' },
+            ],
+          }),
+        },
+      );
+      expect(await response?.text()).toBe(body);
+      expect(nativeProviderRequestAccepted).toHaveBeenCalledTimes(1);
+      expect(nativeProviderRequestAccepted).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: 'glasshive',
+          model: 'gpt-5.6-terra',
+          status: 200,
+          instructionAuthority: instructions,
+          nativeRequestSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+          authorityReceipt: terminal.glasshive.native_provider_authority_receipt,
+        }),
+      );
+      expect(JSON.stringify(nativeProviderRequestAccepted.mock.calls)).not.toContain(
+        'private user text',
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('should preserve the original Codex 401 when connected-account refresh fails', async () => {
     const originalFetch = globalThis.fetch;
     const mockFetch = jest.fn().mockResolvedValue(new Response('unauthorized', { status: 401 }));

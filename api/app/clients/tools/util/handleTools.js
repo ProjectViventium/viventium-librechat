@@ -66,6 +66,14 @@ const { canUseViventiumMCPServer } = require('~/server/services/viventium/mcpAud
  */
 const { resolveViventiumSurface } = require('~/server/services/viventium/surfacePrompts');
 const { createViventiumSearchTool } = require('./viventiumSearchTool');
+const { createActiveWorkTools } = require('./activeWorkTools');
+const {
+  availableGlassHiveMainOrchestrationTools,
+  createGlassHiveMainDelegationTool,
+} = require('./glassHiveOrchestrationTools');
+const {
+  DELEGATION_TOOL_NAME,
+} = require('~/server/services/viventium/GlassHiveConversationOrchestration');
 /* === VIVENTIUM END === */
 
 /**
@@ -135,8 +143,15 @@ const validateTools = async (user, tools = []) => {
  * Feature: Surface-aware web search prompt tuning.
  */
 function buildWebSearchContext({ tool, req }) {
-  const now = replaceSpecialVars({ text: '{{iso_datetime}}' });
-  const header = `# \`${tool}\`:\nCurrent Date & Time: ${now}\n\n`;
+  /* === VIVENTIUM START ===
+   * Feature: Stable native-session tool authority.
+   * Purpose: A conversation provider receives current time through its invocation-fresh turn
+   * header. Repeating that changing timestamp inside the persistent tool/developer context made
+   * every turn look like an authority change and needlessly replaced the native worker.
+   * === VIVENTIUM END === */
+  const timeContextIsInvocationLocal = req?.viventiumTimeContextDelivery === 'per_turn_header';
+  const now = timeContextIsInvocationLocal ? '' : replaceSpecialVars({ text: '{{iso_datetime}}' });
+  const header = now ? `# \`${tool}\`:\nCurrent Date & Time: ${now}\n\n` : `# \`${tool}\`:\n\n`;
   const voiceMode = req?.body?.voiceMode === true;
   const surface = resolveViventiumSurface(req);
 
@@ -240,6 +255,10 @@ const loadTools = async ({
   };
 
   const customConstructors = {
+    [Tools.active_work_list]: async () =>
+      createActiveWorkTools({ userId: user, req: options.req }).list,
+    [Tools.active_work_action]: async () =>
+      createActiveWorkTools({ userId: user, req: options.req }).action,
     image_gen_oai: async (toolContextMap) => {
       const authFields = getAuthFields('image_gen_oai');
       const authValues = await loadAuthValues({ userId: user, authFields });
@@ -286,6 +305,15 @@ const loadTools = async ({
   };
 
   const requestedTools = {};
+  const availableMainOrchestrationTools = new Set(
+    availableGlassHiveMainOrchestrationTools(agent, tools, {
+      user: options.req?.user,
+      turnAvailable: options.req?._viventiumParallelWorkTurnAvailable,
+      /* === VIVENTIUM START === Pin the first readiness decision to this request. */
+      req: options.req,
+      /* === VIVENTIUM END === */
+    }),
+  );
 
   if (functions === true) {
     toolConstructors.dalle = DALLE3;
@@ -313,6 +341,13 @@ const loadTools = async ({
   const requestedMCPTools = {};
 
   for (const tool of tools) {
+    if (
+      (tool === Tools.active_work_list || tool === Tools.active_work_action) &&
+      !availableMainOrchestrationTools.has(tool)
+    ) {
+      logger.warn('[handleTools] GlassHive Main work-control facade is unavailable.');
+      continue;
+    }
     if (tool === Tools.execute_code) {
       requestedTools[tool] = async () => {
         const authValues = await loadAuthValues({
@@ -375,6 +410,7 @@ const loadTools = async ({
            * === VIVENTIUM END === */
           conversationId: options.req?.body?.conversationId,
           activeMessageId: options.req?.body?.messageId,
+          request: options.req,
           fileCitations,
         });
       };
@@ -405,6 +441,20 @@ const loadTools = async ({
           logger,
         });
       };
+      continue;
+    } else if (tool === DELEGATION_TOOL_NAME) {
+      /* === VIVENTIUM START ===
+       * Security: Universal Core-owned Main facade.
+       * Purpose: Never expose the raw peer-spawn MCP schema or execution path to an Agent.
+       * Only a server-declared conversation orchestrator with locally ready isolation receives
+       * the Core facade; every other Agent fails closed instead of falling through to MCP.
+       * === VIVENTIUM END === */
+      if (availableMainOrchestrationTools.has(tool)) {
+        requestedTools[tool] = async () =>
+          createGlassHiveMainDelegationTool({ userId: user, req: options.req, agent });
+      } else {
+        logger.warn('[handleTools] GlassHive Main delegation facade is unavailable.');
+      }
       continue;
     } else if (tool && mcpToolPattern.test(tool)) {
       const [toolName, serverName] = tool.split(Constants.mcp_delimiter);

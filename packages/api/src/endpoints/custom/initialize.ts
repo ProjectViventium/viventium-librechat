@@ -7,7 +7,12 @@ import {
 } from 'librechat-data-provider';
 import type { TEndpoint } from 'librechat-data-provider';
 import type { AppConfig } from '@librechat/data-schemas';
-import type { BaseInitializeParams, InitializeResultBase, EndpointTokenConfig } from '~/types';
+import type {
+  BaseInitializeParams,
+  InitializeResultBase,
+  EndpointTokenConfig,
+  OpenAIConfigOptions,
+} from '~/types';
 import { getOpenAIConfig } from '~/endpoints/openai/config';
 import { getCustomEndpointConfig } from '~/app/config';
 import { fetchModels } from '~/endpoints/models';
@@ -168,9 +173,22 @@ export async function initializeCustom({
   };
 
   const modelOptions = { ...(model_parameters ?? {}), user: userId };
-  const finalClientOptions = {
+  const finalClientOptions: OpenAIConfigOptions = {
     modelOptions,
     ...clientOptions,
+    /* === VIVENTIUM START ===
+     * Feature: Native provider authority receipts for OpenAI-compatible custom endpoints.
+     * Purpose: Keep the receipt sink request-scoped through initialization so an installed
+     * GlassHive Main route can bind its signed terminal receipt to the exact visible turn.
+     * === VIVENTIUM END === */
+    nativeProviderRequestAccepted: (receipt) => {
+      const callback = (
+        req as BaseInitializeParams['req'] & {
+          _viventiumRecordNativeProviderRequestAccepted?: (value: typeof receipt) => void;
+        }
+      )._viventiumRecordNativeProviderRequestAccepted;
+      callback?.(receipt);
+    },
   };
 
   const options = getOpenAIConfig(apiKey, finalClientOptions, endpoint);

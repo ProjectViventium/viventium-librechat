@@ -207,6 +207,106 @@ describe('GenerationJobManager Integration Tests', () => {
   });
 
   describe('Redis Mode', () => {
+    test('atomically carries a Cortex presentation fence through adapter acknowledgement', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
+      const services = createStreamServices({
+        useRedis: true,
+        redisClient: ioredisClient,
+      });
+      GenerationJobManager.configure(services);
+      await GenerationJobManager.initialize();
+
+      const streamId = `redis-cortex-ack-${Date.now()}`;
+      const job = await GenerationJobManager.createJob(
+        streamId,
+        'redis-cortex-owner',
+        'redis-cortex-conversation',
+        {
+          interactionContext: {
+            actor_kind: 'external_user',
+            origin: 'interactive',
+            surface: 'telegram',
+            conversation_id: 'redis-cortex-conversation',
+            revision: 1,
+            source_event_id: 'redis-cortex-source',
+          },
+          deliveryPolicy: { commit_authority: 'external_adapter' },
+        },
+      );
+      await GenerationJobManager.updateMetadata(streamId, {
+        responseMessageId: 'redis-cortex-parent',
+      });
+      const acknowledgement = {
+        logical_turn_id: job.metadata.interactionContext!.logical_turn_id!,
+        revision: 1,
+        state: 'committed' as const,
+        presentation_ref: 'telegram:synthetic-chat:synthetic-message',
+      };
+      const receipt = {
+        ownerId: 'redis-cortex-owner',
+        messageId: 'redis-cortex-follow-up',
+        parentMessageId: 'redis-cortex-parent',
+        revision: 1,
+        generation: 2,
+        deliveryIds: ['redis-cortex-delivery'],
+        deliveryReceipts: [
+          { deliveryId: 'redis-cortex-delivery', graphResultHash: 'a'.repeat(64) },
+        ],
+        claimToken: 'redis-cortex-claim',
+        presentationLeaseToken: 'redis-cortex-lease',
+      };
+      const boundPresentation = await GenerationJobManager.bindCortexPresentation(
+        streamId,
+        receipt,
+      );
+
+      const first = await GenerationJobManager.acknowledgeDelivery(
+        acknowledgement,
+        'telegram',
+        receipt,
+      );
+      const replay = await GenerationJobManager.acknowledgeDelivery(
+        acknowledgement,
+        'telegram',
+        receipt,
+      );
+
+      expect(first).toMatchObject({
+        status: 'recorded',
+        idempotent: false,
+        presentation: {
+          userId: 'redis-cortex-owner',
+          responseMessageId: 'redis-cortex-parent',
+          cortexPresentation: {
+            ownerId: 'redis-cortex-owner',
+            messageId: 'redis-cortex-follow-up',
+            parentMessageId: 'redis-cortex-parent',
+            generation: 2,
+            boundAt: expect.any(Number),
+          },
+        },
+      });
+      expect(first.presentation!.cortexPresentation).toEqual(boundPresentation);
+      expect(replay).toMatchObject({
+        status: 'recorded',
+        idempotent: true,
+        presentation: { cortexPresentation: first.presentation!.cortexPresentation },
+      });
+      await expect(GenerationJobManager.getJob(streamId)).resolves.toMatchObject({
+        metadata: {
+          deliveryAcknowledgement: expect.objectContaining(acknowledgement),
+          cortexPresentation: first.presentation!.cortexPresentation,
+        },
+      });
+      await GenerationJobManager.destroy();
+    });
+
     test('should create and manage jobs via Redis', async () => {
       if (!ioredisClient) {
         console.warn('Redis not available, skipping test');

@@ -45,7 +45,11 @@ const {
   createToolEndCallback,
   getDefaultHandlers,
 } = require('~/server/controllers/agents/callbacks');
-const { loadAgentTools, loadToolsForExecution } = require('~/server/services/ToolService');
+const {
+  loadAgentTools,
+  loadToolsForExecution,
+  startParallelWorkTurnAuthority,
+} = require('~/server/services/ToolService');
 const { getModelsConfig } = require('~/server/controllers/ModelController');
 const AgentClient = require('~/server/controllers/agents/client');
 const { getConvoFiles } = require('~/models/Conversation');
@@ -764,8 +768,9 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * so web, Telegram, and voice share the same explicit fallback contract.
    * Added: 2026-07-13
    */
-  const initializeConfiguredPrimary = (agent) =>
-    initializeAgent(
+  const initializeConfiguredPrimary = (agent) => {
+    startParallelWorkTurnAuthority(req, agent);
+    return initializeAgent(
       {
         req,
         res,
@@ -780,6 +785,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       },
       dbMethods,
     );
+  };
   const initializeConfiguredFallback = () =>
     withPlatformFallbackAuth(() => initializeConfiguredPrimary(fallbackAgent));
   const primaryInitialization = await initializePrimaryAgentWithFallback({

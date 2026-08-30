@@ -322,8 +322,11 @@ describe('VoiceTaskService', () => {
     const completed = observeGenerationEvent(task.taskId, {
       event: 'on_run_step_completed',
       data: {
-        id: 'step-complete',
-        stepDetails: { tool_calls: [{ function: { name: 'web_search' } }] },
+        result: {
+          id: 'step-complete',
+          type: 'tool_call',
+          tool_call: { id: 'tool-call-complete', name: 'web_search' },
+        },
       },
     });
     expect(completed).toMatchObject({
@@ -590,6 +593,35 @@ describe('VoiceTaskService', () => {
     unsubscribeBroken();
     unsubscribeHealthy();
     expect(delivered).toHaveLength(2);
+  });
+
+  test('isolates a failed task subscriber so durable success reaches later listeners', () => {
+    const task = createVoiceTask({
+      callSessionId: 'call-task-listener-isolation',
+      userId: 'user-1',
+      streamId: 'task-listener-isolation-stream',
+    });
+    let brokenDeliveries = 0;
+    const delivered = [];
+    const unsubscribeBroken = subscribeVoiceTask(task.taskId, () => {
+      brokenDeliveries += 1;
+      if (brokenDeliveries > 1) throw new Error('synthetic closed task socket');
+    });
+    const unsubscribeHealthy = subscribeVoiceTask(task.taskId, (event) => delivered.push(event));
+
+    expect(() =>
+      completeVoiceTask(task.taskId, { resultMessageId: 'durable-result' }),
+    ).not.toThrow();
+    unsubscribeBroken();
+    unsubscribeHealthy();
+
+    expect(getVoiceTask(task.taskId)).toMatchObject({ state: 'completed' });
+    expect(snapshotEvent(task.taskId)).toMatchObject({ resultMessageId: 'durable-result' });
+    expect(delivered.at(-1)).toMatchObject({
+      type: 'result',
+      state: 'completed',
+      resultMessageId: 'durable-result',
+    });
   });
 
   test('fails closed when capability flags lack a real owner adapter or ownership mismatches', async () => {

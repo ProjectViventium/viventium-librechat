@@ -102,6 +102,18 @@ describe('agentLlmFallback', () => {
     ).toBe(true);
   });
 
+  test('treats a structured missing provider login as recoverable by another configured route', () => {
+    expect(
+      shouldRetryWithFallback([
+        {
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: 'The configured provider authentication is unavailable.',
+          error_class: 'provider_auth_missing',
+        },
+      ]),
+    ).toBe(true);
+  });
+
   test('builds fallback parameters without mutating primary parameters', () => {
     const primaryParameters = { model: 'claude-opus-4-7', temperature: 0.8 };
     const agent = {
@@ -471,6 +483,43 @@ describe('agentLlmFallback', () => {
     ).toEqual({ model: 'claude-code:opus', reasoning_effort: 'high' });
   });
 
+  test('removes provider-internal fallback fields from the outer GlassHive fallback route', () => {
+    const primaryAgent = {
+      id: 'main',
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'xhigh' },
+      glasshive_options: {
+        workspace: { mode: 'life' },
+        access: 'full',
+        orchestration: { parallel_available: true, default_mode: 'focused' },
+        fallback_model: 'claude-code:opus',
+        fallback_reasoning_effort: 'high',
+      },
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'claude-code:opus',
+      fallback_llm_model_parameters: {
+        model: 'claude-code:opus',
+        reasoning_effort: 'high',
+      },
+    };
+
+    const fallbackAgent = buildFallbackAgent(
+      primaryAgent,
+      resolveFallbackAssignment(primaryAgent),
+      {
+        models: [{ id: 'claude-code:opus', effortChoices: ['high'] }],
+      },
+    );
+
+    expect(fallbackAgent.glasshive_options).toEqual({
+      workspace: { mode: 'life' },
+      access: 'full',
+      orchestration: { parallel_available: true, default_mode: 'focused' },
+    });
+    expect(primaryAgent.glasshive_options.fallback_model).toBe('claude-code:opus');
+  });
+
   test('retries provider overload errors only when no assistant text was produced', () => {
     expect(
       shouldRetryWithFallback([
@@ -591,6 +640,14 @@ describe('agentLlmFallback', () => {
     ['errorStatus', { errorStatus: 401, insight: null }],
     ['errorCode', { errorCode: 'MODEL_AUTHENTICATION', insight: null }],
     ['rate-limit code', { errorCode: 'MODEL_RATE_LIMIT', insight: null }],
+    [
+      'quota/billing class with provider rate-limit code',
+      {
+        errorClass: 'provider_quota_or_billing',
+        errorCode: 'provider_rate_limited',
+        insight: null,
+      },
+    ],
   ])('retries background cortex fallback for structured provider %s', (_label, result) => {
     expect(shouldRetryBackgroundCortexWithFallback(result)).toBe(true);
   });

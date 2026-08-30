@@ -92,6 +92,13 @@ export interface AnthropicConfigOptions {
   oauthProvider?: string;
   /** Persist terminal inference-time OAuth failures and raise reconnect guidance. */
   connectedAccountAuthFailure?: (error: unknown) => Promise<void>;
+  /** Report only a provider-accepted native request to request-scoped Viventium telemetry. */
+  nativeProviderRequestAccepted?: (receipt: {
+    provider: 'anthropic';
+    model: string;
+    status: number;
+    request: Record<string, unknown>;
+  }) => void;
   /** Default parameters to apply only if fields are undefined */
   defaultParams?: Record<string, unknown>;
   /** Additional parameters to add to the configuration */

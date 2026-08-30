@@ -189,6 +189,7 @@
  * agent_index: number;
  * last_agent_index: number;
  * hide_sequential_outputs: boolean;
+ * presentation_policy?: 'primary_final';
  * version?: 'v1' | 'v2';
  * streamMode?: string
  * }> & {

@@ -30,6 +30,10 @@ export enum Tools {
   function = 'function',
   memory = 'memory',
   ui_resources = 'ui_resources',
+  /* === VIVENTIUM START === Provider-independent durable-work controls */
+  active_work_list = 'active_work_list',
+  active_work_action = 'active_work_action',
+  /* === VIVENTIUM END === */
 }
 
 export enum EToolResources {
@@ -182,7 +186,7 @@ export interface ActivationConfig {
   /** Model to use for activation detection (e.g., "gpt-4o-mini") */
   model?: string;
   /** Provider for the activation model (e.g., "openai") */
-  provider: string;
+  provider?: string;
   /** Ordered recovery routes for activation detection */
   fallbacks?: Array<{ provider: string; model: string }>;
   /** Whether an exhausted detector route should be surfaced to the user */
@@ -208,6 +212,13 @@ export interface BackgroundCortex {
   agent_id: string;
   /** Activation configuration for this cortex (specific to this main agent) */
   activation: ActivationConfig;
+  /** Structural proof required before this cortex may expose a visible result. */
+  result_evidence?: {
+    visible_insight_requires: Array<{
+      tool: string;
+      receipt: 'non_empty_sources';
+    }>;
+  };
 }
 /* === VIVENTIUM END === */
 export type AgentParameterValue = number | string | null;
@@ -235,6 +246,14 @@ export type GlassHiveOptions = {
     path?: string;
   };
   access: 'full' | 'workspace';
+  fallback_model?: string;
+  fallback_reasoning_effort?: string;
+  orchestration?: {
+    parallel_available: boolean;
+    default_mode: 'focused' | 'parallel';
+    worker_profile?: string;
+    fallback_worker_profile?: string;
+  };
 };
 
 export interface AgentBaseResource {
@@ -336,6 +355,8 @@ export type Agent = {
   edges?: GraphEdge[];
   end_after_tools?: boolean;
   hide_sequential_outputs?: boolean;
+  /** Viventium: explicit owner of the final visible multi-agent answer. */
+  presentation_policy?: 'primary_final';
   artifacts?: ArtifactModes;
   recursion_limit?: number;
   isPublic?: boolean;

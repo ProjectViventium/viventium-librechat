@@ -9,6 +9,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -30,6 +32,7 @@ from scheduler_prompt_contract import (  # noqa: E402
     SCHEDULER_RUN_ENVELOPE_TEMPLATE,
     render_scheduler_run_envelope,
 )
+from scheduling_cortex.models import CreateScheduleArgs, UpdateScheduleArgs
 from scheduling_cortex.storage import ScheduleStorage, StorageConfig
 
 
@@ -64,6 +67,9 @@ def test_server_instructions_cover_prompt_ownership_contract() -> None:
         "never infer them from conversation history",
         "private periphery",
         "do not inspect periphery by default",
+        "persisted main agent configuration from agent builder",
+        "including its configured fallback",
+        "glasshive_host is a separate explicit workbench executor",
     ]
 
     for phrase in expected:
@@ -147,6 +153,79 @@ def test_create_description_makes_one_time_schedule_discriminator_explicit(tmp_p
     assert "'once'" in description
     assert "run_at" in description
     assert "timezone" in description
+
+
+def test_create_description_marks_glasshive_host_as_workbench_reserved(tmp_path: Path) -> None:
+    mcp = _build_test_server(tmp_path)
+    description = str(_tools_by_name(mcp)["schedule_create"].description or "").lower()
+
+    assert "glasshive_host" in description
+    assert "reserved" in description
+    assert "workbench" in description
+
+
+def test_create_rejects_unowned_glasshive_host_schedule_before_persisting(tmp_path: Path) -> None:
+    mcp = _build_test_server(tmp_path)
+    create = _tools_by_name(mcp)["schedule_create"]
+
+    with pytest.raises(ValueError, match="reserved for Prompt Workbench"):
+        create.fn(
+            CreateScheduleArgs(
+                user_id="user-1",
+                agent_id="agent-1",
+                created_by="agent:agent-1",
+                prompt="ordinary request",
+                schedule={"type": "daily", "time": "09:00", "timezone": "UTC"},
+                executor="glasshive_host",
+            )
+        )
+
+
+def test_update_can_pause_failed_past_one_time_schedule(tmp_path: Path) -> None:
+    storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / "schedules.db")))
+    storage.create_task(
+        {
+            "id": "past-once",
+            "user_id": "user-1",
+            "agent_id": "agent-1",
+            "prompt": "past fixture",
+            "schedule": {
+                "type": "once",
+                "run_at": "2020-01-01T00:00:00Z",
+                "timezone": "UTC",
+            },
+            "channel": "telegram",
+            "executor": "viventium_agent",
+            "conversation_policy": "new",
+            "conversation_id": None,
+            "last_conversation_id": None,
+            "active": 1,
+            "created_by": "agent:agent-1",
+            "created_source": "agent",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2020-01-01T00:00:00Z",
+            "updated_by": "agent:agent-1",
+            "updated_source": "agent",
+            "last_run_at": "2020-01-01T00:00:00Z",
+            "next_run_at": "2020-01-01T00:00:00Z",
+            "last_status": "error",
+            "last_error": "completion_error",
+            "metadata": {},
+        }
+    )
+    update = _tools_by_name(build_server(storage))["schedule_update"]
+
+    result = update.fn(
+        UpdateScheduleArgs(
+            user_id="user-1",
+            task_id="past-once",
+            active=False,
+            updated_by="agent:agent-1",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["task"]["active"] is False
 
 
 def test_registry_source_shared_artifact_and_runtime_scheduler_envelope_are_equal() -> None:

@@ -17,6 +17,7 @@ jest.mock('~/models', () => ({
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: { info: (...args) => mockLoggerInfo(...args) },
 }));
 

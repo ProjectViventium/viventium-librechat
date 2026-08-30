@@ -66,9 +66,16 @@ describe('agentsEndpointSchema provider capability policy', () => {
       automatic_fallback_target: false,
       serial_model_fallback: false,
       workspace_binding: false,
+      conversation_session: false,
+      time_context_delivery: 'developer',
+      usage_accounting_scope: 'provider_request',
+      context_protocol: 'legacy',
+      native_session_authority: 'none',
+      replay_protocol: 'legacy_message_count',
       native_tools: false,
       worker_native_tools: false,
       host_tools: [],
+      conversation_orchestration_tools: [],
       activity_stream: false,
       responses_api: false,
       messaging_delivery_disposition: false,
@@ -77,6 +84,52 @@ describe('agentsEndpointSchema provider capability policy', () => {
       reviewed_mcp_projection: 'deferred',
     });
     expect(parsed.activationOpenAITransportProviders).toEqual(['synthetic-openai-transport']);
+  });
+
+  it('keeps time delivery, usage accounting, and replay authority independent', () => {
+    const parsed = agentsEndpointSchema.parse({
+      providerCapabilities: {
+        'synthetic-harness': {
+          label: 'Synthetic Harness',
+          workspace_binding: true,
+          conversation_session: true,
+          time_context_delivery: 'developer',
+          usage_accounting_scope: 'visible_message_local',
+          context_protocol: 'main_context_v1',
+          native_session_authority: 'stable_authority_v1',
+          replay_protocol: 'replay_decision_v1',
+          models: [],
+        },
+      },
+    });
+
+    expect(parsed.providerCapabilities['synthetic-harness']).toMatchObject({
+      time_context_delivery: 'developer',
+      usage_accounting_scope: 'visible_message_local',
+      context_protocol: 'main_context_v1',
+      native_session_authority: 'stable_authority_v1',
+      replay_protocol: 'replay_decision_v1',
+    });
+  });
+
+  it('keeps conversation orchestration facades distinct from worker host tools', () => {
+    const parsed = agentsEndpointSchema.parse({
+      providerCapabilities: {
+        'synthetic-harness': {
+          label: 'Synthetic Harness',
+          workspace_binding: true,
+          host_tools_transport: 'broker_mcp',
+          host_tools: ['file_search'],
+          conversation_orchestration_tools: ['active_work_list'],
+          models: [],
+        },
+      },
+    });
+
+    expect(parsed.providerCapabilities['synthetic-harness']).toMatchObject({
+      host_tools: ['file_search'],
+      conversation_orchestration_tools: ['active_work_list'],
+    });
   });
 
   it('preserves provider-owned execution and brokered host-tool capabilities', () => {
@@ -246,6 +299,42 @@ describe('getEndpointField', () => {
 });
 
 describe('memorySchema', () => {
+  it('preserves an explicitly configured saved-memory fallback without changing the primary', () => {
+    const parsed = memorySchema.parse({
+      agent: {
+        provider: 'openai',
+        model: 'gpt-memory-primary',
+        fallback: { provider: 'anthropic', model: 'claude-memory-fallback' },
+      },
+    });
+
+    expect(parsed.agent).toEqual({
+      provider: 'openai',
+      model: 'gpt-memory-primary',
+      fallback: { provider: 'anthropic', model: 'claude-memory-fallback' },
+    });
+  });
+
+  it('does not invent a saved-memory fallback when none is configured', () => {
+    const parsed = memorySchema.parse({
+      agent: { provider: 'openai', model: 'gpt-memory-primary' },
+    });
+
+    expect(parsed.agent).not.toHaveProperty('fallback');
+  });
+
+  it.each([
+    { provider: 'xai', model: 'grok-memory' },
+    { provider: 'anthropic', model: '' },
+    { provider: 'anthropic', model: 'claude-memory-fallback', extra: true },
+  ])('rejects unauthorized or malformed saved-memory fallback %j', (fallback) => {
+    const parsed = memorySchema.safeParse({
+      agent: { provider: 'openai', model: 'gpt-memory-primary', fallback },
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
   it('defaults bounded memory reads to the same 8,000-token ceiling as the runtime', () => {
     const parsed = memorySchema.parse({
       agent: { provider: 'anthropic', model: 'claude-sonnet-4-5' },

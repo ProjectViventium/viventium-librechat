@@ -12,9 +12,17 @@
 
 const express = require('express');
 const crypto = require('crypto');
+const mongoose = require('mongoose');
+const {
+  acquireGlassHiveTerminalCallbackResultEffectLease,
+  fenceGlassHiveTerminalCallbackResultEffectTransaction,
+  receiveGlassHiveTerminalCallbackResult,
+  releaseGlassHiveTerminalCallbackResultEffectLease,
+  renewGlassHiveTerminalCallbackResultEffectLease,
+} = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { ContentTypes } = require('librechat-data-provider');
-const { Conversation, Message } = require('~/db/models');
+const { Conversation, Message, GlassHiveTerminalCallbackResult } = require('~/db/models');
 const db = require('~/models');
 const {
   GLASSHIVE_CALLBACK_TYPE,
@@ -22,6 +30,23 @@ const {
 const {
   enqueueGlassHiveCallbackDelivery,
 } = require('~/server/services/viventium/GlassHiveCallbackDeliveryService');
+const {
+  confirmGlassHiveCallbackContext,
+  notifySchedulerExternalWorkSummary,
+  recordGlassHiveCallbackExternalState,
+  recordGlassHiveSurfaceDeliveryOutcome,
+  isGlassHiveWorkTerminalCallback,
+  resolveGlassHiveCallbackContext,
+} = require('~/server/services/viventium/GlassHiveCallbackBindingService');
+const {
+  enqueueGlassHiveMissionAdjudication,
+} = require('~/server/services/viventium/GlassHiveMissionAdjudicationService');
+const {
+  enqueueGlassHiveSchedulerCallbackOutbox,
+} = require('~/server/services/viventium/GlassHiveTerminalCallbackOutboxService');
+const {
+  runGlassHiveTerminalCallbackTransaction,
+} = require('~/server/services/viventium/GlassHiveTerminalCallbackTransaction');
 const {
   claimOrReplaceCallSessionConversationId,
   getCallSession,
@@ -35,19 +60,17 @@ const {
   confirmVoiceTaskOwnerCancellation,
   createVoiceTask,
   failVoiceTask,
-  flushVoiceTaskPersistence,
   getVoiceTaskByStreamId,
   hydrateVoiceTasksForCall,
   hydrateVoiceTaskByStreamId,
   isVoiceTaskSuppressedDurably,
-  linkVoiceTaskOwnerChild,
   observeGenerationEvent,
+  runVoiceTaskTerminalCallbackMutation,
   setVoiceTaskOwnerCapabilities,
 } = require('~/server/services/viventium/VoiceTaskService');
 
 const router = express.Router();
 const CALLBACK_SKEW_SEC = 5 * 60;
-const CALLBACK_REPLAY_TTL_MS = 10 * 60 * 1000;
 const MAX_CALLBACK_TEXT_LENGTH = 4000;
 const MAX_CALLBACK_FULL_TEXT_LENGTH = 64000;
 const MAX_CALLBACK_EVENTS = 20;
@@ -59,8 +82,9 @@ const USER_VISIBLE_CALLBACK_EVENTS = new Set([
   'checkpoint.ready',
   'artifact.created',
   'takeover.requested',
+  'run.needs_input',
+  'run.blocked',
 ]);
-const seenCallbacks = new Map();
 const LOCAL_PATH_PATTERN =
   /(?:~\/|\/Users\/|\/home\/|\/private\/var\/|\/var\/folders\/|\/tmp\/|[A-Za-z]:\\Users\\)[^`'"<>\n\r]*?(?=$|[`'"<>\n\r]|[)\],.;:!?](?:\s|$)|\s+(?:and|or|from|at|with|then|while|because|but|plus|to|in|on)\b)/gi;
 const SAFE_GLASSHIVE_LINK_PATTERN = /\[[^\]\n]{1,160}\]\((https?:\/\/[^)\s]+)\)/g;
@@ -86,6 +110,7 @@ const ACTIVE_WORKER_FAILURE_CODES = new Set([
   'active_worker_conflict',
   'active_worker_limit',
   'host_worker_already_active',
+  'host_capacity',
 ]);
 const GENERATION_PLACEHOLDER_TEXTS = new Set(['generation in progress.']);
 
@@ -105,7 +130,7 @@ async function isGlassHiveVoiceTaskSuppressed(task) {
   });
 }
 
-async function ensureGlassHiveVoiceTask(body = {}) {
+async function ensureGlassHiveVoiceTask(body = {}, { createIfMissing = true } = {}) {
   if (
     String(body.surface || '')
       .trim()
@@ -155,6 +180,14 @@ async function ensureGlassHiveVoiceTask(body = {}) {
   if (parentStreamId) {
     await hydrateVoiceTaskByStreamId(parentStreamId, { callSessionId, userId });
   }
+  const existingTask = getVoiceTaskByStreamId(glassHiveVoiceTaskStreamId(runId));
+  if (existingTask) {
+    const mismatch =
+      existingTask.callSessionId !== callSessionId ||
+      (existingTask.userId && existingTask.userId !== userId) ||
+      (existingTask.conversationId && existingTask.conversationId !== conversationId);
+    return { task: mismatch ? null : existingTask, parentTask: null, mismatch };
+  }
   const parentTask = parentStreamId ? getVoiceTaskByStreamId(parentStreamId) : null;
   if (
     parentTask &&
@@ -163,6 +196,9 @@ async function ensureGlassHiveVoiceTask(body = {}) {
       (parentTask.conversationId && parentTask.conversationId !== conversationId))
   ) {
     return { task: null, parentTask, mismatch: true };
+  }
+  if (!createIfMissing) {
+    return { task: null, parentTask, mismatch: false };
   }
   const task = createVoiceTask({
     callSessionId,
@@ -183,14 +219,6 @@ async function ensureGlassHiveVoiceTask(body = {}) {
       task.taskId,
       'The originating voice task was already cancelled; worker output remains suppressed.',
     );
-  }
-  await flushVoiceTaskPersistence();
-  if (parentTask) {
-    linkVoiceTaskOwnerChild(parentTask.taskId, {
-      continuationPrefix: 'glasshive_dispatch:',
-      resolvedOwnerId: `glasshive_run:${runId}`,
-    });
-    await flushVoiceTaskPersistence();
   }
   return { task, parentTask, mismatch: false };
 }
@@ -259,7 +287,10 @@ async function applyGlassHiveVoiceTaskCallback(body = {}, task, { resultMessageI
       message: sanitizeCallbackMessage(body.message) || 'The GlassHive run failed.',
     });
   }
-  if (event === 'run.cancelled' || event === 'run.interrupted') {
+  if (
+    (event === 'run.cancelled' || event === 'run.interrupted') &&
+    isGlassHiveWorkTerminalCallback(body)
+  ) {
     return await confirmVoiceTaskOwnerCancellation(
       task.taskId,
       sanitizeCallbackMessage(body.message) || 'The GlassHive worker confirmed it stopped.',
@@ -330,20 +361,6 @@ function callbackReplayKey(body = {}) {
     message: body.message,
   });
   return crypto.createHash('sha256').update(stable).digest('hex');
-}
-
-function hasSeenCallback(body = {}, nowMs = Date.now()) {
-  const expiresBefore = nowMs;
-  for (const [key, expiresAt] of seenCallbacks.entries()) {
-    if (expiresAt <= expiresBefore) {
-      seenCallbacks.delete(key);
-    }
-  }
-  return seenCallbacks.has(callbackReplayKey(body));
-}
-
-function rememberCallback(body = {}, nowMs = Date.now()) {
-  seenCallbacks.set(callbackReplayKey(body), nowMs + CALLBACK_REPLAY_TTL_MS);
 }
 
 function isSafeGlassHiveActionUrl(value = '') {
@@ -450,9 +467,6 @@ function sanitizeCallbackMetadataValue(value, { maxLength = 120 } = {}) {
   return text || null;
 }
 
-const ACTIVE_WORKER_FAILURE_TEXT_PATTERN =
-  /\b(?:already\s+has\s+an\s+active\s+worker|one\s+active\s+host\s+worker|active\s+worker\s+conflict)\b/i;
-
 function sanitizeCallbackErrorForLog(error) {
   const message = error?.message ? sanitizeCallbackMessage(error.message, { maxLength: 160 }) : '';
   return {
@@ -464,12 +478,11 @@ function sanitizeCallbackErrorForLog(error) {
 }
 
 function isActiveWorkerFailure({ failureCode = '', message = '' } = {}) {
-  return (
-    ACTIVE_WORKER_FAILURE_CODES.has(
-      String(failureCode || '')
-        .trim()
-        .toLowerCase(),
-    ) || ACTIVE_WORKER_FAILURE_TEXT_PATTERN.test(String(message || ''))
+  void message;
+  return ACTIVE_WORKER_FAILURE_CODES.has(
+    String(failureCode || '')
+      .trim()
+      .toLowerCase(),
   );
 }
 
@@ -487,64 +500,102 @@ function hasCallbackDeliverable(body = {}) {
 }
 
 function isEvidenceGateFailure({ failureCode = '', message = '' } = {}) {
+  void message;
   const code = String(failureCode || '')
     .trim()
     .toLowerCase();
-  if (code === 'glasshive_evidence_check_failed') {
-    return true;
-  }
-  return /\b(?:evidence check|completion compliance|constraint compliance|coverage compliance)\s+failed\b/i.test(
-    String(message || ''),
-  );
+  return code === 'glasshive_evidence_check_failed';
 }
 
 function callbackText(body = {}) {
   const event = String(body.event || '').trim();
-  const message = sanitizeCallbackMessage(body.message);
-  if (event === 'run.completed') {
-    return message || 'Done.';
+  if (event === 'run.completed' && isGlassHiveWorkTerminalCallback(body)) {
+    return 'Mission completed.';
   }
-  if (event === 'run.failed') {
+  if (event === 'run.failed' && isGlassHiveWorkTerminalCallback(body)) {
     const failureCode = String(
       body.failure_code || body.failure_class || body.error_code || body?.error?.code || '',
     )
       .trim()
       .toLowerCase();
-    if (isActiveWorkerFailure({ failureCode, message })) {
-      return 'I got stuck: another local worker is already running, so I could not start this one yet.';
+    if (isActiveWorkerFailure({ failureCode })) {
+      return 'Mission is waiting for worker capacity.';
     }
-    if (hasCallbackDeliverable(body) && isEvidenceGateFailure({ failureCode, message })) {
-      return message
-        ? `I found a worker output, but final verification failed: ${message}`
-        : 'I found a worker output, but final verification failed.';
+    if (hasCallbackDeliverable(body) && isEvidenceGateFailure({ failureCode })) {
+      return 'Mission output needs verification.';
     }
-    return message ? `I got stuck: ${message}` : 'I got stuck and need attention.';
+    return 'Mission needs attention.';
   }
   if (event === 'checkpoint.ready') {
-    return message
-      ? `I need your approval to continue: ${message}`
-      : 'I need your approval to continue.';
+    return 'Mission needs approval.';
   }
-  if (event === 'run.cancelled' || event === 'run.interrupted') {
-    return message ? `I stopped: ${message}` : 'I stopped the task.';
+  if (
+    (event === 'run.cancelled' || event === 'run.interrupted') &&
+    isGlassHiveWorkTerminalCallback(body)
+  ) {
+    return 'Mission stopped.';
   }
   if (event === 'takeover.requested') {
-    return message ? `I need you to take over: ${message}` : 'I need you to take over.';
+    return 'Mission needs user input.';
+  }
+  if (event === 'run.needs_input') {
+    return 'Mission needs user input.';
+  }
+  if (event === 'run.blocked') {
+    return 'Mission needs attention.';
   }
   if (event === 'artifact.created') {
-    return message || 'I saved the artifact.';
+    return 'Mission produced an artifact.';
   }
   return '';
 }
 
-function callbackFullText(body = {}, preview = '') {
-  const full = sanitizeCallbackMessage(body.full_message || '', {
-    maxLength: MAX_CALLBACK_FULL_TEXT_LENGTH,
-  });
-  if (!full || full === preview) {
-    return '';
+function callbackStatus(body = {}) {
+  const event = String(body.event || '').trim();
+  const failureCode = String(
+    body.failure_code || body.failure_class || body.error_code || body?.error?.code || '',
+  )
+    .trim()
+    .toLowerCase();
+  if (event === 'run.completed' && isGlassHiveWorkTerminalCallback(body)) {
+    return { kind: 'mission_status', state: 'completed', attention: null };
   }
-  return full;
+  if (event === 'run.failed' && isGlassHiveWorkTerminalCallback(body)) {
+    if (isActiveWorkerFailure({ failureCode })) {
+      return { kind: 'mission_status', state: 'queued', attention: 'capacity' };
+    }
+    if (isEvidenceGateFailure({ failureCode, message: body.message })) {
+      return { kind: 'mission_status', state: 'failed', attention: 'verification' };
+    }
+    return { kind: 'mission_status', state: 'failed', attention: 'error' };
+  }
+  if (event === 'checkpoint.ready') {
+    return { kind: 'mission_status', state: 'needs_input', attention: 'approval' };
+  }
+  if (event === 'takeover.requested') {
+    return { kind: 'mission_status', state: 'needs_input', attention: 'takeover' };
+  }
+  if (event === 'run.needs_input') {
+    return { kind: 'mission_status', state: 'needs_input', attention: 'input' };
+  }
+  if (event === 'run.blocked') {
+    return { kind: 'mission_status', state: 'needs_input', attention: 'blocked' };
+  }
+  if (event === 'run.cancelled' || event === 'run.interrupted') {
+    return { kind: 'mission_status', state: 'cancelled', attention: null };
+  }
+  if (event === 'artifact.created') {
+    return { kind: 'mission_status', state: 'artifact_ready', attention: null };
+  }
+  return { kind: 'mission_status', state: 'unknown', attention: null };
+}
+
+function callbackFullText(body = {}, preview = '') {
+  void body;
+  void preview;
+  // Raw worker evidence is persisted for Main/Phase-B adjudication, never attached to the
+  // neutral status card or direct surface-delivery payload.
+  return '';
 }
 
 function callbackSurface(body = {}) {
@@ -553,17 +604,68 @@ function callbackSurface(body = {}) {
     .toLowerCase();
 }
 
-function needsSurfaceDelivery(body = {}) {
-  const surface = callbackSurface(body);
-  if (surface === 'telegram') {
-    return Boolean(
-      String(body.telegram_chat_id || '').trim() || String(body.telegram_user_id || '').trim(),
-    );
-  }
-  if (surface === 'voice') {
-    return Boolean(String(body.voice_call_session_id || '').trim());
-  }
-  return false;
+function effectiveCallbackBody(body = {}, deliveryContext = {}) {
+  const destinations = Array.isArray(deliveryContext.destinations)
+    ? deliveryContext.destinations
+    : [];
+  const voice = destinations.find(
+    (destination) => destination?.surface === 'voice' && !destination?.unresolvedReason,
+  );
+  const telegram = destinations.find(
+    (destination) => destination?.surface === 'telegram' && !destination?.unresolvedReason,
+  );
+  // An unresolved destination is durable fan-out truth, not a valid request identity. Never let
+  // it become the callback's primary surface and trigger a false voice/Telegram ownership check.
+  const primary = voice || telegram || { surface: 'librechat' };
+  return {
+    ...body,
+    user_id: deliveryContext.ownerId,
+    conversation_id: deliveryContext.conversationId,
+    parent_message_id: deliveryContext.requestedParentMessageId,
+    message_id: deliveryContext.anchorMessageId,
+    surface: primary.surface || 'librechat',
+    telegram_chat_id: telegram?.telegramChatId || '',
+    telegram_user_id: telegram?.telegramUserId || '',
+    telegram_message_id: telegram?.telegramMessageId || '',
+    voice_call_session_id: voice?.voiceCallSessionId || '',
+    voice_request_id: voice?.voiceRequestId || '',
+  };
+}
+
+function deliveryOutcome(summary = {}) {
+  if (summary?.deferredToMain === true) return 'main_adjudication_pending';
+  const configured = Number(summary?.configured) || 0;
+  const enqueued = Number(summary?.enqueued) || 0;
+  const unresolved = Number(summary?.unresolved) || 0;
+  if (unresolved > 0 && enqueued > 0) return 'partially_enqueued';
+  if (unresolved > 0) return 'unresolved';
+  if (enqueued > 0) return 'enqueued';
+  if (configured > 0) return 'unresolved';
+  return 'not_applicable';
+}
+
+async function recordWebOnlyCallbackDelivery({
+  deliveryContext,
+  deliverySummary,
+  body,
+  effectFence,
+  effectSession,
+}) {
+  effectSession ||= mongoose.transactionAsyncLocalStorage?.getStore()?.session || null;
+  const hasLocalDestination = (deliveryContext?.destinations || []).some((destination) =>
+    ['librechat', 'workbench'].includes(
+      String(destination?.surface || '')
+        .trim()
+        .toLowerCase(),
+    ),
+  );
+  if (!hasLocalDestination || Number(deliverySummary?.configured) > 0) return;
+  // HTTP acceptance and callback persistence are mutable projection truth, not a Main surface receipt.
+  await recordGlassHiveSurfaceDeliveryOutcome({
+    originRef: String(deliveryContext?.originRef || '').trim(),
+    state: 'sent',
+    ...(effectFence ? { body, effectFence, effectSession } : {}),
+  });
 }
 
 function callbackContent(text) {
@@ -577,6 +679,8 @@ function callbackContent(text) {
 }
 
 function sameGlassHiveRun(message, body = {}) {
+  const originRef = String(body.origin_ref || '').trim();
+  const workRef = String(body.work_ref || '').trim();
   const workerId = String(body.worker_id || '').trim();
   const runId = String(body.run_id || '').trim();
   const metadata = message?.metadata?.viventium;
@@ -588,7 +692,14 @@ function sameGlassHiveRun(message, body = {}) {
   }
   const metadataWorkerId = String(metadata.workerId || '').trim();
   const metadataRunId = String(metadata.runId || '').trim();
-  return metadataWorkerId === workerId && (!runId || metadataRunId === runId);
+  const metadataOriginRef = String(metadata.originRef || '').trim();
+  const metadataWorkRef = String(metadata.workRef || '').trim();
+  return (
+    metadataWorkerId === workerId &&
+    (!runId || metadataRunId === runId) &&
+    (!originRef || metadataOriginRef === originRef) &&
+    (!workRef || metadataWorkRef === workRef)
+  );
 }
 
 function messageVisibleText(message) {
@@ -647,19 +758,11 @@ function resolveCallbackTreeParentMessageId({
     };
   }
   if (isGenerationPlaceholderMessage(currentLeaf.message)) {
-    if (currentLeafId !== anchorMessageId && !sameGlassHiveRun(currentLeaf.message, body)) {
-      return {
-        parentMessageId: currentLeafId || anchorMessageId || requestedParentMessageId,
-        currentLeaf,
-        updateMessage: null,
-        blockedByActivePlaceholder: true,
-      };
-    }
     return {
-      parentMessageId:
-        currentLeaf.message.parentMessageId || requestedParentMessageId || anchorMessageId || '',
+      parentMessageId: currentLeafId || anchorMessageId || requestedParentMessageId,
       currentLeaf,
-      updateMessage: currentLeaf.message,
+      updateMessage: null,
+      blockedByActivePlaceholder: true,
     };
   }
   return {
@@ -741,31 +844,67 @@ function hasPersistedCallback(messages, body = {}) {
   return Boolean(persistedCallbackMessage(messages, body));
 }
 
-async function enqueueSurfaceDeliveryOrThrow({ body, message, text, fullText }) {
-  if (!needsSurfaceDelivery(body)) {
-    return null;
+async function enqueueSurfaceDeliveryOrThrow({
+  body,
+  message,
+  text,
+  fullText,
+  deliveryContext,
+  effectFence,
+  effectSession,
+}) {
+  const hasExternalDestination = (deliveryContext?.destinations || []).some((destination) =>
+    ['telegram', 'voice'].includes(
+      String(destination?.surface || '')
+        .trim()
+        .toLowerCase(),
+    ),
+  );
+  if (!hasExternalDestination) {
+    return { configured: 0, enqueued: 0, deliveries: [] };
   }
   return enqueueGlassHiveCallbackDelivery({
     body,
     message,
     text,
     fullText,
+    deliveryContext,
+    effectFence,
+    effectSession,
   });
 }
 
-async function repairDuplicateSurfaceDelivery({ body, messages, text, fullText }) {
-  if (!needsSurfaceDelivery(body)) {
-    return null;
+async function repairDuplicateSurfaceDelivery({
+  body,
+  messages,
+  text,
+  fullText,
+  deliveryContext,
+  effectFence,
+  effectSession,
+}) {
+  const hasExternalDestination = (deliveryContext?.destinations || []).some((destination) =>
+    ['telegram', 'voice'].includes(
+      String(destination?.surface || '')
+        .trim()
+        .toLowerCase(),
+    ),
+  );
+  if (!hasExternalDestination) {
+    return { configured: 0, enqueued: 0, deliveries: [] };
   }
   const persistedMessage = persistedCallbackMessage(messages, body);
   if (!persistedMessage) {
-    return null;
+    return { configured: 0, enqueued: 0, deliveries: [] };
   }
   return enqueueGlassHiveCallbackDelivery({
     body,
     message: persistedMessage,
     text: String(persistedMessage.text || text || '').trim(),
     fullText,
+    deliveryContext,
+    effectFence,
+    effectSession,
   });
 }
 
@@ -806,6 +945,7 @@ function buildCallbackMetadata({
   anchorMessageId,
   previousMetadata,
   hasFullText,
+  deliveryContext,
 }) {
   const previousViventium =
     previousMetadata && typeof previousMetadata === 'object' && previousMetadata.viventium
@@ -826,11 +966,17 @@ function buildCallbackMetadata({
       runId: body?.run_id,
       event: body?.event,
       surface: body?.surface,
+      status: callbackStatus(body || {}),
+      callbackBindingId: deliveryContext?.bindingId || null,
+      originRef: deliveryContext?.originRef || null,
+      workRef: deliveryContext?.workRef || null,
+      configuredDestinations: (deliveryContext?.destinations || []).map((destination) => ({
+        surface: destination?.surface || null,
+        resolved: !destination?.unresolvedReason,
+      })),
       streamId: body?.stream_id,
       voiceCallSessionId: body?.voice_call_session_id,
       voiceRequestId: body?.voice_request_id,
-      telegramChatId: body?.telegram_chat_id,
-      telegramUserId: body?.telegram_user_id,
       logicalTurnId: sanitizeCallbackMetadataValue(body?.logical_turn_id, { maxLength: 160 }),
       logicalTurnRevision:
         Number.isInteger(Number(body?.logical_turn_revision)) &&
@@ -913,7 +1059,147 @@ async function touchCallbackConversation({ userId, conversationId, updatedAt }) 
   );
 }
 
-router.post('/callback', async (req, res) => {
+async function reconcileCallbackExternalWork({
+  deliveryContext,
+  body,
+  effectFence,
+  effectSession,
+}) {
+  effectSession ||= mongoose.transactionAsyncLocalStorage?.getStore()?.session || null;
+  const summary = await recordGlassHiveCallbackExternalState({
+    binding: deliveryContext,
+    body,
+    ...(effectFence ? { effectFence, effectSession } : {}),
+  });
+  if (summary) {
+    if (effectFence) {
+      await enqueueGlassHiveSchedulerCallbackOutbox({
+        binding: deliveryContext,
+        summary,
+        effectFence,
+        effectSession,
+      });
+    } else {
+      await notifySchedulerExternalWorkSummary({ binding: deliveryContext, summary });
+    }
+  }
+  // A callback event describes one run, while adjudication authors the result for the durable
+  // WorkRef. Queue/Message/Steer may leave a sibling alive after this run ends, so only the
+  // authoritative work-terminal contract may enter Main's terminal evidence pipeline.
+  if (isGlassHiveWorkTerminalCallback(body)) {
+    await enqueueGlassHiveMissionAdjudication({
+      binding: deliveryContext,
+      body,
+      ...(effectFence ? { effectFence, effectSession } : {}),
+    });
+  }
+  return summary;
+}
+
+function httpAcceptedPayload({
+  messageId = null,
+  updated = false,
+  duplicate = false,
+  callbackPersisted = true,
+  deliverySummary = null,
+} = {}) {
+  return {
+    status: 'http_accepted',
+    callbackPersisted,
+    duplicate,
+    messageId,
+    updated,
+    surfaceDelivery: deliveryOutcome(deliverySummary),
+    targetRowsEnqueued: Number(deliverySummary?.enqueued) || 0,
+    targetRowsUnresolved: Number(deliverySummary?.unresolved) || 0,
+  };
+}
+
+function withTerminalResultReceipt(payload, receipt) {
+  return receipt ? { ...payload, ...receipt } : payload;
+}
+
+class TerminalCallbackEffectFenceError extends Error {
+  constructor(gate) {
+    super('glasshive_terminal_callback_effect_fence_lost');
+    this.gate = gate;
+  }
+}
+
+async function handleGlassHiveCallback(req, res) {
+  let terminalEffectScope = null;
+  let terminalEffectLease = null;
+  res.locals.releaseGlassHiveTerminalEffectLease = async () => {
+    const lease = terminalEffectLease;
+    terminalEffectLease = null;
+    if (!lease) return;
+    await releaseGlassHiveTerminalCallbackResultEffectLease({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      lease,
+    });
+  };
+  const ensureCurrentTerminalEffectLease = async () => {
+    if (!terminalEffectLease) return;
+    const stillCurrent = await renewGlassHiveTerminalCallbackResultEffectLease({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      lease: terminalEffectLease,
+    });
+    if (stillCurrent) return;
+    const reacquired = await acquireGlassHiveTerminalCallbackResultEffectLease({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      effectScope: terminalEffectScope,
+    });
+    if (!reacquired.acquired) {
+      throw new TerminalCallbackEffectFenceError(reacquired);
+    }
+    terminalEffectLease = reacquired.lease;
+  };
+  const runTerminalEffect = async (effect) => {
+    let result;
+    let effectSession = null;
+    const afterCommit = [];
+    const stageAfterCommit = (operation) => {
+      if (typeof operation !== 'function') {
+        throw new Error('glasshive_callback_after_commit_operation_invalid');
+      }
+      afterCommit.push(operation);
+      return null;
+    };
+    try {
+      if (!terminalEffectLease) {
+        result = await effect(null, null, (operation) => operation());
+      } else {
+        await runGlassHiveTerminalCallbackTransaction(async (session) => {
+          effectSession = session;
+          result = await effect(terminalEffectLease, effectSession, stageAfterCommit);
+          const stillCurrent = await fenceGlassHiveTerminalCallbackResultEffectTransaction({
+            ResultModel: GlassHiveTerminalCallbackResult,
+            lease: terminalEffectLease,
+            session: effectSession,
+          });
+          if (!stillCurrent) {
+            throw Object.assign(new Error('glasshive_callback_effect_fenced'), {
+              code: 'glasshive_callback_effect_fenced',
+            });
+          }
+        });
+        for (const operation of afterCommit) {
+          await ensureCurrentTerminalEffectLease();
+          result = await operation();
+        }
+      }
+    } catch (err) {
+      const transactionConflict =
+        [112, 244, 251].includes(Number(err?.code)) ||
+        err?.hasErrorLabel?.('TransientTransactionError') === true;
+      if (err?.code === 'glasshive_callback_effect_fenced' || transactionConflict) {
+        await ensureCurrentTerminalEffectLease();
+      }
+      throw err;
+    }
+    return result;
+  };
+
   if (!verifySignature(req.body || {}, req.get('x-glasshive-signature'))) {
     return res.status(401).json({ error: 'invalid_signature' });
   }
@@ -921,43 +1207,182 @@ router.post('/callback', async (req, res) => {
     return res.status(401).json({ error: 'stale_callback' });
   }
 
-  const userId = String(req.body?.user_id || '').trim();
-  const conversationId = String(req.body?.conversation_id || '').trim();
-  const requestedParentMessageId = String(req.body?.parent_message_id || '').trim();
-  const anchorMessageId = String(req.body?.message_id || '').trim();
-  const event = String(req.body?.event || '').trim();
-  const taskOnlyEvent =
-    event === 'run.started' &&
-    String(req.body?.surface || '')
-      .trim()
-      .toLowerCase() === 'voice';
-  if (!USER_VISIBLE_CALLBACK_EVENTS.has(event) && !taskOnlyEvent) {
-    return res.status(202).json({ status: 'ignored', reason: 'non_user_visible_event' });
+  const rawBody = req.body || {};
+  let deliveryContext;
+  try {
+    deliveryContext = await resolveGlassHiveCallbackContext(rawBody, { deferConfirmation: true });
+  } catch (err) {
+    logger.warn(
+      '[VIVENTIUM][glasshive] Callback delivery binding lookup unavailable:',
+      sanitizeCallbackErrorForLog(err),
+    );
+    return res.status(503).json({ error: 'callback_delivery_binding_unavailable' });
   }
-  const text = callbackText(req.body);
-  if (!text && !taskOnlyEvent) {
-    return res.status(202).json({ status: 'ignored', reason: 'missing_context_or_text' });
+  if (!deliveryContext) {
+    return res.status(425).json({ error: 'callback_delivery_binding_not_ready' });
   }
-  const fullText = callbackFullText(req.body || {}, text);
-  if (
-    !userId ||
-    !conversationId ||
-    (!taskOnlyEvent && (!requestedParentMessageId || !anchorMessageId))
-  ) {
-    return res.status(425).json({ error: 'missing_callback_anchor' });
+  const callbackBody = effectiveCallbackBody(rawBody, deliveryContext);
+  const userId = String(deliveryContext.ownerId || '').trim();
+  const conversationId = String(deliveryContext.conversationId || '').trim();
+  const requestedParentMessageId = String(deliveryContext.requestedParentMessageId || '').trim();
+  const anchorMessageId = String(deliveryContext.anchorMessageId || '').trim();
+  const event = String(callbackBody.event || '').trim();
+  if (!userId || !conversationId || !requestedParentMessageId || !anchorMessageId) {
+    return res.status(425).json({ error: 'callback_delivery_binding_not_ready' });
+  }
+  let terminalResultReceipt = null;
+  try {
+    const terminalResultGate = await receiveGlassHiveTerminalCallbackResult({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      body: rawBody,
+      headers: {
+        callbackId: req.get('x-glasshive-callback-id'),
+        resultRevision: req.get('x-glasshive-result-revision'),
+        resultDigest: req.get('x-glasshive-result-digest'),
+      },
+      trustedScope: {
+        ownerId: deliveryContext.ownerId,
+        originRef: deliveryContext.originRef,
+        workRef: deliveryContext.workRef,
+      },
+    });
+    if (terminalResultGate.applies && 'error' in terminalResultGate) {
+      return res.status(terminalResultGate.httpStatus).json({ error: terminalResultGate.error });
+    }
+    if (terminalResultGate.applies) {
+      terminalResultReceipt = terminalResultGate.receipt;
+      if (!terminalResultGate.accepted) {
+        return res.status(terminalResultGate.httpStatus).json(terminalResultGate.receipt);
+      }
+      terminalEffectScope = terminalResultGate.effectScope;
+      const effectGate = await acquireGlassHiveTerminalCallbackResultEffectLease({
+        ResultModel: GlassHiveTerminalCallbackResult,
+        effectScope: terminalEffectScope,
+      });
+      if (!effectGate.acquired) {
+        if ('receipt' in effectGate) {
+          return res.status(effectGate.httpStatus).json(effectGate.receipt);
+        }
+        return res.status(effectGate.httpStatus).json({ error: effectGate.error });
+      }
+      terminalEffectLease = effectGate.lease;
+    }
+  } catch (err) {
+    logger.warn(
+      '[VIVENTIUM][glasshive] Terminal callback result CAS unavailable:',
+      sanitizeCallbackErrorForLog(err),
+    );
+    return res.status(503).json({ error: 'callback_result_cas_unavailable' });
+  }
+  try {
+    await runTerminalEffect((effectFence, effectSession) =>
+      confirmGlassHiveCallbackContext({
+        binding: deliveryContext,
+        body: rawBody,
+        effectFence,
+        effectSession,
+      }),
+    );
+  } catch (err) {
+    if (err instanceof TerminalCallbackEffectFenceError) throw err;
+    logger.warn(
+      '[VIVENTIUM][glasshive] Callback delivery binding confirmation unavailable:',
+      sanitizeCallbackErrorForLog(err),
+    );
+    return res.status(503).json({ error: 'callback_delivery_binding_unavailable' });
   }
   if (typeof db.getConvo !== 'function') {
     logger.warn('[VIVENTIUM][glasshive] Callback receiver missing getConvo ownership check.');
     return res.status(500).json({ error: 'ownership_check_unavailable' });
   }
-  const conversation = await db.getConvo(userId, conversationId);
+  const conversation = await db.getConvo(
+    String(deliveryContext.ownerId || '').trim(),
+    String(deliveryContext.conversationId || '').trim(),
+  );
   if (!conversation) {
-    return res.status(403).json({ error: 'conversation_not_found' });
+    // A valid owner-scoped association remains authoritative after the origin conversation is
+    // deleted. Persist work truth/evidence and let Main create an account-level continuation;
+    // never resurrect the deleted conversation merely to host a neutral worker card.
+    try {
+      await runTerminalEffect((effectFence) =>
+        reconcileCallbackExternalWork({ deliveryContext, body: callbackBody, effectFence }),
+      );
+    } catch (err) {
+      if (err instanceof TerminalCallbackEffectFenceError) throw err;
+      logger.warn(
+        '[VIVENTIUM][glasshive] Deleted-origin callback reconciliation failed:',
+        sanitizeCallbackErrorForLog(err),
+      );
+      return res.status(503).json({ error: 'callback_reconciliation_failed' });
+    }
+    return res.status(202).json(
+      withTerminalResultReceipt(
+        {
+          ...httpAcceptedPayload({ callbackPersisted: true }),
+          reason: 'origin_conversation_deleted',
+        },
+        terminalResultReceipt,
+      ),
+    );
   }
+  const taskOnlyEvent = event === 'run.started' && callbackSurface(callbackBody) === 'voice';
+  if (!USER_VISIBLE_CALLBACK_EVENTS.has(event) && !taskOnlyEvent) {
+    // Lifecycle-only events still drive the authoritative active-work projection. HTTP acceptance
+    // means Core durably accounted for them; it must not mean "filtered before reconciliation."
+    try {
+      await runTerminalEffect((effectFence) =>
+        reconcileCallbackExternalWork({ deliveryContext, body: callbackBody, effectFence }),
+      );
+    } catch (err) {
+      if (err instanceof TerminalCallbackEffectFenceError) throw err;
+      logger.warn(
+        '[VIVENTIUM][glasshive] Lifecycle callback reconciliation failed:',
+        sanitizeCallbackErrorForLog(err),
+      );
+      return res.status(503).json({ error: 'callback_reconciliation_failed' });
+    }
+    return res.status(202).json(
+      withTerminalResultReceipt(
+        {
+          ...httpAcceptedPayload({ callbackPersisted: true }),
+          reason: 'lifecycle_reconciled',
+        },
+        terminalResultReceipt,
+      ),
+    );
+  }
+  const text = callbackText(callbackBody);
+  if (!text && !taskOnlyEvent) {
+    try {
+      await runTerminalEffect((effectFence) =>
+        reconcileCallbackExternalWork({ deliveryContext, body: callbackBody, effectFence }),
+      );
+    } catch (err) {
+      if (err instanceof TerminalCallbackEffectFenceError) throw err;
+      logger.warn(
+        '[VIVENTIUM][glasshive] Textless callback reconciliation failed:',
+        sanitizeCallbackErrorForLog(err),
+      );
+      return res.status(503).json({ error: 'callback_reconciliation_failed' });
+    }
+    return res.status(202).json(
+      withTerminalResultReceipt(
+        {
+          ...httpAcceptedPayload({ callbackPersisted: true }),
+          reason: 'missing_context_or_text',
+        },
+        terminalResultReceipt,
+      ),
+    );
+  }
+  const fullText = callbackFullText(callbackBody, text);
   let voiceTaskResolution;
   try {
-    voiceTaskResolution = await ensureGlassHiveVoiceTask(req.body || {});
+    voiceTaskResolution = await runTerminalEffect((effectFence) =>
+      ensureGlassHiveVoiceTask(callbackBody, { createIfMissing: !effectFence }),
+    );
   } catch (err) {
+    if (err instanceof TerminalCallbackEffectFenceError) throw err;
     logger.warn(
       '[VIVENTIUM][glasshive] Voice task session binding unavailable:',
       sanitizeCallbackErrorForLog(err),
@@ -970,24 +1395,58 @@ router.post('/callback', async (req, res) => {
   const voiceTask = voiceTaskResolution.task;
   if (voiceTask && (await isGlassHiveVoiceTaskSuppressed(voiceTask))) {
     if (event === 'run.cancelled' || event === 'run.interrupted') {
-      await applyGlassHiveVoiceTaskCallback(req.body || {}, voiceTask);
-      rememberCallback(req.body || {});
-      return res.status(202).json({ status: 'accepted', reason: 'cancellation_confirmed' });
+      await runTerminalEffect(() =>
+        runVoiceTaskTerminalCallbackMutation(voiceTask.taskId, () =>
+          applyGlassHiveVoiceTaskCallback(callbackBody, voiceTask),
+        ),
+      );
+      await runTerminalEffect((effectFence) =>
+        reconcileCallbackExternalWork({ deliveryContext, body: callbackBody, effectFence }),
+      );
+      return res.status(202).json(
+        withTerminalResultReceipt(
+          {
+            ...httpAcceptedPayload({ callbackPersisted: false }),
+            reason: 'cancellation_confirmed',
+          },
+          terminalResultReceipt,
+        ),
+      );
     }
-    rememberCallback(req.body || {});
-    return res.status(202).json({ status: 'suppressed', reason: 'voice_task_cancelled' });
+    return res
+      .status(202)
+      .json(
+        withTerminalResultReceipt(
+          { status: 'suppressed', reason: 'voice_task_cancelled' },
+          terminalResultReceipt,
+        ),
+      );
   }
   if (voiceTask) {
-    registerGlassHiveVoiceTaskActionCapabilities({ body: req.body || {}, task: voiceTask });
+    await runTerminalEffect(() =>
+      runVoiceTaskTerminalCallbackMutation(voiceTask.taskId, () =>
+        registerGlassHiveVoiceTaskActionCapabilities({ body: callbackBody, task: voiceTask }),
+      ),
+    );
   }
   if (taskOnlyEvent) {
-    await applyGlassHiveVoiceTaskCallback(req.body || {}, voiceTask);
-    rememberCallback(req.body || {});
-    return res.status(202).json({ status: 'accepted', reason: 'voice_task_updated' });
-  }
-  const callbackWasRecentlySeen = hasSeenCallback(req.body || {});
-  if (callbackWasRecentlySeen && !needsSurfaceDelivery(req.body || {})) {
-    return res.status(409).json({ error: 'duplicate_callback' });
+    await runTerminalEffect(() =>
+      runVoiceTaskTerminalCallbackMutation(voiceTask.taskId, () =>
+        applyGlassHiveVoiceTaskCallback(callbackBody, voiceTask),
+      ),
+    );
+    await runTerminalEffect((effectFence) =>
+      reconcileCallbackExternalWork({ deliveryContext, body: callbackBody, effectFence }),
+    );
+    return res.status(202).json(
+      withTerminalResultReceipt(
+        {
+          ...httpAcceptedPayload({ callbackPersisted: false }),
+          reason: 'voice_task_updated',
+        },
+        terminalResultReceipt,
+      ),
+    );
   }
 
   let messages = [];
@@ -1006,44 +1465,70 @@ router.post('/callback', async (req, res) => {
     );
   }
 
-  if (hasPersistedCallback(messages, req.body || {})) {
-    const persistedMessage = persistedCallbackMessage(messages, req.body || {});
+  if (hasPersistedCallback(messages, callbackBody)) {
+    const persistedMessage = persistedCallbackMessage(messages, callbackBody);
+    let deliverySummary;
     try {
-      await repairDuplicateSurfaceDelivery({
-        body: req.body || {},
-        messages,
-        text,
-        fullText,
-      });
-      await touchCallbackConversation({
-        userId,
-        conversationId,
-        updatedAt: persistedMessage?.updatedAt || persistedMessage?.createdAt || new Date(),
-      });
+      deliverySummary = await runTerminalEffect((effectFence, effectSession) =>
+        repairDuplicateSurfaceDelivery({
+          body: callbackBody,
+          messages,
+          text,
+          fullText,
+          deliveryContext,
+          effectFence,
+          effectSession,
+        }),
+      );
+      await runTerminalEffect((effectFence) =>
+        reconcileCallbackExternalWork({ deliveryContext, body: callbackBody, effectFence }),
+      );
+      await runTerminalEffect(() =>
+        touchCallbackConversation({
+          userId,
+          conversationId,
+          updatedAt: persistedMessage?.updatedAt || persistedMessage?.createdAt || new Date(),
+        }),
+      );
+      await runTerminalEffect((effectFence) =>
+        recordWebOnlyCallbackDelivery({
+          deliveryContext,
+          deliverySummary,
+          body: callbackBody,
+          effectFence,
+        }),
+      );
     } catch (err) {
+      if (err instanceof TerminalCallbackEffectFenceError) throw err;
       logger.warn(
         '[VIVENTIUM][glasshive] Failed to repair duplicate callback delivery:',
         sanitizeCallbackErrorForLog(err),
       );
       return res.status(500).json({ error: 'delivery_enqueue_failed' });
     }
-    rememberCallback(req.body || {});
-    return res.status(409).json({ error: 'duplicate_callback' });
-  }
-  if (callbackWasRecentlySeen) {
-    return res.status(409).json({ error: 'duplicate_callback' });
+    return res.json(
+      withTerminalResultReceipt(
+        httpAcceptedPayload({
+          messageId: persistedMessage?.messageId || null,
+          updated: true,
+          duplicate: true,
+          deliverySummary,
+        }),
+        terminalResultReceipt,
+      ),
+    );
   }
   if (!messageById(messages, anchorMessageId)) {
     return res.status(425).json({ error: 'callback_anchor_not_ready' });
   }
 
-  const priorStatusCandidate = latestPriorGlassHiveStatusMessage(messages, req.body || {});
+  const priorStatusCandidate = latestPriorGlassHiveStatusMessage(messages, callbackBody);
   const parentResolution = resolveCallbackTreeParentMessageId({
     messages,
     requestedParentMessageId,
     anchorMessageId,
     priorStatusMessage: priorStatusCandidate,
-    body: req.body || {},
+    body: callbackBody,
   });
   const currentLeafMessage = parentResolution.currentLeaf?.message;
   const currentLeafId = String(parentResolution.currentLeaf?.messageId || '');
@@ -1055,19 +1540,43 @@ router.post('/callback', async (req, res) => {
     currentLeafId !== requestedParentMessageId &&
     currentLeafId !== anchorMessageId
   ) {
-    return res.status(425).json({ error: 'callback_conversation_tip_not_ready' });
+    // The conversation has genuinely moved on. Replaying 425 can never repair that state and
+    // strands terminal evidence forever. Account for the callback now; Main/Phase-B decides
+    // whether to author a separate continuation against the new leaf or stay silent.
+    try {
+      await runTerminalEffect((effectFence) =>
+        reconcileCallbackExternalWork({ deliveryContext, body: callbackBody, effectFence }),
+      );
+    } catch (err) {
+      if (err instanceof TerminalCallbackEffectFenceError) throw err;
+      logger.warn(
+        '[VIVENTIUM][glasshive] Moved-on callback reconciliation failed:',
+        sanitizeCallbackErrorForLog(err),
+      );
+      return res.status(503).json({ error: 'callback_reconciliation_failed' });
+    }
+    return res.status(202).json(
+      withTerminalResultReceipt(
+        {
+          ...httpAcceptedPayload({ callbackPersisted: true }),
+          reason: 'conversation_moved_on',
+        },
+        terminalResultReceipt,
+      ),
+    );
   }
   const priorStatusMessage = parentResolution.updateMessage;
   const parentMessageId = parentResolution.parentMessageId;
   const messageId = priorStatusMessage?.messageId || crypto.randomUUID();
   const metadata = buildCallbackMetadata({
-    body: req.body || {},
+    body: callbackBody,
     parentMessageId: requestedParentMessageId,
     treeParentMessageId: parentMessageId,
     requestedParentMessageId,
     anchorMessageId,
     previousMetadata: priorStatusMessage?.metadata,
     hasFullText: Boolean(fullText),
+    deliveryContext,
   });
   if (voiceTask) {
     metadata.viventium = {
@@ -1089,8 +1598,8 @@ router.post('/callback', async (req, res) => {
     parentMessageId,
     sender: 'AI',
     endpoint: 'agents',
-    model: String(req.body?.agent_id || ''),
-    agent_id: String(req.body?.agent_id || ''),
+    model: String(callbackBody.agent_id || ''),
+    agent_id: String(callbackBody.agent_id || ''),
     text,
     content: callbackContent(text),
     isCreatedByUser: false,
@@ -1101,36 +1610,57 @@ router.post('/callback', async (req, res) => {
   };
 
   if (voiceTask && (await isGlassHiveVoiceTaskSuppressed(voiceTask))) {
-    rememberCallback(req.body || {});
-    return res.status(202).json({ status: 'suppressed', reason: 'voice_task_cancelled' });
+    return res
+      .status(202)
+      .json(
+        withTerminalResultReceipt(
+          { status: 'suppressed', reason: 'voice_task_cancelled' },
+          terminalResultReceipt,
+        ),
+      );
   }
   try {
     if (priorStatusMessage && typeof db.updateMessage === 'function') {
-      await db.updateMessage({ user: { id: userId } }, followUpMessage, {
-        context: 'viventium/routes/glasshive.callback.update',
-        overrideTimestamp: true,
-      });
+      await runTerminalEffect(() =>
+        db.updateMessage({ user: { id: userId } }, followUpMessage, {
+          context: 'viventium/routes/glasshive.callback.update',
+          overrideTimestamp: true,
+        }),
+      );
     } else {
-      await db.saveMessage({ user: { id: userId } }, followUpMessage, {
-        context: 'viventium/routes/glasshive.callback',
-      });
+      await runTerminalEffect(() =>
+        db.saveMessage({ user: { id: userId } }, followUpMessage, {
+          context: 'viventium/routes/glasshive.callback',
+        }),
+      );
     }
-    await touchCallbackConversation({
-      userId,
-      conversationId,
-      updatedAt: timestamps.updatedAt,
-    });
-    if (voiceTask && (await isGlassHiveVoiceTaskSuppressed(voiceTask))) {
-      await rollbackSuppressedVoiceCallback({
-        priorStatusMessage,
-        followUpMessage,
+    await runTerminalEffect(() =>
+      touchCallbackConversation({
         userId,
         conversationId,
-      });
-      rememberCallback(req.body || {});
-      return res.status(202).json({ status: 'suppressed', reason: 'voice_task_cancelled' });
+        updatedAt: timestamps.updatedAt,
+      }),
+    );
+    if (voiceTask && (await isGlassHiveVoiceTaskSuppressed(voiceTask))) {
+      await runTerminalEffect(() =>
+        rollbackSuppressedVoiceCallback({
+          priorStatusMessage,
+          followUpMessage,
+          userId,
+          conversationId,
+        }),
+      );
+      return res
+        .status(202)
+        .json(
+          withTerminalResultReceipt(
+            { status: 'suppressed', reason: 'voice_task_cancelled' },
+            terminalResultReceipt,
+          ),
+        );
     }
   } catch (err) {
+    if (err instanceof TerminalCallbackEffectFenceError) throw err;
     logger.warn(
       '[VIVENTIUM][glasshive] Failed to persist callback message:',
       sanitizeCallbackErrorForLog(err),
@@ -1139,36 +1669,109 @@ router.post('/callback', async (req, res) => {
   }
 
   if (voiceTask && (await isGlassHiveVoiceTaskSuppressed(voiceTask))) {
-    rememberCallback(req.body || {});
-    return res.status(202).json({ status: 'suppressed', reason: 'voice_task_cancelled' });
+    return res
+      .status(202)
+      .json(
+        withTerminalResultReceipt(
+          { status: 'suppressed', reason: 'voice_task_cancelled' },
+          terminalResultReceipt,
+        ),
+      );
   }
-  await applyGlassHiveVoiceTaskCallback(req.body || {}, voiceTask, {
-    resultMessageId: messageId,
-  });
+  await runTerminalEffect(() =>
+    runVoiceTaskTerminalCallbackMutation(voiceTask?.taskId, () =>
+      applyGlassHiveVoiceTaskCallback(callbackBody, voiceTask, {
+        resultMessageId: messageId,
+      }),
+    ),
+  );
 
+  let deliverySummary;
   try {
     if (voiceTask && (await isGlassHiveVoiceTaskSuppressed(voiceTask))) {
-      rememberCallback(req.body || {});
-      return res.status(202).json({ status: 'suppressed', reason: 'voice_task_cancelled' });
+      return res
+        .status(202)
+        .json(
+          withTerminalResultReceipt(
+            { status: 'suppressed', reason: 'voice_task_cancelled' },
+            terminalResultReceipt,
+          ),
+        );
     }
-    await enqueueSurfaceDeliveryOrThrow({
-      body: req.body || {},
-      message: followUpMessage,
-      text,
-      fullText,
-    });
+    deliverySummary = await runTerminalEffect((effectFence, effectSession) =>
+      enqueueSurfaceDeliveryOrThrow({
+        body: callbackBody,
+        message: followUpMessage,
+        text,
+        fullText,
+        deliveryContext,
+        effectFence,
+        effectSession,
+      }),
+    );
   } catch (err) {
+    if (err instanceof TerminalCallbackEffectFenceError) throw err;
     logger.warn(
       '[VIVENTIUM][glasshive] Failed to enqueue callback delivery:',
       sanitizeCallbackErrorForLog(err),
     );
-    if (needsSurfaceDelivery(req.body || {})) {
-      return res.status(500).json({ error: 'delivery_enqueue_failed' });
-    }
+    return res.status(500).json({ error: 'delivery_enqueue_failed' });
   }
 
-  rememberCallback(req.body || {});
-  return res.json({ status: 'ok', messageId, updated: Boolean(priorStatusMessage) });
+  try {
+    await runTerminalEffect((effectFence) =>
+      reconcileCallbackExternalWork({ deliveryContext, body: callbackBody, effectFence }),
+    );
+    await runTerminalEffect((effectFence) =>
+      recordWebOnlyCallbackDelivery({
+        deliveryContext,
+        deliverySummary,
+        body: callbackBody,
+        effectFence,
+      }),
+    );
+  } catch (err) {
+    if (err instanceof TerminalCallbackEffectFenceError) throw err;
+    logger.warn(
+      '[VIVENTIUM][glasshive] Failed to reconcile scheduled external work:',
+      sanitizeCallbackErrorForLog(err),
+    );
+    return res.status(503).json({ error: 'callback_reconciliation_failed' });
+  }
+
+  return res.json(
+    withTerminalResultReceipt(
+      httpAcceptedPayload({
+        messageId,
+        updated: Boolean(priorStatusMessage),
+        deliverySummary,
+      }),
+      terminalResultReceipt,
+    ),
+  );
+}
+
+router.post('/callback', async (req, res, next) => {
+  try {
+    return await handleGlassHiveCallback(req, res);
+  } catch (err) {
+    if (err instanceof TerminalCallbackEffectFenceError && !res.headersSent) {
+      if ('receipt' in err.gate) {
+        return res.status(err.gate.httpStatus).json(err.gate.receipt);
+      }
+      return res.status(err.gate.httpStatus).json({ error: err.gate.error });
+    }
+    return next(err);
+  } finally {
+    try {
+      await res.locals.releaseGlassHiveTerminalEffectLease?.();
+    } catch (err) {
+      logger.warn(
+        '[VIVENTIUM][glasshive] Terminal callback effect lease release unavailable:',
+        sanitizeCallbackErrorForLog(err),
+      );
+    }
+  }
 });
 
 module.exports = router;

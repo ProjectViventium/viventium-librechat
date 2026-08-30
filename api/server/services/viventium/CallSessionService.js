@@ -19,6 +19,7 @@
 
 const crypto = require('crypto');
 const mongoose = require('mongoose');
+const { createVoiceEngagementAttestationService } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { ViventiumCallSession, ViventiumVoiceSpeakerSegment } = require('~/db/models');
 const { getUserById, updateUserViventiumVoicePreferences } = require('~/models');
@@ -1307,6 +1308,10 @@ function getRequiredEnvSecret() {
   return process.env.VIVENTIUM_CALL_SESSION_SECRET || '';
 }
 
+/* === VIVENTIUM START === Core-only voice engagement signing authority. === VIVENTIUM END === */
+const { createVoiceEngagementAttestation, verifyVoiceEngagementAttestation } =
+  createVoiceEngagementAttestationService({ getTransportSecret: getRequiredEnvSecret });
+
 async function assertCallSessionSecret(callSessionId, secret) {
   const expected = getRequiredEnvSecret();
   if (!expected) {
@@ -1714,6 +1719,8 @@ module.exports = {
   assertCallSessionSecret,
   assertCallBrowserCapability,
   assertVoiceGatewayAuth,
+  createVoiceEngagementAttestation,
+  verifyVoiceEngagementAttestation,
   claimDispatch,
   confirmDispatch,
   getDispatchStatus,

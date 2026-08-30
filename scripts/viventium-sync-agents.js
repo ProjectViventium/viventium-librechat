@@ -216,6 +216,7 @@ const AGENT_FIELDS = [
   'recursion_limit',
   'end_after_tools',
   'hide_sequential_outputs',
+  'presentation_policy',
   'support_contact',
   'background_cortices',
   'voice_llm_model',
@@ -268,7 +269,13 @@ const TOOLS_ONLY_FIELDS = [
   'tool_options',
   'conversation_recall_agent_only',
 ];
-const GRAPH_CONFIG_ONLY_FIELDS = ['id', 'recursion_limit', 'edges'];
+const GRAPH_CONFIG_ONLY_FIELDS = [
+  'id',
+  'recursion_limit',
+  'hide_sequential_outputs',
+  'presentation_policy',
+  'edges',
+];
 const REVIEW_FIELDS = [
   'name',
   'description',
@@ -282,6 +289,9 @@ const REVIEW_FIELDS = [
   'model_parameters',
   'glasshive_options',
   'recursion_limit',
+  'end_after_tools',
+  'hide_sequential_outputs',
+  'presentation_policy',
   'voice_llm_model',
   'voice_llm_provider',
   'voice_llm_model_parameters',

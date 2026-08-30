@@ -37,7 +37,8 @@ uv run --group test pytest -q
 - `SCHEDULING_OCCURRENCE_CLAIM_SECONDS` (default: `300`, bounded to `30`–`900`; durable
   claim lease used to fence one GlassHive workspace occurrence across scheduler restarts)
 - `SCHEDULER_LOG_LEVEL` (default: `INFO`)
-- `SCHEDULER_LIBRECHAT_URL` (default: `http://localhost:3080`)
+- `SCHEDULER_LIBRECHAT_URL` (optional explicit override; otherwise
+  `VIVENTIUM_LIBRECHAT_ORIGIN`, then the legacy development fallback `http://localhost:3080`)
 - `SCHEDULER_LIBRECHAT_SECRET` (required for LibreChat dispatch)
 - `VIVENTIUM_SCHEDULER_SECRET` (required signing key for authenticated recurrence control and fresh
   short-lived GlassHive workspace-run assertions; the raw value is not sent on workspace-run dispatch)
@@ -62,7 +63,9 @@ uv run --group test pytest -q
 - Tools are called by the main Viventium agent to create/update schedules.
 - LibreChat injects `X-Viventium-User-Id` and `X-Viventium-Agent-Id` headers for auto scoping.
 - Scheduled tasks carry `executor`. Existing user-level schedules normally use
-  `executor="viventium_agent"`; Prompt Workbench private scheduled prompts use
+  `executor="viventium_agent"`, which reloads the persisted Main Agent route and fallback from
+  Agent Builder at run time without a scheduler-owned provider/model override. Prompt Workbench
+  private scheduled prompts use
   `executor="glasshive_host"` and `channel="workbench"` so dispatch queues GlassHive host work
   directly instead of asking the main Viventium agent to call GlassHive.
 - Viventium-owned GlassHive workspace recurrence uses the internal-only

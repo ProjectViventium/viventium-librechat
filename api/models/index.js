@@ -5,6 +5,7 @@ const { comparePassword } = require('./userMethods');
 const {
   getMessage,
   getMessages,
+  getMessageAncestorBranch,
   getLatestRecallEligibleMessageCreatedAt,
   saveMessage,
   recordMessage,
@@ -29,6 +30,7 @@ module.exports = {
 
   getMessage,
   getMessages,
+  getMessageAncestorBranch,
   getLatestRecallEligibleMessageCreatedAt,
   saveMessage,
   recordMessage,

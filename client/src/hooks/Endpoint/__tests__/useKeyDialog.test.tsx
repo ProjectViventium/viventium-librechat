@@ -120,4 +120,69 @@ describe('useKeyDialog', () => {
     expect(openSpy).not.toHaveBeenCalled();
     expect(mockRequestGet).not.toHaveBeenCalled();
   });
+
+  it('ignores a success signal from a stale OAuth attempt', async () => {
+    mockRequestGet.mockResolvedValue({
+      attemptId: 'current-attempt',
+      flowMode: 'popup_callback',
+      authUrl: 'https://auth.openai.com/oauth/authorize?state=current-state',
+    } as never);
+
+    const popup = {
+      closed: false,
+      close: jest.fn(),
+      location: { href: '' },
+    } as unknown as Window;
+    const openSpy = jest.spyOn(window, 'open').mockImplementation(() => popup);
+    const { result, unmount } = renderHook(() =>
+      useKeyDialog({
+        connectedAccountsEnabled: true,
+        experimentalDirectSubscriptionAuth: true,
+      }),
+    );
+
+    await act(async () => {
+      result.current.handleOpenKeyDialog(EModelEndpoint.openAI, {
+        preventDefault: jest.fn(),
+        stopPropagation: jest.fn(),
+      } as never);
+    });
+
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          origin: window.location.origin,
+          data: {
+            type: 'viventium_connected_account_oauth_success',
+            provider: 'openai',
+            attemptId: 'stale-attempt',
+          },
+        }),
+      );
+    });
+
+    expect(popup.close).not.toHaveBeenCalled();
+    expect(mockInvalidateQueries).not.toHaveBeenCalled();
+    expect(mockShowToast).not.toHaveBeenCalled();
+
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          origin: window.location.origin,
+          data: {
+            type: 'viventium_connected_account_oauth_success',
+            provider: 'openai',
+            attemptId: 'current-attempt',
+          },
+        }),
+      );
+    });
+
+    expect(popup.close).toHaveBeenCalledTimes(1);
+    expect(mockInvalidateQueries).toHaveBeenCalledTimes(1);
+    expect(mockShowToast).toHaveBeenCalledTimes(1);
+
+    unmount();
+    openSpy.mockRestore();
+  });
 });

@@ -255,6 +255,43 @@ describe('memories write routes', () => {
     });
   });
 
+  test('canonical entry route updates a saved memory whose key is preferences', async () => {
+    mockGetAllUserMemories.mockResolvedValueOnce([
+      { key: 'preferences', value: 'old value', tokenCount: 9, __v: 2 },
+    ]);
+    mockSetMemory.mockResolvedValueOnce({ ok: true });
+    mockGetAllUserMemories.mockResolvedValueOnce([
+      { key: 'preferences', value: 'new value', tokenCount: 9, __v: 3 },
+    ]);
+
+    const res = await request(app)
+      .patch('/api/memories/entries/preferences')
+      .send({ value: 'new value', expectedRevision: 2 });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      updated: true,
+      memory: expect.objectContaining({ key: 'preferences', value: 'new value', revision: 3 }),
+    });
+    expect(mockSetMemory).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'preferences', expectedRevision: 2 }),
+    );
+  });
+
+  test('canonical entry route deletes a saved memory whose key is preferences', async () => {
+    mockDeleteMemory.mockResolvedValueOnce({ ok: true });
+
+    const res = await request(app).delete('/api/memories/entries/preferences?revision=4');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ deleted: true });
+    expect(mockDeleteMemory).toHaveBeenCalledWith({
+      userId: 'user_1',
+      key: 'preferences',
+      expectedRevision: 4,
+    });
+  });
+
   test('POST runs maintenance after a successful write', async () => {
     mockGetAllUserMemories.mockResolvedValueOnce([
       { key: 'context', value: 'old', tokenCount: 30 },

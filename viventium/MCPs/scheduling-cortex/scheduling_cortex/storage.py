@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Union
 
+from .scheduled_failure_contract import load_scheduled_failure_contract
+
 
 @dataclass
 class StorageConfig:
@@ -93,15 +95,7 @@ SCHEDULED_PROVIDER_ROUTE_DECISIONS = frozenset(
         "waiting_primary_health",
     }
 )
-_SCHEDULED_FAILURE_CONTRACT_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "source_of_truth"
-    / "scheduled_failure_contract.v1.json"
-)
-with _SCHEDULED_FAILURE_CONTRACT_PATH.open(
-    "r", encoding="utf-8"
-) as _failure_contract_file:
-    SCHEDULED_FAILURE_CONTRACT = json.load(_failure_contract_file)
+SCHEDULED_FAILURE_CONTRACT = load_scheduled_failure_contract()
 SCHEDULED_GENERATION_FAILURE_CLASSES = frozenset(
     {
         *(SCHEDULED_FAILURE_CONTRACT.get("classes") or {}),

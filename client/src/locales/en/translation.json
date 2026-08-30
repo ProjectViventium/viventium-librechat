@@ -1787,8 +1787,6 @@
   "com_ui_glasshive_quota_fallback_description": "Used once only when the primary harness is quota-limited before it authors text, reasons, uses a tool, or changes a file.",
   "com_ui_glasshive_quota_fallback_effort": "Fallback effort",
   "com_ui_model_fallback_used": "Model fallback used",
-  "com_ui_connect_anthropic_account": "Connect Anthropic Account",
-  "com_ui_connect_openai_account": "Connect OpenAI Account",
   "com_ui_feelings_brand": "Viventium · Feelings",
   "com_ui_feelings_brand_description": "live inner state",
   "com_ui_feelings_loading": "Reading Viventium’s inner state…",
@@ -1991,7 +1989,6 @@
   "com_ui_parallel_work_action_pause": "Pause",
   "com_ui_parallel_work_action_resume": "Resume",
   "com_ui_parallel_work_action_stop": "Stop",
-  "com_ui_parallel_work_action_cancel": "Cancel",
   "com_ui_parallel_work_action_retry": "Retry",
   "com_ui_parallel_work_action_dismiss": "Dismiss",
   "com_ui_parallel_work_action_confirm": "{{0}} {{1}}?",
@@ -2001,6 +1998,5 @@
   "com_ui_parallel_work_action_uncertain": "Viventium may already have accepted this action. Retry sends the same operation, so it cannot duplicate it.",
   "com_ui_whoop_loading": "Checking WHOOP status…",
   "com_ui_whoop_error_authorization_reconnect": "WHOOP access expired or was revoked. Reconnect to resume daily updates.",
-  "com_ui_reconnect": "Reconnect",
-  "com_ui_auto_on": "Auto-on"
+  "com_ui_reconnect": "Reconnect"
 }

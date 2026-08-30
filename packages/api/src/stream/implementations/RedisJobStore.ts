@@ -327,6 +327,11 @@ export class RedisJobStore implements IJobStore {
          'active', '1',
          'streamForRevision:' .. tostring(revision), ARGV[1],
          receipt_key, encoded_receipt)
+       if ARGV[6] ~= '' then
+         redis.call(
+           'HSET', KEYS[1], 'sourceSequenceForRevision:' .. tostring(revision), ARGV[6]
+         )
+       end
        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
        return {'claimed', ARGV[1], encoded_context, superseded}`,
       1,
@@ -336,6 +341,9 @@ export class RedisJobStore implements IJobStore {
       KEYS.logicalTurnId(userId, interactionContext),
       JSON.stringify(interactionContext),
       this.ttl.running,
+      Number.isSafeInteger(interactionContext.source_sequence)
+        ? String(interactionContext.source_sequence)
+        : '',
     )) as [string, string, string, string];
 
     const claimedContext = JSON.parse(result[2]) as InteractionContext;
@@ -389,7 +397,12 @@ export class RedisJobStore implements IJobStore {
            redis.call('HDEL', KEYS[1], receipt_key)
          end
        end
-       redis.call('HDEL', KEYS[1], 'streamForRevision:' .. ARGV[2])
+       redis.call(
+         'HDEL', KEYS[1],
+         'streamForRevision:' .. ARGV[2],
+         'sourceSequenceForRevision:' .. ARGV[2],
+         'cortexPresentation:' .. ARGV[2]
+       )
        local previous_revision = tonumber(ARGV[2]) - 1
        if previous_revision > 0 then
          local previous_stream = redis.call(
@@ -542,6 +555,9 @@ export class RedisJobStore implements IJobStore {
        if owner_stream_id == '' then
          return {'stale_revision', ''}
        end
+       if requested_revision < current_revision and ARGV[4] == 'committed' then
+         return {'stale_revision', ''}
+       end
        local ack_key = 'deliveryAck:' .. ARGV[1] .. ':' .. ARGV[2]
        local ack_input_key = 'deliveryAckInput:' .. ARGV[1] .. ':' .. ARGV[2]
        local existing = redis.call('HGET', KEYS[1], ack_key)
@@ -551,9 +567,6 @@ export class RedisJobStore implements IJobStore {
            return {'recorded', existing, owner_stream_id}
          end
          return {'conflict', existing}
-       end
-       if requested_revision < current_revision and ARGV[4] == 'committed' then
-         return {'stale_revision', ''}
        end
        if ARGV[4] == 'committed' or ARGV[4] == 'committed_effect' then
          local source_sequence = tonumber(redis.call(
@@ -682,7 +695,65 @@ export class RedisJobStore implements IJobStore {
     streamId: string,
     binding: CortexPresentationBinding,
   ): Promise<boolean> {
-    const result = await this.redis.eval(
+    const job = await this.getJob(streamId);
+    const logicalTurnId = job?.interactionContext?.logical_turn_id;
+    if (!job || !logicalTurnId || job.interactionContext?.revision !== binding.revision) {
+      return false;
+    }
+    const indexKey = KEYS.logicalTurnIndex(logicalTurnId);
+    const ownerScopeKey =
+      KEYS.logicalTurnFromId(logicalTurnId) ?? (await this.redis.hget(indexKey, 'ownerScopeKey'));
+    if (!ownerScopeKey) {
+      return false;
+    }
+    const encodedBinding = JSON.stringify(binding);
+    const logicalResult = (await this.redis.eval(
+      `if redis.call('HGET', KEYS[1], 'logicalTurnId') ~= ARGV[2] then
+         return {'not_found', ''}
+       end
+       if redis.call('HGET', KEYS[1], 'streamForRevision:' .. ARGV[3]) ~= ARGV[1] then
+         return {'not_found', ''}
+       end
+       local binding_key = 'cortexPresentation:' .. ARGV[3]
+       local current_json = redis.call('HGET', KEYS[1], binding_key)
+       if current_json then
+         local current = cjson.decode(current_json)
+         local incoming = cjson.decode(ARGV[4])
+         if incoming.revision < current.revision or incoming.generation < current.generation then
+           return {'conflict', current_json}
+         end
+         if incoming.revision == current.revision and incoming.generation == current.generation then
+           if incoming.ownerId ~= current.ownerId or
+              incoming.messageId ~= current.messageId or
+              incoming.parentMessageId ~= current.parentMessageId or
+              incoming.claimToken ~= current.claimToken or
+              incoming.presentationLeaseToken ~= current.presentationLeaseToken or
+              cjson.encode(incoming.deliveryIds) ~= cjson.encode(current.deliveryIds) or
+              cjson.encode(incoming.deliveryReceipts) ~= cjson.encode(current.deliveryReceipts) then
+             return {'conflict', current_json}
+           end
+           return {'recorded', current_json}
+         end
+       end
+       redis.call('HSET', KEYS[1], binding_key, ARGV[4])
+       local current_ttl = redis.call('TTL', KEYS[1])
+       if current_ttl < tonumber(ARGV[5]) then
+         redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+       end
+       return {'recorded', ARGV[4]}`,
+      1,
+      ownerScopeKey,
+      streamId,
+      logicalTurnId,
+      binding.revision,
+      encodedBinding,
+      this.ttl.running,
+    )) as [string, string];
+    if (logicalResult[0] !== 'recorded' || !logicalResult[1]) {
+      return false;
+    }
+
+    const mirrored = await this.redis.eval(
       `if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
        local current_json = redis.call('HGET', KEYS[1], 'cortexPresentation')
        if current_json then
@@ -701,6 +772,7 @@ export class RedisJobStore implements IJobStore {
               cjson.encode(incoming.deliveryReceipts) ~= cjson.encode(current.deliveryReceipts) then
              return 0
            end
+           redis.call('HSET', KEYS[1], 'cortexPresentation', ARGV[1])
            return 1
          end
        end
@@ -708,9 +780,9 @@ export class RedisJobStore implements IJobStore {
        return 1`,
       1,
       KEYS.job(streamId),
-      JSON.stringify(binding),
+      logicalResult[1],
     );
-    return Number(result) === 1;
+    return Number(mirrored) === 1;
   }
 
   /** Compare-and-bind an acknowledgement to the expected Cortex generation. */
@@ -719,18 +791,67 @@ export class RedisJobStore implements IJobStore {
     acknowledgement: InteractionDeliveryAck,
     expectedCortexPresentation: CortexPresentationBinding | null,
   ): Promise<DeliveryAcknowledgementBindingResult> {
+    if (!expectedCortexPresentation) {
+      const ownerStreamId = await this.resolveDeliveryOwner(
+        acknowledgement.logical_turn_id,
+        acknowledgement.revision,
+      );
+      if (!ownerStreamId) {
+        return { status: 'not_found' };
+      }
+      if (ownerStreamId !== streamId) {
+        return { status: 'conflict' };
+      }
+      return this.acknowledgeDelivery(acknowledgement);
+    }
+
+    const indexKey = KEYS.logicalTurnIndex(acknowledgement.logical_turn_id);
+    const ownerScopeKey =
+      KEYS.logicalTurnFromId(acknowledgement.logical_turn_id) ??
+      (await this.redis.hget(indexKey, 'ownerScopeKey'));
+    if (!ownerScopeKey) {
+      return { status: 'not_found' };
+    }
+    const scopeDigest = logicalTurnScopeDigestFromKey(ownerScopeKey);
+    const sourceOrderKey = scopeDigest
+      ? KEYS.sourceOrderFromScopeDigest(scopeDigest)
+      : ownerScopeKey;
     const acknowledgementInput = { ...acknowledgement };
     delete acknowledgementInput.presentation_committed_at;
+    const encodedAcknowledgement = JSON.stringify(acknowledgementInput);
+    const encodedBinding = JSON.stringify(expectedCortexPresentation);
     const result = (await this.redis.eval(
-      `if redis.call('EXISTS', KEYS[1]) == 0 then return {'not_found', '', '', '0'} end
-       if ARGV[2] == '' then
-         redis.call('HSET', KEYS[1], 'deliveryAcknowledgement', ARGV[1])
-         return {'recorded', '', ARGV[1], '0'}
+      `if redis.call('HGET', KEYS[1], 'logicalTurnId') ~= ARGV[2] then
+         return {'not_found', '', '', '0'}
        end
-       local current_json = redis.call('HGET', KEYS[1], 'cortexPresentation')
-       if not current_json then return {'retryable_conflict', '', '', '0'} end
+       local current_revision = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
+       local requested_revision = tonumber(ARGV[3])
+       if requested_revision > current_revision then
+         return {'stale_revision', '', '', '0'}
+       end
+       local owner_stream_id = redis.call(
+         'HGET',
+         KEYS[1],
+         'streamForRevision:' .. tostring(requested_revision)
+       ) or ''
+       if owner_stream_id == '' then
+         return {'stale_revision', '', '', '0'}
+       end
+       if owner_stream_id ~= ARGV[1] then
+         return {'conflict', '', '', '0'}
+       end
+       if requested_revision < current_revision and ARGV[7] == 'committed' then
+         return {'stale_revision', '', '', '0'}
+       end
+
+       local binding_key = 'cortexPresentation:' .. ARGV[3]
+       local current_json = redis.call('HGET', KEYS[1], binding_key)
+       local binding_was_missing = not current_json
+       if not current_json then
+         current_json = ARGV[5]
+       end
        local current = cjson.decode(current_json)
-       local expected = cjson.decode(ARGV[2])
+       local expected = cjson.decode(ARGV[5])
        if current.ownerId ~= expected.ownerId or
           current.messageId ~= expected.messageId or
           current.parentMessageId ~= expected.parentMessageId or
@@ -743,57 +864,109 @@ export class RedisJobStore implements IJobStore {
           cjson.encode(current.deliveryReceipts) ~= cjson.encode(expected.deliveryReceipts) then
          return {'retryable_conflict', '', '', '0'}
        end
-       local existing = redis.call('HGET', KEYS[1], 'cortexDeliveryAcknowledgement')
-       local existing_binding = redis.call(
-         'HGET', KEYS[1], 'cortexDeliveryAcknowledgementPresentation'
-       )
-       if existing or existing_binding then
-         if not existing or not existing_binding then
-           return {'retryable_conflict', '', '', '0'}
-         end
-         local existing_input = redis.call(
-           'HGET', KEYS[1], 'cortexDeliveryAcknowledgementInput'
-         )
-         if existing_binding == current_json then
-           if existing_input == ARGV[3] then
-             return {'recorded', current_json, existing, '1'}
-           end
+
+       local ack_key = 'deliveryAck:' .. ARGV[2] .. ':' .. ARGV[3]
+       local ack_input_key = 'deliveryAckInput:' .. ARGV[2] .. ':' .. ARGV[3]
+       local cortex_ack_key = 'cortexDeliveryAcknowledgement:' .. ARGV[2] .. ':' .. ARGV[3]
+       local cortex_input_key =
+         'cortexDeliveryAcknowledgementInput:' .. ARGV[2] .. ':' .. ARGV[3]
+       local cortex_binding_key =
+         'cortexDeliveryAcknowledgementPresentation:' .. ARGV[2] .. ':' .. ARGV[3]
+
+       local existing_ack = redis.call('HGET', KEYS[1], ack_key)
+       local existing_ack_input = redis.call('HGET', KEYS[1], ack_input_key)
+       if existing_ack then
+         if existing_ack_input ~= ARGV[4] and
+            not (not existing_ack_input and existing_ack == ARGV[4]) then
            return {'conflict', '', '', '0'}
          end
-         if existing_input == ARGV[3] then
-           redis.call(
-             'HSET', KEYS[1], 'cortexDeliveryAcknowledgementPresentation', current_json
-           )
-           return {'recorded', current_json, existing, '1'}
+       elseif existing_ack_input then
+         return {'retryable_conflict', '', '', '0'}
+       end
+
+       local existing_cortex_ack = redis.call('HGET', KEYS[1], cortex_ack_key)
+       local existing_cortex_input = redis.call('HGET', KEYS[1], cortex_input_key)
+       local existing_cortex_binding = redis.call(
+         'HGET', KEYS[1], cortex_binding_key
+       )
+       if existing_cortex_ack or existing_cortex_input or existing_cortex_binding then
+         if not existing_cortex_ack or not existing_cortex_binding then
+           return {'retryable_conflict', '', '', '0'}
+         end
+         if existing_cortex_input ~= ARGV[6] and
+            not (not existing_cortex_input and existing_cortex_ack == ARGV[6]) then
+           return {'conflict', '', '', '0'}
          end
        end
-       local server_time = redis.call('TIME')
-       local recorded = cjson.decode(ARGV[3])
-       recorded.presentation_committed_at = tonumber(server_time[1]) * 1000 +
-         math.floor(tonumber(server_time[2]) / 1000)
-       local recorded_json = cjson.encode(recorded)
+
+       if not existing_ack and (ARGV[7] == 'committed' or ARGV[7] == 'committed_effect') then
+         local source_sequence = tonumber(redis.call(
+           'HGET', KEYS[1], 'sourceSequenceForRevision:' .. tostring(requested_revision)
+         ) or '')
+         local latest_source_sequence = tonumber(
+           redis.call('HGET', KEYS[2], 'latestSourceSequence') or ''
+         )
+         if source_sequence and latest_source_sequence and latest_source_sequence > source_sequence then
+           return {'stale_source_order', '', '', '0'}
+         end
+       end
+
+       local recorded_json = existing_ack
+       if not recorded_json then
+         recorded_json = ARGV[4]
+         if ARGV[7] == 'committed' or ARGV[7] == 'committed_effect' then
+           local server_time = redis.call('TIME')
+           local recorded = cjson.decode(ARGV[4])
+           recorded.presentation_committed_at = tonumber(server_time[1]) * 1000 +
+             math.floor(tonumber(server_time[2]) / 1000)
+           recorded_json = cjson.encode(recorded)
+         end
+       end
+
+       if binding_was_missing then
+         redis.call('HSET', KEYS[1], binding_key, current_json)
+       end
        redis.call(
          'HSET', KEYS[1],
-         'cortexDeliveryAcknowledgement', recorded_json,
-         'cortexDeliveryAcknowledgementInput', ARGV[3],
-         'cortexDeliveryAcknowledgementPresentation', current_json
+         ack_key, recorded_json,
+         ack_input_key, ARGV[4],
+         cortex_ack_key, recorded_json,
+         cortex_input_key, ARGV[6],
+         cortex_binding_key, current_json
        )
-       return {'recorded_new', current_json, recorded_json, '0'}`,
-      1,
-      KEYS.job(streamId),
-      JSON.stringify(acknowledgement),
-      expectedCortexPresentation ? JSON.stringify(expectedCortexPresentation) : '',
+       if requested_revision == current_revision and
+          (ARGV[7] == 'committed' or ARGV[7] == 'failed') then
+         redis.call('HSET', KEYS[1], 'active', '0')
+       end
+       redis.call('EXPIRE', KEYS[1], tonumber(ARGV[8]))
+       local idempotent = existing_cortex_ack and '1' or '0'
+       local result_status = existing_cortex_ack and 'recorded' or 'recorded_new'
+       return {result_status, current_json, recorded_json, idempotent, owner_stream_id}`,
+      2,
+      ownerScopeKey,
+      sourceOrderKey,
+      streamId,
+      acknowledgement.logical_turn_id,
+      acknowledgement.revision,
+      encodedAcknowledgement,
+      encodedBinding,
       JSON.stringify(acknowledgementInput),
-    )) as [string, string, string, string];
+      acknowledgement.state,
+      this.ttl.completed,
+    )) as [string, string, string, string, string];
     if (!['recorded', 'recorded_new'].includes(result[0])) {
       return {
-        status: result[0] as 'not_found' | 'conflict' | 'retryable_conflict',
+        status: result[0] as Exclude<DeliveryAcknowledgementBindingResult['status'], 'recorded'>,
       };
+    }
+    if (!KEYS.logicalTurnFromId(acknowledgement.logical_turn_id)) {
+      await this.redis.expire(indexKey, this.ttl.completed);
     }
     return {
       status: 'recorded',
       ...(result[2] ? { acknowledgement: JSON.parse(result[2]) as InteractionDeliveryAck } : {}),
       idempotent: result[3] === '1',
+      ...(result[4] ? { ownerStreamId: result[4] } : {}),
       ...(result[1]
         ? { cortexPresentation: JSON.parse(result[1]) as CortexPresentationBinding }
         : {}),

@@ -82,10 +82,13 @@ describe('Agent Abort Endpoint', () => {
      * Feature: Parallel Work owner isolation.
      * Purpose: An ownerless legacy stream must not become readable by an arbitrary account.
      */
-    it('rejects a stream whose durable owner identity is missing', async () => {
+    it.each([
+      ['missing', {}],
+      ['owned by another user', { userId: 'other-user-456' }],
+    ])('rejects a stream whose durable owner identity is %s', async (_label, metadata) => {
       mockGenerationJobManager.getJob.mockResolvedValue({
         status: 'running',
-        metadata: {},
+        metadata,
       });
 
       const response = await request(app).get('/api/agents/chat/stream/ownerless-stream');
@@ -427,7 +430,10 @@ describe('Agent Abort Endpoint', () => {
           .send({ conversationId: 'new' });
 
         expect(response.status).toBe(200);
-        expect(mockGenerationJobManager.abortJob).toHaveBeenCalledWith('newer-stream');
+        expect(mockGenerationJobManager.abortJob).toHaveBeenCalledWith(
+          'newer-stream',
+          'user_cancelled',
+        );
       });
 
       it('should return 404 when job is not found', async () => {

@@ -15,6 +15,7 @@ const mockGetGenerationJob = jest.fn();
 const mockRecordVoiceOrchestrationTraceBestEffort = jest.fn();
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   GenerationJobManager: {
     markDurableEffectReceipt: (...args) => mockMarkDurableEffectReceipt(...args),
     getJob: (...args) => mockGetGenerationJob(...args),

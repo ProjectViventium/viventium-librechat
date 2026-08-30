@@ -54,28 +54,32 @@ jest.mock('@librechat/api', () => {
   };
 });
 
-jest.mock('@librechat/data-schemas', () => ({
-  decryptV2: jest.fn(),
-  logger: {
-    debug: jest.fn(),
-    info: jest.fn(),
-    warn: jest.fn(),
-    error: jest.fn(),
-  },
-  createModels: jest.fn(() => ({
-    User: {
-      findOne: jest.fn(),
-      findById: jest.fn(),
+jest.mock('@librechat/data-schemas', () => {
+  const actual = jest.requireActual('@librechat/data-schemas');
+  return {
+    ...actual,
+    decryptV2: jest.fn(),
+    logger: {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
     },
-    Conversation: {
-      findOne: jest.fn(),
-      findById: jest.fn(),
-    },
-  })),
-  createMethods: jest.fn(() => ({
-    findUser: jest.fn(),
-  })),
-}));
+    createModels: jest.fn(() => ({
+      User: {
+        findOne: jest.fn(),
+        findById: jest.fn(),
+      },
+      Conversation: {
+        findOne: jest.fn(),
+        findById: jest.fn(),
+      },
+    })),
+    createMethods: jest.fn(() => ({
+      findUser: jest.fn(),
+    })),
+  };
+});
 
 jest.mock('~/models', () => ({
   findToken: jest.fn(),

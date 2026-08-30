@@ -58,10 +58,7 @@ export interface LogicalTurnClaim {
 }
 
 export type DeliveryAcknowledgementState =
-  | 'committed'
-  | 'committed_effect'
-  | 'partial_removed'
-  | 'failed';
+  'committed' | 'committed_effect' | 'partial_removed' | 'failed';
 
 export interface InteractionDeliveryAck {
   logical_turn_id: string;
@@ -87,6 +84,8 @@ export interface CortexPresentationBinding {
   boundAt: number;
 }
 
+export type CortexPresentationFenceReceipt = Omit<CortexPresentationBinding, 'boundAt'>;
+
 export interface DeliveryAcknowledgementResult {
   status:
     | 'recorded'
@@ -110,9 +109,16 @@ export interface DeliveryAcknowledgementResult {
 }
 
 export interface DeliveryAcknowledgementBindingResult {
-  status: 'recorded' | 'not_found' | 'conflict' | 'retryable_conflict';
+  status:
+    | 'recorded'
+    | 'not_found'
+    | 'stale_revision'
+    | 'stale_source_order'
+    | 'conflict'
+    | 'retryable_conflict';
   acknowledgement?: InteractionDeliveryAck;
   idempotent?: boolean;
+  ownerStreamId?: string;
   cortexPresentation?: CortexPresentationBinding;
 }
 
@@ -269,9 +275,7 @@ export interface IJobStore {
   ): Promise<SerializableJobData>;
 
   /** Advance or read the trusted source watermark before presentation. */
-  observeSourceOrder?(
-    observation: SourceOrderObservation,
-  ): Promise<SourceOrderObservationResult>;
+  observeSourceOrder?(observation: SourceOrderObservation): Promise<SourceOrderObservationResult>;
 
   /** Atomically claim a revision, or return the first stream for a duplicate source event. */
   claimLogicalTurn(
@@ -306,12 +310,9 @@ export interface IJobStore {
     acknowledgement: InteractionDeliveryAck,
   ): Promise<DeliveryAcknowledgementResult>;
 
-  bindCortexPresentation?(
-    streamId: string,
-    binding: CortexPresentationBinding,
-  ): Promise<boolean>;
+  bindCortexPresentation(streamId: string, binding: CortexPresentationBinding): Promise<boolean>;
 
-  bindDeliveryAcknowledgement?(
+  bindDeliveryAcknowledgement(
     streamId: string,
     acknowledgement: InteractionDeliveryAck,
     expectedCortexPresentation: CortexPresentationBinding | null,

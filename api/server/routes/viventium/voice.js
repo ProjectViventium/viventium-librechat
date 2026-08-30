@@ -74,10 +74,15 @@ const {
   getGlassHiveCallbackStateForMessage,
 } = require('~/server/services/viventium/GlassHiveCallbackMessageService');
 const {
+  authorizeGlassHiveCallbackDeliveryDispatch,
   claimPendingGlassHiveCallbackDeliveries,
+  completeGlassHiveWorkerCompletionPresentation,
   markGlassHiveCallbackDeliverySent,
   markGlassHiveCallbackDeliveryFailed,
   markGlassHiveCallbackDeliverySuppressed,
+  markGlassHiveCallbackDeliveryUnknown,
+  releaseGlassHiveCallbackDeliveryDispatch,
+  renewGlassHiveCallbackDeliveryDispatch,
 } = require('~/server/services/viventium/GlassHiveCallbackDeliveryService');
 /* === VIVENTIUM NOTE ===
  * Feature: Sidebar parity for gateway-created conversations (title + icon).
@@ -3548,6 +3553,111 @@ router.post('/glasshive/deliveries/claim', voiceAuth, async (req, res) => {
   }
 });
 
+router.post('/glasshive/deliveries/:deliveryId/authorize', voiceAuth, async (req, res) => {
+  const deliveryId = String(req.params?.deliveryId || '').trim();
+  const claimId = String(req.body?.claimId || '').trim();
+  if (!deliveryId || !claimId) {
+    return res.status(400).json({ error: 'deliveryId and claimId are required' });
+  }
+  try {
+    const permit = await authorizeGlassHiveCallbackDeliveryDispatch({
+      deliveryId,
+      claimId,
+      leaseMs: req.body?.leaseMs,
+      userId: req.user?.id || '',
+      voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+    });
+    if (!permit) return res.status(409).json({ error: 'delivery_dispatch_not_authorized' });
+    return res.json({ permit });
+  } catch (error) {
+    logger.warn('[VIVENTIUM][voice/glasshive-delivery] Authorization failed', {
+      code: String(error?.code || error?.name || 'authorization_failed').slice(0, 120),
+    });
+    return res.status(500).json({ error: 'Failed to authorize GlassHive delivery' });
+  }
+});
+
+router.post('/glasshive/deliveries/:deliveryId/renew', voiceAuth, async (req, res) => {
+  const deliveryId = String(req.params?.deliveryId || '').trim();
+  const claimId = String(req.body?.claimId || '').trim();
+  if (!deliveryId || !claimId || !req.body?.dispatchPermit) {
+    return res.status(400).json({ error: 'deliveryId, claimId, and dispatchPermit are required' });
+  }
+  try {
+    const permit = await renewGlassHiveCallbackDeliveryDispatch({
+      deliveryId,
+      claimId,
+      dispatchPermit: req.body.dispatchPermit,
+      leaseMs: req.body?.leaseMs,
+      userId: req.user?.id || '',
+      voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+    });
+    if (!permit) return res.status(409).json({ error: 'delivery_dispatch_not_authorized' });
+    return res.json({ permit });
+  } catch (error) {
+    logger.warn('[VIVENTIUM][voice/glasshive-delivery] Permit renewal failed', {
+      code: String(error?.code || error?.name || 'permit_renewal_failed').slice(0, 120),
+    });
+    return res.status(500).json({ error: 'Failed to renew GlassHive delivery authorization' });
+  }
+});
+
+router.post('/glasshive/deliveries/:deliveryId/release', voiceAuth, async (req, res) => {
+  const deliveryId = String(req.params?.deliveryId || '').trim();
+  const claimId = String(req.body?.claimId || '').trim();
+  if (!deliveryId || !claimId || !req.body?.dispatchPermit) {
+    return res.status(400).json({ error: 'deliveryId, claimId, and dispatchPermit are required' });
+  }
+  try {
+    const released = await releaseGlassHiveCallbackDeliveryDispatch({
+      deliveryId,
+      claimId,
+      dispatchPermit: req.body.dispatchPermit,
+      userId: req.user?.id || '',
+      voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+    });
+    if (!released) return res.status(409).json({ error: 'delivery_dispatch_not_authorized' });
+    return res.json({ released: true });
+  } catch (error) {
+    logger.warn('[VIVENTIUM][voice/glasshive-delivery] Permit release failed', {
+      code: String(error?.code || error?.name || 'permit_release_failed').slice(0, 120),
+    });
+    return res.status(500).json({ error: 'Failed to release GlassHive delivery authorization' });
+  }
+});
+
+router.post(
+  '/glasshive/deliveries/:deliveryId/presentation-complete',
+  voiceAuth,
+  async (req, res) => {
+    const deliveryId = String(req.params?.deliveryId || '').trim();
+    const claimId = String(req.body?.claimId || '').trim();
+    const presentationRef = String(req.body?.presentationRef || '').trim();
+    if (!deliveryId || !claimId || !presentationRef || !req.body?.dispatchPermit) {
+      return res.status(400).json({
+        error: 'deliveryId, claimId, presentationRef, and dispatchPermit are required',
+      });
+    }
+    try {
+      const delivery = await completeGlassHiveWorkerCompletionPresentation({
+        deliveryId,
+        claimId,
+        dispatchPermit: req.body.dispatchPermit,
+        presentationRef,
+        userId: req.user?.id || '',
+        voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+      });
+      if (!delivery) return res.status(409).json({ error: 'delivery_presentation_not_settled' });
+      return res.json({ delivery });
+    } catch (error) {
+      logger.warn('[VIVENTIUM][voice/glasshive-delivery] Presentation settlement failed', {
+        code: String(error?.code || error?.name || 'presentation_settlement_failed').slice(0, 120),
+      });
+      return res.status(500).json({ error: 'Failed to settle GlassHive Voice presentation' });
+    }
+  },
+);
+
 router.post('/glasshive/deliveries/:deliveryId/status', voiceAuth, async (req, res) => {
   const deliveryId = String(req.params?.deliveryId || '').trim();
   const claimId = String(req.body?.claimId || '').trim();
@@ -3555,12 +3665,16 @@ router.post('/glasshive/deliveries/:deliveryId/status', voiceAuth, async (req, r
   if (!deliveryId || !claimId) {
     return res.status(400).json({ error: 'deliveryId and claimId are required' });
   }
+  if (status === 'delivery_unknown' && !req.body?.dispatchPermit) {
+    return res.status(400).json({ error: 'dispatchPermit is required for delivery_unknown' });
+  }
   try {
     let delivery = null;
     if (status === 'sent') {
       delivery = await markGlassHiveCallbackDeliverySent({
         deliveryId,
         claimId,
+        dispatchPermit: req.body?.dispatchPermit || null,
         userId: req.user?.id || '',
         voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
       });
@@ -3568,6 +3682,7 @@ router.post('/glasshive/deliveries/:deliveryId/status', voiceAuth, async (req, r
       delivery = await markGlassHiveCallbackDeliveryFailed({
         deliveryId,
         claimId,
+        dispatchPermit: req.body?.dispatchPermit || null,
         error: req.body?.error || '',
         userId: req.user?.id || '',
         voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
@@ -3577,6 +3692,15 @@ router.post('/glasshive/deliveries/:deliveryId/status', voiceAuth, async (req, r
         deliveryId,
         claimId,
         reason: req.body?.reason || '',
+        userId: req.user?.id || '',
+        voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+      });
+    } else if (status === 'delivery_unknown') {
+      delivery = await markGlassHiveCallbackDeliveryUnknown({
+        deliveryId,
+        claimId,
+        dispatchPermit: req.body.dispatchPermit,
+        reason: req.body?.reason || 'voice_speech_outcome_unknown',
         userId: req.user?.id || '',
         voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
       });

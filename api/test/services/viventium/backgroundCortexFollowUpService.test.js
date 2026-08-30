@@ -11,6 +11,7 @@
 const { EModelEndpoint } = require('librechat-data-provider');
 
 jest.mock('@librechat/agents', () => ({
+  ...jest.requireActual('@librechat/agents'),
   Run: {
     create: jest.fn(async () => ({
       processStream: jest.fn(async () => 'llm-followup'),
@@ -23,6 +24,14 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
+  createViventiumPersonalAccountCleanupReceiptModel: jest.fn(() => ({})),
+  createGlassHiveTerminalCallbackTransactionService: jest.fn(() => ({
+    currentGlassHiveTerminalCallbackTransaction: jest.fn(() => null),
+    deferGlassHiveTerminalCallbackAfterAbort: jest.fn(() => false),
+    deferGlassHiveTerminalCallbackAfterCommit: jest.fn(() => false),
+    runGlassHiveTerminalCallbackTransaction: jest.fn((operation) => operation(null)),
+  })),
   applyDeclaredProviderTransport: jest.fn((modelParameters, transport) => {
     if (transport?.mode !== 'chat_completions') {
       return { ...modelParameters };

@@ -386,14 +386,14 @@ describe('GenerationJobManager subscription readiness', () => {
 
   test('fails closed when reconfiguration is attempted after initialization', async () => {
     const manager = new GenerationJobManagerClass();
-    manager.initialize();
+    await manager.initialize();
 
     expect(() =>
       manager.configure({
         eventTransport: new InMemoryEventTransport(),
         jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
       }),
-    ).toThrow('Destroy the active manager before reconfiguring services');
+    ).toThrow('Generation stream manager is unavailable');
 
     await manager.destroy();
   });
@@ -412,7 +412,7 @@ describe('GenerationJobManager subscription readiness', () => {
         eventTransport: new InMemoryEventTransport(),
         jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
       }),
-    ).toThrow('Destroy the active manager before reconfiguring services');
+    ).toThrow('Generation stream manager is unavailable');
 
     transport.markAbortReady();
     await job;
@@ -433,7 +433,7 @@ describe('GenerationJobManager subscription readiness', () => {
         eventTransport: new InMemoryEventTransport(),
         jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
       }),
-    ).toThrow('Destroy the active manager before reconfiguring services');
+    ).toThrow('Generation stream manager is unavailable');
 
     transport.markDestroyed();
     await destruction;

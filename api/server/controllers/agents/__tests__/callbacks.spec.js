@@ -22,6 +22,7 @@ jest.mock('@librechat/api', () => ({
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: {
     info: jest.fn(),
     error: jest.fn(),

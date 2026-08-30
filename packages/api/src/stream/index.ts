@@ -18,6 +18,8 @@ export type {
   InteractionDeliveryAck,
   DeliveryAcknowledgementResult,
   DeliveryAcknowledgementState,
+  CortexPresentationBinding,
+  CortexPresentationFenceReceipt,
 } from './interfaces/IJobStore';
 
 export { createStreamServices } from './createStreamServices';

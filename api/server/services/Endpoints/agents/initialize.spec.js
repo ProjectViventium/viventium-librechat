@@ -22,8 +22,12 @@ const mockBuildFallbackAgent = jest.fn();
 const mockIsSameAgentRoute = jest.fn();
 const mockInitializePrimaryAgentWithFallback = jest.fn();
 const mockPrimeFiles = jest.fn(async () => ({ files: [], toolContext: '' }));
+const mockStartParallelWorkTurnAuthority = jest.fn();
 
 jest.mock('@librechat/data-schemas', () => ({
+  CORTEX_INSIGHT_DROP_REASONS: [],
+  CORTEX_INSIGHT_FAILURE_REASONS: [],
+  CORTEX_INSIGHT_RECOVERY_DEFERRAL_REASONS: [],
   logger: {
     debug: jest.fn(),
     error: jest.fn(),
@@ -88,6 +92,7 @@ jest.mock('~/server/controllers/agents/callbacks', () => ({
 jest.mock('~/server/services/ToolService', () => ({
   loadAgentTools: (...args) => mockLoadAgentTools(...args),
   loadToolsForExecution: (...args) => mockLoadToolsForExecution(...args),
+  startParallelWorkTurnAuthority: (...args) => mockStartParallelWorkTurnAuthority(...args),
 }));
 jest.mock('~/server/controllers/ModelController', () => ({
   getModelsConfig: jest.fn(async () => ({})),
@@ -336,6 +341,7 @@ describe('initializeClient handoff capability projection', () => {
       glasshive_capability_broker: { allowed_servers: ['synthetic-connected-account'] },
     });
     mockPrimeFiles.mockResolvedValue({ files: [], toolContext: '' });
+    mockStartParallelWorkTurnAuthority.mockResolvedValue(false);
   });
 
   afterAll(() => {
@@ -402,6 +408,35 @@ describe('initializeClient handoff capability projection', () => {
     });
     expect(mockBuildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
     expect(initializedHandoff.viventiumConversationProviderCapabilityRefresh).toBeUndefined();
+  });
+
+  test('starts Parallel turn authority before primary agent tool initialization', async () => {
+    const order = [];
+    const req = makeRequest();
+    mockStartParallelWorkTurnAuthority.mockImplementation(() => {
+      order.push('authority');
+      return Promise.resolve(true);
+    });
+    mockInitializeAgent.mockImplementation(async ({ agent }) => {
+      order.push('initialize');
+      return makeInitializedConfig(agent);
+    });
+
+    await initializeClient({
+      req,
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve({ ...primaryAgent }),
+        model_parameters: { model: primaryAgent.model },
+      },
+    });
+
+    expect(order.slice(0, 2)).toEqual(['authority', 'initialize']);
+    expect(mockStartParallelWorkTurnAuthority).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({ id: primaryAgent.id }),
+    );
   });
 
   test('materializes worker-native Main to Connected Accounts as only a zero-input graph transfer', async () => {

@@ -117,6 +117,73 @@ describe('RedisJobStore job serialization', () => {
     );
   });
 
+  it('repairs a same-generation job mirror from the authoritative logical Cortex fence', async () => {
+    const logicalScope = 'e'.repeat(64);
+    const logicalTurnId = `${logicalScope}.logical-turn-upgrade`;
+    const previousBinding = {
+      ownerId: 'user-upgrade',
+      messageId: 'follow-up-upgrade',
+      parentMessageId: 'parent-upgrade',
+      revision: 1,
+      generation: 2,
+      deliveryIds: ['delivery-upgrade'],
+      deliveryReceipts: [{ deliveryId: 'delivery-upgrade', graphResultHash: 'a'.repeat(64) }],
+      claimToken: 'claim-upgrade',
+      presentationLeaseToken: 'lease-upgrade',
+      boundAt: 1_000,
+    };
+    const authoritativeBinding = { ...previousBinding, boundAt: 2_000 };
+    const redis = {
+      hgetall: jest.fn(),
+      eval: jest
+        .fn()
+        .mockResolvedValueOnce(['recorded', JSON.stringify(authoritativeBinding)])
+        .mockResolvedValueOnce(1),
+    };
+    const store = new RedisJobStore(redis as unknown as Redis);
+    const codec = store as unknown as {
+      serializeJob(value: Record<string, unknown>): Record<string, string>;
+    };
+    redis.hgetall.mockResolvedValue(
+      codec.serializeJob({
+        streamId: 'stream-upgrade',
+        userId: 'user-upgrade',
+        status: 'running',
+        createdAt: 1,
+        syncSent: false,
+        interactionContext: {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'telegram',
+          conversation_id: 'conversation-upgrade',
+          logical_turn_id: logicalTurnId,
+          revision: 1,
+          source_event_id: 'source-upgrade',
+        },
+        cortexPresentation: previousBinding,
+      }),
+    );
+
+    await expect(
+      store.bindCortexPresentation('stream-upgrade', authoritativeBinding),
+    ).resolves.toBe(true);
+
+    const [mirrorScript, keyCount, jobKey, encodedAuthoritativeBinding] = redis.eval.mock.calls[1];
+    const sameGenerationIndex = mirrorScript.indexOf(
+      'if incoming.revision == current.revision and incoming.generation == current.generation',
+    );
+    const authoritativeWriteIndex = mirrorScript.indexOf(
+      "redis.call('HSET', KEYS[1], 'cortexPresentation', ARGV[1])",
+      sameGenerationIndex,
+    );
+    const sameGenerationReturnIndex = mirrorScript.indexOf('return 1', sameGenerationIndex);
+    expect(sameGenerationIndex).toBeGreaterThanOrEqual(0);
+    expect(authoritativeWriteIndex).toBeGreaterThanOrEqual(0);
+    expect(authoritativeWriteIndex).toBeLessThan(sameGenerationReturnIndex);
+    expect([keyCount, jobKey]).toEqual([1, 'stream:{stream-upgrade}:job']);
+    expect(JSON.parse(encodedAuthoritativeBinding)).toEqual(authoritativeBinding);
+  });
+
   it('atomically compares the expected Cortex generation while binding an acknowledgement', async () => {
     const binding = {
       ownerId: 'user-1',
@@ -130,8 +197,9 @@ describe('RedisJobStore job serialization', () => {
       presentationLeaseToken: 'lease-2',
       boundAt: 2_000,
     };
+    const logicalScope = 'f'.repeat(64);
     const acknowledgement = {
-      logical_turn_id: 'logical-turn-1',
+      logical_turn_id: `${logicalScope}.logical-turn-1`,
       revision: 1,
       state: 'committed' as const,
     };
@@ -164,13 +232,36 @@ describe('RedisJobStore job serialization', () => {
       store.bindDeliveryAcknowledgement('stream-1', acknowledgement, binding),
     ).resolves.toEqual({ status: 'retryable_conflict' });
 
-    const [script, keyCount, key, encodedAcknowledgement, encodedBinding, encodedInput] =
-      redis.eval.mock.calls[0];
-    expect(script).toContain("'cortexDeliveryAcknowledgement'");
+    const [
+      script,
+      keyCount,
+      logicalKey,
+      sourceOrderKey,
+      streamId,
+      logicalTurnId,
+      revision,
+      encodedAcknowledgement,
+      encodedBinding,
+      encodedInput,
+    ] = redis.eval.mock.calls[0];
+    expect(script).toContain("'cortexDeliveryAcknowledgement:'");
+    expect(script).toContain("'streamForRevision:'");
+    expect(script).toContain("'cortexPresentation:'");
     expect(script).toContain("redis.call('TIME')");
     expect(script).toContain("return {'retryable_conflict', '', '', '0'}");
-    expect(keyCount).toBe(1);
-    expect(key).toBe('stream:{stream-1}:job');
+    const fenceReadIndex = script.indexOf("local current_json = redis.call('HGET', KEYS[1]");
+    const acknowledgementWriteIndex = script.indexOf('ack_key, recorded_json');
+    expect(fenceReadIndex).toBeGreaterThanOrEqual(0);
+    expect(acknowledgementWriteIndex).toBeGreaterThanOrEqual(0);
+    expect(fenceReadIndex).toBeLessThan(acknowledgementWriteIndex);
+    expect(keyCount).toBe(2);
+    expect(logicalKey).toBe(`stream:logical:{${logicalScope}}`);
+    expect(sourceOrderKey).toBe(`stream:source-order:{${logicalScope}}`);
+    expect([streamId, logicalTurnId, revision]).toEqual([
+      'stream-1',
+      acknowledgement.logical_turn_id,
+      1,
+    ]);
     expect(JSON.parse(encodedAcknowledgement)).toEqual(acknowledgement);
     expect(JSON.parse(encodedBinding)).toEqual(binding);
     expect(JSON.parse(encodedInput)).toEqual(acknowledgement);

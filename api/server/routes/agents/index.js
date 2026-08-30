@@ -72,15 +72,11 @@ router.get('/chat/stream/:streamId', async (req, res) => {
   if (requestAbort.signal.aborted) {
     return;
   }
-  if (!job) {
+  if (!job || !job.metadata?.userId || job.metadata.userId !== req.user.id) {
     return res.status(404).json({
       error: 'Stream not found',
       message: 'The generation job does not exist or has expired.',
     });
-  }
-
-  if (job.metadata?.userId && job.metadata.userId !== req.user.id) {
-    return res.status(403).json({ error: 'Unauthorized' });
   }
 
   res.setHeader('Content-Encoding', 'identity');
@@ -283,19 +279,36 @@ router.post('/chat/abort', async (req, res) => {
     logger.debug(`[AgentStream] Job not found by ID, checking active jobs for user: ${userId}`);
     const activeJobIds = await GenerationJobManager.getActiveJobIdsForUser(userId);
     if (activeJobIds.length > 0) {
-      // Abort the most recent active job for this user
-      jobStreamId = activeJobIds[0];
-      job = await GenerationJobManager.getJob(jobStreamId);
-      logger.debug(`[AgentStream] Found active job for user: ${jobStreamId}`);
+      const candidates = await Promise.all(
+        activeJobIds.map(async (activeStreamId) => ({
+          streamId: activeStreamId,
+          job: await GenerationJobManager.getJob(activeStreamId),
+        })),
+      );
+      const newest = candidates.reduce((selected, candidate) => {
+        if (candidate.job?.status !== 'running' || candidate.job.metadata?.userId !== userId) {
+          return selected;
+        }
+        const createdAt = new Date(candidate.job.createdAt).getTime();
+        if (!Number.isFinite(createdAt) || (selected && createdAt <= selected.createdAt)) {
+          return selected;
+        }
+        return { ...candidate, createdAt };
+      }, null);
+      if (newest) {
+        jobStreamId = newest.streamId;
+        job = newest.job;
+        logger.debug(`[AgentStream] Found active job for user: ${jobStreamId}`);
+      }
     }
   }
 
   logger.debug(`[AgentStream] Computed jobStreamId: ${jobStreamId}`);
 
   if (job && jobStreamId) {
-    if (job.metadata?.userId && job.metadata.userId !== userId) {
-      logger.warn(`[AgentStream] Unauthorized abort attempt for ${jobStreamId} by user ${userId}`);
-      return res.status(403).json({ error: 'Unauthorized' });
+    if (!userId || !job.metadata?.userId || job.metadata.userId !== userId) {
+      logger.warn('[AgentStream] Abort target unavailable for authenticated owner');
+      return res.status(404).json({ error: 'Job not found', streamId: jobStreamId });
     }
 
     /* === VIVENTIUM START ===

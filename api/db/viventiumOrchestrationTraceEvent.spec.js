@@ -479,6 +479,30 @@ describe('ViventiumOrchestrationTraceEvent', () => {
     const originRef = completedDetailOriginRef;
     const workRef = completedDetailFixture.workRef;
     const runRef = 'run_synthetic_1';
+    const detail = JSON.parse(JSON.stringify(completedDetailFixture));
+    const [providerAttempt] = detail.traceability.providerAttempts;
+    delete detail.traceability.providerAttempts;
+    detail.traceability.contractVersion = 2;
+    detail.traceability.runtimeInvocations = [
+      {
+        attemptNumber: providerAttempt.attemptNumber,
+        model: providerAttempt.model,
+        profile: providerAttempt.profile,
+        runtimeInvocationRef: `runtime_invocation_sha256:${'e'.repeat(64)}`,
+        runtime: providerAttempt.runtime,
+        runtimeInvokedAt: providerAttempt.runtimeInvokedAt,
+      },
+    ];
+    detail.traceability.providerAuthorizationPreflights = [
+      {
+        attemptNumber: 1,
+        failureClass: null,
+        observedAt: '2026-08-22T01:00:02.500Z',
+        provider: 'openai',
+        providerAuthorizationPreflightRef: `provider_authorization_preflight_sha256:${'d'.repeat(64)}`,
+        status: 'authorized',
+      },
+    ];
     await service.recordLaunch({
       ownerId,
       originRef,
@@ -498,12 +522,26 @@ describe('ViventiumOrchestrationTraceEvent', () => {
       originRef,
       workRef,
       runRef,
-      detail: completedDetailFixture,
+      detail,
     };
     const [ingestion, replay] = await Promise.all([
       service.recordGlassHiveWorkDetail(ingestionInput),
       service.recordGlassHiveWorkDetail(ingestionInput),
     ]);
+    await service.append({
+      ownerId,
+      originRef,
+      eventKey: 'provider-request-forwarded',
+      stage: 'provider.request.forwarded',
+      at: '2026-08-22T01:00:05.500Z',
+      facts: {
+        workRef,
+        runRef,
+        providerRequestRef: 'provider-request-synthetic-1',
+        provider: 'openai',
+        providerStatus: 'completed',
+      },
+    });
     await service.recordCallback({
       ownerId,
       originRef,
@@ -538,7 +576,7 @@ describe('ViventiumOrchestrationTraceEvent', () => {
       originRef,
       binding: { ownerId, originRef, workRef },
       externalWork: { ownerId, originRef, workRef, runId: runRef },
-      glassHiveDetail: completedDetailFixture,
+      glassHiveDetail: detail,
       glassHiveReadStatus: 'available',
       ledgerPage,
     });
@@ -550,7 +588,7 @@ describe('ViventiumOrchestrationTraceEvent', () => {
         ownerScopeHash: fingerprintTraceReference('owner', ownerId),
         originRefHash: fingerprintTraceReference('origin', originRef),
       }),
-    ).toBe(17);
+    ).toBe(18);
     expect(ledgerPage.chain.fullChainVerified).toBe(true);
     expect(trace.completionClaims).toEqual({ allowed: true });
   });

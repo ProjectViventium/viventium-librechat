@@ -63,16 +63,21 @@ let mockRunVoiceClassifierFaultControl;
 let mockCurrentVoiceOrchestrationTraceBinding;
 let mockActualApi;
 
-jest.mock('@librechat/data-schemas', () => ({
-  logger: {
-    debug: jest.fn(),
-    info: jest.fn((...args) => {
-      mockObservedInfoLogs.push(args.map(String).join(' '));
-    }),
-    warn: jest.fn(),
-    error: jest.fn(),
-  },
-}));
+jest.mock(
+  '@librechat/data-schemas',
+  () => ({
+    ...jest.requireActual('@librechat/data-schemas'),
+    logger: {
+      debug: jest.fn(),
+      info: jest.fn((...args) => {
+        mockObservedInfoLogs.push(args.map(String).join(' '));
+      }),
+      warn: jest.fn(),
+      error: jest.fn(),
+    },
+  }),
+  { virtual: true },
+);
 
 jest.mock('~/server/middleware', () => ({
   configMiddleware: (req, _res, next) => {

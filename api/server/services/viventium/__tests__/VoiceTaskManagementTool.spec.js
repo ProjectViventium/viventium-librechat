@@ -2,6 +2,7 @@
 
 const mockAbortJob = jest.fn();
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   GenerationJobManager: { abortJob: (...args) => mockAbortJob(...args) },
 }));
 

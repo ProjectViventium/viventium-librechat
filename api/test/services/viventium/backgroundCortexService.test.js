@@ -3,6 +3,7 @@ const os = require('os');
 const path = require('path');
 
 jest.mock('@librechat/agents', () => ({
+  ...jest.requireActual('@librechat/agents'),
   Run: {
     create: jest.fn(async () => ({
       processStream: jest.fn(async () => 'cortex-response'),
@@ -27,6 +28,14 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
+  createViventiumPersonalAccountCleanupReceiptModel: jest.fn(() => ({})),
+  createGlassHiveTerminalCallbackTransactionService: jest.fn(() => ({
+    currentGlassHiveTerminalCallbackTransaction: jest.fn(() => null),
+    deferGlassHiveTerminalCallbackAfterAbort: jest.fn(() => false),
+    deferGlassHiveTerminalCallbackAfterCommit: jest.fn(() => false),
+    runGlassHiveTerminalCallbackTransaction: jest.fn((operation) => operation(null)),
+  })),
   initializeAgent: jest.fn(),
   initializeAnthropic: jest.fn(async ({ model_parameters }) => ({
     llmConfig: {

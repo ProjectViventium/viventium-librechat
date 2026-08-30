@@ -35,6 +35,7 @@ jest.mock('librechat-data-provider', () => {
 
 jest.mock('@librechat/data-schemas', () => {
   return {
+    ...jest.requireActual('@librechat/data-schemas'),
     logger: {
       info: jest.fn(),
       warn: jest.fn(),

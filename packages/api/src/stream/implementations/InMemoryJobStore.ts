@@ -11,6 +11,8 @@ import type {
   LogicalTurnClaim,
   InteractionDeliveryAck,
   DeliveryAcknowledgementResult,
+  DeliveryAcknowledgementBindingResult,
+  CortexPresentationBinding,
 } from '~/stream/interfaces/IJobStore';
 
 interface LogicalTurnState {
@@ -329,6 +331,162 @@ export class InMemoryJobStore implements IJobStore {
       return;
     }
     Object.assign(job, updates);
+  }
+
+  /** Atomically bind one exact Cortex presentation generation to its in-memory job. */
+  async bindCortexPresentation(
+    streamId: string,
+    binding: CortexPresentationBinding,
+  ): Promise<boolean> {
+    const job = this.jobs.get(streamId);
+    if (!job) {
+      return false;
+    }
+    const current = job.cortexPresentation;
+    if (current) {
+      if (binding.revision < current.revision || binding.generation < current.generation) {
+        return false;
+      }
+      if (binding.revision === current.revision && binding.generation === current.generation) {
+        return (
+          binding.ownerId === current.ownerId &&
+          binding.messageId === current.messageId &&
+          binding.parentMessageId === current.parentMessageId &&
+          binding.claimToken === current.claimToken &&
+          binding.presentationLeaseToken === current.presentationLeaseToken &&
+          binding.deliveryIds.length === current.deliveryIds.length &&
+          binding.deliveryIds.every(
+            (deliveryId, index) => deliveryId === current.deliveryIds[index],
+          ) &&
+          binding.deliveryReceipts.length === current.deliveryReceipts.length &&
+          binding.deliveryReceipts.every(
+            (receipt, index) =>
+              receipt.deliveryId === current.deliveryReceipts[index].deliveryId &&
+              receipt.graphResultHash === current.deliveryReceipts[index].graphResultHash,
+          )
+        );
+      }
+    }
+    job.cortexPresentation = binding;
+    return true;
+  }
+
+  /** Compare-and-bind an acknowledgement to the exact current Cortex presentation. */
+  async bindDeliveryAcknowledgement(
+    streamId: string,
+    acknowledgement: InteractionDeliveryAck,
+    expectedCortexPresentation: CortexPresentationBinding | null,
+  ): Promise<DeliveryAcknowledgementBindingResult> {
+    const state = this.logicalTurnIndex.get(acknowledgement.logical_turn_id);
+    if (!state || this.logicalTurns.get(state.scope) !== state) {
+      return { status: 'not_found' };
+    }
+    const ownerStreamId = state.revisionStreams.get(acknowledgement.revision);
+    if (!ownerStreamId || acknowledgement.revision > state.revision) {
+      return { status: 'stale_revision' };
+    }
+    if (ownerStreamId !== streamId) {
+      return { status: 'conflict' };
+    }
+    if (acknowledgement.revision < state.revision && acknowledgement.state === 'committed') {
+      return { status: 'stale_revision' };
+    }
+    const job = this.jobs.get(streamId);
+    if (!job) {
+      return { status: 'not_found' };
+    }
+
+    const samePresentation = (
+      left: CortexPresentationBinding | undefined,
+      right: CortexPresentationBinding | undefined,
+    ) =>
+      Boolean(
+        left &&
+        right &&
+        left.ownerId === right.ownerId &&
+        left.messageId === right.messageId &&
+        left.parentMessageId === right.parentMessageId &&
+        left.revision === right.revision &&
+        left.generation === right.generation &&
+        left.boundAt === right.boundAt &&
+        left.claimToken === right.claimToken &&
+        left.presentationLeaseToken === right.presentationLeaseToken &&
+        left.deliveryIds.length === right.deliveryIds.length &&
+        left.deliveryIds.every((deliveryId, index) => deliveryId === right.deliveryIds[index]) &&
+        left.deliveryReceipts.length === right.deliveryReceipts.length &&
+        left.deliveryReceipts.every(
+          (receipt, index) =>
+            receipt.deliveryId === right.deliveryReceipts[index].deliveryId &&
+            receipt.graphResultHash === right.deliveryReceipts[index].graphResultHash,
+        ),
+      );
+    const current = job.cortexPresentation;
+    if (expectedCortexPresentation && !samePresentation(current, expectedCortexPresentation)) {
+      return { status: 'retryable_conflict' };
+    }
+
+    const acknowledgementInput = { ...acknowledgement };
+    delete acknowledgementInput.presentation_committed_at;
+    const existingLogicalAcknowledgement = state.deliveryAcknowledgements.get(
+      acknowledgement.revision,
+    );
+    let recordedAcknowledgement = existingLogicalAcknowledgement;
+    let logicalIdempotent = false;
+    if (existingLogicalAcknowledgement) {
+      const existingInput = { ...existingLogicalAcknowledgement };
+      delete existingInput.presentation_committed_at;
+      if (JSON.stringify(existingInput) !== JSON.stringify(acknowledgementInput)) {
+        return { status: 'conflict' };
+      }
+      logicalIdempotent = true;
+    }
+
+    let cortexIdempotent = !expectedCortexPresentation;
+    if (expectedCortexPresentation) {
+      const existing = job.cortexDeliveryAcknowledgement;
+      const existingPresentation = job.cortexDeliveryAcknowledgementPresentation;
+      if ((existing && !existingPresentation) || (!existing && existingPresentation)) {
+        return { status: 'retryable_conflict' };
+      }
+      if (existing && existingPresentation) {
+        const existingInput = { ...existing };
+        delete existingInput.presentation_committed_at;
+        if (JSON.stringify(existingInput) !== JSON.stringify(acknowledgementInput)) {
+          return { status: 'conflict' };
+        }
+        cortexIdempotent = true;
+      }
+    }
+
+    if (!recordedAcknowledgement) {
+      recordedAcknowledgement = Object.freeze({
+        ...acknowledgementInput,
+        ...(expectedCortexPresentation &&
+        ['committed', 'committed_effect'].includes(acknowledgementInput.state)
+          ? { presentation_committed_at: Date.now() }
+          : {}),
+      });
+      state.deliveryAcknowledgements.set(acknowledgement.revision, recordedAcknowledgement);
+    }
+    if (
+      acknowledgement.revision === state.revision &&
+      (acknowledgement.state === 'committed' || acknowledgement.state === 'failed')
+    ) {
+      state.active = false;
+      state.completedAt = Date.now();
+    }
+    job.deliveryAcknowledgement = recordedAcknowledgement;
+    if (expectedCortexPresentation) {
+      job.cortexDeliveryAcknowledgement = recordedAcknowledgement;
+      job.cortexDeliveryAcknowledgementPresentation = current;
+    }
+    return {
+      status: 'recorded',
+      acknowledgement: recordedAcknowledgement,
+      idempotent: logicalIdempotent && cortexIdempotent,
+      ownerStreamId,
+      ...(expectedCortexPresentation && current ? { cortexPresentation: current } : {}),
+    };
   }
 
   async deleteJob(streamId: string): Promise<void> {

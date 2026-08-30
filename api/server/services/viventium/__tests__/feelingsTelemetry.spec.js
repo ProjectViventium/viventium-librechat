@@ -250,11 +250,13 @@ describe('Feelings telemetry', () => {
     const logger = { info: jest.fn() };
     logFeelingsEvent(logger, { id: 'request-calibration' }, 'feelings.reaction.write', {
       strengthCounts: { slight: 1, clear: 2, strong: 1 },
+      absoluteDeltaCounts: { 3: 1, 8: 2, 11: 1 },
       deltaMagnitudeCounts: { 3: 1, 8: 2, 11: 1 },
     });
 
     const messages = logger.info.mock.calls.map(([message]) => message).join('\n');
     expect(messages).toContain('strengthCounts');
+    expect(messages).toContain('absoluteDeltaCounts');
     expect(messages).toContain('deltaMagnitudeCounts');
     expect(messages).not.toContain('request-calibration');
   });

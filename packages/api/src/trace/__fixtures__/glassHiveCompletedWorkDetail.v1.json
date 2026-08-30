@@ -185,6 +185,14 @@
     }
   ],
   "artifactHistoryOverflowCount": 0,
+  "historyPage": {
+    "cursor": null,
+    "nextCursor": null,
+    "limit": 16,
+    "total": 7,
+    "showing": 7,
+    "overflowCount": 0
+  },
   "viewRef": "/w/ghr_synthetic_1",
   "traceability": {
     "origin": {

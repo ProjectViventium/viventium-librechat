@@ -60,6 +60,7 @@ const mockNonceCollection = {
 };
 
 jest.mock('mongoose', () => ({
+  ...jest.requireActual('mongoose'),
   connection: {
     collection: (name) => {
       if (name === 'viventium_glasshive_capability_authorizations') {
@@ -74,6 +75,7 @@ jest.mock('mongoose', () => ({
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
 }));
 

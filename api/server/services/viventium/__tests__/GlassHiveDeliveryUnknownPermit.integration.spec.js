@@ -117,19 +117,22 @@ describe('GlassHive delivery unknown dispatch permit', () => {
           deliveryId: claimed.deliveryId,
           claimId: claimed.claimId,
           dispatchPermit: permit,
-          reason: `${surface}_effect_outcome_unknown`,
+          reason: `${surface}_effect_outcome_unknown api_key=example-sensitive-value`,
           ...scope,
         }),
       ).resolves.toMatchObject({ deliveryId: delivery.deliveryId, status: 'delivery_unknown' });
-      await expect(
-        ViventiumGlassHiveCallbackDelivery.findOne({ deliveryId: delivery.deliveryId }).lean(),
-      ).resolves.toMatchObject({
+      const settled = await ViventiumGlassHiveCallbackDelivery.findOne({
+        deliveryId: delivery.deliveryId,
+      }).lean();
+      expect(settled).toMatchObject({
         status: 'delivery_unknown',
         nextAttemptAt: null,
+        lastError: `${surface}_effect_outcome_unknown api_key=<redacted>`,
         dispatchPermitId: '',
         dispatchPermitGeneration: 0,
         dispatchPermitExpiresAt: null,
       });
+      expect(JSON.stringify(settled)).not.toContain('example-sensitive-value');
       await expect(claimPendingGlassHiveCallbackDeliveries({ surface, limit: 1 })).resolves.toEqual(
         [],
       );

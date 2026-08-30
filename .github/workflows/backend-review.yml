@@ -162,7 +162,13 @@ jobs:
           fi
 
   test-api:
-    name: 'Tests: api'
+    # VIVENTIUM START — bound full-suite Jest memory without skipping API coverage.
+    name: 'Tests: api (${{ matrix.shard }})'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['1/2', '2/2']
+    # VIVENTIUM END
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -232,7 +238,9 @@ jobs:
         run: cp api/test/.env.test.example api/test/.env.test
 
       - name: Run unit tests
-        run: cd api && npm run test:ci
+        # VIVENTIUM START — run one disjoint half and recycle idle workers before heap retention can exhaust CI.
+        run: cd api && npm run test:ci -- --shard=${{ matrix.shard }} --workerIdleMemoryLimit=1GB
+        # VIVENTIUM END
 
   test-data-provider:
     name: 'Tests: data-provider'

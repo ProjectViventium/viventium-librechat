@@ -7,9 +7,14 @@ let mockGetMessage;
 let mockGetMessages;
 let mockGetInsightDeliveries;
 
-jest.mock('@librechat/data-schemas', () => ({ logger: { info: jest.fn(), warn: jest.fn() } }), {
-  virtual: true,
-});
+jest.mock(
+  '@librechat/data-schemas',
+  () => ({
+    ...jest.requireActual('@librechat/data-schemas'),
+    logger: { info: jest.fn(), warn: jest.fn() },
+  }),
+  { virtual: true },
+);
 
 jest.mock('~/models', () => ({
   getMessage: (...args) => mockGetMessage(...args),

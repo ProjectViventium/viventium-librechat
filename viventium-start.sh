@@ -356,7 +356,7 @@ ensure_local_search_backfill() {
     fi
 
     echo -e "${YELLOW}Ensuring local conversation search is fully indexed...${NC}"
-    node "$sync_script"
+    USE_REDIS=false USE_REDIS_STREAMS=false node "$sync_script"
 }
 
 run_local_search_backfill_nonblocking() {

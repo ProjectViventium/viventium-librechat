@@ -36,6 +36,26 @@ class DispatchWorkbenchTests(unittest.TestCase):
         os.environ.pop('WPR_CLAUDE_CODE_EFFORT', None)
         os.environ.pop('WPR_MODEL_CLAUDE_CODE', None)
 
+    def test_private_run_detail_patch_reports_durable_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            detail_path = Path(directory) / 'run.json'
+            detail_path.write_text(json.dumps({'existing': True}), encoding='utf-8')
+
+            persisted = dispatch._patch_private_run_detail(
+                str(detail_path),
+                {'runtime_recovery': {'to_execution_mode': 'docker'}},
+            )
+
+            self.assertTrue(persisted)
+            self.assertEqual(
+                json.loads(detail_path.read_text(encoding='utf-8')),
+                {
+                    'existing': True,
+                    'runtime_recovery': {'to_execution_mode': 'docker'},
+                },
+            )
+            self.assertEqual(detail_path.stat().st_mode & 0o777, 0o600)
+
     @staticmethod
     def worker_response(worker_id, execution_mode, profile='codex-cli', model='gpt-managed-test'):
         return {

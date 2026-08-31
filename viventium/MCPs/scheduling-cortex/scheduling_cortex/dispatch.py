@@ -3330,27 +3330,6 @@ def _glasshive_execution_backend(wb: Dict[str, Any]) -> str:
     return str(wb.get("execution_backend") or wb.get("backend") or "openclaw").strip() or "openclaw"
 
 
-# === VIVENTIUM START ===
-# Feature: Private Scheduling Cortex detail updates.
-def _patch_private_run_detail(path_value: str, updates: Dict[str, Any]) -> None:
-    path = Path(str(path_value or "")).expanduser()
-    if not path_value or not path.exists():
-        return
-    try:
-        current = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        current = {}
-    if not isinstance(current, dict):
-        current = {}
-    current.update(updates)
-    path.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-# === VIVENTIUM END ===
-
-
 def _can_recover_workbench_host_dependency_to_docker(
     exc: Exception,
     *,

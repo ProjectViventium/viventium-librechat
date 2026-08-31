@@ -97,6 +97,71 @@ class BootstrapEndpointTests(unittest.TestCase):
     def _make_storage(self, tmpdir):
         return ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
 
+    def test_signed_worker_lifecycle_reports_transport_acceptance(self):
+        secret = "synthetic-callback-secret"
+        payload = {
+            "event": "worker.ready",
+            "worker_id": "worker-1",
+            "run_id": "",
+            "message": "Worker ready.",
+        }
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        signature = self._glasshive_signature(secret, raw, payload["worker_id"], "")
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"SCHEDULING_GLASSHIVE_CALLBACK_SECRET": secret},
+            clear=False,
+        ):
+            response = self._make_client(self._make_storage(tmpdir)).post(
+                "/internal/scheduled-prompts/glasshive-callback",
+                content=raw,
+                headers={
+                    "content-type": "application/json",
+                    "x-glasshive-signature": signature,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"status": "http_accepted", "ignored": "worker.ready"},
+        )
+
+    def test_signed_terminal_callback_reports_transport_acceptance(self):
+        secret = "synthetic-callback-secret"
+        payload = self._terminal_payload(
+            {
+                "event": "run.completed",
+                "worker_id": "worker-1",
+                "run_id": "glasshive-run-1",
+                "message": "Synthetic authoritative result.",
+            }
+        )
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        signature = self._glasshive_signature(
+            secret, raw, payload["worker_id"], payload["run_id"]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"SCHEDULING_GLASSHIVE_CALLBACK_SECRET": secret},
+            clear=False,
+        ):
+            storage = self._make_storage(tmpdir)
+            self._create_glasshive_run(storage, error_class="stale_run_reconciled")
+            response = self._make_client(storage).post(
+                "/internal/scheduled-prompts/glasshive-callback",
+                content=raw,
+                headers={
+                    "content-type": "application/json",
+                    "x-glasshive-signature": signature,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "http_accepted")
+
     @staticmethod
     def _glasshive_signature(secret, raw, worker_id, run_id):
         binding = f"{worker_id}:{run_id}".encode("utf-8")

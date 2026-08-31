@@ -1295,8 +1295,16 @@ describe('processMCPEnv', () => {
     }
     expect(result.headers?.['X-Viventium-Surface']).toBe('telegram');
     expect(result.headers?.['X-Viventium-Stream-Id']).toBe('stream-123');
-    expect(result.headers?.['X-Viventium-Voice-Call-Session-Id']).toBe('call-123');
-    expect(result.headers?.['X-Viventium-Telegram-Chat-Id']).toBe('chat-123');
+    /* === VIVENTIUM START ===
+     * Surface-recipient identifiers remain owned by their ingress adapter and are not forwarded
+     * across the GlassHive worker boundary.
+     */
+    expect(result.headers?.['X-Viventium-Voice-Call-Session-Id']).toBeUndefined();
+    expect(result.headers?.['X-Viventium-Voice-Request-Id']).toBeUndefined();
+    expect(result.headers?.['X-Viventium-Telegram-Chat-Id']).toBeUndefined();
+    expect(result.headers?.['X-Viventium-Telegram-User-Id']).toBeUndefined();
+    expect(result.headers?.['X-Viventium-Telegram-Message-Id']).toBeUndefined();
+    /* === VIVENTIUM END === */
     expect(result.headers?.['X-Viventium-Logical-Turn-Id']).toBe('turn-123');
     expect(result.headers?.['X-Viventium-Logical-Turn-Revision']).toBe('2');
     expect(result.headers?.['X-Viventium-Request-Files']?.startsWith('b64:')).toBe(true);

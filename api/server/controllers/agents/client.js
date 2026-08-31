@@ -3137,8 +3137,17 @@ class AgentClient extends BaseClient {
       buildPromptFrame({
         promptFamily: 'main_assembly',
         surface: resolveViventiumSurface(req),
-        provider: this.options.agent?.provider,
+        /* === VIVENTIUM START ===
+         * Preserve the declared conversation provider and bind prompt-frame telemetry to the
+         * authenticated owner and trusted interaction context.
+         */
+        provider: resolveConversationProviderId(this.options.agent),
         model: this.options.agent?.model_parameters?.model || this.options.agent?.model,
+        requestIdentity: {
+          ownerId: req?.user?.id || req?.user?._id,
+          interactionContext: getTrustedInteractionContext(req),
+        },
+        /* === VIVENTIUM END === */
         authClass: 'user_runtime',
         layers: promptFrameLayers,
         promptSourceFiles: {
@@ -5044,8 +5053,17 @@ class AgentClient extends BaseClient {
         buildPromptFrame({
           promptFamily: 'main_runtime',
           surface,
-          provider: this.options.agent?.provider,
+          /* === VIVENTIUM START ===
+           * Preserve the declared conversation provider and bind prompt-frame telemetry to the
+           * authenticated owner and trusted interaction context.
+           */
+          provider: resolveConversationProviderId(this.options.agent),
           model: this.options.agent?.model_parameters?.model || this.options.agent?.model,
+          requestIdentity: {
+            ownerId: this.options.req?.user?.id || this.options.req?.user?._id,
+            interactionContext: trustedInteractionContext,
+          },
+          /* === VIVENTIUM END === */
           authClass: userMCPAuthMap ? 'connected_account_runtime' : 'user_runtime',
           layers: surfacePromptLayers,
           promptSourceFiles: {
@@ -6053,8 +6071,17 @@ class AgentClient extends BaseClient {
           buildPromptFrame({
             promptFamily: 'main_run_create',
             surface,
-            provider: agents[0]?.provider,
+            /* === VIVENTIUM START ===
+             * Preserve the declared conversation provider and bind prompt-frame telemetry to the
+             * authenticated owner and trusted interaction context.
+             */
+            provider: resolveConversationProviderId(agents[0]),
             model: agents[0]?.model_parameters?.model || agents[0]?.model,
+            requestIdentity: {
+              ownerId: this.options.req?.user?.id || this.options.req?.user?._id,
+              interactionContext: trustedInteractionContext,
+            },
+            /* === VIVENTIUM END === */
             authClass: userMCPAuthMap ? 'connected_account_runtime' : 'user_runtime',
             layers: {
               primary_run_instructions: agents[0]?.instructions || '',

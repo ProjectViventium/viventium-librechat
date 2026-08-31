@@ -1144,7 +1144,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
 
         event = str(payload.get("event") or "").strip()
         if event.startswith("worker.") and not run_id:
-            return JSONResponse({"status": "ok", "ignored": event})
+            return JSONResponse({"status": "http_accepted", "ignored": event})
 
         run = storage.get_scheduled_prompt_run_by_glasshive_run(run_id)
         callback_run_id = str(payload.get("message_id") or payload.get("scheduled_prompt_run_id") or "").strip()
@@ -1219,7 +1219,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             )
             if event == "run.completed":
                 _refresh_workbench_periphery_index(run)
-        return JSONResponse({"status": "ok", "run_id": run["run_id"]})
+        return JSONResponse({"status": "http_accepted", "run_id": run["run_id"]})
     # === VIVENTIUM END ===
 
     # === VIVENTIUM START ===

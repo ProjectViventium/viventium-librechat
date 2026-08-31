@@ -10,6 +10,29 @@ const yaml = require('js-yaml');
 const sourcePath = (name) => path.join(__dirname, '../../../viventium/source_of_truth', name);
 
 describe('Viventium prompt source contracts', () => {
+  test('prompt frames preserve declared providers and owner-bound request identity', () => {
+    const clientSource = fs.readFileSync(
+      path.resolve(__dirname, '../../server/controllers/agents/client.js'),
+      'utf8',
+    );
+    const expected = {
+      main_assembly: 'provider: resolveConversationProviderId(this.options.agent)',
+      main_runtime: 'provider: resolveConversationProviderId(this.options.agent)',
+      main_run_create: 'provider: resolveConversationProviderId(agents[0])',
+    };
+
+    for (const [promptFamily, providerBinding] of Object.entries(expected)) {
+      const familyStart = clientSource.indexOf(`promptFamily: '${promptFamily}'`);
+      const frame = clientSource.slice(familyStart, familyStart + 1200);
+
+      expect(familyStart).toBeGreaterThan(-1);
+      expect(frame).toContain(providerBinding);
+      expect(frame).toContain('requestIdentity:');
+      expect(frame).toContain('ownerId:');
+      expect(frame).toContain('interactionContext:');
+    }
+  });
+
   test('registry-owns the complete multi-account Connected Accounts contract', () => {
     const agentsSource = yaml.load(
       fs.readFileSync(sourcePath('local.viventium-agents.yaml'), 'utf8'),

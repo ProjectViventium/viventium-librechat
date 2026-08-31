@@ -51,6 +51,12 @@ TERMINAL_SCHEDULED_PROMPT_RUN_STATUSES = (
     "cancelled",
     "missed",
 )
+LATEST_SCHEDULED_PROMPT_RUN_ORDER_BY = """
+    COALESCE(started_at, created_at) DESC,
+    COALESCE(due_at, created_at) DESC,
+    created_at DESC,
+    rowid DESC
+"""
 DEFAULT_SCHEDULED_PROMPT_RECOVERY_SECONDS = 15 * 60
 DEFAULT_EXTERNAL_WORK_STALE_SECONDS = 24 * 60 * 60
 SCHEDULER_DEFERRED_OCCURRENCE_KEY = "scheduler_deferred_occurrence_v1"
@@ -1327,7 +1333,14 @@ class ScheduleStorage:
         return self._row_to_task(row)
     # === VIVENTIUM NOTE ===
 
-    def update_task(self, user_id: str, task_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def update_task(
+        self,
+        user_id: str,
+        task_id: str,
+        updates: Dict[str, Any],
+        *,
+        expected_latest_scheduled_run_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         if not updates:
             return self.get_task(user_id, task_id)
 
@@ -1407,13 +1420,40 @@ class ScheduleStorage:
 
         assignments = ", ".join([f"{key} = ?" for key in payload.keys()])
         params = list(payload.values()) + [task_id, user_id]
-        sql = f"UPDATE scheduled_tasks SET {assignments} WHERE id = ? AND user_id = ?"
+        latest_guard = ""
+        if expected_latest_scheduled_run_id is not None:
+            latest_guard = f"""
+                AND ? = (
+                    SELECT run_id
+                    FROM scheduled_prompt_runs
+                    WHERE task_id = ? AND user_id = ?
+                    ORDER BY {LATEST_SCHEDULED_PROMPT_RUN_ORDER_BY}
+                    LIMIT 1
+                )
+            """
+            params.extend(
+                [
+                    str(expected_latest_scheduled_run_id),
+                    task_id,
+                    user_id,
+                ]
+            )
+        sql = f"""
+            UPDATE scheduled_tasks
+            SET {assignments}
+            WHERE id = ? AND user_id = ?
+            {latest_guard}
+        """
         with self._connect() as conn:
-            conn.execute(sql, params)
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(sql, params)
         # === VIVENTIUM NOTE ===
         # Feature: Mirror updated DB after writes.
-        self._sync_to_mirror()
+        if cursor.rowcount:
+            self._sync_to_mirror()
         # === VIVENTIUM NOTE ===
+        if expected_latest_scheduled_run_id is not None and cursor.rowcount == 0:
+            return None
         return self.get_task(user_id, task_id)
 
     def delete_task(self, user_id: str, task_id: str) -> bool:
@@ -2634,6 +2674,250 @@ class ScheduleStorage:
             "current_callback_id": str(current["callback_id"] or ""),
         }
 
+    def claim_legacy_scheduled_terminal_callback_effect(
+        self,
+        *,
+        owner_id: str,
+        work_id: str,
+        payload: Dict[str, Any],
+        lease_seconds: int = 120,
+    ) -> Dict[str, Any]:
+        """Claim synthetic revision zero before any legacy terminal side effect."""
+
+        clean_owner = str(owner_id or "").strip()
+        clean_work = str(work_id or "").strip()
+        if not clean_owner or not clean_work or not isinstance(payload, dict):
+            raise ValueError("Legacy terminal callback scope is invalid")
+        supplied_callback_id = str(payload.get("callback_id") or "").strip()
+        supplied_event = str(payload.get("event") or "").strip()
+        supplied_run_id = str(payload.get("run_id") or "").strip()
+        supplied_worker_id = str(payload.get("worker_id") or "").strip()
+        supplied_owner = str(payload.get("user_id") or "").strip()
+        supplied_message_id = str(payload.get("message_id") or "").strip()
+        supplied_scheduled_run_id = str(
+            payload.get("scheduled_prompt_run_id") or ""
+        ).strip()
+        if (
+            (
+                supplied_callback_id
+                and (
+                    len(supplied_callback_id) > 512
+                    or any(
+                        ord(character) < 33
+                        for character in supplied_callback_id
+                    )
+                )
+            )
+            or supplied_event
+            not in {
+                "run.completed",
+                "run.failed",
+                "run.cancelled",
+                "run.interrupted",
+            }
+            or not supplied_run_id
+            or not supplied_worker_id
+            or (supplied_owner and supplied_owner != clean_owner)
+            or (
+                supplied_message_id and supplied_message_id != clean_work
+            )
+            or (
+                supplied_scheduled_run_id
+                and supplied_scheduled_run_id != clean_work
+            )
+        ):
+            raise ValueError("Legacy terminal callback identity is invalid")
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if supplied_callback_id:
+            replay_key = supplied_callback_id
+        else:
+            undefined = object()
+
+            def javascript_stable_stringify(value: Any) -> str:
+                if value is undefined:
+                    return "undefined"
+                if value is None:
+                    return "null"
+                if isinstance(value, bool):
+                    return "true" if value else "false"
+                if isinstance(value, str):
+                    return json.dumps(value, ensure_ascii=False)
+                if isinstance(value, (int, float)):
+                    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                if isinstance(value, list):
+                    return "[" + ",".join(
+                        javascript_stable_stringify(item) for item in value
+                    ) + "]"
+                if isinstance(value, dict):
+                    return "{" + ",".join(
+                        json.dumps(str(key), ensure_ascii=False)
+                        + ":"
+                        + javascript_stable_stringify(value[key])
+                        for key in sorted(value)
+                    ) + "}"
+                return "undefined"
+
+            replay_material = {
+                key: payload[key] if key in payload else undefined
+                for key in (
+                    "event",
+                    "worker_id",
+                    "run_id",
+                    "conversation_id",
+                    "message",
+                )
+            }
+            replay_key = hashlib.sha256(
+                javascript_stable_stringify(replay_material).encode("utf-8")
+            ).hexdigest()
+
+        stable_identity_json = json.dumps(
+            {
+                "callback_id": replay_key,
+                "event": supplied_event,
+                "owner_id": clean_owner,
+                "run_id": supplied_run_id,
+                "work_id": clean_work,
+                "worker_id": supplied_worker_id,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        fingerprint = hashlib.sha256(
+            stable_identity_json.encode("utf-8")
+        ).hexdigest()
+        callback_id = "cb_legacy_" + fingerprint
+        result_digest = "sha256:" + fingerprint
+        now_value = datetime.now(timezone.utc)
+        now = now_value.isoformat()
+        lease_until = (
+            now_value + timedelta(seconds=max(1, lease_seconds))
+        ).isoformat()
+        lease_token = "receiver_" + uuid.uuid4().hex
+        claimed = False
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """
+                SELECT * FROM scheduled_terminal_callback_results
+                WHERE owner_id = ? AND work_id = ?
+                """,
+                (clean_owner, clean_work),
+            ).fetchone()
+            if current is None:
+                conn.execute(
+                    """
+                    INSERT INTO scheduled_terminal_callback_results (
+                      owner_id, work_id, callback_id, result_revision,
+                      result_digest, payload_json, effect_state,
+                      effect_lease_token, effect_lease_until, updated_at
+                    ) VALUES (?, ?, ?, 0, ?, ?, 'applying', ?, ?, ?)
+                    """,
+                    (
+                        clean_owner,
+                        clean_work,
+                        callback_id,
+                        result_digest,
+                        payload_json,
+                        lease_token,
+                        lease_until,
+                        now,
+                    ),
+                )
+                status = "accepted"
+                claimed = True
+            else:
+                current_revision = int(current["result_revision"] or 0)
+                exact = bool(
+                    current_revision == 0
+                    and str(current["callback_id"] or "") == callback_id
+                    and str(current["result_digest"] or "") == result_digest
+                )
+                current_lease_until = self._parse_utc_instant(
+                    current["effect_lease_until"]
+                )
+                active_lease = bool(
+                    str(current["effect_state"] or "") == "applying"
+                    and current_lease_until is not None
+                    and current_lease_until > now_value
+                )
+                if current_revision > 0:
+                    status = "superseded"
+                elif not exact:
+                    status = "conflict"
+                elif str(current["effect_state"] or "") == "committed":
+                    status = "idempotent"
+                elif active_lease:
+                    status = "effects_in_progress"
+                else:
+                    cursor = conn.execute(
+                        """
+                        UPDATE scheduled_terminal_callback_results
+                        SET effect_state = 'applying', effect_lease_token = ?,
+                            effect_lease_until = ?, updated_at = ?
+                        WHERE owner_id = ? AND work_id = ?
+                          AND result_revision = 0 AND callback_id = ?
+                          AND result_digest = ? AND effect_state != 'committed'
+                        """,
+                        (
+                            lease_token,
+                            lease_until,
+                            now,
+                            clean_owner,
+                            clean_work,
+                            callback_id,
+                            result_digest,
+                        ),
+                    )
+                    claimed = cursor.rowcount == 1
+                    status = "replay_pending" if claimed else "effects_in_progress"
+            current = conn.execute(
+                """
+                SELECT * FROM scheduled_terminal_callback_results
+                WHERE owner_id = ? AND work_id = ?
+                """,
+                (clean_owner, clean_work),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO scheduled_terminal_callback_attempts (
+                  owner_id, work_id, callback_id, result_revision,
+                  result_digest, status, current_result_revision,
+                  current_result_digest, created_at
+                ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_owner,
+                    clean_work,
+                    callback_id,
+                    result_digest,
+                    status,
+                    int(current["result_revision"] or 0),
+                    str(current["result_digest"] or ""),
+                    now,
+                ),
+            )
+            conn.execute("COMMIT")
+        self._sync_to_mirror()
+        return {
+            "claimed": claimed,
+            "callback_status": status,
+            "callback_id": callback_id,
+            "result_revision": 0,
+            "result_digest": result_digest,
+            "lease_token": lease_token if claimed else "",
+            "current_result_revision": int(current["result_revision"] or 0),
+            "current_result_digest": str(current["result_digest"] or ""),
+            "current_callback_id": str(current["callback_id"] or ""),
+        }
+
     def claim_scheduled_terminal_callback_effect(
         self,
         *,
@@ -2641,7 +2925,7 @@ class ScheduleStorage:
         work_id: str,
         result_revision: int,
         result_digest: str,
-        lease_seconds: int = 60,
+        lease_seconds: int = 120,
     ) -> Dict[str, Any]:
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
@@ -2893,7 +3177,7 @@ class ScheduleStorage:
                 f"""
                 SELECT * FROM scheduled_prompt_runs
                 {where}
-                ORDER BY COALESCE(started_at, created_at) DESC
+                ORDER BY {LATEST_SCHEDULED_PROMPT_RUN_ORDER_BY}
                 LIMIT ? OFFSET ?
                 """,
                 params,

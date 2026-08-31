@@ -434,8 +434,9 @@ class BootstrapEndpointTests(unittest.TestCase):
                     },
                 )
 
-            self.assertEqual(response.status_code, 404)
-            self.assertEqual(response.json()["reason"], "callback_not_ready")
+            self.assertEqual(response.status_code, 425)
+            self.assertEqual(response.json()["reason"], "worker_binding_pending")
+            self.assertTrue(response.json()["retryable"])
             persisted = storage.get_scheduled_prompt_run("scheduled-run-1")
             self.assertEqual(persisted["status"], "failed")
 

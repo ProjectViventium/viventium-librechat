@@ -969,7 +969,13 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         binding = f"{worker_id}:{run_id}".encode("utf-8")
         derived_secret = hmac.new(secret.encode("utf-8"), binding, hashlib.sha256).hexdigest().encode("utf-8")
         expected = "sha256=" + hmac.new(derived_secret, payload, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, signature)
+        return hmac.compare_digest(expected.encode("utf-8"), signature.encode("utf-8"))
+
+    def _constant_time_text_equal(left: str, right: str) -> bool:
+        return hmac.compare_digest(
+            str(left).encode("utf-8"),
+            str(right).encode("utf-8"),
+        )
 
     _local_path_re = re.compile(r"(?:/Users|/home|/private/var|/var/folders)/[^\s`'\"<>]+")
     _url_re = re.compile(r"https?:\/\/[^\s`'\"<>)]*", re.IGNORECASE)
@@ -1001,7 +1007,13 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             return None
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
-    def _append_private_callback(run: Dict[str, Any], payload: Dict[str, Any], received_at: str) -> Dict[str, Any]:
+    def _append_private_callback(
+        run: Dict[str, Any],
+        payload: Dict[str, Any],
+        received_at: str,
+        *,
+        callback_identity: str | None = None,
+    ) -> Dict[str, Any]:
         path_value = str(run.get("private_detail_path") or "").strip()
         if not path_value:
             return {}
@@ -1011,7 +1023,34 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         except Exception:
             data = {}
         callbacks = data.get("callbacks") if isinstance(data.get("callbacks"), list) else []
-        callbacks.append({"received_at": received_at, "payload": payload})
+        callback_id = str(payload.get("callback_id") or "").strip()
+        effective_identity = str(callback_identity or callback_id).strip()
+        replay_identities = {
+            identity for identity in (effective_identity, callback_id) if identity
+        }
+        callback_already_recorded = bool(
+            replay_identities
+            and any(
+                isinstance(item, dict)
+                and (
+                    str(item.get("callback_identity") or "").strip()
+                    in replay_identities
+                    or (
+                        isinstance(item.get("payload"), dict)
+                        and str(
+                            item["payload"].get("callback_id") or ""
+                        ).strip()
+                        in replay_identities
+                    )
+                )
+                for item in callbacks
+            )
+        )
+        if not callback_already_recorded:
+            callback_record = {"received_at": received_at, "payload": payload}
+            if effective_identity:
+                callback_record["callback_identity"] = effective_identity
+            callbacks.append(callback_record)
         data["callbacks"] = callbacks[-20:]
         try:
             path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1028,11 +1067,11 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         error_class: str | None,
         payload: Dict[str, Any],
         received_at: str,
-    ) -> None:
+    ) -> str:
         task_id = str(run.get("task_id") or "").strip()
         user_id = str(run.get("user_id") or "").strip()
         if not task_id or not user_id:
-            return
+            return "not_applicable"
         event = str(payload.get("event") or "").strip()
         delivery = {
             "outcome": "failed" if status == "failed" else ("sent" if status == "completed" else "queued"),
@@ -1059,7 +1098,13 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         else:
             updates["last_status"] = "running"
             updates["last_error"] = None
-        storage.update_task(user_id, task_id, updates)
+        updated = storage.update_task(
+            user_id,
+            task_id,
+            updates,
+            expected_latest_scheduled_run_id=str(run.get("run_id") or ""),
+        )
+        return "updated" if updated is not None else "fenced"
 
     def _proposal_files(my_folder: str, started_at: str | None) -> list[Path]:
         root = Path(my_folder).expanduser()
@@ -1089,7 +1134,37 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
                 return candidate
         return None
 
-    def _maybe_apply_governed_memory(run: Dict[str, Any], private_detail: Dict[str, Any]) -> dict[str, Any] | None:
+    def _maybe_apply_governed_memory(
+        run: Dict[str, Any],
+        private_detail: Dict[str, Any],
+        *,
+        terminal_result: Dict[str, Any] | None = None,
+        legacy_callback_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        checkpoint = private_detail.get("memory_apply_terminal_result")
+        legacy_checkpoint = private_detail.get("memory_apply_legacy_callback")
+        previous_result = private_detail.get("memory_apply")
+        if (
+            terminal_result is not None
+            and isinstance(checkpoint, dict)
+            and isinstance(previous_result, dict)
+            and str(checkpoint.get("callback_id") or "")
+            == str(terminal_result.get("callback_id") or "")
+            and checkpoint.get("result_revision")
+            == terminal_result.get("result_revision")
+            and str(checkpoint.get("result_digest") or "")
+            == str(terminal_result.get("result_digest") or "")
+        ):
+            return dict(previous_result)
+        if (
+            terminal_result is None
+            and legacy_callback_id
+            and isinstance(legacy_checkpoint, dict)
+            and isinstance(previous_result, dict)
+            and str(legacy_checkpoint.get("callback_id") or "")
+            == legacy_callback_id
+        ):
+            return dict(previous_result)
         if str(private_detail.get("memory_write_mode") or "").strip() != "apply_governed":
             return None
         my_folder = str(private_detail.get("my_folder") or "").strip()
@@ -1117,6 +1192,16 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         if completed.returncode not in {0, 2}:
             result = {"ok": False, "reason": "helper_failed"}
         private_detail["memory_apply"] = result
+        if terminal_result is not None:
+            private_detail["memory_apply_terminal_result"] = {
+                "callback_id": str(terminal_result.get("callback_id") or ""),
+                "result_revision": terminal_result.get("result_revision"),
+                "result_digest": str(terminal_result.get("result_digest") or ""),
+            }
+        elif legacy_callback_id:
+            private_detail["memory_apply_legacy_callback"] = {
+                "callback_id": legacy_callback_id,
+            }
         try:
             detail_path = Path(str(run.get("private_detail_path") or "")).expanduser()
             if detail_path:
@@ -1153,25 +1238,291 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         if not run:
             return JSONResponse({"status": "error", "reason": "unknown_run"}, status_code=404)
 
+        terminal_events = {
+            "run.completed",
+            "run.failed",
+            "run.cancelled",
+            "run.interrupted",
+        }
+        canonical_terminal_identity_present = bool(
+            str(payload.get("callback_id") or "").startswith("cb_terminal_")
+            or any(
+                field in payload
+                for field in (
+                    "result_revision",
+                    "result_digest",
+                    "result_state",
+                    "result_ended_at",
+                )
+            )
+        )
+        terminal_receiver: dict[str, Any] | None = None
+
+        def terminal_response(
+            decision: dict[str, Any],
+            *,
+            status_code: int,
+            callback_persisted: bool,
+            parent_update: str | None = None,
+        ) -> JSONResponse:
+            response_payload: dict[str, Any] = {
+                "status": "http_accepted" if status_code < 300 else "error",
+                "run_id": run_id,
+                "scheduled_prompt_run_id": str(run["run_id"]),
+                "callback_persisted": callback_persisted,
+                "callback_status": str(decision.get("callback_status") or ""),
+                "callback_id": str(decision.get("callback_id") or ""),
+                "result_revision": decision.get("result_revision"),
+                "result_digest": str(decision.get("result_digest") or ""),
+                "current_result_revision": decision.get(
+                    "current_result_revision"
+                ),
+                "current_result_digest": str(
+                    decision.get("current_result_digest") or ""
+                ),
+                "current_callback_id": str(
+                    decision.get("current_callback_id") or ""
+                ),
+            }
+            if parent_update is not None:
+                response_payload["parent_update"] = parent_update
+            return JSONResponse(
+                response_payload,
+                status_code=status_code,
+            )
+
+        if event in terminal_events:
+            expected_worker_id = str(run.get("glasshive_worker_id") or "").strip()
+            if not expected_worker_id:
+                return JSONResponse(
+                    {
+                        "status": "error",
+                        "reason": "worker_binding_pending",
+                        "retryable": True,
+                        "callback_status": "binding_pending",
+                        "scheduled_prompt_run_id": str(run["run_id"]),
+                    },
+                    status_code=425,
+                )
+            if not _constant_time_text_equal(expected_worker_id, worker_id):
+                return JSONResponse(
+                    {"status": "error", "reason": "worker_mismatch"},
+                    status_code=409,
+                )
+            expected_run_id = str(run.get("glasshive_run_id") or "").strip()
+            if not expected_run_id and callback_run_id == str(run.get("run_id") or ""):
+                return JSONResponse(
+                    {
+                        "status": "error",
+                        "reason": "run_binding_pending",
+                        "retryable": True,
+                        "callback_status": "binding_pending",
+                        "scheduled_prompt_run_id": str(run["run_id"]),
+                    },
+                    status_code=425,
+                )
+            if not expected_run_id or not _constant_time_text_equal(expected_run_id, run_id):
+                return JSONResponse(
+                    {"status": "error", "reason": "run_mismatch"},
+                    status_code=409,
+                )
+            if canonical_terminal_identity_present:
+                try:
+                    decision = storage.accept_scheduled_terminal_callback_result(
+                        owner_id=str(run.get("user_id") or ""),
+                        work_id=str(run["run_id"]),
+                        payload=payload,
+                    )
+                except ValueError:
+                    return JSONResponse(
+                        {"status": "error", "reason": "invalid_terminal_identity"},
+                        status_code=400,
+                    )
+            else:
+                decision = None
+                try:
+                    legacy_claim = (
+                        storage.claim_legacy_scheduled_terminal_callback_effect(
+                            owner_id=str(run.get("user_id") or ""),
+                            work_id=str(run["run_id"]),
+                            payload=payload,
+                        )
+                    )
+                except ValueError:
+                    return JSONResponse(
+                        {"status": "error", "reason": "invalid_terminal_identity"},
+                        status_code=400,
+                    )
+                legacy_status = str(
+                    legacy_claim.get("callback_status") or ""
+                )
+                if not legacy_claim.get("claimed"):
+                    if legacy_status == "effects_in_progress":
+                        return terminal_response(
+                            legacy_claim,
+                            status_code=425,
+                            callback_persisted=False,
+                        )
+                    return terminal_response(
+                        {
+                            **legacy_claim,
+                            "callback_status": "legacy_ignored",
+                        },
+                        status_code=200,
+                        callback_persisted=False,
+                        parent_update="not_attempted",
+                    )
+                if (
+                    legacy_status == "accepted"
+                    and str(run.get("status") or "") in {"completed", "failed"}
+                    and not _glasshive_callback_reconciliation_allowed(run, event)
+                ):
+                    storage.complete_scheduled_terminal_callback_effect(
+                        owner_id=str(run.get("user_id") or ""),
+                        work_id=str(run["run_id"]),
+                        result_revision=0,
+                        result_digest=str(legacy_claim["result_digest"]),
+                        lease_token=str(legacy_claim["lease_token"]),
+                    )
+                    return terminal_response(
+                        {
+                            **legacy_claim,
+                            "callback_status": "legacy_ignored",
+                        },
+                        status_code=200,
+                        callback_persisted=False,
+                        parent_update="not_attempted",
+                    )
+                terminal_receiver = {
+                    **legacy_claim,
+                    "owner_id": str(run.get("user_id") or ""),
+                    "work_id": str(run["run_id"]),
+                    "legacy": True,
+                }
+            if decision is not None:
+                callback_status = str(decision.get("callback_status") or "")
+                if callback_status in {"superseded", "conflict"}:
+                    return terminal_response(
+                        decision, status_code=409, callback_persisted=False
+                    )
+                if callback_status == "effects_in_progress":
+                    return terminal_response(
+                        decision, status_code=425, callback_persisted=False
+                    )
+                if callback_status == "idempotent":
+                    return terminal_response(
+                        decision, status_code=200, callback_persisted=False
+                    )
+                owner_id = str(run.get("user_id") or "")
+                work_id = str(run["run_id"])
+                lease = storage.claim_scheduled_terminal_callback_effect(
+                    owner_id=owner_id,
+                    work_id=work_id,
+                    result_revision=int(decision["result_revision"]),
+                    result_digest=str(decision["result_digest"]),
+                )
+                if not lease.get("claimed"):
+                    current = storage.get_scheduled_terminal_callback_result(
+                        owner_id=owner_id,
+                        work_id=work_id,
+                    )
+                    current_revision = int((current or {}).get("result_revision") or 0)
+                    if current_revision > int(decision["result_revision"]):
+                        superseded = {
+                            **decision,
+                            "callback_status": "superseded",
+                            "current_result_revision": current_revision,
+                            "current_result_digest": str(
+                                (current or {}).get("result_digest") or ""
+                            ),
+                            "current_callback_id": str(
+                                (current or {}).get("callback_id") or ""
+                            ),
+                        }
+                        return terminal_response(
+                            superseded, status_code=409, callback_persisted=False
+                        )
+                    return JSONResponse(
+                        {"status": "error", "reason": "callback_effect_in_progress"},
+                        status_code=503,
+                    )
+                terminal_receiver = {
+                    **decision,
+                    "owner_id": owner_id,
+                    "work_id": work_id,
+                    "lease_token": str(lease["lease_token"]),
+                }
+
+        def receiver_effect_is_current() -> bool:
+            if terminal_receiver is None:
+                return True
+            return storage.scheduled_terminal_callback_effect_is_current(
+                owner_id=terminal_receiver["owner_id"],
+                work_id=terminal_receiver["work_id"],
+                result_revision=int(terminal_receiver["result_revision"]),
+                result_digest=str(terminal_receiver["result_digest"]),
+                lease_token=str(terminal_receiver["lease_token"]),
+            )
+
+        def receiver_lost_response() -> JSONResponse:
+            if terminal_receiver is None:
+                return JSONResponse(
+                    {"status": "error", "reason": "callback_effect_lost"},
+                    status_code=503,
+                )
+            current = storage.get_scheduled_terminal_callback_result(
+                owner_id=terminal_receiver["owner_id"],
+                work_id=terminal_receiver["work_id"],
+            )
+            current_revision = int((current or {}).get("result_revision") or 0)
+            if current_revision > int(terminal_receiver["result_revision"]):
+                lost = {
+                    **terminal_receiver,
+                    "callback_status": (
+                        "legacy_superseded"
+                        if terminal_receiver.get("legacy")
+                        else "superseded"
+                    ),
+                    "current_result_revision": current_revision,
+                    "current_result_digest": str(
+                        (current or {}).get("result_digest") or ""
+                    ),
+                    "current_callback_id": str(
+                        (current or {}).get("callback_id") or ""
+                    ),
+                }
+                return terminal_response(
+                    lost,
+                    status_code=(200 if terminal_receiver.get("legacy") else 409),
+                    callback_persisted=False,
+                )
+            return JSONResponse(
+                {"status": "error", "reason": "callback_effect_lost"},
+                status_code=503,
+            )
+
         now = _now_iso()
         terminal_before_callback = str(run.get("status") or "") in {"completed", "failed"}
-        callback_reconciliation_allowed = _glasshive_callback_reconciliation_allowed(run, event)
+        callback_reconciliation_allowed = bool(
+            terminal_receiver is not None
+            or _glasshive_callback_reconciliation_allowed(run, event)
+        )
         status, disposition, completed_at, error_class = _glasshive_callback_lifecycle(
-            run, event, payload, now
+            run,
+            event,
+            payload,
+            now,
+            authoritative_terminal=terminal_receiver is not None,
         )
 
-        private_detail = _append_private_callback(run, payload, now)
+        if not receiver_effect_is_current():
+            return receiver_lost_response()
+        private_detail: Dict[str, Any] = {}
         # GlassHive now mints and revokes capability grants inside the execution boundary. Scheduling
         # Cortex persists only identity/work references and must never receive broker credentials.
         capability_revocation: Dict[str, Any] | None = None
-        memory_apply = _maybe_apply_governed_memory(run, private_detail) if event == "run.completed" else None
-        if memory_apply and not memory_apply.get("ok"):
-            error_class = str(memory_apply.get("reason") or "memory_apply_blocked")
-            result_summary = f"GlassHive run completed; governed memory apply blocked: {error_class}."
-        elif memory_apply and memory_apply.get("ok"):
-            result_summary = "GlassHive run completed; governed memory proposal applied."
-        else:
-            result_summary = _safe_callback_summary(payload, status, error_class)
+        memory_apply: dict[str, Any] | None = None
+        result_summary = _safe_callback_summary(payload, status, error_class)
 
         callback_summary = {
             "event": event,
@@ -1179,7 +1530,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             "status": status,
             "message_hash": _hash_payload_text(payload),
             "has_private_payload": bool(payload.get("message") or payload.get("full_message") or payload.get("error")),
-            "memory_apply_reason": memory_apply.get("reason") if isinstance(memory_apply, dict) else None,
+            "memory_apply_reason": None,
             "capability_revocation_status": (
                 capability_revocation.get("status")
                 if isinstance(capability_revocation, dict)
@@ -1196,30 +1547,177 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             else None,
         }
 
-        if not terminal_before_callback or callback_reconciliation_allowed:
-            storage.update_scheduled_prompt_run(
+        updates = {
+            "status": status,
+            "disposition": disposition,
+            "completed_at": completed_at,
+            "result_summary": result_summary or run.get("result_summary"),
+            "error_class": error_class,
+            "callback_payload_json": json.dumps(callback_summary),
+            "updated_at": now,
+        }
+        if terminal_receiver is None:
+            callback_persisted = False
+            if not terminal_before_callback or callback_reconciliation_allowed:
+                private_detail = _append_private_callback(run, payload, now)
+                callback_persisted = bool(
+                    storage.update_scheduled_prompt_run(
+                        str(run["run_id"]), updates
+                    )
+                )
+                _update_parent_task_for_glasshive_callback(
+                    run,
+                    status=status,
+                    result_summary=result_summary
+                    or str(run.get("result_summary") or ""),
+                    error_class=error_class,
+                    payload=payload,
+                    received_at=now,
+                )
+            return JSONResponse({"status": "http_accepted", "run_id": run["run_id"]})
+
+        if not receiver_effect_is_current():
+            return receiver_lost_response()
+        applied = storage.update_scheduled_prompt_run_if_current(
+            str(run["run_id"]),
+            updates,
+            expected_status=str(run.get("status") or ""),
+            expected_error_class=run.get("error_class"),
+        )
+        if not applied.get("updated"):
+            storage.release_scheduled_terminal_callback_effect(
+                owner_id=terminal_receiver["owner_id"],
+                work_id=terminal_receiver["work_id"],
+                result_revision=int(terminal_receiver["result_revision"]),
+                result_digest=str(terminal_receiver["result_digest"]),
+                lease_token=str(terminal_receiver["lease_token"]),
+            )
+            return JSONResponse(
+                {"status": "error", "reason": "callback_effect_not_persisted"},
+                status_code=503,
+            )
+        persisted_run = applied.get("run") or run
+        if not receiver_effect_is_current():
+            return receiver_lost_response()
+        private_detail = _append_private_callback(
+            persisted_run,
+            payload,
+            now,
+            callback_identity=str(terminal_receiver.get("callback_id") or ""),
+        )
+        # Governed memory application is an external side effect. Run it only after the
+        # lifecycle compare-and-swap wins, otherwise a stale callback could still mutate memory.
+        if (
+            event == "run.completed"
+            and status == "completed"
+            and receiver_effect_is_current()
+        ):
+            memory_apply = _maybe_apply_governed_memory(
+                persisted_run,
+                private_detail,
+                terminal_result=(
+                    None if terminal_receiver.get("legacy") else terminal_receiver
+                ),
+                legacy_callback_id=(
+                    str(terminal_receiver.get("callback_id") or "")
+                    if terminal_receiver.get("legacy")
+                    else None
+                ),
+            )
+        if memory_apply and not memory_apply.get("ok"):
+            error_class = str(memory_apply.get("reason") or "memory_apply_blocked")
+            result_summary = (
+                "GlassHive run completed; governed memory apply blocked: "
+                f"{error_class}."
+            )
+        elif memory_apply and memory_apply.get("ok"):
+            result_summary = "GlassHive run completed; governed memory proposal applied."
+        if isinstance(memory_apply, dict):
+            callback_summary["memory_apply_reason"] = memory_apply.get("reason")
+            if not receiver_effect_is_current():
+                return receiver_lost_response()
+            memory_update = storage.update_scheduled_prompt_run_if_current(
                 str(run["run_id"]),
                 {
-                    "status": status,
-                    "disposition": disposition,
-                    "completed_at": completed_at,
-                    "result_summary": result_summary or run.get("result_summary"),
+                    "result_summary": result_summary,
                     "error_class": error_class,
                     "callback_payload_json": json.dumps(callback_summary),
                     "updated_at": now,
                 },
+                expected_status=status,
+                expected_error_class=(applied.get("run") or {}).get("error_class"),
             )
-            _update_parent_task_for_glasshive_callback(
-                run,
-                status=status,
-                result_summary=result_summary or str(run.get("result_summary") or ""),
-                error_class=error_class,
-                payload=payload,
-                received_at=now,
+            if not memory_update.get("updated"):
+                released = storage.release_scheduled_terminal_callback_effect(
+                    owner_id=terminal_receiver["owner_id"],
+                    work_id=terminal_receiver["work_id"],
+                    result_revision=int(terminal_receiver["result_revision"]),
+                    result_digest=str(terminal_receiver["result_digest"]),
+                    lease_token=str(terminal_receiver["lease_token"]),
+                )
+                if not released:
+                    return receiver_lost_response()
+                return JSONResponse(
+                    {
+                        "status": "error",
+                        "reason": "memory_effect_result_not_persisted",
+                        "run_id": run_id,
+                        "scheduled_prompt_run_id": str(run["run_id"]),
+                        "callback_persisted": False,
+                        "callback_status": "effect_result_not_persisted",
+                        "callback_id": str(terminal_receiver.get("callback_id") or ""),
+                        "result_revision": terminal_receiver.get("result_revision"),
+                        "result_digest": str(
+                            terminal_receiver.get("result_digest") or ""
+                        ),
+                        "lifecycle_persisted": True,
+                        "memory_effect_attempted": True,
+                        "memory_effect_applied": bool(memory_apply.get("ok")),
+                        "retryable": True,
+                    },
+                    status_code=503,
+                )
+            persisted_run = memory_update.get("run") or persisted_run
+            result_summary = str(
+                persisted_run.get("result_summary") or result_summary or ""
             )
-            if event == "run.completed":
-                _refresh_workbench_periphery_index(run)
-        return JSONResponse({"status": "http_accepted", "run_id": run["run_id"]})
+            error_class = persisted_run.get("error_class")
+        if not receiver_effect_is_current():
+            return receiver_lost_response()
+        parent_update = _update_parent_task_for_glasshive_callback(
+            persisted_run,
+            status=status,
+            result_summary=result_summary or str(run.get("result_summary") or ""),
+            error_class=error_class,
+            payload=payload,
+            received_at=now,
+        )
+        if event == "run.completed" and status == "completed":
+            if not receiver_effect_is_current():
+                return receiver_lost_response()
+            _refresh_workbench_periphery_index(persisted_run)
+        if not storage.complete_scheduled_terminal_callback_effect(
+            owner_id=terminal_receiver["owner_id"],
+            work_id=terminal_receiver["work_id"],
+            result_revision=int(terminal_receiver["result_revision"]),
+            result_digest=str(terminal_receiver["result_digest"]),
+            lease_token=str(terminal_receiver["lease_token"]),
+        ):
+            return receiver_lost_response()
+        accepted = {
+            **terminal_receiver,
+            "callback_status": (
+                "legacy_accepted"
+                if terminal_receiver.get("legacy")
+                else "accepted"
+            ),
+        }
+        return terminal_response(
+            accepted,
+            status_code=200,
+            callback_persisted=True,
+            parent_update=parent_update,
+        )
     # === VIVENTIUM END ===
 
     # === VIVENTIUM START ===

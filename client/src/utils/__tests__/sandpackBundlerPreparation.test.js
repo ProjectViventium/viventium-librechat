@@ -53,12 +53,16 @@ describe('local Sandpack bundler preparation', () => {
       fs.writeFileSync(path.join(destinationRoot, 'index.html'), 'stale output');
       fs.writeFileSync(path.join(destinationRoot, 'unexpected.txt'), 'stale extra file');
       let copies = 0;
-      const result = prepareSandpackBundler({ destinationRoot, copyFile: (source, destination) => {
-        copies += 1;
-        fs.copyFileSync(source, destination);
-        const index = path.join(destinationRoot, 'index.html');
-        if (fs.existsSync(index)) expect(sha256(fs.readFileSync(index))).toBe(PINNED_OUTPUT_INDEX_SHA256);
-      } });
+      const result = prepareSandpackBundler({
+        destinationRoot,
+        copyFile: (source, destination) => {
+          copies += 1;
+          fs.copyFileSync(source, destination);
+          const index = path.join(destinationRoot, 'index.html');
+          if (fs.existsSync(index))
+            expect(sha256(fs.readFileSync(index))).toBe(PINNED_OUTPUT_INDEX_SHA256);
+        },
+      });
       expect(copies).toBeGreaterThan(0);
       expect(fs.existsSync(path.join(destinationRoot, 'unexpected.txt'))).toBe(false);
       expect(result.outputTreeSha256).toBe(PINNED_OUTPUT_TREE_SHA256);

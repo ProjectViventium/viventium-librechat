@@ -1479,30 +1479,34 @@ describe('conversationRecallService', () => {
     mockFileFindOneAndUpdate.mockReturnValue(queryResult({ _id: 'file_all' }));
 
     const service = require('../conversationRecallService');
+    const scheduleTimer = jest.spyOn(global, 'setTimeout');
     service.scheduleConversationRecallSync({
       userId: 'user_1',
       conversationId: 'conv_committed',
     });
 
     expect(afterCommit).toHaveLength(1);
-    expect(jest.getTimerCount()).toBe(0);
+    expect(scheduleTimer).not.toHaveBeenCalled();
     expect(mockMessageFind).not.toHaveBeenCalled();
 
     await afterCommit[0]();
+    expect(scheduleTimer).toHaveBeenCalledTimes(1);
     await jest.runOnlyPendingTimersAsync();
     await Promise.resolve();
 
     expect(mockMessageFind).toHaveBeenCalledTimes(1);
 
+    scheduleTimer.mockClear();
     service.scheduleConversationRecallSync({
       userId: 'user_1',
       conversationId: 'conv_aborted',
     });
     expect(afterCommit).toHaveLength(2);
-    expect(jest.getTimerCount()).toBe(0);
+    expect(scheduleTimer).not.toHaveBeenCalled();
 
     await jest.runOnlyPendingTimersAsync();
     expect(mockMessageFind).toHaveBeenCalledTimes(1);
+    scheduleTimer.mockRestore();
   });
 
   test('applies cooldown after transient sync failure', async () => {

@@ -91,10 +91,7 @@ export default function MultiMessage({
             ? MessageContent
             : Message;
       return (
-        <MessageInputBranchContext.Provider
-          key={message.messageId}
-          value={ownsInput && isSelected}
-        >
+        <MessageInputBranchContext.Provider key={message.messageId} value={ownsInput && isSelected}>
           <MessageComponent
             message={message}
             currentEditId={currentEditId}

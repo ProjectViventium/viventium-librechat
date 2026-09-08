@@ -14,7 +14,10 @@ import { renderHook, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { ContentTypes, QueryKeys, ToolCallTypes } from 'librechat-data-provider';
 import type { TMessage } from 'librechat-data-provider';
-import type { ActiveWorkSnapshot, WorkSummary } from '~/data-provider/ViventiumOrchestration/queries';
+import type {
+  ActiveWorkSnapshot,
+  WorkSummary,
+} from '~/data-provider/ViventiumOrchestration/queries';
 import useCortexFollowUpPoll from '~/hooks/Viventium/useCortexFollowUpPoll';
 
 describe('useCortexFollowUpPoll', () => {
@@ -413,24 +416,53 @@ describe('useCortexFollowUpPoll', () => {
     queryClient.setQueryData([QueryKeys.startupConfig], { viventiumBackgroundFollowupWindowS: 30 });
     const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
     const conversationId = 'late-result';
-    let messages = [{ messageId: 'parent', conversationId, isCreatedByUser: false,
-      createdAt: new Date().toISOString(), text: 'Main has answered.',
-      content: [{ type: ContentTypes.CORTEX_BREWING, cortex_id: 'specialist', status: 'brewing' }],
-    }] as TMessage[];
+    let messages = [
+      {
+        messageId: 'parent',
+        conversationId,
+        isCreatedByUser: false,
+        createdAt: new Date().toISOString(),
+        text: 'Main has answered.',
+        content: [
+          { type: ContentTypes.CORTEX_BREWING, cortex_id: 'specialist', status: 'brewing' },
+        ],
+      },
+    ] as TMessage[];
     const getMessages = () => messages;
-    const wrapper = ({ children }: { children: React.ReactNode }) => <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
-    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), { wrapper });
-    act(() => { jest.advanceTimersByTime(4 * 60 * 1000); });
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    renderHook(() => useCortexFollowUpPoll({ conversationId, getMessages, isSubmitting: false }), {
+      wrapper,
+    });
+    act(() => {
+      jest.advanceTimersByTime(4 * 60 * 1000);
+    });
     invalidateSpy.mockClear();
-    act(() => { jest.advanceTimersByTime(12_000); });
+    act(() => {
+      jest.advanceTimersByTime(12_000);
+    });
     expect(invalidateSpy).toHaveBeenCalled();
     expect(invalidateSpy.mock.calls.length).toBeLessThanOrEqual(2);
-    messages = [{ ...messages[0], content: [{ type: ContentTypes.CORTEX_INSIGHT,
-      cortex_id: 'specialist', cortex_name: 'Specialist', status: 'complete', insight: 'New source evidence.' }],
-      metadata: { viventium: { cortexFollowUpDecision: { result: 'suppressed' } } },
-    }] as TMessage[];
+    messages = [
+      {
+        ...messages[0],
+        content: [
+          {
+            type: ContentTypes.CORTEX_INSIGHT,
+            cortex_id: 'specialist',
+            cortex_name: 'Specialist',
+            status: 'complete',
+            insight: 'New source evidence.',
+          },
+        ],
+        metadata: { viventium: { cortexFollowUpDecision: { result: 'suppressed' } } },
+      },
+    ] as TMessage[];
     invalidateSpy.mockClear();
-    act(() => { jest.advanceTimersByTime(45_000); });
+    act(() => {
+      jest.advanceTimersByTime(45_000);
+    });
     expect(invalidateSpy).not.toHaveBeenCalled();
   });
 
@@ -2064,8 +2096,16 @@ describe('durable work result refresh', () => {
   beforeEach(() => jest.useFakeTimers());
   afterEach(() => jest.useRealTimers());
 
-  const work = (workRef: string, state: WorkSummary['state'] = 'running', delivery: WorkSummary['delivery']['state'] = 'pending'): WorkSummary => ({
-    workRef, title: 'Read-only review', state, provider: 'codex', actions: [],
+  const work = (
+    workRef: string,
+    state: WorkSummary['state'] = 'running',
+    delivery: WorkSummary['delivery']['state'] = 'pending',
+  ): WorkSummary => ({
+    workRef,
+    title: 'Read-only review',
+    state,
+    provider: 'codex',
+    actions: [],
     updatedAt: state === 'running' ? '2026-01-01T10:00:00Z' : '2026-01-01T10:01:00Z',
     delivery: { state: delivery, unreadTerminal: delivery === 'pending' },
   });
@@ -2074,19 +2114,27 @@ describe('durable work result refresh', () => {
     const queryClient = new QueryClient();
     const invalidate = jest.spyOn(queryClient, 'invalidateQueries');
     const conversationId = 'durable-readonly';
-    const messages = [{
-      messageId: 'steering-ack', conversationId, isCreatedByUser: false,
-      text: 'Guidance updated.', content: [{ type: ContentTypes.HARNESS_ACTIVITY }],
-    }] as TMessage[];
+    const messages = [
+      {
+        messageId: 'steering-ack',
+        conversationId,
+        isCreatedByUser: false,
+        text: 'Guidance updated.',
+        content: [{ type: ContentTypes.HARNESS_ACTIVITY }],
+      },
+    ] as TMessage[];
     const getMessages = () => messages;
     const wrapper = ({ children }: { children: React.ReactNode }) => (
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     );
     const { rerender } = renderHook(
-      ({ rows }) => useCortexFollowUpPoll({
-        conversationId, getMessages, isSubmitting: false,
-        activeWork: { snapshot: 'fresh', work: rows, overflowCount: 0 },
-      }),
+      ({ rows }) =>
+        useCortexFollowUpPoll({
+          conversationId,
+          getMessages,
+          isSubmitting: false,
+          activeWork: { snapshot: 'fresh', work: rows, overflowCount: 0 },
+        }),
       { wrapper, initialProps: { rows: [] as WorkSummary[] } },
     );
     act(() => jest.advanceTimersByTime(1500));
@@ -2103,7 +2151,9 @@ describe('durable work result refresh', () => {
     rerender({ rows: [work('first', 'completed', 'delivered'), work('second')] });
     act(() => jest.advanceTimersByTime(1500));
     expect(invalidate).toHaveBeenCalledTimes(3);
-    rerender({ rows: [work('first', 'completed', 'delivered'), work('second', 'completed', 'delivered')] });
+    rerender({
+      rows: [work('first', 'completed', 'delivered'), work('second', 'completed', 'delivered')],
+    });
     act(() => jest.advanceTimersByTime(1500));
     expect(invalidate).toHaveBeenCalledTimes(4);
     act(() => jest.advanceTimersByTime(60000));
@@ -2117,16 +2167,27 @@ describe('durable work result refresh', () => {
     const queryClient = new QueryClient();
     const invalidate = jest.spyOn(queryClient, 'invalidateQueries');
     const conversationId = 'durable-streaming';
-    const getMessages = () => [{ messageId: 'answer', conversationId, text: 'Existing answer' }] as TMessage[];
+    const getMessages = () =>
+      [{ messageId: 'answer', conversationId, text: 'Existing answer' }] as TMessage[];
     const wrapper = ({ children }: { children: React.ReactNode }) => (
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     );
     const { rerender } = renderHook(
-      ({ isSubmitting, snapshot }) => useCortexFollowUpPoll({
-        conversationId, getMessages, isSubmitting,
-        activeWork: { snapshot, work: [work('task', 'completed', 'delivered')], overflowCount: 0 },
-      }),
-      { wrapper, initialProps: { isSubmitting: true, snapshot: 'fresh' as ActiveWorkSnapshot['snapshot'] } },
+      ({ isSubmitting, snapshot }) =>
+        useCortexFollowUpPoll({
+          conversationId,
+          getMessages,
+          isSubmitting,
+          activeWork: {
+            snapshot,
+            work: [work('task', 'completed', 'delivered')],
+            overflowCount: 0,
+          },
+        }),
+      {
+        wrapper,
+        initialProps: { isSubmitting: true, snapshot: 'fresh' as ActiveWorkSnapshot['snapshot'] },
+      },
     );
     act(() => jest.advanceTimersByTime(15000));
     expect(invalidate).not.toHaveBeenCalled();

@@ -22,7 +22,8 @@ jest.mock('../GlassHiveCallbackDeliveryService', () => ({
 }));
 
 jest.mock('../GlassHiveMissionAdjudicationService', () => ({
-  reconcilePendingGlassHiveMissionAdjudications: (...args) => mockReconcileMissionAdjudications(...args),
+  reconcilePendingGlassHiveMissionAdjudications: (...args) =>
+    mockReconcileMissionAdjudications(...args),
 }));
 
 jest.mock('../GlassHiveActiveWorkProjectionService', () => ({

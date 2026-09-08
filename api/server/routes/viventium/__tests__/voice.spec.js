@@ -2884,7 +2884,8 @@ describe('/api/viventium/voice/chat', () => {
     );
     const { getVoiceTaskByStreamId } = require('~/server/services/viventium/VoiceTaskService');
     expect(getVoiceTaskByStreamId(res.body.streamId)).toMatchObject({
-      callSessionId: 'call_session_1', conversationId: 'conv-generated-voice',
+      callSessionId: 'call_session_1',
+      conversationId: 'conv-generated-voice',
     });
   });
 
@@ -3235,14 +3236,22 @@ describe('/api/viventium/voice/chat', () => {
   test('a superseded SSE presentation does not complete still-running voice work', async () => {
     const taskService = require('~/server/services/viventium/VoiceTaskService');
     const { GenerationJobManager } = require('@librechat/api');
-    const task = taskService.createVoiceTask({ callSessionId: 'call_session_1', userId: 'user_1', streamId: 'still-running' });
+    const task = taskService.createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: 'still-running',
+    });
     GenerationJobManager.getJob.mockResolvedValue({ metadata: { userId: 'user_1' } });
     GenerationJobManager.subscribe.mockImplementationOnce((_id, _event, done) => {
       done({ final: true, superseded: true });
       return { unsubscribe: jest.fn() };
     });
     const app = createTestApp(require('../voice'));
-    const req = createMockReq({ method: 'GET', url: '/api/viventium/voice/stream/still-running', headers: { 'x-viventium-call-secret': 'secret' } });
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/stream/still-running',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
     const res = createMockRes();
     await dispatch(app, req, res);
     expect(res.write).toHaveBeenCalledWith(expect.stringContaining('"superseded":true'));
@@ -5444,20 +5453,28 @@ describe('/api/viventium/voice/chat', () => {
     expect(res.statusCode).toBe(401);
     expect(mockAgentControllerCallCount).toBe(0);
   });
-  test.each(['wing', 'listen_only'])('typed Call provenance preserves the restricted %s path without effects', async (mode) => {
-    mockAssertVoiceGatewayAuth.mockResolvedValue({ callSessionId: 'call_session_1', ownerParticipantIdentity: 'owner-participant',
-      userId: 'user_1', agentId: 'agent_voice', conversationId: 'conv-voice-1', mode });
-    const app = createTestApp(require('../voice'));
-    const req = createMockReq({ url: '/api/viventium/voice/chat', body: typedBody() });
-    const res = createMockRes();
-    await dispatch(app, req, res);
-    expect(res.statusCode).toBe(200);
-    expect(mockAgentControllerCallCount).toBe(0);
-    expect(req.body.viventiumCanAuthorizeSideEffects).toBe(false);
-    expect(res.body.status).toBe(mode === 'wing' ? 'wing_passive' : 'listen_only');
-    if (mode === 'listen_only') {
-      expect(mockMessageFindOneAndUpdate.mock.calls[0][1].$set.text).toBe(typedBody().text);
-    }
-  });
-
+  test.each(['wing', 'listen_only'])(
+    'typed Call provenance preserves the restricted %s path without effects',
+    async (mode) => {
+      mockAssertVoiceGatewayAuth.mockResolvedValue({
+        callSessionId: 'call_session_1',
+        ownerParticipantIdentity: 'owner-participant',
+        userId: 'user_1',
+        agentId: 'agent_voice',
+        conversationId: 'conv-voice-1',
+        mode,
+      });
+      const app = createTestApp(require('../voice'));
+      const req = createMockReq({ url: '/api/viventium/voice/chat', body: typedBody() });
+      const res = createMockRes();
+      await dispatch(app, req, res);
+      expect(res.statusCode).toBe(200);
+      expect(mockAgentControllerCallCount).toBe(0);
+      expect(req.body.viventiumCanAuthorizeSideEffects).toBe(false);
+      expect(res.body.status).toBe(mode === 'wing' ? 'wing_passive' : 'listen_only');
+      if (mode === 'listen_only') {
+        expect(mockMessageFindOneAndUpdate.mock.calls[0][1].$set.text).toBe(typedBody().text);
+      }
+    },
+  );
 });

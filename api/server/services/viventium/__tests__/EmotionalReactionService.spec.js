@@ -1,3 +1,29 @@
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const {
+  buildPromptBundleFixture,
+} = require('../../../../../scripts/test-support/promptBundle.cjs');
+let promptFixtureDirectory;
+const previousPromptBundlePath = process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+beforeAll(() => {
+  promptFixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-test-prompts-'));
+  const bundlePath = path.join(promptFixtureDirectory, 'bundle.json');
+  fs.writeFileSync(
+    bundlePath,
+    JSON.stringify(
+      buildPromptBundleFixture(
+        path.resolve(__dirname, '../../../../../viventium/source_of_truth/prompts'),
+      ),
+    ),
+  );
+  process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundlePath;
+});
+afterAll(() => {
+  if (previousPromptBundlePath === undefined) delete process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+  else process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = previousPromptBundlePath;
+  fs.rmSync(promptFixtureDirectory, { recursive: true, force: true });
+});
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
   logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
@@ -100,7 +126,7 @@ describe('EmotionalReactionService', () => {
     expect(agent.instructions).toContain('Slight means a subtle but real movement');
     expect(agent.instructions).toContain('Clear means an unmistakable movement');
     expect(agent.instructions).toContain('Strong means a pronounced movement');
-    expect(agent.instructions).toContain('Do not default to slight');
+    expect(agent.instructions).toContain('Do not default to `slight`');
     expect(agent.model_parameters).toEqual(
       expect.objectContaining({
         model: 'gpt-5.6-terra',

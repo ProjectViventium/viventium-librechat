@@ -63,14 +63,24 @@ function coerceTextToString(text) {
 
 /** Preserve separately stored authored user text before the provider formatter drops `text`. */
 function normalizeUserMessageContent(message) {
-  if (message?.isCreatedByUser !== true || typeof message.text !== 'string' ||
-      !message.text || !Array.isArray(message.content) || message.content.some((part) =>
-        typeof part === 'string' ? part.trim().length > 0 :
-          [ContentTypes.TEXT, 'input_text', 'output_text'].includes(part?.type) &&
-            coerceTextToString(part.text ?? part.input_text ?? part.output_text).trim().length > 0)) {
+  if (
+    message?.isCreatedByUser !== true ||
+    typeof message.text !== 'string' ||
+    !message.text ||
+    !Array.isArray(message.content) ||
+    message.content.some((part) =>
+      typeof part === 'string'
+        ? part.trim().length > 0
+        : [ContentTypes.TEXT, 'input_text', 'output_text'].includes(part?.type) &&
+          coerceTextToString(part.text ?? part.input_text ?? part.output_text).trim().length > 0,
+    )
+  ) {
     return message;
   }
-  return { ...message, content: [{ type: ContentTypes.TEXT, text: message.text }, ...message.content] };
+  return {
+    ...message,
+    content: [{ type: ContentTypes.TEXT, text: message.text }, ...message.content],
+  };
 }
 
 /**
@@ -343,9 +353,7 @@ function sanitizeAnthropicFormattedMessages(messages) {
         }
 
         const isTextLike =
-          part.type === ContentTypes.TEXT ||
-          part.text != null ||
-          part[ContentTypes.TEXT] != null;
+          part.type === ContentTypes.TEXT || part.text != null || part[ContentTypes.TEXT] != null;
 
         if (part.type === 'thinking') {
           if (!isValidAnthropicThinkingPart(part)) {

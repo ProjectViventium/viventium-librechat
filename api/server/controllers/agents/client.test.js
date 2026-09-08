@@ -211,9 +211,13 @@ jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   getRequiredPromptText: jest.fn((key, ...args) =>
     key === 'main.user_fact_guard'
-      ? require('fs').readFileSync(require('path').resolve(
-          __dirname, '../../../../viventium/source_of_truth/prompts/main/user_fact_guard.md',
-        ), 'utf8')
+      ? require('fs').readFileSync(
+          require('path').resolve(
+            __dirname,
+            '../../../../viventium/source_of_truth/prompts/main/user_fact_guard.md',
+          ),
+          'utf8',
+        )
       : jest.requireActual('@librechat/api').getRequiredPromptText(key, ...args),
   ),
   checkAccess: jest.fn(),
@@ -237,9 +241,14 @@ jest.mock('@librechat/api', () => ({
     emitCortexPresentation: jest.fn(async (streamId, event, receipt, options) => {
       const verified = await options.verifyPresentation();
       if (verified.claimToken !== receipt.claimToken) return { delivered: false, streamId };
-      return { delivered: true, streamId, target: 'subscriber_transport',
+      return {
+        delivered: true,
+        streamId,
+        target: 'subscriber_transport',
         presentationRef: `sse:${streamId}:${event.data.messageId}:${receipt.revision}`,
-        claimToken: receipt.claimToken, presentationLeaseToken: receipt.presentationLeaseToken };
+        claimToken: receipt.claimToken,
+        presentationLeaseToken: receipt.presentationLeaseToken,
+      };
     }),
     setGraph: jest.fn(),
   },
@@ -249,12 +258,20 @@ jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => ({
   ...jest.requireActual('~/server/services/viventium/CortexInsightDeliveryService'),
   fenceCortexInsightDeliveryPresentationByParent: jest.fn(async (input) => {
     if (!input.expectedDeliveryIds.length) throw new Error('Missing persisted delivery identity');
-    return { ownerId: input.ownerId, messageId: input.persistedMessageId,
-      parentMessageId: input.parentMessageId, revision: input.messageRevision,
-      generation: input.expectedGeneration, claimToken: 'claim-phase-b',
-      presentationLeaseToken: 'lease-phase-b', deliveryIds: input.expectedDeliveryIds,
-      claims: input.expectedDeliveryIds.map((deliveryId) => ({ deliveryId,
-        claimGeneration: input.expectedGeneration })) };
+    return {
+      ownerId: input.ownerId,
+      messageId: input.persistedMessageId,
+      parentMessageId: input.parentMessageId,
+      revision: input.messageRevision,
+      generation: input.expectedGeneration,
+      claimToken: 'claim-phase-b',
+      presentationLeaseToken: 'lease-phase-b',
+      deliveryIds: input.expectedDeliveryIds,
+      claims: input.expectedDeliveryIds.map((deliveryId) => ({
+        deliveryId,
+        claimGeneration: input.expectedGeneration,
+      })),
+    };
   }),
   markCortexInsightDeliveryBatchPresented: jest.fn(async ({ claims }) => claims),
   markCortexInsightDeliveryBatchFailed: jest.fn(async ({ claims }) => claims),
@@ -308,7 +325,8 @@ jest.mock('~/config', () => ({
 
 // Get references to mocked module functions (resolved after jest.mock hoisting)
 const mockEmitChunk = require('@librechat/api').GenerationJobManager.emitChunk;
-const mockEmitCortexPresentation = require('@librechat/api').GenerationJobManager.emitCortexPresentation;
+const mockEmitCortexPresentation =
+  require('@librechat/api').GenerationJobManager.emitCortexPresentation;
 const mockPersistCortexPartsToCanonicalMessage =
   require('~/server/services/viventium/BackgroundCortexFollowUpService').persistCortexPartsToCanonicalMessage;
 const mockFinalizeCanonicalCortexMessage =
@@ -614,18 +632,26 @@ describe('Detached memory writer result classification', () => {
 describe('buildViventiumMcpRequestBody', () => {
   test('projects only server-stamped voice authority and fails closed when its binding is absent', () => {
     const trustedBinding = { version: 1, callSessionId: 'call-trusted', fingerprint: 'digest' };
-    const build = (serverFields = {}) => AgentClient.buildViventiumMcpRequestBody({
-      messageId: 'assistant-1', conversationId: 'conv-1', parentMessageId: 'user-1',
-      req: { body: {
-        viventiumVoiceCallSessionId: 'call-spoofed',
-        viventiumVoiceWorkAuthority: { callSessionId: 'call-spoofed' },
-      }, ...serverFields },
-    });
+    const build = (serverFields = {}) =>
+      AgentClient.buildViventiumMcpRequestBody({
+        messageId: 'assistant-1',
+        conversationId: 'conv-1',
+        parentMessageId: 'user-1',
+        req: {
+          body: {
+            viventiumVoiceCallSessionId: 'call-spoofed',
+            viventiumVoiceWorkAuthority: { callSessionId: 'call-spoofed' },
+          },
+          ...serverFields,
+        },
+      });
     const nonVoice = build();
     expect(nonVoice.viventiumVoiceCallSessionId).toBeUndefined();
     expect(nonVoice.viventiumVoiceWorkAuthority).toBeUndefined();
-    const voice = build({ viventiumCallSession: { callSessionId: 'call-trusted' },
-      viventiumVoiceWorkAuthority: trustedBinding });
+    const voice = build({
+      viventiumCallSession: { callSessionId: 'call-trusted' },
+      viventiumVoiceWorkAuthority: trustedBinding,
+    });
     expect(voice.viventiumVoiceCallSessionId).toBe('call-trusted');
     expect(voice.viventiumVoiceWorkAuthority).toBe(trustedBinding);
     const missingBinding = build({ viventiumCallSession: { callSessionId: 'call-trusted' } });
@@ -636,38 +662,84 @@ describe('buildViventiumMcpRequestBody', () => {
   test('maps trusted single and merged sources and their files without body or attachment-origin spoofing', () => {
     const { selectTrustedLaunchRequestBody } = require('@librechat/api');
     for (const merged of [false, true]) {
-      const req = { body: {
-        viventiumSourceEventId: 'spoofed',
-        viventiumTriggeringSourceSegments: [{ source_event_id: 'spoofed', text: 'spoofed' }],
-      }, headers: { 'x-viventium-source-event-id': 'spoofed-header' } };
+      const req = {
+        body: {
+          viventiumSourceEventId: 'spoofed',
+          viventiumTriggeringSourceSegments: [{ source_event_id: 'spoofed', text: 'spoofed' }],
+        },
+        headers: { 'x-viventium-source-event-id': 'spoofed-header' },
+      };
       const segments = [
-        { source_event_id: 'source-a', source_index: 0, text: 'Exact A', source_files: [{ file_id: 'file-a', filename: 'a.txt', media_group_index: 0 }] },
-        ...(merged ? [{ source_event_id: 'source-b', source_index: 0, text: 'Exact B', source_files: [{ file_id: 'file-b', filename: 'b.txt', media_group_index: 1 }] }] : []),
+        {
+          source_event_id: 'source-a',
+          source_index: 0,
+          text: 'Exact A',
+          source_files: [{ file_id: 'file-a', filename: 'a.txt', media_group_index: 0 }],
+        },
+        ...(merged
+          ? [
+              {
+                source_event_id: 'source-b',
+                source_index: 0,
+                text: 'Exact B',
+                source_files: [{ file_id: 'file-b', filename: 'b.txt', media_group_index: 1 }],
+              },
+            ]
+          : []),
       ];
       setTrustedInteractionContext(req, {
-        actor_kind: 'external_user', origin: 'interactive', surface: 'web',
-        conversation_id: 'conv-1', logical_turn_id: 'turn-1', revision: 2,
-        source_event_id: merged ? 'source-b' : 'source-a', source_segments: segments,
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'web',
+        conversation_id: 'conv-1',
+        logical_turn_id: 'turn-1',
+        revision: 2,
+        source_event_id: merged ? 'source-b' : 'source-a',
+        source_segments: segments,
       });
       const body = AgentClient.buildViventiumMcpRequestBody({
-        messageId: 'assistant-1', conversationId: 'conv-1', parentMessageId: 'user-1', req,
-        attachments: [{ file_id: merged ? 'file-b' : 'file-a', filename: merged ? 'b.txt' : 'a.txt',
-          text: 'Resolved file text', source_event_id: 'spoofed-file-origin', source_index: 9 }],
+        messageId: 'assistant-1',
+        conversationId: 'conv-1',
+        parentMessageId: 'user-1',
+        req,
+        attachments: [
+          {
+            file_id: merged ? 'file-b' : 'file-a',
+            filename: merged ? 'b.txt' : 'a.txt',
+            text: 'Resolved file text',
+            source_event_id: 'spoofed-file-origin',
+            source_index: 9,
+          },
+        ],
       });
       const selectedA = selectTrustedLaunchRequestBody(body, [1]);
       expect(selectedA.error).toBeUndefined();
       expect(selectedA.requestBody.viventiumSourceEventId).toBe('source-a');
-      expect(selectedA.requestBody.viventiumAuthoringSourceEventId).toBe(merged ? 'source-b' : 'source-a');
+      expect(selectedA.requestBody.viventiumAuthoringSourceEventId).toBe(
+        merged ? 'source-b' : 'source-a',
+      );
       expect(selectedA.requestBody.viventiumTriggeringSourceSegments).toEqual([
         expect.objectContaining({ ordinal: 0, source_event_id: 'source-a', text: 'Exact A' }),
       ]);
       expect(selectedA.requestBody.files).toEqual([
-        expect.objectContaining({ file_id: 'file-a', filename: 'a.txt', source_event_id: 'source-a', source_index: 0, media_group_index: 0 }),
+        expect.objectContaining({
+          file_id: 'file-a',
+          filename: 'a.txt',
+          source_event_id: 'source-a',
+          source_index: 0,
+          media_group_index: 0,
+        }),
       ]);
       if (merged) {
         const selectedB = selectTrustedLaunchRequestBody(body, [2]);
         expect(selectedB.requestBody.files).toEqual([
-          expect.objectContaining({ file_id: 'file-b', source_event_id: 'source-b', source_index: 0, media_group_index: 1, text: 'Resolved file text' }),
+          expect.objectContaining({
+            file_id: 'file-b',
+            source_event_id: 'source-b',
+            source_index: 0,
+            media_group_index: 1,
+            text: 'Resolved file text',
+          }),
         ]);
         expect(selectTrustedLaunchRequestBody(body).error).toBe('source_selection_required');
         expect(selectTrustedLaunchRequestBody(body, [3]).error).toBe('invalid_source_selection');
@@ -1301,7 +1373,6 @@ describe('GlassHive harness activity persistence', () => {
 
 describe('late completion error content parts', () => {
   test('preserves structured host capacity and retry delay', () => {
-
     const localCapacity = new Error('Request failed with status code 503');
     localCapacity.status = 503;
     localCapacity.response = {
@@ -3203,7 +3274,9 @@ describe('AgentClient - titleConvo', () => {
         },
       };
 
-      jest.spyOn(require('~/server/services/Config'), 'getAppConfig').mockImplementation(async () => mockReq.config);
+      jest
+        .spyOn(require('~/server/services/Config'), 'getAppConfig')
+        .mockImplementation(async () => mockReq.config);
       mockRes = {};
 
       mockOptions = {
@@ -3214,8 +3287,13 @@ describe('AgentClient - titleConvo', () => {
 
       mockProcessMemory = jest.fn().mockResolvedValue([]);
       jest.spyOn(db, 'getMessage').mockResolvedValue({
-        messageId: 'response-123', user: 'user-123', conversationId: 'convo-123',
-        parentMessageId: 'persisted-user-message', isCreatedByUser: false, text: '', content: [],
+        messageId: 'response-123',
+        user: 'user-123',
+        conversationId: 'convo-123',
+        parentMessageId: 'persisted-user-message',
+        isCreatedByUser: false,
+        text: '',
+        content: [],
       });
       jest.spyOn(db, 'updateMessage').mockResolvedValue(null);
       jest.spyOn(db, 'getNativeResponse').mockResolvedValue(null);
@@ -3225,11 +3303,28 @@ describe('AgentClient - titleConvo', () => {
       db.validateMemoryWriteSnapshot = jest.fn().mockResolvedValue(true);
       jest.spyOn(db, 'getMemoryWriteStatus').mockResolvedValue(null);
       jest.spyOn(db, 'getMessages').mockResolvedValue([
-        { messageId: 'persisted-user-message', user: 'user-123', conversationId: 'convo-123', isCreatedByUser: true, updatedAt: new Date(0) },
-        { messageId: 'persisted-history-message', user: 'user-123', conversationId: 'convo-123', isCreatedByUser: true, updatedAt: new Date(0) },
+        {
+          messageId: 'persisted-user-message',
+          user: 'user-123',
+          conversationId: 'convo-123',
+          isCreatedByUser: true,
+          updatedAt: new Date(0),
+        },
+        {
+          messageId: 'persisted-history-message',
+          user: 'user-123',
+          conversationId: 'convo-123',
+          isCreatedByUser: true,
+          updatedAt: new Date(0),
+        },
       ]);
-      require('@librechat/api').loadMemorySnapshot.mockResolvedValue({ memoryRevisionMap: {}, memoryWriterEffectMap: {} });
-      jest.spyOn(db, 'findUser').mockResolvedValue({ _id: 'user-123', personalization: { memories: true } });
+      require('@librechat/api').loadMemorySnapshot.mockResolvedValue({
+        memoryRevisionMap: {},
+        memoryWriterEffectMap: {},
+      });
+      jest
+        .spyOn(db, 'findUser')
+        .mockResolvedValue({ _id: 'user-123', personalization: { memories: true } });
       require('@librechat/api').checkAccess.mockResolvedValue(true);
 
       client = new AgentClient(mockOptions);
@@ -3240,8 +3335,12 @@ describe('AgentClient - titleConvo', () => {
       client.responseMessageId = 'response-123';
       client.parentMessageId = 'persisted-user-message';
       client.memoryWriterSourceMessageIds = ['persisted-history-message', 'persisted-user-message'];
-      client.memoryWriterSourceMessageDigests = Object.fromEntries(client.memoryWriterSourceMessageIds
-        .map((id) => [id, AgentClient.memoryWriterSourceDigest({})]));
+      client.memoryWriterSourceMessageDigests = Object.fromEntries(
+        client.memoryWriterSourceMessageIds.map((id) => [
+          id,
+          AgentClient.memoryWriterSourceDigest({}),
+        ]),
+      );
     });
 
     it('should filter out image URLs from message content', async () => {
@@ -3669,74 +3768,147 @@ describe('AgentClient - titleConvo', () => {
       const { HumanMessage } = require('@librechat/agents/langchain/messages');
       const source = new HumanMessage('Check the cited guide and correct the saved finding.');
       const response = {
-        messageId: 'response-123', user: 'user-123', conversationId: 'convo-123',
-        parentMessageId: 'persisted-user-message', isCreatedByUser: false, error: false,
+        messageId: 'response-123',
+        user: 'user-123',
+        conversationId: 'convo-123',
+        parentMessageId: 'persisted-user-message',
+        isCreatedByUser: false,
+        error: false,
         text: 'The guide has a quickstart.',
         content: [
           { type: ContentTypes.TEXT, text: 'Reading the guide.', tool_call_ids: ['read-1'] },
-          { type: ContentTypes.TOOL_CALL, tool_call: { id: 'read-1', name: 'read_file', args: '{}', output: 'setup.md:40: Prerequisites and health check are documented.' } },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'read-1',
+              name: 'read_file',
+              args: '{}',
+              output: 'setup.md:40: Prerequisites and health check are documented.',
+            },
+          },
           { type: ContentTypes.TEXT, text: 'The guide has a quickstart.' },
         ],
       };
       const pending = client.scheduleMemoryWriter([source]);
       source.content = 'A later request must not replace this source.';
       db.getMessage.mockResolvedValue(response);
-      db.getMessages.mockResolvedValue([
-        ...await db.getMessages(), response,
-      ]);
+      db.getMessages.mockResolvedValue([...(await db.getMessages()), response]);
       expect(await client.admitMemoryWriter()).toBe(true);
       await pending;
       const admitted = db.admitMemoryWrite.mock.calls[0][0].source;
-      expect(admitted.input).toContain('Human: Check the cited guide and correct the saved finding.');
-      expect(admitted.input).toContain('Tool: setup.md:40: Prerequisites and health check are documented.');
+      expect(admitted.input).toContain(
+        'Human: Check the cited guide and correct the saved finding.',
+      );
+      expect(admitted.input).toContain(
+        'Tool: setup.md:40: Prerequisites and health check are documented.',
+      );
       expect(admitted.input).toContain('AI: The guide has a quickstart.');
       expect(admitted.input).not.toContain('A later request');
       expect(admitted.messageIds).toContain('response-123');
-      expect(admitted.messageDigests['response-123']).toBe(AgentClient.memoryWriterSourceDigest(response));
+      expect(admitted.messageDigests['response-123']).toBe(
+        AgentClient.memoryWriterSourceDigest(response),
+      );
       expect(mockProcessMemory.mock.calls[0][0][0].content).toBe(admitted.input);
     });
 
     it('admits canonical native tool records and fences later evidence changes', async () => {
       const { HumanMessage } = require('@librechat/agents/langchain/messages');
       const crypto = require('crypto');
-      const bounded = (text) => ({ text, bytes: Buffer.byteLength(text), omitted_bytes: 0,
-        sha256: crypto.createHash('sha256').update(text).digest('hex') });
+      const bounded = (text) => ({
+        text,
+        bytes: Buffer.byteLength(text),
+        omitted_bytes: 0,
+        sha256: crypto.createHash('sha256').update(text).digest('hex'),
+      });
       const response = {
-        messageId: 'response-123', user: 'user-123', conversationId: 'convo-123',
-        parentMessageId: 'persisted-user-message', isCreatedByUser: false, error: false,
-        text: 'The review is ready.', content: [{ type: ContentTypes.TEXT, text: 'The review is ready.' }],
-        metadata: { viventium: { nativeToolEvidence: { logicalTurnId: 'turn', revision: 1,
-          evidence: { version: 1, owner_id: 'user-123', conversation_id: 'convo-123',
-            message_id: 'response-123', invocation_id: 'invocation', request_id: 'request', run_id: 'run',
-            omitted_results: 0, excluded_log_prefix_bytes: 0,
-            results: [{ id: 'transcribe', name: 'transcribe_audio', status: 'completed',
-              arguments: bounded('{"file_id":"owned-file"}'), output: bounded('Review the guide; keep files unchanged.') }],
+        messageId: 'response-123',
+        user: 'user-123',
+        conversationId: 'convo-123',
+        parentMessageId: 'persisted-user-message',
+        isCreatedByUser: false,
+        error: false,
+        text: 'The review is ready.',
+        content: [{ type: ContentTypes.TEXT, text: 'The review is ready.' }],
+        metadata: {
+          viventium: {
+            nativeToolEvidence: {
+              logicalTurnId: 'turn',
+              revision: 1,
+              evidence: {
+                version: 1,
+                owner_id: 'user-123',
+                conversation_id: 'convo-123',
+                message_id: 'response-123',
+                invocation_id: 'invocation',
+                request_id: 'request',
+                run_id: 'run',
+                omitted_results: 0,
+                excluded_log_prefix_bytes: 0,
+                results: [
+                  {
+                    id: 'transcribe',
+                    name: 'transcribe_audio',
+                    status: 'completed',
+                    arguments: bounded('{"file_id":"owned-file"}'),
+                    output: bounded('Review the guide; keep files unchanged.'),
+                  },
+                ],
+              },
+            },
           },
-        } } },
+        },
       };
       const evidence = response.metadata.viventium.nativeToolEvidence.evidence;
-      const candidate = { text: response.text, authoritySha256: 'a'.repeat(64), requestId: 'request', runId: 'run',
-        responseJson: JSON.stringify({ id: 'request', glasshive: { request_id: 'request', tool_evidence: evidence } }) };
-      db.getNativeResponse = jest.fn().mockResolvedValue({ ...response, unfinished: false, nativeResponse: {
-        userId: 'user-123', conversationId: 'convo-123', responseMessageId: 'response-123',
-        streamId: 'stream', jobCreatedAt: 1, providerId: 'native', agentId: 'agent-123',
-        bodySha256: 'b'.repeat(64), admittedAt: 1, recoverUntil: Date.now() + 86_400_000,
-        source: { id: 'source-id', messageId: 'persisted-user-message', digest: 'a'.repeat(64) },
-        originSha256: require('@librechat/api').nativeResponseOrigin('https://runtime.example.test/v1'),
-        invocationId: 'invocation', logicalTurnId: 'turn', revision: 1, status: 'completed',
-        candidateJson: JSON.stringify(candidate), candidateSha256: require('@librechat/data-schemas').nativeResponseDigest(candidate),
-      } });
+      const candidate = {
+        text: response.text,
+        authoritySha256: 'a'.repeat(64),
+        requestId: 'request',
+        runId: 'run',
+        responseJson: JSON.stringify({
+          id: 'request',
+          glasshive: { request_id: 'request', tool_evidence: evidence },
+        }),
+      };
+      db.getNativeResponse = jest.fn().mockResolvedValue({
+        ...response,
+        unfinished: false,
+        nativeResponse: {
+          userId: 'user-123',
+          conversationId: 'convo-123',
+          responseMessageId: 'response-123',
+          streamId: 'stream',
+          jobCreatedAt: 1,
+          providerId: 'native',
+          agentId: 'agent-123',
+          bodySha256: 'b'.repeat(64),
+          admittedAt: 1,
+          recoverUntil: Date.now() + 86_400_000,
+          source: { id: 'source-id', messageId: 'persisted-user-message', digest: 'a'.repeat(64) },
+          originSha256: require('@librechat/api').nativeResponseOrigin(
+            'https://runtime.example.test/v1',
+          ),
+          invocationId: 'invocation',
+          logicalTurnId: 'turn',
+          revision: 1,
+          status: 'completed',
+          candidateJson: JSON.stringify(candidate),
+          candidateSha256: require('@librechat/data-schemas').nativeResponseDigest(candidate),
+        },
+      });
       jest.spyOn(db, 'nativeResponseSourceMatches').mockResolvedValue(true);
       const nativeReader = require('@librechat/api').createNativeResponseRecoveryService({
         db,
         resolveRoute: async () => ({ baseURL: 'https://runtime.example.test/v1', headers: {} }),
         fetch: jest.fn().mockResolvedValue(new Response(null, { status: 404 })),
       });
-      jest.spyOn(require('~/server/services/viventium/nativeResponseService'), 'getService')
+      jest
+        .spyOn(require('~/server/services/viventium/nativeResponseService'), 'getService')
         .mockReturnValueOnce(nativeReader);
-      const pending = client.scheduleMemoryWriter([new HumanMessage('Use the original recording.')]);
+      const pending = client.scheduleMemoryWriter([
+        new HumanMessage('Use the original recording.'),
+      ]);
       db.getMessage.mockResolvedValue(response);
-      db.getMessages.mockResolvedValue([...await db.getMessages(), response]);
+      db.getMessages.mockResolvedValue([...(await db.getMessages()), response]);
       expect(await client.admitMemoryWriter()).toBe(true);
       await pending;
       const admitted = db.admitMemoryWrite.mock.calls[0][0].source;
@@ -3744,42 +3916,69 @@ describe('AgentClient - titleConvo', () => {
       expect(admitted.input).toContain('transcribe_audio');
       expect(admitted.input).toContain('owned-file');
       expect(admitted.input).toContain('The review is ready.');
-      expect(admitted.input.indexOf('Review the guide')).toBeLessThan(admitted.input.indexOf('The review is ready.'));
+      expect(admitted.input.indexOf('Review the guide')).toBeLessThan(
+        admitted.input.indexOf('The review is ready.'),
+      );
       const beforeDigest = AgentClient.memoryWriterSourceDigest(response);
-      response.metadata.viventium.nativeToolEvidence.evidence.results[0].output.text = 'Changed after admission';
+      response.metadata.viventium.nativeToolEvidence.evidence.results[0].output.text =
+        'Changed after admission';
       expect(AgentClient.memoryWriterSourceDigest(response)).not.toBe(beforeDigest);
     });
 
     it.each([
       null,
-      { user: 'another-owner' }, { conversationId: 'another-conversation' },
-      { messageId: 'another-response' }, { parentMessageId: 'another-source' },
-      { isCreatedByUser: true }, { error: true }, { deletedAt: new Date() },
+      { user: 'another-owner' },
+      { conversationId: 'another-conversation' },
+      { messageId: 'another-response' },
+      { parentMessageId: 'another-source' },
+      { isCreatedByUser: true },
+      { error: true },
+      { deletedAt: new Date() },
       { content: [{ type: ContentTypes.ERROR, error: 'Provider failed.' }] },
-    ])('rejects a missing, replaced or failed completed source before admission: %j', async (change) => {
-      const { HumanMessage } = require('@librechat/agents/langchain/messages');
-      const base = await db.getMessage();
-      db.getMessage.mockResolvedValue(change === null ? null : { ...base, ...change });
-      const pending = client.scheduleMemoryWriter([new HumanMessage('Original accepted request.')]);
-      expect(await client.admitMemoryWriter()).toBe(false);
-      await pending;
-      expect(db.admitMemoryWrite).not.toHaveBeenCalled();
-      expect(mockProcessMemory).not.toHaveBeenCalled();
-    });
+    ])(
+      'rejects a missing, replaced or failed completed source before admission: %j',
+      async (change) => {
+        const { HumanMessage } = require('@librechat/agents/langchain/messages');
+        const base = await db.getMessage();
+        db.getMessage.mockResolvedValue(change === null ? null : { ...base, ...change });
+        const pending = client.scheduleMemoryWriter([
+          new HumanMessage('Original accepted request.'),
+        ]);
+        expect(await client.admitMemoryWriter()).toBe(false);
+        await pending;
+        expect(db.admitMemoryWrite).not.toHaveBeenCalled();
+        expect(mockProcessMemory).not.toHaveBeenCalled();
+      },
+    );
 
     it.each(['logical_turn_id', 'revision', 'source_event_id'])(
-      'rejects a completed response from a different accepted %s', async (field) => {
+      'rejects a completed response from a different accepted %s',
+      async (field) => {
         const { HumanMessage } = require('@librechat/agents/langchain/messages');
         const context = setTrustedInteractionContext(mockReq, {
-          actor_kind: 'external_user', origin: 'interactive', surface: 'web',
-          conversation_id: 'convo-123', logical_turn_id: 'accepted-turn', revision: 2,
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'web',
+          conversation_id: 'convo-123',
+          logical_turn_id: 'accepted-turn',
+          revision: 2,
           source_event_id: 'accepted-event',
         });
         const base = await db.getMessage();
-        db.getMessage.mockResolvedValue({ ...base, metadata: { viventium: { interactionContext: {
-          ...context, [field]: field === 'revision' ? 1 : 'another-identity',
-        } } } });
-        const pending = client.scheduleMemoryWriter([new HumanMessage('Original accepted request.')]);
+        db.getMessage.mockResolvedValue({
+          ...base,
+          metadata: {
+            viventium: {
+              interactionContext: {
+                ...context,
+                [field]: field === 'revision' ? 1 : 'another-identity',
+              },
+            },
+          },
+        });
+        const pending = client.scheduleMemoryWriter([
+          new HumanMessage('Original accepted request.'),
+        ]);
         expect(await client.admitMemoryWriter()).toBe(false);
         await pending;
         expect(db.admitMemoryWrite).not.toHaveBeenCalled();
@@ -3788,37 +3987,57 @@ describe('AgentClient - titleConvo', () => {
 
     it('rechecks a completed source edit before the admitted writer can mutate memory', async () => {
       const { HumanMessage } = require('@librechat/agents/langchain/messages');
-      const response = { ...await db.getMessage(), text: 'Original completed result.' };
+      const response = { ...(await db.getMessage()), text: 'Original completed result.' };
       db.getMessage.mockResolvedValue(response);
-      db.getMessages.mockResolvedValue([...await db.getMessages(), {
-        ...response, text: 'The result was edited after admission.',
-      }]);
+      db.getMessages.mockResolvedValue([
+        ...(await db.getMessages()),
+        {
+          ...response,
+          text: 'The result was edited after admission.',
+        },
+      ]);
       const pending = client.scheduleMemoryWriter([new HumanMessage('Original accepted request.')]);
       expect(await client.admitMemoryWriter()).toBe(true);
       await pending;
       expect(mockProcessMemory).not.toHaveBeenCalled();
-      expect(db.completeMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
-        receipts: [expect.objectContaining({ memory: expect.objectContaining({ type: 'error' }) })],
-      }));
+      expect(db.completeMemoryWrite).toHaveBeenCalledWith(
+        expect.objectContaining({
+          receipts: [
+            expect.objectContaining({ memory: expect.objectContaining({ type: 'error' }) }),
+          ],
+        }),
+      );
     });
 
     it.each(['same', 'parent_changed', 'failed', 'revision_changed'])(
-      'keeps the completed response authority fenced during execution: %s', async (change) => {
+      'keeps the completed response authority fenced during execution: %s',
+      async (change) => {
         const { HumanMessage } = require('@librechat/agents/langchain/messages');
         const context = setTrustedInteractionContext(mockReq, {
-          actor_kind: 'external_user', origin: 'interactive', surface: 'telegram',
-          conversation_id: 'convo-123', logical_turn_id: 'accepted-turn', revision: 2,
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'telegram',
+          conversation_id: 'convo-123',
+          logical_turn_id: 'accepted-turn',
+          revision: 2,
           source_event_id: 'accepted-event',
         });
-        const response = { ...await db.getMessage(), text: 'Completed answer.', unfinished: true,
-          metadata: { viventium: { interactionContext: context } } };
+        const response = {
+          ...(await db.getMessage()),
+          text: 'Completed answer.',
+          unfinished: true,
+          metadata: { viventium: { interactionContext: context } },
+        };
         db.getMessage.mockResolvedValue(response);
         const current = structuredClone(response);
         if (change === 'parent_changed') current.parentMessageId = 'replacement-source';
         if (change === 'failed') current.error = true;
-        if (change === 'revision_changed') current.metadata.viventium.interactionContext.revision = 3;
-        db.getMessages.mockResolvedValue([...await db.getMessages(), current]);
-        const pending = client.scheduleMemoryWriter([new HumanMessage('Original accepted request.')]);
+        if (change === 'revision_changed')
+          current.metadata.viventium.interactionContext.revision = 3;
+        db.getMessages.mockResolvedValue([...(await db.getMessages()), current]);
+        const pending = client.scheduleMemoryWriter([
+          new HumanMessage('Original accepted request.'),
+        ]);
         expect(await client.admitMemoryWriter()).toBe(true);
         await pending;
         expect(mockProcessMemory).toHaveBeenCalledTimes(change === 'same' ? 1 : 0);
@@ -3834,8 +4053,11 @@ describe('AgentClient - titleConvo', () => {
         [Tools.memory]: { key: 'preferences', type: 'update', value: 'private', tokenCount: 3 },
       };
       db.getMessage.mockResolvedValue({
-        messageId: 'response-123', user: 'user-123',
-        conversationId: 'convo-123', parentMessageId: 'persisted-user-message', isCreatedByUser: false,
+        messageId: 'response-123',
+        user: 'user-123',
+        conversationId: 'convo-123',
+        parentMessageId: 'persisted-user-message',
+        isCreatedByUser: false,
         attachments: [
           { type: 'file', file_id: 'file-1' },
           { type: Tools.memory, [Tools.memory]: { key: 'stale', type: 'update', value: 'old' } },
@@ -3850,15 +4072,25 @@ describe('AgentClient - titleConvo', () => {
       expect(mockReq._viventiumMemoryWriterScheduled).toBeUndefined();
       await client.admitMemoryWriter();
       await pending;
-      expect(db.admitMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
-        userId: 'user-123', messageId: 'response-123', conversationId: 'convo-123',
-        source: expect.objectContaining({ digest: expect.any(String),
-          memoryRevisionMap: {},
-          messageIds: ['persisted-user-message', 'persisted-history-message'] }),
-      }));
-      expect(db.completeMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
-        userId: 'user-123', messageId: 'response-123', receipts: [receipt],
-      }));
+      expect(db.admitMemoryWrite).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'user-123',
+          messageId: 'response-123',
+          conversationId: 'convo-123',
+          source: expect.objectContaining({
+            digest: expect.any(String),
+            memoryRevisionMap: {},
+            messageIds: ['persisted-user-message', 'persisted-history-message'],
+          }),
+        }),
+      );
+      expect(db.completeMemoryWrite).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'user-123',
+          messageId: 'response-123',
+          receipts: [receipt],
+        }),
+      );
       expect(mockReq._viventiumMemoryWriterScheduled).toBe(true);
     });
 
@@ -3871,8 +4103,10 @@ describe('AgentClient - titleConvo', () => {
       await pending;
       expect(client.runMemory).not.toHaveBeenCalled();
       expect(mockReq._viventiumMemoryWriterScheduled).toBeUndefined();
-      expect(JSON.parse(mockReq._viventiumMemoryAdmissionReceipt.memory.value))
-        .toMatchObject({ errorType: 'writer_unavailable', partialApplied: false });
+      expect(JSON.parse(mockReq._viventiumMemoryAdmissionReceipt.memory.value)).toMatchObject({
+        errorType: 'writer_unavailable',
+        partialApplied: false,
+      });
       expect(db.updateMessage).toHaveBeenCalledWith(
         mockReq,
         expect.objectContaining({
@@ -3902,49 +4136,85 @@ describe('AgentClient - titleConvo', () => {
       await client.admitMemoryWriter();
       await pending;
       expect(client.runMemory).not.toHaveBeenCalled();
-      expect(JSON.parse(db.completeMemoryWrite.mock.calls[0][0].receipts[0].memory.value))
-        .toMatchObject({ partialApplied: false });
+      expect(
+        JSON.parse(db.completeMemoryWrite.mock.calls[0][0].receipts[0].memory.value),
+      ).toMatchObject({ partialApplied: false });
     });
 
     it.each(['disabled', 'route_changed', 'agent_changed', 'agent_removed', 'agent_denied'])(
-      'revokes a queued live save when current writer authority is %s', async (change) => {
+      'revokes a queued live save when current writer authority is %s',
+      async (change) => {
         const { HumanMessage } = require('@librechat/agents/langchain/messages');
         const configService = require('~/server/services/Config');
         const model = require('~/models/Agent');
-        const permission = jest.spyOn(require('~/server/services/PermissionService'), 'checkPermission').mockResolvedValue(true);
-        const agent = { _id: 'agent-db-id', id: 'agent_memory_guard', model_parameters: { model: 'pinned-model' } };
+        const permission = jest
+          .spyOn(require('~/server/services/PermissionService'), 'checkPermission')
+          .mockResolvedValue(true);
+        const agent = {
+          _id: 'agent-db-id',
+          id: 'agent_memory_guard',
+          model_parameters: { model: 'pinned-model' },
+        };
         if (change.startsWith('agent_')) {
           mockReq.config.memory.agent = { id: agent.id };
           model.loadAgent.mockResolvedValue(agent);
         }
         db.admitMemoryWrite.mockImplementationOnce(async () => {
-          if (change === 'disabled') configService.getAppConfig.mockResolvedValue({ memory: { ...mockReq.config.memory, disabled: true } });
-          if (change === 'route_changed') configService.getAppConfig.mockResolvedValue({ memory: { agent: { provider: 'other', model: 'other-model' } } });
-          if (change === 'agent_changed') model.loadAgent.mockResolvedValue({ ...agent, model_parameters: { model: 'new-model' } });
+          if (change === 'disabled')
+            configService.getAppConfig.mockResolvedValue({
+              memory: { ...mockReq.config.memory, disabled: true },
+            });
+          if (change === 'route_changed')
+            configService.getAppConfig.mockResolvedValue({
+              memory: { agent: { provider: 'other', model: 'other-model' } },
+            });
+          if (change === 'agent_changed')
+            model.loadAgent.mockResolvedValue({
+              ...agent,
+              model_parameters: { model: 'new-model' },
+            });
           if (change === 'agent_removed') model.loadAgent.mockResolvedValue(null);
           if (change === 'agent_denied') permission.mockResolvedValue(false);
           return true;
         });
         client.runMemory = jest.fn();
         try {
-          const pending = client.scheduleMemoryWriter([new HumanMessage('Remember an admitted fact.')]);
+          const pending = client.scheduleMemoryWriter([
+            new HumanMessage('Remember an admitted fact.'),
+          ]);
           expect(await client.admitMemoryWriter()).toBe(true);
           await pending;
           expect(client.runMemory).not.toHaveBeenCalled();
-          expect(JSON.parse(db.completeMemoryWrite.mock.calls[0][0].receipts[0].memory.value))
-            .toMatchObject({ partialApplied: false });
-        } finally { permission.mockRestore(); }
+          expect(
+            JSON.parse(db.completeMemoryWrite.mock.calls[0][0].receipts[0].memory.value),
+          ).toMatchObject({ partialApplied: false });
+        } finally {
+          permission.mockRestore();
+        }
       },
     );
 
     it('binds source edits without treating receipt metadata as a new user source', () => {
-      const source = { text: 'Original statement', content: [{ type: ContentTypes.TEXT, text: 'Original statement' }] };
-      expect(AgentClient.memoryWriterSourceDigest({ ...source, attachments: [{ memory: { type: 'update' } }], updatedAt: new Date() }))
-        .toBe(AgentClient.memoryWriterSourceDigest(source));
-      expect(AgentClient.memoryWriterSourceDigest({ ...source, text: 'Corrected statement' }))
-        .not.toBe(AgentClient.memoryWriterSourceDigest(source));
-      expect(AgentClient.memoryWriterSourceDigest({ ...source, content: [{ type: ContentTypes.TEXT, text: 'Corrected content' }] }))
-        .not.toBe(AgentClient.memoryWriterSourceDigest(source));
+      const source = {
+        text: 'Original statement',
+        content: [{ type: ContentTypes.TEXT, text: 'Original statement' }],
+      };
+      expect(
+        AgentClient.memoryWriterSourceDigest({
+          ...source,
+          attachments: [{ memory: { type: 'update' } }],
+          updatedAt: new Date(),
+        }),
+      ).toBe(AgentClient.memoryWriterSourceDigest(source));
+      expect(
+        AgentClient.memoryWriterSourceDigest({ ...source, text: 'Corrected statement' }),
+      ).not.toBe(AgentClient.memoryWriterSourceDigest(source));
+      expect(
+        AgentClient.memoryWriterSourceDigest({
+          ...source,
+          content: [{ type: ContentTypes.TEXT, text: 'Corrected content' }],
+        }),
+      ).not.toBe(AgentClient.memoryWriterSourceDigest(source));
     });
 
     it('checks original source on a live save without vetoing ordinary later user turns', async () => {
@@ -3952,7 +4222,9 @@ describe('AgentClient - titleConvo', () => {
       const newer = jest.spyOn(db, 'hasNewerMemorySource').mockResolvedValue(true);
       client.runMemory = jest.fn().mockResolvedValue([]);
       try {
-        const pending = client.scheduleMemoryWriter([new HumanMessage('An earlier accepted fact.')]);
+        const pending = client.scheduleMemoryWriter([
+          new HumanMessage('An earlier accepted fact.'),
+        ]);
         await client.admitMemoryWriter();
         await pending;
         expect(client.runMemory).toHaveBeenCalledTimes(1);
@@ -3962,7 +4234,9 @@ describe('AgentClient - titleConvo', () => {
         await client.admitMemoryWriter();
         await removed;
         expect(client.runMemory).toHaveBeenCalledTimes(1);
-      } finally { newer.mockRestore(); }
+      } finally {
+        newer.mockRestore();
+      }
     });
 
     it('keeps failed admission visible even when the receipt cannot be persisted', async () => {
@@ -3974,8 +4248,10 @@ describe('AgentClient - titleConvo', () => {
       expect(await client.admitMemoryWriter()).toBe(false);
       await pending;
       expect(client.runMemory).not.toHaveBeenCalled();
-      expect(JSON.parse(mockReq._viventiumMemoryAdmissionReceipt.memory.value))
-        .toMatchObject({ errorType: 'writer_interrupted', partialApplied: true });
+      expect(JSON.parse(mockReq._viventiumMemoryAdmissionReceipt.memory.value)).toMatchObject({
+        errorType: 'writer_interrupted',
+        partialApplied: true,
+      });
     });
 
     it('does not turn an already admitted save into a new failed-admission receipt', async () => {
@@ -3989,69 +4265,145 @@ describe('AgentClient - titleConvo', () => {
       expect(mockReq._viventiumMemoryWriterScheduled).toBe(true);
     });
 
-    it.each(['valid', 'superseded', 'deleted', 'missing', 'other_owner', 'other_conversation', 'edited', 'not_user'])('recovers only untouched pending source (%s)', async (sourceState) => {
+    it.each([
+      'valid',
+      'superseded',
+      'deleted',
+      'missing',
+      'other_owner',
+      'other_conversation',
+      'edited',
+      'not_user',
+    ])('recovers only untouched pending source (%s)', async (sourceState) => {
       const api = require('@librechat/api');
       const input = 'Exact previously accepted memory input';
-      const snapshot = { withKeys: 'original state', withoutKeys: 'original state', totalTokens: 1,
-        memoryTokenMap: {}, memoryRevisionMap: {}, memoryValueHashMap: {}, latestMutationAt: 0 };
-      const row = { user: 'user-123', messageId: 'response-123', conversationId: 'convo-123', savedMemoryWrite: {
-        status: 'pending', admittedAt: new Date(1000), source: {
-          input, digest: require('crypto').createHash('sha256').update(input).digest('hex'),
-          timeContext: 'Original time context', messageIds: ['source-message'],
-          messageDigests: { 'source-message': AgentClient.memoryWriterSourceDigest({}) },
-          configDigest: AgentClient.memoryWriterConfigDigest(mockReq.config),
-          agentDigest: require('crypto').createHash('sha256').update('null').digest('hex'),
-          interactionContextJson: JSON.stringify({ actor_kind: 'external_user', origin: 'interactive',
-            surface: 'telegram', conversation_id: 'convo-123', revision: 2, source_event_id: 'event-one' }),
+      const snapshot = {
+        withKeys: 'original state',
+        withoutKeys: 'original state',
+        totalTokens: 1,
+        memoryTokenMap: {},
+        memoryRevisionMap: {},
+        memoryValueHashMap: {},
+        latestMutationAt: 0,
+      };
+      const row = {
+        user: 'user-123',
+        messageId: 'response-123',
+        conversationId: 'convo-123',
+        savedMemoryWrite: {
+          status: 'pending',
+          admittedAt: new Date(1000),
+          source: {
+            input,
+            digest: require('crypto').createHash('sha256').update(input).digest('hex'),
+            timeContext: 'Original time context',
+            messageIds: ['source-message'],
+            messageDigests: { 'source-message': AgentClient.memoryWriterSourceDigest({}) },
+            configDigest: AgentClient.memoryWriterConfigDigest(mockReq.config),
+            agentDigest: require('crypto').createHash('sha256').update('null').digest('hex'),
+            interactionContextJson: JSON.stringify({
+              actor_kind: 'external_user',
+              origin: 'interactive',
+              surface: 'telegram',
+              conversation_id: 'convo-123',
+              revision: 2,
+              source_event_id: 'event-one',
+            }),
+          },
         },
-      } };
-      const configSpy = jest.spyOn(require('~/server/services/Config'), 'getAppConfig').mockResolvedValue(mockReq.config);
-      const sourceSpy = jest.spyOn(db, 'hasNewerMemorySource').mockResolvedValue(sourceState === 'superseded');
-      const sourceRows = [{ messageId: 'source-message', user: row.user, conversationId: row.conversationId,
-        isCreatedByUser: true, updatedAt: new Date(0), deletedAt: null }];
+      };
+      const configSpy = jest
+        .spyOn(require('~/server/services/Config'), 'getAppConfig')
+        .mockResolvedValue(mockReq.config);
+      const sourceSpy = jest
+        .spyOn(db, 'hasNewerMemorySource')
+        .mockResolvedValue(sourceState === 'superseded');
+      const sourceRows = [
+        {
+          messageId: 'source-message',
+          user: row.user,
+          conversationId: row.conversationId,
+          isCreatedByUser: true,
+          updatedAt: new Date(0),
+          deletedAt: null,
+        },
+      ];
       if (sourceState === 'deleted') sourceRows[0].deletedAt = new Date(1);
       if (sourceState === 'other_owner') sourceRows[0].user = 'another-owner';
-      if (sourceState === 'other_conversation') sourceRows[0].conversationId = 'another-conversation';
+      if (sourceState === 'other_conversation')
+        sourceRows[0].conversationId = 'another-conversation';
       if (sourceState === 'edited') sourceRows[0].text = 'A corrected source';
       if (sourceState === 'not_user') sourceRows[0].isCreatedByUser = false;
-      const rowsSpy = jest.spyOn(db, 'getMessages').mockResolvedValue(sourceState === 'missing' ? [] : sourceRows);
-      const readSpy = jest.spyOn(AgentClient.prototype, 'useMemory').mockImplementation(async function () {
-        this.memoryWriterState = { memoryMethods: {}, memoryPolicyConfig: {} };
-      });
+      const rowsSpy = jest
+        .spyOn(db, 'getMessages')
+        .mockResolvedValue(sourceState === 'missing' ? [] : sourceRows);
+      const readSpy = jest
+        .spyOn(AgentClient.prototype, 'useMemory')
+        .mockImplementation(async function () {
+          this.memoryWriterState = { memoryMethods: {}, memoryPolicyConfig: {} };
+        });
       const runSpy = jest.spyOn(AgentClient.prototype, 'runMemory').mockResolvedValue([]);
       api.loadMemorySnapshot.mockResolvedValue(snapshot);
       try {
-        await AgentClient.recoverPendingMemoryWriter(row, { userId: row.user, messageId: row.messageId, owner: 'new-runtime' });
+        await AgentClient.recoverPendingMemoryWriter(row, {
+          userId: row.user,
+          messageId: row.messageId,
+          owner: 'new-runtime',
+        });
         if (sourceState !== 'valid') {
           expect(runSpy).not.toHaveBeenCalled();
-          expect(JSON.parse(db.completeMemoryWrite.mock.calls[0][0].receipts[0].memory.value))
-            .toMatchObject({ errorType: 'writer_recovery_not_safe', partialApplied: false });
+          expect(
+            JSON.parse(db.completeMemoryWrite.mock.calls[0][0].receipts[0].memory.value),
+          ).toMatchObject({ errorType: 'writer_recovery_not_safe', partialApplied: false });
         } else {
           expect(runSpy).toHaveBeenCalledTimes(1);
           const context = runSpy.mock.calls[0][1];
           expect(context.snapshot).toBe(snapshot);
           expect(context.bufferMessage.content).toBe(input);
           expect(context.timeContext).toBe('Original time context');
-          expect(api.getTrustedInteractionContext(context.req)).toMatchObject({ surface: 'telegram', revision: 2 });
+          expect(api.getTrustedInteractionContext(context.req)).toMatchObject({
+            surface: 'telegram',
+            revision: 2,
+          });
         }
-      } finally { configSpy.mockRestore(); sourceSpy.mockRestore(); rowsSpy.mockRestore(); readSpy.mockRestore(); runSpy.mockRestore(); }
+      } finally {
+        configSpy.mockRestore();
+        sourceSpy.mockRestore();
+        rowsSpy.mockRestore();
+        readSpy.mockRestore();
+        runSpy.mockRestore();
+      }
     });
 
-    it.each(['native-route', 'custom-route'])('preserves configured memory effort on primary %s', async (provider) => {
-      const api = require('@librechat/api');
-      mockReq.config.memory = { agent: { provider, model: 'configured-model',
-        model_parameters: { reasoning_effort: 'high' } } };
-      api.getMemoryWriterHealthGate.mockReturnValue({ blocked: false });
-      api.initializeAgent.mockImplementation(async ({ agent }) => ({ ...agent }));
-      api.createMemoryProcessor.mockResolvedValue([null, jest.fn()]);
-      const routed = new AgentClient(mockOptions);
-      routed.memoryWriterState = { appConfig: mockReq.config, userId: 'user-123',
-        memoryConfig: mockReq.config.memory, memoryMethods: {}, memoryPolicyConfig: {} };
-      const outcome = await routed.initializeMemoryWriter({ req: mockReq, res: mockRes });
-      expect(outcome.ok).toBe(true);
-      expect(api.initializeAgent.mock.calls[0][0].agent.model_parameters)
-        .toEqual({ reasoning_effort: 'high' });
-    });
+    it.each(['native-route', 'custom-route'])(
+      'preserves configured memory effort on primary %s',
+      async (provider) => {
+        const api = require('@librechat/api');
+        mockReq.config.memory = {
+          agent: {
+            provider,
+            model: 'configured-model',
+            model_parameters: { reasoning_effort: 'high' },
+          },
+        };
+        api.getMemoryWriterHealthGate.mockReturnValue({ blocked: false });
+        api.initializeAgent.mockImplementation(async ({ agent }) => ({ ...agent }));
+        api.createMemoryProcessor.mockResolvedValue([null, jest.fn()]);
+        const routed = new AgentClient(mockOptions);
+        routed.memoryWriterState = {
+          appConfig: mockReq.config,
+          userId: 'user-123',
+          memoryConfig: mockReq.config.memory,
+          memoryMethods: {},
+          memoryPolicyConfig: {},
+        };
+        const outcome = await routed.initializeMemoryWriter({ req: mockReq, res: mockRes });
+        expect(outcome.ok).toBe(true);
+        expect(api.initializeAgent.mock.calls[0][0].agent.model_parameters).toEqual({
+          reasoning_effort: 'high',
+        });
+      },
+    );
 
     it('initializes the explicitly configured fallback route when the primary route is gated', async () => {
       const api = require('@librechat/api');
@@ -4067,7 +4419,13 @@ describe('AgentClient - titleConvo', () => {
       };
       api.getMemoryWriterHealthGate.mockImplementation(({ provider }) =>
         provider === 'openai'
-          ? { blocked: true, shouldLog: false, reason: 'quota', message: 'gated', blockedUntil: Date.now() + 1000 }
+          ? {
+              blocked: true,
+              shouldLog: false,
+              reason: 'quota',
+              message: 'gated',
+              blockedUntil: Date.now() + 1000,
+            }
           : { blocked: false },
       );
       api.initializeAgent.mockImplementation(async ({ agent }) => ({ ...agent }));
@@ -4094,47 +4452,99 @@ describe('AgentClient - titleConvo', () => {
       expect(prelim.model).toBe('claude-opus-5');
       expect(prelim.fallback).toBeUndefined();
       expect(prelim.model_parameters).toEqual({});
-      expect(routed.memoryWriterRoute).toEqual({ role: 'fallback', provider: 'anthropic', model: 'claude-opus-5' });
+      expect(routed.memoryWriterRoute).toEqual({
+        role: 'fallback',
+        provider: 'anthropic',
+        model: 'claude-opus-5',
+      });
       expect(api.createMemoryProcessor.mock.calls[0][0].config.llmConfig).toEqual({
         provider: 'anthropic',
         model: 'claude-opus-5',
       });
     });
 
-    it.each([false, true])('uses the admitted memory Agent snapshot instead of initialized Main (changed=%s)', async (changed) => {
-      const api = require('@librechat/api');
-      const admittedAgent = { id: 'agent_memory_shared', _id: 'agent-db-id', provider: 'openai',
-        model_parameters: { model: 'pinned-memory-model' }, instructions: 'Memory instructions' };
-      const capturedMain = { ...admittedAgent, instructions: 'Already initialized Main instructions',
-        model_parameters: { model: 'stale-main-model' } };
-      mockReq.config.memory = { agent: { id: admittedAgent.id } };
-      const routed = new AgentClient({ ...mockOptions, agent: capturedMain });
-      routed.memoryWriterState = { appConfig: mockReq.config, userId: 'user-123',
-        memoryConfig: mockReq.config.memory, memoryMethods: {}, memoryPolicyConfig: {} };
-      require('~/models/Agent').loadAgent.mockResolvedValue(changed
-        ? { ...admittedAgent, instructions: 'Changed after authorization' } : admittedAgent);
-      api.initializeAgent.mockImplementation(async ({ agent }) => agent);
-      api.createMemoryProcessor.mockResolvedValue([null, jest.fn()]);
-      api.getMemoryWriterHealthGate.mockReturnValue({ blocked: false });
-      const context = { req: mockReq, res: mockRes, userId: 'user-123', appConfig: mockReq.config,
-        agent: capturedMain, snapshot: {}, memoryWriteIdentity: { messageId: 'answer', owner: 'runtime' },
-        sourceIntegrity: { source: { agentDigest: require('crypto').createHash('sha256')
-          .update(JSON.stringify(admittedAgent)).digest('hex') } } };
-      const result = await routed.initializeMemoryWriter(context);
-      expect(result.ok).toBe(!changed);
-      if (changed) expect(api.initializeAgent).not.toHaveBeenCalled();
-      else expect(api.initializeAgent.mock.calls[0][0].agent).toEqual(admittedAgent);
-    });
+    it.each([false, true])(
+      'uses the admitted memory Agent snapshot instead of initialized Main (changed=%s)',
+      async (changed) => {
+        const api = require('@librechat/api');
+        const admittedAgent = {
+          id: 'agent_memory_shared',
+          _id: 'agent-db-id',
+          provider: 'openai',
+          model_parameters: { model: 'pinned-memory-model' },
+          instructions: 'Memory instructions',
+        };
+        const capturedMain = {
+          ...admittedAgent,
+          instructions: 'Already initialized Main instructions',
+          model_parameters: { model: 'stale-main-model' },
+        };
+        mockReq.config.memory = { agent: { id: admittedAgent.id } };
+        const routed = new AgentClient({ ...mockOptions, agent: capturedMain });
+        routed.memoryWriterState = {
+          appConfig: mockReq.config,
+          userId: 'user-123',
+          memoryConfig: mockReq.config.memory,
+          memoryMethods: {},
+          memoryPolicyConfig: {},
+        };
+        require('~/models/Agent').loadAgent.mockResolvedValue(
+          changed
+            ? { ...admittedAgent, instructions: 'Changed after authorization' }
+            : admittedAgent,
+        );
+        api.initializeAgent.mockImplementation(async ({ agent }) => agent);
+        api.createMemoryProcessor.mockResolvedValue([null, jest.fn()]);
+        api.getMemoryWriterHealthGate.mockReturnValue({ blocked: false });
+        const context = {
+          req: mockReq,
+          res: mockRes,
+          userId: 'user-123',
+          appConfig: mockReq.config,
+          agent: capturedMain,
+          snapshot: {},
+          memoryWriteIdentity: { messageId: 'answer', owner: 'runtime' },
+          sourceIntegrity: {
+            source: {
+              agentDigest: require('crypto')
+                .createHash('sha256')
+                .update(JSON.stringify(admittedAgent))
+                .digest('hex'),
+            },
+          },
+        };
+        const result = await routed.initializeMemoryWriter(context);
+        expect(result.ok).toBe(!changed);
+        if (changed) expect(api.initializeAgent).not.toHaveBeenCalled();
+        else expect(api.initializeAgent.mock.calls[0][0].agent).toEqual(admittedAgent);
+      },
+    );
 
     it('keeps the original snapshot when the writer switches to its configured fallback', async () => {
       const api = require('@librechat/api');
-      const snapshot = { withKeys: 'original', withoutKeys: 'original', totalTokens: 1,
-        memoryTokenMap: {}, memoryRevisionMap: { preferences: 7 }, memoryValueHashMap: {} };
-      mockReq.config.memory = { agent: { provider: 'openai', model: 'configured-primary',
-        fallback: { provider: 'anthropic', model: 'configured-fallback' } } };
+      const snapshot = {
+        withKeys: 'original',
+        withoutKeys: 'original',
+        totalTokens: 1,
+        memoryTokenMap: {},
+        memoryRevisionMap: { preferences: 7 },
+        memoryValueHashMap: {},
+      };
+      mockReq.config.memory = {
+        agent: {
+          provider: 'openai',
+          model: 'configured-primary',
+          fallback: { provider: 'anthropic', model: 'configured-fallback' },
+        },
+      };
       const routed = new AgentClient(mockOptions);
-      routed.memoryWriterState = { appConfig: mockReq.config, userId: 'user-123',
-        memoryConfig: mockReq.config.memory, memoryMethods: {}, memoryPolicyConfig: {} };
+      routed.memoryWriterState = {
+        appConfig: mockReq.config,
+        userId: 'user-123',
+        memoryConfig: mockReq.config.memory,
+        memoryMethods: {},
+        memoryPolicyConfig: {},
+      };
       api.initializeAgent.mockImplementation(async ({ agent }) => agent);
       api.createMemoryProcessor.mockResolvedValue([null, jest.fn()]);
       api.loadMemorySnapshot.mockResolvedValue(snapshot);
@@ -4143,12 +4553,19 @@ describe('AgentClient - titleConvo', () => {
       try {
         expect((await routed.initializeMemoryWriter(context)).ok).toBe(true);
         routed.processMemory = null;
-        api.getMemoryWriterHealthGate.mockImplementation(({ provider }) => ({ blocked: provider === 'openai' }));
+        api.getMemoryWriterHealthGate.mockImplementation(({ provider }) => ({
+          blocked: provider === 'openai',
+        }));
         expect((await routed.initializeMemoryWriter(context)).ok).toBe(true);
         expect(api.loadMemorySnapshot).toHaveBeenCalledTimes(1);
         expect(api.createMemoryProcessor).toHaveBeenCalledTimes(2);
-        expect(api.createMemoryProcessor.mock.calls.map(([params]) => params.snapshot)).toEqual([snapshot, snapshot]);
-      } finally { api.getMemoryWriterHealthGate.mockReturnValue({ blocked: false }); }
+        expect(api.createMemoryProcessor.mock.calls.map(([params]) => params.snapshot)).toEqual([
+          snapshot,
+          snapshot,
+        ]);
+      } finally {
+        api.getMemoryWriterHealthGate.mockReturnValue({ blocked: false });
+      }
     });
 
     it('rechecks recovered source before each mutation and refuses a deleted source after model execution', async () => {
@@ -4157,30 +4574,61 @@ describe('AgentClient - titleConvo', () => {
       const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
       const deleteMemory = jest.fn();
       const routed = new AgentClient(mockOptions);
-      routed.memoryWriterState = { appConfig: mockReq.config, userId: 'user-123',
-        memoryConfig: mockReq.config.memory, memoryMethods: { setMemory, deleteMemory }, memoryPolicyConfig: {} };
+      routed.memoryWriterState = {
+        appConfig: mockReq.config,
+        userId: 'user-123',
+        memoryConfig: mockReq.config.memory,
+        memoryMethods: { setMemory, deleteMemory },
+        memoryPolicyConfig: {},
+      };
       api.initializeAgent.mockImplementation(async ({ agent }) => agent);
       api.createMemoryProcessor.mockResolvedValue([null, jest.fn()]);
       api.getMemoryWriterHealthGate.mockReturnValue({ blocked: false });
-      const rowsSpy = jest.spyOn(db, 'getMessages').mockResolvedValue([{ messageId: 'source', user: 'user-123',
-        conversationId: 'convo-123', isCreatedByUser: true, updatedAt: new Date(0), deletedAt: null }]);
+      const rowsSpy = jest.spyOn(db, 'getMessages').mockResolvedValue([
+        {
+          messageId: 'source',
+          user: 'user-123',
+          conversationId: 'convo-123',
+          isCreatedByUser: true,
+          updatedAt: new Date(0),
+          deletedAt: null,
+        },
+      ]);
       const newerSpy = jest.spyOn(db, 'hasNewerMemorySource').mockResolvedValue(false);
-      const context = { req: mockReq, res: mockRes, userId: 'user-123', appConfig: mockReq.config,
-        conversationId: 'convo-123', snapshot: {}, memoryWriteIdentity: { messageId: 'answer', owner: 'runtime' },
-        sourceIntegrity: { admittedAt: new Date(1000), source: { messageIds: ['source'],
-          configDigest: AgentClient.memoryWriterConfigDigest(mockReq.config),
-          agentDigest: require('crypto').createHash('sha256').update('null').digest('hex'),
-          messageDigests: { source: AgentClient.memoryWriterSourceDigest({}) } } } };
+      const context = {
+        req: mockReq,
+        res: mockRes,
+        userId: 'user-123',
+        appConfig: mockReq.config,
+        conversationId: 'convo-123',
+        snapshot: {},
+        memoryWriteIdentity: { messageId: 'answer', owner: 'runtime' },
+        sourceIntegrity: {
+          admittedAt: new Date(1000),
+          source: {
+            messageIds: ['source'],
+            configDigest: AgentClient.memoryWriterConfigDigest(mockReq.config),
+            agentDigest: require('crypto').createHash('sha256').update('null').digest('hex'),
+            messageDigests: { source: AgentClient.memoryWriterSourceDigest({}) },
+          },
+        },
+      };
       try {
         expect((await routed.initializeMemoryWriter(context)).ok).toBe(true);
         const methods = api.createMemoryProcessor.mock.calls[0][0].memoryMethods;
-        expect(await methods.setMemory({ key: 'preferences', expectedRevision: null })).toMatchObject({ ok: true });
+        expect(
+          await methods.setMemory({ key: 'preferences', expectedRevision: null }),
+        ).toMatchObject({ ok: true });
         rowsSpy.mockResolvedValue([]);
-        await expect(methods.deleteMemory({ key: 'preferences', expectedRevision: 1 }))
-          .rejects.toThrow('recovery source is no longer available');
+        await expect(
+          methods.deleteMemory({ key: 'preferences', expectedRevision: 1 }),
+        ).rejects.toThrow('recovery source is no longer available');
         expect(setMemory).toHaveBeenCalledTimes(1);
         expect(deleteMemory).not.toHaveBeenCalled();
-      } finally { rowsSpy.mockRestore(); newerSpy.mockRestore(); }
+      } finally {
+        rowsSpy.mockRestore();
+        newerSpy.mockRestore();
+      }
     });
 
     it('revokes current configuration between individual memory mutations', async () => {
@@ -4189,24 +4637,44 @@ describe('AgentClient - titleConvo', () => {
       const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
       const deleteMemory = jest.fn();
       const routed = new AgentClient(mockOptions);
-      routed.memoryWriterState = { appConfig: mockReq.config, userId: 'user-123',
-        memoryConfig: mockReq.config.memory, memoryMethods: { setMemory, deleteMemory }, memoryPolicyConfig: {} };
+      routed.memoryWriterState = {
+        appConfig: mockReq.config,
+        userId: 'user-123',
+        memoryConfig: mockReq.config.memory,
+        memoryMethods: { setMemory, deleteMemory },
+        memoryPolicyConfig: {},
+      };
       api.initializeAgent.mockImplementation(async ({ agent }) => agent);
       api.createMemoryProcessor.mockResolvedValue([null, jest.fn()]);
       api.getMemoryWriterHealthGate.mockReturnValue({ blocked: false });
-      const context = { req: mockReq, res: mockRes, userId: 'user-123', appConfig: mockReq.config,
-        conversationId: 'convo-123', snapshot: {}, memoryWriteIdentity: { messageId: 'answer', owner: 'runtime' },
-        sourceIntegrity: { admittedAt: new Date(1000), source: {
-          messageIds: ['persisted-user-message'], messageDigests: client.memoryWriterSourceMessageDigests,
-          configDigest: AgentClient.memoryWriterConfigDigest(mockReq.config),
-          agentDigest: require('crypto').createHash('sha256').update('null').digest('hex'),
-        } } };
+      const context = {
+        req: mockReq,
+        res: mockRes,
+        userId: 'user-123',
+        appConfig: mockReq.config,
+        conversationId: 'convo-123',
+        snapshot: {},
+        memoryWriteIdentity: { messageId: 'answer', owner: 'runtime' },
+        sourceIntegrity: {
+          admittedAt: new Date(1000),
+          source: {
+            messageIds: ['persisted-user-message'],
+            messageDigests: client.memoryWriterSourceMessageDigests,
+            configDigest: AgentClient.memoryWriterConfigDigest(mockReq.config),
+            agentDigest: require('crypto').createHash('sha256').update('null').digest('hex'),
+          },
+        },
+      };
       expect((await routed.initializeMemoryWriter(context)).ok).toBe(true);
       const methods = api.createMemoryProcessor.mock.calls[0][0].memoryMethods;
-      expect(await methods.setMemory({ key: 'preferences', expectedRevision: null })).toMatchObject({ ok: true });
+      expect(await methods.setMemory({ key: 'preferences', expectedRevision: null })).toMatchObject(
+        { ok: true },
+      );
       // Mutate the same config object: the admitted fingerprint must not be recomputed from it.
       mockReq.config.memory.disabled = true;
-      await expect(methods.deleteMemory({ key: 'preferences', expectedRevision: 1 })).rejects.toThrow('settings');
+      await expect(
+        methods.deleteMemory({ key: 'preferences', expectedRevision: 1 }),
+      ).rejects.toThrow('settings');
       expect(setMemory).toHaveBeenCalledTimes(1);
       expect(deleteMemory).not.toHaveBeenCalled();
     });
@@ -4321,7 +4789,13 @@ describe('AgentClient - titleConvo', () => {
       const gated = new Set();
       api.getMemoryWriterHealthGate.mockImplementation(({ provider }) =>
         gated.has(provider)
-          ? { blocked: true, shouldLog: false, reason: 'quota', message: 'gated', blockedUntil: Date.now() + 1000 }
+          ? {
+              blocked: true,
+              shouldLog: false,
+              reason: 'quota',
+              message: 'gated',
+              blockedUntil: Date.now() + 1000,
+            }
           : { blocked: false },
       );
       api.markMemoryWriterRouteExhausted.mockImplementation(({ provider }) => {
@@ -4339,7 +4813,9 @@ describe('AgentClient - titleConvo', () => {
           },
         },
       ];
-      const saved = [{ type: Tools.memory, [Tools.memory]: { key: 'core', type: 'update', value: 'x' } }];
+      const saved = [
+        { type: Tools.memory, [Tools.memory]: { key: 'core', type: 'update', value: 'x' } },
+      ];
       const primaryProcess = jest.fn().mockResolvedValue(quotaFailure);
       const fallbackProcess = jest.fn().mockResolvedValue(saved);
       api.createMemoryProcessor.mockImplementation(async ({ config }) => [
@@ -4374,7 +4850,11 @@ describe('AgentClient - titleConvo', () => {
       });
       expect(fallbackProcess).toHaveBeenCalledTimes(1);
       expect(result).toEqual(saved);
-      expect(routed.memoryWriterRoute).toEqual({ role: 'fallback', provider: 'anthropic', model: 'claude-opus-5' });
+      expect(routed.memoryWriterRoute).toEqual({
+        role: 'fallback',
+        provider: 'anthropic',
+        model: 'claude-opus-5',
+      });
     });
 
     it('uses the captured artifact sink when detached writer completes after client cleanup', async () => {
@@ -4743,11 +5223,18 @@ describe('AgentClient - titleConvo', () => {
 
     it('preserves stored user text before upstream formatting drops an empty content array', async () => {
       client.useMemory = jest.fn().mockResolvedValue(undefined);
-      const original={messageId:'retained-user',parentMessageId:null,sender:'User',isCreatedByUser:true,
-        text:'Leave the existing registration unchanged.',content:[]};
-      const result=await client.buildMessages([original],original.messageId,{});
-      expect(result.prompt.find(message=>message.messageId===original.messageId).content)
-        .toEqual([{type:'text',text:original.text}]);
+      const original = {
+        messageId: 'retained-user',
+        parentMessageId: null,
+        sender: 'User',
+        isCreatedByUser: true,
+        text: 'Leave the existing registration unchanged.',
+        content: [],
+      };
+      const result = await client.buildMessages([original], original.messageId, {});
+      expect(
+        result.prompt.find((message) => message.messageId === original.messageId).content,
+      ).toEqual([{ type: 'text', text: original.text }]);
       expect(original.content).toEqual([]);
     });
 
@@ -4794,8 +5281,12 @@ describe('AgentClient - titleConvo', () => {
       // Verify primary agent has its configured instructions (not from buildOptions) and memory context
       expect(client.options.agent.instructions).toContain('Primary agent instructions');
       expect(client.options.agent.instructions).toContain(memoryContent);
-      expect(client.options.agent.instructions).toContain(`# Existing memory about the user:\n${memoryContent}`);
-      expect(client.options.agent.instructions).not.toContain('The system automatically stores important user information');
+      expect(client.options.agent.instructions).toContain(
+        `# Existing memory about the user:\n${memoryContent}`,
+      );
+      expect(client.options.agent.instructions).not.toContain(
+        'The system automatically stores important user information',
+      );
 
       expect(parallelAgent1.instructions).toContain('Parallel agent 1 instructions');
       expect(parallelAgent1.instructions).toContain(memoryContent);
@@ -4810,12 +5301,24 @@ describe('AgentClient - titleConvo', () => {
         client.memoryReadAvailability = 'available';
         return memory;
       });
-      mockReq.config.endpoints = { agents: { providerCapabilities: {
-        [EModelEndpoint.openAI]: { workspace_binding: true, conversation_session: true },
-      } } };
-      const parallel = { id: 'parallel', instructions: 'Parallel instructions.', provider: EModelEndpoint.anthropic };
+      mockReq.config.endpoints = {
+        agents: {
+          providerCapabilities: {
+            [EModelEndpoint.openAI]: { workspace_binding: true, conversation_session: true },
+          },
+        },
+      };
+      const parallel = {
+        id: 'parallel',
+        instructions: 'Parallel instructions.',
+        provider: EModelEndpoint.anthropic,
+      };
       client.agentConfigs = new Map([['parallel', parallel]]);
-      await client.buildMessages([{messageId: 'user', sender: 'User', text: 'Hello', isCreatedByUser: true}], null, {});
+      await client.buildMessages(
+        [{ messageId: 'user', sender: 'User', text: 'Hello', isCreatedByUser: true }],
+        null,
+        {},
+      );
       expect(client.options.agent.instructions).not.toContain(memory);
       expect(parallel.instructions).toContain(memory);
       expect(client.glasshiveWorkerMemory).toBe(memory);
@@ -5051,17 +5554,30 @@ describe('AgentClient - titleConvo', () => {
       });
     });
 
-    it.each(['available', 'empty', 'unavailable', 'disabled', 'denied'])('records current %s availability without retaining earlier memory', async (status) => {
-      mockCheckAccess.mockResolvedValue(status !== 'denied');
-      if (status === 'disabled') mockReq.user.personalization.memories = false;
-      if (status === 'unavailable') mockLoadMemoryReadContext.mockRejectedValueOnce(new Error('Synthetic read unavailable'));
-      if (status === 'empty') mockLoadMemoryReadContext.mockResolvedValueOnce({text: '', totalTokens: 0, includedKeys: [], omittedKeys: [], duplicateKeys: [], cacheHit: false});
-      client = new AgentClient(mockOptions);
-      client.memoryReadContext = {text: 'Old private memory'};
-      await client.useMemory();
-      expect(client.memoryReadAvailability).toBe(status);
-      if (status !== 'available') expect(client.memoryReadContext?.text).not.toBe('Old private memory');
-    });
+    it.each(['available', 'empty', 'unavailable', 'disabled', 'denied'])(
+      'records current %s availability without retaining earlier memory',
+      async (status) => {
+        mockCheckAccess.mockResolvedValue(status !== 'denied');
+        if (status === 'disabled') mockReq.user.personalization.memories = false;
+        if (status === 'unavailable')
+          mockLoadMemoryReadContext.mockRejectedValueOnce(new Error('Synthetic read unavailable'));
+        if (status === 'empty')
+          mockLoadMemoryReadContext.mockResolvedValueOnce({
+            text: '',
+            totalTokens: 0,
+            includedKeys: [],
+            omittedKeys: [],
+            duplicateKeys: [],
+            cacheHit: false,
+          });
+        client = new AgentClient(mockOptions);
+        client.memoryReadContext = { text: 'Old private memory' };
+        await client.useMemory();
+        expect(client.memoryReadAvailability).toBe(status);
+        if (status !== 'available')
+          expect(client.memoryReadContext?.text).not.toBe('Old private memory');
+      },
+    );
 
     it('should read memory without initializing the writer on the chat critical path', async () => {
       mockCheckAccess.mockResolvedValue(true);
@@ -5383,8 +5899,14 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       messageId: 'follow-up-1',
       parentMessageId: 'resp-1',
       text: 'Follow-up result.',
-      metadata: { viventium: { messageRevision: 1, cortexInsightDeliveryIds: ['delivery-phase-b'],
-        cortexPresentationGeneration: 2, cortexPresentationClaimToken: 'claim-phase-b' } },
+      metadata: {
+        viventium: {
+          messageRevision: 1,
+          cortexInsightDeliveryIds: ['delivery-phase-b'],
+          cortexPresentationGeneration: 2,
+          cortexPresentationClaimToken: 'claim-phase-b',
+        },
+      },
     });
 
     const attached = client.attachBackgroundCortexCompletionPipeline({
@@ -5458,53 +5980,58 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     );
   });
 
-  test.each([false, true])('finishes late Phase B after real request disposal (fallback=%s)', async (useFallback) => {
-    const phaseB = deferred();
-    const completedAgent = useFallback
-      ? { ...primaryAgent, id: 'agent-fallback', model: 'synthetic-fallback' }
-      : client.options.agent;
-    let attached;
-    client.chatCompletion = jest.fn(async () => {
-      attached = client.attachBackgroundCortexCompletionPipeline({
-        cortexExecutionPromise: phaseB.promise,
-        pendingCortexParts: [],
-        req,
-        conversationId: 'conv-1',
-        responseMessageId: 'resp-1',
-        agent: client.options.agent,
-        getResponseContentParts: () => client.contentParts,
-        responseController: { lastUserInputTime: 10 },
-        turnUserInputTime: 10,
-        followupGraceMs: 0,
-        shouldDeferMainResponse: false,
+  test.each([false, true])(
+    'finishes late Phase B after real request disposal (fallback=%s)',
+    async (useFallback) => {
+      const phaseB = deferred();
+      const completedAgent = useFallback
+        ? { ...primaryAgent, id: 'agent-fallback', model: 'synthetic-fallback' }
+        : client.options.agent;
+      let attached;
+      client.chatCompletion = jest.fn(async () => {
+        attached = client.attachBackgroundCortexCompletionPipeline({
+          cortexExecutionPromise: phaseB.promise,
+          pendingCortexParts: [],
+          req,
+          conversationId: 'conv-1',
+          responseMessageId: 'resp-1',
+          agent: client.options.agent,
+          getResponseContentParts: () => client.contentParts,
+          responseController: { lastUserInputTime: 10 },
+          turnUserInputTime: 10,
+          followupGraceMs: 0,
+          shouldDeferMainResponse: false,
+        });
+        client.options.agent = completedAgent;
+        client.contentParts.push({ type: ContentTypes.TEXT, text: 'Saved final answer.' });
       });
-      client.options.agent = completedAgent;
-      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Saved final answer.' });
-    });
-    await client.sendCompletion({ text: 'A normal user request.' });
-    require('~/server/cleanup').disposeClient(client);
-    expect(client.options).toBeNull();
-    expect(client.contentParts).toBeNull();
+      await client.sendCompletion({ text: 'A normal user request.' });
+      require('~/server/cleanup').disposeClient(client);
+      expect(client.options).toBeNull();
+      expect(client.contentParts).toBeNull();
 
-    phaseB.resolve({
-      insights: [{ cortexName: 'Background', insight: 'A later verified finding.' }],
-      mergedPrompt: 'A later verified finding.',
-      cortexCount: 1,
-    });
-    await attached;
+      phaseB.resolve({
+        insights: [{ cortexName: 'Background', insight: 'A later verified finding.' }],
+        mergedPrompt: 'A later verified finding.',
+        cortexCount: 1,
+      });
+      await attached;
 
-    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
-    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledWith(expect.objectContaining({
-      req,
-      conversationId: 'conv-1',
-      parentMessageId: 'resp-1',
-      agent: completedAgent,
-      // The follow-up service owns recovery of the saved parent after streaming is disposed.
-      recentResponse: '',
-      forceVisibleFollowUp: false,
-    }));
-    expect(mockFinalizeCanonicalCortexMessage).toHaveBeenCalledWith({ req, messageId: 'resp-1' });
-  });
+      expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+      expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          req,
+          conversationId: 'conv-1',
+          parentMessageId: 'resp-1',
+          agent: completedAgent,
+          // The follow-up service owns recovery of the saved parent after streaming is disposed.
+          recentResponse: '',
+          forceVisibleFollowUp: false,
+        }),
+      );
+      expect(mockFinalizeCanonicalCortexMessage).toHaveBeenCalledWith({ req, messageId: 'resp-1' });
+    },
+  );
 
   test('drains incremental writes before persisting the authoritative final snapshot', async () => {
     const phaseB = deferred();
@@ -5632,8 +6159,14 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       messageId: 'resp-1',
       parentMessageId: 'user-1',
       text: 'Promoted final answer.',
-      metadata: { viventium: { messageRevision: 1, cortexInsightDeliveryIds: ['delivery-phase-b'],
-        cortexPresentationGeneration: 2, cortexPresentationClaimToken: 'claim-phase-b' } },
+      metadata: {
+        viventium: {
+          messageRevision: 1,
+          cortexInsightDeliveryIds: ['delivery-phase-b'],
+          cortexPresentationGeneration: 2,
+          cortexPresentationClaimToken: 'claim-phase-b',
+        },
+      },
     });
 
     const attached = client.attachBackgroundCortexCompletionPipeline({

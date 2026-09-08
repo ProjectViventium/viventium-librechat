@@ -666,7 +666,9 @@ async function coalesceVoiceTurn({
   const mergedTurnText = (segments) => {
     if (typedInput) return normalizedText;
     if (usesSpeakerSegments) {
-      return combineVoiceSpeakerSegments(segments).map((segment) => segment.text).join(' ');
+      return combineVoiceSpeakerSegments(segments)
+        .map((segment) => segment.text)
+        .join(' ');
     }
     return combineVoiceTurnSegments(segments) || normalizedText;
   };
@@ -782,7 +784,8 @@ async function coalesceVoiceTurn({
         (usesSpeakerSegments
           ? speakerSegments.every((incoming) =>
               savedSpeakerSegments.some(
-                (saved) => saved.segmentId === incoming.segmentId && saved.revision >= incoming.revision,
+                (saved) =>
+                  saved.segmentId === incoming.segmentId && saved.revision >= incoming.revision,
               ),
             )
           : voiceTurnTextAlreadyCaptured(savedText, normalizedText))
@@ -2831,13 +2834,15 @@ router.post(
     }
 
     /* === VIVENTIUM START === Freeze trusted authority for late work dispatch. === */
-    req.viventiumVoiceWorkAuthority = req.body.viventiumCanAuthorizeSideEffects === true
-      ? createVoiceWorkAuthorityBinding({
-      session,
-      segments: req.body.speakerSegments,
-      typedInput: req.viventiumVoiceTypedInput,
-      engagement: req.body.voiceEngagement,
-    }) : null;
+    req.viventiumVoiceWorkAuthority =
+      req.body.viventiumCanAuthorizeSideEffects === true
+        ? createVoiceWorkAuthorityBinding({
+            session,
+            segments: req.body.speakerSegments,
+            typedInput: req.viventiumVoiceTypedInput,
+            engagement: req.body.voiceEngagement,
+          })
+        : null;
     /* === VIVENTIUM END === */
 
     logger.info(

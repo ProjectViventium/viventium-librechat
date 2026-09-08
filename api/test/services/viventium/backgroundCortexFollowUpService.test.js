@@ -1,3 +1,60 @@
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { buildPromptBundleFixture } = require('../../../../scripts/test-support/promptBundle.cjs');
+let promptFixtureDirectory;
+const previousPromptBundlePath = process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+beforeAll(() => {
+  promptFixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-test-prompts-'));
+  const bundlePath = path.join(promptFixtureDirectory, 'bundle.json');
+  fs.writeFileSync(
+    bundlePath,
+    JSON.stringify(
+      buildPromptBundleFixture(
+        path.resolve(__dirname, '../../../../viventium/source_of_truth/prompts'),
+      ),
+    ),
+  );
+  process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundlePath;
+});
+afterAll(() => {
+  if (previousPromptBundlePath === undefined) delete process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+  else process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = previousPromptBundlePath;
+  fs.rmSync(promptFixtureDirectory, { recursive: true, force: true });
+});
+
+jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => {
+  const actual = jest.requireActual('~/server/services/viventium/CortexInsightDeliveryService');
+  const crypto = require('node:crypto');
+  const settle = jest.fn(async ({ claims }) => claims);
+  return {
+    ...actual,
+    claimCortexInsightDeliveryBatch: jest.fn(async ({ insights }) => ({
+      claimed: insights.map((insight, index) => ({
+        deliveryId: `fixture-delivery-${index}`,
+        claimToken: `fixture-claim-${index}`,
+        claimGeneration: 1,
+        attemptNumber: 1,
+        cortexId:
+          insight.cortexId ||
+          insight.cortex_id ||
+          insight.agentId ||
+          insight.agent_id ||
+          insight.cortexName ||
+          insight.cortex_name ||
+          'cortex',
+        insightHash: crypto
+          .createHash('sha256')
+          .update(String(insight.insight || ''))
+          .digest('hex'),
+      })),
+    })),
+    renewCortexInsightDeliveryBatchClaim: settle,
+    markCortexInsightDeliveryBatchPersisted: settle,
+    markCortexInsightDeliveryBatchFailed: settle,
+    markCortexInsightDeliveryBatchDropped: settle,
+  };
+});
 /* === VIVENTIUM START ===
  * Purpose: Viventium addition in private LibreChat fork (new file).
  * Porting: Copy this file wholesale when reapplying Viventium changes onto a fresh upstream checkout.
@@ -94,6 +151,7 @@ jest.mock('~/app/clients/tools/util/fileSearch', () => ({
 }));
 
 jest.mock('~/models', () => ({
+  getNativeResponse: jest.fn(async () => null),
   getMessage: jest.fn(),
   getMessages: jest.fn(),
   updateMessage: jest.fn(),
@@ -136,6 +194,7 @@ describe('BackgroundCortexFollowUpService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     getAgent.mockResolvedValue(null);
+    db.saveMessage.mockImplementation(async (_req, message) => message);
   });
 
   describe('recent response resolution', () => {
@@ -508,13 +567,14 @@ describe('BackgroundCortexFollowUpService', () => {
 
   test('createCortexFollowUpMessage saves a follow-up message with metadata', async () => {
     const req = { user: { id: 'u1' } };
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
 
+    Run.create.mockResolvedValueOnce({ processStream: jest.fn(async () => 'Secret code: 27') });
     const msg = await createCortexFollowUpMessage({
       req,
       conversationId: 'c-123',
       parentMessageId: 'm-parent',
-      agent: { id: 'agent_123' },
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-4o-mini', model_parameters: {} },
       insightsData: {
         cortexCount: 1,
         insights: [{ cortexName: 'Background Analysis', insight: 'Secret code: 27' }],
@@ -542,7 +602,7 @@ describe('BackgroundCortexFollowUpService', () => {
       user: { id: 'u1' },
       body: { viventiumSurface: 'telegram', telegramAudioRequested: true },
     };
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => 'First beat.\n{MSG_BREAK}\nSecond beat.\n{SKIP_VOICE}'),
     });
@@ -593,7 +653,7 @@ describe('BackgroundCortexFollowUpService', () => {
 
   test('createCortexFollowUpMessage attaches non-deferred follow-up to the current leaf message', async () => {
     const req = { user: { id: 'u1' } };
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
     db.getMessages.mockResolvedValueOnce([
       {
         messageId: 'assistant-phase-1',
@@ -609,11 +669,12 @@ describe('BackgroundCortexFollowUpService', () => {
       },
     ]);
 
+    Run.create.mockResolvedValueOnce({ processStream: jest.fn(async () => 'Secret code: 27') });
     const msg = await createCortexFollowUpMessage({
       req,
       conversationId: 'c-123',
       parentMessageId: 'assistant-phase-1',
-      agent: { id: 'agent_123' },
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-4o-mini', model_parameters: {} },
       insightsData: {
         cortexCount: 1,
         insights: [{ cortexName: 'Background Analysis', insight: 'Secret code: 27' }],
@@ -647,7 +708,7 @@ describe('BackgroundCortexFollowUpService', () => {
   test('createCortexFollowUpMessage persists a deterministic fallback when synthesis is empty but insight is substantive', async () => {
     const req = { user: { id: 'u1' } };
     db.getMessages.mockResolvedValueOnce([{ messageId: 'm-parent' }]);
-    db.saveMessage.mockResolvedValueOnce({});
+    db.saveMessage.mockImplementationOnce(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => ''),
@@ -731,7 +792,7 @@ describe('BackgroundCortexFollowUpService', () => {
         text: 'Good, then leave it alone.',
       },
     ]);
-    db.saveMessage.mockResolvedValueOnce({});
+    db.saveMessage.mockImplementationOnce(async (_req, message) => message);
 
     let capturedPrompt = '';
     Run.create.mockResolvedValueOnce({
@@ -839,7 +900,7 @@ describe('BackgroundCortexFollowUpService', () => {
         text: 'I have the main answer.',
       },
     ]);
-    db.saveMessage.mockResolvedValueOnce({});
+    db.saveMessage.mockImplementationOnce(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => 'One still-useful new detail.'),
@@ -961,7 +1022,7 @@ describe('BackgroundCortexFollowUpService', () => {
       content: [{ type: 'text', text: 'Phase A response from DB content parts' }],
     });
     db.getMessages.mockResolvedValueOnce([{ messageId: 'm-parent' }]);
-    db.saveMessage.mockResolvedValueOnce({});
+    db.saveMessage.mockImplementationOnce(async (_req, message) => message);
 
     let capturedPrompt = '';
     Run.create.mockResolvedValueOnce({
@@ -1012,7 +1073,7 @@ describe('BackgroundCortexFollowUpService', () => {
         },
       },
     });
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => 'Final resolved answer'),
@@ -1274,7 +1335,7 @@ describe('BackgroundCortexFollowUpService', () => {
         },
       },
     });
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => '{NTA}'),
@@ -1389,7 +1450,7 @@ describe('BackgroundCortexFollowUpService', () => {
         },
       },
     });
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => '{NTA}'),
@@ -1499,7 +1560,7 @@ describe('BackgroundCortexFollowUpService', () => {
         },
       },
     });
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => {
@@ -1621,7 +1682,7 @@ describe('BackgroundCortexFollowUpService', () => {
       content: [{ type: 'text', text: 'Phase A response from DB content parts' }],
     });
     db.getMessages.mockResolvedValueOnce([{ messageId: 'm-parent' }]);
-    db.saveMessage.mockResolvedValueOnce({});
+    db.saveMessage.mockImplementationOnce(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => '{NTA} Keep the good part \\ue202turn0search0 [12] here'),
@@ -2546,7 +2607,7 @@ describe('BackgroundCortexFollowUpService', () => {
 
       expect(prompt).toContain('Sharing the same topic is not enough to call an insight redundant');
       expect(prompt).toContain(
-        'unless the user explicitly authorized a conditional later continuation',
+        'the user did not explicitly authorize a conditional later continuation',
       );
     });
 
@@ -2672,6 +2733,7 @@ describe('BackgroundCortexFollowUpService', () => {
 
     jest.clearAllMocks();
     getAgent.mockResolvedValue(null);
+    db.saveMessage.mockImplementation(async (_req, message) => message);
     await generateFollowUpText({
       req,
       agent: { id: 'agent_123', provider: 'openai' },

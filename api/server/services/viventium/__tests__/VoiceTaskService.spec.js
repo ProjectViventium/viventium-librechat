@@ -39,8 +39,10 @@ describe('VoiceTaskService', () => {
     bindVoiceTaskStream(task.taskId, 'stream-bind', binding);
     const bound = snapshotEvent(task.taskId);
     expect(bound).toMatchObject({
-      conversationId: 'conversation-bind', state: 'completed',
-      resultMessageId: 'result-before-ready', sequence: prior.sequence + 1,
+      conversationId: 'conversation-bind',
+      state: 'completed',
+      resultMessageId: 'result-before-ready',
+      sequence: prior.sequence + 1,
     });
     bindVoiceTaskStream(task.taskId, 'stream-bind', binding);
     expect(snapshotEvent(task.taskId).sequence).toBe(bound.sequence);
@@ -51,7 +53,11 @@ describe('VoiceTaskService', () => {
     { callSessionId: 'other-call' },
     { conversationId: 'other-conversation' },
   ])('rejects a ready receipt identity change before mutating stream: %j', (mismatch) => {
-    const scope = { callSessionId: 'call-bind', userId: 'user-bind', conversationId: 'conversation-bind' };
+    const scope = {
+      callSessionId: 'call-bind',
+      userId: 'user-bind',
+      conversationId: 'conversation-bind',
+    };
     const task = createVoiceTask({ ...scope, streamId: 'stream-bind' });
     const prior = getVoiceTask(task.taskId);
     expect(bindVoiceTaskStream(task.taskId, 'other-stream', { ...scope, ...mismatch })).toBeNull();
@@ -763,37 +769,57 @@ describe('VoiceTaskService', () => {
   });
 });
 
-
 describe('generation-owned voice task settlement', () => {
   const service = require('../VoiceTaskService');
   const scope = { userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-1' };
-  const create = () => service.createVoiceTask({ ...scope, owner: { kind: 'generation_job', id: 'stream-1' } });
+  const create = () =>
+    service.createVoiceTask({ ...scope, owner: { kind: 'generation_job', id: 'stream-1' } });
   beforeEach(() => service.resetVoiceTasksForTests());
 
-  test.each(['none', 'disconnected'])('persists terminal state with %s task subscribers and replays it once', async (mode) => {
-    const task = create();
-    if (mode === 'disconnected') service.subscribeVoiceTask(task.taskId, jest.fn())();
-    await service.settleVoiceTaskGeneration(task.taskId, scope, { resultMessageId: 'result-1' });
-    expect(service.snapshotEvent(task.taskId)).toMatchObject({ state: 'completed', resultMessageId: 'result-1' });
-    const first = service.snapshotEvent(task.taskId);
-    await service.settleVoiceTaskGeneration(task.taskId, scope, { resultMessageId: 'result-1' });
-    const replay = jest.fn(); service.subscribeVoiceTask(task.taskId, replay)();
-    expect(replay).toHaveBeenCalledTimes(1);
-    expect(replay.mock.calls[0][0]).toMatchObject({ sequence: first.sequence, state: 'completed' });
-  });
+  test.each(['none', 'disconnected'])(
+    'persists terminal state with %s task subscribers and replays it once',
+    async (mode) => {
+      const task = create();
+      if (mode === 'disconnected') service.subscribeVoiceTask(task.taskId, jest.fn())();
+      await service.settleVoiceTaskGeneration(task.taskId, scope, { resultMessageId: 'result-1' });
+      expect(service.snapshotEvent(task.taskId)).toMatchObject({
+        state: 'completed',
+        resultMessageId: 'result-1',
+      });
+      const first = service.snapshotEvent(task.taskId);
+      await service.settleVoiceTaskGeneration(task.taskId, scope, { resultMessageId: 'result-1' });
+      const replay = jest.fn();
+      service.subscribeVoiceTask(task.taskId, replay)();
+      expect(replay).toHaveBeenCalledTimes(1);
+      expect(replay.mock.calls[0][0]).toMatchObject({
+        sequence: first.sequence,
+        state: 'completed',
+      });
+    },
+  );
 
-  test.each(['userId', 'callSessionId', 'streamId'])('rejects a foreign %s completion', async (key) => {
-    const task = create();
-    expect(await service.settleVoiceTaskGeneration(task.taskId, { ...scope, [key]: 'foreign' }, {})).toBeNull();
-    expect(service.getVoiceTask(task.taskId).state).toBe('running');
-  });
+  test.each(['userId', 'callSessionId', 'streamId'])(
+    'rejects a foreign %s completion',
+    async (key) => {
+      const task = create();
+      expect(
+        await service.settleVoiceTaskGeneration(task.taskId, { ...scope, [key]: 'foreign' }, {}),
+      ).toBeNull();
+      expect(service.getVoiceTask(task.taskId).state).toBe('running');
+    },
+  );
 
   test('preserves explicit cancellation and independent pending child work', async () => {
     const parent = create();
     service.markVoiceTaskAwaitingOwnerResult(parent.taskId, 'pending-child');
-    await service.settleVoiceTaskGeneration(parent.taskId, scope, { resultMessageId: 'parent-result' });
+    await service.settleVoiceTaskGeneration(parent.taskId, scope, {
+      resultMessageId: 'parent-result',
+    });
     expect(service.getVoiceTask(parent.taskId).state).toBe('running');
-    service.linkVoiceTaskOwnerChild(parent.taskId, { continuationKey: 'pending-child', resolvedOwnerId: 'child-1' });
+    service.linkVoiceTaskOwnerChild(parent.taskId, {
+      continuationKey: 'pending-child',
+      resolvedOwnerId: 'child-1',
+    });
     expect(service.getVoiceTask(parent.taskId).state).toBe('completed');
     service.resetVoiceTasksForTests();
     const cancelled = create();
@@ -804,10 +830,21 @@ describe('generation-owned voice task settlement', () => {
 
   test('records provider failure and does not overwrite a different execution owner', async () => {
     const task = create();
-    service.setVoiceTaskOwnerCapabilities(task.taskId, { kind: 'glasshive_run', ownerId: 'worker-run' });
+    service.setVoiceTaskOwnerCapabilities(task.taskId, {
+      kind: 'glasshive_run',
+      ownerId: 'worker-run',
+    });
     expect(await service.settleVoiceTaskGeneration(task.taskId, scope, {})).toBeNull();
-    service.setVoiceTaskOwnerCapabilities(task.taskId, { kind: 'remote_generation', ownerId: scope.streamId });
-    await service.settleVoiceTaskGeneration(task.taskId, scope, { error: { code: 'provider_unavailable', message: 'Provider unavailable' } });
-    expect(service.snapshotEvent(task.taskId)).toMatchObject({ state: 'failed', error: { code: 'provider_unavailable' } });
+    service.setVoiceTaskOwnerCapabilities(task.taskId, {
+      kind: 'remote_generation',
+      ownerId: scope.streamId,
+    });
+    await service.settleVoiceTaskGeneration(task.taskId, scope, {
+      error: { code: 'provider_unavailable', message: 'Provider unavailable' },
+    });
+    expect(service.snapshotEvent(task.taskId)).toMatchObject({
+      state: 'failed',
+      error: { code: 'provider_unavailable' },
+    });
   });
 });

@@ -156,14 +156,24 @@ describe('cortexMessageState', () => {
   test('preserves unfinished state when the parent has ordinary visible text', async () => {
     const { getCortexMessageState } = require('~/server/services/viventium/cortexMessageState');
     mockGetMessage.mockResolvedValueOnce({
-      messageId: 'msg-unfinished', conversationId: 'conv-1',
-      text: 'I have an initial result.', unfinished: true,
-      content: [{ type: 'cortex_insight', status: 'complete', cortex_name: 'Review',
-        insight: 'The checked result confirms the delivery date is Friday.' }],
+      messageId: 'msg-unfinished',
+      conversationId: 'conv-1',
+      text: 'I have an initial result.',
+      unfinished: true,
+      content: [
+        {
+          type: 'cortex_insight',
+          status: 'complete',
+          cortex_name: 'Review',
+          insight: 'The checked result confirms the delivery date is Friday.',
+        },
+      ],
     });
     mockGetMessages.mockResolvedValueOnce([]);
     const state = await getCortexMessageState({
-      userId: 'user-1', messageId: 'msg-unfinished', conversationId: 'conv-1',
+      userId: 'user-1',
+      messageId: 'msg-unfinished',
+      conversationId: 'conv-1',
     });
     expect(state.canonicalText).toBe('The checked result confirms the delivery date is Friday.');
     expect(state.canonicalTextSource).toBe('deferred_fallback');

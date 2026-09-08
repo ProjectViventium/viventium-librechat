@@ -10,7 +10,10 @@ jest.mock('~/models', () => ({
   saveConvo: jest.fn(async (_req, conversation) => conversation),
 }));
 jest.mock('~/server/middleware', () => ({
-  requireJwtAuth: (req, _res, next) => { req.user = { id: 'user123' }; next(); },
+  requireJwtAuth: (req, _res, next) => {
+    req.user = { id: 'user123' };
+    next();
+  },
   validateMessageReq: (_req, _res, next) => next(),
 }));
 jest.mock('~/server/services/viventium/nativeResponseService', () => ({
@@ -21,9 +24,10 @@ jest.mock('~/server/services/viventium/nativeResponseService', () => ({
     return require('~/models').mutateNativeResponseSources(
       filter,
       operation,
-      (identity) => mockNativeResponseManager
-        ? mockNativeResponseManager.revokeNativeResponse(identity)
-        : Promise.resolve({ status: 'revoked' }),
+      (identity) =>
+        mockNativeResponseManager
+          ? mockNativeResponseManager.revokeNativeResponse(identity)
+          : Promise.resolve({ status: 'revoked' }),
       transaction.runGlassHiveTerminalCallbackTransaction,
       async (identity) => mockNativeResponseManager?.retireNativeResponse(identity),
       kind,
@@ -238,7 +242,9 @@ describe('Message Operations', () => {
         };
         const transaction = (operation) => mongoose.connection.transaction(operation);
         mongoose.set('transactionAsyncLocalStorage', true);
-        expect(await mockNativeResponseManager.bindNativeResponse(identity)).toBe(true);
+        if ((await mockNativeResponseManager.bindNativeResponse(identity)) !== true) {
+          throw new Error('Native response fixture binding was not accepted');
+        }
         await methods.admitNativeResponse(identity, transaction);
         candidateDigest = undefined;
         finalEvent = undefined;
@@ -448,7 +454,7 @@ describe('Message Operations', () => {
         },
       );
 
-    test('a system snapshot returns the native owner result without a second save', async () => {
+      test('a system snapshot returns the native owner result without a second save', async () => {
         const saved = await saveMessage(
           mockReq,
           {
@@ -472,36 +478,36 @@ describe('Message Operations', () => {
         expect(
           await methods.getNativeResponse(identity.userId, identity.responseMessageId),
         ).toMatchObject({ nativeResponse: { status, invocationId: identity.invocationId } });
-      expect(await store.getJob(identity.streamId)).toMatchObject({ nativeResponse: identity });
-    });
+        expect(await store.getJob(identity.streamId)).toMatchObject({ nativeResponse: identity });
+      });
 
-    test('a recovered BSON-null identity retains the original publication and exact FINAL', async () => {
-      if (status !== 'completed') await completeNative();
-      await Message.collection.updateOne(
-        { user: identity.userId, messageId: identity.responseMessageId },
-        {
-          $set: {
-            'nativeResponse.sourceOrderScope': null,
-            'nativeResponse.sourceSequence': null,
-            'nativeResponse.deliveryDispositionRequired': null,
-            'nativeResponse.deliveryContext': null,
+      test('a recovered BSON-null identity retains the original publication and exact FINAL', async () => {
+        if (status !== 'completed') await completeNative();
+        await Message.collection.updateOne(
+          { user: identity.userId, messageId: identity.responseMessageId },
+          {
+            $set: {
+              'nativeResponse.sourceOrderScope': null,
+              'nativeResponse.sourceSequence': null,
+              'nativeResponse.deliveryDispositionRequired': null,
+              'nativeResponse.deliveryContext': null,
+            },
           },
-        },
-      );
-      const saved = await methods.getNativeResponse(identity.userId, identity.responseMessageId);
-      expect(saved.nativeResponse).toHaveProperty('sourceOrderScope', null);
-      expect(
-        await mockNativeResponseManager.finishNativeResponse(saved.nativeResponse, finalEvent),
-      ).toBe(true);
-      expect(await store.getNativeResponseCommit(saved.nativeResponse)).toEqual({
-        status: 'committed',
-        candidateSha256: candidateDigest,
+        );
+        const saved = await methods.getNativeResponse(identity.userId, identity.responseMessageId);
+        expect(saved.nativeResponse).toHaveProperty('sourceOrderScope', null);
+        expect(
+          await mockNativeResponseManager.finishNativeResponse(saved.nativeResponse, finalEvent),
+        ).toBe(true);
+        expect(await store.getNativeResponseCommit(saved.nativeResponse)).toEqual({
+          status: 'committed',
+          candidateSha256: candidateDigest,
+        });
+        expect(await store.getJob(identity.streamId)).toMatchObject({
+          nativeResponse: identity,
+          finalEvent: JSON.stringify(finalEvent),
+        });
       });
-      expect(await store.getJob(identity.streamId)).toMatchObject({
-        nativeResponse: identity,
-        finalEvent: JSON.stringify(finalEvent),
-      });
-    });
 
       test.each(['edit', 'delete'])(
         '%s retires replay and retains any accepted publication',

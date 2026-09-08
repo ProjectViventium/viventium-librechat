@@ -1,4 +1,6 @@
-jest.mock('~/server/services/viventium/GlassHiveWorkResultService', () => ({ getGlassHiveWorkResult: (...args) => mockGetGlassHiveWorkResult(...args) }));
+jest.mock('~/server/services/viventium/GlassHiveWorkResultService', () => ({
+  getGlassHiveWorkResult: (...args) => mockGetGlassHiveWorkResult(...args),
+}));
 const mockGetActiveWorkPage = jest.fn();
 const mockGetActiveWorkHistoryPage = jest.fn();
 const mockGetGlassHiveWorkResult = jest.fn();

@@ -4,7 +4,9 @@ const {
   markCortexInsightDeliveryBatchFailed,
   requireExactCortexInsightDeliverySettlement,
 } = require('~/server/services/viventium/CortexInsightDeliveryService');
-const { consumeLocalQaCortexFault } = require('~/server/services/viventium/LocalQaCortexFaultService');
+const {
+  consumeLocalQaCortexFault,
+} = require('~/server/services/viventium/LocalQaCortexFaultService');
 /* === VIVENTIUM START ===
  * File: api/server/controllers/agents/client.js
  *
@@ -99,9 +101,7 @@ const {
 } = require('~/server/services/viventium/listenOnlyTranscript');
 const { getRoleByName } = require('~/models/Role');
 const { loadAgent } = require('~/models/Agent');
-const {
-  getActiveWorkTurnContext,
-} = require('~/server/services/viventium/GlassHiveAccountService');
+const { getActiveWorkTurnContext } = require('~/server/services/viventium/GlassHiveAccountService');
 const { getMCPManager } = require('~/config');
 const db = require('~/models');
 const { updateBalance, bulkInsertTransactions } = require('~/models');
@@ -334,13 +334,20 @@ function memoryResultPartiallyApplied(result) {
 async function persistMemoryReceipt(writerContext, attachments) {
   const identity = writerContext?.memoryWriteIdentity;
   if (!identity || identity.userId !== String(writerContext.req?.user?.id || '')) return false;
-  const receipts = (attachments || []).filter((attachment) => attachment?.[Tools.memory] != null)
-    .map((attachment) => ({ ...attachment, messageId: identity.messageId,
-      conversationId: writerContext.conversationId }));
+  const receipts = (attachments || [])
+    .filter((attachment) => attachment?.[Tools.memory] != null)
+    .map((attachment) => ({
+      ...attachment,
+      messageId: identity.messageId,
+      conversationId: writerContext.conversationId,
+    }));
   try {
     return await db.completeMemoryWrite({ ...identity, receipts });
   } catch (error) {
-    logger.warn('[AgentClient] Memory receipt persistence failed', sanitizeCompletionErrorForLog(error));
+    logger.warn(
+      '[AgentClient] Memory receipt persistence failed',
+      sanitizeCompletionErrorForLog(error),
+    );
     return false;
   }
 }
@@ -348,83 +355,156 @@ async function persistMemoryReceipt(writerContext, attachments) {
 async function requireCurrentMemoryWriterAuthority(writerContext) {
   const { req, userId } = writerContext;
   if (
-    isVoiceActorSideEffectRestricted(req) || req?.body?.viventiumDeferVoiceMemory === true ||
-    isCancelledVoiceTask(req) || shouldSkipAutomaticMemoryWriter(req)
+    isVoiceActorSideEffectRestricted(req) ||
+    req?.body?.viventiumDeferVoiceMemory === true ||
+    isCancelledVoiceTask(req) ||
+    shouldSkipAutomaticMemoryWriter(req)
   ) {
     throw new Error('Saved-memory write authority is no longer available');
   }
   const user = await db.findUser({ _id: userId }, 'role personalization');
-  if (!user || user.personalization?.memories === false || !(await checkAccess({
-    user: { ...user, id: String(user._id) }, permissionType: PermissionTypes.MEMORIES,
-    permissions: [Permissions.USE], getRoleByName,
-  }))) {
+  if (
+    !user ||
+    user.personalization?.memories === false ||
+    !(await checkAccess({
+      user: { ...user, id: String(user._id) },
+      permissionType: PermissionTypes.MEMORIES,
+      permissions: [Permissions.USE],
+      getRoleByName,
+    }))
+  ) {
     throw new Error('Saved-memory permission is no longer available');
   }
   const currentConfig = await require('~/server/services/Config').getAppConfig({ role: user.role });
   const admittedSource = writerContext.sourceIntegrity?.source;
-  if (!currentConfig?.memory || currentConfig.memory.disabled === true ||
-    !admittedSource || memoryWriterConfigDigest(currentConfig) !== admittedSource.configDigest) {
+  if (
+    !currentConfig?.memory ||
+    currentConfig.memory.disabled === true ||
+    !admittedSource ||
+    memoryWriterConfigDigest(currentConfig) !== admittedSource.configDigest
+  ) {
     throw new Error('Saved-memory settings are no longer authorized');
   }
   const currentReq = { ...req, config: currentConfig, user: { ...user, id: String(user._id) } };
-  if (await memoryWriterAgentDigest(currentReq) !== admittedSource.agentDigest) {
+  if ((await memoryWriterAgentDigest(currentReq)) !== admittedSource.agentDigest) {
     throw new Error('Saved-memory agent configuration is no longer authorized');
   }
-  if (writerContext.sourceIntegrity && !(await memoryWriterRecoverySourcesAreCurrent({
-    userId, conversationId: writerContext.conversationId, ...writerContext.sourceIntegrity,
-    rejectNewerUserSource: writerContext.isRecovery === true,
-    responseMessageId: writerContext.responseMessageId,
-  }))) {
+  if (
+    writerContext.sourceIntegrity &&
+    !(await memoryWriterRecoverySourcesAreCurrent({
+      userId,
+      conversationId: writerContext.conversationId,
+      ...writerContext.sourceIntegrity,
+      rejectNewerUserSource: writerContext.isRecovery === true,
+      responseMessageId: writerContext.responseMessageId,
+    }))
+  ) {
     throw new Error('Saved-memory recovery source is no longer available');
   }
 }
 
 function memoryWriterSourceDigest(message) {
   // Receipt/feedback/cortex metadata may finish later without changing the admitted conversation.
-  const content = (Array.isArray(message?.content) ? message.content : [])
-    .filter((part) => part?.type === ContentTypes.TEXT || part?.type === ContentTypes.TOOL_CALL);
-  return crypto.createHash('sha256').update(JSON.stringify({ text: String(message?.text || ''), content,
-    nativeToolEvidence: message?.metadata?.viventium?.nativeToolEvidence })).digest('hex');
+  const content = (Array.isArray(message?.content) ? message.content : []).filter(
+    (part) => part?.type === ContentTypes.TEXT || part?.type === ContentTypes.TOOL_CALL,
+  );
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        text: String(message?.text || ''),
+        content,
+        nativeToolEvidence: message?.metadata?.viventium?.nativeToolEvidence,
+      }),
+    )
+    .digest('hex');
 }
 
-async function memoryWriterRecoverySourcesAreCurrent({ userId, conversationId, source, admittedAt, rejectNewerUserSource = false, responseMessageId }) {
+async function memoryWriterRecoverySourcesAreCurrent({
+  userId,
+  conversationId,
+  source,
+  admittedAt,
+  rejectNewerUserSource = false,
+  responseMessageId,
+}) {
   const ids = [...new Set((source?.messageIds || []).filter((id) => typeof id === 'string' && id))];
   const admittedTime = new Date(admittedAt).getTime();
   if (!ids.length || !Number.isFinite(admittedTime)) return false;
-  const rows = await db.getMessages({ user: userId, conversationId, deletedAt: null,
-    messageId: { $in: ids } }, 'user conversationId messageId parentMessageId isCreatedByUser text content deletedAt error metadata');
+  const rows = await db.getMessages(
+    { user: userId, conversationId, deletedAt: null, messageId: { $in: ids } },
+    'user conversationId messageId parentMessageId isCreatedByUser text content deletedAt error metadata',
+  );
   const byId = new Map(rows.map((row) => [row.messageId, row]));
   if (byId.get(ids[0])?.isCreatedByUser !== true) return false;
   if (responseMessageId && ids.includes(responseMessageId)) {
     let context;
-    try { context = JSON.parse(source.interactionContextJson || 'null'); }
-    catch { return false; }
-    if (!isCurrentMemoryWriterResponse({ response: byId.get(responseMessageId), userId,
-      conversationId, messageId: responseMessageId, parentMessageId: ids[0], context })) return false;
+    try {
+      context = JSON.parse(source.interactionContextJson || 'null');
+    } catch {
+      return false;
+    }
+    if (
+      !isCurrentMemoryWriterResponse({
+        response: byId.get(responseMessageId),
+        userId,
+        conversationId,
+        messageId: responseMessageId,
+        parentMessageId: ids[0],
+        context,
+      })
+    )
+      return false;
   }
-  if (!ids.every((id) => {
-    const row = byId.get(id);
-    return row && String(row.user) === String(userId) && row.conversationId === conversationId &&
-      row.deletedAt == null && source.messageDigests?.[id] === memoryWriterSourceDigest(row);
-  })) return false;
+  if (
+    !ids.every((id) => {
+      const row = byId.get(id);
+      return (
+        row &&
+        String(row.user) === String(userId) &&
+        row.conversationId === conversationId &&
+        row.deletedAt == null &&
+        source.messageDigests?.[id] === memoryWriterSourceDigest(row)
+      );
+    })
+  )
+    return false;
   return !rejectNewerUserSource || !(await db.hasNewerMemorySource({ userId, admittedAt }));
 }
 
 function memoryWriterConfigDigest(appConfig) {
-  return crypto.createHash('sha256').update(JSON.stringify({ memory: appConfig?.memory,
-    allowedProviders: appConfig?.endpoints?.[EModelEndpoint.agents]?.allowedProviders })).digest('hex');
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        memory: appConfig?.memory,
+        allowedProviders: appConfig?.endpoints?.[EModelEndpoint.agents]?.allowedProviders,
+      }),
+    )
+    .digest('hex');
 }
 
 async function memoryWriterAgentDigest(req) {
   const agentId = req?.config?.memory?.agent?.id;
   // Load the configured agent through the existing model and ACL services. The captured Main
   // agent can already be initialized/mutated and does not establish current write authority.
-  const agent = agentId ? await loadAgent({ req, agent_id: agentId, endpoint: EModelEndpoint.agents }) : null;
-  if (agentId && (!agent || (!isEphemeralAgentId(agentId) && req.user?.role !== SystemRoles.ADMIN &&
-    (!agent._id || !(await require('~/server/services/PermissionService').checkPermission({
-      userId: req.user?.id, role: req.user?.role, resourceType: ResourceType.AGENT,
-      resourceId: agent._id, requiredPermission: PermissionBits.VIEW,
-    })))))) {
+  const agent = agentId
+    ? await loadAgent({ req, agent_id: agentId, endpoint: EModelEndpoint.agents })
+    : null;
+  if (
+    agentId &&
+    (!agent ||
+      (!isEphemeralAgentId(agentId) &&
+        req.user?.role !== SystemRoles.ADMIN &&
+        (!agent._id ||
+          !(await require('~/server/services/PermissionService').checkPermission({
+            userId: req.user?.id,
+            role: req.user?.role,
+            resourceType: ResourceType.AGENT,
+            resourceId: agent._id,
+            requiredPermission: PermissionBits.VIEW,
+          })))))
+  ) {
     throw new Error('Saved-memory agent permission is no longer available');
   }
   return crypto.createHash('sha256').update(JSON.stringify(agent)).digest('hex');
@@ -433,51 +513,109 @@ async function memoryWriterAgentDigest(req) {
 async function recoverPendingMemoryWriter(row, memoryWriteIdentity) {
   const rejectRecovery = async () => {
     if (await db.startMemoryWrite(memoryWriteIdentity)) {
-      await db.completeMemoryWrite({ ...memoryWriteIdentity, receipts: [{ type: Tools.memory,
-        messageId: row.messageId, conversationId: row.conversationId,
-        [Tools.memory]: { type: 'error', key: 'system', value: JSON.stringify({
-          errorType: 'writer_recovery_not_safe', partialApplied: false,
-          message: 'This interrupted save could not safely resume because its source, settings, permission, or memory changed. Ask again to retry.',
-        }) } }] });
+      await db.completeMemoryWrite({
+        ...memoryWriteIdentity,
+        receipts: [
+          {
+            type: Tools.memory,
+            messageId: row.messageId,
+            conversationId: row.conversationId,
+            [Tools.memory]: {
+              type: 'error',
+              key: 'system',
+              value: JSON.stringify({
+                errorType: 'writer_recovery_not_safe',
+                partialApplied: false,
+                message:
+                  'This interrupted save could not safely resume because its source, settings, permission, or memory changed. Ask again to retry.',
+              }),
+            },
+          },
+        ],
+      });
     }
   };
   try {
-    const recoverySource = { source: row.savedMemoryWrite.source, admittedAt: row.savedMemoryWrite.admittedAt,
-      responseMessageId: row.messageId };
-    if (!(await memoryWriterRecoverySourcesAreCurrent({ userId: row.user,
-      conversationId: row.conversationId, ...recoverySource, rejectNewerUserSource: true }))) return rejectRecovery();
+    const recoverySource = {
+      source: row.savedMemoryWrite.source,
+      admittedAt: row.savedMemoryWrite.admittedAt,
+      responseMessageId: row.messageId,
+    };
+    if (
+      !(await memoryWriterRecoverySourcesAreCurrent({
+        userId: row.user,
+        conversationId: row.conversationId,
+        ...recoverySource,
+        rejectNewerUserSource: true,
+      }))
+    )
+      return rejectRecovery();
     const user = await db.findUser({ _id: row.user });
     if (!user) return rejectRecovery();
     const appConfig = await require('~/server/services/Config').getAppConfig({ role: user.role });
-    const req = { user: { ...user, id: String(user._id) }, config: appConfig, headers: {},
-      body: { conversationId: row.conversationId, messageId: row.savedMemoryWrite.source.messageIds[0] } };
+    const req = {
+      user: { ...user, id: String(user._id) },
+      config: appConfig,
+      headers: {},
+      body: {
+        conversationId: row.conversationId,
+        messageId: row.savedMemoryWrite.source.messageIds[0],
+      },
+    };
     const res = new (require('http').ServerResponse)(req);
     // This host never runs Main. The configured memory route resolves its own real agent below.
-    const client = new AgentClient({ req, res, agent: { model_parameters: {} },
-      artifactPromises: [], contentParts: [], collectedUsage: [] });
+    const client = new AgentClient({
+      req,
+      res,
+      agent: { model_parameters: {} },
+      artifactPromises: [],
+      contentParts: [],
+      collectedUsage: [],
+    });
     client.responseMessageId = row.messageId;
     client.conversationId = row.conversationId;
     await client.useMemory();
     if (!client.memoryWriterState) return rejectRecovery();
-    const snapshot = await loadMemorySnapshot({ userId: row.user, readOnly: true,
+    const snapshot = await loadMemorySnapshot({
+      userId: row.user,
+      readOnly: true,
       memoryMethods: client.memoryWriterState.memoryMethods,
-      config: client.memoryWriterState.memoryPolicyConfig });
-    const validation = validatePendingMemoryRecovery({ source: row.savedMemoryWrite.source,
-      conversationId: row.conversationId, admittedAt: row.savedMemoryWrite.admittedAt,
-      configDigest: memoryWriterConfigDigest(appConfig), agentDigest: await memoryWriterAgentDigest(req),
+      config: client.memoryWriterState.memoryPolicyConfig,
+    });
+    const validation = validatePendingMemoryRecovery({
+      source: row.savedMemoryWrite.source,
+      conversationId: row.conversationId,
+      admittedAt: row.savedMemoryWrite.admittedAt,
+      configDigest: memoryWriterConfigDigest(appConfig),
+      agentDigest: await memoryWriterAgentDigest(req),
       latestMutationAt: snapshot.latestMutationAt,
-      newerUserSource: await db.hasNewerMemorySource({ userId: row.user, admittedAt: row.savedMemoryWrite.admittedAt }),
+      newerUserSource: await db.hasNewerMemorySource({
+        userId: row.user,
+        admittedAt: row.savedMemoryWrite.admittedAt,
+      }),
     });
     if (!validation.ok) return rejectRecovery();
     setTrustedInteractionContext(req, validation.context);
-    await client.executeAdmittedMemoryWriter([], { req, res, userId: row.user, appConfig,
-      responseMessageId: row.messageId, conversationId: row.conversationId, artifactPromises: [],
-      memoryWriteIdentity, snapshot, memoryWriterState: client.memoryWriterState,
-      sourceIntegrity: recoverySource, isRecovery: true,
+    await client.executeAdmittedMemoryWriter([], {
+      req,
+      res,
+      userId: row.user,
+      appConfig,
+      responseMessageId: row.messageId,
+      conversationId: row.conversationId,
+      artifactPromises: [],
+      memoryWriteIdentity,
+      snapshot,
+      memoryWriterState: client.memoryWriterState,
+      sourceIntegrity: recoverySource,
+      isRecovery: true,
       bufferMessage: new HumanMessage(row.savedMemoryWrite.source.input),
-      timeContext: row.savedMemoryWrite.source.timeContext });
+      timeContext: row.savedMemoryWrite.source.timeContext,
+    });
   } catch (error) {
-    logger.warn('[AgentClient] Pending saved-memory recovery could not continue', { name: error?.name });
+    logger.warn('[AgentClient] Pending saved-memory recovery could not continue', {
+      name: error?.name,
+    });
     await rejectRecovery();
   }
 }
@@ -2311,7 +2449,9 @@ function isHarnessInvocationLocked(req) {
  * Restore the registered-tool effect fence for ordinary graph routes. Unknown tools may mutate
  * external state; lock before dispatch, including uncertain outcomes with no visible response.
  */
-const { isFallbackReplaySafeToolMetadata } = require('~/server/services/viventium/toolEffectMetadata');
+const {
+  isFallbackReplaySafeToolMetadata,
+} = require('~/server/services/viventium/toolEffectMetadata');
 function shouldLockFallbackForToolStart(callbackArgs = []) {
   return !isFallbackReplaySafeToolMetadata(callbackArgs[5]);
 }
@@ -2855,7 +2995,8 @@ function buildViventiumMcpRequestBody({
     viventiumSourceEventId: interactionContext?.source_event_id,
     viventiumAuthoringSourceEventId: interactionContext?.source_event_id,
     viventiumTriggeringSourceSegments: sourceSegments,
-    viventiumTriggeringSourceSegmentsOverflowCount: interactionContext?.source_segments_overflow_count,
+    viventiumTriggeringSourceSegmentsOverflowCount:
+      interactionContext?.source_segments_overflow_count,
     viventiumLogicalTurnId: interactionContext?.logical_turn_id,
     viventiumLogicalTurnRevision: interactionContext?.logical_turn_id
       ? String(interactionContext.revision)
@@ -3110,9 +3251,14 @@ class AgentClient extends BaseClient {
       skipCondition: isPassiveVoiceTranscriptMessage,
     });
     // Keep persisted source identities before LangChain formatting assigns invocation-local IDs.
-    this.memoryWriterSourceMessageIds = orderedMessages.map((message) => message.messageId).filter(Boolean);
-    this.memoryWriterSourceMessageDigests = Object.fromEntries(orderedMessages
-      .filter((message) => message.messageId).map((message) => [message.messageId, memoryWriterSourceDigest(message)]));
+    this.memoryWriterSourceMessageIds = orderedMessages
+      .map((message) => message.messageId)
+      .filter(Boolean);
+    this.memoryWriterSourceMessageDigests = Object.fromEntries(
+      orderedMessages
+        .filter((message) => message.messageId)
+        .map((message) => [message.messageId, memoryWriterSourceDigest(message)]),
+    );
 
     let payload;
     /** @type {number | undefined} */
@@ -3317,7 +3463,10 @@ class AgentClient extends BaseClient {
       });
       /* === VIVENTIUM START === Preserve persisted identity through upstream message formatting. */
       formattedMessage.messageId = message.messageId;
-      formattedMessage.delivery = mainMessageDelivery(message, String(this.options.req?.user?.id || ''));
+      formattedMessage.delivery = mainMessageDelivery(
+        message,
+        String(this.options.req?.user?.id || ''),
+      );
       /* === VIVENTIUM END === */
 
       /** For non-latest messages, prepend file context directly to message content */
@@ -3529,9 +3678,10 @@ class AgentClient extends BaseClient {
           agentId,
           logger,
           mcpManager,
-          sharedRunContext: memoryUsesTurnContext && agentId === this.options.agent.id
-            ? sharedRunContextParts.join('\n\n')
-            : sharedRunContext,
+          sharedRunContext:
+            memoryUsesTurnContext && agentId === this.options.agent.id
+              ? sharedRunContextParts.join('\n\n')
+              : sharedRunContext,
           dynamicTailContext: buildViventiumDynamicTail({
             capsule: feelingTailForAgent({
               snapshot: feelingSnapshot,
@@ -3865,10 +4015,13 @@ class AgentClient extends BaseClient {
           model: outcome.model || null,
         };
         if (route.role === 'fallback') {
-          logger.info('[AgentClient] Saved memory writer is using the explicitly configured fallback route', {
-            provider: this.memoryWriterRoute.provider,
-            model: this.memoryWriterRoute.model,
-          });
+          logger.info(
+            '[AgentClient] Saved memory writer is using the explicitly configured fallback route',
+            {
+              provider: this.memoryWriterRoute.provider,
+              model: this.memoryWriterRoute.model,
+            },
+          );
         }
         return { ok: true, route: this.memoryWriterRoute };
       }
@@ -3886,11 +4039,15 @@ class AgentClient extends BaseClient {
    * Initialize the saved-memory writer on exactly one configured route.
    * @returns {Promise<{ok: boolean, provider?: string, model?: string, attachment?: object}>}
    */
-  async initializeMemoryWriterRoute(route, { req, res, activeAgent, state, allowedProviders, writerContext }) {
+  async initializeMemoryWriterRoute(
+    route,
+    { req, res, activeAgent, state, allowedProviders, writerContext },
+  ) {
     const { userId, memoryConfig, memoryMethods, memoryPolicyConfig } = state;
     /** @type {Agent} */
     let prelimAgent;
-    const configuredProvider = route.agentId != null ? memoryConfig?.agent?.provider : route.provider;
+    const configuredProvider =
+      route.agentId != null ? memoryConfig?.agent?.provider : route.provider;
     const configuredModel = route.agentId != null ? memoryConfig?.agent?.model : route.model;
     if (configuredProvider || configuredModel) {
       const gate = getMemoryWriterHealthGate({
@@ -3900,13 +4057,16 @@ class AgentClient extends BaseClient {
       });
       if (gate.blocked) {
         if (gate.shouldLog) {
-          logger.warn('[AgentClient] Saved memory writer route gated; trying the next configured route', {
-            route: route.role,
-            provider: configuredProvider || null,
-            model: configuredModel || null,
-            retryAt: new Date(gate.blockedUntil).toISOString(),
-            reason: gate.reason,
-          });
+          logger.warn(
+            '[AgentClient] Saved memory writer route gated; trying the next configured route',
+            {
+              route: route.role,
+              provider: configuredProvider || null,
+              model: configuredModel || null,
+              retryAt: new Date(gate.blockedUntil).toISOString(),
+              reason: gate.reason,
+            },
+          );
         }
         return {
           ok: false,
@@ -3922,7 +4082,10 @@ class AgentClient extends BaseClient {
     }
 
     try {
-      if (route.agentId != null && (writerContext.memoryWriteIdentity || route.agentId !== activeAgent?.id)) {
+      if (
+        route.agentId != null &&
+        (writerContext.memoryWriteIdentity || route.agentId !== activeAgent?.id)
+      ) {
         const loadedMemoryAgent = await loadAgent({
           req,
           agent_id: route.agentId,
@@ -3930,11 +4093,17 @@ class AgentClient extends BaseClient {
         });
         // Admitted work is bound to the configured source, including when Main shares its ID.
         // Main may already have different initialization overrides; never reuse that mutable object.
-        if (writerContext.memoryWriteIdentity && crypto.createHash('sha256')
-          .update(JSON.stringify(loadedMemoryAgent)).digest('hex') !== writerContext.sourceIntegrity?.source?.agentDigest) {
-          return { ok: false, attachment: this.createMemoryWriterUnavailableAttachment(
-            'Saved-memory agent configuration changed before execution. Ask again to retry.',
-          ) };
+        if (
+          writerContext.memoryWriteIdentity &&
+          crypto.createHash('sha256').update(JSON.stringify(loadedMemoryAgent)).digest('hex') !==
+            writerContext.sourceIntegrity?.source?.agentDigest
+        ) {
+          return {
+            ok: false,
+            attachment: this.createMemoryWriterUnavailableAttachment(
+              'Saved-memory agent configuration changed before execution. Ask again to retry.',
+            ),
+          };
         }
         prelimAgent = loadedMemoryAgent;
       } else if (route.agentId != null) {
@@ -3946,7 +4115,11 @@ class AgentClient extends BaseClient {
           ...configuredAgent,
           provider: route.provider,
           model: route.model,
-          model_parameters: memoryRouteModelParameters(configuredAgent.model_parameters, route, configuredAgent.provider),
+          model_parameters: memoryRouteModelParameters(
+            configuredAgent.model_parameters,
+            route,
+            configuredAgent.provider,
+          ),
         };
       }
     } catch (error) {
@@ -3966,11 +4139,18 @@ class AgentClient extends BaseClient {
     }
 
     /* === VIVENTIUM START === Resolve native memory transport from declared capabilities. === */
-    const writerCapability = req?.config?.endpoints?.agents?.providerCapabilities?.[prelimAgent.provider];
-    const nativeWriter = writerCapability?.worker_native_tools === true || writerCapability?.native_tools === true;
+    const writerCapability =
+      req?.config?.endpoints?.agents?.providerCapabilities?.[prelimAgent.provider];
+    const nativeWriter =
+      writerCapability?.worker_native_tools === true || writerCapability?.native_tools === true;
     if (nativeWriter && !writerContext.memoryWriteIdentity) {
-      return { ok: false, attachment: this.createMemoryWriterUnavailableAttachment(
-        'Saved memory requires an admitted owner-scoped writer run.', configuredProvider) };
+      return {
+        ok: false,
+        attachment: this.createMemoryWriterUnavailableAttachment(
+          'Saved memory requires an admitted owner-scoped writer run.',
+          configuredProvider,
+        ),
+      };
     }
     /* === VIVENTIUM END === */
     let agent;
@@ -4111,7 +4291,8 @@ class AgentClient extends BaseClient {
      *
      * Added: 2026-02-07
      * === VIVENTIUM NOTE END === */
-    const memoryTimeContextInstructions = writerContext.timeContext ?? buildTimeContextInstructions(req);
+    const memoryTimeContextInstructions =
+      writerContext.timeContext ?? buildTimeContextInstructions(req);
     if (memoryTimeContextInstructions) {
       config.instructions = [config.instructions || '', memoryTimeContextInstructions]
         .filter(Boolean)
@@ -4121,33 +4302,51 @@ class AgentClient extends BaseClient {
     const messageId = writerContext.responseMessageId || this.responseMessageId + '';
     const conversationId = writerContext.conversationId || this.conversationId + '';
     const streamId = req?._resumableStreamId || null;
-    const writerMemoryMethods = writerContext.memoryWriteIdentity ? {
-      ...memoryMethods,
-      ...Object.fromEntries(['setMemory', 'deleteMemory'].map((method) => [method, async (params) => {
-        await requireCurrentMemoryWriterAuthority(writerContext);
-        try {
-          const result = await memoryMethods[method]({ ...params, writerEffect: {
-            messageId: writerContext.memoryWriteIdentity.messageId,
-            owner: writerContext.memoryWriteIdentity.owner,
-            operationId: crypto.randomUUID(),
-          } });
-          if (result.ok) writerContext.memoryMutationApplied = true;
-          return result;
-        } catch (error) {
-          writerContext.memoryMutationUncertain = true;
-          throw error;
+    const writerMemoryMethods = writerContext.memoryWriteIdentity
+      ? {
+          ...memoryMethods,
+          ...Object.fromEntries(
+            ['setMemory', 'deleteMemory'].map((method) => [
+              method,
+              async (params) => {
+                await requireCurrentMemoryWriterAuthority(writerContext);
+                try {
+                  const result = await memoryMethods[method]({
+                    ...params,
+                    writerEffect: {
+                      messageId: writerContext.memoryWriteIdentity.messageId,
+                      owner: writerContext.memoryWriteIdentity.owner,
+                      operationId: crypto.randomUUID(),
+                    },
+                  });
+                  if (result.ok) writerContext.memoryMutationApplied = true;
+                  return result;
+                } catch (error) {
+                  writerContext.memoryMutationUncertain = true;
+                  throw error;
+                }
+              },
+            ]),
+          ),
         }
-      }])),
-    } : memoryMethods;
+      : memoryMethods;
     /* === VIVENTIUM START === Reuse the admitted writer and signed native capability broker. === */
     if (nativeWriter) {
       const { createNativeMemoryExecutor } = require('@librechat/api');
-      const { bindActiveMemoryWriterTool } = require('~/server/services/viventium/memoryWriterCoordinator');
-      const { buildConversationProviderBootstrapBundle } = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
-      const { attachConversationProviderBootstrapBundle } = require('~/server/services/viventium/GlassHiveConversationProviderService');
+      const {
+        bindActiveMemoryWriterTool,
+      } = require('~/server/services/viventium/memoryWriterCoordinator');
+      const {
+        buildConversationProviderBootstrapBundle,
+      } = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
+      const {
+        attachConversationProviderBootstrapBundle,
+      } = require('~/server/services/viventium/GlassHiveConversationProviderService');
       config.nativeExecutor = createNativeMemoryExecutor({
         identity: { ...writerContext.memoryWriteIdentity, conversationId },
-        agent, user: createSafeUser(req.user), requestBody: req.body || {},
+        agent,
+        user: createSafeUser(req.user),
+        requestBody: req.body || {},
         authorize: () => requireCurrentMemoryWriterAuthority(writerContext),
         register: bindActiveMemoryWriterTool,
         buildBundle: buildConversationProviderBootstrapBundle,
@@ -4161,7 +4360,11 @@ class AgentClient extends BaseClient {
       // Provider failover shares the original prompt/revision snapshot. Re-reading here could
       // rebase an older source onto a later panel correction and let its stale overwrite pass CAS.
       if (!writerContext.snapshot) {
-        writerContext.snapshot = await loadMemorySnapshot({ userId, config, memoryMethods: writerMemoryMethods });
+        writerContext.snapshot = await loadMemorySnapshot({
+          userId,
+          config,
+          memoryMethods: writerMemoryMethods,
+        });
       }
       [, processMemory] = await createMemoryProcessor({
         userId,
@@ -4316,7 +4519,8 @@ class AgentClient extends BaseClient {
     try {
       const appConfig = writerContext.appConfig || this.memoryWriterState?.appConfig || req?.config;
       const memoryConfig = appConfig?.memory;
-      const bufferMessage = writerContext.bufferMessage || this.prepareMemoryWriterBuffer(messages, memoryConfig);
+      const bufferMessage =
+        writerContext.bufferMessage || this.prepareMemoryWriterBuffer(messages, memoryConfig);
       if (!bufferMessage) return;
 
       const writerInitStart = startDeepTiming(req);
@@ -4359,7 +4563,8 @@ class AgentClient extends BaseClient {
         memoryFailure &&
         TERMINAL_MEMORY_ROUTE_FAILURES.has(memoryFailure) &&
         !memoryResultPartiallyApplied(result) &&
-        !writerContext.memoryMutationApplied && !writerContext.memoryMutationUncertain &&
+        !writerContext.memoryMutationApplied &&
+        !writerContext.memoryMutationUncertain &&
         this.memoryWriterRoute?.role === 'primary' &&
         memoryWriterRoutes(memoryConfig).some((route) => route.role === 'fallback')
       ) {
@@ -4372,12 +4577,22 @@ class AgentClient extends BaseClient {
         });
         this.processMemory = null;
         const replayInit = await this.initializeMemoryWriter(writerContext);
-        if (replayInit?.ok && this.memoryWriterRoute?.role === 'fallback' && this.processMemory != null) {
-          logger.warn('[AgentClient] Saved memory write replayed on the configured fallback route', {
-            failure: memoryFailure,
-            from: { provider: exhaustedRoute.provider, model: exhaustedRoute.model },
-            to: { provider: this.memoryWriterRoute.provider, model: this.memoryWriterRoute.model },
-          });
+        if (
+          replayInit?.ok &&
+          this.memoryWriterRoute?.role === 'fallback' &&
+          this.processMemory != null
+        ) {
+          logger.warn(
+            '[AgentClient] Saved memory write replayed on the configured fallback route',
+            {
+              failure: memoryFailure,
+              from: { provider: exhaustedRoute.provider, model: exhaustedRoute.model },
+              to: {
+                provider: this.memoryWriterRoute.provider,
+                model: this.memoryWriterRoute.model,
+              },
+            },
+          );
           result = await this.processMemory([bufferMessage]);
           memoryFailure = classifyMemoryWriterResult(result);
         } else if (replayInit?.attachment && Array.isArray(result)) {
@@ -4440,13 +4655,25 @@ class AgentClient extends BaseClient {
     return Promise.resolve()
       .then(() => requireCurrentMemoryWriterAuthority(writerContext))
       .then(async () => {
-        if (!writerContext.snapshot) writerContext.snapshot = await loadMemorySnapshot({ userId,
-          readOnly: true, memoryMethods: writerContext.memoryWriterState?.memoryMethods || this.memoryWriterState.memoryMethods,
-          config: writerContext.memoryWriterState?.memoryPolicyConfig || this.memoryWriterState.memoryPolicyConfig });
-        if (!(await db.validateMemoryWriteSnapshot({ ...writerContext.memoryWriteIdentity,
-          revisions: writerContext.snapshot.memoryRevisionMap,
-          effects: writerContext.snapshot.memoryWriterEffectMap,
-        }))) throw new Error('Saved memory changed outside earlier accepted saves after admission');
+        if (!writerContext.snapshot)
+          writerContext.snapshot = await loadMemorySnapshot({
+            userId,
+            readOnly: true,
+            memoryMethods:
+              writerContext.memoryWriterState?.memoryMethods ||
+              this.memoryWriterState.memoryMethods,
+            config:
+              writerContext.memoryWriterState?.memoryPolicyConfig ||
+              this.memoryWriterState.memoryPolicyConfig,
+          });
+        if (
+          !(await db.validateMemoryWriteSnapshot({
+            ...writerContext.memoryWriteIdentity,
+            revisions: writerContext.snapshot.memoryRevisionMap,
+            effects: writerContext.snapshot.memoryWriterEffectMap,
+          }))
+        )
+          throw new Error('Saved memory changed outside earlier accepted saves after admission');
       })
       .then(() => this.runMemory(messages, writerContext))
       .then(async (attachments) => {
@@ -4455,9 +4682,18 @@ class AgentClient extends BaseClient {
           attachments = attachments.map((attachment) => {
             if (attachment[Tools.memory]?.type !== 'error') return attachment;
             let details = {};
-            try { details = JSON.parse(attachment[Tools.memory].value || '{}'); } catch { /* Keep public fallback. */ }
-            return { ...attachment, [Tools.memory]: { ...attachment[Tools.memory],
-              value: JSON.stringify({ ...details, partialApplied: true }) } };
+            try {
+              details = JSON.parse(attachment[Tools.memory].value || '{}');
+            } catch {
+              /* Keep public fallback. */
+            }
+            return {
+              ...attachment,
+              [Tools.memory]: {
+                ...attachment[Tools.memory],
+                value: JSON.stringify({ ...details, partialApplied: true }),
+              },
+            };
           });
         }
         if (attachments.length > 0) {
@@ -4494,13 +4730,24 @@ class AgentClient extends BaseClient {
         if (isDeepTimingEnabled(req)) {
           logDeepTiming(req, 'memory_writer_background_done', scheduleStart, 'status=error');
         }
-        await persistMemoryReceipt(writerContext, [{ type: Tools.memory,
-          messageId: writerContext.responseMessageId, conversationId: writerContext.conversationId,
-          [Tools.memory]: { type: 'error', key: 'system', value: JSON.stringify({
-            errorType: 'writer_interrupted',
-            partialApplied: writerContext.memoryMutationApplied === true || writerContext.memoryMutationUncertain === true,
-            message: 'Saving memory could not finish. Check Memories before retrying.',
-          }) } }]);
+        await persistMemoryReceipt(writerContext, [
+          {
+            type: Tools.memory,
+            messageId: writerContext.responseMessageId,
+            conversationId: writerContext.conversationId,
+            [Tools.memory]: {
+              type: 'error',
+              key: 'system',
+              value: JSON.stringify({
+                errorType: 'writer_interrupted',
+                partialApplied:
+                  writerContext.memoryMutationApplied === true ||
+                  writerContext.memoryMutationUncertain === true,
+                message: 'Saving memory could not finish. Check Memories before retrying.',
+              }),
+            },
+          },
+        ]);
       })
       .finally(() => {
         if (userId != null) {
@@ -4520,7 +4767,8 @@ class AgentClient extends BaseClient {
     if (
       isVoiceActorSideEffectRestricted(req) ||
       req?.body?.viventiumDeferVoiceMemory === true ||
-      isCancelledVoiceTask(req) || shouldSkipAutomaticMemoryWriter(req)
+      isCancelledVoiceTask(req) ||
+      shouldSkipAutomaticMemoryWriter(req)
     ) {
       if (isDeepTimingEnabled(req)) {
         logDeepTiming(req, 'memory_writer_deferred_post_call', scheduleStart);
@@ -4553,84 +4801,143 @@ class AgentClient extends BaseClient {
       conversationId: this.conversationId + '',
       parentMessageId: this.parentMessageId + '',
       interactionContext: getTrustedInteractionContext(req),
-      memoryWriteIdentity: { userId: String(userId), messageId: this.responseMessageId + '', owner: memoryWriterOwner },
+      memoryWriteIdentity: {
+        userId: String(userId),
+        messageId: this.responseMessageId + '',
+        owner: memoryWriterOwner,
+      },
       memoryWriterState: this.memoryWriterState,
       bufferMessage: this.prepareMemoryWriterBuffer(messages, req?.config?.memory),
       timeContext: buildTimeContextInstructions(req),
-      sourceMessageIds: [...new Set([this.parentMessageId, ...(this.memoryWriterSourceMessageIds || [])]
-        .filter(Boolean))],
+      sourceMessageIds: [
+        ...new Set(
+          [this.parentMessageId, ...(this.memoryWriterSourceMessageIds || [])].filter(Boolean),
+        ),
+      ],
       sourceMessageDigests: { ...(this.memoryWriterSourceMessageDigests || {}) },
     };
-    const runDetachedWriter = () => this.executeAdmittedMemoryWriter(messages, writerContext, scheduleStart);
+    const runDetachedWriter = () =>
+      this.executeAdmittedMemoryWriter(messages, writerContext, scheduleStart);
     /* === VIVENTIUM START ===
      * Typed anchor for out-of-band surfaces: the final event says a saved-memory write was
      * scheduled for this turn, so a poller can wait for the durable receipt instead of guessing.
      * === VIVENTIUM END === */
     let finish;
-    const promise = new Promise((resolve) => { finish = resolve; }).finally(() => {
+    const promise = new Promise((resolve) => {
+      finish = resolve;
+    }).finally(() => {
       if (this.memoryWriterPromise === promise) {
         this.memoryWriterPromise = null;
       }
     });
     const reportAdmissionFailure = async (uncertain = false) => {
-      const receipt = { type: Tools.memory, messageId: writerContext.responseMessageId,
-        conversationId: writerContext.conversationId, [Tools.memory]: { type: 'error', key: 'system',
-          value: JSON.stringify({ errorType: uncertain ? 'writer_interrupted' : 'writer_unavailable',
+      const receipt = {
+        type: Tools.memory,
+        messageId: writerContext.responseMessageId,
+        conversationId: writerContext.conversationId,
+        [Tools.memory]: {
+          type: 'error',
+          key: 'system',
+          value: JSON.stringify({
+            errorType: uncertain ? 'writer_interrupted' : 'writer_unavailable',
             partialApplied: uncertain,
             message: uncertain
               ? 'Memory saving could not be confirmed. Check Memories before retrying.'
               : 'This memory save could not be accepted. Your reply is preserved. Try again.',
-          }) } };
+          }),
+        },
+      };
       req._viventiumMemoryAdmissionReceipt = receipt;
-      try { await db.updateMessage(req, { messageId: writerContext.responseMessageId,
-        $addToSet: { attachments: receipt } }, { operationKind: 'system' }); }
-      catch (error) { logger.warn('[AgentClient] Admission failure receipt could not persist', { name: error?.name }); }
+      try {
+        await db.updateMessage(
+          req,
+          { messageId: writerContext.responseMessageId, $addToSet: { attachments: receipt } },
+          { operationKind: 'system' },
+        );
+      } catch (error) {
+        logger.warn('[AgentClient] Admission failure receipt could not persist', {
+          name: error?.name,
+        });
+      }
     };
     this.pendingMemoryWriterAdmission = async () => {
       try {
         // This seam runs after the canonical response is saved and the controller checks its job.
         // Capture that response now; the earlier frozen input cannot contain its result.
-        const response = await db.getMessage({ user: userId, messageId: writerContext.responseMessageId });
-        if (!isCurrentMemoryWriterResponse({ response, userId,
-          conversationId: writerContext.conversationId, messageId: writerContext.responseMessageId,
-          parentMessageId: writerContext.parentMessageId, context: writerContext.interactionContext })) {
+        const response = await db.getMessage({
+          user: userId,
+          messageId: writerContext.responseMessageId,
+        });
+        if (
+          !isCurrentMemoryWriterResponse({
+            response,
+            userId,
+            conversationId: writerContext.conversationId,
+            messageId: writerContext.responseMessageId,
+            parentMessageId: writerContext.parentMessageId,
+            context: writerContext.interactionContext,
+          })
+        ) {
           await reportAdmissionFailure();
           finish();
           return false;
         }
         if (!hasRuntimeHoldAssistantText(response.content)) {
           const nativeEvidence = await require('~/server/services/viventium/nativeResponseService')
-            .getService().readToolEvidence(userId, response.conversationId, response.messageId);
-          const content = [...nativeEvidence,
-            ...(Array.isArray(response.content) ? response.content : [])
-              .filter((part) => part?.type === ContentTypes.TEXT || part?.type === ContentTypes.TOOL_CALL)];
-          const { messages: completedMessages } = formatAgentMessages([{
-            role: 'assistant', messageId: response.messageId,
-            content: content.length ? structuredClone(content) : response.text || '',
-          }]);
+            .getService()
+            .readToolEvidence(userId, response.conversationId, response.messageId);
+          const content = [
+            ...nativeEvidence,
+            ...(Array.isArray(response.content) ? response.content : []).filter(
+              (part) => part?.type === ContentTypes.TEXT || part?.type === ContentTypes.TOOL_CALL,
+            ),
+          ];
+          const { messages: completedMessages } = formatAgentMessages([
+            {
+              role: 'assistant',
+              messageId: response.messageId,
+              content: content.length ? structuredClone(content) : response.text || '',
+            },
+          ]);
           const completedBuffer = buildMemoryBufferString(completedMessages);
           if (completedBuffer) {
             writerContext.bufferMessage = new HumanMessage(
               [writerContext.bufferMessage?.content, completedBuffer].filter(Boolean).join('\n'),
             );
-            writerContext.sourceMessageIds = [...new Set([...writerContext.sourceMessageIds, response.messageId])];
-            writerContext.sourceMessageDigests[response.messageId] = memoryWriterSourceDigest(response);
+            writerContext.sourceMessageIds = [
+              ...new Set([...writerContext.sourceMessageIds, response.messageId]),
+            ];
+            writerContext.sourceMessageDigests[response.messageId] =
+              memoryWriterSourceDigest(response);
           }
         }
         const admittedAt = new Date();
-        const admissionSnapshot = await loadMemorySnapshot({ userId, readOnly: true,
-          memoryMethods: writerContext.memoryWriterState.memoryMethods, config: writerContext.memoryWriterState.memoryPolicyConfig });
-        writerContext.sourceIntegrity = { admittedAt, source: { messageIds: writerContext.sourceMessageIds,
-          messageDigests: writerContext.sourceMessageDigests,
-          interactionContextJson: JSON.stringify(writerContext.interactionContext || null),
-          configDigest: memoryWriterConfigDigest(writerContext.appConfig),
-          agentDigest: await memoryWriterAgentDigest(req),
-        } };
-        const admitted = await db.admitMemoryWrite({ ...writerContext.memoryWriteIdentity,
-          conversationId: writerContext.conversationId, admittedAt,
+        const admissionSnapshot = await loadMemorySnapshot({
+          userId,
+          readOnly: true,
+          memoryMethods: writerContext.memoryWriterState.memoryMethods,
+          config: writerContext.memoryWriterState.memoryPolicyConfig,
+        });
+        writerContext.sourceIntegrity = {
+          admittedAt,
+          source: {
+            messageIds: writerContext.sourceMessageIds,
+            messageDigests: writerContext.sourceMessageDigests,
+            interactionContextJson: JSON.stringify(writerContext.interactionContext || null),
+            configDigest: memoryWriterConfigDigest(writerContext.appConfig),
+            agentDigest: await memoryWriterAgentDigest(req),
+          },
+        };
+        const admitted = await db.admitMemoryWrite({
+          ...writerContext.memoryWriteIdentity,
+          conversationId: writerContext.conversationId,
+          admittedAt,
           source: {
             input: writerContext.bufferMessage?.content || '',
-            digest: crypto.createHash('sha256').update(writerContext.bufferMessage?.content || '').digest('hex'),
+            digest: crypto
+              .createHash('sha256')
+              .update(writerContext.bufferMessage?.content || '')
+              .digest('hex'),
             configDigest: writerContext.sourceIntegrity.source.configDigest,
             agentDigest: writerContext.sourceIntegrity.source.agentDigest,
             timeContext: writerContext.timeContext,
@@ -4649,10 +4956,21 @@ class AgentClient extends BaseClient {
         }
         req._viventiumMemoryWriterScheduled = true;
         const untrack = trackAdmittedMemoryWriter(writerContext.responseMessageId);
-        void enqueueUserMemoryWriter({ userId, identity: { ...writerContext.memoryWriteIdentity,
-          conversationId: writerContext.conversationId }, run: runDetachedWriter })
-          .catch((error) => logger.warn('[AgentClient] Admitted memory writer interrupted', { name: error?.name }))
-          .finally(() => { untrack(); finish(); });
+        void enqueueUserMemoryWriter({
+          userId,
+          identity: {
+            ...writerContext.memoryWriteIdentity,
+            conversationId: writerContext.conversationId,
+          },
+          run: runDetachedWriter,
+        })
+          .catch((error) =>
+            logger.warn('[AgentClient] Admitted memory writer interrupted', { name: error?.name }),
+          )
+          .finally(() => {
+            untrack();
+            finish();
+          });
         return true;
       } catch (error) {
         logger.warn('[AgentClient] Saved-memory admission failed', { name: error?.name });
@@ -5274,10 +5592,17 @@ class AgentClient extends BaseClient {
               },
             });
             if (result === 'suppressed' && mergedInsightsData?.insights?.length) {
-              await settleSuppressedCortexInsightDeliveries({ req, conversationId,
-                parentMessageId: responseMessageId, insightsData: mergedInsightsData,
-                dropReason: suppressionReason === 'voice_task_cancelled' ? 'voice_task_suppressed'
-                  : movedOnAfterParent ? 'conversation_moved_on' : 'semantic_suppression',
+              await settleSuppressedCortexInsightDeliveries({
+                req,
+                conversationId,
+                parentMessageId: responseMessageId,
+                insightsData: mergedInsightsData,
+                dropReason:
+                  suppressionReason === 'voice_task_cancelled'
+                    ? 'voice_task_suppressed'
+                    : movedOnAfterParent
+                      ? 'conversation_moved_on'
+                      : 'semantic_suppression',
               });
             }
             logFollowUpDecisionRecord(req, decisionRecord);
@@ -5484,22 +5809,31 @@ class AgentClient extends BaseClient {
             try {
               const verifyPresentation = async () => {
                 presentationFence = await fenceCortexInsightDeliveryPresentationByParent({
-                  ownerId: String(req?.user?.id || '').trim(), parentMessageId: responseMessageId,
-                  surface: 'web', persistedMessageId: followUpMessage.messageId,
+                  ownerId: String(req?.user?.id || '').trim(),
+                  parentMessageId: responseMessageId,
+                  surface: 'web',
+                  persistedMessageId: followUpMessage.messageId,
                   messageRevision: revision,
-                  expectedDeliveryIds: followUpMessage?.metadata?.viventium?.cortexInsightDeliveryIds || [],
+                  expectedDeliveryIds:
+                    followUpMessage?.metadata?.viventium?.cortexInsightDeliveryIds || [],
                   expectedGeneration: presentationGeneration,
                 });
                 return presentationFence;
               };
               presentationFence = await verifyPresentation();
               const transportReceipt = await GenerationJobManager.emitCortexPresentation(
-                req._resumableStreamId, followUpEvent, presentationFence, {
+                req._resumableStreamId,
+                followUpEvent,
+                presentationFence,
+                {
                   verifyPresentation,
-                  consumeCortexFault: (boundary) => consumeLocalQaCortexFault({
-                    boundary, ownerId: String(req?.user?.id || '').trim(),
-                    conversationId, parentMessageId: responseMessageId,
-                  }),
+                  consumeCortexFault: (boundary) =>
+                    consumeLocalQaCortexFault({
+                      boundary,
+                      ownerId: String(req?.user?.id || '').trim(),
+                      conversationId,
+                      parentMessageId: responseMessageId,
+                    }),
                 },
               );
               if (
@@ -5916,19 +6250,29 @@ class AgentClient extends BaseClient {
        */
       const timeContextInstructions = buildTimeContextInstructions(this.options.req);
       const activeWorkTurnContext = await getActiveWorkTurnContext(
-        this.options.req, this.options.agent, { voice: voiceMode },
+        this.options.req,
+        this.options.agent,
+        { voice: voiceMode },
       );
       const acceptedMainIdentity = this.options.req?._viventiumAcceptedMainCompactionIdentityV1;
       const acceptedMainContext = await loadAcceptedMainContext(acceptedMainIdentity || {});
       const acceptedMainContextInstructions = acceptedMainContext?.messageCapsule || '';
-      const savedMemoryTurnContext = this.options.req?.viventiumTimeContextDelivery === 'per_turn_header'
-        ? buildSavedMemoryTurnContext(this.memoryReadAvailability, this.glasshiveWorkerMemory)
-        : '';
+      const savedMemoryTurnContext =
+        this.options.req?.viventiumTimeContextDelivery === 'per_turn_header'
+          ? buildSavedMemoryTurnContext(this.memoryReadAvailability, this.glasshiveWorkerMemory)
+          : '';
       const recurrenceStateContext = buildRecurrenceStateCapsule(
-        this.options.req, this.options.req?.body?.recurrenceState,
+        this.options.req,
+        this.options.req?.body?.recurrenceState,
       );
-      const turnContextInstructions = [timeContextInstructions, acceptedMainContextInstructions,
-        savedMemoryTurnContext, recurrenceStateContext, activeWorkTurnContext, this.directParentTurnContext]
+      const turnContextInstructions = [
+        timeContextInstructions,
+        acceptedMainContextInstructions,
+        savedMemoryTurnContext,
+        recurrenceStateContext,
+        activeWorkTurnContext,
+        this.directParentTurnContext,
+      ]
         .filter(Boolean)
         .join('\n\n');
       if (turnContextInstructions) {
@@ -6012,12 +6356,15 @@ class AgentClient extends BaseClient {
         hardenedPayload,
         acceptedMainContext?.sourceTurns || [],
       );
-      const existingCounts = new Map(hardenedPayload.map((message, index) => [
-        message, this.indexTokenCountMap[index],
-      ]));
-      const projectedTokenCounts = Object.fromEntries(acceptedProjection.messages.map((message, index) => [
-        index, existingCounts.get(message) ?? this.getTokenCountForMessage(message),
-      ]));
+      const existingCounts = new Map(
+        hardenedPayload.map((message, index) => [message, this.indexTokenCountMap[index]]),
+      );
+      const projectedTokenCounts = Object.fromEntries(
+        acceptedProjection.messages.map((message, index) => [
+          index,
+          existingCounts.get(message) ?? this.getTokenCountForMessage(message),
+        ]),
+      );
       const formatStart = startDeepTiming(req);
       let { messages: initialMessages, indexTokenCountMap } = formatAgentMessages(
         acceptedProjection.messages,
@@ -6839,7 +7186,9 @@ class AgentClient extends BaseClient {
       const mainAgentMessages = initialMessages;
       // Main's retained evidence is not a new memory-writing presentation.
       const injectedContinuityIds = new Set(acceptedProjection.injectedMessageIds);
-      const memoryWriterMessages = initialMessages.filter((message) => !injectedContinuityIds.has(message.id));
+      const memoryWriterMessages = initialMessages.filter(
+        (message) => !injectedContinuityIds.has(message.id),
+      );
 
       /**
        * @param {BaseMessage[]} messages
@@ -7112,8 +7461,13 @@ class AgentClient extends BaseClient {
           agents,
           indexTokenCountMap,
           mainContinuityHeaders: acceptedCarrierHeaders,
-          nativeResponseFetch: (baseFetch, route) => require('~/server/services/viventium/nativeResponseService')
-            .wrapNativeResponseFetch(req, this.options.agent.id, baseFetch, route),
+          nativeResponseFetch: (baseFetch, route) =>
+            require('~/server/services/viventium/nativeResponseService').wrapNativeResponseFetch(
+              req,
+              this.options.agent.id,
+              baseFetch,
+              route,
+            ),
           runId: this.responseMessageId,
           signal: activeRunSignal,
           customHandlers: this.options.eventHandlers,

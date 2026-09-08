@@ -455,7 +455,9 @@ function compactDecisionRecordForMetadata(record) {
 
 function resolveFollowUpDecisionResult({ finalText = '', decision } = {}) {
   const explicitResult = typeof decision?.result === 'string' ? decision.result.trim() : '';
-  if (['pending', 'persisted', 'dropped', 'suppressed', 'empty', 'skipped'].includes(explicitResult)) {
+  if (
+    ['pending', 'persisted', 'dropped', 'suppressed', 'empty', 'skipped'].includes(explicitResult)
+  ) {
     return explicitResult;
   }
   if (typeof finalText === 'string' && finalText.trim().length > 0) {
@@ -1551,12 +1553,11 @@ function resolveFollowUpContinuationContext(messages, parentMessageId, options =
 
   return {
     hasMovedOn,
-    contextText:
-      contextText
-        ? contextText
-        : hasMovedOn
-          ? '(The conversation has newer visible turns after the earlier response, but no saved message text was available.)'
-          : '',
+    contextText: contextText
+      ? contextText
+      : hasMovedOn
+        ? '(The conversation has newer visible turns after the earlier response, but no saved message text was available.)'
+        : '',
     currentLeafMessageId,
     messageCount: visibleContinuation.length,
     lookupFailed: false,
@@ -2184,21 +2185,35 @@ function isDurableMissionInsight(insight) {
 }
 
 function boundMissionInput(insight) {
-  return isDurableMissionInsight(insight) && insight.runInput?.version === 1 &&
-    typeof insight.runInput.run_id === 'string' && insight.runInput.run_id.length > 0 &&
+  return isDurableMissionInsight(insight) &&
+    insight.runInput?.version === 1 &&
+    typeof insight.runInput.run_id === 'string' &&
+    insight.runInput.run_id.length > 0 &&
     insight.authority.runId === insight.runInput.run_id &&
-    typeof insight.runInput.instruction === 'string' ? insight.runInput : null;
+    typeof insight.runInput.instruction === 'string'
+    ? insight.runInput
+    : null;
 }
 
 function acceptedMissionRequest(insights) {
-  if (!Array.isArray(insights) || insights.length === 0 || !insights.every(isDurableMissionInsight)) {
+  if (
+    !Array.isArray(insights) ||
+    insights.length === 0 ||
+    !insights.every(isDurableMissionInsight)
+  ) {
     return null;
   }
   // Preserve each accepted objective and its identity, not the unrelated latest
   // chat question. JSON retains exact instruction whitespace and group order.
-  return JSON.stringify(insights.map((insight) => boundMissionInput(insight) ?? {
-    run_id: insight.authority.runId || null, instruction: null,
-  }));
+  return JSON.stringify(
+    insights.map(
+      (insight) =>
+        boundMissionInput(insight) ?? {
+          run_id: insight.authority.runId || null,
+          instruction: null,
+        },
+    ),
+  );
 }
 
 function formatFollowUpPrompt({
@@ -2319,9 +2334,11 @@ function formatFollowUpPrompt({
           .join('\n\n')
       : cleanUserRequest;
   const missionRequest = acceptedMissionRequest(insights);
-  const userRequestBlock = missionRequest ?? (currentUserRequest
-    ? currentUserRequest.slice(0, 4200)
-    : '(user request unavailable; answer only from the background evidence and state uncertainty)');
+  const userRequestBlock =
+    missionRequest ??
+    (currentUserRequest
+      ? currentUserRequest.slice(0, 4200)
+      : '(user request unavailable; answer only from the background evidence and state uncertainty)');
 
   if (primaryResponseMode) {
     const fallbackPrompt = [
@@ -2681,11 +2698,12 @@ async function promoteForcedFollowUpToEmptyParent({
     });
     const existingViventium = existing.metadata?.viventium || {};
     const { deliveryAcknowledgement: _staleAcknowledgement, ...priorMetadata } = existingViventium;
-    const nextRevision = Math.max(
-      1,
-      Number(existingViventium.messageRevision) || 1,
-      Number(existingViventium.deliveryAcknowledgement?.revision) || 1,
-    ) + 1;
+    const nextRevision =
+      Math.max(
+        1,
+        Number(existingViventium.messageRevision) || 1,
+        Number(existingViventium.deliveryAcknowledgement?.revision) || 1,
+      ) + 1;
     const nextMetadata = {
       ...(existing.metadata || {}),
       viventium: {
@@ -2696,13 +2714,18 @@ async function promoteForcedFollowUpToEmptyParent({
         replacedParentMessage: true,
         forceVisibleFollowUp: true,
         promotedToEmptyParent: true,
-        messageRevision: Math.max(nextRevision, claimedCortexPresentationGeneration(deliveryBatch) || 1),
-        ...(deliveryBatch?.claimed?.length ? {
-          cortexInsightDeliveryIds: claimedCortexInsightDeliveryIds(deliveryBatch),
-          cortexPresentationGeneration: claimedCortexPresentationGeneration(deliveryBatch),
-          cortexPresentationClaimToken: claimedCortexPresentationClaimToken(deliveryBatch),
-          cortexPresentationParentMessageId: parentMessageId,
-        } : {}),
+        messageRevision: Math.max(
+          nextRevision,
+          claimedCortexPresentationGeneration(deliveryBatch) || 1,
+        ),
+        ...(deliveryBatch?.claimed?.length
+          ? {
+              cortexInsightDeliveryIds: claimedCortexInsightDeliveryIds(deliveryBatch),
+              cortexPresentationGeneration: claimedCortexPresentationGeneration(deliveryBatch),
+              cortexPresentationClaimToken: claimedCortexPresentationClaimToken(deliveryBatch),
+              cortexPresentationParentMessageId: parentMessageId,
+            }
+          : {}),
         telegramDeliveryControls: telegramDeliveryControls || undefined,
         recoveredPrimaryErrorClasses:
           recoveredPrimaryErrorClasses.length > 0 ? recoveredPrimaryErrorClasses : undefined,
@@ -2974,25 +2997,33 @@ async function generateFollowUpText({
   let nativeToolEvidence = [];
   if (req?.user?.id && conversationId && parentMessageId) {
     try {
-      nativeToolEvidence = await require('./nativeResponseService').getService().readToolEvidence(
-        req.user.id, conversationId, parentMessageId,
-      );
+      nativeToolEvidence = await require('./nativeResponseService')
+        .getService()
+        .readToolEvidence(req.user.id, conversationId, parentMessageId);
     } catch (error) {
       // Accepted worker results carry their own fenced authority. A failed or
       // replaced foreground reply cannot block their delivery; its optional
       // graph evidence remains guarded and is never used in this case.
-      if (!insights.every(isDurableMissionInsight) ||
-          error?.code !== 'native_graph_tool_evidence_parent_unfinished') throw error;
+      if (
+        !insights.every(isDurableMissionInsight) ||
+        error?.code !== 'native_graph_tool_evidence_parent_unfinished'
+      )
+        throw error;
       logger.info(
         `[BackgroundCortexFollowUpService] Optional parent tool evidence omitted: code=${error.code} conversationId=${conversationId} parentMessageId=${parentMessageId}`,
       );
     }
   }
   const mediaContent = await buildGlassHiveNativeMediaContent(prompt, insights);
-  const modelContent = nativeToolEvidence.length === 0 ? mediaContent : [
-    ...(typeof mediaContent === 'string' ? [{ type: 'text', text: mediaContent }] : mediaContent),
-    ...nativeToolEvidence,
-  ];
+  const modelContent =
+    nativeToolEvidence.length === 0
+      ? mediaContent
+      : [
+          ...(typeof mediaContent === 'string'
+            ? [{ type: 'text', text: mediaContent }]
+            : mediaContent),
+          ...nativeToolEvidence,
+        ];
   const content = await processFollowUpWithDurableReattach({
     run,
     input: {
@@ -3019,7 +3050,9 @@ async function generateFollowUpText({
   if (rawText.length === 0) {
     return '';
   }
-  const sanitizedText = sanitizeFollowUpDisplayText(renderGlassHiveNativeMediaLinks(rawText, insights));
+  const sanitizedText = sanitizeFollowUpDisplayText(
+    renderGlassHiveNativeMediaLinks(rawText, insights),
+  );
   const normalizedText = normalizeNoResponseText(sanitizedText).trim();
 
   if (
@@ -3072,26 +3105,32 @@ async function prepareCortexFollowUpMessage({
     parentMessageId,
     recentResponse,
   });
-  const userRequest = acceptedMissionRequest(insightsData?.insights) ?? await resolveUserRequestTextForAssistantParent({
-    req,
-    parentMessageId,
-    messages: conversationMessages,
-  });
+  const userRequest =
+    acceptedMissionRequest(insightsData?.insights) ??
+    (await resolveUserRequestTextForAssistantParent({
+      req,
+      parentMessageId,
+      messages: conversationMessages,
+    }));
   const followUpRecentResponse = isNoResponseOnly(recentResponseResolution.text)
     ? ''
     : recentResponseResolution.text;
-  const durableMissionEvidence = hasInsights && insightsData.insights.every(
-    (insight) => insight?.authority?.kind === 'durable_terminal_callback',
-  );
+  const durableMissionEvidence =
+    hasInsights &&
+    insightsData.insights.every(
+      (insight) => insight?.authority?.kind === 'durable_terminal_callback',
+    );
   // Durable worker results are separate conversation events, even when their
   // original foreground reply failed. Never promote them into that old branch.
-  const shouldForceVisibleFollowUp = !durableMissionEvidence && shouldForceVisibleFollowUpForEmptyPrimary({
-    configuredForceVisibleFollowUp: forceVisibleFollowUp === true,
-    hasInsights,
-    recentResponse: followUpRecentResponse,
-    voiceMode,
-    surface,
-  });
+  const shouldForceVisibleFollowUp =
+    !durableMissionEvidence &&
+    shouldForceVisibleFollowUpForEmptyPrimary({
+      configuredForceVisibleFollowUp: forceVisibleFollowUp === true,
+      hasInsights,
+      recentResponse: followUpRecentResponse,
+      voiceMode,
+      surface,
+    });
   if (shouldForceVisibleFollowUp === true && forceVisibleFollowUp !== true) {
     logger.warn(
       `[BackgroundCortexFollowUpService] Forcing visible Phase B follow-up because the primary response was empty: conversationId=${conversationId || ''} parent=${parentMessageId || ''}`,
@@ -3209,13 +3248,25 @@ async function prepareCortexFollowUpMessage({
 }
 
 async function persistPreparedCortexFollowUpMessage(
-  { req, conversationId, parentMessageId, agent, insightsData, deliveryBatch = null, dependencies = {} },
+  {
+    req,
+    conversationId,
+    parentMessageId,
+    agent,
+    insightsData,
+    deliveryBatch = null,
+    dependencies = {},
+  },
   prepared,
 ) {
   if (!prepared || prepared.suppressed === true) {
     if (deliveryBatch?.claimed?.length) {
-      await dropCortexInsightDeliveryBatch({ req, parentMessageId, deliveryBatch,
-        dropReason: 'voice_task_suppressed' });
+      await dropCortexInsightDeliveryBatch({
+        req,
+        parentMessageId,
+        deliveryBatch,
+        dropReason: 'voice_task_suppressed',
+      });
     }
     return null;
   }
@@ -3238,9 +3289,13 @@ async function persistPreparedCortexFollowUpMessage(
 
   if (!text || text.trim().length === 0) {
     if (deliveryBatch?.claimed?.length) {
-      await dropCortexInsightDeliveryBatch({ req, parentMessageId, deliveryBatch,
+      await dropCortexInsightDeliveryBatch({
+        req,
+        parentMessageId,
+        deliveryBatch,
         decisionRecord: followUpDecisionRecord,
-        dropReason: resolveCortexInsightDropReason({ decision: prepared.decision }) });
+        dropReason: resolveCortexInsightDropReason({ decision: prepared.decision }),
+      });
     }
     return null;
   }
@@ -3266,10 +3321,14 @@ async function persistPreparedCortexFollowUpMessage(
   });
   if (promotedParentMessage) {
     if (deliveryBatch?.claimed?.length) {
-      await settlePersistedCortexInsightDeliveryBatch({ req, parentMessageId, deliveryBatch,
+      await settlePersistedCortexInsightDeliveryBatch({
+        req,
+        parentMessageId,
+        deliveryBatch,
         persistedMessageId: promotedParentMessage.messageId,
         decisionRecord: followUpDecisionRecord,
-        messageRevision: promotedParentMessage?.metadata?.viventium?.messageRevision || 1 });
+        messageRevision: promotedParentMessage?.metadata?.viventium?.messageRevision || 1,
+      });
     }
     return promotedParentMessage;
   }
@@ -3343,7 +3402,6 @@ async function persistPreparedCortexFollowUpMessage(
           getTrustedInteractionContext(req)?.revision || req?.body?.viventiumLogicalTurnRevision,
         ) || 1,
       ),
-
     },
   };
   if (telegramDeliveryControls) {
@@ -3364,13 +3422,20 @@ async function persistPreparedCortexFollowUpMessage(
   };
 
   if (deliveryBatch?.claimed?.length) {
-    const persisted = await persistCortexFollowUpMessageWithLedger({ req, parentMessageId,
-      followUpMessage, decisionRecord: followUpDecisionRecord, deliveryBatch, dependencies });
+    const persisted = await persistCortexFollowUpMessageWithLedger({
+      req,
+      parentMessageId,
+      followUpMessage,
+      decisionRecord: followUpDecisionRecord,
+      deliveryBatch,
+      dependencies,
+    });
     if (persisted.dropped) return null;
-  } else await db.saveMessage(req, followUpMessage, {
-    operationKind: 'system',
-    context: 'viventium/services/BackgroundCortexFollowUpService.createCortexFollowUpMessage',
-  });
+  } else
+    await db.saveMessage(req, followUpMessage, {
+      operationKind: 'system',
+      context: 'viventium/services/BackgroundCortexFollowUpService.createCortexFollowUpMessage',
+    });
 
   if (voiceTaskId && (await isFollowUpVoiceTaskSuppressed(req, voiceTaskId))) {
     const removed = await Message.findOneAndDelete({
@@ -3384,8 +3449,13 @@ async function persistPreparedCortexFollowUpMessage(
       );
     }
     if (deliveryBatch?.claimed?.length) {
-      await dropCortexInsightDeliveryBatch({ req, parentMessageId, deliveryBatch,
-        decisionRecord: followUpDecisionRecord, dropReason: 'voice_task_suppressed' });
+      await dropCortexInsightDeliveryBatch({
+        req,
+        parentMessageId,
+        deliveryBatch,
+        decisionRecord: followUpDecisionRecord,
+        dropReason: 'voice_task_suppressed',
+      });
     }
     return null;
   }
@@ -3394,34 +3464,56 @@ async function persistPreparedCortexFollowUpMessage(
 }
 
 async function createCortexFollowUpMessage(input) {
-  const { req, conversationId, parentMessageId, insightsData, claimedDeliveryBatch,
-    deliveryParentMessageId = '', dependencies = {} } = input;
+  const {
+    req,
+    conversationId,
+    parentMessageId,
+    insightsData,
+    claimedDeliveryBatch,
+    deliveryParentMessageId = '',
+    dependencies = {},
+  } = input;
   const insights = Array.isArray(insightsData?.insights) ? insightsData.insights : [];
   let deliveryBatch = claimedDeliveryBatch || null;
   if (insights.length && !deliveryBatch) {
     const feelingSnapshot = normalizeCortexFeelingSnapshot(req?._viventiumFeelingSnapshot);
     deliveryBatch = await (dependencies.claimBatch || claimCortexInsightDeliveryBatch)({
-      ownerId: req?.user?.id, conversationId,
+      ownerId: req?.user?.id,
+      conversationId,
       parentMessageId: deliveryParentMessageId || parentMessageId,
       surface: resolveViventiumSurface(req) || (isVoiceMode(req) ? 'voice' : 'web'),
       streamId: req?.body?.streamId || req?._resumableStreamId || '',
-      messageRevision: Math.max(1, Number(getTrustedInteractionContext(req)?.revision ||
-        req?.body?.viventiumLogicalTurnRevision) || 1),
-      ...(feelingSnapshot ? { feelingSnapshot } : {}), insights,
+      messageRevision: Math.max(
+        1,
+        Number(
+          getTrustedInteractionContext(req)?.revision || req?.body?.viventiumLogicalTurnRevision,
+        ) || 1,
+      ),
+      ...(feelingSnapshot ? { feelingSnapshot } : {}),
+      insights,
     });
   }
   if (insights.length && !deliveryBatch?.claimed?.length) return null;
-  const claimedInput = { ...input, deliveryBatch,
-    insightsData: deliveryBatch ? { ...insightsData,
-      insights: selectClaimedCortexInsights({ insights, claimedDeliveries: deliveryBatch.claimed })
-    } : insightsData,
+  const claimedInput = {
+    ...input,
+    deliveryBatch,
+    insightsData: deliveryBatch
+      ? {
+          ...insightsData,
+          insights: selectClaimedCortexInsights({
+            insights,
+            claimedDeliveries: deliveryBatch.claimed,
+          }),
+        }
+      : insightsData,
   };
   const prepared = await prepareCortexFollowUpMessage(claimedInput);
   return persistPreparedCortexFollowUpMessage(claimedInput, prepared);
 }
 
 module.exports = {
-  persistCortexFollowUpMessageWithLedger, resolveCortexInsightDropReason,
+  persistCortexFollowUpMessageWithLedger,
+  resolveCortexInsightDropReason,
   settleSuppressedCortexInsightDeliveries,
   cleanFallbackInsightText,
   getVisibleFallbackInsightTexts,

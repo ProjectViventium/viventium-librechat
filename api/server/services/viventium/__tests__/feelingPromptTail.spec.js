@@ -13,7 +13,9 @@ const {
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { buildPromptBundleFixture } = require('../../../../../scripts/test-support/promptBundle.cjs');
+const {
+  buildPromptBundleFixture,
+} = require('../../../../../scripts/test-support/promptBundle.cjs');
 
 describe('Feeling prompt tail', () => {
   const root = path.resolve(__dirname, '../../../../..');
@@ -30,10 +32,7 @@ describe('Feeling prompt tail', () => {
     source = path.join(directory, 'guard.md');
     bundle = path.join(directory, 'bundle.json');
     fs.copyFileSync(
-      path.join(
-        root,
-        'viventium/source_of_truth/prompts/main/user_fact_guard.md',
-      ),
+      path.join(root, 'viventium/source_of_truth/prompts/main/user_fact_guard.md'),
       source,
     );
     compile();

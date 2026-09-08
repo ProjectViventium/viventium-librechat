@@ -238,8 +238,7 @@ export function isTrustedSystemMessageGroup(message: Partial<TMessage>): boolean
 function isAutonomousMessage(message: Partial<TMessage>): boolean {
   if (isTrustedSystemMessageGroup(message)) return true;
   const metadata = message.metadata as
-    | { viventium?: { type?: string; replacedParentMessage?: boolean } }
-    | undefined;
+    { viventium?: { type?: string; replacedParentMessage?: boolean } } | undefined;
   return (
     message.isCreatedByUser === false &&
     (metadata?.viventium?.type === 'glasshive_worker_callback' ||
@@ -282,10 +281,7 @@ export function selectVisibleMessageBranches(
   const selected = messages.find((message) => message.messageId === selectedMessageId);
   for (const message of messages) {
     if (message.messageId === selectedMessageId) visible.push(message);
-    else if (
-      isAutonomousMessage(message) &&
-      message.conversationId === selected?.conversationId
-    )
+    else if (isAutonomousMessage(message) && message.conversationId === selected?.conversationId)
       visible.push(autonomousResponsePrefix(message));
   }
   return visible;

@@ -92,9 +92,17 @@ describe('preserveTransientCortexState', () => {
     expect(responseMessage).not.toHaveProperty('memoryWriteStatus');
   });
 
-  it.each(['completed', 'failed'] as const)('retains the server memory state %s', (memoryWriteStatus) => {
-    const responseMessage = { messageId: 'answer', text: 'Your reply', memoryWriteStatus } as TMessage;
-    expect(preserveTransientCortexState({ responseMessage, memoryWriterScheduled: true })).toBe(responseMessage);
-  });
-
+  it.each(['completed', 'failed'] as const)(
+    'retains the server memory state %s',
+    (memoryWriteStatus) => {
+      const responseMessage = {
+        messageId: 'answer',
+        text: 'Your reply',
+        memoryWriteStatus,
+      } as TMessage;
+      expect(preserveTransientCortexState({ responseMessage, memoryWriterScheduled: true })).toBe(
+        responseMessage,
+      );
+    },
+  );
 });

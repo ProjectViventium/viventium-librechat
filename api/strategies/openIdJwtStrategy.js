@@ -4,7 +4,13 @@ const { logger } = require('@librechat/data-schemas');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { get } = require('lodash');
 const { SystemRoles } = require('librechat-data-provider');
-const { getSessionCookieName, isEnabled, findOpenIDUser, isEmailDomainAllowed, math } = require('@librechat/api');
+const {
+  getSessionCookieName,
+  isEnabled,
+  findOpenIDUser,
+  isEmailDomainAllowed,
+  math,
+} = require('@librechat/api');
 const { Strategy: JwtStrategy, ExtractJwt } = require('passport-jwt');
 const { getOpenIdEmail } = require('./openidStrategy');
 const { updateUser, findUser } = require('~/models');

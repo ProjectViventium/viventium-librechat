@@ -699,24 +699,42 @@ describe('processAgentFileUpload', () => {
         mergeFileConfig.mockReturnValue(makeFileConfig({ sttSupportedMimeTypes: [mimetype] }));
         getStrategyFunctions.mockReturnValueOnce({
           handleFileUpload: jest.fn().mockResolvedValue({
-            bytes: 2048, filename: 'recording.bin', filepath: '/uploads/recording.bin',
+            bytes: 2048,
+            filename: 'recording.bin',
+            filepath: '/uploads/recording.bin',
           }),
         });
         const req = makeReq({ mimetype });
         req.file.originalname = 'recording.bin';
         req.body.endpoint = req.body.endpointType = 'agents';
-        req.config.endpoints = { agents: { providerCapabilities: {
-          'synthetic-workspace': { workspace_binding: true, worker_native_tools: true },
-        } } };
+        req.config.endpoints = {
+          agents: {
+            providerCapabilities: {
+              'synthetic-workspace': { workspace_binding: true, worker_native_tools: true },
+            },
+          },
+        };
         getAgent.mockResolvedValueOnce({ provider: 'synthetic-workspace', model_parameters: {} });
-        await processAgentFileUpload({ req, res: mockRes, metadata: makeMetadata({
-          agent_id: 'agent-abc', tool_resource: undefined, message_file: true,
-        }) });
+        await processAgentFileUpload({
+          req,
+          res: mockRes,
+          metadata: makeMetadata({
+            agent_id: 'agent-abc',
+            tool_resource: undefined,
+            message_file: true,
+          }),
+        });
         expect(processAudioFile).not.toHaveBeenCalled();
-        expect(createFile).toHaveBeenCalledWith(expect.objectContaining({
-          source: 'local', type: mimetype, filename: 'recording.bin',
-          context: 'message_attachment', file_id: 'file-uuid-123',
-        }), true);
+        expect(createFile).toHaveBeenCalledWith(
+          expect.objectContaining({
+            source: 'local',
+            type: mimetype,
+            filename: 'recording.bin',
+            context: 'message_attachment',
+            file_id: 'file-uuid-123',
+          }),
+          true,
+        );
       },
     );
 
@@ -728,14 +746,27 @@ describe('processAgentFileUpload', () => {
         mergeFileConfig.mockReturnValue(makeFileConfig({ sttSupportedMimeTypes: ['audio/ogg'] }));
         const req = makeReq({ mimetype: 'audio/ogg' });
         req.body.endpoint = req.body.endpointType = 'agents';
-        req.config.endpoints = { agents: { providerCapabilities: {
-          'synthetic-workspace': { workspace_binding: true, worker_native_tools: true,
-            [missingCapability]: false },
-        } } };
+        req.config.endpoints = {
+          agents: {
+            providerCapabilities: {
+              'synthetic-workspace': {
+                workspace_binding: true,
+                worker_native_tools: true,
+                [missingCapability]: false,
+              },
+            },
+          },
+        };
         getAgent.mockResolvedValueOnce({ provider: 'synthetic-workspace', model_parameters: {} });
-        await processAgentFileUpload({ req, res: mockRes, metadata: makeMetadata({
-          agent_id: 'agent-abc', tool_resource: undefined, message_file: true,
-        }) });
+        await processAgentFileUpload({
+          req,
+          res: mockRes,
+          metadata: makeMetadata({
+            agent_id: 'agent-abc',
+            tool_resource: undefined,
+            message_file: true,
+          }),
+        });
         expect(processAudioFile).toHaveBeenCalledTimes(1);
       },
     );
@@ -930,29 +961,40 @@ describe('processAgentFileUpload', () => {
   });
 });
 
-
 describe('canonical file admission', () => {
   const fs = require('fs');
   const path = require('path');
   const yaml = require('js-yaml');
   const { filterFile } = require('./process');
   const actual = jest.requireActual('librechat-data-provider');
-  const source = yaml.load(fs.readFileSync(
-    path.resolve(__dirname, '../../../../viventium/source_of_truth/local.librechat.yaml'), 'utf8'));
+  const source = yaml.load(
+    fs.readFileSync(
+      path.resolve(__dirname, '../../../../viventium/source_of_truth/local.librechat.yaml'),
+      'utf8',
+    ),
+  );
   beforeEach(() => mergeFileConfig.mockImplementation(actual.mergeFileConfig));
   const request = (mimetype) => ({
     config: { fileConfig: source.fileConfig },
-    body: { endpoint: 'agents', endpointType: 'agents', file_id: '11111111-1111-4111-8111-111111111111' },
+    body: {
+      endpoint: 'agents',
+      endpointType: 'agents',
+      file_id: '11111111-1111-4111-8111-111111111111',
+    },
     file: { size: 66_168, mimetype },
   });
   test.each(['audio/x-m4a', 'audio/mp4', 'audio/ogg', 'video/mp4', 'application/pdf'])(
-    'allows supported media and existing documents through the shared upload owner (%s)', (mime) => {
+    'allows supported media and existing documents through the shared upload owner (%s)',
+    (mime) => {
       expect(() => filterFile({ req: request(mime) })).not.toThrow();
     },
   );
   test('keeps unsupported admission typed and permanent', () => {
     expect.assertions(1);
-    try { filterFile({ req: request('application/x-unrecognized') }); }
-    catch (error) { expect(error).toMatchObject({ code: 'unsupported_file_type', status: 415, retryable: false }); }
+    try {
+      filterFile({ req: request('application/x-unrecognized') });
+    } catch (error) {
+      expect(error).toMatchObject({ code: 'unsupported_file_type', status: 415, retryable: false });
+    }
   });
 });

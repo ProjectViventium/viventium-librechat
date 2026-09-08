@@ -11,7 +11,9 @@ const {
   reconcileUnresolvedGlassHiveCallbackDeliveries,
 } = require('./GlassHiveCallbackDeliveryService');
 const { ensureGlassHiveExternalWorkIndexes } = require('./GlassHiveActiveWorkProjectionService');
-const { reconcilePendingGlassHiveMissionAdjudications } = require('./GlassHiveMissionAdjudicationService');
+const {
+  reconcilePendingGlassHiveMissionAdjudications,
+} = require('./GlassHiveMissionAdjudicationService');
 
 module.exports = createGlassHiveLaunchReconciliationService({
   logger,

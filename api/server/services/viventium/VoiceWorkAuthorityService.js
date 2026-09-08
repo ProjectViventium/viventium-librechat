@@ -4,7 +4,10 @@ const { getCallSession, verifyVoiceEngagementAttestation } = require('./CallSess
 const { listSpeakerSegments, voiceTurnAuthority } = require('./SpeakerSegmentService');
 
 const { assertVoiceWorkAuthority } = createVoiceEngagementAuthorityService({
-  getCallSession, listSpeakerSegments, voiceTurnAuthority, verifyVoiceEngagementAttestation,
+  getCallSession,
+  listSpeakerSegments,
+  voiceTurnAuthority,
+  verifyVoiceEngagementAttestation,
 });
 
 module.exports = { assertVoiceWorkAuthority };

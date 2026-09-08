@@ -1300,9 +1300,11 @@ describe('BaseClient', () => {
       TestClient.saveMessageToDatabase = jest.fn().mockResolvedValue({ message: {} });
 
       let capturedFiles;
-      await TestClient.sendMessage('Hello', {onStart: async (message) => {
-        capturedFiles = structuredClone(message.files);
-      }});
+      await TestClient.sendMessage('Hello', {
+        onStart: async (message) => {
+          capturedFiles = structuredClone(message.files);
+        },
+      });
 
       const userSave = TestClient.saveMessageToDatabase.mock.calls.find(
         ([msg]) => msg.isCreatedByUser,

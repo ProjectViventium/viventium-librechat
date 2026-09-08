@@ -15,7 +15,9 @@ jest.mock('@librechat/api', () => ({
   },
 }));
 
-jest.mock('../nativeResponseService', () => ({ recoverNativeResponses: jest.fn(async () => ({})) }));
+jest.mock('../nativeResponseService', () => ({
+  recoverNativeResponses: jest.fn(async () => ({})),
+}));
 
 jest.mock('~/db/models', () => ({
   ViventiumCortexInsightDelivery: {},
@@ -1132,8 +1134,11 @@ describe('staleCortexMessageRecovery', () => {
 
     expect(result).toEqual(expect.objectContaining({ scanned: 1, repaired: 1, timeoutMs: 1000 }));
     expect(Message.updateOne).toHaveBeenCalledWith(
-      { _id: 'mongo-id-1', updatedAt: new Date('2026-05-06T11:59:01.000Z'),
-        'nativeResponse.status': { $nin: ['pending', 'prepared'] } },
+      {
+        _id: 'mongo-id-1',
+        updatedAt: new Date('2026-05-06T11:59:01.000Z'),
+        'nativeResponse.status': { $nin: ['pending', 'prepared'] },
+      },
       {
         $set: expect.objectContaining({
           unfinished: false,
@@ -2234,7 +2239,9 @@ describe('staleCortexMessageRecovery', () => {
   test('admits traffic only through the awaited stream-readiness gate before Cortex recovery', () => {
     const source = fs.readFileSync(path.resolve(__dirname, '../../../index.js'), 'utf8');
     expect(source).toContain('await initializeStreamServicesBeforeTraffic({ admitTraffic })');
-    expect(source).toContain('const admitTraffic = () => app.listen(...apiListenTarget.args, onServerListening)');
+    expect(source).toContain(
+      'const admitTraffic = () => app.listen(...apiListenTarget.args, onServerListening)',
+    );
     const callbackAt = source.indexOf('const onServerListening = async (err) =>');
     const recoveryAt = source.indexOf('await recoverStaleCortexMessages();', callbackAt);
     const periodicAt = source.indexOf('getStaleCortexRecoveryIntervalMs()', recoveryAt);
@@ -2570,8 +2577,11 @@ describe('staleCortexMessageRecovery', () => {
 
     expect(result).toEqual(expect.objectContaining({ scanned: 1, repaired: 1, timeoutMs: 1000 }));
     expect(Message.updateOne).toHaveBeenCalledWith(
-      { _id: 'mongo-id-blank', updatedAt: new Date('2026-05-06T11:59:01.000Z'),
-        'nativeResponse.status': { $nin: ['pending', 'prepared'] } },
+      {
+        _id: 'mongo-id-blank',
+        updatedAt: new Date('2026-05-06T11:59:01.000Z'),
+        'nativeResponse.status': { $nin: ['pending', 'prepared'] },
+      },
       {
         $set: expect.objectContaining({
           unfinished: false,

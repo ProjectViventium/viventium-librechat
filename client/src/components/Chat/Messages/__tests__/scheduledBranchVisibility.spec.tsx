@@ -153,57 +153,82 @@ const callback = (children: TMessage[]): TMessage => ({
 test.each([
   ['chat', MultiMessage],
   ['share', ShareMultiMessage],
-] as const)('%s shows the retained callback subtree once beside the current human branch', (_name, Component) => {
-  render(
-    <RecoilRoot>
-      <Component messageId="anchor" currentEditId={null} messagesTree={[
-        callback([lateResult()]), row('Current question', true, [row('Current answer')]),
-      ]} />
-    </RecoilRoot>,
-  );
-  expect(screen.getAllByText('Useful worker result')).toHaveLength(1);
-  expect(screen.getByText('Current answer')).toBeVisible();
-  expect(screen.queryByRole('navigation', { name: 'Sibling message navigation' })).toBeNull();
-});
+] as const)(
+  '%s shows the retained callback subtree once beside the current human branch',
+  (_name, Component) => {
+    render(
+      <RecoilRoot>
+        <Component
+          messageId="anchor"
+          currentEditId={null}
+          messagesTree={[
+            callback([lateResult()]),
+            row('Current question', true, [row('Current answer')]),
+          ]}
+        />
+      </RecoilRoot>,
+    );
+    expect(screen.getAllByText('Useful worker result')).toHaveLength(1);
+    expect(screen.getByText('Current answer')).toBeVisible();
+    expect(screen.queryByRole('navigation', { name: 'Sibling message navigation' })).toBeNull();
+  },
+);
 
 test('a late result update does not move the composer from the ongoing Main answer', () => {
   const display = (text: string) => (
     <RecoilRoot>
-      <MultiMessage messageId="anchor" currentEditId={null} messagesTree={[
-        row('Question', true, [row('Current answer')]),
-        callback([{ ...lateResult(), text }]),
-      ]} />
+      <MultiMessage
+        messageId="anchor"
+        currentEditId={null}
+        messagesTree={[
+          row('Question', true, [row('Current answer')]),
+          callback([{ ...lateResult(), text }]),
+        ]}
+      />
     </RecoilRoot>
   );
   const { rerender } = render(display('Useful worker result'));
-  expect(mockSetLatest.mock.calls.map(([message]) => message.messageId)).toEqual(['Current answer']);
+  expect(mockSetLatest.mock.calls.map(([message]) => message.messageId)).toEqual([
+    'Current answer',
+  ]);
   mockSetLatest.mockClear();
   rerender(display('Updated worker result'));
   expect(screen.getByText('Updated worker result')).toBeVisible();
-  expect(mockSetLatest.mock.calls.every(([message]) => message.messageId === 'Current answer')).toBe(true);
+  expect(
+    mockSetLatest.mock.calls.every(([message]) => message.messageId === 'Current answer'),
+  ).toBe(true);
   expect(screen.getByText('Current answer')).toBeVisible();
 });
 
 test.each([
   ['chat', MultiMessage],
   ['share', ShareMultiMessage],
-] as const)('%s keeps only one branch control when a late result has an older human continuation', (_name, Component) => {
-  render(
-    <RecoilRoot>
-      <Component messageId="anchor" currentEditId={null} messagesTree={[
-        callback([lateResult([row('Earlier question', true)])]),
-        row('Current question', true),
-      ]} />
-    </RecoilRoot>,
-  );
-  expect(screen.getAllByText('Useful worker result')).toHaveLength(1);
-  expect(screen.queryByText('Earlier question')).toBeNull();
-  expect(screen.getAllByRole('navigation', { name: 'Sibling message navigation' })).toHaveLength(1);
-  fireEvent.click(screen.getByRole('button', { name: 'Previous sibling message' }));
-  expect(screen.getByText('Earlier question')).toBeVisible();
-  expect(screen.queryByText('Current question')).toBeNull();
-  fireEvent.click(screen.getByRole('button', { name: 'Next sibling message' }));
-  expect(screen.getByText('Current question')).toBeVisible();
-  expect(screen.getAllByText('Useful worker result')).toHaveLength(1);
-});
+] as const)(
+  '%s keeps only one branch control when a late result has an older human continuation',
+  (_name, Component) => {
+    render(
+      <RecoilRoot>
+        <Component
+          messageId="anchor"
+          currentEditId={null}
+          messagesTree={[
+            callback([lateResult([row('Earlier question', true)])]),
+            row('Current question', true),
+          ]}
+        />
+      </RecoilRoot>,
+    );
+    expect(screen.getAllByText('Useful worker result')).toHaveLength(1);
+    expect(screen.queryByText('Earlier question')).toBeNull();
+    expect(screen.getAllByRole('navigation', { name: 'Sibling message navigation' })).toHaveLength(
+      1,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Previous sibling message' }));
+    expect(screen.getByText('Earlier question')).toBeVisible();
+    expect(screen.queryByText('Current question')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Next sibling message' }));
+    expect(screen.getByText('Current question')).toBeVisible();
+    expect(screen.getAllByText('Useful worker result')).toHaveLength(1);
+  },
+);
 /* === VIVENTIUM END === */

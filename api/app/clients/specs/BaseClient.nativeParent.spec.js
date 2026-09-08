@@ -132,12 +132,19 @@ test('retracted response leaves both authored user segments in loaded native his
   await mongoose.models.Message.deleteOne(filter);
   let proof;
   await instance.handleStartMethods('Second segment.', {
-    user, conversationId: 'conversation', parentMessageId: 'original',
-    overrideParentMessageId: 'second-input', responseMessageId: 'answer',
+    user,
+    conversationId: 'conversation',
+    parentMessageId: 'original',
+    overrideParentMessageId: 'second-input',
+    responseMessageId: 'answer',
     onStart: async (input) => {
       await mongoose.models.Message.create({ ...input, user });
-      proof = await methods.captureNativeResponseSource(user, 'conversation', input.messageId,
-        instance.nativeResponseParentSource);
+      proof = await methods.captureNativeResponseSource(
+        user,
+        'conversation',
+        input.messageId,
+        instance.nativeResponseParentSource,
+      );
       expect(input).toMatchObject({ parentMessageId: 'original', text: 'Second segment.' });
     },
   });
@@ -189,9 +196,18 @@ test.each([
   expect(mainContinuityMessageEvidence(message).text).toBe(visible);
 });
 
-
 test('captures the exact direct-parent interruption before hydration changes presentation fields', async () => {
-  await mongoose.models.Message.updateOne(filter, {$set: {finish_reason: 'incomplete', content: [{type: 'harness_activity', harness_activity: {event: 'task_started', summary: 'Synthetic activity'}}]}});
+  await mongoose.models.Message.updateOne(filter, {
+    $set: {
+      finish_reason: 'incomplete',
+      content: [
+        {
+          type: 'harness_activity',
+          harness_activity: { event: 'task_started', summary: 'Synthetic activity' },
+        },
+      ],
+    },
+  });
   const instance = client();
   instance.addPreviousAttachments = async (messages) => {
     messages.at(-1).finish_reason = 'stop';
@@ -199,62 +215,114 @@ test('captures the exact direct-parent interruption before hydration changes pre
     return messages;
   };
   await instance.loadHistory('conversation', 'prior');
-  expect(JSON.parse(instance.directParentTurnContext)).toEqual({direct_parent_response: {
-    messageId: 'prior', parentMessageId: 'original', unfinished: true, finish_reason: 'incomplete',
-  }});
+  expect(JSON.parse(instance.directParentTurnContext)).toEqual({
+    direct_parent_response: {
+      messageId: 'prior',
+      parentMessageId: 'original',
+      unfinished: true,
+      finish_reason: 'incomplete',
+    },
+  });
   await instance.loadHistory('conversation', 'prior', 'missing');
   expect(instance.directParentTurnContext).toBe('');
 });
 
 /* === VIVENTIUM START === Web source files must precede native source capture. === */
 test.each(['unchanged', 'file_replaced', 'text_edited'])(
-  'normal source attachment persistence keeps admission exact: %s', async (change) => {
+  'normal source attachment persistence keeps admission exact: %s',
+  async (change) => {
     const instance = client();
-    const file = { file_id: 'b29b732f-f71a-4a3f-8844-c34a23bb3a8c', filename: 'recording.m4a',
-      type: 'audio/x-m4a', bytes: 123, source: 'local', context: 'message_attachment',
-      text: 'Storage-only text', _id: 'storage-only-id' };
+    const file = {
+      file_id: 'b29b732f-f71a-4a3f-8844-c34a23bb3a8c',
+      filename: 'recording.m4a',
+      type: 'audio/x-m4a',
+      bytes: 123,
+      source: 'local',
+      context: 'message_attachment',
+      text: 'Storage-only text',
+      _id: 'storage-only-id',
+    };
     instance.options.req = { body: { files: [{ file_id: file.file_id }] } };
     instance.options.attachments = Promise.resolve([file]);
     let source, input;
     await instance.handleStartMethods('Use the attached recording.', {
-      user, conversationId: 'conversation', parentMessageId: 'original',
-      overrideParentMessageId: 'uploaded-input', responseMessageId: 'uploaded-answer',
+      user,
+      conversationId: 'conversation',
+      parentMessageId: 'original',
+      overrideParentMessageId: 'uploaded-input',
+      responseMessageId: 'uploaded-answer',
       onStart: async (userMessage) => {
         input = userMessage;
         await mongoose.models.Message.create([
           { ...input, user },
-          { user, conversationId: 'conversation', messageId: 'uploaded-answer',
-            parentMessageId: input.messageId, isCreatedByUser: false, unfinished: true },
+          {
+            user,
+            conversationId: 'conversation',
+            messageId: 'uploaded-answer',
+            parentMessageId: input.messageId,
+            isCreatedByUser: false,
+            unfinished: true,
+          },
         ]);
-        source = await methods.captureNativeResponseSource(user, 'conversation', input.messageId,
-          instance.nativeResponseParentSource);
+        source = await methods.captureNativeResponseSource(
+          user,
+          'conversation',
+          input.messageId,
+          instance.nativeResponseParentSource,
+        );
       },
     });
     // The normal later save retains the same source files after provider preparation.
     const { buildMessageFiles } = require('@librechat/api');
     input.files = buildMessageFiles(instance.options.req.body.files, [file]);
-    await mongoose.models.Message.updateOne({ user, messageId: input.messageId }, {$set: input});
+    await mongoose.models.Message.updateOne({ user, messageId: input.messageId }, { $set: input });
     if (change === 'file_replaced') {
-      await mongoose.models.Message.updateOne({ user, messageId: input.messageId },
-        {$set: {'files.0.file_id': 'cf5f56f8-b118-4f8d-aedc-3537cfaeb477'}});
+      await mongoose.models.Message.updateOne(
+        { user, messageId: input.messageId },
+        { $set: { 'files.0.file_id': 'cf5f56f8-b118-4f8d-aedc-3537cfaeb477' } },
+      );
     } else if (change === 'text_edited') {
-      await mongoose.models.Message.updateOne({ user, messageId: input.messageId },
-        {$set: {text: 'A different request.'}});
+      await mongoose.models.Message.updateOne(
+        { user, messageId: input.messageId },
+        { $set: { text: 'A different request.' } },
+      );
     }
     const now = Date.now();
-    const admission = methods.admitNativeResponse({
-      userId: user, conversationId: 'conversation', responseMessageId: 'uploaded-answer',
-      streamId: 'upload-stream', jobCreatedAt: now, logicalTurnId: 'upload-turn', revision: 1,
-      invocationId: 'upload-invocation', bodySha256: 'b'.repeat(64), providerId: 'provider',
-      agentId: 'agent', originSha256: 'c'.repeat(64), source,
-      admittedAt: now, recoverUntil: now + 86_400_000,
-    }, (operation) => mongoose.connection.transaction(operation));
+    const admission = methods.admitNativeResponse(
+      {
+        userId: user,
+        conversationId: 'conversation',
+        responseMessageId: 'uploaded-answer',
+        streamId: 'upload-stream',
+        jobCreatedAt: now,
+        logicalTurnId: 'upload-turn',
+        revision: 1,
+        invocationId: 'upload-invocation',
+        bodySha256: 'b'.repeat(64),
+        providerId: 'provider',
+        agentId: 'agent',
+        originSha256: 'c'.repeat(64),
+        source,
+        admittedAt: now,
+        recoverUntil: now + 86_400_000,
+      },
+      (operation) => mongoose.connection.transaction(operation),
+    );
     if (change === 'unchanged') {
       await expect(admission).resolves.toBeUndefined();
-      expect((await methods.getNativeResponse(user, 'uploaded-answer')).nativeResponse)
-        .toMatchObject({ invocationId: 'upload-invocation', status: 'pending', source });
-      expect(input.files).toEqual([{ file_id: file.file_id, filename: file.filename,
-        type: file.type, bytes: file.bytes, source: file.source, context: file.context }]);
+      expect(
+        (await methods.getNativeResponse(user, 'uploaded-answer')).nativeResponse,
+      ).toMatchObject({ invocationId: 'upload-invocation', status: 'pending', source });
+      expect(input.files).toEqual([
+        {
+          file_id: file.file_id,
+          filename: file.filename,
+          type: file.type,
+          bytes: file.bytes,
+          source: file.source,
+          context: file.context,
+        },
+      ]);
     } else {
       await expect(admission).rejects.toThrow('native_response_source_changed');
     }

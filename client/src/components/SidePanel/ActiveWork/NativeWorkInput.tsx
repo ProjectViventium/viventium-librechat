@@ -131,7 +131,8 @@ export default function NativeWorkInput({
                     change(
                       field.type === 'array'
                         ? Array.from(event.target.selectedOptions, (option) => option.value)
-                        : event.target.value === '' && !options.some((option) => option.value === '')
+                        : event.target.value === '' &&
+                            !options.some((option) => option.value === '')
                           ? undefined
                           : event.target.value,
                     )

@@ -1382,7 +1382,6 @@ function scheduleConversationRecallRefresh({ userId, agentId }) {
   scheduleTask(key, () => refreshConversationRecallForUser({ userId, agentId }), 500);
 }
 
-
 /* === VIVENTIUM START ===
  * Feature: Effective conversation recall on the user payload.
  * Purpose: The UI mirrors `personalization.conversation_recall` only when it is defined, so an

@@ -72,14 +72,24 @@ export default function useStepHandler({
   lastAnnouncementTimeRef,
 }: TUseStepHandler) {
   // Graph activity updates share the existing message presentation, while FINAL replaces it.
-  const setMessages = useCallback((messages: TMessage[]) => {
-    const previews = new Map((getMessages() ?? []).map((message) => [message.messageId,
-      (message as TMessage & { __viventiumAssistantPreview?: string }).__viventiumAssistantPreview]));
-    setMessageState(messages.map((message) => {
-      const preview = previews.get(message.messageId);
-      return preview == null ? message : { ...message, __viventiumAssistantPreview: preview };
-    }));
-  }, [getMessages, setMessageState]);
+  const setMessages = useCallback(
+    (messages: TMessage[]) => {
+      const previews = new Map(
+        (getMessages() ?? []).map((message) => [
+          message.messageId,
+          (message as TMessage & { __viventiumAssistantPreview?: string })
+            .__viventiumAssistantPreview,
+        ]),
+      );
+      setMessageState(
+        messages.map((message) => {
+          const preview = previews.get(message.messageId);
+          return preview == null ? message : { ...message, __viventiumAssistantPreview: preview };
+        }),
+      );
+    },
+    [getMessages, setMessageState],
+  );
   const toolCallIdMap = useRef(new Map<string, string | undefined>());
   const messageMap = useRef(new Map<string, TMessage>());
   const stepMap = useRef(new Map<string, Agents.RunStep>());
@@ -199,8 +209,7 @@ export default function useStepHandler({
         status?: string;
       };
       const previousActivity = currentContent?.harness_activity as
-        | { summary?: string; tool?: string; task?: string; status?: string }
-        | undefined;
+        { summary?: string; tool?: string; task?: string; status?: string } | undefined;
       const previous = previousActivity?.summary ?? '';
       // Typed activity identity (tool/task/status) arrives with the delta that names it; keep it
       // on the part so the live message can be acted on the same way as the persisted one.

@@ -41,7 +41,7 @@ describe('Part harness activity wiring', () => {
       </RecoilRoot>,
     );
 
-    expect(screen.getByText('Harness activity')).toBeInTheDocument();
+    expect(screen.getByText('Activity')).toBeInTheDocument();
     expect(screen.getByText('The harness started working.')).toBeInTheDocument();
     expect(screen.getByText('The harness used a tool.')).toBeInTheDocument();
     expect(screen.queryByText(/thinking/i)).toBeNull();

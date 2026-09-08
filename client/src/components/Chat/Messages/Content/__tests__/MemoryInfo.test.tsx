@@ -43,10 +43,20 @@ describe('MemoryInfo', () => {
 
   describe('Error Memory Display', () => {
     test('shows local capacity without blaming the OpenAI-compatible transport', () => {
-      render(<MemoryInfo memoryArtifacts={[{
-        type: 'error', key: 'system', value: JSON.stringify({ errorType: 'host_capacity', provider: 'openai' }),
-      }]} />);
-      expect(screen.getByText('Not enough free capacity to save memory right now. Try again shortly.')).toBeInTheDocument();
+      render(
+        <MemoryInfo
+          memoryArtifacts={[
+            {
+              type: 'error',
+              key: 'system',
+              value: JSON.stringify({ errorType: 'host_capacity', provider: 'openai' }),
+            },
+          ]}
+        />,
+      );
+      expect(
+        screen.getByText('Not enough free capacity to save memory right now. Try again shortly.'),
+      ).toBeInTheDocument();
       expect(screen.queryByText(/OpenAI/)).not.toBeInTheDocument();
     });
 

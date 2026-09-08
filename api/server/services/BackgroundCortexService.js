@@ -3595,23 +3595,29 @@ async function prepareCortexConversationProviderCapability({
  * @param {number|null} [params.executionTimeoutMs=null] - Optional bounded timeout override.
  * @returns {Promise<{ agentId: string, agentName: string, insight: string }>}
  */
-async function executeCortexOnce({
-  agent,
-  messages,
-  runId,
-  conversationId = null,
-  req,
-  res,
-  activationScope = null,
-  contextMode = 'full',
-  completedResultPolicy = 'deliver',
-  executionTimeoutMs = null,
-  signal = null,
-  insightMode = 'user_facing',
-  resultEvidence = null,
-  onHarnessCancellationOutcome = null,
-}, { initializeAgentFn = initializeAgent, createRunFn = createRun,
-  persistCompletedInsightFn = persistCompletedCortexGraphInsight } = {}) {
+async function executeCortexOnce(
+  {
+    agent,
+    messages,
+    runId,
+    conversationId = null,
+    req,
+    res,
+    activationScope = null,
+    contextMode = 'full',
+    completedResultPolicy = 'deliver',
+    executionTimeoutMs = null,
+    signal = null,
+    insightMode = 'user_facing',
+    resultEvidence = null,
+    onHarnessCancellationOutcome = null,
+  },
+  {
+    initializeAgentFn = initializeAgent,
+    createRunFn = createRun,
+    persistCompletedInsightFn = persistCompletedCortexGraphInsight,
+  } = {},
+) {
   if (!['deliver', 'internal'].includes(completedResultPolicy)) {
     throw new TypeError('completedResultPolicy must be "deliver" or "internal"');
   }
@@ -4222,9 +4228,13 @@ async function executeCortexOnce({
     executionStage = 'postprocess';
     const duration = Date.now() - startTime;
 
-    let insight = normalizeCortexInsight(extractCompletedCortexGraphInsight({
-      completedContent: content, streamedContentParts: contentParts,
-    }), insightMode);
+    let insight = normalizeCortexInsight(
+      extractCompletedCortexGraphInsight({
+        completedContent: content,
+        streamedContentParts: contentParts,
+      }),
+      insightMode,
+    );
 
     /* === VIVENTIUM NOTE ===
      * Feature: No Response Tag ({NTA}) suppression for cortex insights.
@@ -4295,10 +4305,15 @@ async function executeCortexOnce({
     executionStage = 'completed_result_acceptance';
     return await finalizeCortexResultDelivery(cortexResult, {
       completedResultPolicy,
-      persist: () => persistCompletedInsightFn({
-        req: safeReq, conversationId: resolvedConversationId, parentMessageId: runId,
-        agent, insight, surface,
-      }),
+      persist: () =>
+        persistCompletedInsightFn({
+          req: safeReq,
+          conversationId: resolvedConversationId,
+          parentMessageId: runId,
+          agent,
+          insight,
+          surface,
+        }),
     });
   } catch (error) {
     if (executionStage === 'completed_result_acceptance') {
@@ -5436,8 +5451,9 @@ async function executeActivated({
   if (isBackgroundCortexCancellationSignal(ownerSignal)) {
     return { insights: [], cancelled: true };
   }
-  const completedResultDefect = settledResults.find((item) =>
-    item.status === 'rejected' && isCompletedResultProgrammingDefect(item.reason));
+  const completedResultDefect = settledResults.find(
+    (item) => item.status === 'rejected' && isCompletedResultProgrammingDefect(item.reason),
+  );
   if (completedResultDefect) throw completedResultDefect.reason;
   const executionResults = settledResults.map((s) => {
     if (s.status === 'fulfilled') {
@@ -5459,16 +5475,14 @@ async function executeActivated({
   });
 
   // Collect and merge insights
-  const insights = executionResults
-    .filter(isDeliverableCortexResult)
-    .map((r) => ({
-      cortexId: r.agentId,
-      cortexName: sanitizeCortexDisplayName(r.agentName),
-      insight: r.insight,
-      activationScope: r.activationScope || null,
-      configured_tools: r.configuredTools || 0,
-      completed_tool_calls: r.completedToolCalls || 0,
-    }));
+  const insights = executionResults.filter(isDeliverableCortexResult).map((r) => ({
+    cortexId: r.agentId,
+    cortexName: sanitizeCortexDisplayName(r.agentName),
+    insight: r.insight,
+    activationScope: r.activationScope || null,
+    configured_tools: r.configuredTools || 0,
+    completed_tool_calls: r.completedToolCalls || 0,
+  }));
 
   // Collect errors for reporting
   const errors = executionResults
@@ -5785,22 +5799,21 @@ async function processBackgroundCortices({
 
   /* === VIVENTIUM NOTE === Promise.allSettled for defensive safety (mirrors executeActivated) */
   const settledResults = await Promise.allSettled(executionPromises);
-  const completedResultDefect = settledResults.find((item) =>
-    item.status === 'rejected' && isCompletedResultProgrammingDefect(item.reason));
+  const completedResultDefect = settledResults.find(
+    (item) => item.status === 'rejected' && isCompletedResultProgrammingDefect(item.reason),
+  );
   if (completedResultDefect) throw completedResultDefect.reason;
   const executionResults = settledResults.map((s) => (s.status === 'fulfilled' ? s.value : null));
 
   // Filter out failed executions and null insights
-  const insights = executionResults
-    .filter(isDeliverableCortexResult)
-    .map((r) => ({
-      cortexId: r.agentId,
-      cortexName: sanitizeCortexDisplayName(r.agentName),
-      insight: r.insight,
-      activationScope: r.activationScope || null,
-      configured_tools: r.configuredTools || 0,
-      completed_tool_calls: r.completedToolCalls || 0,
-    }));
+  const insights = executionResults.filter(isDeliverableCortexResult).map((r) => ({
+    cortexId: r.agentId,
+    cortexName: sanitizeCortexDisplayName(r.agentName),
+    insight: r.insight,
+    activationScope: r.activationScope || null,
+    configured_tools: r.configuredTools || 0,
+    completed_tool_calls: r.completedToolCalls || 0,
+  }));
 
   logger.info(
     `[BackgroundCortexService] Collected ${insights.length} insights from activated cortices`,
@@ -5853,10 +5866,14 @@ Consider these insights in your response, but do not explicitly mention them unl
 }
 
 module.exports = {
-  executeCortexOnce, extractCompletedCortexGraphInsight, normalizeCortexInsight,
+  executeCortexOnce,
+  extractCompletedCortexGraphInsight,
+  normalizeCortexInsight,
   failClosedCortexResult,
-  isDeliverableCortexResult, collectDeliverableCortexInsights,
-  finalizeCortexResultDelivery, shouldRetryCortexResultWithFallback,
+  isDeliverableCortexResult,
+  collectDeliverableCortexInsights,
+  finalizeCortexResultDelivery,
+  shouldRetryCortexResultWithFallback,
   persistCompletedCortexGraphInsight,
   sanitizeCortexDisplayName,
   mapProvider,

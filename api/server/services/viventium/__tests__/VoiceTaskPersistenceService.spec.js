@@ -29,9 +29,16 @@ describe('VoiceTask durable replay and suppression', () => {
 
   test('persists the canonical ready binding without another generation event and hydrates it after restart', async () => {
     const scope = { callSessionId: 'call-ready-binding', userId: 'user-ready-binding' };
-    const task = service.createVoiceTask({ ...scope, conversationId: 'new', streamId: 'stream-ready-binding' });
+    const task = service.createVoiceTask({
+      ...scope,
+      conversationId: 'new',
+      streamId: 'stream-ready-binding',
+    });
     await service.flushVoiceTaskPersistence();
-    service.bindVoiceTaskStream(task.taskId, 'stream-ready-binding', { ...scope, conversationId: 'conversation-ready-binding' });
+    service.bindVoiceTaskStream(task.taskId, 'stream-ready-binding', {
+      ...scope,
+      conversationId: 'conversation-ready-binding',
+    });
     await service.flushVoiceTaskPersistence();
     expect(await ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean()).toMatchObject({
       payload: { conversationId: 'conversation-ready-binding', state: 'running', sequence: 3 },
@@ -39,7 +46,9 @@ describe('VoiceTask durable replay and suppression', () => {
     service.resetVoiceTasksForTests();
     await service.hydrateVoiceTaskByStreamId('stream-ready-binding', scope);
     expect(service.getVoiceTaskByStreamId('stream-ready-binding')).toMatchObject({
-      callSessionId: scope.callSessionId, conversationId: 'conversation-ready-binding', state: 'running',
+      callSessionId: scope.callSessionId,
+      conversationId: 'conversation-ready-binding',
+      state: 'running',
     });
   });
 
@@ -70,38 +79,68 @@ describe('VoiceTask durable replay and suppression', () => {
     });
   });
 
-
   test('generation cleanup does not wait on a failed unrelated durable batch and the queued result recovers', async () => {
-    const scope = { userId: 'user-generation', callSessionId: 'call-generation', streamId: 'stream-generation' };
-    const task = service.createVoiceTask({ ...scope, owner: { kind: 'generation_job', id: scope.streamId } });
-    const unrelated = service.createVoiceTask({ userId: 'other-user', callSessionId: 'other-call', streamId: 'other-stream' });
+    const scope = {
+      userId: 'user-generation',
+      callSessionId: 'call-generation',
+      streamId: 'stream-generation',
+    };
+    const task = service.createVoiceTask({
+      ...scope,
+      owner: { kind: 'generation_job', id: scope.streamId },
+    });
+    const unrelated = service.createVoiceTask({
+      userId: 'other-user',
+      callSessionId: 'other-call',
+      streamId: 'other-stream',
+    });
     await service.flushVoiceTaskPersistence();
     let storageAvailable = false;
     let failedWrite;
-    const failureObserved = new Promise((resolve) => { failedWrite = resolve; });
+    const failureObserved = new Promise((resolve) => {
+      failedWrite = resolve;
+    });
     const realBulkWrite = ViventiumVoiceTask.bulkWrite.bind(ViventiumVoiceTask);
     const bulkWrite = jest.spyOn(ViventiumVoiceTask, 'bulkWrite').mockImplementation((...args) => {
       if (storageAvailable) return realBulkWrite(...args);
       failedWrite();
-      return Promise.reject(Object.assign(new Error('synthetic durable write outage'), { code: 91 }));
+      return Promise.reject(
+        Object.assign(new Error('synthetic durable write outage'), { code: 91 }),
+      );
     });
     let settled;
     try {
-      service.observeGenerationEvent(unrelated.taskId, { event: 'on_agent_update', data: { eventId: 'unrelated-progress', name: 'Working' } });
+      service.observeGenerationEvent(unrelated.taskId, {
+        event: 'on_agent_update',
+        data: { eventId: 'unrelated-progress', name: 'Working' },
+      });
       await failureObserved;
       let generationFinalized = false;
-      settled = service.settleVoiceTaskGeneration(task.taskId, scope, { resultMessageId: 'finished-answer' }).then(() => { generationFinalized = true; });
+      settled = service
+        .settleVoiceTaskGeneration(task.taskId, scope, { resultMessageId: 'finished-answer' })
+        .then(() => {
+          generationFinalized = true;
+        });
       await new Promise((resolve) => setTimeout(resolve, 30));
       expect(generationFinalized).toBe(true);
-      expect(await ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean()).toMatchObject({ payload: { state: 'running' } });
+      expect(await ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean()).toMatchObject({
+        payload: { state: 'running' },
+      });
       storageAvailable = true;
       await service.flushVoiceTaskPersistence();
       await settled;
-      expect(await ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean()).toMatchObject({ payload: { state: 'completed', current: { resultMessageId: 'finished-answer' } } });
-      expect(await ViventiumVoiceTask.findOne({ taskId: unrelated.taskId }).lean()).toMatchObject({ payload: { state: 'running', current: { label: 'Working' } } });
+      expect(await ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean()).toMatchObject({
+        payload: { state: 'completed', current: { resultMessageId: 'finished-answer' } },
+      });
+      expect(await ViventiumVoiceTask.findOne({ taskId: unrelated.taskId }).lean()).toMatchObject({
+        payload: { state: 'running', current: { label: 'Working' } },
+      });
       service.resetVoiceTasksForTests();
       await service.hydrateVoiceTask(task.taskId, scope);
-      expect(service.snapshotEvent(task.taskId)).toMatchObject({ state: 'completed', resultMessageId: 'finished-answer' });
+      expect(service.snapshotEvent(task.taskId)).toMatchObject({
+        state: 'completed',
+        resultMessageId: 'finished-answer',
+      });
     } finally {
       storageAvailable = true;
       await service.flushVoiceTaskPersistence();

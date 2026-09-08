@@ -88,7 +88,7 @@ jest.mock('~/models', () => ({
 jest.mock('~/db/models', () => ({
   Message: {
     exists: (...args) => mockMessageExists(...args),
-    updateOne: jest.fn(async () => ({matchedCount:1,modifiedCount:1})),
+    updateOne: jest.fn(async () => ({ matchedCount: 1, modifiedCount: 1 })),
     findOneAndDelete: (...args) => mockMessageFindOneAndDelete(...args),
   },
   Conversation: {
@@ -149,30 +149,60 @@ describe('accepted source ledger before logical claim', () => {
     req.body.messageId = 'accepted-message';
     req.body.text = '  Keep this exact request.\n';
     req.body.viventiumSourceEventId = 'spoofed-source';
-    req.body.viventiumTriggeringSourceSegments = [{ text: 'spoofed text', source_event_id: 'spoofed' }];
+    req.body.viventiumTriggeringSourceSegments = [
+      { text: 'spoofed text', source_event_id: 'spoofed' },
+    ];
     req.body.interactionContext = { actor_kind: 'system', origin: 'scheduler' };
     req.headers = { 'x-viventium-source-event-id': 'spoofed-header' };
     req.body.files = [
-      { file_id: 'owned-file', filename: 'spoofed.txt', source_event_id: 'other-source', source_index: 9 },
+      {
+        file_id: 'owned-file',
+        filename: 'spoofed.txt',
+        source_event_id: 'other-source',
+        source_index: 9,
+      },
       { file_id: 'foreign-file', filename: 'foreign.txt' },
     ];
     mockGetFiles.mockResolvedValueOnce([
-      { file_id: 'owned-file', filename: 'owned.txt', type: 'text/plain', bytes: 12, media_group_index: 2 },
+      {
+        file_id: 'owned-file',
+        filename: 'owned.txt',
+        type: 'text/plain',
+        bytes: 12,
+        media_group_index: 2,
+      },
     ]);
     const context = await AgentController.__testables.captureRequestInteractionContext(req, {
-      conversationId: 'conv-1', streamId: 'stream-1',
+      conversationId: 'conv-1',
+      streamId: 'stream-1',
     });
     expect(mockGetFiles).toHaveBeenCalledWith(
       { user: 'user-1', file_id: { $in: ['owned-file', 'foreign-file'] } },
       undefined,
       { file_id: 1, filename: 1, type: 1, bytes: 1, media_group_index: 1 },
     );
-    expect(context).toMatchObject({ actor_kind: 'external_user', origin: 'interactive', source_event_id: 'accepted-message' });
-    expect(context.source_segments).toEqual([expect.objectContaining({
-      ordinal: 0, source_event_id: 'accepted-message', source_index: 0,
-      text: '  Keep this exact request.\n',
-      source_files: [{ file_id: 'owned-file', filename: 'owned.txt', type: 'text/plain', bytes: 12, media_group_index: 2 }],
-    })]);
+    expect(context).toMatchObject({
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      source_event_id: 'accepted-message',
+    });
+    expect(context.source_segments).toEqual([
+      expect.objectContaining({
+        ordinal: 0,
+        source_event_id: 'accepted-message',
+        source_index: 0,
+        text: '  Keep this exact request.\n',
+        source_files: [
+          {
+            file_id: 'owned-file',
+            filename: 'owned.txt',
+            type: 'text/plain',
+            bytes: 12,
+            media_group_index: 2,
+          },
+        ],
+      }),
+    ]);
     expect(JSON.stringify(context)).not.toContain('spoofed');
     expect(JSON.stringify(context)).not.toContain('foreign-file');
   });
@@ -181,8 +211,9 @@ describe('accepted source ledger before logical claim', () => {
     const req = makeReq();
     req.body.files = [{ file_id: 'owned-file' }];
     mockGetFiles.mockRejectedValueOnce(new Error('source lookup unavailable'));
-    await expect(AgentController(req, makeRes(), jest.fn(), jest.fn(), jest.fn()))
-      .rejects.toThrow('source lookup unavailable');
+    await expect(AgentController(req, makeRes(), jest.fn(), jest.fn(), jest.fn())).rejects.toThrow(
+      'source lookup unavailable',
+    );
     expect(mockGenerationJobManager.createJob).not.toHaveBeenCalled();
     expect(mockDecrementPendingRequest).toHaveBeenCalledWith('user-1');
   });
@@ -190,16 +221,25 @@ describe('accepted source ledger before logical claim', () => {
   test('preserves trusted gateway identity and binds accepted text before claim', async () => {
     const req = makeReq();
     setTrustedInteractionContext(req, {
-      actor_kind: 'external_user', origin: 'interactive', surface: 'telegram',
-      conversation_id: 'conv-1', source_event_id: 'trusted-gateway-event',
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      conversation_id: 'conv-1',
+      source_event_id: 'trusted-gateway-event',
     });
     req.body.source_event_id = 'spoofed-source';
     const context = await AgentController.__testables.captureRequestInteractionContext(req, {
-      conversationId: 'conv-1', streamId: 'stream-1',
+      conversationId: 'conv-1',
+      streamId: 'stream-1',
     });
-    expect(context.source_segments).toEqual([expect.objectContaining({
-      ordinal: 0, source_event_id: 'trusted-gateway-event', source_index: 0, text: 'hello',
-    })]);
+    expect(context.source_segments).toEqual([
+      expect.objectContaining({
+        ordinal: 0,
+        source_event_id: 'trusted-gateway-event',
+        source_index: 0,
+        text: 'hello',
+      }),
+    ]);
     expect(context.surface).toBe('telegram');
     expect(context.source_event_id).toBe('trusted-gateway-event');
   });
@@ -305,26 +345,44 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     jest.useRealTimers();
   });
 
-  test.each(['no subscriber', 'disconnected subscriber'])('settles voice generation with %s after actual completion', async (mode) => {
-    const req = makeReq();
-    req.viventiumCallSession = { callSessionId: 'call-1' };
-    req.body.viventiumVoiceTaskId = 'task-1';
-    req.body.streamId = 'stream-1';
-    const res = makeRes();
-    const pending = deferred();
-    const client = makeClient(Promise.resolve());
-    const original = client.sendMessage.getMockImplementation();
-    client.sendMessage.mockImplementation(async (...args) => { await pending.promise; return original(...args); });
-    await AgentController(req, res, jest.fn(), jest.fn(async () => ({ client })), jest.fn());
-    await jest.advanceTimersByTimeAsync(120);
-    if (mode === 'disconnected subscriber') res.writableEnded = true;
-    expect(mockSettleVoiceTaskGeneration).not.toHaveBeenCalled();
-    pending.resolve();
-    await jest.advanceTimersByTimeAsync(120);
-    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith('task-1', {
-      userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-1',
-    }, { resultMessageId: 'resp-msg-1' });
-  });
+  test.each(['no subscriber', 'disconnected subscriber'])(
+    'settles voice generation with %s after actual completion',
+    async (mode) => {
+      const req = makeReq();
+      req.viventiumCallSession = { callSessionId: 'call-1' };
+      req.body.viventiumVoiceTaskId = 'task-1';
+      req.body.streamId = 'stream-1';
+      const res = makeRes();
+      const pending = deferred();
+      const client = makeClient(Promise.resolve());
+      const original = client.sendMessage.getMockImplementation();
+      client.sendMessage.mockImplementation(async (...args) => {
+        await pending.promise;
+        return original(...args);
+      });
+      await AgentController(
+        req,
+        res,
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        jest.fn(),
+      );
+      await jest.advanceTimersByTimeAsync(120);
+      if (mode === 'disconnected subscriber') res.writableEnded = true;
+      expect(mockSettleVoiceTaskGeneration).not.toHaveBeenCalled();
+      pending.resolve();
+      await jest.advanceTimersByTimeAsync(120);
+      expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+        'task-1',
+        {
+          userId: 'user-1',
+          callSessionId: 'call-1',
+          streamId: 'stream-1',
+        },
+        { resultMessageId: 'resp-msg-1' },
+      );
+    },
+  );
 
   test('settles a completed superseded voice generation without reviving its presentation', async () => {
     const req = makeReq();
@@ -332,31 +390,56 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     req.body.viventiumVoiceTaskId = 'task-1';
     req.body.streamId = 'stream-1';
     mockGenerationJobManager.getJob.mockResolvedValue({ createdAt: 1, status: 'superseded' });
-    await AgentController(req, makeRes(), jest.fn(), jest.fn(async () => ({ client: makeClient(Promise.resolve()) })), jest.fn());
+    await AgentController(
+      req,
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => ({ client: makeClient(Promise.resolve()) })),
+      jest.fn(),
+    );
     await jest.advanceTimersByTimeAsync(120);
-    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith('task-1', expect.objectContaining({ streamId: 'stream-1' }), {});
+    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+      'task-1',
+      expect.objectContaining({ streamId: 'stream-1' }),
+      {},
+    );
     expect(mockGenerationJobManager.emitDone).not.toHaveBeenCalled();
     expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
   });
 
-  test.each(['generation', 'initialization'])('settles a real voice %s failure without a subscriber', async (stage) => {
-    const req = makeReq();
-    req.viventiumCallSession = { callSessionId: 'call-1' };
-    req.body.viventiumVoiceTaskId = 'task-1';
-    req.body.streamId = 'stream-1';
-    const error = Object.assign(new Error('Provider unavailable'), { code: 'provider_unavailable' });
-    const client = makeClient(Promise.resolve());
-    const initialize = jest.fn(async () => ({ client }));
-    if (stage === 'generation') client.sendMessage.mockRejectedValue(error);
-    else initialize.mockRejectedValue(error);
-    await AgentController(req, makeRes(), jest.fn(), initialize, jest.fn());
-    await jest.advanceTimersByTimeAsync(120);
-    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith('task-1', expect.objectContaining({ streamId: 'stream-1' }), { error });
-  });
+  test.each(['generation', 'initialization'])(
+    'settles a real voice %s failure without a subscriber',
+    async (stage) => {
+      const req = makeReq();
+      req.viventiumCallSession = { callSessionId: 'call-1' };
+      req.body.viventiumVoiceTaskId = 'task-1';
+      req.body.streamId = 'stream-1';
+      const error = Object.assign(new Error('Provider unavailable'), {
+        code: 'provider_unavailable',
+      });
+      const client = makeClient(Promise.resolve());
+      const initialize = jest.fn(async () => ({ client }));
+      if (stage === 'generation') client.sendMessage.mockRejectedValue(error);
+      else initialize.mockRejectedValue(error);
+      await AgentController(req, makeRes(), jest.fn(), initialize, jest.fn());
+      await jest.advanceTimersByTimeAsync(120);
+      expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+        'task-1',
+        expect.objectContaining({ streamId: 'stream-1' }),
+        { error },
+      );
+    },
+  );
 
   test('resumable requests retain guarded assistant persistence ownership', async () => {
     const client = makeClient(Promise.resolve());
-    await AgentController(makeReq(), makeRes(), jest.fn(), jest.fn(async () => ({ client })), jest.fn());
+    await AgentController(
+      makeReq(),
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => ({ client })),
+      jest.fn(),
+    );
     await jest.advanceTimersByTimeAsync(120);
     expect(client.skipSaveResponseMessage).toBe(true);
     expect(mockSaveMessage).toHaveBeenCalledWith(
@@ -439,9 +522,26 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     const addTitle = jest.fn();
     mockRecoverSavedNativeResponse.mockImplementationOnce(async (_identity, onTerminal) => {
       onTerminal('cancelled');
-      return { messageId: 'resp-msg-1', error: true, unfinished: false, content: [{ type: 'error', error_class: 'native_response_cancelled', error: 'The response was cancelled before completion.' }] };
+      return {
+        messageId: 'resp-msg-1',
+        error: true,
+        unfinished: false,
+        content: [
+          {
+            type: 'error',
+            error_class: 'native_response_cancelled',
+            error: 'The response was cancelled before completion.',
+          },
+        ],
+      };
     });
-    await AgentController(req, makeRes(), jest.fn(), jest.fn(async () => ({ client })), addTitle);
+    await AgentController(
+      req,
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => ({ client })),
+      addTitle,
+    );
     await jest.advanceTimersByTimeAsync(120);
     await Promise.resolve();
     expect(mockRecoverNativeResponse).toHaveBeenCalledWith(req._viventiumNativeResponseIdentity);
@@ -547,7 +647,14 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         conversation_id: 'conv-1',
         revision: 1,
         source_event_id: 'web-source-event-1',
-        source_segments: [expect.objectContaining({ ordinal: 0, source_event_id: 'web-source-event-1', source_index: 0, text: 'hello' })],
+        source_segments: [
+          expect.objectContaining({
+            ordinal: 0,
+            source_event_id: 'web-source-event-1',
+            source_index: 0,
+            text: 'hello',
+          }),
+        ],
       },
       deliveryPolicy: { commit_authority: 'server' },
     });
@@ -985,36 +1092,61 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     ]);
   });
 
-  test.each(['matching', 'other-conversation', 'other-turn', 'not-older', 'missing-user'])('retracting a response preserves only its proven incoming user chain: %s', async (change) => {
-    const req = makeReq();
-    req.body.parentMessageId = 'response-b';
-    setTrustedInteractionContext(req, {
-      actor_kind: 'external_user', origin: 'interactive', surface: 'telegram',
-      conversation_id: 'conv-1', logical_turn_id: 'logical', revision: 2,
-      source_event_id: 'second-segment',
-    }, { segment_stability: 'immediate', supersede_scope: 'response_only' },
-    { commit_authority: 'external_adapter' });
-    const interactionContext = getTrustedInteractionContext(req);
-    mockGenerationJobManager.createJob.mockResolvedValueOnce({
-      createdAt: 2,
-      abortController: { signal: { aborted: false }, abort: jest.fn() },
-      readyPromise: Promise.resolve(), emitter: new EventEmitter(),
-      metadata: { interactionContext },
-      supersededPresentations: [{
-        conversationId: change === 'other-conversation' ? 'other' : 'conv-1',
-        responseMessageId: 'response-b',
-        userMessageId: change === 'missing-user' ? undefined : 'user-a',
-        interactionContext: { logical_turn_id: change === 'other-turn' ? 'other' : 'logical',
-          revision: change === 'not-older' ? 2 : 1 },
-      }],
-    });
-    const client = makeClient(Promise.resolve());
-    await AgentController(req, makeRes(), jest.fn(), jest.fn(async () => ({ client })), jest.fn());
-    await jest.advanceTimersByTimeAsync(120);
-    const expectedParent = change === 'matching' ? 'user-a' : 'response-b';
-    expect(req.body.parentMessageId).toBe(expectedParent);
-    expect(client.sendMessage).toHaveBeenCalledWith('hello', expect.objectContaining({ parentMessageId: expectedParent }));
-  });
+  test.each(['matching', 'other-conversation', 'other-turn', 'not-older', 'missing-user'])(
+    'retracting a response preserves only its proven incoming user chain: %s',
+    async (change) => {
+      const req = makeReq();
+      req.body.parentMessageId = 'response-b';
+      setTrustedInteractionContext(
+        req,
+        {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'telegram',
+          conversation_id: 'conv-1',
+          logical_turn_id: 'logical',
+          revision: 2,
+          source_event_id: 'second-segment',
+        },
+        { segment_stability: 'immediate', supersede_scope: 'response_only' },
+        { commit_authority: 'external_adapter' },
+      );
+      const interactionContext = getTrustedInteractionContext(req);
+      mockGenerationJobManager.createJob.mockResolvedValueOnce({
+        createdAt: 2,
+        abortController: { signal: { aborted: false }, abort: jest.fn() },
+        readyPromise: Promise.resolve(),
+        emitter: new EventEmitter(),
+        metadata: { interactionContext },
+        supersededPresentations: [
+          {
+            conversationId: change === 'other-conversation' ? 'other' : 'conv-1',
+            responseMessageId: 'response-b',
+            userMessageId: change === 'missing-user' ? undefined : 'user-a',
+            interactionContext: {
+              logical_turn_id: change === 'other-turn' ? 'other' : 'logical',
+              revision: change === 'not-older' ? 2 : 1,
+            },
+          },
+        ],
+      });
+      const client = makeClient(Promise.resolve());
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        jest.fn(),
+      );
+      await jest.advanceTimersByTimeAsync(120);
+      const expectedParent = change === 'matching' ? 'user-a' : 'response-b';
+      expect(req.body.parentMessageId).toBe(expectedParent);
+      expect(client.sendMessage).toHaveBeenCalledWith(
+        'hello',
+        expect.objectContaining({ parentMessageId: expectedParent }),
+      );
+    },
+  );
 
   test('keeps external-adapter output unfinished until its authenticated delivery acknowledgement', async () => {
     const req = makeReq();
@@ -1182,10 +1314,16 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       logical_turn_id: 'original-logical-turn',
       revision: 1,
     });
-    expect(req._viventiumBeforeGenerationReceipt).toHaveBeenCalledWith(expect.objectContaining({
-      streamId: originalStreamId, conversationId: originalConversationId, duplicate: true,
-    }));
-    expect(req._viventiumBeforeGenerationReceipt.mock.invocationCallOrder[0]).toBeLessThan(res.json.mock.invocationCallOrder[0]);
+    expect(req._viventiumBeforeGenerationReceipt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        streamId: originalStreamId,
+        conversationId: originalConversationId,
+        duplicate: true,
+      }),
+    );
+    expect(req._viventiumBeforeGenerationReceipt.mock.invocationCallOrder[0]).toBeLessThan(
+      res.json.mock.invocationCallOrder[0],
+    );
     expect(res.status).toHaveBeenCalledWith(202);
     expect(res.json).toHaveBeenCalledWith({
       streamId: originalStreamId,
@@ -1303,108 +1441,278 @@ describe('voice task cancellation persistence barrier', () => {
   });
 });
 
-
 describe('rapid input before asynchronous initialization', () => {
-  beforeEach(() => { jest.clearAllMocks(); mockMessageExists.mockResolvedValue(false); mockSaveMessage.mockResolvedValue({}); });
-  const trusted = (req, event) => setTrustedInteractionContext(req, {
-    actor_kind:'external_user',origin:'interactive',surface:'telegram',conversation_id:'conv-1',source_event_id:event,
-    source_order_scope:'a'.repeat(64),source_sequence:event === 'source-a' ? 1 : 2,
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockMessageExists.mockResolvedValue(false);
+    mockSaveMessage.mockResolvedValue({});
   });
+  const trusted = (req, event) =>
+    setTrustedInteractionContext(req, {
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      conversation_id: 'conv-1',
+      source_event_id: event,
+      source_order_scope: 'a'.repeat(64),
+      source_sequence: event === 'source-a' ? 1 : 2,
+    });
   test('retains source before the slow save and marks it ready only after the raw save', async () => {
-    const req=makeReq(); trusted(req,'source-a'); const saved=deferred();
+    const req = makeReq();
+    trusted(req, 'source-a');
+    const saved = deferred();
     mockSaveMessage.mockImplementationOnce(() => saved.promise);
-    const capture=AgentController.captureAcceptedInteractionInput(req,{conversationId:'conv-1',streamId:'a-stream',text:'First full goal',parentMessageId:'base'});
-    for(let i=0;i<6;i++) await Promise.resolve();
+    const capture = AgentController.captureAcceptedInteractionInput(req, {
+      conversationId: 'conv-1',
+      streamId: 'a-stream',
+      text: 'First full goal',
+      parentMessageId: 'base',
+    });
+    for (let i = 0; i < 6; i++) await Promise.resolve();
     expect(mockGenerationJobManager.retainLogicalTurnInput).toHaveBeenCalledTimes(2);
-    expect(mockGenerationJobManager.retainLogicalTurnInput.mock.calls[0][1].source_segments[0]).toMatchObject({text:'First full goal',source_sequence:1,source_parent_message_id:'base'});
-    expect(mockGenerationJobManager.retainLogicalTurnInput.mock.calls[0][1].source_segments[0].source_persisted).toBeUndefined();
-    saved.resolve({}); await capture;
+    expect(
+      mockGenerationJobManager.retainLogicalTurnInput.mock.calls[0][1].source_segments[0],
+    ).toMatchObject({
+      text: 'First full goal',
+      source_sequence: 1,
+      source_parent_message_id: 'base',
+    });
+    expect(
+      mockGenerationJobManager.retainLogicalTurnInput.mock.calls[0][1].source_segments[0]
+        .source_persisted,
+    ).toBeUndefined();
+    saved.resolve({});
+    await capture;
     expect(mockGenerationJobManager.retainLogicalTurnInput).toHaveBeenCalledTimes(2);
-    await AgentController.__testables.captureRequestInteractionContext(req,{conversationId:'conv-1',streamId:'a-stream'});
-    expect(mockGenerationJobManager.retainLogicalTurnInput.mock.calls[2][1].source_segments[0].source_persisted).toBe(true);
+    await AgentController.__testables.captureRequestInteractionContext(req, {
+      conversationId: 'conv-1',
+      streamId: 'a-stream',
+    });
+    expect(
+      mockGenerationJobManager.retainLogicalTurnInput.mock.calls[2][1].source_segments[0]
+        .source_persisted,
+    ).toBe(true);
   });
   test('unresolved ingress does not reuse pending input across an explicit reset', async () => {
-    const first=makeReq(); trusted(first,'source-a');
-    await AgentController.retainAcceptedInteractionInput(first,{conversationId:'new',text:'First goal'});
+    const first = makeReq();
+    trusted(first, 'source-a');
+    await AgentController.retainAcceptedInteractionInput(first, {
+      conversationId: 'new',
+      text: 'First goal',
+    });
     expect(mockGenerationJobManager.retainLogicalTurnInput).not.toHaveBeenCalled();
-    const firstId=AgentController.__testables.resolveCanonicalConversationId(first,first.user.id,'new');
-    const reset=makeReq(); trusted(reset,'source-b');
-    await AgentController.retainAcceptedInteractionInput(reset,{conversationId:'new',text:'After reset'});
+    const firstId = AgentController.__testables.resolveCanonicalConversationId(
+      first,
+      first.user.id,
+      'new',
+    );
+    const reset = makeReq();
+    trusted(reset, 'source-b');
+    await AgentController.retainAcceptedInteractionInput(reset, {
+      conversationId: 'new',
+      text: 'After reset',
+    });
     expect(mockGenerationJobManager.retainLogicalTurnInput).not.toHaveBeenCalled();
-    const resetId=AgentController.__testables.resolveCanonicalConversationId(reset,reset.user.id,'new');
+    const resetId = AgentController.__testables.resolveCanonicalConversationId(
+      reset,
+      reset.user.id,
+      'new',
+    );
     expect(resetId).not.toBe(firstId);
   });
   test('uses one canonical fresh conversation before the adapter replaces its request body', async () => {
-    const req=makeReq(); trusted(req,'source-a');
-    const early=await AgentController.captureAcceptedInteractionInput(req,{conversationId:'new',streamId:'a-stream',text:'First goal',parentMessageId:null});
-    const canonical=AgentController.__testables.resolveCanonicalConversationId(req,req.user.id,'new');
+    const req = makeReq();
+    trusted(req, 'source-a');
+    const early = await AgentController.captureAcceptedInteractionInput(req, {
+      conversationId: 'new',
+      streamId: 'a-stream',
+      text: 'First goal',
+      parentMessageId: null,
+    });
+    const canonical = AgentController.__testables.resolveCanonicalConversationId(
+      req,
+      req.user.id,
+      'new',
+    );
     expect(early.conversation_id).toBe(canonical);
-    expect(mockSaveMessage).toHaveBeenCalledWith(req,expect.objectContaining({conversationId:canonical,parentMessageId:'00000000-0000-0000-0000-000000000000'}),expect.any(Object));
+    expect(mockSaveMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        conversationId: canonical,
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+      }),
+      expect.any(Object),
+    );
   });
   test('a resolver reset cannot restore an existing rejected conversation', async () => {
-    const req=makeReq();trusted(req,'source-a');
-    await AgentController.retainAcceptedInteractionInput(req,{conversationId:'rejected-existing-conversation',text:'Own user goal'});
-    const resolved=await AgentController.captureAcceptedInteractionInput(req,{conversationId:'new',parentMessageId:null});
+    const req = makeReq();
+    trusted(req, 'source-a');
+    await AgentController.retainAcceptedInteractionInput(req, {
+      conversationId: 'rejected-existing-conversation',
+      text: 'Own user goal',
+    });
+    const resolved = await AgentController.captureAcceptedInteractionInput(req, {
+      conversationId: 'new',
+      parentMessageId: null,
+    });
     expect(resolved.conversation_id).not.toBe('rejected-existing-conversation');
     expect(resolved.conversation_id).not.toBe('new');
-    expect(mockSaveMessage).toHaveBeenCalledWith(req,expect.objectContaining({conversationId:resolved.conversation_id,text:'Own user goal'}),expect.any(Object));
-    expect(mockSaveMessage.mock.calls.every(([,message])=>message.conversationId!=='rejected-existing-conversation')).toBe(true);
-    req.body={...req.body,conversationId:resolved.conversation_id};
-    expect(AgentController.__testables.resolveCanonicalConversationId(req,req.user.id,req.body.conversationId)).toBe(resolved.conversation_id);
+    expect(mockSaveMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({ conversationId: resolved.conversation_id, text: 'Own user goal' }),
+      expect.any(Object),
+    );
+    expect(
+      mockSaveMessage.mock.calls.every(
+        ([, message]) => message.conversationId !== 'rejected-existing-conversation',
+      ),
+    ).toBe(true);
+    req.body = { ...req.body, conversationId: resolved.conversation_id };
+    expect(
+      AgentController.__testables.resolveCanonicalConversationId(
+        req,
+        req.user.id,
+        req.body.conversationId,
+      ),
+    ).toBe(resolved.conversation_id);
   });
   test('stale initialization sends the existing supersession receipt without initializing or cancelling work', async () => {
-    const req=makeReq();trusted(req,'source-a'); const res=makeRes(); const init=jest.fn();
-    mockGenerationJobManager.createJob.mockRejectedValueOnce(Object.assign(new Error('newer source'),{code:'source_order_superseded'}));
-    await AgentController(req,res,jest.fn(),init,jest.fn());
-    expect(mockSaveMessage).toHaveBeenCalledWith(req,expect.objectContaining({text:'hello',isCreatedByUser:true}),expect.any(Object));
+    const req = makeReq();
+    trusted(req, 'source-a');
+    const res = makeRes();
+    const init = jest.fn();
+    mockGenerationJobManager.createJob.mockRejectedValueOnce(
+      Object.assign(new Error('newer source'), { code: 'source_order_superseded' }),
+    );
+    await AgentController(req, res, jest.fn(), init, jest.fn());
+    expect(mockSaveMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({ text: 'hello', isCreatedByUser: true }),
+      expect.any(Object),
+    );
     expect(res.status).toHaveBeenCalledWith(202);
-    expect(res.json).toHaveBeenCalledWith({code:'source_order_superseded',superseded:true,conversationId:'conv-1'});
-    expect(init).not.toHaveBeenCalled(); expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith({
+      code: 'source_order_superseded',
+      superseded: true,
+      conversationId: 'conv-1',
+    });
+    expect(init).not.toHaveBeenCalled();
+    expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
   });
   test('a ready older input releases its preparation receipt when current Main is busy without cancelling work', async () => {
-    const req=makeReq();trusted(req,'source-a'); const res=makeRes(); const init=jest.fn();
-    require('@librechat/api').bindReadyInputContinuation(req,'original-input',2);
-    req._viventiumBeforeGenerationReceipt=jest.fn().mockResolvedValue(undefined);
-    mockGenerationJobManager.createJob.mockRejectedValueOnce(Object.assign(new Error('Main is active'),{code:'source_input_waiting'}));
-    await AgentController(req,res,jest.fn(),init,jest.fn());
+    const req = makeReq();
+    trusted(req, 'source-a');
+    const res = makeRes();
+    const init = jest.fn();
+    require('@librechat/api').bindReadyInputContinuation(req, 'original-input', 2);
+    req._viventiumBeforeGenerationReceipt = jest.fn().mockResolvedValue(undefined);
+    mockGenerationJobManager.createJob.mockRejectedValueOnce(
+      Object.assign(new Error('Main is active'), { code: 'source_input_waiting' }),
+    );
+    await AgentController(req, res, jest.fn(), init, jest.fn());
     expect(res.status).toHaveBeenCalledWith(202);
-    expect(res.json).toHaveBeenCalledWith({code:'source_input_pending',pending:true,conversationId:'conv-1'});
-    expect(req._viventiumBeforeGenerationReceipt).toHaveBeenCalledWith({code:'source_input_pending',pending:true,conversationId:'conv-1'});
-    expect(req._viventiumBeforeGenerationReceipt.mock.invocationCallOrder[0]).toBeLessThan(res.json.mock.invocationCallOrder[0]);
-    expect(init).not.toHaveBeenCalled();expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith({
+      code: 'source_input_pending',
+      pending: true,
+      conversationId: 'conv-1',
+    });
+    expect(req._viventiumBeforeGenerationReceipt).toHaveBeenCalledWith({
+      code: 'source_input_pending',
+      pending: true,
+      conversationId: 'conv-1',
+    });
+    expect(req._viventiumBeforeGenerationReceipt.mock.invocationCallOrder[0]).toBeLessThan(
+      res.json.mock.invocationCallOrder[0],
+    );
+    expect(init).not.toHaveBeenCalled();
+    expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
   });
   test('failed persistence keeps the source unready and the same source retry repairs it', async () => {
-    const first=makeReq();trusted(first,'source-a'); mockSaveMessage.mockRejectedValueOnce(new Error('Mongo temporarily unavailable'));
-    await expect(AgentController.__testables.captureRequestInteractionContext(first,{conversationId:'conv-1',streamId:'a-stream'})).rejects.toThrow('Mongo temporarily unavailable');
-    expect(mockGenerationJobManager.retainLogicalTurnInput.mock.calls.every(([,context])=>context.source_segments[0].source_persisted !== true)).toBe(true);
-    const originalId=mockGenerationJobManager.retainLogicalTurnInput.mock.calls[0][1].source_segments[0].source_message_id;
-    const retry=makeReq();trusted(retry,'source-a');
-    const repaired=await AgentController.__testables.captureRequestInteractionContext(retry,{conversationId:'conv-1',streamId:'retry-stream'});
-    expect(repaired.source_segments[0]).toMatchObject({source_message_id:originalId,source_persisted:true,text:'hello'});
+    const first = makeReq();
+    trusted(first, 'source-a');
+    mockSaveMessage.mockRejectedValueOnce(new Error('Mongo temporarily unavailable'));
+    await expect(
+      AgentController.__testables.captureRequestInteractionContext(first, {
+        conversationId: 'conv-1',
+        streamId: 'a-stream',
+      }),
+    ).rejects.toThrow('Mongo temporarily unavailable');
+    expect(
+      mockGenerationJobManager.retainLogicalTurnInput.mock.calls.every(
+        ([, context]) => context.source_segments[0].source_persisted !== true,
+      ),
+    ).toBe(true);
+    const originalId =
+      mockGenerationJobManager.retainLogicalTurnInput.mock.calls[0][1].source_segments[0]
+        .source_message_id;
+    const retry = makeReq();
+    trusted(retry, 'source-a');
+    const repaired = await AgentController.__testables.captureRequestInteractionContext(retry, {
+      conversationId: 'conv-1',
+      streamId: 'retry-stream',
+    });
+    expect(repaired.source_segments[0]).toMatchObject({
+      source_message_id: originalId,
+      source_persisted: true,
+      text: 'hello',
+    });
   });
   test('pending source persistence returns a typed retryable status rather than starting partial context', async () => {
-    const req=makeReq();trusted(req,'source-b'); const res=makeRes(); const init=jest.fn();
-    mockGenerationJobManager.createJob.mockRejectedValueOnce(Object.assign(new Error('Input persistence pending; retry'),{code:'source_input_persistence_pending'}));
-    await AgentController(req,res,jest.fn(),init,jest.fn());
+    const req = makeReq();
+    trusted(req, 'source-b');
+    const res = makeRes();
+    const init = jest.fn();
+    mockGenerationJobManager.createJob.mockRejectedValueOnce(
+      Object.assign(new Error('Input persistence pending; retry'), {
+        code: 'source_input_persistence_pending',
+      }),
+    );
+    await AgentController(req, res, jest.fn(), init, jest.fn());
     expect(res.status).toHaveBeenCalledWith(503);
-    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({code:'source_input_persistence_pending',retryable:true}));
-    expect(init).not.toHaveBeenCalled(); expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'source_input_persistence_pending', retryable: true }),
+    );
+    expect(init).not.toHaveBeenCalled();
+    expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
   });
   test('links only exact owner-scoped source messages in order for the normal history loader', async () => {
-    const req=makeReq();trusted(req,'source-c');
-    await AgentController.__testables.linkAcceptedInteractionSources(req,{conversation_id:'conv-1',source_event_id:'source-c',source_segments:[
-      {source_event_id:'source-a',source_message_id:'a',source_parent_message_id:'base'},
-      {source_event_id:'source-b',source_message_id:'b',source_parent_message_id:'base'},
-      {source_event_id:'source-c',source_message_id:'c',source_parent_message_id:'base'},
-    ]});
-    const {Message}=require('~/db/models');
-    expect(Message.updateOne).toHaveBeenNthCalledWith(1,{user:'user-1',conversationId:'conv-1',messageId:'b',isCreatedByUser:true,parentMessageId:'base','metadata.viventium.interactionContext.source_event_id':'source-b'},{$set:{parentMessageId:'a'}});
-    expect(Message.updateOne).toHaveBeenNthCalledWith(2,expect.objectContaining({messageId:'c','metadata.viventium.interactionContext.source_event_id':'source-c'}),{$set:{parentMessageId:'b'}});
+    const req = makeReq();
+    trusted(req, 'source-c');
+    await AgentController.__testables.linkAcceptedInteractionSources(req, {
+      conversation_id: 'conv-1',
+      source_event_id: 'source-c',
+      source_segments: [
+        { source_event_id: 'source-a', source_message_id: 'a', source_parent_message_id: 'base' },
+        { source_event_id: 'source-b', source_message_id: 'b', source_parent_message_id: 'base' },
+        { source_event_id: 'source-c', source_message_id: 'c', source_parent_message_id: 'base' },
+      ],
+    });
+    const { Message } = require('~/db/models');
+    expect(Message.updateOne).toHaveBeenNthCalledWith(
+      1,
+      {
+        user: 'user-1',
+        conversationId: 'conv-1',
+        messageId: 'b',
+        isCreatedByUser: true,
+        parentMessageId: 'base',
+        'metadata.viventium.interactionContext.source_event_id': 'source-b',
+      },
+      { $set: { parentMessageId: 'a' } },
+    );
+    expect(Message.updateOne).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        messageId: 'c',
+        'metadata.viventium.interactionContext.source_event_id': 'source-c',
+      }),
+      { $set: { parentMessageId: 'b' } },
+    );
     expect(req.body.parentMessageId).toBe('b');
   });
-  test("one trusted generation shares fresh canonical identity across distinct source events", async () => {
-    const { createTelegramInteractionContext } = require("@librechat/api");
-    const make = (event, generation, requested = "new", owner = "user-1") => {
+  test('one trusted generation shares fresh canonical identity across distinct source events', async () => {
+    const { createTelegramInteractionContext } = require('@librechat/api');
+    const make = (event, generation, requested = 'new', owner = 'user-1') => {
       const req = makeReq();
       req.user.id = owner;
       setTrustedInteractionContext(
@@ -1412,31 +1720,25 @@ describe('rapid input before asynchronous initialization', () => {
         createTelegramInteractionContext({
           conversation_id: requested,
           source_event_id: event,
-          source_order_scope: "a".repeat(64),
-          source_sequence: event === "a" ? 1 : 2,
+          source_order_scope: 'a'.repeat(64),
+          source_sequence: event === 'a' ? 1 : 2,
           conversation_generation: generation,
         }),
       );
       return req;
     };
-    const generation = "b".repeat(64);
-    const a = make("a", generation),
-      b = make("b", generation);
+    const generation = 'b'.repeat(64);
+    const a = make('a', generation),
+      b = make('b', generation);
     const resolve = (req) =>
-      AgentController.__testables.resolveCanonicalConversationId(
-        req,
-        req.user.id,
-        "new",
-      );
+      AgentController.__testables.resolveCanonicalConversationId(req, req.user.id, 'new');
     expect(resolve(a)).toBe(resolve(b));
-    expect(resolve(make("b", "c".repeat(64)))).not.toBe(resolve(a));
-    expect(resolve(make("b", generation, "new", "other-owner"))).not.toBe(
-      resolve(a),
-    );
-    const expiredA = make("a", generation, "previous-chat"),
-      expiredB = make("b", generation, "previous-chat");
+    expect(resolve(make('b', 'c'.repeat(64)))).not.toBe(resolve(a));
+    expect(resolve(make('b', generation, 'new', 'other-owner'))).not.toBe(resolve(a));
+    const expiredA = make('a', generation, 'previous-chat'),
+      expiredB = make('b', generation, 'previous-chat');
     expect(resolve(expiredA)).toBe(resolve(expiredB));
-    expect(resolve(expiredA)).not.toBe("previous-chat");
+    expect(resolve(expiredA)).not.toBe('previous-chat');
     expect(resolve(expiredA)).not.toBe(resolve(a));
   });
 });

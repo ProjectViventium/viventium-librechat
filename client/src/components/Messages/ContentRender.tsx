@@ -155,10 +155,17 @@ const ContentRender = memo(function ContentRender({
 
         <div className="flex min-w-0 flex-col gap-1">
           <div className="flex min-h-[20px] min-w-0 max-w-full flex-grow flex-col gap-0">
-            {effectiveIsSubmitting && !msg.error &&
-              (msg as TMessage & { __viventiumAssistantPreview?: string }).__viventiumAssistantPreview && (
-                <Markdown content={(msg as TMessage & { __viventiumAssistantPreview: string })
-                  .__viventiumAssistantPreview} isLatestMessage={isLatestMessage} />
+            {effectiveIsSubmitting &&
+              !msg.error &&
+              (msg as TMessage & { __viventiumAssistantPreview?: string })
+                .__viventiumAssistantPreview && (
+                <Markdown
+                  content={
+                    (msg as TMessage & { __viventiumAssistantPreview: string })
+                      .__viventiumAssistantPreview
+                  }
+                  isLatestMessage={isLatestMessage}
+                />
               )}
             <ContentParts
               edit={edit}

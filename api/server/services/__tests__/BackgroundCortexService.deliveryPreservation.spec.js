@@ -2,10 +2,19 @@ jest.mock('../viventium/CortexInsightOutboxService', () => ({
   enqueueCompletedCortexInsightOutboxBatch: jest.fn(async () => ({ outboxKeys: [] })),
   settleCompletedCortexInsightOutboxBatch: jest.fn(async () => ({ deleted: 1 })),
 }));
-const { persistCompletedCortexGraphInsight, failClosedCortexResult, finalizeCortexResultDelivery,
-  isDeliverableCortexResult, collectDeliverableCortexInsights, shouldRetryCortexResultWithFallback,
-  buildCortexCompletionPayload, executeCortex } = require('../BackgroundCortexService');
-const { buildCortexInsightDeliveryCandidates } = require('../viventium/CortexInsightDeliveryService');
+const {
+  persistCompletedCortexGraphInsight,
+  failClosedCortexResult,
+  finalizeCortexResultDelivery,
+  isDeliverableCortexResult,
+  collectDeliverableCortexInsights,
+  shouldRetryCortexResultWithFallback,
+  buildCortexCompletionPayload,
+  executeCortex,
+} = require('../BackgroundCortexService');
+const {
+  buildCortexInsightDeliveryCandidates,
+} = require('../viventium/CortexInsightDeliveryService');
 const exactOutboxReceipt = (batch) => ({
   outboxKeys: buildCortexInsightDeliveryCandidates(batch).map((item) => item.deliveryKey),
 });
@@ -281,5 +290,4 @@ describe('saved completed Cortex acceptance', () => {
     expect(collectDeliverableCortexInsights([result])).toEqual([]);
     expect(JSON.stringify(result)).not.toContain('Must not survive the persistence failure.');
   });
-
 });

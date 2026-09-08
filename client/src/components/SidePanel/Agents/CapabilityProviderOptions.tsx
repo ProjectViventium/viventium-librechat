@@ -114,7 +114,7 @@ export default function CapabilityProviderOptions({
   const effortControl = (modelCapability?.effortChoices?.length ?? 0) > 0 && (
     <div className="model-panel-section mt-3">
       <label
-        className="text-text-primary model-panel-label mb-1 block font-medium"
+        className="model-panel-label mb-1 block font-medium text-text-primary"
         htmlFor={`${parameterField}-effort`}
       >
         {localize('com_ui_glasshive_effort')}
@@ -127,7 +127,7 @@ export default function CapabilityProviderOptions({
             {...field}
             value={field.value ?? modelCapability?.recommendedEffort ?? ''}
             id={`${parameterField}-effort`}
-            className="border-border-light bg-surface-primary h-10 w-full rounded-lg border px-3"
+            className="h-10 w-full rounded-lg border border-border-light bg-surface-primary px-3"
           >
             {modelCapability?.effortChoices?.map((effort) => (
               <option key={effort} value={effort}>
@@ -148,11 +148,11 @@ export default function CapabilityProviderOptions({
   }
 
   return (
-    <div className="border-border-light bg-surface-primary mb-4 rounded-lg border p-4 text-left">
+    <div className="mb-4 rounded-lg border border-border-light bg-surface-primary p-4 text-left">
       <div className="mb-3 flex items-center justify-between gap-3">
         <div>
           <div className="font-medium">{localize('com_ui_glasshive_harness')}</div>
-          <div className="text-text-secondary text-xs">
+          <div className="text-xs text-text-secondary">
             {localize('com_ui_glasshive_harness_description')}
           </div>
         </div>
@@ -168,7 +168,7 @@ export default function CapabilityProviderOptions({
           {readinessLabel}
         </span>
       </div>
-      <div className="text-text-secondary mb-3 flex items-start justify-between gap-3 text-xs">
+      <div className="mb-3 flex items-start justify-between gap-3 text-xs text-text-secondary">
         <span>{readinessDetail}</span>
         <button
           type="button"
@@ -193,7 +193,7 @@ export default function CapabilityProviderOptions({
           <select
             {...field}
             id={`${parameterField}-glasshive-workspace-mode`}
-            className="border-border-light bg-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
+            className="mb-3 h-10 w-full rounded-lg border border-border-light bg-surface-primary px-3"
           >
             <option value="life">{localize('com_ui_glasshive_viventium_life')}</option>
             <option value="custom">{localize('com_ui_glasshive_custom_server_path')}</option>
@@ -213,11 +213,11 @@ export default function CapabilityProviderOptions({
                 aria-label={localize('com_ui_glasshive_custom_working_folder')}
                 placeholder={localize('com_ui_glasshive_path_placeholder')}
                 className={cn(
-                  'border-border-light bg-surface-primary h-10 w-full rounded-lg border px-3',
+                  'h-10 w-full rounded-lg border border-border-light bg-surface-primary px-3',
                   error && 'border-red-500',
                 )}
               />
-              <p className="text-text-secondary mt-1 text-xs">
+              <p className="mt-1 text-xs text-text-secondary">
                 {localize('com_ui_glasshive_path_description')}
               </p>
             </div>
@@ -238,7 +238,7 @@ export default function CapabilityProviderOptions({
           <select
             {...field}
             id={`${parameterField}-glasshive-access`}
-            className="border-border-light bg-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
+            className="mb-3 h-10 w-full rounded-lg border border-border-light bg-surface-primary px-3"
           >
             {providerCapability?.allow_full_access === true && (
               <option value="full">{localize('com_ui_glasshive_full_access')}</option>
@@ -247,14 +247,14 @@ export default function CapabilityProviderOptions({
           </select>
         )}
       />
-      <p className="text-text-secondary -mt-2 text-xs">
+      <p className="-mt-2 text-xs text-text-secondary">
         {glassHiveOptions?.access === 'full'
           ? localize('com_ui_glasshive_full_access_warning')
           : localize('com_ui_glasshive_workspace_access_description')}
       </p>
       {(providerCapability?.worker_native_tools === true ||
         providerCapability?.native_tools === true) && (
-        <p className="text-text-secondary mt-3 text-xs">
+        <p className="mt-3 text-xs text-text-secondary">
           {localize('com_ui_glasshive_native_tools_description')}
         </p>
       )}

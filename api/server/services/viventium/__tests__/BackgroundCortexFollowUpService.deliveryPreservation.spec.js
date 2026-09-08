@@ -1,7 +1,11 @@
 const { logger } = require('@librechat/data-schemas');
-const { createCortexFollowUpMessage, settleSuppressedCortexInsightDeliveries,
-  buildFollowUpDecisionRecord, persistCortexFollowUpMessageWithLedger,
-  resolveCortexInsightDropReason } = require('../BackgroundCortexFollowUpService');
+const {
+  createCortexFollowUpMessage,
+  settleSuppressedCortexInsightDeliveries,
+  buildFollowUpDecisionRecord,
+  persistCortexFollowUpMessageWithLedger,
+  resolveCortexInsightDropReason,
+} = require('../BackgroundCortexFollowUpService');
 function pinnedFeelingSnapshot(overrides = {}) {
   return {
     available: true,
@@ -471,28 +475,46 @@ describe('saved exact delivery settlement', () => {
       }),
     ).toBe('generation_failed_without_fallback');
   });
-
 });
 
 test('promoting a new completed result invalidates an older delivery acknowledgement', async () => {
   const db = require('~/models');
   const { persistPreparedCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
   const get = jest.spyOn(db, 'getMessage').mockResolvedValue({
-    messageId: 'parent-promoted', parentMessageId: 'user-parent', conversationId: 'conversation-promoted',
+    messageId: 'parent-promoted',
+    parentMessageId: 'user-parent',
+    conversationId: 'conversation-promoted',
     content: [{ type: 'cortex_insight', insight: 'Completed insight.' }],
     metadata: { viventium: { messageRevision: 2, deliveryAcknowledgement: { revision: 5 } } },
   });
   const update = jest.spyOn(db, 'updateMessage').mockResolvedValue({});
   try {
-    const message = await persistPreparedCortexFollowUpMessage({
-      req: { user: { id: 'owner-promoted' } }, conversationId: 'conversation-promoted',
-      parentMessageId: 'parent-promoted', insightsData: { cortexCount: 1 },
-    }, { text: 'Completed visible result.', shouldForceVisibleFollowUp: true,
-      finalContinuationContext: { hasMovedOn: false }, conversationMessages: [] });
+    const message = await persistPreparedCortexFollowUpMessage(
+      {
+        req: { user: { id: 'owner-promoted' } },
+        conversationId: 'conversation-promoted',
+        parentMessageId: 'parent-promoted',
+        insightsData: { cortexCount: 1 },
+      },
+      {
+        text: 'Completed visible result.',
+        shouldForceVisibleFollowUp: true,
+        finalContinuationContext: { hasMovedOn: false },
+        conversationMessages: [],
+      },
+    );
     expect(message.metadata.viventium.messageRevision).toBe(6);
     expect(message.metadata.viventium).not.toHaveProperty('deliveryAcknowledgement');
-    expect(update).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      messageId: 'parent-promoted', text: 'Completed visible result.',
-    }), expect.objectContaining({ operationKind: 'system' }));
-  } finally { get.mockRestore(); update.mockRestore(); }
+    expect(update).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        messageId: 'parent-promoted',
+        text: 'Completed visible result.',
+      }),
+      expect.objectContaining({ operationKind: 'system' }),
+    );
+  } finally {
+    get.mockRestore();
+    update.mockRestore();
+  }
 });

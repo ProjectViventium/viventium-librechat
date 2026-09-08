@@ -45,7 +45,10 @@ const denyRequest = async (req, res, errorMessage) => {
     await saveMessage(
       req,
       { ...userMessage, user: req.user.id },
-      { operationKind: 'system', context: `api/server/middleware/denyRequest.js - ${responseText}` },
+      {
+        operationKind: 'system',
+        context: `api/server/middleware/denyRequest.js - ${responseText}`,
+      },
     );
   }
 

@@ -1,12 +1,12 @@
 const mongoose = require('mongoose');
 const { buildTree } = require('librechat-data-provider');
-const { MongoMemoryServer } = require('mongodb-memory-server');
+const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const { getMessages, bulkSaveMessages } = require('./Message');
 const { Message } = require('~/db/models');
 
 let mongod;
 beforeAll(async () => {
-  mongod = await MongoMemoryServer.create();
+  mongod = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
   const uri = mongod.getUri();
   await mongoose.connect(uri);
 });

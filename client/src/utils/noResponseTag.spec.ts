@@ -272,9 +272,16 @@ test('shared/imported conversation IDs use the actual message scope, not old dia
 /* === VIVENTIUM START === Worker results use the same additive projection as schedules. === */
 describe('late native result visibility', () => {
   const row = (id: string, user = false, children: TMessage[] = []): TMessage =>
-    mkMessage({ messageId: id, parentMessageId: 'anchor', text: id, isCreatedByUser: user, children });
+    mkMessage({
+      messageId: id,
+      parentMessageId: 'anchor',
+      text: id,
+      isCreatedByUser: user,
+      children,
+    });
   const event = (id: string, type: string, children: TMessage[] = []): TMessage => ({
-    ...row(id, false, children), metadata: { viventium: { type } },
+    ...row(id, false, children),
+    metadata: { viventium: { type } },
   });
 
   test('keeps the callback and useful result beside an overlapping human turn without rewriting parents', () => {
@@ -296,7 +303,9 @@ describe('late native result visibility', () => {
     const tree = [result, current, second];
     expect(getMessageBranchChoices(tree)).toEqual([result, current]);
     expect(selectVisibleMessageBranches(tree, current.messageId)).toEqual([
-      { ...result, children: [] }, current, second,
+      { ...result, children: [] },
+      current,
+      second,
     ]);
     expect(selectVisibleMessageBranches(tree, result.messageId)).toEqual([result, second]);
   });
@@ -306,8 +315,12 @@ describe('late native result visibility', () => {
     promoted.metadata = { viventium: { type: 'cortex_followup', replacedParentMessage: true } };
     const regenerated = row('regenerated-answer');
     expect(getMessageBranchChoices([promoted, regenerated])).toEqual([promoted, regenerated]);
-    expect(selectVisibleMessageBranches([promoted, regenerated], regenerated.messageId)).toEqual([regenerated]);
-    expect(selectVisibleMessageBranches([promoted, regenerated], promoted.messageId)).toEqual([promoted]);
+    expect(selectVisibleMessageBranches([promoted, regenerated], regenerated.messageId)).toEqual([
+      regenerated,
+    ]);
+    expect(selectVisibleMessageBranches([promoted, regenerated], promoted.messageId)).toEqual([
+      promoted,
+    ]);
   });
 
   test('does not expose a foreign result, user-authored type, unknown type or result inside an unselected human branch', () => {
@@ -317,8 +330,9 @@ describe('late native result visibility', () => {
     const unknown = event('unknown', 'other_type');
     const old = row('old', true, [event('hidden-result', 'cortex_followup')]);
     const current = row('current', true);
-    expect(selectVisibleMessageBranches([foreign, user, unknown, old, current], current.messageId))
-      .toEqual([current]);
+    expect(
+      selectVisibleMessageBranches([foreign, user, unknown, old, current], current.messageId),
+    ).toEqual([current]);
   });
 });
 /* === VIVENTIUM END === */

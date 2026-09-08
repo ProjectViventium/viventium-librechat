@@ -47,8 +47,12 @@ const {
 const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
-const { captureAcceptedInteractionInput, retainAcceptedInteractionInput,
-  acceptedInteractionSourceId, resolveCanonicalConversationId } = AgentController;
+const {
+  captureAcceptedInteractionInput,
+  retainAcceptedInteractionInput,
+  acceptedInteractionSourceId,
+  resolveCanonicalConversationId,
+} = AgentController;
 const TelegramInput = require('~/server/services/viventium/TelegramInputService');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { fileAccess } = require('~/server/middleware/accessResources/fileAccess');
@@ -984,48 +988,111 @@ router.post('/source-order', telegramAuth, async (req, res) => {
     let inputReceipt;
     if (req.body?.input) {
       const input = req.body.input;
-      if (!/^[a-f0-9]{64}$/.test(String(input.conversationGeneration || '')) ||
-          !/^[a-f0-9-]{36}$/.test(String(input.preparationId || '')) ||
-          typeof input.text !== 'string' || !input.preparation ||
-          Buffer.byteLength(JSON.stringify(input.preparation), 'utf8') > 64 * 1024) {
+      if (
+        !/^[a-f0-9]{64}$/.test(String(input.conversationGeneration || '')) ||
+        !/^[a-f0-9-]{36}$/.test(String(input.preparationId || '')) ||
+        typeof input.text !== 'string' ||
+        !input.preparation ||
+        Buffer.byteLength(JSON.stringify(input.preparation), 'utf8') > 64 * 1024
+      ) {
         return res.status(400).json({ error: 'invalid_source_input' });
       }
       const requestedConversationId = String(input.conversationId || 'new');
-      setTrustedInteractionContext(req, createTelegramInteractionContext({
-        conversation_id: requestedConversationId, conversation_generation: input.conversationGeneration,
-        source_event_id: sourceEventId, source_order_scope: sourceOrderScope, source_sequence: sourceSequence,
-      }));
-      let resolved = await resolveReusableConversationState({ conversationId: requestedConversationId,
-        userId: req.user.id, surface: 'telegram', maxIdleMs: TELEGRAM_CONVERSATION_IDLE_MAX_MS });
+      setTrustedInteractionContext(
+        req,
+        createTelegramInteractionContext({
+          conversation_id: requestedConversationId,
+          conversation_generation: input.conversationGeneration,
+          source_event_id: sourceEventId,
+          source_order_scope: sourceOrderScope,
+          source_sequence: sourceSequence,
+        }),
+      );
+      let resolved = await resolveReusableConversationState({
+        conversationId: requestedConversationId,
+        userId: req.user.id,
+        surface: 'telegram',
+        maxIdleMs: TELEGRAM_CONVERSATION_IDLE_MAX_MS,
+      });
       if (resolved.reason === 'missing') {
         const pending = await TelegramInput.resolvePendingConversation({
-          requestedConversationId, conversationGeneration: input.conversationGeneration,
-          libreChatUserId: req.user.id, telegramUserId: identity.telegramUserId,
-          telegramChatId: identity.telegramChatId, telegramMessageThreadId,
-          sourceOrderScope, sourceSequence,
+          requestedConversationId,
+          conversationGeneration: input.conversationGeneration,
+          libreChatUserId: req.user.id,
+          telegramUserId: identity.telegramUserId,
+          telegramChatId: identity.telegramChatId,
+          telegramMessageThreadId,
+          sourceOrderScope,
+          sourceSequence,
         });
-        if (pending) resolved = { ...resolved, conversationId: pending.conversationId, reason: 'pending_input' };
+        if (pending)
+          resolved = {
+            ...resolved,
+            conversationId: pending.conversationId,
+            reason: 'pending_input',
+          };
       }
-      const conversationId = resolveCanonicalConversationId(req, req.user.id, resolved.conversationId);
+      const conversationId = resolveCanonicalConversationId(
+        req,
+        req.user.id,
+        resolved.conversationId,
+      );
       bindCanonicalInteractionConversation(req, conversationId);
       const sourceMessageId = acceptedInteractionSourceId(req);
-      if (!await Message.exists({ user: req.user.id, messageId: sourceMessageId })) {
-        await saveMessage(req, { messageId: sourceMessageId, conversationId,
-          parentMessageId: resolved.parentMessageId || Constants.NO_PARENT,
-          text: input.text, sender: 'User', isCreatedByUser: true,
-          metadata: { viventium: { telegramInput: { sourceEventId, state: 'preparing',
-            preparation: input.preparation, originalParentMessageId: resolved.parentMessageId || Constants.NO_PARENT }, interactionContext: getTrustedInteractionContext(req) } },
-        }, { operationKind: 'system', context: 'Telegram input before preparation' });
+      if (!(await Message.exists({ user: req.user.id, messageId: sourceMessageId }))) {
+        await saveMessage(
+          req,
+          {
+            messageId: sourceMessageId,
+            conversationId,
+            parentMessageId: resolved.parentMessageId || Constants.NO_PARENT,
+            text: input.text,
+            sender: 'User',
+            isCreatedByUser: true,
+            metadata: {
+              viventium: {
+                telegramInput: {
+                  sourceEventId,
+                  state: 'preparing',
+                  preparation: input.preparation,
+                  originalParentMessageId: resolved.parentMessageId || Constants.NO_PARENT,
+                },
+                interactionContext: getTrustedInteractionContext(req),
+              },
+            },
+          },
+          { operationKind: 'system', context: 'Telegram input before preparation' },
+        );
       }
-      const record = await TelegramInput.register({ sourceEventId, sourceOrderScope, sourceSequence,
-        libreChatUserId: req.user.id, telegramUserId: identity.telegramUserId,
-        telegramChatId: identity.telegramChatId, telegramMessageThreadId,
-        conversationId, requestedConversationId, conversationGeneration: input.conversationGeneration,
-        sourceMessageId, mediaGroupId: String(input.preparation?.message?.media_group_id || '') }, input.preparationId);
-      const claimed = record.registrationId === input.preparationId && record.leaseUntil > Date.now();
-      inputReceipt = { sourceEventId, sourceMessageId, conversationId: record.conversationId,
-        conversationGeneration: record.conversationGeneration, state: record.state, claimed, retained: true,
-        ...(claimed ? { claimToken: record.claimToken, leaseUntil: record.leaseUntil } : {}) };
+      const record = await TelegramInput.register(
+        {
+          sourceEventId,
+          sourceOrderScope,
+          sourceSequence,
+          libreChatUserId: req.user.id,
+          telegramUserId: identity.telegramUserId,
+          telegramChatId: identity.telegramChatId,
+          telegramMessageThreadId,
+          conversationId,
+          requestedConversationId,
+          conversationGeneration: input.conversationGeneration,
+          sourceMessageId,
+          mediaGroupId: String(input.preparation?.message?.media_group_id || ''),
+        },
+        input.preparationId,
+      );
+      const claimed =
+        record.registrationId === input.preparationId && record.leaseUntil > Date.now();
+      inputReceipt = {
+        sourceEventId,
+        sourceMessageId,
+        conversationId: record.conversationId,
+        conversationGeneration: record.conversationGeneration,
+        state: record.state,
+        claimed,
+        retained: true,
+        ...(claimed ? { claimToken: record.claimToken, leaseUntil: record.leaseUntil } : {}),
+      };
     }
     return res.json({
       ...(inputReceipt ? { input: inputReceipt } : {}),
@@ -1052,14 +1119,25 @@ router.post('/inputs/claim', telegramBridgeAuth, async (req, res, next) => {
     const inputs = (await Promise.all(records.map(TelegramInput.inputEnvelope))).filter(Boolean);
     res.setHeader('Cache-Control', 'no-store, private');
     return res.json({ inputs });
-  } catch (error) { next(error); }
+  } catch (error) {
+    next(error);
+  }
 });
 router.post('/inputs/status', telegramAuth, async (req, res, next) => {
-  if (!['renew', 'failed', 'cancelled'].includes(req.body?.state)) return res.status(400).json({ error: 'invalid_input_status' });
+  if (!['renew', 'failed', 'cancelled'].includes(req.body?.state))
+    return res.status(400).json({ error: 'invalid_input_status' });
   try {
-    const input = await TelegramInput.status(req.user.id, req.body.inputClaim, req.body.state, req.body.failureCode || '', req.body.retryable === true);
+    const input = await TelegramInput.status(
+      req.user.id,
+      req.body.inputClaim,
+      req.body.state,
+      req.body.failureCode || '',
+      req.body.retryable === true,
+    );
     return res.json({ input });
-  } catch (error) { next(error); }
+  } catch (error) {
+    next(error);
+  }
 });
 
 router.post(
@@ -1068,7 +1146,9 @@ router.post(
   configMiddleware,
   async (req, _res, next) => {
     let incoming = req.body ?? {};
-    let retainedInput = incoming.inputClaim ? await TelegramInput.read(req.user.id, incoming.inputClaim) : null;
+    let retainedInput = incoming.inputClaim
+      ? await TelegramInput.read(req.user.id, incoming.inputClaim)
+      : null;
     let preparedInput = null;
     if (req.path === '/inputs/continue') {
       if (!retainedInput || !['ready', 'admitted', 'completed'].includes(retainedInput.state)) {
@@ -1077,23 +1157,48 @@ router.post(
       const envelope = await TelegramInput.inputEnvelope(retainedInput);
       if (retainedInput.state === 'admitted' || retainedInput.state === 'completed') {
         const job = await GenerationJobManager.getJob(retainedInput.streamId);
-        if (!job || job.metadata?.userId !== req.user.id) return _res.status(503).json({ code: 'source_input_response_unavailable', retryable: true });
-        return _res.json({ ...envelope, prepared: await TelegramInput.readPrepared(retainedInput), streamId: retainedInput.streamId, conversationId: retainedInput.conversationId,
-          ...attachLogicalTurnMetadata({}, job.metadata.interactionContext), status: 'duplicate', duplicate: true,
-          inputPresentation: job.metadata.interactionContext?.ready_input_continuation ? {
-            sourceEventId: retainedInput.sourceEventId, sourceMessageId: retainedInput.sourceMessageId,
-            sourceSequence: retainedInput.sourceSequence, sourceOrderScope: retainedInput.sourceOrderScope,
-            presentationSourceSequence: job.metadata.interactionContext.ready_input_continuation.presentation_source_sequence,
-          } : undefined });
+        if (!job || job.metadata?.userId !== req.user.id)
+          return _res
+            .status(503)
+            .json({ code: 'source_input_response_unavailable', retryable: true });
+        return _res.json({
+          ...envelope,
+          prepared: await TelegramInput.readPrepared(retainedInput),
+          streamId: retainedInput.streamId,
+          conversationId: retainedInput.conversationId,
+          ...attachLogicalTurnMetadata({}, job.metadata.interactionContext),
+          status: 'duplicate',
+          duplicate: true,
+          inputPresentation: job.metadata.interactionContext?.ready_input_continuation
+            ? {
+                sourceEventId: retainedInput.sourceEventId,
+                sourceMessageId: retainedInput.sourceMessageId,
+                sourceSequence: retainedInput.sourceSequence,
+                sourceOrderScope: retainedInput.sourceOrderScope,
+                presentationSourceSequence:
+                  job.metadata.interactionContext.ready_input_continuation
+                    .presentation_source_sequence,
+              }
+            : undefined,
+        });
       }
       preparedInput = await TelegramInput.readPrepared(retainedInput);
-      if (!preparedInput) return _res.status(503).json({ code: 'source_input_preparation_unavailable', retryable: true });
-      incoming = { ...incoming, text: preparedInput.text,
-        conversationId: retainedInput.requestedConversationId, conversationGeneration: retainedInput.conversationGeneration,
-        telegramUserId: retainedInput.telegramUserId, telegramChatId: retainedInput.telegramChatId,
-        telegramMessageThreadId: retainedInput.telegramMessageThreadId, telegramMessageId: String(retainedInput.sourceSequence),
+      if (!preparedInput)
+        return _res
+          .status(503)
+          .json({ code: 'source_input_preparation_unavailable', retryable: true });
+      incoming = {
+        ...incoming,
+        text: preparedInput.text,
+        conversationId: retainedInput.requestedConversationId,
+        conversationGeneration: retainedInput.conversationGeneration,
+        telegramUserId: retainedInput.telegramUserId,
+        telegramChatId: retainedInput.telegramChatId,
+        telegramMessageThreadId: retainedInput.telegramMessageThreadId,
+        telegramMessageId: String(retainedInput.sourceSequence),
         clientTimestamp: Number.isFinite(Number(envelope?.preparation?.message?.date))
-          ? new Date(Number(envelope.preparation.message.date) * 1000).toISOString() : undefined,
+          ? new Date(Number(envelope.preparation.message.date) * 1000).toISOString()
+          : undefined,
       };
       req.body = incoming;
     }
@@ -1208,27 +1313,36 @@ router.post(
       },
       { commit_authority: 'external_adapter' },
     );
-    if (retainedInput && (retainedInput.sourceEventId !== sourceEventId || retainedInput.sourceOrderScope !== sourceOrderScope ||
-        retainedInput.sourceSequence !== sourceSequence || retainedInput.conversationGeneration !== conversationGeneration ||
-        retainedInput.requestedConversationId !== requestedConversationId)) {
+    if (
+      retainedInput &&
+      (retainedInput.sourceEventId !== sourceEventId ||
+        retainedInput.sourceOrderScope !== sourceOrderScope ||
+        retainedInput.sourceSequence !== sourceSequence ||
+        retainedInput.conversationGeneration !== conversationGeneration ||
+        retainedInput.requestedConversationId !== requestedConversationId)
+    ) {
       return _res.status(409).json({ code: 'source_input_identity_conflict', retryable: false });
     }
-    if (!retainedInput) await retainAcceptedInteractionInput(req, {
-      conversationId: requestedConversationId || 'new', text,
-    });
+    if (!retainedInput)
+      await retainAcceptedInteractionInput(req, {
+        conversationId: requestedConversationId || 'new',
+        text,
+      });
 
     /* === VIVENTIUM START ===
      * Feature: Telegram ingress de-duplication (defense-in-depth).
      * Duplicate replay requests return 200/no-op so the bot does not emit duplicate turns.
      * === VIVENTIUM END === */
-    const ingressReservation = retainedInput ? { duplicate: false } : await reserveTelegramIngress({
-      telegramUserId,
-      telegramChatId,
-      telegramMessageId,
-      telegramUpdateId,
-      conversationId: requestedConversationId,
-      traceId,
-    });
+    const ingressReservation = retainedInput
+      ? { duplicate: false }
+      : await reserveTelegramIngress({
+          telegramUserId,
+          telegramChatId,
+          telegramMessageId,
+          telegramUpdateId,
+          conversationId: requestedConversationId,
+          traceId,
+        });
     if (ingressReservation.duplicate) {
       logger.info(
         '[VIVENTIUM][telegram/chat] Duplicate ingress suppressed key=%s chatId=%s userId=%s',
@@ -1287,12 +1401,14 @@ router.post(
     let conversationId = retainedInput?.conversationId || conversationState.conversationId;
     let parentMessageId = conversationState.parentMessageId;
     parentMessageId = normalizeGatewayParentMessageId({ conversationId, parentMessageId });
-    const acceptedContext = retainedInput ? bindCanonicalInteractionConversation(req, conversationId) : await captureAcceptedInteractionInput(req, {
-      conversationId,
-      streamId,
-      text,
-      parentMessageId,
-    });
+    const acceptedContext = retainedInput
+      ? bindCanonicalInteractionConversation(req, conversationId)
+      : await captureAcceptedInteractionInput(req, {
+          conversationId,
+          streamId,
+          text,
+          parentMessageId,
+        });
     conversationId = acceptedContext?.conversation_id || conversationState.conversationId;
     logTelegramTiming(
       traceId,
@@ -1353,9 +1469,14 @@ router.post(
     const { images: telegramImageFiles, nonImages: telegramNonImageFiles } =
       splitTelegramFiles(telegramFiles);
     const imageFormatStartTs = performance.now();
-    const formattedImages = preparedInput ? preparedInput.imageUrls.map((url) => ({ type: ContentTypes.IMAGE_URL, image_url: { url, detail: 'auto' } })) : TELEGRAM_FILE_UPLOAD_ENABLED
-      ? formatTelegramImagesForVision(telegramImageFiles)
-      : [];
+    const formattedImages = preparedInput
+      ? preparedInput.imageUrls.map((url) => ({
+          type: ContentTypes.IMAGE_URL,
+          image_url: { url, detail: 'auto' },
+        }))
+      : TELEGRAM_FILE_UPLOAD_ENABLED
+        ? formatTelegramImagesForVision(telegramImageFiles)
+        : [];
     logTelegramTiming(
       traceId,
       'format_images',
@@ -1367,9 +1488,11 @@ router.post(
     const uploadStartTs = performance.now();
     let uploadedFiles = [];
     try {
-      uploadedFiles = preparedInput ? await getFiles({ user: req.user.id, file_id: { $in: preparedInput.fileIds } }) : TELEGRAM_FILE_UPLOAD_ENABLED
-        ? await uploadTelegramFiles({ req, files: telegramNonImageFiles, agentId })
-        : [];
+      uploadedFiles = preparedInput
+        ? await getFiles({ user: req.user.id, file_id: { $in: preparedInput.fileIds } })
+        : TELEGRAM_FILE_UPLOAD_ENABLED
+          ? await uploadTelegramFiles({ req, files: telegramNonImageFiles, agentId })
+          : [];
       logTelegramTiming(traceId, 'upload_files', uploadStartTs, `count=${uploadedFiles.length}`);
     } catch (err) {
       const reason =
@@ -1380,7 +1503,12 @@ router.post(
       logTelegramTiming(traceId, 'upload_files', uploadStartTs, 'failed=1');
       if (retainedInput && err?.code === 'unsupported_file_type' && err?.retryable === false) {
         await TelegramInput.status(req.user.id, incoming.inputClaim, 'failed', err.code);
-        return _res.status(415).json({ attachmentProcessingError: true, code: err.code, retryable: false, error: reason });
+        return _res.status(415).json({
+          attachmentProcessingError: true,
+          code: err.code,
+          retryable: false,
+          error: reason,
+        });
       }
       return _res.status(422).json({ attachmentProcessingError: true, error: reason });
     }
@@ -1390,16 +1518,33 @@ router.post(
     const allFormattedImages = [...formattedImages, ...extractedDocumentImages];
     const hasImages = allFormattedImages.length > 0;
     if (retainedInput) {
-      retainedInput = await TelegramInput.ready(req.user.id, incoming.inputClaim, {
-        text, fileIds: uploadedFiles.map((file) => file.file_id),
-        imageUrls: allFormattedImages.map((image) => image.image_url.url),
-      }, Array.isArray(incoming.inputClaims) ? incoming.inputClaims : []);
-      const observation = await GenerationJobManager.observeSourceOrder({ source_order_scope: sourceOrderScope, source_sequence: sourceSequence });
+      retainedInput = await TelegramInput.ready(
+        req.user.id,
+        incoming.inputClaim,
+        {
+          text,
+          fileIds: uploadedFiles.map((file) => file.file_id),
+          imageUrls: allFormattedImages.map((image) => image.image_url.url),
+        },
+        Array.isArray(incoming.inputClaims) ? incoming.inputClaims : [],
+      );
+      const observation = await GenerationJobManager.observeSourceOrder({
+        source_order_scope: sourceOrderScope,
+        source_sequence: sourceSequence,
+      });
       if (observation.stale || req.path === '/inputs/continue') {
-        bindReadyInputContinuation(req, retainedInput.sourceMessageId, observation.latest_source_sequence);
+        bindReadyInputContinuation(
+          req,
+          retainedInput.sourceMessageId,
+          observation.latest_source_sequence,
+        );
       }
       req._viventiumTelegramInput = retainedInput;
-      req._viventiumTelegramPrepared = { text, fileIds: uploadedFiles.map((file) => file.file_id), imageUrls: allFormattedImages.map((image) => image.image_url.url) };
+      req._viventiumTelegramPrepared = {
+        text,
+        fileIds: uploadedFiles.map((file) => file.file_id),
+        imageUrls: allFormattedImages.map((image) => image.image_url.url),
+      };
     }
     const channelEnvelope = normalizeChannelEnvelope({
       channel: 'telegram',
@@ -1430,13 +1575,21 @@ router.post(
     if (retainedInput) {
       req.body.overrideUserMessageId = `${retainedInput.sourceMessageId}${Constants.COMMON_DIVIDER}1`;
       const sourceFilter = TelegramInput.messageFilter(retainedInput);
-      await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(sourceFilter,
-        () => Message.updateOne(sourceFilter, { $set: { parentMessageId: parentMessageId || Constants.NO_PARENT } }));
+      await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+        sourceFilter,
+        () =>
+          Message.updateOne(sourceFilter, {
+            $set: { parentMessageId: parentMessageId || Constants.NO_PARENT },
+          }),
+      );
       const enriched = bindInteractionSourceSegments(req, text, uploadedFiles, {
-        messageId: retainedInput.sourceMessageId, parentMessageId: parentMessageId || Constants.NO_PARENT, persisted: true,
+        messageId: retainedInput.sourceMessageId,
+        parentMessageId: parentMessageId || Constants.NO_PARENT,
+        persisted: true,
       });
       // Preparation never enters Main's initializing-input wait. Ready input is now persisted.
-      if (!enriched.ready_input_continuation) await GenerationJobManager.retainLogicalTurnInput(req.user.id, enriched);
+      if (!enriched.ready_input_continuation)
+        await GenerationJobManager.retainLogicalTurnInput(req.user.id, enriched);
     }
     req.body.telegramUserId = telegramUserId;
     req.body.telegramChatId = telegramChatId;
@@ -1512,27 +1665,50 @@ router.post(
   async (req, res, next) => {
     req._viventiumBeforeGenerationReceipt = async (payload) => {
       if (!req._viventiumTelegramInput) return;
-      const claim = { sourceEventId: req._viventiumTelegramInput.sourceEventId, claimToken: req._viventiumTelegramInput.claimToken };
+      const claim = {
+        sourceEventId: req._viventiumTelegramInput.sourceEventId,
+        claimToken: req._viventiumTelegramInput.claimToken,
+      };
       if (payload?.pending === true) return TelegramInput.defer(req.user.id, claim);
       if (!payload?.streamId) return;
       await TelegramInput.bindStream(req.user.id, claim, payload.streamId);
-      await Message.updateOne(TelegramInput.messageFilter(req._viventiumTelegramInput),
-        { $set: { 'metadata.viventium.telegramInput.state': 'admitted' } });
+      await Message.updateOne(TelegramInput.messageFilter(req._viventiumTelegramInput), {
+        $set: { 'metadata.viventium.telegramInput.state': 'admitted' },
+      });
     };
     const originalJson = res.json.bind(res);
     res.json = (payload) => {
       const context = getTrustedInteractionContext(req);
       const record = req._viventiumTelegramInput;
-      const withLogicalTurn = attachLogicalTurnMetadata({ ...payload,
-        ...(record ? { inputClaim: { sourceEventId: record.sourceEventId, claimToken: record.claimToken }, prepared: req._viventiumTelegramPrepared,
-          sourceEventId: record.sourceEventId, sourceMessageId: record.sourceMessageId, sourceSequence: record.sourceSequence,
-          sourceOrderScope: record.sourceOrderScope, conversationGeneration: record.conversationGeneration } : {}),
-        ...(record && context?.ready_input_continuation ? { inputPresentation: {
-          sourceEventId: record.sourceEventId, sourceMessageId: record.sourceMessageId, sourceSequence: record.sourceSequence,
-          sourceOrderScope: record.sourceOrderScope,
-          presentationSourceSequence: context.ready_input_continuation.presentation_source_sequence,
-        } } : {}),
-      }, context);
+      const withLogicalTurn = attachLogicalTurnMetadata(
+        {
+          ...payload,
+          ...(record
+            ? {
+                inputClaim: { sourceEventId: record.sourceEventId, claimToken: record.claimToken },
+                prepared: req._viventiumTelegramPrepared,
+                sourceEventId: record.sourceEventId,
+                sourceMessageId: record.sourceMessageId,
+                sourceSequence: record.sourceSequence,
+                sourceOrderScope: record.sourceOrderScope,
+                conversationGeneration: record.conversationGeneration,
+              }
+            : {}),
+          ...(record && context?.ready_input_continuation
+            ? {
+                inputPresentation: {
+                  sourceEventId: record.sourceEventId,
+                  sourceMessageId: record.sourceMessageId,
+                  sourceSequence: record.sourceSequence,
+                  sourceOrderScope: record.sourceOrderScope,
+                  presentationSourceSequence:
+                    context.ready_input_continuation.presentation_source_sequence,
+                },
+              }
+            : {}),
+        },
+        context,
+      );
       if (
         withLogicalTurn &&
         typeof withLogicalTurn === 'object' &&

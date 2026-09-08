@@ -576,11 +576,12 @@ async function presentRecoveredCortexSurface({
           : 'cortex_telegram_presentation_stream_unavailable';
       throw error;
     }
-    if (surface === 'telegram' && (
-      !interactionContext?.logicalTurnId ||
-      !Number.isSafeInteger(interactionContext?.revision) ||
-      interactionContext.revision < 1
-    )) {
+    if (
+      surface === 'telegram' &&
+      (!interactionContext?.logicalTurnId ||
+        !Number.isSafeInteger(interactionContext?.revision) ||
+        interactionContext.revision < 1)
+    ) {
       const error = new Error('Cortex Telegram acknowledgement identity is unavailable');
       error.code = 'cortex_telegram_acknowledgement_identity_unavailable';
       throw error;
@@ -765,22 +766,27 @@ async function bindRecoveredCortexStreamPresentation({ recoveryContext, presenta
   }
   const job = await GenerationJobManager.getJob(streamId);
   const interactionContext = job?.metadata?.interactionContext;
-  if (presentationFence.surface === 'telegram' && (
-    interactionContext?.surface !== 'telegram' ||
-    !String(interactionContext?.logical_turn_id || '').trim() ||
-    !Number.isSafeInteger(interactionContext?.revision) ||
-    interactionContext.revision < 1
-  )) {
+  if (
+    presentationFence.surface === 'telegram' &&
+    (interactionContext?.surface !== 'telegram' ||
+      !String(interactionContext?.logical_turn_id || '').trim() ||
+      !Number.isSafeInteger(interactionContext?.revision) ||
+      interactionContext.revision < 1)
+  ) {
     const error = new Error('Cortex recovery logical-turn binding is unavailable');
     error.code = 'cortex_recovery_logical_turn_binding_unavailable';
     throw error;
   }
   return {
     ...binding,
-    ...(interactionContext ? { interactionContext: {
-      logicalTurnId: String(interactionContext.logical_turn_id || '').trim(),
-      revision: interactionContext.revision,
-    } } : {}),
+    ...(interactionContext
+      ? {
+          interactionContext: {
+            logicalTurnId: String(interactionContext.logical_turn_id || '').trim(),
+            revision: interactionContext.revision,
+          },
+        }
+      : {}),
   };
 }
 
@@ -1389,8 +1395,10 @@ async function recoverPendingCortexInsightDeliveries({
   return summary;
 }
 
-async function recoverStaleCortexMessages({ now = new Date(),
-  recoverInsightDeliveries = recoverPendingCortexInsightDeliveries } = {}) {
+async function recoverStaleCortexMessages({
+  now = new Date(),
+  recoverInsightDeliveries = recoverPendingCortexInsightDeliveries,
+} = {}) {
   /* === VIVENTIUM START === Same recovery pass; native GET never starts or repeats a turn. === */
   await require('./nativeResponseService').recoverNativeResponses();
   const { timeoutMs, limit, cortexExecutionTimeoutMs, graceMs } = getStaleCortexRecoveryConfig();
@@ -1430,8 +1438,11 @@ async function recoverStaleCortexMessages({ now = new Date(),
     }
 
     const result = await Message.updateOne(
-      { _id: message._id, updatedAt: message.updatedAt,
-        'nativeResponse.status': { $nin: ['pending', 'prepared'] } },
+      {
+        _id: message._id,
+        updatedAt: message.updatedAt,
+        'nativeResponse.status': { $nin: ['pending', 'prepared'] },
+      },
       { $set: update },
     );
     if (result?.modifiedCount > 0) {
@@ -1469,8 +1480,10 @@ async function recoverStaleCortexMessages({ now = new Date(),
 }
 
 module.exports = {
-  recoverPendingCortexInsightDeliveries, createRecoveredCortexFollowUp,
-  replayCompletedCortexMessageFallbacks, presentRecoveredCortexSurface,
+  recoverPendingCortexInsightDeliveries,
+  createRecoveredCortexFollowUp,
+  replayCompletedCortexMessageFallbacks,
+  presentRecoveredCortexSurface,
   bindRecoveredCortexStreamPresentation,
   ACTIVE_CORTEX_STATUSES,
   getConfiguredCortexExecutionTimeoutMs,

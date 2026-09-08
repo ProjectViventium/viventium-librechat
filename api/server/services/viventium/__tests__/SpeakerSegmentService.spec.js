@@ -699,7 +699,10 @@ describe('SpeakerSegmentService', () => {
     });
     try {
       await expect(
-        projectSpeakerSegmentRevisionsToMessages({ callSessionId: 'call-race', segments: [revised] }),
+        projectSpeakerSegmentRevisionsToMessages({
+          callSessionId: 'call-race',
+          segments: [revised],
+        }),
       ).resolves.toEqual({ matched: 1, updated: 1 });
       expect(row.metadata.viventium.speakerSegments).toEqual([revised, concurrent]);
     } finally {

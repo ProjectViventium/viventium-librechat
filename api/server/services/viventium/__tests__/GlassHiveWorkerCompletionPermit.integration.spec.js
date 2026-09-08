@@ -17,12 +17,12 @@ const {
 } = require('~/db/models');
 const { saveMessage } = require('~/models');
 
-const mockRecordGlassHiveSurfaceDeliveryOutcome = jest.fn().mockResolvedValue(null);
+const mockReconcileGlassHiveSurfaceDeliveryOutcome = jest.fn().mockResolvedValue({ state: 'sent' });
 const mockRecordVoiceOrchestrationTrace = jest.fn().mockResolvedValue(null);
 
 jest.mock('../GlassHiveCallbackBindingService', () => ({
-  recordGlassHiveSurfaceDeliveryOutcome: (...args) =>
-    mockRecordGlassHiveSurfaceDeliveryOutcome(...args),
+  reconcileGlassHiveSurfaceDeliveryOutcome: (...args) =>
+    mockReconcileGlassHiveSurfaceDeliveryOutcome(...args),
 }));
 
 jest.mock('../VoiceOrchestrationTraceService', () => ({
@@ -66,7 +66,7 @@ describe('GlassHive grouped Voice completion dispatch permit', () => {
   }, 30000);
 
   afterEach(async () => {
-    mockRecordGlassHiveSurfaceDeliveryOutcome.mockClear();
+    mockReconcileGlassHiveSurfaceDeliveryOutcome.mockClear();
     mockRecordVoiceOrchestrationTrace.mockClear();
     await mongoose.connection.dropDatabase();
     await GlassHiveTerminalCallbackResult.syncIndexes();
@@ -276,9 +276,8 @@ describe('GlassHive grouped Voice completion dispatch permit', () => {
       expect(result.effectLeaseExpiresAt).toBeUndefined();
     }
     expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledTimes(4);
-    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: representative.originRef,
-      state: 'sent',
     });
   }, 15000);
 

@@ -40,12 +40,22 @@ export default function useContentHandler({ setMessages, getMessages }: TUseCont
       const _messages = getMessages();
       if (data.preview === true) {
         const current = _messages?.[_messages.length - 1];
-        if (!current || current.isCreatedByUser || current.messageId !== messageId ||
-            current.conversationId !== conversationId) return;
+        if (
+          !current ||
+          current.isCreatedByUser ||
+          current.messageId !== messageId ||
+          current.conversationId !== conversationId
+        )
+          return;
         const preview = typeof data.text === 'string' ? data.text : '';
         // Reuse the current message, not this handler's independent indexed-content cache.
-        setMessages((_messages ?? []).map((message) => message.messageId === messageId
-          ? { ...message, __viventiumAssistantPreview: preview } : message));
+        setMessages(
+          (_messages ?? []).map((message) =>
+            message.messageId === messageId
+              ? { ...message, __viventiumAssistantPreview: preview }
+              : message,
+          ),
+        );
         return;
       }
       const messages =

@@ -6,11 +6,11 @@ import ContentParts from '../ContentParts';
 
 jest.mock('../Part', () => ({
   __esModule: true,
-  default: ({ part, isSubmitting, harnessActivityGrouped }: any) => {
-    const React = require('react');
-    const { ContentTypes } = require('librechat-data-provider');
-    const HarnessActivity = require('../HarnessActivity').default;
-    const { MessageContext } = require('~/Providers');
+  default: function MockPart({ part, isSubmitting, harnessActivityGrouped }: any) {
+    const React = jest.requireActual('react');
+    const { ContentTypes } = jest.requireActual('librechat-data-provider');
+    const HarnessActivity = jest.requireActual('../HarnessActivity').default;
+    const { MessageContext } = jest.requireActual('~/Providers');
     const identity = React.useContext(MessageContext);
     return (
       <div data-part-id={identity?.viventiumPartId} data-agent-id={identity?.viventiumAgentId}>
@@ -65,10 +65,10 @@ describe('message harness activity disclosure', () => {
       } as TMessageContentParts,
     ];
     const { container, rerender, unmount } = render(message(content, true));
-    fireEvent.click(screen.getByText('Harness activity'));
+    fireEvent.click(screen.getByText('Activity'));
     rerender(message([...content, activity('Completed')], false));
 
-    expect(screen.getAllByText('Harness activity')).toHaveLength(1);
+    expect(screen.getAllByText('Activity')).toHaveLength(1);
     expect(container.querySelector('details')).toHaveAttribute('open');
     expect(screen.getByText('Useful answer')).toBeVisible();
     expect(screen.getByText('Started')).toBeVisible();
@@ -85,7 +85,7 @@ describe('message harness activity disclosure', () => {
 
     unmount();
     const restored = render(message([...content, activity('Completed')]));
-    expect(screen.getAllByText('Harness activity')).toHaveLength(1);
+    expect(screen.getAllByText('Activity')).toHaveLength(1);
     expect(restored.container.querySelector('details')).not.toHaveAttribute('open');
     expect(screen.getByText('Useful answer')).toBeVisible();
   });
@@ -100,7 +100,7 @@ describe('message harness activity disclosure', () => {
         activity('  ', 'agent-c', 1),
       ]),
     );
-    expect(screen.getAllByText('Harness activity')).toHaveLength(3);
+    expect(screen.getAllByText('Activity')).toHaveLength(3);
     const panels = Array.from(container.querySelectorAll('details'));
     expect(panels.find((panel) => panel.textContent?.includes('A started'))).toHaveTextContent(
       'A done',

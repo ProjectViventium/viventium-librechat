@@ -7,7 +7,9 @@ const {
 } = require('~/server/services/viventium/listenOnlyTranscript');
 
 function pendingTelegramInput(message) {
-  return ['preparing', 'ready', 'failed', 'cancelled'].includes(message?.metadata?.viventium?.telegramInput?.state);
+  return ['preparing', 'ready', 'failed', 'cancelled'].includes(
+    message?.metadata?.viventium?.telegramInput?.state,
+  );
 }
 
 function toTimestampMs(value) {

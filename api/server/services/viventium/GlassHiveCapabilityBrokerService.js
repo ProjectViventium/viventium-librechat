@@ -1,4 +1,8 @@
-const { backgroundWorkerResources, resolveBackgroundWorkerRoute, mainDelegationJsonSchema } = require('@librechat/api');
+const {
+  backgroundWorkerResources,
+  resolveBackgroundWorkerRoute,
+  mainDelegationJsonSchema,
+} = require('@librechat/api');
 /* === VIVENTIUM START ===
  * Feature: GlassHive capability broker service
  * Purpose:
@@ -441,9 +445,10 @@ async function buildCapabilityCatalog({ grant, signal, requestedServerNames, app
       memoryBinding?.definition.name === toolName
         ? memoryBinding.definition
         : HOST_TOOL_DEFINITIONS[toolName];
-    const baseDefinition = toolName === DELEGATION_TOOL_NAME && declaredDefinition
-      ? { ...declaredDefinition, inputSchema: mainDelegationJsonSchema(resources?.request_body) }
-      : declaredDefinition;
+    const baseDefinition =
+      toolName === DELEGATION_TOOL_NAME && declaredDefinition
+        ? { ...declaredDefinition, inputSchema: mainDelegationJsonSchema(resources?.request_body) }
+        : declaredDefinition;
     const definition =
       baseDefinition &&
       grant?.authority_kind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR &&
@@ -731,11 +736,10 @@ function safeDelegationDiagnosticCode(error, fallback) {
 }
 
 function glassHiveDelegationRetryable(result) {
-  return (
-    result?.retryable === true ||
-    result?.failure_retryable === true ||
-    result?.failureRetryable === true
-  );
+  for (const value of [result?.retryable, result?.failure_retryable, result?.failureRetryable]) {
+    if (typeof value === 'boolean') return value;
+  }
+  return [408, 429].includes(Number(result?.status)) || Number(result?.status) >= 500;
 }
 
 function glassHiveDelegationNeedsInput(result) {
@@ -897,13 +901,19 @@ async function invokeConversationDelegation({
     });
     const mcpManager = getMCPManager(catalog.user.id);
     if (requestBody.viventiumVoiceCallSessionId) {
-      if (requestBody.viventiumVoiceWorkAuthority?.callSessionId !== requestBody.viventiumVoiceCallSessionId) {
+      if (
+        requestBody.viventiumVoiceWorkAuthority?.callSessionId !==
+        requestBody.viventiumVoiceCallSessionId
+      ) {
         throw Object.assign(new Error('voice_work_authority_stale'), {
-          code: 'voice_work_authority_stale', status: 409, retryable: false,
+          code: 'voice_work_authority_stale',
+          status: 409,
+          retryable: false,
         });
       }
       await require('./VoiceWorkAuthorityService').assertVoiceWorkAuthority(
-        requestBody.viventiumVoiceWorkAuthority, catalog.user.id,
+        requestBody.viventiumVoiceWorkAuthority,
+        catalog.user.id,
       );
     }
     dispatchStage = 'mcp_transport';
@@ -980,8 +990,7 @@ async function invokeConversationDelegation({
         status: 'blocked',
         reason: safeDelegationDiagnosticCode(error, 'glasshive_delegation_rejected'),
         tool: hostTool.toolName,
-        retryable: error?.retryable === true || error?.failure_retryable === true ||
-          [408, 429].includes(Number(error?.status)) || Number(error?.status) >= 500,
+        retryable: glassHiveDelegationRetryable(error),
         needsInput: error?.needsInput === true,
       };
     }
@@ -1116,12 +1125,14 @@ async function invokeConversationOrchestrationTool({
         ownerId: catalog.user.id,
         ...input,
         operationId: stableInvocationId,
-        ...(hostTool.resources.request_body?.viventiumVoiceCallSessionId ? {
-          voiceAuthorityContext: {
-            callSessionId: hostTool.resources.request_body.viventiumVoiceCallSessionId,
-            binding: hostTool.resources.request_body.viventiumVoiceWorkAuthority,
-          },
-        } : {}),
+        ...(hostTool.resources.request_body?.viventiumVoiceCallSessionId
+          ? {
+              voiceAuthorityContext: {
+                callSessionId: hostTool.resources.request_body.viventiumVoiceCallSessionId,
+                binding: hostTool.resources.request_body.viventiumVoiceWorkAuthority,
+              },
+            }
+          : {}),
       });
       return { status: 'ok', tool: hostTool.toolName, result };
     } catch (error) {

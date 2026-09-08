@@ -1111,7 +1111,8 @@ function bindVoiceTaskStream(taskId, streamId, { callSessionId, userId, conversa
   ) {
     return null;
   }
-  const conversationBound = hasCanonicalConversation && task.conversationId !== canonicalConversationId;
+  const conversationBound =
+    hasCanonicalConversation && task.conversationId !== canonicalConversationId;
   if (conversationBound) task.conversationId = canonicalConversationId;
   if (task.streamId && task.streamId !== normalizedStreamId) {
     taskIdByStreamId.delete(task.streamId);
@@ -2271,16 +2272,24 @@ function observeGenerationEvent(taskId, generationEvent) {
 async function settleVoiceTaskGeneration(taskId, { userId, callSessionId, streamId }, outcome) {
   const task = tasks.get(String(taskId || ''));
   if (
-    !task || !userId || !callSessionId || !streamId ||
+    !task ||
+    !userId ||
+    !callSessionId ||
+    !streamId ||
     task.userId !== userId ||
     task.callSessionId !== callSessionId ||
     task.streamId !== streamId ||
     task.owner?.id !== streamId ||
     !['generation_job', 'remote_generation'].includes(task.owner?.kind)
-  ) return null;
+  )
+    return null;
   if (await isVoiceTaskSuppressedDurably(taskId, { userId, callSessionId, streamId })) return null;
-  if (tasks.get(task.taskId) !== task || task.owner?.id !== streamId ||
-      !['generation_job', 'remote_generation'].includes(task.owner?.kind)) return null;
+  if (
+    tasks.get(task.taskId) !== task ||
+    task.owner?.id !== streamId ||
+    !['generation_job', 'remote_generation'].includes(task.owner?.kind)
+  )
+    return null;
   const event = outcome.error
     ? failVoiceTask(taskId, outcome.error)
     : completeVoiceTask(taskId, { resultMessageId: outcome.resultMessageId });

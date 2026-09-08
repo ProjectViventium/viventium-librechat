@@ -534,16 +534,26 @@ describe('Phase B prepare/persist boundary', () => {
 
 describe('formatFollowUpPrompt', () => {
   const missionInsight = (runId, instruction, insight) => ({
-    cortexName: 'Mission evidence', insight,
+    cortexName: 'Mission evidence',
+    insight,
     runInput: { version: 1, run_id: runId, instruction },
-    authority: { kind: 'durable_terminal_callback', runId, event: 'run.completed', workState: 'completed' },
+    authority: {
+      kind: 'durable_terminal_callback',
+      runId,
+      event: 'run.completed',
+      workState: 'completed',
+    },
   });
 
   test('restores exact accepted mission input instead of an unrelated quick request', () => {
     const instruction = '  Compare two storage designs.\n Keep the source links.  ';
     const evidence = missionInsight('run-a', instruction, '  Full result\nwith sources.  ');
-    const prompt = formatFollowUpPrompt({ insights: [evidence], userRequest: 'What is 17 times 23?',
-      recentResponse: '391. The comparison was accepted separately.', surface: 'web' });
+    const prompt = formatFollowUpPrompt({
+      insights: [evidence],
+      userRequest: 'What is 17 times 23?',
+      recentResponse: '391. The comparison was accepted separately.',
+      surface: 'web',
+    });
     expect(prompt).toContain(JSON.stringify(evidence.runInput));
     expect(prompt).toContain(JSON.stringify(evidence.authority));
     expect(prompt).toContain(evidence.insight);
@@ -552,41 +562,77 @@ describe('formatFollowUpPrompt', () => {
   });
 
   test('preserves distinct grouped mission inputs and complete evidence without prefix clipping', () => {
-    const a = missionInsight('run-a', 'First objective\n' + 'x'.repeat(4300) + '  END A', 'a'.repeat(12500) + ' END RESULT A');
+    const a = missionInsight(
+      'run-a',
+      'First objective\n' + 'x'.repeat(4300) + '  END A',
+      'a'.repeat(12500) + ' END RESULT A',
+    );
     const b = missionInsight('run-b', '\tSecond objective  ', 'END RESULT B');
-    const prompt = formatFollowUpPrompt({ insights: [a, b], userRequest: 'Unrelated question', surface: 'web' });
+    const prompt = formatFollowUpPrompt({
+      insights: [a, b],
+      userRequest: 'Unrelated question',
+      surface: 'web',
+    });
     expect(prompt).toContain(JSON.stringify(a.runInput));
     expect(prompt).toContain(JSON.stringify(b.runInput));
     expect(prompt).toContain(a.insight);
     expect(prompt).toContain(b.insight);
-    expect(prompt.indexOf(JSON.stringify(a.runInput))).toBeLessThan(prompt.indexOf(JSON.stringify(b.runInput)));
+    expect(prompt.indexOf(JSON.stringify(a.runInput))).toBeLessThan(
+      prompt.indexOf(JSON.stringify(b.runInput)),
+    );
   });
 
   test('distinct accepted missions retain both inputs even when their result text overlaps', () => {
-    const a = missionInsight('run-a', 'First accepted goal', 'Identical factual result with shared source material.');
+    const a = missionInsight(
+      'run-a',
+      'First accepted goal',
+      'Identical factual result with shared source material.',
+    );
     const b = missionInsight('run-b', 'Second accepted goal', a.insight);
     expect(deduplicateInsights([a, b])).toEqual([a, b]);
   });
 
-  test.each([false, true])('retains terminal evidence with missing input without borrowing the quick question (mixed=%s)', (mixed) => {
-    const missing = { cortexName: 'Mission evidence', insight: 'legacy result '.repeat(1500) + ' END LEGACY',
-      authority: { kind: 'durable_terminal_callback', runId: 'run-legacy', event: 'run.completed', workState: 'completed' } };
-    const known = missionInsight('run-known', '  Exact known objective\n', missing.insight);
-    const insights = mixed ? [known, missing] : [missing];
-    expect(deduplicateInsights(insights)).toEqual(insights);
-    const prompt = formatFollowUpPrompt({ insights, userRequest: 'Unrelated quick question', surface: 'web' });
-    expect(prompt).not.toContain('Unrelated quick question');
-    expect(prompt).toContain(missing.insight);
-    expect(prompt).toContain(JSON.stringify(missing.authority));
-    expect(prompt).toContain('"runInput":null');
-    if (mixed) expect(prompt).toContain(JSON.stringify(known.runInput));
-  });
+  test.each([false, true])(
+    'retains terminal evidence with missing input without borrowing the quick question (mixed=%s)',
+    (mixed) => {
+      const missing = {
+        cortexName: 'Mission evidence',
+        insight: 'legacy result '.repeat(1500) + ' END LEGACY',
+        authority: {
+          kind: 'durable_terminal_callback',
+          runId: 'run-legacy',
+          event: 'run.completed',
+          workState: 'completed',
+        },
+      };
+      const known = missionInsight('run-known', '  Exact known objective\n', missing.insight);
+      const insights = mixed ? [known, missing] : [missing];
+      expect(deduplicateInsights(insights)).toEqual(insights);
+      const prompt = formatFollowUpPrompt({
+        insights,
+        userRequest: 'Unrelated quick question',
+        surface: 'web',
+      });
+      expect(prompt).not.toContain('Unrelated quick question');
+      expect(prompt).toContain(missing.insight);
+      expect(prompt).toContain(JSON.stringify(missing.authority));
+      expect(prompt).toContain('"runInput":null');
+      if (mixed) expect(prompt).toContain(JSON.stringify(known.runInput));
+    },
+  );
 
   test('ordinary insights cannot substitute an unbound run input for the current request', () => {
-    const ordinary = { cortexName: 'planner', insight: 'A useful fact.', runInput: { version: 1, run_id: 'run-a', instruction: 'Wrong objective' } };
+    const ordinary = {
+      cortexName: 'planner',
+      insight: 'A useful fact.',
+      runInput: { version: 1, run_id: 'run-a', instruction: 'Wrong objective' },
+    };
     const input = { insights: [ordinary], userRequest: 'Current request', surface: 'web' };
-    const withoutInput = { ...ordinary }; delete withoutInput.runInput;
-    expect(formatFollowUpPrompt(input)).toBe(formatFollowUpPrompt({ ...input, insights: [withoutInput] }));
+    const withoutInput = { ...ordinary };
+    delete withoutInput.runInput;
+    expect(formatFollowUpPrompt(input)).toBe(
+      formatFollowUpPrompt({ ...input, insights: [withoutInput] }),
+    );
     expect(formatFollowUpPrompt(input)).toContain('Current request');
   });
 
@@ -595,7 +641,9 @@ describe('formatFollowUpPrompt', () => {
     (surface) => {
       const recentResponse = `${'The detailed comparison explains the options. '.repeat(80)}\nDecision: retain the current service and verify the restore before launch.`;
       const prompt = formatFollowUpPrompt({
-        insights: [{ cortexName: 'planner', insight: 'Retain the current service and verify restore.' }],
+        insights: [
+          { cortexName: 'planner', insight: 'Retain the current service and verify restore.' },
+        ],
         recentResponse,
         surface,
       });
@@ -832,7 +880,9 @@ describe('resolveFollowUpPersistenceText', () => {
     (surface) => {
       const result = resolveFollowUpPersistenceText({
         generatedText: '',
-        insightsData: { insights: [{ cortexName: 'Analysis', insight: 'The earlier answer is correct.' }] },
+        insightsData: {
+          insights: [{ cortexName: 'Analysis', insight: 'The earlier answer is correct.' }],
+        },
         surface,
         generationFailed: true,
       });
@@ -1406,20 +1456,34 @@ describe('resolveFollowUpContinuationContext', () => {
     const result = resolveFollowUpContinuationContext(
       [
         {
-          messageId: 'anchor', parentMessageId: 'request', sender: 'AI', text: 'Both checks are running.',
-          createdAt: '2026-05-03T03:00:00.000Z', updatedAt: '2026-05-03T03:05:00.000Z',
+          messageId: 'anchor',
+          parentMessageId: 'request',
+          sender: 'AI',
+          text: 'Both checks are running.',
+          createdAt: '2026-05-03T03:00:00.000Z',
+          updatedAt: '2026-05-03T03:05:00.000Z',
         },
         {
-          messageId: 'correction', parentMessageId: 'anchor', sender: 'User', isCreatedByUser: true,
-          text: 'Narrow the first check. Leave the other one unchanged.', createdAt: '2026-05-03T03:01:00.000Z',
+          messageId: 'correction',
+          parentMessageId: 'anchor',
+          sender: 'User',
+          isCreatedByUser: true,
+          text: 'Narrow the first check. Leave the other one unchanged.',
+          createdAt: '2026-05-03T03:01:00.000Z',
         },
         {
-          messageId: 'first-result', parentMessageId: 'correction', sender: 'AI',
-          text: 'The first check found an undocumented sign-in requirement.', createdAt: '2026-05-03T03:04:00.000Z',
+          messageId: 'first-result',
+          parentMessageId: 'correction',
+          sender: 'AI',
+          text: 'The first check found an undocumented sign-in requirement.',
+          createdAt: '2026-05-03T03:04:00.000Z',
         },
         {
-          messageId: 'second-status', parentMessageId: 'first-result', sender: 'AI',
-          text: 'Second check completed.', createdAt: '2026-05-03T03:06:00.000Z',
+          messageId: 'second-status',
+          parentMessageId: 'first-result',
+          sender: 'AI',
+          text: 'Second check completed.',
+          createdAt: '2026-05-03T03:06:00.000Z',
         },
       ],
       'anchor',
@@ -1427,7 +1491,9 @@ describe('resolveFollowUpContinuationContext', () => {
     expect(result.hasMovedOn).toBe(true);
     expect(result.messageCount).toBe(3);
     expect(result.contextText).toContain('Narrow the first check. Leave the other one unchanged.');
-    expect(result.contextText).toContain('The first check found an undocumented sign-in requirement.');
+    expect(result.contextText).toContain(
+      'The first check found an undocumented sign-in requirement.',
+    );
     expect(result.currentLeafMessageId).toBe('second-status');
   });
 
@@ -1678,47 +1744,66 @@ describe('voice follow-up runtime assignment', () => {
   });
 });
 
-
 describe('typed terminal-result follow-up mode', () => {
   test.each([
     ['durable_terminal_callback', 'The requested check is running.', false],
     ['durable_terminal_callback', '', false],
     ['scheduled_evidence', 'The requested check is running.', true],
-  ])('selects mode from authority while preserving empty-primary recovery: %s / %s', async (kind, recentResponse, forced) => {
-    const processStream = jest.fn().mockResolvedValue('{NTA}');
-    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
-    const priorKey = process.env.XAI_API_KEY;
-    process.env.XAI_API_KEY = 'synthetic-xai-key';
-    try {
-      const prepared = await prepareCortexFollowUpMessage({
-        req: { body: {} },
-        conversationId: 'synthetic-conversation', parentMessageId: 'synthetic-parent',
-        agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
-        forceVisibleFollowUp: true, recentResponse,
-        insightsData: { cortexCount: 1, insights: [{
-          cortexName: 'Synthetic evidence', insight: 'A verified finding.',
-          authority: { kind },
-        }] },
-      });
-      expect(prepared.shouldForceVisibleFollowUp).toBe(forced);
-      expect(prepared.followUpDecisionRecord.forceVisibleFollowUp).toBe(forced);
-      expect(Boolean(prepared.text)).toBe(forced);
-      expect(prepared.followUpDecisionRecord.generationFailed).toBe(false);
-      expect(processStream).toHaveBeenCalledTimes(1);
-    } finally {
-      if (priorKey == null) delete process.env.XAI_API_KEY;
-      else process.env.XAI_API_KEY = priorKey;
-      createRun.mockRestore();
-    }
-  });
+  ])(
+    'selects mode from authority while preserving empty-primary recovery: %s / %s',
+    async (kind, recentResponse, forced) => {
+      const processStream = jest.fn().mockResolvedValue('{NTA}');
+      const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+      const priorKey = process.env.XAI_API_KEY;
+      process.env.XAI_API_KEY = 'synthetic-xai-key';
+      try {
+        const prepared = await prepareCortexFollowUpMessage({
+          req: { body: {} },
+          conversationId: 'synthetic-conversation',
+          parentMessageId: 'synthetic-parent',
+          agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
+          forceVisibleFollowUp: true,
+          recentResponse,
+          insightsData: {
+            cortexCount: 1,
+            insights: [
+              {
+                cortexName: 'Synthetic evidence',
+                insight: 'A verified finding.',
+                authority: { kind },
+              },
+            ],
+          },
+        });
+        expect(prepared.shouldForceVisibleFollowUp).toBe(forced);
+        expect(prepared.followUpDecisionRecord.forceVisibleFollowUp).toBe(forced);
+        expect(Boolean(prepared.text)).toBe(forced);
+        expect(prepared.followUpDecisionRecord.generationFailed).toBe(false);
+        expect(processStream).toHaveBeenCalledTimes(1);
+      } finally {
+        if (priorKey == null) delete process.env.XAI_API_KEY;
+        else process.env.XAI_API_KEY = priorKey;
+        createRun.mockRestore();
+      }
+    },
+  );
 });
 
 test('Phase B receives verified parent graph records beside the limited parallel insight', async () => {
   const native = require('../nativeResponseService');
-  const evidence = [{ type: 'text', text: JSON.stringify({ native_tool_evidence: {
-    requests: [{ run_id: 'before', record: 'Primary archive result' },
-      { run_id: 'after', record: 'Later graph verification' }],
-  } }) }];
+  const evidence = [
+    {
+      type: 'text',
+      text: JSON.stringify({
+        native_tool_evidence: {
+          requests: [
+            { run_id: 'before', record: 'Primary archive result' },
+            { run_id: 'after', record: 'Later graph verification' },
+          ],
+        },
+      }),
+    },
+  ];
   const readToolEvidence = jest.fn().mockResolvedValue(evidence);
   const service = jest.spyOn(native, 'getService').mockReturnValue({ readToolEvidence });
   const processStream = jest.fn().mockResolvedValue('Useful synthesis.');
@@ -1726,10 +1811,20 @@ test('Phase B receives verified parent graph records beside the limited parallel
   const oldKey = process.env.XAI_API_KEY;
   try {
     process.env.XAI_API_KEY = 'synthetic-key';
-    await generateFollowUpText({ req: { user: { id: 'owner' }, body: {} },
+    await generateFollowUpText({
+      req: { user: { id: 'owner' }, body: {} },
       agent: { provider: 'xai', model: 'synthetic', model_parameters: {} },
-      conversationId: 'conversation', parentMessageId: 'answer', runId: 'run',
-      insightsData: { insights: [{ cortexName: 'Parallel search', insight: 'The prior conversation search found no record.' }] },
+      conversationId: 'conversation',
+      parentMessageId: 'answer',
+      runId: 'run',
+      insightsData: {
+        insights: [
+          {
+            cortexName: 'Parallel search',
+            insight: 'The prior conversation search found no record.',
+          },
+        ],
+      },
       recentResponse: 'The primary archive read found a record.',
     });
     expect(readToolEvidence).toHaveBeenCalledWith('owner', 'conversation', 'answer');
@@ -1739,42 +1834,64 @@ test('Phase B receives verified parent graph records beside the limited parallel
     expect(transmitted).toContain('prior conversation search found no record');
     expect(createRun.mock.calls[0][0].graphConfig.tools).toEqual([]);
   } finally {
-    if (oldKey == null) delete process.env.XAI_API_KEY; else process.env.XAI_API_KEY = oldKey;
-    service.mockRestore(); createRun.mockRestore();
+    if (oldKey == null) delete process.env.XAI_API_KEY;
+    else process.env.XAI_API_KEY = oldKey;
+    service.mockRestore();
+    createRun.mockRestore();
   }
 });
-
 
 test.each([
   ['durable_terminal_callback', 'native_graph_tool_evidence_parent_unfinished', true],
   ['ordinary_cortex', 'native_graph_tool_evidence_parent_unfinished', false],
   ['durable_terminal_callback', 'native_graph_tool_evidence_identity_mismatch', false],
   ['durable_terminal_callback', 'native_graph_tool_evidence_source_changed', false],
-])('Phase B handles %s parent evidence error %s without weakening its guard', async (kind, code, allowed) => {
-  const native = require('../nativeResponseService');
-  const readToolEvidence = jest.fn().mockRejectedValue(Object.assign(new Error(code), { code }));
-  const service = jest.spyOn(native, 'getService').mockReturnValue({ readToolEvidence });
-  const processStream = jest.fn().mockResolvedValue('The completed worker result.');
-  const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
-  const oldKey = process.env.XAI_API_KEY;
-  try {
-    process.env.XAI_API_KEY = 'synthetic-key';
-    const result = generateFollowUpText({
-      req: { user: { id: 'owner' }, body: {} },
-      agent: { provider: 'xai', model: 'synthetic', model_parameters: {} },
-      conversationId: 'conversation', parentMessageId: 'answer', runId: 'run',
-      insightsData: { insights: [{ cortexName: 'Completed worker', insight: 'Verified retained result.',
-        authority: { kind, runId: 'worker-run', event: 'run.completed', workState: 'completed' } }] },
-    });
-    if (allowed) {
-      await expect(result).resolves.toBe('The completed worker result.');
-      expect(JSON.stringify(processStream.mock.calls[0][0])).toContain('Verified retained result.');
-    } else {
-      await expect(result).rejects.toMatchObject({ code });
-      expect(processStream).not.toHaveBeenCalled();
+])(
+  'Phase B handles %s parent evidence error %s without weakening its guard',
+  async (kind, code, allowed) => {
+    const native = require('../nativeResponseService');
+    const readToolEvidence = jest.fn().mockRejectedValue(Object.assign(new Error(code), { code }));
+    const service = jest.spyOn(native, 'getService').mockReturnValue({ readToolEvidence });
+    const processStream = jest.fn().mockResolvedValue('The completed worker result.');
+    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    const oldKey = process.env.XAI_API_KEY;
+    try {
+      process.env.XAI_API_KEY = 'synthetic-key';
+      const result = generateFollowUpText({
+        req: { user: { id: 'owner' }, body: {} },
+        agent: { provider: 'xai', model: 'synthetic', model_parameters: {} },
+        conversationId: 'conversation',
+        parentMessageId: 'answer',
+        runId: 'run',
+        insightsData: {
+          insights: [
+            {
+              cortexName: 'Completed worker',
+              insight: 'Verified retained result.',
+              authority: {
+                kind,
+                runId: 'worker-run',
+                event: 'run.completed',
+                workState: 'completed',
+              },
+            },
+          ],
+        },
+      });
+      if (allowed) {
+        await expect(result).resolves.toBe('The completed worker result.');
+        expect(JSON.stringify(processStream.mock.calls[0][0])).toContain(
+          'Verified retained result.',
+        );
+      } else {
+        await expect(result).rejects.toMatchObject({ code });
+        expect(processStream).not.toHaveBeenCalled();
+      }
+    } finally {
+      if (oldKey == null) delete process.env.XAI_API_KEY;
+      else process.env.XAI_API_KEY = oldKey;
+      service.mockRestore();
+      createRun.mockRestore();
     }
-  } finally {
-    if (oldKey == null) delete process.env.XAI_API_KEY; else process.env.XAI_API_KEY = oldKey;
-    service.mockRestore(); createRun.mockRestore();
-  }
-});
+  },
+);

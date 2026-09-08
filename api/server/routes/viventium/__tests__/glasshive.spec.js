@@ -496,8 +496,10 @@ describe('/api/viventium/glasshive/callback', () => {
   test.each(['run.started', 'run.cancelled', 'run.completed'])(
     'accepts %s for an unbound parent only through its canonical call session',
     async (event) => {
-      const { createVoiceTask, getVoiceTaskByStreamId } =
-        require('~/server/services/viventium/VoiceTaskService');
+      const {
+        createVoiceTask,
+        getVoiceTaskByStreamId,
+      } = require('~/server/services/viventium/VoiceTaskService');
       const parent = createVoiceTask({
         callSessionId: 'call-first-use',
         userId: 'user-1',
@@ -514,13 +516,19 @@ describe('/api/viventium/glasshive/callback', () => {
         ...(event === 'run.started' ? { message: '' } : {}),
       });
       const res = createMockRes();
-      await dispatch(app, createMockReq({
-        url: '/api/viventium/glasshive/callback',
-        headers: { 'x-glasshive-signature': signature(body) }, body,
-      }), res);
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(body) },
+          body,
+        }),
+        res,
+      );
       expect(res.statusCode).toBeLessThan(300);
       expect(getVoiceTaskByStreamId('glasshive:run-first-use')).toMatchObject({
-        callSessionId: 'call-first-use', conversationId: 'conv-1',
+        callSessionId: 'call-first-use',
+        conversationId: 'conv-1',
         parentTaskId: parent.taskId,
       });
     },
@@ -531,22 +539,35 @@ describe('/api/viventium/glasshive/callback', () => {
     { callSessionId: 'other-call', conversationId: 'new' },
     { conversationId: 'other-conversation' },
   ])('keeps mismatched parent identity fenced: %j', async (mismatch) => {
-    const { createVoiceTask, getVoiceTaskByStreamId } =
-      require('~/server/services/viventium/VoiceTaskService');
+    const {
+      createVoiceTask,
+      getVoiceTaskByStreamId,
+    } = require('~/server/services/viventium/VoiceTaskService');
     createVoiceTask({
-      callSessionId: 'call-first-use', userId: 'user-1', conversationId: 'new',
-      streamId: 'voice-first-use', ...mismatch,
+      callSessionId: 'call-first-use',
+      userId: 'user-1',
+      conversationId: 'new',
+      streamId: 'voice-first-use',
+      ...mismatch,
     });
     const app = createTestApp(require('../glasshive'));
     const body = callbackBody({
-      surface: 'voice', voice_call_session_id: 'call-first-use',
-      voice_request_id: 'voice-first-use', run_id: 'run-first-use', event: 'run.started',
+      surface: 'voice',
+      voice_call_session_id: 'call-first-use',
+      voice_request_id: 'voice-first-use',
+      run_id: 'run-first-use',
+      event: 'run.started',
     });
     const res = createMockRes();
-    await dispatch(app, createMockReq({
-      url: '/api/viventium/glasshive/callback',
-      headers: { 'x-glasshive-signature': signature(body) }, body,
-    }), res);
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
     expect(res.statusCode).toBe(409);
     expect(res.body).toEqual({ error: 'voice_task_session_mismatch' });
     expect(getVoiceTaskByStreamId('glasshive:run-first-use')).toBeNull();

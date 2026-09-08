@@ -213,15 +213,29 @@ function attachQaRunReceipt(req, message) {
 const acceptedInteractionInputs = new WeakMap();
 function acceptedInteractionSourceId(req) {
   const context = getTrustedInteractionContext(req);
-  return req.body?.overrideUserMessageId?.split(Constants.COMMON_DIVIDER)[0] || req.body?.overrideParentMessageId ||
-    stableScopedUuid(['viventium:accepted-user-input:v1', String(req.user.id), context.source_event_id]);
+  return (
+    req.body?.overrideUserMessageId?.split(Constants.COMMON_DIVIDER)[0] ||
+    req.body?.overrideParentMessageId ||
+    stableScopedUuid([
+      'viventium:accepted-user-input:v1',
+      String(req.user.id),
+      context.source_event_id,
+    ])
+  );
 }
-
 
 async function retainAcceptedInteractionInput(req, { conversationId, text, parentMessageId } = {}) {
   let context = getTrustedInteractionContext(req);
-  if (!context || context.logical_turn_id || context.actor_kind !== 'external_user' || context.origin !== 'interactive' ||
-      req.body?.isRegenerate || req.body?.isContinued || req.body?.editedContent) return context;
+  if (
+    !context ||
+    context.logical_turn_id ||
+    context.actor_kind !== 'external_user' ||
+    context.origin !== 'interactive' ||
+    req.body?.isRegenerate ||
+    req.body?.isContinued ||
+    req.body?.editedContent
+  )
+    return context;
   const existing = acceptedInteractionInputs.get(req);
   if (existing) return existing.context;
   if (context.ready_input_continuation) return context;
@@ -238,7 +252,10 @@ async function retainAcceptedInteractionInput(req, { conversationId, text, paren
   return context;
 }
 
-async function captureAcceptedInteractionInput(req, { conversationId, streamId, text, parentMessageId } = {}) {
+async function captureAcceptedInteractionInput(
+  req,
+  { conversationId, streamId, text, parentMessageId } = {},
+) {
   // Honor the validated resolver, including a reset from a rejected existing conversation.
   conversationId = resolveCanonicalConversationId(req, req.user.id, conversationId);
   await retainAcceptedInteractionInput(req, { conversationId, text, parentMessageId });
@@ -248,11 +265,27 @@ async function captureAcceptedInteractionInput(req, { conversationId, streamId, 
   accepted.source.parentMessageId = parentMessageId || Constants.NO_PARENT;
   context = bindInteractionSourceSegments(req, accepted.originalText, [], accepted.source);
   await GenerationJobManager.retainLogicalTurnInput(req.user.id, context);
-  if (!(await Message.exists({ user: req.user.id, conversationId, messageId: accepted.source.messageId, isCreatedByUser: true }))) {
-    await timedSaveMessage(req, {
-      messageId: accepted.source.messageId, parentMessageId: accepted.source.parentMessageId,
-      conversationId, text: accepted.originalText, sender: 'User', isCreatedByUser: true,
-    }, { context: 'accepted user source before initialization' }, 'db_save_user');
+  if (
+    !(await Message.exists({
+      user: req.user.id,
+      conversationId,
+      messageId: accepted.source.messageId,
+      isCreatedByUser: true,
+    }))
+  ) {
+    await timedSaveMessage(
+      req,
+      {
+        messageId: accepted.source.messageId,
+        parentMessageId: accepted.source.parentMessageId,
+        conversationId,
+        text: accepted.originalText,
+        sender: 'User',
+        isCreatedByUser: true,
+      },
+      { context: 'accepted user source before initialization' },
+      'db_save_user',
+    );
   }
   accepted.context = context;
   accepted.persisted = true;
@@ -278,18 +311,27 @@ async function captureRequestInteractionContext(req, { conversationId, streamId 
   if (context?.logical_turn_id) return context;
   if (context.ready_input_continuation) return context;
   if (req._viventiumTelegramInput) return getTrustedInteractionContext(req);
-  await captureAcceptedInteractionInput(req, { conversationId, streamId, text: body.text, parentMessageId: body.parentMessageId });
-  const fileIds = Array.from(new Set(
-    (Array.isArray(body.files) ? body.files : [])
-      .map((file) => file?.file_id)
-      .filter((fileId) => typeof fileId === 'string' && fileId.length > 0),
-  )).slice(0, 32);
+  await captureAcceptedInteractionInput(req, {
+    conversationId,
+    streamId,
+    text: body.text,
+    parentMessageId: body.parentMessageId,
+  });
+  const fileIds = Array.from(
+    new Set(
+      (Array.isArray(body.files) ? body.files : [])
+        .map((file) => file?.file_id)
+        .filter((fileId) => typeof fileId === 'string' && fileId.length > 0),
+    ),
+  ).slice(0, 32);
   const sourceFiles = fileIds.length
-    ? await getFiles(
-        { user: req.user.id, file_id: { $in: fileIds } },
-        undefined,
-        { file_id: 1, filename: 1, type: 1, bytes: 1, media_group_index: 1 },
-      )
+    ? await getFiles({ user: req.user.id, file_id: { $in: fileIds } }, undefined, {
+        file_id: 1,
+        filename: 1,
+        type: 1,
+        bytes: 1,
+        media_group_index: 1,
+      })
     : [];
   const filesById = new Map(sourceFiles.map((file) => [file.file_id, file]));
   const acceptedSource = acceptedInteractionInputs.get(req)?.source;
@@ -347,10 +389,10 @@ function stableNewConversationId(req, userId) {
   const trustedContext = getTrustedInteractionContext(req);
   const sourceEventId = trustedContext?.source_conversation_generation
     ? [
-        "conversation-generation",
+        'conversation-generation',
         trustedContext.source_order_scope,
         trustedContext.source_conversation_generation,
-      ].join(":")
+      ].join(':')
     : requestSourceEventId(req);
   if (!sourceEventId) {
     return crypto.randomUUID();
@@ -515,14 +557,25 @@ async function removeSupersededAssistantMessage(req, message, interactionContext
   if (removed && interactionContext?.surface === 'web' && interactionContext?.logical_turn_id) {
     try {
       const store = GenerationJobManager.getJobStore();
-      const owner = await store.resolveDeliveryOwner(interactionContext.logical_turn_id, interactionContext.revision);
+      const owner = await store.resolveDeliveryOwner(
+        interactionContext.logical_turn_id,
+        interactionContext.revision,
+      );
       const job = owner ? await store.getJob(owner) : null;
-      if (job?.nativeResponse && job.interactionContext?.logical_turn_id === interactionContext.logical_turn_id &&
-          job.interactionContext?.revision === interactionContext.revision &&
-          job.status === 'superseded' && job.userId === req?.user?.id &&
-          job.conversationId === message.conversationId && job.responseMessageId === message.messageId) {
-        await GenerationJobManager.acknowledgeStreamDelivery(owner,
-          { state: 'partial_removed', presentation_ref: message.messageId }, job.nativeResponse);
+      if (
+        job?.nativeResponse &&
+        job.interactionContext?.logical_turn_id === interactionContext.logical_turn_id &&
+        job.interactionContext?.revision === interactionContext.revision &&
+        job.status === 'superseded' &&
+        job.userId === req?.user?.id &&
+        job.conversationId === message.conversationId &&
+        job.responseMessageId === message.messageId
+      ) {
+        await GenerationJobManager.acknowledgeStreamDelivery(
+          owner,
+          { state: 'partial_removed', presentation_ref: message.messageId },
+          job.nativeResponse,
+        );
       }
     } catch (error) {
       logger.warn('[removeSupersededAssistantMessage] Removal receipt unavailable', error);
@@ -540,15 +593,21 @@ async function linkAcceptedInteractionSources(req, context) {
     if (!messageId || seen.has(messageId)) continue;
     seen.add(messageId);
     if (previous && previous !== messageId && segment.source_parent_message_id !== previous) {
-      const filter = { user: req.user.id, conversationId: context.conversation_id,
-        messageId, isCreatedByUser: true, parentMessageId: segment.source_parent_message_id,
+      const filter = {
+        user: req.user.id,
+        conversationId: context.conversation_id,
+        messageId,
+        isCreatedByUser: true,
+        parentMessageId: segment.source_parent_message_id,
         'metadata.viventium.interactionContext.source_event_id': segment.source_event_id,
       };
       await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
-        filter, () => Message.updateOne(filter, { $set: { parentMessageId: previous } }),
+        filter,
+        () => Message.updateOne(filter, { $set: { parentMessageId: previous } }),
       );
     }
-    if (segment.source_event_id === context.source_event_id && previous) req.body.parentMessageId = previous;
+    if (segment.source_event_id === context.source_event_id && previous)
+      req.body.parentMessageId = previous;
     previous = messageId;
   }
 }
@@ -1071,7 +1130,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     interactionContext = await captureRequestInteractionContext(req, { conversationId, streamId });
   } catch (error) {
     await maybeDecrement();
-    if (error?.code === 'source_input_capacity') return res.status(503).json({code:error.code,retryable:true,error:error.message,conversationId});
+    if (error?.code === 'source_input_capacity')
+      return res
+        .status(503)
+        .json({ code: error.code, retryable: true, error: error.message, conversationId });
     throw error;
   }
   let releaseInteractiveAdmissionFence = null;
@@ -1545,7 +1607,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           conversationId,
           parentMessageId,
           abortController: job.abortController,
-          overrideParentMessageId: overrideParentMessageId || acceptedInteractionInputs.get(req)?.source.messageId,
+          overrideParentMessageId:
+            overrideParentMessageId || acceptedInteractionInputs.get(req)?.source.messageId,
           isEdited: !!editedContent,
           userMCPAuthMap: result.userMCPAuthMap,
           responseMessageId: editedResponseMessageId,
@@ -2091,12 +2154,20 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
   } catch (error) {
     completeInteractiveMainAdmission();
     await settleVoiceGenerationForRequest(req, { error });
-    if (['source_input_persistence_pending', 'source_input_capacity'].includes(error?.code) && !res.headersSent) {
+    if (
+      ['source_input_persistence_pending', 'source_input_capacity'].includes(error?.code) &&
+      !res.headersSent
+    ) {
       await maybeDecrement();
-      return res.status(503).json({ code: error.code, retryable: true, error: error.message, conversationId });
+      return res
+        .status(503)
+        .json({ code: error.code, retryable: true, error: error.message, conversationId });
     }
-    if (['source_input_waiting', 'source_order_superseded'].includes(error?.code) &&
-        getTrustedInteractionContext(req)?.ready_input_continuation && !res.headersSent) {
+    if (
+      ['source_input_waiting', 'source_order_superseded'].includes(error?.code) &&
+      getTrustedInteractionContext(req)?.ready_input_continuation &&
+      !res.headersSent
+    ) {
       await maybeDecrement();
       const pendingReceipt = { code: 'source_input_pending', pending: true, conversationId };
       await req._viventiumBeforeGenerationReceipt?.(pendingReceipt);
@@ -2104,7 +2175,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     }
     if (error?.code === 'source_order_superseded' && !res.headersSent) {
       await maybeDecrement();
-      return res.status(202).json({ code: 'source_order_superseded', superseded: true, conversationId });
+      return res
+        .status(202)
+        .json({ code: 'source_order_superseded', superseded: true, conversationId });
     }
     logger.error('[ResumableAgentController] Initialization error:', error);
     if (error?.stack) {
@@ -2171,7 +2244,10 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
     conversationId,
   );
   req._resumableStreamId = streamId;
-  const interactionContext = await captureRequestInteractionContext(req, { conversationId, streamId });
+  const interactionContext = await captureRequestInteractionContext(req, {
+    conversationId,
+    streamId,
+  });
 
   let userMessage;
   let userMessageId;

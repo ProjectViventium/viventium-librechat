@@ -671,51 +671,103 @@ function getDefaultHandlers({
   /* === VIVENTIUM START === Authored native previews use presentation only, never SDK content. === */
   let authoredPreview = null;
   const emitAuthoredPreview = async (data, metadata, clear = false) => {
-    const preview = data?.chunk?.additional_kwargs?.provider_specific_fields?.viventium?.assistant_preview;
+    const preview =
+      data?.chunk?.additional_kwargs?.provider_specific_fields?.viventium?.assistant_preview;
     if (!preview && !(clear && authoredPreview)) return;
     const identity = req?._viventiumNativeResponseIdentity;
-    const tracePreview = (stage, reason = '') => logger.info('[VIVENTIUM][NativePreview] ' + JSON.stringify({
-      messageId: identity?.responseMessageId, stage, reason, streamId,
-      invocationId: identity?.invocationId, agentId: identity?.agentId,
-      eventAgentId: typeof metadata?.agentId === 'string' ? metadata.agentId.slice(0, 160) : null,
-      sequence: Number.isSafeInteger(preview?.sequence) ? preview.sequence : null, clear,
-    }));
+    const tracePreview = (stage, reason = '') =>
+      logger.info(
+        '[VIVENTIUM][NativePreview] ' +
+          JSON.stringify({
+            messageId: identity?.responseMessageId,
+            stage,
+            reason,
+            streamId,
+            invocationId: identity?.invocationId,
+            agentId: identity?.agentId,
+            eventAgentId:
+              typeof metadata?.agentId === 'string' ? metadata.agentId.slice(0, 160) : null,
+            sequence: Number.isSafeInteger(preview?.sequence) ? preview.sequence : null,
+            clear,
+          }),
+      );
     tracePreview('received');
     if (!identity) return tracePreview('rejected', 'identity_missing');
-    const interaction = require('~/server/services/viventium/interactionContext')
-      .getTrustedInteractionContext(req);
+    const interaction =
+      require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(req);
     if (!streamId) return tracePreview('rejected', 'stream_missing');
-    if (req?._viventiumHarnessExecutionEnabled !== true) return tracePreview('rejected', 'execution_disabled');
+    if (req?._viventiumHarnessExecutionEnabled !== true)
+      return tracePreview('rejected', 'execution_disabled');
     if (interaction?.actor_kind !== 'external_user' || interaction?.origin !== 'interactive')
       return tracePreview('rejected', 'authoring_scope');
-    if (interaction.logical_turn_id !== identity.logicalTurnId || interaction.revision !== identity.revision)
+    if (
+      interaction.logical_turn_id !== identity.logicalTurnId ||
+      interaction.revision !== identity.revision
+    )
       return tracePreview('rejected', 'logical_turn');
     if (req.user?.id !== identity.userId) return tracePreview('rejected', 'owner');
     if (identity.streamId !== streamId) return tracePreview('rejected', 'stream_identity');
-    if (identity.deliveryContext?.surface === 'voice') return tracePreview('rejected', 'voice_surface');
-    if (typeof metadata?.agentId !== 'string' || !metadata.agentId || metadata.agentId !== identity.agentId)
+    if (identity.deliveryContext?.surface === 'voice')
+      return tracePreview('rejected', 'voice_surface');
+    if (
+      typeof metadata?.agentId !== 'string' ||
+      !metadata.agentId ||
+      metadata.agentId !== identity.agentId
+    )
       return tracePreview('rejected', 'agent_identity');
-    if (!clear && (!preview || preview.version !== 1 ||
-        preview.invocation_id !== identity.invocationId || preview.message_id !== identity.responseMessageId ||
-        !Number.isSafeInteger(preview.sequence) || preview.sequence <= 0 ||
-        typeof preview.text !== 'string' || !preview.text.trim())) return tracePreview('rejected', 'preview_identity_or_shape');
-    if (!clear && authoredPreview?.invocationId === identity.invocationId && preview.sequence <= authoredPreview.sequence)
+    if (
+      !clear &&
+      (!preview ||
+        preview.version !== 1 ||
+        preview.invocation_id !== identity.invocationId ||
+        preview.message_id !== identity.responseMessageId ||
+        !Number.isSafeInteger(preview.sequence) ||
+        preview.sequence <= 0 ||
+        typeof preview.text !== 'string' ||
+        !preview.text.trim())
+    )
+      return tracePreview('rejected', 'preview_identity_or_shape');
+    if (
+      !clear &&
+      authoredPreview?.invocationId === identity.invocationId &&
+      preview.sequence <= authoredPreview.sequence
+    )
       return tracePreview('rejected', 'already_seen');
     const job = await GenerationJobManager.getJobStore().getJob(streamId);
     if (!nativeJobMatches(job, identity)) return tracePreview('rejected', 'job_identity');
-    if (!job.nativeResponse || nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity))
+    if (
+      !job.nativeResponse ||
+      nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity)
+    )
       return tracePreview('rejected', 'native_binding');
-    const text = clear ? '' : require('~/server/services/viventium/deliveryControls')
-      .stripDeliveryControlsForPreview(preview.text);
+    const text = clear
+      ? ''
+      : require('~/server/services/viventium/deliveryControls').stripDeliveryControlsForPreview(
+          preview.text,
+        );
     if (!clear && !text.trim()) return tracePreview('rejected', 'empty_visible_text');
-    authoredPreview = clear ? null : { invocationId: identity.invocationId, sequence: preview.sequence };
+    authoredPreview = clear
+      ? null
+      : { invocationId: identity.invocationId, sequence: preview.sequence };
     if (!clear) req._viventiumHarnessInvocationStarted = true;
     // The existing generation owner checks cancellation and the current logical turn at emit.
     // Flat replacement content bypasses both the SDK's graph aggregator and durable final text.
     tracePreview('emit_submitted');
-    await GenerationJobManager.emitChunk(streamId, { type: ContentTypes.TEXT, preview: true, edited: true,
-      index: 0, text, messageId: identity.responseMessageId, conversationId: identity.conversationId,
-      userMessageId: identity.source.messageId, thread_id: identity.conversationId }, identity);
+    await GenerationJobManager.emitChunk(
+      streamId,
+      {
+        type: ContentTypes.TEXT,
+        preview: true,
+        edited: true,
+        index: 0,
+        text,
+        messageId: identity.responseMessageId,
+        conversationId: identity.conversationId,
+        userMessageId: identity.source.messageId,
+        thread_id: identity.conversationId,
+      },
+      identity,
+    );
     tracePreview('emit_returned');
   };
   const modelEndHandler = new ModelEndHandler(collectedUsage, req);

@@ -702,7 +702,6 @@ describe('request persistence helpers', () => {
   });
 });
 
-
 describe('superseded Web presentation removal receipt', () => {
   const context = { surface: 'web', logical_turn_id: 'turn', revision: 1 };
   const request = { user: { id: 'owner' } };
@@ -712,30 +711,49 @@ describe('superseded Web presentation removal receipt', () => {
     jest.clearAllMocks();
     require('~/db/models').Message.findOneAndDelete.mockResolvedValue({ _id: 'row' });
     mockResolveDeliveryOwner.mockResolvedValue('old-stream');
-    mockGetJob.mockResolvedValue({ userId: 'owner', conversationId: 'conversation',
-      responseMessageId: 'old-response', status: 'superseded', nativeResponse: identity, interactionContext: context });
+    mockGetJob.mockResolvedValue({
+      userId: 'owner',
+      conversationId: 'conversation',
+      responseMessageId: 'old-response',
+      status: 'superseded',
+      nativeResponse: identity,
+      interactionContext: context,
+    });
     mockAcknowledgeStreamDelivery.mockResolvedValue({ status: 'recorded' });
   });
-  const remove = () => require('../request').__testables.removeSupersededAssistantMessage(request, message, context);
+  const remove = () =>
+    require('../request').__testables.removeSupersededAssistantMessage(request, message, context);
   test('records actual removal against the exact old native incarnation', async () => {
     expect(await remove()).toBe(true);
-    expect(mockAcknowledgeStreamDelivery).toHaveBeenCalledWith('old-stream',
-      { state: 'partial_removed', presentation_ref: 'old-response' }, identity);
+    expect(mockAcknowledgeStreamDelivery).toHaveBeenCalledWith(
+      'old-stream',
+      { state: 'partial_removed', presentation_ref: 'old-response' },
+      identity,
+    );
   });
   test('no removed row provides no removal authority', async () => {
     require('~/db/models').Message.findOneAndDelete.mockResolvedValue(null);
     expect(await remove()).toBe(false);
     expect(mockAcknowledgeStreamDelivery).not.toHaveBeenCalled();
   });
-  test.each([{ userId: 'foreign' }, { responseMessageId: 'new-response' },
-    { conversationId: 'other' }, { status: 'complete' }, { nativeResponse: undefined }])(
-    'rejects mismatched owner facts %p', async (patch) => {
-      mockGetJob.mockResolvedValue({ ...(await mockGetJob()), ...patch });
-      expect(await remove()).toBe(true);
-      expect(mockAcknowledgeStreamDelivery).not.toHaveBeenCalled();
-    });
+  test.each([
+    { userId: 'foreign' },
+    { responseMessageId: 'new-response' },
+    { conversationId: 'other' },
+    { status: 'complete' },
+    { nativeResponse: undefined },
+  ])('rejects mismatched owner facts %p', async (patch) => {
+    mockGetJob.mockResolvedValue({ ...(await mockGetJob()), ...patch });
+    expect(await remove()).toBe(true);
+    expect(mockAcknowledgeStreamDelivery).not.toHaveBeenCalled();
+  });
   test('Telegram removal retains external adapter acknowledgement ownership', async () => {
-    expect(await require('../request').__testables.removeSupersededAssistantMessage(request, message, { ...context, surface: 'telegram' })).toBe(true);
+    expect(
+      await require('../request').__testables.removeSupersededAssistantMessage(request, message, {
+        ...context,
+        surface: 'telegram',
+      }),
+    ).toBe(true);
     expect(mockAcknowledgeStreamDelivery).not.toHaveBeenCalled();
   });
   test('optional receipt failure does not undo successful deletion', async () => {

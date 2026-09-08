@@ -100,13 +100,27 @@ describe('ProgressText and background cortex status layout', () => {
   });
 
   it.each([undefined, new Date(Date.now() - 5 * 60 * 1000).toISOString()])(
-    'keeps server-owned running status until a real terminal result arrives (%s)', (timestamp) => {
-      const { rerender } = render(<CortexCall cortex_id="background" cortex_name="Background Analysis"
-        status="brewing" status_changed_at={timestamp} />);
+    'keeps server-owned running status until a real terminal result arrives (%s)',
+    (timestamp) => {
+      const { rerender } = render(
+        <CortexCall
+          cortex_id="background"
+          cortex_name="Background Analysis"
+          status="brewing"
+          status_changed_at={timestamp}
+        />,
+      );
       expect(screen.getByRole('button')).toHaveTextContent('Analyzing with Background Analysis...');
       expect(screen.getByTestId('spinner')).toBeInTheDocument();
-      rerender(<CortexCall cortex_id="background" cortex_name="Background Analysis"
-        status="complete" insight="Useful delayed result" status_changed_at={new Date().toISOString()} />);
+      rerender(
+        <CortexCall
+          cortex_id="background"
+          cortex_name="Background Analysis"
+          status="complete"
+          insight="Useful delayed result"
+          status_changed_at={new Date().toISOString()}
+        />,
+      );
       expect(screen.getByRole('button')).toHaveTextContent('Background Analysis');
       expect(screen.queryByTestId('spinner')).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole('button'));

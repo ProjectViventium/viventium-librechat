@@ -25,17 +25,24 @@ test.each([false, true])('launch reconciliation startup respects quiesced=%s', a
   });
   const context = {
     require: required,
-    apiListenTarget: {}, host: '127.0.0.1', port: 3000,
+    apiListenTarget: {},
+    host: '127.0.0.1',
+    port: 3000,
     logger: { info: jest.fn(), error: jest.fn() },
     quiescedApiStartup: quiesced,
-    initializeMCPs: async () => {}, initializeOAuthReconnectManager: async () => {},
-    checkMigrations: async () => {}, recoverStaleCortexMessages: async () => {},
+    initializeMCPs: async () => {},
+    initializeOAuthReconnectManager: async () => {},
+    checkMigrations: async () => {},
+    recoverStaleCortexMessages: async () => {},
     getStaleCortexRecoveryIntervalMs: () => 0,
     upgradeFinalization: {
-      recordCompleted: jest.fn(), markReady: jest.fn(), isArmed: () => false,
+      recordCompleted: jest.fn(),
+      markReady: jest.fn(),
+      isArmed: () => false,
     },
     process: { execArgv: [], env: {}, exit: jest.fn() },
-    isEnabled: () => false, memoryDiagnostics: { start: jest.fn() },
+    isEnabled: () => false,
+    memoryDiagnostics: { start: jest.fn() },
   };
   await vm.runInNewContext(source.slice(start, end) + '\nonServerListening();', context);
   expect(startRecovery).toHaveBeenCalledTimes(quiesced ? 0 : 1);

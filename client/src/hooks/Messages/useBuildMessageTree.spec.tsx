@@ -174,14 +174,26 @@ test.each([false, true])(
 
 /* === VIVENTIUM START === Exports share the visible late-result projection. === */
 test('selected-branch export retains callback results and current answers with their original parents', async () => {
-  const resultMessage = { ...row('useful-result'), parentMessageId: 'callback', metadata: { viventium: { type: 'cortex_followup' } } };
-  const callback = { ...row('callback', false, [resultMessage]), metadata: { viventium: { type: 'glasshive_worker_callback' } } };
+  const resultMessage = {
+    ...row('useful-result'),
+    parentMessageId: 'callback',
+    metadata: { viventium: { type: 'cortex_followup' } },
+  };
+  const callback = {
+    ...row('callback', false, [resultMessage]),
+    metadata: { viventium: { type: 'glasshive_worker_callback' } },
+  };
   const input = [callback, current];
   const original = JSON.stringify(input);
   const { result } = renderHook(() => useBuildMessageTree());
   const exported = await result.current({ messageId: 'anchor', message: null, messages: input });
-  expect(Array.isArray(exported) && exported.map((m) => [m?.messageId, m?.parentMessageId])).toEqual([
-    ['callback', 'anchor'], ['useful-result', 'callback'], ['new-question', 'anchor'], ['new-answer', 'anchor'],
+  expect(
+    Array.isArray(exported) && exported.map((m) => [m?.messageId, m?.parentMessageId]),
+  ).toEqual([
+    ['callback', 'anchor'],
+    ['useful-result', 'callback'],
+    ['new-question', 'anchor'],
+    ['new-answer', 'anchor'],
   ]);
   expect(JSON.stringify(input)).toBe(original);
 });

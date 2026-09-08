@@ -101,7 +101,11 @@ export const a: React.ElementType = memo(function MarkdownAnchor({ href, childre
   const user = useRecoilValue(store.user);
   /* === VIVENTIUM START === Indexed source URLs must open in the active signed-in session. === */
   const { data: startupConfig } = useGetStartupConfig();
-  const linkHref = resolveAppLink(href, startupConfig?.viventiumClientOrigin, window.location.origin);
+  const linkHref = resolveAppLink(
+    href,
+    startupConfig?.viventiumClientOrigin,
+    window.location.origin,
+  );
   /* === VIVENTIUM END === */
   const { showToast } = useToastContext();
   const localize = useLocalize();

@@ -232,7 +232,9 @@ describe('ViventiumMainCompactionService', () => {
       expect(calls).toHaveLength(3);
       const payloads = calls.map(({ prompt }) =>
         JSON.parse(
-          prompt.match(/<untrusted_(?:conversation_data|compaction_evidence)_v1>\s*([\s\S]*?)\s*<\/untrusted_(?:conversation_data|compaction_evidence)_v1>/)[1],
+          prompt.match(
+            /<untrusted_(?:conversation_data|compaction_evidence)_v1>\s*([\s\S]*?)\s*<\/untrusted_(?:conversation_data|compaction_evidence)_v1>/,
+          )[1],
         ),
       );
       expect(payloads[1].priorRejection).toMatchObject({
@@ -281,7 +283,10 @@ describe('ViventiumMainCompactionService', () => {
       };
       const rejected = '  ' + JSON.stringify(candidate) + '\n';
       const reason = 'The candidate broadens a single-draft restriction into a standing rule.';
-      const valid = { ...candidate, commitments: ['For this change, leave the other drafts unchanged.'] };
+      const valid = {
+        ...candidate,
+        commitments: ['For this change, leave the other drafts unchanged.'],
+      };
       const calls = [];
       const result = await ensureAcceptedMainCompaction({
         ...identity,
@@ -301,15 +306,22 @@ describe('ViventiumMainCompactionService', () => {
           : { status: 'degraded', attempts: 2, reason: `semantic_fidelity: ${reason}` },
       );
       expect(calls.map((call) => call.stage || 'compaction')).toEqual([
-        'compaction', 'review', 'compaction', 'review',
+        'compaction',
+        'review',
+        'compaction',
+        'review',
       ]);
       const payloads = calls.map(({ prompt }) =>
         JSON.parse(
-          prompt.match(/<untrusted_(?:conversation_data|compaction_evidence)_v1>\s*([\s\S]*?)\s*<\/untrusted_(?:conversation_data|compaction_evidence)_v1>/)[1],
+          prompt.match(
+            /<untrusted_(?:conversation_data|compaction_evidence)_v1>\s*([\s\S]*?)\s*<\/untrusted_(?:conversation_data|compaction_evidence)_v1>/,
+          )[1],
         ),
       );
       expect(payloads[2].priorRejection).toEqual({
-        code: 'semantic_fidelity', candidate: rejected, reason,
+        code: 'semantic_fidelity',
+        candidate: rejected,
+        reason,
       });
       for (const payload of payloads.slice(1)) {
         expect(payload.sourceDigest).toBe(payloads[0].sourceDigest);

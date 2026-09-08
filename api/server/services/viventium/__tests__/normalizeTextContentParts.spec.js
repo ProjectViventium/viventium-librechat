@@ -320,28 +320,52 @@ describe('normalizeTextContentParts', () => {
 
 /* VIVENTIUM START: raw authored text survives the actual provider formatting boundary. */
 describe('normalizeUserMessageContent', () => {
-  test.each([{content:[]}, {content:[{type:'image_url',image_url:{url:'https://example.invalid/image.png'}}]},
-    {content:[{type:'text',text:''},{type:'image_url',image_url:{url:'https://example.invalid/image.png'}}]}])(
-    'preserves authored text and media without mutating stored content %j', ({content}) => {
-      const source={messageId:'original-user',isCreatedByUser:true,text:'Keep the registration unchanged.',content};
-      const normalized=normalizeUserMessageContent(source);
-      expect(normalized.content).toEqual([{type:'text',text:source.text},...content]);
-      expect(source.content).toBe(content);
-      const payload={...formatMessage({message:normalized}),messageId:source.messageId};
-      const {messages}=formatAgentMessages([payload],{0:10},new Set());
-      expect(messages).toHaveLength(1);expect(messages[0].id).toBe(source.messageId);
-      expect(JSON.stringify(messages[0].content)).toContain(source.text);
-      expect(()=>buildMainContinuityHeaders({context:{ownerId:'owner',agentId:'agent',stableAuthoritySha256:'a'.repeat(64)},
-        messages,sourceMessageIds:[source.messageId],logicalTurnId:'logical-turn',revision:1})).not.toThrow();
-    });
   test.each([
-    {isCreatedByUser:false,text:'Assistant display summary',content:[]},
-    {isCreatedByUser:true,text:'Old text',content:[{type:'text',text:'Edited text'}]},
-    {isCreatedByUser:true,text:'Old text',content:[{type:'text',text:{value:'Edited text'}}]},
-    {isCreatedByUser:true,text:'Old text',content:['Authored content']},
-    {isCreatedByUser:true,text:'Old text',content:''},
-    {isCreatedByUser:true,text:'',content:[]},
-  ])('preserves explicit content and non-user provenance %#', (message)=>{
+    { content: [] },
+    { content: [{ type: 'image_url', image_url: { url: 'https://example.invalid/image.png' } }] },
+    {
+      content: [
+        { type: 'text', text: '' },
+        { type: 'image_url', image_url: { url: 'https://example.invalid/image.png' } },
+      ],
+    },
+  ])('preserves authored text and media without mutating stored content %j', ({ content }) => {
+    const source = {
+      messageId: 'original-user',
+      isCreatedByUser: true,
+      text: 'Keep the registration unchanged.',
+      content,
+    };
+    const normalized = normalizeUserMessageContent(source);
+    expect(normalized.content).toEqual([{ type: 'text', text: source.text }, ...content]);
+    expect(source.content).toBe(content);
+    const payload = { ...formatMessage({ message: normalized }), messageId: source.messageId };
+    const { messages } = formatAgentMessages([payload], { 0: 10 }, new Set());
+    expect(messages).toHaveLength(1);
+    expect(messages[0].id).toBe(source.messageId);
+    expect(JSON.stringify(messages[0].content)).toContain(source.text);
+    expect(() =>
+      buildMainContinuityHeaders({
+        context: { ownerId: 'owner', agentId: 'agent', stableAuthoritySha256: 'a'.repeat(64) },
+        messages,
+        sourceMessageIds: [source.messageId],
+        logicalTurnId: 'logical-turn',
+        revision: 1,
+      }),
+    ).not.toThrow();
+  });
+  test.each([
+    { isCreatedByUser: false, text: 'Assistant display summary', content: [] },
+    { isCreatedByUser: true, text: 'Old text', content: [{ type: 'text', text: 'Edited text' }] },
+    {
+      isCreatedByUser: true,
+      text: 'Old text',
+      content: [{ type: 'text', text: { value: 'Edited text' } }],
+    },
+    { isCreatedByUser: true, text: 'Old text', content: ['Authored content'] },
+    { isCreatedByUser: true, text: 'Old text', content: '' },
+    { isCreatedByUser: true, text: '', content: [] },
+  ])('preserves explicit content and non-user provenance %#', (message) => {
     expect(normalizeUserMessageContent(message)).toBe(message);
   });
 });

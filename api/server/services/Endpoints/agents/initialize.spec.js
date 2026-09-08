@@ -45,6 +45,7 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   GenerationJobManager: { setCollectedUsage: jest.fn() },
   applyAgentProviderCapabilityDefaults: jest.fn((agent) => ({ ...agent })),
   createEdgeCollector: jest.fn((checkAgentInit) => {

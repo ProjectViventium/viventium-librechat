@@ -21,10 +21,20 @@ describe('agentSchemaToolBindingPatch', () => {
     const graph = new MultiAgentGraph({
       runId: 'dynamic-handoff-context',
       agents: [
-        { agentId: 'main', name: 'Main', provider: Providers.OPENAI,
-          instructions: 'Main instructions.', clientOptions: { model: 'synthetic-model' } },
-        { agentId: 'specialist', name: 'Specialist', provider: Providers.OPENAI,
-          instructions: 'Specialist instructions.', clientOptions: { model: 'synthetic-model' } },
+        {
+          agentId: 'main',
+          name: 'Main',
+          provider: Providers.OPENAI,
+          instructions: 'Main instructions.',
+          clientOptions: { model: 'synthetic-model' },
+        },
+        {
+          agentId: 'specialist',
+          name: 'Specialist',
+          provider: Providers.OPENAI,
+          instructions: 'Specialist instructions.',
+          clientOptions: { model: 'synthetic-model' },
+        },
       ],
       edges: [
         { from: 'main', to: 'specialist', edgeType: 'handoff' },
@@ -34,22 +44,37 @@ describe('agentSchemaToolBindingPatch', () => {
     const observed = [];
     graph.overrideModel = {
       async *stream(messages) {
-        observed.push(messages.filter((message) => message.getType() === 'system')
-          .map((message) => String(message.content)).join('\n'));
+        observed.push(
+          messages
+            .filter((message) => message.getType() === 'system')
+            .map((message) => String(message.content))
+            .join('\n'),
+        );
         if (observed.length < 3) {
-          yield new AIMessageChunk({ content: '', tool_call_chunks: [{
-            id: `handoff-${observed.length}`, name: observed.length === 1
-              ? 'lc_transfer_to_specialist' : 'lc_transfer_to_main',
-            args: '{}', index: 0, type: 'tool_call_chunk',
-          }] });
+          yield new AIMessageChunk({
+            content: '',
+            tool_call_chunks: [
+              {
+                id: `handoff-${observed.length}`,
+                name: observed.length === 1 ? 'lc_transfer_to_specialist' : 'lc_transfer_to_main',
+                args: '{}',
+                index: 0,
+                type: 'tool_call_chunk',
+              },
+            ],
+          });
         } else {
           yield new AIMessageChunk({ content: 'Final answer.' });
         }
       },
     };
-    const result = await graph.createWorkflow().invoke({
-      messages: [new HumanMessage('Consult as useful, then answer.')], agentMessages: [],
-    }, { recursionLimit: 12, configurable: { thread_id: 'dynamic-handoff-context' } });
+    const result = await graph.createWorkflow().invoke(
+      {
+        messages: [new HumanMessage('Consult as useful, then answer.')],
+        agentMessages: [],
+      },
+      { recursionLimit: 12, configurable: { thread_id: 'dynamic-handoff-context' } },
+    );
     expect(observed).toHaveLength(3);
     expect(observed[0]).not.toContain('transferred from');
     expect(observed[1]).toContain('transferred from "Main"');

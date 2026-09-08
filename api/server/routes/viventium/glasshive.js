@@ -1046,7 +1046,8 @@ async function rollbackSuppressedVoiceCallback({
 }) {
   if (priorStatusMessage && typeof db.updateMessage === 'function') {
     await db.updateMessage({ user: { id: userId } }, priorStatusMessage, {
-      operationKind: 'system', context: 'viventium/routes/glasshive.callback.cancel_rollback',
+      operationKind: 'system',
+      context: 'viventium/routes/glasshive.callback.cancel_rollback',
       overrideTimestamp: true,
     });
     return;
@@ -1698,14 +1699,16 @@ async function handleGlassHiveCallback(req, res) {
     if (priorStatusMessage && typeof db.updateMessage === 'function') {
       await runTerminalEffect(() =>
         db.updateMessage({ user: { id: userId } }, followUpMessage, {
-          operationKind: 'system', context: 'viventium/routes/glasshive.callback.update',
+          operationKind: 'system',
+          context: 'viventium/routes/glasshive.callback.update',
           overrideTimestamp: true,
         }),
       );
     } else {
       await runTerminalEffect(() =>
         db.saveMessage({ user: { id: userId } }, followUpMessage, {
-          operationKind: 'system', context: 'viventium/routes/glasshive.callback',
+          operationKind: 'system',
+          context: 'viventium/routes/glasshive.callback',
         }),
       );
     }

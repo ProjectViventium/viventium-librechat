@@ -58,20 +58,38 @@ test('coverage recovery binds the exact original owner, conversation, generation
   mockMessage.exists.mockResolvedValueOnce(true);
   expect(await mockDependencies.hasCommittedDelivery(row)).toBe(true);
   expect(mockMessage.exists).toHaveBeenCalledWith({
-    user: 'owner', conversationId: 'conversation', isCreatedByUser: false,
+    user: 'owner',
+    conversationId: 'conversation',
+    isCreatedByUser: false,
     unfinished: { $ne: true },
     'metadata.viventium.deliveryAcknowledgement.state': 'committed',
     'metadata.viventium.deliverySourceCoverage.source_order_scope': row.sourceOrderScope,
-    'metadata.viventium.deliverySourceCoverage.source_conversation_generation': { $in: ['bound-generation'] },
-    'metadata.viventium.deliverySourceCoverage.sources': { $elemMatch: {
-      source_event_id: row.sourceEventId, source_message_id: row.sourceMessageId, source_sequence: 12,
-    } },
-    $expr: { $and: [
-      { $eq: ['$metadata.viventium.deliverySourceCoverage.logical_turn_id',
-        '$metadata.viventium.deliveryAcknowledgement.logical_turn_id'] },
-      { $eq: ['$metadata.viventium.deliverySourceCoverage.revision',
-        '$metadata.viventium.deliveryAcknowledgement.revision'] },
-    ] },
+    'metadata.viventium.deliverySourceCoverage.source_conversation_generation': {
+      $in: ['bound-generation'],
+    },
+    'metadata.viventium.deliverySourceCoverage.sources': {
+      $elemMatch: {
+        source_event_id: row.sourceEventId,
+        source_message_id: row.sourceMessageId,
+        source_sequence: 12,
+      },
+    },
+    $expr: {
+      $and: [
+        {
+          $eq: [
+            '$metadata.viventium.deliverySourceCoverage.logical_turn_id',
+            '$metadata.viventium.deliveryAcknowledgement.logical_turn_id',
+          ],
+        },
+        {
+          $eq: [
+            '$metadata.viventium.deliverySourceCoverage.revision',
+            '$metadata.viventium.deliveryAcknowledgement.revision',
+          ],
+        },
+      ],
+    },
   });
   mockMessage.exists.mockResolvedValueOnce(false);
   expect(await mockDependencies.hasCommittedDelivery(row)).toBe(false);
@@ -155,55 +173,100 @@ test('stream binding requires original source ownership; completion requires the
 /* VIVENTIUM END */
 
 const pendingIdentity = {
-  libreChatUserId: 'owner', telegramUserId: 'sender', telegramChatId: 'chat',
-  telegramMessageThreadId: 'thread', sourceOrderScope: 'scope',
-  conversationGeneration: 'generation', requestedConversationId: 'fresh-conversation',
+  libreChatUserId: 'owner',
+  telegramUserId: 'sender',
+  telegramChatId: 'chat',
+  telegramMessageThreadId: 'thread',
+  sourceOrderScope: 'scope',
+  conversationGeneration: 'generation',
+  requestedConversationId: 'fresh-conversation',
   sourceSequence: 13,
 };
 test('pending conversation reuse requires the active exact owner, source scope and generation', async () => {
-  mockIngress.findOne.mockReturnValue({lean: async () => ({...row, conversationId:'fresh-conversation'})});
-  const result = await inputService.resolvePendingConversation(pendingIdentity);
-  expect(result).toEqual({conversationId:'fresh-conversation'});
-  expect(mockIngress.findOne).toHaveBeenCalledWith({
-    libreChatUserId:'owner',telegramUserId:'sender',telegramChatId:'chat',
-    telegramMessageThreadId:'thread',sourceOrderScope:'scope',conversationGeneration:'generation',
-    conversationId:'fresh-conversation',sourceSequence:{$lt:13},
-    inputState:{$in:['preparing','ready','admitted']},
-    $or:[{inputState:'ready'},{inputLeaseUntil:{$gt:expect.any(Number)}}],
+  mockIngress.findOne.mockReturnValue({
+    lean: async () => ({ ...row, conversationId: 'fresh-conversation' }),
   });
-  expect(mockMessage.exists).toHaveBeenCalledWith(expect.objectContaining({
-    user:'owner',conversationId:'fresh-conversation',messageId:'original-message',
-    'metadata.viventium.telegramInput.sourceEventId':row.sourceEventId,
-  }));
+  const result = await inputService.resolvePendingConversation(pendingIdentity);
+  expect(result).toEqual({ conversationId: 'fresh-conversation' });
+  expect(mockIngress.findOne).toHaveBeenCalledWith({
+    libreChatUserId: 'owner',
+    telegramUserId: 'sender',
+    telegramChatId: 'chat',
+    telegramMessageThreadId: 'thread',
+    sourceOrderScope: 'scope',
+    conversationGeneration: 'generation',
+    conversationId: 'fresh-conversation',
+    sourceSequence: { $lt: 13 },
+    inputState: { $in: ['preparing', 'ready', 'admitted'] },
+    $or: [{ inputState: 'ready' }, { inputLeaseUntil: { $gt: expect.any(Number) } }],
+  });
+  expect(mockMessage.exists).toHaveBeenCalledWith(
+    expect.objectContaining({
+      user: 'owner',
+      conversationId: 'fresh-conversation',
+      messageId: 'original-message',
+      'metadata.viventium.telegramInput.sourceEventId': row.sourceEventId,
+    }),
+  );
 });
 test('missing, reset, foreign mapping and deleted original cannot revive a conversation', async () => {
-  mockIngress.findOne.mockReturnValue({lean:async()=>null});
+  mockIngress.findOne.mockReturnValue({ lean: async () => null });
   expect(await inputService.resolvePendingConversation(pendingIdentity)).toBeNull();
-  expect(await inputService.resolvePendingConversation({...pendingIdentity,requestedConversationId:'new'})).toBeNull();
+  expect(
+    await inputService.resolvePendingConversation({
+      ...pendingIdentity,
+      requestedConversationId: 'new',
+    }),
+  ).toBeNull();
   expect(mockIngress.findOne).toHaveBeenCalledTimes(1);
-  mockIngress.findOne.mockReturnValue({lean:async()=>({...row,conversationId:'fresh-conversation'})});
-  mockResolveMapping.mockResolvedValue({libreChatUserId:'foreign'});
+  mockIngress.findOne.mockReturnValue({
+    lean: async () => ({ ...row, conversationId: 'fresh-conversation' }),
+  });
+  mockResolveMapping.mockResolvedValue({ libreChatUserId: 'foreign' });
   expect(await inputService.resolvePendingConversation(pendingIdentity)).toBeNull();
-  mockResolveMapping.mockResolvedValue({libreChatUserId:'owner'});
+  mockResolveMapping.mockResolvedValue({ libreChatUserId: 'owner' });
   mockMessage.exists.mockResolvedValue(false);
   expect(await inputService.resolvePendingConversation(pendingIdentity)).toBeNull();
 });
 
 test('committed coverage permits only the retained source original and canonical conversation generation aliases', async () => {
-  mockConversationGeneration.mockImplementation(record => `generation:${record.requestedConversationId}`);
-  await mockDependencies.hasCommittedDelivery({...row,requestedConversationId:'new'});
-  expect(mockMessage.exists).toHaveBeenCalledWith(expect.objectContaining({
-    conversationId:row.conversationId,
-    'metadata.viventium.deliverySourceCoverage.source_conversation_generation':{$in:['generation:new','generation:conversation']},
-    'metadata.viventium.deliverySourceCoverage.sources':{$elemMatch:{source_event_id:row.sourceEventId,source_message_id:row.sourceMessageId,source_sequence:12}},
-  }));
+  mockConversationGeneration.mockImplementation(
+    (record) => `generation:${record.requestedConversationId}`,
+  );
+  await mockDependencies.hasCommittedDelivery({ ...row, requestedConversationId: 'new' });
+  expect(mockMessage.exists).toHaveBeenCalledWith(
+    expect.objectContaining({
+      conversationId: row.conversationId,
+      'metadata.viventium.deliverySourceCoverage.source_conversation_generation': {
+        $in: ['generation:new', 'generation:conversation'],
+      },
+      'metadata.viventium.deliverySourceCoverage.sources': {
+        $elemMatch: {
+          source_event_id: row.sourceEventId,
+          source_message_id: row.sourceMessageId,
+          source_sequence: 12,
+        },
+      },
+    }),
+  );
 });
 
 test('a ready input waiting for Main preserves its conversation after releasing its preparation lease', async () => {
-  mockIngress.findOne.mockReturnValue({lean:async()=>({...row,conversationId:'fresh-conversation',inputState:'ready',inputLeaseUntil:0})});
-  expect(await inputService.resolvePendingConversation(pendingIdentity)).toEqual({conversationId:'fresh-conversation'});
-  expect(mockIngress.findOne).toHaveBeenCalledWith(expect.objectContaining({
-    inputState:{$in:['preparing','ready','admitted']},
-    $or:[{inputState:'ready'},{inputLeaseUntil:{$gt:expect.any(Number)}}],
-  }));
+  mockIngress.findOne.mockReturnValue({
+    lean: async () => ({
+      ...row,
+      conversationId: 'fresh-conversation',
+      inputState: 'ready',
+      inputLeaseUntil: 0,
+    }),
+  });
+  expect(await inputService.resolvePendingConversation(pendingIdentity)).toEqual({
+    conversationId: 'fresh-conversation',
+  });
+  expect(mockIngress.findOne).toHaveBeenCalledWith(
+    expect.objectContaining({
+      inputState: { $in: ['preparing', 'ready', 'admitted'] },
+      $or: [{ inputState: 'ready' }, { inputLeaseUntil: { $gt: expect.any(Number) } }],
+    }),
+  );
 });

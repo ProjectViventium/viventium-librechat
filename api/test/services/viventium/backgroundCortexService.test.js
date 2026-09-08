@@ -1,13 +1,17 @@
 jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => {
   const actual = jest.requireActual('~/server/services/viventium/CortexInsightDeliveryService');
-  return { ...actual, recordCompletedCortexInsightDeliveryBatch: jest.fn(async (batch) => ({
-    deliveries: actual.buildCortexInsightDeliveryCandidates(batch),
-  })) };
+  return {
+    ...actual,
+    recordCompletedCortexInsightDeliveryBatch: jest.fn(async (batch) => ({
+      deliveries: actual.buildCortexInsightDeliveryCandidates(batch),
+    })),
+  };
 });
 jest.mock('~/server/services/viventium/CortexInsightOutboxService', () => ({
   enqueueCompletedCortexInsightOutboxBatch: jest.fn(async (batch) => ({
     outboxKeys: require('~/server/services/viventium/CortexInsightDeliveryService')
-      .buildCortexInsightDeliveryCandidates(batch).map((row) => row.deliveryKey),
+      .buildCortexInsightDeliveryCandidates(batch)
+      .map((row) => row.deliveryKey),
   })),
   settleCompletedCortexInsightOutboxBatch: jest.fn(async () => ({ deleted: 1 })),
 }));
@@ -302,21 +306,32 @@ describe('BackgroundCortexService GlassHive request identity', () => {
       };
       const before = structuredClone(requestBody);
       const body = buildCortexRequestBody({
-        requestBody, runId: 'cortex-run-1', conversationId: 'conversation-1',
+        requestBody,
+        runId: 'cortex-run-1',
+        conversationId: 'conversation-1',
         idempotencyKey: 'cortex:agent:cortex-run-1',
       });
       expect(body).not.toHaveProperty('viventiumGlassHiveTurnContextB64');
       expect(body).toEqual({
-        text: requestBody.text, conversationId: 'conversation-1', parentMessageId: 'parent-1',
-        files: requestBody.files, viventiumSurface: 'web', scheduleId: 'schedule-1',
-        messageId: 'cortex-run-1', viventiumGlassHiveIdempotencyKey: 'cortex:agent:cortex-run-1',
+        text: requestBody.text,
+        conversationId: 'conversation-1',
+        parentMessageId: 'parent-1',
+        files: requestBody.files,
+        viventiumSurface: 'web',
+        scheduleId: 'schedule-1',
+        messageId: 'cortex-run-1',
+        viventiumGlassHiveIdempotencyKey: 'cortex:agent:cortex-run-1',
       });
       expect(requestBody).toEqual(before);
       const { resolveHeaders } = jest.requireActual('@librechat/api');
-      expect(resolveHeaders({
-        headers: { 'X-GlassHive-Turn-Context-B64': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVETURNCONTEXTB64}}' },
-        body,
-      })['X-GlassHive-Turn-Context-B64']).toBe('');
+      expect(
+        resolveHeaders({
+          headers: {
+            'X-GlassHive-Turn-Context-B64': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVETURNCONTEXTB64}}',
+          },
+          body,
+        })['X-GlassHive-Turn-Context-B64'],
+      ).toBe('');
     },
   );
 
@@ -461,7 +476,9 @@ describe('BackgroundCortexService.detectActivations', () => {
         background_cortices: [
           {
             agent_id: 'a1',
-            result_evidence: { visible_insight_requires: [{ tool: 'file_search', receipt: 'non_empty_sources' }] },
+            result_evidence: {
+              visible_insight_requires: [{ tool: 'file_search', receipt: 'non_empty_sources' }],
+            },
             activation: { enabled: true, intent_scope: 'productivity_google_workspace' },
           },
           { agent_id: 'a2', activation: { enabled: true } },
@@ -478,7 +495,9 @@ describe('BackgroundCortexService.detectActivations', () => {
     expect(res.activatedCortices[0]).toEqual(
       expect.objectContaining({
         agentId: 'a1',
-        resultEvidence: { visible_insight_requires: [{ tool: 'file_search', receipt: 'non_empty_sources' }] },
+        resultEvidence: {
+          visible_insight_requires: [{ tool: 'file_search', receipt: 'non_empty_sources' }],
+        },
         activationScope: 'productivity_google_workspace',
         cortexName: 'Name:a1',
         cortexDescription: 'Desc:a1',
@@ -1797,25 +1816,54 @@ describe('BackgroundCortexService.executeCortex', () => {
   test.each([
     ['no receipt', undefined, 'unverified advice', false],
     ['empty retrieval', { file_search: { sources: [] } }, 'unverified advice', false],
-    ['another tool', { web_search: { sources: [{ content: 'found' }] } }, 'unverified advice', false],
-    ['live retrieval', { file_search: { sources: [{ content: 'found' }] } }, 'retrieved fact', true],
+    [
+      'another tool',
+      { web_search: { sources: [{ content: 'found' }] } },
+      'unverified advice',
+      false,
+    ],
+    [
+      'live retrieval',
+      { file_search: { sources: [{ content: 'found' }] } },
+      'retrieved fact',
+      true,
+    ],
     ['intentional silence', undefined, '{NTA}', true],
   ])('enforces declared result evidence: %s', async (_label, artifact, text, accepted) => {
-    initializeAgent.mockResolvedValueOnce({ id: 'source-specialist', provider: 'openai', tools: ['file_search'] });
+    initializeAgent.mockResolvedValueOnce({
+      id: 'source-specialist',
+      provider: 'openai',
+      tools: ['file_search'],
+    });
     createContentAggregator.mockReturnValueOnce({ contentParts: [], aggregateContent: jest.fn() });
-    createRun.mockResolvedValueOnce({ processStream: jest.fn(async () => {
-      if (artifact) {
-        const handler = getDefaultHandlers.mock.calls.at(-1)[0].toolEndCallback;
-        await handler({ output: { name: 'file_search', tool_call_id: 'current-search', artifact } }, {});
-      }
-      return text;
-    }) });
+    createRun.mockResolvedValueOnce({
+      processStream: jest.fn(async () => {
+        if (artifact) {
+          const handler = getDefaultHandlers.mock.calls.at(-1)[0].toolEndCallback;
+          await handler(
+            { output: { name: 'file_search', tool_call_id: 'current-search', artifact } },
+            {},
+          );
+        }
+        return text;
+      }),
+    });
     const result = await executeCortex({
-      agent: { id: 'source-specialist', provider: 'openai', model: 'gpt-5.4', tools: ['file_search'] },
-      resultEvidence: { visible_insight_requires: [{ tool: 'file_search', receipt: 'non_empty_sources' }] },
+      agent: {
+        id: 'source-specialist',
+        provider: 'openai',
+        model: 'gpt-5.4',
+        tools: ['file_search'],
+      },
+      resultEvidence: {
+        visible_insight_requires: [{ tool: 'file_search', receipt: 'non_empty_sources' }],
+      },
       messages: [{ role: 'user', content: 'Use the relevant stored evidence.' }],
       runId: 'evidence-run',
-      req: { user: { id: 'owner', role: 'USER' }, body: { conversationId: 'conversation', parentMessageId: 'question' } },
+      req: {
+        user: { id: 'owner', role: 'USER' },
+        body: { conversationId: 'conversation', parentMessageId: 'question' },
+      },
     });
     if (accepted) {
       expect(result.error).toBeUndefined();
@@ -2005,30 +2053,36 @@ describe('BackgroundCortexService.executeCortex', () => {
     );
   });
 
-  test.each([['system', 'scheduler'], ['external_user', 'interactive'], [null, null]])('preserves authenticated child scope %s/%s at native capability admission', async (actor_kind, origin) => {
-    const processStream = jest.fn(async () => 'run-output');
-    const initializedAgent = {
-      id: 'agent_glasshive_cortex',
-      name: 'GlassHive Cortex',
-      provider: 'openAI',
-      tools: [],
-      userMCPAuthMap: null,
-      recursion_limit: 11,
-    };
-    const capability = {
-      workspace_binding: true,
-      cortex_execution: true,
-      host_tools_transport: 'broker_mcp',
-    };
+  test.each([
+    ['system', 'scheduler'],
+    ['external_user', 'interactive'],
+    [null, null],
+  ])(
+    'preserves authenticated child scope %s/%s at native capability admission',
+    async (actor_kind, origin) => {
+      const processStream = jest.fn(async () => 'run-output');
+      const initializedAgent = {
+        id: 'agent_glasshive_cortex',
+        name: 'GlassHive Cortex',
+        provider: 'openAI',
+        tools: [],
+        userMCPAuthMap: null,
+        recursion_limit: 11,
+      };
+      const capability = {
+        workspace_binding: true,
+        cortex_execution: true,
+        host_tools_transport: 'broker_mcp',
+      };
 
-    initializeAgent.mockResolvedValueOnce(initializedAgent);
-    createRun.mockResolvedValueOnce({ processStream });
-    createContentAggregator.mockReturnValueOnce({
-      contentParts: [{ type: 'text', text: 'aggregated insight' }],
-      aggregateContent: jest.fn(),
-    });
+      initializeAgent.mockResolvedValueOnce(initializedAgent);
+      createRun.mockResolvedValueOnce({ processStream });
+      createContentAggregator.mockReturnValueOnce({
+        contentParts: [{ type: 'text', text: 'aggregated insight' }],
+        aggregateContent: jest.fn(),
+      });
 
-    const req = {
+      const req = {
         user: { id: 'user-1', role: 'USER' },
         body: { conversationId: 'c1', parentMessageId: 'p1' },
         config: {
@@ -2041,40 +2095,55 @@ describe('BackgroundCortexService.executeCortex', () => {
           },
         },
       };
-    const { setTrustedInteractionContext, getTrustedInteractionContext,
-      projectTrustedNativeInteractionHeaders } = jest.requireActual('@librechat/api');
-    req.body.interactionContext = { actor_kind: 'system', origin: 'scheduler' };
-    if (actor_kind) setTrustedInteractionContext(req, { actor_kind, origin,
-      surface: 'web', conversation_id: 'c1', source_event_id: 'event-synthetic' });
+      const {
+        setTrustedInteractionContext,
+        getTrustedInteractionContext,
+        projectTrustedNativeInteractionHeaders,
+      } = jest.requireActual('@librechat/api');
+      req.body.interactionContext = { actor_kind: 'system', origin: 'scheduler' };
+      if (actor_kind)
+        setTrustedInteractionContext(req, {
+          actor_kind,
+          origin,
+          surface: 'web',
+          conversation_id: 'c1',
+          source_event_id: 'event-synthetic',
+        });
 
-    await executeCortex({
-      agent: {
-        id: 'agent_glasshive_cortex',
-        name: 'GlassHive Cortex',
-        provider: 'glasshive-harness',
-        model: 'codex-cli:gpt-5.6-sol',
-        instructions: 'Use declared capabilities.',
-      },
-      messages: [{ role: 'user', content: 'Inspect the current evidence.' }],
-      runId: 'run-glasshive-cortex',
-      req,
-    });
+      await executeCortex({
+        agent: {
+          id: 'agent_glasshive_cortex',
+          name: 'GlassHive Cortex',
+          provider: 'glasshive-harness',
+          model: 'codex-cli:gpt-5.6-sol',
+          instructions: 'Use declared capabilities.',
+        },
+        messages: [{ role: 'user', content: 'Inspect the current evidence.' }],
+        runId: 'run-glasshive-cortex',
+        req,
+      });
 
-    expect(attachConversationProviderCapabilityBundle).toHaveBeenCalledWith(
-      expect.objectContaining({
-        targetAgent: initializedAgent,
-        declaredAgent: expect.objectContaining({ provider: 'glasshive-harness' }),
-        capability,
-      }),
-    );
+      expect(attachConversationProviderCapabilityBundle).toHaveBeenCalledWith(
+        expect.objectContaining({
+          targetAgent: initializedAgent,
+          declaredAgent: expect.objectContaining({ provider: 'glasshive-harness' }),
+          capability,
+        }),
+      );
 
-    const childReq = attachConversationProviderCapabilityBundle.mock.calls.at(-1)[0].req;
-    expect(childReq).not.toBe(req);
-    expect(getTrustedInteractionContext(childReq)).toEqual(getTrustedInteractionContext(req));
-    expect(projectTrustedNativeInteractionHeaders(childReq)).toEqual(actor_kind ? {
-      'X-Viventium-Actor-Kind': actor_kind, 'X-Viventium-Origin': origin,
-    } : {});
-  });
+      const childReq = attachConversationProviderCapabilityBundle.mock.calls.at(-1)[0].req;
+      expect(childReq).not.toBe(req);
+      expect(getTrustedInteractionContext(childReq)).toEqual(getTrustedInteractionContext(req));
+      expect(projectTrustedNativeInteractionHeaders(childReq)).toEqual(
+        actor_kind
+          ? {
+              'X-Viventium-Actor-Kind': actor_kind,
+              'X-Viventium-Origin': origin,
+            }
+          : {},
+      );
+    },
+  );
 
   test('direct executeCortex uses a validated configured fallback after provider failure', async () => {
     const primaryProcessStream = jest.fn(async () => '');
@@ -2219,7 +2288,9 @@ describe('BackgroundCortexService.executeCortex', () => {
   });
 
   test('preserves a needed productivity clarification without unnecessary tool calls', async () => {
-    const processStream = jest.fn(async () => "Which connected account should I use for the draft?");
+    const processStream = jest.fn(
+      async () => 'Which connected account should I use for the draft?',
+    );
     const initializedAgent = {
       id: 'agent_google',
       name: 'Google',
@@ -2417,12 +2488,14 @@ describe('BackgroundCortexService.executeCortex', () => {
 
     expect(onAllComplete).toHaveBeenCalledWith(
       expect.objectContaining({
-        insights: [expect.objectContaining({
-          cortexId: 'agent_google',
-          insight: "For a live update, I can't access Gmail directly.",
-          activationScope: 'productivity_google_workspace',
-          completed_tool_calls: 0,
-        })],
+        insights: [
+          expect.objectContaining({
+            cortexId: 'agent_google',
+            insight: "For a live update, I can't access Gmail directly.",
+            activationScope: 'productivity_google_workspace',
+            completed_tool_calls: 0,
+          }),
+        ],
         errors: undefined,
       }),
     );
@@ -3471,18 +3544,27 @@ describe('BackgroundCortexService.executeCortex', () => {
           memory: { disabled: false },
         },
         body: {
-          conversationId: 'c1', parentMessageId: 'p1',
-          viventiumGlassHiveTurnContextB64: Buffer.from('Main-only operational context').toString('base64'),
+          conversationId: 'c1',
+          parentMessageId: 'p1',
+          viventiumGlassHiveTurnContextB64: Buffer.from('Main-only operational context').toString(
+            'base64',
+          ),
         },
       },
     });
 
-    expect(createRun.mock.calls[0][0].requestBody).not.toHaveProperty('viventiumGlassHiveTurnContextB64');
+    expect(createRun.mock.calls[0][0].requestBody).not.toHaveProperty(
+      'viventiumGlassHiveTurnContextB64',
+    );
     const initArgs = initializeAgent.mock.calls[0][0];
     expect(initArgs.agent.instructions).toContain('# Existing memory about the user:');
     expect(initArgs.agent.instructions).toContain('did x on 2026-02-07');
-    expect(initArgs.agent.instructions).toContain('# Existing memory about the user:\n- moments: did x on 2026-02-07');
-    expect(initArgs.agent.instructions).not.toContain('The system automatically stores important user information');
+    expect(initArgs.agent.instructions).toContain(
+      '# Existing memory about the user:\n- moments: did x on 2026-02-07',
+    );
+    expect(initArgs.agent.instructions).not.toContain(
+      'The system automatically stores important user information',
+    );
   });
 
   test('marks saved memory unavailable when the cortex access check fails', async () => {
@@ -4110,7 +4192,7 @@ describe('BackgroundCortexService owner abort signal lifecycle', () => {
     const seen = {};
     const processStream = jest.fn(async (_input, config) => {
       seen.runSignalAborted = config.signal.aborted;
-      return "reaction insight";
+      return 'reaction insight';
     });
     initializeAgent.mockResolvedValueOnce(initializedReactionAgent());
     createRun.mockResolvedValueOnce({ processStream });
@@ -4147,7 +4229,7 @@ describe('BackgroundCortexService owner abort signal lifecycle', () => {
     const processStream = jest.fn(async (_input, config) => {
       owner.abort('generation_completed');
       seen.runSignalAbortedAfterOwnerRelease = config.signal.aborted;
-      return "late reaction insight";
+      return 'late reaction insight';
     });
     initializeAgent.mockResolvedValueOnce(initializedReactionAgent());
     createRun.mockResolvedValueOnce({ processStream });
@@ -4320,7 +4402,7 @@ describe('BackgroundCortexService owner abort signal lifecycle', () => {
       recursion_limit: 11,
       provider: 'openai',
     });
-    createRun.mockResolvedValueOnce({ processStream: jest.fn(async () => "late phase b insight") });
+    createRun.mockResolvedValueOnce({ processStream: jest.fn(async () => 'late phase b insight') });
     createContentAggregator.mockReturnValueOnce({
       contentParts: [{ type: 'text', text: 'late phase b insight' }],
       aggregateContent: jest.fn(),
@@ -4385,54 +4467,94 @@ describe('BackgroundCortexService owner abort signal lifecycle', () => {
 });
 
 describe('production Cortex completed-result acceptance', () => {
-  test.each([true, false])('runs one provider attempt and gates completed output on acceptance (%s)', async (accepted) => {
-    jest.clearAllMocks();
-    const ledger = require('~/server/services/viventium/CortexInsightDeliveryService');
-    const outbox = require('~/server/services/viventium/CortexInsightOutboxService');
-    const stale = 'Stale provider delta.';
-    const exact = 'Completed graph result.';
-    initializeAgent.mockResolvedValueOnce({ id: 'acceptance-cortex', provider: 'openai', tools: [] });
-    createContentAggregator.mockReturnValueOnce({ contentParts: [{ type: 'text', text: stale }], aggregateContent: jest.fn() });
-    createRun.mockResolvedValueOnce({ processStream: jest.fn(async () => [{ type: 'text', text: exact }]) });
-    if (!accepted) {
-      ledger.recordCompletedCortexInsightDeliveryBatch.mockRejectedValueOnce(new Error('ledger unavailable'));
-      outbox.enqueueCompletedCortexInsightOutboxBatch.mockRejectedValueOnce(new Error('outbox unavailable'));
-    }
-    const result = await executeCortex({
-      agent: { id: 'acceptance-cortex', provider: 'openai', model: 'configured-model', tools: [],
-        fallback_llm_provider: 'anthropic', fallback_llm_model: 'configured-fallback' },
-      messages: [{ role: 'user', content: 'Review synthetic evidence.' }],
-      runId: 'accepted-parent', contextMode: 'minimal',
-      req: { user: { id: 'owner', role: 'USER' }, body: { conversationId: 'accepted-conversation' } },
-    });
-    expect(createRun).toHaveBeenCalledTimes(1);
-    expect(ledger.recordCompletedCortexInsightDeliveryBatch).toHaveBeenCalledWith(expect.objectContaining({
-      insights: [expect.objectContaining({ insight: exact })],
-    }));
-    if (accepted) expect(result.insight).toBe(exact);
-    else {
-      expect(result).toMatchObject({ insight: null, errorClass: 'delivery_persistence_unavailable' });
-      expect(buildCortexCompletionPayload(result)).not.toHaveProperty('insight');
-    }
-  });
+  test.each([true, false])(
+    'runs one provider attempt and gates completed output on acceptance (%s)',
+    async (accepted) => {
+      jest.clearAllMocks();
+      const ledger = require('~/server/services/viventium/CortexInsightDeliveryService');
+      const outbox = require('~/server/services/viventium/CortexInsightOutboxService');
+      const stale = 'Stale provider delta.';
+      const exact = 'Completed graph result.';
+      initializeAgent.mockResolvedValueOnce({
+        id: 'acceptance-cortex',
+        provider: 'openai',
+        tools: [],
+      });
+      createContentAggregator.mockReturnValueOnce({
+        contentParts: [{ type: 'text', text: stale }],
+        aggregateContent: jest.fn(),
+      });
+      createRun.mockResolvedValueOnce({
+        processStream: jest.fn(async () => [{ type: 'text', text: exact }]),
+      });
+      if (!accepted) {
+        ledger.recordCompletedCortexInsightDeliveryBatch.mockRejectedValueOnce(
+          new Error('ledger unavailable'),
+        );
+        outbox.enqueueCompletedCortexInsightOutboxBatch.mockRejectedValueOnce(
+          new Error('outbox unavailable'),
+        );
+      }
+      const result = await executeCortex({
+        agent: {
+          id: 'acceptance-cortex',
+          provider: 'openai',
+          model: 'configured-model',
+          tools: [],
+          fallback_llm_provider: 'anthropic',
+          fallback_llm_model: 'configured-fallback',
+        },
+        messages: [{ role: 'user', content: 'Review synthetic evidence.' }],
+        runId: 'accepted-parent',
+        contextMode: 'minimal',
+        req: {
+          user: { id: 'owner', role: 'USER' },
+          body: { conversationId: 'accepted-conversation' },
+        },
+      });
+      expect(createRun).toHaveBeenCalledTimes(1);
+      expect(ledger.recordCompletedCortexInsightDeliveryBatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          insights: [expect.objectContaining({ insight: exact })],
+        }),
+      );
+      if (accepted) expect(result.insight).toBe(exact);
+      else {
+        expect(result).toMatchObject({
+          insight: null,
+          errorClass: 'delivery_persistence_unavailable',
+        });
+        expect(buildCortexCompletionPayload(result)).not.toHaveProperty('insight');
+      }
+    },
+  );
 });
 
 test('a batch completion callback cannot expose an unaccepted completed result or rerun inference', async () => {
   jest.clearAllMocks();
   const ledger = require('~/server/services/viventium/CortexInsightDeliveryService');
   const outbox = require('~/server/services/viventium/CortexInsightOutboxService');
-  ledger.recordCompletedCortexInsightDeliveryBatch.mockRejectedValueOnce(new Error('ledger unavailable'));
-  outbox.enqueueCompletedCortexInsightOutboxBatch.mockRejectedValueOnce(new Error('outbox unavailable'));
+  ledger.recordCompletedCortexInsightDeliveryBatch.mockRejectedValueOnce(
+    new Error('ledger unavailable'),
+  );
+  outbox.enqueueCompletedCortexInsightOutboxBatch.mockRejectedValueOnce(
+    new Error('outbox unavailable'),
+  );
   initializeAgent.mockResolvedValueOnce({ id: 'acceptance-cortex', provider: 'openai', tools: [] });
   createContentAggregator.mockReturnValueOnce({ contentParts: [], aggregateContent: jest.fn() });
-  createRun.mockResolvedValueOnce({ processStream: jest.fn(async () => 'Private unaccepted result.') });
+  createRun.mockResolvedValueOnce({
+    processStream: jest.fn(async () => 'Private unaccepted result.'),
+  });
   const onCortexComplete = jest.fn();
   const onAllComplete = jest.fn();
   const result = await executeActivated({
     req: { user: { id: 'owner', role: 'USER' }, body: { conversationId: 'conversation' } },
-    mainAgent: { provider: 'openai' }, messages: [{ role: 'user', content: 'Review synthetic evidence.' }],
-    runId: 'parent', activatedCortices: [{ agentId: 'acceptance-cortex', cortexName: 'Analysis', confidence: 1 }],
-    onCortexComplete, onAllComplete,
+    mainAgent: { provider: 'openai' },
+    messages: [{ role: 'user', content: 'Review synthetic evidence.' }],
+    runId: 'parent',
+    activatedCortices: [{ agentId: 'acceptance-cortex', cortexName: 'Analysis', confidence: 1 }],
+    onCortexComplete,
+    onAllComplete,
   });
   expect(createRun).toHaveBeenCalledTimes(1);
   expect(result.insights).toEqual([]);

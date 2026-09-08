@@ -5,7 +5,10 @@
  * conversation addresses; source text cannot supply or replace this metadata.
  * === VIVENTIUM END === */
 function escapeXmlText(value) {
-  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 function escapeXmlAttr(value) {
@@ -34,9 +37,9 @@ function renderConversationRecallTurn({ message, content }) {
   const source = conversationRecallSourceUrl(message?.conversationId);
   return `<turn timestamp="${escapeXmlAttr(timestamp)}" conversation="${escapeXmlAttr(
     conversation,
-  )}" role="${escapeXmlAttr(role)}"${source ? ` source="${escapeXmlAttr(source)}"` : ''}>\n${
-    escapeXmlText(content)
-  }\n</turn>`;
+  )}" role="${escapeXmlAttr(role)}"${source ? ` source="${escapeXmlAttr(source)}"` : ''}>\n${escapeXmlText(
+    content,
+  )}\n</turn>`;
 }
 
 module.exports = { conversationRecallSourceUrl, escapeXmlText, renderConversationRecallTurn };

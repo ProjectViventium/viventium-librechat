@@ -1,4 +1,10 @@
-jest.mock('../CortexInsightOutboxService', () => ({ replayCompletedCortexInsightOutbox: jest.fn(async () => ({ scanned: 0, replayed: 0, pending: 0 })) }));
+jest.mock('../CortexInsightOutboxService', () => ({
+  replayCompletedCortexInsightOutbox: jest.fn(async () => ({
+    scanned: 0,
+    replayed: 0,
+    pending: 0,
+  })),
+}));
 jest.mock('~/db/models', () => ({
   ViventiumCortexInsightDelivery: {},
   Message: {
@@ -216,26 +222,43 @@ describe('staleCortexMessageRecovery', () => {
 
   test('repairs a recorded recovered error flag after promotion already removed the error part', async () => {
     const updatedAt = new Date('2026-05-21T06:44:46.000Z');
-    const metadata = { viventium: {
-      type: 'cortex_followup', promotedToEmptyParent: true,
-      recoveredPrimaryErrorClasses: ['completion_error'],
-    } };
+    const metadata = {
+      viventium: {
+        type: 'cortex_followup',
+        promotedToEmptyParent: true,
+        recoveredPrimaryErrorClasses: ['completion_error'],
+      },
+    };
     const nativeResponse = { status: 'failed', failureClass: 'completion_error' };
     const content = [{ type: ContentTypes.TEXT, text: 'Recovered answer.' }];
-    mockFindLean([{ _id: 'recovered-flag', updatedAt, error: true, text: 'Recovered answer.',
-      content, metadata, nativeResponse }]);
+    mockFindLean([
+      {
+        _id: 'recovered-flag',
+        updatedAt,
+        error: true,
+        text: 'Recovered answer.',
+        content,
+        metadata,
+        nativeResponse,
+      },
+    ]);
 
-    expect(await recoverVisibleFollowUpErrorCards({ limit: 10 })).toEqual({ scanned: 1, repaired: 1 });
-    expect(Message.find).toHaveBeenCalledWith(expect.objectContaining({
-      'nativeResponse.status': { $nin: ['pending', 'prepared'] },
-      isCreatedByUser: false,
-      'metadata.viventium.type': 'cortex_followup',
-      'metadata.viventium.promotedToEmptyParent': true,
-      $or: [
-        { 'content.type': ContentTypes.ERROR },
-        { error: true, 'metadata.viventium.recoveredPrimaryErrorClasses.0': { $exists: true } },
-      ],
-    }));
+    expect(await recoverVisibleFollowUpErrorCards({ limit: 10 })).toEqual({
+      scanned: 1,
+      repaired: 1,
+    });
+    expect(Message.find).toHaveBeenCalledWith(
+      expect.objectContaining({
+        'nativeResponse.status': { $nin: ['pending', 'prepared'] },
+        isCreatedByUser: false,
+        'metadata.viventium.type': 'cortex_followup',
+        'metadata.viventium.promotedToEmptyParent': true,
+        $or: [
+          { 'content.type': ContentTypes.ERROR },
+          { error: true, 'metadata.viventium.recoveredPrimaryErrorClasses.0': { $exists: true } },
+        ],
+      }),
+    );
     expect(Message.updateOne).toHaveBeenCalledWith(
       { _id: 'recovered-flag', updatedAt },
       { $set: { error: false, unfinished: false, content, metadata } },
@@ -243,18 +266,30 @@ describe('staleCortexMessageRecovery', () => {
     expect(nativeResponse).toEqual({ status: 'failed', failureClass: 'completion_error' });
   });
 
-  test.each([false, true])('does not clear an unproven error flag or count a superseded recovery (%s)', async (hasRecovery) => {
-    mockFindLean([{ _id: 'recovered-flag', updatedAt: new Date('2026-05-21T06:44:46.000Z'),
-      error: true, text: 'Text alone is not recovery authority.',
-      content: [{ type: ContentTypes.TEXT, text: 'Text alone is not recovery authority.' }],
-      metadata: { viventium: { type: 'cortex_followup', promotedToEmptyParent: true,
-        recoveredPrimaryErrorClasses: hasRecovery ? ['completion_error'] : [],
-      } },
-    }]);
-    Message.updateOne.mockResolvedValueOnce({ modifiedCount: 0 });
-    expect(await recoverVisibleFollowUpErrorCards()).toEqual({ scanned: 1, repaired: 0 });
-    expect(Message.updateOne).toHaveBeenCalledTimes(hasRecovery ? 1 : 0);
-  });
+  test.each([false, true])(
+    'does not clear an unproven error flag or count a superseded recovery (%s)',
+    async (hasRecovery) => {
+      mockFindLean([
+        {
+          _id: 'recovered-flag',
+          updatedAt: new Date('2026-05-21T06:44:46.000Z'),
+          error: true,
+          text: 'Text alone is not recovery authority.',
+          content: [{ type: ContentTypes.TEXT, text: 'Text alone is not recovery authority.' }],
+          metadata: {
+            viventium: {
+              type: 'cortex_followup',
+              promotedToEmptyParent: true,
+              recoveredPrimaryErrorClasses: hasRecovery ? ['completion_error'] : [],
+            },
+          },
+        },
+      ]);
+      Message.updateOne.mockResolvedValueOnce({ modifiedCount: 0 });
+      expect(await recoverVisibleFollowUpErrorCards()).toEqual({ scanned: 1, repaired: 0 });
+      expect(Message.updateOne).toHaveBeenCalledTimes(hasRecovery ? 1 : 0);
+    },
+  );
 
   test('strips stale completion errors from deferred hold parents only when structurally safe', () => {
     const holdPart = {
@@ -424,8 +459,11 @@ describe('staleCortexMessageRecovery', () => {
 
     expect(result).toEqual(expect.objectContaining({ scanned: 1, repaired: 1, timeoutMs: 1000 }));
     expect(Message.updateOne).toHaveBeenCalledWith(
-      { _id: 'mongo-id-1', updatedAt: new Date('2026-05-06T11:59:01.000Z'),
-        'nativeResponse.status': { $nin: ['pending', 'prepared'] } },
+      {
+        _id: 'mongo-id-1',
+        updatedAt: new Date('2026-05-06T11:59:01.000Z'),
+        'nativeResponse.status': { $nin: ['pending', 'prepared'] },
+      },
       {
         $set: expect.objectContaining({
           unfinished: false,
@@ -463,8 +501,11 @@ describe('staleCortexMessageRecovery', () => {
 
     expect(result).toEqual(expect.objectContaining({ scanned: 1, repaired: 1, timeoutMs: 1000 }));
     expect(Message.updateOne).toHaveBeenCalledWith(
-      { _id: 'mongo-id-blank', updatedAt: new Date('2026-05-06T11:59:01.000Z'),
-        'nativeResponse.status': { $nin: ['pending', 'prepared'] } },
+      {
+        _id: 'mongo-id-blank',
+        updatedAt: new Date('2026-05-06T11:59:01.000Z'),
+        'nativeResponse.status': { $nin: ['pending', 'prepared'] },
+      },
       {
         $set: expect.objectContaining({
           unfinished: false,

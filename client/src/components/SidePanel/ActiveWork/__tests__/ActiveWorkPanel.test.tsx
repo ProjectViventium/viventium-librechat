@@ -129,11 +129,27 @@ describe('Active work Control Panel', () => {
   });
 
   test('shows native input without a generic resume that could imply approval', () => {
-    setWork({ work: [{ workRef: 'work-native', title: 'App task', state: 'needs_input', actions: ['resume', 'stop'],
-      pendingNativeInput: { version: 1, requestId: 'request-1', requestFingerprint: 'a'.repeat(64),
-        kind: 'elicitation', mcpServerName: 'Computer', message: 'Allow this app?', mode: 'form', state: 'pending',
-        requestedSchema: { type: 'object', properties: {} } },
-    }] });
+    setWork({
+      work: [
+        {
+          workRef: 'work-native',
+          title: 'App task',
+          state: 'needs_input',
+          actions: ['resume', 'stop'],
+          pendingNativeInput: {
+            version: 1,
+            requestId: 'request-1',
+            requestFingerprint: 'a'.repeat(64),
+            kind: 'elicitation',
+            mcpServerName: 'Computer',
+            message: 'Allow this app?',
+            mode: 'form',
+            state: 'pending',
+            requestedSchema: { type: 'object', properties: {} },
+          },
+        },
+      ],
+    });
     render(<ActiveWorkPanel />);
     expect(screen.getByText('Allow this app?')).toBeVisible();
     expect(screen.queryByText('com_ui_parallel_work_action_resume')).not.toBeInTheDocument();

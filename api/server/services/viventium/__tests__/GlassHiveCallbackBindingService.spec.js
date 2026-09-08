@@ -1644,25 +1644,41 @@ describe('GlassHiveCallbackBindingService', () => {
     const externals = new Map();
     const apply = (rows, filter, update) => {
       let row = rows.get(filter._id);
-      if (!row && update.$setOnInsert) { row = { ...update.$setOnInsert }; rows.set(filter._id, row); }
+      if (!row && update.$setOnInsert) {
+        row = { ...update.$setOnInsert };
+        rows.set(filter._id, row);
+      }
       if (!row) return { acknowledged: true, matchedCount: 0 };
-      if (filter.launchState?.$in && !filter.launchState.$in.includes(row.launchState)) return { acknowledged: true, matchedCount: 0 };
+      if (filter.launchState?.$in && !filter.launchState.$in.includes(row.launchState))
+        return { acknowledged: true, matchedCount: 0 };
       if (filter.workRef === '' && row.workRef) return { acknowledged: true, matchedCount: 0 };
       Object.assign(row, update.$set || {});
       return { acknowledged: true, matchedCount: 1 };
     };
-    mockBindingUpdateOne.mockImplementation(async (filter, update) => apply(bindings, filter, update));
-    mockExternalUpdateOne.mockImplementation(async (filter, update) => apply(externals, filter, update));
+    mockBindingUpdateOne.mockImplementation(async (filter, update) =>
+      apply(bindings, filter, update),
+    );
+    mockExternalUpdateOne.mockImplementation(async (filter, update) =>
+      apply(externals, filter, update),
+    );
     mockBindingFindOne.mockImplementation(async (filter) => bindings.get(filter._id) || null);
     mockExternalFindOne.mockImplementation(async (filter) => externals.get(filter._id) || null);
-    mockExternalCursor.toArray.mockImplementation(async () => [...externals.values()].filter((row) => row.launchState === 'dispatch_unknown'));
-    const exactGoal = '  Compare the approaches.\nReturn the requested table and original source files.  ';
+    mockExternalCursor.toArray.mockImplementation(async () =>
+      [...externals.values()].filter((row) => row.launchState === 'dispatch_unknown'),
+    );
+    const exactGoal =
+      '  Compare the approaches.\nReturn the requested table and original source files.  ';
     const launch = await registerGlassHiveLaunchContext({
-      user: { id: 'user-1' }, toolName: 'worker_delegate_once',
+      user: { id: 'user-1' },
+      toolName: 'worker_delegate_once',
       toolArguments: { instruction: exactGoal, require_callback: true },
-      requestBody: { conversationId: 'conversation-1', messageId: 'assistant-anchor', parentMessageId: 'user-message',
+      requestBody: {
+        conversationId: 'conversation-1',
+        messageId: 'assistant-anchor',
+        parentMessageId: 'user-message',
         viventiumSourceEventId: 'source-pending',
-        viventiumTriggeringSourceSegments: [{ ordinal: 0, text: exactGoal }] },
+        viventiumTriggeringSourceSegments: [{ ordinal: 0, text: exactGoal }],
+      },
       toolCall: { id: 'call-pending', turn: 0 },
     });
     const toolArguments = attachGlassHiveTrustedLaunchMetadata({ instruction: exactGoal }, launch);
@@ -1671,31 +1687,81 @@ describe('GlassHiveCallbackBindingService', () => {
     expect(bindings.get(launch.originRef).launchState).toBe('dispatch_unknown');
     expect(launch.delegationContext.triggering_source_segments[0].text).toBe(exactGoal);
     mockRequestAccountApi.mockResolvedValueOnce({ workRef: 'gh-work-pending' });
-    await expect(reconcileUnknownGlassHiveLaunches({ ownerId: 'user-1' })).resolves.toEqual({ scanned: 1, repaired: 1, pending: 0 });
-    await expect(reconcileUnknownGlassHiveLaunches({ ownerId: 'user-1' })).resolves.toEqual({ scanned: 0, repaired: 0, pending: 0 });
+    await expect(reconcileUnknownGlassHiveLaunches({ ownerId: 'user-1' })).resolves.toEqual({
+      scanned: 1,
+      repaired: 1,
+      pending: 0,
+    });
+    await expect(reconcileUnknownGlassHiveLaunches({ ownerId: 'user-1' })).resolves.toEqual({
+      scanned: 0,
+      repaired: 0,
+      pending: 0,
+    });
     expect(mockRequestAccountApi).toHaveBeenCalledTimes(1);
-    expect(mockRequestAccountApi).toHaveBeenCalledWith(expect.objectContaining({
-      ownerId: 'user-1', path: `/v1/delegations/by-origin/${launch.originRef}`,
-    }));
+    expect(mockRequestAccountApi).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerId: 'user-1',
+        path: `/v1/delegations/by-origin/${launch.originRef}`,
+      }),
+    );
     expect(bindings.size).toBe(1);
     expect(externals.size).toBe(1);
-    const body = { origin_ref: launch.originRef, work_ref: 'gh-work-pending', worker_id: 'worker-pending', run_id: 'run-pending',
-      callback_id: 'result-pending', attempt_number: 1, event: 'run.completed', work_state: 'completed', work_terminal: true };
-    mockRequestAccountApi.mockResolvedValue({ valid: true, originRef: launch.originRef, workRef: 'gh-work-pending' });
+    const body = {
+      origin_ref: launch.originRef,
+      work_ref: 'gh-work-pending',
+      worker_id: 'worker-pending',
+      run_id: 'run-pending',
+      callback_id: 'result-pending',
+      attempt_number: 1,
+      event: 'run.completed',
+      work_state: 'completed',
+      work_terminal: true,
+    };
+    mockRequestAccountApi.mockResolvedValue({
+      valid: true,
+      originRef: launch.originRef,
+      workRef: 'gh-work-pending',
+    });
     const resolved = await resolveGlassHiveCallbackContext(body);
-    expect(resolved).toMatchObject({ ownerId: 'user-1', conversationId: 'conversation-1', requestedParentMessageId: 'user-message' });
-    expect(mockRequestAccountApi).toHaveBeenLastCalledWith(expect.objectContaining({
-      body: { originRef: launch.originRef, workRef: 'gh-work-pending', workerId: 'worker-pending', runId: 'run-pending' },
-    }));
+    expect(resolved).toMatchObject({
+      ownerId: 'user-1',
+      conversationId: 'conversation-1',
+      requestedParentMessageId: 'user-message',
+    });
+    expect(mockRequestAccountApi).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        body: {
+          originRef: launch.originRef,
+          workRef: 'gh-work-pending',
+          workerId: 'worker-pending',
+          runId: 'run-pending',
+        },
+      }),
+    );
     const external = externals.get(launch.originRef);
-    Object.assign(external, { externalState: 'completed', deliveryState: 'sent', attentionPending: false });
-    mockExternalFindOneAndUpdate.mockImplementation(async (filter, update) => { apply(externals, filter, update); return external; });
+    Object.assign(external, {
+      externalState: 'completed',
+      deliveryState: 'sent',
+      attentionPending: false,
+    });
+    mockExternalFindOneAndUpdate.mockImplementation(async (filter, update) => {
+      apply(externals, filter, update);
+      return external;
+    });
     await recordGlassHiveCallbackExternalState({ binding: resolved, body });
     const repeated = await resolveGlassHiveCallbackContext(body);
     await recordGlassHiveCallbackExternalState({ binding: repeated, body });
     expect(repeated.traceIdentity).toEqual(resolved.traceIdentity);
-    expect(external).toMatchObject({ externalState: 'completed', deliveryState: 'sent', attentionPending: false });
-    expect(mockExternalFindOneAndUpdate.mock.calls.every(([, update]) => !Object.hasOwn(update.$set, 'deliveryState'))).toBe(true);
+    expect(external).toMatchObject({
+      externalState: 'completed',
+      deliveryState: 'sent',
+      attentionPending: false,
+    });
+    expect(
+      mockExternalFindOneAndUpdate.mock.calls.every(
+        ([, update]) => !Object.hasOwn(update.$set, 'deliveryState'),
+      ),
+    ).toBe(true);
     expect(bindings.size).toBe(1);
     expect(externals.size).toBe(1);
   });
@@ -1938,8 +2004,14 @@ describe('GlassHiveCallbackBindingService', () => {
 
   test('preserves authorized callback state when producer trace is unavailable', async () => {
     mockRequestAccountApi.mockRejectedValueOnce(new Error('producer_detail_unavailable'));
-    mockExternalFindOne.mockResolvedValueOnce({ _id: 'work-producer-missing', externalState: 'running' });
-    mockExternalFindOneAndUpdate.mockResolvedValueOnce({ _id: 'work-producer-missing', externalState: 'completed' });
+    mockExternalFindOne.mockResolvedValueOnce({
+      _id: 'work-producer-missing',
+      externalState: 'running',
+    });
+    mockExternalFindOneAndUpdate.mockResolvedValueOnce({
+      _id: 'work-producer-missing',
+      externalState: 'completed',
+    });
 
     await expect(
       recordGlassHiveCallbackExternalState({
@@ -1966,7 +2038,12 @@ describe('GlassHiveCallbackBindingService', () => {
     ).resolves.not.toThrow();
     expect(mockExternalFindOneAndUpdate).toHaveBeenCalledWith(
       expect.objectContaining({ _id: 'work-producer-missing' }),
-      expect.objectContaining({ $set: expect.objectContaining({ externalState: 'completed', runId: 'run-producer-missing' }) }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          externalState: 'completed',
+          runId: 'run-producer-missing',
+        }),
+      }),
       expect.any(Object),
     );
     expect(mockRecordGlassHiveWorkDetailTrace).not.toHaveBeenCalled();
@@ -1975,8 +2052,14 @@ describe('GlassHiveCallbackBindingService', () => {
 
   test('preserves authorized callback state without accepting invalid producer trace', async () => {
     mockRequestAccountApi.mockResolvedValueOnce({ state: 'completed' });
-    mockExternalFindOne.mockResolvedValueOnce({ _id: 'work-producer-invalid', externalState: 'running' });
-    mockExternalFindOneAndUpdate.mockResolvedValueOnce({ _id: 'work-producer-invalid', externalState: 'completed' });
+    mockExternalFindOne.mockResolvedValueOnce({
+      _id: 'work-producer-invalid',
+      externalState: 'running',
+    });
+    mockExternalFindOneAndUpdate.mockResolvedValueOnce({
+      _id: 'work-producer-invalid',
+      externalState: 'completed',
+    });
     mockRecordGlassHiveWorkDetailTrace.mockResolvedValueOnce({
       accepted: false,
       errors: ['attempt_history_missing'],
@@ -2008,7 +2091,12 @@ describe('GlassHiveCallbackBindingService', () => {
     ).resolves.not.toThrow();
     expect(mockExternalFindOneAndUpdate).toHaveBeenCalledWith(
       expect.objectContaining({ _id: 'work-producer-invalid' }),
-      expect.objectContaining({ $set: expect.objectContaining({ externalState: 'completed', runId: 'run-producer-invalid' }) }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          externalState: 'completed',
+          runId: 'run-producer-invalid',
+        }),
+      }),
       expect.any(Object),
     );
     expect(mockRecordTraceCallback).not.toHaveBeenCalled();

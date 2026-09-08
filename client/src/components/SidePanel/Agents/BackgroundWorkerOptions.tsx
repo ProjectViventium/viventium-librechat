@@ -31,11 +31,11 @@ export default function BackgroundWorkerOptions({
     },
   ] as const;
   return (
-    <fieldset className="border-border-light mb-4 border-t pt-4">
+    <fieldset className="mb-4 border-t border-border-light pt-4">
       <legend className="text-sm font-medium">
         {localize('com_ui_background_worker_preference')}
       </legend>
-      <p className="text-text-secondary mb-3 text-xs">
+      <p className="mb-3 text-xs text-text-secondary">
         {localize('com_ui_background_worker_preference_help')}
       </p>
       {fields.map(({ model, effort, profile, label, effortLabel }) => {
@@ -57,7 +57,7 @@ export default function BackgroundWorkerOptions({
                   {...field}
                   id={model}
                   value={selected}
-                  className="border-border-light bg-surface-primary h-10 w-full rounded-lg border px-3"
+                  className="h-10 w-full rounded-lg border border-border-light bg-surface-primary px-3"
                   onChange={(event) => {
                     field.onChange(event);
                     const next = models.find((candidate) => candidate.id === event.target.value);
@@ -98,7 +98,7 @@ export default function BackgroundWorkerOptions({
                       {...field}
                       id={effort}
                       value={configuredEffort}
-                      className="border-border-light bg-surface-primary h-10 w-full rounded-lg border px-3"
+                      className="h-10 w-full rounded-lg border border-border-light bg-surface-primary px-3"
                     >
                       <option value="">{localize('com_ui_model_default')}</option>
                       {configuredEffort &&

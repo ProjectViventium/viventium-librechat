@@ -113,7 +113,10 @@ jest.mock('~/server/services/viventium/VoiceTaskService', () => ({
   failVoiceTask: jest.fn(),
   getVoiceTaskByStreamId: (...args) => mockGetVoiceTaskByStreamId(...args),
   hydrateVoiceTasksForCall: jest.fn(),
-  hydrateVoiceTaskByStreamId: jest.fn(),
+  hydrateVoiceTaskByStreamId: async (streamId, { callSessionId, userId }) => {
+    const task = mockGetVoiceTaskByStreamId(streamId);
+    return task?.callSessionId === callSessionId && task?.userId === userId ? task : null;
+  },
   isVoiceTaskSuppressedDurably: jest.fn().mockResolvedValue(false),
   observeGenerationEvent: jest.fn(),
   runVoiceTaskTerminalCallbackMutation: (_taskId, operation) => operation(),
@@ -368,7 +371,7 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
       callSessionId: 'call-receiver-cas',
       userId: 'owner-receiver-cas',
       conversationId: 'conv-receiver-cas',
-      owner: { kind: 'glasshive_run', id: 'run-receiver-cas' },
+      owner: { kind: 'glasshive_run', id: 'run_receiver_cas' },
     });
     const voiceScope = {
       surface: 'voice',
@@ -389,10 +392,10 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
       staleAResponse = await withTimeout(aResponse, REQUEST_DEADLINE_MS, 'result_a_response');
     }
 
-    expect(bResponse.status).toBe(200);
     expect(bResponse.body).toEqual(
       expect.objectContaining(receiptFor(resultB, 'accepted', resultB)),
     );
+    expect(bResponse.status).toBe(200);
     expect(staleAResponse.status).toBe(409);
     expect(staleAResponse.body).toEqual(receiptFor(resultA, 'superseded', resultB));
 
@@ -503,7 +506,7 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
       updateSpy.mockRestore();
     }
 
-    expect(bResponse.status).toBe(200);
+    expect({ status: bResponse.status, body: bResponse.body }).toMatchObject({ status: 200 });
     expect(staleAResponse.status).toBe(409);
     expect(staleAResponse.body).toEqual(receiptFor(resultA, 'superseded', resultB));
     const durableEffect = await mongoose.connection.db
@@ -612,7 +615,7 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
         REQUEST_DEADLINE_MS,
         'result_b_response',
       );
-      expect(bResponse.status).toBe(200);
+      expect({ status: bResponse.status, body: bResponse.body }).toMatchObject({ status: 200 });
       const durableEffect = await mongoose.connection.db
         .collection(EXTERNAL_WORK_COLLECTION)
         .findOne({ _id: binding.originRef });

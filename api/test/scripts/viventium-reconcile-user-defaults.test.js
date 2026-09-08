@@ -40,12 +40,16 @@ describe('viventium-reconcile-user-defaults', () => {
   });
 
   test('parses installer boolean env flags consistently', () => {
-    expect(envFlagEnabled('VIVENTIUM_DEFAULT_CONVERSATION_RECALL', {
-      env: { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: 'true' },
-    })).toBe(true);
-    expect(envFlagEnabled('VIVENTIUM_DEFAULT_CONVERSATION_RECALL', {
-      env: { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: '0' },
-    })).toBe(false);
+    expect(
+      envFlagEnabled('VIVENTIUM_DEFAULT_CONVERSATION_RECALL', {
+        env: { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: 'true' },
+      }),
+    ).toBe(true);
+    expect(
+      envFlagEnabled('VIVENTIUM_DEFAULT_CONVERSATION_RECALL', {
+        env: { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: '0' },
+      }),
+    ).toBe(false);
   });
 
   test('builds a missing-only conversation recall reconciliation update', () => {

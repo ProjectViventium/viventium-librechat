@@ -1318,7 +1318,9 @@ function filterFile({ req, image, isAvatar }) {
 
   if (!isSupportedMimeType) {
     throw Object.assign(new Error('Unsupported file type'), {
-      code: 'unsupported_file_type', status: 415, retryable: false,
+      code: 'unsupported_file_type',
+      status: 415,
+      retryable: false,
     });
   }
 

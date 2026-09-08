@@ -21,7 +21,10 @@ describe('withEffectiveConversationRecall', () => {
   });
 
   test('handles a payload without personalization', () => {
-    const projected = withEffectiveConversationRecall({}, { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: 'false' });
+    const projected = withEffectiveConversationRecall(
+      {},
+      { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: 'false' },
+    );
     expect(projected.personalization.conversation_recall).toBe(false);
   });
 });

@@ -29,7 +29,9 @@ function sanitizeAggregatedContentParts(contentParts, { preserveIndices = false 
   // streaming ends; removing a suppressed/empty slot mid-stream splits later text.
   if (preserveIndices) {
     for (let index = 0; index < contentParts.length; index += 1) {
-      const normalized = normalizeTextContentParts(filterMalformedContentParts([contentParts[index]]));
+      const normalized = normalizeTextContentParts(
+        filterMalformedContentParts([contentParts[index]]),
+      );
       contentParts[index] = normalized[0];
     }
     return contentParts;

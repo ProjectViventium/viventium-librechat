@@ -653,7 +653,14 @@ describe('agentLlmFallback', () => {
   });
 
   test('does not retry background cortex fallback for visible output or structured tool failures', () => {
-    expect(shouldRetryBackgroundCortexWithFallback({ insight: null, errorClass: 'missing_required_evidence', error: 'missing_required_evidence', completedToolCalls: 1 })).toBe(false);
+    expect(
+      shouldRetryBackgroundCortexWithFallback({
+        insight: null,
+        errorClass: 'missing_required_evidence',
+        error: 'missing_required_evidence',
+        completedToolCalls: 1,
+      }),
+    ).toBe(false);
     expect(
       shouldRetryBackgroundCortexWithFallback({
         insight: 'usable answer',

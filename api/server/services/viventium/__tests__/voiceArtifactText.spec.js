@@ -31,18 +31,22 @@ describe('voice linked-chat formatting', () => {
       metadata: { source: 'synthetic' },
     };
 
-    expect(sanitizeVoiceAssistantMessageForPersistence({ body: { voiceMode: true } }, message))
-      .toEqual(message);
+    expect(
+      sanitizeVoiceAssistantMessageForPersistence({ body: { voiceMode: true } }, message),
+    ).toEqual(message);
   });
 
   test('keeps paragraph boundaries while stripping transport controls and private reasoning', () => {
     const authored = `{SKIP_VOICE}\n<soft>${markdown}</soft>`;
     const result = sanitizeVoiceAssistantMessageForPersistence(
       { body: { voiceMode: true } },
-      { text: '', content: [
-        { type: 'reasoning', text: 'Private reasoning.' },
-        { type: 'text', text: authored },
-      ] },
+      {
+        text: '',
+        content: [
+          { type: 'reasoning', text: 'Private reasoning.' },
+          { type: 'text', text: authored },
+        ],
+      },
     );
 
     expect(result.text).toBe(markdown);
@@ -50,20 +54,23 @@ describe('voice linked-chat formatting', () => {
   });
 
   test('does not consume a line break next to punctuation during display cleanup', () => {
-    expect(sanitizeVoiceSurfaceTextForDisplay('First line\n; second line. Next , word.'))
-      .toBe('First line\n; second line. Next, word.');
+    expect(sanitizeVoiceSurfaceTextForDisplay('First line\n; second line. Next , word.')).toBe(
+      'First line\n; second line. Next, word.',
+    );
   });
 
   test('preserves nested-list indentation and Markdown hard breaks', () => {
-    const text = '## Tasks\n\n- Prepare the room.\n    - Clear the entrance.\n\nFirst line.  \nSecond line.';
-    expect(sanitizeVoiceAssistantMessageForPersistence(
-      { body: { voiceMode: true } }, { text },
-    ).text).toBe(text);
+    const text =
+      '## Tasks\n\n- Prepare the room.\n    - Clear the entrance.\n\nFirst line.  \nSecond line.';
+    expect(
+      sanitizeVoiceAssistantMessageForPersistence({ body: { voiceMode: true } }, { text }).text,
+    ).toBe(text);
   });
 
   test('preserves indented code layout while removing existing fence artifacts', () => {
     const text = 'Example:\n\n```text\n    first\n        second\n    ; comment\n```\n\nDone.';
-    expect(sanitizeVoiceSurfaceTextForDisplay(text))
-      .toBe('Example:\n\n\n    first\n        second\n    ; comment\n\n\nDone.');
+    expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(
+      'Example:\n\n\n    first\n        second\n    ; comment\n\n\nDone.',
+    );
   });
 });

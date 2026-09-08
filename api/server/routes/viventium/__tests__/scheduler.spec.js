@@ -129,7 +129,13 @@ jest.mock('~/server/services/Endpoints/agents/title', () => jest.fn());
 jest.mock('~/models', () => ({
   getUserById: (...args) => mockGetUserById(...args),
   getMessage: (...args) => mockGetMessage(...args),
-  getMessages: (...args) => mockGetMessages(...args),
+  getMessages: async (filter, ...args) => {
+    if (typeof filter?.messageId === 'string') {
+      const message = await mockGetMessage(filter);
+      return message ? [message] : [];
+    }
+    return mockGetMessages(filter, ...args);
+  },
   getConvo: (...args) => mockGetConvo(...args),
 }));
 

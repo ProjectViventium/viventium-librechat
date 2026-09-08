@@ -1678,12 +1678,14 @@ describe('/api/viventium/gateway', () => {
     const gatewayRouter = require('../gateway');
     const app = createTestApp(gatewayRouter);
 
-    mockGetMessage.mockResolvedValueOnce({
-      messageId: 'msg-1',
-      conversationId: 'conv-1',
-      text: 'Canonical gateway response',
-      content: [{ type: 'cortex_brewing', status: 'brewing' }],
-    });
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'msg-1',
+        conversationId: 'conv-1',
+        text: 'Canonical gateway response',
+        content: [{ type: 'cortex_brewing', status: 'brewing' }],
+      },
+    ]);
     mockGetMessages.mockResolvedValueOnce([{ messageId: 'follow-1', text: 'Follow-up text' }]);
 
     const query = {

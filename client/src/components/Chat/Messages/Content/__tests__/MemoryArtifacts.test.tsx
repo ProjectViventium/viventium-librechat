@@ -88,7 +88,6 @@ describe('MemoryArtifacts', () => {
     } as TAttachment;
   };
 
-
   test('unchanged receipts render no update badge on fresh delivery or reload and preserve real changes', () => {
     const unchanged = createMemoryAttachment('unchanged', 'preferences');
     const { container, rerender } = render(<MemoryArtifacts attachments={[unchanged]} />);

@@ -679,7 +679,9 @@ async function getActiveCallSessionForConversation({ userId, conversationId } = 
     expiresAt: { $gt: now },
     leaseExpiresAt: { $gt: now },
     callStatus: { $in: ['listening', 'speaking', 'working', 'needs_input', 'degraded'] },
-  }).sort({ updatedAt: -1, createdAt: -1 }).lean();
+  })
+    .sort({ updatedAt: -1, createdAt: -1 })
+    .lean();
   const normalized = normalizeSession(session);
   if (normalized?.mode !== 'call' || !normalized.activeJobId || !normalized.activeWorkerId) {
     return null;

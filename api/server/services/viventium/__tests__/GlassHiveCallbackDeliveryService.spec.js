@@ -55,6 +55,7 @@ jest.mock('~/db/models', () => ({
 }));
 
 jest.mock('../GlassHiveTerminalCallbackTransaction', () => ({
+  deferGlassHiveTerminalCallbackAfterCommit: jest.fn(() => false),
   runGlassHiveTerminalCallbackTransaction: (operation) => operation({ inTransaction: () => true }),
 }));
 
@@ -194,7 +195,9 @@ describe('GlassHiveCallbackDeliveryService', () => {
     mockCountDocuments = jest.fn();
     mockUpdateOne = jest.fn().mockResolvedValue({ matchedCount: 1, modifiedCount: 1 });
     mockUpdateMany = jest.fn().mockResolvedValue({ modifiedCount: 0 });
-    mockReconcileGlassHiveSurfaceDeliveryOutcome = jest.fn().mockResolvedValue({ _id: 'current-work' });
+    mockReconcileGlassHiveSurfaceDeliveryOutcome = jest
+      .fn()
+      .mockResolvedValue({ _id: 'current-work' });
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue(null);
     mockRecordTraceDelivery = jest.fn().mockResolvedValue(null);
     mockRecordVoiceOrchestrationTrace = jest.fn().mockResolvedValue(null);

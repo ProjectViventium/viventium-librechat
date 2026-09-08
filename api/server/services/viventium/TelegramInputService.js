@@ -69,20 +69,22 @@ async function verifyOwner(record) {
 }
 async function resolvePendingConversation(identity) {
   if (!identity.requestedConversationId || identity.requestedConversationId === 'new') return null;
-  const record = decode(await Ingress.findOne({
-    libreChatUserId: identity.libreChatUserId,
-    telegramUserId: identity.telegramUserId,
-    telegramChatId: identity.telegramChatId,
-    telegramMessageThreadId: identity.telegramMessageThreadId,
-    sourceOrderScope: identity.sourceOrderScope,
-    conversationGeneration: identity.conversationGeneration,
-    conversationId: identity.requestedConversationId,
-    sourceSequence: { $lt: identity.sourceSequence },
-    inputState: { $in: ['preparing', 'ready', 'admitted'] },
-    // A ready input waiting for Main has deliberately released its preparation lease.
-    $or: [{ inputState: 'ready' }, { inputLeaseUntil: { $gt: Date.now() } }],
-  }).lean());
-  if (!record || !await verifyOwner(record)) return null;
+  const record = decode(
+    await Ingress.findOne({
+      libreChatUserId: identity.libreChatUserId,
+      telegramUserId: identity.telegramUserId,
+      telegramChatId: identity.telegramChatId,
+      telegramMessageThreadId: identity.telegramMessageThreadId,
+      sourceOrderScope: identity.sourceOrderScope,
+      conversationGeneration: identity.conversationGeneration,
+      conversationId: identity.requestedConversationId,
+      sourceSequence: { $lt: identity.sourceSequence },
+      inputState: { $in: ['preparing', 'ready', 'admitted'] },
+      // A ready input waiting for Main has deliberately released its preparation lease.
+      $or: [{ inputState: 'ready' }, { inputLeaseUntil: { $gt: Date.now() } }],
+    }).lean(),
+  );
+  if (!record || !(await verifyOwner(record))) return null;
   return { conversationId: record.conversationId };
 }
 async function readPrepared(record) {
@@ -206,32 +208,53 @@ const service = createTelegramInputService({
       });
   },
   readPrepared,
-  hasCommittedDelivery: async (record) => Boolean(await Message.exists({
-    user: record.libreChatUserId,
-    conversationId: record.conversationId,
-    isCreatedByUser: false,
-    unfinished: { $ne: true },
-    'metadata.viventium.deliveryAcknowledgement.state': 'committed',
-    'metadata.viventium.deliverySourceCoverage.source_order_scope': record.sourceOrderScope,
-    'metadata.viventium.deliverySourceCoverage.source_conversation_generation':
-      { $in: [...new Set([
-        telegramInputConversationGeneration(record),
-        // The same fresh conversation is subsequently addressed by its canonical
-        // ID. Both names belong to this retained source and captured generation.
-        telegramInputConversationGeneration({ ...record, requestedConversationId: record.conversationId }),
-      ])] },
-    'metadata.viventium.deliverySourceCoverage.sources': { $elemMatch: {
-      source_event_id: record.sourceEventId,
-      source_message_id: record.sourceMessageId,
-      source_sequence: record.sourceSequence,
-    } },
-    $expr: { $and: [
-      { $eq: ['$metadata.viventium.deliverySourceCoverage.logical_turn_id',
-        '$metadata.viventium.deliveryAcknowledgement.logical_turn_id'] },
-      { $eq: ['$metadata.viventium.deliverySourceCoverage.revision',
-        '$metadata.viventium.deliveryAcknowledgement.revision'] },
-    ] },
-  })),
+  hasCommittedDelivery: async (record) =>
+    Boolean(
+      await Message.exists({
+        user: record.libreChatUserId,
+        conversationId: record.conversationId,
+        isCreatedByUser: false,
+        unfinished: { $ne: true },
+        'metadata.viventium.deliveryAcknowledgement.state': 'committed',
+        'metadata.viventium.deliverySourceCoverage.source_order_scope': record.sourceOrderScope,
+        'metadata.viventium.deliverySourceCoverage.source_conversation_generation': {
+          $in: [
+            ...new Set([
+              telegramInputConversationGeneration(record),
+              // The same fresh conversation is subsequently addressed by its canonical
+              // ID. Both names belong to this retained source and captured generation.
+              telegramInputConversationGeneration({
+                ...record,
+                requestedConversationId: record.conversationId,
+              }),
+            ]),
+          ],
+        },
+        'metadata.viventium.deliverySourceCoverage.sources': {
+          $elemMatch: {
+            source_event_id: record.sourceEventId,
+            source_message_id: record.sourceMessageId,
+            source_sequence: record.sourceSequence,
+          },
+        },
+        $expr: {
+          $and: [
+            {
+              $eq: [
+                '$metadata.viventium.deliverySourceCoverage.logical_turn_id',
+                '$metadata.viventium.deliveryAcknowledgement.logical_turn_id',
+              ],
+            },
+            {
+              $eq: [
+                '$metadata.viventium.deliverySourceCoverage.revision',
+                '$metadata.viventium.deliveryAcknowledgement.revision',
+              ],
+            },
+          ],
+        },
+      }),
+    ),
   verifyStream: async (record, streamId) => {
     const job = await GenerationJobManager.getJob(streamId);
     const context = job?.metadata?.interactionContext;
@@ -264,5 +287,11 @@ async function inputEnvelope(record) {
     },
   };
 }
-module.exports = { ...service, readPrepared, inputEnvelope, messageFilter, resolvePendingConversation };
+module.exports = {
+  ...service,
+  readPrepared,
+  inputEnvelope,
+  messageFilter,
+  resolvePendingConversation,
+};
 /* VIVENTIUM END */

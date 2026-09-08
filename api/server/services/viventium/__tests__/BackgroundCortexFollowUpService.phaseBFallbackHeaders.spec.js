@@ -17,6 +17,10 @@ jest.mock('~/models/Agent', () => {
   return { ...actual, getAgent: jest.fn(async () => null) };
 });
 
+jest.mock('../nativeResponseService', () => ({
+  getService: () => ({ readToolEvidence: jest.fn().mockResolvedValue([]) }),
+}));
+
 const { setTrustedInteractionContext } = require('../interactionContext');
 
 const { generateFollowUpText } = require('../BackgroundCortexFollowUpService');
@@ -95,7 +99,6 @@ describe('Phase B follow-up serial fallback arming', () => {
     },
   );
 });
-
 
 describe('verified mission image input', () => {
   test('passes distinct observed images to Main and returns only its selected image link', async () => {

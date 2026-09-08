@@ -517,7 +517,7 @@ describe('ViventiumMainContinuityService', () => {
     await expect(claimAcceptedMainCompaction(base)).resolves.toMatchObject({ status: 'claimed' });
   });
 
-  test('preserves an omitted user identifier deterministically', async () => {
+  test('preserves an exact user identifier in approved semantic compaction', async () => {
     const base = {
       ownerId: 'owner-1',
       agentId: 'main-agent',
@@ -550,7 +550,7 @@ describe('ViventiumMainContinuityService', () => {
           commitments: [],
           corrections: [],
           decisions: [],
-          durableIdentifiers: [],
+          durableIdentifiers: ['123e4567-e89b-12d3-a456-426614174000'],
           recurrenceOutcomes: [],
           toolPairs: [],
         },
@@ -561,7 +561,7 @@ describe('ViventiumMainContinuityService', () => {
           commitments: [],
           corrections: [],
           decisions: [],
-          durableIdentifiers: [],
+          durableIdentifiers: ['123e4567-e89b-12d3-a456-426614174000'],
           recurrenceOutcomes: [],
           toolPairs: [],
         }),

@@ -380,12 +380,15 @@ async function getCortexMessageState({ userId, messageId, conversationId, schedu
     canonicalText,
     canonicalTextSource: canonicalState.canonicalTextSource,
     canonicalTextFallbackReason: canonicalState.canonicalTextFallbackReason,
-    memoryReceipt: memoryReceiptFromAttachments(message.attachments) || (
-      memoryWriteStatus === 'completed' ? { status: 'unchanged', keys: [] }
-        : ['pending', 'running'].includes(memoryWriteStatus) ? { status: 'pending', keys: [] }
-          : memoryWriteStatus === 'failed' ? { status: 'failed', keys: [], errorType: 'writer_interrupted' }
-            : null
-    ),
+    memoryReceipt:
+      memoryReceiptFromAttachments(message.attachments) ||
+      (memoryWriteStatus === 'completed'
+        ? { status: 'unchanged', keys: [] }
+        : ['pending', 'running'].includes(memoryWriteStatus)
+          ? { status: 'pending', keys: [] }
+          : memoryWriteStatus === 'failed'
+            ? { status: 'failed', keys: [], errorType: 'writer_interrupted' }
+            : null),
   };
 }
 

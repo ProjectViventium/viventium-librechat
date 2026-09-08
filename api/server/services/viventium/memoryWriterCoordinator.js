@@ -33,14 +33,24 @@ function startMemoryWriterRecovery({ db, logger, recoverPending }) {
       if (recoverPending) {
         for (const row of await db.listPendingMemoryWrites({ before })) {
           const identity = { userId: row.user, messageId: row.messageId, owner: memoryWriterOwner };
-          if (!(await db.reclaimPendingMemoryWrite({ ...identity,
-            previousOwner: row.savedMemoryWrite.owner, heartbeatAt: row.savedMemoryWrite.heartbeatAt }))) {
+          if (
+            !(await db.reclaimPendingMemoryWrite({
+              ...identity,
+              previousOwner: row.savedMemoryWrite.owner,
+              heartbeatAt: row.savedMemoryWrite.heartbeatAt,
+            }))
+          ) {
             continue;
           }
           const untrack = trackAdmittedMemoryWriter(row.messageId);
-          void enqueueUserMemoryWriter({ userId: row.user, identity: { ...identity, conversationId: row.conversationId },
-            run: () => recoverPending(row, identity) })
-            .catch((error) => logger.warn('[MemoryWriter] Pending save could not resume', { name: error?.name }))
+          void enqueueUserMemoryWriter({
+            userId: row.user,
+            identity: { ...identity, conversationId: row.conversationId },
+            run: () => recoverPending(row, identity),
+          })
+            .catch((error) =>
+              logger.warn('[MemoryWriter] Pending save could not resume', { name: error?.name }),
+            )
             .finally(untrack);
         }
       }
@@ -109,13 +119,19 @@ function enqueueUserMemoryWriter({ userId, run, identity }) {
 // removes the binding; existing interrupted-write reconciliation owns any uncertain mutation.
 function bindActiveMemoryWriterTool(binding) {
   const entry = writersByUser.get(String(binding.identity.userId))?.active;
-  if (!entry || binding.identity.owner !== memoryWriterOwner ||
-      !admittedMessages.has(binding.identity.messageId) ||
-      !binding.matchesIdentity(entry.identity) || entry.nativeTool) {
+  if (
+    !entry ||
+    binding.identity.owner !== memoryWriterOwner ||
+    !admittedMessages.has(binding.identity.messageId) ||
+    !binding.matchesIdentity(entry.identity) ||
+    entry.nativeTool
+  ) {
     throw new Error('native_memory_writer_not_active');
   }
   entry.nativeTool = binding;
-  return () => { if (entry.nativeTool === binding) delete entry.nativeTool; };
+  return () => {
+    if (entry.nativeTool === binding) delete entry.nativeTool;
+  };
 }
 
 function activeMemoryWriterTool(grant) {

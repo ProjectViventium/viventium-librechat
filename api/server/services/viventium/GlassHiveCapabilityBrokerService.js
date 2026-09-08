@@ -1140,7 +1140,7 @@ async function invokeConversationOrchestrationTool({
         status: 'blocked',
         reason: cleanBoundedString(error?.code || error?.message, 120) || 'work_action_rejected',
         tool: hostTool.toolName,
-        retryable: Number(error?.status) >= 500,
+        retryable: glassHiveDelegationRetryable(error),
       };
     }
   }

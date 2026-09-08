@@ -682,6 +682,58 @@ describe('GlassHive capability broker', () => {
     expect(mockExecuteGlassHiveWorkAction.mock.calls[1][0].operationId).toBe(firstOperationId);
   });
 
+  test.each([
+    [{ status: 503, retryable: false }, false],
+    [{ status: 429 }, true],
+    [{ status: 408 }, true],
+    [{ status: 429, failureRetryable: false }, false],
+  ])(
+    'preserves work-action retryability through the same broker contract: %j',
+    async (failure, retryable) => {
+      const { BROKER_AUTHORITY_KINDS } = require('../GlassHiveCapabilityBrokerAuth');
+      const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+      mockGetMCPServersRegistry.mockReturnValue({});
+      mockExecuteGlassHiveWorkAction.mockRejectedValueOnce(
+        Object.assign(new Error('work_action_rejected'), {
+          code: 'work_action_rejected',
+          ...failure,
+        }),
+      );
+      const result = await handleToolCall({
+        grant: {
+          grant_id: 'ghcb_orchestrator_failure',
+          user_id: 'user-1',
+          user_role: 'USER',
+          conversation_id: 'conv-1',
+          message_id: 'msg-1',
+          turn_id: 'turn-1',
+          authority_kind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
+          allowed_servers: [],
+          eager_servers: [],
+          deferred_servers: [],
+          allowed_host_tools: ['active_work_action'],
+          host_tool_resources: { active_work_action: { version: 1 } },
+        },
+        toolName: 'active_work_action',
+        args: { workRef: 'work-1', action: 'pause' },
+      });
+      expect(result).toMatchObject({
+        status: 'blocked',
+        reason: 'work_action_rejected',
+        retryable,
+      });
+      expect(mockExecuteGlassHiveWorkAction).toHaveBeenCalledTimes(1);
+      expect(mockExecuteGlassHiveWorkAction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ownerId: 'user-1',
+          workRef: 'work-1',
+          action: 'pause',
+          operationId: expect.stringMatching(/^ghno_[a-f0-9]{64}$/),
+        }),
+      );
+    },
+  );
+
   test.each(['docker', 'host'])(
     'runs executeMainDelegation through the authorized %s worker launch path',
     async (executionMode) => {

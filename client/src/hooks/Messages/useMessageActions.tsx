@@ -16,6 +16,7 @@ import useCopyToClipboard from './useCopyToClipboard';
 import { useAuthContext } from '~/hooks/AuthContext';
 import { useGetAddedConvo } from '~/hooks/Chat';
 import { useLocalize } from '~/hooks';
+import { getVoiceTranscriptLabel } from '~/utils/messages';
 import store from '~/store';
 
 export type TMessageActions = Pick<
@@ -109,6 +110,10 @@ export default function useMessageActions(props: TMessageActions) {
   const copyToClipboard = useCopyToClipboard({ text, content, searchResults });
 
   const messageLabel = useMemo(() => {
+    /* VIVENTIUM START: Preserve ambient speaker provenance before the active agent name. */
+    const transcriptLabel = getVoiceTranscriptLabel(message, localize);
+    if (transcriptLabel) return transcriptLabel;
+    /* VIVENTIUM END */
     if (message?.isCreatedByUser === true) {
       return UsernameDisplay ? (user?.name ?? '') || user?.username : localize('com_user_message');
     } else if (agent) {

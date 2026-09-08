@@ -11,11 +11,7 @@ import {
 } from '~/data-provider/ViventiumOrchestration';
 import { useLocalize } from '~/hooks';
 
-type ParallelWorkProps = {
-  featureAvailable: boolean;
-};
-
-function ParallelWorkPreference() {
+export default function ParallelWork() {
   const localize = useLocalize();
   const { showToast } = useToastContext();
   const preferenceQuery = useOrchestrationPreferenceQuery();
@@ -52,6 +48,13 @@ function ParallelWorkPreference() {
   };
 
   const preferenceAvailable = preferenceQuery.data?.available === true;
+  const readinessPending =
+    !preferenceQuery.isError && preferenceQuery.data?.releaseGate?.blockers.includes('stale');
+  const installationDisabled =
+    !preferenceQuery.isError && preferenceQuery.data?.releaseGate?.blockers.includes('disabled');
+  const unavailableMessage = installationDisabled
+    ? 'com_ui_parallel_work_installation_disabled'
+    : 'com_ui_parallel_work_toggle_unavailable';
 
   return (
     <section
@@ -65,6 +68,9 @@ function ParallelWorkPreference() {
           </h3>
           <p id="parallel-work-description" className="mt-1 text-xs text-text-secondary">
             {localize('com_ui_parallel_work_description')}
+            {mode === 'parallel' && (
+              <span className="mt-1 block">{localize('com_ui_parallel_work_existing_work')}</span>
+            )}
           </p>
         </div>
         {preferenceQuery.isLoading ? (
@@ -73,7 +79,10 @@ function ParallelWorkPreference() {
           <Switch
             checked={mode === 'parallel'}
             onCheckedChange={setParallel}
-            disabled={!preferenceAvailable || preferenceQuery.isError || updatePreference.isLoading}
+            disabled={
+              updatePreference.isLoading ||
+              (mode !== 'parallel' && (!preferenceAvailable || preferenceQuery.isError))
+            }
             aria-label={localize('com_ui_parallel_work')}
             aria-describedby="parallel-work-description"
           />
@@ -83,21 +92,18 @@ function ParallelWorkPreference() {
       {(preferenceQuery.isError ||
         (!preferenceQuery.isLoading && preferenceQuery.data?.available === false)) && (
         <p className="mt-2 text-xs text-text-secondary" role="status">
-          {localize('com_ui_parallel_work_toggle_unavailable')}
+          {localize(readinessPending ? 'com_ui_glasshive_checking' : unavailableMessage)}
         </p>
       )}
-      {preferenceQuery.data?.releaseGate && (
-        <div className="mt-2 text-xs text-text-secondary" role="status">
+      {!readinessPending && preferenceQuery.data?.releaseGate && (
+        <details className="mt-2 text-xs text-text-secondary">
+          <summary className="cursor-pointer">{localize('com_ui_additional_details')}</summary>
           <p className="font-semibold">{preferenceQuery.data.releaseGate.label}</p>
           {preferenceQuery.data.releaseGate.blockers.length > 0 && (
             <p>{preferenceQuery.data.releaseGate.blockers.join(', ')}</p>
           )}
-        </div>
+        </details>
       )}
     </section>
   );
-}
-
-export default function ParallelWork({ featureAvailable }: ParallelWorkProps) {
-  return featureAvailable ? <ParallelWorkPreference /> : null;
 }

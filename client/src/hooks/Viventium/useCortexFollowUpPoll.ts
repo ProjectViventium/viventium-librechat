@@ -10,10 +10,15 @@
  *
  * Approach:
  * - While any cortex is "activating" or "brewing", periodically invalidate the messages query.
- * - Bound automatic browser listening with the canonical server-projected follow-up window.
+ * - Use the server-projected grace for fast refresh and the quiet period after cortices finish.
+ *   Active cortices keep the existing slow refresh cadence, bounded by the 24h anchor cap.
  * - Stop early on a visible follow-up or a durable terminal-silent Phase B decision.
  * - After a recent tool-using assistant response, keep polling briefly for out-of-band direct-action
  *   callbacks that are persisted after the main SSE stream has already closed.
+ * - Once that first grace window elapses, a GlassHive tool call whose latest persisted callback is
+ *   still non-terminal (queued/running/needs_input) or absent keeps a slower refresh cadence,
+ *   bounded by the 24h anchor cap, so a long-running or restarted Worker still lands in the open
+ *   conversation without a reload. Only a terminal callback ends it early.
  * - Window expiry stops query refreshes only; it never cancels Main or Phase B execution.
  * === VIVENTIUM END === */
 
@@ -22,8 +27,10 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Constants, ContentTypes, QueryKeys } from 'librechat-data-provider';
 import type { TMessage, TMessageContentParts } from 'librechat-data-provider';
 import { GLASSHIVE_MCP_SERVER_NAME } from '~/utils/viventiumGlassHive';
+import type { ActiveWorkSnapshot } from '~/data-provider/ViventiumOrchestration/queries';
 
 const POLL_INTERVAL_MS = 1500;
+const SLOW_TOOL_CALLBACK_POLL_INTERVAL_MS = 10 * 1000;
 const DEFAULT_TOOL_CALLBACK_GRACE_MS = 10 * 60 * 1000;
 const MAX_TOOL_CALLBACK_GRACE_MS = 24 * 60 * 60 * 1000;
 
@@ -40,6 +47,9 @@ const TERMINAL_GLASSHIVE_CALLBACK_EVENTS = new Set<string>([
   'checkpoint.ready',
   'takeover.requested',
 ]);
+// Mirrors the server's persisted `metadata.viventium.status.state` (callbackStatus in
+// api/server/routes/viventium/glasshive.js). queued/running/needs_input/artifact_ready stay live.
+const TERMINAL_GLASSHIVE_CALLBACK_STATES = new Set<string>(['completed', 'failed', 'cancelled']);
 const TERMINAL_SILENT_FOLLOW_UP_RESULTS = new Set<string>(['suppressed', 'empty', 'skipped']);
 const GLASSHIVE_MCP_SERVER = GLASSHIVE_MCP_SERVER_NAME;
 
@@ -125,6 +135,39 @@ function isGlassHiveToolName(name: string): boolean {
   return mcpServer === GLASSHIVE_MCP_SERVER;
 }
 
+/**
+ * The harness path reports connected-tool use as a structured harness-activity part
+ * (event `tool`, tool `connected_tool`). The typed `expects_deferred_callback` anchor is the
+ * authority: it marks a GlassHive run-dispatching tool whose real result arrives later as a Worker
+ * callback, so only an anchored part arms the follow-up polling. An ordinary connected tool is
+ * request/response and must never keep the page polling.
+ *
+ * Status is deliberately not required. Only the codex harness reports a terminal tool status; the
+ * claude harness emits the tool-use step with no status at all, so requiring `completed` here made
+ * every delegation on the claude route (the quota fallback) fail to arm and its finished Worker
+ * result never reached the open page. A terminal failure status is still excluded: nothing will be
+ * delivered later for a call the harness already reported as failed or cancelled.
+ */
+const TERMINAL_TOOL_FAILURE_STATUSES = new Set(['failed', 'cancelled']);
+
+function hasCompletedConnectedToolActivity(message: TMessage): boolean {
+  if (!Array.isArray(message?.content)) {
+    return false;
+  }
+  return (message.content as Array<TMessageContentParts | undefined>).some((part) => {
+    if (part?.type !== ContentTypes.HARNESS_ACTIVITY) {
+      return false;
+    }
+    const activity = (part as any)?.harness_activity;
+    return (
+      activity?.event === 'tool' &&
+      activity?.tool === 'connected_tool' &&
+      activity?.expects_deferred_callback === true &&
+      !TERMINAL_TOOL_FAILURE_STATUSES.has(String(activity?.status ?? ''))
+    );
+  });
+}
+
 function hasGlassHiveToolCallPart(message: TMessage): boolean {
   if (!Array.isArray(message.content)) {
     return false;
@@ -135,17 +178,21 @@ function hasGlassHiveToolCallPart(message: TMessage): boolean {
   );
 }
 
-function getLatestRecentToolCallMessageId(
+function getLatestRecentToolCallMessage(
   messages: TMessage[],
   maxAgeMs = DEFAULT_TOOL_CALLBACK_GRACE_MS,
-): string | null {
+): TMessage | null {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
-    if (!message?.messageId || message.isCreatedByUser || !hasGlassHiveToolCallPart(message)) {
+    if (
+      !message?.messageId ||
+      message.isCreatedByUser ||
+      !(hasGlassHiveToolCallPart(message) || hasCompletedConnectedToolActivity(message))
+    ) {
       continue;
     }
     if (Date.now() - messageTimeValue(message) <= maxAgeMs) {
-      return message.messageId;
+      return message;
     }
     return null;
   }
@@ -218,14 +265,31 @@ function latestGlassHiveCallbackEvent(viventiumMetadata: any): string {
   return String(latestEvent || viventiumMetadata?.event || '').trim();
 }
 
-function collectDeferredCallbackAnchorEvents(messages: TMessage[]): Map<string, string> {
-  const anchorEvents = new Map<string, string>();
+function latestGlassHiveCallbackState(viventiumMetadata: any): string {
+  return String(viventiumMetadata?.status?.state || '')
+    .trim()
+    .toLowerCase();
+}
+
+type GlassHiveCallbackStatus = { event: string; state: string };
+
+/**
+ * Every deferred callback that shares an anchor (for example three Workers delegated from one
+ * Main turn) is tracked; an anchor is terminal only when all of its callbacks are terminal.
+ */
+function collectDeferredCallbackAnchorEvents(
+  messages: TMessage[],
+): Map<string, GlassHiveCallbackStatus[]> {
+  const anchorEvents = new Map<string, GlassHiveCallbackStatus[]>();
   for (const message of messages) {
     const viventiumMetadata = (message as any)?.metadata?.viventium;
     if (viventiumMetadata?.type !== 'glasshive_worker_callback') {
       continue;
     }
-    const event = latestGlassHiveCallbackEvent(viventiumMetadata);
+    const status = {
+      event: latestGlassHiveCallbackEvent(viventiumMetadata),
+      state: latestGlassHiveCallbackState(viventiumMetadata),
+    };
     for (const candidate of [
       viventiumMetadata.anchorMessageId,
       viventiumMetadata.parentMessageId,
@@ -233,7 +297,9 @@ function collectDeferredCallbackAnchorEvents(messages: TMessage[]): Map<string, 
       message?.parentMessageId,
     ]) {
       if (typeof candidate === 'string' && candidate.length > 0) {
-        anchorEvents.set(candidate, event);
+        const existing = anchorEvents.get(candidate) ?? [];
+        existing.push(status);
+        anchorEvents.set(candidate, existing);
       }
     }
   }
@@ -242,6 +308,17 @@ function collectDeferredCallbackAnchorEvents(messages: TMessage[]): Map<string, 
 
 function isTerminalGlassHiveCallbackEvent(event: string | null | undefined): boolean {
   return TERMINAL_GLASSHIVE_CALLBACK_EVENTS.has(String(event || '').trim());
+}
+
+function isTerminalGlassHiveCallback(statuses: GlassHiveCallbackStatus[] | undefined): boolean {
+  if (!statuses || statuses.length === 0) {
+    return false;
+  }
+  return statuses.every(
+    (status) =>
+      isTerminalGlassHiveCallbackEvent(status.event) ||
+      TERMINAL_GLASSHIVE_CALLBACK_STATES.has(status.state),
+  );
 }
 
 function getToolCallbackGraceMs(queryClient: ReturnType<typeof useQueryClient>): number {
@@ -274,9 +351,11 @@ export default function useCortexFollowUpPoll({
   conversationId,
   getMessages,
   isSubmitting,
+  activeWork,
 }: {
   conversationId?: string | null;
   getMessages?: () => TMessage[] | undefined;
+  activeWork?: ActiveWorkSnapshot;
   /**
    * IMPORTANT: Do not clobber the in-flight (optimistic) streaming messages.
    *
@@ -292,21 +371,51 @@ export default function useCortexFollowUpPoll({
   const queryClient = useQueryClient();
   const listenWindowStartRef = useRef<number | null>(null);
   const sawActiveRef = useRef(false);
+  const memoryStartsRef = useRef(new Map<string, number>());
+  const memoryPausedAtRef = useRef<number | null>(null);
   const isSubmittingRef = useRef<boolean>(false);
   const targetParentRef = useRef<string | null>(null);
   const expiredCortexTargetRef = useRef<string | null>(null);
+  const cortexLastPollRef = useRef<number | null>(null);
+  const cortexWasActiveRef = useRef(false);
   const toolCallbackTargetRef = useRef<string | null>(null);
   const toolCallbackExpiredTargetRef = useRef<string | null>(null);
   const toolCallbackGraceStartRef = useRef<number | null>(null);
+  const toolCallbackLastPollRef = useRef<number | null>(null);
+  const toolCallbackTerminalTargetRef = useRef<string | null>(null);
+  const toolCallbackTerminalSeenAtRef = useRef<number | null>(null);
+  const toolCallbackStatusSignatureRef = useRef<string>('');
+  const activeWorkRef = useRef(activeWork);
+  activeWorkRef.current = activeWork;
+  const activeWorkSignatureRef = useRef<string | null>(null);
 
   useEffect(() => {
+    if (isSubmitting && !isSubmittingRef.current) {
+      memoryPausedAtRef.current = Date.now();
+      // A stream can cancel a result refresh already in flight; catch up after it closes.
+      activeWorkSignatureRef.current = null;
+      if (conversationId && conversationId !== 'new') {
+        // A refresh already in flight must not replace the new streamed rows when it resolves.
+        void queryClient.cancelQueries(
+          { queryKey: [QueryKeys.messages, conversationId], exact: true },
+          { revert: false },
+        );
+      }
+    } else if (!isSubmitting && memoryPausedAtRef.current != null) {
+      const pausedMs = Date.now() - memoryPausedAtRef.current;
+      for (const [messageId, startedAt] of memoryStartsRef.current) {
+        memoryStartsRef.current.set(messageId, startedAt + pausedMs);
+      }
+      memoryPausedAtRef.current = null;
+    }
     isSubmittingRef.current = Boolean(isSubmitting);
-  }, [isSubmitting]);
+  }, [conversationId, isSubmitting, queryClient]);
 
   useEffect(() => {
     if (!conversationId || conversationId === 'new') {
       return;
     }
+    const memoryStarts = memoryStartsRef.current;
 
     const interval = window.setInterval(() => {
       const messages =
@@ -320,10 +429,12 @@ export default function useCortexFollowUpPoll({
       const toolCallbackGraceMs = getToolCallbackGraceMs(queryClient);
       const recentLatestCortex = hasRecentLatestCortexMessage(messages);
       const latestCortexMessageId = getLatestCortexMessageId(messages);
-      const latestToolCallMessageId = getLatestRecentToolCallMessageId(
+      // Discover the anchor up to the 24h cap; the configured grace only bounds the fast cadence.
+      const latestToolCallMessage = getLatestRecentToolCallMessage(
         messages,
-        toolCallbackGraceMs,
+        MAX_TOOL_CALLBACK_GRACE_MS,
       );
+      const latestToolCallMessageId = latestToolCallMessage?.messageId ?? null;
       const followUpParentIds = collectFollowUpParentIds(messages);
       const deferredCallbackAnchorEvents = collectDeferredCallbackAnchorEvents(messages);
       const existingTargetParentId = targetParentRef.current;
@@ -349,6 +460,66 @@ export default function useCortexFollowUpPoll({
         return;
       }
 
+      // Memory writing can outlive Main without any cortex content part. Reuse this
+      // observer and ordinary message query; the server's projected state owns completion.
+      let refreshed = false;
+      const refreshMessages = () => {
+        if (!refreshed) {
+          refreshed = true;
+          void queryClient.invalidateQueries([QueryKeys.messages, conversationId], undefined, {
+            cancelRefetch: false,
+          });
+        }
+      };
+      // Durable work state also covers native broker paths with no legacy tool content part.
+      const workSnapshot = activeWorkRef.current;
+      if (workSnapshot?.snapshot === 'fresh' && Array.isArray(workSnapshot.work)) {
+        const signature = JSON.stringify(
+          workSnapshot.work
+            .map((work) => [work.workRef, work.state, work.updatedAt, work.delivery?.state])
+            .sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
+        );
+        if (signature !== activeWorkSignatureRef.current) {
+          const hadSnapshot = activeWorkSignatureRef.current !== null;
+          activeWorkSignatureRef.current = signature;
+          if (hadSnapshot || workSnapshot.work.length > 0) refreshMessages();
+        }
+      }
+      const pendingMemoryIds = new Set<string>();
+      let memorySettled = false;
+      const now = Date.now();
+      const memoryWindowMs = getBackgroundFollowUpWindowMs(queryClient);
+      for (const message of messages) {
+        if (message.memoryWriteStatus !== 'pending' && message.memoryWriteStatus !== 'running') {
+          if (
+            memoryStarts.has(message.messageId) &&
+            (message.memoryWriteStatus === 'completed' || message.memoryWriteStatus === 'failed')
+          ) {
+            memorySettled = true;
+          }
+          continue;
+        }
+        pendingMemoryIds.add(message.messageId);
+        const startedAt = memoryStarts.get(message.messageId) ?? now;
+        memoryStarts.set(message.messageId, startedAt);
+        if (now - startedAt < memoryWindowMs) {
+          refreshMessages();
+        }
+      }
+      for (const messageId of memoryStarts.keys()) {
+        if (!pendingMemoryIds.has(messageId)) {
+          memoryStarts.delete(messageId);
+        }
+      }
+      // Late receipts arrive through message polling, after the SSE attachment handler closes.
+      // Reconcile the memory view once from its server owner, even when writing failed.
+      if (memorySettled) {
+        // Invalidation alone reuses an initial read that has not populated the cache yet.
+        void queryClient
+          .cancelQueries({ queryKey: [QueryKeys.memories], exact: true })
+          .then(() => queryClient.invalidateQueries([QueryKeys.memories]));
+      }
+
       if (
         !sawActiveRef.current &&
         latestCortexMessageId &&
@@ -361,31 +532,80 @@ export default function useCortexFollowUpPoll({
 
       if (!sawActiveRef.current) {
         if (
+          latestToolCallMessage &&
           latestToolCallMessageId &&
           latestToolCallMessageId !== toolCallbackExpiredTargetRef.current
         ) {
-          const latestCallbackEvent = deferredCallbackAnchorEvents.get(latestToolCallMessageId);
-          if (isTerminalGlassHiveCallbackEvent(latestCallbackEvent)) {
-            toolCallbackExpiredTargetRef.current = latestToolCallMessageId;
-            toolCallbackTargetRef.current = null;
-            toolCallbackGraceStartRef.current = null;
+          const latestCallback = deferredCallbackAnchorEvents.get(latestToolCallMessageId);
+          const now = Date.now();
+          if (isTerminalGlassHiveCallback(latestCallback)) {
+            // Every Worker callback for this assistant turn is terminal, but Main's Phase B
+            // follow-up that summarizes those results is authored afterwards. Keep listening at
+            // the slow cadence until that follow-up (or a terminal-silent decision) is visible,
+            // bounded by the configured background follow-up window, so the result reaches the
+            // open page without a reload.
+            // Sibling Workers report independently: the callbacks seen so far are not the full
+            // set expected for this turn. Measure the bounded window from the latest change in
+            // the callback set, so a fast sibling cannot end listening while others still run.
+            const statusSignature = JSON.stringify(
+              (latestCallback ?? []).map((status) => [status?.event, status?.state]),
+            );
+            if (
+              toolCallbackTerminalTargetRef.current !== latestToolCallMessageId ||
+              toolCallbackStatusSignatureRef.current !== statusSignature
+            ) {
+              toolCallbackTerminalTargetRef.current = latestToolCallMessageId;
+              toolCallbackStatusSignatureRef.current = statusSignature;
+              toolCallbackTerminalSeenAtRef.current = now;
+            }
+            const terminalElapsedMs = now - (toolCallbackTerminalSeenAtRef.current ?? now);
+            const followUpVisible =
+              followUpParentIds.has(latestToolCallMessageId) ||
+              hasTerminalSilentFollowUpDecision(messages, latestToolCallMessageId);
+            if (
+              followUpVisible ||
+              terminalElapsedMs >= getBackgroundFollowUpWindowMs(queryClient)
+            ) {
+              toolCallbackExpiredTargetRef.current = latestToolCallMessageId;
+              toolCallbackTargetRef.current = null;
+              toolCallbackGraceStartRef.current = null;
+              toolCallbackLastPollRef.current = null;
+              toolCallbackTerminalTargetRef.current = null;
+              toolCallbackTerminalSeenAtRef.current = null;
+              toolCallbackStatusSignatureRef.current = '';
+              return;
+            }
+            const lastTerminalPollAt = toolCallbackLastPollRef.current;
+            if (
+              lastTerminalPollAt == null ||
+              now - lastTerminalPollAt >= SLOW_TOOL_CALLBACK_POLL_INTERVAL_MS
+            ) {
+              toolCallbackLastPollRef.current = now;
+              refreshMessages();
+            }
             return;
           }
-
           if (toolCallbackTargetRef.current !== latestToolCallMessageId) {
             toolCallbackTargetRef.current = latestToolCallMessageId;
-            toolCallbackGraceStartRef.current = Date.now();
+            toolCallbackGraceStartRef.current = now;
+            toolCallbackLastPollRef.current = null;
           }
 
-          const elapsed = Date.now() - (toolCallbackGraceStartRef.current ?? Date.now());
-          if (elapsed < toolCallbackGraceMs) {
-            queryClient.invalidateQueries([QueryKeys.messages, conversationId]);
-            return;
+          // Fast cadence for the first grace window after the tool call. Past it, the Worker is
+          // still live (no terminal callback persisted), so keep a slower cadence instead of going
+          // dark; the 24h anchor cap in getLatestRecentToolCallMessage bounds it.
+          const elapsed = now - (toolCallbackGraceStartRef.current ?? now);
+          const anchorAgeMs = now - messageTimeValue(latestToolCallMessage);
+          const withinGrace = elapsed < toolCallbackGraceMs && anchorAgeMs <= toolCallbackGraceMs;
+          const lastPollAt = toolCallbackLastPollRef.current;
+          if (
+            withinGrace ||
+            lastPollAt == null ||
+            now - lastPollAt >= SLOW_TOOL_CALLBACK_POLL_INTERVAL_MS
+          ) {
+            toolCallbackLastPollRef.current = now;
+            refreshMessages();
           }
-
-          toolCallbackExpiredTargetRef.current = latestToolCallMessageId;
-          toolCallbackTargetRef.current = null;
-          toolCallbackGraceStartRef.current = null;
         }
         return;
       }
@@ -394,20 +614,36 @@ export default function useCortexFollowUpPoll({
         listenWindowStartRef.current = Date.now();
       }
       const backgroundFollowUpWindowMs = getBackgroundFollowUpWindowMs(queryClient);
-      const listenWindowElapsedMs = Date.now() - listenWindowStartRef.current;
+      let listenWindowElapsedMs = Date.now() - listenWindowStartRef.current;
+      if (active && backgroundFollowUpWindowMs > 0) {
+        const anchor = getMostRecentCortexMessage(messages);
+        const anchorAgeMs = anchor ? Date.now() - messageTimeValue(anchor) : 0;
+        if (Math.max(anchorAgeMs, listenWindowElapsedMs) < MAX_TOOL_CALLBACK_GRACE_MS) {
+          cortexWasActiveRef.current = true;
+          if (latestCortexMessageId) targetParentRef.current = latestCortexMessageId;
+          const lastPollAt = cortexLastPollRef.current;
+          if (
+            listenWindowElapsedMs < backgroundFollowUpWindowMs ||
+            lastPollAt == null ||
+            Date.now() - lastPollAt >= SLOW_TOOL_CALLBACK_POLL_INTERVAL_MS
+          ) {
+            cortexLastPollRef.current = Date.now();
+            refreshMessages();
+          }
+          return;
+        }
+      } else if (cortexWasActiveRef.current) {
+        // Phase B is authored after the final cortex settles. Its grace starts here.
+        cortexWasActiveRef.current = false;
+        cortexLastPollRef.current = null;
+        listenWindowStartRef.current = Date.now();
+        listenWindowElapsedMs = 0;
+      }
       if (listenWindowElapsedMs >= backgroundFollowUpWindowMs) {
         expiredCortexTargetRef.current = targetParentRef.current;
         sawActiveRef.current = false;
         listenWindowStartRef.current = null;
         targetParentRef.current = null;
-        return;
-      }
-
-      if (active) {
-        if (latestCortexMessageId) {
-          targetParentRef.current = latestCortexMessageId;
-        }
-        queryClient.invalidateQueries([QueryKeys.messages, conversationId]);
         return;
       }
 
@@ -434,18 +670,27 @@ export default function useCortexFollowUpPoll({
         return;
       }
 
-      queryClient.invalidateQueries([QueryKeys.messages, conversationId]);
+      refreshMessages();
     }, POLL_INTERVAL_MS);
 
     return () => {
       window.clearInterval(interval);
       sawActiveRef.current = false;
+      memoryStarts.clear();
+      activeWorkSignatureRef.current = null;
+      memoryPausedAtRef.current = null;
       listenWindowStartRef.current = null;
       targetParentRef.current = null;
       expiredCortexTargetRef.current = null;
+      cortexLastPollRef.current = null;
+      cortexWasActiveRef.current = false;
       toolCallbackTargetRef.current = null;
       toolCallbackExpiredTargetRef.current = null;
       toolCallbackGraceStartRef.current = null;
+      toolCallbackLastPollRef.current = null;
+      toolCallbackTerminalTargetRef.current = null;
+      toolCallbackTerminalSeenAtRef.current = null;
+      toolCallbackStatusSignatureRef.current = '';
     };
   }, [conversationId, getMessages, queryClient]);
 }

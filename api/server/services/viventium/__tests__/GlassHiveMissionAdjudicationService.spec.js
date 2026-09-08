@@ -3,6 +3,9 @@
  * === VIVENTIUM END === */
 
 let mockUpdateOne;
+let mockMessageUpdateOne;
+let mockMessageFindOne;
+let mockStoredMessages;
 let mockFindOneAndUpdate;
 let mockFindOne;
 let mockFind;
@@ -12,12 +15,15 @@ let mockSaveConvo;
 let mockGetAgent;
 let mockGetAppConfig;
 let mockCreateCortexFollowUpMessage;
+let mockPrepareCortexFollowUpMessage;
+let mockPersistPreparedCortexFollowUpMessage;
 let mockRecordOutcome;
 let mockEnqueueDelivery;
 let mockRecordTraceDelivery;
 let mockGetActiveCallSessionForConversation;
 let mockDeferAfterCommit;
 let mockTransactionSession;
+let mockRunTransaction;
 
 jest.mock('mongoose', () => {
   const actual = jest.requireActual('mongoose');
@@ -28,12 +34,18 @@ jest.mock('mongoose', () => {
     },
     connection: {
       ...actual.connection,
-      collection: () => ({
-        updateOne: (...args) => mockUpdateOne(...args),
-        findOneAndUpdate: (...args) => mockFindOneAndUpdate(...args),
-        findOne: (...args) => mockFindOne(...args),
-        find: (...args) => mockFind(...args),
-      }),
+      collection: (name) =>
+        name === 'messages'
+          ? {
+              updateOne: (...args) => mockMessageUpdateOne(...args),
+              findOne: (...args) => mockMessageFindOne(...args),
+            }
+          : {
+              updateOne: (...args) => mockUpdateOne(...args),
+              findOneAndUpdate: (...args) => mockFindOneAndUpdate(...args),
+              findOne: (...args) => mockFindOne(...args),
+              find: (...args) => mockFind(...args),
+            },
     },
   };
 });
@@ -68,6 +80,9 @@ jest.mock('~/server/services/Config', () => ({
 
 jest.mock('~/server/services/viventium/BackgroundCortexFollowUpService', () => ({
   createCortexFollowUpMessage: (...args) => mockCreateCortexFollowUpMessage(...args),
+  prepareCortexFollowUpMessage: (...args) => mockPrepareCortexFollowUpMessage(...args),
+  persistPreparedCortexFollowUpMessage: (...args) =>
+    mockPersistPreparedCortexFollowUpMessage(...args),
 }));
 
 jest.mock('../CallSessionService', () => ({
@@ -92,7 +107,7 @@ jest.mock('../OrchestrationTraceLedgerService', () => ({
 
 jest.mock('../GlassHiveTerminalCallbackTransaction', () => ({
   deferGlassHiveTerminalCallbackAfterCommit: (...args) => mockDeferAfterCommit(...args),
-  runGlassHiveTerminalCallbackTransaction: (operation) => operation(null),
+  runGlassHiveTerminalCallbackTransaction: (...args) => mockRunTransaction(...args),
 }));
 
 const {
@@ -111,6 +126,30 @@ function cursor(rows) {
     toArray: jest.fn().mockResolvedValue(rows),
   };
   return value;
+}
+
+function storeAuthoredMessage(input, message) {
+  if (message?.messageId) {
+    mockStoredMessages.push({
+      user: input.req.user.id,
+      conversationId: input.conversationId,
+      messageId: message.messageId,
+      isCreatedByUser: false,
+      text: message.text,
+    });
+  }
+  return message;
+}
+
+function retainAuthoredFollowUp(evidence) {
+  evidence.authoredAt ||= new Date('2026-08-28T05:02:26.000Z');
+  storeAuthoredMessage(
+    {
+      req: { user: { id: evidence.ownerId } },
+      conversationId: evidence.accountContinuationConversationId || evidence.conversationId,
+    },
+    { messageId: evidence.followUpMessageId, text: evidence.followUpText },
+  );
 }
 
 function canonicalCallbackRef(value) {
@@ -150,6 +189,14 @@ describe('GlassHiveMissionAdjudicationService', () => {
   beforeEach(() => {
     clearAdjudicationTimersForTests();
     mockUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true });
+    mockMessageUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true, matchedCount: 1 });
+    mockStoredMessages = [];
+    mockMessageFindOne = jest.fn(
+      async (filter) =>
+        mockStoredMessages.find((message) =>
+          Object.entries(filter).every(([key, value]) => message[key] === value),
+        ) || null,
+    );
     mockFindOneAndUpdate = jest.fn(async (filter) => ({
       ...row({ _id: filter._id }),
       state: 'processing',
@@ -163,13 +210,21 @@ describe('GlassHiveMissionAdjudicationService', () => {
     mockSaveConvo = jest.fn().mockImplementation(async (_req, conversation) => conversation);
     mockGetAgent = jest.fn().mockResolvedValue({ id: 'main-agent', provider: 'openAI' });
     mockGetAppConfig = jest.fn().mockResolvedValue({ endpoints: { agents: {} } });
-    mockCreateCortexFollowUpMessage = jest.fn().mockResolvedValue({ messageId: 'follow-up-1' });
+    mockCreateCortexFollowUpMessage = jest.fn().mockResolvedValue({
+      messageId: 'follow-up-1',
+      text: 'Main-authored synthetic follow-up.',
+    });
+    mockPrepareCortexFollowUpMessage = jest.fn().mockResolvedValue({ prepared: true });
+    mockPersistPreparedCortexFollowUpMessage = jest.fn(async (input) =>
+      storeAuthoredMessage(input, await mockCreateCortexFollowUpMessage(input)),
+    );
     mockRecordOutcome = jest.fn().mockResolvedValue({});
     mockEnqueueDelivery = jest.fn().mockResolvedValue({ configured: 1, enqueued: 1 });
     mockRecordTraceDelivery = jest.fn().mockResolvedValue(null);
     mockGetActiveCallSessionForConversation = jest.fn().mockResolvedValue(null);
     mockDeferAfterCommit = jest.fn().mockReturnValue(false);
     mockTransactionSession = null;
+    mockRunTransaction = (operation) => operation(null);
   });
 
   afterEach(() => {
@@ -223,6 +278,114 @@ describe('GlassHiveMissionAdjudicationService', () => {
       { upsert: true },
     );
     expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+  });
+
+  test('retains exact accepted run input before acknowledgement and rejects cross-run context', async () => {
+    const runInput = {
+      version: 1,
+      run_id: 'run-1',
+      instruction: 'Return the requested evidence.',
+      continuation_context: {
+        version: 1,
+        base_instruction: 'Review without submitting.',
+        guidance: ['Use the revised figures.'],
+      },
+    };
+    const input = {
+      binding: {
+        ownerId: 'user-1',
+        originRef: 'origin-1',
+        conversationId: 'conversation-1',
+        anchorMessageId: 'anchor-1',
+      },
+      body: {
+        callback_id: 'cb-1',
+        run_id: 'run-1',
+        worker_id: 'worker-1',
+        event: 'run.completed',
+        work_state: 'completed',
+        work_terminal: true,
+        message: 'Result.',
+        run_input: runInput,
+      },
+    };
+    await enqueueGlassHiveMissionAdjudication(input);
+    expect(mockUpdateOne.mock.calls[0][1].$setOnInsert).toEqual(
+      expect.objectContaining({ ownerId: 'user-1', runId: 'run-1', runInput }),
+    );
+    const count = mockUpdateOne.mock.calls.length;
+    await expect(
+      enqueueGlassHiveMissionAdjudication({
+        ...input,
+        body: { ...input.body, run_id: 'different-run' },
+      }),
+    ).rejects.toThrow('mission_input_identity_invalid');
+    expect(mockUpdateOne.mock.calls).toHaveLength(count);
+  });
+
+  test('passes each accepted run input with its exact synthesis authority', async () => {
+    const runInput = { version: 1, run_id: 'run-1', instruction: 'Compare the revised document.' };
+    mockFind.mockReturnValueOnce(cursor([row({ runInput })]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...row({ runInput }), state: 'processing' });
+    await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+    expect(mockPrepareCortexFollowUpMessage.mock.calls[0][0].insightsData.insights[0]).toEqual(
+      expect.objectContaining({
+        runInput,
+        authority: expect.objectContaining({ kind: 'durable_terminal_callback', runId: 'run-1' }),
+      }),
+    );
+  });
+
+  test('retains native media in the exact owner/run evidence row before synthesis', async () => {
+    const nativeMedia = {
+      observations: [
+        {
+          kind: 'image',
+          source: 'native_tool_result',
+          artifact_ref: `artifact_sha256:${'a'.repeat(64)}`,
+          run_id: 'run-1',
+          tool_call_id: 'call-1',
+          content_index: 0,
+          mime_type: 'image/png',
+          bytes: 100,
+          sha256: 'a'.repeat(64),
+          download_url: 'https://artifacts.example.test/v1/link-refs/ghr_1234567890abcdef',
+          open_url: 'https://artifacts.example.test/v1/link-refs/ghr_fedcba0987654321',
+        },
+      ],
+      omitted_count: 1,
+    };
+    const input = {
+      binding: {
+        ownerId: 'user-1',
+        originRef: 'origin-1',
+        conversationId: 'conversation-1',
+        anchorMessageId: 'anchor-1',
+      },
+      body: {
+        callback_id: 'cb-1',
+        run_id: 'run-1',
+        worker_id: 'worker-1',
+        event: 'run.completed',
+        work_state: 'completed',
+        work_terminal: true,
+        message: 'Observed result.',
+        native_media: nativeMedia,
+      },
+    };
+    await enqueueGlassHiveMissionAdjudication(input);
+    expect(mockUpdateOne.mock.calls[0][1].$setOnInsert).toEqual(
+      expect.objectContaining({ ownerId: 'user-1', runId: 'run-1', nativeMedia }),
+    );
+    expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+    const writes = mockUpdateOne.mock.calls.length;
+    await expect(
+      enqueueGlassHiveMissionAdjudication({
+        ...input,
+        body: { ...input.body, run_id: 'different-run' },
+      }),
+    ).rejects.toThrow('native_media_identity_invalid');
+    expect(mockUpdateOne.mock.calls).toHaveLength(writes);
   });
 
   test('defers account adjudication until callback commit and schedules nothing after abort', async () => {
@@ -429,8 +592,9 @@ describe('GlassHiveMissionAdjudicationService', () => {
   });
 
   test('coalesces same-account mission evidence into existing Main Phase-B synthesis', async () => {
+    const media = { observations: [], omitted_count: 2 };
     const rows = [
-      row(),
+      row({ nativeMedia: media }),
       row({
         _id: 'cb-2',
         evidenceId: 'cb-2',
@@ -438,6 +602,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
         originRef: 'ghi-origin-2',
         anchorMessageId: 'assistant-anchor-newer',
         evidence: 'Second result.',
+        runId: 'run-2',
       }),
     ];
     mockFind.mockReturnValueOnce(cursor(rows));
@@ -458,14 +623,17 @@ describe('GlassHiveMissionAdjudicationService', () => {
       expect.objectContaining({
         agent: expect.objectContaining({ id: 'main-agent' }),
         parentMessageId: 'assistant-anchor-newer',
+        runId: expect.stringMatching(/^ghag_[a-f0-9]{32}$/),
         insightsData: expect.objectContaining({
           insights: [
             {
               cortexName: 'Mission evidence',
               insight: 'Verified synthetic result.',
+              nativeMedia: media,
               maxPromptChars: 12_000,
               authority: {
                 kind: 'durable_terminal_callback',
+                runId: 'run-1',
                 event: 'run.completed',
                 workState: 'completed',
               },
@@ -476,6 +644,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
               maxPromptChars: 12_000,
               authority: {
                 kind: 'durable_terminal_callback',
+                runId: 'run-2',
                 event: 'run.completed',
                 workState: 'completed',
               },
@@ -510,6 +679,55 @@ describe('GlassHiveMissionAdjudicationService', () => {
         }),
       }),
     );
+    expect(mockPrepareCortexFollowUpMessage.mock.calls[0][0].insightsData.insights[0]).toEqual(
+      expect.objectContaining({
+        nativeMedia: media,
+        authority: expect.objectContaining({ kind: 'durable_terminal_callback', runId: 'run-1' }),
+      }),
+    );
+  });
+
+  test('pins bounded media batches without dropping a coalesced mission observation', async () => {
+    const media = (runId) => ({
+      observations: Array.from({ length: 13 }, (_, content_index) => ({
+        kind: 'image',
+        source: 'native_tool_result',
+        artifact_ref: `artifact_sha256:${'a'.repeat(64)}`,
+        run_id: runId,
+        tool_call_id: 'call-1',
+        content_index,
+        mime_type: 'image/png',
+        bytes: 100,
+        sha256: 'a'.repeat(64),
+        download_url: 'https://artifacts.example.test/v1/link-refs/ghr_1234567890abcdef',
+        open_url: 'https://artifacts.example.test/v1/link-refs/ghr_fedcba0987654321',
+      })),
+      omitted_count: 0,
+    });
+    const rows = [
+      row({ nativeMedia: media('run-1') }),
+      row({
+        _id: 'cb-2',
+        evidenceId: 'cb-2',
+        originRef: 'ghi-origin-2',
+        runId: 'run-2',
+        nativeMedia: media('run-2'),
+      }),
+    ];
+    mockFind.mockReturnValueOnce(cursor(rows));
+    mockFindOneAndUpdate.mockImplementation(async (filter) => ({
+      ...rows.find((item) => item._id === filter._id),
+      state: 'processing',
+    }));
+    const summary = await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+    expect(summary).toEqual({ claimed: 2, groups: 2, visible: 2, silent: 0, failed: 0 });
+    expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(2);
+    expect(
+      mockPrepareCortexFollowUpMessage.mock.calls.map(
+        ([input]) => input.insightsData.insights.flatMap((i) => i.nativeMedia.observations).length,
+      ),
+    ).toEqual([13, 13]);
+    expect(rows[0].adjudicationGroupId).not.toBe(rows[1].adjudicationGroupId);
   });
 
   test('gives sequential terminal groups under one anchor distinct pinned delivery parents', async () => {
@@ -736,6 +954,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       adjudicationGroupMemberIds: members,
       adjudicationGroupPinnedAt: new Date('2026-08-28T05:02:25.000Z'),
     });
+    retainAuthoredFollowUp(first);
     mockFind.mockReturnValueOnce(cursor([first, second]));
     mockFindOneAndUpdate.mockImplementation(async (filter) => ({
       ...(filter._id === first._id ? first : second),
@@ -951,6 +1170,58 @@ describe('GlassHiveMissionAdjudicationService', () => {
       expect.anything(),
     );
   });
+
+  test.each([false, true])(
+    'a settled silent predecessor permits the next group (earlier visible result: %s)',
+    async (hasVisiblePredecessor) => {
+      const newer = row({
+        _id: 'cb-after-silence',
+        evidenceId: 'cb-after-silence',
+        createdAt: new Date('2026-08-28T04:56:13.000Z'),
+      });
+      const silent = row({
+        _id: 'cb-settled-silent',
+        state: 'silent',
+        attempts: 1,
+        followUpMessageId: '',
+        adjudicationGroupId: `ghag_${'a'.repeat(32)}`,
+        createdAt: new Date('2026-08-28T04:55:13.000Z'),
+      });
+      const visible = row({
+        _id: 'cb-earlier-visible',
+        state: 'completed',
+        followUpMessageId: 'follow-up-earlier-visible',
+        adjudicationGroupId: `ghag_${'b'.repeat(32)}`,
+        createdAt: new Date('2026-08-28T04:54:13.000Z'),
+      });
+      const predecessors = hasVisiblePredecessor ? [silent, visible] : [silent];
+      const matches = require('sift').default;
+      mockFind.mockReturnValueOnce(cursor([newer]));
+      mockFindOne.mockImplementation(async (filter) => predecessors.find(matches(filter)) || null);
+      mockFindOneAndUpdate.mockResolvedValueOnce({ ...newer, state: 'processing' });
+
+      await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual({
+        claimed: 1,
+        groups: 1,
+        visible: 1,
+        silent: 0,
+        failed: 0,
+      });
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+      expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          parentMessageId: 'assistant-anchor',
+          deliveryParentMessageId: hasVisiblePredecessor
+            ? 'follow-up-earlier-visible'
+            : 'assistant-anchor',
+        }),
+      );
+      expect(mockUpdateOne).not.toHaveBeenCalledWith(
+        expect.objectContaining({ _id: silent._id }),
+        expect.anything(),
+      );
+    },
+  );
 
   test('holds a newer group behind a failed predecessor without consuming an attempt', async () => {
     const newer = row({
@@ -1261,6 +1532,122 @@ describe('GlassHiveMissionAdjudicationService', () => {
     }
   });
 
+  test('hides only the exact neutral completed callback after Main presentation is saved', async () => {
+    const fenced = row({
+      terminalCallbackResultKey: `ghtr_${'a'.repeat(64)}`,
+      terminalCallbackAcceptedOperationId: 'b'.repeat(32),
+      terminalCallbackId: `cb_terminal_${'c'.repeat(64)}`,
+      terminalCallbackResultDigest: `sha256:${'d'.repeat(64)}`,
+      terminalCallbackResultRevision: 1,
+      terminalCallbackEffectGeneration: 1,
+    });
+    mockFind.mockReturnValueOnce(cursor([fenced]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...fenced, state: 'processing' });
+    const activeSession = { id: 'accepted-result-session' };
+    mockRunTransaction = async (operation) => {
+      mockTransactionSession = activeSession;
+      try {
+        return await operation(activeSession);
+      } finally {
+        mockTransactionSession = null;
+      }
+    };
+    mockMessageUpdateOne.mockImplementationOnce(async (filter, update, options) => {
+      expect(mockPersistPreparedCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+      expect(filter).toEqual({
+        user: 'user-1',
+        conversationId: 'conversation-1',
+        isCreatedByUser: false,
+        'metadata.viventium.type': 'glasshive_worker_callback',
+        'metadata.viventium.originRef': 'ghi-origin-1',
+        'metadata.viventium.runId': 'run-1',
+        'metadata.viventium.callbackId': fenced.terminalCallbackId,
+        'metadata.viventium.status.kind': 'mission_status',
+        'metadata.viventium.status.state': 'completed',
+        'metadata.viventium.hasFullText': false,
+      });
+      expect(update).toEqual({ $set: { 'metadata.viventium.visibility': 'internal' } });
+      expect(options).toEqual({ session: activeSession });
+      return { acknowledged: true, matchedCount: 1 };
+    });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({
+      visible: 1,
+      failed: 0,
+    });
+    expect(mockMessageUpdateOne).toHaveBeenCalledTimes(1);
+  });
+
+  test('keeps neutral status visible when Main presentation cannot be saved', async () => {
+    const fenced = row({
+      terminalCallbackResultKey: `ghtr_${'a'.repeat(64)}`,
+      terminalCallbackAcceptedOperationId: 'b'.repeat(32),
+      terminalCallbackId: `cb_terminal_${'c'.repeat(64)}`,
+      terminalCallbackResultDigest: `sha256:${'d'.repeat(64)}`,
+      terminalCallbackResultRevision: 1,
+      terminalCallbackEffectGeneration: 1,
+    });
+    mockFind.mockReturnValueOnce(cursor([fenced]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...fenced, state: 'processing' });
+    mockPersistPreparedCortexFollowUpMessage.mockRejectedValueOnce(
+      new Error('message_store_unavailable'),
+    );
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({
+      visible: 0,
+      failed: 1,
+    });
+    expect(mockMessageUpdateOne).not.toHaveBeenCalled();
+  });
+
+  test('prepares Main synthesis outside Mongo and persists it inside a fresh terminal fence', async () => {
+    const fenced = row({
+      terminalCallbackResultKey: `ghtr_${'a'.repeat(64)}`,
+      terminalCallbackAcceptedOperationId: 'b'.repeat(32),
+      terminalCallbackId: `cb_terminal_${'c'.repeat(64)}`,
+      terminalCallbackResultDigest: `sha256:${'d'.repeat(64)}`,
+      terminalCallbackResultRevision: 1,
+      terminalCallbackEffectGeneration: 1,
+    });
+    let activeTransaction = 0;
+    let transactionSerial = 0;
+    mockFind.mockReturnValueOnce(cursor([fenced]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...fenced, state: 'processing' });
+    mockRunTransaction = jest.fn(async (operation) => {
+      const transaction = ++transactionSerial;
+      activeTransaction = transaction;
+      try {
+        return await operation({ id: `session-${transaction}` });
+      } finally {
+        activeTransaction = 0;
+      }
+    });
+    mockPrepareCortexFollowUpMessage.mockImplementationOnce(async () => {
+      expect(transactionSerial).toBe(2);
+      expect(activeTransaction).toBe(0);
+      return { prepared: true };
+    });
+    mockPersistPreparedCortexFollowUpMessage.mockImplementationOnce(async (input, prepared) => {
+      expect(activeTransaction).toBe(3);
+      expect(prepared).toEqual({ prepared: true });
+      return storeAuthoredMessage(input, {
+        messageId: 'follow-up-fenced',
+        text: 'Main-authored result.',
+      });
+    });
+    mockEnqueueDelivery.mockImplementationOnce(async () => {
+      expect(activeTransaction).toBe(4);
+      return { configured: 1, enqueued: 1 };
+    });
+
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+      expect.objectContaining({ visible: 1, failed: 0 }),
+    );
+
+    expect(mockRunTransaction).toHaveBeenCalledTimes(4);
+    expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    expect(mockPersistPreparedCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    expect(mockEnqueueDelivery).toHaveBeenCalledTimes(1);
+  });
+
   test('binds one coalesced Voice presentation to every exact Worker and the current call', async () => {
     const terminalRow = (suffix) => {
       const rawCallbackId = `cb_terminal_${suffix.repeat(64)}`;
@@ -1324,6 +1711,49 @@ describe('GlassHiveMissionAdjudicationService', () => {
       ],
     });
     expect(input.body.work_ref).toBe('work-a');
+  });
+
+  test('ended Call completion keeps the authored linked result and other destinations without regeneration', async () => {
+    const telegram = { surface: 'telegram', telegramChatId: 'chat-1' };
+    const retained = row({
+      surface: 'voice',
+      state: 'delivery_pending',
+      destinations: [{ surface: 'voice', voiceCallSessionId: 'ended-call' }, telegram],
+      followUpMessageId: 'already-authored-result',
+      followUpText: 'The useful guide is ready.',
+    });
+    retainAuthoredFollowUp(retained);
+    mockFind.mockReturnValueOnce(cursor([retained]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...retained, state: 'processing' });
+    mockEnqueueDelivery.mockImplementationOnce(async ({ deliveryContext }) => ({
+      configured: deliveryContext.destinations.length,
+      enqueued: deliveryContext.destinations.filter((item) => item.surface === 'telegram').length,
+      unresolved: deliveryContext.destinations.filter((item) => item.surface === 'voice').length,
+    }));
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+      expect.objectContaining({ visible: 1, failed: 0 }),
+    );
+    expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: { messageId: 'already-authored-result', text: 'The useful guide is ready.' },
+        deliveryContext: expect.objectContaining({
+          destinations: [telegram, { surface: 'librechat' }],
+        }),
+      }),
+    );
+    expect(mockRecordTraceDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerId: 'user-1',
+        originRef: 'ghi-origin-1',
+        workRef: 'gh-work-1',
+        runRef: 'run-1',
+        deliveryRef: 'main-web:already-authored-result',
+        surface: 'web',
+        status: 'sent',
+      }),
+    );
   });
 
   test('records an exact Web receipt only after Main persists the visible presentation', async () => {
@@ -1431,6 +1861,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       webPresentationMessageId: 'follow-up-web-restart',
       webPresentedAt: presentedAt,
     });
+    retainAuthoredFollowUp(recovered);
     mockFind.mockReturnValueOnce(cursor([recovered]));
     mockFindOneAndUpdate.mockResolvedValueOnce({ ...recovered, state: 'processing' });
 
@@ -1497,6 +1928,111 @@ describe('GlassHiveMissionAdjudicationService', () => {
       }),
     );
     expect(leanUser).toEqual({ _id: 'user-1', role: 'USER' });
+  });
+
+  test('does not deliver fallback prose when the mission synthesis provider failed', async () => {
+    mockFind.mockReturnValueOnce(cursor([row()]));
+    mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({
+      text: 'Generic fallback prose.',
+      followUpDecisionRecord: { generationFailed: true, forceVisibleFollowUp: true },
+    });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+      expect.objectContaining({ failed: 1, silent: 0, visible: 0 }),
+    );
+    expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+    expect(mockMessageUpdateOne).not.toHaveBeenCalled();
+    expect(mockRecordOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        state: 'failed',
+        errorCode: 'mission_synthesis_generation_failed',
+      }),
+    );
+  });
+
+  test('retains an explicit semantic NTA as silent inside the accepted-result fence', async () => {
+    const fenced = row({
+      terminalCallbackResultKey: `ghtr_${'a'.repeat(64)}`,
+      terminalCallbackAcceptedOperationId: 'b'.repeat(32),
+      terminalCallbackId: `cb_terminal_${'c'.repeat(64)}`,
+      terminalCallbackResultDigest: `sha256:${'d'.repeat(64)}`,
+      terminalCallbackResultRevision: 1,
+      terminalCallbackEffectGeneration: 1,
+    });
+    mockFind.mockReturnValueOnce(cursor([fenced]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...fenced, state: 'processing' });
+    const activeSession = { id: 'silent-result-session' };
+    mockRunTransaction = async (operation) => {
+      mockTransactionSession = activeSession;
+      try {
+        return await operation(activeSession);
+      } finally {
+        mockTransactionSession = null;
+      }
+    };
+    mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({
+      followUpDecisionRecord: {
+        generationFailed: false,
+        forceVisibleFollowUp: false,
+        llmResult: 'nta',
+        selectedStrategy: 'no_response_suppressed',
+      },
+    });
+    mockCreateCortexFollowUpMessage.mockResolvedValueOnce(null);
+
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+      expect.objectContaining({ silent: 1, visible: 0, failed: 0 }),
+    );
+    expect(mockRecordOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        originRef: 'ghi-origin-1',
+        state: 'silent',
+        followUpMessageId: '',
+        errorCode: '',
+      }),
+    );
+    expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+    expect(mockMessageUpdateOne).toHaveBeenCalledTimes(1);
+    expect(mockMessageUpdateOne).toHaveBeenCalledWith(
+      {
+        user: 'user-1',
+        conversationId: 'conversation-1',
+        isCreatedByUser: false,
+        'metadata.viventium.type': 'glasshive_worker_callback',
+        'metadata.viventium.originRef': 'ghi-origin-1',
+        'metadata.viventium.runId': 'run-1',
+        'metadata.viventium.callbackId': fenced.terminalCallbackId,
+        'metadata.viventium.status.kind': 'mission_status',
+        'metadata.viventium.status.state': 'completed',
+        'metadata.viventium.hasFullText': false,
+      },
+      { $set: { 'metadata.viventium.visibility': 'internal' } },
+      { session: activeSession },
+    );
+  });
+
+  test.each([
+    { generationFailed: true },
+    { forceVisibleFollowUp: true },
+    { llmResult: 'empty' },
+    { selectedStrategy: 'voice_empty_suppressed' },
+  ])('does not mistake an unavailable presentation for semantic silence: %o', async (changed) => {
+    mockFind.mockReturnValueOnce(cursor([row()]));
+    mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({
+      followUpDecisionRecord: {
+        generationFailed: false,
+        forceVisibleFollowUp: false,
+        llmResult: 'nta',
+        selectedStrategy: 'no_response_suppressed',
+        ...changed,
+      },
+    });
+    mockCreateCortexFollowUpMessage.mockResolvedValueOnce(null);
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+      expect.objectContaining({ silent: 0, visible: 0, failed: 1 }),
+    );
+    expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+    expect(mockMessageUpdateOne).not.toHaveBeenCalled();
   });
 
   test('does not silently discard first terminal evidence when Main returns no presentation', async () => {
@@ -1592,7 +2128,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
 
   test('uses a new account continuation when the origin conversation was deleted', async () => {
     mockFind.mockReturnValueOnce(cursor([row()]));
-    mockGetConvo.mockResolvedValueOnce(null);
+    mockGetConvo.mockResolvedValue(null);
     mockCreateCortexFollowUpMessage.mockResolvedValueOnce({
       messageId: 'follow-up-account-1',
       text: 'Main-authored account continuation.',
@@ -1676,6 +2212,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
     );
 
     mockFind
+      .mockReturnValueOnce(cursor([]))
       .mockReturnValueOnce(cursor([]))
       .mockReturnValueOnce(cursor([row({ state: 'failed', nextAttemptAt: new Date(0) })]));
     await expect(reconcilePendingGlassHiveMissionAdjudications()).resolves.toEqual({
@@ -1793,7 +2330,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
 
   test('classifies a generic synthesis failure by its durable recovery stage', async () => {
     mockFind.mockReturnValueOnce(cursor([row()]));
-    mockCreateCortexFollowUpMessage.mockRejectedValueOnce(new Error('synthetic private detail'));
+    mockPrepareCortexFollowUpMessage.mockRejectedValueOnce(new Error('synthetic private detail'));
 
     await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
       expect.objectContaining({ failed: 1 }),
@@ -1803,7 +2340,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       expect.objectContaining({
         $set: expect.objectContaining({
           state: 'failed',
-          errorCode: 'mission_adjudication_synthesize_failed',
+          errorCode: 'mission_adjudication_prepare_synthesis_failed',
         }),
       }),
     );
@@ -1858,6 +2395,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       followUpMessageId: 'follow-up-1',
       followUpText: 'Main-authored synthetic follow-up.',
     });
+    retainAuthoredFollowUp(retry);
     mockFind.mockReturnValueOnce(cursor([retry]));
     mockFindOneAndUpdate.mockResolvedValueOnce({ ...retry, state: 'processing' });
     mockEnqueueDelivery.mockResolvedValueOnce({ configured: 1, enqueued: 1 });
@@ -1903,5 +2441,260 @@ describe('GlassHiveMissionAdjudicationService', () => {
         }),
       }),
     );
+  });
+
+  describe('committed linked Web projection', () => {
+    function completedPresentation(overrides = {}) {
+      return row({
+        state: 'completed',
+        surface: 'web',
+        destinations: [{ surface: 'librechat' }],
+        followUpMessageId: 'retained-main-result',
+        followUpText: 'Retained Main-authored result.',
+        authoredAt: new Date('2026-08-28T05:02:26.000Z'),
+        webPresentationMessageId: 'retained-main-result',
+        webPresentedAt: new Date('2026-08-28T05:02:27.000Z'),
+        ...overrides,
+      });
+    }
+
+    function recoverOnly(completed) {
+      mockFind.mockImplementation((filter) =>
+        cursor(filter.state === 'completed' ? [completed] : []),
+      );
+    }
+
+    const projectionWrites = () =>
+      mockUpdateOne.mock.calls.filter(([, update]) => update?.$set?.webProjectionReconciledAt);
+
+    test.each([
+      { surface: 'web', destinations: [{ surface: 'librechat' }] },
+      { surface: 'voice', destinations: [{ surface: 'voice', voiceCallSessionId: 'ended-call' }] },
+    ])(
+      'projects committed $surface presentation through the existing local destination',
+      async (input) => {
+        const pending = row(input);
+        mockFind.mockReturnValueOnce(cursor([pending]));
+        mockFindOneAndUpdate.mockResolvedValueOnce({ ...pending, state: 'processing' });
+        mockEnqueueDelivery.mockResolvedValueOnce({
+          configured: 0,
+          enqueued: 0,
+          linkedWebCommitted: true,
+        });
+
+        await expect(
+          flushGlassHiveMissionAdjudications({ ownerId: 'user-1' }),
+        ).resolves.toMatchObject({ visible: 1, failed: 0 });
+
+        expect(mockEnqueueDelivery).toHaveBeenCalledWith(
+          expect.objectContaining({
+            message: { messageId: 'follow-up-1', text: 'Main-authored synthetic follow-up.' },
+            deliveryContext: expect.objectContaining({ destinations: [{ surface: 'librechat' }] }),
+          }),
+        );
+        expect(projectionWrites()).toHaveLength(1);
+        expect(projectionWrites()[0][0]).toEqual({
+          _id: pending._id,
+          ownerId: pending.ownerId,
+          webPresentationMessageId: 'follow-up-1',
+        });
+        expect(mockRecordTraceDelivery).toHaveBeenCalledWith(
+          expect.objectContaining({ surface: 'web', status: 'sent' }),
+        );
+      },
+    );
+
+    test('does not add a local destination to an ordinary pending Telegram result', async () => {
+      const pending = row();
+      mockFind.mockReturnValueOnce(cursor([pending]));
+      await expect(
+        flushGlassHiveMissionAdjudications({ ownerId: 'user-1' }),
+      ).resolves.toMatchObject({ visible: 1, failed: 0 });
+      expect(mockEnqueueDelivery.mock.calls[0][0].deliveryContext.destinations).toEqual(
+        pending.destinations,
+      );
+      expect(projectionWrites()).toHaveLength(0);
+      expect(mockRecordTraceDelivery).not.toHaveBeenCalled();
+    });
+
+    test('recovers a bounded completed local projection without authoring or resetting the result', async () => {
+      const completed = completedPresentation();
+      retainAuthoredFollowUp(completed);
+      recoverOnly(completed);
+      mockEnqueueDelivery.mockResolvedValueOnce({
+        configured: 0,
+        enqueued: 0,
+        linkedWebCommitted: true,
+      });
+
+      await expect(reconcilePendingGlassHiveMissionAdjudications({ limit: 7 })).resolves.toEqual({
+        rows: 0,
+        owners: 0,
+      });
+
+      expect(mockFind.mock.calls[0][0]).toMatchObject({
+        state: 'completed',
+        webPresentedAt: { $type: 'date' },
+        webPresentationMessageId: { $type: 'string', $ne: '' },
+        webProjectionReconciledAt: { $exists: false },
+      });
+      expect(mockFind.mock.results[0].value.limit).toHaveBeenCalledWith(7);
+      expect(mockEnqueueDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: { messageId: completed.followUpMessageId, text: completed.followUpText },
+        }),
+      );
+      expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+      expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
+      expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+      expect(mockRecordOutcome).not.toHaveBeenCalled();
+      expect(mockUpdateOne.mock.calls.every(([, update]) => !update?.$set?.state)).toBe(true);
+      expect(projectionWrites()).toHaveLength(1);
+    });
+
+    test.each(['missing', 'foreign owner', 'changed body'])(
+      'rejects a retained projection with %s Message storage',
+      async (invalid) => {
+        const completed = completedPresentation();
+        if (invalid !== 'missing') {
+          retainAuthoredFollowUp(completed);
+          if (invalid === 'foreign owner') mockStoredMessages[0].user = 'other-owner';
+          else mockStoredMessages[0].text = 'Different authored result.';
+        }
+        recoverOnly(completed);
+        await reconcilePendingGlassHiveMissionAdjudications();
+        expect(mockMessageFindOne).toHaveBeenCalledWith(
+          {
+            user: 'user-1',
+            conversationId: 'conversation-1',
+            messageId: completed.followUpMessageId,
+            isCreatedByUser: false,
+          },
+          undefined,
+        );
+        expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+        expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+        expect(projectionWrites()).toHaveLength(0);
+        expect(mockUpdateOne).toHaveBeenCalledWith(
+          { _id: completed._id, ownerId: completed.ownerId, state: 'completed' },
+          { $set: { webProjectionNextAttemptAt: expect.any(Date) } },
+        );
+        expect(mockFind.mock.calls[0][0].$or).toEqual([
+          { webProjectionNextAttemptAt: null },
+          { webProjectionNextAttemptAt: { $lte: expect.any(Date) } },
+        ]);
+        expect(require('@librechat/data-schemas').logger.warn).toHaveBeenCalledWith(
+          expect.any(String),
+          { code: 'mission_authored_message_unavailable' },
+        );
+      },
+    );
+
+    test('does not mark a local projection reconciled without the committed summary', async () => {
+      const completed = completedPresentation();
+      retainAuthoredFollowUp(completed);
+      recoverOnly(completed);
+      mockEnqueueDelivery.mockResolvedValueOnce({ configured: 0, enqueued: 0 });
+      await reconcilePendingGlassHiveMissionAdjudications();
+      expect(mockEnqueueDelivery).toHaveBeenCalledTimes(1);
+      expect(projectionWrites()).toHaveLength(0);
+      expect(mockUpdateOne).toHaveBeenCalledWith(
+        { _id: completed._id, ownerId: completed.ownerId, state: 'completed' },
+        { $set: { webProjectionNextAttemptAt: expect.any(Date) } },
+      );
+    });
+
+    test.each([
+      {
+        name: 'durably queued',
+        summary: { configured: 1, enqueued: 1, unresolved: 0 },
+        reconciled: true,
+      },
+      {
+        name: 'unresolved',
+        summary: { configured: 1, enqueued: 0, unresolved: 1 },
+        reconciled: false,
+      },
+    ])(
+      'retains pending Telegram delivery and marks only $name enqueue proof',
+      async ({ summary, reconciled }) => {
+        const telegram = { surface: 'telegram', telegramChatId: 'chat-1' };
+        const completed = completedPresentation({ destinations: [telegram] });
+        retainAuthoredFollowUp(completed);
+        recoverOnly(completed);
+        mockEnqueueDelivery.mockResolvedValueOnce(summary);
+        await reconcilePendingGlassHiveMissionAdjudications();
+        expect(mockEnqueueDelivery.mock.calls[0][0].deliveryContext.destinations).toEqual([
+          telegram,
+          { surface: 'librechat' },
+        ]);
+        expect(completed.destinations).toEqual([telegram]);
+        expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+        expect(mockRecordTraceDelivery).not.toHaveBeenCalled();
+        expect(projectionWrites()).toHaveLength(reconciled ? 1 : 0);
+        if (!reconciled) {
+          expect(require('@librechat/data-schemas').logger.warn).toHaveBeenCalledWith(
+            expect.any(String),
+            { code: 'mission_surface_delivery_unresolved' },
+          );
+        }
+      },
+    );
+
+    test('rolls back projection writes when the current accepted callback authority is superseded', async () => {
+      const completed = completedPresentation({
+        terminalCallbackResultKey: `ghtr_${'a'.repeat(64)}`,
+        terminalCallbackAcceptedOperationId: 'b'.repeat(32),
+        terminalCallbackId: `cb_terminal_${'c'.repeat(64)}`,
+        terminalCallbackResultDigest: `sha256:${'d'.repeat(64)}`,
+        terminalCallbackResultRevision: 2,
+        terminalCallbackEffectGeneration: 3,
+      });
+      retainAuthoredFollowUp(completed);
+      recoverOnly(completed);
+      mockEnqueueDelivery.mockResolvedValueOnce({
+        configured: 0,
+        enqueued: 0,
+        linkedWebCommitted: true,
+      });
+      const committed = [];
+      let pending = [];
+      mockUpdateOne.mockImplementation(async (filter, update) => {
+        pending.push({ filter, update });
+        return { acknowledged: true, matchedCount: 1 };
+      });
+      const session = { id: 'projection-fence-session' };
+      mockRunTransaction = async (operation) => {
+        mockTransactionSession = session;
+        pending = [];
+        try {
+          const result = await operation(session);
+          committed.push(...pending);
+          return result;
+        } finally {
+          mockTransactionSession = null;
+          pending = [];
+        }
+      };
+      const fence = require('@librechat/api').fenceGlassHiveTerminalCallbackAcceptedOperation;
+      fence.mockResolvedValueOnce(false);
+      await reconcilePendingGlassHiveMissionAdjudications();
+      expect(fence).toHaveBeenCalledWith(
+        expect.objectContaining({
+          session,
+          reference: expect.objectContaining({
+            acceptedOperationId: completed.terminalCallbackAcceptedOperationId,
+            resultRevision: 2,
+            generation: 3,
+          }),
+        }),
+      );
+      expect(committed).toEqual([]);
+      expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+      expect(require('@librechat/data-schemas').logger.warn).toHaveBeenCalledWith(
+        expect.any(String),
+        { code: 'glasshive_mission_evidence_superseded' },
+      );
+    });
   });
 });

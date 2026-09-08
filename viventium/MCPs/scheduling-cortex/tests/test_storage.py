@@ -630,6 +630,266 @@ class StorageScheduledPromptLifecycleTests(unittest.TestCase):
             self.assertEqual(recovered["run"]["run_id"], first["run"]["run_id"])
             self.assertEqual(recovered["run"]["attempt"], 2)
             self.assertEqual(recovered["run"]["disposition"], "running")
+            expired = storage.list_scheduled_prompt_run_attempts(first["run"]["run_id"])
+            self.assertEqual(len(expired), 1)
+            self.assertEqual(expired[0]["attempt"], 1)
+            self.assertEqual(expired[0]["status"], "failed")
+            self.assertEqual(expired[0]["error_class"], "attempt_lease_expired")
+            self.assertEqual(expired[0]["lease_owner"], "owner-1")
+
+    def test_stale_finalizer_cannot_overwrite_a_reclaimed_attempt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            due_at = "2026-08-10T12:00:00Z"
+            first = storage.claim_scheduled_prompt_occurrence(
+                task_id="task-fenced",
+                user_id="user-1",
+                executor="viventium_agent",
+                due_at=due_at,
+                lease_owner="scheduler:first",
+                now=due_at,
+                lease_seconds=1,
+            )
+            run_id = first["run"]["run_id"]
+            storage.update_scheduled_prompt_run(
+                run_id,
+                {
+                    "status": "dispatching",
+                    "execution_snapshot": {"worker": "first"},
+                    "updated_at": due_at,
+                },
+            )
+            second = storage.claim_scheduled_prompt_occurrence(
+                task_id="task-fenced",
+                user_id="user-1",
+                executor="viventium_agent",
+                due_at=due_at,
+                lease_owner="scheduler:second",
+                now="2026-08-10T12:00:02Z",
+                lease_seconds=60,
+            )
+
+            stale = storage.finalize_scheduled_prompt_run_attempt(
+                run_id,
+                {
+                    "status": "failed",
+                    "disposition": "failed",
+                    "error_class": "provider_response_failed",
+                    "completed_at": "2026-08-10T12:00:03Z",
+                    "updated_at": "2026-08-10T12:00:03Z",
+                },
+                expected_lease_owner="scheduler:first",
+                expected_attempt=1,
+                expected_status="dispatching",
+            )
+            current = storage.get_scheduled_prompt_run(run_id)
+
+            self.assertTrue(second["claimed"])
+            self.assertFalse(stale["finalized"])
+            self.assertEqual(stale["reason"], "stale_finalizer")
+            self.assertEqual(current["attempt"], 2)
+            self.assertEqual(current["lease_owner"], "scheduler:second")
+            self.assertEqual(current["status"], "claimed")
+
+            stale_callback = storage.update_scheduled_prompt_run_if_current(
+                run_id,
+                {"status": "failed", "error_class": "provider_response_failed"},
+                expected_status="claimed",
+                expected_error_class=None,
+                expected_attempt=1,
+                expected_glasshive_run_id="",
+            )
+            self.assertFalse(stale_callback["updated"])
+            self.assertEqual(stale_callback["run"]["attempt"], 2)
+            self.assertEqual(stale_callback["run"]["status"], "claimed")
+
+            storage.update_scheduled_prompt_run(
+                run_id,
+                {
+                    "status": "dispatching",
+                    "execution_snapshot": {"worker": "second"},
+                    "updated_at": "2026-08-10T12:00:03Z",
+                },
+            )
+            completed = storage.finalize_scheduled_prompt_run_attempt(
+                run_id,
+                {
+                    "status": "completed",
+                    "disposition": "delivered",
+                    "completed_at": "2026-08-10T12:00:04Z",
+                    "updated_at": "2026-08-10T12:00:04Z",
+                },
+                expected_lease_owner="scheduler:second",
+                expected_attempt=2,
+                expected_status="dispatching",
+            )
+            attempts = storage.list_scheduled_prompt_run_attempts(run_id)
+
+            self.assertTrue(completed["finalized"])
+            self.assertEqual(
+                [
+                    (row["attempt"], row["lease_owner"], row["error_class"])
+                    for row in attempts
+                ],
+                [
+                    (1, "scheduler:first", "attempt_lease_expired"),
+                    (2, "scheduler:second", None),
+                ],
+            )
+            storage.update_scheduled_prompt_run(
+                run_id,
+                {
+                    "status": "dispatching",
+                    "lease_owner": "scheduler:second",
+                    "lease_until": "2026-08-10T12:01:00Z",
+                },
+            )
+            conflict = storage.finalize_scheduled_prompt_run_attempt(
+                run_id,
+                {
+                    "status": "failed",
+                    "disposition": "failed",
+                    "error_class": "provider_response_failed",
+                    "completed_at": "2026-08-10T12:00:05Z",
+                    "updated_at": "2026-08-10T12:00:05Z",
+                },
+                expected_lease_owner="scheduler:second",
+                expected_attempt=2,
+                expected_status="dispatching",
+            )
+            preserved = storage.list_scheduled_prompt_run_attempts(run_id)
+            self.assertFalse(conflict["finalized"])
+            self.assertEqual(conflict["reason"], "attempt_evidence_conflict")
+            self.assertEqual(preserved[1]["status"], "completed")
+            self.assertIsNone(preserved[1]["error_class"])
+
+    def test_retry_finalization_and_task_transition_are_one_transaction(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "schedules.db")
+            first_storage = ScheduleStorage(StorageConfig(db_path=db_path))
+            second_storage = ScheduleStorage(StorageConfig(db_path=db_path))
+            task = _build_task("task-atomic-retry")
+            task["schedule"] = {
+                "type": "once",
+                "at": "2026-08-10T12:00:00Z",
+                "timezone": "UTC",
+            }
+            task["next_run_at"] = "2026-08-10T12:00:00Z"
+            first_storage.create_task(task)
+            first = first_storage.claim_scheduled_prompt_occurrence(
+                task_id=task["id"],
+                user_id=task["user_id"],
+                executor="viventium_agent",
+                due_at=task["next_run_at"],
+                lease_owner="scheduler:first",
+                now=task["next_run_at"],
+                lease_seconds=60,
+            )
+            run_id = first["run"]["run_id"]
+            occurrence_key = first["run"]["occurrence_key"]
+            first_storage.update_scheduled_prompt_run(
+                run_id,
+                {"status": "dispatching", "updated_at": task["next_run_at"]},
+            )
+            retry_at = "2026-08-10T12:05:00Z"
+            retry_marker = {
+                "version": 1,
+                "run_id": run_id,
+                "occurrence_key": occurrence_key,
+                "due_at": task["next_run_at"],
+                "next_attempt_at": retry_at,
+                "attempt": 1,
+            }
+            inside_transaction = threading.Event()
+            release_transaction = threading.Event()
+            claim_finished = threading.Event()
+            results = {}
+            original_transition = ScheduleStorage._update_scheduled_task_transition
+
+            def pause_after_task_transition(conn, *, task_id, user_id, updates):
+                updated = original_transition(
+                    conn,
+                    task_id=task_id,
+                    user_id=user_id,
+                    updates=updates,
+                )
+                inside_transaction.set()
+                self.assertTrue(release_transaction.wait(2))
+                return updated
+
+            def finalize() -> None:
+                results["finalize"] = first_storage.finalize_scheduled_prompt_run_attempt(
+                    run_id,
+                    {
+                        "status": "failed",
+                        "disposition": "failed",
+                        "error_class": "provider_response_failed",
+                        "completed_at": "2026-08-10T12:00:01Z",
+                        "updated_at": "2026-08-10T12:00:01Z",
+                    },
+                    expected_lease_owner="scheduler:first",
+                    expected_attempt=1,
+                    expected_status="dispatching",
+                    task_transition={
+                        "last_status": "error",
+                        "last_error": "provider_response_failed",
+                        "active": 1,
+                        "next_run_at": retry_at,
+                        "metadata": {
+                            "telegram_user_id": "123",
+                            "scheduler_retry_occurrence_v1": retry_marker,
+                        },
+                        "updated_at": "2026-08-10T12:00:01Z",
+                    },
+                    reopen_for_retry=True,
+                )
+
+            def reclaim() -> None:
+                results["claim"] = second_storage.claim_scheduled_prompt_occurrence(
+                    task_id=task["id"],
+                    user_id=task["user_id"],
+                    executor="viventium_agent",
+                    due_at=task["next_run_at"],
+                    lease_owner="scheduler:second",
+                    now="2026-08-10T12:00:02Z",
+                    lease_seconds=60,
+                )
+                claim_finished.set()
+
+            with patch.object(
+                ScheduleStorage,
+                "_update_scheduled_task_transition",
+                side_effect=pause_after_task_transition,
+            ):
+                finalizer = threading.Thread(target=finalize)
+                finalizer.start()
+                self.assertTrue(inside_transaction.wait(2))
+                reclaimer = threading.Thread(target=reclaim)
+                reclaimer.start()
+                self.assertFalse(claim_finished.wait(0.1))
+                release_transaction.set()
+                finalizer.join(2)
+                reclaimer.join(2)
+
+            self.assertTrue(results["finalize"]["finalized"])
+            self.assertFalse(results["claim"]["claimed"])
+            self.assertEqual(results["claim"]["reason"], "retry_not_due")
+            persisted = second_storage.get_task(task["user_id"], task["id"])
+            self.assertEqual(persisted["next_run_at"], retry_at)
+            self.assertEqual(
+                persisted["metadata"]["scheduler_retry_occurrence_v1"], retry_marker
+            )
+            due_claim = second_storage.claim_scheduled_prompt_occurrence(
+                task_id=task["id"],
+                user_id=task["user_id"],
+                executor="viventium_agent",
+                due_at=task["next_run_at"],
+                lease_owner="scheduler:second",
+                now=retry_at,
+                lease_seconds=60,
+            )
+            self.assertTrue(due_claim["claimed"])
+            self.assertEqual(due_claim["run"]["attempt"], 2)
 
     def test_stale_running_heartbeat_cannot_pin_task_with_oversized_future_lease(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
@@ -1762,11 +2022,35 @@ class StorageScheduledPromptLifecycleTests(unittest.TestCase):
                     "updated_at": now,
                 }
             )
+            storage.update_scheduled_prompt_run(
+                "run-1",
+                {
+                    "status": "dispatching",
+                    "attempt": 1,
+                    "lease_owner": "scheduler:definition-cleanup",
+                    "lease_until": "2026-02-13T19:15:00Z",
+                },
+            )
+            finalized = storage.finalize_scheduled_prompt_run_attempt(
+                "run-1",
+                {
+                    "status": "completed",
+                    "disposition": "delivered",
+                    "completed_at": now,
+                    "updated_at": now,
+                },
+                expected_lease_owner="scheduler:definition-cleanup",
+                expected_attempt=1,
+                expected_status="dispatching",
+            )
+            self.assertTrue(finalized["finalized"])
+            self.assertEqual(len(storage.list_scheduled_prompt_run_attempts("run-1")), 1)
 
             self.assertTrue(storage.delete_scheduled_prompt_definition("definition-1"))
             self.assertIsNone(storage.get_scheduled_prompt_definition("definition-1"))
             self.assertIsNone(storage.latest_scheduled_prompt_version("definition-1"))
             self.assertEqual(storage.list_scheduled_prompt_runs(definition_id="definition-1"), [])
+            self.assertEqual(storage.list_scheduled_prompt_run_attempts("run-1"), [])
 
     def test_startup_reconciles_abandoned_runs_without_deleting_audit_rows(self):
         with tempfile.TemporaryDirectory() as tmpdir:

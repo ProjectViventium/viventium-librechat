@@ -14,6 +14,7 @@ const {
   parallelWorkDeploymentAvailableAsync,
   parallelWorkReleaseGateSnapshot,
   parallelWorkReleaseGateSnapshotAsync,
+  preferredOrchestrationMode,
 } = require('@librechat/api');
 
 configureOrchestrationMode({
@@ -38,4 +39,5 @@ module.exports = {
   parallelWorkDeploymentAvailableAsync,
   parallelWorkReleaseGateSnapshot,
   parallelWorkReleaseGateSnapshotAsync,
+  preferredOrchestrationMode,
 };

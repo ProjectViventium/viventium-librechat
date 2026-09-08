@@ -207,7 +207,10 @@ export function createSessionMethods(mongoose: typeof import('mongoose')) {
   /**
    * Generates a refresh token for a session
    */
-  async function generateRefreshToken(session: t.ISession): Promise<string> {
+  /* === VIVENTIUM START ===
+   * An abandoned refresh must not rotate its session after asynchronous token preparation.
+   */
+  async function generateRefreshToken(session: t.ISession, signal?: AbortSignal): Promise<string> {
     if (!session || !session.user) {
       throw new SessionError('Invalid session object', 'INVALID_SESSION');
     }
@@ -230,15 +233,21 @@ export function createSessionMethods(mongoose: typeof import('mongoose')) {
         expirationTime: Math.floor((expiresIn - Date.now()) / 1000),
       });
 
-      session.refreshTokenHash = await hashToken(refreshToken);
+      const refreshTokenHash = await hashToken(refreshToken);
+      signal?.throwIfAborted();
+      session.refreshTokenHash = refreshTokenHash;
       await session.save();
 
       return refreshToken;
     } catch (error) {
+      if (signal?.aborted) {
+        throw error;
+      }
       logger.error('[generateRefreshToken] Error generating refresh token:', error);
       throw new SessionError('Failed to generate refresh token', 'GENERATE_TOKEN_FAILED');
     }
   }
+  /* === VIVENTIUM END === */
 
   /**
    * Counts active sessions for a user

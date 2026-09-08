@@ -22,6 +22,7 @@ import ChatRoute from './ChatRoute';
 import Search from './Search';
 import Root from './Root';
 import FeelingsView from '~/components/Feelings/FeelingsView';
+import AuthStatus from '~/components/Auth/AuthStatus';
 
 const AuthLayout = () => (
   <AuthContextProvider>
@@ -32,7 +33,7 @@ const AuthLayout = () => (
 
 const FeelingsRoute = () => {
   const { isAuthenticated } = useAuthContext();
-  return isAuthenticated ? <FeelingsView /> : null;
+  return isAuthenticated ? <FeelingsView /> : <AuthStatus />;
 };
 
 const baseEl = document.querySelector('base');

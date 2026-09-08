@@ -58,6 +58,22 @@ describe('GlassHive Main orchestration tools', () => {
     ]);
   });
 
+  test('exposes and validates source selection from the trusted construction request', () => {
+    const make = (count: number) => createGlassHiveMainDelegationTool({ userId: 'owner-1',
+      req: { body: { viventiumTriggeringSourceSegments: Array.from({ length: count }, () => ({ text: 'Source' })) } },
+    }, { executeMainDelegation, logger });
+    const args = { title: 'Mission', instruction: 'Complete it.', resourceClass: 'standard' };
+    const multi = make(3).schema;
+    expect(multi.safeParse(args).success).toBe(false);
+    expect(multi.safeParse({ ...args, sourceOrdinals: [] }).success).toBe(false);
+    expect(multi.safeParse({ ...args, sourceOrdinals: [4] }).success).toBe(false);
+    expect(multi.safeParse({ ...args, sourceOrdinals: [1, 2, 3, 1] }).success).toBe(false);
+    expect(multi.safeParse({ ...args, sourceOrdinals: [2] }).success).toBe(true);
+    expect(multi.safeParse({ ...args, sourceOrdinals: [1, 3] }).success).toBe(true);
+    expect(make(1).schema.safeParse(args).success).toBe(true);
+    expect(make(0).schema.safeParse(args).success).toBe(true);
+  });
+
   test('inherits only the trusted configured route and records an authoritative receipt', async () => {
     const req = { user: { role: 'USER' }, _viventiumFallbackLlmAttempt: true };
     const delegation = createGlassHiveMainDelegationTool(
@@ -93,7 +109,7 @@ describe('GlassHive Main orchestration tools', () => {
     expect(executeMainDelegation).toHaveBeenCalledWith(
       expect.objectContaining({
         user: { id: 'owner-1', role: 'USER' },
-        args: expect.objectContaining({ profile: 'claude-code' }),
+        args: expect.objectContaining({ profile: 'codex-cli' }),
         fallbackWorkerProfile: 'claude-code',
         invocationId: expect.stringMatching(/^ghbi_[a-f0-9]{64}$/),
       }),

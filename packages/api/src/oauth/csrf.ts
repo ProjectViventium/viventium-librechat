@@ -1,10 +1,11 @@
 import crypto from 'crypto';
+import { getSessionCookieName } from '../utils/sessionCookies';
 import type { Request, Response, NextFunction } from 'express';
 
-export const OAUTH_CSRF_COOKIE = 'oauth_csrf';
+export const OAUTH_CSRF_COOKIE = getSessionCookieName('oauth_csrf');
 export const OAUTH_CSRF_MAX_AGE = 10 * 60 * 1000;
 
-export const OAUTH_SESSION_COOKIE = 'oauth_session';
+export const OAUTH_SESSION_COOKIE = getSessionCookieName('oauth_session');
 export const OAUTH_SESSION_MAX_AGE = 24 * 60 * 60 * 1000;
 export const OAUTH_SESSION_COOKIE_PATH = '/api';
 

@@ -434,7 +434,7 @@ describe('messages route content sanitization', () => {
         messageId: 'assistant-artifact-receipt',
         'content.0.text': 'Updated artifact.',
       },
-      { context: 'POST /api/messages/artifact/:messageId' },
+      { operationKind: 'edit', context: 'POST /api/messages/artifact/:messageId' },
     );
   });
 

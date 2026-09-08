@@ -159,6 +159,25 @@ describe('GlassHiveOrchestrationReadinessService', () => {
     });
   });
 
+  test.each([true, false])(
+    'uses authenticated native readiness without borrowing Docker readiness (%s)',
+    async (nativeReady) => {
+      process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE = 'host';
+      mockRequestAccountApi.mockResolvedValue(
+        readyCapability({
+          nativeParallelReady: nativeReady,
+          nativeParallelReason: nativeReady ? '' : 'native_parallel_not_authorized',
+          isolatedParallelReady: true,
+          hostMissionsAllowed: true,
+          hostMissionsActive: 2,
+        }),
+      );
+      await refreshOrchestrationReadiness({ ownerId: 'user-1' });
+      expect(orchestrationReadinessSnapshot({ ownerId: 'user-1' }).available).toBe(nativeReady);
+      expect(orchestrationReadinessSnapshot({ ownerId: 'unrelated-owner' }).available).toBe(false);
+    },
+  );
+
   test('fails closed when source ordering is only process-local', async () => {
     mockGetSourceOrderCapabilities.mockReturnValueOnce({
       durability: 'process',

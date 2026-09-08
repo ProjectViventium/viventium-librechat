@@ -17,3 +17,16 @@ Files:
 - `local.viventium-agents.yaml`: public-safe built-in agent bundle for local installs
 - `managed-agent-baseline-migration.json`: content-fingerprinted predecessor baselines used to
   upgrade managed Main, cortex, and handoff Agents without overwriting user edits
+
+## Main continuity compaction: evidence limit
+
+The Main compactor and its semantic reviewer own which durable identifiers the approved summary
+carries. The continuity runtime preserves identifiers they supply. If both omit an identifier,
+the runtime does not deterministically extract or reinsert it into compacted context. This is a
+limit of the current model-owned contract, not a claim of automatic omission recovery.
+
+`ViventiumMainContinuityService.spec.js` now tests exact identifier preservation **when the
+approved compaction includes it**. Its earlier omitted-identifier fixture did not match the
+implementation and is not evidence that omitted identifiers recover automatically. The corrected
+fixture proves preservation only; it does not prove the compactor and reviewer always retain every
+important identifier. No identifier-recovery code was added and no test was skipped.

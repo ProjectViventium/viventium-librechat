@@ -152,6 +152,9 @@ export type MemoriesResponse = {
   totalTokens: number;
   tokenLimit: number | null;
   usagePercentage: number | null;
+  /* === VIVENTIUM START === Config-governed manual memory keys. === */
+  validKeys: string[];
+  /* === VIVENTIUM END === */
 };
 
 export type PrincipalSearchParams = {

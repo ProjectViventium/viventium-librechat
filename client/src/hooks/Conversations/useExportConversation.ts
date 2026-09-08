@@ -19,7 +19,7 @@ import type {
 } from 'librechat-data-provider';
 import useBuildMessageTree from '~/hooks/Messages/useBuildMessageTree';
 import { useScreenshot } from '~/hooks/ScreenshotContext';
-import { cleanupPreset } from '~/utils';
+import { cleanupPreset, filterTrustedInternalMessagesTree } from '~/utils';
 
 type ExportValues = {
   fieldName: string;
@@ -48,13 +48,19 @@ export default function useExportConversation({
 
   const { conversationId: paramId } = useParams();
 
-  const getMessageTree = useCallback(() => {
-    const queryParam =
-      paramId === 'new' ? paramId : (conversation?.conversationId ?? paramId ?? '');
-    const messages = queryClient.getQueryData<TMessage[]>([QueryKeys.messages, queryParam]) ?? [];
-    const dataTree = buildTree({ messages });
-    return dataTree?.length === 0 ? null : (dataTree ?? null);
-  }, [paramId, conversation?.conversationId, queryClient]);
+  const getMessageTree = useCallback(
+    (preserveInternalStructure = false) => {
+      const queryParam =
+        paramId === 'new' ? paramId : (conversation?.conversationId ?? paramId ?? '');
+      const messages = queryClient.getQueryData<TMessage[]>([QueryKeys.messages, queryParam]) ?? [];
+      const rawTree = buildTree({ messages });
+      const dataTree = preserveInternalStructure
+        ? rawTree
+        : filterTrustedInternalMessagesTree(rawTree);
+      return dataTree?.length === 0 ? null : (dataTree ?? null);
+    },
+    [paramId, conversation?.conversationId, queryClient],
+  );
 
   const getMessageText = (message: Partial<TMessage> | undefined, format = 'text') => {
     if (!message) {
@@ -386,9 +392,10 @@ export default function useExportConversation({
     const messages = await buildMessageTree({
       messageId: conversation?.conversationId,
       message: null,
-      messages: getMessageTree(),
+      messages: getMessageTree(true),
       branches: Boolean(exportBranches),
       recursive: Boolean(recursive),
+      preserveInternalStructure: true,
     });
 
     if (recursive === true && !Array.isArray(messages)) {

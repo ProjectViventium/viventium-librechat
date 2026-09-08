@@ -423,6 +423,41 @@ describe('MCPConnectionFactory', () => {
     });
   });
 
+  describe('invalid stdio configuration', () => {
+    it.each(['', '   '])(
+      'rejects an empty executable without a connection attempt (%j)',
+      async (command) => {
+        mockProcessMCPEnv.mockReturnValue({ type: 'stdio', command, args: [] });
+        await expect(
+          MCPConnectionFactory.create({
+            serverName: 'test-server',
+            serverConfig: mockServerConfig,
+          }),
+        ).rejects.toMatchObject({ code: 'MCP_INVALID_CONFIG' });
+        expect(mockMCPConnection).not.toHaveBeenCalled();
+      },
+    );
+
+    it('connects after the configured executable is corrected', async () => {
+      mockProcessMCPEnv.mockReturnValueOnce({ command: '', args: [] });
+      await expect(
+        MCPConnectionFactory.create({
+          serverName: 'test-server',
+          serverConfig: mockServerConfig,
+        }),
+      ).rejects.toMatchObject({ code: 'MCP_INVALID_CONFIG' });
+      mockProcessMCPEnv.mockReturnValue(mockServerConfig);
+      mockConnectionInstance.isConnected.mockResolvedValue(true);
+      await expect(
+        MCPConnectionFactory.create({
+          serverName: 'test-server',
+          serverConfig: mockServerConfig,
+        }),
+      ).resolves.toBe(mockConnectionInstance);
+      expect(mockConnectionInstance.connect).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('connection retry logic', () => {
     it('should establish connection successfully', async () => {
       const basicOptions = {

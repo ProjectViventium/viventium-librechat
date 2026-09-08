@@ -1,4 +1,5 @@
 import React from 'react';
+import mockEnglishTranslations from '~/locales/en/translation.json';
 import { render, screen, fireEvent } from '@testing-library/react';
 import '@testing-library/jest-dom/extend-expect';
 import MemoryArtifacts from '../MemoryArtifacts';
@@ -7,7 +8,7 @@ import { Tools } from 'librechat-data-provider';
 
 // Mock the localize hook
 jest.mock('~/hooks', () => ({
-  useLocalize: () => (key: string) => {
+  useLocalize: () => (key: string, params?: Record<string, string>) => {
     const translations: Record<string, string> = {
       com_ui_memory: 'Memory',
       com_ui_memory_updated: 'Updated saved memory',
@@ -16,7 +17,14 @@ jest.mock('~/hooks', () => ({
       com_ui_reconnect: 'Reconnect',
       com_ui_provider: 'Provider',
     };
-    return translations[key] || key;
+    const text =
+      translations[key] ||
+      mockEnglishTranslations[key as keyof typeof mockEnglishTranslations] ||
+      key;
+    return Object.entries(params ?? {}).reduce(
+      (copy, [name, value]) => copy.replace(`{{${name}}}`, value),
+      text,
+    );
   },
 }));
 
@@ -35,7 +43,7 @@ jest.mock('../MemoryInfo', () => ({
 }));
 
 describe('MemoryArtifacts', () => {
-  const createMemoryAttachment = (type: 'update' | 'delete' | 'error', key: string): TAttachment =>
+  const createMemoryAttachment = (type: MemoryArtifact['type'], key: string): TAttachment =>
     ({
       type: Tools.memory,
       [Tools.memory]: {
@@ -79,6 +87,18 @@ describe('MemoryArtifacts', () => {
       } as MemoryArtifact,
     } as TAttachment;
   };
+
+  test('unchanged receipts render no update badge on fresh delivery or reload and preserve real changes', () => {
+    const unchanged = createMemoryAttachment('unchanged', 'preferences');
+    const { container, rerender } = render(<MemoryArtifacts attachments={[unchanged]} />);
+    expect(container).toBeEmptyDOMElement();
+    rerender(<MemoryArtifacts attachments={JSON.parse(JSON.stringify([unchanged]))} />);
+    expect(container).toBeEmptyDOMElement();
+    rerender(
+      <MemoryArtifacts attachments={[unchanged, createMemoryAttachment('update', 'world')]} />,
+    );
+    expect(screen.getByRole('button')).toBeInTheDocument();
+  });
 
   describe('Error State Handling', () => {
     test('displays error styling when memory artifacts contain errors', () => {
@@ -137,7 +157,9 @@ describe('MemoryArtifacts', () => {
       expect(screen.queryByText('Memory Error')).not.toBeInTheDocument();
 
       fireEvent.click(button);
-      expect(screen.getByText('Reconnect Memory')).toBeInTheDocument();
+      expect(
+        screen.getByText('OpenAI needs sign-in. Reconnect it in Connected Accounts.'),
+      ).toBeInTheDocument();
       expect(
         screen.queryByText('Untrusted server-supplied English detail.'),
       ).not.toBeInTheDocument();
@@ -149,7 +171,9 @@ describe('MemoryArtifacts', () => {
       const button = screen.getByRole('button', { name: 'Memory · Unavailable' });
       fireEvent.click(button);
 
-      expect(screen.getByText('Provider · Unavailable')).toBeInTheDocument();
+      expect(
+        screen.getByText('OpenAI usage limit reached. Check usage or wait for the limit to reset.'),
+      ).toBeInTheDocument();
       expect(
         screen.queryByText('Untrusted server-supplied English detail.'),
       ).not.toBeInTheDocument();

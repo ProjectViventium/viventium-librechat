@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const cookies = require('cookie');
 const jwt = require('jsonwebtoken');
 const { logger } = require('@librechat/data-schemas');
-const { isEnabled } = require('@librechat/api');
+const { getSessionCookieName, isEnabled } = require('@librechat/api');
 const { TelegramLinkToken, TelegramUserMapping } = require('~/db/models');
 
 const OBJECT_ID_LENGTH = 24;
@@ -192,16 +192,16 @@ function resolveUserIdFromCookies(req) {
     return '';
   }
   const parsedCookies = cookies.parse(cookieHeader);
-  const tokenProvider = parsedCookies.token_provider;
+  const tokenProvider = parsedCookies[getSessionCookieName('token_provider')];
   if (tokenProvider === 'openid' && isEnabled(process.env.OPENID_REUSE_TOKENS)) {
-    const openidUserId = parsedCookies.openid_user_id;
+    const openidUserId = parsedCookies[getSessionCookieName('openid_user_id')];
     if (!openidUserId) {
       return '';
     }
     const validation = validateRefreshToken(openidUserId);
     return validation.valid ? validation.userId : '';
   }
-  const refreshToken = parsedCookies.refreshToken;
+  const refreshToken = parsedCookies[getSessionCookieName('refreshToken')];
   if (!refreshToken) {
     return '';
   }

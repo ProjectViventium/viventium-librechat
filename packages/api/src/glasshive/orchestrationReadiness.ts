@@ -102,8 +102,7 @@ const checkPermission = (
 const requestAccountApi = (
   ...args: Parameters<OrchestrationReadinessDependencies['requestAccountApi']>
 ) => runtimeDependencies().requestAccountApi(...args);
-const promptLayerIntegritySnapshot = () =>
-  runtimeDependencies().promptLayerIntegritySnapshot();
+const promptLayerIntegritySnapshot = () => runtimeDependencies().promptLayerIntegritySnapshot();
 
 const DEFAULT_INTERVAL_MS = 10_000;
 const DEFAULT_MAX_AGE_MS = 30_000;
@@ -172,6 +171,13 @@ function ownerIdleTtlMs(): number {
 }
 
 function validReadyCapability(value: ValueRecord | null | undefined): boolean {
+  if (process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE === 'host') {
+    return (
+      value?.policyVersion === 1 &&
+      value?.nativeParallelReady === true &&
+      value?.hostMissionsAllowed === true
+    );
+  }
   return (
     value?.policyVersion === 1 &&
     value?.isolatedParallelReady === true &&
@@ -582,7 +588,11 @@ export async function refreshOrchestrationReadiness({
         storagePressureAllowsReadiness(storagePressure);
       let reason = '';
       if (!isolationReady) {
-        reason = safeReadinessReason(capability?.isolatedParallelReason);
+        reason = safeReadinessReason(
+          process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE === 'host'
+            ? capability?.nativeParallelReason
+            : capability?.isolatedParallelReason,
+        );
       } else if (!mainAgentId) {
         reason = 'main_agent_unconfigured';
       } else if (!main.configured) {
@@ -746,7 +756,11 @@ export async function refreshStartupOrchestrationReadiness(): Promise<Orchestrat
       if (!deploymentScoped) {
         reason = 'deployment_scope_unverified';
       } else if (!isolationReady) {
-        reason = safeReadinessReason(capability?.isolatedParallelReason);
+        reason = safeReadinessReason(
+          process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE === 'host'
+            ? capability?.nativeParallelReason
+            : capability?.isolatedParallelReason,
+        );
       } else if (sourceOrder.status !== 'verified') {
         reason = sourceOrder.reason || 'source_order_capability_invalid';
       } else if (!workTraceContractAllowsReadiness(workTraceContract)) {
@@ -836,7 +850,11 @@ export async function waitForOrchestrationReadiness({
     50,
     5_000,
   ),
-}: { ownerId?: unknown; timeoutMs?: number; pollIntervalMs?: number } = {}): Promise<OrchestrationReadinessSnapshot> {
+}: {
+  ownerId?: unknown;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+} = {}): Promise<OrchestrationReadinessSnapshot> {
   const normalizedOwnerId = String(ownerId || '').trim();
   if (normalizedOwnerId) observeOwner(normalizedOwnerId);
   let snapshot = orchestrationReadinessSnapshot({ ownerId: normalizedOwnerId });

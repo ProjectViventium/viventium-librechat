@@ -22,6 +22,7 @@ jest.mock('./process', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  getSessionCookieName: jest.requireActual('@librechat/api').getSessionCookieName,
   ...jest.requireActual('@librechat/api'),
   isEnabled: jest.fn().mockReturnValue(true),
   isEmailDomainAllowed: jest.fn().mockReturnValue(true),

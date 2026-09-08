@@ -4,25 +4,17 @@
  * === VIVENTIUM END === */
 
 import { Activity, ChevronDown, Loader2 } from 'lucide-react';
+import type { ReactNode } from 'react';
 import { useLocalize } from '~/hooks';
 
-export default function HarnessActivity({
-  summary,
+export function HarnessActivityPanel({
+  children,
   isSubmitting,
 }: {
-  summary: string;
+  children: ReactNode;
   isSubmitting: boolean;
 }) {
   const localize = useLocalize();
-  const rows = summary
-    .split('\n')
-    .map((row) => row.trim())
-    .filter(Boolean);
-
-  if (rows.length === 0) {
-    return null;
-  }
-
   return (
     <details className="bg-surface-secondary/50 group my-2 rounded-lg border border-border-light px-3 py-2">
       <summary className="flex cursor-pointer list-none items-center gap-2 text-sm text-text-secondary">
@@ -37,11 +29,37 @@ export default function HarnessActivity({
           aria-hidden="true"
         />
       </summary>
-      <ol className="mt-2 space-y-1 border-l border-border-medium pl-3 text-sm text-text-secondary">
-        {rows.map((row, index) => (
-          <li key={`${index}-${row}`}>{row}</li>
-        ))}
-      </ol>
+      {children}
     </details>
+  );
+}
+
+export default function HarnessActivity({
+  summary,
+  isSubmitting,
+  grouped = false,
+}: {
+  summary: string;
+  isSubmitting: boolean;
+  grouped?: boolean;
+}) {
+  const rows = summary
+    .split('\n')
+    .map((row) => row.trim())
+    .filter(Boolean);
+  if (rows.length === 0) {
+    return null;
+  }
+  const content = (
+    <ol className="mt-2 space-y-1 border-l border-border-medium pl-3 text-sm text-text-secondary">
+      {rows.map((row, index) => (
+        <li key={`${index}-${row}`}>{row}</li>
+      ))}
+    </ol>
+  );
+  return grouped ? (
+    content
+  ) : (
+    <HarnessActivityPanel isSubmitting={isSubmitting}>{content}</HarnessActivityPanel>
   );
 }

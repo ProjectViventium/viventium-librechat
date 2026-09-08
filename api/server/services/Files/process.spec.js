@@ -691,6 +691,86 @@ describe('processAgentFileUpload', () => {
       );
     });
 
+    test.each(['audio/x-m4a', 'video/mp4', 'application/pdf'])(
+      'preserves %s for a declared native workspace without forcing extraction',
+      async (mimetype) => {
+        const { createFile } = require('~/models');
+        const { processAudioFile } = require('@librechat/api');
+        mergeFileConfig.mockReturnValue(makeFileConfig({ sttSupportedMimeTypes: [mimetype] }));
+        getStrategyFunctions.mockReturnValueOnce({
+          handleFileUpload: jest.fn().mockResolvedValue({
+            bytes: 2048,
+            filename: 'recording.bin',
+            filepath: '/uploads/recording.bin',
+          }),
+        });
+        const req = makeReq({ mimetype });
+        req.file.originalname = 'recording.bin';
+        req.body.endpoint = req.body.endpointType = 'agents';
+        req.config.endpoints = {
+          agents: {
+            providerCapabilities: {
+              'synthetic-workspace': { workspace_binding: true, worker_native_tools: true },
+            },
+          },
+        };
+        getAgent.mockResolvedValueOnce({ provider: 'synthetic-workspace', model_parameters: {} });
+        await processAgentFileUpload({
+          req,
+          res: mockRes,
+          metadata: makeMetadata({
+            agent_id: 'agent-abc',
+            tool_resource: undefined,
+            message_file: true,
+          }),
+        });
+        expect(processAudioFile).not.toHaveBeenCalled();
+        expect(createFile).toHaveBeenCalledWith(
+          expect.objectContaining({
+            source: 'local',
+            type: mimetype,
+            filename: 'recording.bin',
+            context: 'message_attachment',
+            file_id: 'file-uuid-123',
+          }),
+          true,
+        );
+      },
+    );
+
+    test.each(['workspace_binding', 'worker_native_tools'])(
+      'does not infer native attachment access without %s',
+      async (missingCapability) => {
+        const { processAudioFile } = require('@librechat/api');
+        processAudioFile.mockResolvedValueOnce({ text: 'transcript', bytes: 10 });
+        mergeFileConfig.mockReturnValue(makeFileConfig({ sttSupportedMimeTypes: ['audio/ogg'] }));
+        const req = makeReq({ mimetype: 'audio/ogg' });
+        req.body.endpoint = req.body.endpointType = 'agents';
+        req.config.endpoints = {
+          agents: {
+            providerCapabilities: {
+              'synthetic-workspace': {
+                workspace_binding: true,
+                worker_native_tools: true,
+                [missingCapability]: false,
+              },
+            },
+          },
+        };
+        getAgent.mockResolvedValueOnce({ provider: 'synthetic-workspace', model_parameters: {} });
+        await processAgentFileUpload({
+          req,
+          res: mockRes,
+          metadata: makeMetadata({
+            agent_id: 'agent-abc',
+            tool_resource: undefined,
+            message_file: true,
+          }),
+        });
+        expect(processAudioFile).toHaveBeenCalledTimes(1);
+      },
+    );
+
     test('fails clearly for OCR-only legacy Word attachments when OCR is not configured', async () => {
       const { parseText } = require('@librechat/api');
       parseText.mockClear();
@@ -878,5 +958,43 @@ describe('processAgentFileUpload', () => {
 
       expect(getStrategyFunctions).not.toHaveBeenCalledWith('local');
     });
+  });
+});
+
+describe('canonical file admission', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const yaml = require('js-yaml');
+  const { filterFile } = require('./process');
+  const actual = jest.requireActual('librechat-data-provider');
+  const source = yaml.load(
+    fs.readFileSync(
+      path.resolve(__dirname, '../../../../viventium/source_of_truth/local.librechat.yaml'),
+      'utf8',
+    ),
+  );
+  beforeEach(() => mergeFileConfig.mockImplementation(actual.mergeFileConfig));
+  const request = (mimetype) => ({
+    config: { fileConfig: source.fileConfig },
+    body: {
+      endpoint: 'agents',
+      endpointType: 'agents',
+      file_id: '11111111-1111-4111-8111-111111111111',
+    },
+    file: { size: 66_168, mimetype },
+  });
+  test.each(['audio/x-m4a', 'audio/mp4', 'audio/ogg', 'video/mp4', 'application/pdf'])(
+    'allows supported media and existing documents through the shared upload owner (%s)',
+    (mime) => {
+      expect(() => filterFile({ req: request(mime) })).not.toThrow();
+    },
+  );
+  test('keeps unsupported admission typed and permanent', () => {
+    expect.assertions(1);
+    try {
+      filterFile({ req: request('application/x-unrecognized') });
+    } catch (error) {
+      expect(error).toMatchObject({ code: 'unsupported_file_type', status: 415, retryable: false });
+    }
   });
 });

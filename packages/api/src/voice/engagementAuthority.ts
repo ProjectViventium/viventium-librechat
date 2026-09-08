@@ -1,6 +1,6 @@
 /* === VIVENTIUM START ===
- * Feature: Final owner-only Wing action authority.
- * Purpose: Bind semantic approval to current session mode and finalized persisted owner evidence.
+ * Feature: Current owner voice action authority.
+ * Purpose: Bind typed participant input or finalized audio evidence to the current call authority.
  * === VIVENTIUM END === */
 
 import crypto from 'node:crypto';
@@ -19,6 +19,68 @@ export interface LatestPersistedVoiceTurnAuthorityInput {
   userId?: unknown;
   turnId?: unknown;
   expectedSegments?: unknown;
+}
+
+export interface VoiceTypedInputV1 {
+  version: 1;
+  kind: 'participant_text';
+  callSessionId: string;
+  participantIdentity: string;
+  sourceEventId: string;
+  textSha256: string;
+}
+
+interface VoiceTurnAuthorityInput {
+  session: unknown;
+  segments: unknown[];
+  typedInput?: unknown;
+  sourceEventId?: unknown;
+  text?: unknown;
+  engagement?: unknown;
+}
+
+const TYPED_INPUT_KEYS = new Set([
+  'version',
+  'kind',
+  'callSessionId',
+  'participantIdentity',
+  'sourceEventId',
+  'textSha256',
+]);
+
+/** Only the authenticated gateway may supply participant provenance; no audio evidence is implied. */
+export function normalizeVoiceTypedInput(
+  input: unknown,
+  { session, sourceEventId, text, segments }: VoiceTurnAuthorityInput,
+): VoiceTypedInputV1 | null {
+  const value = recordFrom(input);
+  const current = recordFrom(session);
+  const normalizedText = typeof text === 'string' ? text.trim() : '';
+  if (
+    Object.keys(value).length !== TYPED_INPUT_KEYS.size ||
+    Object.keys(value).some((key) => !TYPED_INPUT_KEYS.has(key)) ||
+    value.version !== 1 ||
+    value.kind !== 'participant_text' ||
+    !current.ownerParticipantIdentity ||
+    value.callSessionId !== current.callSessionId ||
+    value.participantIdentity !== current.ownerParticipantIdentity ||
+    typeof sourceEventId !== 'string' ||
+    !sourceEventId ||
+    sourceEventId.length > 160 ||
+    value.sourceEventId !== sourceEventId ||
+    !normalizedText ||
+    segments.length > 0 ||
+    value.textSha256 !== crypto.createHash('sha256').update(normalizedText, 'utf8').digest('hex')
+  )
+    return null;
+  return {
+    version: 1,
+    kind: 'participant_text',
+    callSessionId: String(current.callSessionId),
+    participantIdentity: String(current.ownerParticipantIdentity),
+    sourceEventId,
+    textSha256: String(value.textSha256),
+  };
 }
 
 const ENGAGEMENT_KEYS = new Set([
@@ -86,7 +148,129 @@ export function matchesCanonicalVoiceOwnerUtterance(
   return crypto.timingSafeEqual(expectedDigest, actualDigest);
 }
 
+/** Server-created evidence only; never accept this binding from a client or model argument. */
+export interface VoiceWorkAuthorityBinding {
+  version: 1;
+  callSessionId: string;
+  userId: string;
+  kind: 'audio' | 'participant_text';
+  fingerprint: string;
+  turnIds: string[];
+  expiresAtMs?: number;
+}
+
+export function createVoiceWorkAuthorityBinding(input: {
+  session: unknown;
+  segments: unknown;
+  typedInput?: unknown;
+  engagement?: unknown;
+}): VoiceWorkAuthorityBinding | null {
+  const session = recordFrom(input.session);
+  const mode = canonicalVoiceSessionMode(session);
+  const kind = input.typedInput ? 'participant_text' : 'audio';
+  const modeRevision = Number(session.revision ?? session.callModeRevision ?? 0);
+  const speakerRevision = Number(session.speakerSessionRevision ?? 0);
+  const segments = recordsFrom(input.segments)
+    .map((segment) => ({
+      segmentId: segment.segmentId,
+      turnId: segment.turnId,
+      revision: Number(segment.revision ?? 0),
+      final: segment.isFinal === true,
+      overlap: segment.overlap === true,
+      uncertain: segment.uncertain === true,
+      participant: recordFrom(segment.speaker).participantIdentity,
+      attribution: recordFrom(segment.speaker).attribution,
+      actorTrust: recordFrom(segment.speaker).actorTrust,
+    }))
+    .sort((a, b) => String(a.segmentId).localeCompare(String(b.segmentId)));
+  const expiresAtMs = Number(recordFrom(input.engagement).expiresAtMs);
+  if (
+    !session.callSessionId ||
+    !session.userId ||
+    !session.ownerParticipantIdentity ||
+    session.status === 'ended' ||
+    session.status === 'failed' ||
+    mode === 'listen_only' ||
+    !Number.isSafeInteger(modeRevision) ||
+    modeRevision < 0 ||
+    !Number.isSafeInteger(speakerRevision) ||
+    speakerRevision < 0 ||
+    (kind === 'audio' &&
+      (!segments.length ||
+        segments.some(
+          (segment) =>
+            !segment.segmentId ||
+            !segment.turnId ||
+            !Number.isSafeInteger(segment.revision) ||
+            segment.revision < 0 ||
+            !segment.final ||
+            segment.overlap ||
+            segment.uncertain ||
+            segment.participant !== session.ownerParticipantIdentity ||
+            segment.attribution !== 'verified' ||
+            segment.actorTrust !== 'owner_participant',
+        ))) ||
+    (kind === 'participant_text' && (mode !== 'call' || segments.length > 0)) ||
+    (mode === 'wing' && !Number.isFinite(expiresAtMs))
+  )
+    return null;
+  return {
+    version: 1,
+    callSessionId: String(session.callSessionId),
+    userId: String(session.userId),
+    kind,
+    turnIds: [...new Set(segments.map((segment) => String(segment.turnId)))].sort(),
+    fingerprint: crypto
+      .createHash('sha256')
+      .update(
+        JSON.stringify({
+          mode,
+          modeRevision,
+          speakerRevision,
+          owner: session.ownerParticipantIdentity,
+          segments,
+        }),
+        'utf8',
+      )
+      .digest('hex'),
+    ...(mode === 'wing' ? { expiresAtMs } : {}),
+  };
+}
+
 export function createVoiceEngagementAuthorityService(deps: VoiceEngagementAuthorityDependencies) {
+  function resolveVoiceTurnAuthority(input: VoiceTurnAuthorityInput) {
+    const session = recordFrom(input.session);
+    const mode = canonicalVoiceSessionMode(session);
+    if (input.typedInput != null) {
+      const typed = normalizeVoiceTypedInput(input.typedInput, input);
+      const allowed = Boolean(
+        typed && mode === 'call' && session.status !== 'ended' && session.status !== 'failed',
+      );
+      return {
+        actorTrust: allowed ? 'owner_participant' : 'unknown',
+        canAuthorizeSideEffects: allowed,
+        directWingEngagement: false,
+      };
+    }
+    const authority = recordFrom(
+      deps.voiceTurnAuthority(input.segments, {
+        speakerAttributionState: session.speakerAttributionState,
+        sharedTrackSids: session.sharedTrackSids,
+        sharedParticipantIdentities: session.sharedParticipantIdentities,
+      }),
+    );
+    const directWingEngagement =
+      mode === 'wing' &&
+      exactVoiceEngagementAuthority(input.engagement, session, input.segments, input.text);
+    return {
+      actorTrust: authority.actorTrust || 'unknown',
+      directWingEngagement,
+      canAuthorizeSideEffects:
+        finalizedOwnerSpeakerAuthority(input.segments, session) &&
+        mode !== 'listen_only' &&
+        (mode !== 'wing' || directWingEngagement),
+    };
+  }
   function finalizedOwnerSpeakerAuthority(segments: unknown, session: unknown): boolean {
     const values = recordsFrom(segments);
     const sessionRecord = recordFrom(session);
@@ -255,7 +439,57 @@ export function createVoiceEngagementAuthorityService(deps: VoiceEngagementAutho
     };
   }
 
+  async function assertVoiceWorkAuthority(
+    binding: VoiceWorkAuthorityBinding | undefined,
+    userId: string,
+  ) {
+    const stale = () =>
+      Object.assign(new Error('voice_work_authority_stale'), {
+        code: 'voice_work_authority_stale',
+        status: 409,
+        retryable: false,
+      });
+    if (
+      !binding ||
+      binding.version !== 1 ||
+      binding.userId !== userId ||
+      !binding.callSessionId ||
+      !Array.isArray(binding.turnIds) ||
+      !['audio', 'participant_text'].includes(binding.kind)
+    )
+      throw stale();
+    const session = recordFrom(await deps.getCallSession(binding.callSessionId));
+    if (
+      String(session.userId || '') !== userId ||
+      String(session.callSessionId || '') !== binding.callSessionId
+    )
+      throw stale();
+    const stored =
+      binding.kind === 'audio'
+        ? await deps.listSpeakerSegments({ callSessionId: binding.callSessionId, limit: 512 })
+        : [];
+    // Bind the accepted turn, not later unrelated conversation audio. The exact turn IDs are
+    // retained separately from the hash so a new utterance does not revoke accepted authority.
+    const current = createVoiceWorkAuthorityBinding({
+      session,
+      segments: recordsFrom(stored).filter((segment) =>
+        binding.turnIds.includes(String(segment.turnId || '')),
+      ),
+      typedInput: binding.kind === 'participant_text',
+      engagement: { expiresAtMs: binding.expiresAtMs },
+    });
+    if (
+      !current ||
+      current.fingerprint !== binding.fingerprint ||
+      (binding.expiresAtMs !== undefined &&
+        (!Number.isFinite(binding.expiresAtMs) || binding.expiresAtMs <= Date.now()))
+    )
+      throw stale();
+  }
+
   return {
+    assertVoiceWorkAuthority,
+    resolveVoiceTurnAuthority,
     exactVoiceEngagementAuthority,
     finalizedOwnerSpeakerAuthority,
     latestPersistedVoiceTurnAuthority,

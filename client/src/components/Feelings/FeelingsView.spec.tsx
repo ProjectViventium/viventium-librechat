@@ -431,10 +431,14 @@ describe('FeelingsView', () => {
     expect(screen.getByLabelText('When should it activate?')).toHaveValue('always');
   });
 
-  test('shows the exact embodied capsule and persists manual band control', async () => {
+  test('keeps the exact capsule behind details and persists manual band control', async () => {
+    const user = userEvent.setup();
     mockQueryData = response(true);
     renderView();
-    expect(screen.getByText(/You, Viventium, are a being/)).toBeInTheDocument();
+    const capsule = screen.getByText(/You, Viventium, are a being/);
+    expect(capsule).not.toBeVisible();
+    await user.click(screen.getByText('Prompt details'));
+    expect(capsule).toBeVisible();
     expect(
       screen.getByText('I want to stay close and follow what still feels unresolved.'),
     ).toBeInTheDocument();

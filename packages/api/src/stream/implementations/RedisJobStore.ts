@@ -1,4 +1,16 @@
+import { interactionPresentationSequence } from '../../agents/interactionContext';
+import type { NativeResponseIdentity, NativeResponseCommit } from '@librechat/data-schemas';
+import {
+  nativeIdentityJson,
+  nativeJobProofJson,
+  nativeIdentityValid,
+  nativeJobMatches,
+  retainNativeResponse,
+  NATIVE_RESPONSE_RECOVERY_WINDOW_MS,
+} from './nativeResponse';
+import { NATIVE_PUBLICATION_LUA, NATIVE_JOB_LUA, NATIVE_RETENTION_LUA } from './nativeResponseLua';
 import { logger } from '@librechat/data-schemas';
+import { retainLogicalTurnInput, mergeLogicalTurnInput } from './logicalTurnInput';
 import { createHash, randomUUID } from 'crypto';
 import { createContentAggregator } from '@librechat/agents';
 import type { StandardGraph } from '@librechat/agents';
@@ -18,6 +30,16 @@ import type {
   SourceOrderObservationResult,
   CortexPresentationBinding,
 } from '~/stream/interfaces/IJobStore';
+
+type NativeJobOwner = Pick<
+  SerializableJobData,
+  'streamId' | 'userId' | 'createdAt' | 'conversationId' | 'responseMessageId'
+> & {
+  interactionContext?: Pick<
+    InteractionContext,
+    'logical_turn_id' | 'revision' | 'source_order_scope' | 'source_sequence' | 'ready_input_continuation'
+  >;
+};
 
 function sourceOrderScopeDigest(sourceOrderScope: string): string {
   return createHash('sha256')
@@ -215,38 +237,341 @@ export class RedisJobStore implements IJobStore {
     conversationId?: string,
     initialData?: Partial<SerializableJobData>,
   ): Promise<SerializableJobData> {
+    const key = KEYS.job(streamId);
+    const previous = await this.getJob(streamId);
+    if (previous) {
+      const cancellation = await this.cancelNativeResponse(previous);
+      if (cancellation.status === 'committed' && !previous.nativeResponseSettled) {
+        throw new Error('Saved native result is pending');
+      }
+      if (cancellation.status === 'unavailable') {
+        throw new Error('Stream authority unavailable');
+      }
+    }
     const job: SerializableJobData = {
       ...initialData,
       streamId,
       userId,
       status: 'running',
-      createdAt: Date.now(),
+      createdAt: Math.max(Date.now(), (previous?.createdAt ?? 0) + 1),
       conversationId,
       syncSent: false,
+      nativeResponse: undefined,
+      nativeResponseCancelled: undefined,
+      nativeResponseFinished: undefined,
+      nativeResponseSettled: undefined,
     };
-
-    const key = KEYS.job(streamId);
-    const userJobsKey = KEYS.userJobs(userId);
-
-    // For cluster mode, we can't pipeline keys on different slots
-    // The job key uses hash tag {streamId}, runningJobs and userJobs are on different slots
-    if (this.isCluster) {
-      await this.redis.hset(key, this.serializeJob(job));
-      await this.redis.expire(key, this.ttl.running);
-      await this.redis.sadd(KEYS.runningJobs, streamId);
-      await this.redis.sadd(userJobsKey, streamId);
-    } else {
-      const pipeline = this.redis.pipeline();
-      pipeline.hset(key, this.serializeJob(job));
-      pipeline.expire(key, this.ttl.running);
-      pipeline.sadd(KEYS.runningJobs, streamId);
-      pipeline.sadd(userJobsKey, streamId);
-      await pipeline.exec();
+    const created = await this.redis.eval(
+      `
+      local current = redis.call('HGET', KEYS[1], 'createdAt') or ''
+      if current ~= ARGV[1] then return 0 end
+      redis.call('DEL', KEYS[1])
+      redis.call('HSET', KEYS[1], unpack(ARGV, 3))
+      redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+      return 1`,
+      1,
+      key,
+      previous?.createdAt ?? '',
+      this.ttl.running,
+      ...Object.entries(this.serializeJob(job)).flat(),
+    );
+    if (created !== 1) {
+      throw new Error('Stream incarnation changed');
     }
+    await this.redis.sadd(KEYS.runningJobs, streamId);
+    await this.redis.sadd(KEYS.userJobs(userId), streamId);
 
     logger.debug(`[RedisJobStore] Created job: ${streamId}`);
     return job;
   }
+
+  /* VIVENTIUM START: co-slotted publication authority with a fixed recovery deadline. */
+  private async nativePublication(
+    mode: 'bind' | 'commit' | 'revoke' | 'cancel' | 'read',
+    job: NativeJobOwner,
+    identity?: NativeResponseIdentity,
+    candidateSha256 = '',
+    allowCreate = false,
+  ): Promise<NativeResponseCommit | { status: 'bound' }> {
+    const context = job.interactionContext;
+    if (!context?.logical_turn_id) {
+      return { status: 'unavailable' };
+    }
+    const logical =
+      KEYS.logicalTurnFromId(context.logical_turn_id) ??
+      (await this.redis.hget(KEYS.logicalTurnIndex(context.logical_turn_id), 'ownerScopeKey'));
+    const scope = logical && logicalTurnScopeDigestFromKey(logical);
+    if (!logical || !scope) {
+      return { status: 'unavailable' };
+    }
+    const proof = JSON.stringify([
+      job.userId,
+      job.streamId,
+      job.createdAt,
+      job.conversationId,
+      job.responseMessageId,
+      context.logical_turn_id,
+      context.revision,
+      context.source_order_scope,
+      interactionPresentationSequence(context),
+    ]);
+    const id = createHash('sha256')
+      .update(JSON.stringify([context.logical_turn_id, context.revision]))
+      .digest('hex');
+    const result = (await this.redis.eval(
+      NATIVE_PUBLICATION_LUA,
+      3,
+      logical,
+      KEYS.sourceOrderFromScopeDigest(scope),
+      `stream:native:{${scope}}:${id}`,
+      mode,
+      identity ? nativeIdentityJson(identity) : '',
+      proof,
+      context.logical_turn_id,
+      String(context.revision),
+      job.streamId,
+      identity?.recoverUntil ?? job.createdAt + NATIVE_RESPONSE_RECOVERY_WINDOW_MS,
+      interactionPresentationSequence(context) ?? '',
+      candidateSha256,
+      allowCreate ? '1' : '0',
+    )) as [NativeResponseCommit['status'] | 'bound', string];
+    return result[0] === 'committed'
+      ? { status: 'committed', candidateSha256: result[1] }
+      : { status: result[0] };
+  }
+
+  private nativeIdentityJob(identity: NativeResponseIdentity): NativeJobOwner {
+    return {
+      streamId: identity.streamId,
+      userId: identity.userId,
+      createdAt: identity.jobCreatedAt,
+      conversationId: identity.conversationId,
+      responseMessageId: identity.responseMessageId,
+      interactionContext: {
+        logical_turn_id: identity.logicalTurnId,
+        revision: identity.revision,
+        source_order_scope: identity.sourceOrderScope,
+        source_sequence: identity.sourceSequence,
+      },
+    };
+  }
+
+  async bindNativeResponse(identity: NativeResponseIdentity): Promise<boolean> {
+    if (!nativeIdentityValid(identity)) {
+      return false;
+    }
+    const job = await this.getJob(identity.streamId);
+    if (!nativeJobMatches(job, identity)) {
+      return false;
+    }
+    const bind = async () =>
+      this.redis.eval(
+        NATIVE_JOB_LUA,
+        1,
+        KEYS.job(identity.streamId),
+        'bind',
+        nativeJobProofJson(job),
+        nativeIdentityJson(identity),
+        identity.recoverUntil,
+        JSON.stringify(job.interactionContext),
+        job.userMessage?.messageId ?? '',
+      );
+    if ((await bind()) !== 1) {
+      return false;
+    }
+    const publication = await this.nativePublication(
+      'bind',
+      job,
+      identity,
+      '',
+      !job.nativeResponse,
+    );
+    if (!['bound', 'committed'].includes(publication.status)) {
+      if (publication.status === 'revoked') {
+        await this.redis.eval(
+          NATIVE_JOB_LUA,
+          1,
+          KEYS.job(identity.streamId),
+          'cancel',
+          nativeJobProofJson(job),
+          '',
+        );
+      }
+      return false;
+    }
+    if ((await bind()) !== 1) {
+      await this.nativePublication('revoke', job, identity);
+      return false;
+    }
+    await this.redis.sadd(KEYS.runningJobs, identity.streamId);
+    return true;
+  }
+
+  async commitNativeResponse(
+    identity: NativeResponseIdentity,
+    candidateSha256: string,
+  ): Promise<NativeResponseCommit> {
+    if (!nativeIdentityValid(identity) || !/^[a-f0-9]{64}$/.test(candidateSha256)) {
+      return { status: 'unavailable' };
+    }
+    const job = await this.getJob(identity.streamId);
+    if (!nativeJobMatches(job, identity)) {
+      return { status: 'unavailable' };
+    }
+    if (
+      (await this.redis.eval(
+        NATIVE_JOB_LUA,
+        1,
+        KEYS.job(identity.streamId),
+        'check',
+        nativeJobProofJson(job),
+        nativeIdentityJson(identity),
+        identity.recoverUntil,
+      )) !== 1
+    ) {
+      return { status: 'revoked' };
+    }
+    const result = await this.nativePublication('commit', job, identity, candidateSha256);
+    return result.status === 'bound' ? { status: 'unavailable' } : result;
+  }
+
+  async getNativeResponseCommit(identity: NativeResponseIdentity): Promise<NativeResponseCommit> {
+    if (!nativeIdentityValid(identity)) {
+      return { status: 'unavailable' };
+    }
+    const result = await this.nativePublication('read', this.nativeIdentityJob(identity), identity);
+    return result.status === 'bound' ? { status: 'unavailable' } : result;
+  }
+
+  async revokeNativeResponse(identity: NativeResponseIdentity): Promise<NativeResponseCommit> {
+    if (!nativeIdentityValid(identity)) {
+      return { status: 'unavailable' };
+    }
+    const job = this.nativeIdentityJob(identity);
+    const result = await this.nativePublication('revoke', job, identity);
+    if (result.status === 'revoked') {
+      await this.redis.eval(
+        NATIVE_JOB_LUA,
+        1,
+        KEYS.job(identity.streamId),
+        'cancel',
+        nativeJobProofJson(job),
+        '',
+      );
+    }
+    return result.status === 'bound' ? { status: 'unavailable' } : result;
+  }
+
+  async cancelNativeResponse(expected: SerializableJobData): Promise<NativeResponseCommit> {
+    const job = await this.getJob(expected.streamId);
+    if (
+      !job ||
+      job.createdAt !== expected.createdAt ||
+      job.userId !== expected.userId ||
+      job.responseMessageId !== expected.responseMessageId
+    ) {
+      return { status: 'unavailable' };
+    }
+    const result = job.interactionContext?.logical_turn_id
+      ? await this.nativePublication('cancel', job, job.nativeResponse)
+      : { status: 'revoked' as const };
+    if (result.status === 'committed') {
+      return result;
+    }
+    if (result.status !== 'revoked') {
+      return { status: 'unavailable' };
+    }
+    if (
+      (await this.redis.eval(
+        NATIVE_JOB_LUA,
+        1,
+        KEYS.job(job.streamId),
+        'cancel',
+        nativeJobProofJson(job),
+        '',
+      )) !== 1
+    ) {
+      return { status: 'unavailable' };
+    }
+    return result;
+  }
+
+  async settleNativeResponse(
+    identity: NativeResponseIdentity,
+    mode?: 'unsupported' | 'cancelled',
+  ): Promise<boolean> {
+    const receipt = await this.getNativeResponseCommit(identity);
+    if (mode === 'unsupported') {
+      if (receipt.status !== 'revoked') return false;
+      const job = await this.getJob(identity.streamId);
+      if (!nativeJobMatches(job, identity)) return false;
+      const released =
+        (await this.redis.eval(
+          NATIVE_JOB_LUA,
+          1,
+          KEYS.job(identity.streamId),
+          'release',
+          nativeJobProofJson(this.nativeIdentityJob(identity)),
+          nativeIdentityJson(identity),
+          identity.recoverUntil,
+          JSON.stringify(job.interactionContext),
+          identity.source.messageId,
+          this.ttl.running,
+          this.ttl.completed,
+        )) === 1;
+      if (released) await this.refreshRunningMembership(identity.streamId);
+      return released;
+    }
+    if (receipt.status !== (mode === 'cancelled' ? 'revoked' : 'committed')) {
+      return false;
+    }
+    const settled =
+      (await this.redis.eval(
+        NATIVE_JOB_LUA,
+        1,
+        KEYS.job(identity.streamId),
+        mode === 'cancelled' ? 'settle-cancelled' : 'settle',
+        nativeJobProofJson(this.nativeIdentityJob(identity)),
+        nativeIdentityJson(identity),
+        identity.recoverUntil,
+        '',
+        this.ttl.completed,
+      )) === 1;
+    if (settled) {
+      await this.refreshRunningMembership(identity.streamId);
+    }
+    return settled;
+  }
+
+  async finishNativeResponse(
+    identity: NativeResponseIdentity,
+    candidateSha256: string,
+    finalEvent: string,
+    mode?: 'cancelled',
+  ): Promise<boolean> {
+    const receipt = await this.getNativeResponseCommit(identity);
+    if (
+      mode === 'cancelled'
+        ? receipt.status !== 'revoked'
+        : receipt.status !== 'committed' || receipt.candidateSha256 !== candidateSha256
+    ) {
+      return false;
+    }
+    return (
+      (await this.redis.eval(
+        NATIVE_JOB_LUA,
+        1,
+        KEYS.job(identity.streamId),
+        mode === 'cancelled' ? 'finish-cancelled' : 'finish',
+        nativeJobProofJson(this.nativeIdentityJob(identity)),
+        nativeIdentityJson(identity),
+        identity.recoverUntil,
+        finalEvent,
+        this.ttl.completed,
+      )) === 1
+    );
+  }
+  /* VIVENTIUM END */
 
   async observeSourceOrder(
     observation: SourceOrderObservation,
@@ -272,6 +597,7 @@ export class RedisJobStore implements IJobStore {
        end
        local current_ttl = redis.call('TTL', KEYS[1])
        if current_ttl < target_ttl then
+         target_ttl = math.max(target_ttl, math.ceil((tonumber(redis.call('HGET', KEYS[1], 'nativeRecoverUntil') or '0') - tonumber(redis.call('TIME')[1]) * 1000) / 1000))
          redis.call('EXPIRE', KEYS[1], target_ttl)
        end
        return {tostring(current), observed_at, stale and '1' or '0'}`,
@@ -289,18 +615,78 @@ export class RedisJobStore implements IJobStore {
     };
   }
 
+  async retainLogicalTurnInput(userId: string, context: InteractionContext): Promise<InteractionContext> {
+    const key = KEYS.logicalTurn(userId, context);
+    for (let attempt = 0; attempt < 32; attempt += 1) {
+      const [pending, previous, active] = await this.redis.hmget(key, 'pendingInputs', 'currentContext', 'active');
+      const inputsBefore = pending ? JSON.parse(pending) as InteractionContext[] : [];
+      const current = active === '1' && previous ? JSON.parse(previous) as InteractionContext : undefined;
+      mergeLogicalTurnInput([...(current ? [current] : []), ...inputsBefore], context);
+      const inputs = retainLogicalTurnInput(inputsBefore, context);
+      const stored = await this.redis.eval(`
+        if (redis.call('HGET', KEYS[1], 'pendingInputs') or '') ~= ARGV[1]
+            or (redis.call('HGET', KEYS[1], 'currentContext') or '') ~= ARGV[5]
+            or (redis.call('HGET', KEYS[1], 'active') or '') ~= ARGV[6] then return 0 end
+        if redis.call('HEXISTS', KEYS[1], 'receipt:' .. ARGV[4]) == 1 then return 1 end
+        local current = redis.call('HGET', KEYS[1], 'currentContext')
+        if current and current ~= '' then
+          for _, source in ipairs(cjson.decode(current).source_segments or {}) do
+            if source.source_event_id == ARGV[4] then return 1 end
+          end
+        end
+        redis.call('HSET', KEYS[1], 'pendingInputs', ARGV[2])
+        redis.call('EXPIRE', KEYS[1], math.max(tonumber(ARGV[3]), redis.call('TTL', KEYS[1])))
+        return 1`, 1, key, pending ?? '', JSON.stringify(inputs), this.ttl.running, context.source_event_id, previous ?? '', active ?? '');
+      if (stored === 1) return context;
+    }
+    throw new Error('Logical input retention contention');
+  }
+
   async claimLogicalTurn(
     streamId: string,
     userId: string,
     interactionContext: InteractionContext,
   ): Promise<LogicalTurnClaim> {
     const key = KEYS.logicalTurn(userId, interactionContext);
-    const result = (await this.redis.eval(
-      `local receipt_key = 'receipt:' .. ARGV[2]
+    let result: [string, string, string, string] | undefined;
+    for (let attempt = 0; attempt < 32; attempt += 1) {
+      const [pending, previous, active] = await this.redis.hmget(key, 'pendingInputs', 'currentContext', 'active');
+      const merged = mergeLogicalTurnInput([
+        ...(active === '1' && previous ? [JSON.parse(previous) as InteractionContext] : []),
+        ...(pending ? JSON.parse(pending) as InteractionContext[] : []),
+      ], interactionContext);
+      result = (await this.redis.eval(
+      `if (redis.call('HGET', KEYS[1], 'pendingInputs') or '') ~= ARGV[7]
+          or (redis.call('HGET', KEYS[1], 'currentContext') or '') ~= ARGV[8]
+          or (redis.call('HGET', KEYS[1], 'active') or '') ~= ARGV[9] then
+         return {'retry', '', '{}', ''}
+       end
+       local receipt_key = 'receipt:' .. ARGV[2]
        local receipt = redis.call('HGET', KEYS[1], receipt_key)
        if receipt then
          local decoded = cjson.decode(receipt)
          return {'duplicate', decoded.streamId, cjson.encode(decoded.interactionContext), ''}
+       end
+       local incoming = cjson.decode(ARGV[4])
+       if incoming.ready_input_continuation and ARGV[9] == '1' then
+         return {'busy', ARGV[1], ARGV[4], ''}
+       end
+       local latest = tonumber(redis.call('HGET', KEYS[2], 'latestSourceSequence') or '0')
+       if ARGV[8] ~= '' then
+         local previous = cjson.decode(ARGV[8])
+         local presentation = previous.ready_input_continuation
+         latest = math.max(latest, tonumber(presentation and presentation.presentation_source_sequence or previous.source_sequence) or 0)
+       end
+       for _, source in ipairs(cjson.decode(ARGV[4]).source_segments or {}) do
+         latest = math.max(latest, tonumber(source.source_sequence) or 0)
+       end
+       if ARGV[6] ~= '' and tonumber(ARGV[6]) < latest then
+         return {'superseded', ARGV[1], ARGV[4], ''}
+       end
+       for _, source in ipairs(cjson.decode(ARGV[4]).source_segments or {}) do
+         if source.source_message_id and source.source_persisted ~= true then
+           return {'initializing', ARGV[1], ARGV[4], ''}
+         end
        end
        local logical_id = redis.call('HGET', KEYS[1], 'logicalTurnId')
        local revision = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
@@ -325,26 +711,35 @@ export class RedisJobStore implements IJobStore {
          'revision', tostring(revision),
          'currentStreamId', ARGV[1],
          'active', '1',
+         'currentContext', encoded_context,
+         'pendingInputs', '[]',
          'streamForRevision:' .. tostring(revision), ARGV[1],
+         'contextForRevision:' .. tostring(revision), encoded_context,
          receipt_key, encoded_receipt)
        if ARGV[6] ~= '' then
          redis.call(
            'HSET', KEYS[1], 'sourceSequenceForRevision:' .. tostring(revision), ARGV[6]
          )
        end
-       redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+       redis.call('EXPIRE', KEYS[1], math.max(tonumber(ARGV[5]), math.ceil((tonumber(redis.call('HGET', KEYS[1], 'nativeRecoverUntil') or '0') - tonumber(redis.call('TIME')[1]) * 1000) / 1000)))
        return {'claimed', ARGV[1], encoded_context, superseded}`,
-      1,
+      2,
       key,
+      interactionContext.source_order_scope ? KEYS.sourceOrder(interactionContext.source_order_scope)
+        : KEYS.sourceOrderFromScopeDigest(logicalTurnScopeDigest(userId, interactionContext)),
       streamId,
       interactionContext.source_event_id,
       KEYS.logicalTurnId(userId, interactionContext),
-      JSON.stringify(interactionContext),
+      JSON.stringify(merged),
       this.ttl.running,
-      Number.isSafeInteger(interactionContext.source_sequence)
-        ? String(interactionContext.source_sequence)
+      Number.isSafeInteger(interactionPresentationSequence(interactionContext))
+        ? String(interactionPresentationSequence(interactionContext))
         : '',
+      pending ?? '', previous ?? '', active ?? '',
     )) as [string, string, string, string];
+      if (result[0] !== 'retry') break;
+    }
+    if (!result || result[0] === 'retry') throw new Error('Logical turn claim contention');
 
     const claimedContext = JSON.parse(result[2]) as InteractionContext;
     if (claimedContext.logical_turn_id) {
@@ -401,8 +796,12 @@ export class RedisJobStore implements IJobStore {
          'HDEL', KEYS[1],
          'streamForRevision:' .. ARGV[2],
          'sourceSequenceForRevision:' .. ARGV[2],
+         'contextForRevision:' .. ARGV[2],
          'cortexPresentation:' .. ARGV[2]
        )
+       local pending = cjson.decode(redis.call('HGET', KEYS[1], 'pendingInputs') or '[]')
+       table.insert(pending, cjson.decode(ARGV[5]))
+       redis.call('HSET', KEYS[1], 'pendingInputs', cjson.encode(pending))
        local previous_revision = tonumber(ARGV[2]) - 1
        if previous_revision > 0 then
          local previous_stream = redis.call(
@@ -413,6 +812,7 @@ export class RedisJobStore implements IJobStore {
          redis.call('HSET', KEYS[1],
            'revision', tostring(previous_revision),
            'currentStreamId', previous_stream,
+           'currentContext', redis.call('HGET', KEYS[1], 'contextForRevision:' .. tostring(previous_revision)) or '',
            'active', previous_stream ~= '' and '1' or '0')
        else
          redis.call('HSET', KEYS[1],
@@ -427,6 +827,7 @@ export class RedisJobStore implements IJobStore {
       interactionContext.revision,
       streamId,
       interactionContext.source_event_id,
+      JSON.stringify(interactionContext),
     );
     if (
       rolledBack === 1 &&
@@ -476,7 +877,28 @@ export class RedisJobStore implements IJobStore {
     return removed === 1;
   }
 
-  async completeLogicalTurn(streamId: string): Promise<void> {
+  async completeLogicalTurn(streamId: string, expected?: NativeResponseIdentity): Promise<void> {
+    if (expected) {
+      if (expected.streamId !== streamId) return;
+      const key =
+        KEYS.logicalTurnFromId(expected.logicalTurnId) ??
+        (await this.redis.hget(KEYS.logicalTurnIndex(expected.logicalTurnId), 'ownerScopeKey'));
+      if (!key) return;
+      await this.redis.eval(
+        `if redis.call('HGET', KEYS[1], 'logicalTurnId') ~= ARGV[1] or
+            redis.call('HGET', KEYS[1], 'revision') ~= ARGV[2] or
+            redis.call('HGET', KEYS[1], 'currentStreamId') ~= ARGV[3] or
+            redis.call('HGET', KEYS[1], 'streamForRevision:' .. ARGV[2]) ~= ARGV[3] then return 0 end
+         redis.call('HSET', KEYS[1], 'active', '0')
+         return 1`,
+        1,
+        key,
+        expected.logicalTurnId,
+        expected.revision,
+        streamId,
+      );
+      return;
+    }
     const job = await this.getJob(streamId);
     if (!job?.interactionContext) {
       return;
@@ -590,7 +1012,7 @@ export class RedisJobStore implements IJobStore {
        if requested_revision == current_revision and (ARGV[4] == 'committed' or ARGV[4] == 'failed') then
          redis.call('HSET', KEYS[1], 'active', '0')
        end
-       redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+       redis.call('EXPIRE', KEYS[1], math.max(tonumber(ARGV[5]), math.ceil((tonumber(redis.call('HGET', KEYS[1], 'nativeRecoverUntil') or '0') - tonumber(redis.call('TIME')[1]) * 1000) / 1000)))
        return {'recorded_new', recorded, owner_stream_id}`,
       2,
       ownerScopeKey,
@@ -629,64 +1051,80 @@ export class RedisJobStore implements IJobStore {
     return this.deserializeJob(data);
   }
 
-  async updateJob(streamId: string, updates: Partial<SerializableJobData>): Promise<void> {
+  async updateJob(
+    streamId: string,
+    updates: Partial<SerializableJobData>,
+    expectedNativeIdentity?: NativeResponseIdentity,
+  ): Promise<void> {
     const key = KEYS.job(streamId);
 
-    const serialized = this.serializeJob(updates as SerializableJobData);
+    const safe = { ...updates };
+    delete safe.nativeResponse;
+    delete safe.nativeResponseCancelled;
+    delete safe.nativeResponseFinished;
+    delete safe.nativeResponseSettled;
+    const serialized = this.serializeJob(safe as SerializableJobData);
     if (Object.keys(serialized).length === 0) {
       return;
     }
-
-    const fields = Object.entries(serialized).flat();
+    const terminal = Boolean(
+      updates.status && ['complete', 'error', 'aborted', 'superseded'].includes(updates.status),
+    );
     const updated = await this.redis.eval(
-      'if redis.call("EXISTS", KEYS[1]) == 1 then redis.call("HSET", KEYS[1], unpack(ARGV)) return 1 else return 0 end',
+      `
+      ${NATIVE_RETENTION_LUA}
+      if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+      if ARGV[3] ~= '' and redis.call('HGET', KEYS[1], 'nativeResponse') ~= ARGV[3] then return 0 end
+      local native = redis.call('HEXISTS', KEYS[1], 'nativeResponse') == 1
+      local finished = redis.call('HGET', KEYS[1], 'nativeResponseFinished') == '1'
+      local protected = {createdAt=true, userId=true, streamId=true, conversationId=true, responseMessageId=true, userMessage=true, interactionContext=true, finalEvent=true, generationCompleted=true}
+      for index = 4, #ARGV, 2 do
+        local field = ARGV[index]
+        if not (native and (protected[field] or (finished and (field == 'status' or field == 'error' or field == 'completedAt')))) then
+          redis.call('HSET', KEYS[1], field, ARGV[index+1])
+        end
+      end
+      local clock = redis.call('TIME')
+      local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+      if retain_native_response(KEYS[1], now) then
+        redis.call('PEXPIREAT', KEYS[1], tonumber(redis.call('HGET', KEYS[1], 'nativeRecoverUntil')))
+      elseif ARGV[1] == '1' then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2])) end
+      return 1`,
       1,
       key,
-      ...fields,
+      terminal ? '1' : '0',
+      this.ttl.completed,
+      expectedNativeIdentity ? nativeIdentityJson(expectedNativeIdentity) : '',
+      ...Object.entries(serialized).flat(),
     );
-
-    if (updated === 0) {
+    if (updated !== 1 || !terminal) {
       return;
     }
-
-    // If status changed to a terminal state, update TTL and remove from running set
-    // Note: userJobs cleanup is handled lazily via self-healing in getActiveJobIdsByUser
-    if (updates.status && ['complete', 'error', 'aborted', 'superseded'].includes(updates.status)) {
-      // In cluster mode, separate runningJobs (global) from stream-specific keys
-      if (this.isCluster) {
-        await this.redis.expire(key, this.ttl.completed);
-        await this.redis.srem(KEYS.runningJobs, streamId);
-
-        if (this.ttl.chunksAfterComplete === 0) {
-          await this.redis.del(KEYS.chunks(streamId));
-        } else {
-          await this.redis.expire(KEYS.chunks(streamId), this.ttl.chunksAfterComplete);
-        }
-
-        if (this.ttl.runStepsAfterComplete === 0) {
-          await this.redis.del(KEYS.runSteps(streamId));
-        } else {
-          await this.redis.expire(KEYS.runSteps(streamId), this.ttl.runStepsAfterComplete);
-        }
+    await this.refreshRunningMembership(streamId);
+    for (const [contentKey, ttl] of [
+      [KEYS.chunks(streamId), this.ttl.chunksAfterComplete],
+      [KEYS.runSteps(streamId), this.ttl.runStepsAfterComplete],
+    ] as const) {
+      if (ttl === 0) {
+        await this.redis.del(contentKey);
       } else {
-        const pipeline = this.redis.pipeline();
-        pipeline.expire(key, this.ttl.completed);
-        pipeline.srem(KEYS.runningJobs, streamId);
-
-        if (this.ttl.chunksAfterComplete === 0) {
-          pipeline.del(KEYS.chunks(streamId));
-        } else {
-          pipeline.expire(KEYS.chunks(streamId), this.ttl.chunksAfterComplete);
-        }
-
-        if (this.ttl.runStepsAfterComplete === 0) {
-          pipeline.del(KEYS.runSteps(streamId));
-        } else {
-          pipeline.expire(KEYS.runSteps(streamId), this.ttl.runStepsAfterComplete);
-        }
-
-        await pipeline.exec();
+        await this.redis.expire(contentKey, ttl);
       }
+    }
+  }
+
+  private async refreshRunningMembership(streamId: string): Promise<void> {
+    const job = await this.getJob(streamId);
+    if (job && (job.status === 'running' || retainNativeResponse(job))) {
+      await this.redis.sadd(KEYS.runningJobs, streamId);
+      return;
+    }
+    await this.redis.srem(KEYS.runningJobs, streamId);
+    // The global set cannot share a slot with every job. Recheck after removal so a
+    // concurrent bind/create cannot lose its existing cleanup enumeration.
+    const current = await this.getJob(streamId);
+    if (current && (current.status === 'running' || retainNativeResponse(current))) {
+      await this.redis.sadd(KEYS.runningJobs, streamId);
     }
   }
 
@@ -738,7 +1176,7 @@ export class RedisJobStore implements IJobStore {
        redis.call('HSET', KEYS[1], binding_key, ARGV[4])
        local current_ttl = redis.call('TTL', KEYS[1])
        if current_ttl < tonumber(ARGV[5]) then
-         redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+         redis.call('EXPIRE', KEYS[1], math.max(tonumber(ARGV[5]), math.ceil((tonumber(redis.call('HGET', KEYS[1], 'nativeRecoverUntil') or '0') - tonumber(redis.call('TIME')[1]) * 1000) / 1000)))
        end
        return {'recorded', ARGV[4]}`,
       1,
@@ -938,7 +1376,7 @@ export class RedisJobStore implements IJobStore {
           (ARGV[7] == 'committed' or ARGV[7] == 'failed') then
          redis.call('HSET', KEYS[1], 'active', '0')
        end
-       redis.call('EXPIRE', KEYS[1], tonumber(ARGV[8]))
+       redis.call('EXPIRE', KEYS[1], math.max(tonumber(ARGV[8]), math.ceil((tonumber(redis.call('HGET', KEYS[1], 'nativeRecoverUntil') or '0') - tonumber(redis.call('TIME')[1]) * 1000) / 1000)))
        local idempotent = existing_cortex_ack and '1' or '0'
        local result_status = existing_cortex_ack and 'recorded' or 'recorded_new'
        return {result_status, current_json, recorded_json, idempotent, owner_stream_id}`,
@@ -973,31 +1411,45 @@ export class RedisJobStore implements IJobStore {
     };
   }
 
-  async deleteJob(streamId: string): Promise<void> {
-    // Clear local caches
-    this.localGraphCache.delete(streamId);
-    this.localCollectedUsageCache.delete(streamId);
-
-    // Note: userJobs cleanup is handled lazily via self-healing in getActiveJobIdsByUser
-    // In cluster mode, separate runningJobs (global) from stream-specific keys (same slot)
-    if (this.isCluster) {
-      // Stream-specific keys all hash to same slot due to {streamId}
-      const pipeline = this.redis.pipeline();
-      pipeline.del(KEYS.job(streamId));
-      pipeline.del(KEYS.chunks(streamId));
-      pipeline.del(KEYS.runSteps(streamId));
-      await pipeline.exec();
-      // Global set is on different slot - execute separately
-      await this.redis.srem(KEYS.runningJobs, streamId);
-    } else {
-      const pipeline = this.redis.pipeline();
-      pipeline.del(KEYS.job(streamId));
-      pipeline.del(KEYS.chunks(streamId));
-      pipeline.del(KEYS.runSteps(streamId));
-      pipeline.srem(KEYS.runningJobs, streamId);
-      await pipeline.exec();
+  async deleteJob(
+    streamId: string,
+    retiredNativeResponse?: NativeResponseIdentity,
+    staleCreatedAt?: number,
+  ): Promise<void> {
+    const job = await this.getJob(streamId);
+    if (!job) {
+      await this.refreshRunningMembership(streamId);
+      return;
     }
-    logger.debug(`[RedisJobStore] Deleted job: ${streamId}`);
+    const deleted = await this.redis.eval(
+      `
+      ${NATIVE_RETENTION_LUA}
+      if redis.call('HGET', KEYS[1], 'createdAt') ~= ARGV[1] then return 0 end
+      if ARGV[3] ~= '' and (
+        ARGV[1] ~= ARGV[3] or
+        redis.call('HGET', KEYS[1], 'status') ~= 'running' or
+        redis.call('PTTL', KEYS[1]) ~= -1
+      ) then return 0 end
+      local retirement = ARGV[2] ~= ''
+      if retirement and redis.call('HGET', KEYS[1], 'nativeResponse') ~= ARGV[2] then return 0 end
+      local clock = redis.call('TIME')
+      local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+      if not retirement and retain_native_response(KEYS[1], now) then return 0 end
+      redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
+      return 1`,
+      3,
+      KEYS.job(streamId),
+      KEYS.chunks(streamId),
+      KEYS.runSteps(streamId),
+      job.createdAt,
+      retiredNativeResponse ? nativeIdentityJson(retiredNativeResponse) : '',
+      staleCreatedAt ?? '',
+    );
+    if (deleted === 1) {
+      this.localGraphCache.delete(streamId);
+      this.localCollectedUsageCache.delete(streamId);
+    }
+    await this.refreshRunningMembership(streamId);
   }
 
   async hasJob(streamId: string): Promise<boolean> {
@@ -1043,24 +1495,32 @@ export class RedisJobStore implements IJobStore {
 
           // Job no longer exists (TTL expired) - remove from set
           if (!job) {
-            await this.redis.srem(KEYS.runningJobs, streamId);
+            await this.refreshRunningMembership(streamId);
             this.localGraphCache.delete(streamId);
             this.localCollectedUsageCache.delete(streamId);
             return 1;
+          }
+
+          if (retainNativeResponse(job, now)) {
+            return 0;
           }
 
           // Job completed but still in running set (shouldn't happen, but handle it)
           if (job.status !== 'running') {
-            await this.redis.srem(KEYS.runningJobs, streamId);
+            await this.refreshRunningMembership(streamId);
             this.localGraphCache.delete(streamId);
             this.localCollectedUsageCache.delete(streamId);
             return 1;
           }
 
-          // Stale running job (failsafe - running for > configured TTL)
-          if (now - job.createdAt > this.ttl.running * 1000) {
+          // Handoff renews Redis expiry, not the immutable creation time. Keep the
+          // age failsafe only for legacy jobs with no expiry; deletion rechecks both.
+          if (
+            now - job.createdAt > this.ttl.running * 1000 &&
+            (await this.redis.pttl(KEYS.job(streamId))) === -1
+          ) {
             logger.warn(`[RedisJobStore] Cleaning up stale job: ${streamId}`);
-            await this.deleteJob(streamId);
+            await this.deleteJob(streamId, undefined, job.createdAt);
             return 1;
           }
 
@@ -1092,7 +1552,7 @@ export class RedisJobStore implements IJobStore {
 
   async getJobCountByStatus(status: JobStatus): Promise<number> {
     if (status === 'running') {
-      return this.redis.scard(KEYS.runningJobs);
+      return (await this.getRunningJobs()).length;
     }
 
     // For other statuses, we'd need to scan - return 0 for now
@@ -1645,6 +2105,12 @@ export class RedisJobStore implements IJobStore {
       cortexDeliveryAcknowledgementPresentation: data.cortexDeliveryAcknowledgementPresentation
         ? JSON.parse(data.cortexDeliveryAcknowledgementPresentation)
         : undefined,
+      nativeResponse: data.nativeResponse ? JSON.parse(data.nativeResponse) : undefined,
+      nativePredecessor: data.nativePredecessor ? JSON.parse(data.nativePredecessor) : undefined,
+      nativeAcceptedSources: data.nativeAcceptedSources ? JSON.parse(data.nativeAcceptedSources) : undefined,
+      nativeResponseCancelled: data.nativeResponseCancelled === '1',
+      nativeResponseFinished: data.nativeResponseFinished === '1',
+      nativeResponseSettled: data.nativeResponseSettled === '1',
       generationCompleted: data.generationCompleted === '1',
       clientPresentation: data.clientPresentation ? JSON.parse(data.clientPresentation) : undefined,
       cortexPresentation: data.cortexPresentation ? JSON.parse(data.cortexPresentation) : undefined,

@@ -457,7 +457,80 @@ describe('createMemoryTool', () => {
       const result = await tool.func({ key: 'test', value: 'some value' });
       expect(result).toHaveLength(2);
       expect(result[0]).toBe('Error setting memory for key "test"');
-      expect(result[1]).toBeUndefined();
+      expect(result[1][Tools.memory].type).toBe('error');
+      expect(JSON.parse(result[1][Tools.memory].value)).toMatchObject({
+        errorType: 'writer_interrupted', key: 'test', partialApplied: false,
+      });
+    });
+  });
+});
+
+
+describe('same-value memory receipt classification', () => {
+  it.each([false, true, undefined])(
+    'uses storage changed=%s without interpreting text or dropping revision',
+    async (changed) => {
+      const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 8, changed });
+      const instance = createMemoryTool({
+        userId: 'owner',
+        setMemory,
+        memoryRevisionMap: { preferences: 7 },
+      });
+      const result = await instance.func({ key: 'preferences', value: 'Same data.' });
+      expect(setMemory).toHaveBeenCalledWith(expect.objectContaining({ expectedRevision: 7 }));
+      expect(result[1][Tools.memory]).toMatchObject({
+        type: changed === false ? 'unchanged' : 'update',
+        revision: 8,
+      });
+    },
+  );
+
+  it.each([[false], [false, true], [true, false]])(
+    'preserves meaningful batch results for changed=%j',
+    async (...changes) => {
+      const setMemory = jest.fn();
+      changes.forEach((changed, index) =>
+        setMemory.mockResolvedValueOnce({ ok: true, changed, revision: index + 1 }),
+      );
+      const instance = createApplyMemoryChangesTool({
+        userId: 'owner',
+        setMemory,
+        deleteMemory: jest.fn(),
+        memoryRevisionMap: { preferences: 0 },
+      });
+      const result = await instance.func({
+        operations: changes.map((_, index) => ({
+          action: 'set',
+          key: 'preferences',
+          value: 'Value ' + index,
+        })),
+      });
+      expect(setMemory).toHaveBeenCalledTimes(changes.length);
+      expect(result[1][Tools.memory].type).toBe(changes.some(Boolean) ? 'update' : 'unchanged');
+    },
+  );
+
+  it('does not claim a changed value when an unchanged set precedes a rejected write', async () => {
+    const setMemory = jest
+      .fn()
+      .mockResolvedValueOnce({ ok: true, changed: false, revision: 1 })
+      .mockResolvedValueOnce({ ok: false, conflict: true });
+    const instance = createApplyMemoryChangesTool({
+      userId: 'owner',
+      setMemory,
+      deleteMemory: jest.fn(),
+      memoryRevisionMap: { preferences: 0 },
+    });
+    const result = await instance.func({
+      operations: [
+        { action: 'set', key: 'preferences', value: 'Same.' },
+        { action: 'set', key: 'preferences', value: 'Rejected.' },
+      ],
+    });
+    expect(result[1][Tools.memory].type).toBe('error');
+    expect(JSON.parse(result[1][Tools.memory].value)).toMatchObject({
+      partialApplied: false,
+      errorType: 'revision_conflict',
     });
   });
 });

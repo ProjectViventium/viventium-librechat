@@ -4,6 +4,20 @@ export * from './crypto';
 export * from './schema';
 export * from './utils';
 export { createModels } from './models';
+/* === VIVENTIUM START === Automatic titles preserve confirmed renames and retention. === */
+export {
+  omitUserTitleMarker,
+  saveUserConversationTitle,
+  saveGeneratedConversationTitle,
+} from './methods/conversationTitle';
+/* === VIVENTIUM END === */
+export {
+  createNativeResponseMethods,
+  nativeResponseDigest,
+  nativeResponseSource,
+  nativeResponseParentSource,
+  normalizeNativeResponseIdentity,
+} from './methods/nativeResponse';
 /* === VIVENTIUM START === GlassHive callback persistence model factories === */
 export { createGlassHiveTerminalCallbackResultModel } from './models/glassHiveTerminalCallbackResult';
 export { createViventiumGlassHiveCallbackEffectOutboxModel } from './models/glassHiveCallbackEffectOutbox';
@@ -18,7 +32,13 @@ export {
 export { createViventiumOrchestrationTraceEventModel } from './models/orchestrationTraceEvent';
 export { createViventiumPersonalAccountCleanupReceiptSchema } from './schema/personalAccountCleanupReceipt';
 /* === VIVENTIUM END === */
-export { createMethods, DEFAULT_REFRESH_TOKEN_EXPIRY, DEFAULT_SESSION_EXPIRY } from './methods';
+export {
+  createMethods,
+  mainContinuityStorageKey,
+  mainContinuityMessageEvidence,
+  DEFAULT_REFRESH_TOKEN_EXPIRY,
+  DEFAULT_SESSION_EXPIRY,
+} from './methods';
 export type * from './types';
 export type * from './methods';
 export { default as logger } from './config/winston';

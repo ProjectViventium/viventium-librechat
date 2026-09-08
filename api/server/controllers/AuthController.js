@@ -2,7 +2,7 @@ const cookies = require('cookie');
 const jwt = require('jsonwebtoken');
 const openIdClient = require('openid-client');
 const { logger } = require('@librechat/data-schemas');
-const { isEnabled, findOpenIDUser } = require('@librechat/api');
+const { getSessionCookieName, isEnabled, findOpenIDUser } = require('@librechat/api');
 const {
   requestPasswordReset,
   setOpenIDAuthTokens,
@@ -28,11 +28,11 @@ const { getGraphApiToken } = require('~/server/services/GraphTokenService');
 const { getOpenIdConfig, getOpenIdEmail } = require('~/strategies');
 
 const clearRefreshCookies = (res) => {
-  res.clearCookie('refreshToken');
-  res.clearCookie('openid_access_token');
-  res.clearCookie('openid_id_token');
-  res.clearCookie('openid_user_id');
-  res.clearCookie('token_provider');
+  res.clearCookie(getSessionCookieName('refreshToken'));
+  res.clearCookie(getSessionCookieName('openid_access_token'));
+  res.clearCookie(getSessionCookieName('openid_id_token'));
+  res.clearCookie(getSessionCookieName('openid_user_id'));
+  res.clearCookie(getSessionCookieName('token_provider'));
 };
 
 const registrationController = async (req, res) => {
@@ -81,11 +81,13 @@ const resetPasswordController = async (req, res) => {
 
 const refreshController = async (req, res) => {
   const parsedCookies = req.headers.cookie ? cookies.parse(req.headers.cookie) : {};
-  const token_provider = parsedCookies.token_provider;
+  const token_provider = parsedCookies[getSessionCookieName('token_provider')];
 
   if (token_provider === 'openid' && isEnabled(process.env.OPENID_REUSE_TOKENS)) {
     /** For OpenID users, read refresh token from session to avoid large cookie issues */
-    const refreshToken = req.session?.openidTokens?.refreshToken || parsedCookies.refreshToken;
+    const refreshToken =
+      req.session?.openidTokens?.refreshToken ||
+      parsedCookies[getSessionCookieName('refreshToken')];
 
     if (!refreshToken) {
       return res.status(200).send('Refresh token not provided');
@@ -132,7 +134,13 @@ const refreshController = async (req, res) => {
         );
       }
 
-      const token = await setOpenIDAuthTokens(tokenset, req, res, user._id.toString(), refreshToken);
+      const token = await setOpenIDAuthTokens(
+        tokenset,
+        req,
+        res,
+        user._id.toString(),
+        refreshToken,
+      );
 
       user.federatedTokens = {
         access_token: tokenset.access_token,
@@ -147,19 +155,59 @@ const refreshController = async (req, res) => {
         return res.status(403).send({ message: PENDING_APPROVAL_MESSAGE });
       }
       clearRefreshCookies(res);
-      logger.warn('[refreshController] Invalid OpenID refresh state cleared', error?.message ?? error);
+      logger.warn(
+        '[refreshController] Invalid OpenID refresh state cleared',
+        error?.message ?? error,
+      );
       return res.status(403).send('Invalid OpenID refresh token');
     }
   }
 
   /** For non-OpenID users, read refresh token from cookies */
-  const refreshToken = parsedCookies.refreshToken;
+  const refreshToken = parsedCookies[getSessionCookieName('refreshToken')];
   if (!refreshToken) {
     return res.status(200).send('Refresh token not provided');
   }
 
+  /* === VIVENTIUM START ===
+   * Stop an abandoned local refresh before it replaces the browser's valid session token.
+   */
+  const refreshAbort = new AbortController();
+  const cancelRefresh = () => {
+    if (!res.writableFinished) {
+      refreshAbort.abort();
+    }
+  };
+  res.once('close', cancelRefresh);
+  if (res.destroyed) {
+    refreshAbort.abort();
+  }
+  /* === VIVENTIUM END === */
+
   try {
-    const payload = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+    /* === VIVENTIUM START === */
+    refreshAbort.signal.throwIfAborted();
+    /* === VIVENTIUM END === */
+    /* === VIVENTIUM START ===
+     * Only a verified JWT rejection invalidates this cookie; server configuration and
+     * operation failures must preserve it without granting access.
+     */
+    const refreshSecret = process.env.JWT_REFRESH_SECRET;
+    if (!refreshSecret) {
+      throw new Error('Refresh signing configuration is unavailable');
+    }
+    let payload;
+    try {
+      payload = jwt.verify(refreshToken, refreshSecret);
+    } catch (error) {
+      if (!(error instanceof jwt.JsonWebTokenError)) {
+        throw error;
+      }
+      clearRefreshCookies(res);
+      logger.warn('[refreshController] Invalid refresh token cleared', { errorType: error.name });
+      return res.status(403).send('Invalid refresh token');
+    }
+    /* === VIVENTIUM END === */
     const user = await getUserById(payload.id, '-password -__v -totpSecret -backupCodes');
     if (!user) {
       return res.status(401).redirect('/login');
@@ -182,7 +230,9 @@ const refreshController = async (req, res) => {
     );
 
     if (session && session.expiration > new Date()) {
-      const token = await setAuthTokens(userId, res, session);
+      /* === VIVENTIUM START === */
+      const token = await setAuthTokens(userId, res, session, refreshAbort.signal);
+      /* === VIVENTIUM END === */
 
       res.status(200).send({ token, user });
     } else if (req?.query?.retry) {
@@ -194,12 +244,24 @@ const refreshController = async (req, res) => {
       res.status(401).send('Refresh token expired or not found for this user');
     }
   } catch (err) {
+    /* === VIVENTIUM START === The response owns cancellation even if an inner layer wraps it. === */
+    if (refreshAbort.signal.aborted) {
+      return;
+    }
+    /* === VIVENTIUM END === */
     if (err?.code === APPROVAL_ERROR_CODE) {
       return res.status(403).send({ message: PENDING_APPROVAL_MESSAGE });
     }
-    clearRefreshCookies(res);
-    logger.warn('[refreshController] Invalid refresh token cleared', err?.message ?? err);
-    res.status(403).send('Invalid refresh token');
+    /* === VIVENTIUM START === Server failure does not prove that the user's token is invalid. === */
+    logger.error('[refreshController] Failed to refresh session', {
+      errorCode: typeof err?.code === 'number' && Number.isFinite(err.code) ? err.code : undefined,
+    });
+    res.status(500).send('Unable to refresh session');
+    /* === VIVENTIUM END === */
+  } finally {
+    /* === VIVENTIUM START === */
+    res.removeListener('close', cancelRefresh);
+    /* === VIVENTIUM END === */
   }
 };
 

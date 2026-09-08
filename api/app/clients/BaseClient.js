@@ -1,8 +1,9 @@
 const crypto = require('crypto');
 const fetch = require('node-fetch');
-const { logger } = require('@librechat/data-schemas');
+const { logger, nativeResponseParentSource } = require('@librechat/data-schemas');
 const {
   countTokens,
+  buildDirectParentTurnContext,
   getBalanceConfig,
   buildMessageFiles,
   extractFileContext,
@@ -70,6 +71,10 @@ class BaseClient {
     this.skipSaveConvo = false;
     /** @type {boolean} */
     this.skipSaveUserMessage = false;
+    /* === VIVENTIUM START === Guarded resumable assistant persistence. === */
+    /** @type {boolean} */
+    this.skipSaveResponseMessage = false;
+    /* === VIVENTIUM END === */
     /** @type {string} */
     this.user;
     /** @type {string} */
@@ -240,7 +245,7 @@ class BaseClient {
       overrideUserMessageId ?? opts.overrideParentMessageId ?? crypto.randomUUID();
     let responseMessageId = opts.responseMessageId ?? crypto.randomUUID();
     let head = isEdited ? responseMessageId : parentMessageId;
-    this.currentMessages = (await this.loadHistory(conversationId, head)) ?? [];
+    this.currentMessages = (await this.loadHistory(conversationId, head, parentMessageId)) ?? [];
     this.conversationId = conversationId;
 
     if (isEdited && !isContinued) {
@@ -299,6 +304,19 @@ class BaseClient {
           conversationId,
           text: message,
         });
+
+    /* === VIVENTIUM START ===
+     * Freeze authorized source attachments before onStart persists the source proof. Provider
+     * rendering may enrich its own attachment metadata later without changing the authored input.
+     */
+    if (!opts.isEdited && Array.isArray(this.options.req?.body?.files)) {
+      const attachments = await this.options.attachments;
+      if (Array.isArray(attachments)) {
+        const files = buildMessageFiles(this.options.req.body.files, attachments);
+        if (files.length > 0) userMessage.files = files;
+      }
+    }
+    /* === VIVENTIUM END === */
 
     if (typeof opts?.getReqData === 'function') {
       opts.getReqData({
@@ -706,10 +724,6 @@ class BaseClient {
     if (!isEdited && !this.skipSaveUserMessage) {
       const reqFiles = this.options.req?.body?.files;
       if (reqFiles && Array.isArray(this.options.attachments)) {
-        const files = buildMessageFiles(reqFiles, this.options.attachments);
-        if (files.length > 0) {
-          userMessage.files = files;
-        }
         delete userMessage.image_urls;
       }
       userMessagePromise = this.saveMessageToDatabase(userMessage, saveOptions, user);
@@ -858,7 +872,11 @@ class BaseClient {
       saveOptions,
       user,
     );
-    this.savedMessageIds.add(responseMessage.messageId);
+    /* === VIVENTIUM START === Deferred output is not yet a persisted message. === */
+    if (!this.skipSaveResponseMessage) {
+      this.savedMessageIds.add(responseMessage.messageId);
+    }
+    /* === VIVENTIUM END === */
     delete responseMessage.tokenCount;
     return responseMessage;
   }
@@ -932,7 +950,11 @@ class BaseClient {
     });
   }
 
-  async loadHistory(conversationId, parentMessageId = null) {
+  async loadHistory(
+    conversationId,
+    parentMessageId = null,
+    sourceParentMessageId = parentMessageId,
+  ) {
     logger.debug('[BaseClient] Loading history:', { conversationId, parentMessageId });
 
     /* VIVENTIUM START
@@ -944,6 +966,14 @@ class BaseClient {
     );
 
     const messages = (await getMessages({ conversationId })) ?? [];
+
+    /* === VIVENTIUM START === Freeze authored parent evidence before mapping or file hydration. === */
+    const sourceParent = messages.find((message) => message.messageId === sourceParentMessageId);
+    this.directParentTurnContext = buildDirectParentTurnContext(sourceParent);
+    this.nativeResponseParentSource = sourceParent?._id
+      ? nativeResponseParentSource(sourceParent)
+      : null;
+    /* === VIVENTIUM END === */
 
     logger.info(
       `[BaseClient] DEBUG LOAD_HISTORY: Found ${messages.length} messages in DB for conversationId=${conversationId}`,
@@ -1019,9 +1049,17 @@ class BaseClient {
       user,
       ...(hasAddedConvo && { addedConvo: true }),
     });
-    const savedMessage = await saveMessage(this.options?.req, messageToSave, {
-      context: 'api/app/clients/BaseClient.js - saveMessageToDatabase #saveMessage',
-    });
+    /* === VIVENTIUM START ===
+     * Resumable requests persist assistants through the controller's current-revision fence.
+     * Keep user input and conversation options under their existing owners.
+     * === VIVENTIUM END === */
+    const savedMessage =
+      this.skipSaveResponseMessage && message.isCreatedByUser !== true
+        ? undefined
+        : await saveMessage(this.options?.req, messageToSave, {
+            operationKind: 'system',
+            context: 'api/app/clients/BaseClient.js - saveMessageToDatabase #saveMessage',
+          });
 
     if (this.skipSaveConvo) {
       return { message: savedMessage };
@@ -1077,7 +1115,7 @@ class BaseClient {
    * @param {Partial<TMessage>} message
    */
   async updateMessageInDatabase(message) {
-    await updateMessage(this.options.req, message);
+    await updateMessage(this.options.req, message, { operationKind: 'system' });
   }
 
   /**

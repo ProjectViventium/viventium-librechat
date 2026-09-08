@@ -11,7 +11,7 @@ import SiblingSwitch from './SiblingSwitch';
 import MultiMessage from './MultiMessage';
 import HoverButtons from './HoverButtons';
 import SubRow from './SubRow';
-import { cn, getMessageAriaLabel } from '~/utils';
+import { cn, getMessageAriaLabel, getVoiceTranscriptLabel } from '~/utils';
 import store from '~/store';
 
 type ViventiumMessage = NonNullable<TMessageProps['message']> & {
@@ -56,6 +56,10 @@ export default function Message(props: TMessageProps) {
   /* VIVENTIUM END */
 
   const name = useMemo(() => {
+    /* VIVENTIUM START: Preserve ambient speaker provenance before the active agent name. */
+    const transcriptLabel = getVoiceTranscriptLabel(message, localize);
+    if (transcriptLabel) return transcriptLabel;
+    /* VIVENTIUM END */
     let result = '';
     if (isCreatedByUser === true) {
       result = localize('com_user_message');
@@ -66,7 +70,7 @@ export default function Message(props: TMessageProps) {
     }
 
     return result;
-  }, [assistant, agent, isCreatedByUser, localize]);
+  }, [assistant, agent, isCreatedByUser, localize, message]);
 
   const iconData: TMessageIcon = useMemo(
     () => ({

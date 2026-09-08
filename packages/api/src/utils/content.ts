@@ -79,3 +79,26 @@ export function filterMalformedContentParts<T>(
     return lastToolCallIndexById.get(toolCallId) === index;
   });
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Shared harness activity projection.
+ * Purpose: A proven harness caller uses legacy think parts for activity summaries. Preserve the
+ *          existing in-place conversion across ordinary finalization and native recovery.
+ */
+export function convertHarnessActivityParts<T>(contentParts: T): T {
+  if (!Array.isArray(contentParts)) return contentParts;
+  for (let index = 0; index < contentParts.length; index++) {
+    const part = contentParts[index] as
+      { type?: string; think?: string | { value?: string } } | null | undefined;
+    if (part?.type !== ContentTypes.THINK) continue;
+    contentParts[index] = {
+      type: ContentTypes.HARNESS_ACTIVITY,
+      harness_activity: {
+        event: 'reasoning-summary',
+        summary: typeof part.think === 'string' ? part.think : String(part.think?.value || ''),
+      },
+    };
+  }
+  return contentParts;
+}
+/* === VIVENTIUM END === */

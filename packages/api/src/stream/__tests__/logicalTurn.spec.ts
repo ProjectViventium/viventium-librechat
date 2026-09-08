@@ -34,6 +34,45 @@ const schedulerContext = (conversationId: string, sourceEventId: string): Intera
 });
 
 describe('GenerationJobManager logical turns', () => {
+  test('reusing a conversation stream retires its old revision without cancelling the replacement', async () => {
+    const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const transport = new InMemoryEventTransport();
+    const manager = new GenerationJobManagerClass({ jobStore: store, eventTransport: transport,
+      cleanupOnComplete: false });
+    await manager.initialize();
+    try {
+      let previous = await manager.createJob('conversation', 'owner', 'conversation', {
+        interactionContext: webContext('conversation', 'source-0'),
+        adapterCapabilities: webCapabilities,
+      });
+      for (let revision = 1; revision <= 3; revision++) {
+        await manager.updateMetadata('conversation', { responseMessageId: `answer-${revision - 1}`,
+          userMessage: { messageId: `input-${revision - 1}`, text: 'Accepted input.' } });
+        const replaced = await store.getJob('conversation');
+        const current = await manager.createJob('conversation', 'owner', 'conversation', {
+          interactionContext: webContext('conversation', `source-${revision}`),
+          adapterCapabilities: webCapabilities,
+        });
+        expect(current.supersededPresentations).toEqual([expect.objectContaining({
+          responseMessageId: `answer-${revision - 1}`, userMessageId: `input-${revision - 1}`,
+          interactionContext: expect.objectContaining({ revision }),
+        })]);
+        expect(previous.abortController.signal.aborted).toBe(true);
+        expect(current.abortController.signal.aborted).toBe(false);
+        expect(await store.getJob('conversation')).toMatchObject({ status: 'running',
+          interactionContext: expect.objectContaining({ revision: revision + 1 }) });
+        expect((await store.getJob('conversation'))?.createdAt).toBeGreaterThan(replaced!.createdAt);
+        const output: unknown[] = [];
+        const subscription = await manager.subscribe('conversation', event => output.push(event));
+        await manager.emitChunk('conversation', { event: 'on_message_delta',
+          data: { text: 'Useful replacement answer.' } } as never);
+        expect(output).toContainEqual(expect.objectContaining({ data: { text: 'Useful replacement answer.' } }));
+        subscription?.unsubscribe();
+        previous = current;
+      }
+    } finally { await manager.destroy(); }
+  });
+
   test('supersedes one provisional revision and suppresses stale chunks and finals', async () => {
     const manager = new GenerationJobManagerClass({
       jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
@@ -46,6 +85,7 @@ describe('GenerationJobManager logical turns', () => {
       interactionContext: webContext('conversation-1', 'event-a'),
       adapterCapabilities: webCapabilities,
     });
+    await manager.updateMetadata('stream-a', { responseMessageId: 'assistant-a', userMessage: { messageId: 'input-a', text: 'First segment.' } });
     const chunks: unknown[] = [];
     const terminals: unknown[] = [];
     await manager.subscribe(
@@ -59,6 +99,7 @@ describe('GenerationJobManager logical turns', () => {
       adapterCapabilities: webCapabilities,
     });
 
+    expect(second.supersededPresentations).toEqual([expect.objectContaining({ conversationId: 'conversation-1', responseMessageId: 'assistant-a', userMessageId: 'input-a' })]);
     expect(first.abortController.signal.aborted).toBe(true);
     expect(first.abortController.signal.reason).toBe('superseded');
     expect((await manager.getJob('stream-a'))?.status).toBe('superseded');
@@ -571,6 +612,58 @@ describe('GenerationJobManager logical turns', () => {
       ),
     ).resolves.toMatchObject({ status: 'conflict' });
     expect((await manager.getJob('web-stream'))?.metadata.deliveryAcknowledgement).toBeUndefined();
+    await manager.destroy();
+  });
+
+  test('resolves only the exact server-owned scheduled Telegram transport receipt', async () => {
+    const manager = new GenerationJobManagerClass({
+      jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
+      eventTransport: new InMemoryEventTransport(),
+      cleanupOnComplete: false,
+    });
+    manager.initialize();
+    const scheduled = await manager.createJob('scheduled-stream', 'user-1', 'conversation-1', {
+      interactionContext: {
+        ...schedulerContext('conversation-1', 'scheduled-event'),
+        schedule_id: 'schedule-1',
+        schedule_run_id: 'run-1',
+      },
+      adapterCapabilities: webCapabilities,
+      deliveryPolicy: serverDelivery,
+    });
+    await manager.updateMetadata('scheduled-stream', {
+      responseMessageId: 'scheduled-response-1',
+    });
+    const acknowledgement = {
+      logical_turn_id: scheduled.metadata.interactionContext!.logical_turn_id!,
+      revision: 1,
+      state: 'committed' as const,
+      source_kind: 'schedule_result' as const,
+      schedule_id: 'schedule-1',
+      schedule_run_id: 'run-1',
+      presentation_refs: ['telegram:1:10'],
+    };
+
+    await expect(
+      manager.acknowledgeServerCommittedTransportReceipt(acknowledgement, 'telegram'),
+    ).resolves.toMatchObject({
+      status: 'recorded',
+      transportOnly: true,
+      presentation: {
+        userId: 'user-1',
+        conversationId: 'conversation-1',
+        responseMessageId: 'scheduled-response-1',
+      },
+    });
+    await expect(
+      manager.acknowledgeServerCommittedTransportReceipt(
+        { ...acknowledgement, schedule_run_id: 'forged-run' },
+        'telegram',
+      ),
+    ).resolves.toMatchObject({ status: 'conflict' });
+    await expect(
+      manager.acknowledgeServerCommittedTransportReceipt(acknowledgement, 'voice'),
+    ).resolves.toMatchObject({ status: 'conflict' });
     await manager.destroy();
   });
 

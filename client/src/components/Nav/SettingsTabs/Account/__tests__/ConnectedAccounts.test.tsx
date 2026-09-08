@@ -4,6 +4,7 @@ import { useToastContext } from '@librechat/client';
 import { useRevokeUserKeyMutation, useUserKeyQuery } from 'librechat-data-provider/react-query';
 import ConnectedAccounts, { connectedAccountPlatformFallbackAvailable } from '../ConnectedAccounts';
 import Account from '../Account';
+import { CONNECTED_ACCOUNTS_MANUAL_FLOW_EVENT } from '~/common/connectedAccounts';
 
 let mockStartupConfig = {
   viventiumConnectedAccountsEnabled: true,
@@ -49,7 +50,8 @@ jest.mock('~/data-provider', () => ({
 
 jest.mock('~/components/Input/SetKeyDialog', () => () => null);
 jest.mock('~/hooks', () => {
-  const localize = (key: string) => key;
+  const localize = (key: string, params?: { provider: string }) =>
+    key === 'com_ui_connected_accounts_provider_region' ? `${params?.provider} account` : key;
   return {
     useLocalize: () => localize,
     useAuthContext: () => ({ user: { role: 'USER', provider: 'external' } }),
@@ -62,9 +64,7 @@ jest.mock('../DeleteAccount', () => () => null);
 jest.mock('../Avatar', () => () => null);
 jest.mock('../TwoFactorAuthentication', () => () => null);
 jest.mock('../BackupCodesItem', () => () => null);
-jest.mock('../ParallelWork', () => ({ featureAvailable }: { featureAvailable: boolean }) => (
-  <div data-testid="parallel-work-account">{String(featureAvailable)}</div>
-));
+jest.mock('../ParallelWork', () => () => <div data-testid="parallel-work-account" />);
 
 describe('ConnectedAccounts OAuth polling', () => {
   const openAIRefetch = jest.fn();
@@ -122,6 +122,11 @@ describe('ConnectedAccounts OAuth polling', () => {
       ({ unmount } = render(<ConnectedAccounts />));
     });
     const openAISection = screen.getByRole('region', { name: 'com_ui_openai account' });
+    fireEvent.click(
+      within(openAISection).getByRole('button', {
+        name: 'com_ui_connected_accounts_manage_provider',
+      }),
+    );
     const connectButton = within(openAISection).getByRole('button', {
       name: 'com_ui_connected_accounts_experimental',
     });
@@ -152,6 +157,42 @@ describe('ConnectedAccounts OAuth polling', () => {
     unmount();
     openSpy.mockRestore();
   });
+
+  it('keeps a pending manual sign-in usable while account details are collapsed', async () => {
+    mockRequestGet.mockResolvedValue({ policy: 'personal_preferred' } as never);
+    (request.post as jest.Mock).mockResolvedValue({});
+    await act(async () => {
+      render(<ConnectedAccounts />);
+    });
+    const anthropic = screen.getByRole('region', { name: 'com_ui_anthropic account' });
+    const details = within(anthropic).getByRole('button', {
+      name: 'com_ui_connected_accounts_provider_details',
+    });
+    expect(details).toHaveAttribute('aria-expanded', 'false');
+    await act(async () => {
+      window.dispatchEvent(
+        new CustomEvent(CONNECTED_ACCOUNTS_MANUAL_FLOW_EVENT, {
+          detail: { provider: 'anthropic', state: 'synthetic-flow-state' },
+        }),
+      );
+    });
+    const code = within(anthropic).getByRole('textbox', {
+      name: 'com_ui_connected_account_manual_instructions',
+    });
+    const submit = within(anthropic).getByRole('button', { name: 'com_ui_submit' });
+    expect(submit).toBeDisabled();
+    fireEvent.change(code, { target: { value: 'synthetic-callback-code' } });
+    expect(submit).toBeEnabled();
+    await act(async () => {
+      fireEvent.click(submit);
+    });
+    expect(request.post).toHaveBeenCalledWith('/api/connected-accounts/anthropic/complete', {
+      callbackInput: 'synthetic-callback-code',
+      state: 'synthetic-flow-state',
+    });
+    expect(within(anthropic).queryByRole('textbox')).not.toBeInTheDocument();
+    expect(details).toHaveAttribute('aria-expanded', 'false');
+  });
 });
 
 describe('ConnectedAccounts provider source truth', () => {
@@ -171,9 +212,13 @@ describe('Account Parallel work wiring', () => {
     };
   });
 
-  it('passes the explicit runtime capability into the Account-wide Parallel work owner', () => {
-    render(<Account />);
+  it.each([true, false])(
+    'mounts the owner control when public release availability is %p',
+    (available) => {
+      mockStartupConfig.viventiumParallelWorkAvailable = available;
+      render(<Account />);
 
-    expect(screen.getByTestId('parallel-work-account')).toHaveTextContent('true');
-  });
+      expect(screen.getByTestId('parallel-work-account')).toBeInTheDocument();
+    },
+  );
 });

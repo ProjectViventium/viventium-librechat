@@ -30,7 +30,7 @@ import {
   CONNECTED_ACCOUNTS_SETUP_PENDING_KEY,
   isConnectedAccountsSetupDestination,
 } from '~/common/connectedAccounts';
-import { SESSION_KEY, isSafeRedirect, getPostLoginRedirect } from '~/utils';
+import { SESSION_KEY, isSafeRedirect, getPostLoginRedirect, getResponseStatus } from '~/utils';
 import useTimeout from './useTimeout';
 import store from '~/store';
 
@@ -49,6 +49,11 @@ const AuthContextProvider = ({
   const [token, setToken] = useState<string | undefined>(undefined);
   const [error, setError] = useState<string | undefined>(undefined);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  /* === VIVENTIUM START ===
+   * A service outage is not evidence that the saved session was rejected.
+   */
+  const [isAuthUnavailable, setIsAuthUnavailable] = useState(false);
+  /* === VIVENTIUM END === */
 
   const { data: userRole = null } = useGetRole(SystemRoles.USER, {
     enabled: !!(isAuthenticated && (user?.role ?? '')),
@@ -67,6 +72,9 @@ const AuthContextProvider = ({
         setToken(token);
         setTokenHeader(token);
         setIsAuthenticated(isAuthenticated);
+        /* === VIVENTIUM START === */
+        setIsAuthUnavailable(false);
+        /* === VIVENTIUM END === */
 
         const searchParams = new URLSearchParams(window.location.search);
         const postLoginRedirect = getPostLoginRedirect(searchParams);
@@ -85,7 +93,7 @@ const AuthContextProvider = ({
 
         const finalRedirect =
           logoutRedirect ??
-          postLoginRedirect ??
+          (isAuthenticated ? postLoginRedirect : null) ??
           (redirect && isSafeRedirect(redirect) ? redirect : null);
 
         if (finalRedirect == null) {
@@ -98,7 +106,7 @@ const AuthContextProvider = ({
   );
   const doSetError = useTimeout({ callback: (error) => setError(error as string | undefined) });
 
-  const loginUser = useLoginUserMutation({
+  const { mutate: loginUser } = useLoginUserMutation({
     onSuccess: (data: t.TLoginResponse) => {
       const { user, token, twoFAPending, tempToken } = data;
       if (twoFAPending) {
@@ -122,7 +130,7 @@ const AuthContextProvider = ({
       navigate(loginPath, { replace: true });
     },
   });
-  const logoutUser = useLogoutUserMutation({
+  const { mutate: logoutUser } = useLogoutUserMutation({
     onSuccess: (data) => {
       if (data.redirect) {
         /** data.redirect is the IdP's end_session_endpoint URL — an absolute URL generated
@@ -151,23 +159,37 @@ const AuthContextProvider = ({
       });
     },
   });
-  const refreshToken = useRefreshTokenMutation();
+  /* === VIVENTIUM START ===
+   * Use the existing request lifecycle for bounded transport recovery.
+   * A rejected session must never be retried as an outage.
+   */
+  const { mutate: refreshToken } = useRefreshTokenMutation({
+    networkMode: 'always',
+    retry: (failureCount, failure) => {
+      const status = getResponseStatus(failure);
+      return (
+        failureCount < 2 && (status == null || status === 408 || status === 429 || status >= 500)
+      );
+    },
+  });
+  /* === VIVENTIUM END === */
 
   const logout = useCallback(
-    (redirect?: string) => {
-      if (redirect) {
-        logoutRedirectRef.current = redirect;
-      }
-      logoutUser.mutate(undefined);
+    (redirect = '/login') => {
+      logoutRedirectRef.current = redirect;
+      logoutUser(undefined);
     },
     [logoutUser],
   );
 
   const userQuery = useGetUserQuery({ enabled: !!(token ?? '') });
 
-  const login = (data: t.TLoginUser) => {
-    loginUser.mutate(data);
-  };
+  const login = useCallback(
+    (data: t.TLoginUser) => {
+      loginUser(data);
+    },
+    [loginUser],
+  );
 
   const silentRefresh = useCallback(() => {
     if (authConfig?.test === true) {
@@ -177,7 +199,10 @@ const AuthContextProvider = ({
     if (isExternalRedirectRef.current) {
       return;
     }
-    refreshToken.mutate(undefined, {
+    /* === VIVENTIUM START === */
+    setIsAuthUnavailable(false);
+    /* === VIVENTIUM END === */
+    refreshToken(undefined, {
       onSuccess: (data: t.TRefreshTokenResponse | undefined) => {
         if (isExternalRedirectRef.current) {
           return;
@@ -192,7 +217,7 @@ const AuthContextProvider = ({
             baseUrl && (rawPath === baseUrl || rawPath.startsWith(baseUrl + '/'))
               ? rawPath.slice(baseUrl.length) || '/'
               : rawPath;
-          const currentUrl = `${strippedPath}${window.location.search}`;
+          const currentUrl = `${strippedPath}${window.location.search}${window.location.hash}`;
           const fallbackRedirect = isSafeRedirect(currentUrl) ? currentUrl : '/c/new';
           const redirect =
             storedRedirect && isSafeRedirect(storedRedirect) ? storedRedirect : fallbackRedirect;
@@ -211,21 +236,36 @@ const AuthContextProvider = ({
         if (authConfig?.test === true) {
           return;
         }
-        navigate(buildLoginRedirectUrl());
+        /* === VIVENTIUM START === */
+        setUserContext({ user: undefined, token: undefined, isAuthenticated: false });
+        navigate(buildLoginRedirectUrl(), { replace: true });
+        /* === VIVENTIUM END === */
       },
       onError: (error) => {
         if (isExternalRedirectRef.current) {
           return;
         }
-        console.log('refreshToken mutation error:', error);
-        if (authConfig?.test === true) {
+        /* === VIVENTIUM START === */
+        const status = getResponseStatus(error);
+        if (status === 401 || status === 403) {
+          setUserContext({ user: undefined, token: undefined, isAuthenticated: false });
+          navigate(buildLoginRedirectUrl(), { replace: true });
           return;
         }
-        navigate(buildLoginRedirectUrl());
+        setIsAuthUnavailable(true);
+        /* === VIVENTIUM END === */
       },
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- deps are stable at mount; adding refreshToken causes infinite re-fire
-  }, []);
+  }, [authConfig?.test, refreshToken, navigate, setUserContext]);
+
+  /* === VIVENTIUM START ===
+   * Authentication owns its initial refresh. Child routes must not infer failure
+   * from an elapsed timer, and a user-query error must not start a refresh loop.
+   */
+  useEffect(() => {
+    silentRefresh();
+  }, [silentRefresh]);
+  /* === VIVENTIUM END === */
 
   useEffect(() => {
     if (isExternalRedirectRef.current) {
@@ -234,14 +274,16 @@ const AuthContextProvider = ({
     if (userQuery.data) {
       setUser(userQuery.data);
     } else if (userQuery.isError) {
-      doSetError((userQuery.error as Error).message);
-      navigate(buildLoginRedirectUrl(), { replace: true });
+      /* === VIVENTIUM START === */
+      const status = getResponseStatus(userQuery.error);
+      if (status === 401 || status === 403) {
+        setUserContext({ user: undefined, token: undefined, isAuthenticated: false });
+        navigate(buildLoginRedirectUrl(), { replace: true });
+      }
+      /* === VIVENTIUM END === */
     }
     if (error != null && error && isAuthenticated) {
-      doSetError(undefined);
-    }
-    if (token == null || !token || !isAuthenticated) {
-      silentRefresh();
+      setError(undefined);
     }
   }, [
     token,
@@ -286,9 +328,24 @@ const AuthContextProvider = ({
         [SystemRoles.ADMIN]: adminRole,
       },
       isAuthenticated,
+      /* === VIVENTIUM START === */
+      isAuthUnavailable,
+      retryAuthentication: silentRefresh,
+      /* === VIVENTIUM END === */
     }),
 
-    [user, error, isAuthenticated, token, userRole, adminRole],
+    [
+      user,
+      error,
+      isAuthenticated,
+      token,
+      userRole,
+      adminRole,
+      isAuthUnavailable,
+      silentRefresh,
+      login,
+      logout,
+    ],
   );
 
   return <AuthContext.Provider value={memoedValue}>{children}</AuthContext.Provider>;

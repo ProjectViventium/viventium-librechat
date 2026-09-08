@@ -58,6 +58,12 @@ export default function Settings({
     }
   }, [open, initialTab]);
 
+  useEffect(() => {
+    if (open && isSmallScreen) {
+      tabRefs.current[activeTab]?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+    }
+  }, [open, isSmallScreen, activeTab]);
+
   const handleKeyDown = (event: React.KeyboardEvent) => {
     const tabs: SettingsTabValues[] = [
       SettingsTabValues.GENERAL,
@@ -233,7 +239,7 @@ export default function Settings({
                 <Tabs.Root
                   value={activeTab}
                   onValueChange={handleTabChange}
-                  className="flex flex-col gap-10 md:flex-row"
+                  className="flex flex-col gap-4 md:flex-row md:gap-10"
                   orientation={isSmallScreen ? 'horizontal' : 'vertical'}
                 >
                   <Tabs.List

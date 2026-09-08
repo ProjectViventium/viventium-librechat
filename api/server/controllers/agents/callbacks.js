@@ -6,6 +6,8 @@ const {
   GenerationJobManager,
   writeAttachmentEvent,
   createToolExecuteHandler,
+  nativeJobMatches,
+  nativeIdentityJson,
 } = require('@librechat/api');
 const {
   Tools,
@@ -97,7 +99,72 @@ const logVoiceLatencyStage = (req, stage, stageStartAt = null, details = '') => 
  */
 const isVoiceModeRequest = (req) => req?.body?.voiceMode === true;
 
-const harnessActivityDelta = (data) => {
+/* === VIVENTIUM START ===
+ * Feature: Typed harness activity carrier.
+ * Purpose: The runtime sends the structured activity identity (event kind, bounded public tool
+ * fields) in `provider_specific_fields.viventium.activity`, the namespace the OpenAI-compatible
+ * adapters preserve into `chunk.additional_kwargs`. The reasoning-delta event only carries the
+ * summary text, so the chat-model-stream adapter stashes the typed activity of the chunk it is
+ * about to dispatch and the reasoning-delta handler consumes it for that same summary.
+ * === VIVENTIUM END === */
+const stashTypedHarnessActivity = (req, data) => {
+  if (!req || typeof req !== 'object') {
+    return;
+  }
+  const chunk = data?.chunk;
+  const activity = chunk?.additional_kwargs?.provider_specific_fields?.viventium?.activity;
+  if (!activity || typeof activity !== 'object') {
+    return;
+  }
+  const reasoningText = String(chunk?.additional_kwargs?.reasoning_content || '');
+  const publicFields = {};
+  for (const key of ['tool', 'task', 'status']) {
+    const value = activity?.[key];
+    if (typeof value === 'string' && value.trim()) {
+      publicFields[key] = value.trim().slice(0, 80);
+    }
+  }
+  if (activity?.expects_deferred_callback === true) {
+    // Typed anchor: only a GlassHive run-dispatching tool delivers a deferred Worker callback.
+    publicFields.expects_deferred_callback = true;
+  }
+  // If the reasoning delta of this same chunk was already captured (the built-in stream path ran
+  // first), upgrade that captured part in place so the persisted part carries the typed identity.
+  const captured = req._viventiumCapturedHarnessActivityParts;
+  if (Array.isArray(captured)) {
+    for (let index = captured.length - 1; index >= 0; index -= 1) {
+      const part = captured[index]?.harness_activity;
+      if (part && part.summary === reasoningText && !part.tool) {
+        const event =
+          typeof activity.event === 'string' && activity.event.trim()
+            ? activity.event.trim()
+            : part.event;
+        Object.assign(part, { event, ...publicFields });
+        return;
+      }
+    }
+  }
+  Object.defineProperty(req, '_viventiumPendingHarnessActivity', {
+    value: { activity, reasoningText },
+    configurable: true,
+    enumerable: false,
+    writable: true,
+  });
+};
+
+const consumeTypedHarnessActivity = (req, summary) => {
+  const pending = req?._viventiumPendingHarnessActivity;
+  if (!pending || typeof pending !== 'object') {
+    return null;
+  }
+  if (pending.reasoningText !== summary) {
+    return null;
+  }
+  req._viventiumPendingHarnessActivity = null;
+  return pending.activity;
+};
+
+const harnessActivityDelta = (data, req) => {
   const content = Array.isArray(data?.delta?.content) ? data.delta.content : [];
   const summary = content
     .map((part) => part?.think || part?.text || '')
@@ -105,6 +172,27 @@ const harnessActivityDelta = (data) => {
     .join('');
   if (!summary) {
     return data;
+  }
+  /* === VIVENTIUM START ===
+   * Feature: Structured activity identity on harness parts.
+   * Purpose: The runtime streams the event kind and bounded public tool fields beside the
+   * summary, so a connected tool that completed (and will deliver later) is a typed fact the
+   * client can act on instead of prose it would have to parse.
+   * === VIVENTIUM END === */
+  const structured =
+    data?.delta?.viventium_activity && typeof data.delta.viventium_activity === 'object'
+      ? data.delta.viventium_activity
+      : consumeTypedHarnessActivity(req, summary);
+  const publicFields = {};
+  for (const key of ['tool', 'task', 'status']) {
+    const value = structured?.[key];
+    if (typeof value === 'string' && value.trim()) {
+      publicFields[key] = value.trim().slice(0, 80);
+    }
+  }
+  if (structured?.expects_deferred_callback === true) {
+    // Typed anchor: only a GlassHive run-dispatching tool delivers a deferred Worker callback.
+    publicFields.expects_deferred_callback = true;
   }
   return {
     ...data,
@@ -114,14 +202,85 @@ const harnessActivityDelta = (data) => {
         {
           type: ContentTypes.HARNESS_ACTIVITY,
           harness_activity: {
-            event: 'reasoning-summary',
+            event:
+              typeof structured?.event === 'string' && structured.event.trim()
+                ? structured.event.trim()
+                : 'reasoning-summary',
             summary,
+            ...publicFields,
           },
         },
       ],
     },
   };
 };
+
+/* === VIVENTIUM START ===
+ * Feature: GlassHive activity durability across upstream aggregation.
+ * Purpose: Keep a request-local, public-safe copy of capability-declared activity parts so a
+ * reasoning-step aggregation miss cannot erase completed connected-tool evidence on refresh.
+ * Native payloads, arguments, results, provider IDs, and call IDs are deliberately not retained.
+ */
+const captureHarnessActivityParts = (req, data, sourceEvent = data) => {
+  if (!req || typeof req !== 'object') {
+    return;
+  }
+  const content = Array.isArray(data?.delta?.content) ? data.delta.content : [];
+  const safeParts = content
+    .filter((part) => part?.type === ContentTypes.HARNESS_ACTIVITY)
+    .map((part) => {
+      const event = String(part?.harness_activity?.event || '').trim();
+      const summary = String(part?.harness_activity?.summary || '');
+      if (!event || !summary) {
+        return null;
+      }
+      return {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: {
+          event,
+          summary,
+          ...Object.fromEntries(
+            ['tool', 'task', 'status']
+              .map((key) => [key, part?.harness_activity?.[key]])
+              .filter(([, value]) => typeof value === 'string' && value.trim())
+              .map(([key, value]) => [key, value.trim().slice(0, 80)]),
+          ),
+          ...(part?.harness_activity?.expects_deferred_callback === true
+            ? { expects_deferred_callback: true }
+            : {}),
+        },
+      };
+    })
+    .filter(Boolean);
+  if (!safeParts.length) {
+    return;
+  }
+  if (!(req._viventiumCapturedHarnessActivityEvents instanceof WeakSet)) {
+    Object.defineProperty(req, '_viventiumCapturedHarnessActivityEvents', {
+      value: new WeakSet(),
+      configurable: true,
+      enumerable: false,
+      writable: false,
+    });
+  }
+  if (sourceEvent && typeof sourceEvent === 'object') {
+    if (req._viventiumCapturedHarnessActivityEvents.has(sourceEvent)) {
+      return;
+    }
+    req._viventiumCapturedHarnessActivityEvents.add(sourceEvent);
+  }
+  if (!Array.isArray(req._viventiumCapturedHarnessActivityParts)) {
+    Object.defineProperty(req, '_viventiumCapturedHarnessActivityParts', {
+      value: [],
+      configurable: true,
+      enumerable: false,
+      writable: false,
+    });
+  }
+  const remainingCapacity = Math.max(0, 128 - req._viventiumCapturedHarnessActivityParts.length);
+  req._viventiumCapturedHarnessActivityParts.push(...safeParts.slice(0, remainingCapacity));
+};
+/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
  * Feature: GlassHive duplicate-author guard.
@@ -148,15 +307,6 @@ const hasVisibleMessageDelta = (data) => {
       (value) => typeof value === 'string' && value.length > 0,
     );
   });
-};
-/* === VIVENTIUM END === */
-
-const getTextDeltaMode = (req) => {
-  const configured = req?.body?.viventiumTextDeltaMode ?? req?.body?.viventiumStreamTextDeltaMode;
-  if (configured === 'snapshot' || configured === 'auto' || configured === 'incremental') {
-    return configured;
-  }
-  return isVoiceModeRequest(req) ? 'auto' : 'incremental';
 };
 /* === VIVENTIUM END === */
 
@@ -449,6 +599,7 @@ async function emitEvent(res, streamId, eventData) {
  * @param {Array<UsageMetadata>} options.collectedUsage - The list of collected usage metadata.
  * @param {string | null} [options.streamId] - The stream ID for resumable mode, or null for standard mode.
  * @param {ToolExecuteOptions} [options.toolExecuteOptions] - Options for event-driven tool execution.
+ * @param {'incremental' | 'snapshot'} [options.messageDeltaMode] - Emitting adapter's text-delta contract.
  * @returns {Record<string, t.EventHandler>} The default handlers.
  * @throws {Error} If the request is not found.
  */
@@ -466,6 +617,7 @@ function getDefaultHandlers({
   collectedUsage,
   streamId = null,
   toolExecuteOptions = null,
+  messageDeltaMode = 'incremental',
 }) {
   if (!res || !aggregateContent) {
     throw new Error(
@@ -484,7 +636,7 @@ function getDefaultHandlers({
    * every consumer sees the same incremental event contract.
    * === VIVENTIUM END === */
   const normalizeMessageDeltaAtBoundary = createMessageDeltaBoundaryNormalizer({
-    mode: getTextDeltaMode(req),
+    deltaMode: messageDeltaMode,
   });
   if (timingEnabled && req && req._viventiumFirstDeltaLogged == null) {
     req._viventiumFirstDeltaLogged = false;
@@ -516,7 +668,124 @@ function getDefaultHandlers({
     }
   }
   /* === VIVENTIUM END === */
+  /* === VIVENTIUM START === Authored native previews use presentation only, never SDK content. === */
+  let authoredPreview = null;
+  const emitAuthoredPreview = async (data, metadata, clear = false) => {
+    const preview =
+      data?.chunk?.additional_kwargs?.provider_specific_fields?.viventium?.assistant_preview;
+    if (!preview && !(clear && authoredPreview)) return;
+    const identity = req?._viventiumNativeResponseIdentity;
+    const tracePreview = (stage, reason = '') =>
+      logger.info(
+        '[VIVENTIUM][NativePreview] ' +
+          JSON.stringify({
+            messageId: identity?.responseMessageId,
+            stage,
+            reason,
+            streamId,
+            invocationId: identity?.invocationId,
+            agentId: identity?.agentId,
+            eventAgentId:
+              typeof metadata?.agentId === 'string' ? metadata.agentId.slice(0, 160) : null,
+            sequence: Number.isSafeInteger(preview?.sequence) ? preview.sequence : null,
+            clear,
+          }),
+      );
+    tracePreview('received');
+    if (!identity) return tracePreview('rejected', 'identity_missing');
+    const interaction =
+      require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(req);
+    if (!streamId) return tracePreview('rejected', 'stream_missing');
+    if (req?._viventiumHarnessExecutionEnabled !== true)
+      return tracePreview('rejected', 'execution_disabled');
+    if (interaction?.actor_kind !== 'external_user' || interaction?.origin !== 'interactive')
+      return tracePreview('rejected', 'authoring_scope');
+    if (
+      interaction.logical_turn_id !== identity.logicalTurnId ||
+      interaction.revision !== identity.revision
+    )
+      return tracePreview('rejected', 'logical_turn');
+    if (req.user?.id !== identity.userId) return tracePreview('rejected', 'owner');
+    if (identity.streamId !== streamId) return tracePreview('rejected', 'stream_identity');
+    if (identity.deliveryContext?.surface === 'voice')
+      return tracePreview('rejected', 'voice_surface');
+    if (
+      typeof metadata?.agentId !== 'string' ||
+      !metadata.agentId ||
+      metadata.agentId !== identity.agentId
+    )
+      return tracePreview('rejected', 'agent_identity');
+    if (
+      !clear &&
+      (!preview ||
+        preview.version !== 1 ||
+        preview.invocation_id !== identity.invocationId ||
+        preview.message_id !== identity.responseMessageId ||
+        !Number.isSafeInteger(preview.sequence) ||
+        preview.sequence <= 0 ||
+        typeof preview.text !== 'string' ||
+        !preview.text.trim())
+    )
+      return tracePreview('rejected', 'preview_identity_or_shape');
+    if (
+      !clear &&
+      authoredPreview?.invocationId === identity.invocationId &&
+      preview.sequence <= authoredPreview.sequence
+    )
+      return tracePreview('rejected', 'already_seen');
+    const job = await GenerationJobManager.getJobStore().getJob(streamId);
+    if (!nativeJobMatches(job, identity)) return tracePreview('rejected', 'job_identity');
+    if (
+      !job.nativeResponse ||
+      nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity)
+    )
+      return tracePreview('rejected', 'native_binding');
+    const text = clear
+      ? ''
+      : require('~/server/services/viventium/deliveryControls').stripDeliveryControlsForPreview(
+          preview.text,
+        );
+    if (!clear && !text.trim()) return tracePreview('rejected', 'empty_visible_text');
+    authoredPreview = clear
+      ? null
+      : { invocationId: identity.invocationId, sequence: preview.sequence };
+    if (!clear) req._viventiumHarnessInvocationStarted = true;
+    // The existing generation owner checks cancellation and the current logical turn at emit.
+    // Flat replacement content bypasses both the SDK's graph aggregator and durable final text.
+    tracePreview('emit_submitted');
+    await GenerationJobManager.emitChunk(
+      streamId,
+      {
+        type: ContentTypes.TEXT,
+        preview: true,
+        edited: true,
+        index: 0,
+        text,
+        messageId: identity.responseMessageId,
+        conversationId: identity.conversationId,
+        userMessageId: identity.source.messageId,
+        thread_id: identity.conversationId,
+      },
+      identity,
+    );
+    tracePreview('emit_returned');
+  };
+  const modelEndHandler = new ModelEndHandler(collectedUsage, req);
+  /* === VIVENTIUM END === */
   const handlers = {
+    /* === VIVENTIUM START ===
+     * Typed harness activity carrier (see stashTypedHarnessActivity). This handler only records
+     * the typed activity of the chunk; the library's own stream path still dispatches the content
+     * and reasoning deltas, so nothing here may dispatch them a second time.
+     * === VIVENTIUM END === */
+    [GraphEvents.CHAT_MODEL_STREAM]: {
+      handle: async (_event, data, metadata) => {
+        await emitAuthoredPreview(data, metadata);
+        if (req?._viventiumHarnessActivityEnabled === true) {
+          stashTypedHarnessActivity(req, data);
+        }
+      },
+    },
     [GraphEvents.CHAT_MODEL_START]: {
       handle: async (_event, _data, metadata) => {
         /* === VIVENTIUM START ===
@@ -644,7 +913,16 @@ function getDefaultHandlers({
      * Purpose: Provide req to ModelEndHandler so it can log model_end timing for Telegram streams.
      * Added: 2026-02-07
      */
-    [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage, req),
+    [GraphEvents.CHAT_MODEL_END]: {
+      handle: async (event, data, metadata, graph) => {
+        // A tool-bearing model end continues the same accepted response through the graph.
+        // Keep its public preview until visible final text or a non-tool terminal end replaces it.
+        if (!Array.isArray(data?.output?.tool_calls) || data.output.tool_calls.length === 0) {
+          await emitAuthoredPreview(null, metadata, true);
+        }
+        return modelEndHandler.handle(event, data, metadata, graph);
+      },
+    },
     /* === VIVENTIUM END === */
     [GraphEvents.TOOL_END]: new ToolEndHandler(toolEndCallback, logger),
     [GraphEvents.ON_RUN_STEP]: {
@@ -794,6 +1072,7 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
+        if (hasVisibleMessageDelta(data)) await emitAuthoredPreview(null, metadata, true);
         /* === VIVENTIUM START ===
          * Feature: Parallel text first-visible-output timing.
          * Purpose: Separate accepted visible Main text from provider and reasoning arrival.
@@ -939,8 +1218,11 @@ function getDefaultHandlers({
         }
         /* === VIVENTIUM END === */
         const visibleData = req?._viventiumHarnessActivityEnabled
-          ? harnessActivityDelta(data)
+          ? harnessActivityDelta(data, req)
           : data;
+        if (req?._viventiumHarnessActivityEnabled === true) {
+          captureHarnessActivityParts(req, visibleData, data);
+        }
         if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
           await emitEvent(res, streamId, { event, data: visibleData });
         } else if (!metadata?.hide_sequential_outputs) {
@@ -1381,6 +1663,10 @@ function createResponsesToolEndCallback({ req, res, tracker, artifactPromises })
 }
 
 module.exports = {
+  harnessActivityDelta,
+  stashTypedHarnessActivity,
+  consumeTypedHarnessActivity,
+  captureHarnessActivityParts,
   getDefaultHandlers,
   createToolEndCallback,
   createResponsesToolEndCallback,

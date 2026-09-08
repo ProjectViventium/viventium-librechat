@@ -49,6 +49,73 @@ describe('Memory Methods', () => {
   });
 
   describe('setMemory revision protection', () => {
+    it('classifies the exact same value after CAS while preserving revisions', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const first = await memoryMethods.setMemory({
+        userId,
+        key: 'preferences',
+        value: 'Keep it short.',
+        expectedRevision: null,
+      });
+      expect(first).toMatchObject({ ok: true, changed: true, revision: 0 });
+      const same = await memoryMethods.setMemory({
+        userId,
+        key: 'preferences',
+        value: 'Keep it short.',
+        expectedRevision: 0,
+      });
+      expect(same).toMatchObject({ ok: true, changed: false, revision: 1 });
+      const stale = await memoryMethods.setMemory({
+        userId,
+        key: 'preferences',
+        value: 'Keep it short.',
+        expectedRevision: 0,
+      });
+      expect(stale).toMatchObject({ ok: false, conflict: true });
+      expect(stale).not.toHaveProperty('changed');
+      const changed = await memoryMethods.setMemory({
+        userId,
+        key: 'preferences',
+        value: 'Decision first.',
+        expectedRevision: 1,
+      });
+      expect(changed).toMatchObject({ ok: true, changed: true, revision: 2 });
+      expect((await MemoryEntry.findOne({ userId, key: 'preferences' }).lean())?.value).toBe(
+        'Decision first.',
+      );
+    });
+
+    it('classifies tombstone resurrection as changed even for equal empty text', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      // Native deletion persists empty tombstones without create-time required-value validation.
+      await MemoryEntry.collection.insertOne({
+        userId,
+        key: 'preferences',
+        value: '',
+        tokenCount: 0,
+        deletedAt: new Date(),
+        __v: 2,
+      });
+      const result = await memoryMethods.setMemory({
+        userId,
+        key: 'preferences',
+        value: '',
+        expectedRevision: 2,
+      });
+      expect(result).toMatchObject({ ok: true, changed: true, revision: 3 });
+      expect(
+        (await MemoryEntry.findOne({ userId, key: 'preferences' }).lean())?.deletedAt,
+      ).toBeUndefined();
+    });
+
+    it('does not infer an unchanged result for unguarded legacy writes', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      await MemoryEntry.create({ userId, key: 'preferences', value: 'Same.' });
+      const result = await memoryMethods.setMemory({ userId, key: 'preferences', value: 'Same.' });
+      expect(result.ok).toBe(true);
+      expect(result).not.toHaveProperty('changed');
+    });
+
     it('rejects a stale full-key overwrite and preserves the newer value', async () => {
       const userId = new mongoose.Types.ObjectId();
       const original = await MemoryEntry.create({

@@ -69,6 +69,7 @@ jest.mock('mongoose', () => {
             updateOne: (...args) => mockExternalUpdateOne(...args),
           };
         }
+        if (name === 'viventium_glasshive_mission_evidence') return {};
         throw new Error(`Unexpected collection ${name}`);
       },
     },
@@ -374,6 +375,47 @@ describe('GlassHiveCallbackBindingService', () => {
       }),
     ).rejects.toMatchObject({ code: 'glasshive_selected_source_anchor_unavailable' });
 
+    expect(mockBindingUpdateOne).not.toHaveBeenCalled();
+    expect(mockExternalUpdateOne).not.toHaveBeenCalled();
+  });
+
+  test('does not persist launch intent when authoring aborts during anchor resolution', async () => {
+    const controller = new AbortController();
+    const reason = Object.assign(new Error('superseded'), { code: 'source_order_superseded' });
+    mockGetMessages.mockImplementation(async (filter) => {
+      controller.abort(reason);
+      return [
+        {
+          messageId: filter.isCreatedByUser ? 'user-b' : 'assistant-b',
+          isCreatedByUser: filter.isCreatedByUser,
+        },
+      ];
+    });
+    await expect(
+      registerGlassHiveLaunchContext({
+        signal: controller.signal,
+        user: { id: 'owner-rapid' },
+        requestBody: {
+          messageId: 'assistant-c',
+          parentMessageId: 'user-c',
+          conversationId: 'conversation-rapid',
+          viventiumAuthoringSourceEventId: 'event-c',
+          viventiumSourceEventId: 'event-b',
+          viventiumTriggeringSourceSegments: [
+            {
+              ordinal: 0,
+              source_event_id: 'event-b',
+              source_message_id: 'user-b',
+              source_index: 0,
+              text: 'Independent objective.',
+            },
+          ],
+        },
+        toolName: 'workspace_launch',
+        toolArguments: { description: 'Independent objective.' },
+        toolCall: { id: 'call-b' },
+      }),
+    ).rejects.toBe(reason);
     expect(mockBindingUpdateOne).not.toHaveBeenCalled();
     expect(mockExternalUpdateOne).not.toHaveBeenCalled();
   });
@@ -1597,6 +1639,133 @@ describe('GlassHiveCallbackBindingService', () => {
     );
   });
 
+  test('repairs a pending-exchange origin once and preserves its exact run and delivered result on callback replay', async () => {
+    const bindings = new Map();
+    const externals = new Map();
+    const apply = (rows, filter, update) => {
+      let row = rows.get(filter._id);
+      if (!row && update.$setOnInsert) {
+        row = { ...update.$setOnInsert };
+        rows.set(filter._id, row);
+      }
+      if (!row) return { acknowledged: true, matchedCount: 0 };
+      if (filter.launchState?.$in && !filter.launchState.$in.includes(row.launchState))
+        return { acknowledged: true, matchedCount: 0 };
+      if (filter.workRef === '' && row.workRef) return { acknowledged: true, matchedCount: 0 };
+      Object.assign(row, update.$set || {});
+      return { acknowledged: true, matchedCount: 1 };
+    };
+    mockBindingUpdateOne.mockImplementation(async (filter, update) =>
+      apply(bindings, filter, update),
+    );
+    mockExternalUpdateOne.mockImplementation(async (filter, update) =>
+      apply(externals, filter, update),
+    );
+    mockBindingFindOne.mockImplementation(async (filter) => bindings.get(filter._id) || null);
+    mockExternalFindOne.mockImplementation(async (filter) => externals.get(filter._id) || null);
+    mockExternalCursor.toArray.mockImplementation(async () =>
+      [...externals.values()].filter((row) => row.launchState === 'dispatch_unknown'),
+    );
+    const exactGoal =
+      '  Compare the approaches.\nReturn the requested table and original source files.  ';
+    const launch = await registerGlassHiveLaunchContext({
+      user: { id: 'user-1' },
+      toolName: 'worker_delegate_once',
+      toolArguments: { instruction: exactGoal, require_callback: true },
+      requestBody: {
+        conversationId: 'conversation-1',
+        messageId: 'assistant-anchor',
+        parentMessageId: 'user-message',
+        viventiumSourceEventId: 'source-pending',
+        viventiumTriggeringSourceSegments: [{ ordinal: 0, text: exactGoal }],
+      },
+      toolCall: { id: 'call-pending', turn: 0 },
+    });
+    const toolArguments = attachGlassHiveTrustedLaunchMetadata({ instruction: exactGoal }, launch);
+    await markGlassHiveLaunchDispatchReady(launch);
+    await markGlassHiveLaunchDispatchUnknown(toolArguments);
+    expect(bindings.get(launch.originRef).launchState).toBe('dispatch_unknown');
+    expect(launch.delegationContext.triggering_source_segments[0].text).toBe(exactGoal);
+    mockRequestAccountApi.mockResolvedValueOnce({ workRef: 'gh-work-pending' });
+    await expect(reconcileUnknownGlassHiveLaunches({ ownerId: 'user-1' })).resolves.toEqual({
+      scanned: 1,
+      repaired: 1,
+      pending: 0,
+    });
+    await expect(reconcileUnknownGlassHiveLaunches({ ownerId: 'user-1' })).resolves.toEqual({
+      scanned: 0,
+      repaired: 0,
+      pending: 0,
+    });
+    expect(mockRequestAccountApi).toHaveBeenCalledTimes(1);
+    expect(mockRequestAccountApi).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerId: 'user-1',
+        path: `/v1/delegations/by-origin/${launch.originRef}`,
+      }),
+    );
+    expect(bindings.size).toBe(1);
+    expect(externals.size).toBe(1);
+    const body = {
+      origin_ref: launch.originRef,
+      work_ref: 'gh-work-pending',
+      worker_id: 'worker-pending',
+      run_id: 'run-pending',
+      callback_id: 'result-pending',
+      attempt_number: 1,
+      event: 'run.completed',
+      work_state: 'completed',
+      work_terminal: true,
+    };
+    mockRequestAccountApi.mockResolvedValue({
+      valid: true,
+      originRef: launch.originRef,
+      workRef: 'gh-work-pending',
+    });
+    const resolved = await resolveGlassHiveCallbackContext(body);
+    expect(resolved).toMatchObject({
+      ownerId: 'user-1',
+      conversationId: 'conversation-1',
+      requestedParentMessageId: 'user-message',
+    });
+    expect(mockRequestAccountApi).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        body: {
+          originRef: launch.originRef,
+          workRef: 'gh-work-pending',
+          workerId: 'worker-pending',
+          runId: 'run-pending',
+        },
+      }),
+    );
+    const external = externals.get(launch.originRef);
+    Object.assign(external, {
+      externalState: 'completed',
+      deliveryState: 'sent',
+      attentionPending: false,
+    });
+    mockExternalFindOneAndUpdate.mockImplementation(async (filter, update) => {
+      apply(externals, filter, update);
+      return external;
+    });
+    await recordGlassHiveCallbackExternalState({ binding: resolved, body });
+    const repeated = await resolveGlassHiveCallbackContext(body);
+    await recordGlassHiveCallbackExternalState({ binding: repeated, body });
+    expect(repeated.traceIdentity).toEqual(resolved.traceIdentity);
+    expect(external).toMatchObject({
+      externalState: 'completed',
+      deliveryState: 'sent',
+      attentionPending: false,
+    });
+    expect(
+      mockExternalFindOneAndUpdate.mock.calls.every(
+        ([, update]) => !Object.hasOwn(update.$set, 'deliveryState'),
+      ),
+    ).toBe(true);
+    expect(bindings.size).toBe(1);
+    expect(externals.size).toBe(1);
+  });
+
   test('backs off a transient poison row and continues repairing later launch intents', async () => {
     mockExternalCursor.toArray.mockResolvedValueOnce([
       {
@@ -1833,8 +2002,16 @@ describe('GlassHiveCallbackBindingService', () => {
     );
   });
 
-  test('rejects completed callback evidence when trusted producer detail is unavailable', async () => {
+  test('preserves authorized callback state when producer trace is unavailable', async () => {
     mockRequestAccountApi.mockRejectedValueOnce(new Error('producer_detail_unavailable'));
+    mockExternalFindOne.mockResolvedValueOnce({
+      _id: 'work-producer-missing',
+      externalState: 'running',
+    });
+    mockExternalFindOneAndUpdate.mockResolvedValueOnce({
+      _id: 'work-producer-missing',
+      externalState: 'completed',
+    });
 
     await expect(
       recordGlassHiveCallbackExternalState({
@@ -1858,13 +2035,31 @@ describe('GlassHiveCallbackBindingService', () => {
           run_id: 'run-producer-missing',
         },
       }),
-    ).rejects.toThrow('producer_detail_unavailable');
+    ).resolves.not.toThrow();
+    expect(mockExternalFindOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ _id: 'work-producer-missing' }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          externalState: 'completed',
+          runId: 'run-producer-missing',
+        }),
+      }),
+      expect.any(Object),
+    );
     expect(mockRecordGlassHiveWorkDetailTrace).not.toHaveBeenCalled();
     expect(mockRecordTraceCallback).not.toHaveBeenCalled();
   });
 
-  test('rejects completed callback evidence when trusted producer detail fails validation', async () => {
+  test('preserves authorized callback state without accepting invalid producer trace', async () => {
     mockRequestAccountApi.mockResolvedValueOnce({ state: 'completed' });
+    mockExternalFindOne.mockResolvedValueOnce({
+      _id: 'work-producer-invalid',
+      externalState: 'running',
+    });
+    mockExternalFindOneAndUpdate.mockResolvedValueOnce({
+      _id: 'work-producer-invalid',
+      externalState: 'completed',
+    });
     mockRecordGlassHiveWorkDetailTrace.mockResolvedValueOnce({
       accepted: false,
       errors: ['attempt_history_missing'],
@@ -1893,7 +2088,17 @@ describe('GlassHiveCallbackBindingService', () => {
           run_id: 'run-producer-invalid',
         },
       }),
-    ).rejects.toThrow('glasshive_trace_producer_detail_rejected');
+    ).resolves.not.toThrow();
+    expect(mockExternalFindOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ _id: 'work-producer-invalid' }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          externalState: 'completed',
+          runId: 'run-producer-invalid',
+        }),
+      }),
+      expect.any(Object),
+    );
     expect(mockRecordTraceCallback).not.toHaveBeenCalled();
   });
 

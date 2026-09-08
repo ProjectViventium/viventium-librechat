@@ -14,6 +14,7 @@ import {
 } from './modelSelection';
 import ModelParametersSection from './ModelParametersSection';
 import CapabilityProviderOptions from './CapabilityProviderOptions';
+import BackgroundWorkerOptions from './BackgroundWorkerOptions';
 
 export default function ModelPanel({
   providers,
@@ -135,7 +136,7 @@ export default function ModelPanel({
         <div className="mb-4">
           <label
             id="provider-label"
-            className="text-token-text-primary model-panel-label mb-2 block font-medium"
+            className="model-panel-label mb-2 block font-medium text-text-primary"
             htmlFor="provider"
           >
             {localize('com_ui_provider')} <span className="text-red-500">*</span>
@@ -186,7 +187,7 @@ export default function ModelPanel({
           <label
             id="model-label"
             className={cn(
-              'text-token-text-primary model-panel-label mb-2 block font-medium',
+              'model-panel-label mb-2 block font-medium text-text-primary',
               !provider && 'text-gray-500 dark:text-gray-400',
             )}
             htmlFor="model"
@@ -246,8 +247,14 @@ export default function ModelPanel({
           parameterField="model_parameters"
           providerCapability={providerCapability}
         />
+        {glassHiveOptions?.orchestration?.parallel_available &&
+          providerCapabilities['glasshive-harness'] && (
+            <BackgroundWorkerOptions
+              providerCapability={providerCapabilities['glasshive-harness']}
+            />
+          )}
         {providerCapability?.serial_model_fallback === true && (
-          <div className="border-token-border-light mb-4 border-t pt-4">
+          <div className="mb-4 border-t border-border-light pt-4">
             <label className="mb-1 block text-sm font-medium" htmlFor="glasshive-fallback-model">
               {localize('com_ui_glasshive_quota_fallback_model')}
             </label>
@@ -259,7 +266,7 @@ export default function ModelPanel({
                   {...field}
                   value={field.value ?? ''}
                   id="glasshive-fallback-model"
-                  className="border-token-border-light bg-token-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
+                  className="mb-3 h-10 w-full rounded-lg border border-border-light bg-surface-primary px-3"
                 >
                   <option value="">{localize('com_ui_glasshive_quota_fallback_empty')}</option>
                   {providerCapability.models
@@ -272,7 +279,7 @@ export default function ModelPanel({
                 </select>
               )}
             />
-            <p className="text-token-text-secondary -mt-2 mb-3 text-xs">
+            <p className="-mt-2 mb-3 text-xs text-text-secondary">
               {localize('com_ui_glasshive_quota_fallback_description')}
             </p>
             {glassHiveFallbackModel &&
@@ -292,7 +299,7 @@ export default function ModelPanel({
                         {...field}
                         value={field.value ?? fallbackModelCapability?.recommendedEffort ?? ''}
                         id="glasshive-fallback-effort"
-                        className="border-token-border-light bg-token-surface-primary h-10 w-full rounded-lg border px-3"
+                        className="h-10 w-full rounded-lg border border-border-light bg-surface-primary px-3"
                       >
                         {fallbackModelCapability?.effortChoices.map((effort) => (
                           <option key={effort} value={effort}>
@@ -317,14 +324,14 @@ export default function ModelPanel({
         <div className="model-panel-section mb-4">
           <label
             id="fallback-llm-label"
-            className="text-token-text-primary model-panel-label mb-2 block font-medium"
+            className="model-panel-label mb-2 block font-medium text-text-primary"
           >
             {localize('com_ui_fallback_llm')}
           </label>
           <button
             type="button"
             onClick={() => setActivePanel(Panel.fallbackLlmModel)}
-            className="btn btn-neutral border-token-border-light relative h-10 w-full rounded-lg font-medium"
+            className="btn btn-neutral relative h-10 w-full rounded-lg border-border-light font-medium"
             aria-haspopup="true"
             aria-expanded="false"
             aria-labelledby="fallback-llm-label"
@@ -338,7 +345,7 @@ export default function ModelPanel({
               <ChevronRight className="h-4 w-4 flex-shrink-0" aria-hidden="true" />
             </div>
           </button>
-          <p className="text-token-text-secondary mt-1 text-xs">
+          <p className="mt-1 text-xs text-text-secondary">
             {localize('com_ui_fallback_llm_short_description')}
           </p>
         </div>

@@ -253,6 +253,10 @@ export type GlassHiveOptions = {
     default_mode: 'focused' | 'parallel';
     worker_profile?: string;
     fallback_worker_profile?: string;
+    worker_model?: string;
+    worker_reasoning_effort?: string;
+    fallback_worker_model?: string;
+    fallback_worker_reasoning_effort?: string;
   };
 };
 
@@ -729,6 +733,8 @@ export type StreamContentData = TMessageContentParts & {
 };
 
 export type TContentData = StreamContentData & {
+  /** Transient authored snapshot; final message content remains authoritative. */
+  preview?: boolean;
   messageId: string;
   conversationId: string;
   userMessageId: string;

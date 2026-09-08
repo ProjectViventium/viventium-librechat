@@ -1,9 +1,7 @@
 const { createContentAggregator } = require('@librechat/agents');
 const { GraphEvents } = require('@librechat/agents');
 const { StepTypes, ContentTypes } = require('librechat-data-provider');
-const {
-  sanitizeAggregatedContentParts,
-} = require('../sanitizeAggregatedContentParts');
+const { sanitizeAggregatedContentParts } = require('../sanitizeAggregatedContentParts');
 
 describe('sanitizeAggregatedContentParts', () => {
   test('removes empty thinking shells left by streaming aggregation before tool follow-up', () => {
@@ -37,6 +35,32 @@ describe('sanitizeAggregatedContentParts', () => {
 
     expect(result).toBe(contentParts);
     expect(contentParts).toEqual([]);
+  });
+
+  test('keeps SDK run-step indexes stable when an earlier reasoning slot is suppressed', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        id: 'answer-step',
+        index: 1,
+        stepDetails: {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: { message_id: 'answer' },
+        },
+      },
+    });
+    for (const text of ['Complete', ' replies', ' survive.']) {
+      aggregateContent({
+        event: GraphEvents.ON_MESSAGE_DELTA,
+        data: { id: 'answer-step', delta: { content: [{ type: ContentTypes.TEXT, text }] } },
+      });
+      sanitizeAggregatedContentParts(contentParts, { preserveIndices: true });
+    }
+    expect(contentParts[0]).toBeUndefined();
+    expect(contentParts[1]).toEqual({ type: ContentTypes.TEXT, text: 'Complete replies survive.' });
+    sanitizeAggregatedContentParts(contentParts);
+    expect(contentParts).toEqual([{ type: ContentTypes.TEXT, text: 'Complete replies survive.' }]);
   });
 
   test('keeps valid reasoning content intact', () => {

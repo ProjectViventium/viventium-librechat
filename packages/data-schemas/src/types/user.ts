@@ -59,6 +59,7 @@ export interface IUser extends Document {
      * Added: 2026-02-19
      */
     conversation_recall?: boolean;
+    conversation_recall_chosen?: boolean;
     orchestration_mode?: ViventiumOrchestrationMode;
     parallel_work_known?: boolean;
     parallel_work_known_epoch?: number;
@@ -122,6 +123,7 @@ export interface UpdateUserRequest {
      * Added: 2026-02-19
      */
     conversation_recall?: boolean;
+    conversation_recall_chosen?: boolean;
     orchestration_mode?: ViventiumOrchestrationMode;
     parallel_work_known?: boolean;
     /* === VIVENTIUM END === */

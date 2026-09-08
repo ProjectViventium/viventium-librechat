@@ -211,6 +211,7 @@ function createToolLoader(signal, streamId = null, definitionsOnly = false) {
    * @param {string[]} params.tools
    * @param {string} params.provider
    * @param {string} params.model
+   * @param {object} [params.glasshive_options]
    * @param {AgentToolResources} params.tool_resources
    * @returns {Promise<{
    *   tools?: StructuredTool[],
@@ -227,13 +228,14 @@ function createToolLoader(signal, streamId = null, definitionsOnly = false) {
     model,
     agentId,
     provider,
+    glasshive_options,
     tool_options,
     tool_resources,
   }) {
     if (isVoiceActorSideEffectRestricted(req)) {
       return emptyToolLoadResult();
     }
-    const agent = { id: agentId, tools, provider, model, tool_options };
+    const agent = { id: agentId, tools, provider, model, glasshive_options, tool_options };
     try {
       return await loadAgentTools({
         req,
@@ -420,7 +422,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         ? extractVisibleTextFromContentParts(contentParts)
         : '';
     rawAggregateContent(event);
-    sanitizeAggregatedContentParts(contentParts);
+    sanitizeAggregatedContentParts(contentParts, { preserveIndices: true });
     if (shouldRepairVoiceDelta) {
       const afterVoiceText = extractVisibleTextFromContentParts(contentParts);
       const repaired = repairMissedVoiceMessageDelta({
@@ -431,7 +433,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         afterText: afterVoiceText,
       });
       if (repaired) {
-        sanitizeAggregatedContentParts(contentParts);
+        sanitizeAggregatedContentParts(contentParts, { preserveIndices: true });
         if (!req._viventiumVoiceDeltaAggregationRepairLogged) {
           req._viventiumVoiceDeltaAggregationRepairLogged = true;
           logger.warn(
@@ -449,7 +451,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         afterText: afterVisibleText,
       });
       if (repaired) {
-        sanitizeAggregatedContentParts(contentParts);
+        sanitizeAggregatedContentParts(contentParts, { preserveIndices: true });
         req._viventiumVisibleDeltaAggregationRepaired = true;
         req._viventiumVisibleDeltaAggregationRecoveredText =
           extractVisibleTextFromContentParts(contentParts);
@@ -517,16 +519,6 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     },
     toolEndCallback,
   };
-
-  const eventHandlers = getDefaultHandlers({
-    req,
-    res,
-    toolExecuteOptions,
-    aggregateContent,
-    toolEndCallback,
-    collectedUsage,
-    streamId,
-  });
 
   if (!endpointOption.agent) {
     throw new Error('No agent promise provided');
@@ -813,6 +805,18 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     req,
     effectivePrimaryProvider,
   );
+  const eventHandlers = getDefaultHandlers({
+    req,
+    res,
+    toolExecuteOptions,
+    aggregateContent,
+    toolEndCallback,
+    collectedUsage,
+    streamId,
+    // The emitting adapter owns the delta shape; request text cannot select it.
+    messageDeltaMode:
+      effectivePrimaryCapability?.message_delta_mode === 'snapshot' ? 'snapshot' : 'incremental',
+  });
   req._viventiumFallbackLlmAttempt = primaryInitializationFallbackUsed === true;
   if (primaryInitializationFallbackUsed === true) {
     req._viventiumFallbackRouteNotice = {

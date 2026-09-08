@@ -1,6 +1,8 @@
+/* === VIVENTIUM START === Render typed memory failures without raw provider payloads. === */
 import type { MemoryArtifact } from 'librechat-data-provider';
 import { useMemo } from 'react';
 import { useLocalize } from '~/hooks';
+import { memoryProviderFailureCopy, memoryProviderLabel } from './memoryErrorPresentation';
 
 export default function MemoryInfo({ memoryArtifacts }: { memoryArtifacts: MemoryArtifact[] }) {
   const localize = useLocalize();
@@ -12,38 +14,49 @@ export default function MemoryInfo({ memoryArtifacts }: { memoryArtifacts: Memor
 
     const messages = errors.map((artifact) => {
       try {
-        const errorData = JSON.parse(artifact.value as string);
-        const errorType = errorData.errorType;
-
-        if (errorType === 'already_exceeded') {
-          return {
-            isStorageFull: true,
-            message: localize('com_ui_memory_already_exceeded', {
-              tokens: errorData.tokenCount,
-            }),
-          };
-        } else if (errorType === 'would_exceed') {
-          return {
-            isStorageFull: true,
-            message: localize('com_ui_memory_would_exceed', {
-              tokens: errorData.tokenCount,
-            }),
-          };
-        } else if (typeof errorData.message === 'string' && errorData.message.trim().length > 0) {
-          return {
-            isStorageFull: false,
-            message: errorData.message.trim(),
-          };
-        } else {
-          return {
-            isStorageFull: false,
-            message: localize('com_ui_memory_error'),
-          };
+        const errorData: {
+          errorType?: string;
+          provider?: string;
+          tokenCount?: number;
+          keyLimit?: number;
+          partialApplied?: boolean;
+        } = JSON.parse(artifact.value as string);
+        const errorType =
+          typeof errorData?.errorType === 'string' ? errorData.errorType : undefined;
+        const providerCopy = memoryProviderFailureCopy(errorType);
+        const provider = memoryProviderLabel(errorData?.provider) ?? localize('com_ui_provider');
+        let message = localize('com_ui_memory_save_failed');
+        let isStorageFull = false;
+        const tokens = Number.isFinite(errorData?.tokenCount) ? errorData.tokenCount : 0;
+        if (providerCopy) {
+          message = localize(providerCopy, { provider });
+        } else if (errorType === 'already_exceeded' || errorType === 'would_exceed') {
+          isStorageFull = true;
+          message = localize(
+            errorType === 'already_exceeded'
+              ? 'com_ui_memory_already_exceeded'
+              : 'com_ui_memory_would_exceed',
+            { tokens },
+          );
+        } else if (errorType === 'key_limit_exceeded' || errorType === 'key_already_exceeded') {
+          const limit = errorData.keyLimit;
+          message =
+            typeof limit === 'number' && Number.isFinite(limit) && limit > 0
+              ? localize('com_ui_memory_item_too_large', { limit })
+              : localize('com_ui_memory_item_too_large_unknown_limit');
+        } else if (errorType === 'revision_conflict') {
+          message = localize('com_ui_memory_changed_before_save');
+        } else if (errorType === 'writer_interrupted') {
+          message = localize('com_ui_memory_save_interrupted');
         }
+        if (errorData?.partialApplied === true) {
+          message = `${message} ${localize('com_ui_memory_partial_save')}`;
+        }
+        return { isStorageFull, message };
       } catch {
         return {
           isStorageFull: false,
-          message: localize('com_ui_memory_error'),
+          message: localize('com_ui_memory_save_failed'),
         };
       }
     });
@@ -128,3 +141,5 @@ export default function MemoryInfo({ memoryArtifacts }: { memoryArtifacts: Memor
     </div>
   );
 }
+
+/* === VIVENTIUM END === */

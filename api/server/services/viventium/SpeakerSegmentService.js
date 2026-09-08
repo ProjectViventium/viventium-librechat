@@ -778,41 +778,43 @@ async function projectSpeakerSegmentRevisionsToMessages({ callSessionId, segment
     .select({ _id: 1, 'metadata.viventium.speakerSegments': 1 })
     .lean();
   let updated = 0;
-  for (const message of messages) {
-    const current = Array.isArray(message?.metadata?.viventium?.speakerSegments)
-      ? message.metadata.viventium.speakerSegments
-      : [];
-    let changed = false;
-    const projected = current.map((segment) => {
-      const revision = latestBySegmentId.get(segment?.segmentId);
-      if (!revision || Number(revision.revision || 0) <= Number(segment?.revision || 0)) {
-        return segment;
+  for (const initialMessage of messages) {
+    let message = initialMessage;
+    while (message) {
+      const current = Array.isArray(message?.metadata?.viventium?.speakerSegments)
+        ? message.metadata.viventium.speakerSegments
+        : [];
+      let changed = false;
+      const projected = current.map((segment) => {
+        const revision = latestBySegmentId.get(segment?.segmentId);
+        if (!revision || Number(revision.revision || 0) <= Number(segment?.revision || 0)) {
+          return segment;
+        }
+        changed = true;
+        return revision;
+      });
+      if (!changed) break;
+      const result = await Message.updateOne(
+        { _id: message._id, 'metadata.viventium.speakerSegments': current },
+        {
+          $set: {
+            'metadata.viventium.speakerSegments': projected,
+            'metadata.viventium.speakerLabel': legacySpeakerLabel(projected),
+          },
+          $unset: { 'metadata.viventium.memoryFinalization': '' },
+        },
+      );
+      if (Number(result?.matchedCount ?? result?.modifiedCount ?? result?.nModified ?? 0)) {
+        updated += Number(result?.modifiedCount || result?.nModified || 0);
+        break;
       }
-      changed = true;
-      return revision;
-    });
-    if (!changed) {
-      continue;
+      message = await Message.findOne({
+        _id: message._id,
+        'metadata.viventium.callSessionId': normalizedCallSessionId,
+      })
+        .select({ _id: 1, 'metadata.viventium.speakerSegments': 1 })
+        .lean();
     }
-    const revisionGuards = projected
-      .map((segment) => latestBySegmentId.get(segment?.segmentId))
-      .filter(Boolean)
-      .map((segment) => ({
-        'metadata.viventium.speakerSegments': {
-          $elemMatch: { segmentId: segment.segmentId, revision: { $lt: segment.revision } },
-        },
-      }));
-    const result = await Message.updateOne(
-      { _id: message._id, ...(revisionGuards.length ? { $or: revisionGuards } : {}) },
-      {
-        $set: {
-          'metadata.viventium.speakerSegments': projected,
-          'metadata.viventium.speakerLabel': legacySpeakerLabel(projected),
-        },
-        $unset: { 'metadata.viventium.memoryFinalization': '' },
-      },
-    );
-    updated += Number(result?.modifiedCount || result?.nModified || 0);
   }
   return { matched: messages.length, updated };
 }

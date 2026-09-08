@@ -13,6 +13,13 @@ if (configuredUploadsRoot && !path.isAbsolute(configuredUploadsRoot)) {
 const uploads = configuredUploadsRoot
   ? path.resolve(configuredUploadsRoot)
   : path.resolve(__dirname, '..', '..', 'uploads');
+const configuredImageOutputRoot = process.env.VIVENTIUM_LIBRECHAT_IMAGE_OUTPUT_ROOT;
+if (configuredImageOutputRoot && !path.isAbsolute(configuredImageOutputRoot)) {
+  throw new Error('VIVENTIUM_LIBRECHAT_IMAGE_OUTPUT_ROOT must be absolute');
+}
+const imageOutput = configuredImageOutputRoot
+  ? path.resolve(configuredImageOutputRoot)
+  : path.resolve(__dirname, '..', '..', 'client', 'public', 'images');
 /* === VIVENTIUM END === */
 
 module.exports = {
@@ -23,7 +30,7 @@ module.exports = {
   publicPath: path.resolve(__dirname, '..', '..', 'client', 'public'),
   fonts: path.resolve(__dirname, '..', '..', 'client', 'public', 'fonts'),
   assets: path.resolve(__dirname, '..', '..', 'client', 'public', 'assets'),
-  imageOutput: path.resolve(__dirname, '..', '..', 'client', 'public', 'images'),
+  imageOutput,
   structuredTools: path.resolve(__dirname, '..', 'app', 'clients', 'tools', 'structured'),
   pluginManifest: path.resolve(__dirname, '..', 'app', 'clients', 'tools', 'manifest.json'),
 };

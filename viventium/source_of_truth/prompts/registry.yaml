@@ -8,6 +8,23 @@ notes:
   - Upstream LibreChat/user-managed prompts remain view-only unless explicitly migrated.
 related_config:
   prompts:
+    worker.safety_checkpoint:
+      - worker.compiled_bootstrap
+      - worker.native_composition
+    worker.host_native_harness:
+      - worker.compiled_bootstrap
+      - worker.host_harness_composition
+    worker.completion_contract:
+      - worker.compiled_bootstrap
+      - worker.native_composition
+    worker.native_capability_inventory:
+      - worker.compiled_bootstrap
+      - worker.native_composition
+    feelings.capsule_policy:
+      - feelings.numeric_kernel
+      - feelings.owner_ranges
+    main.user_fact_guard:
+      - feelings.final_tail
     main.scheduling_self_continuity:
       - scheduling.direct_action_owner
       - scheduling.main_agent_tools
@@ -23,6 +40,42 @@ related_config:
       - scheduling.main_agent_tools
       - scheduling.mcp_server
   refs:
+    worker.host_harness_composition:
+      title: Host Worker Harness Frame
+      summary: The host file producer consumes the registered frame with current operating, capability, completion and safety text in the existing order.
+      path: viventium_v0_4/GlassHive/runtime_phase1/src/workers_projects_runtime/profile_runtime.py
+      selector: _host_harness_prompt
+      source: worker.compiled_prompt_contract
+    worker.compiled_bootstrap:
+      title: GlassHive Compiled Worker Instructions
+      summary: Managed Viventium loads the required compiled worker sources; standalone GlassHive retains its explicit compatibility defaults.
+      path: viventium_v0_4/GlassHive/runtime_phase1/src/workers_projects_runtime/bootstrap.py
+      selector: _worker_prompt
+      source: worker.compiled_prompt_contract
+    worker.native_composition:
+      title: Host And Sandbox Worker Composition
+      summary: Existing harness, project and run instruction producers consume the same resolved completion and capability text.
+      path: viventium_v0_4/GlassHive/runtime_phase1/src/workers_projects_runtime/profile_runtime.py
+      selector: _instruction_with_completion_contract
+      source: worker.compiled_prompt_contract
+    feelings.numeric_kernel:
+      title: Feeling State And Capsule Structure
+      summary: Nine bands retain numeric defaults, range selection, endpoint requirements and strongest eligible moderate pulls; compiled policy supplies their semantic text.
+      path: viventium_v0_4/LibreChat/packages/api/src/feelings/kernel.ts
+      selector: buildFeelingCapsule
+      source: feelings.kernel
+    feelings.owner_ranges:
+      title: Owner Feeling Range Additions
+      summary: Authenticated owner additions remain private state and follow the selected compiled default without changing numeric state.
+      path: viventium_v0_4/LibreChat/api/server/routes/viventium/feelings.js
+      selector: /bands/:bandId
+      source: feelings.owner_settings
+    feelings.final_tail:
+      title: Final Fact Guard And Pinned Feeling
+      summary: The compiled fact guard precedes one exact request-pinned capsule at the final instruction boundary.
+      path: viventium_v0_4/LibreChat/api/server/services/viventium/feelingPromptTail.js
+      selector: buildViventiumDynamicTail
+      source: feelings.final_instruction_layer
     scheduling.direct_action_owner:
       title: Scheduling Direct-Action Owner
       summary: Scheduling Cortex is the direct-action owner for reminders, follow-ups, wakeups, delayed checks, and schedule management.
@@ -48,7 +101,7 @@ related_config:
       title: Shared Scheduled Run Envelope
       summary: Registry-owned generic scheduler wrapper and deterministic factual run context contract.
       path: viventium_v0_4/shared/scheduler_prompt_contract.py
-      selector: SCHEDULER_RUN_ENVELOPE_TEMPLATE
+      selector: render_scheduler_run_envelope
       source: scheduler.shared_prompt_contract
     scheduler.shared_consciousness_continuity_opportunity:
       title: Consciousness Continuity Opportunity

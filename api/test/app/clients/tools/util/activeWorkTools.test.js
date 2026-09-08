@@ -1,9 +1,15 @@
+jest.mock('~/server/services/viventium/GlassHiveWorkResultService', () => ({
+  getGlassHiveWorkResult: (...args) => mockGetGlassHiveWorkResult(...args),
+}));
 const mockGetActiveWorkPage = jest.fn();
+const mockGetActiveWorkHistoryPage = jest.fn();
+const mockGetGlassHiveWorkResult = jest.fn();
 const mockGetActiveWorkSnapshot = jest.fn();
 const mockExecuteGlassHiveWorkAction = jest.fn();
 
 jest.mock('~/server/services/viventium/GlassHiveAccountService', () => ({
   getActiveWorkPage: (...args) => mockGetActiveWorkPage(...args),
+  getActiveWorkHistoryPage: (...args) => mockGetActiveWorkHistoryPage(...args),
   getActiveWorkSnapshot: (...args) => mockGetActiveWorkSnapshot(...args),
 }));
 

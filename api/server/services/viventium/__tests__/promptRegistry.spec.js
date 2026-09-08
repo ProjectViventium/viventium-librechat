@@ -6,10 +6,12 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 
 const {
   PROMPT_BUNDLE_ENV,
   getPromptBundleStatus,
+  getRequiredPromptText,
   getPromptText,
   resetPromptRegistryForTests,
 } = require('../promptRegistry');
@@ -163,5 +165,65 @@ describe('promptRegistry', () => {
     process.env[PROMPT_BUNDLE_ENV] = secondPath;
 
     expect(getPromptText('child', 'fallback')).toBe('Second');
+  });
+
+  test.each(['replace', 'overwrite'])(
+    'reloads a same-path %s and rollback without a process restart',
+    (mode) => {
+      const original = JSON.stringify({ prompt_count: 1, prompts: { child: { body: 'First' } } });
+      const replacement = JSON.stringify({
+        prompt_count: 1,
+        prompts: { child: { body: 'Other' } },
+      });
+      const bundlePath = writeBundle(JSON.parse(original));
+      const initialStat = fs.statSync(bundlePath);
+      expect(getRequiredPromptText('child')).toBe('First');
+      const publish = (bytes) => {
+        if (mode === 'replace') {
+          fs.writeFileSync(`${bundlePath}.next`, bytes);
+          fs.utimesSync(`${bundlePath}.next`, initialStat.atime, initialStat.mtime);
+          fs.renameSync(`${bundlePath}.next`, bundlePath);
+        } else {
+          fs.writeFileSync(bundlePath, bytes);
+          fs.utimesSync(bundlePath, initialStat.atime, initialStat.mtime);
+        }
+      };
+      publish(replacement);
+      expect(getRequiredPromptText('child')).toBe('Other');
+      expect(getPromptBundleStatus().sha256).toBe(
+        crypto.createHash('sha256').update(replacement).digest('hex'),
+      );
+      publish(original);
+      expect(getRequiredPromptText('child')).toBe('First');
+      expect(getPromptBundleStatus().sha256).toBe(
+        crypto.createHash('sha256').update(original).digest('hex'),
+      );
+    },
+  );
+
+  test('fails closed on a removed or corrupt current bundle and recovers after valid publication', () => {
+    const payload = { prompt_count: 1, prompts: { child: { body: 'Current' } } };
+    const bundlePath = writeBundle(payload);
+    expect(getRequiredPromptText('child')).toBe('Current');
+    fs.unlinkSync(bundlePath);
+    expect(() => getRequiredPromptText('child')).toThrow('prompt_bundle_unavailable');
+    expect(getPromptBundleStatus()).toMatchObject({ loaded: false, sha256: '' });
+    fs.writeFileSync(bundlePath, '{invalid');
+    expect(() => getRequiredPromptText('child')).toThrow('prompt_bundle_unavailable');
+    fs.writeFileSync(bundlePath, JSON.stringify(payload));
+    expect(getRequiredPromptText('child')).toBe('Current');
+  });
+
+  test('keeps parsed bundle bytes cached while the artifact identity is unchanged', () => {
+    const bundlePath = writeBundle({ prompt_count: 1, prompts: { child: { body: 'Current' } } });
+    const read = jest.spyOn(fs, 'readFileSync');
+    try {
+      expect(getRequiredPromptText('child')).toBe('Current');
+      expect(getRequiredPromptText('child')).toBe('Current');
+      expect(getPromptBundleStatus().loaded).toBe(true);
+      expect(read.mock.calls.filter(([file]) => file === bundlePath)).toHaveLength(1);
+    } finally {
+      read.mockRestore();
+    }
   });
 });

@@ -12,6 +12,7 @@ export * from './handlers';
 export * from './initialize';
 export * from './legacy';
 export * from './memory';
+export * from './nativeMemoryWriter';
 export * from './migration';
 export * from './interactionContext';
 export * from './noResponseTag';

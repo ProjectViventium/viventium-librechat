@@ -28,8 +28,10 @@ const {
   createMongooseVoiceClassifierFaultControlStore,
   createVoiceClassifierFaultControlManager,
   createVoiceEngagementAuthorityService,
+  createVoiceWorkAuthorityBinding,
   createVoiceEngagementClassifierService,
   matchesCanonicalVoiceOwnerUtterance,
+  normalizeVoiceTypedInput,
 } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { SystemRoles } = require('librechat-data-provider');
@@ -165,6 +167,7 @@ const {
   exactVoiceEngagementAuthority,
   finalizedOwnerSpeakerAuthority,
   latestPersistedVoiceTurnAuthority,
+  resolveVoiceTurnAuthority,
 } = voiceEngagementAuthority;
 
 let voiceClassifierFaultControlManager;
@@ -599,6 +602,13 @@ function combineVoiceSpeakerSegments(segments) {
   );
 }
 
+function sameVoiceSpeakerTrack(left, right) {
+  if (!left?.speaker || !right?.speaker) return false;
+  return ['participantIdentity', 'trackSid', 'key', 'actorTrust', 'attribution'].every(
+    (field) => left.speaker[field] === right.speaker[field],
+  );
+}
+
 function voiceTurnTextAlreadyCaptured(capturedText, incomingText) {
   const captured = normalizeVoiceTurnText(capturedText);
   const incoming = normalizeVoiceTurnText(incomingText);
@@ -611,7 +621,11 @@ function buildVoiceIngressKey({
   parentMessageId,
   mode,
   speakerSegmentId,
+  sourceEventId,
 }) {
+  if (mode === 'typed') {
+    return callSessionId && sourceEventId ? `typed:${callSessionId}:${sourceEventId}` : '';
+  }
   const normalizedMode = mode || 'normal';
   const normalizedSpeakerSegmentId = normalizeVoiceTurnText(speakerSegmentId).slice(0, 160);
   if (normalizedMode === 'listen_only') {
@@ -645,17 +659,29 @@ async function coalesceVoiceTurn({
   requestId,
   mode = 'normal',
   speakerSegments = [],
+  typedInput = null,
 }) {
-  const normalizedText = normalizeVoiceTurnText(text);
+  const normalizedText = typedInput ? text.trim() : normalizeVoiceTurnText(text);
+  const usesSpeakerSegments = mode === 'listen_only' && speakerSegments.length > 0;
+  const mergedTurnText = (segments) => {
+    if (typedInput) return normalizedText;
+    if (usesSpeakerSegments) {
+      return combineVoiceSpeakerSegments(segments)
+        .map((segment) => segment.text)
+        .join(' ');
+    }
+    return combineVoiceTurnSegments(segments) || normalizedText;
+  };
   const speakerSegmentId = Array.isArray(speakerSegments) ? speakerSegments[0]?.segmentId : '';
   const dedupeKey = buildVoiceIngressKey({
     callSessionId,
     conversationId,
     parentMessageId,
-    mode,
+    mode: typedInput ? 'typed' : mode,
     speakerSegmentId,
+    sourceEventId: typedInput?.sourceEventId,
   });
-  const coalesceWindowMs = resolveVoiceTurnCoalesceWindowMs(mode);
+  const coalesceWindowMs = typedInput ? 0 : resolveVoiceTurnCoalesceWindowMs(mode);
   if (!VOICE_TURN_COALESCE_ENABLED || !normalizedText || !dedupeKey) {
     return {
       shouldLaunch: true,
@@ -694,8 +720,7 @@ async function coalesceVoiceTurn({
       await sleep(coalesceWindowMs);
     }
     const doc = await findVoiceIngressEvent({ dedupeKey });
-    const mergedText =
-      combineVoiceTurnSegments(doc?.segments || [normalizedText]) || normalizedText;
+    const mergedText = mergedTurnText(doc?.segments || [normalizedText]);
     const mergedSpeakerSegments = combineVoiceSpeakerSegments(doc?.segments || [segment]);
     return {
       shouldLaunch: true,
@@ -747,11 +772,23 @@ async function coalesceVoiceTurn({
     if (doc.status === 'listen_only') {
       const savedAtMs = doc.savedAt ? new Date(doc.savedAt).getTime() : 0;
       const savedText = combineVoiceTurnSegments(doc.segments || []);
+      const savedSpeakerSegments = combineVoiceSpeakerSegments(doc.segments || []);
+      const sameSpeakerTrack =
+        !usesSpeakerSegments ||
+        (sameVoiceSpeakerTrack(savedSpeakerSegments.at(-1), speakerSegments[0]) &&
+          speakerSegments.every((segment) => sameVoiceSpeakerTrack(segment, speakerSegments[0])));
       const messageId = typeof doc.messageId === 'string' ? doc.messageId.trim() : '';
       if (
         savedAtMs &&
         Date.now() - savedAtMs <= VOICE_TURN_COALESCE_RETURN_WINDOW_MS &&
-        voiceTurnTextAlreadyCaptured(savedText, normalizedText)
+        (usesSpeakerSegments
+          ? speakerSegments.every((incoming) =>
+              savedSpeakerSegments.some(
+                (saved) =>
+                  saved.segmentId === incoming.segmentId && saved.revision >= incoming.revision,
+              ),
+            )
+          : voiceTurnTextAlreadyCaptured(savedText, normalizedText))
       ) {
         return {
           shouldLaunch: false,
@@ -766,7 +803,12 @@ async function coalesceVoiceTurn({
           coalesceWindowMs,
         };
       }
-      if (savedAtMs && messageId && Date.now() - savedAtMs <= VOICE_TURN_CONTINUATION_WINDOW_MS) {
+      if (
+        savedAtMs &&
+        messageId &&
+        sameSpeakerTrack &&
+        Date.now() - savedAtMs <= VOICE_TURN_CONTINUATION_WINDOW_MS
+      ) {
         const continuationDoc = await updateVoiceIngressEvent(
           { dedupeKey, status: 'listen_only', messageId },
           {
@@ -788,8 +830,7 @@ async function coalesceVoiceTurn({
             await sleep(coalesceWindowMs);
           }
           const latestDoc = await findVoiceIngressEvent({ dedupeKey });
-          const mergedText =
-            combineVoiceTurnSegments(latestDoc?.segments || [segment]) || normalizedText;
+          const mergedText = mergedTurnText(latestDoc?.segments || [segment]);
           const mergedSpeakerSegments = combineVoiceSpeakerSegments(
             latestDoc?.segments || [segment],
           );
@@ -825,8 +866,7 @@ async function coalesceVoiceTurn({
           await sleep(coalesceWindowMs);
         }
         const latestDoc = await findVoiceIngressEvent({ dedupeKey });
-        const mergedText =
-          combineVoiceTurnSegments(latestDoc?.segments || [segment]) || normalizedText;
+        const mergedText = mergedTurnText(latestDoc?.segments || [segment]);
         const mergedSpeakerSegments = combineVoiceSpeakerSegments(latestDoc?.segments || [segment]);
         return {
           shouldLaunch: true,
@@ -848,7 +888,7 @@ async function coalesceVoiceTurn({
   const latestDoc = dedupeKey ? await findVoiceIngressEvent({ dedupeKey }) : null;
   return {
     shouldLaunch: true,
-    mergedText: combineVoiceTurnSegments(latestDoc?.segments || [segment]) || normalizedText,
+    mergedText: mergedTurnText(latestDoc?.segments || [segment]),
     mergedSpeakerSegments: combineVoiceSpeakerSegments(latestDoc?.segments || [segment]),
     dedupeKey: '',
     coalesceWindowMs,
@@ -1234,7 +1274,9 @@ async function handleListenOnlyVoiceTurn({ req, res, session }) {
   }
   if (Array.isArray(coalescedTurn.mergedSpeakerSegments)) {
     req.body.speakerSegments = coalescedTurn.mergedSpeakerSegments;
-    req.body.speakerLabel = legacySpeakerLabel(coalescedTurn.mergedSpeakerSegments);
+    req.body.speakerLabel = req.viventiumVoiceTypedInput
+      ? 'You'
+      : legacySpeakerLabel(coalescedTurn.mergedSpeakerSegments);
   }
 
   logger.info(
@@ -1899,6 +1941,71 @@ router.post('/speaker-session-state', voiceAuth, async (req, res) => {
  * Purpose: Restore persisted call-scoped captions after refresh/reconnect without exposing audio
  * or another call session. The ledger is TTL-bounded and returns at most 512 latest segments.
  * === VIVENTIUM END === */
+/* === VIVENTIUM START ===
+ * Feature: Turn speaker authority for the Voice gateway.
+ * Purpose: The gateway reads the exact owner-scoped call mode and the persisted speaker segments of
+ * one turn before it trusts an owner-signed turn. Core already owned that authority (call session
+ * state plus persisted segment revisions) but exposed no route for it, so every lookup was a 404
+ * and the gateway fell back to "uncertain".
+ * === VIVENTIUM END === */
+router.get('/speaker-segments/authority/:turnId', voiceAuth, async (req, res) => {
+  const turnId = typeof req.params?.turnId === 'string' ? req.params.turnId.trim() : '';
+  if (!turnId || turnId.length > 160) {
+    return res
+      .status(400)
+      .json({ code: 'unknown', message: 'turnId is required.', retryable: false });
+  }
+  const session = await heartbeatCallSession({
+    callSessionId: req.viventiumCallSession?.callSessionId,
+    currentSession: req.viventiumCallSession,
+  });
+  if (!session?.callSessionId) {
+    return res.status(404).json({
+      code: 'auth_expired',
+      message: 'Call session not found.',
+      retryable: false,
+    });
+  }
+  const page = await listSpeakerSegments({
+    callSessionId: session.callSessionId,
+    limit: 512,
+    page: true,
+  });
+  const segments = (Array.isArray(page?.segments) ? page.segments : []).filter(
+    (segment) => segment && segment.turnId === turnId,
+  );
+  if (segments.length === 0) {
+    return res.status(404).json({
+      code: 'unknown',
+      message: 'No persisted speaker segments for this turn.',
+      retryable: true,
+    });
+  }
+  const revision = segments.reduce(
+    (highest, segment) => Math.max(highest, Number(segment.revision) || 0),
+    0,
+  );
+  return res.json({
+    version: 1,
+    callSessionId: session.callSessionId,
+    turnId,
+    mode:
+      session.mode ||
+      (session.listenOnlyModeEnabled === true
+        ? 'listen_only'
+        : session.wingModeEnabled === true
+          ? 'wing'
+          : 'call'),
+    status: session.status || 'created',
+    revision,
+    updatedAt: new Date(Number(session.updatedAt) || Date.now()).toISOString(),
+    speakerSegments: segments.slice(0, 32),
+    ...(session.speakerAttributionState
+      ? { speakerAttributionState: session.speakerAttributionState }
+      : {}),
+  });
+});
+
 router.get('/speaker-segments', voiceSessionCapabilityAuth, async (req, res) => {
   const callSessionId = typeof req.query?.callSessionId === 'string' ? req.query.callSessionId : '';
   if (!callSessionId || callSessionId !== req.viventiumCallSession?.callSessionId) {
@@ -2043,57 +2150,166 @@ router.post('/ambient-transcript', voiceAuth, async (req, res) => {
     const now = new Date();
     let parentMessageId = state.parentMessageId;
     const messageIds = [];
-    for (const segment of effectiveSegments) {
-      const messageId = `ambient-${crypto
-        .createHash('sha256')
-        .update(`${session.callSessionId}:${segment.segmentId}`)
-        .digest('hex')
-        .slice(0, 32)}`;
-      const existingMessage = await Message.findOne({ user: req.user.id, messageId })
-        .select({ _id: 1, messageId: 1, parentMessageId: 1 })
+    let transcriptGroups = effectiveSegments.map((segment) => ({ segments: [segment] }));
+    if (isListenOnlyOwner) {
+      const savedRows = await Message.find({
+        user: req.user.id,
+        'metadata.viventium.callSessionId': session.callSessionId,
+        'metadata.viventium.type': 'listen_only_transcript',
+        'metadata.viventium.speakerSegments.segmentId': {
+          $in: effectiveSegments.map((segment) => segment.segmentId),
+        },
+      })
+        .select({ messageId: 1, metadata: 1 })
         .lean();
-      const message = await Message.findOneAndUpdate(
-        { user: req.user.id, messageId },
-        {
-          $set: {
-            endpoint: 'agents',
-            sender: segment.speaker.label || 'Participant',
-            text: segment.text,
-            _meiliIndex: false,
-            memoryEligible: 'soft',
-            isCreatedByUser: false,
-            tokenCount: 0,
-            unfinished: !segment.isFinal,
-            error: false,
-            metadata: {
-              viventium: {
-                type: isListenOnlyOwner ? 'listen_only_transcript' : 'voice_ambient_transcript',
-                source: 'voice_call',
-                mode: authoritativeMode,
-                ingressKind: incoming.ingressKind,
-                ambientKind: isListenOnlyOwner
-                  ? 'listen_only_owner_track'
-                  : 'authenticated_participant_track',
-                callSessionId: session.callSessionId,
-                turnId: segment.turnId,
-                speakerLabel: segment.speaker.label || 'Unknown',
-                speakerSegments: [segment],
-                actorTrust: segment.speaker.actorTrust,
-                memoryEligible: 'soft',
-              },
-            },
-            updatedAt: now,
-          },
-          $setOnInsert: {
+      const rowBySegment = new Map();
+      for (const row of savedRows) {
+        for (const segment of row.metadata?.viventium?.speakerSegments || []) {
+          rowBySegment.set(segment.segmentId, row);
+        }
+      }
+      const revisionsByMessage = new Map();
+      const newSegments = [];
+      for (const segment of effectiveSegments) {
+        const row = rowBySegment.get(segment.segmentId);
+        if (!row) {
+          newSegments.push(segment);
+          continue;
+        }
+        if (!messageIds.includes(row.messageId)) messageIds.push(row.messageId);
+        const saved = row.metadata.viventium.speakerSegments;
+        const previous = saved.find((item) => item.segmentId === segment.segmentId);
+        if (previous.revision >= segment.revision) continue;
+        const revisions = revisionsByMessage.get(row.messageId) || saved;
+        revisionsByMessage.set(
+          row.messageId,
+          combineVoiceSpeakerSegments([
+            { speakerSegments: revisions },
+            { speakerSegments: [segment] },
+          ]),
+        );
+      }
+      transcriptGroups = [...revisionsByMessage].map(([messageId, segments]) => ({
+        messageId,
+        segments,
+      }));
+      for (const segment of newSegments) {
+        const previous = transcriptGroups.at(-1);
+        if (
+          previous?.newOwnerSegments &&
+          previous.segments[0].turnId === segment.turnId &&
+          sameVoiceSpeakerTrack(previous.segments[0], segment)
+        ) {
+          previous.segments.push(segment);
+        } else {
+          transcriptGroups.push({ segments: [segment], newOwnerSegments: true });
+        }
+      }
+    }
+    for (const group of transcriptGroups) {
+      let coalescedOwnerTurn;
+      if (group.newOwnerSegments) {
+        coalescedOwnerTurn = await coalesceVoiceTurn({
+          callSessionId: session.callSessionId,
+          userId: req.user.id,
+          conversationId,
+          parentMessageId,
+          text: group.segments.map((segment) => segment.text).join(' '),
+          receivedAtMs: req.viventiumVoiceIngressReceivedAtMs,
+          requestId:
+            req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || crypto.randomUUID(),
+          mode: 'listen_only',
+          speakerSegments: group.segments,
+        });
+        if (!coalescedOwnerTurn.shouldLaunch) {
+          if (coalescedOwnerTurn.payload?.messageId)
+            messageIds.push(coalescedOwnerTurn.payload.messageId);
+          continue;
+        }
+        group.messageId = coalescedOwnerTurn.continuationMessageId;
+        group.segments = coalescedOwnerTurn.mergedSpeakerSegments;
+      }
+      const segment = group.segments[0];
+      const messageId =
+        group.messageId ||
+        `ambient-${crypto
+          .createHash('sha256')
+          .update(`${session.callSessionId}:${segment.segmentId}`)
+          .digest('hex')
+          .slice(0, 32)}`;
+      let existingMessage;
+      let message;
+      while (!message) {
+        existingMessage = await Message.findOne({ user: req.user.id, messageId })
+          .select({ _id: 1, messageId: 1, parentMessageId: 1, metadata: 1 })
+          .lean();
+        const transcriptSegments = isListenOnlyOwner
+          ? combineVoiceSpeakerSegments([
+              { speakerSegments: existingMessage?.metadata?.viventium?.speakerSegments || [] },
+              { speakerSegments: group.segments },
+            ])
+          : group.segments;
+        const speakerLabel = isListenOnlyOwner
+          ? legacySpeakerLabel(transcriptSegments)
+          : segment.speaker.label;
+        const actorTrust = transcriptSegments.every(
+          (item) => item.speaker.actorTrust === segment.speaker.actorTrust,
+        )
+          ? segment.speaker.actorTrust
+          : 'unknown';
+        message = await Message.findOneAndUpdate(
+          {
             user: req.user.id,
             messageId,
-            conversationId,
-            parentMessageId,
-            createdAt: now,
+            ...(existingMessage
+              ? {
+                  _id: existingMessage._id,
+                  'metadata.viventium.speakerSegments': existingMessage.metadata?.viventium
+                    ?.speakerSegments ?? { $exists: false },
+                }
+              : {}),
           },
-        },
-        { upsert: true, new: true, timestamps: false, overwriteImmutable: true },
-      );
+          {
+            $set: {
+              endpoint: 'agents',
+              sender: speakerLabel || 'Unknown',
+              text: transcriptSegments.map((item) => item.text).join(' '),
+              _meiliIndex: false,
+              memoryEligible: 'soft',
+              isCreatedByUser: false,
+              tokenCount: 0,
+              unfinished: transcriptSegments.some((item) => !item.isFinal),
+              error: false,
+              metadata: {
+                viventium: {
+                  type: isListenOnlyOwner ? 'listen_only_transcript' : 'voice_ambient_transcript',
+                  source: 'voice_call',
+                  mode: authoritativeMode,
+                  ingressKind: incoming.ingressKind,
+                  ambientKind: isListenOnlyOwner
+                    ? 'listen_only_owner_track'
+                    : 'authenticated_participant_track',
+                  callSessionId: session.callSessionId,
+                  turnId: segment.turnId,
+                  speakerLabel: speakerLabel || 'Unknown',
+                  speakerSegments: transcriptSegments,
+                  actorTrust,
+                  memoryEligible: 'soft',
+                },
+              },
+              updatedAt: now,
+            },
+            $setOnInsert: {
+              user: req.user.id,
+              messageId,
+              conversationId,
+              parentMessageId,
+              createdAt: now,
+            },
+          },
+          { upsert: !existingMessage, new: true, timestamps: false, overwriteImmutable: true },
+        );
+      }
       await Conversation.findOneAndUpdate(
         { user: req.user.id, conversationId },
         {
@@ -2113,7 +2329,23 @@ router.post('/ambient-transcript', voiceAuth, async (req, res) => {
       if (!existingMessage) {
         parentMessageId = messageId;
       }
-      messageIds.push(messageId);
+      if (!messageIds.includes(messageId)) messageIds.push(messageId);
+      if (group.newOwnerSegments && coalescedOwnerTurn?.dedupeKey) {
+        await updateVoiceIngressEvent(
+          { dedupeKey: coalescedOwnerTurn.dedupeKey },
+          {
+            $set: {
+              status: 'listen_only',
+              saved: true,
+              messageId,
+              conversationId,
+              savedAt: new Date(),
+              expiresAt: new Date(Date.now() + VOICE_TURN_COALESCE_TTL_S * 1000),
+            },
+          },
+          { new: true },
+        );
+      }
     }
 
     return res.json({
@@ -2151,6 +2383,31 @@ router.post(
     const text = typeof incoming.text === 'string' ? incoming.text : '';
     const speakInsights = incoming.speakInsights === true;
     const systemPrompt = typeof incoming.systemPrompt === 'string' ? incoming.systemPrompt : '';
+    const sourceEventId =
+      (typeof incoming.sourceEventId === 'string' && incoming.sourceEventId) ||
+      (typeof incoming.source_event_id === 'string' && incoming.source_event_id) ||
+      req.viventiumVoiceRequestId ||
+      req.get('X-VIVENTIUM-REQUEST-ID') ||
+      crypto.randomUUID();
+    const typedInput = normalizeVoiceTypedInput(incoming.typedInput, {
+      session,
+      sourceEventId,
+      text,
+      segments: [
+        ...(Array.isArray(incoming.speakerSegments) ? incoming.speakerSegments : []),
+        ...(Array.isArray(incoming.speakerSegmentRevisions)
+          ? incoming.speakerSegmentRevisions
+          : []),
+      ],
+    });
+    if (incoming.typedInput !== undefined && !typedInput) {
+      return _res.status(403).json({
+        code: 'voice_typed_input_invalid',
+        message: 'This typed call input could not be verified.',
+        retryable: false,
+      });
+    }
+    req.viventiumVoiceTypedInput = typedInput;
     /* === VIVENTIUM START ===
      * Feature: SpeakerSegmentV1 persistence and authority
      * Purpose: Store current segments and late revisions before any coalescing or agent execution.
@@ -2202,19 +2459,15 @@ router.post(
       .map((segment) => latestEffectiveSegments.get(segment.segmentId))
       .filter(Boolean);
     const speakerAuthorityComplete = authoritativeSegments.length === currentSegments.length;
-    const authority = voiceTurnAuthority(speakerAuthorityComplete ? authoritativeSegments : [], {
-      speakerAttributionState: session?.speakerAttributionState,
-      sharedTrackSids: session?.sharedTrackSids,
-      sharedParticipantIdentities: session?.sharedParticipantIdentities,
+    const authority = resolveVoiceTurnAuthority({
+      session,
+      segments: speakerAuthorityComplete ? authoritativeSegments : [],
+      typedInput,
+      sourceEventId,
+      text,
+      engagement: incoming.voiceEngagement,
     });
-    const finalizedOwnerAuthority =
-      speakerAuthorityComplete && finalizedOwnerSpeakerAuthority(authoritativeSegments, session);
-    const directWingEngagement =
-      callMode === 'wing' &&
-      speakerAuthorityComplete &&
-      exactVoiceEngagementAuthority(incoming.voiceEngagement, session, authoritativeSegments, text);
-    const canAuthorizeSideEffects =
-      finalizedOwnerAuthority && (callMode !== 'wing' || directWingEngagement);
+    const { directWingEngagement, canAuthorizeSideEffects } = authority;
     logVoiceRouteStage(
       req,
       'voice_chat_session_ready',
@@ -2239,12 +2492,6 @@ router.post(
     });
     const conversationId = conversationState.conversationId;
     let parentMessageId = conversationState.parentMessageId;
-    const sourceEventId =
-      (typeof incoming.sourceEventId === 'string' && incoming.sourceEventId) ||
-      (typeof incoming.source_event_id === 'string' && incoming.source_event_id) ||
-      req.viventiumVoiceRequestId ||
-      req.get('X-VIVENTIUM-REQUEST-ID') ||
-      crypto.randomUUID();
     setTrustedInteractionContext(
       req,
       createVoiceInteractionContext({
@@ -2312,6 +2559,7 @@ router.post(
       adapterCapabilities: _untrustedAdapterCapabilities,
       adapter_capabilities: _untrustedAdapterCapabilitiesSnake,
       voiceEngagement: _untrustedVoiceEngagement,
+      typedInput: _untrustedTypedInput,
       ...safeIncoming
     } = incoming;
     req.body = {
@@ -2327,7 +2575,9 @@ router.post(
       speakerLabel:
         authoritativeSegments.length > 0
           ? legacySpeakerLabel(authoritativeSegments)
-          : incoming.speakerLabel,
+          : typedInput
+            ? 'You'
+            : incoming.speakerLabel,
       viventiumCallSessionId: session.callSessionId,
       viventiumDeferVoiceMemory: true,
       viventiumActorTrust: authority.actorTrust,
@@ -2397,6 +2647,7 @@ router.post(
         req.viventiumVoiceRequestId || req.get('X-VIVENTIUM-REQUEST-ID') || crypto.randomUUID(),
       mode: 'normal',
       speakerSegments: req.body?.speakerSegments,
+      typedInput: req.viventiumVoiceTypedInput,
     });
     logVoiceRouteStage(
       req,
@@ -2438,22 +2689,19 @@ router.post(
     }
     if (Array.isArray(coalescedTurn.mergedSpeakerSegments)) {
       req.body.speakerSegments = coalescedTurn.mergedSpeakerSegments;
-      req.body.speakerLabel = legacySpeakerLabel(coalescedTurn.mergedSpeakerSegments);
-      const mergedAuthority = voiceTurnAuthority(coalescedTurn.mergedSpeakerSegments, {
-        speakerAttributionState: session?.speakerAttributionState,
-        sharedTrackSids: session?.sharedTrackSids,
-        sharedParticipantIdentities: session?.sharedParticipantIdentities,
+      req.body.speakerLabel = req.viventiumVoiceTypedInput
+        ? 'You'
+        : legacySpeakerLabel(coalescedTurn.mergedSpeakerSegments);
+      const mergedAuthority = resolveVoiceTurnAuthority({
+        session,
+        segments: coalescedTurn.mergedSpeakerSegments,
+        typedInput: req.viventiumVoiceTypedInput,
+        sourceEventId: getTrustedInteractionContext(req)?.source_event_id,
+        text: req.body.text,
+        engagement: req.body.voiceEngagement,
       });
       req.body.viventiumActorTrust = mergedAuthority.actorTrust;
-      req.body.viventiumCanAuthorizeSideEffects =
-        finalizedOwnerSpeakerAuthority(coalescedTurn.mergedSpeakerSegments, session) &&
-        (canonicalVoiceSessionMode(session) !== 'wing' ||
-          exactVoiceEngagementAuthority(
-            req.body.voiceEngagement,
-            session,
-            coalescedTurn.mergedSpeakerSegments,
-            req.body.text,
-          ));
+      req.body.viventiumCanAuthorizeSideEffects = mergedAuthority.canAuthorizeSideEffects;
     }
 
     const denyIfVoiceActionAuthorityChanged = async () => {
@@ -2494,22 +2742,17 @@ router.post(
         req.body.speakerSegments = current.segments;
         req.body.speakerLabel = legacySpeakerLabel(current.segments);
       }
-      const authority = voiceTurnAuthority(current.segments, {
-        speakerAttributionState: session?.speakerAttributionState,
-        sharedTrackSids: session?.sharedTrackSids,
-        sharedParticipantIdentities: session?.sharedParticipantIdentities,
+      const authority = resolveVoiceTurnAuthority({
+        session,
+        segments: current.segments,
+        typedInput: req.viventiumVoiceTypedInput,
+        sourceEventId: getTrustedInteractionContext(req)?.source_event_id,
+        text: req.body.text,
+        engagement: req.body.voiceEngagement,
       });
       req.body.viventiumActorTrust = authority.actorTrust;
       req.body.viventiumCanAuthorizeSideEffects =
-        current.complete &&
-        finalizedOwnerSpeakerAuthority(current.segments, session) &&
-        (currentMode !== 'wing' ||
-          exactVoiceEngagementAuthority(
-            req.body.voiceEngagement,
-            session,
-            current.segments,
-            req.body.text,
-          ));
+        current.complete && authority.canAuthorizeSideEffects;
 
       if (currentMode === 'listen_only') {
         req.body.viventiumCanAuthorizeSideEffects = false;
@@ -2590,6 +2833,18 @@ router.post(
       }
     }
 
+    /* === VIVENTIUM START === Freeze trusted authority for late work dispatch. === */
+    req.viventiumVoiceWorkAuthority =
+      req.body.viventiumCanAuthorizeSideEffects === true
+        ? createVoiceWorkAuthorityBinding({
+            session,
+            segments: req.body.speakerSegments,
+            typedInput: req.viventiumVoiceTypedInput,
+            engagement: req.body.voiceEngagement,
+          })
+        : null;
+    /* === VIVENTIUM END === */
+
     logger.info(
       `[VIVENTIUM][voice/chat] user_turn_completed source=route callSessionId=${session?.callSessionId || 'unknown'} ` +
         `conversationId=${req.body?.conversationId || 'unknown'} parentMessageId=${req.body?.parentMessageId || 'none'} ` +
@@ -2617,7 +2872,11 @@ router.post(
     res.json = (payload) => {
       try {
         if (typeof payload?.streamId === 'string' && payload.streamId) {
-          bindVoiceTaskStream(voiceTask.taskId, payload.streamId);
+          bindVoiceTaskStream(voiceTask.taskId, payload.streamId, {
+            callSessionId: session?.callSessionId,
+            userId: req.user?.id,
+            conversationId: payload.conversationId,
+          });
         }
         const convoId = payload?.conversationId;
         const shouldUpdateSessionConversationId =
@@ -3247,7 +3506,7 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
     (event) => {
       enqueueOutput(async () => {
         const suppressed = await outputIsSuppressed();
-        if (voiceTask && !suppressed) {
+        if (voiceTask && !suppressed && event?.superseded !== true) {
           completeVoiceTask(voiceTask.taskId, {
             resultMessageId: event?.responseMessage?.messageId,
           });

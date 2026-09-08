@@ -1,5 +1,9 @@
+import type { NativeAcceptedSource, NativePredecessor } from '../../glasshive/nativeSupersession';
+import type { NativeResponseIdentity, NativeResponseCommit } from '@librechat/data-schemas';
 import type { Agents } from 'librechat-data-provider';
+import type { InteractionSourceSegment } from '../../glasshive/interactionSourceSegments';
 import type { StandardGraph } from '@librechat/agents';
+import type { ReadyInputContinuation } from '../../agents/interactionContext';
 
 /**
  * Job status enum
@@ -17,8 +21,14 @@ export interface InteractionContext {
   source_event_id: string;
   /** Trusted monotonic source order; never inferred from an opaque event ID. */
   source_sequence?: number;
+  source_conversation_generation?: string;
+  ready_input_continuation?: ReadyInputContinuation;
   /** Opaque SHA-256 scope for the authenticated owner and source conversation. */
   source_order_scope?: string;
+  source_segments?: readonly InteractionSourceSegment[];
+  source_segments_overflow_count?: number;
+  schedule_id?: string;
+  schedule_run_id?: string;
 }
 
 export interface InteractionAdapterCapabilities {
@@ -51,7 +61,7 @@ export interface SourceOrderObservationResult {
 }
 
 export interface LogicalTurnClaim {
-  status: 'claimed' | 'duplicate';
+  status: 'claimed' | 'duplicate' | 'superseded' | 'initializing' | 'busy';
   streamId: string;
   interactionContext: InteractionContext;
   supersededStreamIds: string[];
@@ -65,7 +75,11 @@ export interface InteractionDeliveryAck {
   revision: number;
   state: DeliveryAcknowledgementState;
   presentation_ref?: string;
+  presentation_refs?: string[];
   presentation_committed_at?: number;
+  source_kind?: 'assistant_message' | 'schedule_result' | 'callback';
+  schedule_id?: string;
+  schedule_run_id?: string;
 }
 
 export interface CortexPresentationBinding {
@@ -96,6 +110,7 @@ export interface DeliveryAcknowledgementResult {
     | 'retryable_conflict';
   acknowledgement?: InteractionDeliveryAck;
   idempotent?: boolean;
+  transportOnly?: boolean;
   /** Internal server-held owner; never accepted from or exposed as client authority. */
   ownerStreamId?: string;
   /** Internal persistence target derived from the owner job, never from adapter claims. */
@@ -166,6 +181,13 @@ export interface SerializableJobData {
   deliveryAcknowledgement?: InteractionDeliveryAck;
   cortexDeliveryAcknowledgement?: InteractionDeliveryAck;
   cortexDeliveryAcknowledgementPresentation?: CortexPresentationBinding;
+  /** VIVENTIUM: immutable native admission; only the publication owner may change it. */
+  nativeResponse?: NativeResponseIdentity;
+  nativePredecessor?: NativePredecessor;
+  nativeAcceptedSources?: { invocationId: string; sources: NativeAcceptedSource[] };
+  nativeResponseCancelled?: boolean;
+  nativeResponseFinished?: boolean;
+  nativeResponseSettled?: boolean;
   generationCompleted?: boolean;
   clientPresentation?: ClientPresentation;
   cortexPresentation?: CortexPresentationBinding;
@@ -224,6 +246,7 @@ export interface UsageMetadata {
  * for token spending and message saving without storing callbacks
  */
 export interface AbortResult {
+  nativeResponse?: 'committed' | 'pending' | 'unavailable';
   /** Whether the abort was successful */
   success: boolean;
   /** The job data at time of abort */
@@ -277,6 +300,9 @@ export interface IJobStore {
   /** Advance or read the trusted source watermark before presentation. */
   observeSourceOrder?(observation: SourceOrderObservation): Promise<SourceOrderObservationResult>;
 
+  /** Retain authenticated input in the existing logical-turn owner before asynchronous setup. */
+  retainLogicalTurnInput(userId: string, context: InteractionContext): Promise<InteractionContext>;
+
   /** Atomically claim a revision, or return the first stream for a duplicate source event. */
   claimLogicalTurn(
     streamId: string,
@@ -297,7 +323,7 @@ export interface IJobStore {
   ): Promise<boolean>;
 
   /** Release the active revision only when the supplied stream still owns it. */
-  completeLogicalTurn(streamId: string): Promise<void>;
+  completeLogicalTurn(streamId: string, expected?: NativeResponseIdentity): Promise<void>;
 
   /** Whether this stream is still the latest revision of its logical turn. */
   isCurrentLogicalTurn(streamId: string): Promise<boolean>;
@@ -318,14 +344,39 @@ export interface IJobStore {
     expectedCortexPresentation: CortexPresentationBinding | null,
   ): Promise<DeliveryAcknowledgementBindingResult>;
 
+  /** VIVENTIUM: saved native result publication, independent of transport acknowledgement. */
+  bindNativeResponse(identity: NativeResponseIdentity): Promise<boolean>;
+  commitNativeResponse(
+    identity: NativeResponseIdentity,
+    candidateSha256: string,
+  ): Promise<NativeResponseCommit>;
+  settleNativeResponse(
+    identity: NativeResponseIdentity,
+    mode?: 'unsupported' | 'cancelled',
+  ): Promise<boolean>;
+  getNativeResponseCommit(identity: NativeResponseIdentity): Promise<NativeResponseCommit>;
+  revokeNativeResponse(identity: NativeResponseIdentity): Promise<NativeResponseCommit>;
+  cancelNativeResponse(job: SerializableJobData): Promise<NativeResponseCommit>;
+  finishNativeResponse(
+    identity: NativeResponseIdentity,
+    candidateSha256: string,
+    finalEvent: string,
+    mode?: 'cancelled',
+  ): Promise<boolean>;
+
   /** Get a job by streamId (streamId === conversationId) */
   getJob(streamId: string): Promise<SerializableJobData | null>;
 
   /** Update job data */
-  updateJob(streamId: string, updates: Partial<SerializableJobData>): Promise<void>;
+  /** Optional identity fences updates against reuse of a native stream job. */
+  updateJob(
+    streamId: string,
+    updates: Partial<SerializableJobData>,
+    expectedNativeIdentity?: NativeResponseIdentity,
+  ): Promise<void>;
 
   /** Delete a job */
-  deleteJob(streamId: string): Promise<void>;
+  deleteJob(streamId: string, retiredNativeResponse?: NativeResponseIdentity): Promise<void>;
 
   /** Check if job exists */
   hasJob(streamId: string): Promise<boolean>;
@@ -464,7 +515,7 @@ export interface IEventTransport {
     streamId: string,
     handlers: {
       onChunk: (event: unknown) => void;
-      onDone?: (event: unknown) => void;
+      onDone?: (event: unknown, nativeJobProof?: string) => void;
       onError?: (error: string) => void;
     },
   ): { unsubscribe: () => void; ready?: Promise<void> };
@@ -477,7 +528,11 @@ export interface IEventTransport {
   ): EventTransportPublishReceipt | void | Promise<EventTransportPublishReceipt | void>;
 
   /** Publish a done event - returns Promise in Redis mode for ordered delivery */
-  emitDone(streamId: string, event: unknown): void | Promise<void>;
+  emitDone(
+    streamId: string,
+    event: unknown,
+    nativeReplay?: NativeResponseReplayGuard,
+  ): void | boolean | Promise<void | boolean>;
 
   /** Publish an error event - returns Promise in Redis mode for ordered delivery */
   emitError(streamId: string, error: string): void | Promise<void>;
@@ -488,14 +543,21 @@ export interface IEventTransport {
    * generating Replica A receives signal and stops.
    * Optional - only implemented in Redis transport.
    */
-  emitAbort?(streamId: string, reason?: string): void | Promise<void>;
+  emitAbort?(
+    streamId: string,
+    reason?: string,
+    nativeReplay?: NativeResponseReplayGuard,
+  ): void | boolean | Promise<void | boolean>;
 
   /**
    * Register callback for abort signals from any replica (Redis mode).
    * Called when abort is triggered from any replica.
    * Optional - only implemented in Redis transport.
    */
-  onAbort?(streamId: string, callback: (reason?: string) => void): void | Promise<void>;
+  onAbort?(
+    streamId: string,
+    callback: (reason?: string, nativeJobProof?: string) => void,
+  ): void | Promise<void>;
 
   /** Get subscriber count for a stream */
   getSubscriberCount(streamId: string): number;
@@ -529,6 +591,16 @@ export interface IEventTransport {
 export interface EventTransportEmitOptions {
   requirePresentationAcknowledgement?: boolean;
   presentationAcknowledgementTimeoutMs?: number;
+}
+
+/** Native replay is authorized by the exact retained job at the actual publish boundary. */
+export interface NativeResponseReplayGuard {
+  identity: NativeResponseIdentity;
+  isCurrent: () => boolean;
+  /** Stop uses the same retained replay owner, with explicit cancelled state. */
+  cancelled?: boolean;
+  /** Required for ABORT, whose wire event does not itself contain FINAL. */
+  finalEvent?: string;
 }
 
 export interface EventTransportPublishReceipt {

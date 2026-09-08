@@ -84,4 +84,25 @@ describe('preserveTransientCortexState', () => {
 
     expect(result).toBe(responseMessage);
   });
+
+  it('carries an admitted memory write to the final response without inventing a result', () => {
+    const responseMessage = { messageId: 'answer', text: 'Your reply' } as TMessage;
+    const result = preserveTransientCortexState({ responseMessage, memoryWriterScheduled: true });
+    expect(result).toEqual({ ...responseMessage, memoryWriteStatus: 'pending' });
+    expect(responseMessage).not.toHaveProperty('memoryWriteStatus');
+  });
+
+  it.each(['completed', 'failed'] as const)(
+    'retains the server memory state %s',
+    (memoryWriteStatus) => {
+      const responseMessage = {
+        messageId: 'answer',
+        text: 'Your reply',
+        memoryWriteStatus,
+      } as TMessage;
+      expect(preserveTransientCortexState({ responseMessage, memoryWriterScheduled: true })).toBe(
+        responseMessage,
+      );
+    },
+  );
 });

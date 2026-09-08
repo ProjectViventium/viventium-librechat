@@ -4,6 +4,7 @@
  * - Strip leaked `{NTA}` tags when a follow-up also contains real content.
  * - Remove LibreChat citation artifacts before persistence so web + Telegram
  *   follow-up text stays clean and surface-parity remains intact.
+ * - Preserve model-selected wording, Markdown, code spacing, and ordinary source references.
  * Added: 2026-03-08
  * === VIVENTIUM END === */
 
@@ -11,10 +12,10 @@ const { isNoResponseOnly } = require('~/server/services/viventium/noResponseTag'
 
 const LEADING_NTA_RE = /^\s*\{\s*NTA\s*\}\s*/i;
 const TRAILING_NTA_RE = /\s*\{\s*NTA\s*\}\s*$/i;
-const CITATION_COMPOSITE_RE = /(?:\\ue200|ue200|\ue200).*?(?:\\ue201|ue201|\ue201)/gi;
-const CITATION_STANDALONE_RE = /(?:\\ue202|ue202|\ue202)turn\d+[A-Za-z]+\d+/gi;
-const CITATION_CLEANUP_RE = /(?:\\ue2(?:00|01|02|03|04|06)|ue2(?:00|01|02|03|04|06)|[\ue200-\ue206])/gi;
-const BRACKET_CITATION_RE = /\[(\d{1,3})\](?=\s|$)/g;
+const CITATION_COMPOSITE_RE = /(?:\\ue200|ue200|\ue200).*?(?:\\ue201|ue201|\ue201)[ \t]?/gi;
+const CITATION_STANDALONE_RE = /(?:\\ue202|ue202|\ue202)turn\d+[A-Za-z]+\d+[ \t]?/gi;
+const CITATION_CLEANUP_RE =
+  /(?:\\ue2(?:00|01|02|03|04|06)|ue2(?:00|01|02|03|04|06)|[\ue200-\ue206])[ \t]?/gi;
 const LEADING_THINKING_MODE_REASONING_RE =
   /^\s*<thinking_mode\b[^>]*>[\s\S]*?<\/thinking_mode>\s*[\s\S]*?<\/thinking>\s*/i;
 const LEADING_THINKING_MODE_RE = /^\s*<thinking_mode\b[^>]*>[\s\S]*?<\/thinking_mode>\s*/i;
@@ -24,6 +25,21 @@ const LEADING_REASONING_BLOCK_RES = [
   /^\s*:::thinking\s*[\r\n]*[\s\S]*?:::\s*/i,
 ];
 const TOOL_TRANSCRIPT_LINE_RE = /^\s*Tool:\s+.*_mcp_[A-Za-z0-9_.-]+.*(?:\r?\n|$)/gim;
+const GLASSHIVE_LINK_REF_URL_RE =
+  /https?:\/\/[^/\s)`'"<>]+\/v1\/link-refs\/(ghr_[A-Za-z0-9_-]{12,96})/gi;
+
+function canonicalizeGlassHiveArtifactLinkRefs(text) {
+  const configuredBaseUrl = String(process.env.GLASSHIVE_ARTIFACT_BASE_URL || '')
+    .trim()
+    .replace(/\/+$/, '');
+  if (!/^https?:\/\/[^/\s]+$/i.test(configuredBaseUrl)) {
+    return text;
+  }
+  return text.replace(
+    GLASSHIVE_LINK_REF_URL_RE,
+    (_match, refId) => `${configuredBaseUrl}/v1/link-refs/${refId}`,
+  );
+}
 
 function stripCitationArtifacts(text) {
   if (typeof text !== 'string' || text.length === 0) {
@@ -31,11 +47,9 @@ function stripCitationArtifacts(text) {
   }
 
   return text
-    .replace(CITATION_COMPOSITE_RE, ' ')
-    .replace(CITATION_STANDALONE_RE, ' ')
-    .replace(CITATION_CLEANUP_RE, ' ')
-    .replace(BRACKET_CITATION_RE, ' ')
-    .replace(/[ \t]{2,}/g, ' ')
+    .replace(CITATION_COMPOSITE_RE, '')
+    .replace(CITATION_STANDALONE_RE, '')
+    .replace(CITATION_CLEANUP_RE, '')
     .trim();
 }
 
@@ -103,10 +117,11 @@ function sanitizeFollowUpDisplayText(text) {
   const withoutNoResponseLeak = text.replace(LEADING_NTA_RE, '').replace(TRAILING_NTA_RE, '');
   const withoutReasoningLeak = stripLeadingReasoningArtifacts(withoutNoResponseLeak);
   const withoutToolTranscript = stripToolTranscriptArtifacts(withoutReasoningLeak);
-  return stripCitationArtifacts(withoutToolTranscript);
+  return canonicalizeGlassHiveArtifactLinkRefs(stripCitationArtifacts(withoutToolTranscript));
 }
 
 module.exports = {
+  canonicalizeGlassHiveArtifactLinkRefs,
   stripLeadingReasoningArtifacts,
   stripToolTranscriptArtifacts,
   stripCitationArtifacts,

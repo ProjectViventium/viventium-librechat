@@ -81,6 +81,15 @@ describe('memories write routes', () => {
     });
   });
 
+  test('GET exposes the configured valid keys needed by the Memories panel', async () => {
+    mockGetAllUserMemories.mockResolvedValueOnce([]);
+
+    const res = await request(app).get('/api/memories');
+
+    expect(res.status).toBe(200);
+    expect(res.body.validKeys).toEqual(['context', 'drafts', 'context_archive']);
+  });
+
   test('PATCH rejects updates when shared memory policy fails', async () => {
     mockGetAllUserMemories.mockResolvedValueOnce([
       { key: 'context', value: 'old', tokenCount: 40, __v: 3 },

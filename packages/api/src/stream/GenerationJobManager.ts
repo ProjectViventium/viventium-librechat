@@ -1,3 +1,16 @@
+import { nativePredecessorSupersession } from '../glasshive/nativeSupersession';
+import type { NativeAcceptedSource, NativePredecessor } from '../glasshive/nativeSupersession';
+import type {
+  IMessage,
+  NativeResponseIdentity,
+  NativeResponseCommit,
+  NativeResponseMessageProjection,
+} from '@librechat/data-schemas';
+import {
+  nativeIdentityJson,
+  nativeJobMatches,
+  nativeJobProofJson,
+} from './implementations/nativeResponse';
 import { logger } from '@librechat/data-schemas';
 import type { StandardGraph } from '@librechat/agents';
 import { parseTextParts } from 'librechat-data-provider';
@@ -15,6 +28,8 @@ import type {
   InteractionDeliveryPolicy,
   CortexPresentationBinding,
   CortexPresentationFenceReceipt,
+  SourceOrderObservation,
+  SourceOrderObservationResult,
 } from './interfaces/IJobStore';
 import type * as t from '~/types';
 import { InMemoryEventTransport } from './implementations/InMemoryEventTransport';
@@ -147,6 +162,7 @@ function cortexPresentationMatchesReceipt(
  *   when the real client connects, which would prevent readyPromise from resolving.
  */
 interface RuntimeJobState {
+  nativeProducer?: { createdAt: number; responseMessageId?: string };
   abortController: AbortController;
   readyPromise: Promise<void>;
   resolveReady: () => void;
@@ -203,6 +219,13 @@ class GenerationJobManagerClass {
   private _eventTransport: IEventTransport;
   private lifecycleState:
     'configurable' | 'active' | 'destroying' | 'destroyed' | 'teardown-failed' = 'configurable';
+
+  private nativeResponseRecovery?: (identity: NativeResponseIdentity) => Promise<boolean>;
+  private nativeResponseCancellation?: (
+    identity: NativeResponseIdentity,
+    snapshot: NativeResponseMessageProjection,
+    mode?: 'augmentation' | 'published',
+  ) => Promise<Partial<IMessage> | null>;
 
   private destroyPromise?: Promise<void>;
   private serviceGeneration = 0;
@@ -356,6 +379,277 @@ class GenerationJobManagerClass {
     return this.jobStore;
   }
 
+  /* VIVENTIUM START: native finalization uses saved Message evidence before replay. */
+  setNativeResponseRecovery(handler: (identity: NativeResponseIdentity) => Promise<boolean>): void {
+    this.nativeResponseRecovery = handler;
+  }
+
+  setNativeResponseCancellation(
+    handler: NonNullable<GenerationJobManagerClass['nativeResponseCancellation']>,
+  ): void {
+    this.nativeResponseCancellation = handler;
+  }
+
+  hasLocalNativeResponseProducer(identity: NativeResponseIdentity): boolean {
+    const producer = this.runtimeState.get(identity.streamId)?.nativeProducer;
+    return Boolean(
+      producer &&
+      producer.createdAt === identity.jobCreatedAt &&
+      producer.responseMessageId === identity.responseMessageId,
+    );
+  }
+
+  async getNativePredecessorSupersession(
+    context: Pick<NativeResponseIdentity, 'streamId' | 'jobCreatedAt' | 'userId' | 'conversationId' | 'responseMessageId' | 'logicalTurnId' | 'revision'>,
+    sources: NativeAcceptedSource[],
+  ) {
+    const services = this.captureServices();
+    try {
+      const current = await services.jobStore.getJob(context.streamId);
+      if (!current || current.createdAt !== context.jobCreatedAt || current.userId !== context.userId ||
+          current.conversationId !== context.conversationId || current.responseMessageId !== context.responseMessageId ||
+          current.interactionContext?.logical_turn_id !== context.logicalTurnId ||
+          current.interactionContext?.revision !== context.revision || !current.nativePredecessor) return undefined;
+      const previous = await services.jobStore.getJob(current.nativePredecessor.streamId);
+      this.assertServiceGeneration(services.generation);
+      return nativePredecessorSupersession(current, previous, sources);
+    } catch { return undefined; }
+  }
+
+  async retainNativeAcceptedSources(identity: NativeResponseIdentity, sources: NativeAcceptedSource[]): Promise<void> {
+    const services = this.captureServices();
+    try {
+      const job = await services.jobStore.getJob(identity.streamId);
+      if (!job || !nativeJobMatches(job, identity) || job.nativeResponse?.invocationId !== identity.invocationId) return;
+      this.assertServiceGeneration(services.generation);
+      await services.jobStore.updateJob(identity.streamId, {
+        nativeAcceptedSources: { invocationId: identity.invocationId, sources },
+      });
+      this.assertServiceGeneration(services.generation);
+    } catch { /* Optional continuity proof: absent evidence keeps branch replay fail-closed. */ }
+  }
+
+  async bindNativeResponse(identity: NativeResponseIdentity): Promise<boolean> {
+    const services = this.captureServices();
+    try {
+      const bound = await services.jobStore.bindNativeResponse(identity);
+      this.assertServiceGeneration(services.generation);
+      const producer = this.runtimeState.get(identity.streamId)?.nativeProducer;
+      if (bound && producer?.createdAt === identity.jobCreatedAt) {
+        producer.responseMessageId = identity.responseMessageId;
+      }
+      return bound;
+    } catch {
+      this.assertServiceGeneration(services.generation);
+      logger.error('[GenerationJobManager] Native admission authority unavailable');
+      return false;
+    }
+  }
+
+  async commitNativeResponse(
+    identity: NativeResponseIdentity,
+    candidateSha256: string,
+  ): Promise<NativeResponseCommit> {
+    const services = this.captureServices();
+    try {
+      const result = await services.jobStore.commitNativeResponse(identity, candidateSha256);
+      this.assertServiceGeneration(services.generation);
+      return result;
+    } catch {
+      this.assertServiceGeneration(services.generation);
+      logger.error('[GenerationJobManager] Native publication authority unavailable');
+      return { status: 'unavailable' };
+    }
+  }
+
+  async revokeNativeResponse(
+    identity: NativeResponseIdentity,
+    requireCurrent = false,
+  ): Promise<NativeResponseCommit> {
+    const services = this.captureServices();
+    try {
+      if (requireCurrent) {
+        const job = await services.jobStore.getJob(identity.streamId);
+        this.assertServiceGeneration(services.generation);
+        if (
+          !nativeJobMatches(job, identity) ||
+          !job.nativeResponse ||
+          job.nativeResponseFinished ||
+          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity)
+        )
+          return { status: 'unavailable' };
+        const cancelled = await services.jobStore.cancelNativeResponse(job);
+        this.assertServiceGeneration(services.generation);
+        return cancelled;
+      }
+      const result = await services.jobStore.revokeNativeResponse(identity);
+      this.assertServiceGeneration(services.generation);
+      return result;
+    } catch {
+      this.assertServiceGeneration(services.generation);
+      logger.error('[GenerationJobManager] Native revocation authority unavailable');
+      return { status: 'unavailable' };
+    }
+  }
+
+  async finishNativeResponse(
+    identity: NativeResponseIdentity,
+    finalEvent: t.ServerSentEvent,
+    mode?: 'cancelled',
+  ): Promise<boolean> {
+    const services = this.captureServices();
+    const receipt = await services.jobStore.getNativeResponseCommit(identity);
+    this.assertServiceGeneration(services.generation);
+    if (
+      mode === 'cancelled'
+        ? receipt.status !== 'revoked'
+        : receipt.status !== 'committed' || !receipt.candidateSha256
+    ) {
+      return false;
+    }
+    const runtime = await this.getOrCreateRuntimeState(identity.streamId, services);
+    this.assertServiceGeneration(services.generation);
+    if (!runtime) return false;
+    let acceptedEvent = finalEvent;
+    const encoded = JSON.stringify(finalEvent);
+    const saved = await services.jobStore.finishNativeResponse(
+      identity,
+      receipt.candidateSha256 || '',
+      encoded,
+      mode,
+    );
+    this.assertServiceGeneration(services.generation);
+    if (!saved) {
+      const job = await services.jobStore.getJob(identity.streamId);
+      this.assertServiceGeneration(services.generation);
+      if (
+        !job?.nativeResponse ||
+        Boolean(job.nativeResponseCancelled) !== (mode === 'cancelled') ||
+        !job.nativeResponseFinished ||
+        !job.finalEvent ||
+        nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity)
+      ) {
+        return false;
+      }
+      acceptedEvent = JSON.parse(job.finalEvent) as t.ServerSentEvent;
+    }
+    const retained = await services.jobStore.getJob(identity.streamId);
+    this.assertServiceGeneration(services.generation);
+    if (
+      !nativeJobMatches(retained, identity) ||
+      !retained.nativeResponse ||
+      nativeIdentityJson(retained.nativeResponse) !== nativeIdentityJson(identity) ||
+      Boolean(retained.nativeResponseCancelled) !== (mode === 'cancelled')
+    )
+      return false;
+    runtime.finalEvent = acceptedEvent;
+    runtime.errorEvent = undefined;
+    runtime.nativeProducer = undefined;
+    const published = await services.eventTransport.emitDone(identity.streamId, acceptedEvent, {
+      identity,
+      ...(mode === 'cancelled' ? { cancelled: true, finalEvent: retained.finalEvent } : {}),
+      isCurrent: () =>
+        this.runtimeState.get(identity.streamId) === runtime &&
+        identity.recoverUntil > Date.now() &&
+        Boolean(retained.nativeResponseCancelled) === (mode === 'cancelled') &&
+        retained.finalEvent === JSON.stringify(acceptedEvent),
+    });
+    this.assertServiceGeneration(services.generation);
+    if (published === false && runtime.finalEvent === acceptedEvent) runtime.finalEvent = undefined;
+    return published !== false;
+  }
+
+  /** Explicit assistant mutations retire delivery, without rewriting accepted publication history. */
+  async retireNativeResponse(identity: NativeResponseIdentity): Promise<void> {
+    const services = this.captureServices();
+    const runtime = this.runtimeState.get(identity.streamId);
+    const previous = await services.jobStore.getJob(identity.streamId);
+    this.assertServiceGeneration(services.generation);
+    if (
+      previous &&
+      (!previous.nativeResponse ||
+        nativeIdentityJson(previous.nativeResponse) !== nativeIdentityJson(identity))
+    )
+      return;
+    await services.jobStore.deleteJob(identity.streamId, identity);
+    this.assertServiceGeneration(services.generation);
+    const current = await services.jobStore.getJob(identity.streamId);
+    this.assertServiceGeneration(services.generation);
+    if (
+      current?.nativeResponse &&
+      nativeIdentityJson(current.nativeResponse) === nativeIdentityJson(identity)
+    ) {
+      throw new Error('native_response_retirement_rejected');
+    }
+    if (runtime && this.runtimeState.get(identity.streamId) === runtime) {
+      runtime.finalEvent = undefined;
+      runtime.errorEvent = undefined;
+      runtime.nativeProducer = undefined;
+      this.runtimeState.delete(identity.streamId);
+      this.runStepBuffers?.delete(identity.streamId);
+    }
+  }
+
+  async settleNativeResponse(
+    identity: NativeResponseIdentity,
+    mode?: 'unsupported' | 'cancelled',
+  ): Promise<boolean> {
+    const services = this.captureServices();
+    const settled = await services.jobStore.settleNativeResponse(identity, mode);
+    this.assertServiceGeneration(services.generation);
+    if (settled && mode === 'cancelled') {
+      await services.jobStore.completeLogicalTurn(identity.streamId, identity);
+      this.assertServiceGeneration(services.generation);
+    }
+    return settled;
+  }
+  /* VIVENTIUM END */
+
+  /** Report whether source ordering survives process restart and replica changes. */
+  getSourceOrderCapabilities(): {
+    durability: 'process' | 'durable';
+    replica_safe: boolean;
+  } {
+    const durability = this.jobStore.sourceOrderDurability ?? 'process';
+    return { durability, replica_safe: durability === 'durable' };
+  }
+
+  async retainLogicalTurnInput(userId: string, context: InteractionContext): Promise<InteractionContext> {
+    const services = this.captureServices();
+    const retained = await services.jobStore.retainLogicalTurnInput(userId, context);
+    this.assertServiceGeneration(services.generation);
+    if (context.source_order_scope && context.source_sequence) {
+      await this.observeSourceOrder({ source_order_scope: context.source_order_scope, source_sequence: context.source_sequence });
+    }
+    this.assertServiceGeneration(services.generation);
+    return retained;
+  }
+
+  /** Advance or read the Core-held source watermark before provider admission. */
+  async observeSourceOrder(
+    observation: SourceOrderObservation,
+  ): Promise<SourceOrderObservationResult> {
+    if (
+      !/^[a-f0-9]{64}$/.test(observation.source_order_scope) ||
+      !Number.isSafeInteger(observation.source_sequence) ||
+      observation.source_sequence <= 0
+    ) {
+      throw Object.assign(new Error('Invalid source order observation'), {
+        code: 'invalid_source_order',
+      });
+    }
+    const services = this.captureServices();
+    const observer = services.jobStore.observeSourceOrder;
+    if (typeof observer !== 'function') {
+      throw Object.assign(new Error('Source order authority is unavailable'), {
+        code: 'source_order_unavailable',
+      });
+    }
+    const result = await observer.call(services.jobStore, observation);
+    this.assertServiceGeneration(services.generation);
+    return result;
+  }
+
   /** Bind only an exact current-owner Cortex presentation receipt to a stream job. */
   async bindCortexPresentation(
     streamId: string,
@@ -462,10 +756,57 @@ class GenerationJobManagerClass {
     return this.recordDeliveryAcknowledgement(acknowledgement, cortexPresentation, ownerStreamId);
   }
 
+  /** Resolve a Telegram receipt for a scheduler answer already committed by Core. */
+  async acknowledgeServerCommittedTransportReceipt(
+    acknowledgement: InteractionDeliveryAck,
+    adapterSurface: 'telegram' | 'voice',
+  ): Promise<DeliveryAcknowledgementResult> {
+    if (
+      adapterSurface !== 'telegram' ||
+      acknowledgement.state !== 'committed' ||
+      acknowledgement.source_kind !== 'schedule_result'
+    ) {
+      return { status: 'conflict' };
+    }
+    const services = this.captureServices();
+    const ownerStreamId = await services.jobStore.resolveDeliveryOwner(
+      acknowledgement.logical_turn_id,
+      acknowledgement.revision,
+    );
+    this.assertServiceGeneration(services.generation);
+    const ownerJob = ownerStreamId ? await services.jobStore.getJob(ownerStreamId) : null;
+    this.assertServiceGeneration(services.generation);
+    const context = ownerJob?.interactionContext;
+    if (
+      !ownerJob ||
+      ownerJob.deliveryPolicy?.commit_authority !== 'server' ||
+      context?.origin !== 'scheduler' ||
+      context.schedule_id !== acknowledgement.schedule_id ||
+      context.schedule_run_id !== acknowledgement.schedule_run_id ||
+      !ownerJob.responseMessageId
+    ) {
+      return { status: 'conflict' };
+    }
+    return {
+      status: 'recorded',
+      acknowledgement,
+      idempotent: false,
+      ownerStreamId: ownerStreamId!,
+      transportOnly: true,
+      presentation: {
+        userId: ownerJob.userId,
+        conversationId: ownerJob.conversationId,
+        responseMessageId: ownerJob.responseMessageId,
+        interactionContext: context,
+      },
+    };
+  }
+
   private async recordDeliveryAcknowledgement(
     acknowledgement: InteractionDeliveryAck,
     expectedCortexPresentation: CortexPresentationBinding | null = null,
     expectedOwnerStreamId?: string,
+    expectedNativeIdentity?: NativeResponseIdentity,
   ): Promise<DeliveryAcknowledgementResult> {
     const result = expectedCortexPresentation
       ? await this.jobStore.bindDeliveryAcknowledgement(
@@ -477,6 +818,9 @@ class GenerationJobManagerClass {
     const ownerStreamId = result.ownerStreamId || expectedOwnerStreamId;
     if (result.status !== 'recorded' || !ownerStreamId) {
       return result;
+    }
+    if (expectedNativeIdentity && ownerStreamId !== expectedOwnerStreamId) {
+      return { status: 'conflict' };
     }
     const recordedAcknowledgement = result.acknowledgement;
     const cortexPresentation =
@@ -503,8 +847,13 @@ class GenerationJobManagerClass {
             cortexDeliveryAcknowledgementPresentation: cortexPresentation,
           }
         : {}),
-    });
+    }, expectedNativeIdentity);
     const job = await this.jobStore.getJob(ownerStreamId);
+    if (expectedNativeIdentity &&
+        (!job?.nativeResponse || !nativeJobMatches(job, expectedNativeIdentity) ||
+          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(expectedNativeIdentity))) {
+      return { status: 'conflict' };
+    }
     if (acknowledgement.state === 'committed' && job?.generationCompleted === true) {
       await this.finalizeCompletedJob(
         ownerStreamId,
@@ -524,13 +873,19 @@ class GenerationJobManagerClass {
   async acknowledgeStreamDelivery(
     streamId: string,
     acknowledgement: Pick<InteractionDeliveryAck, 'state' | 'presentation_ref'>,
+    expectedNativeIdentity?: NativeResponseIdentity,
   ): Promise<DeliveryAcknowledgementResult> {
     const job = await this.jobStore.getJob(streamId);
     const context = job?.interactionContext;
     if (
       !job ||
       !context?.logical_turn_id ||
-      job.deliveryPolicy?.commit_authority === 'external_adapter'
+      job.deliveryPolicy?.commit_authority === 'external_adapter' ||
+      (expectedNativeIdentity && (!job.nativeResponse ||
+        !nativeJobMatches(job, expectedNativeIdentity) ||
+        nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(expectedNativeIdentity) ||
+        acknowledgement.state !== 'partial_removed' || job.status !== 'superseded' ||
+        acknowledgement.presentation_ref !== expectedNativeIdentity.responseMessageId))
     ) {
       return { status: 'conflict' };
     }
@@ -538,7 +893,7 @@ class GenerationJobManagerClass {
       logical_turn_id: context.logical_turn_id,
       revision: context.revision,
       ...acknowledgement,
-    });
+    }, null, streamId, expectedNativeIdentity);
   }
 
   /**
@@ -576,6 +931,15 @@ class GenerationJobManagerClass {
       const baseInteractionContext = interactionContext;
       let claim = await jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
       this.assertServiceGeneration(generation);
+      const inputDeadline = Date.now() + 10_000;
+      while (claim.status === 'initializing' && Date.now() < inputDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        this.assertServiceGeneration(generation);
+        claim = await jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
+      }
+      if (claim.status === 'initializing') {
+        throw Object.assign(new Error('Accepted input persistence is still pending; retry the request'), { code: 'source_input_persistence_pending' });
+      }
       if (claim.status === 'duplicate' && !(await jobStore.hasJob(claim.streamId))) {
         this.assertServiceGeneration(generation);
         const forgotten = await jobStore.forgetMissingSourceEventReceipt(
@@ -615,6 +979,12 @@ class GenerationJobManagerClass {
           this.assertServiceGeneration(generation);
         }
       }
+      if (claim.status === 'busy') {
+        throw Object.assign(new Error('The current response is still active'), { code: 'source_input_waiting' });
+      }
+      if (claim.status === 'superseded') {
+        throw Object.assign(new Error('A newer accepted source owns the presentation'), { code: 'source_order_superseded' });
+      }
       interactionContext = claim.interactionContext;
       if (claim.status === 'duplicate') {
         const duplicateJob = await this.getJob(claim.streamId);
@@ -628,14 +998,46 @@ class GenerationJobManagerClass {
       supersededStreamIds = claim.supersededStreamIds;
     }
 
+    const supersededPresentations: NonNullable<t.GenerationJob['supersededPresentations']> = [];
+    let nativePredecessor: NativePredecessor | undefined;
     let jobData: SerializableJobData;
     try {
+      // A conversation may reuse its stream ID. Retire the old incarnation and capture its
+      // presentation before publishing the replacement under that same key.
+      for (const supersededStreamId of supersededStreamIds) {
+        const supersededJob = await jobStore.getJob(supersededStreamId);
+        const previousNative = supersededJob?.nativeResponse;
+        if (supersededStreamIds.length === 1 && supersededStreamId !== streamId && previousNative &&
+            supersededJob.userId === userId && supersededJob.conversationId === conversationId &&
+            previousNative.logicalTurnId === interactionContext?.logical_turn_id &&
+            previousNative.revision + 1 === interactionContext.revision &&
+            supersededJob.responseMessageId === previousNative.responseMessageId) {
+          nativePredecessor = { streamId: supersededStreamId, createdAt: supersededJob.createdAt,
+            responseMessageId: previousNative.responseMessageId, invocationId: previousNative.invocationId };
+        }
+        if (supersededJob?.deliveryAcknowledgement?.state !== 'committed') {
+          supersededPresentations.push({
+            conversationId: supersededJob?.conversationId,
+            responseMessageId: supersededJob?.responseMessageId,
+            userMessageId: supersededJob?.userMessage?.messageId,
+            interactionContext: supersededJob?.interactionContext,
+          });
+        }
+        this.assertServiceGeneration(generation);
+        await this.supersedeJob(supersededStreamId);
+        this.assertServiceGeneration(generation);
+      }
       jobData = await jobStore.createJob(streamId, userId, conversationId, {
         interactionContext,
         adapterCapabilities: options?.adapterCapabilities,
         deliveryPolicy: options?.deliveryPolicy,
       });
       this.assertServiceGeneration(generation);
+      if (nativePredecessor) {
+        await jobStore.updateJob(streamId, { nativePredecessor });
+        this.assertServiceGeneration(generation);
+        jobData.nativePredecessor = nativePredecessor;
+      }
     } catch (error) {
       if (interactionContext?.logical_turn_id) {
         await jobStore.rollbackLogicalTurnClaim(streamId, interactionContext);
@@ -662,6 +1064,10 @@ class GenerationJobManagerClass {
     });
 
     const runtime: RuntimeJobState = {
+      nativeProducer: {
+        createdAt: jobData.createdAt,
+        responseMessageId: jobData.responseMessageId,
+      },
       abortController: new AbortController(),
       readyPromise,
       resolveReady: resolveReady!,
@@ -722,13 +1128,22 @@ class GenerationJobManagerClass {
      * and aborts its local AbortController (if it's the one running generation).
      */
     if (eventTransport.onAbort) {
+      const nativeProducer = runtime.nativeProducer;
       try {
         /* === VIVENTIUM START ===
          * Purpose: Do not report a Redis-backed job as created until its
          * cross-replica abort channel is actually live.
          * === VIVENTIUM END === */
-        await eventTransport.onAbort(streamId, (reason) => {
-          if (generation !== this.serviceGeneration) {
+        await eventTransport.onAbort(streamId, (reason, proof) => {
+          if (
+            generation !== this.serviceGeneration ||
+            (proof &&
+              proof !==
+                nativeJobProofJson({
+                  ...jobData,
+                  responseMessageId: nativeProducer?.responseMessageId ?? jobData.responseMessageId,
+                }))
+          ) {
             return;
           }
           const currentRuntime = this.runtimeState.get(streamId);
@@ -752,18 +1167,6 @@ class GenerationJobManagerClass {
 
     logger.debug(`[GenerationJobManager] Created job: ${streamId}`);
 
-    const supersededPresentations: NonNullable<t.GenerationJob['supersededPresentations']> = [];
-    for (const supersededStreamId of supersededStreamIds) {
-      const supersededJob = await this.jobStore.getJob(supersededStreamId);
-      if (supersededJob?.deliveryAcknowledgement?.state !== 'committed') {
-        supersededPresentations.push({
-          conversationId: supersededJob?.conversationId,
-          responseMessageId: supersededJob?.responseMessageId,
-          interactionContext: supersededJob?.interactionContext,
-        });
-      }
-      await this.supersedeJob(supersededStreamId);
-    }
 
     // Return facade for backwards compatibility
     const facade = this.buildJobFacade(streamId, jobData, runtime, eventTransport);
@@ -968,13 +1371,22 @@ class GenerationJobManagerClass {
     // Set up cross-replica abort listener (Redis mode only)
     // This ensures lazily-initialized jobs can receive abort signals
     if (eventTransport.onAbort) {
+      const nativeProducer = runtime.nativeProducer;
       try {
         /* === VIVENTIUM START ===
          * Purpose: A lazily created replica runtime is usable only after its
          * abort subscription is acknowledged.
          * === VIVENTIUM END === */
-        await eventTransport.onAbort(streamId, (reason) => {
-          if (generation !== this.serviceGeneration) {
+        await eventTransport.onAbort(streamId, (reason, proof) => {
+          if (
+            generation !== this.serviceGeneration ||
+            (proof &&
+              proof !==
+                nativeJobProofJson({
+                  ...jobData,
+                  responseMessageId: nativeProducer?.responseMessageId ?? jobData.responseMessageId,
+                }))
+          ) {
             return;
           }
           const currentRuntime = this.runtimeState.get(streamId);
@@ -1057,7 +1469,7 @@ class GenerationJobManagerClass {
     finalEvent?: t.ServerSentEvent,
   ): Promise<boolean> {
     const job = await this.jobStore.getJob(streamId);
-    if (!job || job.status !== 'running') {
+    if (!job || job.status !== 'running' || job.nativeResponse) {
       return false;
     }
     const runtime = this.runtimeState.get(streamId);
@@ -1078,7 +1490,11 @@ class GenerationJobManagerClass {
    */
   private async supersedeJob(streamId: string): Promise<void> {
     const jobData = await this.jobStore.getJob(streamId);
-    if (!jobData || !['running', 'complete'].includes(jobData.status)) {
+    if (
+      !jobData ||
+      (!['running', 'complete'].includes(jobData.status) &&
+        (!jobData.nativeResponse || jobData.nativeResponseCancelled))
+    ) {
       return;
     }
 
@@ -1089,12 +1505,17 @@ class GenerationJobManagerClass {
       logical_turn_id: context?.logical_turn_id,
       revision: context?.revision,
     } as unknown as t.ServerSentEvent;
+    const nativeCancellation = await this.jobStore.cancelNativeResponse(jobData);
+    if (nativeCancellation.status !== 'revoked') {
+      return;
+    }
     const runtime = this.runtimeState.get(streamId);
     const stopsAuthoring = jobData.adapterCapabilities?.supersede_scope !== 'response_only';
     if (stopsAuthoring && runtime && !runtime.abortController.signal.aborted) {
       runtime.abortController.abort('superseded');
     }
     if (runtime) {
+      runtime.nativeProducer = undefined;
       runtime.finalEvent = terminalEvent;
     }
     if (stopsAuthoring) {
@@ -1159,6 +1580,20 @@ class GenerationJobManagerClass {
     const { generation, jobStore, cleanupOnComplete } = services;
     const existingJob = await jobStore.getJob(streamId);
     this.assertServiceGeneration(generation);
+    const nativeRuntime = this.runtimeState.get(streamId);
+    if (nativeRuntime) {
+      nativeRuntime.nativeProducer = undefined;
+    }
+    if (existingJob?.nativeResponse) {
+      if (existingJob.nativeResponseCancelled) return;
+      jobStore.clearContentState(streamId);
+      this.runStepBuffers?.delete(streamId);
+      if (error && !existingJob.nativeResponseFinished) {
+        await jobStore.updateJob(streamId, { status: 'error', completedAt: Date.now(), error });
+        this.assertServiceGeneration(generation);
+      }
+      return;
+    }
     if (existingJob?.status === 'superseded') {
       return;
     }
@@ -1242,18 +1677,33 @@ class GenerationJobManagerClass {
    * Purpose: A browser Stop must carry a distinct reason to harness-backed providers, while
    * disconnect and transport aborts keep their existing reasonless/resumable behavior.
    * === VIVENTIUM END === */
-  async abortJob(streamId: string, reason?: unknown): Promise<AbortResult> {
+  async abortJob(
+    streamId: string,
+    reason?: unknown,
+    expected?: string | NativeResponseIdentity,
+  ): Promise<AbortResult> {
     /* === VIVENTIUM START ===
      * Purpose: A delayed abort must never target a replacement same-stream job
      * after manager teardown and reconfiguration.
      */
     const services = this.captureServices();
     const { generation, jobStore, eventTransport, cleanupOnComplete } = services;
+    const cancellationHandler = this.nativeResponseCancellation;
     const jobData = await jobStore.getJob(streamId);
     this.assertServiceGeneration(generation);
-    const runtime = this.runtimeState.get(streamId);
+    let runtime = this.runtimeState.get(streamId);
 
-    if (!jobData) {
+    const expectedUserId = typeof expected === 'string' ? expected : expected?.userId;
+    if (
+      !jobData ||
+      jobData.status === 'superseded' ||
+      (expectedUserId !== undefined && jobData.userId !== expectedUserId) ||
+      (expected &&
+        typeof expected !== 'string' &&
+        (!nativeJobMatches(jobData, expected) ||
+          !jobData.nativeResponse ||
+          nativeIdentityJson(jobData.nativeResponse) !== nativeIdentityJson(expected)))
+    ) {
       logger.warn(`[GenerationJobManager] Cannot abort - job not found: ${streamId}`);
       return {
         text: '',
@@ -1265,44 +1715,295 @@ class GenerationJobManagerClass {
       };
     }
 
+    let cancellation: NativeResponseCommit;
+    try {
+      cancellation = await jobStore.cancelNativeResponse(jobData);
+    } catch {
+      this.assertServiceGeneration(generation);
+      logger.error('[GenerationJobManager] Stop authority unavailable');
+      return {
+        success: false,
+        nativeResponse: 'unavailable',
+        jobData,
+        content: [],
+        text: '',
+        collectedUsage: [],
+        finalEvent: null,
+      };
+    }
+    this.assertServiceGeneration(generation);
+    if (cancellation.status !== 'revoked') {
+      let current = await jobStore.getJob(streamId);
+      this.assertServiceGeneration(generation);
+      const sameJob =
+        current?.createdAt === jobData.createdAt &&
+        current?.userId === jobData.userId &&
+        current?.responseMessageId === jobData.responseMessageId;
+      const identity = sameJob ? current?.nativeResponse : undefined;
+      if (cancellation.status === 'committed' && identity && this.nativeResponseRecovery) {
+        try {
+          await this.nativeResponseRecovery(identity);
+        } catch {
+          logger.error('[GenerationJobManager] Saved native result is pending recovery');
+        }
+        this.assertServiceGeneration(generation);
+        current = await jobStore.getJob(streamId);
+        this.assertServiceGeneration(generation);
+      }
+      const saved =
+        current &&
+        current.createdAt === jobData.createdAt &&
+        current.nativeResponseFinished &&
+        current.finalEvent;
+      let status: AbortResult['nativeResponse'] = 'unavailable';
+      if (cancellation.status === 'committed') {
+        status = saved ? 'committed' : 'pending';
+      }
+      return {
+        success: false,
+        nativeResponse: status,
+        jobData: current,
+        content: [],
+        text: '',
+        collectedUsage: [],
+        finalEvent: saved ? JSON.parse(saved) : null,
+      };
+    }
+    const makeAbortFinalEvent = (
+      content: Agents.MessageContentComplex[],
+      nativeSnapshot?: Partial<IMessage>,
+    ): t.ServerSentEvent => {
+      /** Detect "early abort" - aborted before any generation happened (e.g., during tool loading)
+    In this case, no messages were saved to DB, so frontend shouldn't navigate to conversation */
+      const isEarlyAbort = content.length === 0 && !jobData.responseMessageId;
+
+      /** Final event for abort */
+      const userMessageId = jobData.userMessage?.messageId;
+
+      return {
+        final: true,
+        // Don't include conversation for early aborts - it doesn't exist in DB
+        conversation: isEarlyAbort ? null : { conversationId: jobData.conversationId },
+        title: 'New Chat',
+        requestMessage: jobData.userMessage
+          ? {
+              messageId: userMessageId,
+              parentMessageId: jobData.userMessage.parentMessageId,
+              conversationId: jobData.conversationId,
+              text: jobData.userMessage.text ?? '',
+              isCreatedByUser: true,
+            }
+          : null,
+        responseMessage:
+          nativeSnapshot ??
+          (isEarlyAbort
+            ? null
+            : {
+                messageId: jobData.responseMessageId ?? `${userMessageId ?? 'aborted'}_`,
+                parentMessageId: userMessageId,
+                conversationId: jobData.conversationId,
+                content,
+                sender: jobData.sender ?? 'AI',
+                unfinished: true,
+                error: false,
+                isCreatedByUser: false,
+              }),
+        aborted: true,
+        // Flag for early abort - no messages saved, frontend should go to new chat
+        earlyAbort: isEarlyAbort,
+      } as unknown as t.ServerSentEvent;
+    };
+
+    let nativeSnapshot: Partial<IMessage> | undefined;
+    const cancellationUnavailable = (): AbortResult => ({
+      success: false,
+      nativeResponse: 'unavailable',
+      jobData,
+      content: [],
+      text: '',
+      collectedUsage: [],
+      finalEvent: null,
+    });
+    const cancelledJobData = await jobStore.getJob(streamId);
+    this.assertServiceGeneration(generation);
+    if (
+      !cancelledJobData ||
+      cancelledJobData.createdAt !== jobData.createdAt ||
+      cancelledJobData.userId !== jobData.userId ||
+      cancelledJobData.responseMessageId !== jobData.responseMessageId
+    )
+      return cancellationUnavailable();
+    // Admission can bind after the first read; cancellation fenced that same job atomically.
+    const nativeIdentity = cancelledJobData.nativeResponse;
+    const sameJob = async () => {
+      const current = await jobStore.getJob(streamId);
+      this.assertServiceGeneration(generation);
+      return nativeIdentity
+        ? nativeJobMatches(current, nativeIdentity) && current.status !== 'superseded'
+        : current?.createdAt === jobData.createdAt &&
+            current?.userId === jobData.userId &&
+            current?.responseMessageId === jobData.responseMessageId;
+    };
+    if (nativeIdentity) {
+      try {
+        if (!cancellationHandler) return cancellationUnavailable();
+        const currentContent = await jobStore.getContentParts(streamId);
+        this.assertServiceGeneration(generation);
+        const content = JSON.parse(JSON.stringify(currentContent?.content || []));
+        const saved = await cancellationHandler(nativeIdentity, {
+          text: parseTextParts(content),
+          content,
+        });
+        this.assertServiceGeneration(generation);
+        if (!saved || !(await sameJob())) return cancellationUnavailable();
+        nativeSnapshot = saved;
+      } catch {
+        this.assertServiceGeneration(generation);
+        logger.error('[GenerationJobManager] Stop snapshot persistence unavailable');
+        return cancellationUnavailable();
+      }
+    }
+    let abortFinalEvent: t.ServerSentEvent | undefined;
+    let nativeReplay: import('./interfaces/IJobStore').NativeResponseReplayGuard | undefined;
+    if (nativeSnapshot && nativeIdentity) {
+      const nativeRuntime = await this.getOrCreateRuntimeState(streamId, services);
+      this.assertServiceGeneration(generation);
+      if (!nativeRuntime || !(await sameJob())) return cancellationUnavailable();
+      runtime = nativeRuntime;
+      abortFinalEvent = makeAbortFinalEvent(
+        nativeSnapshot.content as Agents.MessageContentComplex[],
+        nativeSnapshot,
+      );
+      const encoded = JSON.stringify(abortFinalEvent);
+      const saved = await jobStore.finishNativeResponse(nativeIdentity, '', encoded, 'cancelled');
+      this.assertServiceGeneration(generation);
+      const retained = await jobStore.getJob(streamId);
+      this.assertServiceGeneration(generation);
+      if (
+        !nativeJobMatches(retained, nativeIdentity) ||
+        !retained.nativeResponseCancelled ||
+        !retained.nativeResponseFinished ||
+        !retained.finalEvent ||
+        nativeIdentityJson(retained.nativeResponse!) !== nativeIdentityJson(nativeIdentity)
+      )
+        return cancellationUnavailable();
+      if (!saved) {
+        abortFinalEvent = JSON.parse(retained.finalEvent) as t.ServerSentEvent;
+        if (
+          !abortFinalEvent ||
+          typeof abortFinalEvent !== 'object' ||
+          !('responseMessage' in abortFinalEvent)
+        )
+          return cancellationUnavailable();
+        const savedSnapshot = abortFinalEvent.responseMessage;
+        if (
+          !savedSnapshot ||
+          typeof savedSnapshot !== 'object' ||
+          !('messageId' in savedSnapshot) ||
+          savedSnapshot.messageId !== nativeIdentity.responseMessageId ||
+          !('text' in savedSnapshot) ||
+          typeof savedSnapshot.text !== 'string' ||
+          !('content' in savedSnapshot) ||
+          !Array.isArray(savedSnapshot.content)
+        )
+          return cancellationUnavailable();
+        nativeSnapshot = {
+          ...savedSnapshot,
+          messageId: nativeIdentity.responseMessageId,
+          text: savedSnapshot.text,
+          content: savedSnapshot.content,
+        };
+      }
+      const acceptedFinal = retained.finalEvent;
+      nativeReplay = {
+        identity: nativeIdentity,
+        cancelled: true,
+        finalEvent: acceptedFinal,
+        isCurrent: () =>
+          generation === this.serviceGeneration &&
+          this.runtimeState.get(streamId) === nativeRuntime &&
+          nativeIdentity.recoverUntil > Date.now() &&
+          retained.nativeResponseCancelled === true &&
+          retained.nativeResponseFinished === true &&
+          retained.finalEvent === acceptedFinal,
+      };
+    }
+    if (runtime) {
+      runtime.nativeProducer = undefined;
+    }
+
     // Emit abort signal for cross-replica support (Redis mode)
     // This ensures the generating replica receives the abort signal
     if (eventTransport.emitAbort) {
-      await eventTransport.emitAbort(
+      const published = await eventTransport.emitAbort(
         streamId,
         reason === 'user_cancelled' ? 'user_cancelled' : undefined,
+        nativeReplay,
       );
       this.assertServiceGeneration(generation);
+      if (published === false) return cancellationUnavailable();
     }
+
+    if (nativeSnapshot && !(await sameJob())) return cancellationUnavailable();
 
     // Also abort local controller if we have it (same-replica abort)
     let harnessCancellationDelivered = false;
+    let cancellationDelivery: Promise<unknown> | undefined;
     if (runtime) {
       runtime.abortController.abort(reason);
       if (reason === 'user_cancelled') {
-        const cancellationDelivery = (
+        cancellationDelivery = (
           runtime.abortController.signal as AbortSignal & {
             _viventiumHarnessCancellationDelivery?: Promise<unknown>;
           }
         )._viventiumHarnessCancellationDelivery;
-        if (cancellationDelivery) {
-          const deliveryResult = (await cancellationDelivery) as
-            { delivered?: boolean } | undefined;
-          harnessCancellationDelivered = deliveryResult?.delivered === true;
-        }
+      }
+    }
+
+    let nativePublished = false;
+    if (nativeSnapshot && nativeIdentity && cancellationHandler && abortFinalEvent) {
+      if (runtime) runtime.finalEvent = abortFinalEvent;
+      const published = await eventTransport.emitDone(streamId, abortFinalEvent!, nativeReplay);
+      this.assertServiceGeneration(generation);
+      if (nativeSnapshot && (published === false || !(await sameJob())))
+        return cancellationUnavailable();
+
+      try {
+        const marked = await cancellationHandler(
+          nativeIdentity,
+          { text: nativeSnapshot.text || '', content: nativeSnapshot.content || [] },
+          'published',
+        );
+        this.assertServiceGeneration(generation);
+        if (!marked || !(await sameJob())) return cancellationUnavailable();
+      } catch {
+        this.assertServiceGeneration(generation);
+        return cancellationUnavailable();
+      }
+      nativePublished = true;
+    }
+    if (cancellationDelivery) {
+      try {
+        const deliveryResult = (await cancellationDelivery) as { delivered?: boolean } | undefined;
+        harnessCancellationDelivered = deliveryResult?.delivered === true;
+      } catch (error) {
+        if (!nativePublished) throw error;
+        logger.warn('[GenerationJobManager] Stop activity acknowledgement unavailable');
       }
     }
 
     /** Content before clearing state */
-    const result = await jobStore.getContentParts(streamId);
+    const result = nativeSnapshot ? null : await jobStore.getContentParts(streamId);
     this.assertServiceGeneration(generation);
-    const rawContent = result?.content ?? [];
+    const rawContent = (nativeSnapshot?.content ??
+      result?.content ??
+      []) as Agents.MessageContentComplex[];
     /* === VIVENTIUM START ===
      * Feature: Persist acknowledged harness cancellation as a public activity part.
      * Purpose: The abort save path bypasses the normal final content conversion. Preserve safe
      * activity summaries across refresh and never persist an internal `think` part for this turn.
      * === VIVENTIUM END === */
-    const content = harnessCancellationDelivered
+    let content = harnessCancellationDelivered
       ? rawContent.map((part) => {
           if (part?.type !== 'think') {
             return part;
@@ -1324,66 +2025,79 @@ class GenerationJobManagerClass {
           summary: 'The harness turn was cancelled.\n',
         },
       } as TMessageContentParts);
+      if (nativeSnapshot && nativeIdentity && cancellationHandler) {
+        try {
+          if (!(await sameJob())) throw new Error('native_response_activity_retired');
+          const saved = await cancellationHandler(
+            nativeIdentity,
+            {
+              text: nativeSnapshot.text || '',
+              content: content as NativeResponseMessageProjection['content'],
+            },
+            'augmentation',
+          );
+          this.assertServiceGeneration(generation);
+          if (!saved) throw new Error('native_response_activity_unavailable');
+          // Cancellation activity is a later augmentation; the first Stop FINAL stays immutable.
+          content = (nativeSnapshot.content || []) as Agents.MessageContentComplex[];
+        } catch {
+          this.assertServiceGeneration(generation);
+          logger.warn('[GenerationJobManager] Later Stop activity remains unavailable');
+        }
+      }
     }
 
     /** Collected usage for all models */
     const collectedUsage = jobStore.getCollectedUsage(streamId);
 
     /** Text from content parts for fallback token counting */
-    const text = parseTextParts(content as TMessageContentParts[]);
+    const text = nativeSnapshot?.text ?? parseTextParts(content as TMessageContentParts[]);
 
-    /** Detect "early abort" - aborted before any generation happened (e.g., during tool loading)
-    In this case, no messages were saved to DB, so frontend shouldn't navigate to conversation */
-    const isEarlyAbort = content.length === 0 && !jobData.responseMessageId;
-
-    /** Final event for abort */
-    const userMessageId = jobData.userMessage?.messageId;
-
-    const abortFinalEvent: t.ServerSentEvent = {
-      final: true,
-      // Don't include conversation for early aborts - it doesn't exist in DB
-      conversation: isEarlyAbort ? null : { conversationId: jobData.conversationId },
-      title: 'New Chat',
-      requestMessage: jobData.userMessage
-        ? {
-            messageId: userMessageId,
-            parentMessageId: jobData.userMessage.parentMessageId,
-            conversationId: jobData.conversationId,
-            text: jobData.userMessage.text ?? '',
-            isCreatedByUser: true,
-          }
-        : null,
-      responseMessage: isEarlyAbort
-        ? null
-        : {
-            messageId: jobData.responseMessageId ?? `${userMessageId ?? 'aborted'}_`,
-            parentMessageId: userMessageId,
-            conversationId: jobData.conversationId,
-            content,
-            sender: jobData.sender ?? 'AI',
-            unfinished: true,
-            error: false,
-            isCreatedByUser: false,
-          },
-      aborted: true,
-      // Flag for early abort - no messages saved, frontend should go to new chat
-      earlyAbort: isEarlyAbort,
-    } as unknown as t.ServerSentEvent;
+    const finalEvent = abortFinalEvent ?? makeAbortFinalEvent(content);
 
     if (runtime) {
-      runtime.finalEvent = abortFinalEvent;
+      runtime.finalEvent = finalEvent;
     }
 
-    await eventTransport.emitDone(streamId, abortFinalEvent);
-    this.assertServiceGeneration(generation);
+    if (!nativePublished) {
+      await eventTransport.emitDone(streamId, finalEvent);
+      this.assertServiceGeneration(generation);
+    }
+    if (nativeSnapshot && nativeIdentity && nativePublished) {
+      try {
+        if (await sameJob()) {
+          await jobStore.completeLogicalTurn(streamId, nativeIdentity);
+          this.assertServiceGeneration(generation);
+          if (await sameJob()) {
+            await jobStore.deleteJob(streamId, nativeIdentity);
+            this.assertServiceGeneration(generation);
+            if (this.runtimeState.get(streamId) === runtime) {
+              this.runStepBuffers?.delete(streamId);
+              this.runtimeState.delete(streamId);
+            }
+          }
+        }
+      } catch {
+        this.assertServiceGeneration(generation);
+        logger.warn('[GenerationJobManager] Published Stop cleanup remains pending');
+      }
+      return {
+        success: true,
+        jobData: cancelledJobData,
+        content: (nativeSnapshot.content || []) as Agents.MessageContentComplex[],
+        finalEvent,
+        text: nativeSnapshot.text || '',
+        collectedUsage,
+      };
+    }
     jobStore.clearContentState(streamId);
     this.runStepBuffers?.delete(streamId);
-    await this.jobStore.completeLogicalTurn(streamId);
+    await jobStore.completeLogicalTurn(streamId);
 
     // Immediate cleanup if configured (default: true)
     if (cleanupOnComplete) {
       // Don't cleanup eventTransport here - let the abort event fully transmit first.
-      await jobStore.deleteJob(streamId);
+      await jobStore.deleteJob(streamId, nativeIdentity);
       this.assertServiceGeneration(generation);
       if (!runtime || this.runtimeState.get(streamId) === runtime) {
         this.runtimeState.delete(streamId);
@@ -1401,9 +2115,9 @@ class GenerationJobManagerClass {
 
     return {
       success: true,
-      jobData,
+      jobData: cancelledJobData,
       content,
-      finalEvent: abortFinalEvent,
+      finalEvent,
       text,
       collectedUsage,
     };
@@ -1469,6 +2183,8 @@ class GenerationJobManagerClass {
     // If job already complete/error, send final event or error
     // Error status takes precedence to ensure errors aren't misreported as successes
     setImmediate(() => {
+      // Native replay must cross the same retirement fence as recovery publication.
+      if (jobData?.nativeResponse) return;
       if (generation !== this.serviceGeneration || this.runtimeState.get(streamId) !== runtime) {
         return;
       }
@@ -1494,6 +2210,8 @@ class GenerationJobManagerClass {
      * boundary and let earlyEventBuffer provide the one authoritative replay.
      */
     let transportReady = false;
+    let deliveredFinal: string | undefined;
+    const nativeProducer = runtime.nativeProducer;
     const subscription = eventTransport.subscribe(streamId, {
       onChunk: (event) => {
         if (!transportReady) {
@@ -1505,7 +2223,24 @@ class GenerationJobManagerClass {
           onChunk(e);
         }
       },
-      onDone: (event) => onDone?.(event as t.ServerSentEvent),
+      onDone: (event, proof) => {
+        if (
+          proof &&
+          (!jobData ||
+            proof !==
+              nativeJobProofJson({
+                ...jobData,
+                responseMessageId: nativeProducer?.responseMessageId ?? jobData.responseMessageId,
+              }))
+        )
+          return;
+        // Shared native replay must not repeat an identical FINAL on an existing connection.
+        // A distinct later terminal event (such as supersession) still reaches that connection.
+        const encoded = JSON.stringify(event);
+        if (deliveredFinal === encoded) return;
+        deliveredFinal = encoded;
+        onDone?.(event as t.ServerSentEvent);
+      },
       onError,
     });
 
@@ -1569,6 +2304,14 @@ class GenerationJobManagerClass {
     }
 
     this.assertServiceGeneration(generation);
+    if (jobData?.nativeResponse && jobData.nativeResponseFinished && runtime.finalEvent) {
+      try {
+        await this.finishNativeResponse(jobData.nativeResponse, runtime.finalEvent);
+      } catch (error) {
+        subscription.unsubscribe();
+        throw error;
+      }
+    }
     return subscription;
     /* === VIVENTIUM END === */
   }
@@ -1583,7 +2326,11 @@ class GenerationJobManagerClass {
    * In Redis mode, awaits the publish to guarantee event ordering.
    * This is critical for streaming deltas (tool args, message content) to arrive in order.
    */
-  async emitChunk(streamId: string, event: t.ServerSentEvent): Promise<void> {
+  async emitChunk(
+    streamId: string,
+    event: t.ServerSentEvent,
+    nativePreviewIdentity?: NativeResponseIdentity,
+  ): Promise<void> {
     /* === VIVENTIUM START ===
      * Purpose: Streaming emits stay on one service generation through their
      * asynchronous transport acknowledgement.
@@ -1599,6 +2346,17 @@ class GenerationJobManagerClass {
     }
     if (!(await this.jobStore.isCurrentLogicalTurn(streamId))) {
       return;
+    }
+
+    if (nativePreviewIdentity) {
+      const job = await jobStore.getJob(streamId);
+      this.assertServiceGeneration(generation);
+      if (!nativeJobMatches(job, nativePreviewIdentity) || !job.nativeResponse ||
+          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(nativePreviewIdentity) ||
+          !this.hasLocalNativeResponseProducer(nativePreviewIdentity) ||
+          this.runtimeState.get(streamId) !== runtime || runtime.abortController.signal.aborted) {
+        return;
+      }
     }
 
     // Track user message from created event
@@ -1635,6 +2393,85 @@ class GenerationJobManagerClass {
     this.assertServiceGeneration(generation);
     /* === VIVENTIUM END === */
   }
+
+  /* === VIVENTIUM START === Exact completed-Cortex delivery, independent of Main's lifetime. */
+  async emitCortexPresentation(
+    streamId: string,
+    event: { event: 'on_cortex_followup'; data: {
+      messageId: string; conversationId: string; text: string; parentMessageId?: string;
+      runId?: string; cortexCount?: number; revision?: number; presentationGeneration?: number;
+      presentationClaimToken?: string; presentationParentMessageId?: string;
+      targetSurface?: string; logicalTurnId?: string; logicalTurnRevision?: number;
+      cortexPresentation?: CortexPresentationFenceReceipt;
+    } },
+    receipt: CortexPresentationFenceReceipt,
+    options: {
+      verifyPresentation: () => Promise<CortexPresentationFenceReceipt>;
+      consumeCortexFault?: (boundary: 'web_replay_persistence' | 'web_redis_publish_ack') =>
+        Promise<{ triggered?: boolean }>;
+    },
+  ): Promise<
+    { delivered: false; streamId: string; reason: string } |
+    { delivered: true; streamId: string; target: 'subscriber_transport';
+      presentationRef: string; claimToken: string; presentationLeaseToken: string }
+  > {
+    const services = this.captureServices();
+    const failure = { delivered: false as const, streamId, reason: 'presentation_unconfirmed' };
+    const normalized = normalizeCortexPresentationReceipt(receipt);
+    if (!normalized || event.event !== 'on_cortex_followup' ||
+        event.data.messageId !== normalized.messageId) return failure;
+    const binding = await this.bindCortexPresentation(streamId, normalized);
+    this.assertServiceGeneration(services.generation);
+    if (!binding) return failure;
+    const verify = async () => {
+      const current = await options.verifyPresentation();
+      this.assertServiceGeneration(services.generation);
+      const job = await services.jobStore.getJob(streamId);
+      this.assertServiceGeneration(services.generation);
+      return job?.status !== 'aborted' && job?.userId === normalized.ownerId &&
+        job?.conversationId === event.data.conversationId &&
+        job?.responseMessageId === normalized.parentMessageId &&
+        cortexPresentationMatchesReceipt(binding, current) &&
+        cortexPresentationMatchesReceipt(job?.cortexPresentation, normalized);
+    };
+    const authorizedEvent = { ...event, data: { ...event.data,
+      revision: normalized.revision,
+      presentationGeneration: normalized.generation,
+      presentationClaimToken: normalized.claimToken,
+      presentationParentMessageId: normalized.parentMessageId,
+      cortexPresentation: normalized,
+    } };
+    const consumeFault = async (boundary: 'web_replay_persistence' | 'web_redis_publish_ack') =>
+      (await options.consumeCortexFault?.(boundary))?.triggered === true;
+    if (!(await verify())) return failure;
+    if (services.isRedis && !(await consumeFault('web_replay_persistence'))) {
+      try {
+        await services.jobStore.appendChunk(streamId, authorizedEvent);
+        this.assertServiceGeneration(services.generation);
+      } catch {
+        // A real subscriber acknowledgement may still establish delivery.
+      }
+    }
+    if (!(await verify())) return failure;
+    const published = await consumeFault('web_redis_publish_ack') ? undefined :
+      await services.eventTransport.emitChunk(streamId, authorizedEvent, {
+        requirePresentationAcknowledgement: true,
+      });
+    this.assertServiceGeneration(services.generation);
+    if (!(await verify())) return failure;
+    const subscriberAccepted = published?.published === true &&
+      published.presentationAcknowledged === true;
+    // Redis chunk storage is diagnostic retention, not a Cortex presentation consumer.
+    // Leave the Mongo delivery retryable until an actual subscriber acknowledges it.
+    if (!subscriberAccepted) return failure;
+    return { delivered: true, streamId,
+      target: 'subscriber_transport',
+      presentationRef: `sse:${streamId}:${normalized.messageId}:${normalized.revision}`,
+      claimToken: normalized.claimToken,
+      presentationLeaseToken: normalized.presentationLeaseToken,
+    };
+  }
+  /* === VIVENTIUM END === */
 
   /**
    * Extract and save run step from event data.
@@ -1881,6 +2718,19 @@ class GenerationJobManagerClass {
       return;
     }
     this.assertServiceGeneration(services.generation);
+    const nativeJob = await services.jobStore.getJob(streamId);
+    this.assertServiceGeneration(services.generation);
+    if (nativeJob?.nativeResponse) {
+      if (
+        !nativeJob.nativeResponseCancelled &&
+        nativeJob.nativeResponseFinished &&
+        nativeJob.finalEvent === JSON.stringify(event)
+      ) {
+        await this.finishNativeResponse(nativeJob.nativeResponse, event);
+        this.assertServiceGeneration(services.generation);
+      }
+      return;
+    }
     const runtime = this.runtimeState.get(streamId);
     if (runtime) {
       runtime.finalEvent = event;
@@ -1912,6 +2762,14 @@ class GenerationJobManagerClass {
       return;
     }
     this.assertServiceGeneration(services.generation);
+    const nativeJob = await services.jobStore.getJob(streamId);
+    this.assertServiceGeneration(services.generation);
+    if (
+      nativeJob?.nativeResponseFinished ||
+      (nativeJob?.nativeResponse && nativeJob.nativeResponseCancelled)
+    ) {
+      return;
+    }
     const runtime = this.runtimeState.get(streamId);
     if (runtime) {
       runtime.errorEvent = error;
@@ -2083,18 +2941,34 @@ class GenerationJobManagerClass {
     return newest?.streamId;
   }
 
-  /** Conversation identities used by web navigation/title state, deduplicated from stream IDs. */
-  async getActiveConversationIdsForUser(userId: string): Promise<string[]> {
-    const streamIds = await this.jobStore.getActiveJobIdsByUser(userId);
-    const conversationIds = new Set<string>();
+  /* === VIVENTIUM START ===
+   * Feature: Exact resumable-stream liveness.
+   * Purpose: The existing active index discovers candidates; current job rows prove owner,
+   *          running state and canonical conversation. Storage failures remain failures.
+   */
+  async getActiveStreamsForUser(
+    userId: string,
+  ): Promise<Array<{ streamId: string; conversationId: string }>> {
+    const services = this.captureServices();
+    const streamIds = await services.jobStore.getActiveJobIdsByUser(userId);
+    this.assertServiceGeneration(services.generation);
+    const activeStreams: Array<{ streamId: string; conversationId: string }> = [];
     for (const streamId of streamIds) {
-      const job = await this.jobStore.getJob(streamId);
-      if (job?.status === 'running') {
-        conversationIds.add(job.conversationId ?? streamId);
+      const job = await services.jobStore.getJob(streamId);
+      this.assertServiceGeneration(services.generation);
+      if (job?.status === 'running' && job.userId === userId && job.streamId === streamId) {
+        activeStreams.push({ streamId, conversationId: job.conversationId || streamId });
       }
     }
-    return [...conversationIds];
+    return activeStreams;
   }
+
+  /** Conversation identities used by web navigation/title state, deduplicated from stream IDs. */
+  async getActiveConversationIdsForUser(userId: string): Promise<string[]> {
+    const streams = await this.getActiveStreamsForUser(userId);
+    return [...new Set(streams.map(({ conversationId }) => conversationId))];
+  }
+  /* === VIVENTIUM END === */
 
   /**
    * Destroy the manager.
@@ -2118,6 +2992,8 @@ class GenerationJobManagerClass {
     const eventTransport = this._eventTransport;
     this.serviceGeneration++;
     this.lifecycleState = 'destroying';
+    this.nativeResponseRecovery = undefined;
+    this.nativeResponseCancellation = undefined;
     this.runtimeState.clear();
     this.runStepBuffers?.clear();
     this.destroyPromise = Promise.allSettled([jobStore.destroy(), eventTransport.destroy()])

@@ -15,6 +15,7 @@ const {
   createCallBrowserLaunch,
   exchangeCallBrowserLaunch,
   getCallSession,
+  getActiveCallSessionForConversation,
   getCallSessionVoiceSettings,
   heartbeatCallSession,
   markVoiceSessionReady,
@@ -70,6 +71,99 @@ describe('CallSessionService', () => {
     await ViventiumVoiceSpeakerSegment.deleteMany({});
     await User.deleteMany({});
     await Agent.deleteMany({});
+  });
+
+  test('completion lookup returns the actual exported same-owner live Call', async () => {
+    const user = await User.create({
+      name: 'Call User',
+      email: 'completion@example.com',
+      provider: 'local',
+    });
+    const created = await createCallSession({
+      userId: String(user._id),
+      agentId: 'agent_1',
+      conversationId: 'conversation-completion',
+    });
+    await ViventiumCallSession.updateOne(
+      { callSessionId: created.callSessionId },
+      {
+        $set: {
+          callStatus: 'listening',
+          activeJobId: 'job-current',
+          activeWorkerId: 'worker-current',
+          leaseExpiresAt: new Date(Date.now() + 60_000),
+        },
+      },
+    );
+    const found = await getActiveCallSessionForConversation({
+      userId: String(user._id),
+      conversationId: 'conversation-completion',
+    });
+    expect(found).toMatchObject({
+      callSessionId: created.callSessionId,
+      userId: String(user._id),
+      mode: 'call',
+    });
+    expect(found).not.toHaveProperty('browserCapabilityHash');
+    expect(
+      await getActiveCallSessionForConversation({
+        userId: String(new mongoose.Types.ObjectId()),
+        conversationId: 'conversation-completion',
+      }),
+    ).toBeNull();
+    expect(
+      await getActiveCallSessionForConversation({
+        userId: String(user._id),
+        conversationId: 'other-conversation',
+      }),
+    ).toBeNull();
+    expect(
+      await getActiveCallSessionForConversation({
+        userId: String(user._id),
+        conversationId: 'new',
+      }),
+    ).toBeNull();
+  });
+
+  test.each([
+    { callStatus: 'ended' },
+    { callStatus: 'failed' },
+    { callStatus: 'connecting' },
+    { expiresAt: new Date(0) },
+    { leaseExpiresAt: new Date(0) },
+    { activeJobId: null },
+    { activeWorkerId: null },
+    { mode: 'wing' },
+    { mode: 'listen_only' },
+  ])('completion lookup excludes inactive or restricted session %j', async (change) => {
+    const user = await User.create({
+      name: 'Call User',
+      email: 'completion@example.com',
+      provider: 'local',
+    });
+    const created = await createCallSession({
+      userId: String(user._id),
+      agentId: 'agent_1',
+      conversationId: 'conversation-completion',
+    });
+    await ViventiumCallSession.updateOne(
+      { callSessionId: created.callSessionId },
+      {
+        $set: {
+          callStatus: 'listening',
+          activeJobId: 'job-current',
+          activeWorkerId: 'worker-current',
+          leaseExpiresAt: new Date(Date.now() + 60_000),
+          ...change,
+        },
+      },
+    );
+    expect(
+      await getActiveCallSessionForConversation({
+        userId: String(user._id),
+        conversationId: 'conversation-completion',
+      }),
+    ).toBeNull();
   });
 
   test('createCallSession persists and getCallSession returns it', async () => {

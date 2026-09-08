@@ -1,3 +1,11 @@
+import { feelingPromptBundle } from './promptBundle.helper';
+let promptFixture: ReturnType<typeof feelingPromptBundle>;
+beforeAll(() => {
+  promptFixture = feelingPromptBundle();
+});
+afterAll(() => {
+  promptFixture?.close();
+});
 import {
   applyFeelingOperations,
   clearFeelingsReadCache,
@@ -170,14 +178,23 @@ describe('Feelings state service', () => {
       bypassCache: true,
     });
 
-    expect(withOverride.capsule).toContain(
-      'Every straight line is begging for a ridiculous turn.',
-    );
+    expect(withOverride.capsule).toContain('Every straight line is begging for a ridiculous turn.');
     expect(withOverride.capsule).not.toContain('Saved but inactive.');
     expect(withOverride.rangePromptOverrideCount).toBe(2);
     expect(withOverride.activeRangePromptOverrideCount).toBe(1);
     expect(withOverride.activeRangePromptOverrideChars).toBe(53);
     expect(withOverride.snapshotHash).not.toBe(withoutOverride.snapshotHash);
+  });
+
+  it('keeps a typed change whose entry carries an extra explanatory key', () => {
+    expect(
+      parseFeelingReactionOutput(
+        '{"changes":[{"band":"vigilance","direction":"up","strength":"clear","cause":"uncertainty","note":"the plan is unproven"}],"innerState":"I feel alert."}',
+      ),
+    ).toEqual({
+      changes: [{ band: 'vigilance', direction: 'up', strength: 'clear', cause: 'uncertainty' }],
+      innerState: 'I feel alert.',
+    });
   });
 
   it('parses only typed reaction operations from fenced or plain JSON', () => {

@@ -71,6 +71,11 @@ jest.mock('~/hooks', () => ({
       com_ui_parallel_work_history_empty: 'No earlier work.',
       com_ui_parallel_work_history_unavailable: 'Work history is unavailable.',
       com_ui_parallel_work_mission: 'Mission',
+      com_ui_parallel_work_state_running: 'Working',
+      com_ui_parallel_work_state_completed: 'Complete',
+      com_ui_parallel_work_state_failed: 'Failed',
+      com_ui_parallel_work_state_cancelled: 'Stopped',
+      com_ui_parallel_work_follow_up: 'Follow up',
       com_ui_parallel_work_actions: 'Work actions',
     };
     if (workLabels[key]) return workLabels[key];
@@ -121,6 +126,34 @@ describe('Active work Control Panel', () => {
       refetch: jest.fn(),
     });
     (useToastContext as jest.Mock).mockReturnValue({ showToast: jest.fn() });
+  });
+
+  test('shows native input without a generic resume that could imply approval', () => {
+    setWork({
+      work: [
+        {
+          workRef: 'work-native',
+          title: 'App task',
+          state: 'needs_input',
+          actions: ['resume', 'stop'],
+          pendingNativeInput: {
+            version: 1,
+            requestId: 'request-1',
+            requestFingerprint: 'a'.repeat(64),
+            kind: 'elicitation',
+            mcpServerName: 'Computer',
+            message: 'Allow this app?',
+            mode: 'form',
+            state: 'pending',
+            requestedSchema: { type: 'object', properties: {} },
+          },
+        },
+      ],
+    });
+    render(<ActiveWorkPanel />);
+    expect(screen.getByText('Allow this app?')).toBeVisible();
+    expect(screen.queryByText('com_ui_parallel_work_action_resume')).not.toBeInTheDocument();
+    expect(actionMutation.mutate).not.toHaveBeenCalled();
   });
 
   test('shows the fresh empty roster as operational state', () => {
@@ -595,7 +628,8 @@ describe('Active work Control Panel', () => {
 
     render(<ActiveWorkPanel />);
 
-    expect(screen.getByText('Mission: running · claude · telegram')).toBeInTheDocument();
+    expect(screen.getByText('Working')).toBeInTheDocument();
+    expect(screen.queryByText(/Mission:|claude · telegram/)).not.toBeInTheDocument();
     expect(screen.getByText('2/3 native workers active · 1 needs attention')).toBeInTheDocument();
     expect(screen.queryByText('Delivery: pending')).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'View Prepare the durable report' })).toHaveAttribute(
@@ -678,7 +712,8 @@ describe('Active work Control Panel', () => {
     expect(active.compareDocumentPosition(results)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
     expect(screen.getAllByText('Sign-in is required.')).toHaveLength(1);
     expect(screen.getAllByText('Blocked mission')).toHaveLength(1);
-    expect(screen.getByText('Mission: failed')).toBeVisible();
+    expect(screen.getByText('Failed')).toBeVisible();
+    expect(screen.queryByText(/Mission:/)).not.toBeInTheDocument();
     expect(screen.queryByText('Completed')).not.toBeInTheDocument();
   });
 
@@ -872,7 +907,8 @@ describe('Active work Control Panel', () => {
     render(<ActiveWorkPanel />);
 
     expect(screen.getByText('Result delivered.')).toBeVisible();
-    expect(screen.getByText('Failure reported.')).toBeVisible();
+    expect(screen.getByText('Failed')).toBeVisible();
+    expect(screen.queryByText('Failure reported.')).not.toBeInTheDocument();
     expect(screen.getByText(/Result delivery failed\./)).toBeVisible();
     expect(screen.getByText(/Result delivery not confirmed\./)).toBeVisible();
     expect(screen.queryByText('Delivery: delivered')).not.toBeInTheDocument();
@@ -1079,5 +1115,120 @@ describe('Active work Control Panel', () => {
     expect(screen.queryByText('No earlier work.')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'com_ui_retry' }));
     expect(retryHistory).toHaveBeenCalledTimes(1);
+  });
+  test('completed work reveals its existing follow-up actions on demand and moves keyboard focus', async () => {
+    setWork({
+      work: [
+        {
+          workRef: 'completed-task',
+          title: 'Finished report',
+          state: 'completed',
+          provider: 'internal-provider',
+          originSurface: 'librechat',
+          delivery: { state: 'delivered', unreadTerminal: false },
+          viewRef: 'https://work.example.test/w/result',
+          actions: ['queue', 'message', 'dismiss'],
+        },
+      ],
+    });
+    render(<ActiveWorkPanel />);
+
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'com_ui_parallel_work_action_queue' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'com_ui_parallel_work_action_message' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: 'com_ui_parallel_work_action_dismiss' }),
+    ).toBeEnabled();
+    expect(screen.getByRole('link', { name: 'View Finished report' })).toBeVisible();
+    expect(screen.getAllByText('Result delivered.')).toHaveLength(1);
+    expect(screen.queryByText('Complete')).not.toBeInTheDocument();
+    expect(screen.queryByText(/internal-provider|librechat/)).not.toBeInTheDocument();
+
+    const user = userEvent.setup();
+    screen.getByRole('button', { name: 'Follow up' }).focus();
+    await user.keyboard('{Enter}');
+    const input = screen.getByRole('textbox');
+    expect(input).toHaveFocus();
+    await user.type(input, 'Add the missing appendix.');
+    await user.click(screen.getByRole('button', { name: 'com_ui_parallel_work_action_queue' }));
+    expect(actionMutation.mutate.mock.calls[0][0]).toMatchObject({
+      workRef: 'completed-task',
+      action: 'queue',
+      instruction: 'Add the missing appendix.',
+    });
+  });
+
+  test('retained uncertain follow-up stays visible after completion and retries exactly once', () => {
+    setWork({
+      work: [
+        { workRef: 'uncertain-followup', title: 'Report', state: 'running', actions: ['message'] },
+      ],
+    });
+    const first = render(<ActiveWorkPanel />);
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Keep the appendix.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'com_ui_parallel_work_action_message' }));
+    const original = actionMutation.mutate.mock.calls[0];
+    act(() => {
+      original[1].onError(new Error('connection lost'));
+      original[1].onSettled();
+    });
+    first.unmount();
+    setWork({
+      work: [
+        {
+          workRef: 'uncertain-followup',
+          title: 'Report',
+          state: 'completed',
+          delivery: { state: 'delivered', unreadTerminal: false },
+          actions: ['dismiss'],
+        },
+      ],
+    });
+    render(<ActiveWorkPanel />);
+    expect(screen.getByRole('textbox')).toHaveValue('Keep the appendix.');
+    expect(screen.queryByRole('button', { name: 'Follow up' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'com_ui_parallel_work_action_retry_same' }));
+    expect(actionMutation.mutate.mock.calls[1][0]).toEqual(original[0]);
+  });
+
+  test('reported stops keep their real status without a second acknowledgement', () => {
+    setWork({
+      work: [
+        {
+          workRef: 'stopped-task',
+          title: 'Stopped task',
+          state: 'cancelled',
+          delivery: { state: 'acknowledged', unreadTerminal: false },
+          actions: ['dismiss'],
+        },
+      ],
+    });
+    render(<ActiveWorkPanel />);
+    expect(screen.getByText('Stopped')).toBeVisible();
+    expect(screen.queryByText('Cancellation reported.')).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: 'com_ui_parallel_work_action_dismiss' }),
+    ).toBeEnabled();
+  });
+  test('a completed silent decision does not claim a result was delivered', () => {
+    setWork({
+      work: [
+        {
+          workRef: 'silent-task',
+          title: 'Finished check',
+          state: 'completed',
+          delivery: { state: 'silent', unreadTerminal: false },
+          actions: ['dismiss'],
+        },
+      ],
+    });
+    render(<ActiveWorkPanel />);
+    expect(screen.getByText('Complete')).toBeVisible();
+    expect(screen.queryByText('Result delivered.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Result delivery pending.')).not.toBeInTheDocument();
   });
 });

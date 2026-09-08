@@ -11,3 +11,4 @@ export * from './pairing';
 export * from './telegramReplyProvenance';
 /* === VIVENTIUM START === Versioned messaging delivery disposition. === VIVENTIUM END === */
 export * from './deliveryDisposition';
+export * from './telegramInput';

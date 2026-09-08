@@ -39,6 +39,7 @@
   },
   "homepage": "https://librechat.ai",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "axios": "^1.13.5",
     "dayjs": "^1.11.13",
     "js-yaml": "^4.2.0",

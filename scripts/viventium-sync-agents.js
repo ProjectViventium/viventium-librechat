@@ -91,6 +91,10 @@ const PRIVATE_PROMPT_PATTERNS = [
   ['bearer_token', /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/i],
 ];
 const KNOWN_RUNTIME_PLACEHOLDERS = new Set([
+  'critical_operating_instructions',
+  'native_capability_inventory',
+  'completion_contract',
+  'safety_checkpoint',
   'current_user',
   'current_date',
   'current_datetime',

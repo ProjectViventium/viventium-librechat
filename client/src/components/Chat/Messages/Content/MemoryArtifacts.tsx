@@ -1,7 +1,14 @@
+/* === VIVENTIUM START === Share typed provider reasons between errors and health notices. === */
 import { useState, useRef, useMemo, useLayoutEffect, useEffect } from 'react';
 import { Tools } from 'librechat-data-provider';
 import type { MemoryArtifact, TAttachment } from 'librechat-data-provider';
 import MemoryInfo from './MemoryInfo';
+import {
+  memoryProviderFailureCopy,
+  memoryProviderLabel,
+  memoryWriterAuthErrorTypes,
+  memoryWriterQuotaErrorTypes,
+} from './memoryErrorPresentation';
 import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
 
@@ -16,20 +23,6 @@ type MemoryWriterHealthState = {
 };
 
 type MemoryWriterHealthNotice = MemoryWriterHealthState;
-
-const memoryWriterAuthErrorTypes = new Set([
-  'provider_auth',
-  'provider_auth_missing',
-  'provider_unauthorized',
-  'provider_access_denied',
-  'authentication_error',
-]);
-const memoryWriterQuotaErrorTypes = new Set([
-  'usage_limit_reached',
-  'insufficient_quota',
-  'billing_hard_limit_reached',
-  'provider_quota_exhausted',
-]);
 
 function parseMemoryWriterHealthNotice(artifact: MemoryArtifact): MemoryWriterHealthNotice | null {
   if (artifact.type !== 'error') {
@@ -114,6 +107,9 @@ export default function MemoryArtifacts({ attachments }: { attachments?: TAttach
     for (const attachment of attachments) {
       if (attachment?.[Tools.memory] != null) {
         const artifact = attachment[Tools.memory];
+        if (artifact.type === 'unchanged') {
+          continue;
+        }
         const healthNotice = parseMemoryWriterHealthNotice(artifact);
         if (healthNotice) {
           notices.push(healthNotice);
@@ -134,10 +130,6 @@ export default function MemoryArtifacts({ attachments }: { attachments?: TAttach
   }, [attachments]);
 
   const degradedLabel = `${localize('com_ui_memory')} · ${localize('com_ui_unavailable')}`;
-  const degradedCopy = {
-    auth: `${localize('com_ui_reconnect')} ${localize('com_ui_memory')}`,
-    quota: `${localize('com_ui_provider')} · ${localize('com_ui_unavailable')}`,
-  };
   let buttonLabel = localize('com_ui_memory_updated');
   let buttonStateClass = 'text-text-secondary-alt hover:text-text-primary';
   if (hasDegraded) {
@@ -285,7 +277,23 @@ export default function MemoryArtifacts({ attachments }: { attachments?: TAttach
                           )}
                         >
                           <div className="font-semibold">{noticeLabel}</div>
-                          {isDegraded && <div className="mt-1">{degradedCopy[notice.reason]}</div>}
+                          {isDegraded && (
+                            <div className="mt-1">
+                              {localize(
+                                memoryProviderFailureCopy(
+                                  notice.errorType ??
+                                    (notice.reason === 'auth'
+                                      ? 'provider_auth'
+                                      : 'provider_quota_exhausted'),
+                                ) ?? 'com_ui_memory_provider_unavailable',
+                                {
+                                  provider:
+                                    memoryProviderLabel(notice.provider) ??
+                                    localize('com_ui_provider'),
+                                },
+                              )}
+                            </div>
+                          )}
                         </div>
                       );
                     })}
@@ -302,3 +310,5 @@ export default function MemoryArtifacts({ attachments }: { attachments?: TAttach
     </>
   );
 }
+
+/* === VIVENTIUM END === */

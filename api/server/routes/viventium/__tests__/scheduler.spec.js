@@ -13,6 +13,7 @@ let mockGetConvo;
 let mockResolveTelegramMappingByUserId;
 let mockGetAgent;
 let mockGetJob;
+let mockGetActiveStreamIdForConversation;
 let mockGetResumeState;
 let mockSubscribe;
 let mockBuildScheduledGlassHiveCapabilityBundle;
@@ -128,7 +129,13 @@ jest.mock('~/server/services/Endpoints/agents/title', () => jest.fn());
 jest.mock('~/models', () => ({
   getUserById: (...args) => mockGetUserById(...args),
   getMessage: (...args) => mockGetMessage(...args),
-  getMessages: (...args) => mockGetMessages(...args),
+  getMessages: async (filter, ...args) => {
+    if (typeof filter?.messageId === 'string') {
+      const message = await mockGetMessage(filter);
+      return message ? [message] : [];
+    }
+    return mockGetMessages(filter, ...args);
+  },
   getConvo: (...args) => mockGetConvo(...args),
 }));
 
@@ -149,6 +156,7 @@ jest.mock('~/db/models', () => ({
 
 jest.mock('@librechat/api', () => ({
   GenerationJobManager: {
+    getActiveStreamIdForConversation: (...args) => mockGetActiveStreamIdForConversation(...args),
     getJob: (...args) => mockGetJob(...args),
     getResumeState: (...args) => mockGetResumeState(...args),
     subscribe: (...args) => mockSubscribe(...args),
@@ -541,6 +549,7 @@ describe('/api/viventium/scheduler/chat', () => {
   beforeEach(() => {
     jest.resetModules();
     agentControllerCalls = 0;
+    mockGetActiveStreamIdForConversation = jest.fn().mockResolvedValue(undefined);
     mockSchedulerDispatchIntents.clear();
     lastParentMessageId = null;
     lastSpec = null;
@@ -566,6 +575,80 @@ describe('/api/viventium/scheduler/chat', () => {
     mockUpdateSchedulerConversation = jest.fn().mockResolvedValue({ modifiedCount: 1 });
     process.env.VIVENTIUM_SCHEDULER_SECRET = 'scheduler_secret';
     process.env.DOMAIN_SERVER = 'http://example.com';
+  });
+
+  test('defers before reserving a dispatch or creating a response while its conversation is active', async () => {
+    const conversationId = 'a1111111-1111-4111-8111-111111111111';
+    mockGetConvo = jest
+      .fn()
+      .mockResolvedValue({ conversationId, user: 'user_1', endpoint: 'agents' });
+    mockGetMessages = jest.fn().mockResolvedValue([
+      {
+        messageId: 'prior-user',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        createdAt: '2026-03-26T20:00:00Z',
+        isCreatedByUser: true,
+      },
+      {
+        messageId: 'prior-answer',
+        parentMessageId: 'prior-user',
+        createdAt: '2026-03-26T20:01:00Z',
+        isCreatedByUser: false,
+      },
+    ]);
+    mockGetActiveStreamIdForConversation.mockResolvedValue('interactive-stream');
+    const app = createTestApp(require('../scheduler'));
+    const body = {
+      userId: 'user_1',
+      text: 'Synthetic check',
+      conversationId,
+      agentId: 'agent_test',
+      idempotencyKey: 'same-occurrence',
+    };
+    const first = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/chat',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body,
+      }),
+      first,
+    );
+    expect(first.statusCode).toBe(202);
+    expect(first.body).toEqual({
+      deferred: true,
+      reason: 'conversation_session_authority_conflict',
+      conversationId,
+    });
+    expect(mockGetActiveStreamIdForConversation).toHaveBeenCalledWith('user_1', conversationId);
+    expect(mockSchedulerDispatchIntents.size).toBe(0);
+    expect(agentControllerCalls).toBe(0);
+    mockGetActiveStreamIdForConversation.mockResolvedValue(undefined);
+    const retry = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/chat',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body,
+      }),
+      retry,
+    );
+    expect(retry.statusCode).toBe(200);
+    expect(agentControllerCalls).toBe(1);
+    const repeated = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/chat',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body,
+      }),
+      repeated,
+    );
+    expect(repeated.body.duplicate).toBe(true);
+    expect(agentControllerCalls).toBe(1);
   });
 
   test('new convo sets parentMessageId to NO_PARENT and persists iconURL', async () => {
@@ -799,6 +882,44 @@ describe('/api/viventium/scheduler/stream', () => {
       return { unsubscribe: jest.fn() };
     });
     process.env.VIVENTIUM_SCHEDULER_SECRET = 'scheduler_secret';
+  });
+
+  test('preserves a typed retryable authority conflict in canonical FINAL', async () => {
+    mockSubscribe = jest.fn().mockImplementation(async (_streamId, _onChunk, onDone) => {
+      onDone({
+        final: true,
+        responseMessage: {
+          messageId: 'response-1',
+          error: false,
+          content: [
+            {
+              type: 'error',
+              error: 'Synthetic private failure detail',
+              error_class: 'conversation_session_authority_conflict',
+              failure_retryable: true,
+              failure_contract_version: 1,
+            },
+          ],
+        },
+      });
+      return { unsubscribe: jest.fn() };
+    });
+    const app = createTestApp(require('../scheduler'));
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        method: 'GET',
+        url: '/api/viventium/scheduler/stream/scheduler-1',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        query: { userId: 'user_1' },
+      }),
+      res,
+    );
+    const writes = res.write.mock.calls.map(([value]) => value).join('\n');
+    expect(writes).toContain('"error_class":"conversation_session_authority_conflict"');
+    expect(writes).toContain('"failure_retryable":true');
+    expect(writes).not.toContain('Synthetic private failure detail');
   });
 
   test('streams raw scheduler events for canonical run capture', async () => {

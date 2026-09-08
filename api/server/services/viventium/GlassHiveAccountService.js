@@ -8,6 +8,8 @@ const {
   buildTrustedActionIdempotencyKey,
   buildTrustedDelegationIdentity,
   createGlassHiveActiveWorkService,
+  createActiveWorkContextService,
+  preferredOrchestrationMode,
   createServiceAssertion,
   hasKnownExternalWork: queryKnownExternalWork,
   requestAccountApi,
@@ -26,6 +28,11 @@ const activeWorkService = createGlassHiveActiveWorkService({
   hasKnownExternalWork: ({ ownerId }) =>
     queryKnownExternalWork({ ownerId, collection: externalWorkCollection }),
 });
+const activeWorkContext = createActiveWorkContextService({
+  getActiveWorkSnapshot: activeWorkService.getActiveWorkSnapshot,
+  preferredMode: preferredOrchestrationMode,
+  tenantId: () => String(process.env.VIVENTIUM_TENANT_ID || 'local'),
+});
 
 module.exports = {
   buildTrustedActionIdempotencyKey,
@@ -34,4 +41,5 @@ module.exports = {
   requestAccountApi,
   signTrustedDelegationIdentity,
   ...activeWorkService,
+  ...activeWorkContext,
 };

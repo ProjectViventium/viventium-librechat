@@ -11,6 +11,7 @@ import { ParallelContentRenderer, type PartWithIndex } from './ParallelContent';
 import { mapAttachments } from '~/utils';
 import { EditTextPart, EmptyText } from './Parts';
 import MemoryArtifacts from './MemoryArtifacts';
+import { HarnessActivityPanel } from './HarnessActivity';
 import Sources from '~/components/Web/Sources';
 import Container from './Container';
 import Part from './Part';
@@ -145,8 +146,13 @@ const ContentParts = memo(function ContentParts({
   /**
    * Render a single content part with proper context.
    */
-  const renderPart = useCallback(
-    (part: TMessageContentParts, idx: number, isLastPart: boolean) => {
+  const renderSinglePart = useCallback(
+    (
+      part: TMessageContentParts,
+      idx: number,
+      isLastPart: boolean,
+      harnessActivityGrouped = false,
+    ) => {
       const toolCallId = (part?.[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined)?.id ?? '';
       const partAttachments = attachmentMap[toolCallId];
       const renderIdentity = getRenderableContentPartIdentity(part);
@@ -174,6 +180,7 @@ const ContentParts = memo(function ContentParts({
             isCreatedByUser={isCreatedByUser}
             isLast={isLastPart}
             showCursor={isLastPart && isLast}
+            harnessActivityGrouped={harnessActivityGrouped}
           />
         </MessageContext.Provider>
       );
@@ -188,6 +195,50 @@ const ContentParts = memo(function ContentParts({
       isLatestMessage,
       messageId,
     ],
+  );
+
+  /* === VIVENTIUM START ===
+   * One disclosure per author/parallel round. Keep original parts, order within the activity
+   * history, and message-part identities; only the UI wrapper is shared.
+   * === VIVENTIUM END === */
+  const activityGroups = useMemo(() => {
+    const groups = new Map<string, PartWithIndex[]>();
+    const byIndex = new Map<number, PartWithIndex[]>();
+    displayContent.forEach((part, idx) => {
+      if (part?.type !== ContentTypes.HARNESS_ACTIVITY || !part.harness_activity?.summary?.trim()) {
+        return;
+      }
+      const key = JSON.stringify([
+        part.groupId ?? null,
+        getRenderableContentPartIdentity(part).agentId,
+      ]);
+      const group = groups.get(key) ?? [];
+      group.push({ part, idx });
+      groups.set(key, group);
+      byIndex.set(idx, group);
+    });
+    return byIndex;
+  }, [displayContent]);
+
+  const renderPart = useCallback(
+    (part: TMessageContentParts, idx: number, isLastPart: boolean) => {
+      const group = activityGroups.get(idx);
+      if (!group) {
+        return renderSinglePart(part, idx, isLastPart);
+      }
+      if (group[0].idx !== idx) {
+        return null;
+      }
+      return (
+        <HarnessActivityPanel
+          key={`activity-${messageId}-${idx}`}
+          isSubmitting={effectiveIsSubmitting}
+        >
+          {group.map((entry) => renderSinglePart(entry.part, entry.idx, false, true))}
+        </HarnessActivityPanel>
+      );
+    },
+    [activityGroups, effectiveIsSubmitting, messageId, renderSinglePart],
   );
 
   // Early return: no content

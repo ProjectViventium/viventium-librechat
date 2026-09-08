@@ -26,9 +26,10 @@ const router = express.Router();
 const OAUTH_STATE_TTL_SECONDS = 30 * 60;
 const TOKEN_EXPIRY_BUFFER_SECONDS = 60;
 const OPENAI_LOCAL_CALLBACK_HOST = '127.0.0.1';
-const OPENAI_LOCAL_CALLBACK_PORT = 1455;
+// Registered Codex CLI callbacks; arbitrary loopback ports are not an OAuth contract.
+const OPENAI_LOCAL_CALLBACK_PORTS = Object.freeze([1455, 1457]);
 const OPENAI_LOCAL_CALLBACK_PATH = '/auth/callback';
-const OPENAI_LOCAL_REDIRECT_URI = `http://localhost:${OPENAI_LOCAL_CALLBACK_PORT}${OPENAI_LOCAL_CALLBACK_PATH}`;
+const OPENAI_LOCAL_REDIRECT_URI = `http://localhost:${OPENAI_LOCAL_CALLBACK_PORTS[0]}${OPENAI_LOCAL_CALLBACK_PATH}`;
 const ANTHROPIC_MANUAL_REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback';
 const OAUTH_STATE_VERSION = 'v1';
 const OAUTH_STATE_AAD = Buffer.from('viventium-connected-account-oauth-state-v1', 'utf8');
@@ -156,7 +157,11 @@ function getJWTSecret() {
 }
 
 function getDefaultConnectedAccountsOrigin() {
-  return (process.env.DOMAIN_SERVER || 'http://localhost:3080').replace(/\/+$/, '');
+  return (
+    process.env.DOMAIN_CLIENT ||
+    process.env.DOMAIN_SERVER ||
+    'http://localhost:3080'
+  ).replace(/\/+$/, '');
 }
 
 function getServerOrigin() {
@@ -168,16 +173,17 @@ function getServerOrigin() {
   if (configuredReturnOrigin && configuredReturnOrigin.trim()) {
     return configuredReturnOrigin.trim().replace(/\/+$/, '');
   }
-  if (process.env.DOMAIN_SERVER) {
-    return process.env.DOMAIN_SERVER.replace(/\/+$/, '');
+  const browserOrigin = process.env.DOMAIN_CLIENT || process.env.DOMAIN_SERVER;
+  if (browserOrigin) {
+    return browserOrigin.replace(/\/+$/, '');
   }
   throw new Error(
-    `Missing ${CONNECTED_ACCOUNTS_RETURN_ORIGIN_ENV} or DOMAIN_SERVER for connected-account OAuth`,
+    `Missing ${CONNECTED_ACCOUNTS_RETURN_ORIGIN_ENV}, DOMAIN_CLIENT or DOMAIN_SERVER for connected-account OAuth`,
   );
 }
 
-function getOpenAICallbackRedirectUri() {
-  return OPENAI_LOCAL_REDIRECT_URI;
+function getOpenAICallbackRedirectUri(port) {
+  return `http://localhost:${port}${OPENAI_LOCAL_CALLBACK_PATH}`;
 }
 
 function getAnthropicRedirectUri() {
@@ -804,6 +810,7 @@ async function ensureOpenAILocalCallbackServer() {
       available: false,
       mode: CONNECTED_ACCOUNT_FLOW_MODES.manualCode,
       reason: 'manual_mode_enabled',
+      redirectUri: OPENAI_LOCAL_REDIRECT_URI,
     };
   }
 
@@ -815,32 +822,36 @@ async function ensureOpenAILocalCallbackServer() {
     return openAILocalCallbackServerPromise;
   }
 
-  openAILocalCallbackServerPromise = new Promise((resolve) => {
-    const server = http.createServer((req, res) => {
-      void handleOpenAILocalCallback(req, res);
-    });
-
-    server.once('error', (error) => {
-      logger.warn('[Connected Accounts] Failed to start OpenAI localhost callback server', {
-        message: error instanceof Error ? error.message : String(error),
-      });
-      openAILocalCallbackServerStatus = {
-        available: false,
-        mode: CONNECTED_ACCOUNT_FLOW_MODES.manualCode,
-        reason: 'callback_server_unavailable',
-      };
-      resolve(openAILocalCallbackServerStatus);
-    });
-
-    server.listen(OPENAI_LOCAL_CALLBACK_PORT, OPENAI_LOCAL_CALLBACK_HOST, () => {
-      openAILocalCallbackServerStatus = {
-        available: true,
-        mode: CONNECTED_ACCOUNT_FLOW_MODES.popupCallback,
-        reason: 'callback_server_ready',
-      };
-      resolve(openAILocalCallbackServerStatus);
-    });
-  }).finally(() => {
+  openAILocalCallbackServerPromise = (async () => {
+    for (const port of OPENAI_LOCAL_CALLBACK_PORTS) {
+      try {
+        await new Promise((resolve, reject) => {
+          const server = http.createServer((req, res) => {
+            void handleOpenAILocalCallback(req, res);
+          });
+          server.once('error', reject);
+          server.listen(port, OPENAI_LOCAL_CALLBACK_HOST, resolve);
+        });
+        openAILocalCallbackServerStatus = {
+          available: true,
+          mode: CONNECTED_ACCOUNT_FLOW_MODES.popupCallback,
+          reason: 'callback_server_ready',
+          redirectUri: getOpenAICallbackRedirectUri(port),
+        };
+        return openAILocalCallbackServerStatus;
+      } catch (error) {
+        if (error?.code === 'EADDRINUSE' && port !== OPENAI_LOCAL_CALLBACK_PORTS.at(-1)) {
+          continue;
+        }
+        logger.warn('[Connected Accounts] Failed to start OpenAI localhost callback server', {
+          code: error?.code,
+        });
+        // A foreign listener can consume the code, so automatic bind failure is not manual mode.
+        // Do not cache failure: a later explicit sign-in can bind after that owner has exited.
+        return { available: false, reason: 'callback_server_unavailable' };
+      }
+    }
+  })().finally(() => {
     openAILocalCallbackServerPromise = null;
   });
 
@@ -915,11 +926,18 @@ router.get('/:provider/start', requireJwtAuth, async (req, res) => {
   }
 
   try {
+    const serverOrigin = getServerOrigin();
+    const callback = provider === 'openai' ? await ensureOpenAILocalCallbackServer() : null;
+    if (
+      callback &&
+      !callback.available &&
+      callback.mode !== CONNECTED_ACCOUNT_FLOW_MODES.manualCode
+    ) {
+      return res.status(503).json({ error: 'oauth_unavailable' });
+    }
     const { verifier, challenge } = createPKCE();
     const attemptId = registerConnectedAccountAttempt({ userId: req.user.id, provider });
-    const redirectUri =
-      provider === 'openai' ? getOpenAICallbackRedirectUri() : getAnthropicRedirectUri();
-    const serverOrigin = getServerOrigin();
+    const redirectUri = callback ? callback.redirectUri : getAnthropicRedirectUri();
     const state = createOAuthState({
       provider,
       userId: req.user.id,
@@ -930,10 +948,7 @@ router.get('/:provider/start', requireJwtAuth, async (req, res) => {
       secret,
     });
 
-    const flowMode =
-      provider === 'openai'
-        ? (await ensureOpenAILocalCallbackServer()).mode
-        : CONNECTED_ACCOUNT_FLOW_MODES.manualCode;
+    const flowMode = callback ? callback.mode : CONNECTED_ACCOUNT_FLOW_MODES.manualCode;
 
     const authUrl =
       provider === 'openai'

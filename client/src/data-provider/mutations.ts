@@ -17,6 +17,9 @@ import {
 import useUpdateTagsInConvo from '~/hooks/Conversations/useUpdateTagsInConvo';
 import { updateConversationTag } from '~/utils/conversationTags';
 import { useConversationTagsQuery } from './queries';
+/* === VIVENTIUM START === Confirmed renames own the existing generated-title query. === */
+import { genTitleQueryKey } from './SSE/queries';
+/* === VIVENTIUM END === */
 
 export const useUpdateConversationMutation = (
   id: string,
@@ -30,8 +33,15 @@ export const useUpdateConversationMutation = (
   return useMutation(
     (payload: t.TUpdateConversationRequest) => dataService.updateConversation(payload),
     {
-      onSuccess: (updatedConvo, payload) => {
+      onSuccess: async (updatedConvo, payload) => {
         const targetId = payload.conversationId || id;
+        /* === VIVENTIUM START === A pending title response must not overwrite a saved rename. === */
+        if (typeof payload.title === 'string' && typeof updatedConvo.title === 'string') {
+          const queryKey = genTitleQueryKey(targetId);
+          await queryClient.cancelQueries({ queryKey, exact: true });
+          queryClient.setQueryData(queryKey, { title: updatedConvo.title });
+        }
+        /* === VIVENTIUM END === */
         queryClient.setQueryData([QueryKeys.conversation, targetId], updatedConvo);
         updateConvoInAllQueries(queryClient, targetId, () => updatedConvo);
       },

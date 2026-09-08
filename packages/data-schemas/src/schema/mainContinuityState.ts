@@ -24,22 +24,27 @@ const toolPairSchema = new Schema<IMainContinuityToolPair>(
 
 const acceptedTurnSchema = new Schema<IMainContinuityAcceptedTurn>(
   {
+    acceptedPosition: { type: Number, min: 1 },
     logicalTurnId: { type: String, required: true, maxlength: 160 },
     revision: { type: Number, required: true, min: 1 },
     conversationId: { type: String, default: '', maxlength: 256 },
     userMessageId: { type: String, default: '', maxlength: 256 },
     assistantMessageId: { type: String, required: true, maxlength: 256 },
     origin: { type: String, default: 'interactive', maxlength: 40 },
+    scheduleId: { type: String, maxlength: 256 },
+    scheduleRunId: { type: String, maxlength: 256 },
     userText: { type: String, default: '', maxlength: 6000 },
-    assistantText: { type: String, required: true, maxlength: 6000 },
+    assistantText: { type: String, default: '', maxlength: 6000 },
     toolPairs: { type: [toolPairSchema], default: [] },
     committedAt: { type: Date, required: true },
+    sourceDeletedAt: { type: Date, default: undefined },
   },
   { _id: false },
 );
 
 const acceptedRevisionSchema = new Schema<IMainContinuityAcceptedRevision>(
   {
+    sourceDeleted: { type: Boolean, default: undefined },
     logicalTurnId: { type: String, required: true, maxlength: 160 },
     revision: { type: Number, required: true, min: 1 },
   },
@@ -70,18 +75,37 @@ const compactionLeaseSchema = new Schema<IMainContinuityCompactionLease>(
     sourceTurnKeys: { type: [String], default: [] },
     claimedAt: { type: Date, required: true },
     expiresAt: { type: Date, required: true },
+    sourceGeneration: { type: Number, min: 0 },
+    throughPosition: { type: Number, min: 0 },
+    legacyStateCursor: String,
+    legacyMessageCursor: String,
+    legacyComplete: Boolean,
+    legacySourceOffset: { type: Number, min: 0 },
+    legacySourceRange: {
+      type: new Schema(
+        {
+          artifactId: { type: String, required: true },
+          start: { type: Number, min: 0, required: true },
+          end: { type: Number, min: 0, required: true },
+          total: { type: Number, min: 0, required: true },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
   },
   { _id: false },
 );
 
 const mainContinuityStateSchema = new Schema<IViventiumMainContinuityState>(
   {
+    recordKind: { type: String, enum: ['domain', 'epoch', 'revision_floor', 'legacy'] },
     domainEpochKey: { type: String, required: true, unique: true, index: true, maxlength: 64 },
     continuityDomainId: { type: String, required: true, index: true, maxlength: 64 },
     ownerId: { type: String, required: true, index: true, maxlength: 160 },
     agentId: { type: String, required: true, index: true, maxlength: 160 },
-    contextEpoch: { type: String, required: true, maxlength: 64 },
-    stableAuthoritySha256: { type: String, required: true, maxlength: 64 },
+    contextEpoch: { type: String, maxlength: 64 },
+    stableAuthoritySha256: { type: String, maxlength: 64 },
     version: { type: Number, required: true, default: 1, min: 1 },
     acceptedTurns: { type: [acceptedTurnSchema], default: [] },
     pendingCompactionTurns: { type: [acceptedTurnSchema], default: [] },
@@ -94,10 +118,37 @@ const mainContinuityStateSchema = new Schema<IViventiumMainContinuityState>(
     },
     compactionLease: { type: compactionLeaseSchema, default: null },
     lastCompactionError: { type: String, default: '', maxlength: 120 },
+    acceptedPosition: { type: Number, min: 0 },
+    legacyAvailable: Boolean,
+    sourceGeneration: { type: Number, min: 0 },
+    summarizedThrough: { type: Number, min: 0 },
+    legacyStateCursor: String,
+    legacyMessageCursor: String,
+    legacyComplete: Boolean,
+    legacySourceOffset: { type: Number, min: 0 },
+    logicalTurnId: String,
+    revisionFloor: { type: Number, min: 1 },
+    deletedRevisionFloor: { type: Number, min: 1 },
   },
   { timestamps: true },
 );
 
-mainContinuityStateSchema.index({ ownerId: 1, agentId: 1, contextEpoch: 1 }, { unique: true });
+// Deterministic domainEpochKey is the unique identity for all record kinds. The old
+// redundant epoch index is verified and retired by the owning storage initialization.
+mainContinuityStateSchema.index({
+  ownerId: 1,
+  continuityDomainId: 1,
+  recordKind: 1,
+  domainEpochKey: 1,
+});
+
+mainContinuityStateSchema.index({
+  ownerId: 1,
+  continuityDomainId: 1,
+  recordKind: 1,
+  'acceptedRevisions.logicalTurnId': 1,
+});
+for (const field of ['acceptedTurns.logicalTurnId', 'pendingCompactionTurns.logicalTurnId'])
+  mainContinuityStateSchema.index({ ownerId: 1, continuityDomainId: 1, recordKind: 1, [field]: 1 });
 
 export default mainContinuityStateSchema;

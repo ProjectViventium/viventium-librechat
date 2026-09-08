@@ -211,7 +211,7 @@ function validateCuratedSource(source) {
   }
 }
 
-function loadCuratedOverrides(packageLock, closureLockPaths) {
+function loadCuratedOverrides(packageLock, closureLockPaths, shippedVendoredComponents = null) {
   const overrides = readJson(curatedOverridesPath, 'Curated browser compliance overrides');
   if (
     overrides.schemaVersion !== 1 ||
@@ -288,10 +288,20 @@ function loadCuratedOverrides(packageLock, closureLockPaths) {
   for (const adapter of overrides.vendoredAdapters) {
     assertSafeLockPath(adapter?.lockPath);
     const lockEntry = packageLock.packages?.[adapter.lockPath];
-    const packageMetadata = readJson(
-      path.join(repositoryRoot, adapter.lockPath, 'package.json'),
-      `Vendored browser adapter package metadata for ${adapter?.lockPath}`,
-    );
+    /* === VIVENTIUM START === Preserve the exact build input after production pruning. === */
+    const shippedAdapter = shippedVendoredComponents?.find((component) => component.id === adapter.id);
+    let packageMetadata;
+    if (shippedVendoredComponents !== null) {
+      if (shippedAdapter?.packageMetadata?.path !== `vendored/${adapter.id}/package.json`) {
+        throw new Error(`Shipped vendored browser adapter metadata path mismatch for ${adapter.id}`);
+      }
+      packageMetadata = JSON.parse(verifyFileRecord(shippedAdapter.packageMetadata,
+        `vendored browser adapter package metadata for ${adapter.id}`).toString('utf8'));
+    } else {
+      packageMetadata = readJson(path.join(repositoryRoot, adapter.lockPath, 'package.json'),
+        `Vendored browser adapter package metadata for ${adapter?.lockPath}`);
+    }
+    /* === VIVENTIUM END === */
     if (
       typeof adapter.id !== 'string' ||
       !/^[a-z0-9][a-z0-9.-]*$/.test(adapter.id) ||
@@ -377,6 +387,8 @@ function copyVendoredBrowserAdapter(adapter, curatedOverrides) {
     upstreamIntegrity: adapter.integrity,
     license: adapter.license,
     modified: adapter.modified,
+    packageMetadata: copyAndHash(path.join(repositoryRoot, adapter.lockPath, 'package.json'),
+      `${destinationDirectory}/package.json`),
     notice,
     legalFiles,
     sourceIdentity: {
@@ -682,7 +694,7 @@ function verifyShipped() {
   for (const lockPath of closureLockPaths) {
     assertSafeLockPath(lockPath);
   }
-  const curatedOverrides = loadCuratedOverrides(packageLock, closureLockPaths);
+  const curatedOverrides = loadCuratedOverrides(packageLock, closureLockPaths, manifest.vendoredComponents);
 
   const fileRecords = [];
   for (const packageRecord of manifest.packages) {
@@ -882,7 +894,7 @@ function verifyShipped() {
       assertCuratedFileRecord(legalFile, source, expectedDirectory, adapter.id);
       verifyFileRecord(legalFile, `vendored browser adapter legal file for ${adapter.id}`);
     }
-    fileRecords.push(shippedAdapter.notice, ...shippedAdapter.legalFiles);
+    fileRecords.push(shippedAdapter.packageMetadata, shippedAdapter.notice, ...shippedAdapter.legalFiles);
   }
 
   if (new Set(fileRecords.map((fileRecord) => fileRecord.path)).size !== fileRecords.length) {

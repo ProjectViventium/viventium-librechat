@@ -44,6 +44,7 @@ jest.mock('@librechat/api', () => ({
   isEnabled: jest.fn().mockReturnValue(false),
   sendEvent: jest.fn(),
   GenerationJobManager: {
+    getJob: jest.fn(),
     abortJob: jest.fn(),
   },
   recordCollectedUsage: mockRecordCollectedUsage,
@@ -241,5 +242,136 @@ describe('abortMiddleware - spendCollectedUsage', () => {
       expect(resolved).toBe(true);
       expect(collectedUsage.length).toBe(0);
     });
+  });
+});
+
+describe('native cancellation HTTP boundary', () => {
+  const { handleAbort } = require('./abortMiddleware');
+  const { GenerationJobManager } = require('@librechat/api');
+  const { saveMessage } = require('~/models');
+  let req, res;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    req = { body: { abortKey: 'conversation:request', endpoint: 'agents' }, user: { id: 'owner' } };
+    GenerationJobManager.getJob.mockResolvedValue({ metadata: { userId: 'owner' } });
+    res = {
+      headersSent: false,
+      status: jest.fn(() => res),
+      json: jest.fn(),
+      send: jest.fn(),
+      setHeader: jest.fn(),
+    };
+  });
+  test.each(['committed', 'pending', 'unavailable'])(
+    'reports native %s without a second save or false cancellation',
+    async (nativeResponse) => {
+      GenerationJobManager.abortJob.mockResolvedValue({ success: false, nativeResponse });
+      await handleAbort()(req, res);
+      expect(res.status).toHaveBeenCalledWith(nativeResponse === 'committed' ? 200 : 202);
+      expect(res.json).toHaveBeenCalledWith({ success: false, nativeResponse });
+      expect(saveMessage).not.toHaveBeenCalled();
+      expect(mockSpendTokens).not.toHaveBeenCalled();
+    },
+  );
+  test('returns the abort owner saved projection without rewriting its text or completion flags', async () => {
+    const responseMessage = {
+      messageId: 'answer',
+      conversationId: 'conversation',
+      text: 'Saved partial.',
+      content: [{ type: 'text', text: 'Saved partial.' }],
+      unfinished: true,
+      error: false,
+      finish_reason: 'incomplete',
+      metadata: { retained: true },
+    };
+    GenerationJobManager.abortJob.mockResolvedValue({
+      success: true,
+      text: responseMessage.text,
+      content: responseMessage.content,
+      collectedUsage: [],
+      finalEvent: { responseMessage },
+      jobData: {
+        nativeResponse: { invocationId: 'native' },
+        responseMessageId: 'answer',
+        conversationId: 'conversation',
+        userMessage: { messageId: 'source', conversationId: 'conversation', text: 'Request.' },
+      },
+    });
+    await handleAbort()(req, res);
+    expect(saveMessage).not.toHaveBeenCalled();
+    expect(JSON.parse(res.send.mock.calls[0][0]).responseMessage).toEqual(responseMessage);
+  });
+});
+
+describe('assistants chat Stop route ownership', () => {
+  const express = require('express');
+  const request = require('supertest');
+  const { GenerationJobManager } = require('@librechat/api');
+  const { saveMessage } = require('~/models');
+  const noop = (_req, _res, next) => next();
+  let app;
+  beforeAll(() => {
+    jest.doMock('~/server/middleware', () => ({
+      handleAbort: require('./abortMiddleware').handleAbort,
+      setHeaders: noop,
+      validateModel: noop,
+      buildEndpointOption: noop,
+    }));
+    jest.doMock('~/server/middleware/validate/convoAccess', () => noop);
+    jest.doMock('~/server/middleware/assistants/validate', () => noop);
+    jest.doMock('~/server/controllers/assistants/chatV1', () => noop);
+    jest.doMock('~/server/controllers/assistants/chatV2', () => noop);
+    app = express();
+    app.use(express.json(), (req, _res, next) => {
+      req.user = { id: 'owner' };
+      next();
+    });
+    app.use('/api/assistants/v1/chat', require('~/server/routes/assistants/chatV1'));
+    app.use('/api/assistants/v2/chat', require('~/server/routes/assistants/chatV2'));
+  });
+  beforeEach(() => {
+    jest.clearAllMocks();
+    GenerationJobManager.abortJob.mockResolvedValue({
+      success: false,
+      nativeResponse: 'committed',
+      finalEvent: { responseMessage: { text: 'Private saved answer.' } },
+    });
+  });
+  test.each(['v1', 'v2'])(
+    '%s refuses a foreign job before cancellation or reading its saved FINAL',
+    async (version) => {
+      GenerationJobManager.getJob.mockResolvedValue({ metadata: { userId: 'other-owner' } });
+      const response = await request(app)
+        .post(`/api/assistants/${version}/chat/abort`)
+        .send({ abortKey: 'foreign-conversation:request', endpoint: 'agents' });
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({ error: 'Job not found', streamId: 'foreign-conversation' });
+      expect(GenerationJobManager.abortJob).not.toHaveBeenCalled();
+      expect(saveMessage).not.toHaveBeenCalled();
+    },
+  );
+  test.each(['v1', 'v2'])(
+    '%s permits the selected owner and carries explicit Stop intent',
+    async (version) => {
+      GenerationJobManager.getJob.mockResolvedValue({ metadata: { userId: 'owner' } });
+      const response = await request(app)
+        .post(`/api/assistants/${version}/chat/abort`)
+        .send({ abortKey: 'conversation:request', endpoint: 'agents' });
+      expect(response.status).toBe(200);
+      expect(GenerationJobManager.abortJob).toHaveBeenCalledWith(
+        'conversation',
+        'user_cancelled',
+        'owner',
+      );
+      expect(response.body.finalEvent.responseMessage.text).toBe('Private saved answer.');
+    },
+  );
+  test('missing job owner fails closed', async () => {
+    GenerationJobManager.getJob.mockResolvedValue({ metadata: {} });
+    const response = await request(app)
+      .post('/api/assistants/v1/chat/abort')
+      .send({ abortKey: 'conversation:request', endpoint: 'agents' });
+    expect(response.status).toBe(404);
+    expect(GenerationJobManager.abortJob).not.toHaveBeenCalled();
   });
 });

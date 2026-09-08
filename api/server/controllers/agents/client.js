@@ -1,3 +1,12 @@
+const {
+  fenceCortexInsightDeliveryPresentationByParent,
+  markCortexInsightDeliveryBatchPresented,
+  markCortexInsightDeliveryBatchFailed,
+  requireExactCortexInsightDeliverySettlement,
+} = require('~/server/services/viventium/CortexInsightDeliveryService');
+const {
+  consumeLocalQaCortexFault,
+} = require('~/server/services/viventium/LocalQaCortexFaultService');
 /* === VIVENTIUM START ===
  * File: api/server/controllers/agents/client.js
  *
@@ -33,16 +42,26 @@ const {
   initializeAgent,
   getBalanceConfig,
   getProviderConfig,
-  memoryInstructions,
   applyContextToAgent,
   GenerationJobManager,
   getTransactionsConfig,
   createMemoryProcessor,
+  projectAcceptedMainMessages,
+  prepareMainContinuityCarrier,
+  buildMainContinuityHeaders,
+  mainMessageDelivery,
+  assertMainContinuityCarrier,
+  loadMemorySnapshot,
+  validatePendingMemoryRecovery,
+  isCurrentMemoryWriterResponse,
   loadMemoryReadContext,
+  buildSavedMemoryTurnContext,
   clearMemoryReadContextCache,
   markMemoryWriterFailure,
+  markMemoryWriterRouteExhausted,
   getMemoryWriterHealthGate,
   filterMalformedContentParts,
+  convertHarnessActivityParts,
   loadFeelingsReadContext,
 } = require('@librechat/api');
 const {
@@ -63,6 +82,9 @@ const {
   EModelEndpoint,
   Tools,
   PermissionTypes,
+  PermissionBits,
+  ResourceType,
+  SystemRoles,
   isAgentsEndpoint,
   isEphemeralAgentId,
   bedrockInputSchema,
@@ -79,6 +101,7 @@ const {
 } = require('~/server/services/viventium/listenOnlyTranscript');
 const { getRoleByName } = require('~/models/Role');
 const { loadAgent } = require('~/models/Agent');
+const { getActiveWorkTurnContext } = require('~/server/services/viventium/GlassHiveAccountService');
 const { getMCPManager } = require('~/config');
 const db = require('~/models');
 const { updateBalance, bulkInsertTransactions } = require('~/models');
@@ -87,7 +110,7 @@ const {
   summarizeFeelingCapsulePlacement,
 } = require('~/server/services/viventium/feelingsTelemetry');
 const {
-  VIVENTIUM_USER_FACT_GUARD,
+  getViventiumUserFactGuard,
   buildViventiumDynamicTail,
   pinFeelingCapsuleLast,
   pinViventiumDynamicTailLast,
@@ -95,10 +118,17 @@ const {
 const {
   scheduleEmotionalReaction,
 } = require('~/server/services/viventium/EmotionalReactionService');
-const { enqueueUserMemoryWriter } = require('~/server/services/viventium/memoryWriterCoordinator');
+const {
+  enqueueUserMemoryWriter,
+  memoryWriterOwner,
+  trackAdmittedMemoryWriter,
+} = require('~/server/services/viventium/memoryWriterCoordinator');
 const {
   recordMemoryContinuityHealth,
 } = require('~/server/services/viventium/memoryContinuityHealthLedger');
+const {
+  scheduledFailureMetadata,
+} = require('~/server/services/viventium/ScheduledFailureContractService');
 const {
   initializeTextTurnTiming,
   setTextMainRunContext,
@@ -117,9 +147,16 @@ const {
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
 const {
   getTrustedInteractionContext,
+  setTrustedInteractionContext,
   shouldSkipAutomaticMemoryWriter,
   shouldSkipEmotionalReaction,
 } = require('~/server/services/viventium/interactionContext');
+const {
+  loadAcceptedMainContext,
+} = require('~/server/services/viventium/ViventiumMainContinuityService');
+const {
+  buildRecurrenceStateCapsule,
+} = require('~/server/services/viventium/ViventiumRecurrenceStateContext');
 /* === VIVENTIUM START === Versioned messaging delivery disposition. === */
 const {
   attachEffectiveDeliveryDisposition,
@@ -166,6 +203,40 @@ function buildUntrustedAmbientVoiceContextInstructions(context) {
   ].join('\n');
 }
 
+function canonicalMainAuthority(value) {
+  if (Array.isArray(value)) return value.map(canonicalMainAuthority);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .filter((key) => value[key] !== undefined && typeof value[key] !== 'function')
+        .map((key) => [key, canonicalMainAuthority(value[key])]),
+    );
+  }
+  return value;
+}
+
+function stableMainAuthorityDigest(agent) {
+  const headers = agent?.model_parameters?.configuration?.defaultHeaders;
+  const declared = String(headers?.['X-GlassHive-Stable-Authority-SHA256'] || '')
+    .trim()
+    .toLowerCase();
+  if (/^[a-f0-9]{64}$/.test(declared)) return declared;
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify(
+        canonicalMainAuthority({
+          instructions: String(agent?.instructions || ''),
+          tools: agent?.tools || [],
+          mcp: agent?.mcp || [],
+        }),
+      ),
+      'utf8',
+    )
+    .digest('hex');
+}
+
 /* === VIVENTIUM START ===
  * Classify the detached writer from its structured memory artifact. A completed provider call is
  * not a successful memory run when storage policy rejected the write.
@@ -189,6 +260,364 @@ function classifyMemoryWriterResult(result) {
     }
   }
   return null;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Explicitly authorized saved-memory fallback route (llm.memory.fallback).
+ * Purpose: `memory.agent.fallback` is compiled only from the owner's config. The writer tries the
+ * configured primary route first; a route whose health gate is blocked or whose initialization
+ * fails yields to the declared fallback under the same signed-in owner. A terminal provider
+ * failure (quota, billing, authorization) with no write applied is replayed once on the fallback.
+ * Only the two configured routes exist; nothing here remaps a model.
+ * === VIVENTIUM END === */
+const TERMINAL_MEMORY_ROUTE_FAILURES = new Set([
+  'usage_limit_reached',
+  'insufficient_quota',
+  'billing_hard_limit_reached',
+  'provider_quota_exhausted',
+  'provider_unauthorized',
+  'provider_access_denied',
+]);
+
+function memoryWriterRoutes(memoryConfig) {
+  const agent = memoryConfig?.agent;
+  if (!agent || agent.id != null) {
+    return [];
+  }
+  const routes = [];
+  if (agent.provider && agent.model) {
+    routes.push({ role: 'primary', provider: agent.provider, model: agent.model });
+  }
+  const fallback = agent.fallback;
+  if (
+    fallback?.provider &&
+    fallback?.model &&
+    !(fallback.provider === agent.provider && fallback.model === agent.model)
+  ) {
+    routes.push({ role: 'fallback', provider: fallback.provider, model: fallback.model });
+  }
+  return routes;
+}
+
+function memoryRouteModelParameters(modelParameters, route, configuredProvider) {
+  const params = { ...(modelParameters || {}) };
+  if (route.role === 'fallback' && route.provider !== configuredProvider) {
+    // Preserve the configured route; do not copy its provider-specific effort to another provider.
+    delete params.reasoning_effort;
+  }
+  return params;
+}
+
+function memoryResultPartiallyApplied(result) {
+  for (const attachment of result || []) {
+    const artifact = attachment?.[Tools.memory];
+    if (artifact?.type !== 'error') {
+      continue;
+    }
+    try {
+      if (JSON.parse(String(artifact.value ?? ''))?.partialApplied === true) {
+        return true;
+      }
+    } catch {
+      /* not a structured artifact */
+    }
+  }
+  return false;
+}
+
+/**
+ * The detached writer finishes after the response was sent, so its structured receipt is
+ * persisted on the response message: the web client reads memory artifacts from message
+ * attachments, and Telegram's follow-up poll projects the same durable receipt. A save is only
+ * acknowledged by this receipt, never by prose.
+ */
+async function persistMemoryReceipt(writerContext, attachments) {
+  const identity = writerContext?.memoryWriteIdentity;
+  if (!identity || identity.userId !== String(writerContext.req?.user?.id || '')) return false;
+  const receipts = (attachments || [])
+    .filter((attachment) => attachment?.[Tools.memory] != null)
+    .map((attachment) => ({
+      ...attachment,
+      messageId: identity.messageId,
+      conversationId: writerContext.conversationId,
+    }));
+  try {
+    return await db.completeMemoryWrite({ ...identity, receipts });
+  } catch (error) {
+    logger.warn(
+      '[AgentClient] Memory receipt persistence failed',
+      sanitizeCompletionErrorForLog(error),
+    );
+    return false;
+  }
+}
+
+async function requireCurrentMemoryWriterAuthority(writerContext) {
+  const { req, userId } = writerContext;
+  if (
+    isVoiceActorSideEffectRestricted(req) ||
+    req?.body?.viventiumDeferVoiceMemory === true ||
+    isCancelledVoiceTask(req) ||
+    shouldSkipAutomaticMemoryWriter(req)
+  ) {
+    throw new Error('Saved-memory write authority is no longer available');
+  }
+  const user = await db.findUser({ _id: userId }, 'role personalization');
+  if (
+    !user ||
+    user.personalization?.memories === false ||
+    !(await checkAccess({
+      user: { ...user, id: String(user._id) },
+      permissionType: PermissionTypes.MEMORIES,
+      permissions: [Permissions.USE],
+      getRoleByName,
+    }))
+  ) {
+    throw new Error('Saved-memory permission is no longer available');
+  }
+  const currentConfig = await require('~/server/services/Config').getAppConfig({ role: user.role });
+  const admittedSource = writerContext.sourceIntegrity?.source;
+  if (
+    !currentConfig?.memory ||
+    currentConfig.memory.disabled === true ||
+    !admittedSource ||
+    memoryWriterConfigDigest(currentConfig) !== admittedSource.configDigest
+  ) {
+    throw new Error('Saved-memory settings are no longer authorized');
+  }
+  const currentReq = { ...req, config: currentConfig, user: { ...user, id: String(user._id) } };
+  if ((await memoryWriterAgentDigest(currentReq)) !== admittedSource.agentDigest) {
+    throw new Error('Saved-memory agent configuration is no longer authorized');
+  }
+  if (
+    writerContext.sourceIntegrity &&
+    !(await memoryWriterRecoverySourcesAreCurrent({
+      userId,
+      conversationId: writerContext.conversationId,
+      ...writerContext.sourceIntegrity,
+      rejectNewerUserSource: writerContext.isRecovery === true,
+      responseMessageId: writerContext.responseMessageId,
+    }))
+  ) {
+    throw new Error('Saved-memory recovery source is no longer available');
+  }
+}
+
+function memoryWriterSourceDigest(message) {
+  // Receipt/feedback/cortex metadata may finish later without changing the admitted conversation.
+  const content = (Array.isArray(message?.content) ? message.content : []).filter(
+    (part) => part?.type === ContentTypes.TEXT || part?.type === ContentTypes.TOOL_CALL,
+  );
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        text: String(message?.text || ''),
+        content,
+        nativeToolEvidence: message?.metadata?.viventium?.nativeToolEvidence,
+      }),
+    )
+    .digest('hex');
+}
+
+async function memoryWriterRecoverySourcesAreCurrent({
+  userId,
+  conversationId,
+  source,
+  admittedAt,
+  rejectNewerUserSource = false,
+  responseMessageId,
+}) {
+  const ids = [...new Set((source?.messageIds || []).filter((id) => typeof id === 'string' && id))];
+  const admittedTime = new Date(admittedAt).getTime();
+  if (!ids.length || !Number.isFinite(admittedTime)) return false;
+  const rows = await db.getMessages(
+    { user: userId, conversationId, deletedAt: null, messageId: { $in: ids } },
+    'user conversationId messageId parentMessageId isCreatedByUser text content deletedAt error metadata',
+  );
+  const byId = new Map(rows.map((row) => [row.messageId, row]));
+  if (byId.get(ids[0])?.isCreatedByUser !== true) return false;
+  if (responseMessageId && ids.includes(responseMessageId)) {
+    let context;
+    try {
+      context = JSON.parse(source.interactionContextJson || 'null');
+    } catch {
+      return false;
+    }
+    if (
+      !isCurrentMemoryWriterResponse({
+        response: byId.get(responseMessageId),
+        userId,
+        conversationId,
+        messageId: responseMessageId,
+        parentMessageId: ids[0],
+        context,
+      })
+    )
+      return false;
+  }
+  if (
+    !ids.every((id) => {
+      const row = byId.get(id);
+      return (
+        row &&
+        String(row.user) === String(userId) &&
+        row.conversationId === conversationId &&
+        row.deletedAt == null &&
+        source.messageDigests?.[id] === memoryWriterSourceDigest(row)
+      );
+    })
+  )
+    return false;
+  return !rejectNewerUserSource || !(await db.hasNewerMemorySource({ userId, admittedAt }));
+}
+
+function memoryWriterConfigDigest(appConfig) {
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        memory: appConfig?.memory,
+        allowedProviders: appConfig?.endpoints?.[EModelEndpoint.agents]?.allowedProviders,
+      }),
+    )
+    .digest('hex');
+}
+
+async function memoryWriterAgentDigest(req) {
+  const agentId = req?.config?.memory?.agent?.id;
+  // Load the configured agent through the existing model and ACL services. The captured Main
+  // agent can already be initialized/mutated and does not establish current write authority.
+  const agent = agentId
+    ? await loadAgent({ req, agent_id: agentId, endpoint: EModelEndpoint.agents })
+    : null;
+  if (
+    agentId &&
+    (!agent ||
+      (!isEphemeralAgentId(agentId) &&
+        req.user?.role !== SystemRoles.ADMIN &&
+        (!agent._id ||
+          !(await require('~/server/services/PermissionService').checkPermission({
+            userId: req.user?.id,
+            role: req.user?.role,
+            resourceType: ResourceType.AGENT,
+            resourceId: agent._id,
+            requiredPermission: PermissionBits.VIEW,
+          })))))
+  ) {
+    throw new Error('Saved-memory agent permission is no longer available');
+  }
+  return crypto.createHash('sha256').update(JSON.stringify(agent)).digest('hex');
+}
+
+async function recoverPendingMemoryWriter(row, memoryWriteIdentity) {
+  const rejectRecovery = async () => {
+    if (await db.startMemoryWrite(memoryWriteIdentity)) {
+      await db.completeMemoryWrite({
+        ...memoryWriteIdentity,
+        receipts: [
+          {
+            type: Tools.memory,
+            messageId: row.messageId,
+            conversationId: row.conversationId,
+            [Tools.memory]: {
+              type: 'error',
+              key: 'system',
+              value: JSON.stringify({
+                errorType: 'writer_recovery_not_safe',
+                partialApplied: false,
+                message:
+                  'This interrupted save could not safely resume because its source, settings, permission, or memory changed. Ask again to retry.',
+              }),
+            },
+          },
+        ],
+      });
+    }
+  };
+  try {
+    const recoverySource = {
+      source: row.savedMemoryWrite.source,
+      admittedAt: row.savedMemoryWrite.admittedAt,
+      responseMessageId: row.messageId,
+    };
+    if (
+      !(await memoryWriterRecoverySourcesAreCurrent({
+        userId: row.user,
+        conversationId: row.conversationId,
+        ...recoverySource,
+        rejectNewerUserSource: true,
+      }))
+    )
+      return rejectRecovery();
+    const user = await db.findUser({ _id: row.user });
+    if (!user) return rejectRecovery();
+    const appConfig = await require('~/server/services/Config').getAppConfig({ role: user.role });
+    const req = {
+      user: { ...user, id: String(user._id) },
+      config: appConfig,
+      headers: {},
+      body: {
+        conversationId: row.conversationId,
+        messageId: row.savedMemoryWrite.source.messageIds[0],
+      },
+    };
+    const res = new (require('http').ServerResponse)(req);
+    // This host never runs Main. The configured memory route resolves its own real agent below.
+    const client = new AgentClient({
+      req,
+      res,
+      agent: { model_parameters: {} },
+      artifactPromises: [],
+      contentParts: [],
+      collectedUsage: [],
+    });
+    client.responseMessageId = row.messageId;
+    client.conversationId = row.conversationId;
+    await client.useMemory();
+    if (!client.memoryWriterState) return rejectRecovery();
+    const snapshot = await loadMemorySnapshot({
+      userId: row.user,
+      readOnly: true,
+      memoryMethods: client.memoryWriterState.memoryMethods,
+      config: client.memoryWriterState.memoryPolicyConfig,
+    });
+    const validation = validatePendingMemoryRecovery({
+      source: row.savedMemoryWrite.source,
+      conversationId: row.conversationId,
+      admittedAt: row.savedMemoryWrite.admittedAt,
+      configDigest: memoryWriterConfigDigest(appConfig),
+      agentDigest: await memoryWriterAgentDigest(req),
+      latestMutationAt: snapshot.latestMutationAt,
+      newerUserSource: await db.hasNewerMemorySource({
+        userId: row.user,
+        admittedAt: row.savedMemoryWrite.admittedAt,
+      }),
+    });
+    if (!validation.ok) return rejectRecovery();
+    setTrustedInteractionContext(req, validation.context);
+    await client.executeAdmittedMemoryWriter([], {
+      req,
+      res,
+      userId: row.user,
+      appConfig,
+      responseMessageId: row.messageId,
+      conversationId: row.conversationId,
+      artifactPromises: [],
+      memoryWriteIdentity,
+      snapshot,
+      memoryWriterState: client.memoryWriterState,
+      sourceIntegrity: recoverySource,
+      isRecovery: true,
+      bufferMessage: new HumanMessage(row.savedMemoryWrite.source.input),
+      timeContext: row.savedMemoryWrite.source.timeContext,
+    });
+  } catch (error) {
+    logger.warn('[AgentClient] Pending saved-memory recovery could not continue', {
+      name: error?.name,
+    });
+    await rejectRecovery();
+  }
 }
 
 function memoryReadUnavailableContext() {
@@ -266,6 +695,7 @@ const {
   persistCortexPartsToCanonicalMessage,
   finalizeCanonicalCortexMessage,
   createCortexFollowUpMessage,
+  settleSuppressedCortexInsightDeliveries,
   buildFollowUpDecisionRecord,
   logFollowUpDecisionRecord,
   persistFollowUpDecisionToParentMessage,
@@ -506,6 +936,7 @@ function buildMergedInsightsDataFromCortexParts(cortexParts) {
  */
 const {
   normalizeTextContentParts,
+  normalizeUserMessageContent,
   normalizeTextPartsInPayload,
   sanitizeProviderFormattedMessages,
 } = require('~/server/services/viventium/normalizeTextContentParts');
@@ -1134,7 +1565,7 @@ const BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_FALLBACK = [
   'A request to run multiple independent objectives concurrently or in parallel while Main remains available counts as a durable background mission, even when the user does not say Worker or background.',
   'For multiple independent delegated objectives, invoke one mission per objective; never combine sibling deliverables into one launch.',
   'Main opening delivered artifacts after callbacks is presentation work, not Worker host access. Set `requiresHostAccess` only when the Worker itself must use the live host session during execution.',
-  'If the first mission launch is blocked, do not attempt later sibling launches in that turn. Report the exact blocker and leave each unstarted objective unresolved.',
+  'A blocked objective does not cancel or block independent work. Continue other permitted launches when the returned blocker does not apply to them; report which result or prerequisite is still missing.',
   'Never claim that Workers finished or that artifacts, downloads, files, or browser windows exist or opened without current-turn delivery evidence for those exact results.',
   '',
   'A cortex insight may inform your answer, but it is not a substitute for a requested durable mission. This rule supersedes earlier background-card guidance.',
@@ -1272,6 +1703,7 @@ function getCompletionErrorChain(err, maxNodes = 8) {
       current.cause,
       current.error,
       current.originalError,
+      current.detail,
       current.reason,
       current.response?.data,
       current.response?.data?.error,
@@ -1292,10 +1724,31 @@ function classifyCompletionErrorForLog(err) {
     .map((candidate) => getCompletionErrorMessage(candidate).trim().toLowerCase())
     .filter(Boolean)
     .join('\n');
-  const codes = errorChain.map((candidate) =>
-    String(candidate?.code || candidate?.lc_error_code || '')
-      .trim()
-      .toLowerCase(),
+  const headerValue = (headers, name) => {
+    if (!headers) return '';
+    if (typeof headers.get === 'function') {
+      return String(headers.get(name) || '').trim();
+    }
+    const match = Object.entries(headers).find(
+      ([key]) => String(key).trim().toLowerCase() === name,
+    );
+    return String(match?.[1] || '').trim();
+  };
+  const codes = errorChain.flatMap((candidate) =>
+    [
+      candidate?.failure_class,
+      candidate?.failureClass,
+      candidate?.error_class,
+      candidate?.errorClass,
+      candidate?.code,
+      candidate?.lc_error_code,
+      headerValue(candidate?.headers, 'x-glasshive-error-code'),
+      headerValue(candidate?.response?.headers, 'x-glasshive-error-code'),
+    ].map((code) =>
+      String(code || '')
+        .trim()
+        .toLowerCase(),
+    ),
   );
   const statuses = errorChain.flatMap((candidate) => [
     candidate?.status,
@@ -1328,6 +1781,9 @@ function classifyCompletionErrorForLog(err) {
    * Preserve known structured classes directly so fallback policy never depends on error prose.
    * === VIVENTIUM END === */
   for (const structuredCode of [
+    'host_capacity',
+    'conversation_session_authority_conflict',
+    'source_context_unavailable',
     'provider_rate_limited',
     'provider_quota_exhausted',
     'provider_response_deadline_exceeded',
@@ -1609,6 +2065,8 @@ function shouldSuppressCompletionErrorContentPart(contentParts, err) {
 function createCompletionErrorContentPart(err) {
   const errorClass = classifyCompletionErrorForLog(err);
   const publicMessageByClass = {
+    host_capacity:
+      'Local AI capacity is busy. Interactive work has priority; retry after the indicated delay.',
     late_stream_termination: 'The model stream ended before a response was available.',
     local_retrieval_timeout:
       'Local retrieval timed out before the model response could be completed.',
@@ -1627,13 +2085,60 @@ function createCompletionErrorContentPart(err) {
     provider_unauthorized: 'The model provider credentials were rejected.',
     provider_access_denied: 'The model provider denied access to this request.',
     context_length_exceeded: 'The request was too large for the model context.',
+    conversation_session_authority_conflict:
+      'A conflicting background request was stopped without interrupting the active response.',
+    source_context_unavailable:
+      'The conversation context could not be preserved. Please retry this turn.',
     completion_error: 'The model provider could not complete this request.',
+  };
+  const hostCapacityMetadata = () => {
+    if (errorClass !== 'host_capacity') return {};
+    const chain = getCompletionErrorChain(err);
+    const detail = chain.find(
+      (candidate) =>
+        String(candidate?.code || candidate?.failure_class || '')
+          .trim()
+          .toLowerCase() === 'host_capacity',
+    );
+    const headerValue = (headers, name) => {
+      if (!headers) return '';
+      if (typeof headers.get === 'function') return String(headers.get(name) || '').trim();
+      const match = Object.entries(headers).find(
+        ([key]) => String(key).trim().toLowerCase() === name,
+      );
+      return String(match?.[1] || '').trim();
+    };
+    const retryAfter = Number(
+      detail?.retryAfter ||
+        headerValue(err?.response?.headers, 'retry-after') ||
+        headerValue(err?.headers, 'retry-after'),
+    );
+    const capacityClass = String(detail?.capacityClass || '').trim();
+    return {
+      retryable: true,
+      ...(Number.isFinite(retryAfter) && retryAfter > 0
+        ? { retry_after_seconds: Math.ceil(retryAfter) }
+        : {}),
+      ...(capacityClass ? { capacity_class: capacityClass.slice(0, 80) } : {}),
+    };
   };
   return {
     type: ContentTypes.ERROR,
     [ContentTypes.ERROR]: publicMessageByClass[errorClass] || publicMessageByClass.completion_error,
     error_class: errorClass,
+    ...hostCapacityMetadata(),
   };
+}
+
+function annotateScheduledFailureParts(contentParts, interactionContext) {
+  if (interactionContext?.actor_kind !== 'system' || interactionContext?.origin !== 'scheduler') {
+    return contentParts;
+  }
+  return contentParts.map((part) =>
+    part?.type === ContentTypes.ERROR
+      ? { ...part, ...scheduledFailureMetadata(part.error_class) }
+      : part,
+  );
 }
 
 function handleCompletionErrorContentPart({ contentParts, err, abortController, log = logger }) {
@@ -1784,27 +2289,6 @@ function getCortexSpeculativeParallelEnabled(req) {
   return !voiceMode;
 }
 
-function convertHarnessActivityParts(contentParts) {
-  if (!Array.isArray(contentParts)) {
-    return contentParts;
-  }
-  for (let index = 0; index < contentParts.length; index += 1) {
-    const part = contentParts[index];
-    if (!part || part.type !== ContentTypes.THINK) {
-      continue;
-    }
-    const summary = typeof part.think === 'string' ? part.think : String(part.think?.value || '');
-    contentParts[index] = {
-      type: ContentTypes.HARNESS_ACTIVITY,
-      harness_activity: {
-        event: 'reasoning-summary',
-        summary,
-      },
-    };
-  }
-  return contentParts;
-}
-
 /* === VIVENTIUM START ===
  * Feature: GlassHive activity durability across upstream aggregation.
  * Purpose: Reconcile the request-local safe activity stream with aggregated content before final
@@ -1816,27 +2300,45 @@ function mergeCapturedHarnessActivityParts(contentParts, req) {
     ? req._viventiumCapturedHarnessActivityParts
     : [];
   if (!captured.length) return contentParts;
+  const typedActivityFields = (activity) => ({
+    ...Object.fromEntries(
+      ['tool', 'task', 'status']
+        .map((key) => [key, activity?.[key]])
+        .filter(([, value]) => typeof value === 'string' && value.trim())
+        .map(([key, value]) => [key, value.trim().slice(0, 80)]),
+    ),
+    // Typed anchor: only a GlassHive run-dispatching tool delivers a deferred Worker callback.
+    ...(activity?.expects_deferred_callback === true ? { expects_deferred_callback: true } : {}),
+  });
   const safeCaptured = captured
     .map((part) => {
       if (!part || part.type !== ContentTypes.HARNESS_ACTIVITY) return null;
       const event = String(part?.harness_activity?.event || '');
       const summary = String(part?.harness_activity?.summary || '');
       return event && summary
-        ? { type: ContentTypes.HARNESS_ACTIVITY, harness_activity: { event, summary } }
+        ? {
+            type: ContentTypes.HARNESS_ACTIVITY,
+            harness_activity: { event, summary, ...typedActivityFields(part.harness_activity) },
+          }
         : null;
     })
     .filter(Boolean);
   if (!safeCaptured.length) return contentParts;
   const capturedMatch = (part, startIndex) => {
-    if (!part || part.type !== ContentTypes.HARNESS_ACTIVITY) return null;
-    const event = String(part?.harness_activity?.event || '');
-    const summary = String(part?.harness_activity?.summary || '');
-    if (!event || !summary) return null;
+    const legacyAggregate = part?.type === ContentTypes.THINK;
+    if (!legacyAggregate && part?.type !== ContentTypes.HARNESS_ACTIVITY) return null;
+    const event = legacyAggregate ? '' : String(part.harness_activity?.event || '');
+    const summary = legacyAggregate
+      ? typeof part.think === 'string'
+        ? part.think
+        : String(part.think?.value || '')
+      : String(part.harness_activity?.summary || '');
+    if ((!legacyAggregate && !event) || !summary) return null;
     let combined = '';
     let matchedCount = 0;
     for (let index = startIndex; index < safeCaptured.length; index += 1) {
       const candidate = safeCaptured[index];
-      if (candidate.harness_activity.event !== event) break;
+      if (!legacyAggregate && candidate.harness_activity.event !== event) break;
       combined += candidate.harness_activity.summary;
       matchedCount += 1;
       if (combined === summary) return { length: index - startIndex + 1, remainder: '' };
@@ -1858,6 +2360,7 @@ function mergeCapturedHarnessActivityParts(contentParts, req) {
       harness_activity: {
         event: String(part.harness_activity.event),
         summary: String(part.harness_activity.summary),
+        ...typedActivityFields(part.harness_activity),
       },
     }));
   const reconciled = [];
@@ -1869,7 +2372,10 @@ function mergeCapturedHarnessActivityParts(contentParts, req) {
       captureIndex = safeCaptured.length;
       flushedBeforeText = true;
     }
-    if (captureIndex < safeCaptured.length && part?.type === ContentTypes.HARNESS_ACTIVITY) {
+    if (
+      captureIndex < safeCaptured.length &&
+      (part?.type === ContentTypes.HARNESS_ACTIVITY || part?.type === ContentTypes.THINK)
+    ) {
       let matchedStart = -1;
       let matchedLength = 0;
       let matchedRemainder = '';
@@ -1886,13 +2392,20 @@ function mergeCapturedHarnessActivityParts(contentParts, req) {
         reconciled.push(...cloneCapturedRange(captureIndex, matchedStart + matchedLength));
         captureIndex = matchedStart + matchedLength;
         if (matchedRemainder) {
-          reconciled.push({
-            type: ContentTypes.HARNESS_ACTIVITY,
-            harness_activity: {
-              event: String(part.harness_activity.event),
-              summary: matchedRemainder,
-            },
-          });
+          reconciled.push(
+            part.type === ContentTypes.THINK
+              ? {
+                  type: ContentTypes.THINK,
+                  think: matchedRemainder,
+                }
+              : {
+                  type: ContentTypes.HARNESS_ACTIVITY,
+                  harness_activity: {
+                    event: String(part.harness_activity.event),
+                    summary: matchedRemainder,
+                  },
+                },
+          );
         }
         continue;
       }
@@ -1912,23 +2425,37 @@ function finalizeHarnessActivityPartsForPersistence(contentParts, req) {
     }
   }
   sanitizeAggregatedContentParts(contentParts);
+  mergeCapturedHarnessActivityParts(contentParts, req);
   if (
     req?._viventiumHarnessExecutionEnabled === true ||
     req?._viventiumCapturedHarnessActivityParts?.length > 0
   ) {
     convertHarnessActivityParts(contentParts);
   }
-  return mergeCapturedHarnessActivityParts(contentParts, req);
+  return contentParts;
 }
 /* === VIVENTIUM END === */
 
 function isHarnessInvocationLocked(req) {
   return (
-    (req?._viventiumHarnessExecutionEnabled === true ||
+    req?._viventiumToolInvocationStarted === true ||
+    ((req?._viventiumHarnessExecutionEnabled === true ||
       req?._viventiumHarnessActivityEnabled === true) &&
-    req?._viventiumHarnessInvocationStarted === true
+      req?._viventiumHarnessInvocationStarted === true)
   );
 }
+
+/* === VIVENTIUM START ===
+ * Restore the registered-tool effect fence for ordinary graph routes. Unknown tools may mutate
+ * external state; lock before dispatch, including uncertain outcomes with no visible response.
+ */
+const {
+  isFallbackReplaySafeToolMetadata,
+} = require('~/server/services/viventium/toolEffectMetadata');
+function shouldLockFallbackForToolStart(callbackArgs = []) {
+  return !isFallbackReplaySafeToolMetadata(callbackArgs[5]);
+}
+/* === VIVENTIUM END === */
 
 /**
  * Fail-closed gate for speculative parallel detection.
@@ -2434,6 +2961,17 @@ function buildViventiumMcpRequestBody({
         };
       })
     : [];
+  const sourceSegments = interactionContext?.source_segments || [];
+  const filesById = new Map(files.map((file) => [file.file_id || file.temp_file_id, file]));
+  const sourceFiles = sourceSegments.flatMap((segment) =>
+    (segment.source_files || []).map((file) => ({
+      ...filesById.get(file.file_id),
+      ...file,
+      source_event_id: segment.source_event_id,
+      source_index: segment.source_index,
+    })),
+  );
+  const projectedFiles = sourceSegments.length ? sourceFiles : files;
   return {
     messageId,
     conversationId,
@@ -2447,18 +2985,28 @@ function buildViventiumMcpRequestBody({
     viventiumStreamId: req?.body?.streamId || req?._resumableStreamId,
     viventiumVoiceRequestId: req?.viventiumVoiceRequestId,
     viventiumVoiceCallSessionId: req?.viventiumCallSession?.callSessionId,
+    viventiumVoiceWorkAuthority: req?.viventiumVoiceWorkAuthority,
     viventiumVoiceStartAtMs: req?.viventiumVoiceStartAt,
     viventiumVoiceStartPerfMs: req?.viventiumVoicePerfStartAt,
     viventiumTelegramChatId: req?.body?.telegramChatId,
     viventiumTelegramUserId: req?.body?.telegramUserId,
     viventiumTelegramMessageId: req?.body?.telegramMessageId,
     telegramAudioRequested: req?.body?.telegramAudioRequested === true,
+    viventiumSourceEventId: interactionContext?.source_event_id,
+    viventiumAuthoringSourceEventId: interactionContext?.source_event_id,
+    viventiumTriggeringSourceSegments: sourceSegments,
+    viventiumTriggeringSourceSegmentsOverflowCount:
+      interactionContext?.source_segments_overflow_count,
     viventiumLogicalTurnId: interactionContext?.logical_turn_id,
     viventiumLogicalTurnRevision: interactionContext?.logical_turn_id
       ? String(interactionContext.revision)
       : undefined,
-    ...(files.length
-      ? { files, attachments: files, file_ids: files.map((file) => file.file_id).filter(Boolean) }
+    ...(projectedFiles.length
+      ? {
+          files: projectedFiles,
+          attachments: projectedFiles,
+          file_ids: Array.from(new Set(projectedFiles.map((file) => file.file_id).filter(Boolean))),
+        }
       : {}),
     ...(toolResources ? { tool_resources: toolResources } : {}),
   };
@@ -2556,6 +3104,26 @@ class AgentClient extends BaseClient {
     this.options.agent = sideEffectsRestricted
       ? sanitizeAgentForRestrictedVoiceTurn(this.options.agent)
       : cloneAgentConfigForRuntime(this.options.agent);
+    /* === VIVENTIUM START === Capture authored Main authority before the first durable root placeholder. === */
+    this.mainContinuityStableAuthority = stableMainAuthorityDigest(this.options.agent);
+    const mainRequest = this.options.req;
+    if (
+      mainRequest?.user?.id &&
+      this.options.agent?.id &&
+      !Object.hasOwn(mainRequest, '_viventiumAcceptedMainCompactionIdentityV1')
+    ) {
+      Object.defineProperty(mainRequest, '_viventiumAcceptedMainCompactionIdentityV1', {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: Object.freeze({
+          ownerId: String(mainRequest.user.id),
+          agentId: String(this.options.agent.id),
+          stableAuthoritySha256: this.mainContinuityStableAuthority,
+        }),
+      });
+    }
+    /* === VIVENTIUM END === */
     /* === VIVENTIUM START ===
      * Feature: Voice actor authority boundary
      * Purpose: Shared-mic/guest attribution may inform the reply, but it cannot authorize tools,
@@ -2682,6 +3250,15 @@ class AgentClient extends BaseClient {
       mapCondition: (message) => message.addedConvo === true,
       skipCondition: isPassiveVoiceTranscriptMessage,
     });
+    // Keep persisted source identities before LangChain formatting assigns invocation-local IDs.
+    this.memoryWriterSourceMessageIds = orderedMessages
+      .map((message) => message.messageId)
+      .filter(Boolean);
+    this.memoryWriterSourceMessageDigests = Object.fromEntries(
+      orderedMessages
+        .filter((message) => message.messageId)
+        .map((message) => [message.messageId, memoryWriterSourceDigest(message)]),
+    );
 
     let payload;
     /** @type {number | undefined} */
@@ -2745,7 +3322,7 @@ class AgentClient extends BaseClient {
      * - Fail open to ordinary Viventium if local state is unavailable or slow.
      * === VIVENTIUM END === */
     let feelingSnapshot = null;
-    promptFrameLayers.viventium_user_fact_guard = VIVENTIUM_USER_FACT_GUARD;
+    promptFrameLayers.viventium_user_fact_guard = getViventiumUserFactGuard();
     const feelingReadStartedAt = Date.now();
     const evalIsolation = evalIsolationForRequest(req);
     if (evalIsolation.feelings) {
@@ -2880,10 +3457,17 @@ class AgentClient extends BaseClient {
 
     const formattedMessages = orderedMessages.map((message, i) => {
       const formattedMessage = formatMessage({
-        message,
+        message: normalizeUserMessageContent(message),
         userName: this.options?.name,
         assistantName: this.options?.modelLabel,
       });
+      /* === VIVENTIUM START === Preserve persisted identity through upstream message formatting. */
+      formattedMessage.messageId = message.messageId;
+      formattedMessage.delivery = mainMessageDelivery(
+        message,
+        String(this.options.req?.user?.id || ''),
+      );
+      /* === VIVENTIUM END === */
 
       /** For non-latest messages, prepend file context directly to message content */
       if (message.fileContext && i !== orderedMessages.length - 1) {
@@ -2934,6 +3518,10 @@ class AgentClient extends BaseClient {
      * This includes: file context (latest message), augmented prompt (RAG), memory context.
      */
     const sharedRunContextParts = [];
+    setConversationProviderCapability(req, resolveConversationProviderId(this.options.agent));
+    const memoryUsesTurnContext = req.viventiumTimeContextDelivery === 'per_turn_header';
+    let memoryContext = '';
+    this.glasshiveWorkerMemory = '';
 
     /** File context from the latest message (attachments) */
     const latestMessage = orderedMessages[orderedMessages.length - 1];
@@ -2991,15 +3579,14 @@ class AgentClient extends BaseClient {
       }
     })();
     if (memoryResult) {
-      const memoryContext = `${memoryInstructions}\n\n# Existing memory about the user:\n${memoryResult}`;
-      sharedRunContextParts.push(memoryContext);
+      memoryContext = `# Existing memory about the user:\n${memoryResult}`;
       promptFrameLayers.memory_context = memoryContext;
       // Carry the (already permission-gated + token-limited) memory content so a GlassHive worker
       // launched during this run receives the same user context the main agent has (Quality parity).
       this.glasshiveWorkerMemory = memoryResult;
     } else if (this.memoryReadUnavailable === true) {
       const unavailableContext = memoryReadUnavailableContext();
-      sharedRunContextParts.push(unavailableContext);
+      memoryContext = unavailableContext;
       promptFrameLayers.memory_context = unavailableContext;
       this.glasshiveWorkerMemory = unavailableContext;
     }
@@ -3013,7 +3600,7 @@ class AgentClient extends BaseClient {
     }
     /* === VIVENTIUM NOTE END === */
 
-    const sharedRunContext = sharedRunContextParts.join('\n\n');
+    const sharedRunContext = [...sharedRunContextParts, memoryContext].filter(Boolean).join('\n\n');
 
     /* === VIVENTIUM NOTE ===
      * Feature: Conversation recall prompt injection (config-driven, scope-aware).
@@ -3091,7 +3678,10 @@ class AgentClient extends BaseClient {
           agentId,
           logger,
           mcpManager,
-          sharedRunContext,
+          sharedRunContext:
+            memoryUsesTurnContext && agentId === this.options.agent.id
+              ? sharedRunContextParts.join('\n\n')
+              : sharedRunContext,
           dynamicTailContext: buildViventiumDynamicTail({
             capsule: feelingTailForAgent({
               snapshot: feelingSnapshot,
@@ -3143,6 +3733,8 @@ class AgentClient extends BaseClient {
          */
         provider: resolveConversationProviderId(this.options.agent),
         model: this.options.agent?.model_parameters?.model || this.options.agent?.model,
+        reasoningEffort: this.options.agent?.model_parameters?.reasoning_effort,
+        agentId: this.options.agent?.id,
         requestIdentity: {
           ownerId: req?.user?.id || req?.user?._id,
           interactionContext: getTrustedInteractionContext(req),
@@ -3221,6 +3813,8 @@ class AgentClient extends BaseClient {
    */
   async useMemory() {
     this.memoryReadUnavailable = false;
+    this.memoryReadAvailability = 'disabled';
+    this.memoryReadContext = null;
     if (evalIsolationForRequest(this.options.req).savedMemory) {
       this.memoryWriterState = null;
       logger.debug('[VIVENTIUM][EvalIsolation] Saved memory read/write skipped');
@@ -3241,6 +3835,7 @@ class AgentClient extends BaseClient {
       });
     } catch (error) {
       this.memoryReadUnavailable = true;
+      this.memoryReadAvailability = 'unavailable';
       this.memoryWriterState = null;
       void recordMemoryContinuityHealth({
         userId: String(user.id),
@@ -3256,6 +3851,7 @@ class AgentClient extends BaseClient {
     }
 
     if (!hasAccess) {
+      this.memoryReadAvailability = 'denied';
       logger.debug(
         `[api/server/controllers/agents/client.js #useMemory] User ${user.id} does not have USE permission for memories`,
       );
@@ -3315,6 +3911,7 @@ class AgentClient extends BaseClient {
         config: memoryPolicyConfig,
       });
       this.memoryReadContext = readContext;
+      this.memoryReadAvailability = readContext.text ? 'available' : 'empty';
       void recordMemoryContinuityHealth({
         userId,
         path: 'read',
@@ -3324,6 +3921,7 @@ class AgentClient extends BaseClient {
       return readContext.text || undefined;
     } catch (error) {
       this.memoryReadUnavailable = true;
+      this.memoryReadAvailability = 'unavailable';
       void recordMemoryContinuityHealth({
         userId,
         path: 'read',
@@ -3338,7 +3936,7 @@ class AgentClient extends BaseClient {
     }
   }
 
-  createMemoryWriterStatusAttachment({ message, errorType = 'provider_auth' }) {
+  createMemoryWriterStatusAttachment({ message, errorType = 'provider_auth', provider }) {
     return {
       type: Tools.memory,
       messageId: this.responseMessageId + '',
@@ -3348,18 +3946,20 @@ class AgentClient extends BaseClient {
         key: 'system',
         value: JSON.stringify({
           errorType,
+          ...(provider ? { provider } : {}),
           message,
         }),
       },
     };
   }
 
-  createMemoryWriterUnavailableAttachment(message) {
+  createMemoryWriterUnavailableAttachment(message, provider) {
     return this.createMemoryWriterStatusAttachment({
       message:
         message ||
         'Saved memory could not be updated after this turn. The reply is preserved, but durable memory freshness is degraded until the writer recovers.',
       errorType: 'writer_unavailable',
+      provider,
     });
   }
 
@@ -3368,11 +3968,11 @@ class AgentClient extends BaseClient {
       return { ok: true };
     }
 
-    if (!this.memoryWriterState) {
+    if (!this.memoryWriterState && !writerContext.memoryWriterState) {
       await this.useMemory();
     }
 
-    const state = this.memoryWriterState;
+    const state = writerContext.memoryWriterState || this.memoryWriterState;
     if (!state) {
       return { ok: false };
     }
@@ -3386,8 +3986,69 @@ class AgentClient extends BaseClient {
     const allowedProviders = new Set(
       appConfig?.endpoints?.[EModelEndpoint.agents]?.allowedProviders,
     );
-    const configuredProvider = memoryConfig?.agent?.provider;
-    const configuredModel = memoryConfig?.agent?.model;
+    const routeCandidates =
+      memoryConfig.agent?.id != null
+        ? [{ role: 'primary', agentId: memoryConfig.agent.id }]
+        : memoryWriterRoutes(memoryConfig);
+    if (routeCandidates.length === 0) {
+      return {
+        ok: false,
+        attachment: this.createMemoryWriterUnavailableAttachment(
+          'Saved memory could not be updated because no usable memory writer is configured.',
+        ),
+      };
+    }
+    let lastAttachment = null;
+    for (const route of routeCandidates) {
+      const outcome = await this.initializeMemoryWriterRoute(route, {
+        req,
+        res,
+        activeAgent,
+        state,
+        allowedProviders,
+        writerContext,
+      });
+      if (outcome?.ok) {
+        this.memoryWriterRoute = {
+          role: route.role,
+          provider: outcome.provider || null,
+          model: outcome.model || null,
+        };
+        if (route.role === 'fallback') {
+          logger.info(
+            '[AgentClient] Saved memory writer is using the explicitly configured fallback route',
+            {
+              provider: this.memoryWriterRoute.provider,
+              model: this.memoryWriterRoute.model,
+            },
+          );
+        }
+        return { ok: true, route: this.memoryWriterRoute };
+      }
+      if (outcome?.attachment) {
+        lastAttachment = outcome.attachment;
+      }
+    }
+    return {
+      ok: false,
+      attachment: lastAttachment || this.createMemoryWriterUnavailableAttachment(),
+    };
+  }
+
+  /**
+   * Initialize the saved-memory writer on exactly one configured route.
+   * @returns {Promise<{ok: boolean, provider?: string, model?: string, attachment?: object}>}
+   */
+  async initializeMemoryWriterRoute(
+    route,
+    { req, res, activeAgent, state, allowedProviders, writerContext },
+  ) {
+    const { userId, memoryConfig, memoryMethods, memoryPolicyConfig } = state;
+    /** @type {Agent} */
+    let prelimAgent;
+    const configuredProvider =
+      route.agentId != null ? memoryConfig?.agent?.provider : route.provider;
+    const configuredModel = route.agentId != null ? memoryConfig?.agent?.model : route.model;
     if (configuredProvider || configuredModel) {
       const gate = getMemoryWriterHealthGate({
         userId,
@@ -3396,35 +4057,70 @@ class AgentClient extends BaseClient {
       });
       if (gate.blocked) {
         if (gate.shouldLog) {
-          logger.warn('[AgentClient] Saved memory writer degraded; provider reconnect required', {
-            provider: configuredProvider || null,
-            model: configuredModel || null,
-            retryAt: new Date(gate.blockedUntil).toISOString(),
-            reason: gate.reason,
-          });
+          logger.warn(
+            '[AgentClient] Saved memory writer route gated; trying the next configured route',
+            {
+              route: route.role,
+              provider: configuredProvider || null,
+              model: configuredModel || null,
+              retryAt: new Date(gate.blockedUntil).toISOString(),
+              reason: gate.reason,
+            },
+          );
         }
         return {
           ok: false,
-          attachment: this.createMemoryWriterStatusAttachment({ message: gate.message }),
+          attachment: this.createMemoryWriterStatusAttachment({
+            message: gate.message,
+            errorType:
+              gate.errorType ||
+              (gate.reason === 'quota' ? 'provider_quota_exhausted' : 'provider_auth'),
+            provider: gate.provider || configuredProvider,
+          }),
         };
       }
     }
 
     try {
-      if (memoryConfig.agent?.id != null && memoryConfig.agent.id !== activeAgent?.id) {
-        prelimAgent = await loadAgent({
+      if (
+        route.agentId != null &&
+        (writerContext.memoryWriteIdentity || route.agentId !== activeAgent?.id)
+      ) {
+        const loadedMemoryAgent = await loadAgent({
           req,
-          agent_id: memoryConfig.agent.id,
+          agent_id: route.agentId,
           endpoint: EModelEndpoint.agents,
         });
-      } else if (memoryConfig.agent?.id != null) {
+        // Admitted work is bound to the configured source, including when Main shares its ID.
+        // Main may already have different initialization overrides; never reuse that mutable object.
+        if (
+          writerContext.memoryWriteIdentity &&
+          crypto.createHash('sha256').update(JSON.stringify(loadedMemoryAgent)).digest('hex') !==
+            writerContext.sourceIntegrity?.source?.agentDigest
+        ) {
+          return {
+            ok: false,
+            attachment: this.createMemoryWriterUnavailableAttachment(
+              'Saved-memory agent configuration changed before execution. Ask again to retry.',
+            ),
+          };
+        }
+        prelimAgent = loadedMemoryAgent;
+      } else if (route.agentId != null) {
         prelimAgent = activeAgent;
-      } else if (
-        memoryConfig.agent?.id == null &&
-        memoryConfig.agent?.model != null &&
-        memoryConfig.agent?.provider != null
-      ) {
-        prelimAgent = { id: Constants.EPHEMERAL_AGENT_ID, ...memoryConfig.agent };
+      } else if (route.provider != null && route.model != null) {
+        const { fallback: _fallback, ...configuredAgent } = memoryConfig.agent || {};
+        prelimAgent = {
+          id: Constants.EPHEMERAL_AGENT_ID,
+          ...configuredAgent,
+          provider: route.provider,
+          model: route.model,
+          model_parameters: memoryRouteModelParameters(
+            configuredAgent.model_parameters,
+            route,
+            configuredAgent.provider,
+          ),
+        };
       }
     } catch (error) {
       logger.error(
@@ -3442,6 +4138,21 @@ class AgentClient extends BaseClient {
       };
     }
 
+    /* === VIVENTIUM START === Resolve native memory transport from declared capabilities. === */
+    const writerCapability =
+      req?.config?.endpoints?.agents?.providerCapabilities?.[prelimAgent.provider];
+    const nativeWriter =
+      writerCapability?.worker_native_tools === true || writerCapability?.native_tools === true;
+    if (nativeWriter && !writerContext.memoryWriteIdentity) {
+      return {
+        ok: false,
+        attachment: this.createMemoryWriterUnavailableAttachment(
+          'Saved memory requires an admitted owner-scoped writer run.',
+          configuredProvider,
+        ),
+      };
+    }
+    /* === VIVENTIUM END === */
     let agent;
     try {
       agent = await initializeAgent(
@@ -3453,7 +4164,7 @@ class AgentClient extends BaseClient {
           endpointOption: {
             endpoint: !isEphemeralAgentId(prelimAgent.id)
               ? EModelEndpoint.agents
-              : memoryConfig.agent?.provider,
+              : prelimAgent.provider,
           },
         },
         {
@@ -3479,8 +4190,9 @@ class AgentClient extends BaseClient {
         '[api/server/controllers/agents/client.js #initializeMemoryWriter] Error initializing memory writer',
         {
           error: sanitizeCompletionErrorForLog(error),
-          provider: memoryConfig?.agent?.provider,
-          model: memoryConfig?.agent?.model,
+          route: route.role,
+          provider: configuredProvider,
+          model: configuredModel,
           memoryWriterHealth: healthEntry
             ? {
                 reason: healthEntry.reason,
@@ -3492,8 +4204,12 @@ class AgentClient extends BaseClient {
       return {
         ok: false,
         attachment: healthEntry
-          ? this.createMemoryWriterStatusAttachment({ message: healthEntry.message })
-          : this.createMemoryWriterUnavailableAttachment(),
+          ? this.createMemoryWriterStatusAttachment({
+              message: healthEntry.message,
+              errorType: healthEntry.errorType,
+              provider: healthEntry.provider || configuredProvider,
+            })
+          : this.createMemoryWriterUnavailableAttachment(undefined, configuredProvider),
       };
     }
 
@@ -3502,14 +4218,16 @@ class AgentClient extends BaseClient {
         '[api/server/controllers/agents/client.js #initializeMemoryWriter] No agent found for memory',
         {
           hasMemoryAgent: Boolean(memoryConfig?.agent),
-          provider: memoryConfig?.agent?.provider || null,
-          model: memoryConfig?.agent?.model || null,
+          route: route.role,
+          provider: configuredProvider || null,
+          model: configuredModel || null,
         },
       );
       return {
         ok: false,
         attachment: this.createMemoryWriterUnavailableAttachment(
           'Saved memory could not be updated because the configured memory writer is unavailable.',
+          configuredProvider,
         ),
       };
     }
@@ -3530,6 +4248,7 @@ class AgentClient extends BaseClient {
     if (gate.blocked) {
       if (gate.shouldLog) {
         logger.warn('[AgentClient] Saved memory writer degraded; skipping background writer', {
+          route: route.role,
           provider: llmConfig.provider || null,
           model: llmConfig.model || null,
           retryAt: new Date(gate.blockedUntil).toISOString(),
@@ -3538,7 +4257,13 @@ class AgentClient extends BaseClient {
       }
       return {
         ok: false,
-        attachment: this.createMemoryWriterStatusAttachment({ message: gate.message }),
+        attachment: this.createMemoryWriterStatusAttachment({
+          message: gate.message,
+          errorType:
+            gate.errorType ||
+            (gate.reason === 'quota' ? 'provider_quota_exhausted' : 'provider_auth'),
+          provider: gate.provider || configuredProvider,
+        }),
       };
     }
 
@@ -3566,7 +4291,8 @@ class AgentClient extends BaseClient {
      *
      * Added: 2026-02-07
      * === VIVENTIUM NOTE END === */
-    const memoryTimeContextInstructions = buildTimeContextInstructions(req);
+    const memoryTimeContextInstructions =
+      writerContext.timeContext ?? buildTimeContextInstructions(req);
     if (memoryTimeContextInstructions) {
       config.instructions = [config.instructions || '', memoryTimeContextInstructions]
         .filter(Boolean)
@@ -3576,15 +4302,78 @@ class AgentClient extends BaseClient {
     const messageId = writerContext.responseMessageId || this.responseMessageId + '';
     const conversationId = writerContext.conversationId || this.conversationId + '';
     const streamId = req?._resumableStreamId || null;
+    const writerMemoryMethods = writerContext.memoryWriteIdentity
+      ? {
+          ...memoryMethods,
+          ...Object.fromEntries(
+            ['setMemory', 'deleteMemory'].map((method) => [
+              method,
+              async (params) => {
+                await requireCurrentMemoryWriterAuthority(writerContext);
+                try {
+                  const result = await memoryMethods[method]({
+                    ...params,
+                    writerEffect: {
+                      messageId: writerContext.memoryWriteIdentity.messageId,
+                      owner: writerContext.memoryWriteIdentity.owner,
+                      operationId: crypto.randomUUID(),
+                    },
+                  });
+                  if (result.ok) writerContext.memoryMutationApplied = true;
+                  return result;
+                } catch (error) {
+                  writerContext.memoryMutationUncertain = true;
+                  throw error;
+                }
+              },
+            ]),
+          ),
+        }
+      : memoryMethods;
+    /* === VIVENTIUM START === Reuse the admitted writer and signed native capability broker. === */
+    if (nativeWriter) {
+      const { createNativeMemoryExecutor } = require('@librechat/api');
+      const {
+        bindActiveMemoryWriterTool,
+      } = require('~/server/services/viventium/memoryWriterCoordinator');
+      const {
+        buildConversationProviderBootstrapBundle,
+      } = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
+      const {
+        attachConversationProviderBootstrapBundle,
+      } = require('~/server/services/viventium/GlassHiveConversationProviderService');
+      config.nativeExecutor = createNativeMemoryExecutor({
+        identity: { ...writerContext.memoryWriteIdentity, conversationId },
+        agent,
+        user: createSafeUser(req.user),
+        requestBody: req.body || {},
+        authorize: () => requireCurrentMemoryWriterAuthority(writerContext),
+        register: bindActiveMemoryWriterTool,
+        buildBundle: buildConversationProviderBootstrapBundle,
+        attachBundle: (args) => attachConversationProviderBootstrapBundle({ ...args, req }),
+        createProviderRun: createRun,
+      });
+    }
+    /* === VIVENTIUM END === */
     let processMemory;
     try {
+      // Provider failover shares the original prompt/revision snapshot. Re-reading here could
+      // rebase an older source onto a later panel correction and let its stale overwrite pass CAS.
+      if (!writerContext.snapshot) {
+        writerContext.snapshot = await loadMemorySnapshot({
+          userId,
+          config,
+          memoryMethods: writerMemoryMethods,
+        });
+      }
       [, processMemory] = await createMemoryProcessor({
         userId,
         config,
         messageId,
         streamId,
         conversationId,
-        memoryMethods,
+        snapshot: writerContext.snapshot,
+        memoryMethods: writerMemoryMethods,
         res,
         user: req?.user ? createSafeUser(req.user) : undefined,
         auditSource: resolveViventiumSurface(req) || 'chat',
@@ -3600,6 +4389,7 @@ class AgentClient extends BaseClient {
         '[api/server/controllers/agents/client.js #initializeMemoryWriter] Error creating memory processor',
         {
           error: sanitizeCompletionErrorForLog(error),
+          route: route.role,
           provider: llmConfig.provider,
           model: llmConfig.model,
           memoryWriterHealth: healthEntry
@@ -3613,13 +4403,17 @@ class AgentClient extends BaseClient {
       return {
         ok: false,
         attachment: healthEntry
-          ? this.createMemoryWriterStatusAttachment({ message: healthEntry.message })
-          : this.createMemoryWriterUnavailableAttachment(),
+          ? this.createMemoryWriterStatusAttachment({
+              message: healthEntry.message,
+              errorType: healthEntry.errorType,
+              provider: healthEntry.provider || configuredProvider,
+            })
+          : this.createMemoryWriterUnavailableAttachment(undefined, configuredProvider),
       };
     }
 
     this.processMemory = processMemory;
-    return { ok: true };
+    return { ok: true, provider: llmConfig.provider, model: llmConfig.model };
   }
 
   /**
@@ -3672,6 +4466,49 @@ class AgentClient extends BaseClient {
    * @param {BaseMessage[]} messages
    * @returns {Promise<void | (TAttachment | null)[]>}
    */
+  prepareMemoryWriterBuffer(messages, memoryConfig) {
+    const messageWindowSize = memoryConfig?.messageWindowSize ?? 5;
+    const historyContextMessageScanLimit = memoryConfig?.historyContextMessageScanLimit ?? 40;
+    const historyContextUserTurnLimit = memoryConfig?.historyContextUserTurnLimit ?? 4;
+    const historyContextCharLimit = memoryConfig?.historyContextCharLimit ?? 1200;
+
+    let messagesToProcess = [...messages];
+    let windowStartIndex = 0;
+    if (messages.length > messageWindowSize) {
+      // The window must end at the newest source, including after a dropped/failed assistant.
+      windowStartIndex = Math.max(0, messages.length - messageWindowSize);
+      for (let i = windowStartIndex; i < messages.length; i++) {
+        if (getMemoryRoleLabel(messages[i]) === 'Human') {
+          windowStartIndex = i;
+          break;
+        }
+      }
+      messagesToProcess = messages.slice(windowStartIndex);
+    }
+
+    const historicalUserContext = buildHistoricalUserContextBuffer({
+      messages,
+      windowStartIndex,
+      scanLimit: historyContextMessageScanLimit,
+      userTurnLimit: historyContextUserTurnLimit,
+      charLimit: historyContextCharLimit,
+      transformMessage: (message) => this.filterImageUrls(message),
+    });
+    const filteredMessages = messagesToProcess.map((msg) => this.filterImageUrls(msg));
+    const bufferString = buildMemoryBufferString(filteredMessages);
+    if (!bufferString) {
+      return;
+    }
+    const sections = [];
+    if (historicalUserContext) {
+      sections.push(
+        `# Recent User Context Outside Current Chat Window:\n\n${historicalUserContext}`,
+      );
+    }
+    sections.push(`# Current Chat:\n\n${bufferString}`);
+    return new HumanMessage(sections.join('\n\n'));
+  }
+
   async runMemory(messages, writerContext = {}) {
     const req = writerContext.req || this.options?.req;
     const userId = writerContext.userId || this.memoryWriterState?.userId || req?.user?.id;
@@ -3682,53 +4519,9 @@ class AgentClient extends BaseClient {
     try {
       const appConfig = writerContext.appConfig || this.memoryWriterState?.appConfig || req?.config;
       const memoryConfig = appConfig?.memory;
-      const messageWindowSize = memoryConfig?.messageWindowSize ?? 5;
-      const historyContextMessageScanLimit = memoryConfig?.historyContextMessageScanLimit ?? 40;
-      const historyContextUserTurnLimit = memoryConfig?.historyContextUserTurnLimit ?? 4;
-      const historyContextCharLimit = memoryConfig?.historyContextCharLimit ?? 1200;
-
-      let messagesToProcess = [...messages];
-      let windowStartIndex = 0;
-      if (messages.length > messageWindowSize) {
-        for (let i = messages.length - messageWindowSize; i >= 0; i--) {
-          const potentialWindow = messages.slice(i, i + messageWindowSize);
-          if (potentialWindow[0]?.role === 'user') {
-            messagesToProcess = [...potentialWindow];
-            windowStartIndex = i;
-            break;
-          }
-        }
-
-        if (messagesToProcess.length === messages.length) {
-          windowStartIndex = Math.max(0, messages.length - messageWindowSize);
-          messagesToProcess = [...messages.slice(-messageWindowSize)];
-        }
-      }
-
-      const historicalUserContext = buildHistoricalUserContextBuffer({
-        messages,
-        windowStartIndex,
-        scanLimit: historyContextMessageScanLimit,
-        userTurnLimit: historyContextUserTurnLimit,
-        charLimit: historyContextCharLimit,
-        transformMessage: (message) => this.filterImageUrls(message),
-      });
-      const filteredMessages = messagesToProcess.map((msg) => this.filterImageUrls(msg));
-      const bufferString = buildMemoryBufferString(filteredMessages);
-      if (!bufferString) {
-        if (isDeepTimingEnabled(req)) {
-          logDeepTiming(req, 'memory_run_done', memStart, 'status=skipped sanitized_empty=true');
-        }
-        return;
-      }
-      const sections = [];
-      if (historicalUserContext) {
-        sections.push(
-          `# Recent User Context Outside Current Chat Window:\n\n${historicalUserContext}`,
-        );
-      }
-      sections.push(`# Current Chat:\n\n${bufferString}`);
-      const bufferMessage = new HumanMessage(sections.join('\n\n'));
+      const bufferMessage =
+        writerContext.bufferMessage || this.prepareMemoryWriterBuffer(messages, memoryConfig);
+      if (!bufferMessage) return;
 
       const writerInitStart = startDeepTiming(req);
       const writerInit = await this.initializeMemoryWriter(writerContext);
@@ -3759,8 +4552,62 @@ class AgentClient extends BaseClient {
         return writerInit?.attachment ? [writerInit.attachment] : undefined;
       }
 
-      const result = await this.processMemory([bufferMessage]);
-      const memoryFailure = classifyMemoryWriterResult(result);
+      let result = await this.processMemory([bufferMessage]);
+      let memoryFailure = classifyMemoryWriterResult(result);
+      /* === VIVENTIUM START ===
+       * Replay a terminal primary-route failure once on the explicitly configured fallback route,
+       * only when no write applied. The exhausted route is gated so later turns start on the
+       * fallback directly instead of replaying the exhausted provider.
+       * === VIVENTIUM END === */
+      if (
+        memoryFailure &&
+        TERMINAL_MEMORY_ROUTE_FAILURES.has(memoryFailure) &&
+        !memoryResultPartiallyApplied(result) &&
+        !writerContext.memoryMutationApplied &&
+        !writerContext.memoryMutationUncertain &&
+        this.memoryWriterRoute?.role === 'primary' &&
+        memoryWriterRoutes(memoryConfig).some((route) => route.role === 'fallback')
+      ) {
+        const exhaustedRoute = this.memoryWriterRoute;
+        markMemoryWriterRouteExhausted({
+          userId,
+          provider: exhaustedRoute.provider,
+          model: exhaustedRoute.model,
+          errorType: memoryFailure,
+        });
+        this.processMemory = null;
+        const replayInit = await this.initializeMemoryWriter(writerContext);
+        if (
+          replayInit?.ok &&
+          this.memoryWriterRoute?.role === 'fallback' &&
+          this.processMemory != null
+        ) {
+          logger.warn(
+            '[AgentClient] Saved memory write replayed on the configured fallback route',
+            {
+              failure: memoryFailure,
+              from: { provider: exhaustedRoute.provider, model: exhaustedRoute.model },
+              to: {
+                provider: this.memoryWriterRoute.provider,
+                model: this.memoryWriterRoute.model,
+              },
+            },
+          );
+          result = await this.processMemory([bufferMessage]);
+          memoryFailure = classifyMemoryWriterResult(result);
+        } else if (replayInit?.attachment && Array.isArray(result)) {
+          result = [...result, replayInit.attachment];
+        }
+      }
+      void recordMemoryContinuityHealth({
+        userId,
+        path: 'writer',
+        status: memoryFailure ? 'degraded' : 'ok',
+        reason: memoryFailure || 'write_completed',
+        provider: this.memoryWriterRoute?.provider || memoryConfig?.agent?.provider,
+        model: this.memoryWriterRoute?.model || memoryConfig?.agent?.model,
+        effort: memoryConfig?.agent?.model_parameters?.reasoning_effort,
+      });
       if (isDeepTimingEnabled(req)) {
         logDeepTiming(
           req,
@@ -3781,11 +4628,132 @@ class AgentClient extends BaseClient {
       if (isDeepTimingEnabled(req)) {
         logDeepTiming(req, 'memory_run_done', memStart, 'status=error');
       }
+      /* === VIVENTIUM START ===
+       * A thrown writer error must still leave one durable typed receipt. Without it the response
+       * carries no memory artifact, persistence is skipped, and an out-of-band surface waiting on
+       * the scheduled-write anchor polls to timeout with nothing truthful to show.
+       * === VIVENTIUM END === */
+      return [
+        this.createMemoryWriterStatusAttachment({
+          message:
+            'Saved memory could not be updated after this turn because the memory writer failed.',
+          errorType: 'writer_exception',
+        }),
+      ];
     } finally {
       if (userId != null) {
         clearMemoryReadContextCache(userId);
       }
     }
+  }
+
+  async executeAdmittedMemoryWriter(messages, writerContext, scheduleStart = null) {
+    const { req, userId } = writerContext;
+    if (!(await db.startMemoryWrite(writerContext.memoryWriteIdentity))) {
+      return;
+    }
+    return Promise.resolve()
+      .then(() => requireCurrentMemoryWriterAuthority(writerContext))
+      .then(async () => {
+        if (!writerContext.snapshot)
+          writerContext.snapshot = await loadMemorySnapshot({
+            userId,
+            readOnly: true,
+            memoryMethods:
+              writerContext.memoryWriterState?.memoryMethods ||
+              this.memoryWriterState.memoryMethods,
+            config:
+              writerContext.memoryWriterState?.memoryPolicyConfig ||
+              this.memoryWriterState.memoryPolicyConfig,
+          });
+        if (
+          !(await db.validateMemoryWriteSnapshot({
+            ...writerContext.memoryWriteIdentity,
+            revisions: writerContext.snapshot.memoryRevisionMap,
+            effects: writerContext.snapshot.memoryWriterEffectMap,
+          }))
+        )
+          throw new Error('Saved memory changed outside earlier accepted saves after admission');
+      })
+      .then(() => this.runMemory(messages, writerContext))
+      .then(async (attachments) => {
+        attachments = (attachments || []).filter(Boolean);
+        if (writerContext.memoryMutationApplied || writerContext.memoryMutationUncertain) {
+          attachments = attachments.map((attachment) => {
+            if (attachment[Tools.memory]?.type !== 'error') return attachment;
+            let details = {};
+            try {
+              details = JSON.parse(attachment[Tools.memory].value || '{}');
+            } catch {
+              /* Keep public fallback. */
+            }
+            return {
+              ...attachment,
+              [Tools.memory]: {
+                ...attachment[Tools.memory],
+                value: JSON.stringify({ ...details, partialApplied: true }),
+              },
+            };
+          });
+        }
+        if (attachments.length > 0) {
+          const artifactPromises = writerContext.artifactPromises;
+          if (Array.isArray(artifactPromises)) {
+            artifactPromises.push(...attachments.filter(Boolean));
+          } else {
+            logger.warn(
+              '[AgentClient] Memory writer produced attachments after artifact sink closed',
+              {
+                attachments: attachments.filter(Boolean).length,
+              },
+            );
+          }
+        }
+        // Empty completion records that the model chose no memory change; it is not a saved claim.
+        if (!(await persistMemoryReceipt(writerContext, attachments))) {
+          logger.warn('[AgentClient] Saved-memory receipt awaits durable reconciliation');
+        }
+        if (isDeepTimingEnabled(req)) {
+          logDeepTiming(
+            req,
+            'memory_writer_background_done',
+            scheduleStart,
+            `attachments=${attachments?.filter(Boolean).length ?? 0}`,
+          );
+        }
+      })
+      .catch(async (error) => {
+        logger.error(
+          '[AgentClient] Error in detached memory writer',
+          sanitizeCompletionErrorForLog(error),
+        );
+        if (isDeepTimingEnabled(req)) {
+          logDeepTiming(req, 'memory_writer_background_done', scheduleStart, 'status=error');
+        }
+        await persistMemoryReceipt(writerContext, [
+          {
+            type: Tools.memory,
+            messageId: writerContext.responseMessageId,
+            conversationId: writerContext.conversationId,
+            [Tools.memory]: {
+              type: 'error',
+              key: 'system',
+              value: JSON.stringify({
+                errorType: 'writer_interrupted',
+                partialApplied:
+                  writerContext.memoryMutationApplied === true ||
+                  writerContext.memoryMutationUncertain === true,
+                message: 'Saving memory could not finish. Check Memories before retrying.',
+              }),
+            },
+          },
+        ]);
+      })
+      .finally(() => {
+        if (userId != null) {
+          clearMemoryReadContextCache(userId);
+        }
+      });
   }
 
   scheduleMemoryWriter(messages) {
@@ -3799,7 +4767,8 @@ class AgentClient extends BaseClient {
     if (
       isVoiceActorSideEffectRestricted(req) ||
       req?.body?.viventiumDeferVoiceMemory === true ||
-      isCancelledVoiceTask(req)
+      isCancelledVoiceTask(req) ||
+      shouldSkipAutomaticMemoryWriter(req)
     ) {
       if (isDeepTimingEnabled(req)) {
         logDeepTiming(req, 'memory_writer_deferred_post_call', scheduleStart);
@@ -3813,6 +4782,9 @@ class AgentClient extends BaseClient {
       return this.memoryWriterPromise;
     }
     const userId = req?.user?.id;
+    if (!userId || !this.memoryWriterState) {
+      return;
+    }
     /* === VIVENTIUM START ===
      * Feature: Detached saved-memory writer lifecycle safety.
      * Purpose: The post-response writer can outlive request cleanup; capture the needed request
@@ -3827,59 +4799,197 @@ class AgentClient extends BaseClient {
       artifactPromises: this.artifactPromises,
       responseMessageId: this.responseMessageId + '',
       conversationId: this.conversationId + '',
+      parentMessageId: this.parentMessageId + '',
+      interactionContext: getTrustedInteractionContext(req),
+      memoryWriteIdentity: {
+        userId: String(userId),
+        messageId: this.responseMessageId + '',
+        owner: memoryWriterOwner,
+      },
+      memoryWriterState: this.memoryWriterState,
+      bufferMessage: this.prepareMemoryWriterBuffer(messages, req?.config?.memory),
+      timeContext: buildTimeContextInstructions(req),
+      sourceMessageIds: [
+        ...new Set(
+          [this.parentMessageId, ...(this.memoryWriterSourceMessageIds || [])].filter(Boolean),
+        ),
+      ],
+      sourceMessageDigests: { ...(this.memoryWriterSourceMessageDigests || {}) },
     };
     const runDetachedWriter = () =>
-      this.runMemory(messages, writerContext)
-        .then((attachments) => {
-          if (attachments && attachments.length > 0) {
-            const artifactPromises = writerContext.artifactPromises;
-            if (Array.isArray(artifactPromises)) {
-              artifactPromises.push(...attachments.filter(Boolean));
-            } else {
-              logger.warn(
-                '[AgentClient] Memory writer produced attachments after artifact sink closed',
-                {
-                  attachments: attachments.filter(Boolean).length,
-                },
-              );
-            }
-          }
-          if (isDeepTimingEnabled(req)) {
-            logDeepTiming(
-              req,
-              'memory_writer_background_done',
-              scheduleStart,
-              `attachments=${attachments?.filter(Boolean).length ?? 0}`,
-            );
-          }
-        })
-        .catch((error) => {
-          logger.error(
-            '[AgentClient] Error in detached memory writer',
-            sanitizeCompletionErrorForLog(error),
-          );
-          if (isDeepTimingEnabled(req)) {
-            logDeepTiming(req, 'memory_writer_background_done', scheduleStart, 'status=error');
-          }
-        })
-        .finally(() => {
-          if (userId != null) {
-            clearMemoryReadContextCache(userId);
-          }
-        });
-    const promise = enqueueUserMemoryWriter({
-      userId,
-      run: runDetachedWriter,
+      this.executeAdmittedMemoryWriter(messages, writerContext, scheduleStart);
+    /* === VIVENTIUM START ===
+     * Typed anchor for out-of-band surfaces: the final event says a saved-memory write was
+     * scheduled for this turn, so a poller can wait for the durable receipt instead of guessing.
+     * === VIVENTIUM END === */
+    let finish;
+    const promise = new Promise((resolve) => {
+      finish = resolve;
     }).finally(() => {
       if (this.memoryWriterPromise === promise) {
         this.memoryWriterPromise = null;
       }
     });
+    const reportAdmissionFailure = async (uncertain = false) => {
+      const receipt = {
+        type: Tools.memory,
+        messageId: writerContext.responseMessageId,
+        conversationId: writerContext.conversationId,
+        [Tools.memory]: {
+          type: 'error',
+          key: 'system',
+          value: JSON.stringify({
+            errorType: uncertain ? 'writer_interrupted' : 'writer_unavailable',
+            partialApplied: uncertain,
+            message: uncertain
+              ? 'Memory saving could not be confirmed. Check Memories before retrying.'
+              : 'This memory save could not be accepted. Your reply is preserved. Try again.',
+          }),
+        },
+      };
+      req._viventiumMemoryAdmissionReceipt = receipt;
+      try {
+        await db.updateMessage(
+          req,
+          { messageId: writerContext.responseMessageId, $addToSet: { attachments: receipt } },
+          { operationKind: 'system' },
+        );
+      } catch (error) {
+        logger.warn('[AgentClient] Admission failure receipt could not persist', {
+          name: error?.name,
+        });
+      }
+    };
+    this.pendingMemoryWriterAdmission = async () => {
+      try {
+        // This seam runs after the canonical response is saved and the controller checks its job.
+        // Capture that response now; the earlier frozen input cannot contain its result.
+        const response = await db.getMessage({
+          user: userId,
+          messageId: writerContext.responseMessageId,
+        });
+        if (
+          !isCurrentMemoryWriterResponse({
+            response,
+            userId,
+            conversationId: writerContext.conversationId,
+            messageId: writerContext.responseMessageId,
+            parentMessageId: writerContext.parentMessageId,
+            context: writerContext.interactionContext,
+          })
+        ) {
+          await reportAdmissionFailure();
+          finish();
+          return false;
+        }
+        if (!hasRuntimeHoldAssistantText(response.content)) {
+          const nativeEvidence = await require('~/server/services/viventium/nativeResponseService')
+            .getService()
+            .readToolEvidence(userId, response.conversationId, response.messageId);
+          const content = [
+            ...nativeEvidence,
+            ...(Array.isArray(response.content) ? response.content : []).filter(
+              (part) => part?.type === ContentTypes.TEXT || part?.type === ContentTypes.TOOL_CALL,
+            ),
+          ];
+          const { messages: completedMessages } = formatAgentMessages([
+            {
+              role: 'assistant',
+              messageId: response.messageId,
+              content: content.length ? structuredClone(content) : response.text || '',
+            },
+          ]);
+          const completedBuffer = buildMemoryBufferString(completedMessages);
+          if (completedBuffer) {
+            writerContext.bufferMessage = new HumanMessage(
+              [writerContext.bufferMessage?.content, completedBuffer].filter(Boolean).join('\n'),
+            );
+            writerContext.sourceMessageIds = [
+              ...new Set([...writerContext.sourceMessageIds, response.messageId]),
+            ];
+            writerContext.sourceMessageDigests[response.messageId] =
+              memoryWriterSourceDigest(response);
+          }
+        }
+        const admittedAt = new Date();
+        const admissionSnapshot = await loadMemorySnapshot({
+          userId,
+          readOnly: true,
+          memoryMethods: writerContext.memoryWriterState.memoryMethods,
+          config: writerContext.memoryWriterState.memoryPolicyConfig,
+        });
+        writerContext.sourceIntegrity = {
+          admittedAt,
+          source: {
+            messageIds: writerContext.sourceMessageIds,
+            messageDigests: writerContext.sourceMessageDigests,
+            interactionContextJson: JSON.stringify(writerContext.interactionContext || null),
+            configDigest: memoryWriterConfigDigest(writerContext.appConfig),
+            agentDigest: await memoryWriterAgentDigest(req),
+          },
+        };
+        const admitted = await db.admitMemoryWrite({
+          ...writerContext.memoryWriteIdentity,
+          conversationId: writerContext.conversationId,
+          admittedAt,
+          source: {
+            input: writerContext.bufferMessage?.content || '',
+            digest: crypto
+              .createHash('sha256')
+              .update(writerContext.bufferMessage?.content || '')
+              .digest('hex'),
+            configDigest: writerContext.sourceIntegrity.source.configDigest,
+            agentDigest: writerContext.sourceIntegrity.source.agentDigest,
+            timeContext: writerContext.timeContext,
+            messageIds: writerContext.sourceMessageIds,
+            messageDigests: writerContext.sourceMessageDigests,
+            memoryRevisionMap: admissionSnapshot.memoryRevisionMap,
+            interactionContextJson: writerContext.sourceIntegrity.source.interactionContextJson,
+          },
+        });
+        if (!admitted) {
+          const existing = await db.getMemoryWriteStatus(writerContext.memoryWriteIdentity);
+          if (existing) req._viventiumMemoryWriterScheduled = true;
+          else await reportAdmissionFailure();
+          finish();
+          return false;
+        }
+        req._viventiumMemoryWriterScheduled = true;
+        const untrack = trackAdmittedMemoryWriter(writerContext.responseMessageId);
+        void enqueueUserMemoryWriter({
+          userId,
+          identity: {
+            ...writerContext.memoryWriteIdentity,
+            conversationId: writerContext.conversationId,
+          },
+          run: runDetachedWriter,
+        })
+          .catch((error) =>
+            logger.warn('[AgentClient] Admitted memory writer interrupted', { name: error?.name }),
+          )
+          .finally(() => {
+            untrack();
+            finish();
+          });
+        return true;
+      } catch (error) {
+        logger.warn('[AgentClient] Saved-memory admission failed', { name: error?.name });
+        await reportAdmissionFailure(true);
+        finish();
+        return false;
+      }
+    };
     this.memoryWriterPromise = promise;
     if (isDeepTimingEnabled(req)) {
       logDeepTiming(req, 'memory_writer_scheduled_after_main', scheduleStart);
     }
     return promise;
+  }
+
+  async admitMemoryWriter() {
+    const admit = this.pendingMemoryWriterAdmission;
+    this.pendingMemoryWriterAdmission = null;
+    return admit ? admit() : false;
   }
 
   scheduleFeelingsReaction(payload) {
@@ -4171,7 +5281,8 @@ class AgentClient extends BaseClient {
       }
       /* === VIVENTIUM END === */
     } finally {
-      mainResponseReady.resolve();
+      // Late cortices outlive client disposal; retain the actual completed primary/fallback route.
+      mainResponseReady.resolve(this.options?.agent);
       if (this._phaseBMainResponseReadyPromise === mainResponseReady.promise) {
         this._phaseBMainResponseReadyPromise = Promise.resolve();
       }
@@ -4184,7 +5295,10 @@ class AgentClient extends BaseClient {
     if (graphFallbackRecoveryReceipt && hasVisibleAssistantText(this.contentParts)) {
       insertFallbackRecoveryNotice(this.contentParts, graphFallbackRecoveryReceipt);
     }
-    const completion = normalizeTextContentParts(filterMalformedContentParts(this.contentParts));
+    const completion = annotateScheduledFailureParts(
+      normalizeTextContentParts(filterMalformedContentParts(this.contentParts)),
+      getTrustedInteractionContext(this.options.req),
+    );
     if (hasVisibleAssistantText(completion)) {
       this.scheduleFeelingsReaction(payload);
     } else {
@@ -4365,7 +5479,7 @@ class AgentClient extends BaseClient {
       .then(() => cortexExecutionPromise)
       .then(async (mergedInsightsData) => {
         // Wait for the final primary/fallback answer before DB persistence or follow-up synthesis.
-        await mainResponseReadyPromise.catch((err) => {
+        const completedMainAgent = await mainResponseReadyPromise.catch((err) => {
           logger.warn(
             '[AgentClient] Main response readiness gate failed before Phase B completion pipeline',
             sanitizeCompletionErrorForLog(err),
@@ -4477,6 +5591,20 @@ class AgentClient extends BaseClient {
                 contextText: '',
               },
             });
+            if (result === 'suppressed' && mergedInsightsData?.insights?.length) {
+              await settleSuppressedCortexInsightDeliveries({
+                req,
+                conversationId,
+                parentMessageId: responseMessageId,
+                insightsData: mergedInsightsData,
+                dropReason:
+                  suppressionReason === 'voice_task_cancelled'
+                    ? 'voice_task_suppressed'
+                    : movedOnAfterParent
+                      ? 'conversation_moved_on'
+                      : 'semantic_suppression',
+              });
+            }
             logFollowUpDecisionRecord(req, decisionRecord);
             await persistFollowUpDecisionToParentMessage({
               req,
@@ -4622,7 +5750,7 @@ class AgentClient extends BaseClient {
             req,
             conversationId,
             parentMessageId: responseMessageId,
-            agent: this.options.agent || capturedAgent,
+            agent: completedMainAgent || this.options?.agent || capturedAgent,
             insightsData: mergedInsightsData,
             recentResponse,
             forceVisibleFollowUp: forcePhaseBFollowUp,
@@ -4655,19 +5783,111 @@ class AgentClient extends BaseClient {
                 conversationId,
                 text: followUpMessage.text,
                 cortexCount: mergedInsightsData?.cortexCount ?? undefined,
+                revision: Math.max(
+                  1,
+                  Number(followUpMessage?.metadata?.viventium?.messageRevision) || 1,
+                ),
+                presentationGeneration: Math.max(
+                  1,
+                  Number(followUpMessage?.metadata?.viventium?.cortexPresentationGeneration) || 1,
+                ),
+                presentationClaimToken: String(
+                  followUpMessage?.metadata?.viventium?.cortexPresentationClaimToken || '',
+                ).trim(),
+                presentationParentMessageId: responseMessageId,
               },
             };
-            const emitPromise = GenerationJobManager.emitChunk(
-              req._resumableStreamId,
-              followUpEvent,
+            const revision = Math.max(
+              1,
+              Number(followUpMessage?.metadata?.viventium?.messageRevision) || 1,
             );
-            if (emitPromise && typeof emitPromise.catch === 'function') {
-              emitPromise.catch((err) => {
-                logger.warn(
-                  '[AgentClient] Failed to emit cortex follow-up SSE event:',
-                  sanitizeCompletionErrorForLog(err),
-                );
+            const presentationGeneration = Math.max(
+              1,
+              Number(followUpMessage?.metadata?.viventium?.cortexPresentationGeneration) || 1,
+            );
+            let presentationFence = null;
+            try {
+              const verifyPresentation = async () => {
+                presentationFence = await fenceCortexInsightDeliveryPresentationByParent({
+                  ownerId: String(req?.user?.id || '').trim(),
+                  parentMessageId: responseMessageId,
+                  surface: 'web',
+                  persistedMessageId: followUpMessage.messageId,
+                  messageRevision: revision,
+                  expectedDeliveryIds:
+                    followUpMessage?.metadata?.viventium?.cortexInsightDeliveryIds || [],
+                  expectedGeneration: presentationGeneration,
+                });
+                return presentationFence;
+              };
+              presentationFence = await verifyPresentation();
+              const transportReceipt = await GenerationJobManager.emitCortexPresentation(
+                req._resumableStreamId,
+                followUpEvent,
+                presentationFence,
+                {
+                  verifyPresentation,
+                  consumeCortexFault: (boundary) =>
+                    consumeLocalQaCortexFault({
+                      boundary,
+                      ownerId: String(req?.user?.id || '').trim(),
+                      conversationId,
+                      parentMessageId: responseMessageId,
+                    }),
+                },
+              );
+              if (
+                transportReceipt?.delivered !== true ||
+                String(transportReceipt.streamId || '').trim() !== req._resumableStreamId ||
+                transportReceipt.target !== 'subscriber_transport' ||
+                !String(transportReceipt.presentationRef || '').trim()
+              ) {
+                const error = new Error('Cortex Web presentation receipt is unavailable');
+                error.code = 'cortex_web_presentation_receipt_unavailable';
+                throw error;
+              }
+              if (!presentationFence || !Array.isArray(presentationFence.claims)) {
+                const error = new Error('Cortex Web presentation fence is unavailable');
+                error.code = 'cortex_insight_delivery_settlement_conflict';
+                throw error;
+              }
+              if (
+                String(transportReceipt.claimToken || '').trim() !==
+                  String(presentationFence.claimToken || '').trim() ||
+                String(transportReceipt.presentationLeaseToken || '').trim() !==
+                  String(presentationFence.presentationLeaseToken || '').trim()
+              ) {
+                const error = new Error('Cortex Web presentation lease receipt is unavailable');
+                error.code = 'cortex_insight_delivery_settlement_conflict';
+                throw error;
+              }
+              const settledPresentations = await markCortexInsightDeliveryBatchPresented({
+                ownerId: String(req?.user?.id || '').trim(),
+                claims: presentationFence.claims,
+                surface: 'web',
+                persistedMessageId: followUpMessage.messageId,
+                messageRevision: revision,
+                presentationGeneration: presentationFence.generation,
+                presentationClaimToken: transportReceipt.claimToken,
+                presentationLeaseToken: transportReceipt.presentationLeaseToken,
+                presentationRef: transportReceipt.presentationRef,
               });
+              requireExactCortexInsightDeliverySettlement(
+                presentationFence.claims,
+                settledPresentations,
+              );
+            } catch (err) {
+              if (Array.isArray(presentationFence?.claims) && presentationFence.claims.length > 0) {
+                await markCortexInsightDeliveryBatchFailed({
+                  ownerId: String(req?.user?.id || '').trim(),
+                  claims: presentationFence.claims,
+                  reason: 'presentation_failed',
+                }).catch(() => null);
+              }
+              logger.warn(
+                '[AgentClient] Failed to emit cortex follow-up SSE event:',
+                sanitizeCompletionErrorForLog(err),
+              );
             }
           }
         } catch (e) {
@@ -5029,8 +6249,39 @@ class AgentClient extends BaseClient {
        * Added: 2026-01-31
        */
       const timeContextInstructions = buildTimeContextInstructions(this.options.req);
-      if (timeContextInstructions) {
+      const activeWorkTurnContext = await getActiveWorkTurnContext(
+        this.options.req,
+        this.options.agent,
+        { voice: voiceMode },
+      );
+      const acceptedMainIdentity = this.options.req?._viventiumAcceptedMainCompactionIdentityV1;
+      const acceptedMainContext = await loadAcceptedMainContext(acceptedMainIdentity || {});
+      const acceptedMainContextInstructions = acceptedMainContext?.messageCapsule || '';
+      const savedMemoryTurnContext =
+        this.options.req?.viventiumTimeContextDelivery === 'per_turn_header'
+          ? buildSavedMemoryTurnContext(this.memoryReadAvailability, this.glasshiveWorkerMemory)
+          : '';
+      const recurrenceStateContext = buildRecurrenceStateCapsule(
+        this.options.req,
+        this.options.req?.body?.recurrenceState,
+      );
+      const turnContextInstructions = [
+        timeContextInstructions,
+        acceptedMainContextInstructions,
+        savedMemoryTurnContext,
+        recurrenceStateContext,
+        activeWorkTurnContext,
+        this.directParentTurnContext,
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+      if (turnContextInstructions) {
         surfacePromptLayers.time_context = timeContextInstructions;
+        if (activeWorkTurnContext) surfacePromptLayers.active_work_context = activeWorkTurnContext;
+        if (recurrenceStateContext) surfacePromptLayers.recurrence_state = recurrenceStateContext;
+        if (acceptedMainContextInstructions) {
+          surfacePromptLayers.main_continuity = acceptedMainContextInstructions;
+        }
         const providerCapabilities =
           this.options.req?.config?.endpoints?.agents?.providerCapabilities || {};
         const providerCapability =
@@ -5042,7 +6293,7 @@ class AgentClient extends BaseClient {
           req: this.options.req,
           requestBody: config?.configurable?.requestBody,
           instructions: this.options.agent.instructions || '',
-          timeContextInstructions,
+          timeContextInstructions: turnContextInstructions,
           providerCapability,
         });
       }
@@ -5059,6 +6310,8 @@ class AgentClient extends BaseClient {
            */
           provider: resolveConversationProviderId(this.options.agent),
           model: this.options.agent?.model_parameters?.model || this.options.agent?.model,
+          reasoningEffort: this.options.agent?.model_parameters?.reasoning_effort,
+          agentId: this.options.agent?.id,
           requestIdentity: {
             ownerId: this.options.req?.user?.id || this.options.req?.user?._id,
             interactionContext: trustedInteractionContext,
@@ -5098,12 +6351,27 @@ class AgentClient extends BaseClient {
           })
         : sanitizedPayload;
       /* === VIVENTIUM NOTE END === */
+      /* === VIVENTIUM START === Whole hydrated source uses the existing message body once. */
+      const acceptedProjection = projectAcceptedMainMessages(
+        hardenedPayload,
+        acceptedMainContext?.sourceTurns || [],
+      );
+      const existingCounts = new Map(
+        hardenedPayload.map((message, index) => [message, this.indexTokenCountMap[index]]),
+      );
+      const projectedTokenCounts = Object.fromEntries(
+        acceptedProjection.messages.map((message, index) => [
+          index,
+          existingCounts.get(message) ?? this.getTokenCountForMessage(message),
+        ]),
+      );
       const formatStart = startDeepTiming(req);
       let { messages: initialMessages, indexTokenCountMap } = formatAgentMessages(
-        hardenedPayload,
-        this.indexTokenCountMap,
+        acceptedProjection.messages,
+        projectedTokenCounts,
         toolSet,
       );
+      /* === VIVENTIUM END === */
       const preSanitizeCount = initialMessages.length;
       initialMessages = sanitizeProviderFormattedMessages(
         this.options.agent?.provider,
@@ -5116,6 +6384,20 @@ class AgentClient extends BaseClient {
           } ${preSanitizeCount} -> ${initialMessages.length}`,
         );
       }
+
+      initialMessages = prepareMainContinuityCarrier(
+        initialMessages,
+        this.options.agent?.useLegacyContent === true,
+      );
+      const acceptedCarrierHeaders = buildMainContinuityHeaders({
+        context: { ...acceptedMainIdentity, ...acceptedMainContext },
+        messages: initialMessages,
+        sourceMessageIds: acceptedProjection.sourceMessageIds,
+        deliverySources: acceptedProjection.messages,
+        interactionContext: trustedInteractionContext,
+        logicalTurnId: trustedInteractionContext?.logical_turn_id || this.responseMessageId,
+        revision: trustedInteractionContext?.revision || 1,
+      });
 
       /* === VIVENTIUM START ===
        * Feature: Anthropic request-byte guard for oversized inline payloads.
@@ -5133,6 +6415,11 @@ class AgentClient extends BaseClient {
         }
       }
       /* === VIVENTIUM END === */
+
+      assertMainContinuityCarrier(
+        initialMessages,
+        acceptedCarrierHeaders['X-Viventium-Visible-Message-Chain-B64'],
+      );
 
       if (isDeepTimingEnabled(req)) {
         logDeepTiming(
@@ -5420,6 +6707,13 @@ class AgentClient extends BaseClient {
         speculativeMode =
           req?._viventiumHarnessExecutionEnabled !== true &&
           shouldRunLiveSpeculativePhaseA({ policy: voicePhaseAPolicy });
+        onePassNonblockingMode = shouldRunOnePassNonblockingPhaseA({
+          policy: voicePhaseAPolicy,
+          speculativeMode,
+        });
+        if (onePassNonblockingMode) {
+          speculativeMode = false;
+        }
         if (speculativeMode) {
           speculativeDetectionPromise = detectActivations({
             req,
@@ -5890,6 +7184,11 @@ class AgentClient extends BaseClient {
       }
 
       const mainAgentMessages = initialMessages;
+      // Main's retained evidence is not a new memory-writing presentation.
+      const injectedContinuityIds = new Set(acceptedProjection.injectedMessageIds);
+      const memoryWriterMessages = initialMessages.filter(
+        (message) => !injectedContinuityIds.has(message.id),
+      );
 
       /**
        * @param {BaseMessage[]} messages
@@ -6077,6 +7376,8 @@ class AgentClient extends BaseClient {
              */
             provider: resolveConversationProviderId(agents[0]),
             model: agents[0]?.model_parameters?.model || agents[0]?.model,
+            reasoningEffort: agents[0]?.model_parameters?.reasoning_effort,
+            agentId: agents[0]?.id,
             requestIdentity: {
               ownerId: this.options.req?.user?.id || this.options.req?.user?._id,
               interactionContext: trustedInteractionContext,
@@ -6159,6 +7460,14 @@ class AgentClient extends BaseClient {
         run = await createRun({
           agents,
           indexTokenCountMap,
+          mainContinuityHeaders: acceptedCarrierHeaders,
+          nativeResponseFetch: (baseFetch, route) =>
+            require('~/server/services/viventium/nativeResponseService').wrapNativeResponseFetch(
+              req,
+              this.options.agent.id,
+              baseFetch,
+              route,
+            ),
           runId: this.responseMessageId,
           signal: activeRunSignal,
           customHandlers: this.options.eventHandlers,
@@ -6213,6 +7522,9 @@ class AgentClient extends BaseClient {
         await run.processStream({ messages }, config, {
           callbacks: {
             [Callback.TOOL_START]: (_graph, ...callbackArgs) => {
+              if (req && shouldLockFallbackForToolStart(callbackArgs)) {
+                req._viventiumToolInvocationStarted = true;
+              }
               if (!voiceLatencyEnabled) {
                 return;
               }
@@ -6528,7 +7840,7 @@ class AgentClient extends BaseClient {
         if (isDeepTimingEnabled(req)) {
           logDeepTiming(req, 'chat_completion_done', chatStart);
         }
-        this.scheduleMemoryWriter(mainAgentMessages);
+        this.scheduleMemoryWriter(memoryWriterMessages);
       } else if (speculativeMode) {
         const emitSpeculativeActivationCards = async () => {
           for (const cortex of activatedCorticesList) {
@@ -6707,7 +8019,7 @@ class AgentClient extends BaseClient {
         if (isDeepTimingEnabled(req)) {
           logDeepTiming(req, 'chat_completion_done', chatStart);
         }
-        this.scheduleMemoryWriter(mainAgentMessages);
+        this.scheduleMemoryWriter(memoryWriterMessages);
       } else if (shouldDeferMainResponse) {
         const holdText = pickToolCortexHoldText({
           responseMessageId: this.responseMessageId,
@@ -6731,13 +8043,13 @@ class AgentClient extends BaseClient {
         logger.info(
           `[AgentClient] Tool cortex brewing hold: deferred main response (activated=${activatedCorticesList.length})`,
         );
-        this.scheduleMemoryWriter(mainAgentMessages);
+        this.scheduleMemoryWriter(memoryWriterMessages);
       } else {
         await runWithAnthropicRecovery();
         if (isDeepTimingEnabled(req)) {
           logDeepTiming(req, 'chat_completion_done', chatStart);
         }
-        this.scheduleMemoryWriter(mainAgentMessages);
+        this.scheduleMemoryWriter(memoryWriterMessages);
       }
       /* === VIVENTIUM END === */
       /* === VIVENTIUM NOTE END === */
@@ -6749,10 +8061,7 @@ class AgentClient extends BaseClient {
           `activated=${activatedCorticesList.length}`,
         );
       }
-      sanitizeAggregatedContentParts(this.contentParts);
-      if (req?._viventiumHarnessExecutionEnabled === true) {
-        convertHarnessActivityParts(this.contentParts);
-      }
+      finalizeHarnessActivityPartsForPersistence(this.contentParts, req);
       /** @deprecated Agent Chain */
       if (hideSequentialOutputs) {
         this.contentParts = pruneSequentialOutputPartsForPersistence(this.contentParts);
@@ -7135,6 +8444,9 @@ class AgentClient extends BaseClient {
 }
 
 module.exports = AgentClient;
+module.exports.recoverPendingMemoryWriter = recoverPendingMemoryWriter;
+module.exports.memoryWriterSourceDigest = memoryWriterSourceDigest;
+module.exports.memoryWriterConfigDigest = memoryWriterConfigDigest;
 module.exports.buildViventiumMcpRequestBody = buildViventiumMcpRequestBody;
 module.exports.isLateStreamTerminationError = isLateStreamTerminationError;
 module.exports.hasRuntimeHoldAssistantText = hasRuntimeHoldAssistantText;
@@ -7175,9 +8487,12 @@ module.exports.finalizeHarnessActivityPartsForPersistence =
   finalizeHarnessActivityPartsForPersistence;
 module.exports.mergeCapturedHarnessActivityParts = mergeCapturedHarnessActivityParts;
 module.exports.isHarnessInvocationLocked = isHarnessInvocationLocked;
+module.exports.shouldLockFallbackForToolStart = shouldLockFallbackForToolStart;
 module.exports.stripInternalContentParts = stripInternalContentParts;
 module.exports.isCancelledVoiceTask = isCancelledVoiceTask;
 module.exports.buildUntrustedAmbientVoiceContextInstructions =
   buildUntrustedAmbientVoiceContextInstructions;
+
+module.exports.annotateScheduledFailureParts = annotateScheduledFailureParts;
 
 /* === VIVENTIUM END === */

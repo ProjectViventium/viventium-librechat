@@ -41,7 +41,7 @@ describe('glassHiveOrchestrationTools', () => {
     expect(definitions[0].parameters.properties.longMission).toEqual({ type: 'boolean' });
     expect(definitions[0].description).toContain('new, independently completable');
     expect(definitions[0].description).toContain('active_work_action');
-    expect(definitions[1].description).toContain('identify the exact workRef');
+    expect(definitions[1].description).toContain('an exact runId or workRef');
     expect(definitions[2].description).toContain('instead of starting a competing mission');
     expect(definitions[2].description).toContain('Retry does not deliver new guidance');
     expect(definitions[2].description).toContain('then Message or Steer');
@@ -277,7 +277,7 @@ describe('glassHiveOrchestrationTools', () => {
 
     expect(mockExecuteMainDelegation).toHaveBeenCalledWith(expect.objectContaining({ req }));
     expect(mockExecuteMainDelegation.mock.calls[0][0].args).not.toHaveProperty('profile');
-    expect(mockExecuteMainDelegation.mock.calls[0][0].fallbackWorkerProfile).toBe('');
+    expect(mockExecuteMainDelegation.mock.calls[0][0].fallbackWorkerProfile).toBeUndefined();
   });
 
   test.each([
@@ -302,7 +302,7 @@ describe('glassHiveOrchestrationTools', () => {
       },
     ],
   ])(
-    'inherits the configured worker profile from the Main route that authored the call (%s)',
+    'preserves independent worker profile across Main fallback (%s)',
     async (_descriptorKind, agent) => {
       const {
         createGlassHiveMainDelegationTool,
@@ -355,7 +355,7 @@ describe('glassHiveOrchestrationTools', () => {
         { configurable, toolCall: { id: 'explicit-call' } },
       );
 
-      expect(mockExecuteMainDelegation.mock.calls[0][0].args.profile).toBe('claude-code');
+      expect(mockExecuteMainDelegation.mock.calls[0][0].args.profile).toBe('codex-cli');
       expect(mockExecuteMainDelegation.mock.calls[0][0].fallbackWorkerProfile).toBe('claude-code');
       expect(mockExecuteMainDelegation.mock.calls[1][0].args.profile).toBe('codex-cli');
       expect(mockExecuteMainDelegation.mock.calls[1][0].fallbackWorkerProfile).toBe('claude-code');
@@ -406,7 +406,7 @@ describe('glassHiveOrchestrationTools', () => {
     });
   });
 
-  test('ignores reconnect IDs and attacker fields while material objective changes stay distinct', async () => {
+  test('preserves native call identity across reconnect and changed payload for broker conflict checks', async () => {
     const {
       createGlassHiveMainDelegationTool,
     } = require('~/app/clients/tools/util/glassHiveOrchestrationTools');
@@ -448,7 +448,8 @@ describe('glassHiveOrchestrationTools', () => {
 
     const identities = mockExecuteMainDelegation.mock.calls.map(([value]) => value.invocationId);
     expect(identities[1]).toBe(identities[0]);
-    expect(identities[2]).not.toBe(identities[0]);
+    expect(identities[2]).toBe(identities[0]);
+    expect(mockExecuteMainDelegation.mock.calls[2][0].args.instruction).toBe('Run A differently');
   });
 
   test('separates two intentional identical native calls while replaying each idempotently', async () => {

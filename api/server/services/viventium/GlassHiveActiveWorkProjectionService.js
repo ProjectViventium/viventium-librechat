@@ -8,4 +8,5 @@ const { createGlassHiveActiveWorkProjectionService } = require('@librechat/api')
 
 module.exports = createGlassHiveActiveWorkProjectionService(
   mongoose.connection.collection('viventium_external_work'),
+  mongoose.connection.collection('viventium_glasshive_mission_evidence'),
 );

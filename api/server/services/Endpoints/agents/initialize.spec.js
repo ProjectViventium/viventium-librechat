@@ -45,6 +45,7 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   GenerationJobManager: { setCollectedUsage: jest.fn() },
   applyAgentProviderCapabilityDefaults: jest.fn((agent) => ({ ...agent })),
   createEdgeCollector: jest.fn((checkAgentInit) => {
@@ -413,12 +414,29 @@ describe('initializeClient handoff capability projection', () => {
   test('starts Parallel turn authority before primary agent tool initialization', async () => {
     const order = [];
     const req = makeRequest();
+    const parallelMainAgent = {
+      ...primaryAgent,
+      provider: 'glasshive-harness',
+      tools: ['worker_delegate_once_mcp_glasshive-workers-projects'],
+      glasshive_options: {
+        orchestration: { parallel_available: true },
+      },
+    };
     mockStartParallelWorkTurnAuthority.mockImplementation(() => {
       order.push('authority');
       return Promise.resolve(true);
     });
-    mockInitializeAgent.mockImplementation(async ({ agent }) => {
+    mockInitializeAgent.mockImplementation(async ({ agent, loadTools }) => {
       order.push('initialize');
+      await loadTools({
+        req,
+        res: {},
+        agentId: agent.id,
+        tools: agent.tools,
+        provider: agent.provider,
+        model: agent.model,
+        glasshive_options: agent.glasshive_options,
+      });
       return makeInitializedConfig(agent);
     });
 
@@ -427,15 +445,24 @@ describe('initializeClient handoff capability projection', () => {
       res: {},
       signal: null,
       endpointOption: {
-        agent: Promise.resolve({ ...primaryAgent }),
-        model_parameters: { model: primaryAgent.model },
+        agent: Promise.resolve(parallelMainAgent),
+        model_parameters: { model: parallelMainAgent.model },
       },
     });
 
     expect(order.slice(0, 2)).toEqual(['authority', 'initialize']);
     expect(mockStartParallelWorkTurnAuthority).toHaveBeenCalledWith(
       req,
-      expect.objectContaining({ id: primaryAgent.id }),
+      expect.objectContaining({ id: parallelMainAgent.id }),
+    );
+    expect(mockLoadAgentTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agent: expect.objectContaining({
+          glasshive_options: {
+            orchestration: { parallel_available: true },
+          },
+        }),
+      }),
     );
   });
 

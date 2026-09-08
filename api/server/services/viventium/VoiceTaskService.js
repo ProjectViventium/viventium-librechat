@@ -1093,18 +1093,34 @@ function getVoiceTaskByStreamId(streamId) {
   return taskId ? getVoiceTask(taskId) : null;
 }
 
-function bindVoiceTaskStream(taskId, streamId) {
+function bindVoiceTaskStream(taskId, streamId, { callSessionId, userId, conversationId } = {}) {
   const task = tasks.get(String(taskId || ''));
   const normalizedStreamId = safeText(streamId, 160);
   if (!task || !normalizedStreamId) {
     return null;
   }
+  const canonicalConversationId = safeText(conversationId, 160);
+  const hasCanonicalConversation = canonicalConversationId && canonicalConversationId !== 'new';
+  if (
+    hasCanonicalConversation &&
+    (task.callSessionId !== safeText(callSessionId, 160) ||
+      task.userId !== safeText(userId, 160) ||
+      (task.conversationId &&
+        task.conversationId !== 'new' &&
+        task.conversationId !== canonicalConversationId))
+  ) {
+    return null;
+  }
+  const conversationBound =
+    hasCanonicalConversation && task.conversationId !== canonicalConversationId;
+  if (conversationBound) task.conversationId = canonicalConversationId;
   if (task.streamId && task.streamId !== normalizedStreamId) {
     taskIdByStreamId.delete(task.streamId);
   }
   task.streamId = normalizedStreamId;
   task.owner = { kind: 'generation_job', id: normalizedStreamId };
   taskIdByStreamId.set(normalizedStreamId, task.taskId);
+  if (conversationBound) nextEvent(task, { ...task.current, type: 'snapshot' });
   return publicTask(task);
 }
 
@@ -2253,6 +2269,33 @@ function observeGenerationEvent(taskId, generationEvent) {
   return null;
 }
 
+async function settleVoiceTaskGeneration(taskId, { userId, callSessionId, streamId }, outcome) {
+  const task = tasks.get(String(taskId || ''));
+  if (
+    !task ||
+    !userId ||
+    !callSessionId ||
+    !streamId ||
+    task.userId !== userId ||
+    task.callSessionId !== callSessionId ||
+    task.streamId !== streamId ||
+    task.owner?.id !== streamId ||
+    !['generation_job', 'remote_generation'].includes(task.owner?.kind)
+  )
+    return null;
+  if (await isVoiceTaskSuppressedDurably(taskId, { userId, callSessionId, streamId })) return null;
+  if (
+    tasks.get(task.taskId) !== task ||
+    task.owner?.id !== streamId ||
+    !['generation_job', 'remote_generation'].includes(task.owner?.kind)
+  )
+    return null;
+  const event = outcome.error
+    ? failVoiceTask(taskId, outcome.error)
+    : completeVoiceTask(taskId, { resultMessageId: outcome.resultMessageId });
+  return event;
+}
+
 function completeVoiceTask(taskId, { resultMessageId } = {}) {
   const task = tasks.get(String(taskId || ''));
   const attachingDelayedOwnerResult =
@@ -2774,6 +2817,7 @@ module.exports = {
   canConfirmVoiceTaskCancellation,
   cancelVoiceTask,
   completeVoiceTask,
+  settleVoiceTaskGeneration,
   confirmVoiceTaskOwnerCancellation,
   createVoiceTask,
   failVoiceTask,

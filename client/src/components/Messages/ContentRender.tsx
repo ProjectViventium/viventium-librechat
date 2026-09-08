@@ -4,6 +4,7 @@ import { useRecoilValue } from 'recoil';
 import type { TMessage } from 'librechat-data-provider';
 import type { TMessageProps, TMessageIcon } from '~/common';
 import { useAttachments, useLocalize, useMessageActions, useContentMetadata } from '~/hooks';
+import Markdown from '~/components/Chat/Messages/Content/Markdown';
 import ContentParts from '~/components/Chat/Messages/Content/ContentParts';
 import PlaceholderRow from '~/components/Chat/Messages/ui/PlaceholderRow';
 import SiblingSwitch from '~/components/Chat/Messages/SiblingSwitch';
@@ -13,6 +14,10 @@ import SubRow from '~/components/Chat/Messages/SubRow';
 import { cn, getMessageAriaLabel } from '~/utils';
 import { fontSizeAtom } from '~/store/fontSize';
 import store from '~/store';
+/* === VIVENTIUM START === Show the same saved incomplete status for content-array replies. === */
+import { UnfinishedMessage } from '~/components/Chat/Messages/Content/MessageContent';
+import { isIncompleteMessage } from '~/utils/messages';
+/* === VIVENTIUM END === */
 
 type ContentRenderProps = {
   message?: TMessage;
@@ -109,7 +114,8 @@ const ContentRender = memo(function ContentRender({
    * Purpose: Keep callback/content-array text readable instead of letting flex sizing collapse it.
    * === VIVENTIUM END === */
   const baseClasses = {
-    common: 'group mx-auto flex w-full min-w-0 flex-1 gap-3 transition-all duration-300 transform-gpu ',
+    common:
+      'group mx-auto flex w-full min-w-0 flex-1 gap-3 transition-all duration-300 transform-gpu ',
     chat: getChatWidthClass(),
   };
 
@@ -148,7 +154,19 @@ const ContentRender = memo(function ContentRender({
         )}
 
         <div className="flex min-w-0 flex-col gap-1">
-          <div className="flex min-h-[20px] max-w-full min-w-0 flex-grow flex-col gap-0">
+          <div className="flex min-h-[20px] min-w-0 max-w-full flex-grow flex-col gap-0">
+            {effectiveIsSubmitting &&
+              !msg.error &&
+              (msg as TMessage & { __viventiumAssistantPreview?: string })
+                .__viventiumAssistantPreview && (
+                <Markdown
+                  content={
+                    (msg as TMessage & { __viventiumAssistantPreview: string })
+                      .__viventiumAssistantPreview
+                  }
+                  isLatestMessage={isLatestMessage}
+                />
+              )}
             <ContentParts
               edit={edit}
               isLast={isLast}
@@ -164,6 +182,11 @@ const ContentRender = memo(function ContentRender({
               conversationId={conversation?.conversationId}
               content={msg.content}
             />
+            {/* === VIVENTIUM START === Persisted Stop status remains visible after reload. === */}
+            {!effectiveIsSubmitting && isIncompleteMessage(msg) && (
+              <UnfinishedMessage message={msg} />
+            )}
+            {/* === VIVENTIUM END === */}
           </div>
           {hasNoChildren && effectiveIsSubmitting ? (
             <PlaceholderRow />

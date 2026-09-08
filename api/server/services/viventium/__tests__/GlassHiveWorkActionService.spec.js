@@ -10,14 +10,12 @@ const mockInvalidateActiveWorkSnapshot = jest.fn();
 const mockDismissCoreOnlyPreDispatchAttention = jest.fn();
 const mockGetCoreWorkDelivery = jest.fn();
 const mockGetCoreWorkOriginRef = jest.fn();
-const mockMarkDurableEffectReceipt = jest.fn();
 const mockGetGenerationJob = jest.fn();
 const mockRecordVoiceOrchestrationTraceBestEffort = jest.fn();
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   GenerationJobManager: {
-    markDurableEffectReceipt: (...args) => mockMarkDurableEffectReceipt(...args),
     getJob: (...args) => mockGetGenerationJob(...args),
   },
 }));
@@ -51,7 +49,6 @@ describe('GlassHiveWorkActionService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockBuildTrustedActionIdempotencyKey.mockReturnValue('trusted-action-key');
-    mockMarkDurableEffectReceipt.mockResolvedValue(true);
     mockGetGenerationJob.mockResolvedValue({
       metadata: {
         userId: 'owner-1',
@@ -281,7 +278,7 @@ describe('GlassHiveWorkActionService', () => {
     });
   });
 
-  test('binds the exact durable action receipt from the shared action layer', async () => {
+  test('traces the exact accepted operation from the shared action layer', async () => {
     await executeGlassHiveWorkAction({
       ownerId: 'owner-1',
       workRef: 'work_00000001',
@@ -316,15 +313,7 @@ describe('GlassHiveWorkActionService', () => {
       },
     });
 
-    expect(mockMarkDurableEffectReceipt).toHaveBeenCalledWith({
-      streamId: 'stream-native-1',
-      userId: 'owner-1',
-      sourceEventId: 'voice:session-1:request-1',
-      responseMessageId: 'response-native-1',
-      effectKind: 'durable_work_action_accepted',
-      effectRef: expect.stringMatching(/^work_action_[a-f0-9]{64}$/),
-    });
-    const effectRef = mockMarkDurableEffectReceipt.mock.calls[0][0].effectRef;
+    const effectRef = 'operation-native-provider-1';
     expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenNthCalledWith(1, {
       ownerId: 'owner-1',
       callSessionId: 'call-session-1',
@@ -359,8 +348,8 @@ describe('GlassHiveWorkActionService', () => {
     });
   });
 
-  test('does not claim completed control when the durable receipt was not bound', async () => {
-    mockMarkDurableEffectReceipt.mockResolvedValueOnce(false);
+  test('does not make accepted actions fail when stream tracing is unavailable', async () => {
+    mockGetGenerationJob.mockRejectedValueOnce(new Error('store unavailable'));
 
     await executeGlassHiveWorkAction({
       ownerId: 'owner-1',
@@ -377,13 +366,8 @@ describe('GlassHiveWorkActionService', () => {
       },
     });
 
-    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledTimes(1);
-    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledWith(
-      expect.objectContaining({
-        stage: 'action.accepted',
-        facts: expect.objectContaining({ action: 'steer', effectCount: 0 }),
-      }),
-    );
+    expect(mockRequestAccountApi).toHaveBeenCalledTimes(1);
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });
 
   test('replays the exact durable source context after the generation job expires', async () => {

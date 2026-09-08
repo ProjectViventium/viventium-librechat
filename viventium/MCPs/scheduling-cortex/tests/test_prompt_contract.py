@@ -8,6 +8,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -22,6 +23,7 @@ from scheduling_cortex.server import (
     build_server,
 )
 from scheduling_cortex import dispatch
+from scheduling_cortex import server
 
 SHARED_ROOT = ROOT.parents[3] / "shared"
 if str(SHARED_ROOT) not in sys.path:
@@ -29,7 +31,6 @@ if str(SHARED_ROOT) not in sys.path:
 from scheduler_prompt_contract import (  # noqa: E402
     CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID,
     SCHEDULER_RUN_ENVELOPE_PROMPT_ID,
-    SCHEDULER_RUN_ENVELOPE_TEMPLATE,
     render_scheduler_run_envelope,
 )
 from scheduling_cortex.models import CreateScheduleArgs, UpdateScheduleArgs
@@ -181,6 +182,75 @@ def test_create_rejects_unowned_glasshive_host_schedule_before_persisting(tmp_pa
         )
 
 
+def test_create_same_conversation_uses_current_authenticated_request_identity(
+    tmp_path: Path,
+) -> None:
+    storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / "schedules.db")))
+    create = _tools_by_name(build_server(storage))["schedule_create"]
+
+    with patch.object(
+        server,
+        "_get_request_headers",
+        return_value={
+            "x-viventium-user-id": "user-1",
+            "x-viventium-agent-id": "agent-1",
+            "x-viventium-conversation-id": "current-conversation",
+        },
+    ):
+        result = create.fn(
+            CreateScheduleArgs(
+                prompt="Deliver this reminder here.",
+                schedule={
+                    "type": "once",
+                    "run_at": "2099-01-01T00:00:00Z",
+                    "timezone": "UTC",
+                },
+                channel="librechat",
+                conversation_policy="same",
+                conversation_id="stale-previous-conversation",
+            )
+        )
+
+    assert result["task"]["conversation_id"] == "current-conversation"
+    assert storage.get_task("user-1", result["task"]["id"])["conversation_id"] == (
+        "current-conversation"
+    )
+
+
+def test_update_same_conversation_rejects_stale_explicit_identity(tmp_path: Path) -> None:
+    storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / "schedules.db")))
+    tools = _tools_by_name(build_server(storage))
+    created = tools["schedule_create"].fn(
+        CreateScheduleArgs(
+            user_id="user-1",
+            agent_id="agent-1",
+            prompt="Deliver this reminder here.",
+            schedule={"type": "daily", "time": "09:00", "timezone": "UTC"},
+            channel="librechat",
+            conversation_policy="same",
+            conversation_id="original-conversation",
+        )
+    )
+
+    with patch.object(
+        server,
+        "_get_request_headers",
+        return_value={
+            "x-viventium-user-id": "user-1",
+            "x-viventium-agent-id": "agent-1",
+            "x-viventium-conversation-id": "current-conversation",
+        },
+    ):
+        updated = tools["schedule_update"].fn(
+            UpdateScheduleArgs(
+                task_id=created["task"]["id"],
+                conversation_id="stale-previous-conversation",
+            )
+        )
+
+    assert updated["task"]["conversation_id"] == "current-conversation"
+
+
 def test_update_can_pause_failed_past_one_time_schedule(tmp_path: Path) -> None:
     storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / "schedules.db")))
     storage.create_task(
@@ -229,26 +299,25 @@ def test_update_can_pause_failed_past_one_time_schedule(tmp_path: Path) -> None:
 
 
 def test_registry_source_shared_artifact_and_runtime_scheduler_envelope_are_equal() -> None:
-    source = (
-        ROOT.parents[1]
-        / "source_of_truth"
-        / "prompts"
-        / "scheduler"
-        / "run_envelope.md"
+    compiler = pytest.importorskip(
+        "scripts.viventium.prompt_registry",
+        reason="Cross-repository compiler parity requires Viventium Core on PYTHONPATH",
     )
-    registry = ROOT.parents[1] / "source_of_truth" / "prompts" / "registry.yaml"
-    source_text = source.read_text(encoding="utf-8")
-    source_body = source_text.split("---", 2)[-1].strip()
-    registry_text = registry.read_text(encoding="utf-8")
+    load_prompt_registry, render_prompt = compiler.load_prompt_registry, compiler.render_prompt
+
+    source_root = ROOT.parents[1] / "source_of_truth" / "prompts"
+    registry_text = (source_root / "registry.yaml").read_text(encoding="utf-8")
     context = "- scheduled_due_at_utc: 2026-08-10T12:00:00Z"
+    expected = render_prompt(
+        SCHEDULER_RUN_ENVELOPE_PROMPT_ID,
+        load_prompt_registry(source_root),
+        variables={"scheduled_run_context": context},
+    ).strip()
 
     assert "scheduler.run_envelope:" in registry_text
-    assert "path: viventium_v0_4/shared/scheduler_prompt_contract.py" in registry_text
-    assert "selector: SCHEDULER_RUN_ENVELOPE_TEMPLATE" in registry_text
-    assert source_body == SCHEDULER_RUN_ENVELOPE_TEMPLATE
-    assert dispatch.SCHEDULER_RUN_ENVELOPE_TEMPLATE is SCHEDULER_RUN_ENVELOPE_TEMPLATE
+    assert "selector: render_scheduler_run_envelope" in registry_text
     assert dispatch.render_scheduler_run_envelope is render_scheduler_run_envelope
-    assert dispatch._default_scheduler_run_envelope(context) == render_scheduler_run_envelope(context)
+    assert dispatch._default_scheduler_run_envelope(context) == expected
 
 
 def test_registry_source_shared_artifact_and_runtime_continuity_id_are_equal() -> None:
@@ -497,3 +566,99 @@ def test_periphery_read_keeps_evidence_but_hides_internal_references() -> None:
         "Private duplicate body",
     ):
         assert forbidden not in encoded
+
+
+@pytest.mark.parametrize("prefix_mode", ["default", "custom", "legacy", "custom_alias"])
+def test_compose_uses_edited_compiled_policy_without_literal_reappend(tmp_path, monkeypatch, prefix_mode):
+    import shutil
+    from prompt_bundle_fixture import build_prompt_bundle
+
+    source_root = tmp_path / "prompts"
+    shutil.copytree(ROOT.parents[1] / "source_of_truth" / "prompts" / "scheduler", source_root / "scheduler")
+    policy = source_root / "scheduler" / "run_live_fact_contract.md"
+    frontmatter = policy.read_text().split("\n---\n", 1)[0]
+    policy.write_text(frontmatter + "\n---\n\nSynthetic current evidence contract.\n")
+    context_policy = source_root / "scheduler" / "run_context_contract.md"
+    frontmatter = context_policy.read_text().split("\n---\n", 1)[0]
+    context_policy.write_text(frontmatter + "\n---\n\nSynthetic current context contract.\n")
+    bundle = tmp_path / "edited-bundle.json"
+    bundle.write_text(json.dumps(build_prompt_bundle(source_root)))
+    monkeypatch.setenv("VIVENTIUM_PROMPT_BUNDLE_PATH", str(bundle))
+    monkeypatch.delenv("SCHEDULER_PROMPT_PREFIX", raising=False)
+    monkeypatch.delenv("SCHEDULING_PROMPT_PREFIX", raising=False)
+    original_goal = "Prepare the synthetic project update exactly as requested."
+    task = {"prompt": original_goal}
+    if prefix_mode == "custom":
+        monkeypatch.setenv("SCHEDULER_PROMPT_PREFIX", "Owner-authored custom prefix.")
+    elif prefix_mode == "custom_alias":
+        monkeypatch.setenv("SCHEDULING_PROMPT_PREFIX", "Owner-authored custom prefix.")
+    elif prefix_mode == "legacy":
+        task["prompt"] = "<!--viv_internal:brew_begin-->\nLegacy scheduled self-prompt.\n" + original_goal
+    composed = dispatch._compose_prompt(task, run_context={"schedule_timezone": "UTC"})
+    assert composed.count(original_goal) == 1
+    assert composed.count("- schedule_timezone: UTC") == 1
+    assert composed.count("Synthetic current evidence contract.") == 1
+    assert composed.count("Synthetic current context contract.") == 1
+    assert "For live external facts" not in composed
+    assert "Do not carry forward dates" not in composed
+    if prefix_mode in {"custom", "custom_alias"}:
+        assert composed.startswith("Owner-authored custom prefix.")
+    elif prefix_mode == "legacy":
+        assert composed.startswith(task["prompt"])
+        assert composed.count("<!--viv_internal:brew_begin-->") == 1
+
+
+def test_compose_does_not_restore_an_include_removed_from_registered_default(tmp_path, monkeypatch):
+    from prompt_bundle_fixture import build_prompt_bundle
+
+    bundle = build_prompt_bundle()
+    bundle["prompts"]["scheduler.run_envelope"]["metadata"]["includes"].remove(
+        "scheduler.run_live_fact_contract"
+    )
+    path = tmp_path / "changed-includes.json"
+    path.write_text(json.dumps(bundle))
+    monkeypatch.setenv("VIVENTIUM_PROMPT_BUNDLE_PATH", str(path))
+    monkeypatch.delenv("SCHEDULER_PROMPT_PREFIX", raising=False)
+    monkeypatch.delenv("SCHEDULING_PROMPT_PREFIX", raising=False)
+    composed = dispatch._compose_prompt({"prompt": "Synthetic task."}, run_context={"schedule_timezone": "UTC"})
+    assert "For live external facts" not in composed
+    assert composed.count("- schedule_timezone: UTC") == 1
+
+
+def test_missing_compiled_prompt_is_classified_before_native_dispatch(monkeypatch):
+    monkeypatch.delenv("VIVENTIUM_PROMPT_BUNDLE_PATH")
+    with pytest.raises(ValueError) as error:
+        dispatch._compose_prompt({"prompt": "Synthetic task."})
+    failure = dispatch.scheduled_exception_failure({"executor": "viventium_agent"}, error.value)
+    assert failure == {"error_class": "prompt_bundle_unavailable", "failure_retryable": False}
+
+
+def test_one_composition_keeps_one_bundle_when_file_changes_mid_turn(tmp_path, monkeypatch):
+    from prompt_bundle_fixture import build_prompt_bundle
+
+    bundle = build_prompt_bundle()
+    path = tmp_path / "changing-bundle.json"
+    path.write_text(json.dumps(bundle))
+    monkeypatch.setenv("VIVENTIUM_PROMPT_BUNDLE_PATH", str(path))
+    monkeypatch.delenv("SCHEDULER_PROMPT_PREFIX", raising=False)
+    monkeypatch.delenv("SCHEDULING_PROMPT_PREFIX", raising=False)
+    bundle["prompts"]["scheduler.run_live_fact_contract"]["body"] = "Next evidence contract."
+    bundle["prompts"]["scheduler.run_context_contract"]["body"] = "Next context contract."
+    original = dispatch._format_scheduled_run_context_block
+
+    def replace_bundle_before_context(run_context, prompts):
+        path.write_text(json.dumps(bundle))
+        return original(run_context, prompts)
+
+    monkeypatch.setattr(dispatch, "_format_scheduled_run_context_block", replace_bundle_before_context)
+    task, context = {"prompt": "Synthetic task."}, {"schedule_timezone": "UTC"}
+    first = dispatch._compose_prompt(task, run_context=context)
+    second = dispatch._compose_prompt(task, run_context=context)
+    assert "For live external facts" in first
+    assert "Do not carry forward dates" in first
+    assert "Next evidence contract." not in first
+    assert "Next context contract." not in first
+    assert "For live external facts" not in second
+    assert "Do not carry forward dates" not in second
+    assert "Next evidence contract." in second
+    assert "Next context contract." in second

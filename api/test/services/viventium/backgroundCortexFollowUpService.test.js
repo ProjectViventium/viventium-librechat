@@ -1,3 +1,60 @@
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { buildPromptBundleFixture } = require('../../../../scripts/test-support/promptBundle.cjs');
+let promptFixtureDirectory;
+const previousPromptBundlePath = process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+beforeAll(() => {
+  promptFixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-test-prompts-'));
+  const bundlePath = path.join(promptFixtureDirectory, 'bundle.json');
+  fs.writeFileSync(
+    bundlePath,
+    JSON.stringify(
+      buildPromptBundleFixture(
+        path.resolve(__dirname, '../../../../viventium/source_of_truth/prompts'),
+      ),
+    ),
+  );
+  process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundlePath;
+});
+afterAll(() => {
+  if (previousPromptBundlePath === undefined) delete process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+  else process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = previousPromptBundlePath;
+  fs.rmSync(promptFixtureDirectory, { recursive: true, force: true });
+});
+
+jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => {
+  const actual = jest.requireActual('~/server/services/viventium/CortexInsightDeliveryService');
+  const crypto = require('node:crypto');
+  const settle = jest.fn(async ({ claims }) => claims);
+  return {
+    ...actual,
+    claimCortexInsightDeliveryBatch: jest.fn(async ({ insights }) => ({
+      claimed: insights.map((insight, index) => ({
+        deliveryId: `fixture-delivery-${index}`,
+        claimToken: `fixture-claim-${index}`,
+        claimGeneration: 1,
+        attemptNumber: 1,
+        cortexId:
+          insight.cortexId ||
+          insight.cortex_id ||
+          insight.agentId ||
+          insight.agent_id ||
+          insight.cortexName ||
+          insight.cortex_name ||
+          'cortex',
+        insightHash: crypto
+          .createHash('sha256')
+          .update(String(insight.insight || ''))
+          .digest('hex'),
+      })),
+    })),
+    renewCortexInsightDeliveryBatchClaim: settle,
+    markCortexInsightDeliveryBatchPersisted: settle,
+    markCortexInsightDeliveryBatchFailed: settle,
+    markCortexInsightDeliveryBatchDropped: settle,
+  };
+});
 /* === VIVENTIUM START ===
  * Purpose: Viventium addition in private LibreChat fork (new file).
  * Porting: Copy this file wholesale when reapplying Viventium changes onto a fresh upstream checkout.
@@ -94,6 +151,7 @@ jest.mock('~/app/clients/tools/util/fileSearch', () => ({
 }));
 
 jest.mock('~/models', () => ({
+  getNativeResponse: jest.fn(async () => null),
   getMessage: jest.fn(),
   getMessages: jest.fn(),
   updateMessage: jest.fn(),
@@ -129,13 +187,14 @@ const {
   getPreferredFallbackInsightText,
   resolveRecentResponseText,
   resolveConversationLeafMessageId,
-  stripQuestionSentences,
+  resolveFollowUpPersistenceText,
 } = require('~/server/services/viventium/BackgroundCortexFollowUpService');
 
 describe('BackgroundCortexFollowUpService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     getAgent.mockResolvedValue(null);
+    db.saveMessage.mockImplementation(async (_req, message) => message);
   });
 
   describe('recent response resolution', () => {
@@ -183,51 +242,19 @@ describe('BackgroundCortexFollowUpService', () => {
     });
   });
 
-  describe('question stripping', () => {
-    test('removes pure question sentence', () => {
-      expect(stripQuestionSentences('What should we do next?')).toBe('');
+  describe('model-selected follow-up text', () => {
+    test.each([
+      'Which attendance day should I choose?',
+      'One field remains empty. Which value is correct?',
+      'Use [the source](https://docs.example.test/page?lang=en&view=all).\n\n1. First.\n   - Nested evidence.\n   - Second point.',
+      '```python\nif ready:\n    values = [12]\n    print("a  b?")\n```',
+      '1. Read the source.\n   1. Check the date.\n      - Preserve this evidence.\n\n2. Review the result.',
+    ])('preserves the accepted model text %#', (text) => {
+      expect(resolveFollowUpPersistenceText({ generatedText: text }).text).toBe(text);
     });
 
-    test('keeps declarative sentence when question is a separate sentence', () => {
-      expect(stripQuestionSentences('I found one missing detail. What should we do?')).toBe(
-        'I found one missing detail.',
-      );
-    });
-
-    test('salvages declarative prefix before comma-separated question clause', () => {
-      expect(stripQuestionSentences('New detail X found, shall we dig deeper?')).toBe(
-        'New detail X found.',
-      );
-    });
-
-    test('salvages declarative prefix when comma has no trailing space', () => {
-      expect(stripQuestionSentences('New detail X found,shall we dig deeper?')).toBe(
-        'New detail X found.',
-      );
-    });
-
-    test('salvages declarative prefix before em-dash question clause', () => {
-      expect(stripQuestionSentences("The data shows improvement— isn't that great?")).toBe(
-        'The data shows improvement.',
-      );
-    });
-
-    test('salvages declarative prefix when em-dash has no trailing space', () => {
-      expect(stripQuestionSentences("The data shows improvement—isn't that great?")).toBe(
-        'The data shows improvement.',
-      );
-    });
-
-    test('handles mixed declarative and question sentences together', () => {
-      expect(stripQuestionSentences('Found a pattern. Also X is interesting, right?')).toBe(
-        'Found a pattern. Also X is interesting.',
-      );
-    });
-
-    test('returns text unchanged when no question marks present', () => {
-      expect(stripQuestionSentences('Everything looks good here.')).toBe(
-        'Everything looks good here.',
-      );
+    test('keeps the typed no-response marker silent', () => {
+      expect(resolveFollowUpPersistenceText({ generatedText: '{NTA}' }).text).toBe('');
     });
   });
 
@@ -540,13 +567,14 @@ describe('BackgroundCortexFollowUpService', () => {
 
   test('createCortexFollowUpMessage saves a follow-up message with metadata', async () => {
     const req = { user: { id: 'u1' } };
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
 
+    Run.create.mockResolvedValueOnce({ processStream: jest.fn(async () => 'Secret code: 27') });
     const msg = await createCortexFollowUpMessage({
       req,
       conversationId: 'c-123',
       parentMessageId: 'm-parent',
-      agent: { id: 'agent_123' },
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-4o-mini', model_parameters: {} },
       insightsData: {
         cortexCount: 1,
         insights: [{ cortexName: 'Background Analysis', insight: 'Secret code: 27' }],
@@ -574,7 +602,7 @@ describe('BackgroundCortexFollowUpService', () => {
       user: { id: 'u1' },
       body: { viventiumSurface: 'telegram', telegramAudioRequested: true },
     };
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => 'First beat.\n{MSG_BREAK}\nSecond beat.\n{SKIP_VOICE}'),
     });
@@ -625,7 +653,7 @@ describe('BackgroundCortexFollowUpService', () => {
 
   test('createCortexFollowUpMessage attaches non-deferred follow-up to the current leaf message', async () => {
     const req = { user: { id: 'u1' } };
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
     db.getMessages.mockResolvedValueOnce([
       {
         messageId: 'assistant-phase-1',
@@ -641,11 +669,12 @@ describe('BackgroundCortexFollowUpService', () => {
       },
     ]);
 
+    Run.create.mockResolvedValueOnce({ processStream: jest.fn(async () => 'Secret code: 27') });
     const msg = await createCortexFollowUpMessage({
       req,
       conversationId: 'c-123',
       parentMessageId: 'assistant-phase-1',
-      agent: { id: 'agent_123' },
+      agent: { id: 'agent_123', provider: 'openai', model: 'gpt-4o-mini', model_parameters: {} },
       insightsData: {
         cortexCount: 1,
         insights: [{ cortexName: 'Background Analysis', insight: 'Secret code: 27' }],
@@ -679,7 +708,7 @@ describe('BackgroundCortexFollowUpService', () => {
   test('createCortexFollowUpMessage persists a deterministic fallback when synthesis is empty but insight is substantive', async () => {
     const req = { user: { id: 'u1' } };
     db.getMessages.mockResolvedValueOnce([{ messageId: 'm-parent' }]);
-    db.saveMessage.mockResolvedValueOnce({});
+    db.saveMessage.mockImplementationOnce(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => ''),
@@ -763,7 +792,7 @@ describe('BackgroundCortexFollowUpService', () => {
         text: 'Good, then leave it alone.',
       },
     ]);
-    db.saveMessage.mockResolvedValueOnce({});
+    db.saveMessage.mockImplementationOnce(async (_req, message) => message);
 
     let capturedPrompt = '';
     Run.create.mockResolvedValueOnce({
@@ -871,7 +900,7 @@ describe('BackgroundCortexFollowUpService', () => {
         text: 'I have the main answer.',
       },
     ]);
-    db.saveMessage.mockResolvedValueOnce({});
+    db.saveMessage.mockImplementationOnce(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => 'One still-useful new detail.'),
@@ -953,7 +982,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(db.saveMessage).not.toHaveBeenCalled();
   });
 
-  test('createCortexFollowUpMessage suppresses question-only follow-up as {NTA}', async () => {
+  test('createCortexFollowUpMessage preserves a model-selected question', async () => {
     const req = { user: { id: 'u1' } };
     db.getMessage.mockResolvedValueOnce({
       messageId: 'm-parent',
@@ -979,9 +1008,10 @@ describe('BackgroundCortexFollowUpService', () => {
       recentResponse: '',
     });
 
-    expect(msg).toBeNull();
+    expect(msg).toBeTruthy();
+    expect(msg.text).toBe('Should I ask another question?');
     expect(db.getMessage).toHaveBeenCalledWith({ user: 'u1', messageId: 'm-parent' });
-    expect(db.saveMessage).not.toHaveBeenCalled();
+    expect(db.saveMessage).toHaveBeenCalled();
   });
 
   test('createCortexFollowUpMessage injects DB Phase A text into follow-up prompt', async () => {
@@ -992,7 +1022,7 @@ describe('BackgroundCortexFollowUpService', () => {
       content: [{ type: 'text', text: 'Phase A response from DB content parts' }],
     });
     db.getMessages.mockResolvedValueOnce([{ messageId: 'm-parent' }]);
-    db.saveMessage.mockResolvedValueOnce({});
+    db.saveMessage.mockImplementationOnce(async (_req, message) => message);
 
     let capturedPrompt = '';
     Run.create.mockResolvedValueOnce({
@@ -1043,7 +1073,7 @@ describe('BackgroundCortexFollowUpService', () => {
         },
       },
     });
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => 'Final resolved answer'),
@@ -1120,7 +1150,13 @@ describe('BackgroundCortexFollowUpService', () => {
       sender: 'Viventium',
       text: '',
       unfinished: true,
+      error: true,
       content: [
+        {
+          type: 'error',
+          error: 'The request could not complete.',
+          error_class: 'completion_error',
+        },
         {
           type: 'cortex_insight',
           cortex_id: 'agent_123',
@@ -1163,6 +1199,7 @@ describe('BackgroundCortexFollowUpService', () => {
         messageId: 'm-parent',
         text: 'The real risk is workflow fit, not transcription quality.',
         unfinished: false,
+        error: false,
         content: expect.arrayContaining([
           expect.objectContaining({ type: 'cortex_insight', cortex_id: 'agent_123' }),
           { type: 'text', text: 'The real risk is workflow fit, not transcription quality.' },
@@ -1174,11 +1211,13 @@ describe('BackgroundCortexFollowUpService', () => {
             replacedParentMessage: true,
             forceVisibleFollowUp: true,
             promotedToEmptyParent: true,
+            recoveredPrimaryErrorClasses: ['completion_error'],
           }),
         }),
       }),
       expect.any(Object),
     );
+    expect(msg.content.some((part) => part.type === 'error')).toBe(false);
     expect(msg).toEqual(
       expect.objectContaining({
         messageId: 'm-parent',
@@ -1186,6 +1225,7 @@ describe('BackgroundCortexFollowUpService', () => {
         parentMessageId: 'u-message',
         text: 'The real risk is workflow fit, not transcription quality.',
         unfinished: false,
+        error: false,
       }),
     );
   });
@@ -1295,7 +1335,7 @@ describe('BackgroundCortexFollowUpService', () => {
         },
       },
     });
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => '{NTA}'),
@@ -1410,7 +1450,7 @@ describe('BackgroundCortexFollowUpService', () => {
         },
       },
     });
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => '{NTA}'),
@@ -1520,7 +1560,7 @@ describe('BackgroundCortexFollowUpService', () => {
         },
       },
     });
-    db.saveMessage.mockResolvedValue({});
+    db.saveMessage.mockImplementation(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => {
@@ -1642,7 +1682,7 @@ describe('BackgroundCortexFollowUpService', () => {
       content: [{ type: 'text', text: 'Phase A response from DB content parts' }],
     });
     db.getMessages.mockResolvedValueOnce([{ messageId: 'm-parent' }]);
-    db.saveMessage.mockResolvedValueOnce({});
+    db.saveMessage.mockImplementationOnce(async (_req, message) => message);
 
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async () => '{NTA} Keep the good part \\ue202turn0search0 [12] here'),
@@ -1660,7 +1700,7 @@ describe('BackgroundCortexFollowUpService', () => {
     });
 
     expect(msg).toBeTruthy();
-    expect(msg.text).toBe('Keep the good part here');
+    expect(msg.text).toBe('Keep the good part [12] here');
   });
 
   // === VIVENTIUM NOTE ===
@@ -1780,6 +1820,52 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(runInstance.processStream).toHaveBeenCalled();
   });
 
+  test.each(['low', 'high'])(
+    'generateFollowUpText preserves saved %s effort through final persisted hydration',
+    async (effort) => {
+      const agent = {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-6-astra',
+        model_parameters: { reasoning_effort: effort },
+      };
+      getAgent.mockResolvedValue(agent);
+      getCustomEndpointConfig.mockResolvedValueOnce({
+        apiKey: 'test-key',
+        baseURL: 'https://harness.example.test/v1',
+      });
+      await generateFollowUpText({
+        req: {
+          user: { id: 'u1' },
+          body: {},
+          config: {
+            endpoints: {
+              agents: {
+                capabilityRequiredProviders: ['glasshive-harness'],
+                providerCapabilities: {
+                  'glasshive-harness': {
+                    phase_b_followup: true,
+                    responses_api: false,
+                  },
+                },
+              },
+            },
+          },
+        },
+        agent: { ...agent, model_parameters: {} },
+        insightsData: { insights: [{ cortexName: 'Review', insight: 'The result is ready.' }] },
+        recentResponse: 'Working.',
+        runId: 'saved-effort-followup',
+      });
+      expect(getAgent).toHaveBeenCalledWith({ id: agent.id });
+      expect(Run.create.mock.calls.at(-1)[0].graphConfig.llmConfig.modelKwargs).toMatchObject({
+        model: agent.model,
+        reasoning_effort: effort,
+      });
+      expect(agent.model_parameters.reasoning_effort).toBe(effort);
+    },
+  );
+
   test('generateFollowUpText gives a custom OpenAI-compatible endpoint a top-level API key', async () => {
     getCustomEndpointConfig.mockResolvedValueOnce({
       apiKey: 'glasshive-provider-key',
@@ -1853,6 +1939,67 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(runCall.graphConfig.llmConfig.configuration).not.toHaveProperty('apiKey');
     expect(runCall.graphConfig.llmConfig).not.toHaveProperty('maxTokens');
     expect(runCall.graphConfig.llmConfig).not.toHaveProperty('temperature');
+  });
+
+  test('generateFollowUpText isolates durable GlassHive follow-up work from the active Main session', async () => {
+    getCustomEndpointConfig.mockResolvedValueOnce({
+      apiKey: 'glasshive-provider-key',
+      baseURL: 'http://127.0.0.1:8766/v1',
+      defaultHeaders: {},
+      dropParams: ['temperature', 'max_tokens', 'use_responses_api'],
+    });
+    const req = {
+      user: { id: 'u1' },
+      body: { conversationId: 'conversation-1', messageId: 'shared-parent' },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              'glasshive-harness': {
+                phase_b_followup: true,
+                workspace_binding: true,
+                responses_api: false,
+              },
+            },
+          },
+        },
+      },
+    };
+
+    await generateFollowUpText({
+      req,
+      agent: {
+        id: 'agent-glasshive-main',
+        endpoint: 'glasshive-harness',
+        provider: 'openAI',
+        model: 'codex-cli:gpt-5.6-sol',
+        tools: [],
+        model_parameters: { reasoning_effort: 'medium' },
+      },
+      insightsData: {
+        insights: [{ cortexName: 'Mission evidence', insight: 'Worker B completed.' }],
+      },
+      recentResponse: 'Worker C completed.',
+      runId: 'ghag_11111111111111111111111111111111',
+      conversationId: 'conversation-1',
+      parentMessageId: 'shared-parent',
+    });
+
+    const {
+      attachConversationProviderCapabilityBundle,
+    } = require('~/server/services/viventium/GlassHiveConversationProviderService');
+    const capabilityRequest = attachConversationProviderCapabilityBundle.mock.calls.at(-1)[0];
+    expect(capabilityRequest.requestBody.viventiumGlassHiveIdempotencyKey).toContain(
+      'ghag_11111111111111111111111111111111',
+    );
+    expect(capabilityRequest.requestBody.conversationId).toBe('conversation-1');
+    expect(
+      Run.create.mock.calls.at(-1)[0].graphConfig.llmConfig.configuration.defaultHeaders,
+    ).toEqual(
+      expect.objectContaining({
+        'X-GlassHive-Agent-Id': 'agent-glasshive-main:phase_b:followup',
+      }),
+    );
   });
 
   test.each([
@@ -2460,7 +2607,7 @@ describe('BackgroundCortexFollowUpService', () => {
 
       expect(prompt).toContain('Sharing the same topic is not enough to call an insight redundant');
       expect(prompt).toContain(
-        'unless the user explicitly authorized a conditional later continuation',
+        'the user did not explicitly authorize a conditional later continuation',
       );
     });
 
@@ -2586,6 +2733,7 @@ describe('BackgroundCortexFollowUpService', () => {
 
     jest.clearAllMocks();
     getAgent.mockResolvedValue(null);
+    db.saveMessage.mockImplementation(async (_req, message) => message);
     await generateFollowUpText({
       req,
       agent: { id: 'agent_123', provider: 'openai' },

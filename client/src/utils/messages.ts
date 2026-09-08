@@ -18,6 +18,38 @@ import _ from 'lodash';
 
 export const TEXT_KEY_DIVIDER = '|||';
 
+/* === VIVENTIUM START === Preserve typed call transcript provenance in message headers. === */
+export const getVoiceTranscriptLabel = (
+  message: TMessage | null | undefined,
+  localize: LocalizeFunction,
+): string | undefined => {
+  const metadata = message?.metadata?.viventium;
+  if (
+    message?.isCreatedByUser !== false ||
+    metadata == null ||
+    typeof metadata !== 'object' ||
+    !('type' in metadata) ||
+    (metadata.type !== 'listen_only_transcript' && metadata.type !== 'voice_ambient_transcript')
+  ) {
+    return undefined;
+  }
+  const speaker =
+    'speakerLabel' in metadata && typeof metadata.speakerLabel === 'string'
+      ? metadata.speakerLabel.trim()
+      : '';
+  return localize('com_ui_voice_transcript_speaker', {
+    0: speaker || localize('com_ui_unknown'),
+  });
+};
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Present the saved incomplete finish reason without inferring its cause. === */
+export const isIncompleteMessage = (message?: TMessage | null): boolean =>
+  message?.isCreatedByUser === false &&
+  message.finish_reason === 'incomplete' &&
+  message.error !== true;
+/* === VIVENTIUM END === */
+
 export const getLatestText = (message?: TMessage | null, includeIndex?: boolean): string => {
   if (!message) {
     return '';

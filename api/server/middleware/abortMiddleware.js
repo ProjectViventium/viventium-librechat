@@ -70,7 +70,7 @@ async function spendCollectedUsage({
  * Uses GenerationJobManager for all agent requests.
  * Since streamId === conversationId, we can directly abort by conversationId.
  */
-async function abortMessage(req, res) {
+async function abortMessage(req, res, reason) {
   const { abortKey, endpoint } = req.body;
 
   if (isAssistantsEndpoint(endpoint)) {
@@ -80,8 +80,25 @@ async function abortMessage(req, res) {
   const conversationId = abortKey?.split(':')?.[0] ?? req.user.id;
   const userId = req.user.id;
 
+  const job = await GenerationJobManager.getJob(conversationId);
+  if (!userId || !job?.metadata?.userId || job.metadata.userId !== userId) {
+    const unavailable = { error: 'Job not found', streamId: conversationId };
+    if (res.headersSent) return sendEvent(res, unavailable);
+    return res.status(404).json(unavailable);
+  }
+
   // Use GenerationJobManager to abort the job (streamId === conversationId)
-  const abortResult = await GenerationJobManager.abortJob(conversationId);
+  const abortResult = await GenerationJobManager.abortJob(conversationId, reason, userId);
+
+  if (abortResult.nativeResponse) {
+    const result = {
+      success: false,
+      nativeResponse: abortResult.nativeResponse,
+      ...(abortResult.finalEvent ? { finalEvent: abortResult.finalEvent } : {}),
+    };
+    if (res.headersSent) return sendEvent(res, result);
+    return res.status(abortResult.nativeResponse === 'committed' ? 200 : 202).json(result);
+  }
 
   if (!abortResult.success) {
     if (!res.headersSent) {
@@ -95,22 +112,24 @@ async function abortMessage(req, res) {
   const completionTokens = await countTokens(text);
   const promptTokens = jobData?.promptTokens ?? 0;
 
-  const responseMessage = {
-    messageId: jobData?.responseMessageId,
-    parentMessageId: jobData?.userMessage?.messageId,
-    conversationId: jobData?.conversationId,
-    content,
-    text,
-    sender: jobData?.sender ?? 'AI',
-    finish_reason: 'incomplete',
-    endpoint: jobData?.endpoint,
-    iconURL: jobData?.iconURL,
-    model: jobData?.model,
-    unfinished: false,
-    error: false,
-    isCreatedByUser: false,
-    tokenCount: completionTokens,
-  };
+  const responseMessage = jobData?.nativeResponse
+    ? abortResult.finalEvent?.responseMessage
+    : {
+        messageId: jobData?.responseMessageId,
+        parentMessageId: jobData?.userMessage?.messageId,
+        conversationId: jobData?.conversationId,
+        content,
+        text,
+        sender: jobData?.sender ?? 'AI',
+        finish_reason: 'incomplete',
+        endpoint: jobData?.endpoint,
+        iconURL: jobData?.iconURL,
+        model: jobData?.model,
+        unfinished: false,
+        error: false,
+        isCreatedByUser: false,
+        tokenCount: completionTokens,
+      };
 
   // Spend tokens for ALL models from collectedUsage (handles parallel agents/addedConvo)
   if (collectedUsage && collectedUsage.length > 0) {
@@ -129,11 +148,13 @@ async function abortMessage(req, res) {
     );
   }
 
-  await saveMessage(
-    req,
-    { ...responseMessage, user: userId },
-    { context: 'api/server/middleware/abortMiddleware.js' },
-  );
+  if (!jobData?.nativeResponse) {
+    await saveMessage(
+      req,
+      { ...responseMessage, user: userId },
+      { operationKind: 'system', context: 'api/server/middleware/abortMiddleware.js' },
+    );
+  }
 
   // Get conversation for title
   const conversation = await getConvo(userId, conversationId);
@@ -172,7 +193,7 @@ const handleAbort = function () {
       if (isEnabled(process.env.LIMIT_CONCURRENT_MESSAGES)) {
         await clearPendingReq({ userId: req.user.id });
       }
-      return await abortMessage(req, res);
+      return await abortMessage(req, res, 'user_cancelled');
     } catch (err) {
       logger.error('[abortMessage] handleAbort error', err);
     }

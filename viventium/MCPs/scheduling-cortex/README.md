@@ -28,6 +28,46 @@ adding browser/API test libraries to the production runtime:
 uv run --group test pytest -q
 ```
 
+The consumer tests need the runtime's shared scheduler contract on `PYTHONPATH`. A full Viventium
+checkout supplies `viventium_v0_4/shared`. The GlassHive end-to-end cases additionally need
+`GlassHive/runtime_phase1/src`; Workbench projection and compiler parity cases need the Core repo
+root and `viventium_v0_4/prompt-workbench/backend`. Add those source directories to `PYTHONPATH`
+when running the cross-repository checks. Missing optional integration owners produce explicit
+skips for those cases; the scheduler consumer cases still run. A skip does not prove integration.
+
+### Known source baseline gap
+
+The 2026-09-08 publication review ran `test_glasshive_workspace_schedules.py` and
+`test_scheduled_failure_provenance.py` with the shared runtime contract and without optional
+GlassHive/Core/Workbench owners: **46 passed, 15 failed, 4 explicitly skipped**. The skips are
+only the two GlassHive end-to-end cases and two Workbench projection cases described above.
+With their owners present, both Workbench cases pass; both GlassHive end-to-end cases execute
+and fail on the same missing occurrence-claim method below.
+
+The 15 failures below remain active. Workspace dispatch calls `claim_scheduled_prompt_run`, and
+owner deactivation calls `deactivate_glasshive_workspace_tasks_for_owner`, but `ScheduleStorage`
+does not implement those methods. Both callsites and missing methods also exist in public base
+`ae36f2ec680f9ae60903fa71aad2d94fece02c55`. This is an existing workspace-recurrence gap, not a
+claim that other scheduler paths fail. Source publication does not certify this journey.
+
+All failing cases are in `test_glasshive_workspace_schedules.py`:
+
+- `test_bounded_catch_up_dispatches_only_the_bounded_latest_occurrences`
+- `test_coalesce_and_skip_catch_up_record_truthful_occurrences` (`coalesce` subcase)
+- `test_disable_owner_deactivates_only_glasshive_workspace_definitions`
+- `test_expired_occurrence_claim_is_recovered_idempotently_after_restart`
+- `test_jitter_is_bounded_deterministic_and_delays_dispatch_without_changing_identity`
+- `test_nonretryable_workspace_failure_pauses_action_required_without_retry`
+- `test_occurrence_claim_blocks_duplicate_dispatch_and_reports_its_lease`
+- `test_overlap_policy_skips_or_queues_without_losing_the_occurrence` (`queue` subcase)
+- `test_private_detail_failure_is_claimed_and_stops_after_bounded_budget`
+- `test_real_scheduler_tick_queues_exactly_one_glasshive_workspace_run`
+- `test_retryable_workspace_failures_stop_after_bounded_budget`
+- `test_rfc5545_end_boundary_dispatches_the_final_occurrence_then_deactivates`
+- `test_workspace_fire_delegates_user_revalidation_to_glasshive_without_credentials`
+- `test_workspace_fire_records_glasshive_capability_reconnection_failure`
+- `test_workspace_occurrences_delegate_just_in_time_capabilities_without_persisting_bundles`
+
 ## Environment
 
 - `SCHEDULING_DB_PATH` (default: `~/Library/Application Support/Viventium/state/runtime/isolated/scheduling/schedules.db`)

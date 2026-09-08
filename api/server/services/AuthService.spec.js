@@ -9,6 +9,7 @@ jest.mock('librechat-data-provider', () => ({
   errorsToString: jest.fn(),
 }));
 jest.mock('@librechat/api', () => ({
+  getSessionCookieName: jest.fn((name) => name),
   isEnabled: jest.fn((val) => val === 'true' || val === true),
   checkEmailConfig: jest.fn(),
   isEmailDomainAllowed: jest.fn(),

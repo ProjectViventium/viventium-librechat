@@ -3,6 +3,7 @@ const createValidateImageRequest = require('~/server/middleware/validateImageReq
 
 // Mock only isEnabled, keep getBasePath real so it reads process.env.DOMAIN_CLIENT
 jest.mock('@librechat/api', () => ({
+  getSessionCookieName: jest.requireActual('@librechat/api').getSessionCookieName,
   ...jest.requireActual('@librechat/api'),
   isEnabled: jest.fn(),
 }));

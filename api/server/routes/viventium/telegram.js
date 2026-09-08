@@ -24,10 +24,15 @@ const {
   GenerationJobManager,
   normalizeChannelEnvelope,
   buildChannelAgentRequest,
+  bindReadyInputContinuation,
+  telegramIngressDedupeTtlSeconds,
+  bindInteractionSourceSegments,
+  bindCanonicalInteractionConversation,
 } = require('@librechat/api');
 const { EnvVar } = require('@librechat/agents');
 const { logger } = require('@librechat/data-schemas');
 const {
+  Constants,
   SystemRoles,
   ContentTypes,
   FileSources,
@@ -42,13 +47,21 @@ const {
 const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
+const {
+  captureAcceptedInteractionInput,
+  retainAcceptedInteractionInput,
+  acceptedInteractionSourceId,
+  resolveCanonicalConversationId,
+} = AgentController;
+const TelegramInput = require('~/server/services/viventium/TelegramInputService');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { fileAccess } = require('~/server/middleware/accessResources/fileAccess');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { resizeImageBuffer } = require('~/server/services/Files/images');
 const { cleanFileName } = require('~/server/utils/files');
 const { getOpenAIClient } = require('~/server/controllers/assistants/helpers');
-const { getUserById, getMessages, getConvo } = require('~/models');
+const { getUserById, getMessages, getConvo, getFiles, saveMessage } = require('~/models');
+const { Message } = require('~/db/models');
 /* === VIVENTIUM START ===
  * Feature: Telegram ingress idempotency store.
  * === VIVENTIUM END === */
@@ -73,6 +86,13 @@ const {
   getGlassHiveCallbackStateForMessage,
 } = require('~/server/services/viventium/GlassHiveCallbackMessageService');
 const {
+  claimPendingCortexTelegramDeliveries,
+  authorizeCortexTelegramDeliveryClaim,
+  failCortexTelegramDeliveryClaim,
+  suppressCortexTelegramDeliveryClaim,
+  markCortexTelegramDeliveryUnknown,
+} = require('~/server/services/viventium/CortexTelegramDeliveryDispatchService');
+const {
   authorizeGlassHiveCallbackDeliveryDispatch,
   claimPendingGlassHiveCallbackDeliveries,
   markGlassHiveCallbackDeliverySent,
@@ -88,10 +108,16 @@ const {
 } = require('~/server/services/viventium/conversationThreading');
 const {
   attachLogicalTurnMetadata,
+  buildTelegramSourceEventId,
+  buildTelegramSourceOrderScope,
   createTelegramInteractionContext,
   getTrustedInteractionContext,
   setTrustedInteractionContext,
 } = require('~/server/services/viventium/interactionContext');
+const {
+  effectiveOrchestrationMode,
+  parallelWorkClaimStateAsync,
+} = require('~/server/services/viventium/ViventiumOrchestrationMode');
 
 const EXTRACTED_DOCUMENT_IMAGE_MAX_DIMENSION = 768;
 /* === VIVENTIUM START ===
@@ -148,6 +174,19 @@ const { setTimingBase } = require('~/server/services/viventium/telegramTimingDee
 const TELEGRAM_SECRET_HEADER = 'x-viventium-telegram-secret';
 const TELEGRAM_PUBLIC_PLAYGROUND_REQUIRED_ERROR =
   'Telegram calls need a configured public HTTPS Viventium voice URL';
+
+function parseTelegramSourceSequence(value) {
+  const sequence = Number(value);
+  return Number.isSafeInteger(sequence) && sequence > 0 ? sequence : null;
+}
+
+function normalizeTelegramThreadId(value) {
+  if (value == null || String(value).trim() === '') {
+    return '';
+  }
+  const threadId = Number(value);
+  return Number.isSafeInteger(threadId) && threadId > 0 ? String(threadId) : null;
+}
 
 function getTelegramSecret() {
   return process.env.VIVENTIUM_TELEGRAM_SECRET || process.env.VIVENTIUM_CALL_SESSION_SECRET || '';
@@ -273,10 +312,7 @@ const TELEGRAM_INGRESS_DEDUPE_ENABLED = parseBoolEnv(
   'VIVENTIUM_TELEGRAM_INGRESS_DEDUPE_ENABLED',
   true,
 );
-const TELEGRAM_INGRESS_DEDUPE_TTL_S = Math.max(
-  parseIntEnv('VIVENTIUM_TELEGRAM_INGRESS_DEDUPE_TTL_S', 86400),
-  60,
-);
+const TELEGRAM_INGRESS_DEDUPE_TTL_S = telegramIngressDedupeTtlSeconds();
 const TELEGRAM_CONVERSATION_IDLE_MAX_M = Math.max(
   parseIntEnv('VIVENTIUM_TELEGRAM_CONVERSATION_IDLE_MAX_M', 1440),
   0,
@@ -422,7 +458,10 @@ async function telegramAuth(req, res, next) {
     });
     /* === VIVENTIUM NOTE === */
     if (!userId) {
-      if (req.method === 'POST' && (req.path === '/chat' || req.path === '/call-link')) {
+      if (
+        req.method === 'POST' &&
+        (req.path === '/chat' || req.path === '/call-link' || req.path === '/source-order')
+      ) {
         /* === VIVENTIUM NOTE === */
         const linkUrl = await issueTelegramLink(req, identity);
         if (!linkUrl) {
@@ -763,7 +802,11 @@ async function uploadTelegramFiles({ req, files, agentId }) {
         typeof err?.message === 'string' && err.message.trim().length > 0
           ? err.message.trim()
           : 'Attachment processing failed';
-      throw new Error(`Telegram attachment upload failed for "${safeName}": ${reason}`);
+      const failure = new Error(`Telegram attachment upload failed for "${safeName}": ${reason}`);
+      if (err?.code === 'unsupported_file_type' && err?.retryable === false) {
+        Object.assign(failure, { code: err.code, status: 415, retryable: false });
+      }
+      throw failure;
     } finally {
       req.file = originalFile;
       req.body = originalBody;
@@ -894,13 +937,276 @@ router.get('/voice-route', telegramAuth, async (req, res) => {
   }
 });
 
+/* Observe authenticated Telegram order before any chat lock or provider wait. */
+router.post('/source-order', telegramAuth, async (req, res) => {
+  const identity = extractTelegramIdentity(req);
+  const sourceSequence = parseTelegramSourceSequence(
+    req.body?.sourceSequence ?? req.body?.source_sequence ?? req.body?.telegramMessageId,
+  );
+  const telegramMessageThreadId = normalizeTelegramThreadId(
+    req.body?.telegramMessageThreadId ?? req.body?.telegram_message_thread_id,
+  );
+  const sourceOrderScope = buildTelegramSourceOrderScope({
+    librechat_owner_id: req.user?.id,
+    telegram_user_id: identity.telegramUserId,
+    telegram_chat_id: identity.telegramChatId,
+    message_thread_id: telegramMessageThreadId ?? '',
+    source_domain: 'telegram-interactive-v1',
+  });
+  const sourceEventId = buildTelegramSourceEventId({
+    source_order_scope: sourceOrderScope,
+    source_sequence: sourceSequence,
+  });
+  if (
+    !sourceOrderScope ||
+    !sourceEventId ||
+    sourceSequence == null ||
+    telegramMessageThreadId == null
+  ) {
+    return res.status(400).json({ observed: false, error: 'invalid_source_order' });
+  }
+  try {
+    const capabilities = GenerationJobManager.getSourceOrderCapabilities();
+    if (capabilities.replica_safe !== true) {
+      const claimState = await parallelWorkClaimStateAsync(String(req.user.id));
+      if (
+        claimState.available === true &&
+        effectiveOrchestrationMode(req.user, { available: claimState.available }) === 'parallel'
+      ) {
+        return res.status(503).json({
+          observed: false,
+          error: 'durable_source_order_required',
+          durability: capabilities.durability,
+          replicaSafe: false,
+        });
+      }
+    }
+    const result = await GenerationJobManager.observeSourceOrder({
+      source_order_scope: sourceOrderScope,
+      source_sequence: sourceSequence,
+    });
+    let inputReceipt;
+    if (req.body?.input) {
+      const input = req.body.input;
+      if (
+        !/^[a-f0-9]{64}$/.test(String(input.conversationGeneration || '')) ||
+        !/^[a-f0-9-]{36}$/.test(String(input.preparationId || '')) ||
+        typeof input.text !== 'string' ||
+        !input.preparation ||
+        Buffer.byteLength(JSON.stringify(input.preparation), 'utf8') > 64 * 1024
+      ) {
+        return res.status(400).json({ error: 'invalid_source_input' });
+      }
+      const requestedConversationId = String(input.conversationId || 'new');
+      setTrustedInteractionContext(
+        req,
+        createTelegramInteractionContext({
+          conversation_id: requestedConversationId,
+          conversation_generation: input.conversationGeneration,
+          source_event_id: sourceEventId,
+          source_order_scope: sourceOrderScope,
+          source_sequence: sourceSequence,
+        }),
+      );
+      let resolved = await resolveReusableConversationState({
+        conversationId: requestedConversationId,
+        userId: req.user.id,
+        surface: 'telegram',
+        maxIdleMs: TELEGRAM_CONVERSATION_IDLE_MAX_MS,
+      });
+      if (resolved.reason === 'missing') {
+        const pending = await TelegramInput.resolvePendingConversation({
+          requestedConversationId,
+          conversationGeneration: input.conversationGeneration,
+          libreChatUserId: req.user.id,
+          telegramUserId: identity.telegramUserId,
+          telegramChatId: identity.telegramChatId,
+          telegramMessageThreadId,
+          sourceOrderScope,
+          sourceSequence,
+        });
+        if (pending)
+          resolved = {
+            ...resolved,
+            conversationId: pending.conversationId,
+            reason: 'pending_input',
+          };
+      }
+      const conversationId = resolveCanonicalConversationId(
+        req,
+        req.user.id,
+        resolved.conversationId,
+      );
+      bindCanonicalInteractionConversation(req, conversationId);
+      const sourceMessageId = acceptedInteractionSourceId(req);
+      if (!(await Message.exists({ user: req.user.id, messageId: sourceMessageId }))) {
+        await saveMessage(
+          req,
+          {
+            messageId: sourceMessageId,
+            conversationId,
+            parentMessageId: resolved.parentMessageId || Constants.NO_PARENT,
+            text: input.text,
+            sender: 'User',
+            isCreatedByUser: true,
+            metadata: {
+              viventium: {
+                telegramInput: {
+                  sourceEventId,
+                  state: 'preparing',
+                  preparation: input.preparation,
+                  originalParentMessageId: resolved.parentMessageId || Constants.NO_PARENT,
+                },
+                interactionContext: getTrustedInteractionContext(req),
+              },
+            },
+          },
+          { operationKind: 'system', context: 'Telegram input before preparation' },
+        );
+      }
+      const record = await TelegramInput.register(
+        {
+          sourceEventId,
+          sourceOrderScope,
+          sourceSequence,
+          libreChatUserId: req.user.id,
+          telegramUserId: identity.telegramUserId,
+          telegramChatId: identity.telegramChatId,
+          telegramMessageThreadId,
+          conversationId,
+          requestedConversationId,
+          conversationGeneration: input.conversationGeneration,
+          sourceMessageId,
+          mediaGroupId: String(input.preparation?.message?.media_group_id || ''),
+        },
+        input.preparationId,
+      );
+      const claimed =
+        record.registrationId === input.preparationId && record.leaseUntil > Date.now();
+      inputReceipt = {
+        sourceEventId,
+        sourceMessageId,
+        conversationId: record.conversationId,
+        conversationGeneration: record.conversationGeneration,
+        state: record.state,
+        claimed,
+        retained: true,
+        ...(claimed ? { claimToken: record.claimToken, leaseUntil: record.leaseUntil } : {}),
+      };
+    }
+    return res.json({
+      ...(inputReceipt ? { input: inputReceipt } : {}),
+      observed: true,
+      sourceOrderScope,
+      sourceEventId,
+      latestSourceSequence: result.latest_source_sequence,
+      observedAt: result.observed_at,
+      stale: result.stale,
+      durability: capabilities.durability,
+      replicaSafe: capabilities.replica_safe,
+    });
+  } catch (error) {
+    logger.error('[VIVENTIUM][telegram/source-order] Observation failed', {
+      error: error?.name || 'Error',
+    });
+    return res.status(503).json({ observed: false, error: 'source_order_unavailable' });
+  }
+});
+
+router.post('/inputs/claim', telegramBridgeAuth, async (req, res, next) => {
+  try {
+    const records = await TelegramInput.claimPending(req.body?.limit);
+    const inputs = (await Promise.all(records.map(TelegramInput.inputEnvelope))).filter(Boolean);
+    res.setHeader('Cache-Control', 'no-store, private');
+    return res.json({ inputs });
+  } catch (error) {
+    next(error);
+  }
+});
+router.post('/inputs/status', telegramAuth, async (req, res, next) => {
+  if (!['renew', 'failed', 'cancelled'].includes(req.body?.state))
+    return res.status(400).json({ error: 'invalid_input_status' });
+  try {
+    const input = await TelegramInput.status(
+      req.user.id,
+      req.body.inputClaim,
+      req.body.state,
+      req.body.failureCode || '',
+      req.body.retryable === true,
+    );
+    return res.json({ input });
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.post(
-  '/chat',
+  ['/chat', '/inputs/continue'],
   telegramAuth,
   configMiddleware,
   async (req, _res, next) => {
-    const incoming = req.body ?? {};
+    let incoming = req.body ?? {};
+    let retainedInput = incoming.inputClaim
+      ? await TelegramInput.read(req.user.id, incoming.inputClaim)
+      : null;
+    let preparedInput = null;
+    if (req.path === '/inputs/continue') {
+      if (!retainedInput || !['ready', 'admitted', 'completed'].includes(retainedInput.state)) {
+        return _res.status(409).json({ code: 'source_input_not_ready', retryable: true });
+      }
+      const envelope = await TelegramInput.inputEnvelope(retainedInput);
+      if (retainedInput.state === 'admitted' || retainedInput.state === 'completed') {
+        const job = await GenerationJobManager.getJob(retainedInput.streamId);
+        if (!job || job.metadata?.userId !== req.user.id)
+          return _res
+            .status(503)
+            .json({ code: 'source_input_response_unavailable', retryable: true });
+        return _res.json({
+          ...envelope,
+          prepared: await TelegramInput.readPrepared(retainedInput),
+          streamId: retainedInput.streamId,
+          conversationId: retainedInput.conversationId,
+          ...attachLogicalTurnMetadata({}, job.metadata.interactionContext),
+          status: 'duplicate',
+          duplicate: true,
+          inputPresentation: job.metadata.interactionContext?.ready_input_continuation
+            ? {
+                sourceEventId: retainedInput.sourceEventId,
+                sourceMessageId: retainedInput.sourceMessageId,
+                sourceSequence: retainedInput.sourceSequence,
+                sourceOrderScope: retainedInput.sourceOrderScope,
+                presentationSourceSequence:
+                  job.metadata.interactionContext.ready_input_continuation
+                    .presentation_source_sequence,
+              }
+            : undefined,
+        });
+      }
+      preparedInput = await TelegramInput.readPrepared(retainedInput);
+      if (!preparedInput)
+        return _res
+          .status(503)
+          .json({ code: 'source_input_preparation_unavailable', retryable: true });
+      incoming = {
+        ...incoming,
+        text: preparedInput.text,
+        conversationId: retainedInput.requestedConversationId,
+        conversationGeneration: retainedInput.conversationGeneration,
+        telegramUserId: retainedInput.telegramUserId,
+        telegramChatId: retainedInput.telegramChatId,
+        telegramMessageThreadId: retainedInput.telegramMessageThreadId,
+        telegramMessageId: String(retainedInput.sourceSequence),
+        clientTimestamp: Number.isFinite(Number(envelope?.preparation?.message?.date))
+          ? new Date(Number(envelope.preparation.message.date) * 1000).toISOString()
+          : undefined,
+      };
+      req.body = incoming;
+    }
     const text = typeof incoming.text === 'string' ? incoming.text : '';
+    const conversationGeneration = incoming.conversationGeneration;
+    if (conversationGeneration != null && !/^[a-f0-9]{64}$/.test(String(conversationGeneration))) {
+      return _res.status(400).json({ error: 'invalid_conversation_generation' });
+    }
     const requestedConversationId =
       typeof incoming.conversationId === 'string' ? incoming.conversationId : 'new';
     /* === VIVENTIUM NOTE ===
@@ -947,18 +1253,96 @@ router.post(
       null,
     );
 
+    /* === VIVENTIUM NOTE ===
+     * Feature: Telegram stream isolation
+     * Purpose: Ensure each Telegram request has a unique streamId (prevents stream collisions).
+     * === VIVENTIUM NOTE === */
+    const streamId = `telegram-${crypto.randomUUID()}`;
+    const sourceSequence = parseTelegramSourceSequence(telegramMessageId);
+    const telegramMessageThreadId = normalizeTelegramThreadId(
+      incoming.telegramMessageThreadId ?? incoming.telegram_message_thread_id,
+    );
+    const identity = extractTelegramIdentity(req);
+    const sourceOrderScope =
+      sourceSequence == null
+        ? ''
+        : buildTelegramSourceOrderScope({
+            librechat_owner_id: req.user?.id,
+            telegram_user_id: identity.telegramUserId,
+            telegram_chat_id: identity.telegramChatId,
+            message_thread_id: telegramMessageThreadId ?? '',
+            source_domain: 'telegram-interactive-v1',
+          });
+    const declaredScope = normalizeIngressId(
+      incoming.sourceOrderScope ?? incoming.source_order_scope,
+    );
+    const declaredEvent = normalizeIngressId(incoming.sourceEventId ?? incoming.source_event_id);
+    const declaredSequence = incoming.sourceSequence ?? incoming.source_sequence;
+    const orderedEvent = sourceOrderScope
+      ? buildTelegramSourceEventId({
+          source_order_scope: sourceOrderScope,
+          source_sequence: sourceSequence,
+        })
+      : '';
+    if (
+      (sourceSequence != null && (!sourceOrderScope || telegramMessageThreadId == null)) ||
+      (declaredScope && declaredScope !== sourceOrderScope) ||
+      (orderedEvent && declaredEvent && declaredEvent !== orderedEvent) ||
+      (declaredSequence != null &&
+        (sourceSequence == null ||
+          parseTelegramSourceSequence(declaredSequence) !== sourceSequence))
+    ) {
+      return _res.status(400).json({ error: 'invalid_source_order' });
+    }
+    // Legacy ingress without an ordered Telegram message keeps its existing opaque event identity.
+    const sourceEventId =
+      orderedEvent || declaredEvent || telegramMessageId || telegramUpdateId || streamId;
+    setTrustedInteractionContext(
+      req,
+      createTelegramInteractionContext({
+        conversation_id: requestedConversationId,
+        conversation_generation: conversationGeneration,
+        source_event_id: sourceEventId,
+        ...(sourceOrderScope
+          ? { source_order_scope: sourceOrderScope, source_sequence: sourceSequence }
+          : {}),
+      }),
+      {
+        segment_stability: 'immediate',
+        supersede_scope: 'response_and_authoring',
+      },
+      { commit_authority: 'external_adapter' },
+    );
+    if (
+      retainedInput &&
+      (retainedInput.sourceEventId !== sourceEventId ||
+        retainedInput.sourceOrderScope !== sourceOrderScope ||
+        retainedInput.sourceSequence !== sourceSequence ||
+        retainedInput.conversationGeneration !== conversationGeneration ||
+        retainedInput.requestedConversationId !== requestedConversationId)
+    ) {
+      return _res.status(409).json({ code: 'source_input_identity_conflict', retryable: false });
+    }
+    if (!retainedInput)
+      await retainAcceptedInteractionInput(req, {
+        conversationId: requestedConversationId || 'new',
+        text,
+      });
+
     /* === VIVENTIUM START ===
      * Feature: Telegram ingress de-duplication (defense-in-depth).
      * Duplicate replay requests return 200/no-op so the bot does not emit duplicate turns.
      * === VIVENTIUM END === */
-    const ingressReservation = await reserveTelegramIngress({
-      telegramUserId,
-      telegramChatId,
-      telegramMessageId,
-      telegramUpdateId,
-      conversationId: requestedConversationId,
-      traceId,
-    });
+    const ingressReservation = retainedInput
+      ? { duplicate: false }
+      : await reserveTelegramIngress({
+          telegramUserId,
+          telegramChatId,
+          telegramMessageId,
+          telegramUpdateId,
+          conversationId: requestedConversationId,
+          traceId,
+        });
     if (ingressReservation.duplicate) {
       logger.info(
         '[VIVENTIUM][telegram/chat] Duplicate ingress suppressed key=%s chatId=%s userId=%s',
@@ -1006,38 +1390,26 @@ router.post(
      * Feature: Extract files for vision model support
      * === VIVENTIUM NOTE === */
     const telegramFiles = Array.isArray(incoming.files) ? incoming.files : [];
-    /* === VIVENTIUM NOTE ===
-     * Feature: Telegram stream isolation
-     * Purpose: Ensure each Telegram request has a unique streamId (prevents stream collisions).
-     * === VIVENTIUM NOTE === */
-    const streamId = `telegram-${crypto.randomUUID()}`;
 
     const parentStartTs = performance.now();
     const conversationState = await resolveReusableConversationState({
-      conversationId: requestedConversationId,
+      conversationId: retainedInput?.conversationId || requestedConversationId,
       userId: req.user?.id,
       surface: 'telegram',
-      maxIdleMs: TELEGRAM_CONVERSATION_IDLE_MAX_MS,
+      maxIdleMs: retainedInput ? 0 : TELEGRAM_CONVERSATION_IDLE_MAX_MS,
     });
-    const conversationId = conversationState.conversationId;
+    let conversationId = retainedInput?.conversationId || conversationState.conversationId;
     let parentMessageId = conversationState.parentMessageId;
-    const sourceEventId =
-      normalizeIngressId(incoming.sourceEventId ?? incoming.source_event_id) ||
-      telegramMessageId ||
-      telegramUpdateId ||
-      streamId;
-    setTrustedInteractionContext(
-      req,
-      createTelegramInteractionContext({
-        conversation_id: conversationId,
-        source_event_id: sourceEventId,
-      }),
-      {
-        segment_stability: 'immediate',
-        supersede_scope: 'response_and_authoring',
-      },
-      { commit_authority: 'external_adapter' },
-    );
+    parentMessageId = normalizeGatewayParentMessageId({ conversationId, parentMessageId });
+    const acceptedContext = retainedInput
+      ? bindCanonicalInteractionConversation(req, conversationId)
+      : await captureAcceptedInteractionInput(req, {
+          conversationId,
+          streamId,
+          text,
+          parentMessageId,
+        });
+    conversationId = acceptedContext?.conversation_id || conversationState.conversationId;
     logTelegramTiming(
       traceId,
       'parent_message_lookup',
@@ -1084,7 +1456,6 @@ router.post(
      * - Icon rendering: sidebar list relies on `conversation.iconURL`, which LibreChat derives
      *   from `spec` (modelSpecs) server-side (client-sent iconURL is stripped).
      * === VIVENTIUM NOTE === */
-    parentMessageId = normalizeGatewayParentMessageId({ conversationId, parentMessageId });
     const resolvedSpec = ensureGatewaySpec({
       req,
       existingSpec: incoming?.spec,
@@ -1098,9 +1469,14 @@ router.post(
     const { images: telegramImageFiles, nonImages: telegramNonImageFiles } =
       splitTelegramFiles(telegramFiles);
     const imageFormatStartTs = performance.now();
-    const formattedImages = TELEGRAM_FILE_UPLOAD_ENABLED
-      ? formatTelegramImagesForVision(telegramImageFiles)
-      : [];
+    const formattedImages = preparedInput
+      ? preparedInput.imageUrls.map((url) => ({
+          type: ContentTypes.IMAGE_URL,
+          image_url: { url, detail: 'auto' },
+        }))
+      : TELEGRAM_FILE_UPLOAD_ENABLED
+        ? formatTelegramImagesForVision(telegramImageFiles)
+        : [];
     logTelegramTiming(
       traceId,
       'format_images',
@@ -1112,9 +1488,11 @@ router.post(
     const uploadStartTs = performance.now();
     let uploadedFiles = [];
     try {
-      uploadedFiles = TELEGRAM_FILE_UPLOAD_ENABLED
-        ? await uploadTelegramFiles({ req, files: telegramNonImageFiles, agentId })
-        : [];
+      uploadedFiles = preparedInput
+        ? await getFiles({ user: req.user.id, file_id: { $in: preparedInput.fileIds } })
+        : TELEGRAM_FILE_UPLOAD_ENABLED
+          ? await uploadTelegramFiles({ req, files: telegramNonImageFiles, agentId })
+          : [];
       logTelegramTiming(traceId, 'upload_files', uploadStartTs, `count=${uploadedFiles.length}`);
     } catch (err) {
       const reason =
@@ -1123,6 +1501,15 @@ router.post(
           : 'Attachment processing failed';
       logger.warn('[VIVENTIUM][telegram/chat] Attachment processing failed: %s', reason);
       logTelegramTiming(traceId, 'upload_files', uploadStartTs, 'failed=1');
+      if (retainedInput && err?.code === 'unsupported_file_type' && err?.retryable === false) {
+        await TelegramInput.status(req.user.id, incoming.inputClaim, 'failed', err.code);
+        return _res.status(415).json({
+          attachmentProcessingError: true,
+          code: err.code,
+          retryable: false,
+          error: reason,
+        });
+      }
       return _res.status(422).json({ attachmentProcessingError: true, error: reason });
     }
     const extractedDocumentImages = Array.isArray(req._telegramUploadedDocumentImages)
@@ -1130,6 +1517,35 @@ router.post(
       : [];
     const allFormattedImages = [...formattedImages, ...extractedDocumentImages];
     const hasImages = allFormattedImages.length > 0;
+    if (retainedInput) {
+      retainedInput = await TelegramInput.ready(
+        req.user.id,
+        incoming.inputClaim,
+        {
+          text,
+          fileIds: uploadedFiles.map((file) => file.file_id),
+          imageUrls: allFormattedImages.map((image) => image.image_url.url),
+        },
+        Array.isArray(incoming.inputClaims) ? incoming.inputClaims : [],
+      );
+      const observation = await GenerationJobManager.observeSourceOrder({
+        source_order_scope: sourceOrderScope,
+        source_sequence: sourceSequence,
+      });
+      if (observation.stale || req.path === '/inputs/continue') {
+        bindReadyInputContinuation(
+          req,
+          retainedInput.sourceMessageId,
+          observation.latest_source_sequence,
+        );
+      }
+      req._viventiumTelegramInput = retainedInput;
+      req._viventiumTelegramPrepared = {
+        text,
+        fileIds: uploadedFiles.map((file) => file.file_id),
+        imageUrls: allFormattedImages.map((image) => image.image_url.url),
+      };
+    }
     const channelEnvelope = normalizeChannelEnvelope({
       channel: 'telegram',
       accountId: 'default',
@@ -1156,6 +1572,25 @@ router.post(
         spec: resolvedSpec,
       },
     });
+    if (retainedInput) {
+      req.body.overrideUserMessageId = `${retainedInput.sourceMessageId}${Constants.COMMON_DIVIDER}1`;
+      const sourceFilter = TelegramInput.messageFilter(retainedInput);
+      await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+        sourceFilter,
+        () =>
+          Message.updateOne(sourceFilter, {
+            $set: { parentMessageId: parentMessageId || Constants.NO_PARENT },
+          }),
+      );
+      const enriched = bindInteractionSourceSegments(req, text, uploadedFiles, {
+        messageId: retainedInput.sourceMessageId,
+        parentMessageId: parentMessageId || Constants.NO_PARENT,
+        persisted: true,
+      });
+      // Preparation never enters Main's initializing-input wait. Ready input is now persisted.
+      if (!enriched.ready_input_continuation)
+        await GenerationJobManager.retainLogicalTurnInput(req.user.id, enriched);
+    }
     req.body.telegramUserId = telegramUserId;
     req.body.telegramChatId = telegramChatId;
     req.body.telegramMessageId = telegramMessageId;
@@ -1228,9 +1663,52 @@ router.post(
   validateConvoAccess,
   buildEndpointOption,
   async (req, res, next) => {
+    req._viventiumBeforeGenerationReceipt = async (payload) => {
+      if (!req._viventiumTelegramInput) return;
+      const claim = {
+        sourceEventId: req._viventiumTelegramInput.sourceEventId,
+        claimToken: req._viventiumTelegramInput.claimToken,
+      };
+      if (payload?.pending === true) return TelegramInput.defer(req.user.id, claim);
+      if (!payload?.streamId) return;
+      await TelegramInput.bindStream(req.user.id, claim, payload.streamId);
+      await Message.updateOne(TelegramInput.messageFilter(req._viventiumTelegramInput), {
+        $set: { 'metadata.viventium.telegramInput.state': 'admitted' },
+      });
+    };
     const originalJson = res.json.bind(res);
     res.json = (payload) => {
-      const withLogicalTurn = attachLogicalTurnMetadata(payload, getTrustedInteractionContext(req));
+      const context = getTrustedInteractionContext(req);
+      const record = req._viventiumTelegramInput;
+      const withLogicalTurn = attachLogicalTurnMetadata(
+        {
+          ...payload,
+          ...(record
+            ? {
+                inputClaim: { sourceEventId: record.sourceEventId, claimToken: record.claimToken },
+                prepared: req._viventiumTelegramPrepared,
+                sourceEventId: record.sourceEventId,
+                sourceMessageId: record.sourceMessageId,
+                sourceSequence: record.sourceSequence,
+                sourceOrderScope: record.sourceOrderScope,
+                conversationGeneration: record.conversationGeneration,
+              }
+            : {}),
+          ...(record && context?.ready_input_continuation
+            ? {
+                inputPresentation: {
+                  sourceEventId: record.sourceEventId,
+                  sourceMessageId: record.sourceMessageId,
+                  sourceSequence: record.sourceSequence,
+                  sourceOrderScope: record.sourceOrderScope,
+                  presentationSourceSequence:
+                    context.ready_input_continuation.presentation_source_sequence,
+                },
+              }
+            : {}),
+        },
+        context,
+      );
       if (
         withLogicalTurn &&
         typeof withLogicalTurn === 'object' &&
@@ -1617,6 +2095,90 @@ router.post('/glasshive/deliveries/claim', telegramBridgeAuth, async (req, res) 
   } catch (err) {
     logger.error('[VIVENTIUM][telegram/glasshive-delivery] Claim failed:', err);
     return res.status(500).json({ error: 'Failed to claim GlassHive deliveries' });
+  }
+});
+
+/* === VIVENTIUM START ===
+ * Feature: Durable late Cortex Telegram dispatcher.
+ * Purpose: The bot can discover persisted Telegram-missing follow-ups after the per-turn listener
+ * closes. Successful presentation still settles only through the canonical interaction ACK.
+ * === VIVENTIUM END === */
+router.post('/cortex/deliveries/claim', telegramBridgeAuth, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, private');
+  try {
+    const deliveries = await claimPendingCortexTelegramDeliveries({
+      limit: req.body?.limit,
+      leaseMs: req.body?.leaseMs,
+    });
+    return res.json({ deliveries });
+  } catch (error) {
+    logger.error('[VIVENTIUM][telegram/cortex-delivery] Claim failed', {
+      code: error?.code || error?.name || 'cortex_telegram_claim_failed',
+    });
+    return res.status(500).json({ error: 'Failed to claim Cortex Telegram deliveries' });
+  }
+});
+
+router.post('/cortex/deliveries/authorize', telegramBridgeAuth, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, private');
+  if (!req.body?.cortexClaim) {
+    return res.status(400).json({ error: 'Exact Cortex claim required' });
+  }
+  try {
+    const cortexPresentation = await authorizeCortexTelegramDeliveryClaim({
+      cortexClaim: req.body.cortexClaim,
+      leaseMs: req.body?.leaseMs,
+    });
+    return res.json({ cortexPresentation });
+  } catch (error) {
+    const conflict = error?.code === 'cortex_telegram_dispatch_claim_conflict';
+    logger.warn('[VIVENTIUM][telegram/cortex-delivery] Authorization rejected', {
+      code: error?.code || error?.name || 'cortex_telegram_authorization_failed',
+    });
+    return res
+      .status(conflict ? 409 : 500)
+      .json({ error: conflict ? 'delivery_not_claimed' : 'Failed to authorize Cortex delivery' });
+  }
+});
+
+router.post('/cortex/deliveries/status', telegramBridgeAuth, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, private');
+  const status = String(req.body?.status || '').trim();
+  const cortexClaim = req.body?.cortexClaim;
+  const cortexPresentation = req.body?.cortexPresentation;
+  if (
+    (!cortexClaim && !cortexPresentation) ||
+    !['failed', 'suppressed', 'delivery_unknown'].includes(status) ||
+    (status === 'delivery_unknown' && !cortexPresentation)
+  ) {
+    return res.status(400).json({ error: 'Exact Cortex authority and supported status required' });
+  }
+  try {
+    let delivery;
+    if (status === 'failed') {
+      delivery = await failCortexTelegramDeliveryClaim({
+        ...(cortexClaim ? { cortexClaim } : {}),
+        ...(cortexPresentation ? { cortexPresentation } : {}),
+        reason: 'presentation_failed',
+      });
+    } else if (status === 'suppressed') {
+      delivery = await suppressCortexTelegramDeliveryClaim({
+        ...(cortexClaim ? { cortexClaim } : {}),
+        ...(cortexPresentation ? { cortexPresentation } : {}),
+        dropReason: 'conversation_moved_on',
+      });
+    } else {
+      delivery = await markCortexTelegramDeliveryUnknown({ cortexPresentation });
+    }
+    return res.json({ delivery });
+  } catch (error) {
+    const conflict = error?.code === 'cortex_telegram_dispatch_claim_conflict';
+    logger.warn('[VIVENTIUM][telegram/cortex-delivery] Status settlement rejected', {
+      code: error?.code || error?.name || 'cortex_telegram_status_failed',
+    });
+    return res
+      .status(conflict ? 409 : 500)
+      .json({ error: conflict ? 'delivery_not_claimed' : 'Failed to settle Cortex delivery' });
   }
 });
 

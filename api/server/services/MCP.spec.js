@@ -123,6 +123,16 @@ jest.mock('./Tools/mcp', () => ({
   reinitMCPServer: jest.fn(),
 }));
 
+// These MCP transport cases use ordinary servers; worker launch authorization has its own tests.
+jest.mock('./viventium/GlassHiveCapabilityBootstrapService', () => ({
+  isGlassHiveLaunchTool: jest.fn(() => false),
+  maybeInjectGlassHiveCapabilityBroker: jest.fn(async ({ toolArguments }) => toolArguments),
+}));
+
+jest.mock('./viventium/GlassHiveDispatchContinuationService', () => ({
+  markCallbackBackedVoiceContinuation: jest.fn(),
+}));
+
 jest.mock('./GraphTokenService', () => ({
   getGraphApiToken: jest.fn(),
 }));

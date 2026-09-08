@@ -72,6 +72,7 @@ import {
   applyAgentProviderCapabilityDefaults,
   type ProviderCapabilityRegistry,
 } from './validation';
+import { isConversationOrchestrationTool } from '../glasshive/conversationOrchestration';
 /* === VIVENTIUM END === */
 
 /**
@@ -79,6 +80,8 @@ import {
  */
 export type InitializedAgent = Agent & {
   tools: GenericTool[];
+  /** Request-local declarations for the native capability broker; never ordinary tool binding. */
+  readonly declaredToolNames?: readonly string[];
   attachments: IMongoFile[];
   toolContextMap: Record<string, unknown>;
   maxContextTokens: number;
@@ -132,6 +135,7 @@ export interface InitializeAgentParams {
     agentId: string;
     tools: string[];
     model: string | null;
+    glasshive_options?: Agent['glasshive_options'];
     tool_options: AgentToolOptions | undefined;
     tool_resources: AgentToolResources | undefined;
   }) => Promise<{
@@ -486,8 +490,7 @@ export async function initializeAgent(
         const latestRecallEligibleMessageCreatedAt =
           await db.getLatestRecallEligibleMessageCreatedAt({
             user: req.user.id,
-            excludeMessageId:
-              typeof req.body?.messageId === 'string' ? req.body.messageId : null,
+            excludeMessageId: typeof req.body?.messageId === 'string' ? req.body.messageId : null,
             excludeParentMessageId:
               typeof req.body?.messageId === 'string' ? req.body.messageId : null,
           });
@@ -724,11 +727,13 @@ export async function initializeAgent(
    * A provider declaring worker_native_tools (or the legacy native_tools alias) owns execution
    * through its authenticated capability bundle;
    * retaining the declarations on `agent` lets that bundle remain complete while preventing a
-   * second, incompatible ordinary tool set from being bound to the provider request. Agent
-   * Builder's structural transfer controls are compiled separately from its configured edges. */
+   * second, incompatible ordinary tool set from being bound to the provider request. Conversation
+   * orchestration declarations still cross this boundary so ToolService can replace them with the
+   * trusted Main facade. Agent Builder's structural transfer controls are compiled separately from
+   * its configured edges. */
   const runtimeAgentTools =
     providerCapability?.worker_native_tools === true || providerCapability?.native_tools === true
-      ? []
+      ? (agent.tools ?? []).filter(isConversationOrchestrationTool)
       : (agent.tools ?? []).filter((tool) => {
           const delimiterIndex = tool.lastIndexOf(Constants.mcp_delimiter);
           if (delimiterIndex < 0) {
@@ -753,6 +758,7 @@ export async function initializeAgent(
     agentId: agent.id,
     tools: runtimeAgentTools,
     model: agent.model,
+    glasshive_options: agent.glasshive_options,
     tool_options: agent.tool_options,
     tool_resources,
   })) ?? {
@@ -995,6 +1001,21 @@ export async function initializeAgent(
     maxContextTokens:
       explicitMaxContextTokens ?? Math.round((agentMaxContextNum - maxOutputTokensNum) * 0.9),
   };
+
+  /* === VIVENTIUM START ===
+   * Native tools bypass ordinary binding, but the broker and a declared fallback still need
+   * this participant's tool declarations and initialized resources. Keep the request-local
+   * declaration snapshot out of persisted/serialized Agent documents.
+   * === VIVENTIUM END === */
+  if (
+    providerCapability?.worker_native_tools === true ||
+    providerCapability?.native_tools === true
+  ) {
+    Object.defineProperty(initializedAgent, 'declaredToolNames', {
+      value: Object.freeze([...(agent.tools ?? [])]),
+      enumerable: false,
+    });
+  }
 
   return initializedAgent;
 }

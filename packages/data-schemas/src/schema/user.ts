@@ -186,7 +186,15 @@ const userSchema = new Schema<IUser>(
          */
         conversation_recall: {
           type: Boolean,
-          default: false,
+        },
+        /* === VIVENTIUM START ===
+         * Feature: Installer default for conversation recall.
+         * Purpose: `conversation_recall` has no schema default so an account that never chose is
+         * represented as absent and follows the compiled installer default. The saved boolean itself
+         * takes precedence; `conversation_recall_chosen` records choice provenance for diagnostics.
+         * === VIVENTIUM END === */
+        conversation_recall_chosen: {
+          type: Boolean,
         },
         /* === VIVENTIUM START === Account-wide Parallel Work preference. === VIVENTIUM END === */
         orchestration_mode: {

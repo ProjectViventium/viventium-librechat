@@ -1,6 +1,6 @@
 const cookies = require('cookie');
 const passport = require('passport');
-const { isEnabled } = require('@librechat/api');
+const { getSessionCookieName, isEnabled } = require('@librechat/api');
 
 /**
  * Custom Middleware to handle JWT authentication, with support for OpenID token reuse
@@ -8,7 +8,9 @@ const { isEnabled } = require('@librechat/api');
  */
 const requireJwtAuth = (req, res, next) => {
   const cookieHeader = req.headers.cookie;
-  const tokenProvider = cookieHeader ? cookies.parse(cookieHeader).token_provider : null;
+  const tokenProvider = cookieHeader
+    ? cookies.parse(cookieHeader)[getSessionCookieName('token_provider')]
+    : null;
 
   if (tokenProvider === 'openid' && isEnabled(process.env.OPENID_REUSE_TOKENS)) {
     return passport.authenticate('openidJwt', { session: false })(req, res, next);

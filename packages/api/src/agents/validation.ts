@@ -172,6 +172,10 @@ export const glassHiveOptionsSchema = z
         parallel_available: z.boolean(),
         default_mode: z.enum(['focused', 'parallel']),
         worker_profile: z.enum(['codex-cli', 'claude-code', 'openclaw-general']).optional(),
+        worker_model: z.string().trim().max(160).optional(),
+        worker_reasoning_effort: z.string().trim().max(32).optional(),
+        fallback_worker_model: z.string().trim().max(160).optional(),
+        fallback_worker_reasoning_effort: z.string().trim().max(32).optional(),
         fallback_worker_profile: z
           .enum(['codex-cli', 'claude-code', 'openclaw-general'])
           .optional(),
@@ -340,6 +344,10 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
         default_mode: 'focused' | 'parallel';
         worker_profile?: string;
         fallback_worker_profile?: string;
+        worker_model?: string;
+        worker_reasoning_effort?: string;
+        fallback_worker_model?: string;
+        fallback_worker_reasoning_effort?: string;
       };
     };
   };

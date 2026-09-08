@@ -164,47 +164,6 @@ function isOperationalFallbackParagraph(text) {
   return OPERATIONAL_FALLBACK_PARAGRAPH_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
-function stripQuestionSentences(text) {
-  if (typeof text !== 'string') {
-    return '';
-  }
-
-  const trimmed = text.trim();
-  if (!trimmed || !trimmed.includes('?')) {
-    return trimmed;
-  }
-
-  const segments = trimmed
-    .split(/(?<=[.!?])\s+/)
-    .map((segment) => segment.trim())
-    .filter(Boolean);
-
-  const kept = [];
-  for (const segment of segments) {
-    if (!segment.includes('?')) {
-      kept.push(segment);
-      continue;
-    }
-    const qIdx = segment.lastIndexOf('?');
-    const prefix = segment.slice(0, qIdx);
-    const lastSep = Math.max(
-      prefix.lastIndexOf(','),
-      prefix.lastIndexOf(';'),
-      prefix.lastIndexOf('—'),
-      prefix.lastIndexOf('–'),
-    );
-    if (lastSep > 0) {
-      let salvaged = prefix.slice(0, lastSep).trim();
-      salvaged = salvaged.replace(/[,;—–\s]+$/, '');
-      if (salvaged) {
-        kept.push(/[.!]$/.test(salvaged) ? salvaged : `${salvaged}.`);
-      }
-    }
-  }
-
-  return kept.join(' ').trim();
-}
-
 function cleanFallbackInsightText(text) {
   if (typeof text !== 'string') {
     return '';
@@ -217,7 +176,7 @@ function cleanFallbackInsightText(text) {
 
   const visibleParagraphs = sanitized
     .split(/\n\s*\n+/)
-    .map((paragraph) => stripQuestionSentences(paragraph).trim())
+    .map((paragraph) => paragraph.trim())
     .filter(Boolean)
     .filter((paragraph) => !isOperationalFallbackParagraph(paragraph));
 
@@ -436,5 +395,4 @@ module.exports = {
   getVisibleFallbackInsightTexts,
   isOperationalFallbackParagraph,
   normalizeDeferredFallbackErrorClass,
-  stripQuestionSentences,
 };

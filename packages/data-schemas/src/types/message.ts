@@ -1,4 +1,7 @@
 import type { Document } from 'mongoose';
+import type { IAcceptedMainContext } from './mainContinuityState';
+import type { SavedMemoryWrite } from './memoryWrite';
+import type { NativeResponseAdmission } from './nativeResponse';
 import type { TFeedbackRating, TFeedbackTag } from 'librechat-data-provider';
 import type { IPersonalAccountCleanupTombstone } from './personalAccountCleanupTombstone';
 
@@ -40,6 +43,9 @@ export interface IMessage extends Document {
   iconURL?: string;
   addedConvo?: boolean;
   metadata?: Record<string, unknown>;
+  savedMemoryWrite?: SavedMemoryWrite;
+  nativeResponse?: NativeResponseAdmission;
+  acceptedMainContext?: IAcceptedMainContext;
   attachments?: unknown[];
   expiredAt?: Date;
   createdAt?: Date;

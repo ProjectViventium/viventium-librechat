@@ -17,6 +17,9 @@ interface MemoryCreateDialogProps {
   onOpenChange: (open: boolean) => void;
   children: React.ReactNode;
   triggerRef?: React.MutableRefObject<HTMLButtonElement | null>;
+  /* === VIVENTIUM START === Match manual writes to the configured memory policy. === */
+  validKeys?: string[];
+  /* === VIVENTIUM END === */
 }
 
 export default function MemoryCreateDialog({
@@ -24,6 +27,7 @@ export default function MemoryCreateDialog({
   onOpenChange,
   children,
   triggerRef,
+  validKeys,
 }: MemoryCreateDialogProps) {
   const localize = useLocalize();
   const { showToast } = useToastContext();
@@ -76,6 +80,15 @@ export default function MemoryCreateDialog({
 
   const [key, setKey] = useState('');
   const [value, setValue] = useState('');
+  /* === VIVENTIUM START ===
+   * The server owns the governed key list. Reject impossible input before issuing a request while
+   * preserving unrestricted upstream installs that do not configure valid keys.
+   * === VIVENTIUM END === */
+  const normalizedKey = key.trim();
+  const hasGovernedKeys = (validKeys?.length ?? 0) > 0;
+  const isKeyInvalid =
+    normalizedKey.length > 0 && hasGovernedKeys && !validKeys?.includes(normalizedKey);
+  const allowedKeysLabel = validKeys?.join(', ') ?? '';
 
   const handleSave = () => {
     if (!hasCreateAccess) {
@@ -90,8 +103,16 @@ export default function MemoryCreateDialog({
       return;
     }
 
+    if (isKeyInvalid) {
+      showToast({
+        message: localize('com_ui_memory_key_not_allowed', { 0: allowedKeysLabel }),
+        status: 'error',
+      });
+      return;
+    }
+
     createMemory({
-      key: key.trim(),
+      key: normalizedKey,
       value: value.trim(),
     });
   };
@@ -122,8 +143,29 @@ export default function MemoryCreateDialog({
                 onKeyDown={handleKeyPress}
                 placeholder={localize('com_ui_enter_key')}
                 className="w-full"
+                list={hasGovernedKeys ? 'memory-valid-keys' : undefined}
+                aria-invalid={isKeyInvalid}
+                aria-describedby="memory-key-guidance"
               />
-              <p className="text-xs text-text-secondary">{localize('com_ui_memory_key_hint')}</p>
+              {hasGovernedKeys && (
+                <datalist id="memory-valid-keys">
+                  {validKeys?.map((validKey) => (
+                    <option key={validKey} value={validKey} />
+                  ))}
+                </datalist>
+              )}
+              <p
+                id="memory-key-guidance"
+                role={isKeyInvalid ? 'alert' : undefined}
+                className={isKeyInvalid ? 'text-xs text-red-600' : 'text-xs text-text-secondary'}
+              >
+                {hasGovernedKeys
+                  ? localize(
+                      isKeyInvalid ? 'com_ui_memory_key_not_allowed' : 'com_ui_memory_allowed_keys',
+                      { 0: allowedKeysLabel },
+                    )
+                  : localize('com_ui_memory_key_hint')}
+              </p>
             </div>
             <div className="space-y-2">
               <Label htmlFor="memory-value" className="text-sm font-medium text-text-primary">
@@ -146,7 +188,7 @@ export default function MemoryCreateDialog({
             type="button"
             variant="submit"
             onClick={handleSave}
-            disabled={isLoading || !key.trim() || !value.trim()}
+            disabled={isLoading || !normalizedKey || !value.trim() || isKeyInvalid}
             className="text-white"
             aria-label={localize('com_ui_create_memory')}
           >

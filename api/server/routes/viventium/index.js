@@ -41,6 +41,7 @@ const glasshive = require('./glasshive');
  * Feature: GlassHive connected-account capability broker MCP endpoint.
  * === VIVENTIUM NOTE === */
 const glasshiveCapabilities = require('./glasshiveCapabilities');
+const glasshiveProvider = require('./glasshiveProvider');
 /* === VIVENTIUM START ===
  * Feature: LibreChat-owned GlassHive inference credential broker.
  */
@@ -54,6 +55,8 @@ const promptWorkbench = require('./promptWorkbench');
 const healthWhoop = require('./healthWhoop');
 /* === VIVENTIUM NOTE === Feelings / Emotional Cortex */
 const feelings = require('./feelings');
+/* === VIVENTIUM NOTE === Optional Life setup (ONB-007/008) */
+const life = require('./life');
 /* === VIVENTIUM START === Connected Channels administration === */
 const channels = require('./channels');
 /* === VIVENTIUM END === */
@@ -79,12 +82,14 @@ router.use('/auth', auth);
 router.use('/skyvern', skyvern);
 router.use('/glasshive', glasshive);
 router.use('/glasshive/capabilities', glasshiveCapabilities);
+router.use('/glasshive/providers', glasshiveProvider);
 /* === VIVENTIUM START === GlassHive inference credential broker route. === */
 router.use('/glasshive/inference', glasshiveInference);
 /* === VIVENTIUM END === */
 router.use('/prompt-workbench', promptWorkbench);
 router.use('/health/whoop', healthWhoop);
 router.use('/feelings', feelings);
+router.use('/life', life);
 router.use('/channels', channels);
 router.use('/orchestration-traces', orchestrationTrace);
 router.use('/personal-account-cleanup', personalAccountCleanup);

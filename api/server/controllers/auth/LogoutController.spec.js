@@ -6,7 +6,10 @@ const mockIsEnabled = jest.fn();
 const mockGetOpenIdConfig = jest.fn();
 
 jest.mock('cookie');
-jest.mock('@librechat/api', () => ({ isEnabled: (...args) => mockIsEnabled(...args) }));
+jest.mock('@librechat/api', () => ({
+  getSessionCookieName: jest.fn((name) => name),
+  isEnabled: (...args) => mockIsEnabled(...args),
+}));
 jest.mock('@librechat/data-schemas', () => ({ logger: mockLogger }));
 jest.mock('~/server/services/AuthService', () => ({
   logoutUser: (...args) => mockLogoutUser(...args),

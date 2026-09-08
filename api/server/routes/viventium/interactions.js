@@ -7,7 +7,7 @@
  * === VIVENTIUM END === */
 
 const express = require('express');
-const { GenerationJobManager } = require('@librechat/api');
+const { GenerationJobManager, telegramInputDeliveryCoverage } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { Message, Conversation } = require('~/db/models');
 const {
@@ -51,7 +51,6 @@ async function persistPresentationOutcome(result) {
     user: presentation.userId,
     messageId: presentation.responseMessageId,
     isCreatedByUser: { $ne: true },
-    unfinished: true,
     'metadata.viventium.interactionContext.logical_turn_id': context.logical_turn_id,
     'metadata.viventium.interactionContext.revision': context.revision,
   };
@@ -60,6 +59,7 @@ async function persistPresentationOutcome(result) {
   }
 
   if (acknowledgement.state === 'partial_removed') {
+    query.unfinished = true;
     const removed = await Message.findOneAndDelete(query);
     if (removed?._id && presentation.conversationId) {
       await Conversation.updateOne(
@@ -70,14 +70,32 @@ async function persistPresentationOutcome(result) {
     return;
   }
 
-  await Message.updateOne(query, {
+  const coverage = telegramInputDeliveryCoverage(result);
+  if (!['committed', 'committed_effect'].includes(acknowledgement.state)) query.unfinished = true;
+  const persisted = await Message.updateOne(query, {
     $set: {
       ...(['committed', 'committed_effect'].includes(acknowledgement.state)
         ? { unfinished: false }
         : {}),
       'metadata.viventium.deliveryAcknowledgement': acknowledgement,
+      ...(coverage ? { 'metadata.viventium.deliverySourceCoverage': coverage } : {}),
     },
   });
+  // A job receipt alone does not prove that its exact assistant projection was stored.
+  const matchedCount = Number(persisted?.matchedCount ?? persisted?.n ?? 0);
+  const modifiedCount = Number(persisted?.modifiedCount ?? persisted?.nModified ?? 0);
+  if (matchedCount > 0 || modifiedCount > 0) return;
+  if (['committed', 'committed_effect'].includes(acknowledgement.state)) {
+    const terminalQuery = { ...query, unfinished: false };
+    for (const [key, value] of Object.entries(acknowledgement)) {
+      terminalQuery[`metadata.viventium.deliveryAcknowledgement.${key}`] = value;
+    }
+    const existing = await Message.findOne(terminalQuery).select('_id').lean();
+    if (existing?._id) return;
+  }
+  const error = new Error('Exact assistant presentation state was not persisted');
+  error.code = 'interaction_presentation_state_unmatched';
+  throw error;
 }
 
 async function persistTelegramTransportReceipt(result, adapterSurface) {
@@ -273,7 +291,7 @@ router.post('/delivery-ack', async (req, res) => {
   }
 
   try {
-    let result =
+    const result =
       parsed.acknowledgement.source_kind === 'schedule_result'
         ? await GenerationJobManager.acknowledgeServerCommittedTransportReceipt(
             parsed.acknowledgement,
@@ -286,12 +304,6 @@ router.post('/delivery-ack', async (req, res) => {
                 parsed.cortexPresentation,
               )
             : GenerationJobManager.acknowledgeDelivery(parsed.acknowledgement, adapterSurface));
-    if (result.status === 'stale_revision' && parsed.acknowledgement.state === 'committed') {
-      result = await GenerationJobManager.acknowledgeDurableEffectDelivery(
-        parsed.acknowledgement,
-        adapterSurface,
-      );
-    }
     if (result.status === 'recorded') {
       await persistPresentationOutcome(result);
       await persistTelegramTransportReceipt(result, adapterSurface);

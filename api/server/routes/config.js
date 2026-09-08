@@ -21,6 +21,11 @@ const {
 // VIVENTIUM END
 
 const router = express.Router();
+/* === VIVENTIUM START === Keep links to this installation on the browser's active origin. === */
+const viventiumClientOrigin = URL.canParse(process.env.DOMAIN_CLIENT ?? '')
+  ? new URL(process.env.DOMAIN_CLIENT).origin
+  : undefined;
+/* === VIVENTIUM END === */
 const emailLoginEnabled =
   process.env.ALLOW_EMAIL_LOGIN === undefined || isEnabled(process.env.ALLOW_EMAIL_LOGIN);
 const passwordResetEnabled = isEnabled(process.env.ALLOW_PASSWORD_RESET);
@@ -76,6 +81,7 @@ router.get('/', async function (req, res) {
   if (cachedStartupConfig) {
     res.send({
       ...cachedStartupConfig,
+      viventiumClientOrigin,
       viventiumParallelWorkAvailable: await parallelWorkDeploymentAvailableAsync(),
       ...connectedAccountAuthRequirements(),
     });
@@ -134,6 +140,7 @@ router.get('/', async function (req, res) {
       samlLabel: process.env.SAML_BUTTON_LABEL,
       samlImageUrl: process.env.SAML_IMAGE_URL,
       serverDomain: process.env.DOMAIN_SERVER || 'http://localhost:3080',
+      viventiumClientOrigin,
       emailLoginEnabled,
       registrationEnabled,
       socialLoginEnabled: isEnabled(process.env.ALLOW_SOCIAL_LOGIN),

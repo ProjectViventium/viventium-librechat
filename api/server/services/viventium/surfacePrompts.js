@@ -379,7 +379,7 @@ function buildWebTextInstructions() {
     'WEB TEXT MODE:',
     '- Use standard Markdown formatting (bold, italic, inline code, code blocks, block quotes).',
     '- Prefer short paragraphs and bullet lists when they improve scanability.',
-    '- Avoid markdown tables, heading syntax (#), and HTML.',
+    '- Respect the user’s requested format and structure; Markdown headings and tables are supported. Do not use raw HTML.',
     '- If sources are helpful, include plain URLs on a "Sources" line (no markdown links, no citation markers).',
   ].join('\n');
   return getPromptText('surface.web', fallback);

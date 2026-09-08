@@ -22,11 +22,13 @@ export type RequestBody = {
   viventiumInputMode?: string;
   viventiumStreamId?: string;
   viventiumGlassHiveIdempotencyKey?: string;
+  viventiumGlassHiveTurnContextB64?: string;
   viventiumVoiceRequestId?: string;
   viventiumVoiceCallSessionId?: string;
   viventiumTelegramChatId?: string;
   viventiumTelegramUserId?: string;
   viventiumTelegramMessageId?: string;
+  telegramAudioRequested?: boolean;
   viventiumLogicalTurnId?: string;
   viventiumLogicalTurnRevision?: string;
   files?: unknown[];

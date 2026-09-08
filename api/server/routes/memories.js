@@ -5,6 +5,7 @@ const {
   generateCheckAccess,
   prepareMemoryValueForWrite,
   runMemoryMaintenance,
+  resolveConversationRecallPreference,
 } = require('@librechat/api');
 const { PermissionTypes, Permissions } = require('librechat-data-provider');
 const {
@@ -141,6 +142,10 @@ router.get('/', checkMemoryRead, configMiddleware, async (req, res) => {
       tokenLimit: tokenLimit || null,
       charLimit,
       usagePercentage,
+      /* === VIVENTIUM START ===
+       * Keep the manual Memories UI on the same configured key contract as server writes.
+       * === VIVENTIUM END === */
+      validKeys: Array.isArray(memoryConfig?.validKeys) ? memoryConfig.validKeys : [],
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -283,7 +288,7 @@ router.patch('/preferences', checkMemoryOptOut, async (req, res) => {
       updated: true,
       preferences: {
         memories: updatedUser.personalization?.memories ?? true,
-        conversation_recall: updatedUser.personalization?.conversation_recall ?? false,
+        conversation_recall: resolveConversationRecallPreference(updatedUser),
       },
     });
   } catch (error) {

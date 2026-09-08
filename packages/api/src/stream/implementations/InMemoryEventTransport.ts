@@ -4,8 +4,10 @@ import type {
   EventTransportEmitOptions,
   EventTransportPublishReceipt,
   IEventTransport,
+  NativeResponseReplayGuard,
 } from '../interfaces/IJobStore';
 import { streamLogRef } from '../logPrivacy';
+import { nativeIdentityJobProofJson } from './nativeResponse';
 
 interface StreamState {
   emitter: EventEmitter;
@@ -34,14 +36,15 @@ export class InMemoryEventTransport implements IEventTransport {
     streamId: string,
     handlers: {
       onChunk: (event: unknown) => void;
-      onDone?: (event: unknown) => void;
+      onDone?: (event: unknown, nativeJobProof?: string) => void;
       onError?: (error: string) => void;
     },
   ): { unsubscribe: () => void; ready?: Promise<void> } {
     const state = this.getOrCreateStream(streamId);
 
     const chunkHandler = (event: unknown) => handlers.onChunk(event);
-    const doneHandler = (event: unknown) => handlers.onDone?.(event);
+    const doneHandler = (event: unknown, proof?: string) =>
+      proof === undefined ? handlers.onDone?.(event) : handlers.onDone?.(event, proof);
     const errorHandler = (error: string) => handlers.onError?.(error);
 
     state.emitter.on('chunk', chunkHandler);
@@ -91,9 +94,17 @@ export class InMemoryEventTransport implements IEventTransport {
     };
   }
 
-  emitDone(streamId: string, event: unknown): void {
+  emitDone(
+    streamId: string,
+    event: unknown,
+    nativeReplay?: NativeResponseReplayGuard,
+  ): void | boolean {
+    if (nativeReplay && !nativeReplay.isCurrent()) return false;
     const state = this.streams.get(streamId);
-    state?.emitter.emit('done', event);
+    if (nativeReplay)
+      state?.emitter.emit('done', event, nativeIdentityJobProofJson(nativeReplay.identity));
+    else state?.emitter.emit('done', event);
+    if (nativeReplay) return true;
   }
 
   emitError(streamId: string, error: string): void {

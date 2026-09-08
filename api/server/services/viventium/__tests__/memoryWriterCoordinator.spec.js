@@ -4,12 +4,18 @@
 
 const {
   enqueueUserMemoryWriter,
+  bindActiveMemoryWriterTool,
+  activeMemoryWriterTool,
+  trackAdmittedMemoryWriter,
+  startMemoryWriterRecovery,
+  memoryWriterOwner,
   resetMemoryWriterCoordinatorForTests,
 } = require('../memoryWriterCoordinator');
 
 describe('memoryWriterCoordinator', () => {
   afterEach(() => {
     resetMemoryWriterCoordinatorForTests();
+    jest.useRealTimers();
   });
 
   it('serializes writers for the same user across client instances', async () => {
@@ -97,5 +103,113 @@ describe('memoryWriterCoordinator', () => {
 
     releaseFirst();
     await first;
+  });
+
+  it('heartbeats only live closures and sends only CAS-reclaimed pending work through recovery', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    let release;
+    const hold = new Promise((resolve) => {
+      release = resolve;
+    });
+    const row = {
+      user: 'owner',
+      messageId: 'answer',
+      savedMemoryWrite: {
+        owner: 'old-runtime',
+        status: 'pending',
+        heartbeatAt: new Date(0),
+      },
+    };
+    const db = {
+      refreshMemoryWrites: jest.fn().mockResolvedValue(0),
+      ensureMemoryWriteIndex: jest.fn().mockResolvedValue('index'),
+      listPendingMemoryWrites: jest.fn().mockResolvedValueOnce([row]).mockResolvedValue([]),
+      reclaimPendingMemoryWrite: jest.fn().mockResolvedValue(true),
+      recoverInterruptedMemoryWrites: jest.fn().mockResolvedValue(0),
+    };
+    const recoverPending = jest.fn(() => hold);
+    startMemoryWriterRecovery({ db, logger: { warn: jest.fn() }, recoverPending });
+    await new Promise(setImmediate);
+    expect(recoverPending).toHaveBeenCalledWith(row, {
+      userId: 'owner',
+      messageId: 'answer',
+      owner: memoryWriterOwner,
+    });
+    expect(db.reclaimPendingMemoryWrite).toHaveBeenCalledWith(
+      expect.objectContaining({
+        previousOwner: 'old-runtime',
+        heartbeatAt: row.savedMemoryWrite.heartbeatAt,
+      }),
+    );
+    expect(db.recoverInterruptedMemoryWrites).toHaveBeenCalledWith({
+      before: expect.any(Date),
+      includePending: false,
+    });
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(db.refreshMemoryWrites).toHaveBeenLastCalledWith(memoryWriterOwner, ['answer']);
+    release();
+    await new Promise(setImmediate);
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(db.refreshMemoryWrites).toHaveBeenLastCalledWith(memoryWriterOwner, []);
+    expect(db.ensureMemoryWriteIndex).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Native transport uses the existing active queue entry, never a separate callback registry.
+describe('admitted native memory callback ownership', () => {
+  afterEach(resetMemoryWriterCoordinatorForTests);
+  it('binds only the active admitted identity and removes access on finish', async () => {
+    const identity = {
+      userId: 'owner',
+      messageId: 'answer',
+      conversationId: 'chat',
+      owner: memoryWriterOwner,
+    };
+    const binding = {
+      identity,
+      matchesIdentity: (other) => other === identity,
+      accepts: () => true,
+    };
+    expect(() => bindActiveMemoryWriterTool(binding)).toThrow('not_active');
+    const untrack = trackAdmittedMemoryWriter(identity.messageId);
+    await enqueueUserMemoryWriter({
+      userId: identity.userId,
+      identity,
+      run: async () => {
+        const unregister = bindActiveMemoryWriterTool(binding);
+        expect(activeMemoryWriterTool({ user_id: identity.userId })).toBe(binding);
+        expect(activeMemoryWriterTool({ user_id: 'other' })).toBeNull();
+        expect(() => bindActiveMemoryWriterTool(binding)).toThrow('not_active');
+        unregister();
+        expect(activeMemoryWriterTool({ user_id: identity.userId })).toBeNull();
+      },
+    });
+    untrack();
+    await new Promise(setImmediate);
+    expect(() => bindActiveMemoryWriterTool(binding)).toThrow('not_active');
+  });
+  it('drops a running callback when its process-owned state disappears', async () => {
+    const identity = {
+      userId: 'owner',
+      messageId: 'answer',
+      conversationId: 'chat',
+      owner: memoryWriterOwner,
+    };
+    const untrack = trackAdmittedMemoryWriter(identity.messageId);
+    await enqueueUserMemoryWriter({
+      userId: identity.userId,
+      identity,
+      run: async () => {
+        const binding = {
+          identity,
+          matchesIdentity: (other) => other === identity,
+          accepts: () => true,
+        };
+        bindActiveMemoryWriterTool(binding);
+        resetMemoryWriterCoordinatorForTests();
+        expect(activeMemoryWriterTool({ user_id: identity.userId })).toBeNull();
+      },
+    });
+    untrack();
   });
 });

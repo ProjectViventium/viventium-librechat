@@ -59,6 +59,8 @@ export interface GenerationJob {
   supersededPresentations?: Array<{
     conversationId?: string;
     responseMessageId?: string;
+    /** Persisted input retained when this provisional response is retracted. */
+    userMessageId?: string;
     interactionContext?: InteractionContext;
   }>;
 }

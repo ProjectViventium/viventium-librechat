@@ -144,6 +144,7 @@ const SCHEDULER_PUBLIC_FAILURES = Object.freeze({
   provider_response_failed: 'The model provider could not complete this request.',
   provider_response_deadline_exceeded: 'The model provider response exceeded its deadline.',
   provider_temporarily_unavailable: 'The model provider is temporarily unavailable.',
+  conversation_session_authority_conflict: 'The conversation is busy with an active response.',
   completion_error: 'The scheduled model response could not be completed.',
 });
 
@@ -573,6 +574,19 @@ router.post(
       surface: 'scheduler',
     });
     const conversationId = conversationState.conversationId;
+    if (
+      conversationId !== 'new' &&
+      (await GenerationJobManager.getActiveStreamIdForConversation(
+        String(req.user?.id || ''),
+        conversationId,
+      ))
+    ) {
+      return _res.status(202).json({
+        deferred: true,
+        reason: 'conversation_session_authority_conflict',
+        conversationId,
+      });
+    }
     if (dispatchDocumentId && !existingDispatch) {
       await schedulerDispatchCollection().updateOne(
         { _id: dispatchDocumentId },
@@ -608,6 +622,8 @@ router.post(
       createSchedulerInteractionContext({
         conversation_id: conversationId,
         source_event_id: incoming.source_event_id || incoming.sourceEventId || streamId,
+        schedule_id: scheduleId,
+        schedule_run_id: typeof incoming.scheduleRunId === 'string' ? incoming.scheduleRunId : '',
       }),
       {
         segment_stability: 'immediate',

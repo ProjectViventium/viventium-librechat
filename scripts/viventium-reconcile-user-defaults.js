@@ -33,6 +33,12 @@ function buildMissingConversationRecallUpdate({ env = process.env } = {}) {
       $or: [
         { personalization: { $exists: false } },
         { 'personalization.conversation_recall': { $exists: false } },
+        /* === VIVENTIUM START ===
+         * Only accounts that never wrote the preference receive the installer default. A stored
+         * `false` is left alone even when no explicit-choice marker exists: older accounts could
+         * have opted out before the marker existed, and consent must never be overwritten by a
+         * default.
+         * === VIVENTIUM END === */
       ],
     },
     update: {
@@ -57,9 +63,16 @@ async function reconcileUserDefaults({ env = process.env } = {}) {
 
 async function closeDbConnection() {
   const mongoose = require('mongoose');
-  if (mongoose.connection?.readyState === 1) {
-    await mongoose.disconnect();
-  }
+  const { ioredisClient, keyvRedisClient } = require('@librechat/api');
+  // connectDb imports the API barrel, which also opens cache sockets. This one-shot
+  // command must release all of its connections before native startup can continue.
+  const closed = await Promise.allSettled([
+    Promise.resolve().then(() => mongoose.connection?.readyState === 1 && mongoose.disconnect()),
+    Promise.resolve().then(() => ioredisClient?.disconnect()),
+    Promise.resolve().then(() => keyvRedisClient?.isOpen && keyvRedisClient.disconnect()),
+  ]);
+  const failed = closed.find((result) => result.status === 'rejected');
+  if (failed) throw failed.reason;
 }
 
 async function run() {

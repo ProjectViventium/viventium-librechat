@@ -1,3 +1,8 @@
+jest.mock('@librechat/api', () => ({
+  ioredisClient: { disconnect: jest.fn() },
+  keyvRedisClient: { isOpen: true, disconnect: jest.fn() },
+}));
+
 jest.mock('../../../api/db/connect', () => ({
   connectDb: jest.fn(),
 }));
@@ -18,6 +23,7 @@ jest.mock('mongoose', () => ({
 const { connectDb } = require('../../../api/db/connect');
 const { User } = require('../../../api/db/models');
 const mongoose = require('mongoose');
+const { ioredisClient, keyvRedisClient } = require('@librechat/api');
 const {
   envFlagEnabled,
   buildMissingConversationRecallUpdate,
@@ -29,15 +35,21 @@ describe('viventium-reconcile-user-defaults', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mongoose.connection.readyState = 1;
+    keyvRedisClient.isOpen = true;
+    mongoose.disconnect.mockResolvedValue(undefined);
   });
 
   test('parses installer boolean env flags consistently', () => {
-    expect(envFlagEnabled('VIVENTIUM_DEFAULT_CONVERSATION_RECALL', {
-      env: { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: 'true' },
-    })).toBe(true);
-    expect(envFlagEnabled('VIVENTIUM_DEFAULT_CONVERSATION_RECALL', {
-      env: { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: '0' },
-    })).toBe(false);
+    expect(
+      envFlagEnabled('VIVENTIUM_DEFAULT_CONVERSATION_RECALL', {
+        env: { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: 'true' },
+      }),
+    ).toBe(true);
+    expect(
+      envFlagEnabled('VIVENTIUM_DEFAULT_CONVERSATION_RECALL', {
+        env: { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: '0' },
+      }),
+    ).toBe(false);
   });
 
   test('builds a missing-only conversation recall reconciliation update', () => {
@@ -95,6 +107,26 @@ describe('viventium-reconcile-user-defaults', () => {
     await closeDbConnection();
 
     expect(mongoose.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  test('closes both cache clients opened by the database module import', async () => {
+    await closeDbConnection();
+    expect(ioredisClient.disconnect).toHaveBeenCalledTimes(1);
+    expect(keyvRedisClient.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  test('still closes cache clients when Mongo shutdown fails', async () => {
+    mongoose.disconnect.mockRejectedValueOnce(new Error('Synthetic Mongo close failure'));
+    await expect(closeDbConnection()).rejects.toThrow('Synthetic Mongo close failure');
+    expect(ioredisClient.disconnect).toHaveBeenCalledTimes(1);
+    expect(keyvRedisClient.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not disconnect an already closed keyv client', async () => {
+    keyvRedisClient.isOpen = false;
+    await closeDbConnection();
+    expect(ioredisClient.disconnect).toHaveBeenCalledTimes(1);
+    expect(keyvRedisClient.disconnect).not.toHaveBeenCalled();
   });
 
   test('does not disconnect when mongoose is already closed', async () => {

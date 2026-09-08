@@ -102,6 +102,9 @@ const {
   parallelWorkClaimStateAsync,
 } = require('~/server/services/viventium/ViventiumOrchestrationMode');
 const {
+  waitForOrchestrationReadiness,
+} = require('~/server/services/viventium/GlassHiveOrchestrationReadinessService');
+const {
   appendGlassHiveMainOrchestrationFacade,
   availableGlassHiveMainOrchestrationTools,
 } = require('~/app/clients/tools/util/glassHiveOrchestrationTools');
@@ -158,6 +161,7 @@ function startParallelWorkTurnAuthority(req, agent) {
   if (!req || typeof req !== 'object' || !hasParallelWorkTools(agent)) {
     return Promise.resolve(false);
   }
+  require('~/server/services/viventium/GlassHiveAccountService').startActiveWorkContext(req, agent);
   if (typeof req._viventiumParallelWorkTurnAvailable === 'boolean') {
     return Promise.resolve(req._viventiumParallelWorkTurnAvailable);
   }
@@ -172,15 +176,15 @@ function startParallelWorkTurnAuthority(req, agent) {
     return unavailable;
   }
 
+  const authorityTimeoutMs = parallelWorkTurnAuthorityTimeoutMs();
   let timeout;
   const timeoutPromise = new Promise((resolve) => {
-    timeout = setTimeout(
-      () => resolve(PARALLEL_WORK_AUTHORITY_TIMEOUT),
-      parallelWorkTurnAuthorityTimeoutMs(),
-    );
+    timeout = setTimeout(() => resolve(PARALLEL_WORK_AUTHORITY_TIMEOUT), authorityTimeoutMs);
     timeout.unref?.();
   });
-  const claimPromise = Promise.resolve().then(() => parallelWorkClaimStateAsync(ownerId));
+  const claimPromise = Promise.resolve()
+    .then(() => waitForOrchestrationReadiness({ ownerId, timeoutMs: authorityTimeoutMs }))
+    .then(() => parallelWorkClaimStateAsync(ownerId));
   const authority = Promise.race([claimPromise, timeoutPromise])
     .then((claimState) => {
       if (typeof req._viventiumParallelWorkTurnAvailable === 'boolean') {

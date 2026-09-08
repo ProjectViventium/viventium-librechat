@@ -11,6 +11,10 @@ import { Constants, isAssistantsEndpoint } from 'librechat-data-provider';
 import type { TMessage, TConversation, TSubmission, Agents } from 'librechat-data-provider';
 import { useActiveJobs, useStreamStatus } from '~/data-provider';
 import store from '~/store';
+/* === VIVENTIUM START === Recover title work from the saved first response. === */
+import { queueTitleGeneration } from '~/data-provider';
+import { shouldQueueLoadedCanonicalTitle } from './canonicalConversation';
+/* === VIVENTIUM END === */
 /* === VIVENTIUM START === Exact optimistic-to-authoritative resume identity. === */
 import { projectResumeMessages, type ResumeMessageProjection } from './resumeMessageProjection';
 /* === VIVENTIUM END === */
@@ -82,7 +86,7 @@ export function buildSubmissionFromResumeState(
  */
 export default function useResumeOnLoad(
   conversationId: string | undefined,
-  getMessages: () => TMessage[] | undefined,
+  observedMessages: TMessage[] | undefined,
   runIndex = 0,
   messagesLoaded = true,
 ) {
@@ -145,6 +149,13 @@ export default function useResumeOnLoad(
       console.log('[ResumeOnLoad] Waiting for messages to load');
       return;
     }
+
+    /* === VIVENTIUM START === Recovery can finish before this browser subscribes. === */
+    const messages = observedMessages ?? [];
+    if (shouldQueueLoadedCanonicalTitle(conversationId, messages)) {
+      queueTitleGeneration(conversationId);
+    }
+    /* === VIVENTIUM END === */
 
     // Local active-job cache is the single source of truth for same-session resume decisions.
     // FINAL removes the job optimistically so Phase B can finish in the background without
@@ -236,8 +247,6 @@ export default function useResumeOnLoad(
       hasResponseMessageId: Boolean(streamStatus.resumeState?.responseMessageId),
     });
 
-    const messages = getMessages() || [];
-
     // Build submission from resume state if available
     if (streamStatus.resumeState) {
       /* === VIVENTIUM START === Exact optimistic-to-authoritative resume identity. === */
@@ -291,7 +300,7 @@ export default function useResumeOnLoad(
     isSuccess,
     streamStatus,
     refetchStreamStatus,
-    getMessages,
+    observedMessages,
     queryClient,
     setSubmission,
   ]);

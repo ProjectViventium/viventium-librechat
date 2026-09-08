@@ -1,4 +1,14 @@
+import { interactionPresentationSequence } from '../../agents/interactionContext';
+import type { NativeResponseIdentity, NativeResponseCommit } from '@librechat/data-schemas';
+import {
+  nativeIdentityJson,
+  nativeIdentityValid,
+  nativeJobMatches,
+  retainNativeResponse,
+  NATIVE_RESPONSE_RECOVERY_WINDOW_MS,
+} from './nativeResponse';
 import { logger } from '@librechat/data-schemas';
+import { retainLogicalTurnInput, mergeLogicalTurnInput } from './logicalTurnInput';
 import { randomUUID } from 'crypto';
 import type { StandardGraph } from '@librechat/agents';
 import type { Agents } from 'librechat-data-provider';
@@ -13,6 +23,8 @@ import type {
   DeliveryAcknowledgementResult,
   DeliveryAcknowledgementBindingResult,
   CortexPresentationBinding,
+  SourceOrderObservation,
+  SourceOrderObservationResult,
 } from '~/stream/interfaces/IJobStore';
 
 interface LogicalTurnState {
@@ -25,9 +37,12 @@ interface LogicalTurnState {
   revisionStreams: Map<number, string>;
   deliveryAcknowledgements: Map<number, InteractionDeliveryAck>;
   completedAt?: number;
+  pendingInputs?: InteractionContext[];
+  currentContext?: InteractionContext;
 }
 
 function logicalTurnScope(userId: string, interactionContext: InteractionContext): string {
+  if (interactionContext.source_order_scope) return interactionContext.source_order_scope;
   return [
     userId,
     interactionContext.conversation_id,
@@ -56,6 +71,21 @@ interface ContentState {
  * - No chunk persistence needed - same instance handles generation and reconnects
  */
 export class InMemoryJobStore implements IJobStore {
+  /* VIVENTIUM START: process-local mirrors of the logical/source publication owner. */
+  readonly sourceOrderDurability = 'process' as const;
+
+  private nativePublications = new Map<
+    string,
+    {
+      identity?: string;
+      state: 'bound' | 'committed' | 'revoked';
+      candidateSha256?: string;
+      recoverUntil: number;
+    }
+  >();
+
+  private sourceOrders = new Map<string, SourceOrderObservationResult & { expiresAt: number }>();
+  /* VIVENTIUM END */
   private jobs = new Map<string, SerializableJobData>();
   private contentState = new Map<string, ContentState>();
   private cleanupInterval: NodeJS.Timeout | null = null;
@@ -106,8 +136,21 @@ export class InMemoryJobStore implements IJobStore {
     conversationId?: string,
     initialData?: Partial<SerializableJobData>,
   ): Promise<SerializableJobData> {
+    const previous = this.jobs.get(streamId);
+    if (previous) {
+      const result = await this.cancelNativeResponse(previous);
+      if (result.status === 'committed' && !previous.nativeResponseSettled) {
+        throw new Error('Saved native result is pending');
+      }
+      if (this.jobs.get(streamId) !== previous) {
+        throw new Error('Stream incarnation changed');
+      }
+    }
     if (this.jobs.size >= this.maxJobs) {
       await this.evictOldest();
+      if (this.jobs.size >= this.maxJobs && !previous) {
+        throw new Error('Generation job capacity reached');
+      }
     }
 
     const job: SerializableJobData = {
@@ -115,11 +158,20 @@ export class InMemoryJobStore implements IJobStore {
       streamId,
       userId,
       status: 'running',
-      createdAt: Date.now(),
+      createdAt: Math.max(Date.now(), (previous?.createdAt ?? 0) + 1),
+      nativeResponse: undefined,
+      nativeResponseCancelled: undefined,
+      nativeResponseFinished: undefined,
+      nativeResponseSettled: undefined,
       conversationId,
       syncSent: false,
     };
 
+    // Existing replay closures must observe retirement before the replacement is published.
+    if (previous) {
+      previous.nativeResponseCancelled = true;
+      delete previous.finalEvent;
+    }
     this.jobs.set(streamId, job);
 
     // Track job by userId for efficient user-scoped queries
@@ -133,6 +185,246 @@ export class InMemoryJobStore implements IJobStore {
     logger.debug(`[InMemoryJobStore] Created job: ${streamId}`);
 
     return job;
+  }
+
+  /* VIVENTIUM START: one publication winner, before any transport replay. */
+  async observeSourceOrder(
+    observation: SourceOrderObservation,
+  ): Promise<SourceOrderObservationResult> {
+    const previous = this.sourceOrders.get(observation.source_order_scope);
+    const latest = Math.max(previous?.latest_source_sequence ?? 0, observation.source_sequence);
+    const result = {
+      latest_source_sequence: latest,
+      observed_at: latest === previous?.latest_source_sequence ? previous.observed_at : Date.now(),
+      stale: observation.source_sequence < latest,
+    };
+    this.sourceOrders.set(observation.source_order_scope, {
+      ...result,
+      expiresAt: Math.max(previous?.expiresAt ?? 0, Date.now() + 300_000),
+    });
+    return result;
+  }
+
+  private nativeKey(identity: { logicalTurnId: string; revision: number }): string {
+    return JSON.stringify([identity.logicalTurnId, identity.revision]);
+  }
+
+  private nativeCurrent(identity: NativeResponseIdentity): boolean {
+    const state = this.logicalTurnIndex.get(identity.logicalTurnId);
+    return Boolean(
+      state &&
+      this.logicalTurns.get(state.scope) === state &&
+      state.currentStreamId === identity.streamId &&
+      state.revision === identity.revision &&
+      (!identity.sourceOrderScope ||
+        this.sourceOrders.get(identity.sourceOrderScope)?.latest_source_sequence ===
+          identity.sourceSequence),
+    );
+  }
+
+  async bindNativeResponse(identity: NativeResponseIdentity): Promise<boolean> {
+    const job = this.jobs.get(identity.streamId) ?? null;
+    if (
+      !nativeIdentityValid(identity) ||
+      !nativeJobMatches(job, identity) ||
+      job.nativeResponseCancelled ||
+      ['aborted', 'superseded'].includes(job.status) ||
+      !this.nativeCurrent(identity)
+    ) {
+      return false;
+    }
+    const encoded = nativeIdentityJson(identity);
+    const prior = this.nativePublications.get(this.nativeKey(identity));
+    if (
+      (job.nativeResponse && nativeIdentityJson(job.nativeResponse) !== encoded) ||
+      (prior && (prior.state === 'revoked' || prior.identity !== encoded))
+    ) {
+      return false;
+    }
+    if (!prior && job.status !== 'running') {
+      return false;
+    }
+    if (!prior) {
+      this.nativePublications.set(this.nativeKey(identity), {
+        identity: encoded,
+        state: 'bound',
+        recoverUntil: identity.recoverUntil,
+      });
+    }
+    job.nativeResponse = JSON.parse(encoded) as NativeResponseIdentity;
+    const source = identity.sourceOrderScope && this.sourceOrders.get(identity.sourceOrderScope);
+    if (source) {
+      source.expiresAt = Math.max(source.expiresAt, identity.recoverUntil);
+    }
+    return true;
+  }
+
+  async commitNativeResponse(
+    identity: NativeResponseIdentity,
+    candidateSha256: string,
+  ): Promise<NativeResponseCommit> {
+    if (!nativeIdentityValid(identity) || !/^[a-f0-9]{64}$/.test(candidateSha256)) {
+      return { status: 'unavailable' };
+    }
+    const record = this.nativePublications.get(this.nativeKey(identity));
+    const job = this.jobs.get(identity.streamId) ?? null;
+    if (
+      !record ||
+      !nativeJobMatches(job, identity) ||
+      record.identity !== nativeIdentityJson(identity)
+    ) {
+      return { status: 'unavailable' };
+    }
+    if (record.state === 'committed') {
+      return record.candidateSha256 === candidateSha256
+        ? { status: 'committed', candidateSha256 }
+        : { status: 'revoked' };
+    }
+    if (
+      record.state === 'revoked' ||
+      job.nativeResponseCancelled ||
+      !this.nativeCurrent(identity)
+    ) {
+      return { status: 'revoked' };
+    }
+    record.state = 'committed';
+    record.candidateSha256 = candidateSha256;
+    return { status: 'committed', candidateSha256 };
+  }
+
+  async getNativeResponseCommit(identity: NativeResponseIdentity): Promise<NativeResponseCommit> {
+    if (!nativeIdentityValid(identity)) {
+      return { status: 'unavailable' };
+    }
+    const record = this.nativePublications.get(this.nativeKey(identity));
+    if (!record || record.identity !== nativeIdentityJson(identity)) {
+      return { status: 'unavailable' };
+    }
+    return record.state === 'committed'
+      ? { status: 'committed', candidateSha256: record.candidateSha256 }
+      : { status: record.state === 'revoked' ? 'revoked' : 'unavailable' };
+  }
+
+  async revokeNativeResponse(identity: NativeResponseIdentity): Promise<NativeResponseCommit> {
+    if (!nativeIdentityValid(identity)) {
+      return { status: 'unavailable' };
+    }
+    const record = this.nativePublications.get(this.nativeKey(identity));
+    if (!record || record.identity !== nativeIdentityJson(identity)) {
+      return { status: 'unavailable' };
+    }
+    if (record.state === 'committed') {
+      return { status: 'committed', candidateSha256: record.candidateSha256 };
+    }
+    record.state = 'revoked';
+    const job = this.jobs.get(identity.streamId) ?? null;
+    if (nativeJobMatches(job, identity)) {
+      job.nativeResponseCancelled = true;
+    }
+    return { status: 'revoked' };
+  }
+
+  async cancelNativeResponse(expected: SerializableJobData): Promise<NativeResponseCommit> {
+    const job = this.jobs.get(expected.streamId);
+    if (
+      !job ||
+      job.createdAt !== expected.createdAt ||
+      job.responseMessageId !== expected.responseMessageId ||
+      job.userId !== expected.userId
+    ) {
+      return { status: 'unavailable' };
+    }
+    if (job.nativeResponse) {
+      return this.revokeNativeResponse(job.nativeResponse);
+    }
+    const context = job.interactionContext;
+    if (context?.logical_turn_id) {
+      this.nativePublications.set(
+        this.nativeKey({ logicalTurnId: context.logical_turn_id, revision: context.revision }),
+        { state: 'revoked', recoverUntil: job.createdAt + NATIVE_RESPONSE_RECOVERY_WINDOW_MS },
+      );
+    }
+    job.nativeResponseCancelled = true;
+    return { status: 'revoked' };
+  }
+
+  async settleNativeResponse(
+    identity: NativeResponseIdentity,
+    mode?: 'unsupported' | 'cancelled',
+  ): Promise<boolean> {
+    const receipt = await this.getNativeResponseCommit(identity);
+    const job = this.jobs.get(identity.streamId) ?? null;
+    if (mode === 'unsupported') {
+      if (
+        receipt.status !== 'revoked' ||
+        !nativeJobMatches(job, identity) ||
+        job.nativeResponseFinished ||
+        (job.nativeResponse &&
+          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity))
+      )
+        return false;
+      delete job.nativeResponse;
+      delete job.nativeResponseCancelled;
+      return true;
+    }
+    if (
+      receipt.status !== (mode === 'cancelled' ? 'revoked' : 'committed') ||
+      !nativeJobMatches(job, identity) ||
+      Boolean(job.nativeResponseCancelled) !== (mode === 'cancelled') ||
+      !job.nativeResponseFinished
+    ) {
+      return false;
+    }
+    job.nativeResponseSettled = true;
+    return true;
+  }
+
+  async finishNativeResponse(
+    identity: NativeResponseIdentity,
+    candidateSha256: string,
+    finalEvent: string,
+    mode?: 'cancelled',
+  ): Promise<boolean> {
+    const receipt = await this.getNativeResponseCommit(identity);
+    const job = this.jobs.get(identity.streamId) ?? null;
+    if (
+      (mode === 'cancelled'
+        ? receipt.status !== 'revoked' || !job?.nativeResponseCancelled
+        : receipt.status !== 'committed' ||
+          receipt.candidateSha256 !== candidateSha256 ||
+          job?.nativeResponseCancelled) ||
+      !nativeJobMatches(job, identity) ||
+      !job.nativeResponse ||
+      nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity)
+    ) {
+      return false;
+    }
+    if (job.nativeResponseFinished) {
+      return job.finalEvent === finalEvent;
+    }
+    job.finalEvent = finalEvent;
+    job.nativeResponseFinished = true;
+    job.generationCompleted = true;
+    job.status = mode === 'cancelled' ? 'aborted' : 'complete';
+    job.completedAt = Date.now();
+    delete job.error;
+    return true;
+  }
+  /* VIVENTIUM END */
+
+  async retainLogicalTurnInput(userId: string, context: InteractionContext): Promise<InteractionContext> {
+    const scope = logicalTurnScope(userId, context);
+    let state = this.logicalTurns.get(scope);
+    mergeLogicalTurnInput([...(state?.active && state.currentContext ? [state.currentContext] : []), ...(state?.pendingInputs ?? [])], context);
+    if (!state) {
+      state = { scope, logicalTurnId: randomUUID(), revision: 0, active: false,
+        receipts: new Map(), revisionStreams: new Map(), deliveryAcknowledgements: new Map() };
+      this.logicalTurns.set(scope, state);
+    }
+    if (state.receipts.has(context.source_event_id) || state.currentContext?.source_segments?.some((source) => source.source_event_id === context.source_event_id)) return context;
+    state.pendingInputs = retainLogicalTurnInput(state.pendingInputs ?? [], context);
+    state.completedAt = Date.now();
+    return context;
   }
 
   async claimLogicalTurn(
@@ -152,6 +444,23 @@ export class InMemoryJobStore implements IJobStore {
       };
     }
 
+    if (interactionContext.ready_input_continuation && existing?.active) {
+      return { status: 'busy', streamId, interactionContext, supersededStreamIds: [] };
+    }
+    const presentationSequence = interactionPresentationSequence(interactionContext);
+    const latestSequence = interactionContext.source_order_scope
+      ? Math.max(this.sourceOrders.get(interactionContext.source_order_scope)?.latest_source_sequence ?? 0,
+          interactionPresentationSequence(existing?.currentContext) ?? 0,
+          ...(existing?.pendingInputs ?? []).flatMap((input) => (input.source_segments ?? []).map((segment) => segment.source_sequence ?? 0))) : undefined;
+    if (presentationSequence != null && latestSequence != null && presentationSequence < latestSequence) {
+      return { status: 'superseded', streamId, interactionContext, supersededStreamIds: [] };
+    }
+    const pendingInputs = existing?.pendingInputs ?? [];
+    const previousContext = existing?.active ? existing.currentContext : undefined;
+    const mergedInput = mergeLogicalTurnInput([...(previousContext ? [previousContext] : []), ...pendingInputs], interactionContext);
+    if (mergedInput.source_segments?.some((segment) => segment.source_message_id && segment.source_persisted !== true)) {
+      return { status: 'initializing', streamId, interactionContext, supersededStreamIds: [] };
+    }
     const activeStreamId = existing?.active ? existing.currentStreamId : undefined;
     const continuesTurn = activeStreamId != null;
     if (!continuesTurn && existing) {
@@ -172,11 +481,13 @@ export class InMemoryJobStore implements IJobStore {
     state.revision += 1;
 
     const claimedContext: InteractionContext = Object.freeze({
-      ...interactionContext,
+      ...mergedInput,
       logical_turn_id: state.logicalTurnId,
       revision: state.revision,
     });
     const supersededStreamIds = continuesTurn && activeStreamId ? [activeStreamId] : [];
+    state.currentContext = claimedContext;
+    state.pendingInputs = [];
     state.currentStreamId = streamId;
     state.active = true;
     state.revisionStreams.set(state.revision, streamId);
@@ -215,11 +526,13 @@ export class InMemoryJobStore implements IJobStore {
     if (receipt?.streamId === streamId) {
       state.receipts.delete(interactionContext.source_event_id);
     }
+    state.pendingInputs = retainLogicalTurnInput(state.pendingInputs ?? [], interactionContext);
     state.revisionStreams.delete(state.revision);
     this.streamScopes.delete(streamId);
     state.revision -= 1;
     if (state.revision > 0) {
       state.currentStreamId = state.revisionStreams.get(state.revision);
+      state.currentContext = [...state.receipts.values()].find((receipt) => receipt.streamId === state.currentStreamId)?.interactionContext;
       state.active = Boolean(state.currentStreamId);
     } else {
       state.currentStreamId = undefined;
@@ -248,7 +561,22 @@ export class InMemoryJobStore implements IJobStore {
     return true;
   }
 
-  async completeLogicalTurn(streamId: string): Promise<void> {
+  async completeLogicalTurn(streamId: string, expected?: NativeResponseIdentity): Promise<void> {
+    if (expected) {
+      const state = this.logicalTurnIndex.get(expected.logicalTurnId);
+      if (
+        expected.streamId !== streamId ||
+        !state ||
+        this.logicalTurns.get(state.scope) !== state ||
+        state.revision !== expected.revision ||
+        state.currentStreamId !== streamId ||
+        state.revisionStreams.get(expected.revision) !== streamId
+      )
+        return;
+      state.active = false;
+      state.completedAt = Date.now();
+      return;
+    }
     const scope = this.streamScopes.get(streamId);
     if (!scope) {
       return;
@@ -274,6 +602,13 @@ export class InMemoryJobStore implements IJobStore {
       return null;
     }
     return state.revisionStreams.get(revision) ?? null;
+  }
+
+  private stalePresentation(state: LogicalTurnState, revision: number): boolean {
+    const context = [...state.receipts.values()].find((receipt) => receipt.interactionContext.revision === revision)?.interactionContext;
+    const sequence = interactionPresentationSequence(context);
+    const latest = context?.source_order_scope ? this.sourceOrders.get(context.source_order_scope)?.latest_source_sequence : undefined;
+    return sequence != null && latest != null && sequence < latest;
   }
 
   async acknowledgeDelivery(
@@ -304,6 +639,9 @@ export class InMemoryJobStore implements IJobStore {
           }
         : { status: 'conflict' };
     }
+    if (['committed', 'committed_effect'].includes(acknowledgement.state) && this.stalePresentation(state, acknowledgement.revision)) {
+      return { status: 'stale_source_order' };
+    }
     const recordedAcknowledgement = Object.freeze({ ...acknowledgement });
     state.deliveryAcknowledgements.set(acknowledgement.revision, recordedAcknowledgement);
     if (
@@ -325,12 +663,46 @@ export class InMemoryJobStore implements IJobStore {
     return this.jobs.get(streamId) ?? null;
   }
 
-  async updateJob(streamId: string, updates: Partial<SerializableJobData>): Promise<void> {
+  async updateJob(
+    streamId: string,
+    updates: Partial<SerializableJobData>,
+    expectedNativeIdentity?: NativeResponseIdentity,
+  ): Promise<void> {
     const job = this.jobs.get(streamId);
-    if (!job) {
+    if (
+      !job ||
+      (expectedNativeIdentity &&
+        (!nativeJobMatches(job, expectedNativeIdentity) || !job.nativeResponse ||
+          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(expectedNativeIdentity)))
+    ) {
       return;
     }
-    Object.assign(job, updates);
+    const safe = { ...updates };
+    delete safe.nativeResponse;
+    delete safe.nativeResponseCancelled;
+    delete safe.nativeResponseFinished;
+    delete safe.nativeResponseSettled;
+    if (job.nativeResponse) {
+      for (const key of [
+        'createdAt',
+        'userId',
+        'streamId',
+        'conversationId',
+        'responseMessageId',
+        'userMessage',
+        'interactionContext',
+        'finalEvent',
+        'generationCompleted',
+      ] as const) {
+        delete safe[key];
+      }
+      if (job.nativeResponseFinished) {
+        delete safe.status;
+        delete safe.error;
+        delete safe.completedAt;
+      }
+    }
+    Object.assign(job, safe);
   }
 
   /** Atomically bind one exact Cortex presentation generation to its in-memory job. */
@@ -430,6 +802,8 @@ export class InMemoryJobStore implements IJobStore {
     const existingLogicalAcknowledgement = state.deliveryAcknowledgements.get(
       acknowledgement.revision,
     );
+    if (!existingLogicalAcknowledgement && ['committed', 'committed_effect'].includes(acknowledgement.state) &&
+        this.stalePresentation(state, acknowledgement.revision)) return { status: 'stale_source_order' };
     let recordedAcknowledgement = existingLogicalAcknowledgement;
     let logicalIdempotent = false;
     if (existingLogicalAcknowledgement) {
@@ -489,7 +863,20 @@ export class InMemoryJobStore implements IJobStore {
     };
   }
 
-  async deleteJob(streamId: string): Promise<void> {
+  async deleteJob(streamId: string, retiredNativeResponse?: NativeResponseIdentity): Promise<void> {
+    const job = this.jobs.get(streamId);
+    if (retiredNativeResponse && job) {
+      if (
+        !job.nativeResponse ||
+        nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(retiredNativeResponse)
+      )
+        return;
+      // Existing in-flight replay references observe retirement before this job is removed.
+      job.nativeResponseCancelled = true;
+      delete job.finalEvent;
+    } else if (job && retainNativeResponse(job)) {
+      return;
+    }
     this.jobs.delete(streamId);
     this.contentState.delete(streamId);
     logger.debug(`[InMemoryJobStore] Deleted job: ${streamId}`);
@@ -514,6 +901,13 @@ export class InMemoryJobStore implements IJobStore {
     const toDelete: string[] = [];
 
     for (const [streamId, job] of this.jobs) {
+      if (retainNativeResponse(job, now)) {
+        continue;
+      }
+      if (job.nativeResponse && job.nativeResponse.recoverUntil <= now) {
+        toDelete.push(streamId);
+        continue;
+      }
       const isFinished = ['complete', 'error', 'aborted', 'superseded'].includes(job.status);
       if (isFinished && job.completedAt) {
         // TTL of 0 means immediate cleanup, otherwise wait for TTL to expire
@@ -527,6 +921,16 @@ export class InMemoryJobStore implements IJobStore {
       await this.deleteJob(id);
     }
 
+    for (const [scope, source] of this.sourceOrders) {
+      if (source.expiresAt <= now) {
+        this.sourceOrders.delete(scope);
+      }
+    }
+    for (const [key, publication] of this.nativePublications) {
+      if (publication.recoverUntil <= now) {
+        this.nativePublications.delete(key);
+      }
+    }
     for (const state of this.logicalTurns.values()) {
       if (
         !state.active &&
@@ -549,7 +953,7 @@ export class InMemoryJobStore implements IJobStore {
     let oldestTime = Infinity;
 
     for (const [streamId, job] of this.jobs) {
-      if (job.createdAt < oldestTime) {
+      if (!retainNativeResponse(job) && job.createdAt < oldestTime) {
         oldestTime = job.createdAt;
         oldestId = streamId;
       }
@@ -596,6 +1000,8 @@ export class InMemoryJobStore implements IJobStore {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
     }
+    this.nativePublications.clear();
+    this.sourceOrders.clear();
     this.jobs.clear();
     this.contentState.clear();
     this.userJobMap.clear();

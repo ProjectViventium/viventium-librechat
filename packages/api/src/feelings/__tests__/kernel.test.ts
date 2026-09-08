@@ -1,3 +1,11 @@
+import { feelingPromptBundle } from './promptBundle.helper';
+let promptFixture: ReturnType<typeof feelingPromptBundle>;
+beforeAll(() => {
+  promptFixture = feelingPromptBundle();
+});
+afterAll(() => {
+  promptFixture?.close();
+});
 import {
   FEELING_BANDS,
   buildFeelingCapsule,

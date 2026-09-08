@@ -45,7 +45,11 @@ describe('redisClients Integration Tests', () => {
     process.env.REDIS_RETRY_MAX_ATTEMPTS = '5';
     process.env.USE_REDIS = process.env.USE_REDIS || 'true';
     process.env.USE_REDIS_CLUSTER = process.env.USE_REDIS_CLUSTER || 'false';
-    process.env.REDIS_URI = process.env.REDIS_URI || 'redis://127.0.0.1:6379';
+    // VIVENTIUM START: run the same real client contract against a private socket.
+    if (!process.env.REDIS_SOCKET_PATH) {
+      process.env.REDIS_URI = process.env.REDIS_URI || 'redis://127.0.0.1:6379';
+    }
+    // VIVENTIUM END
 
     // Clear module cache to reload module
     jest.resetModules();

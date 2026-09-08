@@ -36,6 +36,11 @@ const MemoryEntrySchema: Schema<IMemoryEntry> = new Schema({
     type: Date,
     default: undefined,
   },
+  /* === VIVENTIUM START === Atomic proof of the last admitted mutation, including deletion. === */
+  writerEffect: {
+    type: new Schema({ messageId: String, owner: String, operationId: String }, { _id: false }),
+    default: undefined,
+  },
 });
 
 MemoryEntrySchema.index(

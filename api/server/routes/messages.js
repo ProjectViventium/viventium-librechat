@@ -112,7 +112,9 @@ const sanitizeMessageForPublicResponse = (message) => {
 };
 
 const sanitizeMessageForRead = (message) => {
-  const normalizedMessage = normalizeHistoricalVoiceMessageForRead(message);
+  // The shared reader projects memory state; keep database identity fields out of HTTP reads.
+  const { _id, __v, user: _user, ...readableMessage } = message ?? {};
+  const normalizedMessage = normalizeHistoricalVoiceMessageForRead(readableMessage);
   const publicMessage = sanitizeMessageForPublicResponse(normalizedMessage);
   if (!publicMessage || !Array.isArray(publicMessage.content)) {
     return publicMessage;
@@ -372,7 +374,7 @@ router.post('/artifact/:messageId', async (req, res) => {
         messageId,
         [targetPath]: updatedText,
       },
-      { context: 'POST /api/messages/artifact/:messageId' },
+      { context: 'POST /api/messages/artifact/:messageId', operationKind: 'edit' },
     );
 
     res.status(200).json(
@@ -392,7 +394,7 @@ router.post('/artifact/:messageId', async (req, res) => {
 router.get('/:conversationId', validateMessageReq, async (req, res) => {
   try {
     const { conversationId } = req.params;
-    const messages = await getMessages({ conversationId }, '-_id -__v -user');
+    const messages = await getMessages({ conversationId, user: req.user.id });
     res.status(200).json(sanitizeMessagesForRead(messages));
   } catch (error) {
     logger.error('Error fetching messages:', error);
@@ -406,7 +408,7 @@ router.post('/:conversationId', validateMessageReq, async (req, res) => {
     const savedMessage = await saveMessage(
       req,
       sanitizeMessageForPublicResponse({ ...message, user: req.user.id }),
-      { context: 'POST /api/messages/:conversationId' },
+      { context: 'POST /api/messages/:conversationId', operationKind: 'edit' },
     );
     if (!savedMessage) {
       return res.status(400).json({ error: 'Message not saved' });
@@ -422,7 +424,7 @@ router.post('/:conversationId', validateMessageReq, async (req, res) => {
 router.get('/:conversationId/:messageId', validateMessageReq, async (req, res) => {
   try {
     const { conversationId, messageId } = req.params;
-    const message = await getMessages({ conversationId, messageId }, '-_id -__v -user');
+    const message = await getMessages({ conversationId, messageId, user: req.user.id });
     if (!message) {
       return res.status(404).json({ error: 'Message not found' });
     }
@@ -440,7 +442,11 @@ router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) =
 
     if (index === undefined) {
       const tokenCount = await countTokens(text, model);
-      const result = await updateMessage(req, { messageId, text, tokenCount });
+      const result = await updateMessage(
+        req,
+        { messageId, text, tokenCount },
+        { operationKind: 'edit' },
+      );
       return res.status(200).json(sanitizeMessageForPublicResponse(result));
     }
 
@@ -483,7 +489,7 @@ router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) =
       [`content.${index}.${currentPartType}`]: text,
       tokenCount,
     };
-    const result = await updateMessage(req, targetedUpdate);
+    const result = await updateMessage(req, targetedUpdate, { operationKind: 'edit' });
     return res.status(200).json(sanitizeMessageForPublicResponse(result));
   } catch (error) {
     logger.error('Error updating message:', error);
@@ -502,7 +508,7 @@ router.put('/:conversationId/:messageId/feedback', validateMessageReq, async (re
         messageId,
         feedback: feedback || null,
       },
-      { context: 'updateFeedback' },
+      { context: 'updateFeedback', operationKind: 'system' },
     );
 
     res.json({
@@ -518,8 +524,8 @@ router.put('/:conversationId/:messageId/feedback', validateMessageReq, async (re
 
 router.delete('/:conversationId/:messageId', validateMessageReq, async (req, res) => {
   try {
-    const { messageId } = req.params;
-    await deleteMessages({ messageId });
+    const { messageId, conversationId } = req.params;
+    await deleteMessages({ messageId, conversationId, user: req.user.id });
     res.status(204).send();
   } catch (error) {
     logger.error('Error deleting message:', error);

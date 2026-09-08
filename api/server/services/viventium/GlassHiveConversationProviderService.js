@@ -1,3 +1,4 @@
+const { configuredBackgroundWorkerRoute } = require('@librechat/api');
 /* === VIVENTIUM START ===
  * Feature: GlassHive core-provider capability projection
  * Purpose: Attach a signed, Agent-declared MCP broker bundle to an authenticated harness request
@@ -6,8 +7,23 @@
 
 const { Constants, extractEnvVariable } = require('librechat-data-provider');
 const crypto = require('crypto');
+const {
+  transcriptionAttachmentReferences,
+  resolveSelectedHistoryAttachments,
+} = require('@librechat/api');
+const { getMessages, getFiles } = require('~/models');
 const { logger } = require('@librechat/data-schemas');
 const { primeFiles } = require('~/app/clients/tools/util/fileSearch');
+const { getEndpointsConfig } = require('~/server/services/Config/getEndpointsConfig');
+const {
+  MAIN_DELEGATION_PROFILES,
+  isConversationOrchestrationTool,
+} = require('./GlassHiveConversationOrchestration');
+const {
+  projectTrustedClientPresentation,
+  projectTrustedNativeInteractionHeaders,
+} = require('./interactionContext');
+const { trustedUploadedFilesFromRequestBody } = require('./GlassHiveSourceSelection');
 const {
   enforceRestrictedVoiceRequest,
   isVoiceActorSideEffectRestricted,
@@ -19,8 +35,16 @@ const {
  * cancellation delivery failures within one small background budget.
  * === VIVENTIUM END === */
 const HARNESS_CANCELLATION_ATTEMPT_TIMEOUT_MS = 1500;
+const MAINTENANCE_CANCELLATION_ATTEMPT_TIMEOUT_MS = 4500;
+const MAINTENANCE_CANCELLATION_TOTAL_TIMEOUT_MS = 5500;
+const MAINTENANCE_CANCELLATION_RETRY_DELAYS_MS = Object.freeze([100, 250, 500]);
 const HARNESS_CANCELLATION_RETRY_DELAYS_MS = Object.freeze([100, 300]);
 const HARNESS_CANCELLATION_RETRYABLE_STATUSES = new Set([408, 425, 429]);
+const HARNESS_CANCELLATION_ABORT_REASONS = new Set([
+  'user_cancelled',
+  'superseded',
+  'maintenance_yield',
+]);
 
 function waitForHarnessCancellationRetry(delayMs) {
   return new Promise((resolve) => {
@@ -50,36 +74,74 @@ function buildHarnessCancellationDeliveryError({ attempts, status }) {
   return error;
 }
 
-async function deliverHarnessCancellation({ url, headers, fetchImpl }) {
+async function deliverHarnessCancellation({
+  url,
+  headers,
+  fetchImpl,
+  attemptTimeoutMs = HARNESS_CANCELLATION_ATTEMPT_TIMEOUT_MS,
+  retryDelaysMs = HARNESS_CANCELLATION_RETRY_DELAYS_MS,
+  requireCapacityRelease = false,
+  totalTimeoutMs = 0,
+}) {
   let attempts = 0;
   let lastStatus = null;
+  const startedAt = Date.now();
 
-  for (let index = 0; index <= HARNESS_CANCELLATION_RETRY_DELAYS_MS.length; index += 1) {
+  for (let index = 0; index <= retryDelaysMs.length; index += 1) {
     attempts += 1;
     let response;
     try {
+      const remainingMs = totalTimeoutMs > 0 ? totalTimeoutMs - (Date.now() - startedAt) : 0;
+      if (totalTimeoutMs > 0 && remainingMs <= 0) {
+        throw buildHarnessCancellationDeliveryError({ attempts, status: lastStatus });
+      }
       response = await fetchImpl(url, {
         method: 'POST',
         headers,
-        signal: AbortSignal.timeout(HARNESS_CANCELLATION_ATTEMPT_TIMEOUT_MS),
+        signal: AbortSignal.timeout(
+          totalTimeoutMs > 0 ? Math.min(attemptTimeoutMs, remainingMs) : attemptTimeoutMs,
+        ),
       });
     } catch (_) {
       response = null;
     }
 
-    if (response?.ok) {
-      return;
+    if (response?.ok && !requireCapacityRelease) {
+      return { acknowledged: true };
+    }
+    let capacityReleasePending = false;
+    if (response?.ok && requireCapacityRelease) {
+      let body = null;
+      try {
+        body = await response.json();
+      } catch (_) {
+        body = null;
+      }
+      if (body?.capacityReleased === true) {
+        return { acknowledged: true, capacityReleased: true };
+      }
+      capacityReleasePending = true;
     }
 
     const numericStatus = Number(response?.status);
-    lastStatus = Number.isInteger(numericStatus) && numericStatus > 0 ? numericStatus : null;
-    if (
-      !isRetryableHarnessCancellationStatus(lastStatus) ||
-      index === HARNESS_CANCELLATION_RETRY_DELAYS_MS.length
-    ) {
+    lastStatus = capacityReleasePending
+      ? 425
+      : Number.isInteger(numericStatus) && numericStatus > 0
+        ? numericStatus
+        : null;
+    if (!isRetryableHarnessCancellationStatus(lastStatus) || index === retryDelaysMs.length) {
       throw buildHarnessCancellationDeliveryError({ attempts, status: lastStatus });
     }
-    await waitForHarnessCancellationRetry(HARNESS_CANCELLATION_RETRY_DELAYS_MS[index]);
+    const remainingBeforeDelay =
+      totalTimeoutMs > 0 ? totalTimeoutMs - (Date.now() - startedAt) : retryDelaysMs[index];
+    if (totalTimeoutMs > 0 && remainingBeforeDelay <= 0) {
+      throw buildHarnessCancellationDeliveryError({ attempts, status: lastStatus });
+    }
+    await waitForHarnessCancellationRetry(
+      totalTimeoutMs > 0
+        ? Math.min(retryDelaysMs[index], remainingBeforeDelay)
+        : retryDelaysMs[index],
+    );
   }
 }
 
@@ -271,56 +333,76 @@ function bindHarnessCancellation({
     return true;
   }
   boundBaseURLs.add(cancelBaseURL);
-  signal.addEventListener(
-    'abort',
-    () => {
-      if (req._viventiumHarnessCancellationActiveBaseURL !== cancelBaseURL) {
-        return;
-      }
-      const fallbackIdempotencyKey =
-        String(req._viventiumHarnessIdempotencyKey || '').trim() ||
-        buildHarnessAttemptIdempotencyKey(req, req.body?.responseMessageId);
-      const configuredKeys =
-        req._viventiumHarnessIdempotencyKeys instanceof Set
-          ? Array.from(req._viventiumHarnessIdempotencyKeys)
-          : Array.isArray(req._viventiumHarnessIdempotencyKeys)
-            ? req._viventiumHarnessIdempotencyKeys
-            : [];
-      const cancelIdempotencyKeys = Array.from(
-        new Set(
-          (configuredKeys.length > 0 ? configuredKeys : [fallbackIdempotencyKey])
-            .map((key) => String(key || '').trim())
-            .filter(Boolean),
-        ),
-      );
-      if (
-        signal.reason !== 'user_cancelled' ||
-        cancelIdempotencyKeys.length === 0 ||
-        !cancelOwnerId ||
-        typeof fetchImpl !== 'function'
-      ) {
-        return;
-      }
-      for (const cancelIdempotencyKey of cancelIdempotencyKeys) {
-        void deliverHarnessCancellation({
+  const deliverCancellation = () => {
+    if (req._viventiumHarnessCancellationActiveBaseURL !== cancelBaseURL) {
+      return;
+    }
+    const fallbackIdempotencyKey =
+      String(req._viventiumHarnessIdempotencyKey || '').trim() ||
+      buildHarnessAttemptIdempotencyKey(req, req.body?.responseMessageId);
+    const configuredKeys =
+      req._viventiumHarnessIdempotencyKeys instanceof Set
+        ? Array.from(req._viventiumHarnessIdempotencyKeys)
+        : Array.isArray(req._viventiumHarnessIdempotencyKeys)
+          ? req._viventiumHarnessIdempotencyKeys
+          : [];
+    const cancelIdempotencyKeys = Array.from(
+      new Set(
+        (configuredKeys.length > 0 ? configuredKeys : [fallbackIdempotencyKey])
+          .map((key) => String(key || '').trim())
+          .filter(Boolean),
+      ),
+    );
+    if (
+      !HARNESS_CANCELLATION_ABORT_REASONS.has(signal.reason) ||
+      cancelIdempotencyKeys.length === 0 ||
+      !cancelOwnerId ||
+      typeof fetchImpl !== 'function'
+    ) {
+      return;
+    }
+    const maintenanceYield = signal.reason === 'maintenance_yield';
+    const deliveries = cancelIdempotencyKeys.map(async (cancelIdempotencyKey) => {
+      try {
+        return await deliverHarnessCancellation({
           url: `${cancelBaseURL}/requests/by-idempotency/${encodeURIComponent(cancelIdempotencyKey)}/cancel`,
           headers: {
             Authorization: `Bearer ${cancelApiKey}`,
             'X-Viventium-User-Id': cancelOwnerId,
           },
           fetchImpl,
-        }).catch((error) => reportHarnessCancellationDeliveryError(onDeliveryError, error));
+          ...(maintenanceYield
+            ? {
+                attemptTimeoutMs: MAINTENANCE_CANCELLATION_ATTEMPT_TIMEOUT_MS,
+                retryDelaysMs: MAINTENANCE_CANCELLATION_RETRY_DELAYS_MS,
+                requireCapacityRelease: true,
+                totalTimeoutMs: MAINTENANCE_CANCELLATION_TOTAL_TIMEOUT_MS,
+              }
+            : {}),
+        });
+      } catch (error) {
+        reportHarnessCancellationDeliveryError(onDeliveryError, error);
+        return {
+          acknowledged: false,
+          errorCode: String(error?.code || 'HARNESS_CANCELLATION_DELIVERY_FAILED'),
+          status: Number(error?.status) || null,
+        };
       }
-    },
-    { once: true },
-  );
+    });
+    req._viventiumHarnessCancellationDeliveryPromise = Promise.all(deliveries).then((outcomes) => ({
+      acknowledged: outcomes.every((outcome) => outcome?.acknowledged === true),
+      outcomes,
+    }));
+  };
+  if (signal.aborted) deliverCancellation();
+  else signal.addEventListener('abort', deliverCancellation, { once: true });
   return true;
 }
 
 function declaredMcpServerNames(agent, excludedServers = []) {
   const excluded = new Set((excludedServers || []).map((value) => String(value || '').trim()));
   const serverNames = new Set();
-  for (const tool of agent?.tools || []) {
+  for (const tool of agent?.declaredToolNames ?? agent?.tools ?? []) {
     if (typeof tool !== 'string') {
       continue;
     }
@@ -341,16 +423,7 @@ function declaredMcpServerNames(agent, excludedServers = []) {
  * Purpose: Project only host tools that survived the common Agent initialization seam. This is
  * capability/resource state, never provider-name, prompt-text, or user-entity matching.
  * === VIVENTIUM END === */
-function resolvedHostToolNames(targetAgent, capability = {}) {
-  if (capability.host_tools_transport !== 'broker_mcp') {
-    return [];
-  }
-  const permitted = new Set(
-    (capability.host_tools || []).map((value) => String(value || '').trim()).filter(Boolean),
-  );
-  if (permitted.size === 0) {
-    return [];
-  }
+function resolvedAgentToolNameSet(targetAgent) {
   const resolved = new Set();
   if (targetAgent?.toolRegistry instanceof Map) {
     for (const name of targetAgent.toolRegistry.keys()) {
@@ -369,9 +442,52 @@ function resolvedHostToolNames(targetAgent, capability = {}) {
       resolved.add(String(name).trim());
     }
   }
+  return resolved;
+}
+
+function resolvedHostToolNames(targetAgent, capability = {}) {
+  if (capability.host_tools_transport !== 'broker_mcp') {
+    return [];
+  }
+  const permitted = new Set(
+    (capability.host_tools || []).map((value) => String(value || '').trim()).filter(Boolean),
+  );
+  if (permitted.size === 0) {
+    return [];
+  }
+  const resolved = resolvedAgentToolNameSet(targetAgent);
   return Array.from(permitted)
     .filter((name) => resolved.has(name))
     .sort();
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Conversation-lane orchestration projection.
+ * Purpose: Resolve only canonical Core facades from Main's initialized tools. These names remain
+ * separate from ordinary host tools so durable mission roots cannot inherit peer authority.
+ * === VIVENTIUM END === */
+function resolvedConversationOrchestrationToolNames(targetAgent, capability = {}) {
+  if (
+    targetAgent?.glasshive_options?.orchestration?.parallel_available !== true ||
+    capability.workspace_binding !== true ||
+    capability.host_tools_transport !== 'broker_mcp'
+  ) {
+    return [];
+  }
+  const resolved = resolvedAgentToolNameSet(targetAgent);
+  return Array.from(
+    new Set(
+      (capability.conversation_orchestration_tools || [])
+        .map((value) => String(value || '').trim())
+        .filter(isConversationOrchestrationTool),
+    ),
+  )
+    .filter((name) => resolved.has(name))
+    .sort();
+}
+
+function configuredConversationOrchestrationWorkerRoute(agent) {
+  return configuredBackgroundWorkerRoute(agent);
 }
 
 function configuredBrokerHostTools(providerCapabilities = {}) {
@@ -583,12 +699,23 @@ function applyCapabilityBrokerUnavailableInstructions(targetAgent, unavailable =
   return boundary;
 }
 
-const hostToolRequiresResources = (toolName) => toolName === 'file_search';
+const hostToolRequiresResources = (toolName) =>
+  ['file_search', 'transcribe_audio'].includes(toolName);
 
-async function resolvedHostToolResources(targetAgent, allowedHostTools = [], req) {
+async function resolvedHostToolResources(
+  targetAgent,
+  allowedHostTools = [],
+  req,
+  uploadedFiles = [],
+) {
   const resources = {};
   const toolResources = targetAgent?.tool_resources || {};
   for (const toolName of allowedHostTools) {
+    if (toolName === 'transcribe_audio') {
+      const files = transcriptionAttachmentReferences(uploadedFiles);
+      if (files.length) resources.transcribe_audio = { files };
+      continue;
+    }
     if (toolName !== 'file_search') {
       continue;
     }
@@ -608,11 +735,44 @@ async function resolvedHostToolResources(targetAgent, allowedHostTools = [], req
   return resources;
 }
 
-async function resolveHostToolCapabilityState({ targetAgent, capability, req } = {}) {
-  const allowedHostTools = resolvedHostToolNames(targetAgent, capability);
+async function resolveHostToolCapabilityState({
+  targetAgent,
+  declarationSource = targetAgent,
+  capability,
+  req,
+  uploadedFiles = [],
+} = {}) {
+  let allowedHostTools = resolvedHostToolNames(targetAgent, capability);
+  if (capability?.worker_native_tools === true || capability?.native_tools === true) {
+    // Native execution deliberately omits ordinary tool binding. Resolve the original
+    // participant declarations against the same endpoint capability gate as ToolService.
+    const endpoints = await getEndpointsConfig(req);
+    const enabled = new Set(endpoints?.agents?.capabilities ?? []);
+    allowedHostTools = resolvedHostToolNames(
+      {
+        tools: declarationSource?.declaredToolNames ?? declarationSource?.tools,
+      },
+      capability,
+    ).filter((name) => enabled.has(name));
+  }
+  // Selected conversation attachments are a declared native capability, independent of semantic routing.
+  if (
+    capability?.workspace_binding === true &&
+    capability?.host_tools_transport === 'broker_mcp' &&
+    capability.host_tools?.includes('transcribe_audio') &&
+    !allowedHostTools.includes('transcribe_audio') &&
+    transcriptionAttachmentReferences(uploadedFiles).length > 0
+  ) {
+    allowedHostTools.push('transcribe_audio');
+  }
   let hostToolResources = {};
   try {
-    hostToolResources = await resolvedHostToolResources(targetAgent, allowedHostTools, req);
+    hostToolResources = await resolvedHostToolResources(
+      targetAgent,
+      allowedHostTools,
+      req,
+      uploadedFiles,
+    );
   } catch (error) {
     logger.warn('[VIVENTIUM][glasshive-capability-broker] Host tool resource priming failed', {
       message: error?.message,
@@ -668,6 +828,18 @@ async function attachConversationProviderCapabilityBundle({
   if (!targetAgent || capability?.workspace_binding !== true) {
     return false;
   }
+  const modelParameters = { ...(targetAgent.model_parameters || {}) };
+  const configuration = { ...(modelParameters.configuration || {}) };
+  configuration.defaultHeaders = projectTrustedNativeInteractionHeaders(
+    req,
+    configuration.defaultHeaders,
+  );
+  if (
+    Object.keys(configuration.defaultHeaders).length > 0 ||
+    modelParameters.configuration?.defaultHeaders
+  ) {
+    targetAgent.model_parameters = { ...modelParameters, configuration };
+  }
   /* === VIVENTIUM START ===
    * Feature: Participant-owned capability parity across provider fallback routes.
    * Purpose: The fallback route declares provider identity, while the owning participant declares
@@ -680,16 +852,49 @@ async function attachConversationProviderCapabilityBundle({
     mcpCapabilitySource,
     capability.excluded_mcp_servers,
   );
+  const trustedRequestBody = projectTrustedClientPresentation(requestBody, req);
+  const currentUploads = trustedUploadedFilesFromRequestBody(trustedRequestBody);
+  const historyUploads =
+    capability.workspace_binding === true
+      ? await resolveSelectedHistoryAttachments(
+          {
+            userId: String(req?.user?.id || req?.user?._id || ''),
+            conversationId: trustedRequestBody.conversationId,
+            parentMessageId: trustedRequestBody.parentMessageId,
+          },
+          { getMessages, getFiles },
+        )
+      : [];
+  // Preserve current source inputs; selected history enriches only the signed file/capability view.
+  const uploadedFiles = Array.from(
+    new Map(
+      trustedUploadedFilesFromRequestBody({ files: [...currentUploads, ...historyUploads] }).map(
+        (file) => [file.file_id || file.filename, file],
+      ),
+    ).values(),
+  );
   const hostToolCapabilityState = await resolveHostToolCapabilityState({
     targetAgent: capabilitySourceAgent,
+    declarationSource: mcpCapabilitySource,
     capability,
     req,
+    uploadedFiles,
   });
+  const allowedConversationOrchestrationTools = resolvedConversationOrchestrationToolNames(
+    mcpCapabilitySource,
+    capability,
+  );
+  const workerRoute = configuredConversationOrchestrationWorkerRoute(mcpCapabilitySource);
   const unavailableInstructions = applyHostEvidenceBoundaryInstructions(
     targetAgent,
     hostToolCapabilityState.unavailableHostTools,
   );
-  if (allowedServerNames.length === 0 && hostToolCapabilityState.authorizedHostTools.length === 0) {
+  if (
+    allowedServerNames.length === 0 &&
+    hostToolCapabilityState.authorizedHostTools.length === 0 &&
+    allowedConversationOrchestrationTools.length === 0 &&
+    uploadedFiles.length === 0
+  ) {
     setConversationProviderInstructionAppend(targetAgent, unavailableInstructions);
     return false;
   }
@@ -702,10 +907,49 @@ async function attachConversationProviderCapabilityBundle({
   try {
     bundle = await buildConversationProviderBootstrapBundle({
       user: req?.user,
-      requestBody,
+      requestBody: trustedRequestBody,
       allowedServerNames,
       allowedHostTools: hostToolCapabilityState.authorizedHostTools,
       hostToolResources: hostToolCapabilityState.hostToolResources,
+      ...(allowedConversationOrchestrationTools.length > 0
+        ? { allowedConversationOrchestrationTools, ...workerRoute }
+        : {}),
+      ...(req?._viventiumGlassHiveWorkerMemory !== undefined
+        ? { workerMemory: req._viventiumGlassHiveWorkerMemory }
+        : {}),
+      ...(req?._viventiumGlassHiveWorkerFeelings !== undefined
+        ? { workerFeelings: req._viventiumGlassHiveWorkerFeelings }
+        : {}),
+      ...(req?._viventiumGlassHiveWorkerFeelingsEnabled !== undefined
+        ? { workerFeelingsEnabled: req._viventiumGlassHiveWorkerFeelingsEnabled === true }
+        : {}),
+      ...(req?._viventiumGlassHiveWorkerFeelingsHash !== undefined
+        ? { workerFeelingsHash: req._viventiumGlassHiveWorkerFeelingsHash }
+        : {}),
+      ...(req?._viventiumGlassHiveWorkerFeelingsScope !== undefined
+        ? { workerFeelingsScope: req._viventiumGlassHiveWorkerFeelingsScope }
+        : {}),
+      ...(req?._viventiumGlassHiveWorkerFeelingsRangePromptOverrideCount !== undefined
+        ? {
+            workerFeelingsRangePromptOverrideCount:
+              req._viventiumGlassHiveWorkerFeelingsRangePromptOverrideCount,
+          }
+        : {}),
+      ...(req?._viventiumGlassHiveWorkerFeelingsActiveRangePromptOverrideCount !== undefined
+        ? {
+            workerFeelingsActiveRangePromptOverrideCount:
+              req._viventiumGlassHiveWorkerFeelingsActiveRangePromptOverrideCount,
+          }
+        : {}),
+      ...(req?._viventiumGlassHiveWorkerFeelingsActiveRangePromptOverrideChars !== undefined
+        ? {
+            workerFeelingsActiveRangePromptOverrideChars:
+              req._viventiumGlassHiveWorkerFeelingsActiveRangePromptOverrideChars,
+          }
+        : {}),
+      ...(req?._viventiumGlassHiveCapabilityDependency !== undefined
+        ? { capabilityDependency: req._viventiumGlassHiveCapabilityDependency }
+        : {}),
     });
   } catch (error) {
     logger.warn('[VIVENTIUM][glasshive-capability-broker] Provider bundle build failed', {
@@ -725,6 +969,11 @@ async function attachConversationProviderCapabilityBundle({
     setConversationProviderInstructionAppend(targetAgent, unavailableInstructions);
     return false;
   }
+  // The signed ledger carries only current upload IDs and safe metadata. GlassHive resolves
+  // original bytes under this authenticated owner's storage root, never a request-supplied path.
+  if (uploadedFiles.length > 0) {
+    bundle = { ...bundle, viventium_upload_context: { selected_uploads: uploadedFiles } };
+  }
   if (!bundle || Object.keys(bundle).length === 0) {
     const brokerUnavailableInstructions = applyCapabilityBrokerUnavailableInstructions(
       targetAgent,
@@ -736,14 +985,33 @@ async function attachConversationProviderCapabilityBundle({
     );
     return false;
   }
+  return attachConversationProviderBootstrapBundle({
+    targetAgent,
+    bundle,
+    unavailableInstructions,
+    req,
+  });
+}
+
+function attachConversationProviderBootstrapBundle({
+  targetAgent,
+  bundle,
+  unavailableInstructions = '',
+  req,
+}) {
+  const modelParameters = { ...(targetAgent.model_parameters || {}) };
+  const configuration = { ...(modelParameters.configuration || {}) };
+  if (req)
+    configuration.defaultHeaders = projectTrustedNativeInteractionHeaders(
+      req,
+      configuration.defaultHeaders,
+    );
   const capabilityInstructions = [
     String(bundle.conversation_provider_instructions || '').trim(),
     unavailableInstructions,
   ]
     .filter(Boolean)
     .join('\n\n');
-  const modelParameters = { ...(targetAgent.model_parameters || {}) };
-  const configuration = { ...(modelParameters.configuration || {}) };
   const defaultHeaders = { ...(configuration.defaultHeaders || {}) };
   const encodedBundle = Buffer.from(JSON.stringify(bundle), 'utf8').toString('base64');
   const issuedAt = String(Math.floor(Date.now() / 1000));
@@ -778,10 +1046,13 @@ async function attachConversationProviderCapabilityBundle({
   configuration.defaultHeaders = defaultHeaders;
   modelParameters.configuration = configuration;
   targetAgent.model_parameters = modelParameters;
+  // Server-owned observer stays outside the signed/serialized model input and is closed by its run.
+  req?._viventiumCortexToolEvidence?.observeGrant(bundle.glasshive_capability_broker?.grant_id);
   return true;
 }
 
 module.exports = {
+  attachConversationProviderBootstrapBundle,
   applyHostEvidenceBoundaryInstructions,
   applyCapabilityBrokerUnavailableInstructions,
   attachDeclaredConversationProviderCapabilityBundle,
@@ -791,11 +1062,13 @@ module.exports = {
   buildHarnessAgentIdempotencyKeys,
   buildHarnessAttemptIdempotencyKey,
   configuredBrokerHostTools,
+  configuredConversationOrchestrationWorkerRoute,
   buildHarnessIdempotencyKey,
   declaredMcpServerNames,
   installConversationProviderCapabilityRefresher,
   resolveHostToolCapabilityState,
   resolvedHostToolNames,
+  resolvedConversationOrchestrationToolNames,
   resolvedHostToolResources,
   resolveConversationProviderId,
   setConversationProviderCapability,

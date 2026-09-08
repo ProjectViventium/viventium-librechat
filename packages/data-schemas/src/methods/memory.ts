@@ -27,6 +27,21 @@ const formatDate = (date: Date): string => {
 
 // Factory function that takes mongoose instance and returns the methods
 export function createMemoryMethods(mongoose: typeof import('mongoose')) {
+  async function requireRunningAdmission(
+    userId: t.SetMemoryParams['userId'],
+    effect: t.SetMemoryParams['writerEffect'],
+    expectedRevision: t.SetMemoryParams['expectedRevision'],
+  ): Promise<void> {
+    if (!effect) {
+      return;
+    }
+    if (expectedRevision === undefined || !effect.operationId || !(await mongoose.models.Message.exists({
+      user: String(userId), messageId: effect.messageId, deletedAt: null,
+      'savedMemoryWrite.owner': effect.owner, 'savedMemoryWrite.status': 'running',
+    }))) {
+      throw new Error('Saved-memory admission is no longer running or lacks a revision guard');
+    }
+  }
   /* === VIVENTIUM NOTE ===
    * Feature: Guardrail for destructive `moments` rewrites
    *
@@ -207,8 +222,10 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
     value,
     tokenCount = 0,
     expectedRevision,
+    writerEffect,
   }: t.SetMemoryParams): Promise<t.MemoryResult> {
     try {
+      await requireRunningAdmission(userId, writerEffect, expectedRevision);
       if (key?.toLowerCase() === 'nothing') {
         return { ok: false };
       }
@@ -274,8 +291,14 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
             value: finalValue,
             tokenCount,
             updated_at: updatedAt,
+            writerEffect,
           });
-          return { ok: true, updatedAt: created.updated_at, revision: Number(created.__v ?? 0) };
+          return {
+            ok: true,
+            changed: true,
+            updatedAt: created.updated_at,
+            revision: Number(created.__v ?? 0),
+          };
         } catch (error) {
           if ((error as { code?: number })?.code === 11000) {
             const current = await MemoryEntry.findOne({ userId, key }).lean();
@@ -301,8 +324,8 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
         updated = await MemoryEntry.findOneAndUpdate(
           updateFilter,
           {
-            $set: { value: finalValue, tokenCount, updated_at: updatedAt },
-            $unset: { deletedAt: 1 },
+            $set: { value: finalValue, tokenCount, updated_at: updatedAt, ...(writerEffect ? { writerEffect } : {}) },
+            $unset: { deletedAt: 1, ...(!writerEffect ? { writerEffect: 1 } : {}) },
             $inc: { __v: 1 },
           },
           { upsert: !revisionProtected, new: true, setDefaultsOnInsert: true },
@@ -312,8 +335,8 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
           updated = await MemoryEntry.findOneAndUpdate(
             { userId, key },
             {
-              $set: { value: finalValue, tokenCount, updated_at: updatedAt },
-              $unset: { deletedAt: 1 },
+              $set: { value: finalValue, tokenCount, updated_at: updatedAt, ...(writerEffect ? { writerEffect } : {}) },
+              $unset: { deletedAt: 1, ...(!writerEffect ? { writerEffect: 1 } : {}) },
               $inc: { __v: 1 },
             },
             { new: true },
@@ -336,6 +359,10 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
         ok: true,
         updatedAt: updated.updated_at,
         revision: Number(updated.__v ?? 0),
+        // The successful CAS binds this comparison to the exact prior stored value.
+        ...(revisionProtected
+          ? { changed: !existing || Boolean(existing.deletedAt) || existing.value !== finalValue }
+          : {}),
       };
     } catch (error) {
       throw new Error(
@@ -351,8 +378,10 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
     userId,
     key,
     expectedRevision,
+    writerEffect,
   }: t.DeleteMemoryParams): Promise<t.MemoryResult> {
     try {
+      await requireRunningAdmission(userId, writerEffect, expectedRevision);
       const MemoryEntry = mongoose.models.MemoryEntry;
       const filter: Record<string, unknown> = { userId, key, deletedAt: null };
       if (expectedRevision !== undefined) {
@@ -374,7 +403,8 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
       const result = await MemoryEntry.findOneAndUpdate(
         filter,
         {
-          $set: { value: '', tokenCount: 0, deletedAt: new Date(), updated_at: new Date() },
+          $set: { value: '', tokenCount: 0, deletedAt: new Date(), updated_at: new Date(), ...(writerEffect ? { writerEffect } : {}) },
+          ...(!writerEffect ? { $unset: { writerEffect: 1 } } : {}),
           $inc: { __v: 1 },
         },
         { new: true },
@@ -446,6 +476,7 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
           { _id: source._id, userId, key, deletedAt: null, ...revisionFilter },
           {
             $set: { value, tokenCount, updated_at: new Date() },
+            $unset: { writerEffect: 1 },
             $inc: { __v: 1 },
           },
           { new: true },
@@ -494,7 +525,7 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
             },
             {
               $set: { value, tokenCount, updated_at: destinationUpdatedAt, __v: nextRevision },
-              $unset: { deletedAt: 1 },
+              $unset: { deletedAt: 1, writerEffect: 1 },
             },
             { new: true },
           );
@@ -544,6 +575,7 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
               deletedAt: destination?.deletedAt || new Date(),
               updated_at: new Date(),
             },
+            $unset: { writerEffect: 1 },
             $inc: { __v: 1 },
           },
           { new: true },
@@ -559,6 +591,7 @@ export function createMemoryMethods(mongoose: typeof import('mongoose')) {
           { _id: source._id, userId, key, deletedAt: null, ...revisionFilter },
           {
             $set: { value: '', tokenCount: 0, deletedAt: new Date(), updated_at: new Date() },
+            $unset: { writerEffect: 1 },
             $inc: { __v: 1 },
           },
           { new: true },

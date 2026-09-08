@@ -1,4 +1,5 @@
 const fs = require('fs');
+const express = require('express');
 const request = require('supertest');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const mongoose = require('mongoose');
@@ -32,6 +33,11 @@ jest.mock('~/config', () => ({
   }),
 }));
 
+// Server routing tests do not start the independent durable-response recovery loop.
+jest.mock('~/server/services/viventium/nativeResponseService', () => ({
+  installNativeResponseRecovery: jest.fn().mockResolvedValue(undefined),
+}));
+
 describe('Server Configuration', () => {
   // Increase the default timeout to allow for Mongo cleanup
   /* === VIVENTIUM START ===
@@ -44,6 +50,8 @@ describe('Server Configuration', () => {
 
   let mongoServer;
   let app;
+  let server;
+  let listenSpy;
 
   /** Mocked fs.readFileSync for index.html */
   const originalReadFileSync = fs.readFileSync;
@@ -85,10 +93,16 @@ describe('Server Configuration', () => {
     });
     process.env.MONGO_URI = mongoServer.getUri();
     process.env.PORT = '0'; // Use a random available port
+    const originalListen = express.application.listen;
+    listenSpy = jest.spyOn(express.application, 'listen').mockImplementation(function (...args) {
+      server = originalListen.apply(this, args);
+      return server;
+    });
     app = require('~/server');
 
     // Wait for the app to be healthy
     await healthCheckPoll(app);
+    listenSpy.mockRestore();
   });
 
   afterAll(async () => {
@@ -98,6 +112,11 @@ describe('Server Configuration', () => {
      * Added: 2026-02-06
      */
     try {
+      listenSpy?.mockRestore();
+      if (server) {
+        server.closeAllConnections();
+        await new Promise((resolve) => server.close(resolve));
+      }
       if (mongoServer) {
         await mongoServer.stop();
       }

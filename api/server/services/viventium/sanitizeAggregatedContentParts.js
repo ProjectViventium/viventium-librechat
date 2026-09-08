@@ -20,8 +20,20 @@ const { normalizeTextContentParts } = require('./normalizeTextContentParts');
  * @param {unknown} contentParts
  * @returns {unknown}
  */
-function sanitizeAggregatedContentParts(contentParts) {
+function sanitizeAggregatedContentParts(contentParts, { preserveIndices = false } = {}) {
   if (!Array.isArray(contentParts)) {
+    return contentParts;
+  }
+
+  // The streaming SDK keeps a run-step -> array-index map. Compact only after
+  // streaming ends; removing a suppressed/empty slot mid-stream splits later text.
+  if (preserveIndices) {
+    for (let index = 0; index < contentParts.length; index += 1) {
+      const normalized = normalizeTextContentParts(
+        filterMalformedContentParts([contentParts[index]]),
+      );
+      contentParts[index] = normalized[0];
+    }
     return contentParts;
   }
 

@@ -13,12 +13,17 @@ async function _getResponse<T>(url: string, options?: AxiosRequestConfig): Promi
   return await axios.get(url, { ...options });
 }
 
-async function _post(url: string, data?: any) {
+/* === VIVENTIUM START ===
+ * Permit scoped Axios request options without changing other request deadlines.
+ */
+async function _post(url: string, data?: any, options?: AxiosRequestConfig) {
   const response = await axios.post(url, JSON.stringify(data), {
+    ...options,
     headers: { 'Content-Type': 'application/json' },
   });
   return response.data;
 }
+/* === VIVENTIUM END === */
 
 async function _postMultiPart(url: string, formData: FormData, options?: AxiosRequestConfig) {
   const response = await axios.post(url, formData, {
@@ -64,8 +69,12 @@ async function _patch(url: string, data?: any) {
 let isRefreshing = false;
 let failedQueue: { resolve: (value?: any) => void; reject: (reason?: any) => void }[] = [];
 
+/* === VIVENTIUM START ===
+ * A session check must settle so the existing auth retry lifecycle can recover.
+ */
 const refreshToken = (retry?: boolean): Promise<t.TRefreshTokenResponse | undefined> =>
-  _post(endpoints.refreshToken(retry));
+  _post(endpoints.refreshToken(retry), undefined, { timeout: 15_000 });
+/* === VIVENTIUM END === */
 
 const dispatchTokenUpdatedEvent = (token: string) => {
   setTokenHeader(token);
@@ -98,6 +107,13 @@ if (typeof window !== 'undefined') {
       if (originalRequest.url?.includes('/api/auth/logout') === true) {
         return Promise.reject(error);
       }
+      /* === VIVENTIUM START ===
+       * A rejected refresh must settle its waiting requests, never join its own queue.
+       */
+      if (originalRequest.url?.split('?')[0] === endpoints.refreshToken()) {
+        return Promise.reject(error);
+      }
+      /* === VIVENTIUM END === */
 
       /** Skip refresh when the Authorization header has been cleared (e.g. during logout),
        *  but allow shared link requests to proceed so auth recovery/redirect can happen */
@@ -127,10 +143,7 @@ if (typeof window !== 'undefined') {
         isRefreshing = true;
 
         try {
-          const response = await refreshToken(
-            // Handle edge case where we get a blank screen if the initial 401 error is from a refresh token request
-            originalRequest.url?.includes('api/auth/refresh') === true ? true : false,
-          );
+          const response = await refreshToken();
 
           const token = response?.token ?? '';
 

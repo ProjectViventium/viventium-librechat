@@ -57,7 +57,11 @@ For live external facts, use verified test context only.
 
 ## Scheduled Run Context (Deterministic)
 {{scheduled_run_context}}"""
-prompt_contract.render_scheduler_run_envelope = lambda context: (
+prompt_contract.SCHEDULED_RUN_CONTEXT_HEADER = "## Scheduled Run Context (Deterministic)"
+prompt_contract.SCHEDULED_RUN_CONTEXT_PLACEHOLDER = "{{scheduled_run_context}}"
+prompt_contract.load_scheduler_prompts = lambda: {}
+prompt_contract.render_scheduler_prompt = lambda prompt_id, *, prompts=None: "Synthetic scheduler dispatch contract."
+prompt_contract.render_scheduler_run_envelope = lambda context, *, prompts=None: (
     prompt_contract.SCHEDULER_RUN_ENVELOPE_TEMPLATE.replace(
         "{{scheduled_run_context}}", str(context).strip()
     )

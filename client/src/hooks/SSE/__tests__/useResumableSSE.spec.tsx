@@ -8,7 +8,13 @@ import { buildSubmissionFromResumeState } from '~/hooks/SSE/useResumeOnLoad';
 import { Constants, ContentTypes, QueryKeys, request } from 'librechat-data-provider';
 import { queueTitleGeneration } from '~/data-provider';
 import type { Dispatch, ReactNode, SetStateAction } from 'react';
-import type { Agents, EventSubmission, TConversation, TMessage } from 'librechat-data-provider';
+import type {
+  Agents,
+  EventSubmission,
+  TConversation,
+  TMessage,
+  TSubmission,
+} from 'librechat-data-provider';
 
 const mockErrorHandler = jest.fn();
 let mockActiveJobIds: string[] = [];
@@ -304,6 +310,88 @@ describe('useResumableSSE', () => {
     expect(screen.getByTestId('stream-mounted')).toBeInTheDocument();
     expect(screen.queryByTestId('route-mismatch')).not.toBeInTheDocument();
     expect(mockSSEInstances.at(-1)?.close).not.toHaveBeenCalled();
+  });
+
+  it('resumes the accepted stream instead of replaying a new-chat submission after route remount', async () => {
+    let resolveStart:
+      | ((receipt: {
+          streamId: string;
+          conversationId: string;
+          logical_turn_id: string;
+          revision: number;
+        }) => void)
+      | undefined;
+    (request.post as jest.Mock).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveStart = resolve;
+      }),
+    );
+    const initialSubmission = createSubmission();
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+      },
+    });
+
+    const StreamMount = ({
+      submission,
+      setConversation,
+      setSubmission,
+    }: {
+      submission: TSubmission | null;
+      setConversation: Dispatch<SetStateAction<TConversation | null>>;
+      setSubmission: Dispatch<SetStateAction<TSubmission | null>>;
+    }) => {
+      useResumableSSE(submission, {
+        ...chatHelpers,
+        setConversation,
+        setSubmission,
+      });
+      return <div data-testid="remounted-stream" />;
+    };
+
+    const RouteBoundChat = () => {
+      const { conversationId = '' } = useParams();
+      const [conversation, setConversation] = useState<TConversation | null>({
+        conversationId: String(Constants.NEW_CONVO),
+      } as TConversation);
+      const [submission, setSubmission] = useState<TSubmission | null>(initialSubmission);
+
+      return conversation?.conversationId === conversationId ? (
+        <StreamMount
+          key={conversationId}
+          submission={submission}
+          setConversation={setConversation}
+          setSubmission={setSubmission}
+        />
+      ) : (
+        <div data-testid="remount-route-mismatch" />
+      );
+    };
+
+    render(
+      <MemoryRouter initialEntries={[`/c/${Constants.NEW_CONVO}`]}>
+        <QueryClientProvider client={queryClient}>
+          <Routes>
+            <Route path="/c/:conversationId" element={<RouteBoundChat />} />
+          </Routes>
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+
+    await act(async () => {
+      resolveStart?.({
+        streamId: 'stream-remount',
+        conversationId: 'conversation-remount',
+        logical_turn_id: 'turn-remount',
+        revision: 1,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('remounted-stream')).toBeInTheDocument();
+    });
+    expect(request.post).toHaveBeenCalledTimes(1);
   });
 
   it('does not reclaim the canonical route after the user leaves during generation start', async () => {

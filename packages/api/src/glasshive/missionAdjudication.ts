@@ -10,6 +10,15 @@
  * === VIVENTIUM END === */
 
 import * as crypto from 'crypto';
+import {
+  GLASSHIVE_NATIVE_MEDIA_MAX_BYTES,
+  GLASSHIVE_NATIVE_MEDIA_MAX_IMAGES,
+  normalizeGlassHiveNativeMedia,
+} from './nativeMedia';
+import type { GlassHiveNativeMedia } from './nativeMedia';
+import { normalizeGlassHiveRunInput } from './missionInput';
+import type { GlassHiveRunInput } from './missionInput';
+import { evidenceId, legacyEvidenceId } from './missionEvidenceIdentity';
 
 import type { Logger } from 'winston';
 import type { ClientSession, Model } from 'mongoose';
@@ -77,6 +86,8 @@ export interface GlassHiveMissionCallbackBody {
   callback_ts?: string;
   work_state?: string;
   work_terminal?: boolean;
+  native_media?: unknown;
+  run_input?: unknown;
   full_message?: string;
   message?: string;
   failure_code?: string;
@@ -119,6 +130,8 @@ export interface GlassHiveMissionEvidence {
   surface: string;
   destinations: GlassHiveMissionDestination[];
   evidence: string;
+  nativeMedia?: GlassHiveNativeMedia;
+  runInput?: GlassHiveRunInput;
   state: string;
   attempts: number;
   createdAt: Date;
@@ -192,6 +205,7 @@ interface CallbackDeliverySummary {
   enqueued?: number;
   unresolved?: number;
   deferredToMain?: boolean;
+  linkedWebCommitted?: boolean;
 }
 
 export interface GlassHiveMissionAdjudicationDependencies {
@@ -218,7 +232,11 @@ export interface GlassHiveMissionAdjudicationDependencies {
   ) => Promise<{ message?: string } | null>;
   getAgent: (input: { id: string }) => Promise<MissionAgent | null>;
   getAppConfig: (input: { role?: string }) => Promise<object>;
-  createCortexFollowUpMessage: (input: object) => Promise<MissionFollowUp>;
+  prepareCortexFollowUpMessage: (input: object) => Promise<RuntimeRecord>;
+  persistPreparedCortexFollowUpMessage: (
+    input: object,
+    prepared: RuntimeRecord,
+  ) => Promise<MissionFollowUp>;
   isGlassHiveWorkTerminalCallback: (body: GlassHiveMissionCallbackBody) => boolean;
   recordGlassHiveAdjudicationOutcome: (input: object) => Promise<object | null>;
   recordOrchestrationTraceDelivery: (input: object) => Promise<object | null>;
@@ -226,7 +244,7 @@ export interface GlassHiveMissionAdjudicationDependencies {
     userId: string;
     conversationId: string;
   }) => Promise<{ callSessionId?: string } | null>;
-  sanitizeGlassHiveCallbackText: (value: string | undefined, options: { maxLength: number }) => string;
+  sanitizeGlassHiveCallbackText: (value: string | undefined, options: { maxLength: number; ownerResult?: boolean }) => string;
   deferGlassHiveTerminalCallbackAfterCommit: (operation: () => void) => boolean;
   runGlassHiveTerminalCallbackTransaction: <T>(
     operation: (session: ClientSession) => T | Promise<T>,
@@ -248,7 +266,8 @@ export function createGlassHiveMissionAdjudicationService(
     saveConvo,
     getAgent,
     getAppConfig,
-    createCortexFollowUpMessage,
+    prepareCortexFollowUpMessage,
+    persistPreparedCortexFollowUpMessage,
     isGlassHiveWorkTerminalCallback,
     recordGlassHiveAdjudicationOutcome,
     recordOrchestrationTraceDelivery,
@@ -306,48 +325,17 @@ function timestamp(value: unknown): number | null {
   return Number.isFinite(result) ? result : null;
 }
 
-function legacyEvidenceId(body: GlassHiveMissionCallbackBody = {}): string {
-  const callbackId = safeText(body.callback_id, 160);
-  if (callbackId) return callbackId;
-  return `ghe_${crypto
-    .createHash('sha256')
-    .update(
-      [body.origin_ref, body.work_ref, body.worker_id, body.run_id, body.event, body.callback_ts]
-        .map((value) => safeText(value, 4096))
-        .join('\0'),
-    )
-    .digest('hex')
-    .slice(0, 32)}`;
-}
-
-function evidenceId({
-  ownerId,
-  originRef,
-  body = {},
-}: {
-  ownerId: string;
-  originRef: string;
-  body?: GlassHiveMissionCallbackBody;
-}): string {
-  // A GlassHive callback id is stable within its producer, but it is not a global tenant-scoped
-  // identity. Hash it with the verified Core owner/origin so one tenant cannot suppress another
-  // tenant's terminal evidence by reusing the same vendor callback id.
-  return `ghe_${crypto
-    .createHash('sha256')
-    .update([safeText(ownerId, 160), safeText(originRef, 160), legacyEvidenceId(body)].join('\0'))
-    .digest('hex')
-    .slice(0, 32)}`;
-}
-
 function terminalEvidence(body: GlassHiveMissionCallbackBody = {}): string {
   const event = safeText(body.event, 64);
   if (!['run.completed', 'run.failed'].includes(event)) return '';
   if (!isGlassHiveWorkTerminalCallback(body)) return '';
   const full = sanitizeGlassHiveCallbackText(body.full_message, {
     maxLength: MAX_EVIDENCE_CHARS,
+    ownerResult: true,
   });
   const preview = sanitizeGlassHiveCallbackText(body.message, {
     maxLength: MAX_EVIDENCE_CHARS,
+    ownerResult: true,
   });
   const text = full || preview;
   if (text) return text;
@@ -499,6 +487,8 @@ async function persistGlassHiveMissionEvidence({
     workTerminal: body.work_terminal === true,
   } as RuntimeRecord);
   const callbackReference = terminalCallbackReference(effectFence);
+  const nativeMedia = normalizeGlassHiveNativeMedia(body.native_media, safeText(body.run_id, 160));
+  const runInput = normalizeGlassHiveRunInput(body.run_input, safeText(body.run_id, 160));
   const row: GlassHiveMissionEvidence = {
     _id: id,
     evidenceId: id,
@@ -517,6 +507,8 @@ async function persistGlassHiveMissionEvidence({
     surface: normalizedSurface(binding),
     destinations: safeDestinations(binding),
     evidence,
+    ...(nativeMedia ? { nativeMedia } : {}),
+    ...(runInput ? { runInput } : {}),
     state: 'pending',
     attempts: 0,
     createdAt: now,
@@ -739,8 +731,28 @@ async function reconcilePartialGroupPins(pending: RuntimeRecord[]): Promise<void
 async function pinPendingAdjudicationGroups(pending: RuntimeRecord[]): Promise<RuntimeRecord[]> {
   await reconcilePartialGroupPins(pending);
   const groups = new Map<string, RuntimeRecord[]>();
+  const mediaBudgets = new Map<string, { batch: number; images: number; bytes: number }>();
   for (const row of pending) {
-    const key = safeText(row.adjudicationGroupId, 160) || `new:${coalescingGroupKey(row)}`;
+    let key = safeText(row.adjudicationGroupId, 160);
+    if (!key) {
+      const scope = coalescingGroupKey(row);
+      const budget = mediaBudgets.get(scope) || { batch: 0, images: 0, bytes: 0 };
+      const media = normalizeGlassHiveNativeMedia(row.nativeMedia, safeText(row.runId, 160));
+      const images = media?.observations.length || 0;
+      const bytes = media?.observations.reduce((sum, item) => sum + item.bytes, 0) || 0;
+      if (
+        budget.images + images > GLASSHIVE_NATIVE_MEDIA_MAX_IMAGES ||
+        budget.bytes + bytes > GLASSHIVE_NATIVE_MEDIA_MAX_BYTES
+      ) {
+        budget.batch += 1;
+        budget.images = 0;
+        budget.bytes = 0;
+      }
+      budget.images += images;
+      budget.bytes += bytes;
+      mediaBudgets.set(scope, budget);
+      key = `new:${scope}:${budget.batch}`;
+    }
     groups.set(key, [...(groups.get(key) || []), row]);
   }
   const prepared: RuntimeRecord[] = [];
@@ -833,7 +845,7 @@ function scopedPredecessorFilter(rows: RuntimeRecord[], groupId: string): Runtim
     conversationId: first.conversationId,
     anchorMessageId: first.anchorMessageId,
     adjudicationGroupId: { $ne: groupId },
-    state: { $ne: 'superseded' },
+    state: { $nin: ['superseded', 'silent'] },
     ...(created.length > 0 ? { createdAt: { $lt: new Date(Math.min(...created)) } } : {}),
   };
 }
@@ -1102,26 +1114,30 @@ async function pinMissionDeliveryParent(
   return deliveryParentMessageId;
 }
 
-async function synthesizeGroup(
+function groupFollowUpInput(
   rows: RuntimeRecord[],
   { target, authorContext }: RuntimeRecord,
-): Promise<RuntimeRecord> {
+): RuntimeRecord {
   // The owner-wide timer opens one coalescing window. Keep conversation/surface boundaries safe,
   // and anchor the combined continuation to the latest mission turn within that destination.
   const { req, agent } = authorContext;
-  return createCortexFollowUpMessage({
+  return {
     req,
     conversationId: target.conversationId,
     parentMessageId: target.parentMessageId,
     deliveryParentMessageId: target.deliveryParentMessageId,
+    runId: adjudicationGroupId(rows),
     agent,
     insightsData: {
       insights: rows.map((row) => ({
         cortexName: 'Mission evidence',
         insight: row.evidence,
+        ...(row.nativeMedia ? { nativeMedia: row.nativeMedia } : {}),
+        ...(row.runInput ? { runInput: row.runInput } : {}),
         maxPromptChars: 12_000,
         authority: {
           kind: 'durable_terminal_callback',
+          runId: safeText(row.runId, 160),
           event: safeText(row.event, 64),
           workState: safeText(
             row.workState || (row.event === 'run.completed' ? 'completed' : 'failed'),
@@ -1135,7 +1151,40 @@ async function synthesizeGroup(
     recentResponse: '',
     forceVisibleFollowUp: true,
     allowMovedOnUsefulFollowUp: true,
-  });
+  };
+}
+
+async function prepareGroupSynthesis(
+  rows: RuntimeRecord[],
+  context: RuntimeRecord,
+): Promise<RuntimeRecord> {
+  return prepareCortexFollowUpMessage(groupFollowUpInput(rows, context));
+}
+
+async function persistPreparedGroupSynthesis(
+  rows: RuntimeRecord[],
+  context: RuntimeRecord,
+  prepared: RuntimeRecord,
+): Promise<RuntimeRecord> {
+  const followUp = await persistPreparedCortexFollowUpMessage(
+    groupFollowUpInput(rows, context),
+    prepared,
+  );
+  if (followUp?.messageId) {
+    const session = mongoose.transactionAsyncLocalStorage?.getStore()?.session;
+    const persisted = await mongoose.connection.collection('messages').findOne({
+      user: safeText(rows[rows.length - 1].ownerId, 160),
+      conversationId: safeText(context.target?.conversationId, 160),
+      messageId: safeText(followUp.messageId, 160),
+      isCreatedByUser: false,
+    }, session ? { session } : undefined);
+    if (!persisted || persisted.text !== followUp.text) {
+      throw Object.assign(new Error('mission_authored_message_not_persisted'), {
+        code: 'mission_authored_message_not_persisted',
+      });
+    }
+  }
+  return followUp;
 }
 
 async function ensureAccountContinuationConversation({
@@ -1224,7 +1273,35 @@ async function reconcilePersistedGroupFollowUp(
   const persistedAuthoredAt = persistedRows
     .map((row) => timestamp(row.authoredAt))
     .find((value) => value != null);
-  const authoredAt = persistedAuthoredAt == null ? new Date() : new Date(persistedAuthoredAt);
+  // An ID left by an aborted message transaction is not a committed authored result.
+  if (!text || persistedAuthoredAt == null) {
+    await Promise.all(rows.map((row) => collection().updateOne(
+      { _id: row._id, state: 'processing', followUpMessageId: messageId },
+      { $unset: { followUpMessageId: '', followUpText: '', authoredAt: '' } },
+    )));
+    for (const row of rows) {
+      delete row.followUpMessageId;
+      delete row.followUpText;
+      delete row.authoredAt;
+    }
+    return null;
+  }
+  const authoredAt = new Date(persistedAuthoredAt);
+  const representative = persistedRows[persistedRows.length - 1];
+  const session = mongoose.transactionAsyncLocalStorage?.getStore()?.session;
+  const persistedMessage = await mongoose.connection.collection('messages').findOne({
+    user: safeText(representative.ownerId, 160),
+    conversationId: safeText(
+      representative.accountContinuationConversationId || representative.conversationId, 160,
+    ),
+    messageId,
+    isCreatedByUser: false,
+  }, session ? { session } : undefined);
+  if (!persistedMessage || safeText(persistedMessage.text, MAX_EVIDENCE_CHARS) !== text) {
+    throw Object.assign(new Error('mission_authored_message_unavailable'), {
+      code: 'mission_authored_message_unavailable',
+    });
+  }
 
   for (const row of rows) {
     if (safeText(row.followUpMessageId, 160) === messageId) continue;
@@ -1287,11 +1364,34 @@ async function persistAuthoredFollowUp(
   );
 }
 
+async function markSettledCallbackStatusInternal(row: RuntimeRecord): Promise<void> {
+  const reference = persistedTerminalCallbackReference(row);
+  if (!reference || row.event !== 'run.completed' || row.workState !== 'completed') return;
+  const session = mongoose.transactionAsyncLocalStorage?.getStore()?.session;
+  await mongoose.connection.collection('messages').updateOne(
+    {
+      user: safeText(row.ownerId, 160),
+      conversationId: safeText(row.conversationId, 160),
+      isCreatedByUser: false,
+      'metadata.viventium.type': 'glasshive_worker_callback',
+      'metadata.viventium.originRef': safeText(row.originRef, 160),
+      'metadata.viventium.runId': safeText(row.runId, 160),
+      'metadata.viventium.callbackId': reference.callbackId,
+      'metadata.viventium.status.kind': 'mission_status',
+      'metadata.viventium.status.state': 'completed',
+      'metadata.viventium.hasFullText': false,
+    },
+    { $set: { 'metadata.viventium.visibility': 'internal' } },
+    session ? { session } : undefined,
+  );
+}
+
 async function recordMainWebPresentationDelivery({
   row,
   followUp,
+  linkedTextFallback = false,
 }: RuntimeRecord): Promise<unknown> {
-  if (safeText(row?.surface, 32) !== 'web' || !followUp?.messageId) return null;
+  if ((safeText(row?.surface, 32) !== 'web' && !linkedTextFallback) || !followUp?.messageId) return null;
   const traceIdentity = exactTraceIdentity(row);
   if (!traceIdentity || row.workTerminal !== true) return null;
   const messageId = safeText(followUp.messageId, 160);
@@ -1345,6 +1445,12 @@ async function enqueueMainAuthoredFollowUpDelivery({
 }: RuntimeRecord): Promise<RuntimeRecord | null> {
   if (!followUp?.messageId) return null;
   const traceIdentity = exactTraceIdentity(row);
+  const destinations = Array.isArray(deliveryContext.destinations)
+    ? deliveryContext.destinations
+    : Array.isArray(row.destinations) ? row.destinations : [];
+  const hasCommittedWebPresentation =
+    safeText(row.webPresentationMessageId, 160) === safeText(followUp.messageId, 160) &&
+    timestamp(row.webPresentedAt) != null;
   const summary = await enqueueGlassHiveCallbackDelivery({
     body: {
       callback_id: traceIdentity?.callbackRef || `main:${row.originRef}:${followUp.messageId}`,
@@ -1372,11 +1478,9 @@ async function enqueueMainAuthoredFollowUpDelivery({
             traceSurface: safeText(row.surface, 32),
           }
         : {}),
-      destinations: Array.isArray(deliveryContext.destinations)
-        ? deliveryContext.destinations
-        : Array.isArray(row.destinations)
-          ? row.destinations
-          : [],
+      destinations: hasCommittedWebPresentation && !destinations.some(
+        (destination: RuntimeRecord) => ['librechat', 'workbench'].includes(safeText(destination.surface, 32)),
+      ) ? [...destinations, { surface: 'librechat' }] : destinations,
       ...(deliveryContext.workerCompletionPresentation
         ? { workerCompletionPresentation: deliveryContext.workerCompletionPresentation }
         : {}),
@@ -1390,6 +1494,14 @@ async function enqueueMainAuthoredFollowUpDelivery({
     throw Object.assign(new Error('mission_surface_delivery_unresolved'), {
       code: 'mission_surface_delivery_unresolved',
     });
+  }
+  const durablyEnqueued = Number(summary?.configured) > 0 &&
+    Number(summary?.enqueued) > 0 && Number(summary?.unresolved || 0) === 0;
+  if (hasCommittedWebPresentation && (summary?.linkedWebCommitted === true || durablyEnqueued)) {
+    await collection().updateOne(
+      { _id: row._id, ownerId: row.ownerId, webPresentationMessageId: followUp.messageId },
+      { $set: { webProjectionReconciledAt: new Date() } },
+    );
   }
   return summary;
 }
@@ -1440,11 +1552,10 @@ async function mainFollowUpDeliveryContext({
   });
   if (!activeCall?.callSessionId) {
     return {
-      destinations: destinations.map((destination: RuntimeRecord) =>
-        safeText(destination?.surface, 32) === 'voice'
-          ? { surface: 'voice', unresolvedReason: 'voice_active_session_not_bound' }
-          : destination,
+      destinations: destinations.filter(
+        (destination: RuntimeRecord) => safeText(destination?.surface, 32) !== 'voice',
       ),
+      linkedTextFallback: true,
     };
   }
   const responseText = safeText(followUp?.text, MAX_EVIDENCE_CHARS);
@@ -1497,21 +1608,63 @@ async function flushGlassHiveMissionAdjudications({
   };
   for (const rows of groups.values()) {
     let followUp: RuntimeRecord | null = null;
+    let authoredCommitted = false;
+    let target: RuntimeRecord | null = null;
+    let authorContext: RuntimeRecord | null = null;
+    let preparedFollowUp: RuntimeRecord | null = null;
     let stage = 'resolve_target';
     try {
-      const completedState = await runFencedMissionTransaction(rows, async () => {
+      stage = 'preflight';
+      await runFencedMissionTransaction(rows, async () => {
         followUp = await reconcilePersistedGroupFollowUp(rows);
-        const target = await resolveMissionContinuationTarget(rows);
-        let authorContext = null;
+        target = await resolveMissionContinuationTarget(rows);
+      });
+      authoredCommitted = Boolean((followUp as RuntimeRecord | null)?.messageId);
+      if (!followUp) {
+        stage = 'load_main_author';
+        authorContext = await loadMainAuthorContext(rows[rows.length - 1]);
+        stage = 'prepare_synthesis';
+        preparedFollowUp = await prepareGroupSynthesis(rows, { target, authorContext });
+        if (preparedFollowUp?.followUpDecisionRecord?.generationFailed === true) {
+          throw Object.assign(new Error('mission_synthesis_generation_failed'), {
+            code: 'mission_synthesis_generation_failed',
+          });
+        }
+      }
+      const authoredState = await runFencedMissionTransaction(rows, async () => {
+        followUp = await reconcilePersistedGroupFollowUp(rows);
+        target = await resolveMissionContinuationTarget(rows);
         if (!followUp) {
-          stage = 'load_main_author';
-          authorContext = await loadMainAuthorContext(rows[rows.length - 1]);
-          stage = 'synthesize';
-          followUp = await synthesizeGroup(rows, { target, authorContext });
+          if (!authorContext || !preparedFollowUp) {
+            throw Object.assign(new Error('mission_prepared_follow_up_unavailable'), {
+              code: 'mission_prepared_follow_up_unavailable',
+            });
+          }
+          stage = 'persist_prepared_synthesis';
+          followUp = await persistPreparedGroupSynthesis(
+            rows,
+            { target, authorContext },
+            preparedFollowUp,
+          );
           stage = 'persist_authored_follow_up';
           await persistAuthoredFollowUp(rows, followUp);
         }
         if (!followUp?.messageId) {
+          const decision = preparedFollowUp?.followUpDecisionRecord;
+          if (
+            decision?.generationFailed === false &&
+            decision?.forceVisibleFollowUp === false &&
+            decision?.llmResult === 'nta' &&
+            decision?.selectedStrategy === 'no_response_suppressed'
+          ) {
+            // Preserve Main's explicit semantic decision through the same
+            // accepted-result fence; absent or failed generation stays retryable.
+            stage = 'settle_silent_callback_presentation';
+            await Promise.all(rows.map(markSettledCallbackStatusInternal));
+            stage = 'finish_silent';
+            await finishRows(rows, { state: 'silent' });
+            return 'silent';
+          }
           throw Object.assign(new Error('mission_terminal_presentation_missing'), {
             code: 'mission_terminal_presentation_missing',
           });
@@ -1522,10 +1675,30 @@ async function flushGlassHiveMissionAdjudications({
           stage = 'persist_account_continuation';
           await ensureAccountContinuationConversation({ target, authorContext, followUp });
         }
-        stage = 'record_web_presentation';
-        await Promise.all(rows.map((row) => recordMainWebPresentationDelivery({ row, followUp })));
-        stage = 'enqueue_surface_delivery';
+        return 'authored';
+      });
+      if (authoredState === 'silent') {
+        summary.silent += rows.length;
+        continue;
+      }
+      // A receiver/configuration failure must not roll back the already authored answer.
+      // Both phases retain the same accepted callback fence; delivery reuses the committed ID.
+      authoredCommitted = true;
+      const completedState = await runFencedMissionTransaction(rows, async () => {
+        if (!followUp?.messageId) {
+          throw Object.assign(new Error('mission_authored_message_unavailable'), {
+            code: 'mission_authored_message_unavailable',
+          });
+        }
+        stage = 'settle_callback_presentation';
+        await Promise.all(rows.map(markSettledCallbackStatusInternal));
+        stage = 'resolve_surface_delivery';
         const deliveryContext = await mainFollowUpDeliveryContext({ rows, followUp, target });
+        stage = 'record_web_presentation';
+        await Promise.all(rows.map((row) => recordMainWebPresentationDelivery({
+          row, followUp, linkedTextFallback: deliveryContext.linkedTextFallback === true,
+        })));
+        stage = 'enqueue_surface_delivery';
         await enqueueMainAuthoredFollowUpDelivery({
           row: rows[rows.length - 1],
           followUp,
@@ -1568,8 +1741,9 @@ async function flushGlassHiveMissionAdjudications({
         stage,
         code: errorCode,
       });
-      const failedFollowUp = followUp as RuntimeRecord | null;
-      const exhausted = rows.every((row) => Number(row.attempts || 0) >= MAX_ADJUDICATION_ATTEMPTS);
+      const failedFollowUp = authoredCommitted ? followUp as RuntimeRecord | null : null;
+      const exhausted = !failedFollowUp?.messageId &&
+        rows.every((row) => Number(row.attempts || 0) >= MAX_ADJUDICATION_ATTEMPTS);
       let failedState = 'failed';
       if (exhausted) failedState = 'deadletter';
       else if (failedFollowUp?.messageId) failedState = 'delivery_pending';
@@ -1578,7 +1752,8 @@ async function flushGlassHiveMissionAdjudications({
         followUpMessageId: safeText(failedFollowUp?.messageId, 160),
         errorCode: exhausted ? 'mission_adjudication_retry_exhausted' : errorCode,
         preserveFollowUpMessageIds:
-          runtimeError.code === 'mission_adjudication_group_follow_up_conflict',
+          runtimeError.code === 'mission_adjudication_group_follow_up_conflict' ||
+          (!authoredCommitted && rows.some((row) => safeText(row.followUpMessageId, 160))),
       });
       summary.failed += rows.length;
     }
@@ -1707,6 +1882,37 @@ async function redriveLegacyDeletedOriginMissionAdjudications({
 async function reconcilePendingGlassHiveMissionAdjudications({
   limit = 100,
 }: Pick<GlassHiveMissionLimitInput, 'limit'> = {}): Promise<GlassHiveMissionReconciliationSummary> {
+  // Repair only retained committed Web presentations; never regenerate their answer.
+  const completedPresentations = await collection().find({
+    state: 'completed',
+    webPresentedAt: { $type: 'date' },
+    webPresentationMessageId: { $type: 'string', $ne: '' },
+    webProjectionReconciledAt: { $exists: false },
+    $or: [{ webProjectionNextAttemptAt: null }, { webProjectionNextAttemptAt: { $lte: new Date() } }],
+  }).sort({ webProjectionNextAttemptAt: 1, updatedAt: 1 }).limit(Math.max(1, Math.min(Number(limit) || 100, 500))).toArray();
+  for (const row of completedPresentations) {
+    // Advance the scan even when a legacy row has no usable presentation proof.
+    await collection().updateOne(
+      { _id: row._id, ownerId: row.ownerId, state: 'completed' },
+      { $set: { webProjectionNextAttemptAt: new Date(Date.now() + 30_000) } },
+    );
+    try {
+      await runFencedMissionTransaction([row], async () => {
+        const followUp = await reconcilePersistedGroupFollowUp([row]);
+        if (!followUp || followUp.messageId !== row.webPresentationMessageId) return;
+        const target = {
+          conversationId: row.accountContinuationConversationId || row.conversationId,
+          parentMessageId: row.accountContinuationAnchorMessageId || row.anchorMessageId,
+        };
+        const deliveryContext = await mainFollowUpDeliveryContext({ rows: [row], followUp, target });
+        await enqueueMainAuthoredFollowUpDelivery({ row, followUp, target, deliveryContext });
+      });
+    } catch (error) {
+      logger.warn('[VIVENTIUM][glasshive-adjudication] Web delivery projection recovery deferred', {
+        code: safeText((error as RuntimeError).code || 'web_delivery_projection_unavailable', 120),
+      });
+    }
+  }
   const legacyRedrive = await redriveLegacyDeletedOriginMissionAdjudications({ limit });
   if (legacyRedrive.redriven > 0) {
     logger.info('[VIVENTIUM][glasshive-adjudication] Recovered legacy delivery-parent rows', {
@@ -1719,6 +1925,10 @@ async function reconcilePendingGlassHiveMissionAdjudications({
         { state: 'pending' },
         { state: 'failed', nextAttemptAt: { $lte: new Date() } },
         { state: 'delivery_pending', nextAttemptAt: { $lte: new Date() } },
+        // Retained authored deliveries use the same recovery owner and attempt history.
+        // Preflight distinguishes a committed answer from a rolled-back pointer before delivery.
+        { state: 'deadletter', followUpMessageId: { $type: 'string', $ne: '' },
+          updatedAt: { $lte: new Date(Date.now() - 60_000) } },
         { state: 'processing', processingAt: { $lte: new Date(Date.now() - 5 * 60_000) } },
       ],
     })

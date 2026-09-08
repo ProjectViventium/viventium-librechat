@@ -15,6 +15,27 @@ if str(ROOT) not in sys.path:
 from scheduling_cortex import dispatch
 
 
+def test_pre_admission_wait_does_not_stream_or_deliver_an_error(monkeypatch):
+    monkeypatch.setenv('VIVENTIUM_SCHEDULER_SECRET', 'synthetic-secret')
+    task = {'id': 'task', 'user_id': 'owner', 'agent_id': 'agent', 'schedule': {'type': 'interval'},
+            'channel': 'librechat', 'conversation_policy': 'same', 'conversation_id': 'conversation',
+            '_scheduled_prompt_occurrence_key': 'same-occurrence'}
+    with patch.object(dispatch, '_compose_prompt', return_value='Authored goal'), \
+         patch.object(dispatch, '_build_scheduled_run_context', return_value={}), \
+         patch.object(dispatch, '_post_json', return_value={
+             'deferred': True, 'reason': 'conversation_session_authority_conflict',
+             'conversationId': 'conversation',
+         }) as post, \
+         patch.object(dispatch, '_stream_scheduler_response') as stream, \
+         patch.object(dispatch, 'scheduled_failure_result') as failure:
+        result = dispatch.dispatch_task(task)
+    assert result == {'deferred': True, 'reason': 'conversation_session_authority_conflict',
+                      'conversation_id': 'conversation'}
+    stream.assert_not_called()
+    failure.assert_not_called()
+    assert post.call_args.args[1]['idempotencyKey'] == 'same-occurrence'
+
+
 @pytest.mark.parametrize(
     ("failure_class", "retryable"),
     [

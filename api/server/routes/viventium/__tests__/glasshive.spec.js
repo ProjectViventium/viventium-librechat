@@ -493,6 +493,86 @@ describe('/api/viventium/glasshive/callback', () => {
     }
   });
 
+  test.each(['run.started', 'run.cancelled', 'run.completed'])(
+    'accepts %s for an unbound parent only through its canonical call session',
+    async (event) => {
+      const {
+        createVoiceTask,
+        getVoiceTaskByStreamId,
+      } = require('~/server/services/viventium/VoiceTaskService');
+      const parent = createVoiceTask({
+        callSessionId: 'call-first-use',
+        userId: 'user-1',
+        conversationId: 'new',
+        streamId: 'voice-first-use',
+      });
+      const app = createTestApp(require('../glasshive'));
+      const body = callbackBody({
+        surface: 'voice',
+        voice_call_session_id: 'call-first-use',
+        voice_request_id: 'voice-first-use',
+        run_id: 'run-first-use',
+        event,
+        ...(event === 'run.started' ? { message: '' } : {}),
+      });
+      const res = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(body) },
+          body,
+        }),
+        res,
+      );
+      expect(res.statusCode).toBeLessThan(300);
+      expect(getVoiceTaskByStreamId('glasshive:run-first-use')).toMatchObject({
+        callSessionId: 'call-first-use',
+        conversationId: 'conv-1',
+        parentTaskId: parent.taskId,
+      });
+    },
+  );
+
+  test.each([
+    { userId: 'other-user', conversationId: 'new' },
+    { callSessionId: 'other-call', conversationId: 'new' },
+    { conversationId: 'other-conversation' },
+  ])('keeps mismatched parent identity fenced: %j', async (mismatch) => {
+    const {
+      createVoiceTask,
+      getVoiceTaskByStreamId,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    createVoiceTask({
+      callSessionId: 'call-first-use',
+      userId: 'user-1',
+      conversationId: 'new',
+      streamId: 'voice-first-use',
+      ...mismatch,
+    });
+    const app = createTestApp(require('../glasshive'));
+    const body = callbackBody({
+      surface: 'voice',
+      voice_call_session_id: 'call-first-use',
+      voice_request_id: 'voice-first-use',
+      run_id: 'run-first-use',
+      event: 'run.started',
+    });
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({ error: 'voice_task_session_mismatch' });
+    expect(getVoiceTaskByStreamId('glasshive:run-first-use')).toBeNull();
+  });
+
   test('rejects signed voice callback session mismatch and ignores reordered terminal replay', async () => {
     const {
       createVoiceTask,
@@ -1072,6 +1152,210 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(res.body.error).toBe('invalid_signature');
     expect(mockSaveMessage).not.toHaveBeenCalled();
   });
+
+  test.each([
+    ['run.needs_input', 'failure_code'],
+    ['run.needs_input', 'failure_class'],
+    ['run.blocked', 'failure_code'],
+    ['run.blocked', 'failure_class'],
+  ])(
+    'gives an exact reconnect action for nonterminal %s callbacks with structured %s',
+    async (event, failureField) => {
+      const router = require('../glasshive');
+      const app = createTestApp(router);
+      const body = callbackBody({
+        callback_id: `cb_${event.replaceAll('.', '_')}_reconnect_required_${failureField}`,
+        event,
+        message: 'Internal provider detail that must not be shown.',
+        [failureField]: 'provider_connected_account_reconnect_required',
+      });
+      const req = createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      });
+      const res = createMockRes();
+
+      await dispatch(app, req, res);
+
+      expect(res.statusCode).toBe(200);
+      const [, message] = mockSaveMessage.mock.calls[0];
+      expect(message.text).toBe(
+        'Reconnect the required model provider account in Settings > Account > Connected Accounts, then resume this mission.',
+      );
+      expect(message.text).not.toContain(body.message);
+    },
+  );
+
+  test('appends the sanitized failure_user_message reason to the needs_input notice', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_needs_input_failure_user_message',
+      event: 'run.needs_input',
+      message: 'Internal provider detail that must not be shown.',
+      failure_code: 'provider_progress_stalled',
+      failure_user_message: `The provider stopped responding for worker wrk_abc123 while writing ${syntheticLocalPath(
+        'private',
+        'report.md',
+      )}.`,
+      failure_recommended_recovery: 'Resume the mission once the provider is available again.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toBe(
+      'Mission needs user input. The provider stopped responding for worker [worker id] while writing [local path].',
+    );
+    expect(message.content[0].text).toBe(message.text);
+    expect(message.text).not.toContain(body.message);
+    expect(message.text).not.toContain('wrk_abc123');
+    expect(message.text).not.toContain(syntheticLocalPath());
+    expect(message.metadata.viventium.status).toEqual({
+      kind: 'mission_status',
+      state: 'needs_input',
+      attention: 'input',
+    });
+  });
+
+  test.each([
+    ['blank', '   '],
+    ['non-string', ['not', 'a', 'string']],
+  ])('keeps the bare needs_input notice for a %s failure_user_message', async (_label, value) => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: `cb_needs_input_failure_user_message_${_label}`,
+      event: 'run.needs_input',
+      message: 'Internal provider detail that must not be shown.',
+      failure_user_message: value,
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toBe('Mission needs user input.');
+  });
+
+  test('keeps the exact reconnect action ahead of a failure_user_message reason', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_needs_input_reconnect_with_reason',
+      event: 'run.needs_input',
+      message: 'Internal provider detail that must not be shown.',
+      failure_code: 'provider_connected_account_reconnect_required',
+      failure_user_message: 'The provider account token expired.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toBe(
+      'Reconnect the required model provider account in Settings > Account > Connected Accounts, then resume this mission.',
+    );
+    expect(message.text).not.toContain(body.failure_user_message);
+  });
+
+  test('preserves terminal failure wording for reconnect-required failures', async () => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_failed_reconnect_required',
+      event: 'run.failed',
+      message: 'Internal provider detail that must not be shown.',
+      failure_code: 'provider_connected_account_reconnect_required',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.text).toBe('Mission needs attention.');
+    expect(message.text).not.toContain(body.message);
+  });
+
+  test.each([
+    [
+      'array failure code',
+      callbackBody({
+        callback_id: 'cb_needs_input_array_reconnect_code',
+        event: 'run.needs_input',
+        message: 'Internal provider detail that must not be shown.',
+        failure_code: ['provider_connected_account_reconnect_required'],
+      }),
+      'invalid_callback_failure_metadata',
+    ],
+    [
+      'terminal work contract',
+      callbackBody({
+        callback_id: 'cb_blocked_terminal_reconnect_code',
+        event: 'run.blocked',
+        work_state: 'needs_input',
+        work_terminal: true,
+        message: 'Internal provider detail that must not be shown.',
+        failure_code: 'provider_connected_account_reconnect_required',
+      }),
+      'invalid_nonterminal_callback_contract',
+    ],
+    [
+      'array work state',
+      callbackBody({
+        callback_id: 'cb_needs_input_array_work_state',
+        event: 'run.needs_input',
+        work_state: ['needs_input'],
+        message: 'Internal provider detail that must not be shown.',
+        failure_code: 'provider_connected_account_reconnect_required',
+      }),
+      'invalid_callback_work_state',
+    ],
+  ])(
+    'rejects malformed or terminal reconnect callback contract: %s',
+    async (_label, body, error) => {
+      const router = require('../glasshive');
+      const app = createTestApp(router);
+      const req = createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      });
+      const res = createMockRes();
+
+      await dispatch(app, req, res);
+
+      expect(res.statusCode).toBe(400);
+      expect(res.body.error).toBe(error);
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+    },
+  );
 
   test('binds callback signatures to the worker and run ids', async () => {
     const router = require('../glasshive');
@@ -1960,12 +2244,14 @@ describe('/api/viventium/glasshive/callback', () => {
     const [, message] = mockSaveMessage.mock.calls[0];
     expect(message.messageId).not.toBe('generation-placeholder');
     expect(message.parentMessageId).toBe('generation-placeholder');
+    // Without a structured `failure_user_message`, the notice stays bare; raw `message` never leaks.
     expect(message.text).toBe('Mission needs user input.');
+    expect(message.text).not.toContain(body.message);
     expect(message.unfinished).toBe(false);
     expect(message.metadata.viventium.treeParentMessageId).toBe('generation-placeholder');
   });
 
-  test('does not overwrite an unrelated active generation placeholder', async () => {
+  test('accepts terminal truth without overwriting an unrelated active generation placeholder', async () => {
     mockGetMessages.mockResolvedValueOnce([
       {
         messageId: 'user-msg',
@@ -2016,13 +2302,21 @@ describe('/api/viventium/glasshive/callback', () => {
 
     await dispatch(app, req, res);
 
-    expect(res.statusCode).toBe(425);
-    expect(res.body.error).toBe('callback_conversation_tip_not_ready');
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toEqual(
+      expect.objectContaining({ status: 'http_accepted', reason: 'conversation_tip_busy' }),
+    );
     expect(mockUpdateMessage).not.toHaveBeenCalled();
     expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockRecordGlassHiveCallbackExternalState).toHaveBeenCalledWith(
+      expect.objectContaining({ body: expect.objectContaining({ event: 'run.completed' }) }),
+    );
+    expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+      expect.objectContaining({ body: expect.objectContaining({ event: 'run.completed' }) }),
+    );
   });
 
-  test('does not overwrite an unfinished generation placeholder for failed worker callbacks', async () => {
+  test('accepts failed terminal truth without overwriting an unfinished generation placeholder', async () => {
     mockGetMessages.mockResolvedValueOnce([
       {
         messageId: 'user-msg',
@@ -2058,10 +2352,18 @@ describe('/api/viventium/glasshive/callback', () => {
 
     await dispatch(app, req, res);
 
-    expect(res.statusCode).toBe(425);
-    expect(res.body.error).toBe('callback_conversation_tip_not_ready');
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toEqual(
+      expect.objectContaining({ status: 'http_accepted', reason: 'conversation_tip_busy' }),
+    );
     expect(mockSaveMessage).not.toHaveBeenCalled();
     expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockRecordGlassHiveCallbackExternalState).toHaveBeenCalledWith(
+      expect.objectContaining({ body: expect.objectContaining({ event: 'run.failed' }) }),
+    );
+    expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+      expect.objectContaining({ body: expect.objectContaining({ event: 'run.failed' }) }),
+    );
   });
 
   test('updates one GlassHive status message instead of creating callback branches', async () => {

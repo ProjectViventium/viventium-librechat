@@ -218,6 +218,23 @@ function prepareSandpackBundler({
     throw new Error('Sandpack source runtime bytes do not match the pinned package');
   }
 
+  // A normal dev start may overlap API startup. Keep an already verified tree intact.
+  try {
+    const entries = fs.readdirSync(resolvedDestinationRoot, { recursive: true, withFileTypes: true });
+    if (!fs.lstatSync(resolvedDestinationRoot).isSymbolicLink() &&
+        entries.every((entry) => entry.isFile() || entry.isDirectory()) &&
+        entries.filter((entry) => entry.isFile()).length === files.length &&
+        treeSha256(resolvedDestinationRoot, relativePaths) === PINNED_OUTPUT_TREE_SHA256) {
+      return {
+        destinationRoot: resolvedDestinationRoot, fileCount: files.length,
+        sourceIndexSha256, outputIndexSha256: PINNED_OUTPUT_INDEX_SHA256,
+        runtimeSha256, sourceTreeSha256, outputTreeSha256: PINNED_OUTPUT_TREE_SHA256,
+      };
+    }
+  } catch (error) {
+    if (!['ENOENT', 'ENOTDIR'].includes(error.code)) throw error;
+  }
+
   fs.rmSync(resolvedDestinationRoot, { recursive: true, force: true });
   fs.mkdirSync(resolvedDestinationRoot, { recursive: true, mode: 0o755 });
   const sanitizationCounts = new Map(UPSTREAM_PATH_SANITIZATIONS.map((rule) => [rule.id, 0]));
@@ -243,7 +260,13 @@ function prepareSandpackBundler({
         changed = true;
       }
     }
-    if (changed) {
+    if (file.relativePath === 'index.html') {
+      const temporaryIndex = `${destinationPath}.preparing`;
+      fs.writeFileSync(temporaryIndex, injectOnPremEnvironment(sourceBytes.toString('utf8')), {
+        mode: 0o644,
+      });
+      fs.renameSync(temporaryIndex, destinationPath);
+    } else if (changed) {
       fs.writeFileSync(destinationPath, sourceBytes, { mode: 0o644 });
     } else {
       copyFile(file.absolutePath, destinationPath, file.relativePath);
@@ -262,9 +285,9 @@ function prepareSandpackBundler({
   if (outputIndexSha256 !== PINNED_OUTPUT_INDEX_SHA256) {
     throw new Error('Telemetry-disabled Sandpack index does not match the pinned output');
   }
-  fs.writeFileSync(path.join(resolvedDestinationRoot, 'index.html'), outputIndex, {
-    mode: 0o644,
-  });
+  if (sha256(fs.readFileSync(path.join(resolvedDestinationRoot, 'index.html'))) !== outputIndexSha256) {
+    throw new Error('Prepared Sandpack index changed before verification');
+  }
 
   assertPublicSafeRuntime(resolvedDestinationRoot, relativePaths);
   const outputTreeSha256 = treeSha256(resolvedDestinationRoot, relativePaths);

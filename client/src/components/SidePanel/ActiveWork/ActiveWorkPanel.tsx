@@ -3,16 +3,18 @@
  * Purpose: Keep durable missions visible and controllable beside the conversation that owns them.
  * === VIVENTIUM END === */
 
-import { useMemo, useRef, useState } from 'react';
+import { useMemo, useRef, useState, useEffect } from 'react';
 import { Button, Spinner, useToastContext } from '@librechat/client';
 import {
   type WorkAction,
   type WorkSummary,
+  type WorkState,
   useActiveWorkHistoryQuery,
   useActiveWorkQuery,
   useWorkActionMutation,
 } from '~/data-provider/ViventiumOrchestration';
 import { useAuthContext, useLocalize } from '~/hooks';
+import NativeWorkInput from './NativeWorkInput';
 
 const SUPPORTED_ACTIONS: WorkAction[] = [
   'queue',
@@ -44,6 +46,21 @@ const ACTION_LABELS = {
 } as const;
 
 const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled']);
+const STATE_LABELS = {
+  accepted: 'com_ui_parallel_work_state_accepted',
+  queued: 'com_ui_parallel_work_state_queued',
+  claimed: 'com_ui_parallel_work_state_starting',
+  admitted: 'com_ui_parallel_work_state_starting',
+  starting: 'com_ui_parallel_work_state_starting',
+  running: 'com_ui_parallel_work_state_running',
+  settling: 'com_ui_parallel_work_state_settling',
+  paused: 'com_ui_parallel_work_state_paused',
+  needs_input: 'com_ui_parallel_work_state_needs_input',
+  stopping: 'com_ui_parallel_work_state_stopping',
+  completed: 'com_ui_parallel_work_state_completed',
+  failed: 'com_ui_parallel_work_state_failed',
+  cancelled: 'com_ui_parallel_work_state_cancelled',
+} as const satisfies Record<WorkState, string>;
 const ATTENTION_STATES = new Set(['paused', 'needs_input']);
 
 function needsAttention(work: WorkSummary): boolean {
@@ -256,9 +273,9 @@ function terminalDeliveryLabelKey(work: WorkSummary) {
   if (!TERMINAL_STATES.has(work.state) || !work.delivery?.state) {
     return null;
   }
-  if (['delivered', 'acknowledged', 'silent'].includes(work.delivery.state)) {
-    if (work.state === 'failed') return 'com_ui_parallel_work_failure_reported' as const;
-    if (work.state === 'cancelled') return 'com_ui_parallel_work_cancellation_reported' as const;
+  if (work.delivery.state === 'silent') return null;
+  if (['delivered', 'acknowledged'].includes(work.delivery.state)) {
+    if (work.state !== 'completed') return null;
     return 'com_ui_parallel_work_result_delivered' as const;
   }
   if (work.delivery.state === 'failed') {
@@ -282,6 +299,8 @@ function WorkItem({ work }: { work: WorkSummary }) {
         findStoredActionOperation(accountScope, work.workRef, action),
       ).find((operation) => operation?.instruction)?.instruction ?? '',
   );
+  const instructionRef = useRef<HTMLTextAreaElement>(null);
+  const [instructionExpanded, setInstructionExpanded] = useState(false);
   const [pendingAction, setPendingAction] = useState<WorkAction | null>(null);
   const [uncertainAction, setUncertainAction] = useState<WorkAction | null>(
     () =>
@@ -292,7 +311,9 @@ function WorkItem({ work }: { work: WorkSummary }) {
   const operations = useRef<Partial<Record<WorkAction, StoredActionOperation>>>({});
   const actions = useMemo(() => {
     const mask = Array.isArray(work.actions) ? work.actions : [];
-    const visible = SUPPORTED_ACTIONS.filter((action) => mask.includes(action));
+    const visible = SUPPORTED_ACTIONS.filter(
+      (action) => mask.includes(action) && !(action === 'resume' && work.pendingNativeInput),
+    );
     // A response can be lost after GlassHive commits the action and advances
     // the work state. Keep that exact stored operation visible even when the
     // new state no longer advertises the original action; the backend then
@@ -301,20 +322,43 @@ function WorkItem({ work }: { work: WorkSummary }) {
       visible.push(uncertainAction);
     }
     return visible;
-  }, [uncertainAction, work.actions]);
+  }, [uncertainAction, work.actions, work.pendingNativeInput]);
   const needsInstruction = actions.some((action) => INSTRUCTION_ACTIONS.has(action));
+  const showInstruction =
+    needsInstruction &&
+    (!TERMINAL_STATES.has(work.state) ||
+      instructionExpanded ||
+      Boolean(instruction) ||
+      Boolean(uncertainAction && INSTRUCTION_ACTIONS.has(uncertainAction)));
+  useEffect(() => {
+    if (instructionExpanded) {
+      instructionRef.current?.focus();
+    }
+  }, [instructionExpanded]);
   const viewRef = safeViewRef(work.viewRef);
   const deliveryLabelKey = terminalDeliveryLabelKey(work);
   const deliveryLabel = deliveryLabelKey ? localize(deliveryLabelKey) : null;
+  const localizedState = localize(STATE_LABELS[work.state] ?? 'com_ui_parallel_work_state_unknown');
+  const settledDelivery = ['delivered', 'acknowledged', 'silent'].includes(work.delivery?.state);
+  const primaryStatus = settledDelivery && deliveryLabel ? deliveryLabel : localizedState;
   const attentionSummary = work.attention?.summary.trim();
   const statusSummary = work.statusSummary?.trim();
   const statusIsRedundant =
     sameText(statusSummary, stateLabel(work.state)) ||
+    sameText(statusSummary, localizedState) ||
     sameText(statusSummary, attentionSummary) ||
     sameText(statusSummary, deliveryLabel);
-  const attentionIsRedundant = sameText(attentionSummary, stateLabel(work.state));
-  const showDeliveryLabel = Boolean(deliveryLabel && !sameText(deliveryLabel, attentionSummary));
-  const showUnreadDelivery = Boolean(deliveryLabel && work.delivery.unreadTerminal);
+  const attentionIsRedundant =
+    sameText(attentionSummary, stateLabel(work.state)) ||
+    sameText(attentionSummary, localizedState);
+  const showDeliveryLabel = Boolean(
+    deliveryLabel &&
+    !sameText(deliveryLabel, primaryStatus) &&
+    !sameText(deliveryLabel, attentionSummary),
+  );
+  const showUnreadDelivery = Boolean(
+    TERMINAL_STATES.has(work.state) && work.delivery?.unreadTerminal,
+  );
   const nativeTeam =
     !TERMINAL_STATES.has(work.state) &&
     work.nativeTeam &&
@@ -398,15 +442,7 @@ function WorkItem({ work }: { work: WorkSummary }) {
         <h4 className="text-sm font-medium text-text-primary [overflow-wrap:anywhere]">
           {work.title}
         </h4>
-        <p className="mt-1 text-sm text-text-secondary [overflow-wrap:anywhere]">
-          {[
-            `${localize('com_ui_parallel_work_mission')}: ${stateLabel(work.state)}`,
-            work.provider,
-            work.originSurface,
-          ]
-            .filter(Boolean)
-            .join(' · ')}
-        </p>
+        <p className="mt-1 text-sm text-text-secondary [overflow-wrap:anywhere]">{primaryStatus}</p>
         {statusSummary && !statusIsRedundant && (
           <p className="mt-1 text-sm text-text-secondary [overflow-wrap:anywhere]">
             {statusSummary}
@@ -414,13 +450,21 @@ function WorkItem({ work }: { work: WorkSummary }) {
         )}
       </div>
 
+      {work.pendingNativeInput && (
+        <NativeWorkInput
+          key={`${accountScope}:${work.pendingNativeInput.requestFingerprint}`}
+          workRef={work.workRef}
+          input={work.pendingNativeInput}
+        />
+      )}
+
       {attentionSummary && !attentionIsRedundant && (
         <p className="mt-2 text-sm font-medium text-text-primary [overflow-wrap:anywhere]">
           {attentionSummary}
         </p>
       )}
 
-      {(nativeTeam || showDeliveryLabel || showUnreadDelivery || viewRef) && (
+      {(nativeTeam || showDeliveryLabel || showUnreadDelivery) && (
         <div className="mt-2 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-sm text-text-secondary [overflow-wrap:anywhere]">
           {nativeTeam && (
             <span>
@@ -442,6 +486,30 @@ function WorkItem({ work }: { work: WorkSummary }) {
                 : ''}
             </span>
           )}
+        </div>
+      )}
+
+      {showInstruction && (
+        <label className="mt-3 block text-sm text-text-secondary">
+          {localize('com_ui_parallel_work_instruction')}
+          <textarea
+            ref={instructionRef}
+            rows={2}
+            value={instruction}
+            onChange={(event) => setInstruction(event.target.value)}
+            className="mt-1 w-full resize-y rounded-md border border-border-xheavy bg-surface-primary px-3 py-2 text-sm text-text-primary ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            aria-label={localize('com_ui_parallel_work_instruction')}
+            placeholder={localize('com_ui_parallel_work_instruction_placeholder')}
+          />
+        </label>
+      )}
+
+      {(actions.length > 0 || viewRef) && (
+        <div
+          className="mt-3 flex flex-wrap gap-2"
+          role="group"
+          aria-label={localize('com_ui_parallel_work_actions')}
+        >
           {viewRef && (
             <a
               href={viewRef}
@@ -453,62 +521,53 @@ function WorkItem({ work }: { work: WorkSummary }) {
               {localize('com_ui_parallel_work_view')}
             </a>
           )}
-        </div>
-      )}
-
-      {needsInstruction && (
-        <label className="mt-3 block text-sm text-text-secondary">
-          {localize('com_ui_parallel_work_instruction')}
-          <textarea
-            rows={2}
-            value={instruction}
-            onChange={(event) => setInstruction(event.target.value)}
-            className="mt-1 w-full resize-y rounded-md border border-border-xheavy bg-surface-primary px-3 py-2 text-sm text-text-primary ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-            aria-label={localize('com_ui_parallel_work_instruction')}
-            placeholder={localize('com_ui_parallel_work_instruction_placeholder')}
-          />
-        </label>
-      )}
-
-      {actions.length > 0 && (
-        <div
-          className="mt-3 flex flex-wrap gap-2"
-          role="group"
-          aria-label={localize('com_ui_parallel_work_actions')}
-        >
-          {actions.map((action) => {
-            const label = localize(
-              uncertainAction === action
-                ? 'com_ui_parallel_work_action_retry_same'
-                : ACTION_LABELS[action],
-            );
-            return (
-              <Button
-                key={action}
-                type="button"
-                variant="outline"
-                size="sm"
-                className="min-h-11"
-                aria-label={label}
-                aria-busy={pendingAction === action}
-                disabled={
-                  actionMutation.isLoading ||
-                  pendingAction != null ||
-                  (INSTRUCTION_ACTIONS.has(action) && !instruction.trim())
-                }
-                onClick={() => runAction(action)}
-              >
-                {pendingAction === action ? (
-                  <>
-                    <Spinner className="icon-sm" />
-                    <span className="sr-only">{label}</span>
-                  </>
-                ) : (
-                  label
-                )}
-              </Button>
-            );
-          })}
+          {needsInstruction && !showInstruction && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="min-h-11"
+              aria-expanded={false}
+              onClick={() => setInstructionExpanded(true)}
+            >
+              {localize('com_ui_parallel_work_follow_up')}
+            </Button>
+          )}
+          {actions
+            .filter((action) => showInstruction || !INSTRUCTION_ACTIONS.has(action))
+            .map((action) => {
+              const label = localize(
+                uncertainAction === action
+                  ? 'com_ui_parallel_work_action_retry_same'
+                  : ACTION_LABELS[action],
+              );
+              return (
+                <Button
+                  key={action}
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="min-h-11"
+                  aria-label={label}
+                  aria-busy={pendingAction === action}
+                  disabled={
+                    actionMutation.isLoading ||
+                    pendingAction != null ||
+                    (INSTRUCTION_ACTIONS.has(action) && !instruction.trim())
+                  }
+                  onClick={() => runAction(action)}
+                >
+                  {pendingAction === action ? (
+                    <>
+                      <Spinner className="icon-sm" />
+                      <span className="sr-only">{label}</span>
+                    </>
+                  ) : (
+                    label
+                  )}
+                </Button>
+              );
+            })}
         </div>
       )}
       {uncertainAction && (

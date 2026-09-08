@@ -20,3 +20,7 @@ type MessageContext = {
 
 export const MessageContext = createContext<MessageContext>({} as MessageContext);
 export const useMessageContext = () => useContext(MessageContext);
+
+/* === VIVENTIUM START === Additive history must not take ownership of the next chat input. === */
+export const MessageInputBranchContext = createContext(true);
+/* === VIVENTIUM END === */

@@ -5,7 +5,8 @@ import { Tools, supportsAdaptiveThinking } from 'librechat-data-provider';
 import { logger } from '@librechat/data-schemas';
 import { tool } from '@librechat/agents/langchain/tools';
 import { Run, Providers, GraphEvents } from '@librechat/agents';
-import { HumanMessage } from '@librechat/agents/langchain/messages';
+import { HumanMessage, ToolMessage as MemoryToolMessage } from '@librechat/agents/langchain/messages';
+import type { NativeMemoryExecutor } from './nativeMemoryWriter';
 import type { MemoryKeyLimits } from '~/memory';
 import type {
   OpenAIClientOptions,
@@ -60,6 +61,8 @@ function normalizeMemoryLLMConfig(llmConfig?: Partial<LLMConfig>): SanitizedMemo
 }
 
 export interface MemoryConfig {
+  /** Request-local native transport; never serialized or inherited from Main. */
+  nativeExecutor?: NativeMemoryExecutor;
   validKeys?: string[];
   instructions?: string;
   llmConfig?: Partial<LLMConfig>;
@@ -76,6 +79,12 @@ export interface MemorySnapshot {
   memoryTokenMap: Record<string, number>;
   memoryRevisionMap: Record<string, number>;
   memoryValueHashMap: Record<string, string>;
+  /** Only populated for read-only recovery snapshots; unknown timestamps prohibit recovery. */
+  latestMutationAt?: number;
+  memoryWriterEffectMap?: Record<
+    string,
+    NonNullable<import('@librechat/data-schemas').IMemoryEntryLean['writerEffect']>
+  >;
 }
 
 export interface MemoryWriteAuditContext {
@@ -96,6 +105,19 @@ export interface MemoryReadProfileConfig {
   cacheTtlMs?: number;
 }
 
+export type MemoryReadAvailability = 'available' | 'empty' | 'unavailable' | 'disabled' | 'denied';
+
+/** Serialize the current permission-gated read, without turning missing data into a write receipt. */
+export function buildSavedMemoryTurnContext(
+  status: MemoryReadAvailability | undefined,
+  text = '',
+): string {
+  if (!status) return '';
+  return `# Current saved-memory snapshot\n${JSON.stringify(
+    status === 'available' ? { status, text } : { status },
+  )}`;
+}
+
 export interface MemoryReadContext {
   text: string;
   totalTokens: number;
@@ -104,9 +126,6 @@ export interface MemoryReadContext {
   duplicateKeys: string[];
   cacheHit: boolean;
 }
-
-export const memoryInstructions =
-  'The system automatically stores important user information and can update or delete memories based on user requests, enabling dynamic memory management.';
 
 const MEMORY_DECISION_TOOL_NAME = 'apply_memory_changes';
 const ANTHROPIC_MEMORY_DEFAULT_THINKING = true;
@@ -151,7 +170,8 @@ type MemoryReadCacheEntry = MemoryReadContext & {
 
 type MemoryWriterHealthEntry = {
   blockedUntil: number;
-  reason: 'auth';
+  reason: 'auth' | 'quota';
+  errorType: string;
   message: string;
   provider?: string;
   model?: string;
@@ -638,7 +658,12 @@ export function markMemoryWriterFailure({
   model?: string;
   error: unknown;
 }): MemoryWriterHealthEntry | undefined {
-  if (!errorContainsAuthFailure(error)) {
+  const errorType = classifyMemoryProviderError(error);
+  if (
+    errorType !== 'provider_unauthorized' &&
+    errorType !== 'provider_access_denied' &&
+    !(errorType === 'provider_unavailable' && errorContainsAuthFailure(error))
+  ) {
     return undefined;
   }
   const normalizedProvider = normalizeMemoryWriterHealthProvider(provider);
@@ -646,8 +671,43 @@ export function markMemoryWriterFailure({
   const entry: MemoryWriterHealthEntry = {
     blockedUntil: Date.now() + MEMORY_WRITER_AUTH_SUPPRESSION_MS,
     reason: 'auth',
+    errorType: errorType === 'provider_unavailable' ? 'provider_auth' : errorType,
     message:
       'Saved memory writer authentication failed. Reconnect the memory provider account before retrying durable memory writes.',
+    provider: normalizedProvider,
+    model,
+  };
+  memoryWriterHealth.set(key, entry);
+  return entry;
+}
+
+/* === VIVENTIUM START ===
+ * A terminal quota/billing/authorization failure on one saved-memory route gates that exact
+ * route for the suppression window, so the explicitly configured fallback route is tried first on
+ * later turns instead of replaying the exhausted provider. Nothing here selects a model.
+ * === VIVENTIUM END === */
+const MEMORY_WRITER_QUOTA_SUPPRESSION_MS = MEMORY_WRITER_AUTH_SUPPRESSION_MS;
+
+export function markMemoryWriterRouteExhausted({
+  userId,
+  provider,
+  model,
+  errorType,
+}: {
+  userId: string | ObjectId;
+  provider?: string;
+  model?: string;
+  errorType: string;
+}): MemoryWriterHealthEntry {
+  const normalizedProvider = normalizeMemoryWriterHealthProvider(provider);
+  const key = getMemoryWriterHealthKey({ userId, provider: normalizedProvider, model });
+  const entry: MemoryWriterHealthEntry = {
+    blockedUntil: Date.now() + MEMORY_WRITER_QUOTA_SUPPRESSION_MS,
+    // Keep the exact structured cause after failover so later turns do not turn a denied
+    // account into a usage-limit claim. The existing grouping still owns suppression policy.
+    reason: TERMINAL_MEMORY_PROVIDER_ERROR_TYPES.has(errorType) ? 'quota' : 'auth',
+    errorType,
+    message: `Saved memory writer route is unavailable (${errorType}). Writes use the explicitly configured fallback route until the provider recovers.`,
     provider: normalizedProvider,
     model,
   };
@@ -823,6 +883,7 @@ const TERMINAL_MEMORY_PROVIDER_ERROR_TYPES = new Set([
 ]);
 
 const TRANSIENT_MEMORY_PROVIDER_ERROR_TYPES = new Set([
+  'host_capacity',
   'provider_rate_limited',
   'rate_limit_exceeded',
   'rate_limit_error',
@@ -831,6 +892,7 @@ const TRANSIENT_MEMORY_PROVIDER_ERROR_TYPES = new Set([
 ]);
 
 const KNOWN_MEMORY_PROVIDER_ERROR_TYPES = new Set([
+  'host_capacity',
   ...TERMINAL_MEMORY_PROVIDER_ERROR_TYPES,
   'provider_rate_limited',
   'rate_limit_exceeded',
@@ -990,12 +1052,14 @@ function buildMemoryProviderErrorAttachment({
   messageId,
   conversationId,
   errorType,
+  provider,
   totalTokens,
   partialApplied = false,
 }: {
   messageId: string;
   conversationId: string;
   errorType: string;
+  provider?: string;
   totalTokens: number;
   partialApplied?: boolean;
 }): TAttachment {
@@ -1008,9 +1072,14 @@ function buildMemoryProviderErrorAttachment({
       type: 'error',
       value: JSON.stringify({
         errorType,
-        message: partialApplied
-          ? 'Saved memory was only partially updated because the configured provider became unavailable.'
-          : 'Saved memory could not be updated because the configured provider is unavailable.',
+        ...(provider ? { provider } : {}),
+        message: errorType === 'host_capacity'
+          ? partialApplied
+            ? 'Saved memory was only partially updated because there was not enough free capacity.'
+            : 'Not enough free capacity to save memory right now. Try again shortly.'
+          : partialApplied
+            ? 'Saved memory was only partially updated because the configured provider became unavailable.'
+            : 'Saved memory could not be updated because the configured provider is unavailable.',
         ...(partialApplied ? { partialApplied: true } : {}),
       }),
       tokenCount: totalTokens,
@@ -1063,7 +1132,10 @@ function markMemoryErrorPartialApply(
 ) {
   const details = parseMemoryErrorDetails(artifact[Tools.memory]);
   if (details) {
-    artifact[Tools.memory].value = JSON.stringify({ ...details, partialApplied });
+    artifact[Tools.memory].value = JSON.stringify({
+      ...details,
+      partialApplied: partialApplied || details.partialApplied === true,
+    });
   }
   return artifact;
 }
@@ -1126,6 +1198,8 @@ type MemoryRuntimeState = {
 
 type MemoryProcessingAttemptState = {
   storageApplied: boolean;
+  /** A write was dispatched but its acknowledgement was lost. Never treat this as no effect. */
+  storageUncertain?: boolean;
 };
 
 const memoryAuditHashKey = randomBytes(32);
@@ -1270,6 +1344,9 @@ export const createMemoryTool = ({
   return tool(
     async ({ key, value }) => {
       try {
+        if (attemptState?.storageUncertain) {
+          throw new Error('An earlier memory mutation has an unknown outcome');
+        }
         const preparedValue = prepareMemoryValueForWrite({ key, value, keyLimits });
         const nextValue = preparedValue.value;
         const tokenCount = preparedValue.tokenCount;
@@ -1312,8 +1389,13 @@ export const createMemoryTool = ({
             ? { expectedRevision: runtimeState.revisions[key] ?? null }
             : {}),
         };
+        if (attemptState) attemptState.storageUncertain = true;
         const result = await setMemory(writeParams);
+        if (attemptState) attemptState.storageUncertain = false;
         if (result.ok) {
+          /* === VIVENTIUM START === Storage alone classifies unchanged values. === */
+          artifact[Tools.memory].type = result.changed === false ? 'unchanged' : 'update';
+          /* === VIVENTIUM END === */
           if (attemptState) {
             attemptState.storageApplied = true;
           }
@@ -1334,7 +1416,12 @@ export const createMemoryTool = ({
             auditContext,
           });
           logger.debug(`Memory set for key "${key}" (${tokenCount} tokens)`);
-          return [`Memory set for key "${key}" (${tokenCount} tokens)`, artifact];
+          return [
+            result.changed === false
+              ? `Memory unchanged for key "${key}" (${tokenCount} tokens)`
+              : `Memory set for key "${key}" (${tokenCount} tokens)`,
+            artifact,
+          ];
         }
         if (result.conflict) {
           const message = `Memory key "${key}" changed while this memory update was running; the stale update was not applied.`;
@@ -1377,7 +1464,18 @@ export const createMemoryTool = ({
           auditContext,
         });
         logger.error('Memory Agent failed to set memory', memoryErrorMetadata(error));
-        return [`Error setting memory for key "${key}"`, undefined];
+        return [
+          `Error setting memory for key "${key}"`,
+          buildGenericMemoryErrorArtifact(
+            'Saving memory was interrupted. Some changes may already be saved. Check Memories before retrying.',
+            runtimeState.runningTotalTokens,
+            {
+              errorType: 'writer_interrupted',
+              key,
+              partialApplied: attemptState?.storageUncertain === true,
+            },
+          ),
+        ];
       }
     },
     {
@@ -1445,6 +1543,9 @@ const createDeleteMemoryTool = ({
   return tool(
     async ({ key }) => {
       try {
+        if (attemptState?.storageUncertain) {
+          throw new Error('An earlier memory mutation has an unknown outcome');
+        }
         if (validKeys && validKeys.length > 0 && !validKeys.includes(key)) {
           logger.warn(
             `Memory Agent failed to delete memory: Invalid key "${key}". Must be one of: ${validKeys.join(
@@ -1462,6 +1563,7 @@ const createDeleteMemoryTool = ({
         };
 
         const beforeHash = runtimeState.valueHashes[key];
+        if (attemptState) attemptState.storageUncertain = true;
         const result = await deleteMemory({
           userId,
           key,
@@ -1469,6 +1571,7 @@ const createDeleteMemoryTool = ({
             ? { expectedRevision: runtimeState.revisions[key] ?? null }
             : {}),
         });
+        if (attemptState) attemptState.storageUncertain = false;
         if (result.ok) {
           if (attemptState) {
             attemptState.storageApplied = true;
@@ -1535,7 +1638,18 @@ const createDeleteMemoryTool = ({
           auditContext,
         });
         logger.error('Memory Agent failed to delete memory', memoryErrorMetadata(error));
-        return [`Error deleting memory for key "${key}"`, undefined];
+        return [
+          `Error deleting memory for key "${key}"`,
+          buildGenericMemoryErrorArtifact(
+            'Deleting memory was interrupted. The change may already be saved. Check Memories before retrying.',
+            runtimeState.runningTotalTokens,
+            {
+              errorType: 'writer_interrupted',
+              key,
+              partialApplied: attemptState?.storageUncertain === true,
+            },
+          ),
+        ];
       }
     },
     {
@@ -1712,6 +1826,10 @@ export const createApplyMemoryChangesTool = ({
           break;
         } else if (memoryArtifact?.type === 'update' || memoryArtifact?.type === 'delete') {
           appliedCount += 1;
+          if (!primaryArtifact || primaryArtifact[Tools.memory].type === 'unchanged') {
+            primaryArtifact = result[1];
+          }
+        } else if (memoryArtifact?.type === 'unchanged') {
           primaryArtifact ??= result[1];
         } else if ((action === 'set' || action === 'delete') && result[1] == null) {
           errorArtifact ??= buildGenericMemoryErrorArtifact(
@@ -1880,6 +1998,7 @@ export async function processMemory({
   totalTokens = 0,
   streamId = null,
   deferArtifactDelivery = false,
+  nativeExecutor,
   user,
 }: {
   res: ServerResponse;
@@ -1902,12 +2021,12 @@ export async function processMemory({
   llmConfig?: Partial<LLMConfig>;
   streamId?: string | null;
   deferArtifactDelivery?: boolean;
+  nativeExecutor?: NativeMemoryExecutor;
   user?: IUser;
 }): Promise<(TAttachment | null)[] | undefined> {
   const attemptState: MemoryProcessingAttemptState = { storageApplied: false };
   const artifactPromises: Promise<TAttachment | null>[] = [];
   try {
-    const attemptState: MemoryProcessingAttemptState = { storageApplied: false };
     const resolvedKeyLimits = resolveMemoryKeyLimits(keyLimits);
     const memoryTool = createMemoryTool({
       userId,
@@ -2085,7 +2204,6 @@ ${memory ?? 'No existing memories'}`;
       });
     }
 
-    const artifactPromises: Promise<TAttachment | null>[] = [];
     const memoryCallback = createMemoryCallback({
       res,
       artifactPromises,
@@ -2133,6 +2251,22 @@ ${memory ?? 'No existing memories'}`;
       graphAdditionalInstructions = undefined;
     }
 
+    /* === VIVENTIUM START === Native callbacks retain the same governed tools and receipts. === */
+    if (nativeExecutor) {
+      await nativeExecutor({ tool: applyMemoryChangesTool, messages: processedMessages,
+        instructions: [graphInstructions, graphAdditionalInstructions].filter(Boolean).join('\n\n'),
+        onResult: async ([content, artifact], callId) => memoryCallback({
+          input: {},
+          output: new MemoryToolMessage({ content, artifact, tool_call_id: callId,
+            name: applyMemoryChangesTool.name }),
+        }, { run_id: messageId, thread_id: conversationId }),
+      });
+      clearMemoryWriterHealth({ userId, provider: llmConfig?.provider,
+        model: llmConfig != null && 'model' in llmConfig ? String(llmConfig.model) : undefined });
+      return await Promise.all(artifactPromises);
+    }
+
+    /* === VIVENTIUM END === */
     const run = await Run.create({
       runId: messageId,
       graphConfig: {
@@ -2166,7 +2300,11 @@ ${memory ?? 'No existing memories'}`;
     try {
       content = await run.processStream(inputs, config);
     } catch (error) {
-      if (!isRetryableMemoryProcessingError(error) || attemptState.storageApplied) {
+      if (
+        !isRetryableMemoryProcessingError(error) ||
+        attemptState.storageApplied ||
+        attemptState.storageUncertain
+      ) {
         throw error;
       }
 
@@ -2253,8 +2391,9 @@ ${memory ?? 'No existing memories'}`;
         messageId,
         conversationId,
         errorType: providerErrorType,
+        provider: llmConfig?.provider,
         totalTokens,
-        partialApplied: attemptState.storageApplied,
+        partialApplied: attemptState.storageApplied || attemptState.storageUncertain === true,
       }),
     ];
     /* === VIVENTIUM END === */
@@ -2265,10 +2404,12 @@ export async function loadMemorySnapshot({
   userId,
   memoryMethods,
   config = {},
+  readOnly = false,
 }: {
   userId: string | ObjectId;
   memoryMethods: RequiredMemoryMethods;
   config?: MemoryConfig;
+  readOnly?: boolean;
 }): Promise<MemorySnapshot> {
   const { validKeys, tokenLimit, keyLimits, maintenanceThresholdPercent } = config;
   /* === VIVENTIUM START ===
@@ -2282,24 +2423,26 @@ export async function loadMemorySnapshot({
    *
    * Added: 2026-03-09
    * === VIVENTIUM END === */
-  await runMemoryMaintenance({
-    userId: String(userId),
-    getAllUserMemories: async (resolvedUserId) => memoryMethods.getAllUserMemories(resolvedUserId),
-    setMemory: async ({ userId: maintenanceUserId, key, value, tokenCount, expectedRevision }) =>
-      memoryMethods.setMemory({
-        userId: maintenanceUserId,
-        key,
-        value,
-        tokenCount,
-        expectedRevision,
-      }),
-    policy: {
-      validKeys,
-      tokenLimit,
-      keyLimits,
-      maintenanceThresholdPercent,
-    },
-  });
+  if (!readOnly)
+    await runMemoryMaintenance({
+      userId: String(userId),
+      getAllUserMemories: async (resolvedUserId) =>
+        memoryMethods.getAllUserMemories(resolvedUserId),
+      setMemory: async ({ userId: maintenanceUserId, key, value, tokenCount, expectedRevision }) =>
+        memoryMethods.setMemory({
+          userId: maintenanceUserId,
+          key,
+          value,
+          tokenCount,
+          expectedRevision,
+        }),
+      policy: {
+        validKeys,
+        tokenLimit,
+        keyLimits,
+        maintenanceThresholdPercent,
+      },
+    });
 
   /* === VIVENTIUM START ===
    * User prompt text sees active rows only; writer CAS state also retains deleted-key revisions.
@@ -2309,11 +2452,13 @@ export async function loadMemorySnapshot({
   const formatted = await memoryMethods.getFormattedMemories({ userId, memories: entries });
   const memoryRevisionMap: Record<string, number> = {};
   const memoryValueHashMap: Record<string, string> = {};
+  const memoryWriterEffectMap: NonNullable<MemorySnapshot['memoryWriterEffectMap']> = {};
   for (const entry of states ?? []) {
     if (!entry?.key) {
       continue;
     }
     memoryRevisionMap[entry.key] = Number(entry.__v ?? 0);
+    if (entry.writerEffect) memoryWriterEffectMap[entry.key] = entry.writerEffect;
     if (!entry.deletedAt) {
       memoryValueHashMap[entry.key] = hashMemoryAuditValue(entry.value);
     }
@@ -2325,6 +2470,18 @@ export async function loadMemorySnapshot({
     memoryTokenMap: formatted.memoryTokenMap ?? {},
     memoryRevisionMap,
     memoryValueHashMap,
+    ...(readOnly
+      ? {
+          memoryWriterEffectMap,
+          latestMutationAt: Math.max(
+            0,
+            ...states.map((entry) => {
+              const timestamp = new Date(entry.updated_at ?? '').getTime();
+              return Number.isFinite(timestamp) ? timestamp : Infinity;
+            }),
+          ),
+        }
+      : {}),
   };
   /* === VIVENTIUM END === */
 }
@@ -2352,7 +2509,7 @@ export async function createMemoryProcessor({
   snapshot?: MemorySnapshot;
   auditSource?: string;
 }): Promise<[string, (messages: BaseMessage[]) => Promise<(TAttachment | null)[] | undefined>]> {
-  const { validKeys, instructions, llmConfig, tokenLimit, keyLimits } = config;
+  const { validKeys, instructions, llmConfig, tokenLimit, keyLimits, nativeExecutor } = config;
   const finalInstructions = [
     instructions || getDefaultInstructions(validKeys, tokenLimit),
     getMemoryToolProtocolInstructions(),
@@ -2386,6 +2543,7 @@ export async function createMemoryProcessor({
             messages: attemptMessages,
             validKeys,
             llmConfig,
+            nativeExecutor,
             keyLimits,
             messageId,
             tokenLimit,
@@ -2434,6 +2592,16 @@ export async function createMemoryProcessor({
         return attachments;
       } catch (error) {
         logger.error('Memory Agent failed to process memory', error);
+        return [
+          buildMemoryProviderErrorAttachment({
+            messageId,
+            conversationId,
+            errorType: 'writer_interrupted',
+            provider: llmConfig?.provider,
+            totalTokens,
+            partialApplied: true,
+          }),
+        ];
       }
     },
   ];

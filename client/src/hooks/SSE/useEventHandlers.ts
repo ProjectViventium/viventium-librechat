@@ -34,6 +34,9 @@ import {
   findConversationInInfinite,
 } from '~/utils';
 import { queueTitleGeneration } from '~/data-provider/SSE/queries';
+/* === VIVENTIUM START === Preserve new-chat title work after canonical ID settlement. === */
+import { shouldQueueCanonicalTitle } from './canonicalConversation';
+/* === VIVENTIUM END === */
 import useAttachmentHandler from '~/hooks/SSE/useAttachmentHandler';
 import useContentHandler from '~/hooks/SSE/useContentHandler';
 import useStepHandler from '~/hooks/SSE/useStepHandler';
@@ -43,6 +46,10 @@ import { useAuthContext } from '~/hooks/AuthContext';
 import { MESSAGE_UPDATE_INTERVAL } from '~/common';
 import { useLiveAnnouncer } from '~/Providers';
 import store from '~/store';
+/* === VIVENTIUM START === Match the final announcement to the saved reply status. === */
+import { isIncompleteMessage } from '~/utils/messages';
+import useLocalize from '~/hooks/useLocalize';
+/* === VIVENTIUM END === */
 
 type TSyncData = {
   sync: boolean;
@@ -179,6 +186,9 @@ export default function useEventHandlers({
 }: EventHandlerParams) {
   const queryClient = useQueryClient();
   const { announcePolite } = useLiveAnnouncer();
+  /* === VIVENTIUM START === Shared localized wording for incomplete terminal replies. === */
+  const localize = useLocalize();
+  /* === VIVENTIUM END === */
   const applyAgentTemplate = useApplyAgentTemplate();
   const setAbortScroll = useSetRecoilState(store.abortScroll);
   const navigate = useNavigate();
@@ -482,17 +492,36 @@ export default function useEventHandlers({
           currentMessages,
           requestMessageId: requestMessage?.messageId,
           responseMessage,
+          memoryWriterScheduled: data.memoryWriterScheduled,
         });
 
         /* a11y announcements */
-        announcePolite({ message: 'end', isStatus: true });
+        /* === VIVENTIUM START === Do not announce an incomplete saved reply as complete. === */
+        announcePolite({
+          message: isIncompleteMessage(finalResponseMessage ?? responseMessage)
+            ? localize('com_ui_response_incomplete')
+            : 'end',
+          isStatus: true,
+        });
+        /* === VIVENTIUM END === */
         announcePolite({ message: getAllContentText(finalResponseMessage ?? responseMessage) });
 
         const isNewConvo = conversation.conversationId !== submissionConvo.conversationId;
 
-        if (isNewConvo && conversation.conversationId) {
+        /* === VIVENTIUM START === The start receipt can already have rebound the new chat. === */
+        if (
+          responseMessage?.error !== true &&
+          conversation.conversationId &&
+          shouldQueueCanonicalTitle(
+            conversation.conversationId,
+            submission,
+            requestMessage,
+            responseMessage,
+          )
+        ) {
           queueTitleGeneration(conversation.conversationId);
         }
+        /* === VIVENTIUM END === */
 
         const setFinalMessages = (id: string | null, _messages: TMessage[]) => {
           setMessages(_messages);
@@ -616,6 +645,7 @@ export default function useEventHandlers({
       setCompleted,
       isAddedRequest,
       announcePolite,
+      localize,
       setConversation,
       setIsSubmitting,
       setShowStopButton,

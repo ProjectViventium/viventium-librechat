@@ -456,6 +456,10 @@ export type TAuthContext = {
   user: t.TUser | undefined;
   token: string | undefined;
   isAuthenticated: boolean;
+  /* === VIVENTIUM START === */
+  isAuthUnavailable: boolean;
+  retryAuthentication: () => void;
+  /* === VIVENTIUM END === */
   error: string | undefined;
   login: (data: t.TLoginUser) => void;
   logout: (redirect?: string) => void;
@@ -611,6 +615,9 @@ export type TResData = TBaseResData & {
 };
 
 export type TFinalResData = Omit<TBaseResData, 'conversation'> & {
+  /* === VIVENTIUM START === Existing durable-memory final-event signal. === */
+  memoryWriterScheduled?: boolean;
+  /* === VIVENTIUM END === */
   conversation: Partial<t.TConversation> & Pick<t.TConversation, 'conversationId'>;
   requestMessage?: t.TMessage;
   responseMessage?: t.TMessage;

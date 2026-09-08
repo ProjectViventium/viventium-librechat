@@ -9,6 +9,7 @@ export interface GlassHiveLaunchReconciliationDependencies {
   reconcileKnownExternalWorkHints(input: { limit: number }): Promise<object>;
   reconcileUnresolvedGlassHiveCallbackDeliveries(input: { limit: number }): Promise<object>;
   reconcileGlassHiveSurfaceDeliveryProjections(input: { limit: number }): Promise<object>;
+  reconcilePendingGlassHiveMissionAdjudications(input: { limit: number }): Promise<object>;
   logger: { warn(message: string, details: { code: string }): void };
   environment?: NodeJS.ProcessEnv;
 }
@@ -18,6 +19,7 @@ export interface GlassHiveLaunchReconciliationResult {
   hints: object;
   deliveries: object;
   deliveryProjections: object;
+  missionAdjudications: object;
 }
 
 const DEFAULT_INTERVAL_MS = 30_000;
@@ -63,13 +65,17 @@ export function createGlassHiveLaunchReconciliationService(
           dependencies.reconcileGlassHiveSurfaceDeliveryProjections({
             limit: RECONCILIATION_BATCH,
           }),
+          dependencies.reconcilePendingGlassHiveMissionAdjudications({
+            limit: RECONCILIATION_BATCH,
+          }),
         ]),
       )
-      .then(([launches, hints, deliveries, deliveryProjections]) => ({
+      .then(([launches, hints, deliveries, deliveryProjections, missionAdjudications]) => ({
         launches,
         hints,
         deliveries,
         deliveryProjections,
+        missionAdjudications,
       }));
     try {
       return await inFlight;

@@ -15,17 +15,6 @@ import CortexCallInfo from './CortexCallInfo';
 import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
 
-const ACTIVE_CORTEX_STATUSES = new Set<CortexStatus>(['activating', 'brewing']);
-const STALE_CORTEX_DISPLAY_TIMEOUT_MS = 4 * 60 * 1000;
-
-function parseStatusChangedAt(value?: string): number | null {
-  if (!value) {
-    return null;
-  }
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
 export default function CortexCall({
   cortex_id: _cortex_id,
   cortex_name,
@@ -39,7 +28,6 @@ export default function CortexCall({
   no_response = false,
   fallback_used = false,
   fallback_reason_class,
-  status_changed_at,
   isLast = false,
 }: {
   cortex_id: string;
@@ -63,26 +51,10 @@ export default function CortexCall({
   const [contentHeight, setContentHeight] = useState<number | undefined>(0);
   const [isAnimating, setIsAnimating] = useState(false);
   const prevShowInfoRef = useRef<boolean>(showInfo);
-  const [nowMs, setNowMs] = useState(() => Date.now());
-
-  const statusChangedAtMs = useMemo(
-    () => parseStatusChangedAt(status_changed_at),
-    [status_changed_at],
-  );
-  const isActiveStatus = ACTIVE_CORTEX_STATUSES.has(status);
-  const isMissingStatusTimestamp = isActiveStatus && statusChangedAtMs === null;
-  const isStaleActive =
-    isActiveStatus &&
-    (statusChangedAtMs === null
-      ? true
-      : nowMs - statusChangedAtMs >= STALE_CORTEX_DISPLAY_TIMEOUT_MS);
-  const displayStatus: CortexStatus = isStaleActive ? 'error' : status;
-  const displayError =
-    isStaleActive && !error
-      ? isMissingStatusTimestamp
-        ? 'Background processing state is missing a status timestamp.'
-        : 'Background processing did not finish before the UI safety timeout.'
-      : error;
+  // Elapsed browser time cannot establish a server failure. The existing observer
+  // refreshes long-running work; only a persisted terminal result changes its status.
+  const displayStatus = status;
+  const displayError = error;
 
   const hasInsight = (insight?.trim().length ?? 0) > 0;
   const hasErrorDetail = (displayError?.trim().length ?? 0) > 0;
@@ -99,16 +71,6 @@ export default function CortexCall({
     }
     return fallback_used || hasInsight || hasErrorDetail || (reason?.trim().length ?? 0) > 0;
   }, [fallback_used, hasInsight, hasErrorDetail, isSilentComplete, reason]);
-
-  useEffect(() => {
-    if (!isActiveStatus || statusChangedAtMs === null) {
-      return;
-    }
-    const nextStaleAt = statusChangedAtMs + STALE_CORTEX_DISPLAY_TIMEOUT_MS;
-    const delayMs = Math.max(0, nextStaleAt - Date.now());
-    const timer = window.setTimeout(() => setNowMs(Date.now()), delayMs);
-    return () => window.clearTimeout(timer);
-  }, [isActiveStatus, statusChangedAtMs]);
 
   // Progress state: 0-1 based on status
   const progress = useMemo(() => {

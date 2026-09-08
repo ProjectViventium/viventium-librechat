@@ -41,7 +41,12 @@ from .models import (
     ScheduleTask,
 )
 from .scheduler import SchedulerEngine, compute_next_run, compute_next_runs
-from .dispatch import _patch_private_run_detail
+from .dispatch import (
+    _patch_private_run_detail,
+    _scheduled_generation_failure_notice,
+    normalized_scheduled_generation_failure_class,
+    resolve_scheduled_failure_transition,
+)
 from .glasshive_workspace_schedules import (
     GlassHiveWorkspaceScheduleService,
     WorkspaceScheduleError,
@@ -52,6 +57,7 @@ from .utils import to_utc_iso
 DEFAULT_PORT = 7010
 HEADER_USER_ID = "x-viventium-user-id"
 HEADER_AGENT_ID = "x-viventium-agent-id"
+HEADER_CONVERSATION_ID = "x-viventium-conversation-id"
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +118,11 @@ def _glasshive_callback_lifecycle(
         )
         disposition = "failed" if event == "run.failed" else "cancelled"
         return "failed", disposition, now, error_class
+    if event == "run.needs_input":
+        error_class = normalized_scheduled_generation_failure_class(
+            payload.get("failure_class") or payload.get("failure_code")
+        )
+        return "failed", "failed", now, error_class
     if event == "run.queued":
         status = current_status if current_status in {"running", "completed", "failed"} else "queued"
         return (
@@ -509,6 +520,12 @@ def _resolve_request_agent_id(fallback: Optional[str] = None) -> str:
     if not agent_id:
         raise ValueError("request agent_id is required (missing from headers and VIVENTIUM_MAIN_AGENT_ID)")
     return agent_id
+
+
+def _resolve_same_conversation_id(explicit_conversation_id: Optional[str]) -> Optional[str]:
+    headers = _get_request_headers()
+    conversation_id = _sanitize_header_value(headers.get(HEADER_CONVERSATION_ID))
+    return conversation_id or explicit_conversation_id
 
 
 def _resolve_actor_id(explicit_actor: Optional[str], agent_id: str) -> str:
@@ -982,10 +999,22 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
     _mongo_uri_re = re.compile(r"mongodb(?:\+srv)?:\/\/[^\s`'\"<>]+", re.IGNORECASE)
     _bearer_re = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE)
 
-    def _safe_callback_summary(payload: Dict[str, Any], status: str, error_class: str | None) -> str:
+    def _safe_callback_summary(
+        payload: Dict[str, Any], status: str, error_class: str | None, task: Dict[str, Any]
+    ) -> str:
         event = str(payload.get("event") or "").strip()
         if status == "completed":
             return "GlassHive run completed. Private details are stored in the run detail file."
+        if status == "failed" and event == "run.needs_input":
+            retryable = payload.get("failure_retryable")
+            transition = resolve_scheduled_failure_transition(
+                task, error_class, retryable if isinstance(retryable, bool) else None
+            )
+            return _scheduled_generation_failure_notice(
+                transition["error_class"], transition["retryable"],
+                "next_occurrence_only" if (task.get("schedule") or {}).get("type") != "once"
+                else "terminal_action_required", transition.get("next_attempt_at"),
+            )
         if status == "failed":
             raw = str(payload.get("error") or error_class or event or "GlassHive run failed").strip()
         elif event == "run.waiting_on_capacity":
@@ -1291,7 +1320,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
                 status_code=status_code,
             )
 
-        if event in terminal_events:
+        if event in terminal_events or event == "run.needs_input":
             expected_worker_id = str(run.get("glasshive_worker_id") or "").strip()
             if not expected_worker_id:
                 return JSONResponse(
@@ -1326,6 +1355,32 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
                     {"status": "error", "reason": "run_mismatch"},
                     status_code=409,
                 )
+        if event == "run.needs_input":
+            task_id = str(run.get("task_id") or "").strip()
+            scheduled_run_id = str(run.get("run_id") or "").strip()
+            exact_identity = (
+                ("project_id", str(run.get("glasshive_project_id") or "")),
+                ("user_id", str(run.get("user_id") or "")),
+                ("message_id", scheduled_run_id),
+                ("conversation_id", f"workbench-scheduled-prompt:{task_id}"),
+                ("parent_message_id", f"scheduled-prompt:{task_id}"),
+                ("surface", "workbench"),
+            )
+            if any(
+                not expected
+                or not _constant_time_text_equal(expected, str(payload.get(field) or "").strip())
+                for field, expected in exact_identity
+            ) or (
+                payload.get("scheduled_prompt_run_id")
+                and not _constant_time_text_equal(
+                    scheduled_run_id, str(payload["scheduled_prompt_run_id"]).strip()
+                )
+            ):
+                return JSONResponse(
+                    {"status": "error", "reason": "needs_input_identity_mismatch"},
+                    status_code=409,
+                )
+        if event in terminal_events:
             if canonical_terminal_identity_present:
                 try:
                     decision = storage.accept_scheduled_terminal_callback_result(
@@ -1522,12 +1577,17 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         # Cortex persists only identity/work references and must never receive broker credentials.
         capability_revocation: Dict[str, Any] | None = None
         memory_apply: dict[str, Any] | None = None
-        result_summary = _safe_callback_summary(payload, status, error_class)
+        callback_task = (
+            storage.get_task(str(run.get("user_id") or ""), str(run.get("task_id") or "")) or {}
+            if status == "failed" and event == "run.needs_input" else {}
+        )
+        result_summary = _safe_callback_summary(payload, status, error_class, callback_task)
 
         callback_summary = {
             "event": event,
             "received_at": now,
             "status": status,
+            "failure_class": error_class if status == "failed" else None,
             "message_hash": _hash_payload_text(payload),
             "has_private_payload": bool(payload.get("message") or payload.get("full_message") or payload.get("error")),
             "memory_apply_reason": None,
@@ -1559,22 +1619,42 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         if terminal_receiver is None:
             callback_persisted = False
             if not terminal_before_callback or callback_reconciliation_allowed:
-                private_detail = _append_private_callback(run, payload, now)
-                callback_persisted = bool(
-                    storage.update_scheduled_prompt_run(
-                        str(run["run_id"]), updates
+                if event == "run.needs_input":
+                    applied = storage.update_scheduled_prompt_run_if_current(
+                        str(run["run_id"]), updates,
+                        expected_status=str(run.get("status") or "queued"),
+                        expected_error_class=run.get("error_class"),
+                        expected_attempt=int(run.get("attempt") or 0),
+                        expected_glasshive_run_id=str(run.get("glasshive_run_id") or ""),
                     )
-                )
-                _update_parent_task_for_glasshive_callback(
-                    run,
-                    status=status,
-                    result_summary=result_summary
-                    or str(run.get("result_summary") or ""),
-                    error_class=error_class,
-                    payload=payload,
-                    received_at=now,
-                )
-            return JSONResponse({"status": "http_accepted", "run_id": run["run_id"]})
+                    callback_persisted = bool(applied.get("updated"))
+                    if callback_persisted:
+                        run = applied.get("run") or run
+                        private_detail = _append_private_callback(run, payload, now)
+                    elif str((applied.get("run") or {}).get("status") or "") not in {
+                        "completed", "failed", "cancelled",
+                    }:
+                        return JSONResponse(
+                            {"status": "error", "reason": "callback_effect_not_persisted",
+                             "run_id": run["run_id"], "callback_persisted": False},
+                            status_code=503,
+                        )
+                else:
+                    private_detail = _append_private_callback(run, payload, now)
+                    callback_persisted = bool(storage.update_scheduled_prompt_run(str(run["run_id"]), updates))
+                if callback_persisted:
+                    _update_parent_task_for_glasshive_callback(
+                        run,
+                        status=status,
+                        result_summary=result_summary or str(run.get("result_summary") or ""),
+                        error_class=error_class,
+                        payload=payload,
+                        received_at=now,
+                    )
+            return JSONResponse({
+                "status": "http_accepted", "run_id": run["run_id"],
+                "callback_persisted": callback_persisted,
+            })
 
         if not receiver_effect_is_current():
             return receiver_lost_response()
@@ -2008,7 +2088,11 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             "executor": args.executor,
             # === VIVENTIUM NOTE ===
             "conversation_policy": args.conversation_policy,
-            "conversation_id": args.conversation_id,
+            "conversation_id": (
+                _resolve_same_conversation_id(args.conversation_id)
+                if args.conversation_policy == "same"
+                else args.conversation_id
+            ),
             "last_conversation_id": None,
             "active": 1 if args.active else 0,
             "created_by": created_by,
@@ -2200,6 +2284,14 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             selected_required_capabilities,
             executor=effective_executor,
         )
+        effective_conversation_policy = (
+            args.conversation_policy or existing.get("conversation_policy") or "new"
+        )
+        resolved_conversation_id = args.conversation_id
+        if effective_conversation_policy == "same" and (
+            args.conversation_policy == "same" or args.conversation_id is not None
+        ):
+            resolved_conversation_id = _resolve_same_conversation_id(args.conversation_id)
 
         updates: Dict[str, Any] = {
             "updated_at": to_utc_iso(now),
@@ -2221,15 +2313,15 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             updates["executor"] = args.executor
         if args.conversation_policy is not None:
             updates["conversation_policy"] = args.conversation_policy
-            if args.conversation_policy == "same" and not args.conversation_id:
+            if args.conversation_policy == "same" and not resolved_conversation_id:
                 last_convo = existing.get("last_conversation_id")
                 current_convo = existing.get("conversation_id")
                 if last_convo and not current_convo:
                     updates["conversation_id"] = last_convo
             if args.conversation_policy == "new" and args.conversation_id is None:
                 updates["conversation_id"] = None
-        if args.conversation_id is not None:
-            updates["conversation_id"] = args.conversation_id
+        if resolved_conversation_id is not None:
+            updates["conversation_id"] = resolved_conversation_id
         if args.active is not None:
             updates["active"] = 1 if args.active else 0
         if (

@@ -31,6 +31,7 @@ module.exports = {
   // This integration contract owns parent Viventium release scripts and runs in a full checkout.
   testPathIgnorePatterns: [
     '/node_modules/',
+    '/__tests__/fixtures/',
     ...(!hasParentReleaseContracts
       ? [
           '/server/services/viventium/__tests__/ViventiumOrchestrationMode\\.spec\\.js$',

@@ -45,6 +45,10 @@ export interface InteractionSourceSegment {
   ordinal: number;
   source_event_id: string;
   source_index: number;
+  source_sequence?: number;
+  source_message_id?: string;
+  source_persisted?: true;
+  source_parent_message_id?: string;
   text: string;
   source_files?: readonly InteractionSourceFile[];
   truncated?: true;
@@ -108,6 +112,11 @@ export function normalizeInteractionSourceSegments(
         ordinal: 0,
         source_event_id: sourceEventId,
         source_index: sourceIndex,
+        ...(Number.isSafeInteger(candidate.source_sequence) && Number(candidate.source_sequence) > 0
+          ? { source_sequence: Number(candidate.source_sequence) } : {}),
+        ...(candidate.source_persisted === true ? { source_persisted: true as const } : {}),
+        ...(boundedIdentifier(candidate.source_message_id) ? { source_message_id: boundedIdentifier(candidate.source_message_id) } : {}),
+        ...(boundedIdentifier(candidate.source_parent_message_id) ? { source_parent_message_id: boundedIdentifier(candidate.source_parent_message_id) } : {}),
         text: clipped.text,
         ...(sourceFiles.length ? { source_files: sourceFiles } : {}),
         ...(truncated

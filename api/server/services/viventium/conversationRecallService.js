@@ -26,6 +26,8 @@ const {
   buildConversationRecallFilename,
   parseConversationRecallAgentIdFromFilename,
 } = require('librechat-data-provider');
+const { resolveConversationRecallPreference } = require('@librechat/api');
+const { escapeXmlText, renderConversationRecallTurn } = require('./conversationRecallSource');
 const { uploadVectors, deleteVectors } = require('~/server/services/Files/VectorDB/crud');
 const { Agent, Conversation, File, Message, User } = require('~/db/models');
 const {
@@ -422,21 +424,6 @@ function computeAdaptiveUploadTimeoutMs(charCount) {
   return Math.min(UPLOAD_TIMEOUT_MAX_MS, adaptiveTimeout);
 }
 
-function escapeXmlText(value) {
-  return String(value || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
-function escapeXmlAttr(value) {
-  return String(value || '')
-    .replace(/&/g, '&amp;')
-    .replace(/"/g, '&quot;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
 function renderConversationRecallCorpus({ segments, scope, latestTimestamp }) {
   const semanticLines = [
     '<semantic_context>',
@@ -600,7 +587,7 @@ async function getAgentIdForConversation(userId, conversationId) {
 
 async function getRecallPolicy({ userId, conversationId, agentId: _agentId }) {
   const user = await User.findById(userId).select('personalization').lean();
-  const globalEnabled = user?.personalization?.conversation_recall === true;
+  const globalEnabled = resolveConversationRecallPreference(user);
 
   const agentId = _agentId ?? (await getAgentIdForConversation(userId, conversationId));
   let agentOnlyEnabled = false;
@@ -694,21 +681,14 @@ async function buildConversationRecallCorpus({ userId, agentId }) {
       continue;
     }
 
-    const role = message.isCreatedByUser ? 'user' : message.sender || 'assistant';
     const timestamp = message.createdAt
       ? new Date(message.createdAt).toISOString()
       : new Date().toISOString();
-    const convoId = message.conversationId || 'unknown';
 
     if (!latestTimestamp || timestamp > latestTimestamp) {
       latestTimestamp = timestamp;
     }
-    const segment =
-      `<turn timestamp="${escapeXmlAttr(timestamp)}" conversation="${escapeXmlAttr(
-        convoId,
-      )}" role="${escapeXmlAttr(role)}">\n` +
-      `${escapeXmlText(content)}\n` +
-      '</turn>';
+    const segment = renderConversationRecallTurn({ message, content });
     segments.push(segment);
     totalChars += segment.length + 7;
 
@@ -1402,7 +1382,34 @@ function scheduleConversationRecallRefresh({ userId, agentId }) {
   scheduleTask(key, () => refreshConversationRecallForUser({ userId, agentId }), 500);
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Effective conversation recall on the user payload.
+ * Purpose: The UI mirrors `personalization.conversation_recall` only when it is defined, so an
+ * account that never chose showed the toggle off while the backend applied the installer default.
+ * Project the effective value onto the payload without persisting it; a saved choice is untouched.
+ * === VIVENTIUM END === */
+function withEffectiveConversationRecall(userData, env = process.env) {
+  if (!userData || typeof userData !== 'object') {
+    return userData;
+  }
+  const personalization =
+    userData.personalization && typeof userData.personalization === 'object'
+      ? userData.personalization
+      : {};
+  if (typeof personalization.conversation_recall === 'boolean') {
+    return userData;
+  }
+  return {
+    ...userData,
+    personalization: {
+      ...personalization,
+      conversation_recall: resolveConversationRecallPreference(userData, env),
+    },
+  };
+}
+
 module.exports = {
+  withEffectiveConversationRecall,
   scheduleConversationRecallSync,
   scheduleConversationRecallRefresh,
   /* exported for testability */

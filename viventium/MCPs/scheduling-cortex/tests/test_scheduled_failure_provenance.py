@@ -27,6 +27,18 @@ from scheduling_cortex.server import build_server
 from scheduling_cortex.storage import ScheduleStorage, StorageConfig
 
 
+@pytest.fixture
+def workbench_modules(monkeypatch: pytest.MonkeyPatch):
+    for source in (ROOT.parents[4], ROOT.parents[3] / "prompt-workbench" / "backend"):
+        if source.is_dir():
+            monkeypatch.syspath_prepend(str(source))
+    pytest.importorskip("scripts.viventium", reason="Cross-repository integration requires Viventium Core on PYTHONPATH")
+    pytest.importorskip("prompt_workbench", reason="Cross-repository integration requires Prompt Workbench backend on PYTHONPATH")
+    from prompt_workbench import cognitive_integrity, scheduled_prompts
+
+    return cognitive_integrity, scheduled_prompts
+
+
 def _task(
     storage: ScheduleStorage,
     *,
@@ -724,7 +736,7 @@ def test_scheduler_does_not_misreport_accepted_route_as_effective_execution(
 
 
 def test_native_winning_scheduled_route_reaches_run_ledger_and_workbench(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workbench_modules
 ) -> None:
     storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / "schedules.db")))
     task = _task(storage)
@@ -781,9 +793,7 @@ def test_native_winning_scheduled_route_reaches_run_ledger_and_workbench(
         lambda *_args, **_kwargs: {"followup_text": "", "canonical_text": ""},
     )
     monkeypatch.setattr(dispatch, "_get_json", lambda *_args: {})
-    monkeypatch.syspath_prepend(str(ROOT.parents[4]))
-    monkeypatch.syspath_prepend(str(ROOT.parents[3] / "prompt-workbench" / "backend"))
-    from prompt_workbench import scheduled_prompts
+    _cognitive_integrity, scheduled_prompts = workbench_modules
 
     engine = SchedulerEngine(
         storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300
@@ -805,7 +815,7 @@ def test_native_winning_scheduled_route_reaches_run_ledger_and_workbench(
 
 
 def test_scheduler_failure_reaches_workbench_and_cognitive_health_without_guessing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workbench_modules
 ) -> None:
     storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / "schedules.db")))
     task = _task(storage)
@@ -839,9 +849,7 @@ def test_scheduler_failure_reaches_workbench_and_cognitive_health_without_guessi
         ),
     )
     monkeypatch.setattr(dispatch, "_get_json", lambda *_args: {})
-    monkeypatch.syspath_prepend(str(ROOT.parents[4]))
-    monkeypatch.syspath_prepend(str(ROOT.parents[3] / "prompt-workbench" / "backend"))
-    from prompt_workbench import cognitive_integrity, scheduled_prompts
+    cognitive_integrity, scheduled_prompts = workbench_modules
 
     engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
     engine._process_task(task, datetime(2026, 8, 25, 15, 15, tzinfo=timezone.utc))

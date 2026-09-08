@@ -5,6 +5,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 
+const originalImageOutputRoot = process.env.VIVENTIUM_LIBRECHAT_IMAGE_OUTPUT_ROOT;
 const originalUploadsRoot = process.env.VIVENTIUM_LIBRECHAT_UPLOADS_ROOT;
 let testRoot;
 
@@ -27,6 +28,11 @@ afterEach(() => {
     delete process.env.VIVENTIUM_LIBRECHAT_UPLOADS_ROOT;
   } else {
     process.env.VIVENTIUM_LIBRECHAT_UPLOADS_ROOT = originalUploadsRoot;
+  }
+  if (originalImageOutputRoot == null) {
+    delete process.env.VIVENTIUM_LIBRECHAT_IMAGE_OUTPUT_ROOT;
+  } else {
+    process.env.VIVENTIUM_LIBRECHAT_IMAGE_OUTPUT_ROOT = originalImageOutputRoot;
   }
   jest.resetModules();
   fs.rmSync(testRoot, { recursive: true, force: true });
@@ -62,6 +68,23 @@ describe('Viventium uploads path isolation', () => {
   it('rejects an ambiguous relative compiler-owned uploads root', () => {
     expect(() => loadPathsWithUploadsRoot('relative/uploads')).toThrow(
       'VIVENTIUM_LIBRECHAT_UPLOADS_ROOT must be absolute',
+    );
+  });
+  it('uses an explicit image root and keeps the standalone image default', () => {
+    process.env.VIVENTIUM_LIBRECHAT_IMAGE_OUTPUT_ROOT = path.join(testRoot, 'data/uploads/images');
+    expect(loadPathsWithUploadsRoot(undefined).imageOutput).toBe(
+      process.env.VIVENTIUM_LIBRECHAT_IMAGE_OUTPUT_ROOT,
+    );
+    delete process.env.VIVENTIUM_LIBRECHAT_IMAGE_OUTPUT_ROOT;
+    expect(loadPathsWithUploadsRoot(undefined).imageOutput).toBe(
+      path.resolve(__dirname, '..', '..', 'client', 'public', 'images'),
+    );
+  });
+
+  it('rejects a relative image root before any image operation', () => {
+    process.env.VIVENTIUM_LIBRECHAT_IMAGE_OUTPUT_ROOT = 'relative/images';
+    expect(() => loadPathsWithUploadsRoot(undefined)).toThrow(
+      'VIVENTIUM_LIBRECHAT_IMAGE_OUTPUT_ROOT must be absolute',
     );
   });
 });

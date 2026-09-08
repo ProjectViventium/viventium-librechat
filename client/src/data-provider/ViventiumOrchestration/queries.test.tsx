@@ -50,6 +50,51 @@ describe('Viventium orchestration data hooks', () => {
     expect(request.get).toHaveBeenCalledWith('/api/viventium/orchestration/work');
   });
 
+  test('refreshes pending readiness without a window focus and stops polling when ready', async () => {
+    jest.useFakeTimers();
+    try {
+      (request.get as jest.Mock)
+        .mockResolvedValueOnce({
+          available: false,
+          mode: 'focused',
+          releaseGate: { label: 'NOT READY', blockers: ['stale'] },
+        })
+        .mockResolvedValue({ available: true, mode: 'focused' });
+      const preference = renderHook(() => useOrchestrationPreferenceQuery(), { wrapper });
+      await waitFor(() => expect(preference.result.current.data?.available).toBe(false));
+      await act(async () => {
+        jest.advanceTimersByTime(10_000);
+      });
+      await waitFor(() => expect(preference.result.current.data?.available).toBe(true));
+      const calls = (request.get as jest.Mock).mock.calls.length;
+      await act(async () => {
+        jest.advanceTimersByTime(30_000);
+      });
+      expect(request.get).toHaveBeenCalledTimes(calls);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('does not poll an intentionally disabled capability', async () => {
+    jest.useFakeTimers();
+    try {
+      (request.get as jest.Mock).mockResolvedValue({
+        available: false,
+        mode: 'focused',
+        releaseGate: { label: 'NOT READY', blockers: ['disabled'] },
+      });
+      const preference = renderHook(() => useOrchestrationPreferenceQuery(), { wrapper });
+      await waitFor(() => expect(preference.result.current.isSuccess).toBe(true));
+      await act(async () => {
+        jest.advanceTimersByTime(30_000);
+      });
+      expect(request.get).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   /* === VIVENTIUM START ===
    * Feature: Active work Control Panel discovery.
    * Purpose: Prevent duplicate preference traffic when startup config already enables the entry.

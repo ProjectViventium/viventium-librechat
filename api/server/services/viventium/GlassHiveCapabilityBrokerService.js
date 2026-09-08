@@ -1,3 +1,8 @@
+const {
+  backgroundWorkerResources,
+  resolveBackgroundWorkerRoute,
+  mainDelegationJsonSchema,
+} = require('@librechat/api');
 /* === VIVENTIUM START ===
  * Feature: GlassHive capability broker service
  * Purpose:
@@ -6,7 +11,14 @@
  * === VIVENTIUM END === */
 
 const { logger } = require('@librechat/data-schemas');
-const { loadWebSearchAuth } = require('@librechat/api');
+const { loadWebSearchAuth, reportCortexHostToolResult } = require('@librechat/api');
+const {
+  audioTranscriptionDefinition,
+  transcribeAttachedAudio,
+  transcriptionAttachmentReferences,
+} = require('@librechat/api');
+const { getFiles } = require('~/models');
+const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { CacheKeys } = require('librechat-data-provider');
 const { getMCPManager, getMCPServersRegistry, getFlowStateManager } = require('~/config');
 const { findToken, createToken, updateToken, deleteToken, getUserById } = require('~/models');
@@ -35,17 +47,71 @@ const {
   mcpToolAnnotations,
 } = require('./GlassHiveCapabilityPolicyService');
 const {
+  BROKER_AUTHORITY_KINDS,
   grantReplayTtlMs,
   rememberInvocation,
   verifyWriteConfirmation,
 } = require('./GlassHiveCapabilityBrokerAuth');
+const {
+  ACTIVE_WORK_ACTION_DESCRIPTION,
+  ACTIVE_WORK_ACTION_JSON_SCHEMA,
+  ACTIVE_WORK_LIST_DESCRIPTION,
+  ACTIVE_WORK_LIST_JSON_SCHEMA,
+  DELEGATION_TOOL_NAME,
+  MAIN_DELEGATION_DESCRIPTION,
+  MAIN_DELEGATION_JSON_SCHEMA,
+  canonicalConversationOrchestrationArguments,
+  isConversationOrchestrationMutationTool,
+  isConversationOrchestrationTool,
+} = require('./GlassHiveConversationOrchestration');
+const {
+  NativeOrchestrationOperationError,
+  commitNativeOrchestrationOperation,
+  nativeMutationInputSchema,
+  operationTokenFromArgs,
+  verifyNativeOrchestrationOperation,
+} = require('./GlassHiveNativeOrchestrationOperation');
+const {
+  getActiveWorkPage,
+  getActiveWorkHistoryPage,
+  invalidateActiveWorkSnapshot,
+} = require('./GlassHiveAccountService');
+const { readActiveWork } = require('@librechat/api');
+const { getGlassHiveWorkResult } = require('./GlassHiveWorkResultService');
+const { executeGlassHiveWorkAction } = require('./GlassHiveWorkActionService');
+const {
+  markGlassHiveLaunchDispatchUnknown,
+  markGlassHiveLaunchDispatchRejected,
+  reconcileGlassHiveLaunchResult,
+} = require('./GlassHiveCallbackBindingService');
+const { maybeInjectGlassHiveCapabilityBroker } = require('./GlassHiveCapabilityBootstrapService');
+const {
+  selectTrustedLaunchRequestBody,
+  trustedUploadedFilesFromRequestBody,
+} = require('./GlassHiveSourceSelection');
+
+const { activeMemoryWriterTool } = require('./memoryWriterCoordinator');
 
 const DEFAULT_PROVIDER = 'openai';
 const DEFAULT_DISCOVERY_CACHE_TTL_MS = 2 * 60 * 1000;
 const MAX_DISCOVERY_CACHE_GRANTS = 256;
 const GRANT_DISCOVERY_CACHE = new Map();
+const WORK_REF_PATTERN = /^[A-Za-z0-9._:-]{1,160}$/;
+const ACTIVE_WORK_ACTIONS = new Set(ACTIVE_WORK_ACTION_JSON_SCHEMA.properties.action.enum);
+
+function hostToolAnnotations({ access, riskClass, openWorldDefault }) {
+  return Object.freeze({
+    ...mcpToolAnnotations({ access, openWorldDefault }),
+    access,
+    riskClass,
+  });
+}
 
 const HOST_TOOL_DEFINITIONS = Object.freeze({
+  transcribe_audio: Object.freeze({
+    ...audioTranscriptionDefinition,
+    annotations: Object.freeze(mcpToolAnnotations({ access: 'read', openWorldDefault: false })),
+  }),
   file_search: Object.freeze({
     name: 'file_search',
     description:
@@ -75,7 +141,52 @@ const HOST_TOOL_DEFINITIONS = Object.freeze({
     }),
     annotations: Object.freeze(mcpToolAnnotations({ access: 'read', openWorldDefault: true })),
   }),
+  /* === VIVENTIUM START ===
+   * Feature: Main-only durable orchestration facades.
+   * Purpose: Give native conversation Main the canonical Core launch/list/action paths without
+   * accepting owner authority or execution mode from model-controlled input.
+   * === VIVENTIUM END === */
+  [DELEGATION_TOOL_NAME]: Object.freeze({
+    name: DELEGATION_TOOL_NAME,
+    description: MAIN_DELEGATION_DESCRIPTION,
+    inputSchema: MAIN_DELEGATION_JSON_SCHEMA,
+    annotations: hostToolAnnotations({
+      access: 'write',
+      riskClass: 'durable_work_control',
+      openWorldDefault: false,
+    }),
+  }),
+  active_work_list: Object.freeze({
+    name: 'active_work_list',
+    description: ACTIVE_WORK_LIST_DESCRIPTION,
+    inputSchema: ACTIVE_WORK_LIST_JSON_SCHEMA,
+    annotations: hostToolAnnotations({
+      access: 'read',
+      riskClass: 'durable_work_read',
+      openWorldDefault: false,
+    }),
+  }),
+  active_work_action: Object.freeze({
+    name: 'active_work_action',
+    description: ACTIVE_WORK_ACTION_DESCRIPTION,
+    inputSchema: ACTIVE_WORK_ACTION_JSON_SCHEMA,
+    annotations: hostToolAnnotations({
+      access: 'write',
+      riskClass: 'durable_work_control',
+      openWorldDefault: false,
+    }),
+  }),
 });
+
+function nativeConversationMutationDefinition(definition) {
+  return Object.freeze({
+    ...definition,
+    description:
+      `${definition.description} Native conversation providers commit this mutation in one exact ` +
+      'call. Exact retries in the same authenticated turn reuse the same Core-derived operation.',
+    inputSchema: nativeMutationInputSchema(definition.inputSchema),
+  });
+}
 
 function brokerDiscoveryRetryDelayMs() {
   const raw = Number(process.env.VIVENTIUM_GLASSHIVE_BROKER_DISCOVERY_RETRY_DELAY_MS);
@@ -321,14 +432,68 @@ async function buildCapabilityCatalog({ grant, signal, requestedServerNames, app
   const claimedBrokerToolNames = new Map();
 
   for (const toolName of grant?.allowed_host_tools || []) {
-    const definition = HOST_TOOL_DEFINITIONS[toolName];
+    if (
+      isConversationOrchestrationTool(toolName) &&
+      grant?.authority_kind !== BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
+    ) {
+      omissions.push({ reason: 'orchestration_authority_required', tool: toolName });
+      continue;
+    }
+    const memoryBinding = activeMemoryWriterTool(grant);
+    const resources = grant?.host_tool_resources?.[toolName];
+    const declaredDefinition =
+      memoryBinding?.definition.name === toolName
+        ? memoryBinding.definition
+        : HOST_TOOL_DEFINITIONS[toolName];
+    const baseDefinition =
+      toolName === DELEGATION_TOOL_NAME && declaredDefinition
+        ? { ...declaredDefinition, inputSchema: mainDelegationJsonSchema(resources?.request_body) }
+        : declaredDefinition;
+    const definition =
+      baseDefinition &&
+      grant?.authority_kind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR &&
+      isConversationOrchestrationMutationTool(toolName)
+        ? nativeConversationMutationDefinition(baseDefinition)
+        : baseDefinition;
     if (!definition) {
       omissions.push({ reason: 'unsupported_host_tool', tool: toolName });
       continue;
     }
-    const resources = grant?.host_tool_resources?.[toolName];
     if (toolName === 'file_search' && !Array.isArray(resources?.files)) {
       omissions.push({ reason: 'missing_host_tool_resources', tool: toolName });
+      continue;
+    }
+    if (toolName === DELEGATION_TOOL_NAME && resources?.version !== 1) {
+      omissions.push({ reason: 'missing_host_tool_resources', tool: toolName });
+      continue;
+    }
+    if (toolName === 'transcribe_audio') {
+      const files = transcriptionAttachmentReferences(
+        Array.isArray(resources?.files) ? resources.files : [],
+      );
+      if (files.length === 0) {
+        omissions.push({ reason: 'missing_host_tool_resources', tool: toolName });
+        continue;
+      }
+      hostTools.push({
+        toolName,
+        resources: { files },
+        definition: {
+          ...definition,
+          inputSchema: {
+            ...definition.inputSchema,
+            properties: {
+              file_id: {
+                ...definition.inputSchema.properties.file_id,
+                oneOf: files.map((file) => ({
+                  const: file.file_id,
+                  title: file.filename || file.file_id,
+                })),
+              },
+            },
+          },
+        },
+      });
       continue;
     }
     hostTools.push({ toolName, definition, resources });
@@ -415,6 +580,10 @@ async function buildCapabilityCatalog({ grant, signal, requestedServerNames, app
 
   return {
     user,
+    authorityKind:
+      grant?.authority_kind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
+        ? BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
+        : BROKER_AUTHORITY_KINDS.MISSION_WORKER,
     servers,
     omissions,
     tools,
@@ -454,7 +623,10 @@ function publicCatalog(catalog) {
     })),
     hostTools: catalog.hostTools.map((item) => ({
       name: item.toolName,
-      access: 'read',
+      access: item.definition?.annotations?.access || 'read',
+      ...(item.definition?.annotations?.riskClass
+        ? { riskClass: item.definition.annotations.riskClass }
+        : {}),
       transport: 'host',
     })),
     omissions: catalog.omissions,
@@ -466,7 +638,552 @@ function findHostTool(catalog, toolName) {
   return catalog.hostTools.find((item) => item.toolName === toolName);
 }
 
-async function invokeHostTool({ grant, catalog, hostTool, args = {}, signal } = {}) {
+function cleanBoundedString(value, maxLength) {
+  return typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
+}
+
+const GLASSHIVE_MCP_RESULT_MAX_CHARS = 1024 * 1024;
+const GLASSHIVE_MCP_RESULT_MAX_DEPTH = 8;
+const SAFE_DELEGATION_FAILURE_CODE = /^[a-z][a-z0-9_]{0,119}$/;
+const GLASSHIVE_RESULT_CONTAINER_KEYS = Object.freeze([
+  'structuredContent',
+  'structured_content',
+  'result',
+  'output',
+  'data',
+  'content',
+  'artifacts',
+]);
+
+function parseBoundedJsonObject(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text || text.length > GLASSHIVE_MCP_RESULT_MAX_CHARS) return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function isGlassHiveDispatchResult(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return ['status', 'work_ref', 'workRef', 'failure_class', 'failureClass'].some((key) =>
+    Object.prototype.hasOwnProperty.call(value, key),
+  );
+}
+
+function decodedGlassHiveMcpResult(value, depth = 0, visited = new Set()) {
+  if (depth > GLASSHIVE_MCP_RESULT_MAX_DEPTH || value == null) return null;
+  if (typeof value === 'string') {
+    const parsed = parseBoundedJsonObject(value);
+    return parsed ? decodedGlassHiveMcpResult(parsed, depth + 1, visited) : null;
+  }
+  if (typeof value !== 'object' || visited.has(value)) return null;
+  visited.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const decoded = decodedGlassHiveMcpResult(item, depth + 1, visited);
+      if (decoded) return decoded;
+    }
+    return null;
+  }
+  if (isGlassHiveDispatchResult(value)) return value;
+  if (value.type === 'text') {
+    const decodedText = decodedGlassHiveMcpResult(value.text, depth + 1, visited);
+    if (decodedText) return decodedText;
+  }
+  for (const key of GLASSHIVE_RESULT_CONTAINER_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    const decoded = decodedGlassHiveMcpResult(value[key], depth + 1, visited);
+    if (decoded) return decoded;
+  }
+  return null;
+}
+
+function glassHiveMcpToolError(value, depth = 0, visited = new Set()) {
+  if (depth > GLASSHIVE_MCP_RESULT_MAX_DEPTH || value == null || typeof value !== 'object') {
+    return false;
+  }
+  if (visited.has(value)) return false;
+  visited.add(value);
+  if (!Array.isArray(value) && (value.isError === true || value.is_error === true)) return true;
+  if (Array.isArray(value)) {
+    return value.some((item) => glassHiveMcpToolError(item, depth + 1, visited));
+  }
+  return GLASSHIVE_RESULT_CONTAINER_KEYS.some(
+    (key) =>
+      Object.prototype.hasOwnProperty.call(value, key) &&
+      glassHiveMcpToolError(value[key], depth + 1, visited),
+  );
+}
+
+function safeDelegationFailureCode(result) {
+  for (const value of [result?.failure_class, result?.failureClass, result?.reason]) {
+    const code = cleanBoundedString(value, 120).toLowerCase();
+    if (SAFE_DELEGATION_FAILURE_CODE.test(code)) return code;
+  }
+  return 'glasshive_delegation_blocked';
+}
+
+function safeDelegationDiagnosticCode(error, fallback) {
+  for (const value of [error?.code, error?.name]) {
+    const code = cleanBoundedString(value, 120).toLowerCase();
+    if (code !== 'error' && SAFE_DELEGATION_FAILURE_CODE.test(code)) return code;
+  }
+  return fallback;
+}
+
+function glassHiveDelegationRetryable(result) {
+  for (const value of [result?.retryable, result?.failure_retryable, result?.failureRetryable]) {
+    if (typeof value === 'boolean') return value;
+  }
+  return [408, 429].includes(Number(result?.status)) || Number(result?.status) >= 500;
+}
+
+function glassHiveDelegationNeedsInput(result) {
+  return result?.needs_input === true || result?.needsInput === true;
+}
+
+function validActiveWorkActionArgs(args = {}) {
+  const canonical = canonicalConversationOrchestrationArguments('active_work_action', args);
+  const { workRef, action, instruction = '' } = canonical;
+  if (!WORK_REF_PATTERN.test(workRef) || !ACTIVE_WORK_ACTIONS.has(action)) return null;
+  if (['queue', 'message', 'steer'].includes(action) && !instruction) return null;
+  return { workRef, action, ...(instruction ? { instruction } : {}) };
+}
+
+function glassHiveMissionServerName() {
+  return (
+    String(process.env.VIVENTIUM_GLASSHIVE_MCP_SERVER_NAMES || 'glasshive-workers-projects')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean)[0] || 'glasshive-workers-projects'
+  );
+}
+
+function delegationToolArguments(args = {}) {
+  const canonical = canonicalConversationOrchestrationArguments(DELEGATION_TOOL_NAME, args);
+  if (!canonical.title || !canonical.instruction) return null;
+  const optional = {
+    goal: canonical.goal,
+    worker_name: canonical.workerName,
+    worker_role: canonical.workerRole,
+    profile: canonical.profile,
+    effort: canonical.effort,
+    resource_class: canonical.resourceClass,
+    long_mission: canonical.longMission,
+  };
+  return {
+    title: canonical.title,
+    instruction: canonical.instruction,
+    ...Object.fromEntries(Object.entries(optional).filter(([, value]) => value !== undefined)),
+    reuse_existing_workspace: false,
+    require_callback: true,
+    execution_mode:
+      process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE === 'host' ? 'host' : 'docker',
+    expose_diagnostics: false,
+  };
+}
+
+async function invokeConversationDelegation({
+  grant,
+  catalog,
+  hostTool,
+  args,
+  invocationId,
+  trustedToolCall,
+  signal,
+}) {
+  let canonicalArgs;
+  try {
+    canonicalArgs = canonicalConversationOrchestrationArguments(DELEGATION_TOOL_NAME, args);
+  } catch {
+    return {
+      status: 'blocked',
+      reason: 'invalid_arguments',
+      tool: hostTool.toolName,
+      retryable: false,
+      needsInput: false,
+    };
+  }
+  if (
+    canonicalArgs.requiresHostAccess === true &&
+    process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE !== 'host'
+  ) {
+    return {
+      status: 'blocked',
+      reason: 'host_access_unavailable_in_parallel',
+      tool: hostTool.toolName,
+      needsInput: true,
+      retryable: false,
+    };
+  }
+  const resources = hostTool.resources || {};
+  const { args: routedArgs, authority: workerRouteAuthority } = resolveBackgroundWorkerRoute(
+    canonicalArgs,
+    resources,
+  );
+  const toolArguments = delegationToolArguments(routedArgs);
+  const stableInvocationId = cleanBoundedString(invocationId, 192);
+  if (!toolArguments || !stableInvocationId) {
+    return { status: 'blocked', reason: 'invalid_arguments', tool: hostTool.toolName };
+  }
+  const baseRequestBody =
+    resources.request_body &&
+    typeof resources.request_body === 'object' &&
+    !Array.isArray(resources.request_body)
+      ? resources.request_body
+      : {};
+  const selection = selectTrustedLaunchRequestBody(baseRequestBody, routedArgs.sourceOrdinals);
+  if (selection.error) {
+    return { status: 'blocked', reason: selection.error, tool: hostTool.toolName };
+  }
+  const requestBody = selection.requestBody;
+  const trustedUploadedFiles = trustedUploadedFilesFromRequestBody(requestBody);
+  if (trustedUploadedFiles.length > 0) {
+    toolArguments.uploaded_files = trustedUploadedFiles;
+  }
+  const config = {
+    signal,
+    toolCall: {
+      id: cleanBoundedString(trustedToolCall?.id, 256) || stableInvocationId,
+      stepId: cleanBoundedString(trustedToolCall?.stepId, 256),
+      name: 'worker_delegate_once',
+      turn: Number.isInteger(Number(trustedToolCall?.turn)) ? Number(trustedToolCall.turn) : 0,
+    },
+    configurable: {
+      user: catalog.user,
+      requestBody,
+      glasshive_worker_memory: cleanBoundedString(resources.worker_memory, 200000),
+      glasshive_worker_feelings: cleanBoundedString(resources.worker_feelings, 200000),
+      glasshive_worker_feelings_enabled: resources.worker_feelings_enabled === true,
+      glasshive_worker_feelings_hash: cleanBoundedString(resources.worker_feelings_hash, 256),
+      glasshive_worker_feelings_scope: cleanBoundedString(resources.worker_feelings_scope, 64),
+      glasshive_worker_feelings_range_prompt_override_count: Number(
+        resources.worker_feelings_range_prompt_override_count || 0,
+      ),
+      glasshive_worker_feelings_active_range_prompt_override_count: Number(
+        resources.worker_feelings_active_range_prompt_override_count || 0,
+      ),
+      glasshive_worker_feelings_active_range_prompt_override_chars: Number(
+        resources.worker_feelings_active_range_prompt_override_chars || 0,
+      ),
+      glasshive_host_tools: Array.isArray(resources.mission_host_tools)
+        ? resources.mission_host_tools
+        : [],
+      glasshive_host_tool_resources:
+        resources.mission_host_tool_resources &&
+        typeof resources.mission_host_tool_resources === 'object' &&
+        !Array.isArray(resources.mission_host_tool_resources)
+          ? resources.mission_host_tool_resources
+          : {},
+      glasshive_capability_dependency:
+        resources.capability_dependency &&
+        typeof resources.capability_dependency === 'object' &&
+        !Array.isArray(resources.capability_dependency)
+          ? resources.capability_dependency
+          : {},
+      glasshive_launch_authority_kind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
+      glasshive_worker_route: workerRouteAuthority,
+    },
+  };
+  let effectiveToolArguments = null;
+  let dispatchStage = 'launch_preparation';
+  try {
+    const serverName = glassHiveMissionServerName();
+    effectiveToolArguments = await maybeInjectGlassHiveCapabilityBroker({
+      serverName,
+      toolName: 'worker_delegate_once',
+      toolArguments,
+      config,
+    });
+    const mcpManager = getMCPManager(catalog.user.id);
+    if (requestBody.viventiumVoiceCallSessionId) {
+      if (
+        requestBody.viventiumVoiceWorkAuthority?.callSessionId !==
+        requestBody.viventiumVoiceCallSessionId
+      ) {
+        throw Object.assign(new Error('voice_work_authority_stale'), {
+          code: 'voice_work_authority_stale',
+          status: 409,
+          retryable: false,
+        });
+      }
+      await require('./VoiceWorkAuthorityService').assertVoiceWorkAuthority(
+        requestBody.viventiumVoiceWorkAuthority,
+        catalog.user.id,
+      );
+    }
+    dispatchStage = 'mcp_transport';
+    const rawResult = await mcpManager.callTool({
+      serverName,
+      toolName: 'worker_delegate_once',
+      provider: DEFAULT_PROVIDER,
+      toolArguments: effectiveToolArguments,
+      options: { signal },
+      user: catalog.user,
+      requestBody,
+      flowManager: getFlowStateManager(getLogStores(CacheKeys.FLOWS)),
+      tokenMethods: { findToken, createToken, updateToken, deleteToken },
+      oauthStart: async () => {
+        throw new Error('OAuth authentication required for the GlassHive mission service');
+      },
+      oauthEnd: async () => {},
+      graphTokenResolver: getGraphApiToken,
+      returnRawResponse: true,
+    });
+    dispatchStage = 'mcp_result_classification';
+    const result = decodedGlassHiveMcpResult(rawResult);
+    const dispatchStatus = cleanBoundedString(result?.status, 64).toLowerCase();
+    if (['blocked', 'failed', 'rejected'].includes(dispatchStatus)) {
+      const blockedError = new Error(safeDelegationFailureCode(result));
+      blockedError.code = blockedError.message;
+      try {
+        await markGlassHiveLaunchDispatchRejected(effectiveToolArguments, blockedError);
+      } catch (cleanupError) {
+        await markGlassHiveLaunchDispatchUnknown(effectiveToolArguments).catch(() => {});
+        logger.warn(
+          '[VIVENTIUM][glasshive-capability-broker] Main delegation rejection cleanup deferred',
+          { code: safeDelegationDiagnosticCode(cleanupError, 'launch_rejection_cleanup_failed') },
+        );
+      }
+      return {
+        status: 'blocked',
+        reason: blockedError.code,
+        tool: hostTool.toolName,
+        retryable: glassHiveDelegationRetryable(result),
+        needsInput: glassHiveDelegationNeedsInput(result),
+      };
+    }
+    if (glassHiveMcpToolError(rawResult) && !result?.work_ref && !result?.workRef) {
+      await markGlassHiveLaunchDispatchUnknown(effectiveToolArguments).catch(() => {});
+      return {
+        status: 'blocked',
+        reason: 'glasshive_delegation_tool_error',
+        tool: hostTool.toolName,
+        retryable: false,
+        needsInput: false,
+      };
+    }
+    dispatchStage = 'receipt_reconciliation';
+    const receipt = await reconcileGlassHiveLaunchResult({
+      toolArguments: effectiveToolArguments,
+      result,
+    });
+    if (!receipt?.workRef) {
+      const error = new Error('glasshive_delegation_receipt_unconfirmed');
+      error.code = 'glasshive_delegation_receipt_unconfirmed';
+      throw error;
+    }
+    invalidateActiveWorkSnapshot({ ownerId: catalog.user.id });
+    return {
+      status: 'ok',
+      tool: hostTool.toolName,
+      workRef: receipt.workRef,
+      dispatch: result,
+    };
+  } catch (error) {
+    if (dispatchStage === 'launch_preparation') {
+      return {
+        status: 'blocked',
+        reason: safeDelegationDiagnosticCode(error, 'glasshive_delegation_rejected'),
+        tool: hostTool.toolName,
+        retryable: glassHiveDelegationRetryable(error),
+        needsInput: error?.needsInput === true,
+      };
+    }
+    if (effectiveToolArguments) {
+      await markGlassHiveLaunchDispatchUnknown(effectiveToolArguments).catch(() => {});
+    }
+    logger.warn('[VIVENTIUM][glasshive-capability-broker] Main delegation unconfirmed', {
+      stage: dispatchStage,
+      code: safeDelegationDiagnosticCode(error, 'delegation_dispatch_unconfirmed'),
+    });
+    return {
+      status: 'blocked',
+      reason: 'delegation_dispatch_unconfirmed',
+      tool: hostTool.toolName,
+      retryable: true,
+    };
+  }
+}
+
+async function executeMainDelegation({
+  user,
+  requestBody,
+  workerMemory = '',
+  workerFeelings = '',
+  workerFeelingsEnabled = false,
+  workerFeelingsHash = '',
+  workerFeelingsScope = 'unknown',
+  workerFeelingsRangePromptOverrideCount = 0,
+  workerFeelingsActiveRangePromptOverrideCount = 0,
+  workerFeelingsActiveRangePromptOverrideChars = 0,
+  missionHostTools = [],
+  missionHostToolResources = {},
+  capabilityDependency = {},
+  args,
+  invocationId,
+  toolCall,
+  signal,
+  workerProfile = '',
+  workerModel = '',
+  workerReasoningEffort = '',
+  fallbackWorkerProfile = '',
+  fallbackWorkerModel = '',
+  fallbackWorkerReasoningEffort = '',
+} = {}) {
+  const ownerId = cleanBoundedString(user?.id || user?._id, 160);
+  if (!ownerId) {
+    return {
+      status: 'blocked',
+      reason: 'delegation_owner_unavailable',
+      tool: DELEGATION_TOOL_NAME,
+    };
+  }
+  return invokeConversationDelegation({
+    grant: { grant_id: `core_main_${cleanBoundedString(invocationId, 192)}` },
+    catalog: { user: { ...user, id: ownerId } },
+    hostTool: {
+      toolName: DELEGATION_TOOL_NAME,
+      resources: {
+        request_body: requestBody,
+        worker_memory: workerMemory,
+        worker_feelings: workerFeelings,
+        worker_feelings_enabled: workerFeelingsEnabled === true,
+        worker_feelings_hash: workerFeelingsHash,
+        worker_feelings_scope: workerFeelingsScope,
+        worker_feelings_range_prompt_override_count: workerFeelingsRangePromptOverrideCount,
+        worker_feelings_active_range_prompt_override_count:
+          workerFeelingsActiveRangePromptOverrideCount,
+        worker_feelings_active_range_prompt_override_chars:
+          workerFeelingsActiveRangePromptOverrideChars,
+        mission_host_tools: missionHostTools,
+        mission_host_tool_resources: missionHostToolResources,
+        capability_dependency: capabilityDependency,
+        ...backgroundWorkerResources({
+          workerProfile,
+          workerModel,
+          workerReasoningEffort,
+          fallbackWorkerProfile,
+          fallbackWorkerModel,
+          fallbackWorkerReasoningEffort,
+        }),
+      },
+    },
+    args,
+    invocationId,
+    trustedToolCall: toolCall,
+    signal,
+  });
+}
+
+async function invokeConversationOrchestrationTool({
+  grant,
+  catalog,
+  hostTool,
+  args = {},
+  invocationId,
+  signal,
+}) {
+  if (hostTool.toolName === DELEGATION_TOOL_NAME) {
+    return invokeConversationDelegation({
+      grant,
+      catalog,
+      hostTool,
+      args,
+      invocationId,
+      signal,
+    });
+  }
+  if (hostTool.toolName === 'active_work_list') {
+    const result = await readActiveWork(catalog.user.id, args, {
+      getActiveWorkPage,
+      getActiveWorkHistoryPage,
+      getGlassHiveWorkResult,
+    });
+    return { status: 'ok', tool: hostTool.toolName, result };
+  }
+  if (hostTool.toolName === 'active_work_action') {
+    if (hostTool.resources?.version !== 1) {
+      return {
+        status: 'blocked',
+        reason: 'invalid_capability_contract',
+        tool: hostTool.toolName,
+        retryable: false,
+      };
+    }
+    const input = validActiveWorkActionArgs(args);
+    const stableInvocationId = cleanBoundedString(invocationId, 192);
+    if (!input || !stableInvocationId) {
+      return { status: 'blocked', reason: 'invalid_arguments', tool: hostTool.toolName };
+    }
+    try {
+      const result = await executeGlassHiveWorkAction({
+        ownerId: catalog.user.id,
+        ...input,
+        operationId: stableInvocationId,
+        ...(hostTool.resources.request_body?.viventiumVoiceCallSessionId
+          ? {
+              voiceAuthorityContext: {
+                callSessionId: hostTool.resources.request_body.viventiumVoiceCallSessionId,
+                binding: hostTool.resources.request_body.viventiumVoiceWorkAuthority,
+              },
+            }
+          : {}),
+      });
+      return { status: 'ok', tool: hostTool.toolName, result };
+    } catch (error) {
+      return {
+        status: 'blocked',
+        reason: cleanBoundedString(error?.code || error?.message, 120) || 'work_action_rejected',
+        tool: hostTool.toolName,
+        retryable: glassHiveDelegationRetryable(error),
+      };
+    }
+  }
+  return { status: 'not_found', tool: hostTool.toolName };
+}
+
+async function invokeHostTool({ grant, catalog, hostTool, args = {}, invocationId, signal } = {}) {
+  const memoryBinding = activeMemoryWriterTool(grant);
+  if (memoryBinding?.definition.name === hostTool.toolName) {
+    return memoryBinding.invoke(grant, args);
+  }
+  if (isConversationOrchestrationTool(hostTool.toolName)) {
+    return invokeConversationOrchestrationTool({
+      grant,
+      catalog,
+      hostTool,
+      args,
+      invocationId,
+      signal,
+    });
+  }
+  if (hostTool.toolName === 'transcribe_audio') {
+    return transcribeAttachedAudio(
+      {
+        ownerId: catalog.user.id,
+        args,
+        signal,
+        allowedFileIds: (hostTool.resources?.files || []).map((file) => file.file_id),
+      },
+      {
+        readFile: async (ownerId, fileId) => {
+          const [file] = await getFiles({ user: ownerId, file_id: fileId });
+          if (!file) return null;
+          const { getDownloadStream } = getStrategyFunctions(file.source);
+          const stream = await getDownloadStream(
+            { user: catalog.user, config: catalog.appConfig },
+            file.filepath,
+          );
+          return { file, stream };
+        },
+      },
+    );
+  }
   const query = typeof args.query === 'string' ? args.query.trim() : '';
   if (!query) {
     return { status: 'blocked', reason: 'invalid_arguments', tool: hostTool.toolName };
@@ -784,7 +1501,14 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
   /* === VIVENTIUM END === */
 }
 
-async function handleToolCall({ grant, toolName, args = {}, signal, appConfig } = {}) {
+async function handleToolCall({
+  grant,
+  toolName,
+  args = {},
+  invocationId = '',
+  signal,
+  appConfig,
+} = {}) {
   if (toolName === 'capabilities_list') {
     const catalog = await buildCapabilityCatalog({ grant, signal, appConfig });
     return publicCatalog(catalog);
@@ -841,7 +1565,58 @@ async function handleToolCall({ grant, toolName, args = {}, signal, appConfig } 
   const catalog = await buildCapabilityCatalog({ grant, signal, appConfig });
   const hostTool = findHostTool(catalog, toolName);
   if (hostTool) {
-    return invokeHostTool({ grant, catalog, hostTool, args, signal });
+    let effectiveArgs = args;
+    let effectiveInvocationId = invocationId;
+    if (
+      grant?.authority_kind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR &&
+      isConversationOrchestrationMutationTool(toolName)
+    ) {
+      let canonicalMutationArgs;
+      try {
+        canonicalMutationArgs = canonicalConversationOrchestrationArguments(toolName, args);
+      } catch {
+        return {
+          status: 'blocked',
+          reason: 'invalid_arguments',
+          tool: toolName,
+          retryable: false,
+          needsInput: false,
+        };
+      }
+      try {
+        const operationToken = operationTokenFromArgs(args);
+        const commit = operationToken
+          ? verifyNativeOrchestrationOperation({
+              token: operationToken,
+              grant,
+              toolName,
+              args: canonicalMutationArgs,
+            })
+          : commitNativeOrchestrationOperation({
+              grant,
+              toolName,
+              args: canonicalMutationArgs,
+            });
+        effectiveArgs = commit.args;
+        effectiveInvocationId = commit.invocationId;
+      } catch (error) {
+        const reason =
+          error instanceof NativeOrchestrationOperationError
+            ? error.code
+            : 'orchestration_operation_token_invalid';
+        return { status: 'blocked', reason, tool: toolName, retryable: false };
+      }
+    }
+    const result = await invokeHostTool({
+      grant,
+      catalog,
+      hostTool,
+      args: effectiveArgs,
+      invocationId: effectiveInvocationId,
+      signal,
+    });
+    reportCortexHostToolResult(grant.grant_id, result);
+    return result;
   }
   const nativeTool = findNativeTool(catalog, toolName);
   if (!nativeTool) {
@@ -858,6 +1633,7 @@ async function handleToolCall({ grant, toolName, args = {}, signal, appConfig } 
 
 module.exports = {
   buildCapabilityCatalog,
+  executeMainDelegation,
   handleToolCall,
   publicCatalog,
   toolDefinitionsForMcp,

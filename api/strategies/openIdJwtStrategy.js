@@ -4,7 +4,13 @@ const { logger } = require('@librechat/data-schemas');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { get } = require('lodash');
 const { SystemRoles } = require('librechat-data-provider');
-const { isEnabled, findOpenIDUser, isEmailDomainAllowed, math } = require('@librechat/api');
+const {
+  getSessionCookieName,
+  isEnabled,
+  findOpenIDUser,
+  isEmailDomainAllowed,
+  math,
+} = require('@librechat/api');
 const { Strategy: JwtStrategy, ExtractJwt } = require('passport-jwt');
 const { getOpenIdEmail } = require('./openidStrategy');
 const { updateUser, findUser } = require('~/models');
@@ -172,9 +178,9 @@ const openIdJwtLogin = (openIdConfig) => {
           if (!accessToken || !refreshToken || !idToken) {
             const cookieHeader = req.headers.cookie;
             const parsedCookies = cookieHeader ? cookies.parse(cookieHeader) : {};
-            accessToken = accessToken || parsedCookies.openid_access_token;
-            idToken = idToken || parsedCookies.openid_id_token;
-            refreshToken = refreshToken || parsedCookies.refreshToken;
+            accessToken = accessToken || parsedCookies[getSessionCookieName('openid_access_token')];
+            idToken = idToken || parsedCookies[getSessionCookieName('openid_id_token')];
+            refreshToken = refreshToken || parsedCookies[getSessionCookieName('refreshToken')];
           }
 
           user.federatedTokens = {

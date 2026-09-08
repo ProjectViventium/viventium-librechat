@@ -233,6 +233,9 @@ export function createUserMethods(mongoose: typeof import('mongoose')) {
     }
     if (typeof personalization.conversation_recall === 'boolean') {
       updateSet['personalization.conversation_recall'] = personalization.conversation_recall;
+      /* === VIVENTIUM START === A saved preference is an explicit choice; installer-default
+       * reconciliation must never override it. === VIVENTIUM END === */
+      updateSet['personalization.conversation_recall_chosen'] = true;
     }
 
     if (Object.keys(updateSet).length === 0) {

@@ -34,9 +34,43 @@ module.exports = function createViventiumTelegramIngressEvent(db) {
       sourceEventId: { type: String, default: '', index: true },
       authorityBoundAt: { type: Date, default: null, index: true },
       /* === VIVENTIUM END === */
-      expiresAt: { type: Date, required: true, index: { expireAfterSeconds: 0 } },
+      sourceMessageId: String,
+      mediaGroupId: String,
+      inputPrimarySourceEventId: String,
+      inputRelatedSourceEventIds: [String],
+      requestedConversationId: String,
+      conversationGeneration: String,
+      inputState: {
+        type: String,
+        enum: ['preparing', 'ready', 'admitted', 'failed', 'completed', 'cancelled'],
+        index: true,
+      },
+      inputClaimToken: String,
+      inputRegistrationId: String,
+      inputLeaseUntil: { type: Number, default: 0, index: true },
+      inputRetryAt: { type: Number, default: 0 },
+      inputAttempts: { type: Number, default: 0 },
+      inputFailureCode: String,
+      inputPreparedDigest: String,
+      inputFailures: [{ _id: false, code: String, at: Number }],
+      expiresAt: {
+        type: Date,
+        required: function () {
+          return !this.inputState;
+        },
+        index: { expireAfterSeconds: 0 },
+      },
     },
     { timestamps: true },
+  );
+
+  schema.index(
+    { sourceEventId: 1 },
+    {
+      unique: true,
+      partialFilterExpression: { inputState: { $type: 'string' } },
+      name: 'viventium_telegram_prepared_source_unique',
+    },
   );
 
   schema.index(

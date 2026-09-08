@@ -20,6 +20,13 @@ const convoSchema: Schema<IConversation> = new Schema(
       default: 'New Chat',
       meiliIndex: true,
     },
+    /* === VIVENTIUM START === Explicit renames remain authoritative, including placeholder text. === */
+    titleSetByUser: {
+      type: Boolean,
+      default: undefined,
+      select: false,
+    },
+    /* === VIVENTIUM END === */
     user: {
       type: String,
       index: true,

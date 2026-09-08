@@ -21,11 +21,13 @@ jest.mock('~/models', () => ({
   findUser: jest.fn(),
 }));
 jest.mock('@librechat/api', () => ({
+  getSessionCookieName: jest.fn((name) => name),
   isEnabled: jest.fn(),
   findOpenIDUser: jest.fn(),
 }));
 
 const openIdClient = require('openid-client');
+const { EventEmitter } = require('node:events');
 const { isEnabled, findOpenIDUser } = require('@librechat/api');
 const { graphTokenController, refreshController } = require('./AuthController');
 const { getGraphApiToken } = require('~/server/services/GraphTokenService');
@@ -181,12 +183,12 @@ describe('refreshController – OpenID path', () => {
       session: {},
     };
 
-    res = {
+    res = Object.assign(new EventEmitter(), {
       status: jest.fn().mockReturnThis(),
       send: jest.fn().mockReturnThis(),
       redirect: jest.fn(),
       clearCookie: jest.fn(),
-    };
+    });
   });
 
   it('should call getOpenIdEmail with token claims and use result for findOpenIDUser', async () => {

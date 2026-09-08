@@ -1,10 +1,18 @@
 const axios = require('axios');
 const { logger } = require('@librechat/data-schemas');
 const { tool } = require('@librechat/agents/langchain/tools');
-const { generateShortLivedToken } = require('@librechat/api');
-const { Tools, EToolResources } = require('librechat-data-provider');
+const {
+  generateShortLivedToken,
+  rebuildSourceOnlyConversationRecallFiles,
+} = require('@librechat/api');
+const { Tools, EToolResources, ResourceType, PermissionBits } = require('librechat-data-provider');
 const { filterFilesByAgentAccess } = require('~/server/services/Files/permissions');
 const { getFiles } = require('~/models');
+/* === VIVENTIUM START ===
+ * Reuse current Agent authority for the existing rowless source-recall builder.
+ * === VIVENTIUM END === */
+const { getAgent } = require('~/models/Agent');
+const { checkPermission } = require('~/server/services/PermissionService');
 /* === VIVENTIUM START ===
  * Feature: Conversation recall exact-literal rescue.
  * Reason:
@@ -13,6 +21,9 @@ const { getFiles } = require('~/models');
  * - The tool now has a bounded source-backed rescue path for recall files only.
  * === VIVENTIUM END === */
 const { Message, Conversation } = require('~/db/models');
+const {
+  renderConversationRecallTurn: buildConversationRecallSnippet,
+} = require('~/server/services/viventium/conversationRecallSource');
 const {
   getMessageText: getConversationRecallMessageText,
   orderRecallMessagesParentFirst,
@@ -943,15 +954,6 @@ const parseConversationRecallAgentIdFromFileId = (fileId) => {
   return match?.[1] || null;
 };
 
-const buildConversationRecallSnippet = ({ message, content }) => {
-  const role = message?.isCreatedByUser ? 'user' : message?.sender || 'assistant';
-  const timestamp = message?.createdAt
-    ? new Date(message.createdAt).toISOString()
-    : new Date().toISOString();
-  const conversation = message?.conversationId || 'unknown';
-  return `<turn timestamp="${timestamp}" conversation="${conversation}" role="${role}">\n${content}\n</turn>`;
-};
-
 /* === VIVENTIUM START ===
  * Feature: Bounded adjacent-turn context for source-backed recall.
  * Purpose: Keep facts split across several short neighboring chat turns together without widening
@@ -1496,8 +1498,21 @@ const primeFiles = async (options) => {
   const agentResourceIds = new Set(file_ids);
   const resourceFiles = tool_resources?.[EToolResources.file_search]?.files ?? [];
 
-  // Get all files first
-  const allFiles = (await getFiles({ file_id: { $in: file_ids } }, null, { text: 0 })) ?? [];
+  /* === VIVENTIUM START ===
+   * Staged resources are snapshots. Current File rows own availability and uploaded-file metadata.
+   * === VIVENTIUM END === */
+  const requestedIds = [
+    ...new Set([...file_ids, ...resourceFiles.map((file) => file?.file_id)]),
+  ].filter(Boolean);
+  const allFiles =
+    (await getFiles(
+      {
+        file_id: { $in: requestedIds },
+        $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }],
+      },
+      null,
+      { text: 0 },
+    )) ?? [];
 
   // Filter by access if user and agent are provided
   let dbFiles;
@@ -1512,8 +1527,38 @@ const primeFiles = async (options) => {
     dbFiles = allFiles;
   }
 
+  /* === VIVENTIUM START ===
+   * Only the existing source-only builder can supply a rowless resource. A denied current row
+   * cannot regain access through this path, and native vector resources require a File row.
+   * === VIVENTIUM END === */
+  const currentIds = new Set(allFiles.map((file) => file.file_id));
+  const missingSourceFiles = resourceFiles.filter(
+    (file) =>
+      file?.viventiumConversationRecallMode === 'source_only' && !currentIds.has(file.file_id),
+  );
+  let virtualFiles = [];
+  if (req?.user?.id && agentId && missingSourceFiles.length) {
+    const agent = await getAgent({ id: agentId });
+    const allowed =
+      agent &&
+      (agent.author?.toString() === req.user.id.toString() ||
+        (await checkPermission({
+          userId: req.user.id,
+          role: req.user.role,
+          resourceType: ResourceType.AGENT,
+          resourceId: agent._id,
+          requiredPermission: PermissionBits.VIEW,
+        })));
+    if (allowed) {
+      virtualFiles = rebuildSourceOnlyConversationRecallFiles({
+        user: req.user,
+        agent,
+        files: missingSourceFiles,
+      });
+    }
+  }
   dbFiles = overlayConversationRecallRuntimeState(dbFiles, resourceFiles);
-  dbFiles = dedupeFilesById(dbFiles.concat(resourceFiles));
+  dbFiles = dedupeFilesById(dbFiles.concat(virtualFiles));
 
   let toolContext = `- Note: Semantic search is available through the ${Tools.file_search} tool but no files are currently loaded. Request the user to upload documents to search through.`;
 

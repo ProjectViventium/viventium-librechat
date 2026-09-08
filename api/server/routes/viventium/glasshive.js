@@ -173,27 +173,32 @@ async function ensureGlassHiveVoiceTask(body = {}, { createIfMissing = true } = 
     return { task: null, parentTask: null, mismatch: true };
   }
   await hydrateVoiceTasksForCall({ callSessionId, userId });
-  await hydrateVoiceTaskByStreamId(glassHiveVoiceTaskStreamId(runId), {
+  const scopedTask = await hydrateVoiceTaskByStreamId(glassHiveVoiceTaskStreamId(runId), {
     callSessionId,
     userId,
   });
-  if (parentStreamId) {
-    await hydrateVoiceTaskByStreamId(parentStreamId, { callSessionId, userId });
-  }
+  const parentTask = parentStreamId
+    ? await hydrateVoiceTaskByStreamId(parentStreamId, { callSessionId, userId })
+    : null;
   const existingTask = getVoiceTaskByStreamId(glassHiveVoiceTaskStreamId(runId));
   if (existingTask) {
     const mismatch =
+      !scopedTask ||
       existingTask.callSessionId !== callSessionId ||
       (existingTask.userId && existingTask.userId !== userId) ||
       (existingTask.conversationId && existingTask.conversationId !== conversationId);
     return { task: mismatch ? null : existingTask, parentTask: null, mismatch };
   }
-  const parentTask = parentStreamId ? getVoiceTaskByStreamId(parentStreamId) : null;
+  if (parentStreamId && getVoiceTaskByStreamId(parentStreamId) && !parentTask) {
+    return { task: null, parentTask: null, mismatch: true };
+  }
   if (
     parentTask &&
     (parentTask.callSessionId !== callSessionId ||
       (parentTask.userId && parentTask.userId !== userId) ||
-      (parentTask.conversationId && parentTask.conversationId !== conversationId))
+      (parentTask.conversationId &&
+        parentTask.conversationId !== 'new' &&
+        parentTask.conversationId !== conversationId))
   ) {
     return { task: null, parentTask, mismatch: true };
   }
@@ -507,8 +512,43 @@ function isEvidenceGateFailure({ failureCode = '', message = '' } = {}) {
   return code === 'glasshive_evidence_check_failed';
 }
 
+function callbackContractError(body = {}) {
+  for (const field of ['failure_code', 'failure_class']) {
+    const value = body[field];
+    if (value != null && typeof value !== 'string') {
+      return 'invalid_callback_failure_metadata';
+    }
+  }
+  if (body.work_state != null && typeof body.work_state !== 'string') {
+    return 'invalid_callback_work_state';
+  }
+  const event = typeof body.event === 'string' ? body.event.trim() : '';
+  if ((event === 'run.needs_input' || event === 'run.blocked') && body.work_terminal === true) {
+    return 'invalid_nonterminal_callback_contract';
+  }
+  return '';
+}
+
 function callbackText(body = {}) {
-  const event = String(body.event || '').trim();
+  const event = typeof body.event === 'string' ? body.event.trim() : '';
+  const structuredFailureCode =
+    typeof body.failure_code === 'string'
+      ? body.failure_code
+      : typeof body.failure_class === 'string'
+        ? body.failure_class
+        : '';
+  const nonterminalFailureCode = structuredFailureCode.trim().toLowerCase();
+  const canonicalNonterminalAttention =
+    body.work_terminal === false &&
+    typeof body.work_state === 'string' &&
+    body.work_state.trim().toLowerCase() === 'needs_input';
+  if (
+    (event === 'run.needs_input' || event === 'run.blocked') &&
+    canonicalNonterminalAttention &&
+    nonterminalFailureCode === 'provider_connected_account_reconnect_required'
+  ) {
+    return 'Reconnect the required model provider account in Settings > Account > Connected Accounts, then resume this mission.';
+  }
   if (event === 'run.completed' && isGlassHiveWorkTerminalCallback(body)) {
     return 'Mission completed.';
   }
@@ -539,7 +579,13 @@ function callbackText(body = {}) {
     return 'Mission needs user input.';
   }
   if (event === 'run.needs_input') {
-    return 'Mission needs user input.';
+    // The runtime's `failure_user_message` is the designated user-facing reason for the
+    // interruption. Raw `message` stays hidden from the neutral status card, as everywhere else.
+    const reason =
+      typeof body.failure_user_message === 'string'
+        ? sanitizeCallbackMessage(body.failure_user_message)
+        : '';
+    return reason ? `Mission needs user input. ${reason}` : 'Mission needs user input.';
   }
   if (event === 'run.blocked') {
     return 'Mission needs attention.';
@@ -1000,7 +1046,7 @@ async function rollbackSuppressedVoiceCallback({
 }) {
   if (priorStatusMessage && typeof db.updateMessage === 'function') {
     await db.updateMessage({ user: { id: userId } }, priorStatusMessage, {
-      context: 'viventium/routes/glasshive.callback.cancel_rollback',
+      operationKind: 'system', context: 'viventium/routes/glasshive.callback.cancel_rollback',
       overrideTimestamp: true,
     });
     return;
@@ -1208,6 +1254,10 @@ async function handleGlassHiveCallback(req, res) {
   }
 
   const rawBody = req.body || {};
+  const contractError = callbackContractError(rawBody);
+  if (contractError) {
+    return res.status(400).json({ error: contractError });
+  }
   let deliveryContext;
   try {
     deliveryContext = await resolveGlassHiveCallbackContext(rawBody, { deferConfirmation: true });
@@ -1533,7 +1583,32 @@ async function handleGlassHiveCallback(req, res) {
   const currentLeafMessage = parentResolution.currentLeaf?.message;
   const currentLeafId = String(parentResolution.currentLeaf?.messageId || '');
   if (parentResolution.blockedByActivePlaceholder) {
-    return res.status(425).json({ error: 'callback_conversation_tip_not_ready' });
+    if (!isGlassHiveWorkTerminalCallback(callbackBody)) {
+      return res.status(425).json({ error: 'callback_conversation_tip_not_ready' });
+    }
+    // The terminal result is durable independently of the conversation's active generation.
+    // Account for it now and let Main's existing adjudication path present it after the tip clears.
+    try {
+      await runTerminalEffect((effectFence) =>
+        reconcileCallbackExternalWork({ deliveryContext, body: callbackBody, effectFence }),
+      );
+    } catch (err) {
+      if (err instanceof TerminalCallbackEffectFenceError) throw err;
+      logger.warn(
+        '[VIVENTIUM][glasshive] Busy-tip callback reconciliation failed:',
+        sanitizeCallbackErrorForLog(err),
+      );
+      return res.status(503).json({ error: 'callback_reconciliation_failed' });
+    }
+    return res.status(202).json(
+      withTerminalResultReceipt(
+        {
+          ...httpAcceptedPayload({ callbackPersisted: true }),
+          reason: 'conversation_tip_busy',
+        },
+        terminalResultReceipt,
+      ),
+    );
   }
   if (
     currentLeafMessage?.isCreatedByUser === true &&
@@ -1623,14 +1698,14 @@ async function handleGlassHiveCallback(req, res) {
     if (priorStatusMessage && typeof db.updateMessage === 'function') {
       await runTerminalEffect(() =>
         db.updateMessage({ user: { id: userId } }, followUpMessage, {
-          context: 'viventium/routes/glasshive.callback.update',
+          operationKind: 'system', context: 'viventium/routes/glasshive.callback.update',
           overrideTimestamp: true,
         }),
       );
     } else {
       await runTerminalEffect(() =>
         db.saveMessage({ user: { id: userId } }, followUpMessage, {
-          context: 'viventium/routes/glasshive.callback',
+          operationKind: 'system', context: 'viventium/routes/glasshive.callback',
         }),
       );
     }

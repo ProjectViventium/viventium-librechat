@@ -1284,6 +1284,92 @@ describe('/api/viventium/voice/chat', () => {
     expect(claimVoiceSession).not.toHaveBeenCalled();
   });
 
+  test('turn speaker authority returns the call mode and persisted turn segments', async () => {
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'call',
+      status: 'active',
+      revision: 2,
+      updatedAt: Date.parse('2026-08-09T10:00:00.000Z'),
+    });
+    const persistedSegments = [
+      {
+        version: 1,
+        callSessionId: 'call_session_1',
+        turnId: 'turn_000001',
+        segmentId: 'seg_1',
+        revision: 1,
+      },
+      {
+        version: 1,
+        callSessionId: 'call_session_1',
+        turnId: 'turn_000001',
+        segmentId: 'seg_2',
+        revision: 3,
+      },
+      {
+        version: 1,
+        callSessionId: 'call_session_1',
+        turnId: 'turn_000002',
+        segmentId: 'seg_3',
+        revision: 1,
+      },
+    ];
+    mockListSpeakerSegments.mockImplementationOnce(async ({ page }) =>
+      page === true ? { segments: persistedSegments } : persistedSegments,
+    );
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/speaker-segments/authority/turn_000001',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      version: 1,
+      callSessionId: 'call_session_1',
+      turnId: 'turn_000001',
+      mode: 'call',
+      status: 'active',
+      revision: 3,
+    });
+    expect(res.body.speakerSegments.map((segment) => segment.segmentId)).toEqual([
+      'seg_1',
+      'seg_2',
+    ]);
+  });
+
+  test('turn speaker authority reports a turn without persisted segments as retryable', async () => {
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'call',
+      status: 'active',
+      revision: 1,
+      updatedAt: Date.parse('2026-08-09T10:00:00.000Z'),
+    });
+    mockListSpeakerSegments.mockResolvedValueOnce({ segments: [] });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/speaker-segments/authority/turn_000009',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toMatchObject({ retryable: true });
+  });
+
   test('gateway state includes the terminal canonical status', async () => {
     mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
       callSessionId: 'call_session_1',
@@ -2150,6 +2236,239 @@ describe('/api/viventium/voice/chat', () => {
     });
   });
 
+  describe('authenticated Listen-Only continuation', () => {
+    function setupAmbientContinuation() {
+      process.env.VIVENTIUM_VOICE_LISTEN_ONLY_TURN_COALESCE_WINDOW_MS = '0';
+      mockAssertVoiceGatewayAuth.mockResolvedValue({
+        callSessionId: 'call_session_listen',
+        userId: 'user_1',
+        agentId: 'agent_voice',
+        conversationId: 'conv-voice-1',
+        mode: 'listen_only',
+        ownerParticipantIdentity: 'owner-participant',
+      });
+      const rows = new Map();
+      mockMessageFind = jest.fn((query) => {
+        const ids = query['metadata.viventium.speakerSegments.segmentId']?.$in || [];
+        return createMessageFindMock(
+          [...rows.values()].filter((row) =>
+            row.metadata?.viventium?.speakerSegments?.some((segment) =>
+              ids.includes(segment.segmentId),
+            ),
+          ),
+        )();
+      });
+      mockMessageFindOne = jest.fn((query) =>
+        createMessageFindOneMock(rows.get(query.messageId) || null)(),
+      );
+      mockMessageFindOneAndUpdate = jest.fn(async (query, update) => {
+        const existing = rows.get(query.messageId);
+        const row = {
+          ...(existing || { _id: query.messageId, ...update.$setOnInsert }),
+          ...update.$set,
+        };
+        rows.set(query.messageId, row);
+        return row;
+      });
+      const app = createTestApp(require('../voice'));
+      const segment = (sequence, text, revision = 1) => ({
+        version: 1,
+        callSessionId: 'call_session_listen',
+        segmentId: `seg-${sequence}`,
+        turnId: `turn-${sequence}`,
+        sequence,
+        revision,
+        text,
+        isFinal: true,
+        speaker: {
+          key: 'unknown',
+          label: 'Unknown',
+          source: 'unknown',
+          attribution: 'unknown',
+          actorTrust: 'unknown',
+          participantIdentity: 'owner-participant',
+        },
+        uncertain: true,
+        overlap: false,
+      });
+      const send = async (segments) => {
+        const res = createMockRes();
+        await dispatch(
+          app,
+          createMockReq({
+            method: 'POST',
+            url: '/api/viventium/voice/ambient-transcript',
+            headers: { 'x-viventium-call-secret': 'secret' },
+            body: {
+              version: 1,
+              callSessionId: 'call_session_listen',
+              ingressKind: 'listen_only_owner',
+              segments,
+            },
+          }),
+          res,
+        );
+        expect(res.statusCode).toBe(200);
+        return res.body;
+      };
+      return { rows, segment, send };
+    }
+    test('stores all same-turn typed segments in one ambient row', async () => {
+      const { rows, segment, send } = setupAmbientContinuation();
+      const a = segment(1, 'The first clause.');
+      const b = { ...segment(2, 'The second clause.'), turnId: a.turnId };
+      const result = await send([a, b]);
+      expect(result.messageIds).toHaveLength(1);
+      expect(rows.size).toBe(1);
+      expect([...rows.values()][0]).toMatchObject({
+        text: 'The first clause. The second clause.',
+        isCreatedByUser: false,
+        _meiliIndex: false,
+        metadata: { viventium: { speakerSegments: [a, b], memoryEligible: 'soft' } },
+      });
+      expect(mockAgentControllerCallCount).toBe(0);
+    });
+    test('resumes within the existing continuation window despite distinct turn IDs and parent progress', async () => {
+      const { rows, segment, send } = setupAmbientContinuation();
+      const first = await send([segment(1, 'A continued thought.')]);
+      const parent = [...rows.values()][0].parentMessageId;
+      const next = await send([segment(2, 'Its next clause.')]);
+      expect(next.messageIds).toEqual(first.messageIds);
+      expect(rows.size).toBe(1);
+      expect([...rows.values()][0]).toMatchObject({
+        text: 'A continued thought. Its next clause.',
+        parentMessageId: parent,
+      });
+    });
+    test('preserves repeated text from distinct typed source segments', async () => {
+      const { rows, segment, send } = setupAmbientContinuation();
+      await send([segment(1, 'Check the door.')]);
+      await send([segment(2, 'Check the door.')]);
+      expect(rows.size).toBe(1);
+      expect([...rows.values()][0].text).toBe('Check the door. Check the door.');
+    });
+    test.each(['key', 'trackSid'])(
+      'keeps distinct speaker %s groups separate without changing authority',
+      async (field) => {
+        const { rows, segment, send } = setupAmbientContinuation();
+        const first = segment(1, 'First speaker track.');
+        const second = { ...segment(2, 'Second speaker track.'), turnId: first.turnId };
+        second.speaker = { ...second.speaker, [field]: 'another-track-or-speaker' };
+        const result = await send([first, second]);
+        expect(result.messageIds).toHaveLength(2);
+        expect(rows.size).toBe(2);
+        expect([...rows.values()].map((row) => row.metadata.viventium.speakerSegments)).toEqual([
+          [first],
+          [second],
+        ]);
+        expect(
+          [...rows.values()].every(
+            (row) =>
+              row.metadata.viventium.actorTrust === 'unknown' &&
+              row.metadata.viventium.memoryEligible === 'soft',
+          ),
+        ).toBe(true);
+        expect(mockAgentControllerCallCount).toBe(0);
+      },
+    );
+    test('opens a new row after the existing continuation window', async () => {
+      const { rows, segment, send } = setupAmbientContinuation();
+      const first = await send([segment(1, 'The earlier turn.')]);
+      const now = Date.now();
+      const clock = jest.spyOn(Date, 'now').mockReturnValue(now + 5000);
+      try {
+        const next = await send([segment(2, 'A later turn.')]);
+        expect(next.messageIds).not.toEqual(first.messageIds);
+        expect(rows.size).toBe(2);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+    test('replays a retained segment after ingress expiry without another row or parent rewrite', async () => {
+      const { rows, segment, send } = setupAmbientContinuation();
+      const a = segment(1, 'The original.');
+      const b = segment(2, 'The continuation.');
+      const first = await send([a]);
+      await send([b]);
+      const saved = JSON.parse(JSON.stringify([...rows.values()]));
+      const writes = mockMessageFindOneAndUpdate.mock.calls.length;
+      const now = Date.now();
+      const clock = jest.spyOn(Date, 'now').mockReturnValue(now + 31000);
+      try {
+        const replay = await send([b]);
+        expect(replay.messageIds).toEqual(first.messageIds);
+        expect(JSON.parse(JSON.stringify([...rows.values()]))).toEqual(saved);
+        expect(mockMessageFindOneAndUpdate).toHaveBeenCalledTimes(writes);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+    test('retries ambient revision projection when another segment changes after its row read', async () => {
+      const { rows, segment, send } = setupAmbientContinuation();
+      const a = segment(1, 'The first draft.');
+      const b = segment(2, 'The retained clause.');
+      await send([a]);
+      await send([b]);
+      const messageId = [...rows.keys()][0];
+      const concurrent = {
+        ...b,
+        revision: 3,
+        uncertain: true,
+        speaker: {
+          ...b.speaker,
+          key: 'provider:other',
+          label: 'Speaker 2',
+          actorTrust: 'shared_mic_unverified',
+          attribution: 'unverified',
+        },
+      };
+      const originalWrite = mockMessageFindOneAndUpdate.getMockImplementation();
+      let raced = false;
+      mockMessageFindOneAndUpdate.mockImplementation(async (query, update) => {
+        if (!raced) {
+          raced = true;
+          const saved = rows.get(messageId);
+          rows.set(messageId, {
+            ...saved,
+            metadata: {
+              viventium: {
+                ...saved.metadata.viventium,
+                speakerSegments: [a, concurrent],
+              },
+            },
+          });
+        }
+        const expected = query['metadata.viventium.speakerSegments'];
+        if (
+          expected &&
+          JSON.stringify(expected) !==
+            JSON.stringify(rows.get(messageId).metadata.viventium.speakerSegments)
+        )
+          return null;
+        return originalWrite(query, update);
+      });
+      await send([segment(1, 'The first correction.', 2)]);
+      expect(rows.get(messageId).metadata.viventium.speakerSegments).toEqual([
+        segment(1, 'The first correction.', 2),
+        concurrent,
+      ]);
+      expect(rows.get(messageId).metadata.viventium.actorTrust).toBe('unknown');
+      expect(rows.size).toBe(1);
+    });
+    test('applies a newer segment revision without dropping the other continued source', async () => {
+      const { rows, segment, send } = setupAmbientContinuation();
+      const first = await send([segment(1, 'The draft text.')]);
+      await send([segment(2, 'The retained clause.')]);
+      const revised = await send([segment(1, 'The corrected text.', 2)]);
+      expect(revised.messageIds).toEqual(first.messageIds);
+      expect(rows.size).toBe(1);
+      expect([...rows.values()][0].text).toBe('The corrected text. The retained clause.');
+      expect(
+        [...rows.values()][0].metadata.viventium.speakerSegments.map((segment) => segment.revision),
+      ).toEqual([2, 1]);
+    });
+  });
+
   test('persists authenticated ambient participant segments as soft evidence without agent work', async () => {
     mockPersistSpeakerSegments.mockResolvedValueOnce({
       accepted: ['seg-guest'],
@@ -2563,6 +2882,10 @@ describe('/api/viventium/voice/chat', () => {
       'call_session_1',
       'conv-generated-voice',
     );
+    const { getVoiceTaskByStreamId } = require('~/server/services/viventium/VoiceTaskService');
+    expect(getVoiceTaskByStreamId(res.body.streamId)).toMatchObject({
+      callSessionId: 'call_session_1', conversationId: 'conv-generated-voice',
+    });
   });
 
   test('reuses the generated conversation on the next voice turn after a stale reset', async () => {
@@ -2907,6 +3230,23 @@ describe('/api/viventium/voice/chat', () => {
     });
     expect(GenerationJobManager.abortJob).not.toHaveBeenCalled();
     expect(mockSaveMessage).not.toHaveBeenCalled();
+  });
+
+  test('a superseded SSE presentation does not complete still-running voice work', async () => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const { GenerationJobManager } = require('@librechat/api');
+    const task = taskService.createVoiceTask({ callSessionId: 'call_session_1', userId: 'user_1', streamId: 'still-running' });
+    GenerationJobManager.getJob.mockResolvedValue({ metadata: { userId: 'user_1' } });
+    GenerationJobManager.subscribe.mockImplementationOnce((_id, _event, done) => {
+      done({ final: true, superseded: true });
+      return { unsubscribe: jest.fn() };
+    });
+    const app = createTestApp(require('../voice'));
+    const req = createMockReq({ method: 'GET', url: '/api/viventium/voice/stream/still-running', headers: { 'x-viventium-call-secret': 'secret' } });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.write).toHaveBeenCalledWith(expect.stringContaining('"superseded":true'));
+    expect(taskService.getVoiceTask(task.taskId).state).toBe('running');
   });
 
   test('reconciles durable cancellation before relaying or observing a late stream event', async () => {
@@ -4958,4 +5298,166 @@ describe('/api/viventium/voice/chat', () => {
     expect(res.statusCode).toBe(409);
     expect(res.body.error).toBe('delivery_not_claimed');
   });
+  const typedBody = (
+    text = 'Check the retained draft.',
+    sourceEventId = 'voice:call_session_1:item:typed-one',
+  ) => ({
+    text,
+    sourceEventId,
+    streamId: sourceEventId,
+    typedInput: {
+      version: 1,
+      kind: 'participant_text',
+      callSessionId: 'call_session_1',
+      participantIdentity: 'owner-participant',
+      sourceEventId,
+      textSha256: require('crypto').createHash('sha256').update(text).digest('hex'),
+    },
+  });
+
+  test('typed Call keeps owner capabilities through initial, coalesced and final authority checks', async () => {
+    const app = createTestApp(require('../voice'));
+    const req = createMockReq({ url: '/api/viventium/voice/chat', body: typedBody() });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.statusCode).toBe(200);
+    expect(mockLastCanAuthorizeSideEffects).toBe(true);
+    expect(mockLastActorTrust).toBe('owner_participant');
+    expect(req.body.speakerSegments).toEqual([]);
+    expect(mockVoiceIngressCreate.mock.calls[0][0].dedupeKey).toContain(
+      'typed:call_session_1:voice:',
+    );
+    const {
+      attachVoiceMessageMetadata,
+    } = require('~/server/services/viventium/voiceMessageMetadata');
+    expect(attachVoiceMessageMetadata(req, {}).metadata.viventium.typedInput).toEqual(
+      typedBody().typedInput,
+    );
+  });
+
+  test.each(['participantIdentity', 'callSessionId', 'sourceEventId', 'textSha256'])(
+    'typed Call rejects changed %s before Main',
+    async (key) => {
+      const body = typedBody();
+      body.typedInput[key] = 'wrong';
+      const app = createTestApp(require('../voice'));
+      const req = createMockReq({ url: '/api/viventium/voice/chat', body });
+      const res = createMockRes();
+      await dispatch(app, req, res);
+      expect(res.statusCode).toBe(403);
+      expect(mockAgentControllerCallCount).toBe(0);
+    },
+  );
+
+  test('typed Call cannot elevate a combined audio input', async () => {
+    const app = createTestApp(require('../voice'));
+    const body = { ...typedBody(), speakerSegments: [{ text: 'unknown audio' }] };
+    const res = createMockRes();
+    await dispatch(app, createMockReq({ url: '/api/viventium/voice/chat', body }), res);
+    expect(res.statusCode).toBe(403);
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('typed Call retains separate rapid typed and audio ingress', async () => {
+    process.env.VIVENTIUM_VOICE_LIVE_TURN_COALESCE_WINDOW_MS = '10';
+    const app = createTestApp(require('../voice'));
+    const typed = createMockReq({ url: '/api/viventium/voice/chat', body: typedBody() });
+    const audio = createMockReq({
+      url: '/api/viventium/voice/chat',
+      body: { text: 'unverified audio', streamId: 'audio-1' },
+    });
+    const a = createMockRes(),
+      z = createMockRes();
+    await dispatch(app, typed, a);
+    await dispatch(app, audio, z);
+    expect(mockAgentControllerCallCount).toBe(2);
+    expect(typed.body.viventiumCanAuthorizeSideEffects).toBe(true);
+    expect(audio.body.viventiumCanAuthorizeSideEffects).toBe(false);
+    expect(mockVoiceIngressCreate.mock.calls[0][0].dedupeKey).not.toBe(
+      mockVoiceIngressCreate.mock.calls[1][0].dedupeKey,
+    );
+  });
+
+  test('typed Call rechecks a mode switch before the controller', async () => {
+    mockGetCallSession.mockResolvedValue({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+    });
+    const app = createTestApp(require('../voice'));
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({ url: '/api/viventium/voice/chat', body: typedBody() }),
+      res,
+    );
+    expect(res.body.wingPassive).toBe(true);
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('typed Call rechecks ended or replaced call authority before the controller', async () => {
+    mockGetCallSession.mockResolvedValue({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'other-owner',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      status: 'ended',
+      mode: 'call',
+    });
+    const app = createTestApp(require('../voice'));
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({ url: '/api/viventium/voice/chat', body: typedBody() }),
+      res,
+    );
+    expect(res.statusCode).toBe(403);
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('typed Call preserves exact multiline text through coalescing and final authority', async () => {
+    const text = 'Review these notes:\n\n  Keep both lines.';
+    const app = createTestApp(require('../voice'));
+    const req = createMockReq({ url: '/api/viventium/voice/chat', body: typedBody(text) });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.statusCode).toBe(200);
+    expect(mockLastRequestText).toBe(text);
+    expect(mockLastCanAuthorizeSideEffects).toBe(true);
+    expect(req.body.speakerLabel).toBe('You');
+  });
+
+  test('typed Call cannot bypass a revoked gateway lease', async () => {
+    mockAssertVoiceGatewayAuth.mockRejectedValueOnce(
+      Object.assign(new Error('revoked'), { status: 401 }),
+    );
+    const app = createTestApp(require('../voice'));
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({ url: '/api/viventium/voice/chat', body: typedBody() }),
+      res,
+    );
+    expect(res.statusCode).toBe(401);
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+  test.each(['wing', 'listen_only'])('typed Call provenance preserves the restricted %s path without effects', async (mode) => {
+    mockAssertVoiceGatewayAuth.mockResolvedValue({ callSessionId: 'call_session_1', ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1', agentId: 'agent_voice', conversationId: 'conv-voice-1', mode });
+    const app = createTestApp(require('../voice'));
+    const req = createMockReq({ url: '/api/viventium/voice/chat', body: typedBody() });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.statusCode).toBe(200);
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(req.body.viventiumCanAuthorizeSideEffects).toBe(false);
+    expect(res.body.status).toBe(mode === 'wing' ? 'wing_passive' : 'listen_only');
+    if (mode === 'listen_only') {
+      expect(mockMessageFindOneAndUpdate.mock.calls[0][1].$set.text).toBe(typedBody().text);
+    }
+  });
+
 });

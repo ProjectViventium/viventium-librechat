@@ -484,7 +484,7 @@ function normalized(value) {
     .join(' ');
 }
 
-function writeValidOwnerState(boundProcess = ownerProcess) {
+function writeValidOwnerState(boundProcess = ownerProcess, ownerLaunchMode = 'detached') {
   const startedAt = normalized(
     execFileSync('ps', ['-p', String(boundProcess.pid), '-o', 'lstart='], { encoding: 'utf8' }),
   );
@@ -498,7 +498,7 @@ function writeValidOwnerState(boundProcess = ownerProcess) {
     runtimeDir: fs.realpathSync(releaseDir),
     configFile: fs.realpathSync(ownerConfig),
     componentsLockFile: fs.realpathSync(ownerLock),
-    ownerLaunchMode: 'detached',
+    ownerLaunchMode,
     runtimeProfile: 'isolated',
     command: 'start',
     ownerPid: String(boundProcess.pid),
@@ -516,8 +516,8 @@ function writeValidOwnerState(boundProcess = ownerProcess) {
   return { ownerPath, payload };
 }
 
-function validOwnerBinding(boundProcess = ownerProcess) {
-  const { ownerPath, payload } = writeValidOwnerState(boundProcess);
+function validOwnerBinding(boundProcess = ownerProcess, ownerLaunchMode = 'detached') {
+  const { ownerPath, payload } = writeValidOwnerState(boundProcess, ownerLaunchMode);
   const ownerText = fs.readFileSync(ownerPath);
   const generatedAt = new Date();
   const expiresAt = new Date(generatedAt.getTime() + 86_400_000);
@@ -731,7 +731,7 @@ function writeReleaseSnapshot(overrides = {}) {
     release_ready: true,
     exposure_allowed: true,
     local_qa_override: false,
-    source_defaults_dark: true,
+    source_defaults_valid: true,
     gate_count: validGates().length,
     open_gate_count: 0,
     gates: validGates(),
@@ -907,6 +907,15 @@ describe('ViventiumOrchestrationMode', () => {
     fs.rmSync(releaseRoot, { recursive: true, force: true });
   });
 
+  test('new accounts use automatic work while an explicit focused preference survives', () => {
+    delete process.env.VIVENTIUM_PARALLEL_WORK_DEFAULT_MODE;
+    const { preferredOrchestrationMode } = require('../ViventiumOrchestrationMode');
+    expect(preferredOrchestrationMode({ id: 'owner-1' })).toBe('parallel');
+    expect(preferredOrchestrationMode({ personalization: { orchestration_mode: 'focused' } })).toBe(
+      'focused',
+    );
+  });
+
   test('uses the compiled default only when the account has no explicit override', () => {
     process.env.VIVENTIUM_PARALLEL_WORK_DEFAULT_MODE = 'parallel';
     writeLocalQaSnapshot();
@@ -935,57 +944,46 @@ describe('ViventiumOrchestrationMode', () => {
 
   test('keeps deployment readiness separate from account readiness', () => {
     process.env.VIVENTIUM_PARALLEL_WORK_DEPLOYMENT_READY = 'true';
-    writeLocalQaSnapshot();
+    writeBlockedReleaseSnapshot();
     const {
+      parallelWorkClaimState,
       parallelWorkAvailable,
       parallelWorkDeploymentAvailable,
     } = require('../ViventiumOrchestrationMode');
 
-    expect(parallelWorkDeploymentAvailable()).toBe(true);
+    expect(parallelWorkDeploymentAvailable()).toBe(false);
     expect(parallelWorkAvailable()).toBe(false);
     expect(parallelWorkAvailable('owner-1')).toBe(true);
+    expect(parallelWorkClaimState('owner-1')).toEqual({
+      available: true,
+      label: 'READY',
+      blockers: [],
+    });
   });
 
-  test('reuses only the exact process-validated release gate for one owner claim', () => {
-    writeLocalQaSnapshot();
+  test('keeps operational owner claims single-use without release validation', () => {
     const childProcess = require('child_process');
     const subprocess = jest.spyOn(childProcess, 'execFileSync');
     const {
       consumeTrustedParallelWorkClaimState,
       parallelWorkClaimState,
-      parallelWorkReleaseGateSnapshot,
     } = require('../ViventiumOrchestrationMode');
 
     try {
-      const releaseGate = parallelWorkReleaseGateSnapshot();
-      const validationsAfterGate = subprocess.mock.calls.filter(
+      const validationsBeforeClaim = subprocess.mock.calls.filter(
         ([, args]) => Array.isArray(args) && args.includes('--validate-snapshot'),
       ).length;
 
-      const claimState = parallelWorkClaimState('owner-1', releaseGate);
+      const claimState = parallelWorkClaimState('owner-1');
       expect(claimState.available).toBe(true);
       expect(
         subprocess.mock.calls.filter(
           ([, args]) => Array.isArray(args) && args.includes('--validate-snapshot'),
         ),
-      ).toHaveLength(validationsAfterGate);
+      ).toHaveLength(validationsBeforeClaim);
       expect(consumeTrustedParallelWorkClaimState(claimState, 'owner-2')).toBe(false);
       expect(consumeTrustedParallelWorkClaimState(claimState, 'owner-1')).toBe(true);
       expect(consumeTrustedParallelWorkClaimState(claimState, 'owner-1')).toBe(false);
-
-      expect(parallelWorkClaimState('owner-1', releaseGate).available).toBe(true);
-      expect(
-        subprocess.mock.calls.filter(
-          ([, args]) => Array.isArray(args) && args.includes('--validate-snapshot'),
-        ),
-      ).toHaveLength(validationsAfterGate + 1);
-
-      expect(parallelWorkClaimState('owner-1', { ...releaseGate }).available).toBe(true);
-      expect(
-        subprocess.mock.calls.filter(
-          ([, args]) => Array.isArray(args) && args.includes('--validate-snapshot'),
-        ),
-      ).toHaveLength(validationsAfterGate + 2);
     } finally {
       subprocess.mockRestore();
     }
@@ -1087,17 +1085,17 @@ describe('ViventiumOrchestrationMode', () => {
       await expect(parallelWorkClaimStateAsync('owner-1')).resolves.toEqual(
         expect.objectContaining({ available: true }),
       );
-      expect(mockWorkerConstructor).toHaveBeenCalledTimes(2);
+      expect(mockWorkerConstructor).toHaveBeenCalledTimes(1);
 
       writeLocalQaSnapshot();
       await expect(parallelWorkDeploymentAvailableAsync()).resolves.toBe(true);
-      expect(mockWorkerConstructor).toHaveBeenCalledTimes(3);
+      expect(mockWorkerConstructor).toHaveBeenCalledTimes(2);
 
       ownerPath = path.join(releaseRoot, 'state', 'runtime', 'isolated', 'stack-owner.json');
       ownerBytes = fs.readFileSync(ownerPath);
       fs.appendFileSync(ownerPath, '\n');
       await expect(parallelWorkDeploymentAvailableAsync()).resolves.toBe(false);
-      expect(mockWorkerConstructor).toHaveBeenCalledTimes(3);
+      expect(mockWorkerConstructor).toHaveBeenCalledTimes(2);
       fs.writeFileSync(ownerPath, ownerBytes);
     } finally {
       if (ownerPath && ownerBytes) fs.writeFileSync(ownerPath, ownerBytes);
@@ -1182,7 +1180,16 @@ describe('ViventiumOrchestrationMode', () => {
   });
 
   test('fails closed to focused whenever the capability is unavailable', () => {
-    const { effectiveOrchestrationMode } = require('../ViventiumOrchestrationMode');
+    const {
+      effectiveOrchestrationMode,
+      preferredOrchestrationMode,
+    } = require('../ViventiumOrchestrationMode');
+
+    expect(
+      preferredOrchestrationMode({
+        personalization: { orchestration_mode: 'parallel' },
+      }),
+    ).toBe('parallel');
 
     expect(
       effectiveOrchestrationMode(
@@ -1192,21 +1199,16 @@ describe('ViventiumOrchestrationMode', () => {
     ).toBe('focused');
   });
 
-  test('fails the actual claim path closed when the compiled snapshot is missing', () => {
+  test('fails the public release gate closed when the compiled snapshot is missing', () => {
     fs.unlinkSync(releasePath);
-    const {
-      parallelWorkAvailable,
-      parallelWorkClaimState,
-    } = require('../ViventiumOrchestrationMode');
+    const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
 
-    expect(parallelWorkAvailable('owner-1')).toBe(false);
-    expect(parallelWorkClaimState('owner-1')).toEqual(
-      expect.objectContaining({
-        available: false,
-        label: 'NOT READY',
-        blockers: expect.arrayContaining(['release_snapshot_unavailable']),
-      }),
-    );
+    expect(parallelWorkReleaseGateSnapshot()).toEqual({
+      available: false,
+      releaseReady: false,
+      label: 'NOT READY',
+      blockers: ['release_snapshot_unavailable'],
+    });
   });
 
   test('rejects a release snapshot without a bound owner projection', () => {
@@ -1608,6 +1610,57 @@ describe('ViventiumOrchestrationMode', () => {
     }
   });
 
+  test.each([
+    [
+      'ordinary dev flags',
+      [
+        '--restart',
+        '--skip-telegram',
+        '--skip-v1-agent',
+        '--skip-livekit',
+        '--skip-playground',
+        '--skip-voice-gateway',
+        '--no-bootstrap',
+      ],
+      true,
+    ],
+    ['matching profile', ['--profile', 'isolated'], true],
+    ['foreign profile', ['--profile=compat'], false],
+    ['unknown flag', ['--forged-flag'], false],
+    ['path override', ['--config-file', '/tmp/unrelated-config.yaml'], false],
+    ['shell syntax', [';', 'touch', 'unexpected'], false],
+  ])('uses canonical owner proof for attached %s', (_label, flags, available) => {
+    const attachedOwner = spawn(
+      fs.realpathSync(ownerExecutable),
+      [
+        '--app-support-dir',
+        fs.realpathSync(releaseRoot),
+        '--config-file',
+        fs.realpathSync(ownerConfig),
+        '--runtime-dir',
+        fs.realpathSync(releaseDir),
+        'start',
+        ...flags,
+      ],
+      { cwd: fs.realpathSync(ownerRepo), stdio: 'ignore' },
+    );
+    try {
+      writeLocalQaSnapshot({ owner_binding: validOwnerBinding(attachedOwner, 'attached') });
+      const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
+      const result = parallelWorkReleaseGateSnapshot();
+      expect(result).toEqual(
+        expect.objectContaining({
+          available,
+          releaseReady: false,
+          label: 'PRE-GATE / NOT READY',
+        }),
+      );
+      if (!available) expect(result.blockers).toContain('release_owner_unavailable');
+    } finally {
+      attachedOwner.kill();
+    }
+  });
+
   test('binds pre-gate Voice traces to the measured installed runtime without claiming READY', () => {
     const gates = validGates().map((gate) => openGate(gate.case_id));
     writeLocalQaSnapshot({
@@ -1849,11 +1902,11 @@ describe('ViventiumOrchestrationMode', () => {
     }
   });
 
-  test('fails the actual claim path closed for open QA and exposes typed blockers', () => {
+  test('fails the public release gate closed for open QA and exposes typed blockers', () => {
     writeBlockedReleaseSnapshot();
-    const { parallelWorkClaimState } = require('../ViventiumOrchestrationMode');
+    const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
 
-    expect(parallelWorkClaimState('owner-1')).toEqual(
+    expect(parallelWorkReleaseGateSnapshot()).toEqual(
       expect.objectContaining({
         available: false,
         label: 'NOT READY',
@@ -2049,7 +2102,7 @@ describe('ViventiumOrchestrationMode', () => {
     });
   });
 
-  test('allows an explicit fully-gated local QA exposure but never labels it ready', () => {
+  test('allows an explicit fully-gated local QA release exposure but never labels it ready', () => {
     writeReleaseSnapshot({
       mode: 'local-qa',
       label: 'PRE-GATE / NOT READY',
@@ -2057,9 +2110,9 @@ describe('ViventiumOrchestrationMode', () => {
       exposure_allowed: true,
       local_qa_override: true,
     });
-    const { parallelWorkClaimState } = require('../ViventiumOrchestrationMode');
+    const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
 
-    expect(parallelWorkClaimState('owner-1')).toEqual(
+    expect(parallelWorkReleaseGateSnapshot()).toEqual(
       expect.objectContaining({
         available: true,
         label: 'PRE-GATE / NOT READY',
@@ -2068,7 +2121,7 @@ describe('ViventiumOrchestrationMode', () => {
     );
   });
 
-  test('preserves PRE-GATE wording when local QA is valid but operational readiness fails', () => {
+  test('fails an operational claim when owner readiness fails', () => {
     process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'false';
     writeReleaseSnapshot({
       mode: 'local-qa',
@@ -2082,7 +2135,8 @@ describe('ViventiumOrchestrationMode', () => {
     expect(parallelWorkClaimState('owner-1')).toEqual(
       expect.objectContaining({
         available: false,
-        label: 'PRE-GATE / NOT READY',
+        label: 'NOT READY',
+        blockers: ['operational_readiness_unavailable'],
       }),
     );
   });
@@ -2125,9 +2179,9 @@ describe('ViventiumOrchestrationMode', () => {
       gates,
       open_gates: gates.filter((gate) => gate.status !== 'PASS'),
     });
-    const { parallelWorkClaimState } = require('../ViventiumOrchestrationMode');
+    const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
 
-    expect(parallelWorkClaimState('owner-1')).toEqual(
+    expect(parallelWorkReleaseGateSnapshot()).toEqual(
       expect.objectContaining({
         available: true,
         label: 'PRE-GATE / NOT READY',
@@ -2168,9 +2222,9 @@ describe('ViventiumOrchestrationMode', () => {
         blocking_artifact_checks: [artifactChecks[0], artifactChecks[3]],
         artifact_identity: artifactIdentity,
       });
-      const { parallelWorkClaimState } = require('../ViventiumOrchestrationMode');
+      const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
 
-      expect(parallelWorkClaimState('owner-1')).toEqual(
+      expect(parallelWorkReleaseGateSnapshot()).toEqual(
         expect.objectContaining({
           available: true,
           label: 'PRE-GATE / NOT READY',
@@ -2184,7 +2238,7 @@ describe('ViventiumOrchestrationMode', () => {
           blocking_artifact_checks: [artifactChecks[0], artifactChecks[3]],
           artifact_identity: artifactIdentity,
         });
-        expect(parallelWorkClaimState('owner-1')).toEqual(
+        expect(parallelWorkReleaseGateSnapshot()).toEqual(
           expect.objectContaining({
             available: false,
             label: 'NOT READY',
@@ -2285,8 +2339,8 @@ describe('ViventiumOrchestrationMode', () => {
         local_qa_override: true,
         ...degraded,
       });
-      const { parallelWorkClaimState } = require('../ViventiumOrchestrationMode');
-      expect(parallelWorkClaimState('owner-1')).toEqual(
+      const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
+      expect(parallelWorkReleaseGateSnapshot()).toEqual(
         expect.objectContaining({
           available: true,
           label: 'PRE-GATE / NOT READY',
@@ -2299,7 +2353,7 @@ describe('ViventiumOrchestrationMode', () => {
           mode,
           ...degraded,
         });
-        expect(parallelWorkClaimState('owner-1')).toEqual(
+        expect(parallelWorkReleaseGateSnapshot()).toEqual(
           expect.objectContaining({
             available: false,
             label: 'NOT READY',
@@ -2376,8 +2430,8 @@ describe('ViventiumOrchestrationMode', () => {
 
     expect(parallelWorkClaimState()).toEqual({
       available: false,
-      label: 'PRE-GATE / NOT READY',
-      blockers: ['local_qa_override_active', 'owner_required'],
+      label: 'NOT READY',
+      blockers: ['owner_required'],
     });
   });
 });

@@ -1,5 +1,7 @@
+import crypto from 'node:crypto';
 import { createVoiceEngagementAttestationService } from './engagementAttestation';
 import {
+  normalizeVoiceTypedInput,
   canonicalVoiceOwnerUtterance,
   canonicalVoiceSessionMode,
   createVoiceEngagementAuthorityService,
@@ -186,5 +188,62 @@ describe('voice engagement authority', () => {
         userId: 'owner-1',
       }),
     ).resolves.toBeNull();
+  });
+});
+
+describe('authenticated typed Call authority', () => {
+  const text = 'Please check the saved draft.';
+  const sourceEventId = 'voice:call-1:item:text-event';
+  const call = { ...session, mode: 'call', speakerAttributionState: 'shared_mic_unverified' };
+  const typedInput = {
+    version: 1,
+    kind: 'participant_text',
+    callSessionId: call.callSessionId,
+    participantIdentity: call.ownerParticipantIdentity,
+    sourceEventId,
+    textSha256: crypto.createHash('sha256').update(text).digest('hex'),
+  };
+  const resolve = createVoiceEngagementAuthorityService({
+    getCallSession: jest.fn(),
+    listSpeakerSegments: jest.fn(),
+    voiceTurnAuthority: () => ({ actorTrust: 'unknown', canAuthorizeSideEffects: false }),
+    verifyVoiceEngagementAttestation: () => false,
+  }).resolveVoiceTurnAuthority;
+  const input = { session: call, segments: [], typedInput, sourceEventId, text };
+
+  test('uses actual typed participant evidence without changing shared-microphone audio trust', () => {
+    expect(normalizeVoiceTypedInput(typedInput, input)).toEqual(typedInput);
+    expect(resolve(input)).toMatchObject({
+      actorTrust: 'owner_participant',
+      canAuthorizeSideEffects: true,
+    });
+    expect(resolve({ ...input, typedInput: undefined })).toMatchObject({
+      canAuthorizeSideEffects: false,
+    });
+  });
+
+  test.each([
+    ['owner', { ...typedInput, participantIdentity: 'guest' }],
+    ['call', { ...typedInput, callSessionId: 'other-call' }],
+    ['source', { ...typedInput, sourceEventId: 'another-event' }],
+    ['text', { ...typedInput, textSha256: '0'.repeat(64) }],
+    ['extra authority', { ...typedInput, canAuthorizeSideEffects: true }],
+  ])('rejects a changed %s binding', (_name, changed) => {
+    expect(resolve({ ...input, typedInput: changed }).canAuthorizeSideEffects).toBe(false);
+  });
+
+  test('does not grant mixed audio/text or changed request text', () => {
+    expect(resolve({ ...input, segments: [segment] }).canAuthorizeSideEffects).toBe(false);
+    expect(resolve({ ...input, text: text + ' Also publish it.' }).canAuthorizeSideEffects).toBe(
+      false,
+    );
+  });
+
+  test.each(['wing', 'listen_only'])('does not bypass %s authority', (mode) => {
+    expect(resolve({ ...input, session: { ...call, mode } }).canAuthorizeSideEffects).toBe(false);
+  });
+
+  test.each(['ended', 'failed'])('does not authorize a %s call', (status) => {
+    expect(resolve({ ...input, session: { ...call, status } }).canAuthorizeSideEffects).toBe(false);
   });
 });

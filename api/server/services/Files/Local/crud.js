@@ -65,14 +65,16 @@ const saveLocalImage = async (req, file, filename) => {
  */
 async function saveLocalBuffer({ userId, buffer, fileName, basePath = 'images' }) {
   try {
-    const { publicPath, uploads } = paths;
+    const { imageOutput, uploads } = paths;
 
     /**
-     * For 'images': save to publicPath/images/userId (images are served statically)
+     * For 'images': save to configured imageOutput/userId (served at /images)
      * For 'uploads': save to uploads/userId (files downloaded via API)
      * */
+    /* === VIVENTIUM START: Images and uploads use their existing writable roots. === */
     const directoryPath =
-      basePath === 'images' ? path.join(publicPath, basePath, userId) : path.join(uploads, userId);
+      basePath === 'images' ? path.join(imageOutput, userId) : path.join(uploads, userId);
+    /* === VIVENTIUM END === */
 
     if (!fs.existsSync(directoryPath)) {
       fs.mkdirSync(directoryPath, { recursive: true });
@@ -118,7 +120,11 @@ async function saveFileFromURL({ userId, URL, fileName, basePath = 'images' }) {
     const { bytes, type, dimensions, extension } = await getBufferMetadata(buffer);
 
     // Construct the outputPath based on the basePath and userId
-    const outputPath = path.join(paths.publicPath, basePath, userId.toString());
+    /* === VIVENTIUM START: Preserve the image URL while using mutable storage. === */
+    const outputRoot =
+      basePath === 'images' ? paths.imageOutput : path.join(paths.publicPath, basePath);
+    const outputPath = path.join(outputRoot, userId.toString());
+    /* === VIVENTIUM END === */
 
     // Check if the output directory exists, if not, create it
     if (!fs.existsSync(outputPath)) {
@@ -180,7 +186,15 @@ async function getLocalFileURL({ fileName, basePath = 'images' }) {
 const isValidPath = (req, base, subfolder, filepath) => {
   const normalizedBase = path.resolve(base, subfolder, req.user.id);
   const normalizedFilepath = path.resolve(filepath);
-  return normalizedFilepath.startsWith(normalizedBase);
+  /* === VIVENTIUM START: A sibling user prefix is not the user's directory. === */
+  const relative = path.relative(normalizedBase, normalizedFilepath);
+  return (
+    relative !== '' &&
+    relative !== '..' &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+  /* === VIVENTIUM END === */
 };
 
 /**
@@ -208,7 +222,7 @@ const unlinkFile = async (filepath) => {
  */
 const deleteLocalFile = async (req, file) => {
   const appConfig = req.config;
-  const { publicPath, uploads } = appConfig.paths;
+  const { publicPath, imageOutput, uploads } = appConfig.paths;
 
   /** Filepath stripped of query parameters (e.g., ?manual=true) */
   const cleanFilepath = file.filepath.split('?')[0];
@@ -240,9 +254,14 @@ const deleteLocalFile = async (req, file) => {
     logger.warn(`Agent File ${file.file_id} is missing filepath, may have been deleted already`);
     return;
   }
-  const filepath = path.join(publicPath, cleanFilepath);
+  /* === VIVENTIUM START: Delete from the same image root used by writes and reads. === */
+  const storageRoot = subfolder === 'images' ? imageOutput : publicPath;
+  const relativeFilepath = subfolder === 'images' ? parts.slice(2).join(path.sep) : cleanFilepath;
+  const filepath = path.join(storageRoot, relativeFilepath);
+  const storageSubfolder = subfolder === 'images' ? '' : subfolder;
+  /* === VIVENTIUM END === */
 
-  if (!isValidPath(req, publicPath, subfolder, filepath)) {
+  if (!isValidPath(req, storageRoot, storageSubfolder, filepath)) {
     throw new Error('Invalid file path');
   }
 

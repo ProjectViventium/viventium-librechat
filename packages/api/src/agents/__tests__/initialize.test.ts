@@ -567,22 +567,25 @@ describe('initializeAgent — custom endpoint init routing', () => {
 
 /* === VIVENTIUM START ===
  * Regression: harness worker-native tool ownership.
- * Purpose: A worker-native provider receives declared Agent tools through its signed capability
- * bundle, so LibreChat must not also bind those tools into the model graph.
+ * Purpose: A worker-native provider receives ordinary Agent tools through its signed capability
+ * bundle, while the server must still see conversation-orchestration declarations so it can
+ * replace them with the trusted Main facade.
  * === VIVENTIUM END === */
 describe('initializeAgent — provider-native tool ownership', () => {
   beforeEach(() => {
     jest.clearAllMocks();
   });
 
-  it('keeps declared tools on the Agent while skipping LibreChat tool binding', async () => {
+  it('keeps orchestration declarations for the trusted facade while skipping ordinary binding', async () => {
     const provider = 'glasshive-harness';
     const { agent, req, res, loadTools, db } = createMocks({ provider });
     const connectedAccountsAgentId = 'connected-accounts-agent';
     const declaredTools = [
       'file_search',
       'mcp__filesystem__read_file',
-      'mcp__glasshive-workers-projects__delegate',
+      'worker_delegate_once_mcp_glasshive-workers-projects',
+      'active_work_list',
+      'active_work_action',
     ];
     agent.tools = [...declaredTools];
     agent.agent_ids = [connectedAccountsAgentId];
@@ -632,12 +635,18 @@ describe('initializeAgent — provider-native tool ownership', () => {
     expect(loadTools).toHaveBeenCalledWith(
       expect.objectContaining({
         provider,
-        tools: [],
+        tools: [
+          'worker_delegate_once_mcp_glasshive-workers-projects',
+          'active_work_list',
+          'active_work_action',
+        ],
       }),
     );
     expect(agent.tools).toEqual(declaredTools);
     expect(result.tools).toEqual([]);
     expect(result.toolDefinitions).toEqual([]);
+    expect(result.declaredToolNames).toEqual(declaredTools);
+    expect(JSON.parse(JSON.stringify(result))).not.toHaveProperty('declaredToolNames');
     expect(result.agent_ids).toEqual([connectedAccountsAgentId]);
     expect(result.edges).toEqual([
       {

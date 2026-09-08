@@ -119,11 +119,11 @@ config:
 mainAgent:
   id: agent_viventium_main_95aeb3
   name: Viventium
-  description: The conscious self. Background cortices process in parallel, surfacing insights without blocking dialogue.
+  description: ''
   instructions:
     promptRef: main.conscious_agent
   provider: glasshive-harness
-  model: codex-cli:gpt-5.6-sol
+  model: codex-cli:gpt-6-astra
   recursion_limit: 40
   tools:
     - sys__server__sys_mcp_scheduling-cortex
@@ -152,17 +152,23 @@ mainAgent:
       defer_loading: false
   tool_kwargs: []
   model_parameters:
-    model: codex-cli:gpt-5.6-sol
-    reasoning_effort: medium
+    model: codex-cli:gpt-6-astra
+    reasoning_effort: low
   glasshive_options:
     workspace:
       mode: life
     access: full
+    fallback_model: claude-code:claude-opus-5
+    fallback_reasoning_effort: low
     orchestration:
       parallel_available: true
-      default_mode: focused
+      default_mode: parallel
       worker_profile: codex-cli
+      worker_model: codex-cli:gpt-6-astra
+      worker_reasoning_effort: medium
       fallback_worker_profile: claude-code
+      fallback_worker_model: claude-code:claude-opus-5
+      fallback_worker_reasoning_effort: medium
   end_after_tools: false
   hide_sequential_outputs: true
   support_contact:
@@ -377,11 +383,11 @@ mainAgent:
     model: gpt-5.6-terra
     reasoning_effort: none
     useResponsesApi: true
-  fallback_llm_model: claude-code:opus
+  fallback_llm_model: claude-code:claude-opus-5
   fallback_llm_provider: glasshive-harness
   fallback_llm_model_parameters:
-    model: claude-code:opus
-    reasoning_effort: high
+    model: claude-code:claude-opus-5
+    reasoning_effort: low
   agent_ids: []
   edges:
     - from: agent_viventium_main_95aeb3
@@ -483,7 +489,7 @@ backgroundAgents:
     category: viventium
   - id: agent_viventium_deep_memory_95aeb3
     name: Deep Memory Search
-    description: Always searches authorized long-term conversation and file memory in the background, surfacing only new relevant evidence through Phase B.
+    description: Searches authorized long-term conversation and file memory when older evidence could materially help, surfacing only new relevant evidence through Phase B.
     conversation_recall_agent_only: false
     instructions:
       promptRef: cortex.deep_memory.execution

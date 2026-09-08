@@ -131,7 +131,7 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
     process.env = ORIGINAL_ENV;
   });
 
-  async function prepare(nowMs = 1_800_000_000_000) {
+  async function prepare(nowMs = 1_800_000_000_000, executionMode = 'docker') {
     const { createCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
     return createCapabilityAuthorization({
       user: { id: 'owner-1', role: 'USER' },
@@ -140,7 +140,7 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
       allowedHostTools: ['file_search'],
       hostToolResources: { file_search: { files: [{ file_id: 'file-1' }] } },
       contentReadScope: true,
-      executionMode: 'host',
+      executionMode,
       requestContext: {
         conversation_id: 'conversation-1',
         message_id: 'message-1',
@@ -150,6 +150,123 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
       nowMs,
     });
   }
+
+  test('binds host admission to its exact startup lease and revokes only that lease', async () => {
+    const {
+      admitCapabilityAuthorization,
+      assertActiveCapabilityAuthorizationGrant,
+      revokeCapabilityAuthorizationGrant,
+    } = require('../GlassHiveCapabilityAuthorizationService');
+    mockMintBrokerGrant.mockReturnValueOnce({
+      token: 'host-token',
+      payload: {
+        grant_id: 'grant-synthetic-host',
+        exp: 1_800_086_400,
+        scopes: { content_read: true },
+      },
+    });
+    const authorization = await prepare(1_800_000_000_000, 'host');
+    const identity = {
+      authorizationRef: authorization.authorizationRef,
+      originRef: 'ghi_origin_0001',
+      workRef: 'work_00000001',
+      workerId: 'worker_000001',
+      runId: 'run_000000001',
+    };
+    const hostStartupLeaseId = 'b'.repeat(64);
+    const admitted = await admitCapabilityAuthorization({
+      ...identity,
+      hostStartupLeaseId,
+      nowMs: 1_800_000_010_000,
+    });
+    expect(admitted).toMatchObject({ status: 'authorized', hostStartupLeaseId });
+    expect(admitted).not.toHaveProperty('containerGenerationId');
+    expect(mockMintBrokerGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        executionMode: 'host',
+        requestContext: expect.objectContaining({
+          host_startup_lease_id: hostStartupLeaseId,
+        }),
+      }),
+    );
+    expect(mockMintBrokerGrant.mock.calls[0][0].requestContext).not.toHaveProperty(
+      'container_generation_id',
+    );
+    const grant = {
+      authorization_ref: authorization.authorizationRef,
+      grant_id: 'grant-synthetic-host',
+      user_id: 'owner-1',
+      worker_id: identity.workerId,
+      run_id: identity.runId,
+      host_startup_lease_id: hostStartupLeaseId,
+    };
+    const record = authorizations.get(authorization.authorizationRef);
+    expect(record.currentGrantId).toBe('grant-synthetic-host');
+    expect(record.currentHostStartupLeaseId).toBe(hostStartupLeaseId);
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_800_000_011_000);
+    try {
+      await expect(assertActiveCapabilityAuthorizationGrant(grant)).resolves.toMatchObject({
+        runId: identity.runId,
+      });
+      await expect(
+        assertActiveCapabilityAuthorizationGrant({
+          ...grant,
+          host_startup_lease_id: 'c'.repeat(64),
+        }),
+      ).rejects.toMatchObject({ code: 'capability_grant_inactive' });
+      await expect(
+        assertActiveCapabilityAuthorizationGrant({
+          ...grant,
+          container_generation_id: hostStartupLeaseId,
+        }),
+      ).rejects.toMatchObject({ code: 'capability_grant_inactive' });
+      await revokeCapabilityAuthorizationGrant({
+        ...identity,
+        hostStartupLeaseId: 'c'.repeat(64),
+        grantId: grant.grant_id,
+      });
+      await expect(assertActiveCapabilityAuthorizationGrant(grant)).resolves.toMatchObject({
+        runId: identity.runId,
+      });
+      await revokeCapabilityAuthorizationGrant({
+        ...identity,
+        hostStartupLeaseId,
+        grantId: grant.grant_id,
+      });
+      await expect(assertActiveCapabilityAuthorizationGrant(grant)).rejects.toMatchObject({
+        code: 'capability_grant_inactive',
+      });
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  test.each([
+    ['host', { containerGenerationId: 'a'.repeat(64) }],
+    ['docker', { hostStartupLeaseId: 'b'.repeat(64) }],
+    ['host', { hostStartupLeaseId: 'b'.repeat(64), containerGenerationId: 'a'.repeat(64) }],
+    ['host', { hostStartupLeaseId: 'bad-lease' }],
+  ])(
+    'rejects mismatched or ambiguous %s execution admission %#',
+    async (executionMode, generation) => {
+      const {
+        admitCapabilityAuthorization,
+      } = require('../GlassHiveCapabilityAuthorizationService');
+      const authorization = await prepare(1_800_000_000_000, executionMode);
+      await expect(
+        admitCapabilityAuthorization({
+          authorizationRef: authorization.authorizationRef,
+          originRef: 'ghi_origin_0001',
+          workRef: 'work_00000001',
+          workerId: 'worker_000001',
+          runId: 'run_000000001',
+          ...generation,
+          nowMs: 1_800_000_010_000,
+        }),
+      ).rejects.toMatchObject({ code: 'capability_admission_generation_invalid' });
+      expect(mockMintBrokerGrant).not.toHaveBeenCalled();
+    },
+  );
 
   test('persists scope and horizon without minting a bearer while work is queued', async () => {
     const authorization = await prepare();
@@ -443,128 +560,136 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
     expect(mockPersistBrokerGrantResources).toHaveBeenCalledTimes(1);
   });
 
-  test('invalidates an old container-generation grant and revokes only the exact current generation', async () => {
-    const {
-      admitCapabilityAuthorization,
-      assertActiveCapabilityAuthorizationGrant,
-      revokeCapabilityAuthorizationGrant,
-    } = require('../GlassHiveCapabilityAuthorizationService');
-    const authorization = await prepare();
-    const generationA = 'a'.repeat(64);
-    const generationB = generationA;
-    mockMintBrokerGrant
-      .mockReturnValueOnce({
-        token: 'grant-token-a',
-        payload: {
-          grant_id: 'grant-synthetic-a',
-          exp: 1_800_000_610,
-          scopes: { content_read: true },
-        },
-      })
-      .mockReturnValueOnce({
-        token: 'grant-token-b',
-        payload: {
-          grant_id: 'grant-synthetic-b',
-          exp: 1_800_000_620,
-          scopes: { content_read: true },
-        },
+  test.each([
+    ['docker', 'containerGenerationId', 'container_generation_id'],
+    ['host', 'hostStartupLeaseId', 'host_startup_lease_id'],
+  ])(
+    'invalidates an old %s grant and revokes only the current generation',
+    async (executionMode, requestField, grantField) => {
+      const {
+        admitCapabilityAuthorization,
+        assertActiveCapabilityAuthorizationGrant,
+        revokeCapabilityAuthorizationGrant,
+      } = require('../GlassHiveCapabilityAuthorizationService');
+      const authorization = await prepare(1_800_000_000_000, executionMode);
+      const generationA = 'a'.repeat(64);
+      const generationB = executionMode === 'host' ? 'b'.repeat(64) : generationA;
+      mockMintBrokerGrant
+        .mockReturnValueOnce({
+          token: 'grant-token-a',
+          payload: {
+            grant_id: 'grant-synthetic-a',
+            exp: 1_800_000_610,
+            scopes: { content_read: true },
+          },
+        })
+        .mockReturnValueOnce({
+          token: 'grant-token-b',
+          payload: {
+            grant_id: 'grant-synthetic-b',
+            exp: 1_800_000_620,
+            scopes: { content_read: true },
+          },
+        });
+
+      await admitCapabilityAuthorization({
+        authorizationRef: authorization.authorizationRef,
+        originRef: 'ghi_origin_0001',
+        workRef: 'work_00000001',
+        workerId: 'worker_000001',
+        runId: 'run_000000001',
+        [requestField]: generationA,
+        nowMs: 1_800_000_010_000,
+      });
+      await admitCapabilityAuthorization({
+        authorizationRef: authorization.authorizationRef,
+        originRef: 'ghi_origin_0001',
+        workRef: 'work_00000001',
+        workerId: 'worker_000001',
+        runId: 'run_000000001',
+        [requestField]: generationB,
+        nowMs: 1_800_000_020_000,
       });
 
-    await admitCapabilityAuthorization({
-      authorizationRef: authorization.authorizationRef,
-      originRef: 'ghi_origin_0001',
-      workRef: 'work_00000001',
-      workerId: 'worker_000001',
-      runId: 'run_000000001',
-      containerGenerationId: generationA,
-      nowMs: 1_800_000_010_000,
-    });
-    await admitCapabilityAuthorization({
-      authorizationRef: authorization.authorizationRef,
-      originRef: 'ghi_origin_0001',
-      workRef: 'work_00000001',
-      workerId: 'worker_000001',
-      runId: 'run_000000001',
-      containerGenerationId: generationB,
-      nowMs: 1_800_000_020_000,
-    });
+      await expect(
+        assertActiveCapabilityAuthorizationGrant({
+          authorization_ref: authorization.authorizationRef,
+          grant_id: 'grant-synthetic-a',
+          user_id: 'owner-1',
+          worker_id: 'worker_000001',
+          run_id: 'run_000000001',
+          [grantField]: generationA,
+          exp: 1_800_000_610,
+        }),
+      ).rejects.toMatchObject({ code: 'capability_grant_inactive', status: 401 });
+      await expect(
+        assertActiveCapabilityAuthorizationGrant({
+          authorization_ref: authorization.authorizationRef,
+          grant_id: 'grant-synthetic-b',
+          user_id: 'owner-1',
+          worker_id: 'worker_000001',
+          run_id: 'run_000000001',
+          [grantField]: generationB,
+          exp: 1_800_000_620,
+        }),
+      ).resolves.toMatchObject({
+        authorizationRef: authorization.authorizationRef,
+        ownerId: 'owner-1',
+        originRef: 'ghi_origin_0001',
+        workRef: 'work_00000001',
+        workerId: 'worker_000001',
+        runId: 'run_000000001',
+        grantId: 'grant-synthetic-b',
+      });
 
-    await expect(
-      assertActiveCapabilityAuthorizationGrant({
-        authorization_ref: authorization.authorizationRef,
-        grant_id: 'grant-synthetic-a',
-        worker_id: 'worker_000001',
-        run_id: 'run_000000001',
-        container_generation_id: generationA,
-        exp: 1_800_000_610,
-      }),
-    ).rejects.toMatchObject({ code: 'capability_grant_inactive', status: 401 });
-    await expect(
-      assertActiveCapabilityAuthorizationGrant({
-        authorization_ref: authorization.authorizationRef,
-        grant_id: 'grant-synthetic-b',
-        user_id: 'owner-1',
-        worker_id: 'worker_000001',
-        run_id: 'run_000000001',
-        container_generation_id: generationB,
-        exp: 1_800_000_620,
-      }),
-    ).resolves.toMatchObject({
-      authorizationRef: authorization.authorizationRef,
-      ownerId: 'owner-1',
-      originRef: 'ghi_origin_0001',
-      workRef: 'work_00000001',
-      workerId: 'worker_000001',
-      runId: 'run_000000001',
-      grantId: 'grant-synthetic-b',
-    });
+      await revokeCapabilityAuthorizationGrant({
+        authorizationRef: authorization.authorizationRef,
+        originRef: 'ghi_origin_0001',
+        workRef: 'work_00000001',
+        workerId: 'worker_000001',
+        runId: 'run_000000001',
+        [requestField]: generationA,
+        grantId: 'grant-synthetic-a',
+      });
+      await expect(
+        assertActiveCapabilityAuthorizationGrant({
+          authorization_ref: authorization.authorizationRef,
+          grant_id: 'grant-synthetic-b',
+          user_id: 'owner-1',
+          worker_id: 'worker_000001',
+          run_id: 'run_000000001',
+          [grantField]: generationB,
+          exp: 1_800_000_620,
+        }),
+      ).resolves.toMatchObject({
+        ownerId: 'owner-1',
+        originRef: 'ghi_origin_0001',
+        workRef: 'work_00000001',
+        grantId: 'grant-synthetic-b',
+      });
 
-    await revokeCapabilityAuthorizationGrant({
-      authorizationRef: authorization.authorizationRef,
-      originRef: 'ghi_origin_0001',
-      workRef: 'work_00000001',
-      workerId: 'worker_000001',
-      runId: 'run_000000001',
-      containerGenerationId: generationA,
-      grantId: 'grant-synthetic-a',
-    });
-    await expect(
-      assertActiveCapabilityAuthorizationGrant({
-        authorization_ref: authorization.authorizationRef,
-        grant_id: 'grant-synthetic-b',
-        user_id: 'owner-1',
-        worker_id: 'worker_000001',
-        run_id: 'run_000000001',
-        container_generation_id: generationB,
-        exp: 1_800_000_620,
-      }),
-    ).resolves.toMatchObject({
-      ownerId: 'owner-1',
-      originRef: 'ghi_origin_0001',
-      workRef: 'work_00000001',
-      grantId: 'grant-synthetic-b',
-    });
-
-    await revokeCapabilityAuthorizationGrant({
-      authorizationRef: authorization.authorizationRef,
-      originRef: 'ghi_origin_0001',
-      workRef: 'work_00000001',
-      workerId: 'worker_000001',
-      runId: 'run_000000001',
-      containerGenerationId: generationB,
-      grantId: 'grant-synthetic-b',
-    });
-    await expect(
-      assertActiveCapabilityAuthorizationGrant({
-        authorization_ref: authorization.authorizationRef,
-        grant_id: 'grant-synthetic-b',
-        worker_id: 'worker_000001',
-        run_id: 'run_000000001',
-        container_generation_id: generationB,
-        exp: 1_800_000_620,
-      }),
-    ).rejects.toMatchObject({ code: 'capability_grant_inactive', status: 401 });
-  });
+      await revokeCapabilityAuthorizationGrant({
+        authorizationRef: authorization.authorizationRef,
+        originRef: 'ghi_origin_0001',
+        workRef: 'work_00000001',
+        workerId: 'worker_000001',
+        runId: 'run_000000001',
+        [requestField]: generationB,
+        grantId: 'grant-synthetic-b',
+      });
+      await expect(
+        assertActiveCapabilityAuthorizationGrant({
+          authorization_ref: authorization.authorizationRef,
+          grant_id: 'grant-synthetic-b',
+          user_id: 'owner-1',
+          worker_id: 'worker_000001',
+          run_id: 'run_000000001',
+          [grantField]: generationB,
+          exp: 1_800_000_620,
+        }),
+      ).rejects.toMatchObject({ code: 'capability_grant_inactive', status: 401 });
+    },
+  );
 
   test('fails closed when policy narrows instead of silently minting a weaker grant', async () => {
     const { admitCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');

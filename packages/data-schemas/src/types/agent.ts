@@ -85,6 +85,10 @@ export interface IAgent extends Omit<Document, 'model'> {
       default_mode: 'focused' | 'parallel';
       worker_profile?: 'codex-cli' | 'claude-code' | 'openclaw-general';
       fallback_worker_profile?: 'codex-cli' | 'claude-code' | 'openclaw-general';
+      worker_model?: string;
+      worker_reasoning_effort?: string;
+      fallback_worker_model?: string;
+      fallback_worker_reasoning_effort?: string;
     };
   };
   /* === VIVENTIUM END === */

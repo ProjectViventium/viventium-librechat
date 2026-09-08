@@ -375,6 +375,7 @@ async function runEmotionalReaction(
         req: reactionReq,
         res: createBackgroundRes(),
         contextMode: 'minimal',
+        completedResultPolicy: 'internal',
         executionTimeoutMs: config.reaction.timeoutMs,
       });
       const canRetryEmptyModel =

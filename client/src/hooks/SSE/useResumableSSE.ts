@@ -20,6 +20,7 @@ import {
   removeNullishValues,
 } from 'librechat-data-provider';
 import type { TMessage, TPayload, TSubmission, EventSubmission } from 'librechat-data-provider';
+import type { SetterOrUpdater } from 'recoil';
 import type { EventHandlerParams } from './useEventHandlers';
 import { useActiveJobs, useGetStartupConfig, useGetUserBalance } from '~/data-provider';
 import type { ActiveJobsResponse } from '~/data-provider';
@@ -52,7 +53,9 @@ type ChatHelpers = Pick<
   | 'setIsSubmitting'
   | 'newConversation'
   | 'resetLatestMessage'
->;
+> & {
+  setSubmission?: SetterOrUpdater<TSubmission | null>;
+};
 
 const MAX_RETRIES = 5;
 
@@ -145,6 +148,7 @@ export default function useResumableSSE(
 
   const sseRef = useRef<SSE | null>(null);
   const reconnectAttemptRef = useRef(0);
+  const reconnectExhaustedAtRef = useRef(0);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const submissionRef = useRef<TSubmission | null>(null);
   /* === VIVENTIUM START ===
@@ -160,6 +164,7 @@ export default function useResumableSSE(
     setMessages,
     getMessages,
     setConversation,
+    setSubmission: setCanonicalSubmission,
     setIsSubmitting,
     newConversation,
     resetLatestMessage,
@@ -271,6 +276,8 @@ export default function useResumableSSE(
 
       sse.addEventListener('open', () => {
         console.log('[ResumableSSE] Stream connected');
+        intentionallyClosed = false;
+        transportFailureHandled = false;
         setAbortScroll(false);
         // Restore UI state on successful connection (including reconnection)
         setIsSubmitting(true);
@@ -588,6 +595,54 @@ export default function useResumableSSE(
         }
       });
 
+      /* === VIVENTIUM START ===
+       * Feature: Recovery after transport loss.
+       * Purpose: Both network failure and EOF without FINAL use the existing reconnect owner.
+       */
+      let intentionallyClosed = false;
+      let transportFailureHandled = false;
+      const reconnectStream = () => {
+        if (sseRef.current !== sse || terminalStreamRef.current === currentStreamId) {
+          return;
+        }
+        if (reconnectAttemptRef.current < MAX_RETRIES) {
+          // Increment counter BEFORE close() so abort handler knows we're reconnecting
+          reconnectAttemptRef.current++;
+          const delay = Math.min(1000 * Math.pow(2, reconnectAttemptRef.current - 1), 30000);
+
+          console.log(
+            `[ResumableSSE] Reconnecting in ${delay}ms (attempt ${reconnectAttemptRef.current}/${MAX_RETRIES})`,
+          );
+
+          sse.close();
+
+          reconnectTimeoutRef.current = setTimeout(() => {
+            reconnectTimeoutRef.current = null;
+            if (submissionRef.current) {
+              // Reconnect with isResume=true to get sync event with any missed content
+              subscribeToStream(currentStreamId, submissionRef.current, true);
+            }
+          }, delay);
+
+          // Keep UI in "submitting" state during reconnection attempts
+          // so user knows we're still trying (abort handler may have reset these)
+          setIsSubmitting(true);
+          setShowStopButton(true);
+        } else {
+          reconnectExhaustedAtRef.current = Date.now();
+          console.error('[ResumableSSE] Transport retries exhausted; awaiting job registry');
+          sse.close();
+          // The accepted job remains owned by the server. Its existing registry poll will
+          // resume a running stream or reconcile a completed response after transport returns.
+        }
+      };
+      sse.addEventListener('readystatechange', (event: Event & { readyState?: number }) => {
+        if (event.readyState === SSE.CLOSED && !intentionallyClosed && !transportFailureHandled) {
+          reconnectStream();
+        }
+      });
+      /* === VIVENTIUM END === */
+
       /**
        * Error event handler - handles BOTH:
        * 1. HTTP-level errors (responseCode present) - 404, 401, network failures
@@ -596,6 +651,7 @@ export default function useResumableSSE(
        * Order matters: check responseCode first since HTTP errors may also include data
        */
       sse.addEventListener('error', async (e: MessageEvent) => {
+        transportFailureHandled = true;
         (startupConfig?.balance?.enabled ?? false) && balanceQuery.refetch();
 
         /* @ts-ignore - sse.js types don't expose responseCode */
@@ -627,6 +683,9 @@ export default function useResumableSSE(
             if (!newToken) {
               throw new Error('Token refresh failed.');
             }
+            if (sseRef.current !== sse || intentionallyClosed) {
+              return;
+            }
             sse.headers = {
               Authorization: `Bearer ${newToken}`,
             };
@@ -643,7 +702,7 @@ export default function useResumableSSE(
          * These are structured server errors that should be displayed to the user.
          * Only check e.data if there's no HTTP responseCode, since HTTP errors may also have body data.
          */
-        if (!responseCode && e.data) {
+        if (typeof responseCode !== 'number' && e.data) {
           console.log('[ResumableSSE] Server-sent error event received:', e.data);
           sse.close();
           removeActiveJob(currentStreamId, activeConversationId);
@@ -673,44 +732,7 @@ export default function useResumableSSE(
           return;
         }
 
-        // Network failure or unknown HTTP error - attempt reconnection with backoff
-        console.log('[ResumableSSE] Stream error (network failure) - will attempt reconnect', {
-          responseCode,
-          hasData: !!e.data,
-        });
-
-        if (reconnectAttemptRef.current < MAX_RETRIES) {
-          // Increment counter BEFORE close() so abort handler knows we're reconnecting
-          reconnectAttemptRef.current++;
-          const delay = Math.min(1000 * Math.pow(2, reconnectAttemptRef.current - 1), 30000);
-
-          console.log(
-            `[ResumableSSE] Reconnecting in ${delay}ms (attempt ${reconnectAttemptRef.current}/${MAX_RETRIES})`,
-          );
-
-          sse.close();
-
-          reconnectTimeoutRef.current = setTimeout(() => {
-            if (submissionRef.current) {
-              // Reconnect with isResume=true to get sync event with any missed content
-              subscribeToStream(currentStreamId, submissionRef.current, true);
-            }
-          }, delay);
-
-          // Keep UI in "submitting" state during reconnection attempts
-          // so user knows we're still trying (abort handler may have reset these)
-          setIsSubmitting(true);
-          setShowStopButton(true);
-        } else {
-          console.error('[ResumableSSE] Max reconnect attempts reached');
-          sse.close();
-          errorHandler({ data: undefined, submission: currentSubmission as EventSubmission });
-          // Optimistically remove from active jobs on max retries
-          removeActiveJob(currentStreamId, activeConversationId);
-          setIsSubmitting(false);
-          setShowStopButton(false);
-          setStreamId(null);
-        }
+        reconnectStream();
       });
 
       /**
@@ -719,6 +741,7 @@ export default function useResumableSSE(
        * Only reset state if we're NOT in a reconnection cycle.
        */
       sse.addEventListener('abort', () => {
+        intentionallyClosed = true;
         // If we're in a reconnection cycle, don't reset state
         // (error handler will set up the reconnect timeout)
         if (reconnectAttemptRef.current > 0) {
@@ -835,6 +858,7 @@ export default function useResumableSSE(
 
     if (
       verifiedRegistryStreamId !== streamId ||
+      !activeJobsSuccess ||
       activeJobsFetching ||
       terminalStreamRef.current === streamId
     ) {
@@ -852,6 +876,16 @@ export default function useResumableSSE(
       (stream) => stream.streamId === streamId && stream.conversationId === canonicalConversationId,
     );
     if (exactStreamActive) {
+      if (
+        activeJobsSuccess &&
+        activeJobsDataUpdatedAt > reconnectExhaustedAtRef.current &&
+        reconnectAttemptRef.current >= MAX_RETRIES &&
+        !reconnectTimeoutRef.current &&
+        sseRef.current?.readyState === SSE.CLOSED
+      ) {
+        reconnectAttemptRef.current = 0;
+        subscribeToStream(streamId, currentSubmission, true);
+      }
       return;
     }
 
@@ -891,6 +925,7 @@ export default function useResumableSSE(
     setIsSubmitting,
     setShowStopButton,
     streamId,
+    subscribeToStream,
     verifiedRegistryStreamId,
   ]);
   /* === VIVENTIUM END === */
@@ -1092,7 +1127,24 @@ export default function useResumableSSE(
               !submission.conversation?.conversationId ||
               submission.conversation.conversationId === Constants.NEW_CONVO
             ) {
+              /* === VIVENTIUM START ===
+               * Feature: Canonical new-chat stream handoff.
+               * Purpose: Route settlement can remount ChatView. Persist the accepted stream first
+               *          so the remount resumes it instead of replaying the original start POST.
+               */
+              if (setCanonicalSubmission) {
+                setCanonicalSubmission({
+                  ...claimedSubmission,
+                  resumeStreamId: newStreamId,
+                } as TSubmission & { resumeStreamId: string });
+                setConversation?.((previous) =>
+                  previous ? { ...previous, conversationId: canonicalConversationId } : previous,
+                );
+                navigate(`/c/${canonicalConversationId}`, { replace: true });
+                return;
+              }
               navigate(`/c/${canonicalConversationId}`, { replace: true });
+              /* === VIVENTIUM END === */
             }
             setConversation?.((previous) =>
               previous ? { ...previous, conversationId: canonicalConversationId } : previous,

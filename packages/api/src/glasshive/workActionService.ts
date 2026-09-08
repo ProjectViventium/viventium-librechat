@@ -5,6 +5,8 @@
  * === VIVENTIUM END === */
 
 import crypto from 'node:crypto';
+import type { VoiceWorkAuthorityBinding } from '../voice/engagementAuthority';
+import type { NativeWorkInputResponse } from 'librechat-data-provider';
 import { safeErrorCode } from '../logging/safeError';
 
 type UnknownRecord = Record<string, unknown>;
@@ -22,13 +24,15 @@ export interface GlassHiveWorkActionInput {
   workRef?: unknown;
   action?: unknown;
   instruction?: unknown;
+  nativeInput?: NativeWorkInputResponse;
+  ownerInputControl?: boolean;
   operationId?: unknown;
   sourceSurface?: unknown;
   durableEffectContext?: DurableActionEffectContext;
+  voiceAuthorityContext?: { callSessionId?: unknown; binding?: VoiceWorkAuthorityBinding };
 }
 
 interface GenerationJobManagerAdapter {
-  markDurableEffectReceipt(input: UnknownRecord): Promise<unknown>;
   getJob(streamId: string): Promise<unknown>;
 }
 
@@ -38,6 +42,10 @@ interface LoggerAdapter {
 
 export interface GlassHiveWorkActionDependencies {
   GenerationJobManager: GenerationJobManagerAdapter;
+  assertVoiceWorkAuthority(
+    binding: VoiceWorkAuthorityBinding | undefined,
+    ownerId: string,
+  ): Promise<void>;
   logger: LoggerAdapter;
   buildTrustedActionIdempotencyKey(input: UnknownRecord): string;
   getActiveWorkSnapshot(input: UnknownRecord): Promise<unknown>;
@@ -144,52 +152,15 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
     };
   }
 
-  async function bindDurableActionReceipt({
-    ownerId,
-    workRef,
-    action,
-    operationId,
-    durableEffectContext,
-  }: GlassHiveWorkActionInput): Promise<{ effectRef: string; marked: boolean } | null> {
-    if (!durableEffectContext) return null;
-    const effectRef = `work_action_${crypto
-      .createHash('sha256')
-      .update(
-        `${String(workRef || '')}\0${String(action || '')}\0${String(operationId || '')}`,
-        'utf8',
-      )
-      .digest('hex')}`;
-    const marked = Boolean(
-      await deps.GenerationJobManager.markDurableEffectReceipt({
-        streamId: normalizedText(durableEffectContext.streamId),
-        userId: normalizedText(ownerId),
-        sourceEventId: normalizedText(durableEffectContext.sourceEventId),
-        responseMessageId: normalizedText(durableEffectContext.responseMessageId),
-        effectKind: 'durable_work_action_accepted',
-        effectRef,
-      }).catch(() => false),
-    );
-    if (!marked) {
-      deps.logger.warn(
-        '[VIVENTIUM][parallel-work] Existing-work action succeeded but its exact presentation receipt could not be bound',
-        { code: 'action_receipt_binding_failed', stage: 'action_receipt_binding' },
-      );
-    }
-    return { effectRef, marked };
-  }
-
   async function traceAcceptedVoiceAction({
     ownerId,
     workRef,
     action,
     operationId,
     durableEffectContext,
-    receipt,
-  }: GlassHiveWorkActionInput & {
-    receipt: { effectRef: string; marked: boolean } | null;
-  }): Promise<void> {
+  }: GlassHiveWorkActionInput): Promise<void> {
     const streamId = normalizedText(durableEffectContext?.streamId);
-    if (!streamId || !receipt?.effectRef) return;
+    if (!streamId || !normalizedText(operationId)) return;
     try {
       const job = recordFrom(await deps.GenerationJobManager.getJob(streamId));
       const metadata = recordFrom(job.metadata);
@@ -210,9 +181,9 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
         streamRef: streamId,
         ...(taskId ? { taskRef: taskId } : {}),
         actionRef: operationId,
-        receiptRef: receipt.effectRef,
+        receiptRef: operationId,
         action,
-        effectCount: receipt.marked ? 1 : 0,
+        effectCount: 1,
       };
       await deps.recordVoiceOrchestrationTraceBestEffort({
         ownerId,
@@ -222,16 +193,14 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
         stage: 'action.accepted',
         facts,
       });
-      if (receipt.marked) {
-        await deps.recordVoiceOrchestrationTraceBestEffort({
+      await deps.recordVoiceOrchestrationTraceBestEffort({
           ownerId,
           callSessionId,
           turnId,
-          eventRef: receipt.effectRef,
+          eventRef: operationId,
           stage: 'control.completed',
           facts,
         });
-      }
     } catch (error) {
       deps.logger.warn('[VIVENTIUM][voice-trace] accepted_action_context_unavailable', {
         code: safeErrorCode(error, 'context_unavailable'),
@@ -267,6 +236,25 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
     const { ownerId, workRef, instruction, operationId, sourceSurface, durableEffectContext } =
       input;
     const action = normalizedText(input.action).toLowerCase();
+    const assertCurrentVoiceAuthority = async () => {
+      const context = input.voiceAuthorityContext;
+      if (!context?.callSessionId) return;
+      if (context.binding?.callSessionId !== context.callSessionId) {
+        throw Object.assign(new Error('voice_work_authority_stale'), {
+          code: 'voice_work_authority_stale',
+          status: 409,
+          retryable: false,
+        });
+      }
+      await deps.assertVoiceWorkAuthority(context.binding, normalizedText(ownerId));
+    };
+    await assertCurrentVoiceAuthority();
+    if (input.nativeInput && (action !== 'resume' || input.ownerInputControl !== true)) {
+      throw Object.assign(new Error('native_input_owner_control_required'), {
+        code: 'native_input_owner_control_required',
+        status: 403,
+      });
+    }
     if (action === 'dismiss') {
       const coreOnlyReceipt = await deps.dismissCoreOnlyPreDispatchAttention({
         ownerId,
@@ -276,8 +264,7 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
       if (coreOnlyReceipt) {
         deps.invalidateActiveWorkSnapshot({ ownerId });
         await deps.getActiveWorkSnapshot({ ownerId, forceRefresh: true });
-        const receipt = await bindDurableActionReceipt(input);
-        await traceAcceptedVoiceAction({ ...input, action, receipt });
+        await traceAcceptedVoiceAction({ ...input, action });
         return coreOnlyReceipt;
       }
       const delivery = recordFrom(await deps.getCoreWorkDelivery({ ownerId, workRef }));
@@ -304,14 +291,17 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
       sourceSurface,
       durableEffectContext,
     });
+    await assertCurrentVoiceAuthority();
     const result = await deps.requestAccountApi({
       ownerId,
       path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}/actions`,
       method: 'POST',
+      ...(input.nativeInput ? { ownerNativeInput: input.nativeInput } : {}),
       body: {
         action,
         ...(instruction ? { instruction } : {}),
         idempotencyKey,
+        ...(input.nativeInput ? { nativeInput: input.nativeInput } : {}),
         ...(capabilityReauthorization ? { capabilityReauthorization } : {}),
         ...(sourceContext ? { sourceContext } : {}),
       },
@@ -320,8 +310,7 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
     if (action === 'dismiss') {
       await deps.getActiveWorkSnapshot({ ownerId, forceRefresh: true });
     }
-    const receipt = await bindDurableActionReceipt({ ...input, action });
-    await traceAcceptedVoiceAction({ ...input, action, receipt });
+    await traceAcceptedVoiceAction({ ...input, action });
     return result;
   }
 

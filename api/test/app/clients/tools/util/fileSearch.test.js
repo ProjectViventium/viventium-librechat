@@ -1,11 +1,18 @@
 const axios = require('axios');
 
 jest.mock('axios');
-jest.mock('@librechat/api', () => ({
-  generateShortLivedToken: jest.fn(),
-}));
+jest.mock('@librechat/api', () => {
+  const actual = jest.requireActual('@librechat/api');
+  return {
+    generateShortLivedToken: jest.fn(),
+    buildConversationRecallAttachmentFiles: actual.buildConversationRecallAttachmentFiles,
+    rebuildSourceOnlyConversationRecallFiles: actual.rebuildSourceOnlyConversationRecallFiles,
+    primeResources: actual.primeResources,
+  };
+});
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: {
     warn: jest.fn(),
     info: jest.fn(),
@@ -17,6 +24,9 @@ jest.mock('@librechat/data-schemas', () => ({
 jest.mock('~/models', () => ({
   getFiles: jest.fn().mockResolvedValue([]),
 }));
+
+jest.mock('~/models/Agent', () => ({ getAgent: jest.fn() }));
+jest.mock('~/server/services/PermissionService', () => ({ checkPermission: jest.fn() }));
 
 const mockMessageFind = jest.fn();
 const mockMessageAggregate = jest.fn();
@@ -1807,53 +1817,66 @@ describe('fileSearch.js - tuple return validation', () => {
     });
 
     it('uses source-backed rescue for source-only conversation recall attachments', async () => {
-      generateShortLivedToken.mockReturnValue('mock-jwt-token');
-      axios.post.mockImplementation((url, body) => {
-        if (body.file_id === 'manual-file-1') {
+      const previousClientUrl = process.env.DOMAIN_CLIENT;
+      process.env.DOMAIN_CLIENT = 'https://chat.example.test/workspace';
+      try {
+        generateShortLivedToken.mockReturnValue('mock-jwt-token');
+        axios.post.mockImplementation((url, body) => {
+          if (body.file_id === 'manual-file-1') {
+            return Promise.resolve({ data: [] });
+          }
           return Promise.resolve({ data: [] });
-        }
-        return Promise.resolve({ data: [] });
-      });
-      mockMessageFind.mockImplementation((filter) => {
-        if (filter?.parentMessageId === 'source_user_turn') {
-          return queryResult([]);
-        }
-        return queryResult([
-          {
-            messageId: 'source_user_turn',
-            conversationId: 'source_convo',
-            createdAt: '2026-04-09T18:12:00.000Z',
-            isCreatedByUser: true,
-            text: 'Project Atlas decision: ship the slimmer onboarding flow first.',
-          },
-        ]);
-      });
+        });
+        mockMessageFind.mockImplementation((filter) => {
+          if (filter?.parentMessageId === 'source_user_turn') {
+            return queryResult([]);
+          }
+          return queryResult([
+            {
+              messageId: 'source_user_turn',
+              conversationId: 'source_convo',
+              createdAt: '2026-04-09T18:12:00.000Z',
+              isCreatedByUser: true,
+              text: 'Project Atlas decision: ship the slimmer onboarding flow first.',
+            },
+          ]);
+        });
 
-      const fileSearchTool = await createFileSearchTool({
-        userId: 'user1',
-        conversationId: 'current-convo',
-        files: [
-          {
-            file_id: 'conversation_recall:user_1:all',
-            filename: 'conversation-recall-all.txt',
-            viventiumConversationRecallMode: 'source_only',
-          },
-          { file_id: 'manual-file-1', filename: 'manual.pdf' },
-        ],
-      });
+        const fileSearchTool = await createFileSearchTool({
+          userId: 'user1',
+          conversationId: 'current-convo',
+          files: [
+            {
+              file_id: 'conversation_recall:user_1:all',
+              filename: 'conversation-recall-all.txt',
+              viventiumConversationRecallMode: 'source_only',
+            },
+            { file_id: 'manual-file-1', filename: 'manual.pdf' },
+          ],
+        });
 
-      const [, artifact] = await fileSearchTool.func({ query: 'Project Atlas onboarding flow' });
+        const [output, artifact] = await fileSearchTool.func({
+          query: 'Project Atlas onboarding flow',
+        });
 
-      expect(axios.post.mock.calls.map(([, body]) => body.file_id)).toEqual(
-        expect.arrayContaining(['manual-file-1']),
-      );
-      expect(axios.post.mock.calls.map(([, body]) => body.file_id)).not.toContain(
-        'conversation_recall:user_1:all',
-      );
-      expect(artifact.file_search.sources[0].fileId).toBe('conversation_recall:user_1:all');
-      expect(artifact.file_search.sources[0].content).toContain(
-        'Project Atlas decision: ship the slimmer onboarding flow first.',
-      );
+        expect(axios.post.mock.calls.map(([, body]) => body.file_id)).toEqual(
+          expect.arrayContaining(['manual-file-1']),
+        );
+        expect(axios.post.mock.calls.map(([, body]) => body.file_id)).not.toContain(
+          'conversation_recall:user_1:all',
+        );
+        expect(artifact.file_search.sources[0].fileId).toBe('conversation_recall:user_1:all');
+        expect(artifact.file_search.sources[0].content).toContain(
+          'Project Atlas decision: ship the slimmer onboarding flow first.',
+        );
+        expect(output).toContain('source="https://chat.example.test/workspace/c/source_convo"');
+        expect(artifact.file_search.sources[0].content).toContain(
+          'source="https://chat.example.test/workspace/c/source_convo"',
+        );
+      } finally {
+        if (previousClientUrl === undefined) delete process.env.DOMAIN_CLIENT;
+        else process.env.DOMAIN_CLIENT = previousClientUrl;
+      }
     });
 
     it('batches four source-only matches within a two-database-round-trip latency budget', async () => {
@@ -2555,7 +2578,10 @@ describe('fileSearch.js - primeFiles', () => {
   });
 
   it('deduplicates files merged from DB and resource payload by file_id', async () => {
-    getFiles.mockResolvedValueOnce([{ file_id: 'file-1', filename: 'from-db.pdf' }]);
+    getFiles.mockResolvedValueOnce([
+      { file_id: 'file-1', filename: 'from-db.pdf' },
+      { file_id: 'file-2', filename: 'new-attachment.pdf' },
+    ]);
 
     const result = await primeFiles({
       tool_resources: {
@@ -2633,5 +2659,205 @@ describe('fileSearch.js - primeFiles', () => {
     expect(artifact.file_search.sources[0].content).toContain(
       'Synthetic source-only recall evidence.',
     );
+  });
+});
+
+/* === VIVENTIUM START ===
+ * Current File authority survives staged attachment snapshots; virtual recall reuses its owner.
+ * === VIVENTIUM END === */
+describe('fileSearch.js - current resource authority', () => {
+  const { getAgent } = require('~/models/Agent');
+  const { checkPermission } = require('~/server/services/PermissionService');
+  const { filterFilesByAgentAccess } = require('~/server/services/Files/permissions');
+  const { buildConversationRecallAttachmentFiles, primeResources } = require('@librechat/api');
+  const req = {
+    user: { id: 'owner', role: 'USER', personalization: { conversation_recall: true } },
+  };
+  const agent = { id: 'agent', _id: 'agent-row', author: 'owner' };
+  const stored = {
+    file_id: 'upload',
+    filename: 'current.pdf',
+    user: 'owner',
+    embedded: true,
+    type: 'application/pdf',
+    metadata: { source: 'current' },
+  };
+  const prime = (files, request = req, fileIds = files.map((file) => file.file_id)) =>
+    primeFiles({
+      req: request,
+      agentId: agent.id,
+      tool_resources: { file_search: { file_ids: fileIds, files } },
+    });
+  const virtual = (options = {}) =>
+    buildConversationRecallAttachmentFiles({
+      userId: req.user.id,
+      scope: 'all',
+      mode: 'source_only',
+      ...options,
+    });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    getFiles.mockResolvedValue([]);
+    getAgent.mockResolvedValue(agent);
+    checkPermission.mockResolvedValue(false);
+    filterFilesByAgentAccess.mockImplementation(
+      jest.requireActual('~/server/services/Files/permissions').filterFilesByAgentAccess,
+    );
+  });
+
+  it('loads staged upload IDs and keeps only current stored metadata', async () => {
+    getFiles.mockResolvedValue([stored]);
+    const result = await prime(
+      [{ ...stored, filename: 'stale.pdf', metadata: { source: 'stale' } }],
+      req,
+      [],
+    );
+    expect(getFiles).toHaveBeenCalledTimes(1);
+    expect(getFiles.mock.calls[0][0].file_id).toEqual({ $in: [stored.file_id] });
+    expect(result.files).toEqual([
+      expect.objectContaining({
+        file_id: stored.file_id,
+        filename: 'current.pdf',
+        metadata: { source: 'current' },
+      }),
+    ]);
+    expect(result.toolContext).toContain('current.pdf (just attached by user)');
+    expect(getAgent).not.toHaveBeenCalled();
+  });
+
+  it('cannot restore an upload removed after the actual server resource producer', async () => {
+    const staged = await primeResources({
+      req,
+      agentId: agent.id,
+      appConfig: {},
+      getFiles,
+      tool_resources: {},
+      requestFileSet: new Set([stored.file_id]),
+      attachments: Promise.resolve([stored]),
+    });
+    expect(staged.tool_resources.file_search.files).toEqual([stored]);
+    const result = await primeFiles({
+      req,
+      agentId: agent.id,
+      tool_resources: staged.tool_resources,
+    });
+    expect(result.files).toEqual([]);
+    expect(result.toolContext).not.toContain(stored.filename);
+  });
+
+  it('does not restore a currently denied upload from its staged descriptor', async () => {
+    getFiles.mockResolvedValue([{ ...stored, user: 'other-owner' }]);
+    getAgent.mockResolvedValue({
+      ...agent,
+      author: 'other-owner',
+      tool_resources: {
+        file_search: { file_ids: [stored.file_id] },
+      },
+    });
+    const result = await prime([stored]);
+    expect(checkPermission).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: req.user.id,
+        resourceId: agent._id,
+      }),
+    );
+    expect(result.files).toEqual([]);
+  });
+
+  it('does not reconstruct a currently denied recall row as a virtual resource', async () => {
+    const files = virtual();
+    getFiles.mockResolvedValue([{ ...files[0], user: 'other-owner' }]);
+    getAgent.mockResolvedValue({ ...agent, author: 'other-owner' });
+    expect((await prime(files)).files).toEqual([]);
+    expect(getAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves current files attached to a shared Agent with VIEW permission', async () => {
+    getFiles.mockResolvedValue([{ ...stored, user: 'other-owner' }]);
+    getAgent.mockResolvedValue({
+      ...agent,
+      author: 'other-owner',
+      tool_resources: {
+        file_search: { file_ids: [stored.file_id] },
+      },
+    });
+    checkPermission.mockResolvedValue(true);
+    expect((await prime([stored])).files).toEqual([
+      expect.objectContaining({ file_id: stored.file_id }),
+    ]);
+  });
+
+  it('excludes expired rows in the current database query without restoring snapshots', async () => {
+    const before = Date.now();
+    const result = await prime([{ ...stored, expiresAt: new Date(before - 1) }]);
+    const filter = getFiles.mock.calls[0][0];
+    expect(filter.$or).toEqual([{ expiresAt: null }, { expiresAt: { $gt: expect.any(Date) } }]);
+    expect(filter.$or[1].expiresAt.$gt.getTime()).toBeGreaterThanOrEqual(before);
+    expect(filter.$or[1].expiresAt.$gt.getTime()).toBeLessThanOrEqual(Date.now());
+    expect(result.files).toEqual([]);
+  });
+
+  it('retains an active owned upload with a future expiry', async () => {
+    getFiles.mockResolvedValue([{ ...stored, expiresAt: new Date(Date.now() + 60000) }]);
+    expect((await prime([stored])).files).toEqual([
+      expect.objectContaining({ file_id: stored.file_id }),
+    ]);
+  });
+
+  it('reconstructs authorized source-only recall instead of trusting staged metadata', async () => {
+    const files = virtual();
+    const result = await prime([
+      { ...files[0], filename: 'untrusted-name', metadata: { private: 'stale' } },
+    ]);
+    expect(result.files).toEqual([
+      expect.objectContaining({
+        file_id: files[0].file_id,
+        filename: files[0].filename,
+        metadata: undefined,
+        viventiumConversationRecallMode: 'source_only',
+      }),
+    ]);
+  });
+
+  it('preserves the user-specific source-only resource for an authorized shared Agent', async () => {
+    getAgent.mockResolvedValue({ ...agent, author: 'other-owner' });
+    checkPermission.mockResolvedValue(true);
+    expect((await prime(virtual())).files).toHaveLength(1);
+  });
+
+  it.each(['missing', 'denied'])('does not reconstruct recall for a %s Agent', async (state) => {
+    getAgent.mockResolvedValue(state === 'missing' ? null : { ...agent, author: 'other-owner' });
+    expect((await prime(virtual())).files).toEqual([]);
+  });
+
+  it('cannot enable disabled recall with a source-only flag', async () => {
+    expect(
+      (
+        await prime(virtual(), {
+          user: { ...req.user, personalization: { conversation_recall: false } },
+        })
+      ).files,
+    ).toEqual([]);
+  });
+
+  it('keeps Agent-only scope without widening to the enabled global preference', async () => {
+    getAgent.mockResolvedValue({ ...agent, conversation_recall_agent_only: true });
+    const scoped = virtual({ scope: 'agent', agentId: agent.id });
+    const result = await prime([
+      ...virtual(),
+      ...scoped,
+      ...virtual({ scope: 'agent', agentId: 'another-agent' }),
+    ]);
+    expect(result.files.map((file) => file.file_id)).toEqual([scoped[0].file_id]);
+  });
+
+  it('does not accept another owner, arbitrary source-only IDs, or a rowless vector', async () => {
+    const result = await prime([
+      ...virtual({ userId: 'other-owner' }),
+      { ...stored, viventiumConversationRecallMode: 'source_only' },
+      ...virtual({ mode: 'vector' }),
+    ]);
+    expect(result.files).toEqual([]);
   });
 });

@@ -1,3 +1,4 @@
+import type { NativeWorkInputResponse, PendingNativeWorkInput } from 'librechat-data-provider';
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiBaseUrl, request } from 'librechat-data-provider';
 
@@ -40,6 +41,7 @@ export type WorkSummary = {
   state: WorkState;
   statusSummary?: string;
   attention?: WorkAttention;
+  pendingNativeInput?: PendingNativeWorkInput;
   provider: string;
   originSurface?: string;
   nativeTeam?: {
@@ -73,6 +75,7 @@ export type WorkActionVariables = {
   action: WorkAction;
   operationId: string;
   instruction?: string;
+  nativeInput?: NativeWorkInputResponse;
 };
 
 const preferenceKey = ['viventium', 'orchestration', 'preference'] as const;
@@ -118,7 +121,7 @@ export const activeWorkRefetchInterval = (data?: { pages?: ActiveWorkSnapshot[] 
 
 /* === VIVENTIUM START ===
  * Feature: Active work Control Panel discovery.
- * Purpose: Let an authoritative startup gate suppress the fallback preference request.
+ * Purpose: Share the signed-in owner's operational readiness and preference across local controls.
  */
 export const useOrchestrationPreferenceQuery = ({ enabled = true }: { enabled?: boolean } = {}) =>
   useQuery<OrchestrationPreference>(
@@ -129,6 +132,14 @@ export const useOrchestrationPreferenceQuery = ({ enabled = true }: { enabled?: 
       staleTime: 2_000,
       refetchOnWindowFocus: true,
       refetchOnReconnect: true,
+      // Readiness probes finish after the first snapshot. Keep the mounted navigation current,
+      // without polling healthy or deliberately disabled installations.
+      refetchInterval: (data, query) =>
+        query.state.status !== 'error' &&
+        data?.available === false &&
+        !data.releaseGate?.blockers.includes('disabled')
+          ? 10_000
+          : false,
       retry: 1,
     },
   );
@@ -157,7 +168,7 @@ const mergedSnapshot = (
     : undefined;
 };
 
-export const useActiveWorkQuery = () => {
+export const useActiveWorkQuery = ({ enabled = true }: { enabled?: boolean } = {}) => {
   const query = useInfiniteQuery<ActiveWorkSnapshot>({
     queryKey: activeWorkKey,
     queryFn: ({ pageParam }) => {
@@ -166,6 +177,7 @@ export const useActiveWorkQuery = () => {
       return request.get(`${apiBaseUrl()}/api/viventium/orchestration/work${queryString}`);
     },
     getNextPageParam: (lastPage) => lastPage.cursor || undefined,
+    enabled,
     staleTime: 2_000,
     keepPreviousData: true,
     refetchInterval: activeWorkRefetchInterval,
@@ -212,13 +224,14 @@ export const useUpdateOrchestrationMutation = () => {
 export const useWorkActionMutation = () => {
   const queryClient = useQueryClient();
   return useMutation<unknown, Error, WorkActionVariables>(
-    ({ workRef, action, operationId, instruction }) =>
+    ({ workRef, action, operationId, instruction, nativeInput }) =>
       request.post(
         `${apiBaseUrl()}/api/viventium/orchestration/work/${encodeURIComponent(workRef)}/actions`,
         {
           action,
           operationId,
           ...(instruction ? { instruction } : {}),
+          ...(nativeInput ? { nativeInput } : {}),
         },
       ),
     {

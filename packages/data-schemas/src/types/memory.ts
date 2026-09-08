@@ -1,4 +1,5 @@
 import type { Types, Document } from 'mongoose';
+import type { MemoryWriterEffect } from './memoryWrite';
 
 // Base memory interfaces
 export interface IMemoryEntry extends Document {
@@ -9,6 +10,7 @@ export interface IMemoryEntry extends Document {
   updated_at?: Date;
   /* === VIVENTIUM START === Retained tombstone for monotonic memory revisions. === */
   deletedAt?: Date;
+  writerEffect?: MemoryWriterEffect;
   /* === VIVENTIUM END === */
   __v?: number;
 }
@@ -22,6 +24,7 @@ export interface IMemoryEntryLean {
   updated_at?: Date;
   /* === VIVENTIUM START === Retained tombstone for monotonic memory revisions. === */
   deletedAt?: Date;
+  writerEffect?: MemoryWriterEffect;
   /* === VIVENTIUM END === */
   __v?: number;
 }
@@ -34,12 +37,14 @@ export interface SetMemoryParams {
   tokenCount?: number;
   /** Undefined preserves legacy last-write behavior; null means the key was absent in the snapshot. */
   expectedRevision?: number | null;
+  writerEffect?: MemoryWriterEffect;
 }
 
 export interface DeleteMemoryParams {
   userId: string | Types.ObjectId;
   key: string;
   expectedRevision?: number | null;
+  writerEffect?: MemoryWriterEffect;
 }
 
 /* === VIVENTIUM START === Atomic memory-key rename contract. === */
@@ -56,6 +61,9 @@ export interface GetFormattedMemoriesParams {
 // Result interfaces
 export interface MemoryResult {
   ok: boolean;
+  /* === VIVENTIUM START === Exact CAS value change; absent for legacy writes. === */
+  changed?: boolean;
+  /* === VIVENTIUM END === */
   conflict?: boolean;
   /* === VIVENTIUM START === Stable conflict class for truthful memory rename recovery. === */
   conflictReason?: 'target_key_reserved';

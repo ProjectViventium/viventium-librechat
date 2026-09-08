@@ -4,6 +4,8 @@
  * two by opaque workRef so the roster never reports every completed mission as pending forever.
  * === VIVENTIUM END === */
 
+import { evidenceId } from './missionEvidenceIdentity';
+
 const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled']);
 const DISMISS_SAFE_DELIVERY_STATES = new Set(['delivered', 'acknowledged', 'silent']);
 const SETTLED_CORE_DELIVERY_STATES = new Set([
@@ -18,6 +20,16 @@ const CORE_ONLY_TERMINAL_RECENCY_MS = 3 * 24 * 60 * 60 * 1000;
 const STATE_RECONCILIATION_MIN_RETRY_MS = 5000;
 const STATE_RECONCILIATION_MAX_RETRY_MS = 5 * 60 * 1000;
 const ORIGIN_SURFACES = new Set(['librechat', 'telegram', 'voice', 'workbench']);
+const CURRENT_RESULT_PROJECTION = {
+  _id: 1,
+  originRef: 1,
+  workRef: 1,
+  terminalCallbackId: 1,
+  terminalCallbackRunId: 1,
+  terminalCallbackResultDigest: 1,
+  terminalCallbackResultRevision: 1,
+  terminalCallbackAcceptedOperationId: 1,
+};
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -67,7 +79,10 @@ function dateFrom(value: unknown, fallback: Date): Date {
   return Number.isFinite(date.getTime()) ? date : fallback;
 }
 
-export function createGlassHiveActiveWorkProjectionService(collection: ExternalWorkCollection) {
+export function createGlassHiveActiveWorkProjectionService(
+  collection: ExternalWorkCollection,
+  missionEvidence: Pick<ExternalWorkCollection, 'find'>,
+) {
   let indexPromise: Promise<unknown[]> | undefined;
 
   async function ensureGlassHiveExternalWorkIndexes(): Promise<void> {
@@ -113,7 +128,64 @@ export function createGlassHiveActiveWorkProjectionService(collection: ExternalW
     await indexPromise;
   }
 
-  function projectedDelivery(itemValue: unknown, rowValue?: unknown): unknown {
+  async function currentMissionStates(
+    ownerId: string,
+    rows: UnknownRecord[],
+  ): Promise<Map<string, string>> {
+    const identities = rows.flatMap((row) => {
+      const callbackId = normalizeText(row.terminalCallbackId, 80);
+      const originRef = normalizeText(row.originRef || row._id);
+      if (
+        !callbackId ||
+        !originRef ||
+        !normalizeText(row.terminalCallbackRunId) ||
+        !normalizeText(row.terminalCallbackResultDigest, 80) ||
+        !normalizeText(row.terminalCallbackAcceptedOperationId, 64) ||
+        !Number.isSafeInteger(row.terminalCallbackResultRevision) ||
+        Number(row.terminalCallbackResultRevision) < 1
+      )
+        return [];
+      return [
+        {
+          row,
+          originRef,
+          callbackId,
+          id: evidenceId({ ownerId, originRef, body: { callback_id: callbackId } }),
+        },
+      ];
+    });
+    if (!identities.length) return new Map();
+    const evidence = await missionEvidence
+      .find(
+        { ownerId, _id: { $in: identities.flatMap(({ id, callbackId }) => [id, callbackId]) } },
+        { projection: { ...CURRENT_RESULT_PROJECTION, ownerId: 1, runId: 1, state: 1 } },
+      )
+      .toArray();
+    const byId = new Map(evidence.map((row) => [normalizeText(row._id), row]));
+    const states = new Map<string, string>();
+    for (const { row, originRef, callbackId, id } of identities) {
+      const current = byId.get(id) || byId.get(callbackId);
+      if (
+        !current ||
+        normalizeText(current.ownerId) !== ownerId ||
+        normalizeText(current.originRef) !== originRef ||
+        normalizeText(current.workRef) !== normalizeText(row.workRef) ||
+        normalizeText(current.runId) !== normalizeText(row.terminalCallbackRunId) ||
+        normalizeText(current.terminalCallbackId, 80) !== callbackId ||
+        normalizeText(current.terminalCallbackResultDigest, 80) !==
+          normalizeText(row.terminalCallbackResultDigest, 80) ||
+        current.terminalCallbackResultRevision !== row.terminalCallbackResultRevision ||
+        normalizeText(current.terminalCallbackAcceptedOperationId, 64) !==
+          normalizeText(row.terminalCallbackAcceptedOperationId, 64)
+      ) {
+        continue;
+      }
+      states.set(normalizeText(row.workRef), normalizeText(current.state, 32));
+    }
+    return states;
+  }
+
+  function projectedDelivery(itemValue: unknown, rowValue?: unknown, missionState = ''): unknown {
     const item = recordFrom(itemValue);
     if (!rowValue) {
       return item.delivery;
@@ -122,15 +194,23 @@ export function createGlassHiveActiveWorkProjectionService(collection: ExternalW
     const terminal = TERMINAL_STATES.has(normalizeText(item.state, 32));
     const deliveryState = normalizeText(row.deliveryState, 32).toLowerCase();
     const adjudicationState = normalizeText(row.adjudicationState, 32).toLowerCase();
+    const currentPending = ['pending', 'processing'].includes(missionState);
+    const currentFailed = ['failed', 'delivery_pending', 'deadletter'].includes(missionState);
 
     let state = 'pending';
-    if (deliveryState === 'sent') {
+    if (currentPending) {
+      state = 'pending';
+    } else if (currentFailed || adjudicationState === 'failed') {
+      state = 'failed';
+    } else if (missionState === 'silent' || adjudicationState === 'silent') {
+      state = 'silent';
+    } else if (deliveryState === 'sent') {
       state = 'delivered';
     } else if (deliveryState === 'unknown') {
       state = 'unknown';
     } else if (deliveryState === 'acknowledged') {
       state = 'acknowledged';
-    } else if (deliveryState === 'suppressed' || adjudicationState === 'silent') {
+    } else if (deliveryState === 'suppressed') {
       state = 'silent';
     } else if (
       deliveryState === 'failed' ||
@@ -144,7 +224,10 @@ export function createGlassHiveActiveWorkProjectionService(collection: ExternalW
       state,
       unreadTerminal:
         terminal &&
-        row.attentionPending !== false &&
+        (currentPending ||
+          currentFailed ||
+          adjudicationState === 'failed' ||
+          row.attentionPending !== false) &&
         !['delivered', 'acknowledged', 'silent'].includes(state),
     };
   }
@@ -429,9 +512,18 @@ export function createGlassHiveActiveWorkProjectionService(collection: ExternalW
     await ensureGlassHiveExternalWorkIndexes();
     const row = await collection.findOne(
       { ownerId: normalizedOwnerId, workRef: normalizedWorkRef },
-      { projection: { _id: 0, deliveryState: 1, adjudicationState: 1, attentionPending: 1 } },
+      {
+        projection: {
+          ...CURRENT_RESULT_PROJECTION,
+          deliveryState: 1,
+          adjudicationState: 1,
+          attentionPending: 1,
+        },
+      },
     );
-    return row ? projectedDelivery({ state: 'completed' }, row) : null;
+    if (!row) return null;
+    const states = await currentMissionStates(normalizedOwnerId, [row]);
+    return projectedDelivery({ state: 'completed' }, row, states.get(normalizedWorkRef));
   }
 
   async function getCoreWorkOriginRef({
@@ -492,8 +584,8 @@ export function createGlassHiveActiveWorkProjectionService(collection: ExternalW
               { ownerId: normalizedOwnerId, workRef: { $in: workRefs } },
               {
                 projection: {
-                  _id: 0,
-                  workRef: 1,
+                  ...CURRENT_RESULT_PROJECTION,
+                  updatedAt: 1,
                   externalState: 1,
                   deliveryState: 1,
                   adjudicationState: 1,
@@ -509,6 +601,7 @@ export function createGlassHiveActiveWorkProjectionService(collection: ExternalW
         ? coreOnlyFailureRows(normalizedOwnerId, { history: includeCoreOnlyHistory })
         : [],
     ]);
+    const missionStates = await currentMissionStates(normalizedOwnerId, rows);
     const byRef = new Map(rows.map((row) => [normalizeText(row.workRef), row]));
     await Promise.all(
       sourceWork
@@ -533,11 +626,16 @@ export function createGlassHiveActiveWorkProjectionService(collection: ExternalW
     const projectedWork = sourceWork.map((itemValue): UnknownRecord => {
       const item = recordFrom(itemValue);
       const row = byRef.get(normalizeText(item.workRef));
-      const delivery = projectedDelivery(item, row);
+      const delivery = projectedDelivery(item, row, missionStates.get(normalizeText(item.workRef)));
       const actions = Array.isArray(item.actions) ? item.actions : [];
+      const coreUpdatedAt = isoDate(row?.updatedAt);
+      const executionUpdatedAt = isoDate(item.updatedAt);
       return {
         ...item,
         ...(row ? { delivery } : {}),
+        ...(coreUpdatedAt && (!executionUpdatedAt || coreUpdatedAt > executionUpdatedAt)
+          ? { updatedAt: coreUpdatedAt }
+          : {}),
         actions: DISMISS_SAFE_DELIVERY_STATES.has(
           normalizeText(recordFrom(delivery).state, 32).toLowerCase(),
         )

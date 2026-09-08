@@ -6,6 +6,7 @@ import {
   DELEGATION_TOOL_NAME,
   MAIN_DELEGATION_DESCRIPTION,
   MAIN_DELEGATION_JSON_SCHEMA,
+  mainDelegationJsonSchema,
   canonicalConversationOrchestrationArguments,
   mainDelegationTurnTruth,
   mainOrchestrationInvocationIdentity,
@@ -98,6 +99,44 @@ describe('GlassHive conversation orchestration contract', () => {
     expect(mainOrchestrationInvocationIdentity({ ...input, requestBody: {} })).toBe('');
   });
 
+  it('keeps one trusted provider occurrence stable when reconstructed arguments change', () => {
+    const input = {
+      userId: 'owner-1',
+      requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
+      toolName: 'active_work_action',
+      args: { workRef: 'work-1', action: 'stop' },
+      trustedCallIdentity: 'call-1',
+    };
+
+    expect(
+      mainOrchestrationInvocationIdentity({
+        ...input,
+        args: { workRef: 'work-1', action: 'STOP', instruction: 'reconstructed' },
+      }),
+    ).toBe(mainOrchestrationInvocationIdentity(input));
+  });
+
+  it('keeps distinct reconstructed arguments distinct without a trusted occurrence', () => {
+    const input = {
+      userId: 'owner-1',
+      requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
+      toolName: 'active_work_action',
+      trustedCallIdentity: '',
+    };
+
+    expect(
+      mainOrchestrationInvocationIdentity({
+        ...input,
+        args: { workRef: 'work-1', action: 'stop' },
+      }),
+    ).not.toBe(
+      mainOrchestrationInvocationIdentity({
+        ...input,
+        args: { workRef: 'work-2', action: 'stop' },
+      }),
+    );
+  });
+
   it('records only bounded public launch truth on the owning request', () => {
     const request = {};
     expect(
@@ -121,5 +160,23 @@ describe('GlassHive conversation orchestration contract', () => {
       needsInputCount: 1,
     });
     expect(Object.keys(request)).toEqual([]);
+  });
+});
+
+
+describe('trusted delegation source schema', () => {
+  test.each([undefined, {}, { viventiumTriggeringSourceSegments: [] },
+    { viventiumTriggeringSourceSegments: [{ text: 'One source.' }] }])(
+    'preserves the legacy schema when selection is not required', (body) => {
+      expect(mainDelegationJsonSchema(body)).toBe(MAIN_DELEGATION_JSON_SCHEMA);
+    },
+  );
+  test('requires a nonempty bounded selection without mutating the shared schema', () => {
+    const schema = mainDelegationJsonSchema({ viventiumTriggeringSourceSegments: [{}, {}, {}] });
+    expect(schema.required).toContain('sourceOrdinals');
+    expect(schema.properties.sourceOrdinals).toMatchObject({ minItems: 1, maxItems: 3,
+      items: { type: 'integer', minimum: 1, maximum: 3 } });
+    expect(MAIN_DELEGATION_JSON_SCHEMA.required).not.toContain('sourceOrdinals');
+    expect(MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals.maxItems).toBe(32);
   });
 });

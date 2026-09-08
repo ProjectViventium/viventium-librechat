@@ -47,3 +47,27 @@ export type MCPServerDBObjectResponse = {
 } & MCPOptions;
 
 export type MCPServersListResponse = Record<string, MCPServerDBObjectResponse>;
+
+/** Owner response to one pending native MCP request; never inferred from a Resume action. */
+export type NativeWorkInputResponse = {
+  version: 1;
+  requestId: string;
+  requestFingerprint: string;
+  action: 'accept' | 'decline' | 'cancel';
+  content?: Record<string, string | number | boolean | string[]>;
+};
+
+export type PendingNativeWorkInput = {
+  version: 1;
+  requestId: string;
+  requestFingerprint: string;
+  kind: 'elicitation';
+  mcpServerName: string;
+  message: string;
+  mode: 'form' | 'url';
+  requestedSchema?: import('@modelcontextprotocol/sdk/types.js').ElicitRequestFormParams['requestedSchema'];
+  url?: string;
+  elicitationId?: string;
+  title?: string;
+  state: 'pending';
+};

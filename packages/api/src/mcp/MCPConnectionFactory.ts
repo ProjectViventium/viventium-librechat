@@ -198,6 +198,16 @@ export class MCPConnectionFactory {
       options: basic.serverConfig,
       customUserVars: oauth?.customUserVars,
     });
+    /* === VIVENTIUM START ===
+     * Invalid stdio configuration cannot recover through connection retries. Validate the
+     * resolved executable before allocating a transport; later config edits are revalidated.
+     */
+    if ('command' in this.serverConfig && !this.serverConfig.command?.trim()) {
+      throw Object.assign(new Error('MCP stdio configuration requires a non-empty executable'), {
+        code: 'MCP_INVALID_CONFIG',
+      });
+    }
+    /* === VIVENTIUM END === */
     this.serverName = basic.serverName;
     this.useOAuth = !!oauth?.useOAuth;
     this.useSSRFProtection = basic.useSSRFProtection === true;

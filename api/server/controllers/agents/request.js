@@ -16,12 +16,14 @@
  * Added: 2026-01-11
  * Updated: 2026-01-31, 2026-02-07
  */
+const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
 const { Constants, ContentTypes, ViolationTypes } = require('librechat-data-provider');
 const {
   sendEvent,
   getViolationInfo,
   GenerationJobManager,
+  isAcceptedMainProjectionComplete,
   decrementPendingRequest,
   sanitizeFileForTransmit,
   sanitizeMessageForTransmit,
@@ -30,7 +32,7 @@ const {
 const { disposeClient, clientRegistry, requestDataMap } = require('~/server/cleanup');
 const { handleAbortError } = require('~/server/middleware');
 const { logViolation } = require('~/cache');
-const { saveMessage } = require('~/models');
+const { getFiles, saveMessage } = require('~/models');
 const { Conversation, Message } = require('~/db/models');
 /* === VIVENTIUM NOTE ===
  * Feature: Deep Telegram timing instrumentation (toggleable)
@@ -45,6 +47,7 @@ const {
   voiceLatencyNow,
 } = require('~/server/services/viventium/voiceLatencyTiming');
 const { getCortexFollowupGraceMs } = require('~/server/services/viventium/cortexFollowupGrace');
+const { memoryReceiptFromAttachments } = require('~/server/services/viventium/memoryReceipt');
 const { attachVoiceMessageMetadata } = require('~/server/services/viventium/voiceMessageMetadata');
 /* === VIVENTIUM NOTE END === */
 
@@ -70,7 +73,16 @@ const {
 const {
   isVoiceTaskSuppressedDurably,
   setVoiceTaskOwnerCapabilities,
+  settleVoiceTaskGeneration,
 } = require('~/server/services/viventium/VoiceTaskService');
+const {
+  commitAcceptedMainTurnFromPresentation,
+} = require('~/server/services/viventium/ViventiumMainContinuityService');
+const {
+  acquireInteractiveMainAdmissionFence,
+  ensureAcceptedMainCompaction,
+  yieldAcceptedMainCompaction,
+} = require('~/server/services/viventium/ViventiumMainCompactionService');
 /* === VIVENTIUM START === Versioned messaging delivery disposition. === */
 const {
   attachEffectiveDeliveryDisposition,
@@ -79,6 +91,7 @@ const {
 const {
   attachInteractionContextMetadata,
   bindCanonicalInteractionConversation,
+  bindInteractionSourceSegments,
   bindLogicalTurnContext,
   createWebInteractionContext,
   getTrustedInteractionContext,
@@ -89,6 +102,59 @@ const {
   setTrustedInteractionContext,
 } = require('~/server/services/viventium/interactionContext');
 /* === VIVENTIUM NOTE END === */
+
+const acceptedMainCompactionScheduledRequests = new WeakSet();
+const {
+  isVoiceActorSideEffectRestricted,
+} = require('~/server/services/viventium/VoiceActorAuthorityService');
+
+function scheduleAcceptedMainCompaction(req, client, commitResult) {
+  if (!['committed', 'already_committed'].includes(String(commitResult?.status || ''))) {
+    return false;
+  }
+  if (!req || acceptedMainCompactionScheduledRequests.has(req)) return false;
+  if (isVoiceActorSideEffectRestricted(req)) return false;
+  const identity = req._viventiumAcceptedMainCompactionIdentityV1;
+  const agent = client?.options?.agent;
+  if (!identity?.ownerId || !identity?.agentId || !identity?.stableAuthoritySha256 || !agent) {
+    return false;
+  }
+  acceptedMainCompactionScheduledRequests.add(req);
+  try {
+    void Promise.resolve(
+      ensureAcceptedMainCompaction({
+        trigger: 'accepted_turn',
+        ownerId: identity.ownerId,
+        agentId: identity.agentId,
+        stableAuthoritySha256: identity.stableAuthoritySha256,
+        req,
+        agent,
+      }),
+    ).catch((error) => {
+      logger.warn('[VIVENTIUM][main-continuity] Background semantic compaction unavailable', {
+        errorClass: String(error?.name || 'PersistenceError').slice(0, 80),
+      });
+    });
+  } catch (error) {
+    logger.warn('[VIVENTIUM][main-continuity] Semantic compaction could not be scheduled', {
+      errorClass: String(error?.name || 'PersistenceError').slice(0, 80),
+    });
+  }
+  return true;
+}
+
+async function commitAcceptedMainTurnAndScheduleCompaction({ presentation, req, client }) {
+  try {
+    const result = await commitAcceptedMainTurnFromPresentation(presentation);
+    scheduleAcceptedMainCompaction(req, client, result);
+    return result;
+  } catch (error) {
+    logger.error('[VIVENTIUM][main-continuity] Accepted turn commit failed', {
+      errorClass: String(error?.name || 'PersistenceError').slice(0, 80),
+    });
+    return null;
+  }
+}
 
 /* === VIVENTIUM NOTE ===
  * Feature: Timed message persistence for Telegram deep timing.
@@ -144,21 +210,190 @@ function attachQaRunReceipt(req, message) {
   };
 }
 
-function captureRequestInteractionContext(req, { conversationId, streamId } = {}) {
+const acceptedInteractionInputs = new WeakMap();
+function acceptedInteractionSourceId(req) {
+  const context = getTrustedInteractionContext(req);
+  return req.body?.overrideUserMessageId?.split(Constants.COMMON_DIVIDER)[0] || req.body?.overrideParentMessageId ||
+    stableScopedUuid(['viventium:accepted-user-input:v1', String(req.user.id), context.source_event_id]);
+}
+
+
+async function retainAcceptedInteractionInput(req, { conversationId, text, parentMessageId } = {}) {
+  let context = getTrustedInteractionContext(req);
+  if (!context || context.logical_turn_id || context.actor_kind !== 'external_user' || context.origin !== 'interactive' ||
+      req.body?.isRegenerate || req.body?.isContinued || req.body?.editedContent) return context;
+  const existing = acceptedInteractionInputs.get(req);
+  if (existing) return existing.context;
+  if (context.ready_input_continuation) return context;
+  // The adapter's unresolved 'new' value also means an explicit reset. Do not reuse an old scope.
+  if (!conversationId || conversationId === 'new') return context;
+  context = bindCanonicalInteractionConversation(req, conversationId);
+  const originalText = typeof text === 'string' ? text : req.body?.text;
+  if (typeof originalText !== 'string') return context;
+  const messageId = acceptedInteractionSourceId(req);
+  const source = { messageId, parentMessageId: parentMessageId || Constants.NO_PARENT };
+  context = bindInteractionSourceSegments(req, originalText, [], source);
+  await GenerationJobManager.retainLogicalTurnInput(req.user.id, context);
+  acceptedInteractionInputs.set(req, { context, source, originalText, persisted: false });
+  return context;
+}
+
+async function captureAcceptedInteractionInput(req, { conversationId, streamId, text, parentMessageId } = {}) {
+  // Honor the validated resolver, including a reset from a rejected existing conversation.
+  conversationId = resolveCanonicalConversationId(req, req.user.id, conversationId);
+  await retainAcceptedInteractionInput(req, { conversationId, text, parentMessageId });
+  const accepted = acceptedInteractionInputs.get(req);
+  if (!accepted || accepted.persisted) return getTrustedInteractionContext(req);
+  let context = bindCanonicalInteractionConversation(req, conversationId);
+  accepted.source.parentMessageId = parentMessageId || Constants.NO_PARENT;
+  context = bindInteractionSourceSegments(req, accepted.originalText, [], accepted.source);
+  await GenerationJobManager.retainLogicalTurnInput(req.user.id, context);
+  if (!(await Message.exists({ user: req.user.id, conversationId, messageId: accepted.source.messageId, isCreatedByUser: true }))) {
+    await timedSaveMessage(req, {
+      messageId: accepted.source.messageId, parentMessageId: accepted.source.parentMessageId,
+      conversationId, text: accepted.originalText, sender: 'User', isCreatedByUser: true,
+    }, { context: 'accepted user source before initialization' }, 'db_save_user');
+  }
+  accepted.context = context;
+  accepted.persisted = true;
+  return context;
+}
+
+async function captureRequestInteractionContext(req, { conversationId, streamId } = {}) {
   const existing = getTrustedInteractionContext(req);
-  if (existing) return bindCanonicalInteractionConversation(req, conversationId);
   const body = req?.body && typeof req.body === 'object' ? req.body : {};
   const sourceEventId =
     body.messageId || body.userMessageId || body.source_event_id || body.sourceEventId || streamId;
   delete body.interactionContext;
   delete body.viventiumInteractionContext;
-  return setTrustedInteractionContext(
+  const context = existing
+    ? bindCanonicalInteractionConversation(req, conversationId)
+    : setTrustedInteractionContext(
+        req,
+        createWebInteractionContext({
+          conversation_id: conversationId,
+          source_event_id: sourceEventId,
+        }),
+      );
+  if (context?.logical_turn_id) return context;
+  if (context.ready_input_continuation) return context;
+  if (req._viventiumTelegramInput) return getTrustedInteractionContext(req);
+  await captureAcceptedInteractionInput(req, { conversationId, streamId, text: body.text, parentMessageId: body.parentMessageId });
+  const fileIds = Array.from(new Set(
+    (Array.isArray(body.files) ? body.files : [])
+      .map((file) => file?.file_id)
+      .filter((fileId) => typeof fileId === 'string' && fileId.length > 0),
+  )).slice(0, 32);
+  const sourceFiles = fileIds.length
+    ? await getFiles(
+        { user: req.user.id, file_id: { $in: fileIds } },
+        undefined,
+        { file_id: 1, filename: 1, type: 1, bytes: 1, media_group_index: 1 },
+      )
+    : [];
+  const filesById = new Map(sourceFiles.map((file) => [file.file_id, file]));
+  const acceptedSource = acceptedInteractionInputs.get(req)?.source;
+  if (acceptedSource) acceptedSource.persisted = true;
+  const enriched = bindInteractionSourceSegments(
     req,
-    createWebInteractionContext({
-      conversation_id: conversationId,
-      source_event_id: sourceEventId,
-    }),
+    body.text,
+    fileIds.map((fileId) => filesById.get(fileId)).filter(Boolean),
+    acceptedSource,
   );
+  await GenerationJobManager.retainLogicalTurnInput(req.user.id, enriched);
+  return enriched;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Stable new-conversation authority across lost start responses.
+ * Purpose: A client can retry `conversationId: new` after the first 202 response is lost. Scope
+ *          the server-minted canonical conversation to the trusted user/source event so both
+ *          attempts reach the same logical-turn receipt instead of starting two generations.
+ * === VIVENTIUM END === */
+const NEW_CONVERSATION_UUID_NAMESPACE = Buffer.from('6ba7b8119dad11d180b400c04fd430c8', 'hex');
+
+function requestSourceEventId(req) {
+  const body = req?.body && typeof req.body === 'object' ? req.body : {};
+  const trustedContext = getTrustedInteractionContext(req);
+  return String(
+    trustedContext?.source_event_id ||
+      body.messageId ||
+      body.userMessageId ||
+      body.source_event_id ||
+      body.sourceEventId ||
+      body.responseMessageId ||
+      '',
+  ).trim();
+}
+
+function stableScopedUuid(parts) {
+  const name = JSON.stringify(parts);
+  const digest = crypto
+    .createHash('sha1')
+    .update(NEW_CONVERSATION_UUID_NAMESPACE)
+    .update(name, 'utf8')
+    .digest();
+  const bytes = Buffer.from(digest.subarray(0, 16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(
+    16,
+    20,
+  )}-${hex.slice(20)}`;
+}
+
+function stableNewConversationId(req, userId) {
+  const trustedContext = getTrustedInteractionContext(req);
+  const sourceEventId = trustedContext?.source_conversation_generation
+    ? [
+        "conversation-generation",
+        trustedContext.source_order_scope,
+        trustedContext.source_conversation_generation,
+      ].join(":")
+    : requestSourceEventId(req);
+  if (!sourceEventId) {
+    return crypto.randomUUID();
+  }
+  return stableScopedUuid([
+    'viventium:new-conversation:v1',
+    String(userId || ''),
+    String(trustedContext?.actor_kind || 'external_user'),
+    String(trustedContext?.origin || 'interactive'),
+    String(trustedContext?.surface || 'web'),
+    sourceEventId,
+  ]);
+}
+
+function resolveCanonicalConversationId(req, userId, requestedConversationId) {
+  return !requestedConversationId || requestedConversationId === 'new'
+    ? stableNewConversationId(req, userId)
+    : requestedConversationId;
+}
+
+function duplicateGenerationReceipt(req, job, fallbackConversationId) {
+  const jobInteractionContext = job?.metadata?.interactionContext;
+  const canonicalConversationId =
+    jobInteractionContext?.conversation_id ||
+    job?.metadata?.conversationId ||
+    fallbackConversationId;
+  bindCanonicalInteractionConversation(req, canonicalConversationId);
+  const claimedInteractionContext = bindLogicalTurnContext(req, jobInteractionContext);
+  const receiptContext = claimedInteractionContext?.logical_turn_id
+    ? claimedInteractionContext
+    : jobInteractionContext;
+  return {
+    streamId: job.duplicateOfStreamId,
+    conversationId: canonicalConversationId,
+    status: 'duplicate',
+    duplicate: true,
+    ...(receiptContext?.logical_turn_id
+      ? {
+          logical_turn_id: receiptContext.logical_turn_id,
+          revision: receiptContext.revision,
+        }
+      : {}),
+  };
 }
 
 async function resolveRequestStreamId(req, userId, conversationId) {
@@ -198,6 +433,17 @@ async function resolveDeliveryDispositionRequirement(req, endpointOption) {
 function voiceTaskIdForRequest(req) {
   const taskId = req?.body?.viventiumVoiceTaskId;
   return typeof taskId === 'string' && taskId.trim() ? taskId.trim() : '';
+}
+
+async function settleVoiceGenerationForRequest(req, outcome) {
+  const taskId = voiceTaskIdForRequest(req);
+  const callSessionId = req?.viventiumCallSession?.callSessionId;
+  if (!taskId || !callSessionId) return;
+  await settleVoiceTaskGeneration(
+    taskId,
+    { userId: req.user?.id, callSessionId, streamId: req._resumableStreamId },
+    outcome,
+  );
 }
 
 async function isVoiceTaskOutputSuppressedDurably(req) {
@@ -266,12 +512,63 @@ async function removeSupersededAssistantMessage(req, message, interactionContext
   if (removed?._id && message?.conversationId) {
     await pullConversationMessageReference(req, message.conversationId, removed._id);
   }
+  if (removed && interactionContext?.surface === 'web' && interactionContext?.logical_turn_id) {
+    try {
+      const store = GenerationJobManager.getJobStore();
+      const owner = await store.resolveDeliveryOwner(interactionContext.logical_turn_id, interactionContext.revision);
+      const job = owner ? await store.getJob(owner) : null;
+      if (job?.nativeResponse && job.interactionContext?.logical_turn_id === interactionContext.logical_turn_id &&
+          job.interactionContext?.revision === interactionContext.revision &&
+          job.status === 'superseded' && job.userId === req?.user?.id &&
+          job.conversationId === message.conversationId && job.responseMessageId === message.messageId) {
+        await GenerationJobManager.acknowledgeStreamDelivery(owner,
+          { state: 'partial_removed', presentation_ref: message.messageId }, job.nativeResponse);
+      }
+    } catch (error) {
+      logger.warn('[removeSupersededAssistantMessage] Removal receipt unavailable', error);
+    }
+  }
   return Boolean(removed);
 }
 
+async function linkAcceptedInteractionSources(req, context) {
+  if (context?.ready_input_continuation) return;
+  const seen = new Set();
+  let previous;
+  for (const segment of context?.source_segments || []) {
+    const messageId = segment.source_message_id;
+    if (!messageId || seen.has(messageId)) continue;
+    seen.add(messageId);
+    if (previous && previous !== messageId && segment.source_parent_message_id !== previous) {
+      const filter = { user: req.user.id, conversationId: context.conversation_id,
+        messageId, isCreatedByUser: true, parentMessageId: segment.source_parent_message_id,
+        'metadata.viventium.interactionContext.source_event_id': segment.source_event_id,
+      };
+      await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+        filter, () => Message.updateOne(filter, { $set: { parentMessageId: previous } }),
+      );
+    }
+    if (segment.source_event_id === context.source_event_id && previous) req.body.parentMessageId = previous;
+    previous = messageId;
+  }
+}
+
 async function removeSupersededPresentations(req, presentations) {
+  const current = getTrustedInteractionContext(req);
   for (const presentation of presentations || []) {
     if (!presentation?.responseMessageId) continue;
+    // Retain the preceding user segment when its provisional reply is retracted.
+    // The job owner supplies this link; an arbitrary missing parent is never rebased.
+    if (
+      presentation.userMessageId &&
+      presentation.responseMessageId === req.body.parentMessageId &&
+      presentation.conversationId === req.body.conversationId &&
+      current?.logical_turn_id &&
+      presentation.interactionContext?.logical_turn_id === current.logical_turn_id &&
+      presentation.interactionContext.revision < current.revision
+    ) {
+      req.body.parentMessageId = presentation.userMessageId;
+    }
     await removeSupersededAssistantMessage(
       req,
       {
@@ -307,7 +604,7 @@ const timedSaveMessage = async (req, message, options, step) => {
     attachQaRunReceipt(req, attachVoiceMessageMetadata(req, message)),
   );
   const t = isDeepTimingEnabled(req) ? startDeepTiming(req) : null;
-  const result = await saveMessage(req, messageToSave, options);
+  const result = await saveMessage(req, messageToSave, { ...options, operationKind: 'system' });
   if (message?.isCreatedByUser !== true && (await isSupersededRequest(req))) {
     await removeSupersededAssistantMessage(req, messageToSave);
     return { suppressed: true, reason: 'superseded' };
@@ -467,7 +764,9 @@ function sanitizePersistedAssistantContent(req, content) {
 function normalizePersistedAssistantResponse(req, response) {
   const persistedResponse = sanitizeVoiceAssistantMessageForPersistence(
     req,
-    attachEffectiveDeliveryDisposition(req, response),
+    req?._viventiumNativeResponseCompleted === true
+      ? response
+      : attachEffectiveDeliveryDisposition(req, response),
   );
   if (req?.body?.voiceMode === true) {
     return persistedResponse;
@@ -493,6 +792,8 @@ function normalizePersistedAssistantResponse(req, response) {
  * Added: 2026-07-30
  * === VIVENTIUM END === */
 function normalizeAssistantResponseForTransmit(req, response) {
+  // The native owner already projected the saved candidate for its original authenticated surface.
+  if (req?._viventiumNativeResponseCompleted === true) return response;
   const isTelegramText =
     req?._viventiumTelegram === true &&
     String(req?.body?.viventiumSurface || '').toLowerCase() === 'telegram' &&
@@ -528,6 +829,7 @@ async function persistAssistantSnapshot({
   unfinished = true,
   error = false,
   context,
+  mainContextBinding,
 }) {
   let resolvedUserMessage =
     userMessage?.messageId != null
@@ -635,7 +937,7 @@ async function persistAssistantSnapshot({
       user: userId,
       ...(req.body?.agent_id ? { agent_id: req.body.agent_id } : {}),
     },
-    { context },
+    { context, ...(mainContextBinding ? { mainContextBinding } : {}) },
     error ? 'db_save_error_response' : 'db_save_partial_response',
   );
 
@@ -715,10 +1017,11 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     conversationId: reqConversationId,
     isContinued = false,
     editedContent = null,
-    parentMessageId = null,
+    parentMessageId: requestedParentMessageId = null,
     overrideParentMessageId = null,
     responseMessageId: editedResponseMessageId = null,
   } = req.body;
+  let parentMessageId = requestedParentMessageId;
 
   const userId = req.user.id;
 
@@ -751,8 +1054,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
   // Generate conversationId upfront if not provided.
   // Treat "new" as a placeholder that needs a real UUID (frontend may send "new" for new convos)
-  const conversationId =
-    !reqConversationId || reqConversationId === 'new' ? crypto.randomUUID() : reqConversationId;
+  const conversationId = resolveCanonicalConversationId(req, userId, reqConversationId);
   /* === VIVENTIUM NOTE ===
    * Feature: Allow caller-supplied streamId to avoid stream collisions (Telegram).
    * Purpose: Telegram bridge can pass a stable streamId so resumable jobs don't collide across surfaces.
@@ -764,7 +1066,33 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     conversationId,
   );
   req._resumableStreamId = streamId;
-  const interactionContext = captureRequestInteractionContext(req, { conversationId, streamId });
+  let interactionContext;
+  try {
+    interactionContext = await captureRequestInteractionContext(req, { conversationId, streamId });
+  } catch (error) {
+    await maybeDecrement();
+    if (error?.code === 'source_input_capacity') return res.status(503).json({code:error.code,retryable:true,error:error.message,conversationId});
+    throw error;
+  }
+  let releaseInteractiveAdmissionFence = null;
+  const completeInteractiveMainAdmission = () => {
+    const release = releaseInteractiveAdmissionFence;
+    releaseInteractiveAdmissionFence = null;
+    release?.();
+  };
+  if (
+    interactionContext?.actor_kind === 'external_user' &&
+    interactionContext?.origin === 'interactive'
+  ) {
+    releaseInteractiveAdmissionFence = acquireInteractiveMainAdmissionFence(userId);
+    try {
+      await yieldAcceptedMainCompaction(userId);
+    } catch (error) {
+      completeInteractiveMainAdmission();
+      await maybeDecrement();
+      throw error;
+    }
+  }
   /* === VIVENTIUM NOTE END === */
   const voiceLatencyEnabled = isVoiceLatencyEnabled(req);
   req._viventiumDeliveryDispositionRequired = await resolveDeliveryDispositionRequirement(
@@ -788,22 +1116,22 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       adapterCapabilities: getTrustedAdapterCapabilities(req),
       deliveryPolicy: getTrustedDeliveryPolicy(req),
     });
-    const claimedInteractionContext = bindLogicalTurnContext(req, job.metadata?.interactionContext);
     if (job.duplicateOfStreamId) {
+      completeInteractiveMainAdmission();
       await maybeDecrement();
+      const duplicateReceipt = duplicateGenerationReceipt(req, job, conversationId);
+      await req._viventiumBeforeGenerationReceipt?.(duplicateReceipt);
       return res.status(202).json({
-        streamId: job.duplicateOfStreamId,
-        conversationId,
-        status: 'duplicate',
-        duplicate: true,
-        logical_turn_id: claimedInteractionContext?.logical_turn_id,
-        revision: claimedInteractionContext?.revision,
+        ...duplicateReceipt,
         ...(req._viventiumDeliveryDispositionRequired === true
           ? { deliveryDispositionRequired: true }
           : {}),
       });
     }
+    const claimedInteractionContext = bindLogicalTurnContext(req, job.metadata?.interactionContext);
     await removeSupersededPresentations(req, job.supersededPresentations);
+    await linkAcceptedInteractionSources(req, claimedInteractionContext);
+    parentMessageId = req.body.parentMessageId ?? parentMessageId;
     /* === VIVENTIUM START ===
      * Feature: voice-task owner metadata and composed cancellation signal
      * Purpose: Carry task identity and the real generation abort signal into every owning layer.
@@ -834,6 +1162,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     // Send JSON response IMMEDIATELY so client can connect to SSE stream
     // This is critical: tool loading (MCP OAuth) may emit events that the client needs to receive
     const voiceReadyJsonStart = voiceLatencyEnabled ? voiceLatencyNow() : 0;
+    await req._viventiumBeforeGenerationReceipt?.({ streamId, conversationId });
     res.json({
       streamId,
       conversationId,
@@ -974,12 +1303,17 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     }
 
     if (job.abortController.signal.aborted) {
+      completeInteractiveMainAdmission();
+      await settleVoiceGenerationForRequest(req, {
+        error: { code: 'generation_aborted', message: 'Request aborted during initialization' },
+      });
       GenerationJobManager.completeJob(streamId, 'Request aborted during initialization');
       await maybeDecrement();
       return;
     }
 
     client = result.client;
+    client.skipSaveResponseMessage = true;
     sender = client?.sender;
     if (viventiumVoiceTaskId && req._viventiumHarnessExecutionEnabled === true) {
       setVoiceTaskOwnerCapabilities(viventiumVoiceTaskId, {
@@ -1076,6 +1410,14 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               unfinished: true,
               error: false,
               context: 'api/server/controllers/agents/request.js - initial assistant placeholder',
+              ...(req._viventiumAcceptedMainCompactionIdentityV1
+                ? {
+                    mainContextBinding: {
+                      responseMessageId: respMsgId,
+                      identity: req._viventiumAcceptedMainCompactionIdentityV1,
+                    },
+                  }
+                : {}),
             });
             if (snapshot.persisted) {
               placeholderSnapshotSaved = true;
@@ -1097,6 +1439,28 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               text: userMsg.text,
             },
           });
+
+          /* === VIVENTIUM START === Freeze the actual persisted source before native dispatch. === */
+          const nativeCapability =
+            req.config?.endpoints?.agents?.providerCapabilities?.[
+              client.options?.agent?.endpoint || client.options?.agent?.provider
+            ];
+          if (
+            nativeCapability?.conversation_session === true &&
+            nativeCapability?.workspace_binding === true
+          ) {
+            req._viventiumNativeResponseSource = {
+              conversationId,
+              responseMessageId: respMsgId,
+              proof: await require('~/models').captureNativeResponseSource(
+                userId,
+                conversationId,
+                userMsg.messageId,
+                client.nativeResponseParentSource ?? null,
+              ),
+            };
+          }
+          /* === VIVENTIUM END === */
 
           await GenerationJobManager.emitChunk(streamId, {
             created: true,
@@ -1181,7 +1545,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           conversationId,
           parentMessageId,
           abortController: job.abortController,
-          overrideParentMessageId,
+          overrideParentMessageId: overrideParentMessageId || acceptedInteractionInputs.get(req)?.source.messageId,
           isEdited: !!editedContent,
           userMCPAuthMap: result.userMCPAuthMap,
           responseMessageId: editedResponseMessageId,
@@ -1200,7 +1564,12 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           logVoiceLatencyStage(req, 'send_message_start', null, `stream_id=${streamId}`);
         }
         startPartialCheckpointing();
-        const response = await client.sendMessage(text, messageOptions);
+        let response;
+        try {
+          response = await client.sendMessage(text, messageOptions);
+        } finally {
+          completeInteractiveMainAdmission();
+        }
         stopPartialCheckpointing();
         if (voiceLatencyEnabled) {
           logVoiceLatencyStage(
@@ -1277,6 +1646,64 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         }
 
         // Check if our job was replaced by a new request before emitting
+        /* === VIVENTIUM START === Normal completion uses the same canonical saved native result. === */
+        if (req._viventiumNativeResponseIdentity) {
+          let nativeTerminal = false;
+          const saved =
+            await require('~/server/services/viventium/nativeResponseService').recoverSavedNativeResponse(
+              req._viventiumNativeResponseIdentity,
+              () => {
+                nativeTerminal = true;
+              },
+            );
+          if (saved && nativeTerminal) {
+            const finished =
+              await require('~/server/services/viventium/nativeResponseService').recoverNativeResponse(
+                req._viventiumNativeResponseIdentity,
+              );
+            if (!finished) throw new Error('native_response_terminal_pending');
+            await settleVoiceGenerationForRequest(req, { resultMessageId: saved.messageId });
+            stopPartialCheckpointing();
+            await maybeDecrement();
+            if (client) disposeClient(client);
+            return;
+          }
+          if (saved) {
+            Object.assign(response, saved);
+            req._viventiumNativeResponseCompleted = true;
+          } else {
+            const nativeRow = await require('~/models').getNativeResponse(userId, messageId);
+            if (nativeRow?.nativeResponse?.status !== 'unsupported') {
+              const completionError = Array.isArray(response.content)
+                ? response.content.find(
+                    (part) =>
+                      part?.type === ContentTypes.ERROR &&
+                      typeof part.error === 'string' &&
+                      part.error,
+                  )
+                : null;
+              if (completionError) {
+                throw Object.assign(new Error(completionError.error), {
+                  code: completionError.error_class,
+                });
+              }
+              throw new Error('native_response_final_pending');
+            }
+            await timedSaveMessage(
+              req,
+              normalizePersistedAssistantResponse(req, {
+                ...response,
+                user: userId,
+                unfinished: wasAbortedBeforeComplete || requiresExternalDeliveryAcknowledgement,
+              }),
+              { context: 'native graph continuation owned by the host' },
+              'db_save_response',
+            );
+          }
+        }
+        /* === VIVENTIUM END === */
+
+        // Check if our job was replaced by a new request before emitting
         // This prevents stale requests from emitting events to newer jobs
         const currentJob = await GenerationJobManager.getJob(streamId);
         const jobWasReplaced =
@@ -1299,11 +1726,14 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               isCreatedByUser: false,
             });
           }
+          await settleVoiceGenerationForRequest(req, {});
           await maybeDecrement();
           return;
         }
 
         if (!wasAbortedBeforeComplete && !(await isVoiceTaskOutputSuppressedDurably(req))) {
+          // Accept detached memory work only after its response is durable and still current.
+          await client.admitMemoryWriter?.();
           /* === VIVENTIUM NOTE ===
            * Feature: Log empty responses for Telegram debugging.
            * Added: 2026-02-01
@@ -1324,12 +1754,23 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           /* === VIVENTIUM NOTE END === */
 
           const responseMessageForTransmit = normalizeAssistantResponseForTransmit(req, response);
+          const admissionReceipt = req._viventiumMemoryAdmissionReceipt;
+          if (admissionReceipt)
+            responseMessageForTransmit.attachments = [
+              ...(responseMessageForTransmit.attachments || []),
+              admissionReceipt,
+            ];
           const finalEvent = {
             final: true,
             conversation,
             title: conversation.title,
             requestMessage: sanitizeMessageForTransmit(userMessage),
             responseMessage: responseMessageForTransmit,
+            // Typed anchor: a saved-memory write is in flight for this response.
+            memoryWriterScheduled: req._viventiumMemoryWriterScheduled === true,
+            ...(admissionReceipt
+              ? { memoryReceipt: memoryReceiptFromAttachments([admissionReceipt]) }
+              : {}),
           };
 
           logger.debug(`[ResumableAgentController] Emitting FINAL event`, {
@@ -1343,14 +1784,48 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           /* Main is complete even while Phase B continues. Mark the job non-active immediately so
            * reload/resume cannot present a destructive Stop action against a persisted final answer.
            * The existing Phase B poller remains the durable out-of-band delivery path. */
-          await GenerationJobManager.markMainResponseComplete(streamId, finalEvent);
-          await GenerationJobManager.emitDone(streamId, finalEvent);
-          if (getTrustedDeliveryPolicy(req)?.commit_authority === 'server') {
-            await GenerationJobManager.acknowledgeStreamDelivery(streamId, {
-              state: 'committed',
-              presentation_ref: response?.messageId,
-            });
+          if (req._viventiumNativeResponseCompleted === true) {
+            const nativeFinished = await GenerationJobManager.finishNativeResponse(
+              req._viventiumNativeResponseIdentity,
+              finalEvent,
+            );
+            if (!nativeFinished) throw new Error('native_response_final_pending');
+          } else {
+            await GenerationJobManager.markMainResponseComplete(streamId, finalEvent);
+            await GenerationJobManager.emitDone(streamId, finalEvent);
           }
+          if (getTrustedDeliveryPolicy(req)?.commit_authority === 'server') {
+            const acceptedDelivery = await GenerationJobManager.acknowledgeStreamDelivery(
+              streamId,
+              {
+                state: 'committed',
+                presentation_ref: response?.messageId,
+              },
+            );
+            if (acceptedDelivery?.status === 'recorded') {
+              const projected = await commitAcceptedMainTurnAndScheduleCompaction({
+                presentation: acceptedDelivery.presentation,
+                req,
+                client,
+              });
+              if (
+                req._viventiumNativeResponseCompleted === true &&
+                !isAcceptedMainProjectionComplete(projected)
+              ) {
+                throw new Error('native_response_presentation_pending');
+              }
+            } else if (req._viventiumNativeResponseCompleted === true) {
+              throw new Error('native_response_presentation_pending');
+            }
+          }
+          if (req._viventiumNativeResponseCompleted === true) {
+            const replayStored =
+              await require('~/server/services/viventium/nativeResponseService').markNativeResponseReplayStored(
+                req._viventiumNativeResponseIdentity,
+              );
+            if (!replayStored) throw new Error('native_response_replay_pending');
+          }
+          await settleVoiceGenerationForRequest(req, { resultMessageId: response.messageId });
           await maybeDecrement();
 
           /* === VIVENTIUM START ===
@@ -1470,6 +1945,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
           await GenerationJobManager.emitDone(streamId, finalEvent);
           stopPartialCheckpointing();
+          await settleVoiceGenerationForRequest(req, {
+            error: { code: 'generation_aborted', message: 'Request aborted' },
+          });
           GenerationJobManager.completeJob(streamId, 'Request aborted');
           await maybeDecrement();
         } else {
@@ -1502,7 +1980,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           }
         }
       } catch (error) {
+        completeInteractiveMainAdmission();
         stopPartialCheckpointing();
+        await settleVoiceGenerationForRequest(req, { error });
         // Check if this was an abort (not a real error)
         const wasAborted = job.abortController.signal.aborted || error.message?.includes('abort');
 
@@ -1574,6 +2054,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
     // Start generation and handle any unhandled errors
     startGeneration().catch(async (err) => {
+      completeInteractiveMainAdmission();
       stopPartialCheckpointing();
       logger.error(
         `[ResumableAgentController] Unhandled error in background generation: ${err.message}`,
@@ -1603,10 +2084,28 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           snapshotError,
         );
       }
+      await settleVoiceGenerationForRequest(req, { error: err });
       GenerationJobManager.completeJob(streamId, err.message);
       await maybeDecrement();
     });
   } catch (error) {
+    completeInteractiveMainAdmission();
+    await settleVoiceGenerationForRequest(req, { error });
+    if (['source_input_persistence_pending', 'source_input_capacity'].includes(error?.code) && !res.headersSent) {
+      await maybeDecrement();
+      return res.status(503).json({ code: error.code, retryable: true, error: error.message, conversationId });
+    }
+    if (['source_input_waiting', 'source_order_superseded'].includes(error?.code) &&
+        getTrustedInteractionContext(req)?.ready_input_continuation && !res.headersSent) {
+      await maybeDecrement();
+      const pendingReceipt = { code: 'source_input_pending', pending: true, conversationId };
+      await req._viventiumBeforeGenerationReceipt?.(pendingReceipt);
+      return res.status(202).json(pendingReceipt);
+    }
+    if (error?.code === 'source_order_superseded' && !res.headersSent) {
+      await maybeDecrement();
+      return res.status(202).json({ code: 'source_order_superseded', superseded: true, conversationId });
+    }
     logger.error('[ResumableAgentController] Initialization error:', error);
     if (error?.stack) {
       logger.error('[ResumableAgentController] Initialization stack:', error.stack);
@@ -1653,15 +2152,16 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
     conversationId: reqConversationId,
     isContinued = false,
     editedContent = null,
-    parentMessageId = null,
+    parentMessageId: requestedParentMessageId = null,
     overrideParentMessageId = null,
     responseMessageId: editedResponseMessageId = null,
   } = req.body;
 
+  let parentMessageId = requestedParentMessageId;
+
   // Generate conversationId upfront if not provided.
   // Treat "new" as a placeholder that needs a real UUID (frontend may send "new" for new convos)
-  const conversationId =
-    !reqConversationId || reqConversationId === 'new' ? crypto.randomUUID() : reqConversationId;
+  const conversationId = resolveCanonicalConversationId(req, req.user.id, reqConversationId);
   /* === VIVENTIUM NOTE ===
    * Feature: Allow caller-supplied streamId to avoid stream collisions (Telegram).
    * === VIVENTIUM NOTE END === */
@@ -1671,7 +2171,7 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
     conversationId,
   );
   req._resumableStreamId = streamId;
-  const interactionContext = captureRequestInteractionContext(req, { conversationId, streamId });
+  const interactionContext = await captureRequestInteractionContext(req, { conversationId, streamId });
 
   let userMessage;
   let userMessageId;
@@ -1787,18 +2287,14 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
       adapterCapabilities: getTrustedAdapterCapabilities(req),
       deliveryPolicy: getTrustedDeliveryPolicy(req),
     });
-    bindLogicalTurnContext(req, job.metadata?.interactionContext);
     await removeSupersededPresentations(req, job.supersededPresentations);
+    parentMessageId = req.body.parentMessageId ?? parentMessageId;
     if (job.duplicateOfStreamId) {
       disposeClient(client);
       client = null;
-      return res.status(202).json({
-        streamId: job.duplicateOfStreamId,
-        conversationId,
-        status: 'duplicate',
-        duplicate: true,
-      });
+      return res.status(202).json(duplicateGenerationReceipt(req, job, conversationId));
     }
+    bindLogicalTurnContext(req, job.metadata?.interactionContext);
     req._viventiumVoiceAbortSignal = job.abortController.signal;
 
     // Store endpoint metadata for abort handling
@@ -1932,12 +2428,21 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
         );
       }
 
+      await client.admitMemoryWriter?.();
+      const admissionReceipt = req._viventiumMemoryAdmissionReceipt;
+      if (admissionReceipt)
+        finalResponse.attachments = [...(finalResponse.attachments || []), admissionReceipt];
       sendEvent(res, {
         final: true,
         conversation,
         title: conversation.title,
         requestMessage: sanitizeMessageForTransmit(userMessage),
         responseMessage: finalResponse,
+        // Typed anchor: a saved-memory write is in flight for this response.
+        memoryWriterScheduled: req._viventiumMemoryWriterScheduled === true,
+        ...(admissionReceipt
+          ? { memoryReceipt: memoryReceiptFromAttachments([admissionReceipt]) }
+          : {}),
       });
       res.end();
       if (!requiresExternalDeliveryAcknowledgement) {
@@ -2027,6 +2532,8 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
 
 module.exports = AgentController;
 module.exports.ResumableAgentController = ResumableAgentController;
+module.exports.captureAcceptedInteractionInput = captureAcceptedInteractionInput;
+module.exports.retainAcceptedInteractionInput = retainAcceptedInteractionInput;
 module.exports.__testables = {
   extractTextFromContentParts,
   sanitizePersistedAssistantContent,
@@ -2037,12 +2544,20 @@ module.exports.__testables = {
   timedSaveMessage,
   isVoiceTaskOutputSuppressed: isVoiceTaskOutputSuppressedDurably,
   removeSuppressedAssistantMessage,
+  removeSupersededAssistantMessage,
   normalizeQaRunReceipt,
   captureQaRunReceipt,
   attachQaRunReceipt,
   captureRequestInteractionContext,
+  captureAcceptedInteractionInput,
+  linkAcceptedInteractionSources,
+  duplicateGenerationReceipt,
+  resolveCanonicalConversationId,
   resolveRequestStreamId,
   resolveDeliveryDispositionRequirement,
 };
 
 /* === VIVENTIUM END === */
+
+module.exports.acceptedInteractionSourceId = acceptedInteractionSourceId;
+module.exports.resolveCanonicalConversationId = resolveCanonicalConversationId;

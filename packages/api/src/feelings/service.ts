@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { getPromptBundleStatus } from '../prompts/runtime';
 import {
   buildFeelingCapsule,
   clampFeelingValue,
@@ -49,7 +50,10 @@ const LEGACY_DEFAULT_REACTION_INSTRUCTIONS = new Set([
 ]);
 
 const DEFAULT_READ_CACHE_TTL_MS = 5000;
-const readCache = new Map<string, { expiresAt: number; value: FeelingsReadSnapshot }>();
+const readCache = new Map<
+  string,
+  { expiresAt: number; promptBundleSha256: string; value: FeelingsReadSnapshot }
+>();
 const readCacheGenerationTokens = new Map<string, object>();
 
 function readCacheGenerationToken(key: string): object {
@@ -60,6 +64,9 @@ function readCacheGenerationToken(key: string): object {
   return token;
 }
 
+// A change entry is fully determined by its four typed fields; a model that adds an
+// explanatory key beside them has still produced a valid appraisal, so unknown keys are stripped
+// (and counted by the caller) instead of failing the whole reaction and forcing a retry.
 const reactionChangeSchema = z
   .object({
     band: z.enum(FEELING_BAND_IDS),
@@ -67,7 +74,7 @@ const reactionChangeSchema = z
     strength: z.enum(['slight', 'clear', 'strong']),
     cause: z.enum(FEELING_MODEL_REACTION_CAUSES),
   })
-  .strict();
+  .strip();
 
 const reactionOutputSchema = z
   .object({
@@ -202,8 +209,9 @@ export async function loadFeelingsReadContext({
 }): Promise<FeelingsReadSnapshot> {
   const key = String(userId);
   const nowMs = now.getTime();
+  const promptBundleSha256 = getPromptBundleStatus().sha256;
   const cached = !bypassCache ? readCache.get(key) : undefined;
-  if (cached && cached.expiresAt > nowMs) {
+  if (cached && cached.expiresAt > nowMs && cached.promptBundleSha256 === promptBundleSha256) {
     return { ...cached.value, cacheHit: true };
   }
   // A mutation can invalidate this user while the database read is still in flight. Retain the
@@ -247,6 +255,7 @@ export async function loadFeelingsReadContext({
   ) {
     readCache.set(key, {
       expiresAt: nowMs + DEFAULT_READ_CACHE_TTL_MS,
+      promptBundleSha256,
       value: snapshot,
     });
   }

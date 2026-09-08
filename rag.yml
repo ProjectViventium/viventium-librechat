@@ -69,6 +69,12 @@ services:
       # operator-overridable while preventing indefinite local embedding runners by default.
       # === VIVENTIUM END ===
       - VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS=${VIVENTIUM_RAG_OLLAMA_KEEP_ALIVE_SECONDS:-300}
+      # === VIVENTIUM START ===
+      # Fix: Bound the embedding batch so one conversation-recall corpus refresh never sends every
+      # chunk to the local embedding runner in a single request; a whole-corpus batch made the
+      # Ollama runner fail (HTTP 400, "tokenize: EOF") and left recall stale. Operator-overridable.
+      # === VIVENTIUM END ===
+      - EMBEDDING_BATCH_SIZE=${VIVENTIUM_RAG_EMBEDDING_BATCH_SIZE:-64}
     ports:
       # === VIVENTIUM START ===
       # Fix: Provide a default published port so compose does not fail when RAG_PORT

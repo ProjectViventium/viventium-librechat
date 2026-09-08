@@ -1,5 +1,9 @@
 const mockSaveMessage = jest.fn();
 const mockGetResumeState = jest.fn();
+const mockResolveDeliveryOwner = jest.fn();
+const mockGetJob = jest.fn();
+const mockAcknowledgeStreamDelivery = jest.fn();
+jest.mock('~/server/services/viventium/ViventiumMainContinuityService', () => ({}));
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
@@ -11,6 +15,7 @@ jest.mock('@librechat/data-schemas', () => ({
 }));
 
 jest.mock('librechat-data-provider', () => ({
+  ...jest.requireActual('librechat-data-provider'),
   Constants: {},
   ContentTypes: { THINK: 'think' },
   FileContext: { execute_code: 'execute_code' },
@@ -46,6 +51,8 @@ jest.mock('@librechat/api', () => ({
   getViolationInfo: jest.fn(),
   GenerationJobManager: {
     getResumeState: (...args) => mockGetResumeState(...args),
+    getJobStore: () => ({ resolveDeliveryOwner: mockResolveDeliveryOwner, getJob: mockGetJob }),
+    acknowledgeStreamDelivery: (...args) => mockAcknowledgeStreamDelivery(...args),
   },
   decrementPendingRequest: jest.fn(),
   sanitizeFileForTransmit: jest.fn((value) => value),
@@ -102,6 +109,39 @@ jest.mock('~/server/services/viventium/VoiceTaskService', () => ({
 
 describe('request persistence helpers', () => {
   const { __testables } = require('../request');
+
+  it('retains the canonical completed-native disposition despite a conflicting live capture', () => {
+    const canonical = { version: 1, audio: 'skip', required: true, valid: true, source: 'model' };
+    const req = {
+      _viventiumTelegram: true,
+      _viventiumNativeResponseCompleted: true,
+      _viventiumDeliveryDispositionRequired: true,
+      _viventiumDeliveryDispositionCapture: {
+        status: 'valid',
+        disposition: { ...canonical, audio: 'eligible' },
+      },
+      body: { viventiumSurface: 'telegram', telegramAudioRequested: true },
+    };
+    const response = {
+      text: 'Answer.',
+      metadata: { viventium: { deliveryDisposition: canonical } },
+    };
+    expect(
+      __testables.normalizeAssistantResponseForTransmit(req, response).metadata.viventium
+        .deliveryDisposition,
+    ).toEqual(canonical);
+    req.body.voiceMode = true;
+    const nativeTransmission = { ...response, text: 'Answer.\n{MSG_BREAK}\nMore.' };
+    expect(__testables.normalizeAssistantResponseForTransmit(req, nativeTransmission)).toEqual(
+      nativeTransmission,
+    );
+    req.body.voiceMode = false;
+    req._viventiumNativeResponseCompleted = false;
+    expect(
+      __testables.normalizeAssistantResponseForTransmit(req, response).metadata.viventium
+        .deliveryDisposition.audio,
+    ).toBe('eligible');
+  });
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -659,5 +699,47 @@ describe('request persistence helpers', () => {
       }),
       expect.objectContaining({ context: 'test-explicit-state' }),
     );
+  });
+});
+
+
+describe('superseded Web presentation removal receipt', () => {
+  const context = { surface: 'web', logical_turn_id: 'turn', revision: 1 };
+  const request = { user: { id: 'owner' } };
+  const message = { messageId: 'old-response', conversationId: 'conversation' };
+  const identity = { responseMessageId: 'old-response', jobCreatedAt: 100 };
+  beforeEach(() => {
+    jest.clearAllMocks();
+    require('~/db/models').Message.findOneAndDelete.mockResolvedValue({ _id: 'row' });
+    mockResolveDeliveryOwner.mockResolvedValue('old-stream');
+    mockGetJob.mockResolvedValue({ userId: 'owner', conversationId: 'conversation',
+      responseMessageId: 'old-response', status: 'superseded', nativeResponse: identity, interactionContext: context });
+    mockAcknowledgeStreamDelivery.mockResolvedValue({ status: 'recorded' });
+  });
+  const remove = () => require('../request').__testables.removeSupersededAssistantMessage(request, message, context);
+  test('records actual removal against the exact old native incarnation', async () => {
+    expect(await remove()).toBe(true);
+    expect(mockAcknowledgeStreamDelivery).toHaveBeenCalledWith('old-stream',
+      { state: 'partial_removed', presentation_ref: 'old-response' }, identity);
+  });
+  test('no removed row provides no removal authority', async () => {
+    require('~/db/models').Message.findOneAndDelete.mockResolvedValue(null);
+    expect(await remove()).toBe(false);
+    expect(mockAcknowledgeStreamDelivery).not.toHaveBeenCalled();
+  });
+  test.each([{ userId: 'foreign' }, { responseMessageId: 'new-response' },
+    { conversationId: 'other' }, { status: 'complete' }, { nativeResponse: undefined }])(
+    'rejects mismatched owner facts %p', async (patch) => {
+      mockGetJob.mockResolvedValue({ ...(await mockGetJob()), ...patch });
+      expect(await remove()).toBe(true);
+      expect(mockAcknowledgeStreamDelivery).not.toHaveBeenCalled();
+    });
+  test('Telegram removal retains external adapter acknowledgement ownership', async () => {
+    expect(await require('../request').__testables.removeSupersededAssistantMessage(request, message, { ...context, surface: 'telegram' })).toBe(true);
+    expect(mockAcknowledgeStreamDelivery).not.toHaveBeenCalled();
+  });
+  test('optional receipt failure does not undo successful deletion', async () => {
+    mockAcknowledgeStreamDelivery.mockRejectedValue(new Error('store unavailable'));
+    expect(await remove()).toBe(true);
   });
 });

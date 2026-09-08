@@ -18,7 +18,7 @@ let mockAcquireEffectLease;
 let mockFenceEffectTransaction;
 let mockReleaseEffectLease;
 let mockRenewEffectLease;
-let mockRecordGlassHiveSurfaceDeliveryOutcome;
+let mockReconcileGlassHiveSurfaceDeliveryOutcome;
 let mockResolveTelegramMappingByUserId;
 let mockRecordTraceDelivery;
 let mockRecordVoiceOrchestrationTrace;
@@ -59,8 +59,9 @@ jest.mock('../GlassHiveTerminalCallbackTransaction', () => ({
 }));
 
 jest.mock('../GlassHiveCallbackBindingService', () => ({
-  recordGlassHiveSurfaceDeliveryOutcome: (...args) =>
-    mockRecordGlassHiveSurfaceDeliveryOutcome(...args),
+  recordGlassHiveSurfaceDeliveryOutcome: jest.fn().mockResolvedValue(null),
+  reconcileGlassHiveSurfaceDeliveryOutcome: (...args) =>
+    mockReconcileGlassHiveSurfaceDeliveryOutcome(...args),
 }));
 
 jest.mock('../OrchestrationTraceLedgerService', () => ({
@@ -193,7 +194,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
     mockCountDocuments = jest.fn();
     mockUpdateOne = jest.fn().mockResolvedValue({ matchedCount: 1, modifiedCount: 1 });
     mockUpdateMany = jest.fn().mockResolvedValue({ modifiedCount: 0 });
-    mockRecordGlassHiveSurfaceDeliveryOutcome = jest.fn().mockResolvedValue(null);
+    mockReconcileGlassHiveSurfaceDeliveryOutcome = jest.fn().mockResolvedValue({ _id: 'current-work' });
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue(null);
     mockRecordTraceDelivery = jest.fn().mockResolvedValue(null);
     mockRecordVoiceOrchestrationTrace = jest.fn().mockResolvedValue(null);
@@ -291,36 +292,41 @@ describe('GlassHiveCallbackDeliveryService', () => {
     expect(JSON.stringify(update)).not.toContain(syntheticLocalPath());
   });
 
-  test.each(['run.needs_input', 'run.blocked'])(
-    'delivers %s immediately to the trusted Telegram destination',
-    async (event) => {
-      mockFindOneAndUpdate.mockImplementation((_query, update) =>
-        leanResult({ ...update.$setOnInsert, ...update.$set }),
-      );
+  test.each([
+    [
+      'run.needs_input',
+      'Mission needs user input. Reconnect the provider account, then resume this mission.',
+    ],
+    ['run.blocked', 'Mission needs attention.'],
+  ])('delivers %s immediately to the trusted Telegram destination', async (event, text) => {
+    mockFindOneAndUpdate.mockImplementation((_query, update) =>
+      leanResult({ ...update.$setOnInsert, ...update.$set }),
+    );
 
-      const summary = await enqueueGlassHiveCallbackDelivery({
-        body: { callback_id: `cb_${event}`, event },
-        deliveryContext: {
-          ownerId: 'user_1',
-          conversationId: 'conv_1',
-          anchorMessageId: 'msg_anchor',
-          destinations: [
-            { surface: 'telegram', telegramChatId: 'chat_1', telegramUserId: 'telegram_user_1' },
-          ],
-        },
-        message: {
-          messageId: 'msg_callback',
-          text: 'Mission needs user input.',
-          metadata: { viventium: { callbackKey: 'safe_key' } },
-        },
-        text: 'Mission needs user input.',
-        fullText: '',
-      });
+    const summary = await enqueueGlassHiveCallbackDelivery({
+      body: { callback_id: `cb_${event}`, event },
+      deliveryContext: {
+        ownerId: 'user_1',
+        conversationId: 'conv_1',
+        anchorMessageId: 'msg_anchor',
+        destinations: [
+          { surface: 'telegram', telegramChatId: 'chat_1', telegramUserId: 'telegram_user_1' },
+        ],
+      },
+      message: {
+        messageId: 'msg_callback',
+        text,
+        metadata: { viventium: { callbackKey: 'safe_key' } },
+      },
+      text,
+      fullText: '',
+    });
 
-      expect(summary.enqueued).toBe(1);
-      expect(mockFindOneAndUpdate).toHaveBeenCalledTimes(1);
-    },
-  );
+    expect(summary.enqueued).toBe(1);
+    expect(mockFindOneAndUpdate).toHaveBeenCalledTimes(1);
+    // The interruption notice, reason included, reaches the external surface verbatim.
+    expect(mockFindOneAndUpdate.mock.calls[0][1].$set.text).toBe(text);
+  });
 
   test('semantic silence persists one suppressed row for a resolved terminal Telegram destination', async () => {
     mockFindOneAndUpdate.mockImplementation((_query, update) =>
@@ -360,9 +366,8 @@ describe('GlassHiveCallbackDeliveryService', () => {
       nextAttemptAt: null,
       telegramChatId: 'chat-1',
     });
-    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: 'origin-1',
-      state: 'suppressed',
     });
   });
 
@@ -420,9 +425,8 @@ describe('GlassHiveCallbackDeliveryService', () => {
       unresolved: 1,
       deliveries: [expect.objectContaining({ status: 'unresolved' })],
     });
-    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: 'ghi_origin_unresolved',
-      state: 'unresolved',
     });
     expect(logger.warn).toHaveBeenCalledWith(
       '[VIVENTIUM][glasshive-delivery] Terminal surface destination unresolved',
@@ -481,9 +485,8 @@ describe('GlassHiveCallbackDeliveryService', () => {
         expect.objectContaining({ surface: 'voice', status: 'unresolved' }),
       ],
     });
-    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: 'ghi_origin_partial',
-      state: 'unresolved',
     });
     expect(logger.warn).toHaveBeenCalledWith(
       '[VIVENTIUM][glasshive-delivery] Terminal surface destination unresolved',
@@ -1295,9 +1298,8 @@ describe('GlassHiveCallbackDeliveryService', () => {
       transportReceiptVersion: 1,
     });
 
-    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: 'ghi_origin_partial',
-      state: 'unresolved',
     });
     expect(mockRecordTraceDelivery).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1371,9 +1373,8 @@ describe('GlassHiveCallbackDeliveryService', () => {
       }),
       { new: true },
     );
-    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: 'ghi_origin_linked',
-      state: 'enqueued',
     });
   });
 
@@ -1460,7 +1461,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
       }),
     ).resolves.toBeNull();
     expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
-    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).not.toHaveBeenCalled();
+    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).not.toHaveBeenCalled();
   });
 
   test('retries a durable Core projection without requiring a GlassHive callback replay', async () => {
@@ -1481,9 +1482,8 @@ describe('GlassHiveCallbackDeliveryService', () => {
       pending: 0,
     });
 
-    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: 'ghi_projection_retry',
-      state: 'unknown',
     });
     expect(mockUpdateMany).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1514,7 +1514,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
         ]),
       )
       .mockReturnValueOnce(leanResult([{ status: 'sent' }]));
-    mockRecordGlassHiveSurfaceDeliveryOutcome.mockRejectedValueOnce(
+    mockReconcileGlassHiveSurfaceDeliveryOutcome.mockRejectedValueOnce(
       Object.assign(new Error('core unavailable'), { code: 'core_unavailable' }),
     );
 
@@ -1616,9 +1616,8 @@ describe('GlassHiveCallbackDeliveryService', () => {
         projectionPendingAt: expect.any(Date),
         projectionNextAttemptAt: expect.any(Date),
       });
-      expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+      expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
         originRef: existing.originRef,
-        state: status,
       });
       expect(mockUpdateMany).toHaveBeenCalledWith(
         expect.objectContaining({ originRef: existing.originRef }),

@@ -18,6 +18,16 @@ type UnknownRecord = Record<string, unknown>;
 
 export interface ActiveWorkToolsDependencies {
   getActiveWorkPage(input: { ownerId: string; cursor: string; limit: number }): Promise<unknown>;
+  getActiveWorkHistoryPage(input: {
+    ownerId: string;
+    cursor: string;
+    limit: number;
+  }): Promise<unknown>;
+  getGlassHiveWorkResult(input: {
+    ownerId: string;
+    runId?: string;
+    workRef?: string;
+  }): Promise<unknown>;
   executeGlassHiveWorkAction(input: UnknownRecord): Promise<unknown>;
 }
 
@@ -29,13 +39,58 @@ export interface ActiveWorkToolsOptions {
 const workRefSchema = z.string().regex(/^[A-Za-z0-9._:-]{1,160}$/);
 const listSchema = z
   .object({
+    scope: z.enum(['active', 'history', 'result']).optional(),
+    runId: workRefSchema.optional(),
+    workRef: workRefSchema.optional(),
     cursor: z
       .string()
       .regex(/^[A-Za-z0-9._~:@+-]{1,2048}$/)
       .optional(),
     limit: z.number().int().min(1).max(100).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.scope === 'result') {
+      if (
+        (!value.runId && !value.workRef) ||
+        value.cursor !== undefined ||
+        value.limit !== undefined
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'result requires runId or workRef and no pagination',
+        });
+      }
+    } else if (value.runId !== undefined || value.workRef !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'runId and workRef require result scope',
+      });
+    }
+  });
+
+/** Use the same owner-bound reader for Main and the native capability broker. */
+export async function readActiveWork(
+  ownerId: string,
+  input: unknown,
+  deps: Pick<
+    ActiveWorkToolsDependencies,
+    'getActiveWorkPage' | 'getActiveWorkHistoryPage' | 'getGlassHiveWorkResult'
+  >,
+) {
+  if (!ownerId.trim()) throw new Error('active_work_owner_required');
+  const parsed = listSchema.parse(input);
+  if (parsed.scope === 'result') {
+    return deps.getGlassHiveWorkResult({
+      ownerId,
+      ...(parsed.runId ? { runId: parsed.runId } : {}),
+      ...(parsed.workRef ? { workRef: parsed.workRef } : {}),
+    });
+  }
+  const readPage =
+    parsed.scope === 'history' ? deps.getActiveWorkHistoryPage : deps.getActiveWorkPage;
+  return readPage({ ownerId, cursor: parsed.cursor || '', limit: parsed.limit || 50 });
+}
 const controlSchema = z
   .object({
     workRef: workRefSchema.describe('Opaque workRef returned by active_work_list'),
@@ -80,22 +135,12 @@ export function createActiveWorkTools(
     throw new Error('active_work_owner_required');
   }
 
-  const list = tool(
-    async (input) =>
-      JSON.stringify(
-        await deps.getActiveWorkPage({
-          ownerId,
-          cursor: input.cursor || '',
-          limit: input.limit || 50,
-        }),
-      ),
-    {
-      name: 'active_work_list',
-      description: ACTIVE_WORK_LIST_DESCRIPTION,
-      schema: listSchema,
-      metadata: toolEffectMetadata(TOOL_EFFECT_CLASSES.readOnly),
-    },
-  );
+  const list = tool(async (input) => JSON.stringify(await readActiveWork(ownerId, input, deps)), {
+    name: 'active_work_list',
+    description: ACTIVE_WORK_LIST_DESCRIPTION,
+    schema: listSchema,
+    metadata: toolEffectMetadata(TOOL_EFFECT_CLASSES.readOnly),
+  });
 
   const action = tool(
     async (input, runnableConfig) => {
@@ -116,6 +161,14 @@ export function createActiveWorkTools(
           workRef: input.workRef,
           action: input.action,
           operationId,
+          ...(requestBody.viventiumVoiceCallSessionId
+            ? {
+                voiceAuthorityContext: {
+                  callSessionId: requestBody.viventiumVoiceCallSessionId,
+                  binding: requestBody.viventiumVoiceWorkAuthority,
+                },
+              }
+            : {}),
           durableEffectContext: {
             streamId: requestBody.viventiumStreamId,
             sourceEventId: requestBody.viventiumAuthoringSourceEventId,

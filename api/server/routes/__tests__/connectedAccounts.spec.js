@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const request = require('supertest');
 const { EModelEndpoint, ErrorTypes } = require('librechat-data-provider');
 
@@ -33,6 +34,7 @@ describe('Connected Accounts Routes', () => {
   let getUserKey;
   let updateUserKey;
   let clearMemoryWriterHealth;
+  const originalNodeEnv = process.env.NODE_ENV;
 
   beforeEach(() => {
     jest.resetModules();
@@ -54,6 +56,9 @@ describe('Connected Accounts Routes', () => {
   });
 
   afterEach(() => {
+    jest.restoreAllMocks();
+    process.env.NODE_ENV = originalNodeEnv;
+    delete process.env.DOMAIN_CLIENT;
     delete process.env.DOMAIN_SERVER;
     delete process.env.JWT_SECRET;
     delete process.env.VIVENTIUM_LOCAL_SUBSCRIPTION_AUTH;
@@ -62,6 +67,128 @@ describe('Connected Accounts Routes', () => {
     delete process.env.VIVENTIUM_OPENAI_LOCAL_CALLBACK_MANUAL_ONLY;
     delete process.env.VIVENTIUM_CONNECTED_ACCOUNTS_RETURN_ORIGIN;
     delete process.env.VIVENTIUM_CONNECTED_ACCOUNTS_ENABLED;
+  });
+
+  function mockCallbackListeners(errorsByPort = {}) {
+    const http = require('http');
+    const { EventEmitter } = require('events');
+    const createServer = http.createServer.bind(http);
+    const attempts = [];
+    jest.spyOn(http, 'createServer').mockImplementation((listener) => {
+      // Supertest still uses a real HTTP server for the owning Express route.
+      if (listener === app) {
+        return createServer(listener);
+      }
+      const server = new EventEmitter();
+      server.listen = jest.fn((port, host, ready) => {
+        attempts.push({ port, host, listener });
+        queueMicrotask(() => {
+          if (errorsByPort[port]) {
+            server.emit(
+              'error',
+              Object.assign(new Error('Synthetic bind failure'), {
+                code: errorsByPort[port],
+              }),
+            );
+          } else {
+            ready();
+          }
+        });
+        return server;
+      });
+      return server;
+    });
+    return attempts;
+  }
+
+  it('binds the registered fallback before issuing state and uses it for token exchange', async () => {
+    process.env.NODE_ENV = 'development';
+    const attempts = mockCallbackListeners({ 1455: 'EADDRINUSE' });
+    const responses = await Promise.all([
+      request(app).get('/api/connected-accounts/openai/start'),
+      request(app).get('/api/connected-accounts/openai/start'),
+    ]);
+    const response = responses[1];
+    expect(responses.map((result) => result.status)).toEqual([200, 200]);
+    expect(attempts.map(({ port, host }) => [port, host])).toEqual([
+      [1455, '127.0.0.1'],
+      [1457, '127.0.0.1'],
+    ]);
+    const authUrl = new URL(response.body.authUrl);
+    expect(response.body.flowMode).toBe('popup_callback');
+    expect(authUrl.searchParams.get('redirect_uri')).toBe('http://localhost:1457/auth/callback');
+    expect(authUrl.searchParams.get('code_challenge_method')).toBe('S256');
+    global.fetch.mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({ access_token: 'synthetic-token', expires_in: 3600 }),
+    });
+    const headers = {};
+    await new Promise((resolve) => {
+      attempts[1].listener(
+        {
+          url: `/auth/callback?code=synthetic-code&state=${encodeURIComponent(authUrl.searchParams.get('state'))}`,
+        },
+        {
+          setHeader: (name, value) => {
+            headers[name] = value;
+          },
+          end: resolve,
+        },
+      );
+    });
+    expect(headers.Location).toContain('/oauth/success?');
+    expect(new URLSearchParams(global.fetch.mock.calls[0][1].body).get('redirect_uri')).toBe(
+      'http://localhost:1457/auth/callback',
+    );
+    expect(updateUserKey).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the default registered callback when it is available', async () => {
+    process.env.NODE_ENV = 'development';
+    const attempts = mockCallbackListeners();
+    const response = await request(app).get('/api/connected-accounts/openai/start');
+    expect(response.status).toBe(200);
+    expect(response.body.flowMode).toBe('popup_callback');
+    expect(new URL(response.body.authUrl).searchParams.get('redirect_uri')).toBe(
+      'http://localhost:1455/auth/callback',
+    );
+    expect(attempts.map(({ port }) => port)).toEqual([1455]);
+  });
+
+  it('does not issue a URL to a foreign callback when both registered ports are occupied', async () => {
+    process.env.NODE_ENV = 'development';
+    const errors = { 1455: 'EADDRINUSE', 1457: 'EADDRINUSE' };
+    const attempts = mockCallbackListeners(errors);
+    const response = await request(app).get('/api/connected-accounts/openai/start');
+    expect(response.status).toBe(503);
+    expect(response.body).toEqual({ error: 'oauth_unavailable' });
+    expect(attempts.map(({ port }) => port)).toEqual([1455, 1457]);
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(updateUserKey).not.toHaveBeenCalled();
+    delete errors[1455];
+    const retry = await request(app).get('/api/connected-accounts/openai/start');
+    expect(retry.status).toBe(200);
+    expect(retry.body.flowMode).toBe('popup_callback');
+    expect(attempts.map(({ port }) => port)).toEqual([1455, 1457, 1455]);
+  });
+
+  it('does not disguise a different callback bind error as manual sign-in', async () => {
+    process.env.NODE_ENV = 'development';
+    const attempts = mockCallbackListeners({ 1455: 'EACCES' });
+    const response = await request(app).get('/api/connected-accounts/openai/start');
+    expect(response.status).toBe(503);
+    expect(response.body.authUrl).toBeUndefined();
+    expect(attempts.map(({ port }) => port)).toEqual([1455]);
+  });
+
+  it('preserves explicitly selected manual mode without binding a callback listener', async () => {
+    process.env.NODE_ENV = 'development';
+    process.env.VIVENTIUM_OPENAI_LOCAL_CALLBACK_MANUAL_ONLY = 'true';
+    const attempts = mockCallbackListeners();
+    const response = await request(app).get('/api/connected-accounts/openai/start');
+    expect(response.status).toBe(200);
+    expect(response.body.flowMode).toBe('manual_code');
+    expect(attempts).toEqual([]);
   });
 
   it('should persist and report a personal-required credential policy per user and provider', async () => {
@@ -244,6 +371,41 @@ describe('Connected Accounts Routes', () => {
     expect(response.status).toBe(500);
     expect(response.body).toEqual({ error: 'oauth_start_failed' });
   });
+
+  it.each([
+    [undefined, 'https://chat.example.test'],
+    ['https://return.example.test/', 'https://return.example.test'],
+  ])(
+    'binds the browser return to the configured UI origin (override %s)',
+    async (override, expected) => {
+      process.env.DOMAIN_CLIENT = 'https://chat.example.test/';
+      process.env.DOMAIN_SERVER = 'https://api.example.test';
+      if (override) {
+        process.env.VIVENTIUM_CONNECTED_ACCOUNTS_RETURN_ORIGIN = override;
+      }
+      const start = await request(app)
+        .get('/api/connected-accounts/openai/start')
+        .set('Host', 'untrusted.example');
+      expect(start.status).toBe(200);
+      const state = new URL(start.body.authUrl).searchParams.get('state');
+      const [version, iv, ciphertext, tag] = state.split('.');
+      expect(version).toBe('v1');
+      const key = crypto
+        .createHash('sha256')
+        .update(`viventium:connected-account-oauth-state:${process.env.JWT_SECRET}`)
+        .digest();
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64url'));
+      decipher.setAAD(Buffer.from('viventium-connected-account-oauth-state-v1'));
+      decipher.setAuthTag(Buffer.from(tag, 'base64url'));
+      const payload = JSON.parse(
+        Buffer.concat([
+          decipher.update(Buffer.from(ciphertext, 'base64url')),
+          decipher.final(),
+        ]).toString(),
+      );
+      expect(payload.serverOrigin).toBe(expected);
+    },
+  );
 
   it('should exchange callback code and store OpenAI credentials', async () => {
     global.fetch.mockResolvedValue({

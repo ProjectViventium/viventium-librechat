@@ -29,7 +29,7 @@ export default function MemoryPanel() {
   const localize = useLocalize();
   const { user } = useAuthContext();
   const { data: userData } = useGetUserQuery();
-  const { data: memData, isLoading } = useMemoriesQuery();
+  const { data: memData, isLoading, isError, isFetching, refetch } = useMemoriesQuery();
   const { showToast } = useToastContext();
   const [pageIndex, setPageIndex] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
@@ -126,9 +126,17 @@ export default function MemoryPanel() {
     });
   }, [memories, searchQuery]);
 
+  /* === VIVENTIUM START === A refreshed list cannot leave the reader on a removed page. === */
+  const totalPages = Math.ceil(filteredMemories.length / pageSize);
+  const currentPageIndex = Math.min(pageIndex, Math.max(0, totalPages - 1));
+  useEffect(() => {
+    setPageIndex(currentPageIndex);
+  }, [currentPageIndex]);
+  /* === VIVENTIUM END === */
+
   const currentRows = useMemo(() => {
-    return filteredMemories.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize);
-  }, [filteredMemories, pageIndex]);
+    return filteredMemories.slice(currentPageIndex * pageSize, (currentPageIndex + 1) * pageSize);
+  }, [filteredMemories, currentPageIndex]);
 
   // Reset page when search changes
   useEffect(() => {
@@ -153,8 +161,6 @@ export default function MemoryPanel() {
     );
   }
 
-  const totalPages = Math.ceil(filteredMemories.length / pageSize);
-
   return (
     <div className="flex h-full w-full flex-col">
       <div role="region" aria-label={localize('com_ui_memories')} className="mt-2 space-y-3">
@@ -168,7 +174,11 @@ export default function MemoryPanel() {
             containerClassName="flex-1"
           />
           {hasCreateAccess && (
-            <MemoryCreateDialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
+            <MemoryCreateDialog
+              open={createDialogOpen}
+              onOpenChange={setCreateDialogOpen}
+              validKeys={memData?.validKeys}
+            >
               <OGDialogTrigger asChild>
                 <TooltipAnchor
                   description={localize('com_ui_create_memory')}
@@ -235,12 +245,31 @@ export default function MemoryPanel() {
           </div>
         )}
 
-        {/* Memory List */}
-        <MemoryList
-          memories={currentRows}
-          hasUpdateAccess={hasUpdateAccess}
-          isFiltered={searchQuery.length > 0}
-        />
+        {/* === VIVENTIUM START === Failed reads are unavailable; retained rows are not current. === */}
+        {isError && (
+          <div role="alert" className="flex items-start gap-3 text-sm text-text-secondary">
+            <p className="min-w-0 flex-1">
+              {localize(memData ? 'com_ui_memories_refresh_error' : 'com_ui_memories_load_error')}
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              onClick={() => void refetch()}
+              disabled={isFetching}
+            >
+              {localize('com_ui_retry')}
+            </Button>
+          </div>
+        )}
+        {(!isError || currentRows.length > 0) && (
+          <MemoryList
+            memories={currentRows}
+            hasUpdateAccess={hasUpdateAccess}
+            isFiltered={searchQuery.length > 0}
+          />
+        )}
+        {/* === VIVENTIUM END === */}
 
         {/* Footer: Admin Settings + Pagination */}
         {(user?.role === SystemRoles.ADMIN || filteredMemories.length > pageSize) && (
@@ -254,20 +283,20 @@ export default function MemoryPanel() {
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => setPageIndex((prev) => Math.max(prev - 1, 0))}
-                  disabled={pageIndex === 0}
+                  onClick={() => setPageIndex(Math.max(currentPageIndex - 1, 0))}
+                  disabled={currentPageIndex === 0}
                   aria-label={localize('com_ui_prev')}
                 >
                   {localize('com_ui_prev')}
                 </Button>
                 <div className="whitespace-nowrap text-sm" aria-live="polite">
-                  {pageIndex + 1} / {totalPages}
+                  {currentPageIndex + 1} / {totalPages}
                 </div>
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => setPageIndex((prev) => (prev + 1 < totalPages ? prev + 1 : prev))}
-                  disabled={pageIndex + 1 >= totalPages}
+                  onClick={() => setPageIndex(Math.min(currentPageIndex + 1, totalPages - 1))}
+                  disabled={currentPageIndex + 1 >= totalPages}
                   aria-label={localize('com_ui_next')}
                 >
                   {localize('com_ui_next')}

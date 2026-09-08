@@ -7,10 +7,12 @@ import type { ActiveJobsResponse } from '~/data-provider';
 import useChatFunctions from '~/hooks/Chat/useChatFunctions';
 import { useAbortStreamMutation } from '~/data-provider';
 import useNewConvo from '~/hooks/useNewConvo';
+import useLocalize from '~/hooks/useLocalize';
 import store from '~/store';
 
 // this to be set somewhere else
 export default function useChatHelpers(index = 0, paramId?: string) {
+  const localize = useLocalize();
   const clearAllSubmissions = store.useClearSubmissionState();
   const [files, setFiles] = useRecoilState(store.filesByIndex(index));
   const [filesLoading, setFilesLoading] = useState(false);
@@ -99,27 +101,17 @@ export default function useChatHelpers(index = 0, paramId?: string) {
     [],
   );
 
+  /* === VIVENTIUM START === Continue preserves the prior answer and uses normal new-turn ownership. === */
   const continueGeneration = useCallback(() => {
     const currentLatest = latestMessageRef.current;
-    if (!currentLatest) {
-      console.error('Failed to regenerate the message: latestMessage not found.');
-      return;
-    }
-
-    const messages = getMessages();
-
-    const parentMessage = messages?.find(
-      (element) => element.messageId == currentLatest.parentMessageId,
-    );
-
-    if (parentMessage && parentMessage.isCreatedByUser) {
-      ask({ ...parentMessage }, { isContinued: true, isRegenerate: true, isEdited: true });
-    } else {
-      console.error(
-        'Failed to regenerate the message: parentMessage not found, or not created by user.',
-      );
-    }
-  }, [getMessages, ask]);
+    if (!currentLatest || currentLatest.isCreatedByUser) return;
+    ask({
+      text: localize('com_ui_continue'),
+      conversationId: currentLatest.conversationId,
+      parentMessageId: currentLatest.messageId,
+    });
+  }, [ask, localize]);
+  /* === VIVENTIUM END === */
 
   /**
    * Stop generation - for non-assistants endpoints, calls abort endpoint first.
@@ -203,6 +195,7 @@ export default function useChatHelpers(index = 0, paramId?: string) {
       newConversation,
       conversation,
       setConversation,
+      setSubmission,
       isSubmitting,
       setIsSubmitting,
       getMessages,
@@ -236,6 +229,7 @@ export default function useChatHelpers(index = 0, paramId?: string) {
       newConversation,
       conversation,
       setConversation,
+      setSubmission,
       isSubmitting,
       setIsSubmitting,
       getMessages,

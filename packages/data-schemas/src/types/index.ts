@@ -10,6 +10,7 @@ export * from './balance';
 export * from './banner';
 export * from './transaction';
 export * from './message';
+export * from './memoryWrite';
 export * from './agent';
 export * from './agentApiKey';
 export * from './agentCategory';
@@ -46,3 +47,4 @@ export * from './cortexInsightDelivery';
 export * from './orchestrationTraceEvent';
 export * from './personalAccountCleanupReceipt';
 /* === VIVENTIUM END === */
+export * from './nativeResponse';

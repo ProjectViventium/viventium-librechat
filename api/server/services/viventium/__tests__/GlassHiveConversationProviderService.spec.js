@@ -1,5 +1,13 @@
 const { Constants } = require('librechat-data-provider');
 const crypto = require('crypto');
+const { setTrustedInteractionContext } = require('../interactionContext');
+
+jest.mock('~/server/services/Config/getEndpointsConfig', () => ({
+  getEndpointsConfig: jest.fn(async () => ({
+    agents: { capabilities: ['file_search', 'web_search'] },
+  })),
+}));
+const { getEndpointsConfig } = require('~/server/services/Config/getEndpointsConfig');
 
 jest.mock('../GlassHiveCapabilityBootstrapService', () => ({
   buildConversationProviderBootstrapBundle: jest.fn(),
@@ -15,10 +23,13 @@ const {
   buildConversationProviderBootstrapBundle,
 } = require('../GlassHiveCapabilityBootstrapService');
 const { primeFiles } = require('~/app/clients/tools/util/fileSearch');
+jest.mock('~/models', () => ({ getMessages: jest.fn(async () => []), getFiles: jest.fn(async () => []) }));
+const { getMessages, getFiles } = require('~/models');
 const {
   applyHostEvidenceBoundaryInstructions,
   attachDeclaredConversationProviderCapabilityBundle,
   attachConversationProviderCapabilityBundle,
+  attachConversationProviderBootstrapBundle,
   installConversationProviderCapabilityRefresher,
   bindConversationProviderDeveloperInstructionTail,
   bindHarnessCancellation,
@@ -26,8 +37,10 @@ const {
   buildHarnessAttemptIdempotencyKey,
   buildHarnessIdempotencyKey,
   configuredBrokerHostTools,
+  configuredConversationOrchestrationWorkerRoute,
   declaredMcpServerNames,
   resolveConversationProviderId,
+  resolvedConversationOrchestrationToolNames,
   setConversationProviderCapability,
 } = require('../GlassHiveConversationProviderService');
 
@@ -36,8 +49,123 @@ describe('GlassHiveConversationProviderService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    getMessages.mockResolvedValue([]);
+    getFiles.mockResolvedValue([]);
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-bundle-secret';
   });
+
+  test('signs safe current attachment identities without requiring a broker tool', async () => {
+    buildConversationProviderBootstrapBundle.mockResolvedValue({});
+    const targetAgent = { model_parameters: {} };
+    const files = [{ file_id: 'audio-current', filename: 'request.m4a', type: 'audio/mp4',
+      source: 'local', bytes: 123, filepath: '/uploads/other-owner/private.m4a',
+      url: 'https://untrusted.invalid/file', source_path: '/private/arbitrary' }];
+    expect(await attachConversationProviderCapabilityBundle({
+      targetAgent, req: { user: { id: 'owner-a' }, body: { files } },
+      capability: { workspace_binding: true, worker_native_tools: true },
+    })).toBe(true);
+    const headers = targetAgent.model_parameters.configuration.defaultHeaders;
+    const encoded = headers['X-GlassHive-Bootstrap-Bundle-B64'];
+    const bundle = JSON.parse(Buffer.from(encoded, 'base64').toString());
+    expect(bundle.viventium_upload_context.selected_uploads).toEqual([
+      { file_id: 'audio-current', filename: 'request.m4a', type: 'audio/mp4',
+        source: 'local', bytes: 123, media_group_index: 0 },
+    ]);
+    expect(encoded).not.toBe('');
+    const expected = crypto.createHmac('sha256', 'synthetic-bundle-secret')
+      .update(`v1\n${headers['X-GlassHive-Bootstrap-Timestamp']}\n${encoded}`).digest('hex');
+    expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(`sha256=${expected}`);
+  });
+
+  test('native audio uses the same signed current upload resources while preserving inherited worker capabilities', async () => {
+    buildConversationProviderBootstrapBundle.mockResolvedValue({ glasshive_capability_broker: {
+      allowed_host_tools: ['file_search', 'transcribe_audio'],
+    } });
+    const current = { file_id: '11111111-1111-4111-8111-111111111111', filename: 'current.m4a',
+      type: 'audio/mp4', bytes: 4, source: 'local', filepath: '/private/untrusted.m4a',
+      url: 'https://untrusted.invalid/current.m4a' };
+    const inherited = { file_id: 'recall-owner', filename: 'recall.txt', context: 'conversation_recall' };
+    const targetAgent = { id: 'main', model_parameters: {}, declaredToolNames: ['file_search'],
+      toolRegistry: new Map([['file_search', { name: 'file_search' }]]),
+      tool_resources: { file_search: { files: [inherited] },
+        transcribe_audio: { files: [{ file_id: 'old-upload', filename: 'old.m4a' }] } } };
+    const req = { user: { id: 'owner' }, body: { files: [current], conversationId: 'conversation', messageId: 'message' },
+      _viventiumGlassHiveWorkerMemory: 'Authorized preference.',
+      _viventiumGlassHiveCapabilityDependency: { version: 1, source: 'turn_tool_activation' } };
+    expect(await attachConversationProviderCapabilityBundle({ targetAgent, req,
+      capability: { workspace_binding: true, worker_native_tools: true,
+        host_tools_transport: 'broker_mcp', host_tools: ['file_search', 'transcribe_audio'] } })).toBe(true);
+    const call = buildConversationProviderBootstrapBundle.mock.calls[0][0];
+    expect(call.allowedHostTools).toEqual(['file_search', 'transcribe_audio']);
+    expect(call.hostToolResources.file_search).toEqual({ entity_id: 'main', files: [inherited] });
+    expect(call.workerMemory).toBe('Authorized preference.');
+    expect(call.capabilityDependency).toEqual(req._viventiumGlassHiveCapabilityDependency);
+    const headers = targetAgent.model_parameters.configuration.defaultHeaders;
+    const bundle = JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64').toString());
+    expect(call.hostToolResources.transcribe_audio.files.map(file => file.file_id))
+      .toEqual(bundle.viventium_upload_context.selected_uploads.map(file => file.file_id));
+    expect(call.hostToolResources.transcribe_audio.files).toEqual([{ file_id: current.file_id,
+      filename: current.filename }]);
+    expect(bundle.viventium_upload_context.selected_uploads[0]).toMatchObject({
+      type: current.type, bytes: 4, source: 'local', media_group_index: 0 });
+    expect(JSON.stringify(call.hostToolResources)).not.toContain('/private/');
+    expect(JSON.stringify(call.hostToolResources)).not.toContain('untrusted.invalid');
+    expect(targetAgent.tool_resources.transcribe_audio.files[0].file_id).toBe('old-upload');
+  });
+
+  test.each([false, true])('a follow-up grants selected historical attachments without rewriting current inputs (new upload=%s)', async (includeCurrent) => {
+    const historical = { file_id: '22222222-2222-4222-8222-222222222222', filename: 'prior.m4a',
+      type: 'audio/mp4', bytes: 4, source: 'local' };
+    const current = { file_id: '11111111-1111-4111-8111-111111111111', filename: 'current.m4a',
+      type: 'audio/mp4', bytes: 8, source: 'local' };
+    const conversationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const parentMessageId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    getMessages.mockResolvedValue([{ messageId: parentMessageId, files: [{ file_id: historical.file_id }] }]);
+    getFiles.mockResolvedValue([historical]);
+    buildConversationProviderBootstrapBundle.mockResolvedValue({});
+    const currentFiles = includeCurrent ? [current] : [];
+    const expectedIds = [...currentFiles.map(file => file.file_id), historical.file_id];
+    const req = { user: { id: 'owner' }, body: { conversationId, parentMessageId, files: currentFiles } };
+    const targetAgent = { model_parameters: {} };
+    await attachConversationProviderCapabilityBundle({ targetAgent, req,
+      capability: { workspace_binding: true, host_tools_transport: 'broker_mcp', host_tools: ['transcribe_audio'] } });
+    const call = buildConversationProviderBootstrapBundle.mock.calls[0][0];
+    expect(call.hostToolResources.transcribe_audio.files.map(file => file.file_id)).toEqual(expectedIds);
+    expect(call.requestBody.files).toEqual(currentFiles);
+    expect(req.body.files).toEqual(currentFiles);
+    expect(getMessages).toHaveBeenCalledWith({ user: 'owner', conversationId }, 'messageId parentMessageId files');
+    expect(getFiles).toHaveBeenCalledWith({ user: 'owner', file_id: { $in: [historical.file_id] } }, null, 'file_id filename type bytes source context');
+    const encoded = targetAgent.model_parameters.configuration.defaultHeaders['X-GlassHive-Bootstrap-Bundle-B64'];
+    const bundle = JSON.parse(Buffer.from(encoded, 'base64').toString());
+    expect(bundle.viventium_upload_context.selected_uploads.map(file => file.file_id))
+      .toEqual(call.hostToolResources.transcribe_audio.files.map(file => file.file_id));
+  });
+
+  test.each([
+    { workspace_binding: false, host_tools_transport: 'broker_mcp', host_tools: ['transcribe_audio'] },
+    { workspace_binding: true, host_tools_transport: 'none', host_tools: ['transcribe_audio'] },
+    { workspace_binding: true, host_tools_transport: 'broker_mcp', host_tools: [] },
+  ])('native audio is not granted when the selected provider disables the capability (%p)', async capability => {
+    buildConversationProviderBootstrapBundle.mockResolvedValue({});
+    await attachConversationProviderCapabilityBundle({ targetAgent: { model_parameters: {} }, capability,
+      req: { user: { id: 'owner' }, body: { files: [{ file_id: '11111111-1111-4111-8111-111111111111', filename: 'a.m4a' }] } } });
+    for (const [call] of buildConversationProviderBootstrapBundle.mock.calls) {
+      expect(call.allowedHostTools).not.toContain('transcribe_audio');
+      expect(call.hostToolResources).not.toHaveProperty('transcribe_audio');
+    }
+  });
+
+  test.each([{ files: [] }, { files: [{ filename: 'no-owned-id.m4a', type: 'audio/mp4' }] }])(
+    'native audio is not granted without usable current upload IDs (%p)', async ({ files }) => {
+      buildConversationProviderBootstrapBundle.mockResolvedValue({});
+      await attachConversationProviderCapabilityBundle({ targetAgent: { model_parameters: {} },
+        capability: { workspace_binding: true, host_tools_transport: 'broker_mcp', host_tools: ['transcribe_audio'] },
+        req: { user: { id: 'owner' }, body: { files } } });
+      for (const [call] of buildConversationProviderBootstrapBundle.mock.calls) {
+        expect(call.allowedHostTools).not.toContain('transcribe_audio');
+        expect(call.hostToolResources).not.toHaveProperty('transcribe_audio');
+      }
+    });
 
   afterAll(() => {
     if (originalBrokerSecret === undefined) {
@@ -46,6 +174,59 @@ describe('GlassHiveConversationProviderService', () => {
       process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = originalBrokerSecret;
     }
   });
+
+  test('observes only the attached grant without serializing the server evidence observer', () => {
+    const observeGrant = jest.fn();
+    const targetAgent = { model_parameters: {} };
+    const req = { _viventiumCortexToolEvidence: { observeGrant } };
+    const bundle = { glasshive_capability_broker: { grant_id: 'fresh-grant' } };
+    expect(attachConversationProviderBootstrapBundle({ targetAgent, bundle, req })).toBe(true);
+    expect(observeGrant).toHaveBeenCalledWith('fresh-grant');
+    const headers = targetAgent.model_parameters.configuration.defaultHeaders;
+    expect(JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64').toString())).toEqual(bundle);
+  });
+
+  test.each(['empty', 'broker-unavailable'])(
+    'retains trusted native scope across %s capability projection and refresh',
+    async (mode) => {
+      const req = { user: { id: 'owner' }, body: { origin: 'interactive' } };
+      setTrustedInteractionContext(req, {
+        actor_kind: 'system',
+        origin: 'scheduler',
+        surface: 'workbench',
+        source_event_id: 'occurrence',
+      });
+      const targetAgent = {
+        id: 'participant',
+        tools: mode === 'empty' ? [] : [`lookup${Constants.mcp_delimiter}declared`],
+        model_parameters: {
+          configuration: {
+            defaultHeaders: {
+              'x-viventium-actor-kind': 'external_user',
+              'X-VIVENTIUM-ORIGIN': 'interactive',
+              'X-Existing': 'keep',
+            },
+          },
+        },
+      };
+      if (mode === 'broker-unavailable') {
+        buildConversationProviderBootstrapBundle.mockRejectedValueOnce(new Error('offline'));
+      }
+      const args = { targetAgent, req, capability: { workspace_binding: true } };
+      expect(await attachConversationProviderCapabilityBundle(args)).toBe(false);
+      const expected = {
+        'X-Existing': 'keep',
+        'X-Viventium-Actor-Kind': 'system',
+        'X-Viventium-Origin': 'scheduler',
+      };
+      expect(targetAgent.model_parameters.configuration.defaultHeaders).toEqual(expected);
+      expect(installConversationProviderCapabilityRefresher(args)).toBe(true);
+      expect(
+        (await targetAgent.viventiumConversationProviderCapabilityRefresh()).defaultHeaders,
+      ).toEqual(expected);
+      if (mode === 'empty') expect(buildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
+    },
+  );
 
   test('builds stable role-scoped keys for main, Phase B, and parallel cortices', () => {
     expect(buildHarnessIdempotencyKey('main', 'response-1')).toBe('main:response-1');
@@ -248,6 +429,114 @@ describe('GlassHiveConversationProviderService', () => {
     ).toEqual(['file_search']);
   });
 
+  test('projects Main orchestration separately from inheritable worker host tools', async () => {
+    buildConversationProviderBootstrapBundle.mockResolvedValue({
+      glasshive_capability_broker: {
+        allowed_host_tools: ['file_search', 'active_work_list'],
+      },
+    });
+    const targetAgent = {
+      id: 'agent-synthetic',
+      glasshive_options: {
+        orchestration: {
+          parallel_available: true,
+          worker_profile: 'codex-cli',
+          fallback_worker_profile: 'claude-code',
+        },
+      },
+      toolRegistry: new Map([
+        ['file_search', { name: 'file_search' }],
+        ['active_work_list', { name: 'active_work_list' }],
+        ['active_work_action', { name: 'active_work_action' }],
+        [
+          'worker_delegate_once_mcp_glasshive-workers-projects',
+          { name: 'worker_delegate_once_mcp_glasshive-workers-projects' },
+        ],
+        ['unknown_peer_spawn', { name: 'unknown_peer_spawn' }],
+      ]),
+      tool_resources: { file_search: { files: [{ file_id: 'file-1' }] } },
+      model_parameters: { configuration: { defaultHeaders: {} } },
+    };
+    const capability = {
+      workspace_binding: true,
+      host_tools_transport: 'broker_mcp',
+      host_tools: ['file_search'],
+      conversation_orchestration_tools: [
+        'active_work_list',
+        'active_work_action',
+        'worker_delegate_once_mcp_glasshive-workers-projects',
+        'unknown_peer_spawn',
+      ],
+    };
+    const req = {
+      user: { id: 'user-synthetic' },
+      body: { conversationId: 'conversation-synthetic', messageId: 'message-synthetic' },
+      _viventiumGlassHiveWorkerMemory: 'Permission-gated user fact.',
+      _viventiumGlassHiveCapabilityDependency: { version: 1, source: 'turn_tool_activation' },
+    };
+
+    expect(resolvedConversationOrchestrationToolNames(targetAgent, capability)).toEqual([
+      'active_work_action',
+      'active_work_list',
+      'worker_delegate_once_mcp_glasshive-workers-projects',
+    ]);
+    expect(configuredConversationOrchestrationWorkerRoute(targetAgent)).toEqual({
+      workerProfile: 'codex-cli',
+      fallbackWorkerProfile: 'claude-code',
+    });
+    await expect(
+      attachConversationProviderCapabilityBundle({
+        targetAgent,
+        declaredAgent: targetAgent,
+        req,
+        capability,
+      }),
+    ).resolves.toBe(true);
+
+    expect(buildConversationProviderBootstrapBundle).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allowedHostTools: ['file_search'],
+        allowedConversationOrchestrationTools: [
+          'active_work_action',
+          'active_work_list',
+          'worker_delegate_once_mcp_glasshive-workers-projects',
+        ],
+        workerMemory: 'Permission-gated user fact.',
+        capabilityDependency: { version: 1, source: 'turn_tool_activation' },
+        workerProfile: 'codex-cli',
+        fallbackWorkerProfile: 'claude-code',
+      }),
+    );
+    expect(configuredBrokerHostTools({ 'synthetic-harness': capability })).toEqual(['file_search']);
+  });
+
+  test('denies broker-native peer orchestration to mission roots', () => {
+    const missionRoot = {
+      id: 'mission-root',
+      toolRegistry: new Map([
+        [
+          'worker_delegate_once_mcp_glasshive-workers-projects',
+          { name: 'worker_delegate_once_mcp_glasshive-workers-projects' },
+        ],
+        ['active_work_list', { name: 'active_work_list' }],
+        ['active_work_action', { name: 'active_work_action' }],
+      ]),
+    };
+    const capability = {
+      workspace_binding: true,
+      host_tools_transport: 'broker_mcp',
+      conversation_orchestration_tools: [
+        'worker_delegate_once_mcp_glasshive-workers-projects',
+        'active_work_list',
+        'active_work_action',
+      ],
+    };
+
+    expect(resolvedConversationOrchestrationToolNames(missionRoot, capability)).toEqual([]);
+    missionRoot.glasshive_options = { orchestration: { parallel_available: false } };
+    expect(resolvedConversationOrchestrationToolNames(missionRoot, capability)).toEqual([]);
+  });
+
   test('delivers an intentional Stop to the exact authenticated main request', async () => {
     const abortController = new AbortController();
     const fetchImpl = jest.fn().mockResolvedValue({ ok: true });
@@ -281,6 +570,125 @@ describe('GlassHiveConversationProviderService', () => {
       }),
     );
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  test('cancels the exact native request when a newer logical-turn revision supersedes it', async () => {
+    const abortController = new AbortController();
+    const fetchImpl = jest.fn().mockResolvedValue({ ok: true });
+    const req = {
+      _viventiumHarnessExecutionEnabled: true,
+      _viventiumHarnessIdempotencyKey: 'main:response-superseded',
+      body: { responseMessageId: 'response-superseded' },
+      user: { id: 'user-synthetic' },
+    };
+
+    bindHarnessCancellation({
+      req,
+      signal: abortController.signal,
+      endpointConfig: { baseURL: 'http://glasshive.local/v1', apiKey: 'synthetic-key' },
+      fetchImpl,
+    });
+
+    abortController.abort('superseded');
+    await req._viventiumHarnessCancellationDeliveryPromise;
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://glasshive.local/v1/requests/by-idempotency/main%3Aresponse-superseded/cancel',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  test('delivers a maintenance yield to release the exact native compactor request', async () => {
+    const abortController = new AbortController();
+    const fetchImpl = jest.fn().mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ capacityReleased: true }),
+    });
+    const req = {
+      _viventiumHarnessExecutionEnabled: true,
+      _viventiumHarnessIdempotencyKey: 'cortex:compaction-run:compactor-agent',
+      body: {},
+      user: { id: 'user-synthetic' },
+    };
+
+    bindHarnessCancellation({
+      req,
+      signal: abortController.signal,
+      endpointConfig: { baseURL: 'http://glasshive.local/v1', apiKey: 'synthetic-key' },
+      fetchImpl,
+    });
+    abortController.abort('maintenance_yield');
+    await req._viventiumHarnessCancellationDeliveryPromise;
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://glasshive.local/v1/requests/by-idempotency/cortex%3Acompaction-run%3Acompactor-agent/cancel',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  test('delivers an already-requested maintenance yield when direct binding finishes late', async () => {
+    const abortController = new AbortController();
+    abortController.abort('maintenance_yield');
+    const fetchImpl = jest.fn().mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ capacityReleased: true }),
+    });
+    const req = {
+      _viventiumHarnessExecutionEnabled: true,
+      _viventiumHarnessIdempotencyKey: 'cortex:late-binding:compactor-agent',
+      body: {},
+      user: { id: 'user-synthetic' },
+    };
+
+    bindHarnessCancellation({
+      req,
+      signal: abortController.signal,
+      endpointConfig: { baseURL: 'http://glasshive.local/v1', apiKey: 'synthetic-key' },
+      fetchImpl,
+    });
+    await req._viventiumHarnessCancellationDeliveryPromise;
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not acknowledge maintenance yield without explicit capacity release', async () => {
+    jest.useFakeTimers();
+    try {
+      const abortController = new AbortController();
+      const onDeliveryError = jest.fn();
+      const fetchImpl = jest.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: jest.fn().mockResolvedValue({ capacityReleased: false }),
+      });
+      const req = {
+        _viventiumHarnessExecutionEnabled: true,
+        _viventiumHarnessIdempotencyKey: 'cortex:unconfirmed:compactor-agent',
+        body: {},
+        user: { id: 'user-synthetic' },
+      };
+
+      bindHarnessCancellation({
+        req,
+        signal: abortController.signal,
+        endpointConfig: { baseURL: 'http://glasshive.local/v1', apiKey: 'synthetic-key' },
+        fetchImpl,
+        onDeliveryError,
+      });
+      abortController.abort('maintenance_yield');
+      await jest.runAllTimersAsync();
+
+      await expect(req._viventiumHarnessCancellationDeliveryPromise).resolves.toMatchObject({
+        acknowledged: false,
+        outcomes: [expect.objectContaining({ acknowledged: false, status: 425 })],
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(4);
+      expect(onDeliveryError).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test('retries an unacknowledged Stop delivery and stops after the first acknowledgement', async () => {
@@ -622,6 +1030,81 @@ describe('GlassHiveConversationProviderService', () => {
     });
     expect(targetAgent.instructions).toBe(
       'Existing authority.\n\nHost-tool resources are service-backed. Call the authorized host tool first.',
+    );
+  });
+
+  test.each([false, true])(
+    'keeps native host evidence through initialization and fallback (fallback=%s)',
+    async (fallback) => {
+      buildConversationProviderBootstrapBundle.mockResolvedValue({
+        glasshive_capability_broker: {},
+      });
+      const files = [
+        { file_id: 'conversation_recall:all:user-synthetic', context: 'conversation_recall' },
+      ];
+      const initialized = {
+        id: 'agent-synthetic',
+        tools: [],
+        toolDefinitions: [],
+        toolRegistry: new Map(),
+        declaredToolNames: [
+          'file_search',
+          'web_search',
+          `read_mail${Constants.mcp_delimiter}mail-service`,
+        ],
+        tool_resources: { file_search: { files } },
+        model_parameters: { configuration: { defaultHeaders: {} } },
+      };
+      const target = fallback
+        ? { ...initialized, declaredToolNames: [], tool_resources: {} }
+        : initialized;
+      await attachConversationProviderCapabilityBundle({
+        targetAgent: target,
+        declaredAgent: {
+          id: 'agent-synthetic',
+          tools: fallback ? [] : initialized.declaredToolNames,
+        },
+        capabilitySourceAgent: initialized,
+        req: { user: { id: 'user-synthetic' }, body: {} },
+        capability: {
+          workspace_binding: true,
+          worker_native_tools: true,
+          host_tools_transport: 'broker_mcp',
+          host_tools: ['file_search', 'web_search'],
+        },
+      });
+      expect(buildConversationProviderBootstrapBundle).toHaveBeenCalledWith(
+        expect.objectContaining({
+          allowedHostTools: ['file_search', 'web_search'],
+          hostToolResources: { file_search: { entity_id: 'agent-synthetic', files } },
+          allowedServerNames: ['mail-service'],
+        }),
+      );
+      expect(target.tools).toEqual([]);
+    },
+  );
+
+  test('does not restore disabled native host capabilities from declarations', async () => {
+    getEndpointsConfig.mockResolvedValueOnce({ agents: { capabilities: ['web_search'] } });
+    buildConversationProviderBootstrapBundle.mockResolvedValue({ glasshive_capability_broker: {} });
+    await attachConversationProviderCapabilityBundle({
+      targetAgent: {
+        id: 'agent-synthetic',
+        tools: [],
+        tool_resources: { file_search: { files: [{ file_id: 'file-a' }] } },
+        model_parameters: { configuration: { defaultHeaders: {} } },
+      },
+      declaredAgent: { tools: ['file_search', 'web_search'] },
+      req: { user: { id: 'user-synthetic' }, body: {} },
+      capability: {
+        workspace_binding: true,
+        worker_native_tools: true,
+        host_tools_transport: 'broker_mcp',
+        host_tools: ['file_search', 'web_search'],
+      },
+    });
+    expect(buildConversationProviderBootstrapBundle).toHaveBeenCalledWith(
+      expect.objectContaining({ allowedHostTools: ['web_search'], hostToolResources: {} }),
     );
   });
 

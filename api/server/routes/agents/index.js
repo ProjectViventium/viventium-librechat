@@ -328,7 +328,16 @@ router.post('/chat/abort', async (req, res) => {
      * Feature: Explicit harness cancellation reason.
      * Purpose: This authenticated Stop endpoint is user intent, unlike subscriber disconnects.
      * === VIVENTIUM END === */
-    const abortResult = await GenerationJobManager.abortJob(jobStreamId, 'user_cancelled');
+    const abortResult = await GenerationJobManager.abortJob(jobStreamId, 'user_cancelled', userId);
+    /* === VIVENTIUM START === A committed native answer cannot truthfully become cancelled. === */
+    if (abortResult.nativeResponse) {
+      return res.status(abortResult.nativeResponse === 'committed' ? 200 : 202).json({
+        success: false,
+        nativeResponse: abortResult.nativeResponse,
+        ...(abortResult.finalEvent ? { finalEvent: abortResult.finalEvent } : {}),
+      });
+    }
+    /* === VIVENTIUM END === */
     logger.debug(`[AgentStream] Job aborted successfully: ${jobStreamId}`, {
       abortResultSuccess: abortResult.success,
       abortResultUserMessageId: abortResult.jobData?.userMessage?.messageId,
@@ -340,6 +349,7 @@ router.post('/chat/abort', async (req, res) => {
     // Only save if we have a valid responseMessageId (skip early aborts before generation started)
     if (
       abortResult.success &&
+      !abortResult.jobData?.nativeResponse &&
       abortResult.jobData?.userMessage?.messageId &&
       abortResult.jobData?.responseMessageId
     ) {
@@ -361,6 +371,7 @@ router.post('/chat/abort', async (req, res) => {
 
       try {
         await saveMessage(req, responseMessage, {
+          operationKind: 'system',
           context: 'api/server/routes/agents/index.js - abort endpoint',
         });
         logger.debug(`[AgentStream] Saved partial response for: ${jobStreamId}`);

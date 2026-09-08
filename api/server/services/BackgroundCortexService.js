@@ -6,6 +6,7 @@
  * Porting: Copy this file wholesale when reapplying Viventium changes onto a fresh upstream checkout.
  * === VIVENTIUM END === */
 
+const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
 /* === VIVENTIUM NOTE ===
  * Feature: Enable token counting for background cortex context pruning.
@@ -27,11 +28,11 @@ const {
   initializeOpenAI,
   createRun,
   Tokenizer,
-  memoryInstructions,
   loadMemoryReadContext,
   extractFileContext,
   countTokens,
   checkAccess,
+  createCortexToolEvidence,
 } = require('@librechat/api');
 const { loadAgent } = require('~/models/Agent');
 const { getAppConfig } = require('./Config/app');
@@ -62,6 +63,16 @@ const {
   buildTimeContextInstructions,
 } = require('~/server/services/viventium/surfacePrompts');
 const {
+  buildCortexInsightDeliveryCandidates,
+  normalizeCortexFeelingSnapshot,
+  recordCompletedCortexInsightDeliveryBatch,
+  requireExactCortexInsightDeliveryAcceptance,
+} = require('~/server/services/viventium/CortexInsightDeliveryService');
+const {
+  enqueueCompletedCortexInsightOutboxBatch,
+  settleCompletedCortexInsightOutboxBatch,
+} = require('~/server/services/viventium/CortexInsightOutboxService');
+const {
   calcVoiceLatencyDurationMs,
   formatVoiceLatencyTiming,
   voiceLatencyNow,
@@ -69,7 +80,10 @@ const {
 /* === VIVENTIUM NOTE ===
  * Feature: Source-owned activation policy promptRefs.
  */
-const { getPromptText } = require('~/server/services/viventium/promptRegistry');
+const {
+  getPromptText,
+  getRequiredPromptText,
+} = require('~/server/services/viventium/promptRegistry');
 /* === VIVENTIUM NOTE ===
  * Feature: Strict provider text-part sanitization for background cortex runs.
  */
@@ -81,10 +95,7 @@ const {
 } = require('~/server/services/viventium/sanitizeAggregatedContentParts');
 /* === VIVENTIUM NOTE === */
 const {
-  buildProductivitySpecialistRuntimeInstructions,
-  getLatestUserText,
   resolveProductivitySpecialistScope,
-  shouldIsolateProductivitySpecialistContext,
 } = require('~/server/services/viventium/productivitySpecialistContext');
 const {
   resolveFallbackAssignment,
@@ -109,9 +120,17 @@ const {
 const { logFeelingsEvent } = require('~/server/services/viventium/feelingsTelemetry');
 const {
   attachConversationProviderCapabilityBundle,
+  bindHarnessCancellation,
   buildHarnessIdempotencyKey,
   installConversationProviderCapabilityRefresher,
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
+
+const {
+  getTrustedInteractionContext,
+  getTrustedAdapterCapabilities,
+  getTrustedDeliveryPolicy,
+  setTrustedInteractionContext,
+} = require('~/server/services/viventium/interactionContext');
 
 const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
 
@@ -153,9 +172,12 @@ const ACTIVATION_PROVIDER_USER_SCOPED_ERROR_CLASSES = new Set([
 ]);
 const ACTIVATION_SUPPRESSION_PROBEABLE_ERROR_CLASSES = new Set(['provider_unauthorized']);
 const PUBLIC_CORTEX_ERROR_MESSAGES = {
+  delivery_persistence_unavailable:
+    'This background agent could not durably accept its result, so no insight was delivered.',
   activation_provider_unavailable:
     'This background agent could not start because every configured activation provider was unavailable.',
   no_live_tool_execution: 'This background agent could not verify live tool evidence for this run.',
+  missing_required_evidence: 'This background result has no verified source evidence.',
   timeout: 'This background agent timed out before returning a result.',
   cortex_agent_not_found: 'This background agent is not available in the current configuration.',
   provider_unauthorized:
@@ -166,6 +188,9 @@ const PUBLIC_CORTEX_ERROR_MESSAGES = {
     'This background agent could not use the configured provider because it was rate limited.',
   provider_quota_or_billing:
     'This background agent could not use the configured provider because of a quota or billing issue.',
+  host_capacity: 'This background agent could not start because host capacity is unavailable.',
+  provider_request_rejected: 'The configured provider rejected this background request.',
+  provider_unavailable: 'The configured provider is unavailable for this background request.',
   recoverable_provider_error:
     'This background agent hit a recoverable provider issue before returning a result.',
   background_agent_error:
@@ -534,7 +559,7 @@ async function getUserMemoryContextBlock(req) {
     if (!memoryText) {
       return '';
     }
-    return `${memoryInstructions}\n\n# Existing memory about the user:\n${memoryText}`;
+    return `# Existing memory about the user:\n${memoryText}`;
   } catch (error) {
     logger.warn(
       '[BackgroundCortexService] Failed to load memory read profile for cortex context',
@@ -860,6 +885,54 @@ function extractUserFacingInsight(rawText) {
 /* === VIVENTIUM NOTE ===
  * Feature: Background cortex context pruning via Run token counter.
  */
+function normalizeCortexInsight(rawText, insightMode = 'user_facing') {
+  const exact = typeof rawText === 'string' ? rawText : '';
+  if (insightMode === 'structured') {
+    return exact;
+  }
+  const original = exact.trim();
+  return extractUserFacingInsight(original) || original;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Completed-graph cortex insight extraction.
+ * Purpose: Treat Run.processStream's completed graph as authoritative over incremental callbacks.
+ */
+function extractCompletedCortexGraphInsight({ completedContent, streamedContentParts } = {}) {
+  if (Array.isArray(completedContent)) {
+    const finalTextParts = [];
+    for (let index = completedContent.length - 1; index >= 0; index -= 1) {
+      const part = completedContent[index];
+      const isFinalText =
+        part?.type === 'text' &&
+        typeof part?.text === 'string' &&
+        (!Array.isArray(part?.tool_call_ids) || part.tool_call_ids.length === 0);
+      if (!isFinalText) {
+        if (finalTextParts.length > 0) {
+          break;
+        }
+        continue;
+      }
+      finalTextParts.unshift(part.text);
+    }
+    const exactFinalText = finalTextParts.join('');
+    if (exactFinalText.trim()) {
+      return exactFinalText;
+    }
+  }
+
+  const exactCompletedText = extractTextFromContent(completedContent);
+  if (exactCompletedText.trim()) {
+    return exactCompletedText;
+  }
+  const exactStreamedText = (Array.isArray(streamedContentParts) ? streamedContentParts : [])
+    .filter((part) => part?.type === 'text')
+    .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+    .join('');
+  return exactStreamedText.trim() ? exactStreamedText : '';
+}
+/* === VIVENTIUM END === */
+
 const DEFAULT_TOKEN_ENCODING = 'o200k_base';
 
 function createTokenCounter(encoding = DEFAULT_TOKEN_ENCODING) {
@@ -1651,8 +1724,101 @@ function hasVisibleCortexInsight(insight) {
  * their own terminal result after `generation_completed`, while an intentional Stop still cancels
  * their provider/tool work.
  * === VIVENTIUM END === */
+function isDeliverableCortexResult(result) {
+  return Boolean(result && !result.error && hasVisibleCortexInsight(result.insight));
+}
+
+function collectDeliverableCortexInsights(results) {
+  return (Array.isArray(results) ? results : [])
+    .filter(isDeliverableCortexResult)
+    .map((result) => ({
+      cortexId: result.agentId,
+      cortexName: sanitizeCortexDisplayName(result.agentName),
+      insight: result.insight,
+      activationScope: result.activationScope || null,
+      configured_tools: result.configuredTools || 0,
+      completed_tool_calls: result.completedToolCalls || 0,
+    }));
+}
+
+const completedResultProgrammingDefects = new WeakSet();
+
+function markCompletedResultProgrammingDefect(error) {
+  if (error && (typeof error === 'object' || typeof error === 'function')) {
+    completedResultProgrammingDefects.add(error);
+    return error;
+  }
+  const wrapped = new Error(
+    'Completed-result persistence dependency rejected with a non-Error value',
+  );
+  wrapped.code = 'cortex_completed_result_programming_defect';
+  completedResultProgrammingDefects.add(wrapped);
+  return wrapped;
+}
+
+function isCompletedResultProgrammingDefect(error) {
+  return Boolean(
+    error &&
+    (typeof error === 'object' || typeof error === 'function') &&
+    completedResultProgrammingDefects.has(error),
+  );
+}
+
+function failClosedCortexResult(result, error) {
+  return {
+    ...result,
+    insight: null,
+    error: error?.message || 'Completed cortex insight has no private durable acceptance path',
+    errorClass: 'delivery_persistence_unavailable',
+    errorCode: error?.code || 'cortex_insight_delivery_acceptance_unavailable',
+    retryable: error?.retryable === true,
+    graphResultHashes: Array.isArray(error?.graphResultHashes) ? [...error.graphResultHashes] : [],
+  };
+}
+
+async function finalizeCortexResultDelivery(
+  result,
+  { completedResultPolicy = 'deliver', persist },
+) {
+  if (completedResultPolicy !== 'deliver' || !isDeliverableCortexResult(result)) {
+    return result;
+  }
+  try {
+    await persist();
+    return result;
+  } catch (error) {
+    if (
+      error?.code !== 'cortex_insight_delivery_acceptance_unavailable' ||
+      error?.retryable !== true ||
+      !Array.isArray(error?.graphResultHashes)
+    ) {
+      throw error;
+    }
+    logger.warn('[BackgroundCortexService] Completed insight suppressed without acceptance', {
+      code: error.code,
+      graphResultHashCount: error.graphResultHashes.length,
+    });
+    return failClosedCortexResult(result, error);
+  }
+}
+
+function isCortexDeliveryPersistenceFailure(result) {
+  return (
+    result?.errorClass === 'delivery_persistence_unavailable' ||
+    result?.errorCode === 'cortex_insight_delivery_acceptance_unavailable'
+  );
+}
+
+function shouldRetryCortexResultWithFallback(result) {
+  return (
+    !isCortexDeliveryPersistenceFailure(result) && shouldRetryBackgroundCortexWithFallback(result)
+  );
+}
+
+const BACKGROUND_CORTEX_CANCELLATION_REASONS = new Set(['user_cancelled', 'maintenance_yield']);
+
 function isBackgroundCortexCancellationSignal(signal) {
-  return signal?.aborted === true && signal.reason === 'user_cancelled';
+  return signal?.aborted === true && BACKGROUND_CORTEX_CANCELLATION_REASONS.has(signal.reason);
 }
 
 function buildCortexCompletionPayload(result) {
@@ -1660,7 +1826,7 @@ function buildCortexCompletionPayload(result) {
     return null;
   }
 
-  const hasVisibleInsight = hasVisibleCortexInsight(result.insight);
+  const hasVisibleInsight = isDeliverableCortexResult(result);
   const basePayload = {
     cortex_id: result.agentId,
     cortex_name: sanitizeCortexDisplayName(result.agentName || result.agentId),
@@ -1706,6 +1872,8 @@ function buildCortexCompletionPayload(result) {
       status: 'error',
       error: publicError.message,
       error_class: publicError.errorClass,
+      ...(result.errorCode ? { error_code: result.errorCode } : {}),
+      ...(result.retryable === true ? { retryable: true } : {}),
     };
   }
 
@@ -1743,6 +1911,8 @@ function buildCompletionInputFromActivation({
     activationScope: result?.activationScope || activationResult.activationScope || null,
     configuredTools: result?.configuredTools || 0,
     completedToolCalls: result?.completedToolCalls || 0,
+    errorCode: result?.errorCode || null,
+    retryable: result?.retryable === true,
     fallbackUsed: result?.fallbackUsed === true,
     primaryErrorClass: result?.primaryErrorClass || null,
     confidence: activationResult.confidence,
@@ -1939,6 +2109,11 @@ function extractCortexErrorStatus(error, message = '') {
 
 function extractCortexErrorCode(error, message = '') {
   const candidates = [
+    error?.error?.detail?.code,
+    error?.response?.data?.detail?.code,
+    error?.detail?.code,
+    error?.cause?.error?.detail?.code,
+
     error?.code,
     error?.lc_error_code,
     error?.errorCode,
@@ -1974,6 +2149,10 @@ function classifyCortexPublicError(error, explicitClass = '') {
     .toLowerCase();
   const status = extractCortexErrorStatus(error, rawMessage);
   const code = String(extractCortexErrorCode(error, rawMessage) || '').toUpperCase();
+  if (code === 'HOST_CAPACITY') return 'host_capacity';
+  if (['INVALID_REQUEST', 'INVALID_REQUEST_ERROR', 'UNSUPPORTED_PARAMETER'].includes(code))
+    return 'provider_request_rejected';
+  if (code === 'SERVICE_UNAVAILABLE') return 'provider_unavailable';
 
   if (
     status === 401 ||
@@ -2050,7 +2229,7 @@ function sanitizeRuntimeErrorForLog(error, explicitClass = '') {
     class: publicError.errorClass,
     name: error?.name || null,
     status: Number.isFinite(error?.status) ? error.status : null,
-    code: error?.code || error?.lc_error_code || null,
+    code: extractCortexErrorCode(error) || null,
   };
 }
 
@@ -3336,8 +3515,11 @@ function buildCortexRequestBody({
     String(conversationId || '').trim() ||
     String(requestBody?.conversationId || '').trim() ||
     String(runId || '').trim();
+  const cortexRequestBody = { ...(requestBody || {}) };
+  // Main owns this mutable carrier; cortices assemble their own time, memory and file context.
+  delete cortexRequestBody.viventiumGlassHiveTurnContextB64;
   return {
-    ...(requestBody || {}),
+    ...cortexRequestBody,
     messageId: runId,
     conversationId: resolvedConversationId,
     parentMessageId: requestBody?.parentMessageId,
@@ -3356,11 +3538,46 @@ async function prepareCortexConversationProviderCapability({
   req,
   capability,
   requestBody,
+  signal = null,
+  cancellationReq = req,
   attachBundle = attachConversationProviderCapabilityBundle,
   installRefresher = installConversationProviderCapabilityRefresher,
+  bindCancellation = bindHarnessCancellation,
 }) {
+  const providerSessionMode = String(
+    declaredAgent?.viventiumProviderSessionMode || targetAgent?.viventiumProviderSessionMode || '',
+  )
+    .trim()
+    .toLowerCase();
+  if (targetAgent && providerSessionMode === 'stateless') {
+    const modelParameters = { ...(targetAgent.model_parameters || {}) };
+    const configuration = { ...(modelParameters.configuration || {}) };
+    configuration.defaultHeaders = {
+      ...(configuration.defaultHeaders || {}),
+      'X-GlassHive-Provider-Session-Mode': 'stateless',
+    };
+    modelParameters.configuration = configuration;
+    targetAgent.model_parameters = modelParameters;
+  }
   const args = { targetAgent, declaredAgent, req, capability, requestBody };
   const attached = await attachBundle(args);
+  const idempotencyKey = String(requestBody?.viventiumGlassHiveIdempotencyKey || '').trim();
+  if (cancellationReq && idempotencyKey) {
+    cancellationReq._viventiumHarnessExecutionEnabled = capability?.workspace_binding === true;
+    cancellationReq._viventiumHarnessIdempotencyKey = idempotencyKey;
+  }
+  if (signal && idempotencyKey) {
+    bindCancellation({
+      req: cancellationReq,
+      signal,
+      endpointConfig: targetAgent?.model_parameters?.configuration,
+      onDeliveryError: (error) => {
+        logger.warn('[GlassHiveProvider] Native cortex cancellation delivery failed', {
+          error: error?.message || 'provider_unreachable',
+        });
+      },
+    });
+  }
   installRefresher(args);
   return attached;
 }
@@ -3387,14 +3604,29 @@ async function executeCortexOnce({
   res,
   activationScope = null,
   contextMode = 'full',
+  completedResultPolicy = 'deliver',
   executionTimeoutMs = null,
   signal = null,
-}) {
+  insightMode = 'user_facing',
+  resultEvidence = null,
+  onHarnessCancellationOutcome = null,
+}, { initializeAgentFn = initializeAgent, createRunFn = createRun,
+  persistCompletedInsightFn = persistCompletedCortexGraphInsight } = {}) {
+  if (!['deliver', 'internal'].includes(completedResultPolicy)) {
+    throw new TypeError('completedResultPolicy must be "deliver" or "internal"');
+  }
+  if (!['user_facing', 'structured'].includes(insightMode)) {
+    throw new TypeError('insightMode must be "user_facing" or "structured"');
+  }
   const startTime = Date.now();
   /** @type {AbortController | null} */
   let abortController = null;
   /** @type {NodeJS.Timeout | null} */
   let abortTimer = null;
+  /* === VIVENTIUM START ===
+   * Fix: Only a fired execution deadline may classify an aborted cortex run as `timeout`.
+   * === VIVENTIUM END === */
+  let deadlineTimerFired = false;
   let removeExternalAbortListener = null;
   /* === VIVENTIUM START ===
    * Fix: Preserve Phase B metadata through provider failures so UI cards, DB parts, and fallback
@@ -3404,6 +3636,8 @@ async function executeCortexOnce({
   let configuredToolCount = countConfiguredCortexTools(agent, agent);
   let completedToolCalls = 0;
   let harnessInvocationReq = null;
+  let cortexCancellationReq = null;
+  let toolEvidence = null;
 
   try {
     const safeReq = req || { body: {}, user: {} };
@@ -3428,33 +3662,6 @@ async function executeCortexOnce({
     const productivityScope = minimalContext
       ? null
       : resolveProductivitySpecialistScope(agentForRun) || null;
-    const isolateProductivityContext = shouldIsolateProductivitySpecialistContext(agentForRun, {
-      scope: productivityScope,
-    });
-    const latestUserText = getLatestUserText(messages);
-
-    /* === VIVENTIUM NOTE ===
-     * Feature: Fresh-request execution envelope for productivity specialist cortices.
-     *
-     * Why:
-     * - Google/MS365 tool specialists should act on the current request, not stale assistant claims.
-     * - When the latest user turn already contains Google Docs/Drive links, surface extracted file IDs
-     *   so the specialist prefers direct retrieval instead of brittle search-by-ID guesses.
-     */
-    const productivityRuntimeInstructions = minimalContext
-      ? ''
-      : buildProductivitySpecialistRuntimeInstructions({
-          agent: agentForRun,
-          latestUserText,
-          scope: productivityScope,
-        });
-    if (productivityRuntimeInstructions) {
-      agentForRun.instructions = [agentForRun.instructions || '', productivityRuntimeInstructions]
-        .filter((part) => typeof part === 'string' && part.trim().length > 0)
-        .join('\n\n');
-    }
-    /* === VIVENTIUM NOTE === */
-
     /* === VIVENTIUM NOTE ===
      * Feature: Time context parity for background cortices
      * Purpose: Provide the same canonical local time context to cortices as the main agent.
@@ -3486,11 +3693,7 @@ async function executeCortexOnce({
      * Note: This mirrors the main agent behavior (AgentClient.buildMessages → useMemory()) but
      * does NOT run memory updates for cortex outputs (only reads existing memory for context).
      */
-    const memoryContextBlock = minimalContext
-      ? ''
-      : isolateProductivityContext
-        ? ''
-        : await getUserMemoryContextBlock(safeReq);
+    const memoryContextBlock = minimalContext ? '' : await getUserMemoryContextBlock(safeReq);
     if (memoryContextBlock) {
       agentForRun.instructions = [agentForRun.instructions || '', memoryContextBlock]
         .filter((part) => typeof part === 'string' && part.trim().length > 0)
@@ -3579,7 +3782,7 @@ async function executeCortexOnce({
       safeReq.body.web_search = false;
     }
 
-    const safeRes = res || createBackgroundRes();
+    const safeRes = createBackgroundRes();
     const streamId = null;
 
     const collectedUsage = [];
@@ -3593,6 +3796,11 @@ async function executeCortexOnce({
       completed: 0,
       names: new Set(),
     };
+    toolEvidence = createCortexToolEvidence(resultEvidence, (output) => {
+      toolExecutionState.completed += 1;
+      completedToolCalls = toolExecutionState.completed;
+      if (output.name) toolExecutionState.names.add(output.name);
+    });
     const baseToolEndCallback = createToolEndCallback({
       req: safeReq,
       res: safeRes,
@@ -3601,6 +3809,7 @@ async function executeCortexOnce({
     });
     const toolEndCallback = async (data, metadata) => {
       const output = data?.output;
+      if (output) toolEvidence.record(output);
       if (output?.tool_call_id || output?.name) {
         toolExecutionState.completed += 1;
         completedToolCalls = toolExecutionState.completed;
@@ -3616,12 +3825,22 @@ async function executeCortexOnce({
      * Feature: composed voice-task cancellation
      * Purpose: Bind the owning generation signal to background cortex tools/providers so a task
      * cancellation does not merely hide a late result while avoidable work keeps running.
+     * Fix: Only an intentional cancellation reason propagates. GenerationJobManager also aborts the
+     * owning request signal with `generation_completed` when the main turn finishes, and a detached
+     * cortex (for example the Emotional Reaction cortex scheduled after the main turn) must run to
+     * its own terminal result instead of failing immediately as a false `timeout`.
      * === VIVENTIUM END === */
     const ownerSignal = signal || safeReq?._viventiumVoiceAbortSignal || null;
     if (ownerSignal?.aborted) {
-      abortController.abort(ownerSignal.reason);
+      if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+        abortController.abort(ownerSignal.reason);
+      }
     } else if (typeof ownerSignal?.addEventListener === 'function') {
-      const abortFromOwner = () => abortController?.abort(ownerSignal.reason);
+      const abortFromOwner = () => {
+        if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+          abortController?.abort(ownerSignal.reason);
+        }
+      };
       ownerSignal.addEventListener('abort', abortFromOwner, { once: true });
       removeExternalAbortListener = () =>
         ownerSignal.removeEventListener?.('abort', abortFromOwner);
@@ -3633,7 +3852,14 @@ async function executeCortexOnce({
     if (effectiveExecutionTimeoutMs > 0) {
       abortTimer = setTimeout(() => {
         try {
-          abortController?.abort();
+          /* === VIVENTIUM START ===
+           * Fix: Record the deadline as the abort cause only when this timer performs the abort,
+           * so an earlier intentional cancellation is never relabelled as a timeout.
+           * === VIVENTIUM END === */
+          if (abortController?.signal?.aborted !== true) {
+            deadlineTimerFired = true;
+            abortController?.abort();
+          }
         } catch (_e) {
           // Ignore abort errors; we just need the run to unwind.
         }
@@ -3659,7 +3885,7 @@ async function executeCortexOnce({
         `Provider capability configuration is unavailable for "${cortexProviderName}"`,
       );
     }
-    const initializedAgent = await initializeAgent(
+    const initializedAgent = await initializeAgentFn(
       {
         req: safeReq,
         res: safeRes,
@@ -3788,6 +4014,17 @@ async function executeCortexOnce({
      * direct-provider author.
      * === VIVENTIUM END === */
     harnessInvocationReq = Object.create(safeReq);
+    // Trust is request-bound in WeakMaps; inheriting Express properties does not copy it.
+    const interactionContext = getTrustedInteractionContext(safeReq);
+    if (interactionContext) {
+      setTrustedInteractionContext(
+        harnessInvocationReq,
+        interactionContext,
+        getTrustedAdapterCapabilities(safeReq) || undefined,
+        getTrustedDeliveryPolicy(safeReq) || undefined,
+      );
+    }
+    harnessInvocationReq._viventiumCortexToolEvidence = toolEvidence;
     harnessInvocationReq._viventiumHarnessExecutionEnabled =
       cortexCapability?.workspace_binding === true;
     harnessInvocationReq._viventiumHarnessInvocationStarted = false;
@@ -3814,12 +4051,23 @@ async function executeCortexOnce({
     const scopedMessages = filteredMessages;
     const inputMessages =
       Array.isArray(scopedMessages) && scopedMessages.length > 0
-        ? scopedMessages
+        ? [...scopedMessages]
         : [
             new (require('@librechat/agents/langchain/messages').HumanMessage)(
               lastUserMessage || 'Analyze the latest conversation and respond.',
             ),
           ];
+    /* === VIVENTIUM START ===
+     * Keep the conversation as evidence and the specialist assignment as the current invocation.
+     * Compact internal workers already receive an explicit task from their owning caller.
+     * === VIVENTIUM END === */
+    if (!minimalContext) {
+      inputMessages.push(
+        new (require('@librechat/agents/langchain/messages').HumanMessage)(
+          getRequiredPromptText('cortex.execution_subject'),
+        ),
+      );
+    }
 
     /* === VIVENTIUM START ===
      * Root-cause fix: apply strict-provider sanitization on background inputs.
@@ -3852,7 +4100,6 @@ async function executeCortexOnce({
         authClass: initializedAgent.userMCPAuthMap ? 'connected_account_runtime' : 'user_runtime',
         layers: {
           cortex_instructions: initializedAgent.instructions || agentForRun.instructions || '',
-          productivity_runtime_instructions: productivityRuntimeInstructions || '',
           time_context: timeContextInstructions || '',
           file_context: fileContextBlock || '',
           memory_context: memoryContextBlock || '',
@@ -3867,7 +4114,6 @@ async function executeCortexOnce({
         flags: {
           voice_mode: voiceMode,
           input_mode: inputMode,
-          productivity_context_isolated: isolateProductivityContext,
           has_request_files: hasRequestFiles,
           no_response_injected: !!noResponseInstructions,
           feeling_state_injected: !!backgroundFeelingTail,
@@ -3902,12 +4148,21 @@ async function executeCortexOnce({
       conversationId,
       idempotencyKey: cortexIdempotencyKey,
     });
+    cortexCancellationReq = harnessInvocationReq;
+    cortexCancellationReq.body = cortexRequestBody;
+    cortexCancellationReq.user = safeReq.user;
+    cortexCancellationReq.config = safeReq.config;
+    cortexCancellationReq._viventiumHarnessIdempotencyKeys = new Set();
+    cortexCancellationReq._viventiumHarnessCancellationBoundBaseURLs = new Set();
+    cortexCancellationReq._viventiumHarnessCancellationActiveBaseURL = '';
     await prepareCortexConversationProviderCapability({
       targetAgent: initializedAgent,
       declaredAgent: agentForRun,
-      req: safeReq,
+      req: harnessInvocationReq,
       capability: cortexCapability,
       requestBody: cortexRequestBody,
+      signal: abortController.signal,
+      cancellationReq: cortexCancellationReq,
     });
     const disableStreaming = cortexProvider === 'anthropic';
     const runOptions = {
@@ -3926,7 +4181,7 @@ async function executeCortexOnce({
       runOptions.streamUsage = false;
     }
     executionStage = 'create_run';
-    const run = await createRun(runOptions);
+    const run = await createRunFn(runOptions);
     /* === VIVENTIUM NOTE === */
 
     if (!run) {
@@ -3967,32 +4222,9 @@ async function executeCortexOnce({
     executionStage = 'postprocess';
     const duration = Date.now() - startTime;
 
-    const aggregatedText = contentParts
-      .filter((part) => part?.type === 'text')
-      .map((part) => part.text || '')
-      .join('');
-
-    let insight = aggregatedText.trim();
-    if (!insight) {
-      if (typeof content === 'string') {
-        insight = content;
-      } else if (Array.isArray(content)) {
-        insight = content
-          .filter((part) => part.type === 'text')
-          .map((part) => part.text)
-          .join('');
-      } else if (content?.text) {
-        insight = content.text;
-      }
-    }
-    /* === VIVENTIUM NOTE ===
-     * Feature: Prefer user-facing summaries when cortex outputs structured JSON.
-     */
-    const extractedInsight = extractUserFacingInsight(insight);
-    if (extractedInsight) {
-      insight = extractedInsight;
-    }
-    /* === VIVENTIUM NOTE === */
+    let insight = normalizeCortexInsight(extractCompletedCortexGraphInsight({
+      completedContent: content, streamedContentParts: contentParts,
+    }), insightMode);
 
     /* === VIVENTIUM NOTE ===
      * Feature: No Response Tag ({NTA}) suppression for cortex insights.
@@ -4006,15 +4238,12 @@ async function executeCortexOnce({
     }
     /* === VIVENTIUM NOTE === */
 
-    if (isolateProductivityContext && toolExecutionState.completed === 0) {
+    const missingDeclaredEvidence = insight.trim() && !toolEvidence.isSatisfied();
+    if (missingDeclaredEvidence) {
       logger.warn(
-        insight.trim()
-          ? `[BackgroundCortexService] Suppressing unverified productivity insight for ${agent.id}; ` +
-              'no live tools completed in this run'
-          : `[BackgroundCortexService] Productivity cortex ${agent.id} completed without live tool evidence`,
+        `[BackgroundCortexService] Suppressing insight for ${agent.id}; declared retrieval receipt is missing`,
         {
           agentId: agent.id,
-          latestUserTextHash: hashString(latestUserText, 12),
           configuredTools: configuredToolCount,
           completedToolCalls: toolExecutionState.completed || 0,
         },
@@ -4023,8 +4252,8 @@ async function executeCortexOnce({
         agentId: agent.id,
         agentName: agent.name || agent.id,
         insight: null,
-        error: 'no_live_tool_execution',
-        errorClass: 'no_live_tool_execution',
+        error: 'missing_required_evidence',
+        errorClass: 'missing_required_evidence',
         activationScope,
         configuredTools: configuredToolCount,
         completedToolCalls: toolExecutionState.completed || 0,
@@ -4054,23 +4283,42 @@ async function executeCortexOnce({
       };
     }
 
-    logger.info(
-      `[BackgroundCortexService] Cortex ${agent.name || agent.id} executed in ${duration}ms ` +
-        `(configured_tools: ${configuredToolCount}, completed_tool_calls: ${toolExecutionState.completed})`,
-    );
-
-    return {
+    const cortexResult = {
       agentId: agent.id,
       agentName: agent.name || agent.id,
-      insight: insight.trim(),
+      insight,
       activationScope,
       configuredTools: configuredToolCount,
       completedToolCalls: toolExecutionState.completed || 0,
       harnessInvocationStarted: harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
     };
+    executionStage = 'completed_result_acceptance';
+    return await finalizeCortexResultDelivery(cortexResult, {
+      completedResultPolicy,
+      persist: () => persistCompletedInsightFn({
+        req: safeReq, conversationId: resolvedConversationId, parentMessageId: runId,
+        agent, insight, surface,
+      }),
+    });
   } catch (error) {
+    if (executionStage === 'completed_result_acceptance') {
+      throw markCompletedResultProgrammingDefect(error);
+    }
     const isAborted = abortController?.signal?.aborted === true || error?.name === 'AbortError';
-    let publicError = publicCortexError(error, isAborted ? 'timeout' : '');
+    /* === VIVENTIUM START ===
+     * Fix: An aborted run is a `timeout` only when this run's own execution deadline fired. An
+     * intentional owner cancellation (`user_cancelled` / `maintenance_yield`) has no dedicated
+     * public class, so it keeps the generic `background_agent_error` class; any other abort is
+     * classified from its own error text.
+     * === VIVENTIUM END === */
+    const abortedByOwnerCancellation =
+      isAborted && isBackgroundCortexCancellationSignal(abortController?.signal);
+    let publicError = abortedByOwnerCancellation
+      ? {
+          errorClass: 'background_agent_error',
+          message: PUBLIC_CORTEX_ERROR_MESSAGES.background_agent_error,
+        }
+      : publicCortexError(error, deadlineTimerFired ? 'timeout' : '');
     const providerRouteStage = executionStage === 'create_run' || executionStage === 'stream';
     if (
       !isAborted &&
@@ -4110,27 +4358,204 @@ async function executeCortexOnce({
       harnessInvocationStarted: harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
     };
   } finally {
+    if (abortController?.signal.aborted && typeof onHarnessCancellationOutcome === 'function') {
+      const deliveryPromise = cortexCancellationReq?._viventiumHarnessCancellationDeliveryPromise;
+      if (deliveryPromise) {
+        const outcome = await deliveryPromise;
+        onHarnessCancellationOutcome(outcome);
+      } else {
+        const cancellationWasExpected =
+          cortexCancellationReq?._viventiumHarnessExecutionEnabled === true &&
+          Boolean(String(cortexCancellationReq?._viventiumHarnessIdempotencyKey || '').trim());
+        onHarnessCancellationOutcome({ acknowledged: !cancellationWasExpected });
+      }
+    }
     if (abortTimer) {
       clearTimeout(abortTimer);
     }
     removeExternalAbortListener?.();
+    toolEvidence?.close();
   }
+}
+
+async function persistCompletedCortexGraphInsight(
+  { req, conversationId, parentMessageId, agent, insight, surface },
+  {
+    recordBatch = recordCompletedCortexInsightDeliveryBatch,
+    enqueueOutbox = enqueueCompletedCortexInsightOutboxBatch,
+    settleOutbox = settleCompletedCortexInsightOutboxBatch,
+  } = {},
+) {
+  const exactInsight = insight == null ? '' : String(insight);
+  if (!exactInsight.trim()) return { deliveries: [] };
+  const exactGraphResultHashes = [crypto.createHash('sha256').update(exactInsight).digest('hex')];
+  const acceptanceUnavailableError = () => {
+    const error = new Error('Completed cortex insight has no private durable acceptance path');
+    error.code = 'cortex_insight_delivery_acceptance_unavailable';
+    error.retryable = true;
+    error.graphResultHashes = exactGraphResultHashes;
+    return error;
+  };
+  let batch;
+  let expectedDeliveries;
+  try {
+    const ownerId = req?.user?.id;
+    const hasRequiredIdentity = [ownerId, conversationId, parentMessageId].every(
+      (value) => value != null && String(value).trim().length > 0,
+    );
+    if (!hasRequiredIdentity) {
+      const error = new Error('Cortex insight delivery identity is incomplete');
+      error.code = 'cortex_insight_delivery_identity_invalid';
+      throw error;
+    }
+    const feelingSnapshot = normalizeCortexFeelingSnapshot(req?._viventiumFeelingSnapshot);
+    batch = {
+      ownerId,
+      conversationId,
+      parentMessageId,
+      surface: surface || resolveViventiumSurface(req),
+      streamId: req?.body?.streamId || req?._resumableStreamId || '',
+      messageRevision: Math.max(
+        1,
+        Number(
+          getTrustedInteractionContext(req)?.revision || req?.body?.viventiumLogicalTurnRevision,
+        ) || 1,
+      ),
+      ...(feelingSnapshot ? { feelingSnapshot } : {}),
+      insights: [
+        {
+          cortexId: agent?.id,
+          cortexName: agent?.name || agent?.id,
+          insight: exactInsight,
+          status: 'completed',
+        },
+      ],
+    };
+    expectedDeliveries = buildCortexInsightDeliveryCandidates(batch);
+  } catch (error) {
+    if (
+      error?.code === 'cortex_feeling_snapshot_invalid' ||
+      error?.code === 'cortex_insight_delivery_identity_invalid'
+    ) {
+      throw acceptanceUnavailableError();
+    }
+    throw error;
+  }
+  const graphResultHashes = expectedDeliveries.map((delivery) => delivery.graphResultHash);
+  const expectedOutboxKeys = expectedDeliveries.map((delivery) => delivery.deliveryKey);
+  const requireExactOutboxAcceptance = (receipt) => {
+    const outboxKeys = Array.isArray(receipt?.outboxKeys) ? receipt.outboxKeys : [];
+    const accepted =
+      expectedOutboxKeys.length > 0 &&
+      new Set(expectedOutboxKeys).size === expectedOutboxKeys.length &&
+      expectedOutboxKeys.every((key) => typeof key === 'string' && key.trim().length > 0) &&
+      outboxKeys.length === expectedOutboxKeys.length &&
+      new Set(outboxKeys).size === outboxKeys.length &&
+      outboxKeys.every((key) => typeof key === 'string' && key.trim().length > 0) &&
+      expectedOutboxKeys.every((key) => outboxKeys.includes(key));
+    if (!accepted) {
+      const error = new Error('Completed cortex insight outbox acceptance is incomplete');
+      error.code = 'cortex_insight_outbox_acceptance_conflict';
+      throw error;
+    }
+    return { ...receipt, outboxKeys };
+  };
+  let outboxOutcome;
+  try {
+    outboxOutcome = {
+      status: 'fulfilled',
+      value: requireExactOutboxAcceptance(await enqueueOutbox(batch)),
+    };
+  } catch (error) {
+    outboxOutcome = { status: 'rejected', reason: error };
+  }
+  let ledgerOutcome;
+  try {
+    ledgerOutcome = { status: 'fulfilled', value: await recordBatch(batch) };
+  } catch (error) {
+    ledgerOutcome = { status: 'rejected', reason: error };
+  }
+  const outbox = outboxOutcome.status === 'fulfilled' ? outboxOutcome.value : { outboxKeys: [] };
+  let recorded = null;
+  let ledgerError = ledgerOutcome.status === 'rejected' ? ledgerOutcome.reason : null;
+  if (ledgerOutcome.status === 'fulfilled') {
+    try {
+      recorded = ledgerOutcome.value;
+      requireExactCortexInsightDeliveryAcceptance(expectedDeliveries, recorded);
+    } catch (error) {
+      ledgerError = error;
+      recorded = null;
+    }
+  }
+
+  const errorCode = (error, fallback) =>
+    String(error?.code || error?.name || fallback).slice(0, 120);
+
+  if (recorded) {
+    if (outboxOutcome.status === 'rejected') {
+      return {
+        ...recorded,
+        durableAcceptance: 'ledger',
+        outboxPending: false,
+        outboxKeys: [],
+        outboxErrorCode: errorCode(outboxOutcome.reason, 'outbox_write_failed'),
+      };
+    }
+    try {
+      await settleOutbox({ outboxKeys: outbox.outboxKeys });
+      return {
+        ...recorded,
+        durableAcceptance: 'ledger',
+        outboxPending: false,
+        outboxKeys: outbox.outboxKeys,
+      };
+    } catch (error) {
+      logger.warn('[BackgroundCortexService] Completed insight outbox cleanup remains pending', {
+        code: errorCode(error, 'outbox_cleanup_failed'),
+      });
+      return {
+        ...recorded,
+        durableAcceptance: 'ledger',
+        outboxPending: true,
+        outboxKeys: outbox.outboxKeys,
+      };
+    }
+  }
+
+  if (outboxOutcome.status === 'fulfilled') {
+    logger.warn('[BackgroundCortexService] Completed insight ledger write deferred to outbox', {
+      code: errorCode(ledgerError, 'delivery_ledger_write_failed'),
+    });
+    return {
+      deliveries: [],
+      durableAcceptance: 'outbox',
+      deliveryPending: true,
+      outboxPending: true,
+      outboxKeys: outbox.outboxKeys,
+      outboxErrorCode: errorCode(ledgerError, 'cortex_insight_delivery_ledger_write_failed'),
+      graphResultHashes,
+    };
+  }
+
+  throw acceptanceUnavailableError();
 }
 
 /* === VIVENTIUM START ===
  * Feature: Shared direct-cortex fallback execution.
  * Purpose: Direct callers, including the detached Emotional Reaction Cortex, must use the same
  * declared provider/model recovery route as batched activated cortices.
+ * Fix: Only an intentional owner cancellation skips the fallback; `generation_completed` is
+ * Main-response cleanup and must not strand a detached cortex on its failed primary route.
  * === VIVENTIUM END === */
-async function executeCortex(params) {
+async function executeCortex(params, { executeOnce = executeCortexOnce } = {}) {
   const primaryAgent = params?.agent;
-  const primaryResult = await executeCortexOnce(params);
+  const primaryResult = await executeOnce(params);
   const ownerSignal = params?.signal || params?.req?._viventiumVoiceAbortSignal;
   if (
-    ownerSignal?.aborted === true ||
+    isBackgroundCortexCancellationSignal(ownerSignal) ||
     !resolveFallbackAssignment(primaryAgent) ||
     primaryResult?.harnessInvocationStarted === true ||
-    !shouldRetryBackgroundCortexWithFallback(primaryResult)
+    !shouldRetryCortexResultWithFallback(primaryResult)
   ) {
     return primaryResult;
   }
@@ -4161,7 +4586,7 @@ async function executeCortex(params) {
       `retrying fallback ${fallbackProvider}/${fallbackModel}`,
   );
 
-  const fallbackResult = await executeCortexOnce({
+  const fallbackResult = await executeOnce({
     ...params,
     agent: fallbackAgent,
   });
@@ -4550,6 +4975,7 @@ async function detectActivations({
       cortexName: r.cortexName || r.agentId,
       cortexDescription: r.cortexDescription || '',
       activationScope: r.activationScope || null,
+      resultEvidence: cortexConfigById.get(r.agentId)?.result_evidence || null,
       directActionSurfaces: Array.isArray(r.directActionSurfaces) ? r.directActionSurfaces : [],
       directActionSurfaceScopes: normalizeDirectActionSurfaceScopes(r.directActionSurfaceScopes),
       confidence: r.confidence,
@@ -4718,7 +5144,12 @@ async function executeActivated({
 
   const executionTimeoutMs = getCortexExecutionTimeoutMs();
   const ownerSignal = req?._viventiumVoiceAbortSignal || null;
-  if (ownerSignal?.aborted) {
+  /* === VIVENTIUM START ===
+   * Fix: Only an intentional cancellation (`user_cancelled` / `maintenance_yield`) cancels detached
+   * Phase B. `generation_completed` is Main-response cleanup and must not skip, silence, or discard
+   * cortex work that outlives the main turn. Every owner-signal gate below uses the same predicate.
+   * === VIVENTIUM END === */
+  if (isBackgroundCortexCancellationSignal(ownerSignal)) {
     return { insights: [], cancelled: true };
   }
   let modelsConfigPromise = null;
@@ -4743,6 +5174,7 @@ async function executeActivated({
       req,
       res,
       activationScope: activationResult.activationScope || null,
+      resultEvidence: activationResult.resultEvidence || null,
       signal: ownerSignal,
     });
     const guardTimeoutMs = getCortexAttemptGuardTimeoutMs(executionTimeoutMs);
@@ -4802,7 +5234,7 @@ async function executeActivated({
       }
 
       // Notify UI that cortex is brewing
-      if (onCortexBrewing && !ownerSignal?.aborted) {
+      if (onCortexBrewing && !isBackgroundCortexCancellationSignal(ownerSignal)) {
         try {
           onCortexBrewing({
             cortex_id: activationResult.agentId,
@@ -4871,6 +5303,7 @@ async function executeActivated({
       try {
         result = await runCortexWithGuard({ agent: cortexAgent, activationResult });
       } catch (error) {
+        if (isCompletedResultProgrammingDefect(error)) throw error;
         const publicError = publicCortexError(error);
         logger.error(
           `[BackgroundCortexService] Cortex execution failed for ${activationResult.agentId} ` +
@@ -4893,10 +5326,10 @@ async function executeActivated({
       }
       if (
         fallbackAgent &&
-        !ownerSignal?.aborted &&
+        !isBackgroundCortexCancellationSignal(ownerSignal) &&
         result?.fallbackUsed !== true &&
         result?.harnessInvocationStarted !== true &&
-        shouldRetryBackgroundCortexWithFallback(result)
+        shouldRetryCortexResultWithFallback(result)
       ) {
         const primaryProvider = cortexAgent.provider || 'unknown';
         const primaryModel = cortexAgent.model || cortexAgent.model_parameters?.model || 'unknown';
@@ -4934,7 +5367,11 @@ async function executeActivated({
       const completionPayload = buildCortexCompletionPayload(
         buildCompletionInputFromActivation({ activationResult, cortexAgent, result }),
       );
-      if (completionPayload && onCortexComplete && !ownerSignal?.aborted) {
+      if (
+        completionPayload &&
+        onCortexComplete &&
+        !isBackgroundCortexCancellationSignal(ownerSignal)
+      ) {
         try {
           onCortexComplete(completionPayload);
         } catch (e) {
@@ -4947,6 +5384,7 @@ async function executeActivated({
 
       return result;
     } catch (error) {
+      if (isCompletedResultProgrammingDefect(error)) throw error;
       const rawError = error?.message || 'Cortex execution failed';
       const publicError = publicCortexError(error || rawError);
       logger.error(
@@ -4959,7 +5397,7 @@ async function executeActivated({
       );
 
       // Notify UI of error so it doesn't stay stuck on "Analyzing..."
-      if (onCortexComplete && !ownerSignal?.aborted) {
+      if (onCortexComplete && !isBackgroundCortexCancellationSignal(ownerSignal)) {
         try {
           onCortexComplete(
             buildCortexCompletionPayload(
@@ -4995,9 +5433,12 @@ async function executeActivated({
    * downstream code stays unchanged.
    */
   const settledResults = await Promise.allSettled(executionPromises);
-  if (ownerSignal?.aborted) {
+  if (isBackgroundCortexCancellationSignal(ownerSignal)) {
     return { insights: [], cancelled: true };
   }
+  const completedResultDefect = settledResults.find((item) =>
+    item.status === 'rejected' && isCompletedResultProgrammingDefect(item.reason));
+  if (completedResultDefect) throw completedResultDefect.reason;
   const executionResults = settledResults.map((s) => {
     if (s.status === 'fulfilled') {
       return s.value;
@@ -5019,7 +5460,7 @@ async function executeActivated({
 
   // Collect and merge insights
   const insights = executionResults
-    .filter((r) => r && hasVisibleCortexInsight(r.insight))
+    .filter(isDeliverableCortexResult)
     .map((r) => ({
       cortexId: r.agentId,
       cortexName: sanitizeCortexDisplayName(r.agentName),
@@ -5181,7 +5622,7 @@ async function processBackgroundCortices({
         mainAgent,
       });
       // Attach the name to the result for later use
-      return { ...result, cortexName };
+      return { ...result, cortexName, resultEvidence: cortexConfig.result_evidence || null };
     } catch (error) {
       logger.error(
         `[BackgroundCortexService] Failed to check activation for ${cortexConfig.agent_id}`,
@@ -5288,6 +5729,7 @@ async function processBackgroundCortices({
         runId,
         req,
         activationScope: activationResult.activationScope || null,
+        resultEvidence: activationResult.resultEvidence || null,
       });
 
       const completionPayload = buildCortexCompletionPayload(
@@ -5306,6 +5748,7 @@ async function processBackgroundCortices({
 
       return result;
     } catch (error) {
+      if (isCompletedResultProgrammingDefect(error)) throw error;
       const rawError = error?.message || 'Cortex execution failed';
       const publicError = publicCortexError(rawError);
       logger.error(
@@ -5342,11 +5785,14 @@ async function processBackgroundCortices({
 
   /* === VIVENTIUM NOTE === Promise.allSettled for defensive safety (mirrors executeActivated) */
   const settledResults = await Promise.allSettled(executionPromises);
+  const completedResultDefect = settledResults.find((item) =>
+    item.status === 'rejected' && isCompletedResultProgrammingDefect(item.reason));
+  if (completedResultDefect) throw completedResultDefect.reason;
   const executionResults = settledResults.map((s) => (s.status === 'fulfilled' ? s.value : null));
 
   // Filter out failed executions and null insights
   const insights = executionResults
-    .filter((r) => r && hasVisibleCortexInsight(r.insight))
+    .filter(isDeliverableCortexResult)
     .map((r) => ({
       cortexId: r.agentId,
       cortexName: sanitizeCortexDisplayName(r.agentName),
@@ -5407,6 +5853,11 @@ Consider these insights in your response, but do not explicitly mention them unl
 }
 
 module.exports = {
+  executeCortexOnce, extractCompletedCortexGraphInsight, normalizeCortexInsight,
+  failClosedCortexResult,
+  isDeliverableCortexResult, collectDeliverableCortexInsights,
+  finalizeCortexResultDelivery, shouldRetryCortexResultWithFallback,
+  persistCompletedCortexGraphInsight,
   sanitizeCortexDisplayName,
   mapProvider,
   getCustomEndpointConfig,
@@ -5457,6 +5908,8 @@ module.exports = {
   ACTIVATION_SYSTEM_PROMPT,
   DEFAULT_ACTIVATION_DECISION_SUBJECT_RULE,
   // Exported for unit testing only
+  extractCortexErrorCode,
+  classifyCortexPublicError,
   createBackgroundRes,
   memoryReadUnavailableContext,
   buildCortexRequestBody,

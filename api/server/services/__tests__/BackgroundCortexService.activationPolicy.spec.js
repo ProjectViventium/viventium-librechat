@@ -1,4 +1,6 @@
 const {
+  extractCortexErrorCode,
+  classifyCortexPublicError,
   buildActivationPolicySection,
   applyActivationJsonMode,
   ACTIVATION_SYSTEM_PROMPT,
@@ -1348,5 +1350,27 @@ describe('BackgroundCortexService activation policy helpers', () => {
         reasoning_effort: 'high',
       },
     });
+  });
+});
+
+describe('native structured cortex failures', () => {
+  test.each([
+    [503, 'host_capacity', 'host_capacity'],
+    [401, 'invalid_api_key', 'provider_unauthorized'],
+    [403, 'permission_denied', 'provider_access_denied'],
+    [400, 'invalid_request', 'provider_request_rejected'],
+    [503, 'service_unavailable', 'provider_unavailable'],
+  ])('keeps native status %s and code %s distinct', (status, code, expectedClass) => {
+    const error = { status, error: { detail: { code, message: 'Structured failure.' } } };
+    expect(extractCortexErrorCode(error)).toBe(code);
+    expect(classifyCortexPublicError(error)).toBe(expectedClass);
+  });
+  test('prefers native detail code to a generic transport wrapper', () => {
+    expect(
+      extractCortexErrorCode({
+        code: 'ERR_BAD_RESPONSE',
+        response: { data: { detail: { code: 'host_capacity' } } },
+      }),
+    ).toBe('host_capacity');
   });
 });

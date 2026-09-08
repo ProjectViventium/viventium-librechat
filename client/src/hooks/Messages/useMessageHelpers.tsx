@@ -1,6 +1,7 @@
-import { useEffect, useRef, useCallback, useMemo } from 'react';
+import { useEffect, useRef, useCallback, useMemo, useContext } from 'react';
 import throttle from 'lodash/throttle';
 import { Constants, isAssistantsEndpoint, isAgentsEndpoint } from 'librechat-data-provider';
+import { MessageInputBranchContext } from '~/Providers/MessageContext';
 import type { TMessageProps } from '~/common';
 import { useMessagesViewContext, useAssistantsMapContext, useAgentsMapContext } from '~/Providers';
 import { getTextKey, TEXT_KEY_DIVIDER, logger } from '~/utils';
@@ -9,6 +10,7 @@ import { useGetAddedConvo } from '~/hooks/Chat';
 
 export default function useMessageHelpers(props: TMessageProps) {
   const latestText = useRef<string | number>('');
+  const ownsInput = useContext(MessageInputBranchContext);
   const { message, currentEditId, setCurrentEditId } = props;
 
   const {
@@ -32,6 +34,10 @@ export default function useMessageHelpers(props: TMessageProps) {
   const isLast = children?.length === 0 || children?.length === undefined;
 
   useEffect(() => {
+    if (!ownsInput) {
+      latestText.current = '';
+      return;
+    }
     const convoId = conversation?.conversationId;
     if (convoId === Constants.NEW_CONVO) {
       return;
@@ -74,7 +80,7 @@ export default function useMessageHelpers(props: TMessageProps) {
     } else {
       logger.log('latest_message', 'No change in latest message', logInfo);
     }
-  }, [isLast, message, setLatestMessage, conversation?.conversationId]);
+  }, [ownsInput, isLast, message, setLatestMessage, conversation?.conversationId]);
 
   const enterEdit = useCallback(
     (cancel?: boolean) => setCurrentEditId && setCurrentEditId(cancel === true ? -1 : messageId),

@@ -2,7 +2,13 @@ const multer = require('multer');
 const express = require('express');
 const { sleep } = require('@librechat/agents');
 const { isEnabled } = require('@librechat/api');
-const { logger } = require('@librechat/data-schemas');
+/* === VIVENTIUM START === Shared title-only conditional persistence. === */
+const {
+  logger,
+  saveUserConversationTitle,
+  saveGeneratedConversationTitle,
+} = require('@librechat/data-schemas');
+/* === VIVENTIUM END === */
 const { CacheKeys, EModelEndpoint } = require('librechat-data-provider');
 const {
   createImportLimiters,
@@ -12,6 +18,9 @@ const {
 } = require('~/server/middleware');
 const { getConvosByCursor, deleteConvos, getConvo, saveConvo } = require('~/models/Conversation');
 const { getMessages } = require('~/models/Message');
+/* === VIVENTIUM START === Recover titles without overwriting a concurrent user rename. === */
+const { Conversation } = require('~/db/models');
+/* === VIVENTIUM END === */
 const { forkConversation, duplicateConversation } = require('~/server/utils/import/fork');
 const { storage, importFileFilter } = require('~/server/routes/files/multer');
 const { deleteAllSharedLinks, deleteConvoSharedLink } = require('~/models');
@@ -88,47 +97,41 @@ router.get('/gen_title/:conversationId', async (req, res) => {
     }
   }
 
-  if (!title) {
-    try {
-      const convo = await getConvo(req.user.id, conversationId);
-      if (convo?.title && convo.title !== 'New Chat') {
-        title = convo.title;
-      }
+  /* === VIVENTIUM START === Persisted owner state takes precedence over the generated cache. === */
+  try {
+    const convo = await getConvo(req.user.id, conversationId, 'title +titleSetByUser');
+    if (!convo) {
+      title = undefined;
+    } else if (convo.titleSetByUser === true || (convo.title && convo.title !== 'New Chat')) {
+      title = convo.title;
+    } else if (!title) {
+      const messages = await getMessages(
+        { conversationId, user: req.user.id },
+        'text sender isCreatedByUser',
+      );
+      const seedMessage = messages.find(
+        (message) =>
+          typeof message?.text === 'string' &&
+          message.text.trim() &&
+          (message.isCreatedByUser === true || message.sender === 'User'),
+      );
 
-      if (!title) {
-        const messages = await getMessages(
-          { conversationId, user: req.user.id },
-          'text sender isCreatedByUser',
+      if (seedMessage?.text) {
+        title = await saveGeneratedConversationTitle(
+          Conversation,
+          req.user.id,
+          conversationId,
+          buildFallbackTitle(seedMessage.text),
         );
-        const seedMessage = messages.find(
-          (message) =>
-            typeof message?.text === 'string' &&
-            message.text.trim() &&
-            (message.isCreatedByUser === true || message.sender === 'User'),
-        );
-
-        if (seedMessage?.text) {
-          title = buildFallbackTitle(seedMessage.text);
-          await titleCache.set(key, title, 120000);
-
-          if (!convo?.title || convo.title === 'New Chat') {
-            await saveConvo(
-              req,
-              {
-                conversationId,
-                title,
-              },
-              { context: 'api/server/routes/convos.js gen_title fallback' },
-            );
-          }
-        }
       }
-    } catch (error) {
-      logger.warn('[convos/gen_title] Failed to synthesize fallback title', error);
     }
+  } catch (error) {
+    logger.warn('[convos/gen_title] Failed to synthesize fallback title', error);
+    return res.status(500).json({ message: 'Unable to read conversation title' });
   }
+  /* === VIVENTIUM END === */
 
-  if (title) {
+  if (typeof title === 'string') {
     await titleCache.delete(key);
     res.status(200).json({ title });
   } else {
@@ -253,12 +256,18 @@ router.post('/update', validateConvoAccess, async (req, res) => {
   const sanitizedTitle = title.trim().slice(0, MAX_CONVO_TITLE_LENGTH);
 
   try {
-    const dbResponse = await saveConvo(
-      req,
-      { conversationId, title: sanitizedTitle },
-      { context: `POST /api/convos/update ${conversationId}` },
+    /* === VIVENTIUM START === Explicit title authority is one owner-scoped, title-only write. === */
+    const dbResponse = await saveUserConversationTitle(
+      Conversation,
+      req.user.id,
+      conversationId,
+      sanitizedTitle,
     );
-    res.status(201).json(dbResponse);
+    if (!dbResponse) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    res.status(201).json(dbResponse.toObject());
+    /* === VIVENTIUM END === */
   } catch (error) {
     logger.error('Error updating conversation', error);
     res.status(500).send('Error updating conversation');

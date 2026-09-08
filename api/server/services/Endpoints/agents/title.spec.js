@@ -4,6 +4,7 @@ jest.mock('@librechat/api', () => ({
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
+  saveGeneratedConversationTitle: jest.fn(async (_model, _user, _conversationId, title) => title),
   logger: {
     debug: jest.fn(),
     warn: jest.fn(),
@@ -15,9 +16,7 @@ const mockRecordVoiceOrchestrationTraceBestEffort = jest.fn();
 const mockGetTrustedInteractionContext = jest.fn();
 
 jest.mock('~/cache/getLogStores', () => jest.fn(() => ({ set: mockSet })));
-jest.mock('~/models', () => ({
-  saveConvo: jest.fn(),
-}));
+jest.mock('~/db/models', () => ({ Conversation: {} }));
 jest.mock('~/server/services/viventium/interactionContext', () => ({
   getTrustedInteractionContext: (...args) => mockGetTrustedInteractionContext(...args),
 }));
@@ -28,13 +27,50 @@ jest.mock('~/server/services/viventium/VoiceOrchestrationTraceService', () => ({
 
 const addTitle = require('./title');
 const getLogStores = require('~/cache/getLogStores');
-const { saveConvo } = require('~/models');
+const { saveGeneratedConversationTitle } = require('@librechat/data-schemas');
+const { Conversation } = require('~/db/models');
+const { isEnabled } = require('@librechat/api');
 
 describe('agents addTitle', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetTrustedInteractionContext.mockReturnValue(null);
     mockRecordVoiceOrchestrationTraceBestEffort.mockResolvedValue({ sequence: 1 });
+  });
+
+  it.each([
+    { gate: 'disabled globally', enabled: false, options: {}, body: {} },
+    { gate: 'disabled on the client', enabled: true, options: { titleConvo: false }, body: {} },
+    { gate: 'temporary conversation', enabled: true, options: {}, body: { isTemporary: true } },
+  ])('does no title work for $gate', async ({ enabled, options, body }) => {
+    isEnabled.mockReturnValueOnce(enabled);
+    const titleConvo = jest.fn();
+    await addTitle(
+      { user: { id: 'owner' }, body },
+      {
+        text: 'Question',
+        response: { conversationId: 'conversation' },
+        client: { options, titleConvo },
+      },
+    );
+    expect(titleConvo).not.toHaveBeenCalled();
+    expect(saveGeneratedConversationTitle).not.toHaveBeenCalled();
+    expect(mockSet).not.toHaveBeenCalled();
+  });
+
+  it('does not cache a title when durable persistence fails', async () => {
+    saveGeneratedConversationTitle.mockRejectedValueOnce(new Error('Database unavailable'));
+    await expect(
+      addTitle(
+        { user: { id: 'owner' }, body: {} },
+        {
+          text: 'Question',
+          response: { conversationId: 'conversation' },
+          client: { options: {}, titleConvo: jest.fn().mockResolvedValue('Generated title') },
+        },
+      ),
+    ).rejects.toThrow('Database unavailable');
+    expect(mockSet).not.toHaveBeenCalled();
   });
 
   it('records a real generated title for the exact Voice turn without title text', async () => {
@@ -91,13 +127,11 @@ describe('agents addTitle', () => {
 
     expect(getLogStores).toHaveBeenCalled();
     expect(mockSet).toHaveBeenCalledWith('user-1-convo-1', 'check my ms365 inbox', 120000);
-    expect(saveConvo).toHaveBeenCalledWith(
-      req,
-      {
-        conversationId: 'convo-1',
-        title: 'check my ms365 inbox',
-      },
-      { context: 'api/server/services/Endpoints/agents/title.js' },
+    expect(saveGeneratedConversationTitle).toHaveBeenCalledWith(
+      Conversation,
+      'user-1',
+      'convo-1',
+      'check my ms365 inbox',
     );
     expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });
@@ -123,13 +157,11 @@ describe('agents addTitle', () => {
       'this is a deliberately long title see...',
       120000,
     );
-    expect(saveConvo).toHaveBeenCalledWith(
-      req,
-      {
-        conversationId: 'convo-2',
-        title: 'this is a deliberately long title see...',
-      },
-      { context: 'api/server/services/Endpoints/agents/title.js', noUpsert: true },
+    expect(saveGeneratedConversationTitle).toHaveBeenCalledWith(
+      Conversation,
+      'user-2',
+      'convo-2',
+      'this is a deliberately long title see...',
     );
     expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });

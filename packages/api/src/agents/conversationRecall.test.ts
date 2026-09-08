@@ -9,6 +9,7 @@ import {
   buildConversationRecallAttachmentFiles,
   ensureConversationRecallTool,
   getConversationRecallRuntimeScope,
+  resolveConversationRecallPreference,
   mergeConversationRecallResources,
 } from './conversationRecall';
 
@@ -71,6 +72,58 @@ describe('conversationRecall runtime helpers', () => {
       });
 
       expect(scope).toBe('none');
+    });
+  });
+
+  describe('resolveConversationRecallPreference', () => {
+    it('follows the installer default when the account never chose', () => {
+      expect(
+        resolveConversationRecallPreference(
+          { personalization: {} },
+          { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: 'true' },
+        ),
+      ).toBe(true);
+      expect(
+        resolveConversationRecallPreference(
+          { personalization: {} },
+          { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: 'false' },
+        ),
+      ).toBe(false);
+      expect(resolveConversationRecallPreference(null, {})).toBe(false);
+    });
+
+    it('lets an explicit saved choice win over the installer default', () => {
+      expect(
+        resolveConversationRecallPreference(
+          { personalization: { conversation_recall: false } },
+          { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: 'true' },
+        ),
+      ).toBe(false);
+      expect(
+        resolveConversationRecallPreference(
+          { personalization: { conversation_recall: true } },
+          { VIVENTIUM_DEFAULT_CONVERSATION_RECALL: 'false' },
+        ),
+      ).toBe(true);
+    });
+
+    it('drives the runtime scope for an account without a saved choice', () => {
+      const previous = process.env.VIVENTIUM_DEFAULT_CONVERSATION_RECALL;
+      process.env.VIVENTIUM_DEFAULT_CONVERSATION_RECALL = 'true';
+      try {
+        expect(
+          getConversationRecallRuntimeScope({
+            user: { personalization: {} } as never,
+            agent: null,
+          }),
+        ).toBe('all');
+      } finally {
+        if (previous === undefined) {
+          delete process.env.VIVENTIUM_DEFAULT_CONVERSATION_RECALL;
+        } else {
+          process.env.VIVENTIUM_DEFAULT_CONVERSATION_RECALL = previous;
+        }
+      }
     });
   });
 

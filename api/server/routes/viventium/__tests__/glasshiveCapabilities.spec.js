@@ -9,6 +9,21 @@ const mockHandleToolCall = jest.fn();
 const mockToolDefinitionsForMcp = jest.fn();
 const mockGetAppConfig = jest.fn();
 const mockSharedCache = new Map();
+const mockVerifyAndConsumeAdmission = jest.fn();
+const mockAdmitCapabilityAuthorization = jest.fn();
+const mockPrepareScheduledProviderAuthorization = jest.fn();
+const mockAssertActiveCapabilityAuthorizationGrant = jest.fn();
+const mockRevokeCapabilityAuthorizationGrant = jest.fn();
+const mockResolveBrokerUrl = jest.fn();
+
+class MockCapabilityAuthorizationError extends Error {
+  constructor(code, message, { status = 409, needsInput = true } = {}) {
+    super(message);
+    this.code = code;
+    this.status = status;
+    this.needsInput = needsInput;
+  }
+}
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
@@ -50,6 +65,18 @@ jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () 
   buildDirectGlassHiveCapabilityBundle: jest.fn(),
   directCapabilityReadiness: jest.fn(),
   revokeDirectGlassHiveCapabilityGrant: jest.fn(),
+  resolveBrokerUrl: (...args) => mockResolveBrokerUrl(...args),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveCapabilityAuthorizationService', () => ({
+  assertActiveCapabilityAuthorizationGrant: (...args) =>
+    mockAssertActiveCapabilityAuthorizationGrant(...args),
+  CapabilityAuthorizationError: MockCapabilityAuthorizationError,
+  admitCapabilityAuthorization: (...args) => mockAdmitCapabilityAuthorization(...args),
+  prepareScheduledProviderAuthorization: (...args) =>
+    mockPrepareScheduledProviderAuthorization(...args),
+  revokeCapabilityAuthorizationGrant: (...args) => mockRevokeCapabilityAuthorizationGrant(...args),
+  verifyAndConsumeAdmission: (...args) => mockVerifyAndConsumeAdmission(...args),
 }));
 
 jest.mock('~/server/services/viventium/GlassHiveCapabilityDirectIssuerAuth', () => ({
@@ -128,6 +155,29 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     mockGetAppConfig.mockResolvedValue({
       webSearch: { searchProvider: 'searxng', searxngInstanceUrl: 'http://127.0.0.1:18082' },
     });
+    mockVerifyAndConsumeAdmission.mockResolvedValue(undefined);
+    mockAssertActiveCapabilityAuthorizationGrant.mockResolvedValue(undefined);
+    mockRevokeCapabilityAuthorizationGrant.mockResolvedValue(undefined);
+    mockResolveBrokerUrl.mockReturnValue(
+      'http://host.docker.internal:3180/api/viventium/glasshive/capabilities/mcp',
+    );
+    mockAdmitCapabilityAuthorization.mockResolvedValue({
+      status: 'authorized',
+      authorizationRef: 'gha_authorization_1',
+      originRef: 'ghi_origin_0001',
+      workRef: 'work_00000001',
+      workerId: 'worker_000001',
+      runId: 'run_000000001',
+      containerGenerationId: 'a'.repeat(64),
+      grantToken: 'secret-worker-bearer',
+      grant: { grantId: 'grant-1', expiresAt: 1_800_086_400 },
+    });
+    mockPrepareScheduledProviderAuthorization.mockResolvedValue({
+      authorizationRef: 'gha_scheduled_synthetic_0001',
+      scopeFingerprint: 'scope_fingerprint_synthetic_0001',
+      brokerUrl: 'http://host.docker.internal:3180/api/viventium/glasshive/capabilities/mcp',
+      maxExpiresAt: '2026-09-03T00:00:00.000Z',
+    });
   });
 
   afterAll(() => {
@@ -143,6 +193,157 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     expect(response.body.error.message).toBe('Unauthorized GlassHive capability broker request');
   });
 
+  test('rejects an admitted bearer after its exact authorization is inactive', async () => {
+    const {
+      mintBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const { token } = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      allowedServers: ['google_workspace'],
+      requestContext: {
+        conversation_id: 'conv-1',
+        message_id: 'msg-1',
+        worker_id: 'worker_000001',
+        run_id: 'run_000000001',
+        authorization_ref: 'gha_authorization_1',
+        container_generation_id: 'a'.repeat(64),
+      },
+    });
+    mockAssertActiveCapabilityAuthorizationGrant.mockRejectedValueOnce(
+      new MockCapabilityAuthorizationError(
+        'capability_grant_inactive',
+        'The mission capability grant is no longer active.',
+        { status: 401, needsInput: false },
+      ),
+    );
+
+    await request(appWithRoute())
+      .post('/api/viventium/glasshive/capabilities/mcp')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
+      .expect(401);
+
+    expect(mockAssertActiveCapabilityAuthorizationGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authorization_ref: 'gha_authorization_1',
+        container_generation_id: 'a'.repeat(64),
+      }),
+    );
+    expect(mockBuildCapabilityCatalog).not.toHaveBeenCalled();
+  });
+
+  test('admits an exact mission only after verifying the GlassHive server signature', async () => {
+    const body = {
+      authorizationRef: 'gha_authorization_1',
+      originRef: 'ghi_origin_0001',
+      workRef: 'work_00000001',
+      workerId: 'worker_000001',
+      runId: 'run_000000001',
+      containerGenerationId: 'a'.repeat(64),
+    };
+
+    const response = await request(appWithRoute())
+      .post('/api/viventium/glasshive/capabilities/admit')
+      .set('X-Viventium-GlassHive-Admission', 'v1:1800000000:nonce-0001:signature')
+      .send(body)
+      .expect(200);
+
+    expect(mockVerifyAndConsumeAdmission).toHaveBeenCalledWith({
+      body,
+      header: 'v1:1800000000:nonce-0001:signature',
+    });
+    expect(mockAdmitCapabilityAuthorization).toHaveBeenCalledWith(body);
+    expect(response.body).toMatchObject({
+      status: 'authorized',
+      grantToken: 'secret-worker-bearer',
+    });
+  });
+
+  test.each([
+    ['admit', 200],
+    ['revoke', 204],
+  ])('accepts the signed host lease identity for %s', async (action, status) => {
+    const body = {
+      authorizationRef: 'gha_authorization_1',
+      originRef: 'ghi_origin_0001',
+      workRef: 'work_00000001',
+      workerId: 'worker_000001',
+      runId: 'run_000000001',
+      hostStartupLeaseId: 'b'.repeat(64),
+      ...(action === 'revoke' ? { grantId: 'grant_00000001' } : {}),
+    };
+    await request(appWithRoute())
+      .post(`/api/viventium/glasshive/capabilities/${action}`)
+      .set('X-Viventium-GlassHive-Admission', 'v1:1800000000:nonce-0003:signature')
+      .send(body)
+      .expect(status);
+    expect(mockVerifyAndConsumeAdmission).toHaveBeenCalledWith({
+      body,
+      header: 'v1:1800000000:nonce-0003:signature',
+    });
+    expect(
+      action === 'admit'
+        ? mockAdmitCapabilityAuthorization
+        : mockRevokeCapabilityAuthorizationGrant,
+    ).toHaveBeenCalledWith(body);
+    await request(appWithRoute())
+      .post(`/api/viventium/glasshive/capabilities/${action}`)
+      .send({ ...body, containerGenerationId: 'a'.repeat(64) })
+      .expect(400);
+  });
+
+  test('prepares one signed scheduled authorization without exposing a bearer', async () => {
+    const body = {
+      ownerId: 'user_synthetic_0001',
+      originRef: 'scheduled_run_0001',
+      workRef: 'scheduled_run_0001',
+      workerId: 'worker_synthetic_0001',
+      runId: 'glasshive_run_0001',
+      containerGenerationId: 'a'.repeat(64),
+    };
+
+    const response = await request(appWithRoute())
+      .post('/api/viventium/glasshive/capabilities/prepare-scheduled')
+      .set('X-Viventium-GlassHive-Admission', 'v1:1800000000:nonce-0002:signature')
+      .send(body)
+      .expect(200);
+
+    expect(mockPrepareScheduledProviderAuthorization).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ...body,
+        executionMode: 'docker',
+        brokerUrl: 'http://host.docker.internal:3180/api/viventium/glasshive/capabilities/mcp',
+      }),
+    );
+    expect(response.body.authorizationRef).toBe('gha_scheduled_synthetic_0001');
+    expect(response.body).not.toHaveProperty('grantToken');
+    expect(response.body).not.toHaveProperty('grant');
+  });
+
+  test('revokes the exact admitted mission grant through the signed route', async () => {
+    const body = {
+      authorizationRef: 'gha_authorization_1',
+      originRef: 'ghi_origin_0001',
+      workRef: 'work_00000001',
+      workerId: 'worker_000001',
+      runId: 'run_000000001',
+      containerGenerationId: 'a'.repeat(64),
+      grantId: 'grant_00000001',
+    };
+
+    await request(appWithRoute())
+      .post('/api/viventium/glasshive/capabilities/revoke')
+      .set('X-Viventium-GlassHive-Admission', 'v1:1800000000:nonce-0003:signature')
+      .send(body)
+      .expect(204);
+
+    expect(mockVerifyAndConsumeAdmission).toHaveBeenCalledWith({
+      body,
+      header: 'v1:1800000000:nonce-0003:signature',
+    });
+    expect(mockRevokeCapabilityAuthorizationGrant).toHaveBeenCalledWith(body);
+  });
+
   test('preserves read-only ToolAnnotations over the signed loopback MCP transport', async () => {
     const {
       mintBrokerGrant,
@@ -150,6 +351,13 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     const { token } = mintBrokerGrant({
       user: { id: 'user-1', role: 'USER' },
       allowedServers: ['google_workspace'],
+      allowedHostTools: ['worker_delegate_once'],
+      hostToolResources: {
+        worker_delegate_once: {
+          version: 1,
+          exact_request_body: 'Delegate this exact request.',
+        },
+      },
       requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
     });
     mockBuildCapabilityCatalog.mockResolvedValue({ tools: [] });
@@ -179,6 +387,14 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
         signal: expect.any(AbortSignal),
         appConfig: expect.objectContaining({
           webSearch: expect.objectContaining({ searchProvider: 'searxng' }),
+        }),
+        grant: expect.objectContaining({
+          host_tool_resources: {
+            worker_delegate_once: {
+              version: 1,
+              exact_request_body: 'Delegate this exact request.',
+            },
+          },
         }),
       }),
     );

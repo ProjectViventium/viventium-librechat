@@ -6,7 +6,7 @@
 const fs = require('fs');
 const crypto = require('crypto');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, execFile } = require('child_process');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
 import type { Document } from 'mongodb';
@@ -131,58 +131,6 @@ const REQUIRED_ARTIFACT_CHECK_IDS = Object.freeze([
   'NESTED-PINS',
   'PREBUILT-IDENTITY',
   'INSTALLED-ARTIFACT',
-]);
-const CANONICAL_DETACHED_OWNER_ARGV = Object.freeze([
-  '{ownerExecutablePath}',
-  '--app-support-dir',
-  '{appSupportDir}',
-  '--config-file',
-  '{configFile}',
-  '--runtime-dir',
-  '{runtimeDir}',
-  '--lock-file',
-  '{componentsLockFile}',
-  'start',
-  '--restart',
-]);
-const CANONICAL_ATTACHED_OWNER_ARGV = Object.freeze([
-  ['{ownerExecutablePath}', '{command}'],
-  ['{ownerExecutablePath}', '{command}', '--restart'],
-  [
-    '{ownerExecutablePath}',
-    '--app-support-dir',
-    '{appSupportDir}',
-    '--config-file',
-    '{configFile}',
-    '--runtime-dir',
-    '{runtimeDir}',
-    '--lock-file',
-    '{componentsLockFile}',
-    '{command}',
-  ],
-  [
-    '{ownerExecutablePath}',
-    '--app-support-dir',
-    '{appSupportDir}',
-    '--config-file',
-    '{configFile}',
-    '--runtime-dir',
-    '{runtimeDir}',
-    '--lock-file',
-    '{componentsLockFile}',
-    '{command}',
-    '--restart',
-  ],
-]);
-const CANONICAL_PROCESS_WRAPPERS = Object.freeze([
-  '',
-  '/bin/bash ',
-  '/bin/sh ',
-  '/bin/zsh ',
-  '/usr/bin/env bash ',
-  'bash ',
-  'sh ',
-  'zsh ',
 ]);
 const INSTALLED_ARTIFACT_HASH_KEYS = Object.freeze([
   'componentsLockSha256',
@@ -719,10 +667,7 @@ function qaReceiptAttestationValid(
   receipt: ValueRecord,
   authority: QaReceiptAuthority | null,
 ): boolean {
-  if (
-    !authority?.key ||
-    !/^hmac-sha256:[0-9a-f]{64}$/.test(String(receipt.attestation || ''))
-  ) {
+  if (!authority?.key || !/^hmac-sha256:[0-9a-f]{64}$/.test(String(receipt.attestation || ''))) {
     return false;
   }
   const { attestation, ...unsigned } = receipt;
@@ -919,10 +864,7 @@ function nestedRevisionsHash(nested: unknown[]): string {
   );
 }
 
-function artifactIdentityFacts(
-  identity: unknown,
-  promptBundleSha256 = '',
-): ArtifactIdentityFacts {
+function artifactIdentityFacts(identity: unknown, promptBundleSha256 = ''): ArtifactIdentityFacts {
   if (!isRecord(identity) || identity.contractVersion !== 1) {
     return {
       shapeValid: false,
@@ -938,9 +880,7 @@ function artifactIdentityFacts(
   const installed = identity.installed;
   const readiness = identity.readiness;
   const nestedNames = Array.isArray(nested)
-    ? nested.map((component: unknown) =>
-        String(isRecord(component) ? component.name || '' : ''),
-      )
+    ? nested.map((component: unknown) => String(isRecord(component) ? component.name || '' : ''))
     : [];
   const sourceShapeValid =
     isRecord(source) &&
@@ -1163,81 +1103,6 @@ function normalizedProcessValue(value: unknown): string {
     .join(' ');
 }
 
-function commandExecutesPath(command: unknown, owner: ValueRecord): boolean {
-  try {
-    const repoRoot = fs.realpathSync(String(owner.repoRoot || ''));
-    const contractPath = fs.realpathSync(
-      path.join(repoRoot, 'scripts', 'viventium', 'runtime_owner_command_contract.json'),
-    );
-    const contract = JSON.parse(fs.readFileSync(contractPath, 'utf8'));
-    if (
-      contract.contractVersion !== 1 ||
-      !Array.isArray(contract.processWrappers) ||
-      contract.processWrappers.length === 0 ||
-      !contract.processWrappers.every((wrapper: unknown) => typeof wrapper === 'string') ||
-      JSON.stringify(contract.detached?.argvTemplate) !==
-        JSON.stringify(CANONICAL_DETACHED_OWNER_ARGV) ||
-      contract.detached?.command !== 'start' ||
-      contract.detached?.allowTrailingArguments !== false ||
-      JSON.stringify(contract.attached?.argvTemplates) !==
-        JSON.stringify(CANONICAL_ATTACHED_OWNER_ARGV) ||
-      JSON.stringify(contract.attached?.commands) !== JSON.stringify(['start', 'launch']) ||
-      contract.attached?.allowTrailingArguments !== false ||
-      JSON.stringify(contract.processWrappers) !== JSON.stringify(CANONICAL_PROCESS_WRAPPERS)
-    ) {
-      return false;
-    }
-    const values: Record<string, unknown> = {
-      ownerExecutablePath: owner.ownerExecutablePath,
-      appSupportDir: owner.appSupportDir,
-      configFile: owner.configFile,
-      runtimeDir: owner.runtimeDir,
-      componentsLockFile: owner.componentsLockFile,
-      command: owner.command,
-    };
-    let templates: unknown[] = [];
-    if (
-      owner.ownerLaunchMode === 'detached' &&
-      owner.command === contract.detached?.command &&
-      owner.ownerProcessCwd === repoRoot
-    ) {
-      templates = [contract.detached?.argvTemplate];
-    } else if (
-      owner.ownerLaunchMode === 'attached' &&
-      contract.attached?.commands?.includes(owner.command)
-    ) {
-      templates = contract.attached?.argvTemplates;
-    }
-    const validTemplates = templates.filter(
-      (template): template is string[] =>
-        Array.isArray(template) &&
-        template.length > 0 &&
-        template.every((token: unknown) => typeof token === 'string' && token.length > 0),
-    );
-    if (!templates.length || validTemplates.length !== templates.length) {
-      return false;
-    }
-    const bases = validTemplates.map((template) =>
-      template
-        .map((token) =>
-          token.replace(/\{([^}]+)\}/g, (_match: string, key: string) => {
-            if (!Object.prototype.hasOwnProperty.call(values, key))
-              throw new Error('unknown token');
-            return String(values[key]);
-          }),
-        )
-        .join(' '),
-    );
-    const normalized = normalizedProcessValue(command);
-    return contract.processWrappers.some(
-      (wrapper: unknown) =>
-        typeof wrapper === 'string' && bases.some((base) => normalized === `${wrapper}${base}`),
-    );
-  } catch (_error) {
-    return false;
-  }
-}
-
 function canonicalOwnerProcessProof(ownerPath: string, repoRoot: string): boolean {
   try {
     const gateScript = fs.realpathSync(
@@ -1372,14 +1237,6 @@ function liveRuntimeOwnerMatches(snapshot: ValueRecord, runtimeDir: string): boo
       ownerProcessStartedAt: owner.ownerProcessStartedAt,
       ownerProcessCommand: owner.ownerProcessCommand,
     };
-    const commandExecutesOwner = commandExecutesPath(command, {
-      ...owner,
-      ownerExecutablePath: executable,
-      appSupportDir,
-      configFile,
-      runtimeDir: ownerRuntimeDir,
-      componentsLockFile,
-    });
     return (
       owner.contractVersion === 1 &&
       owner.repoRoot === repoRoot &&
@@ -1405,7 +1262,6 @@ function liveRuntimeOwnerMatches(snapshot: ValueRecord, runtimeDir: string): boo
       startedAt === normalizedProcessValue(projection.ownerProcessStartedAt) &&
       command === ownerCommand &&
       liveCwd === ownerCwd &&
-      commandExecutesOwner &&
       canonicalOwnerProcessProof(exactOwnerPath, repoRoot) &&
       sha256Text(canonicalJson(binding)) === owner.ownerBindingSha256 &&
       projection.ownerBindingSha256 === owner.ownerBindingSha256 &&
@@ -1526,7 +1382,7 @@ function validatedReleaseSnapshot(
     typeof snapshot.release_ready !== 'boolean' ||
     typeof snapshot.exposure_allowed !== 'boolean' ||
     typeof snapshot.local_qa_override !== 'boolean' ||
-    typeof snapshot.source_defaults_dark !== 'boolean' ||
+    typeof snapshot.source_defaults_valid !== 'boolean' ||
     !Number.isInteger(snapshot.gate_count) ||
     !Number.isInteger(snapshot.open_gate_count) ||
     !Array.isArray(gates) ||
@@ -1634,10 +1490,10 @@ function validatedReleaseSnapshot(
   const gatesPass = openGates.length === 0;
   const readinessPass = checks.every((check) => check.status === 'PASS');
   const artifactsPass = artifactChecks.every((check) => check.status === 'PASS');
-  const integrityPass = readinessPass && artifactsPass && snapshot.source_defaults_dark === true;
+  const integrityPass = readinessPass && artifactsPass && snapshot.source_defaults_valid === true;
   const candidatePass =
     gatesPass && integrityPass && snapshot.qa_receipt_summary.status === 'verified';
-  const localQaShapePass = snapshot.source_defaults_dark === true;
+  const localQaShapePass = snapshot.source_defaults_valid === true;
   const isLocalQa = snapshot.mode === 'local-qa';
   const expectedReleaseReady = candidatePass && !isLocalQa;
   const expectedExposureAllowed = isLocalQa ? localQaShapePass : expectedReleaseReady;
@@ -1656,7 +1512,10 @@ function validatedReleaseSnapshot(
   }
   const typedChecks = checks.filter(isRecord);
   const typedArtifactChecks = artifactChecks.filter(isRecord);
-  if (typedChecks.length !== checks.length || typedArtifactChecks.length !== artifactChecks.length) {
+  if (
+    typedChecks.length !== checks.length ||
+    typedArtifactChecks.length !== artifactChecks.length
+  ) {
     return null;
   }
   return {
@@ -1669,6 +1528,7 @@ function validatedReleaseSnapshot(
 }
 
 export function parallelWorkReleaseGateSnapshot(): ParallelWorkReleaseGate {
+  if (nativeRuntimeRequested()) return nativeReleaseGate(cachedNativeIdentity());
   const snapshotPath = configuredReleaseSnapshotPath();
   const runtimeDir = configuredRuntimeDirectory(snapshotPath);
   let snapshot: ValueRecord | null = null;
@@ -1752,7 +1612,7 @@ export function parallelWorkReleaseGateSnapshot(): ParallelWorkReleaseGate {
       .map((check) => String(check.check_id || '').trim())
       .filter(Boolean),
   ];
-  if (releaseSnapshot.source_defaults_dark !== true) blockers.push('source_defaults_not_dark');
+  if (releaseSnapshot.source_defaults_valid !== true) blockers.push('source_defaults_invalid');
   if (releaseSnapshot.local_qa_override === true) blockers.push('local_qa_override_active');
   if (releaseSnapshot.exposure_allowed !== true) blockers.push('release_exposure_disabled');
   if (releaseSnapshot.release_ready !== true && releaseSnapshot.local_qa_override !== true) {
@@ -1781,6 +1641,160 @@ export function parallelWorkReleaseGateSnapshot(): ParallelWorkReleaseGate {
   });
 }
 
+interface NativeParallelWorkIdentity extends OrchestrationRuntimeTraceBinding {
+  localQa: boolean;
+}
+
+let nativeIdentityCache: {
+  fingerprint: string;
+  checkedAtMs: number;
+  identity: NativeParallelWorkIdentity;
+} | null = null;
+let nativeIdentityInFlight: Promise<NativeParallelWorkIdentity | null> | null = null;
+
+function nativeRuntimeRequested(): boolean {
+  return process.env.VIVENTIUM_INSTALL_MODE === 'native';
+}
+
+function nativeRuntimeInputs(): { root: string; support: string; fingerprint: string } | null {
+  try {
+    const root = String(process.env.VIVENTIUM_NATIVE_RELEASE_ROOT || '');
+    const support = String(process.env.VIVENTIUM_APP_SUPPORT_DIR || '');
+    if (
+      !path.isAbsolute(root) ||
+      !path.isAbsolute(support) ||
+      fs.realpathSync(root) !== root ||
+      fs.realpathSync(support) !== support ||
+      fs.realpathSync(process.execPath) !== path.join(root, 'runtime/node/bin/node')
+    )
+      return null;
+    const files = [
+      path.join(root, '.viventium-manifest.json'),
+      path.join(support, 'state/native-runtime.json'),
+      path.join(support, 'state/native-first-admin.json'),
+      ...['librechat', 'glasshive', 'glasshive-mcp', 'redis'].map((service) =>
+        path.join(support, 'runtime', `${service}.process.json`),
+      ),
+    ];
+    const digest = crypto.createHash('sha256').update(root).update('\0').update(support);
+    for (const file of files) {
+      const details = fs.lstatSync(file);
+      const isManifest = file === files[0];
+      if (
+        !details.isFile() ||
+        details.uid !== process.getuid?.() ||
+        details.nlink !== 1 ||
+        (details.mode & 0o777) !== (isManifest ? 0o444 : 0o600) ||
+        details.size <= 0 ||
+        details.size > (isManifest ? 64 * 1024 * 1024 : RELEASE_GATE_FAST_READ_MAX_BYTES)
+      )
+        return null;
+      const contents = fs.readFileSync(file);
+      const record = JSON.parse(contents.toString('utf8'));
+      if (file.endsWith('.process.json')) {
+        if (record.release_root !== root || !Number.isSafeInteger(record.pid) || record.pid <= 1)
+          return null;
+        process.kill(record.pid, 0);
+      }
+      if (file === files[1] && record.release_root !== root) return null;
+      digest.update('\0').update(contents);
+    }
+    return { root, support, fingerprint: digest.digest('hex') };
+  } catch (_error) {
+    return null;
+  }
+}
+
+function cachedNativeIdentity(): NativeParallelWorkIdentity | null {
+  const inputs = nativeRuntimeInputs();
+  return inputs &&
+    nativeIdentityCache?.fingerprint === inputs.fingerprint &&
+    Date.now() - nativeIdentityCache.checkedAtMs < DEPLOYMENT_AVAILABILITY_REFRESH_MS
+    ? nativeIdentityCache.identity
+    : null;
+}
+
+async function loadNativeIdentity(): Promise<NativeParallelWorkIdentity | null> {
+  const cached = cachedNativeIdentity();
+  if (cached) return cached;
+  const inputs = nativeRuntimeInputs();
+  if (!inputs) return null;
+  if (nativeIdentityInFlight) return nativeIdentityInFlight;
+  nativeIdentityInFlight = new Promise<NativeParallelWorkIdentity | null>((resolve) => {
+    execFile(
+      path.join(inputs.root, 'runtime/python/bin/python3'),
+      [
+        '-E',
+        '-s',
+        '-B',
+        path.join(inputs.root, 'runtime/scripts/native_runtime.py'),
+        'parallel-work-identity',
+        '--app-support-dir',
+        inputs.support,
+      ],
+      {
+        encoding: 'utf8',
+        timeout: RELEASE_GATE_WORKER_TIMEOUT_MS,
+        maxBuffer: 16 * 1024,
+        env: { PATH: '/usr/bin:/bin', HOME: process.env.HOME || '', LANG: 'en_US.UTF-8' },
+      },
+      (error: Error | null, stdout: string) => {
+        try {
+          if (error || nativeRuntimeInputs()?.fingerprint !== inputs.fingerprint)
+            return resolve(null);
+          const identity = JSON.parse(stdout);
+          if (
+            !isRecord(identity) ||
+            identity.contractVersion !== 1 ||
+            Object.keys(identity).sort().join(',') !==
+              'candidateDigest,contractVersion,installedArtifactDigest,localQa,runtimeOwnerBindingHash' ||
+            typeof identity.localQa !== 'boolean' ||
+            !['candidateDigest', 'installedArtifactDigest', 'runtimeOwnerBindingHash'].every(
+              (key) => isSha256Ref(identity[key]),
+            )
+          )
+            return resolve(null);
+          const verified: NativeParallelWorkIdentity = {
+            contractVersion: 1,
+            localQa: identity.localQa,
+            candidateDigest: identity.candidateDigest,
+            installedArtifactDigest: identity.installedArtifactDigest,
+            runtimeOwnerBindingHash: identity.runtimeOwnerBindingHash,
+          };
+          nativeIdentityCache = {
+            fingerprint: inputs.fingerprint,
+            checkedAtMs: Date.now(),
+            identity: verified,
+          };
+          resolve(verified);
+        } catch (_error) {
+          resolve(null);
+        }
+      },
+    );
+  })
+    .catch(() => null)
+    .finally(() => {
+      nativeIdentityInFlight = null;
+    });
+  return nativeIdentityInFlight;
+}
+
+function nativeReleaseGate(identity: NativeParallelWorkIdentity | null): ParallelWorkReleaseGate {
+  return permitReleaseGateReuse({
+    available: identity?.localQa === true,
+    releaseReady: false,
+    label: identity?.localQa === true ? 'PRE-GATE / NOT READY' : 'NOT READY',
+    blockers: [
+      identity
+        ? identity.localQa
+          ? 'local_qa_override_active'
+          : 'native_release_evidence_missing'
+        : 'release_owner_unavailable',
+    ],
+  });
+}
+
 function unavailableWorkerReleaseGate(): ParallelWorkReleaseGate {
   return permitReleaseGateReuse({
     available: false,
@@ -1799,8 +1813,7 @@ function normalizedWorkerReleaseGate(value: unknown): ParallelWorkReleaseGate | 
     !['READY', 'NOT READY', 'PRE-GATE / NOT READY'].includes(value.label) ||
     !Array.isArray(value.blockers) ||
     value.blockers.some(
-      (blocker: unknown) =>
-        typeof blocker !== 'string' || !blocker.trim() || blocker.length > 160,
+      (blocker: unknown) => typeof blocker !== 'string' || !blocker.trim() || blocker.length > 160,
     ) ||
     new Set(value.blockers).size !== value.blockers.length ||
     !(
@@ -1829,6 +1842,7 @@ function normalizedWorkerReleaseGate(value: unknown): ParallelWorkReleaseGate | 
 }
 
 export function parallelWorkReleaseGateSnapshotAsync(): Promise<ParallelWorkReleaseGate> {
+  if (nativeRuntimeRequested()) return loadNativeIdentity().then(nativeReleaseGate);
   return new Promise((resolve) => {
     let worker: WorkerThread;
     try {
@@ -1872,6 +1886,7 @@ export function parallelWorkReleaseGateSnapshotAsync(): Promise<ParallelWorkRele
 }
 
 function rawReleaseSnapshotExposureFingerprint(): string {
+  if (nativeRuntimeRequested()) return nativeRuntimeInputs()?.fingerprint || '';
   const snapshotPath = configuredReleaseSnapshotPath();
   const runtimeDir = configuredRuntimeDirectory(snapshotPath);
   if (!runtimeDir) return '';
@@ -2000,6 +2015,16 @@ function prewarmDeploymentAvailability(): void {
  * these facts and no raw machine path or process identity leaves this module.
  * === VIVENTIUM END === */
 export function orchestrationRuntimeTraceBinding(): OrchestrationRuntimeTraceBinding | null {
+  if (nativeRuntimeRequested()) {
+    const identity = cachedNativeIdentity();
+    if (!identity) return null;
+    return Object.freeze({
+      contractVersion: 1,
+      candidateDigest: identity.candidateDigest,
+      installedArtifactDigest: identity.installedArtifactDigest,
+      runtimeOwnerBindingHash: identity.runtimeOwnerBindingHash,
+    });
+  }
   const snapshotPath = configuredReleaseSnapshotPath();
   const runtimeDir = configuredRuntimeDirectory(snapshotPath);
   if (!runtimeDir) return null;
@@ -2049,13 +2074,6 @@ function permitReleaseGateReuse(value: ParallelWorkReleaseGate): ParallelWorkRel
   return result;
 }
 
-function consumeReleaseGateReuse(value: unknown): ParallelWorkReleaseGate | null {
-  if (!value || typeof value !== 'object') return null;
-  const result = releaseGateReusePermits.get(value) || null;
-  releaseGateReusePermits.delete(value);
-  return result;
-}
-
 function permitOwnerClaimReuse(
   value: ParallelWorkClaimState,
   ownerId: string,
@@ -2074,19 +2092,14 @@ export function consumeTrustedParallelWorkClaimState(value: unknown, ownerId?: u
   return true;
 }
 
-export function parallelWorkClaimState(
-  ownerId?: unknown,
-  reusableReleaseGate?: unknown,
-): ParallelWorkClaimState {
+export function parallelWorkClaimState(ownerId?: unknown): ParallelWorkClaimState {
   const normalized = normalizedOwnerId(ownerId);
-  const releaseGate =
-    consumeReleaseGateReuse(reusableReleaseGate) || parallelWorkReleaseGateSnapshot();
   if (!normalized) {
     return permitOwnerClaimReuse(
       {
         available: false,
-        label: releaseGate.label,
-        blockers: [...releaseGate.blockers, 'owner_required'],
+        label: 'NOT READY',
+        blockers: ['owner_required'],
       },
       normalized,
     );
@@ -2100,17 +2113,18 @@ export function parallelWorkClaimState(
       : [String(operational.reason || operational.status || 'operational_readiness_unavailable')];
   return permitOwnerClaimReuse(
     {
-      available: operational.available === true && releaseGate.available === true,
-      label: releaseGate.label,
-      blockers: [...new Set([...releaseGate.blockers, ...operationalBlocker].filter(Boolean))],
+      available: operational.available === true,
+      label: operational.available === true ? 'READY' : 'NOT READY',
+      blockers: operationalBlocker,
     },
     normalized,
   );
 }
 
-export async function parallelWorkClaimStateAsync(ownerId?: unknown): Promise<ParallelWorkClaimState> {
-  const releaseGate = await parallelWorkReleaseGateSnapshotAsync();
-  return parallelWorkClaimState(ownerId, releaseGate);
+export async function parallelWorkClaimStateAsync(
+  ownerId?: unknown,
+): Promise<ParallelWorkClaimState> {
+  return parallelWorkClaimState(ownerId);
 }
 
 export function parallelWorkAvailable(ownerId?: unknown): boolean {
@@ -2152,7 +2166,13 @@ export async function parallelWorkDeploymentAvailableAsync(): Promise<boolean> {
 }
 
 export function configuredOrchestrationDefault(): 'parallel' | 'focused' {
-  return process.env.VIVENTIUM_PARALLEL_WORK_DEFAULT_MODE === 'parallel' ? 'parallel' : 'focused';
+  return process.env.VIVENTIUM_PARALLEL_WORK_DEFAULT_MODE === 'focused' ? 'focused' : 'parallel';
+}
+
+export function preferredOrchestrationMode(user?: OrchestrationModeUser): 'parallel' | 'focused' {
+  const explicit = user?.personalization?.orchestration_mode;
+  if (explicit === 'parallel' || explicit === 'focused') return explicit;
+  return configuredOrchestrationDefault();
 }
 
 export function effectiveOrchestrationMode(
@@ -2162,9 +2182,7 @@ export function effectiveOrchestrationMode(
   const ownerAvailable =
     typeof available === 'boolean' ? available : parallelWorkAvailable(ownerIdFromUser(user));
   if (!ownerAvailable) return 'focused';
-  const explicit = user?.personalization?.orchestration_mode;
-  if (explicit === 'parallel' || explicit === 'focused') return explicit;
-  return configuredOrchestrationDefault();
+  return preferredOrchestrationMode(user);
 }
 
 if (isMainThread && process.env.NODE_ENV !== 'test') {

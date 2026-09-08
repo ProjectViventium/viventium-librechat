@@ -51,13 +51,17 @@ function deliveryControlText(message) {
     .join('');
 }
 
-function attachEffectiveDeliveryDisposition(req, message) {
+function attachEffectiveDeliveryDisposition(
+  req,
+  message,
+  captured = getDeliveryDispositionCapture(req),
+) {
   if (!isRecord(message) || message.isCreatedByUser === true) return message;
   const legacySkipVoice = parseDeliveryControls(deliveryControlText(message)).skipVoice;
   const disposition = resolveEffectiveDeliveryDisposition({
     audioEligible: req?._viventiumDeliveryDispositionRequired === true,
     legacySkipVoice,
-    captured: getDeliveryDispositionCapture(req),
+    captured,
   });
   if (!disposition) return message;
   const metadata = isRecord(message.metadata) ? message.metadata : {};

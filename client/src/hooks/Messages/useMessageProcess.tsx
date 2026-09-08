@@ -1,17 +1,23 @@
 import throttle from 'lodash/throttle';
 import { Constants } from 'librechat-data-provider';
-import { useEffect, useRef, useCallback, useMemo } from 'react';
+import { useEffect, useRef, useCallback, useMemo, useContext } from 'react';
+import { MessageInputBranchContext } from '~/Providers/MessageContext';
 import type { TMessage } from 'librechat-data-provider';
 import { getTextKey, TEXT_KEY_DIVIDER, logger } from '~/utils';
 import { useMessagesViewContext } from '~/Providers';
 
 export default function useMessageProcess({ message }: { message?: TMessage | null }) {
   const latestText = useRef<string | number>('');
+  const ownsInput = useContext(MessageInputBranchContext);
   const hasNoChildren = useMemo(() => (message?.children?.length ?? 0) === 0, [message]);
 
   const { conversation, setAbortScroll, setLatestMessage, isSubmitting } = useMessagesViewContext();
 
   useEffect(() => {
+    if (!ownsInput) {
+      latestText.current = '';
+      return;
+    }
     const convoId = conversation?.conversationId;
     if (convoId === Constants.NEW_CONVO) {
       return;
@@ -54,7 +60,7 @@ export default function useMessageProcess({ message }: { message?: TMessage | nu
     } else {
       logger.log('latest_message', 'No change in latest message; logInfo', logInfo);
     }
-  }, [hasNoChildren, message, setLatestMessage, conversation?.conversationId]);
+  }, [ownsInput, hasNoChildren, message, setLatestMessage, conversation?.conversationId]);
 
   const handleScroll = useCallback(
     (event: unknown | TouchEvent | WheelEvent) => {

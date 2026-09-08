@@ -677,6 +677,9 @@ if [ ! -f "client/dist/index.html" ]; then
     build_client_bundle || exit 1
 fi
 
+# Prepare the privacy-checked runtime synchronously before either server can read it.
+node client/scripts/prepare-local-sandpack-bundler.cjs || exit 1
+
 echo ""
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}  Starting servers...${NC}"
@@ -687,8 +690,13 @@ echo ""
 cleanup() {
     echo ""
     echo -e "${YELLOW}Shutting down servers...${NC}"
-    pkill -f "node api/server/index.js" 2>/dev/null || true
-    pkill -f "vite" 2>/dev/null || true
+    # Each npm job forwards the signal to its own server. Other runtimes may use
+    # the same command names, so they must never be selected by name here.
+    local server_pid
+    for server_pid in $(jobs -pr); do
+        kill -TERM "$server_pid" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true
     echo -e "${GREEN}Servers stopped.${NC}"
     exit 0
 }
@@ -699,11 +707,11 @@ if [ "$FRONTEND_ONLY" = true ]; then
     echo -e "${BLUE}Starting frontend only...${NC}"
     # Use --host to ensure frontend URL works on systems where localhost resolves to IPv4 first.
     # Ensure Vite proxy routes /api to the active LibreChat API port.
-    cd client && BACKEND_PORT="$LC_API_PORT" VIVENTIUM_LC_API_PORT="$LC_API_PORT" npm run dev -- --host "${HOST}" --port "$LC_FRONTEND_PORT"
+    cd client && exec env BACKEND_PORT="$LC_API_PORT" VIVENTIUM_LC_API_PORT="$LC_API_PORT" npm run dev -- --host "${HOST}" --port "$LC_FRONTEND_PORT"
 elif [ "$BACKEND_ONLY" = true ]; then
     echo -e "${BLUE}Starting backend only...${NC}"
     run_local_search_backfill_nonblocking
-    npm run backend:dev
+    exec npm run backend:dev
 else
     # Start both backend and frontend
     run_local_search_backfill_nonblocking
@@ -717,7 +725,7 @@ else
 
     echo -e "${BLUE}Starting frontend dev server...${NC}"
     # Use --host/--port to ensure frontend is reachable via LC_FRONTEND_URL.
-    (cd client && BACKEND_PORT="$LC_API_PORT" VIVENTIUM_LC_API_PORT="$LC_API_PORT" npm run dev -- --host "${HOST}" --port "$LC_FRONTEND_PORT") &
+    (cd client && exec env BACKEND_PORT="$LC_API_PORT" VIVENTIUM_LC_API_PORT="$LC_API_PORT" npm run dev -- --host "${HOST}" --port "$LC_FRONTEND_PORT") &
     FRONTEND_PID=$!
 
     echo ""

@@ -69,11 +69,40 @@ async function verifyProductionDependencies(root = projectRoot) {
   assert.equal(typeof streamableHttp.StreamableHTTPServerTransport, 'function');
 }
 
+// VIVENTIUM START: exercise patched parsers through their production dependency owners.
+function verifyStructuredInputDependencies(root = projectRoot) {
+  const requireFromBackend = createRequire(path.join(root, 'api', 'package.json'));
+  const requireFromExpress = createRequire(requireFromBackend.resolve('express'));
+  const qs = requireFromExpress('qs');
+  assert.equal(versionAtLeast(readResolvedPackageVersion(requireFromExpress, 'qs'), '6.16.0'), true);
+  const parsedQuery = qs.parse('record[constructor][isBuffer]=invalid', { plainObjects: true });
+  assert.doesNotThrow(() => qs.stringify(parsedQuery));
+  assert.equal(qs.parse(qs.stringify({ record: { title: 'Useful report' } })).record.title, 'Useful report');
+
+  const requireFromSdk = createRequire(requireFromBackend.resolve('@modelcontextprotocol/sdk/server/streamableHttp.js'));
+  const requireFromAjv = createRequire(requireFromSdk.resolve('ajv'));
+  const uri = requireFromAjv('fast-uri');
+  assert.equal(versionAtLeast(readResolvedPackageVersion(requireFromAjv, 'fast-uri'), '3.1.6'), true);
+  assert.equal(uri.resolve('https://base.invalid/', '//exämple.invalid/report'), 'https://xn--exmple-cua.invalid/report');
+  assert.equal(uri.resolve('https://base.invalid/work/', '../report'), 'https://base.invalid/report');
+
+  const { DOMImplementation, DOMParser, XMLSerializer } = requireFromBackend('@xmldom/xmldom');
+  assert.equal(versionAtLeast(readResolvedPackageVersion(requireFromBackend, '@xmldom/xmldom'), '0.8.15'), true);
+  const document = new DOMImplementation().createDocument(null, 'root', null);
+  assert.throws(() => {
+    const reference = document.createEntityReference('safe; <injected/> &x');
+    new XMLSerializer().serializeToString(reference, { requireWellFormed: true });
+  }, /not a valid xml name/);
+  assert.equal(new DOMParser().parseFromString('<report>Useful work</report>', 'text/xml').documentElement.textContent, 'Useful work');
+}
+// VIVENTIUM END
+
 async function main() {
   loadBuiltApi();
   await verifyProductionDependencies();
+  verifyStructuredInputDependencies();
   console.log(
-    'PASS: pruned production runtime loads @librechat/api, patched image processing, and MCP HTTP transport.',
+    'PASS: pruned production runtime loads @librechat/api, patched image processing, MCP HTTP transport, and structured input parsers.',
   );
 }
 
@@ -88,5 +117,6 @@ module.exports = {
   loadBuiltApi,
   readResolvedPackageVersion,
   verifyProductionDependencies,
+  verifyStructuredInputDependencies,
   versionAtLeast,
 };

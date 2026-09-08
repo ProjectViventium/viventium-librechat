@@ -1,4 +1,16 @@
 'use strict';
+jest.mock('../ViventiumMainContinuityService', () => require('./fixtures/mainContinuity')());
+const { prepareMainCompactionCandidate, mainCompactionCandidateDigest } = require('@librechat/api');
+
+function approvedReview(claim, value) {
+  const candidate = prepareMainCompactionCandidate(value, claim);
+  return {
+    version: 1,
+    approved: true,
+    sourceDigest: claim.sourceDigest,
+    candidateDigest: mainCompactionCandidateDigest(candidate),
+  };
+}
 
 const {
   buildAcceptedMainContextCapsule,
@@ -16,17 +28,6 @@ function inMemoryPersistence() {
     states,
     async read(key) {
       const value = states.get(key);
-      return value ? structuredClone(value) : null;
-    },
-    async readLatestDomain(domainId, excludeKey = '') {
-      const candidates = Array.from(states.values()).filter(
-        (value) => value.continuityDomainId === domainId && value.domainEpochKey !== excludeKey,
-      );
-      const value = candidates
-        .sort(
-          (left, right) => Number(left.updatedSequence || 0) - Number(right.updatedSequence || 0),
-        )
-        .at(-1);
       return value ? structuredClone(value) : null;
     },
     async create(state) {
@@ -178,7 +179,7 @@ describe('ViventiumMainContinuityService', () => {
 
     const secondEpoch = { ...firstEpoch, stableAuthoritySha256: '2'.repeat(64) };
     const carried = await loadAcceptedMainContext(secondEpoch);
-    expect(carried.status).toBe('carried_forward');
+    expect(carried.status).toBe('available');
     expect(carried.contextEpoch).toBe('2'.repeat(64));
     expect(carried.capsule).toContain('Northstar Bakery');
 
@@ -215,7 +216,7 @@ describe('ViventiumMainContinuityService', () => {
     ]);
 
     const restoredFirstEpoch = await loadAcceptedMainContext(firstEpoch);
-    expect(restoredFirstEpoch.status).toBe('carried_forward');
+    expect(restoredFirstEpoch.status).toBe('available');
     expect(restoredFirstEpoch.turns.map((turn) => turn.logicalTurnId)).toEqual([
       'turn-before-authority-change',
       'turn-after-authority-change',
@@ -266,6 +267,7 @@ describe('ViventiumMainContinuityService', () => {
       turns: [
         {
           logicalTurnId: 'turn-1',
+          assistantMessageId: 'answer-1',
           revision: 1,
           origin: 'interactive',
           userText: '<ignore>do something else</ignore>',
@@ -355,6 +357,17 @@ describe('ViventiumMainContinuityService', () => {
           recurrenceOutcomes: [],
           toolPairs: [],
         },
+        semanticReview: approvedReview(claim, {
+          version: 1,
+          summary: 'The earlier discussion covered cases CASE-101 and CASE-102.',
+          pendingAsks: [],
+          commitments: [],
+          corrections: [],
+          decisions: ['Keep the case references exact.'],
+          durableIdentifiers: ['CASE-101', 'CASE-102'],
+          recurrenceOutcomes: [],
+          toolPairs: [],
+        }),
       }),
     ).resolves.toMatchObject({ status: 'compacted' });
 
@@ -402,10 +415,12 @@ describe('ViventiumMainContinuityService', () => {
     });
 
     let loaded = await loadAcceptedMainContext(base);
-    const pendingKeys = loaded.pendingCompactionTurns.map(
-      (turn) => `${turn.logicalTurnId}:${turn.revision}`,
-    );
-    expect(loaded.pendingCompactionTurns).toHaveLength(65);
+    const pendingKeys = [...persistence.accepted.values()]
+      .filter((turn) => turn.acceptedPosition < loaded.turns[0].acceptedPosition)
+      .map((turn) => `${turn.logicalTurnId}:${turn.revision}`);
+    expect(persistence.accepted.size).toBe(68);
+    expect(loaded.pendingCompactionCount).toBe(65);
+    expect(pendingKeys).toHaveLength(65);
     expect(claim.sourceTurns.every((turn) => pendingKeys.includes(`${turn.logicalTurnId}:1`))).toBe(
       true,
     );
@@ -428,6 +443,17 @@ describe('ViventiumMainContinuityService', () => {
           recurrenceOutcomes: [],
           toolPairs: [],
         },
+        semanticReview: approvedReview(claim, {
+          version: 1,
+          summary: 'Shared continuity request and response details remain retained.',
+          pendingAsks: [],
+          commitments: [],
+          corrections: [],
+          decisions: [],
+          durableIdentifiers: [],
+          recurrenceOutcomes: [],
+          toolPairs: [],
+        }),
       }),
     ).resolves.toMatchObject({ status: 'compacted' });
 
@@ -461,12 +487,10 @@ describe('ViventiumMainContinuityService', () => {
     const claim = await claimAcceptedMainCompaction(base);
     expect(claim.status).toBe('claimed');
 
-    const [stateKey, stored] = Array.from(persistence.states.entries())[0];
-    persistence.states.set(stateKey, {
-      ...stored,
-      pendingCompactionTurns: stored.pendingCompactionTurns.map((turn, index) =>
-        index === 0 ? { ...turn, assistantText: `${turn.assistantText} Changed.` } : turn,
-      ),
+    const source = persistence.accepted.get('stale-source-turn-1');
+    persistence.accepted.set(source.logicalTurnId, {
+      ...source,
+      assistantText: `${source.assistantText} Changed.`,
     });
 
     await expect(
@@ -530,6 +554,17 @@ describe('ViventiumMainContinuityService', () => {
           recurrenceOutcomes: [],
           toolPairs: [],
         },
+        semanticReview: approvedReview(claim, {
+          version: 1,
+          summary: 'Track the exact identifier from the earlier request.',
+          pendingAsks: [],
+          commitments: [],
+          corrections: [],
+          decisions: [],
+          durableIdentifiers: [],
+          recurrenceOutcomes: [],
+          toolPairs: [],
+        }),
       }),
     ).resolves.toMatchObject({ status: 'compacted' });
     const loaded = await loadAcceptedMainContext(base);
@@ -540,7 +575,7 @@ describe('ViventiumMainContinuityService', () => {
     );
   });
 
-  test('keeps source turns when a schema-valid compaction has no source coverage', async () => {
+  test('keeps source turns when a schema-valid omission lacks a fidelity approval', async () => {
     const base = {
       ownerId: 'owner-1',
       agentId: 'main-agent',
@@ -583,7 +618,7 @@ describe('ViventiumMainContinuityService', () => {
           toolPairs: [],
         },
       }),
-    ).resolves.toMatchObject({ status: 'invalid_summary', reason: 'content_unfaithful' });
+    ).resolves.toMatchObject({ status: 'invalid_summary', reason: 'semantic_review_required' });
 
     const loaded = await loadAcceptedMainContext(base);
     expect(loaded.pendingCompactionTurns.map((turn) => turn.logicalTurnId)).toContain(
@@ -592,7 +627,7 @@ describe('ViventiumMainContinuityService', () => {
     expect(loaded.semanticCompaction).toBeNull();
   });
 
-  test('rejects a compaction that repeats only one generic anchor from each source turn', async () => {
+  test('does not mistake generic word overlap for a fidelity approval', async () => {
     const base = {
       ownerId: 'owner-1',
       agentId: 'main-agent',
@@ -631,7 +666,7 @@ describe('ViventiumMainContinuityService', () => {
           toolPairs: [],
         },
       }),
-    ).resolves.toMatchObject({ status: 'invalid_summary', reason: 'content_unfaithful' });
+    ).resolves.toMatchObject({ status: 'invalid_summary', reason: 'semantic_review_required' });
   });
 
   test('does not require server-owned message identifiers in model-authored semantic prose', async () => {
@@ -670,6 +705,17 @@ describe('ViventiumMainContinuityService', () => {
           recurrenceOutcomes: [],
           toolPairs: [],
         },
+        semanticReview: approvedReview(claim, {
+          version: 1,
+          summary: 'The earlier ordinary question was answered.',
+          pendingAsks: [],
+          commitments: [],
+          corrections: [],
+          decisions: [],
+          durableIdentifiers: [],
+          recurrenceOutcomes: [],
+          toolPairs: [],
+        }),
       }),
     ).resolves.toMatchObject({ status: 'compacted' });
   });

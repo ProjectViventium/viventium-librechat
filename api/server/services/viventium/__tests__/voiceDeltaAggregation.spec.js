@@ -6,10 +6,11 @@ const {
   repairMissedVisibleMessageDelta,
   repairMissedVoiceMessageDelta,
 } = require('../voiceDeltaAggregation');
+const { projectVisibleTextFromContentParts } = require('../ViventiumVisibleContentProjection');
 
 describe('voiceDeltaAggregation', () => {
   test('normalizes cumulative snapshots at the message-delta event boundary', () => {
-    const normalize = createMessageDeltaBoundaryNormalizer({ mode: 'auto' });
+    const normalize = createMessageDeltaBoundaryNormalizer({ deltaMode: 'snapshot' });
     const emitted = [];
 
     for (const text of ['I', 'I hear', 'I hear you.']) {
@@ -24,8 +25,8 @@ describe('voiceDeltaAggregation', () => {
     expect(emitted.join('')).toBe('I hear you.');
   });
 
-  test('normalizes mid-word cumulative snapshots in auto mode', () => {
-    const normalize = createMessageDeltaBoundaryNormalizer({ mode: 'auto' });
+  test('normalizes mid-word cumulative snapshots when the adapter declares snapshot mode', () => {
+    const normalize = createMessageDeltaBoundaryNormalizer({ deltaMode: 'snapshot' });
     const emitted = [];
 
     for (const text of ['Hel', 'Hello', 'Hello world']) {
@@ -41,7 +42,7 @@ describe('voiceDeltaAggregation', () => {
   });
 
   test('normalizes cumulative no-response snapshots without malformed recombination', () => {
-    const normalize = createMessageDeltaBoundaryNormalizer({ mode: 'auto' });
+    const normalize = createMessageDeltaBoundaryNormalizer({ deltaMode: 'snapshot' });
     const emitted = [];
 
     for (const text of ['{N', '{NTA', '{NTA}']) {
@@ -56,24 +57,27 @@ describe('voiceDeltaAggregation', () => {
     expect(emitted.join('')).toBe('{NTA}');
   });
 
-  test('does not collapse legitimate repeated incremental text in auto mode', () => {
-    const normalize = createMessageDeltaBoundaryNormalizer({ mode: 'auto' });
-    const emitted = [];
-
-    for (const text of ['ha', 'haha', '!']) {
-      const result = normalize({
+  test.each([
+    ['a', 'and'],
+    ['ha', 'hahaha'],
+    ['I', 'Item'],
+  ])('preserves ambiguous incremental prefixes by default: %s + %s', (first, second) => {
+    const normalize = createMessageDeltaBoundaryNormalizer();
+    const emitted = [first, second].map((text) =>
+      normalize({
         event: 'on_message_delta',
         data: { id: 'step-1', delta: { content: [{ type: ContentTypes.TEXT, text }] } },
-      });
-      emitted.push(result.data.delta.content[0].text);
-    }
+      }),
+    );
 
-    expect(emitted).toEqual(['ha', 'haha', '!']);
-    expect(emitted.join('')).toBe('hahaha!');
+    expect(emitted.map((result) => result.data.delta.content[0].text)).toEqual([first, second]);
+    expect(emitted.map((result) => result.data.delta.content[0].text).join('')).toBe(
+      `${first}${second}`,
+    );
   });
 
   test('leaves events unchanged when explicitly configured for incremental deltas', () => {
-    const normalize = createMessageDeltaBoundaryNormalizer({ mode: 'incremental' });
+    const normalize = createMessageDeltaBoundaryNormalizer({ deltaMode: 'incremental' });
     const result = normalize({
       event: 'on_message_delta',
       data: { id: 'step-1', delta: { content: [{ type: ContentTypes.TEXT, text: 'I hear' }] } },
@@ -183,6 +187,49 @@ describe('voiceDeltaAggregation', () => {
         viventiumSourceStepId: 'step-late-owner',
       },
     ]);
+  });
+
+  test('reclaims a single-stream ownerless prefix when the run-step owner arrives mid-word', () => {
+    const contentParts = [];
+
+    repairMissedVoiceMessageDelta({
+      contentParts,
+      beforeContentParts: [],
+      event: 'on_message_delta',
+      data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'V' }] } },
+      beforeText: '',
+      afterText: '',
+      contentMeta: { agentId: null, groupId: null },
+    });
+
+    const beforeSecond = contentParts.map((part) => ({ ...part }));
+    contentParts.push({
+      type: ContentTypes.TEXT,
+      text: 'IVENTIUM VOICE LIVE PASS',
+      agentId: 'agent-main',
+    });
+    repairMissedVoiceMessageDelta({
+      contentParts,
+      beforeContentParts: beforeSecond,
+      event: 'on_message_delta',
+      data: {
+        delta: { content: [{ type: ContentTypes.TEXT, text: 'IVENTIUM VOICE LIVE PASS' }] },
+      },
+      beforeText: 'V',
+      afterText: 'VIVENTIUM VOICE LIVE PASS',
+      contentMeta: { agentId: 'agent-main', groupId: null },
+    });
+
+    expect(contentParts).toEqual([
+      {
+        type: ContentTypes.TEXT,
+        text: 'VIVENTIUM VOICE LIVE PASS',
+        agentId: 'agent-main',
+      },
+    ]);
+    expect(projectVisibleTextFromContentParts(contentParts, { trim: true })).toBe(
+      'VIVENTIUM VOICE LIVE PASS',
+    );
   });
 
   test('keeps a split no-response marker contiguous when its owner arrives late', () => {
@@ -346,6 +393,102 @@ describe('voiceDeltaAggregation', () => {
       expect.objectContaining({ viventiumSourceStepId: 'step-first-invocation' }),
     );
   });
+
+  test('moves a new-step delta out of an older pinned step for the same agent and group', () => {
+    const beforeContentParts = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'before',
+        agentId: 'agent-main',
+        groupId: 1,
+        viventiumSourceStepId: 'step-old',
+      },
+    ];
+    const contentParts = [
+      {
+        ...beforeContentParts[0],
+        text: 'beforeafter',
+      },
+    ];
+
+    expect(
+      repairMissedVisibleMessageDelta({
+        contentParts,
+        beforeContentParts,
+        event: 'on_message_delta',
+        data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'after' }] } },
+        beforeText: 'before',
+        afterText: 'beforeafter',
+        contentMeta: {
+          agentId: 'agent-main',
+          groupId: 1,
+          sourceStepId: 'step-new',
+        },
+      }),
+    ).toBe(true);
+    expect(contentParts).toEqual([
+      beforeContentParts[0],
+      {
+        type: ContentTypes.TEXT,
+        text: 'after',
+        agentId: 'agent-main',
+        groupId: 1,
+        viventiumSourceStepId: 'step-new',
+      },
+    ]);
+  });
+
+  test.each([
+    ['VOICE', ' DELTA QA'],
+    ['VOICE ', 'DELTA QA'],
+    ['micro', 'scope'],
+  ])(
+    'coalesces adjacent fragments from the same owned run step byte-for-byte: %j + %j',
+    (firstFragment, secondFragment) => {
+      const beforeContentParts = [
+        {
+          type: ContentTypes.TEXT,
+          text: firstFragment,
+          agentId: 'agent-main',
+          viventiumSourceStepId: 'step-voice-reply',
+        },
+      ];
+      const contentParts = [
+        ...beforeContentParts.map((part) => ({ ...part })),
+        {
+          type: ContentTypes.TEXT,
+          text: secondFragment,
+          agentId: 'agent-main',
+          viventiumSourceStepId: 'step-voice-reply',
+        },
+      ];
+
+      expect(
+        repairMissedVoiceMessageDelta({
+          contentParts,
+          beforeContentParts,
+          event: 'on_message_delta',
+          data: { delta: { content: [{ type: ContentTypes.TEXT, text: secondFragment }] } },
+          beforeText: firstFragment,
+          afterText: `${firstFragment}${secondFragment}`,
+          contentMeta: {
+            agentId: 'agent-main',
+            groupId: null,
+            sourceStepId: 'step-voice-reply',
+          },
+        }),
+      ).toBe(true);
+
+      expect(contentParts).toEqual([
+        {
+          type: ContentTypes.TEXT,
+          text: `${firstFragment}${secondFragment}`,
+          agentId: 'agent-main',
+          viventiumSourceStepId: 'step-voice-reply',
+        },
+      ]);
+    },
+  );
 
   /* === VIVENTIUM START ===
    * Regression: MC-045 must exercise the exact-advance branch with realistic interleaving.
@@ -569,7 +712,7 @@ describe('voiceDeltaAggregation', () => {
 
   test('repairs cumulative snapshot deltas after boundary normalization', () => {
     const contentParts = [];
-    const normalize = createMessageDeltaBoundaryNormalizer({ mode: 'auto' });
+    const normalize = createMessageDeltaBoundaryNormalizer({ deltaMode: 'snapshot' });
 
     for (const snapshot of ['I', 'I hear', 'I hear you.']) {
       const event = normalize({
@@ -590,7 +733,7 @@ describe('voiceDeltaAggregation', () => {
 
   test('does not turn normalized no-response snapshots into malformed visible text', () => {
     const contentParts = [];
-    const normalize = createMessageDeltaBoundaryNormalizer({ mode: 'auto' });
+    const normalize = createMessageDeltaBoundaryNormalizer({ deltaMode: 'snapshot' });
 
     for (const snapshot of ['{N', '{NTA', '{NTA}']) {
       const event = normalize({
@@ -611,7 +754,7 @@ describe('voiceDeltaAggregation', () => {
 
   test('preserves quoted repeated words in cumulative snapshots after boundary normalization', () => {
     const contentParts = [];
-    const normalize = createMessageDeltaBoundaryNormalizer({ mode: 'auto' });
+    const normalize = createMessageDeltaBoundaryNormalizer({ deltaMode: 'snapshot' });
     const snapshots = [
       'She said "no',
       'She said "no no no',

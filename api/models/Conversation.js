@@ -1,4 +1,6 @@
-const { logger } = require('@librechat/data-schemas');
+/* === VIVENTIUM START === General saves cannot set or clear explicit title authority. === */
+const { logger, omitUserTitleMarker } = require('@librechat/data-schemas');
+/* === VIVENTIUM END === */
 const { createTempChatExpirationDate } = require('@librechat/api');
 const { getMessages, deleteMessages } = require('./Message');
 const { Conversation } = require('~/db/models');
@@ -121,7 +123,7 @@ module.exports = {
       }
 
       const messages = await getMessages({ conversationId }, '_id');
-      const update = { ...convo, messages, user: req.user.id, expiredAt };
+      const update = omitUserTitleMarker({ ...convo, messages, user: req.user.id, expiredAt });
       if (newConversationId) {
         update.conversationId = newConversationId;
       }
@@ -129,7 +131,7 @@ module.exports = {
       /** @type {{ $set: Partial<TConversation>; $unset?: Record<keyof TConversation, number> }} */
       const updateOperation = { $set: update };
       if (metadata && metadata.unsetFields && Object.keys(metadata.unsetFields).length > 0) {
-        updateOperation.$unset = metadata.unsetFields;
+        updateOperation.$unset = omitUserTitleMarker(metadata.unsetFields);
       }
 
       /** Note: the resulting Model object is necessary for Meilisearch operations */
@@ -161,7 +163,7 @@ module.exports = {
       const bulkOps = conversations.map((convo) => ({
         updateOne: {
           filter: { conversationId: convo.conversationId, user: convo.user },
-          update: convo,
+          update: omitUserTitleMarker(convo),
           upsert: true,
           timestamps: false,
         },
@@ -242,7 +244,7 @@ module.exports = {
             },
           ],
         };
-      } catch (err) {
+      } catch {
         logger.warn('[getConvosByCursor] Invalid cursor format, starting from beginning');
       }
       if (cursorFilter) {

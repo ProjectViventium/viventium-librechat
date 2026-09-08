@@ -148,10 +148,13 @@ async function resolveMessageAttachmentSurface({ req, agent_id }) {
     requestedEndpointType ||
     requestedEndpoint;
 
+  const capability = req.config?.endpoints?.agents?.providerCapabilities?.[currentProvider];
   return {
     currentProvider,
     endpointType,
     useResponsesApi,
+    nativeWorkspaceAttachments:
+      capability?.workspace_binding === true && capability?.worker_native_tools === true,
   };
 }
 
@@ -160,7 +163,15 @@ function isProviderNativeMessageAttachment({
   endpointType,
   currentProvider,
   useResponsesApi,
+  nativeWorkspaceAttachments = false,
 }) {
+  /* === VIVENTIUM START ===
+   * Native workspace providers receive admitted, owner-scoped files through the existing signed
+   * source bundle. Preserve those bytes instead of forcing API-specific text/STT extraction.
+   * === VIVENTIUM END === */
+  if (nativeWorkspaceAttachments) {
+    return true;
+  }
   const isAzureWithResponsesApi =
     currentProvider === EModelEndpoint.azureOpenAI && useResponsesApi === true;
   const isBedrock =
@@ -684,7 +695,7 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
         originalname: file.originalname,
       });
     } else {
-      const { currentProvider, endpointType, useResponsesApi } =
+      const { currentProvider, endpointType, useResponsesApi, nativeWorkspaceAttachments } =
         await resolveMessageAttachmentSurface({
           req,
           agent_id,
@@ -694,6 +705,7 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
         endpointType,
         currentProvider,
         useResponsesApi,
+        nativeWorkspaceAttachments,
       });
 
       if (providerNativeAttachment) {
@@ -1305,7 +1317,9 @@ function filterFile({ req, image, isAvatar }) {
   );
 
   if (!isSupportedMimeType) {
-    throw new Error('Unsupported file type');
+    throw Object.assign(new Error('Unsupported file type'), {
+      code: 'unsupported_file_type', status: 415, retryable: false,
+    });
   }
 
   if (!image || isAvatar === true) {

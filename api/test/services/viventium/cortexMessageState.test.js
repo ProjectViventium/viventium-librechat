@@ -5,7 +5,15 @@ let mockGetCortexInsightDeliveries;
 
 jest.mock('~/models', () => ({
   getMessage: (...args) => mockGetMessage(...args),
-  getMessages: (...args) => mockGetMessages(...args),
+  getMessages: async (filter, select) => {
+    if (filter.messageId) {
+      const message = await mockGetMessage(filter);
+      if (!message) return [];
+      const fields = select.split(' ');
+      return [Object.fromEntries(Object.entries(message).filter(([key]) => fields.includes(key)))];
+    }
+    return mockGetMessages(filter, select);
+  },
 }));
 
 jest.mock('~/models/Agent', () => ({
@@ -143,6 +151,22 @@ describe('cortexMessageState', () => {
 
     expect(state.canonicalText).toBe('Checking now.');
     expect(state.canonicalTextSource).toBe('message');
+  });
+
+  test('preserves unfinished state when the parent has ordinary visible text', async () => {
+    const { getCortexMessageState } = require('~/server/services/viventium/cortexMessageState');
+    mockGetMessage.mockResolvedValueOnce({
+      messageId: 'msg-unfinished', conversationId: 'conv-1',
+      text: 'I have an initial result.', unfinished: true,
+      content: [{ type: 'cortex_insight', status: 'complete', cortex_name: 'Review',
+        insight: 'The checked result confirms the delivery date is Friday.' }],
+    });
+    mockGetMessages.mockResolvedValueOnce([]);
+    const state = await getCortexMessageState({
+      userId: 'user-1', messageId: 'msg-unfinished', conversationId: 'conv-1',
+    });
+    expect(state.canonicalText).toBe('The checked result confirms the delivery date is Friday.');
+    expect(state.canonicalTextSource).toBe('deferred_fallback');
   });
 
   test('resolves configured hold text to best completed insight when no follow-up exists', async () => {

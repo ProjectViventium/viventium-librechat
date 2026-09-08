@@ -242,7 +242,7 @@ const PRIVATE_USE_CITATION_RE =
 const INTERNAL_TURN_ID_RE = /\bturn\d+[A-Za-z]+\d+\b/gi;
 const INTERNAL_NO_RESPONSE_RE =
   /(^|[^$])\{(?:[NTA{}]*)N(?:[NTA{}]*)T(?:[NTA{}]*)A(?:[NTA{}]*)\}?/gi;
-const WHITESPACE_BEFORE_PUNCT_RE = /\s+([.,!?;:])/g;
+const WHITESPACE_BEFORE_PUNCT_RE = /(?<=\S)[ \t]+([.,!?;:])/g;
 const SENTENCE_SPACE_RE = /([.!?])([A-Z])/g;
 
 function countAdjacentDuplicateWords(text) {
@@ -410,8 +410,7 @@ function stripVoiceControlTags(text) {
 
 function normalizeVoiceSurfaceWhitespace(text) {
   return String(text || '')
-    .replace(/\s*[\r\n]+\s*/g, ' ')
-    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/(?<=\S)[ \t]{2,}(?=\S)/g, ' ')
     .replace(WHITESPACE_BEFORE_PUNCT_RE, (match, punct, offset, value) => {
       if (punct === '.') {
         const next = value[offset + match.length] || '';
@@ -450,7 +449,7 @@ function sanitizeVoiceSurfaceTextForDisplay(text) {
   let cleaned = parseDeliveryControls(text).cleanText.replace(/\\n/g, '\n').replace(/\\r/g, '\r');
   cleaned = cleaned.replace(INTERNAL_NO_RESPONSE_RE, '$1');
   cleaned = cleaned.replace(CODE_BLOCK_RE, (match) =>
-    match.replace(/```[A-Za-z0-9_-]*\s*/g, '').replace(/```/g, ' '),
+    match.replace(/```[A-Za-z0-9_-]*[ \t]*/g, '').replace(/```/g, ' '),
   );
   cleaned = cleaned.replace(INLINE_CODE_RE, '$1');
   cleaned = cleaned.replace(REFERENCE_DEF_RE, ' ');

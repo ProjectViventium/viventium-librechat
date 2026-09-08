@@ -17,6 +17,7 @@ const { getAppConfig } = require('~/server/services/Config');
 const { findUser, getUserById } = require('~/models');
 const {
   assertBrokerGrantActive,
+  hydrateBrokerGrantResources,
   rememberInvocation,
   rememberBrokerRequest,
   resolveBrokerTenantId,
@@ -30,8 +31,17 @@ const {
 const {
   buildDirectGlassHiveCapabilityBundle,
   directCapabilityReadiness,
+  resolveBrokerUrl,
   revokeDirectGlassHiveCapabilityGrant,
 } = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
+const {
+  assertActiveCapabilityAuthorizationGrant,
+  CapabilityAuthorizationError,
+  admitCapabilityAuthorization,
+  prepareScheduledProviderAuthorization,
+  revokeCapabilityAuthorizationGrant,
+  verifyAndConsumeAdmission,
+} = require('~/server/services/viventium/GlassHiveCapabilityAuthorizationService');
 const {
   verifyDirectIssuerAssertion,
 } = require('~/server/services/viventium/GlassHiveCapabilityDirectIssuerAuth');
@@ -68,14 +78,18 @@ async function handleRpc(req, res) {
   let grant;
   try {
     /* === VIVENTIUM START === Tenant-bound grants and durable revocation. === */
-    grant = verifyBrokerGrant(bearerToken(req), {
+    const verifiedGrant = verifyBrokerGrant(bearerToken(req), {
       allowRenewal: true,
       expectedTenantId: resolveBrokerTenantId(),
       // Existing direct-conversation grants live for minutes. Accept those v1 grants during the
       // rolling upgrade only; all newly minted grants are tenant-bound v2 grants.
       allowLegacyTenantless: true,
     });
-    await assertBrokerGrantActive(grant);
+    await assertBrokerGrantActive(verifiedGrant);
+    if (String(verifiedGrant?.authorization_ref || '').trim()) {
+      await assertActiveCapabilityAuthorizationGrant(verifiedGrant);
+    }
+    grant = await hydrateBrokerGrantResources(verifiedGrant);
     /* === VIVENTIUM END === */
     if (grant.renewed) {
       res.set('x-glasshive-capability-grant-renewed', 'true');
@@ -176,6 +190,193 @@ async function handleRpc(req, res) {
 }
 
 router.post('/mcp', handleRpc);
+
+router.post('/prepare-scheduled', async (req, res) => {
+  res.set('Cache-Control', 'no-store, private');
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  const allowedKeys = new Set([
+    'ownerId',
+    'originRef',
+    'workRef',
+    'workerId',
+    'runId',
+    'containerGenerationId',
+  ]);
+  const simpleRef = /^[A-Za-z0-9][A-Za-z0-9._:@-]{7,191}$/;
+  const exactKeys =
+    Object.keys(body).length === allowedKeys.size &&
+    Object.keys(body).every((key) => allowedKeys.has(key));
+  const validRefs = ['ownerId', 'originRef', 'workRef', 'workerId', 'runId'].every(
+    (key) => typeof body[key] === 'string' && simpleRef.test(body[key]),
+  );
+  const validGeneration =
+    typeof body.containerGenerationId === 'string' &&
+    /^[a-f0-9]{64}$/.test(body.containerGenerationId);
+  if (!exactKeys || !validRefs || !validGeneration) {
+    return res.status(400).json({
+      error: {
+        code: 'capability_scheduled_prepare_request_invalid',
+        message: 'The scheduled provider authorization request is invalid.',
+        needsInput: false,
+      },
+    });
+  }
+  if (body.workRef !== body.originRef) {
+    return res.status(400).json({
+      error: {
+        code: 'capability_scheduled_prepare_identity_mismatch',
+        message: 'The scheduled provider authorization identity does not match.',
+        needsInput: false,
+      },
+    });
+  }
+  try {
+    await verifyAndConsumeAdmission({
+      body,
+      header: req.get('X-Viventium-GlassHive-Admission'),
+    });
+    const prepared = await prepareScheduledProviderAuthorization({
+      ...body,
+      allowedServers: [],
+      allowedHostTools: [],
+      contentReadScope: false,
+      executionMode: 'docker',
+      requestContext: {
+        message_id: body.originRef,
+        turn_id: body.originRef,
+      },
+      brokerUrl: resolveBrokerUrl('docker'),
+    });
+    return res.status(200).json({
+      status: 'prepared',
+      ownerId: body.ownerId,
+      originRef: body.originRef,
+      workRef: body.workRef,
+      workerId: body.workerId,
+      runId: body.runId,
+      containerGenerationId: body.containerGenerationId,
+      authorizationRef: prepared.authorizationRef,
+      scopeFingerprint: prepared.scopeFingerprint,
+      brokerUrl: prepared.brokerUrl,
+      maxExpiresAt: prepared.maxExpiresAt,
+    });
+  } catch (error) {
+    const known = error instanceof CapabilityAuthorizationError;
+    const status = known ? error.status : 500;
+    logger[status >= 500 ? 'error' : 'warn'](
+      '[VIVENTIUM][glasshive-capability-authorization] Scheduled preparation rejected',
+      { code: known ? error.code : 'capability_scheduled_prepare_failed', status },
+    );
+    return res.status(status).json({
+      error: {
+        code: known ? error.code : 'capability_scheduled_prepare_failed',
+        message: known
+          ? error.message
+          : 'GlassHive scheduled provider authorization preparation failed.',
+        needsInput: known ? error.needsInput : false,
+      },
+    });
+  }
+});
+
+router.post('/admit', async (req, res) => {
+  res.set('Cache-Control', 'no-store, private');
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  const allowedKeys = new Set([
+    'authorizationRef',
+    'originRef',
+    'workRef',
+    'workerId',
+    'runId',
+    Object.hasOwn(body, 'hostStartupLeaseId') ? 'hostStartupLeaseId' : 'containerGenerationId',
+  ]);
+  const values = Object.values(body);
+  if (
+    Object.keys(body).length !== allowedKeys.size ||
+    Object.keys(body).some((key) => !allowedKeys.has(key)) ||
+    values.some((value) => typeof value !== 'string' || value.length < 8 || value.length > 192)
+  ) {
+    return res.status(400).json({
+      error: {
+        code: 'capability_admission_request_invalid',
+        message: 'The GlassHive capability admission request is invalid.',
+        needsInput: false,
+      },
+    });
+  }
+  try {
+    await verifyAndConsumeAdmission({
+      body,
+      header: req.get('X-Viventium-GlassHive-Admission'),
+    });
+    const admitted = await admitCapabilityAuthorization(body);
+    return res.status(200).json(admitted);
+  } catch (error) {
+    const known = error instanceof CapabilityAuthorizationError;
+    const status = known ? error.status : 500;
+    logger[status >= 500 ? 'error' : 'warn'](
+      '[VIVENTIUM][glasshive-capability-authorization] Admission rejected',
+      { code: known ? error.code : 'capability_admission_failed', status },
+    );
+    return res.status(status).json({
+      error: {
+        code: known ? error.code : 'capability_admission_failed',
+        message: known ? error.message : 'GlassHive mission capability admission failed.',
+        needsInput: known ? error.needsInput : false,
+      },
+    });
+  }
+});
+
+router.post('/revoke', async (req, res) => {
+  res.set('Cache-Control', 'no-store, private');
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  const allowedKeys = new Set([
+    'authorizationRef',
+    'originRef',
+    'workRef',
+    'workerId',
+    'runId',
+    Object.hasOwn(body, 'hostStartupLeaseId') ? 'hostStartupLeaseId' : 'containerGenerationId',
+    'grantId',
+  ]);
+  const values = Object.values(body);
+  if (
+    Object.keys(body).length !== allowedKeys.size ||
+    Object.keys(body).some((key) => !allowedKeys.has(key)) ||
+    values.some((value) => typeof value !== 'string' || value.length < 8 || value.length > 192)
+  ) {
+    return res.status(400).json({
+      error: {
+        code: 'capability_revocation_request_invalid',
+        message: 'The GlassHive capability revocation request is invalid.',
+        needsInput: false,
+      },
+    });
+  }
+  try {
+    await verifyAndConsumeAdmission({
+      body,
+      header: req.get('X-Viventium-GlassHive-Admission'),
+    });
+    await revokeCapabilityAuthorizationGrant(body);
+    return res.status(204).end();
+  } catch (error) {
+    const known = error instanceof CapabilityAuthorizationError;
+    const status = known ? error.status : 500;
+    logger[status >= 500 ? 'error' : 'warn'](
+      '[VIVENTIUM][glasshive-capability-authorization] Revocation rejected',
+      { code: known ? error.code : 'capability_revocation_failed', status },
+    );
+    return res.status(status).json({
+      error: {
+        code: known ? error.code : 'capability_revocation_failed',
+        message: known ? error.message : 'GlassHive mission capability revocation failed.',
+        needsInput: false,
+      },
+    });
+  }
+});
 
 /* === VIVENTIUM START ===
  * Feature: Replay-safe direct capability readiness, grant, and revoke issuer surface.

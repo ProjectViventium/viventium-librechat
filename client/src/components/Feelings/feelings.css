@@ -1199,6 +1199,16 @@
   color: var(--feelings-quiet);
   font-size: 12px;
 }
+.feelings-capsule summary {
+  width: fit-content;
+  padding: 6px 0;
+  color: var(--feelings-quiet);
+  cursor: pointer;
+  font-size: 12px;
+}
+.feelings-capsule details[open] summary {
+  margin-bottom: 8px;
+}
 .feelings-capsule pre {
   min-height: 148px;
   margin: 0;

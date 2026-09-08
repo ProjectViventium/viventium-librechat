@@ -31,3 +31,10 @@ export { InMemoryJobStore } from './implementations/InMemoryJobStore';
 export { InMemoryEventTransport } from './implementations/InMemoryEventTransport';
 export { RedisJobStore } from './implementations/RedisJobStore';
 export { RedisEventTransport } from './implementations/RedisEventTransport';
+
+/* VIVENTIUM: the admission and publication owners use one fixed recovery window. */
+export {
+  NATIVE_RESPONSE_RECOVERY_WINDOW_MS,
+  nativeIdentityJson,
+  nativeJobMatches,
+} from './implementations/nativeResponse';

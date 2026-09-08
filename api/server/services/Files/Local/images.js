@@ -3,6 +3,10 @@ const path = require('path');
 const sharp = require('sharp');
 const { resizeImageBuffer } = require('../images/resize');
 const { updateUser, updateFile } = require('~/models');
+/* === VIVENTIUM START: Reuse configured mutable image storage and its path validation. === */
+const paths = require('~/config/paths');
+const { getLocalFileStream } = require('./crud');
+/* === VIVENTIUM END === */
 
 /**
  * Converts an image file to the target format. The function first resizes the image based on the specified
@@ -90,19 +94,17 @@ function encodeImage(imagePath) {
  * @returns {Promise<[MongoFile, string]>} - A promise that resolves to an array of results from updateFile and encodeImage.
  */
 async function prepareImagesLocal(req, file) {
-  const appConfig = req.config;
-  const { publicPath, imageOutput } = appConfig.paths;
-  const userPath = path.join(imageOutput, req.user.id);
-
-  if (!fs.existsSync(userPath)) {
-    fs.mkdirSync(userPath, { recursive: true });
+  /* === VIVENTIUM START: Read the same storage root used to save and serve images. === */
+  if (typeof file.filepath !== 'string' || !file.filepath.startsWith('/images/')) {
+    throw new Error('Invalid image file path');
   }
-  const filepath = path.join(publicPath, file.filepath);
-
-  const promises = [];
-  promises.push(updateFile({ file_id: file.file_id }));
-  promises.push(encodeImage(filepath));
-  return await Promise.all(promises);
+  const stream = await getLocalFileStream(req, file.filepath);
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  return [await updateFile({ file_id: file.file_id }), Buffer.concat(chunks).toString('base64')];
+  /* === VIVENTIUM END === */
 }
 
 /**
@@ -118,18 +120,9 @@ async function prepareImagesLocal(req, file) {
  * @throws {Error} - Throws an error if Firebase is not initialized or if there is an error in uploading.
  */
 async function processLocalAvatar({ buffer, userId, manual, agentId }) {
-  const userDir = path.resolve(
-    __dirname,
-    '..',
-    '..',
-    '..',
-    '..',
-    '..',
-    'client',
-    'public',
-    'images',
-    userId,
-  );
+  /* === VIVENTIUM START: Avatars belong with the installation's writable images. === */
+  const userDir = path.join(paths.imageOutput, userId);
+  /* === VIVENTIUM END === */
 
   const metadata = await sharp(buffer).metadata();
   const extension = metadata.format === 'gif' ? 'gif' : 'png';

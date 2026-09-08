@@ -6,7 +6,8 @@ import MermaidErrorBoundary from '~/components/Messages/Content/MermaidErrorBoun
 import CodeBlock from '~/components/Messages/Content/CodeBlock';
 import Mermaid from '~/components/Messages/Content/Mermaid';
 import useHasAccess from '~/hooks/Roles/useHasAccess';
-import { useFileDownload } from '~/data-provider';
+import { useFileDownload, useGetStartupConfig } from '~/data-provider';
+import { resolveAppLink } from '~/utils/appLinks';
 import { useCodeBlockContext } from '~/Providers';
 import { handleDoubleClick } from '~/utils';
 import { useLocalize } from '~/hooks';
@@ -98,6 +99,10 @@ type TAnchorProps = {
 
 export const a: React.ElementType = memo(function MarkdownAnchor({ href, children }: TAnchorProps) {
   const user = useRecoilValue(store.user);
+  /* === VIVENTIUM START === Indexed source URLs must open in the active signed-in session. === */
+  const { data: startupConfig } = useGetStartupConfig();
+  const linkHref = resolveAppLink(href, startupConfig?.viventiumClientOrigin, window.location.origin);
+  /* === VIVENTIUM END === */
   const { showToast } = useToastContext();
   const localize = useLocalize();
 
@@ -123,7 +128,7 @@ export const a: React.ElementType = memo(function MarkdownAnchor({ href, childre
 
   if (!file_id || !filename) {
     return (
-      <a href={href} {...props}>
+      <a href={linkHref} {...props}>
         {children}
       </a>
     );

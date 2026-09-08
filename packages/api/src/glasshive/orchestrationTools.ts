@@ -14,6 +14,7 @@ import {
   DELEGATION_TOOL_NAME,
   MAIN_DELEGATION_DESCRIPTION,
   MAIN_DELEGATION_JSON_SCHEMA,
+  mainDelegationJsonSchema,
   MAIN_DELEGATION_PROFILES,
   MAIN_DELEGATION_RESOURCE_CLASSES,
   MAIN_DELEGATION_STRING_LIMITS,
@@ -24,6 +25,8 @@ import {
   mainOrchestrationInvocationIdentity,
   recordMainDelegationOutcome,
 } from './conversationOrchestration';
+
+import { configuredBackgroundWorkerRoute } from './backgroundWorkerRoute';
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -128,21 +131,6 @@ export function availableGlassHiveMainOrchestrationTools(
   });
 }
 
-function configuredWorkerProfile(agent: unknown, { fallback = false } = {}): string {
-  const descriptor = recordFrom(agent);
-  const agentOrchestration = recordFrom(recordFrom(descriptor.glasshive_options).orchestration);
-  const definitionsOnlyOrchestration = recordFrom(descriptor.orchestration);
-  const orchestration = Object.keys(agentOrchestration).length
-    ? agentOrchestration
-    : definitionsOnlyOrchestration;
-  const configured = String(
-    (fallback ? orchestration.fallback_worker_profile : orchestration.worker_profile) || '',
-  ).trim();
-  return configured.length > 0 && configured.length <= MAIN_DELEGATION_STRING_LIMITS.profile
-    ? configured
-    : '';
-}
-
 export function createGlassHiveMainDelegationTool(
   options: GlassHiveMainDelegationOptions,
   deps: GlassHiveMainDelegationDependencies,
@@ -151,15 +139,22 @@ export function createGlassHiveMainDelegationTool(
   if (!ownerId) throw new Error('glasshive_delegation_owner_required');
   const req = recordFrom(options.req);
   const agent = recordFrom(options.agent);
+  const sourceSchema = mainDelegationJsonSchema(req.body);
+  const schema = sourceSchema.required.includes('sourceOrdinals')
+    ? delegationSchema.extend({
+        sourceOrdinals: z.array(z.number().int().min(1)
+          .max(sourceSchema.properties.sourceOrdinals.items.maximum))
+          .min(1).max(sourceSchema.properties.sourceOrdinals.maxItems),
+      })
+    : delegationSchema;
   return tool(
     async (args, runnableConfig) => {
       const config = recordFrom(runnableConfig);
       const configurable = recordFrom(config.configurable);
       const requestBody = recordFrom(configurable.requestBody);
-      const inheritedProfile = configuredWorkerProfile(agent, {
-        fallback: req._viventiumFallbackLlmAttempt === true,
-      });
-      const fallbackWorkerProfile = configuredWorkerProfile(agent, { fallback: true });
+      const workerRoute = configuredBackgroundWorkerRoute(agent);
+      const inheritedProfile = workerRoute.workerProfile;
+      const fallbackWorkerProfile = workerRoute.fallbackWorkerProfile;
       let descriptorShape = 'missing';
       if (Object.keys(recordFrom(recordFrom(agent.glasshive_options).orchestration)).length) {
         descriptorShape = 'agent';
@@ -168,7 +163,7 @@ export function createGlassHiveMainDelegationTool(
       }
       deps.logger.info('[VIVENTIUM][parallel-work] Selected trusted worker route', {
         descriptorShape,
-        primaryWorkerProfile: configuredWorkerProfile(agent),
+        primaryWorkerProfile: inheritedProfile,
         fallbackWorkerProfile,
         mainProviderAttempt: req._viventiumFallbackLlmAttempt === true ? 'fallback' : 'primary',
       });
@@ -232,7 +227,7 @@ export function createGlassHiveMainDelegationTool(
           req._viventiumGlassHiveCapabilityDependency ||
           {},
         args: effectiveArgs,
-        fallbackWorkerProfile,
+        ...workerRoute,
         invocationId,
         toolCall: config.toolCall,
         signal: config.signal,
@@ -243,7 +238,7 @@ export function createGlassHiveMainDelegationTool(
     {
       name: DELEGATION_TOOL_NAME,
       description: MAIN_DELEGATION_DESCRIPTION,
-      schema: delegationSchema,
+      schema,
     },
   );
 }

@@ -5,6 +5,24 @@ import { RecoilRoot } from 'recoil';
 import Part from '../Part';
 
 describe('Part harness activity wiring', () => {
+  it('keeps activity rows inside a shared message disclosure without a nested disclosure', () => {
+    const { container } = render(
+      <RecoilRoot>
+        <Part
+          isSubmitting={false}
+          showCursor={false}
+          isCreatedByUser={false}
+          harnessActivityGrouped={true}
+          part={{
+            type: ContentTypes.HARNESS_ACTIVITY,
+            harness_activity: { event: 'completed', summary: 'Work completed.' },
+          }}
+        />
+      </RecoilRoot>,
+    );
+    expect(screen.getByText('Work completed.')).toBeInTheDocument();
+    expect(container.querySelector('details')).toBeNull();
+  });
   it('renders progress summaries as harness activity instead of hidden model reasoning', () => {
     render(
       <RecoilRoot>

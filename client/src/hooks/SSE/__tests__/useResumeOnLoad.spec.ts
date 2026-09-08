@@ -2,9 +2,34 @@
  * Feature: Durable client-presentation resume identity regression coverage.
  */
 import { Constants, ContentTypes } from 'librechat-data-provider';
+import { renderHook } from '@testing-library/react';
 import type { Agents, TMessage } from 'librechat-data-provider';
+import { queueTitleGeneration } from '~/data-provider';
+import useResumeOnLoad from '../useResumeOnLoad';
 import { buildSubmissionFromResumeState, hasAuthoritativeResumePair } from '../useResumeOnLoad';
 import { projectResumeMessages } from '../resumeMessageProjection';
+
+const mockSetSubmission = jest.fn();
+const mockQueryClient = { setQueryData: jest.fn() };
+const mockConversation = { endpoint: 'agents' };
+const mockActiveJobs = { isSuccess: true, data: { activeJobIds: [] } };
+const mockStatus = { isSuccess: true, data: { active: false } };
+jest.mock('recoil', () => ({
+  useSetRecoilState: () => mockSetSubmission,
+  useRecoilValue: (key: string) => (key === 'conversation' ? mockConversation : null),
+}));
+jest.mock('@tanstack/react-query', () => ({
+  useQueryClient: () => mockQueryClient,
+}));
+jest.mock('~/data-provider', () => ({
+  queueTitleGeneration: jest.fn(),
+  useActiveJobs: () => mockActiveJobs,
+  useStreamStatus: () => mockStatus,
+}));
+jest.mock('~/store', () => ({
+  submissionByIndex: () => 'submission',
+  conversationByIndex: () => 'conversation',
+}));
 
 const conversationId = 'conversation-canonical';
 const rootId = String(Constants.NO_PARENT);
@@ -55,6 +80,46 @@ function resumeState(
     ...overrides,
   } as ResumeStateWithPresentation;
 }
+
+describe('already-recovered first response title', () => {
+  it('observes a later partial-to-final message update with stable native dependencies', () => {
+    const user = message({ messageId: 'root-user', isCreatedByUser: true });
+    const answer = message({ messageId: 'answer', parentMessageId: user.messageId });
+    let messages = [user, { ...answer, unfinished: true }];
+    const getMessages = () => messages;
+    const { rerender } = renderHook(() => useResumeOnLoad(conversationId, getMessages(), 0, true));
+    expect(queueTitleGeneration).not.toHaveBeenCalled();
+    messages = [user, { ...answer, unfinished: false }];
+    rerender();
+    expect(queueTitleGeneration).toHaveBeenCalledWith(conversationId);
+  });
+
+  it.each([
+    { label: 'completed root pair', overrides: {}, expected: 1 },
+    { label: 'unfinished response', overrides: { unfinished: true }, expected: 0 },
+    { label: 'unknown completion', overrides: { unfinished: undefined }, expected: 0 },
+    { label: 'different parent', overrides: { parentMessageId: 'other-user' }, expected: 0 },
+    { label: 'other conversation', overrides: { conversationId: 'other' }, expected: 0 },
+    { label: 'user row', overrides: { isCreatedByUser: true }, expected: 0 },
+  ])('queues $expected for $label after history loads', ({ overrides, expected }) => {
+    const user = message({ messageId: 'root-user', isCreatedByUser: true });
+    const response = message({
+      messageId: 'finished-answer',
+      parentMessageId: user.messageId,
+      unfinished: false,
+      ...overrides,
+    });
+    const getMessages = () => [response, user];
+    const { rerender } = renderHook(
+      ({ loaded }) => useResumeOnLoad(conversationId, getMessages(), 0, loaded),
+      { initialProps: { loaded: false } },
+    );
+    expect(queueTitleGeneration).not.toHaveBeenCalled();
+    rerender({ loaded: true });
+    expect(queueTitleGeneration).toHaveBeenCalledTimes(expected);
+    if (expected) expect(queueTitleGeneration).toHaveBeenCalledWith(conversationId);
+  });
+});
 
 describe('buildSubmissionFromResumeState', () => {
   it('replaces the exact optimistic pair before SYNC and FINAL append the authoritative pair', () => {

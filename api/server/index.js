@@ -381,6 +381,15 @@ const startServer = async () => {
       upgradeFinalization.recordCompleted('channel-persistence-ready');
       await checkMigrations();
       upgradeFinalization.recordCompleted('permission-migration-inspection');
+      /* === VIVENTIUM START === Recover interrupted saved-memory receipts without replaying models. === */
+      require('./services/viventium/memoryWriterCoordinator').startMemoryWriterRecovery({
+        db: require('~/models'), logger,
+        recoverPending: (row, identity) => require('./controllers/agents/client')
+          .recoverPendingMemoryWriter(row, identity),
+      });
+      await require('./services/viventium/nativeResponseService').installNativeResponseRecovery();
+      require('./services/viventium/GlassHiveLaunchReconciliationService')
+        .startGlassHiveLaunchReconciliation();
 
       if (upgradeFinalization.isArmed()) {
         await recoverStaleCortexMessages();

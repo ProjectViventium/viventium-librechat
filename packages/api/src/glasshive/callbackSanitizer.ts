@@ -34,6 +34,9 @@ export function isSafeGlassHiveActionUrl(value: unknown = ''): boolean {
     const isSignedLink = new RegExp(`^/v1/signed-links/[A-Za-z0-9._-]{10,4096}$`).test(
       url.pathname,
     );
+    const isArtifactLinkRef = /^\/v1\/link-refs\/ghr_[A-Za-z0-9_-]{12,96}$/.test(
+      url.pathname,
+    );
     const artifactPath = String(url.searchParams.get('path') || '').replace(/\\/g, '/');
     const segments = artifactPath.split('/').filter(Boolean);
     const artifactPathIsSafe =
@@ -49,7 +52,7 @@ export function isSafeGlassHiveActionUrl(value: unknown = ''): boolean {
       (new RegExp(`^/v1/workers/${safeId}/artifacts/open$`).test(url.pathname) ||
         new RegExp(`^/v1/workers/${safeId}/artifacts/download$`).test(url.pathname)) &&
       artifactPathIsSafe;
-    if (isLocalHost) return isWatchLink || isSignedLink || isArtifact;
+    if (isLocalHost) return isWatchLink || isSignedLink || isArtifactLinkRef || isArtifact;
     return (isWatchLink && url.searchParams.has('gh_token')) || isSignedLink;
   } catch {
     return false;
@@ -58,7 +61,7 @@ export function isSafeGlassHiveActionUrl(value: unknown = ''): boolean {
 
 export function sanitizeGlassHiveCallbackText(
   value: unknown,
-  { maxLength = 4000 }: { maxLength?: number } = {},
+  { maxLength = 4000, ownerResult = false }: { maxLength?: number; ownerResult?: boolean } = {},
 ): string {
   const links: Array<{ token: string; value: string }> = [];
   let text = String(value || '')
@@ -78,11 +81,11 @@ export function sanitizeGlassHiveCallbackText(
     )
     .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, '[secret]')
     .replace(/https?:\/\/(?:localhost|127\.0\.0\.1):\d+\/[^\s)`'"<>]*/gi, '[local worker link]')
-    .replace(LOCAL_PATH_PATTERN, '[local path]')
-    .replace(/\]\(\[local path\](?!\))/g, ']([local path])')
-    .replace(/\bwrk[_-][A-Za-z0-9_-]+\b/g, '[worker id]')
-    .replace(/\brun[_-][A-Za-z0-9_-]+\b/g, '[run id]')
-    .replace(/\bprj[_-][A-Za-z0-9_-]+\b/g, '[project id]')
+    .replace(LOCAL_PATH_PATTERN, (path) => ownerResult ? path : '[local path]')
+    .replace(/\[([^\]\n]+)\]\(\[(?:local path|REDACTED_LOCAL_PATH)\]\)?/g, '$1')
+    .replace(/\bwrk_[a-f0-9]{10,64}\b/g, '[worker id]')
+    .replace(/\brun_(?:idem_)?[a-f0-9]{10,64}\b/g, '[run id]')
+    .replace(/\bprj_[a-f0-9]{10,64}\b/g, '[project id]')
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .split('\n')

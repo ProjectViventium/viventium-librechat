@@ -8,6 +8,11 @@ import { createKeyMethods, type KeyMethods } from './key';
 import { createFileMethods, type FileMethods } from './file';
 /* Memories */
 import { createMemoryMethods, type MemoryMethods } from './memory';
+import { createMemoryWriteMethods, type MemoryWriteMethods } from './memoryWrite';
+import { createNativeResponseMethods } from './nativeResponse';
+import { createMainContinuityMethods } from './mainContinuity';
+export { mainContinuityStorageKey, mainContinuityMessageEvidence } from './mainContinuity';
+import type { MainContinuityMethods } from './mainContinuity';
 import { createFeelingStateMethods, type FeelingStateMethods } from './feelingState';
 /* Agent Categories */
 import { createAgentCategoryMethods, type AgentCategoryMethods } from './agentCategory';
@@ -31,6 +36,8 @@ export type AllMethods = UserMethods &
   KeyMethods &
   FileMethods &
   MemoryMethods &
+  MemoryWriteMethods &
+  MainContinuityMethods &
   FeelingStateMethods &
   AgentCategoryMethods &
   AgentApiKeyMethods &
@@ -55,6 +62,9 @@ export function createMethods(mongoose: typeof import('mongoose')): AllMethods {
     ...createKeyMethods(mongoose),
     ...createFileMethods(mongoose),
     ...createMemoryMethods(mongoose),
+    ...createMemoryWriteMethods(mongoose),
+    ...createNativeResponseMethods(mongoose),
+    ...createMainContinuityMethods(mongoose),
     ...createFeelingStateMethods(mongoose),
     ...createAgentCategoryMethods(mongoose),
     ...createAgentApiKeyMethods(mongoose),
@@ -76,6 +86,7 @@ export type {
   KeyMethods,
   FileMethods,
   MemoryMethods,
+  MemoryWriteMethods,
   FeelingStateMethods,
   AgentCategoryMethods,
   AgentApiKeyMethods,

@@ -18,9 +18,9 @@ const useUserKey = (endpoint: string) => {
   const checkUserKey = useUserKeyQuery(keyName);
 
   const getExpiry = useCallback(() => {
-    if (checkUserKey.data) {
-      return checkUserKey.data.expiresAt || 'never';
-    }
+    // VIVENTIUM: the server returns "never" for a saved, non-expiring key;
+    // null or empty means no usable key, including reconnect-required state.
+    return checkUserKey.data?.expiresAt || undefined;
   }, [checkUserKey.data]);
 
   const checkExpiry = useCallback(() => {

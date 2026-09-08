@@ -633,6 +633,14 @@ describe('buildScheduledCanonicalOutputInstructions', () => {
     expect(result).not.toContain('Telegram');
   });
 
+  test('web preserves requested structures supported by its renderer without changing Telegram rules', () => {
+    const web = buildWebTextInstructions();
+    expect(web).not.toContain('Avoid markdown tables');
+    expect(web).toContain('Markdown headings and tables are supported');
+    expect(web).toContain('Do not use raw HTML');
+    expect(buildTelegramTextInstructions()).toContain('Avoid markdown tables');
+  });
+
   test('ordinary web output retains its independent interactive contract', () => {
     expect(buildWebTextInstructions()).toContain('WEB TEXT MODE:');
     expect(buildWebTextInstructions()).not.toContain('SCHEDULED CANONICAL OUTPUT:');

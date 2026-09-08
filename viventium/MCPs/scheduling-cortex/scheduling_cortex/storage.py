@@ -61,10 +61,12 @@ DEFAULT_SCHEDULED_PROMPT_RECOVERY_SECONDS = 15 * 60
 DEFAULT_EXTERNAL_WORK_STALE_SECONDS = 24 * 60 * 60
 SCHEDULER_DEFERRED_OCCURRENCE_KEY = "scheduler_deferred_occurrence_v1"
 SCHEDULER_MISFIRE_KEY = "scheduler_misfire"
+SCHEDULER_RETRY_OCCURRENCE_KEY = "scheduler_retry_occurrence_v1"
 NON_STRUCTURAL_SCHEDULE_METADATA_KEYS = frozenset(
     {
         SCHEDULER_DEFERRED_OCCURRENCE_KEY,
         SCHEDULER_MISFIRE_KEY,
+        SCHEDULER_RETRY_OCCURRENCE_KEY,
         "recurrence_state_v1",
         "scheduled_failure_state_v1",
         "heartbeat_quiet_streak",
@@ -460,6 +462,37 @@ class ScheduleStorage:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_prompt_run_attempts (
+              run_id TEXT NOT NULL,
+              attempt INTEGER NOT NULL,
+              attempted_at TEXT NOT NULL,
+              completed_at TEXT NOT NULL,
+              status TEXT NOT NULL,
+              disposition TEXT,
+              error_class TEXT,
+              result_summary TEXT,
+              lease_owner TEXT,
+              execution_snapshot_json TEXT,
+              channel_outcomes_json TEXT,
+              interaction_ref TEXT,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (run_id, attempt),
+              FOREIGN KEY(run_id) REFERENCES scheduled_prompt_runs(run_id)
+            )
+            """
+        )
+        attempt_columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(scheduled_prompt_run_attempts)"
+            ).fetchall()
+        }
+        if "lease_owner" not in attempt_columns:
+            conn.execute(
+                "ALTER TABLE scheduled_prompt_run_attempts ADD COLUMN lease_owner TEXT"
+            )
         # === VIVENTIUM START ===
         # Feature: Receiver-owned monotonic GlassHive terminal callback authority.
         conn.execute(
@@ -899,6 +932,30 @@ class ScheduleStorage:
                 else {"id": run["task_id"], "schedule": {"type": "daily"}}
             )
             task_metadata = dict(task.get("metadata") or {})
+            retry_occurrence = task_metadata.get(SCHEDULER_RETRY_OCCURRENCE_KEY)
+            try:
+                retry_attempt = int(
+                    retry_occurrence.get("attempt") or 0
+                ) if isinstance(retry_occurrence, dict) else 0
+            except (TypeError, ValueError):
+                retry_attempt = 0
+            recorded_attempt = conn.execute(
+                """
+                SELECT 1 FROM scheduled_prompt_run_attempts
+                WHERE run_id = ? AND attempt = ?
+                """,
+                (str(run["run_id"]), max(1, int(run["attempt"] or 0))),
+            ).fetchone()
+            if (
+                str(run["status"] or "") == "queued"
+                and isinstance(retry_occurrence, dict)
+                and str(retry_occurrence.get("run_id") or "") == str(run["run_id"])
+                and str(retry_occurrence.get("occurrence_key") or "")
+                == str(run["occurrence_key"] or "")
+                and retry_attempt == int(run["attempt"] or 0)
+                and recorded_attempt is not None
+            ):
+                continue
             delivery = {
                 "outcome": "failed",
                 "reason": failure_class,
@@ -962,6 +1019,21 @@ class ScheduleStorage:
                         run["task_id"],
                         run["user_id"],
                     ),
+                )
+            if int(run["attempt"] or 0) > 0 and recorded_attempt is None:
+                cls._insert_scheduled_prompt_run_attempt(
+                    conn,
+                    {
+                        **run_data,
+                        "status": "failed",
+                        "disposition": "failed",
+                        "error_class": failure_class,
+                        "result_summary": summary,
+                        "completed_at": now_iso,
+                        "updated_at": now_iso,
+                        "execution_snapshot_json": json.dumps(execution_snapshot),
+                    },
+                    lease_owner=str(run["lease_owner"] or ""),
                 )
             conn.execute(
                 """
@@ -1550,6 +1622,15 @@ class ScheduleStorage:
     def delete_scheduled_prompt_definition(self, definition_id: str) -> bool:
         with self._connect() as conn:
             conn.execute(
+                """
+                DELETE FROM scheduled_prompt_run_attempts
+                WHERE run_id IN (
+                  SELECT run_id FROM scheduled_prompt_runs WHERE definition_id = ?
+                )
+                """,
+                (definition_id,),
+            )
+            conn.execute(
                 "DELETE FROM scheduled_prompt_runs WHERE definition_id = ?",
                 (definition_id,),
             )
@@ -2113,6 +2194,86 @@ class ScheduleStorage:
             self._sync_to_mirror()
         return updated
 
+    def begin_scheduled_prompt_run_dispatch(
+        self,
+        run_id: str,
+        *,
+        expected_lease_owner: str,
+        expected_attempt: int,
+        now: str,
+        lease_seconds: int,
+        execution_snapshot: Dict[str, Any],
+        task_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Atomically fence one claimed attempt before any external dispatch."""
+        if not str(expected_lease_owner or "").strip():
+            raise ValueError("expected lease owner is required")
+        if int(expected_attempt) < 1:
+            raise ValueError("expected attempt must be positive")
+        now_dt = self._parse_utc_instant(now)
+        if now_dt is None:
+            raise ValueError("dispatch preparation time must be a UTC instant")
+        now_iso = now_dt.isoformat().replace("+00:00", "Z")
+        lease_until = (
+            now_dt + timedelta(seconds=max(1, int(lease_seconds)))
+        ).isoformat().replace("+00:00", "Z")
+        row: Optional[sqlite3.Row] = None
+        prepared = False
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE scheduled_prompt_runs
+                SET status = 'dispatching', disposition = 'running',
+                    execution_snapshot_json = ?, lease_until = ?, updated_at = ?
+                WHERE run_id = ? AND lease_owner = ? AND attempt = ?
+                  AND status = 'claimed' AND lease_until IS NOT NULL
+                  AND julianday(lease_until) > julianday(?)
+                """,
+                (
+                    self._json_or_none(execution_snapshot),
+                    lease_until,
+                    now_iso,
+                    str(run_id),
+                    str(expected_lease_owner),
+                    int(expected_attempt),
+                    now_iso,
+                ),
+            )
+            if cursor.rowcount != 1:
+                row = conn.execute(
+                    "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
+                    (str(run_id),),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
+                    (str(run_id),),
+                ).fetchone()
+                if row is None or not self._update_scheduled_task_transition(
+                    conn,
+                    task_id=str(row["task_id"]),
+                    user_id=str(row["user_id"]),
+                    updates={
+                        "last_run_at": now_iso,
+                        "last_status": "running",
+                        "last_error": None,
+                        "updated_at": now_iso,
+                        **({"metadata": task_metadata} if task_metadata is not None else {}),
+                    },
+                ):
+                    raise RuntimeError(
+                        "scheduled task disappeared during dispatch preparation"
+                    )
+                prepared = True
+        if prepared:
+            self._sync_to_mirror()
+        return {
+            "prepared": prepared,
+            "reason": "prepared" if prepared else "stale_attempt",
+            "run": self._row_to_scheduled_prompt_run(row),
+        }
+
     def claim_scheduled_prompt_occurrence(
         self,
         *,
@@ -2148,8 +2309,47 @@ class ScheduleStorage:
             ).fetchone()
             if occurrence is not None:
                 occurrence_data = dict(occurrence)
+                retry_not_before: Optional[datetime] = None
+                retry_task = conn.execute(
+                    "SELECT metadata_json FROM scheduled_tasks WHERE id = ? AND user_id = ?",
+                    (str(task_id), str(user_id)),
+                ).fetchone()
+                if retry_task is not None:
+                    try:
+                        retry_metadata = json.loads(retry_task["metadata_json"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        retry_metadata = {}
+                    retry_occurrence = (
+                        retry_metadata.get(SCHEDULER_RETRY_OCCURRENCE_KEY)
+                        if isinstance(retry_metadata, dict)
+                        else None
+                    )
+                    recorded_retry_attempt = conn.execute(
+                        """
+                        SELECT 1 FROM scheduled_prompt_run_attempts
+                        WHERE run_id = ? AND attempt = ?
+                        """,
+                        (
+                            str(occurrence_data.get("run_id") or ""),
+                            max(1, int(occurrence_data.get("attempt") or 0)),
+                        ),
+                    ).fetchone()
+                    if (
+                        isinstance(retry_occurrence, dict)
+                        and str(retry_occurrence.get("run_id") or "")
+                        == str(occurrence_data.get("run_id") or "")
+                        and str(retry_occurrence.get("occurrence_key") or "")
+                        == occurrence_key
+                        and recorded_retry_attempt is not None
+                    ):
+                        retry_not_before = self._parse_utc_instant(
+                            retry_occurrence.get("next_attempt_at")
+                        )
                 existing_lease_until = self._parse_utc_instant(occurrence_data.get("lease_until"))
-                if (
+                if retry_not_before is not None and retry_not_before > now_utc:
+                    run = occurrence_data
+                    reason = "retry_not_due"
+                elif (
                     str(occurrence_data.get("status") or "")
                     in ACTIVE_SCHEDULED_PROMPT_RUN_STATUSES
                     and str(occurrence_data.get("status") or "") != "claimed"
@@ -2173,7 +2373,9 @@ class ScheduleStorage:
                         str(occurrence_data.get("status") or "")
                         in TERMINAL_SCHEDULED_PROMPT_RUN_STATUSES
                     )
-                if self._scheduled_prompt_run_is_active(occurrence_data, now_utc):
+                if reason == "retry_not_due":
+                    pass
+                elif self._scheduled_prompt_run_is_active(occurrence_data, now_utc):
                     run = occurrence_data
                     reason = "occurrence_already_claimed"
                 elif str(occurrence_data.get("status") or "") in TERMINAL_SCHEDULED_PROMPT_RUN_STATUSES:
@@ -2197,12 +2399,47 @@ class ScheduleStorage:
                         run = dict(active)
                         reason = "task_has_active_occurrence"
                     else:
+                        previous_attempt = max(
+                            1, int(occurrence_data.get("attempt") or 0)
+                        )
+                        recorded_attempt = conn.execute(
+                            """
+                            SELECT 1 FROM scheduled_prompt_run_attempts
+                            WHERE run_id = ? AND attempt = ?
+                            """,
+                            (
+                                str(occurrence_data.get("run_id") or ""),
+                                previous_attempt,
+                            ),
+                        ).fetchone()
+                        if recorded_attempt is None:
+                            self._insert_scheduled_prompt_run_attempt(
+                                conn,
+                                {
+                                    **occurrence_data,
+                                    "attempt": previous_attempt,
+                                    "status": "failed",
+                                    "disposition": "failed",
+                                    "error_class": "attempt_lease_expired",
+                                    "result_summary": (
+                                        "The scheduler lease expired before the attempt "
+                                        "reached a terminal result."
+                                    ),
+                                    "completed_at": now_iso,
+                                    "updated_at": now_iso,
+                                },
+                                lease_owner=str(
+                                    occurrence_data.get("lease_owner") or ""
+                                ),
+                            )
                         conn.execute(
                             """
                             UPDATE scheduled_prompt_runs
                             SET lease_owner = ?, lease_until = ?, attempt = COALESCE(attempt, 0) + 1,
                                 status = 'claimed', disposition = 'running', started_at = ?,
-                                completed_at = NULL, error_class = NULL, updated_at = ?
+                                completed_at = NULL, error_class = NULL, result_summary = NULL,
+                                execution_snapshot_json = NULL, channel_outcomes_json = NULL,
+                                interaction_ref = NULL, updated_at = ?
                             WHERE occurrence_key = ?
                             """,
                             (lease_owner, lease_until_iso, now_iso, now_iso, occurrence_key),
@@ -2299,6 +2536,278 @@ class ScheduleStorage:
         self._sync_to_mirror()
         return self.get_scheduled_prompt_run(run_id)
 
+    @staticmethod
+    def _insert_scheduled_prompt_run_attempt(
+        conn: sqlite3.Connection,
+        terminal: Dict[str, Any],
+        *,
+        lease_owner: str,
+    ) -> None:
+        attempt = max(1, int(terminal.get("attempt") or 0))
+        completed_at = str(
+            terminal.get("completed_at")
+            or terminal.get("updated_at")
+            or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+        attempted_at = str(
+            terminal.get("started_at") or terminal.get("created_at") or completed_at
+        )
+        conn.execute(
+            """
+            INSERT INTO scheduled_prompt_run_attempts (
+              run_id, attempt, attempted_at, completed_at, status, disposition,
+              error_class, result_summary, lease_owner, execution_snapshot_json,
+              channel_outcomes_json, interaction_ref, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(terminal.get("run_id") or ""),
+                attempt,
+                attempted_at,
+                completed_at,
+                str(terminal.get("status") or "failed"),
+                terminal.get("disposition"),
+                terminal.get("error_class"),
+                terminal.get("result_summary"),
+                str(lease_owner or "") or None,
+                terminal.get("execution_snapshot_json"),
+                terminal.get("channel_outcomes_json"),
+                terminal.get("interaction_ref"),
+                completed_at,
+            ),
+        )
+
+    @classmethod
+    def _update_scheduled_task_transition(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        task_id: str,
+        user_id: str,
+        updates: Dict[str, Any],
+    ) -> bool:
+        allowed = {
+            "active",
+            "conversation_id",
+            "last_conversation_id",
+            "last_delivery",
+            "last_delivery_at",
+            "last_delivery_outcome",
+            "last_delivery_reason",
+            "last_error",
+            "last_generated_text",
+            "last_run_at",
+            "last_status",
+            "metadata",
+            "next_run_at",
+            "updated_at",
+        }
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(
+                "unsupported scheduled task transition fields: "
+                + ", ".join(sorted(unknown))
+            )
+        current = conn.execute(
+            "SELECT * FROM scheduled_tasks WHERE id = ? AND user_id = ?",
+            (str(task_id), str(user_id)),
+        ).fetchone()
+        if current is None:
+            return False
+        payload = dict(updates)
+        structural_fields = {"conversation_id", "metadata"}
+        if structural_fields.intersection(payload):
+            current_task = dict(current)
+            current_task["schedule"] = json.loads(current_task.pop("schedule_json"))
+            current_task["channel"] = cls._deserialize_channel(
+                current_task.get("channel")
+            )
+            current_task["metadata"] = json.loads(
+                current_task.pop("metadata_json") or "{}"
+            )
+            merged_task = {
+                **current_task,
+                **payload,
+                "id": str(task_id),
+                "user_id": str(user_id),
+            }
+            payload["structural_fingerprint"] = cls._structural_fingerprint(
+                merged_task
+            )
+        if "last_delivery" in payload:
+            delivery = payload.pop("last_delivery")
+            payload["last_delivery_json"] = (
+                json.dumps(delivery) if delivery is not None else None
+            )
+        if "metadata" in payload:
+            metadata = payload.pop("metadata")
+            payload["metadata_json"] = (
+                json.dumps(metadata) if metadata is not None else None
+            )
+        assignments = ", ".join(f"{key} = ?" for key in payload)
+        cursor = conn.execute(
+            f"UPDATE scheduled_tasks SET {assignments} WHERE id = ? AND user_id = ?",
+            [*payload.values(), str(task_id), str(user_id)],
+        )
+        return cursor.rowcount == 1
+
+    def finalize_scheduled_prompt_run_attempt(
+        self,
+        run_id: str,
+        updates: Dict[str, Any],
+        *,
+        expected_lease_owner: str,
+        expected_attempt: int,
+        expected_status: str,
+        task_transition: Optional[Dict[str, Any]] = None,
+        reopen_for_retry: bool = False,
+    ) -> Dict[str, Any]:
+        """Fence and persist one terminal attempt plus its retry transition."""
+        payload = dict(updates)
+        terminal_status = str(payload.get("status") or "")
+        if terminal_status not in TERMINAL_SCHEDULED_PROMPT_RUN_STATUSES:
+            raise ValueError("scheduled prompt attempt must have a terminal status")
+        if not str(expected_lease_owner or "").strip():
+            raise ValueError("expected lease owner is required")
+        if int(expected_attempt) < 1:
+            raise ValueError("expected attempt must be positive")
+        if str(expected_status or "") not in ACTIVE_SCHEDULED_PROMPT_RUN_STATUSES:
+            raise ValueError("expected status must be active")
+        if reopen_for_retry and (
+            terminal_status != "failed" or task_transition is None
+        ):
+            raise ValueError("retry reopening requires one failed task transition")
+        if "execution_snapshot" in payload:
+            payload["execution_snapshot_json"] = self._json_or_none(
+                payload.pop("execution_snapshot")
+            )
+        if "channel_outcomes" in payload:
+            payload["channel_outcomes_json"] = self._json_or_none(
+                payload.pop("channel_outcomes")
+            )
+        payload["lease_owner"] = None
+        payload["lease_until"] = None
+
+        row: Optional[sqlite3.Row] = None
+        finalized = False
+        reason = ""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if current is None:
+                return {"finalized": False, "reason": "run_not_found", "run": None}
+            current_data = dict(current)
+            if (
+                str(current_data.get("lease_owner") or "")
+                != str(expected_lease_owner)
+                or int(current_data.get("attempt") or 0) != int(expected_attempt)
+                or str(current_data.get("status") or "") != str(expected_status)
+            ):
+                return {
+                    "finalized": False,
+                    "reason": "stale_finalizer",
+                    "run": self._row_to_scheduled_prompt_run_dict(current_data),
+                }
+            evidence_conflict = conn.execute(
+                """
+                SELECT 1 FROM scheduled_prompt_run_attempts
+                WHERE run_id = ? AND attempt = ?
+                """,
+                (str(run_id), int(expected_attempt)),
+            ).fetchone()
+            if evidence_conflict is not None:
+                return {
+                    "finalized": False,
+                    "reason": "attempt_evidence_conflict",
+                    "run": self._row_to_scheduled_prompt_run_dict(current_data),
+                }
+            if task_transition is not None:
+                task_exists = conn.execute(
+                    "SELECT 1 FROM scheduled_tasks WHERE id = ? AND user_id = ?",
+                    (
+                        str(current_data.get("task_id") or ""),
+                        str(current_data.get("user_id") or ""),
+                    ),
+                ).fetchone()
+                if task_exists is None:
+                    return {
+                        "finalized": False,
+                        "reason": "task_not_found",
+                        "run": self._row_to_scheduled_prompt_run_dict(current_data),
+                    }
+            assignments = ", ".join([f"{key} = ?" for key in payload.keys()])
+            cursor = conn.execute(
+                f"""
+                UPDATE scheduled_prompt_runs SET {assignments}
+                WHERE run_id = ? AND lease_owner = ? AND attempt = ? AND status = ?
+                """,
+                [
+                    *payload.values(),
+                    str(run_id),
+                    str(expected_lease_owner),
+                    int(expected_attempt),
+                    str(expected_status),
+                ],
+            )
+            if cursor.rowcount != 1:
+                return {
+                    "finalized": False,
+                    "reason": "stale_finalizer",
+                    "run": self._row_to_scheduled_prompt_run_dict(current_data),
+                }
+            terminal = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if terminal is None:
+                return {"finalized": False, "reason": "run_not_found", "run": None}
+            terminal_data = dict(terminal)
+            self._insert_scheduled_prompt_run_attempt(
+                conn,
+                terminal_data,
+                lease_owner=str(expected_lease_owner),
+            )
+            if task_transition is not None and not self._update_scheduled_task_transition(
+                conn,
+                task_id=str(current_data.get("task_id") or ""),
+                user_id=str(current_data.get("user_id") or ""),
+                updates=task_transition,
+            ):
+                raise RuntimeError("scheduled task transition disappeared during finalization")
+            if reopen_for_retry:
+                conn.execute(
+                    """
+                    UPDATE scheduled_prompt_runs
+                    SET status = 'queued', disposition = 'running', completed_at = NULL,
+                        lease_owner = NULL, lease_until = NULL, error_class = NULL,
+                        result_summary = NULL, execution_snapshot_json = NULL,
+                        channel_outcomes_json = NULL, interaction_ref = NULL,
+                        updated_at = ?
+                    WHERE run_id = ? AND attempt = ? AND status = 'failed'
+                    """,
+                    (
+                        str(payload.get("updated_at") or payload.get("completed_at")),
+                        str(run_id),
+                        int(expected_attempt),
+                    ),
+                )
+            row = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            finalized = True
+            reason = "finalized"
+        if finalized:
+            self._sync_to_mirror()
+        return {
+            "finalized": finalized,
+            "reason": reason,
+            "run": self._row_to_scheduled_prompt_run(row),
+        }
+
     def update_scheduled_prompt_run_if_current(
         self,
         run_id: str,
@@ -2306,6 +2815,8 @@ class ScheduleStorage:
         *,
         expected_status: str,
         expected_error_class: Optional[str],
+        expected_attempt: Optional[int] = None,
+        expected_glasshive_run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Atomically apply callback state only while its observed lifecycle is still current.
 
@@ -2339,6 +2850,11 @@ class ScheduleStorage:
                 current is not None
                 and str(current["status"] or "") == str(expected_status or "")
                 and current["error_class"] == expected_error_class
+                and (expected_attempt is None or int(current["attempt"] or 0) == expected_attempt)
+                and (
+                    expected_glasshive_run_id is None
+                    or str(current["glasshive_run_id"] or "") == expected_glasshive_run_id
+                )
             )
             if current_matches and payload:
                 if str(payload.get("status") or "") == "failed":
@@ -3183,6 +3699,28 @@ class ScheduleStorage:
                 params,
             ).fetchall()
         return [self._row_to_scheduled_prompt_run(row) for row in rows if row]
+
+    def list_scheduled_prompt_run_attempts(self, run_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM scheduled_prompt_run_attempts
+                WHERE run_id = ?
+                ORDER BY attempt ASC
+                """,
+                (str(run_id),),
+            ).fetchall()
+        attempts: List[Dict[str, Any]] = []
+        for row in rows:
+            attempt = dict(row)
+            execution_json = attempt.get("execution_snapshot_json")
+            attempt["execution_snapshot"] = (
+                json.loads(execution_json) if execution_json else None
+            )
+            channel_json = attempt.get("channel_outcomes_json")
+            attempt["channel_outcomes"] = json.loads(channel_json) if channel_json else None
+            attempts.append(attempt)
+        return attempts
 
     def _row_to_scheduled_prompt_definition(self, row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
         if row is None:

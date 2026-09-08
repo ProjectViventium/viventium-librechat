@@ -25,6 +25,7 @@ const mockGenerationJobManager = {
 };
 
 const mockSaveMessage = jest.fn();
+const mockSettleNativeResponse = jest.fn();
 
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
@@ -39,6 +40,7 @@ jest.mock('@librechat/api', () => ({
 
 jest.mock('~/models', () => ({
   saveMessage: (...args) => mockSaveMessage(...args),
+  settleNativeResponse: (...args) => mockSettleNativeResponse(...args),
 }));
 
 jest.mock('~/server/middleware', () => ({
@@ -75,6 +77,55 @@ describe('Agent Abort Endpoint', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+  });
+
+  it.each(['committed', 'pending', 'unavailable'])(
+    'does not claim Stop cancelled a %s native result',
+    async (nativeResponse) => {
+      mockGenerationJobManager.getJob.mockResolvedValue({
+        status: 'running',
+        metadata: { userId: 'test-user-123' },
+      });
+      const finalEvent =
+        nativeResponse === 'committed'
+          ? { final: true, responseMessage: { text: 'Saved.' } }
+          : null;
+      mockGenerationJobManager.abortJob.mockResolvedValue({
+        success: false,
+        nativeResponse,
+        finalEvent,
+      });
+      const response = await request(app)
+        .post('/api/agents/chat/abort')
+        .send({ conversationId: 'native-stream' });
+      expect(response.status).toBe(nativeResponse === 'committed' ? 200 : 202);
+      expect(response.body).toEqual({
+        success: false,
+        nativeResponse,
+        ...(finalEvent ? { finalEvent } : {}),
+      });
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not repeat native settlement after the abort owner saved its partial', async () => {
+    mockGenerationJobManager.getJob.mockResolvedValue({
+      status: 'running',
+      metadata: { userId: 'test-user-123' },
+    });
+    const identity = { invocationId: 'native-invocation' };
+    mockGenerationJobManager.abortJob.mockResolvedValue({
+      success: true,
+      jobData: { nativeResponse: identity },
+      content: [],
+      text: '',
+    });
+    const response = await request(app)
+      .post('/api/agents/chat/abort')
+      .send({ conversationId: 'native-stream' });
+    expect(response.body).toEqual({ success: true, aborted: 'native-stream' });
+    expect(mockSettleNativeResponse).not.toHaveBeenCalled();
+    expect(mockSaveMessage).not.toHaveBeenCalled();
   });
 
   describe('GET /chat/stream/:streamId', () => {
@@ -191,6 +242,7 @@ describe('Agent Abort Endpoint', () => {
         expect(mockGenerationJobManager.abortJob).toHaveBeenCalledWith(
           jobStreamId,
           'user_cancelled',
+          'test-user-123',
         );
       });
 
@@ -433,6 +485,7 @@ describe('Agent Abort Endpoint', () => {
         expect(mockGenerationJobManager.abortJob).toHaveBeenCalledWith(
           'newer-stream',
           'user_cancelled',
+          'test-user-123',
         );
       });
 

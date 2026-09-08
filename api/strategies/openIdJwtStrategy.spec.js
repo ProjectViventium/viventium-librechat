@@ -24,6 +24,7 @@ jest.mock('@librechat/data-schemas', () => ({
   logger: { info: jest.fn(), warn: jest.fn(), debug: jest.fn(), error: jest.fn() },
 }));
 jest.mock('@librechat/api', () => ({
+  getSessionCookieName: jest.requireActual('@librechat/api').getSessionCookieName,
   isEnabled: jest.fn(() => false),
   findOpenIDUser: jest.fn(),
   isEmailDomainAllowed: jest.fn(() => true),

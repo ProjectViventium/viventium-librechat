@@ -12,6 +12,9 @@ import { useLocalize } from '~/hooks';
 import Container from './Container';
 import Markdown from './Markdown';
 import { cn } from '~/utils';
+/* === VIVENTIUM START === Reuse the saved terminal reason for visible reply status. === */
+import { isIncompleteMessage } from '~/utils/messages';
+/* === VIVENTIUM END === */
 import store from '~/store';
 
 const ERROR_CONNECTION_TEXT = 'Error connecting to server, try refreshing the page.';
@@ -127,12 +130,22 @@ const DisplayMessage = ({ text, isCreatedByUser, message, showCursor }: TDisplay
   );
 };
 
-export const UnfinishedMessage = ({ message }: { message: TMessage }) => (
-  <ErrorMessage
-    message={message}
-    text="The response is incomplete; it's either still processing, was cancelled, or censored. Refresh or try a different prompt."
-  />
-);
+export const UnfinishedMessage = ({ message }: { message: TMessage }) => {
+  /* === VIVENTIUM START === An incomplete terminal reply is distinct from a processing error. === */
+  const localize = useLocalize();
+  if (isIncompleteMessage(message)) {
+    return (
+      <p className="mt-2 text-sm text-text-secondary">{localize('com_ui_response_incomplete')}</p>
+    );
+  }
+  /* === VIVENTIUM END === */
+  return (
+    <ErrorMessage
+      message={message}
+      text="The response is incomplete; it's either still processing, was cancelled, or censored. Refresh or try a different prompt."
+    />
+  );
+};
 
 const MessageContent = ({
   text,
@@ -149,17 +162,20 @@ const MessageContent = ({
   const { thinkingContent, regularContent } = useMemo(() => parseThinkingContent(text), [text]);
   const showRegularCursor = useMemo(() => isLast && isSubmitting, [isLast, isSubmitting]);
 
-  const unfinishedMessage = useMemo(
-    () =>
-      !isSubmitting && unfinished ? (
-        <Suspense>
-          <DelayedRender delay={UNFINISHED_DELAY}>
-            <UnfinishedMessage message={message} />
-          </DelayedRender>
-        </Suspense>
-      ) : null,
-    [isSubmitting, unfinished, message],
-  );
+  const unfinishedMessage = useMemo(() => {
+    if (isSubmitting) return null;
+    /* === VIVENTIUM START === The stored terminal status needs no delay or new timing state. === */
+    if (isIncompleteMessage(message)) return <UnfinishedMessage message={message} />;
+    /* === VIVENTIUM END === */
+    if (!unfinished) return null;
+    return (
+      <Suspense>
+        <DelayedRender delay={UNFINISHED_DELAY}>
+          <UnfinishedMessage message={message} />
+        </DelayedRender>
+      </Suspense>
+    );
+  }, [isSubmitting, unfinished, message]);
 
   if (error) {
     return <ErrorMessage message={message} text={text} />;

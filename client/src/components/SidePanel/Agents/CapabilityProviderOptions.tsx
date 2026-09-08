@@ -114,7 +114,7 @@ export default function CapabilityProviderOptions({
   const effortControl = (modelCapability?.effortChoices?.length ?? 0) > 0 && (
     <div className="model-panel-section mt-3">
       <label
-        className="text-token-text-primary model-panel-label mb-1 block font-medium"
+        className="text-text-primary model-panel-label mb-1 block font-medium"
         htmlFor={`${parameterField}-effort`}
       >
         {localize('com_ui_glasshive_effort')}
@@ -127,7 +127,7 @@ export default function CapabilityProviderOptions({
             {...field}
             value={field.value ?? modelCapability?.recommendedEffort ?? ''}
             id={`${parameterField}-effort`}
-            className="border-token-border-light bg-token-surface-primary h-10 w-full rounded-lg border px-3"
+            className="border-border-light bg-surface-primary h-10 w-full rounded-lg border px-3"
           >
             {modelCapability?.effortChoices?.map((effort) => (
               <option key={effort} value={effort}>
@@ -148,11 +148,11 @@ export default function CapabilityProviderOptions({
   }
 
   return (
-    <div className="border-token-border-light bg-token-surface-primary mb-4 rounded-lg border p-4 text-left">
+    <div className="border-border-light bg-surface-primary mb-4 rounded-lg border p-4 text-left">
       <div className="mb-3 flex items-center justify-between gap-3">
         <div>
           <div className="font-medium">{localize('com_ui_glasshive_harness')}</div>
-          <div className="text-token-text-secondary text-xs">
+          <div className="text-text-secondary text-xs">
             {localize('com_ui_glasshive_harness_description')}
           </div>
         </div>
@@ -168,7 +168,7 @@ export default function CapabilityProviderOptions({
           {readinessLabel}
         </span>
       </div>
-      <div className="text-token-text-secondary mb-3 flex items-start justify-between gap-3 text-xs">
+      <div className="text-text-secondary mb-3 flex items-start justify-between gap-3 text-xs">
         <span>{readinessDetail}</span>
         <button
           type="button"
@@ -193,7 +193,7 @@ export default function CapabilityProviderOptions({
           <select
             {...field}
             id={`${parameterField}-glasshive-workspace-mode`}
-            className="border-token-border-light bg-token-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
+            className="border-border-light bg-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
           >
             <option value="life">{localize('com_ui_glasshive_viventium_life')}</option>
             <option value="custom">{localize('com_ui_glasshive_custom_server_path')}</option>
@@ -213,11 +213,11 @@ export default function CapabilityProviderOptions({
                 aria-label={localize('com_ui_glasshive_custom_working_folder')}
                 placeholder={localize('com_ui_glasshive_path_placeholder')}
                 className={cn(
-                  'border-token-border-light bg-token-surface-primary h-10 w-full rounded-lg border px-3',
+                  'border-border-light bg-surface-primary h-10 w-full rounded-lg border px-3',
                   error && 'border-red-500',
                 )}
               />
-              <p className="text-token-text-secondary mt-1 text-xs">
+              <p className="text-text-secondary mt-1 text-xs">
                 {localize('com_ui_glasshive_path_description')}
               </p>
             </div>
@@ -238,7 +238,7 @@ export default function CapabilityProviderOptions({
           <select
             {...field}
             id={`${parameterField}-glasshive-access`}
-            className="border-token-border-light bg-token-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
+            className="border-border-light bg-surface-primary mb-3 h-10 w-full rounded-lg border px-3"
           >
             {providerCapability?.allow_full_access === true && (
               <option value="full">{localize('com_ui_glasshive_full_access')}</option>
@@ -247,14 +247,14 @@ export default function CapabilityProviderOptions({
           </select>
         )}
       />
-      <p className="text-token-text-secondary -mt-2 text-xs">
+      <p className="text-text-secondary -mt-2 text-xs">
         {glassHiveOptions?.access === 'full'
           ? localize('com_ui_glasshive_full_access_warning')
           : localize('com_ui_glasshive_workspace_access_description')}
       </p>
       {(providerCapability?.worker_native_tools === true ||
         providerCapability?.native_tools === true) && (
-        <p className="text-token-text-secondary mt-3 text-xs">
+        <p className="text-text-secondary mt-3 text-xs">
           {localize('com_ui_glasshive_native_tools_description')}
         </p>
       )}

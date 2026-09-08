@@ -8,6 +8,7 @@ const {
 } = require('@librechat/data-schemas');
 const { ErrorTypes, SystemRoles, errorsToString } = require('librechat-data-provider');
 const {
+  getSessionCookieName,
   math,
   isEnabled,
   checkEmailConfig,
@@ -393,9 +394,11 @@ const resetPassword = async (userId, token, password) => {
  * @param {String | ObjectId} userId
  * @param {ServerResponse} res
  * @param {ISession | null} [session=null]
+ * @param {AbortSignal} [signal]
  * @returns
  */
-const setAuthTokens = async (userId, res, _session = null) => {
+/* === VIVENTIUM START === Existing-session refresh cancellation reaches the native save owner. === */
+const setAuthTokens = async (userId, res, _session = null, signal) => {
   try {
     let session = _session;
     let refreshToken;
@@ -404,7 +407,7 @@ const setAuthTokens = async (userId, res, _session = null) => {
 
     if (session && session._id && session.expiration != null) {
       refreshTokenExpires = session.expiration.getTime();
-      refreshToken = await generateRefreshToken(session);
+      refreshToken = await generateRefreshToken(session, signal);
     } else {
       const result = await createSession(userId, { expiresIn });
       session = result.session;
@@ -412,22 +415,25 @@ const setAuthTokens = async (userId, res, _session = null) => {
       refreshTokenExpires = session.expiration.getTime();
     }
 
+    signal?.throwIfAborted();
     const user = await getUserById(userId);
     /* === VIVENTIUM START ===
      * Feature: Approval gate at token issuance layer.
      * Purpose: Block local login, refresh, and 2FA token issuance for pending/denied users.
      * === VIVENTIUM END === */
     await assertViventiumApproved(user);
+    signal?.throwIfAborted();
     const sessionExpiry = math(process.env.SESSION_EXPIRY, DEFAULT_SESSION_EXPIRY);
     const token = await generateToken(user, sessionExpiry);
+    signal?.throwIfAborted();
 
-    res.cookie('refreshToken', refreshToken, {
+    res.cookie(getSessionCookieName('refreshToken'), refreshToken, {
       expires: new Date(refreshTokenExpires),
       httpOnly: true,
       secure: shouldUseSecureCookie(),
       sameSite: 'strict',
     });
-    res.cookie('token_provider', 'librechat', {
+    res.cookie(getSessionCookieName('token_provider'), 'librechat', {
       expires: new Date(refreshTokenExpires),
       httpOnly: true,
       secure: shouldUseSecureCookie(),
@@ -435,10 +441,14 @@ const setAuthTokens = async (userId, res, _session = null) => {
     });
     return token;
   } catch (error) {
+    if (signal?.aborted) {
+      throw error;
+    }
     logger.error('[setAuthTokens] Error in setting authentication tokens:', error);
     throw error;
   }
 };
+/* === VIVENTIUM END === */
 
 /**
  * @function setOpenIDAuthTokens
@@ -499,7 +509,7 @@ const setOpenIDAuthTokens = (tokenset, req, res, userId, existingRefreshToken) =
      * size limits that motivated session storage for the larger access_token/id_token.
      */
     const persistTokens = () => {
-      res.cookie('refreshToken', refreshToken, {
+      res.cookie(getSessionCookieName('refreshToken'), refreshToken, {
         expires: expirationDate,
         httpOnly: true,
         secure: shouldUseSecureCookie(),
@@ -516,14 +526,14 @@ const setOpenIDAuthTokens = (tokenset, req, res, userId, existingRefreshToken) =
         };
       } else {
         logger.warn('[setOpenIDAuthTokens] No session available, falling back to cookies');
-        res.cookie('openid_access_token', tokenset.access_token, {
+        res.cookie(getSessionCookieName('openid_access_token'), tokenset.access_token, {
           expires: expirationDate,
           httpOnly: true,
           secure: shouldUseSecureCookie(),
           sameSite: 'strict',
         });
         if (tokenset.id_token) {
-          res.cookie('openid_id_token', tokenset.id_token, {
+          res.cookie(getSessionCookieName('openid_id_token'), tokenset.id_token, {
             expires: expirationDate,
             httpOnly: true,
             secure: shouldUseSecureCookie(),
@@ -533,7 +543,7 @@ const setOpenIDAuthTokens = (tokenset, req, res, userId, existingRefreshToken) =
       }
 
       /** Small cookie to indicate token provider (required for auth middleware) */
-      res.cookie('token_provider', 'openid', {
+      res.cookie(getSessionCookieName('token_provider'), 'openid', {
         expires: expirationDate,
         httpOnly: true,
         secure: shouldUseSecureCookie(),
@@ -544,7 +554,7 @@ const setOpenIDAuthTokens = (tokenset, req, res, userId, existingRefreshToken) =
         const signedUserId = jwt.sign({ id: userId }, process.env.JWT_REFRESH_SECRET, {
           expiresIn: expiryInMilliseconds / 1000,
         });
-        res.cookie('openid_user_id', signedUserId, {
+        res.cookie(getSessionCookieName('openid_user_id'), signedUserId, {
           expires: expirationDate,
           httpOnly: true,
           secure: shouldUseSecureCookie(),

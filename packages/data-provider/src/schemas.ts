@@ -655,6 +655,9 @@ export const tMessageSchema = z.object({
     .default(() => new Date().toISOString()),
   current: z.boolean().optional(),
   unfinished: z.boolean().optional(),
+  /* === VIVENTIUM START === Public projection; private writer admission is never transmitted. === */
+  memoryWriteStatus: z.enum(['pending', 'running', 'completed', 'failed']).optional(),
+  /* === VIVENTIUM END === */
   searchResult: z.boolean().optional(),
   finish_reason: z.string().optional(),
   /* assistant */
@@ -673,7 +676,9 @@ export type MemoryArtifact = {
   /* === VIVENTIUM START === Post-write revision for conflict-safe optimistic memory state. === */
   revision?: number;
   /* === VIVENTIUM END === */
-  type: 'update' | 'delete' | 'error';
+  /* === VIVENTIUM START === Same-value writes are distinct from saved changes. === */
+  type: 'update' | 'delete' | 'error' | 'unchanged';
+  /* === VIVENTIUM END === */
 };
 
 export type UIResource = {

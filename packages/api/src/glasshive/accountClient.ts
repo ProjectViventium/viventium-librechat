@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import type { NativeWorkInputResponse } from 'librechat-data-provider';
 import { glassHiveAccountUrl } from './accountUrl';
 
 /* === VIVENTIUM START ===
@@ -10,6 +11,8 @@ import { glassHiveAccountUrl } from './accountUrl';
 const ASSERTION_AUDIENCE = 'glasshive-account-api';
 const ASSERTION_TTL_SECONDS = 60;
 const MAX_RESPONSE_BYTES = 256 * 1024;
+const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
+const DEFAULT_ACTION_TIMEOUT_MS = 15000;
 const ASSERTION_NONCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@-]{7,191}$/;
 
 type UnknownRecord = Record<string, unknown>;
@@ -60,6 +63,32 @@ function configuredTenantId(): string {
   return String(process.env.VIVENTIUM_TENANT_ID || 'local').trim() || 'local';
 }
 
+function positiveIntEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function accountRequestTimeoutMs({
+  method,
+  path,
+  timeoutMs,
+}: {
+  method?: unknown;
+  path?: unknown;
+  timeoutMs?: unknown;
+}): number {
+  const explicitTimeoutMs = Number(timeoutMs);
+  if (Number.isInteger(explicitTimeoutMs) && explicitTimeoutMs > 0) return explicitTimeoutMs;
+  if (
+    String(method || 'GET').toUpperCase() === 'POST' &&
+    String(path || '').startsWith('/v1/work/') &&
+    String(path || '').endsWith('/actions')
+  ) {
+    return positiveIntEnv('VIVENTIUM_ACTIVE_WORK_ACTION_TIMEOUT_MS', DEFAULT_ACTION_TIMEOUT_MS);
+  }
+  return DEFAULT_REQUEST_TIMEOUT_MS;
+}
+
 export function signTrustedDelegationIdentity(
   identity: TrustedDelegationIdentityInput = {},
   options: { ownerId?: unknown; tenantId?: unknown } = {},
@@ -92,10 +121,12 @@ export function signTrustedDelegationIdentity(
 
 export function createServiceAssertion({
   ownerId,
+  nativeInputDigest,
   nowMs = Date.now(),
   nonce = crypto.randomUUID(),
 }: {
   ownerId?: unknown;
+  nativeInputDigest?: string;
   nowMs?: number;
   nonce?: unknown;
 }): string {
@@ -104,9 +135,13 @@ export function createServiceAssertion({
     throw new Error('glasshive_owner_required');
   }
 
+  if (nativeInputDigest && !/^[a-f0-9]{64}$/.test(nativeInputDigest)) {
+    throw new Error('native_input_digest_invalid');
+  }
   const issuedAt = Math.floor(nowMs / 1000);
   const payload = {
     v: 1,
+    ...(nativeInputDigest ? { native_input_digest: nativeInputDigest } : {}),
     aud: ASSERTION_AUDIENCE,
     tenant_id: configuredTenantId(),
     owner_id: normalizedOwnerId,
@@ -135,13 +170,15 @@ export async function requestAccountApi({
   path,
   method = 'GET',
   body,
+  ownerNativeInput,
   fetchImpl = globalThis.fetch,
-  timeoutMs = 5000,
+  timeoutMs,
 }: {
   ownerId?: unknown;
   path: string;
   method?: string;
   body?: unknown;
+  ownerNativeInput?: NativeWorkInputResponse;
   fetchImpl?: AccountFetch;
   timeoutMs?: number;
 }): Promise<unknown> {
@@ -150,14 +187,20 @@ export async function requestAccountApi({
   }
 
   const url = glassHiveAccountUrl(requiredEnv('GLASSHIVE_PROVIDER_BASE_URL'), path);
+  const serializedBody = body == null ? undefined : JSON.stringify(body);
+  const nativeInputDigest =
+    ownerNativeInput && serializedBody
+      ? crypto.createHash('sha256').update(serializedBody, 'utf8').digest('hex')
+      : undefined;
   const headers: Record<string, string> = {
     Accept: 'application/json',
     Authorization: `Bearer ${requiredEnv('WPR_API_TOKEN')}`,
-    'X-Viventium-Service-Assertion': createServiceAssertion({ ownerId }),
+    'X-Viventium-Service-Assertion': createServiceAssertion({ ownerId, nativeInputDigest }),
   };
   if (body != null) {
     headers['Content-Type'] = 'application/json';
   }
+  const requestTimeoutMs = accountRequestTimeoutMs({ method, path, timeoutMs });
 
   const abortSignalConstructor = AbortSignal as typeof AbortSignal & {
     timeout?: (milliseconds: number) => AbortSignal;
@@ -166,9 +209,9 @@ export async function requestAccountApi({
     method,
     redirect: 'error',
     headers,
-    ...(body != null ? { body: JSON.stringify(body) } : {}),
+    ...(serializedBody != null ? { body: serializedBody } : {}),
     ...(typeof abortSignalConstructor.timeout === 'function'
-      ? { signal: abortSignalConstructor.timeout(timeoutMs) }
+      ? { signal: abortSignalConstructor.timeout(requestTimeoutMs) }
       : {}),
   });
   const contentType = String(response.headers.get('content-type') || '').toLowerCase();

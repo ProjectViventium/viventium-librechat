@@ -47,6 +47,19 @@ export interface InteractionReplyContext {
   readonly attachments?: readonly InteractionReplyAttachment[];
 }
 
+export interface ReadyInputContinuation {
+  readonly source_message_id: string;
+  readonly presentation_source_sequence: number;
+}
+
+/** Original source order remains immutable; this separate fence owns resumed presentation. */
+export function interactionPresentationSequence(context?: {
+  readonly source_sequence?: number;
+  readonly ready_input_continuation?: ReadyInputContinuation;
+}): number | undefined {
+  return context?.ready_input_continuation?.presentation_source_sequence ?? context?.source_sequence;
+}
+
 export interface TrustedInteractionContext {
   readonly actor_kind: InteractionActorKind;
   readonly origin: InteractionOrigin;
@@ -57,6 +70,8 @@ export interface TrustedInteractionContext {
   readonly source_event_id: string;
   readonly source_order_scope?: string;
   readonly source_sequence?: number;
+  readonly source_conversation_generation?: string;
+  readonly ready_input_continuation?: ReadyInputContinuation;
   readonly turn_scope?: InteractionTurnScope;
   readonly schedule_id?: string;
   readonly schedule_run_id?: string;
@@ -77,6 +92,8 @@ export interface InteractionContextInput {
   source_event_id?: unknown;
   source_order_scope?: unknown;
   source_sequence?: unknown;
+  source_conversation_generation?: unknown;
+  ready_input_continuation?: unknown;
   turn_scope?: unknown;
   schedule_id?: unknown;
   schedule_run_id?: unknown;
@@ -113,6 +130,7 @@ export interface InteractionFactoryInput {
 }
 
 export interface TelegramInteractionFactoryInput extends InteractionFactoryInput {
+  conversation_generation?: unknown;
   source_order_scope?: unknown;
   source_sequence?: unknown;
   reply_context?: unknown;
@@ -360,6 +378,13 @@ export function normalizeInteractionContext(
   const sourceSequence = Number(context.source_sequence);
   const hasSourceOrder =
     Boolean(sourceOrderScope) && Number.isSafeInteger(sourceSequence) && sourceSequence > 0;
+  const continuation = recordFrom(context.ready_input_continuation);
+  const presentationSequence = Number(continuation.presentation_source_sequence);
+  const sourceMessageId = boundedIdentifier(continuation.source_message_id);
+  if (context.ready_input_continuation != null && (!hasSourceOrder || !sourceMessageId ||
+      !Number.isSafeInteger(presentationSequence) || presentationSequence < sourceSequence)) {
+    throw new Error('Invalid prepared input presentation authority');
+  }
   const normalized: TrustedInteractionContext = {
     actor_kind: enumValue(context.actor_kind, ACTORS, 'external_user'),
     origin: enumValue(context.origin, ORIGINS, 'interactive'),
@@ -371,6 +396,12 @@ export function normalizeInteractionContext(
     ...(hasSourceOrder
       ? { source_order_scope: sourceOrderScope, source_sequence: sourceSequence }
       : {}),
+    ...(/^[a-f0-9]{64}$/.test(String(context.source_conversation_generation || ''))
+      ? { source_conversation_generation: String(context.source_conversation_generation) } : {}),
+    ...(context.ready_input_continuation != null ? {
+      ready_input_continuation: Object.freeze({ source_message_id: sourceMessageId,
+        presentation_source_sequence: presentationSequence }),
+    } : {}),
     ...(context.turn_scope
       ? { turn_scope: enumValue(context.turn_scope, TURN_SCOPES, 'conversation') }
       : {}),
@@ -440,6 +471,9 @@ export function createTelegramInteractionContext(
     source_order_scope: input.source_order_scope,
     source_sequence: input.source_sequence,
     reply_context: input.reply_context,
+    source_conversation_generation: /^[a-f0-9]{64}$/.test(String(input.conversation_generation || ''))
+      ? createHash('sha256').update(JSON.stringify([input.conversation_generation, input.conversation_id || 'new'])).digest('hex')
+      : undefined,
   });
 }
 
@@ -501,6 +535,25 @@ export function getTrustedInteractionContext(
   return req ? trustedContexts.get(req) || null : null;
 }
 
+/** Provider scope comes only from the authenticated request, including tool-less child runs. */
+export function projectTrustedNativeInteractionHeaders(
+  request: object | null | undefined,
+  headers: Readonly<Record<string, string>> = {},
+): Record<string, string> {
+  const projected = Object.fromEntries(
+    Object.entries(headers).filter(([key]) => {
+      const normalized = key.toLowerCase();
+      return normalized !== 'x-viventium-actor-kind' && normalized !== 'x-viventium-origin';
+    }),
+  );
+  const context = getTrustedInteractionContext(request);
+  if (context) {
+    projected['X-Viventium-Actor-Kind'] = context.actor_kind;
+    projected['X-Viventium-Origin'] = context.origin;
+  }
+  return projected;
+}
+
 export function getTrustedAdapterCapabilities(
   request: object | null | undefined,
 ): TrustedInteractionAdapterCapabilities | null {
@@ -550,10 +603,28 @@ export function projectTrustedClientPresentation(
   return projected;
 }
 
+/** Bind an owner-validated prepared source before the shared logical-turn claim. */
+export function bindReadyInputContinuation(
+  request: object, sourceMessageId: string, presentationSourceSequence: number,
+): TrustedInteractionContext {
+  const current = trustedContexts.get(request);
+  if (!current || current.logical_turn_id || current.actor_kind !== 'external_user' ||
+      current.origin !== 'interactive' || current.surface !== 'telegram') {
+    throw new Error('Prepared input requires an unclaimed authenticated Telegram source');
+  }
+  const normalized = normalizeInteractionContext({ ...current,
+    ready_input_continuation: { source_message_id: sourceMessageId,
+      presentation_source_sequence: presentationSourceSequence },
+  });
+  trustedContexts.set(request, normalized);
+  return normalized;
+}
+
 export function bindInteractionSourceSegments(
   request: object | null | undefined,
   text: unknown,
   sourceFiles: readonly InteractionSourceFile[] = [],
+  sourceMessage?: { messageId: string; parentMessageId: string; persisted?: true },
 ): TrustedInteractionContext | null {
   const req = objectKey(request);
   const current = req ? trustedContexts.get(req) || null : null;
@@ -569,12 +640,17 @@ export function bindInteractionSourceSegments(
   const incoming = values.map((value, sourceIndex) => ({
     source_event_id: current.source_event_id,
     source_index: sourceIndex,
+    ...(current.source_sequence ? { source_sequence: current.source_sequence } : {}),
+    ...(sourceMessage ? { source_message_id: sourceMessage.messageId, source_parent_message_id: sourceMessage.parentMessageId, ...(sourceMessage.persisted ? { source_persisted: true } : {}) } : {}),
     text: value,
     ...(sourceIndex === 0 && sourceFiles.length ? { source_files: sourceFiles } : {}),
   }));
   const normalized = normalizeInteractionContext({
     ...current,
-    source_segments: [...(current.source_segments || []), ...incoming],
+    source_segments: [...(current.source_segments || []).map((segment) => {
+      const addition = incoming.find((candidate) => candidate.source_event_id === segment.source_event_id && candidate.source_index === segment.source_index);
+      return addition ? { ...segment, ...(addition.source_files ? { source_files: addition.source_files } : {}), ...(sourceMessage ? { source_message_id: sourceMessage.messageId, source_parent_message_id: sourceMessage.parentMessageId, ...(sourceMessage.persisted ? { source_persisted: true } : {}) } : {}) } : segment;
+    }), ...incoming],
   });
   trustedContexts.set(req, normalized);
   return normalized;

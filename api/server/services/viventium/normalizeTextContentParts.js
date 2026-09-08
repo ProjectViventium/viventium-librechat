@@ -11,7 +11,7 @@
  *     messages.N.content.M.text.text: Input should be a valid string
  *
  * Safety:
- * - Only rewrites `type: "text"` parts.
+ * - Normalizes text parts and projects separately stored authored user text before formatting.
  * - Leaves non-text parts unchanged (tool_call, image_url, cortex parts, etc).
  * - Returns original references when no changes are required.
  *
@@ -59,6 +59,18 @@ function coerceTextToString(text) {
   }
 
   return '';
+}
+
+/** Preserve separately stored authored user text before the provider formatter drops `text`. */
+function normalizeUserMessageContent(message) {
+  if (message?.isCreatedByUser !== true || typeof message.text !== 'string' ||
+      !message.text || !Array.isArray(message.content) || message.content.some((part) =>
+        typeof part === 'string' ? part.trim().length > 0 :
+          [ContentTypes.TEXT, 'input_text', 'output_text'].includes(part?.type) &&
+            coerceTextToString(part.text ?? part.input_text ?? part.output_text).trim().length > 0)) {
+    return message;
+  }
+  return { ...message, content: [{ type: ContentTypes.TEXT, text: message.text }, ...message.content] };
 }
 
 /**
@@ -440,6 +452,7 @@ function sanitizeProviderFormattedMessages(provider, messages) {
 
 module.exports = {
   coerceTextToString,
+  normalizeUserMessageContent,
   normalizeTextContentParts,
   normalizeTextPartsInPayload,
   normalizeProviderKey,

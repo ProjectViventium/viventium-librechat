@@ -167,7 +167,7 @@ async function saveInputMessages(req, conversationId, inputMessages, agentId) {
           endpoint: EModelEndpoint.agents,
           model: agentId,
         },
-        { context: 'Responses API - save user input' },
+        { operationKind: 'system', context: 'Responses API - save user input' },
       );
     }
   }
@@ -210,7 +210,7 @@ async function saveResponseOutput(req, conversationId, responseId, response, age
       finish_reason: response.status === 'completed' ? 'stop' : response.status,
       tokenCount: response.usage?.output_tokens,
     },
-    { context: 'Responses API - save assistant response' },
+    { operationKind: 'system', context: 'Responses API - save assistant response' },
   );
 }
 

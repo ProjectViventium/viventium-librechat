@@ -6,6 +6,7 @@ describe('cacheConfig', () => {
 
     // Clear all related env vars first
     delete process.env.REDIS_URI;
+    delete process.env.REDIS_SOCKET_PATH;
     delete process.env.REDIS_CA;
     delete process.env.REDIS_KEY_PREFIX_VAR;
     delete process.env.REDIS_KEY_PREFIX;
@@ -76,7 +77,7 @@ describe('cacheConfig', () => {
 
       await expect(async () => {
         await import('../cacheConfig');
-      }).rejects.toThrow('USE_REDIS is enabled but REDIS_URI is not set.');
+      }).rejects.toThrow('USE_REDIS requires REDIS_URI or REDIS_SOCKET_PATH.');
     });
 
     test('should not throw error when USE_REDIS is enabled and REDIS_URI is set', async () => {
@@ -95,9 +96,26 @@ describe('cacheConfig', () => {
 
       await expect(async () => {
         await import('../cacheConfig');
-      }).rejects.toThrow('USE_REDIS is enabled but REDIS_URI is not set.');
+      }).rejects.toThrow('USE_REDIS requires REDIS_URI or REDIS_SOCKET_PATH.');
     });
   });
+
+  // VIVENTIUM START: a local socket is a complete, mutually exclusive transport.
+  test('accepts a private Redis socket without a TCP URL', async () => {
+    process.env.USE_REDIS = 'true';
+    process.env.REDIS_SOCKET_PATH = '/tmp/synthetic-redis.sock';
+    const { cacheConfig } = await import('../cacheConfig');
+    expect(cacheConfig.REDIS_SOCKET_PATH).toBe('/tmp/synthetic-redis.sock');
+    expect(cacheConfig.USE_REDIS_STREAMS).toBe(true);
+  });
+
+  test.each(['REDIS_URI', 'USE_REDIS_CLUSTER'])('rejects socket mixed with %s', async (setting) => {
+    process.env.USE_REDIS = 'true';
+    process.env.REDIS_SOCKET_PATH = '/tmp/synthetic-redis.sock';
+    process.env[setting] = setting === 'REDIS_URI' ? 'redis://localhost:6379' : 'true';
+    await expect(import('../cacheConfig')).rejects.toThrow('cannot be combined');
+  });
+  // VIVENTIUM END
 
   describe('USE_REDIS_CLUSTER configuration', () => {
     test('should default to false when USE_REDIS_CLUSTER is not set', async () => {

@@ -30,6 +30,7 @@ interface AuthorizationRecord extends ValueRecord {
   currentRunId: string;
   currentGrantId: string;
   currentContainerGenerationId: string;
+  currentHostStartupLeaseId?: string;
   maxExpiresAt: Date | string;
   lastNeedsInputCode?: string;
 }
@@ -136,6 +137,7 @@ interface VerifyAdmissionInput {
 }
 
 interface AdmitAuthorizationInput {
+  hostStartupLeaseId?: unknown;
   authorizationRef?: unknown;
   originRef?: unknown;
   workRef?: unknown;
@@ -171,9 +173,7 @@ function runtime(): CapabilityAuthorizationDependencies {
 }
 
 function recordFrom(value: unknown): ValueRecord {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? (value as ValueRecord)
-    : {};
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as ValueRecord) : {};
 }
 
 function errorCode(error: unknown): unknown {
@@ -740,6 +740,44 @@ async function revalidateAuthorization(record: AuthorizationRecord): Promise<Use
   return normalizedUser;
 }
 
+interface RunAuthorityGeneration {
+  id: string;
+  executionMode: 'docker' | 'host';
+  recordField: 'currentContainerGenerationId' | 'currentHostStartupLeaseId';
+  requestField: 'containerGenerationId' | 'hostStartupLeaseId';
+  grantField: 'container_generation_id' | 'host_startup_lease_id';
+}
+
+function runAuthorityGeneration(
+  containerGenerationId: unknown,
+  hostStartupLeaseId: unknown,
+): RunAuthorityGeneration | null {
+  const container = String(containerGenerationId || '')
+    .trim()
+    .toLowerCase();
+  const host = String(hostStartupLeaseId || '')
+    .trim()
+    .toLowerCase();
+  if (Boolean(container) === Boolean(host)) return null;
+  const id = container || host;
+  if (!CONTAINER_GENERATION_ID.test(id)) return null;
+  return container
+    ? {
+        id,
+        executionMode: 'docker',
+        recordField: 'currentContainerGenerationId',
+        requestField: 'containerGenerationId',
+        grantField: 'container_generation_id',
+      }
+    : {
+        id,
+        executionMode: 'host',
+        recordField: 'currentHostStartupLeaseId',
+        requestField: 'hostStartupLeaseId',
+        grantField: 'host_startup_lease_id',
+      };
+}
+
 export async function admitCapabilityAuthorization({
   authorizationRef,
   originRef,
@@ -747,6 +785,7 @@ export async function admitCapabilityAuthorization({
   workerId,
   runId,
   containerGenerationId,
+  hostStartupLeaseId,
   nowMs = Date.now(),
 }: AdmitAuthorizationInput = {}) {
   const identifiers = [authorizationRef, originRef, workRef, workerId, runId].map((value) =>
@@ -760,13 +799,11 @@ export async function admitCapabilityAuthorization({
     );
   }
   const [authRef, normalizedOrigin, normalizedWork, normalizedWorker, normalizedRun] = identifiers;
-  const normalizedContainerGeneration = String(containerGenerationId || '')
-    .trim()
-    .toLowerCase();
-  if (!CONTAINER_GENERATION_ID.test(normalizedContainerGeneration)) {
+  const generation = runAuthorityGeneration(containerGenerationId, hostStartupLeaseId);
+  if (!generation) {
     throw new CapabilityAuthorizationError(
       'capability_admission_generation_invalid',
-      'The mission container generation is invalid.',
+      'The mission runtime generation is invalid.',
       { status: 400, needsInput: false },
     );
   }
@@ -780,6 +817,13 @@ export async function admitCapabilityAuthorization({
       'capability_authorization_not_found',
       'The mission capability authorization was not found.',
       { status: 404, needsInput: false },
+    );
+  }
+  if (record.executionMode !== generation.executionMode) {
+    throw new CapabilityAuthorizationError(
+      'capability_admission_generation_invalid',
+      'The mission runtime generation does not match its authorized execution mode.',
+      { status: 400, needsInput: false },
     );
   }
   if (
@@ -840,11 +884,11 @@ export async function admitCapabilityAuthorization({
       worker_id: normalizedWorker,
       run_id: normalizedRun,
       authorization_ref: authRef,
-      container_generation_id: normalizedContainerGeneration,
+      [generation.grantField]: generation.id,
       execution_mode: record.executionMode,
     },
     executionMode: record.executionMode,
-    // This bearer is still exact-run, exact-worker, and exact-container scoped,
+    // This bearer is still exact-run, exact-worker, and exact-runtime-generation scoped,
     // checked against the active authorization on every request, and revoked at
     // terminal cleanup. Keep it valid for the remaining reviewed horizon so a
     // legitimate long-running mission cannot lose authority halfway through.
@@ -868,7 +912,9 @@ export async function admitCapabilityAuthorization({
         workerId: normalizedWorker,
         currentRunId: normalizedRun,
         currentGrantId: grantId,
-        currentContainerGenerationId: normalizedContainerGeneration,
+        currentContainerGenerationId: '',
+        currentHostStartupLeaseId: '',
+        [generation.recordField]: generation.id,
         lastAdmittedAt: now,
         updatedAt: now,
       },
@@ -891,7 +937,8 @@ export async function admitCapabilityAuthorization({
     workerId: normalizedWorker,
     currentRunId: normalizedRun,
     currentGrantId: grantId,
-    currentContainerGenerationId: normalizedContainerGeneration,
+    [generation.recordField]: generation.id,
+    executionMode: generation.executionMode,
   });
   if (!confirmed) {
     throw new CapabilityAuthorizationError(
@@ -907,7 +954,7 @@ export async function admitCapabilityAuthorization({
     workRef: normalizedWork,
     workerId: normalizedWorker,
     runId: normalizedRun,
-    containerGenerationId: normalizedContainerGeneration,
+    [generation.requestField]: generation.id,
     scopeFingerprint: record.scopeFingerprint,
     brokerUrl: record.brokerUrl,
     grantToken: minted.token,
@@ -936,9 +983,10 @@ export async function assertActiveCapabilityAuthorizationGrant(grant: ValueRecor
   const ownerId = String(grant.user_id || '').trim();
   const workerId = String(grant.worker_id || '').trim();
   const runId = String(grant.run_id || '').trim();
-  const containerGenerationId = String(grant.container_generation_id || '')
-    .trim()
-    .toLowerCase();
+  const generation = runAuthorityGeneration(
+    grant.container_generation_id,
+    grant.host_startup_lease_id,
+  );
   if (
     !SIMPLE_REF.test(authorizationRef) ||
     !SIMPLE_REF.test(grantId) ||
@@ -946,7 +994,7 @@ export async function assertActiveCapabilityAuthorizationGrant(grant: ValueRecor
     ownerId.length > 192 ||
     !SIMPLE_REF.test(workerId) ||
     !SIMPLE_REF.test(runId) ||
-    !CONTAINER_GENERATION_ID.test(containerGenerationId)
+    !generation
   ) {
     throw inactiveGrantError();
   }
@@ -957,7 +1005,8 @@ export async function assertActiveCapabilityAuthorizationGrant(grant: ValueRecor
     currentGrantId: grantId,
     workerId,
     currentRunId: runId,
-    currentContainerGenerationId: containerGenerationId,
+    [generation.recordField]: generation.id,
+    executionMode: generation.executionMode,
   });
   if (!record || new Date(record.maxExpiresAt).getTime() <= Date.now()) {
     throw inactiveGrantError();
@@ -986,18 +1035,14 @@ export async function revokeCapabilityAuthorizationGrant({
   workerId,
   runId,
   containerGenerationId,
+  hostStartupLeaseId,
   grantId,
 }: RevokeAuthorizationInput = {}) {
   const identifiers = [authorizationRef, originRef, workRef, workerId, runId, grantId].map(
     (value) => String(value || '').trim(),
   );
-  const generation = String(containerGenerationId || '')
-    .trim()
-    .toLowerCase();
-  if (
-    identifiers.some((value) => !SIMPLE_REF.test(value)) ||
-    !CONTAINER_GENERATION_ID.test(generation)
-  ) {
+  const generation = runAuthorityGeneration(containerGenerationId, hostStartupLeaseId);
+  if (identifiers.some((value) => !SIMPLE_REF.test(value)) || !generation) {
     throw new CapabilityAuthorizationError(
       'capability_revocation_request_invalid',
       'The mission capability revocation request is invalid.',
@@ -1021,12 +1066,14 @@ export async function revokeCapabilityAuthorizationGrant({
       workerId: normalizedWorker,
       currentRunId: normalizedRun,
       currentGrantId: normalizedGrant,
-      currentContainerGenerationId: generation,
+      [generation.recordField]: generation.id,
+      executionMode: generation.executionMode,
     },
     {
       $set: {
         currentGrantId: '',
         currentContainerGenerationId: '',
+        currentHostStartupLeaseId: '',
         lastGrantRevokedAt: now,
         updatedAt: now,
       },

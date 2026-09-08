@@ -16,25 +16,22 @@ function Account() {
   const { data: startupConfig } = useGetStartupConfig();
   const whoopEnabled =
     startupConfig?.viventiumHealthWhoopEnabled === true && user?.role === SystemRoles.ADMIN;
-  const parallelWorkAvailable =
-    (startupConfig as { viventiumParallelWorkAvailable?: boolean } | undefined)
-      ?.viventiumParallelWorkAvailable === true;
 
   return (
     <div className="flex flex-col gap-3 p-1 text-sm text-text-primary">
-      {/* === VIVENTIUM START ===
-       * Feature: Account-wide Parallel work.
-       * Purpose: Keep the control dark until runtime support is explicitly available.
-       * === VIVENTIUM END === */}
-      <div className="pb-3">
-        <ParallelWork featureAvailable={parallelWorkAvailable} />
-      </div>
       {/* === VIVENTIUM START ===
        * Feature: Connected Accounts.
        * Purpose: Surface OpenAI/Anthropic account connection in Settings > Account for reliable discoverability.
        * === VIVENTIUM END === */}
       <div className="pb-3">
         <ConnectedAccounts />
+      </div>
+      {/* === VIVENTIUM START ===
+       * Feature: Account-wide Parallel work.
+       * Purpose: Let the signed-in owner's operational readiness govern the local control.
+       * === VIVENTIUM END === */}
+      <div className="pb-3">
+        <ParallelWork />
       </div>
       {whoopEnabled && (
         <div className="pb-3">

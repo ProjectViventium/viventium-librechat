@@ -1,4 +1,6 @@
+jest.mock('../CortexInsightOutboxService', () => ({ replayCompletedCortexInsightOutbox: jest.fn(async () => ({ scanned: 0, replayed: 0, pending: 0 })) }));
 jest.mock('~/db/models', () => ({
+  ViventiumCortexInsightDelivery: {},
   Message: {
     find: jest.fn(),
     findOne: jest.fn(),
@@ -13,6 +15,7 @@ const {
   recoverDeferredHoldParentErrorCards,
   recoverVisibleFollowUpErrorCards,
   recoverStaleCortexMessages,
+  bindRecoveredCortexPresentationGeneration,
   getStaleCortexRecoveryConfig,
   stripDeferredHoldParentErrorParts,
   stripErrorPartsFromRecoveredFollowUpContent,
@@ -35,6 +38,7 @@ function mockFindOneLean(message) {
 describe('staleCortexMessageRecovery', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    Message.updateOne.mockReset();
     delete process.env.VIVENTIUM_STALE_CORTEX_RECOVERY_MS;
     delete process.env.VIVENTIUM_STALE_CORTEX_RECOVERY_GRACE_MS;
     delete process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS;
@@ -49,6 +53,75 @@ describe('staleCortexMessageRecovery', () => {
         timeoutMs: 240000,
         cortexExecutionTimeoutMs: 0,
         graceMs: 60000,
+      }),
+    );
+  });
+
+  test('binds a recovered Cortex message to the exact claim generation before dispatch', async () => {
+    const message = {
+      messageId: 'followup-1',
+      metadata: {
+        viventium: {
+          type: 'cortex_followup',
+          cortexPresentationParentMessageId: 'parent-1',
+          cortexPresentationGeneration: 1,
+          cortexPresentationClaimToken: 'claim-1',
+        },
+      },
+    };
+    Message.updateOne.mockResolvedValueOnce({
+      acknowledged: true,
+      matchedCount: 1,
+      modifiedCount: 1,
+    });
+
+    const result = await bindRecoveredCortexPresentationGeneration({
+      ownerId: 'owner-1',
+      conversationId: 'conversation-1',
+      message,
+      revision: 2,
+      claimGeneration: 2,
+      claimToken: 'claim-2',
+      parentMessageId: 'parent-1',
+    });
+
+    expect(Message.updateOne).toHaveBeenCalledWith(
+      {
+        user: 'owner-1',
+        conversationId: 'conversation-1',
+        messageId: 'followup-1',
+        isCreatedByUser: { $ne: true },
+        'metadata.viventium.type': 'cortex_followup',
+        'metadata.viventium.cortexPresentationParentMessageId': 'parent-1',
+        $or: [
+          { 'metadata.viventium.cortexPresentationGeneration': { $exists: false } },
+          { 'metadata.viventium.cortexPresentationGeneration': { $lt: 2 } },
+          {
+            'metadata.viventium.cortexPresentationGeneration': 2,
+            'metadata.viventium.cortexPresentationClaimToken': { $in: ['', null] },
+          },
+        ],
+      },
+      {
+        $set: {
+          'metadata.viventium.messageRevision': 2,
+          'metadata.viventium.cortexPresentationGeneration': 2,
+          'metadata.viventium.cortexPresentationClaimToken': 'claim-2',
+          'metadata.viventium.cortexPresentationParentMessageId': 'parent-1',
+        },
+      },
+    );
+    expect(result).toEqual(
+      expect.objectContaining({
+        revision: 2,
+        metadata: expect.objectContaining({
+          viventium: expect.objectContaining({
+            messageRevision: 2,
+            cortexPresentationGeneration: 2,
+            cortexPresentationClaimToken: 'claim-2',
+            cortexPresentationParentMessageId: 'parent-1',
+          }),
+        }),
       }),
     );
   });
@@ -139,6 +212,48 @@ describe('staleCortexMessageRecovery', () => {
         }),
       },
     );
+  });
+
+  test('repairs a recorded recovered error flag after promotion already removed the error part', async () => {
+    const updatedAt = new Date('2026-05-21T06:44:46.000Z');
+    const metadata = { viventium: {
+      type: 'cortex_followup', promotedToEmptyParent: true,
+      recoveredPrimaryErrorClasses: ['completion_error'],
+    } };
+    const nativeResponse = { status: 'failed', failureClass: 'completion_error' };
+    const content = [{ type: ContentTypes.TEXT, text: 'Recovered answer.' }];
+    mockFindLean([{ _id: 'recovered-flag', updatedAt, error: true, text: 'Recovered answer.',
+      content, metadata, nativeResponse }]);
+
+    expect(await recoverVisibleFollowUpErrorCards({ limit: 10 })).toEqual({ scanned: 1, repaired: 1 });
+    expect(Message.find).toHaveBeenCalledWith(expect.objectContaining({
+      'nativeResponse.status': { $nin: ['pending', 'prepared'] },
+      isCreatedByUser: false,
+      'metadata.viventium.type': 'cortex_followup',
+      'metadata.viventium.promotedToEmptyParent': true,
+      $or: [
+        { 'content.type': ContentTypes.ERROR },
+        { error: true, 'metadata.viventium.recoveredPrimaryErrorClasses.0': { $exists: true } },
+      ],
+    }));
+    expect(Message.updateOne).toHaveBeenCalledWith(
+      { _id: 'recovered-flag', updatedAt },
+      { $set: { error: false, unfinished: false, content, metadata } },
+    );
+    expect(nativeResponse).toEqual({ status: 'failed', failureClass: 'completion_error' });
+  });
+
+  test.each([false, true])('does not clear an unproven error flag or count a superseded recovery (%s)', async (hasRecovery) => {
+    mockFindLean([{ _id: 'recovered-flag', updatedAt: new Date('2026-05-21T06:44:46.000Z'),
+      error: true, text: 'Text alone is not recovery authority.',
+      content: [{ type: ContentTypes.TEXT, text: 'Text alone is not recovery authority.' }],
+      metadata: { viventium: { type: 'cortex_followup', promotedToEmptyParent: true,
+        recoveredPrimaryErrorClasses: hasRecovery ? ['completion_error'] : [],
+      } },
+    }]);
+    Message.updateOne.mockResolvedValueOnce({ modifiedCount: 0 });
+    expect(await recoverVisibleFollowUpErrorCards()).toEqual({ scanned: 1, repaired: 0 });
+    expect(Message.updateOne).toHaveBeenCalledTimes(hasRecovery ? 1 : 0);
   });
 
   test('strips stale completion errors from deferred hold parents only when structurally safe', () => {
@@ -309,7 +424,8 @@ describe('staleCortexMessageRecovery', () => {
 
     expect(result).toEqual(expect.objectContaining({ scanned: 1, repaired: 1, timeoutMs: 1000 }));
     expect(Message.updateOne).toHaveBeenCalledWith(
-      { _id: 'mongo-id-1', updatedAt: new Date('2026-05-06T11:59:01.000Z') },
+      { _id: 'mongo-id-1', updatedAt: new Date('2026-05-06T11:59:01.000Z'),
+        'nativeResponse.status': { $nin: ['pending', 'prepared'] } },
       {
         $set: expect.objectContaining({
           unfinished: false,
@@ -347,7 +463,8 @@ describe('staleCortexMessageRecovery', () => {
 
     expect(result).toEqual(expect.objectContaining({ scanned: 1, repaired: 1, timeoutMs: 1000 }));
     expect(Message.updateOne).toHaveBeenCalledWith(
-      { _id: 'mongo-id-blank', updatedAt: new Date('2026-05-06T11:59:01.000Z') },
+      { _id: 'mongo-id-blank', updatedAt: new Date('2026-05-06T11:59:01.000Z'),
+        'nativeResponse.status': { $nin: ['pending', 'prepared'] } },
       {
         $set: expect.objectContaining({
           unfinished: false,
@@ -408,3 +525,4 @@ describe('staleCortexMessageRecovery', () => {
     });
   });
 });
+jest.mock('../nativeResponseService', () => ({ recoverNativeResponses: jest.fn() }));

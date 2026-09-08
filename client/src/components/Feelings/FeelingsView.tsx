@@ -900,7 +900,10 @@ export default function FeelingsView() {
                   </span>
                 </div>
                 {state.capsule ? (
-                  <pre>{state.capsule}</pre>
+                  <details>
+                    <summary>{localize('com_ui_feelings_prompt_details')}</summary>
+                    <pre>{state.capsule}</pre>
+                  </details>
                 ) : (
                   <p>{localize('com_ui_feelings_capsule_empty')}</p>
                 )}

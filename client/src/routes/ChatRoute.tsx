@@ -6,6 +6,7 @@ import { Constants, EModelEndpoint } from 'librechat-data-provider';
 import { useGetModelsQuery } from 'librechat-data-provider/react-query';
 import type { TPreset } from 'librechat-data-provider';
 import {
+  useAuthContext,
   useNewConvo,
   useAppStartup,
   useAssistantListMap,
@@ -23,13 +24,12 @@ import {
 import { ToolCallsMapProvider } from '~/Providers';
 import ChatView from '~/components/Chat/ChatView';
 import { NotificationSeverity } from '~/common';
-import useAuthRedirect from './useAuthRedirect';
 import temporaryStore from '~/store/temporary';
 import store from '~/store';
 
 export default function ChatRoute() {
   const { data: startupConfig } = useGetStartupConfig();
-  const { isAuthenticated, user, roles } = useAuthRedirect();
+  const { isAuthenticated, user, roles } = useAuthContext();
 
   const defaultTemporaryChat = useRecoilValue(temporaryStore.defaultTemporaryChat);
   const setIsTemporary = useRecoilCallback(

@@ -14,12 +14,18 @@ const validState = {
 };
 
 describe('ViventiumMainContinuityState model', () => {
-  test('keeps one state per owner, agent, and context epoch', () => {
+  test('keeps deterministic storage identities without treating structural records as epochs', () => {
     expect(ContinuityState.schema.indexes()).toEqual(
       expect.arrayContaining([
         [{ domainEpochKey: 1 }, expect.objectContaining({ unique: true })],
-        [{ ownerId: 1, agentId: 1, contextEpoch: 1 }, expect.objectContaining({ unique: true })],
+        [
+          { ownerId: 1, continuityDomainId: 1, recordKind: 1, domainEpochKey: 1 },
+          expect.any(Object),
+        ],
       ]),
+    );
+    expect(ContinuityState.schema.indexes()).not.toEqual(
+      expect.arrayContaining([[{ ownerId: 1, agentId: 1, contextEpoch: 1 }, expect.any(Object)]]),
     );
   });
 
@@ -36,6 +42,32 @@ describe('ViventiumMainContinuityState model', () => {
       compactionStatus: 'empty',
       compactionLease: null,
       lastCompactionError: '',
+    });
+  });
+
+  test('persists source-only accepted references and scheduler provenance', async () => {
+    const document = new ContinuityState({
+      ...validState,
+      acceptedTurns: [
+        {
+          logicalTurnId: 'scheduled-turn',
+          revision: 1,
+          assistantMessageId: 'scheduled-answer',
+          userMessageId: 'internal-envelope',
+          conversationId: 'schedule-conversation',
+          origin: 'scheduler',
+          scheduleId: 'synthetic-schedule',
+          scheduleRunId: 'synthetic-run',
+          committedAt: new Date(),
+        },
+      ],
+    });
+    await expect(document.validate()).resolves.toBeUndefined();
+    expect(document.toObject().acceptedTurns[0]).toMatchObject({
+      assistantText: '',
+      userText: '',
+      scheduleId: 'synthetic-schedule',
+      scheduleRunId: 'synthetic-run',
     });
   });
 

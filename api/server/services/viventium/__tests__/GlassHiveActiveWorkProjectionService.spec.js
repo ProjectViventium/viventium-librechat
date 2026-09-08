@@ -3,6 +3,7 @@ let mockFind;
 let mockFindOne;
 let mockFindOneAndUpdate;
 let mockUpdateOne;
+let mockMissionFind;
 
 jest.mock('mongoose', () => {
   const actual = jest.requireActual('mongoose');
@@ -10,6 +11,9 @@ jest.mock('mongoose', () => {
     ...actual,
     connection: {
       collection: (name) => {
+        if (name === 'viventium_glasshive_mission_evidence') {
+          return { find: (...args) => mockMissionFind(...args) };
+        }
         if (name !== 'viventium_external_work') throw new Error(`Unexpected collection ${name}`);
         return {
           createIndex: (...args) => mockCreateIndex(...args),
@@ -27,6 +31,7 @@ const {
   dismissCoreOnlyPreDispatchAttention,
   enrichActiveWorkSnapshot,
   getCoreWorkOriginRef,
+  getCoreWorkDelivery,
 } = require('../GlassHiveActiveWorkProjectionService');
 
 describe('GlassHiveActiveWorkProjectionService', () => {
@@ -36,6 +41,7 @@ describe('GlassHiveActiveWorkProjectionService', () => {
     mockFindOne = jest.fn().mockResolvedValue(null);
     mockFindOneAndUpdate = jest.fn().mockResolvedValue(null);
     mockUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true, matchedCount: 1 });
+    mockMissionFind = jest.fn().mockReturnValue({ toArray: jest.fn().mockResolvedValue([]) });
   });
 
   test('joins only the asserted owner and maps Core delivery truth by opaque workRef', async () => {
@@ -208,6 +214,72 @@ describe('GlassHiveActiveWorkProjectionService', () => {
       ]),
     );
   });
+
+  test('exposes a later Main presentation even when a retried mission remains delivered', async () => {
+    const executionTime = '2026-05-03T03:04:00.000Z';
+    const presentationTime = '2026-05-03T03:05:00.000Z';
+    const snapshot = {
+      snapshot: 'fresh',
+      work: [
+        {
+          workRef: 'work-retried',
+          state: 'completed',
+          updatedAt: executionTime,
+          delivery: { state: 'pending' },
+          actions: ['retry'],
+        },
+      ],
+    };
+    const project = async (updatedAt) => {
+      mockFind.mockReturnValue({
+        toArray: jest.fn().mockResolvedValue([
+          {
+            workRef: 'work-retried',
+            externalState: 'completed',
+            deliveryState: 'sent',
+            updatedAt,
+          },
+        ]),
+      });
+      return enrichActiveWorkSnapshot({ ownerId: 'owner-1', snapshot });
+    };
+    const first = await project(new Date(executionTime));
+    const delivered = await project(new Date(presentationTime));
+    const repeated = await project(new Date(presentationTime));
+    expect(first.work[0].delivery.state).toBe('delivered');
+    expect(delivered.work[0].delivery.state).toBe('delivered');
+    expect(first.work[0].updatedAt).toBe(executionTime);
+    expect(delivered.work[0].updatedAt).toBe(presentationTime);
+    expect(repeated).toEqual(delivered);
+    expect(mockFind).toHaveBeenLastCalledWith(
+      { ownerId: 'owner-1', workRef: { $in: ['work-retried'] } },
+      expect.objectContaining({ projection: expect.objectContaining({ updatedAt: 1 }) }),
+    );
+  });
+
+  test.each([undefined, 'invalid-date', '2026-05-03T03:03:00.000Z'])(
+    'keeps the execution timestamp when Core has no later valid update: %s',
+    async (updatedAt) => {
+      mockFind.mockReturnValue({
+        toArray: jest.fn().mockResolvedValue([
+          {
+            workRef: 'work-1',
+            externalState: 'completed',
+            deliveryState: 'sent',
+            updatedAt,
+          },
+        ]),
+      });
+      const projected = await enrichActiveWorkSnapshot({
+        ownerId: 'owner-1',
+        snapshot: {
+          snapshot: 'fresh',
+          work: [{ workRef: 'work-1', state: 'completed', updatedAt: '2026-05-03T03:04:00.000Z' }],
+        },
+      });
+      expect(projected.work[0].updatedAt).toBe('2026-05-03T03:04:00.000Z');
+    },
+  );
 
   test('does not query when the snapshot is unavailable or empty', async () => {
     await expect(
@@ -589,5 +661,152 @@ describe('GlassHiveActiveWorkProjectionService', () => {
       { ownerId: 'owner-1', workRef: 'work-1' },
       { projection: { _id: 1, originRef: 1 } },
     );
+  });
+  test('a previous delivered result cannot hide a failed current Main presentation', async () => {
+    mockFind.mockReturnValue({
+      toArray: jest.fn().mockResolvedValue([
+        {
+          workRef: 'work-followup',
+          deliveryState: 'sent',
+          adjudicationState: 'failed',
+          attentionPending: false,
+        },
+      ]),
+    });
+    const snapshot = await enrichActiveWorkSnapshot({
+      ownerId: 'owner-1',
+      snapshot: { work: [{ workRef: 'work-followup', state: 'completed' }] },
+    });
+    expect(snapshot.work[0].delivery).toEqual({ state: 'failed', unreadTerminal: true });
+  });
+
+  function currentResultFixture(state = 'pending') {
+    const row = {
+      originRef: 'origin-1',
+      workRef: 'work-followup',
+      externalState: 'completed',
+      deliveryState: 'sent',
+      adjudicationState: 'completed',
+      attentionPending: false,
+      followUpMessageId: 'prior-delivered-message',
+      terminalCallbackId: `cb_terminal_${'a'.repeat(64)}`,
+      terminalCallbackRunId: 'run-current',
+      terminalCallbackResultDigest: `sha256:${'b'.repeat(64)}`,
+      terminalCallbackResultRevision: 2,
+      terminalCallbackAcceptedOperationId: 'c'.repeat(32),
+    };
+    const evidence = {
+      ...row,
+      _id: 'ghe_0d05af79a2fbf525454227555abc9bd4',
+      ownerId: 'owner-1',
+      runId: 'run-current',
+      state,
+    };
+    return { row, evidence };
+  }
+
+  test.each(['pending', 'processing'])(
+    'current %s result does not inherit an older delivered presentation',
+    async (state) => {
+      const { row, evidence } = currentResultFixture(state);
+      const original = JSON.parse(JSON.stringify(row));
+      mockFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([row]) });
+      mockMissionFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([evidence]) });
+      const snapshot = await enrichActiveWorkSnapshot({
+        ownerId: 'owner-1',
+        snapshot: {
+          work: [{ workRef: row.workRef, state: 'completed', actions: ['dismiss', 'retry'] }],
+        },
+      });
+      expect(snapshot.work[0]).toMatchObject({
+        delivery: { state: 'pending', unreadTerminal: true },
+        actions: ['retry'],
+      });
+      expect(mockMissionFind).toHaveBeenCalledTimes(1);
+      expect(mockMissionFind).toHaveBeenCalledWith(
+        {
+          ownerId: 'owner-1',
+          _id: {
+            $in: [evidence._id, row.terminalCallbackId],
+          },
+        },
+        expect.objectContaining({ projection: expect.not.objectContaining({ evidence: 1 }) }),
+      );
+      expect(row).toEqual(original);
+      expect(mockUpdateOne).not.toHaveBeenCalled();
+      expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+    },
+  );
+
+  test('a silent current result does not inherit an internal or older sent receipt', async () => {
+    const { row, evidence } = currentResultFixture('silent');
+    mockFindOne.mockResolvedValue(row);
+    mockMissionFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([evidence]) });
+    await expect(
+      getCoreWorkDelivery({ ownerId: 'owner-1', workRef: row.workRef }),
+    ).resolves.toEqual({ state: 'silent', unreadTerminal: false });
+    expect(mockUpdateOne).not.toHaveBeenCalled();
+  });
+
+  test('silent adjudication is not a visible delivery even when its status receipt was sent', async () => {
+    mockFindOne.mockResolvedValue({
+      workRef: 'work-silent-status',
+      deliveryState: 'sent',
+      adjudicationState: 'silent',
+      attentionPending: false,
+    });
+    await expect(
+      getCoreWorkDelivery({ ownerId: 'owner-1', workRef: 'work-silent-status' }),
+    ).resolves.toEqual({ state: 'silent', unreadTerminal: false });
+  });
+
+  test('the dismiss delivery gate also reads the current result identity', async () => {
+    const { row, evidence } = currentResultFixture();
+    mockFindOne.mockResolvedValue(row);
+    mockMissionFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([evidence]) });
+    await expect(
+      getCoreWorkDelivery({ ownerId: 'owner-1', workRef: row.workRef }),
+    ).resolves.toEqual({
+      state: 'pending',
+      unreadTerminal: true,
+    });
+  });
+
+  test.each([
+    ['ownerId', 'another-owner'],
+    ['originRef', 'another-origin'],
+    ['workRef', 'another-work'],
+    ['runId', 'run-previous'],
+    ['terminalCallbackResultRevision', 1],
+    ['terminalCallbackAcceptedOperationId', 'd'.repeat(32)],
+    ['terminalCallbackResultDigest', `sha256:${'e'.repeat(64)}`],
+  ])('a mismatched %s cannot change this work presentation', async (field, value) => {
+    const { row, evidence } = currentResultFixture();
+    evidence[field] = value;
+    mockFindOne.mockResolvedValue(row);
+    mockMissionFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([evidence]) });
+    await expect(
+      getCoreWorkDelivery({ ownerId: 'owner-1', workRef: row.workRef }),
+    ).resolves.toEqual({
+      state: 'delivered',
+      unreadTerminal: false,
+    });
+  });
+
+  test('settled current evidence and repeated reads preserve delivered history', async () => {
+    const { row, evidence } = currentResultFixture('completed');
+    mockFindOne.mockResolvedValue(row);
+    mockMissionFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([evidence]) });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(
+        getCoreWorkDelivery({ ownerId: 'owner-1', workRef: row.workRef }),
+      ).resolves.toEqual({
+        state: 'delivered',
+        unreadTerminal: false,
+      });
+    }
+    expect(row.followUpMessageId).toBe('prior-delivered-message');
+    expect(mockUpdateOne).not.toHaveBeenCalled();
+    expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
   });
 });

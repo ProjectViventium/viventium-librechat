@@ -21,6 +21,7 @@ import { Nav, MobileNav, NAV_WIDTH } from '~/components/Nav';
 import { TermsAndConditionsModal } from '~/components/ui';
 import { useHealthCheck } from '~/data-provider';
 import { Banner } from '~/components/Banners';
+import AuthStatus from '~/components/Auth/AuthStatus';
 
 export default function Root() {
   const [showTerms, setShowTerms] = useState(false);
@@ -62,9 +63,14 @@ export default function Root() {
     logout('/login?redirect=false');
   };
 
+  /* === VIVENTIUM START ===
+   * Keep the requested page while the server is unavailable; do not ask for
+   * credentials without a rejected session. Existing authentication owns retry.
+   */
   if (!isAuthenticated) {
-    return null;
+    return <AuthStatus />;
   }
+  /* === VIVENTIUM END === */
 
   return (
     <SetConvoProvider>

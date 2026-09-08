@@ -13,9 +13,15 @@ if (REDIS_KEY_PREFIX_VAR && REDIS_KEY_PREFIX) {
 }
 
 const USE_REDIS = isEnabled(process.env.USE_REDIS);
-if (USE_REDIS && !process.env.REDIS_URI) {
-  throw new Error('USE_REDIS is enabled but REDIS_URI is not set.');
+// VIVENTIUM START: support the installed runtime's private Redis socket.
+const REDIS_SOCKET_PATH = process.env.REDIS_SOCKET_PATH;
+if (USE_REDIS && !process.env.REDIS_URI && !REDIS_SOCKET_PATH) {
+  throw new Error('USE_REDIS requires REDIS_URI or REDIS_SOCKET_PATH.');
 }
+if (REDIS_SOCKET_PATH && (process.env.REDIS_URI || isEnabled(process.env.USE_REDIS_CLUSTER))) {
+  throw new Error('REDIS_SOCKET_PATH cannot be combined with a Redis URL or cluster.');
+}
+// VIVENTIUM END
 
 // USE_REDIS_STREAMS controls whether Redis is used for resumable stream job storage.
 // Defaults to true if USE_REDIS is enabled but USE_REDIS_STREAMS is not explicitly set.
@@ -75,6 +81,9 @@ const cacheConfig = {
   USE_REDIS,
   USE_REDIS_STREAMS,
   REDIS_URI: process.env.REDIS_URI,
+  // VIVENTIUM START: local socket transport for both existing Redis clients.
+  REDIS_SOCKET_PATH,
+  // VIVENTIUM END
   REDIS_USERNAME: process.env.REDIS_USERNAME,
   REDIS_PASSWORD: process.env.REDIS_PASSWORD,
   REDIS_CA: getRedisCA(),

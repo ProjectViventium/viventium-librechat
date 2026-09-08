@@ -175,7 +175,7 @@ describe('/api/viventium/orchestration', () => {
     });
   });
 
-  test('fails closed to focused and rejects enabling when Parallel work is unavailable', async () => {
+  test('preserves the saved preference but rejects enabling when Parallel work is unavailable', async () => {
     process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'false';
     mockGetUserById.mockResolvedValueOnce({
       personalization: { orchestration_mode: 'parallel' },
@@ -183,9 +183,12 @@ describe('/api/viventium/orchestration', () => {
 
     const read = await request(createApp()).get('/api/viventium/orchestration').expect(200);
     expect(read.body).toEqual(
-      expect.objectContaining({ available: false, mode: 'focused', hasKnownWork: false }),
+      expect.objectContaining({ available: false, mode: 'parallel', hasKnownWork: false }),
     );
-    expect(read.body.releaseGate).toBeUndefined();
+    expect(read.body.releaseGate).toEqual({
+      label: 'NOT READY',
+      blockers: ['operational_readiness_unavailable'],
+    });
 
     const write = await request(createApp())
       .patch('/api/viventium/orchestration')
@@ -218,10 +221,6 @@ describe('/api/viventium/orchestration', () => {
       expect.objectContaining({
         available: true,
         mode: 'parallel',
-        releaseGate: {
-          label: 'PRE-GATE / NOT READY',
-          blockers: expect.arrayContaining(['REL-UC-004']),
-        },
       }),
     );
 
@@ -233,12 +232,10 @@ describe('/api/viventium/orchestration', () => {
       expect.objectContaining({
         available: true,
         mode: 'parallel',
-        releaseGate: {
-          label: 'PRE-GATE / NOT READY',
-          blockers: expect.arrayContaining(['REL-UC-004']),
-        },
       }),
     );
+    expect(read.body.releaseGate).toBeUndefined();
+    expect(write.body.releaseGate).toBeUndefined();
     expect(mockUpdatePreferences).toHaveBeenCalledTimes(1);
   });
 

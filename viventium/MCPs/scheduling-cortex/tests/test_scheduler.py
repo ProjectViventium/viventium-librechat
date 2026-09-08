@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scheduling_cortex.dispatch import HttpJsonError, scheduled_exception_failure
+from scheduling_cortex.dispatch import HttpJsonError, scheduled_exception_failure, _build_scheduled_run_context
 from scheduling_cortex.models import ScheduleRule
 from scheduling_cortex.scheduler import (
     SchedulerEngine,
@@ -65,6 +65,52 @@ def _seed_task(
     created = storage.get_task("user-1", task_id)
     assert created is not None
     return created
+
+
+def test_pre_admission_wait_reclaims_same_occurrence_after_restart_without_duplicate(tmp_path):
+    storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / 'schedules.db')))
+    task = _seed_task(storage, 'admission-wait', schedule={
+        'type': 'interval', 'timezone': 'UTC', 'interval': {'every': 2, 'unit': 'minute'},
+    })
+    engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+    first_time = datetime(2026, 2, 13, 19, 0, tzinfo=timezone.utc)
+    with patch('scheduling_cortex.scheduler.dispatch_task', return_value={
+        'deferred': True, 'reason': 'conversation_session_authority_conflict',
+        'conversation_id': 'same-conversation',
+    }) as invoke:
+        engine._process_task(task, first_time)
+        first = invoke.call_args.args[0]
+    waiting = storage.get_task(task['user_id'], task['id'])
+    runs = storage.list_scheduled_prompt_runs(task_id=task['id'])
+    assert len(runs) == 1
+    assert runs[0]['status'] == 'queued'
+    assert runs[0]['completed_at'] is None
+    assert waiting['last_status'] == 'waiting'
+    assert waiting['last_error'] is None
+    assert waiting['next_run_at'] == '2026-02-13T19:05:00Z'
+    restarted = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+    with patch('scheduling_cortex.scheduler.dispatch_task', return_value={
+        'conversation_id': 'same-conversation',
+        'delivery': {'outcome': 'sent', 'channels': {'librechat': {'outcome': 'sent'}}},
+    }) as invoke:
+        restarted._process_task(waiting, first_time + timedelta(minutes=4))
+        invoke.assert_not_called()
+        restarted._process_task(waiting, first_time + timedelta(minutes=5))
+        invoke.assert_called_once()
+        retried = invoke.call_args.args[0]
+        assert retried['_scheduled_prompt_occurrence_key'] == first['_scheduled_prompt_occurrence_key']
+        assert retried['_scheduled_prompt_run_id'] == first['_scheduled_prompt_run_id']
+        assert _build_scheduled_run_context(retried)['scheduled_due_at_utc'] == '2026-02-13T19:00:00Z'
+        restarted._process_task(waiting, first_time + timedelta(minutes=5))
+        invoke.assert_called_once()
+    runs = storage.list_scheduled_prompt_runs(task_id=task['id'])
+    assert len(runs) == 1
+    assert runs[0]['status'] == 'completed'
+    assert runs[0]['attempt'] == 2
+    assert runs[0]['due_at'] == '2026-02-13T19:00:00Z'
+    assert 'scheduler_deferred_occurrence_v1' not in storage.get_task(task['user_id'], task['id'])['metadata']
+    engine.stop()
+    restarted.stop()
 
 
 class LatestDueOccurrenceTests(unittest.TestCase):
@@ -585,6 +631,22 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
             )
             self.assertNotIn("synthetic-private-value", run["result_summary"])
             self.assertIsNone(run["lease_until"])
+            recurring = storage.get_task(task["user_id"], task["id"])
+            self.assertEqual(recurring["active"], 1)
+            self.assertEqual(recurring["next_run_at"], "2026-02-14T09:00:00Z")
+            self.assertEqual(
+                recurring["metadata"]["scheduled_failure_state_v1"][
+                    "retry_disposition"
+                ],
+                "next_occurrence_only",
+            )
+            self.assertNotIn(
+                "scheduler_retry_occurrence_v1", recurring["metadata"]
+            )
+            self.assertEqual(
+                len(storage.list_scheduled_prompt_run_attempts(run["run_id"])),
+                1,
+            )
             close_failure.assert_called_once()
 
     def test_user_not_found_occurrence_closes_the_orphaned_schedule(self):
@@ -756,6 +818,288 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
                     self.assertEqual(state["retry_disposition"], "terminal_action_required")
                     self.assertEqual(task["active"], 0)
                     self.assertIsNone(task["next_run_at"])
+
+    def test_retryable_one_time_failure_recovers_in_one_occurrence_with_immutable_attempts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
+            task = _seed_task(
+                storage,
+                "task-provider-recovery",
+                schedule={"type": "once", "at": "2026-02-13T19:00:00Z", "timezone": "UTC"},
+            )
+            first_engine = SchedulerEngine(
+                storage,
+                poll_interval_s=30,
+                misfire_grace_s=900,
+                retry_delay_s=300,
+            )
+            dispatch_count = 0
+
+            def recover_on_second_attempt(_task):
+                nonlocal dispatch_count
+                dispatch_count += 1
+                if dispatch_count == 1:
+                    return {
+                        "generation_failure": {
+                            "error_class": "provider_response_failed",
+                            "failure_retryable": True,
+                        },
+                        "delivery": {
+                            "outcome": "failed",
+                            "reason": "provider_response_failed",
+                            "channels": {
+                                "librechat": {
+                                    "outcome": "failed",
+                                    "reason": "provider_response_failed",
+                                }
+                            },
+                        },
+                    }
+                return {
+                    "conversation_id": "conversation-provider-recovery",
+                    "execution": {
+                        "provider": "glasshive-harness",
+                        "model": "codex-cli:gpt-5.6-sol",
+                    },
+                    "delivery": {
+                        "outcome": "sent",
+                        "reason": "delivered",
+                        "generated_text": "Synthetic provider recovery result.",
+                        "channels": {
+                            "librechat": {"outcome": "sent", "reason": "delivered"}
+                        },
+                    },
+                }
+
+            with patch(
+                "scheduling_cortex.scheduler.dispatch_task",
+                side_effect=recover_on_second_attempt,
+            ):
+                first_engine._process_task(
+                    task,
+                    datetime(2026, 2, 13, 19, 0, tzinfo=timezone.utc),
+                )
+                restarted_storage = ScheduleStorage(
+                    StorageConfig(db_path=str(Path(tmpdir) / "schedules.db"))
+                )
+                restarted_engine = SchedulerEngine(
+                    restarted_storage,
+                    poll_interval_s=30,
+                    misfire_grace_s=900,
+                    retry_delay_s=300,
+                )
+                retry_task = restarted_storage.get_task(task["user_id"], task["id"])
+                self.assertIsNotNone(retry_task)
+                retry_occurrence = retry_task["metadata"]["scheduler_retry_occurrence_v1"]
+                self.assertEqual(retry_occurrence["due_at"], "2026-02-13T19:00:00Z")
+                self.assertEqual(retry_occurrence["attempt"], 1)
+                self.assertEqual(retry_occurrence["next_attempt_at"], retry_task["next_run_at"])
+                restarted_engine._process_task(
+                    retry_task,
+                    datetime(2026, 2, 13, 19, 5, tzinfo=timezone.utc),
+                )
+
+            runs = storage.list_scheduled_prompt_runs(task_id=task["id"])
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["attempt"], 2)
+            self.assertEqual(runs[0]["status"], "completed")
+            self.assertEqual(runs[0]["disposition"], "delivered")
+            self.assertEqual(
+                runs[0]["occurrence_key"],
+                storage.scheduled_prompt_occurrence_key(
+                    task["id"], "2026-02-13T19:00:00Z"
+                ),
+            )
+
+            attempts = storage.list_scheduled_prompt_run_attempts(runs[0]["run_id"])
+            self.assertEqual(
+                [(attempt["attempt"], attempt["status"], attempt["error_class"]) for attempt in attempts],
+                [
+                    (1, "failed", "provider_response_failed"),
+                    (2, "completed", None),
+                ],
+            )
+            self.assertEqual(
+                attempts[0]["execution_snapshot"]["scheduled_failure_state_v1"]["error_class"],
+                "provider_response_failed",
+            )
+            self.assertEqual(
+                attempts[1]["execution_snapshot"]["model"],
+                "codex-cli:gpt-5.6-sol",
+            )
+            self.assertEqual(attempts[0]["lease_owner"], first_engine._lease_owner)
+            self.assertEqual(attempts[1]["lease_owner"], restarted_engine._lease_owner)
+            self.assertNotEqual(attempts[0]["lease_owner"], attempts[1]["lease_owner"])
+            recovered = storage.get_task(task["user_id"], task["id"])
+            self.assertEqual(recovered["active"], 0)
+            self.assertEqual(recovered["last_status"], "success")
+            self.assertNotIn("scheduler_retry_occurrence_v1", recovered["metadata"])
+
+    def test_atomic_finalizer_fault_leaves_claim_for_lease_recovery_without_split_writes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "schedules.db")
+            storage = ScheduleStorage(StorageConfig(db_path=db_path))
+            recovery_storage = ScheduleStorage(StorageConfig(db_path=db_path))
+            task = _seed_task(
+                storage,
+                "task-finalizer-fault",
+                schedule={"type": "once", "at": "2026-02-13T19:00:00Z", "timezone": "UTC"},
+            )
+            engine = SchedulerEngine(
+                storage,
+                poll_interval_s=30,
+                misfire_grace_s=900,
+                retry_delay_s=300,
+            )
+            failure = {
+                "generation_failure": {
+                    "error_class": "provider_response_failed",
+                    "failure_retryable": True,
+                },
+                "delivery": {
+                    "outcome": "failed",
+                    "reason": "provider_response_failed",
+                },
+            }
+
+            with patch(
+                "scheduling_cortex.scheduler.dispatch_task",
+                return_value=failure,
+            ), patch(
+                "scheduling_cortex.scheduler.scheduled_failure_result",
+                return_value=failure,
+            ), patch.object(
+                storage,
+                "finalize_scheduled_prompt_run_attempt",
+                side_effect=RuntimeError("synthetic atomic finalizer fault"),
+            ):
+                engine._process_task(
+                    task,
+                    datetime(2026, 2, 13, 19, 0, tzinfo=timezone.utc),
+                )
+
+            run = storage.list_scheduled_prompt_runs(task_id=task["id"])[0]
+            persisted_task = storage.get_task(task["user_id"], task["id"])
+            attempts = storage.list_scheduled_prompt_run_attempts(run["run_id"])
+
+            self.assertEqual(run["status"], "dispatching")
+            self.assertEqual(run["lease_owner"], engine._lease_owner)
+            self.assertEqual(run["attempt"], 1)
+            self.assertEqual(attempts, [])
+            self.assertEqual(persisted_task["last_status"], "running")
+            self.assertEqual(persisted_task["next_run_at"], "2026-02-13T19:00:00Z")
+            self.assertNotIn(
+                "scheduler_retry_occurrence_v1",
+                persisted_task.get("metadata") or {},
+            )
+
+            recovered = recovery_storage.claim_scheduled_prompt_occurrence(
+                task_id=task["id"],
+                user_id=task["user_id"],
+                executor="viventium_agent",
+                due_at="2026-02-13T19:00:00Z",
+                lease_owner="scheduler:restarted",
+                now="2026-02-13T19:15:01Z",
+                lease_seconds=900,
+            )
+            expired = recovery_storage.list_scheduled_prompt_run_attempts(run["run_id"])
+
+            self.assertTrue(recovered["claimed"])
+            self.assertEqual(recovered["reason"], "lease_recovered")
+            self.assertEqual(recovered["run"]["attempt"], 2)
+            self.assertEqual(
+                [(row["attempt"], row["error_class"]) for row in expired],
+                [(1, "attempt_lease_expired")],
+            )
+
+    def test_reclaimed_attempt_fences_stale_engine_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "schedules.db")
+            primary = ScheduleStorage(StorageConfig(db_path=db_path))
+            task = _seed_task(
+                primary,
+                "task-pre-dispatch-fence",
+                schedule={"type": "once", "at": "2026-02-13T19:00:00Z", "timezone": "UTC"},
+            )
+            first_storage = ScheduleStorage(StorageConfig(db_path=db_path))
+            second_storage = ScheduleStorage(StorageConfig(db_path=db_path))
+            first_engine = SchedulerEngine(
+                first_storage,
+                poll_interval_s=30,
+                misfire_grace_s=900,
+                retry_delay_s=300,
+                occurrence_lease_s=1,
+            )
+            second_engine = SchedulerEngine(
+                second_storage,
+                poll_interval_s=30,
+                misfire_grace_s=900,
+                retry_delay_s=300,
+                occurrence_lease_s=1,
+            )
+            first_claimed = threading.Event()
+            release_first = threading.Event()
+            dispatch_attempts = []
+            thread_errors = []
+            original_claim = first_storage.claim_scheduled_prompt_occurrence
+
+            def pause_after_first_claim(**kwargs):
+                claimed = original_claim(**kwargs)
+                first_claimed.set()
+                self.assertTrue(release_first.wait(2))
+                return claimed
+
+            def record_dispatch(dispatched):
+                dispatch_attempts.append(int(dispatched["_scheduled_prompt_attempt"]))
+                return {
+                    "delivery": {
+                        "outcome": "sent",
+                        "reason": "delivered",
+                        "channels": {"librechat": {"outcome": "sent"}},
+                    }
+                }
+
+            def run_first_engine():
+                try:
+                    first_engine._process_task(
+                        task,
+                        datetime(2026, 2, 13, 19, 0, tzinfo=timezone.utc),
+                    )
+                except Exception as exc:
+                    thread_errors.append(exc)
+
+            with patch.object(
+                first_storage,
+                "claim_scheduled_prompt_occurrence",
+                side_effect=pause_after_first_claim,
+            ), patch(
+                "scheduling_cortex.scheduler.dispatch_task",
+                side_effect=record_dispatch,
+            ):
+                first_thread = threading.Thread(target=run_first_engine)
+                first_thread.start()
+                self.assertTrue(first_claimed.wait(2))
+                second_engine._process_task(
+                    task,
+                    datetime(2026, 2, 13, 19, 0, 2, tzinfo=timezone.utc),
+                )
+                release_first.set()
+                first_thread.join(2)
+
+            run = primary.list_scheduled_prompt_runs(task_id=task["id"])[0]
+            attempts = primary.list_scheduled_prompt_run_attempts(run["run_id"])
+            persisted_task = primary.get_task(task["user_id"], task["id"])
+
+            self.assertFalse(first_thread.is_alive())
+            self.assertEqual(thread_errors, [])
+            self.assertEqual(dispatch_attempts, [2])
+            self.assertEqual(run["status"], "completed")
+            self.assertEqual(run["attempt"], 2)
+            self.assertEqual(
+                [(row["attempt"], row["status"]) for row in attempts],
+                [(1, "failed"), (2, "completed")],
+            )
+            self.assertEqual(persisted_task["last_status"], "success")
 
     def test_glasshive_occurrence_reuses_claimed_row_and_remains_queued(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(

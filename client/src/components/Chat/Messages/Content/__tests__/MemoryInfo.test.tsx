@@ -1,4 +1,5 @@
 import React from 'react';
+import mockEnglishTranslations from '~/locales/en/translation.json';
 import { render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom/extend-expect';
 import MemoryInfo from '../MemoryInfo';
@@ -6,7 +7,7 @@ import type { MemoryArtifact } from 'librechat-data-provider';
 
 // Mock the localize hook
 jest.mock('~/hooks', () => ({
-  useLocalize: () => (key: string, params?: Record<string, any>) => {
+  useLocalize: () => (key: string, params?: Record<string, string | number>) => {
     const translations: Record<string, string> = {
       com_ui_memory_updated_items: 'Updated Memories',
       com_ui_memory_deleted_items: 'Deleted Memories',
@@ -18,7 +19,14 @@ jest.mock('~/hooks', () => ({
       com_ui_updated_successfully: 'Updated successfully',
       com_ui_none_selected: 'None selected',
     };
-    return translations[key] || key;
+    const text =
+      translations[key] ||
+      mockEnglishTranslations[key as keyof typeof mockEnglishTranslations] ||
+      key;
+    return Object.entries(params ?? {}).reduce(
+      (copy, [name, value]) => copy.replace(`{{${name}}}`, String(value)),
+      text,
+    );
   },
 }));
 
@@ -34,6 +42,14 @@ describe('MemoryInfo', () => {
   });
 
   describe('Error Memory Display', () => {
+    test('shows local capacity without blaming the OpenAI-compatible transport', () => {
+      render(<MemoryInfo memoryArtifacts={[{
+        type: 'error', key: 'system', value: JSON.stringify({ errorType: 'host_capacity', provider: 'openai' }),
+      }]} />);
+      expect(screen.getByText('Not enough free capacity to save memory right now. Try again shortly.')).toBeInTheDocument();
+      expect(screen.queryByText(/OpenAI/)).not.toBeInTheDocument();
+    });
+
     test('displays error section when memory is already exceeded', () => {
       const memoryArtifacts: MemoryArtifact[] = [
         {
@@ -126,6 +142,121 @@ describe('MemoryInfo', () => {
     });
   });
 
+  describe('Typed provider failures', () => {
+    test.each([
+      [
+        'usage_limit_reached',
+        'OpenAI usage limit reached. Check usage or wait for the limit to reset.',
+      ],
+      ['provider_auth', 'OpenAI needs sign-in. Reconnect it in Connected Accounts.'],
+      ['provider_access_denied', "OpenAI denied access. Check the account's access."],
+      ['provider_rate_limited', 'OpenAI is temporarily unavailable. Try again shortly.'],
+      ['provider_unavailable', 'OpenAI could not save memory. Try again later.'],
+    ])('renders %s with its own action and no raw provider payload', (errorType, expected) => {
+      render(
+        <MemoryInfo
+          memoryArtifacts={[
+            createMemoryArtifact(
+              'error',
+              'system',
+              JSON.stringify({
+                errorType,
+                provider: 'openAI',
+                message: 'Bearer synthetic-private-token',
+                accountId: 'synthetic-private-account',
+                headers: { authorization: 'secret' },
+              }),
+            ),
+          ]}
+        />,
+      );
+      expect(screen.getByText(expected)).toBeInTheDocument();
+      expect(screen.queryByText(/synthetic-private|Bearer|secret/)).not.toBeInTheDocument();
+    });
+
+    test('keeps primary quota and fallback login failures distinct', () => {
+      render(
+        <MemoryInfo
+          memoryArtifacts={[
+            createMemoryArtifact(
+              'error',
+              'system',
+              JSON.stringify({ errorType: 'usage_limit_reached', provider: 'openAI' }),
+            ),
+            createMemoryArtifact(
+              'error',
+              'system',
+              JSON.stringify({ errorType: 'provider_auth', provider: 'anthropic' }),
+            ),
+          ]}
+        />,
+      );
+      expect(
+        screen.getByText('OpenAI usage limit reached. Check usage or wait for the limit to reset.'),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText('Anthropic needs sign-in. Reconnect it in Connected Accounts.'),
+      ).toBeInTheDocument();
+    });
+
+    test('does not infer provider or error meaning from private error text', () => {
+      render(
+        <MemoryInfo
+          memoryArtifacts={[
+            createMemoryArtifact(
+              'error',
+              'system',
+              JSON.stringify({
+                errorType: 'unknown',
+                provider: 'synthetic-private-provider',
+                message: 'OpenAI quota Bearer synthetic-token',
+              }),
+            ),
+          ]}
+        />,
+      );
+      expect(screen.getByText('Memory could not be saved. Try again.')).toBeInTheDocument();
+      expect(screen.queryByText(/synthetic|OpenAI/)).not.toBeInTheDocument();
+    });
+
+    test('does not invent a token limit when the rejection has no limit', () => {
+      render(
+        <MemoryInfo
+          memoryArtifacts={[
+            createMemoryArtifact(
+              'error',
+              'system',
+              JSON.stringify({ errorType: 'key_limit_exceeded' }),
+            ),
+          ]}
+        />,
+      );
+      expect(
+        screen.getByText('This memory item is too long. Shorten it and try again.'),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/0-token/)).not.toBeInTheDocument();
+    });
+
+    test('retains partial-apply uncertainty beside the provider failure', () => {
+      render(
+        <MemoryInfo
+          memoryArtifacts={[
+            createMemoryArtifact(
+              'error',
+              'system',
+              JSON.stringify({
+                errorType: 'usage_limit_reached',
+                provider: 'openAI',
+                partialApplied: true,
+              }),
+            ),
+          ]}
+        />,
+      );
+      expect(screen.getByText(/Some changes may have been saved/)).toBeInTheDocument();
+    });
+  });
+
   describe('Mixed Memory Types', () => {
     test('displays all sections when different memory types are present', () => {
       const memoryArtifacts: MemoryArtifact[] = [
@@ -193,7 +324,7 @@ describe('MemoryInfo', () => {
 
       // Should render generic error message
       expect(screen.getByRole('heading', { name: 'Memory Error' })).toBeInTheDocument();
-      expect(screen.getAllByText('Memory Error')).toHaveLength(2);
+      expect(screen.getByText('Memory could not be saved. Try again.')).toBeInTheDocument();
     });
 
     test('handles missing value in error artifact', () => {
@@ -208,7 +339,7 @@ describe('MemoryInfo', () => {
       render(<MemoryInfo memoryArtifacts={memoryArtifacts} />);
 
       expect(screen.getByRole('heading', { name: 'Memory Error' })).toBeInTheDocument();
-      expect(screen.getAllByText('Memory Error')).toHaveLength(2);
+      expect(screen.getByText('Memory could not be saved. Try again.')).toBeInTheDocument();
     });
 
     test('handles unknown errorType gracefully', () => {
@@ -224,7 +355,7 @@ describe('MemoryInfo', () => {
 
       // Should show generic error message for unknown types
       expect(screen.getByRole('heading', { name: 'Memory Error' })).toBeInTheDocument();
-      expect(screen.getAllByText('Memory Error')).toHaveLength(2);
+      expect(screen.getByText('Memory could not be saved. Try again.')).toBeInTheDocument();
     });
 
     test('renders backend-provided per-key budget messages without mislabeling them as storage full', () => {
@@ -246,7 +377,9 @@ describe('MemoryInfo', () => {
 
       expect(screen.getByText('Memory Error')).toBeInTheDocument();
       expect(
-        screen.getByText('Memory key "drafts" would exceed its 1000-token budget.'),
+        screen.getByText(
+          'This memory item exceeds its 1000-token limit. Shorten it and try again.',
+        ),
       ).toBeInTheDocument();
       expect(screen.queryByText('Memory Storage Full')).not.toBeInTheDocument();
     });

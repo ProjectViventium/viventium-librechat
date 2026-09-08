@@ -170,7 +170,7 @@ viventium:
   installMode: native
   consciousAgent:
     provider: glasshive-harness
-    model: codex-cli:gpt-5.6-sol
+    model: codex-cli:gpt-6-astra
 balance:
   enabled: false
   startBalance: 200000
@@ -183,8 +183,6 @@ modelSpecs:
   list:
     - name: viventium
       label: Viventium
-      description: The conscious self. Background cortices process in parallel, surfacing
-        insights without blocking dialogue.
       default: true
       iconURL: /assets/logo.svg
       preset:
@@ -446,6 +444,8 @@ fileConfig:
         - image/svg+xml
         - image/bmp
         - image/tiff
+        - ^audio/
+        - ^video/
     openAI:
       disabled: false
       fileLimit: 100
@@ -499,6 +499,8 @@ fileConfig:
         - image/svg+xml
         - image/bmp
         - image/tiff
+        - ^audio/
+        - ^video/
     google:
       disabled: false
       fileLimit: 100
@@ -552,6 +554,8 @@ fileConfig:
         - image/svg+xml
         - image/bmp
         - image/tiff
+        - ^audio/
+        - ^video/
     agents:
       disabled: false
       fileLimit: 100
@@ -605,6 +609,8 @@ fileConfig:
         - image/svg+xml
         - image/bmp
         - image/tiff
+        - ^audio/
+        - ^video/
     default:
       fileLimit: 100
       fileSizeLimit: 50
@@ -657,6 +663,8 @@ fileConfig:
         - image/svg+xml
         - image/bmp
         - image/tiff
+        - ^audio/
+        - ^video/
 ocr:
   strategy: document_parser
 endpoints:
@@ -702,6 +710,7 @@ endpoints:
         context_protocol: main_context_v1
         native_session_authority: stable_authority_v1
         replay_protocol: legacy_message_count
+        message_delta_mode: incremental
         worker_native_tools: true
         default_access: full
         allow_full_access: true
@@ -709,6 +718,7 @@ endpoints:
         host_tools:
           - file_search
           - web_search
+          - transcribe_audio
         conversation_orchestration_tools:
           - worker_delegate_once_mcp_glasshive-workers-projects
           - active_work_list
@@ -720,6 +730,18 @@ endpoints:
         excluded_mcp_servers:
           - glasshive-workers-projects
         models:
+          - id: codex-cli:gpt-6-astra
+            label: Codex / GPT-6 Astra
+            harnessProfile: codex-cli
+            effortChoices: [low, medium, high, xhigh, max, ultra]
+            recommendedEffort: medium
+            contextLimit: 272000
+          - id: claude-code:claude-opus-5
+            label: Claude / Opus 5
+            harnessProfile: claude-code
+            effortChoices: [default, low, medium, high, xhigh, max]
+            recommendedEffort: medium
+            contextLimit: 1000000
           - id: codex-cli:gpt-5.6-sol
             label: Codex / GPT-5.6 Sol
             harnessProfile: codex-cli
@@ -727,11 +749,23 @@ endpoints:
             recommendedEffort: medium
             contextLimit: 272000
           - id: claude-code:opus
-            label: Claude / Opus 5
+            label: Claude / Opus
             harnessProfile: claude-code
-            effortChoices: [low, medium, high, xhigh, max]
+            effortChoices: [default, low, medium, high, xhigh, max]
             recommendedEffort: high
             contextLimit: 200000
+          - id: codex-cli:gpt-5.6-luna
+            label: Codex / GPT-5.6 Luna
+            harnessProfile: codex-cli
+            effortChoices: [low, medium, high, xhigh, max]
+            recommendedEffort: medium
+            contextLimit: 272000
+          - id: codex-cli:gpt-5.6-terra
+            label: Codex / GPT-5.6 Terra
+            harnessProfile: codex-cli
+            effortChoices: [low, medium, high, xhigh, max, ultra]
+            recommendedEffort: medium
+            contextLimit: 272000
     capabilityRequiredProviders:
       - glasshive-harness
     # VIVENTIUM END
@@ -764,6 +798,8 @@ endpoints:
       baseURL: ${GLASSHIVE_PROVIDER_BASE_URL}
       models:
         default:
+          - codex-cli:gpt-6-astra
+          - claude-code:claude-opus-5
           - codex-cli:gpt-5.6-sol
           - claude-code:opus
         fetch: false
@@ -1017,6 +1053,7 @@ mcpServers:
       X-Viventium-User-Id: '{{LIBRECHAT_USER_ID}}'
       X-Viventium-Storage-User-Id: '{{LIBRECHAT_USER_ID}}'
       X-Viventium-Agent-Id: agent_viventium_main_95aeb3
+      X-Viventium-Conversation-Id: '{{LIBRECHAT_BODY_CONVERSATIONID}}'
     startup: false
     chatMenu: true
     timeout: 120000

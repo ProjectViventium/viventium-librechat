@@ -5,6 +5,8 @@ import type { IPersonalAccountCleanupTombstone } from './personalAccountCleanupT
 export interface IConversation extends Document {
   conversationId: string;
   title?: string;
+  /** Internal authority set only by the authenticated explicit rename operation. */
+  titleSetByUser?: boolean;
   user?: string;
   messages?: Types.ObjectId[];
   // Fields provided by conversationPreset (adjust types as needed)

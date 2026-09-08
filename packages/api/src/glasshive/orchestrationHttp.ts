@@ -69,10 +69,7 @@ export interface OrchestrationHttpDependencies {
   }): Promise<WorkSnapshot>;
   getActiveWorkInteractiveSnapshot(input: { ownerId: string }): Promise<WorkSnapshot>;
   executeGlassHiveWorkAction(input: ValueRecord): Promise<unknown>;
-  effectiveOrchestrationMode(
-    user: UserRecord,
-    readiness: { available: boolean },
-  ): 'focused' | 'parallel';
+  preferredOrchestrationMode(user: UserRecord): 'focused' | 'parallel';
   parallelWorkClaimStateAsync(ownerId: string): Promise<ClaimState>;
   observeOrchestrationOwner(ownerId: string): unknown;
   refreshOrchestrationReadiness(input: { ownerId: string }): Promise<unknown>;
@@ -86,9 +83,28 @@ const actionSchema = z
     action: z.enum(['queue', 'message', 'steer', 'pause', 'resume', 'stop', 'retry', 'dismiss']),
     instruction: z.string().trim().min(1).max(8000).optional(),
     operationId: z.string().uuid(),
+    nativeInput: z
+      .object({
+        version: z.literal(1),
+        requestId: z.string().min(1).max(512),
+        requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+        action: z.enum(['accept', 'decline', 'cancel']),
+        content: z
+          .record(z.union([z.string(), z.number().finite(), z.boolean(), z.array(z.string())]))
+          .optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .superRefine((value, context) => {
+    if (value.nativeInput && value.action !== 'resume') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['nativeInput'],
+        message: 'Native input requires Resume',
+      });
+    }
     if (['queue', 'message', 'steer'].includes(value.action) && !value.instruction) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -103,9 +119,7 @@ const WORKER_VIEW_PATH = /^\/w\/ghr_[A-Za-z0-9_-]{8,160}$/;
 const CURSOR = /^[A-Za-z0-9._~:@+-]+$/;
 
 function record(value: unknown): ValueRecord {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? (value as ValueRecord)
-    : {};
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as ValueRecord) : {};
 }
 
 function ownerIdFrom(req: HttpRequest): string {
@@ -137,7 +151,10 @@ export function clientReachableWorkSnapshot(
   let runtimeBase: string;
   try {
     const configured = new URL(configuredBaseUrl);
-    if (!['http:', 'https:'].includes(configured.protocol) || !LOOPBACK_HOSTS.has(configured.hostname)) {
+    if (
+      !['http:', 'https:'].includes(configured.protocol) ||
+      !LOOPBACK_HOSTS.has(configured.hostname)
+    ) {
       return snapshot;
     }
     configured.pathname = configured.pathname.replace(/\/v1\/?$/, '').replace(/\/$/, '');
@@ -170,10 +187,11 @@ export function createOrchestrationHttpHandlers(dependencies: OrchestrationHttpD
     ownerId: string,
     admittedClaimState?: ClaimState | null,
   ): Promise<ValueRecord> {
-    const claimState = admittedClaimState || (await dependencies.parallelWorkClaimStateAsync(ownerId));
+    const claimState =
+      admittedClaimState || (await dependencies.parallelWorkClaimStateAsync(ownerId));
     return {
       available: claimState.available,
-      mode: dependencies.effectiveOrchestrationMode(user, { available: claimState.available }),
+      mode: dependencies.preferredOrchestrationMode(user),
       hasKnownWork: user.personalization?.parallel_work_known === true,
       ...(claimState.label === 'READY'
         ? {}
@@ -344,6 +362,7 @@ export function createOrchestrationHttpHandlers(dependencies: OrchestrationHttpD
         workRef: workRef.data,
         operationId,
         ...safeAction,
+        ...(safeAction.nativeInput ? { ownerInputControl: true } : {}),
       });
       return res.status(202).json(result);
     } catch (error) {

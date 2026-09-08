@@ -22,6 +22,22 @@ const FALLBACK_GRANT_RESOURCE_CACHE = new Map();
 const DEFAULT_GRANT_RESOURCE_MAX_BYTES = 512 * 1024;
 let BROKER_REVOCATION_CACHE;
 
+/* === VIVENTIUM START ===
+ * Feature: Capability-lane separation for top-level orchestration.
+ * Purpose: Mission roots and conversation Main share one broker transport, but only a
+ * server-minted conversation-orchestrator grant may expose peer mission controls.
+ * === VIVENTIUM END === */
+const BROKER_AUTHORITY_KINDS = Object.freeze({
+  MISSION_WORKER: 'mission_worker',
+  CONVERSATION_ORCHESTRATOR: 'conversation_orchestrator',
+});
+
+function normalizeBrokerAuthorityKind(value) {
+  return value === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
+    ? BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
+    : BROKER_AUTHORITY_KINDS.MISSION_WORKER;
+}
+
 function base64urlEncode(value) {
   return Buffer.from(value, 'utf8').toString('base64url');
 }
@@ -188,6 +204,7 @@ function mintBrokerGrant({
   hostToolResources = {},
   requestContext = {},
   executionMode,
+  authorityKind = BROKER_AUTHORITY_KINDS.MISSION_WORKER,
   ttlSeconds = DEFAULT_TTL_SECONDS,
   renewableTtlSeconds = ttlSeconds,
   scopes = {},
@@ -277,8 +294,22 @@ function mintBrokerGrant({
     turn_id: turnId,
     worker_id: String(requestContext.worker_id || requestContext.workerId || ''),
     run_id: String(requestContext.run_id || requestContext.runId || ''),
+    authorization_ref: String(
+      requestContext.authorization_ref || requestContext.authorizationRef || '',
+    ),
+    container_generation_id: String(
+      requestContext.container_generation_id || requestContext.containerGenerationId || '',
+    ),
+    ...(requestContext.host_startup_lease_id || requestContext.hostStartupLeaseId
+      ? {
+          host_startup_lease_id: String(
+            requestContext.host_startup_lease_id || requestContext.hostStartupLeaseId,
+          ),
+        }
+      : {}),
     schedule_id: String(requestContext.schedule_id || requestContext.scheduleId || ''),
     execution_mode: String(executionMode || requestContext.execution_mode || ''),
+    authority_kind: normalizeBrokerAuthorityKind(authorityKind),
     allowed_servers: sanitizedAllowedServers,
     eager_servers: sanitizedEagerServers,
     deferred_servers: sanitizedDeferredServers,
@@ -384,6 +415,7 @@ function verifyBrokerGrant(
   );
   return {
     ...payload,
+    authority_kind: normalizeBrokerAuthorityKind(payload.authority_kind),
     allowed_servers: verifiedAllowedServers,
     /* === VIVENTIUM START: preserve backwards compatibility for grants minted before deferred
      * projection by treating their complete allowlist as eager. === */
@@ -797,6 +829,7 @@ async function rememberInvocation({ grantId, invocationId, ttlMs = 10 * 60 * 100
 }
 
 module.exports = {
+  BROKER_AUTHORITY_KINDS,
   BROKER_AUDIENCE,
   WRITE_CONFIRMATION_AUDIENCE,
   argsHash,

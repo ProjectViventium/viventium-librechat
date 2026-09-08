@@ -24,6 +24,49 @@ describe('local Sandpack bundler preparation', () => {
     expect(() => injectOnPremEnvironment(output)).toThrow(/already declares the on-prem flag/);
   });
 
+  it('reuses a verified output without exposing an unpatched index during API startup', () => {
+    const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sandpack-startup-'));
+    const destinationRoot = path.join(tempDirectory, 'sandpack-bundler');
+    try {
+      prepareSandpackBundler({ destinationRoot });
+      const index = path.join(destinationRoot, 'index.html');
+      const before = fs.statSync(index);
+      const copyFile = jest.fn(() => {
+        throw new Error('Live verified artifact must remain unchanged');
+      });
+      const result = prepareSandpackBundler({ destinationRoot, copyFile });
+      expect(copyFile).not.toHaveBeenCalled();
+      expect(fs.statSync(index).ino).toBe(before.ino);
+      expect(fs.statSync(index).mtimeMs).toBe(before.mtimeMs);
+      expect(sha256(fs.readFileSync(index))).toBe(PINNED_OUTPUT_INDEX_SHA256);
+      expect(result.outputTreeSha256).toBe(PINNED_OUTPUT_TREE_SHA256);
+    } finally {
+      fs.rmSync(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it('repairs changed output without ever copying an upstream index into the served tree', () => {
+    const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sandpack-repair-'));
+    const destinationRoot = path.join(tempDirectory, 'sandpack-bundler');
+    try {
+      prepareSandpackBundler({ destinationRoot });
+      fs.writeFileSync(path.join(destinationRoot, 'index.html'), 'stale output');
+      fs.writeFileSync(path.join(destinationRoot, 'unexpected.txt'), 'stale extra file');
+      let copies = 0;
+      const result = prepareSandpackBundler({ destinationRoot, copyFile: (source, destination) => {
+        copies += 1;
+        fs.copyFileSync(source, destination);
+        const index = path.join(destinationRoot, 'index.html');
+        if (fs.existsSync(index)) expect(sha256(fs.readFileSync(index))).toBe(PINNED_OUTPUT_INDEX_SHA256);
+      } });
+      expect(copies).toBeGreaterThan(0);
+      expect(fs.existsSync(path.join(destinationRoot, 'unexpected.txt'))).toBe(false);
+      expect(result.outputTreeSha256).toBe(PINNED_OUTPUT_TREE_SHA256);
+    } finally {
+      fs.rmSync(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
   it('copies only pinned upstream bytes and emits a pinned telemetry-disabled index', () => {
     const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sandpack-bundler-'));
     const destinationRoot = path.join(tempDirectory, 'sandpack-bundler');

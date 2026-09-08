@@ -18,6 +18,8 @@ jest.mock('@librechat/api', () => ({
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
+  saveGeneratedConversationTitle: jest.fn(async (_model, _user, _conversationId, title) => title),
+  saveUserConversationTitle: jest.fn(),
   logger: {
     debug: jest.fn(),
     info: jest.fn(),
@@ -41,6 +43,10 @@ jest.mock('~/models/Conversation', () => ({
 
 jest.mock('~/models/Message', () => ({
   getMessages: jest.fn(),
+}));
+
+jest.mock('~/db/models', () => ({
+  Conversation: { findOneAndUpdate: jest.fn() },
 }));
 
 jest.mock('~/models/ToolCall', () => ({
@@ -313,6 +319,51 @@ describe('Convos Routes', () => {
   });
 
   describe('GET /gen_title/:conversationId', () => {
+    it.each(['New Chat', ''])(
+      'keeps an explicit title %j over stale generation on reload',
+      async (title) => {
+        const titleCache = {
+          get: jest.fn().mockResolvedValue('Older generated title'),
+          delete: jest.fn().mockResolvedValue(undefined),
+        };
+        getLogStores.mockReturnValue(titleCache);
+        getConvo.mockResolvedValue({ conversationId: 'renamed', title, titleSetByUser: true });
+        const response = await request(app).get('/api/convos/gen_title/renamed');
+        expect(response.status).toBe(200);
+        expect(response.body).toEqual({ title });
+        expect(getMessages).not.toHaveBeenCalled();
+        expect(getConvo).toHaveBeenCalledWith('test-user-123', 'renamed', 'title +titleSetByUser');
+      },
+    );
+    it('returns a read failure instead of a cached title when persisted owner state is unavailable', async () => {
+      const titleCache = {
+        get: jest.fn().mockResolvedValue('Older generated title'),
+        delete: jest.fn(),
+      };
+      getLogStores.mockReturnValue(titleCache);
+      getConvo.mockRejectedValueOnce(new Error('Database unavailable'));
+      const response = await request(app).get('/api/convos/gen_title/renamed');
+      expect(response.status).toBe(500);
+      expect(response.body).toEqual({ message: 'Unable to read conversation title' });
+      expect(titleCache.delete).not.toHaveBeenCalled();
+    });
+    it('keeps the persisted rename when an older generated title remains cached', async () => {
+      const titleCache = {
+        get: jest.fn().mockResolvedValue('Older generated title'),
+        set: jest.fn(),
+        delete: jest.fn().mockResolvedValue(undefined),
+      };
+      getLogStores.mockReturnValue(titleCache);
+      getConvo.mockResolvedValue({ conversationId: 'renamed', title: 'User chosen title' });
+
+      const response = await request(app).get('/api/convos/gen_title/renamed');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ title: 'User chosen title' });
+      expect(getMessages).not.toHaveBeenCalled();
+      expect(saveConvo).not.toHaveBeenCalled();
+    });
+
     it('should synthesize a fallback title from the first user message when the cache is empty', async () => {
       const titleCache = {
         get: jest.fn().mockResolvedValue(null),
@@ -335,21 +386,15 @@ describe('Convos Routes', () => {
 
       expect(response.status).toBe(200);
       expect(response.body).toEqual({ title: 'check my ms365 inbox' });
-      expect(titleCache.set).toHaveBeenCalledWith(
-        'test-user-123-conv-title-1',
+      expect(
+        require('@librechat/data-schemas').saveGeneratedConversationTitle,
+      ).toHaveBeenCalledWith(
+        require('~/db/models').Conversation,
+        'test-user-123',
+        'conv-title-1',
         'check my ms365 inbox',
-        120000,
       );
-      expect(saveConvo).toHaveBeenCalledWith(
-        expect.objectContaining({
-          user: { id: 'test-user-123' },
-        }),
-        {
-          conversationId: 'conv-title-1',
-          title: 'check my ms365 inbox',
-        },
-        { context: 'api/server/routes/convos.js gen_title fallback' },
-      );
+      expect(saveConvo).not.toHaveBeenCalled();
     });
 
     it('should return the persisted conversation title when cache is empty but the conversation is already titled', async () => {
@@ -369,6 +414,56 @@ describe('Convos Routes', () => {
       expect(response.status).toBe(200);
       expect(response.body).toEqual({ title: 'MS365 Inbox Review' });
       expect(getMessages).not.toHaveBeenCalled();
+      expect(saveConvo).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /update explicit title authority', () => {
+    it.each(['New Chat', 'User chosen title', ''])(
+      'saves the authenticated explicit title %j',
+      async (title) => {
+        const { saveUserConversationTitle } = require('@librechat/data-schemas');
+        saveUserConversationTitle.mockResolvedValueOnce({
+          toObject: () => ({ conversationId: 'renamed', title }),
+        });
+        const response = await request(app)
+          .post('/api/convos/update')
+          .send({
+            arg: { conversationId: 'renamed', title, user: 'foreign', titleSetByUser: false },
+          });
+        expect(response.status).toBe(201);
+        expect(response.body).toEqual({ conversationId: 'renamed', title });
+        expect(saveUserConversationTitle).toHaveBeenCalledWith(
+          require('~/db/models').Conversation,
+          'test-user-123',
+          'renamed',
+          title,
+        );
+        expect(saveConvo).not.toHaveBeenCalled();
+      },
+    );
+
+    it('returns not found when the owned target no longer exists', async () => {
+      require('@librechat/data-schemas').saveUserConversationTitle.mockResolvedValueOnce(null);
+      const response = await request(app)
+        .post('/api/convos/update')
+        .send({
+          arg: { conversationId: 'missing', title: 'New Chat' },
+        });
+      expect(response.status).toBe(404);
+      expect(saveConvo).not.toHaveBeenCalled();
+    });
+
+    it('reports a failed durable rename instead of confirming it', async () => {
+      require('@librechat/data-schemas').saveUserConversationTitle.mockRejectedValueOnce(
+        new Error('Database unavailable'),
+      );
+      const response = await request(app)
+        .post('/api/convos/update')
+        .send({
+          arg: { conversationId: 'renamed', title: 'New Chat' },
+        });
+      expect(response.status).toBe(500);
       expect(saveConvo).not.toHaveBeenCalled();
     });
   });

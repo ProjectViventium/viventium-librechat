@@ -15,9 +15,11 @@ const { logger } = require('@librechat/data-schemas');
 const { Run, Providers } = require('@librechat/agents');
 const {
   applyDeclaredProviderTransport,
+  buildGlassHiveNativeMediaContent,
   createSafeUser,
   initializeAnthropic,
   initializeOpenAI,
+  renderGlassHiveNativeMediaLinks,
   resolveHeaders,
 } = require('@librechat/api');
 const { HumanMessage } = require('@librechat/agents/langchain/messages');
@@ -29,6 +31,20 @@ const {
 const db = require('~/models');
 const { Conversation, Message } = require('~/db/models');
 const { isVoiceTaskSuppressedDurably } = require('./VoiceTaskService');
+
+const {
+  CORTEX_INSIGHT_RETRYABLE_FAILURE_REASONS,
+  claimCortexInsightDeliveryBatch,
+  markCortexInsightDeliveryBatchDropped,
+  markCortexInsightDeliveryBatchFailed,
+  markCortexInsightDeliveryBatchPersisted,
+  normalizeCortexFeelingSnapshot,
+  requireExactCortexInsightDeliverySettlement,
+  renewCortexInsightDeliveryBatchClaim,
+  selectClaimedCortexInsights,
+} = require('./CortexInsightDeliveryService');
+
+const { getTrustedInteractionContext } = require('./interactionContext');
 
 async function isFollowUpVoiceTaskSuppressed(req, taskId) {
   return isVoiceTaskSuppressedDurably(taskId, {
@@ -86,7 +102,6 @@ const {
   getPreferredFallbackInsightText,
   getVisibleFallbackInsightTexts,
   isOperationalFallbackParagraph,
-  stripQuestionSentences,
 } = require('~/server/services/viventium/cortexFallbackText');
 const {
   sanitizeOpenAIReasoningSamplingParams,
@@ -132,6 +147,7 @@ const PLACEHOLDER_RESPONSE_PATTERNS = [
  * of creating a second author. Keep retries bounded and limited to structured transport failures.
  * === VIVENTIUM END === */
 const DURABLE_FOLLOW_UP_RECONNECT_DELAYS_MS = Object.freeze([0, 250, 500, 1000, 2000, 4000]);
+const PHASE_B_PROVIDER_SESSION_LANE = 'phase_b:followup';
 const RETRYABLE_FOLLOW_UP_TRANSPORT_CODES = new Set([
   'ECONNREFUSED',
   'ECONNRESET',
@@ -439,11 +455,11 @@ function compactDecisionRecordForMetadata(record) {
 
 function resolveFollowUpDecisionResult({ finalText = '', decision } = {}) {
   const explicitResult = typeof decision?.result === 'string' ? decision.result.trim() : '';
-  if (['persisted', 'suppressed', 'empty', 'skipped'].includes(explicitResult)) {
+  if (['pending', 'persisted', 'dropped', 'suppressed', 'empty', 'skipped'].includes(explicitResult)) {
     return explicitResult;
   }
   if (typeof finalText === 'string' && finalText.trim().length > 0) {
-    return 'persisted';
+    return 'pending';
   }
   if (decision?.suppressionReason) {
     return 'suppressed';
@@ -452,6 +468,309 @@ function resolveFollowUpDecisionResult({ finalText = '', decision } = {}) {
     return 'empty';
   }
   return 'skipped';
+}
+
+function claimedCortexInsightDeliveryIds(deliveryBatch) {
+  return (Array.isArray(deliveryBatch?.claimed) ? deliveryBatch.claimed : [])
+    .map((delivery) => String(delivery?.deliveryId || '').trim())
+    .filter(Boolean);
+}
+
+function claimedCortexInsightDeliveryClaims(deliveryBatch) {
+  return (Array.isArray(deliveryBatch?.claimed) ? deliveryBatch.claimed : [])
+    .map((delivery) => ({
+      deliveryId: String(delivery?.deliveryId || '').trim(),
+      claimToken: String(delivery?.claimToken || '').trim(),
+      claimGeneration: Number(delivery?.claimGeneration),
+      attemptNumber: Number(delivery?.attemptNumber),
+    }))
+    .filter(
+      (claim) =>
+        claim.deliveryId &&
+        claim.claimToken &&
+        Number.isInteger(claim.claimGeneration) &&
+        claim.claimGeneration > 0,
+    );
+}
+
+function claimedCortexPresentationGeneration(deliveryBatch) {
+  return Math.max(
+    1,
+    ...(Array.isArray(deliveryBatch?.claimed) ? deliveryBatch.claimed : []).map(
+      (delivery) => Number(delivery?.claimGeneration) || 1,
+    ),
+  );
+}
+
+function claimedCortexPresentationClaimToken(deliveryBatch) {
+  const tokens = new Set(
+    (Array.isArray(deliveryBatch?.claimed) ? deliveryBatch.claimed : [])
+      .map((delivery) => String(delivery?.claimToken || '').trim())
+      .filter(Boolean),
+  );
+  return tokens.size === 1 ? [...tokens][0] : '';
+}
+
+function resolveCortexInsightDropReason({ decision } = {}) {
+  if (decision?.generationFailed === true) {
+    return 'generation_failed_without_fallback';
+  }
+  if (decision?.movedOnAfterParent === true) {
+    return 'conversation_moved_on';
+  }
+  return 'semantic_suppression';
+}
+
+function withCortexInsightDeliveryOutcome(
+  decisionRecord,
+  { result, deliveryStatus, dropReason = '', persistedMessageId = '' },
+) {
+  return {
+    ...(decisionRecord || {}),
+    result,
+    deliveryStatus,
+    dropReason,
+    persistedMessageId,
+    terminalAt: ['sent', 'dropped'].includes(deliveryStatus) ? new Date().toISOString() : '',
+  };
+}
+
+function withFollowUpDecisionMetadata(followUpMessage, decisionRecord) {
+  const metadata = followUpMessage?.metadata || {};
+  const viventium = metadata.viventium || {};
+  return {
+    ...followUpMessage,
+    metadata: {
+      ...metadata,
+      viventium: {
+        ...viventium,
+        cortexFollowUpDecision: compactDecisionRecordForMetadata(decisionRecord),
+      },
+    },
+  };
+}
+
+async function persistCortexFollowUpMessageWithLedger({
+  req,
+  parentMessageId,
+  followUpMessage,
+  decisionRecord,
+  deliveryBatch,
+  dependencies = {},
+}) {
+  const saveMessage = dependencies.saveMessage || db.saveMessage;
+  const markPersisted = dependencies.markPersisted || markCortexInsightDeliveryBatchPersisted;
+  const markDropped = dependencies.markDropped || markCortexInsightDeliveryBatchDropped;
+  const markFailed = dependencies.markFailed || markCortexInsightDeliveryBatchFailed;
+  const persistDecision = dependencies.persistDecision || persistFollowUpDecisionToParentMessage;
+  const afterSave = dependencies.afterSave;
+  const ownerId = String(req?.user?.id || '').trim();
+  const claims = claimedCortexInsightDeliveryClaims(deliveryBatch);
+  const persistedDecision = withCortexInsightDeliveryOutcome(decisionRecord, {
+    result: 'persisted',
+    deliveryStatus: 'pending',
+    persistedMessageId: followUpMessage.messageId,
+  });
+  const messageToPersist = withFollowUpDecisionMetadata(followUpMessage, persistedDecision);
+
+  try {
+    const saveReceipt = await saveMessage(req, messageToPersist, {
+      operationKind: 'system',
+      context: 'viventium/services/BackgroundCortexFollowUpService.createCortexFollowUpMessage',
+    });
+    if (
+      !saveReceipt ||
+      String(saveReceipt.messageId || '').trim() !== String(messageToPersist.messageId || '').trim()
+    ) {
+      const receiptError = new Error('Cortex follow-up persistence returned no receipt');
+      receiptError.code = 'cortex_followup_persistence_receipt_missing';
+      throw receiptError;
+    }
+  } catch (error) {
+    const retryDecision = withCortexInsightDeliveryOutcome(decisionRecord, {
+      result: 'pending',
+      deliveryStatus: 'pending',
+      dropReason: 'durable_surface_persistence_failed',
+    });
+    if (claims.length > 0) {
+      await markFailed({
+        ownerId,
+        claims,
+        reason: 'durable_surface_persistence_failed',
+      });
+    }
+    logFollowUpDecisionRecord(req, retryDecision);
+    await persistDecision({ req, parentMessageId, decisionRecord: retryDecision });
+    throw error;
+  }
+
+  if (claims.length > 0) {
+    const persisted = await markPersisted({
+      ownerId,
+      claims,
+      persistedMessageId: messageToPersist.messageId,
+      messageRevision: Math.max(
+        1,
+        Number(messageToPersist?.metadata?.viventium?.messageRevision) || 1,
+      ),
+    });
+    requireExactCortexInsightDeliverySettlement(claims, persisted);
+  }
+
+  let afterSaveOutcome = null;
+  if (typeof afterSave === 'function') {
+    try {
+      afterSaveOutcome = await afterSave(messageToPersist);
+    } catch (error) {
+      logger.warn('[VIVENTIUM][cortex-insight-delivery] post-save hook failed', {
+        code: String(error?.code || error?.name || 'post_save_hook_failed').slice(0, 120),
+      });
+    }
+  }
+  if (afterSaveOutcome?.dropReason) {
+    const droppedDecision = withCortexInsightDeliveryOutcome(decisionRecord, {
+      result: 'empty',
+      deliveryStatus: 'dropped',
+      dropReason: afterSaveOutcome.dropReason,
+    });
+    if (claims.length > 0) {
+      await markDropped({
+        ownerId,
+        claims,
+        dropReason: afterSaveOutcome.dropReason,
+      });
+    }
+    logFollowUpDecisionRecord(req, droppedDecision);
+    await persistDecision({ req, parentMessageId, decisionRecord: droppedDecision });
+    return { followUpMessage: null, decisionRecord: droppedDecision, dropped: true };
+  }
+
+  logFollowUpDecisionRecord(req, persistedDecision);
+  await persistDecision({ req, parentMessageId, decisionRecord: persistedDecision });
+  return { followUpMessage: messageToPersist, decisionRecord: persistedDecision };
+}
+
+async function settlePersistedCortexInsightDeliveryBatch({
+  req,
+  parentMessageId,
+  persistedMessageId,
+  decisionRecord,
+  deliveryBatch,
+  messageRevision = 1,
+}) {
+  const claims = claimedCortexInsightDeliveryClaims(deliveryBatch);
+  const persistedDecision = withCortexInsightDeliveryOutcome(decisionRecord, {
+    result: 'persisted',
+    deliveryStatus: 'pending',
+    persistedMessageId,
+  });
+  if (claims.length > 0) {
+    const persisted = await markCortexInsightDeliveryBatchPersisted({
+      ownerId: String(req?.user?.id || '').trim(),
+      claims,
+      persistedMessageId,
+      messageRevision: Math.max(1, Number(messageRevision) || 1),
+    });
+    requireExactCortexInsightDeliverySettlement(claims, persisted);
+  }
+  logFollowUpDecisionRecord(req, persistedDecision);
+  await persistFollowUpDecisionToParentMessage({
+    req,
+    parentMessageId,
+    decisionRecord: persistedDecision,
+  });
+  return persistedDecision;
+}
+
+async function dropCortexInsightDeliveryBatch({
+  req,
+  parentMessageId,
+  decisionRecord,
+  deliveryBatch,
+  dropReason,
+}) {
+  const claims = claimedCortexInsightDeliveryClaims(deliveryBatch);
+  const retryable = CORTEX_INSIGHT_RETRYABLE_FAILURE_REASONS.includes(dropReason);
+  if (claims.length > 0) {
+    if (retryable) {
+      await markCortexInsightDeliveryBatchFailed({
+        ownerId: String(req?.user?.id || '').trim(),
+        claims,
+        reason: dropReason,
+      });
+    } else {
+      await markCortexInsightDeliveryBatchDropped({
+        ownerId: String(req?.user?.id || '').trim(),
+        claims,
+        dropReason,
+      });
+    }
+  }
+  const outcomeDecision = withCortexInsightDeliveryOutcome(decisionRecord, {
+    result: retryable ? 'pending' : 'dropped',
+    deliveryStatus: retryable ? 'pending' : 'dropped',
+    dropReason,
+  });
+  logFollowUpDecisionRecord(req, outcomeDecision);
+  await persistFollowUpDecisionToParentMessage({
+    req,
+    parentMessageId,
+    decisionRecord: outcomeDecision,
+  });
+  return outcomeDecision;
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Early Phase B suppression settlement.
+ * Purpose: When Main suppresses synthesis before createCortexFollowUpMessage, close the exact
+ * already-accepted insight rows through the same owner-scoped claim ledger instead of leaving them
+ * to retry until delivery_attempts_exhausted.
+ * === VIVENTIUM END === */
+async function settleSuppressedCortexInsightDeliveries({
+  req,
+  conversationId,
+  parentMessageId,
+  insightsData,
+  dropReason,
+  dependencies = {},
+}) {
+  const insights = Array.isArray(insightsData?.insights) ? insightsData.insights : [];
+  if (insights.length === 0) {
+    return { claimed: 0, dropped: 0, dropReason };
+  }
+  const claimBatch = dependencies.claimBatch || claimCortexInsightDeliveryBatch;
+  const markDropped = dependencies.markDropped || markCortexInsightDeliveryBatchDropped;
+  const requireExact =
+    dependencies.requireExactSettlement || requireExactCortexInsightDeliverySettlement;
+  const voiceMode = isVoiceMode(req);
+  const surface = resolveViventiumSurface(req);
+  const feelingSnapshot = normalizeCortexFeelingSnapshot(req?._viventiumFeelingSnapshot);
+  const deliveryBatch = await claimBatch({
+    ownerId: req?.user?.id,
+    conversationId,
+    parentMessageId,
+    surface: surface || (voiceMode ? 'voice' : 'web'),
+    streamId: req?.body?.streamId || req?._resumableStreamId || '',
+    messageRevision: Math.max(
+      1,
+      Number(
+        getTrustedInteractionContext(req)?.revision || req?.body?.viventiumLogicalTurnRevision,
+      ) || 1,
+    ),
+    ...(feelingSnapshot ? { feelingSnapshot } : {}),
+    insights,
+  });
+  const claims = claimedCortexInsightDeliveryClaims(deliveryBatch);
+  if (claims.length === 0) {
+    return { claimed: 0, dropped: 0, dropReason };
+  }
+  const settled = await markDropped({
+    ownerId: String(req?.user?.id || '').trim(),
+    claims,
+    dropReason,
+  });
+  requireExact(claims, settled);
+  return { claimed: claims.length, dropped: settled.length, dropReason };
 }
 
 function buildFollowUpDecisionRecord({
@@ -592,6 +911,7 @@ async function persistFollowUpDecisionToParentMessage({ req, parentMessageId, de
       req,
       { messageId: parentMessageId, metadata },
       {
+        operationKind: 'system',
         context:
           'viventium/services/BackgroundCortexFollowUpService.persistFollowUpDecisionToParentMessage',
       },
@@ -732,6 +1052,14 @@ function resolveFollowUpPersistenceText({
     return { text: '', decision };
   }
 
+  // Failed optional synthesis has no authored public answer. Keep internal insights
+  // internal; empty-primary/explicit delivery recovery remains owned by forceVisible.
+  if (!text && generationFailed === true && shouldForceVisibleFollowUp !== true) {
+    decision.selectedStrategy = 'failed_optional_followup_suppressed';
+    decision.suppressionReason = 'followup_generation_failed';
+    return { text: '', decision };
+  }
+
   if (!text) {
     text = formatFollowUpText({
       ...(insightsData ?? {}),
@@ -755,7 +1083,6 @@ function resolveFollowUpPersistenceText({
     }
   }
 
-  text = stripQuestionSentences(String(text || '').trim());
   text = sanitizeFollowUpDisplayText(text);
   text = normalizeNoResponseText(text).trim();
 
@@ -970,9 +1297,9 @@ async function resolveCanonicalFollowUpAgent(
       return assignment;
     }
 
-    const canonicalSourceAgent = rewriteAgentForRuntime(
-      mergeFollowUpAgentRuntimeState(assignment.runtimeAgent, persistedAgent),
-      { capabilityRequiredProviders },
+    const canonicalSourceAgent = mergeFollowUpAgentRuntimeState(
+      assignment.runtimeAgent,
+      persistedAgent,
     );
     const canonicalAssignment = resolveFollowUpRuntimeAssignment(canonicalSourceAgent, {
       useVoiceModel,
@@ -1071,7 +1398,7 @@ function isVoiceMode(req) {
 }
 
 function getMessageTimelineValue(message) {
-  const value = message?.updatedAt || message?.createdAt || 0;
+  const value = message?.createdAt || message?.updatedAt || 0;
   const timestamp = new Date(value).getTime();
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
@@ -1225,7 +1552,7 @@ function resolveFollowUpContinuationContext(messages, parentMessageId, options =
   return {
     hasMovedOn,
     contextText:
-      hasMovedOn && contextText
+      contextText
         ? contextText
         : hasMovedOn
           ? '(The conversation has newer visible turns after the earlier response, but no saved message text was available.)'
@@ -1337,6 +1664,7 @@ async function resolveFollowUpLLMConfig({
   effectiveModel,
   primaryResponseMode = false,
   useVoiceModel = false,
+  runId = '',
   conversationId = '',
   parentMessageId = '',
 }) {
@@ -1358,10 +1686,7 @@ async function resolveFollowUpLLMConfig({
         const priorModel = resolvedModel;
         const priorThinking = resolvedAgent?.model_parameters?.thinking;
         const priorReasoningEffort = resolvedAgent?.model_parameters?.reasoning_effort;
-        const mergedAgent = rewriteAgentForRuntime(
-          mergeFollowUpAgentRuntimeState(resolvedAgent, persistedAgent),
-          { capabilityRequiredProviders },
-        );
+        const mergedAgent = mergeFollowUpAgentRuntimeState(resolvedAgent, persistedAgent);
         const hydratedAssignment = resolveFollowUpRuntimeAssignment(mergedAgent, {
           useVoiceModel,
           capabilityRequiredProviders,
@@ -1504,7 +1829,7 @@ async function resolveFollowUpLLMConfig({
     }
     const followUpIdempotencyKey = buildHarnessIdempotencyKey(
       'phase_b',
-      parentMessageId || req.body?.responseMessageId || req.body?.messageId,
+      runId || parentMessageId || req.body?.responseMessageId || req.body?.messageId,
       resolvedAgent?.id,
     );
     if (followUpCapability?.phase_b_followup === false) {
@@ -1518,6 +1843,18 @@ async function resolveFollowUpLLMConfig({
         `Provider capability configuration is unavailable for "${resolvedProviderName}"`,
       );
     }
+    const customConfig = await getCustomEndpointConfig(resolvedProviderName, req);
+    const configuration = resolvedAgent.model_parameters?.configuration || {};
+    resolvedAgent.model_parameters = {
+      ...(resolvedAgent.model_parameters || {}),
+      configuration: {
+        ...configuration,
+        defaultHeaders: {
+          ...(customConfig?.defaultHeaders || {}),
+          ...(configuration.defaultHeaders || {}),
+        },
+      },
+    };
     await attachConversationProviderCapabilityBundle({
       targetAgent: resolvedAgent,
       declaredAgent: resolvedAgent,
@@ -1531,7 +1868,6 @@ async function resolveFollowUpLLMConfig({
         viventiumGlassHiveIdempotencyKey: followUpIdempotencyKey,
       },
     });
-    const customConfig = await getCustomEndpointConfig(resolvedProviderName, req);
     if (customConfig?.apiKey && customConfig?.baseURL) {
       const existingHeaders =
         resolvedAgent?.model_parameters?.configuration?.defaultHeaders ||
@@ -1556,12 +1892,18 @@ async function resolveFollowUpLLMConfig({
           'X-Viventium-Stream-Id': '{{LIBRECHAT_BODY_VIVENTIUMSTREAMID}}',
           'X-Viventium-Surface': '{{LIBRECHAT_BODY_VIVENTIUMSURFACE}}',
           'X-Viventium-Input-Mode': '{{LIBRECHAT_BODY_VIVENTIUMINPUTMODE}}',
-          'X-GlassHive-Agent-Id': resolvedAgent.id,
+          'X-GlassHive-Agent-Id': `${resolvedAgent.id}:${PHASE_B_PROVIDER_SESSION_LANE}`,
           'X-GlassHive-Workspace-Mode': options?.workspace?.mode || 'life',
           'X-GlassHive-Workspace-Path-B64': customPath
             ? Buffer.from(customPath, 'utf8').toString('base64')
             : '',
           'X-GlassHive-Access': options?.access || providerDefaultAccess,
+          // The Phase B follow-up turn runs on the same GlassHive conversation route as the
+          // user turn, so it must carry the same serial fallback declaration; otherwise a
+          // provider quota failure during the follow-up ends the turn instead of continuing on
+          // the configured fallback model.
+          'X-GlassHive-Fallback-Model': String(options?.fallback_model ?? ''),
+          'X-GlassHive-Fallback-Reasoning-Effort': String(options?.fallback_reasoning_effort ?? ''),
         };
       }
       llmConfig.provider = Providers.OPENAI;
@@ -1673,6 +2015,7 @@ async function persistCortexPartsToCanonicalMessage({
         req,
         { messageId: responseMessageId, content: merged },
         {
+          operationKind: 'system',
           context:
             'viventium/services/BackgroundCortexFollowUpService.persistCortexPartsToCanonicalMessage',
         },
@@ -1724,6 +2067,7 @@ async function finalizeCanonicalCortexMessage({ req, messageId }) {
     req,
     { messageId, unfinished: false },
     {
+      operationKind: 'system',
       context: 'viventium/services/BackgroundCortexFollowUpService.finalizeCanonicalCortexMessage',
     },
   );
@@ -1802,6 +2146,10 @@ function deduplicateInsights(insights) {
 
   const kept = [];
   for (const insight of insights) {
+    if (insight.nativeMedia || isDurableMissionInsight(insight)) {
+      kept.push(insight);
+      continue;
+    }
     const text = (typeof insight.insight === 'string' ? insight.insight : '').toLowerCase();
     const words = text.split(/\s+/).filter((w) => w.length > 3);
     if (words.length === 0) {
@@ -1831,6 +2179,28 @@ function deduplicateInsights(insights) {
 }
 /* === VIVENTIUM END === */
 
+function isDurableMissionInsight(insight) {
+  return insight?.authority?.kind === 'durable_terminal_callback';
+}
+
+function boundMissionInput(insight) {
+  return isDurableMissionInsight(insight) && insight.runInput?.version === 1 &&
+    typeof insight.runInput.run_id === 'string' && insight.runInput.run_id.length > 0 &&
+    insight.authority.runId === insight.runInput.run_id &&
+    typeof insight.runInput.instruction === 'string' ? insight.runInput : null;
+}
+
+function acceptedMissionRequest(insights) {
+  if (!Array.isArray(insights) || insights.length === 0 || !insights.every(isDurableMissionInsight)) {
+    return null;
+  }
+  // Preserve each accepted objective and its identity, not the unrelated latest
+  // chat question. JSON retains exact instruction whitespace and group order.
+  return JSON.stringify(insights.map((insight) => boundMissionInput(insight) ?? {
+    run_id: insight.authority.runId || null, instruction: null,
+  }));
+}
+
 function formatFollowUpPrompt({
   insights = [],
   errors = [],
@@ -1850,11 +2220,23 @@ function formatFollowUpPrompt({
   const insightLines = insights
     .map((i) => {
       const name = i.cortexName || i.cortex_name || 'Background Agent';
-      const text = typeof i.insight === 'string' ? i.insight.trim() : '';
+      const mission = isDurableMissionInsight(i);
+      const text = typeof i.insight === 'string' ? (mission ? i.insight : i.insight.trim()) : '';
       if (!text) {
         return null;
       }
-      const clipped = text.length > 700 ? `${text.slice(0, 700)}...` : text;
+      if (mission) {
+        // The courier must not discard the already-admitted input, authority or
+        // result. The configured model owns synthesis; normal context admission
+        // owns size limits rather than an arbitrary character prefix here.
+        return `- ${name}: ${text}\n${JSON.stringify({ runInput: boundMissionInput(i), authority: i.authority })}`;
+      }
+      const requestedMaxPromptChars = Number(i.maxPromptChars);
+      const maxPromptChars =
+        Number.isFinite(requestedMaxPromptChars) && requestedMaxPromptChars > 0
+          ? Math.min(Math.trunc(requestedMaxPromptChars), 12_000)
+          : 700;
+      const clipped = text.length > maxPromptChars ? `${text.slice(0, maxPromptChars)}...` : text;
       return `- ${name}: ${clipped}`;
     })
     .filter(Boolean)
@@ -1924,22 +2306,22 @@ function formatFollowUpPrompt({
   /* === VIVENTIUM NOTE === */
 
   /* === VIVENTIUM START ===
-   * Feature: Anti-repetition follow-up prompt (fixes cortex follow-up echo bug).
-   * Updated: 2026-02-24
-   *
-   * Why: The previous prompt buried the "don't repeat" instruction after the insights,
-   * causing the follow-up LLM to echo topics already covered in Phase A. Multi-cortex
-   * amplification (e.g. 6 cortices all mentioning "pancakes") further overwhelmed
-   * the weak instruction.
-   *
-   * Fix: (1) Anti-repetition rule at the TOP (primacy effect), (2) include full recent
-   * response (cap raised to 2400), (3) make {NTA} the default behavior, (4) explicit
-   * "DO NOT repeat" language.
+   * Feature: Evidence for the model's follow-up decision.
+   * Purpose: Preserve the complete delivered answer, including its conclusion. A
+   * character prefix hides already-delivered advice and makes it appear new.
+   * The selected provider's normal context admission owns capacity limits.
    */
-  const recentBlock = cleanRecent ? cleanRecent.slice(0, 2400) : '(short acknowledgment)';
-  const userRequestBlock = cleanUserRequest
-    ? cleanUserRequest.slice(0, 2400)
-    : '(user request unavailable; answer only from the background evidence and state uncertainty)';
+  const recentBlock = cleanRecent || '(short acknowledgment)';
+  const currentUserRequest =
+    primaryResponseMode && cleanContinuation
+      ? [cleanUserRequest.slice(0, 2400), cleanContinuation.slice(-1800)]
+          .filter(Boolean)
+          .join('\n\n')
+      : cleanUserRequest;
+  const missionRequest = acceptedMissionRequest(insights);
+  const userRequestBlock = missionRequest ?? (currentUserRequest
+    ? currentUserRequest.slice(0, 4200)
+    : '(user request unavailable; answer only from the background evidence and state uncertainty)');
 
   if (primaryResponseMode) {
     const fallbackPrompt = [
@@ -2263,6 +2645,7 @@ async function promoteForcedFollowUpToEmptyParent({
   forceVisibleFollowUp,
   scheduleId,
   continuationContext,
+  deliveryBatch,
 }) {
   const normalizedText = typeof text === 'string' ? text.trim() : '';
   if (!forceVisibleFollowUp || !normalizedText || scheduleId) {
@@ -2296,16 +2679,30 @@ async function promoteForcedFollowUpToEmptyParent({
     const nextContent = mergeVisibleTextIntoMessageContent(existing.content, normalizedText, {
       dropErrorParts: true,
     });
+    const existingViventium = existing.metadata?.viventium || {};
+    const { deliveryAcknowledgement: _staleAcknowledgement, ...priorMetadata } = existingViventium;
+    const nextRevision = Math.max(
+      1,
+      Number(existingViventium.messageRevision) || 1,
+      Number(existingViventium.deliveryAcknowledgement?.revision) || 1,
+    ) + 1;
     const nextMetadata = {
       ...(existing.metadata || {}),
       viventium: {
-        ...((existing.metadata || {}).viventium || {}),
+        ...priorMetadata,
         type: 'cortex_followup',
         parentMessageId: existing.parentMessageId || undefined,
         cortexCount: insightsData?.cortexCount ?? undefined,
         replacedParentMessage: true,
         forceVisibleFollowUp: true,
         promotedToEmptyParent: true,
+        messageRevision: Math.max(nextRevision, claimedCortexPresentationGeneration(deliveryBatch) || 1),
+        ...(deliveryBatch?.claimed?.length ? {
+          cortexInsightDeliveryIds: claimedCortexInsightDeliveryIds(deliveryBatch),
+          cortexPresentationGeneration: claimedCortexPresentationGeneration(deliveryBatch),
+          cortexPresentationClaimToken: claimedCortexPresentationClaimToken(deliveryBatch),
+          cortexPresentationParentMessageId: parentMessageId,
+        } : {}),
         telegramDeliveryControls: telegramDeliveryControls || undefined,
         recoveredPrimaryErrorClasses:
           recoveredPrimaryErrorClasses.length > 0 ? recoveredPrimaryErrorClasses : undefined,
@@ -2320,8 +2717,10 @@ async function promoteForcedFollowUpToEmptyParent({
         content: nextContent,
         metadata: nextMetadata,
         unfinished: false,
+        error: false,
       },
       {
+        operationKind: 'system',
         context:
           'viventium/services/BackgroundCortexFollowUpService.promoteForcedFollowUpToEmptyParent',
       },
@@ -2340,6 +2739,7 @@ async function promoteForcedFollowUpToEmptyParent({
       content: nextContent,
       metadata: nextMetadata,
       unfinished: false,
+      error: false,
     };
   } catch (err) {
     logger.warn(
@@ -2459,6 +2859,7 @@ async function generateFollowUpText({
     effectiveModel,
     primaryResponseMode,
     useVoiceModel,
+    runId,
     conversationId,
     parentMessageId,
   });
@@ -2570,9 +2971,33 @@ async function generateFollowUpText({
     version: 'v2',
   };
 
+  let nativeToolEvidence = [];
+  if (req?.user?.id && conversationId && parentMessageId) {
+    try {
+      nativeToolEvidence = await require('./nativeResponseService').getService().readToolEvidence(
+        req.user.id, conversationId, parentMessageId,
+      );
+    } catch (error) {
+      // Accepted worker results carry their own fenced authority. A failed or
+      // replaced foreground reply cannot block their delivery; its optional
+      // graph evidence remains guarded and is never used in this case.
+      if (!insights.every(isDurableMissionInsight) ||
+          error?.code !== 'native_graph_tool_evidence_parent_unfinished') throw error;
+      logger.info(
+        `[BackgroundCortexFollowUpService] Optional parent tool evidence omitted: code=${error.code} conversationId=${conversationId} parentMessageId=${parentMessageId}`,
+      );
+    }
+  }
+  const mediaContent = await buildGlassHiveNativeMediaContent(prompt, insights);
+  const modelContent = nativeToolEvidence.length === 0 ? mediaContent : [
+    ...(typeof mediaContent === 'string' ? [{ type: 'text', text: mediaContent }] : mediaContent),
+    ...nativeToolEvidence,
+  ];
   const content = await processFollowUpWithDurableReattach({
     run,
-    input: { messages: [new HumanMessage(prompt)] },
+    input: {
+      messages: [new HumanMessage(modelContent)],
+    },
     config,
     providerCapability: followUpProviderCapability,
     llmConfig,
@@ -2594,8 +3019,7 @@ async function generateFollowUpText({
   if (rawText.length === 0) {
     return '';
   }
-  const strippedText = stripQuestionSentences(rawText);
-  const sanitizedText = sanitizeFollowUpDisplayText(strippedText);
+  const sanitizedText = sanitizeFollowUpDisplayText(renderGlassHiveNativeMediaLinks(rawText, insights));
   const normalizedText = normalizeNoResponseText(sanitizedText).trim();
 
   if (
@@ -2609,17 +3033,18 @@ async function generateFollowUpText({
 
   if (process.env.VIVENTIUM_DEBUG_PHASE_B === 'true') {
     logger.info(
-      `[BackgroundCortexFollowUpService] Follow-up text stages: primary=${primaryResponseMode} raw_len=${rawText.length} raw_hash=${hashFollowUpTextForLog(rawText)} stripped_len=${strippedText.length} stripped_hash=${hashFollowUpTextForLog(strippedText)} sanitized_len=${sanitizedText.length} sanitized_hash=${hashFollowUpTextForLog(sanitizedText)} normalized_len=${normalizedText.length} normalized_hash=${hashFollowUpTextForLog(normalizedText)}`,
+      `[BackgroundCortexFollowUpService] Follow-up text stages: primary=${primaryResponseMode} raw_len=${rawText.length} raw_hash=${hashFollowUpTextForLog(rawText)} sanitized_len=${sanitizedText.length} sanitized_hash=${hashFollowUpTextForLog(sanitizedText)} normalized_len=${normalizedText.length} normalized_hash=${hashFollowUpTextForLog(normalizedText)}`,
     );
   }
 
   return normalizedText;
 }
 
-async function createCortexFollowUpMessage({
+async function prepareCortexFollowUpMessage({
   req,
   conversationId,
   parentMessageId,
+  runId = '',
   agent,
   insightsData,
   recentResponse,
@@ -2627,7 +3052,7 @@ async function createCortexFollowUpMessage({
 }) {
   const voiceTaskId = String(req?.body?.viventiumVoiceTaskId || '').trim();
   if (voiceTaskId && (await isFollowUpVoiceTaskSuppressed(req, voiceTaskId))) {
-    return null;
+    return { suppressed: true };
   }
   let text = '';
   let generationFailed = false;
@@ -2647,7 +3072,7 @@ async function createCortexFollowUpMessage({
     parentMessageId,
     recentResponse,
   });
-  const userRequest = await resolveUserRequestTextForAssistantParent({
+  const userRequest = acceptedMissionRequest(insightsData?.insights) ?? await resolveUserRequestTextForAssistantParent({
     req,
     parentMessageId,
     messages: conversationMessages,
@@ -2655,7 +3080,12 @@ async function createCortexFollowUpMessage({
   const followUpRecentResponse = isNoResponseOnly(recentResponseResolution.text)
     ? ''
     : recentResponseResolution.text;
-  const shouldForceVisibleFollowUp = shouldForceVisibleFollowUpForEmptyPrimary({
+  const durableMissionEvidence = hasInsights && insightsData.insights.every(
+    (insight) => insight?.authority?.kind === 'durable_terminal_callback',
+  );
+  // Durable worker results are separate conversation events, even when their
+  // original foreground reply failed. Never promote them into that old branch.
+  const shouldForceVisibleFollowUp = !durableMissionEvidence && shouldForceVisibleFollowUpForEmptyPrimary({
     configuredForceVisibleFollowUp: forceVisibleFollowUp === true,
     hasInsights,
     recentResponse: followUpRecentResponse,
@@ -2686,7 +3116,7 @@ async function createCortexFollowUpMessage({
         recentResponse: followUpRecentResponse,
         userRequest,
         continuationContext: continuationContext.contextText,
-        runId: parentMessageId || conversationId || '',
+        runId: runId || parentMessageId || conversationId || '',
         primaryResponseMode: shouldForceVisibleFollowUp,
         conversationId,
         parentMessageId,
@@ -2763,6 +3193,42 @@ async function createCortexFollowUpMessage({
     initialContinuationContext: continuationContext,
     finalContinuationContext,
   });
+
+  return {
+    suppressed: false,
+    voiceTaskId,
+    text,
+    telegramDeliveryControls,
+    followUpDecisionRecord,
+    conversationMessages,
+    finalContinuationContext,
+    shouldForceVisibleFollowUp,
+    scheduleId,
+    decision,
+  };
+}
+
+async function persistPreparedCortexFollowUpMessage(
+  { req, conversationId, parentMessageId, agent, insightsData, deliveryBatch = null, dependencies = {} },
+  prepared,
+) {
+  if (!prepared || prepared.suppressed === true) {
+    if (deliveryBatch?.claimed?.length) {
+      await dropCortexInsightDeliveryBatch({ req, parentMessageId, deliveryBatch,
+        dropReason: 'voice_task_suppressed' });
+    }
+    return null;
+  }
+  const {
+    voiceTaskId,
+    text,
+    telegramDeliveryControls,
+    followUpDecisionRecord,
+    conversationMessages,
+    finalContinuationContext,
+    shouldForceVisibleFollowUp,
+    scheduleId,
+  } = prepared;
   logFollowUpDecisionRecord(req, followUpDecisionRecord);
   await persistFollowUpDecisionToParentMessage({
     req,
@@ -2771,7 +3237,19 @@ async function createCortexFollowUpMessage({
   });
 
   if (!text || text.trim().length === 0) {
+    if (deliveryBatch?.claimed?.length) {
+      await dropCortexInsightDeliveryBatch({ req, parentMessageId, deliveryBatch,
+        decisionRecord: followUpDecisionRecord,
+        dropReason: resolveCortexInsightDropReason({ decision: prepared.decision }) });
+    }
     return null;
+  }
+  if (deliveryBatch?.claimed?.length) {
+    const renewed = await renewCortexInsightDeliveryBatchClaim({
+      ownerId: String(req?.user?.id || '').trim(),
+      claims: claimedCortexInsightDeliveryClaims(deliveryBatch),
+    });
+    requireExactCortexInsightDeliverySettlement(deliveryBatch.claimed, renewed);
   }
 
   const promotedParentMessage = await promoteForcedFollowUpToEmptyParent({
@@ -2784,8 +3262,15 @@ async function createCortexFollowUpMessage({
     forceVisibleFollowUp: shouldForceVisibleFollowUp,
     scheduleId,
     continuationContext: finalContinuationContext,
+    deliveryBatch,
   });
   if (promotedParentMessage) {
+    if (deliveryBatch?.claimed?.length) {
+      await settlePersistedCortexInsightDeliveryBatch({ req, parentMessageId, deliveryBatch,
+        persistedMessageId: promotedParentMessage.messageId,
+        decisionRecord: followUpDecisionRecord,
+        messageRevision: promotedParentMessage?.metadata?.viventium?.messageRevision || 1 });
+    }
     return promotedParentMessage;
   }
 
@@ -2827,7 +3312,15 @@ async function createCortexFollowUpMessage({
   }
   /* === VIVENTIUM END === */
 
-  const messageId = crypto.randomUUID();
+  const deliveryIds = claimedCortexInsightDeliveryIds(deliveryBatch).sort();
+  const stableMessageHash = crypto
+    .createHash('sha256')
+    .update([String(parentMessageId || ''), ...deliveryIds].join('\u0000'))
+    .digest('hex');
+  const messageId =
+    deliveryIds.length > 0
+      ? `${stableMessageHash.slice(0, 8)}-${stableMessageHash.slice(8, 12)}-5${stableMessageHash.slice(13, 16)}-a${stableMessageHash.slice(17, 20)}-${stableMessageHash.slice(20, 32)}`
+      : crypto.randomUUID();
   const sender = 'AI';
 
   const endpoint = EModelEndpoint.agents;
@@ -2840,6 +3333,17 @@ async function createCortexFollowUpMessage({
       replacedParentMessage: false,
       forceVisibleFollowUp: shouldForceVisibleFollowUp,
       cortexFollowUpDecision: compactDecisionRecordForMetadata(followUpDecisionRecord),
+      cortexInsightDeliveryIds: claimedCortexInsightDeliveryIds(deliveryBatch),
+      cortexPresentationGeneration: claimedCortexPresentationGeneration(deliveryBatch),
+      cortexPresentationClaimToken: claimedCortexPresentationClaimToken(deliveryBatch),
+      cortexPresentationParentMessageId: parentMessageId,
+      messageRevision: Math.max(
+        1,
+        Number(
+          getTrustedInteractionContext(req)?.revision || req?.body?.viventiumLogicalTurnRevision,
+        ) || 1,
+      ),
+
     },
   };
   if (telegramDeliveryControls) {
@@ -2859,7 +3363,12 @@ async function createCortexFollowUpMessage({
     metadata,
   };
 
-  await db.saveMessage(req, followUpMessage, {
+  if (deliveryBatch?.claimed?.length) {
+    const persisted = await persistCortexFollowUpMessageWithLedger({ req, parentMessageId,
+      followUpMessage, decisionRecord: followUpDecisionRecord, deliveryBatch, dependencies });
+    if (persisted.dropped) return null;
+  } else await db.saveMessage(req, followUpMessage, {
+    operationKind: 'system',
     context: 'viventium/services/BackgroundCortexFollowUpService.createCortexFollowUpMessage',
   });
 
@@ -2874,13 +3383,46 @@ async function createCortexFollowUpMessage({
         { $pull: { messages: removed._id } },
       );
     }
+    if (deliveryBatch?.claimed?.length) {
+      await dropCortexInsightDeliveryBatch({ req, parentMessageId, deliveryBatch,
+        decisionRecord: followUpDecisionRecord, dropReason: 'voice_task_suppressed' });
+    }
     return null;
   }
 
   return followUpMessage;
 }
 
+async function createCortexFollowUpMessage(input) {
+  const { req, conversationId, parentMessageId, insightsData, claimedDeliveryBatch,
+    deliveryParentMessageId = '', dependencies = {} } = input;
+  const insights = Array.isArray(insightsData?.insights) ? insightsData.insights : [];
+  let deliveryBatch = claimedDeliveryBatch || null;
+  if (insights.length && !deliveryBatch) {
+    const feelingSnapshot = normalizeCortexFeelingSnapshot(req?._viventiumFeelingSnapshot);
+    deliveryBatch = await (dependencies.claimBatch || claimCortexInsightDeliveryBatch)({
+      ownerId: req?.user?.id, conversationId,
+      parentMessageId: deliveryParentMessageId || parentMessageId,
+      surface: resolveViventiumSurface(req) || (isVoiceMode(req) ? 'voice' : 'web'),
+      streamId: req?.body?.streamId || req?._resumableStreamId || '',
+      messageRevision: Math.max(1, Number(getTrustedInteractionContext(req)?.revision ||
+        req?.body?.viventiumLogicalTurnRevision) || 1),
+      ...(feelingSnapshot ? { feelingSnapshot } : {}), insights,
+    });
+  }
+  if (insights.length && !deliveryBatch?.claimed?.length) return null;
+  const claimedInput = { ...input, deliveryBatch,
+    insightsData: deliveryBatch ? { ...insightsData,
+      insights: selectClaimedCortexInsights({ insights, claimedDeliveries: deliveryBatch.claimed })
+    } : insightsData,
+  };
+  const prepared = await prepareCortexFollowUpMessage(claimedInput);
+  return persistPreparedCortexFollowUpMessage(claimedInput, prepared);
+}
+
 module.exports = {
+  persistCortexFollowUpMessageWithLedger, resolveCortexInsightDropReason,
+  settleSuppressedCortexInsightDeliveries,
   cleanFallbackInsightText,
   getVisibleFallbackInsightTexts,
   isOperationalFallbackParagraph,
@@ -2889,6 +3431,8 @@ module.exports = {
   persistCortexPartsToCanonicalMessage,
   finalizeCanonicalCortexMessage,
   createCortexFollowUpMessage,
+  prepareCortexFollowUpMessage,
+  persistPreparedCortexFollowUpMessage,
   generateFollowUpText,
   formatFollowUpText,
   deduplicateInsights,
@@ -2912,5 +3456,4 @@ module.exports = {
   resolvePhaseBFeelingInjection,
   persistFollowUpDecisionToParentMessage,
   sanitizeAnthropicFollowUpLLMConfig,
-  stripQuestionSentences,
 };

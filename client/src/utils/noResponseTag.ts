@@ -216,6 +216,82 @@ export function filterNoResponseMessagesTree(
   return _filterNoResponseMessagesTree(messagesTree, options);
 }
 
+/* === VIVENTIUM START === Autonomous results are additive, not alternative user answers. === */
+export function isTrustedSystemMessageGroup(message: Partial<TMessage>): boolean {
+  const metadata = message.metadata as
+    | {
+        viventium?: {
+          visibility?: string;
+          interactionContext?: { actor_kind?: string };
+        };
+      }
+    | undefined;
+  const context = metadata?.viventium?.interactionContext;
+  return (
+    message.isCreatedByUser === true &&
+    metadata?.viventium?.visibility === 'internal' &&
+    context?.actor_kind === 'system'
+  );
+}
+
+/** Persisted server events share the scheduler projection without hiding assistant content. */
+function isAutonomousMessage(message: Partial<TMessage>): boolean {
+  if (isTrustedSystemMessageGroup(message)) return true;
+  const metadata = message.metadata as
+    | { viventium?: { type?: string; replacedParentMessage?: boolean } }
+    | undefined;
+  return (
+    message.isCreatedByUser === false &&
+    (metadata?.viventium?.type === 'glasshive_worker_callback' ||
+      (metadata?.viventium?.type === 'cortex_followup' &&
+        metadata.viventium.replacedParentMessage !== true))
+  );
+}
+
+function autonomousResponsePrefix(message: TMessage): TMessage {
+  const children: TMessage[] = [];
+  for (const child of message.children ?? []) {
+    if (child.isCreatedByUser && !isTrustedSystemMessageGroup(child)) continue;
+    children.push(autonomousResponsePrefix(child));
+  }
+  return { ...message, children };
+}
+
+function hasOrdinaryContinuation(message: TMessage): boolean {
+  for (const child of message.children ?? []) {
+    if (child.isCreatedByUser && !isTrustedSystemMessageGroup(child)) return true;
+    if (hasOrdinaryContinuation(child)) return true;
+  }
+  return false;
+}
+
+/** An autonomous answer alone is not an alternate user conversation. */
+export function getMessageBranchChoices(messages: TMessage[]): TMessage[] {
+  const choices = messages.filter(
+    (message) => !isAutonomousMessage(message) || hasOrdinaryContinuation(message),
+  );
+  return choices.length > 0 ? choices : messages;
+}
+
+/** Keep autonomous responses at the current branch anchor; never traverse another user branch. */
+export function selectVisibleMessageBranches(
+  messages: TMessage[],
+  selectedMessageId: string,
+): TMessage[] {
+  const visible: TMessage[] = [];
+  const selected = messages.find((message) => message.messageId === selectedMessageId);
+  for (const message of messages) {
+    if (message.messageId === selectedMessageId) visible.push(message);
+    else if (
+      isAutonomousMessage(message) &&
+      message.conversationId === selected?.conversationId
+    )
+      visible.push(autonomousResponsePrefix(message));
+  }
+  return visible;
+}
+/* === VIVENTIUM END === */
+
 /** Remove only rows explicitly marked internal by trusted server metadata. */
 export function filterTrustedInternalMessagesTree(
   messagesTree?: TMessage[] | null,
@@ -228,7 +304,7 @@ export function filterTrustedInternalMessagesTree(
       { viventium?: { visibility?: unknown } } | null | undefined;
     const children = Array.isArray(message.children) ? message.children : [];
     const filteredChildren = filterTrustedInternalMessagesTree(children) ?? [];
-    if (metadata?.viventium?.visibility === 'internal') {
+    if (metadata?.viventium?.visibility === 'internal' && !isTrustedSystemMessageGroup(message)) {
       changed = true;
       visible.push(...filteredChildren);
       continue;

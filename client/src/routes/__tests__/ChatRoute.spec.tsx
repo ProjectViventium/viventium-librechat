@@ -131,6 +131,7 @@ jest.mock('~/data-provider', () => ({
 }));
 
 jest.mock('~/hooks', () => ({
+  useAuthContext: () => ({ isAuthenticated: true, user: mockUser, roles: mockRoles }),
   useAppStartup: jest.fn(),
   useAssistantListMap: () => mockAssistantListMap,
   useIdChangeEffect: jest.fn(),
@@ -229,15 +230,6 @@ jest.mock('~/components/Chat/ChatView', () => ({
       }),
     );
   },
-}));
-
-jest.mock('../useAuthRedirect', () => ({
-  __esModule: true,
-  default: () => ({
-    isAuthenticated: true,
-    user: mockUser,
-    roles: mockRoles,
-  }),
 }));
 
 jest.mock('~/store/temporary', () => ({

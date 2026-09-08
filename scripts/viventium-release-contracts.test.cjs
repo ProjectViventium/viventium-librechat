@@ -25,7 +25,7 @@ test('explicit Viventium env file isolates direct start from canonical App Suppo
 
   assert.match(
     launcher,
-    /if \[\[ -n "\$\{VIVENTIUM_ENV_FILE:-\}" \]\]; then[\s\S]*generated_env_files=\("\$VIVENTIUM_ENV_FILE"\)[\s\S]*else[\s\S]*runtime\/service-env\/librechat\.env[\s\S]*runtime\/runtime\.env[\s\S]*fi/,
+    /if \[\[ -n "\$\{VIVENTIUM_ENV_FILE:-\}" \]\]; then[\s\S]*generated_env_files=\(\s*"\$VIVENTIUM_ENV_FILE"\s*"\$\(dirname "\$VIVENTIUM_ENV_FILE"\)\/service-env\/librechat\.env"\s*\)[\s\S]*else[\s\S]*runtime\/service-env\/librechat\.env[\s\S]*runtime\/runtime\.env[\s\S]*fi/,
   );
   assert.doesNotMatch(
     launcher,
@@ -231,3 +231,46 @@ test('Native API startup runs a zero-age bounded HEIC temp scavenger before serv
   const server = read('api/server/index.js');
   assert.match(server, /await scavengeNativeHeicTemporaryFiles\([\s\S]*minimumAgeMs:\s*0/);
 });
+
+/* === VIVENTIUM START === CSS compatibility follows the shipped browser baseline. === */
+test('browser CSS preserves native dark and focus selectors without dropping required prefixes', async () => {
+  const previousDirectory = process.cwd();
+  process.chdir(path.join(ROOT, 'client'));
+  try {
+    const postcss = require('postcss');
+    const { plugins } = require('../client/postcss.config.cjs');
+    const result = await postcss(plugins).process(
+      `.group:focus-within .field:is(.dark *) { color: rgb(255 0 0 / 50%); }
+       .peer:focus ~ .field:is(.dark *) { background: black; }
+       .field:is(:focus, :hover) { user-select: none; }`,
+      { from: path.join(ROOT, 'client/src/css-contract.css'), map: false },
+    );
+    assert.deepEqual(
+      result.warnings().map((warning) => warning.text),
+      [],
+    );
+    assert.ok(result.css.includes('.group:focus-within .field:is(.dark *)'));
+    assert.ok(result.css.includes('.peer:focus ~ .field:is(.dark *)'));
+    assert.ok(result.css.includes('-webkit-user-select: none'), 'Safari still needs its prefix');
+    assert.ok(result.css.includes('user-select: none'));
+  } finally {
+    process.chdir(previousDirectory);
+  }
+});
+
+test('CSS browser targets include every installed Vite JavaScript target', async () => {
+  const browserslist = require('browserslist');
+  const { resolveConfig } = require('vite');
+  const clientRoot = path.join(ROOT, 'client');
+  const configured = browserslist(undefined, { path: clientRoot });
+  const viteConfig = await resolveConfig(
+    { configFile: false, root: clientRoot, logLevel: 'silent' },
+    'build',
+  );
+  for (const target of viteConfig.build.target) {
+    const [, browser, version] = target.match(/^([a-z]+)([\d.]+)$/);
+    const [canonical] = browserslist(`${browser} ${version}`);
+    assert.ok(configured.includes(canonical), `CSS must support Vite's ${target} target`);
+  }
+});
+/* === VIVENTIUM END === */

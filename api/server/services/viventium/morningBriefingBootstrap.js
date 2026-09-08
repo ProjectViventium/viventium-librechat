@@ -99,7 +99,12 @@ async function ensureMorningBriefing({ userId, clientTimezone, surface }) {
 
     const response = await fetch(`${baseUrl}/internal/bootstrap-schedule`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(process.env.SCHEDULING_MCP_API_KEY
+          ? { Authorization: `Bearer ${process.env.SCHEDULING_MCP_API_KEY}` }
+          : {}),
+      },
       body: JSON.stringify(payload),
       signal: controller.signal,
     });

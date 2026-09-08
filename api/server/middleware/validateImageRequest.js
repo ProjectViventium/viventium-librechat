@@ -1,7 +1,7 @@
 const cookies = require('cookie');
 const jwt = require('jsonwebtoken');
 const { logger } = require('@librechat/data-schemas');
-const { isEnabled, getBasePath } = require('@librechat/api');
+const { getSessionCookieName, isEnabled, getBasePath } = require('@librechat/api');
 
 const OBJECT_ID_LENGTH = 24;
 const OBJECT_ID_PATTERN = /^[0-9a-f]{24}$/i;
@@ -68,12 +68,12 @@ function createValidateImageRequest(secureImageLinks) {
       }
 
       const parsedCookies = cookies.parse(cookieHeader);
-      const tokenProvider = parsedCookies.token_provider;
+      const tokenProvider = parsedCookies[getSessionCookieName('token_provider')];
       let userIdForPath;
 
       if (tokenProvider === 'openid' && isEnabled(process.env.OPENID_REUSE_TOKENS)) {
         /** For OpenID users with OPENID_REUSE_TOKENS, use openid_user_id cookie */
-        const openidUserId = parsedCookies.openid_user_id;
+        const openidUserId = parsedCookies[getSessionCookieName('openid_user_id')];
         if (!openidUserId) {
           logger.warn('[validateImageRequest] No OpenID user ID cookie found');
           return res.status(403).send('Access Denied');
@@ -90,7 +90,7 @@ function createValidateImageRequest(secureImageLinks) {
          * For non-OpenID users (or OpenID without REUSE_TOKENS), use refreshToken from cookies.
          * These users authenticate via setAuthTokens() which stores refreshToken in cookies.
          */
-        const refreshToken = parsedCookies.refreshToken;
+        const refreshToken = parsedCookies[getSessionCookieName('refreshToken')];
 
         if (!refreshToken) {
           logger.warn('[validateImageRequest] Token not provided');

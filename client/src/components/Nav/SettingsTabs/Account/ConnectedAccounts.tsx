@@ -7,6 +7,7 @@ import { EModelEndpoint, apiBaseUrl, request } from 'librechat-data-provider';
 import type { ConnectedAccountCredentialPolicy } from 'librechat-data-provider';
 import { useRevokeUserKeyMutation, useUserKeyQuery } from 'librechat-data-provider/react-query';
 import { Button, Label, Spinner, useToastContext } from '@librechat/client';
+import { ChevronDown } from 'lucide-react';
 import { useGetEndpointsQuery, useGetStartupConfig } from '~/data-provider';
 import { SetKeyDialog } from '~/components/Input/SetKeyDialog';
 import { NotificationSeverity } from '~/common';
@@ -103,6 +104,9 @@ function ConnectedAccounts() {
   const { data: startupConfig } = useGetStartupConfig();
   const { data: endpointsConfig } = useGetEndpointsQuery();
   const [connectingProvider, setConnectingProvider] = useState<string | null>(null);
+  const [expandedProviders, setExpandedProviders] = useState<
+    Partial<Record<ProviderDefinition['slug'], boolean>>
+  >({});
   const [keyDialogProvider, setKeyDialogProvider] = useState<ProviderDefinition | null>(null);
   /* === VIVENTIUM START ===
    * Feature: Per-user connected-account credential policy.
@@ -598,16 +602,6 @@ function ConnectedAccounts() {
     };
   }, [clearKeyPoller, clearPopupMonitor, clearPopupWindow, invalidateFlowAttempt]);
 
-  const getSourceLine = (isConnected: boolean, platformFallbackAvailable: boolean) => {
-    if (isConnected) {
-      return localize('com_ui_connected_account_source_user');
-    }
-    if (platformFallbackAvailable) {
-      return localize('com_ui_connected_account_source_platform');
-    }
-    return localize('com_ui_connected_account_source_none');
-  };
-
   const connectProvider = async (provider: ProviderDefinition) => {
     if (!experimentalDirectSubscriptionAuth || !provider.oauth) {
       return;
@@ -824,29 +818,19 @@ function ConnectedAccounts() {
     ? providers
     : providers.filter((provider) => provider.oauth);
 
+  /* === VIVENTIUM START ===
+   * Feature: Compact account controls with optional details.
+   * Purpose: Keep account state and the next action visible without hiding auth limitations.
+   */
   return (
     <div className="space-y-3">
-      <div className="space-y-1">
-        <Label id="connected-accounts-label">{localize('com_ui_connected_accounts')}</Label>
+      <Label id="connected-accounts-label">{localize('com_ui_connected_accounts')}</Label>
+      {!connectedAccountsEnabled && (
         <p className="text-xs text-text-secondary">
-          {localize(
-            connectedAccountsEnabled
-              ? 'com_ui_connected_accounts_description'
-              : 'com_ui_connected_account_policy_description',
-          )}
+          {localize('com_ui_connected_account_policy_description')}
         </p>
-      </div>
-      {connectedAccountsEnabled && experimentalDirectSubscriptionAuth && (
-        <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-950 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-100">
-          <p className="text-sm font-medium">
-            {localize('com_ui_connected_accounts_experimental')}
-          </p>
-          <p className="mt-1 text-xs">
-            {localize('com_ui_connected_accounts_experimental_description')}
-          </p>
-        </div>
       )}
-      <div className="space-y-2" aria-labelledby="connected-accounts-label">
+      <div className="divide-y divide-border-light" aria-labelledby="connected-accounts-label">
         {visibleProviders.map((provider) => {
           const providerLabel = localize(provider.labelKey);
           const keyQuery = getKeyQuery(provider.queryKey);
@@ -855,60 +839,252 @@ function ConnectedAccounts() {
           const manualFlow = provider.oauth ? manualFlows[provider.slug] : undefined;
           const isManualSubmitting = manualFlow?.isSubmitting === true;
           const isConnecting = connectingProvider === provider.endpoint || isManualSubmitting;
-          const statusText = isConnected
-            ? localize('com_ui_connected_accounts_local_credential_saved')
-            : localize('com_ui_connected_accounts_no_local_credential');
           const credentialPolicy = provider.oauth ? credentialPolicies[provider.slug] : undefined;
           const credentialPolicyState = provider.oauth
             ? credentialPolicyStates[provider.slug]
             : undefined;
-          const effectivePlatformFallbackAvailable = connectedAccountPlatformFallbackAvailable(
-            provider.platformFallbackAvailable,
-            credentialPolicy === 'personal_required',
-          );
+          const effectivePlatformFallbackAvailable =
+            (!credentialPolicyEnabled || credentialPolicyState === 'ready') &&
+            connectedAccountPlatformFallbackAvailable(
+              provider.platformFallbackAvailable,
+              credentialPolicy === 'personal_required',
+            );
           const personalOnlyUnavailable =
             provider.oauth &&
             !connectedAccountsEnabled &&
             !isConnected &&
             credentialPolicy !== 'personal_required';
+          const detailsExpanded = expandedProviders[provider.slug] === true;
+          const detailsId = `connected-account-${provider.slug}-details`;
+          const actionUnavailable =
+            keyQuery.isLoading || keyQuery.isError || revokeMutation.isLoading || isConnecting;
+          let statusKey: TranslationKeys = 'com_ui_connected_accounts_no_local_credential';
+          if (keyQuery.isLoading) {
+            statusKey = 'com_ui_connected_accounts_loading';
+          } else if (keyQuery.isError) {
+            statusKey = 'com_ui_connected_accounts_load_error';
+          } else if (isConnected) {
+            statusKey = 'com_ui_connected_accounts_local_credential_saved';
+          } else if (effectivePlatformFallbackAvailable) {
+            statusKey = 'com_ui_connected_account_source_platform';
+          }
+          const toggleDetails = () =>
+            setExpandedProviders((current) => ({
+              ...current,
+              [provider.slug]: !detailsExpanded,
+            }));
+          let primaryActionLabel = localize('com_ui_connected_accounts_add_key');
+          let primaryAccessibleLabel = localize('com_ui_connected_accounts_add_provider_key', {
+            provider: providerLabel,
+          });
+          if (keyQuery.isError) {
+            primaryActionLabel = localize('com_ui_retry');
+            primaryAccessibleLabel = localize('com_ui_connected_accounts_retry_provider', {
+              provider: providerLabel,
+            });
+          } else if (isConnected) {
+            primaryActionLabel = localize('com_ui_connected_accounts_manage');
+            primaryAccessibleLabel = localize('com_ui_connected_accounts_manage_provider', {
+              provider: providerLabel,
+            });
+          }
+          const primaryDisabled = keyQuery.isError
+            ? keyQuery.isFetching
+            : keyQuery.isLoading || (!isConnected && actionUnavailable);
 
           return (
             <section
               key={provider.endpoint}
-              className="rounded-xl border border-border-light bg-surface-primary p-3"
-              aria-label={`${providerLabel} account`}
+              className="py-3 first:pt-0 last:pb-0"
+              aria-label={localize('com_ui_connected_accounts_provider_region', {
+                provider: providerLabel,
+              })}
             >
-              <div className="mb-3 flex items-start justify-between gap-2">
-                <div className="space-y-1">
-                  <p className="font-medium">{providerLabel}</p>
-                  {connectedAccountsEnabled && (
-                    <>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="min-w-24 flex-1">
+                  <p className="text-sm font-medium text-text-primary">{providerLabel}</p>
+                  <p
+                    className="mt-0.5 flex items-center gap-1.5 text-xs text-text-secondary"
+                    role="status"
+                  >
+                    {keyQuery.isLoading && <Spinner className="icon-sm" />}
+                    {localize(statusKey)}
+                  </p>
+                </div>
+                {connectedAccountsEnabled && (
+                  <Button
+                    variant="outline"
+                    className="shrink-0"
+                    aria-label={primaryAccessibleLabel}
+                    aria-expanded={isConnected && !keyQuery.isError ? detailsExpanded : undefined}
+                    aria-controls={isConnected && !keyQuery.isError ? detailsId : undefined}
+                    onClick={() => {
+                      if (keyQuery.isError) {
+                        void keyQuery.refetch();
+                      } else if (isConnected) {
+                        toggleDetails();
+                      } else {
+                        setKeyDialogProvider(provider);
+                      }
+                    }}
+                    disabled={primaryDisabled}
+                  >
+                    {primaryActionLabel}
+                  </Button>
+                )}
+                {(!connectedAccountsEnabled || !isConnected) && (
+                  <Button
+                    variant="ghost"
+                    className="gap-1 px-2 text-text-secondary"
+                    aria-label={localize('com_ui_connected_accounts_provider_details', {
+                      provider: providerLabel,
+                    })}
+                    aria-expanded={detailsExpanded}
+                    aria-controls={detailsId}
+                    onClick={toggleDetails}
+                  >
+                    {localize('com_ui_connected_accounts_details')}
+                    <ChevronDown
+                      aria-hidden="true"
+                      className={cn(
+                        'icon-sm transition-transform',
+                        detailsExpanded && 'rotate-180',
+                      )}
+                    />
+                  </Button>
+                )}
+              </div>
+              {provider.oauth &&
+                credentialPolicyEnabled &&
+                credentialPolicyState === 'unavailable' && (
+                  <p className="mt-2 text-xs text-text-secondary" role="alert">
+                    {localize('com_ui_connected_account_policy_unavailable')}
+                  </p>
+                )}
+              {detailsExpanded && (
+                <div id={detailsId} className="mt-3 space-y-3 rounded-lg bg-surface-secondary p-3">
+                  {isConnected && !keyQuery.isLoading && !keyQuery.isError && (
+                    <p className="text-xs text-text-secondary">
+                      {localize('com_ui_connected_account_source_user')}
+                    </p>
+                  )}
+                  {connectedAccountsEnabled && isConnected && (
+                    <Button
+                      variant="outline"
+                      aria-label={localize('com_ui_connected_accounts_use_provider_api_key', {
+                        provider: providerLabel,
+                      })}
+                      onClick={() => setKeyDialogProvider(provider)}
+                      disabled={actionUnavailable}
+                    >
+                      {localize('com_ui_connected_accounts_use_key')}
+                    </Button>
+                  )}
+                  {provider.oauth &&
+                    credentialPolicyEnabled &&
+                    credentialPolicyState === 'loading' && (
                       <p
-                        className={cn(
-                          'text-xs',
-                          isConnected
-                            ? 'text-amber-700 dark:text-amber-300'
-                            : 'text-text-secondary',
-                        )}
+                        className="flex items-center gap-2 text-xs text-text-secondary"
+                        role="status"
                       >
-                        {statusText}
+                        <Spinner className="icon-sm" />
+                        {localize('com_ui_connected_account_policy_loading')}
                       </p>
-                      <p className="text-xs text-text-secondary">
-                        {getSourceLine(isConnected, effectivePlatformFallbackAvailable)}
+                    )}
+                  {provider.oauth &&
+                    credentialPolicyEnabled &&
+                    credentialPolicyState === 'ready' && (
+                      <label className="flex items-start gap-2">
+                        <input
+                          type="checkbox"
+                          aria-label={localize('com_ui_connected_account_personal_required')}
+                          className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
+                          aria-describedby={`${detailsId}-preference`}
+                          checked={credentialPolicy === 'personal_required'}
+                          disabled={
+                            updatingCredentialPolicy === provider.slug || personalOnlyUnavailable
+                          }
+                          onChange={(event) =>
+                            void updateCredentialPolicy(
+                              provider.slug,
+                              event.target.checked ? 'personal_required' : 'personal_preferred',
+                            )
+                          }
+                        />
+                        <span>
+                          <span className="block text-sm">
+                            {localize('com_ui_connected_account_personal_required')}
+                          </span>
+                          <span
+                            id={`${detailsId}-preference`}
+                            className="mt-1 block text-xs text-text-secondary"
+                          >
+                            {localize(
+                              personalOnlyUnavailable
+                                ? 'com_ui_connected_account_personal_required_unavailable'
+                                : 'com_ui_connected_account_personal_required_description',
+                            )}
+                          </span>
+                        </span>
+                      </label>
+                    )}
+                  {connectedAccountsEnabled &&
+                    experimentalDirectSubscriptionAuth &&
+                    provider.oauth && (
+                      <div className="space-y-2">
+                        <p className="text-xs text-text-secondary" id={`${detailsId}-experimental`}>
+                          {localize('com_ui_connected_accounts_experimental_description')}
+                        </p>
+                        <Button
+                          variant="outline"
+                          aria-describedby={`${detailsId}-experimental`}
+                          onClick={() => connectProvider(provider)}
+                          disabled={actionUnavailable}
+                        >
+                          {localize(
+                            isConnecting
+                              ? 'com_ui_connecting'
+                              : 'com_ui_connected_accounts_experimental',
+                          )}
+                        </Button>
+                      </div>
+                    )}
+                  {connectedAccountsEnabled && isConnected && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border-light pt-3">
+                      <p
+                        className="min-w-0 flex-1 text-xs text-text-secondary"
+                        id={`${detailsId}-remove`}
+                      >
+                        {localize('com_ui_connected_accounts_disconnect_local_only')}
                       </p>
-                    </>
+                      <Button
+                        variant="outline"
+                        aria-describedby={`${detailsId}-remove`}
+                        onClick={() => disconnectLocalCredential(provider)}
+                        disabled={actionUnavailable}
+                      >
+                        {localize(
+                          revokeMutation.isLoading
+                            ? 'com_ui_connected_accounts_removing'
+                            : 'com_ui_connected_accounts_disconnect',
+                        )}
+                      </Button>
+                    </div>
                   )}
                 </div>
-                {keyQuery.isLoading && <Spinner className="icon-sm" />}
-              </div>
+              )}
               {manualFlow && (
-                <div className="mb-3 space-y-2 rounded-lg border border-border-light bg-surface-secondary p-2">
-                  <p className="text-xs text-text-secondary">
+                <div className="mt-3 space-y-2 rounded-lg border border-border-light bg-surface-secondary p-3">
+                  <label
+                    htmlFor={`${detailsId}-code`}
+                    className="block text-xs text-text-secondary"
+                  >
                     {localize('com_ui_connected_account_manual_instructions', {
                       provider: providerLabel,
                     })}
-                  </p>
+                  </label>
                   <textarea
+                    id={`${detailsId}-code`}
                     rows={3}
                     value={manualFlow.callbackInput}
                     onChange={(event) => setManualFlowInput(provider.slug, event.target.value)}
@@ -918,7 +1094,7 @@ function ConnectedAccounts() {
                       'placeholder:text-text-secondary focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary',
                     )}
                   />
-                  <div className="flex items-center justify-end gap-2">
+                  <div className="flex flex-wrap items-center justify-end gap-2">
                     <Button
                       variant="outline"
                       onClick={() => cancelManualFlow(provider)}
@@ -930,98 +1106,9 @@ function ConnectedAccounts() {
                       onClick={() => void submitManualFlow(provider)}
                       disabled={isManualSubmitting || manualFlow.callbackInput.trim().length === 0}
                     >
-                      {isManualSubmitting ? (
-                        <Spinner className="icon-sm" />
-                      ) : (
-                        localize('com_ui_submit')
-                      )}
+                      {localize(isManualSubmitting ? 'com_ui_connecting' : 'com_ui_submit')}
                     </Button>
                   </div>
-                </div>
-              )}
-              {connectedAccountsEnabled && isConnected && (
-                <p className="mb-3 text-xs text-text-secondary">
-                  {localize('com_ui_connected_accounts_disconnect_local_only')}
-                </p>
-              )}
-              {provider.oauth && credentialPolicyEnabled && credentialPolicyState === 'loading' && (
-                <div
-                  className="mb-3 flex items-center gap-2 rounded-lg border border-border-light bg-surface-secondary p-2 text-xs text-text-secondary"
-                  role="status"
-                >
-                  <Spinner className="icon-sm" />
-                  {localize('com_ui_connected_account_policy_loading')}
-                </div>
-              )}
-              {provider.oauth &&
-                credentialPolicyEnabled &&
-                credentialPolicyState === 'unavailable' && (
-                  <p
-                    className="mb-3 rounded-lg border border-red-300 bg-red-50 p-2 text-xs text-red-800 dark:border-red-800 dark:bg-red-950/30 dark:text-red-200"
-                    role="alert"
-                  >
-                    {localize('com_ui_connected_account_policy_unavailable')}
-                  </p>
-                )}
-              {provider.oauth && credentialPolicyEnabled && credentialPolicyState === 'ready' && (
-                <label className="mb-3 flex items-start gap-2 rounded-lg border border-border-light bg-surface-secondary p-2">
-                  <input
-                    type="checkbox"
-                    className="mt-0.5"
-                    aria-label={localize('com_ui_connected_account_personal_required')}
-                    checked={credentialPolicy === 'personal_required'}
-                    disabled={updatingCredentialPolicy === provider.slug || personalOnlyUnavailable}
-                    onChange={(event) =>
-                      void updateCredentialPolicy(
-                        provider.slug,
-                        event.target.checked ? 'personal_required' : 'personal_preferred',
-                      )
-                    }
-                  />
-                  <span className="space-y-0.5">
-                    <span className="block text-sm font-medium">
-                      {localize('com_ui_connected_account_personal_required')}
-                    </span>
-                    <span className="block text-xs text-text-secondary">
-                      {localize('com_ui_connected_account_personal_required_description')}
-                    </span>
-                    {personalOnlyUnavailable && (
-                      <span className="block text-xs text-amber-700 dark:text-amber-300">
-                        {localize('com_ui_connected_account_personal_required_unavailable')}
-                      </span>
-                    )}
-                  </span>
-                </label>
-              )}
-              {connectedAccountsEnabled && (
-                <div className="flex items-center justify-end gap-2">
-                  {isConnected && (
-                    <Button
-                      variant="outline"
-                      onClick={() => disconnectLocalCredential(provider)}
-                      disabled={revokeMutation.isLoading || isConnecting}
-                    >
-                      {revokeMutation.isLoading ? (
-                        <Spinner className="icon-sm" />
-                      ) : (
-                        localize('com_ui_connected_accounts_disconnect')
-                      )}
-                    </Button>
-                  )}
-                  <Button variant="outline" onClick={() => setKeyDialogProvider(provider)}>
-                    {localize('com_ui_connected_accounts_use_provider_api_key', {
-                      provider: providerLabel,
-                    })}
-                  </Button>
-                  {experimentalDirectSubscriptionAuth && provider.oauth && (
-                    <Button onClick={() => connectProvider(provider)} disabled={isConnecting}>
-                      {isConnecting ? (
-                        <Spinner className="icon-sm" />
-                      ) : (
-                        localize('com_ui_connected_accounts_experimental')
-                      )}
-                    </Button>
-                  )}
                 </div>
               )}
             </section>
@@ -1045,4 +1132,5 @@ function ConnectedAccounts() {
   );
 }
 
+/* === VIVENTIUM END === */
 export default ConnectedAccounts;

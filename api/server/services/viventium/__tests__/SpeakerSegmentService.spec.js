@@ -638,6 +638,76 @@ describe('SpeakerSegmentService', () => {
     updateOne.mockRestore();
   });
 
+  test('retries a speaker revision when ambient continuation changes another segment after its row read', async () => {
+    const segment = (segmentId, sequence) => ({
+      version: 1,
+      callSessionId: 'call-race',
+      segmentId,
+      turnId: 'turn-1',
+      sequence,
+      revision: 1,
+      text: 'retained source',
+      isFinal: true,
+      speaker: { key: 'unknown', label: 'Unknown', actorTrust: 'unknown', attribution: 'unknown' },
+      uncertain: true,
+    });
+    const a = segment('segment-a', 1);
+    const b = segment('segment-b', 2);
+    const revised = {
+      ...a,
+      revision: 2,
+      speaker: {
+        ...a.speaker,
+        label: 'Speaker 1',
+        key: 'provider:A',
+        actorTrust: 'shared_mic_unverified',
+        attribution: 'unverified',
+      },
+    };
+    const concurrent = { ...b, revision: 3, text: 'continued source correction' };
+    let row = {
+      _id: 'message-race',
+      metadata: {
+        viventium: {
+          callSessionId: 'call-race',
+          speakerSegments: [a, b],
+        },
+      },
+    };
+    const clone = () => JSON.parse(JSON.stringify(row));
+    const find = jest.spyOn(Message, 'find').mockImplementation(() => ({
+      select: () => ({ lean: async () => [clone()] }),
+    }));
+    const findOne = jest.spyOn(Message, 'findOne').mockImplementation(() => ({
+      select: () => ({ lean: async () => clone() }),
+    }));
+    let raced = false;
+    const updateOne = jest.spyOn(Message, 'updateOne').mockImplementation(async (query, update) => {
+      if (!raced) {
+        raced = true;
+        row.metadata.viventium.speakerSegments = [a, concurrent];
+      }
+      const expected = query['metadata.viventium.speakerSegments'];
+      if (
+        expected &&
+        JSON.stringify(expected) !== JSON.stringify(row.metadata.viventium.speakerSegments)
+      ) {
+        return { matchedCount: 0, modifiedCount: 0 };
+      }
+      row.metadata.viventium.speakerSegments = update.$set['metadata.viventium.speakerSegments'];
+      return { matchedCount: 1, modifiedCount: 1 };
+    });
+    try {
+      await expect(
+        projectSpeakerSegmentRevisionsToMessages({ callSessionId: 'call-race', segments: [revised] }),
+      ).resolves.toEqual({ matched: 1, updated: 1 });
+      expect(row.metadata.viventium.speakerSegments).toEqual([revised, concurrent]);
+    } finally {
+      find.mockRestore();
+      findOne.mockRestore();
+      updateOne.mockRestore();
+    }
+  });
   test('persists a monotonic shared-mic session tombstone that can never revert', async () => {
     let stored = {
       callSessionId: 'call-tombstone',

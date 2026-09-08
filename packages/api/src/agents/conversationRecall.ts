@@ -17,6 +17,7 @@ import {
   Tools,
 } from 'librechat-data-provider';
 import type { Agent, AgentToolResources, TFile, TUser } from 'librechat-data-provider';
+import { isEnabled } from '~/utils/common';
 
 export type ConversationRecallRuntimeScope = 'none' | 'all' | 'agent';
 export type ConversationRecallAttachmentMode = 'vector' | 'source_only';
@@ -49,11 +50,27 @@ export function getConversationRecallRuntimeScope({
     return 'agent';
   }
 
-  if (user?.personalization?.conversation_recall === true) {
+  if (resolveConversationRecallPreference(user)) {
     return 'all';
   }
 
   return 'none';
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Installer default for conversation recall.
+ * Purpose: An account that never chose a recall preference follows the compiled installer default
+ * (`VIVENTIUM_DEFAULT_CONVERSATION_RECALL`); an explicit saved choice always wins.
+ * === VIVENTIUM END === */
+export function resolveConversationRecallPreference(
+  user?: Pick<TUser, 'personalization'> | null,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const choice = user?.personalization?.conversation_recall;
+  if (typeof choice === 'boolean') {
+    return choice;
+  }
+  return isEnabled(env.VIVENTIUM_DEFAULT_CONVERSATION_RECALL);
 }
 
 export function mergeConversationRecallResources(params: {
@@ -144,6 +161,34 @@ export function buildConversationRecallAttachmentFiles(params: {
       context: FileContext.conversation_recall,
     } as TFile),
   ];
+}
+
+/* === VIVENTIUM START ===
+ * Reconstruct rowless source recall from the authorized current scope, never staged metadata.
+ * === VIVENTIUM END === */
+export function rebuildSourceOnlyConversationRecallFiles({
+  user,
+  agent,
+  files,
+}: {
+  user: TUser;
+  agent: Agent;
+  files: Array<Pick<TFile, 'file_id'> & { viventiumConversationRecallMode?: string }>;
+}): TFile[] {
+  if (!user?.id || !agent?.id) {
+    return [];
+  }
+  const requestedIds = new Set(
+    files
+      .filter((file) => file.viventiumConversationRecallMode === 'source_only')
+      .map((file) => file.file_id),
+  );
+  return buildConversationRecallAttachmentFiles({
+    userId: user.id,
+    agentId: agent.id,
+    scope: getConversationRecallRuntimeScope({ user, agent }),
+    mode: 'source_only',
+  }).filter((file) => requestedIds.has(file.file_id));
 }
 
 export function ensureConversationRecallTool(tools?: string[] | null): string[] {

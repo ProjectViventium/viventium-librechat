@@ -667,6 +667,26 @@ async function getCallSession(callSessionId) {
   return normalizeSession(session);
 }
 
+/** Resolve only the current live Call for a completion already bound to this owner and chat. */
+async function getActiveCallSessionForConversation({ userId, conversationId } = {}) {
+  const owner = normalizeVoiceRouteText(userId, 160);
+  const conversation = normalizeVoiceRouteText(conversationId, 160);
+  if (!owner || !conversation || conversation === 'new') return null;
+  const now = new Date();
+  const session = await ViventiumCallSession.findOne({
+    userId: owner,
+    conversationId: conversation,
+    expiresAt: { $gt: now },
+    leaseExpiresAt: { $gt: now },
+    callStatus: { $in: ['listening', 'speaking', 'working', 'needs_input', 'degraded'] },
+  }).sort({ updatedAt: -1, createdAt: -1 }).lean();
+  const normalized = normalizeSession(session);
+  if (normalized?.mode !== 'call' || !normalized.activeJobId || !normalized.activeWorkerId) {
+    return null;
+  }
+  return normalized;
+}
+
 /* === VIVENTIUM START ===
  * Feature: one-time Telegram call launch exchange
  * Purpose: A Telegram button carries only a single-use launch bearer. The browser receives its
@@ -1702,6 +1722,7 @@ module.exports = {
   createCallBrowserLaunch,
   exchangeCallBrowserLaunch,
   getCallSession,
+  getActiveCallSessionForConversation,
   getCallSessionVoiceSettings,
   heartbeatCallSession,
   markVoiceSessionReady,

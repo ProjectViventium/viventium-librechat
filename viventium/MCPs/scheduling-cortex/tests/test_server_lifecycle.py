@@ -62,6 +62,42 @@ def test_waiting_on_capacity_remains_retryable_and_queued():
     ) == ("queued", "running", None, None)
 
 
+def test_needs_input_closes_only_the_schedule_occurrence_as_action_required():
+    queued = {"status": "queued", "disposition": "running"}
+
+    projected = _glasshive_callback_lifecycle(
+        queued,
+        "run.needs_input",
+        {
+            "failure_class": "provider_connected_account_reconnect_required",
+            "failure_retryable": False,
+        },
+        "now",
+    )
+    assert projected == (
+        "failed",
+        "failed",
+        "now",
+        "provider_connected_account_reconnect_required",
+    )
+    failed = {
+        "status": projected[0],
+        "disposition": projected[1],
+        "completed_at": projected[2],
+        "error_class": projected[3],
+    }
+    assert _glasshive_callback_lifecycle(
+        failed, "run.completed", {}, "later"
+    ) == projected
+    assert _glasshive_callback_lifecycle(
+        failed,
+        "run.completed",
+        {},
+        "later",
+        authoritative_terminal=True,
+    ) == ("completed", "delivered", "later", None)
+
+
 def test_late_failed_callback_cannot_regress_completed_run():
     completed = {
         "status": "completed",

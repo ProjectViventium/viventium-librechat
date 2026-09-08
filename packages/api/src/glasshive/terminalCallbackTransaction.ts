@@ -1,17 +1,15 @@
-/* === VIVENTIUM START === Single-attempt GlassHive terminal-callback transaction owner. === */
+/* === VIVENTIUM START === Terminal callbacks keep one attempt; replayable writes opt into native retries. === */
+import { mongo } from 'mongoose';
+import type { ClientSession } from 'mongoose';
 
 export type DeferredTerminalCallbackOperation = () => unknown | Promise<unknown>;
 
-interface TransactionSession {
-  abortTransaction: () => Promise<unknown>;
-  commitTransaction: () => Promise<unknown>;
-  endSession: () => Promise<unknown>;
-  inTransaction: () => boolean;
-  startTransaction: () => void;
+export interface TerminalCallbackTransactionOptions {
+  retry?: 'native';
 }
 
 interface TransactionContext {
-  session: TransactionSession;
+  session: ClientSession;
   afterCommit: DeferredTerminalCallbackOperation[];
   afterAbort: DeferredTerminalCallbackOperation[];
 }
@@ -22,7 +20,7 @@ export interface TerminalCallbackTransactionMongoose {
     run: <T>(context: TransactionContext, operation: () => T) => T;
   };
   set: (key: string, value: unknown) => unknown;
-  startSession: () => Promise<TransactionSession>;
+  startSession: () => Promise<ClientSession>;
 }
 
 export function createGlassHiveTerminalCallbackTransactionService(
@@ -51,14 +49,67 @@ export function createGlassHiveTerminalCallbackTransactionService(
     return true;
   }
 
+  async function rollbackAttempt(context: TransactionContext | undefined): Promise<void> {
+    if (!context) return;
+    context.afterCommit.length = 0;
+    let failure: Error | undefined;
+    for (const operation of context.afterAbort.splice(0).reverse()) {
+      try {
+        await operation();
+      } catch (error) {
+        failure ||= Object.assign(new Error('glasshive_terminal_callback_rollback_failed'), {
+          cause: error,
+        });
+      }
+    }
+    if (failure) throw failure;
+  }
+
+  async function runNativeTransaction<T>(
+    operation: (session: ClientSession) => T | Promise<T>,
+  ): Promise<T> {
+    const storage = mongoose.transactionAsyncLocalStorage;
+    if (!storage) {
+      throw new Error('glasshive_terminal_callback_transaction_storage_unavailable');
+    }
+    const session = await mongoose.startSession();
+    let context: TransactionContext | undefined;
+    let committed = false;
+    try {
+      const result = await session.withTransaction(async () => {
+        // A commit conflict can replay a callback that returned successfully.
+        await rollbackAttempt(context);
+        context = { session, afterCommit: [], afterAbort: [] };
+        const value = await storage.run(context, async () => operation(session));
+        if (!session.inTransaction()) {
+          throw new Error('glasshive_terminal_callback_transaction_ended_by_operation');
+        }
+        return value;
+      });
+      committed = true;
+      for (const afterCommit of context?.afterCommit || []) await afterCommit();
+      return result;
+    } catch (error) {
+      const unknownCommit =
+        error instanceof mongo.MongoError && error.hasErrorLabel('UnknownTransactionCommitResult');
+      if (!committed && !unknownCommit) await rollbackAttempt(context);
+      throw error;
+    } finally {
+      // Match native Mongoose cleanup without replacing the operation's result or error.
+      await session.endSession().catch(() => undefined);
+    }
+  }
+
   async function runGlassHiveTerminalCallbackTransaction<T>(
-    operation: (session: TransactionSession) => T | Promise<T>,
+    operation: (session: ClientSession) => T | Promise<T>,
+    options: TerminalCallbackTransactionOptions = {},
   ): Promise<T> {
     const inherited = mongoose.transactionAsyncLocalStorage?.getStore()?.session;
     if (inherited?.inTransaction()) return operation(inherited);
     if (!mongoose.transactionAsyncLocalStorage) {
       mongoose.set('transactionAsyncLocalStorage', true);
     }
+    if (options.retry === 'native') return runNativeTransaction(operation);
     const session = await mongoose.startSession();
     session.startTransaction();
     const context: TransactionContext = { session, afterCommit: [], afterAbort: [] };

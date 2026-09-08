@@ -91,3 +91,9 @@ export { memoryDiagnostics } from './utils/memory';
 export type * from './mcp/types';
 export type * from './flow/types';
 export type * from './types';
+
+export { runLifeSetup } from './life/setup';
+
+/* VIVENTIUM: shared authorized attachment transcription. */
+export * from './files/transcribeAudio';
+export * from './files/selectedHistoryAttachments';

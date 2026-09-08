@@ -1,10 +1,13 @@
 import { randomUUID } from 'node:crypto';
+import { nativeIdentityJson, nativeIdentityJobProofJson } from './nativeResponse';
+import { NATIVE_REPLAY_PUBLISH_LUA } from './nativeResponseLua';
 import type { Redis, Cluster } from 'ioredis';
 import { logger } from '@librechat/data-schemas';
 import type {
   EventTransportEmitOptions,
   EventTransportPublishReceipt,
   IEventTransport,
+  NativeResponseReplayGuard,
 } from '~/stream/interfaces/IJobStore';
 
 /**
@@ -35,6 +38,8 @@ interface PubSubMessage {
   error?: string;
   reason?: string;
   presentationReceiptId?: string;
+  /** Internal incarnation evidence, never copied into the user event payload. */
+  nativeJobProof?: string;
 }
 
 /**
@@ -67,13 +72,13 @@ interface StreamSubscribers {
     string,
     {
       onChunk: (event: unknown) => void;
-      onDone?: (event: unknown) => void;
+      onDone?: (event: unknown, nativeJobProof?: string) => void;
       onError?: (error: string) => void;
     }
   >;
   allSubscribersLeftCallbacks: Array<() => void>;
   /** Abort callbacks - called when abort signal is received from any replica */
-  abortCallbacks: Array<(reason?: string) => void>;
+  abortCallbacks: Array<(reason?: string, nativeJobProof?: string) => void>;
   /** Reorder buffer for handling out-of-order delivery in Redis Cluster */
   reorderBuffer: ReorderBuffer;
 }
@@ -789,7 +794,8 @@ export class RedisEventTransport implements IEventTransport {
             acceptedPresentationHandlers += 1;
             break;
           case EventTypes.DONE:
-            handlers.onDone?.(message.data);
+            if (message.nativeJobProof === undefined) handlers.onDone?.(message.data);
+            else handlers.onDone?.(message.data, message.nativeJobProof);
             break;
           case EventTypes.ERROR:
             handlers.onError?.(message.error ?? 'Unknown error');
@@ -820,9 +826,10 @@ export class RedisEventTransport implements IEventTransport {
     if (message.type === EventTypes.ABORT) {
       for (const callback of streamState.abortCallbacks) {
         try {
-          callback(
-            message.reason ?? (message.data === 'user_cancelled' ? 'user_cancelled' : undefined),
-          );
+          const reason =
+            message.reason ?? (message.data === 'user_cancelled' ? 'user_cancelled' : undefined);
+          if (message.nativeJobProof === undefined) callback(reason);
+          else callback(reason, message.nativeJobProof);
         } catch (err) {
           logger.error(`[RedisEventTransport] Error in abort callback:`, err);
         }
@@ -867,7 +874,7 @@ export class RedisEventTransport implements IEventTransport {
     streamId: string,
     handlers: {
       onChunk: (event: unknown) => void;
-      onDone?: (event: unknown) => void;
+      onDone?: (event: unknown, nativeJobProof?: string) => void;
       onError?: (error: string) => void;
     },
   ): { unsubscribe: () => void; ready: Promise<void> } {
@@ -1024,12 +1031,38 @@ export class RedisEventTransport implements IEventTransport {
    * Publish a done event to all subscribers.
    * Includes sequence number to ensure delivery after all chunks.
    */
-  async emitDone(streamId: string, event: unknown): Promise<void> {
+  async emitDone(
+    streamId: string,
+    event: unknown,
+    nativeReplay?: NativeResponseReplayGuard,
+  ): Promise<void | boolean> {
     const channel = CHANNELS.events(streamId);
     const seq = this.getNextSequence(streamId);
-    const message: PubSubMessage = { type: EventTypes.DONE, seq, data: event };
+    const message: PubSubMessage = {
+      type: EventTypes.DONE,
+      seq,
+      data: event,
+      ...(nativeReplay
+        ? { nativeJobProof: nativeIdentityJobProofJson(nativeReplay.identity) }
+        : {}),
+    };
 
     try {
+      if (nativeReplay) {
+        if (!nativeReplay.isCurrent()) return false;
+        return (
+          (await this.publisher.eval(
+            NATIVE_REPLAY_PUBLISH_LUA,
+            1,
+            `stream:{${streamId}}:job`,
+            nativeIdentityJson(nativeReplay.identity),
+            JSON.stringify(event),
+            channel,
+            JSON.stringify(message),
+            nativeReplay.cancelled ? 'cancelled' : '',
+          )) === 1
+        );
+      }
       await this.publisher.publish(channel, JSON.stringify(message));
     } catch (err) {
       logger.error(`[RedisEventTransport] Failed to publish done:`, err);
@@ -1124,20 +1157,41 @@ export class RedisEventTransport implements IEventTransport {
    * This enables cross-replica abort: when a user aborts on Replica B,
    * the generating Replica A receives the signal and stops.
    */
-  emitAbort(streamId: string, reason?: string): Promise<void> {
+  async emitAbort(
+    streamId: string,
+    reason?: string,
+    nativeReplay?: NativeResponseReplayGuard,
+  ): Promise<void | boolean> {
     const channel = CHANNELS.events(streamId);
     const message: PubSubMessage = {
       type: EventTypes.ABORT,
       reason,
+      ...(nativeReplay
+        ? { nativeJobProof: nativeIdentityJobProofJson(nativeReplay.identity) }
+        : {}),
     };
-
-    return this.publisher.publish(channel, JSON.stringify(message)).then(
-      () => undefined,
-      (err) => {
-        logger.error(`[RedisEventTransport] Failed to publish abort:`, err);
-        throw err;
-      },
-    );
+    try {
+      if (nativeReplay) {
+        if (!nativeReplay.isCurrent() || !nativeReplay.cancelled || !nativeReplay.finalEvent)
+          return false;
+        return (
+          (await this.publisher.eval(
+            NATIVE_REPLAY_PUBLISH_LUA,
+            1,
+            `stream:{${streamId}}:job`,
+            nativeIdentityJson(nativeReplay.identity),
+            nativeReplay.finalEvent,
+            channel,
+            JSON.stringify(message),
+            'cancelled',
+          )) === 1
+        );
+      }
+      await this.publisher.publish(channel, JSON.stringify(message));
+    } catch (err) {
+      logger.error(`[RedisEventTransport] Failed to publish abort:`, err);
+      throw err;
+    }
   }
 
   /**
@@ -1147,7 +1201,10 @@ export class RedisEventTransport implements IEventTransport {
    * @param streamId - The stream identifier
    * @param callback - Called when abort signal is received
    */
-  onAbort(streamId: string, callback: (reason?: string) => void): Promise<void> {
+  onAbort(
+    streamId: string,
+    callback: (reason?: string, nativeJobProof?: string) => void,
+  ): Promise<void> {
     const channel = CHANNELS.events(streamId);
     let state = this.streams.get(streamId);
 

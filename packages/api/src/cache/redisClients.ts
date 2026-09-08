@@ -6,7 +6,10 @@ import type { RedisClientType, RedisClusterType } from '@redis/client';
 import type { ScanCommandOptions } from '@redis/client/dist/lib/commands/SCAN';
 import { cacheConfig } from './cacheConfig';
 
+// VIVENTIUM START: preserve TCP/cluster defaults and permit a private local socket.
+const socketPath = cacheConfig.REDIS_SOCKET_PATH;
 const urls = cacheConfig.REDIS_URI?.split(',').map((uri) => new URL(uri)) || [];
+// VIVENTIUM END
 const username = urls?.[0]?.username || cacheConfig.REDIS_USERNAME;
 const password = urls?.[0]?.password || cacheConfig.REDIS_PASSWORD;
 const ca = cacheConfig.REDIS_CA;
@@ -49,9 +52,11 @@ if (cacheConfig.USE_REDIS) {
   };
 
   ioredisClient =
-    urls.length === 1 && !cacheConfig.USE_REDIS_CLUSTER
-      ? new IoRedis(cacheConfig.REDIS_URI!, redisOptions)
-      : new IoRedis.Cluster(
+    // VIVENTIUM START: ioredis accepts a socket path directly.
+    (socketPath || urls.length === 1) && !cacheConfig.USE_REDIS_CLUSTER
+      ? new IoRedis(socketPath || cacheConfig.REDIS_URI!, redisOptions)
+      : // VIVENTIUM END
+        new IoRedis.Cluster(
           urls.map((url) => ({ host: url.hostname, port: parseInt(url.port, 10) || 6379 })),
           {
             ...(cacheConfig.REDIS_USE_ALTERNATIVE_DNS_LOOKUP
@@ -140,6 +145,9 @@ if (cacheConfig.USE_REDIS) {
     username,
     password,
     socket: {
+      // VIVENTIUM START: node-redis uses the same private socket as ioredis.
+      ...(socketPath ? { path: socketPath } : {}),
+      // VIVENTIUM END
       tls: ca != null,
       ca,
       connectTimeout: cacheConfig.REDIS_CONNECT_TIMEOUT,
@@ -167,9 +175,11 @@ if (cacheConfig.USE_REDIS) {
   };
 
   keyvRedisClient =
-    urls.length === 1 && !cacheConfig.USE_REDIS_CLUSTER
-      ? createClient({ url: cacheConfig.REDIS_URI, ...redisOptions })
-      : createCluster({
+    // VIVENTIUM START: a socket transport must not receive a TCP URL.
+    (socketPath || urls.length === 1) && !cacheConfig.USE_REDIS_CLUSTER
+      ? createClient({ ...(socketPath ? {} : { url: cacheConfig.REDIS_URI }), ...redisOptions })
+      : // VIVENTIUM END
+        createCluster({
           rootNodes: urls.map((url) => ({ url: url.href })),
           defaults: redisOptions,
         });

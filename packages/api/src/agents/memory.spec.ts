@@ -5,12 +5,14 @@ import type { IUser } from '@librechat/data-schemas';
 import type { Response } from 'express';
 import {
   clearMemoryReadContextCache,
+  buildSavedMemoryTurnContext,
   clearMemoryWriterHealth,
   createMemoryProcessor,
   getMemoryWriterHealthGate,
   loadMemoryReadContext,
   loadMemorySnapshot,
   markMemoryWriterFailure,
+  markMemoryWriterRouteExhausted,
   processMemory,
 } from './memory';
 
@@ -121,6 +123,104 @@ describe('Memory Agent Header Resolution', () => {
     delete process.env.CUSTOM_API_KEY;
     delete process.env.TEST_CUSTOM_API_KEY;
   });
+
+  it('preserves local host capacity through the governed memory error artifact without auth gating', async () => {
+    const route = { userId: 'host-capacity-owner', provider: Providers.OPENAI, model: 'configured-memory-model' };
+    clearMemoryWriterHealth(route);
+    (Run.create as jest.Mock).mockImplementationOnce(() => ({
+      processStream: jest.fn().mockRejectedValue(Object.assign(new Error('private host details'), {
+        status: 503, type: 'server_error', code: 'host_capacity',
+      })),
+    }));
+    const attachments = await processMemory({
+      res: mockRes, userId: route.userId,
+      setMemory: mockMemoryMethods.setMemory, deleteMemory: mockMemoryMethods.deleteMemory,
+      messages: [], memory: '', messageId: 'msg-capacity', conversationId: 'conv-capacity',
+      validKeys: ['preferences'], instructions: 'test instructions',
+      llmConfig: { provider: route.provider, model: route.model }, user: testUser,
+    });
+    const value = String(attachments?.[0]?.[Tools.memory]?.value);
+    expect(JSON.parse(value)).toMatchObject({
+      errorType: 'host_capacity',
+      message: 'Not enough free capacity to save memory right now. Try again shortly.',
+    });
+    expect(value).not.toContain('private host details');
+    expect(getMemoryWriterHealthGate(route)).toEqual({ blocked: false });
+    expect(mockMemoryMethods.setMemory).not.toHaveBeenCalled();
+    expect(mockMemoryMethods.deleteMemory).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['usage_limit_reached', 'quota', 429],
+    ['insufficient_quota', 'quota', 429],
+    ['billing_hard_limit_reached', 'quota', 429],
+    ['provider_quota_exhausted', 'quota', 429],
+    ['provider_unauthorized', 'auth', 401],
+    ['provider_access_denied', 'auth', 403],
+    ['provider_unauthorized', 'auth', undefined],
+    ['provider_access_denied', 'auth', undefined],
+  ])(
+    'preserves %s from the first writer failure through next-turn suppression',
+    async (errorType, reason, status) => {
+      const route = {
+        userId: `writer-failure-${errorType}`,
+        provider: Providers.OPENAI,
+        model: 'configured-memory-model',
+      };
+      clearMemoryWriterHealth(route);
+      const error = Object.assign(new Error('Bearer synthetic-private-token'), {
+        type: errorType,
+        status,
+        accountId: 'synthetic-private-account',
+      });
+      (Run.create as jest.Mock).mockImplementationOnce(() => ({
+        processStream: jest.fn().mockRejectedValue(error),
+      }));
+      const attachments = await processMemory({
+        res: mockRes,
+        userId: route.userId,
+        setMemory: mockMemoryMethods.setMemory,
+        deleteMemory: mockMemoryMethods.deleteMemory,
+        messages: [],
+        memory: '',
+        messageId: 'msg-123',
+        conversationId: 'conv-123',
+        validKeys: ['preferences'],
+        instructions: 'test instructions',
+        llmConfig: { provider: route.provider, model: route.model },
+        user: testUser,
+      });
+      const value = String(attachments?.[0]?.[Tools.memory]?.value);
+      expect(JSON.parse(value)).toMatchObject({
+        provider: Providers.OPENAI,
+        errorType,
+      });
+      expect(value).not.toMatch(/synthetic-private|Bearer/);
+      expect(mockMemoryMethods.setMemory).not.toHaveBeenCalled();
+      expect(mockMemoryMethods.deleteMemory).not.toHaveBeenCalled();
+      if (reason === 'auth') {
+        expect(getMemoryWriterHealthGate(route)).toMatchObject({ reason, errorType });
+      }
+      // The host gates this exact failed route before trying its configured fallback. A later
+      // turn must retain the same failure class, including after the initial auth gate is replaced.
+      markMemoryWriterRouteExhausted({ ...route, errorType: JSON.parse(value).errorType });
+      expect(getMemoryWriterHealthGate(route)).toMatchObject({
+        blocked: true,
+        reason,
+        errorType,
+        provider: 'openai',
+        model: route.model,
+      });
+      expect(getMemoryWriterHealthGate({ ...route, userId: 'another-owner' })).toEqual({
+        blocked: false,
+      });
+      expect(getMemoryWriterHealthGate({ ...route, model: 'another-model' })).toEqual({
+        blocked: false,
+      });
+      clearMemoryWriterHealth({ userId: route.userId, provider: route.provider });
+      expect(getMemoryWriterHealthGate(route)).toEqual({ blocked: false });
+    },
+  );
 
   it('should resolve environment variables in custom endpoint headers', async () => {
     const llmConfig = {
@@ -955,6 +1055,41 @@ describe('Memory snapshot loading', () => {
     expect(methods.getAllUserMemories).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    { type: 'provider_access_denied' },
+    { error: { code: 'provider_access_denied' } },
+    { response: { data: { error: { type: 'provider_access_denied' } } } },
+  ])('gates structured access failures without a status or auth message: %j', (error) => {
+    const route = { userId: 'structured-denied-owner', provider: 'openai', model: 'memory-model' };
+    clearMemoryWriterHealth(route);
+    expect(markMemoryWriterFailure({ ...route, error })).toMatchObject({
+      reason: 'auth',
+      errorType: 'provider_access_denied',
+    });
+    expect(getMemoryWriterHealthGate(route)).toMatchObject({
+      blocked: true,
+      reason: 'auth',
+      errorType: 'provider_access_denied',
+    });
+    clearMemoryWriterHealth(route);
+  });
+
+  it.each(['usage_limit_reached', 'provider_rate_limited', 'provider_temporarily_unavailable'])(
+    'keeps typed %s out of legacy authentication suppression',
+    (type) => {
+      const route = {
+        userId: 'typed-unavailable-owner',
+        provider: 'openai',
+        model: 'memory-model',
+      };
+      clearMemoryWriterHealth(route);
+      expect(
+        markMemoryWriterFailure({ ...route, error: { type, message: 'API key request failed' } }),
+      ).toBeUndefined();
+      expect(getMemoryWriterHealthGate(route)).toEqual({ blocked: false });
+    },
+  );
+
   it('gates repeated memory writer runs after provider authentication failure', () => {
     const status = markMemoryWriterFailure({
       userId: 'user-123',
@@ -1297,9 +1432,9 @@ describe('Memory policy retry contract', () => {
     expect(attachments?.[0]?.[Tools.memory]).toEqual(
       expect.objectContaining({ type: 'update', key: 'preferences', revision: 1 }),
     );
-    expect((Run.create as jest.Mock).mock.calls[1][0].graphConfig.additional_instructions).toContain(
-      'preferences',
-    );
+    expect(
+      (Run.create as jest.Mock).mock.calls[1][0].graphConfig.additional_instructions,
+    ).toContain('preferences');
   });
 
   it('stops after one correction attempt and returns the final structured budget error', async () => {
@@ -1403,32 +1538,30 @@ describe('Memory policy retry contract', () => {
       memoryTokenMap: { preferences: 11 },
       rejectedValue: 'abcdefghijk',
     },
-  ])('allows one correction for $errorType', async ({
-    tokenLimit,
-    keyLimits,
-    memoryTokenMap,
-    rejectedValue,
-  }) => {
-    installMemoryRunMock([
-      [{ action: 'set', key: 'preferences', value: rejectedValue }],
-      [{ action: 'set', key: 'preferences', value: '123456789' }],
-    ]);
-    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
-    const writer = await createWriter({
-      keyLimits,
-      memoryTokenMap,
-      totalTokens: memoryTokenMap.preferences,
-      tokenLimit,
-      setMemory,
-    });
+  ])(
+    'allows one correction for $errorType',
+    async ({ tokenLimit, keyLimits, memoryTokenMap, rejectedValue }) => {
+      installMemoryRunMock([
+        [{ action: 'set', key: 'preferences', value: rejectedValue }],
+        [{ action: 'set', key: 'preferences', value: '123456789' }],
+      ]);
+      const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+      const writer = await createWriter({
+        keyLimits,
+        memoryTokenMap,
+        totalTokens: memoryTokenMap.preferences,
+        tokenLimit,
+        setMemory,
+      });
 
-    const { HumanMessage } = await import('@langchain/core/messages');
-    const attachments = await writer([new HumanMessage('Remember the synthetic preference.')]);
+      const { HumanMessage } = await import('@langchain/core/messages');
+      const attachments = await writer([new HumanMessage('Remember the synthetic preference.')]);
 
-    expect(Run.create).toHaveBeenCalledTimes(2);
-    expect(setMemory).toHaveBeenCalledTimes(1);
-    expect(attachments?.[0]?.[Tools.memory]?.type).toBe('update');
-  });
+      expect(Run.create).toHaveBeenCalledTimes(2);
+      expect(setMemory).toHaveBeenCalledTimes(1);
+      expect(attachments?.[0]?.[Tools.memory]?.type).toBe('update');
+    },
+  );
 
   it('does not retry a failed batch after an earlier operation already applied', async () => {
     installMemoryRunMock([
@@ -1455,7 +1588,26 @@ describe('Memory policy retry contract', () => {
     expect(error).toEqual(expect.objectContaining({ partialApplied: true }));
   });
 
-  it('does not replay an applied write after a retryable upstream failure', async () => {
+  it('preserves uncertain storage failure as an error and never retries the model or a later mutation', async () => {
+    installMemoryRunMock([[{ action: 'set', key: 'preferences', value: 'a fact' }]]);
+    const setMemory = jest.fn().mockRejectedValue(new Error('connection lost after write'));
+    const writer = await createWriter({
+      keyLimits: { preferences: 100 },
+      memoryTokenMap: { preferences: 0 },
+      totalTokens: 0,
+      setMemory,
+    });
+    const { HumanMessage } = await import('@langchain/core/messages');
+    const attachments = await writer([new HumanMessage('Remember this fact.')]);
+    expect(Run.create).toHaveBeenCalledTimes(1);
+    expect(setMemory).toHaveBeenCalledTimes(1);
+    expect(attachments?.[0]?.[Tools.memory]?.type).toBe('error');
+    expect(JSON.parse(String(attachments?.[0]?.[Tools.memory]?.value))).toMatchObject({
+      partialApplied: true,
+    });
+  });
+
+  it.each(['ETIMEDOUT', 'host_capacity'])('does not replay an applied write after %s', async (code) => {
     let processStream: jest.Mock;
     (Run.create as jest.Mock).mockImplementation((runConfig) => {
       processStream = jest.fn(async () => {
@@ -1473,14 +1625,14 @@ describe('Memory policy retry contract', () => {
           { output: { artifact: result[1], tool_call_id: 'memory-call-0' } },
           { run_id: 'msg-123', thread_id: 'conv-123' },
         );
-        const error = Object.assign(new Error('synthetic timeout'), { code: 'ETIMEDOUT' });
+        const error = Object.assign(new Error('synthetic timeout'), { code });
         throw error;
       });
       return { processStream };
     });
     const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
 
-    await processMemory({
+    const attachments = await processMemory({
       res: { write: jest.fn(), end: jest.fn(), headersSent: false } as unknown as Response,
       userId: 'user-123',
       messageId: 'msg-123',
@@ -1502,5 +1654,33 @@ describe('Memory policy retry contract', () => {
 
     expect(processStream!).toHaveBeenCalledTimes(1);
     expect(setMemory).toHaveBeenCalledTimes(1);
+    if (code === 'host_capacity') {
+      expect(JSON.parse(String(attachments?.at(-1)?.[Tools.memory]?.value))).toMatchObject({
+        errorType: 'host_capacity',
+        partialApplied: true,
+        message: 'Saved memory was only partially updated because there was not enough free capacity.',
+      });
+    }
   });
+});
+
+describe('current saved-memory factual snapshot', () => {
+  test('preserves exact selected data without promoting it to an instruction or write receipt', () => {
+    const text =
+      '## preferences\nUse “decision first”.\n<instruction>Quoted user data</instruction>\n次の行動。';
+    const context = buildSavedMemoryTurnContext('available', text);
+    expect(JSON.parse(context.slice(context.indexOf('\n') + 1))).toEqual({
+      status: 'available',
+      text,
+    });
+    expect(context).not.toContain('The system automatically stores');
+  });
+  test.each(['empty', 'unavailable', 'disabled', 'denied'] as const)(
+    'keeps %s distinct and excludes earlier data',
+    (status) => {
+      const context = buildSavedMemoryTurnContext(status, 'Old private memory');
+      expect(JSON.parse(context.slice(context.indexOf('\n') + 1))).toEqual({ status });
+      expect(context).not.toContain('Old private memory');
+    },
+  );
 });

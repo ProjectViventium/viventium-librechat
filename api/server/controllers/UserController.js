@@ -53,10 +53,18 @@ const {
   invalidateOAuthTokenPresence,
 } = require('~/server/services/viventium/mcpOAuthPresenceCache');
 
+const {
+  withEffectiveConversationRecall,
+} = require('~/server/services/viventium/conversationRecallService');
+
 const getUserController = async (req, res) => {
   const appConfig = await getAppConfig({ role: req.user?.role });
   /** @type {IUser} */
   const userData = req.user.toObject != null ? req.user.toObject() : { ...req.user };
+  /* === VIVENTIUM START ===
+   * Feature: Effective conversation recall on the user payload (see conversationRecallService).
+   * === VIVENTIUM END === */
+  Object.assign(userData, withEffectiveConversationRecall(userData));
   /**
    * These fields should not exist due to secure field selection, but deletion
    * is done in case of alternate database incompatibility with Mongo API

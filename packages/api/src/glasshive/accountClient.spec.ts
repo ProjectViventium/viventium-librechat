@@ -15,6 +15,7 @@ describe('GlassHive account client', () => {
     process.env.WPR_API_TOKEN = 'synthetic-api-token';
     process.env.GLASSHIVE_PROVIDER_BASE_URL = 'http://127.0.0.1:8766/v1';
     process.env.VIVENTIUM_TENANT_ID = 'local-public-test';
+    delete process.env.VIVENTIUM_ACTIVE_WORK_ACTION_TIMEOUT_MS;
   });
 
   afterAll(() => {
@@ -81,6 +82,44 @@ describe('GlassHive account client', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it('gives accepted work actions enough time to settle without changing read deadlines', async () => {
+    const timeoutSpy = jest
+      .spyOn(AbortSignal, 'timeout')
+      .mockImplementation(() => new AbortController().signal);
+    const fetchImpl = jest.fn(async () =>
+      Promise.resolve(
+        new Response(JSON.stringify({ workRef: 'work-1', state: 'queued' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      ),
+    );
+
+    await requestAccountApi({
+      ownerId: 'owner-1',
+      path: '/v1/work/work-1/actions',
+      method: 'POST',
+      body: { action: 'steer' },
+      fetchImpl,
+    });
+    expect(timeoutSpy).toHaveBeenLastCalledWith(15000);
+
+    await requestAccountApi({ ownerId: 'owner-1', path: '/v1/work/work-1', fetchImpl });
+    expect(timeoutSpy).toHaveBeenLastCalledWith(5000);
+
+    process.env.VIVENTIUM_ACTIVE_WORK_ACTION_TIMEOUT_MS = '18000';
+    await requestAccountApi({
+      ownerId: 'owner-1',
+      path: '/v1/work/work-1/actions',
+      method: 'POST',
+      body: { action: 'steer' },
+      fetchImpl,
+    });
+    expect(timeoutSpy).toHaveBeenLastCalledWith(18000);
+
+    timeoutSpy.mockRestore();
+  });
+
   it('derives stable Core-owned delegation and action identities', () => {
     const delegation = buildTrustedDelegationIdentity({
       ownerId: 'owner-1',
@@ -114,5 +153,33 @@ describe('GlassHive account client', () => {
         { ownerId: 'owner-1' },
       ),
     ).toMatch(/^[a-f0-9]{64}$/);
+  });
+  it('binds explicit owner input to the exact transmitted body including Unicode and numbers', async () => {
+    const nativeInput = {
+      version: 1 as const,
+      requestId: 'input-1',
+      requestFingerprint: 'b'.repeat(64),
+      action: 'accept' as const,
+      content: { text: 'Résumé', small: 1e-8, whole: 1, allowed: false },
+    };
+    const fetchImpl = jest.fn(
+      async (_url: string | URL | Request, _init?: RequestInit) =>
+        new Response('{}', { status: 202, headers: { 'Content-Type': 'application/json' } }),
+    );
+    await requestAccountApi({
+      ownerId: 'owner-1',
+      path: '/v1/work/work-1/actions',
+      method: 'POST',
+      ownerNativeInput: nativeInput,
+      body: { action: 'resume', idempotencyKey: 'operation-1', nativeInput },
+      fetchImpl,
+    });
+    const request = fetchImpl.mock.calls[0][1] as RequestInit;
+    const assertion = (request.headers as Record<string, string>)['X-Viventium-Service-Assertion'];
+    const claims = JSON.parse(Buffer.from(assertion.split('.')[0], 'base64url').toString());
+    expect(claims.native_input_digest).toBe(
+      crypto.createHash('sha256').update(String(request.body), 'utf8').digest('hex'),
+    );
+    expect(claims.owner_id).toBe('owner-1');
   });
 });

@@ -37,7 +37,7 @@ const MAIN_DELEGATION_OUTCOMES_FIELD = '_viventiumMainDelegationOutcomes' as con
 const WORK_REF_PATTERN = /^[A-Za-z0-9._:-]{1,160}$/;
 
 export const MAIN_DELEGATION_DESCRIPTION =
-  "Start one new, independently completable durable background objective for the authenticated user and return only after Core has an authoritative workRef receipt. Create one mission for one independent objective; invoke this tool separately for sibling objectives. Terminal history cannot satisfy a new simultaneous execution group unless the user explicitly asks to reuse it. Preserve the current turn's requested mission count. Never present an old artifact as a current delivery. A mission receives the user's current connected-account capability projection independently from Main's direct callable catalog. Preserve and delegate the objective intact even when Main cannot directly see or call the required provider server. The mission must discover the live prerequisite or return precise needs_input truth. When the request continues, guides, redirects, pauses, resumes, stops, retries, or dismisses existing work, use the exact roster workRef with active_work_action instead of creating a duplicate mission. Use active_work_list first when the target is not already unambiguous in the ephemeral roster. The launch always uses an isolated Docker/workstation boundary. Opening a delivered artifact later is Main presentation work and does not make the Worker objective host-dependent. Set requiresHostAccess=true only when the Worker itself must use the current live host session during execution; that request will be truthfully blocked for a separate user-confirmed path.";
+  "Start one new, independently completable durable background objective for the authenticated user and return only after Core has an authoritative workRef receipt. Create one mission for one independent objective; invoke this tool separately for sibling objectives. Terminal history cannot satisfy a new simultaneous execution group unless the user explicitly asks to reuse it. Preserve the current turn's requested mission count. Never present an old artifact as a current delivery. A mission receives the user's current connected-account capability projection independently from Main's direct callable catalog. Preserve and delegate the objective intact even when Main cannot directly see or call the required provider server. The mission must discover the live prerequisite or return precise needs_input truth. When the request continues, guides, redirects, pauses, resumes, stops, retries, or dismisses existing work, use the exact roster workRef with active_work_action instead of creating a duplicate mission. Use active_work_list first when the target is not already unambiguous in the ephemeral roster. The runtime uses the installation's authorized worker execution surface. Opening a delivered artifact later is Main presentation work and does not make the Worker objective host-dependent. Set requiresHostAccess=true when execution needs the current local computer or signed-in session; the runtime rejects it when that capability is unavailable. Host workers have separate workspaces and share the local desktop; coordinate conflicting actions without stopping independent work.";
 
 export const MAIN_DELEGATION_STRING_LIMITS = Object.freeze({
   title: 200,
@@ -106,11 +106,37 @@ export const MAIN_DELEGATION_JSON_SCHEMA = Object.freeze({
   additionalProperties: false,
 });
 
+/** Match the schema to the trusted source ledger that owns launch admission. */
+export function mainDelegationJsonSchema(requestBody: unknown = {}) {
+  const sources = requestBody && typeof requestBody === 'object' && !Array.isArray(requestBody)
+    ? (requestBody as Record<string, unknown>).viventiumTriggeringSourceSegments
+    : undefined;
+  const count = Array.isArray(sources) ? sources.length : 0;
+  if (count <= 1) return MAIN_DELEGATION_JSON_SCHEMA;
+  const maximum = Math.min(count, MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals.items.maximum);
+  return {
+    ...MAIN_DELEGATION_JSON_SCHEMA,
+    properties: {
+      ...MAIN_DELEGATION_JSON_SCHEMA.properties,
+      sourceOrdinals: {
+        ...MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals,
+        minItems: 1,
+        maxItems: maximum,
+        items: { type: 'integer', minimum: 1, maximum },
+      },
+    },
+    required: [...MAIN_DELEGATION_JSON_SCHEMA.required, 'sourceOrdinals'],
+  };
+}
+
 export const ACTIVE_WORK_LIST_DESCRIPTION =
-  'List the authenticated user’s existing durable background missions so Main can identify the exact workRef to continue or control instead of creating duplicate work. Each returned mission includes its current lifecycle state and authoritative actions. Follow a returned cursor until none remains when a complete roster is needed; unavailable never means empty.';
+  'Read the authenticated user’s durable background work. Default scope active lists the current roster with lifecycle state and authoritative actions. Scope history lists retained completed work. Follow returned cursors for a complete list; unavailable never means empty. Scope result with an exact runId or workRef reads the stored original goal, complete result and artifact references without rerunning, steering, retrying or changing delivery state. A result is retained historical evidence, not proof that the current work has finished; use the roster for current state. Result reads do not accept pagination. Use history to find a completed target, then result to present its existing output.';
 export const ACTIVE_WORK_LIST_JSON_SCHEMA = Object.freeze({
   type: 'object',
   properties: {
+    scope: { type: 'string', enum: ['active', 'history', 'result'] },
+    runId: { type: 'string', pattern: '^[A-Za-z0-9._:-]{1,160}$' },
+    workRef: { type: 'string', pattern: '^[A-Za-z0-9._:-]{1,160}$' },
     cursor: { type: 'string', minLength: 1, maxLength: 2048 },
     limit: { type: 'integer', minimum: 1, maximum: 100 },
   },
@@ -219,12 +245,23 @@ export function canonicalConversationOrchestrationArguments(
     };
   }
   if (toolName === 'active_work_list') {
+    if (input.scope === 'result') {
+      return {
+        scope: 'result',
+        ...(input.runId ? { runId: boundedString(input.runId, 160) } : {}),
+        ...(input.workRef ? { workRef: boundedString(input.workRef, 160) } : {}),
+      };
+    }
     const cursor = boundedString(input.cursor, 2048);
     const limit =
       Number.isInteger(input.limit) && Number(input.limit) >= 1 && Number(input.limit) <= 100
         ? Number(input.limit)
         : 50;
-    return { ...(cursor ? { cursor } : {}), limit };
+    return {
+      ...(input.scope === 'history' ? { scope: 'history' } : {}),
+      ...(cursor ? { cursor } : {}),
+      limit,
+    };
   }
   return input;
 }
@@ -271,6 +308,7 @@ export function mainOrchestrationInvocationIdentity({
   trustedCallIdentity?: unknown;
 } = {}): string {
   const executableArgs = canonicalConversationOrchestrationArguments(toolName, args);
+  const trustedOccurrence = String(trustedCallIdentity || '').trim();
   const conversationScope =
     requestBody.conversationId || requestBody.conversation_id || requestBody.viventiumLogicalTurnId;
   const messageScope = requestBody.messageId || requestBody.message_id;
@@ -279,9 +317,9 @@ export function mainOrchestrationInvocationIdentity({
     conversationScope,
     messageScope,
     requestBody.viventiumSourceEventId,
-    String(trustedCallIdentity || '').trim(),
+    trustedOccurrence,
     toolName,
-    stableJson(executableArgs),
+    trustedOccurrence ? '' : stableJson(executableArgs),
   ]
     .map((value) => String(value || ''))
     .join('\0');

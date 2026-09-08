@@ -7,6 +7,7 @@ const mockReconcileKnownExternalWorkHints = jest.fn();
 const mockReconcileUnresolvedDeliveries = jest.fn();
 const mockReconcileDeliveryProjections = jest.fn();
 const mockEnsureExternalWorkIndexes = jest.fn();
+const mockReconcileMissionAdjudications = jest.fn();
 
 jest.mock('../GlassHiveCallbackBindingService', () => ({
   reconcileKnownExternalWorkHints: (...args) => mockReconcileKnownExternalWorkHints(...args),
@@ -18,6 +19,10 @@ jest.mock('../GlassHiveCallbackDeliveryService', () => ({
     mockReconcileUnresolvedDeliveries(...args),
   reconcileGlassHiveSurfaceDeliveryProjections: (...args) =>
     mockReconcileDeliveryProjections(...args),
+}));
+
+jest.mock('../GlassHiveMissionAdjudicationService', () => ({
+  reconcilePendingGlassHiveMissionAdjudications: (...args) => mockReconcileMissionAdjudications(...args),
 }));
 
 jest.mock('../GlassHiveActiveWorkProjectionService', () => ({
@@ -46,6 +51,7 @@ describe('GlassHiveLaunchReconciliationService', () => {
     mockReconcileUnresolvedDeliveries.mockResolvedValue({ scanned: 0, repaired: 0, pending: 0 });
     mockReconcileDeliveryProjections.mockResolvedValue({ scanned: 0, projected: 0, pending: 0 });
     mockEnsureExternalWorkIndexes.mockResolvedValue(undefined);
+    mockReconcileMissionAdjudications.mockResolvedValue({ rows: 0, owners: 0 });
   });
 
   afterEach(() => {
@@ -62,10 +68,12 @@ describe('GlassHiveLaunchReconciliationService', () => {
     expect(mockReconcileKnownExternalWorkHints).toHaveBeenCalledWith({ limit: 100 });
     expect(mockReconcileUnresolvedDeliveries).toHaveBeenCalledWith({ limit: 25 });
     expect(mockReconcileDeliveryProjections).toHaveBeenCalledWith({ limit: 25 });
+    expect(mockReconcileMissionAdjudications).toHaveBeenCalledWith({ limit: 25 });
 
     await jest.advanceTimersByTimeAsync(30_000);
     expect(mockReconcileUnknownGlassHiveLaunches).toHaveBeenCalledTimes(2);
     expect(mockReconcileKnownExternalWorkHints).toHaveBeenCalledTimes(2);
+    expect(mockReconcileMissionAdjudications).toHaveBeenCalledTimes(2);
     expect(mockReconcileUnknownGlassHiveLaunches).toHaveBeenLastCalledWith({ limit: 25 });
   });
 
@@ -90,6 +98,7 @@ describe('GlassHiveLaunchReconciliationService', () => {
       hints: { scanned: 0, updatedOwners: 0 },
       deliveries: { scanned: 0, repaired: 0, pending: 0 },
       deliveryProjections: { scanned: 0, projected: 0, pending: 0 },
+      missionAdjudications: { rows: 0, owners: 0 },
     });
   });
 

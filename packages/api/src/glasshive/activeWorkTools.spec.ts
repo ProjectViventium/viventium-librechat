@@ -4,6 +4,8 @@ import { createActiveWorkTools } from './activeWorkTools';
 describe('createActiveWorkTools', () => {
   const getActiveWorkPage = jest.fn();
   const executeGlassHiveWorkAction = jest.fn();
+  const getActiveWorkHistoryPage = jest.fn();
+  const getGlassHiveWorkResult = jest.fn();
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -12,7 +14,15 @@ describe('createActiveWorkTools', () => {
   });
 
   function create(userId: unknown = 'owner-1') {
-    return createActiveWorkTools({ userId }, { getActiveWorkPage, executeGlassHiveWorkAction });
+    return createActiveWorkTools(
+      { userId },
+      {
+        getActiveWorkPage,
+        getActiveWorkHistoryPage,
+        getGlassHiveWorkResult,
+        executeGlassHiveWorkAction,
+      },
+    );
   }
 
   test('lists the authenticated owner roster with bounded defaults', async () => {
@@ -27,6 +37,39 @@ describe('createActiveWorkTools', () => {
       cursor: '',
       limit: 50,
     });
+  });
+
+  test('reads retained history and exact results without a mutation', async () => {
+    const { list } = create();
+    getActiveWorkHistoryPage.mockResolvedValue({ work: [{ workRef: 'work-old' }] });
+    getGlassHiveWorkResult.mockResolvedValue({
+      runId: 'run-old',
+      outputText: 'Complete retained result',
+    });
+    await list.invoke({ scope: 'history', cursor: 'next', limit: 20 });
+    expect(getActiveWorkHistoryPage).toHaveBeenCalledWith({
+      ownerId: 'owner-1',
+      cursor: 'next',
+      limit: 20,
+    });
+    expect(JSON.parse(await list.invoke({ scope: 'result', runId: 'run-old' }))).toEqual({
+      runId: 'run-old',
+      outputText: 'Complete retained result',
+    });
+    expect(getGlassHiveWorkResult).toHaveBeenCalledWith({ ownerId: 'owner-1', runId: 'run-old' });
+    expect(executeGlassHiveWorkAction).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    { scope: 'result' },
+    { scope: 'result', runId: 'run-1', cursor: 'next' },
+    { scope: 'active', runId: 'run-1' },
+    { scope: 'result', runId: 'run-1', ownerId: 'other' },
+    { scope: 'unknown' },
+  ])('rejects invalid or owner-supplied result selectors %j', async (input) => {
+    const { list } = create();
+    await expect(list.invoke(input)).rejects.toThrow();
+    expect(getGlassHiveWorkResult).not.toHaveBeenCalled();
   });
 
   test('declares roster reads and durable mutations structurally', () => {

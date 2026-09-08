@@ -1,7 +1,7 @@
 import { ContentTypes, ToolCallTypes } from 'librechat-data-provider';
 import type { Agents, PartMetadata, TMessageContentParts } from 'librechat-data-provider';
 import type { ToolCall } from '@librechat/agents/langchain/messages/tool';
-import { filterMalformedContentParts } from './content';
+import { convertHarnessActivityParts, filterMalformedContentParts } from './content';
 
 describe('filterMalformedContentParts', () => {
   describe('basic filtering', () => {
@@ -263,5 +263,39 @@ describe('filterMalformedContentParts', () => {
       const result = filterMalformedContentParts(parts);
       expect(result).toHaveLength(1);
     });
+  });
+});
+
+/* VIVENTIUM: this conversion is called only by a proven harness owner. */
+describe('convertHarnessActivityParts', () => {
+  it('retains the existing in-place array and converts string and structured summaries', () => {
+    const parts = [
+      { type: 'think', think: 'Synthetic activity.' },
+      { type: 'think', think: { value: 'Structured activity.' } },
+      { type: 'text', text: 'Answer.' },
+      {
+        type: 'harness_activity',
+        harness_activity: { event: 'tool', summary: 'Tool activity.', tool: 'synthetic' },
+      },
+    ];
+    expect(convertHarnessActivityParts(parts)).toBe(parts);
+    expect(parts.slice(0, 2)).toEqual([
+      {
+        type: 'harness_activity',
+        harness_activity: { event: 'reasoning-summary', summary: 'Synthetic activity.' },
+      },
+      {
+        type: 'harness_activity',
+        harness_activity: { event: 'reasoning-summary', summary: 'Structured activity.' },
+      },
+    ]);
+    expect(parts[2]).toEqual({ type: 'text', text: 'Answer.' });
+    expect(parts[3]).toEqual({
+      type: 'harness_activity',
+      harness_activity: { event: 'tool', summary: 'Tool activity.', tool: 'synthetic' },
+    });
+  });
+  it('keeps absent content unchanged', () => {
+    expect(convertHarnessActivityParts(undefined)).toBeUndefined();
   });
 });

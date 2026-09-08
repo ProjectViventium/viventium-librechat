@@ -653,6 +653,7 @@ describe('agentLlmFallback', () => {
   });
 
   test('does not retry background cortex fallback for visible output or structured tool failures', () => {
+    expect(shouldRetryBackgroundCortexWithFallback({ insight: null, errorClass: 'missing_required_evidence', error: 'missing_required_evidence', completedToolCalls: 1 })).toBe(false);
     expect(
       shouldRetryBackgroundCortexWithFallback({
         insight: 'usable answer',
@@ -674,4 +675,17 @@ describe('agentLlmFallback', () => {
       }),
     ).toBe(false);
   });
+});
+
+test('host capacity rejection does not start another provider before any harness invocation', () => {
+  expect(
+    shouldRetryBackgroundCortexWithFallback({
+      insight: null,
+      errorStatus: 503,
+      errorCode: 'host_capacity',
+      errorClass: 'host_capacity',
+      harnessInvocationStarted: false,
+      error: 'Host capacity is unavailable.',
+    }),
+  ).toBe(false);
 });

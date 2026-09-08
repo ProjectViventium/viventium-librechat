@@ -2,8 +2,8 @@ import { createGlassHiveWorkActionService } from './workActionService';
 
 function dependencies() {
   return {
+    assertVoiceWorkAuthority: jest.fn(async () => {}),
     GenerationJobManager: {
-      markDurableEffectReceipt: jest.fn(async () => true),
       getJob: jest.fn(async () => ({
         metadata: {
           userId: 'owner-1',
@@ -82,7 +82,18 @@ describe('GlassHive work-action service', () => {
     expect(deps.invalidateActiveWorkSnapshot).toHaveBeenCalledWith({ ownerId: 'owner-1' });
   });
 
-  it('binds durable event-time provenance and voice receipts', async () => {
+  it('does not trace a completed control when the owner action request fails', async () => {
+    const deps = dependencies();
+    deps.requestAccountApi.mockRejectedValueOnce(new Error('action_request_failed'));
+    const service = createGlassHiveWorkActionService(deps);
+    await expect(service.executeGlassHiveWorkAction({
+      ownerId: 'owner-1', workRef: 'work-1', action: 'stop', operationId: 'failed-operation',
+      durableEffectContext: { streamId: 'stream-1' },
+    })).rejects.toThrow('action_request_failed');
+    expect(deps.recordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
+  });
+
+  it('retains event-time provenance and traces accepted actions without a presentation override', async () => {
     const deps = dependencies();
     const service = createGlassHiveWorkActionService(deps);
     await service.executeGlassHiveWorkAction({
@@ -109,12 +120,6 @@ describe('GlassHive work-action service', () => {
             surface: 'voice',
           }),
         }),
-      }),
-    );
-    expect(deps.GenerationJobManager.markDurableEffectReceipt).toHaveBeenCalledWith(
-      expect.objectContaining({
-        effectKind: 'durable_work_action_accepted',
-        effectRef: expect.stringMatching(/^work_action_[a-f0-9]{64}$/),
       }),
     );
     expect(deps.recordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledTimes(2);
@@ -167,4 +172,67 @@ describe('GlassHive work-action service', () => {
       forceRefresh: true,
     });
   });
+});
+
+it('requires the authenticated owner control for native input, not a model action', async () => {
+  const deps = dependencies();
+  const service = createGlassHiveWorkActionService(deps);
+  const nativeInput = {
+    version: 1 as const,
+    requestId: 'request-1',
+    requestFingerprint: 'a'.repeat(64),
+    action: 'decline' as const,
+  };
+  await expect(
+    service.executeGlassHiveWorkAction({
+      ownerId: 'owner-1',
+      workRef: 'work-1',
+      action: 'resume',
+      nativeInput,
+    }),
+  ).rejects.toMatchObject({ status: 403 });
+  expect(deps.requestAccountApi).not.toHaveBeenCalled();
+  await service.executeGlassHiveWorkAction({
+    ownerId: 'owner-1',
+    workRef: 'work-1',
+    action: 'resume',
+    operationId: 'op-native',
+    nativeInput,
+    ownerInputControl: true,
+  });
+  expect(deps.requestAccountApi).toHaveBeenCalledWith(
+    expect.objectContaining({
+      ownerNativeInput: nativeInput,
+      body: expect.objectContaining({ nativeInput }),
+    }),
+  );
+});
+
+it('rechecks voice authority after async preparation and before dispatch', async () => {
+  const deps = dependencies();
+  deps.assertVoiceWorkAuthority
+    .mockResolvedValueOnce(undefined)
+    .mockRejectedValueOnce(
+      Object.assign(new Error('voice_work_authority_stale'), {
+        code: 'voice_work_authority_stale',
+      }),
+    );
+  const binding = {
+    version: 1 as const,
+    callSessionId: 'call-1',
+    userId: 'owner-1',
+    kind: 'audio' as const,
+    fingerprint: 'synthetic-fingerprint',
+    turnIds: ['turn-1'],
+  };
+  await expect(
+    createGlassHiveWorkActionService(deps).executeGlassHiveWorkAction({
+      ownerId: 'owner-1',
+      workRef: 'work-1',
+      action: 'stop',
+      operationId: 'action-1',
+      voiceAuthorityContext: { callSessionId: 'call-1', binding },
+    }),
+  ).rejects.toMatchObject({ code: 'voice_work_authority_stale' });
+  expect(deps.requestAccountApi).not.toHaveBeenCalled();
 });

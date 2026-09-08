@@ -1530,3 +1530,103 @@ describe('extractDiscoveredToolsFromHistory', () => {
     expect(discovered.size).toBe(0);
   });
 });
+
+/* === VIVENTIUM START ===
+ * Accepted-source guards belong to this Main run, never the persisted agent or Cortex defaults.
+ * === VIVENTIUM END === */
+it('keeps accepted-source guards local to Main run options and its exact fallback routes', async () => {
+  const createSpy = jest.spyOn(Run, 'create').mockResolvedValue({ run: 'synthetic' } as never);
+  const primaryParameters = { model: 'synthetic-primary' };
+  const fallbackParameters = { model: 'synthetic-fallback' };
+  try {
+    await createRun({
+      agents: [
+        {
+          id: 'main',
+          provider: Providers.OPENAI,
+          model_parameters: primaryParameters,
+          tools: [],
+          viventiumGraphLlmFallbacks: [
+            {
+              id: 'main',
+              provider: Providers.ANTHROPIC,
+              model_parameters: fallbackParameters,
+            },
+          ],
+        },
+      ],
+      signal: new AbortController().signal,
+      mainContinuityHeaders: {
+        'X-Viventium-Visible-Message-Chain-B64': Buffer.from('[]').toString('base64'),
+      },
+    } as never);
+    expect(createSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        graphConfig: expect.objectContaining({
+          agents: [
+            expect.objectContaining({
+              clientOptions: expect.objectContaining({
+                model: 'synthetic-primary',
+                callbacks: [expect.objectContaining({ awaitHandlers: true, raiseError: true })],
+                fallbacks: [
+                  expect.objectContaining({
+                    provider: Providers.ANTHROPIC,
+                    clientOptions: expect.objectContaining({
+                      model: 'synthetic-fallback',
+                      callbacks: [
+                        expect.objectContaining({ awaitHandlers: true, raiseError: true }),
+                      ],
+                    }),
+                  }),
+                ],
+              }),
+            }),
+          ],
+        }),
+      }),
+    );
+    expect(primaryParameters).not.toHaveProperty('callbacks');
+    expect(fallbackParameters).not.toHaveProperty('callbacks');
+  } finally {
+    createSpy.mockRestore();
+  }
+});
+
+it('keeps native dispatch wrappers out of source agent configuration and composes final-body binding locally', async () => {
+  const createSpy = jest.spyOn(Run, 'create').mockResolvedValue({ run: 'synthetic' } as never);
+  const baseFetch = jest.fn(async () => new Response('{}'));
+  const configuration = { defaultHeaders: { 'X-GlassHive-Agent-Id': 'main' }, fetch: baseFetch };
+  const parameters = { model: 'synthetic', configuration };
+  const boundFetch = jest.fn(async () => new Response('{}'));
+  const nativeResponseFetch = jest.fn(() => boundFetch);
+  try {
+    await createRun({
+      agents: [
+        {
+          id: 'main',
+          provider: Providers.OPENAI,
+          endpoint: 'synthetic-native',
+          model_parameters: parameters,
+          tools: [],
+        },
+      ],
+      signal: new AbortController().signal,
+      mainContinuityHeaders: {
+        'X-Viventium-Visible-Message-Chain-B64': Buffer.from('[]').toString('base64'),
+        'X-Viventium-Main-Context-Owner': 'core',
+      },
+      nativeResponseFetch,
+    } as never);
+    expect(nativeResponseFetch).toHaveBeenCalledWith(baseFetch, {
+      agentId: 'main',
+      provider: Providers.OPENAI,
+      endpoint: 'synthetic-native',
+    });
+    expect(parameters.configuration).toBe(configuration);
+    expect(configuration.fetch).toBe(baseFetch);
+    expect(configuration.defaultHeaders).toEqual({ 'X-GlassHive-Agent-Id': 'main' });
+    expect(parameters).not.toHaveProperty('callbacks');
+  } finally {
+    createSpy.mockRestore();
+  }
+});

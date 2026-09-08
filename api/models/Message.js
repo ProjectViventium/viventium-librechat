@@ -1,7 +1,13 @@
 const { z } = require('zod');
 const mongoose = require('mongoose');
 const { logger } = require('@librechat/data-schemas');
-const { createTempChatExpirationDate } = require('@librechat/api');
+const {
+  createTempChatExpirationDate,
+  capturedMainContextStamp,
+  sanitizeMainContextUpdate,
+  mainContextUpdateNeedsRead,
+  preserveMainContextUpdate,
+} = require('@librechat/api');
 const { Message } = require('~/db/models');
 /* === VIVENTIUM START ===
  * Feature: Conversation Recall RAG proactive sync hooks
@@ -91,6 +97,15 @@ function sanitizeMessageForPersistence(message) {
   }
 
   for (const key of Object.keys(sanitizedMessage)) {
+    // Admission and recovery are internal store operations, never user/message-authored metadata.
+    if (
+      ['savedMemoryWrite', 'nativeResponse', 'memoryWriteStatus', 'acceptedMainContext'].includes(
+        key.split('.')[0],
+      )
+    ) {
+      delete sanitizedMessage[key];
+      continue;
+    }
     if (
       key.startsWith('$') &&
       sanitizedMessage[key] != null &&
@@ -100,6 +115,23 @@ function sanitizeMessageForPersistence(message) {
       const sanitizedOperator = {};
       for (const [path, value] of Object.entries(sanitizedMessage[key])) {
         const pathSegments = path.split('.');
+        if (
+          [
+            'savedMemoryWrite',
+            'nativeResponse',
+            'memoryWriteStatus',
+            'acceptedMainContext',
+          ].includes(pathSegments[0]) ||
+          (key === '$rename' &&
+            [
+              'savedMemoryWrite',
+              'nativeResponse',
+              'memoryWriteStatus',
+              'acceptedMainContext',
+            ].includes(String(value).split('.')[0]))
+        ) {
+          continue;
+        }
         if (
           key === '$rename' &&
           (hasPrivateMessageContentPathSegment(path) || hasPrivateMessageContentPathSegment(value))
@@ -126,8 +158,16 @@ function sanitizeMessageForPersistence(message) {
       sanitizedMessage[key] = sanitizePrivateMessageContent(sanitizedMessage[key]);
     }
   }
-  return sanitizedMessage;
+  return sanitizeMainContextUpdate(sanitizedMessage);
 }
+
+/* === VIVENTIUM START === Reserved Main authority is retained inside the existing write transaction. === */
+async function preserveMessageMainContext(filter, update, captured) {
+  if (!captured && !mainContextUpdateNeedsRead(update)) return update;
+  const previous = await Message.findOne(filter).lean();
+  return preserveMainContextUpdate(update, previous, captured);
+}
+/* === VIVENTIUM END === */
 
 function containsPendingLegacyCortexRecovery(value, ancestors = new WeakSet()) {
   if (value == null || typeof value !== 'object' || ancestors.has(value)) {
@@ -431,11 +471,59 @@ async function saveMessage(req, params, metadata) {
       options.overwriteImmutable = true;
     }
     /* === VIVENTIUM END === */
-    const message = await Message.findOneAndUpdate(
-      { messageId: params.messageId, user: req.user.id },
-      update,
-      options,
-    );
+    /* === VIVENTIUM START === Native completion and source mutation retain their durable fences. === */
+    const operationKind = metadata?.operationKind || 'edit';
+    const sourceFilter = { messageId: params.messageId, user: req.user.id };
+    const mainContext =
+      operationKind === 'system'
+        ? capturedMainContextStamp(
+            req,
+            update,
+            metadata?.mainContextBinding,
+            require('~/server/services/viventium/VoiceActorAuthorityService').isVoiceActorSideEffectRestricted(
+              req,
+            ),
+          )
+        : undefined;
+    const persist = async () => {
+      const protectedUpdate = await preserveMessageMainContext(sourceFilter, update, mainContext);
+      if (operationKind === 'system' && protectedUpdate.isCreatedByUser !== true) {
+        const guarded = await require('~/models').saveNativeResponseSnapshot(
+          req.user.id,
+          protectedUpdate,
+          req._viventiumNativeResponseIdentity,
+        );
+        if (guarded !== undefined) return guarded;
+      }
+      const filter =
+        operationKind === 'system'
+          ? {
+              ...sourceFilter,
+              $or: [
+                { nativeResponse: { $exists: false } },
+                { 'nativeResponse.status': 'unsupported' },
+              ],
+            }
+          : sourceFilter;
+      if (req._viventiumNativeResponseIdentity?.responseMessageId === params.messageId)
+        options.upsert = false;
+      return Message.findOneAndUpdate(filter, protectedUpdate, options);
+    };
+    const message =
+      await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+        sourceFilter,
+        persist,
+        operationKind,
+      );
+    if (!message) {
+      const winner = await Message.findOne({
+        messageId: params.messageId,
+        user: req.user.id,
+      }).lean();
+      if (!winner) throw new Error('native_response_message_deleted');
+      return winner;
+    }
+    /* === VIVENTIUM END === */
 
     /* === VIVENTIUM START ===
      * Feature: Conversation Recall RAG proactive sync on message upsert
@@ -449,7 +537,7 @@ async function saveMessage(req, params, metadata) {
     }
     /* === VIVENTIUM END === */
 
-    return message.toObject();
+    return typeof message.toObject === 'function' ? message.toObject() : message;
   } catch (err) {
     logger.error('Error saving message:', err);
     logger.info(`---\`saveMessage\` context: ${metadata?.context}`);
@@ -519,14 +607,41 @@ async function bulkSaveMessages(messages, overrideTimestamp = false) {
       const sanitizedMessage = sanitizeMessageForPersistence(message);
       return {
         updateOne: {
-          filter: { messageId: message.messageId },
+          filter: { messageId: message.messageId, user: message.user },
           update: sanitizedMessage,
           timestamps: !overrideTimestamp,
           upsert: true,
         },
       };
     });
-    const result = await Message.bulkWrite(bulkOps);
+    const filter = { $or: messages.map(({ messageId, user }) => ({ messageId, user })) };
+    const result =
+      await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+        filter,
+        async () => {
+          if (!bulkOps.some(({ updateOne }) => mainContextUpdateNeedsRead(updateOne.update))) {
+            return Message.bulkWrite(bulkOps);
+          }
+          const previous = await Message.find(filter).lean();
+          const byMessage = new Map(
+            previous.map((row) => [JSON.stringify([row.user, row.messageId]), row]),
+          );
+          return Message.bulkWrite(
+            bulkOps.map(({ updateOne }) => ({
+              updateOne: {
+                ...updateOne,
+                update: preserveMainContextUpdate(
+                  updateOne.update,
+                  byMessage.get(
+                    JSON.stringify([updateOne.filter.user, updateOne.filter.messageId]),
+                  ),
+                ),
+              },
+            })),
+          );
+        },
+        'edit',
+      );
     return result;
   } catch (err) {
     logger.error('Error saving messages in bulk:', err);
@@ -568,10 +683,20 @@ async function recordMessage({
       ...rest,
     });
 
-    const savedMessage = await Message.findOneAndUpdate({ user, messageId }, message, {
-      upsert: true,
-      new: true,
-    });
+    const savedMessage =
+      await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+        { user, messageId },
+        async () =>
+          Message.findOneAndUpdate(
+            { user, messageId },
+            await preserveMessageMainContext({ user, messageId }, message),
+            {
+              upsert: true,
+              new: true,
+            },
+          ),
+        'edit',
+      );
 
     /* === VIVENTIUM START ===
      * Feature: Conversation Recall RAG proactive sync on direct recordMessage writes
@@ -607,11 +732,12 @@ async function recordMessage({
  */
 async function updateMessageText(req, { messageId, text }) {
   try {
-    const result = await Message.findOneAndUpdate(
-      { messageId, user: req.user.id },
-      { text },
-      { new: true },
-    );
+    const result =
+      await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+        { messageId, user: req.user.id },
+        () => Message.findOneAndUpdate({ messageId, user: req.user.id }, { text }, { new: true }),
+        'edit',
+      );
 
     if (result?.conversationId) {
       scheduleConversationRecallSync({
@@ -640,6 +766,7 @@ async function updateMessageText(req, { messageId, text }) {
  * @param {number} [message.tokenCount] - The number of tokens in the message.
  * @param {Object} [metadata] - The operation metadata
  * @param {string} [metadata.context] - The operation metadata
+ * @param {import('@librechat/data-schemas').NativeResponseMutationKind} [metadata.operationKind='edit']
  * @returns {Promise<TMessage>} The updated message document.
  * @throws {Error} If there is an error in updating the message or if the message is not found.
  */
@@ -659,11 +786,34 @@ async function updateMessage(req, message, metadata) {
       options.timestamps = false;
       options.overwriteImmutable = true;
     }
-    const updatedMessage = await Message.findOneAndUpdate(
-      { messageId, user: req.user.id },
-      update,
-      options,
-    );
+    const operationKind = metadata?.operationKind || 'edit';
+    const persist = async () => {
+      const protectedUpdate = await preserveMessageMainContext(
+        { messageId, user: req.user.id },
+        update,
+      );
+      // Direct system snapshots use the existing canonical-field guard. Mongo operator
+      // augmentations (for example $addToSet receipts) keep their native update semantics.
+      if (
+        operationKind === 'system' &&
+        !Object.keys(protectedUpdate).some((key) => key.startsWith('$'))
+      ) {
+        const guarded = await require('~/models').saveNativeResponseSnapshot(
+          req.user.id,
+          { messageId, ...protectedUpdate },
+          req._viventiumNativeResponseIdentity,
+          'augmentation',
+        );
+        if (guarded !== undefined) return guarded;
+      }
+      return Message.findOneAndUpdate({ messageId, user: req.user.id }, protectedUpdate, options);
+    };
+    const updatedMessage =
+      await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+        { messageId, user: req.user.id },
+        persist,
+        operationKind,
+      );
 
     if (!updatedMessage) {
       throw new Error('Message not found or user not authorized.');
@@ -715,10 +865,13 @@ async function deleteMessagesSince(req, { messageId, conversationId }) {
     const message = await Message.findOne({ messageId, user: req.user.id }).lean();
 
     if (message) {
-      const query = Message.find({ conversationId, user: req.user.id });
-      const result = await query.deleteMany({
-        createdAt: { $gt: message.createdAt },
-      });
+      const filter = { conversationId, user: req.user.id, createdAt: { $gt: message.createdAt } };
+      const result =
+        await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+          filter,
+          () => Message.deleteMany(filter),
+          'delete',
+        );
       /* === VIVENTIUM START ===
        * Feature: Conversation Recall RAG proactive sync on branch delete
        * Added: 2026-02-19
@@ -752,7 +905,18 @@ async function getMessages(filter, select) {
       return await Message.find(filter).select(select).sort({ createdAt: 1 }).lean();
     }
 
-    return await Message.find(filter).sort({ createdAt: 1 }).lean();
+    // Exclude private writer input in Mongo itself, then expose only its existing state.
+    // Explicit projections above remain internal callers' responsibility.
+    const rows = await Message.find(filter)
+      .select('+savedMemoryWrite -savedMemoryWrite.source')
+      .sort({ createdAt: 1 })
+      .lean();
+    return rows.map(({ savedMemoryWrite, memoryWriteStatus: _ignored, ...message }) => {
+      const status = savedMemoryWrite?.status;
+      return ['pending', 'running', 'completed', 'failed'].includes(status)
+        ? { ...message, memoryWriteStatus: status }
+        : message;
+    });
   } catch (err) {
     logger.error('Error getting messages:', err);
     throw err;
@@ -948,7 +1112,11 @@ async function getMessage({ user, messageId }) {
  */
 async function deleteMessages(filter) {
   try {
-    return await Message.deleteMany(filter);
+    return await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+      filter,
+      () => Message.deleteMany(filter),
+      'delete',
+    );
   } catch (err) {
     logger.error('Error deleting messages:', err);
     throw err;

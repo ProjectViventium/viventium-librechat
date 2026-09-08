@@ -52,7 +52,7 @@ const sendError = async (req, res, options, callback) => {
       req,
       { ...errorMessage, user },
       {
-        context: 'api/server/utils/streamResponse.js - sendError',
+        operationKind: 'system', context: 'api/server/utils/streamResponse.js - sendError',
       },
     );
   }

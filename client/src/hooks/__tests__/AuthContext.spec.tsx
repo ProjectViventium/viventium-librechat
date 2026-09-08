@@ -1,8 +1,9 @@
 /**
  * @jest-environment @happy-dom/jest-environment
  */
+/* eslint-disable i18next/no-literal-string */
 import React from 'react';
-import { render, act } from '@testing-library/react';
+import { render, act, fireEvent } from '@testing-library/react';
 import { RecoilRoot } from 'recoil';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
@@ -11,6 +12,7 @@ import type { TAuthConfig } from '~/common';
 
 import { AuthContextProvider, useAuthContext } from '../AuthContext';
 import { SESSION_KEY } from '~/utils';
+import { useGetUserQuery } from '~/data-provider';
 
 const mockNavigate = jest.fn();
 jest.mock('react-router-dom', () => ({
@@ -70,7 +72,16 @@ const authConfig: TAuthConfig = { loginRedirect: '/login', test: true };
 
 function TestConsumer() {
   const ctx = useAuthContext();
-  return <div data-testid="consumer" data-authenticated={ctx.isAuthenticated} />;
+  return (
+    <div
+      data-testid="consumer"
+      data-authenticated={ctx.isAuthenticated}
+      data-unavailable={ctx.isAuthUnavailable}
+    >
+      <button onClick={ctx.retryAuthentication}>Retry</button>
+      <button onClick={() => ctx.logout()}>Log out</button>
+    </div>
+  );
 }
 
 function renderProvider() {
@@ -97,7 +108,7 @@ function renderProviderLive() {
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
 
-  return render(
+  const tree = () => (
     <QueryClientProvider client={queryClient}>
       <RecoilRoot>
         <MemoryRouter>
@@ -106,8 +117,10 @@ function renderProviderLive() {
           </AuthContextProvider>
         </MemoryRouter>
       </RecoilRoot>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const result = render(tree());
+  return { ...result, rerenderProvider: () => result.rerender(tree()) };
 }
 
 describe('AuthContextProvider — login onError redirect handling', () => {
@@ -223,6 +236,37 @@ describe('AuthContextProvider — logout onSuccess/onError handling', () => {
 
     expect(replaceSpy).not.toHaveBeenCalled();
   });
+
+  it.each(['success', 'error'] as const)(
+    'opens local sign-in after the user logs out (%s)',
+    (result) => {
+      jest.useFakeTimers();
+      sessionStorage.setItem(SESSION_KEY, '/c/old-destination');
+      const { getByRole, getByTestId } = renderProvider();
+
+      act(() => {
+        mockCapturedLoginOptions.onSuccess({ user: { id: '1', role: 'USER' }, token: 'token' });
+        jest.advanceTimersByTime(100);
+      });
+      expect(getByTestId('consumer').getAttribute('data-authenticated')).toBe('true');
+      mockNavigate.mockClear();
+
+      fireEvent.click(getByRole('button', { name: 'Log out' }));
+      act(() => {
+        if (result === 'success') {
+          mockCapturedLogoutOptions.onSuccess({ message: 'Logout successful' });
+        } else {
+          mockCapturedLogoutOptions.onError(new Error('Logout failed'));
+        }
+        jest.advanceTimersByTime(100);
+      });
+
+      expect(getByTestId('consumer').getAttribute('data-authenticated')).toBe('false');
+      expect(mockNavigate).toHaveBeenCalledWith('/login', { replace: true });
+      jest.useRealTimers();
+      sessionStorage.clear();
+    },
+  );
 
   it('does not trigger silentRefresh after OIDC redirect', () => {
     const replaceSpy = jest.spyOn(window.location, 'replace').mockImplementation(() => {});
@@ -443,5 +487,122 @@ describe('AuthContextProvider — logout error handling', () => {
     expect(replaceSpy).not.toHaveBeenCalled();
     expect(getByTestId('consumer').getAttribute('data-authenticated')).toBe('false');
     jest.useRealTimers();
+  });
+});
+
+describe('AuthContextProvider — service availability is separate from authentication', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+    window.history.replaceState({}, '', '/c/availability?view=notes#last');
+    sessionStorage.clear();
+  });
+  afterEach(() => {
+    (useGetUserQuery as jest.Mock).mockReturnValue({
+      data: undefined,
+      isError: false,
+      error: null,
+    });
+    jest.useRealTimers();
+    window.history.replaceState({}, '', '/');
+  });
+
+  it.each([undefined, 408, 429, 500, 503])(
+    'keeps the destination on refresh failure %s and allows recovery',
+    (status) => {
+      const { getByTestId, getByRole } = renderProviderLive();
+      act(() => mockRefreshMutate.mock.calls[0][1].onError({ status, message: 'Unavailable' }));
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(getByTestId('consumer')).toHaveAttribute('data-authenticated', 'false');
+      expect(getByTestId('consumer')).toHaveAttribute('data-unavailable', 'true');
+      fireEvent.click(getByRole('button', { name: 'Retry' }));
+      expect(mockRefreshMutate).toHaveBeenCalledTimes(2);
+      act(() => {
+        mockRefreshMutate.mock.calls[1][1].onSuccess({ token: 'restored', user: { id: 'owner' } });
+        jest.advanceTimersByTime(50);
+      });
+      expect(getByTestId('consumer')).toHaveAttribute('data-authenticated', 'true');
+      expect(getByTestId('consumer')).toHaveAttribute('data-unavailable', 'false');
+      expect(mockNavigate).toHaveBeenLastCalledWith('/c/availability?view=notes#last', {
+        replace: true,
+      });
+    },
+  );
+
+  it.each([401, 403])(
+    'redirects only after confirmed rejection %s and preserves the destination',
+    (status) => {
+      renderProviderLive();
+      act(() => {
+        mockRefreshMutate.mock.calls[0][1].onError({ status });
+        jest.advanceTimersByTime(50);
+      });
+      expect(mockNavigate).toHaveBeenLastCalledWith(
+        '/login?redirect_to=%2Fc%2Favailability%3Fview%3Dnotes%23last',
+        { replace: true },
+      );
+    },
+  );
+
+  it('treats a successful refresh with no token as signed out', () => {
+    renderProviderLive();
+    act(() => {
+      mockRefreshMutate.mock.calls[0][1].onSuccess(undefined);
+      jest.advanceTimersByTime(50);
+    });
+    expect(mockNavigate).toHaveBeenLastCalledWith(
+      '/login?redirect_to=%2Fc%2Favailability%3Fview%3Dnotes%23last',
+      { replace: true },
+    );
+  });
+
+  it('does not infer sign-in failure from a slow refresh', () => {
+    const { getByTestId } = renderProviderLive();
+    act(() => jest.advanceTimersByTime(10000));
+    expect(mockNavigate).not.toHaveBeenCalled();
+    expect(getByTestId('consumer')).toHaveAttribute('data-authenticated', 'false');
+    expect(mockRefreshMutate).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([undefined, 429, 503])(
+    'keeps the authenticated view when user lookup fails with %s',
+    (status) => {
+      const result = renderProviderLive();
+      act(() => {
+        mockRefreshMutate.mock.calls[0][1].onSuccess({ token: 'valid', user: { id: 'owner' } });
+        jest.advanceTimersByTime(50);
+      });
+      mockNavigate.mockClear();
+      (useGetUserQuery as jest.Mock).mockReturnValue({
+        data: undefined,
+        isError: true,
+        error: { status },
+      });
+      result.rerenderProvider();
+      act(() => jest.advanceTimersByTime(50));
+      expect(mockNavigate).not.toHaveBeenCalled();
+      expect(result.getByTestId('consumer')).toHaveAttribute('data-authenticated', 'true');
+    },
+  );
+
+  it('clears the authenticated view when user lookup confirms rejection', () => {
+    const result = renderProviderLive();
+    act(() => {
+      mockRefreshMutate.mock.calls[0][1].onSuccess({ token: 'valid', user: { id: 'owner' } });
+      jest.advanceTimersByTime(50);
+    });
+    mockNavigate.mockClear();
+    (useGetUserQuery as jest.Mock).mockReturnValue({
+      data: undefined,
+      isError: true,
+      error: { status: 401 },
+    });
+    result.rerenderProvider();
+    act(() => jest.advanceTimersByTime(50));
+    expect(result.getByTestId('consumer')).toHaveAttribute('data-authenticated', 'false');
+    expect(mockNavigate).toHaveBeenLastCalledWith(
+      '/login?redirect_to=%2Fc%2Favailability%3Fview%3Dnotes%23last',
+      { replace: true },
+    );
   });
 });

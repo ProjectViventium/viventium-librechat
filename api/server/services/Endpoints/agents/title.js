@@ -1,8 +1,10 @@
 const { isEnabled } = require('@librechat/api');
-const { logger } = require('@librechat/data-schemas');
+/* === VIVENTIUM START === Shared title-only conditional persistence. === */
+const { logger, saveGeneratedConversationTitle } = require('@librechat/data-schemas');
+const { Conversation } = require('~/db/models');
+/* === VIVENTIUM END === */
 const { CacheKeys } = require('librechat-data-provider');
 const getLogStores = require('~/cache/getLogStores');
-const { saveConvo } = require('~/models');
 const buildFallbackTitle = require('~/server/utils/buildFallbackTitle');
 const { getTrustedInteractionContext } = require('~/server/services/viventium/interactionContext');
 const {
@@ -32,6 +34,9 @@ const addTitle = async (req, { text, response, client }) => {
   /** @type {NodeJS.Timeout} */
   let timeoutId;
   const fallbackTitle = buildFallbackTitle(text);
+  /* === VIVENTIUM START === All generation outcomes share one durable title owner. === */
+  let title = fallbackTitle;
+  /* === VIVENTIUM END === */
   try {
     const timeoutPromise = new Promise((_, reject) => {
       timeoutId = setTimeout(() => reject(new Error('Title generation timeout')), 45000);
@@ -51,7 +56,7 @@ const addTitle = async (req, { text, response, client }) => {
       return;
     }
 
-    let title = await titlePromise;
+    title = await titlePromise;
     const modelGeneratedTitle = Boolean(title);
     if (!abortController.signal.aborted) {
       abortController.abort();
@@ -83,31 +88,24 @@ const addTitle = async (req, { text, response, client }) => {
         facts: { effectCount: 1 },
       });
     }
-
-    await titleCache.set(key, title, 120000);
-    await saveConvo(
-      req,
-      {
-        conversationId: response.conversationId,
-        title,
-      },
-      { context: 'api/server/services/Endpoints/agents/title.js', noUpsert: true },
-    );
   } catch (error) {
     logger.warn('Error generating title, using fallback title:', error);
     if (timeoutId) {
       clearTimeout(timeoutId);
     }
-    await titleCache.set(key, fallbackTitle, 120000);
-    await saveConvo(
-      req,
-      {
-        conversationId: response.conversationId,
-        title: fallbackTitle,
-      },
-      { context: 'api/server/services/Endpoints/agents/title.js' },
-    );
+    title = fallbackTitle;
   }
+  /* === VIVENTIUM START === A deleted or renamed conversation must survive late generation. === */
+  const savedTitle = await saveGeneratedConversationTitle(
+    Conversation,
+    req.user.id,
+    response.conversationId,
+    title,
+  );
+  if (savedTitle) {
+    await titleCache.set(key, savedTitle, 120000);
+  }
+  /* === VIVENTIUM END === */
 };
 
 module.exports = addTitle;

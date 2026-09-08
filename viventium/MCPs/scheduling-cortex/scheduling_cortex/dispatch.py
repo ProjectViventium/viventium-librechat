@@ -18,12 +18,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
-SCHEDULED_RUN_CONTEXT_CONTRACT_LINE = (
-    "Use `scheduled_due_local_date` as the anchor date for this run. Do not carry forward dates "
-    "or day labels from earlier messages in the conversation, and do not use the next recurrence "
-    "as today's date."
-)
-
 # === VIVENTIUM START ===
 # Feature: Multi-channel dispatch support.
 from .models import AVAILABLE_CHANNELS, DEFAULT_DELIVERY_CHANNELS
@@ -59,22 +53,15 @@ if _SHARED_PATH and str(_SHARED_PATH) not in sys.path:
 from scheduler_prompt_contract import (
     CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID,
     SCHEDULER_RUN_ENVELOPE_PROMPT_ID,
-    SCHEDULER_RUN_ENVELOPE_TEMPLATE,
+    SCHEDULED_RUN_CONTEXT_HEADER,
+    SCHEDULED_RUN_CONTEXT_PLACEHOLDER,
+    load_scheduler_prompts,
+    render_scheduler_prompt,
     render_scheduler_run_envelope,
 )
 
-_ENVELOPE_LINES = SCHEDULER_RUN_ENVELOPE_TEMPLATE.splitlines()
-BREW_PROMPT_MARKER = _ENVELOPE_LINES[0]
-BREW_PROMPT_HEADER = _ENVELOPE_LINES[1]
-SCHEDULED_RUN_CONTEXT_HEADER = next(
-    line for line in _ENVELOPE_LINES if line.startswith("## Scheduled Run Context")
-)
-LIVE_FACT_CONTRACT_LINE = next(
-    line for line in _ENVELOPE_LINES if line.startswith("For live external facts")
-)
-DEFAULT_SCHEDULER_PROMPT_PREFIX = SCHEDULER_RUN_ENVELOPE_TEMPLATE.split(
-    f"\n\n{SCHEDULED_RUN_CONTEXT_HEADER}", 1
-)[0]
+BREW_PROMPT_MARKER = "<!--viv_internal:brew_begin-->"
+BREW_PROMPT_HEADER = "## Background Processing (Brewing)"
 
 try:
     from no_response import is_no_response_only, strip_trailing_nta
@@ -225,6 +212,8 @@ SCHEDULED_RUNTIME_FAILURE_RETRYABILITY = {
     "host_capacity": True,
     "orphaned_user_not_found": False,
     "parallel_execution_isolation_required": False,
+    "prompt_bundle_unavailable": False,
+    "required_prompt_invalid": False,
     "runtime_dependency_missing": False,
     "runtime_io_failed": True,
     "runtime_sandbox_unavailable": True,
@@ -466,6 +455,12 @@ def _scheduled_generation_failure_notice(
         ),
         "parallel_execution_isolation_required": (
             "Scheduled work requires an authorized isolated execution environment."
+        ),
+        "prompt_bundle_unavailable": (
+            "Scheduled work could not start because its compiled prompt bundle is unavailable."
+        ),
+        "required_prompt_invalid": (
+            "Scheduled work could not start because its compiled prompt configuration is invalid."
         ),
         "runtime_dependency_missing": (
             "Scheduled work could not start because a required worker dependency is unavailable."
@@ -1007,11 +1002,13 @@ def _get_telegram_bot_token() -> str:
 # === VIVENTIUM START ===
 # Rationale: ensure scheduled prompts use the shipped self-prompt by default and avoid
 # double-prefixing stored prompts that already contain the scheduler contract.
-def _get_prompt_prefix() -> str:
+def _get_prompt_prefix(prompts: Optional[Dict[str, Any]] = None) -> str:
     prefix = (
         os.getenv("SCHEDULER_PROMPT_PREFIX")
         or os.getenv("SCHEDULING_PROMPT_PREFIX")
-        or DEFAULT_SCHEDULER_PROMPT_PREFIX
+        or render_scheduler_run_envelope(
+            SCHEDULED_RUN_CONTEXT_PLACEHOLDER, prompts=prompts
+        ).split(f"\n\n{SCHEDULED_RUN_CONTEXT_HEADER}", 1)[0]
     )
     return prefix.strip()
 
@@ -1027,24 +1024,14 @@ def _looks_like_scheduled_self_prompt(text: str) -> bool:
     )
 
 
-def _has_live_fact_contract(text: str) -> bool:
-    if not isinstance(text, str):
-        return False
-    lowered = text.lower()
-    return (
-        "live external facts" in lowered
-        and "verified tool/cortex result" in lowered
-        and "omit that section" in lowered
-    )
-
-
-def _ensure_live_fact_contract(text: str) -> str:
+def _ensure_live_fact_contract(text: str, prompts: Optional[Dict[str, Any]] = None) -> str:
     cleaned = (text or "").strip()
-    if _has_live_fact_contract(cleaned):
+    contract = render_scheduler_prompt("scheduler.run_live_fact_contract", prompts=prompts)
+    if contract in cleaned:
         return cleaned
     if not cleaned:
-        return LIVE_FACT_CONTRACT_LINE
-    return f"{cleaned}\n\n{LIVE_FACT_CONTRACT_LINE}"
+        return contract
+    return f"{cleaned}\n\n{contract}"
 
 
 def _utc_now() -> datetime:
@@ -1119,7 +1106,9 @@ def _has_scheduled_run_context(text: str) -> bool:
     return isinstance(text, str) and SCHEDULED_RUN_CONTEXT_HEADER.lower() in text.lower()
 
 
-def _format_scheduled_run_context_block(run_context: Dict[str, str]) -> str:
+def _format_scheduled_run_context_block(
+    run_context: Dict[str, str], prompts: Optional[Dict[str, Any]] = None
+) -> str:
     fields = [
         "run_started_at_utc",
         "scheduled_due_at_utc",
@@ -1140,19 +1129,17 @@ def _format_scheduled_run_context_block(run_context: Dict[str, str]) -> str:
         value = str(run_context.get(field) or "").strip()
         if value:
             lines.append(f"- {field}: {value}")
-    lines.append(SCHEDULED_RUN_CONTEXT_CONTRACT_LINE)
-    lines.append(
-        "For calendar/email/task sections, use the calendar window above and verified tool/cortex "
-        "results. If those results are unavailable, do not invent events, tasks, or day-specific plans."
-    )
+    lines.append(render_scheduler_prompt("scheduler.run_context_contract", prompts=prompts))
     return "\n".join(lines)
 
 
-def _default_scheduler_run_envelope(scheduled_run_context: str) -> str:
+def _default_scheduler_run_envelope(
+    scheduled_run_context: str, prompts: Optional[Dict[str, Any]] = None
+) -> str:
     context = str(scheduled_run_context or "").strip()
     if context.startswith(SCHEDULED_RUN_CONTEXT_HEADER):
         context = context[len(SCHEDULED_RUN_CONTEXT_HEADER) :].lstrip()
-    return render_scheduler_run_envelope(context)
+    return render_scheduler_run_envelope(context, prompts=prompts)
 
 
 _WEEKDAY_NAME_TO_INDEX = {calendar.day_name[index].lower(): index for index in range(7)}
@@ -1263,19 +1250,23 @@ def _compose_prompt(
     run_context: Optional[Dict[str, str]] = None,
     now_utc: Optional[datetime] = None,
 ) -> str:
+    prompts = load_scheduler_prompts()
     base = (task.get("prompt") or "").strip()
-    prefix = _get_prompt_prefix()
+    prefix = _get_prompt_prefix(prompts)
     custom_prefix = str(
         os.getenv("SCHEDULER_PROMPT_PREFIX")
         or os.getenv("SCHEDULING_PROMPT_PREFIX")
         or ""
     ).strip()
     context = run_context or _build_scheduled_run_context(task, now_utc=now_utc)
-    context_block = "" if _has_scheduled_run_context(base) else _format_scheduled_run_context_block(context)
+    context_block = (
+        "" if _has_scheduled_run_context(base)
+        else _format_scheduled_run_context_block(context, prompts)
+    )
     parts: list[str] = []
     base_has_scheduler_prefix = _looks_like_scheduled_self_prompt(base)
     if not base_has_scheduler_prefix and context_block and not custom_prefix:
-        parts.append(_default_scheduler_run_envelope(context_block))
+        parts.append(_default_scheduler_run_envelope(context_block, prompts))
         context_block = ""
     elif prefix and not base_has_scheduler_prefix:
         parts.append(prefix)
@@ -1286,7 +1277,9 @@ def _compose_prompt(
     if base and not base_has_scheduler_prefix:
         parts.append(base)
     composed = "\n\n".join(part for part in parts if part).strip()
-    return _ensure_live_fact_contract(composed)
+    if custom_prefix or base_has_scheduler_prefix:
+        return _ensure_live_fact_contract(composed, prompts)
+    return composed
 
 
 def _scheduler_late_delivery(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2186,6 +2179,16 @@ def _run_scheduler_generation(
             if str(response.get("state") or "").strip().lower() == "reserved":
                 response = _post_json(chat_url, payload, headers, timeout_s)
     stream_id = response.get("streamId") or response.get("stream_id")
+    if (
+        response.get("deferred") is True
+        and response.get("reason") == "conversation_session_authority_conflict"
+        and not stream_id
+    ):
+        return {
+            "deferred": True,
+            "reason": "conversation_session_authority_conflict",
+            "conversation_id": _extract_conversation_id(response, conversation_id),
+        }
     if not stream_id:
         raise RuntimeError("Scheduler dispatch missing streamId")
     # Scheduled Main may inherit a long-running Agent Builder route. Keep the wait below the
@@ -4036,6 +4039,10 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "execution": effective_execution_snapshot,
         }
     except Exception as exc:
+        # Scheduled attempts close through the scheduler's lease-fenced transaction.
+        # A direct/manual dispatch still owns its immediate failure receipt.
+        if expected_preclaim is not None:
+            raise
         failure = scheduled_exception_failure(task, exc)
         failure_snapshot = {
             **execution_snapshot,
@@ -4779,6 +4786,8 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
     channel_results: Dict[str, Dict[str, Any]] = {}
     errors: Dict[str, Dict[str, Any]] = {}
     generation_result = _run_scheduler_generation(task, base_url, timeout_s, conversation_id)
+    if generation_result.get("deferred") is True:
+        return generation_result
     resolved_conversation_id = generation_result.get("conversation_id")
     generation_failure = (
         generation_result.get("generation_failure")

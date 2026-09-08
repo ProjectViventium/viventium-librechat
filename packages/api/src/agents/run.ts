@@ -1,6 +1,7 @@
 import { Run, Providers, Constants } from '@librechat/agents';
 import { providerEndpointMap, KnownEndpoints } from 'librechat-data-provider';
 import type { BaseMessage } from '@librechat/agents/langchain/messages';
+import type { Callbacks } from '@langchain/core/callbacks/manager';
 import type {
   MultiAgentGraphConfig,
   OpenAIClientOptions,
@@ -16,6 +17,14 @@ import type { IUser } from '@librechat/data-schemas';
 import type { Agent, AgentModelParameters } from 'librechat-data-provider';
 import type * as t from '~/types';
 import { resolveHeaders, createSafeUser } from '~/utils/env';
+// VIVENTIUM START: preserve accepted Main source after provider-independent graph pruning.
+import type { MainContinuityFetch } from '~/continuity';
+import {
+  withMainContinuityCallbacks,
+  createMainContinuityFetch,
+  MAIN_CONTINUITY_CHAIN_HEADER,
+} from '~/continuity';
+// VIVENTIUM END
 
 /** Expected shape of JSON tool search results */
 interface ToolSearchJsonResult {
@@ -544,6 +553,8 @@ export async function createRun({
   tokenCounter,
   customHandlers,
   indexTokenCountMap,
+  mainContinuityHeaders,
+  nativeResponseFetch,
   streaming = true,
   streamUsage = true,
 }: {
@@ -556,6 +567,12 @@ export async function createRun({
   user?: IUser;
   /** Message history for extracting previously discovered tools */
   messages?: BaseMessage[];
+  /** Request-local accepted source manifest, checked after graph pruning on every selected route. */
+  mainContinuityHeaders?: Readonly<Record<string, string>>;
+  nativeResponseFetch?: (
+    baseFetch: MainContinuityFetch,
+    route: { agentId: string; provider: string; endpoint?: string },
+  ) => MainContinuityFetch;
 } & Pick<RunConfig, 'tokenCounter' | 'customHandlers' | 'indexTokenCountMap'>): Promise<
   Run<IState>
 > {
@@ -605,6 +622,42 @@ export async function createRun({
       streaming,
       streamUsage,
     });
+    // VIVENTIUM START: keep guards local to this run and each exact selected route.
+    const sourceChain = mainContinuityHeaders?.[MAIN_CONTINUITY_CHAIN_HEADER];
+    const selectedRoutes = [agent, ...(agent.viventiumGraphLlmFallbacks || [])];
+    const selectedOptions = [
+      llmConfig,
+      ...graphFallbacks.map((fallback) => fallback.clientOptions),
+    ];
+    for (let index = 0; index < selectedOptions.length; index += 1) {
+      const options = selectedOptions[index] as t.RunLLMConfig & { callbacks?: Callbacks };
+      const configuration = options.configuration;
+      const nativeTransport = Boolean(
+        (configuration?.defaultHeaders as Record<string, string> | undefined)?.[
+          'X-GlassHive-Agent-Id'
+        ],
+      );
+      if (sourceChain)
+        options.callbacks = withMainContinuityCallbacks(
+          options.callbacks,
+          sourceChain,
+          nativeTransport,
+        );
+      if (!nativeTransport || !configuration) continue;
+      const route = selectedRoutes[index];
+      const baseFetch = (configuration.fetch || fetch) as MainContinuityFetch;
+      const boundFetch = nativeResponseFetch
+        ? nativeResponseFetch(baseFetch, {
+            agentId: agent.id,
+            provider: route.provider,
+            endpoint: route.endpoint ?? undefined,
+          })
+        : baseFetch;
+      configuration.fetch = sourceChain
+        ? createMainContinuityFetch(boundFetch, sourceChain, mainContinuityHeaders)
+        : boundFetch;
+    }
+    // VIVENTIUM END
     if (graphFallbacks.length > 0) {
       (
         llmConfig as t.RunLLMConfig & {

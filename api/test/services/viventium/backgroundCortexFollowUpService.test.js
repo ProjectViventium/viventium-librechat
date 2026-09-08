@@ -129,7 +129,7 @@ const {
   getPreferredFallbackInsightText,
   resolveRecentResponseText,
   resolveConversationLeafMessageId,
-  stripQuestionSentences,
+  resolveFollowUpPersistenceText,
 } = require('~/server/services/viventium/BackgroundCortexFollowUpService');
 
 describe('BackgroundCortexFollowUpService', () => {
@@ -183,51 +183,19 @@ describe('BackgroundCortexFollowUpService', () => {
     });
   });
 
-  describe('question stripping', () => {
-    test('removes pure question sentence', () => {
-      expect(stripQuestionSentences('What should we do next?')).toBe('');
+  describe('model-selected follow-up text', () => {
+    test.each([
+      'Which attendance day should I choose?',
+      'One field remains empty. Which value is correct?',
+      'Use [the source](https://docs.example.test/page?lang=en&view=all).\n\n1. First.\n   - Nested evidence.\n   - Second point.',
+      '```python\nif ready:\n    values = [12]\n    print("a  b?")\n```',
+      '1. Read the source.\n   1. Check the date.\n      - Preserve this evidence.\n\n2. Review the result.',
+    ])('preserves the accepted model text %#', (text) => {
+      expect(resolveFollowUpPersistenceText({ generatedText: text }).text).toBe(text);
     });
 
-    test('keeps declarative sentence when question is a separate sentence', () => {
-      expect(stripQuestionSentences('I found one missing detail. What should we do?')).toBe(
-        'I found one missing detail.',
-      );
-    });
-
-    test('salvages declarative prefix before comma-separated question clause', () => {
-      expect(stripQuestionSentences('New detail X found, shall we dig deeper?')).toBe(
-        'New detail X found.',
-      );
-    });
-
-    test('salvages declarative prefix when comma has no trailing space', () => {
-      expect(stripQuestionSentences('New detail X found,shall we dig deeper?')).toBe(
-        'New detail X found.',
-      );
-    });
-
-    test('salvages declarative prefix before em-dash question clause', () => {
-      expect(stripQuestionSentences("The data shows improvement— isn't that great?")).toBe(
-        'The data shows improvement.',
-      );
-    });
-
-    test('salvages declarative prefix when em-dash has no trailing space', () => {
-      expect(stripQuestionSentences("The data shows improvement—isn't that great?")).toBe(
-        'The data shows improvement.',
-      );
-    });
-
-    test('handles mixed declarative and question sentences together', () => {
-      expect(stripQuestionSentences('Found a pattern. Also X is interesting, right?')).toBe(
-        'Found a pattern. Also X is interesting.',
-      );
-    });
-
-    test('returns text unchanged when no question marks present', () => {
-      expect(stripQuestionSentences('Everything looks good here.')).toBe(
-        'Everything looks good here.',
-      );
+    test('keeps the typed no-response marker silent', () => {
+      expect(resolveFollowUpPersistenceText({ generatedText: '{NTA}' }).text).toBe('');
     });
   });
 
@@ -953,7 +921,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(db.saveMessage).not.toHaveBeenCalled();
   });
 
-  test('createCortexFollowUpMessage suppresses question-only follow-up as {NTA}', async () => {
+  test('createCortexFollowUpMessage preserves a model-selected question', async () => {
     const req = { user: { id: 'u1' } };
     db.getMessage.mockResolvedValueOnce({
       messageId: 'm-parent',
@@ -979,9 +947,10 @@ describe('BackgroundCortexFollowUpService', () => {
       recentResponse: '',
     });
 
-    expect(msg).toBeNull();
+    expect(msg).toBeTruthy();
+    expect(msg.text).toBe('Should I ask another question?');
     expect(db.getMessage).toHaveBeenCalledWith({ user: 'u1', messageId: 'm-parent' });
-    expect(db.saveMessage).not.toHaveBeenCalled();
+    expect(db.saveMessage).toHaveBeenCalled();
   });
 
   test('createCortexFollowUpMessage injects DB Phase A text into follow-up prompt', async () => {
@@ -1120,7 +1089,13 @@ describe('BackgroundCortexFollowUpService', () => {
       sender: 'Viventium',
       text: '',
       unfinished: true,
+      error: true,
       content: [
+        {
+          type: 'error',
+          error: 'The request could not complete.',
+          error_class: 'completion_error',
+        },
         {
           type: 'cortex_insight',
           cortex_id: 'agent_123',
@@ -1163,6 +1138,7 @@ describe('BackgroundCortexFollowUpService', () => {
         messageId: 'm-parent',
         text: 'The real risk is workflow fit, not transcription quality.',
         unfinished: false,
+        error: false,
         content: expect.arrayContaining([
           expect.objectContaining({ type: 'cortex_insight', cortex_id: 'agent_123' }),
           { type: 'text', text: 'The real risk is workflow fit, not transcription quality.' },
@@ -1174,11 +1150,13 @@ describe('BackgroundCortexFollowUpService', () => {
             replacedParentMessage: true,
             forceVisibleFollowUp: true,
             promotedToEmptyParent: true,
+            recoveredPrimaryErrorClasses: ['completion_error'],
           }),
         }),
       }),
       expect.any(Object),
     );
+    expect(msg.content.some((part) => part.type === 'error')).toBe(false);
     expect(msg).toEqual(
       expect.objectContaining({
         messageId: 'm-parent',
@@ -1186,6 +1164,7 @@ describe('BackgroundCortexFollowUpService', () => {
         parentMessageId: 'u-message',
         text: 'The real risk is workflow fit, not transcription quality.',
         unfinished: false,
+        error: false,
       }),
     );
   });
@@ -1660,7 +1639,7 @@ describe('BackgroundCortexFollowUpService', () => {
     });
 
     expect(msg).toBeTruthy();
-    expect(msg.text).toBe('Keep the good part here');
+    expect(msg.text).toBe('Keep the good part [12] here');
   });
 
   // === VIVENTIUM NOTE ===
@@ -1780,6 +1759,52 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(runInstance.processStream).toHaveBeenCalled();
   });
 
+  test.each(['low', 'high'])(
+    'generateFollowUpText preserves saved %s effort through final persisted hydration',
+    async (effort) => {
+      const agent = {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-6-astra',
+        model_parameters: { reasoning_effort: effort },
+      };
+      getAgent.mockResolvedValue(agent);
+      getCustomEndpointConfig.mockResolvedValueOnce({
+        apiKey: 'test-key',
+        baseURL: 'https://harness.example.test/v1',
+      });
+      await generateFollowUpText({
+        req: {
+          user: { id: 'u1' },
+          body: {},
+          config: {
+            endpoints: {
+              agents: {
+                capabilityRequiredProviders: ['glasshive-harness'],
+                providerCapabilities: {
+                  'glasshive-harness': {
+                    phase_b_followup: true,
+                    responses_api: false,
+                  },
+                },
+              },
+            },
+          },
+        },
+        agent: { ...agent, model_parameters: {} },
+        insightsData: { insights: [{ cortexName: 'Review', insight: 'The result is ready.' }] },
+        recentResponse: 'Working.',
+        runId: 'saved-effort-followup',
+      });
+      expect(getAgent).toHaveBeenCalledWith({ id: agent.id });
+      expect(Run.create.mock.calls.at(-1)[0].graphConfig.llmConfig.modelKwargs).toMatchObject({
+        model: agent.model,
+        reasoning_effort: effort,
+      });
+      expect(agent.model_parameters.reasoning_effort).toBe(effort);
+    },
+  );
+
   test('generateFollowUpText gives a custom OpenAI-compatible endpoint a top-level API key', async () => {
     getCustomEndpointConfig.mockResolvedValueOnce({
       apiKey: 'glasshive-provider-key',
@@ -1853,6 +1878,67 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(runCall.graphConfig.llmConfig.configuration).not.toHaveProperty('apiKey');
     expect(runCall.graphConfig.llmConfig).not.toHaveProperty('maxTokens');
     expect(runCall.graphConfig.llmConfig).not.toHaveProperty('temperature');
+  });
+
+  test('generateFollowUpText isolates durable GlassHive follow-up work from the active Main session', async () => {
+    getCustomEndpointConfig.mockResolvedValueOnce({
+      apiKey: 'glasshive-provider-key',
+      baseURL: 'http://127.0.0.1:8766/v1',
+      defaultHeaders: {},
+      dropParams: ['temperature', 'max_tokens', 'use_responses_api'],
+    });
+    const req = {
+      user: { id: 'u1' },
+      body: { conversationId: 'conversation-1', messageId: 'shared-parent' },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              'glasshive-harness': {
+                phase_b_followup: true,
+                workspace_binding: true,
+                responses_api: false,
+              },
+            },
+          },
+        },
+      },
+    };
+
+    await generateFollowUpText({
+      req,
+      agent: {
+        id: 'agent-glasshive-main',
+        endpoint: 'glasshive-harness',
+        provider: 'openAI',
+        model: 'codex-cli:gpt-5.6-sol',
+        tools: [],
+        model_parameters: { reasoning_effort: 'medium' },
+      },
+      insightsData: {
+        insights: [{ cortexName: 'Mission evidence', insight: 'Worker B completed.' }],
+      },
+      recentResponse: 'Worker C completed.',
+      runId: 'ghag_11111111111111111111111111111111',
+      conversationId: 'conversation-1',
+      parentMessageId: 'shared-parent',
+    });
+
+    const {
+      attachConversationProviderCapabilityBundle,
+    } = require('~/server/services/viventium/GlassHiveConversationProviderService');
+    const capabilityRequest = attachConversationProviderCapabilityBundle.mock.calls.at(-1)[0];
+    expect(capabilityRequest.requestBody.viventiumGlassHiveIdempotencyKey).toContain(
+      'ghag_11111111111111111111111111111111',
+    );
+    expect(capabilityRequest.requestBody.conversationId).toBe('conversation-1');
+    expect(
+      Run.create.mock.calls.at(-1)[0].graphConfig.llmConfig.configuration.defaultHeaders,
+    ).toEqual(
+      expect.objectContaining({
+        'X-GlassHive-Agent-Id': 'agent-glasshive-main:phase_b:followup',
+      }),
+    );
   });
 
   test.each([

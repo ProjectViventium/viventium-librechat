@@ -16,6 +16,8 @@ const {
 
 module.exports = createGlassHiveWorkActionService({
   GenerationJobManager,
+  assertVoiceWorkAuthority: (...args) =>
+    require('./VoiceWorkAuthorityService').assertVoiceWorkAuthority(...args),
   logger,
   buildTrustedActionIdempotencyKey,
   getActiveWorkSnapshot,

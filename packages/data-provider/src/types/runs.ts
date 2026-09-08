@@ -67,6 +67,12 @@ export interface HarnessActivityContentPart {
       | 'failed'
       | 'cancelled';
     summary: string;
+    /** Bounded public identity of a tool activity (never native payloads or ids). */
+    tool?: string;
+    task?: string;
+    status?: string;
+    /** Typed anchor: the connected tool queued Worker work whose result arrives by callback. */
+    expects_deferred_callback?: boolean;
   };
 }
 /* === VIVENTIUM END === */

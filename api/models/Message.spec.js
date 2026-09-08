@@ -1,7 +1,35 @@
 const mongoose = require('mongoose');
 const { v4: uuidv4 } = require('uuid');
 const { logger, messageSchema } = require('@librechat/data-schemas');
-const { MongoMemoryServer } = require('mongodb-memory-server');
+const { MongoMemoryReplSet } = require('mongodb-memory-server');
+let mockNativeResponseManager;
+
+jest.mock('~/models', () => ({
+  ...jest.requireActual('~/models'),
+  ...jest.requireActual('@librechat/data-schemas').createNativeResponseMethods(require('mongoose')),
+  saveConvo: jest.fn(async (_req, conversation) => conversation),
+}));
+jest.mock('~/server/middleware', () => ({
+  requireJwtAuth: (req, _res, next) => { req.user = { id: 'user123' }; next(); },
+  validateMessageReq: (_req, _res, next) => next(),
+}));
+jest.mock('~/server/services/viventium/nativeResponseService', () => ({
+  mutateNativeResponseSources: (filter, operation, kind) => {
+    const transaction = jest
+      .requireActual('@librechat/api')
+      .createGlassHiveTerminalCallbackTransactionService(require('mongoose'));
+    return require('~/models').mutateNativeResponseSources(
+      filter,
+      operation,
+      (identity) => mockNativeResponseManager
+        ? mockNativeResponseManager.revokeNativeResponse(identity)
+        : Promise.resolve({ status: 'revoked' }),
+      transaction.runGlassHiveTerminalCallbackTransaction,
+      async (identity) => mockNativeResponseManager?.retireNativeResponse(identity),
+      kind,
+    );
+  },
+}));
 
 const mockScheduleConversationRecallSync = jest.fn();
 
@@ -26,6 +54,48 @@ const {
   recordMessage,
   __testables: { buildMessageAncestorBranchPipeline },
 } = require('./Message');
+
+test('ordinary message edits cannot forge or erase internal memory admission state', () => {
+  const { sanitizeMessageForPersistence } = require('./Message').__testables;
+  expect(
+    sanitizeMessageForPersistence({
+      text: 'safe',
+      savedMemoryWrite: { status: 'running' },
+      'savedMemoryWrite.owner': 'forged',
+      $set: { 'savedMemoryWrite.status': 'completed', text: 'safe' },
+      $unset: { savedMemoryWrite: 1 },
+      $rename: { content: 'savedMemoryWrite' },
+    }),
+  ).toEqual({ text: 'safe', $set: { text: 'safe' }, $unset: {}, $rename: {} });
+});
+
+test('ordinary message edits cannot forge or erase native response admission', () => {
+  const { sanitizeMessageForPersistence } = require('./Message').__testables;
+  expect(
+    sanitizeMessageForPersistence({
+      text: 'safe',
+      nativeResponse: { status: 'completed' },
+      'nativeResponse.invocationId': 'forged',
+      $set: { 'nativeResponse.status': 'completed', text: 'safe' },
+      $unset: { nativeResponse: 1 },
+      $rename: { content: 'nativeResponse' },
+    }),
+  ).toEqual({ text: 'safe', $set: { text: 'safe' }, $unset: {}, $rename: {} });
+});
+
+test('ordinary message edits cannot forge or erase accepted Main projection identity', () => {
+  const { sanitizeMessageForPersistence } = require('./Message').__testables;
+  expect(
+    sanitizeMessageForPersistence({
+      text: 'safe',
+      acceptedMainContext: { revision: 1 },
+      'acceptedMainContext.logicalTurnId': 'forged',
+      $set: { 'acceptedMainContext.revision': 2, text: 'safe' },
+      $unset: { acceptedMainContext: 1 },
+      $rename: { content: 'acceptedMainContext' },
+    }),
+  ).toEqual({ text: 'safe', $set: { text: 'safe' }, $unset: {}, $rename: {} });
+});
 
 jest.mock('~/server/services/Config/app');
 
@@ -67,10 +137,11 @@ describe('Message Operations', () => {
   let mockMessageData;
 
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create();
+    mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     const mongoUri = mongoServer.getUri();
     Message = mongoose.models.Message || mongoose.model('Message', messageSchema);
     await mongoose.connect(mongoUri);
+    await Message.init();
   });
 
   afterAll(async () => {
@@ -100,7 +171,496 @@ describe('Message Operations', () => {
     };
   });
 
+  /* === VIVENTIUM START === Native publication survives non-content Message bookkeeping. === */
+  describe.each(['pending', 'prepared', 'completed'])(
+    'native response bookkeeping (%s)',
+    (status) => {
+      let store;
+      let transport;
+      let methods;
+      let identity;
+      let candidateDigest;
+      let finalEvent;
+
+      beforeEach(async () => {
+        const { InMemoryJobStore, InMemoryEventTransport, GenerationJobManagerClass } =
+          jest.requireActual('@librechat/api');
+        store = new InMemoryJobStore();
+        transport = new InMemoryEventTransport();
+        mockNativeResponseManager = new GenerationJobManagerClass({
+          jobStore: store,
+          eventTransport: transport,
+        });
+        mockNativeResponseManager.initialize();
+        methods = require('~/models');
+        const user = mockReq.user.id;
+        const conversationId = mockMessageData.conversationId;
+        await Message.create([
+          { ...mockMessageData, messageId: 'native-source', isCreatedByUser: true },
+          {
+            ...mockMessageData,
+            messageId: 'native-answer',
+            parentMessageId: 'native-source',
+            isCreatedByUser: false,
+            unfinished: true,
+            text: 'In progress.',
+          },
+        ]);
+        const claim = await store.claimLogicalTurn('native-stream', user, {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'web',
+          conversation_id: conversationId,
+          revision: 1,
+          source_event_id: 'native-source',
+        });
+        const job = await store.createJob('native-stream', user, conversationId, {
+          responseMessageId: 'native-answer',
+          interactionContext: claim.interactionContext,
+          userMessage: { messageId: 'native-source' },
+        });
+        identity = {
+          userId: user,
+          conversationId,
+          responseMessageId: 'native-answer',
+          streamId: 'native-stream',
+          jobCreatedAt: job.createdAt,
+          logicalTurnId: claim.interactionContext.logical_turn_id,
+          revision: claim.interactionContext.revision,
+          invocationId: 'native-invocation',
+          bodySha256: 'b'.repeat(64),
+          providerId: 'native-provider',
+          agentId: 'native-agent',
+          originSha256: 'c'.repeat(64),
+          source: await methods.captureNativeResponseSource(user, conversationId, 'native-source'),
+          admittedAt: Date.now(),
+          recoverUntil: Date.now() + 86_400_000,
+        };
+        const transaction = (operation) => mongoose.connection.transaction(operation);
+        mongoose.set('transactionAsyncLocalStorage', true);
+        expect(await mockNativeResponseManager.bindNativeResponse(identity)).toBe(true);
+        await methods.admitNativeResponse(identity, transaction);
+        candidateDigest = undefined;
+        finalEvent = undefined;
+        if (status !== 'pending') await prepareNative();
+        if (status === 'completed') await completeNative();
+      });
+
+      afterEach(async () => {
+        await mockNativeResponseManager?.destroy();
+        mockNativeResponseManager = undefined;
+      });
+
+      async function prepareNative() {
+        candidateDigest = await methods.prepareNativeResponse(
+          identity,
+          {
+            text: 'Canonical native answer.',
+            authoritySha256: 'a'.repeat(64),
+            requestId: 'native-request',
+            runId: 'native-run',
+            responseJson: '{"saved":true}',
+          },
+          (operation) => mongoose.connection.transaction(operation),
+        );
+      }
+
+      async function completeNative() {
+        if (!candidateDigest) await prepareNative();
+        const saved = await methods.materializeNativeResponse(
+          identity,
+          candidateDigest,
+          (bound, digest) => mockNativeResponseManager.commitNativeResponse(bound, digest),
+          (operation) => mongoose.connection.transaction(operation),
+        );
+        finalEvent = { final: true, responseMessage: saved };
+        expect(await mockNativeResponseManager.finishNativeResponse(identity, finalEvent)).toBe(
+          true,
+        );
+      }
+
+      test.each([
+        ['assistant token count', 'native-answer', { tokenCount: 42 }],
+        ['current user token count', 'native-source', { tokenCount: 42 }],
+        [
+          'Phase B content merge',
+          'native-answer',
+          {
+            content: [
+              { type: 'text', text: 'Canonical native answer.' },
+              {
+                type: 'cortex_insight',
+                insight: 'A background contribution.',
+                cortex_id: 'background',
+                status: 'complete',
+              },
+            ],
+          },
+        ],
+        [
+          'memory admission receipt',
+          'native-answer',
+          {
+            $addToSet: {
+              attachments: {
+                type: 'memory',
+                messageId: 'native-answer',
+                memory: {
+                  type: 'error',
+                  key: 'system',
+                  value: JSON.stringify({ errorType: 'writer_unavailable' }),
+                },
+              },
+            },
+          },
+        ],
+      ])('preserves admission and exact FINAL after %s', async (name, messageId, update) => {
+        if (name === 'current user token count') {
+          const BaseClient = require('~/app/clients/BaseClient');
+          const client = Object.create(BaseClient.prototype);
+          client.options = { req: mockReq, resendFiles: true };
+          client.inputTokensKey = 'input_tokens';
+          client.calculateCurrentTokenCount = () => 42;
+          await client.updateUserMessageTokenCount({
+            usage: { input_tokens: 100 },
+            tokenCountMap: {},
+            userMessage: { messageId, tokenCount: 1 },
+            userMessagePromise: Promise.resolve(),
+            opts: {},
+          });
+        } else if (name === 'Phase B content merge') {
+          const {
+            persistCortexPartsToCanonicalMessage,
+          } = require('~/server/services/viventium/BackgroundCortexFollowUpService');
+          await persistCortexPartsToCanonicalMessage({
+            req: mockReq,
+            responseMessageId: messageId,
+            cortexParts: [update.content[1]],
+            maxAttempts: 1,
+          });
+        } else {
+          await updateMessage(mockReq, { messageId, ...update }, { operationKind: 'system' });
+        }
+        const unchanged = await methods.getNativeResponse(
+          identity.userId,
+          identity.responseMessageId,
+        );
+        expect(unchanged.nativeResponse).toMatchObject({
+          status,
+          invocationId: identity.invocationId,
+        });
+        expect(await store.getJob(identity.streamId)).toMatchObject({ nativeResponse: identity });
+        if (status !== 'completed') await completeNative();
+        const retained = await methods.getNativeResponse(
+          identity.userId,
+          identity.responseMessageId,
+        );
+        expect(retained).toMatchObject({
+          text: 'Canonical native answer.',
+          unfinished: false,
+          nativeResponse: {
+            status: 'completed',
+            invocationId: identity.invocationId,
+            candidateSha256: candidateDigest,
+          },
+        });
+        const changed = await Message.findOne({ user: identity.userId, messageId }).lean();
+        if (update.tokenCount) expect(changed.tokenCount).toBe(42);
+        if (update.content)
+          expect(changed.content).toEqual(expect.arrayContaining([update.content[1]]));
+        if (update.$addToSet)
+          expect(changed.attachments).toContainEqual(update.$addToSet.attachments);
+        expect(await store.getNativeResponseCommit(identity)).toEqual({
+          status: 'committed',
+          candidateSha256: candidateDigest,
+        });
+        expect(await store.getJob(identity.streamId)).toMatchObject({
+          nativeResponse: identity,
+          finalEvent: JSON.stringify(finalEvent),
+        });
+        const delivered = jest.fn();
+        await mockNativeResponseManager.subscribe(identity.streamId, jest.fn(), delivered);
+        expect(delivered).toHaveBeenCalledTimes(1);
+        expect(delivered).toHaveBeenCalledWith(finalEvent);
+        expect(await methods.markNativeResponseReplayStored(identity)).toBe(true);
+        expect(await mockNativeResponseManager.settleNativeResponse(identity)).toBe(true);
+      });
+
+      test.each([true, false])(
+        'system metadata preserves the completed delivery decision, present: %s',
+        async (present) => {
+          if (status !== 'completed') await completeNative();
+          const canonical = {
+            version: 1,
+            audio: 'skip',
+            required: true,
+            valid: true,
+            source: 'model',
+          };
+          await Message.updateOne(
+            { user: identity.userId, messageId: identity.responseMessageId },
+            {
+              metadata: {
+                keep: true,
+                viventium: {
+                  sibling: 'before',
+                  ...(present ? { deliveryDisposition: canonical } : {}),
+                },
+              },
+            },
+          );
+          await updateMessage(
+            mockReq,
+            {
+              messageId: identity.responseMessageId,
+              text: 'An obsolete snapshot.',
+              metadata: {
+                added: true,
+                viventium: {
+                  sibling: 'after',
+                  deliveryDisposition: { ...canonical, audio: 'eligible' },
+                },
+              },
+            },
+            { operationKind: 'system' },
+          );
+          const saved = await methods.getNativeResponse(
+            identity.userId,
+            identity.responseMessageId,
+          );
+          expect(saved).toMatchObject({
+            text: 'Canonical native answer.',
+            unfinished: false,
+            nativeResponse: { status: 'completed', invocationId: identity.invocationId },
+          });
+          expect(saved.metadata).toEqual({
+            keep: true,
+            added: true,
+            viventium: {
+              sibling: 'after',
+              ...(present ? { deliveryDisposition: canonical } : {}),
+            },
+          });
+          expect(await store.getJob(identity.streamId)).toMatchObject({
+            nativeResponse: identity,
+            finalEvent: JSON.stringify(finalEvent),
+          });
+        },
+      );
+
+    test('a system snapshot returns the native owner result without a second save', async () => {
+        const saved = await saveMessage(
+          mockReq,
+          {
+            ...mockMessageData,
+            messageId: identity.responseMessageId,
+            parentMessageId: 'native-source',
+            isCreatedByUser: false,
+            unfinished: true,
+            text: 'A generation checkpoint.',
+          },
+          { operationKind: 'system' },
+        );
+        expect(saved.text).toBe(
+          status === 'completed'
+            ? 'Canonical native answer.'
+            : status === 'prepared'
+              ? 'In progress.'
+              : 'A generation checkpoint.',
+        );
+        expect(saved.nativeResponse).toBeUndefined();
+        expect(
+          await methods.getNativeResponse(identity.userId, identity.responseMessageId),
+        ).toMatchObject({ nativeResponse: { status, invocationId: identity.invocationId } });
+      expect(await store.getJob(identity.streamId)).toMatchObject({ nativeResponse: identity });
+    });
+
+    test('a recovered BSON-null identity retains the original publication and exact FINAL', async () => {
+      if (status !== 'completed') await completeNative();
+      await Message.collection.updateOne(
+        { user: identity.userId, messageId: identity.responseMessageId },
+        {
+          $set: {
+            'nativeResponse.sourceOrderScope': null,
+            'nativeResponse.sourceSequence': null,
+            'nativeResponse.deliveryDispositionRequired': null,
+            'nativeResponse.deliveryContext': null,
+          },
+        },
+      );
+      const saved = await methods.getNativeResponse(identity.userId, identity.responseMessageId);
+      expect(saved.nativeResponse).toHaveProperty('sourceOrderScope', null);
+      expect(
+        await mockNativeResponseManager.finishNativeResponse(saved.nativeResponse, finalEvent),
+      ).toBe(true);
+      expect(await store.getNativeResponseCommit(saved.nativeResponse)).toEqual({
+        status: 'committed',
+        candidateSha256: candidateDigest,
+      });
+      expect(await store.getJob(identity.streamId)).toMatchObject({
+        nativeResponse: identity,
+        finalEvent: JSON.stringify(finalEvent),
+      });
+    });
+
+      test.each(['edit', 'delete'])(
+        '%s retires replay and retains any accepted publication',
+        async (action) => {
+          if (action === 'edit') {
+            await updateMessage(
+              mockReq,
+              { messageId: identity.responseMessageId, text: 'Explicit correction.' },
+              { operationKind: 'edit' },
+            );
+            expect(
+              await methods.getNativeResponse(identity.userId, identity.responseMessageId),
+            ).toMatchObject({
+              text: 'Explicit correction.',
+              nativeResponse: { status: 'cancelled' },
+            });
+          } else {
+            await deleteMessages({ user: identity.userId, messageId: identity.responseMessageId });
+            expect(
+              await methods.getNativeResponse(identity.userId, identity.responseMessageId),
+            ).toBeNull();
+          }
+          expect(await store.getJob(identity.streamId)).toBeNull();
+          const receipt = await store.getNativeResponseCommit(identity);
+          if (status === 'completed') {
+            expect(receipt).toEqual({ status: 'committed', candidateSha256: candidateDigest });
+          } else {
+            expect(receipt.status).not.toBe('committed');
+          }
+          expect(
+            await store.getNativeResponseCommit({ ...identity, invocationId: 'other' }),
+          ).not.toMatchObject({ status: 'committed' });
+          const delivered = jest.fn();
+          transport.subscribe(identity.streamId, { onChunk: jest.fn(), onDone: delivered });
+          expect(
+            await mockNativeResponseManager.finishNativeResponse(
+              identity,
+              finalEvent || { final: true, responseMessage: { text: 'Obsolete answer.' } },
+            ),
+          ).toBe(false);
+          expect(delivered).not.toHaveBeenCalled();
+        },
+      );
+
+      test('a user-source edit cancels only unaccepted dependent answers', async () => {
+        await updateMessage(
+          mockReq,
+          { messageId: 'native-source', text: 'Changed request.' },
+          { operationKind: 'edit' },
+        );
+        const saved = await methods.getNativeResponse(identity.userId, identity.responseMessageId);
+        expect(saved.nativeResponse.status).toBe(
+          status === 'completed' ? 'completed' : 'cancelled',
+        );
+        if (status === 'completed') {
+          expect(saved.text).toBe('Canonical native answer.');
+          expect(await store.getNativeResponseCommit(identity)).toMatchObject({
+            status: 'committed',
+            candidateSha256: candidateDigest,
+          });
+          expect(await mockNativeResponseManager.finishNativeResponse(identity, finalEvent)).toBe(
+            true,
+          );
+        } else {
+          expect(await store.getNativeResponseCommit(identity)).toMatchObject({
+            status: 'revoked',
+          });
+        }
+      });
+
+      test('explicit POST replacement is not swallowed by immutable snapshot preservation', async () => {
+        const express = require('express');
+        const request = require('supertest');
+        const app = express();
+        app.use(express.json());
+        app.use('/api/messages', require('~/server/routes/messages'));
+        const response = await request(app)
+          .post(`/api/messages/${identity.conversationId}`)
+          .send({
+            messageId: identity.responseMessageId,
+            conversationId: identity.conversationId,
+            user: identity.userId,
+            isCreatedByUser: false,
+            text: 'Explicit replacement.',
+            content: [{ type: 'text', text: 'Explicit replacement.' }],
+            metadata: { operationKind: 'system' },
+          });
+        expect(response.status).toBe(201);
+        expect(response.body.text).toBe('Explicit replacement.');
+        expect(response.body.nativeResponse).toBeUndefined();
+        expect(
+          await methods.getNativeResponse(identity.userId, identity.responseMessageId),
+        ).toMatchObject({
+          text: 'Explicit replacement.',
+          nativeResponse: { status: 'cancelled' },
+        });
+        expect(await store.getJob(identity.streamId)).toBeNull();
+      });
+    },
+  );
+  /* === VIVENTIUM END === */
+
   describe('saveMessage', () => {
+    it('bulk replacement cannot overwrite another owner at the same message id', async () => {
+      await Message.create({
+        ...mockMessageData,
+        user: 'original-owner',
+        text: 'Original owner text.',
+      });
+      await bulkSaveMessages([
+        { ...mockMessageData, user: 'another-owner', text: 'Foreign replacement.' },
+      ]).catch(() => undefined);
+      expect(
+        await Message.findOne({
+          messageId: mockMessageData.messageId,
+          user: 'original-owner',
+        }).lean(),
+      ).toMatchObject({ text: 'Original owner text.' });
+    });
+
+    it('cannot overwrite a native completion admitted after the ordinary snapshot read', async () => {
+      await Message.create({ ...mockMessageData, isCreatedByUser: false, unfinished: true });
+      const db = require('~/models');
+      const guard = jest
+        .spyOn(db, 'saveNativeResponseSnapshot')
+        .mockImplementationOnce(async () => {
+          await Message.updateOne(
+            { messageId: mockMessageData.messageId },
+            {
+              $set: {
+                nativeResponse: { status: 'completed', invocationId: 'native-winner' },
+                text: 'Canonical native answer.',
+                unfinished: false,
+              },
+            },
+          );
+          return undefined;
+        });
+      try {
+        const saved = await saveMessage(
+          mockReq,
+          {
+            ...mockMessageData,
+            isCreatedByUser: false,
+            unfinished: true,
+            text: 'Late checkpoint.',
+          },
+          { operationKind: 'system' },
+        );
+        expect(saved.text).toBe('Canonical native answer.');
+        expect(saved.unfinished).toBe(false);
+        expect((await Message.findOne({ messageId: mockMessageData.messageId })).text).toBe(
+          'Canonical native answer.',
+        );
+      } finally {
+        guard.mockRestore();
+      }
+    });
+
     it('should save a message for an authenticated user', async () => {
       const result = await saveMessage(mockReq, mockMessageData);
 

@@ -14,7 +14,7 @@ const {
   executeGlassHiveWorkAction,
 } = require('~/server/services/viventium/GlassHiveWorkActionService');
 const {
-  effectiveOrchestrationMode,
+  preferredOrchestrationMode,
   parallelWorkClaimStateAsync,
 } = require('~/server/services/viventium/ViventiumOrchestrationMode');
 const {
@@ -30,7 +30,7 @@ const handlers = createOrchestrationHttpHandlers({
   getActiveWorkInteractiveSnapshot,
   getActiveWorkPage,
   executeGlassHiveWorkAction,
-  effectiveOrchestrationMode,
+  preferredOrchestrationMode,
   parallelWorkClaimStateAsync,
   observeOrchestrationOwner,
   refreshOrchestrationReadiness,

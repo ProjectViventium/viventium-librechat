@@ -891,6 +891,8 @@ export type TStartupConfig = {
     username?: boolean;
   };
   serverDomain: string;
+  /** Canonical origin of this installation; browser links retain the active session origin. */
+  viventiumClientOrigin?: string;
   emailLoginEnabled: boolean;
   registrationEnabled: boolean;
   socialLoginEnabled: boolean;

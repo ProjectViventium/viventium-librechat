@@ -660,6 +660,7 @@ describe('BaseClient', () => {
       expect(TestClient.loadHistory).toHaveBeenCalledWith(
         opts.conversationId,
         opts.parentMessageId,
+        opts.parentMessageId,
       );
     });
 
@@ -688,6 +689,37 @@ describe('BaseClient', () => {
         true,
       );
     });
+
+    test.each([false, true])(
+      'keeps assistant persistence with its selected owner (deferred: %s)',
+      async (deferred) => {
+        const user = { id: 'owner' };
+        saveMessage.mockClear();
+        saveConvo.mockClear();
+        getConvo.mockResolvedValue(null);
+        saveMessage.mockImplementation(async (_req, message) => message);
+        saveConvo.mockResolvedValue({ conversationId: 'retained-conversation' });
+        TestClient = initializeFakeClient(apiKey, { ...options, req: { user } }, []);
+        TestClient.skipSaveResponseMessage = deferred;
+        TestClient.options.attachments = [{ file_id: 'retained-file' }];
+
+        const response = await TestClient.sendMessage('Keep the original input.', {
+          user,
+          conversationId: 'retained-conversation',
+        });
+        const persisted = await response.databasePromise;
+        const saved = saveMessage.mock.calls.map((call) => call[1]);
+        expect(saved.filter((message) => message.isCreatedByUser)).toHaveLength(1);
+        expect(saved.filter((message) => !message.isCreatedByUser)).toHaveLength(deferred ? 0 : 1);
+        expect(TestClient.savedMessageIds.has(response.messageId)).toBe(!deferred);
+        expect(persisted.conversation.conversationId).toBe('retained-conversation');
+        expect(saveConvo).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({ files: ['retained-file'] }),
+          expect.anything(),
+        );
+      },
+    );
 
     test('saveMessageToDatabase is called with the correct arguments', async () => {
       const saveOptions = TestClient.getSaveOptions();
@@ -797,6 +829,28 @@ describe('BaseClient', () => {
         .map((call) => call[1])
         .find((message) => message.isCreatedByUser === false);
       expect(assistantSave.text).toBe('bold italic rule Done');
+    });
+
+    test('normal client saves leave explicit title state under the conversation owner', async () => {
+      getConvo.mockResolvedValue({
+        conversationId: 'renamed-conversation',
+        title: 'New Chat',
+        model: 'old-model',
+      });
+      saveMessage.mockResolvedValue({ messageId: 'message' });
+      saveConvo.mockResolvedValue({ conversationId: 'renamed-conversation', title: 'New Chat' });
+      TestClient = initializeFakeClient(apiKey, { ...options, req: { user: { id: 'owner' } } }, []);
+      await TestClient.saveMessageToDatabase(
+        { messageId: 'message', conversationId: 'renamed-conversation', text: 'Next turn' },
+        { model: 'new-model' },
+        'owner',
+      );
+      const [, fields, metadata] = saveConvo.mock.calls.at(-1);
+      expect(fields.model).toBe('new-model');
+      expect(fields).not.toHaveProperty('title');
+      expect(fields).not.toHaveProperty('titleSetByUser');
+      expect(metadata.unsetFields).not.toHaveProperty('title');
+      expect(metadata.unsetFields).not.toHaveProperty('titleSetByUser');
     });
 
     test('should handle existing conversation when getConvo retrieves one', async () => {
@@ -1241,16 +1295,20 @@ describe('BaseClient', () => {
       expect(userSave[0].files).toBeUndefined();
     });
 
-    test('skips file population when attachments is not an array (Promise case)', async () => {
+    test('resolves source attachments before onStart and the later user save', async () => {
       TestClient.options.attachments = Promise.resolve([attachment]);
       TestClient.saveMessageToDatabase = jest.fn().mockResolvedValue({ message: {} });
 
-      await TestClient.sendMessage('Hello');
+      let capturedFiles;
+      await TestClient.sendMessage('Hello', {onStart: async (message) => {
+        capturedFiles = structuredClone(message.files);
+      }});
 
       const userSave = TestClient.saveMessageToDatabase.mock.calls.find(
         ([msg]) => msg.isCreatedByUser,
       );
-      expect(userSave[0].files).toBeUndefined();
+      expect(capturedFiles).toHaveLength(1);
+      expect(userSave[0].files).toEqual(capturedFiles);
     });
 
     test('skips file population when skipSaveUserMessage is true', async () => {

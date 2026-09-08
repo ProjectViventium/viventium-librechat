@@ -5,7 +5,9 @@ type TCortexCarrier = TMessage & {
 };
 
 function cloneTransientParts(parts: unknown[]): unknown[] {
-  return parts.map((part) => (part && typeof part === 'object' ? { ...(part as Record<string, unknown>) } : part));
+  return parts.map((part) =>
+    part && typeof part === 'object' ? { ...(part as Record<string, unknown>) } : part,
+  );
 }
 
 function getTransientParts(message: TMessage | null | undefined): unknown[] | null {
@@ -32,22 +34,31 @@ export function preserveTransientCortexState({
   currentMessages,
   requestMessageId,
   responseMessage,
+  memoryWriterScheduled,
 }: {
   currentMessages?: TMessage[] | null;
   requestMessageId?: string | null;
   responseMessage?: TMessage | null;
+  memoryWriterScheduled?: boolean;
 }): TMessage | null | undefined {
   if (!responseMessage) {
     return responseMessage;
   }
 
-  if (getTransientParts(responseMessage)) {
-    return responseMessage;
+  // The server has already admitted this write. Keep only a public pending signal until
+  // the ordinary message read returns its authoritative state and attachments.
+  const finalResponse =
+    memoryWriterScheduled && !responseMessage.memoryWriteStatus
+      ? { ...responseMessage, memoryWriteStatus: 'pending' as const }
+      : responseMessage;
+
+  if (getTransientParts(finalResponse)) {
+    return finalResponse;
   }
 
   const requestId = typeof requestMessageId === 'string' ? requestMessageId : '';
   if (!Array.isArray(currentMessages) || currentMessages.length === 0 || requestId.length === 0) {
-    return responseMessage;
+    return finalResponse;
   }
 
   const placeholderId = `${requestId}_`;
@@ -57,7 +68,7 @@ export function preserveTransientCortexState({
     }
 
     return (
-      message.messageId === responseMessage.messageId ||
+      message.messageId === finalResponse.messageId ||
       message.messageId === placeholderId ||
       message.parentMessageId === requestId
     );
@@ -70,10 +81,10 @@ export function preserveTransientCortexState({
     }
 
     return {
-      ...responseMessage,
+      ...finalResponse,
       __viventiumCortexParts: cloneTransientParts(transientParts),
     } as TMessage;
   }
 
-  return responseMessage;
+  return finalResponse;
 }

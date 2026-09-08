@@ -25,6 +25,12 @@ const {
 } = require('~/db/models');
 const { saveConvo, saveMessage } = require('~/models');
 const {
+  createGlassHiveMissionAdjudicationService,
+  fenceGlassHiveTerminalCallbackAcceptedOperation,
+  buildVoiceWorkerCompletionPresentation,
+} = require('@librechat/api');
+
+const {
   currentGlassHiveTerminalCallbackTransaction,
   deferGlassHiveTerminalCallbackAfterCommit,
   runGlassHiveTerminalCallbackTransaction,
@@ -38,6 +44,7 @@ const {
   authorizeGlassHiveCallbackDeliveryDispatch,
   claimPendingGlassHiveCallbackDeliveries,
   enqueueGlassHiveCallbackDelivery,
+  reconcileGlassHiveSurfaceDeliveryProjections,
   markGlassHiveCallbackDeliverySent,
   releaseGlassHiveCallbackDeliveryDispatch,
   renewGlassHiveCallbackDeliveryDispatch,
@@ -489,6 +496,63 @@ const REAL_DESTINATIONS = [
   },
 ];
 
+
+async function authoredDeliveryProof(scope) {
+  const result = identity(1, 'a', scope);
+  const conversationId = PRESENTATION_CONVERSATION_ID;
+  await Conversation.create({ conversationId, user: result.ownerId, title: 'Local guide', endpoint: 'agents', agent_id: 'agent-main' });
+  const accepted = await compareAndSetGlassHiveTerminalCallbackResult({ ResultModel: GlassHiveTerminalCallbackResult, incoming: result });
+  const acquired = await acquireGlassHiveTerminalCallbackEffectLease({ ResultModel: GlassHiveTerminalCallbackResult, incoming: result, acceptedOperationId: accepted.acceptedOperationId });
+  expect(acquired.status).toBe('acquired');
+  const collection = mongoose.connection.collection(MISSION_EVIDENCE_COLLECTION);
+  const receipts = mongoose.connection.collection('test_authored_delivery_receipts');
+  const preparedText = 'The local guide is complete. Its original answer stays intact.';
+  const authoredId = `authored-${scope}`;
+  const request = { user: { id: result.ownerId }, body: { viventiumQaRun: true, viventiumEvalIsolation: { conversationRecall: true } }, config: {} };
+  const writeAuthored = async (messageId = authoredId) => {
+    const message = { messageId, conversationId, parentMessageId: 'original-anchor', sender: 'AI', endpoint: 'agents', model: 'agent-main', text: preparedText, isCreatedByUser: false, unfinished: false, error: false };
+    await saveMessage(request, message, { context: 'viventium/tests/authored-delivery-transaction' });
+    return { messageId, text: preparedText };
+  };
+  const prepare = jest.fn(async () => ({ text: preparedText }));
+  const persist = jest.fn(async () => writeAuthored());
+  let failDelivery = true;
+  const delivery = jest.fn(async () => {
+    if (failDelivery) throw Object.assign(new Error('synthetic surface unavailable'), { code: 'surface_unavailable' });
+    return { configured: 1, enqueued: 1 };
+  });
+  const service = createGlassHiveMissionAdjudicationService({
+    mongoose, logger: { info: jest.fn(), warn: jest.fn() },
+    buildVoiceWorkerCompletionPresentation, fenceGlassHiveTerminalCallbackAcceptedOperation,
+    getConvo: (ownerId, id) => Conversation.findOne({ user: ownerId, conversationId: id }).lean(),
+    getUserById: async () => ({ id: result.ownerId, role: 'USER' }),
+    saveConvo, getAgent: async () => ({ id: 'agent-main' }), getAppConfig: async () => ({}),
+    prepareCortexFollowUpMessage: prepare, persistPreparedCortexFollowUpMessage: persist,
+    isGlassHiveWorkTerminalCallback: (body) => body.work_terminal === true,
+    recordGlassHiveAdjudicationOutcome: async () => ({}),
+    recordOrchestrationTraceDelivery: async (receipt) => receipts.insertOne(receipt, { session: currentGlassHiveTerminalCallbackTransaction()?.session }),
+    getActiveCallSessionForConversation: async () => null,
+    sanitizeGlassHiveCallbackText: (value) => String(value || ''),
+    deferGlassHiveTerminalCallbackAfterCommit, runGlassHiveTerminalCallbackTransaction,
+    enqueueGlassHiveCallbackDelivery: delivery,
+    getTerminalCallbackResultModel: () => GlassHiveTerminalCallbackResult,
+  });
+  let evidence;
+  await runGlassHiveTerminalCallbackTransaction(async (session) => {
+    evidence = await service.persistGlassHiveMissionEvidence({
+      binding: callbackBinding(result, { conversationId, anchorMessageId: 'original-anchor', traceIdentity: { callbackRef: 'callback_sha256:' + require('crypto').createHash('sha256').update(result.callbackId).digest('hex'), attemptNumber: 1 } }),
+      body: callbackBody(result), effectFence: acquired.lease, effectSession: session,
+    });
+  });
+  // Advance only the isolated retry clock; the existing reconciliation owner performs admission.
+  const due = async () => {
+    await collection.updateOne({ _id: evidence._id }, { $set: { nextAttemptAt: new Date(0), updatedAt: new Date(0) } });
+    await service.reconcilePendingGlassHiveMissionAdjudications();
+    service.clearAdjudicationTimersForTests();
+  };
+  return { result, conversationId, collection, receipts, evidence, prepare, persist, delivery, service, authoredId, preparedText, writeAuthored, due, allowDelivery: () => { failDelivery = false; } };
+}
+
 describe('GlassHive terminal callback all-destination transaction fence', () => {
   let replicaSet;
   let providerUrlBeforeTest;
@@ -519,6 +583,217 @@ describe('GlassHive terminal callback all-destination transaction fence', () => 
     if (mongoose.connection.readyState !== 0) await mongoose.disconnect();
     await replicaSet?.stop({ doCleanup: true, force: true });
   }, 15000);
+
+  async function neutralEndedCallProof(scope, callStatus = 'ended') {
+    const result = identity(1, 'a', scope, 'cancelled');
+    const binding = await seedExternalWork(result, { claimed: true });
+    const conversationId = PRESENTATION_CONVERSATION_ID;
+    await mongoose.connection.collection(EXTERNAL_WORK_COLLECTION).updateOne(
+      { _id: result.originRef }, { $set: { conversationId } });
+    const accepted = await compareAndSetGlassHiveTerminalCallbackResult({
+      ResultModel: GlassHiveTerminalCallbackResult, incoming: result,
+    });
+    const acquired = await acquireGlassHiveTerminalCallbackEffectLease({
+      ResultModel: GlassHiveTerminalCallbackResult, incoming: result,
+      acceptedOperationId: accepted.acceptedOperationId,
+    });
+    expect(acquired.status).toBe('acquired');
+    const callSessionId = `call-${scope}`;
+    await ViventiumCallSession.create({ callSessionId, userId: result.ownerId,
+      conversationId, agentId: 'agent-main', roomName: `room-${scope}`, mode: 'call',
+      callStatus, expiresAt: new Date(Date.now() + 3600000) });
+    const message = await Message.create({ messageId: `neutral-${scope}`, user: result.ownerId,
+      conversationId, parentMessageId: 'anchor', sender: 'AI', endpoint: 'agents',
+      text: 'Mission stopped.', isCreatedByUser: false,
+      metadata: { viventium: { type: 'glasshive_worker_callback',
+        status: { kind: 'mission_status', state: 'cancelled' },
+        originRef: result.originRef, workRef: result.workRef,
+        workerId: result.workerId, runId: result.runId, callbackId: result.callbackId,
+        voiceCallSessionId: callSessionId, configuredDestinations: [{ surface: 'voice', resolved: true },
+          { surface: 'librechat', resolved: true }] } } });
+    const body = callbackBody(result, { event: 'run.cancelled' });
+    const context = { ...binding, conversationId,
+      traceIdentity: { callbackRef: `callback_sha256:${require('crypto').createHash('sha256').update(result.callbackId).digest('hex')}`, attemptNumber: 1 },
+      traceSurface: 'voice', traceCallbackEvent: 'run.cancelled',
+      destinations: [{ surface: 'voice', voiceCallSessionId: callSessionId }, { surface: 'librechat' }] };
+    const enqueue = (overrides = {}) => runGlassHiveTerminalCallbackTransaction(async (session) => {
+      await fenceGlassHiveTerminalCallbackEffectTransaction({
+        ResultModel: GlassHiveTerminalCallbackResult, lease: acquired.lease, session,
+      });
+      return enqueueGlassHiveCallbackDelivery({ body, message: message.toObject(),
+        deliveryContext: context, effectFence: acquired.lease, effectSession: session, ...overrides });
+    });
+    return { result, acquired, callSessionId, message, body, context, enqueue };
+  }
+
+  test('ended Call neutral presentation commits linked Web once without any voice send', async () => {
+    const h = await neutralEndedCallProof('ended-neutral');
+    await h.enqueue();
+    await h.enqueue();
+    const rows = await ViventiumGlassHiveCallbackDelivery.find({ originRef: h.result.originRef }).lean();
+    expect(rows).toHaveLength(2);
+    expect(rows.find((row) => row.surface === 'voice')).toMatchObject({
+      status: 'suppressed', lastError: 'call_ended_linked_text', sentAt: null, claimedAt: null });
+    expect(rows.find((row) => row.surface === 'librechat')).toMatchObject({
+      status: 'sent', callbackMessageId: h.message.messageId, text: h.message.text });
+    expect(await mongoose.connection.collection(EXTERNAL_WORK_COLLECTION).findOne({ _id: h.result.originRef }))
+      .toMatchObject({ deliveryState: 'sent', attentionPending: false });
+  });
+
+  test('existing projection reconciliation settles a retained neutral after its Call ends', async () => {
+    const h = await neutralEndedCallProof('retained-neutral', 'working');
+    await h.enqueue();
+    await releaseGlassHiveTerminalCallbackEffectLease({ ResultModel: GlassHiveTerminalCallbackResult, lease: h.acquired.lease });
+    await ViventiumCallSession.updateOne({ callSessionId: h.callSessionId }, { $set: { callStatus: 'ended' } });
+    await ViventiumGlassHiveCallbackDelivery.updateMany({}, { $set: { projectionPendingAt: null, projectionAppliedAt: new Date(), projectionNextAttemptAt: null } });
+    await reconcileGlassHiveSurfaceDeliveryProjections();
+    await reconcileGlassHiveSurfaceDeliveryProjections();
+    const rows = await ViventiumGlassHiveCallbackDelivery.find({ originRef: h.result.originRef }).lean();
+    expect(rows).toHaveLength(2);
+    expect(rows.find((row) => row.surface === 'voice')).toMatchObject({ status: 'suppressed', sentAt: null });
+    expect(rows.find((row) => row.surface === 'librechat')).toMatchObject({ status: 'sent', callbackMessageId: h.message.messageId });
+  });
+
+  test.each(['active_call', 'wrong_owner', 'wrong_conversation', 'missing_message', 'claimed_voice', 'superseded_callback', 'main_followup'])(
+    'neutral linked fallback preserves %s without inventing Web delivery', async (scenario) => {
+      const h = await neutralEndedCallProof(`fence-${scenario}`, 'working');
+      await h.enqueue();
+      await releaseGlassHiveTerminalCallbackEffectLease({ ResultModel: GlassHiveTerminalCallbackResult, lease: h.acquired.lease });
+      if (scenario !== 'active_call') await ViventiumCallSession.updateOne({ callSessionId: h.callSessionId }, { $set: { callStatus: 'ended' } });
+      if (scenario === 'wrong_owner') await ViventiumCallSession.updateOne({ callSessionId: h.callSessionId }, { $set: { userId: 'another-owner' } });
+      if (scenario === 'wrong_conversation') await ViventiumCallSession.updateOne({ callSessionId: h.callSessionId }, { $set: { conversationId: 'another-conversation' } });
+      if (scenario === 'missing_message') await Message.deleteOne({ messageId: h.message.messageId });
+      if (scenario === 'claimed_voice') await ViventiumGlassHiveCallbackDelivery.updateMany({}, { $set: { status: 'claimed', claimId: 'actual-claim', claimedAt: new Date() } });
+      if (scenario === 'superseded_callback') await compareAndSetGlassHiveTerminalCallbackResult({ ResultModel: GlassHiveTerminalCallbackResult, incoming: identity(2, 'b', `fence-${scenario}`, 'completed') });
+      if (scenario === 'main_followup') await ViventiumGlassHiveCallbackDelivery.updateMany({}, { $set: { event: 'main.followup' } });
+      await reconcileGlassHiveSurfaceDeliveryProjections();
+      const rows = await ViventiumGlassHiveCallbackDelivery.find({ originRef: h.result.originRef }).lean();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].surface).toBe('voice');
+      expect(rows[0].sentAt).toBeNull();
+      expect(rows[0].status).toBe(scenario === 'claimed_voice' ? 'claimed' : 'pending');
+    });
+
+  test('Main linked Web acquires current authority without a callback-route lease', async () => {
+    const h = await neutralEndedCallProof('main-accepted', 'working');
+    await releaseGlassHiveTerminalCallbackEffectLease({ ResultModel: GlassHiveTerminalCallbackResult, lease: h.acquired.lease });
+    const run = () => runGlassHiveTerminalCallbackTransaction(() => enqueueGlassHiveCallbackDelivery({
+      body: { ...h.body, callback_id: h.context.traceIdentity.callbackRef, event: 'main.followup' }, message: h.message.toObject(),
+      deliveryContext: { ...h.context, destinations: [{ surface: 'librechat' }] },
+    }));
+    await expect(run()).resolves.toMatchObject({ linkedWebCommitted: true });
+    await expect(run()).resolves.toMatchObject({ linkedWebCommitted: true });
+    expect(await ViventiumGlassHiveCallbackDelivery.countDocuments({ originRef: h.result.originRef })).toBe(1);
+  });
+
+  test('Main linked Web requires an actual Message and leaves an unresolved external destination intact', async () => {
+    const h = await neutralEndedCallProof('main-local', 'working');
+    const context = { ...h.context, destinations: [{ surface: 'librechat' }] };
+    const body = { ...h.body, event: 'main.followup' };
+    const summary = await h.enqueue({ body, deliveryContext: context });
+    expect(summary).toMatchObject({ configured: 0, linkedWebCommitted: true });
+    await expect(h.enqueue({ body, deliveryContext: context, message: { messageId: 'not-saved', text: h.message.text } }))
+      .rejects.toThrow('glasshive_linked_presentation_message_unavailable');
+    const external = await h.enqueue({ body, deliveryContext: { ...context,
+      destinations: [{ surface: 'librechat' }, { surface: 'telegram', unresolvedReason: 'mapping_missing' }] } });
+    expect(external).toMatchObject({ configured: 1, unresolved: 1 });
+    expect(external.linkedWebCommitted).toBeUndefined();
+    expect(await mongoose.connection.collection(EXTERNAL_WORK_COLLECTION).findOne({ _id: h.result.originRef }))
+      .toMatchObject({ deliveryState: 'unresolved' });
+  });
+
+  test('authored Message and evidence survive a later surface rollback and more than ten delivery failures', async () => {
+    const h = await authoredDeliveryProof('authored-commit');
+    const flush = () => h.service.flushGlassHiveMissionAdjudications({ ownerId: h.result.ownerId });
+    try {
+      await expect(flush()).resolves.toMatchObject({ failed: 1 });
+      const committed = await Message.findOne({ user: h.result.ownerId, messageId: h.authoredId }).lean();
+      expect(committed).toMatchObject({ text: h.preparedText, conversationId: h.conversationId });
+      let evidence = await h.collection.findOne({ _id: h.evidence._id });
+      expect(evidence).toMatchObject({ state: 'delivery_pending', followUpMessageId: h.authoredId, followUpText: h.preparedText, authoredAt: expect.any(Date) });
+      expect(await h.receipts.countDocuments({})).toBe(0);
+      for (let attempt = 2; attempt <= 11; attempt += 1) {
+        await h.due();
+        await expect(flush()).resolves.toMatchObject({ failed: 1 });
+      }
+      evidence = await h.collection.findOne({ _id: h.evidence._id });
+      expect(evidence).toMatchObject({ state: 'delivery_pending', attempts: 11, followUpMessageId: h.authoredId });
+      expect(h.prepare).toHaveBeenCalledTimes(1);
+      expect(h.persist).toHaveBeenCalledTimes(1);
+      expect(await Message.countDocuments({ user: h.result.ownerId, messageId: h.authoredId })).toBe(1);
+      h.allowDelivery(); await h.due();
+      await expect(flush()).resolves.toMatchObject({ visible: 1, failed: 0 });
+      expect(await h.collection.findOne({ _id: h.evidence._id })).toMatchObject({ state: 'completed', attempts: 12 });
+      expect(await h.receipts.countDocuments({ deliveryRef: `main-web:${h.authoredId}` })).toBe(1);
+      await h.service.reconcilePendingGlassHiveMissionAdjudications();h.service.clearAdjudicationTimersForTests();await flush();
+      expect(h.prepare).toHaveBeenCalledTimes(1);
+      expect(h.delivery).toHaveBeenCalledTimes(12);
+    } finally { h.service.clearAdjudicationTimersForTests(); }
+  });
+
+  test('an authored return value without a real Message commit cannot publish a delivery receipt', async () => {
+    const h = await authoredDeliveryProof('missing-message-commit');
+    try {
+      h.persist.mockResolvedValueOnce({ messageId: 'never-saved-message', text: h.preparedText });
+      h.allowDelivery();
+      await expect(h.service.flushGlassHiveMissionAdjudications({ ownerId: h.result.ownerId })).resolves.toMatchObject({ failed: 1, visible: 0 });
+      expect(await Message.countDocuments({ user: h.result.ownerId })).toBe(0);
+      expect(await h.receipts.countDocuments({})).toBe(0);
+      expect(h.delivery).not.toHaveBeenCalled();
+      const evidence = await h.collection.findOne({ _id: h.evidence._id });
+      expect(evidence.followUpMessageId || '').toBe('');
+      expect(evidence.authoredAt).toBeUndefined();
+    } finally { h.service.clearAdjudicationTimersForTests(); }
+  });
+
+  test('a transient committed Message read preserves the durable pointer for retry', async () => {
+    const h = await authoredDeliveryProof('committed-read-outage');
+    let read;
+    try {
+      await expect(h.service.flushGlassHiveMissionAdjudications({ ownerId: h.result.ownerId })).resolves.toMatchObject({ failed: 1 });
+      await h.due();
+      read = jest.spyOn(mongoose.connection.collection('messages'), 'findOne').mockRejectedValueOnce(new Error('synthetic_message_read_outage'));
+      await expect(h.service.flushGlassHiveMissionAdjudications({ ownerId: h.result.ownerId })).resolves.toMatchObject({ failed: 1 });
+      expect(read).toHaveBeenCalled();read.mockRestore();read = null;
+      const evidence = await h.collection.findOne({ _id: h.evidence._id });
+      expect(evidence).toMatchObject({ followUpMessageId: h.authoredId, followUpText: h.preparedText, authoredAt: expect.any(Date) });
+      expect(await Message.findOne({ messageId: h.authoredId }).lean()).toMatchObject({ text: h.preparedText });
+      expect(h.prepare).toHaveBeenCalledTimes(1);
+      h.allowDelivery();await h.due();
+      await expect(h.service.flushGlassHiveMissionAdjudications({ ownerId: h.result.ownerId })).resolves.toMatchObject({ visible: 1, failed: 0 });
+      expect(h.prepare).toHaveBeenCalledTimes(1);
+      expect(h.persist).toHaveBeenCalledTimes(1);
+    } finally { read?.mockRestore();h.service.clearAdjudicationTimersForTests(); }
+  });
+
+  test('a real rolled-back Message and dangling catch pointer are not presentation proof', async () => {
+    const h = await authoredDeliveryProof('dangling-rollback');
+    const danglingId = 'rolled-back-message';
+    try {
+      await expect(runGlassHiveTerminalCallbackTransaction(async (session) => {
+        await h.writeAuthored(danglingId);
+        await h.collection.updateOne({ _id: h.evidence._id }, { $set: {
+          followUpMessageId: danglingId, followUpText: h.preparedText, authoredAt: new Date(),
+        } }, { session });
+        throw new Error('surface_enqueue_failed_after_message');
+      })).rejects.toThrow('surface_enqueue_failed_after_message');
+      expect(await Message.findOne({ messageId: danglingId }).lean()).toBeNull();
+      expect(await h.collection.findOne({ _id: h.evidence._id })).not.toHaveProperty('authoredAt');
+      // Reproduce the former catch write, which survived the failed transaction without its text.
+      await h.collection.updateOne({ _id: h.evidence._id }, { $set: {
+        followUpMessageId: danglingId, state: 'deadletter', attempts: 10,
+        errorCode: 'mission_adjudication_retry_exhausted', updatedAt: new Date(0),
+      } });
+      h.allowDelivery(); await h.due();
+      await expect(h.service.flushGlassHiveMissionAdjudications({ ownerId: h.result.ownerId })).resolves.toMatchObject({ visible: 1, failed: 0 });
+      expect(h.prepare).toHaveBeenCalledTimes(1);
+      expect(h.persist).toHaveBeenCalledTimes(1);
+      expect(await Message.findOne({ messageId: danglingId }).lean()).toBeNull();
+      expect(await Message.findOne({ messageId: h.authoredId }).lean()).toMatchObject({ user: h.result.ownerId, text: h.preparedText });
+      expect(await h.receipts.countDocuments({ deliveryRef: `main-web:${danglingId}` })).toBe(0);
+      expect(await h.collection.findOne({ _id: h.evidence._id })).toMatchObject({ state: 'completed', followUpMessageId: h.authoredId, followUpText: h.preparedText });
+    } finally { h.service.clearAdjudicationTimersForTests(); }
+  });
 
   test('a newer retry run at revision one replaces a legacy prior-run revision one without allowing the older run back', async () => {
     const prior = identity(1, 'a', 'cross-run-order');

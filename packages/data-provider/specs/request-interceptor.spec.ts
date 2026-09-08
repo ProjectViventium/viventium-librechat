@@ -1,7 +1,8 @@
 /**
  * @jest-environment @happy-dom/jest-environment
  */
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
+import request from '../src/request';
 import { setTokenHeader } from '../src/headers-helpers';
 
 /**
@@ -20,11 +21,128 @@ const mockAdapter = jest.fn();
 let originalAdapter: typeof axios.defaults.adapter;
 let savedLocation: Location;
 
-beforeAll(async () => {
+beforeAll(() => {
   originalAdapter = axios.defaults.adapter;
   axios.defaults.adapter = mockAdapter;
+});
 
-  await import('../src/request');
+describe('refresh rejection recovery', () => {
+  it.each([401, 403, 503])(
+    'settles concurrent requests after refresh status %s, then permits another refresh',
+    async (status) => {
+      setTokenHeader('expired-token');
+      let rejectRefresh: () => void = () => {};
+      let refreshStarted: () => void = () => {};
+      const started = new Promise<void>((resolve) => {
+        refreshStarted = resolve;
+      });
+      mockAdapter.mockImplementation((config) => {
+        if (config.url.includes('/api/auth/refresh')) {
+          refreshStarted();
+          return new Promise((_resolve, reject) => {
+            rejectRefresh = () => reject({ response: { status }, config });
+          });
+        }
+        return Promise.reject({ response: { status: 401 }, config });
+      });
+
+      const requests = Promise.allSettled([axios.get('/api/messages'), axios.get('/api/user')]);
+      await started;
+      rejectRefresh();
+      const result = await Promise.race([
+        requests,
+        new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 200)),
+      ]);
+      expect(result).not.toBe('hung');
+      expect(result).toMatchObject([
+        { status: 'rejected', reason: { response: { status } } },
+        { status: 'rejected', reason: { response: { status } } },
+      ]);
+      expect(
+        mockAdapter.mock.calls.filter(([config]) => config.url.includes('/api/auth/refresh')),
+      ).toHaveLength(1);
+
+      mockAdapter.mockImplementation((config) => {
+        if (config.url.includes('/api/auth/refresh')) {
+          return Promise.resolve({ data: { token: 'reconnected-token' }, status: 200, config });
+        }
+        if (config._retry) {
+          return Promise.resolve({ data: { messages: [] }, status: 200, config });
+        }
+        return Promise.reject({ response: { status: 401 }, config });
+      });
+      await expect(axios.get('/api/messages')).resolves.toMatchObject({ data: { messages: [] } });
+    },
+  );
+
+  it('does not recursively refresh a rejected initial session check', async () => {
+    setTokenHeader('expired-token');
+    mockAdapter.mockImplementation((config) =>
+      Promise.reject({ response: { status: 401 }, config }),
+    );
+    await expect(axios.post('/api/auth/refresh')).rejects.toMatchObject({
+      response: { status: 401 },
+    });
+    expect(mockAdapter).toHaveBeenCalledTimes(1);
+  });
+
+  it('settles concurrent requests after a refresh timeout and permits another refresh', async () => {
+    setTokenHeader('expired-token');
+    let rejectRefresh: () => void = () => {};
+    let refreshStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      refreshStarted = resolve;
+    });
+    mockAdapter.mockImplementation((config) => {
+      if (config.url.includes('/api/auth/refresh')) {
+        refreshStarted();
+        return new Promise((_resolve, reject) => {
+          rejectRefresh = () =>
+            reject(new AxiosError('timeout of 15000ms exceeded', 'ECONNABORTED', config));
+        });
+      }
+      return Promise.reject({ response: { status: 401 }, config });
+    });
+
+    const requests = Promise.allSettled([axios.get('/api/messages'), axios.get('/api/user')]);
+    await started;
+    rejectRefresh();
+    await expect(requests).resolves.toMatchObject([
+      { status: 'rejected', reason: { code: 'ECONNABORTED' } },
+      { status: 'rejected', reason: { code: 'ECONNABORTED' } },
+    ]);
+    expect(
+      mockAdapter.mock.calls.filter(([config]) => config.url.includes('/api/auth/refresh')),
+    ).toHaveLength(1);
+
+    mockAdapter.mockImplementation((config) => {
+      if (config.url.includes('/api/auth/refresh')) {
+        return Promise.resolve({ data: { token: 'reconnected-token' }, status: 200, config });
+      }
+      if (config._retry) {
+        return Promise.resolve({ data: { messages: [] }, status: 200, config });
+      }
+      return Promise.reject({ response: { status: 401 }, config });
+    });
+    await expect(axios.get('/api/messages')).resolves.toMatchObject({ data: { messages: [] } });
+  });
+
+  it('keeps the refresh deadline local to refresh requests', async () => {
+    const defaultTimeout = axios.defaults.timeout;
+    mockAdapter.mockImplementation((config) =>
+      Promise.resolve({ data: { token: 'valid-token' }, status: 200, config }),
+    );
+
+    await request.refreshToken();
+    await request.refreshToken(true);
+    await request.post('/api/agents/chat', { text: 'A long request' });
+    expect(mockAdapter.mock.calls.map(([config]) => config.timeout)).toEqual([
+      15_000,
+      15_000,
+      defaultTimeout,
+    ]);
+    expect(axios.defaults.timeout).toBe(defaultTimeout);
+  });
 });
 
 beforeEach(() => {

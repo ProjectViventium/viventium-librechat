@@ -81,6 +81,7 @@ interface GlassHiveAccountApiResult {
   workerId?: string;
   runId?: string;
   state?: string;
+  callbackDeliveries?: RuntimeRecord[];
 }
 
 interface PromptLayerIntegritySnapshot {
@@ -109,6 +110,7 @@ interface OrchestrationTraceWriteInput {
 
 interface OrchestrationTraceWriteResult {
   accepted?: boolean;
+  errors?: ReadonlyArray<string>;
 }
 
 interface WorkStateReconciliationInput {
@@ -163,6 +165,7 @@ export interface GlassHiveLaunchRequestBody {
 }
 
 export interface GlassHiveLaunchRegistrationInput {
+  signal?: AbortSignal;
   user?: { id?: string; _id?: object | string };
   requestBody?: GlassHiveLaunchRequestBody;
   toolName?: string;
@@ -334,6 +337,7 @@ export interface GlassHiveCallbackBindingService {
     errorCode?: string;
     effectSession?: ClientSession;
   }) => Promise<object | null>;
+  reconcileGlassHiveSurfaceDeliveryOutcome: (input: { originRef: string }) => Promise<object | null>;
   recordGlassHiveSurfaceDeliveryOutcome: (input?: {
     originRef?: string;
     state?: 'enqueued' | 'sent' | 'failed' | 'suppressed' | 'unresolved' | 'unknown';
@@ -1195,6 +1199,7 @@ async function registerGlassHiveLaunchContext({
   toolName = '',
   toolArguments = {},
   toolCall = {},
+  signal,
 }: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
   const ownerId = normalizeText(user?.id || user?._id);
   const conversationId = normalizeText(requestBody.conversationId || requestBody.conversation_id);
@@ -1253,6 +1258,9 @@ async function registerGlassHiveLaunchContext({
     requestBody.viventiumSchedulerExternalWorkRequired === true;
   const now = new Date();
   const preparationExpiresAt = new Date(now.getTime() + launchPreparationLeaseMs());
+  // VIVENTIUM START: Anchor resolution may outlive the exact authoring request.
+  signal?.throwIfAborted();
+  // VIVENTIUM END
   await callbackBindingCollection().updateOne(
     { _id: bindingId },
     {
@@ -2049,6 +2057,119 @@ async function hasAcceptedGlassHiveLaunchForPresentation({
   return Boolean(binding?._id);
 }
 
+/** Recover a confirmed Stop notification through the existing verified producer trace. */
+async function recoverRetainedStopCallback(row: RuntimeRecord): Promise<void> {
+  const ownerId = normalizeText(row.ownerId, 160);
+  const originRef = normalizeText(row.originRef || row._id, 160);
+  const workRef = normalizeText(row.workRef, 160);
+  const runId = normalizeText(row.runId, 160);
+  const workerId = normalizeText(row.workerId, 160);
+  if (row.externalState !== 'cancelled' || !workerId) return;
+  const detail = await requestAccountApi({
+    ownerId, path: `/v1/work/${encodeURIComponent(workRef)}`, timeoutMs: 3000,
+  });
+  if (detail?.workRef !== workRef || detail?.state !== 'cancelled') return;
+  const ingestion = await recordGlassHiveWorkDetailTrace({
+    ownerId, originRef, workRef, runRef: runId, detail,
+  });
+  if (ingestion?.accepted !== true) return;
+  const latest = new Map<string, RuntimeRecord>();
+  for (const delivery of Array.isArray(detail.callbackDeliveries) ? detail.callbackDeliveries : []) {
+    const ref = normalizeText(delivery?.callbackRef, 100);
+    if (!/^callback_sha256:[a-f0-9]{64}$/.test(ref)) continue;
+    if (Number(delivery.callbackRevision) > Number(latest.get(ref)?.callbackRevision || 0)) {
+      latest.set(ref, delivery);
+    }
+  }
+  const retained = [...latest.values()].find((delivery) =>
+    delivery.event === 'run.cancelled' && delivery.status === 'dead_lettered' &&
+    delivery.resultRevision === 0 && !delivery.resultDigest &&
+    /^sha256:[a-f0-9]{64}$/.test(String(delivery.payloadSha256 || '')) &&
+    /^sha256:[a-f0-9]{64}$/.test(String(delivery.authoritySha256 || '')),
+  );
+  if (!retained) return;
+  await requestAccountApi({
+    ownerId, path: '/v1/callback-associations/recover', method: 'POST', timeoutMs: 3000,
+    body: {
+      originRef, workRef, workerId, runId,
+      callbackRef: retained.callbackRef,
+      payloadSha256: retained.payloadSha256,
+      authoritySha256: retained.authoritySha256,
+    },
+  });
+  await externalWorkCollection().updateOne({ ownerId, originRef, workRef, runId }, {
+    $set: { stateReconciliationNextAt: new Date(Date.now() + 60_000) },
+  });
+}
+
+/** Request the sender's retained result only after Core accepted that exact authenticated identity. */
+async function recoverAcceptedTerminalResult(row: RuntimeRecord): Promise<void> {
+  const scope = {
+    ownerId: normalizeText(row.ownerId, 160),
+    originRef: normalizeText(row.originRef || row._id, 160),
+    workRef: normalizeText(row.workRef, 160),
+    runId: normalizeText(row.runId, 160),
+  };
+  if (Object.values(scope).some((value) => !value)) return;
+  const accepted = await mongoose.connection
+    .collection('viventium_glasshive_callback_results')
+    .findOne(scope, {
+      projection: {
+        workerId: 1,
+        callbackId: 1,
+        resultRevision: 1,
+        resultDigest: 1,
+        acceptedOperationId: 1,
+      },
+    });
+  if (!accepted) {
+    await recoverRetainedStopCallback(row);
+    return;
+  }
+  if (
+    !accepted?.workerId ||
+    !accepted.acceptedOperationId ||
+    !/^cb_terminal_[a-f0-9]{64}$/.test(String(accepted.callbackId || '')) ||
+    !/^sha256:[a-f0-9]{64}$/.test(String(accepted.resultDigest || '')) ||
+    !Number.isSafeInteger(accepted.resultRevision) ||
+    accepted.resultRevision < 1
+  )
+    return;
+  const evidence = await mongoose.connection
+    .collection('viventium_glasshive_mission_evidence')
+    .findOne(
+      {
+        ...scope,
+        terminalCallbackId: accepted.callbackId,
+        terminalCallbackResultDigest: accepted.resultDigest,
+        terminalCallbackResultRevision: accepted.resultRevision,
+        terminalCallbackAcceptedOperationId: accepted.acceptedOperationId,
+      },
+      { projection: { _id: 1 } },
+    );
+  if (evidence) return;
+  await requestAccountApi({
+    ownerId: scope.ownerId,
+    path: '/v1/callback-associations/recover',
+    method: 'POST',
+    body: {
+      originRef: scope.originRef,
+      workRef: scope.workRef,
+      runId: scope.runId,
+      workerId: accepted.workerId,
+      callbackId: accepted.callbackId,
+      resultRevision: accepted.resultRevision,
+      resultDigest: accepted.resultDigest,
+    },
+    timeoutMs: 3000,
+  });
+  await externalWorkCollection().updateOne(scope, {
+    $set: {
+      stateReconciliationNextAt: new Date(Date.now() + 60_000),
+    },
+  });
+}
+
 /**
  * Re-seed the conservative per-account hint after a Core restart or schema migration. Never clear
  * here: only a fresh authoritative GlassHive empty roster may prove that an account has no work.
@@ -2114,7 +2235,10 @@ async function reconcileKnownExternalWorkHints(
         normalizeText(row?.workRef, 160) &&
         normalizeText(row?.runId, 160) &&
         ['accepted', 'callback_confirmed'].includes(normalizeText(row?.launchState, 32)) &&
-        !TERMINAL_STATES.includes(normalizeText(row?.externalState, 32)) &&
+        (!TERMINAL_STATES.includes(normalizeText(row?.externalState, 32)) ||
+          ['pending', 'enqueued', 'failed', 'unresolved', 'unknown'].includes(
+            normalizeText(row?.deliveryState, 32),
+          )) &&
         (!Number.isFinite(nextAttemptAt) || nextAttemptAt <= now),
       );
     })
@@ -2124,6 +2248,10 @@ async function reconcileKnownExternalWorkHints(
       const ownerId = normalizeText(row.ownerId, 160);
       const workRef = normalizeText(row.workRef, 160);
       try {
+        if (TERMINAL_STATES.includes(normalizeText(row.externalState, 32))) {
+          await recoverAcceptedTerminalResult(row);
+          return;
+        }
         const detail = await requestAccountApi({
           ownerId,
           path: `/v1/work/${encodeURIComponent(workRef)}`,
@@ -2304,39 +2432,50 @@ async function recordGlassHiveCallbackExternalState({
     ? callbackTraceIdentity(body, binding.traceIdentity)
     : null;
   if (traceIdentity && callbackAt && originRef && workRef && runId) {
-    const workState = canonicalGlassHiveWorkState(body) || state;
-    if (TERMINAL_STATES.includes(workState) && isGlassHiveWorkTerminalCallback(body)) {
-      const detail = await requestAccountApi({
-        ownerId: normalizeText(binding.ownerId, 160),
-        path: `/v1/work/${encodeURIComponent(workRef)}`,
-        timeoutMs: 3000,
-      });
-      const ingestion = await recordGlassHiveWorkDetailTrace({
+    // Callback authority and destination fencing are independent of the
+    // diagnostic producer trace. A trace gap must not strand an authorized result.
+    try {
+      const workState = canonicalGlassHiveWorkState(body) || state;
+      if (TERMINAL_STATES.includes(workState) && isGlassHiveWorkTerminalCallback(body)) {
+        const detail = await requestAccountApi({
+          ownerId: normalizeText(binding.ownerId, 160),
+          path: `/v1/work/${encodeURIComponent(workRef)}`,
+          timeoutMs: 3000,
+        });
+        const ingestion = await recordGlassHiveWorkDetailTrace({
+          ownerId: normalizeText(binding.ownerId, 160),
+          originRef,
+          workRef,
+          runRef: runId,
+          detail,
+        });
+        if (ingestion?.accepted !== true) {
+          throw Object.assign(new Error('glasshive_trace_producer_detail_rejected'), {
+            code: 'glasshive_trace_producer_detail_rejected',
+            traceErrors: ingestion?.errors || [],
+          });
+        }
+      }
+      await recordOrchestrationTraceCallback({
         ownerId: normalizeText(binding.ownerId, 160),
         originRef,
         workRef,
-        runRef: runId,
-        detail,
+        runRef: normalizeText(body.run_id, 160),
+        callbackRef: traceIdentity.callbackRef,
+        event: normalizeText(body.event, 64),
+        workState,
+        workTerminal: isGlassHiveWorkTerminalCallback(body),
+        callbackAt,
+        callbackAcceptedAt,
+        attemptNumber: traceIdentity.attemptNumber,
       });
-      if (ingestion?.accepted !== true) {
-        throw Object.assign(new Error('glasshive_trace_producer_detail_rejected'), {
-          code: 'glasshive_trace_producer_detail_rejected',
-        });
-      }
+    } catch (error) {
+      const traceError = error as Error & { code?: string; traceErrors?: unknown };
+      const codes = Array.isArray(traceError.traceErrors) ? traceError.traceErrors : [traceError.code];
+      logger.warn('[VIVENTIUM][glasshive-binding] Callback trace incomplete', {
+        codes: codes.filter((code) => typeof code === 'string' && /^[a-z0-9_]{1,120}$/.test(code)).slice(0, 16),
+      });
     }
-    await recordOrchestrationTraceCallback({
-      ownerId: normalizeText(binding.ownerId, 160),
-      originRef,
-      workRef,
-      runRef: normalizeText(body.run_id, 160),
-      callbackRef: traceIdentity.callbackRef,
-      event: normalizeText(body.event, 64),
-      workState,
-      workTerminal: isGlassHiveWorkTerminalCallback(body),
-      callbackAt,
-      callbackAcceptedAt,
-      attemptNumber: traceIdentity.attemptNumber,
-    });
   }
   const collection = externalWorkCollection();
   const work = originRef
@@ -2459,6 +2598,52 @@ async function recordGlassHiveAdjudicationOutcome({
     : settledResult || null;
 }
 
+async function reconcileGlassHiveSurfaceDeliveryOutcome({ originRef }: { originRef: string }): Promise<RuntimeRecord | null> {
+  const ref = normalizeText(originRef, 160);
+  if (!ref) return null;
+  const current = await externalWorkCollection().findOne({ _id: ref });
+  if (!current?.ownerId || !current.workRef) return null;
+  const runId = normalizeText(current.terminalCallbackRunId || current.runId, 160);
+  if (!runId) return null;
+  const deliveryFilter: RuntimeRecord = {
+    originRef: ref, userId: current.ownerId, workRef: current.workRef, runId,
+  };
+  const snapshotFilter: RuntimeRecord = { _id: ref, ownerId: current.ownerId, workRef: current.workRef };
+  // Read only receipts for the aggregate's current result identity. Match the
+  // same snapshot at write time so a correction that advances during this read wins.
+  for (const key of [
+    'runId', 'updatedAt', 'terminalCallbackRunId', 'terminalCallbackResultEndedAt',
+    'terminalCallbackId', 'terminalCallbackResultDigest', 'terminalCallbackResultRevision',
+    'terminalCallbackAcceptedOperationId', 'terminalCallbackEffectLeaseGeneration',
+  ]) snapshotFilter[key] = Object.prototype.hasOwnProperty.call(current, key) ? current[key] : { $exists: false };
+  for (const key of [
+    'terminalCallbackId', 'terminalCallbackResultDigest', 'terminalCallbackResultRevision',
+    'terminalCallbackAcceptedOperationId',
+  ]) {
+    if (current[key] != null) deliveryFilter[key] = current[key];
+  }
+  const rows = await mongoose.connection.collection('viventiumglasshivecallbackdeliveries')
+    .find(deliveryFilter, { projection: { status: 1 } }).toArray();
+  const statuses = new Set(rows.map((row) => row.status));
+  const state = statuses.has('delivery_unknown') ? 'unknown'
+    : statuses.has('unresolved') ? 'unresolved'
+    : statuses.has('failed') ? 'failed'
+    : statuses.has('pending') || statuses.has('claimed') ? 'enqueued'
+    : statuses.has('sent') ? 'sent'
+    : statuses.has('suppressed') ? 'suppressed' : '';
+  // Historical receipts do not invent a status for a current run with no receipts yet.
+  if (!state) return current;
+  const updated = await externalWorkCollection().findOneAndUpdate(snapshotFilter, {
+    $set: { deliveryState: state, attentionPending: ['failed', 'unresolved', 'unknown'].includes(state),
+      deliveryUpdatedAt: new Date(), updatedAt: new Date() },
+  }, { returnDocument: 'after' });
+  const document = updated && Object.prototype.hasOwnProperty.call(updated, 'value') ? updated.value : updated;
+  if (!document) throw Object.assign(new Error('glasshive_delivery_projection_snapshot_changed'), {
+    code: 'glasshive_delivery_projection_snapshot_changed',
+  });
+  return document;
+}
+
 async function recordGlassHiveSurfaceDeliveryOutcome({
   originRef,
   state,
@@ -2480,8 +2665,7 @@ async function recordGlassHiveSurfaceDeliveryOutcome({
     _id: ref,
     ...(deliveryState === 'enqueued' ? { deliveryState: { $nin: PROTECTED_DELIVERY_STATES } } : {}),
   };
-  const result = requireFencedDestinationDocument(
-    await externalWorkCollection().findOneAndUpdate(
+  const updated = await externalWorkCollection().findOneAndUpdate(
       terminalCallbackDestinationFilter(projectionFilter, fence),
       {
         $set: {
@@ -2496,9 +2680,37 @@ async function recordGlassHiveSurfaceDeliveryOutcome({
         returnDocument: 'after',
         ...(effectSession ? { session: effectSession } : {}),
       },
-    ),
-    fence,
-  );
+    );
+  const document = updated && Object.prototype.hasOwnProperty.call(updated, 'value')
+    ? updated.value : updated;
+  if (!document && fence && deliveryState === 'sent' && effectSession?.inTransaction()) {
+    // An earlier run can finish delivering after a correction has already
+    // become the aggregate status owner. Keep its exact delivery receipt, but
+    // do not overwrite the newer run's status or bypass accepted-result authority.
+    const newer = await externalWorkCollection().findOne({
+      _id: ref,
+      terminalCallbackRunId: { $exists: true, $nin: ['', fence.runId] },
+      terminalCallbackResultEndedAt: { $gt: fence.resultEndedAt },
+    }, { session: effectSession });
+    if (newer) {
+      const accepted = await mongoose.connection.collection('viventium_glasshive_callback_results').findOne({
+        _id: fence.resultKey, ownerId: newer.ownerId, originRef: ref,
+        workRef: newer.workRef, runId: fence.runId,
+        acceptedOperationId: fence.acceptedOperationId,
+        acceptedOperationGeneration: fence.generation,
+        callbackId: fence.callbackId, resultDigest: fence.resultDigest,
+        resultRevision: fence.resultRevision,
+        effectLeaseId: fence.leaseId, effectLeaseGeneration: fence.leaseGeneration,
+        effectLeaseExpiresAt: { $gt: new Date() },
+      }, { session: effectSession });
+      if (accepted) {
+        logger.info('[VIVENTIUM][glasshive-delivery] Retained historical delivery; newer aggregate status preserved');
+        return newer;
+      }
+    }
+  }
+  const result = requireFencedDestinationDocument(updated, fence);
+
   return result?.value || result || null;
 }
 
@@ -2604,6 +2816,7 @@ const service: GlassHiveCallbackBindingService = {
     )) as GlassHiveReconciliationSummary,
   recordGlassHiveAdjudicationOutcome: async (input = {}) =>
     recordGlassHiveAdjudicationOutcome(input as RuntimeRecord),
+  reconcileGlassHiveSurfaceDeliveryOutcome,
   recordGlassHiveSurfaceDeliveryOutcome: async (input = {}) =>
     recordGlassHiveSurfaceDeliveryOutcome(input as RuntimeRecord),
   recordGlassHiveCallbackExternalState: async (input = {}) =>

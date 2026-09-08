@@ -6,6 +6,10 @@ const {
   isPassiveVoiceTranscriptMessage,
 } = require('~/server/services/viventium/listenOnlyTranscript');
 
+function pendingTelegramInput(message) {
+  return ['preparing', 'ready', 'failed', 'cancelled'].includes(message?.metadata?.viventium?.telegramInput?.state);
+}
+
 function toTimestampMs(value) {
   if (value == null) {
     return NaN;
@@ -45,7 +49,7 @@ function resolveLatestLeafMessageId(messages) {
 
   const hasChildren = new Set();
   for (const message of messages) {
-    if (isPassiveVoiceTranscriptMessage(message)) {
+    if (isPassiveVoiceTranscriptMessage(message) || pendingTelegramInput(message)) {
       continue;
     }
     const parentMessageId = message?.parentMessageId;
@@ -57,7 +61,7 @@ function resolveLatestLeafMessageId(messages) {
   let latestLeaf = null;
   let latestLeafMs = NaN;
   for (const message of messages) {
-    if (isPassiveVoiceTranscriptMessage(message)) {
+    if (isPassiveVoiceTranscriptMessage(message) || pendingTelegramInput(message)) {
       continue;
     }
     const messageId = message?.messageId ?? message?.id;
@@ -96,7 +100,7 @@ function resolveLatestLeafMessageId(messages) {
 
   const fallback = [...messages]
     .reverse()
-    .find((message) => !isPassiveVoiceTranscriptMessage(message));
+    .find((message) => !isPassiveVoiceTranscriptMessage(message) && !pendingTelegramInput(message));
   return fallback?.messageId ?? fallback?.id ?? null;
 }
 
@@ -182,7 +186,7 @@ async function resolveReusableConversationState({
     messages =
       (await getMessages(
         { conversationId },
-        'messageId parentMessageId createdAt metadata.viventium.type metadata.viventium.mode metadata.viventium.actorTrust',
+        'messageId parentMessageId createdAt metadata.viventium.type metadata.viventium.mode metadata.viventium.actorTrust metadata.viventium.telegramInput.state',
       )) ?? [];
   } catch (err) {
     logger.warn(

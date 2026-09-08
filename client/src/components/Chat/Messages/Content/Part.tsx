@@ -42,10 +42,19 @@ type PartProps = {
   showCursor: boolean;
   isCreatedByUser: boolean;
   attachments?: TAttachment[];
+  harnessActivityGrouped?: boolean;
 };
 
 const Part = memo(
-  ({ part, isSubmitting, attachments, isLast, showCursor, isCreatedByUser }: PartProps) => {
+  ({
+    part,
+    isSubmitting,
+    attachments,
+    isLast,
+    showCursor,
+    isCreatedByUser,
+    harnessActivityGrouped,
+  }: PartProps) => {
     if (!part) {
       return null;
     }
@@ -103,7 +112,13 @@ const Part = memo(
       if (!activity?.summary) {
         return null;
       }
-      return <HarnessActivity summary={activity.summary} isSubmitting={isSubmitting} />;
+      return (
+        <HarnessActivity
+          summary={activity.summary}
+          isSubmitting={isSubmitting}
+          grouped={harnessActivityGrouped}
+        />
+      );
     } else if (part.type === ContentTypes.TOOL_CALL) {
       const toolCall = part[ContentTypes.TOOL_CALL];
 

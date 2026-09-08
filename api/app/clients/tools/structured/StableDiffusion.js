@@ -74,11 +74,10 @@ class StableDiffusionAPI extends Tool {
   }
 
   getMarkdownImageUrl(imageName) {
-    const imageUrl = path
-      .join(this.relativePath, this.userId, imageName)
-      .replace(/\\/g, '/')
-      .replace('public/', '');
-    return `![generated image](/${imageUrl})`;
+    /* === VIVENTIUM START: Browser URLs must not depend on the installation's disk layout. === */
+    const imageUrl = path.posix.join('/images', this.userId, imageName);
+    return `![generated image](${imageUrl})`;
+    /* === VIVENTIUM END === */
   }
 
   returnValue(value) {
@@ -129,9 +128,8 @@ class StableDiffusionAPI extends Tool {
 
     const file_id = uuidv4();
     const imageName = `${file_id}.png`;
-    const { imageOutput: imageOutputPath, clientPath } = paths;
+    const { imageOutput: imageOutputPath } = paths;
     const filepath = path.join(imageOutputPath, this.userId, imageName);
-    this.relativePath = path.relative(clientPath, imageOutputPath);
 
     if (!fs.existsSync(path.join(imageOutputPath, this.userId))) {
       fs.mkdirSync(path.join(imageOutputPath, this.userId), { recursive: true });

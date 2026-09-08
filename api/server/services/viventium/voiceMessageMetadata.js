@@ -65,6 +65,7 @@ function attachVoiceMessageMetadata(req, message) {
         inputMode: inputMode || 'voice_call',
         mode,
         speakerSegments,
+        ...(req.viventiumVoiceTypedInput ? { typedInput: req.viventiumVoiceTypedInput } : {}),
         ...(speakerLabel ? { speakerLabel } : {}),
         actorTrust,
         memoryDeferredPostCall: req?.body?.viventiumDeferVoiceMemory === true,

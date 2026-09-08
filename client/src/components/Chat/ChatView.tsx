@@ -19,6 +19,7 @@ import {
   useChatHelpers,
   useCortexFollowUpPoll,
 } from '~/hooks';
+import { useActiveWorkQuery } from '~/data-provider/ViventiumOrchestration';
 /* === VIVENTIUM END === */
 import ConversationStarters from './Input/ConversationStarters';
 import { useGetMessagesByConvoId } from '~/data-provider';
@@ -47,6 +48,7 @@ function ChatView({ index = 0 }: { index?: number }) {
   const centerFormOnLanding = useRecoilValue(store.centerFormOnLanding);
 
   const fileMap = useFileMapContext();
+  const chatHelpers = useChatHelpers(index, conversationId);
 
   const { data: messagesTree = null, isLoading } = useGetMessagesByConvoId(conversationId ?? '', {
     select: useCallback(
@@ -56,10 +58,18 @@ function ChatView({ index = 0 }: { index?: number }) {
       },
       [fileMap],
     ),
-    enabled: !!fileMap,
+    enabled: Boolean(fileMap && conversationId && conversationId !== Constants.NEW_CONVO),
+    /* === VIVENTIUM START ===
+     * Scheduled and other-channel messages can arrive after all local work has settled.
+     * Reuse the visible page's message query; active streams retain their existing SSE owner.
+     * React Query pauses interval fetches in hidden tabs and deduplicates active refreshes.
+     */
+    refetchInterval: chatHelpers.isSubmitting ? false : 10_000,
+    refetchOnWindowFocus: !chatHelpers.isSubmitting,
+    refetchOnReconnect: !chatHelpers.isSubmitting,
+    /* === VIVENTIUM END === */
   });
 
-  const chatHelpers = useChatHelpers(index, conversationId);
   const addedChatHelpers = useAddedResponse();
 
   useAdaptiveSSE(rootSubmission, chatHelpers, false, index);
@@ -68,15 +78,21 @@ function ChatView({ index = 0 }: { index?: number }) {
    * Purpose: Poll background cortex completion and merge follow-up results post-stream.
    * Details: docs/requirements_and_learnings/05_Open_Source_Modifications.md#librechat-chatview-cortex-followup
    */
+  const activeWorkQuery = useActiveWorkQuery({
+    enabled: Boolean(conversationId && conversationId !== Constants.NEW_CONVO),
+  });
   useCortexFollowUpPoll({
     conversationId,
     getMessages: chatHelpers.getMessages,
     isSubmitting: chatHelpers.isSubmitting,
+    activeWork: activeWorkQuery.data,
   });
   /* VIVENTIUM END */
   // Auto-resume if navigating back to conversation with active job
   // Wait for messages to load before resuming to avoid race condition
-  useResumeOnLoad(conversationId, chatHelpers.getMessages, index, !isLoading);
+  /* === VIVENTIUM START === The existing message query also observes later recovery writes. === */
+  useResumeOnLoad(conversationId, chatHelpers.getMessages(), index, !isLoading);
+  /* === VIVENTIUM END === */
 
   const methods = useForm<ChatFormValues>({
     defaultValues: { text: '' },

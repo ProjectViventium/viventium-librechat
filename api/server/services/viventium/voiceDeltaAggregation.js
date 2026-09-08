@@ -80,6 +80,55 @@ function extractVisibleTextFromContentParts(contentParts) {
     .join('');
 }
 
+function singleUnpartitionedTextPartIndex(contentParts) {
+  if (!Array.isArray(contentParts)) {
+    return -1;
+  }
+  let textPartIndex = -1;
+  for (let index = 0; index < contentParts.length; index += 1) {
+    const part = contentParts[index];
+    if (!part || part.type !== ContentTypes.TEXT) {
+      continue;
+    }
+    if (
+      textPartIndex !== -1 ||
+      typeof part.text !== 'string' ||
+      part.agentId ||
+      part.groupId != null ||
+      part.viventiumSourceStepId ||
+      part.viventiumUnownedVisible === true
+    ) {
+      return -1;
+    }
+    textPartIndex = index;
+  }
+  return textPartIndex;
+}
+
+function adoptableUnpartitionedTextPrefixIndex(contentParts, contentMeta = {}) {
+  const agentId = typeof contentMeta?.agentId === 'string' ? contentMeta.agentId : '';
+  const sourceStepId =
+    typeof contentMeta?.sourceStepId === 'string' ? contentMeta.sourceStepId : '';
+  if (!agentId || contentMeta?.groupId != null || sourceStepId) {
+    return -1;
+  }
+  return singleUnpartitionedTextPartIndex(contentParts);
+}
+
+function adoptSingleUnpartitionedTextPrefix(contentParts, text, contentMeta = {}) {
+  const prefixIndex = adoptableUnpartitionedTextPrefixIndex(contentParts, contentMeta);
+  if (prefixIndex === -1) {
+    return false;
+  }
+  const prefix = contentParts[prefixIndex];
+  contentParts[prefixIndex] = {
+    ...prefix,
+    text: `${prefix.text}${text}`,
+    agentId: contentMeta.agentId,
+  };
+  return true;
+}
+
 function appendTextToContentParts(contentParts, text, contentMeta = {}) {
   if (!Array.isArray(contentParts) || typeof text !== 'string' || !text) {
     return false;
@@ -88,6 +137,9 @@ function appendTextToContentParts(contentParts, text, contentMeta = {}) {
   const groupId = contentMeta?.groupId;
   const sourceStepId =
     typeof contentMeta?.sourceStepId === 'string' ? contentMeta.sourceStepId : '';
+  if (adoptSingleUnpartitionedTextPrefix(contentParts, text, contentMeta)) {
+    return true;
+  }
   if (agentId && sourceStepId) {
     for (let index = contentParts.length - 1; index >= 0; index -= 1) {
       const part = contentParts[index];
@@ -188,7 +240,14 @@ function isTextPartForContentMeta(part, contentMeta = {}) {
     return false;
   }
   const groupId = contentMeta?.groupId;
-  return groupId == null || part.groupId === groupId;
+  if (groupId != null && part.groupId !== groupId) {
+    return false;
+  }
+  const sourceStepId =
+    typeof contentMeta?.sourceStepId === 'string' ? contentMeta.sourceStepId : '';
+  return (
+    !sourceStepId || !part.viventiumSourceStepId || part.viventiumSourceStepId === sourceStepId
+  );
 }
 
 function pinLatestTextPartToSourceStep(contentParts, contentMeta = {}) {
@@ -215,6 +274,47 @@ function pinLatestTextPartToSourceStep(contentParts, contentMeta = {}) {
     return true;
   }
   return false;
+}
+
+function coalesceAdjacentTextPartsForContentMeta(contentParts, contentMeta = {}) {
+  if (!Array.isArray(contentParts)) {
+    return false;
+  }
+  const agentId = typeof contentMeta?.agentId === 'string' ? contentMeta.agentId : '';
+  const sourceStepId =
+    typeof contentMeta?.sourceStepId === 'string' ? contentMeta.sourceStepId : '';
+  if (!agentId || !sourceStepId) {
+    return false;
+  }
+  const groupId = contentMeta?.groupId ?? null;
+  let changed = false;
+  for (let index = 1; index < contentParts.length;) {
+    const previous = contentParts[index - 1];
+    const current = contentParts[index];
+    const samePartition =
+      previous?.type === ContentTypes.TEXT &&
+      current?.type === ContentTypes.TEXT &&
+      previous.agentId === agentId &&
+      current.agentId === agentId &&
+      (previous.groupId ?? null) === groupId &&
+      (current.groupId ?? null) === groupId &&
+      previous.viventiumSourceStepId === sourceStepId &&
+      current.viventiumSourceStepId === sourceStepId &&
+      previous.viventiumUnownedVisible !== true &&
+      current.viventiumUnownedVisible !== true &&
+      typeof previous.text === 'string' &&
+      typeof current.text === 'string';
+    if (!samePartition) {
+      index += 1;
+      continue;
+    }
+    contentParts.splice(index - 1, 2, {
+      ...previous,
+      text: `${previous.text}${current.text}`,
+    });
+    changed = true;
+  }
+  return changed;
 }
 
 function textForContentMeta(contentParts, contentMeta) {
@@ -245,44 +345,6 @@ function otherTextPartitionSignature(contentParts, contentMeta) {
   );
 }
 
-function isNoResponseMarkerProgression(previous, incoming) {
-  const marker = '{NTA}';
-  return (
-    typeof previous === 'string' &&
-    typeof incoming === 'string' &&
-    previous.length > 0 &&
-    incoming.length > previous.length &&
-    marker.startsWith(previous) &&
-    marker.startsWith(incoming)
-  );
-}
-
-function shouldTreatAsCumulativeSnapshot(previous, incoming) {
-  if (
-    typeof previous !== 'string' ||
-    typeof incoming !== 'string' ||
-    !previous ||
-    !incoming ||
-    incoming === previous ||
-    !incoming.startsWith(previous)
-  ) {
-    return false;
-  }
-
-  if (isNoResponseMarkerProgression(previous, incoming)) {
-    return true;
-  }
-
-  const suffix = incoming.slice(previous.length);
-  if (/^[\s.,!?;:)"'\]}]/.test(suffix)) {
-    return true;
-  }
-
-  // Mid-word cumulative snapshots look like `Hel` -> `Hello`. The one prefix-superset
-  // shape we intentionally preserve as incremental is exact doubling, e.g. `ha` + `haha`.
-  return suffix !== previous;
-}
-
 function cloneTextPartWithText(part, text) {
   return {
     ...part,
@@ -290,9 +352,9 @@ function cloneTextPartWithText(part, text) {
   };
 }
 
-function createMessageDeltaBoundaryNormalizer({ mode = 'incremental' } = {}) {
+function createMessageDeltaBoundaryNormalizer({ deltaMode = 'incremental' } = {}) {
   const textByKey = new Map();
-  const normalizedMode = ['auto', 'snapshot'].includes(mode) ? mode : 'incremental';
+  const normalizedMode = deltaMode === 'snapshot' ? 'snapshot' : 'incremental';
 
   const normalizeText = (key, text) => {
     if (normalizedMode === 'incremental' || typeof text !== 'string' || !text) {
@@ -309,12 +371,7 @@ function createMessageDeltaBoundaryNormalizer({ mode = 'incremental' } = {}) {
       return '';
     }
 
-    const isSnapshot =
-      normalizedMode === 'snapshot'
-        ? text.startsWith(previous)
-        : shouldTreatAsCumulativeSnapshot(previous, text);
-
-    if (isSnapshot) {
+    if (text.startsWith(previous)) {
       textByKey.set(key, text);
       return text.slice(previous.length);
     }
@@ -416,8 +473,12 @@ function repairMissedVisibleMessageDelta({
       otherTextPartitionSignature(beforeContentParts, contentMeta) ===
       otherTextPartitionSignature(contentParts, contentMeta);
     if (targetAdvancedExactly && otherPartitionsUnchanged) {
+      if (adoptableUnpartitionedTextPrefixIndex(beforeContentParts, contentMeta) !== -1) {
+        contentParts.splice(0, contentParts.length, ...beforeContentParts);
+        return appendTextToContentParts(contentParts, deltaText, contentMeta);
+      }
       pinLatestTextPartToSourceStep(contentParts, contentMeta);
-      return false;
+      return coalesceAdjacentTextPartsForContentMeta(contentParts, contentMeta);
     }
 
     // A visible parallel delta can arrive before the upstream run-step map is ready, or the raw

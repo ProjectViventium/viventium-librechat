@@ -13,6 +13,7 @@ import SetKeyDialog from './SetKeyDialog';
 
 const mockSaveUserKey = jest.fn();
 const mockShowToast = jest.fn();
+let mockCurrentKeyExpiry: string | undefined;
 
 jest.mock('librechat-data-provider/react-query', () => ({
   useRevokeUserKeyMutation: () => ({ isLoading: false, mutate: jest.fn() }),
@@ -65,15 +66,15 @@ jest.mock('@librechat/client', () => ({
 
 jest.mock('~/hooks', () => ({
   useUserKey: () => ({
-    getExpiry: () => 'never',
+    getExpiry: () => mockCurrentKeyExpiry,
     saveUserKey: (...args: unknown[]) => mockSaveUserKey(...args),
   }),
   useLocalize: () => (key: string) => {
     const copy: Record<string, string> = {
-      com_endpoint_config_key_for: 'Set API Key for',
-      com_endpoint_config_key_encryption: 'Your key will be encrypted and deleted at',
+      com_endpoint_config_key_for: 'API key ·',
+      com_endpoint_config_key_encryption: 'Encrypted. Removed on',
       com_endpoint_config_key_never_expires: 'Your key will never expire',
-      com_ui_submit: 'Submit',
+      com_ui_save: 'Save',
       com_ui_revoke: 'Revoke',
       com_ui_cancel: 'Cancel',
     };
@@ -101,13 +102,15 @@ jest.mock('./OpenAIConfig', () => ({
 describe('SetKeyDialog first-run lifecycle truth', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockCurrentKeyExpiry = undefined;
   });
 
   it('describes the selected 12-hour retention instead of the current saved-key state', () => {
+    mockCurrentKeyExpiry = 'never';
     render(<SetKeyDialog open onOpenChange={jest.fn()} endpoint={EModelEndpoint.openAI} />);
 
     expect(screen.getByRole('combobox')).toHaveTextContent('Expires in 12 hours');
-    expect(screen.getByText(/Your key will be encrypted and deleted at/)).toBeInTheDocument();
+    expect(screen.getByText(/Encrypted\. Removed on/)).toBeInTheDocument();
     expect(screen.queryByText('Your key will never expire')).not.toBeInTheDocument();
   });
 
@@ -118,7 +121,9 @@ describe('SetKeyDialog first-run lifecycle truth', () => {
     );
 
     fireEvent.change(screen.getByLabelText('API key'), { target: { value: 'synthetic-secret' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    expect(screen.queryByRole('button', { name: 'Revoke' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
 
     expect(onOpenChange).toHaveBeenCalledWith(false);
     expect(mockSaveUserKey).not.toHaveBeenCalled();

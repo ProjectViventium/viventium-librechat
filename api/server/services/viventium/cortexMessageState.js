@@ -12,7 +12,8 @@
 
 const { ContentTypes } = require('librechat-data-provider');
 const { logger } = require('@librechat/data-schemas');
-const { getMessage, getMessages } = require('~/models');
+const { memoryReceiptFromAttachments } = require('./memoryReceipt');
+const { getMessages } = require('~/models');
 const { getAgent } = require('~/models/Agent');
 const {
   sanitizeFollowUpDisplayText,
@@ -292,6 +293,15 @@ async function getFollowUpMessageForParent({ userId, conversationId, parentMessa
   };
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Durable saved-memory receipt projection.
+ * Purpose: The detached memory writer persists its structured artifact on the response message
+ * after the stream closed. Every polling surface (Telegram, gateway, scheduler) reads the same
+ * receipt here, so a save is acknowledged only by durable truth: saved keys, a typed failure, or
+ * a partial apply. Private memory values and raw provider text are never projected: only key
+ * names and the typed error class cross this boundary.
+ * === VIVENTIUM END === */
+
 async function getCortexMessageState({ userId, messageId, conversationId, scheduleId = '' }) {
   if (typeof userId !== 'string' || userId.length === 0) {
     throw new Error('getCortexMessageState requires userId');
@@ -300,7 +310,12 @@ async function getCortexMessageState({ userId, messageId, conversationId, schedu
     throw new Error('getCortexMessageState requires messageId');
   }
 
-  const message = await getMessage({ user: userId, messageId });
+  // Status and receipts must share one snapshot; a terminal status paired with older attachments
+  // could silently discard a saved receipt or misreport an uncertain write as unapplied.
+  const [message] = await getMessages(
+    { user: userId, messageId },
+    'messageId conversationId text content metadata agent_id model unfinished attachments savedMemoryWrite.status',
+  );
   if (!message) {
     return null;
   }
@@ -314,6 +329,7 @@ async function getCortexMessageState({ userId, messageId, conversationId, schedu
    * Feature: Durable cortex insight delivery state projection.
    * Purpose: Every polling surface sees the same owner-scoped persistence outcome.
    * === VIVENTIUM END === */
+  const memoryWriteStatus = message.savedMemoryWrite?.status;
   const [resolvedFollowUp, insightDeliveries] = await Promise.all([
     getFollowUpMessageForParent({
       userId,
@@ -364,10 +380,17 @@ async function getCortexMessageState({ userId, messageId, conversationId, schedu
     canonicalText,
     canonicalTextSource: canonicalState.canonicalTextSource,
     canonicalTextFallbackReason: canonicalState.canonicalTextFallbackReason,
+    memoryReceipt: memoryReceiptFromAttachments(message.attachments) || (
+      memoryWriteStatus === 'completed' ? { status: 'unchanged', keys: [] }
+        : ['pending', 'running'].includes(memoryWriteStatus) ? { status: 'pending', keys: [] }
+          : memoryWriteStatus === 'failed' ? { status: 'failed', keys: [], errorType: 'writer_interrupted' }
+            : null
+    ),
   };
 }
 
 module.exports = {
+  memoryReceiptFromAttachments,
   extractCanonicalMessageText,
   extractCortexParts,
   getCortexMessageState,

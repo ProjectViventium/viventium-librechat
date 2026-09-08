@@ -66,11 +66,20 @@ type AllContentTypes =
   | ContentTypes.ERROR;
 
 export default function useStepHandler({
-  setMessages,
+  setMessages: setMessageState,
   getMessages,
   announcePolite,
   lastAnnouncementTimeRef,
 }: TUseStepHandler) {
+  // Graph activity updates share the existing message presentation, while FINAL replaces it.
+  const setMessages = useCallback((messages: TMessage[]) => {
+    const previews = new Map((getMessages() ?? []).map((message) => [message.messageId,
+      (message as TMessage & { __viventiumAssistantPreview?: string }).__viventiumAssistantPreview]));
+    setMessageState(messages.map((message) => {
+      const preview = previews.get(message.messageId);
+      return preview == null ? message : { ...message, __viventiumAssistantPreview: preview };
+    }));
+  }, [getMessages, setMessageState]);
   const toolCallIdMap = useRef(new Map<string, string | undefined>());
   const messageMap = useRef(new Map<string, TMessage>());
   const stepMap = useRef(new Map<string, Agents.RunStep>());
@@ -182,13 +191,30 @@ export default function useStepHandler({
       contentPart.harness_activity
     ) {
       const currentContent = updatedContent[index] as HarnessActivityDeltaUpdate | undefined;
-      const incoming = contentPart.harness_activity as { event?: string; summary?: string };
-      const previous = currentContent?.harness_activity?.summary ?? '';
+      const incoming = contentPart.harness_activity as {
+        event?: string;
+        summary?: string;
+        tool?: string;
+        task?: string;
+        status?: string;
+      };
+      const previousActivity = currentContent?.harness_activity as
+        | { summary?: string; tool?: string; task?: string; status?: string }
+        | undefined;
+      const previous = previousActivity?.summary ?? '';
+      // Typed activity identity (tool/task/status) arrives with the delta that names it; keep it
+      // on the part so the live message can be acted on the same way as the persisted one.
+      const typedFields = Object.fromEntries(
+        (['tool', 'task', 'status'] as const)
+          .map((key) => [key, incoming[key] ?? previousActivity?.[key]])
+          .filter(([, value]) => typeof value === 'string' && value.length > 0),
+      );
       updatedContent[index] = {
         type: ContentTypes.HARNESS_ACTIVITY,
         harness_activity: {
           event: incoming.event ?? 'reasoning-summary',
           summary: previous + (incoming.summary ?? ''),
+          ...typedFields,
         },
       } as TMessageContentParts;
     } else if (contentType === ContentTypes.IMAGE_URL && 'image_url' in contentPart) {

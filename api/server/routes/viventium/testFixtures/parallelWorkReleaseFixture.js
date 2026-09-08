@@ -1038,7 +1038,7 @@ function createParallelWorkReleaseFixture(prefix) {
       release_ready: true,
       exposure_allowed: true,
       local_qa_override: false,
-      source_defaults_dark: true,
+      source_defaults_valid: true,
       gate_count: validGates().length,
       open_gate_count: 0,
       gates: validGates(),

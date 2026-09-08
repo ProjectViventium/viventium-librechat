@@ -81,14 +81,12 @@ export default function useSideNavLinks({
    * Purpose: A disabled admission gate must not hide work that already exists. Once revealed,
    * retain the entry for this mounted session so dismissing the final item does not move the nav.
    */
-  const parallelWorkAvailable =
-    (startupConfig as { viventiumParallelWorkAvailable?: boolean } | undefined)
-      ?.viventiumParallelWorkAvailable === true;
-  const orchestrationPreference = useOrchestrationPreferenceQuery({
-    enabled: !parallelWorkAvailable,
-  });
+  const orchestrationPreference = useOrchestrationPreferenceQuery();
   const activeWorkWasVisible = useRef(false);
-  if (parallelWorkAvailable || orchestrationPreference.data?.hasKnownWork === true) {
+  if (
+    (!orchestrationPreference.isError && orchestrationPreference.data?.available === true) ||
+    orchestrationPreference.data?.hasKnownWork === true
+  ) {
     activeWorkWasVisible.current = true;
   }
   const showActiveWork = activeWorkWasVisible.current;

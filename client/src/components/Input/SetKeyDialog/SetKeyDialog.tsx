@@ -130,7 +130,7 @@ const RevokeKeysButton = ({
             <OGDialogTitle>
               {localize(
                 disconnectOnly ? 'com_ui_disconnect_key_endpoint' : 'com_ui_revoke_key_endpoint',
-                { 0: endpoint },
+                { 0: alternateName[endpoint] ?? endpoint },
               )}
             </OGDialogTitle>
           </OGDialogHeader>
@@ -198,6 +198,7 @@ const SetKeyDialog = ({
   const { getExpiry, saveUserKey } = useUserKey(endpoint);
   const { showToast } = useToastContext();
   const localize = useLocalize();
+  const descriptionId = React.useId();
 
   const expirationOptions = Object.values(EXPIRY);
   const selectedExpiration = expirationOptions.find((option) => option.label === expiresAtLabel);
@@ -335,14 +336,14 @@ const SetKeyDialog = ({
 
   return (
     <OGDialog open={open} onOpenChange={handleDialogOpenChange}>
-      <OGDialogContent className="w-11/12 max-w-2xl">
+      <OGDialogContent className="w-11/12 max-w-2xl" aria-describedby={descriptionId}>
         <OGDialogHeader>
           <OGDialogTitle>
             {`${localize('com_endpoint_config_key_for')} ${alternateName[endpoint] ?? endpoint}`}
           </OGDialogTitle>
         </OGDialogHeader>
         <div className="grid w-full items-center gap-2 py-4">
-          <small className="text-red-600">
+          <small id={descriptionId} className="text-text-secondary">
             {/* === VIVENTIUM START ===
              * UX truth: describe the retention policy being selected for this new key, not the
              * unrelated lifecycle of a currently saved key.
@@ -371,14 +372,20 @@ const SetKeyDialog = ({
           <HelpText endpoint={endpoint} />
         </div>
         <OGDialogFooter>
-          <RevokeKeysButton
-            endpoint={endpoint}
-            disabled={!(currentKeyExpiry ?? '')}
-            setDialogOpen={handleDialogOpenChange}
-            removalMode={removalMode}
-          />
+          {currentKeyExpiry ? (
+            <RevokeKeysButton
+              endpoint={endpoint}
+              disabled={false}
+              setDialogOpen={handleDialogOpenChange}
+              removalMode={removalMode}
+            />
+          ) : (
+            <Button variant="outline" onClick={() => handleDialogOpenChange(false)}>
+              {localize('com_ui_cancel')}
+            </Button>
+          )}
           <Button variant="submit" onClick={() => void submit()}>
-            {localize('com_ui_submit')}
+            {localize('com_ui_save')}
           </Button>
         </OGDialogFooter>
       </OGDialogContent>

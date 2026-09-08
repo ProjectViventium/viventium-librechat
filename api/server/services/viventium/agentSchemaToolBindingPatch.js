@@ -213,6 +213,12 @@ function installScopedFallbackRouteAccessors(agentContext) {
     if (descriptor?.configurable === false) {
       return false;
     }
+    let propertyOwner = agentContext;
+    let baseDescriptor = descriptor;
+    while (!baseDescriptor && (propertyOwner = Object.getPrototypeOf(propertyOwner))) {
+      baseDescriptor = Object.getOwnPropertyDescriptor(propertyOwner, field);
+    }
+    // Preserve SDK accessors: handoffs and compaction invalidate their lazy system context.
     let baseValue = agentContext[field];
     Object.defineProperty(agentContext, field, {
       configurable: true,
@@ -221,10 +227,16 @@ function installScopedFallbackRouteAccessors(agentContext) {
         const activeRoute = fallbackInvocationPolicy.getStore()?.activeRoute;
         return activeRoute && Object.prototype.hasOwnProperty.call(activeRoute, field)
           ? activeRoute[field]
-          : baseValue;
+          : baseDescriptor?.get
+            ? baseDescriptor.get.call(this)
+            : baseValue;
       },
       set(value) {
-        baseValue = value;
+        if (baseDescriptor?.set) {
+          baseDescriptor.set.call(this, value);
+        } else {
+          baseValue = value;
+        }
       },
     });
   }

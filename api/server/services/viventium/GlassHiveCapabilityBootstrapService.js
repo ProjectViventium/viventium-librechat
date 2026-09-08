@@ -1,3 +1,4 @@
+const { backgroundWorkerResources } = require('@librechat/api');
 /* === VIVENTIUM START ===
  * Feature: GlassHive capability broker bootstrap injection
  * Purpose:
@@ -22,14 +23,26 @@ const {
 } = require('./GlassHiveCapabilityPolicyService');
 /* === VIVENTIUM START === Scheduled/direct mint and exact revoke boundary. === */
 const {
+  BROKER_AUTHORITY_KINDS,
   mintBrokerGrant,
   persistBrokerGrantResources,
   revokeBrokerGrant,
   resolveBrokerTenantId,
 } = require('./GlassHiveCapabilityBrokerAuth');
+const { createCapabilityAuthorization } = require('./GlassHiveCapabilityAuthorizationService');
 /* === VIVENTIUM END === */
+const {
+  DELEGATION_TOOL_NAME,
+  MAIN_DELEGATION_PROFILES,
+  isConversationOrchestrationTool,
+} = require('./GlassHiveConversationOrchestration');
 const { pinFeelingCapsuleLast } = require('./feelingPromptTail');
 const { logFeelingsEvent, summarizeFeelingCapsulePlacement } = require('./feelingsTelemetry');
+const {
+  attachGlassHiveTrustedLaunchMetadata,
+  markGlassHiveLaunchDispatchReady,
+  registerGlassHiveLaunchContext,
+} = require('./GlassHiveCallbackBindingService');
 
 const WORKER_INSTRUCTION_FIELDS = Object.freeze(['agents_md', 'claude_md', 'codex_md']);
 
@@ -1061,6 +1074,79 @@ function mergeBrokerBundle({
   return pinWorkerFeelingBlockLast(bundle, workerFeelingBlock(workerFeelings));
 }
 
+function mergePendingBrokerAuthorizationBundle({
+  existingBundle,
+  authorization,
+  brokerUrl,
+  allowedServers,
+  allowedHostTools = [],
+  contentReadScope = false,
+  workerMemory = '',
+  workerFeelings = '',
+  launchAuthorityKind = '',
+  workerRoute = {},
+  executionMode = 'docker',
+}) {
+  const bundle = mergeWorkerContextBundle({ existingBundle, workerMemory, workerFeelings });
+  const tokenEnvVar = 'GLASSHIVE_CAPABILITY_BROKER_TOKEN';
+  const serverConfig = {
+    type: 'http',
+    transport: 'http',
+    url: brokerUrl,
+    headers: {
+      Authorization: `Bearer \${${tokenEnvVar}}`,
+    },
+  };
+  bundle.version = bundle.version || 1;
+  bundle.glasshive_capability_authorization = {
+    version: 1,
+    status: 'pending_admission',
+    authorization_ref: authorization.authorizationRef,
+    origin_ref: authorization.originRef,
+    scope_fingerprint: authorization.scopeFingerprint,
+    max_expires_at: new Date(authorization.maxExpiresAt).toISOString(),
+  };
+  bundle.glasshive_capability_broker = {
+    version: 1,
+    status: 'pending_admission',
+    name: 'glasshive-user-capabilities',
+    url: brokerUrl,
+    allowed_servers: allowedServers,
+    allowed_host_tools: allowedHostTools,
+    scopes: { content_read: contentReadScope },
+    projection: 'all_user_enabled_policy_gated',
+  };
+  if (launchAuthorityKind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR) {
+    bundle.viventium_launch_authority = {
+      version: 1,
+      kind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
+      execution_mode: executionMode,
+      ...workerRoute,
+    };
+  }
+  bundle.glasshive_capability_intent = {
+    ...(bundle.glasshive_capability_intent || {}),
+    content_read: contentReadScope,
+  };
+  bundle.claude_project_mcp = {
+    ...(bundle.claude_project_mcp || {}),
+    'glasshive-user-capabilities': serverConfig,
+  };
+  const codexBlock = [
+    '[mcp_servers.glasshive-user-capabilities]',
+    `url = ${tomlString(brokerUrl)}`,
+    `bearer_token_env_var = ${tomlString(tokenEnvVar)}`,
+  ].join('\n');
+  bundle.codex_config_append = appendText(bundle.codex_config_append, codexBlock);
+  bundle.env = { ...(bundle.env || {}) };
+  delete bundle.env[tokenEnvVar];
+  const instruction = brokerContextBrief(allowedServers, { contentReadScope, allowedHostTools });
+  bundle.agents_md = appendText(bundle.agents_md, instruction);
+  bundle.claude_md = appendText(bundle.claude_md, instruction);
+  bundle.codex_md = appendText(bundle.codex_md, instruction);
+  return pinWorkerFeelingBlockLast(bundle, workerFeelingBlock(workerFeelings));
+}
+
 function applyContextBrief(
   args,
   toolName,
@@ -1109,6 +1195,46 @@ async function maybeInjectGlassHiveCapabilityBroker({
   if (!args) {
     return toolArguments;
   }
+  const launchAuthorityKind = String(
+    config?.configurable?.glasshive_launch_authority_kind || '',
+  ).trim();
+  const workerRoute =
+    config?.configurable?.glasshive_worker_route ||
+    (config?.configurable?.glasshive_fallback_worker_profile
+      ? { fallback_worker_profile: config.configurable.glasshive_fallback_worker_profile }
+      : {});
+  if (launchAuthorityKind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR) {
+    args.execution_mode =
+      process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE === 'host' ? 'host' : 'docker';
+    delete args.executionMode;
+    if (args.execution_mode === 'docker') args.bootstrap_profile = 'clean-room';
+    delete args.bootstrapProfile;
+  }
+  // VIVENTIUM START: Superseded authoring cannot create a new launch intent.
+  config?.signal?.throwIfAborted();
+  // VIVENTIUM END
+  const launchContext = await registerGlassHiveLaunchContext({
+    signal: config?.signal,
+    user: config?.configurable?.user,
+    requestBody: config?.configurable?.requestBody || {},
+    toolName,
+    toolArguments: args,
+    toolCall: config?.toolCall || {},
+  });
+  if (!launchContext?.originRef || !launchContext?.delegationIdentity) {
+    throw new Error('glasshive_launch_origin_not_bound');
+  }
+  const originalWasString = typeof toolArguments === 'string';
+  const finalizeTrustedLaunchArgs = async () => {
+    const trustedLaunchArgs = attachGlassHiveTrustedLaunchMetadata(
+      args,
+      launchContext,
+      args.bootstrap_bundle_json,
+    );
+    Object.assign(args, trustedLaunchArgs);
+    await markGlassHiveLaunchDispatchReady(launchContext);
+    return originalWasString ? JSON.stringify(args) : args;
+  };
   const workerMemory = String(config?.configurable?.glasshive_worker_memory || '').trim();
   const workerFeelings = String(config?.configurable?.glasshive_worker_feelings || '').trim();
   const allowedHostTools = Array.from(
@@ -1139,14 +1265,21 @@ async function maybeInjectGlassHiveCapabilityBroker({
       config?.configurable?.glasshive_worker_feelings_active_range_prompt_override_chars || 0,
     ),
   };
-  const originalWasString = typeof toolArguments === 'string';
-  const returnWorkerContextOnly = (reason) => {
+  const returnWorkerContextOnly = async (reason) => {
     args.bootstrap_bundle_json = mergeWorkerContextBundle({
       existingBundle: normalizeBootstrapBundle(args.bootstrap_bundle_json),
       workerMemory,
       workerFeelings,
       brokerUnavailableReason: reason,
     });
+    if (launchAuthorityKind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR) {
+      args.bootstrap_bundle_json.viventium_launch_authority = {
+        version: 1,
+        kind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
+        execution_mode: executionModeForBroker(args),
+        ...workerRoute,
+      };
+    }
     applyUnavailableContextBrief(args, toolName, reason);
     logWorkerFeelingPlacement({
       requestBody: config?.configurable?.requestBody,
@@ -1164,15 +1297,15 @@ async function maybeInjectGlassHiveCapabilityBroker({
       toolName,
       brokerStatus: reason,
     });
-    return originalWasString ? JSON.stringify(args) : args;
+    return finalizeTrustedLaunchArgs();
   };
   if (!shouldInjectForTool({ serverName, toolName })) {
-    return returnWorkerContextOnly('broker_disabled');
+    return await returnWorkerContextOnly('broker_disabled');
   }
   const user = config?.configurable?.user;
   const userId = String(user?.id || user?._id || '').trim();
   if (!userId) {
-    return returnWorkerContextOnly('missing_user');
+    return await returnWorkerContextOnly('missing_user');
   }
   const registry = getMCPServersRegistry();
   const mcpConfig = await registry.getAllServerConfigs(userId).catch((error) => {
@@ -1185,7 +1318,7 @@ async function maybeInjectGlassHiveCapabilityBroker({
     return null;
   });
   if (!mcpConfig && allowedHostTools.length === 0) {
-    return returnWorkerContextOnly('broker_config_unavailable');
+    return await returnWorkerContextOnly('broker_config_unavailable');
   }
   const executionMode = executionModeForBroker(args);
   const allowedServerEntries = mcpConfig
@@ -1193,7 +1326,7 @@ async function maybeInjectGlassHiveCapabilityBroker({
     : [];
   const allowedServers = allowedServerEntries.map(({ serverName }) => serverName);
   if (allowedServers.length === 0 && allowedHostTools.length === 0) {
-    return returnWorkerContextOnly('no_broker_servers');
+    return await returnWorkerContextOnly('no_broker_servers');
   }
   const requestBody = config?.configurable?.requestBody || {};
   const existingBundle = normalizeBootstrapBundle(args.bootstrap_bundle_json);
@@ -1204,38 +1337,39 @@ async function maybeInjectGlassHiveCapabilityBroker({
     ...workerTurnScope,
     execution_mode: executionMode,
   };
-  let mintedGrant;
+  let authorization;
+  const brokerUrl = resolveBrokerUrl(executionMode);
   try {
-    mintedGrant = mintBrokerGrant({
+    authorization = await createCapabilityAuthorization({
       user,
+      originRef: launchContext.originRef,
       allowedServers,
       allowedHostTools,
       hostToolResources,
-      allowDynamicPolicyServers: false,
+      contentReadScope,
       requestContext,
       executionMode,
-      ttlSeconds: grantTtlSecondsForTool(toolName, args),
-      scopes: { content_read: contentReadScope },
+      brokerUrl,
     });
-    await persistBrokerGrantResources(mintedGrant);
   } catch (error) {
-    logger.warn('[VIVENTIUM][glasshive-capability-broker] Skipping bootstrap injection', {
-      reason: 'grant_mint_failed',
+    logger.error('[VIVENTIUM][glasshive-capability-authorization] Launch preparation failed', {
+      reason: 'authorization_prepare_failed',
       message: error?.message,
     });
-    return returnWorkerContextOnly('grant_mint_failed');
+    throw error;
   }
-  const { token, payload } = mintedGrant;
-  args.bootstrap_bundle_json = mergeBrokerBundle({
+  args.bootstrap_bundle_json = mergePendingBrokerAuthorizationBundle({
+    executionMode,
     existingBundle,
-    brokerUrl: resolveBrokerUrl(executionMode),
-    grantToken: token,
-    grantPayload: payload,
+    authorization,
+    brokerUrl,
     allowedServers,
     allowedHostTools,
     contentReadScope,
     workerMemory,
     workerFeelings,
+    launchAuthorityKind,
+    workerRoute,
   });
   logWorkerFeelingPlacement({
     requestBody,
@@ -1260,7 +1394,7 @@ async function maybeInjectGlassHiveCapabilityBroker({
     );
   }
   applyContextBrief(args, toolName, allowedServers, { contentReadScope, allowedHostTools });
-  return typeof toolArguments === 'string' ? JSON.stringify(args) : args;
+  return finalizeTrustedLaunchArgs();
 }
 
 /* === VIVENTIUM START ===
@@ -1276,6 +1410,22 @@ async function buildConversationProviderBootstrapBundle({
   excludedServerNames = [],
   allowedHostTools = [],
   hostToolResources = {},
+  allowedConversationOrchestrationTools = [],
+  workerProfile = '',
+  workerModel = '',
+  workerReasoningEffort = '',
+  fallbackWorkerProfile = '',
+  fallbackWorkerModel = '',
+  fallbackWorkerReasoningEffort = '',
+  workerMemory = '',
+  workerFeelings = '',
+  workerFeelingsEnabled = false,
+  workerFeelingsHash = '',
+  workerFeelingsScope = 'unknown',
+  workerFeelingsRangePromptOverrideCount = 0,
+  workerFeelingsActiveRangePromptOverrideCount = 0,
+  workerFeelingsActiveRangePromptOverrideChars = 0,
+  capabilityDependency = {},
   capabilityResolutionStatus = '',
 } = {}) {
   const userId = String(user?.id || user?._id || '').trim();
@@ -1291,8 +1441,77 @@ async function buildConversationProviderBootstrapBundle({
   const normalizedHostTools = Array.from(
     new Set((allowedHostTools || []).map((value) => String(value || '').trim()).filter(Boolean)),
   ).sort();
+  /* === VIVENTIUM START ===
+   * Feature: Conversation-only native orchestration projection.
+   * Purpose: Add only canonical Main facades to this provider grant while keeping the ordinary
+   * host-tool set, which missions inherit, structurally separate.
+   * === VIVENTIUM END === */
+  const normalizedConversationOrchestrationTools = Array.from(
+    new Set(
+      (allowedConversationOrchestrationTools || [])
+        .map((value) => String(value || '').trim())
+        .filter(isConversationOrchestrationTool),
+    ),
+  ).sort();
+  const allProviderHostTools = Array.from(
+    new Set([...normalizedHostTools, ...normalizedConversationOrchestrationTools]),
+  ).sort();
+  const delegationResources = normalizedConversationOrchestrationTools.includes(
+    DELEGATION_TOOL_NAME,
+  )
+    ? {
+        [DELEGATION_TOOL_NAME]: {
+          version: 1,
+          request_body: requestBody,
+          worker_memory: String(workerMemory || ''),
+          worker_feelings: String(workerFeelings || ''),
+          worker_feelings_enabled: workerFeelingsEnabled === true,
+          worker_feelings_hash: String(workerFeelingsHash || ''),
+          worker_feelings_scope: String(workerFeelingsScope || 'unknown'),
+          worker_feelings_range_prompt_override_count: Number(
+            workerFeelingsRangePromptOverrideCount || 0,
+          ),
+          worker_feelings_active_range_prompt_override_count: Number(
+            workerFeelingsActiveRangePromptOverrideCount || 0,
+          ),
+          worker_feelings_active_range_prompt_override_chars: Number(
+            workerFeelingsActiveRangePromptOverrideChars || 0,
+          ),
+          mission_host_tools: normalizedHostTools,
+          mission_host_tool_resources: hostToolResources,
+          capability_dependency:
+            capabilityDependency &&
+            typeof capabilityDependency === 'object' &&
+            !Array.isArray(capabilityDependency)
+              ? capabilityDependency
+              : {},
+          ...backgroundWorkerResources({
+            workerProfile,
+            workerModel,
+            workerReasoningEffort,
+            fallbackWorkerProfile,
+            fallbackWorkerModel,
+            fallbackWorkerReasoningEffort,
+          }),
+        },
+      }
+    : {};
+  const orchestrationResources = {
+    ...delegationResources,
+    ...(normalizedConversationOrchestrationTools.includes('active_work_action')
+      ? { active_work_action: { version: 1, request_body: requestBody } }
+      : {}),
+  };
+  const allProviderHostToolResources = {
+    ...(hostToolResources &&
+    typeof hostToolResources === 'object' &&
+    !Array.isArray(hostToolResources)
+      ? hostToolResources
+      : {}),
+    ...orchestrationResources,
+  };
   const hasRequestedCapabilities =
-    declaredServers.size > 0 || declaredDeferredServers.size > 0 || normalizedHostTools.length > 0;
+    declaredServers.size > 0 || declaredDeferredServers.size > 0 || allProviderHostTools.length > 0;
   if (!hasRequestedCapabilities) {
     return capabilityResolutionStatus
       ? degradedConversationCapabilityBundle(capabilityResolutionStatus)
@@ -1337,7 +1556,7 @@ async function buildConversationProviderBootstrapBundle({
   const deferredServers = allowedServers.filter(
     (serverName) => !declaredServers.has(serverName) && declaredDeferredServers.has(serverName),
   );
-  if (allowedServers.length === 0 && normalizedHostTools.length === 0) {
+  if (allowedServers.length === 0 && allProviderHostTools.length === 0) {
     return degradedConversationCapabilityBundle('no_reviewed_capabilities');
   }
   const contentReadScope = shouldGrantContentReadScope(allowedServerEntries);
@@ -1348,8 +1567,12 @@ async function buildConversationProviderBootstrapBundle({
       allowedServers,
       eagerServers,
       deferredServers,
-      allowedHostTools: normalizedHostTools,
-      hostToolResources,
+      allowedHostTools: allProviderHostTools,
+      hostToolResources: allProviderHostToolResources,
+      authorityKind:
+        normalizedConversationOrchestrationTools.length > 0
+          ? BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
+          : BROKER_AUTHORITY_KINDS.MISSION_WORKER,
       executionMode,
       requestContext: { ...brokerTurnScope(requestBody), execution_mode: executionMode },
       ttlSeconds: intEnv('VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_TTL_SECONDS', 60 * 60),
@@ -1378,7 +1601,7 @@ async function buildConversationProviderBootstrapBundle({
     allowedServers,
     eagerServers,
     deferredServers,
-    allowedHostTools: normalizedHostTools,
+    allowedHostTools: allProviderHostTools,
     contentReadScope,
   });
   if (!capabilityResolutionStatus) {

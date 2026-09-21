@@ -705,7 +705,7 @@ function measuredArtifactIdentityFromPython() {
   return JSON.parse(
     execFileSync(
       '/usr/bin/python3',
-      ['-c', source, installedGateScript, ownerRepo, promptBundlePath, ownerPath],
+      ['-B', '-c', source, installedGateScript, ownerRepo, promptBundlePath, ownerPath],
       {
         encoding: 'utf8',
       },

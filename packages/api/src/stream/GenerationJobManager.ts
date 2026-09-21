@@ -4415,7 +4415,7 @@ class GenerationJobManagerClass {
     const activeStreams: Array<{ streamId: string; conversationId: string }> = [];
     for (const streamId of streamIds) {
       const job = await this.jobStore.getJob(streamId);
-      if (job?.status === 'running') {
+      if (job?.status === 'running' && job.userId === userId) {
         activeStreams.push({
           streamId,
           conversationId: job.conversationId ?? streamId,
@@ -4437,6 +4437,7 @@ class GenerationJobManagerClass {
       const job = await this.jobStore.getJob(streamId);
       if (
         job?.status === 'running' &&
+        job.userId === userId &&
         job.conversationId === conversationId &&
         (!newest || job.createdAt > newest.createdAt)
       ) {

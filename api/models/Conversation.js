@@ -106,6 +106,16 @@ module.exports = {
         logger.debug(`[saveConvo] ${metadata.context}`);
       }
 
+      if (metadata?.titleOnly === true) {
+        const owner = { conversationId, user: req.user.id };
+        const updated = await Conversation.findOneAndUpdate(
+          { ...owner, titleSetByUser: { $ne: true } },
+          { $set: { title: convo.title } },
+          { new: true, upsert: false },
+        );
+        return updated || Conversation.findOne(owner);
+      }
+
       /* === VIVENTIUM START ===
        * Fix: Compute temporary chat expiration before awaiting `getMessages()` (downstream I/O).
        * Reason: Prevents time skew and reduces flakiness in `api/models/Conversation.spec.js`.

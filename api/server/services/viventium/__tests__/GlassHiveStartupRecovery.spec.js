@@ -34,6 +34,10 @@ test.each([false, true])('launch reconciliation startup respects quiesced=%s', a
     initializeOAuthReconnectManager: async () => {},
     checkMigrations: async () => {},
     recoverStaleCortexMessages: async () => {},
+    reconcilePendingGlassHiveMissionAdjudications: async () => {},
+    reconcileGlassHiveSchedulerCallbackOutbox: async () => {},
+    startGlassHiveLaunchReconciliation: startRecovery,
+    startOrchestrationReadinessWatcher: () => {},
     getStaleCortexRecoveryIntervalMs: () => 0,
     upgradeFinalization: {
       recordCompleted: jest.fn(),

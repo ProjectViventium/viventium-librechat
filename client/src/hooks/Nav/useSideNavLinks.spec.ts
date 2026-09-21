@@ -80,7 +80,7 @@ describe('useSideNavLinks Feelings discovery', () => {
     expect(linkIds.indexOf('active-work')).toBeLessThan(linkIds.indexOf('prompts'));
     expect(linkIds.indexOf('active-work')).toBeLessThan(linkIds.indexOf('feelings'));
     expect(linkIds.indexOf('active-work')).toBeLessThan(linkIds.indexOf('memories'));
-    expect(mockUseOrchestrationPreferenceQuery).toHaveBeenCalledWith();
+    expect(mockUseOrchestrationPreferenceQuery).toHaveBeenCalledWith(undefined);
   });
 
   it('keeps the dark empty feature out of the Control Panel', () => {
@@ -88,7 +88,7 @@ describe('useSideNavLinks Feelings discovery', () => {
     const { result } = renderHook(() => useSideNavLinks(baseArguments));
 
     expect(result.current.some((link) => link.id === 'active-work')).toBe(false);
-    expect(mockUseOrchestrationPreferenceQuery).toHaveBeenCalledWith();
+    expect(mockUseOrchestrationPreferenceQuery).toHaveBeenCalledWith(undefined);
   });
 
   it('does not substitute deployment readiness for an unavailable owner', () => {

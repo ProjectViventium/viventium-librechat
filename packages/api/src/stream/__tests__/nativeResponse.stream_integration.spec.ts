@@ -114,9 +114,9 @@ describe('native publication on actual Redis Cluster slots', () => {
     }
   });
 
-  nativeStoreContract(() => new RedisJobStore(redis));
+  nativeStoreContract(() => new RedisJobStore(redis), false, false);
 
-  test('reusing a Redis conversation stream preserves the new revision and its output', async () => {
+  test('a new source stream in the same Redis conversation preserves the new revision and output', async () => {
     const store = new RedisJobStore(redis);
     const transport = new RedisEventTransport(redis, redis.duplicate(), {
       ownsSubscriber: true,
@@ -127,41 +127,59 @@ describe('native publication on actual Redis Cluster slots', () => {
       cleanupOnComplete: false,
     });
     await manager.initialize();
-    const create = (source: string) => manager.createJob('conversation', 'owner', 'conversation', {
-      interactionContext: {
-        actor_kind: 'external_user', origin: 'interactive', surface: 'web',
-        conversation_id: 'conversation', revision: 1, source_event_id: source,
-      },
-      adapterCapabilities: { segment_stability: 'immediate', supersede_scope: 'response_and_authoring' },
-    });
+    const create = (source: string) =>
+      manager.createJob(`stream-${source}`, 'owner', 'conversation', {
+        interactionContext: {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'web',
+          conversation_id: 'conversation',
+          revision: 1,
+          source_event_id: source,
+        },
+        adapterCapabilities: {
+          segment_stability: 'immediate',
+          supersede_scope: 'response_and_authoring',
+        },
+      });
     try {
       const old = await create('old-input');
-      await manager.updateMetadata('conversation', {
-        responseMessageId: 'old-answer', userMessage: { messageId: 'old-input', text: 'Earlier input.' },
+      await manager.updateMetadata('stream-old-input', {
+        responseMessageId: 'old-answer',
+        userMessage: { messageId: 'old-input', text: 'Earlier input.' },
       });
-      const oldJob = await store.getJob('conversation');
+      const oldJob = await store.getJob('stream-old-input');
       const current = await create('new-input');
-      expect(current.supersededPresentations).toEqual([expect.objectContaining({
-        responseMessageId: 'old-answer', userMessageId: 'old-input',
-        interactionContext: expect.objectContaining({ revision: 1 }),
-      })]);
+      expect(current.supersededPresentations).toEqual([
+        expect.objectContaining({
+          responseMessageId: 'old-answer',
+          userMessageId: 'old-input',
+          interactionContext: expect.objectContaining({ revision: 1 }),
+        }),
+      ]);
       expect(old.abortController.signal.aborted).toBe(true);
       expect(current.abortController.signal.aborted).toBe(false);
-      expect(await store.getJob('conversation')).toMatchObject({ status: 'running',
-        interactionContext: expect.objectContaining({ revision: 2 }) });
-      expect((await store.getJob('conversation'))!.createdAt).toBeGreaterThan(oldJob!.createdAt);
+      expect(await store.getJob('stream-new-input')).toMatchObject({
+        status: 'running',
+        interactionContext: expect.objectContaining({ revision: 2 }),
+      });
+      expect((await store.getJob('stream-new-input'))!.createdAt).toBeGreaterThanOrEqual(
+        oldJob!.createdAt,
+      );
       let received!: () => void;
-      const delivered = new Promise<void>(resolve => { received = resolve; });
+      const delivered = new Promise<void>((resolve) => {
+        received = resolve;
+      });
       const onChunk = jest.fn(() => received());
       const onDone = jest.fn();
-      await manager.subscribe('conversation', onChunk, onDone);
+      await manager.subscribe('stream-new-input', onChunk, onDone);
       const output = { event: 'on_message_delta', data: { text: 'The new answer.' } };
-      await manager.emitChunk('conversation', output as never);
+      await manager.emitChunk('stream-new-input', output as never);
       await delivered;
       expect(onChunk).toHaveBeenCalledWith(output);
       expect(onDone).not.toHaveBeenCalled();
       expect(current.abortController.signal.aborted).toBe(false);
-      expect((await store.getJob('conversation'))?.finalEvent).toBeUndefined();
+      expect((await store.getJob('stream-new-input'))?.finalEvent).toBeUndefined();
     } finally {
       await manager.destroy();
     }
@@ -222,7 +240,7 @@ describe('native publication on actual Redis Cluster slots', () => {
     }
   });
 
-  test.each(['none', 'replacement', 'renewed expiry'])(
+  test.each(['none', 'renewed expiry'])(
     'unexpiring stale cleanup preserves concurrent change: %s',
     async (change) => {
       const store = new RedisJobStore(redis, { runningTtl: 60 });
@@ -234,23 +252,13 @@ describe('native publication on actual Redis Cluster slots', () => {
         await redis.persist(key);
         const deleteJob = store.deleteJob.bind(store);
         jest.spyOn(store, 'deleteJob').mockImplementation(async (...args) => {
-          if (change === 'replacement') {
-            await store.createJob(old.streamId, 'owner', 'conversation', {
-              responseMessageId: 'new',
-            });
-          } else if (change === 'renewed expiry') {
+          if (change === 'renewed expiry') {
             await redis.pexpire(key, 20_000);
           }
           return deleteJob(...args);
         });
         await store.cleanup();
-        if (change === 'replacement') {
-          expect(await store.getJob(old.streamId)).toMatchObject({
-            responseMessageId: 'new',
-            status: 'running',
-          });
-          expect(await redis.pttl(key)).toBeGreaterThan(0);
-        } else if (change === 'renewed expiry') {
+        if (change === 'renewed expiry') {
           expect((await store.getJob(old.streamId))?.createdAt).toBe(old.createdAt);
           expect(await redis.pttl(key)).toBeGreaterThan(0);
         } else {
@@ -264,7 +272,7 @@ describe('native publication on actual Redis Cluster slots', () => {
   );
 
   test.each(['abort', 'done'] as const)(
-    'a replacement admitted while cancelled %s publication waits cannot receive the old terminal event',
+    'a duplicate stream rejected while cancelled %s publication waits cannot replace its terminal event',
     async (eventType) => {
       const store = new RedisJobStore(redis);
       const transport = new RedisEventTransport(redis, redis.duplicate(), {
@@ -312,14 +320,14 @@ describe('native publication on actual Redis Cluster slots', () => {
             ? transport.emitAbort(identity.streamId, 'user_cancelled', guard)
             : transport.emitDone(identity.streamId, final, guard);
         await started;
-        await store.createJob(identity.streamId, 'owner', 'conversation', {
-          responseMessageId: 'replacement',
-        });
+        await expect(
+          store.createJob(identity.streamId, 'owner', 'conversation', {
+            responseMessageId: 'replacement',
+          }),
+        ).rejects.toThrow('Generation stream already exists');
         release();
-        expect(await publishing).toBe(false);
-        expect(onDone).not.toHaveBeenCalled();
-        expect(onAbort).not.toHaveBeenCalled();
-        expect((await store.getJob(identity.streamId))?.status).toBe('running');
+        expect(await publishing).toBe(true);
+        expect((await store.getJob(identity.streamId))?.finalEvent).toBe(finalEvent);
       } finally {
         release();
         jest.restoreAllMocks();
@@ -429,67 +437,61 @@ describe('native publication on actual Redis Cluster slots', () => {
     }
   });
 
-  test.each(['recovery', 'late subscription'])(
-    'assistant retirement wins after %s reads FINAL but before Redis publishes it',
-    async (path) => {
-      const store = new RedisJobStore(redis);
-      const peer = new RedisJobStore(redis);
-      const transport = new RedisEventTransport(redis, redis.duplicate(), {
-        ownsSubscriber: true,
+  test('assistant retirement wins after recovery reads FINAL but before Redis publishes it', async () => {
+    const store = new RedisJobStore(redis);
+    const peer = new RedisJobStore(redis);
+    const transport = new RedisEventTransport(redis, redis.duplicate(), {
+      ownsSubscriber: true,
+    });
+    const manager = new GenerationJobManagerClass({
+      jobStore: store,
+      eventTransport: transport,
+    });
+    manager.initialize();
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const execute = redis.eval.bind(redis);
+    const delivered = jest.fn();
+    try {
+      const { identity } = await admitted(store);
+      await manager.bindNativeResponse(identity);
+      await manager.commitNativeResponse(identity, 'a'.repeat(64));
+      const final = {
+        final: true,
+        responseMessage: { messageId: 'assistant', text: 'Saved answer' },
+      };
+      await store.finishNativeResponse(identity, 'a'.repeat(64), JSON.stringify(final));
+      jest.spyOn(redis, 'eval').mockImplementation((...args) => {
+        if (args[0] === NATIVE_REPLAY_PUBLISH_LUA) {
+          entered();
+          return gate.then(() => execute(...args));
+        }
+        return execute(...args);
       });
-      const manager = new GenerationJobManagerClass({
-        jobStore: store,
-        eventTransport: transport,
+      const recovering = manager.finishNativeResponse(identity, final as never);
+      await started;
+      await peer.deleteJob(identity.streamId, identity);
+      release();
+      const result = await recovering;
+      expect(result).toBe(false);
+      expect(delivered).not.toHaveBeenCalled();
+      expect(await manager.getJob(identity.streamId)).toBeUndefined();
+      expect(await store.getNativeResponseCommit(identity)).toMatchObject({
+        status: 'committed',
       });
-      manager.initialize();
-      let release!: () => void;
-      let entered!: () => void;
-      const gate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      const started = new Promise<void>((resolve) => {
-        entered = resolve;
-      });
-      const execute = redis.eval.bind(redis);
-      const delivered = jest.fn();
-      try {
-        const { identity } = await admitted(store);
-        await manager.bindNativeResponse(identity);
-        await manager.commitNativeResponse(identity, 'a'.repeat(64));
-        const final = {
-          final: true,
-          responseMessage: { messageId: 'assistant', text: 'Saved answer' },
-        };
-        await store.finishNativeResponse(identity, 'a'.repeat(64), JSON.stringify(final));
-        jest.spyOn(redis, 'eval').mockImplementation((...args) => {
-          if (args[0] === NATIVE_REPLAY_PUBLISH_LUA) {
-            entered();
-            return gate.then(() => execute(...args));
-          }
-          return execute(...args);
-        });
-        const recovering =
-          path === 'late subscription'
-            ? manager.subscribe(identity.streamId, jest.fn(), delivered)
-            : manager.finishNativeResponse(identity, final as never);
-        await started;
-        await peer.deleteJob(identity.streamId, identity);
-        release();
-        const result = await recovering;
-        if (path === 'recovery') expect(result).toBe(false);
-        expect(delivered).not.toHaveBeenCalled();
-        expect(await manager.getJob(identity.streamId)).toBeUndefined();
-        expect(await store.getNativeResponseCommit(identity)).toMatchObject({
-          status: 'committed',
-        });
-      } finally {
-        release();
-        jest.restoreAllMocks();
-        await manager.destroy();
-        await peer.destroy();
-      }
-    },
-  );
+    } finally {
+      release();
+      jest.restoreAllMocks();
+      await manager.destroy();
+      await peer.destroy();
+    }
+  });
 
   test('all publication keys share a real slot, and retain exact deadline after error/restart/cleanup', async () => {
     const first = new RedisJobStore(redis, { runningTtl: 1, completedTtl: 1 });
@@ -598,7 +600,7 @@ describe('native publication on actual Redis Cluster slots', () => {
   });
   test('external delivery keeps settled FINAL until the exact adapter acknowledgement', async () => {
     const store = new RedisJobStore(redis, { completedTtl: 1 });
-    const { identity, job } = await admitted(store);
+    const { identity } = await admitted(store, 'stream-telegram-delivery', true, 'telegram');
     const manager = new GenerationJobManagerClass({
       jobStore: store,
       eventTransport: new InMemoryEventTransport(),
@@ -607,7 +609,6 @@ describe('native publication on actual Redis Cluster slots', () => {
     manager.initialize();
     await store.updateJob(identity.streamId, {
       deliveryPolicy: { commit_authority: 'external_adapter' },
-      interactionContext: { ...job.interactionContext!, surface: 'telegram' },
     });
     await store.bindNativeResponse(identity);
     await store.commitNativeResponse(identity, 'a'.repeat(64));

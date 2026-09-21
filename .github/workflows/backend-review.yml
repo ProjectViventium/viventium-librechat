@@ -191,6 +191,9 @@ jobs:
         with:
           repository: ProjectViventium/viventium
           path: parent-viventium
+      - uses: actions/checkout@v4
+        with:
+          path: parent-viventium/viventium_v0_4/LibreChat
       # VIVENTIUM END
 
       # VIVENTIUM START — exact release toolchain.
@@ -205,6 +208,10 @@ jobs:
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: '0.9.5'
+      - name: Prepare scheduler integration runtime
+        if: matrix.shard == '1/2'
+        working-directory: viventium/MCPs/scheduling-cortex
+        run: uv sync --frozen
       # VIVENTIUM END
 
       - name: Restore node_modules cache

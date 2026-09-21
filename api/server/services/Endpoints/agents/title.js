@@ -77,15 +77,18 @@ const addTitle = async (req, { text, response, client }) => {
     });
   }
 
-  await saveConvo(
+  const saved = await saveConvo(
     req,
     { conversationId: response.conversationId, title },
     {
       context: 'api/server/services/Endpoints/agents/title.js',
-      ...(modelGeneratedTitle ? { noUpsert: true } : {}),
+      titleOnly: true,
+      noUpsert: true,
     },
   );
-  await titleCache.set(key, title, 120000);
+  if (saved) {
+    await titleCache.set(key, saved.title, 120000);
+  }
 };
 
 module.exports = addTitle;

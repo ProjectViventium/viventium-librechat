@@ -15,7 +15,7 @@ const mockRecordVoiceOrchestrationTraceBestEffort = jest.fn();
 const mockGetTrustedInteractionContext = jest.fn();
 
 jest.mock('~/cache/getLogStores', () => jest.fn(() => ({ set: mockSet })));
-jest.mock('~/models', () => ({ saveConvo: jest.fn(async () => ({})) }));
+jest.mock('~/models', () => ({ saveConvo: jest.fn(async (_req, convo) => convo) }));
 jest.mock('~/db/models', () => ({ Conversation: {} }));
 jest.mock('~/server/services/viventium/interactionContext', () => ({
   getTrustedInteractionContext: (...args) => mockGetTrustedInteractionContext(...args),
@@ -132,7 +132,7 @@ describe('agents addTitle', () => {
         conversationId: 'convo-1',
         title: 'check my ms365 inbox',
       },
-      { context: 'api/server/services/Endpoints/agents/title.js' },
+      { context: 'api/server/services/Endpoints/agents/title.js', titleOnly: true, noUpsert: true },
     );
     expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });
@@ -164,7 +164,7 @@ describe('agents addTitle', () => {
         conversationId: 'convo-2',
         title: 'this is a deliberately long title see...',
       },
-      { context: 'api/server/services/Endpoints/agents/title.js' },
+      { context: 'api/server/services/Endpoints/agents/title.js', titleOnly: true, noUpsert: true },
     );
     expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });

@@ -929,7 +929,14 @@ function sanitizePersistedAssistantContent(req, content) {
  * Added: 2026-05-15
  */
 function normalizePersistedAssistantResponse(req, response) {
-  const persistedResponse = sanitizeVoiceAssistantMessageForPersistence(req, response);
+  const telegramText =
+    req?._viventiumTelegram === true &&
+    req?.body?.viventiumSurface === 'telegram' &&
+    req?.body?.voiceMode !== true;
+  const withDisposition = telegramText
+    ? attachEffectiveDeliveryDisposition(req, response)
+    : response;
+  const persistedResponse = sanitizeVoiceAssistantMessageForPersistence(req, withDisposition);
   if (req?.body?.voiceMode === true) {
     return persistedResponse;
   }
@@ -1077,9 +1084,15 @@ async function persistAssistantSnapshot({
   const rawContent = Array.isArray(aggregatedContent)
     ? aggregatedContent.filter(Boolean)
     : (resumeState?.aggregatedContent ?? []);
-  const effectiveContent = sanitizePersistedAssistantContent(req, rawContent);
-  const extractedText = extractTextFromContentParts(effectiveContent);
-  const text = sanitizePersistedAssistantText(req, extractedText || fallbackText || '');
+  const initialContent = sanitizePersistedAssistantContent(req, rawContent);
+  const extractedText = extractTextFromContentParts(initialContent);
+  const initialText = sanitizePersistedAssistantText(req, extractedText || fallbackText || '');
+  const snapshot = sanitizeVoiceAssistantMessageForPersistence(req, {
+    content: initialContent,
+    text: initialText,
+  });
+  const effectiveContent = snapshot.content;
+  const text = snapshot.text;
 
   if (effectiveContent.length === 0 && text.length === 0) {
     return { persisted: false, fingerprint: null };
@@ -3021,6 +3034,7 @@ module.exports.__testables = {
   hasExactDurableEffectReceipt,
   isVoiceTaskOutputSuppressed: isVoiceTaskOutputSuppressedDurably,
   removeSuppressedAssistantMessage,
+  removeSupersededAssistantMessage,
   normalizeQaRunReceipt,
   captureQaRunReceipt,
   attachQaRunReceipt,

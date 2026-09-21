@@ -902,8 +902,14 @@ async function deleteMessagesSince(req, { messageId, conversationId }) {
 async function getMessages(filter, select) {
   try {
     if (select) {
-      const rows = await Message.find(filter).select(select).sort({ createdAt: 1 }).lean();
-      return rows;
+      const fields = select.split(/\s+/);
+      const exclusionOnly = fields.every((field) => field.startsWith('-'));
+      const excludesWriter = fields.some(
+        (field) => field === '-savedMemoryWrite' || field.startsWith('-savedMemoryWrite.'),
+      );
+      const projection = exclusionOnly && !excludesWriter ? `${select} +savedMemoryWrite` : select;
+      const rows = await Message.find(filter).select(projection).sort({ createdAt: 1 }).lean();
+      return exclusionOnly && !excludesWriter ? rows.map(projectMemoryWriteStatus) : rows;
     }
 
     // Exclude private writer input in Mongo itself, then expose only its existing state.

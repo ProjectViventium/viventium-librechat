@@ -4,6 +4,9 @@ const mockResolveDeliveryOwner = jest.fn();
 const mockGetJob = jest.fn();
 const mockAcknowledgeStreamDelivery = jest.fn();
 jest.mock('~/server/services/viventium/ViventiumMainContinuityService', () => ({}));
+jest.mock('~/server/services/viventium/VoiceOrchestrationTraceService', () => ({
+  recordVoiceOrchestrationTraceBestEffort: jest.fn(),
+}));
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
@@ -80,7 +83,7 @@ jest.mock('~/models', () => ({
 
 jest.mock('~/db/models', () => ({
   Message: { findOneAndDelete: jest.fn() },
-  Conversation: { updateOne: jest.fn() },
+  Conversation: { collection: { updateOne: jest.fn() }, updateOne: jest.fn() },
 }));
 
 jest.mock('~/server/services/viventium/telegramTimingDeep', () => ({

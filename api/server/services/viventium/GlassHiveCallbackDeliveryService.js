@@ -25,10 +25,12 @@ const {
   Message,
   ViventiumGlassHiveCallbackDelivery,
 } = require('~/db/models');
+const { getCallSession } = require('./CallSessionService');
 const { recordOrchestrationTraceDelivery } = require('./OrchestrationTraceLedgerService');
 const { recordVoiceOrchestrationTrace } = require('./VoiceOrchestrationTraceService');
 const { resolveTelegramMappingByUserId } = require('~/server/services/TelegramLinkService');
 const {
+  currentGlassHiveTerminalCallbackTransaction,
   runGlassHiveTerminalCallbackTransaction,
 } = require('./GlassHiveTerminalCallbackTransaction');
 
@@ -848,6 +850,343 @@ function isResolvedDestination(destination = {}) {
   return surface === 'voice' && Boolean(normalizeText(destination.voiceCallSessionId));
 }
 
+function terminalCallbackFields(reference) {
+  if (!reference) return {};
+  return {
+    terminalCallbackResultKey: reference.resultKey,
+    terminalCallbackAcceptedOperationId: reference.acceptedOperationId,
+    terminalCallbackId: reference.callbackId,
+    terminalCallbackResultDigest: reference.resultDigest,
+    terminalCallbackResultRevision: reference.resultRevision,
+    terminalCallbackEffectGeneration: reference.generation,
+  };
+}
+
+function aggregateSurfaceState(statuses, fallback) {
+  if (statuses.has('delivery_unknown')) return 'unknown';
+  if (statuses.has('unresolved')) return 'unresolved';
+  if (statuses.has('failed')) return 'failed';
+  if (statuses.has('pending') || statuses.has('claimed')) return 'enqueued';
+  if (statuses.has('sent')) return 'sent';
+  if (statuses.has('suppressed')) return 'suppressed';
+  return fallback;
+}
+
+async function recordGlassHiveLinkedWebDelivery({
+  body = {},
+  message,
+  deliveryContext = {},
+  effectFence,
+  effectSession,
+}) {
+  if (
+    !deliveryContext.destinations?.some((destination) =>
+      ['librechat', 'workbench'].includes(normalizeText(destination?.surface).toLowerCase()),
+    ) ||
+    externalDestinations(deliveryContext).length > 0
+  )
+    return null;
+  effectSession ||= currentGlassHiveTerminalCallbackTransaction()?.session || null;
+  if (!effectSession) throw new Error('glasshive_linked_presentation_transaction_required');
+  if (!effectFence) {
+    const reference = await acceptedTerminalCallbackReference({
+      body,
+      deliveryContext,
+      traceIdentity: callbackTraceIdentity(body, deliveryContext),
+    });
+    if (!reference) throw new Error('glasshive_linked_presentation_identity_invalid');
+    const lease = await acquireGlassHiveTerminalCallbackAcceptedOperationEffectLease({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      reference,
+      session: effectSession,
+    });
+    if (!lease) throw new Error('glasshive_linked_presentation_authority_unavailable');
+    try {
+      await fenceGlassHiveTerminalCallbackEffectTransaction({
+        ResultModel: GlassHiveTerminalCallbackResult,
+        lease,
+        session: effectSession,
+      });
+      return await recordGlassHiveLinkedWebDelivery({
+        body,
+        message,
+        deliveryContext,
+        effectFence: lease,
+        effectSession,
+      });
+    } finally {
+      await releaseGlassHiveTerminalCallbackEffectLease({
+        ResultModel: GlassHiveTerminalCallbackResult,
+        lease,
+        session: effectSession,
+      });
+    }
+  }
+  const reference = terminalCallbackReference(effectFence);
+  const ownerId = normalizeText(deliveryContext.ownerId);
+  const conversationId = normalizeText(deliveryContext.conversationId);
+  const originRef = normalizeText(deliveryContext.originRef);
+  const workRef = normalizeText(deliveryContext.workRef);
+  const callbackId = callbackRef(reference.callbackId);
+  const traceIdentity = callbackTraceIdentity(body, deliveryContext);
+  if (
+    !ownerId ||
+    !conversationId ||
+    !originRef ||
+    !workRef ||
+    !traceIdentity ||
+    traceIdentity.callbackRef !== callbackId
+  ) {
+    throw new Error('glasshive_linked_presentation_identity_invalid');
+  }
+  const accepted = await queryLean(
+    GlassHiveTerminalCallbackResult.findOne({
+      _id: reference.resultKey,
+      ownerId,
+      originRef,
+      workRef,
+      workerId: normalizeText(body.worker_id),
+      runId: normalizeText(body.run_id),
+      acceptedOperationId: reference.acceptedOperationId,
+      acceptedOperationGeneration: reference.generation,
+      callbackId: reference.callbackId,
+      resultDigest: reference.resultDigest,
+      resultRevision: reference.resultRevision,
+      effectLeaseId: normalizeText(effectFence.leaseId),
+      effectLeaseGeneration: Number(effectFence.generation),
+      effectLeaseExpiresAt: { $gt: nowDate() },
+    }),
+    effectSession,
+  );
+  const stored = await queryLean(
+    Message.findOne({
+      user: ownerId,
+      conversationId,
+      messageId: normalizeText(message?.messageId),
+      isCreatedByUser: false,
+    }),
+    effectSession,
+  );
+  if (!accepted || !stored || !normalizeText(stored.text) || stored.text !== message?.text) {
+    throw new Error('glasshive_linked_presentation_message_unavailable');
+  }
+  const event = normalizeText(body.event);
+  const deliveryKey = deliveryKeyFor({
+    ownerId,
+    originRef,
+    surface: 'librechat',
+    callbackId,
+    callbackMessageId: stored.messageId,
+    event,
+    attemptNumber: traceIdentity.attemptNumber,
+  });
+  const now = nowDate();
+  const row = await queryLean(
+    ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
+      {
+        deliveryKey,
+        userId: ownerId,
+        originRef,
+        callbackMessageId: stored.messageId,
+      },
+      {
+        $setOnInsert: {
+          deliveryKey,
+          deliveryId: deliveryIdFor(deliveryKey),
+          callbackId,
+          callbackMessageId: stored.messageId,
+          userId: ownerId,
+          conversationId,
+          originRef,
+          workRef,
+          workerId: normalizeText(body.worker_id),
+          runId: normalizeText(body.run_id),
+          event,
+          surface: 'librechat',
+          status: 'sent',
+          sentAt: now,
+          text: stored.text,
+          projectionPendingAt: now,
+          projectionNextAttemptAt: now,
+          expiresAt: new Date(now.getTime() + DELIVERY_RETENTION_MS),
+          ...terminalCallbackFields(reference),
+        },
+      },
+      { new: true, upsert: true, setDefaultsOnInsert: true, session: effectSession },
+    ),
+    effectSession,
+  );
+  const rows = await queryLean(
+    ViventiumGlassHiveCallbackDelivery.find(
+      {
+        originRef,
+        userId: ownerId,
+        workRef,
+        runId: normalizeText(body.run_id),
+        ...terminalCallbackFields(reference),
+      },
+      { status: 1 },
+    ),
+    effectSession,
+  );
+  const { recordGlassHiveSurfaceDeliveryOutcome } = require('./GlassHiveCallbackBindingService');
+  await recordGlassHiveSurfaceDeliveryOutcome({
+    originRef,
+    state: aggregateSurfaceState(new Set(rows.map((item) => item.status)), 'sent'),
+    body: {
+      ...body,
+      callback_id: reference.callbackId,
+      result_ended_at: accepted.resultEndedAt,
+      result_digest: accepted.resultDigest,
+      result_revision: accepted.resultRevision,
+    },
+    effectFence,
+    effectSession,
+  });
+  return row;
+}
+
+function pendingNeutralVoiceDelivery(row) {
+  return (
+    row?.surface === 'voice' &&
+    row.status === 'pending' &&
+    ['run.failed', 'run.cancelled', 'run.interrupted'].includes(row.event) &&
+    row.traceIdentityVerified === true &&
+    !row.workerCompletionPresentation &&
+    !row.claimId &&
+    !row.claimedAt &&
+    !row.dispatchPermitId &&
+    !row.fullText
+  );
+}
+
+async function settleEndedCallNeutralDelivery(row, { effectFence, effectSession } = {}) {
+  if (!pendingNeutralVoiceDelivery(row)) return row;
+  const call = await getCallSession(row.voiceCallSessionId);
+  if (
+    call?.status !== 'ended' ||
+    call.userId !== row.userId ||
+    call.conversationId !== row.conversationId
+  )
+    return row;
+  const reference = terminalCallbackReference({
+    resultKey: row.terminalCallbackResultKey,
+    acceptedOperationId: row.terminalCallbackAcceptedOperationId,
+    callbackId: row.terminalCallbackId,
+    resultDigest: row.terminalCallbackResultDigest,
+    resultRevision: row.terminalCallbackResultRevision,
+    generation: row.terminalCallbackEffectGeneration,
+  });
+  const settle = async (session, fence) => {
+    const message = await queryLean(
+      Message.findOne({
+        user: row.userId,
+        conversationId: row.conversationId,
+        messageId: row.callbackMessageId,
+        isCreatedByUser: false,
+      }),
+      session,
+    );
+    const metadata = message?.metadata?.viventium;
+    if (
+      metadata?.type !== 'glasshive_worker_callback' ||
+      metadata.status?.kind !== 'mission_status' ||
+      metadata.status.state !== deliveryTerminalState(row.event) ||
+      metadata.originRef !== row.originRef ||
+      metadata.workRef !== row.workRef ||
+      metadata.workerId !== row.workerId ||
+      metadata.runId !== row.runId ||
+      callbackRef(metadata.callbackId) !== row.callbackId ||
+      metadata.voiceCallSessionId !== row.voiceCallSessionId ||
+      !normalizeText(message.text)
+    )
+      return row;
+    const destinations = (metadata.configuredDestinations || []).filter(
+      (destination) => destination.surface !== 'voice',
+    );
+    if (
+      !destinations.some((destination) => ['librechat', 'workbench'].includes(destination.surface))
+    )
+      return row;
+    const now = nowDate();
+    const updated = await queryLean(
+      ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
+        {
+          deliveryId: row.deliveryId,
+          userId: row.userId,
+          conversationId: row.conversationId,
+          status: 'pending',
+          surface: 'voice',
+          claimId: { $in: ['', null] },
+          claimedAt: null,
+          dispatchPermitId: { $in: ['', null] },
+          ...terminalCallbackFields(reference),
+        },
+        {
+          $set: {
+            status: 'suppressed',
+            suppressedAt: now,
+            nextAttemptAt: null,
+            lastError: 'call_ended_linked_text',
+            projectionPendingAt: now,
+            projectionNextAttemptAt: now,
+          },
+        },
+        { new: true, session },
+      ),
+      session,
+    );
+    if (!updated) return row;
+    await recordGlassHiveLinkedWebDelivery({
+      body: {
+        callback_id: reference.callbackId,
+        event: row.event,
+        attempt_number: deliveryAttemptNumber(row) ?? null,
+        worker_id: row.workerId,
+        run_id: row.runId,
+      },
+      message,
+      deliveryContext: {
+        ownerId: row.userId,
+        conversationId: row.conversationId,
+        originRef: row.originRef,
+        workRef: row.workRef,
+        destinations,
+        traceIdentity: {
+          callbackRef: row.callbackId,
+          attemptNumber: deliveryAttemptNumber(row) ?? null,
+        },
+      },
+      effectFence: fence,
+      effectSession: session,
+    });
+    return updated;
+  };
+  if (effectSession && effectFence) return settle(effectSession, effectFence);
+  return runGlassHiveTerminalCallbackTransaction(async (session) => {
+    const lease = await acquireGlassHiveTerminalCallbackAcceptedOperationEffectLease({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      reference,
+      session,
+    });
+    if (!lease) return row;
+    try {
+      await fenceGlassHiveTerminalCallbackEffectTransaction({
+        ResultModel: GlassHiveTerminalCallbackResult,
+        lease,
+        session,
+      });
+      return await settle(session, lease);
+    } finally {
+      await releaseGlassHiveTerminalCallbackEffectLease({
+        ResultModel: GlassHiveTerminalCallbackResult,
+        lease,
+        session,
+      });
+    }
+  });
+}
+
 async function enqueueGlassHiveCallbackDelivery({
   body,
   message,
@@ -868,8 +1207,16 @@ async function enqueueGlassHiveCallbackDelivery({
   // Successful terminal prose is authored only by Main after the 2s account coalescing window.
   // Do not race that synthesis with a direct worker callback delivery. Failure/input/stop statuses
   // remain immediate, neutral, and actionable.
-  if (!message || destinations.length === 0) {
-    return summary;
+  if (!message) return summary;
+  if (destinations.length === 0) {
+    const linked = await recordGlassHiveLinkedWebDelivery({
+      body,
+      message,
+      deliveryContext,
+      effectFence,
+      effectSession,
+    });
+    return linked ? { ...summary, linkedWebCommitted: true } : summary;
   }
   if (!shouldDispatchNeutralStatus(body)) {
     return { ...summary, deferredToMain: true };
@@ -1065,6 +1412,7 @@ async function enqueueGlassHiveCallbackDelivery({
         ).lean();
       }
 
+      updated = await settleEndedCallNeutralDelivery(updated, { effectFence, effectSession });
       if (updated?.status === 'unresolved') {
         summary.unresolved += 1;
       } else {
@@ -2415,13 +2763,23 @@ async function reconcileGlassHiveSurfaceDeliveryProjections({ limit = 25 } = {})
         $or: [{ projectionNextAttemptAt: null }, { projectionNextAttemptAt: { $lte: now } }],
       },
       { projectionPendingAt: null, projectionAppliedAt: null },
+      {
+        surface: 'voice',
+        status: 'pending',
+        event: { $in: ['run.failed', 'run.cancelled', 'run.interrupted'] },
+        claimId: { $in: ['', null] },
+        claimedAt: null,
+        dispatchPermitId: { $in: ['', null] },
+        $or: [{ projectionNextAttemptAt: null }, { projectionNextAttemptAt: { $lte: now } }],
+      },
     ],
   })
     .sort({ projectionNextAttemptAt: 1, projectionPendingAt: 1, updatedAt: 1 })
     .limit(safeLimit)
     .lean();
   const origins = new Map();
-  for (const row of Array.isArray(rows) ? rows : []) {
+  for (let row of Array.isArray(rows) ? rows : []) {
+    row = await settleEndedCallNeutralDelivery(row);
     const originRef = normalizeText(row?.originRef);
     if (originRef && !origins.has(originRef)) origins.set(originRef, row);
   }
@@ -2431,6 +2789,12 @@ async function reconcileGlassHiveSurfaceDeliveryProjections({ limit = 25 } = {})
     const accepted = await recordSurfaceOutcomeBestEffort(originRef, row.status, row);
     if (accepted) projected += 1;
     else pending += 1;
+    if (pendingNeutralVoiceDelivery(row)) {
+      await ViventiumGlassHiveCallbackDelivery.updateOne(
+        { deliveryId: row.deliveryId, status: 'pending' },
+        { $set: { projectionNextAttemptAt: new Date(now.getTime() + PROJECTION_RETRY_MS) } },
+      );
+    }
   }
   return { scanned: Array.isArray(rows) ? rows.length : 0, projected, pending };
 }

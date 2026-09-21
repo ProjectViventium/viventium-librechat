@@ -1573,12 +1573,7 @@ class GenerationJobManagerClass {
     } else if (!expectedCortexPresentation) {
       const acknowledgementBinding = await this.runLifecycleOperation(
         lifecycle,
-        () =>
-          lifecycle.jobStore.bindDeliveryAcknowledgement(
-            ownerStreamId,
-            result.acknowledgement!,
-            null,
-          ),
+        () => lifecycle.jobStore.bindDeliveryAcknowledgement(ownerStreamId, acknowledgement, null),
         ownerStreamId,
         runtime,
       );

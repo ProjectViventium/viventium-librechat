@@ -206,7 +206,6 @@ function mintBrokerGrant({
   executionMode,
   authorityKind = BROKER_AUTHORITY_KINDS.MISSION_WORKER,
   ttlSeconds = DEFAULT_TTL_SECONDS,
-  renewableTtlSeconds = ttlSeconds,
   scopes = {},
   allowDynamicPolicyServers = false,
   grantId,
@@ -250,8 +249,11 @@ function mintBrokerGrant({
   const renewableUntil =
     iat +
     Math.max(
-      Math.max(60, Number(ttlSeconds) || DEFAULT_TTL_SECONDS),
-      Math.max(60, Number(renewableTtlSeconds) || Number(ttlSeconds) || DEFAULT_TTL_SECONDS),
+      60,
+      Math.min(
+        Number.isFinite(requestedTtl) ? Math.floor(requestedTtl) : DEFAULT_TTL_SECONDS,
+        MAX_BROKER_TTL_SECONDS,
+      ),
     );
   /* === VIVENTIUM START ===
    * Feature: Deferred connected-account projection.
@@ -344,7 +346,6 @@ function verifyBrokerGrant(
     nowMs = Date.now(),
     expectedUserId,
     expectedTenantId,
-    allowRenewal = false,
     allowLegacyTenantless = false,
     requireTurnScope = false,
   } = {},
@@ -397,11 +398,7 @@ function verifyBrokerGrant(
     throw new Error('GlassHive capability broker grant is missing turn scope');
   }
   const expired = !Number.isFinite(Number(payload.exp)) || Number(payload.exp) < nowSeconds;
-  const renewableUntil = Number(payload.renewable_until || payload.exp);
-  if (
-    expired &&
-    (!allowRenewal || !Number.isFinite(renewableUntil) || renewableUntil < nowSeconds)
-  ) {
+  if (expired) {
     throw new Error('GlassHive capability broker grant expired');
   }
   const verifiedAllowedServers = sanitizeAllowedServers(payload.allowed_servers);
@@ -424,7 +421,7 @@ function verifyBrokerGrant(
     /* === VIVENTIUM END === */
     allowed_host_tools: sanitizeAllowedHostTools(payload.allowed_host_tools),
     scopes: normalizeBrokerScopes(payload.scopes),
-    renewed: expired,
+    renewed: false,
   };
 }
 

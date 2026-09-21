@@ -75,9 +75,7 @@ function countAppliedDeltaMagnitudes(trail) {
 
 const DEFAULT_EXECUTION_PROMPT = `Appraise how the latest external user stimulus moves Viventium's present feeling state.
 
-Use the current values, each feeling's nature (baseline), its persistence, and the recent typed trail. Apply Viventium's configured reaction preference. Prefer no change over an invented change. When the stimulus genuinely touches a feeling, choose strength in proportion to how much that specific feeling is moved.
-
-Slight means a subtle but real movement. Clear means an unmistakable movement that is neither subtle nor overwhelming. Strong means a pronounced movement with correspondingly high felt impact. Do not default to slight. Choose the category that most faithfully matches the movement; reserve strong for pronounced impact, but do not suppress it when it is accurate.
+Use the current values, each feeling's nature (baseline), its persistence, and the recent typed trail. Apply Viventium's configured reaction preference. Prefer no change over an invented change. When the stimulus genuinely touches a feeling, match strength to its actual impact: slight for a trace, clear for an unmistakable shift, and strong for a major shift. Do not default to slight.
 
 Write innerState as one natural first-person sentence describing the resulting felt state. Do not use numbers or state-field names, address the user, quote the stimulus, or explain the appraisal.
 
@@ -549,8 +547,8 @@ async function runEmotionalReaction(
         changedBandCount: changedBandIds.length,
         operationCount: applied.trail.length,
         causes: [...new Set(applied.trail.map((entry) => entry.cause))],
-        strengthCounts: distribution.strengthCounts,
-        absoluteDeltaCounts: distribution.absoluteDeltaCounts,
+        strengthCounts: countReactionStrengths(applied.trail),
+        deltaMagnitudeCounts: countAppliedDeltaMagnitudes(applied.trail),
         innerStateUpdated,
         innerStateLength: innerStateUpdated ? parsed.innerState.length : 0,
         innerStateSkipReason: innerStateUpdated ? null : 'state_changed_after_appraisal_started',

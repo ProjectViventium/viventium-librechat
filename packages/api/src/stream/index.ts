@@ -1,6 +1,8 @@
 export {
   GenerationJobManager,
   GenerationJobManagerClass,
+  DURABLE_WORK_ACCEPTED_TEXT,
+  DURABLE_WORK_ACTION_ACCEPTED_TEXT,
   type GenerationJobManagerOptions,
 } from './GenerationJobManager';
 
@@ -16,6 +18,8 @@ export type {
   InteractionAdapterCapabilities,
   InteractionDeliveryPolicy,
   InteractionDeliveryAck,
+  SourceOrderObservation,
+  SourceOrderObservationResult,
   DeliveryAcknowledgementResult,
   DeliveryAcknowledgementState,
   CortexPresentationBinding,

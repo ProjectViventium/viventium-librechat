@@ -126,6 +126,10 @@ const {
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
 
 const {
+  bindMainContextSnapshot,
+  getMainContextSnapshot,
+} = require('~/server/services/viventium/ViventiumMainContextService');
+const {
   getTrustedInteractionContext,
   getTrustedAdapterCapabilities,
   getTrustedDeliveryPolicy,
@@ -1176,6 +1180,83 @@ function filterCortexContentFromLangChainMessages(messages) {
       }
       return true;
     });
+}
+
+/* === VIVENTIUM START ===
+ * Feature: MainContextSnapshotV1 parity for primary background cortex runs.
+ * Purpose: Reuse the accepted Main snapshot as the cortex provider's authority carrier. The
+ * snapshot is optional for internal/non-Main paths; an existing but unbindable snapshot fails
+ * closed before the cortex provider can run.
+ * === VIVENTIUM END === */
+function bindCortexMainContextSnapshot(req, targetAgent, { required = false } = {}) {
+  const snapshot = getMainContextSnapshot(req);
+  if (!snapshot) {
+    if (required) {
+      const error = new Error(
+        'Background cortex cannot use a workspace provider without the request-pinned Main context.',
+      );
+      error.code = 'phase_b_main_context_unavailable';
+      throw error;
+    }
+    return { bound: false, snapshot: null };
+  }
+
+  const existingHeaders = targetAgent?.model_parameters?.configuration?.defaultHeaders;
+  const protectedKeys = [
+    'X-Viventium-Main-Context-Protocol',
+    'X-Viventium-Main-Context-Owner',
+    'X-GlassHive-Stable-Authority-SHA256',
+    'X-Viventium-Main-Context-Snapshot-SHA256',
+    'X-Viventium-Main-Context-Epoch',
+    'X-Viventium-Continuity-Domain-Id',
+    'X-Viventium-Continuity-Agent-Id',
+    'X-Viventium-Logical-Turn-Id',
+    'X-Viventium-Logical-Turn-Revision',
+  ];
+  const expectedHeaders = {
+    'X-Viventium-Main-Context-Protocol': 'main_context_v1',
+    'X-Viventium-Main-Context-Owner': 'core',
+    'X-GlassHive-Stable-Authority-SHA256': snapshot.stableAuthoritySha256,
+    'X-Viventium-Main-Context-Snapshot-SHA256': snapshot.snapshotSha256,
+    'X-Viventium-Main-Context-Epoch': snapshot.contextEpoch,
+    'X-Viventium-Continuity-Domain-Id': snapshot.continuityDomainId,
+    'X-Viventium-Continuity-Agent-Id': snapshot.agentId,
+    'X-Viventium-Logical-Turn-Id': snapshot.logicalTurnId,
+    'X-Viventium-Logical-Turn-Revision': String(snapshot.revision),
+  };
+  const hasExistingMainBinding =
+    existingHeaders &&
+    protectedKeys
+      .filter((key) => key !== 'X-GlassHive-Stable-Authority-SHA256')
+      .some((key) => Object.prototype.hasOwnProperty.call(existingHeaders, key));
+  if (
+    hasExistingMainBinding &&
+    protectedKeys.some(
+      (key) =>
+        existingHeaders[key] != null &&
+        String(existingHeaders[key]) !== String(expectedHeaders[key] || ''),
+    )
+  ) {
+    const error = new Error('Background cortex Main context binding does not match the accepted snapshot.');
+    error.code = 'phase_b_main_context_binding_failed';
+    throw error;
+  }
+
+  if (!bindMainContextSnapshot(targetAgent, snapshot)) {
+    const error = new Error('Background cortex could not bind the accepted Main context snapshot.');
+    error.code = 'phase_b_main_context_binding_failed';
+    throw error;
+  }
+  const boundHeaders = targetAgent.model_parameters?.configuration?.defaultHeaders || {};
+  const boundExactly = protectedKeys.every(
+    (key) => String(boundHeaders[key] || '') === String(expectedHeaders[key] || ''),
+  );
+  if (!boundExactly) {
+    const error = new Error('Background cortex Main context binding verification failed.');
+    error.code = 'phase_b_main_context_binding_failed';
+    throw error;
+  }
+  return { bound: true, snapshot };
 }
 
 function getActivationFormat(config) {
@@ -2966,6 +3047,18 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
   });
 }
 
+function buildCortexPromptFrame({ agentId, decisionState = {}, ...frame }) {
+  const normalizedAgentId = typeof agentId === 'string' ? agentId.trim() : '';
+  return buildPromptFrame({
+    ...frame,
+    agentId: normalizedAgentId,
+    decisionState: {
+      ...decisionState,
+      agent_id_hash: normalizedAgentId ? hashString(normalizedAgentId) : 'missing',
+    },
+  });
+}
+
 async function invokeActivationClassifierAttempt({
   agentId,
   providerName,
@@ -2979,7 +3072,8 @@ async function invokeActivationClassifierAttempt({
   const runIdSuffix = `${providerName}-${model}`.replace(/[^a-z0-9_-]+/gi, '_');
   logPromptFrame(
     logger,
-    buildPromptFrame({
+    buildCortexPromptFrame({
+      agentId,
       promptFamily: 'cortex_activation',
       surface: resolveViventiumSurface(req),
       provider: providerName,
@@ -2994,9 +3088,6 @@ async function invokeActivationClassifierAttempt({
       },
       flags: {
         has_abort_signal: !!abortController?.signal,
-      },
-      decisionState: {
-        agent_id_hash: hashString(agentId, 12),
       },
     }),
   );
@@ -3544,6 +3635,16 @@ async function prepareCortexConversationProviderCapability({
   installRefresher = installConversationProviderCapabilityRefresher,
   bindCancellation = bindHarnessCancellation,
 }) {
+  if (targetAgent && capability?.workspace_binding === true) {
+    const modelParameters = { ...(targetAgent.model_parameters || {}) };
+    const configuration = { ...(modelParameters.configuration || {}) };
+    configuration.defaultHeaders = {
+      ...(configuration.defaultHeaders || {}),
+      'X-GlassHive-Access': 'read_only',
+    };
+    modelParameters.configuration = configuration;
+    targetAgent.model_parameters = modelParameters;
+  }
   const providerSessionMode = String(
     declaredAgent?.viventiumProviderSessionMode || targetAgent?.viventiumProviderSessionMode || '',
   )
@@ -3601,6 +3702,7 @@ async function executeCortexOnce(
     messages,
     runId,
     conversationId = null,
+    activeMessageId = null,
     req,
     res,
     activationScope = null,
@@ -3609,7 +3711,9 @@ async function executeCortexOnce(
     executionTimeoutMs = null,
     signal = null,
     insightMode = 'user_facing',
+    harnessAttemptRole = 'primary',
     resultEvidence = null,
+    resultEvidencePolicy = null,
     onHarnessCancellationOutcome = null,
   },
   {
@@ -3699,7 +3803,8 @@ async function executeCortexOnce(
      * Note: This mirrors the main agent behavior (AgentClient.buildMessages → useMemory()) but
      * does NOT run memory updates for cortex outputs (only reads existing memory for context).
      */
-    const memoryContextBlock = minimalContext ? '' : await getUserMemoryContextBlock(safeReq);
+    const memoryContextBlock =
+      minimalContext || productivityScope ? '' : await getUserMemoryContextBlock(safeReq);
     if (memoryContextBlock) {
       agentForRun.instructions = [agentForRun.instructions || '', memoryContextBlock]
         .filter((part) => typeof part === 'string' && part.trim().length > 0)
@@ -3802,7 +3907,8 @@ async function executeCortexOnce(
       completed: 0,
       names: new Set(),
     };
-    toolEvidence = createCortexToolEvidence(resultEvidence, (output) => {
+    const declaredResultEvidence = resultEvidence ?? resultEvidencePolicy;
+    toolEvidence = createCortexToolEvidence(declaredResultEvidence, (output) => {
       toolExecutionState.completed += 1;
       completedToolCalls = toolExecutionState.completed;
       if (output.name) toolExecutionState.names.add(output.name);
@@ -3900,6 +4006,7 @@ async function executeCortexOnce(
         streamId,
         requestFiles: safeReq.body.files ?? [],
         conversationId: resolvedConversationId ?? null,
+        activeMessageId,
         agent: agentForRun,
         endpointOption: { endpoint: EModelEndpoint.agents },
         allowedProviders,
@@ -3916,6 +4023,10 @@ async function executeCortexOnce(
         getLatestRecallEligibleMessageCreatedAt: db.getLatestRecallEligibleMessageCreatedAt,
       },
     );
+
+    bindCortexMainContextSnapshot(safeReq, initializedAgent, {
+      required: cortexCapability?.workspace_binding === true,
+    });
 
     const backgroundFeelingTail = feelingTailForBackgroundAgent(safeReq._viventiumFeelingSnapshot);
     if (backgroundFeelingTail) {
@@ -4094,7 +4205,8 @@ async function executeCortexOnce(
     /* === VIVENTIUM NOTE === */
     logPromptFrame(
       logger,
-      buildPromptFrame({
+      buildCortexPromptFrame({
+        agentId: agentForRun.id,
         promptFamily: 'cortex_execution',
         surface,
         provider: initializedAgent.provider || agentForRun.provider,
@@ -4129,7 +4241,6 @@ async function executeCortexOnce(
         decisionState: {
           activation_scope_present: !!activationScope,
           productivity_scope_present: !!productivityScope,
-          agent_id_hash: hashString(agent?.id, 12),
         },
         voiceText: initializedAgent.instructions || agentForRun.instructions || '',
       }),
@@ -4147,7 +4258,11 @@ async function executeCortexOnce(
      * Reason: Anthropic SDK streaming can emit control characters that break JSON parsing in background runs.
      */
     const cortexProvider = (initializedAgent.provider || '').toLowerCase();
-    const cortexIdempotencyKey = buildHarnessIdempotencyKey('cortex', runId, agentForRun.id);
+    const cortexIdempotencyKey = buildHarnessIdempotencyKey(
+      harnessAttemptRole === 'fallback' ? 'cortex-fallback' : 'cortex',
+      runId,
+      agentForRun.id,
+    );
     const cortexRequestBody = buildCortexRequestBody({
       requestBody: safeReq.body,
       runId,
@@ -4262,11 +4377,25 @@ async function executeCortexOnce(
         agentId: agent.id,
         agentName: agent.name || agent.id,
         insight: null,
-        error: 'missing_required_evidence',
-        errorClass: 'missing_required_evidence',
+        resultEvidenceStatus: 'missing_required_receipt',
+        verifiedEvidenceToolReceipts: toolEvidence.verifiedReceiptCount(),
         activationScope,
         configuredTools: configuredToolCount,
         completedToolCalls: toolExecutionState.completed || 0,
+        harnessInvocationStarted: harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
+      };
+    }
+
+    if (productivityScope && toolExecutionState.completed === 0) {
+      return {
+        agentId: agent.id,
+        agentName: agent.name || agent.id,
+        insight: null,
+        error: 'no_live_tool_execution',
+        errorClass: 'no_live_tool_execution',
+        activationScope,
+        configuredTools: configuredToolCount,
+        completedToolCalls: 0,
         harnessInvocationStarted: harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
       };
     }
@@ -4301,6 +4430,12 @@ async function executeCortexOnce(
       configuredTools: configuredToolCount,
       completedToolCalls: toolExecutionState.completed || 0,
       harnessInvocationStarted: harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
+      ...(declaredResultEvidence != null
+        ? {
+            resultEvidenceStatus: 'satisfied',
+            verifiedEvidenceToolReceipts: toolEvidence.verifiedReceiptCount(),
+          }
+        : {}),
     };
     executionStage = 'completed_result_acceptance';
     return await finalizeCortexResultDelivery(cortexResult, {
@@ -4604,6 +4739,7 @@ async function executeCortex(params, { executeOnce = executeCortexOnce } = {}) {
   const fallbackResult = await executeOnce({
     ...params,
     agent: fallbackAgent,
+    harnessAttemptRole: 'fallback',
   });
   return {
     ...fallbackResult,
@@ -5141,18 +5277,27 @@ async function detectActivations({
  * @param {Function} [params.onAllComplete] - Callback when ALL cortices complete with merged insights
  * @returns {Promise<{ insights: Array }>}
  */
-async function executeActivated({
-  req,
-  res,
-  mainAgent,
-  messages,
-  runId,
-  conversationId = null,
-  activatedCortices,
-  onCortexBrewing,
-  onCortexComplete,
-  onAllComplete,
-}) {
+async function executeActivated(
+  {
+    req,
+    res,
+    mainAgent,
+    messages,
+    runId,
+    conversationId = null,
+    activeMessageId = null,
+    activatedCortices,
+    onCortexBrewing,
+    onCortexComplete,
+    onAllComplete,
+  },
+  {
+    loadAgentFn = loadAgent,
+    loadModelsConfigFn = loadModelsConfigForCortexFallback,
+    resolveFallbackAgentFn = resolveBackgroundCortexFallbackAgent,
+    executeCortexFn = executeCortex,
+  } = {},
+) {
   if (!activatedCortices.length) {
     return { insights: [] };
   }
@@ -5170,7 +5315,7 @@ async function executeActivated({
   let modelsConfigPromise = null;
   const getModelsConfigOnce = () => {
     if (!modelsConfigPromise) {
-      modelsConfigPromise = loadModelsConfigForCortexFallback(req).catch((error) => {
+      modelsConfigPromise = loadModelsConfigFn(req).catch((error) => {
         logger.warn(
           '[BackgroundCortexService] Failed to load models config for cortex fallback',
           sanitizeRuntimeErrorForLog(error),
@@ -5181,11 +5326,12 @@ async function executeActivated({
     return modelsConfigPromise;
   };
   const runCortexWithGuard = async ({ agent, activationResult }) => {
-    const cortexPromise = executeCortex({
+    const cortexPromise = executeCortexFn({
       agent,
       messages,
       runId,
       conversationId,
+      activeMessageId,
       req,
       res,
       activationScope: activationResult.activationScope || null,
@@ -5218,7 +5364,7 @@ async function executeActivated({
   const executionPromises = activatedCortices.map(async (activationResult) => {
     try {
       // Load the cortex agent
-      const cortexAgent = await loadAgent({
+      const cortexAgent = await loadAgentFn({
         req,
         agent_id: activationResult.agentId,
         endpoint: mainAgent.provider,
@@ -5306,7 +5452,7 @@ async function executeActivated({
       }
 
       const fallbackAgent = resolveFallbackAssignment(cortexAgent)
-        ? await resolveBackgroundCortexFallbackAgent({
+        ? await resolveFallbackAgentFn({
             cortexAgent,
             req,
             modelsConfig: await getModelsConfigOnce(),
@@ -5494,6 +5640,8 @@ async function executeActivated({
         cortexName: sanitizeCortexDisplayName(r.agentName),
         error: publicError.message,
         error_class: publicError.errorClass,
+        ...(r.errorCode ? { error_code: r.errorCode } : {}),
+        ...(r.retryable === true ? { retryable: true } : {}),
         activationScope: r.activationScope || null,
         configured_tools: r.configuredTools || 0,
         completed_tool_calls: r.completedToolCalls || 0,
@@ -5866,6 +6014,7 @@ Consider these insights in your response, but do not explicitly mention them unl
 }
 
 module.exports = {
+  bindCortexMainContextSnapshot,
   executeCortexOnce,
   extractCompletedCortexGraphInsight,
   normalizeCortexInsight,
@@ -5927,6 +6076,7 @@ module.exports = {
   // Exported for unit testing only
   extractCortexErrorCode,
   classifyCortexPublicError,
+  buildCortexPromptFrame,
   createBackgroundRes,
   memoryReadUnavailableContext,
   buildCortexRequestBody,

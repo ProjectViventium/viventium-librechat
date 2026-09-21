@@ -61,11 +61,11 @@ jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
   deleteVectors: (...args) => mockDeleteVectors(...args),
 }));
 
-jest.doMock('../GlassHiveTerminalCallbackTransaction', () => ({
+jest.mock('../GlassHiveTerminalCallbackTransaction', () => ({
   deferGlassHiveTerminalCallbackAfterCommit: (...args) => mockDeferAfterCommit(...args),
 }));
 
-jest.doMock('~/db/models', () => ({
+jest.mock('~/db/models', () => ({
   Agent: {
     findOne: (...args) => mockAgentFindOne(...args),
     find: jest.fn(),
@@ -144,6 +144,9 @@ function queryResult(result) {
 
 describe('conversationRecallService', () => {
   beforeEach(() => {
+    jest.useRealTimers();
+    global.setTimeout = require('node:timers').setTimeout;
+    global.clearTimeout = require('node:timers').clearTimeout;
     jest.resetModules();
     jest.clearAllMocks();
 
@@ -1486,11 +1489,10 @@ describe('conversationRecallService', () => {
     });
 
     expect(afterCommit).toHaveLength(1);
-    expect(scheduleTimer).not.toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBe(0);
     expect(mockMessageFind).not.toHaveBeenCalled();
 
     await afterCommit[0]();
-    expect(scheduleTimer).toHaveBeenCalledTimes(1);
     await jest.runOnlyPendingTimersAsync();
     await Promise.resolve();
 
@@ -1502,11 +1504,10 @@ describe('conversationRecallService', () => {
       conversationId: 'conv_aborted',
     });
     expect(afterCommit).toHaveLength(2);
-    expect(scheduleTimer).not.toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBe(0);
 
     await jest.runOnlyPendingTimersAsync();
     expect(mockMessageFind).toHaveBeenCalledTimes(1);
-    scheduleTimer.mockRestore();
   });
 
   test('applies cooldown after transient sync failure', async () => {

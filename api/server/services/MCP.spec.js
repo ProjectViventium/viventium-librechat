@@ -137,6 +137,20 @@ jest.mock('./GraphTokenService', () => ({
   getGraphApiToken: jest.fn(),
 }));
 
+/* === VIVENTIUM START ===
+ * Feature: Parallel Work MCP handoff.
+ * Purpose: Isolate capability projection and durable launch reconciliation in upstream MCP tests.
+ */
+jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () => ({
+  maybeInjectGlassHiveCapabilityBroker: jest.fn(async ({ toolArguments }) => toolArguments),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveCallbackBindingService', () => ({
+  markGlassHiveLaunchDispatchUnknown: jest.fn(),
+  reconcileGlassHiveLaunchResult: jest.fn(),
+}));
+/* === VIVENTIUM END === */
+
 describe('tests for the new helper functions used by the MCP connection status endpoints', () => {
   let mockGetMCPManager;
   let mockGetFlowStateManager;

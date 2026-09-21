@@ -21,8 +21,18 @@ const crypto = require('crypto');
 const mongoose = require('mongoose');
 const { createVoiceEngagementAttestationService } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
-const { ViventiumCallSession, ViventiumVoiceSpeakerSegment } = require('~/db/models');
-const { getUserById, updateUserViventiumVoicePreferences } = require('~/models');
+const {
+  File,
+  Message,
+  ViventiumCallSession,
+  ViventiumVoiceSpeakerSegment,
+} = require('~/db/models');
+const { getConvo, getUserById, updateUserViventiumVoicePreferences } = require('~/models');
+const {
+  normalizeVoiceContextKeyterms,
+  voiceContextKeytermsFromFiles,
+  voiceContextKeytermsFromNativeFiles,
+} = require('./VoiceContextKeyterms');
 const { resolveVoiceOverrideAssignment } = require('./voiceLlmOverride');
 const { rewriteAgentForRuntime } = require('../../../../scripts/viventium-agent-runtime-models');
 
@@ -403,6 +413,8 @@ function normalizeSession(session) {
   const speakerSessionRevision = Number.isFinite(Number(session.speakerSessionRevision))
     ? Number(session.speakerSessionRevision)
     : 0;
+  const callFailure = publicCallFailure(session.callFailure);
+  const contextualKeyterms = normalizeVoiceContextKeyterms(session.contextualKeyterms);
   const sharedTrackSids = Array.isArray(session.speakerSharedTrackSids)
     ? [
         ...new Set(
@@ -423,7 +435,6 @@ function normalizeSession(session) {
         ),
       ].sort()
     : null;
-  const callFailure = publicCallFailure(session.callFailure);
   return {
     version: 1,
     callSessionId: session.callSessionId,
@@ -436,6 +447,7 @@ function normalizeSession(session) {
     createdAtMs: createdAt,
     expiresAtMs: expiresAt,
     requestedVoiceRoute: normalizeVoiceRouteState(session.requestedVoiceRoute),
+    ...(contextualKeyterms.length ? { contextualKeyterms } : {}),
     speakerAttributionState,
     sharedTrackSids,
     sharedParticipantIdentities,
@@ -585,6 +597,53 @@ async function resolveCallSessionAssistantRoute(
   };
 }
 
+async function resolveVoiceContextKeyterms({ userId, conversationId }) {
+  const normalizedConversationId = String(conversationId || '').trim();
+  if (!userId || !normalizedConversationId || normalizedConversationId === 'new') {
+    return [];
+  }
+
+  try {
+    const conversation = await getConvo(userId, normalizedConversationId, 'files');
+    const fileIds = Array.isArray(conversation?.files)
+      ? conversation.files.filter((fileId) => typeof fileId === 'string' && fileId.trim())
+      : [];
+    const files = fileIds.length
+      ? await File.find({
+          user: String(userId),
+          file_id: { $in: fileIds },
+        })
+          .select({
+            _id: 0,
+            filename: 1,
+            'metadata.meetingTranscriptDisplayTitle': 1,
+            'metadata.meetingTranscriptOriginalFilename': 1,
+          })
+          .lean()
+      : [];
+    const nativeFileMessages = await Message.find({
+      user: String(userId),
+      conversationId: normalizedConversationId,
+      isCreatedByUser: false,
+      'metadata.viventium.nativeFiles': { $exists: true, $ne: [] },
+    })
+      .select({ _id: 0, 'metadata.viventium.nativeFiles': 1 })
+      .lean();
+    const nativeFiles = nativeFileMessages.flatMap(
+      (message) => message.metadata?.viventium?.nativeFiles || [],
+    );
+    return normalizeVoiceContextKeyterms([
+      ...voiceContextKeytermsFromFiles(files),
+      ...voiceContextKeytermsFromNativeFiles(nativeFiles),
+    ]);
+  } catch (_error) {
+    logger.warn('[VIVENTIUM][CallSession] Contextual voice keyterms unavailable', {
+      code: 'voice_context_keyterms_unavailable',
+    });
+    return [];
+  }
+}
+
 async function createCallSession({ userId, agentId, conversationId, ttlMs }) {
   if (!userId) {
     throw new Error('createCallSession requires userId');
@@ -604,6 +663,8 @@ async function createCallSession({ userId, agentId, conversationId, ttlMs }) {
     error.retryable = false;
     throw error;
   }
+
+  const contextualKeyterms = await resolveVoiceContextKeyterms({ userId, conversationId });
 
   const callSessionId = crypto.randomUUID();
   const createdAtMs = Date.now();
@@ -638,14 +699,11 @@ async function createCallSession({ userId, agentId, conversationId, ttlMs }) {
     mode: 'call',
     callStatus: 'created',
     requestedVoiceRoute: normalizedRequestedVoiceRoute,
+    ...(contextualKeyterms.length ? { contextualKeyterms } : {}),
   };
 
   const saved = await ViventiumCallSession.create(session);
 
-  /* === VIVENTIUM START ===
-   * Feature: Voice diagnostics privacy.
-   * Purpose: Record lifecycle state without persisting user, agent, conversation, room, or session identifiers.
-   * === VIVENTIUM END === */
   logger.debug?.('[VIVENTIUM][CallSession] created');
 
   return {
@@ -667,26 +725,32 @@ async function getCallSession(callSessionId) {
   return normalizeSession(session);
 }
 
-/** Resolve only the current live Call for a completion already bound to this owner and chat. */
-async function getActiveCallSessionForConversation({ userId, conversationId } = {}) {
-  const owner = normalizeVoiceRouteText(userId, 160);
-  const conversation = normalizeVoiceRouteText(conversationId, 160);
-  if (!owner || !conversation || conversation === 'new') return null;
-  const now = new Date();
-  const session = await ViventiumCallSession.findOne({
-    userId: owner,
-    conversationId: conversation,
-    expiresAt: { $gt: now },
-    leaseExpiresAt: { $gt: now },
-    callStatus: { $in: ['listening', 'speaking', 'working', 'needs_input', 'degraded'] },
-  })
-    .sort({ updatedAt: -1, createdAt: -1 })
-    .lean();
-  const normalized = normalizeSession(session);
-  if (normalized?.mode !== 'call' || !normalized.activeJobId || !normalized.activeWorkerId) {
+/* === VIVENTIUM START ===
+ * Feature: Current-call Worker completion delivery.
+ * Purpose: A background result may speak only into one exact, actively leased owner/conversation
+ * call. Ambiguous, ended, expired, or detached sessions fail closed and never trigger a call.
+ * === VIVENTIUM END === */
+async function getActiveCallSessionForConversation({ userId, conversationId, now = new Date() }) {
+  const normalizedUserId = String(userId || '').trim();
+  const normalizedConversationId = String(conversationId || '').trim();
+  const observedAt = now instanceof Date ? now : new Date(now);
+  if (!normalizedUserId || !normalizedConversationId || !Number.isFinite(observedAt.getTime())) {
     return null;
   }
-  return normalized;
+  const sessions = await ViventiumCallSession.find({
+    userId: normalizedUserId,
+    conversationId: normalizedConversationId,
+    mode: 'call',
+    callStatus: { $in: ['listening', 'speaking', 'working', 'needs_input', 'degraded'] },
+    expiresAt: { $gt: observedAt },
+    activeJobId: { $type: 'string', $ne: '' },
+    activeWorkerId: { $type: 'string', $ne: '' },
+    leaseExpiresAt: { $gt: observedAt },
+  })
+    .sort({ updatedAt: -1, createdAt: -1 })
+    .limit(2)
+    .lean();
+  return Array.isArray(sessions) && sessions.length === 1 ? normalizeSession(sessions[0]) : null;
 }
 
 /* === VIVENTIUM START ===
@@ -1099,7 +1163,11 @@ async function claimVoiceSession({
     callSessionId: String(callSessionId),
     expiresAt: { $gt: now },
     callStatus: { $ne: 'ended' },
-    $or: [{ activeJobId: String(jobId) }, { activeJobId: null }, { leaseExpiresAt: { $lt: now } }],
+    $or: [
+      { activeJobId: String(jobId), activeWorkerId: String(workerId) },
+      { activeJobId: null },
+      { leaseExpiresAt: { $lt: now } },
+    ],
   };
   if (normalizedDispatchClaimId) {
     filter.dispatchClaimId = normalizedDispatchClaimId;
@@ -1115,9 +1183,7 @@ async function claimVoiceSession({
     update.$unset = { dispatchClaimId: '', dispatchClaimedAt: '' };
   }
 
-  const session = await ViventiumCallSession.findOneAndUpdate(filter, update, {
-    new: true,
-  }).lean();
+  const session = await ViventiumCallSession.findOneAndUpdate(filter, update, { new: true }).lean();
 
   return normalizeSession(session);
 }
@@ -1358,9 +1424,10 @@ async function assertCallSessionSecret(callSessionId, secret) {
 /* === VIVENTIUM START ===
  * Feature: browser-scoped call capability
  * Purpose: Require both the trusted BFF secret and the exact per-session browser capability on
- * browser-facing state/snapshot/control calls. Ended or expired capability is terminal (410).
+ * browser-facing state/snapshot/control calls. Ended is terminal for controls, while the status
+ * route may explicitly read the final record so an already-open playground can settle truthfully.
  * === VIVENTIUM END === */
-async function assertCallBrowserCapability(callSessionId, capability) {
+async function assertCallBrowserCapability(callSessionId, capability, { allowEnded = false } = {}) {
   const incomingHash = hashBrowserCallCapability(capability);
   if (!callSessionId || !incomingHash) {
     const error = new Error('Invalid call browser capability');
@@ -1377,7 +1444,7 @@ async function assertCallBrowserCapability(callSessionId, capability) {
     .lean();
   if (
     !session ||
-    session.callStatus === 'ended' ||
+    (session.callStatus === 'ended' && !allowEnded) ||
     !session.expiresAt ||
     new Date(session.expiresAt) <= now ||
     !session.browserCapabilityExpiresAt ||
@@ -1401,7 +1468,7 @@ async function assertCallBrowserCapability(callSessionId, capability) {
   return normalizeSession(session);
 }
 
-async function assertVoiceGatewayAuth(req, { nowMs } = {}) {
+async function assertVoiceGatewayAuth(req, { nowMs, allowEnded = false } = {}) {
   const callSessionId =
     req.get('X-VIVENTIUM-CALL-SESSION') || req.get('x-viventium-call-session') || '';
   const secret = req.get('X-VIVENTIUM-CALL-SECRET') || req.get('x-viventium-call-secret') || '';
@@ -1485,7 +1552,20 @@ async function assertVoiceGatewayAuth(req, { nowMs } = {}) {
     err.status = 401;
     throw err;
   }
+  /* === VIVENTIUM START ===
+   * Feature: terminal call-state acknowledgement
+   * Purpose: An ended session remains terminal for every claim and mutation. Its exact already-
+   * bound worker may make a bounded read of the final state so the gateway can stop polling and
+   * shut down cleanly instead of receiving an endless 410 loop after the browser ends the call.
+   * === VIVENTIUM END === */
   if (session.status === 'ended') {
+    if (
+      allowEnded === true &&
+      session.activeJobId === normalizedJobId &&
+      session.activeWorkerId === normalizedWorkerId
+    ) {
+      return session;
+    }
     const err = new Error('Call session has ended');
     err.status = 410;
     throw err;
@@ -1639,11 +1719,38 @@ function normalizeDispatchError(error) {
   if (!error) {
     return null;
   }
-  const text = String(error);
-  if (text.length <= 300) {
-    return text;
+
+  const knownReasons = new Map([
+    ['dispatch_failed', 'dispatch_failed'],
+    ['dispatch_timeout', 'dispatch_timeout'],
+    ['dispatch_unavailable', 'dispatch_unavailable'],
+    ['dispatch_unauthorized', 'dispatch_unauthorized'],
+    ['dispatch_rate_limited', 'dispatch_rate_limited'],
+    ['ETIMEDOUT', 'dispatch_timeout'],
+    ['ESOCKETTIMEDOUT', 'dispatch_timeout'],
+    ['ECONNREFUSED', 'dispatch_unavailable'],
+    ['ECONNRESET', 'dispatch_unavailable'],
+    ['ENOTFOUND', 'dispatch_unavailable'],
+  ]);
+  const code = typeof error === 'string' ? error : error.code;
+  if (typeof code === 'string' && knownReasons.has(code)) {
+    return knownReasons.get(code);
   }
-  return `${text.slice(0, 300)}...`;
+
+  const status = Number(error?.status ?? error?.statusCode);
+  if (status === 401 || status === 403) {
+    return 'dispatch_unauthorized';
+  }
+  if (status === 408 || status === 504 || error?.name === 'TimeoutError') {
+    return 'dispatch_timeout';
+  }
+  if (status === 429) {
+    return 'dispatch_rate_limited';
+  }
+  if (status >= 500) {
+    return 'dispatch_unavailable';
+  }
+  return 'dispatch_failed';
 }
 
 async function confirmDispatch({ callSessionId, claimId, success, error }) {
@@ -1662,7 +1769,7 @@ async function confirmDispatch({ callSessionId, claimId, success, error }) {
       }
     : {
         $set: {
-          dispatchLastError: normalizeDispatchError(error) || 'dispatch failed',
+          dispatchLastError: normalizeDispatchError(error) || 'dispatch_failed',
           dispatchLastErrorAt: now,
         },
         $unset: { dispatchClaimId: '', dispatchAttemptId: '', dispatchClaimedAt: '' },
@@ -1700,7 +1807,8 @@ async function getDispatchStatus({ callSessionId, claimId }) {
     return { version: 1, status: 'expired', isWorkerClaimed: false };
   }
 
-  if (String(session.dispatchAttemptId || '') !== String(claimId)) {
+  const currentAttemptId = session.dispatchAttemptId || session.dispatchClaimId;
+  if (String(currentAttemptId || '') !== String(claimId)) {
     return { version: 1, status: 'superseded', isWorkerClaimed: false };
   }
 
@@ -1723,8 +1831,8 @@ module.exports = {
   createCallSession,
   createCallBrowserLaunch,
   exchangeCallBrowserLaunch,
-  getCallSession,
   getActiveCallSessionForConversation,
+  getCallSession,
   getCallSessionVoiceSettings,
   heartbeatCallSession,
   markVoiceSessionReady,

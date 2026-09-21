@@ -10,24 +10,19 @@ const { Constants } = require('librechat-data-provider');
 const mockInitializeAgent = jest.fn();
 const mockGetAgent = jest.fn();
 const mockBuildConversationProviderBootstrapBundle = jest.fn();
-const mockLoadAgentTools = jest.fn();
-const mockLoadToolsForExecution = jest.fn();
-const mockProcessAddedConvo = jest.fn();
-const mockGetDefaultHandlers = jest.fn();
-const mockValidateAgentModel = jest.fn();
 const mockCheckPermission = jest.fn();
+const mockValidateAgentModel = jest.fn();
 const mockResolveFallbackCandidates = jest.fn();
 const mockIsFallbackModelValid = jest.fn();
 const mockBuildFallbackAgent = jest.fn();
 const mockIsSameAgentRoute = jest.fn();
 const mockInitializePrimaryAgentWithFallback = jest.fn();
 const mockPrimeFiles = jest.fn(async () => ({ files: [], toolContext: '' }));
+const mockLoadAgentTools = jest.fn(async () => ({ toolDefinitions: [] }));
 const mockStartParallelWorkTurnAuthority = jest.fn();
+const mockApplyVoiceModelOverride = jest.fn();
 
 jest.mock('@librechat/data-schemas', () => ({
-  CORTEX_INSIGHT_DROP_REASONS: [],
-  CORTEX_INSIGHT_FAILURE_REASONS: [],
-  CORTEX_INSIGHT_RECOVERY_DEFERRAL_REASONS: [],
   logger: {
     debug: jest.fn(),
     error: jest.fn(),
@@ -45,7 +40,12 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
-  ...jest.requireActual('@librechat/api'),
+  projectTrustedNativeInteractionHeaders: jest.fn((_req, headers) => headers ?? {}),
+  projectTrustedClientPresentation: jest.fn((body) => body ?? {}),
+  trustedUploadedFilesFromRequestBody: jest.fn((body) => body?.files ?? []),
+  transcriptionAttachmentReferences: jest.fn(() => []),
+  resolveSelectedHistoryAttachments: jest.fn(async () => []),
+  configuredBackgroundWorkerRoute: jest.fn(() => null),
   GenerationJobManager: { setCollectedUsage: jest.fn() },
   applyAgentProviderCapabilityDefaults: jest.fn((agent) => ({ ...agent })),
   createEdgeCollector: jest.fn((checkAgentInit) => {
@@ -68,9 +68,10 @@ jest.mock('@librechat/api', () => ({
     };
   }),
   createSequentialChainEdges: jest.fn(async () => []),
-  filterOrphanedEdges: (...args) =>
-    jest.requireActual('@librechat/api').filterOrphanedEdges(...args),
+  filterOrphanedEdges: jest.fn((edges) => edges),
   getCustomEndpointConfig: jest.fn(() => ({})),
+  isEnabled: jest.fn(() => false),
+  isUserProvided: jest.fn(() => false),
   initializeAgent: (...args) => mockInitializeAgent(...args),
   validateAgentModel: (...args) => mockValidateAgentModel(...args),
 }));
@@ -83,16 +84,17 @@ jest.mock('librechat-data-provider', () => {
     getResponseSender: jest.fn(() => 'Synthetic Agent'),
     isAgentsEndpoint: jest.fn((endpoint) => endpoint === 'agents'),
     isEphemeralAgentId: jest.fn(() => false),
+    isUserProvided: jest.fn((value) => Boolean(value)),
   };
 });
 
 jest.mock('~/server/controllers/agents/callbacks', () => ({
   createToolEndCallback: jest.fn(() => jest.fn()),
-  getDefaultHandlers: (...args) => mockGetDefaultHandlers(...args),
+  getDefaultHandlers: jest.fn(() => ({})),
 }));
 jest.mock('~/server/services/ToolService', () => ({
   loadAgentTools: (...args) => mockLoadAgentTools(...args),
-  loadToolsForExecution: (...args) => mockLoadToolsForExecution(...args),
+  loadToolsForExecution: jest.fn(async () => ({ loadedTools: [] })),
   startParallelWorkTurnAuthority: (...args) => mockStartParallelWorkTurnAuthority(...args),
 }));
 jest.mock('~/server/controllers/ModelController', () => ({
@@ -103,10 +105,13 @@ jest.mock('~/server/controllers/agents/client', () =>
 );
 jest.mock('~/models/Conversation', () => ({ getConvoFiles: jest.fn(async () => []) }));
 jest.mock('./addedConvo', () => ({
-  processAddedConvo: (...args) => mockProcessAddedConvo(...args),
+  processAddedConvo: jest.fn(async ({ userMCPAuthMap }) => ({ userMCPAuthMap })),
 }));
 jest.mock('~/models/Agent', () => ({
-  getAgent: (...args) => mockGetAgent(...args),
+  getAgent: async (...args) => {
+    const agent = await mockGetAgent(...args);
+    return agent ? { _id: agent._id ?? agent.id, ...agent } : agent;
+  },
 }));
 jest.mock('~/server/services/PermissionService', () => ({
   checkPermission: (...args) => mockCheckPermission(...args),
@@ -147,7 +152,7 @@ jest.mock('~/server/services/viventium/voiceLatencyTiming', () => ({
   voiceLatencyNow: jest.fn(() => 0),
 }));
 jest.mock('~/server/services/viventium/voiceLlmOverride', () => ({
-  applyVoiceModelOverride: jest.fn(),
+  applyVoiceModelOverride: (...args) => mockApplyVoiceModelOverride(...args),
   isVoiceCallActive: jest.fn(() => false),
 }));
 jest.mock('~/server/services/viventium/agentLlmFallback', () => ({
@@ -159,20 +164,12 @@ jest.mock('~/server/services/viventium/agentLlmFallback', () => ({
   resolveFallbackCandidates: (...args) => mockResolveFallbackCandidates(...args),
 }));
 jest.mock('~/server/services/viventium/agentGraphResilience', () => ({
-  appendOmittedCapabilityReadiness: jest.fn(),
-  evaluateOptionalAgentCapabilityReadiness: jest.fn(() => ({
-    keep: true,
-    declaredServers: [],
-    readyServers: [],
-    unavailableServers: [],
-    unknownServers: [],
-  })),
   markOptionalAgentInitializationFailed: jest.fn(),
-  synchronizeFallbackGraphResilience: jest.fn(),
 }));
-jest.mock('~/server/services/viventium/scheduledAgentOverride', () => ({
-  applyScheduledAgentOverride: jest.fn(),
+jest.mock('~/server/services/Config/getEndpointsConfig', () => ({
+  getEndpointsConfig: jest.fn(async () => ({})),
 }));
+
 jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () => ({
   buildConversationProviderBootstrapBundle: (...args) =>
     mockBuildConversationProviderBootstrapBundle(...args),
@@ -182,10 +179,14 @@ jest.mock('~/app/clients/tools/util/fileSearch', () => ({
 }));
 
 const { initializeClient } = require('./initialize');
-const { logger } = require('@librechat/data-schemas');
+const {
+  conversationProviderStableAuthorityDigest,
+} = require('~/server/services/viventium/GlassHiveConversationProviderService');
+const {
+  mainRouteTargetForAgent,
+} = require('~/server/services/viventium/ViventiumMainContextService');
 
 const primaryAgent = {
-  _id: 'resource-main-agent',
   id: 'main-agent',
   name: 'Main Agent',
   provider: 'openAI',
@@ -233,7 +234,7 @@ function makeInitializedConfig(agent) {
 }
 
 async function initializeWithHandoff(handoffAgent) {
-  mockGetAgent.mockResolvedValue(handoffAgent);
+  mockGetAgent.mockResolvedValue({ _id: handoffAgent.id, ...handoffAgent });
   mockInitializeAgent.mockImplementation(async ({ agent }) => makeInitializedConfig(agent));
   const endpointOption = {
     agent: Promise.resolve({ ...primaryAgent }),
@@ -242,58 +243,11 @@ async function initializeWithHandoff(handoffAgent) {
   return initializeClient({ req: makeRequest(), res: {}, signal: null, endpointOption });
 }
 
-async function invokeMainOnlyGraph(initializedMain, runId) {
-  const { MultiAgentGraph, Providers } = jest.requireActual('@librechat/agents');
-  const { AIMessageChunk, HumanMessage } = jest.requireActual('@langchain/core/messages');
-  const graph = new MultiAgentGraph({
-    runId,
-    agents: [
-      {
-        agentId: initializedMain.id,
-        name: initializedMain.name,
-        provider: Providers.OPENAI,
-        clientOptions: { model: initializedMain.model },
-        tools: initializedMain.tools,
-        toolDefinitions: initializedMain.toolDefinitions,
-        toolRegistry: initializedMain.toolRegistry,
-      },
-    ],
-    edges: initializedMain.edges,
-  });
-  graph.overrideModel = {
-    async *stream() {
-      yield new AIMessageChunk({ content: 'Main remains available.' });
-    },
-  };
-  return graph.createWorkflow().invoke(
-    {
-      messages: [new HumanMessage('Give me a safe answer without the unavailable handoff.')],
-      agentMessages: [],
-    },
-    {
-      recursionLimit: 4,
-      metadata: { run_id: runId, thread_id: `${runId}-thread` },
-      configurable: { thread_id: `${runId}-thread` },
-    },
-  );
-}
-
 describe('initializeClient handoff capability projection', () => {
   const originalBrokerSecret = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    mockLoadAgentTools.mockResolvedValue({
-      tools: [],
-      toolDefinitions: [],
-      toolRegistry: new Map(),
-      userMCPAuthMap: {},
-    });
-    mockLoadToolsForExecution.mockResolvedValue({ loadedTools: [] });
-    mockProcessAddedConvo.mockImplementation(async ({ userMCPAuthMap }) => ({ userMCPAuthMap }));
-    mockGetDefaultHandlers.mockImplementation(({ toolExecuteOptions }) => ({
-      invokeSyntheticTool: (toolNames, agentId) => toolExecuteOptions.loadTools(toolNames, agentId),
-    }));
     mockValidateAgentModel.mockResolvedValue({ isValid: true });
     mockCheckPermission.mockResolvedValue(true);
     mockResolveFallbackCandidates.mockReturnValue([]);
@@ -305,7 +259,7 @@ describe('initializeClient handoff capability projection', () => {
       provider: assignment.provider,
       model: assignment.model,
       model_parameters: {
-        ...agent.model_parameters,
+        ...(agent[assignment.parametersField] || agent.model_parameters),
         model: assignment.model,
       },
     }));
@@ -342,7 +296,9 @@ describe('initializeClient handoff capability projection', () => {
       glasshive_capability_broker: { allowed_servers: ['synthetic-connected-account'] },
     });
     mockPrimeFiles.mockResolvedValue({ files: [], toolContext: '' });
+    mockLoadAgentTools.mockResolvedValue({ toolDefinitions: [] });
     mockStartParallelWorkTurnAuthority.mockResolvedValue(false);
+    mockApplyVoiceModelOverride.mockReset();
   });
 
   afterAll(() => {
@@ -353,9 +309,30 @@ describe('initializeClient handoff capability projection', () => {
     }
   });
 
+  test('passes the effective provider adapter delta contract to stream callbacks', async () => {
+    const req = makeRequest();
+    req.config.endpoints.agents.providerCapabilities.openAI.message_delta_mode = 'snapshot';
+    const directPrimary = { ...primaryAgent, edges: [] };
+    mockInitializeAgent.mockImplementation(async ({ agent }) => makeInitializedConfig(agent));
+
+    await initializeClient({
+      req,
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve(directPrimary),
+        model_parameters: { model: directPrimary.model },
+      },
+    });
+
+    const { getDefaultHandlers } = require('~/server/controllers/agents/callbacks');
+    expect(getDefaultHandlers).toHaveBeenCalledWith(
+      expect.objectContaining({ messageDeltaMode: 'snapshot' }),
+    );
+  });
+
   test('attaches a signed bundle to a workspace-bound Agent Builder handoff', async () => {
     const handoffAgent = {
-      _id: 'resource-handoff-agent',
       id: 'handoff-agent',
       endpoint: 'glasshive-harness',
       provider: 'openAI',
@@ -369,6 +346,8 @@ describe('initializeClient handoff capability projection', () => {
 
     const { client } = await initializeWithHandoff(handoffAgent);
     const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    expect(mockBuildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
+    await initializedHandoff.viventiumConnectedAgentInitializer();
     const headers = initializedHandoff.model_parameters.configuration.defaultHeaders;
 
     expect(headers['X-Existing']).toBe('kept');
@@ -392,7 +371,6 @@ describe('initializeClient handoff capability projection', () => {
 
   test('leaves an ordinary Agent Builder handoff unchanged', async () => {
     const handoffAgent = {
-      _id: 'resource-handoff-agent',
       id: 'handoff-agent',
       endpoint: 'openAI',
       provider: 'openAI',
@@ -403,6 +381,7 @@ describe('initializeClient handoff capability projection', () => {
 
     const { client } = await initializeWithHandoff(handoffAgent);
     const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    await initializedHandoff.viventiumConnectedAgentInitializer();
 
     expect(initializedHandoff.model_parameters.configuration.defaultHeaders).toEqual({
       'X-Existing': 'kept',
@@ -411,32 +390,119 @@ describe('initializeClient handoff capability projection', () => {
     expect(initializedHandoff.viventiumConversationProviderCapabilityRefresh).toBeUndefined();
   });
 
-  test('starts Parallel turn authority before primary agent tool initialization', async () => {
-    const order = [];
-    const req = makeRequest();
-    const parallelMainAgent = {
+  test('applies the authenticated scheduled execution tuple without carrying interactive fallback', async () => {
+    const scheduledMain = {
       ...primaryAgent,
       provider: 'glasshive-harness',
-      tools: ['worker_delegate_once_mcp_glasshive-workers-projects'],
-      glasshive_options: {
-        orchestration: { parallel_available: true },
-      },
+      model: 'codex-cli:gpt-5.6-sol',
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'claude-code:opus',
+      fallback_llm_model_parameters: { model: 'claude-code:opus' },
+      edges: [],
     };
-    mockStartParallelWorkTurnAuthority.mockImplementation(() => {
-      order.push('authority');
-      return Promise.resolve(true);
+    const req = makeRequest();
+    req.viventiumScheduledAgentExecution = {
+      provider: 'openai',
+      model: 'gpt-5.6-sol',
+      reasoning_effort: 'xhigh',
+    };
+    mockInitializeAgent.mockImplementation(async ({ agent }) => makeInitializedConfig(agent));
+
+    await initializeClient({
+      req,
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve(scheduledMain),
+        model_parameters: { model: scheduledMain.model },
+      },
     });
-    mockInitializeAgent.mockImplementation(async ({ agent, loadTools }) => {
-      order.push('initialize');
-      await loadTools({
-        req,
-        res: {},
-        agentId: agent.id,
-        tools: agent.tools,
-        provider: agent.provider,
-        model: agent.model,
-        glasshive_options: agent.glasshive_options,
-      });
+
+    expect(mockResolveFallbackCandidates).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'openAI',
+        model: 'gpt-5.6-sol',
+        model_parameters: expect.objectContaining({
+          model: 'gpt-5.6-sol',
+          reasoning_effort: 'xhigh',
+        }),
+      }),
+      { isVoiceCall: false },
+    );
+    const [executionAgent] = mockResolveFallbackCandidates.mock.calls[0];
+    expect(executionAgent).not.toHaveProperty('fallback_llm_provider');
+    expect(executionAgent).not.toHaveProperty('fallback_llm_model');
+  });
+
+  test('keeps the user-readable model label on the healthy Main lazy fallback assignment', async () => {
+    const nativeMain = {
+      ...primaryAgent,
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      model_parameters: {
+        model: 'codex-cli:gpt-5.6-sol',
+        modelLabel: 'GPT-5.6 Sol',
+        reasoning_effort: 'medium',
+      },
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'claude-code:opus',
+      fallback_llm_model_parameters: {
+        model: 'claude-code:opus',
+        modelLabel: 'Claude Opus 5',
+        reasoning_effort: 'high',
+      },
+      edges: [],
+    };
+    mockResolveFallbackCandidates.mockReturnValue([
+      {
+        provider: 'glasshive-harness',
+        model: 'claude-code:opus',
+        source: 'agent',
+        parametersField: 'fallback_llm_model_parameters',
+      },
+    ]);
+    mockInitializeAgent.mockImplementation(async ({ agent }) => makeInitializedConfig(agent));
+
+    const { client } = await initializeClient({
+      req: makeRequest(),
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve(nativeMain),
+        model_parameters: { model: nativeMain.model },
+      },
+    });
+
+    const assignment = client.options.agent.viventiumFallbackLlmAssignment;
+    expect(assignment).toEqual({
+      provider: 'glasshive-harness',
+      model: 'claude-code:opus',
+      modelLabel: 'Claude Opus 5',
+      effort: 'high',
+    });
+    expect(mainRouteTargetForAgent(assignment)).toEqual({
+      provider: 'glasshive-harness',
+      model: 'claude-code:opus',
+      modelLabel: 'Claude Opus 5',
+      effort: 'high',
+    });
+  });
+
+  test('sets native per-turn context delivery before tool initialization builds durable authority', async () => {
+    const nativeMain = {
+      ...primaryAgent,
+      endpoint: 'glasshive-harness',
+      provider: 'openAI',
+      model: 'codex-cli:gpt-5.6-sol',
+      edges: [],
+    };
+    const req = makeRequest();
+    req.config.endpoints.agents.providerCapabilities['glasshive-harness'].conversation_session =
+      true;
+    req.config.endpoints.agents.providerCapabilities['glasshive-harness'].time_context_delivery =
+      'per_turn_header';
+    mockInitializeAgent.mockImplementation(async ({ agent, req: initializationRequest }) => {
+      expect(initializationRequest.viventiumTimeContextDelivery).toBe('per_turn_header');
       return makeInitializedConfig(agent);
     });
 
@@ -445,315 +511,25 @@ describe('initializeClient handoff capability projection', () => {
       res: {},
       signal: null,
       endpointOption: {
-        agent: Promise.resolve(parallelMainAgent),
-        model_parameters: { model: parallelMainAgent.model },
+        agent: Promise.resolve(nativeMain),
+        model_parameters: { model: nativeMain.model },
       },
     });
-
-    expect(order.slice(0, 2)).toEqual(['authority', 'initialize']);
-    expect(mockStartParallelWorkTurnAuthority).toHaveBeenCalledWith(
-      req,
-      expect.objectContaining({ id: parallelMainAgent.id }),
-    );
-    expect(mockLoadAgentTools).toHaveBeenCalledWith(
-      expect.objectContaining({
-        agent: expect.objectContaining({
-          glasshive_options: {
-            orchestration: { parallel_available: true },
-          },
-        }),
-      }),
-    );
   });
 
-  test('materializes worker-native Main to Connected Accounts as only a zero-input graph transfer', async () => {
-    const { MultiAgentGraph, Providers } = jest.requireActual('@librechat/agents');
-    const { AIMessageChunk, HumanMessage } = jest.requireActual('@langchain/core/messages');
-    const connectedAccountsAgent = {
-      _id: 'resource-connected-accounts',
-      id: 'connected_accounts',
-      name: 'Connected Accounts',
-      endpoint: 'openAI',
-      provider: 'openAI',
-      model: 'synthetic-connected-model',
-      tools: ['synthetic_connected_mail_search'],
-      edges: [],
-    };
-    const nativeMainAgent = {
-      ...primaryAgent,
-      endpoint: 'glasshive-harness',
-      provider: 'glasshive-harness',
-      tools: ['synthetic_primary_native_tool'],
-      agent_ids: [],
-      edges: [
-        {
-          from: primaryAgent.id,
-          to: connectedAccountsAgent.id,
-          edgeType: 'handoff',
-          description: 'Use the connected account specialist.',
-        },
-        {
-          from: connectedAccountsAgent.id,
-          to: primaryAgent.id,
-          edgeType: 'handoff',
-          description: 'Return the connected account result to Main for final synthesis.',
-        },
-      ],
-    };
+  test('starts Parallel turn authority before primary agent tool initialization', async () => {
+    const order = [];
     const req = makeRequest();
-    req.config.endpoints.agents.providerCapabilities['glasshive-harness'] = {
-      worker_native_tools: true,
-      workspace_binding: true,
-      host_tools_transport: 'broker_mcp',
-      host_tools: [],
-    };
-    mockGetAgent.mockResolvedValue(connectedAccountsAgent);
+    mockStartParallelWorkTurnAuthority.mockImplementation(() => {
+      order.push('authority');
+      return Promise.resolve(true);
+    });
     mockInitializeAgent.mockImplementation(async ({ agent }) => {
-      const config = makeInitializedConfig(agent);
-      if (agent.id === nativeMainAgent.id) {
-        return {
-          ...config,
-          tools: [],
-          toolDefinitions: [],
-          toolRegistry: new Map(),
-        };
-      }
-      return {
-        ...config,
-        tools: [{ name: 'synthetic_connected_mail_search', invoke: jest.fn() }],
-        toolDefinitions: [{ name: 'synthetic_connected_mail_search' }],
-        toolRegistry: new Map([
-          ['synthetic_connected_mail_search', { name: 'synthetic_connected_mail_search' }],
-        ]),
-      };
+      order.push('initialize');
+      return makeInitializedConfig(agent);
     });
 
-    const { client } = await initializeClient({
-      req,
-      res: {},
-      signal: null,
-      endpointOption: {
-        agent: Promise.resolve(nativeMainAgent),
-        model_parameters: { model: nativeMainAgent.model },
-      },
-    });
-    const initializedMain = client.options.agent;
-    const initializedConnectedAccounts = client.options.agentConfigs.get(connectedAccountsAgent.id);
-
-    expect(mockGetAgent).toHaveBeenCalledWith({ id: connectedAccountsAgent.id });
-    expect(mockCheckPermission).toHaveBeenCalledWith({
-      userId: req.user.id,
-      role: req.user.role,
-      resourceType: 'agent',
-      resourceId: connectedAccountsAgent._id,
-      requiredPermission: 1,
-    });
-    expect(initializedMain.edges).toEqual(nativeMainAgent.edges);
-    expect(initializedMain.tools).toEqual([]);
-    expect(initializedMain.toolDefinitions).toEqual([]);
-    expect(initializedMain.toolRegistry).toEqual(new Map());
-    expect(initializedConnectedAccounts.tools).toEqual([
-      expect.objectContaining({ name: 'synthetic_connected_mail_search' }),
-    ]);
-
-    const graph = new MultiAgentGraph({
-      runId: 'synthetic-connected-handoff-run',
-      agents: [initializedMain, initializedConnectedAccounts].map((agent) => ({
-        agentId: agent.id,
-        name: agent.name,
-        provider: Providers.OPENAI,
-        clientOptions: { model: agent.model },
-        tools: agent.tools,
-        toolDefinitions: agent.toolDefinitions,
-        toolRegistry: agent.toolRegistry,
-      })),
-      edges: initializedMain.edges,
-    });
-    const mainContext = graph.agentContexts.get(nativeMainAgent.id);
-    const connectedContext = graph.agentContexts.get(connectedAccountsAgent.id);
-
-    expect(mainContext.tools).toEqual([]);
-    expect(mainContext.graphTools).toHaveLength(1);
-    expect(mainContext.graphTools[0]).toMatchObject({
-      name: 'lc_transfer_to_connected_accounts',
-      schema: { type: 'object', properties: {}, required: [] },
-    });
-    expect(mainContext.graphTools).not.toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ name: 'synthetic_connected_mail_search' }),
-      ]),
-    );
-    expect(connectedContext.tools).toEqual([
-      expect.objectContaining({ name: 'synthetic_connected_mail_search' }),
-    ]);
-    expect(mainContext.getToolsForBinding().map((tool) => tool.name)).toEqual([
-      'lc_transfer_to_connected_accounts',
-    ]);
-    expect(connectedContext.getToolsForBinding().map((tool) => tool.name)).toEqual(
-      expect.arrayContaining(['synthetic_connected_mail_search', 'lc_transfer_to_main-agent']),
-    );
-
-    const calls = [];
-    graph.overrideModel = {
-      async *stream(_messages, config) {
-        const node = String(config?.metadata?.langgraph_node || '');
-        const activeAgentId = node.split('agent=').at(-1) || primaryAgent.id;
-        calls.push(activeAgentId);
-        if (calls.length === 1) {
-          yield new AIMessageChunk({
-            content: '',
-            tool_call_chunks: [
-              {
-                id: 'call-main-connected',
-                name: 'lc_transfer_to_connected_accounts',
-                args: '{}',
-                index: 0,
-                type: 'tool_call_chunk',
-              },
-            ],
-          });
-          return;
-        }
-        if (activeAgentId === connectedAccountsAgent.id) {
-          yield new AIMessageChunk({
-            content: 'Synthetic connected-account evidence.',
-            tool_call_chunks: [
-              {
-                id: 'call-connected-main',
-                name: 'lc_transfer_to_main-agent',
-                args: '{}',
-                index: 0,
-                type: 'tool_call_chunk',
-              },
-            ],
-          });
-          return;
-        }
-        yield new AIMessageChunk({ content: 'Main final synthesis.' });
-      },
-    };
-
-    const result = await graph.createWorkflow().invoke(
-      {
-        messages: [new HumanMessage('Check the connected accounts and give me the final answer.')],
-        agentMessages: [],
-      },
-      {
-        recursionLimit: 8,
-        metadata: {
-          run_id: 'synthetic-connected-handoff-run',
-          thread_id: 'synthetic-connected-handoff-thread',
-        },
-        configurable: { thread_id: 'synthetic-connected-handoff-thread' },
-      },
-    );
-
-    expect(calls).toEqual([primaryAgent.id, connectedAccountsAgent.id, primaryAgent.id]);
-    expect(result.messages.at(-1)?.content).toBe('Main final synthesis.');
-  });
-
-  test('omits a handoff target and its edge when the current user lacks VIEW permission', async () => {
-    const deniedAgent = {
-      _id: 'resource-denied-handoff',
-      id: 'handoff-agent',
-      name: 'Private Handoff',
-      endpoint: 'openAI',
-      provider: 'openAI',
-      model: 'synthetic-private-model',
-      tools: ['synthetic_private_tool'],
-      edges: [],
-    };
-    mockGetAgent.mockResolvedValue(deniedAgent);
-    mockCheckPermission.mockResolvedValue(false);
-    mockInitializeAgent.mockImplementation(async ({ agent }) => makeInitializedConfig(agent));
-    const guardedPrimary = {
-      ...primaryAgent,
-      edges: [
-        { from: primaryAgent.id, to: deniedAgent.id, edgeType: 'handoff' },
-        { from: deniedAgent.id, to: primaryAgent.id, edgeType: 'handoff' },
-      ],
-    };
-
-    const { client } = await initializeClient({
-      req: makeRequest(),
-      res: {},
-      signal: null,
-      endpointOption: {
-        agent: Promise.resolve(guardedPrimary),
-        model_parameters: { model: guardedPrimary.model },
-      },
-    });
-
-    expect(client.options.agentConfigs.has(deniedAgent.id)).toBe(false);
-    expect(client.options.agent.edges).toEqual([]);
-    expect(mockCheckPermission).toHaveBeenCalledWith({
-      userId: 'user-synthetic',
-      role: 'USER',
-      resourceType: 'agent',
-      resourceId: deniedAgent._id,
-      requiredPermission: 1,
-    });
-    expect(mockValidateAgentModel).toHaveBeenCalledTimes(1);
-    expect(mockInitializeAgent).toHaveBeenCalledTimes(1);
-    expect(mockBuildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
-    expect(logger.warn).toHaveBeenCalledWith('[processAgent] Handoff agent unavailable, skipping');
-    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(deniedAgent.id);
-    const result = await invokeMainOnlyGraph(client.options.agent, 'denied-handoff-run');
-    expect(result.messages.at(-1)?.content).toBe('Main remains available.');
-  });
-
-  test('removes both directions of a missing handoff and keeps the Main graph runnable', async () => {
-    const missingAgentId = 'missing-handoff-agent';
-    const guardedPrimary = {
-      ...primaryAgent,
-      edges: [
-        { from: primaryAgent.id, to: missingAgentId, edgeType: 'handoff' },
-        { from: missingAgentId, to: primaryAgent.id, edgeType: 'handoff' },
-      ],
-    };
-    mockGetAgent.mockResolvedValue(null);
-    mockInitializeAgent.mockImplementation(async ({ agent }) => makeInitializedConfig(agent));
-
-    const { client } = await initializeClient({
-      req: makeRequest(),
-      res: {},
-      signal: null,
-      endpointOption: {
-        agent: Promise.resolve(guardedPrimary),
-        model_parameters: { model: guardedPrimary.model },
-      },
-    });
-
-    expect(client.options.agentConfigs).toEqual(new Map());
-    expect(client.options.agent.edges).toEqual([]);
-    expect(mockCheckPermission).not.toHaveBeenCalled();
-    expect(mockValidateAgentModel).toHaveBeenCalledTimes(1);
-    expect(mockInitializeAgent).toHaveBeenCalledTimes(1);
-    expect(mockBuildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
-    expect(logger.warn).toHaveBeenCalledWith('[processAgent] Handoff agent unavailable, skipping');
-    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(missingAgentId);
-    const result = await invokeMainOnlyGraph(client.options.agent, 'missing-handoff-run');
-    expect(result.messages.at(-1)?.content).toBe('Main remains available.');
-  });
-
-  test('preserves the Agent API administrator bypass for a loaded handoff target', async () => {
-    const adminAgent = {
-      _id: 'resource-admin-handoff',
-      id: 'handoff-agent',
-      name: 'Admin Handoff',
-      endpoint: 'openAI',
-      provider: 'openAI',
-      model: 'synthetic-admin-model',
-      tools: [],
-      edges: [],
-    };
-    const req = makeRequest();
-    req.user.role = 'ADMIN';
-    mockGetAgent.mockResolvedValue(adminAgent);
-    mockCheckPermission.mockResolvedValue(false);
-    mockInitializeAgent.mockImplementation(async ({ agent }) => makeInitializedConfig(agent));
-
-    const { client } = await initializeClient({
+    await initializeClient({
       req,
       res: {},
       signal: null,
@@ -763,15 +539,269 @@ describe('initializeClient handoff capability projection', () => {
       },
     });
 
-    expect(client.options.agentConfigs.has(adminAgent.id)).toBe(true);
-    expect(client.options.agent.edges).toEqual(primaryAgent.edges);
-    expect(mockCheckPermission).not.toHaveBeenCalled();
+    expect(order.slice(0, 2)).toEqual(['authority', 'initialize']);
+    expect(mockStartParallelWorkTurnAuthority).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        id: primaryAgent.id,
+      }),
+    );
+  });
+
+  test('binds Main authority from the persisted declaration before runtime context mutates it', async () => {
+    const nativeMain = {
+      ...primaryAgent,
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      instructions: 'Stable Main policy with {{current_datetime}}.',
+      tools: ['file_search'],
+      glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
+      edges: [],
+    };
+    const expectedDigest = conversationProviderStableAuthorityDigest(nativeMain);
+    const req = makeRequest();
+    Object.assign(req.config.endpoints.agents.providerCapabilities['glasshive-harness'], {
+      conversation_session: true,
+      native_session_authority: 'stable_authority_v1',
+    });
+    mockInitializeAgent.mockImplementation(async ({ agent }) => {
+      agent.instructions = 'Runtime-rendered policy at a changing minute.';
+      agent.tools = [{ name: 'request-resolved-file-search' }];
+      const config = makeInitializedConfig(agent);
+      config.model_parameters.configuration.defaultHeaders['X-GlassHive-Agent-Id'] = agent.id;
+      config.toolDefinitions = [{ name: 'request-resolved-file-search' }];
+      return config;
+    });
+
+    const { client } = await initializeClient({
+      req,
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve(nativeMain),
+        model_parameters: { model: nativeMain.model },
+      },
+    });
+
+    expect(
+      client.options.agent.model_parameters.configuration.defaultHeaders[
+        'X-GlassHive-Stable-Authority-SHA256'
+      ],
+    ).toBe(expectedDigest);
+    expect(conversationProviderStableAuthorityDigest(client.options.agent)).not.toBe(
+      expectedDigest,
+    );
+  });
+
+  test('sets identical native context delivery before primary and fallback tool initialization', async () => {
+    const nativeMain = {
+      ...primaryAgent,
+      endpoint: 'glasshive-harness',
+      provider: 'openAI',
+      model: 'codex-cli:gpt-5.6-sol',
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'claude-code:opus',
+      fallback_llm_model_parameters: { model: 'claude-code:opus' },
+      edges: [],
+    };
+    const req = makeRequest();
+    req.config.endpoints.agents.providerCapabilities['glasshive-harness'].conversation_session =
+      true;
+    req.config.endpoints.agents.providerCapabilities['glasshive-harness'].time_context_delivery =
+      'per_turn_header';
+    mockResolveFallbackCandidates.mockReturnValue([
+      {
+        provider: 'glasshive-harness',
+        model: 'claude-code:opus',
+        source: 'agent',
+        parametersField: 'fallback_llm_model_parameters',
+      },
+    ]);
+    const contextDeliveryAtInitialization = [];
+    mockInitializeAgent.mockImplementation(async ({ agent, req: initializationRequest }) => {
+      contextDeliveryAtInitialization.push(initializationRequest.viventiumTimeContextDelivery);
+      if (agent.model === nativeMain.model) {
+        const error = new Error('synthetic primary unavailable');
+        error.status = 503;
+        throw error;
+      }
+      return makeInitializedConfig(agent);
+    });
+
+    await initializeClient({
+      req,
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve(nativeMain),
+        model_parameters: { model: nativeMain.model },
+      },
+    });
+
+    expect(contextDeliveryAtInitialization).toEqual(['per_turn_header', 'per_turn_header']);
+  });
+
+  test('uses the normal Agent Builder fallback when interactive Main initialization fails', async () => {
+    const scheduledMain = {
+      ...primaryAgent,
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+      model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'medium' },
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'claude-code:opus',
+      fallback_llm_model_parameters: {
+        model: 'claude-code:opus',
+        reasoning_effort: 'high',
+      },
+      edges: [],
+    };
+    const fallbackAssignment = {
+      provider: 'glasshive-harness',
+      model: 'claude-code:opus',
+      source: 'agent',
+      parametersField: 'fallback_llm_model_parameters',
+    };
+    const req = makeRequest();
+    mockResolveFallbackCandidates.mockReturnValue([fallbackAssignment]);
+    mockInitializeAgent.mockImplementation(async ({ agent }) => {
+      if (agent.model === scheduledMain.model) {
+        const error = new Error('synthetic provider rate limit');
+        error.status = 429;
+        throw error;
+      }
+      return makeInitializedConfig(agent);
+    });
+
+    const { client } = await initializeClient({
+      req,
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve(scheduledMain),
+        model_parameters: { model: scheduledMain.model },
+      },
+    });
+
+    expect(mockInitializeAgent.mock.calls.map(([options]) => options.agent.model)).toEqual([
+      'codex-cli:gpt-5.6-sol',
+      'claude-code:opus',
+    ]);
+    expect(client.options.agent).toMatchObject({
+      provider: 'glasshive-harness',
+      model: 'claude-code:opus',
+    });
+    expect(req._viventiumFallbackLlmAttempt).toBe(true);
+    expect(req._viventiumFallbackRouteNotice).toEqual({ model: 'claude-code:opus' });
+  });
+
+  test('preserves only the Main orchestration declaration when a voice override loads tool definitions', async () => {
+    const voiceMain = {
+      ...primaryAgent,
+      tools: ['active_work_list', 'active_work_action'],
+      glasshive_options: {
+        workspace: { mode: 'life' },
+        access: 'full',
+        fallback_model: 'must-not-cross-the-tool-boundary',
+        orchestration: {
+          parallel_available: true,
+          default_mode: 'focused',
+        },
+      },
+    };
+    mockApplyVoiceModelOverride.mockImplementation((agent) => {
+      agent.provider = 'xai';
+      agent.model = 'synthetic-voice-model';
+    });
+    mockInitializeAgent.mockImplementation(async (params) => {
+      if (typeof params.loadTools === 'function') {
+        await params.loadTools({
+          req: params.req,
+          res: params.res,
+          provider: params.agent.provider,
+          agentId: params.agent.id,
+          tools: params.agent.tools,
+          model: params.agent.model,
+          tool_options: params.agent.tool_options,
+          tool_resources: params.agent.tool_resources,
+          orchestration: params.agent.glasshive_options?.orchestration,
+        });
+      }
+      return makeInitializedConfig(params.agent);
+    });
+
+    await initializeClient({
+      req: makeRequest(),
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve(voiceMain),
+        model_parameters: { model: voiceMain.model },
+      },
+    });
+
+    expect(mockLoadAgentTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agent: {
+          id: voiceMain.id,
+          tools: voiceMain.tools,
+          provider: 'xai',
+          model: 'synthetic-voice-model',
+          tool_options: undefined,
+          glasshive_options: {
+            orchestration: voiceMain.glasshive_options.orchestration,
+          },
+        },
+      }),
+    );
+  });
+
+  test('does not project Main orchestration authority for a mission root without the declaration', async () => {
+    const missionRoot = {
+      ...primaryAgent,
+      provider: 'glasshive-harness',
+      tools: ['active_work_list', 'active_work_action'],
+      glasshive_options: {
+        workspace: { mode: 'life' },
+        access: 'full',
+      },
+    };
+    mockInitializeAgent.mockImplementation(async (params) => {
+      if (typeof params.loadTools === 'function') {
+        await params.loadTools({
+          req: params.req,
+          res: params.res,
+          provider: params.agent.provider,
+          agentId: params.agent.id,
+          tools: params.agent.tools,
+          model: params.agent.model,
+          tool_options: params.agent.tool_options,
+          tool_resources: params.agent.tool_resources,
+          orchestration: params.agent.glasshive_options?.orchestration,
+        });
+      }
+      return makeInitializedConfig(params.agent);
+    });
+
+    await initializeClient({
+      req: makeRequest(),
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve(missionRoot),
+        model_parameters: { model: missionRoot.model },
+      },
+    });
+
+    expect(mockLoadAgentTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agent: expect.not.objectContaining({ glasshive_options: expect.anything() }),
+      }),
+    );
   });
 
   test('marks unavailable workspace capabilities instead of attaching an empty handoff bundle', async () => {
     mockBuildConversationProviderBootstrapBundle.mockResolvedValue({});
     const handoffAgent = {
-      _id: 'resource-handoff-agent',
       id: 'handoff-agent',
       endpoint: 'glasshive-harness',
       provider: 'openAI',
@@ -783,6 +813,8 @@ describe('initializeClient handoff capability projection', () => {
 
     const { client } = await initializeWithHandoff(handoffAgent);
     const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    expect(mockBuildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
+    await initializedHandoff.viventiumConnectedAgentInitializer();
     const headers = initializedHandoff.model_parameters.configuration.defaultHeaders;
 
     expect(initializedHandoff.instructions).toContain('host capability broker is unavailable');
@@ -790,96 +822,8 @@ describe('initializeClient handoff capability projection', () => {
     expect(headers['X-GlassHive-Bootstrap-Signature']).toBeUndefined();
   });
 
-  test('fails a shared-mic turn closed before tools, handoffs, native capabilities, or controller execution initialize', async () => {
-    const req = makeRequest();
-    req.body.voiceMode = true;
-    req.body.viventiumActorTrust = 'shared_mic_unverified';
-    req.body.viventiumCanAuthorizeSideEffects = false;
-    const sourceAgent = {
-      ...primaryAgent,
-      provider: 'glasshive-harness',
-      endpoint: 'glasshive-harness',
-      tools: [`send_email${Constants.mcp_delimiter}synthetic-connected-account`],
-      background_cortices: [{ agent_id: 'side-effect-cortex' }],
-      agent_ids: ['legacy-action-agent'],
-      glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
-    };
-    const endpointOption = {
-      agent: Promise.resolve(sourceAgent),
-      addedConvo: { endpoint: 'agents', agent_id: 'parallel-action-agent' },
-      model_parameters: { model: sourceAgent.model },
-    };
-    mockInitializeAgent.mockImplementation(async ({ agent, loadTools, req: initReq }) => {
-      await loadTools({
-        req: initReq,
-        res: {},
-        agentId: agent.id,
-        tools: agent.tools,
-        provider: agent.provider,
-        model: agent.model,
-      });
-      return {
-        ...makeInitializedConfig(agent),
-        tools: [{ name: 'synthetic_side_effect', invoke: jest.fn() }],
-        toolDefinitions: [{ name: 'synthetic_side_effect' }],
-        toolRegistry: new Map([['synthetic_side_effect', { invoke: jest.fn() }]]),
-        userMCPAuthMap: { synthetic: { token: 'synthetic-never-used' } },
-        background_cortices: [{ agent_id: 'side-effect-cortex' }],
-        agent_ids: ['legacy-action-agent'],
-        edges: [{ from: agent.id, to: 'handoff-agent', edgeType: 'handoff' }],
-        glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
-        model_parameters: {
-          configuration: {
-            defaultHeaders: {
-              'X-Existing': 'kept',
-              'X-GlassHive-Agent-Id': 'synthetic-action-agent',
-              'X-GlassHive-Access': 'full',
-              'X-GlassHive-Bootstrap-Bundle-B64': 'synthetic-capability',
-              'X-GlassHive-Bootstrap-Signature': 'sha256=synthetic',
-            },
-          },
-        },
-      };
-    });
-
-    const { client, userMCPAuthMap } = await initializeClient({
-      req,
-      res: {},
-      signal: null,
-      endpointOption,
-    });
-    const initialized = client.options.agent;
-
-    expect(mockLoadAgentTools).not.toHaveBeenCalled();
-    expect(mockGetAgent).not.toHaveBeenCalled();
-    expect(mockProcessAddedConvo).not.toHaveBeenCalled();
-    expect(mockBuildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
-    expect(initialized.tools).toEqual([]);
-    expect(initialized.toolDefinitions).toEqual([]);
-    expect(initialized.toolRegistry).toEqual(new Map());
-    expect(initialized.background_cortices).toEqual([]);
-    expect(initialized.agent_ids).toEqual([]);
-    expect(initialized.edges).toEqual([]);
-    expect(initialized.glasshive_options).toBeUndefined();
-    expect(initialized.model_parameters.configuration.defaultHeaders).toEqual({
-      'X-Existing': 'kept',
-    });
-    expect(client.options.agentConfigs).toEqual(new Map());
-    expect(userMCPAuthMap).toEqual({});
-    await expect(
-      client.options.eventHandlers.invokeSyntheticTool(['synthetic_side_effect'], sourceAgent.id),
-    ).resolves.toEqual({ loadedTools: [] });
-    expect(mockLoadToolsForExecution).not.toHaveBeenCalled();
-    expect(req.body.viventiumDeferVoiceMemory).toBe(true);
-    expect(req.body.suppressBackgroundCortices).toBe(true);
-    expect(req._viventiumHarnessExecutionEnabled).toBe(false);
-    expect(req._viventiumHarnessActivityEnabled).toBe(false);
-    expect(req._viventiumHarnessIdempotencyKey).toBeUndefined();
-  });
-
   test('prepares the handoff own validated fallback as hidden graph runtime state without loading tools twice', async () => {
     const handoffAgent = {
-      _id: 'resource-handoff-agent',
       id: 'handoff-agent',
       endpoint: 'openAI',
       provider: 'openAI',
@@ -901,6 +845,7 @@ describe('initializeClient handoff capability projection', () => {
 
     const { client } = await initializeWithHandoff(handoffAgent);
     const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    await initializedHandoff.viventiumConnectedAgentInitializer();
     const fallbackRoutes = initializedHandoff.viventiumGraphLlmFallbacks;
     const fallbackInitCall = mockInitializeAgent.mock.calls.find(
       ([params]) => params.agent?.provider === assignment.provider,
@@ -941,12 +886,11 @@ describe('initializeClient handoff capability projection', () => {
   test('mints a tool-less fallback bundle from the initialized participant host authority', async () => {
     const recallFile = { file_id: 'synthetic-file', filename: 'synthetic-evidence.txt' };
     const handoffAgent = {
-      _id: 'resource-handoff-agent',
       id: 'handoff-agent',
       endpoint: 'openAI',
       provider: 'openAI',
       model: 'synthetic-primary-model',
-      tools: ['file_search'],
+      tools: ['file_search', `read_mail${Constants.mcp_delimiter}synthetic-connected-account`],
       fallback_llm_provider: 'glasshive-harness',
       fallback_llm_model: 'synthetic-fallback-model',
       edges: [],
@@ -978,8 +922,9 @@ describe('initializeClient handoff capability projection', () => {
     });
     mockGetAgent.mockResolvedValue(handoffAgent);
     mockBuildConversationProviderBootstrapBundle.mockImplementation(
-      async ({ allowedHostTools, hostToolResources }) => ({
+      async ({ allowedServerNames, allowedHostTools, hostToolResources }) => ({
         glasshive_capability_broker: {
+          allowed_servers: allowedServerNames,
           allowed_host_tools: allowedHostTools,
           host_tool_resources: hostToolResources,
         },
@@ -996,6 +941,7 @@ describe('initializeClient handoff capability projection', () => {
       },
     });
     const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    await initializedHandoff.viventiumConnectedAgentInitializer();
     const [fallbackRoute] = initializedHandoff.viventiumGraphLlmFallbacks;
     const encodedBundle =
       fallbackRoute.model_parameters.configuration.defaultHeaders[
@@ -1003,6 +949,9 @@ describe('initializeClient handoff capability projection', () => {
       ];
     const bundle = JSON.parse(Buffer.from(encodedBundle, 'base64').toString('utf8'));
 
+    expect(bundle.glasshive_capability_broker.allowed_servers).toEqual([
+      'synthetic-connected-account',
+    ]);
     expect(bundle.glasshive_capability_broker.allowed_host_tools).toEqual(['file_search']);
     expect(bundle.glasshive_capability_broker.host_tool_resources).toEqual({
       file_search: { entity_id: handoffAgent.id, files: [recallFile] },
@@ -1017,7 +966,6 @@ describe('initializeClient handoff capability projection', () => {
 
   test('keeps a healthy handoff and its edge when optional fallback preparation fails', async () => {
     const handoffAgent = {
-      _id: 'resource-handoff-agent',
       id: 'handoff-agent',
       provider: 'openAI',
       model: 'synthetic-primary-model',
@@ -1053,6 +1001,7 @@ describe('initializeClient handoff capability projection', () => {
       endpointOption,
     });
     const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    await initializedHandoff.viventiumConnectedAgentInitializer();
 
     expect(initializedHandoff).toMatchObject({
       id: handoffAgent.id,
@@ -1065,7 +1014,6 @@ describe('initializeClient handoff capability projection', () => {
 
   test('recovers a handoff initialization failure through that handoff configured fallback', async () => {
     const handoffAgent = {
-      _id: 'resource-handoff-agent',
       id: 'handoff-agent',
       provider: 'openAI',
       model: 'synthetic-primary-model',
@@ -1105,6 +1053,7 @@ describe('initializeClient handoff capability projection', () => {
       endpointOption,
     });
     const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    await initializedHandoff.viventiumConnectedAgentInitializer();
 
     expect(initializedHandoff).toMatchObject({
       id: handoffAgent.id,
@@ -1118,7 +1067,6 @@ describe('initializeClient handoff capability projection', () => {
 
   test('ignores same-route and invalid handoff fallback candidates without preparing either', async () => {
     const handoffAgent = {
-      _id: 'resource-handoff-agent',
       id: 'handoff-agent',
       provider: 'openAI',
       model: 'synthetic-primary-model',
@@ -1144,9 +1092,228 @@ describe('initializeClient handoff capability projection', () => {
 
     const { client } = await initializeWithHandoff(handoffAgent);
     const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    await initializedHandoff.viventiumConnectedAgentInitializer();
 
     expect(initializedHandoff.viventiumGraphLlmFallbacks).toBeUndefined();
     expect(mockBuildFallbackAgent).not.toHaveBeenCalled();
     expect(mockInitializeAgent).toHaveBeenCalledTimes(2);
+  });
+
+  test('discovers transitive graph topology without materializing unused participants', async () => {
+    const rootAgent = {
+      ...primaryAgent,
+      edges: [{ from: primaryAgent.id, to: 'handoff-a', edgeType: 'handoff' }],
+    };
+    const handoffA = {
+      id: 'handoff-a',
+      provider: 'openAI',
+      model: 'synthetic-a-model',
+      edges: [{ from: 'handoff-a', to: 'handoff-b', edgeType: 'handoff' }],
+    };
+    const handoffB = {
+      id: 'handoff-b',
+      provider: 'openAI',
+      model: 'synthetic-b-model',
+      edges: [],
+    };
+    mockGetAgent.mockImplementation(async ({ id }) =>
+      id === handoffA.id ? handoffA : id === handoffB.id ? handoffB : null,
+    );
+    mockInitializeAgent.mockImplementation(async ({ agent }) => makeInitializedConfig(agent));
+
+    const { client } = await initializeClient({
+      req: makeRequest(),
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve(rootAgent),
+        model_parameters: { model: rootAgent.model },
+      },
+    });
+
+    expect([...client.options.agentConfigs.keys()]).toEqual(['handoff-a', 'handoff-b']);
+    expect(client.options.agent.edges).toEqual([rootAgent.edges[0], handoffA.edges[0]]);
+    expect(mockInitializeAgent).toHaveBeenCalledTimes(1);
+    expect(
+      mockInitializeAgent.mock.calls.some(
+        ([params]) => params.agent?.id === handoffA.id || params.agent?.id === handoffB.id,
+      ),
+    ).toBe(false);
+  });
+
+  test('keeps fallback auth enabled until concurrent participant hydration completes', async () => {
+    const rootAgent = {
+      ...primaryAgent,
+      edges: [
+        { from: primaryAgent.id, to: 'handoff-a', edgeType: 'handoff' },
+        { from: primaryAgent.id, to: 'handoff-b', edgeType: 'handoff' },
+      ],
+    };
+    const handoffs = new Map(
+      ['handoff-a', 'handoff-b'].map((id) => [
+        id,
+        {
+          id,
+          provider: 'openAI',
+          model: `synthetic-${id}-model`,
+          fallback_llm_provider: 'glasshive-harness',
+          fallback_llm_model: `synthetic-${id}-fallback`,
+          edges: [],
+        },
+      ]),
+    );
+    const fallbackReleases = new Map();
+    const fallbackStarts = new Map();
+    mockGetAgent.mockImplementation(async ({ id }) => handoffs.get(id));
+    mockResolveFallbackCandidates.mockImplementation((agent) =>
+      handoffs.has(agent.id)
+        ? [
+            {
+              provider: 'glasshive-harness',
+              model: `synthetic-${agent.id}-fallback`,
+              source: 'agent',
+              parametersField: 'fallback_llm_model_parameters',
+            },
+          ]
+        : [],
+    );
+    mockInitializeAgent.mockImplementation(async ({ agent, req }) => {
+      if (agent.provider === 'glasshive-harness') {
+        expect(req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure).toBe(true);
+        fallbackStarts.get(agent.id)?.();
+        await new Promise((resolve) => fallbackReleases.set(agent.id, resolve));
+      }
+      return makeInitializedConfig(agent);
+    });
+    const req = makeRequest();
+
+    const { client } = await initializeClient({
+      req,
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve(rootAgent),
+        model_parameters: { model: rootAgent.model },
+      },
+    });
+    const aStarted = new Promise((resolve) => fallbackStarts.set('handoff-a', resolve));
+    const bStarted = new Promise((resolve) => fallbackStarts.set('handoff-b', resolve));
+    const initializeA = client.options.agentConfigs
+      .get('handoff-a')
+      .viventiumConnectedAgentInitializer();
+    const initializeB = client.options.agentConfigs
+      .get('handoff-b')
+      .viventiumConnectedAgentInitializer();
+    await Promise.all([aStarted, bStarted]);
+
+    fallbackReleases.get('handoff-a')();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure).toBe(true);
+
+    fallbackReleases.get('handoff-b')();
+    await Promise.all([initializeA, initializeB]);
+    expect(req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure).toBeUndefined();
+  });
+
+  test('defers connected participant tools until first use and singleflights materialization', async () => {
+    const handoffAgent = {
+      id: 'handoff-agent',
+      provider: 'openAI',
+      model: 'synthetic-connected-model',
+      instructions: 'Persisted {{current_datetime}} specialist instructions.',
+      additional_instructions: 'Persisted artifact instructions.',
+      tools: [`read_mail${Constants.mcp_delimiter}synthetic-connected-account`],
+      edges: [],
+    };
+    let releaseToolInitialization;
+    let toolInitializationGate = null;
+    let holdToolInitialization = false;
+    let connectedToolInitializationCount = 0;
+    mockGetAgent.mockResolvedValue(handoffAgent);
+    mockInitializeAgent.mockImplementation(async ({ agent, loadTools }) => {
+      const config = makeInitializedConfig(agent);
+      if (agent.id !== handoffAgent.id || typeof loadTools !== 'function') {
+        return config;
+      }
+      config.instructions = 'Rendered specialist instructions.';
+      config.additional_instructions = 'Rendered artifact instructions.';
+      connectedToolInitializationCount += 1;
+      if (holdToolInitialization) {
+        await toolInitializationGate;
+      }
+      config.tools = [{ name: 'read_mail_mcp_synthetic-connected-account' }];
+      config.toolDefinitions = [{ name: 'read_mail_mcp_synthetic-connected-account' }];
+      config.toolRegistry = new Map([
+        [
+          'read_mail_mcp_synthetic-connected-account',
+          { name: 'read_mail_mcp_synthetic-connected-account' },
+        ],
+      ]);
+      return config;
+    });
+
+    const { client } = await initializeClient({
+      req: makeRequest(),
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve({ ...primaryAgent }),
+        model_parameters: { model: primaryAgent.model },
+      },
+    });
+    const lazyHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    lazyHandoff.instructions = [lazyHandoff.instructions, lazyHandoff.additional_instructions]
+      .filter(Boolean)
+      .join('\n');
+    lazyHandoff.additional_instructions = '';
+    lazyHandoff.instructions = [
+      lazyHandoff.instructions,
+      'Invocation-local surface and Feeling authority.',
+    ].join('\n\n');
+    const handoffCallsBeforeUse = mockInitializeAgent.mock.calls.filter(
+      ([params]) => params.agent?.id === handoffAgent.id,
+    );
+
+    expect(handoffCallsBeforeUse).toHaveLength(0);
+    expect(connectedToolInitializationCount).toBe(0);
+    expect(
+      mockResolveFallbackCandidates.mock.calls.some(([agent]) => agent?.id === handoffAgent.id),
+    ).toBe(false);
+    expect(mockBuildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
+    expect(
+      Object.getOwnPropertyDescriptor(lazyHandoff, 'viventiumConnectedAgentInitializer'),
+    ).toMatchObject({ enumerable: false, writable: false, value: expect.any(Function) });
+    expect(JSON.stringify(lazyHandoff)).not.toContain('viventiumConnectedAgentInitializer');
+
+    holdToolInitialization = true;
+    toolInitializationGate = new Promise((resolve) => {
+      releaseToolInitialization = resolve;
+    });
+    const first = lazyHandoff.viventiumConnectedAgentInitializer();
+    const second = lazyHandoff.viventiumConnectedAgentInitializer();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(connectedToolInitializationCount).toBe(1);
+    expect(
+      mockInitializeAgent.mock.calls.filter(([params]) => params.agent?.id === handoffAgent.id),
+    ).toHaveLength(1);
+    expect(
+      mockResolveFallbackCandidates.mock.calls.some(([agent]) => agent?.id === handoffAgent.id),
+    ).toBe(true);
+
+    releaseToolInitialization();
+    const [firstConfig, secondConfig] = await Promise.all([first, second]);
+    expect(firstConfig).toBe(secondConfig);
+    expect(firstConfig.toolDefinitions).toEqual([
+      { name: 'read_mail_mcp_synthetic-connected-account' },
+    ]);
+    expect(lazyHandoff.toolDefinitions).toEqual(firstConfig.toolDefinitions);
+    expect(lazyHandoff.instructions).toBe(
+      [
+        'Rendered specialist instructions.',
+        'Rendered artifact instructions.',
+        'Invocation-local surface and Feeling authority.',
+      ].join('\n\n'),
+    );
+    expect(lazyHandoff.additional_instructions).toBe('');
   });
 });

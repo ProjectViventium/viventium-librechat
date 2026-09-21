@@ -12,9 +12,6 @@ import {
   forceRefreshOpenAISubscriptionUserValues,
   resolveOpenAISubscriptionUserValues,
 } from './oauthSubscription';
-/* === VIVENTIUM START === Connected Accounts credential policy === */
-import { resolveConnectedAccountCredentialPolicy } from '../connectedAccounts/policy';
-/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
  * Feature: Connected Accounts routing policy.
@@ -127,16 +124,6 @@ export async function initializeOpenAI({
 
   const { key: expiresAt } = req.body;
   const modelName = model_parameters?.model as string | undefined;
-  /* === VIVENTIUM START ===
-   * Feature: Per-user connected-account credential policy.
-   * Purpose: Resolve the personal-only opt-out before any platform credential can be selected.
-   * === VIVENTIUM END === */
-  const credentialPolicy = await resolveConnectedAccountCredentialPolicy({
-    userId: req.user?.id ?? '',
-    provider: 'openai',
-    db,
-  });
-  const personalCredentialsRequired = credentialPolicy === 'personal_required';
 
   const credentials = {
     [EModelEndpoint.openAI]: OPENAI_API_KEY,
@@ -162,22 +149,14 @@ export async function initializeOpenAI({
     if (isNoUserKeyError(error)) {
       userValues = null;
     } else if (isOpenAIConnectedAccountReadError(error)) {
-      /* === VIVENTIUM START === Personal-required credential policy === */
-      if (personalCredentialsRequired || isConnectedAccountAuthMode()) {
+      if (isConnectedAccountAuthMode()) {
         throw openAIConnectedAccountReconnectError();
       }
-      /* === VIVENTIUM END === */
       userValues = null;
     } else if (isOpenAIConnectedAccountReconnectFailure(error)) {
-      /* === VIVENTIUM START === Personal-required credential policy === */
-      if (
-        personalCredentialsRequired ||
-        isConnectedAccountAuthMode() ||
-        !allowPlatformFallbackOnOAuthFailure(req)
-      ) {
+      if (isConnectedAccountAuthMode() || !allowPlatformFallbackOnOAuthFailure(req)) {
         throw openAIConnectedAccountReconnectError();
       }
-      /* === VIVENTIUM END === */
       userValues = null;
     } else if (isOpenAIConnectedAccountTransientFailure(error)) {
       if (isConnectedAccountAuthMode() || !allowPlatformFallbackOnOAuthFailure(req)) {
@@ -195,11 +174,9 @@ export async function initializeOpenAI({
   const isOpenAIOAuthSubscription = userValues?.oauthProvider === 'openai-codex';
 
   let apiKey = credentials[endpoint as keyof typeof credentials];
-  /* === VIVENTIUM START === Personal-required credential policy === */
-  if (userProvidesKey || personalCredentialsRequired) {
+  if (userProvidesKey) {
     apiKey = undefined;
   }
-  /* === VIVENTIUM END === */
   if (hasUserApiKey) {
     apiKey = userValues?.apiKey;
   }
@@ -315,17 +292,8 @@ export async function initializeOpenAI({
     apiKey = clientOptions.azure ? clientOptions.azure.azureOpenAIApiKey : undefined;
   }
 
-  /* === VIVENTIUM START ===
-   * Feature: Personal-required credential policy.
-   * Purpose: Azure/OpenAI platform configuration must not reintroduce a shared key after opt-out.
-   * === VIVENTIUM END === */
-  if (personalCredentialsRequired && !hasUserApiKey) {
-    apiKey = undefined;
-  }
-
-  /* === VIVENTIUM START === Personal-required credential policy === */
-  if ((userProvidesKey || personalCredentialsRequired) && !apiKey) {
-    if (personalCredentialsRequired || isConnectedAccountAuthMode()) {
+  if (userProvidesKey && !apiKey) {
+    if (isConnectedAccountAuthMode()) {
       throw new Error(
         JSON.stringify({
           type: ErrorTypes.CONNECTED_ACCOUNT_REQUIRED,
@@ -340,7 +308,6 @@ export async function initializeOpenAI({
       }),
     );
   }
-  /* === VIVENTIUM END === */
 
   if (!apiKey) {
     throw new Error(`${endpoint} API Key not provided.`);

@@ -527,12 +527,15 @@ describe('User Methods - Database Tests', () => {
         provider: 'local',
       });
 
-      const updated = await methods.updateUserViventiumVoicePreferences(user._id?.toString() || '', {
-        livekitPlayground: {
-          stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
-          tts: { provider: 'cartesia', variant: 'sonic-2' },
+      const updated = await methods.updateUserViventiumVoicePreferences(
+        user._id?.toString() || '',
+        {
+          livekitPlayground: {
+            stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
+            tts: { provider: 'cartesia', variant: 'sonic-2' },
+          },
         },
-      });
+      );
 
       expect(updated?.viventiumVoicePreferences?.livekitPlayground).toEqual({
         stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
@@ -553,9 +556,12 @@ describe('User Methods - Database Tests', () => {
         },
       });
 
-      const updated = await methods.updateUserViventiumVoicePreferences(user._id?.toString() || '', {
-        livekitPlayground: null,
-      });
+      const updated = await methods.updateUserViventiumVoicePreferences(
+        user._id?.toString() || '',
+        {
+          livekitPlayground: null,
+        },
+      );
 
       expect(updated?.viventiumVoicePreferences?.livekitPlayground).toBeNull();
     });

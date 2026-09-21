@@ -70,6 +70,119 @@ describe('getLLMConfig', () => {
     expect(result.llmConfig).toHaveProperty('maxRetries', 1);
   });
 
+  /* === VIVENTIUM START ===
+   * Feature: Public-safe provider diagnostics.
+   * Purpose: Debug logs may report credential presence/auth mode, never credential bytes.
+   * === VIVENTIUM END === */
+  it('does not log any API key bytes when Anthropic auth diagnostics are enabled', () => {
+    const priorDebug = process.env.VIVENTIUM_ANTHROPIC_DEBUG;
+    const info = jest.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const syntheticCredential = 'synthetic-debug-credential-value';
+    process.env.VIVENTIUM_ANTHROPIC_DEBUG = 'true';
+    try {
+      getLLMConfig(syntheticCredential, { modelOptions: {} });
+      const serializedLogs = info.mock.calls.flat().join('\n');
+      expect(serializedLogs).not.toContain(syntheticCredential);
+      expect(serializedLogs).not.toContain(syntheticCredential.slice(0, 12));
+      expect(info).toHaveBeenCalledWith(expect.stringContaining('"apiKeyPresent":true'));
+    } finally {
+      info.mockRestore();
+      if (priorDebug == null) {
+        delete process.env.VIVENTIUM_ANTHROPIC_DEBUG;
+      } else {
+        process.env.VIVENTIUM_ANTHROPIC_DEBUG = priorDebug;
+      }
+    }
+  });
+
+  /* === VIVENTIUM START ===
+   * Feature: Public-safe Anthropic request diagnostics regression coverage.
+   */
+  it('logs only structural Anthropic request diagnostics without prompt or tool data', async () => {
+    const priorDebug = process.env.VIVENTIUM_ANTHROPIC_DEBUG;
+    const info = jest.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const create = jest
+      .spyOn(Anthropic.Messages.prototype, 'create')
+      .mockReturnValue(Promise.resolve({}) as never);
+    const sensitiveValues = {
+      credential: 'synthetic-request-debug-credential',
+      system: 'synthetic-system-instruction-private',
+      user: 'synthetic-user-message-private',
+      assistant: 'synthetic-assistant-message-private',
+      toolName: 'synthetic_private_tool_name',
+      toolDescription: 'synthetic-private-tool-description',
+      toolUseId: 'synthetic-private-tool-use-id',
+      inputKey: 'synthetic_private_input_key',
+      inputValue: 'synthetic-private-input-value',
+      model: 'synthetic-private-model-deployment',
+      oauthProvider: 'synthetic-private-oauth-provider',
+      incomingCredential: 'synthetic-incoming-client-credential',
+      headerCredential: 'synthetic-custom-header-credential',
+    };
+    process.env.VIVENTIUM_ANTHROPIC_DEBUG = 'true';
+
+    try {
+      const result = getLLMConfig(sensitiveValues.credential, {
+        modelOptions: {},
+        oauthType: 'subscription',
+        oauthProvider: sensitiveValues.oauthProvider,
+      });
+      const oauthClient = result.llmConfig.createClient?.({
+        apiKey: sensitiveValues.incomingCredential,
+        defaultHeaders: { authorization: sensitiveValues.headerCredential },
+      });
+
+      await oauthClient?.messages.create({
+        model: sensitiveValues.model,
+        max_tokens: 512,
+        stream: false,
+        system: [{ type: 'text', text: sensitiveValues.system }],
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: sensitiveValues.user }] },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: sensitiveValues.assistant },
+              {
+                type: 'tool_use',
+                id: sensitiveValues.toolUseId,
+                name: sensitiveValues.toolName,
+                input: { [sensitiveValues.inputKey]: sensitiveValues.inputValue },
+              },
+            ],
+          },
+        ],
+        tools: [
+          {
+            name: sensitiveValues.toolName,
+            description: sensitiveValues.toolDescription,
+            input_schema: {
+              type: 'object',
+              properties: { [sensitiveValues.inputKey]: { type: 'string' } },
+            },
+          },
+        ],
+      });
+
+      const serializedLogs = info.mock.calls.flat().join('\n');
+      for (const sensitiveValue of Object.values(sensitiveValues)) {
+        expect(serializedLogs).not.toContain(sensitiveValue);
+      }
+      expect(serializedLogs).toContain('Anthropic OAuth Request Debug');
+      expect(serializedLogs).toContain('"message_count":2');
+      expect(serializedLogs).toContain('"tool_count":1');
+    } finally {
+      create.mockRestore();
+      info.mockRestore();
+      if (priorDebug == null) {
+        delete process.env.VIVENTIUM_ANTHROPIC_DEBUG;
+      } else {
+        process.env.VIVENTIUM_ANTHROPIC_DEBUG = priorDebug;
+      }
+    }
+  });
+  /* === VIVENTIUM END === */
+
   it('should let endpoint addParams override the Viventium Anthropic retry default', () => {
     const result = getLLMConfig('test-api-key', {
       modelOptions: {},

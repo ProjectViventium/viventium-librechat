@@ -158,6 +158,7 @@ function compactUploadEntryForHeader(value: unknown): unknown {
     'bytes',
     'width',
     'height',
+    'media_group_index',
     'metadata',
   ]) {
     if (entry[key] != null) {

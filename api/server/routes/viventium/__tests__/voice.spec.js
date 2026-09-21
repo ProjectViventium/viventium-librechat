@@ -35,6 +35,7 @@ let mockLastRequestText = null;
 let mockLastStreamId = null;
 let mockLastCanAuthorizeSideEffects = null;
 let mockLastActorTrust = null;
+let mockLastVoiceEffectAuthority = null;
 let mockLastAmbientContext = null;
 let mockLastCallSessionId = null;
 let mockLastInteractionContext = null;
@@ -42,21 +43,28 @@ let mockLastAdapterCapabilities = null;
 let mockLastDeliveryPolicy = null;
 let mockClaimedLogicalTurn = null;
 let mockAgentControllerCallCount = 0;
+let mockExternalMutationRequested = false;
+let mockExternalMutationCount = 0;
 let mockAgentControllerResponseDelayMs = 0;
 let mockAgentControllerGeneratedConversationId = null;
-let mockClaimGlassHiveDeliveries;
-let mockMarkGlassHiveDeliverySent;
-let mockMarkGlassHiveDeliveryFailed;
-let mockMarkGlassHiveDeliverySuppressed;
-let mockObservedInfoLogs;
-let mockConsoleLogSpy;
-let mockRequireVoiceAgentAccess;
-let mockBackgroundActivationPolicy;
 let mockCheckVoiceEngagement;
 let mockGetCallSession;
 let mockGetCallSessionVoiceSettings;
 let mockCreateVoiceEngagementAttestation;
 let mockVerifyVoiceEngagementAttestation;
+let mockClaimGlassHiveDeliveries;
+let mockAuthorizeGlassHiveDeliveryDispatch;
+let mockRenewGlassHiveDeliveryDispatch;
+let mockReleaseGlassHiveDeliveryDispatch;
+let mockMarkGlassHiveDeliverySent;
+let mockMarkGlassHiveDeliveryFailed;
+let mockMarkGlassHiveDeliveryUnknown;
+let mockMarkGlassHiveDeliverySuppressed;
+let mockCompleteGlassHiveWorkerCompletionPresentation;
+let mockObservedInfoLogs;
+let mockConsoleLogSpy;
+let mockRequireVoiceAgentAccess;
+let mockBackgroundActivationPolicy;
 let mockRecordVoiceOrchestrationTrace;
 let mockRecordVoiceOrchestrationTraceBestEffort;
 let mockRunVoiceClassifierFaultControl;
@@ -132,6 +140,9 @@ jest.mock('~/server/controllers/agents/request', () => (req, res) => {
     bindLogicalTurnContext(req, { ...mockLastInteractionContext, ...mockClaimedLogicalTurn });
   }
   mockAgentControllerCallCount += 1;
+  if (mockExternalMutationRequested) {
+    mockExternalMutationCount += 1;
+  }
   mockSpeakerPersistedAtController = mockSpeakerPersisted;
   mockLastParentMessageId = req.body.parentMessageId;
   mockLastConversationId = req.body.conversationId;
@@ -140,6 +151,7 @@ jest.mock('~/server/controllers/agents/request', () => (req, res) => {
   mockLastStreamId = req.body.streamId;
   mockLastCanAuthorizeSideEffects = req.body.viventiumCanAuthorizeSideEffects;
   mockLastActorTrust = req.body.viventiumActorTrust;
+  mockLastVoiceEffectAuthority = req.body.viventiumVoiceEffectAuthority;
   mockLastAmbientContext = req.body.viventiumAmbientContext;
   mockLastCallSessionId = req.body.viventiumCallSessionId;
   const respond = () =>
@@ -225,11 +237,19 @@ jest.mock('~/server/services/viventium/SpeakerSegmentService', () => {
 });
 
 jest.mock('~/server/services/viventium/GlassHiveCallbackDeliveryService', () => ({
+  authorizeGlassHiveCallbackDeliveryDispatch: (...args) =>
+    mockAuthorizeGlassHiveDeliveryDispatch(...args),
   claimPendingGlassHiveCallbackDeliveries: (...args) => mockClaimGlassHiveDeliveries(...args),
   markGlassHiveCallbackDeliverySent: (...args) => mockMarkGlassHiveDeliverySent(...args),
   markGlassHiveCallbackDeliveryFailed: (...args) => mockMarkGlassHiveDeliveryFailed(...args),
+  markGlassHiveCallbackDeliveryUnknown: (...args) => mockMarkGlassHiveDeliveryUnknown(...args),
   markGlassHiveCallbackDeliverySuppressed: (...args) =>
     mockMarkGlassHiveDeliverySuppressed(...args),
+  completeGlassHiveWorkerCompletionPresentation: (...args) =>
+    mockCompleteGlassHiveWorkerCompletionPresentation(...args),
+  releaseGlassHiveCallbackDeliveryDispatch: (...args) =>
+    mockReleaseGlassHiveDeliveryDispatch(...args),
+  renewGlassHiveCallbackDeliveryDispatch: (...args) => mockRenewGlassHiveDeliveryDispatch(...args),
 }));
 
 jest.mock('~/server/services/viventium/VoiceAgentAuthorizationService', () => ({
@@ -517,6 +537,8 @@ describe('/api/viventium/voice/chat', () => {
     mockLastAmbientContext = null;
     mockLastCallSessionId = null;
     mockAgentControllerCallCount = 0;
+    mockExternalMutationRequested = false;
+    mockExternalMutationCount = 0;
     mockAgentControllerResponseDelayMs = 0;
     mockAgentControllerGeneratedConversationId = null;
     mockRequireVoiceAgentAccess = jest.fn((_req, _res, next) => next());
@@ -716,8 +738,33 @@ describe('/api/viventium/voice/chat', () => {
       },
     ]);
     mockClaimGlassHiveDeliveries = jest.fn().mockResolvedValue([]);
+    mockAuthorizeGlassHiveDeliveryDispatch = jest.fn().mockResolvedValue({
+      deliveryId: 'ghcd_voice',
+      claimId: 'claim_voice',
+      surface: 'voice',
+      permitId: 'a'.repeat(32),
+      permitGeneration: 2,
+      expiresAt: '2026-08-23T20:00:00.000Z',
+      resultRevision: 2,
+      resultDigest: `sha256:${'b'.repeat(64)}`,
+    });
+    mockRenewGlassHiveDeliveryDispatch = jest.fn().mockResolvedValue({
+      deliveryId: 'ghcd_voice',
+      claimId: 'claim_voice',
+      surface: 'voice',
+      permitId: 'a'.repeat(32),
+      permitGeneration: 2,
+      expiresAt: '2026-08-23T20:01:00.000Z',
+      resultRevision: 2,
+      resultDigest: `sha256:${'b'.repeat(64)}`,
+    });
+    mockReleaseGlassHiveDeliveryDispatch = jest.fn().mockResolvedValue(true);
     mockMarkGlassHiveDeliverySent = jest.fn().mockResolvedValue({ deliveryId: 'ghcd_voice' });
+    mockCompleteGlassHiveWorkerCompletionPresentation = jest
+      .fn()
+      .mockResolvedValue({ deliveryId: 'ghcd_voice', status: 'sent' });
     mockMarkGlassHiveDeliveryFailed = jest.fn().mockResolvedValue({ deliveryId: 'ghcd_voice' });
+    mockMarkGlassHiveDeliveryUnknown = jest.fn().mockResolvedValue({ deliveryId: 'ghcd_voice' });
     mockMarkGlassHiveDeliverySuppressed = jest.fn().mockResolvedValue({ deliveryId: 'ghcd_voice' });
   });
 
@@ -734,6 +781,12 @@ describe('/api/viventium/voice/chat', () => {
     delete process.env.VIVENTIUM_VOICE_TURN_COALESCE_RETURN_WINDOW_MS;
     delete process.env.VIVENTIUM_VOICE_TURN_CONTINUATION_WINDOW_MS;
     delete process.env.VIVENTIUM_VOICE_LOG_LATENCY;
+    delete process.env.VIVENTIUM_LOCAL_QA_CASE_ID;
+    delete process.env.VIVENTIUM_LOCAL_QA_MODE;
+    delete process.env.VIVENTIUM_LOCAL_QA_CASE_TOKEN;
+    delete process.env.VIVENTIUM_LOCAL_QA_SESSION_REF;
+    delete process.env.VIVENTIUM_LOCAL_QA_COMPONENT_ARTIFACT_DIGEST;
+    delete process.env.VIVENTIUM_LOCAL_QA_CANDIDATE_DIGEST;
   });
 
   test('claim returns only the canonical server-owned room, agent, identity, route, and speaker state', async () => {
@@ -747,6 +800,7 @@ describe('/api/viventium/voice/chat', () => {
         stt: { provider: 'assemblyai', variant: 'universal-streaming' },
         tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
       },
+      contextualKeyterms: ['Quarterly Roadmap 2026.pdf', 'EIN-Migration Plan.xlsx'],
       speakerSessionState: {
         version: 1,
         callSessionId: 'call_session_1',
@@ -800,6 +854,7 @@ describe('/api/viventium/voice/chat', () => {
         stt: { provider: 'assemblyai', variant: 'universal-streaming' },
         tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
       },
+      contextualKeyterms: ['Quarterly Roadmap 2026.pdf', 'EIN-Migration Plan.xlsx'],
       speakerSessionState: { attributionState: 'shared_mic_unverified', revision: 3 },
       callState: {
         version: 1,
@@ -1398,6 +1453,9 @@ describe('/api/viventium/voice/chat', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(200);
+    expect(mockAssertVoiceGatewayAuth).toHaveBeenCalledWith(expect.any(Object), {
+      allowEnded: true,
+    });
     expect(res.body).toMatchObject({
       version: 1,
       callSessionId: 'call_session_1',
@@ -1460,6 +1518,7 @@ describe('/api/viventium/voice/chat', () => {
     expect(res.statusCode).toBe(200);
     expect(mockLastCanAuthorizeSideEffects).toBe(false);
     expect(mockLastActorTrust).toBe('shared_mic_unverified');
+    expect(mockLastCallSessionId).toBe('call_session_1');
     expect(mockPersistSpeakerSegments).toHaveBeenCalledWith(
       expect.objectContaining({ speakerAttributionState: 'shared_mic_unverified' }),
     );
@@ -1713,6 +1772,1369 @@ describe('/api/viventium/voice/chat', () => {
     expect(req.body.viventiumDeferVoiceMemory).toBe(true);
   });
 
+  test('passive Wing cannot create the observed unauthorized reminder or reach any controller', async () => {
+    mockExternalMutationRequested = true;
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      wingModeEnabled: true,
+      revision: 2,
+      speakerSessionRevision: 4,
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        text: 'I should remember to pick up the blue folder tomorrow afternoon.',
+        ownerTrackSid: 'owner-track',
+        speakerSegments: [
+          {
+            version: 1,
+            segmentId: 'segment_owner_1',
+            turnId: 'turn_owner_1',
+            sequence: 1,
+            revision: 1,
+            text: 'I should remember to pick up the blue folder tomorrow afternoon.',
+            isFinal: true,
+            speaker: {
+              key: 'participant:owner-participant',
+              label: 'You',
+              source: 'hybrid',
+              attribution: 'verified',
+              actorTrust: 'owner_participant',
+              participantIdentity: 'owner-participant',
+              trackSid: 'owner-track',
+              providerSpeakerId: 'A',
+            },
+          },
+        ],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ status: 'wing_passive', wingPassive: true });
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+    expect(req.body.viventiumActorTrust).toBe('owner_participant');
+    expect(req.body.viventiumCanAuthorizeSideEffects).toBe(false);
+  });
+
+  test('trusted directly addressed Wing authorizes the exact verified owner turn', async () => {
+    mockExternalMutationRequested = true;
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      wingModeEnabled: true,
+      revision: 2,
+      speakerSessionRevision: 4,
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        text: 'Please launch the requested worker.',
+        ownerTrackSid: 'owner-track',
+        voiceEngagement: {
+          version: 1,
+          callSessionId: 'call_session_1',
+          turnId: 'turn_owner_2',
+          participantIdentity: 'owner-participant',
+          segmentIds: ['segment_owner_2'],
+          directlyAddressed: true,
+          source: 'semantic_model',
+          revision: 1,
+          issuedAtMs: Date.now(),
+          expiresAtMs: Date.now() + 30_000,
+          attestation: 'signed-owner-engagement',
+        },
+        speakerSegments: [
+          {
+            version: 1,
+            segmentId: 'segment_owner_2',
+            turnId: 'turn_owner_2',
+            sequence: 2,
+            revision: 1,
+            text: 'Please launch the requested worker.',
+            isFinal: true,
+            speaker: {
+              key: 'participant:owner-participant',
+              label: 'You',
+              source: 'hybrid',
+              attribution: 'verified',
+              actorTrust: 'owner_participant',
+              participantIdentity: 'owner-participant',
+              trackSid: 'owner-track',
+              providerSpeakerId: 'A',
+            },
+          },
+        ],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockAgentControllerCallCount).toBe(1);
+    expect(mockExternalMutationCount).toBe(1);
+    expect(mockLastActorTrust).toBe('owner_participant');
+    expect(mockLastCanAuthorizeSideEffects).toBe(true);
+    expect(mockLastVoiceEffectAuthority).toMatchObject({
+      version: 1,
+      userId: 'user_1',
+      voiceAuthorityRef: expect.stringMatching(/^voice_authority_[a-f0-9]{64}$/),
+      voice: {
+        callSessionId: 'call_session_1',
+        voiceTurnId: 'turn_owner_2',
+        mode: 'wing',
+        callModeRevision: 2,
+        speakerSessionRevision: 4,
+        segmentRevisionDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+        ownerParticipantDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+        engagementDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      },
+    });
+    expect(mockVerifyVoiceEngagementAttestation).toHaveBeenCalled();
+  });
+
+  test('Wing rejects substituted action text even when the exact owner-turn receipt is genuine', async () => {
+    mockExternalMutationRequested = true;
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      wingModeEnabled: true,
+    });
+    const request = createSignedWingChatRequest({
+      turnId: 'turn_owner_substituted',
+      text: 'Please describe the current worker status.',
+    });
+    request.body.text = 'Please create an unrelated external reminder.';
+    const response = createMockRes();
+
+    await dispatch(createTestApp(require('../voice')), request, response);
+
+    expect(response.body).toMatchObject({ status: 'wing_passive', wingPassive: true });
+    expect(request.body.viventiumCanAuthorizeSideEffects).toBe(false);
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+  });
+
+  test('trusted Wing preserves legitimate whitespace-normalized owner speech', async () => {
+    mockExternalMutationRequested = true;
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      wingModeEnabled: true,
+    });
+    const request = createSignedWingChatRequest({
+      turnId: 'turn_owner_normalized_whitespace',
+      text: 'Please   launch\n the requested worker.',
+    });
+    const response = createMockRes();
+
+    await dispatch(createTestApp(require('../voice')), request, response);
+
+    expect(response.statusCode).toBe(200);
+    expect(mockLastRequestText).toBe('Please launch the requested worker.');
+    expect(mockAgentControllerCallCount).toBe(1);
+    expect(mockExternalMutationCount).toBe(1);
+  });
+
+  test('Wing rejects edited speaker text when its persisted signed owner segment is unchanged', async () => {
+    mockExternalMutationRequested = true;
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      wingModeEnabled: true,
+    });
+    const request = createSignedWingChatRequest({
+      turnId: 'turn_owner_segment_edit',
+      text: 'Please describe the current worker status.',
+    });
+    const persistedOwnerSegment = {
+      ...request.body.speakerSegments[0],
+      callSessionId: 'call_session_1',
+    };
+    request.body.text = 'Please create an unrelated external reminder.';
+    request.body.speakerSegments[0].text = request.body.text;
+    mockPersistSpeakerSegments.mockResolvedValueOnce({
+      accepted: [],
+      ignored: [persistedOwnerSegment.segmentId],
+      effectiveSegments: [persistedOwnerSegment],
+    });
+    const response = createMockRes();
+
+    await dispatch(createTestApp(require('../voice')), request, response);
+
+    expect(response.body).toMatchObject({ status: 'wing_passive', wingPassive: true });
+    expect(request.body.speakerSegments[0].text).toBe('Please describe the current worker status.');
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+  });
+
+  test('Wing denies a signed owner turn when its latest persisted speaker revision removes owner trust', async () => {
+    mockExternalMutationRequested = true;
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      wingModeEnabled: true,
+    });
+    const request = createSignedWingChatRequest({
+      turnId: 'turn_owner_downgraded',
+      text: 'Please perform the previously signed external action.',
+    });
+    const submitted = request.body.speakerSegments[0];
+    const downgraded = {
+      ...submitted,
+      revision: submitted.revision + 1,
+      uncertain: true,
+      speaker: {
+        ...submitted.speaker,
+        attribution: 'unverified',
+        actorTrust: 'shared_mic_unverified',
+      },
+    };
+    mockPersistSpeakerSegments.mockResolvedValueOnce({
+      accepted: [],
+      ignored: [submitted.segmentId],
+      effectiveSegments: [downgraded],
+    });
+    const response = createMockRes();
+
+    await dispatch(createTestApp(require('../voice')), request, response);
+
+    expect(response.body).toMatchObject({ status: 'wing_passive', wingPassive: true });
+    expect(request.body.speakerSegments).toEqual([expect.objectContaining({ revision: 2 })]);
+    expect(request.body.viventiumActorTrust).toBe('shared_mic_unverified');
+    expect(request.body.viventiumCanAuthorizeSideEffects).toBe(false);
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+  });
+
+  test('Wing denies an owner action when Listen-Only replaces its mode during the durable claim await', async () => {
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_ENABLED = 'false';
+    mockExternalMutationRequested = true;
+    const wingSession = {
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      wingModeEnabled: true,
+    };
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce(wingSession);
+    mockGetCallSession.mockResolvedValue(wingSession);
+    const originalCreate = mockVoiceIngressCreate.getMockImplementation();
+    mockVoiceIngressCreate.mockImplementation(async (document) => {
+      const saved = await originalCreate(document);
+      if (document.status === 'wing_authorized') {
+        mockGetCallSession.mockResolvedValue({
+          ...wingSession,
+          mode: 'listen_only',
+          listenOnlyModeEnabled: true,
+        });
+      }
+      return saved;
+    });
+    const request = createSignedWingChatRequest({
+      turnId: 'turn_owner_concurrent_listen_only',
+      text: 'Please create the exact requested external action.',
+    });
+    const response = createMockRes();
+
+    await dispatch(createTestApp(require('../voice')), request, response);
+
+    expect(response.body).toMatchObject({ status: 'listen_only', listenOnly: true });
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+    expect(request.body.viventiumCanAuthorizeSideEffects).toBe(false);
+  });
+
+  test('Wing rejects a speaker downgrade that arrives after its durable one-use authority claim', async () => {
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_ENABLED = 'false';
+    mockExternalMutationRequested = true;
+    const wingSession = {
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      wingModeEnabled: true,
+    };
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce(wingSession);
+    const request = createSignedWingChatRequest({
+      turnId: 'turn_owner_revision_after_claim',
+      text: 'Please launch the requested worker.',
+    });
+    const trustedSegment = request.body.speakerSegments[0];
+    mockListSpeakerSegments.mockResolvedValue([trustedSegment]);
+    const originalCreate = mockVoiceIngressCreate.getMockImplementation();
+    mockVoiceIngressCreate.mockImplementation(async (document) => {
+      const saved = await originalCreate(document);
+      if (document.status === 'wing_authorized') {
+        mockListSpeakerSegments.mockResolvedValue([
+          {
+            ...trustedSegment,
+            revision: trustedSegment.revision + 1,
+            uncertain: true,
+            speaker: {
+              ...trustedSegment.speaker,
+              attribution: 'unverified',
+              actorTrust: 'shared_mic_unverified',
+            },
+          },
+        ]);
+      }
+      return saved;
+    });
+    const response = createMockRes();
+
+    await dispatch(createTestApp(require('../voice')), request, response);
+
+    expect(response.body).toMatchObject({ status: 'wing_passive', wingPassive: true });
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+    expect(request.body.viventiumCanAuthorizeSideEffects).toBe(false);
+  });
+
+  test('Wing rejects an owner-session replacement that arrives during its durable authority claim', async () => {
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_ENABLED = 'false';
+    mockExternalMutationRequested = true;
+    const wingSession = {
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+    };
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce(wingSession);
+    mockGetCallSession.mockResolvedValue(wingSession);
+    const originalCreate = mockVoiceIngressCreate.getMockImplementation();
+    mockVoiceIngressCreate.mockImplementation(async (document) => {
+      const saved = await originalCreate(document);
+      if (document.status === 'wing_authorized') {
+        mockGetCallSession.mockResolvedValue({
+          ...wingSession,
+          ownerParticipantIdentity: 'different-owner',
+        });
+      }
+      return saved;
+    });
+    const request = createSignedWingChatRequest({
+      turnId: 'turn_owner_session_replaced',
+      text: 'Please launch the requested worker.',
+    });
+    const response = createMockRes();
+
+    await dispatch(createTestApp(require('../voice')), request, response);
+
+    expect(response.statusCode).toBe(403);
+    expect(response.body).toMatchObject({ code: 'voice_turn_authority_unavailable' });
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+    expect(request.body.viventiumCanAuthorizeSideEffects).toBe(false);
+  });
+
+  test('Wing fails closed when merged speaker segments invalidate its signed owner authority', async () => {
+    mockExternalMutationRequested = true;
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      wingModeEnabled: true,
+    });
+    const request = createSignedWingChatRequest({
+      turnId: 'turn_owner_merged',
+      text: 'Please launch the requested worker.',
+    });
+    const originalCreate = mockVoiceIngressCreate.getMockImplementation();
+    mockVoiceIngressCreate.mockImplementationOnce(async (document) => {
+      const stored = await originalCreate(document);
+      const unverified = {
+        ...request.body.speakerSegments[0],
+        segmentId: 'segment_merged_unverified',
+        sequence: 2,
+        uncertain: true,
+        speaker: {
+          ...request.body.speakerSegments[0].speaker,
+          attribution: 'unverified',
+          actorTrust: 'shared_mic_unverified',
+        },
+      };
+      stored.segments.push({
+        text: 'An unrelated nearby speaker joined this merged turn.',
+        receivedAtMs: Date.now() + 1,
+        requestId: 'request_merged_unverified',
+        speakerSegments: [unverified],
+      });
+      return stored;
+    });
+    const response = createMockRes();
+
+    await dispatch(createTestApp(require('../voice')), request, response);
+
+    expect(response.body).toMatchObject({ status: 'wing_passive', wingPassive: true });
+    expect(request.body.viventiumCanAuthorizeSideEffects).toBe(false);
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+    expect(mockVoiceIngressCreate).toHaveBeenCalledTimes(1);
+  });
+
+  test('Core independently rejects replay of a signed Wing turn even when ordinary coalescing is disabled', async () => {
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_ENABLED = 'false';
+    mockExternalMutationRequested = true;
+    mockAssertVoiceGatewayAuth.mockResolvedValue({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      wingModeEnabled: true,
+    });
+    const app = createTestApp(require('../voice'));
+    const request = {
+      turnId: 'turn_owner_replay',
+      text: 'Please launch the requested worker exactly once.',
+    };
+    const firstResponse = createMockRes();
+    const replayResponse = createMockRes();
+
+    await dispatch(app, createSignedWingChatRequest(request), firstResponse);
+    await dispatch(app, createSignedWingChatRequest(request), replayResponse);
+
+    expect(firstResponse.statusCode).toBe(200);
+    expect(replayResponse.statusCode).toBe(200);
+    expect(replayResponse.body).toMatchObject({
+      status: 'wing_passive',
+      wingPassive: true,
+      engagementReplayed: true,
+    });
+    expect(mockAgentControllerCallCount).toBe(1);
+    expect(mockExternalMutationCount).toBe(1);
+    expect(mockVoiceIngressCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        callSessionId: 'call_session_1',
+        userId: 'user_1',
+        status: 'wing_authorized',
+        requestId: 'turn_owner_replay',
+      }),
+    );
+  });
+
+  test('Core fails closed before any Wing mutation if its durable one-use authority ledger is unavailable', async () => {
+    process.env.VIVENTIUM_VOICE_TURN_COALESCE_ENABLED = 'false';
+    mockExternalMutationRequested = true;
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      wingModeEnabled: true,
+    });
+    mockVoiceIngressCreate.mockRejectedValueOnce(new Error('synthetic ledger unavailable'));
+    const app = createTestApp(require('../voice'));
+    const response = createMockRes();
+
+    await dispatch(
+      app,
+      createSignedWingChatRequest({
+        turnId: 'turn_owner_no_ledger',
+        text: 'Please launch the requested worker.',
+      }),
+      response,
+    );
+
+    expect(response.statusCode).toBe(503);
+    expect(response.body).toMatchObject({
+      code: 'voice_engagement_unavailable',
+      retryable: true,
+    });
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+  });
+
+  test.each([
+    { field: 'participantIdentity', value: 'guest-participant' },
+    { field: 'turnId', value: 'turn_another' },
+    { field: 'segmentIds', value: ['segment_another'] },
+    { field: 'source', value: 'browser' },
+    { field: 'attestation', value: 'forged-browser-engagement' },
+    { field: 'directlyAddressed', value: false },
+  ])('Wing rejects forged or non-addressed engagement field $field', async ({ field, value }) => {
+    mockExternalMutationRequested = true;
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      wingModeEnabled: true,
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        text: 'Please perform an external action.',
+        ownerTrackSid: 'owner-track',
+        voiceEngagement: {
+          version: 1,
+          callSessionId: 'call_session_1',
+          turnId: 'turn_owner_3',
+          participantIdentity: 'owner-participant',
+          segmentIds: ['segment_owner_3'],
+          directlyAddressed: true,
+          source: 'semantic_model',
+          revision: 1,
+          attestation: 'signed-owner-engagement',
+          [field]: value,
+        },
+        speakerSegments: [
+          {
+            version: 1,
+            segmentId: 'segment_owner_3',
+            turnId: 'turn_owner_3',
+            sequence: 3,
+            revision: 1,
+            text: 'Please perform an external action.',
+            isFinal: true,
+            speaker: {
+              key: 'participant:owner-participant',
+              label: 'You',
+              source: 'hybrid',
+              attribution: 'verified',
+              actorTrust: 'owner_participant',
+              participantIdentity: 'owner-participant',
+              trackSid: 'owner-track',
+              providerSpeakerId: 'A',
+            },
+          },
+        ],
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.body).toMatchObject({ status: 'wing_passive', wingPassive: true });
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+  });
+
+  test('canonical Listen-Only mode blocks external mutations even when a stale legacy flag disagrees', async () => {
+    mockExternalMutationRequested = true;
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'listen_only',
+      listenOnlyModeEnabled: false,
+    });
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { text: 'Please create a reminder.' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ status: 'listen_only', listenOnly: true });
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+  });
+
+  test('signed browser Wing classification uses only the configured model and Workbench Wing instructions, never background policy', async () => {
+    mockBackgroundActivationPolicy = {
+      enabled: true,
+      prompt: 'BACKGROUND_POLICY_FORBIDS_ALL_DIRECT_WORKER_LAUNCHES',
+    };
+    const { assertCallSessionSecret } = require('~/server/services/viventium/CallSessionService');
+    assertCallSessionSecret.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+    });
+    mockListSpeakerSegments.mockResolvedValueOnce([
+      {
+        version: 1,
+        callSessionId: 'call_session_1',
+        segmentId: 'segment_owner_classify',
+        turnId: 'turn_owner_classify',
+        sequence: 4,
+        revision: 2,
+        text: 'Please launch the worker I requested.',
+        isFinal: true,
+        speaker: {
+          key: 'participant:owner-participant',
+          label: 'You',
+          source: 'hybrid',
+          attribution: 'verified',
+          actorTrust: 'owner_participant',
+          participantIdentity: 'owner-participant',
+          trackSid: 'owner-track',
+          providerSpeakerId: 'A',
+        },
+      },
+    ]);
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/engagement/classify',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-call-capability': 'synthetic-browser-capability',
+      },
+      body: { version: 1, callSessionId: 'call_session_1', turnId: 'turn_owner_classify' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      callSessionId: 'call_session_1',
+      turnId: 'turn_owner_classify',
+      participantIdentity: 'owner-participant',
+      directlyAddressed: true,
+      source: 'semantic_model',
+      attestation: 'signed-owner-engagement',
+    });
+    expect(mockCheckVoiceEngagement).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cortexConfig: expect.objectContaining({
+          activation: expect.objectContaining({
+            provider: 'xai',
+            model: 'grok-4.5',
+            prompt: expect.stringContaining('WING MODE:'),
+          }),
+        }),
+        req: expect.objectContaining({
+          config: expect.objectContaining({
+            viventium: expect.objectContaining({
+              background_cortices: expect.objectContaining({
+                activation_policy: expect.objectContaining({ enabled: false }),
+                activation_subject_rule: expect.objectContaining({
+                  enabled: true,
+                  prompt: { promptRef: 'surface.wing' },
+                }),
+              }),
+            }),
+          }),
+          body: expect.objectContaining({
+            viventiumCanAuthorizeSideEffects: false,
+            suppressBackgroundCortices: true,
+          }),
+        }),
+      }),
+    );
+    const primaryAttempt = mockCheckVoiceEngagement.mock.calls[0][0];
+    expect(primaryAttempt.cortexConfig.activation).not.toHaveProperty('fallbacks');
+    expect(primaryAttempt.timeoutMs).toBeGreaterThanOrEqual(6_000);
+    expect(primaryAttempt.timeoutMs).toBeLessThanOrEqual(7_800);
+    expect(primaryAttempt.req.config.viventium.background_cortices.activation_policy).toEqual({
+      enabled: false,
+    });
+    expect(primaryAttempt.cortexConfig.activation.prompt).not.toContain('BACKGROUND_POLICY');
+    expect(req.config.viventium.background_cortices.activation_policy).toBe(
+      mockBackgroundActivationPolicy,
+    );
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+    expect(mockPersistSpeakerSegments).not.toHaveBeenCalled();
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+  });
+
+  test('browser classification rejects unverified or unfinished speaker evidence before any model call', async () => {
+    const { assertCallSessionSecret } = require('~/server/services/viventium/CallSessionService');
+    assertCallSessionSecret.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+    });
+    mockListSpeakerSegments.mockResolvedValueOnce([
+      {
+        version: 1,
+        callSessionId: 'call_session_1',
+        segmentId: 'segment_owner_interim',
+        turnId: 'turn_owner_interim',
+        sequence: 5,
+        revision: 1,
+        text: 'Unverified interim request',
+        isFinal: false,
+        speaker: {
+          attribution: 'verified',
+          actorTrust: 'owner_participant',
+          participantIdentity: 'owner-participant',
+        },
+      },
+    ]);
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/engagement/classify',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-call-capability': 'synthetic-browser-capability',
+      },
+      body: { version: 1, callSessionId: 'call_session_1', turnId: 'turn_owner_interim' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toMatchObject({ code: 'voice_engagement_not_authorized' });
+    expect(mockCheckVoiceEngagement).not.toHaveBeenCalled();
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('Wing classification does not sign when the call changes to Listen-Only during model execution', async () => {
+    const { app, req, res } = createVerifiedWingClassificationRequest({
+      turnId: 'turn_owner_model_mode_race',
+      text: 'Please launch the requested worker.',
+    });
+    mockCheckVoiceEngagement.mockImplementationOnce(async () => {
+      mockGetCallSession.mockResolvedValue({
+        callSessionId: 'call_session_1',
+        ownerParticipantIdentity: 'owner-participant',
+        userId: 'user_1',
+        agentId: 'agent_voice',
+        conversationId: 'conv-voice-1',
+        mode: 'listen_only',
+        listenOnlyModeEnabled: true,
+      });
+      return {
+        shouldActivate: true,
+        providerAttempts: [{ provider: 'xai', model: 'grok-4.5', status: 'completed' }],
+      };
+    });
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toMatchObject({ code: 'voice_engagement_not_authorized' });
+    expect(mockCreateVoiceEngagementAttestation).not.toHaveBeenCalled();
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('Wing classification does not sign when a final owner segment is downgraded during model execution', async () => {
+    const turnId = 'turn_owner_model_speaker_race';
+    const { app, req, res } = createVerifiedWingClassificationRequest({
+      turnId,
+      text: 'Please launch the requested worker.',
+    });
+    mockCheckVoiceEngagement.mockImplementationOnce(async () => {
+      mockListSpeakerSegments.mockResolvedValueOnce([
+        {
+          version: 1,
+          callSessionId: 'call_session_1',
+          segmentId: `${turnId}_segment`,
+          turnId,
+          sequence: 1,
+          revision: 2,
+          text: 'Please launch the requested worker.',
+          isFinal: true,
+          uncertain: true,
+          speaker: {
+            key: 'participant:owner-participant',
+            label: 'You',
+            source: 'hybrid',
+            attribution: 'unverified',
+            actorTrust: 'shared_mic_unverified',
+            participantIdentity: 'owner-participant',
+            trackSid: 'owner-track',
+            providerSpeakerId: 'A',
+          },
+        },
+      ]);
+      return {
+        shouldActivate: true,
+        providerAttempts: [{ provider: 'xai', model: 'grok-4.5', status: 'completed' }],
+      };
+    });
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toMatchObject({ code: 'voice_engagement_not_authorized' });
+    expect(mockCreateVoiceEngagementAttestation).not.toHaveBeenCalled();
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('Wing classification does not sign when final owner speech changes during model execution', async () => {
+    const turnId = 'turn_owner_model_utterance_race';
+    const { app, req, res } = createVerifiedWingClassificationRequest({
+      turnId,
+      text: 'Please describe the current worker status.',
+    });
+    mockCheckVoiceEngagement.mockImplementationOnce(async () => {
+      mockListSpeakerSegments.mockResolvedValueOnce([
+        {
+          version: 1,
+          callSessionId: 'call_session_1',
+          segmentId: `${turnId}_segment`,
+          turnId,
+          sequence: 1,
+          revision: 1,
+          text: 'Please create an unrelated external reminder.',
+          isFinal: true,
+          speaker: {
+            key: 'participant:owner-participant',
+            label: 'You',
+            source: 'hybrid',
+            attribution: 'verified',
+            actorTrust: 'owner_participant',
+            participantIdentity: 'owner-participant',
+            trackSid: 'owner-track',
+            providerSpeakerId: 'A',
+          },
+        },
+      ]);
+      return {
+        shouldActivate: true,
+        providerAttempts: [{ provider: 'xai', model: 'grok-4.5', status: 'completed' }],
+      };
+    });
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toMatchObject({ code: 'voice_engagement_not_authorized' });
+    expect(mockCreateVoiceEngagementAttestation).not.toHaveBeenCalled();
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('Wing classification does not sign when the active owner changes during model execution', async () => {
+    const { app, req, res } = createVerifiedWingClassificationRequest({
+      turnId: 'turn_owner_model_session_race',
+      text: 'Please launch the requested worker.',
+    });
+    mockCheckVoiceEngagement.mockImplementationOnce(async () => {
+      mockGetCallSession.mockResolvedValue({
+        callSessionId: 'call_session_1',
+        ownerParticipantIdentity: 'different-owner',
+        userId: 'user_1',
+        agentId: 'agent_voice',
+        conversationId: 'conv-voice-1',
+        mode: 'wing',
+      });
+      return {
+        shouldActivate: true,
+        providerAttempts: [{ provider: 'xai', model: 'grok-4.5', status: 'completed' }],
+      };
+    });
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toMatchObject({ code: 'voice_engagement_not_authorized' });
+    expect(mockCreateVoiceEngagementAttestation).not.toHaveBeenCalled();
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('browser Wing classification signs a genuine negative model decision without any action', async () => {
+    const { assertCallSessionSecret } = require('~/server/services/viventium/CallSessionService');
+    assertCallSessionSecret.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+    });
+    mockCheckVoiceEngagement.mockResolvedValueOnce({
+      shouldActivate: false,
+      confidence: 0.98,
+      reason: 'ambient conversation',
+      providerAttempts: [{ provider: 'xai', model: 'grok-4.5', status: 'completed' }],
+    });
+    mockListSpeakerSegments.mockResolvedValueOnce([
+      {
+        version: 1,
+        callSessionId: 'call_session_1',
+        segmentId: 'segment_owner_passive',
+        turnId: 'turn_owner_passive',
+        sequence: 7,
+        revision: 2,
+        text: 'I should remember to pick up the blue folder tomorrow afternoon.',
+        isFinal: true,
+        speaker: {
+          key: 'participant:owner-participant',
+          label: 'You',
+          source: 'hybrid',
+          attribution: 'verified',
+          actorTrust: 'owner_participant',
+          participantIdentity: 'owner-participant',
+          trackSid: 'owner-track',
+          providerSpeakerId: 'A',
+        },
+      },
+    ]);
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/engagement/classify',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-call-capability': 'synthetic-browser-capability',
+      },
+      body: { version: 1, callSessionId: 'call_session_1', turnId: 'turn_owner_passive' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ directlyAddressed: false, source: 'semantic_model' });
+    expect(mockCreateVoiceEngagementAttestation).toHaveBeenCalledWith(
+      expect.objectContaining({ directlyAddressed: false }),
+    );
+    expect(mockCheckVoiceEngagement).toHaveBeenCalledTimes(1);
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerId: 'user_1',
+        callSessionId: 'call_session_1',
+        turnId: 'turn_owner_passive',
+        stage: 'provider.attempt.completed',
+        facts: expect.objectContaining({
+          provider: 'xai',
+          model: 'grok-4.5',
+          providerStatus: 'completed',
+          attemptRole: 'primary',
+          effectCount: 1,
+        }),
+      }),
+    );
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+  });
+
+  test('Wing gives its configured primary an independent bounded budget, then uses only its declared fallback', async () => {
+    mockCheckVoiceEngagement
+      .mockResolvedValueOnce({
+        shouldActivate: false,
+        reason: 'global_timeout',
+        providerAttempts: [
+          {
+            provider: 'xai',
+            model: 'grok-4.5',
+            status: 'error',
+            error: { class: 'provider_timeout', code: 'ABORT_ERR' },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        shouldActivate: true,
+        confidence: 0.99,
+        reason: 'direct user engagement',
+        providerAttempts: [{ provider: 'anthropic', model: 'claude-opus-5', status: 'completed' }],
+      });
+    const { app, req, res } = createVerifiedWingClassificationRequest({
+      turnId: 'turn_owner_declared_fallback',
+      text: 'Please launch the requested worker.',
+    });
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ directlyAddressed: true, source: 'semantic_model' });
+    expect(mockCheckVoiceEngagement).toHaveBeenCalledTimes(2);
+    const [primaryAttempt, fallbackAttempt] = mockCheckVoiceEngagement.mock.calls.map(
+      ([attempt]) => attempt,
+    );
+    expect(primaryAttempt.cortexConfig.activation).toMatchObject({
+      provider: 'xai',
+      model: 'grok-4.5',
+    });
+    expect(primaryAttempt.cortexConfig.activation).not.toHaveProperty('fallbacks');
+    expect(primaryAttempt.timeoutMs).toBeGreaterThanOrEqual(6_000);
+    expect(fallbackAttempt.cortexConfig.activation).toMatchObject({
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+    });
+    expect(fallbackAttempt.cortexConfig.activation).not.toHaveProperty('fallbacks');
+    expect(fallbackAttempt.timeoutMs).toBeGreaterThan(0);
+    expect(fallbackAttempt.timeoutMs).toBeLessThanOrEqual(7_800);
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledTimes(2);
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        ownerId: 'user_1',
+        callSessionId: 'call_session_1',
+        turnId: 'turn_owner_declared_fallback',
+        stage: 'provider.attempt.completed',
+        facts: expect.objectContaining({
+          provider: 'anthropic',
+          model: 'claude-opus-5',
+          providerStatus: 'completed',
+          attemptRole: 'fallback',
+        }),
+      }),
+    );
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        ownerId: 'user_1',
+        callSessionId: 'call_session_1',
+        turnId: 'turn_owner_declared_fallback',
+        stage: 'provider.fallback.completed',
+        facts: expect.objectContaining({
+          primaryProvider: 'xai',
+          primaryModel: 'grok-4.5',
+          primaryProviderStatus: 'timeout',
+          fallbackProvider: 'anthropic',
+          fallbackModel: 'claude-opus-5',
+          fallbackProviderStatus: 'completed',
+          configuredFallback: true,
+          requiredCapabilitiesPreserved: true,
+        }),
+      }),
+    );
+    expect(mockAgentControllerCallCount).toBe(0);
+    expect(mockExternalMutationCount).toBe(0);
+  });
+
+  test('MPV-054 exact synthetic control consumes before the primary and runs only the configured fallback', async () => {
+    process.env.VIVENTIUM_LOCAL_QA_CASE_ID = 'MPV-054';
+    process.env.VIVENTIUM_LOCAL_QA_MODE = 'mpv_054';
+    process.env.VIVENTIUM_LOCAL_QA_CASE_TOKEN = Buffer.alloc(32, 7).toString('base64url');
+    process.env.VIVENTIUM_LOCAL_QA_SESSION_REF = 'qa_0123456789abcdef01234567';
+    process.env.VIVENTIUM_LOCAL_QA_COMPONENT_ARTIFACT_DIGEST = `sha256:${'4'.repeat(64)}`;
+    process.env.VIVENTIUM_LOCAL_QA_CANDIDATE_DIGEST = `sha256:${'1'.repeat(64)}`;
+    mockGetUserById.mockResolvedValueOnce({
+      _id: { toString: () => 'user_1' },
+      role: 'USER',
+      name: 'Viventium Voice QA',
+      email: 'viventium-voice-qa-mpv-054-exact@example.com',
+      provider: 'local',
+    });
+    mockRunVoiceClassifierFaultControl.mockResolvedValueOnce({
+      consumed: true,
+      controlId: `mpv054_${'a'.repeat(24)}`,
+      challengeId: `mpv054_ch_${'b'.repeat(24)}`,
+      receiptDigest: `sha256:${'5'.repeat(64)}`,
+      receiptExpiresAt: '2026-08-26T12:15:00.000Z',
+      failure: 'provider_temporarily_unavailable',
+      preModel: true,
+    });
+    mockCheckVoiceEngagement.mockResolvedValueOnce({
+      shouldActivate: true,
+      confidence: 0.99,
+      reason: 'direct user engagement',
+      providerAttempts: [{ provider: 'anthropic', model: 'claude-opus-5', status: 'completed' }],
+    });
+    const { app, req, res } = createVerifiedWingClassificationRequest({
+      turnId: 'turn_owner_controlled_fallback',
+      text: 'Please launch the requested worker.',
+    });
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockRunVoiceClassifierFaultControl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        caseId: 'MPV-054',
+        sessionRef: 'qa_0123456789abcdef01234567',
+        candidateDigest: `sha256:${'1'.repeat(64)}`,
+        componentArtifactDigest: `sha256:${'4'.repeat(64)}`,
+        installedArtifactDigest: `sha256:${'2'.repeat(64)}`,
+        runtimeOwnerBindingHash: `sha256:${'3'.repeat(64)}`,
+        ownerId: 'user_1',
+        callSessionId: 'call_session_1',
+        turnId: 'turn_owner_controlled_fallback',
+        segments: [{ segmentId: 'turn_owner_controlled_fallback_segment', revision: 1 }],
+        utteranceHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+        primary: { provider: 'xai', model: 'grok-4.5' },
+        fallback: { provider: 'anthropic', model: 'claude-opus-5' },
+      }),
+    );
+    expect(mockCheckVoiceEngagement).toHaveBeenCalledTimes(1);
+    expect(mockCheckVoiceEngagement.mock.calls[0][0].cortexConfig.activation).toMatchObject({
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+    });
+    expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'attempt.history.complete',
+        facts: expect.objectContaining({
+          provider: 'xai',
+          model: 'grok-4.5',
+          providerStatus: 'failed',
+          failure: 'provider_temporarily_unavailable',
+          preModel: true,
+          primaryStartedCount: 0,
+          primaryCompletedCount: 0,
+          providerHealthMutationCount: 0,
+          providerHealthSuppressed: false,
+          receiptRef: `sha256:${'5'.repeat(64)}`,
+          effectCount: 1,
+        }),
+      }),
+    );
+    expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'provider.request.forwarded',
+        facts: expect.objectContaining({
+          provider: 'anthropic',
+          model: 'claude-opus-5',
+          attemptRole: 'fallback',
+          state: 'running',
+        }),
+      }),
+    );
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'provider.fallback.completed',
+        facts: expect.objectContaining({
+          primaryProviderStatus: 'failed',
+          fallbackProviderStatus: 'completed',
+        }),
+      }),
+    );
+  });
+
+  test('MPV-054 exact armed synthetic turn fails typed before any provider call', async () => {
+    process.env.VIVENTIUM_LOCAL_QA_CASE_ID = 'MPV-054';
+    process.env.VIVENTIUM_LOCAL_QA_MODE = 'mpv_054';
+    mockGetUserById.mockResolvedValueOnce({
+      _id: { toString: () => 'user_1' },
+      role: 'USER',
+      name: 'Viventium Voice QA',
+      email: 'viventium-voice-qa-mpv-054-exact@example.com',
+      provider: 'local',
+    });
+    mockRunVoiceClassifierFaultControl.mockRejectedValueOnce(
+      Object.assign(new Error('private parent unavailable'), {
+        code: 'voice_classifier_qa_parent_unavailable',
+      }),
+    );
+    const controlled = createVerifiedWingClassificationRequest({
+      turnId: 'turn_owner_control_unavailable',
+      text: 'Please launch the requested worker.',
+    });
+    await dispatch(controlled.app, controlled.req, controlled.res);
+    expect(controlled.res.statusCode).toBe(503);
+    expect(controlled.res.body).toEqual({
+      code: 'voice_classifier_qa_control_unavailable',
+      message: 'The local Voice QA control could not complete.',
+      retryable: true,
+    });
+    expect(mockCheckVoiceEngagement).not.toHaveBeenCalled();
+  });
+
+  test('MPV-054 consumed synthetic turn fails typed when its strict trace cannot persist', async () => {
+    process.env.VIVENTIUM_LOCAL_QA_CASE_ID = 'MPV-054';
+    process.env.VIVENTIUM_LOCAL_QA_MODE = 'mpv_054';
+    mockGetUserById.mockResolvedValueOnce({
+      _id: { toString: () => 'user_1' },
+      role: 'USER',
+      name: 'Viventium Voice QA',
+      email: 'viventium-voice-qa-mpv-054-exact@example.com',
+      provider: 'local',
+    });
+    mockRunVoiceClassifierFaultControl.mockResolvedValueOnce({
+      consumed: true,
+      controlId: `mpv054_${'a'.repeat(24)}`,
+      receiptDigest: `sha256:${'5'.repeat(64)}`,
+      failure: 'provider_temporarily_unavailable',
+      preModel: true,
+    });
+    mockRecordVoiceOrchestrationTrace.mockRejectedValueOnce(new Error('ledger unavailable'));
+    const controlled = createVerifiedWingClassificationRequest({
+      turnId: 'turn_owner_control_trace_unavailable',
+      text: 'Please launch the requested worker.',
+    });
+
+    await dispatch(controlled.app, controlled.req, controlled.res);
+
+    expect(controlled.res.statusCode).toBe(503);
+    expect(controlled.res.body).toEqual({
+      code: 'voice_classifier_qa_control_unavailable',
+      message: 'The local Voice QA control could not complete.',
+      retryable: true,
+    });
+    expect(mockCheckVoiceEngagement).not.toHaveBeenCalled();
+  });
+
+  test('inactive MPV-054 control leaves ordinary traffic on its configured primary route', async () => {
+    process.env.VIVENTIUM_LOCAL_QA_CASE_ID = 'MPV-054';
+    process.env.VIVENTIUM_LOCAL_QA_MODE = 'mpv_054';
+    mockGetUserById.mockResolvedValueOnce({ _id: { toString: () => 'user_1' }, role: 'USER' });
+    const personal = createVerifiedWingClassificationRequest({
+      turnId: 'turn_personal_unrelated',
+      text: 'Please launch the requested worker.',
+    });
+    await dispatch(personal.app, personal.req, personal.res);
+    expect(personal.res.statusCode).toBe(200);
+    expect(mockRunVoiceClassifierFaultControl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerId: 'user_1',
+        callSessionId: 'call_session_1',
+        turnId: 'turn_personal_unrelated',
+      }),
+    );
+    expect(mockCheckVoiceEngagement).toHaveBeenCalledTimes(1);
+  });
+
+  test('Wing reports configured-provider authentication failure without minting semantic authority', async () => {
+    mockGetCallSessionVoiceSettings.mockResolvedValueOnce({
+      assistantRoute: { effective: { provider: 'xai', model: 'grok-4.5' } },
+    });
+    mockCheckVoiceEngagement.mockResolvedValueOnce({
+      shouldActivate: false,
+      reason: 'provider_unavailable',
+      providerAttempts: [
+        {
+          provider: 'xai',
+          model: 'grok-4.5',
+          status: 'error',
+          error: { class: 'provider_unauthorized', status: 401, code: 'INVALID_API_KEY' },
+        },
+      ],
+    });
+    const { app, req, res } = createVerifiedWingClassificationRequest({
+      turnId: 'turn_owner_provider_auth',
+      text: 'Please launch the requested worker.',
+    });
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toMatchObject({
+      code: 'provider_failure',
+      failure: 'provider_unauthorized',
+      provider: 'xai',
+      model: 'grok-4.5',
+      retryable: false,
+    });
+    expect(mockCreateVoiceEngagementAttestation).not.toHaveBeenCalled();
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
+  test('Wing classifier never signs a provider failure as a semantic decision', async () => {
+    const { assertCallSessionSecret } = require('~/server/services/viventium/CallSessionService');
+    assertCallSessionSecret.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+    });
+    mockCheckVoiceEngagement
+      .mockResolvedValueOnce({
+        shouldActivate: false,
+        confidence: 0,
+        reason: 'provider_rate_limited',
+        providerAttempts: [{ provider: 'xai', model: 'grok-4.5', status: 'error' }],
+      })
+      .mockResolvedValueOnce({
+        shouldActivate: false,
+        confidence: 0,
+        reason: 'provider_rate_limited',
+        providerAttempts: [{ provider: 'anthropic', model: 'claude-opus-5', status: 'error' }],
+      });
+    mockListSpeakerSegments.mockResolvedValueOnce([
+      {
+        version: 1,
+        callSessionId: 'call_session_1',
+        segmentId: 'segment_owner_failure',
+        turnId: 'turn_owner_failure',
+        sequence: 8,
+        revision: 1,
+        text: 'Please launch the requested worker.',
+        isFinal: true,
+        speaker: {
+          key: 'participant:owner-participant',
+          label: 'You',
+          source: 'hybrid',
+          attribution: 'verified',
+          actorTrust: 'owner_participant',
+          participantIdentity: 'owner-participant',
+          trackSid: 'owner-track',
+          providerSpeakerId: 'A',
+        },
+      },
+    ]);
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      url: '/api/viventium/voice/engagement/classify',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-call-capability': 'synthetic-browser-capability',
+      },
+      body: { version: 1, callSessionId: 'call_session_1', turnId: 'turn_owner_failure' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toMatchObject({ code: 'voice_engagement_unavailable', retryable: true });
+    expect(mockCreateVoiceEngagementAttestation).not.toHaveBeenCalled();
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
   test('accepts late speaker revisions without requiring another chat turn', async () => {
     mockPersistSpeakerSegments.mockResolvedValueOnce({
       accepted: ['seg-late'],
@@ -1854,6 +3276,331 @@ describe('/api/viventium/voice/chat', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(403);
+    expect(mockListSpeakerSegments).not.toHaveBeenCalled();
+  });
+
+  test('gateway turn authority returns only the latest exact persisted call and turn revisions', async () => {
+    mockGetCallSession.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      mode: 'wing',
+      status: 'listening',
+      revision: 9,
+      updatedAt: Date.parse('2026-08-09T15:10:00.000Z'),
+    });
+    mockListSpeakerSegments.mockResolvedValueOnce([
+      {
+        version: 1,
+        callSessionId: 'call_session_1',
+        turnId: 'turn_owner',
+        segmentId: 'segment_owner',
+        revision: 2,
+        sequence: 1,
+        isFinal: true,
+        speaker: {
+          participantIdentity: 'owner-participant',
+          attribution: 'verified',
+          actorTrust: 'owner_participant',
+        },
+      },
+      {
+        version: 1,
+        callSessionId: 'call_session_1',
+        turnId: 'turn_other',
+        segmentId: 'segment_other',
+        revision: 4,
+        sequence: 2,
+        isFinal: true,
+      },
+    ]);
+    const request = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/speaker-segments/authority/turn_owner',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
+    const response = createMockRes();
+
+    await dispatch(createTestApp(require('../voice')), request, response);
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toMatchObject({
+      version: 1,
+      callSessionId: 'call_session_1',
+      turnId: 'turn_owner',
+      mode: 'wing',
+      status: 'listening',
+      revision: 9,
+      updatedAt: '2026-08-09T15:10:00.000Z',
+      speakerSegments: [{ segmentId: 'segment_owner', revision: 2 }],
+    });
+    expect(JSON.stringify(response.body)).not.toContain('turn_other');
+  });
+
+  test('gateway verifies a signed owner decision through Core without access to its signing key', async () => {
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'wing',
+      status: 'listening',
+    });
+    const signedRequest = createSignedWingChatRequest({
+      turnId: 'turn_owner_core_verification',
+      text: 'Please launch the requested worker.',
+    });
+    const segment = {
+      ...signedRequest.body.speakerSegments[0],
+      callSessionId: 'call_session_1',
+    };
+    mockListSpeakerSegments.mockResolvedValueOnce([segment]);
+    const request = createMockReq({
+      url: '/api/viventium/voice/engagement/verify',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { version: 1, engagement: signedRequest.body.voiceEngagement },
+    });
+    const response = createMockRes();
+
+    await dispatch(createTestApp(require('../voice')), request, response);
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toEqual({
+      version: 1,
+      callSessionId: 'call_session_1',
+      turnId: 'turn_owner_core_verification',
+      verified: true,
+    });
+    expect(mockVerifyVoiceEngagementAttestation).toHaveBeenCalledWith(
+      signedRequest.body.voiceEngagement,
+      expect.objectContaining({ utterance: 'Please launch the requested worker.' }),
+    );
+  });
+
+  test.each(['tts.completed', 'audio.completed'])(
+    'records %s only for the exact leased Voice task and logical turn',
+    async (stage) => {
+      const { GenerationJobManager } = require('@librechat/api');
+      const voiceTaskService = require('~/server/services/viventium/VoiceTaskService');
+      const task = voiceTaskService.createVoiceTask({
+        callSessionId: 'call_session_1',
+        userId: 'user_1',
+        conversationId: 'conv-voice-1',
+        turnId: 'speaker-turn-1',
+        streamId: 'stream-trace-1',
+        owner: { kind: 'generation_job', id: 'stream-trace-1' },
+      });
+      GenerationJobManager.getJob.mockResolvedValueOnce({
+        metadata: {
+          userId: 'user_1',
+          viventiumCallSessionId: 'call_session_1',
+          viventiumVoiceTaskId: task.taskId,
+          interactionContext: {
+            surface: 'voice',
+            logical_turn_id: 'logical-turn-1',
+          },
+        },
+      });
+      const response = createMockRes();
+
+      await dispatch(
+        createTestApp(require('../voice')),
+        createMockReq({
+          url: '/api/viventium/voice/trace/stages',
+          headers: { 'x-viventium-call-secret': 'secret' },
+          body: {
+            version: 1,
+            callSessionId: 'call_session_1',
+            turnId: 'logical-turn-1',
+            streamId: 'stream-trace-1',
+            taskId: task.taskId,
+            presentationRef: 'speech-presentation-1',
+            stage,
+          },
+        }),
+        response,
+      );
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toEqual({ version: 1, accepted: true, stage });
+      expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledWith({
+        ownerId: 'user_1',
+        callSessionId: 'call_session_1',
+        turnId: 'logical-turn-1',
+        eventRef: 'speech-presentation-1',
+        stage,
+        facts: {
+          streamRef: 'stream-trace-1',
+          taskRef: task.taskId,
+          presentationRef: 'speech-presentation-1',
+          effectCount: 1,
+        },
+      });
+    },
+  );
+
+  test('rejects private content and mismatched Voice trace authority before recording', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const voiceTaskService = require('~/server/services/viventium/VoiceTaskService');
+    const task = voiceTaskService.createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      conversationId: 'conv-voice-1',
+      turnId: 'speaker-turn-1',
+      streamId: 'stream-trace-private',
+      owner: { kind: 'generation_job', id: 'stream-trace-private' },
+    });
+    const validJob = {
+      metadata: {
+        userId: 'user_1',
+        viventiumCallSessionId: 'call_session_1',
+        viventiumVoiceTaskId: task.taskId,
+        interactionContext: { surface: 'voice', logical_turn_id: 'logical-turn-1' },
+      },
+    };
+    const validBody = {
+      version: 1,
+      callSessionId: 'call_session_1',
+      turnId: 'logical-turn-1',
+      streamId: 'stream-trace-private',
+      taskId: task.taskId,
+      presentationRef: 'speech-presentation-private',
+      stage: 'tts.completed',
+    };
+
+    for (const body of [
+      { ...validBody, text: 'private transcript must never cross this boundary' },
+      { ...validBody, callSessionId: 'call-other' },
+      { ...validBody, turnId: 'logical-turn-other' },
+      { ...validBody, taskId: 'task-other' },
+      { ...validBody, stage: 'response.completed' },
+    ]) {
+      GenerationJobManager.getJob.mockResolvedValueOnce(validJob);
+      const response = createMockRes();
+      await dispatch(
+        createTestApp(require('../voice')),
+        createMockReq({
+          url: '/api/viventium/voice/trace/stages',
+          headers: { 'x-viventium-call-secret': 'secret' },
+          body,
+        }),
+        response,
+      );
+      expect(response.statusCode).toBeGreaterThanOrEqual(400);
+    }
+
+    expect(mockRecordVoiceOrchestrationTrace).not.toHaveBeenCalled();
+  });
+
+  test('gateway verification rejects a forged decision and a concurrently downgraded session', async () => {
+    mockAssertVoiceGatewayAuth.mockResolvedValue({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      mode: 'wing',
+      status: 'listening',
+    });
+    const signedRequest = createSignedWingChatRequest({
+      turnId: 'turn_owner_gateway_forgery',
+      text: 'Please launch the requested worker.',
+    });
+    const segment = {
+      ...signedRequest.body.speakerSegments[0],
+      callSessionId: 'call_session_1',
+    };
+    mockListSpeakerSegments.mockResolvedValue([segment]);
+
+    for (const rejected of [
+      { ...signedRequest.body.voiceEngagement, attestation: 'forged-with-gateway-secret' },
+      { ...signedRequest.body.voiceEngagement, directlyAddressed: false },
+    ]) {
+      const response = createMockRes();
+      await dispatch(
+        createTestApp(require('../voice')),
+        createMockReq({
+          url: '/api/viventium/voice/engagement/verify',
+          headers: { 'x-viventium-call-secret': 'secret' },
+          body: { version: 1, engagement: rejected },
+        }),
+        response,
+      );
+      expect(response.statusCode).toBe(403);
+      expect(response.body).toMatchObject({ code: 'voice_engagement_not_authorized' });
+    }
+
+    mockGetCallSession.mockResolvedValueOnce({
+      callSessionId: 'call_session_1',
+      ownerParticipantIdentity: 'owner-participant',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      mode: 'listen_only',
+      status: 'listening',
+    });
+    const response = createMockRes();
+    await dispatch(
+      createTestApp(require('../voice')),
+      createMockReq({
+        url: '/api/viventium/voice/engagement/verify',
+        headers: { 'x-viventium-call-secret': 'secret' },
+        body: { version: 1, engagement: signedRequest.body.voiceEngagement },
+      }),
+      response,
+    );
+    expect(response.statusCode).toBe(403);
+    expect(response.body).toMatchObject({ code: 'voice_engagement_not_authorized' });
+  });
+
+  test('gateway turn authority fails closed when owner or session changes while reading', async () => {
+    for (const changed of [
+      { callSessionId: 'call_other', userId: 'user_1', status: 'listening' },
+      { callSessionId: 'call_session_1', userId: 'owner_other', status: 'listening' },
+      { callSessionId: 'call_session_1', userId: 'user_1', status: 'ended' },
+    ]) {
+      mockGetCallSession.mockResolvedValueOnce(changed);
+      mockListSpeakerSegments.mockResolvedValueOnce([]);
+      const response = createMockRes();
+
+      await dispatch(
+        createTestApp(require('../voice')),
+        createMockReq({
+          method: 'GET',
+          url: '/api/viventium/voice/speaker-segments/authority/turn_owner',
+          headers: { 'x-viventium-call-secret': 'secret' },
+        }),
+        response,
+      );
+
+      expect(response.statusCode).toBe(403);
+      expect(response.body).toMatchObject({ code: 'voice_turn_authority_unavailable' });
+    }
+  });
+
+  test('gateway turn authority never accepts a browser capability without its bound worker lease', async () => {
+    const gatewayError = new Error('Missing voice job id');
+    gatewayError.status = 401;
+    mockAssertVoiceGatewayAuth.mockRejectedValueOnce(gatewayError);
+    const { assertCallSessionSecret } = require('~/server/services/viventium/CallSessionService');
+    const response = createMockRes();
+
+    await dispatch(
+      createTestApp(require('../voice')),
+      createMockReq({
+        method: 'GET',
+        url: '/api/viventium/voice/speaker-segments/authority/turn_owner',
+        headers: {
+          'x-viventium-call-secret': 'secret',
+          'x-viventium-call-session': 'call_session_1',
+          'x-viventium-call-capability': 'synthetic-browser-capability',
+        },
+      }),
+      response,
+    );
+
+    expect(response.statusCode).toBe(401);
+    expect(assertCallSessionSecret).not.toHaveBeenCalled();
     expect(mockListSpeakerSegments).not.toHaveBeenCalled();
   });
 
@@ -3175,7 +4922,6 @@ describe('/api/viventium/voice/chat', () => {
   });
 
   test('logs committed voice turns with callSessionId and requestId', async () => {
-    const { logger } = require('@librechat/data-schemas');
     const voiceRouter = require('../voice');
     const app = createTestApp(voiceRouter);
     const req = createMockReq({
@@ -3483,19 +5229,27 @@ describe('/api/viventium/voice/chat', () => {
 
   test('subscribes live first and replays every durable task page beyond the in-memory limit', async () => {
     const taskService = require('~/server/services/viventium/VoiceTaskService');
-    const snapshots = Array.from({ length: 1_002 }, (_, index) => ({
-      version: 1,
-      eventId: `snapshot-${index}`,
-      sequence: 2,
-      emittedAt: '2026-08-09T12:00:00.000Z',
-      callSessionId: 'call_session_1',
-      taskId: `durable-task-${index.toString().padStart(4, '0')}`,
-      type: 'snapshot',
-      state: index === 0 ? 'cancelled_unenforceable' : index === 1_001 ? 'running' : 'completed',
-      cancellable: index === 1_001,
-      retryable: false,
-      owner: { kind: 'generation_job' },
-    }));
+    const snapshots = Array.from({ length: 1_002 }, (_, index) => {
+      let state = 'completed';
+      if (index === 0) {
+        state = 'cancelled_unenforceable';
+      } else if (index === 1_001) {
+        state = 'running';
+      }
+      return {
+        version: 1,
+        eventId: `snapshot-${index}`,
+        sequence: 2,
+        emittedAt: '2026-08-09T12:00:00.000Z',
+        callSessionId: 'call_session_1',
+        taskId: `durable-task-${index.toString().padStart(4, '0')}`,
+        type: 'snapshot',
+        state,
+        cancellable: index === 1_001,
+        retryable: false,
+        owner: { kind: 'generation_job' },
+      };
+    });
     const listSpy = jest
       .spyOn(taskService, 'listDurableVoiceTaskSnapshots')
       .mockResolvedValueOnce({
@@ -4529,6 +6283,43 @@ describe('/api/viventium/voice/chat', () => {
     expect(mockAgentControllerCallCount).toBe(0);
   });
 
+  test('Listen-Only transcript persistence redacts private upstream errors from HTTP and logs', async () => {
+    const { logger } = require('@librechat/data-schemas');
+    const sensitiveMarker = 'SYNTHETIC_PRIVATE_TRANSCRIPT_CREDENTIAL';
+    mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
+      callSessionId: 'call_session_listen_only',
+      userId: 'user_1',
+      agentId: 'agent_voice',
+      conversationId: 'conv-voice-1',
+      mode: 'listen_only',
+      listenOnlyModeEnabled: true,
+    });
+    mockMessageFindOneAndUpdate.mockRejectedValueOnce(
+      Object.assign(new Error(`upstream rejected ${sensitiveMarker}`), { status: 503 }),
+    );
+    const response = createMockRes();
+
+    await dispatch(
+      createTestApp(require('../voice')),
+      createMockReq({
+        url: '/api/viventium/voice/chat',
+        headers: { 'x-viventium-call-secret': 'secret' },
+        body: { text: 'Synthetic ambient transcript only.' },
+      }),
+      response,
+    );
+
+    expect(response.statusCode).toBe(503);
+    expect(response.body).toMatchObject({
+      error: 'Listen-Only transcript persistence failed',
+      listenOnly: true,
+      status: 'listen_only_error',
+    });
+    expect(JSON.stringify(response.body)).not.toContain(sensitiveMarker);
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(sensitiveMarker);
+    expect(mockAgentControllerCallCount).toBe(0);
+  });
+
   test('Listen-Only mode coalesces rapid parentless transcript duplicates into one saved row', async () => {
     jest.useFakeTimers();
     process.env.VIVENTIUM_VOICE_TURN_COALESCE_WINDOW_MS = '10';
@@ -5264,6 +7055,8 @@ describe('/api/viventium/voice/chat', () => {
         callbackId: 'cb_voice',
         text: 'Worker finished.',
         claimId: 'claim_voice',
+        userId: 'user_1',
+        voiceCallSessionId: 'call_session_1',
       },
     ]);
     const voiceRouter = require('../voice');
@@ -5290,6 +7083,231 @@ describe('/api/viventium/voice/chat', () => {
     );
   });
 
+  test('POST glasshive delivery claim rejects a substituted callback or a different owner/call', async () => {
+    for (const mismatch of [
+      { callbackId: 'different_callback', userId: 'user_1', voiceCallSessionId: 'call_session_1' },
+      { callbackId: 'cb_voice', userId: 'different_owner', voiceCallSessionId: 'call_session_1' },
+      { callbackId: 'cb_voice', userId: 'user_1', voiceCallSessionId: 'different_call' },
+    ]) {
+      mockClaimGlassHiveDeliveries.mockResolvedValueOnce([
+        { deliveryId: 'ghcd_voice', claimId: 'claim_voice', ...mismatch },
+      ]);
+      const request = createMockReq({
+        method: 'POST',
+        url: '/api/viventium/voice/glasshive/deliveries/claim',
+        headers: { 'x-viventium-call-secret': 'secret' },
+        body: { callbackId: 'cb_voice' },
+      });
+      const response = createMockRes();
+
+      await dispatch(createTestApp(require('../voice')), request, response);
+
+      expect(response.statusCode).toBe(409);
+      expect(response.body).toMatchObject({ error: 'delivery_scope_mismatch' });
+    }
+  });
+
+  test('POST glasshive delivery claim fails closed when one exact request yields multiple claims', async () => {
+    const exact = {
+      deliveryId: 'ghcd_voice',
+      claimId: 'claim_voice',
+      callbackId: 'cb_voice',
+      userId: 'user_1',
+      voiceCallSessionId: 'call_session_1',
+    };
+    mockClaimGlassHiveDeliveries.mockResolvedValueOnce([exact, { ...exact }]);
+    const response = createMockRes();
+
+    await dispatch(
+      createTestApp(require('../voice')),
+      createMockReq({
+        method: 'POST',
+        url: '/api/viventium/voice/glasshive/deliveries/claim',
+        headers: { 'x-viventium-call-secret': 'secret' },
+        body: { callbackId: 'cb_voice' },
+      }),
+      response,
+    );
+
+    expect(response.statusCode).toBe(409);
+    expect(response.body).toMatchObject({ error: 'delivery_scope_mismatch' });
+  });
+
+  test('POST glasshive delivery authorize binds speech to the authenticated call', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/glasshive/deliveries/ghcd_voice/authorize',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { claimId: 'claim_voice', leaseMs: 45000 },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.permit).toMatchObject({
+      deliveryId: 'ghcd_voice',
+      claimId: 'claim_voice',
+      surface: 'voice',
+      resultRevision: 2,
+    });
+    expect(mockAuthorizeGlassHiveDeliveryDispatch).toHaveBeenCalledWith({
+      deliveryId: 'ghcd_voice',
+      claimId: 'claim_voice',
+      leaseMs: 45000,
+      userId: 'user_1',
+      voiceCallSessionId: 'call_session_1',
+    });
+  });
+
+  test('POST glasshive delivery authorize rejects stale speech before its side effect', async () => {
+    mockAuthorizeGlassHiveDeliveryDispatch.mockResolvedValueOnce(null);
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/glasshive/deliveries/ghcd_voice/authorize',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { claimId: 'claim_stale' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.error).toBe('delivery_dispatch_not_authorized');
+  });
+
+  test('POST glasshive voice permit renew and release stay call scoped', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const dispatchPermit = { permitId: 'a'.repeat(32), permitGeneration: 2 };
+    const renewReq = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/glasshive/deliveries/ghcd_voice/renew',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { claimId: 'claim_voice', dispatchPermit, leaseMs: 45000 },
+    });
+    const renewRes = createMockRes();
+
+    await dispatch(app, renewReq, renewRes);
+
+    expect(renewRes.statusCode).toBe(200);
+    expect(mockRenewGlassHiveDeliveryDispatch).toHaveBeenCalledWith({
+      deliveryId: 'ghcd_voice',
+      claimId: 'claim_voice',
+      dispatchPermit,
+      leaseMs: 45000,
+      userId: 'user_1',
+      voiceCallSessionId: 'call_session_1',
+    });
+
+    const releaseReq = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/glasshive/deliveries/ghcd_voice/release',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { claimId: 'claim_voice', dispatchPermit },
+    });
+    const releaseRes = createMockRes();
+
+    await dispatch(app, releaseReq, releaseRes);
+
+    expect(releaseRes.statusCode).toBe(200);
+    expect(releaseRes.body).toEqual({ released: true });
+    expect(mockReleaseGlassHiveDeliveryDispatch).toHaveBeenCalledWith({
+      deliveryId: 'ghcd_voice',
+      claimId: 'claim_voice',
+      dispatchPermit,
+      userId: 'user_1',
+      voiceCallSessionId: 'call_session_1',
+    });
+  });
+
+  test('POST glasshive voice sent status settles the exact dispatch permit', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const dispatchPermit = { permitId: 'a'.repeat(32), permitGeneration: 2 };
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/glasshive/deliveries/ghcd_voice/status',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { claimId: 'claim_voice', status: 'sent', dispatchPermit },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockMarkGlassHiveDeliverySent).toHaveBeenCalledWith({
+      deliveryId: 'ghcd_voice',
+      claimId: 'claim_voice',
+      dispatchPermit,
+      userId: 'user_1',
+      voiceCallSessionId: 'call_session_1',
+    });
+  });
+
+  test('POST glasshive Voice completion settles only the exact coalesced presentation', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const dispatchPermit = { permitId: 'a'.repeat(32), permitGeneration: 2 };
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/glasshive/deliveries/ghcd_voice/presentation-complete',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        claimId: 'claim_voice',
+        dispatchPermit,
+        presentationRef: `voice_worker_completion_${'b'.repeat(64)}`,
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockCompleteGlassHiveWorkerCompletionPresentation).toHaveBeenCalledWith({
+      deliveryId: 'ghcd_voice',
+      claimId: 'claim_voice',
+      dispatchPermit,
+      presentationRef: `voice_worker_completion_${'b'.repeat(64)}`,
+      userId: 'user_1',
+      voiceCallSessionId: 'call_session_1',
+    });
+  });
+
+  test('POST glasshive voice unknown status settles the exact permit without replay', async () => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const dispatchPermit = { permitId: 'a'.repeat(32), permitGeneration: 2 };
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/glasshive/deliveries/ghcd_voice/status',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: {
+        claimId: 'claim_voice',
+        status: 'delivery_unknown',
+        dispatchPermit,
+        reason: 'voice_partial_speech_permit_renewal_failed',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockMarkGlassHiveDeliveryUnknown).toHaveBeenCalledWith({
+      deliveryId: 'ghcd_voice',
+      claimId: 'claim_voice',
+      dispatchPermit,
+      reason: 'voice_partial_speech_permit_renewal_failed',
+      userId: 'user_1',
+      voiceCallSessionId: 'call_session_1',
+    });
+  });
+
   test('POST glasshive delivery status reports lost voice claim as conflict', async () => {
     mockMarkGlassHiveDeliverySent.mockResolvedValueOnce(null);
     const voiceRouter = require('../voice');
@@ -5298,7 +7316,11 @@ describe('/api/viventium/voice/chat', () => {
       method: 'POST',
       url: '/api/viventium/voice/glasshive/deliveries/ghcd_voice/status',
       headers: { 'x-viventium-call-secret': 'secret' },
-      body: { claimId: 'claim-stale', status: 'sent' },
+      body: {
+        claimId: 'claim-stale',
+        status: 'sent',
+        dispatchPermit: { permitId: 'a'.repeat(32), permitGeneration: 2 },
+      },
     });
     const res = createMockRes();
 

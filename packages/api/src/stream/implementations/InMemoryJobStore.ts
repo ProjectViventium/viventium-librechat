@@ -1,14 +1,6 @@
 import { interactionPresentationSequence } from '../../agents/interactionContext';
-import type { NativeResponseIdentity, NativeResponseCommit } from '@librechat/data-schemas';
-import {
-  nativeIdentityJson,
-  nativeIdentityValid,
-  nativeJobMatches,
-  retainNativeResponse,
-  NATIVE_RESPONSE_RECOVERY_WINDOW_MS,
-} from './nativeResponse';
 import { logger } from '@librechat/data-schemas';
-import { retainLogicalTurnInput, mergeLogicalTurnInput } from './logicalTurnInput';
+import type { NativeResponseIdentity, NativeResponseCommit } from '@librechat/data-schemas';
 import { randomUUID } from 'crypto';
 import type { StandardGraph } from '@librechat/agents';
 import type { Agents } from 'librechat-data-provider';
@@ -22,10 +14,21 @@ import type {
   InteractionDeliveryAck,
   DeliveryAcknowledgementResult,
   DeliveryAcknowledgementBindingResult,
-  CortexPresentationBinding,
+  InteractionSourceSegment,
   SourceOrderObservation,
   SourceOrderObservationResult,
+  CortexPresentationBinding,
 } from '~/stream/interfaces/IJobStore';
+import { mergeSourceSegmentsWithOverflow } from '~/stream/sourceSegments';
+import { retainLogicalTurnInput, mergeLogicalTurnInput } from './logicalTurnInput';
+import { streamLogRef } from '~/stream/logPrivacy';
+import {
+  nativeIdentityJson,
+  nativeIdentityValid,
+  nativeJobMatches,
+  retainNativeResponse,
+  NATIVE_RESPONSE_RECOVERY_WINDOW_MS,
+} from './nativeResponse';
 
 interface LogicalTurnState {
   scope: string;
@@ -35,20 +38,89 @@ interface LogicalTurnState {
   currentStreamId?: string;
   receipts: Map<string, { streamId: string; interactionContext: InteractionContext }>;
   revisionStreams: Map<number, string>;
+  admittedRevisions: Set<number>;
   deliveryAcknowledgements: Map<number, InteractionDeliveryAck>;
-  completedAt?: number;
-  pendingInputs?: InteractionContext[];
+  sourceSegments: InteractionSourceSegment[];
+  sourceSegmentsOverflowCount: number;
+  revisionSourceSegments: Map<number, InteractionSourceSegment[]>;
+  revisionSourceSegmentsOverflowCounts: Map<number, number>;
+  revisionSourceOrders: Map<number, SourceOrderObservation>;
   currentContext?: InteractionContext;
+  pendingInputs?: InteractionContext[];
+  completedAt?: number;
 }
 
 function logicalTurnScope(userId: string, interactionContext: InteractionContext): string {
-  if (interactionContext.source_order_scope) return interactionContext.source_order_scope;
+  if (interactionContext.source_order_scope) {
+    return [
+      'source-order',
+      interactionContext.source_order_scope,
+      interactionContext.actor_kind,
+      interactionContext.origin,
+    ].join('\u0000');
+  }
   return [
     userId,
     interactionContext.conversation_id,
     interactionContext.actor_kind,
     interactionContext.origin,
+    ...(interactionContext.turn_scope === 'source_event'
+      ? [interactionContext.source_event_id]
+      : []),
   ].join('\u0000');
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Owner-safe stream identity.
+ * Purpose: Stream IDs are routing references, not overwrite authority. Preserve the first owner.
+ * === VIVENTIUM END === */
+function streamIdConflictError(): Error & { code: string } {
+  return Object.assign(new Error('Generation stream already exists'), {
+    code: 'stream_id_conflict',
+  });
+}
+
+function streamStoreUnavailableError(): Error & { code: string } {
+  return Object.assign(new Error('Generation stream store is unavailable'), {
+    code: 'stream_store_unavailable',
+  });
+}
+
+function streamCapacityExhaustedError(): Error & { code: string } {
+  return Object.assign(new Error('Generation stream capacity is exhausted'), {
+    code: 'stream_capacity_exhausted',
+  });
+}
+
+function sameCortexPresentationBinding(
+  current: CortexPresentationBinding | undefined,
+  expected: CortexPresentationBinding | null,
+): boolean {
+  if (!current || !expected) return !current && !expected;
+  return (
+    current.ownerId === expected.ownerId &&
+    current.messageId === expected.messageId &&
+    current.parentMessageId === expected.parentMessageId &&
+    current.revision === expected.revision &&
+    current.generation === expected.generation &&
+    current.boundAt === expected.boundAt &&
+    current.claimToken === expected.claimToken &&
+    current.presentationLeaseToken === expected.presentationLeaseToken &&
+    current.deliveryIds.length === expected.deliveryIds.length &&
+    current.deliveryIds.every((deliveryId, index) => deliveryId === expected.deliveryIds[index]) &&
+    current.deliveryReceipts.length === expected.deliveryReceipts.length &&
+    current.deliveryReceipts.every(
+      (receipt, index) =>
+        receipt.deliveryId === expected.deliveryReceipts[index].deliveryId &&
+        receipt.graphResultHash === expected.deliveryReceipts[index].graphResultHash,
+    )
+  );
+}
+
+function deliveryAckInput(acknowledgement: InteractionDeliveryAck): string {
+  const input = { ...acknowledgement };
+  delete input.presentation_committed_at;
+  return JSON.stringify(input);
 }
 
 /**
@@ -71,7 +143,6 @@ interface ContentState {
  * - No chunk persistence needed - same instance handles generation and reconnects
  */
 export class InMemoryJobStore implements IJobStore {
-  /* VIVENTIUM START: process-local mirrors of the logical/source publication owner. */
   readonly sourceOrderDurability = 'process' as const;
 
   private nativePublications = new Map<
@@ -84,17 +155,29 @@ export class InMemoryJobStore implements IJobStore {
     }
   >();
 
-  private sourceOrders = new Map<string, SourceOrderObservationResult & { expiresAt: number }>();
-  /* VIVENTIUM END */
   private jobs = new Map<string, SerializableJobData>();
   private contentState = new Map<string, ContentState>();
   private cleanupInterval: NodeJS.Timeout | null = null;
+
+  /* === VIVENTIUM START ===
+   * Feature: Owner-safe stream identity.
+   * Purpose: Serialize capacity eviction and create-once ownership in the in-process store.
+   * === VIVENTIUM END === */
+  private createJobTail: Promise<void> = Promise.resolve();
+  private destroyed = false;
+  private lifecycleEpoch = 0;
 
   /** Maps userId -> Set of streamIds (conversationIds) for active jobs */
   private userJobMap = new Map<string, Set<string>>();
 
   /** One synchronous claim state per user/conversation scope. */
   private logicalTurns = new Map<string, LogicalTurnState>();
+  /** Core-held source watermarks survive bot process restarts and are shared by all callers. */
+  private sourceOrderWatermarks = new Map<
+    string,
+    { latestSourceSequence: number; observedAt: number; expiresAt: number }
+  >();
+
   /** Reverse owner index; callers never supply user or conversation authority. */
   private logicalTurnIndex = new Map<string, LogicalTurnState>();
   private streamScopes = new Map<string, string>();
@@ -102,15 +185,21 @@ export class InMemoryJobStore implements IJobStore {
   /** Time to keep completed jobs before cleanup (0 = immediate) */
   private ttlAfterComplete = 0;
 
+  /** Bounded retention for inactive source-order scopes. Active turns are never expired. */
+  private sourceOrderTtl = 300_000;
+
   /** Maximum number of concurrent jobs */
   private maxJobs = 1000;
 
-  constructor(options?: { ttlAfterComplete?: number; maxJobs?: number }) {
+  constructor(options?: { ttlAfterComplete?: number; maxJobs?: number; sourceOrderTtl?: number }) {
     if (options?.ttlAfterComplete) {
       this.ttlAfterComplete = options.ttlAfterComplete;
     }
     if (options?.maxJobs) {
       this.maxJobs = options.maxJobs;
+    }
+    if (options?.sourceOrderTtl != null) {
+      this.sourceOrderTtl = Math.max(1, options.sourceOrderTtl);
     }
   }
 
@@ -118,6 +207,8 @@ export class InMemoryJobStore implements IJobStore {
     if (this.cleanupInterval) {
       return;
     }
+
+    this.destroyed = false;
 
     this.cleanupInterval = setInterval(() => {
       this.cleanup();
@@ -128,81 +219,6 @@ export class InMemoryJobStore implements IJobStore {
     }
 
     logger.debug('[InMemoryJobStore] Initialized with cleanup interval');
-  }
-
-  async createJob(
-    streamId: string,
-    userId: string,
-    conversationId?: string,
-    initialData?: Partial<SerializableJobData>,
-  ): Promise<SerializableJobData> {
-    const previous = this.jobs.get(streamId);
-    if (previous) {
-      const result = await this.cancelNativeResponse(previous);
-      if (result.status === 'committed' && !previous.nativeResponseSettled) {
-        throw new Error('Saved native result is pending');
-      }
-      if (this.jobs.get(streamId) !== previous) {
-        throw new Error('Stream incarnation changed');
-      }
-    }
-    if (this.jobs.size >= this.maxJobs) {
-      await this.evictOldest();
-      if (this.jobs.size >= this.maxJobs && !previous) {
-        throw new Error('Generation job capacity reached');
-      }
-    }
-
-    const job: SerializableJobData = {
-      ...initialData,
-      streamId,
-      userId,
-      status: 'running',
-      createdAt: Math.max(Date.now(), (previous?.createdAt ?? 0) + 1),
-      nativeResponse: undefined,
-      nativeResponseCancelled: undefined,
-      nativeResponseFinished: undefined,
-      nativeResponseSettled: undefined,
-      conversationId,
-      syncSent: false,
-    };
-
-    // Existing replay closures must observe retirement before the replacement is published.
-    if (previous) {
-      previous.nativeResponseCancelled = true;
-      delete previous.finalEvent;
-    }
-    this.jobs.set(streamId, job);
-
-    // Track job by userId for efficient user-scoped queries
-    let userJobs = this.userJobMap.get(userId);
-    if (!userJobs) {
-      userJobs = new Set();
-      this.userJobMap.set(userId, userJobs);
-    }
-    userJobs.add(streamId);
-
-    logger.debug(`[InMemoryJobStore] Created job: ${streamId}`);
-
-    return job;
-  }
-
-  /* VIVENTIUM START: one publication winner, before any transport replay. */
-  async observeSourceOrder(
-    observation: SourceOrderObservation,
-  ): Promise<SourceOrderObservationResult> {
-    const previous = this.sourceOrders.get(observation.source_order_scope);
-    const latest = Math.max(previous?.latest_source_sequence ?? 0, observation.source_sequence);
-    const result = {
-      latest_source_sequence: latest,
-      observed_at: latest === previous?.latest_source_sequence ? previous.observed_at : Date.now(),
-      stale: observation.source_sequence < latest,
-    };
-    this.sourceOrders.set(observation.source_order_scope, {
-      ...result,
-      expiresAt: Math.max(previous?.expiresAt ?? 0, Date.now() + 300_000),
-    });
-    return result;
   }
 
   private nativeKey(identity: { logicalTurnId: string; revision: number }): string {
@@ -217,7 +233,7 @@ export class InMemoryJobStore implements IJobStore {
       state.currentStreamId === identity.streamId &&
       state.revision === identity.revision &&
       (!identity.sourceOrderScope ||
-        this.sourceOrders.get(identity.sourceOrderScope)?.latest_source_sequence ===
+        this.sourceOrderWatermarks.get(identity.sourceOrderScope)?.latestSourceSequence ===
           identity.sourceSequence),
     );
   }
@@ -241,9 +257,7 @@ export class InMemoryJobStore implements IJobStore {
     ) {
       return false;
     }
-    if (!prior && job.status !== 'running') {
-      return false;
-    }
+    if (!prior && job.status !== 'running') return false;
     if (!prior) {
       this.nativePublications.set(this.nativeKey(identity), {
         identity: encoded,
@@ -252,10 +266,9 @@ export class InMemoryJobStore implements IJobStore {
       });
     }
     job.nativeResponse = JSON.parse(encoded) as NativeResponseIdentity;
-    const source = identity.sourceOrderScope && this.sourceOrders.get(identity.sourceOrderScope);
-    if (source) {
-      source.expiresAt = Math.max(source.expiresAt, identity.recoverUntil);
-    }
+    const watermark =
+      identity.sourceOrderScope && this.sourceOrderWatermarks.get(identity.sourceOrderScope);
+    if (watermark) watermark.expiresAt = Math.max(watermark.expiresAt, identity.recoverUntil);
     return true;
   }
 
@@ -293,9 +306,7 @@ export class InMemoryJobStore implements IJobStore {
   }
 
   async getNativeResponseCommit(identity: NativeResponseIdentity): Promise<NativeResponseCommit> {
-    if (!nativeIdentityValid(identity)) {
-      return { status: 'unavailable' };
-    }
+    if (!nativeIdentityValid(identity)) return { status: 'unavailable' };
     const record = this.nativePublications.get(this.nativeKey(identity));
     if (!record || record.identity !== nativeIdentityJson(identity)) {
       return { status: 'unavailable' };
@@ -306,9 +317,7 @@ export class InMemoryJobStore implements IJobStore {
   }
 
   async revokeNativeResponse(identity: NativeResponseIdentity): Promise<NativeResponseCommit> {
-    if (!nativeIdentityValid(identity)) {
-      return { status: 'unavailable' };
-    }
+    if (!nativeIdentityValid(identity)) return { status: 'unavailable' };
     const record = this.nativePublications.get(this.nativeKey(identity));
     if (!record || record.identity !== nativeIdentityJson(identity)) {
       return { status: 'unavailable' };
@@ -318,9 +327,7 @@ export class InMemoryJobStore implements IJobStore {
     }
     record.state = 'revoked';
     const job = this.jobs.get(identity.streamId) ?? null;
-    if (nativeJobMatches(job, identity)) {
-      job.nativeResponseCancelled = true;
-    }
+    if (nativeJobMatches(job, identity)) job.nativeResponseCancelled = true;
     return { status: 'revoked' };
   }
 
@@ -334,9 +341,7 @@ export class InMemoryJobStore implements IJobStore {
     ) {
       return { status: 'unavailable' };
     }
-    if (job.nativeResponse) {
-      return this.revokeNativeResponse(job.nativeResponse);
-    }
+    if (job.nativeResponse) return this.revokeNativeResponse(job.nativeResponse);
     const context = job.interactionContext;
     if (context?.logical_turn_id) {
       this.nativePublications.set(
@@ -361,8 +366,9 @@ export class InMemoryJobStore implements IJobStore {
         job.nativeResponseFinished ||
         (job.nativeResponse &&
           nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity))
-      )
+      ) {
         return false;
+      }
       delete job.nativeResponse;
       delete job.nativeResponseCancelled;
       return true;
@@ -399,9 +405,7 @@ export class InMemoryJobStore implements IJobStore {
     ) {
       return false;
     }
-    if (job.nativeResponseFinished) {
-      return job.finalEvent === finalEvent;
-    }
+    if (job.nativeResponseFinished) return job.finalEvent === finalEvent;
     job.finalEvent = finalEvent;
     job.nativeResponseFinished = true;
     job.generationCompleted = true;
@@ -410,18 +414,176 @@ export class InMemoryJobStore implements IJobStore {
     delete job.error;
     return true;
   }
-  /* VIVENTIUM END */
 
-  async retainLogicalTurnInput(userId: string, context: InteractionContext): Promise<InteractionContext> {
+  async createJob(
+    streamId: string,
+    userId: string,
+    conversationId?: string,
+    initialData?: Partial<SerializableJobData>,
+  ): Promise<SerializableJobData> {
+    /* === VIVENTIUM START ===
+     * Feature: Owner-safe stream identity.
+     * Purpose: An await during capacity eviction must not let a second creator pass the same key.
+     * === VIVENTIUM END === */
+    const lifecycleEpoch = this.lifecycleEpoch;
+    const unavailableAtEnqueue = this.destroyed;
+    let releaseCreate!: () => void;
+    const precedingCreate = this.createJobTail;
+    this.createJobTail = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    await precedingCreate;
+
+    try {
+      if (unavailableAtEnqueue || this.destroyed || lifecycleEpoch !== this.lifecycleEpoch) {
+        throw streamStoreUnavailableError();
+      }
+      const previous = this.jobs.get(streamId);
+      const reservedScope = this.streamScopes.get(streamId);
+      const reservedState = reservedScope ? this.logicalTurns.get(reservedScope) : undefined;
+      const reservedContext = initialData?.interactionContext;
+      const replacesReservedRevision = Boolean(
+        previous &&
+        reservedScope &&
+        reservedContext &&
+        logicalTurnScope(userId, reservedContext) === reservedScope &&
+        reservedState?.currentStreamId === streamId &&
+        reservedState.revision === reservedContext.revision &&
+        (previous.interactionContext?.revision ?? 0) < reservedContext.revision,
+      );
+      const replacesSameOwner =
+        previous != null &&
+        previous.userId === userId &&
+        previous.conversationId === conversationId &&
+        (initialData?.interactionContext == null || replacesReservedRevision);
+      if (previous && !replacesSameOwner) {
+        throw streamIdConflictError();
+      }
+      if (previous) {
+        const cancellation = await this.cancelNativeResponse(previous);
+        if (cancellation.status === 'committed' && !previous.nativeResponseSettled) {
+          throw new Error('Saved native result is pending');
+        }
+        if (this.jobs.get(streamId) !== previous) {
+          throw new Error('Stream incarnation changed');
+        }
+      }
+      if (reservedScope && !replacesSameOwner) {
+        const interactionContext = initialData?.interactionContext;
+        const state = this.logicalTurns.get(reservedScope);
+        const receipt = interactionContext
+          ? state?.receipts.get(interactionContext.source_event_id)
+          : undefined;
+        const exactReservation =
+          interactionContext != null &&
+          logicalTurnScope(userId, interactionContext) === reservedScope &&
+          state != null &&
+          state.logicalTurnId === interactionContext.logical_turn_id &&
+          receipt?.streamId === streamId &&
+          state.revisionStreams.get(interactionContext.revision) === streamId &&
+          receipt.interactionContext.logical_turn_id === interactionContext.logical_turn_id &&
+          receipt.interactionContext.revision === interactionContext.revision &&
+          !Array.from(state.admittedRevisions).some(
+            (revision) => revision > interactionContext.revision,
+          );
+        if (!exactReservation) {
+          throw streamIdConflictError();
+        }
+      } else if (!reservedScope && initialData?.interactionContext) {
+        // Context-bearing jobs are admitted only through claimLogicalTurn. A low-level caller may
+        // still create a legacy context-free job when no logical reservation exists.
+        throw streamIdConflictError();
+      }
+      if (this.jobs.size >= this.maxJobs && !previous) {
+        // Never evict a live generation to admit a newer caller. Completed/error jobs are
+        // retired by the normal lifecycle cleanup, which also owns their turn indexes.
+        throw streamCapacityExhaustedError();
+      }
+      if (this.destroyed || lifecycleEpoch !== this.lifecycleEpoch) {
+        throw streamStoreUnavailableError();
+      }
+
+      const job: SerializableJobData = {
+        ...initialData,
+        streamId,
+        userId,
+        status: 'running',
+        createdAt: Math.max(Date.now(), (previous?.createdAt ?? 0) + 1),
+        nativeResponse: undefined,
+        nativeResponseCancelled: undefined,
+        nativeResponseFinished: undefined,
+        nativeResponseSettled: undefined,
+        conversationId,
+        syncSent: false,
+      };
+
+      if (previous) {
+        previous.nativeResponseCancelled = true;
+        delete previous.finalEvent;
+      }
+      this.jobs.set(streamId, job);
+      if (initialData?.interactionContext) {
+        const state = this.logicalTurns.get(reservedScope!);
+        if (state) {
+          state.admittedRevisions.add(initialData.interactionContext.revision);
+        }
+      }
+
+      // Track job by userId for efficient user-scoped queries
+      let userJobs = this.userJobMap.get(userId);
+      if (!userJobs) {
+        userJobs = new Set();
+        this.userJobMap.set(userId, userJobs);
+      }
+      userJobs.add(streamId);
+
+      logger.debug(`[InMemoryJobStore] Created job ${streamLogRef(streamId)}`);
+
+      return job;
+    } finally {
+      releaseCreate();
+    }
+  }
+
+  async retainLogicalTurnInput(
+    userId: string,
+    context: InteractionContext,
+  ): Promise<InteractionContext> {
     const scope = logicalTurnScope(userId, context);
     let state = this.logicalTurns.get(scope);
-    mergeLogicalTurnInput([...(state?.active && state.currentContext ? [state.currentContext] : []), ...(state?.pendingInputs ?? [])], context);
+    mergeLogicalTurnInput(
+      [
+        ...(state?.active && state.currentContext ? [state.currentContext] : []),
+        ...(state?.pendingInputs ?? []),
+      ],
+      context,
+    );
     if (!state) {
-      state = { scope, logicalTurnId: randomUUID(), revision: 0, active: false,
-        receipts: new Map(), revisionStreams: new Map(), deliveryAcknowledgements: new Map() };
+      state = {
+        scope,
+        logicalTurnId: randomUUID(),
+        revision: 0,
+        active: false,
+        receipts: new Map(),
+        revisionStreams: new Map(),
+        admittedRevisions: new Set(),
+        deliveryAcknowledgements: new Map(),
+        sourceSegments: [],
+        sourceSegmentsOverflowCount: 0,
+        revisionSourceSegments: new Map(),
+        revisionSourceSegmentsOverflowCounts: new Map(),
+        revisionSourceOrders: new Map(),
+      };
       this.logicalTurns.set(scope, state);
     }
-    if (state.receipts.has(context.source_event_id) || state.currentContext?.source_segments?.some((source) => source.source_event_id === context.source_event_id)) return context;
+    if (
+      state.receipts.has(context.source_event_id) ||
+      state.currentContext?.source_segments?.some(
+        (source) => source.source_event_id === context.source_event_id,
+      )
+    ) {
+      return context;
+    }
     state.pendingInputs = retainLogicalTurnInput(state.pendingInputs ?? [], context);
     state.completedAt = Date.now();
     return context;
@@ -433,7 +595,19 @@ export class InMemoryJobStore implements IJobStore {
     interactionContext: InteractionContext,
   ): Promise<LogicalTurnClaim> {
     const scope = logicalTurnScope(userId, interactionContext);
-    const existing = this.logicalTurns.get(scope);
+    let existing = this.logicalTurns.get(scope);
+    const reservedScope = this.streamScopes.get(streamId);
+    if (
+      !this.jobs.has(streamId) &&
+      reservedScope === scope &&
+      existing &&
+      !existing.active &&
+      existing.currentStreamId === streamId &&
+      existing.completedAt != null
+    ) {
+      this.retireLogicalTurnState(existing);
+      existing = undefined;
+    }
     const receipt = existing?.receipts.get(interactionContext.source_event_id);
     if (receipt) {
       return {
@@ -447,43 +621,120 @@ export class InMemoryJobStore implements IJobStore {
     if (interactionContext.ready_input_continuation && existing?.active) {
       return { status: 'busy', streamId, interactionContext, supersededStreamIds: [] };
     }
+    const observedSourceOrder = interactionContext.source_order_scope
+      ? this.sourceOrderWatermarks.get(interactionContext.source_order_scope)
+      : undefined;
+    const activeSourceOrder = existing?.active
+      ? existing.revisionSourceOrders.get(existing.revision)
+      : undefined;
+    const latestSourceSequence = Math.max(
+      observedSourceOrder?.latestSourceSequence ?? -1,
+      activeSourceOrder &&
+        activeSourceOrder.source_order_scope === interactionContext.source_order_scope
+        ? activeSourceOrder.source_sequence
+        : -1,
+    );
+    if (
+      !existing &&
+      !interactionContext.ready_input_continuation &&
+      interactionContext.source_order_scope &&
+      Number.isSafeInteger(interactionContext.source_sequence) &&
+      interactionContext.source_sequence! < latestSourceSequence
+    ) {
+      return {
+        status: 'stale_source_order',
+        streamId,
+        interactionContext,
+        supersededStreamIds: [],
+      };
+    }
     const presentationSequence = interactionPresentationSequence(interactionContext);
-    const latestSequence = interactionContext.source_order_scope
-      ? Math.max(this.sourceOrders.get(interactionContext.source_order_scope)?.latest_source_sequence ?? 0,
+    const latestPresentationSequence = interactionContext.source_order_scope
+      ? Math.max(
+          this.sourceOrderWatermarks.get(interactionContext.source_order_scope)
+            ?.latestSourceSequence ?? 0,
           interactionPresentationSequence(existing?.currentContext) ?? 0,
-          ...(existing?.pendingInputs ?? []).flatMap((input) => (input.source_segments ?? []).map((segment) => segment.source_sequence ?? 0))) : undefined;
-    if (presentationSequence != null && latestSequence != null && presentationSequence < latestSequence) {
+          ...(existing?.pendingInputs ?? []).flatMap((input) =>
+            (input.source_segments ?? []).map((segment) => segment.source_sequence ?? 0),
+          ),
+        )
+      : undefined;
+    if (
+      presentationSequence != null &&
+      latestPresentationSequence != null &&
+      presentationSequence < latestPresentationSequence
+    ) {
       return { status: 'superseded', streamId, interactionContext, supersededStreamIds: [] };
     }
     const pendingInputs = existing?.pendingInputs ?? [];
-    const previousContext = existing?.active ? existing.currentContext : undefined;
-    const mergedInput = mergeLogicalTurnInput([...(previousContext ? [previousContext] : []), ...pendingInputs], interactionContext);
-    if (mergedInput.source_segments?.some((segment) => segment.source_message_id && segment.source_persisted !== true)) {
+    const mergedInput = mergeLogicalTurnInput(pendingInputs, interactionContext);
+    if (
+      mergedInput.source_segments?.some(
+        (segment) => segment.source_message_id && segment.source_persisted !== true,
+      )
+    ) {
       return { status: 'initializing', streamId, interactionContext, supersededStreamIds: [] };
     }
+
+    /* === VIVENTIUM START ===
+     * Feature: Owner-safe logical-turn reservation.
+     * Purpose: Claiming a turn must not overwrite another scope's stream reverse index before
+     * createJob can enforce its create-once owner fence.
+     * === VIVENTIUM END === */
+    const reusesCurrentStream =
+      existing?.active === true &&
+      existing.currentStreamId === streamId &&
+      this.streamScopes.get(streamId) === scope &&
+      this.jobs.get(streamId)?.userId === userId;
+    if ((this.jobs.has(streamId) || this.streamScopes.has(streamId)) && !reusesCurrentStream) {
+      throw streamIdConflictError();
+    }
+
     const activeStreamId = existing?.active ? existing.currentStreamId : undefined;
     const continuesTurn = activeStreamId != null;
-    if (!continuesTurn && existing) {
+    const continuesPending = !continuesTurn && Boolean(existing?.pendingInputs?.length);
+    if (!continuesTurn && existing && !continuesPending) {
       this.retireLogicalTurnState(existing);
     }
-    const state: LogicalTurnState = continuesTurn
-      ? existing!
-      : {
-          scope,
-          logicalTurnId: randomUUID(),
-          revision: 0,
-          active: false,
-          receipts: new Map(),
-          revisionStreams: new Map(),
-          deliveryAcknowledgements: new Map(),
-        };
+    const state: LogicalTurnState =
+      continuesTurn || continuesPending
+        ? existing!
+        : {
+            scope,
+            logicalTurnId: randomUUID(),
+            revision: 0,
+            active: false,
+            receipts: new Map(),
+            revisionStreams: new Map(),
+            admittedRevisions: new Set(),
+            deliveryAcknowledgements: new Map(),
+            sourceSegments: [],
+            sourceSegmentsOverflowCount: 0,
+            revisionSourceSegments: new Map(),
+            revisionSourceSegmentsOverflowCounts: new Map(),
+            revisionSourceOrders: new Map(),
+          };
     state.completedAt = undefined;
     state.revision += 1;
+    const mergedSourceSegments = mergeSourceSegmentsWithOverflow(
+      continuesTurn ? state.sourceSegments : [],
+      mergedInput.source_segments ? [...mergedInput.source_segments] : undefined,
+      continuesTurn ? state.sourceSegmentsOverflowCount : 0,
+      mergedInput.source_segments_overflow_count,
+    );
+    state.sourceSegments = mergedSourceSegments.segments;
+    state.sourceSegmentsOverflowCount = mergedSourceSegments.overflowCount;
 
     const claimedContext: InteractionContext = Object.freeze({
       ...mergedInput,
       logical_turn_id: state.logicalTurnId,
       revision: state.revision,
+      ...(state.sourceSegments.length
+        ? { source_segments: state.sourceSegments.map((segment) => ({ ...segment })) }
+        : {}),
+      ...(state.sourceSegmentsOverflowCount > 0
+        ? { source_segments_overflow_count: state.sourceSegmentsOverflowCount }
+        : {}),
     });
     const supersededStreamIds = continuesTurn && activeStreamId ? [activeStreamId] : [];
     state.currentContext = claimedContext;
@@ -491,6 +742,24 @@ export class InMemoryJobStore implements IJobStore {
     state.currentStreamId = streamId;
     state.active = true;
     state.revisionStreams.set(state.revision, streamId);
+    state.revisionSourceSegments.set(
+      state.revision,
+      state.sourceSegments.map((segment) => ({ ...segment })),
+    );
+    state.revisionSourceSegmentsOverflowCounts.set(
+      state.revision,
+      state.sourceSegmentsOverflowCount,
+    );
+    if (
+      claimedContext.source_order_scope &&
+      Number.isSafeInteger(claimedContext.source_sequence) &&
+      claimedContext.source_sequence! >= 0
+    ) {
+      state.revisionSourceOrders.set(state.revision, {
+        source_order_scope: claimedContext.source_order_scope,
+        source_sequence: claimedContext.source_sequence!,
+      });
+    }
     state.receipts.set(interactionContext.source_event_id, {
       streamId,
       interactionContext: claimedContext,
@@ -507,38 +776,93 @@ export class InMemoryJobStore implements IJobStore {
     };
   }
 
+  async observeSourceOrder(
+    observation: SourceOrderObservation,
+  ): Promise<SourceOrderObservationResult> {
+    const observedAt = Date.now();
+    let existing = this.sourceOrderWatermarks.get(observation.source_order_scope);
+    if (
+      existing &&
+      existing.expiresAt <= observedAt &&
+      !this.hasActiveSourceOrderScope(observation.source_order_scope)
+    ) {
+      this.sourceOrderWatermarks.delete(observation.source_order_scope);
+      existing = undefined;
+    }
+    const stale = existing != null && observation.source_sequence < existing.latestSourceSequence;
+    const latestSourceSequence = Math.max(
+      observation.source_sequence,
+      existing?.latestSourceSequence ?? observation.source_sequence,
+    );
+    const watermark = {
+      latestSourceSequence,
+      observedAt:
+        existing && latestSourceSequence === existing.latestSourceSequence
+          ? existing.observedAt
+          : observedAt,
+      expiresAt: observedAt + this.sourceOrderTtl,
+    };
+    this.sourceOrderWatermarks.set(observation.source_order_scope, watermark);
+    return {
+      latest_source_sequence: watermark.latestSourceSequence,
+      observed_at: watermark.observedAt,
+      stale,
+    };
+  }
+
   async rollbackLogicalTurnClaim(
     streamId: string,
     interactionContext: InteractionContext,
   ): Promise<boolean> {
     const scope = this.streamScopes.get(streamId);
     const state = scope ? this.logicalTurns.get(scope) : undefined;
+    const receipt = state?.receipts.get(interactionContext.source_event_id);
     if (
       !scope ||
       !state ||
       state.logicalTurnId !== interactionContext.logical_turn_id ||
-      state.revision !== interactionContext.revision ||
-      state.currentStreamId !== streamId
+      receipt?.streamId !== streamId ||
+      receipt.interactionContext.revision !== interactionContext.revision ||
+      state.revisionStreams.get(interactionContext.revision) !== streamId ||
+      state.admittedRevisions.has(interactionContext.revision) ||
+      this.jobs.has(streamId)
     ) {
       return false;
     }
-    const receipt = state.receipts.get(interactionContext.source_event_id);
     if (receipt?.streamId === streamId) {
       state.receipts.delete(interactionContext.source_event_id);
     }
-    state.pendingInputs = retainLogicalTurnInput(state.pendingInputs ?? [], interactionContext);
-    state.revisionStreams.delete(state.revision);
+    state.revisionStreams.delete(interactionContext.revision);
+    state.revisionSourceSegments.delete(interactionContext.revision);
+    state.revisionSourceSegmentsOverflowCounts.delete(interactionContext.revision);
+    state.revisionSourceOrders.delete(interactionContext.revision);
     this.streamScopes.delete(streamId);
-    state.revision -= 1;
+    if (state.currentStreamId === streamId) {
+      state.revision = Math.max(0, ...state.revisionStreams.keys());
+    }
     if (state.revision > 0) {
       state.currentStreamId = state.revisionStreams.get(state.revision);
-      state.currentContext = [...state.receipts.values()].find((receipt) => receipt.streamId === state.currentStreamId)?.interactionContext;
+      state.sourceSegments = (state.revisionSourceSegments.get(state.revision) || []).map(
+        (segment) => ({ ...segment }),
+      );
+      state.sourceSegmentsOverflowCount =
+        state.revisionSourceSegmentsOverflowCounts.get(state.revision) || 0;
       state.active = Boolean(state.currentStreamId);
     } else {
+      state.pendingInputs = retainLogicalTurnInput(state.pendingInputs ?? [], interactionContext);
       state.currentStreamId = undefined;
+      state.sourceSegments = [];
+      state.sourceSegmentsOverflowCount = 0;
       state.active = false;
       state.completedAt = Date.now();
-      this.logicalTurnIndex.delete(state.logicalTurnId);
+      /* === VIVENTIUM START ===
+       * Feature: Bounded failed-admission state.
+       * Purpose: A rolled-back first revision owns no durable job and must not accumulate until
+       * the periodic cleanup tick under repeated capacity pressure.
+       * === VIVENTIUM END === */
+      if (!state.pendingInputs?.length) {
+        this.retireLogicalTurnState(state);
+      }
     }
     return true;
   }
@@ -550,10 +874,16 @@ export class InMemoryJobStore implements IJobStore {
     const logicalTurnId = interactionContext.logical_turn_id;
     const state = logicalTurnId ? this.logicalTurnIndex.get(logicalTurnId) : undefined;
     const receipt = state?.receipts.get(interactionContext.source_event_id);
+    /* === VIVENTIUM START ===
+     * Feature: Durable source-event idempotency.
+     * Purpose: Missing job data is not stale while the current claim is still creating that job.
+     * === VIVENTIUM END === */
+    const isClaimStillInFlight = state?.active && state.currentStreamId === expectedStreamId;
     if (
       !state ||
       this.logicalTurns.get(state.scope) !== state ||
-      receipt?.streamId !== expectedStreamId
+      receipt?.streamId !== expectedStreamId ||
+      isClaimStillInFlight
     ) {
       return false;
     }
@@ -571,8 +901,9 @@ export class InMemoryJobStore implements IJobStore {
         state.revision !== expected.revision ||
         state.currentStreamId !== streamId ||
         state.revisionStreams.get(expected.revision) !== streamId
-      )
+      ) {
         return;
+      }
       state.active = false;
       state.completedAt = Date.now();
       return;
@@ -589,9 +920,16 @@ export class InMemoryJobStore implements IJobStore {
   }
 
   async isCurrentLogicalTurn(streamId: string): Promise<boolean> {
+    const job = this.jobs.get(streamId);
+    if (!job || !['running', 'complete'].includes(job.status)) {
+      return false;
+    }
+    if (!job.interactionContext) {
+      return true;
+    }
     const scope = this.streamScopes.get(streamId);
     if (!scope) {
-      return true;
+      return false;
     }
     return this.logicalTurns.get(scope)?.currentStreamId === streamId;
   }
@@ -602,13 +940,6 @@ export class InMemoryJobStore implements IJobStore {
       return null;
     }
     return state.revisionStreams.get(revision) ?? null;
-  }
-
-  private stalePresentation(state: LogicalTurnState, revision: number): boolean {
-    const context = [...state.receipts.values()].find((receipt) => receipt.interactionContext.revision === revision)?.interactionContext;
-    const sequence = interactionPresentationSequence(context);
-    const latest = context?.source_order_scope ? this.sourceOrders.get(context.source_order_scope)?.latest_source_sequence : undefined;
-    return sequence != null && latest != null && sequence < latest;
   }
 
   async acknowledgeDelivery(
@@ -622,14 +953,10 @@ export class InMemoryJobStore implements IJobStore {
     if (!ownerStreamId || acknowledgement.revision > state.revision) {
       return { status: 'stale_revision' };
     }
-    if (acknowledgement.revision < state.revision && acknowledgement.state === 'committed') {
-      return { status: 'stale_revision' };
-    }
     const existingAcknowledgement = state.deliveryAcknowledgements.get(acknowledgement.revision);
     if (existingAcknowledgement) {
       const idempotent =
-        existingAcknowledgement.state === acknowledgement.state &&
-        existingAcknowledgement.presentation_ref === acknowledgement.presentation_ref;
+        deliveryAckInput(existingAcknowledgement) === deliveryAckInput(acknowledgement);
       return idempotent
         ? {
             status: 'recorded',
@@ -639,10 +966,27 @@ export class InMemoryJobStore implements IJobStore {
           }
         : { status: 'conflict' };
     }
-    if (['committed', 'committed_effect'].includes(acknowledgement.state) && this.stalePresentation(state, acknowledgement.revision)) {
+    if (acknowledgement.revision < state.revision && acknowledgement.state === 'committed') {
+      return { status: 'stale_revision' };
+    }
+    const sourceOrder = state.revisionSourceOrders.get(acknowledgement.revision);
+    const latestSourceOrder = sourceOrder
+      ? this.sourceOrderWatermarks.get(sourceOrder.source_order_scope)
+      : undefined;
+    if (
+      ['committed', 'committed_effect'].includes(acknowledgement.state) &&
+      sourceOrder &&
+      latestSourceOrder &&
+      latestSourceOrder.latestSourceSequence > sourceOrder.source_sequence
+    ) {
       return { status: 'stale_source_order' };
     }
-    const recordedAcknowledgement = Object.freeze({ ...acknowledgement });
+    const recordedAcknowledgement = { ...acknowledgement };
+    delete recordedAcknowledgement.presentation_committed_at;
+    if (['committed', 'committed_effect'].includes(recordedAcknowledgement.state)) {
+      recordedAcknowledgement.presentation_committed_at = Date.now();
+    }
+    Object.freeze(recordedAcknowledgement);
     state.deliveryAcknowledgements.set(acknowledgement.revision, recordedAcknowledgement);
     if (
       acknowledgement.revision === state.revision &&
@@ -650,6 +994,12 @@ export class InMemoryJobStore implements IJobStore {
     ) {
       state.active = false;
       state.completedAt = Date.now();
+      if (sourceOrder) {
+        const watermark = this.sourceOrderWatermarks.get(sourceOrder.source_order_scope);
+        if (watermark) {
+          watermark.expiresAt = Date.now() + this.sourceOrderTtl;
+        }
+      }
     }
     return {
       status: 'recorded',
@@ -672,7 +1022,8 @@ export class InMemoryJobStore implements IJobStore {
     if (
       !job ||
       (expectedNativeIdentity &&
-        (!nativeJobMatches(job, expectedNativeIdentity) || !job.nativeResponse ||
+        (!nativeJobMatches(job, expectedNativeIdentity) ||
+          !job.nativeResponse ||
           nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(expectedNativeIdentity)))
     ) {
       return;
@@ -705,15 +1056,13 @@ export class InMemoryJobStore implements IJobStore {
     Object.assign(job, safe);
   }
 
-  /** Atomically bind one exact Cortex presentation generation to its in-memory job. */
+  /* === VIVENTIUM START === Exact owner/generation/hash Cortex binding replay. === */
   async bindCortexPresentation(
     streamId: string,
     binding: CortexPresentationBinding,
   ): Promise<boolean> {
     const job = this.jobs.get(streamId);
-    if (!job) {
-      return false;
-    }
+    if (!job) return false;
     const current = job.cortexPresentation;
     if (current) {
       if (binding.revision < current.revision || binding.generation < current.generation) {
@@ -743,125 +1092,62 @@ export class InMemoryJobStore implements IJobStore {
     return true;
   }
 
-  /** Compare-and-bind an acknowledgement to the exact current Cortex presentation. */
   async bindDeliveryAcknowledgement(
     streamId: string,
     acknowledgement: InteractionDeliveryAck,
     expectedCortexPresentation: CortexPresentationBinding | null,
   ): Promise<DeliveryAcknowledgementBindingResult> {
-    const state = this.logicalTurnIndex.get(acknowledgement.logical_turn_id);
-    if (!state || this.logicalTurns.get(state.scope) !== state) {
-      return { status: 'not_found' };
-    }
-    const ownerStreamId = state.revisionStreams.get(acknowledgement.revision);
-    if (!ownerStreamId || acknowledgement.revision > state.revision) {
-      return { status: 'stale_revision' };
-    }
-    if (ownerStreamId !== streamId) {
-      return { status: 'conflict' };
-    }
-    if (acknowledgement.revision < state.revision && acknowledgement.state === 'committed') {
-      return { status: 'stale_revision' };
-    }
     const job = this.jobs.get(streamId);
-    if (!job) {
-      return { status: 'not_found' };
+    if (!job) return { status: 'not_found' };
+    if (!expectedCortexPresentation) {
+      job.deliveryAcknowledgement = acknowledgement;
+      return { status: 'recorded', acknowledgement };
     }
-
-    const samePresentation = (
-      left: CortexPresentationBinding | undefined,
-      right: CortexPresentationBinding | undefined,
-    ) =>
-      Boolean(
-        left &&
-        right &&
-        left.ownerId === right.ownerId &&
-        left.messageId === right.messageId &&
-        left.parentMessageId === right.parentMessageId &&
-        left.revision === right.revision &&
-        left.generation === right.generation &&
-        left.boundAt === right.boundAt &&
-        left.claimToken === right.claimToken &&
-        left.presentationLeaseToken === right.presentationLeaseToken &&
-        left.deliveryIds.length === right.deliveryIds.length &&
-        left.deliveryIds.every((deliveryId, index) => deliveryId === right.deliveryIds[index]) &&
-        left.deliveryReceipts.length === right.deliveryReceipts.length &&
-        left.deliveryReceipts.every(
-          (receipt, index) =>
-            receipt.deliveryId === right.deliveryReceipts[index].deliveryId &&
-            receipt.graphResultHash === right.deliveryReceipts[index].graphResultHash,
-        ),
-      );
-    const current = job.cortexPresentation;
-    if (expectedCortexPresentation && !samePresentation(current, expectedCortexPresentation)) {
+    if (!sameCortexPresentationBinding(job.cortexPresentation, expectedCortexPresentation)) {
       return { status: 'retryable_conflict' };
     }
-
-    const acknowledgementInput = { ...acknowledgement };
-    delete acknowledgementInput.presentation_committed_at;
-    const existingLogicalAcknowledgement = state.deliveryAcknowledgements.get(
-      acknowledgement.revision,
-    );
-    if (!existingLogicalAcknowledgement && ['committed', 'committed_effect'].includes(acknowledgement.state) &&
-        this.stalePresentation(state, acknowledgement.revision)) return { status: 'stale_source_order' };
-    let recordedAcknowledgement = existingLogicalAcknowledgement;
-    let logicalIdempotent = false;
-    if (existingLogicalAcknowledgement) {
-      const existingInput = { ...existingLogicalAcknowledgement };
-      delete existingInput.presentation_committed_at;
-      if (JSON.stringify(existingInput) !== JSON.stringify(acknowledgementInput)) {
-        return { status: 'conflict' };
-      }
-      logicalIdempotent = true;
-    }
-
-    let cortexIdempotent = !expectedCortexPresentation;
-    if (expectedCortexPresentation) {
-      const existing = job.cortexDeliveryAcknowledgement;
-      const existingPresentation = job.cortexDeliveryAcknowledgementPresentation;
-      if ((existing && !existingPresentation) || (!existing && existingPresentation)) {
+    const existingAcknowledgement = job.cortexDeliveryAcknowledgement;
+    const existingPresentation = job.cortexDeliveryAcknowledgementPresentation;
+    if (existingAcknowledgement || existingPresentation) {
+      if (!existingAcknowledgement || !existingPresentation) {
         return { status: 'retryable_conflict' };
       }
-      if (existing && existingPresentation) {
-        const existingInput = { ...existing };
-        delete existingInput.presentation_committed_at;
-        if (JSON.stringify(existingInput) !== JSON.stringify(acknowledgementInput)) {
-          return { status: 'conflict' };
-        }
-        cortexIdempotent = true;
+      const idempotent =
+        deliveryAckInput(existingAcknowledgement) === deliveryAckInput(acknowledgement);
+      if (sameCortexPresentationBinding(existingPresentation, expectedCortexPresentation)) {
+        return idempotent
+          ? {
+              status: 'recorded',
+              acknowledgement: existingAcknowledgement,
+              idempotent: true,
+              cortexPresentation: expectedCortexPresentation,
+            }
+          : { status: 'conflict' };
+      }
+      if (idempotent) {
+        job.cortexDeliveryAcknowledgementPresentation = expectedCortexPresentation;
+        return {
+          status: 'recorded',
+          acknowledgement: existingAcknowledgement,
+          idempotent: true,
+          cortexPresentation: expectedCortexPresentation,
+        };
       }
     }
-
-    if (!recordedAcknowledgement) {
-      recordedAcknowledgement = Object.freeze({
-        ...acknowledgementInput,
-        ...(expectedCortexPresentation &&
-        ['committed', 'committed_effect'].includes(acknowledgementInput.state)
-          ? { presentation_committed_at: Date.now() }
-          : {}),
-      });
-      state.deliveryAcknowledgements.set(acknowledgement.revision, recordedAcknowledgement);
-    }
-    if (
-      acknowledgement.revision === state.revision &&
-      (acknowledgement.state === 'committed' || acknowledgement.state === 'failed')
-    ) {
-      state.active = false;
-      state.completedAt = Date.now();
-    }
-    job.deliveryAcknowledgement = recordedAcknowledgement;
-    if (expectedCortexPresentation) {
-      job.cortexDeliveryAcknowledgement = recordedAcknowledgement;
-      job.cortexDeliveryAcknowledgementPresentation = current;
-    }
+    const recordedAcknowledgement = { ...acknowledgement };
+    delete recordedAcknowledgement.presentation_committed_at;
+    recordedAcknowledgement.presentation_committed_at = Date.now();
+    Object.freeze(recordedAcknowledgement);
+    job.cortexDeliveryAcknowledgement = recordedAcknowledgement;
+    job.cortexDeliveryAcknowledgementPresentation = expectedCortexPresentation;
     return {
       status: 'recorded',
       acknowledgement: recordedAcknowledgement,
-      idempotent: logicalIdempotent && cortexIdempotent,
-      ownerStreamId,
-      ...(expectedCortexPresentation && current ? { cortexPresentation: current } : {}),
+      idempotent: false,
+      cortexPresentation: expectedCortexPresentation,
     };
   }
+  /* === VIVENTIUM END === */
 
   async deleteJob(streamId: string, retiredNativeResponse?: NativeResponseIdentity): Promise<void> {
     const job = this.jobs.get(streamId);
@@ -869,9 +1155,9 @@ export class InMemoryJobStore implements IJobStore {
       if (
         !job.nativeResponse ||
         nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(retiredNativeResponse)
-      )
+      ) {
         return;
-      // Existing in-flight replay references observe retirement before this job is removed.
+      }
       job.nativeResponseCancelled = true;
       delete job.finalEvent;
     } else if (job && retainNativeResponse(job)) {
@@ -879,7 +1165,14 @@ export class InMemoryJobStore implements IJobStore {
     }
     this.jobs.delete(streamId);
     this.contentState.delete(streamId);
-    logger.debug(`[InMemoryJobStore] Deleted job: ${streamId}`);
+    if (job) {
+      const userJobs = this.userJobMap.get(job.userId);
+      userJobs?.delete(streamId);
+      if (userJobs?.size === 0) {
+        this.userJobMap.delete(job.userId);
+      }
+    }
+    logger.debug(`[InMemoryJobStore] Deleted job ${streamLogRef(streamId)}`);
   }
 
   async hasJob(streamId: string): Promise<boolean> {
@@ -921,16 +1214,6 @@ export class InMemoryJobStore implements IJobStore {
       await this.deleteJob(id);
     }
 
-    for (const [scope, source] of this.sourceOrders) {
-      if (source.expiresAt <= now) {
-        this.sourceOrders.delete(scope);
-      }
-    }
-    for (const [key, publication] of this.nativePublications) {
-      if (publication.recoverUntil <= now) {
-        this.nativePublications.delete(key);
-      }
-    }
     for (const state of this.logicalTurns.values()) {
       if (
         !state.active &&
@@ -941,28 +1224,22 @@ export class InMemoryJobStore implements IJobStore {
       }
     }
 
+    for (const [scope, watermark] of this.sourceOrderWatermarks) {
+      if (watermark.expiresAt <= now && !this.hasActiveSourceOrderScope(scope)) {
+        this.sourceOrderWatermarks.delete(scope);
+      }
+    }
+    for (const [key, publication] of this.nativePublications) {
+      if (publication.recoverUntil <= now) {
+        this.nativePublications.delete(key);
+      }
+    }
+
     if (toDelete.length > 0) {
       logger.debug(`[InMemoryJobStore] Cleaned up ${toDelete.length} expired jobs`);
     }
 
     return toDelete.length;
-  }
-
-  private async evictOldest(): Promise<void> {
-    let oldestId: string | null = null;
-    let oldestTime = Infinity;
-
-    for (const [streamId, job] of this.jobs) {
-      if (!retainNativeResponse(job) && job.createdAt < oldestTime) {
-        oldestTime = job.createdAt;
-        oldestId = streamId;
-      }
-    }
-
-    if (oldestId) {
-      logger.warn(`[InMemoryJobStore] Evicting oldest job: ${oldestId}`);
-      await this.deleteJob(oldestId);
-    }
   }
 
   private retireLogicalTurnState(state: LogicalTurnState): void {
@@ -977,6 +1254,20 @@ export class InMemoryJobStore implements IJobStore {
         this.streamScopes.delete(streamId);
       }
     }
+  }
+
+  private hasActiveSourceOrderScope(scope: string): boolean {
+    for (const state of this.logicalTurns.values()) {
+      if (
+        state.active &&
+        Array.from(state.revisionSourceOrders.values()).some(
+          (sourceOrder) => sourceOrder.source_order_scope === scope,
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Get job count (for monitoring) */
@@ -996,16 +1287,18 @@ export class InMemoryJobStore implements IJobStore {
   }
 
   async destroy(): Promise<void> {
+    this.destroyed = true;
+    this.lifecycleEpoch += 1;
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
     }
-    this.nativePublications.clear();
-    this.sourceOrders.clear();
     this.jobs.clear();
     this.contentState.clear();
     this.userJobMap.clear();
     this.logicalTurns.clear();
+    this.sourceOrderWatermarks.clear();
+    this.nativePublications.clear();
     this.logicalTurnIndex.clear();
     this.streamScopes.clear();
     logger.debug('[InMemoryJobStore] Destroyed');

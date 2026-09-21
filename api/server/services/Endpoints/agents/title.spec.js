@@ -4,7 +4,6 @@ jest.mock('@librechat/api', () => ({
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
-  saveGeneratedConversationTitle: jest.fn(async (_model, _user, _conversationId, title) => title),
   logger: {
     debug: jest.fn(),
     warn: jest.fn(),
@@ -16,6 +15,7 @@ const mockRecordVoiceOrchestrationTraceBestEffort = jest.fn();
 const mockGetTrustedInteractionContext = jest.fn();
 
 jest.mock('~/cache/getLogStores', () => jest.fn(() => ({ set: mockSet })));
+jest.mock('~/models', () => ({ saveConvo: jest.fn(async () => ({})) }));
 jest.mock('~/db/models', () => ({ Conversation: {} }));
 jest.mock('~/server/services/viventium/interactionContext', () => ({
   getTrustedInteractionContext: (...args) => mockGetTrustedInteractionContext(...args),
@@ -27,8 +27,7 @@ jest.mock('~/server/services/viventium/VoiceOrchestrationTraceService', () => ({
 
 const addTitle = require('./title');
 const getLogStores = require('~/cache/getLogStores');
-const { saveGeneratedConversationTitle } = require('@librechat/data-schemas');
-const { Conversation } = require('~/db/models');
+const { saveConvo } = require('~/models');
 const { isEnabled } = require('@librechat/api');
 
 describe('agents addTitle', () => {
@@ -54,12 +53,12 @@ describe('agents addTitle', () => {
       },
     );
     expect(titleConvo).not.toHaveBeenCalled();
-    expect(saveGeneratedConversationTitle).not.toHaveBeenCalled();
+    expect(saveConvo).not.toHaveBeenCalled();
     expect(mockSet).not.toHaveBeenCalled();
   });
 
   it('does not cache a title when durable persistence fails', async () => {
-    saveGeneratedConversationTitle.mockRejectedValueOnce(new Error('Database unavailable'));
+    saveConvo.mockRejectedValueOnce(new Error('Database unavailable'));
     await expect(
       addTitle(
         { user: { id: 'owner' }, body: {} },
@@ -127,12 +126,10 @@ describe('agents addTitle', () => {
 
     expect(getLogStores).toHaveBeenCalled();
     expect(mockSet).toHaveBeenCalledWith('user-1-convo-1', 'check my ms365 inbox', 120000);
-    expect(saveGeneratedConversationTitle).toHaveBeenCalledWith(
-      Conversation,
-      'user-1',
-      'convo-1',
-      'check my ms365 inbox',
-    );
+    expect(saveConvo).toHaveBeenCalledWith(req, {
+      conversationId: 'convo-1',
+      title: 'check my ms365 inbox',
+    }, { context: 'api/server/services/Endpoints/agents/title.js' });
     expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });
 
@@ -157,12 +154,10 @@ describe('agents addTitle', () => {
       'this is a deliberately long title see...',
       120000,
     );
-    expect(saveGeneratedConversationTitle).toHaveBeenCalledWith(
-      Conversation,
-      'user-2',
-      'convo-2',
-      'this is a deliberately long title see...',
-    );
+    expect(saveConvo).toHaveBeenCalledWith(req, {
+      conversationId: 'convo-2',
+      title: 'this is a deliberately long title see...',
+    }, { context: 'api/server/services/Endpoints/agents/title.js' });
     expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });
 });

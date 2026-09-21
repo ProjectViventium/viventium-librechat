@@ -19,6 +19,15 @@ const { LIMIT_MESSAGE_IP, LIMIT_MESSAGE_USER } = process.env ?? {};
 
 const router = express.Router();
 
+/* === VIVENTIUM START ===
+ * Feature: Parallel Work owner isolation.
+ * Purpose: Generation jobs are account-scoped authority. Missing legacy owner metadata is not a
+ *          compatibility grant: every read/control boundary must prove the authenticated owner.
+ */
+const jobBelongsToUser = (job, userId) =>
+  Boolean(userId && job?.metadata?.userId && job.metadata.userId === userId);
+/* === VIVENTIUM END === */
+
 /**
  * Open Responses API routes (API key authentication handled in route file)
  * Mounted at /agents/v1/responses (full path: /api/agents/v1/responses)
@@ -225,9 +234,14 @@ router.get('/chat/status/:conversationId', async (req, res) => {
     return res.json({ active: false });
   }
 
-  if (job.metadata.userId !== req.user.id) {
-    return res.status(403).json({ error: 'Unauthorized' });
+  /* === VIVENTIUM START ===
+   * Feature: Parallel Work owner isolation.
+   * Purpose: Status is stream data and requires the same exact owner proof as subscription.
+   */
+  if (!jobBelongsToUser(job, req.user.id)) {
+    return res.json({ active: false });
   }
+  /* === VIVENTIUM END === */
 
   // Get resume state which contains aggregatedContent
   // Avoid calling both getStreamInfo and getResumeState (both fetch content)

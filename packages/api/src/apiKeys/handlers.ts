@@ -92,7 +92,11 @@ export function createApiKeyHandlers(deps: ApiKeyHandlerDependencies) {
 
   async function getApiKey(req: AuthenticatedRequest, res: Response) {
     try {
-      const key = await deps.getAgentApiKeyById(req.params.id, req.user?.id || '');
+      const keyId = req.params.id;
+      if (typeof keyId !== 'string') {
+        return res.status(400).json({ error: 'Invalid API key ID' });
+      }
+      const key = await deps.getAgentApiKeyById(keyId, req.user?.id || '');
 
       if (!key) {
         return res.status(404).json({ error: 'API key not found' });
@@ -107,7 +111,11 @@ export function createApiKeyHandlers(deps: ApiKeyHandlerDependencies) {
 
   async function deleteApiKey(req: AuthenticatedRequest, res: Response) {
     try {
-      const deleted = await deps.deleteAgentApiKey(req.params.id, req.user?.id || '');
+      const keyId = req.params.id;
+      if (typeof keyId !== 'string') {
+        return res.status(400).json({ error: 'Invalid API key ID' });
+      }
+      const deleted = await deps.deleteAgentApiKey(keyId, req.user?.id || '');
 
       if (!deleted) {
         return res.status(404).json({ error: 'API key not found' });

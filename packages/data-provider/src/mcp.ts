@@ -49,6 +49,17 @@ const BaseOptionsSchema = z.object({
     })
     .optional(),
   /* === VIVENTIUM START ===
+   * Feature: Multiple OAuth connections for one logical MCP provider.
+   * Purpose: Let trusted config expose independent account slots backed by one reviewed OAuth
+   * provider/callback without allowing user-created MCP input to forge that grouping.
+   * === VIVENTIUM END === */
+  viventiumOAuthConnection: z
+    .object({
+      providerId: z.string().regex(/^[a-zA-Z0-9_-]+$/),
+      slot: z.number().int().min(1).max(10),
+    })
+    .optional(),
+  /* === VIVENTIUM START ===
    * Feature: GlassHive autonomous MCP capability broker policy.
    * Purpose: Let reviewed Viventium-managed MCP server configs opt into projection through the
    * GlassHive capability broker without allowing user-created MCP configs to self-authorize.
@@ -76,17 +87,6 @@ const BaseOptionsSchema = z.object({
           }),
         )
         .optional(),
-    })
-    .optional(),
-  /* === VIVENTIUM START ===
-   * Feature: Multiple OAuth connections for one logical MCP provider.
-   * Purpose: Allow trusted config to expose independent account slots backed by the same endpoint
-   * and callback without coupling the connection model to Gmail or any user identity.
-   * === VIVENTIUM END === */
-  viventiumOAuthConnection: z
-    .object({
-      providerId: z.string().regex(/^[a-zA-Z0-9_-]+$/),
-      slot: z.number().int().min(1).max(10),
     })
     .optional(),
   /**
@@ -278,8 +278,8 @@ const omitServerManagedFields = <T extends z.ZodObject<z.ZodRawShape>>(schema: T
     serverInstructions: true,
     viventiumRequestContext: true,
     viventiumAccess: true,
-    viventiumGlassHive: true,
     viventiumOAuthConnection: true,
+    viventiumGlassHive: true,
     requiresOAuth: true,
     customUserVars: true,
     oauth_headers: true,

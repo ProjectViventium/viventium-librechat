@@ -4,7 +4,7 @@
  * === VIVENTIUM END === */
 
 const mongoose = require('mongoose');
-const { createViventiumCortexFeelingSnapshotSchema } = require('@librechat/data-schemas');
+const createViventiumCortexFeelingSnapshotSchema = require('./viventiumCortexFeelingSnapshot');
 
 const IMMUTABLE_OUTBOX_PATHS = new Set([
   'outboxKey',

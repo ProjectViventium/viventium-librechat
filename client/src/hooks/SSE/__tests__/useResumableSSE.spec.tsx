@@ -1143,5 +1143,355 @@ describe('useResumableSSE', () => {
     });
     expect(mockRecoilSetters.get('show-stop')).toHaveBeenCalledWith(false);
   });
+
+  it('removes only the unfinished assistant draft when a revision is superseded', async () => {
+    const user = createSubmission().userMessage;
+    const draft = createSubmission().initialResponse;
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+      },
+    });
+    queryClient.setQueryData<TMessage[]>([QueryKeys.messages, Constants.NEW_CONVO], [user, draft]);
+    renderHook(() => useResumableSSE(createSubmission(), chatHelpers), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <MemoryRouter initialEntries={[`/c/${Constants.NEW_CONVO}`]}>
+          <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+        </MemoryRouter>
+      ),
+    });
+
+    await waitFor(() => expect(mockSSEInstances.length).toBeGreaterThan(0));
+    const latestStream = mockSSEInstances.at(-1);
+    act(() => {
+      latestStream?.emit('message', {
+        data: JSON.stringify({ final: true, superseded: true, revision: 1 }),
+      });
+    });
+
+    expect(queryClient.getQueryData<TMessage[]>([QueryKeys.messages, Constants.NEW_CONVO])).toEqual(
+      [user],
+    );
+    expect(mockErrorHandler).not.toHaveBeenCalled();
+    expect(latestStream?.close).toHaveBeenCalled();
+  });
+
+  it('owns terminal UI cleanup when the final frame is received', async () => {
+    mockActiveJobIds = ['stream-1'];
+    mockActiveStreams = [{ streamId: 'stream-1', conversationId: 'stream-1' }];
+    const submission = createSubmission();
+    renderHook(() => useResumableSSE(submission, chatHelpers), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(mockSSEInstances.length).toBeGreaterThan(0));
+    act(() => {
+      mockSSEInstances.at(-1)?.emit('message', {
+        data: JSON.stringify({
+          final: true,
+          conversation: { conversationId: Constants.NEW_CONVO },
+          requestMessage: createSubmission().userMessage,
+          responseMessage: createSubmission().initialResponse,
+        }),
+      });
+    });
+
+    expect(chatHelpers.setIsSubmitting).toHaveBeenCalledWith(false);
+  });
+
+  it('projects one authoritative branch through reconnect SYNC and FINAL', async () => {
+    const priorUser = {
+      messageId: 'prior-user',
+      parentMessageId: String(Constants.NO_PARENT),
+      conversationId: 'conversation-resume',
+      text: 'prior',
+      isCreatedByUser: true,
+    } as TMessage;
+    const priorResponse = {
+      messageId: 'prior-response',
+      parentMessageId: 'prior-user',
+      conversationId: 'conversation-resume',
+      text: 'prior answer',
+      isCreatedByUser: false,
+    } as TMessage;
+    const optimisticUser = {
+      messageId: 'client-user',
+      parentMessageId: 'prior-response',
+      conversationId: 'conversation-resume',
+      text: 'synthetic prompt',
+      isCreatedByUser: true,
+    } as TMessage;
+    const optimisticResponse = {
+      messageId: 'client-user_',
+      parentMessageId: 'client-user',
+      conversationId: 'conversation-resume',
+      text: '',
+      content: [],
+      isCreatedByUser: false,
+    } as TMessage;
+    const authoritativeUser = {
+      messageId: 'server-user',
+      parentMessageId: 'prior-response',
+      conversationId: 'conversation-resume',
+      text: 'synthetic prompt',
+      isCreatedByUser: true,
+    } as TMessage;
+    const authoritativeResponse = {
+      messageId: 'server-response',
+      parentMessageId: 'server-user',
+      conversationId: 'conversation-resume',
+      text: 'authoritative answer',
+      content: [{ type: 'text', text: 'authoritative answer' }],
+      isCreatedByUser: false,
+    } as TMessage;
+    const state: Agents.ResumeState = {
+      runSteps: [],
+      aggregatedContent: [{ type: ContentTypes.TEXT, text: 'authoritative partial' }],
+      userMessage: {
+        messageId: 'server-user',
+        parentMessageId: 'prior-response',
+        conversationId: 'conversation-resume',
+        text: 'synthetic prompt',
+      },
+      responseMessageId: 'server-response',
+      clientPresentation: {
+        mode: 'append',
+        userMessageId: 'client-user',
+        responseMessageId: 'client-user_',
+        targetUserMessageId: 'client-user',
+      },
+      conversationId: 'conversation-resume',
+    } as Agents.ResumeState;
+    const resumeSubmission = buildSubmissionFromResumeState(
+      state,
+      'stream-resume',
+      [priorUser, priorResponse, optimisticUser, optimisticResponse],
+      'conversation-resume',
+    );
+    let currentMessages = [priorUser, priorResponse, optimisticUser, optimisticResponse];
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    queryClient.setQueryData<TMessage[]>(
+      [QueryKeys.messages, 'conversation-resume'],
+      currentMessages,
+    );
+    const resumeHelpers = {
+      ...chatHelpers,
+      getMessages: () => currentMessages,
+      setMessages: (messages: TMessage[]) => {
+        currentMessages = messages;
+      },
+    };
+
+    renderHook(() => useResumableSSE(resumeSubmission, resumeHelpers), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <MemoryRouter initialEntries={['/c/conversation-resume']}>
+          <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+        </MemoryRouter>
+      ),
+    });
+    await waitFor(() => expect(mockSSEInstances.at(-1)?.stream).toHaveBeenCalledTimes(1));
+
+    // Model a canonical message refetch winning the race before SYNC arrives.
+    currentMessages = [priorUser, priorResponse, authoritativeUser, authoritativeResponse];
+    queryClient.setQueryData<TMessage[]>(
+      [QueryKeys.messages, 'conversation-resume'],
+      currentMessages,
+    );
+
+    act(() => {
+      mockSSEInstances.at(-1)?.emit('message', {
+        data: JSON.stringify({ sync: true, resumeState: state }),
+      });
+    });
+    expect(
+      queryClient
+        .getQueryData<TMessage[]>([QueryKeys.messages, 'conversation-resume'])
+        ?.map((item) => item.messageId),
+    ).toEqual(['prior-user', 'prior-response', 'server-user', 'server-response']);
+
+    act(() => {
+      mockSSEInstances.at(-1)?.emit('message', {
+        data: JSON.stringify({
+          final: true,
+          conversation: { conversationId: 'conversation-resume' },
+          requestMessage: authoritativeUser,
+          responseMessage: authoritativeResponse,
+        }),
+      });
+    });
+    expect(
+      queryClient
+        .getQueryData<TMessage[]>([QueryKeys.messages, 'conversation-resume'])
+        ?.map((item) => item.messageId),
+    ).toEqual(['prior-user', 'prior-response', 'server-user', 'server-response']);
+  });
+
+  it('attaches terminal handlers before starting the SSE transport', async () => {
+    const submission = createSubmission();
+    renderHook(() => useResumableSSE(submission, chatHelpers), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(mockSSEInstances.length).toBeGreaterThan(0));
+
+    const stream = mockSSEInstances.at(-1);
+    expect(stream?.options).toMatchObject({ start: false });
+    expect(stream?.addEventListener).toHaveBeenCalledWith('message', expect.any(Function));
+    expect(stream?.stream).toHaveBeenCalledTimes(1);
+    expect(stream?.addEventListener.mock.invocationCallOrder[0]).toBeLessThan(
+      stream?.stream.mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER,
+    );
+  });
+
+  it('clears a lost-final Stop state when the claimed job leaves the active registry', async () => {
+    mockActiveJobIds = ['conversation-canonical'];
+    mockActiveStreams = [
+      { streamId: 'stream-1', conversationId: 'conversation-canonical' },
+      { streamId: 'stream-2', conversationId: 'conversation-canonical' },
+    ];
+    (request.post as jest.Mock).mockResolvedValueOnce({
+      streamId: 'stream-1',
+      conversationId: 'conversation-canonical',
+    });
+    const submission = createSubmission();
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+      },
+    });
+    const invalidateQueries = jest.spyOn(queryClient, 'invalidateQueries');
+    const { rerender } = renderHook(() => useResumableSSE(submission, chatHelpers), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <MemoryRouter initialEntries={[`/c/${Constants.NEW_CONVO}`]}>
+          <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+        </MemoryRouter>
+      ),
+    });
+
+    await waitFor(() => expect(mockSSEInstances.length).toBeGreaterThan(0));
+    await waitFor(() => expect(mockRefetchActiveJobs).toHaveBeenCalled());
+    chatHelpers.setIsSubmitting.mockClear();
+
+    mockActiveJobIds = ['conversation-canonical'];
+    mockActiveStreams = [{ streamId: 'stream-2', conversationId: 'conversation-canonical' }];
+    rerender();
+
+    await waitFor(() => {
+      expect(chatHelpers.setIsSubmitting).toHaveBeenCalledWith(false);
+    });
+    expect(mockRecoilSetters.get('show-stop')).toHaveBeenCalledWith(false);
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: [QueryKeys.messages, 'conversation-canonical'],
+      exact: true,
+    });
+  });
+
+  it('does not settle a verified stream when exact active-stream authority disappears', async () => {
+    mockActiveJobIds = ['conversation-canonical'];
+    mockActiveStreams = [{ streamId: 'stream-1', conversationId: 'conversation-canonical' }];
+    (request.post as jest.Mock).mockResolvedValueOnce({
+      streamId: 'stream-1',
+      conversationId: 'conversation-canonical',
+    });
+    const submission = createSubmission();
+    const { rerender } = renderHook(() => useResumableSSE(submission, chatHelpers), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(mockSSEInstances.length).toBeGreaterThan(0));
+    await waitFor(() => expect(mockRefetchActiveJobs).toHaveBeenCalled());
+    chatHelpers.setIsSubmitting.mockClear();
+
+    mockActiveStreams = undefined;
+    rerender();
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(chatHelpers.setIsSubmitting).not.toHaveBeenCalledWith(false);
+    expect(mockRecoilSetters.get('show-stop')).not.toHaveBeenCalledWith(false);
+  });
+
+  it('does not settle a new stream from an initially empty active-jobs response', async () => {
+    mockActiveJobIds = [];
+    mockActiveStreams = [];
+    mockRefetchActiveJobs.mockImplementationOnce(async () => {
+      mockActiveJobIds = ['stream-1'];
+      mockActiveStreams = [{ streamId: 'stream-1', conversationId: 'stream-1' }];
+      return {
+        data: { activeJobIds: mockActiveJobIds, activeStreams: mockActiveStreams },
+        isSuccess: true,
+      };
+    });
+    const submission = createSubmission();
+    renderHook(() => useResumableSSE(submission, chatHelpers), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(mockSSEInstances.length).toBeGreaterThan(0));
+    chatHelpers.setIsSubmitting.mockClear();
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(chatHelpers.setIsSubmitting).not.toHaveBeenCalledWith(false);
+  });
+
+  it('does not treat a failed active-registry refresh as terminal proof', async () => {
+    mockRefetchActiveJobs.mockResolvedValueOnce({
+      data: { activeJobIds: [], activeStreams: [] },
+      isSuccess: false,
+    });
+    const submission = createSubmission();
+    renderHook(() => useResumableSSE(submission, chatHelpers), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(mockRefetchActiveJobs).toHaveBeenCalled());
+    chatHelpers.setIsSubmitting.mockClear();
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(chatHelpers.setIsSubmitting).not.toHaveBeenCalledWith(false);
+  });
+
+  it('recovers after a failed registry probe and later authoritative poll', async () => {
+    mockRefetchActiveJobs.mockResolvedValueOnce({
+      data: { activeJobIds: [], activeStreams: [] },
+      isSuccess: false,
+    });
+    (request.post as jest.Mock).mockResolvedValueOnce({
+      streamId: 'stream-1',
+      conversationId: 'conversation-canonical',
+    });
+    const submission = createSubmission();
+    const { rerender } = renderHook(() => useResumableSSE(submission, chatHelpers), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(mockRefetchActiveJobs).toHaveBeenCalled());
+    chatHelpers.setIsSubmitting.mockClear();
+
+    mockActiveJobIds = ['conversation-canonical'];
+    mockActiveStreams = [{ streamId: 'stream-1', conversationId: 'conversation-canonical' }];
+    mockActiveJobsDataUpdatedAt = 1;
+    rerender();
+    expect(chatHelpers.setIsSubmitting).not.toHaveBeenCalledWith(false);
+
+    mockActiveJobIds = [];
+    mockActiveStreams = [];
+    mockActiveJobsDataUpdatedAt = 2;
+    rerender();
+
+    await waitFor(() => {
+      expect(chatHelpers.setIsSubmitting).toHaveBeenCalledWith(false);
+    });
+    expect(mockRecoilSetters.get('show-stop')).toHaveBeenCalledWith(false);
+  });
 });
 // VIVENTIUM END

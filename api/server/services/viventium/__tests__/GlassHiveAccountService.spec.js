@@ -56,6 +56,7 @@ describe('GlassHiveAccountService', () => {
     process.env.VIVENTIUM_ACTIVE_WORK_CACHE_MS = '2000';
     process.env.VIVENTIUM_ACTIVE_WORK_COLD_TIMEOUT_MS = '100';
     process.env.VIVENTIUM_ACTIVE_WORK_INTERACTIVE_TIMEOUT_MS = '4321';
+    delete process.env.VIVENTIUM_ACTIVE_WORK_ACTION_TIMEOUT_MS;
     mockEnrichActiveWorkSnapshot.mockClear();
     mockUpdateUserViventiumOrchestrationPreferences.mockClear();
     mockGetUserParallelWorkKnownEpoch.mockReset().mockResolvedValue(0);
@@ -275,6 +276,45 @@ describe('GlassHiveAccountService', () => {
 
     await getActiveWorkInteractiveSnapshot({ ownerId: 'owner-interactive-snapshot', fetchImpl });
     expect(timeoutSpy).toHaveBeenLastCalledWith(4321);
+  });
+
+  test('gives accepted work actions enough time to settle without changing read deadlines', async () => {
+    const timeoutSpy = jest
+      .spyOn(AbortSignal, 'timeout')
+      .mockImplementation(() => new AbortController().signal);
+    const fetchImpl = jest.fn().mockResolvedValue({
+      status: 200,
+      ok: true,
+      headers: { get: () => 'application/json' },
+      text: async () => JSON.stringify({ workRef: 'work-1', state: 'queued' }),
+    });
+    const { requestAccountApi } = require('../GlassHiveAccountService');
+
+    await requestAccountApi({
+      ownerId: 'owner-1',
+      path: '/v1/work/work-1/actions',
+      method: 'POST',
+      body: { action: 'steer' },
+      fetchImpl,
+    });
+    expect(timeoutSpy).toHaveBeenLastCalledWith(15000);
+
+    await requestAccountApi({
+      ownerId: 'owner-1',
+      path: '/v1/work/work-1',
+      fetchImpl,
+    });
+    expect(timeoutSpy).toHaveBeenLastCalledWith(5000);
+
+    process.env.VIVENTIUM_ACTIVE_WORK_ACTION_TIMEOUT_MS = '18000';
+    await requestAccountApi({
+      ownerId: 'owner-1',
+      path: '/v1/work/work-1/actions',
+      method: 'POST',
+      body: { action: 'steer' },
+      fetchImpl,
+    });
+    expect(timeoutSpy).toHaveBeenLastCalledWith(18000);
   });
 
   test('waits for a fresh roster on each user-triggered interactive refresh after cache expiry', async () => {

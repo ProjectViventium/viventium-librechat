@@ -22,10 +22,17 @@ let mockAbortJob;
 let mockGetCortexInsightDeliveriesForParent;
 let mockDeleteSchedulerPlaceholder;
 let mockUpdateSchedulerConversation;
+let mockGetSchedulerExternalWorkSummary;
+let mockConfiguredMainAgentId = '';
 let lastParentMessageId = null;
 let lastSpec = null;
 let lastAgentId = null;
 let lastScheduledAgentExecution = null;
+let lastSchedulerModel = null;
+let lastSchedulerReasoningEffort = null;
+let lastExternalWorkRequired = null;
+let lastInteractionContext = null;
+let lastSchedulerMessageId = null;
 let lastSchedulerRequest = null;
 let lastSchedulerTitleHandler = null;
 let agentControllerCalls = 0;
@@ -34,6 +41,7 @@ const mockSchedulerDispatchIntents = new Map();
 jest.mock(
   '@librechat/data-schemas',
   () => ({
+    ...jest.requireActual('@librechat/data-schemas'),
     logger: {
       debug: jest.fn(),
       info: jest.fn(),
@@ -47,6 +55,9 @@ jest.mock(
 jest.mock('~/server/middleware', () => ({
   configMiddleware: (req, _res, next) => {
     req.config = {
+      ...(mockConfiguredMainAgentId
+        ? { interface: { defaultAgent: mockConfiguredMainAgentId } }
+        : {}),
       modelSpecs: {
         list: [
           {
@@ -90,7 +101,12 @@ jest.mock(
     lastSpec = req.body.spec;
     lastAgentId = req.body.agent_id;
     lastScheduledAgentExecution = req.viventiumScheduledAgentExecution ?? null;
-    res.json({ streamId: 'stream_1', conversationId: req.body.conversationId || 'new' });
+    lastSchedulerModel = req.body.model ?? null;
+    lastSchedulerReasoningEffort = req.body.reasoning_effort ?? null;
+    lastExternalWorkRequired = req.viventiumSchedulerExternalWorkRequired ?? null;
+    lastInteractionContext = req._viventiumInteractionContext ?? null;
+    lastSchedulerMessageId = req.body.messageId ?? null;
+    res.json({ streamId: req.body.streamId, conversationId: req.body.conversationId || 'new' });
   },
 );
 
@@ -155,6 +171,7 @@ jest.mock('~/db/models', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   GenerationJobManager: {
     getActiveStreamIdForConversation: (...args) => mockGetActiveStreamIdForConversation(...args),
     getJob: (...args) => mockGetJob(...args),
@@ -174,7 +191,7 @@ jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => ({
 }));
 
 jest.mock('~/server/services/viventium/interactionContext', () => ({
-  createSchedulerInteractionContext: (context) => context,
+  ...jest.requireActual('~/server/services/viventium/interactionContext'),
   setTrustedInteractionContext: (req, context) => {
     req._viventiumInteractionContext = context;
   },
@@ -203,6 +220,20 @@ jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () 
     mockBuildScheduledGlassHiveCapabilityBundle(...args),
   revokeScheduledGlassHiveCapabilityGrant: (...args) =>
     mockRevokeScheduledGlassHiveCapabilityGrant(...args),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveCallbackBindingService', () => ({
+  getSchedulerExternalWorkSummary: (...args) => mockGetSchedulerExternalWorkSummary(...args),
+}));
+
+jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => ({
+  getCortexInsightDeliveriesForParent: (...args) =>
+    mockGetCortexInsightDeliveriesForParent(...args),
+}));
+
+jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => ({
+  getCortexInsightDeliveriesForParent: (...args) =>
+    mockGetCortexInsightDeliveriesForParent(...args),
 }));
 
 function createTestApp(router) {
@@ -415,6 +446,15 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
     lastSpec = null;
     lastAgentId = null;
     lastScheduledAgentExecution = null;
+    lastSchedulerModel = null;
+    lastSchedulerReasoningEffort = null;
+    lastExternalWorkRequired = null;
+    agentControllerCalls = 0;
+    mockSchedulerDispatchIntents.clear();
+    lastInteractionContext = null;
+    lastSchedulerMessageId = null;
+    lastSchedulerRequest = null;
+    lastSchedulerTitleHandler = null;
     mockGetUserById = jest.fn().mockResolvedValue({ _id: 'user_1', role: 'USER' });
     mockGetMessage = jest.fn().mockResolvedValue(null);
     mockGetMessages = jest.fn().mockResolvedValue([]);
@@ -548,6 +588,7 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
 describe('/api/viventium/scheduler/chat', () => {
   beforeEach(() => {
     jest.resetModules();
+    mockConfiguredMainAgentId = '';
     agentControllerCalls = 0;
     mockGetActiveStreamIdForConversation = jest.fn().mockResolvedValue(undefined);
     mockSchedulerDispatchIntents.clear();
@@ -555,8 +596,9 @@ describe('/api/viventium/scheduler/chat', () => {
     lastSpec = null;
     lastAgentId = null;
     lastScheduledAgentExecution = null;
-    lastSchedulerRequest = null;
-    lastSchedulerTitleHandler = null;
+    lastSchedulerModel = null;
+    lastSchedulerReasoningEffort = null;
+    lastSchedulerMessageId = null;
     mockGetUserById = jest.fn().mockResolvedValue({ _id: 'user_1', role: 'USER' });
     mockGetMessage = jest.fn().mockResolvedValue(null);
     mockGetMessages = jest.fn().mockResolvedValue([]);
@@ -569,6 +611,14 @@ describe('/api/viventium/scheduler/chat', () => {
       metadata: { userId: 'user_1' },
     });
     mockGetResumeState = jest.fn().mockResolvedValue(null);
+    mockGetSchedulerExternalWorkSummary = jest.fn().mockResolvedValue({
+      requiredTotal: 0,
+      requiredTerminal: 0,
+      requiredFailed: 0,
+      allRequiredTerminal: true,
+      state: 'none',
+      items: [],
+    });
     mockSubscribe = jest.fn().mockResolvedValue({ unsubscribe: jest.fn() });
     mockAbortJob = jest.fn().mockResolvedValue({ success: true });
     mockDeleteSchedulerPlaceholder = jest.fn().mockResolvedValue({ _id: 'message-object-id' });
@@ -672,6 +722,7 @@ describe('/api/viventium/scheduler/chat', () => {
     expect(lastParentMessageId).toBe(Constants.NO_PARENT);
     expect(lastSpec).toBe('viventium');
     expect(lastAgentId).toBe('agent_test');
+    expect(lastExternalWorkRequired).toBe(true);
   });
 
   test('keeps internal scheduler execution envelopes out of the visible conversation title', async () => {
@@ -705,7 +756,106 @@ describe('/api/viventium/scheduler/chat', () => {
     );
   });
 
-  test('authenticated scheduler request carries a validated per-run model tuple', async () => {
+  test('carries only a validated scheduler-owned informational-work policy', async () => {
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        text: 'synthetic scheduled prompt',
+        conversationId: 'new',
+        agentId: 'agent_test',
+        externalWorkRequired: false,
+        viventiumSchedulerExternalWorkRequired: true,
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(lastExternalWorkRequired).toBe(false);
+  });
+
+  test('preserves only authenticated structured QA provenance for downstream exclusion', async () => {
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        text: 'synthetic QA schedule',
+        conversationId: 'new',
+        agentId: 'agent_test',
+        viventiumQaRun: true,
+        viventiumQaRunId: 'run-qa-123',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(lastSchedulerRequest.body.viventiumQaRun).toBe(true);
+    expect(lastSchedulerRequest.body.viventiumQaRunId).toBe('run-qa-123');
+    expect(lastInteractionContext).toEqual(
+      expect.objectContaining({
+        qa_run: true,
+        qa_run_id: 'run-qa-123',
+      }),
+    );
+  });
+
+  test('rejects malformed scheduler QA provenance before authoring', async () => {
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        text: 'synthetic QA schedule',
+        conversationId: 'new',
+        agentId: 'agent_test',
+        viventiumQaRun: 'true',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toEqual(expect.objectContaining({ reason: 'invalid_qa_provenance' }));
+    expect(agentControllerCalls).toBe(0);
+  });
+
+  test('rejects a malformed scheduler external-work policy before authoring', async () => {
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        text: 'synthetic scheduled prompt',
+        conversationId: 'new',
+        agentId: 'agent_test',
+        externalWorkRequired: 'false',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toEqual(expect.objectContaining({ reason: 'invalid_external_work_policy' }));
+    expect(agentControllerCalls).toBe(0);
+  });
+
+  test('authenticated scheduler request cannot override the Agent Builder route', async () => {
     const schedulerRouter = require('../scheduler');
     const app = createTestApp(schedulerRouter);
     const req = createMockReq({
@@ -728,14 +878,431 @@ describe('/api/viventium/scheduler/chat', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(200);
-    expect(lastScheduledAgentExecution).toEqual({
-      provider: 'openai',
-      model: 'gpt-5.6-sol',
-      reasoning_effort: 'xhigh',
+    expect(lastScheduledAgentExecution).toBeNull();
+    expect(lastSchedulerModel).toBeNull();
+    expect(lastSchedulerReasoningEffort).toBeNull();
+  });
+
+  test('uses the current configured Main instead of stale conversation or request agent identities', async () => {
+    mockConfiguredMainAgentId = 'agent-current-main';
+    mockGetConvo = jest.fn().mockResolvedValue({
+      conversationId: 'conversation-main-continuity',
+      endpoint: 'agents',
+      agent_id: 'agent-stale-specialist',
+    });
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        text: 'Continue the existing Main work.',
+        conversationId: 'conversation-main-continuity',
+        agentId: 'agent-request-specialist',
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(lastAgentId).toBe('agent-current-main');
+  });
+
+  test('removes nested fallback, GlassHive, and effort overrides before Main initialization', async () => {
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        text: 'Continue the existing Main work.',
+        conversationId: 'new',
+        agentId: 'agent_test',
+        effort: 'max',
+        fallback: { provider: 'synthetic-unapproved', model: 'synthetic-unapproved-model' },
+        fallbackProvider: 'synthetic-unapproved',
+        fallbackModel: 'synthetic-unapproved-model',
+        glasshive_options: { fallback_provider: 'synthetic-unapproved' },
+        glasshiveOptions: { fallback_model: 'synthetic-unapproved-model' },
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(lastSchedulerRequest.body).not.toHaveProperty('effort');
+    expect(lastSchedulerRequest.body).not.toHaveProperty('fallback');
+    expect(lastSchedulerRequest.body).not.toHaveProperty('fallbackProvider');
+    expect(lastSchedulerRequest.body).not.toHaveProperty('fallbackModel');
+    expect(lastSchedulerRequest.body).not.toHaveProperty('glasshive_options');
+    expect(lastSchedulerRequest.body).not.toHaveProperty('glasshiveOptions');
+  });
+
+  test('reuses one accepted stream for duplicate authenticated idempotency key', async () => {
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const body = {
+      userId: 'user_1',
+      text: 'synthetic scheduled prompt',
+      conversationId: 'new',
+      agentId: 'agent_test',
+      idempotencyKey: 'occurrence:synthetic:2026-08-11T00:00:00Z',
+    };
+
+    const first = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/chat',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body,
+      }),
+      first,
+    );
+    const duplicate = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/chat',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body,
+      }),
+      duplicate,
+    );
+    const reconciled = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        method: 'GET',
+        url: `/api/viventium/scheduler/dispatches/${encodeURIComponent(body.idempotencyKey)}?userId=user_1`,
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        query: { userId: 'user_1' },
+      }),
+      reconciled,
+    );
+
+    expect(first.body.streamId).toBe(duplicate.body.streamId);
+    expect(duplicate.body.duplicate).toBe(true);
+    expect(reconciled.body.streamId).toBe(first.body.streamId);
+    expect(reconciled.body.state).toBe('accepted');
+    expect(agentControllerCalls).toBe(1);
+  });
+
+  test('authors one deterministic server-owned message identity for a scheduled occurrence', async () => {
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const body = {
+      userId: 'user_1',
+      text: 'synthetic scheduled prompt',
+      conversationId: 'new',
+      agentId: 'agent_test',
+      idempotencyKey: 'occurrence:synthetic:stable-turn',
+      messageId: 'forged-caller-message',
+    };
+
+    const first = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/chat',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body,
+      }),
+      first,
+    );
+    const firstMessageId = lastSchedulerMessageId;
+
+    mockSchedulerDispatchIntents.clear();
+    const replay = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/chat',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body,
+      }),
+      replay,
+    );
+
+    expect(first.statusCode).toBe(200);
+    expect(replay.statusCode).toBe(200);
+    expect(firstMessageId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(firstMessageId).not.toBe(body.messageId);
+    expect(lastSchedulerMessageId).toBe(firstMessageId);
+  });
+
+  test('returns the durable required external-work summary for a scheduled occurrence', async () => {
+    mockGetSchedulerExternalWorkSummary.mockResolvedValueOnce({
+      requiredTotal: 2,
+      requiredTerminal: 1,
+      requiredFailed: 0,
+      allRequiredTerminal: false,
+      state: 'waiting_external',
+      items: [
+        { workRef: 'work-1', required: true, state: 'running' },
+        { workRef: 'work-2', required: true, state: 'completed' },
+      ],
+    });
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const idempotencyKey = 'schedule:synthetic-external-work';
+    const body = {
+      userId: 'user_1',
+      text: 'synthetic scheduled prompt',
+      conversationId: 'new',
+      agentId: 'agent_test',
+      scheduleId: 'schedule-1',
+      idempotencyKey,
+      deliveryChannels: ['telegram', 'librechat'],
+    };
+    const accepted = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/chat',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body,
+      }),
+      accepted,
+    );
+
+    const reconciled = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        method: 'GET',
+        url: `/api/viventium/scheduler/dispatches/${encodeURIComponent(idempotencyKey)}?userId=user_1`,
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        query: { userId: 'user_1' },
+      }),
+      reconciled,
+    );
+
+    expect(mockGetSchedulerExternalWorkSummary).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerId: 'user_1',
+        schedulerDispatchDocumentId: expect.any(String),
+      }),
+    );
+    expect(reconciled.body.externalWork).toEqual(
+      expect.objectContaining({
+        requiredTotal: 2,
+        requiredTerminal: 1,
+        state: 'waiting_external',
+      }),
+    );
+  });
+
+  test('explicitly cancels only a running scheduler-owned authoring stream', async () => {
+    mockAbortJob.mockResolvedValueOnce({
+      success: true,
+      jobData: {
+        responseMessageId: 'assistant-placeholder',
+        conversationId: 'conversation-scheduled',
+      },
+    });
+    mockGetJob.mockResolvedValueOnce({
+      status: 'running',
+      metadata: {
+        userId: 'user_1',
+        interactionContext: {
+          actor_kind: 'system',
+          origin: 'scheduler',
+          surface: 'workbench',
+        },
+      },
+    });
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const res = createMockRes();
+
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/stream/stream-timeout/cancel',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body: { userId: 'user_1', reason: 'stream_timeout' },
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ success: true, cancelled: 'stream-timeout' });
+    expect(mockAbortJob).toHaveBeenCalledWith('stream-timeout');
+    expect(mockDeleteSchedulerPlaceholder).toHaveBeenCalledWith(
+      expect.objectContaining({
+        user: 'user_1',
+        messageId: 'assistant-placeholder',
+        unfinished: true,
+      }),
+    );
+    expect(mockUpdateSchedulerConversation).toHaveBeenCalledWith(
+      { user: 'user_1', conversationId: 'conversation-scheduled' },
+      expect.objectContaining({
+        $pull: { messages: 'message-object-id' },
+        $set: { isArchived: true },
+      }),
+    );
+  });
+
+  test('does not let scheduler credentials cancel an interactive stream', async () => {
+    mockGetJob.mockResolvedValueOnce({
+      status: 'running',
+      metadata: {
+        userId: 'user_1',
+        interactionContext: {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'web',
+        },
+      },
+    });
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const res = createMockRes();
+
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/stream/web-stream/cancel',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body: { userId: 'user_1', reason: 'stream_timeout' },
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.reason).toBe('not_scheduler_authoring');
+    expect(mockAbortJob).not.toHaveBeenCalled();
+  });
+
+  test("does not reveal another owner's scheduler stream existence", async () => {
+    mockGetJob.mockResolvedValueOnce({
+      status: 'running',
+      metadata: {
+        userId: 'another-owner',
+        interactionContext: { actor_kind: 'system', origin: 'scheduler' },
+      },
+    });
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const res = createMockRes();
+
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/stream/foreign-stream/cancel',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body: { userId: 'user_1', reason: 'stream_timeout' },
+      }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toEqual({ error: 'Scheduler stream not found' });
+    expect(mockAbortJob).not.toHaveBeenCalled();
+  });
+
+  test('authors a trusted noninteractive Workbench context and ignores forged privileged fields', async () => {
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        text: 'synthetic scheduled prompt',
+        conversationId: 'new',
+        agentId: 'agent_test',
+        source_event_id: 'scheduled-run-42',
+        scheduleId: 'schedule-42',
+        scheduleRunId: 'run-42',
+        interactionContext: {
+          actor: 'user',
+          origin: 'user',
+          surface: 'telegram',
+          interactionMode: 'interactive',
+        },
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(lastInteractionContext).toEqual({
+      actor_kind: 'system',
+      origin: 'scheduler',
+      surface: 'workbench',
+      conversation_id: 'new',
+      revision: 1,
+      source_event_id: 'scheduled-run-42',
+      schedule_id: 'schedule-42',
+      schedule_run_id: 'run-42',
     });
   });
 
-  test('authenticated scheduler request carries an exact capability-managed GlassHive tuple', async () => {
+  test('ignores a partial legacy scheduled-agent tuple and uses Agent Builder', async () => {
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        text: 'synthetic scheduled prompt',
+        conversationId: 'new',
+        agentId: 'agent_test',
+        scheduledAgentExecution: {
+          provider: 'openai',
+          model: 'gpt-5.6-sol',
+        },
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(lastScheduledAgentExecution).toBeNull();
+    expect(lastSchedulerModel).toBeNull();
+  });
+
+  test('authenticated scheduler request uses Agent Builder despite a legacy model tuple', async () => {
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: {
+        userId: 'user_1',
+        text: 'synthetic scheduled prompt',
+        conversationId: 'new',
+        agentId: 'agent_test',
+        scheduledAgentExecution: {
+          provider: 'openai',
+          model: 'gpt-5.6-sol',
+          reasoning_effort: 'xhigh',
+        },
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(lastScheduledAgentExecution).toBeNull();
+    expect(lastSchedulerModel).toBeNull();
+    expect(lastSchedulerReasoningEffort).toBeNull();
+  });
+
+  test('authenticated scheduler request ignores a legacy GlassHive tuple', async () => {
     const schedulerRouter = require('../scheduler');
     const app = createTestApp(schedulerRouter);
     const req = createMockReq({
@@ -758,36 +1325,9 @@ describe('/api/viventium/scheduler/chat', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(200);
-    expect(lastScheduledAgentExecution).toEqual({
-      provider: 'glasshive-harness',
-      model: 'codex-cli:gpt-5.6-sol',
-      reasoning_effort: 'ultra',
-    });
-  });
-
-  test('rejects a partial scheduled-agent tuple', async () => {
-    const schedulerRouter = require('../scheduler');
-    const app = createTestApp(schedulerRouter);
-    const req = createMockReq({
-      url: '/api/viventium/scheduler/chat',
-      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
-      body: {
-        userId: 'user_1',
-        text: 'synthetic scheduled prompt',
-        conversationId: 'new',
-        agentId: 'agent_test',
-        scheduledAgentExecution: {
-          provider: 'openai',
-          model: 'gpt-5.6-sol',
-        },
-      },
-    });
-    const res = createMockRes();
-
-    await dispatch(app, req, res);
-
-    expect(res.statusCode).toBe(400);
-    expect(res.body.reason).toBe('invalid_scheduled_agent_execution');
+    expect(lastScheduledAgentExecution).toBeNull();
+    expect(lastSchedulerModel).toBeNull();
+    expect(lastSchedulerReasoningEffort).toBeNull();
   });
 
   test('existing convo resolves parentMessageId from the latest leaf', async () => {
@@ -867,7 +1407,12 @@ describe('/api/viventium/scheduler/stream', () => {
     mockGetConvo = jest.fn().mockResolvedValue(null);
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue({ telegramUserId: 'tg-1' });
     mockGetAgent = jest.fn().mockResolvedValue({ avatar: { filepath: '/images/viventium.png' } });
-    mockGetJob = jest.fn().mockResolvedValue({ metadata: { userId: 'user_1' } });
+    mockGetJob = jest.fn().mockResolvedValue({
+      metadata: {
+        userId: 'user_1',
+        interactionContext: { logical_turn_id: 'turn-stream-1', revision: 3 },
+      },
+    });
     mockGetResumeState = jest.fn().mockResolvedValue(null);
     mockSubscribe = jest.fn().mockImplementation(async (_streamId, onChunk, onDone) => {
       onChunk({
@@ -938,6 +1483,428 @@ describe('/api/viventium/scheduler/stream', () => {
     expect(res.statusCode).toBe(200);
     expect(writes).toContain('"event":"on_message_delta"');
     expect(writes).toContain('"final":true');
+    expect(writes).toContain('"logical_turn_id":"turn-stream-1"');
+    expect(writes).toContain('"revision":3');
+  });
+
+  test.each(['stream', 'events'])(
+    'redacts nested provider failures and credentials from resumed %s scheduler streams',
+    async (endpoint) => {
+      const resumedErrorSecret = 'synthetic-resumed-provider-error-never-publish';
+      const resumedHeaderSecret = 'synthetic-resumed-provider-header-never-publish';
+      const resumedApiKey = 'synthetic-resumed-provider-api-key-never-publish';
+      const resumeState = {
+        conversationId: 'conversation-resume-visible',
+        responseMessageId: 'message-resume-visible',
+        userMessage: { text: 'Keep the owner-visible scheduled request.' },
+        aggregatedContent: [
+          { type: 'text', text: 'Keep the owner-visible scheduled response.' },
+          {
+            type: 'error',
+            error: 'Raw provider response: ' + resumedErrorSecret,
+            error_class: 'provider_unauthorized',
+            failure_retryable: false,
+            failure_contract_version: 1,
+            response: { body: resumedErrorSecret },
+          },
+        ],
+        runSteps: [
+          {
+            id: 'run-step-visible',
+            stepDetails: {
+              progress: 'Keep the owner-visible run progress.',
+              lastError: {
+                code: 'provider_unauthorized',
+                message: resumedErrorSecret,
+                response: { data: { api_key: resumedApiKey } },
+              },
+              request: {
+                headers: {
+                  authorization: 'Bearer ' + resumedHeaderSecret,
+                  'x-api-key': resumedApiKey,
+                  'x-request-id': 'request-id-visible',
+                },
+              },
+            },
+          },
+        ],
+      };
+      mockGetResumeState = jest.fn().mockResolvedValue(resumeState);
+      const schedulerRouter = require('../scheduler');
+      const app = createTestApp(schedulerRouter);
+      const req = createMockReq({
+        method: 'GET',
+        url: '/api/viventium/scheduler/' + endpoint + '/scheduler-private-resume',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        query: { userId: 'user_1', resume: 'true' },
+      });
+      const res = createMockRes();
+
+      await dispatch(app, req, res);
+
+      const writes = res.write.mock.calls.map(([value]) => value).join('\n');
+      expect(writes).toContain('"conversationId":"conversation-resume-visible"');
+      expect(writes).toContain('"responseMessageId":"message-resume-visible"');
+      expect(writes).toContain('Keep the owner-visible scheduled request.');
+      expect(writes).toContain('Keep the owner-visible scheduled response.');
+      expect(writes).toContain('Keep the owner-visible run progress.');
+      expect(writes).toContain('"x-request-id":"request-id-visible"');
+      expect(writes).toContain('"error_class":"provider_unauthorized"');
+      expect(writes).toContain('"failure_retryable":false');
+      expect(writes).toContain('"failure_contract_version":1');
+      expect(writes).not.toContain(resumedErrorSecret);
+      expect(writes).not.toContain(resumedHeaderSecret);
+      expect(writes).not.toContain(resumedApiKey);
+      expect(resumeState.runSteps[0].stepDetails.request.headers.authorization).toContain(
+        resumedHeaderSecret,
+      );
+    },
+  );
+
+  test.each([
+    ['stream', 'on_cortex_update'],
+    ['events', 'on_cortex_update'],
+    ['stream', 'on_cortex_followup'],
+    ['events', 'on_cortex_followup'],
+  ])(
+    'redacts nested provider failures from %s %s scheduler status events',
+    async (endpoint, eventName) => {
+      const providerBodySecret = 'synthetic-status-provider-body-never-publish';
+      const providerHeaderSecret = 'synthetic-status-provider-header-never-publish';
+      const providerAccessToken = 'synthetic-status-provider-access-token-never-publish';
+      mockSubscribe = jest.fn().mockImplementation(async (_streamId, onChunk, onDone) => {
+        onChunk({
+          event: eventName,
+          data: {
+            runId: 'run-status-visible',
+            cortex_name: 'Pattern Recognition',
+            status: 'brewing',
+            text: 'Keep the owner-visible cortex update.',
+            provider: {
+              name: 'xai',
+              model: 'grok-4.5',
+              error: {
+                code: 'provider_rate_limited',
+                message: 'Raw provider response: ' + providerBodySecret,
+                response: {
+                  body: providerBodySecret,
+                  headers: { authorization: 'Bearer ' + providerHeaderSecret },
+                },
+              },
+            },
+            diagnostics: {
+              progress: 2,
+              credentials: { accessToken: providerAccessToken },
+              request: {
+                headers: {
+                  Authorization: 'Bearer ' + providerHeaderSecret,
+                  'x-request-id': 'status-request-visible',
+                },
+              },
+            },
+          },
+        });
+        onDone({
+          final: true,
+          responseMessage: {
+            text: 'Keep the final scheduled answer.',
+            messageId: 'message-status-visible',
+          },
+        });
+        return { unsubscribe: jest.fn() };
+      });
+      const schedulerRouter = require('../scheduler');
+      const app = createTestApp(schedulerRouter);
+      const req = createMockReq({
+        method: 'GET',
+        url: '/api/viventium/scheduler/' + endpoint + '/scheduler-private-status',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        query: { userId: 'user_1' },
+      });
+      const res = createMockRes();
+
+      await dispatch(app, req, res);
+
+      const writes = res.write.mock.calls.map(([value]) => value).join('\n');
+      expect(writes).toContain(eventName);
+      expect(writes).toContain('"runId":"run-status-visible"');
+      expect(writes).toContain('"cortex_name":"Pattern Recognition"');
+      expect(writes).toContain('"status":"brewing"');
+      expect(writes).toContain('Keep the owner-visible cortex update.');
+      expect(writes).toContain('"name":"xai"');
+      expect(writes).toContain('"model":"grok-4.5"');
+      expect(writes).toContain('"progress":2');
+      expect(writes).toContain('"x-request-id":"status-request-visible"');
+      expect(writes).toContain('"error_class":"provider_rate_limited"');
+      expect(writes).toContain('Keep the final scheduled answer.');
+      expect(writes).not.toContain(providerBodySecret);
+      expect(writes).not.toContain(providerHeaderSecret);
+      expect(writes).not.toContain(providerAccessToken);
+    },
+  );
+
+  test.each(['stream', 'events'])(
+    'redacts upstream provider details from the %s scheduler event stream',
+    async (endpoint) => {
+      const privateDetail = 'synthetic-provider-secret-never-publish';
+      mockSubscribe = jest
+        .fn()
+        .mockImplementation(async (_streamId, _onChunk, _onDone, onError) => {
+          onError(
+            Object.assign(new Error('Upstream rejected ' + privateDetail), {
+              code: 'provider_unauthorized',
+              status: 401,
+              response: { data: { token: privateDetail } },
+            }),
+          );
+          return { unsubscribe: jest.fn() };
+        });
+      const schedulerRouter = require('../scheduler');
+      const app = createTestApp(schedulerRouter);
+      const req = createMockReq({
+        method: 'GET',
+        url: '/api/viventium/scheduler/' + endpoint + '/scheduler-private-1',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        query: { userId: 'user_1' },
+      });
+      const res = createMockRes();
+
+      await dispatch(app, req, res);
+
+      const writes = res.write.mock.calls.map((call) => call[0]).join('\n');
+      expect(writes).toContain('"error_class":"provider_unauthorized"');
+      expect(writes).not.toContain(privateDetail);
+      expect(writes).not.toContain('Upstream rejected');
+    },
+  );
+
+  test.each(['stream', 'events'])(
+    'preserves the flat public failure contract for %s scheduler error events',
+    async (endpoint) => {
+      mockSubscribe = jest
+        .fn()
+        .mockImplementation(async (_streamId, _onChunk, _onDone, onError) => {
+          onError({ code: 'provider_unauthorized', message: 'Private upstream response' });
+          return { unsubscribe: jest.fn() };
+        });
+      const schedulerRouter = require('../scheduler');
+      const app = createTestApp(schedulerRouter);
+      const req = createMockReq({
+        method: 'GET',
+        url: '/api/viventium/scheduler/' + endpoint + '/scheduler-flat-public-error',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        query: { userId: 'user_1' },
+      });
+      const res = createMockRes();
+
+      await dispatch(app, req, res);
+
+      const errorFrame = res.write.mock.calls
+        .map(([value]) => value)
+        .find((value) => value.startsWith('event: error\ndata: '));
+      expect(JSON.parse(errorFrame.slice('event: error\ndata: '.length))).toEqual({
+        error: 'The model provider credentials were rejected.',
+        error_class: 'provider_unauthorized',
+      });
+    },
+  );
+
+  test.each(['stream', 'events'])(
+    'redacts upstream provider details from final %s scheduled failure events',
+    async (endpoint) => {
+      const privateDetail = 'synthetic-final-provider-secret-never-publish';
+      mockSubscribe = jest.fn().mockImplementation(async (_streamId, _onChunk, onDone) => {
+        onDone({
+          final: true,
+          responseMessage: {
+            messageId: 'msg-private-provider-failure',
+            content: [
+              {
+                type: 'error',
+                error: 'Raw upstream response ' + privateDetail,
+                error_class: 'provider_unauthorized',
+                response: { body: privateDetail },
+              },
+            ],
+          },
+        });
+        return { unsubscribe: jest.fn() };
+      });
+      const schedulerRouter = require('../scheduler');
+      const app = createTestApp(schedulerRouter);
+      const req = createMockReq({
+        method: 'GET',
+        url: '/api/viventium/scheduler/' + endpoint + '/scheduler-private-final',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        query: { userId: 'user_1' },
+      });
+      const res = createMockRes();
+
+      await dispatch(app, req, res);
+
+      const writes = res.write.mock.calls.map((call) => call[0]).join('\n');
+      expect(writes).toContain('"error_class":"provider_unauthorized"');
+      expect(writes).not.toContain(privateDetail);
+    },
+  );
+
+  test('preserves exact provider failure class and retry truth in scheduler event receipts', async () => {
+    mockSubscribe = jest.fn().mockImplementation(async (_streamId, _onChunk, onDone) => {
+      onDone({
+        final: true,
+        responseMessage: {
+          messageId: 'msg-provider-failure',
+          content: [
+            {
+              type: 'error',
+              error: 'The selected model provider quota is exhausted.',
+              error_class: 'provider_quota_exhausted',
+              failure_retryable: false,
+              failure_contract_version: 1,
+            },
+          ],
+        },
+      });
+      return { unsubscribe: jest.fn() };
+    });
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/scheduler/events/scheduler-1',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      query: { userId: 'user_1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    const writes = res.write.mock.calls.map(([value]) => value).join('\n');
+    expect(writes).toContain('event: error');
+    expect(writes).toContain('"error_class":"provider_quota_exhausted"');
+    expect(writes).toContain('"failure_retryable":false');
+    expect(writes).not.toContain('completion_error');
+  });
+
+  test('includes only the actual server-authored winning route in the final scheduler receipt', async () => {
+    mockSubscribe = jest.fn().mockImplementation(async (_streamId, _onChunk, onDone) => {
+      onDone({
+        final: true,
+        responseMessage: {
+          messageId: 'msg-scheduled-success',
+          text: 'One scheduled Main answer.',
+          metadata: {
+            viventium: {
+              scheduledExecution: {
+                version: 1,
+                provider: 'claude-code',
+                model: 'opus',
+                reasoningEffort: 'high',
+                fallbackUsed: true,
+                fallbackReason: 'provider_quota_exhausted',
+              },
+            },
+          },
+        },
+      });
+      return { unsubscribe: jest.fn() };
+    });
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/scheduler/events/scheduler-1',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      query: { userId: 'user_1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    const writes = res.write.mock.calls.map(([value]) => value).join('\n');
+    expect(writes).toContain('event: done');
+    expect(writes).toContain('"provider":"claude-code"');
+    expect(writes).toContain('"model":"opus"');
+    expect(writes).toContain('"reasoningEffort":"high"');
+    expect(writes).toContain('"fallbackUsed":true');
+    expect(writes).toContain('"fallbackReason":"provider_quota_exhausted"');
+  });
+
+  test('records the configured Main primary without leaking a stale fallback reason', async () => {
+    mockSubscribe = jest.fn().mockImplementation(async (_streamId, _onChunk, onDone) => {
+      onDone({
+        final: true,
+        responseMessage: {
+          messageId: 'msg-configured-main-primary',
+          text: 'Configured Main answer.',
+          metadata: {
+            viventium: {
+              scheduledExecution: {
+                version: 1,
+                provider: 'xai',
+                model: 'grok-4.5',
+                reasoningEffort: 'high',
+                fallbackUsed: false,
+                fallbackReason: 'provider_quota_exhausted',
+              },
+            },
+          },
+        },
+      });
+      return { unsubscribe: jest.fn() };
+    });
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/scheduler/events/scheduler-1',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      query: { userId: 'user_1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    const writes = res.write.mock.calls.map(([value]) => value).join('\n');
+    expect(writes).toContain('"provider":"xai"');
+    expect(writes).toContain('"model":"grok-4.5"');
+    expect(writes).toContain('"fallbackUsed":false');
+    expect(writes).not.toContain('fallbackReason');
+  });
+
+  test.each([
+    ['missing provider', { version: 1, model: 'grok-4.5', fallbackUsed: false }],
+    [
+      'untyped fallback decision',
+      { version: 1, provider: 'xai', model: 'grok-4.5', fallbackUsed: 'false' },
+    ],
+  ])('rejects a final scheduler execution receipt with %s', async (_description, execution) => {
+    mockSubscribe = jest.fn().mockImplementation(async (_streamId, _onChunk, onDone) => {
+      onDone({
+        final: true,
+        responseMessage: {
+          messageId: 'msg-malformed-execution',
+          text: 'Configured Main answer.',
+          metadata: { viventium: { scheduledExecution: execution } },
+        },
+      });
+      return { unsubscribe: jest.fn() };
+    });
+    const schedulerRouter = require('../scheduler');
+    const app = createTestApp(schedulerRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/scheduler/events/scheduler-1',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      query: { userId: 'user_1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    const writes = res.write.mock.calls.map(([value]) => value).join('\n');
+    expect(writes).toContain('event: done');
+    expect(writes).not.toContain('"execution"');
   });
 
   test('does not subscribe when the client closes during job lookup', async () => {

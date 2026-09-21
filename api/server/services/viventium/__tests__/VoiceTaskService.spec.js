@@ -1,5 +1,12 @@
 /* === VIVENTIUM START === VoiceTaskEventV1 state-machine tests. === VIVENTIUM END === */
 
+const mockRecordVoiceOrchestrationTraceBestEffort = jest.fn();
+
+jest.mock('../VoiceOrchestrationTraceService', () => ({
+  recordVoiceOrchestrationTraceBestEffort: (...args) =>
+    mockRecordVoiceOrchestrationTraceBestEffort(...args),
+}));
+
 const {
   bindVoiceTaskStream,
   cancelVoiceTask,
@@ -28,7 +35,11 @@ const {
 } = require('../VoiceTaskService');
 
 describe('VoiceTaskService', () => {
-  beforeEach(() => resetVoiceTasksForTests());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockRecordVoiceOrchestrationTraceBestEffort.mockResolvedValue({ sequence: 1 });
+    resetVoiceTasksForTests();
+  });
 
   test('binds the ready receipt conversation once without changing current task state', () => {
     const scope = { callSessionId: 'call-bind', userId: 'user-bind' };
@@ -96,6 +107,76 @@ describe('VoiceTaskService', () => {
       state: 'completed',
       resultMessageId: 'assistant-1',
     });
+  });
+
+  test('records only authoritative completed tool and cortex producer events', () => {
+    const task = createVoiceTask({
+      callSessionId: 'call-trace-1',
+      userId: 'user-trace-1',
+      conversationId: 'conv-trace-1',
+      turnId: 'turn-trace-1',
+      streamId: 'stream-trace-1',
+      owner: { kind: 'generation_job', id: 'stream-trace-1' },
+    });
+
+    observeGenerationEvent(task.taskId, {
+      event: 'on_run_step',
+      data: { id: 'tool-step-1', status: 'in_progress' },
+    });
+    observeGenerationEvent(task.taskId, {
+      event: 'on_run_step_completed',
+      data: { id: 'non-tool-step', result: { id: 'non-tool-result', type: 'message' } },
+    });
+    observeGenerationEvent(task.taskId, {
+      event: 'on_run_step_completed',
+      data: {
+        result: {
+          id: 'tool-step-1',
+          type: 'tool_call',
+          tool_call: { id: 'tool-call-1', name: 'web_search' },
+        },
+      },
+    });
+    observeGenerationEvent(task.taskId, {
+      event: 'on_cortex_update',
+      data: { id: 'cortex-1', status: 'running', cortex_name: 'private-name' },
+    });
+    observeGenerationEvent(task.taskId, {
+      event: 'on_cortex_followup',
+      data: { id: 'cortex-1-followup', status: 'completed', text: 'private insight text' },
+    });
+
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledTimes(2);
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenNthCalledWith(1, {
+      ownerId: 'user-trace-1',
+      callSessionId: 'call-trace-1',
+      turnId: 'turn-trace-1',
+      eventRef: 'tool-step-1',
+      stage: 'tool.completed',
+      facts: {
+        taskRef: task.taskId,
+        streamRef: 'stream-trace-1',
+        effectCount: 1,
+      },
+    });
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenNthCalledWith(2, {
+      ownerId: 'user-trace-1',
+      callSessionId: 'call-trace-1',
+      turnId: 'turn-trace-1',
+      eventRef: 'cortex-1-followup',
+      stage: 'cortex.completed',
+      facts: {
+        taskRef: task.taskId,
+        streamRef: 'stream-trace-1',
+        effectCount: 1,
+      },
+    });
+    expect(JSON.stringify(mockRecordVoiceOrchestrationTraceBestEffort.mock.calls)).not.toContain(
+      'private insight text',
+    );
+    expect(JSON.stringify(mockRecordVoiceOrchestrationTraceBestEffort.mock.calls)).not.toContain(
+      'private-name',
+    );
   });
 
   test('cancellation installs an idempotent suppression barrier before confirmation', () => {

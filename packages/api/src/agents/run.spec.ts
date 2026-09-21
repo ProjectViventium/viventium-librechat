@@ -1,16 +1,24 @@
+import { z } from 'zod';
 import { ToolMessage, AIMessage, AIMessageChunk, HumanMessage } from '@langchain/core/messages';
 import { RunnableLambda } from '@langchain/core/runnables';
-import { getChatModelClass, MultiAgentGraph, Providers, Run } from '@librechat/agents';
+import { DynamicStructuredTool } from '@langchain/core/tools';
+import { getChatModelClass, GraphEvents, MultiAgentGraph, Providers, Run } from '@librechat/agents';
 import { installUnifiedSchemaToolBindingPatch } from '../../../../api/server/services/viventium/agentSchemaToolBindingPatch';
 import {
   applyDeclaredProviderTransport,
+  buildRunAgentSystemInstructions,
   createRun,
   extractDiscoveredToolsFromHistory,
+  markGraphCoordinationTools,
   projectGraphLlmFallbacks,
   requestBodyForAgent,
 } from './run';
 
 installUnifiedSchemaToolBindingPatch();
+
+type ViventiumGraph = MultiAgentGraph & {
+  viventiumGraphFallbackRecoveryReceipt?: { provider: string; model: string };
+};
 
 /* === VIVENTIUM START ===
  * Regression: capability-declared Chat Completions must beat SDK model-name heuristics.
@@ -138,6 +146,86 @@ describe('requestBodyForAgent', () => {
     );
   });
 });
+
+describe('buildRunAgentSystemInstructions', () => {
+  it('matches the real provider system pipe after removing stale capability authority', () => {
+    const staleCapability = 'Stale signed capability authority.';
+    const capsule = '<viventium_feeling_state>steady</viventium_feeling_state>';
+    const agent = {
+      instructions: `Stable Main instructions.\n\n${staleCapability}\n\n${capsule}`,
+      additional_instructions: 'Final structured output contract.',
+      toolContextMap: { evidence: 'Declared tool context.' },
+      viventiumConversationProviderInstructionAppend: staleCapability,
+      viventiumConversationProviderCapabilityRefresh: jest.fn(),
+    } as never;
+
+    expect(buildRunAgentSystemInstructions(agent)).toBe(
+      [
+        'Declared tool context.',
+        `Stable Main instructions.\n\n${capsule}`,
+        'Final structured output contract.',
+      ].join('\n'),
+    );
+  });
+});
+// VIVENTIUM END
+
+// VIVENTIUM START: verify graph-owned coordination stays distinct from external effects.
+describe('graph coordination tool effect metadata', () => {
+  it('marks graph-owned tools structurally without inspecting their names', () => {
+    const graphTool = { name: 'synthetic-future-handoff-shape', metadata: { existing: true } };
+    const ordinaryTool = { name: 'synthetic-external-effect-tool', metadata: {} };
+    const run = {
+      Graph: {
+        agentContexts: new Map([['main', { graphTools: [graphTool], tools: [ordinaryTool] }]]),
+      },
+    };
+
+    markGraphCoordinationTools(run as never);
+
+    expect(graphTool.metadata.existing).toBe(true);
+    expect((graphTool.metadata as Record<string, unknown>).viventiumToolEffectClass).toBe(
+      Symbol.for('viventium.agent.graph.coordination.effect.token.v1'),
+    );
+    expect(ordinaryTool.metadata).toEqual({});
+  });
+
+  it('carries the server token through the real tool callback metadata slot', async () => {
+    const graphTool = new DynamicStructuredTool({
+      name: 'synthetic-coordination-callback',
+      description: 'Synthetic no-op graph coordination tool.',
+      schema: z.object({}),
+      func: async () => 'ok',
+      metadata: { existing: true },
+    });
+    const run = {
+      Graph: {
+        agentContexts: new Map([['main', { graphTools: [graphTool] }]]),
+      },
+    };
+    let callbackMetadata: Record<string, unknown> | undefined;
+
+    markGraphCoordinationTools(run as never);
+    await graphTool.invoke(
+      {},
+      {
+        callbacks: [
+          {
+            handleToolStart: async (...args: unknown[]) => {
+              callbackMetadata = args[5] as Record<string, unknown> | undefined;
+            },
+          },
+        ],
+      },
+    );
+
+    expect(callbackMetadata?.existing).toBe(true);
+    expect(callbackMetadata?.viventiumToolEffectClass).toBe(
+      Symbol.for('viventium.agent.graph.coordination.effect.token.v1'),
+    );
+  });
+});
+// VIVENTIUM END
 
 describe('projectGraphLlmFallbacks', () => {
   it('projects an initialized participant fallback with that participant request identity', async () => {
@@ -331,6 +419,237 @@ describe('projectGraphLlmFallbacks', () => {
     createSpy.mockRestore();
   });
 
+  it('projects a connected participant as a hidden singleflight lazy shell', async () => {
+    const createSpy = jest.spyOn(Run, 'create').mockReturnValue({ synthetic: true } as never);
+    const initializedRegistry = new Map([
+      ['read_mail', { name: 'read_mail', description: 'Read authorized mail.' }],
+    ]);
+    let releaseInitialization!: () => void;
+    const initializationGate = new Promise<void>((resolve) => {
+      releaseInitialization = resolve;
+    });
+    const connectedInitializer = jest.fn(async () => {
+      await initializationGate;
+      return {
+        id: 'connected',
+        name: 'Connected Accounts',
+        provider: 'openAI',
+        endpoint: 'openAI',
+        model_parameters: { model: 'synthetic-connected-model' },
+        instructions: 'Use only authorized connected accounts.',
+        tools: [{ name: 'read_mail' }],
+        toolDefinitions: [{ name: 'read_mail', description: 'Read authorized mail.' }],
+        toolRegistry: initializedRegistry,
+        maxContextTokens: 32000,
+        edges: [],
+      };
+    });
+    const connectedAgent = {
+      id: 'connected',
+      name: 'Connected Accounts',
+      provider: 'openAI',
+      endpoint: 'openAI',
+      model_parameters: { model: 'synthetic-connected-model' },
+      instructions: 'Connected shell.',
+      edges: [],
+    } as never;
+    Object.defineProperty(connectedAgent, 'viventiumConnectedAgentInitializer', {
+      value: connectedInitializer,
+      enumerable: false,
+    });
+
+    await createRun({
+      agents: [connectedAgent],
+      signal: new AbortController().signal,
+      streaming: true,
+      streamUsage: true,
+    });
+
+    const graphAgent = createSpy.mock.calls[0]?.[0].graphConfig.agents[0];
+    const initializerSymbol = Symbol.for('viventium.agent.connected.initializer.v1');
+    const projectedInitializer = graphAgent.clientOptions[initializerSymbol] as () => Promise<{
+      toolDefinitions: Array<{ name: string }>;
+      toolRegistry: Map<string, { name: string }>;
+      instructions: string;
+    }>;
+    expect(connectedInitializer).not.toHaveBeenCalled();
+    expect(
+      Object.getOwnPropertyDescriptor(graphAgent.clientOptions, initializerSymbol),
+    ).toMatchObject({ enumerable: false, writable: false, value: expect.any(Function) });
+    expect(JSON.stringify(graphAgent.clientOptions)).not.toContain('initializer');
+    expect(graphAgent.toolDefinitions).toEqual([
+      expect.objectContaining({ name: 'viventium_connected_agent_lazy_sentinel' }),
+    ]);
+
+    const first = projectedInitializer();
+    const second = projectedInitializer();
+    await Promise.resolve();
+    expect(connectedInitializer).toHaveBeenCalledTimes(1);
+    releaseInitialization();
+    const [firstProjection, secondProjection] = await Promise.all([first, second]);
+    expect(firstProjection).toBe(secondProjection);
+    expect(firstProjection.instructions).toBe('Use only authorized connected accounts.');
+    expect(firstProjection.toolDefinitions).toEqual([
+      { name: 'read_mail', description: 'Read authorized mail.' },
+    ]);
+    expect(firstProjection.toolRegistry).toBe(graphAgent.toolRegistry);
+    expect([...firstProjection.toolRegistry.keys()]).toEqual(['read_mail']);
+
+    createSpy.mockRestore();
+  });
+
+  it('hydrates the compiled event-driven ToolNode before the selected participant uses a tool', async () => {
+    const initializedRegistry = new Map([
+      [
+        'read_mail',
+        {
+          name: 'read_mail',
+          description: 'Read authorized mail.',
+          allowed_callers: ['direct'],
+        },
+      ],
+    ]);
+    const connectedInitializer = jest.fn(async () => ({
+      id: 'connected',
+      name: 'Connected Accounts',
+      provider: 'openAI',
+      endpoint: 'openAI',
+      model_parameters: { model: 'synthetic-connected-model' },
+      instructions: 'Use only authorized connected accounts.',
+      tools: [],
+      toolDefinitions: [
+        {
+          name: 'read_mail',
+          description: 'Read authorized mail.',
+          allowed_callers: ['direct'],
+        },
+      ],
+      toolRegistry: initializedRegistry,
+      maxContextTokens: 32000,
+      edges: [],
+    }));
+    const connectedAgent = {
+      id: 'connected',
+      name: 'Connected Accounts',
+      provider: 'openAI',
+      endpoint: 'openAI',
+      model_parameters: { model: 'synthetic-connected-model' },
+      instructions: 'Connected shell.',
+      edges: [],
+    } as never;
+    Object.defineProperty(connectedAgent, 'viventiumConnectedAgentInitializer', {
+      value: connectedInitializer,
+      enumerable: false,
+    });
+    const toolExecutions: Array<{ agentId?: string; name?: string }> = [];
+    const run = await createRun({
+      runId: 'synthetic-lazy-connected-tool-run',
+      agents: [connectedAgent],
+      signal: new AbortController().signal,
+      customHandlers: {
+        [GraphEvents.ON_TOOL_EXECUTE]: {
+          handle: (_event: string, data: unknown) => {
+            const request = data as {
+              agentId?: string;
+              toolCalls: Array<{ id: string; name: string }>;
+              resolve: (results: unknown[]) => void;
+            };
+            toolExecutions.push({
+              agentId: request.agentId,
+              name: request.toolCalls[0]?.name,
+            });
+            request.resolve(
+              request.toolCalls.map((call) => ({
+                toolCallId: call.id,
+                status: 'success',
+                content: 'Synthetic authorized mail result.',
+              })),
+            );
+          },
+        },
+      },
+      indexTokenCountMap: {},
+      tokenCounter: () => 1,
+    });
+    const graph = run.Graph as ViventiumGraph;
+    let providerCallCount = 0;
+    graph.overrideModel = {
+      async *stream() {
+        expect(connectedInitializer).toHaveBeenCalledTimes(1);
+        providerCallCount += 1;
+        if (providerCallCount === 1) {
+          yield new AIMessageChunk({
+            content: '',
+            tool_call_chunks: [
+              {
+                id: 'call-connected-read-mail',
+                name: 'read_mail',
+                args: '{}',
+                index: 0,
+                type: 'tool_call_chunk',
+              },
+            ],
+          });
+          return;
+        }
+        yield new AIMessageChunk({ content: 'Connected result returned.' });
+      },
+    } as never;
+
+    expect(connectedInitializer).not.toHaveBeenCalled();
+    await run.processStream(
+      { messages: [new HumanMessage('Read my authorized mail.')] },
+      {
+        version: 'v2',
+        recursionLimit: 6,
+        configurable: { thread_id: 'synthetic-lazy-connected-tool-thread' },
+      },
+    );
+
+    expect(connectedInitializer).toHaveBeenCalledTimes(1);
+    expect(toolExecutions).toEqual([{ agentId: 'connected', name: 'read_mail' }]);
+    expect(providerCallCount).toBe(2);
+    expect([...initializedRegistry.keys()]).toEqual(['read_mail']);
+  });
+
+  it('binds a final native-authority observer only to the visible Main route', async () => {
+    const createSpy = jest.spyOn(Run, 'create').mockReturnValue({ synthetic: true } as never);
+    const observer = jest.fn();
+    const params = {
+      agents: [
+        {
+          id: 'main',
+          provider: 'openAI',
+          endpoint: 'glasshive-harness',
+          model_parameters: { model: 'synthetic-main' },
+          edges: [],
+        },
+        {
+          id: 'hidden',
+          provider: 'openAI',
+          endpoint: 'openAI',
+          model_parameters: { model: 'synthetic-hidden' },
+          edges: [],
+        },
+      ],
+      signal: new AbortController().signal,
+      customHandlers: {},
+      indexTokenCountMap: {},
+      nativeRequestAuthorityObserver: observer,
+    };
+
+    await createRun(params as never);
+
+    const graphAgents = createSpy.mock.calls[0]?.[0].graphConfig.agents;
+    const observerSymbol = Symbol.for('viventium.agent.model.route.native.authority.observer.v1');
+    expect(graphAgents[0].clientOptions[observerSymbol]).toBe(observer);
+    expect(graphAgents[1].clientOptions[observerSymbol]).toBeUndefined();
+    expect(
+      Object.getOwnPropertyDescriptor(graphAgents[0].clientOptions, observerSymbol),
+    ).toMatchObject({ enumerable: false, writable: false });
+    createSpy.mockRestore();
+  });
+
   it('keeps initialization-time authority out of the real system pipe and injects only refreshed truth', async () => {
     const oldAuthority = 'Old authorized capability claim.';
     const unavailableAuthority = 'The host capability broker is unavailable for this run.';
@@ -359,7 +678,7 @@ describe('projectGraphLlmFallbacks', () => {
       indexTokenCountMap: {},
       tokenCounter: jest.fn(),
     });
-    const graph = run.Graph as MultiAgentGraph;
+    const graph = run.Graph as ViventiumGraph;
     expect(
       (graph.agentContexts.get('main')?.clientOptions as unknown as Record<PropertyKey, unknown>)[
         Symbol.for('viventium.agent.messaging.delivery-disposition.capability-owner.v1')
@@ -421,7 +740,7 @@ describe('projectGraphLlmFallbacks', () => {
       indexTokenCountMap: {},
       tokenCounter: jest.fn(),
     });
-    const graph = run.Graph as MultiAgentGraph;
+    const graph = run.Graph as ViventiumGraph;
     let invocationCount = 0;
     const scriptedModel = {
       async *stream() {
@@ -987,7 +1306,7 @@ describe('zero-input graph handoffs', () => {
       indexTokenCountMap: {},
       tokenCounter: jest.fn(),
     });
-    const graph = run.Graph as MultiAgentGraph;
+    const graph = run.Graph as ViventiumGraph;
     const calls: string[] = [];
     const fallbackSystemMessages: string[] = [];
     const fallbackReasoningKeys: string[] = [];

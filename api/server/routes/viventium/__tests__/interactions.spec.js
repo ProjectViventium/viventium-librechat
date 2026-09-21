@@ -1,6 +1,7 @@
 const express = require('express');
 
 let mockAcknowledgeDelivery;
+let mockAcknowledgeDurableEffectDelivery;
 let mockAcknowledgeServerCommittedTransportReceipt;
 let mockHasAcceptedGlassHiveLaunchForPresentation;
 const mockMessageUpdateOne = jest.fn();
@@ -22,6 +23,7 @@ jest.mock('@librechat/api', () => ({
   telegramInputDeliveryCoverage: (...args) => mockTelegramInputDeliveryCoverage(...args),
   GenerationJobManager: {
     acknowledgeDelivery: (...args) => mockAcknowledgeDelivery(...args),
+    acknowledgeDurableEffectDelivery: (...args) => mockAcknowledgeDurableEffectDelivery(...args),
     acknowledgeServerCommittedTransportReceipt: (...args) =>
       mockAcknowledgeServerCommittedTransportReceipt(...args),
   },
@@ -166,6 +168,7 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
         },
       },
     });
+    mockAcknowledgeDurableEffectDelivery = jest.fn().mockResolvedValue({ status: 'conflict' });
     mockAcknowledgeServerCommittedTransportReceipt = jest
       .fn()
       .mockResolvedValue({ status: 'conflict' });
@@ -1038,7 +1041,78 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
     expect(res.statusCode).toBe(503);
   });
 
-  test('rejects stale answers without calling a removed presentation exemption', async () => {
+  test('lets the manager-owned exact receipt authorize an older durable presentation', async () => {
+    const presentation = {
+      userId: 'server-user',
+      conversationId: 'server-conversation',
+      responseMessageId: 'server-response-old',
+      interactionContext: {
+        logical_turn_id: 'turn-1',
+        revision: 1,
+        source_event_id: 'source-1',
+      },
+    };
+    mockAcknowledgeDelivery.mockResolvedValueOnce({
+      status: 'stale_revision',
+      ownerStreamId: 'stream-old',
+      presentation,
+    });
+    mockHasAcceptedGlassHiveLaunchForPresentation.mockResolvedValueOnce(false);
+    mockAcknowledgeDurableEffectDelivery.mockResolvedValueOnce({
+      status: 'recorded',
+      acknowledgement: {
+        logical_turn_id: 'turn-1',
+        revision: 1,
+        state: 'committed_effect',
+        presentation_ref: 'telegram:1:10',
+      },
+      idempotent: false,
+      presentation,
+    });
+
+    const router = require('../interactions');
+    const app = createApp(router);
+    const req = request({
+      headers: { 'x-viventium-adapter-secret': 'adapter-secret' },
+      body: {
+        logical_turn_id: 'turn-1',
+        revision: 1,
+        state: 'committed',
+        presentation_ref: 'telegram:1:10',
+      },
+    });
+    const res = response();
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockHasAcceptedGlassHiveLaunchForPresentation).not.toHaveBeenCalled();
+    expect(mockAcknowledgeDurableEffectDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        logical_turn_id: 'turn-1',
+        revision: 1,
+        state: 'committed',
+      }),
+      'telegram',
+    );
+    expect(mockMessageUpdateOne).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: 'server-response-old', unfinished: true }),
+      expect.objectContaining({
+        $set: expect.objectContaining({ unfinished: false }),
+      }),
+    );
+    expect(mockRecordTelegramTransportReceipt).toHaveBeenCalledWith({
+      sourceKind: 'assistant_message',
+      userId: 'server-user',
+      conversationId: 'server-conversation',
+      logicalMessageId: 'server-response-old',
+      telegramChatId: '1',
+      telegramSentMessageIds: ['10'],
+      scheduleId: '',
+      scheduleRunId: '',
+    });
+  });
+
+  test('keeps rejecting an older ordinary answer when the manager has no durable receipt', async () => {
     mockAcknowledgeDelivery.mockResolvedValueOnce({
       status: 'stale_revision',
       ownerStreamId: 'stream-old',
@@ -1063,8 +1137,10 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(409);
-    expect(res.body).toEqual({ acknowledged: false, error: 'stale_revision' });
-    expect(mockCommitAcceptedMainTurnFromPresentation).not.toHaveBeenCalled();
+    expect(mockAcknowledgeDurableEffectDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({ logical_turn_id: 'turn-1', revision: 1, state: 'committed' }),
+      'telegram',
+    );
   });
 
   test('never turns stale source-order prose into a durable-work presentation fallback', async () => {
@@ -1081,6 +1157,7 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
 
     expect(res.statusCode).toBe(409);
     expect(res.body).toEqual({ acknowledged: false, error: 'stale_source_order' });
+    expect(mockAcknowledgeDurableEffectDelivery).not.toHaveBeenCalled();
   });
 
   test('fails closed when two adapter surfaces share one credential', async () => {

@@ -125,6 +125,8 @@ export interface InitializeAgentParams {
   conversationId?: string | null;
   /** Parent message ID for determining the current thread (optional) */
   parentMessageId?: string | null;
+  /** Active user message ID for excluding the current turn from recall freshness checks (optional) */
+  activeMessageId?: string | null;
   /** Request files */
   requestFiles?: IMongoFile[];
   /** Function to load agent tools */
@@ -138,6 +140,17 @@ export interface InitializeAgentParams {
     glasshive_options?: Agent['glasshive_options'];
     tool_options: AgentToolOptions | undefined;
     tool_resources: AgentToolResources | undefined;
+    /* === VIVENTIUM START ===
+     * Feature: Provider-independent Main orchestration facade binding.
+     * Purpose: Carry only the server-owned orchestration declaration across the narrow
+     * definitions-only loader boundary; never project the whole provider workspace bundle.
+     * === VIVENTIUM END === */
+    orchestration?: {
+      parallel_available: boolean;
+      default_mode: 'focused' | 'parallel';
+      worker_profile?: string;
+      fallback_worker_profile?: string;
+    };
   }) => Promise<{
     /** Full tool instances (only present when definitionsOnly=false) */
     tools?: GenericTool[];
@@ -260,6 +273,7 @@ export async function initializeAgent(
     conversationId,
     endpointOption,
     parentMessageId,
+    activeMessageId,
     allowedProviders,
     isInitialAgent = false,
   } = params;
@@ -460,6 +474,12 @@ export async function initializeAgent(
 
   if (conversationRecallScope !== 'none' && req.user?.id) {
     try {
+      const recallActiveMessageId =
+        typeof activeMessageId === 'string' && activeMessageId.trim().length > 0
+          ? activeMessageId.trim()
+          : typeof req.body?.messageId === 'string' && req.body.messageId.trim().length > 0
+            ? req.body.messageId.trim()
+            : null;
       const recallFileId =
         conversationRecallScope === 'agent'
           ? buildConversationRecallFileId({
@@ -490,9 +510,8 @@ export async function initializeAgent(
         const latestRecallEligibleMessageCreatedAt =
           await db.getLatestRecallEligibleMessageCreatedAt({
             user: req.user.id,
-            excludeMessageId: typeof req.body?.messageId === 'string' ? req.body.messageId : null,
-            excludeParentMessageId:
-              typeof req.body?.messageId === 'string' ? req.body.messageId : null,
+            excludeMessageId: recallActiveMessageId,
+            excludeParentMessageId: recallActiveMessageId,
           });
         recallFreshness = evaluateConversationRecallCorpusFreshness({
           recallFiles: conversationRecallFiles,
@@ -761,6 +780,13 @@ export async function initializeAgent(
     glasshive_options: agent.glasshive_options,
     tool_options: agent.tool_options,
     tool_resources,
+    /* === VIVENTIUM START ===
+     * Feature: Provider-independent Main orchestration facade binding.
+     * Purpose: The definitions-only loader reconstructs an Agent-shaped descriptor, so pass the
+     * exact declaration it needs to expose Core-owned list/action/delegation tools after a voice
+     * model override without forwarding workspace, fallback, or worker authority.
+     * === VIVENTIUM END === */
+    orchestration: agent.glasshive_options?.orchestration,
   })) ?? {
     tools: [],
     toolContextMap: {},

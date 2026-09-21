@@ -153,6 +153,10 @@ module.exports = function createViventiumCallSession(db) {
       memoryFinalizedEvidenceEpoch: { type: Number, default: null },
       memoryFinalizedAt: { type: Date, default: null },
       requestedVoiceRoute: { type: voiceRouteStateSchema, default: null },
+      contextualKeyterms: {
+        type: [{ type: String, maxlength: 96 }],
+        default: undefined,
+      },
       // === VIVENTIUM NOTE ===
       // Feature: Voice worker lease + dispatch idempotency fields
       // Purpose: Ensure one active worker per call session and atomic dispatch creation.

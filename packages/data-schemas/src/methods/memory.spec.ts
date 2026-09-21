@@ -420,6 +420,57 @@ describe('Memory Methods', () => {
         expect.objectContaining({ value: '', __v: 1 }),
       );
     });
+
+    it('compensates the destination to a newer tombstone when the source CAS loses a race', async () => {
+      const userId = new mongoose.Types.ObjectId();
+      const source = await MemoryEntry.create({
+        userId,
+        key: 'context',
+        value: 'Concurrent source',
+        tokenCount: 2,
+      });
+      const originalFindOneAndUpdate = MemoryEntry.findOneAndUpdate.bind(MemoryEntry);
+      let injectedSourceRace = false;
+      const findOneAndUpdateSpy = jest
+        .spyOn(MemoryEntry, 'findOneAndUpdate')
+        .mockImplementation(async (filter: any, update: any, options: any) => {
+          if (
+            !injectedSourceRace &&
+            filter?.key === 'context' &&
+            filter?.deletedAt === null &&
+            update?.$set?.deletedAt
+          ) {
+            injectedSourceRace = true;
+            await MemoryEntry.updateOne({ _id: source._id }, { $inc: { __v: 1 } });
+          }
+          return originalFindOneAndUpdate(filter, update, options);
+        });
+
+      try {
+        const result = await memoryMethods.renameMemory({
+          userId,
+          key: 'context',
+          newKey: 'context_archive',
+          value: 'Should be compensated',
+          tokenCount: 3,
+          expectedRevision: 0,
+        });
+
+        expect(result).toEqual(
+          expect.objectContaining({ ok: false, conflict: true, currentRevision: 1 }),
+        );
+      } finally {
+        findOneAndUpdateSpy.mockRestore();
+      }
+
+      expect(await MemoryEntry.findOne({ userId, key: 'context' }).lean()).toEqual(
+        expect.objectContaining({ value: 'Concurrent source', __v: 1 }),
+      );
+      expect(await MemoryEntry.findOne({ userId, key: 'context_archive' }).lean()).toEqual(
+        expect.objectContaining({ value: '', tokenCount: 0, __v: 2 }),
+      );
+      expect(await MemoryEntry.countDocuments({ userId, deletedAt: null })).toBe(1);
+    });
   });
 
   describe('getFormattedMemories', () => {

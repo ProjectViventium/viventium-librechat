@@ -1,5 +1,5 @@
 /* === VIVENTIUM START ===
- * Feature: MPV-061 strict Voice classifier fallback control.
+ * Feature: MPV-054 strict Voice classifier fallback control.
  * Purpose: Persist one exact synthetic PRE-GATE control with guarded state transitions and TTL.
  * === VIVENTIUM END === */
 
@@ -9,8 +9,8 @@ import type { ILocalQaVoiceClassifierFaultControl } from '~/types/localQaVoiceCl
 
 const HASH = /^sha256:[a-f0-9]{64}$/;
 const PROOF = /^[A-Za-z0-9_-]{43}$/;
-const CONTROL_ID = /^mpv061_[A-Za-z0-9_-]{22,80}$/;
-const CHALLENGE_ID = /^mpv061_ch_[A-Za-z0-9_-]{22,80}$/;
+const CONTROL_ID = /^mpv054_[A-Za-z0-9_-]{22,80}$/;
+const CHALLENGE_ID = /^mpv054_ch_[A-Za-z0-9_-]{22,80}$/;
 
 const hashField = { type: String, required: true, match: HASH, immutable: true } as const;
 const optionalHashField = { type: String, default: null, match: HASH } as const;
@@ -37,7 +37,7 @@ const localQaVoiceClassifierFaultControlSchema = new Schema<ILocalQaVoiceClassif
   {
     schemaVersion: { type: Number, required: true, enum: [1], immutable: true },
     controlId: { type: String, required: true, match: CONTROL_ID, unique: true, immutable: true },
-    caseId: { type: String, required: true, enum: ['MPV-061'], immutable: true },
+    caseId: { type: String, required: true, enum: ['MPV-054'], immutable: true },
     sessionRefHash: hashField,
     sessionCandidateDigest: hashField,
     caseTokenHash: hashField,

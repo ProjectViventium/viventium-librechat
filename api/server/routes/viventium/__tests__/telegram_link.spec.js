@@ -9,6 +9,7 @@ let mockResolveUserIdFromCookies;
 let mockConsumeLinkToken;
 let mockUpsertTelegramMapping;
 let mockGetUserById;
+let mockReconcileUnresolvedDeliveries;
 
 jest.mock(
   '@librechat/data-schemas',
@@ -31,6 +32,11 @@ jest.mock('~/server/services/TelegramLinkService', () => ({
 
 jest.mock('~/models', () => ({
   getUserById: (...args) => mockGetUserById(...args),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveCallbackDeliveryService', () => ({
+  reconcileUnresolvedGlassHiveCallbackDeliveries: (...args) =>
+    mockReconcileUnresolvedDeliveries(...args),
 }));
 
 function createTestApp(router) {
@@ -110,6 +116,9 @@ describe('/api/viventium/telegram/link', () => {
     mockConsumeLinkToken = jest.fn();
     mockUpsertTelegramMapping = jest.fn();
     mockGetUserById = jest.fn();
+    mockReconcileUnresolvedDeliveries = jest
+      .fn()
+      .mockResolvedValue({ scanned: 0, repaired: 0, pending: 0 });
   });
 
   test('GET requires login', async () => {
@@ -164,6 +173,10 @@ describe('/api/viventium/telegram/link', () => {
       telegramUserId: 'tg-1',
       libreChatUserId: 'user_1',
       telegramUsername: 'testuser',
+    });
+    expect(mockReconcileUnresolvedDeliveries).toHaveBeenCalledWith({
+      userId: 'user_1',
+      limit: 100,
     });
   });
 });

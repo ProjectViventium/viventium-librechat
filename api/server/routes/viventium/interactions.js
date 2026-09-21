@@ -21,6 +21,11 @@ const {
 const {
   commitAcceptedMainTurnFromPresentation,
 } = require('~/server/services/viventium/ViventiumMainContinuityService');
+/* === VIVENTIUM START === Mongo-first durable-effect delivery authority. === */
+const {
+  acknowledgeDurableEffectDelivery: acknowledgeMongoDurableEffectDelivery,
+} = require('~/server/services/viventium/InteractionDurableEffectService');
+/* === VIVENTIUM END === */
 const {
   markCortexInsightDeliveryPresentationFailedByParent,
   markCortexInsightDeliveryPresentationByParent,
@@ -71,7 +76,7 @@ async function persistPresentationOutcome(result) {
   }
 
   const coverage = telegramInputDeliveryCoverage(result);
-  if (!['committed', 'committed_effect'].includes(acknowledgement.state)) query.unfinished = true;
+  if (acknowledgement.state !== 'committed') query.unfinished = true;
   const persisted = await Message.updateOne(query, {
     $set: {
       ...(['committed', 'committed_effect'].includes(acknowledgement.state)
@@ -81,18 +86,22 @@ async function persistPresentationOutcome(result) {
       ...(coverage ? { 'metadata.viventium.deliverySourceCoverage': coverage } : {}),
     },
   });
-  // A job receipt alone does not prove that its exact assistant projection was stored.
   const matchedCount = Number(persisted?.matchedCount ?? persisted?.n ?? 0);
   const modifiedCount = Number(persisted?.modifiedCount ?? persisted?.nModified ?? 0);
   if (matchedCount > 0 || modifiedCount > 0) return;
+
   if (['committed', 'committed_effect'].includes(acknowledgement.state)) {
-    const terminalQuery = { ...query, unfinished: false };
+    const terminalQuery = {
+      ...query,
+      unfinished: false,
+    };
     for (const [key, value] of Object.entries(acknowledgement)) {
       terminalQuery[`metadata.viventium.deliveryAcknowledgement.${key}`] = value;
     }
     const existing = await Message.findOne(terminalQuery).select('_id').lean();
     if (existing?._id) return;
   }
+
   const error = new Error('Exact assistant presentation state was not persisted');
   error.code = 'interaction_presentation_state_unmatched';
   throw error;
@@ -291,19 +300,47 @@ router.post('/delivery-ack', async (req, res) => {
   }
 
   try {
-    const result =
-      parsed.acknowledgement.source_kind === 'schedule_result'
-        ? await GenerationJobManager.acknowledgeServerCommittedTransportReceipt(
+    let result;
+    /* === VIVENTIUM START ===
+     * Feature: Restart-safe durable-effect delivery acknowledgement.
+     * Purpose: Commit exact Mongo authority before projecting Redis or terminal Message state.
+     */
+    if (parsed.acknowledgement.state === 'committed' && parsed.acknowledgement.effect_ref) {
+      result = await acknowledgeMongoDurableEffectDelivery(parsed.acknowledgement, adapterSurface);
+      if (result.status === 'recorded') {
+        try {
+          await GenerationJobManager.acknowledgeDurableEffectDelivery(
             parsed.acknowledgement,
             adapterSurface,
-          )
-        : await (parsed.cortexPresentation
-            ? GenerationJobManager.acknowledgeDelivery(
-                parsed.acknowledgement,
-                adapterSurface,
-                parsed.cortexPresentation,
-              )
-            : GenerationJobManager.acknowledgeDelivery(parsed.acknowledgement, adapterSurface));
+          );
+        } catch (error) {
+          logger.warn('[VIVENTIUM][interactions/delivery-ack] Redis projection unavailable', {
+            error: error?.name || 'Error',
+          });
+        }
+      }
+    } else {
+      result =
+        parsed.acknowledgement.source_kind === 'schedule_result'
+          ? await GenerationJobManager.acknowledgeServerCommittedTransportReceipt(
+              parsed.acknowledgement,
+              adapterSurface,
+            )
+          : await (parsed.cortexPresentation
+              ? GenerationJobManager.acknowledgeDelivery(
+                  parsed.acknowledgement,
+                  adapterSurface,
+                  parsed.cortexPresentation,
+                )
+              : GenerationJobManager.acknowledgeDelivery(parsed.acknowledgement, adapterSurface));
+      if (result.status === 'stale_revision' && parsed.acknowledgement.state === 'committed') {
+        result = await GenerationJobManager.acknowledgeDurableEffectDelivery(
+          parsed.acknowledgement,
+          adapterSurface,
+        );
+      }
+    }
+    /* === VIVENTIUM END === */
     if (result.status === 'recorded') {
       await persistPresentationOutcome(result);
       await persistTelegramTransportReceipt(result, adapterSurface);

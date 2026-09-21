@@ -1269,4 +1269,79 @@ describe('/api/viventium/calls', () => {
       status: 'ended',
     });
   });
+
+  test('denies an unavailable or revoked agent before creating any call authority', async () => {
+    const error = new Error('Voice assistant is unavailable');
+    error.status = 404;
+    error.code = 'no_route';
+    error.retryable = false;
+    mockAssertVoiceAgentAccess.mockRejectedValueOnce(error);
+    const app = require('express')();
+    app.use(express.json());
+    app.use('/api/viventium/calls', require('../calls'));
+    const response = await request(app)
+      .post('/api/viventium/calls')
+      .send({ conversationId: 'new', agentId: 'agent_foreign' });
+
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({
+      code: 'no_route',
+      message: 'Voice assistant is unavailable.',
+      retryable: false,
+    });
+    expect(mockAssertVoiceAgentAccess).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: 'agent_foreign' }),
+    );
+    expect(
+      require('~/server/services/viventium/CallSessionService').createCallSession,
+    ).not.toHaveBeenCalled();
+  });
+
+  test('authorizes the persisted conversation agent after override and denies a revoked route', async () => {
+    require('~/models').getConvo.mockResolvedValueOnce({ agent_id: 'agent_revoked' });
+    const error = new Error('Voice assistant is unavailable');
+    error.status = 404;
+    error.code = 'no_route';
+    mockAssertVoiceAgentAccess.mockRejectedValueOnce(error);
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', require('../calls'));
+    const response = await request(app).post('/api/viventium/calls').send({
+      conversationId: 'conversation-existing',
+      agentId: 'agent_accessible_decoy',
+    });
+
+    expect(response.status).toBe(404);
+    expect(mockAssertVoiceAgentAccess).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: 'agent_revoked' }),
+    );
+    expect(
+      require('~/server/services/viventium/CallSessionService').createCallSession,
+    ).not.toHaveBeenCalled();
+  });
+
+  test('exchanges a one-time launch header without caching or echoing it', async () => {
+    const response = await request(
+      require('express')().use('/api/viventium/calls', require('../calls')),
+    )
+      .post('/api/viventium/calls/call_session_test/browser-capability/exchange')
+      .set('X-VIVENTIUM-CALL-SECRET', 'secret')
+      .set('X-VIVENTIUM-CALL-LAUNCH', 'L'.repeat(43))
+      .set('X-VIVENTIUM-CALL-LAUNCH-IDEMPOTENCY', 'I'.repeat(43))
+      .send({ viventiumCallLaunch: 'body-must-be-ignored' });
+
+    expect(response.status).toBe(200);
+    expect(response.headers['cache-control']).toBe('no-store, private');
+    expect(response.headers.pragma).toBe('no-cache');
+    expect(response.body).toEqual({
+      version: 1,
+      callSessionId: 'call_session_test',
+      browserCapability: 'N'.repeat(43),
+      expiresAt: '2026-08-09T22:00:00.000Z',
+    });
+    expect(
+      require('~/server/services/viventium/CallSessionService').exchangeCallBrowserLaunch,
+    ).toHaveBeenCalledWith('call_session_test', 'L'.repeat(43), 'I'.repeat(43));
+    expect(JSON.stringify(response.body)).not.toContain('L'.repeat(43));
+  });
 });

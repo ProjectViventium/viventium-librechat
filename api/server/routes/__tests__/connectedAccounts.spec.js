@@ -1,3 +1,7 @@
+/* === VIVENTIUM START ===
+ * Feature: Connected-account safety regression coverage.
+ * Purpose: Keep fork-specific OAuth attempt fencing protected during upstream replay.
+ */
 const express = require('express');
 const crypto = require('crypto');
 const request = require('supertest');
@@ -692,3 +696,4 @@ describe('Connected Accounts Routes', () => {
     expect(global.fetch).not.toHaveBeenCalled();
   });
 });
+/* === VIVENTIUM END === */

@@ -1,10 +1,8 @@
 const { isEnabled } = require('@librechat/api');
-/* === VIVENTIUM START === Shared title-only conditional persistence. === */
-const { logger, saveGeneratedConversationTitle } = require('@librechat/data-schemas');
-const { Conversation } = require('~/db/models');
-/* === VIVENTIUM END === */
+const { logger } = require('@librechat/data-schemas');
 const { CacheKeys } = require('librechat-data-provider');
 const getLogStores = require('~/cache/getLogStores');
+const { saveConvo } = require('~/models');
 const buildFallbackTitle = require('~/server/utils/buildFallbackTitle');
 const { getTrustedInteractionContext } = require('~/server/services/viventium/interactionContext');
 const {
@@ -29,83 +27,65 @@ const addTitle = async (req, { text, response, client }) => {
     return;
   }
 
+  if (typeof client?.titleConvo !== 'function') return;
   const titleCache = getLogStores(CacheKeys.GEN_TITLE);
   const key = `${req.user.id}-${response.conversationId}`;
   /** @type {NodeJS.Timeout} */
   let timeoutId;
   const fallbackTitle = buildFallbackTitle(text);
-  /* === VIVENTIUM START === All generation outcomes share one durable title owner. === */
+  const abortController = new AbortController();
   let title = fallbackTitle;
-  /* === VIVENTIUM END === */
+  let modelGeneratedTitle = false;
   try {
     const timeoutPromise = new Promise((_, reject) => {
       timeoutId = setTimeout(() => reject(new Error('Title generation timeout')), 45000);
     });
 
-    let titlePromise;
-    const abortController = new AbortController();
-    if (client && typeof client.titleConvo === 'function') {
-      titlePromise = Promise.race([
-        client.titleConvo({
-          text,
-          abortController,
-        }),
-        timeoutPromise,
-      ]);
+    const generated = await Promise.race([
+      client.titleConvo({ text, abortController }),
+      timeoutPromise,
+    ]);
+    if (generated) {
+      title = generated;
+      modelGeneratedTitle = true;
     } else {
-      return;
-    }
-
-    title = await titlePromise;
-    const modelGeneratedTitle = Boolean(title);
-    if (!abortController.signal.aborted) {
-      abortController.abort();
-    }
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-
-    if (!title) {
       logger.debug(`[${key}] No title generated, using fallback title`);
-      title = fallbackTitle;
-    }
-
-    const interaction = getTrustedInteractionContext(req);
-    if (
-      modelGeneratedTitle &&
-      req?.body?.voiceMode === true &&
-      req?.body?.viventiumCallSessionId &&
-      interaction?.surface === 'voice' &&
-      interaction?.logical_turn_id &&
-      response?.conversationId
-    ) {
-      await recordVoiceOrchestrationTraceBestEffort({
-        ownerId: req.user?.id,
-        callSessionId: req.body.viventiumCallSessionId,
-        turnId: interaction.logical_turn_id,
-        eventRef: response.conversationId,
-        stage: 'title_model.completed',
-        facts: { effectCount: 1 },
-      });
     }
   } catch (error) {
     logger.warn('Error generating title, using fallback title:', error);
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-    title = fallbackTitle;
+  } finally {
+    if (!abortController.signal.aborted) abortController.abort();
+    if (timeoutId) clearTimeout(timeoutId);
   }
-  /* === VIVENTIUM START === A deleted or renamed conversation must survive late generation. === */
-  const savedTitle = await saveGeneratedConversationTitle(
-    Conversation,
-    req.user.id,
-    response.conversationId,
-    title,
+
+  const interaction = getTrustedInteractionContext(req);
+  if (
+    modelGeneratedTitle &&
+    req?.body?.voiceMode === true &&
+    req?.body?.viventiumCallSessionId &&
+    interaction?.surface === 'voice' &&
+    interaction?.logical_turn_id &&
+    response?.conversationId
+  ) {
+    await recordVoiceOrchestrationTraceBestEffort({
+      ownerId: req.user?.id,
+      callSessionId: req.body.viventiumCallSessionId,
+      turnId: interaction.logical_turn_id,
+      eventRef: response.conversationId,
+      stage: 'title_model.completed',
+      facts: { effectCount: 1 },
+    });
+  }
+
+  await saveConvo(
+    req,
+    { conversationId: response.conversationId, title },
+    {
+      context: 'api/server/services/Endpoints/agents/title.js',
+      ...(modelGeneratedTitle ? { noUpsert: true } : {}),
+    },
   );
-  if (savedTitle) {
-    await titleCache.set(key, savedTitle, 120000);
-  }
-  /* === VIVENTIUM END === */
+  await titleCache.set(key, title, 120000);
 };
 
 module.exports = addTitle;

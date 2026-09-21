@@ -35,13 +35,19 @@ const {
   attachConversationProviderBootstrapBundle,
   installConversationProviderCapabilityRefresher,
   bindConversationProviderDeveloperInstructionTail,
+  captureConversationProviderStableAuthority,
+  conversationProviderStableAuthorityDigest,
   bindHarnessCancellation,
   buildHarnessAgentIdempotencyKeys,
   buildHarnessAttemptIdempotencyKey,
   buildHarnessIdempotencyKey,
+  clearConversationProviderCapabilityBundle,
   configuredBrokerHostTools,
   configuredConversationOrchestrationWorkerRoute,
+  conversationProviderUsesLocalVisibleAccounting,
+  conversationProviderUsesInvocationLocalTime,
   declaredMcpServerNames,
+  resolveConversationProviderContextProtocol,
   resolveConversationProviderId,
   resolvedConversationOrchestrationToolNames,
   setConversationProviderCapability,
@@ -446,6 +452,94 @@ describe('GlassHiveConversationProviderService', () => {
     expect(resolveConversationProviderId({ provider: 'anthropic' })).toBe('anthropic');
   });
 
+  test('removes native broker bearer headers case-insensitively from presentation lanes', () => {
+    const targetAgent = {
+      model_parameters: {
+        configuration: {
+          defaultHeaders: {
+            'x-glasshive-bootstrap-bundle-b64': 'synthetic-bundle',
+            'X-GlassHive-Bootstrap-Timestamp': '123',
+            'x-GlassHive-Bootstrap-Signature': 'sha256=synthetic',
+            'X-GlassHive-Agent-Id': 'agent-main',
+          },
+        },
+      },
+    };
+
+    clearConversationProviderCapabilityBundle(targetAgent);
+
+    expect(targetAgent.model_parameters.configuration.defaultHeaders).toEqual({
+      'X-GlassHive-Agent-Id': 'agent-main',
+    });
+  });
+
+  test('resolves invocation-local provider behavior from structured capabilities', () => {
+    const req = {
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              'glasshive-harness': {
+                time_context_delivery: 'per_turn_header',
+                usage_accounting_scope: 'provider_request',
+                context_protocol: 'main_context_v1',
+              },
+              anthropic: {
+                time_context_delivery: 'developer',
+                usage_accounting_scope: 'visible_message_local',
+                context_protocol: 'legacy',
+              },
+            },
+          },
+        },
+      },
+    };
+
+    expect(conversationProviderUsesInvocationLocalTime(req, 'glasshive-harness')).toBe(true);
+    expect(conversationProviderUsesInvocationLocalTime(req, { provider: 'anthropic' })).toBe(false);
+    expect(conversationProviderUsesLocalVisibleAccounting(req, { provider: 'anthropic' })).toBe(
+      true,
+    );
+    expect(resolveConversationProviderContextProtocol(req, 'glasshive-harness')).toBe(
+      'main_context_v1',
+    );
+  });
+
+  test('binds stable authority independently from per-turn runtime state', () => {
+    const makeAgent = () => ({
+      id: 'synthetic-main',
+      provider: 'glasshive-harness',
+      model: 'codex-cli:synthetic',
+      instructions: 'Stable synthetic Main authority.',
+      tools: ['file_search'],
+      model_parameters: {
+        configuration: {
+          defaultHeaders: { 'X-GlassHive-Agent-Id': 'synthetic-main' },
+        },
+      },
+    });
+    const first = makeAgent();
+    const second = makeAgent();
+
+    expect(captureConversationProviderStableAuthority(first)).toBe(true);
+    expect(captureConversationProviderStableAuthority(second)).toBe(true);
+    first.instructions += '\n\nCurrent Feeling: calm.';
+    second.instructions += '\n\nCurrent Feeling: energetic.';
+
+    const firstDigest =
+      first.model_parameters.configuration.defaultHeaders['X-GlassHive-Stable-Authority-SHA256'];
+    expect(firstDigest).toMatch(/^[a-f0-9]{64}$/);
+    expect(
+      second.model_parameters.configuration.defaultHeaders['X-GlassHive-Stable-Authority-SHA256'],
+    ).toBe(firstDigest);
+    expect(
+      conversationProviderStableAuthorityDigest({
+        ...makeAgent(),
+        toolDefinitions: [{ name: 'file_search', description: 'Runtime schema.' }],
+      }),
+    ).toBe(conversationProviderStableAuthorityDigest(makeAgent()));
+  });
+
   test('switches harness execution flags from structured provider capabilities', () => {
     const req = {
       config: {
@@ -456,6 +550,11 @@ describe('GlassHiveConversationProviderService', () => {
                 activity_stream: true,
                 workspace_binding: true,
                 conversation_session: true,
+                time_context_delivery: 'per_turn_header',
+                usage_accounting_scope: 'visible_message_local',
+                context_protocol: 'legacy',
+                native_session_authority: 'none',
+                replay_protocol: 'legacy_message_count',
               },
               anthropic: {
                 activity_stream: false,
@@ -475,6 +574,7 @@ describe('GlassHiveConversationProviderService', () => {
       _viventiumHarnessActivityEnabled: true,
       _viventiumHarnessExecutionEnabled: true,
       viventiumTimeContextDelivery: 'per_turn_header',
+      viventiumUsageAccountingScope: 'visible_message_local',
     });
 
     expect(setConversationProviderCapability(req, 'anthropic')).toMatchObject({

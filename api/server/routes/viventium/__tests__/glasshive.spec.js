@@ -1576,6 +1576,56 @@ describe('/api/viventium/glasshive/callback', () => {
     );
   });
 
+  test('accepts failed terminal truth without overwriting an unfinished generation placeholder', async () => {
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'user-msg',
+        parentMessageId: 'previous-assistant',
+        text: 'Start worker.',
+        isCreatedByUser: true,
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'generation-placeholder',
+        parentMessageId: 'user-msg',
+        text: 'Generation in progress.',
+        unfinished: true,
+        isCreatedByUser: false,
+        createdAt: '2026-04-28T14:00:01.000Z',
+      },
+    ]);
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({
+      callback_id: 'cb_generation_placeholder_failed',
+      parent_message_id: 'user-msg',
+      message_id: 'generation-placeholder',
+      event: 'run.failed',
+      message: 'The worker hit a synthetic blocker.',
+    });
+    const req = createMockReq({
+      url: '/api/viventium/glasshive/callback',
+      headers: { 'x-glasshive-signature': signature(body) },
+      body,
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toEqual(
+      expect.objectContaining({ status: 'http_accepted', reason: 'conversation_tip_busy' }),
+    );
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockRecordGlassHiveCallbackExternalState).toHaveBeenCalledWith(
+      expect.objectContaining({ body: expect.objectContaining({ event: 'run.failed' }) }),
+    );
+    expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+      expect.objectContaining({ body: expect.objectContaining({ event: 'run.failed' }) }),
+    );
+  });
+
   test.each(['run.started', 'run.paused', 'run.requeued', 'run.capacity_waiting', 'run.stopping'])(
     'reconciles %s lifecycle truth before accepting it as non-conversational',
     async (event) => {
@@ -2316,7 +2366,7 @@ describe('/api/viventium/glasshive/callback', () => {
     );
   });
 
-  test('accepts failed terminal truth without overwriting an unfinished generation placeholder', async () => {
+  test('does not overwrite an unfinished generation placeholder for failed worker callbacks', async () => {
     mockGetMessages.mockResolvedValueOnce([
       {
         messageId: 'user-msg',
@@ -2353,15 +2403,10 @@ describe('/api/viventium/glasshive/callback', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(202);
-    expect(res.body).toEqual(
-      expect.objectContaining({ status: 'http_accepted', reason: 'conversation_tip_busy' }),
-    );
+    expect(res.body.reason).toBe('conversation_tip_busy');
     expect(mockSaveMessage).not.toHaveBeenCalled();
     expect(mockUpdateMessage).not.toHaveBeenCalled();
     expect(mockRecordGlassHiveCallbackExternalState).toHaveBeenCalledWith(
-      expect.objectContaining({ body: expect.objectContaining({ event: 'run.failed' }) }),
-    );
-    expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
       expect.objectContaining({ body: expect.objectContaining({ event: 'run.failed' }) }),
     );
   });

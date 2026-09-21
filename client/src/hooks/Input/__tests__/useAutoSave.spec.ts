@@ -5,6 +5,7 @@ import { getDraft, setDraft } from '~/utils/drafts';
 
 describe('pending conversation draft migration', () => {
   const canonicalConversationId = 'conversation-canonical';
+  const pendingConversationId = String(Constants.PENDING_CONVO);
 
   beforeAll(() => {
     Object.assign(globalThis, { TextEncoder, TextDecoder });
@@ -15,7 +16,7 @@ describe('pending conversation draft migration', () => {
   });
 
   it('does not resurrect an already-submitted pending draft after completion', () => {
-    setDraft({ id: Constants.PENDING_CONVO, value: 'already submitted' });
+    setDraft({ id: pendingConversationId, value: 'already submitted' });
     setDraft({ id: canonicalConversationId, value: 'older canonical draft' });
 
     migratePendingTextDraft(canonicalConversationId, '');
@@ -27,7 +28,7 @@ describe('pending conversation draft migration', () => {
   });
 
   it('preserves text that is still visibly being authored when generation completes', () => {
-    setDraft({ id: Constants.PENDING_CONVO, value: 'still typing' });
+    setDraft({ id: pendingConversationId, value: 'still typing' });
 
     migratePendingTextDraft(canonicalConversationId, 'still typing');
 

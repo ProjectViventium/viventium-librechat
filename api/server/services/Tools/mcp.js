@@ -326,6 +326,10 @@ async function reinitMCPServer({
         return oauthAuthorizationUnavailableResult(serverName);
       }
 
+      if (suppressOAuthFlow && serverRequiresOAuth && isOAuthError) {
+        return oauthAuthorizationUnavailableResult(serverName);
+      }
+
       const isOAuthFlowInitiated = err.message === 'OAuth flow initiated - return early';
 
       if (

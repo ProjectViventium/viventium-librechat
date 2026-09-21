@@ -38,6 +38,12 @@ interface DeploymentAvailabilityInFlight {
   promise: Promise<boolean>;
 }
 
+interface ReleaseGateAsyncCache {
+  fingerprint: string;
+  value: ParallelWorkReleaseGate;
+  checkedAtMs: number;
+}
+
 interface ArtifactIdentityFacts {
   shapeValid: boolean;
   sourcePass: boolean;
@@ -114,6 +120,11 @@ const RELEASE_GATE_WORKER_ACTION = 'viventium.parallel-work.release-gate.v1';
 const RELEASE_GATE_WORKER_TIMEOUT_MS = 135_000;
 const RELEASE_GATE_FAST_READ_MAX_BYTES = 1_048_576;
 const DEPLOYMENT_AVAILABILITY_REFRESH_MS = 5 * 60_000;
+let releaseGateAsyncCache: ReleaseGateAsyncCache | null = null;
+let releaseGateAsyncInFlight: {
+  fingerprint: string;
+  promise: Promise<ParallelWorkReleaseGate>;
+} | null = null;
 const RELEASE_GATE_WORKER_ENVIRONMENT_KEYS = Object.freeze([
   'CONFIG_PATH',
   'VIVENTIUM_LIBRECHAT_CONFIG_PATH',
@@ -1843,7 +1854,17 @@ function normalizedWorkerReleaseGate(value: unknown): ParallelWorkReleaseGate | 
 
 export function parallelWorkReleaseGateSnapshotAsync(): Promise<ParallelWorkReleaseGate> {
   if (nativeRuntimeRequested()) return loadNativeIdentity().then(nativeReleaseGate);
-  return new Promise((resolve) => {
+  const fingerprint = releaseGateInputsFingerprint();
+  if (
+    releaseGateAsyncCache?.fingerprint === fingerprint &&
+    Date.now() - releaseGateAsyncCache.checkedAtMs < DEPLOYMENT_AVAILABILITY_REFRESH_MS
+  ) {
+    return Promise.resolve(permitReleaseGateReuse({ ...releaseGateAsyncCache.value }));
+  }
+  if (releaseGateAsyncInFlight?.fingerprint === fingerprint) {
+    return releaseGateAsyncInFlight.promise.then((value) => permitReleaseGateReuse({ ...value }));
+  }
+  const promise: Promise<ParallelWorkReleaseGate> = new Promise<ParallelWorkReleaseGate>((resolve) => {
     let worker: WorkerThread;
     try {
       const env = Object.fromEntries(
@@ -1882,7 +1903,39 @@ export function parallelWorkReleaseGateSnapshotAsync(): Promise<ParallelWorkRele
     });
     watchdog = setTimeout(failClosed, RELEASE_GATE_WORKER_TIMEOUT_MS);
     watchdog.unref();
+  }).then((value) => {
+    if (releaseGateInputsFingerprint() !== fingerprint) {
+      releaseGateAsyncCache = null;
+      return unavailableWorkerReleaseGate();
+    }
+    releaseGateAsyncCache = { fingerprint, value, checkedAtMs: Date.now() };
+    return value;
+  }).finally(() => {
+    if (releaseGateAsyncInFlight?.promise === promise) releaseGateAsyncInFlight = null;
   });
+  releaseGateAsyncInFlight = { fingerprint, promise };
+  return promise.then((value) => permitReleaseGateReuse({ ...value }));
+}
+
+function releaseGateInputsFingerprint(): string {
+  const validatedExposure = rawReleaseSnapshotExposureFingerprint();
+  const environment = RELEASE_GATE_WORKER_ENVIRONMENT_KEYS.map(
+    (key) => [key, process.env[key] || ''],
+  );
+  if (validatedExposure) return sha256Text(`${validatedExposure}\0${JSON.stringify(environment)}`);
+  // Missing, malformed, stale, or revoked inputs still need a stable key so a known
+  // unavailable result does not start another validation worker on every request.
+  let snapshot = Buffer.alloc(0);
+  try {
+    snapshot = fs.readFileSync(configuredReleaseSnapshotPath());
+  } catch (_error) {
+    // The absent file has its own stable fingerprint.
+  }
+  return sha256Text(Buffer.concat([
+    Buffer.from('unexposed\0'),
+    snapshot,
+    Buffer.from(`\0${JSON.stringify(environment)}`),
+  ]));
 }
 
 function rawReleaseSnapshotExposureFingerprint(): string {
@@ -1951,7 +2004,24 @@ function rawReleaseSnapshotExposureFingerprint(): string {
     }
     const ownerText = fs.readFileSync(exactOwnerPath);
     if (sha256Text(ownerText) !== projection.ownerStateSha256) return '';
-    process.kill(Number(projection.ownerPid), 0);
+    const pid = String(projection.ownerPid);
+    process.kill(Number(pid), 0);
+    const startedAt = normalizedProcessValue(
+      execFileSync('ps', ['-p', pid, '-o', 'lstart='], { encoding: 'utf8' }),
+    );
+    const command = normalizedProcessValue(
+      execFileSync('ps', ['-p', pid, '-o', 'command='], { encoding: 'utf8' }),
+    );
+    const cwdLines = String(execFileSync('/usr/sbin/lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], {
+      encoding: 'utf8',
+    })).split('\n').filter((line) => line.startsWith('n') && line.length > 1);
+    if (
+      cwdLines.length !== 1 ||
+      startedAt !== normalizedProcessValue(projection.ownerProcessStartedAt) ||
+      command !== normalizedProcessValue(JSON.parse(ownerText.toString('utf8')).ownerProcessCommand) ||
+      sha256Text(command) !== projection.ownerProcessCommandSha256 ||
+      sha256Text(fs.realpathSync(cwdLines[0].slice(1))) !== projection.ownerProcessCwdSha256
+    ) return '';
     return sha256Text(Buffer.concat([contents, Buffer.from([0]), ownerText]));
   } catch (_error) {
     return '';

@@ -108,6 +108,7 @@ const helperRoot = path.join(ownerRepo, 'apps', 'macos', 'ViventiumHelper');
 const helperSourceFiles = [
   'Package.swift',
   'Sources/ViventiumHelper/ViventiumHelperApp.swift',
+  'Sources/ViventiumHelper/LifeSetup.swift',
   'Sources/ViventiumHelper/Resources/Info.plist',
 ];
 for (const relative of helperSourceFiles) {
@@ -138,6 +139,10 @@ fs.mkdirSync(path.dirname(installedGateScript), { recursive: true });
 fs.copyFileSync(
   path.join(productionRoot, 'scripts', 'viventium', 'parallel_work_release_gate.py'),
   installedGateScript,
+);
+fs.copyFileSync(
+  path.join(productionRoot, 'scripts', 'viventium', 'helper_artifact_verify.py'),
+  path.join(path.dirname(installedGateScript), 'helper_artifact_verify.py'),
 );
 fs.chmodSync(installedGateScript, 0o755);
 const installedGateSource = fs.readFileSync(installedGateScript, 'utf8');

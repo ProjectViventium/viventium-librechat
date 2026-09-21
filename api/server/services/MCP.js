@@ -1,4 +1,4 @@
-const { tool } = require('@librechat/agents/langchain/tools');
+const { tool } = require('@langchain/core/tools');
 const { logger } = require('@librechat/data-schemas');
 const {
   Providers,
@@ -39,12 +39,12 @@ const { getLogStores } = require('~/cache');
  * without relying on the chat model to choose connected-account tools.
  * === VIVENTIUM END === */
 const {
-  isGlassHiveLaunchTool,
   maybeInjectGlassHiveCapabilityBroker,
 } = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
 const {
-  markCallbackBackedVoiceContinuation,
-} = require('~/server/services/viventium/GlassHiveDispatchContinuationService');
+  markGlassHiveLaunchDispatchUnknown,
+  reconcileGlassHiveLaunchResult,
+} = require('~/server/services/viventium/GlassHiveCallbackBindingService');
 
 /* === VIVENTIUM START ===
  * Feature: Deep Telegram timing instrumentation (toggleable)
@@ -557,6 +557,7 @@ function createToolInstance({
     let abortHandler = null;
     /** @type {AbortSignal} */
     let derivedSignal = null;
+    let effectiveToolArguments = null;
 
     try {
       const flowsCache = getLogStores(CacheKeys.FLOWS);
@@ -593,7 +594,7 @@ function createToolInstance({
       const customUserVars =
         config?.configurable?.userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
 
-      const effectiveToolArguments = await maybeInjectGlassHiveCapabilityBroker({
+      effectiveToolArguments = await maybeInjectGlassHiveCapabilityBroker({
         serverName,
         toolName,
         toolArguments,
@@ -623,18 +624,10 @@ function createToolInstance({
         graphTokenResolver: getGraphApiToken,
       });
 
-      const requestBody = config?.configurable?.requestBody;
-      if (
-        isGlassHiveLaunchTool({ serverName, toolName }) &&
-        requestBody?.voiceMode === true &&
-        typeof requestBody?.viventiumVoiceTaskId === 'string'
-      ) {
-        await markCallbackBackedVoiceContinuation({
-          result,
-          requestBody,
-          continuationKey: config?.toolCall?.id || stepId,
-        });
-      }
+      await reconcileGlassHiveLaunchResult({
+        toolArguments: effectiveToolArguments,
+        result,
+      });
 
       if (isAssistantsEndpoint(provider) && Array.isArray(result)) {
         return result[0];
@@ -644,6 +637,15 @@ function createToolInstance({
       }
       return result;
     } catch (error) {
+      if (effectiveToolArguments) {
+        try {
+          await markGlassHiveLaunchDispatchUnknown(effectiveToolArguments);
+        } catch (reconcileError) {
+          logger.warn('[VIVENTIUM][glasshive-binding] Failed to mark uncertain dispatch', {
+            message: reconcileError?.message,
+          });
+        }
+      }
       logger.error(
         `[MCP][${serverName}][${toolName}][User: ${userId}] Error calling MCP tool:`,
         error,

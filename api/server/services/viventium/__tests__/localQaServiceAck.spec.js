@@ -26,7 +26,7 @@ const createOptions = (overrides = {}) => {
     env: {
       VIVENTIUM_LOCAL_QA_CASE_ID: 'PWK-UC-016',
       VIVENTIUM_LOCAL_QA_SESSION_REF: 'qa_session_1',
-      VIVENTIUM_LOCAL_QA_CASE_TOKEN: 'synthetic-test-token',
+      VIVENTIUM_LOCAL_QA_CASE_TOKEN: 'private-token',
     },
     executable: '/runtime/node',
     fileSystem,
@@ -131,12 +131,12 @@ describe('localQaServiceAck', () => {
   test.each([
     {
       name: 'timeout',
-      spawn: () => ({ status: null, error: new Error('synthetic child failure') }),
+      spawn: () => ({ status: null, error: new Error('private child output') }),
     },
     {
       name: 'throw',
       spawn: () => {
-        throw new Error('synthetic helper failure');
+        throw new Error('private helper path and token');
       },
     },
   ])('redacts helper $name failures', ({ spawn }) => {

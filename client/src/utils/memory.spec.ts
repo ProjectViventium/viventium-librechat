@@ -1,10 +1,3 @@
-/**
- * === VIVENTIUM START ===
- * Feature: Revision-safe saved-memory reducer regression coverage.
- * Purpose: Prove optimistic artifacts cannot overwrite newer authoritative memory state.
- * === VIVENTIUM END ===
- */
-
 import type { MemoriesResponse, MemoryArtifact } from 'librechat-data-provider';
 import { handleMemoryArtifact } from './memory';
 

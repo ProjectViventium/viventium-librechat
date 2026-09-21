@@ -15,7 +15,7 @@ export type VoiceClassifierFaultControlState =
 export interface ILocalQaVoiceClassifierFaultControl extends Document {
   schemaVersion: 1;
   controlId: string;
-  caseId: 'MPV-061';
+  caseId: 'MPV-054';
   sessionRefHash: string;
   sessionCandidateDigest: string;
   caseTokenHash: string;

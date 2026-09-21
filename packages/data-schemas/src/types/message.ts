@@ -5,6 +5,17 @@ import type { NativeResponseAdmission } from './nativeResponse';
 import type { TFeedbackRating, TFeedbackTag } from 'librechat-data-provider';
 import type { IPersonalAccountCleanupTombstone } from './personalAccountCleanupTombstone';
 
+export type MemoryWriteStatus = 'pending' | 'running' | 'completed' | 'failed';
+
+export interface ISavedMemoryWrite {
+  owner: string;
+  status: MemoryWriteStatus;
+  admittedAt?: Date;
+  startedAt?: Date;
+  finishedAt?: Date;
+  heartbeatAt?: Date;
+}
+
 // @ts-ignore
 export interface IMessage extends Document {
   messageId: string;

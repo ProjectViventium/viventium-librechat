@@ -53,8 +53,11 @@ const {
   createMessageDeltaBoundaryNormalizer,
 } = require('~/server/services/viventium/voiceDeltaAggregation');
 const {
+  markMainProviderAttemptEnd,
   markMainProviderAttemptStart,
   markMainProviderFirstOutput,
+  markMainToolEnd,
+  markMainToolStart,
 } = require('~/server/services/viventium/textTurnTiming');
 /* === VIVENTIUM END === */
 
@@ -377,12 +380,34 @@ const hasProviderStreamOutput = (data) => {
   );
 };
 
+const toolTimingInvocationId = (data, metadata) => {
+  const candidates = [
+    data?.id,
+    data?.run_id,
+    data?.runId,
+    data?.tool_call_id,
+    data?.toolCallId,
+    data?.output?.id,
+    data?.output?.tool_call_id,
+    data?.output?.toolCallId,
+    metadata?.tool_call_id,
+    metadata?.toolCallId,
+  ];
+  const identity = candidates.find(
+    (candidate) => typeof candidate === 'string' && candidate.trim().length > 0,
+  );
+  return identity?.trim() || null;
+};
+
 /* === VIVENTIUM START ===
  * Feature: Parallel text first-output timing.
  * Purpose: Recognize normalized reasoning content without treating empty compatibility deltas as output.
  */
 const hasReasoningDelta = (data) => {
   const content = data?.delta?.content;
+  if (typeof content === 'string') {
+    return content.length > 0;
+  }
   if (!Array.isArray(content)) {
     return false;
   }
@@ -393,9 +418,15 @@ const hasReasoningDelta = (data) => {
     if (!part || typeof part !== 'object') {
       return false;
     }
-    return [part.think, part.thinking, part.reasoning, part.reasoningText?.text].some(
-      (value) => typeof value === 'string' && value.length > 0,
-    );
+    return [
+      part.think,
+      part.thinking,
+      part.reasoning,
+      part.reasoningText?.text,
+      part.text,
+      part.output_text,
+      part.content,
+    ].some((value) => typeof value === 'string' && value.length > 0);
   });
 };
 /* === VIVENTIUM END === */
@@ -566,6 +597,47 @@ function checkIfLastAgent(last_agent_id, langgraph_node) {
     return false;
   }
   return langgraph_node?.endsWith(last_agent_id);
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Main-owned visible output with hidden sequential specialists.
+ * Purpose: `hide_sequential_outputs` must suppress specialist chatter without hiding the
+ * conscious Main answer merely because background agents appear later in the graph list.
+ * === VIVENTIUM END === */
+function checkIfMainAgent(main_agent_id, langgraph_node) {
+  if (!main_agent_id || !langgraph_node) {
+    return false;
+  }
+  return langgraph_node?.endsWith(main_agent_id);
+}
+
+function normalizedAgentId(value) {
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function visibleAgentIds(metadata) {
+  if (Array.isArray(metadata?.visible_agent_ids) && metadata.visible_agent_ids.length > 0) {
+    return metadata.visible_agent_ids.map(normalizedAgentId).filter(Boolean);
+  }
+  const declaredOwner =
+    normalizedAgentId(metadata?.visible_agent_id) ||
+    normalizedAgentId(metadata?.main_agent_id) ||
+    normalizedAgentId(metadata?.last_agent_id);
+  return declaredOwner ? [declaredOwner] : [];
+}
+
+function shouldEmitAgentOutput(metadata, eventAgentId = null) {
+  if (!metadata?.hide_sequential_outputs) {
+    return true;
+  }
+  const allowedAgentIds = visibleAgentIds(metadata);
+  if (eventAgentId && allowedAgentIds.length > 0) {
+    return allowedAgentIds.includes(eventAgentId);
+  }
+  if (allowedAgentIds.length > 0) {
+    return allowedAgentIds.some((agentId) => checkIfMainAgent(agentId, metadata?.langgraph_node));
+  }
+  return checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node);
 }
 
 /**
@@ -770,7 +842,44 @@ function getDefaultHandlers({
     );
     tracePreview('emit_returned');
   };
+  /* === VIVENTIUM START ===
+   * Feature: Exact visible-agent ownership under parallel graph execution.
+   * Purpose: The upstream graph runner reuses mutable runnable metadata while source components
+   * execute in parallel. Run-step payloads keep the exact structured agent identity, so bind later
+   * text/reasoning deltas to that step instead of trusting a raced `langgraph_node` string.
+   * === VIVENTIUM END === */
+  const agentIdByStepId = new Map();
+  const groupIdByStepId = new Map();
+  const eventStepId = (data) => normalizedAgentId(data?.result?.id) || normalizedAgentId(data?.id);
+  const bindEventAgentId = (data) => {
+    const stepId = eventStepId(data);
+    const agentId =
+      normalizedAgentId(data?.agentId) ||
+      normalizedAgentId(data?.agent_id) ||
+      normalizedAgentId(data?.result?.agentId) ||
+      normalizedAgentId(data?.result?.agent_id);
+    if (stepId && agentId) {
+      agentIdByStepId.set(stepId, agentId);
+    }
+    const groupId = data?.result?.groupId ?? data?.groupId;
+    if (stepId && groupId != null) {
+      groupIdByStepId.set(stepId, groupId);
+    }
+    return agentId || (stepId ? agentIdByStepId.get(stepId) || null : null);
+  };
+  const eventGroupId = (data) => {
+    const stepId = eventStepId(data);
+    return data?.result?.groupId ?? data?.groupId ?? (stepId ? groupIdByStepId.get(stepId) : null);
+  };
   const modelEndHandler = new ModelEndHandler(collectedUsage, req);
+  const toolEndHandler = new ToolEndHandler(toolEndCallback, logger);
+  const recordPassiveTextTiming = (record) => {
+    try {
+      return record();
+    } catch {
+      return null;
+    }
+  };
   /* === VIVENTIUM END === */
   const handlers = {
     /* === VIVENTIUM START ===
@@ -920,11 +1029,34 @@ function getDefaultHandlers({
         if (!Array.isArray(data?.output?.tool_calls) || data.output.tool_calls.length === 0) {
           await emitAuthoredPreview(null, metadata, true);
         }
+        const toolCallCount = Array.isArray(data?.output?.tool_calls)
+          ? data.output.tool_calls.length
+          : 0;
+        recordPassiveTextTiming(() => markMainProviderAttemptEnd(req, metadata, { toolCallCount }));
         return modelEndHandler.handle(event, data, metadata, graph);
       },
     },
     /* === VIVENTIUM END === */
-    [GraphEvents.TOOL_END]: new ToolEndHandler(toolEndCallback, logger),
+    [GraphEvents.TOOL_START]: {
+      handle: async (_event, data, metadata) => {
+        recordPassiveTextTiming(() =>
+          markMainToolStart(req, metadata, {
+            toolInvocationId: toolTimingInvocationId(data, metadata),
+          }),
+        );
+      },
+    },
+    [GraphEvents.TOOL_END]: {
+      handle: async (...args) => {
+        const [, data, metadata] = args;
+        recordPassiveTextTiming(() =>
+          markMainToolEnd(req, metadata, {
+            toolInvocationId: toolTimingInvocationId(data, metadata),
+          }),
+        );
+        return toolEndHandler.handle(...args);
+      },
+    },
     [GraphEvents.ON_RUN_STEP]: {
       /**
        * Handle ON_RUN_STEP event.
@@ -933,6 +1065,7 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
+        const eventAgentId = bindEventAgentId(data);
         const runStepMetric = markVoiceOrchEvent(req, 'on_run_step');
         if (runStepMetric?.firstSeen) {
           logVoiceLatencyStage(
@@ -970,9 +1103,7 @@ function getDefaultHandlers({
         }
         if (data?.stepDetails.type === StepTypes.TOOL_CALLS) {
           await emitEvent(res, streamId, { event, data });
-        } else if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitEvent(res, streamId, { event, data });
-        } else if (!metadata?.hide_sequential_outputs) {
+        } else if (shouldEmitAgentOutput(metadata, eventAgentId)) {
           await emitEvent(res, streamId, { event, data });
         } else {
           const agentName = metadata?.name ?? 'Agent';
@@ -997,6 +1128,7 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
+        const eventAgentId = bindEventAgentId(data);
         const runStepDeltaMetric = markVoiceOrchEvent(req, 'on_run_step_delta');
         if (runStepDeltaMetric?.firstSeen) {
           logVoiceLatencyStage(
@@ -1008,9 +1140,7 @@ function getDefaultHandlers({
         }
         if (data?.delta.type === StepTypes.TOOL_CALLS) {
           await emitEvent(res, streamId, { event, data });
-        } else if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitEvent(res, streamId, { event, data });
-        } else if (!metadata?.hide_sequential_outputs) {
+        } else if (shouldEmitAgentOutput(metadata, eventAgentId)) {
           await emitEvent(res, streamId, { event, data });
         }
         aggregateContent({ event, data });
@@ -1024,6 +1154,7 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
+        const eventAgentId = bindEventAgentId(data);
         const runStepCompletedMetric = markVoiceOrchEvent(req, 'on_run_step_completed');
         if (runStepCompletedMetric?.firstSeen) {
           logVoiceLatencyStage(
@@ -1056,9 +1187,7 @@ function getDefaultHandlers({
         }
         if (data?.result != null) {
           await emitEvent(res, streamId, { event, data });
-        } else if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitEvent(res, streamId, { event, data });
-        } else if (!metadata?.hide_sequential_outputs) {
+        } else if (shouldEmitAgentOutput(metadata, eventAgentId)) {
           await emitEvent(res, streamId, { event, data });
         }
         aggregateContent({ event, data });
@@ -1072,6 +1201,7 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
+        const eventAgentId = bindEventAgentId(data);
         if (hasVisibleMessageDelta(data)) await emitAuthoredPreview(null, metadata, true);
         /* === VIVENTIUM START ===
          * Feature: Parallel text first-visible-output timing.
@@ -1099,7 +1229,7 @@ function getDefaultHandlers({
           timingEnabled &&
           req &&
           req._viventiumFirstDeltaLogged === false &&
-          checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)
+          shouldEmitAgentOutput(metadata, eventAgentId)
         ) {
           req._viventiumFirstDeltaLogged = true;
           logDeepTiming(req, 'model_first_delta');
@@ -1109,8 +1239,7 @@ function getDefaultHandlers({
           voiceLatencyEnabled &&
           req &&
           req._viventiumVoiceFirstMessageDeltaLogged === false &&
-          (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node) ||
-            !metadata?.hide_sequential_outputs)
+          shouldEmitAgentOutput(metadata, eventAgentId)
         ) {
           req._viventiumVoiceFirstMessageDeltaLogged = true;
           const processStreamStartAt = getVoiceProcessStreamStartAt(req);
@@ -1122,11 +1251,16 @@ function getDefaultHandlers({
             `delta_parts=${deltaCount}`,
           );
         }
-        const shouldEmitLastAgent = checkIfLastAgent(
-          metadata?.last_agent_id,
-          metadata?.langgraph_node,
-        );
-        const shouldEmit = shouldEmitLastAgent || !metadata?.hide_sequential_outputs;
+        const shouldEmit = shouldEmitAgentOutput(metadata, eventAgentId);
+        const shouldMarkUnownedVisible =
+          shouldEmit &&
+          !eventAgentId &&
+          metadata?.hide_sequential_outputs === true &&
+          visibleAgentIds(metadata).length > 0;
+        const sourceStepId =
+          metadata?.hide_sequential_outputs === true && visibleAgentIds(metadata).length > 0
+            ? eventStepId(data)
+            : null;
         const emitStartedAt = shouldEmit ? voiceLatencyNow() : null;
         const normalizedEvent = normalizeMessageDeltaAtBoundary({ event, data });
         const eventData = { event: normalizedEvent.event, data: normalizedEvent.data };
@@ -1135,7 +1269,16 @@ function getDefaultHandlers({
          * Purpose: Track whether a streamed delta was actually visible to the user so later repair
          * logic can avoid duplicate Telegram/voice/chat callback delivery.
          */
-        const aggregateEventData = { ...eventData, visibleToUser: shouldEmit };
+        const aggregateEventData = {
+          ...eventData,
+          visibleToUser: shouldEmit,
+          viventiumContentMeta: {
+            agentId: eventAgentId,
+            groupId: eventGroupId(data) ?? null,
+            ...(sourceStepId ? { sourceStepId } : {}),
+            ...(shouldMarkUnownedVisible ? { unownedVisible: true } : {}),
+          },
+        };
         /* === VIVENTIUM END === */
 
         if (shouldEmit) {
@@ -1155,7 +1298,9 @@ function getDefaultHandlers({
             );
           }
         }
-        aggregateContent(aggregateEventData);
+        if (shouldEmit) {
+          aggregateContent(aggregateEventData);
+        }
       },
     },
     [GraphEvents.ON_REASONING_DELTA]: {
@@ -1166,6 +1311,7 @@ function getDefaultHandlers({
        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
        */
       handle: async (event, data, metadata) => {
+        const eventAgentId = bindEventAgentId(data);
         /* === VIVENTIUM START ===
          * Feature: Parallel text first-output timing.
          * Purpose: Normalized reasoning is real provider output even before visible answer text.
@@ -1179,7 +1325,7 @@ function getDefaultHandlers({
          * Purpose: GlassHive emits normalized activity through the reasoning channel before
          * ordinary text. Treat that first accepted delta as the authoring-run commit point.
          * === VIVENTIUM END === */
-        if (req?._viventiumHarnessExecutionEnabled === true) {
+        if (req?._viventiumHarnessExecutionEnabled === true && hasReasoningDelta(data)) {
           req._viventiumHarnessInvocationStarted = true;
         }
         const reasoningMetric = markVoiceOrchEvent(req, 'on_reasoning_delta');
@@ -1194,7 +1340,7 @@ function getDefaultHandlers({
           timingEnabled &&
           req &&
           req._viventiumFirstThinkingDeltaLogged === false &&
-          checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)
+          shouldEmitAgentOutput(metadata, eventAgentId)
         ) {
           req._viventiumFirstThinkingDeltaLogged = true;
           logDeepTiming(req, 'model_first_thinking_delta');
@@ -1223,14 +1369,15 @@ function getDefaultHandlers({
         if (req?._viventiumHarnessActivityEnabled === true) {
           captureHarnessActivityParts(req, visibleData, data);
         }
-        if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitEvent(res, streamId, { event, data: visibleData });
-        } else if (!metadata?.hide_sequential_outputs) {
+        const shouldEmit = shouldEmitAgentOutput(metadata, eventAgentId);
+        if (shouldEmit) {
           await emitEvent(res, streamId, { event, data: visibleData });
         }
         // The closed upstream aggregator understands THINK only. Persisted content is converted
         // to HARNESS_ACTIVITY at AgentClient's provider-aware finalization seam.
-        aggregateContent({ event, data });
+        if (shouldEmit) {
+          aggregateContent({ event, data });
+        }
       },
     },
   };

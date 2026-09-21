@@ -24,7 +24,6 @@ describe('voice engagement classifier', () => {
   const runSemanticClassification = jest.fn();
   const createVoiceEngagementAttestation = jest.fn();
   const getCallSessionVoiceSettings = jest.fn();
-  const getVoiceClassifierFaultControlContext = jest.fn(() => ({}));
   const listSpeakerSegments = jest.fn();
   const matchesCanonicalVoiceOwnerUtterance = jest.fn(() => true);
   const recordVoiceOrchestrationTrace = jest.fn();
@@ -39,7 +38,6 @@ describe('voice engagement classifier', () => {
       createVoiceEngagementAttestation,
       finalizedOwnerSpeakerAuthority,
       getCallSessionVoiceSettings,
-      getVoiceClassifierFaultControlContext,
       latestPersistedVoiceTurnAuthority,
       listSpeakerSegments,
       logger,
@@ -85,6 +83,7 @@ describe('voice engagement classifier', () => {
       expiresAtMs: 31_000,
       attestation: 'A'.repeat(43),
     });
+    runVoiceClassifierFaultControl.mockResolvedValue({ active: false });
   });
 
   const request = {
@@ -120,6 +119,15 @@ describe('voice engagement classifier', () => {
       directlyAddressed: true,
       revision: 2,
       utterance: 'Please help',
+    });
+    expect(runVoiceClassifierFaultControl).toHaveBeenCalledWith({
+      ownerId: 'owner-1',
+      callSessionId: 'call-1',
+      turnId: 'turn-1',
+      segments: [{ segmentId: 'segment-1', revision: 2 }],
+      utteranceHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      primary: { provider: 'xai', model: 'grok-4.5' },
+      fallback: { provider: 'anthropic', model: 'claude-opus-5' },
     });
   });
 

@@ -34,13 +34,16 @@ import {
   findConversationInInfinite,
 } from '~/utils';
 import { queueTitleGeneration } from '~/data-provider/SSE/queries';
-/* === VIVENTIUM START === Preserve new-chat title work after canonical ID settlement. === */
-import { shouldQueueCanonicalTitle } from './canonicalConversation';
-/* === VIVENTIUM END === */
 import useAttachmentHandler from '~/hooks/SSE/useAttachmentHandler';
 import useContentHandler from '~/hooks/SSE/useContentHandler';
 import useStepHandler from '~/hooks/SSE/useStepHandler';
 import { preserveTransientCortexState } from '~/hooks/SSE/viventiumTransientCortex';
+/* === VIVENTIUM START === Canonical new-chat title provenance === */
+import {
+  shouldQueueCanonicalTitle,
+  type CanonicalConversationSubmission,
+} from '~/hooks/SSE/canonicalConversation';
+/* === VIVENTIUM END === */
 import { useApplyAgentTemplate } from '~/hooks/Agents';
 import { useAuthContext } from '~/hooks/AuthContext';
 import { MESSAGE_UPDATE_INTERVAL } from '~/common';

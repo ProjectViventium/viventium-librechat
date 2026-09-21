@@ -31,6 +31,20 @@ const initializeMCPs = require('./services/initializeMCPs');
 const configureSocialLogins = require('./socialLogins');
 const { getAppConfig } = require('./services/Config');
 const { recoverStaleCortexMessages } = require('./services/viventium/staleCortexMessageRecovery');
+/* === VIVENTIUM START ===
+ * Feature: Durable Parallel Work recovery.
+ * Purpose: Resume mission adjudication and lost-launch reconciliation after API restart.
+ */
+const {
+  reconcilePendingGlassHiveMissionAdjudications,
+} = require('./services/viventium/GlassHiveMissionAdjudicationService');
+const {
+  reconcileGlassHiveSchedulerCallbackOutbox,
+} = require('./services/viventium/GlassHiveTerminalCallbackOutboxService');
+const {
+  startGlassHiveLaunchReconciliation,
+} = require('./services/viventium/GlassHiveLaunchReconciliationService');
+/* === VIVENTIUM END === */
 const staticCache = require('./utils/staticCache');
 const noIndex = require('./middleware/noIndex');
 const { seedDatabase } = require('~/models');
@@ -476,6 +490,14 @@ if (cluster.isMaster) {
         // Stream persistence is fully initialized before the listener opens.
         upgradeFinalization.recordCompleted('generation-runtime-ready');
         upgradeFinalization.markReady();
+        // Recovery writers run only after the required startup services are ready.
+        reconcilePendingGlassHiveMissionAdjudications().catch((error) => {
+          logger.error('[glasshiveMissionAdjudication] Startup recovery failed:', error);
+        });
+        reconcileGlassHiveSchedulerCallbackOutbox().catch((error) => {
+          logger.error('[glasshiveCallbackOutbox] Startup recovery failed:', error);
+        });
+        startGlassHiveLaunchReconciliation();
       } catch (startupError) {
         if (!upgradeFinalization.isArmed()) {
           throw startupError;

@@ -7,6 +7,7 @@ const {
   MAIN_DELEGATION_DESCRIPTION,
   MAIN_DELEGATION_JSON_SCHEMA,
   canonicalConversationOrchestrationArguments,
+  mainOrchestrationInvocationIdentity,
 } = require('../GlassHiveConversationOrchestration');
 
 describe('GlassHive conversation orchestration Active Work contract', () => {
@@ -119,6 +120,56 @@ describe('GlassHive conversation orchestration Active Work contract', () => {
     );
     expect(MAIN_DELEGATION_DESCRIPTION).toContain(
       'Never present an old artifact as a current delivery',
+    );
+  });
+
+  test('keeps exact tool-call reconstruction stable and sibling occurrences distinct', () => {
+    const requestBody = {
+      conversationId: 'conversation-1',
+      messageId: 'response-1',
+      viventiumSourceEventId: 'web:event-1',
+    };
+    const args = {
+      title: 'Synthetic mission',
+      instruction: 'Complete the synthetic objective.',
+      resourceClass: 'standard',
+    };
+    const identity = (trustedCallIdentity, overrides = {}) =>
+      mainOrchestrationInvocationIdentity({
+        userId: 'owner-1',
+        requestBody,
+        toolName: DELEGATION_TOOL_NAME,
+        args,
+        trustedCallIdentity,
+        ...overrides,
+      });
+
+    expect(identity('provider-call-a')).toBe(identity('provider-call-a'));
+    expect(identity('provider-call-a')).not.toBe(identity('provider-call-b'));
+    expect(identity('provider-call-a')).not.toBe(
+      identity('provider-call-a', { userId: 'owner-2' }),
+    );
+    expect(identity('provider-call-a')).not.toBe(
+      identity('provider-call-a', {
+        requestBody: { ...requestBody, messageId: 'response-2' },
+      }),
+    );
+    expect(identity('provider-call-a')).toBe(
+      mainOrchestrationInvocationIdentity({
+        userId: 'owner-1',
+        requestBody,
+        toolName: DELEGATION_TOOL_NAME,
+        args: { ...args, instruction: 'Corrupted reconstruction.' },
+        trustedCallIdentity: 'provider-call-a',
+      }),
+    );
+    expect(identity('')).not.toBe(
+      mainOrchestrationInvocationIdentity({
+        userId: 'owner-1',
+        requestBody,
+        toolName: DELEGATION_TOOL_NAME,
+        args: { ...args, instruction: 'A separate unbound objective.' },
+      }),
     );
   });
 });

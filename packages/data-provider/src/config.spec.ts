@@ -79,6 +79,7 @@ describe('agentsEndpointSchema provider capability policy', () => {
       activity_stream: false,
       responses_api: false,
       messaging_delivery_disposition: false,
+      message_delta_mode: 'incremental',
       default_access: 'workspace',
       allow_full_access: false,
       reviewed_mcp_projection: 'deferred',
@@ -299,6 +300,9 @@ describe('getEndpointField', () => {
 });
 
 describe('memorySchema', () => {
+  /* === VIVENTIUM START ===
+   * Preserve only explicitly authorized saved-memory fallback routes through runtime parsing.
+   */
   it('preserves an explicitly configured saved-memory fallback without changing the primary', () => {
     const parsed = memorySchema.parse({
       agent: {
@@ -334,7 +338,12 @@ describe('memorySchema', () => {
 
     expect(parsed.success).toBe(false);
   });
+  /* === VIVENTIUM END === */
 
+  /* === VIVENTIUM START ===
+   * Feature: Bounded Viventium memory context.
+   * Purpose: Keep configured memory reads aligned with the runtime token ceiling.
+   */
   it('defaults bounded memory reads to the same 8,000-token ceiling as the runtime', () => {
     const parsed = memorySchema.parse({
       agent: { provider: 'anthropic', model: 'claude-sonnet-4-5' },

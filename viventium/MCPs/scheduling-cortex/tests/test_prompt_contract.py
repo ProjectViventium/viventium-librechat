@@ -36,6 +36,8 @@ from scheduler_prompt_contract import (  # noqa: E402
 from scheduling_cortex.models import CreateScheduleArgs, UpdateScheduleArgs
 from scheduling_cortex.storage import ScheduleStorage, StorageConfig
 
+COMPILED_SCHEDULER_CONTRACT = callable(dispatch.load_scheduler_prompts)
+
 
 def _build_test_server(tmp_path: Path):
     storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / "schedules.db")))
@@ -298,12 +300,12 @@ def test_update_can_pause_failed_past_one_time_schedule(tmp_path: Path) -> None:
     assert result["task"]["active"] is False
 
 
+@pytest.mark.skipif(
+    not COMPILED_SCHEDULER_CONTRACT,
+    reason="exact registry rendering requires the compiled parent scheduler contract",
+)
 def test_registry_source_shared_artifact_and_runtime_scheduler_envelope_are_equal() -> None:
-    compiler = pytest.importorskip(
-        "scripts.viventium.prompt_registry",
-        reason="Cross-repository compiler parity requires Viventium Core on PYTHONPATH",
-    )
-    load_prompt_registry, render_prompt = compiler.load_prompt_registry, compiler.render_prompt
+    from scripts.viventium.prompt_registry import load_prompt_registry, render_prompt
 
     source_root = ROOT.parents[1] / "source_of_truth" / "prompts"
     registry_text = (source_root / "registry.yaml").read_text(encoding="utf-8")
@@ -569,9 +571,13 @@ def test_periphery_read_keeps_evidence_but_hides_internal_references() -> None:
 
 
 @pytest.mark.parametrize("prefix_mode", ["default", "custom", "legacy", "custom_alias"])
+@pytest.mark.skipif(
+    not COMPILED_SCHEDULER_CONTRACT,
+    reason="requires the compiled parent scheduler prompt contract",
+)
 def test_compose_uses_edited_compiled_policy_without_literal_reappend(tmp_path, monkeypatch, prefix_mode):
     import shutil
-    from prompt_bundle_fixture import build_prompt_bundle
+    from scripts.viventium.prompt_registry import build_prompt_bundle
 
     source_root = tmp_path / "prompts"
     shutil.copytree(ROOT.parents[1] / "source_of_truth" / "prompts" / "scheduler", source_root / "scheduler")
@@ -608,10 +614,14 @@ def test_compose_uses_edited_compiled_policy_without_literal_reappend(tmp_path, 
         assert composed.count("<!--viv_internal:brew_begin-->") == 1
 
 
+@pytest.mark.skipif(
+    not COMPILED_SCHEDULER_CONTRACT,
+    reason="requires the compiled parent scheduler prompt contract",
+)
 def test_compose_does_not_restore_an_include_removed_from_registered_default(tmp_path, monkeypatch):
-    from prompt_bundle_fixture import build_prompt_bundle
+    from scripts.viventium.prompt_registry import build_prompt_bundle
 
-    bundle = build_prompt_bundle()
+    bundle = build_prompt_bundle(ROOT.parents[1] / "source_of_truth" / "prompts")
     bundle["prompts"]["scheduler.run_envelope"]["metadata"]["includes"].remove(
         "scheduler.run_live_fact_contract"
     )
@@ -625,6 +635,10 @@ def test_compose_does_not_restore_an_include_removed_from_registered_default(tmp
     assert composed.count("- schedule_timezone: UTC") == 1
 
 
+@pytest.mark.skipif(
+    not COMPILED_SCHEDULER_CONTRACT,
+    reason="requires the compiled parent scheduler prompt contract",
+)
 def test_missing_compiled_prompt_is_classified_before_native_dispatch(monkeypatch):
     monkeypatch.delenv("VIVENTIUM_PROMPT_BUNDLE_PATH")
     with pytest.raises(ValueError) as error:
@@ -633,10 +647,43 @@ def test_missing_compiled_prompt_is_classified_before_native_dispatch(monkeypatc
     assert failure == {"error_class": "prompt_bundle_unavailable", "failure_retryable": False}
 
 
-def test_one_composition_keeps_one_bundle_when_file_changes_mid_turn(tmp_path, monkeypatch):
-    from prompt_bundle_fixture import build_prompt_bundle
+def test_compose_remains_compatible_with_the_public_static_shared_contract(monkeypatch):
+    public_prefix = "<!--viv_internal:brew_begin-->\n## Background Processing (Brewing)"
 
-    bundle = build_prompt_bundle()
+    def render_public_envelope(context: str) -> str:
+        return (
+            f"{public_prefix}\n\n{dispatch.SCHEDULED_RUN_CONTEXT_HEADER}\n"
+            f"{context}"
+        )
+
+    monkeypatch.delenv("SCHEDULER_PROMPT_PREFIX", raising=False)
+    monkeypatch.delenv("SCHEDULING_PROMPT_PREFIX", raising=False)
+    monkeypatch.setattr(dispatch, "load_scheduler_prompts", None)
+    monkeypatch.setattr(dispatch, "render_scheduler_prompt", None)
+    monkeypatch.setattr(
+        dispatch,
+        "render_scheduler_run_envelope",
+        render_public_envelope,
+    )
+
+    composed = dispatch._compose_prompt(
+        {"prompt": "Synthetic task."},
+        run_context={"schedule_timezone": "UTC"},
+    )
+
+    assert composed.startswith(public_prefix)
+    assert composed.count("- schedule_timezone: UTC") == 1
+    assert composed.endswith("Synthetic task.")
+
+
+@pytest.mark.skipif(
+    not COMPILED_SCHEDULER_CONTRACT,
+    reason="requires the compiled parent scheduler prompt contract",
+)
+def test_one_composition_keeps_one_bundle_when_file_changes_mid_turn(tmp_path, monkeypatch):
+    from scripts.viventium.prompt_registry import build_prompt_bundle
+
+    bundle = build_prompt_bundle(ROOT.parents[1] / "source_of_truth" / "prompts")
     path = tmp_path / "changing-bundle.json"
     path.write_text(json.dumps(bundle))
     monkeypatch.setenv("VIVENTIUM_PROMPT_BUNDLE_PATH", str(path))

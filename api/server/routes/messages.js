@@ -112,9 +112,7 @@ const sanitizeMessageForPublicResponse = (message) => {
 };
 
 const sanitizeMessageForRead = (message) => {
-  // The shared reader projects memory state; keep database identity fields out of HTTP reads.
-  const { _id, __v, user: _user, ...readableMessage } = message ?? {};
-  const normalizedMessage = normalizeHistoricalVoiceMessageForRead(readableMessage);
+  const normalizedMessage = normalizeHistoricalVoiceMessageForRead(message);
   const publicMessage = sanitizeMessageForPublicResponse(normalizedMessage);
   if (!publicMessage || !Array.isArray(publicMessage.content)) {
     return publicMessage;
@@ -408,7 +406,7 @@ router.post('/:conversationId', validateMessageReq, async (req, res) => {
     const savedMessage = await saveMessage(
       req,
       sanitizeMessageForPublicResponse({ ...message, user: req.user.id }),
-      { context: 'POST /api/messages/:conversationId', operationKind: 'edit' },
+      { context: 'POST /api/messages/:conversationId' },
     );
     if (!savedMessage) {
       return res.status(400).json({ error: 'Message not saved' });
@@ -442,11 +440,7 @@ router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) =
 
     if (index === undefined) {
       const tokenCount = await countTokens(text, model);
-      const result = await updateMessage(
-        req,
-        { messageId, text, tokenCount },
-        { operationKind: 'edit' },
-      );
+      const result = await updateMessage(req, { messageId, text, tokenCount });
       return res.status(200).json(sanitizeMessageForPublicResponse(result));
     }
 
@@ -489,7 +483,7 @@ router.put('/:conversationId/:messageId', validateMessageReq, async (req, res) =
       [`content.${index}.${currentPartType}`]: text,
       tokenCount,
     };
-    const result = await updateMessage(req, targetedUpdate, { operationKind: 'edit' });
+    const result = await updateMessage(req, targetedUpdate);
     return res.status(200).json(sanitizeMessageForPublicResponse(result));
   } catch (error) {
     logger.error('Error updating message:', error);

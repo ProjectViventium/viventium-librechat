@@ -503,7 +503,9 @@ async function deleteMemoryEntry(req, res) {
   /* === VIVENTIUM END === */
 }
 
+/* === VIVENTIUM START === Canonical collision-free entry routes plus legacy compatibility. === */
 router.delete('/entries/:key', checkMemoryDelete, deleteMemoryEntry);
 router.delete('/:key', checkMemoryDelete, deleteMemoryEntry);
+/* === VIVENTIUM END === */
 
 module.exports = router;

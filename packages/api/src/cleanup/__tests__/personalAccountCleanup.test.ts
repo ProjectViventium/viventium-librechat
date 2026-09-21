@@ -189,11 +189,10 @@ describe('personal account cleanup service', () => {
       kind: 'message',
       resourceId: 'message-1',
     });
-    const targetWithChangedBinding = {
+    const bound = cleanupTargetSha256(OWNER_ID, {
       ...requestFor(messageState()).target,
       stateSha256: HEX_B,
-    };
-    const bound = cleanupTargetSha256(OWNER_ID, targetWithChangedBinding);
+    });
 
     expect(bound).toBe(base);
   });

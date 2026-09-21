@@ -113,6 +113,8 @@ describe('viventium-sync-agents args', () => {
         instructions: 'do not overwrite this live prompt',
         tools: ['web_search'],
         recursion_limit: 40,
+        hide_sequential_outputs: true,
+        presentation_policy: 'primary_final',
         edges: [
           {
             from: 'main-agent',
@@ -125,6 +127,8 @@ describe('viventium-sync-agents args', () => {
 
     expect(update).toEqual({
       recursion_limit: 40,
+      hide_sequential_outputs: true,
+      presentation_policy: 'primary_final',
       edges: [
         {
           from: 'main-agent',

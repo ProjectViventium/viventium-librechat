@@ -157,12 +157,7 @@ const TOKEN_FIELDS = new Set([
   'usedProvider',
   'usedServiceTier',
 ]);
-const COUNT_MAP_FIELDS = new Set([
-  'absoluteDeltaCounts',
-  'causeCounts',
-  'deltaMagnitudeCounts',
-  'strengthCounts',
-]);
+const COUNT_MAP_FIELDS = new Set(['causeCounts', 'deltaMagnitudeCounts', 'strengthCounts']);
 /* This is deliberately a positive allowlist, not a blacklist. A new telemetry field must be
  * reviewed here before it can reach either the structured transport or the formatted log line. */
 const SAFE_FEELINGS_TELEMETRY_FIELDS = new Set([

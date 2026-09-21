@@ -221,6 +221,10 @@ export const agentBaseSchema = z.object({
   edges: z.array(graphEdgeSchema).optional(),
   end_after_tools: z.boolean().optional(),
   hide_sequential_outputs: z.boolean().optional(),
+  /* === VIVENTIUM START ===
+   * Feature: Typed multi-agent presentation ownership.
+   * Purpose: Primary-only output is opt-in and runtime-validated against the graph topology.
+   * === VIVENTIUM END === */
   presentation_policy: z.enum(['primary_final']).optional(),
   artifacts: z.string().optional(),
   recursion_limit: z.number().optional(),

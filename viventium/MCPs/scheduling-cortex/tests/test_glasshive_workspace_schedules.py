@@ -8,8 +8,6 @@ import sys
 import tempfile
 import time
 import unittest
-
-import pytest
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as wall_time
 from pathlib import Path
@@ -19,9 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 GLASSHIVE_SRC = Path(__file__).resolve().parents[5] / "GlassHive" / "runtime_phase1" / "src"
-if GLASSHIVE_SRC.is_dir() and str(GLASSHIVE_SRC) not in sys.path:
+if str(GLASSHIVE_SRC) not in sys.path:
     sys.path.insert(0, str(GLASSHIVE_SRC))
 
+from workers_projects_runtime.api import create_app as create_glasshive_app
 
 from scheduling_cortex import dispatch as dispatch_module
 from scheduling_cortex.glasshive_workspace_schedules import (
@@ -1070,10 +1069,12 @@ class GlassHiveWorkspaceScheduleTests(unittest.TestCase):
         return storage.get_task("owner-synthetic", "rsd_synthetic")
 
     def test_real_scheduler_retry_reaches_glasshive_once_end_to_end(self):
-        pytest.importorskip("workers_projects_runtime", reason="Cross-repository integration requires the GlassHive runtime source on PYTHONPATH")
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
             os.environ,
             {
+                # GlassHive's real admission path probes macOS resource tools.
+                # Preserve their system lookup while isolating every product setting.
+                "PATH": os.environ.get("PATH", ""),
                 "VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV": "1",
                 "VIVENTIUM_SCHEDULER_SECRET": "synthetic-scheduler-secret",
                 "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET": "synthetic-callback-secret",
@@ -1084,8 +1085,6 @@ class GlassHiveWorkspaceScheduleTests(unittest.TestCase):
             },
             clear=True,
         ):
-            from workers_projects_runtime.api import create_app as create_glasshive_app
-
             glasshive_app = create_glasshive_app(
                 str(Path(temp_dir) / "glasshive.db"),
                 runtime_backend="stub",
@@ -1184,10 +1183,12 @@ class GlassHiveWorkspaceScheduleTests(unittest.TestCase):
                 self.assertEqual(attempts, 2)
 
     def test_real_scheduler_terminal_callback_reconciles_the_authoritative_occurrence(self):
-        pytest.importorskip("workers_projects_runtime", reason="Cross-repository integration requires the GlassHive runtime source on PYTHONPATH")
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
             os.environ,
             {
+                # GlassHive's real admission path probes macOS resource tools.
+                # Preserve their system lookup while isolating every product setting.
+                "PATH": os.environ.get("PATH", ""),
                 "VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV": "1",
                 "VIVENTIUM_SCHEDULER_SECRET": "synthetic-scheduler-secret",
                 "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET": "synthetic-callback-secret",
@@ -1201,8 +1202,6 @@ class GlassHiveWorkspaceScheduleTests(unittest.TestCase):
         ):
             storage = ScheduleStorage(StorageConfig(db_path=os.environ["SCHEDULING_DB_PATH"]))
             cortex_app = build_server(storage).http_app(transport="streamable-http")
-            from workers_projects_runtime.api import create_app as create_glasshive_app
-
             glasshive_app = create_glasshive_app(
                 str(Path(temp_dir) / "glasshive.db"),
                 runtime_backend="stub",

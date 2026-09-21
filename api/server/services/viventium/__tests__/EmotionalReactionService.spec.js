@@ -50,7 +50,7 @@ function snapshot(overrides = {}) {
     asOf: '2026-07-09T12:00:00.000Z',
     bands,
     capsule: buildFeelingCapsule({ enabled: true, bands }),
-    snapshotHash: 'snapshot-3',
+    snapshotHash: '3'.repeat(64),
     reactionInstruction: 'Prefer small natural changes.',
     reactionActivationMode: 'always',
     innerState: null,
@@ -123,9 +123,8 @@ describe('EmotionalReactionService', () => {
     expect(agent.instructions).not.toContain('manual_adjustment');
     expect(agent.instructions).not.toContain('reset_to_nature');
     expect(agent.instructions).not.toContain('smallest accurate strength');
-    expect(agent.instructions).toContain('Slight means a subtle but real movement');
+    expect(agent.instructions).toContain('Slight means a subtle but real movement.');
     expect(agent.instructions).toContain('Clear means an unmistakable movement');
-    expect(agent.instructions).toContain('Strong means a pronounced movement');
     expect(agent.instructions).toContain('Do not default to `slight`');
     expect(agent.model_parameters).toEqual(
       expect.objectContaining({
@@ -233,7 +232,7 @@ describe('EmotionalReactionService', () => {
       ...chunks.filter((envelope) => envelope.i === writeStart.i),
     );
     expect(writeEvent.strengthCounts).toEqual({ clear: 1 });
-    expect(writeEvent.absoluteDeltaCounts).toEqual({ 8: 1 });
+    expect(writeEvent.deltaMagnitudeCounts).toEqual({ 8: 1 });
     expect(writeEvent).not.toHaveProperty('userText');
   });
 
@@ -352,6 +351,14 @@ describe('EmotionalReactionService', () => {
       innerStateUpdated: true,
     });
     expect(deps.executeCortex).toHaveBeenCalledTimes(2);
+    expect(deps.executeCortex).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ completedResultPolicy: 'internal' }),
+    );
+    expect(deps.executeCortex).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ completedResultPolicy: 'internal' }),
+    );
     expect(deps.executeCortex.mock.calls[1][0].executionTimeoutMs).toBeLessThanOrEqual(15000);
     expect(deps.executeCortex.mock.calls[1][0].messages).toHaveLength(2);
   });

@@ -19,6 +19,7 @@ let mockGetJob;
 let mockGetResumeState;
 let mockGetMessages;
 let mockGetMessage;
+let mockGetCortexInsightDeliveries;
 let mockGetConvo;
 let mockGetAgent;
 let mockGatewayMappingFindOne;
@@ -133,6 +134,10 @@ jest.mock('~/models/Agent', () => ({
   getAgent: (...args) => mockGetAgent(...args),
 }));
 
+jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => ({
+  getCortexInsightDeliveriesForParent: (...args) => mockGetCortexInsightDeliveries(...args),
+}));
+
 jest.mock('@librechat/api', () => ({
   normalizeChannelEnvelope: (input) => ({
     externalUsername: '',
@@ -170,10 +175,6 @@ jest.mock('@librechat/api', () => ({
     subscribe: (...args) => mockSubscribe(...args),
   },
   isEnabled: () => false,
-}));
-
-jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => ({
-  getCortexInsightDeliveriesForParent: jest.fn().mockResolvedValue([]),
 }));
 
 jest.mock('~/server/services/viventium/noResponseTag', () => {
@@ -421,6 +422,7 @@ describe('/api/viventium/gateway', () => {
     mockGetResumeState = jest.fn().mockResolvedValue(null);
     mockGetMessages = jest.fn().mockResolvedValue([]);
     mockGetMessage = jest.fn().mockResolvedValue(null);
+    mockGetCortexInsightDeliveries = jest.fn().mockResolvedValue([]);
     mockGetConvo = jest.fn().mockResolvedValue(null);
     mockGetAgent = jest.fn().mockResolvedValue({ avatar: { filepath: '/images/viventium.png' } });
 
@@ -1343,79 +1345,6 @@ describe('/api/viventium/gateway', () => {
     expect(writes.some((line) => line.includes('event: done'))).toBe(true);
   });
 
-  test('GET stream persists an error-free empty final as completed terminal state', async () => {
-    mockSubscribe.mockImplementation(async (_streamId, _onChunk, onDone) => {
-      onDone({
-        final: true,
-        responseMessage: { conversationId: 'conv-empty', files: [{ file_id: 'file-1' }] },
-      });
-      return { unsubscribe: jest.fn() };
-    });
-    const gatewayRouter = require('../gateway');
-    const app = createTestApp(gatewayRouter);
-    const query = { channel: 'discord', accountId: 'acct-1', externalUserId: 'ext-1' };
-    const req = createMockReq({
-      method: 'GET',
-      url: '/api/viventium/gateway/stream/empty-stream?channel=discord&accountId=acct-1&externalUserId=ext-1',
-      query,
-      headers: signedGatewayHeaders({
-        secret: 'gateway_secret',
-        method: 'GET',
-        path: '/api/viventium/gateway/stream/empty-stream',
-        body: {},
-      }),
-    });
-    const res = createMockRes();
-
-    await dispatch(app, req, res);
-
-    expect(mockGatewayIngressUpdateOne).toHaveBeenCalledWith(
-      { streamId: 'empty-stream' },
-      expect.objectContaining({
-        $set: expect.objectContaining({ state: 'completed', finalText: '' }),
-      }),
-    );
-    const writes = res.write.mock.calls.map((call) => String(call[0] || '')).join('');
-    expect(writes).toContain('"type":"final"');
-    expect(writes).toContain('event: done');
-  });
-
-  test('GET stream replays a persisted empty completion after job eviction', async () => {
-    mockGetJob.mockResolvedValueOnce(null);
-    mockGatewayIngressFindOne.mockReturnValueOnce({
-      lean: async () => ({
-        state: 'completed',
-        finalText: '',
-        responseConversationId: 'conv-empty',
-        libreChatUserId: 'user_1',
-        bindingVersion: '',
-      }),
-    });
-    const gatewayRouter = require('../gateway');
-    const app = createTestApp(gatewayRouter);
-    const query = { channel: 'discord', accountId: 'acct-1', externalUserId: 'ext-1' };
-    const req = createMockReq({
-      method: 'GET',
-      url: '/api/viventium/gateway/stream/empty-replay?channel=discord&accountId=acct-1&externalUserId=ext-1',
-      query,
-      headers: signedGatewayHeaders({
-        secret: 'gateway_secret',
-        method: 'GET',
-        path: '/api/viventium/gateway/stream/empty-replay',
-        body: {},
-      }),
-    });
-    const res = createMockRes();
-
-    await dispatch(app, req, res);
-
-    expect(res.statusCode).toBe(200);
-    const writes = res.write.mock.calls.map((call) => String(call[0] || '')).join('');
-    expect(writes).toContain('"type":"final"');
-    expect(writes).toContain('event: done');
-    expect(mockSubscribe).not.toHaveBeenCalled();
-  });
-
   test('GET stream replays a legacy terminal-empty completion after job eviction', async () => {
     mockGetJob.mockResolvedValueOnce(null);
     mockGatewayIngressFindOne.mockReturnValueOnce({
@@ -1721,6 +1650,10 @@ describe('/api/viventium/gateway', () => {
       'metadata.viventium.parentMessageId': 'msg-1',
       'metadata.viventium.type': 'cortex_followup',
     });
+    expect(mockGetCortexInsightDeliveries).toHaveBeenCalledWith({
+      ownerId: 'user_1',
+      parentMessageId: 'msg-1',
+    });
   });
 
   test('GET files/download streams file bytes', async () => {
@@ -1793,5 +1726,78 @@ describe('/api/viventium/gateway', () => {
     expect(res.statusCode).toBe(200);
     expect(Buffer.concat(res.chunks).toString('utf-8')).toBe('code-bytes');
     expect(mockLoadAuthValues).toHaveBeenCalled();
+  });
+
+  test('GET stream persists an error-free empty final as completed terminal state', async () => {
+    mockSubscribe.mockImplementation(async (_streamId, _onChunk, onDone) => {
+      onDone({
+        final: true,
+        responseMessage: { conversationId: 'conv-empty', files: [{ file_id: 'file-1' }] },
+      });
+      return { unsubscribe: jest.fn() };
+    });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const query = { channel: 'discord', accountId: 'acct-1', externalUserId: 'ext-1' };
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/gateway/stream/empty-stream?channel=discord&accountId=acct-1&externalUserId=ext-1',
+      query,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'GET',
+        path: '/api/viventium/gateway/stream/empty-stream',
+        body: {},
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(mockGatewayIngressUpdateOne).toHaveBeenCalledWith(
+      { streamId: 'empty-stream' },
+      expect.objectContaining({
+        $set: expect.objectContaining({ state: 'completed', finalText: '' }),
+      }),
+    );
+    const writes = res.write.mock.calls.map((call) => String(call[0] || '')).join('');
+    expect(writes).toContain('"type":"final"');
+    expect(writes).toContain('event: done');
+  });
+
+  test('GET stream replays a persisted empty completion after job eviction', async () => {
+    mockGetJob.mockResolvedValueOnce(null);
+    mockGatewayIngressFindOne.mockReturnValueOnce({
+      lean: async () => ({
+        state: 'completed',
+        finalText: '',
+        responseConversationId: 'conv-empty',
+        libreChatUserId: 'user_1',
+        bindingVersion: '',
+      }),
+    });
+    const gatewayRouter = require('../gateway');
+    const app = createTestApp(gatewayRouter);
+    const query = { channel: 'discord', accountId: 'acct-1', externalUserId: 'ext-1' };
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/gateway/stream/empty-replay?channel=discord&accountId=acct-1&externalUserId=ext-1',
+      query,
+      headers: signedGatewayHeaders({
+        secret: 'gateway_secret',
+        method: 'GET',
+        path: '/api/viventium/gateway/stream/empty-replay',
+        body: {},
+      }),
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.statusCode).toBe(200);
+    const writes = res.write.mock.calls.map((call) => String(call[0] || '')).join('');
+    expect(writes).toContain('"type":"final"');
+    expect(writes).toContain('event: done');
+    expect(mockSubscribe).not.toHaveBeenCalled();
   });
 });

@@ -145,11 +145,11 @@ async function connectedAccountValues(userId, endpoint, resolver) {
   }
   try {
     return await resolver(userId, stored, endpointDb());
-  } catch (_error) {
+  } catch (error) {
     let refreshed;
     try {
       refreshed = await getUserKeyValues({ userId, name: endpoint });
-    } catch (_readError) {
+    } catch (readError) {
       throw providerAuthProjectionUnavailableError();
     }
     if (refreshed?.oauthReconnectRequired === true) {
@@ -173,7 +173,7 @@ async function persistConnectedAccountReconnectRequired(userId, endpoint, values
       value: JSON.stringify({ ...values, oauthReconnectRequired: true }),
       expiresAt: null,
     });
-  } catch (_error) {
+  } catch (error) {
     throw providerAuthProjectionUnavailableError();
   }
 }

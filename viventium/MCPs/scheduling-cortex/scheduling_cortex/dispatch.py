@@ -20,10 +20,10 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 # === VIVENTIUM START ===
 # Feature: Multi-channel dispatch support.
-from .models import AVAILABLE_CHANNELS, DEFAULT_DELIVERY_CHANNELS
+from .models import AVAILABLE_CHANNELS, DEFAULT_DELIVERY_CHANNELS, _normalize_capability_servers
 from .glasshive_assertions import ASSERTION_HEADER, mint_workspace_run_assertion
 from .scheduled_failure_contract import load_scheduled_failure_contract
-from .storage import ScheduleStorage, StorageConfig
+from .storage import UNCONFIRMED_DELIVERY_NOTICE_CHANNEL, ScheduleStorage, StorageConfig
 from .utils import ensure_timezone, parse_iso, to_utc_iso
 from .workbench_artifacts import (
     isolated_periphery_contract,
@@ -50,14 +50,24 @@ _SHARED_PATH = _find_shared_path(Path(__file__).resolve())  # .../viventium_v0_4
 if _SHARED_PATH and str(_SHARED_PATH) not in sys.path:
     sys.path.insert(0, str(_SHARED_PATH))
 
-from scheduler_prompt_contract import (
-    CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID,
-    SCHEDULER_RUN_ENVELOPE_PROMPT_ID,
-    SCHEDULED_RUN_CONTEXT_HEADER,
-    SCHEDULED_RUN_CONTEXT_PLACEHOLDER,
-    load_scheduler_prompts,
-    render_scheduler_prompt,
-    render_scheduler_run_envelope,
+import scheduler_prompt_contract as _scheduler_prompt_contract
+
+CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID = (
+    _scheduler_prompt_contract.CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID
+)
+SCHEDULER_RUN_ENVELOPE_PROMPT_ID = (
+    _scheduler_prompt_contract.SCHEDULER_RUN_ENVELOPE_PROMPT_ID
+)
+SCHEDULED_RUN_CONTEXT_HEADER = _scheduler_prompt_contract.SCHEDULED_RUN_CONTEXT_HEADER
+SCHEDULED_RUN_CONTEXT_PLACEHOLDER = (
+    _scheduler_prompt_contract.SCHEDULED_RUN_CONTEXT_PLACEHOLDER
+)
+render_scheduler_run_envelope = _scheduler_prompt_contract.render_scheduler_run_envelope
+load_scheduler_prompts = getattr(
+    _scheduler_prompt_contract, "load_scheduler_prompts", None
+)
+render_scheduler_prompt = getattr(
+    _scheduler_prompt_contract, "render_scheduler_prompt", None
 )
 
 BREW_PROMPT_MARKER = "<!--viv_internal:brew_begin-->"
@@ -748,6 +758,51 @@ class HttpJsonError(RuntimeError):
         self.failure_retryable = failure_retryable
 
 
+class TelegramChannelNotLinked(RuntimeError):
+    """The owner has no Telegram mapping, so Telegram is not an available destination."""
+
+
+TELEGRAM_NOT_LINKED_DELIVERY: Dict[str, Any] = {
+    "channel": "telegram",
+    "outcome": "skipped",
+    "reason": "telegram_not_linked",
+    "generated_text": None,
+}
+
+
+class SchedulerAdmissionRefused(RuntimeError):
+    """Core refused the connection before admitting this occurrence, so no dispatch was accepted."""
+
+    failure_class = "scheduler_gateway_unavailable"
+    failure_retryable = True
+
+
+class WorkbenchCapabilityRequiresIsolation(RuntimeError):
+    """A declared connected capability reaches a Workbench run only through GlassHive's isolated
+    scheduled grant boundary, so a host run would silently run without it."""
+
+    failure_class = "unsupported_runtime_configuration"
+    failure_retryable = False
+
+
+def _connection_refused(error: BaseException) -> bool:
+    return isinstance(error, urllib.error.URLError) and isinstance(
+        getattr(error, "reason", None), ConnectionRefusedError
+    )
+
+
+def _post_unadmitted_dispatch(
+    url: str, payload: Dict[str, Any], headers: Dict[str, str], timeout_s: int
+) -> Dict[str, Any]:
+    """Admit an occurrence Core confirmed it never accepted; a refused connection keeps it unadmitted."""
+    try:
+        return _post_json(url, payload, headers, timeout_s)
+    except urllib.error.URLError as error:
+        if _connection_refused(error):
+            raise SchedulerAdmissionRefused("scheduler_gateway_unavailable") from error
+        raise
+
+
 def scheduled_exception_failure(task: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
     """Classify trusted exception structure without inspecting provider or prompt prose."""
 
@@ -1002,13 +1057,36 @@ def _get_telegram_bot_token() -> str:
 # === VIVENTIUM START ===
 # Rationale: ensure scheduled prompts use the shipped self-prompt by default and avoid
 # double-prefixing stored prompts that already contain the scheduler contract.
+def _load_scheduler_prompts_if_supported() -> Optional[Dict[str, Any]]:
+    if callable(load_scheduler_prompts):
+        return load_scheduler_prompts()
+    return None
+
+
+def _render_scheduler_run_envelope(
+    scheduled_run_context: str,
+    prompts: Optional[Dict[str, Any]] = None,
+) -> str:
+    if callable(render_scheduler_prompt):
+        return render_scheduler_run_envelope(
+            scheduled_run_context,
+            prompts=prompts,
+        )
+    return render_scheduler_run_envelope(scheduled_run_context)
+
+
+def _default_prompt_prefix(prompts: Optional[Dict[str, Any]] = None) -> str:
+    return _render_scheduler_run_envelope(
+        SCHEDULED_RUN_CONTEXT_PLACEHOLDER,
+        prompts,
+    ).split(f"\n\n{SCHEDULED_RUN_CONTEXT_HEADER}", 1)[0].strip()
+
+
 def _get_prompt_prefix(prompts: Optional[Dict[str, Any]] = None) -> str:
     prefix = (
         os.getenv("SCHEDULER_PROMPT_PREFIX")
         or os.getenv("SCHEDULING_PROMPT_PREFIX")
-        or render_scheduler_run_envelope(
-            SCHEDULED_RUN_CONTEXT_PLACEHOLDER, prompts=prompts
-        ).split(f"\n\n{SCHEDULED_RUN_CONTEXT_HEADER}", 1)[0]
+        or _default_prompt_prefix(prompts)
     )
     return prefix.strip()
 
@@ -1026,7 +1104,17 @@ def _looks_like_scheduled_self_prompt(text: str) -> bool:
 
 def _ensure_live_fact_contract(text: str, prompts: Optional[Dict[str, Any]] = None) -> str:
     cleaned = (text or "").strip()
-    contract = render_scheduler_prompt("scheduler.run_live_fact_contract", prompts=prompts)
+    if callable(render_scheduler_prompt):
+        contract = render_scheduler_prompt(
+            "scheduler.run_live_fact_contract",
+            prompts=prompts,
+        )
+    else:
+        # The first public shared contract exposed one registry-owned envelope,
+        # not separately addressable compiled fragments. Reuse that published
+        # contract rather than copying policy into this component. Its final
+        # two lines are the live-fact and internal-surface clauses.
+        contract = "\n".join(_default_prompt_prefix().splitlines()[-2:]).strip()
     if contract in cleaned:
         return cleaned
     if not cleaned:
@@ -1129,7 +1217,13 @@ def _format_scheduled_run_context_block(
         value = str(run_context.get(field) or "").strip()
         if value:
             lines.append(f"- {field}: {value}")
-    lines.append(render_scheduler_prompt("scheduler.run_context_contract", prompts=prompts))
+    if callable(render_scheduler_prompt):
+        lines.append(
+            render_scheduler_prompt(
+                "scheduler.run_context_contract",
+                prompts=prompts,
+            )
+        )
     return "\n".join(lines)
 
 
@@ -1139,7 +1233,7 @@ def _default_scheduler_run_envelope(
     context = str(scheduled_run_context or "").strip()
     if context.startswith(SCHEDULED_RUN_CONTEXT_HEADER):
         context = context[len(SCHEDULED_RUN_CONTEXT_HEADER) :].lstrip()
-    return render_scheduler_run_envelope(context, prompts=prompts)
+    return _render_scheduler_run_envelope(context, prompts)
 
 
 _WEEKDAY_NAME_TO_INDEX = {calendar.day_name[index].lower(): index for index in range(7)}
@@ -1250,7 +1344,7 @@ def _compose_prompt(
     run_context: Optional[Dict[str, str]] = None,
     now_utc: Optional[datetime] = None,
 ) -> str:
-    prompts = load_scheduler_prompts()
+    prompts = _load_scheduler_prompts_if_supported()
     base = (task.get("prompt") or "").strip()
     prefix = _get_prompt_prefix(prompts)
     custom_prefix = str(
@@ -1377,12 +1471,17 @@ def _resolve_telegram_identity(
             "Content-Type": "application/json",
             "X-VIVENTIUM-SCHEDULER-SECRET": scheduler_secret,
         }
-        response = _post_json(
-            f"{base_url}/api/viventium/scheduler/telegram/resolve",
-            {"userId": task.get("user_id")},
-            headers,
-            timeout_s,
-        )
+        try:
+            response = _post_json(
+                f"{base_url}/api/viventium/scheduler/telegram/resolve",
+                {"userId": task.get("user_id")},
+                headers,
+                timeout_s,
+            )
+        except HttpJsonError as error:
+            if error.status == 404:
+                raise TelegramChannelNotLinked("telegram_not_linked") from error
+            raise
         telegram_user_id = _coerce_id(
             response.get("telegram_user_id") or response.get("telegramUserId")
         )
@@ -2099,11 +2198,21 @@ def _run_scheduler_generation(
     schedule = task.get("schedule") or {}
     run_context = _build_scheduled_run_context(task)
     source_prompt_id = _declared_scheduler_source_prompt_id(task)
-    idempotency_key = str(
+    occurrence_key = str(
         task.get("_scheduled_prompt_occurrence_key")
         or task.get("_scheduled_prompt_run_id")
         or ""
     ).strip()
+    # Core keys its dispatch record by the admission key and never re-admits one it already
+    # accepted, so a genuine re-run of the same occurrence needs a fresh admission key. The ordinal
+    # advances only from a requeue holding a definite typed failure; an attempt whose outcome is
+    # uncertain keeps the key stable so reconciliation can still discover whether it landed.
+    readmit_attempt = int(task.get("_scheduled_prompt_readmit_attempt") or 0)
+    idempotency_key = (
+        f"{occurrence_key}#r{readmit_attempt}"
+        if occurrence_key and readmit_attempt > 0
+        else occurrence_key
+    )
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     recurrence_state = metadata.get("recurrence_state_v1")
     bounded_recurrence_state: Dict[str, Any] = {}
@@ -2151,6 +2260,9 @@ def _run_scheduler_generation(
             payload["viventiumQaRunId"] = qa_run_id[:128]
     if idempotency_key:
         payload["idempotencyKey"] = idempotency_key
+        # Core's per-turn receipt is keyed by this value, and claimLogicalTurn keeps refusing a
+        # repeat while the first attempt's receipt survives, so a re-run has to present its own
+        # turn identity. For a first admission it is still the bare occurrence key.
         payload["source_event_id"] = idempotency_key
     if source_prompt_id:
         payload["sourcePromptId"] = source_prompt_id
@@ -2161,7 +2273,7 @@ def _run_scheduler_generation(
     chat_url = f"{base_url}/api/viventium/scheduler/chat"
     try:
         response = _post_json(chat_url, payload, headers, timeout_s)
-    except (urllib.error.URLError, TimeoutError):
+    except (urllib.error.URLError, TimeoutError) as admission_error:
         if not idempotency_key:
             raise
         reconcile_url = (
@@ -2174,7 +2286,11 @@ def _run_scheduler_generation(
         except HttpJsonError as error:
             if error.status != 404:
                 raise
-            response = _post_json(chat_url, payload, headers, timeout_s)
+            response = _post_unadmitted_dispatch(chat_url, payload, headers, timeout_s)
+        except urllib.error.URLError as error:
+            if _connection_refused(admission_error) and _connection_refused(error):
+                raise SchedulerAdmissionRefused("scheduler_gateway_unavailable") from error
+            raise
         else:
             if str(response.get("state") or "").strip().lower() == "reserved":
                 response = _post_json(chat_url, payload, headers, timeout_s)
@@ -2531,6 +2647,14 @@ def _send_telegram_voice_or_text(
 
 
 def _resolve_conversation_id(task: Dict[str, Any]) -> str:
+    readmit_conversation_id = str(
+        task.get("_scheduled_prompt_readmit_conversation_id") or ""
+    ).strip()
+    if readmit_conversation_id:
+        # A readmitted occurrence presents a fresh turn identity, so it must name the conversation
+        # its failed attempt already reached; resolving "new" again would strand the answer in a
+        # different thread from the error the owner has already seen.
+        return readmit_conversation_id
     policy = (task.get("conversation_policy") or "new").lower()
     metadata = task.get("metadata") or {}
     conversation_id = task.get("conversation_id") or metadata.get("conversation_id")
@@ -3553,6 +3677,7 @@ def _glasshive_bootstrap_bundle(
         "files": projected_files,
     }
     if clean_execution_mode == "docker":
+        required_capability_servers = _workbench_required_capability_servers(wb)
         bundle["viventium_execution_authority_request"] = {
             "version": 1,
             "kind": "prompt_workbench_scheduled",
@@ -3577,8 +3702,18 @@ def _glasshive_bootstrap_bundle(
                 if fallback_worker_route
                 else {}
             ),
+            **(
+                {"required_capability_servers": required_capability_servers}
+                if required_capability_servers
+                else {}
+            ),
         }
     return bundle
+
+
+def _workbench_required_capability_servers(wb: Dict[str, Any]) -> list[str]:
+    """Return the schedule's typed capability declaration as authored; servers are never inferred."""
+    return _normalize_capability_servers(wb.get("required_capability_servers")) or []
 
 
 def _ensure_glasshive_project(storage: ScheduleStorage, task: Dict[str, Any], wb: Dict[str, Any]) -> str:
@@ -3797,6 +3932,11 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             raise RuntimeError(
                 "Isolated Workbench execution requires a declared artifact return contract "
                 "and memory_write_mode=off when a private host folder is configured"
+            )
+        if execution_mode != "docker" and _workbench_required_capability_servers(wb):
+            raise WorkbenchCapabilityRequiresIsolation(
+                "Declared connected capabilities run only in an isolated Docker Workbench "
+                "workspace; set execution_mode=docker for this schedule."
             )
         base_url = _glasshive_base_url()
         timeout_s = int(os.getenv("SCHEDULER_GLASSHIVE_HTTP_TIMEOUT_S", "20"))
@@ -4039,10 +4179,6 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "execution": effective_execution_snapshot,
         }
     except Exception as exc:
-        # Scheduled attempts close through the scheduler's lease-fenced transaction.
-        # A direct/manual dispatch still owns its immediate failure receipt.
-        if expected_preclaim is not None:
-            raise
         failure = scheduled_exception_failure(task, exc)
         failure_snapshot = {
             **execution_snapshot,
@@ -4455,6 +4591,7 @@ def _deliver_telegram_generated_text(
     timeout_s: int,
     response_message_id: Optional[str],
     visibility: Dict[str, Any],
+    ledger_channel: str = "telegram",
 ) -> Dict[str, Any]:
     final_text = visibility.get("final_text") or ""
     followup_text = visibility.get("followup_text") or ""
@@ -4504,7 +4641,7 @@ def _deliver_telegram_generated_text(
             claim = delivery_storage.claim_scheduled_prompt_delivery(
                 run_id=run_id,
                 occurrence_key=occurrence_key or None,
-                channel="telegram",
+                channel=ledger_channel,
                 part_index=part_index,
                 payload_hash=payload_hash,
                 lease_owner=delivery_lease_owner,
@@ -4642,6 +4779,56 @@ def _deliver_telegram_generated_text(
     return detail
 
 
+# === VIVENTIUM START ===
+# Feature: Once-only owner notice for a scheduled delivery that could not be confirmed.
+# Purpose: An uncertain send is never repeated, so the owner is told once instead. The notice has
+# its own durable ledger key on the same run, so a replay or restart finds it and sends nothing.
+def _unconfirmed_delivery_notice_text(conversation_saved: bool) -> str:
+    text = (
+        "I couldn't confirm that your scheduled message reached Telegram, so I didn't send it "
+        "again to avoid a duplicate."
+    )
+    if conversation_saved:
+        text += " The full reply is saved in its Viventium conversation."
+    return text
+
+
+def deliver_unconfirmed_delivery_notice(
+    task: Dict[str, Any],
+    *,
+    conversation_saved: bool,
+) -> Dict[str, Any]:
+    if not str(task.get("_scheduled_prompt_run_id") or "").strip():
+        return {"outcome": "skipped", "reason": "run_identity_missing"}
+    base_url = (
+        os.getenv("SCHEDULER_LIBRECHAT_URL")
+        or os.getenv("VIVENTIUM_LIBRECHAT_ORIGIN")
+        or "http://localhost:3080"
+    ).rstrip("/")
+    timeout_s = int(os.getenv("SCHEDULER_HTTP_TIMEOUT_S", "15"))
+    visibility = _prepare_generated_visibility(
+        task, _unconfirmed_delivery_notice_text(conversation_saved), ""
+    )
+    try:
+        detail = _deliver_telegram_generated_text(
+            task,
+            base_url,
+            timeout_s,
+            None,
+            visibility,
+            ledger_channel=UNCONFIRMED_DELIVERY_NOTICE_CHANNEL,
+        )
+    except TelegramChannelNotLinked:
+        return {"outcome": "skipped", "reason": "telegram_not_linked"}
+    except Exception as exc:
+        return {"outcome": "failed", "reason": type(exc).__name__}
+    return {
+        "outcome": str(detail.get("outcome") or "failed"),
+        "reason": str(detail.get("delivery_unknown_reason") or detail.get("reason") or ""),
+    }
+# === VIVENTIUM END ===
+
+
 def scheduled_failure_result(
     task: Dict[str, Any],
     error_class: Any,
@@ -4709,6 +4896,8 @@ def scheduled_failure_result(
                     transition["reported_failure_classes"] = sorted(
                         set(transition.get("reported_failure_classes") or []) | {normalized}
                     )
+            except TelegramChannelNotLinked:
+                failure_channels["telegram"] = dict(TELEGRAM_NOT_LINKED_DELIVERY)
             except Exception as exc:
                 channel_errors["telegram"] = _scheduled_channel_exception_failure(task, exc)
                 failure_channels["telegram"] = channel_errors["telegram"]
@@ -4840,6 +5029,7 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "delivery": _build_librechat_delivery_detail(visibility),
         }
 
+    skipped_channels: Dict[str, Dict[str, Any]] = {}
     if "telegram" in channels:
         try:
             telegram_detail = _deliver_telegram_generated_text(
@@ -4863,6 +5053,8 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 "conversation_id": resolved_conversation_id,
                 "delivery": telegram_detail,
             }
+        except TelegramChannelNotLinked:
+            skipped_channels["telegram"] = dict(TELEGRAM_NOT_LINKED_DELIVERY)
         except Exception as exc:
             errors["telegram"] = _scheduled_channel_exception_failure(task, exc)
             logger.warning(
@@ -4889,7 +5081,10 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
     # least one requested channel delivered or intentionally suppressed with a truthful ledger.
     if not channel_results:
         classes = ", ".join(
-            sorted({str(error.get("error_class") or "Error") for error in errors.values()})
+            sorted(
+                {str(error.get("error_class") or "Error") for error in errors.values()}
+                | {str(detail["reason"]) for detail in skipped_channels.values()}
+            )
         )
         raise RuntimeError(f"Dispatch failed for all channels ({classes or 'Error'})")
     if errors:
@@ -4942,6 +5137,7 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 text = detail.get("generated_text")
                 if isinstance(text, str) and text.strip():
                     generated_text = text.strip()
+    delivery_by_channel.update(skipped_channels)
     delivery_by_channel.update(errors)
     if saw_sent:
         delivery_outcome = "sent"
@@ -4971,6 +5167,18 @@ def dispatch_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "channels": delivery_by_channel,
         },
     }
+    # === VIVENTIUM START ===
+    # Purpose: "sent" means some destination delivered; a destination whose receipt is uncertain
+    # stays named at task level instead of being hidden inside its channel entry.
+    unconfirmed_channels = sorted(
+        channel
+        for channel, detail in delivery_by_channel.items()
+        if isinstance(detail, dict)
+        and str(detail.get("outcome") or "").strip().lower() == "delivery_unknown"
+    )
+    if unconfirmed_channels:
+        response["delivery"]["unconfirmed_channels"] = unconfirmed_channels
+    # === VIVENTIUM END ===
     execution = generation_result.get("execution")
     if isinstance(execution, dict) and execution:
         response["execution"] = execution

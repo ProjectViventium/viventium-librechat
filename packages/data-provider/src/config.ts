@@ -336,6 +336,7 @@ export const agentProviderCapabilitySchema = z.object({
   replay_protocol: z
     .enum(['legacy_message_count', 'replay_decision_v1'])
     .default('legacy_message_count'),
+  /** @deprecated Ambiguous pre-contract field; retained only for older config compatibility. */
   native_tools: z.boolean().default(false),
   worker_native_tools: z.boolean().default(false),
   host_tools_transport: z.enum(['broker_mcp']).optional(),
@@ -346,6 +347,9 @@ export const agentProviderCapabilitySchema = z.object({
   responses_api: z.boolean().default(false),
   messaging_delivery_disposition: z.boolean().default(false),
   messaging_delivery_disposition_version: z.literal(1).optional(),
+  /* === VIVENTIUM START === Provider-declared incremental vs snapshot stream transport. === */
+  message_delta_mode: z.enum(['incremental', 'snapshot']).default('incremental'),
+  /* === VIVENTIUM END === */
   default_access: z.enum(['full', 'workspace']).default('workspace'),
   allow_full_access: z.boolean().default(false),
   excluded_mcp_servers: z.array(z.string()).optional().default([]),
@@ -910,15 +914,15 @@ export type TStartupConfig = {
   /** Explicit opt-in for legacy direct provider subscription OAuth. Defaults false. */
   viventiumExperimentalDirectSubscriptionAuth?: boolean;
   /* === VIVENTIUM START ===
-   * Feature: Express browser-first onboarding.
-   * Purpose: Expose only the bounded install experience needed for the first-user handoff.
-   * === VIVENTIUM END === */
-  viventiumInstallExperience?: 'express' | 'custom' | 'legacy';
-  /* === VIVENTIUM START ===
    * Feature: Voice readiness and privacy guard.
    * Purpose: Hide call surfaces unless the server explicitly enables Voice.
    * === VIVENTIUM END === */
   viventiumVoiceEnabled?: boolean;
+  /* === VIVENTIUM START ===
+   * Feature: Express browser-first onboarding.
+   * Purpose: Expose only the bounded install experience needed for the first-user handoff.
+   * === VIVENTIUM END === */
+  viventiumInstallExperience?: 'express' | 'custom' | 'legacy';
   /* === VIVENTIUM START ===
    * Feature: Prompt Workbench local launcher.
    * Purpose: Expose the server-side workbench link gate to the web client.
@@ -1161,6 +1165,7 @@ export const memorySchema = z.object({
           })
           .strict()
           .optional(),
+        /* === VIVENTIUM END === */
       }),
     ])
     .optional(),

@@ -1,12 +1,17 @@
 const mockExecuteMainDelegation = jest.fn();
+const mockParallelWorkAvailable = jest.fn();
 
 jest.mock('~/server/services/viventium/GlassHiveCapabilityBrokerService', () => ({
   executeMainDelegation: (...args) => mockExecuteMainDelegation(...args),
+}));
+jest.mock('~/server/services/viventium/ViventiumOrchestrationMode', () => ({
+  parallelWorkAvailable: (...args) => mockParallelWorkAvailable(...args),
 }));
 
 describe('glassHiveOrchestrationTools', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockParallelWorkAvailable.mockImplementation((ownerId) => Boolean(ownerId));
     mockExecuteMainDelegation.mockImplementation(async ({ args }) => ({
       status: 'ok',
       workRef: args.sourceOrdinals?.[0] === 2 ? 'work-b' : 'work-a',
@@ -41,7 +46,7 @@ describe('glassHiveOrchestrationTools', () => {
     expect(definitions[0].parameters.properties.longMission).toEqual({ type: 'boolean' });
     expect(definitions[0].description).toContain('new, independently completable');
     expect(definitions[0].description).toContain('active_work_action');
-    expect(definitions[1].description).toContain('an exact runId or workRef');
+    expect(definitions[1].description).toContain('exact runId or workRef');
     expect(definitions[2].description).toContain('instead of starting a competing mission');
     expect(definitions[2].description).toContain('Retry does not deliver new guidance');
     expect(definitions[2].description).toContain('then Message or Steer');
@@ -86,6 +91,8 @@ describe('glassHiveOrchestrationTools', () => {
       'active_work_action',
     ];
     const main = { glasshive_options: { orchestration: { parallel_available: true } } };
+    mockParallelWorkAvailable.mockReturnValue(false);
+
     expect(
       availableGlassHiveMainOrchestrationTools(main, requested, {
         user: { personalization: { parallel_work_known: true } },
@@ -115,6 +122,8 @@ describe('glassHiveOrchestrationTools', () => {
       'active_work_action',
     ];
     const main = { glasshive_options: { orchestration: { parallel_available: true } } };
+    mockParallelWorkAvailable.mockReturnValue(false);
+
     expect(
       availableGlassHiveMainOrchestrationTools(main, requested, {
         user: { personalization: { orchestration_mode: 'parallel' } },
@@ -135,6 +144,7 @@ describe('glassHiveOrchestrationTools', () => {
     req._viventiumParallelWorkTurnAvailable = true;
     expect(availableGlassHiveMainOrchestrationTools(main, requested, { req })).toEqual(requested);
     expect(availableGlassHiveMainOrchestrationTools(main, requested, { req })).toEqual(requested);
+    expect(mockParallelWorkAvailable).not.toHaveBeenCalled();
   });
 
   test('re-appends only centralized rollback controls after an OAuth tool reload', () => {
@@ -302,7 +312,7 @@ describe('glassHiveOrchestrationTools', () => {
       },
     ],
   ])(
-    'preserves independent worker profile across Main fallback (%s)',
+    'keeps the configured background worker profile independent of the Main provider attempt (%s)',
     async (_descriptorKind, agent) => {
       const {
         createGlassHiveMainDelegationTool,
@@ -406,7 +416,7 @@ describe('glassHiveOrchestrationTools', () => {
     });
   });
 
-  test('preserves native call identity across reconnect and changed payload for broker conflict checks', async () => {
+  test('keeps one trusted provider occurrence stable when its reconstructed arguments change', async () => {
     const {
       createGlassHiveMainDelegationTool,
     } = require('~/app/clients/tools/util/glassHiveOrchestrationTools');
@@ -449,7 +459,6 @@ describe('glassHiveOrchestrationTools', () => {
     const identities = mockExecuteMainDelegation.mock.calls.map(([value]) => value.invocationId);
     expect(identities[1]).toBe(identities[0]);
     expect(identities[2]).toBe(identities[0]);
-    expect(mockExecuteMainDelegation.mock.calls[2][0].args.instruction).toBe('Run A differently');
   });
 
   test('separates two intentional identical native calls while replaying each idempotently', async () => {

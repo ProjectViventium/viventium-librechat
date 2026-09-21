@@ -11,7 +11,11 @@ import {
 } from '~/data-provider/ViventiumOrchestration';
 import { useLocalize } from '~/hooks';
 
-export default function ParallelWork() {
+type ParallelWorkProps = {
+  featureAvailable: boolean;
+};
+
+function ParallelWorkPreference() {
   const localize = useLocalize();
   const { showToast } = useToastContext();
   const preferenceQuery = useOrchestrationPreferenceQuery();
@@ -96,14 +100,17 @@ export default function ParallelWork() {
         </p>
       )}
       {!readinessPending && preferenceQuery.data?.releaseGate && (
-        <details className="mt-2 text-xs text-text-secondary">
-          <summary className="cursor-pointer">{localize('com_ui_additional_details')}</summary>
+        <div className="mt-2 text-xs text-text-secondary" role="status">
           <p className="font-semibold">{preferenceQuery.data.releaseGate.label}</p>
           {preferenceQuery.data.releaseGate.blockers.length > 0 && (
             <p>{preferenceQuery.data.releaseGate.blockers.join(', ')}</p>
           )}
-        </details>
+        </div>
       )}
     </section>
   );
+}
+
+export default function ParallelWork({ featureAvailable }: ParallelWorkProps) {
+  return featureAvailable ? <ParallelWorkPreference /> : null;
 }

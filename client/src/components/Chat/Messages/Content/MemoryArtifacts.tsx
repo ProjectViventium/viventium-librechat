@@ -130,6 +130,10 @@ export default function MemoryArtifacts({ attachments }: { attachments?: TAttach
   }, [attachments]);
 
   const degradedLabel = `${localize('com_ui_memory')} · ${localize('com_ui_unavailable')}`;
+  const degradedCopy = {
+    auth: `${localize('com_ui_reconnect')} ${localize('com_ui_memory')}`,
+    quota: `${localize('com_ui_provider')} · ${localize('com_ui_unavailable')}`,
+  };
   let buttonLabel = localize('com_ui_memory_updated');
   let buttonStateClass = 'text-text-secondary-alt hover:text-text-primary';
   if (hasDegraded) {

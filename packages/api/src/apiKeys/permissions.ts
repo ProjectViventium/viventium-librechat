@@ -123,8 +123,12 @@ export function backfillRemoteAgentPermissions(
 
   const { AclEntry, AccessRole, logger } = deps;
 
+  if (typeof resourceId === 'string' && !/^[a-f\d]{24}$/i.test(resourceId)) {
+    logger.error('[backfillRemoteAgentPermissions] Invalid resource ID');
+    return;
+  }
   const resourceObjectId =
-    typeof resourceId === 'string' && /^[a-f\d]{24}$/i.test(resourceId)
+    typeof resourceId === 'string'
       ? AclEntry.base.Types.ObjectId.createFromHexString(resourceId)
       : resourceId;
 

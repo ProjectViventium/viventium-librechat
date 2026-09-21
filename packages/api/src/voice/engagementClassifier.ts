@@ -28,7 +28,6 @@ export interface VoiceEngagementClassifierDependencies {
   createVoiceEngagementAttestation(input: UnknownRecord): unknown;
   finalizedOwnerSpeakerAuthority(segments: unknown, session: unknown): boolean;
   getCallSessionVoiceSettings(callSessionId: string): Promise<unknown>;
-  getVoiceClassifierFaultControlContext(): UnknownRecord;
   latestPersistedVoiceTurnAuthority(input: UnknownRecord): Promise<unknown>;
   listSpeakerSegments(input: { callSessionId: string; limit: number }): Promise<unknown>;
   logger: { warn(message: string, fields: UnknownRecord): void };
@@ -37,7 +36,15 @@ export interface VoiceEngagementClassifierDependencies {
   recordVoiceOrchestrationTrace(input: UnknownRecord): Promise<unknown>;
   recordVoiceOrchestrationTraceBestEffort(input: UnknownRecord): Promise<unknown>;
   runSemanticClassification(input: VoiceSemanticClassificationInput): Promise<unknown>;
-  runVoiceClassifierFaultControl(input: UnknownRecord): Promise<unknown>;
+  runVoiceClassifierFaultControl(input: {
+    ownerId: string;
+    callSessionId: string;
+    turnId: string;
+    segments: Array<{ segmentId: string; revision: number }>;
+    utteranceHash: string;
+    primary: { provider: string; model: string };
+    fallback: { provider: string; model: string };
+  }): Promise<unknown>;
 }
 
 export interface VoiceEngagementClassificationRequest {
@@ -98,18 +105,6 @@ function voiceProviderAttemptStatus(attempt: unknown): string {
   }
   if (errorClass === 'cancelled' || errorClass === 'AbortError') return 'cancelled';
   return 'failed';
-}
-
-function isExactMpv054SyntheticOwner(user: unknown): boolean {
-  const value = recordFrom(user);
-  const email = String(value.email || '')
-    .trim()
-    .toLowerCase();
-  return Boolean(
-    value.name === 'Viventium Voice QA' &&
-    value.provider === 'local' &&
-    /^viventium-voice-qa-mpv-061-[a-z0-9-]{1,80}@example\.com$/.test(email),
-  );
 }
 
 function exactRequestBody(body: UnknownRecord): boolean {
@@ -203,29 +198,22 @@ export function createVoiceEngagementClassifierService(
       const observedProviderAttempts: UnknownRecord[] = [];
       let firstConfiguredRouteIndex = 0;
       let controlledPrimaryReceipt: UnknownRecord | null = null;
-      if (isExactMpv054SyntheticOwner(user) && configuredRoutes.length === 2) {
-        const context = deps.getVoiceClassifierFaultControlContext();
+      if (configuredRoutes.length === 2) {
         const controlResult = recordFrom(
           await deps.runVoiceClassifierFaultControl({
-            caseId: 'MPV-061',
-            sessionRef: context.sessionRef,
-            candidateDigest: context.candidateDigest,
-            componentArtifactDigest: context.componentArtifactDigest,
-            installedArtifactDigest: context.installedArtifactDigest,
-            runtimeOwnerBindingHash: context.runtimeOwnerBindingHash,
-            ownerId: user.id,
-            callSessionId: session.callSessionId,
+            ownerId: String(user.id),
+            callSessionId: String(session.callSessionId),
             turnId,
             segments: segments.map((segment) => ({
-              segmentId: segment.segmentId,
+              segmentId: String(segment.segmentId),
               revision: Number(segment.revision),
             })),
             utteranceHash: `sha256:${crypto
               .createHash('sha256')
               .update(classifiedUtterance, 'utf8')
               .digest('hex')}`,
-            primary: { provider: effective.provider, model: effective.model },
-            fallback: { provider: fallback.provider, model: fallback.model },
+            primary: { provider: String(effective.provider), model: String(effective.model) },
+            fallback: { provider: String(fallback.provider), model: String(fallback.model) },
           }),
         );
         if (controlResult.consumed === true) {

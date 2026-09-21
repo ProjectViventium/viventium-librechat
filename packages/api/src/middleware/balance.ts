@@ -10,6 +10,16 @@ export interface BalanceMiddlewareOptions {
   Balance: Model<IBalance>;
 }
 
+type BalanceRecord = Pick<
+  IBalance,
+  | 'tokenCredits'
+  | 'autoRefillEnabled'
+  | 'refillIntervalValue'
+  | 'refillIntervalUnit'
+  | 'refillAmount'
+  | 'lastRefill'
+>;
+
 /**
  * Build an object containing fields that need updating
  * @param config - The balance configuration
@@ -19,7 +29,7 @@ export interface BalanceMiddlewareOptions {
  */
 function buildUpdateFields(
   config: BalanceConfig,
-  userRecord: IBalance | null,
+  userRecord: BalanceRecord | null,
   userId: string,
 ): BalanceUpdateFields {
   const updateFields: BalanceUpdateFields = {};

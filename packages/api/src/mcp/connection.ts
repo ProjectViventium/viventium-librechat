@@ -101,18 +101,19 @@ function sanitizeTransportErrorForLog(error: unknown): {
   message: string | null;
 } {
   const record = error && typeof error === 'object' ? (error as Record<string, unknown>) : {};
-  const message =
-    error instanceof Error
-      ? error.message
-      : typeof error === 'string'
-        ? error
-        : typeof record.message === 'string'
-          ? record.message
-          : '';
+  let message = '';
+  if (error instanceof Error) {
+    message = error.message;
+  } else if (typeof error === 'string') {
+    message = error;
+  } else if (typeof record.message === 'string') {
+    message = record.message;
+  }
   return {
     name: error instanceof Error ? error.name : null,
     code: record.code ?? null,
-    status: typeof record.status === 'number' && Number.isFinite(record.status) ? record.status : null,
+    status:
+      typeof record.status === 'number' && Number.isFinite(record.status) ? record.status : null,
     message: message
       ? message
           .replace(/https?:\/\/[^\s)]+/gi, '<url>')
@@ -591,7 +592,7 @@ export class MCPConnection extends EventEmitter {
                   ...init,
                   redirect: 'manual',
                   dispatcher: sseAgent,
-                  headers: fetchHeaders,
+                  headers: Object.fromEntries(fetchHeaders.entries()),
                 });
               },
             },
@@ -607,7 +608,10 @@ export class MCPConnection extends EventEmitter {
           };
 
           transport.onmessage = (message) => {
-            logger.info(`${this.getLogPrefix()} Message received`, summarizeJsonRpcMessageForLog(message));
+            logger.info(
+              `${this.getLogPrefix()} Message received`,
+              summarizeJsonRpcMessageForLog(message),
+            );
           };
 
           this.setupTransportErrorHandlers(transport);
@@ -639,11 +643,9 @@ export class MCPConnection extends EventEmitter {
               headers,
               signal: abortController.signal,
             },
-            fetch: this.createFetchFunction(
-              this.getRequestHeaders.bind(this),
-              this.timeout,
-              { sseReadTimeout },
-            ) as unknown as FetchLike,
+            fetch: this.createFetchFunction(this.getRequestHeaders.bind(this), this.timeout, {
+              sseReadTimeout,
+            }) as unknown as FetchLike,
           });
 
           transport.onclose = () => {
@@ -652,7 +654,10 @@ export class MCPConnection extends EventEmitter {
           };
 
           transport.onmessage = (message: JSONRPCMessage) => {
-            logger.info(`${this.getLogPrefix()} Message received`, summarizeJsonRpcMessageForLog(message));
+            logger.info(
+              `${this.getLogPrefix()} Message received`,
+              summarizeJsonRpcMessageForLog(message),
+            );
           };
 
           this.setupTransportErrorHandlers(transport);
@@ -818,7 +823,10 @@ export class MCPConnection extends EventEmitter {
             await this.closeRegisteredAgents();
             this.transport = null;
           } catch (error) {
-            logger.warn(`${this.getLogPrefix()} Error closing connection:`, sanitizeTransportErrorForLog(error));
+            logger.warn(
+              `${this.getLogPrefix()} Error closing connection:`,
+              sanitizeTransportErrorForLog(error),
+            );
           }
         }
 
@@ -979,7 +987,10 @@ export class MCPConnection extends EventEmitter {
         throw new Error('Connection not established');
       }
     } catch (error) {
-      logger.error(`${this.getLogPrefix()} Connection failed:`, sanitizeTransportErrorForLog(error));
+      logger.error(
+        `${this.getLogPrefix()} Connection failed:`,
+        sanitizeTransportErrorForLog(error),
+      );
       throw error;
     }
   }
@@ -1033,7 +1044,9 @@ export class MCPConnection extends EventEmitter {
       if (errorCode === 404 && errorMessage.toLowerCase().includes('failed to open sse stream')) {
         const sessionId = (transport as Transport & { sessionId?: string }).sessionId;
         if (!sessionId) {
-          logger.warn(`${this.getLogPrefix()} SSE stream not available (404, no session). Ignoring.`);
+          logger.warn(
+            `${this.getLogPrefix()} SSE stream not available (404, no session). Ignoring.`,
+          );
           return;
         }
         logger.warn(

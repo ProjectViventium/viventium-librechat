@@ -125,19 +125,34 @@ describe('Memory Agent Header Resolution', () => {
   });
 
   it('preserves local host capacity through the governed memory error artifact without auth gating', async () => {
-    const route = { userId: 'host-capacity-owner', provider: Providers.OPENAI, model: 'configured-memory-model' };
+    const route = {
+      userId: 'host-capacity-owner',
+      provider: Providers.OPENAI,
+      model: 'configured-memory-model',
+    };
     clearMemoryWriterHealth(route);
     (Run.create as jest.Mock).mockImplementationOnce(() => ({
-      processStream: jest.fn().mockRejectedValue(Object.assign(new Error('private host details'), {
-        status: 503, type: 'server_error', code: 'host_capacity',
-      })),
+      processStream: jest.fn().mockRejectedValue(
+        Object.assign(new Error('private host details'), {
+          status: 503,
+          type: 'server_error',
+          code: 'host_capacity',
+        }),
+      ),
     }));
     const attachments = await processMemory({
-      res: mockRes, userId: route.userId,
-      setMemory: mockMemoryMethods.setMemory, deleteMemory: mockMemoryMethods.deleteMemory,
-      messages: [], memory: '', messageId: 'msg-capacity', conversationId: 'conv-capacity',
-      validKeys: ['preferences'], instructions: 'test instructions',
-      llmConfig: { provider: route.provider, model: route.model }, user: testUser,
+      res: mockRes,
+      userId: route.userId,
+      setMemory: mockMemoryMethods.setMemory,
+      deleteMemory: mockMemoryMethods.deleteMemory,
+      messages: [],
+      memory: '',
+      messageId: 'msg-capacity',
+      conversationId: 'conv-capacity',
+      validKeys: ['preferences'],
+      instructions: 'test instructions',
+      llmConfig: { provider: route.provider, model: route.model },
+      user: testUser,
     });
     const value = String(attachments?.[0]?.[Tools.memory]?.value);
     expect(JSON.parse(value)).toMatchObject({
@@ -1011,6 +1026,180 @@ describe('Memory snapshot loading', () => {
     expect(context.omittedKeys).not.toContain('preferences:truncated');
   });
 
+  it('exposes a governed world key up to its storage ceiling so middle facts are not silently lost', async () => {
+    const userId = new Types.ObjectId();
+    const middleFact = 'Synthetic pet fact: Juniper is a dog.';
+    const value = [
+      ...Array.from({ length: 65 }, (_, index) => `- Older world fact ${index}.`),
+      `- ${middleFact}`,
+      ...Array.from({ length: 65 }, (_, index) => `- Newer world fact ${index}.`),
+    ].join('\n');
+    const tokenCount = Math.ceil(value.length / 4);
+    expect(tokenCount).toBeLessThanOrEqual(1200);
+    const methods = {
+      setMemory: jest.fn(),
+      deleteMemory: jest.fn(),
+      getFormattedMemories: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([
+        {
+          _id: new Types.ObjectId(),
+          userId,
+          key: 'world',
+          value,
+          tokenCount,
+          updated_at: new Date('2026-08-08T00:00:00Z'),
+        },
+      ]),
+    };
+
+    const context = await loadMemoryReadContext({
+      userId,
+      memoryMethods: methods,
+      config: { validKeys: ['world'] },
+    });
+
+    expect(context.text).toContain(middleFact);
+    expect(context.text).not.toContain('Memory read boundary');
+    expect(context.omittedKeys).not.toContain('world:truncated');
+  });
+
+  it('uses the persisted tokenizer count when an English value fits its governed key budget', async () => {
+    const userId = new Types.ObjectId();
+    const value = `HEAD ${'real tokenizer budget text '.repeat(215)} MIDDLE_CANARY TAIL`;
+    expect(Math.ceil(value.length / 4)).toBeGreaterThan(1200);
+    const methods = {
+      setMemory: jest.fn(),
+      deleteMemory: jest.fn(),
+      getFormattedMemories: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([
+        {
+          _id: new Types.ObjectId(),
+          userId,
+          key: 'world',
+          value,
+          tokenCount: 1191,
+          updated_at: new Date('2026-08-08T00:00:00Z'),
+        },
+      ]),
+    };
+
+    const context = await loadMemoryReadContext({
+      userId,
+      memoryMethods: methods,
+      config: { validKeys: ['world'] },
+    });
+
+    expect(context.text).toContain('MIDDLE_CANARY');
+    expect(context.text).not.toContain('Memory read boundary');
+    expect(context.totalTokens).toBe(1191);
+    expect(context.omittedKeys).not.toContain('world:truncated');
+  });
+
+  it('keeps lifecycle metadata out of the model-facing memory snapshot', async () => {
+    const methods = {
+      setMemory: jest.fn(),
+      deleteMemory: jest.fn(),
+      getFormattedMemories: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([
+        {
+          key: 'context',
+          value: [
+            'Current synthetic priority is the north launch review.',
+            '_updated: 2026-08-09 | _stale_after: 2026-08-10 | _expires: 2026-08-12',
+          ].join('\n'),
+          tokenCount: 30,
+        },
+      ]),
+    };
+
+    const context = await loadMemoryReadContext({
+      userId: 'user-lifecycle-boundary',
+      memoryMethods: methods,
+      config: { validKeys: ['context'] },
+    });
+
+    expect(context.text).toContain('Current synthetic priority is the north launch review.');
+    expect(context.text).not.toContain('_updated');
+    expect(context.text).not.toContain('_stale_after');
+    expect(context.text).not.toContain('_expires');
+  });
+
+  it('surfaces fully omitted keys to the model instead of hiding them in telemetry', async () => {
+    const methods = {
+      setMemory: jest.fn(),
+      deleteMemory: jest.fn(),
+      getFormattedMemories: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([
+        { key: 'core', value: 'Core consumes the budget.', tokenCount: 8 },
+        { key: 'world', value: 'Hidden world value.', tokenCount: 5 },
+      ]),
+    };
+    const context = await loadMemoryReadContext({
+      userId: 'user-omission',
+      memoryMethods: methods,
+      config: {
+        validKeys: ['core', 'world'],
+        readProfile: { tokenLimit: 8, keyOrder: ['core', 'world'] },
+      },
+    });
+
+    expect(context.text).toContain('omitted entire saved-memory keys (world)');
+    expect(context.text).toContain('snapshot as incomplete');
+    expect(context.omittedKeys).toContain('world');
+  });
+
+  it('retains bounded head and tail evidence from one oversized unpunctuated entry', async () => {
+    const value = `HEAD_CANARY ${'continuousword '.repeat(600)} TAIL_CANARY`;
+    const methods = {
+      setMemory: jest.fn(),
+      deleteMemory: jest.fn(),
+      getFormattedMemories: jest.fn(),
+      getAllUserMemories: jest
+        .fn()
+        .mockResolvedValue([{ key: 'world', value, tokenCount: Math.ceil(value.length / 4) }]),
+    };
+
+    const context = await loadMemoryReadContext({
+      userId: 'user-single-segment',
+      memoryMethods: methods,
+      config: {
+        validKeys: ['world'],
+        readProfile: { tokenLimit: 120, keyLimits: { world: 120 } },
+      },
+    });
+
+    expect(context.text).toContain('HEAD_CANARY');
+    expect(context.text).toContain('TAIL_CANARY');
+    expect(context.text).toContain('Memory read boundary');
+    expect(context.omittedKeys).toContain('world:truncated');
+  });
+
+  it('does not let stale persisted token metadata exceed the total read budget', async () => {
+    const oversized = 'Bounded content '.repeat(100);
+    const methods = {
+      setMemory: jest.fn(),
+      deleteMemory: jest.fn(),
+      getFormattedMemories: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([
+        { key: 'core', value: oversized, tokenCount: 1 },
+        { key: 'world', value: 'This key must not leak past the total budget.', tokenCount: 1 },
+      ]),
+    };
+
+    const context = await loadMemoryReadContext({
+      userId: 'user-stale-token-count',
+      memoryMethods: methods,
+      config: {
+        validKeys: ['core', 'world'],
+        readProfile: { tokenLimit: 40, keyOrder: ['core', 'world'], keyLimits: { core: 40 } },
+      },
+    });
+
+    expect(context.totalTokens).toBeLessThanOrEqual(40);
+    expect(context.omittedKeys).toContain('world');
+    expect(context.text).not.toContain('This key must not leak past the total budget.');
+  });
+
   it('caches the read context by user and read profile until explicitly cleared', async () => {
     const methods = {
       setMemory: jest.fn(),
@@ -1110,6 +1299,117 @@ describe('Memory snapshot loading', () => {
       expect(gate.message).toContain('Reconnect');
       expect(gate.shouldLog).toBe(true);
     }
+  });
+
+  it('isolates terminal quota cooldowns by memory owner, provider, and model', () => {
+    const status = markMemoryWriterFailure({
+      userId: 'quota-owner-a',
+      provider: 'openAI',
+      model: 'gpt-quota-primary',
+      error: { status: 429, type: 'usage_limit_reached' },
+    });
+
+    expect(status).toEqual(
+      expect.objectContaining({
+        reason: 'quota',
+        errorType: 'usage_limit_reached',
+        provider: 'openai',
+        model: 'gpt-quota-primary',
+      }),
+    );
+    expect(
+      getMemoryWriterHealthGate({
+        userId: 'quota-owner-a',
+        provider: 'openai',
+        model: 'gpt-quota-primary',
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        blocked: true,
+        reason: 'quota',
+        errorType: 'usage_limit_reached',
+      }),
+    );
+    expect(
+      getMemoryWriterHealthGate({
+        userId: 'quota-owner-b',
+        provider: 'openai',
+        model: 'gpt-quota-primary',
+      }),
+    ).toEqual({ blocked: false });
+    expect(
+      getMemoryWriterHealthGate({
+        userId: 'quota-owner-a',
+        provider: 'anthropic',
+        model: 'claude-quota-fallback',
+      }),
+    ).toEqual({ blocked: false });
+    expect(
+      getMemoryWriterHealthGate({
+        userId: 'quota-owner-a',
+        provider: 'openai',
+        model: 'gpt-quota-other',
+      }),
+    ).toEqual({ blocked: false });
+
+    clearMemoryWriterHealth({ userId: 'quota-owner-a' });
+  });
+
+  it('reopens a terminal quota route when its bounded cooldown expires', () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+
+    try {
+      const status = markMemoryWriterFailure({
+        userId: 'quota-cooldown-owner',
+        provider: Providers.OPENAI,
+        model: 'gpt-quota-cooldown',
+        error: { response: { status: 429, data: { error: { code: 'insufficient_quota' } } } },
+      });
+
+      expect(status).toEqual(
+        expect.objectContaining({ reason: 'quota', errorType: 'insufficient_quota' }),
+      );
+      expect(status?.blockedUntil).toBeGreaterThan(Date.now());
+
+      now.mockReturnValue((status?.blockedUntil ?? Date.now()) - 1);
+      expect(
+        getMemoryWriterHealthGate({
+          userId: 'quota-cooldown-owner',
+          provider: 'openai',
+          model: 'gpt-quota-cooldown',
+        }).blocked,
+      ).toBe(true);
+
+      now.mockReturnValue(status?.blockedUntil ?? Date.now());
+      expect(
+        getMemoryWriterHealthGate({
+          userId: 'quota-cooldown-owner',
+          provider: 'openai',
+          model: 'gpt-quota-cooldown',
+        }),
+      ).toEqual({ blocked: false });
+    } finally {
+      now.mockRestore();
+      clearMemoryWriterHealth({ userId: 'quota-cooldown-owner' });
+    }
+  });
+
+  it('does not classify a transient rate limit as terminal quota exhaustion', () => {
+    const status = markMemoryWriterFailure({
+      userId: 'transient-rate-owner',
+      provider: Providers.OPENAI,
+      model: 'gpt-rate-limited',
+      error: { status: 429, type: 'rate_limit_exceeded' },
+    });
+
+    expect(status).toBeUndefined();
+    expect(
+      getMemoryWriterHealthGate({
+        userId: 'transient-rate-owner',
+        provider: 'openai',
+        model: 'gpt-rate-limited',
+      }),
+    ).toEqual({ blocked: false });
   });
 
   it('recognizes nested provider authorization failures and clears every model after reconnect', () => {
@@ -1273,6 +1573,7 @@ describe('Memory snapshot loading', () => {
       setMemory: jest.fn().mockResolvedValue({ ok: true }),
       deleteMemory: jest.fn(),
       getAllUserMemories: jest.fn().mockResolvedValue([]),
+      getAllUserMemoryStates: jest.fn(),
       getFormattedMemories: jest.fn(),
     };
 
@@ -1607,61 +1908,65 @@ describe('Memory policy retry contract', () => {
     });
   });
 
-  it.each(['ETIMEDOUT', 'host_capacity'])('does not replay an applied write after %s', async (code) => {
-    let processStream: jest.Mock;
-    (Run.create as jest.Mock).mockImplementation((runConfig) => {
-      processStream = jest.fn(async () => {
-        const decisionTool = runConfig.graphConfig.tools.find(
-          (candidate: { name: string }) => candidate.name === 'apply_memory_changes',
-        );
-        const result = await decisionTool.func({
-          operations: [{ action: 'set', key: 'preferences', value: '123456789' }],
+  it.each(['ETIMEDOUT', 'host_capacity'])(
+    'does not replay an applied write after %s',
+    async (code) => {
+      let processStream: jest.Mock;
+      (Run.create as jest.Mock).mockImplementation((runConfig) => {
+        processStream = jest.fn(async () => {
+          const decisionTool = runConfig.graphConfig.tools.find(
+            (candidate: { name: string }) => candidate.name === 'apply_memory_changes',
+          );
+          const result = await decisionTool.func({
+            operations: [{ action: 'set', key: 'preferences', value: '123456789' }],
+          });
+          const handler = Object.values(runConfig.customHandlers)[0] as {
+            handle: (event: string, data: unknown, metadata: unknown) => void;
+          };
+          handler.handle(
+            'tool_end',
+            { output: { artifact: result[1], tool_call_id: 'memory-call-0' } },
+            { run_id: 'msg-123', thread_id: 'conv-123' },
+          );
+          const error = Object.assign(new Error('synthetic timeout'), { code });
+          throw error;
         });
-        const handler = Object.values(runConfig.customHandlers)[0] as {
-          handle: (event: string, data: unknown, metadata: unknown) => void;
-        };
-        handler.handle(
-          'tool_end',
-          { output: { artifact: result[1], tool_call_id: 'memory-call-0' } },
-          { run_id: 'msg-123', thread_id: 'conv-123' },
-        );
-        const error = Object.assign(new Error('synthetic timeout'), { code });
-        throw error;
+        return { processStream };
       });
-      return { processStream };
-    });
-    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+      const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
 
-    const attachments = await processMemory({
-      res: { write: jest.fn(), end: jest.fn(), headersSent: false } as unknown as Response,
-      userId: 'user-123',
-      messageId: 'msg-123',
-      conversationId: 'conv-123',
-      messages: [],
-      memory: 'Existing synthetic memory',
-      instructions: 'Apply explicit durable-memory requests.',
-      llmConfig: { provider: Providers.OPENAI, model: 'gpt-5.4' },
-      validKeys: ['preferences'],
-      keyLimits: { preferences: 10 },
-      tokenLimit: 100,
-      memoryTokenMap: { preferences: 9 },
-      memoryRevisionMap: { preferences: 0 },
-      totalTokens: 9,
-      setMemory,
-      deleteMemory: jest.fn().mockResolvedValue({ ok: true }),
-      user: createTestUser(),
-    });
-
-    expect(processStream!).toHaveBeenCalledTimes(1);
-    expect(setMemory).toHaveBeenCalledTimes(1);
-    if (code === 'host_capacity') {
-      expect(JSON.parse(String(attachments?.at(-1)?.[Tools.memory]?.value))).toMatchObject({
-        errorType: 'host_capacity',
-        partialApplied: true,
-        message: 'Saved memory was only partially updated because there was not enough free capacity.',
+      const attachments = await processMemory({
+        res: { write: jest.fn(), end: jest.fn(), headersSent: false } as unknown as Response,
+        userId: 'user-123',
+        messageId: 'msg-123',
+        conversationId: 'conv-123',
+        messages: [],
+        memory: 'Existing synthetic memory',
+        instructions: 'Apply explicit durable-memory requests.',
+        llmConfig: { provider: Providers.OPENAI, model: 'gpt-5.4' },
+        validKeys: ['preferences'],
+        keyLimits: { preferences: 10 },
+        tokenLimit: 100,
+        memoryTokenMap: { preferences: 9 },
+        memoryRevisionMap: { preferences: 0 },
+        totalTokens: 9,
+        setMemory,
+        deleteMemory: jest.fn().mockResolvedValue({ ok: true }),
+        user: createTestUser(),
       });
-    }
-  });
+
+      expect(processStream!).toHaveBeenCalledTimes(1);
+      expect(setMemory).toHaveBeenCalledTimes(1);
+      if (code === 'host_capacity') {
+        expect(JSON.parse(String(attachments?.at(-1)?.[Tools.memory]?.value))).toMatchObject({
+          errorType: 'host_capacity',
+          partialApplied: true,
+          message:
+            'Saved memory was only partially updated because there was not enough free capacity.',
+        });
+      }
+    },
+  );
 });
 
 describe('current saved-memory factual snapshot', () => {

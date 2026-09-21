@@ -197,7 +197,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ProjectViventium/GlassHive
-          ref: codex/public-main-lockin-20260920-final
+          ref: codex/public-main-glasshive-sanitized
           path: parent-viventium/viventium_v0_4/GlassHive
       # VIVENTIUM END
 

@@ -167,11 +167,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: ['1/2', '2/2']
+        shard: ['1/4', '2/4', '3/4', '4/4']
     # VIVENTIUM END
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       VIVENTIUM_TEST_PRODUCTION_ROOT: ${{ github.workspace }}/parent-viventium
       MONGO_URI: ${{ secrets.MONGO_URI }}
@@ -194,6 +194,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: parent-viventium/viventium_v0_4/LibreChat
+      - uses: actions/checkout@v4
+        with:
+          repository: ProjectViventium/GlassHive
+          ref: codex/public-main-lockin-20260920-final
+          path: parent-viventium/viventium_v0_4/GlassHive
       # VIVENTIUM END
 
       # VIVENTIUM START — exact release toolchain.
@@ -209,7 +214,6 @@ jobs:
         with:
           version: '0.9.5'
       - name: Prepare scheduler integration runtime
-        if: matrix.shard == '1/2'
         working-directory: viventium/MCPs/scheduling-cortex
         run: uv sync --frozen
       # VIVENTIUM END
@@ -257,8 +261,8 @@ jobs:
         run: cp api/test/.env.test.example api/test/.env.test
 
       - name: Run unit tests
-        # VIVENTIUM START — run one disjoint half and recycle idle workers before heap retention can exhaust CI.
-        run: cd api && npm run test:ci -- --shard=${{ matrix.shard }} --workerIdleMemoryLimit=1GB
+        # VIVENTIUM START — split coverage across isolated jobs; bound each job to one recyclable worker.
+        run: cd api && npm run test:ci -- --shard=${{ matrix.shard }} --maxWorkers=1 --workerIdleMemoryLimit=1GB
         # VIVENTIUM END
 
   test-data-provider:

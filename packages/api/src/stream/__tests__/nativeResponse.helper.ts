@@ -10,6 +10,7 @@ export async function admitted(
   streamId = 'stream-a',
   ordered = true,
   surface: 'web' | 'telegram' = 'web',
+  externalDelivery = false,
 ) {
   if (ordered) await store.observeSourceOrder?.({ source_order_scope: scope, source_sequence: 1 });
   const claim = await store.claimLogicalTurn(streamId, 'owner', {
@@ -25,6 +26,9 @@ export async function admitted(
     responseMessageId: 'assistant',
     interactionContext: claim.interactionContext,
     userMessage: { messageId: 'source' },
+    ...(externalDelivery
+      ? { deliveryPolicy: { commit_authority: 'external_adapter' as const } }
+      : {}),
   });
   const admittedAt = Date.now();
   const identity: NativeResponseIdentity = {

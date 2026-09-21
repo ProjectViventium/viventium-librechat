@@ -1489,7 +1489,7 @@ describe('conversationRecallService', () => {
     });
 
     expect(afterCommit).toHaveLength(1);
-    expect(jest.getTimerCount()).toBe(0);
+    expect(scheduleTimer).not.toHaveBeenCalled();
     expect(mockMessageFind).not.toHaveBeenCalled();
 
     await afterCommit[0]();
@@ -1504,7 +1504,7 @@ describe('conversationRecallService', () => {
       conversationId: 'conv_aborted',
     });
     expect(afterCommit).toHaveLength(2);
-    expect(jest.getTimerCount()).toBe(0);
+    expect(scheduleTimer).not.toHaveBeenCalled();
 
     await jest.runOnlyPendingTimersAsync();
     expect(mockMessageFind).toHaveBeenCalledTimes(1);

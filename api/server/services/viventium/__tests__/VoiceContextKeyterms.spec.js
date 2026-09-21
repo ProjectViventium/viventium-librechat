@@ -9,25 +9,25 @@ describe('voice context keyterms', () => {
   test('projects owner-visible display names and stable titles without file bodies or paths', () => {
     const keyterms = voiceContextKeytermsFromFiles([
       {
-        filename: 'Quarterly Roadmap 2026.pdf',
-        filepath: '/private/owner/secret/Quarterly Roadmap 2026.pdf',
+        filename: 'Example Planning Notes.pdf',
+        filepath: '/private/owner/secret/Example Planning Notes.pdf',
         text: 'do not send document contents to STT',
-        metadata: { meetingTranscriptDisplayTitle: 'Q4 Planning Review' },
+        metadata: { meetingTranscriptDisplayTitle: 'Example Review' },
       },
       {
-        filename: 'EIN-Migration Plan.xlsx',
-        metadata: { meetingTranscriptDisplayTitle: 'Finance Migration' },
+        filename: 'Example Reference Table.xlsx',
+        metadata: { meetingTranscriptDisplayTitle: 'Example Meeting' },
       },
       {
-        filename: 'quarterly roadmap 2026.pdf',
+        filename: 'example planning notes.pdf',
       },
     ]);
 
     expect(keyterms).toEqual([
-      'Quarterly Roadmap 2026.pdf',
-      'Q4 Planning Review',
-      'EIN-Migration Plan.xlsx',
-      'Finance Migration',
+      'Example Planning Notes.pdf',
+      'Example Review',
+      'Example Reference Table.xlsx',
+      'Example Meeting',
     ]);
     expect(keyterms.join(' ')).not.toContain('secret');
     expect(keyterms.join(' ')).not.toContain('document contents');
@@ -56,15 +56,15 @@ describe('voice context keyterms', () => {
   test('projects only native artifact filenames', () => {
     const keyterms = voiceContextKeytermsFromNativeFiles([
       {
-        filename: 'winter-boat-checklist.txt',
+        filename: 'example-checklist.txt',
         filepath: '/private/body/path',
         sha256: 'not-forwarded',
       },
-      { filename: 'Finance_Migration_Plan.xlsx', body: 'not-forwarded' },
-      { filename: 'winter-boat-checklist.txt' },
+      { filename: 'Example_Reference_Table.xlsx', body: 'not-forwarded' },
+      { filename: 'example-checklist.txt' },
     ]);
 
-    expect(keyterms).toEqual(['winter-boat-checklist.txt', 'Finance_Migration_Plan.xlsx']);
+    expect(keyterms).toEqual(['example-checklist.txt', 'Example_Reference_Table.xlsx']);
     expect(keyterms.join(' ')).not.toContain('private');
     expect(keyterms.join(' ')).not.toContain('not-forwarded');
   });

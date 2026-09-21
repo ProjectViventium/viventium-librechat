@@ -2027,7 +2027,7 @@ describe('CallSessionService', () => {
         user: user._id,
         file_id: 'file-roadmap',
         bytes: 10,
-        filename: 'Quarterly Roadmap 2026.pdf',
+        filename: 'Example Planning Notes.pdf',
         filepath: '/not-forwarded/roadmap.pdf',
         object: 'file',
         type: 'application/pdf',
@@ -2036,11 +2036,11 @@ describe('CallSessionService', () => {
         user: user._id,
         file_id: 'file-migration',
         bytes: 10,
-        filename: 'EIN-Migration Plan.xlsx',
+        filename: 'Example Reference Table.xlsx',
         filepath: '/not-forwarded/migration.xlsx',
         object: 'file',
         type: 'application/vnd.ms-excel',
-        metadata: { meetingTranscriptDisplayTitle: 'Finance Migration' },
+        metadata: { meetingTranscriptDisplayTitle: 'Example Meeting' },
       },
       {
         user: otherUser._id,
@@ -2061,9 +2061,9 @@ describe('CallSessionService', () => {
 
     expect(created.contextualKeyterms).toEqual(
       expect.arrayContaining([
-        'Quarterly Roadmap 2026.pdf',
-        'EIN-Migration Plan.xlsx',
-        'Finance Migration',
+        'Example Planning Notes.pdf',
+        'Example Reference Table.xlsx',
+        'Example Meeting',
       ]),
     );
     expect(created.contextualKeyterms).toHaveLength(3);
@@ -2102,8 +2102,8 @@ describe('CallSessionService', () => {
         metadata: {
           viventium: {
             nativeFiles: [
-              { filename: 'winter-boat-checklist.txt', filepath: '/private/body/path' },
-              { filename: 'Finance_Migration_Plan.xlsx', sha256: 'not-forwarded' },
+              { filename: 'example-checklist.txt', filepath: '/private/body/path' },
+              { filename: 'Example_Reference_Table.xlsx', sha256: 'not-forwarded' },
             ],
           },
         },
@@ -2127,8 +2127,8 @@ describe('CallSessionService', () => {
     });
 
     expect(created.contextualKeyterms).toEqual([
-      'winter-boat-checklist.txt',
-      'Finance_Migration_Plan.xlsx',
+      'example-checklist.txt',
+      'Example_Reference_Table.xlsx',
     ]);
     expect(created.contextualKeyterms.join(' ')).not.toContain('private');
     expect(created.contextualKeyterms.join(' ')).not.toContain('not-forwarded');

@@ -600,15 +600,16 @@ describe('native publication on actual Redis Cluster slots', () => {
   });
   test('external delivery keeps settled FINAL until the exact adapter acknowledgement', async () => {
     const store = new RedisJobStore(redis, { completedTtl: 1 });
-    const { identity } = await admitted(store, 'stream-telegram-delivery', true, 'telegram');
+    const { identity } = await admitted(store, 'stream-telegram-delivery', true, 'telegram', true);
     const manager = new GenerationJobManagerClass({
       jobStore: store,
       eventTransport: new InMemoryEventTransport(),
       cleanupOnComplete: false,
     });
     manager.initialize();
-    await store.updateJob(identity.streamId, {
+    expect(await store.getJob(identity.streamId)).toMatchObject({
       deliveryPolicy: { commit_authority: 'external_adapter' },
+      interactionContext: { surface: 'telegram' },
     });
     await store.bindNativeResponse(identity);
     await store.commitNativeResponse(identity, 'a'.repeat(64));

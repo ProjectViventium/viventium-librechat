@@ -800,7 +800,7 @@ describe('/api/viventium/voice/chat', () => {
         stt: { provider: 'assemblyai', variant: 'universal-streaming' },
         tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
       },
-      contextualKeyterms: ['Quarterly Roadmap 2026.pdf', 'EIN-Migration Plan.xlsx'],
+      contextualKeyterms: ['Example Planning Notes.pdf', 'Example Reference Table.xlsx'],
       speakerSessionState: {
         version: 1,
         callSessionId: 'call_session_1',
@@ -854,7 +854,7 @@ describe('/api/viventium/voice/chat', () => {
         stt: { provider: 'assemblyai', variant: 'universal-streaming' },
         tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
       },
-      contextualKeyterms: ['Quarterly Roadmap 2026.pdf', 'EIN-Migration Plan.xlsx'],
+      contextualKeyterms: ['Example Planning Notes.pdf', 'Example Reference Table.xlsx'],
       speakerSessionState: { attributionState: 'shared_mic_unverified', revision: 3 },
       callState: {
         version: 1,

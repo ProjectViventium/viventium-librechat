@@ -52,9 +52,7 @@ describe('Main runtime recurrence context wiring', () => {
     path.join(__dirname, '../../../controllers/agents/client.js'),
     'utf8',
   );
-  const start = source.indexOf(
-    '      const timeContextInstructions = buildTimeContextInstructions(this.options.req);',
-  );
+  const start = source.indexOf('      const timeContextInstructions = replaysPinnedMainContext');
   const end = source.indexOf('      /* === VIVENTIUM NOTE END === */', start);
   const state = {
     version: 1,
@@ -75,10 +73,18 @@ describe('Main runtime recurrence context wiring', () => {
       config: { configurable: { requestBody } },
       surfacePromptLayers,
       voiceMode: false,
+      replaysPinnedMainContext: false,
+      telegramReplyContext: '',
       buildTimeContextInstructions: () => '',
-      getActiveWorkTurnContext: async () => '',
-      loadAcceptedMainContext: async () => ({ messageCapsule: '' }),
-      buildSavedMemoryTurnContext: () => '',
+      resolveActiveWorkTurnContext: async () => '',
+      sourceSelectionTurnContext: () => '',
+      stableAuthorityDigest: () => '',
+      loadAcceptedMainContext: async () => ({ capsule: '' }),
+      evalIsolationForRequest: () => ({ savedMemory: false }),
+      isCancelledVoiceTask: () => false,
+      shouldSkipAutomaticMemoryWriter: () => false,
+      buildSavedMemoryWriterTurnContext: () => '',
+      combineTurnContextInstructions: (...parts) => parts.filter(Boolean).join('\n'),
       buildRecurrenceStateCapsule,
       applyTimeContextDelivery,
     };

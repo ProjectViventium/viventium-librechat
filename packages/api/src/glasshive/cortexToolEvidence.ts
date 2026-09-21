@@ -38,6 +38,7 @@ export function createCortexToolEvidence(
   };
   return {
     record,
+    verifiedReceiptCount: () => requirements.filter((required) => sources.has(required.tool)).length,
     observeGrant(grantId: string) {
       if (closed || !requirements.length || !grantId || grants.has(grantId)) return;
       const observers = grantObservers.get(grantId) ?? new Set();

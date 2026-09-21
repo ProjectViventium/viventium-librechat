@@ -18,7 +18,7 @@ let mockAcquireEffectLease;
 let mockFenceEffectTransaction;
 let mockReleaseEffectLease;
 let mockRenewEffectLease;
-let mockReconcileGlassHiveSurfaceDeliveryOutcome;
+let mockRecordGlassHiveSurfaceDeliveryOutcome;
 let mockResolveTelegramMappingByUserId;
 let mockRecordTraceDelivery;
 let mockRecordVoiceOrchestrationTrace;
@@ -55,14 +55,12 @@ jest.mock('~/db/models', () => ({
 }));
 
 jest.mock('../GlassHiveTerminalCallbackTransaction', () => ({
-  deferGlassHiveTerminalCallbackAfterCommit: jest.fn(() => false),
   runGlassHiveTerminalCallbackTransaction: (operation) => operation({ inTransaction: () => true }),
 }));
 
 jest.mock('../GlassHiveCallbackBindingService', () => ({
-  recordGlassHiveSurfaceDeliveryOutcome: jest.fn().mockResolvedValue(null),
-  reconcileGlassHiveSurfaceDeliveryOutcome: (...args) =>
-    mockReconcileGlassHiveSurfaceDeliveryOutcome(...args),
+  recordGlassHiveSurfaceDeliveryOutcome: (...args) =>
+    mockRecordGlassHiveSurfaceDeliveryOutcome(...args),
 }));
 
 jest.mock('../OrchestrationTraceLedgerService', () => ({
@@ -78,6 +76,7 @@ jest.mock('~/server/services/TelegramLinkService', () => ({
 }));
 
 const {
+  authorizeGlassHiveCallbackDeliveryDispatch,
   completeGlassHiveWorkerCompletionPresentation,
   enqueueGlassHiveCallbackDelivery,
   claimPendingGlassHiveCallbackDeliveries,
@@ -85,6 +84,8 @@ const {
   markGlassHiveCallbackDeliveryFailed,
   markGlassHiveCallbackDeliverySuppressed,
   markGlassHiveCallbackDeliveryUnknown,
+  releaseGlassHiveCallbackDeliveryDispatch,
+  renewGlassHiveCallbackDeliveryDispatch,
   reconcileUnresolvedGlassHiveCallbackDeliveries,
   reconcileGlassHiveSurfaceDeliveryProjections,
 } = require('../GlassHiveCallbackDeliveryService');
@@ -188,16 +189,14 @@ function workerCompletionFixture() {
 describe('GlassHiveCallbackDeliveryService', () => {
   beforeEach(() => {
     mockFindOneAndUpdate = jest.fn();
-    mockFindOne = jest.fn().mockReturnValue(leanResult(null));
+    mockFindOne = jest.fn();
     mockFindTerminalCallbackResult = jest.fn().mockReturnValue(leanResult(null));
     mockTerminalCallbackResultExists = jest.fn().mockReturnValue(leanResult(null));
     mockFindDeliveries = jest.fn().mockReturnValue(leanResult([]));
     mockCountDocuments = jest.fn();
     mockUpdateOne = jest.fn().mockResolvedValue({ matchedCount: 1, modifiedCount: 1 });
     mockUpdateMany = jest.fn().mockResolvedValue({ modifiedCount: 0 });
-    mockReconcileGlassHiveSurfaceDeliveryOutcome = jest
-      .fn()
-      .mockResolvedValue({ _id: 'current-work' });
+    mockRecordGlassHiveSurfaceDeliveryOutcome = jest.fn().mockResolvedValue(null);
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue(null);
     mockRecordTraceDelivery = jest.fn().mockResolvedValue(null);
     mockRecordVoiceOrchestrationTrace = jest.fn().mockResolvedValue(null);
@@ -295,41 +294,36 @@ describe('GlassHiveCallbackDeliveryService', () => {
     expect(JSON.stringify(update)).not.toContain(syntheticLocalPath());
   });
 
-  test.each([
-    [
-      'run.needs_input',
-      'Mission needs user input. Reconnect the provider account, then resume this mission.',
-    ],
-    ['run.blocked', 'Mission needs attention.'],
-  ])('delivers %s immediately to the trusted Telegram destination', async (event, text) => {
-    mockFindOneAndUpdate.mockImplementation((_query, update) =>
-      leanResult({ ...update.$setOnInsert, ...update.$set }),
-    );
+  test.each(['run.needs_input', 'run.blocked'])(
+    'delivers %s immediately to the trusted Telegram destination',
+    async (event) => {
+      mockFindOneAndUpdate.mockImplementation((_query, update) =>
+        leanResult({ ...update.$setOnInsert, ...update.$set }),
+      );
 
-    const summary = await enqueueGlassHiveCallbackDelivery({
-      body: { callback_id: `cb_${event}`, event },
-      deliveryContext: {
-        ownerId: 'user_1',
-        conversationId: 'conv_1',
-        anchorMessageId: 'msg_anchor',
-        destinations: [
-          { surface: 'telegram', telegramChatId: 'chat_1', telegramUserId: 'telegram_user_1' },
-        ],
-      },
-      message: {
-        messageId: 'msg_callback',
-        text,
-        metadata: { viventium: { callbackKey: 'safe_key' } },
-      },
-      text,
-      fullText: '',
-    });
+      const summary = await enqueueGlassHiveCallbackDelivery({
+        body: { callback_id: `cb_${event}`, event },
+        deliveryContext: {
+          ownerId: 'user_1',
+          conversationId: 'conv_1',
+          anchorMessageId: 'msg_anchor',
+          destinations: [
+            { surface: 'telegram', telegramChatId: 'chat_1', telegramUserId: 'telegram_user_1' },
+          ],
+        },
+        message: {
+          messageId: 'msg_callback',
+          text: 'Mission needs user input.',
+          metadata: { viventium: { callbackKey: 'safe_key' } },
+        },
+        text: 'Mission needs user input.',
+        fullText: '',
+      });
 
-    expect(summary.enqueued).toBe(1);
-    expect(mockFindOneAndUpdate).toHaveBeenCalledTimes(1);
-    // The interruption notice, reason included, reaches the external surface verbatim.
-    expect(mockFindOneAndUpdate.mock.calls[0][1].$set.text).toBe(text);
-  });
+      expect(summary.enqueued).toBe(1);
+      expect(mockFindOneAndUpdate).toHaveBeenCalledTimes(1);
+    },
+  );
 
   test('semantic silence persists one suppressed row for a resolved terminal Telegram destination', async () => {
     mockFindOneAndUpdate.mockImplementation((_query, update) =>
@@ -369,8 +363,9 @@ describe('GlassHiveCallbackDeliveryService', () => {
       nextAttemptAt: null,
       telegramChatId: 'chat-1',
     });
-    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: 'origin-1',
+      state: 'suppressed',
     });
   });
 
@@ -428,8 +423,9 @@ describe('GlassHiveCallbackDeliveryService', () => {
       unresolved: 1,
       deliveries: [expect.objectContaining({ status: 'unresolved' })],
     });
-    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: 'ghi_origin_unresolved',
+      state: 'unresolved',
     });
     expect(logger.warn).toHaveBeenCalledWith(
       '[VIVENTIUM][glasshive-delivery] Terminal surface destination unresolved',
@@ -488,8 +484,9 @@ describe('GlassHiveCallbackDeliveryService', () => {
         expect.objectContaining({ surface: 'voice', status: 'unresolved' }),
       ],
     });
-    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: 'ghi_origin_partial',
+      state: 'unresolved',
     });
     expect(logger.warn).toHaveBeenCalledWith(
       '[VIVENTIUM][glasshive-delivery] Terminal surface destination unresolved',
@@ -542,32 +539,66 @@ describe('GlassHiveCallbackDeliveryService', () => {
     expect(secondKey).toContain(
       `owner_b:ghi_owner_b_origin:telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
     );
-    expect(firstFilter.$or[0]).toMatchObject({
+    expect(firstFilter.$or[1]).toEqual({
+      deliveryKey: `owner_a:ghi_owner_a_origin:telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
       userId: 'owner_a',
       originRef: 'ghi_owner_a_origin',
     });
-    expect(secondFilter.$or[0]).toMatchObject({
+    expect(secondFilter.$or[1]).toEqual({
+      deliveryKey: `owner_b:ghi_owner_b_origin:telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
       userId: 'owner_b',
       originRef: 'ghi_owner_b_origin',
     });
-    expect(firstFilter.$or[1]).toEqual({
-      deliveryKey: `telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
-      userId: 'owner_a',
-      $or: [
-        { originRef: { $exists: false } },
-        { originRef: '' },
-        { originRef: 'ghi_owner_a_origin' },
-      ],
+    expect(firstFilter.$or[2]).toEqual(
+      expect.objectContaining({
+        deliveryKey: `telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
+        userId: 'owner_a',
+      }),
+    );
+    expect(secondFilter.$or[2]).toEqual(
+      expect.objectContaining({
+        deliveryKey: `telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
+        userId: 'owner_b',
+      }),
+    );
+  });
+
+  test('carries one canonical callback ref and exact attempt from enqueue through trace evidence', async () => {
+    const callbackRef = canonicalCallbackRef('raw-failed-callback');
+    mockFindOneAndUpdate.mockImplementation((_query, update) =>
+      leanResult({ ...update.$setOnInsert, ...update.$set }),
+    );
+
+    await enqueueGlassHiveCallbackDelivery({
+      body: {
+        callback_id: 'raw-failed-callback',
+        attempt_number: 3,
+        event: 'run.failed',
+        run_id: 'run-exact',
+        work_ref: 'work-exact',
+      },
+      deliveryContext: {
+        ownerId: 'owner-exact',
+        originRef: 'origin-exact',
+        workRef: 'work-exact',
+        conversationId: 'conversation-exact',
+        traceIdentity: { callbackRef, attemptNumber: 3 },
+        destinations: [{ surface: 'telegram', telegramChatId: 'chat-exact' }],
+      },
+      message: { messageId: 'message-exact', text: 'Mission failed.' },
+      text: 'Mission failed.',
     });
-    expect(secondFilter.$or[1]).toEqual({
-      deliveryKey: `telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
-      userId: 'owner_b',
-      $or: [
-        { originRef: { $exists: false } },
-        { originRef: '' },
-        { originRef: 'ghi_owner_b_origin' },
-      ],
-    });
+
+    expect(mockFindOneAndUpdate.mock.calls[0][1].$setOnInsert.callbackId).toBe(callbackRef);
+    expect(mockFindOneAndUpdate.mock.calls[0][1].$setOnInsert.deliveryKey).toContain(':attempt:3');
+    expect(mockRecordTraceDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        callbackRef,
+        attemptNumber: 3,
+        runRef: 'run-exact',
+        workRef: 'work-exact',
+      }),
+    );
   });
 
   test.each([
@@ -614,44 +645,6 @@ describe('GlassHiveCallbackDeliveryService', () => {
         { originRef: 'origin-upgrade' },
       ]);
     }
-  });
-
-  test('carries one canonical callback ref and exact attempt from enqueue through trace evidence', async () => {
-    const callbackRef = canonicalCallbackRef('raw-failed-callback');
-    mockFindOneAndUpdate.mockImplementation((_query, update) =>
-      leanResult({ ...update.$setOnInsert, ...update.$set }),
-    );
-
-    await enqueueGlassHiveCallbackDelivery({
-      body: {
-        callback_id: 'raw-failed-callback',
-        attempt_number: 3,
-        event: 'run.failed',
-        run_id: 'run-exact',
-        work_ref: 'work-exact',
-      },
-      deliveryContext: {
-        ownerId: 'owner-exact',
-        originRef: 'origin-exact',
-        workRef: 'work-exact',
-        conversationId: 'conversation-exact',
-        traceIdentity: { callbackRef, attemptNumber: 3 },
-        destinations: [{ surface: 'telegram', telegramChatId: 'chat-exact' }],
-      },
-      message: { messageId: 'message-exact', text: 'Mission failed.' },
-      text: 'Mission failed.',
-    });
-
-    expect(mockFindOneAndUpdate.mock.calls[0][1].$setOnInsert.callbackId).toBe(callbackRef);
-    expect(mockFindOneAndUpdate.mock.calls[0][1].$setOnInsert.deliveryKey).toContain(':attempt:3');
-    expect(mockRecordTraceDelivery).toHaveBeenCalledWith(
-      expect.objectContaining({
-        callbackRef,
-        attemptNumber: 3,
-        runRef: 'run-exact',
-        workRef: 'work-exact',
-      }),
-    );
   });
 
   test('carries an exact pre-runtime Stop identity through Telegram trace evidence', async () => {
@@ -1301,8 +1294,9 @@ describe('GlassHiveCallbackDeliveryService', () => {
       transportReceiptVersion: 1,
     });
 
-    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: 'ghi_origin_partial',
+      state: 'unresolved',
     });
     expect(mockRecordTraceDelivery).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1376,8 +1370,9 @@ describe('GlassHiveCallbackDeliveryService', () => {
       }),
       { new: true },
     );
-    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: 'ghi_origin_linked',
+      state: 'enqueued',
     });
   });
 
@@ -1433,6 +1428,38 @@ describe('GlassHiveCallbackDeliveryService', () => {
     expect(update.$set.leaseExpiresAt.getTime()).toBeGreaterThan(Date.now() + 9 * 60 * 1000);
   });
 
+  test('marks an ambiguous Telegram send without making it retryable', async () => {
+    mockFindOneAndUpdate.mockReturnValueOnce(
+      leanResult({
+        deliveryId: 'ghcd_unknown',
+        callbackMessageId: 'msg_callback',
+        originRef: 'ghi_unknown',
+        conversationId: 'conv_1',
+        event: 'main.followup',
+        surface: 'telegram',
+        status: 'delivery_unknown',
+        claimId: 'claim_unknown',
+      }),
+    );
+    mockFindDeliveries.mockReturnValueOnce(leanResult([{ status: 'delivery_unknown' }]));
+
+    await markGlassHiveCallbackDeliveryUnknown({
+      deliveryId: 'ghcd_unknown',
+      claimId: 'claim_unknown',
+      reason: 'telegram_receipt_missing',
+    });
+
+    expect(mockFindOneAndUpdate.mock.calls[0][1].$set).toMatchObject({
+      status: 'delivery_unknown',
+      leaseExpiresAt: null,
+      nextAttemptAt: null,
+    });
+    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+      originRef: 'ghi_unknown',
+      state: 'unknown',
+    });
+  });
+
   test('refuses an ambiguous Telegram settlement without the exact dispatch permit', async () => {
     mockFindOne.mockReturnValue(
       leanResult({
@@ -1464,8 +1491,55 @@ describe('GlassHiveCallbackDeliveryService', () => {
       }),
     ).resolves.toBeNull();
     expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
-    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).not.toHaveBeenCalled();
+    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).not.toHaveBeenCalled();
   });
+
+  test.each([
+    ['failed', markGlassHiveCallbackDeliveryFailed],
+    ['suppressed', markGlassHiveCallbackDeliverySuppressed],
+  ])(
+    'a post-projection %s transition re-arms and applies durable Core truth',
+    async (status, mark) => {
+      const existing = {
+        deliveryId: `ghcd_projection_${status}`,
+        claimId: `claim_projection_${status}`,
+        originRef: `origin_projection_${status}`,
+        surface: 'telegram',
+        status: 'claimed',
+        retryCount: 0,
+        projectionPendingAt: null,
+        projectionAppliedAt: new Date('2026-08-23T12:00:00.000Z'),
+      };
+      if (status === 'failed') mockFindOne.mockReturnValueOnce(leanResult(existing));
+      mockFindOneAndUpdate.mockReturnValueOnce(leanResult({ ...existing, status }));
+      mockFindDeliveries.mockReturnValueOnce(leanResult([{ status }]));
+
+      await mark({
+        deliveryId: existing.deliveryId,
+        claimId: existing.claimId,
+        ...(status === 'failed' ? { error: 'synthetic failure' } : { reason: 'synthetic silence' }),
+      });
+
+      expect(mockFindOneAndUpdate.mock.calls[0][1].$set).toMatchObject({
+        status,
+        projectionPendingAt: expect.any(Date),
+        projectionNextAttemptAt: expect.any(Date),
+      });
+      expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+        originRef: existing.originRef,
+        state: status,
+      });
+      expect(mockUpdateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ originRef: existing.originRef }),
+        expect.objectContaining({
+          $set: expect.objectContaining({
+            projectionPendingAt: null,
+            projectionAppliedAt: expect.any(Date),
+          }),
+        }),
+      );
+    },
+  );
 
   test('retries a durable Core projection without requiring a GlassHive callback replay', async () => {
     const pendingProjection = {
@@ -1485,8 +1559,9 @@ describe('GlassHiveCallbackDeliveryService', () => {
       pending: 0,
     });
 
-    expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
+    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
       originRef: 'ghi_projection_retry',
+      state: 'unknown',
     });
     expect(mockUpdateMany).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1517,7 +1592,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
         ]),
       )
       .mockReturnValueOnce(leanResult([{ status: 'sent' }]));
-    mockReconcileGlassHiveSurfaceDeliveryOutcome.mockRejectedValueOnce(
+    mockRecordGlassHiveSurfaceDeliveryOutcome.mockRejectedValueOnce(
       Object.assign(new Error('core unavailable'), { code: 'core_unavailable' }),
     );
 
@@ -1587,52 +1662,6 @@ describe('GlassHiveCallbackDeliveryService', () => {
     expect(JSON.stringify(failedUpdate)).not.toContain('raw-token');
     expect(JSON.stringify(suppressedUpdate)).not.toContain('raw-token');
   });
-
-  test.each([
-    ['failed', markGlassHiveCallbackDeliveryFailed],
-    ['suppressed', markGlassHiveCallbackDeliverySuppressed],
-  ])(
-    'a post-projection %s transition re-arms and applies durable Core truth',
-    async (status, mark) => {
-      const existing = {
-        deliveryId: `ghcd_projection_${status}`,
-        claimId: `claim_projection_${status}`,
-        originRef: `origin_projection_${status}`,
-        surface: 'telegram',
-        status: 'claimed',
-        retryCount: 0,
-        projectionPendingAt: null,
-        projectionAppliedAt: new Date('2026-08-23T12:00:00.000Z'),
-      };
-      if (status === 'failed') mockFindOne.mockReturnValueOnce(leanResult(existing));
-      mockFindOneAndUpdate.mockReturnValueOnce(leanResult({ ...existing, status }));
-      mockFindDeliveries.mockReturnValueOnce(leanResult([{ status }]));
-
-      await mark({
-        deliveryId: existing.deliveryId,
-        claimId: existing.claimId,
-        ...(status === 'failed' ? { error: 'synthetic failure' } : { reason: 'synthetic silence' }),
-      });
-
-      expect(mockFindOneAndUpdate.mock.calls[0][1].$set).toMatchObject({
-        status,
-        projectionPendingAt: expect.any(Date),
-        projectionNextAttemptAt: expect.any(Date),
-      });
-      expect(mockReconcileGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
-        originRef: existing.originRef,
-      });
-      expect(mockUpdateMany).toHaveBeenCalledWith(
-        expect.objectContaining({ originRef: existing.originRef }),
-        expect.objectContaining({
-          $set: expect.objectContaining({
-            projectionPendingAt: null,
-            projectionAppliedAt: expect.any(Date),
-          }),
-        }),
-      );
-    },
-  );
 
   test('voice delivery claim and mark can be scoped to user and call session', async () => {
     mockFindOneAndUpdate

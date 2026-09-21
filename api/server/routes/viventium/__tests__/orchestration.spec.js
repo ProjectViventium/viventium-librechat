@@ -105,12 +105,12 @@ describe('/api/viventium/orchestration', () => {
     expect(response.headers['cache-control']).toContain('no-store');
   });
 
-  test('GET treats a legacy missing preference as focused', async () => {
+  test('GET uses the current parallel default for a legacy missing preference', async () => {
     mockGetUserById.mockResolvedValueOnce({});
 
     const response = await request(createApp()).get('/api/viventium/orchestration').expect(200);
 
-    expect(response.body).toEqual({ available: true, mode: 'focused', hasKnownWork: false });
+    expect(response.body).toEqual({ available: true, mode: 'parallel', hasKnownWork: false });
   });
 
   test('GET applies the compiled agent default only when a legacy account has no override', async () => {

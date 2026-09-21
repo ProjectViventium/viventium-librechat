@@ -1,3 +1,4 @@
+// VIVENTIUM START: verify Viventium search eligibility and synchronization contracts.
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import { EModelEndpoint } from 'librechat-data-provider';
@@ -24,6 +25,7 @@ const mockIndex = jest.fn().mockReturnValue({
   getDocument: mockGetDocument,
   getDocuments: jest.fn().mockReturnValue({ results: [] }),
 });
+// VIVENTIUM END
 jest.mock('meilisearch', () => {
   return {
     MeiliSearch: jest.fn().mockImplementation(() => {

@@ -40,6 +40,21 @@ const {
   getStaleCortexRecoveryIntervalMs,
   recoverStaleCortexMessages,
 } = require('./services/viventium/staleCortexMessageRecovery');
+const {
+  reconcilePendingGlassHiveMissionAdjudications,
+} = require('./services/viventium/GlassHiveMissionAdjudicationService');
+const {
+  reconcileGlassHiveSchedulerCallbackOutbox,
+} = require('./services/viventium/GlassHiveTerminalCallbackOutboxService');
+const {
+  startGlassHiveLaunchReconciliation,
+} = require('./services/viventium/GlassHiveLaunchReconciliationService');
+const {
+  startOrchestrationReadinessWatcher,
+} = require('./services/viventium/GlassHiveOrchestrationReadinessService');
+const {
+  ensureInteractionDurableEffectIndexes,
+} = require('./services/viventium/InteractionDurableEffectService');
 /* === VIVENTIUM START ===
  * Feature: Fail-closed local-QA service startup acknowledgement.
  */
@@ -117,6 +132,7 @@ const startServer = async () => {
   await connectDb();
   logger.info('Connected to MongoDB');
   upgradeFinalization.recordCompleted('database-connected');
+  await ensureInteractionDurableEffectIndexes();
   /* === VIVENTIUM START ===
    * Feature: Quiesced successor validation.
    * Purpose: Derived search synchronization and managed database seeding remain disabled until
@@ -389,7 +405,14 @@ const startServer = async () => {
           require('./controllers/agents/client').recoverPendingMemoryWriter(row, identity),
       });
       await require('./services/viventium/nativeResponseService').installNativeResponseRecovery();
-      require('./services/viventium/GlassHiveLaunchReconciliationService').startGlassHiveLaunchReconciliation();
+      reconcilePendingGlassHiveMissionAdjudications().catch((error) => {
+        logger.error('[glasshiveMissionAdjudication] Startup recovery failed:', error);
+      });
+      reconcileGlassHiveSchedulerCallbackOutbox().catch((error) => {
+        logger.error('[glasshiveCallbackOutbox] Startup recovery failed:', error);
+      });
+      startGlassHiveLaunchReconciliation();
+      startOrchestrationReadinessWatcher();
 
       if (upgradeFinalization.isArmed()) {
         await recoverStaleCortexMessages();
@@ -404,6 +427,12 @@ const startServer = async () => {
         setInterval(() => {
           recoverStaleCortexMessages().catch((error) => {
             logger.error('[staleCortexMessageRecovery] Periodic recovery failed:', error);
+          });
+          reconcilePendingGlassHiveMissionAdjudications().catch((error) => {
+            logger.error('[glasshiveMissionAdjudication] Periodic recovery failed:', error);
+          });
+          reconcileGlassHiveSchedulerCallbackOutbox().catch((error) => {
+            logger.error('[glasshiveCallbackOutbox] Periodic recovery failed:', error);
           });
         }, staleCortexRecoveryIntervalMs).unref?.();
       }

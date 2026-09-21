@@ -11,6 +11,7 @@ import {
 import { NATIVE_PUBLICATION_LUA, NATIVE_JOB_LUA, NATIVE_RETENTION_LUA } from './nativeResponseLua';
 import { logger } from '@librechat/data-schemas';
 import { retainLogicalTurnInput, mergeLogicalTurnInput } from './logicalTurnInput';
+import { normalizeInteractionSourceSegments } from '../../glasshive/interactionSourceSegments';
 import { createHash, randomUUID } from 'crypto';
 import { createContentAggregator } from '@librechat/agents';
 import type { StandardGraph } from '@librechat/agents';
@@ -30,6 +31,60 @@ import type {
   SourceOrderObservationResult,
   CortexPresentationBinding,
 } from '~/stream/interfaces/IJobStore';
+import { SOURCE_SEGMENTS_MAX_BYTES, SOURCE_SEGMENTS_MAX_COUNT } from '~/stream/sourceSegments';
+
+function streamClaimIdentity(scopeDigest: string, sourceEventId: string): string {
+  return createHash('sha256')
+    .update(`viventium.stream-claim.v1\0${scopeDigest}\0${sourceEventId}`)
+    .digest('hex');
+}
+
+function streamIdConflictError(): Error & { code: string } {
+  return Object.assign(new Error('Generation stream already exists'), {
+    code: 'stream_id_conflict',
+  });
+}
+
+const CLAIM_STREAM_OWNER_SCRIPT = `
+local current = redis.call('GET', KEYS[1])
+if current then
+  if current ~= ARGV[1] then
+    return 0
+  end
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+  return 1
+end
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return -1
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+`;
+
+const RELEASE_STREAM_OWNER_SCRIPT = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return 0
+end
+return redis.call('DEL', KEYS[1])
+`;
+
+const FENCE_UNPUBLISHED_SUPERSEDED_CLAIM_SCRIPT = `
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return 2
+end
+local current = redis.call('GET', KEYS[1])
+if not current then
+  return 3
+end
+if current ~= ARGV[1] and current ~= ARGV[2] then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1
+`;
 
 type NativeJobOwner = Pick<
   SerializableJobData,
@@ -37,7 +92,11 @@ type NativeJobOwner = Pick<
 > & {
   interactionContext?: Pick<
     InteractionContext,
-    'logical_turn_id' | 'revision' | 'source_order_scope' | 'source_sequence' | 'ready_input_continuation'
+    | 'logical_turn_id'
+    | 'revision'
+    | 'source_order_scope'
+    | 'source_sequence'
+    | 'ready_input_continuation'
   >;
 };
 
@@ -58,6 +117,9 @@ function logicalTurnScopeDigest(userId: string, interactionContext: InteractionC
         interactionContext.conversation_id,
         interactionContext.actor_kind,
         interactionContext.origin,
+        ...(interactionContext.turn_scope === 'source_event'
+          ? [interactionContext.source_event_id]
+          : []),
       ].join('\u0000'),
     )
     .digest('hex');
@@ -238,48 +300,53 @@ export class RedisJobStore implements IJobStore {
     initialData?: Partial<SerializableJobData>,
   ): Promise<SerializableJobData> {
     const key = KEYS.job(streamId);
-    const previous = await this.getJob(streamId);
-    if (previous) {
-      const cancellation = await this.cancelNativeResponse(previous);
-      if (cancellation.status === 'committed' && !previous.nativeResponseSettled) {
-        throw new Error('Saved native result is pending');
-      }
-      if (cancellation.status === 'unavailable') {
-        throw new Error('Stream authority unavailable');
-      }
-    }
+    const userJobsKey = KEYS.userJobs(userId);
     const job: SerializableJobData = {
       ...initialData,
       streamId,
       userId,
       status: 'running',
-      createdAt: Math.max(Date.now(), (previous?.createdAt ?? 0) + 1),
+      createdAt: Date.now(),
       conversationId,
       syncSent: false,
-      nativeResponse: undefined,
-      nativeResponseCancelled: undefined,
-      nativeResponseFinished: undefined,
-      nativeResponseSettled: undefined,
     };
+    const interactionContext = initialData?.interactionContext;
+    const claimIdentity = interactionContext
+      ? streamClaimIdentity(
+          logicalTurnScopeDigest(userId, interactionContext),
+          interactionContext.source_event_id,
+        )
+      : '';
+    const serializedJob = this.serializeJob(job);
     const created = await this.redis.eval(
       `
-      local current = redis.call('HGET', KEYS[1], 'createdAt') or ''
-      if current ~= ARGV[1] then return 0 end
-      redis.call('DEL', KEYS[1])
-      redis.call('HSET', KEYS[1], unpack(ARGV, 3))
-      redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+      if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+      if ARGV[1] ~= '' and redis.call('GET', KEYS[2]) ~= ARGV[1] then return -1 end
+      if ARGV[1] == '' and redis.call('EXISTS', KEYS[2]) == 1 then return -1 end
+      redis.call('HSET', KEYS[1], unpack(ARGV, 2, #ARGV - 1))
+      redis.call('EXPIRE', KEYS[1], tonumber(ARGV[#ARGV]))
+      if ARGV[1] ~= '' then redis.call('EXPIRE', KEYS[2], tonumber(ARGV[#ARGV])) end
       return 1`,
-      1,
+      2,
       key,
-      previous?.createdAt ?? '',
-      this.ttl.running,
-      ...Object.entries(this.serializeJob(job)).flat(),
+      KEYS.streamOwner(streamId),
+      claimIdentity,
+      ...Object.entries(serializedJob).flat(),
+      String(this.ttl.running),
     );
-    if (created !== 1) {
-      throw new Error('Stream incarnation changed');
+    if (Number(created) !== 1) {
+      throw streamIdConflictError();
     }
-    await this.redis.sadd(KEYS.runningJobs, streamId);
-    await this.redis.sadd(KEYS.userJobs(userId), streamId);
+
+    if (this.isCluster) {
+      await this.redis.sadd(KEYS.runningJobs, streamId);
+      await this.redis.sadd(userJobsKey, streamId);
+    } else {
+      const pipeline = this.redis.pipeline();
+      pipeline.sadd(KEYS.runningJobs, streamId);
+      pipeline.sadd(userJobsKey, streamId);
+      await pipeline.exec();
+    }
 
     logger.debug(`[RedisJobStore] Created job: ${streamId}`);
     return job;
@@ -615,15 +682,25 @@ export class RedisJobStore implements IJobStore {
     };
   }
 
-  async retainLogicalTurnInput(userId: string, context: InteractionContext): Promise<InteractionContext> {
+  async retainLogicalTurnInput(
+    userId: string,
+    context: InteractionContext,
+  ): Promise<InteractionContext> {
     const key = KEYS.logicalTurn(userId, context);
     for (let attempt = 0; attempt < 32; attempt += 1) {
-      const [pending, previous, active] = await this.redis.hmget(key, 'pendingInputs', 'currentContext', 'active');
-      const inputsBefore = pending ? JSON.parse(pending) as InteractionContext[] : [];
-      const current = active === '1' && previous ? JSON.parse(previous) as InteractionContext : undefined;
+      const [pending, previous, active] = await this.redis.hmget(
+        key,
+        'pendingInputs',
+        'currentContext',
+        'active',
+      );
+      const inputsBefore = pending ? (JSON.parse(pending) as InteractionContext[]) : [];
+      const current =
+        active === '1' && previous ? (JSON.parse(previous) as InteractionContext) : undefined;
       mergeLogicalTurnInput([...(current ? [current] : []), ...inputsBefore], context);
       const inputs = retainLogicalTurnInput(inputsBefore, context);
-      const stored = await this.redis.eval(`
+      const stored = await this.redis.eval(
+        `
         if (redis.call('HGET', KEYS[1], 'pendingInputs') or '') ~= ARGV[1]
             or (redis.call('HGET', KEYS[1], 'currentContext') or '') ~= ARGV[5]
             or (redis.call('HGET', KEYS[1], 'active') or '') ~= ARGV[6] then return 0 end
@@ -636,7 +713,16 @@ export class RedisJobStore implements IJobStore {
         end
         redis.call('HSET', KEYS[1], 'pendingInputs', ARGV[2])
         redis.call('EXPIRE', KEYS[1], math.max(tonumber(ARGV[3]), redis.call('TTL', KEYS[1])))
-        return 1`, 1, key, pending ?? '', JSON.stringify(inputs), this.ttl.running, context.source_event_id, previous ?? '', active ?? '');
+        return 1`,
+        1,
+        key,
+        pending ?? '',
+        JSON.stringify(inputs),
+        this.ttl.running,
+        context.source_event_id,
+        previous ?? '',
+        active ?? '',
+      );
       if (stored === 1) return context;
     }
     throw new Error('Logical input retention contention');
@@ -648,28 +734,101 @@ export class RedisJobStore implements IJobStore {
     interactionContext: InteractionContext,
   ): Promise<LogicalTurnClaim> {
     const key = KEYS.logicalTurn(userId, interactionContext);
-    let result: [string, string, string, string] | undefined;
+    const claimIdentity = streamClaimIdentity(
+      logicalTurnScopeDigest(userId, interactionContext),
+      interactionContext.source_event_id,
+    );
+    const receiptKey = `receipt:${interactionContext.source_event_id}`;
+    const existingReceipt = await this.redis.hget(key, receiptKey);
+    if (existingReceipt) {
+      let decoded: { streamId?: string; interactionContext?: InteractionContext };
+      try {
+        decoded = JSON.parse(existingReceipt) as typeof decoded;
+      } catch {
+        throw streamIdConflictError();
+      }
+      const duplicateStreamId = String(decoded.streamId || '');
+      const duplicateContext = decoded.interactionContext;
+      const storedOwner = duplicateStreamId
+        ? await this.redis.get(KEYS.streamOwner(duplicateStreamId))
+        : null;
+      if (!duplicateStreamId || !duplicateContext || storedOwner !== claimIdentity) {
+        throw streamIdConflictError();
+      }
+      return {
+        status: 'duplicate',
+        streamId: duplicateStreamId,
+        interactionContext: duplicateContext,
+        supersededStreamIds: [],
+      };
+    }
+    const ownerClaimed = await this.redis.eval(
+      CLAIM_STREAM_OWNER_SCRIPT,
+      2,
+      KEYS.streamOwner(streamId),
+      KEYS.job(streamId),
+      claimIdentity,
+      String(this.ttl.running),
+    );
+    if (Number(ownerClaimed) !== 1) {
+      throw streamIdConflictError();
+    }
+
+    let result: [string, string, string, string, string] | undefined;
     for (let attempt = 0; attempt < 32; attempt += 1) {
-      const [pending, previous, active] = await this.redis.hmget(key, 'pendingInputs', 'currentContext', 'active');
-      const merged = mergeLogicalTurnInput([
-        ...(active === '1' && previous ? [JSON.parse(previous) as InteractionContext] : []),
-        ...(pending ? JSON.parse(pending) as InteractionContext[] : []),
-      ], interactionContext);
+      const [pending, previous, active] = await this.redis.hmget(
+        key,
+        'pendingInputs',
+        'currentContext',
+        'active',
+      );
+      const pendingInputs = pending ? (JSON.parse(pending) as InteractionContext[]) : [];
+      const normalizedIncomingSourceSegments = normalizeInteractionSourceSegments(
+        [
+          ...pendingInputs.flatMap((context) => context.source_segments ?? []),
+          ...(interactionContext.source_segments ?? []),
+        ],
+        pendingInputs.reduce(
+          (total, context) => total + (context.source_segments_overflow_count ?? 0),
+          interactionContext.source_segments_overflow_count ?? 0,
+        ),
+      );
+      const merged: InteractionContext = {
+        ...interactionContext,
+        source_segments: normalizedIncomingSourceSegments.segments.length
+          ? normalizedIncomingSourceSegments.segments
+          : undefined,
+        source_segments_overflow_count: normalizedIncomingSourceSegments.overflowCount || undefined,
+      };
       result = (await this.redis.eval(
-      `if (redis.call('HGET', KEYS[1], 'pendingInputs') or '') ~= ARGV[7]
+        `if (redis.call('HGET', KEYS[1], 'pendingInputs') or '') ~= ARGV[7]
           or (redis.call('HGET', KEYS[1], 'currentContext') or '') ~= ARGV[8]
           or (redis.call('HGET', KEYS[1], 'active') or '') ~= ARGV[9] then
-         return {'retry', '', '{}', ''}
+         return {'retry', '', '{}', '', ''}
        end
        local receipt_key = 'receipt:' .. ARGV[2]
        local receipt = redis.call('HGET', KEYS[1], receipt_key)
        if receipt then
          local decoded = cjson.decode(receipt)
-         return {'duplicate', decoded.streamId, cjson.encode(decoded.interactionContext), ''}
+         return {'duplicate', decoded.streamId, cjson.encode(decoded.interactionContext), '', ''}
        end
        local incoming = cjson.decode(ARGV[4])
        if incoming.ready_input_continuation and ARGV[9] == '1' then
-         return {'busy', ARGV[1], ARGV[4], ''}
+         return {'busy', ARGV[1], ARGV[4], '', ''}
+       end
+       if ARGV[11] ~= '' and not incoming.ready_input_continuation
+          and redis.call('EXISTS', KEYS[1]) == 0 then
+         local incoming_source_sequence = tonumber(ARGV[11])
+         local observed_source_sequence = tonumber(
+           redis.call('HGET', KEYS[2], 'latestSourceSequence') or '-1'
+         )
+         local active_revision = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
+         local active_source_sequence = tonumber(redis.call(
+           'HGET', KEYS[1], 'sourceSequenceForRevision:' .. tostring(active_revision)
+         ) or '-1')
+         if incoming_source_sequence < math.max(observed_source_sequence, active_source_sequence) then
+           return {'stale_source_order', ARGV[1], ARGV[4], '', ''}
+         end
        end
        local latest = tonumber(redis.call('HGET', KEYS[2], 'latestSourceSequence') or '0')
        if ARGV[8] ~= '' then
@@ -681,11 +840,11 @@ export class RedisJobStore implements IJobStore {
          latest = math.max(latest, tonumber(source.source_sequence) or 0)
        end
        if ARGV[6] ~= '' and tonumber(ARGV[6]) < latest then
-         return {'superseded', ARGV[1], ARGV[4], ''}
+         return {'superseded', ARGV[1], ARGV[4], '', ''}
        end
        for _, source in ipairs(cjson.decode(ARGV[4]).source_segments or {}) do
          if source.source_message_id and source.source_persisted ~= true then
-           return {'initializing', ARGV[1], ARGV[4], ''}
+           return {'initializing', ARGV[1], ARGV[4], '', ''}
          end
        end
        local logical_id = redis.call('HGET', KEYS[1], 'logicalTurnId')
@@ -693,7 +852,11 @@ export class RedisJobStore implements IJobStore {
        local current = redis.call('HGET', KEYS[1], 'currentStreamId') or ''
        local active = redis.call('HGET', KEYS[1], 'active') == '1'
        local superseded = ''
+       local superseded_identity = ''
        if active and current ~= '' then
+         superseded_identity = redis.call(
+           'HGET', KEYS[1], 'claimIdentityForRevision:' .. tostring(revision)
+         ) or ''
          revision = revision + 1
          superseded = current
        else
@@ -702,6 +865,50 @@ export class RedisJobStore implements IJobStore {
          revision = 1
        end
        local context = cjson.decode(ARGV[4])
+       local accumulated = {}
+       local seen_events = {}
+       local total_bytes = 0
+       local overflow_count = tonumber(context.source_segments_overflow_count or '0') or 0
+       if active then
+         overflow_count = overflow_count + tonumber(
+           redis.call('HGET', KEYS[1], 'sourceSegmentsOverflowCount') or '0'
+         )
+         local stored_segments = redis.call('HGET', KEYS[1], 'sourceSegments')
+         if stored_segments then
+           for _, segment in ipairs(cjson.decode(stored_segments)) do
+             table.insert(accumulated, segment)
+             local identity = string.len(segment.source_event_id) .. ':' ..
+               segment.source_event_id .. ':' .. tostring(segment.source_index or 0)
+             seen_events[identity] = true
+             total_bytes = total_bytes + string.len(segment.text or '')
+           end
+         end
+       end
+       if context.source_segments then
+         for _, segment in ipairs(context.source_segments) do
+           local event_id = segment.source_event_id
+           local identity = event_id and (string.len(event_id) .. ':' .. event_id .. ':' ..
+             tostring(segment.source_index or 0)) or nil
+           if event_id and not seen_events[identity] then
+             table.insert(accumulated, segment)
+             seen_events[identity] = true
+             total_bytes = total_bytes + string.len(segment.text or '')
+           end
+         end
+       end
+       while #accumulated > tonumber(ARGV[12]) or total_bytes > tonumber(ARGV[13]) do
+         local evicted = table.remove(accumulated, 1)
+         if not evicted then break end
+         total_bytes = total_bytes - string.len(evicted.text or '')
+         overflow_count = overflow_count + 1
+       end
+       if #accumulated > 0 then
+         for index, segment in ipairs(accumulated) do segment.ordinal = index - 1 end
+         context.source_segments = accumulated
+       else
+         context.source_segments = nil
+       end
+       context.source_segments_overflow_count = overflow_count > 0 and overflow_count or nil
        context.logical_turn_id = logical_id
        context.revision = revision
        local encoded_context = cjson.encode(context)
@@ -713,35 +920,91 @@ export class RedisJobStore implements IJobStore {
          'active', '1',
          'currentContext', encoded_context,
          'pendingInputs', '[]',
+         'sourceSegmentsOverflowCount', tostring(overflow_count),
+         'sourceSegmentsOverflowCountForRevision:' .. tostring(revision), tostring(overflow_count),
          'streamForRevision:' .. tostring(revision), ARGV[1],
          'contextForRevision:' .. tostring(revision), encoded_context,
+         'claimIdentityForRevision:' .. tostring(revision), ARGV[10],
          receipt_key, encoded_receipt)
-       if ARGV[6] ~= '' then
-         redis.call(
-           'HSET', KEYS[1], 'sourceSequenceForRevision:' .. tostring(revision), ARGV[6]
-         )
+       if context.source_order_scope and context.source_sequence then
+         redis.call('HSET', KEYS[1],
+           'sourceOrderScopeForRevision:' .. tostring(revision), context.source_order_scope,
+           'sourceSequenceForRevision:' .. tostring(revision), tostring(context.source_sequence))
+       end
+       if #accumulated > 0 then
+         local encoded_segments = cjson.encode(accumulated)
+         redis.call('HSET', KEYS[1],
+           'sourceSegments', encoded_segments,
+           'sourceSegmentsForRevision:' .. tostring(revision), encoded_segments)
        end
        redis.call('EXPIRE', KEYS[1], math.max(tonumber(ARGV[5]), math.ceil((tonumber(redis.call('HGET', KEYS[1], 'nativeRecoverUntil') or '0') - tonumber(redis.call('TIME')[1]) * 1000) / 1000)))
-       return {'claimed', ARGV[1], encoded_context, superseded}`,
-      2,
-      key,
-      interactionContext.source_order_scope ? KEYS.sourceOrder(interactionContext.source_order_scope)
-        : KEYS.sourceOrderFromScopeDigest(logicalTurnScopeDigest(userId, interactionContext)),
-      streamId,
-      interactionContext.source_event_id,
-      KEYS.logicalTurnId(userId, interactionContext),
-      JSON.stringify(merged),
-      this.ttl.running,
-      Number.isSafeInteger(interactionPresentationSequence(interactionContext))
-        ? String(interactionPresentationSequence(interactionContext))
-        : '',
-      pending ?? '', previous ?? '', active ?? '',
-    )) as [string, string, string, string];
+       if context.source_order_scope and redis.call('EXISTS', KEYS[2]) == 1 then
+         local source_ttl = redis.call('TTL', KEYS[2])
+         if source_ttl < tonumber(ARGV[5]) then
+           redis.call('EXPIRE', KEYS[2], tonumber(ARGV[5]))
+         end
+       end
+       return {'claimed', ARGV[1], encoded_context, superseded, superseded_identity}`,
+        2,
+        key,
+        interactionContext.source_order_scope
+          ? KEYS.sourceOrder(interactionContext.source_order_scope)
+          : KEYS.sourceOrderFromScopeDigest(logicalTurnScopeDigest(userId, interactionContext)),
+        streamId,
+        interactionContext.source_event_id,
+        KEYS.logicalTurnId(userId, interactionContext),
+        JSON.stringify(merged),
+        this.ttl.running,
+        Number.isSafeInteger(interactionPresentationSequence(interactionContext))
+          ? String(interactionPresentationSequence(interactionContext))
+          : '',
+        pending ?? '',
+        previous ?? '',
+        active ?? '',
+        claimIdentity,
+        interactionContext.source_order_scope &&
+          Number.isSafeInteger(interactionContext.source_sequence)
+          ? String(interactionContext.source_sequence)
+          : '',
+        SOURCE_SEGMENTS_MAX_COUNT,
+        SOURCE_SEGMENTS_MAX_BYTES,
+      )) as [string, string, string, string, string];
       if (result[0] !== 'retry') break;
     }
-    if (!result || result[0] === 'retry') throw new Error('Logical turn claim contention');
+    if (!result || result[0] === 'retry') {
+      await this.redis.eval(
+        RELEASE_STREAM_OWNER_SCRIPT,
+        2,
+        KEYS.streamOwner(streamId),
+        KEYS.job(streamId),
+        claimIdentity,
+      );
+      throw new Error('Logical turn claim contention');
+    }
 
     const claimedContext = JSON.parse(result[2]) as InteractionContext;
+    if (result[0] === 'duplicate' && result[1] !== streamId) {
+      const duplicateOwner = await this.redis.get(KEYS.streamOwner(result[1]));
+      await this.redis.eval(
+        RELEASE_STREAM_OWNER_SCRIPT,
+        2,
+        KEYS.streamOwner(streamId),
+        KEYS.job(streamId),
+        claimIdentity,
+      );
+      if (duplicateOwner !== claimIdentity) {
+        throw streamIdConflictError();
+      }
+    }
+    if (!['claimed', 'duplicate'].includes(result[0])) {
+      await this.redis.eval(
+        RELEASE_STREAM_OWNER_SCRIPT,
+        2,
+        KEYS.streamOwner(streamId),
+        KEYS.job(streamId),
+        claimIdentity,
+      );
+    }
     if (claimedContext.logical_turn_id) {
       // Prefixed IDs resolve directly to this hash slot, so ack ownership cannot race a second
       // reverse-index write. Retain the index only for pre-upgrade UUID turns.
@@ -761,7 +1024,70 @@ export class RedisJobStore implements IJobStore {
       streamId: result[1],
       interactionContext: claimedContext,
       supersededStreamIds: result[3] ? [result[3]] : [],
+      supersededClaimIdentities: result[3] ? [result[4]] : [],
     };
+  }
+
+  async fenceSupersededLogicalTurnClaims(claim: LogicalTurnClaim): Promise<void> {
+    if (claim.supersededStreamIds.length === 0) {
+      return;
+    }
+    if (
+      !claim.interactionContext.logical_turn_id ||
+      claim.supersededClaimIdentities?.length !== claim.supersededStreamIds.length
+    ) {
+      throw streamIdConflictError();
+    }
+    const ownerScopeKey =
+      KEYS.logicalTurnFromId(claim.interactionContext.logical_turn_id) ??
+      (await this.redis.hget(
+        KEYS.logicalTurnIndex(claim.interactionContext.logical_turn_id),
+        'ownerScopeKey',
+      ));
+    if (!ownerScopeKey) {
+      throw streamIdConflictError();
+    }
+    const revision = claim.interactionContext.revision;
+    const [logicalTurnId, currentRevision, currentStreamId, currentClaimIdentity] =
+      await this.redis.hmget(
+        ownerScopeKey,
+        'logicalTurnId',
+        'revision',
+        'currentStreamId',
+        `claimIdentityForRevision:${revision}`,
+      );
+    if (
+      logicalTurnId !== claim.interactionContext.logical_turn_id ||
+      Number(currentRevision) !== revision ||
+      currentStreamId !== claim.streamId ||
+      !currentClaimIdentity
+    ) {
+      throw streamIdConflictError();
+    }
+    const fenceIdentity = `fenced:${createHash('sha256')
+      .update(
+        `viventium.stream-supersession.v1\0${logicalTurnId}\0${revision}\0${currentClaimIdentity}`,
+      )
+      .digest('hex')}`;
+    for (let index = 0; index < claim.supersededStreamIds.length; index += 1) {
+      const supersededStreamId = claim.supersededStreamIds[index];
+      const expectedIdentity = claim.supersededClaimIdentities[index];
+      if (!expectedIdentity) {
+        throw streamIdConflictError();
+      }
+      const fenced = await this.redis.eval(
+        FENCE_UNPUBLISHED_SUPERSEDED_CLAIM_SCRIPT,
+        2,
+        KEYS.streamOwner(supersededStreamId),
+        KEYS.job(supersededStreamId),
+        expectedIdentity,
+        fenceIdentity,
+        String(this.ttl.running),
+      );
+      if (![1, 2, 3].includes(Number(fenced))) {
+        throw streamIdConflictError();
+      }
+    }
   }
 
   async rollbackLogicalTurnClaim(
@@ -795,6 +1121,10 @@ export class RedisJobStore implements IJobStore {
        redis.call(
          'HDEL', KEYS[1],
          'streamForRevision:' .. ARGV[2],
+         'claimIdentityForRevision:' .. ARGV[2],
+         'sourceSegmentsForRevision:' .. ARGV[2],
+         'sourceSegmentsOverflowCountForRevision:' .. ARGV[2],
+         'sourceOrderScopeForRevision:' .. ARGV[2],
          'sourceSequenceForRevision:' .. ARGV[2],
          'contextForRevision:' .. ARGV[2],
          'cortexPresentation:' .. ARGV[2]
@@ -814,11 +1144,26 @@ export class RedisJobStore implements IJobStore {
            'currentStreamId', previous_stream,
            'currentContext', redis.call('HGET', KEYS[1], 'contextForRevision:' .. tostring(previous_revision)) or '',
            'active', previous_stream ~= '' and '1' or '0')
+         local previous_segments = redis.call(
+           'HGET', KEYS[1], 'sourceSegmentsForRevision:' .. tostring(previous_revision)
+         )
+         if previous_segments then
+           redis.call('HSET', KEYS[1], 'sourceSegments', previous_segments)
+         else
+           redis.call('HDEL', KEYS[1], 'sourceSegments')
+         end
+         local previous_overflow = redis.call(
+           'HGET', KEYS[1],
+           'sourceSegmentsOverflowCountForRevision:' .. tostring(previous_revision)
+         ) or '0'
+         redis.call('HSET', KEYS[1], 'sourceSegmentsOverflowCount', previous_overflow)
        else
          redis.call('HSET', KEYS[1],
            'revision', '0',
            'currentStreamId', '',
            'active', '0')
+         redis.call('HDEL', KEYS[1], 'sourceSegments')
+         redis.call('HSET', KEYS[1], 'sourceSegmentsOverflowCount', '0')
        end
        return 1`,
       1,
@@ -835,6 +1180,18 @@ export class RedisJobStore implements IJobStore {
       !KEYS.logicalTurnFromId(interactionContext.logical_turn_id)
     ) {
       await this.redis.del(indexKey);
+    }
+    if (rolledBack === 1) {
+      const scopeDigest = logicalTurnScopeDigestFromKey(ownerScopeKey);
+      if (scopeDigest) {
+        await this.redis.eval(
+          RELEASE_STREAM_OWNER_SCRIPT,
+          2,
+          KEYS.streamOwner(streamId),
+          KEYS.job(streamId),
+          streamClaimIdentity(scopeDigest, interactionContext.source_event_id),
+        );
+      }
     }
     return rolledBack === 1;
   }
@@ -866,6 +1223,10 @@ export class RedisJobStore implements IJobStore {
        if decoded.streamId ~= ARGV[3] then
          return 0
        end
+       if redis.call('HGET', KEYS[1], 'active') == '1'
+          and redis.call('HGET', KEYS[1], 'currentStreamId') == ARGV[3] then
+         return 0
+       end
        redis.call('HDEL', KEYS[1], receipt_key)
        return 1`,
       1,
@@ -874,6 +1235,18 @@ export class RedisJobStore implements IJobStore {
       interactionContext.source_event_id,
       expectedStreamId,
     );
+    if (Number(removed) === 1) {
+      const scopeDigest = logicalTurnScopeDigestFromKey(ownerScopeKey);
+      if (scopeDigest) {
+        await this.redis.eval(
+          RELEASE_STREAM_OWNER_SCRIPT,
+          2,
+          KEYS.streamOwner(expectedStreamId),
+          KEYS.job(expectedStreamId),
+          streamClaimIdentity(scopeDigest, interactionContext.source_event_id),
+        );
+      }
+    }
     return removed === 1;
   }
 
@@ -975,9 +1348,6 @@ export class RedisJobStore implements IJobStore {
          'streamForRevision:' .. tostring(requested_revision)
        ) or ''
        if owner_stream_id == '' then
-         return {'stale_revision', ''}
-       end
-       if requested_revision < current_revision and ARGV[4] == 'committed' then
          return {'stale_revision', ''}
        end
        local ack_key = 'deliveryAck:' .. ARGV[1] .. ':' .. ARGV[2]
@@ -1128,6 +1498,136 @@ export class RedisJobStore implements IJobStore {
     }
   }
 
+  private async bindJobCortexPresentation(
+    streamId: string,
+    binding: CortexPresentationBinding,
+  ): Promise<boolean> {
+    const result = await this.redis.eval(
+      `if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+       local current_json = redis.call('HGET', KEYS[1], 'cortexPresentation')
+       if current_json then
+         local current = cjson.decode(current_json)
+         local incoming = cjson.decode(ARGV[1])
+         if incoming.revision < current.revision or incoming.generation < current.generation then
+           return 0
+         end
+         if incoming.revision == current.revision and incoming.generation == current.generation then
+           if incoming.ownerId ~= current.ownerId or
+              incoming.messageId ~= current.messageId or
+              incoming.parentMessageId ~= current.parentMessageId or
+              incoming.claimToken ~= current.claimToken or
+              incoming.presentationLeaseToken ~= current.presentationLeaseToken or
+              cjson.encode(incoming.deliveryIds) ~= cjson.encode(current.deliveryIds) or
+              cjson.encode(incoming.deliveryReceipts) ~= cjson.encode(current.deliveryReceipts) then
+             return 0
+           end
+           return 1
+         end
+       end
+       redis.call('HSET', KEYS[1], 'cortexPresentation', ARGV[1])
+       return 1`,
+      1,
+      KEYS.job(streamId),
+      JSON.stringify(binding),
+    );
+    return Number(result) === 1;
+  }
+
+  private async bindJobDeliveryAcknowledgement(
+    streamId: string,
+    acknowledgement: InteractionDeliveryAck,
+    expectedCortexPresentation: CortexPresentationBinding | null,
+  ): Promise<DeliveryAcknowledgementBindingResult> {
+    const acknowledgementInput = { ...acknowledgement };
+    delete acknowledgementInput.presentation_committed_at;
+    const result = (await this.redis.eval(
+      `${NATIVE_RETENTION_LUA}
+       if redis.call('EXISTS', KEYS[1]) == 0 then return {'not_found', '', '', '0'} end
+       if ARGV[2] == '' then
+         redis.call('HSET', KEYS[1], 'deliveryAcknowledgement', ARGV[1])
+         if redis.call('HGET', KEYS[1], 'nativeResponseSettled') == '1' then
+           local clock = redis.call('TIME')
+           local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+           if retain_native_response(KEYS[1], now) then
+             redis.call('PEXPIREAT', KEYS[1], tonumber(redis.call('HGET', KEYS[1], 'nativeRecoverUntil')))
+           else
+             redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
+           end
+         end
+         return {'recorded', '', ARGV[1], '0'}
+       end
+       local current_json = redis.call('HGET', KEYS[1], 'cortexPresentation')
+       if not current_json then return {'retryable_conflict', '', '', '0'} end
+       local current = cjson.decode(current_json)
+       local expected = cjson.decode(ARGV[2])
+       if current.ownerId ~= expected.ownerId or
+          current.messageId ~= expected.messageId or
+          current.parentMessageId ~= expected.parentMessageId or
+          current.revision ~= expected.revision or
+          current.generation ~= expected.generation or
+          current.boundAt ~= expected.boundAt or
+          current.claimToken ~= expected.claimToken or
+          current.presentationLeaseToken ~= expected.presentationLeaseToken or
+          cjson.encode(current.deliveryIds) ~= cjson.encode(expected.deliveryIds) or
+          cjson.encode(current.deliveryReceipts) ~= cjson.encode(expected.deliveryReceipts) then
+         return {'retryable_conflict', '', '', '0'}
+       end
+       local existing = redis.call('HGET', KEYS[1], 'cortexDeliveryAcknowledgement')
+       local existing_binding = redis.call(
+         'HGET', KEYS[1], 'cortexDeliveryAcknowledgementPresentation'
+       )
+       if existing or existing_binding then
+         if not existing or not existing_binding then
+           return {'retryable_conflict', '', '', '0'}
+         end
+         local existing_input = redis.call(
+           'HGET', KEYS[1], 'cortexDeliveryAcknowledgementInput'
+         )
+         if existing_binding == current_json then
+           if existing_input == ARGV[3] then
+             return {'recorded', current_json, existing, '1'}
+           end
+           return {'conflict', '', '', '0'}
+         end
+         if existing_input == ARGV[3] then
+           redis.call(
+             'HSET', KEYS[1], 'cortexDeliveryAcknowledgementPresentation', current_json
+           )
+           return {'recorded', current_json, existing, '1'}
+         end
+       end
+       local server_time = redis.call('TIME')
+       local recorded = cjson.decode(ARGV[3])
+       recorded.presentation_committed_at = tonumber(server_time[1]) * 1000 +
+         math.floor(tonumber(server_time[2]) / 1000)
+       local recorded_json = cjson.encode(recorded)
+       redis.call('HSET', KEYS[1],
+         'cortexDeliveryAcknowledgement', recorded_json,
+         'cortexDeliveryAcknowledgementInput', ARGV[3],
+         'cortexDeliveryAcknowledgementPresentation', current_json)
+       return {'recorded_new', current_json, recorded_json, '0'}`,
+      1,
+      KEYS.job(streamId),
+      JSON.stringify(acknowledgement),
+      expectedCortexPresentation ? JSON.stringify(expectedCortexPresentation) : '',
+      JSON.stringify(acknowledgementInput),
+      this.ttl.completed,
+    )) as [string, string, string, string];
+    if (!['recorded', 'recorded_new'].includes(result[0])) {
+      return {
+        status: result[0] as Exclude<DeliveryAcknowledgementBindingResult['status'], 'recorded'>,
+      };
+    }
+    return {
+      status: 'recorded',
+      ...(result[2] ? { acknowledgement: JSON.parse(result[2]) as InteractionDeliveryAck } : {}),
+      idempotent: result[3] === '1',
+      ...(result[1]
+        ? { cortexPresentation: JSON.parse(result[1]) as CortexPresentationBinding }
+        : {}),
+    };
+  }
+
   /** Atomically bind one exact Cortex presentation generation to its durable stream job. */
   async bindCortexPresentation(
     streamId: string,
@@ -1135,9 +1635,13 @@ export class RedisJobStore implements IJobStore {
   ): Promise<boolean> {
     const job = await this.getJob(streamId);
     const logicalTurnId = job?.interactionContext?.logical_turn_id;
-    if (!job || !logicalTurnId || job.interactionContext?.revision !== binding.revision) {
+    if (!job) {
       return false;
     }
+    if (!logicalTurnId) {
+      return this.bindJobCortexPresentation(streamId, binding);
+    }
+    if (job.interactionContext?.revision !== binding.revision) return false;
     const indexKey = KEYS.logicalTurnIndex(logicalTurnId);
     const ownerScopeKey =
       KEYS.logicalTurnFromId(logicalTurnId) ?? (await this.redis.hget(indexKey, 'ownerScopeKey'));
@@ -1229,27 +1733,44 @@ export class RedisJobStore implements IJobStore {
     acknowledgement: InteractionDeliveryAck,
     expectedCortexPresentation: CortexPresentationBinding | null,
   ): Promise<DeliveryAcknowledgementBindingResult> {
-    if (!expectedCortexPresentation) {
-      const ownerStreamId = await this.resolveDeliveryOwner(
-        acknowledgement.logical_turn_id,
-        acknowledgement.revision,
+    const indexKey = KEYS.logicalTurnIndex(acknowledgement.logical_turn_id);
+    let ownerScopeKey = KEYS.logicalTurnFromId(acknowledgement.logical_turn_id);
+    if (!ownerScopeKey && typeof this.redis.hget === 'function') {
+      ownerScopeKey = await this.redis.hget(indexKey, 'ownerScopeKey');
+    }
+    if (!ownerScopeKey) {
+      return this.bindJobDeliveryAcknowledgement(
+        streamId,
+        acknowledgement,
+        expectedCortexPresentation,
       );
-      if (!ownerStreamId) {
+    }
+    if (!expectedCortexPresentation) {
+      const [storedLogicalTurnId, ownerStreamId] = await this.redis.hmget(
+        ownerScopeKey,
+        'logicalTurnId',
+        `streamForRevision:${acknowledgement.revision}`,
+      );
+      if (storedLogicalTurnId !== acknowledgement.logical_turn_id || !ownerStreamId) {
         return { status: 'not_found' };
       }
       if (ownerStreamId !== streamId) {
         return { status: 'conflict' };
       }
-      return this.acknowledgeDelivery(acknowledgement);
+      const recorded = await this.acknowledgeDelivery(acknowledgement);
+      if (recorded.status !== 'recorded' || !recorded.acknowledgement) {
+        return recorded;
+      }
+      const bound = await this.bindJobDeliveryAcknowledgement(
+        streamId,
+        recorded.acknowledgement,
+        null,
+      );
+      return bound.status === 'recorded'
+        ? { ...bound, idempotent: recorded.idempotent, ownerStreamId: recorded.ownerStreamId }
+        : bound;
     }
 
-    const indexKey = KEYS.logicalTurnIndex(acknowledgement.logical_turn_id);
-    const ownerScopeKey =
-      KEYS.logicalTurnFromId(acknowledgement.logical_turn_id) ??
-      (await this.redis.hget(indexKey, 'ownerScopeKey'));
-    if (!ownerScopeKey) {
-      return { status: 'not_found' };
-    }
     const scopeDigest = logicalTurnScopeDigestFromKey(ownerScopeKey);
     const sourceOrderKey = scopeDigest
       ? KEYS.sourceOrderFromScopeDigest(scopeDigest)
@@ -1278,10 +1799,6 @@ export class RedisJobStore implements IJobStore {
        if owner_stream_id ~= ARGV[1] then
          return {'conflict', '', '', '0'}
        end
-       if requested_revision < current_revision and ARGV[7] == 'committed' then
-         return {'stale_revision', '', '', '0'}
-       end
-
        local binding_key = 'cortexPresentation:' .. ARGV[3]
        local current_json = redis.call('HGET', KEYS[1], binding_key)
        local binding_was_missing = not current_json
@@ -1400,14 +1917,26 @@ export class RedisJobStore implements IJobStore {
     if (!KEYS.logicalTurnFromId(acknowledgement.logical_turn_id)) {
       await this.redis.expire(indexKey, this.ttl.completed);
     }
+    const recordedAcknowledgement = result[2]
+      ? (JSON.parse(result[2]) as InteractionDeliveryAck)
+      : undefined;
+    const recordedPresentation = result[1]
+      ? (JSON.parse(result[1]) as CortexPresentationBinding)
+      : undefined;
+    if (recordedAcknowledgement && recordedPresentation) {
+      await this.updateJob(streamId, {
+        deliveryAcknowledgement: recordedAcknowledgement,
+        cortexPresentation: recordedPresentation,
+        cortexDeliveryAcknowledgement: recordedAcknowledgement,
+        cortexDeliveryAcknowledgementPresentation: recordedPresentation,
+      });
+    }
     return {
       status: 'recorded',
-      ...(result[2] ? { acknowledgement: JSON.parse(result[2]) as InteractionDeliveryAck } : {}),
+      ...(recordedAcknowledgement ? { acknowledgement: recordedAcknowledgement } : {}),
       idempotent: result[3] === '1',
       ...(result[4] ? { ownerStreamId: result[4] } : {}),
-      ...(result[1]
-        ? { cortexPresentation: JSON.parse(result[1]) as CortexPresentationBinding }
-        : {}),
+      ...(recordedPresentation ? { cortexPresentation: recordedPresentation } : {}),
     };
   }
 
@@ -1435,12 +1964,13 @@ export class RedisJobStore implements IJobStore {
       local clock = redis.call('TIME')
       local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
       if not retirement and retain_native_response(KEYS[1], now) then return 0 end
-      redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
+      redis.call('DEL', KEYS[1], KEYS[2], KEYS[3], KEYS[4])
       return 1`,
-      3,
+      4,
       KEYS.job(streamId),
       KEYS.chunks(streamId),
       KEYS.runSteps(streamId),
+      KEYS.streamOwner(streamId),
       job.createdAt,
       retiredNativeResponse ? nativeIdentityJson(retiredNativeResponse) : '',
       staleCreatedAt ?? '',
@@ -2107,7 +2637,9 @@ export class RedisJobStore implements IJobStore {
         : undefined,
       nativeResponse: data.nativeResponse ? JSON.parse(data.nativeResponse) : undefined,
       nativePredecessor: data.nativePredecessor ? JSON.parse(data.nativePredecessor) : undefined,
-      nativeAcceptedSources: data.nativeAcceptedSources ? JSON.parse(data.nativeAcceptedSources) : undefined,
+      nativeAcceptedSources: data.nativeAcceptedSources
+        ? JSON.parse(data.nativeAcceptedSources)
+        : undefined,
       nativeResponseCancelled: data.nativeResponseCancelled === '1',
       nativeResponseFinished: data.nativeResponseFinished === '1',
       nativeResponseSettled: data.nativeResponseSettled === '1',

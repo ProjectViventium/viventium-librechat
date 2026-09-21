@@ -536,6 +536,7 @@ function createParallelWorkReleaseFixture(prefix) {
   const helperSourceFiles = [
     'Package.swift',
     'Sources/ViventiumHelper/ViventiumHelperApp.swift',
+    'Sources/ViventiumHelper/LifeSetup.swift',
     'Sources/ViventiumHelper/Resources/Info.plist',
   ];
   const helperSourceDigest = crypto.createHash('sha256');
@@ -570,6 +571,10 @@ function createParallelWorkReleaseFixture(prefix) {
   fs.copyFileSync(
     path.join(productionRoot, 'scripts', 'viventium', 'qa_release_attestation.py'),
     path.join(ownerRepo, 'scripts', 'viventium', 'qa_release_attestation.py'),
+  );
+  fs.copyFileSync(
+    path.join(productionRoot, 'scripts', 'viventium', 'helper_artifact_verify.py'),
+    path.join(ownerRepo, 'scripts', 'viventium', 'helper_artifact_verify.py'),
   );
   fs.copyFileSync(
     path.join(productionRoot, 'scripts', 'viventium', 'runtime_owner_command_contract.json'),
@@ -1038,6 +1043,7 @@ function createParallelWorkReleaseFixture(prefix) {
       release_ready: true,
       exposure_allowed: true,
       local_qa_override: false,
+      source_defaults_dark: true,
       source_defaults_valid: true,
       gate_count: validGates().length,
       open_gate_count: 0,

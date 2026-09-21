@@ -41,12 +41,22 @@ describe('CallSessionService', () => {
   let ViventiumCallSession;
   let ViventiumVoiceSpeakerSegment;
   let User;
+  let Conversation;
+  let File;
+  let Message;
   let Agent;
 
   beforeAll(async () => {
     mongoServer = await MongoMemoryServer.create();
     await mongoose.connect(mongoServer.getUri());
-    ({ ViventiumCallSession, ViventiumVoiceSpeakerSegment, User } = require('~/db/models'));
+    ({
+      ViventiumCallSession,
+      ViventiumVoiceSpeakerSegment,
+      User,
+      Conversation,
+      File,
+      Message,
+    } = require('~/db/models'));
     Agent = mongoose.models.Agent || mongoose.model('Agent', agentSchema);
   });
 
@@ -70,6 +80,9 @@ describe('CallSessionService', () => {
     await ViventiumCallSession.deleteMany({});
     await ViventiumVoiceSpeakerSegment.deleteMany({});
     await User.deleteMany({});
+    await Conversation.deleteMany({});
+    await File.deleteMany({});
+    await Message.deleteMany({});
     await Agent.deleteMany({});
   });
 
@@ -1989,5 +2002,254 @@ describe('CallSessionService', () => {
       provider: 'glasshive-harness',
       model: 'codex-cli:gpt-5.6-sol',
     });
+  });
+
+  test('createCallSession carries only current-owner artifact display keyterms', async () => {
+    const user = await User.create({
+      name: 'Context User',
+      email: 'context-user@example.com',
+      provider: 'local',
+    });
+    const otherUser = await User.create({
+      name: 'Other User',
+      email: 'other-user@example.com',
+      provider: 'local',
+    });
+    const conversationId = 'conversation-context-keyterms';
+    await Conversation.create({
+      conversationId,
+      user: user._id.toString(),
+      endpoint: 'agents',
+      files: ['file-roadmap', 'file-migration', 'file-other-owner'],
+    });
+    await File.create([
+      {
+        user: user._id,
+        file_id: 'file-roadmap',
+        bytes: 10,
+        filename: 'Example Planning Notes.pdf',
+        filepath: '/not-forwarded/roadmap.pdf',
+        object: 'file',
+        type: 'application/pdf',
+      },
+      {
+        user: user._id,
+        file_id: 'file-migration',
+        bytes: 10,
+        filename: 'Example Reference Table.xlsx',
+        filepath: '/not-forwarded/migration.xlsx',
+        object: 'file',
+        type: 'application/vnd.ms-excel',
+        metadata: { meetingTranscriptDisplayTitle: 'Example Meeting' },
+      },
+      {
+        user: otherUser._id,
+        file_id: 'file-other-owner',
+        bytes: 10,
+        filename: 'Other Owner Secret.txt',
+        filepath: '/not-forwarded/other.txt',
+        object: 'file',
+        type: 'text/plain',
+      },
+    ]);
+
+    const created = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent_1',
+      conversationId,
+    });
+
+    expect(created.contextualKeyterms).toEqual(
+      expect.arrayContaining([
+        'Example Planning Notes.pdf',
+        'Example Reference Table.xlsx',
+        'Example Meeting',
+      ]),
+    );
+    expect(created.contextualKeyterms).toHaveLength(3);
+    expect(created.contextualKeyterms.join(' ')).not.toContain('Other Owner');
+    expect(created.contextualKeyterms.join(' ')).not.toContain('not-forwarded');
+    expect((await getCallSession(created.callSessionId)).contextualKeyterms).toEqual(
+      created.contextualKeyterms,
+    );
+  });
+
+  test('carries owner-bound native artifact names when the conversation file list is empty', async () => {
+    const user = await User.create({
+      name: 'Native Context User',
+      email: 'native-context-user@example.com',
+      provider: 'local',
+    });
+    const otherUser = await User.create({
+      name: 'Other Native User',
+      email: 'other-native-user@example.com',
+      provider: 'local',
+    });
+    const conversationId = 'conversation-native-keyterms';
+    await Conversation.create({
+      conversationId,
+      user: user._id.toString(),
+      endpoint: 'agents',
+      files: [],
+    });
+    await Message.create([
+      {
+        messageId: 'native-context-message',
+        conversationId,
+        user: user._id.toString(),
+        isCreatedByUser: false,
+        text: 'Owner-visible native artifact metadata',
+        metadata: {
+          viventium: {
+            nativeFiles: [
+              { filename: 'example-checklist.txt', filepath: '/private/body/path' },
+              { filename: 'Example_Reference_Table.xlsx', sha256: 'not-forwarded' },
+            ],
+          },
+        },
+      },
+      {
+        messageId: 'other-native-context-message',
+        conversationId,
+        user: otherUser._id.toString(),
+        isCreatedByUser: false,
+        text: 'Other owner metadata',
+        metadata: {
+          viventium: { nativeFiles: [{ filename: 'other-owner-secret.txt' }] },
+        },
+      },
+    ]);
+
+    const created = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent_1',
+      conversationId,
+    });
+
+    expect(created.contextualKeyterms).toEqual([
+      'example-checklist.txt',
+      'Example_Reference_Table.xlsx',
+    ]);
+    expect(created.contextualKeyterms.join(' ')).not.toContain('private');
+    expect(created.contextualKeyterms.join(' ')).not.toContain('not-forwarded');
+    expect(created.contextualKeyterms.join(' ')).not.toContain('other-owner');
+  });
+
+  test('resolves only one exact owner/conversation session with a current gateway lease', async () => {
+    const now = new Date();
+    const base = {
+      userId: 'owner-active-call',
+      agentId: 'main-agent',
+      conversationId: 'conversation-active-call',
+      roomName: 'room-active-call',
+      gatewayAgentName: 'voice-gateway',
+      ownerParticipantIdentity: 'owner-participant',
+      callStatus: 'listening',
+      activeJobId: 'job-active-call',
+      activeWorkerId: 'worker-active-call',
+      leaseExpiresAt: new Date(now.getTime() + 60_000),
+      expiresAt: new Date(now.getTime() + 120_000),
+    };
+    await ViventiumCallSession.create({ ...base, callSessionId: 'call-active-one' });
+
+    await expect(
+      getActiveCallSessionForConversation({
+        userId: base.userId,
+        conversationId: base.conversationId,
+        now,
+      }),
+    ).resolves.toMatchObject({ callSessionId: 'call-active-one' });
+
+    await ViventiumCallSession.create({
+      ...base,
+      callSessionId: 'call-active-two',
+      roomName: 'room-active-two',
+      activeJobId: 'job-active-two',
+      activeWorkerId: 'worker-active-two',
+    });
+    await expect(
+      getActiveCallSessionForConversation({
+        userId: base.userId,
+        conversationId: base.conversationId,
+        now,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  test('claimVoiceSession rejects a different worker that reuses the active job identity', async () => {
+    const user = await User.create({
+      name: 'Worker Claim Owner',
+      email: 'worker-claim-owner@example.com',
+      provider: 'local',
+    });
+    const created = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent_1',
+      conversationId: 'new',
+    });
+
+    const original = await claimVoiceSession({
+      callSessionId: created.callSessionId,
+      jobId: 'job_shared_identity',
+      workerId: 'worker_owner',
+      leaseDurationMs: 60_000,
+    });
+    expect(original.activeWorkerId).toBe('worker_owner');
+
+    const replacement = await claimVoiceSession({
+      callSessionId: created.callSessionId,
+      jobId: 'job_shared_identity',
+      workerId: 'worker_intruder',
+      leaseDurationMs: 60_000,
+    });
+
+    expect(replacement).toBeNull();
+    expect((await getCallSession(created.callSessionId)).activeWorkerId).toBe('worker_owner');
+    await expect(
+      claimVoiceSession({
+        callSessionId: created.callSessionId,
+        jobId: 'job_shared_identity',
+        workerId: 'worker_owner',
+        leaseDurationMs: 60_000,
+      }),
+    ).resolves.toMatchObject({ activeWorkerId: 'worker_owner' });
+  });
+
+  test('confirmDispatch persists and returns only a typed safe dispatch failure reason', async () => {
+    const user = await User.create({
+      name: 'Dispatch Failure Owner',
+      email: 'dispatch-failure-owner@example.com',
+      provider: 'local',
+    });
+    const created = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent_1',
+      conversationId: 'new',
+    });
+    const claim = await claimDispatch({
+      callSessionId: created.callSessionId,
+      roomName: created.roomName,
+      agentName: 'librechat-voice-gateway',
+    });
+    const sensitiveMarker = 'SYNTHETIC_PRIVATE_DISPATCH_CREDENTIAL';
+    const failure = Object.assign(new Error(`upstream rejected ${sensitiveMarker}`), {
+      code: 'ETIMEDOUT',
+      authorization: sensitiveMarker,
+    });
+
+    const confirmed = await confirmDispatch({
+      callSessionId: created.callSessionId,
+      claimId: claim.claimId,
+      success: false,
+      error: failure,
+    });
+    const persisted = await ViventiumCallSession.findOne({
+      callSessionId: created.callSessionId,
+    }).lean();
+
+    expect(confirmed.dispatchLastError).toBe('dispatch_timeout');
+    expect(persisted.dispatchLastError).toBe('dispatch_timeout');
+    expect(JSON.stringify(confirmed)).not.toContain(sensitiveMarker);
+    expect(JSON.stringify(persisted)).not.toContain(sensitiveMarker);
   });
 });

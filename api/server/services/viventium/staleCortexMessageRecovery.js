@@ -22,7 +22,6 @@ const { getAppConfig } = require('~/server/services/Config');
 
 const { getDeferredFallbackErrorText } = require('~/server/services/viventium/cortexFallbackText');
 const { isRuntimeHoldTextPart } = require('~/server/services/viventium/runtimeHoldText');
-
 const {
   buildCortexInsightDeliveryCandidates,
   cortexInsightDeliveryService,

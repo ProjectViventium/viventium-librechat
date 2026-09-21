@@ -113,6 +113,7 @@ def _definition(task: dict[str, Any]) -> dict[str, Any]:
         "failed",
         "missed",
         "partial_success",
+        "superseded",
         "terminal",
     }:
         last_error = str(task.get("last_delivery_reason") or "").strip()

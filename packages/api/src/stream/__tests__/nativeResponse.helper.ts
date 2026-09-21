@@ -1,15 +1,22 @@
 /* eslint-disable jest/no-export -- Shared contract helper excluded from test discovery. */
+/* eslint-disable jest/no-conditional-expect -- The shared contract checks both supported stream-admission policies. */
 import type { NativeResponseIdentity } from '@librechat/data-schemas';
 import type { IJobStore } from '../interfaces/IJobStore';
 
 const digest = 'a'.repeat(64);
 const scope = 'b'.repeat(64);
-export async function admitted(store: IJobStore, streamId = 'stream-a', ordered = true) {
+export async function admitted(
+  store: IJobStore,
+  streamId = 'stream-a',
+  ordered = true,
+  surface: 'web' | 'telegram' = 'web',
+  externalDelivery = false,
+) {
   if (ordered) await store.observeSourceOrder?.({ source_order_scope: scope, source_sequence: 1 });
   const claim = await store.claimLogicalTurn(streamId, 'owner', {
     actor_kind: 'external_user',
     origin: 'interactive',
-    surface: 'web',
+    surface,
     conversation_id: 'conversation',
     revision: 1,
     source_event_id: streamId,
@@ -19,6 +26,9 @@ export async function admitted(store: IJobStore, streamId = 'stream-a', ordered 
     responseMessageId: 'assistant',
     interactionContext: claim.interactionContext,
     userMessage: { messageId: 'source' },
+    ...(externalDelivery
+      ? { deliveryPolicy: { commit_authority: 'external_adapter' as const } }
+      : {}),
   });
   const admittedAt = Date.now();
   const identity: NativeResponseIdentity = {
@@ -43,7 +53,11 @@ export async function admitted(store: IJobStore, streamId = 'stream-a', ordered 
   return { identity, job };
 }
 
-export function nativeStoreContract(factory: () => IJobStore, clock = false) {
+export function nativeStoreContract(
+  factory: () => IJobStore,
+  clock = false,
+  sameStreamReplacement = true,
+) {
   let store: IJobStore;
   beforeEach(() => {
     store = factory();
@@ -55,8 +69,17 @@ export function nativeStoreContract(factory: () => IJobStore, clock = false) {
   test('identity-fenced updates reject a stale incarnation and accept the exact native owner', async () => {
     const { identity } = await admitted(store);
     await store.bindNativeResponse(identity);
-    const ack = { logical_turn_id: identity.logicalTurnId!, revision: identity.revision!, state: 'partial_removed' as const, presentation_ref: identity.responseMessageId };
-    await store.updateJob(identity.streamId, { deliveryAcknowledgement: ack }, { ...identity, jobCreatedAt: identity.jobCreatedAt + 1 });
+    const ack = {
+      logical_turn_id: identity.logicalTurnId!,
+      revision: identity.revision!,
+      state: 'partial_removed' as const,
+      presentation_ref: identity.responseMessageId,
+    };
+    await store.updateJob(
+      identity.streamId,
+      { deliveryAcknowledgement: ack },
+      { ...identity, jobCreatedAt: identity.jobCreatedAt + 1 },
+    );
     expect((await store.getJob(identity.streamId))?.deliveryAcknowledgement).toBeUndefined();
     await store.updateJob(identity.streamId, { deliveryAcknowledgement: ack }, identity);
     expect((await store.getJob(identity.streamId))?.deliveryAcknowledgement).toEqual(ack);
@@ -244,6 +267,15 @@ export function nativeStoreContract(factory: () => IJobStore, clock = false) {
   test('replacement same-stream incarnation cannot inherit native authority', async () => {
     const { identity } = await admitted(store);
     await store.bindNativeResponse(identity);
+    if (!sameStreamReplacement) {
+      await expect(
+        store.createJob(identity.streamId, 'owner', 'conversation', {
+          responseMessageId: 'replacement',
+        }),
+      ).rejects.toThrow('Generation stream already exists');
+      expect((await store.getJob(identity.streamId))?.nativeResponse).toEqual(identity);
+      return;
+    }
     await store.createJob(identity.streamId, 'owner', 'conversation', {
       responseMessageId: 'replacement',
     });
@@ -294,9 +326,15 @@ export function nativeStoreContract(factory: () => IJobStore, clock = false) {
     await store.finishNativeResponse(identity, '', 'stop', 'cancelled');
     expect(await store.settleNativeResponse(identity, 'unsupported')).toBe(false);
     expect((await store.getJob(identity.streamId))?.finalEvent).toBe('stop');
-    await store.createJob(identity.streamId, 'owner', 'conversation', {
+    const replacement = store.createJob(identity.streamId, 'owner', 'conversation', {
       responseMessageId: 'replacement',
     });
+    if (!sameStreamReplacement) {
+      await expect(replacement).rejects.toThrow('Generation stream already exists');
+      expect((await store.getJob(identity.streamId))?.finalEvent).toBe('stop');
+      return;
+    }
+    await replacement;
     expect(await store.settleNativeResponse(identity, 'unsupported')).toBe(false);
     expect((await store.getJob(identity.streamId))?.responseMessageId).toBe('replacement');
   });
@@ -353,9 +391,15 @@ export function nativeStoreContract(factory: () => IJobStore, clock = false) {
     await store.bindNativeResponse(identity);
     await store.cancelNativeResponse((await store.getJob(identity.streamId))!);
     await store.finishNativeResponse(identity, '', 'stop', 'cancelled');
-    await store.createJob(identity.streamId, 'owner', 'conversation', {
+    const replacement = store.createJob(identity.streamId, 'owner', 'conversation', {
       responseMessageId: 'replacement',
     });
+    if (!sameStreamReplacement) {
+      await expect(replacement).rejects.toThrow('Generation stream already exists');
+      expect((await store.getJob(identity.streamId))?.finalEvent).toBe('stop');
+      return;
+    }
+    await replacement;
     expect(await store.finishNativeResponse(identity, '', 'stop', 'cancelled')).toBe(false);
     expect(await store.getJob(identity.streamId)).toMatchObject({
       responseMessageId: 'replacement',
@@ -373,7 +417,8 @@ export function nativeStoreContract(factory: () => IJobStore, clock = false) {
   });
   test('late logical cleanup uses the captured revision instead of a replacement sharing its stream', async () => {
     const { identity } = await admitted(store);
-    const next = await store.claimLogicalTurn(identity.streamId, 'owner', {
+    const nextStreamId = sameStreamReplacement ? identity.streamId : 'new-stream';
+    const next = await store.claimLogicalTurn(nextStreamId, 'owner', {
       actor_kind: 'external_user',
       origin: 'interactive',
       surface: 'web',
@@ -383,7 +428,7 @@ export function nativeStoreContract(factory: () => IJobStore, clock = false) {
       source_order_scope: scope,
       source_sequence: 1,
     });
-    await store.createJob(identity.streamId, 'owner', 'conversation', {
+    await store.createJob(nextStreamId, 'owner', 'conversation', {
       responseMessageId: 'replacement',
       interactionContext: next.interactionContext,
       userMessage: { messageId: 'source-2' },
@@ -425,7 +470,7 @@ export function nativeStoreContract(factory: () => IJobStore, clock = false) {
       store.createJob(identity.streamId, 'owner', 'conversation', {
         responseMessageId: 'replacement',
       }),
-    ).rejects.toThrow('pending');
+    ).rejects.toThrow(sameStreamReplacement ? 'pending' : 'Generation stream already exists');
     expect((await store.getJob(identity.streamId))?.nativeResponse).toEqual(identity);
   });
   test('generic updates cannot change bound identity or accepted final content', async () => {

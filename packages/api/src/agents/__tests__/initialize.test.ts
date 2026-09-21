@@ -919,6 +919,54 @@ describe('initializeAgent — conversation recall resources', () => {
       ]),
     );
   });
+
+  it('uses the typed active message ID when the request body has only the parent thread ID', async () => {
+    process.env.RAG_API_URL = 'http://rag.example.test';
+
+    const { agent, req, res, loadTools, db } = createMocks();
+    agent.tools = [];
+    req.user.personalization = { conversation_recall: true };
+    req.body = { parentMessageId: 'prior-message' };
+    db.getFiles = jest.fn().mockResolvedValue([
+      {
+        file_id: 'conversation_recall:user-1:all',
+        filename: 'conversation-recall-all.txt',
+        updatedAt: '2026-04-08T16:00:00.000Z',
+      },
+    ]);
+    db.getLatestRecallEligibleMessageCreatedAt = jest
+      .fn()
+      .mockResolvedValue('2026-04-08T16:00:00.000Z');
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        loadTools,
+        agent,
+        activeMessageId: 'current-user-turn',
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(db.getLatestRecallEligibleMessageCreatedAt).toHaveBeenCalledWith({
+      user: 'user-1',
+      excludeMessageId: 'current-user-turn',
+      excludeParentMessageId: 'current-user-turn',
+    });
+    expect(result.tool_resources?.file_search?.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          file_id: 'conversation_recall:user-1:all',
+          viventiumConversationRecallMode: 'vector',
+          viventiumConversationRecallAttachmentReason: 'vector_ready',
+        }),
+      ]),
+    );
+  });
 });
 
 describe('initializeAgent — meeting transcript resources', () => {

@@ -1,6 +1,11 @@
 const mockExecute = jest.fn();
 const mockSweep = jest.fn();
-const mockCreateRuntime = jest.fn();
+const mockCreateExecutor = jest.fn();
+const mockCreateCleanupService = jest.fn();
+const mockCreateLedger = jest.fn();
+const mockCreateRepository = jest.fn();
+const mockCreateMemoryAdapter = jest.fn();
+const mockCreateResidueAdapter = jest.fn();
 const mockCreateSearchAdapter = jest.fn();
 const mockCreateScheduleAdapter = jest.fn();
 const mockLoadVerifier = jest.fn();
@@ -10,7 +15,10 @@ const mockModels = {
   Conversation: { modelName: 'Conversation' },
   MemoryEntry: { modelName: 'MemoryEntry' },
   Message: { modelName: 'Message' },
-  ViventiumPersonalAccountCleanupReceipt: { modelName: 'CleanupReceipt' },
+  ViventiumPersonalAccountCleanupReceipt: {
+    modelName: 'CleanupReceipt',
+    configureCleanupRecoveryVerifier: jest.fn(),
+  },
 };
 const mockRecall = {
   reconcileConversationRecallForCleanup: jest.fn(),
@@ -22,9 +30,14 @@ jest.mock('meilisearch', () => ({
   MeiliSearch: jest.fn(() => mockSearchClient),
 }));
 jest.mock('@librechat/api', () => ({
+  createCleanupLedgerAdapter: (...args) => mockCreateLedger(...args),
   createExactMeiliCleanupAdapter: (...args) => mockCreateSearchAdapter(...args),
-  createPersonalAccountCleanupRuntime: (...args) => mockCreateRuntime(...args),
-  createPersonalAccountCleanupScheduleAdapter: (...args) => mockCreateScheduleAdapter(...args),
+  createMongoMemoryCleanupAdapter: (...args) => mockCreateMemoryAdapter(...args),
+  createMongoPersonalAccountCleanupRepository: (...args) => mockCreateRepository(...args),
+  createMongoSyntheticQaResidueAdapter: (...args) => mockCreateResidueAdapter(...args),
+  createPersonalAccountCleanupExecutor: (...args) => mockCreateExecutor(...args),
+  createPersonalAccountCleanupService: (...args) => mockCreateCleanupService(...args),
+  createScheduleCleanupProcessAdapter: (...args) => mockCreateScheduleAdapter(...args),
   loadTrustedPrivateBackupAuthorityVerifier: (...args) => mockLoadVerifier(...args),
 }));
 jest.mock('~/db/models', () => mockModels);
@@ -40,9 +53,14 @@ describe('PersonalAccountCleanupExecutionService', () => {
     process.env.MEILI_MASTER_KEY = 'synthetic-search-key';
     process.env.RAG_API_URL = 'http://recall.invalid';
     mockCreateSearchAdapter.mockReturnValue({ name: 'search-adapter' });
-    mockCreateScheduleAdapter.mockReturnValue({ name: 'schedule-adapter' });
+    mockCreateScheduleAdapter.mockReturnValue({ name: 'schedule-adapter', assertReady: jest.fn() });
+    mockCreateLedger.mockReturnValue({ name: 'ledger-adapter' });
+    mockCreateRepository.mockReturnValue({ name: 'repository-adapter' });
+    mockCreateMemoryAdapter.mockReturnValue({ name: 'memory-adapter' });
+    mockCreateResidueAdapter.mockReturnValue({ name: 'residue-adapter' });
+    mockCreateCleanupService.mockReturnValue({ name: 'cleanup-service' });
     mockLoadVerifier.mockReturnValue(jest.fn());
-    mockCreateRuntime.mockReturnValue({
+    mockCreateExecutor.mockReturnValue({
       execute: mockExecute,
       verifyDelayedSweep: mockSweep,
     });
@@ -55,7 +73,7 @@ describe('PersonalAccountCleanupExecutionService', () => {
     delete process.env.RAG_API_URL;
   });
 
-  test('binds legacy dependencies once to the package-owned typed runtime', async () => {
+  test('binds owner-scoped cleanup adapters once to the package-owned executor', async () => {
     const service = require('../PersonalAccountCleanupExecutionService');
     const input = { authenticatedOwnerId: 'owner-cleanup-1' };
     mockExecute.mockResolvedValue({ status: 'completed' });
@@ -68,15 +86,27 @@ describe('PersonalAccountCleanupExecutionService', () => {
       status: 'verified',
     });
 
-    expect(mockCreateRuntime).toHaveBeenCalledTimes(1);
-    expect(mockCreateRuntime).toHaveBeenCalledWith(
+    expect(
+      mockModels.ViventiumPersonalAccountCleanupReceipt.configureCleanupRecoveryVerifier,
+    ).toHaveBeenCalledWith(expect.any(Function));
+    expect(mockCreateExecutor).toHaveBeenCalledTimes(1);
+    expect(mockCreateExecutor).toHaveBeenCalledWith(
       expect.objectContaining({
-        Conversation: mockModels.Conversation,
-        MemoryEntry: mockModels.MemoryEntry,
-        Message: mockModels.Message,
-        receiptModel: mockModels.ViventiumPersonalAccountCleanupReceipt,
+        cleanup: { name: 'cleanup-service' },
+        registry: expect.objectContaining({
+          claimCleanupExecution: expect.any(Function),
+          completeCleanupExecution: expect.any(Function),
+        }),
+        preflight: expect.any(Function),
+      }),
+    );
+    expect(mockCreateCleanupService).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repository: { name: 'repository-adapter' },
         search: { name: 'search-adapter' },
-        schedules: { name: 'schedule-adapter' },
+        schedules: expect.objectContaining({ name: 'schedule-adapter' }),
+        memories: { name: 'memory-adapter' },
+        residue: { name: 'residue-adapter' },
       }),
     );
     expect(mockExecute).toHaveBeenCalledWith(input);
@@ -90,6 +120,6 @@ describe('PersonalAccountCleanupExecutionService', () => {
     await expect(service.executePersonalAccountCleanup({})).rejects.toThrow(
       'cleanup_backup_external_verifier_unavailable',
     );
-    expect(mockCreateRuntime).not.toHaveBeenCalled();
+    expect(mockCreateExecutor).not.toHaveBeenCalled();
   });
 });

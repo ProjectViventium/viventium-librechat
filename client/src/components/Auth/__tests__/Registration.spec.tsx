@@ -1,9 +1,8 @@
 import reactRouter from 'react-router-dom';
 import userEvent from '@testing-library/user-event';
-import { act } from 'react';
-import { render, waitFor, screen } from 'test/layout-test-utils';
+import { act, render, waitFor, screen } from 'test/layout-test-utils';
 import * as mockDataProvider from 'librechat-data-provider/react-query';
-import type { TStartupConfig } from 'librechat-data-provider';
+import type { TRegisterUser, TStartupConfig } from 'librechat-data-provider';
 import * as miscDataProvider from '~/data-provider/Misc/queries';
 import * as endpointQueries from '~/data-provider/Endpoints/queries';
 import * as authMutations from '~/data-provider/Auth/mutations';
@@ -35,6 +34,50 @@ const mockStartupConfig = {
     serverDomain: 'mock-server',
     viventiumInstallExperience: 'express',
   },
+};
+
+type RegistrationMutationResult = ReturnType<typeof mockDataProvider.useRegisterUserMutation>;
+
+const createRegistrationMutationResult = (
+  mutate: RegistrationMutationResult['mutate'],
+  error: Error | null = null,
+): RegistrationMutationResult => {
+  const mutationState = {
+    mutate,
+    mutateAsync: jest.fn(async (_variables: TRegisterUser) => ({
+      message: 'Registration succeeded',
+    })),
+    reset: jest.fn(),
+    context: undefined,
+    variables: undefined,
+    data: undefined,
+    failureCount: error ? 1 : 0,
+    failureReason: error,
+    isPaused: false,
+    isPending: false as const,
+  };
+
+  if (error) {
+    return {
+      ...mutationState,
+      error,
+      isError: true,
+      isIdle: false,
+      isLoading: false,
+      isSuccess: false,
+      status: 'error',
+    };
+  }
+
+  return {
+    ...mutationState,
+    error: null,
+    isError: false,
+    isIdle: true,
+    isLoading: false,
+    isSuccess: false,
+    status: 'idle',
+  };
 };
 
 const setup = ({

@@ -109,7 +109,8 @@ describe('Cortex restart claim binding', () => {
   });
 
   test('atomically carries the server-bound presentation through adapter acknowledgement', async () => {
-    const manager = await configuredManager();
+    const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const manager = await configuredManager(store);
     const job = await manager.getJob('stream-restart');
     const boundPresentation = await manager.bindCortexPresentation('stream-restart', receipt());
     const acknowledgement = {
@@ -145,17 +146,16 @@ describe('Cortex restart claim binding', () => {
       idempotent: true,
       presentation: { cortexPresentation: first.presentation!.cortexPresentation },
     });
-    await expect(manager.getJob('stream-restart')).resolves.toMatchObject({
-      metadata: {
-        deliveryAcknowledgement: expect.objectContaining(acknowledgement),
-        cortexPresentation: first.presentation!.cortexPresentation,
-      },
+    await expect(store.getJob('stream-restart')).resolves.toMatchObject({
+      cortexDeliveryAcknowledgement: expect.objectContaining(acknowledgement),
+      cortexPresentation: first.presentation!.cortexPresentation,
     });
     await manager.destroy();
   });
 
   test('does not record the adapter acknowledgement when the Cortex owner fence is invalid', async () => {
-    const manager = await configuredManager();
+    const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const manager = await configuredManager(store);
     const job = await manager.getJob('stream-restart');
     const boundPresentation = await manager.bindCortexPresentation('stream-restart', receipt());
 
@@ -169,13 +169,10 @@ describe('Cortex restart claim binding', () => {
         'telegram',
         receipt({ generation: 3, hash: 'b'.repeat(64) }),
       ),
-    ).resolves.toEqual({ status: 'retryable_conflict' });
-    await expect(manager.getJob('stream-restart')).resolves.toMatchObject({
-      metadata: {
-        deliveryAcknowledgement: undefined,
-        cortexPresentation: boundPresentation,
-      },
-    });
+    ).resolves.toEqual({ status: 'conflict' });
+    const unchanged = await store.getJob('stream-restart');
+    expect(unchanged?.cortexDeliveryAcknowledgement).toBeUndefined();
+    expect(unchanged?.cortexPresentation).toEqual(boundPresentation);
     await manager.destroy();
   });
 

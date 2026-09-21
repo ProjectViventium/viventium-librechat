@@ -157,6 +157,16 @@ function shouldSkipRecallMessage({
   ) {
     return true;
   }
+  /* === VIVENTIUM START ===
+   * QA and explicitly ineligible rows must stay out of every recall path, including source rescue.
+   * === VIVENTIUM END === */
+  if (
+    viventiumMetadata?.recallEligible === false ||
+    (viventiumMetadata?.memoryEligible === false && viventiumMetadata?.recallEligible !== true) ||
+    viventiumMetadata?.qaRun === true
+  ) {
+    return true;
+  }
   if (messageUsesConversationRecallSearch(message)) {
     return true;
   }

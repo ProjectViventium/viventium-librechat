@@ -647,6 +647,14 @@ export default function useCortexFollowUpPoll({
         return;
       }
 
+      if (active) {
+        if (latestCortexMessageId) {
+          targetParentRef.current = latestCortexMessageId;
+        }
+        refreshMessages();
+        return;
+      }
+
       if (!targetParentRef.current && latestCortexMessageId) {
         targetParentRef.current = latestCortexMessageId;
       }

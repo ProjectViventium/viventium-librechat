@@ -46,9 +46,29 @@ const {
   verifyDirectIssuerAssertion,
 } = require('~/server/services/viventium/GlassHiveCapabilityDirectIssuerAuth');
 const { requestLifetimeSignal } = require('./GlassHiveRequestLifetimeSignal');
+const {
+  canonicalConversationOrchestrationArguments,
+  isConversationOrchestrationMutationTool,
+  isConversationOrchestrationTool,
+  mainOrchestrationInvocationIdentity,
+} = require('~/server/services/viventium/GlassHiveConversationOrchestration');
 /* === VIVENTIUM END === */
 
 const router = express.Router();
+
+function brokerInvocationIdentity({ grant, toolName, args } = {}) {
+  if (!isConversationOrchestrationTool(toolName)) return '';
+  if (isConversationOrchestrationMutationTool(toolName)) return '';
+  return mainOrchestrationInvocationIdentity({
+    userId: grant?.user_id,
+    requestBody: {
+      conversationId: grant?.conversation_id || grant?.turn_id,
+      messageId: grant?.message_id,
+    },
+    toolName,
+    args: canonicalConversationOrchestrationArguments(toolName, args),
+  });
+}
 
 function bearerToken(req) {
   const header = String(req.get('authorization') || req.get('Authorization') || '').trim();
@@ -74,6 +94,7 @@ function rpcError(id, code, message, data) {
 async function handleRpc(req, res) {
   const body = req.body || {};
   const id = body.id ?? null;
+  res.set('Cache-Control', 'no-store, private');
   const signal = requestLifetimeSignal(req, res);
   let grant;
   try {
@@ -149,10 +170,14 @@ async function handleRpc(req, res) {
       return res.json(rpcResult(id, { tools: toolDefinitionsForMcp(catalog) }));
     }
     if (body.method === 'tools/call') {
+      const toolName = body.params?.name;
+      const args = body.params?.arguments || {};
+      const invocationId = brokerInvocationIdentity({ grant, toolName, args });
       const result = await handleToolCall({
         grant,
-        toolName: body.params?.name,
-        args: body.params?.arguments || {},
+        toolName,
+        args,
+        invocationId,
         signal,
         appConfig,
       });

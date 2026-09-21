@@ -294,11 +294,6 @@ export function createUserMethods(mongoose: typeof import('mongoose')) {
     viventiumOrchestrationPreferences: ViventiumOrchestrationPreferences,
   ): Promise<IUser | null> {
     const User = mongoose.models.User;
-    const user = await User.findById(userId);
-    if (!user) {
-      return null;
-    }
-
     if (
       !('mode' in viventiumOrchestrationPreferences) &&
       !('knownWork' in viventiumOrchestrationPreferences)

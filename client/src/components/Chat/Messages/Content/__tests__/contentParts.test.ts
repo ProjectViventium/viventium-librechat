@@ -1,3 +1,4 @@
+// VIVENTIUM START: verify Parallel Work content grouping and rendering contracts.
 import { Constants, ContentTypes, ToolCallTypes } from 'librechat-data-provider';
 import type { TMessageContentParts } from 'librechat-data-provider';
 import { groupParallelContent } from '../ParallelContent';
@@ -774,6 +775,7 @@ describe('filterRenderableContentParts', () => {
     expect(filterRenderableContentParts(parts)).toBe(parts);
   });
 });
+// VIVENTIUM END
 
 describe('groupParallelContent', () => {
   it('keeps malformed non-array content empty instead of crashing', () => {

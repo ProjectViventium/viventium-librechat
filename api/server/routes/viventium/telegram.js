@@ -60,7 +60,14 @@ const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { resizeImageBuffer } = require('~/server/services/Files/images');
 const { cleanFileName } = require('~/server/utils/files');
 const { getOpenAIClient } = require('~/server/controllers/assistants/helpers');
-const { getUserById, getMessages, getConvo, getFiles, saveMessage } = require('~/models');
+const {
+  getUserById,
+  getMessages,
+  getConvo,
+  getFiles,
+  saveMessage,
+  updateUserViventiumOrchestrationPreferences,
+} = require('~/models');
 const { Message } = require('~/db/models');
 /* === VIVENTIUM START ===
  * Feature: Telegram ingress idempotency store.
@@ -116,8 +123,22 @@ const {
 } = require('~/server/services/viventium/interactionContext');
 const {
   effectiveOrchestrationMode,
+  parallelWorkClaimState,
   parallelWorkClaimStateAsync,
+  parallelWorkReleaseGateSnapshotAsync,
 } = require('~/server/services/viventium/ViventiumOrchestrationMode');
+const {
+  observeOrchestrationOwner,
+  refreshOrchestrationReadiness,
+  waitForOrchestrationReadiness,
+} = require('~/server/services/viventium/GlassHiveOrchestrationReadinessService');
+const {
+  getActiveWorkInteractiveSnapshot,
+  getActiveWorkPage,
+} = require('~/server/services/viventium/GlassHiveAccountService');
+const {
+  executeGlassHiveWorkAction,
+} = require('~/server/services/viventium/GlassHiveWorkActionService');
 
 const EXTRACTED_DOCUMENT_IMAGE_MAX_DIMENSION = 768;
 /* === VIVENTIUM START ===
@@ -178,6 +199,13 @@ const TELEGRAM_PUBLIC_PLAYGROUND_REQUIRED_ERROR =
 function parseTelegramSourceSequence(value) {
   const sequence = Number(value);
   return Number.isSafeInteger(sequence) && sequence > 0 ? sequence : null;
+}
+
+function isTrustedTelegramSourceScope(value, expected) {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value) || !expected) {
+    return false;
+  }
+  return crypto.timingSafeEqual(Buffer.from(value, 'hex'), Buffer.from(expected, 'hex'));
 }
 
 function normalizeTelegramThreadId(value) {
@@ -253,16 +281,15 @@ async function reserveTelegramIngress({
   conversationId,
   traceId,
 }) {
-  if (!TELEGRAM_INGRESS_DEDUPE_ENABLED) {
-    return { duplicate: false };
-  }
-
   const messageKeyPart = telegramMessageId ? `m:${telegramChatId}:${telegramMessageId}` : '';
   const updateKeyPart = telegramUpdateId ? `u:${telegramUpdateId}` : '';
-  const dedupeKey = messageKeyPart || updateKeyPart;
-  if (!dedupeKey) {
+  const sourceKey = messageKeyPart || updateKeyPart;
+  if (!sourceKey) {
     return { duplicate: false };
   }
+  const dedupeKey = TELEGRAM_INGRESS_DEDUPE_ENABLED
+    ? sourceKey
+    : `authority:${crypto.randomUUID()}`;
 
   const expiresAt = new Date(Date.now() + TELEGRAM_INGRESS_DEDUPE_TTL_S * 1000);
   try {
@@ -281,6 +308,56 @@ async function reserveTelegramIngress({
     if (isMongoDuplicateKeyError(error)) {
       return { duplicate: true, dedupeKey };
     }
+    throw error;
+  }
+}
+
+async function bindTelegramIngressAuthority({
+  recordId,
+  dedupeKey,
+  libreChatUserId,
+  telegramUserId,
+  telegramChatId,
+  telegramMessageId,
+  telegramMessageThreadId,
+  conversationId,
+  streamId,
+  sourceSequence,
+  sourceOrderScope,
+  sourceEventId,
+}) {
+  if (!recordId) {
+    const error = new Error('Telegram ingress authority record is unavailable');
+    error.code = 'TELEGRAM_INGRESS_AUTHORITY_UNAVAILABLE';
+    throw error;
+  }
+  const result = await ViventiumTelegramIngressEvent.updateOne(
+    {
+      _id: recordId,
+      dedupeKey,
+      telegramUserId,
+      telegramChatId,
+      telegramMessageId,
+      authorityBoundAt: null,
+    },
+    {
+      $set: {
+        libreChatUserId,
+        conversationId,
+        streamId,
+        telegramMessageThreadId,
+        sourceSequence,
+        sourceOrderScope,
+        sourceEventId,
+        authorityBoundAt: new Date(),
+      },
+    },
+  );
+  const matchedCount = Number(result?.matchedCount ?? result?.n ?? 0);
+  const modifiedCount = Number(result?.modifiedCount ?? result?.nModified ?? 0);
+  if (result?.acknowledged === false || (matchedCount < 1 && modifiedCount < 1)) {
+    const error = new Error('Telegram ingress authority could not be bound exactly once');
+    error.code = 'TELEGRAM_INGRESS_AUTHORITY_UNAVAILABLE';
     throw error;
   }
 }
@@ -471,6 +548,7 @@ async function telegramAuth(req, res, next) {
         }
         return res.status(401).json({
           error: 'Telegram account not linked',
+          code: 'TELEGRAM_ACCOUNT_NOT_LINKED',
           linkRequired: true,
           linkUrl,
         });
@@ -480,6 +558,10 @@ async function telegramAuth(req, res, next) {
         source === 'missing' ? 'telegramUserId is required' : 'Telegram account not linked',
       );
       err.status = 401;
+      if (source !== 'missing') {
+        err.code = 'TELEGRAM_ACCOUNT_NOT_LINKED';
+        err.linkRequired = true;
+      }
       throw err;
     }
 
@@ -506,7 +588,11 @@ async function telegramAuth(req, res, next) {
   } catch (err) {
     const status = err?.status || 401;
     logger.error('[VIVENTIUM][telegramAuth] Auth failed:', err);
-    return res.status(status).json({ error: err?.message || 'Unauthorized' });
+    return res.status(status).json({
+      error: err?.message || 'Unauthorized',
+      ...(err?.code ? { code: err.code } : {}),
+      ...(err?.linkRequired === true ? { linkRequired: true } : {}),
+    });
   }
 }
 
@@ -683,6 +769,16 @@ async function uploadTelegramFiles({ req, files, agentId }) {
   req._telegramUploadedDocumentImages = [];
   const originalFile = req.file;
   const originalBody = req.body;
+  const hadDocumentImageExtraction = Object.prototype.hasOwnProperty.call(
+    req,
+    '_viventiumBridgeDocumentImageExtraction',
+  );
+  const originalDocumentImageExtraction = req._viventiumBridgeDocumentImageExtraction;
+  const hadDurableMissionAttachment = Object.prototype.hasOwnProperty.call(
+    req,
+    '_viventiumBridgeDurableMissionAttachment',
+  );
+  const originalDurableMissionAttachment = req._viventiumBridgeDurableMissionAttachment;
 
   for (let index = 0; index < files.length; index += 1) {
     const file = files[index];
@@ -756,6 +852,7 @@ async function uploadTelegramFiles({ req, files, agentId }) {
     try {
       req.file = tempFile;
       req._viventiumBridgeDocumentImageExtraction = true;
+      req._viventiumBridgeDurableMissionAttachment = mimeType.startsWith('image/');
       const model =
         originalBody && typeof originalBody === 'object' ? originalBody.model : undefined;
       req.body = {
@@ -783,7 +880,11 @@ async function uploadTelegramFiles({ req, files, agentId }) {
 
       await processAgentFileUpload({ req, res, metadata });
       if (result) {
-        uploaded.push(result);
+        uploaded.push({
+          ...result,
+          viventium_media_group_index: index,
+          viventium_media_group_kind: mimeType.startsWith('image/') ? 'image' : 'file',
+        });
         const extractedImages = await formatExtractedImagesForVision(
           result.viventiumExtractedImages,
         );
@@ -810,6 +911,16 @@ async function uploadTelegramFiles({ req, files, agentId }) {
     } finally {
       req.file = originalFile;
       req.body = originalBody;
+      if (hadDocumentImageExtraction) {
+        req._viventiumBridgeDocumentImageExtraction = originalDocumentImageExtraction;
+      } else {
+        delete req._viventiumBridgeDocumentImageExtraction;
+      }
+      if (hadDurableMissionAttachment) {
+        req._viventiumBridgeDurableMissionAttachment = originalDurableMissionAttachment;
+      } else {
+        delete req._viventiumBridgeDurableMissionAttachment;
+      }
       try {
         await fs.promises.unlink(filePath);
       } catch (err) {
@@ -1196,6 +1307,8 @@ router.post(
         telegramChatId: retainedInput.telegramChatId,
         telegramMessageThreadId: retainedInput.telegramMessageThreadId,
         telegramMessageId: String(retainedInput.sourceSequence),
+        sourceOrderScope: retainedInput.sourceOrderScope,
+        sourceEventId: retainedInput.sourceEventId,
         clientTimestamp: Number.isFinite(Number(envelope?.preparation?.message?.date))
           ? new Date(Number(envelope.preparation.message.date) * 1000).toISOString()
           : undefined,
@@ -1285,6 +1398,21 @@ router.post(
         })
       : '';
     if (
+      !identity.telegramUserId ||
+      !identity.telegramChatId ||
+      telegramMessageThreadId == null ||
+      sourceSequence == null ||
+      !isTrustedTelegramSourceScope(declaredScope, sourceOrderScope) ||
+      !isTrustedTelegramSourceScope(declaredEvent, orderedEvent)
+    ) {
+      _res.setHeader('Cache-Control', 'no-store, private');
+      return _res.status(400).json({
+        error: 'Telegram chat requires verified source ordering.',
+        code: 'INVALID_SOURCE_ORDER_IDENTITY',
+        retryable: true,
+      });
+    }
+    if (
       (sourceSequence != null && (!sourceOrderScope || telegramMessageThreadId == null)) ||
       (declaredScope && declaredScope !== sourceOrderScope) ||
       (orderedEvent && declaredEvent && declaredEvent !== orderedEvent) ||
@@ -1293,6 +1421,24 @@ router.post(
           parseTelegramSourceSequence(declaredSequence) !== sourceSequence))
     ) {
       return _res.status(400).json({ error: 'invalid_source_order' });
+    }
+    req._viventiumParallelWorkTurnAvailable = false;
+    if (effectiveOrchestrationMode(req.user, { available: true }) === 'parallel') {
+      const releaseGate = await parallelWorkReleaseGateSnapshotAsync();
+      if (releaseGate.available === true) {
+        const readiness = await waitForOrchestrationReadiness({ ownerId: String(req.user.id) });
+        const claimState = parallelWorkClaimState(String(req.user.id), releaseGate);
+        req._viventiumParallelWorkTurnClaim = claimState;
+        req._viventiumParallelWorkTurnAvailable = Boolean(
+          readiness.requested && readiness.available && claimState.available,
+        );
+        if (readiness.requested && req._viventiumParallelWorkTurnAvailable) {
+          const sourceOrderCapabilities = GenerationJobManager.getSourceOrderCapabilities();
+          if (sourceOrderCapabilities.replica_safe !== true) {
+            req._viventiumParallelWorkTurnAvailable = false;
+          }
+        }
+      }
     }
     // Legacy ingress without an ordered Telegram message keeps its existing opaque event identity.
     const sourceEventId =
@@ -1309,7 +1455,7 @@ router.post(
       }),
       {
         segment_stability: 'immediate',
-        supersede_scope: 'response_and_authoring',
+        supersede_scope: 'response_only',
       },
       { commit_authority: 'external_adapter' },
     );
@@ -1410,6 +1556,34 @@ router.post(
           parentMessageId,
         });
     conversationId = acceptedContext?.conversation_id || conversationState.conversationId;
+    if (!retainedInput) {
+      try {
+        await bindTelegramIngressAuthority({
+          recordId: ingressReservation.recordId,
+          dedupeKey: ingressReservation.dedupeKey,
+          libreChatUserId: String(req.user?.id || ''),
+          telegramUserId,
+          telegramChatId,
+          telegramMessageId,
+          telegramMessageThreadId,
+          conversationId: resolveCanonicalConversationId(req, req.user?.id, conversationId),
+          streamId,
+          sourceSequence,
+          sourceOrderScope,
+          sourceEventId,
+        });
+      } catch (error) {
+        logger.error('[VIVENTIUM][telegram/chat] Durable ingress authority binding failed', {
+          code: error?.code || error?.name || 'TELEGRAM_INGRESS_AUTHORITY_UNAVAILABLE',
+        });
+        _res.setHeader('Cache-Control', 'no-store, private');
+        return _res.status(503).json({
+          error: 'Telegram turn could not be accepted durably.',
+          code: 'TELEGRAM_INGRESS_AUTHORITY_UNAVAILABLE',
+          retryable: true,
+        });
+      }
+    }
     logTelegramTiming(
       traceId,
       'parent_message_lookup',
@@ -1466,8 +1640,7 @@ router.post(
      * Feature: Format images for vision model injection
      * Updated: 2026-01-31 - Use req._telegramImages for direct injection into agent messages
      * === VIVENTIUM NOTE === */
-    const { images: telegramImageFiles, nonImages: telegramNonImageFiles } =
-      splitTelegramFiles(telegramFiles);
+    const { images: telegramImageFiles } = splitTelegramFiles(telegramFiles);
     const imageFormatStartTs = performance.now();
     const formattedImages = preparedInput
       ? preparedInput.imageUrls.map((url) => ({
@@ -1491,7 +1664,7 @@ router.post(
       uploadedFiles = preparedInput
         ? await getFiles({ user: req.user.id, file_id: { $in: preparedInput.fileIds } })
         : TELEGRAM_FILE_UPLOAD_ENABLED
-          ? await uploadTelegramFiles({ req, files: telegramNonImageFiles, agentId })
+          ? await uploadTelegramFiles({ req, files: telegramFiles, agentId })
           : [];
       logTelegramTiming(traceId, 'upload_files', uploadStartTs, `count=${uploadedFiles.length}`);
     } catch (err) {
@@ -1568,7 +1741,11 @@ router.post(
         conversationId,
         parentMessageId,
         streamId,
-        files: uploadedFiles,
+        files: uploadedFiles.filter(
+          (file) =>
+            file?.viventium_media_group_kind !== 'image' &&
+            !String(file?.type || '').startsWith('image/'),
+        ),
         spec: resolvedSpec,
       },
     });
@@ -1626,6 +1803,11 @@ router.post(
       logger.info(
         '[VIVENTIUM][telegram/chat] Images prepared for vision: count=%d',
         allFormattedImages.length,
+      );
+    }
+    if (uploadedFiles.length > 0) {
+      req._viventiumMissionAttachments = uploadedFiles.map(
+        ({ viventium_media_group_kind: _kind, ...file }) => ({ ...file }),
       );
     }
 
@@ -1778,6 +1960,169 @@ router.post('/preferences', telegramAuth, async (req, res) => {
       voice_responses_enabled: voiceResponsesEnabled,
     },
   });
+});
+
+/* === VIVENTIUM START ===
+ * Feature: Telegram Parallel work account and Active work controls.
+ * Purpose: Use the same linked account preference and exact-work plane as Web/Main, without a
+ * model call or Telegram-owned mission registry.
+ * === VIVENTIUM END === */
+const PARALLEL_WORK_ACTIONS = new Set([
+  'queue',
+  'message',
+  'steer',
+  'pause',
+  'resume',
+  'stop',
+  'retry',
+  'dismiss',
+]);
+const PARALLEL_WORK_INSTRUCTION_ACTIONS = new Set(['queue', 'message', 'steer']);
+const WORK_REF_PATTERN = /^[A-Za-z0-9._:-]{1,160}$/;
+const OPERATION_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+async function telegramOrchestrationResponse(user, ownerId, admittedClaimState) {
+  const claimState = admittedClaimState || (await parallelWorkClaimStateAsync(ownerId));
+  const releaseGate = await parallelWorkReleaseGateSnapshotAsync();
+  return {
+    available: claimState.available,
+    mode: effectiveOrchestrationMode(user, { available: claimState.available }),
+    hasKnownWork: user?.personalization?.parallel_work_known === true,
+    ...(releaseGate.label === 'READY'
+      ? {}
+      : { releaseGate: { label: releaseGate.label, blockers: releaseGate.blockers } }),
+  };
+}
+
+function setTelegramOrchestrationNoStore(res) {
+  res.setHeader('Cache-Control', 'no-store, private');
+  res.setHeader('Pragma', 'no-cache');
+}
+
+router.get('/orchestration', telegramAuth, async (req, res) => {
+  setTelegramOrchestrationNoStore(res);
+  observeOrchestrationOwner(String(req.user.id));
+  return res.json(await telegramOrchestrationResponse(req.user, String(req.user.id)));
+});
+
+router.patch('/orchestration', telegramAuth, async (req, res) => {
+  setTelegramOrchestrationNoStore(res);
+  const ownerId = String(req.user.id);
+  observeOrchestrationOwner(ownerId);
+  const mode = String(req.body?.mode || '').trim();
+  if (!['focused', 'parallel'].includes(mode)) {
+    return res.status(400).json({
+      error: 'Mode must be focused or parallel.',
+      code: 'INVALID_ORCHESTRATION_PREFERENCE',
+    });
+  }
+  let claimState = mode === 'parallel' ? await parallelWorkClaimStateAsync(ownerId) : null;
+  if (mode === 'parallel' && claimState.available !== true) {
+    await refreshOrchestrationReadiness({ ownerId });
+    claimState = await parallelWorkClaimStateAsync(ownerId);
+  }
+  if (mode === 'parallel' && claimState.available !== true) {
+    return res.status(409).json({
+      error: 'Parallel work is not available in this runtime yet.',
+      code: 'PARALLEL_WORK_UNAVAILABLE',
+      label: claimState.label,
+      blockers: claimState.blockers,
+    });
+  }
+  try {
+    const user = await updateUserViventiumOrchestrationPreferences(ownerId, { mode });
+    if (!user) {
+      return res.status(404).json({ error: 'Account not found.', code: 'ACCOUNT_NOT_FOUND' });
+    }
+    return res.json(await telegramOrchestrationResponse(user, ownerId, claimState));
+  } catch (error) {
+    logger.error('[VIVENTIUM][telegram/orchestration] Preference update failed', {
+      errorClass: String(error?.message || 'orchestration_update_failed').slice(0, 120),
+    });
+    return res.status(500).json({
+      error: 'Unable to update Parallel work.',
+      code: 'ORCHESTRATION_UPDATE_FAILED',
+    });
+  }
+});
+
+router.get('/orchestration/work', telegramAuth, async (req, res) => {
+  setTelegramOrchestrationNoStore(res);
+  const cursor = String(req.query?.cursor || '').trim();
+  const limit = Number(req.query?.limit || 50);
+  if (
+    (cursor && (cursor.length > 2048 || !/^[A-Za-z0-9._~:@+-]+$/.test(cursor))) ||
+    !Number.isInteger(limit) ||
+    limit < 1 ||
+    limit > 100
+  ) {
+    return res.status(400).json({
+      error: 'The Active work page is invalid.',
+      code: 'INVALID_ACTIVE_WORK_CURSOR',
+    });
+  }
+  try {
+    return res.json(
+      cursor
+        ? await getActiveWorkPage({ ownerId: String(req.user.id), cursor, limit })
+        : await getActiveWorkInteractiveSnapshot({ ownerId: String(req.user.id) }),
+    );
+  } catch (error) {
+    logger.error('[VIVENTIUM][telegram/orchestration] Active work read failed', {
+      errorClass: String(error?.message || 'active_work_read_failed').slice(0, 120),
+    });
+    return res.status(500).json({
+      error: 'Unable to read Active work.',
+      code: 'ACTIVE_WORK_READ_FAILED',
+    });
+  }
+});
+
+router.post('/orchestration/work/:workRef/actions', telegramAuth, async (req, res) => {
+  setTelegramOrchestrationNoStore(res);
+  const workRef = String(req.params?.workRef || '').trim();
+  const action = String(req.body?.action || '').trim();
+  const instruction = String(req.body?.instruction || '').trim();
+  const operationId = String(req.body?.operationId || '').trim();
+  if (
+    !WORK_REF_PATTERN.test(workRef) ||
+    !PARALLEL_WORK_ACTIONS.has(action) ||
+    !OPERATION_ID_PATTERN.test(operationId) ||
+    (PARALLEL_WORK_INSTRUCTION_ACTIONS.has(action) && !instruction) ||
+    instruction.length > 8000
+  ) {
+    return res.status(400).json({
+      error: 'The Active work action is invalid.',
+      code: 'INVALID_WORK_ACTION',
+    });
+  }
+
+  const ownerId = String(req.user.id);
+  try {
+    const result = await executeGlassHiveWorkAction({
+      ownerId,
+      workRef,
+      action,
+      instruction,
+      operationId,
+      sourceSurface: 'telegram',
+    });
+    return res.status(202).json(result);
+  } catch (error) {
+    const status = Number(error?.status);
+    logger.warn('[VIVENTIUM][telegram/orchestration] Active work action rejected', {
+      action,
+      status: Number.isInteger(status) ? status : 502,
+      errorClass: String(error?.message || 'active_work_action_failed').slice(0, 120),
+    });
+    return res
+      .status(Number.isInteger(status) && status >= 400 && status < 600 ? status : 502)
+      .json({
+        error: error?.userMessage || 'Unable to apply the Active work action.',
+        code: error?.message || 'ACTIVE_WORK_ACTION_FAILED',
+      });
+  }
 });
 
 router.get('/stream/:streamId', telegramAuth, async (req, res) => {

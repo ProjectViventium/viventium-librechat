@@ -15,10 +15,7 @@ const { getMessages, getFiles } = require('~/models');
 const { logger } = require('@librechat/data-schemas');
 const { primeFiles } = require('~/app/clients/tools/util/fileSearch');
 const { getEndpointsConfig } = require('~/server/services/Config/getEndpointsConfig');
-const {
-  MAIN_DELEGATION_PROFILES,
-  isConversationOrchestrationTool,
-} = require('./GlassHiveConversationOrchestration');
+const { isConversationOrchestrationTool } = require('./GlassHiveConversationOrchestration');
 const {
   projectTrustedClientPresentation,
   projectTrustedNativeInteractionHeaders,
@@ -247,9 +244,35 @@ function resolveConversationProviderId(agent) {
   return String(agent?.endpoint || agent?.provider || '').trim();
 }
 
+function resolveConversationProviderCapability(req, agentOrProvider) {
+  const providerId =
+    typeof agentOrProvider === 'string'
+      ? String(agentOrProvider || '').trim()
+      : resolveConversationProviderId(agentOrProvider);
+  return req?.config?.endpoints?.agents?.providerCapabilities?.[providerId];
+}
+
+function conversationProviderUsesInvocationLocalTime(req, agentOrProvider) {
+  return (
+    resolveConversationProviderCapability(req, agentOrProvider)?.time_context_delivery ===
+    'per_turn_header'
+  );
+}
+
+function conversationProviderUsesLocalVisibleAccounting(req, agentOrProvider) {
+  return (
+    resolveConversationProviderCapability(req, agentOrProvider)?.usage_accounting_scope ===
+    'visible_message_local'
+  );
+}
+
+function resolveConversationProviderContextProtocol(req, agentOrProvider) {
+  return resolveConversationProviderCapability(req, agentOrProvider)?.context_protocol || 'legacy';
+}
+
 function setConversationProviderCapability(req, provider) {
   const providerId = String(provider || '').trim();
-  const capability = req?.config?.endpoints?.agents?.providerCapabilities?.[providerId];
+  const capability = resolveConversationProviderCapability(req, providerId);
   if (!req || typeof req !== 'object') {
     return capability;
   }
@@ -257,16 +280,120 @@ function setConversationProviderCapability(req, provider) {
     enforceRestrictedVoiceRequest(req);
     return capability;
   }
-  req.viventiumTimeContextDelivery =
-    capability?.workspace_binding === true && capability?.conversation_session === true
-      ? 'per_turn_header'
-      : 'developer';
+  req.viventiumTimeContextDelivery = conversationProviderUsesInvocationLocalTime(req, providerId)
+    ? 'per_turn_header'
+    : 'developer';
+  req.viventiumUsageAccountingScope = capability?.usage_accounting_scope || 'provider_request';
+  req.viventiumContextProtocol = capability?.context_protocol || 'legacy';
+  req.viventiumNativeSessionAuthority = capability?.native_session_authority || 'none';
+  req.viventiumReplayProtocol = capability?.replay_protocol || 'legacy_message_count';
   req._viventiumHarnessActivityEnabled = capability?.activity_stream === true;
   req._viventiumHarnessExecutionEnabled = capability?.workspace_binding === true;
   if (req._viventiumHarnessExecutionEnabled !== true) {
     req._viventiumHarnessCancellationActiveBaseURL = '';
   }
   return capability;
+}
+
+function canonicalStableAuthorityValue(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => canonicalStableAuthorityValue(item))
+      .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .filter((key) => value[key] !== undefined && typeof value[key] !== 'function')
+        .map((key) => [key, canonicalStableAuthorityValue(value[key])]),
+    );
+  }
+  return value;
+}
+
+function conversationProviderStableAuthorityDescriptor(agent) {
+  const modelParameters =
+    agent?.model_parameters && typeof agent.model_parameters === 'object'
+      ? { ...agent.model_parameters }
+      : {};
+  delete modelParameters.configuration;
+  return canonicalStableAuthorityValue({
+    version: 2,
+    agentId: String(agent?.id || ''),
+    provider: String(agent?.provider || ''),
+    model: String(agent?.model || modelParameters.model || ''),
+    modelParameters,
+    instructions: String(agent?.instructions || '').trim(),
+    additionalInstructions: String(agent?.additional_instructions || '').trim(),
+    artifacts: agent?.artifacts || '',
+    tools: agent?.tools || [],
+    mcp: agent?.mcp || [],
+    toolOptions: agent?.tool_options || {},
+    toolResources: agent?.tool_resources || {},
+    agentIds: agent?.agent_ids || [],
+    edges: agent?.edges || [],
+    backgroundCortices: agent?.background_cortices || [],
+    glassHiveOptions: agent?.glasshive_options || {},
+    fallbackProvider: String(agent?.fallback_llm_provider || ''),
+    fallbackModel: String(agent?.fallback_llm_model || ''),
+    fallbackModelParameters: agent?.fallback_llm_model_parameters || {},
+  });
+}
+
+function conversationProviderStableAuthorityDigest(agent) {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(conversationProviderStableAuthorityDescriptor(agent)), 'utf8')
+    .digest('hex');
+}
+
+function bindConversationProviderStableAuthorityDigest(targetAgent, stableAuthoritySha256) {
+  const digest = String(stableAuthoritySha256 || '')
+    .trim()
+    .toLowerCase();
+  const modelParameters = targetAgent?.model_parameters;
+  const configuration = modelParameters?.configuration;
+  const currentHeaders = configuration?.defaultHeaders;
+  if (
+    !/^[a-f0-9]{64}$/.test(digest) ||
+    !currentHeaders ||
+    typeof currentHeaders !== 'object' ||
+    !Object.prototype.hasOwnProperty.call(currentHeaders, 'X-GlassHive-Agent-Id')
+  ) {
+    return false;
+  }
+  targetAgent.model_parameters = {
+    ...modelParameters,
+    configuration: {
+      ...configuration,
+      defaultHeaders: {
+        ...currentHeaders,
+        'X-GlassHive-Stable-Authority-SHA256': digest,
+      },
+    },
+  };
+  return true;
+}
+
+function captureConversationProviderStableAuthority(targetAgent) {
+  const currentHeaders = targetAgent?.model_parameters?.configuration?.defaultHeaders;
+  if (
+    !currentHeaders ||
+    typeof currentHeaders !== 'object' ||
+    !Object.prototype.hasOwnProperty.call(currentHeaders, 'X-GlassHive-Agent-Id')
+  ) {
+    return false;
+  }
+  const existingDigest = String(currentHeaders['X-GlassHive-Stable-Authority-SHA256'] || '')
+    .trim()
+    .toLowerCase();
+  return bindConversationProviderStableAuthorityDigest(
+    targetAgent,
+    /^[a-f0-9]{64}$/.test(existingDigest)
+      ? existingDigest
+      : conversationProviderStableAuthorityDigest(targetAgent),
+  );
 }
 
 function bindConversationProviderDeveloperInstructionTail({ targetAgent, tail } = {}) {
@@ -567,6 +694,9 @@ const BOOTSTRAP_HEADER_NAMES = Object.freeze([
   'X-GlassHive-Bootstrap-Timestamp',
   'X-GlassHive-Bootstrap-Signature',
 ]);
+const BOOTSTRAP_HEADER_NAMES_LOWERCASE = new Set(
+  BOOTSTRAP_HEADER_NAMES.map((headerName) => headerName.toLowerCase()),
+);
 
 function setConversationProviderInstructionAppend(targetAgent, instructions) {
   if (!targetAgent || typeof targetAgent !== 'object') {
@@ -597,13 +727,21 @@ function removeBootstrapBundleHeaders(targetAgent) {
     return;
   }
   const defaultHeaders = { ...currentHeaders };
-  for (const headerName of BOOTSTRAP_HEADER_NAMES) {
-    delete defaultHeaders[headerName];
+  for (const headerName of Object.keys(defaultHeaders)) {
+    if (BOOTSTRAP_HEADER_NAMES_LOWERCASE.has(headerName.toLowerCase())) {
+      delete defaultHeaders[headerName];
+    }
   }
   targetAgent.model_parameters = {
     ...modelParameters,
     configuration: { ...configuration, defaultHeaders },
   };
+}
+
+function clearConversationProviderCapabilityBundle(targetAgent) {
+  removeBootstrapBundleHeaders(targetAgent);
+  setConversationProviderInstructionAppend(targetAgent, '');
+  return targetAgent;
 }
 
 function capabilityRefreshResult(targetAgent, attached, previousInstructionAppend = '') {
@@ -621,6 +759,7 @@ function installConversationProviderCapabilityRefresher({
   targetAgent,
   declaredAgent = targetAgent,
   capabilitySourceAgent = targetAgent,
+  mcpCapabilitySourceAgent,
   req,
   capability,
   requestBody = req?.body || {},
@@ -651,6 +790,7 @@ function installConversationProviderCapabilityRefresher({
       targetAgent,
       declaredAgent,
       capabilitySourceAgent,
+      mcpCapabilitySourceAgent,
       req,
       capability: resolvedCapability,
       requestBody: effectiveRequestBody,
@@ -796,6 +936,7 @@ async function attachDeclaredConversationProviderCapabilityBundle({
   targetAgent,
   declaredAgent = targetAgent,
   capabilitySourceAgent = targetAgent,
+  mcpCapabilitySourceAgent,
   req,
   requestBody = req?.body || {},
   resolveAgentById,
@@ -806,6 +947,7 @@ async function attachDeclaredConversationProviderCapabilityBundle({
     targetAgent,
     declaredAgent,
     capabilitySourceAgent,
+    mcpCapabilitySourceAgent,
     req,
     capability,
     requestBody,
@@ -817,6 +959,7 @@ async function attachConversationProviderCapabilityBundle({
   targetAgent,
   declaredAgent = targetAgent,
   capabilitySourceAgent = targetAgent,
+  mcpCapabilitySourceAgent,
   req,
   capability,
   requestBody = req?.body || {},
@@ -847,7 +990,8 @@ async function attachConversationProviderCapabilityBundle({
    * fallback model cannot silently lose the participant's connected-account access.
    * === VIVENTIUM END === */
   const mcpCapabilitySource =
-    capabilitySourceAgent === targetAgent ? declaredAgent : capabilitySourceAgent;
+    mcpCapabilitySourceAgent ||
+    (capabilitySourceAgent === targetAgent ? declaredAgent : capabilitySourceAgent);
   const allowedServerNames = declaredMcpServerNames(
     mcpCapabilitySource,
     capability.excluded_mcp_servers,
@@ -1058,18 +1202,25 @@ module.exports = {
   attachDeclaredConversationProviderCapabilityBundle,
   attachConversationProviderCapabilityBundle,
   bindConversationProviderDeveloperInstructionTail,
+  bindConversationProviderStableAuthorityDigest,
+  captureConversationProviderStableAuthority,
   bindHarnessCancellation,
   buildHarnessAgentIdempotencyKeys,
   buildHarnessAttemptIdempotencyKey,
   configuredBrokerHostTools,
   configuredConversationOrchestrationWorkerRoute,
+  conversationProviderUsesLocalVisibleAccounting,
+  conversationProviderUsesInvocationLocalTime,
+  conversationProviderStableAuthorityDigest,
   buildHarnessIdempotencyKey,
+  clearConversationProviderCapabilityBundle,
   declaredMcpServerNames,
   installConversationProviderCapabilityRefresher,
   resolveHostToolCapabilityState,
   resolvedHostToolNames,
   resolvedConversationOrchestrationToolNames,
   resolvedHostToolResources,
+  resolveConversationProviderContextProtocol,
   resolveConversationProviderId,
   setConversationProviderCapability,
 };

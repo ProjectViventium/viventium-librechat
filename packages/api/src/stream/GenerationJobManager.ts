@@ -1,17 +1,17 @@
-import { nativePredecessorSupersession } from '../glasshive/nativeSupersession';
-import type { NativeAcceptedSource, NativePredecessor } from '../glasshive/nativeSupersession';
+import { logger } from '@librechat/data-schemas';
 import type {
   IMessage,
   NativeResponseIdentity,
   NativeResponseCommit,
   NativeResponseMessageProjection,
 } from '@librechat/data-schemas';
+import { nativePredecessorSupersession } from '../glasshive/nativeSupersession';
+import type { NativeAcceptedSource, NativePredecessor } from '../glasshive/nativeSupersession';
 import {
   nativeIdentityJson,
   nativeJobMatches,
   nativeJobProofJson,
 } from './implementations/nativeResponse';
-import { logger } from '@librechat/data-schemas';
 import type { StandardGraph } from '@librechat/agents';
 import { parseTextParts } from 'librechat-data-provider';
 import type { Agents, TMessageContentParts } from 'librechat-data-provider';
@@ -22,18 +22,23 @@ import type {
   AbortResult,
   IJobStore,
   InteractionContext,
+  LogicalTurnClaim,
   AdapterCapabilities,
   InteractionDeliveryAck,
   DeliveryAcknowledgementResult,
   InteractionDeliveryPolicy,
-  CortexPresentationBinding,
-  CortexPresentationFenceReceipt,
+  ClientPresentation,
+  EventTransportPublishReceipt,
   SourceOrderObservation,
   SourceOrderObservationResult,
+  CortexPresentationBinding,
+  CortexPresentationFenceReceipt,
+  ChunkEmissionOptions,
 } from './interfaces/IJobStore';
 import type * as t from '~/types';
 import { InMemoryEventTransport } from './implementations/InMemoryEventTransport';
 import { InMemoryJobStore } from './implementations/InMemoryJobStore';
+import { safeStreamLogError, streamLogRef } from './logPrivacy';
 
 /**
  * Configuration options for GenerationJobManager
@@ -53,6 +58,31 @@ export interface CreateGenerationJobOptions {
   interactionContext?: InteractionContext;
   adapterCapabilities?: AdapterCapabilities;
   deliveryPolicy?: InteractionDeliveryPolicy;
+  clientPresentation?: ClientPresentation;
+}
+
+export type ChunkEmissionReceipt =
+  | {
+      delivered: true;
+      streamId: string;
+      target: 'subscriber_transport' | 'runtime_replay_buffer' | 'durable_replay_store';
+      presentationRef?: string;
+      claimToken?: string;
+      presentationLeaseToken?: string;
+    }
+  | {
+      delivered: false;
+      streamId: string;
+      reason: 'runtime_unavailable' | 'logical_turn_inactive' | 'presentation_unconfirmed';
+    };
+
+export interface DurableEffectReceiptInput {
+  streamId: string;
+  userId: string;
+  sourceEventId: string;
+  responseMessageId: string;
+  effectKind: 'durable_work_accepted' | 'durable_work_action_accepted';
+  effectRef: string;
 }
 
 function normalizeCortexPresentationReceipt(
@@ -143,6 +173,171 @@ function cortexPresentationMatchesReceipt(
   );
 }
 
+export const DURABLE_WORK_ACCEPTED_TEXT =
+  'Background work started. Open Active Work to view or steer it.';
+export const DURABLE_WORK_ACTION_ACCEPTED_TEXT =
+  'Background work updated. Open Active Work to view or steer it.';
+
+function durableEffectReceiptText(
+  receipt: SerializableJobData['durableEffectReceipt'] | undefined,
+): string {
+  return receipt?.effect_kind === 'durable_work_action_accepted'
+    ? DURABLE_WORK_ACTION_ACCEPTED_TEXT
+    : DURABLE_WORK_ACCEPTED_TEXT;
+}
+
+function buildDurableWorkReceiptFinalEvent(
+  job: SerializableJobData,
+  responseMessageId: string,
+  receipt = job.durableEffectReceipt,
+): t.ServerSentEvent {
+  const receiptText = durableEffectReceiptText(receipt);
+  return {
+    final: true,
+    conversation: { conversationId: job.conversationId },
+    title: 'New Chat',
+    requestMessage: job.userMessage
+      ? {
+          ...job.userMessage,
+          conversationId: job.conversationId,
+          isCreatedByUser: true,
+        }
+      : null,
+    responseMessage: {
+      messageId: responseMessageId,
+      parentMessageId: job.userMessage?.messageId,
+      conversationId: job.conversationId,
+      text: receiptText,
+      content: [
+        {
+          type: 'text',
+          text: { value: receiptText },
+        },
+      ],
+      sender: job.sender ?? 'AI',
+      unfinished: true,
+      error: false,
+      isCreatedByUser: false,
+    },
+  } as unknown as t.ServerSentEvent;
+}
+
+function parseStoredFinalEvent(job: SerializableJobData): Record<string, unknown> | null {
+  if (!job.finalEvent) {
+    return null;
+  }
+  try {
+    return (
+      typeof job.finalEvent === 'string' ? JSON.parse(job.finalEvent) : job.finalEvent
+    ) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function hasDurableWorkReceiptFinalEvent(job: SerializableJobData): boolean {
+  const finalEvent = parseStoredFinalEvent(job);
+  const responseMessage = finalEvent?.responseMessage as Record<string, unknown> | undefined;
+  return [DURABLE_WORK_ACCEPTED_TEXT, DURABLE_WORK_ACTION_ACCEPTED_TEXT].includes(
+    String(responseMessage?.text || ''),
+  );
+}
+
+function hasResponseOnlySupersededFinalEvent(job: SerializableJobData): boolean {
+  if (hasDurableWorkReceiptFinalEvent(job)) {
+    return true;
+  }
+  const finalEvent = parseStoredFinalEvent(job);
+  return (
+    finalEvent?.final === true &&
+    finalEvent?.superseded === true &&
+    finalEvent?.logical_turn_id === job.interactionContext?.logical_turn_id &&
+    finalEvent?.revision === job.interactionContext?.revision
+  );
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Durable source-event idempotency.
+ * Purpose: A retry must not erase the first creator's receipt during its claim-to-job window.
+ * === VIVENTIUM END === */
+function streamCreationPendingError(): Error & { code: string } {
+  return Object.assign(new Error('Generation stream creation is still pending'), {
+    code: 'stream_creation_pending',
+  });
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Owner-safe duplicate stream recovery.
+ * Purpose: A stale or forged receipt must never return another owner's persisted generation.
+ * === VIVENTIUM END === */
+function streamReceiptConflictError(): Error & { code: string } {
+  return Object.assign(new Error('Generation stream receipt ownership does not match'), {
+    code: 'stream_id_conflict',
+  });
+}
+
+function sourceOrderSupersededError(): Error & { code: string } {
+  return Object.assign(new Error('A newer ordered source event is already current'), {
+    code: 'source_order_superseded',
+  });
+}
+
+function sourceOrderObservationFromContext(
+  context: InteractionContext | undefined,
+): SourceOrderObservation | undefined {
+  if (
+    !context?.source_order_scope ||
+    !/^[a-f0-9]{64}$/.test(context.source_order_scope) ||
+    !Number.isSafeInteger(context.source_sequence) ||
+    context.source_sequence! < 0
+  ) {
+    return undefined;
+  }
+  return {
+    source_order_scope: context.source_order_scope,
+    source_sequence: context.source_sequence!,
+  };
+}
+
+function streamManagerUnavailableError(): Error & { code: string } {
+  return Object.assign(new Error('Generation stream manager is unavailable'), {
+    code: 'stream_store_unavailable',
+  });
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Stream-manager lifecycle fencing.
+ * Purpose: Shutdown must cancel a transport handshake instead of waiting forever on old state.
+ */
+const LIFECYCLE_ABORTED = Symbol('lifecycle_aborted');
+const lifecycleAbortPromises = new WeakMap<AbortSignal, Promise<typeof LIFECYCLE_ABORTED>>();
+
+function lifecycleAbortPromise(signal: AbortSignal): Promise<typeof LIFECYCLE_ABORTED> {
+  const existing = lifecycleAbortPromises.get(signal);
+  if (existing) {
+    return existing;
+  }
+  const created = signal.aborted
+    ? Promise.resolve(LIFECYCLE_ABORTED)
+    : new Promise<typeof LIFECYCLE_ABORTED>((resolve) => {
+        signal.addEventListener('abort', () => resolve(LIFECYCLE_ABORTED), { once: true });
+      });
+  lifecycleAbortPromises.set(signal, created);
+  return created;
+}
+
+async function awaitLifecycle<T>(value: T | PromiseLike<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    throw streamManagerUnavailableError();
+  }
+  const result = await Promise.race([Promise.resolve(value), lifecycleAbortPromise(signal)]);
+  if (result === LIFECYCLE_ABORTED) {
+    throw streamManagerUnavailableError();
+  }
+  return result as T;
+}
+/* === VIVENTIUM END === */
+
 /**
  * Runtime state for active jobs - not serializable, kept in-memory per instance.
  * Contains AbortController, ready promise, and other non-serializable state.
@@ -172,12 +367,25 @@ interface RuntimeJobState {
   earlyEventBuffer: t.ServerSentEvent[];
   hasSubscriber: boolean;
   allSubscribersLeftHandlers?: Array<(...args: unknown[]) => void>;
+  /** Main is terminal; only an exact, fenced Phase B presentation may still use this runtime. */
+  presentationOnly?: boolean;
+  /** Shared readiness for a lazily-created cross-replica runtime. */
+  initializationReady?: Promise<void>;
 }
 
 /* === VIVENTIUM START ===
- * Purpose: Keep every asynchronous manager operation bound to one immutable
- * store/transport generation across teardown and reconfiguration.
+ * Feature: Stream-manager lifecycle fencing.
+ * Purpose: Bind every lazy cross-replica hydration to one exact service generation.
  */
+interface ManagerLifecycleSnapshot {
+  epoch: number;
+  jobStore: IJobStore;
+  eventTransport: IEventTransport;
+  signal: AbortSignal;
+  isRedis: boolean;
+  cleanupOnComplete: boolean;
+}
+
 interface ServiceGenerationSnapshot {
   generation: number;
   jobStore: IJobStore;
@@ -210,8 +418,7 @@ interface ServiceGenerationSnapshot {
  */
 class GenerationJobManagerClass {
   /* === VIVENTIUM START ===
-   * Purpose: Lock configuration from the first store/transport use until a
-   * successful asynchronous teardown completes, including before initialize().
+   * Purpose: Lock configuration from first service use until asynchronous teardown settles.
    */
   /** Job metadata + content state storage - swappable for Redis, etc. */
   private _jobStore: IJobStore;
@@ -220,22 +427,16 @@ class GenerationJobManagerClass {
   private lifecycleState:
     'configurable' | 'active' | 'destroying' | 'destroyed' | 'teardown-failed' = 'configurable';
 
-  private nativeResponseRecovery?: (identity: NativeResponseIdentity) => Promise<boolean>;
-  private nativeResponseCancellation?: (
-    identity: NativeResponseIdentity,
-    snapshot: NativeResponseMessageProjection,
-    mode?: 'augmentation' | 'published',
-  ) => Promise<Partial<IMessage> | null>;
-
   private destroyPromise?: Promise<void>;
   private serviceGeneration = 0;
+  private readonly hasInjectedInitialServices: boolean;
 
   private markActive(): void {
     if (this.lifecycleState === 'configurable' || this.lifecycleState === 'active') {
       this.lifecycleState = 'active';
       return;
     }
-    throw new Error('[GenerationJobManager] Configure services before using a destroyed manager');
+    throw streamManagerUnavailableError();
   }
 
   private get jobStore(): IJobStore {
@@ -246,6 +447,54 @@ class GenerationJobManagerClass {
   private get eventTransport(): IEventTransport {
     this.markActive();
     return this._eventTransport;
+  }
+
+  private serviceGenerationChangedError(): Error & { code: string } {
+    return Object.assign(
+      new Error('[GenerationJobManager] Operation rejected because service generation changed'),
+      { code: 'stream_store_unavailable' },
+    );
+  }
+  /* === VIVENTIUM END === */
+
+  /** Runtime state - always in-memory, not serializable */
+  private runtimeState = new Map<string, RuntimeJobState>();
+
+  private cleanupInterval: NodeJS.Timeout | null = null;
+  /* === VIVENTIUM START === Stream readiness is a traffic-admission prerequisite. === */
+  private initializationPromise: Promise<void> | null = null;
+  /* === VIVENTIUM END === */
+
+  /** Whether we're using Redis stores */
+  private _isRedis = false;
+
+  /** Whether to cleanup event transport immediately on job completion */
+  private _cleanupOnComplete = true;
+  private lifecycleEpoch = 0;
+  private pendingAdmissions = 0;
+  private unavailable = false;
+  private lifecycleAbortController = new AbortController();
+  private nativeResponseRecovery?: (identity: NativeResponseIdentity) => Promise<boolean>;
+  private nativeResponseCancellation?: (
+    identity: NativeResponseIdentity,
+    snapshot: NativeResponseMessageProjection,
+    mode?: 'augmentation' | 'published',
+  ) => Promise<Partial<IMessage> | null>;
+
+  /* === VIVENTIUM START ===
+   * Feature: Stream-manager lifecycle fencing.
+   * Purpose: Old asynchronous reads may only observe and clean up their captured services.
+   */
+  private captureLifecycle(): ManagerLifecycleSnapshot {
+    this.markActive();
+    return {
+      epoch: this.lifecycleEpoch,
+      jobStore: this._jobStore,
+      eventTransport: this._eventTransport,
+      signal: this.lifecycleAbortController.signal,
+      isRedis: this._isRedis,
+      cleanupOnComplete: this._cleanupOnComplete,
+    };
   }
 
   private captureServices(): ServiceGenerationSnapshot {
@@ -261,65 +510,111 @@ class GenerationJobManagerClass {
 
   private assertServiceGeneration(generation: number): void {
     if (generation !== this.serviceGeneration) {
-      throw new Error(
-        '[GenerationJobManager] Operation rejected because service generation changed',
-      );
+      throw this.serviceGenerationChangedError();
     }
+  }
+
+  private isLifecycleCurrent(lifecycle: ManagerLifecycleSnapshot): boolean {
+    return (
+      !this.unavailable &&
+      !lifecycle.signal.aborted &&
+      lifecycle.epoch === this.lifecycleEpoch &&
+      lifecycle.jobStore === this._jobStore &&
+      lifecycle.eventTransport === this._eventTransport
+    );
+  }
+
+  private async awaitRuntimeInitialization(
+    streamId: string,
+    runtime: RuntimeJobState,
+    lifecycle: ManagerLifecycleSnapshot,
+  ): Promise<RuntimeJobState> {
+    if (runtime.initializationReady) {
+      await runtime.initializationReady;
+    }
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
+    return runtime;
+  }
+
+  private assertLifecycleOperation(
+    lifecycle: ManagerLifecycleSnapshot,
+    streamId?: string,
+    expectedRuntime: RuntimeJobState | undefined | null = null,
+  ): void {
+    if (
+      lifecycle.epoch !== this.lifecycleEpoch ||
+      lifecycle.jobStore !== this._jobStore ||
+      lifecycle.eventTransport !== this._eventTransport
+    ) {
+      throw this.serviceGenerationChangedError();
+    }
+    if (
+      !this.isLifecycleCurrent(lifecycle) ||
+      (streamId !== undefined &&
+        expectedRuntime !== null &&
+        this.runtimeState.get(streamId) !== expectedRuntime)
+    ) {
+      throw streamManagerUnavailableError();
+    }
+  }
+
+  private async runLifecycleOperation<T>(
+    lifecycle: ManagerLifecycleSnapshot,
+    operation: () => T | PromiseLike<T>,
+    streamId?: string,
+    expectedRuntime: RuntimeJobState | undefined | null = null,
+  ): Promise<T> {
+    this.assertLifecycleOperation(lifecycle, streamId, expectedRuntime);
+    const result = await operation();
+    this.assertLifecycleOperation(lifecycle, streamId, expectedRuntime);
+    return result;
   }
   /* === VIVENTIUM END === */
 
-  /** Runtime state - always in-memory, not serializable */
-  private runtimeState = new Map<string, RuntimeJobState>();
-
-  private cleanupInterval: NodeJS.Timeout | null = null;
-
-  /** Whether we're using Redis stores */
-  private _isRedis = false;
-
-  /** Whether to cleanup event transport immediately on job completion */
-  private _cleanupOnComplete = true;
-
-  /* === VIVENTIUM START ===
-   * Purpose: Assign initial services without treating startup configuration as
-   * runtime use; guarded accessors lock configuration on first actual use.
-   */
   constructor(options?: GenerationJobManagerOptions) {
+    this.hasInjectedInitialServices = Boolean(options?.jobStore || options?.eventTransport);
     this._jobStore =
       options?.jobStore ?? new InMemoryJobStore({ ttlAfterComplete: 0, maxJobs: 1000 });
     this._eventTransport = options?.eventTransport ?? new InMemoryEventTransport();
     this._cleanupOnComplete = options?.cleanupOnComplete ?? true;
   }
-  /* === VIVENTIUM END === */
 
+  /* === VIVENTIUM START ===
+   * Feature: Stream readiness before traffic admission.
+   * Purpose: Make store initialization awaitable and block destructive reconfiguration while it runs.
+   */
   /**
    * Initialize the job manager with periodic cleanup.
    * Call this once at application startup.
    */
   async initialize(): Promise<void> {
-    /* === VIVENTIUM START ===
-     * Purpose: Preserve idempotent initialization while lifecycle state owns
-     * the fail-closed reconfiguration boundary.
-     */
-    if (this.lifecycleState === 'active' && this.cleanupInterval) {
-      return;
+    if (this.cleanupInterval) {
+      return this.initializationPromise ?? Promise.resolve();
     }
-    /* === VIVENTIUM END === */
-
-    await this.jobStore.initialize();
-
-    this.cleanupInterval = setInterval(() => {
-      void this.cleanup().catch((error) => {
-        if (this.lifecycleState === 'active') {
-          logger.error('[GenerationJobManager] Periodic cleanup failed:', error);
-        }
-      });
-    }, 60000);
-
-    if (this.cleanupInterval.unref) {
-      this.cleanupInterval.unref();
+    if (this.initializationPromise) {
+      return this.initializationPromise;
     }
-
-    logger.debug('[GenerationJobManager] Initialized');
+    const lifecycle = this.captureLifecycle();
+    const initialization = (async () => {
+      await this.runLifecycleOperation(lifecycle, () => lifecycle.jobStore.initialize());
+      this.cleanupInterval = setInterval(() => {
+        void this.cleanup().catch((error: { code?: string }) => {
+          if (error?.code !== 'stream_store_unavailable') {
+            logger.warn('[GenerationJobManager] Periodic cleanup unavailable');
+          }
+        });
+      }, 60000);
+      this.cleanupInterval.unref?.();
+      logger.debug('[GenerationJobManager] Initialized');
+    })();
+    this.initializationPromise = initialization;
+    try {
+      await initialization;
+    } finally {
+      if (this.initializationPromise === initialization) {
+        this.initializationPromise = null;
+      }
+    }
   }
 
   /**
@@ -333,7 +628,7 @@ class GenerationJobManagerClass {
    *
    * const services = createStreamServicesFromCache({ cacheConfig, ioredisClient });
    * GenerationJobManager.configure(services);
-   * GenerationJobManager.initialize();
+   * await GenerationJobManager.initialize();
    * ```
    */
   configure(services: {
@@ -342,28 +637,75 @@ class GenerationJobManagerClass {
     isRedis?: boolean;
     cleanupOnComplete?: boolean;
   }): void {
-    /* === VIVENTIUM START ===
-     * Purpose: Reconfiguration is a startup-only boundary. Failing closed
-     * prevents in-flight operations from mutating replacement services while
-     * asynchronous teardown is still draining the old generation.
-     */
-    if (this.lifecycleState !== 'configurable' && this.lifecycleState !== 'destroyed') {
-      throw new Error('Generation stream manager is unavailable');
+    const replacesIdleInjectedServices =
+      this.lifecycleState === 'active' &&
+      this.hasInjectedInitialServices &&
+      this.pendingAdmissions === 0 &&
+      this.runtimeState.size === 0 &&
+      this.initializationPromise == null;
+    if (
+      this.lifecycleState !== 'configurable' &&
+      this.lifecycleState !== 'destroyed' &&
+      !replacesIdleInjectedServices
+    ) {
+      throw streamManagerUnavailableError();
     }
+    const wasInitialized = this.cleanupInterval != null;
+    const previousJobStore = this._jobStore;
+    const previousEventTransport = this._eventTransport;
+    if (replacesIdleInjectedServices && this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+    this.lifecycleAbortController.abort('manager_reconfigured');
+    this.lifecycleAbortController = new AbortController();
+    this.lifecycleEpoch += 1;
+    for (const runtime of this.runtimeState.values()) {
+      if (!runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('manager_reconfigured');
+      }
+    }
+    this.runtimeState.clear();
+    this.runStepBuffers?.clear();
 
     this._jobStore = services.jobStore;
     this._eventTransport = services.eventTransport;
     this._isRedis = services.isRedis ?? false;
     this._cleanupOnComplete = services.cleanupOnComplete ?? true;
+    this.unavailable = false;
     this.lifecycleState = 'configurable';
     this.destroyPromise = undefined;
-    this.serviceGeneration++;
-    /* === VIVENTIUM END === */
+    this.serviceGeneration += 1;
+
+    if (replacesIdleInjectedServices) {
+      if (previousEventTransport !== services.eventTransport) {
+        void Promise.resolve(previousEventTransport.destroy()).catch((error) => {
+          logger.error(
+            '[GenerationJobManager] Previous event transport destroy failed',
+            safeStreamLogError(error),
+          );
+        });
+      }
+      if (previousJobStore !== services.jobStore) {
+        void previousJobStore.destroy().catch((error) => {
+          logger.error(
+            '[GenerationJobManager] Previous job store destroy failed',
+            safeStreamLogError(error),
+          );
+        });
+      }
+      if (wasInitialized) {
+        void this.initialize().catch((error) => {
+          logger.error('[GenerationJobManager] Reinitialization failed', safeStreamLogError(error));
+        });
+      }
+    }
 
     logger.info(
       `[GenerationJobManager] Configured with ${this._isRedis ? 'Redis' : 'in-memory'} stores`,
     );
   }
+  /* === VIVENTIUM END === */
 
   /**
    * Check if using Redis stores.
@@ -378,6 +720,120 @@ class GenerationJobManagerClass {
   getJobStore(): IJobStore {
     return this.jobStore;
   }
+
+  /* === VIVENTIUM START ===
+   * Feature: Restart-safe Cortex presentation binding.
+   * Purpose: Bind only the real current owner/generation/hash claim to its durable stream job.
+   */
+  /** Bind a current owner-scoped Cortex claim receipt to its durable stream job. */
+  async bindCortexPresentation(
+    streamId: string,
+    receipt: CortexPresentationFenceReceipt,
+  ): Promise<CortexPresentationBinding | null> {
+    const lifecycle = this.captureLifecycle();
+    const ownerId = String(receipt?.ownerId || '').trim();
+    const messageId = String(receipt?.messageId || '').trim();
+    const parentMessageId = String(receipt?.parentMessageId || '').trim();
+    const revision = Number(receipt?.revision);
+    const generation = Number(receipt?.generation);
+    const claimToken = String(receipt?.claimToken || '').trim();
+    const presentationLeaseToken = String(receipt?.presentationLeaseToken || '').trim();
+    const deliveryIds = [
+      ...new Set(
+        (Array.isArray(receipt?.deliveryIds) ? receipt.deliveryIds : [])
+          .map((deliveryId) => String(deliveryId || '').trim())
+          .filter(Boolean),
+      ),
+    ].sort();
+    const deliveryReceipts = (
+      Array.isArray(receipt?.deliveryReceipts) ? receipt.deliveryReceipts : []
+    )
+      .map((deliveryReceipt) => ({
+        deliveryId: String(deliveryReceipt?.deliveryId || '').trim(),
+        graphResultHash: String(deliveryReceipt?.graphResultHash || '')
+          .trim()
+          .toLowerCase(),
+      }))
+      .sort((left, right) => left.deliveryId.localeCompare(right.deliveryId));
+    const exactReceipt =
+      ownerId !== '' &&
+      messageId !== '' &&
+      parentMessageId !== '' &&
+      Number.isSafeInteger(revision) &&
+      revision > 0 &&
+      Number.isSafeInteger(generation) &&
+      generation > 0 &&
+      claimToken !== '' &&
+      presentationLeaseToken !== '' &&
+      deliveryIds.length > 0 &&
+      deliveryReceipts.length === deliveryIds.length &&
+      deliveryReceipts.every(
+        (deliveryReceipt, index) =>
+          deliveryReceipt.deliveryId === deliveryIds[index] &&
+          /^[a-f0-9]{64}$/.test(deliveryReceipt.graphResultHash),
+      );
+    if (!exactReceipt) return null;
+
+    const ownerJob = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      null,
+    );
+    if (
+      !ownerJob ||
+      ownerJob.userId !== ownerId ||
+      ownerJob.responseMessageId !== parentMessageId
+    ) {
+      return null;
+    }
+    const binding: CortexPresentationBinding = {
+      ownerId,
+      messageId,
+      parentMessageId,
+      revision,
+      generation,
+      deliveryIds,
+      deliveryReceipts,
+      claimToken,
+      presentationLeaseToken,
+      boundAt: Date.now(),
+    };
+    const bound = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.bindCortexPresentation(streamId, binding),
+      streamId,
+      null,
+    );
+    if (!bound) return null;
+    const stored = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      null,
+    );
+    const storedBinding = stored?.cortexPresentation;
+    if (
+      !storedBinding ||
+      storedBinding.ownerId !== ownerId ||
+      storedBinding.messageId !== messageId ||
+      storedBinding.parentMessageId !== parentMessageId ||
+      storedBinding.revision !== revision ||
+      storedBinding.generation !== generation ||
+      storedBinding.claimToken !== claimToken ||
+      storedBinding.presentationLeaseToken !== presentationLeaseToken ||
+      storedBinding.deliveryReceipts.length !== deliveryReceipts.length ||
+      storedBinding.deliveryReceipts.some(
+        (storedReceipt, index) =>
+          storedReceipt.deliveryId !== deliveryReceipts[index].deliveryId ||
+          storedReceipt.graphResultHash !== deliveryReceipts[index].graphResultHash,
+      )
+    ) {
+      return null;
+    }
+    return storedBinding;
+  }
+  /* === VIVENTIUM END === */
 
   /* VIVENTIUM START: native finalization uses saved Message evidence before replay. */
   setNativeResponseRecovery(handler: (identity: NativeResponseIdentity) => Promise<boolean>): void {
@@ -400,33 +856,61 @@ class GenerationJobManagerClass {
   }
 
   async getNativePredecessorSupersession(
-    context: Pick<NativeResponseIdentity, 'streamId' | 'jobCreatedAt' | 'userId' | 'conversationId' | 'responseMessageId' | 'logicalTurnId' | 'revision'>,
+    context: Pick<
+      NativeResponseIdentity,
+      | 'streamId'
+      | 'jobCreatedAt'
+      | 'userId'
+      | 'conversationId'
+      | 'responseMessageId'
+      | 'logicalTurnId'
+      | 'revision'
+    >,
     sources: NativeAcceptedSource[],
   ) {
     const services = this.captureServices();
     try {
       const current = await services.jobStore.getJob(context.streamId);
-      if (!current || current.createdAt !== context.jobCreatedAt || current.userId !== context.userId ||
-          current.conversationId !== context.conversationId || current.responseMessageId !== context.responseMessageId ||
-          current.interactionContext?.logical_turn_id !== context.logicalTurnId ||
-          current.interactionContext?.revision !== context.revision || !current.nativePredecessor) return undefined;
+      if (
+        !current ||
+        current.createdAt !== context.jobCreatedAt ||
+        current.userId !== context.userId ||
+        current.conversationId !== context.conversationId ||
+        current.responseMessageId !== context.responseMessageId ||
+        current.interactionContext?.logical_turn_id !== context.logicalTurnId ||
+        current.interactionContext?.revision !== context.revision ||
+        !current.nativePredecessor
+      )
+        return undefined;
       const previous = await services.jobStore.getJob(current.nativePredecessor.streamId);
       this.assertServiceGeneration(services.generation);
       return nativePredecessorSupersession(current, previous, sources);
-    } catch { return undefined; }
+    } catch {
+      return undefined;
+    }
   }
 
-  async retainNativeAcceptedSources(identity: NativeResponseIdentity, sources: NativeAcceptedSource[]): Promise<void> {
+  async retainNativeAcceptedSources(
+    identity: NativeResponseIdentity,
+    sources: NativeAcceptedSource[],
+  ): Promise<void> {
     const services = this.captureServices();
     try {
       const job = await services.jobStore.getJob(identity.streamId);
-      if (!job || !nativeJobMatches(job, identity) || job.nativeResponse?.invocationId !== identity.invocationId) return;
+      if (
+        !job ||
+        !nativeJobMatches(job, identity) ||
+        job.nativeResponse?.invocationId !== identity.invocationId
+      )
+        return;
       this.assertServiceGeneration(services.generation);
       await services.jobStore.updateJob(identity.streamId, {
         nativeAcceptedSources: { invocationId: identity.invocationId, sources },
       });
       this.assertServiceGeneration(services.generation);
-    } catch { /* Optional continuity proof: absent evidence keeps branch replay fail-closed. */ }
+    } catch {
+      /* Optional continuity proof: absent evidence keeps branch replay fail-closed. */
+    }
   }
 
   async bindNativeResponse(identity: NativeResponseIdentity): Promise<boolean> {
@@ -507,7 +991,7 @@ class GenerationJobManagerClass {
     ) {
       return false;
     }
-    const runtime = await this.getOrCreateRuntimeState(identity.streamId, services);
+    const runtime = await this.getOrCreateRuntimeState(identity.streamId);
     this.assertServiceGeneration(services.generation);
     if (!runtime) return false;
     let acceptedEvent = finalEvent;
@@ -597,9 +1081,16 @@ class GenerationJobManagerClass {
     const services = this.captureServices();
     const settled = await services.jobStore.settleNativeResponse(identity, mode);
     this.assertServiceGeneration(services.generation);
-    if (settled && mode === 'cancelled') {
+    if (settled && mode !== 'unsupported') {
+      services.jobStore.clearContentState(identity.streamId);
+      this.runStepBuffers?.delete(identity.streamId);
       await services.jobStore.completeLogicalTurn(identity.streamId, identity);
       this.assertServiceGeneration(services.generation);
+      if (services.cleanupOnComplete) {
+        await services.jobStore.deleteJob(identity.streamId, identity);
+        this.assertServiceGeneration(services.generation);
+        this.runtimeState.delete(identity.streamId);
+      }
     }
     return settled;
   }
@@ -614,128 +1105,65 @@ class GenerationJobManagerClass {
     return { durability, replica_safe: durability === 'durable' };
   }
 
-  async retainLogicalTurnInput(userId: string, context: InteractionContext): Promise<InteractionContext> {
+  async retainLogicalTurnInput(
+    userId: string,
+    context: InteractionContext,
+  ): Promise<InteractionContext> {
     const services = this.captureServices();
     const retained = await services.jobStore.retainLogicalTurnInput(userId, context);
     this.assertServiceGeneration(services.generation);
     if (context.source_order_scope && context.source_sequence) {
-      await this.observeSourceOrder({ source_order_scope: context.source_order_scope, source_sequence: context.source_sequence });
+      await this.observeSourceOrder({
+        source_order_scope: context.source_order_scope,
+        source_sequence: context.source_sequence,
+      });
     }
     this.assertServiceGeneration(services.generation);
     return retained;
   }
 
-  /** Advance or read the Core-held source watermark before provider admission. */
+  /** Advance or read the Core-held source watermark before any provider or presentation wait. */
   async observeSourceOrder(
     observation: SourceOrderObservation,
   ): Promise<SourceOrderObservationResult> {
     if (
       !/^[a-f0-9]{64}$/.test(observation.source_order_scope) ||
       !Number.isSafeInteger(observation.source_sequence) ||
-      observation.source_sequence <= 0
+      observation.source_sequence < 0
     ) {
       throw Object.assign(new Error('Invalid source order observation'), {
         code: 'invalid_source_order',
       });
     }
-    const services = this.captureServices();
-    const observer = services.jobStore.observeSourceOrder;
-    if (typeof observer !== 'function') {
-      throw Object.assign(new Error('Source order authority is unavailable'), {
-        code: 'source_order_unavailable',
-      });
-    }
-    const result = await observer.call(services.jobStore, observation);
-    this.assertServiceGeneration(services.generation);
-    return result;
-  }
-
-  /** Bind only an exact current-owner Cortex presentation receipt to a stream job. */
-  async bindCortexPresentation(
-    streamId: string,
-    receipt: CortexPresentationFenceReceipt,
-  ): Promise<CortexPresentationBinding | null> {
-    const services = this.captureServices();
-    const normalized = normalizeCortexPresentationReceipt(receipt);
-    if (!normalized) {
-      return null;
-    }
-    const {
-      ownerId,
-      messageId,
-      parentMessageId,
-      revision,
-      generation,
-      deliveryIds,
-      deliveryReceipts,
-      claimToken,
-      presentationLeaseToken,
-    } = normalized;
-
-    const ownerJob = await services.jobStore.getJob(streamId);
-    this.assertServiceGeneration(services.generation);
-    if (
-      !ownerJob ||
-      ownerJob.userId !== ownerId ||
-      ownerJob.responseMessageId !== parentMessageId
-    ) {
-      return null;
-    }
-    const binding: CortexPresentationBinding = {
-      ownerId,
-      messageId,
-      parentMessageId,
-      revision,
-      generation,
-      deliveryIds,
-      deliveryReceipts,
-      claimToken,
-      presentationLeaseToken,
-      boundAt: Date.now(),
-    };
-    const bound = await services.jobStore.bindCortexPresentation(streamId, binding);
-    this.assertServiceGeneration(services.generation);
-    if (!bound) {
-      return null;
-    }
-    const stored = await services.jobStore.getJob(streamId);
-    this.assertServiceGeneration(services.generation);
-    const storedBinding = stored?.cortexPresentation;
-    if (
-      !storedBinding ||
-      storedBinding.ownerId !== ownerId ||
-      storedBinding.messageId !== messageId ||
-      storedBinding.parentMessageId !== parentMessageId ||
-      storedBinding.revision !== revision ||
-      storedBinding.generation !== generation ||
-      storedBinding.claimToken !== claimToken ||
-      storedBinding.presentationLeaseToken !== presentationLeaseToken ||
-      storedBinding.deliveryIds.length !== deliveryIds.length ||
-      storedBinding.deliveryIds.some((deliveryId, index) => deliveryId !== deliveryIds[index]) ||
-      storedBinding.deliveryReceipts.length !== deliveryReceipts.length ||
-      storedBinding.deliveryReceipts.some(
-        (storedReceipt, index) =>
-          storedReceipt.deliveryId !== deliveryReceipts[index].deliveryId ||
-          storedReceipt.graphResultHash !== deliveryReceipts[index].graphResultHash,
-      )
-    ) {
-      return null;
-    }
-    return storedBinding;
+    const lifecycle = this.captureLifecycle();
+    return this.runLifecycleOperation(lifecycle, () =>
+      lifecycle.jobStore.observeSourceOrder(observation),
+    );
   }
 
   /** Persist an adapter's terminal presentation outcome against server-held turn ownership. */
   async acknowledgeDelivery(
     acknowledgement: InteractionDeliveryAck,
     adapterSurface: 'telegram' | 'voice',
-    cortexPresentationReceipt?: CortexPresentationFenceReceipt,
+    expectedCortexPresentation?: CortexPresentationFenceReceipt,
   ): Promise<DeliveryAcknowledgementResult> {
-    const ownerStreamId = await this.jobStore.resolveDeliveryOwner(
-      acknowledgement.logical_turn_id,
-      acknowledgement.revision,
+    const lifecycle = this.captureLifecycle();
+    const ownerStreamId = await this.runLifecycleOperation(lifecycle, () =>
+      lifecycle.jobStore.resolveDeliveryOwner(
+        acknowledgement.logical_turn_id,
+        acknowledgement.revision,
+      ),
     );
-    const ownerJob = ownerStreamId ? await this.jobStore.getJob(ownerStreamId) : null;
-    if (!ownerStreamId || !ownerJob) {
+    const runtime = ownerStreamId ? this.runtimeState.get(ownerStreamId) : undefined;
+    const ownerJob = ownerStreamId
+      ? await this.runLifecycleOperation(
+          lifecycle,
+          () => lifecycle.jobStore.getJob(ownerStreamId),
+          ownerStreamId,
+          runtime,
+        )
+      : null;
+    if (!ownerJob) {
       return { status: 'not_found' };
     }
     if (
@@ -744,19 +1172,69 @@ class GenerationJobManagerClass {
     ) {
       return { status: 'conflict' };
     }
-    let cortexPresentation: CortexPresentationBinding | null = null;
-    if (cortexPresentationReceipt) {
-      if (
-        !cortexPresentationMatchesReceipt(ownerJob.cortexPresentation, cortexPresentationReceipt)
-      ) {
-        return { status: 'retryable_conflict' };
-      }
-      cortexPresentation = ownerJob.cortexPresentation;
+    const currentCortexPresentation = ownerJob.cortexPresentation;
+    if (
+      expectedCortexPresentation &&
+      (!currentCortexPresentation ||
+        currentCortexPresentation.ownerId !== expectedCortexPresentation.ownerId ||
+        currentCortexPresentation.messageId !== expectedCortexPresentation.messageId ||
+        currentCortexPresentation.parentMessageId !== expectedCortexPresentation.parentMessageId ||
+        currentCortexPresentation.revision !== expectedCortexPresentation.revision ||
+        currentCortexPresentation.generation !== expectedCortexPresentation.generation ||
+        currentCortexPresentation.claimToken !== expectedCortexPresentation.claimToken ||
+        currentCortexPresentation.presentationLeaseToken !==
+          expectedCortexPresentation.presentationLeaseToken ||
+        currentCortexPresentation.deliveryIds.length !==
+          expectedCortexPresentation.deliveryIds.length ||
+        currentCortexPresentation.deliveryIds.some(
+          (deliveryId, index) => deliveryId !== expectedCortexPresentation.deliveryIds[index],
+        ) ||
+        currentCortexPresentation.deliveryReceipts.length !==
+          expectedCortexPresentation.deliveryReceipts.length ||
+        currentCortexPresentation.deliveryReceipts.some(
+          (receipt, index) =>
+            receipt.deliveryId !== expectedCortexPresentation.deliveryReceipts[index]?.deliveryId ||
+            receipt.graphResultHash !==
+              expectedCortexPresentation.deliveryReceipts[index]?.graphResultHash,
+        ))
+    ) {
+      return { status: 'conflict' };
     }
-    return this.recordDeliveryAcknowledgement(acknowledgement, cortexPresentation, ownerStreamId);
+    const result = await this.recordDeliveryAcknowledgement(
+      acknowledgement,
+      lifecycle,
+      ownerStreamId!,
+      runtime,
+      expectedCortexPresentation ? (currentCortexPresentation ?? null) : null,
+    );
+    if (!['stale_revision', 'stale_source_order'].includes(result.status)) {
+      if (!expectedCortexPresentation && result.presentation?.cortexPresentation) {
+        const { userId, conversationId, responseMessageId, interactionContext } =
+          result.presentation;
+        return {
+          ...result,
+          presentation: { userId, conversationId, responseMessageId, interactionContext },
+        };
+      }
+      return result;
+    }
+    return {
+      ...result,
+      ownerStreamId: ownerStreamId!,
+      presentation: {
+        userId: ownerJob.userId,
+        conversationId: ownerJob.conversationId,
+        responseMessageId: ownerJob.responseMessageId,
+        interactionContext: ownerJob.interactionContext,
+      },
+    };
   }
 
-  /** Resolve a Telegram receipt for a scheduler answer already committed by Core. */
+  /**
+   * Resolve a Telegram transport receipt for an answer that the server already committed.
+   * Scheduler turns keep server presentation authority; the Telegram adapter may only attach
+   * transport IDs after the exact schedule and run identities match server-owned context.
+   */
   async acknowledgeServerCommittedTransportReceipt(
     acknowledgement: InteractionDeliveryAck,
     adapterSurface: 'telegram' | 'voice',
@@ -768,21 +1246,29 @@ class GenerationJobManagerClass {
     ) {
       return { status: 'conflict' };
     }
-    const services = this.captureServices();
-    const ownerStreamId = await services.jobStore.resolveDeliveryOwner(
-      acknowledgement.logical_turn_id,
-      acknowledgement.revision,
+    const lifecycle = this.captureLifecycle();
+    const ownerStreamId = await this.runLifecycleOperation(lifecycle, () =>
+      lifecycle.jobStore.resolveDeliveryOwner(
+        acknowledgement.logical_turn_id,
+        acknowledgement.revision,
+      ),
     );
-    this.assertServiceGeneration(services.generation);
-    const ownerJob = ownerStreamId ? await services.jobStore.getJob(ownerStreamId) : null;
-    this.assertServiceGeneration(services.generation);
+    const runtime = ownerStreamId ? this.runtimeState.get(ownerStreamId) : undefined;
+    const ownerJob = ownerStreamId
+      ? await this.runLifecycleOperation(
+          lifecycle,
+          () => lifecycle.jobStore.getJob(ownerStreamId),
+          ownerStreamId,
+          runtime,
+        )
+      : null;
     const context = ownerJob?.interactionContext;
     if (
       !ownerJob ||
       ownerJob.deliveryPolicy?.commit_authority !== 'server' ||
       context?.origin !== 'scheduler' ||
-      context.schedule_id !== acknowledgement.schedule_id ||
-      context.schedule_run_id !== acknowledgement.schedule_run_id ||
+      context?.schedule_id !== acknowledgement.schedule_id ||
+      context?.schedule_run_id !== acknowledgement.schedule_run_id ||
       !ownerJob.responseMessageId
     ) {
       return { status: 'conflict' };
@@ -802,71 +1288,331 @@ class GenerationJobManagerClass {
     };
   }
 
-  private async recordDeliveryAcknowledgement(
+  /**
+   * Record an older presentation only after Core has independently proven that the exact response
+   * committed a durable external side effect. The adapter cannot request this class directly.
+   */
+  async acknowledgeDurableEffectDelivery(
     acknowledgement: InteractionDeliveryAck,
-    expectedCortexPresentation: CortexPresentationBinding | null = null,
-    expectedOwnerStreamId?: string,
-    expectedNativeIdentity?: NativeResponseIdentity,
+    adapterSurface: 'telegram' | 'voice',
   ): Promise<DeliveryAcknowledgementResult> {
-    const result = expectedCortexPresentation
-      ? await this.jobStore.bindDeliveryAcknowledgement(
-          expectedOwnerStreamId || '',
-          acknowledgement,
-          expectedCortexPresentation,
-        )
-      : await this.jobStore.acknowledgeDelivery(acknowledgement);
-    const ownerStreamId = result.ownerStreamId || expectedOwnerStreamId;
-    if (result.status !== 'recorded' || !ownerStreamId) {
-      return result;
-    }
-    if (expectedNativeIdentity && ownerStreamId !== expectedOwnerStreamId) {
+    if (acknowledgement.state !== 'committed') {
       return { status: 'conflict' };
     }
-    const recordedAcknowledgement = result.acknowledgement;
-    const cortexPresentation =
-      'cortexPresentation' in result ? result.cortexPresentation : undefined;
-    const idempotent = result.idempotent === true;
-    if (expectedCortexPresentation && !cortexPresentation) {
-      return { status: 'retryable_conflict' };
+    const lifecycle = this.captureLifecycle();
+    const ownerStreamId = await this.runLifecycleOperation(lifecycle, () =>
+      lifecycle.jobStore.resolveDeliveryOwner(
+        acknowledgement.logical_turn_id,
+        acknowledgement.revision,
+      ),
+    );
+    const runtime = ownerStreamId ? this.runtimeState.get(ownerStreamId) : undefined;
+    const ownerJob = ownerStreamId
+      ? await this.runLifecycleOperation(
+          lifecycle,
+          () => lifecycle.jobStore.getJob(ownerStreamId),
+          ownerStreamId,
+          runtime,
+        )
+      : null;
+    if (!ownerJob) {
+      return { status: 'not_found' };
     }
-    const ownerJob = await this.jobStore.getJob(ownerStreamId);
+    const effectRef = String(acknowledgement.effect_ref || '').trim();
+    if (
+      ownerJob.deliveryPolicy?.commit_authority !== 'external_adapter' ||
+      ownerJob.interactionContext?.surface !== adapterSurface ||
+      ownerJob.durableEffectReceipt?.source_event_id !==
+        ownerJob.interactionContext?.source_event_id ||
+      ownerJob.durableEffectReceipt?.response_message_id !== ownerJob.responseMessageId ||
+      (effectRef && ownerJob.durableEffectReceipt?.effect_ref !== effectRef) ||
+      (adapterSurface === 'voice' && !effectRef)
+    ) {
+      return { status: 'conflict' };
+    }
+    return this.recordDeliveryAcknowledgement(
+      { ...acknowledgement, state: 'committed_effect' },
+      lifecycle,
+      ownerStreamId!,
+      runtime,
+      null,
+    );
+  }
+
+  /**
+   * Record that trusted server code committed durable work for this exact source/response pair.
+   * Every surface gets the append-only replay fence; only response-only external adapters receive
+   * presentation authority for an older response. Model text and adapter claims cannot set either.
+   */
+  async markDurableEffectReceipt(input: DurableEffectReceiptInput): Promise<boolean> {
+    const reject = (reason: string): false => {
+      logger.warn('[GenerationJobManager] Durable effect receipt binding rejected', {
+        reason,
+      });
+      return false;
+    };
+    const streamId = String(input.streamId || '').trim();
+    const userId = String(input.userId || '').trim();
+    const sourceEventId = String(input.sourceEventId || '').trim();
+    const responseMessageId = String(input.responseMessageId || '').trim();
+    const effectRef = String(input.effectRef || '').trim();
+    if (
+      !streamId ||
+      !userId ||
+      !sourceEventId ||
+      !responseMessageId ||
+      !effectRef ||
+      !['durable_work_accepted', 'durable_work_action_accepted'].includes(input.effectKind) ||
+      streamId.length > 256 ||
+      userId.length > 160 ||
+      sourceEventId.length > 512 ||
+      responseMessageId.length > 256 ||
+      effectRef.length > 160
+    ) {
+      return reject('invalid_input');
+    }
+    const lifecycle = this.captureLifecycle();
+    const runtime = this.runtimeState.get(streamId);
+    const job = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
+    if (!job) return reject('job_missing');
+    if (job.userId !== userId) return reject('owner_mismatch');
+    if (job.responseMessageId !== responseMessageId) return reject('response_mismatch');
+    if (job.interactionContext?.source_event_id !== sourceEventId) {
+      return reject('source_mismatch');
+    }
+    const canPresentDurableReceipt =
+      job.deliveryPolicy?.commit_authority === 'external_adapter' &&
+      job.adapterCapabilities?.supersede_scope === 'response_only';
+    let existingReceipts = job.durableEffectReceipts ?? [];
+    if (existingReceipts.length === 0 && job.durableEffectReceipt) {
+      existingReceipts = [job.durableEffectReceipt];
+    }
+    const existing = existingReceipts.find((receipt) => receipt.effect_ref === effectRef);
+    if (
+      existing &&
+      (existing.effect_kind !== input.effectKind ||
+        existing.source_event_id !== sourceEventId ||
+        existing.response_message_id !== responseMessageId)
+    ) {
+      return reject('receipt_conflict');
+    }
+    const committedReceipt =
+      existing ??
+      ({
+        effect_kind: input.effectKind,
+        effect_ref: effectRef,
+        source_event_id: sourceEventId,
+        response_message_id: responseMessageId,
+        committed_at: Date.now(),
+      } as const);
+    /* === VIVENTIUM START ===
+     * Feature: Cross-surface durable-effect replay fence with narrow presentation authority.
+     * Purpose: Every surface records the exact committed effect so provider fallback cannot replay
+     *          it. Only response-only external adapters receive the singular presentation receipt
+     *          that can close a superseded response; web and scheduler retain their normal authoring.
+     */
+    const receiptFinalEvent = canPresentDurableReceipt
+      ? buildDurableWorkReceiptFinalEvent(job, responseMessageId, committedReceipt)
+      : null;
+    /* === VIVENTIUM END === */
+    await this.runLifecycleOperation(
+      lifecycle,
+      () =>
+        lifecycle.jobStore.updateJob(streamId, {
+          ...(canPresentDurableReceipt && !job.durableEffectReceipt
+            ? {
+                durableEffectReceipt: committedReceipt,
+              }
+            : {}),
+          durableEffectReceipts: existing
+            ? existingReceipts
+            : [...existingReceipts, committedReceipt],
+        }),
+      streamId,
+      runtime,
+    );
+    const persisted = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
+    if (!(
+      persisted?.durableEffectReceipts?.some(
+        (receipt) =>
+          receipt.effect_kind === input.effectKind &&
+          receipt.effect_ref === effectRef &&
+          receipt.source_event_id === sourceEventId &&
+          receipt.response_message_id === responseMessageId,
+      ) ??
+      (persisted?.durableEffectReceipt?.effect_kind === input.effectKind &&
+        persisted.durableEffectReceipt.effect_ref === effectRef &&
+        persisted.durableEffectReceipt.source_event_id === sourceEventId &&
+        persisted.durableEffectReceipt.response_message_id === responseMessageId)
+    )) {
+      return reject('receipt_not_persisted');
+    }
+    if (
+      canPresentDurableReceipt &&
+      receiptFinalEvent &&
+      persisted.status === 'superseded' &&
+      !hasDurableWorkReceiptFinalEvent(persisted)
+    ) {
+      if (runtime) {
+        runtime.finalEvent = receiptFinalEvent;
+      }
+      await this.runLifecycleOperation(
+        lifecycle,
+        () =>
+          lifecycle.jobStore.updateJob(streamId, {
+            finalEvent: JSON.stringify(receiptFinalEvent),
+          }),
+        streamId,
+        runtime,
+      );
+      await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.eventTransport.emitDone(streamId, receiptFinalEvent),
+        streamId,
+        runtime,
+      );
+    }
+    return true;
+  }
+
+  private async recordDeliveryAcknowledgement(
+    acknowledgement: InteractionDeliveryAck,
+    lifecycle: ManagerLifecycleSnapshot = this.captureLifecycle(),
+    expectedOwnerStreamId?: string,
+    expectedRuntime: RuntimeJobState | undefined = expectedOwnerStreamId
+      ? this.runtimeState.get(expectedOwnerStreamId)
+      : undefined,
+    expectedCortexPresentation?: CortexPresentationBinding | null,
+    expectedNativeIdentity?: NativeResponseIdentity,
+  ): Promise<DeliveryAcknowledgementResult> {
+    let result: DeliveryAcknowledgementResult;
+    let cortexPresentation: CortexPresentationBinding | undefined;
+    if (expectedCortexPresentation) {
+      if (!expectedOwnerStreamId) return { status: 'conflict' };
+      const binding = await this.runLifecycleOperation(
+        lifecycle,
+        () =>
+          lifecycle.jobStore.bindDeliveryAcknowledgement(
+            expectedOwnerStreamId,
+            acknowledgement,
+            expectedCortexPresentation,
+          ),
+        expectedOwnerStreamId,
+        expectedRuntime,
+      );
+      if (binding.status !== 'recorded' || !binding.acknowledgement) {
+        return { status: binding.status };
+      }
+      cortexPresentation = binding.cortexPresentation;
+      result = {
+        status: 'recorded',
+        acknowledgement: binding.acknowledgement,
+        idempotent: binding.idempotent === true,
+        ownerStreamId: expectedOwnerStreamId,
+      };
+    } else {
+      result = await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.acknowledgeDelivery(acknowledgement),
+        expectedOwnerStreamId,
+        expectedOwnerStreamId ? expectedRuntime : null,
+      );
+      if (result.status !== 'recorded' || !result.ownerStreamId) {
+        return result;
+      }
+      if (expectedOwnerStreamId && result.ownerStreamId !== expectedOwnerStreamId) {
+        return { status: 'conflict' };
+      }
+    }
+    const ownerStreamId = result.ownerStreamId;
+    if (!ownerStreamId) return { status: 'conflict' };
+    const runtime = expectedOwnerStreamId ? expectedRuntime : this.runtimeState.get(ownerStreamId);
+    const ownerJob = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(ownerStreamId),
+      ownerStreamId,
+      runtime,
+    );
+    if (expectedNativeIdentity) {
+      await this.runLifecycleOperation(
+        lifecycle,
+        () =>
+          lifecycle.jobStore.updateJob(
+            ownerStreamId,
+            { deliveryAcknowledgement: result.acknowledgement },
+            expectedNativeIdentity,
+          ),
+        ownerStreamId,
+        runtime,
+      );
+      const fencedJob = await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.getJob(ownerStreamId),
+        ownerStreamId,
+        runtime,
+      );
+      if (
+        !fencedJob?.nativeResponse ||
+        !nativeJobMatches(fencedJob, expectedNativeIdentity) ||
+        nativeIdentityJson(fencedJob.nativeResponse) !==
+          nativeIdentityJson(expectedNativeIdentity) ||
+        fencedJob.deliveryAcknowledgement !== result.acknowledgement
+      ) {
+        return { status: 'conflict' };
+      }
+    } else if (!expectedCortexPresentation) {
+      const acknowledgementBinding = await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.bindDeliveryAcknowledgement(ownerStreamId, acknowledgement, null),
+        ownerStreamId,
+        runtime,
+      );
+      if (acknowledgementBinding.status !== 'recorded') {
+        return { status: acknowledgementBinding.status };
+      }
+    }
+    const verifiedCortexPresentation =
+      cortexPresentation &&
+      ['committed', 'committed_effect'].includes(result.acknowledgement?.state || '')
+        ? cortexPresentation
+        : undefined;
     const presentation = ownerJob
       ? {
           userId: ownerJob.userId,
           conversationId: ownerJob.conversationId,
           responseMessageId: ownerJob.responseMessageId,
           interactionContext: ownerJob.interactionContext,
-          ...(cortexPresentation ? { cortexPresentation } : {}),
+          ...(verifiedCortexPresentation ? { cortexPresentation: verifiedCortexPresentation } : {}),
         }
       : undefined;
-    await this.jobStore.updateJob(ownerStreamId, {
-      deliveryAcknowledgement: recordedAcknowledgement,
-      ...(cortexPresentation
-        ? {
-            cortexDeliveryAcknowledgement: recordedAcknowledgement,
-            cortexDeliveryAcknowledgementPresentation: cortexPresentation,
-          }
-        : {}),
-    }, expectedNativeIdentity);
-    const job = await this.jobStore.getJob(ownerStreamId);
-    if (expectedNativeIdentity &&
-        (!job?.nativeResponse || !nativeJobMatches(job, expectedNativeIdentity) ||
-          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(expectedNativeIdentity))) {
-      return { status: 'conflict' };
-    }
-    if (acknowledgement.state === 'committed' && job?.generationCompleted === true) {
+    const job = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(ownerStreamId),
+      ownerStreamId,
+      runtime,
+    );
+    if (
+      ['committed', 'committed_effect'].includes(acknowledgement.state) &&
+      job?.generationCompleted === true
+    ) {
       await this.finalizeCompletedJob(
         ownerStreamId,
         job.deliveryPolicy?.commit_authority === 'external_adapter',
+        lifecycle,
+        runtime,
       );
     }
-    return {
-      ...result,
-      ownerStreamId,
-      acknowledgement: recordedAcknowledgement,
-      idempotent,
-      presentation,
-    };
+    return { ...result, presentation };
   }
 
   /** Server-owned commit point used only after canonical persistence and successful final emit. */
@@ -875,25 +1621,41 @@ class GenerationJobManagerClass {
     acknowledgement: Pick<InteractionDeliveryAck, 'state' | 'presentation_ref'>,
     expectedNativeIdentity?: NativeResponseIdentity,
   ): Promise<DeliveryAcknowledgementResult> {
-    const job = await this.jobStore.getJob(streamId);
+    const lifecycle = this.captureLifecycle();
+    const runtime = this.runtimeState.get(streamId);
+    const job = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
     const context = job?.interactionContext;
     if (
       !job ||
       !context?.logical_turn_id ||
       job.deliveryPolicy?.commit_authority === 'external_adapter' ||
-      (expectedNativeIdentity && (!job.nativeResponse ||
-        !nativeJobMatches(job, expectedNativeIdentity) ||
-        nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(expectedNativeIdentity) ||
-        acknowledgement.state !== 'partial_removed' || job.status !== 'superseded' ||
-        acknowledgement.presentation_ref !== expectedNativeIdentity.responseMessageId))
+      (expectedNativeIdentity &&
+        (!job.nativeResponse ||
+          !nativeJobMatches(job, expectedNativeIdentity) ||
+          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(expectedNativeIdentity) ||
+          acknowledgement.state !== 'partial_removed' ||
+          job.status !== 'superseded' ||
+          acknowledgement.presentation_ref !== expectedNativeIdentity.responseMessageId))
     ) {
       return { status: 'conflict' };
     }
-    return this.recordDeliveryAcknowledgement({
-      logical_turn_id: context.logical_turn_id,
-      revision: context.revision,
-      ...acknowledgement,
-    }, null, streamId, expectedNativeIdentity);
+    return this.recordDeliveryAcknowledgement(
+      {
+        logical_turn_id: context.logical_turn_id,
+        revision: context.revision,
+        ...acknowledgement,
+      },
+      lifecycle,
+      streamId,
+      runtime,
+      null,
+      expectedNativeIdentity,
+    );
   }
 
   /**
@@ -919,42 +1681,75 @@ class GenerationJobManagerClass {
     conversationId?: string,
     options?: CreateGenerationJobOptions,
   ): Promise<t.GenerationJob> {
-    /* === VIVENTIUM START ===
-     * Purpose: Bind logical-turn claiming and job creation to one immutable service generation so
-     * a teardown cannot split ownership state across replacement services.
-     */
-    const services = this.captureServices();
-    const { generation, jobStore, eventTransport } = services;
+    if (this.unavailable) {
+      throw streamManagerUnavailableError();
+    }
+    const serviceGeneration = this.serviceGeneration;
+    const lifecycleEpoch = this.lifecycleEpoch;
+    const lifecycleJobStore = this.jobStore;
+    const lifecycleEventTransport = this.eventTransport;
+    const lifecycleSignal = this.lifecycleAbortController.signal;
+    this.pendingAdmissions += 1;
+    try {
+      const job = await this.createJobWithinLifecycle(
+        streamId,
+        userId,
+        conversationId,
+        options,
+        lifecycleSignal,
+      );
+      if (
+        serviceGeneration !== this.serviceGeneration ||
+        this.unavailable ||
+        lifecycleEpoch !== this.lifecycleEpoch
+      ) {
+        if (!job.abortController.signal.aborted) {
+          job.abortController.abort('manager_lifecycle_changed');
+        }
+        await lifecycleJobStore.deleteJob(streamId).catch(() => undefined);
+        lifecycleEventTransport.cleanup(streamId);
+        throw this.serviceGenerationChangedError();
+      }
+      return job;
+    } catch (error) {
+      if (serviceGeneration !== this.serviceGeneration || lifecycleEpoch !== this.lifecycleEpoch) {
+        throw this.serviceGenerationChangedError();
+      }
+      throw error;
+    } finally {
+      this.pendingAdmissions -= 1;
+    }
+  }
+
+  private async createJobWithinLifecycle(
+    streamId: string,
+    userId: string,
+    conversationId?: string,
+    options?: CreateGenerationJobOptions,
+    lifecycleSignal: AbortSignal = this.lifecycleAbortController.signal,
+  ): Promise<t.GenerationJob> {
     let interactionContext = options?.interactionContext;
     let supersededStreamIds: string[] = [];
+    let logicalTurnClaim: LogicalTurnClaim | undefined;
     if (interactionContext) {
       const baseInteractionContext = interactionContext;
-      let claim = await jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
-      this.assertServiceGeneration(generation);
-      const inputDeadline = Date.now() + 10_000;
-      while (claim.status === 'initializing' && Date.now() < inputDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-        this.assertServiceGeneration(generation);
-        claim = await jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
+      let claim = await this.jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
+      if (claim.status === 'stale_source_order') {
+        throw sourceOrderSupersededError();
       }
-      if (claim.status === 'initializing') {
-        throw Object.assign(new Error('Accepted input persistence is still pending; retry the request'), { code: 'source_input_persistence_pending' });
-      }
-      if (claim.status === 'duplicate' && !(await jobStore.hasJob(claim.streamId))) {
-        this.assertServiceGeneration(generation);
-        const forgotten = await jobStore.forgetMissingSourceEventReceipt(
+      if (claim.status === 'duplicate' && !(await this.jobStore.hasJob(claim.streamId))) {
+        const forgotten = await this.jobStore.forgetMissingSourceEventReceipt(
           claim.interactionContext,
           claim.streamId,
         );
-        this.assertServiceGeneration(generation);
         if (forgotten) {
-          claim = await jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
-          this.assertServiceGeneration(generation);
+          claim = await this.jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
+        } else {
+          throw streamCreationPendingError();
         }
       }
       if (claim.status === 'claimed' && claim.supersededStreamIds.length > 0) {
-        const supersededJob = await jobStore.getJob(claim.supersededStreamIds[0]);
-        this.assertServiceGeneration(generation);
+        const supersededJob = await this.jobStore.getJob(claim.supersededStreamIds[0]);
         const persistedServerFinal =
           supersededJob?.deliveryPolicy?.commit_authority === 'server' &&
           supersededJob.status === 'complete' &&
@@ -962,9 +1757,8 @@ class GenerationJobManagerClass {
           Boolean(supersededJob.interactionContext?.logical_turn_id);
         if (
           persistedServerFinal &&
-          (await jobStore.rollbackLogicalTurnClaim(streamId, claim.interactionContext))
+          (await this.jobStore.rollbackLogicalTurnClaim(streamId, claim.interactionContext))
         ) {
-          this.assertServiceGeneration(generation);
           const supersededContext = supersededJob.interactionContext!;
           await this.recordDeliveryAcknowledgement({
             logical_turn_id: supersededContext.logical_turn_id!,
@@ -974,78 +1768,185 @@ class GenerationJobManagerClass {
               ? { presentation_ref: supersededJob.responseMessageId }
               : {}),
           });
-          this.assertServiceGeneration(generation);
-          claim = await jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
-          this.assertServiceGeneration(generation);
+          claim = await this.jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
         }
-      }
-      if (claim.status === 'busy') {
-        throw Object.assign(new Error('The current response is still active'), { code: 'source_input_waiting' });
-      }
-      if (claim.status === 'superseded') {
-        throw Object.assign(new Error('A newer accepted source owns the presentation'), { code: 'source_order_superseded' });
       }
       interactionContext = claim.interactionContext;
       if (claim.status === 'duplicate') {
-        const duplicateJob = await this.getJob(claim.streamId);
-        this.assertServiceGeneration(generation);
-        if (!duplicateJob) {
-          throw new Error(`Duplicate source event references unavailable stream ${claim.streamId}`);
+        const persistedJob = await this.jobStore.getJob(claim.streamId);
+        if (!persistedJob) {
+          throw new Error(
+            `Duplicate source event references unavailable ${streamLogRef(claim.streamId)}`,
+          );
         }
+        const persistedContext = persistedJob.interactionContext;
+        /* === VIVENTIUM START ===
+         * Feature: Source-order-safe Telegram receipt replay.
+         * Purpose: Preserve canonical-session ownership and fence duplicate admissions against
+         * the latest trusted watermark before returning an already-admitted generation.
+         */
+        if (
+          persistedJob.userId !== userId ||
+          !persistedContext?.logical_turn_id ||
+          persistedJob.conversationId !== conversationId ||
+          persistedContext.conversation_id !== baseInteractionContext.conversation_id ||
+          persistedContext.logical_turn_id !== claim.interactionContext.logical_turn_id ||
+          persistedContext.revision !== claim.interactionContext.revision ||
+          persistedContext.source_event_id !== claim.interactionContext.source_event_id
+        ) {
+          throw streamReceiptConflictError();
+        }
+        const duplicateJob = await this.getJob(claim.streamId);
+        if (!duplicateJob) {
+          throw new Error(
+            `Duplicate source event references unavailable ${streamLogRef(claim.streamId)}`,
+          );
+        }
+        const replaySourceOrder = sourceOrderObservationFromContext(baseInteractionContext);
+        if (
+          replaySourceOrder &&
+          (await this.jobStore.observeSourceOrder(replaySourceOrder)).stale
+        ) {
+          throw sourceOrderSupersededError();
+        }
+        /* === VIVENTIUM END === */
         duplicateJob.duplicateOfStreamId = claim.streamId;
         return duplicateJob;
       }
       supersededStreamIds = claim.supersededStreamIds;
+      logicalTurnClaim = claim;
     }
 
-    const supersededPresentations: NonNullable<t.GenerationJob['supersededPresentations']> = [];
-    let nativePredecessor: NativePredecessor | undefined;
-    let jobData: SerializableJobData;
-    try {
-      // A conversation may reuse its stream ID. Retire the old incarnation and capture its
-      // presentation before publishing the replacement under that same key.
-      for (const supersededStreamId of supersededStreamIds) {
-        const supersededJob = await jobStore.getJob(supersededStreamId);
-        const previousNative = supersededJob?.nativeResponse;
-        if (supersededStreamIds.length === 1 && supersededStreamId !== streamId && previousNative &&
-            supersededJob.userId === userId && supersededJob.conversationId === conversationId &&
-            previousNative.logicalTurnId === interactionContext?.logical_turn_id &&
-            previousNative.revision + 1 === interactionContext.revision &&
-            supersededJob.responseMessageId === previousNative.responseMessageId) {
-          nativePredecessor = { streamId: supersededStreamId, createdAt: supersededJob.createdAt,
-            responseMessageId: previousNative.responseMessageId, invocationId: previousNative.invocationId };
-        }
-        if (supersededJob?.deliveryAcknowledgement?.state !== 'committed') {
-          supersededPresentations.push({
-            conversationId: supersededJob?.conversationId,
-            responseMessageId: supersededJob?.responseMessageId,
-            userMessageId: supersededJob?.userMessage?.messageId,
-            interactionContext: supersededJob?.interactionContext,
-          });
-        }
-        this.assertServiceGeneration(generation);
-        await this.supersedeJob(supersededStreamId);
-        this.assertServiceGeneration(generation);
+    let sameStreamSupersededJob: SerializableJobData | null = null;
+    if (supersededStreamIds.includes(streamId)) {
+      sameStreamSupersededJob = await this.jobStore.getJob(streamId);
+      if (sameStreamSupersededJob) {
+        await this.supersedeJob(streamId);
+        await this.jobStore.deleteJob(streamId);
       }
-      jobData = await jobStore.createJob(streamId, userId, conversationId, {
+    }
+
+    const staleRuntime = this.runtimeState.get(streamId);
+    if (staleRuntime) {
+      const persistedStaleJob = await this.jobStore.getJob(streamId);
+      if (
+        persistedStaleJob &&
+        (!staleRuntime.abortController.signal.aborted ||
+          persistedStaleJob.userId !== userId ||
+          persistedStaleJob.conversationId !== conversationId ||
+          interactionContext != null)
+      ) {
+        throw streamReceiptConflictError();
+      }
+      if (!staleRuntime.abortController.signal.aborted) {
+        staleRuntime.abortController.abort('stream_reused');
+      }
+      this.runtimeState.delete(streamId);
+      this.eventTransport.cleanup(streamId);
+    }
+    let resolveReady!: () => void;
+    const readyPromise = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    const runtime: RuntimeJobState = {
+      abortController: new AbortController(),
+      readyPromise,
+      resolveReady,
+      syncSent: false,
+      earlyEventBuffer: [],
+      hasSubscriber: false,
+    };
+    this.runtimeState.set(streamId, runtime);
+    let jobData: SerializableJobData;
+    let jobAdmitted = false;
+    try {
+      if (this.eventTransport.onAbort) {
+        await awaitLifecycle(
+          this.eventTransport.onAbort(streamId, (reason, proof) => {
+            const currentRuntime = this.runtimeState.get(streamId);
+            if (
+              !jobData ||
+              currentRuntime?.nativeProducer?.createdAt !== jobData.createdAt ||
+              (proof &&
+                proof !==
+                  nativeJobProofJson({
+                    ...jobData,
+                    responseMessageId:
+                      currentRuntime.nativeProducer.responseMessageId ?? jobData.responseMessageId,
+                  }))
+            ) {
+              return;
+            }
+            if (!currentRuntime.abortController.signal.aborted) {
+              logger.debug(
+                `[GenerationJobManager] Received cross-replica abort for ${streamLogRef(streamId)}`,
+              );
+              currentRuntime.abortController.abort(reason ?? 'user_cancelled');
+            }
+          }),
+          lifecycleSignal,
+        );
+      }
+      jobData = await this.jobStore.createJob(streamId, userId, conversationId, {
         interactionContext,
         adapterCapabilities: options?.adapterCapabilities,
         deliveryPolicy: options?.deliveryPolicy,
+        clientPresentation: options?.clientPresentation,
       });
-      this.assertServiceGeneration(generation);
-      if (nativePredecessor) {
-        await jobStore.updateJob(streamId, { nativePredecessor });
-        this.assertServiceGeneration(generation);
-        jobData.nativePredecessor = nativePredecessor;
+      runtime.nativeProducer = {
+        createdAt: jobData.createdAt,
+        responseMessageId: jobData.responseMessageId,
+      };
+      if (sameStreamSupersededJob && jobData.createdAt <= sameStreamSupersededJob.createdAt) {
+        jobData.createdAt = sameStreamSupersededJob.createdAt + 1;
+        await this.jobStore.updateJob(streamId, { createdAt: jobData.createdAt });
+      }
+      jobAdmitted = true;
+      if (
+        logicalTurnClaim?.supersededStreamIds.length &&
+        this.jobStore.fenceSupersededLogicalTurnClaims
+      ) {
+        await this.jobStore.fenceSupersededLogicalTurnClaims(logicalTurnClaim);
       }
     } catch (error) {
+      if (!runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('admission_failed');
+      }
+      this.runtimeState.delete(streamId);
+      this.eventTransport.cleanup(streamId);
+      if (jobAdmitted) {
+        await this.jobStore.deleteJob(streamId);
+      }
       if (interactionContext?.logical_turn_id) {
-        await jobStore.rollbackLogicalTurnClaim(streamId, interactionContext);
-        this.assertServiceGeneration(generation);
+        await this.jobStore.rollbackLogicalTurnClaim(streamId, interactionContext);
+      }
+      const sourceOrderObservation = sourceOrderObservationFromContext(interactionContext);
+      if (
+        (error as { code?: string })?.code === 'stream_id_conflict' &&
+        sourceOrderObservation &&
+        (await this.jobStore.observeSourceOrder(sourceOrderObservation)).stale
+      ) {
+        throw sourceOrderSupersededError();
       }
       throw error;
     }
-    /* === VIVENTIUM END === */
+
+    const persistedAdmission = await this.jobStore.getJob(streamId);
+    if (!persistedAdmission || persistedAdmission.status !== 'running') {
+      if (!runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('superseded');
+      }
+      this.runtimeState.delete(streamId);
+      this.eventTransport.cleanup(streamId);
+      const sourceOrderObservation = sourceOrderObservationFromContext(interactionContext);
+      if (
+        sourceOrderObservation &&
+        (await this.jobStore.observeSourceOrder(sourceOrderObservation)).stale
+      ) {
+        throw sourceOrderSupersededError();
+      }
+      throw streamReceiptConflictError();
+    }
 
     /**
      * Create runtime state with readyPromise.
@@ -1058,27 +1959,8 @@ class GenerationJobManagerClass {
      * We resolve readyPromise immediately to eliminate startup latency.
      * The sync mechanism handles late-connecting clients.
      */
-    let resolveReady: () => void;
-    const readyPromise = new Promise<void>((resolve) => {
-      resolveReady = resolve;
-    });
-
-    const runtime: RuntimeJobState = {
-      nativeProducer: {
-        createdAt: jobData.createdAt,
-        responseMessageId: jobData.responseMessageId,
-      },
-      abortController: new AbortController(),
-      readyPromise,
-      resolveReady: resolveReady!,
-      syncSent: false,
-      earlyEventBuffer: [],
-      hasSubscriber: false,
-    };
-    this.runtimeState.set(streamId, runtime);
-
     // Resolve immediately - early event buffer handles late subscribers
-    resolveReady!();
+    resolveReady();
 
     /**
      * Set up all-subscribers-left callback.
@@ -1086,21 +1968,21 @@ class GenerationJobManagerClass {
      * 1. Resets syncSent so reconnecting clients get sync event (persisted to Redis)
      * 2. Calls any registered allSubscribersLeft handlers (e.g., to save partial responses)
      */
-    eventTransport.onAllSubscribersLeft(streamId, () => {
-      if (generation !== this.serviceGeneration) {
-        return;
-      }
+    this.eventTransport.onAllSubscribersLeft(streamId, () => {
       const currentRuntime = this.runtimeState.get(streamId);
-      if (currentRuntime === runtime) {
+      if (currentRuntime) {
         currentRuntime.syncSent = false;
         currentRuntime.hasSubscriber = false;
         // Persist syncSent=false to Redis for cross-replica consistency
-        jobStore.updateJob(streamId, { syncSent: false }).catch((err) => {
-          logger.error(`[GenerationJobManager] Failed to persist syncSent=false:`, err);
+        this.jobStore.updateJob(streamId, { syncSent: false }).catch((err) => {
+          logger.error(
+            `[GenerationJobManager] Failed to persist syncSent=false ${streamLogRef(streamId)}`,
+            safeStreamLogError(err),
+          );
         });
         // Call registered handlers (from job.emitter.on('allSubscribersLeft', ...))
         if (currentRuntime.allSubscribersLeftHandlers) {
-          jobStore
+          this.jobStore
             .getContentParts(streamId)
             .then((result) => {
               const parts = result?.content ?? [];
@@ -1108,68 +1990,74 @@ class GenerationJobManagerClass {
                 try {
                   handler(parts);
                 } catch (err) {
-                  logger.error(`[GenerationJobManager] Error in allSubscribersLeft handler:`, err);
+                  logger.error(
+                    `[GenerationJobManager] Error in allSubscribersLeft handler ${streamLogRef(streamId)}`,
+                    safeStreamLogError(err),
+                  );
                 }
               }
             })
             .catch((err) => {
               logger.error(
-                `[GenerationJobManager] Failed to get content parts for allSubscribersLeft handlers:`,
-                err,
+                `[GenerationJobManager] Failed to get content parts for allSubscribersLeft handlers ${streamLogRef(streamId)}`,
+                safeStreamLogError(err),
               );
             });
         }
       }
     });
 
-    /**
-     * Set up cross-replica abort listener (Redis mode only).
-     * When abort is triggered on ANY replica, this replica receives the signal
-     * and aborts its local AbortController (if it's the one running generation).
-     */
-    if (eventTransport.onAbort) {
-      const nativeProducer = runtime.nativeProducer;
-      try {
-        /* === VIVENTIUM START ===
-         * Purpose: Do not report a Redis-backed job as created until its
-         * cross-replica abort channel is actually live.
-         * === VIVENTIUM END === */
-        await eventTransport.onAbort(streamId, (reason, proof) => {
-          if (
-            generation !== this.serviceGeneration ||
-            (proof &&
-              proof !==
-                nativeJobProofJson({
-                  ...jobData,
-                  responseMessageId: nativeProducer?.responseMessageId ?? jobData.responseMessageId,
-                }))
-          ) {
-            return;
-          }
-          const currentRuntime = this.runtimeState.get(streamId);
-          if (currentRuntime === runtime && !currentRuntime.abortController.signal.aborted) {
-            logger.debug(`[GenerationJobManager] Received cross-replica abort for ${streamId}`);
-            currentRuntime.abortController.abort(reason);
-          }
+    logger.debug(`[GenerationJobManager] Created job ${streamLogRef(streamId)}`);
+
+    const supersededPresentations: NonNullable<t.GenerationJob['supersededPresentations']> = [];
+    let nativePredecessor: NativePredecessor | undefined;
+    for (const supersededStreamId of supersededStreamIds) {
+      const supersededJob =
+        supersededStreamId === streamId && sameStreamSupersededJob
+          ? sameStreamSupersededJob
+          : await this.jobStore.getJob(supersededStreamId);
+      const previousNative = supersededJob?.nativeResponse;
+      if (
+        supersededStreamIds.length === 1 &&
+        supersededStreamId !== streamId &&
+        previousNative &&
+        interactionContext &&
+        supersededJob.userId === userId &&
+        supersededJob.conversationId === conversationId &&
+        previousNative.logicalTurnId === interactionContext?.logical_turn_id &&
+        previousNative.revision + 1 === interactionContext.revision &&
+        supersededJob.responseMessageId === previousNative.responseMessageId
+      ) {
+        nativePredecessor = {
+          streamId: supersededStreamId,
+          createdAt: supersededJob.createdAt,
+          responseMessageId: previousNative.responseMessageId,
+          invocationId: previousNative.invocationId,
+        };
+      }
+      if (
+        !['committed', 'committed_effect'].includes(
+          supersededJob?.deliveryAcknowledgement?.state ?? '',
+        )
+      ) {
+        supersededPresentations.push({
+          conversationId: supersededJob?.conversationId,
+          responseMessageId: supersededJob?.responseMessageId,
+          userMessageId: supersededJob?.userMessage?.messageId,
+          interactionContext: supersededJob?.interactionContext,
         });
-        this.assertServiceGeneration(generation);
-      } catch (error) {
-        if (generation === this.serviceGeneration) {
-          eventTransport.cleanup(streamId);
-          if (this.runtimeState.get(streamId) === runtime) {
-            this.runtimeState.delete(streamId);
-          }
-          await jobStore.deleteJob(streamId);
-        }
-        throw error;
+      }
+      if (nativePredecessor) {
+        await this.jobStore.updateJob(streamId, { nativePredecessor });
+        jobData.nativePredecessor = nativePredecessor;
+      }
+      if (supersededStreamId !== streamId) {
+        await this.supersedeJob(supersededStreamId);
       }
     }
 
-    logger.debug(`[GenerationJobManager] Created job: ${streamId}`);
-
-
     // Return facade for backwards compatibility
-    const facade = this.buildJobFacade(streamId, jobData, runtime, eventTransport);
+    const facade = this.buildJobFacade(streamId, jobData, runtime);
     facade.supersededPresentations = supersededPresentations;
     return facade;
   }
@@ -1202,7 +2090,6 @@ class GenerationJobManagerClass {
     streamId: string,
     jobData: SerializableJobData,
     runtime: RuntimeJobState,
-    eventTransport: IEventTransport,
   ): t.GenerationJob {
     /**
      * Proxy emitter that delegates to eventTransport for most operations.
@@ -1222,11 +2109,11 @@ class GenerationJobManagerClass {
       emit: () => {
         /* handled via eventTransport */
       },
-      listenerCount: () => eventTransport.getSubscriberCount(streamId),
+      listenerCount: () => this.eventTransport.getSubscriberCount(streamId),
       setMaxListeners: () => {
         /* no-op for proxy */
       },
-      removeAllListeners: () => eventTransport.cleanup(streamId),
+      removeAllListeners: () => this.eventTransport.cleanup(streamId),
       off: () => {
         /* handled via unsubscribe */
       },
@@ -1251,6 +2138,11 @@ class GenerationJobManagerClass {
         adapterCapabilities: jobData.adapterCapabilities,
         deliveryPolicy: jobData.deliveryPolicy,
         deliveryAcknowledgement: jobData.deliveryAcknowledgement,
+        durableEffectReceipt: jobData.durableEffectReceipt,
+        durableEffectReceipts: jobData.durableEffectReceipts,
+        viventiumVoiceEffectAuthority: jobData.viventiumVoiceEffectAuthority,
+        viventiumCallSessionId: jobData.viventiumCallSessionId,
+        viventiumVoiceTaskId: jobData.viventiumVoiceTaskId,
         generationCompleted: jobData.generationCompleted,
         cortexPresentation: jobData.cortexPresentation,
       },
@@ -1279,138 +2171,173 @@ class GenerationJobManagerClass {
    */
   private async getOrCreateRuntimeState(
     streamId: string,
-    services: ServiceGenerationSnapshot,
+    lifecycle: ManagerLifecycleSnapshot = this.captureLifecycle(),
+    persistedJob?: SerializableJobData,
   ): Promise<RuntimeJobState | null> {
-    const { generation, jobStore, eventTransport } = services;
-    this.assertServiceGeneration(generation);
-    const existingRuntime = this.runtimeState.get(streamId);
-    if (existingRuntime) {
-      return existingRuntime;
+    /* === VIVENTIUM START ===
+     * Feature: Stream-manager lifecycle fencing.
+     * Purpose: Lazy Redis hydration must fail closed when destroy/reconfigure wins.
+     */
+    if (!this.isLifecycleCurrent(lifecycle)) {
+      throw streamManagerUnavailableError();
     }
 
-    // Job doesn't exist locally - check Redis
-    const jobData = await jobStore.getJob(streamId);
-    this.assertServiceGeneration(generation);
+    const existingRuntime = this.runtimeState.get(streamId);
+    if (existingRuntime) {
+      return this.awaitRuntimeInitialization(streamId, existingRuntime, lifecycle);
+    }
+
+    const jobData =
+      persistedJob ??
+      (await this.runLifecycleOperation(lifecycle, () => lifecycle.jobStore.getJob(streamId)));
+    this.assertLifecycleOperation(lifecycle);
     if (!jobData) {
       return null;
     }
 
-    // Cross-replica scenario: job exists in Redis but not locally
-    // Create minimal runtime state for handling reconnection/subscription
-    logger.debug(`[GenerationJobManager] Creating cross-replica runtime for ${streamId}`);
+    const concurrentlyInitializedRuntime = this.runtimeState.get(streamId);
+    if (concurrentlyInitializedRuntime) {
+      return this.awaitRuntimeInitialization(streamId, concurrentlyInitializedRuntime, lifecycle);
+    }
 
-    let resolveReady: () => void;
+    logger.debug(
+      `[GenerationJobManager] Creating cross-replica runtime for ${streamLogRef(streamId)}`,
+    );
+
+    let resolveReady!: () => void;
     const readyPromise = new Promise<void>((resolve) => {
       resolveReady = resolve;
     });
+    resolveReady();
 
-    // For jobs created on other replicas, readyPromise should be pre-resolved
-    // since generation has already started
-    resolveReady!();
-
-    // Parse finalEvent from Redis if available
     let finalEvent: t.ServerSentEvent | undefined;
     if (jobData.finalEvent) {
       try {
         finalEvent = JSON.parse(jobData.finalEvent) as t.ServerSentEvent;
       } catch {
-        // Ignore parse errors
+        // Ignore malformed persisted terminal data; the durable status still controls replay.
       }
     }
 
     const runtime: RuntimeJobState = {
       abortController: new AbortController(),
       readyPromise,
-      resolveReady: resolveReady!,
+      resolveReady,
       syncSent: jobData.syncSent ?? false,
       earlyEventBuffer: [],
       hasSubscriber: false,
       finalEvent,
       errorEvent: jobData.error,
+      presentationOnly:
+        jobData.generationCompleted === true &&
+        jobData.deliveryPolicy?.commit_authority === 'external_adapter' &&
+        ['committed', 'committed_effect'].includes(jobData.deliveryAcknowledgement?.state ?? ''),
     };
 
     this.runtimeState.set(streamId, runtime);
 
-    // Set up all-subscribers-left callback for this replica
-    eventTransport.onAllSubscribersLeft(streamId, () => {
-      if (generation !== this.serviceGeneration) {
-        return;
-      }
-      const currentRuntime = this.runtimeState.get(streamId);
-      if (currentRuntime === runtime) {
+    runtime.initializationReady = (async () => {
+      lifecycle.eventTransport.onAllSubscribersLeft(streamId, () => {
+        const currentRuntime = this.runtimeState.get(streamId);
+        if (!this.isLifecycleCurrent(lifecycle) || currentRuntime !== runtime) {
+          return;
+        }
         currentRuntime.syncSent = false;
         currentRuntime.hasSubscriber = false;
-        // Persist syncSent=false to Redis
-        jobStore.updateJob(streamId, { syncSent: false }).catch((err) => {
-          logger.error(`[GenerationJobManager] Failed to persist syncSent=false:`, err);
+        lifecycle.jobStore.updateJob(streamId, { syncSent: false }).catch((err) => {
+          logger.error(
+            `[GenerationJobManager] Failed to persist syncSent=false ${streamLogRef(streamId)}`,
+            safeStreamLogError(err),
+          );
         });
-        // Call registered handlers
         if (currentRuntime.allSubscribersLeftHandlers) {
-          jobStore
+          lifecycle.jobStore
             .getContentParts(streamId)
             .then((result) => {
+              if (!this.isLifecycleCurrent(lifecycle)) {
+                return;
+              }
               const parts = result?.content ?? [];
               for (const handler of currentRuntime.allSubscribersLeftHandlers ?? []) {
                 try {
                   handler(parts);
                 } catch (err) {
-                  logger.error(`[GenerationJobManager] Error in allSubscribersLeft handler:`, err);
+                  logger.error(
+                    `[GenerationJobManager] Error in allSubscribersLeft handler ${streamLogRef(streamId)}`,
+                    safeStreamLogError(err),
+                  );
                 }
               }
             })
             .catch((err) => {
               logger.error(
-                `[GenerationJobManager] Failed to get content parts for allSubscribersLeft handlers:`,
-                err,
+                `[GenerationJobManager] Failed to get content parts for allSubscribersLeft handlers ${streamLogRef(streamId)}`,
+                safeStreamLogError(err),
               );
             });
         }
-      }
-    });
+      });
 
-    // Set up cross-replica abort listener (Redis mode only)
-    // This ensures lazily-initialized jobs can receive abort signals
-    if (eventTransport.onAbort) {
-      const nativeProducer = runtime.nativeProducer;
-      try {
-        /* === VIVENTIUM START ===
-         * Purpose: A lazily created replica runtime is usable only after its
-         * abort subscription is acknowledged.
-         * === VIVENTIUM END === */
-        await eventTransport.onAbort(streamId, (reason, proof) => {
-          if (
-            generation !== this.serviceGeneration ||
-            (proof &&
-              proof !==
-                nativeJobProofJson({
-                  ...jobData,
-                  responseMessageId: nativeProducer?.responseMessageId ?? jobData.responseMessageId,
-                }))
-          ) {
-            return;
-          }
-          const currentRuntime = this.runtimeState.get(streamId);
-          if (currentRuntime === runtime && !currentRuntime.abortController.signal.aborted) {
-            logger.debug(
-              `[GenerationJobManager] Received cross-replica abort for lazily-init job ${streamId}`,
-            );
-            currentRuntime.abortController.abort(reason);
-          }
-        });
-        this.assertServiceGeneration(generation);
-      } catch (error) {
-        if (generation === this.serviceGeneration) {
-          eventTransport.cleanup(streamId);
-          if (this.runtimeState.get(streamId) === runtime) {
-            this.runtimeState.delete(streamId);
-          }
-        }
-        throw error;
+      if (lifecycle.eventTransport.onAbort) {
+        await awaitLifecycle(
+          lifecycle.eventTransport.onAbort(streamId, (reason, proof) => {
+            const currentRuntime = this.runtimeState.get(streamId);
+            if (
+              currentRuntime?.nativeProducer?.createdAt !== jobData.createdAt ||
+              (proof &&
+                proof !==
+                  nativeJobProofJson({
+                    ...jobData,
+                    responseMessageId:
+                      currentRuntime.nativeProducer.responseMessageId ?? jobData.responseMessageId,
+                  }))
+            ) {
+              return;
+            }
+            if (
+              this.isLifecycleCurrent(lifecycle) &&
+              currentRuntime === runtime &&
+              !currentRuntime.abortController.signal.aborted
+            ) {
+              logger.debug(
+                `[GenerationJobManager] Received cross-replica abort for lazily-init job ${streamLogRef(streamId)}`,
+              );
+              currentRuntime.abortController.abort(reason ?? 'user_cancelled');
+            }
+          }),
+          lifecycle.signal,
+        );
       }
+
+      if (!this.isLifecycleCurrent(lifecycle) || this.runtimeState.get(streamId) !== runtime) {
+        throw streamManagerUnavailableError();
+      }
+    })();
+
+    try {
+      await runtime.initializationReady;
+      return runtime;
+    } catch (error) {
+      if (!runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('manager_lifecycle_changed');
+      }
+      const currentRuntime = this.runtimeState.get(streamId);
+      const lifecycleChanged = !this.isLifecycleCurrent(lifecycle);
+      if (currentRuntime === runtime) {
+        this.runtimeState.delete(streamId);
+      }
+      if (
+        currentRuntime === runtime ||
+        (lifecycleChanged && lifecycle.eventTransport !== this.eventTransport)
+      ) {
+        lifecycle.eventTransport.cleanup(streamId);
+      }
+      if (lifecycleChanged) {
+        throw streamManagerUnavailableError();
+      }
+      throw error;
     }
-
-    this.assertServiceGeneration(generation);
-    return runtime;
+    /* === VIVENTIUM END === */
   }
 
   /**
@@ -1418,23 +2345,26 @@ class GenerationJobManagerClass {
    */
   async getJob(streamId: string): Promise<t.GenerationJob | undefined> {
     /* === VIVENTIUM START ===
-     * Purpose: A lazy lookup may outlive teardown; never let it attach old job
-     * data or callbacks to replacement services.
+     * Feature: Stream-manager lifecycle fencing.
+     * Purpose: One getJob call may not mix persisted data and runtime state across generations.
      */
-    const services = this.captureServices();
-    const jobData = await services.jobStore.getJob(streamId);
-    this.assertServiceGeneration(services.generation);
+    const lifecycle = this.captureLifecycle();
+    if (!this.isLifecycleCurrent(lifecycle)) {
+      throw streamManagerUnavailableError();
+    }
+    const jobData = await this.runLifecycleOperation(lifecycle, () =>
+      lifecycle.jobStore.getJob(streamId),
+    );
     if (!jobData) {
       return undefined;
     }
 
-    const runtime = await this.getOrCreateRuntimeState(streamId, services);
-    this.assertServiceGeneration(services.generation);
+    const runtime = await this.getOrCreateRuntimeState(streamId, lifecycle, jobData);
     if (!runtime) {
       return undefined;
     }
 
-    return this.buildJobFacade(streamId, jobData, runtime, services.eventTransport);
+    return this.buildJobFacade(streamId, jobData, runtime);
     /* === VIVENTIUM END === */
   }
 
@@ -1442,19 +2372,14 @@ class GenerationJobManagerClass {
    * Check if a job exists.
    */
   async hasJob(streamId: string): Promise<boolean> {
-    const services = this.captureServices();
-    const hasJob = await services.jobStore.hasJob(streamId);
-    this.assertServiceGeneration(services.generation);
-    return hasJob;
+    return this.jobStore.hasJob(streamId);
   }
 
   /**
    * Get job status.
    */
   async getJobStatus(streamId: string): Promise<t.GenerationJobStatus | undefined> {
-    const services = this.captureServices();
-    const jobData = await services.jobStore.getJob(streamId);
-    this.assertServiceGeneration(services.generation);
+    const jobData = await this.jobStore.getJob(streamId);
     return jobData?.status as t.GenerationJobStatus | undefined;
   }
 
@@ -1468,19 +2393,29 @@ class GenerationJobManagerClass {
     streamId: string,
     finalEvent?: t.ServerSentEvent,
   ): Promise<boolean> {
-    const job = await this.jobStore.getJob(streamId);
+    const lifecycle = this.captureLifecycle();
+    const job = await this.runLifecycleOperation(lifecycle, () =>
+      lifecycle.jobStore.getJob(streamId),
+    );
     if (!job || job.status !== 'running' || job.nativeResponse) {
       return false;
     }
     const runtime = this.runtimeState.get(streamId);
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
     if (runtime && finalEvent) {
       runtime.finalEvent = finalEvent;
     }
-    await this.jobStore.updateJob(streamId, {
-      status: 'complete',
-      completedAt: Date.now(),
-      ...(finalEvent ? { finalEvent: JSON.stringify(finalEvent) } : {}),
-    });
+    await this.runLifecycleOperation(
+      lifecycle,
+      () =>
+        lifecycle.jobStore.updateJob(streamId, {
+          status: 'complete',
+          completedAt: Date.now(),
+          ...(finalEvent ? { finalEvent: JSON.stringify(finalEvent) } : {}),
+        }),
+      streamId,
+      runtime,
+    );
     return true;
   }
 
@@ -1511,55 +2446,201 @@ class GenerationJobManagerClass {
     }
     const runtime = this.runtimeState.get(streamId);
     const stopsAuthoring = jobData.adapterCapabilities?.supersede_scope !== 'response_only';
+    const durableReceipt = jobData.durableEffectReceipt;
+    const presentationEvent = durableReceipt
+      ? buildDurableWorkReceiptFinalEvent(jobData, durableReceipt.response_message_id)
+      : terminalEvent;
+    const waitsForDurableEffectDecision =
+      !stopsAuthoring && jobData.status === 'running' && !durableReceipt;
     if (stopsAuthoring && runtime && !runtime.abortController.signal.aborted) {
       runtime.abortController.abort('superseded');
     }
     if (runtime) {
       runtime.nativeProducer = undefined;
-      runtime.finalEvent = terminalEvent;
-    }
-    if (stopsAuthoring) {
-      this.eventTransport.emitAbort?.(streamId, 'superseded');
+      if (!waitsForDurableEffectDecision) {
+        runtime.finalEvent = presentationEvent;
+      }
     }
     await this.jobStore.updateJob(streamId, {
       status: 'superseded',
       completedAt: Date.now(),
-      finalEvent: JSON.stringify(terminalEvent),
+      ...(waitsForDurableEffectDecision ? {} : { finalEvent: JSON.stringify(presentationEvent) }),
     });
+    if (waitsForDurableEffectDecision) {
+      const supersededJob = await this.jobStore.getJob(streamId);
+      const supersededReceipt = supersededJob?.durableEffectReceipt;
+      if (
+        supersededJob?.status === 'superseded' &&
+        supersededReceipt &&
+        !hasDurableWorkReceiptFinalEvent(supersededJob)
+      ) {
+        const receiptEvent = buildDurableWorkReceiptFinalEvent(
+          supersededJob,
+          supersededReceipt.response_message_id,
+        );
+        if (runtime) {
+          runtime.finalEvent = receiptEvent;
+        }
+        await this.jobStore.updateJob(streamId, {
+          finalEvent: JSON.stringify(receiptEvent),
+        });
+        try {
+          await this.eventTransport.emitDone(streamId, receiptEvent);
+        } catch {
+          logger.warn(
+            '[GenerationJobManager] Durable receipt notification unavailable after supersession',
+          );
+        }
+      }
+    }
+    if (stopsAuthoring) {
+      try {
+        await this.eventTransport.emitAbort?.(streamId, 'superseded');
+      } catch {
+        logger.warn('[GenerationJobManager] Supersession signal unavailable after durable fence');
+      }
+    }
     if (stopsAuthoring) {
       this.jobStore.clearContentState(streamId);
       this.runStepBuffers?.delete(streamId);
     }
-    await this.eventTransport.emitDone(streamId, terminalEvent);
-    logger.debug(`[GenerationJobManager] Job superseded: ${streamId}`);
+    /* === VIVENTIUM START ===
+     * Feature: Durable logical-turn supersession.
+     * Purpose: Terminal delivery is best-effort after the old and new revisions are committed.
+     */
+    if (!waitsForDurableEffectDecision) {
+      try {
+        await this.eventTransport.emitDone(streamId, presentationEvent);
+      } catch {
+        logger.warn(
+          '[GenerationJobManager] Superseded terminal notification unavailable after durable fence',
+        );
+      }
+    }
+    /* === VIVENTIUM END === */
+    logger.debug(`[GenerationJobManager] Job superseded ${streamLogRef(streamId)}`);
   }
 
   private async finalizeCompletedJob(
     streamId: string,
     preserveJob = false,
-    services: ServiceGenerationSnapshot = this.captureServices(),
+    lifecycle: ManagerLifecycleSnapshot = this.captureLifecycle(),
+    runtime: RuntimeJobState | undefined = this.runtimeState.get(streamId),
   ): Promise<void> {
-    const { generation, jobStore, cleanupOnComplete } = services;
-    const runtime = this.runtimeState.get(streamId);
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
     if (runtime && !runtime.abortController.signal.aborted) {
-      runtime.abortController.abort('generation_completed');
+      if (preserveJob) {
+        // External adapters may still present one exact, durable Phase B follow-up after Main has
+        // committed. Close ordinary authoring without aborting that separately fenced delivery.
+        runtime.presentationOnly = true;
+      } else {
+        runtime.abortController.abort('generation_completed');
+      }
     }
-    jobStore.clearContentState(streamId);
+    lifecycle.jobStore.clearContentState(streamId);
     this.runStepBuffers?.delete(streamId);
-    await jobStore.completeLogicalTurn(streamId);
-    this.assertServiceGeneration(generation);
-    if (cleanupOnComplete && !preserveJob) {
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.completeLogicalTurn(streamId),
+      streamId,
+      runtime,
+    );
+    if (lifecycle.cleanupOnComplete && !preserveJob) {
+      await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.deleteJob(streamId),
+        streamId,
+        runtime,
+      );
       this.runtimeState.delete(streamId);
-      await jobStore.deleteJob(streamId);
-      this.assertServiceGeneration(generation);
       return;
     }
-    await jobStore.updateJob(streamId, {
-      status: 'complete',
-      completedAt: Date.now(),
-      generationCompleted: true,
-    });
-    this.assertServiceGeneration(generation);
+    await this.runLifecycleOperation(
+      lifecycle,
+      () =>
+        lifecycle.jobStore.updateJob(streamId, {
+          status: 'complete',
+          completedAt: Date.now(),
+          generationCompleted: true,
+        }),
+      streamId,
+      runtime,
+    );
+  }
+
+  /**
+   * Resolve the response-only window once stale authoring reaches a real terminal boundary. The
+   * newer turn suppresses prose, but an exact durable-work receipt still wins presentation.
+   */
+  private async finishResponseOnlySupersededJob(
+    streamId: string,
+    lifecycle: ManagerLifecycleSnapshot,
+    runtime: RuntimeJobState | undefined,
+    error?: string,
+  ): Promise<boolean> {
+    const job = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
+    if (
+      job?.status !== 'superseded' ||
+      job.adapterCapabilities?.supersede_scope !== 'response_only'
+    ) {
+      return false;
+    }
+    const receipt = job.durableEffectReceipt;
+    const finalEvent = receipt
+      ? buildDurableWorkReceiptFinalEvent(job, receipt.response_message_id)
+      : ({
+          final: true,
+          superseded: true,
+          logical_turn_id: job.interactionContext?.logical_turn_id,
+          revision: job.interactionContext?.revision,
+        } as unknown as t.ServerSentEvent);
+    const terminalAlreadyPresented = hasResponseOnlySupersededFinalEvent(job);
+    if (runtime) {
+      runtime.finalEvent = finalEvent;
+      if (error) runtime.errorEvent = error;
+    }
+    await this.runLifecycleOperation(
+      lifecycle,
+      () =>
+        lifecycle.jobStore.updateJob(streamId, {
+          generationCompleted: true,
+          finalEvent: JSON.stringify(finalEvent),
+          ...(error ? { error } : {}),
+        }),
+      streamId,
+      runtime,
+    );
+    if (!terminalAlreadyPresented) {
+      try {
+        await this.runLifecycleOperation(
+          lifecycle,
+          () => lifecycle.eventTransport.emitDone(streamId, finalEvent),
+          streamId,
+          runtime,
+        );
+      } catch {
+        logger.warn(
+          '[GenerationJobManager] Superseded response terminal unavailable after durable fence',
+        );
+      }
+    }
+    if (runtime && !runtime.abortController.signal.aborted) {
+      runtime.abortController.abort('durable_stream_terminal');
+    }
+    lifecycle.jobStore.clearContentState(streamId);
+    this.runStepBuffers?.delete(streamId);
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.completeLogicalTurn(streamId),
+      streamId,
+      runtime,
+    );
+    return true;
   }
 
   /**
@@ -1573,94 +2654,119 @@ class GenerationJobManagerClass {
    */
   async completeJob(streamId: string, error?: string): Promise<void> {
     /* === VIVENTIUM START ===
-     * Purpose: Completion, logical-turn ownership, and presentation acknowledgement stay on one
-     * immutable service generation across shutdown and reconfiguration.
+     * Feature: Stream-manager lifecycle fencing.
+     * Purpose: Completion may only finalize the exact runtime and service generation it observed.
      */
-    const services = this.captureServices();
-    const { generation, jobStore, cleanupOnComplete } = services;
-    const existingJob = await jobStore.getJob(streamId);
-    this.assertServiceGeneration(generation);
-    const nativeRuntime = this.runtimeState.get(streamId);
-    if (nativeRuntime) {
-      nativeRuntime.nativeProducer = undefined;
+    const lifecycle = this.captureLifecycle();
+    const existingJob = await this.runLifecycleOperation(lifecycle, () =>
+      lifecycle.jobStore.getJob(streamId),
+    );
+    if (existingJob?.status === 'superseded') {
+      const runtime = this.runtimeState.get(streamId);
+      await this.finishResponseOnlySupersededJob(streamId, lifecycle, runtime, error);
+      return;
+    }
+    const runtime = this.runtimeState.get(streamId);
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
+    if (runtime) {
+      runtime.nativeProducer = undefined;
     }
     if (existingJob?.nativeResponse) {
-      if (existingJob.nativeResponseCancelled) return;
-      jobStore.clearContentState(streamId);
+      if (existingJob.nativeResponseCancelled) {
+        return;
+      }
+      lifecycle.jobStore.clearContentState(streamId);
       this.runStepBuffers?.delete(streamId);
       if (error && !existingJob.nativeResponseFinished) {
-        await jobStore.updateJob(streamId, { status: 'error', completedAt: Date.now(), error });
-        this.assertServiceGeneration(generation);
+        await this.runLifecycleOperation(
+          lifecycle,
+          () =>
+            lifecycle.jobStore.updateJob(streamId, {
+              status: 'error',
+              completedAt: Date.now(),
+              error,
+            }),
+          streamId,
+          runtime,
+        );
       }
-      return;
-    }
-    if (existingJob?.status === 'superseded') {
       return;
     }
 
+    // For error jobs, DON'T delete immediately - keep around so late-connecting
+    // clients can receive the error. This handles the race condition where error
+    // occurs before client connects to SSE stream.
+    //
+    // Cleanup strategy: Error jobs are cleaned up by periodic cleanup (every 60s)
+    // via jobStore.cleanup() which checks for jobs with status 'error' and
+    // completedAt set. The TTL is configurable via jobStore options (default: 0,
+    // meaning cleanup on next interval). This gives clients ~60s to connect and
+    // receive the error before the job is removed.
     if (error) {
-      const runtime = this.runtimeState.get(streamId);
       if (runtime && !runtime.abortController.signal.aborted) {
         runtime.abortController.abort('generation_completed');
       }
-      jobStore.clearContentState(streamId);
+      lifecycle.jobStore.clearContentState(streamId);
       this.runStepBuffers?.delete(streamId);
-      await jobStore.updateJob(streamId, {
-        status: 'error',
-        completedAt: Date.now(),
-        error,
-      });
-      this.assertServiceGeneration(generation);
-      await jobStore.completeLogicalTurn(streamId);
-      this.assertServiceGeneration(generation);
+      await this.runLifecycleOperation(
+        lifecycle,
+        () =>
+          lifecycle.jobStore.updateJob(streamId, {
+            status: 'error',
+            completedAt: Date.now(),
+            error,
+          }),
+        streamId,
+        runtime,
+      );
+      await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.completeLogicalTurn(streamId),
+        streamId,
+        runtime,
+      );
+      // Keep runtime state so subscribe() can access errorEvent
       logger.debug(
-        `[GenerationJobManager] Job completed with error (keeping for late subscribers): ${streamId}`,
+        `[GenerationJobManager] Job completed with error (keeping for late subscribers) ${streamLogRef(streamId)}`,
       );
       return;
     }
 
-    await jobStore.updateJob(streamId, {
-      status: 'complete',
-      completedAt: Date.now(),
-      generationCompleted: true,
-    });
-    this.assertServiceGeneration(generation);
-    const refreshedJob = await jobStore.getJob(streamId);
-    this.assertServiceGeneration(generation);
+    await this.runLifecycleOperation(
+      lifecycle,
+      () =>
+        lifecycle.jobStore.updateJob(streamId, {
+          status: 'complete',
+          completedAt: Date.now(),
+          generationCompleted: true,
+        }),
+      streamId,
+      runtime,
+    );
+    const refreshedJob = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
     const hasTrustedLifecycle = Boolean(refreshedJob?.interactionContext?.logical_turn_id);
-    const presentationCommitted = refreshedJob?.deliveryAcknowledgement?.state === 'committed';
+    const presentationCommitted = ['committed', 'committed_effect'].includes(
+      refreshedJob?.deliveryAcknowledgement?.state ?? '',
+    );
     if (hasTrustedLifecycle && !presentationCommitted) {
       logger.debug(
-        `[GenerationJobManager] Generation complete; awaiting presentation acknowledgement: ${streamId}`,
+        `[GenerationJobManager] Generation complete; awaiting presentation acknowledgement ${streamLogRef(streamId)}`,
       );
       return;
     }
+    await this.finalizeCompletedJob(
+      streamId,
+      refreshedJob?.deliveryPolicy?.commit_authority === 'external_adapter',
+      lifecycle,
+      runtime,
+    );
 
-    if (hasTrustedLifecycle) {
-      await this.finalizeCompletedJob(
-        streamId,
-        refreshedJob?.deliveryPolicy?.commit_authority === 'external_adapter',
-        services,
-      );
-      this.assertServiceGeneration(generation);
-    } else {
-      const runtime = this.runtimeState.get(streamId);
-      if (runtime && !runtime.abortController.signal.aborted) {
-        runtime.abortController.abort('generation_completed');
-      }
-      jobStore.clearContentState(streamId);
-      this.runStepBuffers?.delete(streamId);
-      if (cleanupOnComplete) {
-        await jobStore.deleteJob(streamId);
-        this.assertServiceGeneration(generation);
-      }
-      if (!runtime || this.runtimeState.get(streamId) === runtime) {
-        this.runtimeState.delete(streamId);
-      }
-    }
-    await this.finalizeCompletedJob(streamId);
-
-    logger.debug(`[GenerationJobManager] Job completed: ${streamId}`);
+    logger.debug(`[GenerationJobManager] Job completed ${streamLogRef(streamId)}`);
     /* === VIVENTIUM END === */
   }
 
@@ -1672,11 +2778,6 @@ class GenerationJobManagerClass {
    * - Emits abort signal via Redis pub/sub
    * - The replica running generation receives signal and aborts its AbortController
    */
-  /* === VIVENTIUM START ===
-   * Feature: Preserve explicit user-cancellation intent across provider boundaries.
-   * Purpose: A browser Stop must carry a distinct reason to harness-backed providers, while
-   * disconnect and transport aborts keep their existing reasonless/resumable behavior.
-   * === VIVENTIUM END === */
   async abortJob(
     streamId: string,
     reason?: unknown,
@@ -1866,7 +2967,7 @@ class GenerationJobManagerClass {
     let abortFinalEvent: t.ServerSentEvent | undefined;
     let nativeReplay: import('./interfaces/IJobStore').NativeResponseReplayGuard | undefined;
     if (nativeSnapshot && nativeIdentity) {
-      const nativeRuntime = await this.getOrCreateRuntimeState(streamId, services);
+      const nativeRuntime = await this.getOrCreateRuntimeState(streamId);
       this.assertServiceGeneration(generation);
       if (!nativeRuntime || !(await sameJob())) return cancellationUnavailable();
       runtime = nativeRuntime;
@@ -2140,7 +3241,6 @@ class GenerationJobManagerClass {
    * @param onChunk - Handler for chunk events (streamed tokens, run steps, etc.)
    * @param onDone - Handler for completion event (includes final message)
    * @param onError - Handler for error events
-   * @param signal - Optional request-lifetime cancellation signal
    * @returns Subscription object with unsubscribe function, or null if job not found
    */
   async subscribe(
@@ -2151,11 +3251,10 @@ class GenerationJobManagerClass {
     signal?: AbortSignal,
   ): Promise<{ unsubscribe: t.UnsubscribeFn } | null> {
     /* === VIVENTIUM START ===
-     * Purpose: Keep lazy runtime lookup, stored status, subscription readiness,
-     * and post-readiness mutation on one service generation.
+     * Feature: Stream-manager lifecycle fencing.
+     * Purpose: An SSE subscription cannot escape before its exact lifecycle/channel is ready.
      */
-    const services = this.captureServices();
-    const { generation, jobStore, eventTransport } = services;
+    const lifecycle = this.captureLifecycle();
     const createCancellationError = () => {
       const error = new Error('Generation stream subscription cancelled');
       error.name = 'AbortError';
@@ -2165,8 +3264,7 @@ class GenerationJobManagerClass {
       throw createCancellationError();
     }
     // Use lazy initialization to support cross-replica subscriptions
-    const runtime = await this.getOrCreateRuntimeState(streamId, services);
-    this.assertServiceGeneration(generation);
+    const runtime = await this.getOrCreateRuntimeState(streamId, lifecycle);
     if (signal?.aborted) {
       throw createCancellationError();
     }
@@ -2174,8 +3272,12 @@ class GenerationJobManagerClass {
       return null;
     }
 
-    const jobData = await jobStore.getJob(streamId);
-    this.assertServiceGeneration(generation);
+    const jobData = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
     if (signal?.aborted) {
       throw createCancellationError();
     }
@@ -2183,9 +3285,7 @@ class GenerationJobManagerClass {
     // If job already complete/error, send final event or error
     // Error status takes precedence to ensure errors aren't misreported as successes
     setImmediate(() => {
-      // Native replay must cross the same retirement fence as recovery publication.
-      if (jobData?.nativeResponse) return;
-      if (generation !== this.serviceGeneration || this.runtimeState.get(streamId) !== runtime) {
+      if (!this.isLifecycleCurrent(lifecycle) || this.runtimeState.get(streamId) !== runtime) {
         return;
       }
       if (jobData && ['complete', 'error', 'aborted', 'superseded'].includes(jobData.status)) {
@@ -2194,7 +3294,7 @@ class GenerationJobManagerClass {
           const errorToSend = runtime.errorEvent ?? jobData.error;
           if (errorToSend) {
             logger.debug(
-              `[GenerationJobManager] Sending stored error to late subscriber: ${streamId}`,
+              `[GenerationJobManager] Sending stored error to late subscriber ${streamLogRef(streamId)}`,
             );
             onError?.(errorToSend);
           }
@@ -2204,17 +3304,9 @@ class GenerationJobManagerClass {
       }
     });
 
-    /* === VIVENTIUM START ===
-     * Purpose: The transport may install its local callback before the backing
-     * subscription is acknowledged. Keep user delivery behind the readiness
-     * boundary and let earlyEventBuffer provide the one authoritative replay.
-     */
-    let transportReady = false;
-    let deliveredFinal: string | undefined;
-    const nativeProducer = runtime.nativeProducer;
-    const subscription = eventTransport.subscribe(streamId, {
+    const subscription = lifecycle.eventTransport.subscribe(streamId, {
       onChunk: (event) => {
-        if (!transportReady) {
+        if (!this.isLifecycleCurrent(lifecycle) || this.runtimeState.get(streamId) !== runtime) {
           return;
         }
         const e = event as t.ServerSentEvent;
@@ -2224,43 +3316,46 @@ class GenerationJobManagerClass {
         }
       },
       onDone: (event, proof) => {
+        const currentRuntime = this.runtimeState.get(streamId);
+        const expectedProof = nativeJobProofJson({
+          ...jobData!,
+          responseMessageId:
+            currentRuntime?.nativeProducer?.responseMessageId ?? jobData?.responseMessageId,
+        });
         if (
-          proof &&
-          (!jobData ||
-            proof !==
-              nativeJobProofJson({
-                ...jobData,
-                responseMessageId: nativeProducer?.responseMessageId ?? jobData.responseMessageId,
-              }))
-        )
-          return;
-        // Shared native replay must not repeat an identical FINAL on an existing connection.
-        // A distinct later terminal event (such as supersession) still reaches that connection.
-        const encoded = JSON.stringify(event);
-        if (deliveredFinal === encoded) return;
-        deliveredFinal = encoded;
-        onDone?.(event as t.ServerSentEvent);
+          this.isLifecycleCurrent(lifecycle) &&
+          currentRuntime === runtime &&
+          (proof === undefined || proof === expectedProof)
+        ) {
+          onDone?.(event as t.ServerSentEvent);
+        }
       },
-      onError,
+      onError: (error) => {
+        if (this.isLifecycleCurrent(lifecycle) && this.runtimeState.get(streamId) === runtime) {
+          onError?.(error);
+        }
+      },
     });
 
-    /* === VIVENTIUM START ===
-     * Purpose: A Redis subscription is not live until Redis acknowledges it.
-     * Await that boundary before generation is allowed to publish its first
-     * chunk; otherwise fast first responses can be silently lost.
-     * === VIVENTIUM END === */
     let onAbort: () => void = () => undefined;
     try {
-      const cancellation = new Promise<never>((_, reject) => {
-        onAbort = () => reject(createCancellationError());
-        signal?.addEventListener('abort', onAbort, { once: true });
-        if (signal?.aborted) {
-          onAbort();
-        }
-      });
-      await (signal ? Promise.race([subscription.ready, cancellation]) : subscription.ready);
-      this.assertServiceGeneration(generation);
-      transportReady = true;
+      if (subscription.ready) {
+        const cancellation = new Promise<never>((_, reject) => {
+          onAbort = () => reject(createCancellationError());
+          signal?.addEventListener('abort', onAbort, { once: true });
+          if (signal?.aborted) {
+            onAbort();
+          }
+        });
+        await (signal
+          ? Promise.race([
+              this.runLifecycleOperation(lifecycle, () => subscription.ready!, streamId, runtime),
+              cancellation,
+            ])
+          : this.runLifecycleOperation(lifecycle, () => subscription.ready!, streamId, runtime));
+      } else {
+        this.assertLifecycleOperation(lifecycle, streamId, runtime);
+      }
     } catch (error) {
       subscription.unsubscribe();
       throw error;
@@ -2269,7 +3364,8 @@ class GenerationJobManagerClass {
     }
 
     // Check if this is the first subscriber
-    const isFirst = eventTransport.isFirstSubscriber(streamId);
+    const isFirst = lifecycle.eventTransport.isFirstSubscriber(streamId);
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
 
     // First subscriber: replay buffered events and mark as connected
     if (!runtime.hasSubscriber) {
@@ -2279,7 +3375,7 @@ class GenerationJobManagerClass {
        * stale expected sequence numbers can buffer fresh chunks until timeout.
        * === VIVENTIUM END === */
       if (isFirst) {
-        eventTransport.syncReorderBuffer?.(streamId);
+        lifecycle.eventTransport.syncReorderBuffer?.(streamId);
       }
 
       runtime.hasSubscriber = true;
@@ -2287,7 +3383,7 @@ class GenerationJobManagerClass {
       // Replay any events that were emitted before subscriber connected
       if (runtime.earlyEventBuffer.length > 0) {
         logger.debug(
-          `[GenerationJobManager] Replaying ${runtime.earlyEventBuffer.length} buffered events for ${streamId}`,
+          `[GenerationJobManager] Replaying ${runtime.earlyEventBuffer.length} buffered events for ${streamLogRef(streamId)}`,
         );
         for (const bufferedEvent of runtime.earlyEventBuffer) {
           onChunk(bufferedEvent);
@@ -2299,19 +3395,11 @@ class GenerationJobManagerClass {
     if (isFirst) {
       runtime.resolveReady();
       logger.debug(
-        `[GenerationJobManager] First subscriber ready, resolving promise for ${streamId}`,
+        `[GenerationJobManager] First subscriber ready, resolving promise for ${streamLogRef(streamId)}`,
       );
     }
 
-    this.assertServiceGeneration(generation);
-    if (jobData?.nativeResponse && jobData.nativeResponseFinished && runtime.finalEvent) {
-      try {
-        await this.finishNativeResponse(jobData.nativeResponse, runtime.finalEvent);
-      } catch (error) {
-        subscription.unsubscribe();
-        throw error;
-      }
-    }
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
     return subscription;
     /* === VIVENTIUM END === */
   }
@@ -2329,97 +3417,378 @@ class GenerationJobManagerClass {
   async emitChunk(
     streamId: string,
     event: t.ServerSentEvent,
-    nativePreviewIdentity?: NativeResponseIdentity,
-  ): Promise<void> {
-    /* === VIVENTIUM START ===
-     * Purpose: Streaming emits stay on one service generation through their
-     * asynchronous transport acknowledgement.
-     */
-    const services = this.captureServices();
-    const { generation, jobStore, eventTransport, isRedis } = services;
+    emission: ChunkEmissionOptions | NativeResponseIdentity = {},
+  ): Promise<ChunkEmissionReceipt> {
+    const nativePreviewIdentity =
+      'streamId' in emission ? (emission as NativeResponseIdentity) : undefined;
+    const options = nativePreviewIdentity ? {} : (emission as ChunkEmissionOptions);
+    const lifecycle = this.captureLifecycle();
+    const cortexEvent = event as {
+      event?: string;
+      data?: {
+        messageId?: string;
+        parentMessageId?: string;
+        presentationParentMessageId?: string;
+        revision?: number;
+        presentationGeneration?: number;
+        presentationClaimToken?: string;
+      };
+    };
+    const isCortexPresentationCandidate =
+      cortexEvent.event === 'on_cortex_followup' &&
+      String(cortexEvent.data?.messageId || '').trim() !== '';
     const runtime = this.runtimeState.get(streamId);
-    const allowAfterAbort =
-      (event as t.ServerSentEvent & { _viventiumAllowAfterAbort?: boolean })
-        ._viventiumAllowAfterAbort === true;
-    if (!runtime || (runtime.abortController.signal.aborted && !allowAfterAbort)) {
-      return;
+    if (
+      !runtime ||
+      runtime.abortController.signal.aborted ||
+      (runtime.presentationOnly === true && !isCortexPresentationCandidate)
+    ) {
+      return { delivered: false, streamId, reason: 'runtime_unavailable' };
     }
-    if (!(await this.jobStore.isCurrentLogicalTurn(streamId))) {
-      return;
+    if (
+      !(await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.isCurrentLogicalTurn(streamId),
+        streamId,
+        runtime,
+      ))
+    ) {
+      await this.stopRuntimeAfterDurableFence(streamId, lifecycle, runtime);
+      return { delivered: false, streamId, reason: 'logical_turn_inactive' };
     }
-
     if (nativePreviewIdentity) {
-      const job = await jobStore.getJob(streamId);
-      this.assertServiceGeneration(generation);
-      if (!nativeJobMatches(job, nativePreviewIdentity) || !job.nativeResponse ||
-          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(nativePreviewIdentity) ||
-          !this.hasLocalNativeResponseProducer(nativePreviewIdentity) ||
-          this.runtimeState.get(streamId) !== runtime || runtime.abortController.signal.aborted) {
-        return;
+      const job = await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.getJob(streamId),
+        streamId,
+        runtime,
+      );
+      if (
+        !nativeJobMatches(job, nativePreviewIdentity) ||
+        !job.nativeResponse ||
+        nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(nativePreviewIdentity) ||
+        !this.hasLocalNativeResponseProducer(nativePreviewIdentity) ||
+        this.runtimeState.get(streamId) !== runtime ||
+        runtime.abortController.signal.aborted
+      ) {
+        return { delivered: false, streamId, reason: 'runtime_unavailable' };
       }
     }
 
+    const messageId = String(cortexEvent.data?.messageId || '').trim();
+    const parentMessageId = String(
+      cortexEvent.data?.presentationParentMessageId || cortexEvent.data?.parentMessageId || '',
+    ).trim();
+    const revision = Math.max(1, Number(cortexEvent.data?.revision) || 1);
+    const isCortexPresentation = cortexEvent.event === 'on_cortex_followup' && !!messageId;
+    /* === VIVENTIUM START ===
+     * Feature: Exact Cortex presentation receipts.
+     * Purpose: Keep owner and graph-result identity stable through bind, append, and publish.
+     */
+    let presentationGeneration = 0;
+    let deliveryIds: string[] = [];
+    let deliveryReceipts: CortexPresentationBinding['deliveryReceipts'] = [];
+    let presentationOwnerId = '';
+    let presentationClaimToken = '';
+    let presentationLeaseToken = '';
+    let authorizedEvent = event;
+
+    const consumeCortexFault = async (
+      boundary: 'web_replay_persistence' | 'web_redis_publish_ack',
+    ): Promise<boolean> => {
+      if (!isCortexPresentation || typeof options.consumeCortexFault !== 'function') return false;
+      try {
+        return (await options.consumeCortexFault(boundary)).triggered === true;
+      } catch {
+        return false;
+      }
+    };
+
+    const verifyCurrentCortexPresentation = async (stage: 'bind' | 'append' | 'publish') => {
+      if (!isCortexPresentation || typeof options.verifyCortexPresentation !== 'function') {
+        return false;
+      }
+      const verified = await options.verifyCortexPresentation(stage);
+      const verifiedMessageId = String(verified?.messageId || '').trim();
+      const verifiedParentMessageId = String(verified?.parentMessageId || '').trim();
+      const verifiedRevision = Math.max(0, Number(verified?.revision) || 0);
+      const verifiedGeneration = Math.max(0, Number(verified?.generation) || 0);
+      const verifiedOwnerId = String(verified?.ownerId || '').trim();
+      const verifiedClaimToken = String(verified?.claimToken || '').trim();
+      const verifiedPresentationLeaseToken = String(verified?.presentationLeaseToken || '').trim();
+      const verifiedDeliveryIds = [
+        ...new Set(
+          (Array.isArray(verified?.deliveryIds) ? verified.deliveryIds : [])
+            .map((deliveryId) => String(deliveryId || '').trim())
+            .filter(Boolean),
+        ),
+      ].sort();
+      const verifiedDeliveryReceipts = (
+        Array.isArray(verified?.deliveryReceipts) ? verified.deliveryReceipts : []
+      )
+        .map((deliveryReceipt) => ({
+          deliveryId: String(deliveryReceipt?.deliveryId || '').trim(),
+          graphResultHash: String(deliveryReceipt?.graphResultHash || '')
+            .trim()
+            .toLowerCase(),
+        }))
+        .sort((left, right) => left.deliveryId.localeCompare(right.deliveryId));
+      const exactInitialIdentity =
+        verifiedOwnerId !== '' &&
+        verifiedMessageId === messageId &&
+        verifiedParentMessageId === parentMessageId &&
+        verifiedRevision === revision &&
+        verifiedGeneration > 0 &&
+        verifiedClaimToken !== '' &&
+        verifiedPresentationLeaseToken !== '' &&
+        verifiedDeliveryIds.length > 0 &&
+        verifiedDeliveryReceipts.length === verifiedDeliveryIds.length &&
+        verifiedDeliveryReceipts.every(
+          (deliveryReceipt, index) =>
+            deliveryReceipt.deliveryId === verifiedDeliveryIds[index] &&
+            /^[a-f0-9]{64}$/.test(deliveryReceipt.graphResultHash),
+        );
+      if (!exactInitialIdentity) return false;
+      if (presentationGeneration > 0) {
+        return (
+          verifiedGeneration === presentationGeneration &&
+          verifiedClaimToken === presentationClaimToken &&
+          verifiedPresentationLeaseToken === presentationLeaseToken &&
+          verifiedOwnerId === presentationOwnerId &&
+          verifiedDeliveryIds.length === deliveryIds.length &&
+          verifiedDeliveryIds.every((deliveryId, index) => deliveryId === deliveryIds[index]) &&
+          verifiedDeliveryReceipts.length === deliveryReceipts.length &&
+          verifiedDeliveryReceipts.every(
+            (deliveryReceipt, index) =>
+              deliveryReceipt.deliveryId === deliveryReceipts[index].deliveryId &&
+              deliveryReceipt.graphResultHash === deliveryReceipts[index].graphResultHash,
+          )
+        );
+      }
+      presentationOwnerId = verifiedOwnerId;
+      presentationGeneration = verifiedGeneration;
+      presentationClaimToken = verifiedClaimToken;
+      presentationLeaseToken = verifiedPresentationLeaseToken;
+      deliveryIds = verifiedDeliveryIds;
+      deliveryReceipts = verifiedDeliveryReceipts;
+      return true;
+    };
+
+    if (isCortexPresentation) {
+      if (!parentMessageId || typeof options.verifyCortexPresentation !== 'function') {
+        return { delivered: false, streamId, reason: 'presentation_unconfirmed' };
+      }
+      if (!(await verifyCurrentCortexPresentation('bind'))) {
+        return { delivered: false, streamId, reason: 'presentation_unconfirmed' };
+      }
+      authorizedEvent = {
+        ...(event as Record<string, unknown>),
+        data: {
+          ...((cortexEvent.data || {}) as Record<string, unknown>),
+          presentationGeneration,
+          presentationClaimToken,
+        },
+      } as t.ServerSentEvent;
+      const cortexPresentation: CortexPresentationBinding = {
+        ownerId: presentationOwnerId,
+        messageId,
+        parentMessageId,
+        revision,
+        generation: presentationGeneration,
+        deliveryIds,
+        deliveryReceipts,
+        claimToken: presentationClaimToken,
+        presentationLeaseToken,
+        boundAt: Date.now(),
+      };
+      const presentationBound = await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.bindCortexPresentation(streamId, cortexPresentation),
+        streamId,
+        runtime,
+      );
+      if (!presentationBound) {
+        return { delivered: false, streamId, reason: 'presentation_unconfirmed' };
+      }
+    }
+    /* === VIVENTIUM END === */
+
+    const eventObj = authorizedEvent as Record<string, unknown>;
+    const eventType = eventObj.event as string | undefined;
+    const eventData = eventObj.data;
+
     // Track user message from created event
-    this.trackUserMessage(streamId, event);
+    this.trackUserMessage(streamId, authorizedEvent, lifecycle.jobStore);
 
     // For Redis mode, persist chunk for later reconstruction (fire-and-forget for resumability)
-    if (isRedis) {
-      // The SSE event structure is { event: string, data: unknown, ... }
-      // The aggregator expects { event: string, data: unknown } where data is the payload
-      const eventObj = event as Record<string, unknown>;
-      const eventType = eventObj.event as string | undefined;
-      const eventData = eventObj.data;
-
+    let durableChunkStored = false;
+    if (lifecycle.isRedis) {
       if (eventType && eventData !== undefined) {
-        // Store in format expected by aggregateContent: { event, data }
-        jobStore.appendChunk(streamId, { event: eventType, data: eventData }).catch((err) => {
-          logger.error(`[GenerationJobManager] Failed to append chunk:`, err);
-        });
+        const appendChunk = () =>
+          lifecycle.jobStore.appendChunk(streamId, { event: eventType, data: eventData });
+        if (isCortexPresentation) {
+          try {
+            if (!(await verifyCurrentCortexPresentation('append'))) {
+              return { delivered: false, streamId, reason: 'presentation_unconfirmed' };
+            }
+            /* === VIVENTIUM START === EMO-UC-048 Web replay persistence fault boundary. === */
+            if (await consumeCortexFault('web_replay_persistence')) {
+              throw new Error('Cortex Web replay persistence failed');
+            }
+            /* === VIVENTIUM END === */
+            await this.runLifecycleOperation(lifecycle, appendChunk, streamId, runtime);
+            durableChunkStored = true;
+          } catch (err) {
+            logger.error(
+              `[GenerationJobManager] Failed to append chunk ${streamLogRef(streamId)}`,
+              safeStreamLogError(err),
+            );
+          }
+        } else {
+          appendChunk().catch((err) => {
+            logger.error(
+              `[GenerationJobManager] Failed to append chunk ${streamLogRef(streamId)}`,
+              safeStreamLogError(err),
+            );
+          });
+        }
 
         // For run step events, also save to run steps key for quick retrieval
         if (eventType === 'on_run_step' || eventType === 'on_run_step_completed') {
-          this.saveRunStepFromEvent(streamId, eventData as Record<string, unknown>);
+          this.saveRunStepFromEvent(
+            streamId,
+            eventData as Record<string, unknown>,
+            lifecycle.jobStore,
+          );
         }
       }
     }
 
-    // Buffer early events if no subscriber yet (replay when first subscriber connects)
-    if (!runtime.hasSubscriber) {
-      runtime.earlyEventBuffer.push(event);
+    // Redis owns Cortex replay only after appendChunk confirms durable storage. Never retain a
+    // failed Cortex presentation in the process-local early buffer for a later subscriber.
+    const bufferedForRuntime = !runtime.hasSubscriber;
+    const canUseRuntimeReplayBuffer = !lifecycle.isRedis || !isCortexPresentation;
+    if (isCortexPresentation && !(await verifyCurrentCortexPresentation('publish'))) {
+      return { delivered: false, streamId, reason: 'presentation_unconfirmed' };
+    }
+    if (!runtime.hasSubscriber && canUseRuntimeReplayBuffer) {
+      runtime.earlyEventBuffer.push(authorizedEvent);
     }
 
     // Await the transport emit - critical for Redis mode to maintain event order
-    await eventTransport.emitChunk(streamId, event);
-    this.assertServiceGeneration(generation);
+    /* === VIVENTIUM START === EMO-UC-048 Redis publish/ack fault boundary. === */
+    const publishFaultInjected =
+      lifecycle.isRedis && (await consumeCortexFault('web_redis_publish_ack'));
     /* === VIVENTIUM END === */
+    const transportReceipt = publishFaultInjected
+      ? {
+          published: false,
+          subscriberCount: 0,
+          ...(isCortexPresentation ? { presentationAcknowledged: false } : {}),
+        }
+      : await this.runLifecycleOperation(
+          lifecycle,
+          () =>
+            lifecycle.eventTransport.emitChunk(streamId, authorizedEvent, {
+              requirePresentationAcknowledgement: isCortexPresentation && !durableChunkStored,
+            }),
+          streamId,
+          runtime,
+        );
+    const publishReceipt = transportReceipt as EventTransportPublishReceipt | undefined;
+    let subscriberAcknowledged =
+      publishReceipt?.published === true && Number(publishReceipt.subscriberCount) > 0;
+    if (isCortexPresentation) {
+      subscriberAcknowledged =
+        publishReceipt?.published === true && publishReceipt.presentationAcknowledged === true;
+    }
+    const runtimeReplayAcknowledged =
+      !lifecycle.isRedis && bufferedForRuntime && canUseRuntimeReplayBuffer;
+    if (
+      isCortexPresentation &&
+      !subscriberAcknowledged &&
+      !durableChunkStored &&
+      !runtimeReplayAcknowledged
+    ) {
+      return { delivered: false, streamId, reason: 'presentation_unconfirmed' };
+    }
+    let target: Extract<ChunkEmissionReceipt, { delivered: true }>['target'] =
+      'runtime_replay_buffer';
+    if (subscriberAcknowledged) {
+      target = 'subscriber_transport';
+    } else if (durableChunkStored) {
+      target = 'durable_replay_store';
+    } else if (runtime.hasSubscriber) {
+      target = 'subscriber_transport';
+    }
+    const presentationRef = isCortexPresentation
+      ? `sse:${streamId}:${messageId}:${revision}`
+      : undefined;
+    return {
+      delivered: true,
+      streamId,
+      target,
+      ...(presentationRef ? { presentationRef } : {}),
+      ...(isCortexPresentation
+        ? { claimToken: presentationClaimToken, presentationLeaseToken }
+        : {}),
+    };
   }
 
+  /**
+   * Extract and save run step from event data.
+   * The data is already the run step object from the event payload.
+   */
   /* === VIVENTIUM START === Exact completed-Cortex delivery, independent of Main's lifetime. */
   async emitCortexPresentation(
     streamId: string,
-    event: { event: 'on_cortex_followup'; data: {
-      messageId: string; conversationId: string; text: string; parentMessageId?: string;
-      runId?: string; cortexCount?: number; revision?: number; presentationGeneration?: number;
-      presentationClaimToken?: string; presentationParentMessageId?: string;
-      targetSurface?: string; logicalTurnId?: string; logicalTurnRevision?: number;
-      cortexPresentation?: CortexPresentationFenceReceipt;
-    } },
+    event: {
+      event: 'on_cortex_followup';
+      data: {
+        messageId: string;
+        conversationId: string;
+        text: string;
+        parentMessageId?: string;
+        runId?: string;
+        cortexCount?: number;
+        revision?: number;
+        presentationGeneration?: number;
+        presentationClaimToken?: string;
+        presentationParentMessageId?: string;
+        targetSurface?: string;
+        logicalTurnId?: string;
+        logicalTurnRevision?: number;
+        cortexPresentation?: CortexPresentationFenceReceipt;
+      };
+    },
     receipt: CortexPresentationFenceReceipt,
     options: {
       verifyPresentation: () => Promise<CortexPresentationFenceReceipt>;
-      consumeCortexFault?: (boundary: 'web_replay_persistence' | 'web_redis_publish_ack') =>
-        Promise<{ triggered?: boolean }>;
+      consumeCortexFault?: (
+        boundary: 'web_replay_persistence' | 'web_redis_publish_ack',
+      ) => Promise<{ triggered?: boolean }>;
     },
   ): Promise<
-    { delivered: false; streamId: string; reason: string } |
-    { delivered: true; streamId: string; target: 'subscriber_transport';
-      presentationRef: string; claimToken: string; presentationLeaseToken: string }
+    | { delivered: false; streamId: string; reason: string }
+    | {
+        delivered: true;
+        streamId: string;
+        target: 'subscriber_transport';
+        presentationRef: string;
+        claimToken: string;
+        presentationLeaseToken: string;
+      }
   > {
     const services = this.captureServices();
     const failure = { delivered: false as const, streamId, reason: 'presentation_unconfirmed' };
     const normalized = normalizeCortexPresentationReceipt(receipt);
-    if (!normalized || event.event !== 'on_cortex_followup' ||
-        event.data.messageId !== normalized.messageId) return failure;
+    if (
+      !normalized ||
+      event.event !== 'on_cortex_followup' ||
+      event.data.messageId !== normalized.messageId
+    ) {
+      return failure;
+    }
     const binding = await this.bindCortexPresentation(streamId, normalized);
     this.assertServiceGeneration(services.generation);
     if (!binding) return failure;
@@ -2428,19 +3797,26 @@ class GenerationJobManagerClass {
       this.assertServiceGeneration(services.generation);
       const job = await services.jobStore.getJob(streamId);
       this.assertServiceGeneration(services.generation);
-      return job?.status !== 'aborted' && job?.userId === normalized.ownerId &&
+      return (
+        job?.status !== 'aborted' &&
+        job?.userId === normalized.ownerId &&
         job?.conversationId === event.data.conversationId &&
         job?.responseMessageId === normalized.parentMessageId &&
         cortexPresentationMatchesReceipt(binding, current) &&
-        cortexPresentationMatchesReceipt(job?.cortexPresentation, normalized);
+        cortexPresentationMatchesReceipt(job?.cortexPresentation, normalized)
+      );
     };
-    const authorizedEvent = { ...event, data: { ...event.data,
-      revision: normalized.revision,
-      presentationGeneration: normalized.generation,
-      presentationClaimToken: normalized.claimToken,
-      presentationParentMessageId: normalized.parentMessageId,
-      cortexPresentation: normalized,
-    } };
+    const authorizedEvent = {
+      ...event,
+      data: {
+        ...event.data,
+        revision: normalized.revision,
+        presentationGeneration: normalized.generation,
+        presentationClaimToken: normalized.claimToken,
+        presentationParentMessageId: normalized.parentMessageId,
+        cortexPresentation: normalized,
+      },
+    };
     const consumeFault = async (boundary: 'web_replay_persistence' | 'web_redis_publish_ack') =>
       (await options.consumeCortexFault?.(boundary))?.triggered === true;
     if (!(await verify())) return failure;
@@ -2453,18 +3829,19 @@ class GenerationJobManagerClass {
       }
     }
     if (!(await verify())) return failure;
-    const published = await consumeFault('web_redis_publish_ack') ? undefined :
-      await services.eventTransport.emitChunk(streamId, authorizedEvent, {
-        requirePresentationAcknowledgement: true,
-      });
+    const published = (await consumeFault('web_redis_publish_ack'))
+      ? undefined
+      : await services.eventTransport.emitChunk(streamId, authorizedEvent, {
+          requirePresentationAcknowledgement: true,
+        });
     this.assertServiceGeneration(services.generation);
     if (!(await verify())) return failure;
-    const subscriberAccepted = published?.published === true &&
-      published.presentationAcknowledged === true;
-    // Redis chunk storage is diagnostic retention, not a Cortex presentation consumer.
-    // Leave the Mongo delivery retryable until an actual subscriber acknowledges it.
+    const subscriberAccepted =
+      published?.published === true && published.presentationAcknowledged === true;
     if (!subscriberAccepted) return failure;
-    return { delivered: true, streamId,
+    return {
+      delivered: true,
+      streamId,
       target: 'subscriber_transport',
       presentationRef: `sse:${streamId}:${normalized.messageId}:${normalized.revision}`,
       claimToken: normalized.claimToken,
@@ -2473,11 +3850,11 @@ class GenerationJobManagerClass {
   }
   /* === VIVENTIUM END === */
 
-  /**
-   * Extract and save run step from event data.
-   * The data is already the run step object from the event payload.
-   */
-  private saveRunStepFromEvent(streamId: string, data: Record<string, unknown>): void {
+  private saveRunStepFromEvent(
+    streamId: string,
+    data: Record<string, unknown>,
+    jobStore: IJobStore = this.jobStore,
+  ): void {
     // The data IS the run step object
     const runStep = data as Agents.RunStep;
     if (!runStep.id) {
@@ -2485,7 +3862,7 @@ class GenerationJobManagerClass {
     }
 
     // Fire and forget - accumulate run steps
-    this.accumulateRunStep(streamId, runStep);
+    this.accumulateRunStep(streamId, runStep, jobStore);
   }
 
   /**
@@ -2495,7 +3872,11 @@ class GenerationJobManagerClass {
    */
   private runStepBuffers: Map<string, Agents.RunStep[]> | null = null;
 
-  private accumulateRunStep(streamId: string, runStep: Agents.RunStep): void {
+  private accumulateRunStep(
+    streamId: string,
+    runStep: Agents.RunStep,
+    jobStore: IJobStore = this.jobStore,
+  ): void {
     // Lazy initialization - only create map when first used (Redis mode)
     if (!this.runStepBuffers) {
       this.runStepBuffers = new Map();
@@ -2516,9 +3897,12 @@ class GenerationJobManagerClass {
     }
 
     // Save to Redis
-    if (this.jobStore.saveRunSteps) {
-      this.jobStore.saveRunSteps(streamId, buffer).catch((err) => {
-        logger.error(`[GenerationJobManager] Failed to save run steps:`, err);
+    if (jobStore.saveRunSteps) {
+      jobStore.saveRunSteps(streamId, buffer).catch((err) => {
+        logger.error(
+          `[GenerationJobManager] Failed to save run steps ${streamLogRef(streamId)}`,
+          safeStreamLogError(err),
+        );
       });
     }
   }
@@ -2526,7 +3910,11 @@ class GenerationJobManagerClass {
   /**
    * Track user message from created event.
    */
-  private trackUserMessage(streamId: string, event: t.ServerSentEvent): void {
+  private trackUserMessage(
+    streamId: string,
+    event: t.ServerSentEvent,
+    jobStore: IJobStore = this.jobStore,
+  ): void {
     const data = event as Record<string, unknown>;
     if (!data.created || !data.message) {
       return;
@@ -2546,7 +3934,7 @@ class GenerationJobManagerClass {
       updates.conversationId = message.conversationId as string;
     }
 
-    this.jobStore.updateJob(streamId, updates);
+    jobStore.updateJob(streamId, updates);
   }
 
   /**
@@ -2556,14 +3944,14 @@ class GenerationJobManagerClass {
     streamId: string,
     metadata: Partial<t.GenerationJobMetadata>,
   ): Promise<void> {
-    /* === VIVENTIUM START ===
-     * Purpose: Metadata persistence must not report success after its service
-     * generation has been replaced.
-     */
     const services = this.captureServices();
     const updates: Partial<SerializableJobData> = {};
     if (metadata.responseMessageId) {
       updates.responseMessageId = metadata.responseMessageId;
+      const runtime = this.runtimeState.get(streamId);
+      if (runtime?.nativeProducer) {
+        runtime.nativeProducer.responseMessageId = metadata.responseMessageId;
+      }
     }
     if (metadata.sender) {
       updates.sender = metadata.sender;
@@ -2589,9 +3977,17 @@ class GenerationJobManagerClass {
     if (metadata.voiceCallSessionId) {
       updates.voiceCallSessionId = metadata.voiceCallSessionId;
     }
+    if (metadata.viventiumVoiceEffectAuthority) {
+      updates.viventiumVoiceEffectAuthority = metadata.viventiumVoiceEffectAuthority;
+    }
+    if (metadata.viventiumCallSessionId) {
+      updates.viventiumCallSessionId = metadata.viventiumCallSessionId;
+    }
+    if (metadata.viventiumVoiceTaskId) {
+      updates.viventiumVoiceTaskId = metadata.viventiumVoiceTaskId;
+    }
     await services.jobStore.updateJob(streamId, updates);
     this.assertServiceGeneration(services.generation);
-    /* === VIVENTIUM END === */
   }
 
   /**
@@ -2632,10 +4028,6 @@ class GenerationJobManagerClass {
    * Get resume state for reconnecting clients.
    */
   async getResumeState(streamId: string): Promise<t.ResumeState | null> {
-    /* === VIVENTIUM START ===
-     * Purpose: Resume state cannot combine metadata from an old store with
-     * content from replacement services.
-     */
     const services = this.captureServices();
     const jobData = await services.jobStore.getJob(streamId);
     this.assertServiceGeneration(services.generation);
@@ -2649,8 +4041,7 @@ class GenerationJobManagerClass {
     const runSteps = await services.jobStore.getRunSteps(streamId);
     this.assertServiceGeneration(services.generation);
 
-    logger.debug(`[GenerationJobManager] getResumeState:`, {
-      streamId,
+    logger.debug(`[GenerationJobManager] getResumeState ${streamLogRef(streamId)}`, {
       runStepsLength: runSteps.length,
       aggregatedContentLength: aggregatedContent.length,
     });
@@ -2660,10 +4051,12 @@ class GenerationJobManagerClass {
       aggregatedContent,
       userMessage: jobData.userMessage,
       responseMessageId: jobData.responseMessageId,
+      /* === VIVENTIUM START === Exact optimistic-to-authoritative resume identity. === */
+      clientPresentation: jobData.clientPresentation,
+      /* === VIVENTIUM END === */
       conversationId: jobData.conversationId,
       sender: jobData.sender,
     };
-    /* === VIVENTIUM END === */
   }
 
   /**
@@ -2671,20 +4064,17 @@ class GenerationJobManagerClass {
    * Persists to Redis for cross-replica consistency.
    */
   markSyncSent(streamId: string): void {
-    /* === VIVENTIUM START ===
-     * Purpose: Fire-and-forget persistence still captures its originating store
-     * instead of resolving a replacement service later.
-     */
-    const services = this.captureServices();
     const runtime = this.runtimeState.get(streamId);
     if (runtime) {
       runtime.syncSent = true;
     }
     // Persist to Redis for cross-replica consistency
-    services.jobStore.updateJob(streamId, { syncSent: true }).catch((err) => {
-      logger.error(`[GenerationJobManager] Failed to persist syncSent flag:`, err);
+    this.jobStore.updateJob(streamId, { syncSent: true }).catch((err) => {
+      logger.error(
+        `[GenerationJobManager] Failed to persist syncSent flag ${streamLogRef(streamId)}`,
+        safeStreamLogError(err),
+      );
     });
-    /* === VIVENTIUM END === */
   }
 
   /**
@@ -2697,10 +4087,36 @@ class GenerationJobManagerClass {
       return localSyncSent;
     }
     // Cross-replica: check Redis
-    const services = this.captureServices();
-    const jobData = await services.jobStore.getJob(streamId);
-    this.assertServiceGeneration(services.generation);
+    const jobData = await this.jobStore.getJob(streamId);
     return jobData?.syncSent ?? false;
+  }
+
+  /* === VIVENTIUM START ===
+   * Feature: Durable cross-replica cancellation.
+   * Purpose: Stop a stale local generator when durable ownership is gone, while preserving the
+   * response-only adapter contract that suppresses presentation but allows background authoring.
+   * === VIVENTIUM END === */
+  private async stopRuntimeAfterDurableFence(
+    streamId: string,
+    lifecycle: ManagerLifecycleSnapshot = this.captureLifecycle(),
+    runtime: RuntimeJobState | undefined = this.runtimeState.get(streamId),
+  ): Promise<void> {
+    if (!runtime || runtime.abortController.signal.aborted) {
+      return;
+    }
+    const persisted = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
+    if (
+      persisted?.status === 'superseded' &&
+      persisted.adapterCapabilities?.supersede_scope === 'response_only'
+    ) {
+      return;
+    }
+    runtime.abortController.abort('durable_stream_terminal');
   }
 
   /**
@@ -2708,18 +4124,71 @@ class GenerationJobManagerClass {
    * Persists finalEvent to Redis for cross-replica access.
    */
   async emitDone(streamId: string, event: t.ServerSentEvent): Promise<void> {
-    /* === VIVENTIUM START ===
-     * Purpose: Terminal persistence and delivery share one immutable service
-     * generation and reject stale completion.
-     */
-    const services = this.captureServices();
-    if (!(await services.jobStore.isCurrentLogicalTurn(streamId))) {
-      this.assertServiceGeneration(services.generation);
+    const lifecycle = this.captureLifecycle();
+    const runtime = this.runtimeState.get(streamId);
+    const nativeJob = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
+    const isCurrent =
+      nativeJob == null ||
+      (await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.isCurrentLogicalTurn(streamId),
+        streamId,
+        runtime,
+      ));
+    if (!isCurrent) {
+      const persisted = await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.getJob(streamId),
+        streamId,
+        runtime,
+      );
+      if (
+        persisted?.status === 'superseded' &&
+        persisted.adapterCapabilities?.supersede_scope === 'response_only'
+      ) {
+        const terminalAlreadyPresented = hasResponseOnlySupersededFinalEvent(persisted);
+        const finalEvent = persisted.durableEffectReceipt
+          ? buildDurableWorkReceiptFinalEvent(
+              persisted,
+              persisted.durableEffectReceipt.response_message_id,
+            )
+          : ({
+              final: true,
+              superseded: true,
+              logical_turn_id: persisted.interactionContext?.logical_turn_id,
+              revision: persisted.interactionContext?.revision,
+            } as unknown as t.ServerSentEvent);
+        if (runtime) {
+          runtime.finalEvent = finalEvent;
+        }
+        await this.runLifecycleOperation(
+          lifecycle,
+          () =>
+            lifecycle.jobStore.updateJob(streamId, {
+              finalEvent: JSON.stringify(finalEvent),
+              generationCompleted: true,
+            }),
+          streamId,
+          runtime,
+        );
+        if (!terminalAlreadyPresented) {
+          await this.runLifecycleOperation(
+            lifecycle,
+            () => lifecycle.eventTransport.emitDone(streamId, finalEvent),
+            streamId,
+            runtime,
+          );
+        }
+        return;
+      }
+      await this.stopRuntimeAfterDurableFence(streamId, lifecycle, runtime);
       return;
     }
-    this.assertServiceGeneration(services.generation);
-    const nativeJob = await services.jobStore.getJob(streamId);
-    this.assertServiceGeneration(services.generation);
     if (nativeJob?.nativeResponse) {
       if (
         !nativeJob.nativeResponseCancelled &&
@@ -2727,23 +4196,29 @@ class GenerationJobManagerClass {
         nativeJob.finalEvent === JSON.stringify(event)
       ) {
         await this.finishNativeResponse(nativeJob.nativeResponse, event);
-        this.assertServiceGeneration(services.generation);
       }
       return;
     }
-    const runtime = this.runtimeState.get(streamId);
     if (runtime) {
       runtime.finalEvent = event;
     }
-    // Persist finalEvent to Redis for cross-replica consistency
-    void services.jobStore
-      .updateJob(streamId, { finalEvent: JSON.stringify(event) })
-      .catch((error) => {
-        logger.error(`[GenerationJobManager] Failed to persist terminal event:`, error);
-      });
-    await services.eventTransport.emitDone(streamId, event);
-    this.assertServiceGeneration(services.generation);
-    /* === VIVENTIUM END === */
+    // Terminal delivery remains available when best-effort replay persistence fails.
+    try {
+      await lifecycle.jobStore.updateJob(streamId, { finalEvent: JSON.stringify(event) });
+    } catch (error) {
+      this.assertLifecycleOperation(lifecycle, streamId, runtime);
+      logger.error(
+        `[GenerationJobManager] Failed to persist terminal event ${streamLogRef(streamId)}`,
+        safeStreamLogError(error),
+      );
+    }
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.eventTransport.emitDone(streamId, event),
+      streamId,
+      runtime,
+    );
   }
 
   /**
@@ -2752,35 +4227,55 @@ class GenerationJobManagerClass {
    * occurs before client connects to SSE stream).
    */
   async emitError(streamId: string, error: string): Promise<void> {
-    /* === VIVENTIUM START ===
-     * Purpose: Error persistence and delivery share one immutable service
-     * generation and reject stale completion.
-     */
-    const services = this.captureServices();
-    if (!(await services.jobStore.isCurrentLogicalTurn(streamId))) {
-      this.assertServiceGeneration(services.generation);
+    const lifecycle = this.captureLifecycle();
+    const runtime = this.runtimeState.get(streamId);
+    const nativeJob = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
+    if (
+      nativeJob != null &&
+      !(await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.isCurrentLogicalTurn(streamId),
+        streamId,
+        runtime,
+      ))
+    ) {
+      if (await this.finishResponseOnlySupersededJob(streamId, lifecycle, runtime, error)) {
+        return;
+      }
+      await this.stopRuntimeAfterDurableFence(streamId, lifecycle, runtime);
       return;
     }
-    this.assertServiceGeneration(services.generation);
-    const nativeJob = await services.jobStore.getJob(streamId);
-    this.assertServiceGeneration(services.generation);
     if (
       nativeJob?.nativeResponseFinished ||
       (nativeJob?.nativeResponse && nativeJob.nativeResponseCancelled)
     ) {
       return;
     }
-    const runtime = this.runtimeState.get(streamId);
     if (runtime) {
       runtime.errorEvent = error;
     }
-    // Persist error to job store for cross-replica consistency
-    void services.jobStore.updateJob(streamId, { error }).catch((persistError) => {
-      logger.error(`[GenerationJobManager] Failed to persist terminal error:`, persistError);
-    });
-    await services.eventTransport.emitError(streamId, error);
-    this.assertServiceGeneration(services.generation);
-    /* === VIVENTIUM END === */
+    // Terminal delivery remains available when best-effort replay persistence fails.
+    try {
+      await lifecycle.jobStore.updateJob(streamId, { error });
+    } catch (persistError) {
+      this.assertLifecycleOperation(lifecycle, streamId, runtime);
+      logger.error(
+        `[GenerationJobManager] Failed to persist terminal error ${streamLogRef(streamId)}`,
+        safeStreamLogError(persistError),
+      );
+    }
+    this.assertLifecycleOperation(lifecycle, streamId, runtime);
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.eventTransport.emitError(streamId, error),
+      streamId,
+      runtime,
+    );
   }
 
   /**
@@ -2788,10 +4283,6 @@ class GenerationJobManagerClass {
    * Also cleans up any orphaned runtime state, buffers, and event transport entries.
    */
   private async cleanup(): Promise<void> {
-    /* === VIVENTIUM START ===
-     * Purpose: Periodic cleanup must stop at the generation boundary instead
-     * of traversing replacement runtime, store, or transport state.
-     */
     const services = this.captureServices();
     const { generation, jobStore, eventTransport } = services;
     const count = await jobStore.cleanup();
@@ -2825,17 +4316,14 @@ class GenerationJobManagerClass {
     for (const streamId of eventTransport.getTrackedStreamIds()) {
       const jobExists = await jobStore.hasJob(streamId);
       this.assertServiceGeneration(generation);
-      if (!jobExists) {
-        if (!this.runtimeState.has(streamId)) {
-          eventTransport.cleanup(streamId);
-        }
+      if (!jobExists && !this.runtimeState.has(streamId)) {
+        eventTransport.cleanup(streamId);
       }
     }
 
     if (count > 0) {
       logger.debug(`[GenerationJobManager] Cleaned up ${count} expired jobs`);
     }
-    /* === VIVENTIUM END === */
   }
 
   /**
@@ -2847,15 +4335,12 @@ class GenerationJobManagerClass {
     aggregatedContent?: Agents.MessageContentComplex[];
     createdAt: number;
   } | null> {
-    const services = this.captureServices();
-    const jobData = await services.jobStore.getJob(streamId);
-    this.assertServiceGeneration(services.generation);
+    const jobData = await this.jobStore.getJob(streamId);
     if (!jobData) {
       return null;
     }
 
-    const result = await services.jobStore.getContentParts(streamId);
-    this.assertServiceGeneration(services.generation);
+    const result = await this.jobStore.getContentParts(streamId);
     const aggregatedContent = result?.content ?? [];
 
     return {
@@ -2870,25 +4355,20 @@ class GenerationJobManagerClass {
    * Get total job count.
    */
   async getJobCount(): Promise<number> {
-    const services = this.captureServices();
-    const count = await services.jobStore.getJobCount();
-    this.assertServiceGeneration(services.generation);
-    return count;
+    return this.jobStore.getJobCount();
   }
 
   /**
    * Get job count by status.
    */
   async getJobCountByStatus(): Promise<Record<t.GenerationJobStatus, number>> {
-    const services = this.captureServices();
     const [running, complete, error, aborted, superseded] = await Promise.all([
-      services.jobStore.getJobCountByStatus('running'),
-      services.jobStore.getJobCountByStatus('complete'),
-      services.jobStore.getJobCountByStatus('error'),
-      services.jobStore.getJobCountByStatus('aborted'),
-      services.jobStore.getJobCountByStatus('superseded'),
+      this.jobStore.getJobCountByStatus('running'),
+      this.jobStore.getJobCountByStatus('complete'),
+      this.jobStore.getJobCountByStatus('error'),
+      this.jobStore.getJobCountByStatus('aborted'),
+      this.jobStore.getJobCountByStatus('superseded'),
     ]);
-    this.assertServiceGeneration(services.generation);
     return { running, complete, error, aborted, superseded };
   }
 
@@ -2915,11 +4395,31 @@ class GenerationJobManagerClass {
    * @returns Array of conversation IDs with active jobs
    */
   async getActiveJobIdsForUser(userId: string): Promise<string[]> {
-    const services = this.captureServices();
-    const activeJobIds = await services.jobStore.getActiveJobIdsByUser(userId);
-    this.assertServiceGeneration(services.generation);
-    return activeJobIds;
+    return this.jobStore.getActiveJobIdsByUser(userId);
   }
+
+  /* === VIVENTIUM START ===
+   * Feature: Exact resumable-stream liveness.
+   * Purpose: Conversation IDs drive navigation, but terminal UI reconciliation must distinguish
+   *          overlapping streams within one conversation.
+   */
+  async getActiveStreamsForUser(
+    userId: string,
+  ): Promise<Array<{ streamId: string; conversationId: string }>> {
+    const streamIds = await this.jobStore.getActiveJobIdsByUser(userId);
+    const activeStreams: Array<{ streamId: string; conversationId: string }> = [];
+    for (const streamId of streamIds) {
+      const job = await this.jobStore.getJob(streamId);
+      if (job?.status === 'running' && job.userId === userId) {
+        activeStreams.push({
+          streamId,
+          conversationId: job.conversationId ?? streamId,
+        });
+      }
+    }
+    return activeStreams;
+  }
+  /* === VIVENTIUM END === */
 
   /** Resolve the newest active stream by stable conversation identity. */
   async getActiveStreamIdForConversation(
@@ -2932,6 +4432,7 @@ class GenerationJobManagerClass {
       const job = await this.jobStore.getJob(streamId);
       if (
         job?.status === 'running' &&
+        job.userId === userId &&
         job.conversationId === conversationId &&
         (!newest || job.createdAt > newest.createdAt)
       ) {
@@ -2941,68 +4442,55 @@ class GenerationJobManagerClass {
     return newest?.streamId;
   }
 
-  /* === VIVENTIUM START ===
-   * Feature: Exact resumable-stream liveness.
-   * Purpose: The existing active index discovers candidates; current job rows prove owner,
-   *          running state and canonical conversation. Storage failures remain failures.
-   */
-  async getActiveStreamsForUser(
-    userId: string,
-  ): Promise<Array<{ streamId: string; conversationId: string }>> {
-    const services = this.captureServices();
-    const streamIds = await services.jobStore.getActiveJobIdsByUser(userId);
-    this.assertServiceGeneration(services.generation);
-    const activeStreams: Array<{ streamId: string; conversationId: string }> = [];
-    for (const streamId of streamIds) {
-      const job = await services.jobStore.getJob(streamId);
-      this.assertServiceGeneration(services.generation);
-      if (job?.status === 'running' && job.userId === userId && job.streamId === streamId) {
-        activeStreams.push({ streamId, conversationId: job.conversationId || streamId });
-      }
-    }
-    return activeStreams;
-  }
-
   /** Conversation identities used by web navigation/title state, deduplicated from stream IDs. */
   async getActiveConversationIdsForUser(userId: string): Promise<string[]> {
-    const streams = await this.getActiveStreamsForUser(userId);
-    return [...new Set(streams.map(({ conversationId }) => conversationId))];
+    const activeStreams = await this.getActiveStreamsForUser(userId);
+    const conversationIds = new Set(activeStreams.map(({ conversationId }) => conversationId));
+    return [...conversationIds];
   }
-  /* === VIVENTIUM END === */
 
   /**
    * Destroy the manager.
    * Cleans up all resources including runtime state, buffers, and stores.
    */
-  /* === VIVENTIUM START ===
-   * Purpose: Make teardown idempotent, keep configuration locked until both
-   * services settle, and retain a failed state when teardown is incomplete.
-   */
   destroy(): Promise<void> {
     if (this.destroyPromise) {
       return this.destroyPromise;
     }
-
+    const lifecycleJobStore = this._jobStore;
+    const lifecycleEventTransport = this._eventTransport;
+    this.unavailable = true;
+    this.lifecycleAbortController.abort('manager_destroyed');
+    this.lifecycleEpoch += 1;
+    this.serviceGeneration += 1;
+    this.lifecycleState = 'destroying';
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
     }
+    /* === VIVENTIUM START === Stream readiness lifecycle cleanup. === */
+    this.initializationPromise = null;
+    /* === VIVENTIUM END === */
 
-    const jobStore = this._jobStore;
-    const eventTransport = this._eventTransport;
-    this.serviceGeneration++;
-    this.lifecycleState = 'destroying';
+    for (const runtime of this.runtimeState.values()) {
+      if (!runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('manager_destroyed');
+      }
+    }
     this.nativeResponseRecovery = undefined;
     this.nativeResponseCancellation = undefined;
     this.runtimeState.clear();
     this.runStepBuffers?.clear();
-    this.destroyPromise = Promise.allSettled([jobStore.destroy(), eventTransport.destroy()])
+    this.destroyPromise = Promise.allSettled([
+      lifecycleJobStore.destroy(),
+      lifecycleEventTransport.destroy(),
+    ])
       .then(([jobStoreResult, eventTransportResult]) => {
         if (jobStoreResult.status === 'rejected') {
           if (eventTransportResult.status === 'rejected') {
             logger.error(
-              '[GenerationJobManager] Event transport teardown also failed:',
-              eventTransportResult.reason,
+              '[GenerationJobManager] Event transport teardown also failed',
+              safeStreamLogError(eventTransportResult.reason),
             );
           }
           throw jobStoreResult.reason;
@@ -3010,7 +4498,6 @@ class GenerationJobManagerClass {
         if (eventTransportResult.status === 'rejected') {
           throw eventTransportResult.reason;
         }
-
         this.lifecycleState = 'destroyed';
         logger.debug('[GenerationJobManager] Destroyed');
       })
@@ -3020,7 +4507,6 @@ class GenerationJobManagerClass {
       });
     return this.destroyPromise;
   }
-  /* === VIVENTIUM END === */
 }
 
 export const GenerationJobManager = new GenerationJobManagerClass();

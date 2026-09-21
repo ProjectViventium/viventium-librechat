@@ -161,25 +161,22 @@ load_env_file_preserving_existing() {
     return 0
 }
 
-generated_env_files=()
 if [[ -n "${VIVENTIUM_ENV_FILE:-}" ]]; then
-    # An explicit runtime env is an isolation boundary. In particular, dev/QA profiles must not
-    # fill missing credentials or provider settings from the canonical production App Support.
-    generated_env_files=(
-        "$VIVENTIUM_ENV_FILE"
-        "$(dirname "$VIVENTIUM_ENV_FILE")/service-env/librechat.env"
-    )
+    explicit_runtime_root="$(dirname "$VIVENTIUM_ENV_FILE")"
+    for explicit_env_file in \
+        "$VIVENTIUM_ENV_FILE" \
+        "$explicit_runtime_root/service-env/librechat.env"
+    do
+        load_env_file_preserving_existing "$explicit_env_file" "explicit Viventium runtime" || true
+    done
 else
-    generated_env_files=(
-        "${HOME}/Library/Application Support/Viventium/runtime/service-env/librechat.env"
+    for generated_env_file in \
+        "${HOME}/Library/Application Support/Viventium/runtime/service-env/librechat.env" \
         "${HOME}/Library/Application Support/Viventium/runtime/runtime.env"
-    )
+    do
+        load_env_file_preserving_existing "$generated_env_file" "generated Viventium" || true
+    done
 fi
-
-for generated_env_file in "${generated_env_files[@]}"; do
-    [[ -n "$generated_env_file" ]] || continue
-    load_env_file_preserving_existing "$generated_env_file" "generated Viventium" || true
-done
 # === VIVENTIUM END ===
 
 # Load environment variables from .env file if it exists

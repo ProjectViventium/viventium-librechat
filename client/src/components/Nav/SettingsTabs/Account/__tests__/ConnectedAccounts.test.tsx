@@ -98,9 +98,6 @@ describe('ConnectedAccounts OAuth polling', () => {
   it('does not treat a key saved before this attempt as OAuth completion', async () => {
     let attemptStatus = 'pending';
     mockRequestGet.mockImplementation((url) => {
-      if (String(url).endsWith('/policy')) {
-        return Promise.resolve({ policy: 'personal_preferred' }) as never;
-      }
       if (String(url).endsWith('/start')) {
         return Promise.resolve({
           attemptId: 'attempt-current',
@@ -117,10 +114,7 @@ describe('ConnectedAccounts OAuth polling', () => {
       location: { href: '' },
     } as unknown as Window;
     const openSpy = jest.spyOn(window, 'open').mockImplementation(() => popup);
-    let unmount: () => void = () => undefined;
-    await act(async () => {
-      ({ unmount } = render(<ConnectedAccounts />));
-    });
+    const { unmount } = render(<ConnectedAccounts />);
     const openAISection = screen.getByRole('region', { name: 'com_ui_openai account' });
     fireEvent.click(
       within(openAISection).getByRole('button', {

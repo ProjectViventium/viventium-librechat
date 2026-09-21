@@ -14,6 +14,9 @@ const {
   consumeLinkToken,
   upsertTelegramMapping,
 } = require('~/server/services/TelegramLinkService');
+const {
+  reconcileUnresolvedGlassHiveCallbackDeliveries,
+} = require('~/server/services/viventium/GlassHiveCallbackDeliveryService');
 
 const router = express.Router();
 
@@ -44,14 +47,12 @@ router.get('/link/:token', async (req, res) => {
 
     const userId = resolveUserIdFromCookies(req);
     if (!userId) {
-      return res
-        .status(401)
-        .send(
-          renderLinkResult({
-            ok: false,
-            message: 'Please log in to LibreChat, then reopen this link.',
-          }),
-        );
+      return res.status(401).send(
+        renderLinkResult({
+          ok: false,
+          message: 'Please log in to LibreChat, then reopen this link.',
+        }),
+      );
     }
 
     const user = await getUserById(userId, '-password -__v -totpSecret -backupCodes');
@@ -73,6 +74,21 @@ router.get('/link/:token', async (req, res) => {
       libreChatUserId: user._id,
       telegramUsername: linkToken.telegramUsername,
     });
+    try {
+      await reconcileUnresolvedGlassHiveCallbackDeliveries({
+        userId: String(user._id),
+        limit: 100,
+      });
+    } catch (deliveryError) {
+      // Linking is authoritative even if the repair scan is temporarily unavailable; the startup
+      // and periodic reconciler will retry the same unresolved rows without another GH callback.
+      logger.warn('[VIVENTIUM][telegram/link] Deferred callback delivery repair failed', {
+        code: String(deliveryError?.code || deliveryError?.name || 'delivery_repair_failed').slice(
+          0,
+          120,
+        ),
+      });
+    }
 
     return res.status(200).send(renderLinkResult({ ok: true }));
   } catch (err) {

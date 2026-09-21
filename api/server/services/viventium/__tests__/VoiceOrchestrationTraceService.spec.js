@@ -1,4 +1,4 @@
-/* === VIVENTIUM START === MPV-061 production Voice trace contract tests. === VIVENTIUM END === */
+/* === VIVENTIUM START === MPV-054 production Voice trace contract tests. === VIVENTIUM END === */
 
 const mockRecordOrchestrationTraceEvent = jest.fn();
 const mockOrchestrationRuntimeTraceBinding = jest.fn();
@@ -32,7 +32,7 @@ describe('VoiceOrchestrationTraceService', () => {
     mockRecordOrchestrationTraceEvent.mockImplementation(async (input) => input);
   });
 
-  test('publishes every MPV-061 production stage through the owner-scoped ledger', async () => {
+  test('publishes every MPV-054 production stage through the owner-scoped ledger', async () => {
     const stages = {
       'action.accepted': 'control',
       'control.completed': 'control',

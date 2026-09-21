@@ -2,7 +2,9 @@ import { createHash, createHmac } from 'crypto';
 import {
   createMongooseVoiceClassifierFaultControlStore,
   createVoiceClassifierFaultControlManager,
+  runBoundVoiceClassifierFaultControl,
   type VoiceClassifierFaultControlRow,
+  type VoiceClassifierFaultControlManager,
   type VoiceClassifierFaultControlManagerOptions,
   type VoiceClassifierFaultControlStore,
   type VoiceClassifierFaultTurnBinding,
@@ -119,8 +121,8 @@ class MemoryStore implements VoiceClassifierFaultControlStore {
 
 function env(): NodeJS.ProcessEnv {
   return {
-    VIVENTIUM_LOCAL_QA_CASE_ID: 'MPV-061',
-    VIVENTIUM_LOCAL_QA_MODE: 'mpv_061',
+    VIVENTIUM_LOCAL_QA_CASE_ID: 'MPV-054',
+    VIVENTIUM_LOCAL_QA_MODE: 'mpv_054',
     VIVENTIUM_LOCAL_QA_CASE_TOKEN: TOKEN,
     VIVENTIUM_LOCAL_QA_SESSION_REF: 'qa_0123456789abcdef01234567',
     VIVENTIUM_LOCAL_QA_COMPONENT_ARTIFACT_DIGEST: HASH('component'),
@@ -132,7 +134,7 @@ function binding(
   overrides: Partial<VoiceClassifierFaultTurnBinding> = {},
 ): VoiceClassifierFaultTurnBinding {
   return {
-    caseId: 'MPV-061',
+    caseId: 'MPV-054',
     sessionRef: 'qa_0123456789abcdef01234567',
     candidateDigest: HASH('candidate'),
     componentArtifactDigest: HASH('component'),
@@ -172,8 +174,8 @@ function managerRowFixture(): VoiceClassifierFaultControlRow {
   const current = binding();
   return {
     schemaVersion: 1,
-    controlId: 'mpv061_' + Buffer.alloc(18, 1).toString('base64url'),
-    caseId: 'MPV-061',
+    controlId: 'mpv054_' + Buffer.alloc(18, 1).toString('base64url'),
+    caseId: 'MPV-054',
     sessionRefHash: HASH(current.sessionRef),
     sessionCandidateDigest: HASH('candidate'),
     caseTokenHash: HASH('token'),
@@ -197,7 +199,7 @@ function managerRowFixture(): VoiceClassifierFaultControlRow {
   };
 }
 
-describe('MPV-061 strict Voice classifier fallback control', () => {
+describe('MPV-054 strict Voice classifier fallback control', () => {
   test('Mongo adapter uses exact CAS filters and receipt-bound cleanup', async () => {
     const created = { toObject: () => ({ ...managerRowFixture(), armedAt: NOW }) };
     const findOneAndUpdate = jest.fn().mockResolvedValue(created);
@@ -217,7 +219,7 @@ describe('MPV-061 strict Voice classifier fallback control', () => {
       expectedExpiresAt: row.expiresAt,
       issuedAt: NOW.toISOString(),
       challenge: {
-        challengeId: 'mpv061_ch_' + Buffer.alloc(18, 2).toString('base64url'),
+        challengeId: 'mpv054_ch_' + Buffer.alloc(18, 2).toString('base64url'),
         challengeIssuedAt: NOW.toISOString(),
         challengeExpiresAt: new Date(NOW.getTime() + 5_000).toISOString(),
         replayExpiresAt: new Date(NOW.getTime() + 60_000).toISOString(),
@@ -247,7 +249,7 @@ describe('MPV-061 strict Voice classifier fallback control', () => {
     const challengeExpiresAt = new Date(NOW.getTime() + 5_000).toISOString();
     await mongo.approve({
       controlId: row.controlId,
-      challengeId: 'mpv061_ch_' + Buffer.alloc(18, 2).toString('base64url'),
+      challengeId: 'mpv054_ch_' + Buffer.alloc(18, 2).toString('base64url'),
       expectedChallengeExpiresAt: challengeExpiresAt,
       checkedAt: NOW.toISOString(),
       approvedAt: NOW.toISOString(),
@@ -257,7 +259,7 @@ describe('MPV-061 strict Voice classifier fallback control', () => {
       2,
       {
         controlId: row.controlId,
-        challengeId: 'mpv061_ch_' + Buffer.alloc(18, 2).toString('base64url'),
+        challengeId: 'mpv054_ch_' + Buffer.alloc(18, 2).toString('base64url'),
         state: 'challenged',
         challengeExpiresAt: {
           $eq: new Date(challengeExpiresAt),
@@ -270,7 +272,7 @@ describe('MPV-061 strict Voice classifier fallback control', () => {
 
     await mongo.consume({
       controlId: row.controlId,
-      challengeId: 'mpv061_ch_' + Buffer.alloc(18, 2).toString('base64url'),
+      challengeId: 'mpv054_ch_' + Buffer.alloc(18, 2).toString('base64url'),
       expectedChallengeExpiresAt: challengeExpiresAt,
       checkedAt: NOW.toISOString(),
       consumedAt: NOW.toISOString(),
@@ -281,7 +283,7 @@ describe('MPV-061 strict Voice classifier fallback control', () => {
       3,
       {
         controlId: row.controlId,
-        challengeId: 'mpv061_ch_' + Buffer.alloc(18, 2).toString('base64url'),
+        challengeId: 'mpv054_ch_' + Buffer.alloc(18, 2).toString('base64url'),
         state: 'approved',
         challengeExpiresAt: {
           $eq: new Date(challengeExpiresAt),
@@ -312,6 +314,20 @@ describe('MPV-061 strict Voice classifier fallback control', () => {
 
     await expect(control.issueChallenge(binding())).resolves.toEqual({ active: false });
     expect(store.rows).toHaveLength(0);
+  });
+
+  test('keeps the QA case identity inside the fault-control boundary', async () => {
+    const run = jest.fn().mockResolvedValue({ active: false });
+    const current = binding();
+    const { caseId: _caseId, ...runtimeBinding } = current;
+
+    await expect(
+      runBoundVoiceClassifierFaultControl(
+        { run } as VoiceClassifierFaultControlManager,
+        runtimeBinding,
+      ),
+    ).resolves.toEqual({ active: false });
+    expect(run).toHaveBeenCalledWith(current);
   });
 
   test('an enabled environment alone cannot mint or trigger a fault', async () => {

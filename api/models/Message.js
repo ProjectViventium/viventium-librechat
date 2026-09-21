@@ -902,7 +902,14 @@ async function deleteMessagesSince(req, { messageId, conversationId }) {
 async function getMessages(filter, select) {
   try {
     if (select) {
-      return await Message.find(filter).select(select).sort({ createdAt: 1 }).lean();
+      const fields = select.split(/\s+/);
+      const exclusionOnly = fields.every((field) => field.startsWith('-'));
+      const excludesWriter = fields.some(
+        (field) => field === '-savedMemoryWrite' || field.startsWith('-savedMemoryWrite.'),
+      );
+      const projection = exclusionOnly && !excludesWriter ? `${select} +savedMemoryWrite` : select;
+      const rows = await Message.find(filter).select(projection).sort({ createdAt: 1 }).lean();
+      return exclusionOnly && !excludesWriter ? rows.map(projectMemoryWriteStatus) : rows;
     }
 
     // Exclude private writer input in Mongo itself, then expose only its existing state.
@@ -921,6 +928,42 @@ async function getMessages(filter, select) {
     logger.error('Error getting messages:', err);
     throw err;
   }
+}
+
+function projectMemoryWriteStatus({ savedMemoryWrite, memoryWriteStatus: _ignored, ...message }) {
+  const status = savedMemoryWrite?.status;
+  return ['pending', 'running', 'completed', 'failed'].includes(status)
+    ? { ...message, memoryWriteStatus: status }
+    : message;
+}
+
+/**
+ * Updates the private detached memory-writer lifecycle for one owner-bound assistant message.
+ * Public message reads project only the typed status through getMessages().
+ */
+async function updateMemoryWriteStatus({ userId, messageId, status }) {
+  const owner = String(userId || '').trim();
+  const id = String(messageId || '').trim();
+  if (!owner || !id || !['pending', 'running', 'completed', 'failed'].includes(status)) {
+    return null;
+  }
+
+  const now = new Date();
+  const set = {
+    'savedMemoryWrite.owner': owner,
+    'savedMemoryWrite.status': status,
+    'savedMemoryWrite.heartbeatAt': now,
+  };
+  if (status === 'pending') set['savedMemoryWrite.admittedAt'] = now;
+  if (status === 'running') set['savedMemoryWrite.startedAt'] = now;
+  if (status === 'completed' || status === 'failed') set['savedMemoryWrite.finishedAt'] = now;
+
+  const updated = await Message.findOneAndUpdate(
+    { user: owner, messageId: id },
+    { $set: set },
+    { new: true },
+  ).lean();
+  return updated || null;
 }
 
 /* === VIVENTIUM START ===
@@ -1091,10 +1134,13 @@ async function getLatestRecallEligibleMessageCreatedAt({
  */
 async function getMessage({ user, messageId }) {
   try {
-    return await Message.findOne({
+    const message = await Message.findOne({
       user,
       messageId,
-    }).lean();
+    })
+      .select('+savedMemoryWrite')
+      .lean();
+    return message ? projectMemoryWriteStatus(message) : null;
   } catch (err) {
     logger.error('Error getting message:', err);
     throw err;
@@ -1133,6 +1179,7 @@ module.exports = {
   getMessages,
   getMessageAncestorBranch,
   getLatestRecallEligibleMessageCreatedAt,
+  updateMemoryWriteStatus,
   getMessage,
   deleteMessages,
   __testables: {

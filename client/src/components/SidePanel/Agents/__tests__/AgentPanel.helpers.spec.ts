@@ -1,3 +1,4 @@
+// VIVENTIUM START: preserve Viventium agent-panel form behavior.
 /**
  * @jest-environment jsdom
  */
@@ -39,6 +40,7 @@ const createForm = (): AgentForm => ({
   avatar_preview: '',
   avatar_action: null,
 });
+// VIVENTIUM END
 
 describe('composeAgentUpdatePayload', () => {
   it('includes avatar: null when resetting a persistent agent', () => {

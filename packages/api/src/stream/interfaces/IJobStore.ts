@@ -1,12 +1,21 @@
-import type { NativeAcceptedSource, NativePredecessor } from '../../glasshive/nativeSupersession';
-import type { NativeResponseIdentity, NativeResponseCommit } from '@librechat/data-schemas';
 import type { Agents } from 'librechat-data-provider';
-import type { InteractionSourceSegment } from '../../glasshive/interactionSourceSegments';
 import type { StandardGraph } from '@librechat/agents';
+import type { NativeAcceptedSource, NativePredecessor } from '../../glasshive/nativeSupersession';
+import type { InteractionSourceSegment } from '../../glasshive/interactionSourceSegments';
+export type { InteractionSourceSegment } from '../../glasshive/interactionSourceSegments';
 import type { ReadyInputContinuation } from '../../agents/interactionContext';
+import type { NativeResponseIdentity, NativeResponseCommit } from '@librechat/data-schemas';
+
+/* === VIVENTIUM START === EMO-UC-048 typed local-QA fault boundary. === */
+import type { CortexLocalQaFaultBoundary } from '../../localQa';
+/* === VIVENTIUM END === */
 
 /**
  * Job status enum
+ */
+/* === VIVENTIUM START ===
+ * Feature: Durable logical-turn continuity.
+ * Purpose: Define trusted stream ownership, revision, source, and delivery contracts.
  */
 export type JobStatus = 'running' | 'complete' | 'error' | 'aborted' | 'superseded';
 
@@ -19,16 +28,20 @@ export interface InteractionContext {
   logical_turn_id?: string;
   revision: number;
   source_event_id: string;
-  /** Trusted monotonic source order; never inferred from an opaque event ID. */
+  /** Trusted monotonic source order; never inferred from the opaque source event identity. */
   source_sequence?: number;
   source_conversation_generation?: string;
   ready_input_continuation?: ReadyInputContinuation;
-  /** Opaque SHA-256 scope for the authenticated owner and source conversation. */
+  /** Opaque SHA-256 scope for the authenticated owner + source chat + topic. */
   source_order_scope?: string;
-  source_segments?: readonly InteractionSourceSegment[];
-  source_segments_overflow_count?: number;
+  /** Optional server-owned boundary for sources that must never revise one unresolved turn. */
+  turn_scope?: 'conversation' | 'source_event';
   schedule_id?: string;
   schedule_run_id?: string;
+  /** Presentation/message metadata must omit this raw text. */
+  source_segments?: readonly InteractionSourceSegment[];
+  /** Number of oldest source segments evicted from the bounded internal ledger. */
+  source_segments_overflow_count?: number;
 }
 
 export interface InteractionAdapterCapabilities {
@@ -42,6 +55,7 @@ export interface InteractionDeliveryPolicy {
   commit_authority: 'server' | 'external_adapter';
 }
 
+/** Exact client-authored placeholders for one resumable presentation. */
 export interface ClientPresentation {
   mode: 'append' | 'regenerate';
   userMessageId: string;
@@ -49,6 +63,43 @@ export interface ClientPresentation {
   targetUserMessageId: string;
 }
 
+/** Server-verified durable side effect that is allowed to outlive response supersession. */
+export interface DurableEffectReceipt {
+  effect_kind: 'durable_work_accepted' | 'durable_work_action_accepted';
+  effect_ref: string;
+  source_event_id: string;
+  response_message_id: string;
+  committed_at: number;
+}
+
+/** Hash-only Voice authority frozen after the route's final persisted authority re-read. */
+export interface VoiceDurableEffectAuthorityBinding {
+  version: 1;
+  userId: string;
+  voiceAuthorityRef: string;
+  voice: {
+    callSessionId: string;
+    voiceTurnId: string;
+    mode: 'call' | 'wing';
+    callModeRevision: number;
+    speakerSessionRevision: number;
+    segmentRevisionDigest: string;
+    ownerParticipantDigest: string;
+    engagementDigest?: string;
+    engagementExpiresAt?: string;
+  };
+}
+
+export interface LogicalTurnClaim {
+  status: 'claimed' | 'duplicate' | 'superseded' | 'initializing' | 'busy' | 'stale_source_order';
+  streamId: string;
+  interactionContext: InteractionContext;
+  supersededStreamIds: string[];
+  /** Store-internal owner receipts for fencing a prior claim that has not published its job yet. */
+  supersededClaimIdentities?: string[];
+}
+
+/** Authenticated monotonic source-order observation made before provider or presentation awaits. */
 export interface SourceOrderObservation {
   source_order_scope: string;
   source_sequence: number;
@@ -60,13 +111,6 @@ export interface SourceOrderObservationResult {
   stale: boolean;
 }
 
-export interface LogicalTurnClaim {
-  status: 'claimed' | 'duplicate' | 'superseded' | 'initializing' | 'busy';
-  streamId: string;
-  interactionContext: InteractionContext;
-  supersededStreamIds: string[];
-}
-
 export type DeliveryAcknowledgementState =
   'committed' | 'committed_effect' | 'partial_removed' | 'failed';
 
@@ -74,8 +118,11 @@ export interface InteractionDeliveryAck {
   logical_turn_id: string;
   revision: number;
   state: DeliveryAcknowledgementState;
+  /** Exact server-persisted durable provider receipt; never inferred from presentation text. */
+  effect_ref?: string;
   presentation_ref?: string;
   presentation_refs?: string[];
+  /** Store-authored visible-presentation time. Adapter input is never authoritative. */
   presentation_committed_at?: number;
   source_kind?: 'assistant_message' | 'schedule_result' | 'callback';
   schedule_id?: string;
@@ -95,10 +142,35 @@ export interface CortexPresentationBinding {
   }>;
   claimToken: string;
   presentationLeaseToken: string;
+  /** Server time when this exact presentation was bound to the stream job. */
   boundAt: number;
 }
 
-export type CortexPresentationFenceReceipt = Omit<CortexPresentationBinding, 'boundAt'>;
+export interface CortexPresentationFenceReceipt {
+  ownerId: string;
+  messageId: string;
+  parentMessageId: string;
+  revision: number;
+  generation: number;
+  deliveryIds: string[];
+  deliveryReceipts: Array<{
+    deliveryId: string;
+    graphResultHash: string;
+  }>;
+  claimToken: string;
+  presentationLeaseToken: string;
+}
+
+export type CortexPresentationVerificationStage = 'bind' | 'append' | 'publish';
+
+export interface ChunkEmissionOptions {
+  verifyCortexPresentation?: (
+    stage: CortexPresentationVerificationStage,
+  ) => Promise<CortexPresentationFenceReceipt>;
+  /* === VIVENTIUM START === EMO-UC-048 fault capability after presentation authorization. === */
+  consumeCortexFault?: (boundary: CortexLocalQaFaultBoundary) => Promise<{ triggered: boolean }>;
+  /* === VIVENTIUM END === */
+}
 
 export interface DeliveryAcknowledgementResult {
   status:
@@ -123,6 +195,7 @@ export interface DeliveryAcknowledgementResult {
   };
 }
 
+/** Result of atomically binding one delivery acknowledgement to the expected Cortex generation. */
 export interface DeliveryAcknowledgementBindingResult {
   status:
     | 'recorded'
@@ -136,6 +209,7 @@ export interface DeliveryAcknowledgementBindingResult {
   ownerStreamId?: string;
   cortexPresentation?: CortexPresentationBinding;
 }
+/* === VIVENTIUM END === */
 
 /**
  * Serializable job data - no object references, suitable for Redis/external storage
@@ -174,14 +248,27 @@ export interface SerializableJobData {
   iconURL?: string;
   model?: string;
   promptTokens?: number;
+  /** Legacy/public call-session metadata retained for stream resume compatibility. */
   voiceCallSessionId?: string;
+  /* === VIVENTIUM START ===
+   * Feature: Durable logical-turn continuity.
+   * Purpose: Persist only server-authored generation and delivery ownership metadata with a job.
+   */
   interactionContext?: InteractionContext;
   adapterCapabilities?: AdapterCapabilities;
   deliveryPolicy?: InteractionDeliveryPolicy;
   deliveryAcknowledgement?: InteractionDeliveryAck;
+  /** Exact adapter receipt for the current fenced Cortex presentation, separate from Main. */
   cortexDeliveryAcknowledgement?: InteractionDeliveryAck;
   cortexDeliveryAcknowledgementPresentation?: CortexPresentationBinding;
-  /** VIVENTIUM: immutable native admission; only the publication owner may change it. */
+  durableEffectReceipt?: DurableEffectReceipt;
+  /** All durable launches committed by this response; the singular field is the first receipt. */
+  durableEffectReceipts?: DurableEffectReceipt[];
+  /** Exact route-captured Voice authority used only for Mongo-before-provider effect admission. */
+  viventiumVoiceEffectAuthority?: VoiceDurableEffectAuthorityBinding;
+  viventiumCallSessionId?: string;
+  viventiumVoiceTaskId?: string;
+  /** Immutable native admission; only the typed publication owner may change it. */
   nativeResponse?: NativeResponseIdentity;
   nativePredecessor?: NativePredecessor;
   nativeAcceptedSources?: { invocationId: string; sources: NativeAcceptedSource[] };
@@ -189,8 +276,11 @@ export interface SerializableJobData {
   nativeResponseFinished?: boolean;
   nativeResponseSettled?: boolean;
   generationCompleted?: boolean;
+  /** Admission-time receipt used only to project optimistic UI IDs onto authoritative IDs. */
   clientPresentation?: ClientPresentation;
+  /** Exact server-held Cortex presentation emitted on this logical-turn stream. */
   cortexPresentation?: CortexPresentationBinding;
+  /* === VIVENTIUM END === */
 }
 
 /**
@@ -271,6 +361,7 @@ export interface ResumeState {
   responseMessageId?: string;
   conversationId?: string;
   sender?: string;
+  clientPresentation?: ClientPresentation;
 }
 
 /**
@@ -284,6 +375,7 @@ export interface ResumeState {
  * This consolidates job metadata + content state into a single interface.
  */
 export interface IJobStore {
+  /** Process-local stores cannot protect Telegram ordering across restarts or replicas. */
   readonly sourceOrderDurability?: 'process' | 'durable';
 
   /** Initialize the store (e.g., connect to Redis, start cleanup intervals) */
@@ -294,12 +386,18 @@ export interface IJobStore {
     streamId: string,
     userId: string,
     conversationId?: string,
+    /* === VIVENTIUM START ===
+     * Feature: Durable logical-turn continuity.
+     * Purpose: Atomically seed trusted job metadata at create-once admission.
+     */
     initialData?: Partial<SerializableJobData>,
+    /* === VIVENTIUM END === */
   ): Promise<SerializableJobData>;
 
-  /** Advance or read the trusted source watermark before presentation. */
-  observeSourceOrder?(observation: SourceOrderObservation): Promise<SourceOrderObservationResult>;
-
+  /* === VIVENTIUM START ===
+   * Feature: Durable logical-turn continuity.
+   * Purpose: Keep revision ownership, rollback, and external delivery acknowledgement server-held.
+   */
   /** Retain authenticated input in the existing logical-turn owner before asynchronous setup. */
   retainLogicalTurnInput(userId: string, context: InteractionContext): Promise<InteractionContext>;
 
@@ -310,11 +408,17 @@ export interface IJobStore {
     interactionContext: InteractionContext,
   ): Promise<LogicalTurnClaim>;
 
+  /** Atomically advance or read one authenticated source-order watermark. */
+  observeSourceOrder(observation: SourceOrderObservation): Promise<SourceOrderObservationResult>;
+
   /** Conditionally undo a failed claim only while that stream still owns the latest revision. */
   rollbackLogicalTurnClaim(
     streamId: string,
     interactionContext: InteractionContext,
   ): Promise<boolean>;
+
+  /** Fence any older claimed stream slots after this revision's job is durably admitted. */
+  fenceSupersededLogicalTurnClaims?(claim: LogicalTurnClaim): Promise<void>;
 
   /** Remove only a source-event receipt that points at a confirmed missing owner job. */
   forgetMissingSourceEventReceipt(
@@ -335,16 +439,28 @@ export interface IJobStore {
   acknowledgeDelivery(
     acknowledgement: InteractionDeliveryAck,
   ): Promise<DeliveryAcknowledgementResult>;
+  /* === VIVENTIUM END === */
 
+  /** Get a job by streamId (streamId === conversationId) */
+  getJob(streamId: string): Promise<SerializableJobData | null>;
+
+  /** Update job data */
+  updateJob(
+    streamId: string,
+    updates: Partial<SerializableJobData>,
+    expectedNativeIdentity?: NativeResponseIdentity,
+  ): Promise<void>;
+
+  /** Monotonically bind one server-authorized Cortex presentation to this stream. */
   bindCortexPresentation(streamId: string, binding: CortexPresentationBinding): Promise<boolean>;
 
+  /** Bind Main or a separately fenced Cortex acknowledgement to the exact current job state. */
   bindDeliveryAcknowledgement(
     streamId: string,
     acknowledgement: InteractionDeliveryAck,
     expectedCortexPresentation: CortexPresentationBinding | null,
   ): Promise<DeliveryAcknowledgementBindingResult>;
 
-  /** VIVENTIUM: saved native result publication, independent of transport acknowledgement. */
   bindNativeResponse(identity: NativeResponseIdentity): Promise<boolean>;
   commitNativeResponse(
     identity: NativeResponseIdentity,
@@ -363,17 +479,6 @@ export interface IJobStore {
     finalEvent: string,
     mode?: 'cancelled',
   ): Promise<boolean>;
-
-  /** Get a job by streamId (streamId === conversationId) */
-  getJob(streamId: string): Promise<SerializableJobData | null>;
-
-  /** Update job data */
-  /** Optional identity fences updates against reuse of a native stream job. */
-  updateJob(
-    streamId: string,
-    updates: Partial<SerializableJobData>,
-    expectedNativeIdentity?: NativeResponseIdentity,
-  ): Promise<void>;
 
   /** Delete a job */
   deleteJob(streamId: string, retiredNativeResponse?: NativeResponseIdentity): Promise<void>;
@@ -520,7 +625,7 @@ export interface IEventTransport {
     },
   ): { unsubscribe: () => void; ready?: Promise<void> };
 
-  /** Publish a chunk event and report whether the transport accepted it. */
+  /** Publish a chunk event and report whether a transport accepted it. */
   emitChunk(
     streamId: string,
     event: unknown,
@@ -543,21 +648,31 @@ export interface IEventTransport {
    * generating Replica A receives signal and stops.
    * Optional - only implemented in Redis transport.
    */
+  /* === VIVENTIUM START ===
+   * Feature: Exact stream supersession.
+   * Purpose: Carry a typed internal abort reason without widening public stream authority.
+   */
   emitAbort?(
     streamId: string,
     reason?: string,
     nativeReplay?: NativeResponseReplayGuard,
   ): void | boolean | Promise<void | boolean>;
+  /* === VIVENTIUM END === */
 
   /**
    * Register callback for abort signals from any replica (Redis mode).
    * Called when abort is triggered from any replica.
    * Optional - only implemented in Redis transport.
    */
+  /* === VIVENTIUM START ===
+   * Feature: Exact stream supersession.
+   * Purpose: Propagate the internal abort reason to the exact stream subscriber.
+   */
   onAbort?(
     streamId: string,
     callback: (reason?: string, nativeJobProof?: string) => void,
   ): void | Promise<void>;
+  /* === VIVENTIUM END === */
 
   /** Get subscriber count for a stream */
   getSubscriberCount(streamId: string): number;
@@ -593,13 +708,10 @@ export interface EventTransportEmitOptions {
   presentationAcknowledgementTimeoutMs?: number;
 }
 
-/** Native replay is authorized by the exact retained job at the actual publish boundary. */
 export interface NativeResponseReplayGuard {
   identity: NativeResponseIdentity;
   isCurrent: () => boolean;
-  /** Stop uses the same retained replay owner, with explicit cancelled state. */
   cancelled?: boolean;
-  /** Required for ABORT, whose wire event does not itself contain FINAL. */
   finalEvent?: string;
 }
 

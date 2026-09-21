@@ -148,13 +148,10 @@ async function resolveMessageAttachmentSurface({ req, agent_id }) {
     requestedEndpointType ||
     requestedEndpoint;
 
-  const capability = req.config?.endpoints?.agents?.providerCapabilities?.[currentProvider];
   return {
     currentProvider,
     endpointType,
     useResponsesApi,
-    nativeWorkspaceAttachments:
-      capability?.workspace_binding === true && capability?.worker_native_tools === true,
   };
 }
 
@@ -163,13 +160,9 @@ function isProviderNativeMessageAttachment({
   endpointType,
   currentProvider,
   useResponsesApi,
-  nativeWorkspaceAttachments = false,
+  nativeWorkspace,
 }) {
-  /* === VIVENTIUM START ===
-   * Native workspace providers receive admitted, owner-scoped files through the existing signed
-   * source bundle. Preserve those bytes instead of forcing API-specific text/STT extraction.
-   * === VIVENTIUM END === */
-  if (nativeWorkspaceAttachments) {
+  if (nativeWorkspace) {
     return true;
   }
   const isAzureWithResponsesApi =
@@ -695,7 +688,7 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
         originalname: file.originalname,
       });
     } else {
-      const { currentProvider, endpointType, useResponsesApi, nativeWorkspaceAttachments } =
+      const { currentProvider, endpointType, useResponsesApi } =
         await resolveMessageAttachmentSurface({
           req,
           agent_id,
@@ -705,7 +698,11 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
         endpointType,
         currentProvider,
         useResponsesApi,
-        nativeWorkspaceAttachments,
+        nativeWorkspace:
+          req.config?.endpoints?.agents?.providerCapabilities?.[currentProvider]
+            ?.workspace_binding === true &&
+          req.config?.endpoints?.agents?.providerCapabilities?.[currentProvider]
+            ?.worker_native_tools === true,
       });
 
       if (providerNativeAttachment) {

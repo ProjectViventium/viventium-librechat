@@ -108,6 +108,9 @@ const {
   appendGlassHiveMainOrchestrationFacade,
   availableGlassHiveMainOrchestrationTools,
 } = require('~/app/clients/tools/util/glassHiveOrchestrationTools');
+const {
+  conversationProviderUsesInvocationLocalTime,
+} = require('~/server/services/viventium/GlassHiveConversationProviderService');
 // === VIVENTIUM END ===
 const VIVENTIUM_GLASSHIVE_MCP_SERVER_NAME = 'glasshive-workers-projects';
 const DEFAULT_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS = 15_000;
@@ -1177,7 +1180,14 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
   const hasExecuteCode = filteredTools.includes(Tools.execute_code);
 
   if (hasWebSearch) {
-    toolContextMap[Tools.web_search] = buildWebSearchContext();
+    /* === VIVENTIUM START ===
+     * Feature: Stable native-session tool authority.
+     * Purpose: Keep changing wall-clock context out of the durable provider snapshot when the
+     * same request already carries invocation-local turn context.
+     * === VIVENTIUM END === */
+    toolContextMap[Tools.web_search] = buildWebSearchContext({
+      includeCurrentTime: !conversationProviderUsesInvocationLocalTime(req, agent),
+    });
   }
 
   if (hasExecuteCode && tool_resources) {

@@ -108,6 +108,7 @@ const helperRoot = path.join(ownerRepo, 'apps', 'macos', 'ViventiumHelper');
 const helperSourceFiles = [
   'Package.swift',
   'Sources/ViventiumHelper/ViventiumHelperApp.swift',
+  'Sources/ViventiumHelper/LifeSetup.swift',
   'Sources/ViventiumHelper/Resources/Info.plist',
 ];
 for (const relative of helperSourceFiles) {
@@ -138,6 +139,10 @@ fs.mkdirSync(path.dirname(installedGateScript), { recursive: true });
 fs.copyFileSync(
   path.join(productionRoot, 'scripts', 'viventium', 'parallel_work_release_gate.py'),
   installedGateScript,
+);
+fs.copyFileSync(
+  path.join(productionRoot, 'scripts', 'viventium', 'helper_artifact_verify.py'),
+  path.join(path.dirname(installedGateScript), 'helper_artifact_verify.py'),
 );
 fs.chmodSync(installedGateScript, 0o755);
 const installedGateSource = fs.readFileSync(installedGateScript, 'utf8');
@@ -579,6 +584,31 @@ function openGate(caseId) {
   };
 }
 
+function measuredStoragePressure(status = 'healthy') {
+  const disk = fs.statfsSync(releaseDir);
+  const usedPercent = Math.round(((disk.blocks - disk.bfree) / disk.blocks) * 100000) / 1000;
+  const availableBytes = disk.bavail * disk.bsize;
+  // Isolate the policy state under test from the runner's unrelated disk occupancy.
+  let thresholdPercent = 100;
+  let warningMarginPercent = 0.001;
+  if (status === 'warning') {
+    const gap = Math.min(1, usedPercent / 2, (100 - usedPercent) / 2);
+    thresholdPercent = usedPercent + gap;
+    warningMarginPercent = gap * 2;
+  } else if (status === 'critical') {
+    thresholdPercent = usedPercent - Math.min(1, usedPercent / 2);
+    warningMarginPercent = Math.min(1, thresholdPercent / 2);
+  }
+  return {
+    version: 1,
+    status,
+    usedPercent,
+    availableBytes,
+    thresholdPercent,
+    warningMarginPercent,
+  };
+}
+
 function validReadinessFacts() {
   return {
     contractVersion: 1,
@@ -593,14 +623,7 @@ function validReadinessFacts() {
       layerNames: ['main'],
       registryHash: VALID_PROMPT_REGISTRY_HASH,
     },
-    storagePressure: {
-      version: 1,
-      status: 'healthy',
-      usedPercent: 40,
-      availableBytes: 20 * 1024 * 1024 * 1024,
-      thresholdPercent: 90,
-      warningMarginPercent: 10,
-    },
+    storagePressure: measuredStoragePressure(),
   };
 }
 
@@ -682,7 +705,7 @@ function measuredArtifactIdentityFromPython() {
   return JSON.parse(
     execFileSync(
       '/usr/bin/python3',
-      ['-c', source, installedGateScript, ownerRepo, promptBundlePath, ownerPath],
+      ['-B', '-c', source, installedGateScript, ownerRepo, promptBundlePath, ownerPath],
       {
         encoding: 'utf8',
       },
@@ -744,7 +767,9 @@ function writeReleaseSnapshot(overrides = {}) {
     readiness_facts: validReadinessFacts(),
     artifact_checks: validArtifactChecks(),
     blocking_artifact_checks: [],
-    artifact_identity: validArtifactIdentity(),
+    artifact_identity: Object.hasOwn(overrides, 'artifact_identity')
+      ? overrides.artifact_identity
+      : validArtifactIdentity(),
     owner_binding: ownerBinding,
     ...overrides,
   };
@@ -883,6 +908,11 @@ jest.mock('../GlassHiveOrchestrationReadinessService', () => ({
   }),
 }));
 
+afterAll(() => {
+  ownerProcess.kill();
+  fs.rmSync(releaseRoot, { recursive: true, force: true });
+});
+
 describe('ViventiumOrchestrationMode', () => {
   beforeEach(() => {
     jest.resetModules();
@@ -903,8 +933,6 @@ describe('ViventiumOrchestrationMode', () => {
 
   afterAll(() => {
     process.env = ORIGINAL_ENV;
-    ownerProcess.kill();
-    fs.rmSync(releaseRoot, { recursive: true, force: true });
   });
 
   test('new accounts use automatic work while an explicit focused preference survives', () => {
@@ -2200,6 +2228,11 @@ describe('ViventiumOrchestrationMode', () => {
   test('allows explicit local QA with shaped dirty artifacts but blocks every non-local mode', () => {
     const dirtyPath = path.join(ownerRepo, 'dirty-local-qa.txt');
     fs.writeFileSync(dirtyPath, 'intentional local QA drift\n');
+    const readinessFacts = validReadinessFacts();
+    fs.writeFileSync(
+      path.join(releaseDir, 'parallel-work-readiness-facts.json'),
+      `${JSON.stringify(readinessFacts)}\n`,
+    );
     const artifactIdentity = measuredArtifactIdentityFromPython();
     const artifactChecks = [
       { check_id: 'SOURCE-IDENTITY', status: 'FAIL', reason: 'source_dirty' },
@@ -2221,6 +2254,7 @@ describe('ViventiumOrchestrationMode', () => {
         artifact_checks: artifactChecks,
         blocking_artifact_checks: [artifactChecks[0], artifactChecks[3]],
         artifact_identity: artifactIdentity,
+        readiness_facts: readinessFacts,
       });
       const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
 
@@ -2237,6 +2271,7 @@ describe('ViventiumOrchestrationMode', () => {
           artifact_checks: artifactChecks,
           blocking_artifact_checks: [artifactChecks[0], artifactChecks[3]],
           artifact_identity: artifactIdentity,
+          readiness_facts: readinessFacts,
         });
         expect(parallelWorkReleaseGateSnapshot()).toEqual(
           expect.objectContaining({
@@ -2271,13 +2306,13 @@ describe('ViventiumOrchestrationMode', () => {
             reason: 'prompt_layer_hash_mismatch',
           },
         ],
-        readiness_facts: {
+        readiness_facts: () => ({
           ...validReadinessFacts(),
           promptLayers: {
             ...validReadinessFacts().promptLayers,
             registryHash: '9'.repeat(64),
           },
-        },
+        }),
       },
     ],
     [
@@ -2291,17 +2326,10 @@ describe('ViventiumOrchestrationMode', () => {
         blocking_checks: [
           { check_id: 'STORAGE-PRESSURE', status: 'FAIL', reason: 'storage_pressure' },
         ],
-        readiness_facts: {
+        readiness_facts: () => ({
           ...validReadinessFacts(),
-          storagePressure: {
-            version: 1,
-            status: 'warning',
-            usedPercent: 85,
-            availableBytes: 100 * 1024 ** 3,
-            thresholdPercent: 90,
-            warningMarginPercent: 10,
-          },
-        },
+          storagePressure: measuredStoragePressure('warning'),
+        }),
       },
     ],
     [
@@ -2315,22 +2343,21 @@ describe('ViventiumOrchestrationMode', () => {
         blocking_checks: [
           { check_id: 'STORAGE-PRESSURE', status: 'FAIL', reason: 'storage_pressure' },
         ],
-        readiness_facts: {
+        readiness_facts: () => ({
           ...validReadinessFacts(),
-          storagePressure: {
-            version: 1,
-            status: 'critical',
-            usedPercent: 95,
-            availableBytes: 1024,
-            thresholdPercent: 90,
-            warningMarginPercent: 10,
-          },
-        },
+          storagePressure: measuredStoragePressure('critical'),
+        }),
       },
     ],
   ])(
     'allows explicit shaped local QA with %s while every non-local mode remains blocked',
     (_caseName, blocker, degraded) => {
+      const readinessFacts = degraded.readiness_facts();
+      fs.writeFileSync(
+        path.join(releaseDir, 'parallel-work-readiness-facts.json'),
+        `${JSON.stringify(readinessFacts)}\n`,
+      );
+      const artifactIdentity = measuredArtifactIdentityFromPython();
       writeReleaseSnapshot({
         mode: 'local-qa',
         label: 'PRE-GATE / NOT READY',
@@ -2338,6 +2365,8 @@ describe('ViventiumOrchestrationMode', () => {
         exposure_allowed: true,
         local_qa_override: true,
         ...degraded,
+        readiness_facts: readinessFacts,
+        artifact_identity: artifactIdentity,
       });
       const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
       expect(parallelWorkReleaseGateSnapshot()).toEqual(
@@ -2352,6 +2381,8 @@ describe('ViventiumOrchestrationMode', () => {
         writeBlockedReleaseSnapshot({
           mode,
           ...degraded,
+          readiness_facts: readinessFacts,
+          artifact_identity: artifactIdentity,
         });
         expect(parallelWorkReleaseGateSnapshot()).toEqual(
           expect.objectContaining({

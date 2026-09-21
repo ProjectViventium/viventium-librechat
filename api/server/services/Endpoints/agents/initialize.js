@@ -31,15 +31,13 @@ const {
 } = require('@librechat/api');
 const {
   EModelEndpoint,
+  PermissionBits,
+  ResourceType,
+  SystemRoles,
   isAgentsEndpoint,
   getResponseSender,
   isEphemeralAgentId,
 } = require('librechat-data-provider');
-/* === VIVENTIUM START ===
- * Feature: ACL-safe handoff graph initialization
- * Purpose: A persisted graph edge must not bypass the same VIEW gate used by the Agent API.
- * === VIVENTIUM END === */
-const { PermissionBits, ResourceType, SystemRoles } = require('librechat-data-provider');
 const { checkPermission } = require('~/server/services/PermissionService');
 const {
   createToolEndCallback,
@@ -60,7 +58,6 @@ const {
   sanitizeAggregatedContentParts,
 } = require('~/server/services/viventium/sanitizeAggregatedContentParts');
 const {
-  collapseRecoveredVisibleTextDuplicate,
   extractVisibleTextFromContentParts,
   repairMissedVisibleMessageDelta,
   repairMissedVoiceMessageDelta,
@@ -80,6 +77,9 @@ const {
   isVoiceCallActive,
 } = require('~/server/services/viventium/voiceLlmOverride');
 const {
+  applyScheduledAgentOverride,
+} = require('~/server/services/viventium/scheduledAgentOverride');
+const {
   resolveFallbackCandidates,
   isFallbackModelValid,
   buildFallbackAgent,
@@ -88,18 +88,14 @@ const {
   initializePrimaryAgentWithFallback,
 } = require('~/server/services/viventium/agentLlmFallback');
 const {
-  appendOmittedCapabilityReadiness,
-  evaluateOptionalAgentCapabilityReadiness,
   markOptionalAgentInitializationFailed,
-  synchronizeFallbackGraphResilience,
 } = require('~/server/services/viventium/agentGraphResilience');
-const {
-  applyScheduledAgentOverride,
-} = require('~/server/services/viventium/scheduledAgentOverride');
 const {
   attachDeclaredConversationProviderCapabilityBundle,
   attachConversationProviderCapabilityBundle,
+  bindConversationProviderStableAuthorityDigest,
   bindHarnessCancellation,
+  conversationProviderStableAuthorityDigest,
   installConversationProviderCapabilityRefresher,
   resolveConversationProviderId,
   setConversationProviderCapability,
@@ -193,6 +189,13 @@ const summarizeInitTools = (config) => {
     mcpAuthServers,
   };
 };
+
+const createConnectedAgentAbortError = () => {
+  const error = new Error('operation was aborted');
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  return error;
+};
 /* === VIVENTIUM END === */
 
 /**
@@ -211,8 +214,8 @@ function createToolLoader(signal, streamId = null, definitionsOnly = false) {
    * @param {string[]} params.tools
    * @param {string} params.provider
    * @param {string} params.model
-   * @param {object} [params.glasshive_options]
    * @param {AgentToolResources} params.tool_resources
+   * @param {{parallel_available: boolean, default_mode: 'focused'|'parallel', worker_profile?: string, fallback_worker_profile?: string} | undefined} params.orchestration
    * @returns {Promise<{
    *   tools?: StructuredTool[],
    *   toolContextMap: Record<string, unknown>,
@@ -228,14 +231,27 @@ function createToolLoader(signal, streamId = null, definitionsOnly = false) {
     model,
     agentId,
     provider,
-    glasshive_options,
     tool_options,
     tool_resources,
+    orchestration,
   }) {
     if (isVoiceActorSideEffectRestricted(req)) {
       return emptyToolLoadResult();
     }
-    const agent = { id: agentId, tools, provider, model, glasshive_options, tool_options };
+    /* === VIVENTIUM START ===
+     * Feature: Provider-independent Main orchestration facade binding.
+     * Purpose: Preserve only the trusted Main declaration required by ToolService. A voice model
+     * override changes provider/model but must not erase this declaration; mission roots without
+     * it still receive no peer-spawn/control facade.
+     * === VIVENTIUM END === */
+    const agent = {
+      id: agentId,
+      tools,
+      provider,
+      model,
+      tool_options,
+      ...(orchestration ? { glasshive_options: { orchestration } } : {}),
+    };
     try {
       return await loadAgentTools({
         req,
@@ -414,6 +430,8 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
      * === VIVENTIUM END === */
     const shouldRepairVoiceDelta = req?.body?.voiceMode === true;
     const shouldRepairVisibleDelta = event?.visibleToUser === true;
+    const beforeContentParts =
+      shouldRepairVoiceDelta || shouldRepairVisibleDelta ? contentParts.slice() : null;
     const beforeVoiceText = shouldRepairVoiceDelta
       ? extractVisibleTextFromContentParts(contentParts)
       : '';
@@ -422,18 +440,20 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         ? extractVisibleTextFromContentParts(contentParts)
         : '';
     rawAggregateContent(event);
-    sanitizeAggregatedContentParts(contentParts, { preserveIndices: true });
+    sanitizeAggregatedContentParts(contentParts);
     if (shouldRepairVoiceDelta) {
       const afterVoiceText = extractVisibleTextFromContentParts(contentParts);
       const repaired = repairMissedVoiceMessageDelta({
         contentParts,
+        beforeContentParts,
         event: event?.event,
         data: event?.data,
         beforeText: beforeVoiceText,
         afterText: afterVoiceText,
+        contentMeta: event?.viventiumContentMeta,
       });
       if (repaired) {
-        sanitizeAggregatedContentParts(contentParts, { preserveIndices: true });
+        sanitizeAggregatedContentParts(contentParts);
         if (!req._viventiumVoiceDeltaAggregationRepairLogged) {
           req._viventiumVoiceDeltaAggregationRepairLogged = true;
           logger.warn(
@@ -445,36 +465,29 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       const afterVisibleText = extractVisibleTextFromContentParts(contentParts);
       const repaired = repairMissedVisibleMessageDelta({
         contentParts,
+        beforeContentParts,
         event: event?.event,
         data: event?.data,
         beforeText: beforeVisibleText,
         afterText: afterVisibleText,
+        contentMeta: event?.viventiumContentMeta,
       });
       if (repaired) {
-        sanitizeAggregatedContentParts(contentParts, { preserveIndices: true });
+        sanitizeAggregatedContentParts(contentParts);
         req._viventiumVisibleDeltaAggregationRepaired = true;
         req._viventiumVisibleDeltaAggregationRecoveredText =
           extractVisibleTextFromContentParts(contentParts);
         if (!req._viventiumVisibleDeltaAggregationRepairLogged) {
           req._viventiumVisibleDeltaAggregationRepairLogged = true;
           logger.warn(
-            `[VIVENTIUM][VisibleDeltaAggregation] Repaired missed visible message delta streamId=${streamId || 'none'}`,
+            `[VIVENTIUM][VisibleDeltaAggregation] Repaired missed visible message delta streamId=${streamId || 'none'} agentId=${event?.viventiumContentMeta?.agentId || 'unknown'} groupId=${event?.viventiumContentMeta?.groupId ?? 'none'} partitions=${
+              contentParts
+                .filter((part) => part?.type === 'text')
+                .map((part) => `${part?.agentId || 'unknown'}:${part?.groupId ?? 'none'}`)
+                .join(',') || 'none'
+            }`,
           );
         }
-      }
-    }
-    if (
-      collapseRecoveredVisibleTextDuplicate({
-        contentParts,
-        recoveredText: req?._viventiumVisibleDeltaAggregationRecoveredText,
-      })
-    ) {
-      req._viventiumVisibleDeltaAggregationDuplicateCollapsed = true;
-      if (!req._viventiumVisibleDeltaAggregationCollapseLogged) {
-        req._viventiumVisibleDeltaAggregationCollapseLogged = true;
-        logger.warn(
-          `[VIVENTIUM][VisibleDeltaAggregation] Collapsed exact final replay of repaired text streamId=${streamId || 'none'}`,
-        );
       }
     }
   };
@@ -548,41 +561,36 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   if (!loadedPrimaryAgent) {
     throw new Error('Agent not found');
   }
+  /* === VIVENTIUM START ===
+   * Feature: Agent Builder-owned stable Main authority.
+   * Purpose: Fingerprint the persisted declaration before voice routing, special-variable
+   * rendering, recall/tool health, or request-local tool loading can mutate the runtime agent.
+   * === VIVENTIUM END === */
+  const primaryStableAuthoritySha256 =
+    conversationProviderStableAuthorityDigest(loadedPrimaryAgent);
   const primaryAgent = sideEffectsRestricted
     ? sanitizeAgentForRestrictedVoiceTurn(loadedPrimaryAgent)
     : loadedPrimaryAgent;
   /* === VIVENTIUM START ===
    * Feature: Runtime provider capability enforcement.
-   * Purpose: Fail loudly for a stored provider/model/options tuple that no longer matches the
-   * compiled capability registry; never coerce an unknown provider to OpenAI.
+   * Purpose: Validate the stored primary selection before scheduled or voice overrides.
    */
-  Object.assign(
+  const capabilityValidatedPrimaryAgent = applyAgentProviderCapabilityDefaults(
     primaryAgent,
-    applyAgentProviderCapabilityDefaults(
-      primaryAgent,
-      req.config?.endpoints?.agents?.providerCapabilities,
-      req.config?.endpoints?.agents?.capabilityRequiredProviders,
-    ),
+    req.config?.endpoints?.agents?.providerCapabilities,
+    req.config?.endpoints?.agents?.capabilityRequiredProviders,
   );
-  /* === VIVENTIUM END === */
-  /* === VIVENTIUM NOTE END === */
-
-  /* === VIVENTIUM START ===
-   * Feature: Scheduled-agent execution policy
-   * Purpose: Authenticated scheduled runs use their compiled automation tuple while
-   * ordinary conscious chat keeps its independent latency/effort setting.
-   * === VIVENTIUM END === */
+  Object.assign(primaryAgent, capabilityValidatedPrimaryAgent);
   applyScheduledAgentOverride(primaryAgent, req);
   if (req.viventiumScheduledAgentExecution) {
-    const {
-      provider,
-      model,
-      reasoning_effort: reasoningEffort,
-    } = req.viventiumScheduledAgentExecution;
-    logger.info(
-      `[scheduledAgent] Applied authenticated execution tuple provider=${provider} model=${model} effort=${reasoningEffort}`,
-    );
+    logger.info('[VIVENTIUM][scheduler] Applied authenticated scheduled agent execution tuple', {
+      provider: req.viventiumScheduledAgentExecution.provider,
+      model: req.viventiumScheduledAgentExecution.model,
+      reasoningEffort: req.viventiumScheduledAgentExecution.reasoning_effort,
+    });
   }
+  /* === VIVENTIUM END === */
+  /* === VIVENTIUM NOTE END === */
 
   /* === VIVENTIUM START ===
    * Feature: Voice Chat LLM Override
@@ -601,28 +609,16 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   /* === VIVENTIUM END === */
 
   /* === VIVENTIUM START ===
-   * Feature: Structured harness lifecycle.
-   * Purpose: Voice overrides and provider capabilities, not labels, decide whether this request
-   * owns workspace execution, activity rendering, duplicate prevention, and native cancellation.
-   */
-  const selectedPrimaryCapability =
-    appConfig?.endpoints?.[EModelEndpoint.agents]?.providerCapabilities?.[primaryAgent.provider];
-  req._viventiumHarnessActivityEnabled =
-    !sideEffectsRestricted && selectedPrimaryCapability?.activity_stream === true;
-  req._viventiumHarnessExecutionEnabled =
-    !sideEffectsRestricted && selectedPrimaryCapability?.workspace_binding === true;
-  req._viventiumHarnessInvocationStarted = false;
-  /* === VIVENTIUM END === */
-
-  /* === VIVENTIUM START ===
    * Feature: Harness activity/cancellation lifecycle binding.
    * Purpose: Mark activity-stream providers through structured capabilities after voice overrides,
    * so UI rendering and duplicate-run guards never depend on a provider label.
    * === VIVENTIUM END === */
   const primaryProviderCapability =
     appConfig?.endpoints?.[EModelEndpoint.agents]?.providerCapabilities?.[primaryAgent.provider];
-  req._viventiumHarnessActivityEnabled = primaryProviderCapability?.activity_stream === true;
-  req._viventiumHarnessExecutionEnabled = primaryProviderCapability?.workspace_binding === true;
+  req._viventiumHarnessActivityEnabled =
+    !sideEffectsRestricted && primaryProviderCapability?.activity_stream === true;
+  req._viventiumHarnessExecutionEnabled =
+    !sideEffectsRestricted && primaryProviderCapability?.workspace_binding === true;
   req._viventiumHarnessInvocationStarted = false;
 
   const validateStart = nowIfDeep();
@@ -711,17 +707,21 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     return { fallbackAgent: null, fallbackAssignment: null };
   };
 
+  const initialOpenAIPlatformFallbackFlag = req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
+  let platformFallbackAuthDepth = 0;
   const withPlatformFallbackAuth = async (callback) => {
-    const previousOpenAIPlatformFallbackFlag =
-      req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
+    platformFallbackAuthDepth += 1;
     req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = true;
     try {
       return await callback();
     } finally {
-      if (previousOpenAIPlatformFallbackFlag === undefined) {
+      platformFallbackAuthDepth -= 1;
+      if (platformFallbackAuthDepth > 0) {
+        req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = true;
+      } else if (initialOpenAIPlatformFallbackFlag === undefined) {
         delete req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
       } else {
-        req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = previousOpenAIPlatformFallbackFlag;
+        req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = initialOpenAIPlatformFallbackFlag;
       }
     }
   };
@@ -755,13 +755,16 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   const voiceInitPrimaryStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
   /* === VIVENTIUM START ===
    * Feature: Provider fallback during agent initialization
-   * Purpose: Provider auth and workspace-harness readiness resolve before AgentClient exists.
-   * Recover once through the validated, user-configured fallback before a harness process starts,
-   * so web, Telegram, and voice share the same explicit fallback contract.
+   * Purpose: Provider auth is resolved inside initializeAgent. If it fails before AgentClient
+   * exists, recover once through the already validated, user-configured fallback route so web,
+   * Telegram, and voice share the same fallback contract.
    * Added: 2026-07-13
    */
   const initializeConfiguredPrimary = (agent) => {
     startParallelWorkTurnAuthority(req, agent);
+    // === VIVENTIUM START === Native sessions deliver volatile turn context outside durable authority.
+    setConversationProviderCapability(req, resolveConversationProviderId(agent));
+    // === VIVENTIUM END ===
     return initializeAgent(
       {
         req,
@@ -805,6 +808,11 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     req,
     effectivePrimaryProvider,
   );
+  /* === VIVENTIUM START ===
+   * Feature: Provider-declared stream delta contract.
+   * Purpose: The effective emitting adapter owns whether message deltas are incremental chunks or
+   * cumulative snapshots. Missing or invalid declarations fail safely to incremental mode.
+   * === VIVENTIUM END === */
   const eventHandlers = getDefaultHandlers({
     req,
     res,
@@ -813,16 +821,17 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     toolEndCallback,
     collectedUsage,
     streamId,
-    // The emitting adapter owns the delta shape; request text cannot select it.
     messageDeltaMode:
       effectivePrimaryCapability?.message_delta_mode === 'snapshot' ? 'snapshot' : 'incremental',
   });
   req._viventiumFallbackLlmAttempt = primaryInitializationFallbackUsed === true;
   if (primaryInitializationFallbackUsed === true) {
+    req._viventiumFallbackReason = 'primary_initialization_failed';
     req._viventiumFallbackRouteNotice = {
       model: fallbackAssignment.model,
     };
   } else {
+    delete req._viventiumFallbackReason;
     delete req._viventiumFallbackRouteNotice;
   }
   if (!sideEffectsRestricted) {
@@ -832,6 +841,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       req,
       capability: effectivePrimaryCapability,
     });
+    bindConversationProviderStableAuthorityDigest(primaryConfig, primaryStableAuthoritySha256);
     installConversationProviderCapabilityRefresher({
       targetAgent: primaryConfig,
       declaredAgent: effectivePrimaryAgent,
@@ -909,9 +919,12 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       voiceInitSummary.fallbackProvider = fallbackAssignment.provider;
       voiceInitSummary.fallbackModel = fallbackAssignment.model;
     }
+    const fallbackModelLabel = String(fallbackAgent?.model_parameters?.modelLabel || '').trim();
     primaryConfig.viventiumFallbackLlmAssignment = {
       provider: fallbackAssignment.provider,
       model: fallbackAssignment.model,
+      ...(fallbackModelLabel ? { modelLabel: fallbackModelLabel } : {}),
+      effort: String(fallbackAgent?.model_parameters?.reasoning_effort || '').trim(),
     };
     let fallbackConfigPromise = null;
     const materializeFallbackLlm = async () => {
@@ -922,53 +935,66 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         return fallbackConfigPromise;
       }
       const voiceFallbackInitStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
-      const previousOpenAIPlatformFallbackFlag =
-        req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
-      req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure = true;
-      fallbackConfigPromise = initializeAgent(
-        {
-          req,
-          res,
-          loadTools,
-          requestFiles,
-          conversationId,
-          parentMessageId,
-          agent: fallbackAgent,
-          endpointOption,
-          allowedProviders,
-          isInitialAgent: false,
-        },
-        dbMethods,
+      fallbackConfigPromise = withPlatformFallbackAuth(() =>
+        initializeAgent(
+          {
+            req,
+            res,
+            loadTools,
+            requestFiles,
+            conversationId,
+            parentMessageId,
+            agent: fallbackAgent,
+            endpointOption,
+            allowedProviders,
+            isInitialAgent: false,
+          },
+          dbMethods,
+        ),
       )
         .then(async (fallbackConfig) => {
           if (sideEffectsRestricted) {
             fallbackConfig = sanitizeAgentForRestrictedVoiceTurn(fallbackConfig);
           }
           inheritResolvedAgentGraph(fallbackConfig, primaryConfig);
-          /* === VIVENTIUM START ===
-           * Feature: Lazy fallback graph resilience parity.
-           * Purpose: The fallback is the same logical agent. Preserve the request-resolved graph
-           * and omitted-capability facts so fallback cannot resurrect a capability-empty handoff.
-           * === VIVENTIUM END === */
-          synchronizeFallbackGraphResilience(
-            fallbackConfig,
-            primaryConfig,
-            omittedCapabilityReadiness,
-          );
           if (!sideEffectsRestricted) {
             await attachDeclaredConversationProviderCapabilityBundle({
               targetAgent: fallbackConfig,
               declaredAgent: fallbackAgent,
               capabilitySourceAgent: primaryConfig,
+              mcpCapabilitySourceAgent: effectivePrimaryAgent,
               req,
             });
+            bindConversationProviderStableAuthorityDigest(
+              fallbackConfig,
+              primaryStableAuthoritySha256,
+            );
             installConversationProviderCapabilityRefresher({
               targetAgent: fallbackConfig,
               declaredAgent: fallbackAgent,
               capabilitySourceAgent: primaryConfig,
+              mcpCapabilitySourceAgent: effectivePrimaryAgent,
               req,
             });
-            attachHarnessCancellationConfig(fallbackConfig, 'agentLlmFallback');
+            let fallbackEndpointConfig = appConfig.endpoints?.[fallbackConfig.endpoint];
+            if (!isAgentsEndpoint(fallbackConfig.endpoint) && !fallbackEndpointConfig) {
+              try {
+                fallbackEndpointConfig = getCustomEndpointConfig({
+                  endpoint: fallbackConfig.endpoint,
+                  appConfig,
+                });
+              } catch (error) {
+                logger.warn(
+                  `[agentLlmFallback] Could not resolve cancellation endpoint for ${fallbackAssignment.provider}/${fallbackAssignment.model}: ${error?.message || error}`,
+                );
+              }
+            }
+            Object.defineProperty(fallbackConfig, 'viventiumHarnessCancellationEndpointConfig', {
+              value: fallbackEndpointConfig,
+              configurable: true,
+              enumerable: false,
+              writable: false,
+            });
           }
           primaryConfig.viventiumFallbackLlm = fallbackConfig;
           primaryConfig.viventiumFallbackLlmInitializationError = null;
@@ -1000,14 +1026,6 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
             `[agentLlmFallback] Failed to initialize fallback model ${fallbackAssignment.provider}/${fallbackAssignment.model} for agent ${primaryAgent.id}: ${error?.message || error}`,
           );
           return null;
-        })
-        .finally(() => {
-          if (previousOpenAIPlatformFallbackFlag === undefined) {
-            delete req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure;
-          } else {
-            req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure =
-              previousOpenAIPlatformFallbackFlag;
-          }
         });
       return fallbackConfigPromise;
     };
@@ -1041,9 +1059,8 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
 
   /* === VIVENTIUM START ===
    * Feature: Native provider tool ownership with Agent Builder handoff preservation.
-   * Purpose: Ordinary Agent tools are filtered at initializeAgent's load boundary for native-tool
-   * providers. Preserve the separately configured graph topology so its bounded, zero-input
-   * transfer controls can still route Main to connected agents.
+   * Purpose: Preserve persisted graph topology, including zero-input graph selection, after
+   * provider-specific tool filtering changes the initialized agent shell.
    * === VIVENTIUM END === */
   const primaryGraph = selectLibreChatAgentGraph({
     agentIds: primaryConfig.agent_ids,
@@ -1061,22 +1078,19 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
 
   /** @type {Set<string>} Track agents that failed to load (orphaned references) */
   const skippedAgentIds = new Set();
-  const omittedCapabilityReadiness = [];
 
-  async function processAgent(agentId) {
+  async function processAgent(
+    agentId,
+    { deferTools = false, materializeInto = null, sourceAgent = null } = {},
+  ) {
     const getAgentStart = nowIfDeep();
-    const loadedAgent = await getAgent({ id: agentId });
+    const loadedAgent = sourceAgent ?? (await getAgent({ id: agentId }));
     logDeep('handoff_get_agent', getAgentStart, `agentId=${agentId}`);
     if (!loadedAgent) {
       logger.warn('[processAgent] Handoff agent unavailable, skipping');
       skippedAgentIds.add(agentId);
       return null;
     }
-    /* === VIVENTIUM START ===
-     * Feature: ACL-safe handoff graph initialization
-     * Purpose: Enforce VIEW before validation, model setup, tool loading, or provider bootstrap.
-     * Match the Agent API's administrator bypass and keep denial logs non-enumerating.
-     * === VIVENTIUM END === */
     const canViewAgent =
       req.user?.role === SystemRoles.ADMIN ||
       (loadedAgent._id != null &&
@@ -1092,6 +1106,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       skippedAgentIds.add(agentId);
       return null;
     }
+    const handoffStableAuthoritySha256 = conversationProviderStableAuthorityDigest(loadedAgent);
     const agent = sideEffectsRestricted
       ? sanitizeAgentForRestrictedVoiceTurn(loadedAgent)
       : loadedAgent;
@@ -1125,6 +1140,103 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       throw new Error(validationResult.error?.message);
     }
 
+    /* === VIVENTIUM START ===
+     * Feature: Lazy connected Agent Builder participants.
+     * Purpose: Preserve only the validated graph/model shell during Main setup. Provider options,
+     * files/recall, ToolService, MCP/OAuth discovery, capability minting, cancellation, and fallback
+     * preparation all wait until this exact participant receives graph control. The shell cannot
+     * author because the graph invocation seam requires successful hydration first.
+     * === VIVENTIUM END === */
+    if (deferTools) {
+      const lazyMaterializationAgent = structuredClone(agent);
+      const shellModelParameters = structuredClone(
+        agent.model_parameters ?? { model: agent.model },
+      );
+      const config = {
+        ...agent,
+        endpoint: agent.endpoint || agent.provider,
+        model_parameters: shellModelParameters,
+        attachments: [],
+        hasDeferredTools: false,
+        maxContextTokens:
+          Number.isFinite(Number(agent.maxContextTokens)) && Number(agent.maxContextTokens) > 0
+            ? Number(agent.maxContextTokens)
+            : 18000,
+        resendFiles: true,
+        toolContextMap: {},
+        toolDefinitions: [],
+        toolRegistry: new Map(),
+        tools: [],
+        useLegacyContent: false,
+        userMCPAuthMap: undefined,
+      };
+      const declaredInstructionBase = [
+        config.instructions ?? '',
+        config.additional_instructions ?? '',
+      ]
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+      let connectedAgentInitializationPromise = null;
+      const materializeConnectedAgent = () => {
+        if (connectedAgentInitializationPromise) {
+          return connectedAgentInitializationPromise;
+        }
+        if (signal?.aborted === true) {
+          connectedAgentInitializationPromise = Promise.reject(createConnectedAgentAbortError());
+          return connectedAgentInitializationPromise;
+        }
+        const invocationInstructions = String(config.instructions ?? '').trim();
+        let invocationInstructionAppend = invocationInstructions;
+        if (declaredInstructionBase && invocationInstructions.includes(declaredInstructionBase)) {
+          invocationInstructionAppend = [
+            invocationInstructions.slice(
+              0,
+              invocationInstructions.indexOf(declaredInstructionBase),
+            ),
+            invocationInstructions.slice(
+              invocationInstructions.indexOf(declaredInstructionBase) +
+                declaredInstructionBase.length,
+            ),
+          ]
+            .filter(Boolean)
+            .join('\n\n')
+            .trim();
+        }
+        connectedAgentInitializationPromise = processAgent(agentId, {
+          deferTools: false,
+          materializeInto: config,
+          sourceAgent: lazyMaterializationAgent,
+        }).then(() => {
+          if (signal?.aborted === true) {
+            throw createConnectedAgentAbortError();
+          }
+          // initializeAgent renders persisted variables and provider capability authority. AgentClient
+          // separately assembled surface, Feeling, and request-pinned authority on the shell. Keep
+          // both in their original order, with the invocation-local tail remaining final.
+          config.instructions = [
+            config.instructions ?? '',
+            config.additional_instructions ?? '',
+            invocationInstructionAppend,
+          ]
+            .filter(Boolean)
+            .join('\n\n')
+            .trim();
+          config.additional_instructions = '';
+          return config;
+        });
+        return connectedAgentInitializationPromise;
+      };
+      Object.defineProperty(config, 'viventiumConnectedAgentInitializer', {
+        value: materializeConnectedAgent,
+        configurable: true,
+        enumerable: false,
+        writable: false,
+      });
+      agentConfigs.set(agentId, config);
+      return agent;
+    }
+
     const { fallbackAgent: handoffFallbackAgent, fallbackAssignment: handoffFallbackAssignment } =
       await resolveValidatedFallbackRoute(agent);
     const initStart = nowIfDeep();
@@ -1153,7 +1265,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         withPlatformFallbackAuth(() => initializeHandoffAgent(handoffFallbackAgent)),
       signal,
     });
-    const config = sideEffectsRestricted
+    let config = sideEffectsRestricted
       ? sanitizeAgentForRestrictedVoiceTurn(handoffInitialization.config)
       : handoffInitialization.config;
     const effectiveAgent = sideEffectsRestricted
@@ -1173,6 +1285,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         declaredAgent: effectiveAgent,
         req,
       });
+      bindConversationProviderStableAuthorityDigest(config, handoffStableAuthoritySha256);
       installConversationProviderCapabilityRefresher({
         targetAgent: config,
         declaredAgent: effectiveAgent,
@@ -1209,12 +1322,18 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
             targetAgent: graphFallbackConfig,
             declaredAgent: handoffFallbackAgent,
             capabilitySourceAgent: config,
+            mcpCapabilitySourceAgent: effectiveAgent,
             req,
           });
+          bindConversationProviderStableAuthorityDigest(
+            graphFallbackConfig,
+            handoffStableAuthoritySha256,
+          );
           installConversationProviderCapabilityRefresher({
             targetAgent: graphFallbackConfig,
             declaredAgent: handoffFallbackAgent,
             capabilitySourceAgent: config,
+            mcpCapabilitySourceAgent: effectiveAgent,
             req,
           });
           attachHarnessCancellationConfig(graphFallbackConfig, 'processAgentFallback');
@@ -1238,6 +1357,11 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         `[agentLlmFallback] Handoff provider initialization recovered through configured fallback for agent ${agentId}: ${handoffFallbackAssignment.provider}/${handoffFallbackAssignment.model}`,
       );
     }
+    if (materializeInto) {
+      Object.defineProperties(materializeInto, Object.getOwnPropertyDescriptors(config));
+      config = materializeInto;
+    }
+
     const handoffToolSummary = summarizeInitTools(config);
     if (voiceLatencyEnabled && voiceInitSummary) {
       const handoffInitializeMs = calcVoiceStageMs(voiceHandoffInitStart);
@@ -1259,28 +1383,6 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       );
     }
     logDeep('handoff_initialize_agent', initStart, `agentId=${agentId}`);
-
-    /* === VIVENTIUM START ===
-     * Feature: Capability-ready optional handoffs.
-     * Purpose: A successfully initialized model is still not a valid handoff target when every
-     * MCP capability it declares was conclusively removed for missing/broken auth or service
-     * readiness. Keep one-provider partial availability and unknown telemetry fail-open.
-     */
-    const capabilityReadiness = evaluateOptionalAgentCapabilityReadiness(agent, config);
-    if (!capabilityReadiness.keep) {
-      markOptionalAgentInitializationFailed(skippedAgentIds, agentId);
-      omittedCapabilityReadiness.push(capabilityReadiness);
-      logger.warn(
-        '[initializeClient] Optional handoff omitted because all declared MCPs are unavailable',
-        {
-          agentId,
-          readiness: capabilityReadiness.unavailableServers,
-        },
-      );
-      return null;
-    }
-    /* === VIVENTIUM END === */
-
     if (userMCPAuthMap != null) {
       Object.assign(userMCPAuthMap, config.userMCPAuthMap ?? {});
     } else {
@@ -1315,7 +1417,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     const agentId = agentsToProcess.values().next().value;
     agentsToProcess.delete(agentId);
     try {
-      const agent = await processAgent(agentId);
+      const agent = await processAgent(agentId, { deferTools: true });
       if (agent?.edges?.length) {
         collectEdges(agent.edges);
       }
@@ -1337,7 +1439,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       if (checkAgentInit(agentId)) {
         continue;
       }
-      await processAgent(agentId);
+      await processAgent(agentId, { deferTools: true });
     }
     const chain = await createSequentialChainEdges([primaryConfig.id].concat(agent_ids), '{convo}');
     collectEdges(chain);
@@ -1390,8 +1492,6 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   // Filter out edges referencing non-existent agents (orphaned references)
   edges = filterOrphanedEdges(edges, skippedAgentIds);
 
-  appendOmittedCapabilityReadiness(primaryConfig, omittedCapabilityReadiness);
-
   primaryConfig.edges = edges;
 
   let endpointConfig = appConfig.endpoints?.[primaryConfig.endpoint];
@@ -1410,10 +1510,11 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   }
 
   /* === VIVENTIUM START ===
-   * Feature: Explicit native harness cancellation.
-   * Purpose: Only the intentional Stop reason cancels; a transport disconnect leaves the native
-   * run available for resumable reattachment through its stable idempotency key.
-   */
+   * Feature: Explicit GlassHive cancellation propagation.
+   * Purpose: Only the user-facing Stop action cancels the native harness. Browser disconnects and
+   * resumable-stream reconnects leave the run alive. The idempotency key is the authenticated
+   * assistant response ID already sent to the provider; no provider internals are read.
+   * === VIVENTIUM END === */
   if (!sideEffectsRestricted) {
     bindHarnessCancellation({
       req,
@@ -1426,7 +1527,6 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       },
     });
   }
-  /* === VIVENTIUM END === */
 
   const sender =
     effectivePrimaryAgent.name ??

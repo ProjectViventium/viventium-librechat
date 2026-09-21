@@ -3,10 +3,13 @@ import type { Agents } from 'librechat-data-provider';
 import type { ServerSentEvent } from '~/types';
 import type {
   AdapterCapabilities,
+  ClientPresentation,
   CortexPresentationBinding,
+  DurableEffectReceipt,
   InteractionContext,
   InteractionDeliveryAck,
   InteractionDeliveryPolicy,
+  VoiceDurableEffectAuthorityBinding,
 } from '~/stream/interfaces/IJobStore';
 
 export interface GenerationJobMetadata {
@@ -30,8 +33,14 @@ export interface GenerationJobMetadata {
   adapterCapabilities?: AdapterCapabilities;
   deliveryPolicy?: InteractionDeliveryPolicy;
   deliveryAcknowledgement?: InteractionDeliveryAck;
+  durableEffectReceipt?: DurableEffectReceipt;
+  durableEffectReceipts?: DurableEffectReceipt[];
+  viventiumVoiceEffectAuthority?: VoiceDurableEffectAuthorityBinding;
+  viventiumCallSessionId?: string;
+  viventiumVoiceTaskId?: string;
   generationCompleted?: boolean;
   cortexPresentation?: CortexPresentationBinding;
+  clientPresentation?: ClientPresentation;
   /** Viventium voice-call session that owns this generation, when applicable */
   voiceCallSessionId?: string;
 }

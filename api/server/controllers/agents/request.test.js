@@ -635,29 +635,34 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       jest.fn(),
     );
 
-    expect(mockGenerationJobManager.createJob).toHaveBeenCalledWith('conv-1', 'user-1', 'conv-1', {
-      adapterCapabilities: {
-        segment_stability: 'immediate',
-        supersede_scope: 'response_and_authoring',
+    expect(mockGenerationJobManager.createJob).toHaveBeenCalledWith(
+      expect.any(String),
+      'user-1',
+      'conv-1',
+      {
+        adapterCapabilities: {
+          segment_stability: 'immediate',
+          supersede_scope: 'response_and_authoring',
+        },
+        interactionContext: {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'web',
+          conversation_id: 'conv-1',
+          revision: 1,
+          source_event_id: 'web-source-event-1',
+          source_segments: [
+            expect.objectContaining({
+              ordinal: 0,
+              source_event_id: 'web-source-event-1',
+              source_index: 0,
+              text: 'hello',
+            }),
+          ],
+        },
+        deliveryPolicy: { commit_authority: 'server' },
       },
-      interactionContext: {
-        actor_kind: 'external_user',
-        origin: 'interactive',
-        surface: 'web',
-        conversation_id: 'conv-1',
-        revision: 1,
-        source_event_id: 'web-source-event-1',
-        source_segments: [
-          expect.objectContaining({
-            ordinal: 0,
-            source_event_id: 'web-source-event-1',
-            source_index: 0,
-            text: 'hello',
-          }),
-        ],
-      },
-      deliveryPolicy: { commit_authority: 'server' },
-    });
+    );
   });
 
   test('attaches trusted internal provenance to persisted rows', async () => {
@@ -1197,6 +1202,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     const addTitle = jest.fn();
 
     mockGenerationJobManager.getJob
+      .mockResolvedValueOnce({ createdAt: 1 })
       .mockResolvedValueOnce({ createdAt: 1 })
       .mockResolvedValueOnce({ createdAt: 2 });
 

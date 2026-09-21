@@ -1,10 +1,3 @@
-/**
- * === VIVENTIUM START ===
- * Feature: Revision-safe saved-memory mutation regression coverage.
- * Purpose: Prove conflicts invalidate cached state so the UI refetches authoritative memory data.
- * === VIVENTIUM END ===
- */
-
 import { QueryKeys } from 'librechat-data-provider';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useDeleteMemoryMutation, useUpdateMemoryMutation } from './queries';

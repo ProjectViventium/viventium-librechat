@@ -60,9 +60,7 @@ export interface ThinkingConfigAdaptive {
  * for details.
  */
 export type ThinkingConfigParam =
-  | ThinkingConfigEnabled
-  | ThinkingConfigDisabled
-  | ThinkingConfigAdaptive;
+  ThinkingConfigEnabled | ThinkingConfigDisabled | ThinkingConfigAdaptive;
 
 export type AnthropicModelOptions = Partial<Omit<AnthropicParameters, 'thinking'>> & {
   thinking?: AnthropicParameters['thinking'] | null;
@@ -99,6 +97,7 @@ export interface AnthropicConfigOptions {
     status: number;
     request: Record<string, unknown>;
   }) => void;
+  /* === VIVENTIUM END === */
   /** Default parameters to apply only if fields are undefined */
   defaultParams?: Record<string, unknown>;
   /** Additional parameters to add to the configuration */

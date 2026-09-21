@@ -48,6 +48,7 @@ jest.mock('~/server/services/viventium/conversationRecallService', () => {
 const {
   saveMessage,
   getMessages,
+  updateMemoryWriteStatus,
   getMessageAncestorBranch,
   getLatestRecallEligibleMessageCreatedAt,
   updateMessage,
@@ -136,6 +137,10 @@ function expectPrivateFeelingAbsent(value, canary) {
 }
 
 describe('Message Operations', () => {
+  it('exports the memory-writer lifecycle helper through the runtime model facade', () => {
+    expect(require('./index').updateMemoryWriteStatus).toBe(updateMemoryWriteStatus);
+  });
+
   let mongoServer;
   let mockReq;
   let mockMessageData;
@@ -223,6 +228,7 @@ describe('Message Operations', () => {
           interactionContext: claim.interactionContext,
           userMessage: { messageId: 'native-source' },
         });
+        const admittedAt = Date.now();
         identity = {
           userId: user,
           conversationId,
@@ -237,8 +243,8 @@ describe('Message Operations', () => {
           agentId: 'native-agent',
           originSha256: 'c'.repeat(64),
           source: await methods.captureNativeResponseSource(user, conversationId, 'native-source'),
-          admittedAt: Date.now(),
-          recoverUntil: Date.now() + 86_400_000,
+          admittedAt,
+          recoverUntil: admittedAt + 86_400_000,
         };
         const transaction = (operation) => mongoose.connection.transaction(operation);
         mongoose.set('transactionAsyncLocalStorage', true);
@@ -386,6 +392,7 @@ describe('Message Operations', () => {
         });
         const delivered = jest.fn();
         await mockNativeResponseManager.subscribe(identity.streamId, jest.fn(), delivered);
+        await new Promise((resolve) => setImmediate(resolve));
         expect(delivered).toHaveBeenCalledTimes(1);
         expect(delivered).toHaveBeenCalledWith(finalEvent);
         expect(await methods.markNativeResponseReplayStored(identity)).toBe(true);
@@ -1285,6 +1292,66 @@ describe('Message Operations', () => {
       expect(messages).toHaveLength(2);
       expect(messages[0].text).toBe('First message');
       expect(messages[1].text).toBe('Second message');
+    });
+
+    it('projects detached memory-writer status without exposing private lifecycle state', async () => {
+      await saveMessage(mockReq, mockMessageData);
+
+      await updateMemoryWriteStatus({
+        userId: 'user123',
+        messageId: 'msg123',
+        status: 'pending',
+      });
+      await updateMemoryWriteStatus({
+        userId: 'user123',
+        messageId: 'msg123',
+        status: 'running',
+      });
+
+      const running = await getMessages({ conversationId: mockMessageData.conversationId });
+      expect(running[0]).toMatchObject({ messageId: 'msg123', memoryWriteStatus: 'running' });
+      expect(running[0]).not.toHaveProperty('savedMemoryWrite');
+
+      await updateMemoryWriteStatus({
+        userId: 'user123',
+        messageId: 'msg123',
+        status: 'completed',
+      });
+      const completed = await getMessages(
+        { conversationId: mockMessageData.conversationId },
+        '-_id -__v -user',
+      );
+      expect(completed[0]).toMatchObject({ messageId: 'msg123', memoryWriteStatus: 'completed' });
+      expect(completed[0]).not.toHaveProperty('savedMemoryWrite');
+    });
+
+    it('does not admit a writer status before the authoritative assistant row exists', async () => {
+      const status = await updateMemoryWriteStatus({
+        userId: 'user123',
+        messageId: 'late-assistant',
+        status: 'pending',
+      });
+      expect(status).toBeNull();
+
+      await saveMessage(mockReq, {
+        ...mockMessageData,
+        messageId: 'late-assistant',
+      });
+
+      expect(
+        await updateMemoryWriteStatus({
+          userId: 'user123',
+          messageId: 'late-assistant',
+          status: 'pending',
+        }),
+      ).toBeTruthy();
+      const messages = await getMessages({ conversationId: mockMessageData.conversationId });
+      expect(messages).toContainEqual(
+        expect.objectContaining({
+          messageId: 'late-assistant',
+          memoryWriteStatus: 'pending',
+        }),
+      );
     });
   });
 

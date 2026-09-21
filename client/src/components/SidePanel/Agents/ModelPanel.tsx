@@ -16,6 +16,15 @@ import ModelParametersSection from './ModelParametersSection';
 import CapabilityProviderOptions from './CapabilityProviderOptions';
 import BackgroundWorkerOptions from './BackgroundWorkerOptions';
 
+type ProviderReadiness = {
+  status: string;
+  detail: string;
+  models: Array<{
+    id: string;
+    readiness?: { status?: string; authentication?: string; detail?: string };
+  }>;
+};
+
 export default function ModelPanel({
   providers,
   setActivePanel,

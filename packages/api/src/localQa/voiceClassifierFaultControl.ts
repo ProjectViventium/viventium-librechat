@@ -1,5 +1,5 @@
 /* === VIVENTIUM START ===
- * Feature: MPV-061 strict Voice classifier fallback control.
+ * Feature: MPV-054 strict Voice classifier fallback control.
  * Purpose: Keep a local PRE-GATE fault behind an exact synthetic, candidate-bound, one-time
  * parent approval. This module never selects a provider, model, prompt, or user.
  * === VIVENTIUM END === */
@@ -20,7 +20,7 @@ export interface VoiceClassifierSegmentIdentity {
 }
 
 export interface VoiceClassifierFaultArmBinding {
-  caseId: 'MPV-061';
+  caseId: 'MPV-054';
   sessionRef: string;
   candidateDigest: string;
   componentArtifactDigest: string;
@@ -38,10 +38,12 @@ export interface VoiceClassifierFaultTurnBinding extends VoiceClassifierFaultArm
   utteranceHash: string;
 }
 
+export type VoiceClassifierFaultRuntimeBinding = Omit<VoiceClassifierFaultTurnBinding, 'caseId'>;
+
 export interface VoiceClassifierFaultControlRow {
   schemaVersion: 1;
   controlId: string;
-  caseId: 'MPV-061';
+  caseId: 'MPV-054';
   sessionRefHash: string;
   sessionCandidateDigest: string;
   caseTokenHash: string;
@@ -199,13 +201,13 @@ export interface VoiceClassifierFaultMongooseModel {
   deleteOne(filter: object): PromiseLike<{ deletedCount?: number }>;
 }
 
-const CASE_ID = 'MPV-061';
-const MODE = 'mpv_061';
+const CASE_ID = 'MPV-054';
+const MODE = 'mpv_054';
 const HASH = /^sha256:[a-f0-9]{64}$/;
 const SESSION_REF = /^qa_[a-f0-9]{24}$/;
 const TOKEN = /^[A-Za-z0-9_-]{43}$/;
-const CONTROL_ID = /^mpv061_[A-Za-z0-9_-]{22,80}$/;
-const CHALLENGE_ID = /^mpv061_ch_[A-Za-z0-9_-]{22,80}$/;
+const CONTROL_ID = /^mpv054_[A-Za-z0-9_-]{22,80}$/;
+const CHALLENGE_ID = /^mpv054_ch_[A-Za-z0-9_-]{22,80}$/;
 const PROOF = /^[A-Za-z0-9_-]{43}$/;
 const MAX_TEXT = 256;
 const ARM_TTL_MS = 60_000;
@@ -215,6 +217,13 @@ const DEFAULT_POLL_INTERVAL_MS = 25;
 const REPLAY_TTL_MS = 60_000;
 const RECEIPT_TTL_MS = 15 * 60_000;
 const PURGE_TTL_MS = 24 * 60 * 60_000;
+
+export function runBoundVoiceClassifierFaultControl(
+  manager: VoiceClassifierFaultControlManager,
+  input: VoiceClassifierFaultRuntimeBinding,
+) {
+  return manager.run({ ...input, caseId: CASE_ID });
+}
 
 function controlError(code: string, status = 503): Error {
   return Object.assign(new Error(code), { code, status, retryable: status === 503 });
@@ -699,7 +708,7 @@ export function createVoiceClassifierFaultControlManager({
       const identity = armIdentity(normalized, active);
       const armedAt = now();
       const expiresAt = new Date(armedAt.getTime() + ARM_TTL_MS);
-      const controlId = `mpv061_${randomBytes(18).toString('base64url')}`;
+      const controlId = `mpv054_${randomBytes(18).toString('base64url')}`;
       if (!CONTROL_ID.test(controlId)) throw controlError('voice_classifier_qa_random_invalid');
       const row: VoiceClassifierFaultControlRow = {
         ...identity,
@@ -739,7 +748,7 @@ export function createVoiceClassifierFaultControlManager({
       if (issuedAt.getTime() >= new Date(existing.expiresAt).getTime()) {
         throw controlError('voice_classifier_qa_control_expired');
       }
-      const challengeId = `mpv061_ch_${randomBytes(18).toString('base64url')}`;
+      const challengeId = `mpv054_ch_${randomBytes(18).toString('base64url')}`;
       if (!CHALLENGE_ID.test(challengeId)) {
         throw controlError('voice_classifier_qa_random_invalid');
       }

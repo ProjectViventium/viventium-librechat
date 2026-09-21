@@ -237,6 +237,7 @@ jest.mock('@librechat/api', () => ({
     snapshotHash: 'test-disabled',
   }),
   GenerationJobManager: {
+    getJob: jest.fn().mockResolvedValue({ status: 'running' }),
     emitChunk: jest.fn(),
     emitCortexPresentation: jest.fn(async (streamId, event, receipt, options) => {
       const verified = await options.verifyPresentation();
@@ -3132,7 +3133,10 @@ describe('AgentClient - titleConvo', () => {
       });
 
       // Verify formatInstructionsForContext was called with correct server names
-      expect(mockFormatInstructions).toHaveBeenCalledWith(['server1', 'server2']);
+      expect(mockFormatInstructions).toHaveBeenCalledWith(
+        ['server1', 'server2'],
+        expect.objectContaining({ user: mockReq.user, body: mockReq.body }),
+      );
 
       // Verify the instructions do NOT contain [object Promise]
       expect(client.options.agent.instructions).not.toContain('[object Promise]');
@@ -3172,10 +3176,10 @@ describe('AgentClient - titleConvo', () => {
       });
 
       // Verify formatInstructionsForContext was called with ephemeral server names
-      expect(mockFormatInstructions).toHaveBeenCalledWith([
-        'ephemeral-server1',
-        'ephemeral-server2',
-      ]);
+      expect(mockFormatInstructions).toHaveBeenCalledWith(
+        ['ephemeral-server1', 'ephemeral-server2'],
+        expect.objectContaining({ user: mockReq.user, body: mockReq.body }),
+      );
 
       // Verify no [object Promise] in instructions
       expect(client.options.agent.instructions).not.toContain('[object Promise]');
@@ -5304,7 +5308,11 @@ describe('AgentClient - titleConvo', () => {
       mockReq.config.endpoints = {
         agents: {
           providerCapabilities: {
-            [EModelEndpoint.openAI]: { workspace_binding: true, conversation_session: true },
+            [EModelEndpoint.openAI]: {
+              workspace_binding: true,
+              conversation_session: true,
+              time_context_delivery: 'per_turn_header',
+            },
           },
         },
       };
@@ -5785,10 +5793,10 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
 
   const fallbackRecoveryPart = (model) => ({
     type: ContentTypes.HARNESS_ACTIVITY,
-    harness_activity: {
+    harness_activity: expect.objectContaining({
       event: 'fallback-recovery',
       summary: expect.stringContaining(`configured fallback model (${model})`),
-    },
+    }),
   });
 
   const expectFallbackCompletion = (parts, text, model) => {
@@ -5797,6 +5805,18 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    require('@librechat/api').GenerationJobManager.getJob.mockResolvedValue({ status: 'running' });
+    mockEmitChunk.mockImplementation(async (streamId, event, options) => {
+      const fence = await options?.verifyCortexPresentation?.();
+      return {
+        delivered: true,
+        streamId,
+        target: 'subscriber_transport',
+        presentationRef: `sse:${streamId}:${event.data.messageId}`,
+        claimToken: fence?.claimToken,
+        presentationLeaseToken: fence?.presentationLeaseToken,
+      };
+    });
     mockPersistCortexPartsToCanonicalMessage.mockResolvedValue(undefined);
     mockFinalizeCanonicalCortexMessage.mockResolvedValue(undefined);
     mockCreateCortexFollowUpMessage.mockResolvedValue(null);
@@ -5964,7 +5984,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       req,
       messageId: 'resp-1',
     });
-    expect(mockEmitCortexPresentation).toHaveBeenCalledWith(
+    expect(mockEmitChunk).toHaveBeenCalledWith(
       'stream-1',
       expect.objectContaining({
         event: 'on_cortex_followup',
@@ -5975,8 +5995,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
           cortexCount: 1,
         }),
       }),
-      expect.objectContaining({ claimToken: 'claim-phase-b', generation: 2 }),
-      expect.objectContaining({ verifyPresentation: expect.any(Function) }),
+      expect.objectContaining({ verifyCortexPresentation: expect.any(Function) }),
     );
   });
 
@@ -6198,7 +6217,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         forceVisibleFollowUp: true,
       }),
     );
-    expect(mockEmitCortexPresentation).toHaveBeenCalledWith(
+    expect(mockEmitChunk).toHaveBeenCalledWith(
       'stream-1',
       expect.objectContaining({
         event: 'on_cortex_followup',
@@ -6210,8 +6229,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
           cortexCount: 1,
         }),
       }),
-      expect.objectContaining({ claimToken: 'claim-phase-b', generation: 2 }),
-      expect.objectContaining({ verifyPresentation: expect.any(Function) }),
+      expect.objectContaining({ verifyCortexPresentation: expect.any(Function) }),
     );
   });
 
@@ -7076,13 +7094,15 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
 
     expect(fallbackKeys).toEqual([
       'main:resp-1',
-      'main:reality-agent:resp-1',
-      'main:red-agent:resp-1',
+      'main-fallback:resp-1',
+      'main-fallback:reality-agent:resp-1',
+      'main-fallback:red-agent:resp-1',
     ]);
     expect(cancellationFetch.mock.calls.map(([url]) => url)).toEqual([
       'http://glasshive.local/v1/requests/by-idempotency/main%3Aresp-1/cancel',
-      'http://glasshive.local/v1/requests/by-idempotency/main%3Areality-agent%3Aresp-1/cancel',
-      'http://glasshive.local/v1/requests/by-idempotency/main%3Ared-agent%3Aresp-1/cancel',
+      'http://glasshive.local/v1/requests/by-idempotency/main-fallback%3Aresp-1/cancel',
+      'http://glasshive.local/v1/requests/by-idempotency/main-fallback%3Areality-agent%3Aresp-1/cancel',
+      'http://glasshive.local/v1/requests/by-idempotency/main-fallback%3Ared-agent%3Aresp-1/cancel',
     ]);
   });
 
@@ -7095,8 +7115,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     });
 
     const completionPromise = client.sendCompletion({ text: 'hello' }, { abortController });
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
     expect(primaryAgent.viventiumFallbackLlmInitializer).toHaveBeenCalledTimes(1);
 
     abortController.abort('user_cancelled');

@@ -906,6 +906,10 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
       return next();
     }
 
+    /* === VIVENTIUM START ===
+     * Preserve the owning query result: a legitimate no-match update returns null. The search
+     * mirror hook must not turn that result into a TypeError before the caller reports not-found.
+     * === VIVENTIUM END === */
     if (!doc || doc.unfinished) {
       return next();
     }

@@ -48,13 +48,17 @@ interface:
       label:
         en: I understand and want to continue
       subLabel:
-        en: Only connect MCP servers you trust. Unreviewed servers can expose data
-          or trigger unintended actions.
+        en: Only connect MCP servers you trust. Unreviewed servers can expose data or trigger unintended actions.
 viventium:
   background_cortices:
     activation_format:
-      response_format: "Respond with a JSON object:\n{\n  \"should_activate\": true,\n\
-        \  \"confidence\": 1.0,\n  \"reason\": \"2-4 explanatory words\"\n}\n"
+      response_format: |
+        Respond with a JSON object:
+        {
+          "should_activate": true,
+          "confidence": 1.0,
+          "reason": "2-4 explanatory words"
+        }
       brew_begin_tag: <!--viv_internal:brew_begin-->
     activation_subject_rule:
       enabled: true
@@ -66,15 +70,13 @@ viventium:
         promptRef: cortex.background_activation_policy
       direct_action_mcp_servers:
         - server: glasshive-workers-projects
-          owns: persistent workers, project runs, browser/desktop/local computer execution,
-            worker status, and completion reports
+          owns: persistent workers, project runs, browser/desktop/local computer execution, worker status, and completion reports
           tool_names:
             - worker_delegate_once_mcp_glasshive-workers-projects
             - active_work_list
             - active_work_action
         - server: scheduling-cortex
-          owns: reminders, scheduled follow-ups, same-conversation wakeups, delayed
-            status checks, and schedule management
+          owns: reminders, scheduled follow-ups, same-conversation wakeups, delayed status checks, and schedule management
           tool_names:
             - sys__server__sys_mcp_scheduling-cortex
             - schedule_create_mcp_scheduling-cortex
@@ -88,8 +90,7 @@ viventium:
             - periphery_list_mcp_scheduling-cortex
             - periphery_read_mcp_scheduling-cortex
         - server: viventium-health
-          owns: read-only local health-source capture runs, raw response records, verified
-            manual images, timestamps, and integrity evidence
+          owns: read-only local health-source capture runs, raw response records, verified manual images, timestamps, and integrity evidence
           tool_names:
             - sys__server__sys_mcp_viventium-health
             - health_list_runs_mcp_viventium-health
@@ -99,8 +100,7 @@ viventium:
         - server: google-workspace
           scope_key: productivity_google_workspace
           same_scope_background_allowed: false
-          owns: live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat,
-            Tasks, and Workspace actions when this MCP is connected to the main agent
+          owns: live Gmail, Google Calendar, Google Drive, Docs, Sheets, Slides, Chat, Tasks, and Workspace actions when this MCP is connected to the main agent
           tool_names:
             - sys__server__sys_mcp_google_workspace
             - search_gmail_messages_mcp_google_workspace
@@ -129,9 +129,7 @@ viventium:
         - server: ms365
           scope_key: productivity_ms365
           same_scope_background_allowed: false
-          owns: live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner,
-            To Do, and Microsoft 365 actions when this MCP is connected to the main
-            agent
+          owns: live Outlook email, Outlook calendar, OneDrive, Excel, OneNote, Planner, To Do, and Microsoft 365 actions when this MCP is connected to the main agent
           tool_names:
             - sys__server__sys_mcp_ms-365
             - list-mail-messages_mcp_ms-365
@@ -143,25 +141,15 @@ viventium:
             - download-onedrive-file-content_mcp_ms-365
             - get-excel-range_mcp_ms-365
             - search-query_mcp_ms-365
-      direct_action_tool_rule: 'Connected direct-action surfaces are execution owners.
-        Their presence means the main agent has the primary path; background cortices
-        should stay silent unless they add separately scoped value or the matching
-        direct-action surface explicitly allows same-scope supplemental background
-        evidence.
-
-        '
+      direct_action_tool_rule: |
+        Connected direct-action surfaces are execution owners. Their presence means the main agent has the primary path; background cortices should stay silent unless they add separately scoped value or the matching direct-action surface explicitly allows same-scope supplemental background evidence.
   no_response:
-    prompt: "NO RESPONSE TAG:
-
+    prompt: |-
+      NO RESPONSE TAG:
       - If you have nothing meaningful to add, respond with exactly: {NTA}
-
       - When you use {NTA}, output ONLY that token and nothing else.
-
       - Never use {NTA} to hide errors/tool failures; explain the issue briefly instead.
-
-      - Never use {NTA} to hide a new verified fact, time-sensitive blocker, tool
-      completion, approval need, or meaningful change. Surface it briefly in the user's
-      current channel."
+      - Never use {NTA} to hide a new verified fact, time-sensitive blocker, tool completion, approval need, or meaningful change. Surface it briefly in the user's current channel.
   conversation_recall:
     prompt:
       promptRef: main.conversation_recall
@@ -188,26 +176,31 @@ modelSpecs:
       preset:
         endpoint: agents
         agent_id: agent_viventium_main_95aeb3
+      description: The conscious self. Background cortices process in parallel, surfacing insights without blocking dialogue.
     - name: agent_viventium_background_analysis_95aeb3
       label: Background Analysis
-      description: Deep analytical processing - surfaces hidden meanings and logical
-        gaps.
+      description: Deep analytical processing - surfaces hidden meanings and logical gaps.
       iconURL: /assets/logo.svg
       preset:
         endpoint: agents
         agent_id: agent_viventium_background_analysis_95aeb3
     - name: agent_viventium_confirmation_bias_95aeb3
       label: Confirmation Bias
-      description: Error detection - flags overconfidence and unchecked assumptions
-        before they solidify.
+      description: Error detection - flags overconfidence and unchecked assumptions before they solidify.
       iconURL: /assets/logo.svg
       preset:
         endpoint: agents
         agent_id: agent_viventium_confirmation_bias_95aeb3
+    - name: agent_viventium_deep_memory_95aeb3
+      label: Deep Memory Search
+      description: Searches authorized long-term conversation and file memory when older evidence could materially help, surfacing only new relevant evidence through Phase B.
+      iconURL: /assets/logo.svg
+      preset:
+        endpoint: agents
+        agent_id: agent_viventium_deep_memory_95aeb3
     - name: agent_viventium_red_team_95aeb3
       label: Red Team
-      description: Evidence-first mistake detection - verifies claims, tests viability,
-        and calls out rationalization.
+      description: Evidence-first mistake detection - verifies claims, tests viability, and calls out rationalization.
       iconURL: /assets/logo.svg
       preset:
         endpoint: agents
@@ -221,49 +214,42 @@ modelSpecs:
         agent_id: agent_viventium_deep_research_95aeb3
     - name: agent_viventium_online_tool_use_95aeb3
       label: MS365
-      description: Orchestrates MS365 productivity tool calls (Outlook email, calendar,
-        OneDrive files).
+      description: Orchestrates MS365 productivity tool calls (Outlook email, calendar, OneDrive files).
       iconURL: /assets/logo.svg
       preset:
         endpoint: agents
         agent_id: agent_viventium_online_tool_use_95aeb3
     - name: agent_viventium_parietal_cortex_95aeb3
       label: Parietal Cortex
-      description: Mathematical, physics, and statistical reasoning using first-principles
-        thinking.
+      description: Mathematical, physics, and statistical reasoning using first-principles thinking.
       iconURL: /assets/logo.svg
       preset:
         endpoint: agents
         agent_id: agent_viventium_parietal_cortex_95aeb3
     - name: agent_viventium_pattern_recognition_95aeb3
       label: Pattern Recognition
-      description: Identifies recurring themes, behavioral loops, and contradictions
-        across conversation.
+      description: Identifies recurring themes, behavioral loops, and contradictions across conversation.
       iconURL: /assets/logo.svg
       preset:
         endpoint: agents
         agent_id: agent_viventium_pattern_recognition_95aeb3
     - name: agent_viventium_emotional_resonance_95aeb3
       label: Emotional Resonance
-      description: Senses emotional undercurrents and unspoken needs that words don't
-        capture.
+      description: Senses emotional undercurrents and unspoken needs that words don't capture.
       iconURL: /assets/logo.svg
       preset:
         endpoint: agents
         agent_id: agent_viventium_emotional_resonance_95aeb3
     - name: agent_viventium_strategic_planning_95aeb3
       label: Strategic Planning
-      description: Transforms abstract goals into concrete action sequences with risk
-        awareness.
+      description: Transforms abstract goals into concrete action sequences with risk awareness.
       iconURL: /assets/logo.svg
       preset:
         endpoint: agents
         agent_id: agent_viventium_strategic_planning_95aeb3
     - name: agent_viventium_support_95aeb3
       label: Viventium User Help
-      description: "In-product help for using Viventium \u2014 conversations, voice,\
-        \ agents, integrations, scheduling. Never mentions internal implementation;\
-        \ escalates to the official Viventium support channel only when needed."
+      description: In-product help for using Viventium — conversations, voice, agents, integrations, scheduling. Never mentions internal implementation; escalates to the official Viventium support channel only when needed.
       iconURL: /assets/logo.svg
       preset:
         endpoint: agents
@@ -671,17 +657,13 @@ endpoints:
   anthropic:
     titleEndpoint: anthropic
     titleModel: claude-opus-5
-    titlePrompt: "Generate a concise natural conversation title from the user's request
-      and the assistant's response. Do not browse, fetch, or judge URL accessibility.
-      If the conversation contains a URL, title the user's intended task or outcome
-      instead of whether the URL is accessible.
-
+    titlePrompt: |-
+      Generate a concise natural conversation title from the user's request and the assistant's response. Do not browse, fetch, or judge URL accessibility. If the conversation contains a URL, title the user's intended task or outcome instead of whether the URL is accessible.
       Conversation: {convo}
-
-      Return only one natural title under 40 characters."
-    titlePromptTemplate: 'User: {input}
-
-      AI: {output}'
+      Return only one natural title under 40 characters.
+    titlePromptTemplate: |-
+      User: {input}
+      AI: {output}
     summarize: false
     summaryModel: claude-opus-5
     modelDisplayLabel: Azure AI Foundry (Claude)
@@ -692,7 +674,6 @@ endpoints:
     disableBuilder: false
     defaultId: agent_viventium_main_95aeb3
     iconURL: /assets/logo.svg
-    # VIVENTIUM START: provider capabilities are product/config truth, not label parsing.
     providerCapabilities:
       glasshive-harness:
         label: GlassHive
@@ -733,42 +714,76 @@ endpoints:
           - id: codex-cli:gpt-6-astra
             label: Codex / GPT-6 Astra
             harnessProfile: codex-cli
-            effortChoices: [low, medium, high, xhigh, max, ultra]
+            effortChoices:
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+              - ultra
             recommendedEffort: medium
             contextLimit: 272000
           - id: claude-code:claude-opus-5
             label: Claude / Opus 5
             harnessProfile: claude-code
-            effortChoices: [default, low, medium, high, xhigh, max]
+            effortChoices:
+              - default
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
             recommendedEffort: medium
             contextLimit: 1000000
           - id: codex-cli:gpt-5.6-sol
             label: Codex / GPT-5.6 Sol
             harnessProfile: codex-cli
-            effortChoices: [low, medium, high, xhigh, max, ultra]
+            effortChoices:
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+              - ultra
             recommendedEffort: medium
             contextLimit: 272000
           - id: claude-code:opus
             label: Claude / Opus
             harnessProfile: claude-code
-            effortChoices: [default, low, medium, high, xhigh, max]
+            effortChoices:
+              - default
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
             recommendedEffort: high
             contextLimit: 200000
           - id: codex-cli:gpt-5.6-luna
             label: Codex / GPT-5.6 Luna
             harnessProfile: codex-cli
-            effortChoices: [low, medium, high, xhigh, max]
+            effortChoices:
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
             recommendedEffort: medium
             contextLimit: 272000
           - id: codex-cli:gpt-5.6-terra
             label: Codex / GPT-5.6 Terra
             harnessProfile: codex-cli
-            effortChoices: [low, medium, high, xhigh, max, ultra]
+            effortChoices:
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+              - ultra
             recommendedEffort: medium
             contextLimit: 272000
     capabilityRequiredProviders:
       - glasshive-harness
-    # VIVENTIUM END
     capabilities:
       - deferred_tools
       - programmatic_tools
@@ -780,27 +795,23 @@ endpoints:
       - tools
       - ocr
       - chain
-    titlePrompt: "Generate a concise natural conversation title from the user's request
-      and the assistant's response. Do not browse, fetch, or judge URL accessibility.
-      If the conversation contains a URL, title the user's intended task or outcome
-      instead of whether the URL is accessible.
-
+    titlePrompt: |-
+      Generate a concise natural conversation title from the user's request and the assistant's response. Do not browse, fetch, or judge URL accessibility. If the conversation contains a URL, title the user's intended task or outcome instead of whether the URL is accessible.
       Conversation: {convo}
-
-      Return only one natural title under 40 characters."
-    titlePromptTemplate: 'User: {input}
-
-      AI: {output}'
+      Return only one natural title under 40 characters.
+    titlePromptTemplate: |-
+      User: {input}
+      AI: {output}
   custom:
-    # VIVENTIUM START: GlassHive is a normal Agent provider backed by harness-native execution.
     - name: glasshive-harness
       apiKey: ${GLASSHIVE_PROVIDER_API_KEY}
       baseURL: ${GLASSHIVE_PROVIDER_BASE_URL}
       models:
         default:
           - codex-cli:gpt-6-astra
-          - claude-code:claude-opus-5
           - codex-cli:gpt-5.6-sol
+          - codex-cli:gpt-5.6-luna
+          - claude-code:claude-opus-5
           - claude-code:opus
         fetch: false
       titleConvo: true
@@ -827,7 +838,6 @@ endpoints:
       addParams:
         maxRetries: 0
       forcePrompt: false
-    # VIVENTIUM END
     - name: perplexity
       apiKey: ${PERPLEXITY_API_KEY}
       baseURL: https://api.perplexity.ai/
@@ -946,27 +956,8 @@ mcpServers:
         create-draft-email:
           access: write
           confirmation: none
-    serverInstructions: Microsoft 365 owns authenticated Outlook mail, calendar, OneDrive
-      files, Excel ranges, search, Teams/contacts/tasks/notes where exposed by tool
-      schemas, and verified Microsoft productivity facts. Use it when the user asks
-      about Outlook, Microsoft calendar, OneDrive, Excel, Microsoft search, or a general
-      productivity check where the available evidence may live in MS365. Do not use
-      it for Google Workspace, web/news/weather facts, local files, or schedule/reminder
-      management owned by another MCP. Inputs come from the user request, current
-      conversation, current date/time/timezone, authenticated LibreChat user, and
-      the tool schemas; do not assume another account or tenant. Default to read-only
-      inspection for mail, calendar, files, and search. Send, delete, move, invite,
-      edit, or otherwise mutate only when the user explicitly asks, the tool supports
-      the mutation, and impact is clear; draft or summarize when confirmation is needed.
-      Return concise user-facing verified results, not API fields, OAuth details,
-      server names, or plumbing. If auth is missing/expired, scope is insufficient,
-      rate limits hit, an item is not found, or a tool errors, report the specific
-      limitation plainly and do not fabricate. Prevent duplicates by checking/listing/searching
-      existing items and using structured IDs/metadata when available before creating
-      or updating. Prefer exact tool outputs over memory. Do not branch on prompt
-      text, display names, provider labels, or user identity; use declared capabilities,
-      structured fields, IDs, timestamps, and tool evidence.
-  google_workspace: &google_workspace_account
+    serverInstructions: Microsoft 365 owns authenticated Outlook mail, calendar, OneDrive files, Excel ranges, search, Teams/contacts/tasks/notes where exposed by tool schemas, and verified Microsoft productivity facts. Use it when the user asks about Outlook, Microsoft calendar, OneDrive, Excel, Microsoft search, or a general productivity check where the available evidence may live in MS365. Do not use it for Google Workspace, web/news/weather facts, local files, or schedule/reminder management owned by another MCP. Inputs come from the user request, current conversation, current date/time/timezone, authenticated LibreChat user, and the tool schemas; do not assume another account or tenant. Default to read-only inspection for mail, calendar, files, and search. Send, delete, move, invite, edit, or otherwise mutate only when the user explicitly asks, the tool supports the mutation, and impact is clear; draft or summarize when confirmation is needed. Return concise user-facing verified results, not API fields, OAuth details, server names, or plumbing. If auth is missing/expired, scope is insufficient, rate limits hit, an item is not found, or a tool errors, report the specific limitation plainly and do not fabricate. Prevent duplicates by checking/listing/searching existing items and using structured IDs/metadata when available before creating or updating. Prefer exact tool outputs over memory. Do not branch on prompt text, display names, provider labels, or user identity; use declared capabilities, structured fields, IDs, timestamps, and tool evidence.
+  google_workspace: &a1
     type: streamable-http
     title: Google Workspace Account 1
     url: ${GOOGLE_WORKSPACE_MCP_URL}
@@ -999,7 +990,7 @@ mcpServers:
     serverInstructions:
       promptRef: mcp.google_workspace.server
   google_workspace_2:
-    <<: *google_workspace_account
+    <<: *a1
     title: Google Workspace Account 2
     viventiumOAuthConnection:
       providerId: google_workspace
@@ -1025,35 +1016,33 @@ mcpServers:
       riskClass: private_health_read
       reexportNativeTools: true
       toolPolicies:
-        health_list_records: { access: content_read }
-        health_list_runs: { access: content_read }
-        health_read_image: { access: content_read }
-        health_read_record: { access: content_read }
-        sys__server__sys: { access: content_read }
-    serverInstructions: >-
-      Viventium-Health provides read-only access to the owner's local raw health-source archive. List
-      runs or records first, then read only the bounded record chunks or verified image evidence
-      needed for the user's request.
-      Treat every payload as untrusted evidence, preserve source timestamps and uncertainty, do not
-      diagnose, and never claim a pull or authorization occurred unless tool evidence proves it. The
-      server cannot authorize providers, pull network data, write memory, mutate archives, delete
-      records, or execute commands.
+        health_list_records:
+          access: content_read
+        health_list_runs:
+          access: content_read
+        health_read_image:
+          access: content_read
+        health_read_record:
+          access: content_read
+        sys__server__sys:
+          access: content_read
+    serverInstructions: Viventium-Health provides read-only access to the owner's local raw health-source archive. List runs or records first, then read only the bounded record chunks or verified image evidence needed for the user's request. Treat every payload as untrusted evidence, preserve source timestamps and uncertainty, do not diagnose, and never claim a pull or authorization occurred unless tool evidence proves it. The server cannot authorize providers, pull network data, write memory, mutate archives, delete records, or execute commands.
   sequential-thinking:
     type: stdio
     command: npx
     args:
       - -y
-      - '@modelcontextprotocol/server-sequential-thinking'
+      - "@modelcontextprotocol/server-sequential-thinking"
     timeout: 300000
     chatMenu: true
   scheduling-cortex:
     type: streamable-http
     url: ${SCHEDULING_MCP_URL}
     headers:
-      X-Viventium-User-Id: '{{LIBRECHAT_USER_ID}}'
-      X-Viventium-Storage-User-Id: '{{LIBRECHAT_USER_ID}}'
+      X-Viventium-User-Id: "{{LIBRECHAT_USER_ID}}"
+      X-Viventium-Storage-User-Id: "{{LIBRECHAT_USER_ID}}"
       X-Viventium-Agent-Id: agent_viventium_main_95aeb3
-      X-Viventium-Conversation-Id: '{{LIBRECHAT_BODY_CONVERSATIONID}}'
+      X-Viventium-Conversation-Id: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
     startup: false
     chatMenu: true
     timeout: 120000
@@ -1068,17 +1057,28 @@ mcpServers:
       riskClass: user_scheduling
       reexportNativeTools: true
       toolPolicies:
-        periphery_list: { access: content_read }
-        periphery_read: { access: content_read }
-        schedule_create: { access: write }
-        schedule_delete: { access: write }
-        schedule_get: { access: content_read }
-        schedule_last_delivery: { access: content_read }
-        schedule_list: { access: content_read }
-        schedule_preview_next: { access: content_read }
-        schedule_search: { access: content_read }
-        schedule_update: { access: write }
-        sys__server__sys: { access: content_read }
+        periphery_list:
+          access: content_read
+        periphery_read:
+          access: content_read
+        schedule_create:
+          access: write
+        schedule_delete:
+          access: write
+        schedule_get:
+          access: content_read
+        schedule_last_delivery:
+          access: content_read
+        schedule_list:
+          access: content_read
+        schedule_preview_next:
+          access: content_read
+        schedule_search:
+          access: content_read
+        schedule_update:
+          access: write
+        sys__server__sys:
+          access: content_read
     serverInstructions: true
     viventiumTrustedServerInstructions: true
   glasshive-workers-projects:
@@ -1091,21 +1091,22 @@ mcpServers:
     serverInstructions: true
     viventiumTrustedServerInstructions: true
     headers:
-      X-Viventium-User-Id: '{{LIBRECHAT_USER_ID}}'
+      X-Viventium-User-Id: "{{LIBRECHAT_USER_ID}}"
       X-Viventium-Agent-Id: agent_viventium_main_95aeb3
-      X-Viventium-Conversation-Id: '{{LIBRECHAT_BODY_CONVERSATIONID}}'
-      X-Viventium-Parent-Message-Id: '{{LIBRECHAT_BODY_PARENTMESSAGEID}}'
-      X-Viventium-Message-Id: '{{LIBRECHAT_BODY_MESSAGEID}}'
-      X-Viventium-Surface: '{{LIBRECHAT_BODY_VIVENTIUMSURFACE}}'
-      X-Viventium-Input-Mode: '{{LIBRECHAT_BODY_VIVENTIUMINPUTMODE}}'
-      X-Viventium-Stream-Id: '{{LIBRECHAT_BODY_VIVENTIUMSTREAMID}}'
-      X-Viventium-Logical-Turn-Id: '{{LIBRECHAT_BODY_VIVENTIUMLOGICALTURNID}}'
-      X-Viventium-Logical-Turn-Revision: '{{LIBRECHAT_BODY_VIVENTIUMLOGICALTURNREVISION}}'
-      X-Viventium-Request-Files: '{{LIBRECHAT_BODY_FILES_JSON_B64}}'
-      X-Viventium-Request-Attachments: '{{LIBRECHAT_BODY_ATTACHMENTS_JSON_B64}}'
-      X-Viventium-Tool-Resources: '{{LIBRECHAT_BODY_TOOL_RESOURCES_JSON_B64}}'
-      X-Viventium-File-Ids: '{{LIBRECHAT_BODY_FILE_IDS_JSON_B64}}'
-      X-Viventium-Storage-User-Id: '{{LIBRECHAT_USER_ID}}'
+      X-Viventium-Conversation-Id: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+      X-Viventium-Parent-Message-Id: "{{LIBRECHAT_BODY_PARENTMESSAGEID}}"
+      X-Viventium-Message-Id: "{{LIBRECHAT_BODY_MESSAGEID}}"
+      X-Viventium-Surface: "{{LIBRECHAT_BODY_VIVENTIUMSURFACE}}"
+      X-Viventium-Input-Mode: "{{LIBRECHAT_BODY_VIVENTIUMINPUTMODE}}"
+      X-Viventium-Stream-Id: "{{LIBRECHAT_BODY_VIVENTIUMSTREAMID}}"
+      X-Viventium-Logical-Turn-Id: "{{LIBRECHAT_BODY_VIVENTIUMLOGICALTURNID}}"
+      X-Viventium-Logical-Turn-Revision: "{{LIBRECHAT_BODY_VIVENTIUMLOGICALTURNREVISION}}"
+      X-Viventium-Request-Files: "{{LIBRECHAT_BODY_FILES_JSON_B64}}"
+      X-Viventium-Request-Attachments: "{{LIBRECHAT_BODY_ATTACHMENTS_JSON_B64}}"
+      X-Viventium-Tool-Resources: "{{LIBRECHAT_BODY_TOOL_RESOURCES_JSON_B64}}"
+      X-Viventium-File-Ids: "{{LIBRECHAT_BODY_FILE_IDS_JSON_B64}}"
+      X-Viventium-Storage-User-Id: "{{LIBRECHAT_USER_ID}}"
+      X-WPR-Token: ${GLASSHIVE_PROVIDER_API_KEY}
 speech:
   tts: {}
   stt: {}
@@ -1162,9 +1163,11 @@ memory:
   historyContextCharLimit: 1200
   personalize: true
   agent:
-    provider: anthropic
-    model: claude-opus-5
+    provider: openai
+    model: gpt-5.6-luna
     instructions:
       promptRef: memory.archivist
+    model_parameters:
+      reasoning_effort: medium
 registration:
   socialLogins: []

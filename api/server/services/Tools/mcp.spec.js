@@ -1,3 +1,4 @@
+// VIVENTIUM START: protect non-interactive MCP authorization and recovery contracts.
 jest.mock('@librechat/data-schemas', () => ({
   decryptV2: jest.fn(),
   logger: {
@@ -470,3 +471,4 @@ describe('shouldUseCachedMcpTools', () => {
     expect(shouldUseCachedMcpTools({ requiresOAuth: false }, null)).toBe(true);
   });
 });
+// VIVENTIUM END

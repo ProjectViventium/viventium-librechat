@@ -47,6 +47,8 @@ jest.mock('~/server/middleware', () => ({
   checkAdmin: (...args) => mockCheckAdmin(...args),
 }));
 
+jest.mock('../channels', () => require('express').Router());
+
 describe('/api/viventium/health/whoop', () => {
   beforeEach(() => {
     jest.resetModules();
@@ -99,9 +101,8 @@ describe('/api/viventium/health/whoop', () => {
       'glasshiveInference',
       'promptWorkbench',
       'feelings',
-      'life',
-      'channels',
       'orchestration',
+      'parallelWorkHealth',
       'orchestrationTrace',
       'personalAccountCleanup',
     ];

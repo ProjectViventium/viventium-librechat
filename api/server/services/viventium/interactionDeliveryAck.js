@@ -120,6 +120,11 @@ function parseDeliveryAcknowledgement(body) {
     presentationRef = boundedString(body.presentation_ref, false);
     if (presentationRef === null) return { error: 'presentation_ref' };
   }
+  let effectRef;
+  if (body.effect_ref !== undefined) {
+    effectRef = boundedString(body.effect_ref, true);
+    if (!effectRef || body.state !== 'committed') return { error: 'effect_ref' };
+  }
   let presentationRefs = [];
   if (body.presentation_refs !== undefined) {
     if (
@@ -166,6 +171,7 @@ function parseDeliveryAcknowledgement(body) {
       logical_turn_id: logicalTurnId,
       revision: body.revision,
       state: body.state,
+      ...(effectRef ? { effect_ref: effectRef } : {}),
       ...(presentationRef ? { presentation_ref: presentationRef } : {}),
       ...(presentationRefs.length ? { presentation_refs: presentationRefs } : {}),
       ...(sourceKind ? { source_kind: sourceKind } : {}),

@@ -33,6 +33,12 @@ const GRAPH_FALLBACK_CONTEXT = Symbol.for('viventium.agent.graph.fallback.runtim
 const MODEL_ROUTE_CAPABILITY_REFRESH = Symbol.for(
   'viventium.agent.model.route.capability.refresh.v1',
 );
+const MODERN_GRAPH_FALLBACK_OWNER = Symbol.for('viventium.agent.modern.graph.fallback.patch.v1');
+const MODEL_ROUTE_NATIVE_AUTHORITY_OBSERVER = Symbol.for(
+  'viventium.agent.model.route.native.authority.observer.v1',
+);
+const CONNECTED_AGENT_INITIALIZER = Symbol.for('viventium.agent.connected.initializer.v1');
+const CONNECTED_AGENT_HYDRATION = Symbol.for('viventium.agent.connected.hydration.v1');
 const scopedTools = new AsyncLocalStorage();
 const fallbackInvocationPolicy = new AsyncLocalStorage();
 
@@ -201,6 +207,89 @@ function createGraphAbortError() {
   return error;
 }
 
+async function hydrateConnectedAgentContext(agentContext, signal) {
+  if (signal?.aborted === true) {
+    throw createGraphAbortError();
+  }
+  const initializer = agentContext?.clientOptions?.[CONNECTED_AGENT_INITIALIZER];
+  if (typeof initializer !== 'function') {
+    return false;
+  }
+  if (!agentContext[CONNECTED_AGENT_HYDRATION]) {
+    const priorTokenCalculation = agentContext.tokenCalculationPromise;
+    const hydrationPromise = Promise.all([
+      initializer(),
+      priorTokenCalculation && typeof priorTokenCalculation.then === 'function'
+        ? priorTokenCalculation
+        : Promise.resolve(),
+    ]).then(([hydrated]) => {
+      if (!hydrated || typeof hydrated !== 'object') {
+        throw new Error('Connected agent initialization returned no graph configuration');
+      }
+
+      const stableRegistry =
+        agentContext.toolRegistry instanceof Map ? agentContext.toolRegistry : new Map();
+      if (hydrated.toolRegistry instanceof Map && hydrated.toolRegistry !== stableRegistry) {
+        stableRegistry.clear();
+        for (const [name, definition] of hydrated.toolRegistry) {
+          stableRegistry.set(name, definition);
+        }
+      }
+
+      agentContext.provider = hydrated.provider;
+      agentContext.reasoningKey = hydrated.reasoningKey ?? agentContext.reasoningKey;
+      agentContext.clientOptions = hydrated.clientOptions;
+      agentContext.name = hydrated.name ?? agentContext.name;
+      agentContext.tools = hydrated.tools;
+      agentContext.toolRegistry = stableRegistry;
+      agentContext.toolDefinitions = hydrated.toolDefinitions;
+      agentContext.instructions = hydrated.instructions;
+      agentContext.additionalInstructions = hydrated.additional_instructions;
+      agentContext.maxContextTokens = hydrated.maxContextTokens;
+      agentContext.useLegacyContent = hydrated.useLegacyContent ?? false;
+      if (hydrated.toolEnd !== undefined) {
+        agentContext.toolEnd = hydrated.toolEnd;
+      }
+      for (const toolName of hydrated.discoveredTools ?? []) {
+        agentContext.discoveredToolNames?.add?.(toolName);
+      }
+
+      // Rebuild only prompt/tool token state. Preserve the handoff context that the graph wrapper
+      // set immediately before this target node received control.
+      agentContext.instructionTokens = 0;
+      agentContext.systemMessageTokens = 0;
+      agentContext.cachedSystemRunnable = undefined;
+      agentContext.systemRunnableStale = true;
+      agentContext.pruneMessages = undefined;
+      agentContext.initializeSystemRunnable?.();
+      if (
+        typeof agentContext.tokenCounter === 'function' &&
+        typeof agentContext.calculateInstructionTokens === 'function'
+      ) {
+        const baseTokenMap = { ...(agentContext.baseIndexTokenCountMap ?? {}) };
+        agentContext.indexTokenCountMap = baseTokenMap;
+        agentContext.tokenCalculationPromise = agentContext
+          .calculateInstructionTokens(agentContext.tokenCounter)
+          .then(() => agentContext.updateTokenMapWithInstructions?.(baseTokenMap));
+      } else {
+        agentContext.tokenCalculationPromise = undefined;
+      }
+      return true;
+    });
+    Object.defineProperty(agentContext, CONNECTED_AGENT_HYDRATION, {
+      value: hydrationPromise,
+      configurable: false,
+      enumerable: false,
+      writable: false,
+    });
+  }
+  await agentContext[CONNECTED_AGENT_HYDRATION];
+  if (signal?.aborted === true) {
+    throw createGraphAbortError();
+  }
+  return true;
+}
+
 function installScopedFallbackRouteAccessors(agentContext) {
   if (agentContext?.[SCOPED_FALLBACK_ROUTE_FLAG] === true) {
     return true;
@@ -320,6 +409,54 @@ function replaceCapabilitySystemInstructions(
   return nextMessages;
 }
 
+function reportNativeInstructionAuthority(messages, policy) {
+  const observer = policy?.agentContext?.clientOptions?.[MODEL_ROUTE_NATIVE_AUTHORITY_OBSERVER];
+  if (typeof observer !== 'function') {
+    return;
+  }
+  const instructionParts = (Array.isArray(messages) ? messages : [])
+    .filter((message) => typeof message?.getType === 'function' && message.getType() === 'system')
+    .map(systemMessageText)
+    .map((value) => value.trim())
+    .filter((value, index, values) => value && values.indexOf(value) === index);
+  let instructionAuthority = instructionParts.join('\n\n').trim();
+  const defaultHeaders = policy?.agentContext?.clientOptions?.configuration?.defaultHeaders;
+  const encodedTail =
+    defaultHeaders && typeof defaultHeaders === 'object'
+      ? Object.entries(defaultHeaders).find(
+          ([name]) => String(name).toLowerCase() === 'x-glasshive-developer-instruction-tail-b64',
+        )?.[1]
+      : '';
+  if (instructionAuthority && typeof encodedTail === 'string' && encodedTail.trim()) {
+    let tail = '';
+    try {
+      tail = Buffer.from(encodedTail.trim(), 'base64').toString('utf8').trim();
+    } catch {
+      tail = '';
+    }
+    if (tail && instructionAuthority.includes(tail)) {
+      const withoutTail = instructionAuthority
+        .split(tail)
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .join('\n\n');
+      instructionAuthority = [withoutTail, tail].filter(Boolean).join('\n\n');
+    }
+  }
+  if (!instructionAuthority) {
+    return;
+  }
+  try {
+    observer({ instructionAuthority });
+  } catch (error) {
+    logger.warn(
+      `[Agent Schema Tool Binding Patch] native authority observer failed: ${
+        error instanceof Error ? error.name : 'unknown'
+      }`,
+    );
+  }
+}
+
 async function prepareFallbackInvocationInput(input, config, policy) {
   const agentContext = policy?.agentContext;
   let finalMessages = input?.finalMessages;
@@ -342,18 +479,20 @@ async function prepareFallbackInvocationInput(input, config, policy) {
       policy?.activeFallbackContext?.systemInstructionAppend,
     );
   }
+  reportNativeInstructionAuthority(finalMessages, policy);
   return { ...input, finalMessages };
 }
 
 function preparePrimaryInvocationInput(input, policy) {
   const refreshResult = policy?.activeCapabilityRefreshResult;
-  if (!refreshResult) {
-    return input;
-  }
-  return {
-    ...input,
-    finalMessages: replaceCapabilitySystemInstructions(input?.finalMessages, refreshResult),
-  };
+  const prepared = refreshResult
+    ? {
+        ...input,
+        finalMessages: replaceCapabilitySystemInstructions(input?.finalMessages, refreshResult),
+      }
+    : input;
+  reportNativeInstructionAuthority(prepared?.finalMessages, policy);
+  return prepared;
 }
 
 async function refreshCapabilityForAttempt(policy, attemptIndex) {
@@ -579,7 +718,12 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
           attemptIndex > 0
             ? await prepareFallbackInvocationInput(input, config, policy)
             : preparePrimaryInvocationInput(input, policy);
-        const result = await originalAttemptInvoke.call(this, invocationInput, config, ...rest);
+        let result;
+        try {
+          result = await originalAttemptInvoke.call(this, invocationInput, config, ...rest);
+        } catch (error) {
+          throw markOpaqueProviderAttemptFailure(error);
+        }
         if (attemptIndex > 0) {
           recordGraphFallbackRecovery(this, policy?.activeFallbackContext);
         }
@@ -624,6 +768,9 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
 
     return async (state, config) => {
       const invokeWithFallbackPolicy = () => {
+        if (proto[MODERN_GRAPH_FALLBACK_OWNER] === true) {
+          return originalCallModel(state, config);
+        }
         const policy = {
           attemptCount: 0,
           blockedError: null,
@@ -652,6 +799,7 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
         );
       };
       const agentContext = this?.agentContexts?.get?.(agentId);
+      await hydrateConnectedAgentContext(agentContext, config?.signal);
       if (agentContext && !installScopedFallbackRouteAccessors(agentContext)) {
         logger.error(
           `[Agent Schema Tool Binding Patch] fallback route accessor unavailable agent=${agentId}`,

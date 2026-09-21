@@ -1,3 +1,7 @@
+/* === VIVENTIUM START ===
+ * Feature: Viventium stream, voice, and timing regression coverage.
+ * Purpose: Keep fork-specific callback behavior protected during upstream replay.
+ */
 const { Tools } = require('librechat-data-provider');
 const { GraphEvents, GraphNodeKeys } = require('@librechat/agents');
 
@@ -38,7 +42,7 @@ jest.mock('@librechat/data-schemas', () => ({
 jest.mock('@librechat/agents', () => ({
   ...jest.requireActual('@librechat/agents'),
   getMessageId: jest.fn(),
-  ToolEndHandler: jest.fn(),
+  ToolEndHandler: jest.fn(() => ({ handle: jest.fn() })),
   handleToolCalls: jest.fn(),
 }));
 
@@ -1333,3 +1337,4 @@ describe('authored native preview presentation', () => {
     expect(GenerationJobManager.emitChunk).not.toHaveBeenCalled();
   });
 });
+/* === VIVENTIUM END === */

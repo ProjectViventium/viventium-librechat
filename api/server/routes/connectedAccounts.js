@@ -748,6 +748,8 @@ async function completeConnectedAccount({ provider, code, state, secret, expecte
     });
     setConnectedAccountAttemptStatus(decodedState.attemptId, 'completed');
 
+    setConnectedAccountAttemptStatus(decodedState.attemptId, 'completed');
+
     return { decodedState, value };
   } catch (callbackError) {
     setConnectedAccountAttemptStatus(decodedState.attemptId, 'failed');

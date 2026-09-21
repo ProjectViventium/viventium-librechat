@@ -115,6 +115,10 @@ describe('AgentSelect', () => {
       },
     };
 
+    /* === VIVENTIUM START ===
+     * Feature: Provider capability-aware Parallel Work agent form.
+     * Purpose: Supply the new capability contract in the legacy selector fixture.
+     */
     render(
       <AgentSelect
         agentQuery={{ data: agent, isSuccess: true } as any}
@@ -124,6 +128,7 @@ describe('AgentSelect', () => {
         providerCapabilities={{}}
       />,
     );
+    /* === VIVENTIUM END === */
 
     await waitFor(() => expect(mockReset).toHaveBeenCalledTimes(1));
 

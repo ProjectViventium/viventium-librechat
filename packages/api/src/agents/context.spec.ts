@@ -403,6 +403,44 @@ describe('Agent Context Utilities', () => {
       });
     });
 
+    it('passes authenticated request context to server-instruction resolution', async () => {
+      const agent = {
+        id: 'test-agent',
+        instructions: 'Original instructions',
+        tools: [
+          new DynamicStructuredTool({
+            name: `tool${Constants.mcp_delimiter}glasshive`,
+            description: 'Test tool',
+            schema: testSchema,
+            func: async () => 'result',
+          }),
+        ],
+      };
+      const formatWithMetadata = jest.fn().mockResolvedValue({
+        text: 'Authenticated MCP instructions',
+        sources: { glasshive: 'server_fetched' },
+      });
+      (
+        mockMCPManager as jest.Mocked<MCPManager> & {
+          formatInstructionsForContextWithMetadata: jest.Mock;
+        }
+      ).formatInstructionsForContextWithMetadata = formatWithMetadata;
+      const requestContext = {
+        user: { id: 'authenticated-user' } as IUser,
+        body: { conversationId: 'conversation-1' },
+      };
+
+      await applyContextToAgent({
+        agent,
+        sharedRunContext: 'Shared context',
+        mcpManager: mockMCPManager,
+        requestContext,
+      });
+
+      expect(formatWithMetadata).toHaveBeenCalledWith(['glasshive'], requestContext);
+      expect(agent.instructions).toContain('Authenticated MCP instructions');
+    });
+
     it('should use ephemeral agent MCP servers when provided', async () => {
       const agent = {
         id: 'test-agent',

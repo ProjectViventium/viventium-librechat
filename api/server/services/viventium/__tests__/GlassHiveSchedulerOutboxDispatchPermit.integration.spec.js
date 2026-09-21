@@ -41,32 +41,14 @@ function identity(revision, character) {
 }
 
 const schedulerRoot = path.resolve(__dirname, '../../../../../viventium/MCPs/scheduling-cortex');
+const sharedRoot = process.env.VIVENTIUM_TEST_PRODUCTION_ROOT
+  ? path.join(process.env.VIVENTIUM_TEST_PRODUCTION_ROOT, 'viventium_v0_4', 'shared')
+  : path.resolve(schedulerRoot, '../../../../shared');
 const schedulerPython = path.join(schedulerRoot, '.venv/bin/python');
 const schedulerDriver = String.raw`
 import json
 import os
 import sys
-import types
-
-prompt_contract = types.ModuleType("scheduler_prompt_contract")
-prompt_contract.CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID = "test.continuity"
-prompt_contract.SCHEDULER_RUN_ENVELOPE_PROMPT_ID = "test.scheduler_envelope"
-prompt_contract.SCHEDULER_RUN_ENVELOPE_TEMPLATE = """<!--test:begin-->
-## Test Background Processing
-For live external facts, use verified test context only.
-
-## Scheduled Run Context (Deterministic)
-{{scheduled_run_context}}"""
-prompt_contract.SCHEDULED_RUN_CONTEXT_HEADER = "## Scheduled Run Context (Deterministic)"
-prompt_contract.SCHEDULED_RUN_CONTEXT_PLACEHOLDER = "{{scheduled_run_context}}"
-prompt_contract.load_scheduler_prompts = lambda: {}
-prompt_contract.render_scheduler_prompt = lambda prompt_id, *, prompts=None: "Synthetic scheduler dispatch contract."
-prompt_contract.render_scheduler_run_envelope = lambda context, *, prompts=None: (
-    prompt_contract.SCHEDULER_RUN_ENVELOPE_TEMPLATE.replace(
-        "{{scheduled_run_context}}", str(context).strip()
-    )
-)
-sys.modules.setdefault("scheduler_prompt_contract", prompt_contract)
 
 from scheduling_cortex.server import build_server
 from scheduling_cortex.storage import ScheduleStorage, StorageConfig
@@ -79,23 +61,14 @@ if request["action"] == "seed":
     storage.create_scheduled_prompt_run({
         "run_id": "scheduled-run-core-http",
         "task_id": "task-core-http",
-        "definition_id": None,
         "user_id": "owner-scheduler-permit",
-        "version_id": None,
         "due_at": now,
         "started_at": now,
         "completed_at": None,
         "status": "running",
         "executor": "glasshive_host",
-        "rendered_hash": None,
-        "variable_snapshot_hash": None,
-        "glasshive_project_id": None,
-        "glasshive_worker_id": None,
-        "glasshive_run_id": None,
         "result_summary": "Running.",
         "error_class": None,
-        "private_detail_path": None,
-        "callback_payload_json": None,
         "disposition": "running",
         "occurrence_key": "occurrence-scheduler-permit",
         "created_at": now,
@@ -110,11 +83,7 @@ elif request["action"] == "post":
         content=request["body"].encode("utf-8"),
         headers=request["headers"],
     )
-    try:
-        response_body = received.json()
-    except ValueError:
-        response_body = {"raw": received.text}
-    response = {"status": received.status_code, "body": response_body}
+    response = {"status": received.status_code, "body": received.json()}
 elif request["action"] == "read":
     response = {
         "run": storage.get_scheduled_prompt_run("scheduled-run-core-http"),
@@ -129,31 +98,14 @@ print(json.dumps(response, separators=(",", ":")))
 `;
 
 function runSchedulerDriver(input) {
-  const localEnvironmentReady = fs.existsSync(schedulerPython);
-  const command = localEnvironmentReady ? schedulerPython : 'uv';
-  const args = localEnvironmentReady
-    ? ['-c', schedulerDriver]
-    : ['run', '--frozen', '--project', '.', 'python', '-c', schedulerDriver];
-  const result = spawnSync(command, args, {
+  const result = spawnSync(schedulerPython, ['-c', schedulerDriver], {
     cwd: schedulerRoot,
     encoding: 'utf8',
     input: JSON.stringify(input),
-    env: { ...process.env, PYTHONPATH: '.' },
+    env: { ...process.env, PYTHONPATH: [schedulerRoot, sharedRoot].join(path.delimiter) },
   });
   if (result.status !== 0) {
-    const diagnostic = [
-      result.error ? `${result.error.name}: ${result.error.message}` : '',
-      result.stderr || '',
-      result.stdout || '',
-    ]
-      .filter(Boolean)
-      .join('\n')
-      .replaceAll(schedulerRoot, '<scheduling-cortex>')
-      .replaceAll(path.resolve(schedulerRoot, '..', '..', '..'), '<repository>')
-      .replaceAll(os.homedir(), '<home>');
-    throw new Error(
-      `scheduler_driver_failed status=${result.status ?? 'spawn_error'}: ${diagnostic || 'no diagnostic output'}`,
-    );
+    throw new Error(`scheduler_driver_failed: ${result.stderr || result.stdout}`);
   }
   const output = result.stdout.trim().split('\n').at(-1);
   return JSON.parse(output);

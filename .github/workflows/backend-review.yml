@@ -167,12 +167,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: ['1/2', '2/2']
+        shard: ['1/4', '2/4', '3/4', '4/4']
     # VIVENTIUM END
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 35
     env:
+      # The Telegram, scheduling, and orchestration suites exceed a 6 GiB V8 heap
+      # when each complete file runs in one worker. Keep all tests enabled.
+      NODE_OPTIONS: '--max-old-space-size=12288'
+      VIVENTIUM_TEST_PRODUCTION_ROOT: ${{ github.workspace }}/parent-viventium
       MONGO_URI: ${{ secrets.MONGO_URI }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       JWT_SECRET: ${{ secrets.JWT_SECRET }}
@@ -186,6 +190,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: ProjectViventium/viventium
+          ref: ${{ vars.VIVENTIUM_PARENT_CI_REF || 'main' }}
+          path: parent-viventium
+      - uses: actions/checkout@v4
+        with:
+          path: parent-viventium/viventium_v0_4/LibreChat
+      - uses: actions/checkout@v4
+        with:
+          repository: ProjectViventium/GlassHive
+          path: parent-viventium/viventium_v0_4/GlassHive
       # VIVENTIUM END
 
       # VIVENTIUM START — exact release toolchain.
@@ -200,6 +216,9 @@ jobs:
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: '0.9.5'
+      - name: Prepare scheduler integration runtime
+        working-directory: viventium/MCPs/scheduling-cortex
+        run: uv sync --frozen
       # VIVENTIUM END
 
       - name: Restore node_modules cache
@@ -245,9 +264,93 @@ jobs:
         run: cp api/test/.env.test.example api/test/.env.test
 
       - name: Run unit tests
-        # VIVENTIUM START — run one disjoint half and recycle idle workers before heap retention can exhaust CI.
-        run: cd api && npm run test:ci -- --shard=${{ matrix.shard }} --workerIdleMemoryLimit=1GB
+        # VIVENTIUM START — split coverage across isolated jobs; bound each job to one recyclable worker.
+        run: cd api && npm run test:ci -- --shard=${{ matrix.shard }} --maxWorkers=1 --workerIdleMemoryLimit=1GB --testPathIgnorePatterns='/node_modules/|/__tests__/fixtures/|/server/services/viventium/__tests__/ViventiumOrchestrationMode.spec.js$|/server/routes/viventium/__tests__/telegram.spec.js$'
         # VIVENTIUM END
+
+      - name: Run orchestration contracts in bounded processes
+        if: matrix.shard == '3/4'
+        run: |
+          cd api
+          suite=server/services/viventium/__tests__/ViventiumOrchestrationMode.spec.js
+          patterns=(
+            '^ViventiumOrchestrationMode (?!rejects )'
+            '^ViventiumOrchestrationMode rejects a'
+            '^ViventiumOrchestrationMode rejects (?!a)'
+            '^independently attested release evidence'
+          )
+          for index in "${!patterns[@]}"; do
+            npm run test:ci -- --runInBand "$suite" --testNamePattern="${patterns[$index]}" --json --outputFile="$RUNNER_TEMP/orchestration-$index.json"
+          done
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const expected = new Map();
+          const passed = new Map();
+          for (let index = 0; index < 4; index += 1) {
+            const file = path.join(process.env.RUNNER_TEMP, `orchestration-${index}.json`);
+            const results = JSON.parse(fs.readFileSync(file, 'utf8')).testResults[0].assertionResults;
+            if (index === 0) {
+              for (const result of results) {
+                expected.set(result.fullName, (expected.get(result.fullName) || 0) + 1);
+              }
+            }
+            for (const result of results) {
+              if (result.status === 'passed') {
+                passed.set(result.fullName, (passed.get(result.fullName) || 0) + 1);
+              }
+            }
+          }
+          const complete = [...expected].every(([name, count]) => passed.get(name) === count)
+            && [...passed].every(([name, count]) => expected.get(name) === count);
+          if (!complete) {
+            console.error('Orchestration suite partition omitted or repeated a test');
+            process.exit(1);
+          }
+          console.log(`Verified ${[...passed.values()].reduce((sum, count) => sum + count, 0)} orchestration tests exactly once`);
+          NODE
+
+      - name: Run Telegram contracts in bounded processes
+        if: matrix.shard == '1/4'
+        run: |
+          cd api
+          suite=server/routes/viventium/__tests__/telegram.spec.js
+          patterns=(
+            '^/api/viventium/telegram POST /chat'
+            '^/api/viventium/telegram POST (?:/source-order|glasshive|cortex|orchestration|/call-link)'
+            '^/api/viventium/telegram POST (?!/chat|/source-order|glasshive|cortex|orchestration|/call-link)'
+            '^/api/viventium/telegram (?!POST )'
+          )
+          for index in "${!patterns[@]}"; do
+            npm run test:ci -- --runInBand "$suite" --testNamePattern="${patterns[$index]}" --json --outputFile="$RUNNER_TEMP/telegram-$index.json"
+          done
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const expected = new Map();
+          const passed = new Map();
+          for (let index = 0; index < 4; index += 1) {
+            const file = path.join(process.env.RUNNER_TEMP, `telegram-${index}.json`);
+            const results = JSON.parse(fs.readFileSync(file, 'utf8')).testResults[0].assertionResults;
+            if (index === 0) {
+              for (const result of results) {
+                expected.set(result.fullName, (expected.get(result.fullName) || 0) + 1);
+              }
+            }
+            for (const result of results) {
+              if (result.status === 'passed') {
+                passed.set(result.fullName, (passed.get(result.fullName) || 0) + 1);
+              }
+            }
+          }
+          const complete = [...expected].every(([name, count]) => passed.get(name) === count)
+            && [...passed].every(([name, count]) => expected.get(name) === count);
+          if (!complete) {
+            console.error('Telegram suite partition omitted or repeated a test');
+            process.exit(1);
+          }
+          console.log(`Verified ${[...passed.values()].reduce((sum, count) => sum + count, 0)} Telegram tests exactly once`);
+          NODE
 
   test-data-provider:
     name: 'Tests: data-provider'

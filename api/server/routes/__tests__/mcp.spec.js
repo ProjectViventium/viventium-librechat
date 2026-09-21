@@ -1586,6 +1586,7 @@ describe('MCP Routes', () => {
         expect.objectContaining({
           serverName: 'ms-365',
           returnOnOAuth: true,
+          suppressOAuthFlow: true,
         }),
       );
     });

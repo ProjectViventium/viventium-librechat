@@ -4,7 +4,9 @@ const vm = require('vm');
 
 // Exercise the production wiring, rather than only its already-tested policy helper.
 const source = fs.readFileSync(path.join(__dirname, 'client.js'), 'utf8');
-const selectionStart = source.indexOf('        speculativeMode =\n');
+const selectionStart = source.indexOf(
+  '        onePassNonblockingMode = shouldRunOnePassNonblockingPhaseA({',
+);
 const selectionEnd = source.indexOf('        if (speculativeMode) {', selectionStart);
 const onePassStart = source.indexOf('        if (onePassNonblockingMode) {', selectionEnd);
 const onePassEnd = source.indexOf('        /* === VIVENTIUM END === */', onePassStart);

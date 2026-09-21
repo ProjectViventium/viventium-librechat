@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Union
 
+from .channel_outcomes import _glasshive_callback_channel_outcomes
 from .scheduled_failure_contract import load_scheduled_failure_contract
 
 
@@ -104,6 +105,17 @@ SCHEDULED_PROVIDER_ROUTE_DECISIONS = frozenset(
     }
 )
 SCHEDULED_FAILURE_CONTRACT = load_scheduled_failure_contract()
+# === VIVENTIUM START ===
+# Purpose: The owner notice for an unconfirmed scheduled delivery has its own durable ledger key on
+# the same run, so it can never collide with (or stand in for) the run's own delivery parts.
+UNCONFIRMED_DELIVERY_NOTICE_CHANNEL = "telegram_unconfirmed_notice"
+
+
+def unconfirmed_delivery_reason(reason: str, channels: list[str]) -> str:
+    listed = ", ".join(channels)
+    detail = f"delivery unconfirmed on {listed}, not resent"
+    return f"{reason}; {detail}" if reason else detail
+# === VIVENTIUM END ===
 SCHEDULED_GENERATION_FAILURE_CLASSES = frozenset(
     {
         *(SCHEDULED_FAILURE_CONTRACT.get("classes") or {}),
@@ -457,42 +469,14 @@ class ScheduleStorage:
               execution_snapshot_json TEXT,
               channel_outcomes_json TEXT,
               interaction_ref TEXT,
+              claimed_at TEXT,
+              claim_expires_at TEXT,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS scheduled_prompt_run_attempts (
-              run_id TEXT NOT NULL,
-              attempt INTEGER NOT NULL,
-              attempted_at TEXT NOT NULL,
-              completed_at TEXT NOT NULL,
-              status TEXT NOT NULL,
-              disposition TEXT,
-              error_class TEXT,
-              result_summary TEXT,
-              lease_owner TEXT,
-              execution_snapshot_json TEXT,
-              channel_outcomes_json TEXT,
-              interaction_ref TEXT,
-              created_at TEXT NOT NULL,
-              PRIMARY KEY (run_id, attempt),
-              FOREIGN KEY(run_id) REFERENCES scheduled_prompt_runs(run_id)
-            )
-            """
-        )
-        attempt_columns = {
-            row["name"]
-            for row in conn.execute(
-                "PRAGMA table_info(scheduled_prompt_run_attempts)"
-            ).fetchall()
-        }
-        if "lease_owner" not in attempt_columns:
-            conn.execute(
-                "ALTER TABLE scheduled_prompt_run_attempts ADD COLUMN lease_owner TEXT"
-            )
         # === VIVENTIUM START ===
         # Feature: Receiver-owned monotonic GlassHive terminal callback authority.
         conn.execute(
@@ -547,12 +531,46 @@ class ScheduleStorage:
             "execution_snapshot_json": "TEXT",
             "channel_outcomes_json": "TEXT",
             "interaction_ref": "TEXT",
+            "claimed_at": "TEXT",
+            "claim_expires_at": "TEXT",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, declaration in additive_run_columns.items():
             if column not in run_columns:
                 conn.execute(
                     f"ALTER TABLE scheduled_prompt_runs ADD COLUMN {column} {declaration}"
                 )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_prompt_run_attempts (
+              run_id TEXT NOT NULL,
+              attempt INTEGER NOT NULL,
+              attempted_at TEXT NOT NULL,
+              completed_at TEXT NOT NULL,
+              status TEXT NOT NULL,
+              disposition TEXT,
+              error_class TEXT,
+              result_summary TEXT,
+              lease_owner TEXT,
+              execution_snapshot_json TEXT,
+              channel_outcomes_json TEXT,
+              interaction_ref TEXT,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (run_id, attempt),
+              FOREIGN KEY(run_id) REFERENCES scheduled_prompt_runs(run_id)
+            )
+            """
+        )
+        attempt_columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(scheduled_prompt_run_attempts)"
+            ).fetchall()
+        }
+        if "lease_owner" not in attempt_columns:
+            conn.execute(
+                "ALTER TABLE scheduled_prompt_run_attempts ADD COLUMN lease_owner TEXT"
+            )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scheduled_prompt_definitions_user ON scheduled_prompt_definitions(user_id)"
         )
@@ -999,6 +1017,31 @@ class ScheduleStorage:
                     )
                 )
             )
+            # === VIVENTIUM START ===
+            # Purpose: A run that stopped after its channel send is not a failed run. Its delivery
+            # ledger says what was sent and what is uncertain; nothing uncertain is resent, and the
+            # owner is told once through the pending notice.
+            settled = (
+                {"sent": [], "unknown": [], "in_flight": False}
+                if evidence
+                else cls._settle_scheduled_prompt_run_deliveries(
+                    conn, run_id=run["run_id"], now=now, now_iso=now_iso
+                )
+            )
+            if settled["in_flight"]:
+                continue
+            if settled["sent"] or settled["unknown"]:
+                cls._close_stale_run_from_delivery_ledger(
+                    conn,
+                    run=run,
+                    settled=settled,
+                    execution_snapshot=execution_snapshot,
+                    owns_parent_occurrence=owns_parent_occurrence,
+                    now_iso=now_iso,
+                )
+                reconciled_count += 1
+                continue
+            # === VIVENTIUM END ===
             if owns_parent_occurrence:
                 conn.execute(
                     """
@@ -1020,6 +1063,14 @@ class ScheduleStorage:
                         run["user_id"],
                     ),
                 )
+            # === VIVENTIUM START ===
+            # Owner channels still waiting on this run take the ledger's outcome and actual reason.
+            channel_outcomes_json = cls._reconciled_channel_outcomes_json(
+                run["channel_outcomes_json"],
+                outcome=delivery["outcome"],
+                reason=failure_class,
+            )
+            # === VIVENTIUM END ===
             if int(run["attempt"] or 0) > 0 and recorded_attempt is None:
                 cls._insert_scheduled_prompt_run_attempt(
                     conn,
@@ -1041,7 +1092,8 @@ class ScheduleStorage:
                 SET status = 'failed', completed_at = COALESCE(completed_at, ?),
                     error_class = ?, result_summary = ?, disposition = 'failed',
                     lease_owner = NULL, lease_until = NULL,
-                    execution_snapshot_json = ?, callback_payload_json = ?, updated_at = ?
+                    execution_snapshot_json = ?, callback_payload_json = ?,
+                    channel_outcomes_json = COALESCE(?, channel_outcomes_json), updated_at = ?
                 WHERE run_id = ? AND user_id = ?
                 """,
                 (
@@ -1050,6 +1102,7 @@ class ScheduleStorage:
                     summary,
                     json.dumps(execution_snapshot),
                     callback_payload_json,
+                    channel_outcomes_json,
                     now_iso,
                     run["run_id"],
                     run["user_id"],
@@ -1058,6 +1111,41 @@ class ScheduleStorage:
             reconciled_count += 1
         if reconciled_count:
             logger.info("Reconciled %s stale scheduled prompt run(s)", reconciled_count)
+
+    # === VIVENTIUM START ===
+    # Purpose: Restart reconciliation resolves only the owner channels still waiting on the run.
+    @staticmethod
+    def _reconciled_channel_outcomes_json(
+        value: Any,
+        *,
+        outcome: str,
+        reason: str,
+    ) -> Optional[str]:
+        """Resolve channels still awaiting a terminal callback; sent and failed keep their record.
+
+        A needs_input callback holds the run queued with its channels action_required, and a signed
+        failure accepted before the run update reaches this path too, so both are still open.
+        """
+        try:
+            existing = json.loads(value) if isinstance(value, str) else value
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(existing, dict):
+            return None
+        waiting = {
+            channel: detail
+            for channel, detail in existing.items()
+            if isinstance(detail, dict) and detail.get("outcome") in {"queued", "action_required"}
+        }
+        if not waiting:
+            return None
+        resolved = _glasshive_callback_channel_outcomes(
+            {"channel_outcomes": waiting},
+            outcome=outcome,
+            reason=reason,
+        )
+        return json.dumps({**existing, **resolved})
+    # === VIVENTIUM END ===
 
     # === VIVENTIUM NOTE ===
     # Feature: Serialize multi-channel values for storage and filter support.
@@ -1404,6 +1492,88 @@ class ScheduleStorage:
             row = conn.execute(sql, params).fetchone()
         return self._row_to_task(row)
     # === VIVENTIUM NOTE ===
+
+    def deactivate_glasshive_workspace_tasks_for_owner(
+        self,
+        *,
+        user_id: str,
+        tenant_id: str,
+        updated_at: str,
+    ) -> int:
+        """Atomically pause this principal's delegated GlassHive definitions only."""
+
+        delivery = json.dumps(
+            {
+                "outcome": "action_required",
+                "reason": "principal_disabled",
+                "failure_class": "principal_disabled",
+                "generated_text": None,
+            }
+        )
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT id, metadata_json
+                FROM scheduled_tasks
+                WHERE user_id = ? AND executor = 'glasshive_workspace' AND active = 1
+                """,
+                (user_id,),
+            ).fetchall()
+            task_ids: list[str] = []
+            cleaned_metadata_by_id: dict[str, str] = {}
+            for row in rows:
+                try:
+                    metadata = json.loads(row["metadata_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                workspace = (
+                    metadata.get("glasshive_workspace_schedule")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                if not isinstance(workspace, dict):
+                    continue
+                if str(workspace.get("tenant_id") or "local") != tenant_id:
+                    continue
+                task_id = str(row["id"])
+                cleaned_workspace = dict(workspace)
+                cleaned_workspace.pop("pending_occurrence_key", None)
+                cleaned_metadata = dict(metadata)
+                cleaned_metadata["glasshive_workspace_schedule"] = cleaned_workspace
+                task_ids.append(task_id)
+                cleaned_metadata_by_id[task_id] = json.dumps(cleaned_metadata)
+            if task_ids:
+                placeholders = ", ".join("?" for _ in task_ids)
+                conn.execute(
+                    f"""
+                    UPDATE scheduled_tasks
+                    SET active = 0,
+                        next_run_at = NULL,
+                        last_status = 'action_required',
+                        last_error = 'principal_disabled',
+                        last_delivery_outcome = 'action_required',
+                        last_delivery_reason = 'principal_disabled',
+                        last_delivery_at = ?,
+                        last_generated_text = NULL,
+                        last_delivery_json = ?,
+                        updated_at = ?
+                    WHERE id IN ({placeholders}) AND user_id = ?
+                    """,
+                    (updated_at, delivery, updated_at, *task_ids, user_id),
+                )
+                for task_id, metadata_json in cleaned_metadata_by_id.items():
+                    conn.execute(
+                        """
+                        UPDATE scheduled_tasks
+                        SET metadata_json = ?
+                        WHERE id = ? AND user_id = ?
+                        """,
+                        (metadata_json, task_id, user_id),
+                    )
+            conn.execute("COMMIT")
+        self._sync_to_mirror()
+        return len(task_ids)
 
     def update_task(
         self,
@@ -2008,6 +2178,209 @@ class ScheduleStorage:
         if updated:
             self._sync_to_mirror()
         return {"updated": updated, "delivery": dict(row) if row is not None else None}
+
+    @classmethod
+    def _settle_scheduled_prompt_run_deliveries(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        now: datetime,
+        now_iso: str,
+    ) -> Dict[str, Any]:
+        """Read a stopped run's delivery ledger without resending anything.
+
+        A send claim whose lease expired may already have reached the channel, so it becomes
+        delivery_unknown exactly as a later claim would record it. A claim whose lease is still live
+        belongs to a sender that may yet confirm it, so the run is left for a later pass untouched.
+        Owner notice rows are excluded: they report this uncertainty rather than deliver the result.
+        """
+
+        deliveries = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM scheduled_prompt_deliveries WHERE run_id = ? AND channel != ?"
+                " ORDER BY channel, part_index",
+                (run_id, UNCONFIRMED_DELIVERY_NOTICE_CHANNEL),
+            ).fetchall()
+        ]
+        for delivery in deliveries:
+            lease_until = cls._parse_utc_instant(delivery.get("lease_until"))
+            if str(delivery.get("state") or "") == "claimed" and lease_until is not None and lease_until > now:
+                return {"sent": [], "unknown": [], "in_flight": True}
+        settled: Dict[str, Any] = {"sent": [], "unknown": [], "in_flight": False}
+        for delivery in deliveries:
+            state = str(delivery.get("state") or "")
+            if state == "sent":
+                settled["sent"].append(delivery)
+                continue
+            if state == "claimed":
+                conn.execute(
+                    """
+                    UPDATE scheduled_prompt_deliveries
+                    SET state = 'delivery_unknown', lease_owner = NULL, lease_until = NULL,
+                        unknown_at = COALESCE(unknown_at, ?),
+                        error_class = 'send_receipt_missing_after_lease', updated_at = ?
+                    WHERE delivery_key = ? AND state = 'claimed'
+                    """,
+                    (now_iso, now_iso, delivery["delivery_key"]),
+                )
+            if state in {"claimed", "delivery_unknown"}:
+                settled["unknown"].append(delivery)
+        return settled
+
+    @staticmethod
+    def _close_stale_run_from_delivery_ledger(
+        conn: sqlite3.Connection,
+        *,
+        run: sqlite3.Row,
+        settled: Dict[str, list[Dict[str, Any]]],
+        execution_snapshot: Dict[str, Any],
+        owns_parent_occurrence: bool,
+        now_iso: str,
+    ) -> None:
+        """Close a run that stopped after its channel send from what its delivery ledger proves."""
+
+        uncertain_channels = sorted(
+            {str(delivery.get("channel") or "") for delivery in settled["unknown"]} - {""}
+        )
+        channels: Dict[str, Dict[str, Any]] = {}
+        for delivery in settled["sent"]:
+            channel = str(delivery.get("channel") or "")
+            if not channel or channel in uncertain_channels:
+                continue
+            entry = channels.setdefault(
+                channel,
+                {
+                    "channel": channel,
+                    "outcome": "sent",
+                    "reason": "delivered",
+                    "delivery_receipt_state": "confirmed",
+                    "message_ids": [],
+                },
+            )
+            if delivery.get("message_id"):
+                entry["message_ids"].append(str(delivery["message_id"]))
+        for channel in uncertain_channels:
+            channels[channel] = {
+                "channel": channel,
+                "outcome": "delivery_unknown",
+                "reason": "send_receipt_missing_after_lease",
+                "delivery_receipt_state": "unknown",
+            }
+        outcome = "delivery_unknown" if uncertain_channels else "sent"
+        reason = "send_receipt_missing_after_lease" if uncertain_channels else "delivered"
+        delivery_json: Dict[str, Any] = {
+            "outcome": outcome,
+            "reason": reason,
+            "generated_text": None,
+            "channels": channels,
+            "scheduled_prompt_run_id": run["run_id"],
+            "recovered_from_delivery_ledger": True,
+        }
+        snapshot = dict(execution_snapshot)
+        if uncertain_channels:
+            delivery_json["unconfirmed_channels"] = uncertain_channels
+            snapshot.setdefault(
+                "unconfirmed_delivery_notice",
+                {"state": "pending", "channels": uncertain_channels},
+            )
+        if owns_parent_occurrence:
+            conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET last_status = ?, last_error = NULL,
+                    last_delivery_outcome = ?, last_delivery_reason = ?,
+                    last_delivery_at = ?, last_delivery_json = ?, updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (
+                    "partial_success" if uncertain_channels else "success",
+                    outcome,
+                    unconfirmed_delivery_reason(reason, uncertain_channels)
+                    if uncertain_channels
+                    else reason,
+                    now_iso,
+                    json.dumps(delivery_json),
+                    now_iso,
+                    run["task_id"],
+                    run["user_id"],
+                ),
+            )
+        conn.execute(
+            """
+            UPDATE scheduled_prompt_runs
+            SET status = 'completed', completed_at = COALESCE(completed_at, ?),
+                error_class = ?, result_summary = ?, disposition = ?,
+                lease_owner = NULL, lease_until = NULL,
+                execution_snapshot_json = ?, channel_outcomes_json = ?, updated_at = ?
+            WHERE run_id = ? AND user_id = ?
+            """,
+            (
+                now_iso,
+                "delivery_unknown" if uncertain_channels else None,
+                "The scheduler stopped after sending; delivery could not be confirmed and was not resent."
+                if uncertain_channels
+                else "The scheduler stopped after a confirmed send; closed from the delivery ledger.",
+                "partial" if uncertain_channels else "delivered",
+                json.dumps(snapshot),
+                json.dumps(channels),
+                now_iso,
+                run["run_id"],
+                run["user_id"],
+            ),
+        )
+
+    def list_pending_unconfirmed_delivery_notices(self, *, limit: int = 5) -> list[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM scheduled_prompt_runs
+                WHERE json_extract(execution_snapshot_json, '$.unconfirmed_delivery_notice.state')
+                      = 'pending'
+                ORDER BY updated_at
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [run for run in (self._row_to_scheduled_prompt_run(row) for row in rows) if run]
+
+    def record_unconfirmed_delivery_notice(
+        self,
+        run_id: str,
+        *,
+        outcome: str,
+        reason: str,
+        now: str,
+    ) -> bool:
+        """Close a pending owner notice once; a closed notice is never reopened."""
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT execution_snapshot_json FROM scheduled_prompt_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            try:
+                snapshot = json.loads(row["execution_snapshot_json"] or "{}") if row else {}
+            except json.JSONDecodeError:
+                snapshot = {}
+            notice = snapshot.get("unconfirmed_delivery_notice") if isinstance(snapshot, dict) else None
+            if not isinstance(notice, dict) or notice.get("state") != "pending":
+                return False
+            snapshot["unconfirmed_delivery_notice"] = {
+                **notice,
+                "state": str(outcome or "failed"),
+                "reason": str(reason or ""),
+                "closed_at": now,
+            }
+            conn.execute(
+                "UPDATE scheduled_prompt_runs SET execution_snapshot_json = ?, updated_at = ?"
+                " WHERE run_id = ?",
+                (json.dumps(snapshot), now, run_id),
+            )
+        self._sync_to_mirror()
+        return True
     # === VIVENTIUM END ===
 
     @staticmethod
@@ -2273,6 +2646,127 @@ class ScheduleStorage:
             "reason": "prepared" if prepared else "stale_attempt",
             "run": self._row_to_scheduled_prompt_run(row),
         }
+
+
+    def claim_scheduled_prompt_run(
+        self,
+        run: Dict[str, Any],
+        *,
+        claimed_at: str,
+        claim_expires_at: str,
+    ) -> Dict[str, Any]:
+        """Atomically reserve or recover one deterministic occurrence dispatch."""
+
+        payload = {
+            **run,
+            "claimed_at": claimed_at,
+            "claim_expires_at": claim_expires_at,
+            "attempt_count": 1,
+        }
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
+                (payload["run_id"],),
+            ).fetchone()
+            claimed = False
+            reason = ""
+            if row is None:
+                columns = tuple(payload.keys())
+                placeholders = ", ".join("?" for _ in columns)
+                conn.execute(
+                    f"INSERT INTO scheduled_prompt_runs ({', '.join(columns)}) VALUES ({placeholders})",
+                    tuple(payload[column] for column in columns),
+                )
+                claimed = True
+            else:
+                current = dict(row)
+                status = str(current.get("status") or "")
+                active_expiry = str(current.get("claim_expires_at") or "")
+                if str(current.get("glasshive_run_id") or ""):
+                    reason = "occurrence_already_reserved"
+                elif status in {"completed", "skipped"}:
+                    reason = "occurrence_terminal"
+                elif status in {"queued", "running"}:
+                    reason = "occurrence_active"
+                elif status == "dispatching" and active_expiry and active_expiry > claimed_at:
+                    reason = "occurrence_claim_active"
+                else:
+                    conn.execute(
+                        """
+                        UPDATE scheduled_prompt_runs
+                        SET status = 'dispatching', started_at = ?, completed_at = NULL,
+                            result_summary = NULL, error_class = NULL,
+                            claimed_at = ?, claim_expires_at = ?,
+                            attempt_count = COALESCE(attempt_count, 0) + 1,
+                            updated_at = ?
+                        WHERE run_id = ?
+                        """,
+                        (
+                            payload["started_at"],
+                            claimed_at,
+                            claim_expires_at,
+                            payload["updated_at"],
+                            payload["run_id"],
+                        ),
+                    )
+                    claimed = True
+            selected = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
+                (payload["run_id"],),
+            ).fetchone()
+            conn.execute("COMMIT")
+        self._sync_to_mirror()
+        return {
+            "claimed": claimed,
+            "reason": reason,
+            "run": self._row_to_scheduled_prompt_run(selected),
+        }
+
+    def link_scheduled_prompt_glasshive_run(
+        self,
+        run_id: str,
+        glasshive_run_id: str,
+        *,
+        queued_summary: str,
+        updated_at: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Link dispatch identity without overwriting an already-terminal callback."""
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status FROM scheduled_prompt_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return None
+            if str(row["status"] or "") in {"completed", "failed"}:
+                conn.execute(
+                    """
+                    UPDATE scheduled_prompt_runs
+                    SET glasshive_run_id = ?, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (glasshive_run_id, updated_at, run_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE scheduled_prompt_runs
+                    SET status = 'queued', glasshive_run_id = ?, result_summary = ?, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (glasshive_run_id, queued_summary, updated_at, run_id),
+                )
+            linked = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            conn.execute("COMMIT")
+        self._sync_to_mirror()
+        return self._row_to_scheduled_prompt_run(linked)
 
     def claim_scheduled_prompt_occurrence(
         self,
@@ -2577,6 +3071,7 @@ class ScheduleStorage:
             ),
         )
 
+
     @classmethod
     def _update_scheduled_task_transition(
         cls,
@@ -2650,6 +3145,7 @@ class ScheduleStorage:
             [*payload.values(), str(task_id), str(user_id)],
         )
         return cursor.rowcount == 1
+
 
     def finalize_scheduled_prompt_run_attempt(
         self,
@@ -2808,6 +3304,7 @@ class ScheduleStorage:
             "run": self._row_to_scheduled_prompt_run(row),
         }
 
+
     def update_scheduled_prompt_run_if_current(
         self,
         run_id: str,
@@ -2850,10 +3347,14 @@ class ScheduleStorage:
                 current is not None
                 and str(current["status"] or "") == str(expected_status or "")
                 and current["error_class"] == expected_error_class
-                and (expected_attempt is None or int(current["attempt"] or 0) == expected_attempt)
+                and (
+                    expected_attempt is None
+                    or int(current["attempt"] or 0) == expected_attempt
+                )
                 and (
                     expected_glasshive_run_id is None
-                    or str(current["glasshive_run_id"] or "") == expected_glasshive_run_id
+                    or str(current["glasshive_run_id"] or "")
+                    == expected_glasshive_run_id
                 )
             )
             if current_matches and payload:
@@ -3721,6 +4222,7 @@ class ScheduleStorage:
             attempt["channel_outcomes"] = json.loads(channel_json) if channel_json else None
             attempts.append(attempt)
         return attempts
+
 
     def _row_to_scheduled_prompt_definition(self, row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
         if row is None:

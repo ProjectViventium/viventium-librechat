@@ -86,32 +86,39 @@ function logCallRouteError(event, error) {
  * Feature: Dispatch guard auth (call-session secret)
  * Purpose: Allow server-to-server dispatch claims without user JWTs.
  * === VIVENTIUM NOTE === */
-async function dispatchAuth(req, res, next) {
-  try {
-    const callSessionId = req.params.callSessionId || '';
-    const secret = req.get('X-VIVENTIUM-CALL-SECRET') || req.get('x-viventium-call-secret') || '';
-    const browserCapability =
-      req.get('X-VIVENTIUM-CALL-CAPABILITY') || req.get('x-viventium-call-capability') || '';
-    const session = await assertCallSessionSecret(callSessionId, secret);
-    const browserSession = await assertCallBrowserCapability(callSessionId, browserCapability);
-    if (browserSession.callSessionId !== session.callSessionId) {
-      const error = new Error('Call browser capability mismatch');
-      error.status = 401;
-      throw error;
+function callCapabilityAuth({ allowEnded = false } = {}) {
+  return async function dispatchAuth(req, res, next) {
+    try {
+      const callSessionId = req.params.callSessionId || '';
+      const secret = req.get('X-VIVENTIUM-CALL-SECRET') || req.get('x-viventium-call-secret') || '';
+      const browserCapability =
+        req.get('X-VIVENTIUM-CALL-CAPABILITY') || req.get('x-viventium-call-capability') || '';
+      const session = await assertCallSessionSecret(callSessionId, secret);
+      const browserSession = await assertCallBrowserCapability(callSessionId, browserCapability, {
+        allowEnded,
+      });
+      if (browserSession.callSessionId !== session.callSessionId) {
+        const error = new Error('Call browser capability mismatch');
+        error.status = 401;
+        throw error;
+      }
+      req.viventiumCallSession = session;
+      next();
+    } catch (err) {
+      const status = err?.status || 401;
+      logger.warn('[VIVENTIUM][calls] dispatch_auth_failed', { status });
+      logCallRouteError('dispatch auth failed', err);
+      res.status(status).json({
+        code: 'auth_expired',
+        message: 'The call session expired or is unauthorized.',
+        retryable: false,
+      });
     }
-    req.viventiumCallSession = session;
-    next();
-  } catch (err) {
-    const status = err?.status || 401;
-    logger.warn('[VIVENTIUM][calls] dispatch_auth_failed', { status });
-    logCallRouteError('dispatch auth failed', err);
-    res.status(status).json({
-      code: 'auth_expired',
-      message: 'The call session expired or is unauthorized.',
-      retryable: false,
-    });
-  }
+  };
 }
+
+const dispatchAuth = callCapabilityAuth();
+const callStateAuth = callCapabilityAuth({ allowEnded: true });
 
 router.post('/', requireJwtAuth, async (req, res) => {
   try {
@@ -157,12 +164,11 @@ router.post('/', requireJwtAuth, async (req, res) => {
         if (typeof convo.agent_id === 'string' && convo.agent_id.length > 0) {
           effectiveAgentId = convo.agent_id;
         }
-      } catch {
-        logger.error('[VIVENTIUM][calls] conversation_lookup_failed');
+      } catch (e) {
+        logCallRouteError('conversation route lookup failed', e);
         return res.status(500).json({ error: 'Failed to load conversation' });
       }
     }
-
     if (typeof effectiveAgentId !== 'string' || effectiveAgentId.length === 0) {
       logger.info('[VIVENTIUM][calls] call_rejected', { reason: 'agent_required' });
       return res.status(400).json({
@@ -184,7 +190,6 @@ router.post('/', requireJwtAuth, async (req, res) => {
         message: 'Voice is temporarily unavailable. Check Viventium status and try again.',
       });
     }
-    /* === VIVENTIUM END === */
 
     await assertVoiceAgentAccess({ req, agentId: effectiveAgentId });
 
@@ -521,7 +526,7 @@ router.get('/:callSessionId/dispatch/status', dispatchAuth, async (req, res) => 
   }
 });
 
-router.get('/:callSessionId/state', dispatchAuth, async (req, res) => {
+router.get('/:callSessionId/state', callStateAuth, async (req, res) => {
   const session = await heartbeatCallSession({
     callSessionId: req.viventiumCallSession.callSessionId,
     currentSession: req.viventiumCallSession,
@@ -554,7 +559,7 @@ router.get('/:callSessionId/state', dispatchAuth, async (req, res) => {
   });
 });
 
-router.post('/:callSessionId/state', dispatchAuth, async (req, res) => {
+router.post('/:callSessionId/state', callStateAuth, async (req, res) => {
   try {
     const session = req.viventiumCallSession;
     const body = req.body ?? {};

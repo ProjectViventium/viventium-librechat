@@ -16,6 +16,9 @@ jest.mock('~/server/services/viventium/ViventiumOrchestrationMode', () => ({
 jest.mock('~/server/services/viventium/cortexFollowupGrace', () => ({
   getCortexFollowupGraceSeconds: jest.fn().mockReturnValue(0),
 }));
+jest.mock('~/server/services/viventium/cortexFollowupGrace', () => ({
+  getCortexFollowupGraceSeconds: jest.fn().mockReturnValue(0),
+}));
 jest.mock('~/models/Project', () => ({
   getProjectByName: jest.fn().mockResolvedValue({ _id: { toString: () => 'project-test' } }),
 }));

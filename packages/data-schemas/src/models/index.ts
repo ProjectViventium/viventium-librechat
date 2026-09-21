@@ -36,6 +36,7 @@ import { createViventiumGlassHiveCallbackEffectOutboxModel } from './glassHiveCa
 import { createViventiumMainContinuityStateModel } from './mainContinuityState';
 import { createViventiumCortexInsightDeliveryModel } from './cortexInsightDelivery';
 import { createViventiumOrchestrationTraceEventModel } from './orchestrationTraceEvent';
+import { createInteractionDurableEffectModel } from './interactionDurableEffect';
 /* === VIVENTIUM END === */
 /* === VIVENTIUM START ===
  * Feature: Channel-neutral messaging persistence.
@@ -95,6 +96,7 @@ export function createModels(mongoose: typeof import('mongoose')) {
     ViventiumMainContinuityState: createViventiumMainContinuityStateModel(mongoose),
     ViventiumCortexInsightDelivery: createViventiumCortexInsightDeliveryModel(mongoose),
     ViventiumOrchestrationTraceEvent: createViventiumOrchestrationTraceEventModel(mongoose),
+    InteractionDurableEffect: createInteractionDurableEffectModel(mongoose),
     ChannelConnection: createChannelConnectionModel(mongoose),
     ChannelThread: createChannelThreadModel(mongoose),
     GatewayUserMapping: createGatewayUserMappingModel(mongoose),

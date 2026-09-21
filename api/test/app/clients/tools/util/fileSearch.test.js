@@ -31,6 +31,7 @@ jest.mock('~/server/services/PermissionService', () => ({ checkPermission: jest.
 const mockMessageFind = jest.fn();
 const mockMessageAggregate = jest.fn();
 const mockConversationFind = jest.fn();
+const mockRecordVoiceOrchestrationTraceBestEffort = jest.fn().mockResolvedValue({ accepted: true });
 
 jest.mock('~/db/models', () => ({
   Message: {
@@ -88,6 +89,15 @@ jest.mock('~/server/services/Files/permissions', () => ({
   filterFilesByAgentAccess: jest.fn((options) => Promise.resolve(options.files)),
 }));
 
+jest.mock('~/server/services/viventium/interactionContext', () => ({
+  getTrustedInteractionContext: jest.fn(() => null),
+}));
+
+jest.mock('~/server/services/viventium/VoiceOrchestrationTraceService', () => ({
+  recordVoiceOrchestrationTraceBestEffort: (...args) =>
+    mockRecordVoiceOrchestrationTraceBestEffort(...args),
+}));
+
 const { createFileSearchTool } = require('~/app/clients/tools/util/fileSearch');
 const { generateShortLivedToken } = require('@librechat/api');
 const { getFiles } = require('~/models');
@@ -98,6 +108,7 @@ const {
 const {
   FILE_SEARCH_NO_RETRIEVED_EVIDENCE,
 } = require('~/app/clients/tools/util/modelFacingToolOutput');
+const { setTrustedInteractionContext } = require('~/server/services/viventium/interactionContext');
 
 function queryResult(result) {
   return {

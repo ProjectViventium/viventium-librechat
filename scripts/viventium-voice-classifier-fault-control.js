@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /* === VIVENTIUM START ===
- * Feature: MPV-061 strict Voice classifier fallback control.
+ * Feature: MPV-054 strict Voice classifier fallback control.
  * Purpose: Give the installed QA parent a bounded private-FD arm/query/approve/clear/cleanup path.
  * Safety: No HTTP/browser surface, argument secret, personal owner, provider remap, or fault flag.
  * === VIVENTIUM END === */
@@ -16,7 +16,7 @@ require('module-alias')({ base: path.resolve(__dirname, '..', 'api') });
 const COMMANDS = new Set(['arm', 'query', 'watch', 'receipt', 'approve', 'clear', 'cleanup']);
 const MAX_INPUT_BYTES = 16 * 1024;
 const READ_CHUNK_BYTES = 4 * 1024;
-const SYNTHETIC_EMAIL = /^viventium-voice-qa-mpv-061-[a-z0-9-]{1,80}@example\.com$/;
+const SYNTHETIC_EMAIL = /^viventium-voice-qa-mpv-054-[a-z0-9-]{1,80}@example\.com$/;
 
 function cliError(code) {
   return Object.assign(new Error(code), { code });

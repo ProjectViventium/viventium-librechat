@@ -51,8 +51,6 @@ const glasshiveInference = require('./glasshiveInference');
  * Feature: Prompt Workbench local launcher route.
  * === VIVENTIUM NOTE === */
 const promptWorkbench = require('./promptWorkbench');
-/* === VIVENTIUM NOTE === WHOOP owner health onboarding */
-const healthWhoop = require('./healthWhoop');
 /* === VIVENTIUM NOTE === Feelings / Emotional Cortex */
 const feelings = require('./feelings');
 /* === VIVENTIUM NOTE === Optional Life setup (ONB-007/008) */
@@ -62,9 +60,14 @@ const channels = require('./channels');
 /* === VIVENTIUM END === */
 /* === VIVENTIUM START === Account-wide Parallel Work and owner-scoped trace routes. === */
 const orchestration = require('./orchestration');
+/* === VIVENTIUM NOTE === Owner-scoped WHOOP health onboarding and recovery */
+const healthWhoop = require('./healthWhoop');
+/* === VIVENTIUM NOTE === Exact local surface handoff readiness for Parallel Work */
+const parallelWorkHealth = require('./parallelWorkHealth');
+/* === VIVENTIUM NOTE === Owner-scoped redacted orchestration trace */
 const orchestrationTrace = require('./orchestrationTrace');
+/* === VIVENTIUM NOTE === Owner-authenticated reviewed synthetic-QA cleanup */
 const personalAccountCleanup = require('./personalAccountCleanup');
-/* === VIVENTIUM END === */
 
 const router = express.Router();
 
@@ -87,10 +90,11 @@ router.use('/glasshive/providers', glasshiveProvider);
 router.use('/glasshive/inference', glasshiveInference);
 /* === VIVENTIUM END === */
 router.use('/prompt-workbench', promptWorkbench);
-router.use('/health/whoop', healthWhoop);
 router.use('/feelings', feelings);
 router.use('/life', life);
 router.use('/channels', channels);
+router.use('/health/whoop', healthWhoop);
+router.use('/health/parallel-work', parallelWorkHealth);
 router.use('/orchestration-traces', orchestrationTrace);
 router.use('/personal-account-cleanup', personalAccountCleanup);
 router.use('/orchestration', orchestration);

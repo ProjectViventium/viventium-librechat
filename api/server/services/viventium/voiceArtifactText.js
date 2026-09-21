@@ -16,7 +16,7 @@
 const XAI_TTS_CAPABILITIES = require('../../../../shared/voice/xai_tts_capabilities.json');
 const { parseDeliveryControls } = require('./deliveryControls');
 
-const ARTIFACT_CONTRACT_VERSION = '2026-07-22.1';
+const ARTIFACT_CONTRACT_VERSION = '2026-07-13.4';
 
 const KNOWN_MISSING_SPACE_JOINS = Object.freeze([]);
 

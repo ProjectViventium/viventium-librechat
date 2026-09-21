@@ -31,6 +31,15 @@ type ProviderDefinition = {
   platformFallbackAvailable: boolean;
   queryKey: EModelEndpoint | string;
 } & ({ oauth: true; slug: ProviderSlug } | { oauth: false; slug: ApiKeyOnlyProviderSlug });
+type OAuthProviderDefinition = Extract<ProviderDefinition, { oauth: true }>;
+
+type ConnectedAccountsStartupConfig = {
+  viventiumConnectedAccountsEnabled?: boolean;
+  viventiumCredentialPolicyEnabled?: boolean;
+  viventiumExperimentalDirectSubscriptionAuth?: boolean;
+  viventiumOpenAIConnectedAccountRequired?: boolean;
+  viventiumAnthropicConnectedAccountRequired?: boolean;
+};
 
 type OAuthSuccessMessage = {
   type: 'viventium_connected_account_oauth_success';
@@ -130,13 +139,18 @@ function ConnectedAccounts() {
   const keyPollInFlightRef = useRef<Partial<Record<ProviderSlug, number>>>({});
   const flowAttemptsRef = useRef<Partial<Record<ProviderSlug, number>>>({});
   const oauthAttemptIdsRef = useRef<Partial<Record<ProviderSlug, string>>>({});
+  const connectedAccountsStartupConfig = startupConfig as
+    ConnectedAccountsStartupConfig | undefined;
   const connectedAccountsEnabled =
-    (startupConfig as { viventiumConnectedAccountsEnabled?: boolean } | undefined)
-      ?.viventiumConnectedAccountsEnabled === true;
+    connectedAccountsStartupConfig?.viventiumConnectedAccountsEnabled === true;
   const credentialPolicyEnabled =
     startupConfig?.viventiumCredentialPolicyEnabled === true || connectedAccountsEnabled;
   const experimentalDirectSubscriptionAuth =
     startupConfig?.viventiumExperimentalDirectSubscriptionAuth === true;
+  const openAIConnectedAccountRequired =
+    connectedAccountsStartupConfig?.viventiumOpenAIConnectedAccountRequired === true;
+  const anthropicConnectedAccountRequired =
+    connectedAccountsStartupConfig?.viventiumAnthropicConnectedAccountRequired === true;
   const allowedPostMessageOrigins = useMemo(() => getAllowedPostMessageOrigins(), []);
 
   const openAIKeyQuery = useUserKeyQuery(EModelEndpoint.openAI, { refetchOnMount: 'always' });
@@ -151,16 +165,22 @@ function ConnectedAccounts() {
   const openAIPlatformFallbackAvailable = useMemo(() => {
     const openAIConfig = endpointsConfig?.[EModelEndpoint.openAI];
     const azureOpenAIConfig = endpointsConfig?.[EModelEndpoint.azureOpenAI];
-    return Boolean(
-      (openAIConfig && !openAIConfig.userProvide) ||
-      (azureOpenAIConfig && !azureOpenAIConfig.userProvide),
+    return connectedAccountPlatformFallbackAvailable(
+      Boolean(
+        (openAIConfig && !openAIConfig.userProvide) ||
+        (azureOpenAIConfig && !azureOpenAIConfig.userProvide),
+      ),
+      openAIConnectedAccountRequired,
     );
-  }, [endpointsConfig]);
+  }, [endpointsConfig, openAIConnectedAccountRequired]);
 
   const anthropicPlatformFallbackAvailable = useMemo(() => {
     const anthropicConfig = endpointsConfig?.[EModelEndpoint.anthropic];
-    return Boolean(anthropicConfig && !anthropicConfig.userProvide);
-  }, [endpointsConfig]);
+    return connectedAccountPlatformFallbackAvailable(
+      Boolean(anthropicConfig && !anthropicConfig.userProvide),
+      anthropicConnectedAccountRequired,
+    );
+  }, [anthropicConnectedAccountRequired, endpointsConfig]);
 
   useEffect(() => {
     const policyProviders: ProviderSlug[] = ['openai', 'anthropic'];
@@ -291,7 +311,7 @@ function ConnectedAccounts() {
           }
           return acc;
         },
-        {} as Record<ProviderSlug, ProviderDefinition>,
+        {} as Record<ProviderSlug, OAuthProviderDefinition>,
       ),
     [providers],
   );
@@ -404,7 +424,7 @@ function ConnectedAccounts() {
   );
 
   const pollForConnectedKey = useCallback(
-    (provider: ProviderDefinition, attempt: number, oauthAttemptId: string) => {
+    (provider: OAuthProviderDefinition, attempt: number, oauthAttemptId: string) => {
       clearKeyPoller(provider.slug);
       const startedAt = Date.now();
       keyPollersRef.current[provider.slug] = window.setInterval(() => {
@@ -602,8 +622,8 @@ function ConnectedAccounts() {
     };
   }, [clearKeyPoller, clearPopupMonitor, clearPopupWindow, invalidateFlowAttempt]);
 
-  const connectProvider = async (provider: ProviderDefinition) => {
-    if (!experimentalDirectSubscriptionAuth || !provider.oauth) {
+  const connectProvider = async (provider: OAuthProviderDefinition) => {
+    if (!experimentalDirectSubscriptionAuth) {
       return;
     }
     const attempt = beginFlowAttempt(provider.slug);
@@ -701,7 +721,7 @@ function ConnectedAccounts() {
     }
   };
 
-  const submitManualFlow = async (provider: ProviderDefinition) => {
+  const submitManualFlow = async (provider: OAuthProviderDefinition) => {
     const manualFlow = manualFlows[provider.slug];
     const callbackInput = manualFlow?.callbackInput.trim();
     if (!manualFlow || !callbackInput) {
@@ -746,7 +766,7 @@ function ConnectedAccounts() {
     }
   };
 
-  const cancelManualFlow = (provider: ProviderDefinition) => {
+  const cancelManualFlow = (provider: OAuthProviderDefinition) => {
     invalidateFlowAttempt(provider.slug);
     delete oauthAttemptIdsRef.current[provider.slug];
     clearManualFlow(provider.slug);
@@ -790,10 +810,10 @@ function ConnectedAccounts() {
   ) => {
     setUpdatingCredentialPolicy(provider);
     try {
-      const response = await request.put<ConnectedAccountPolicyResponse>(
+      const response = (await request.put(
         `${apiBaseUrl()}/api/connected-accounts/${provider}/policy`,
         { policy },
-      );
+      )) as ConnectedAccountPolicyResponse;
       setCredentialPolicies((current) => ({ ...current, [provider]: response.policy }));
       showToast({
         message: localize('com_ui_connected_account_policy_updated'),
@@ -1073,7 +1093,7 @@ function ConnectedAccounts() {
                   )}
                 </div>
               )}
-              {manualFlow && (
+              {provider.oauth && manualFlow && (
                 <div className="mt-3 space-y-2 rounded-lg border border-border-light bg-surface-secondary p-3">
                   <label
                     htmlFor={`${detailsId}-code`}

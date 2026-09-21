@@ -216,6 +216,7 @@ describe('RedisJobStore job serialization', () => {
           JSON.stringify(recordedAcknowledgement),
           '0',
         ])
+        .mockResolvedValueOnce(1) // Mirror the recorded acknowledgement into the job row.
         .mockResolvedValueOnce(['retryable_conflict', '', '', '0']),
     };
     const store = new RedisJobStore(redis as unknown as Redis);

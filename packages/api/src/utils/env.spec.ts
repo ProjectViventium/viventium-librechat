@@ -556,6 +556,22 @@ describe('resolveHeaders', () => {
     expect(result['X-GlassHive-Turn-Context-B64']).toBe('c3ludGhldGljLXR1cm4tY29udGV4dA==');
   });
 
+  /* === VIVENTIUM START ===
+   * Feature: Trusted Parallel Work handoff.
+   * Purpose: Resolve only the server-authored bounded turn context into GlassHive headers.
+   */
+  it('should resolve GlassHive per-turn context headers', () => {
+    const headers = {
+      'X-GlassHive-Turn-Context-B64': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVETURNCONTEXTB64}}',
+    };
+    const body = { viventiumGlassHiveTurnContextB64: 'c3ludGhldGljLXR1cm4tY29udGV4dA==' };
+
+    const result = resolveHeaders({ headers, body });
+
+    expect(result['X-GlassHive-Turn-Context-B64']).toBe('c3ludGhldGljLXR1cm4tY29udGV4dA==');
+  });
+  /* === VIVENTIUM END === */
+
   describe('non-string header values (type guard tests)', () => {
     it('should handle numeric header values without crashing', () => {
       const headers = {

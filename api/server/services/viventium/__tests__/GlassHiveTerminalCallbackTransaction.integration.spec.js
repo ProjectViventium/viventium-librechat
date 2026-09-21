@@ -857,7 +857,13 @@ describe('GlassHive terminal callback all-destination transaction fence', () => 
     expect(rows).toHaveLength(1);
     expect(rows[0].surface).toBe('voice');
     expect(rows[0].sentAt).toBeNull();
-    expect(rows[0].status).toBe(scenario === 'claimed_voice' ? 'claimed' : 'pending');
+    expect(rows[0].status).toBe(
+      scenario === 'claimed_voice'
+        ? 'claimed'
+        : scenario === 'superseded_callback'
+          ? 'superseded'
+          : 'pending',
+    );
   });
 
   test('Main linked Web acquires current authority without a callback-route lease', async () => {

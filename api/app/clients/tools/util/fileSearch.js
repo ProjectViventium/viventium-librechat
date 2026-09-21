@@ -35,6 +35,10 @@ const {
   isConversationRecallFileId,
   messageUsesConversationRecallSearch,
 } = require('~/server/services/viventium/conversationRecallFilters');
+const { getTrustedInteractionContext } = require('~/server/services/viventium/interactionContext');
+const {
+  recordVoiceOrchestrationTraceBestEffort,
+} = require('~/server/services/viventium/VoiceOrchestrationTraceService');
 /* === VIVENTIUM START ===
  * Feature: Evidence-oriented file_search fallback output.
  * === VIVENTIUM END === */
@@ -1617,12 +1621,51 @@ const primeFiles = async (options) => {
  * @param {boolean} [options.fileCitations=false] - Whether to include citation instructions
  * @returns
  */
+async function recordVoiceRecallCompletion({ request, userId, includedResults }) {
+  const recallResultCount = includedResults.filter((result) =>
+    isConversationRecallFileId(result?.file_id),
+  ).length;
+  if (recallResultCount < 1) return null;
+  const interaction = getTrustedInteractionContext(request);
+  const ownerId = String(request?.user?.id || request?.user?._id || '').trim();
+  const callSessionId = String(request?.body?.viventiumCallSessionId || '').trim();
+  const turnId = String(interaction?.logical_turn_id || '').trim();
+  if (
+    request?.body?.voiceMode !== true ||
+    interaction?.surface !== 'voice' ||
+    !ownerId ||
+    ownerId !== String(userId || '').trim() ||
+    !callSessionId ||
+    !turnId
+  ) {
+    return null;
+  }
+  const responseRef = String(request?.body?.responseMessageId || '').trim();
+  const streamRef = String(request?.body?.streamId || '').trim();
+  const taskRef = String(request?.body?.viventiumVoiceTaskId || '').trim();
+  const eventRef = `recall:${responseRef || streamRef || taskRef || turnId}`;
+  return recordVoiceOrchestrationTraceBestEffort({
+    ownerId,
+    callSessionId,
+    turnId,
+    eventRef,
+    stage: 'recall.completed',
+    facts: {
+      ...(responseRef ? { responseRef } : {}),
+      ...(streamRef ? { streamRef } : {}),
+      ...(taskRef ? { taskRef } : {}),
+      effectCount: recallResultCount,
+    },
+  });
+}
+
 const createFileSearchTool = async ({
   userId,
   files,
   entity_id,
   conversationId,
   activeMessageId,
+  request,
   fileCitations = false,
 }) => {
   const hasMeetingTranscriptResources = files.some((file) =>
@@ -2055,6 +2098,8 @@ const createFileSearchTool = async ({
           undefined,
         ];
       }
+
+      await recordVoiceRecallCompletion({ request, userId, includedResults });
 
       const formattedString = includedResults
         .map((result, index) => {

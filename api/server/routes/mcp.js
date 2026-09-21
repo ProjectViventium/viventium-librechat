@@ -81,6 +81,11 @@ function getExpectedMCPOAuthUrls(providerId) {
   }
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Multiple OAuth connections for one logical MCP provider.
+ * Purpose: Account-slot routing ids keep independent tokens while sharing the provider's reviewed
+ * OAuth URLs and callback. Only trusted server config can declare this mapping.
+ * === VIVENTIUM END === */
 function getOAuthProviderId(serverName, serverConfig) {
   return serverConfig?.viventiumOAuthConnection?.providerId || serverName;
 }
@@ -368,6 +373,12 @@ async function warmPersistentUserMCPConnections(user, mcpConfig, oauthServers) {
         flowManager,
         tokenMethods,
         returnOnOAuth: true,
+        /* === VIVENTIUM START ===
+         * Feature: Interactive MCP OAuth flow ownership.
+         * Purpose: A status warm-up may refresh stored credentials, but must never
+         * create a hidden authorization flow that replaces the browser-owned flow.
+         * === VIVENTIUM END === */
+        suppressOAuthFlow: true,
       });
       logger.info(
         `[MCP Persistent Warmup][User: ${user.id}] Ensured connection for "${serverName}"`,

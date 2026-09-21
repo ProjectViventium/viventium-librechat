@@ -530,7 +530,7 @@ class DispatchWorkbenchTests(unittest.TestCase):
         self.assertEqual(sum(call.args[0].endswith('/assign') for call in post_json.call_args_list), 1)
         self.assertIn('occurrence-key-1', reconcile.call_args.args[0])
 
-    def test_glasshive_dispatch_delegates_just_in_time_capabilities_without_credentials(self):
+    def test_docker_workbench_forwards_declared_capabilities_without_credentials(self):
         storage = MagicMock()
         storage.get_scheduled_prompt_definition.return_value = {
             'id': 'definition-1',
@@ -544,12 +544,64 @@ class DispatchWorkbenchTests(unittest.TestCase):
             if url.endswith('/workers/find-or-resume'):
                 calls.append('worker')
                 worker_payloads.append(payload)
-                return self.worker_response('worker-1', 'host')
+                return self.worker_response('worker-1', 'docker')
             if url.endswith('/assign'):
                 calls.append('assign')
                 return {'run_id': 'glasshive-run-1'}
             raise AssertionError(url)
 
+        task = {
+            'id': 'task-1',
+            'user_id': 'user-1',
+            'prompt': 'Synthetic prompt',
+            'next_run_at': '2026-08-05T12:00:00Z',
+            'metadata': {
+                'workbench_scheduled_prompt': {
+                    'definition_id': 'definition-1',
+                    'execution_profile': 'codex-cli',
+                    'execution_mode': 'docker',
+                    'required_capability_servers': ['ms-365', 'google_workspace'],
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {
+                'VIVENTIUM_PRIVATE_USER_DATA_DIR': temp_dir,
+                'SCHEDULER_LIBRECHAT_SECRET': 'scheduler-secret',
+                'SCHEDULING_GLASSHIVE_CALLBACK_SECRET': 'callback-secret',
+            },
+        ), patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_ensure_glasshive_project', side_effect=lambda *_args: calls.append('project') or 'project-1'
+        ), patch.object(dispatch, '_post_json', side_effect=fake_post):
+            result = dispatch._dispatch_glasshive_task(task)
+            created_run = storage.create_scheduled_prompt_run.call_args.args[0]
+            private_detail = json.loads(Path(created_run['private_detail_path']).read_text())
+
+        self.assertEqual(calls, ['project', 'worker', 'assign'])
+        self.assertEqual(result['glasshive_run_id'], 'glasshive-run-1')
+        worker_payload = worker_payloads[0]
+        self.assertEqual(worker_payload['execution_mode'], 'docker')
+        self.assertEqual(
+            worker_payload['bootstrap_bundle']['viventium_execution_authority_request'][
+                'required_capability_servers'
+            ],
+            ['google_workspace', 'ms-365'],
+        )
+        self.assertNotIn('glasshive_capability_broker', worker_payload['bootstrap_bundle'])
+        self.assertNotIn('viventium_launch_authority', worker_payload['bootstrap_bundle'])
+        self.assertNotIn('GLASSHIVE_CAPABILITY_BROKER_TOKEN', json.dumps(worker_payload))
+        self.assertNotIn('glasshive_capability_grant', private_detail)
+        self.assertNotIn('GLASSHIVE_CAPABILITY_BROKER_TOKEN', json.dumps(created_run))
+        self.assertNotIn('GLASSHIVE_CAPABILITY_BROKER_TOKEN', json.dumps(private_detail))
+
+    def test_host_workbench_declaring_capabilities_fails_before_any_glasshive_call(self):
+        storage = MagicMock()
+        storage.get_scheduled_prompt_definition.return_value = {
+            'id': 'definition-1',
+            'prompt_text': 'Synthetic prompt',
+            'metadata': {},
+        }
         task = {
             'id': 'task-1',
             'user_id': 'user-1',
@@ -572,18 +624,16 @@ class DispatchWorkbenchTests(unittest.TestCase):
                 'SCHEDULING_GLASSHIVE_CALLBACK_SECRET': 'callback-secret',
             },
         ), patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
-            dispatch, '_ensure_glasshive_project', side_effect=lambda *_args: calls.append('project') or 'project-1'
-        ), patch.object(dispatch, '_post_json', side_effect=fake_post):
-            result = dispatch._dispatch_glasshive_task(task)
-            created_run = storage.create_scheduled_prompt_run.call_args.args[0]
-            private_detail = json.loads(Path(created_run['private_detail_path']).read_text())
+            dispatch, '_ensure_glasshive_project'
+        ) as ensure_project, patch.object(dispatch, '_post_json') as post_json:
+            with self.assertRaises(dispatch.WorkbenchCapabilityRequiresIsolation):
+                dispatch._dispatch_glasshive_task(task)
 
-        self.assertEqual(calls, ['project', 'worker', 'assign'])
-        self.assertEqual(result['glasshive_run_id'], 'glasshive-run-1')
-        self.assertNotIn('GLASSHIVE_CAPABILITY_BROKER_TOKEN', json.dumps(worker_payloads[0]))
-        self.assertNotIn('glasshive_capability_grant', private_detail)
-        self.assertNotIn('GLASSHIVE_CAPABILITY_BROKER_TOKEN', json.dumps(created_run))
-        self.assertNotIn('GLASSHIVE_CAPABILITY_BROKER_TOKEN', json.dumps(private_detail))
+        ensure_project.assert_not_called()
+        post_json.assert_not_called()
+        failed_update = storage.update_scheduled_prompt_run.call_args_list[-1].args[1]
+        self.assertEqual(failed_update['status'], 'failed')
+        self.assertEqual(failed_update['error_class'], 'unsupported_runtime_configuration')
 
     def test_glasshive_dispatch_records_runtime_capability_failure(self):
         storage = MagicMock()
@@ -609,7 +659,7 @@ class DispatchWorkbenchTests(unittest.TestCase):
                 'workbench_scheduled_prompt': {
                     'definition_id': 'definition-1',
                     'execution_profile': 'codex-cli',
-                    'execution_mode': 'host',
+                    'execution_mode': 'docker',
                     'required_capability_servers': ['ms-365'],
                 }
             },
@@ -926,6 +976,69 @@ class DispatchTelegramTests(unittest.TestCase):
         os.environ.pop('VIVENTIUM_TELEGRAM_FOLLOWUP_TIMEOUT_S', None)
         os.environ.pop('VIVENTIUM_TELEGRAM_FOLLOWUP_GRACE_S', None)
 
+    def _admission_task(self):
+        return {
+            'id': 'task-core-admission',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'synthetic prompt',
+            'channel': 'librechat',
+            'conversation_policy': 'new',
+            '_scheduled_prompt_occurrence_key': 'occurrence-admission-1',
+            'metadata': None,
+        }
+
+    def test_refused_admission_and_refused_reconcile_is_typed_unadmitted(self):
+        with patch.object(
+            dispatch, '_post_json', side_effect=URLError(ConnectionRefusedError(61, 'refused'))
+        ) as post_json, patch.object(
+            dispatch, '_get_json', side_effect=URLError(ConnectionRefusedError(61, 'refused'))
+        ):
+            with self.assertRaises(dispatch.SchedulerAdmissionRefused) as raised:
+                dispatch._run_scheduler_generation(
+                    self._admission_task(), 'http://localhost:3080', 10, 'new'
+                )
+
+        post_json.assert_called_once()
+        failure = dispatch.scheduled_exception_failure(self._admission_task(), raised.exception)
+        self.assertEqual(failure['error_class'], 'scheduler_gateway_unavailable')
+        self.assertTrue(failure['failure_retryable'])
+
+    def test_timed_out_admission_with_unreachable_reconcile_is_not_typed_unadmitted(self):
+        with patch.object(
+            dispatch, '_post_json', side_effect=TimeoutError('admission timed out')
+        ), patch.object(
+            dispatch, '_get_json', side_effect=URLError(ConnectionRefusedError(61, 'refused'))
+        ):
+            with self.assertRaises(URLError) as raised:
+                dispatch._run_scheduler_generation(
+                    self._admission_task(), 'http://localhost:3080', 10, 'new'
+                )
+
+        self.assertNotIsInstance(raised.exception, dispatch.SchedulerAdmissionRefused)
+
+    def test_refused_readmission_after_confirmed_missing_dispatch_is_typed_unadmitted(self):
+        missing = dispatch.HttpJsonError(
+            'Not Found',
+            status=404,
+            method='GET',
+            path='/api/viventium/scheduler/dispatches/occurrence-admission-1',
+        )
+        with patch.object(
+            dispatch,
+            '_post_json',
+            side_effect=[
+                TimeoutError('admission timed out'),
+                URLError(ConnectionRefusedError(61, 'refused')),
+            ],
+        ) as post_json, patch.object(dispatch, '_get_json', side_effect=missing):
+            with self.assertRaises(dispatch.SchedulerAdmissionRefused):
+                dispatch._run_scheduler_generation(
+                    self._admission_task(), 'http://localhost:3080', 10, 'new'
+                )
+
+        self.assertEqual(post_json.call_count, 2)
+
     def test_core_accept_lost_response_reconciles_by_occurrence_without_second_generation(self):
         task = {
             'id': 'task-core-reconcile',
@@ -956,6 +1069,161 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertEqual(post_json.call_count, 1)
         self.assertIn('occurrence-core-1', reconcile.call_args.args[0])
         self.assertEqual(post_json.call_args.args[1]['idempotencyKey'], 'occurrence-core-1')
+
+    def test_readmitted_occurrence_sends_fresh_admission_key_and_keeps_occurrence_identity(self):
+        # Two separate Core gates refuse a repeat of the same occurrence: the dispatch record, keyed
+        # by idempotencyKey, and the per-turn receipt, keyed by source_event_id. A re-run has to
+        # clear both, so both carry the readmit ordinal. Scheduler occurrence identity is unchanged
+        # (run_id, due_at, occurrence key); it is Core's turn identity that must differ.
+        task = {
+            'id': 'task-core-readmit',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'synthetic prompt',
+            'channel': 'librechat',
+            'conversation_policy': 'new',
+            '_scheduled_prompt_occurrence_key': 'occurrence-core-1',
+            '_scheduled_prompt_readmit_attempt': 1,
+            'metadata': None,
+        }
+        with patch.object(
+            dispatch,
+            '_post_json',
+            return_value={'streamId': 'stream-readmit', 'conversationId': 'conversation-readmit'},
+        ) as post_json, patch.object(
+            # This asserts on admission identity, not on prompt text, so composition is stubbed
+            # rather than depending on a compiled prompt bundle.
+            dispatch, '_compose_prompt', return_value='composed prompt'
+        ), patch.object(
+            # Setting an occurrence key means the post-stream external-work reconcile runs; it is
+            # unrelated to admission identity.
+            dispatch, '_get_json', return_value={}
+        ), patch.object(
+            dispatch, '_stream_scheduler_response', return_value=('canonical', 'message-2', '')
+        ), patch.object(
+            dispatch,
+            '_poll_scheduler_followup',
+            return_value={'followup_text': '', 'canonical_text': '', 'canonical_text_source': ''},
+        ):
+            dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'new')
+
+        sent = post_json.call_args.args[1]
+        self.assertEqual(sent['idempotencyKey'], 'occurrence-core-1#r1')
+        # Reusing the bare occurrence key here made claimLogicalTurn return attempt 1's job while
+        # its receipt survived, so the attempt was spent without re-running.
+        self.assertEqual(sent['source_event_id'], 'occurrence-core-1#r1')
+
+    def test_first_admission_of_an_occurrence_keeps_the_bare_occurrence_key(self):
+        task = {
+            'id': 'task-core-first',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'synthetic prompt',
+            'channel': 'librechat',
+            'conversation_policy': 'new',
+            '_scheduled_prompt_occurrence_key': 'occurrence-core-1',
+            'metadata': None,
+        }
+        with patch.object(
+            dispatch,
+            '_post_json',
+            return_value={'streamId': 'stream-first', 'conversationId': 'conversation-first'},
+        ) as post_json, patch.object(
+            dispatch, '_compose_prompt', return_value='composed prompt'
+        ), patch.object(
+            dispatch, '_get_json', return_value={}
+        ), patch.object(
+            dispatch, '_stream_scheduler_response', return_value=('canonical', 'message-1', '')
+        ), patch.object(
+            dispatch,
+            '_poll_scheduler_followup',
+            return_value={'followup_text': '', 'canonical_text': '', 'canonical_text_source': ''},
+        ):
+            dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'new')
+
+        sent = post_json.call_args.args[1]
+        self.assertEqual(sent['idempotencyKey'], 'occurrence-core-1')
+        self.assertEqual(sent['source_event_id'], 'occurrence-core-1')
+
+    def test_readmitted_occurrence_is_not_refused_by_cores_retained_turn_receipt(self):
+        # Faithful fake of the two gates Core applies to a repeat of the same occurrence: the
+        # dispatch record keyed by idempotencyKey, and the per-turn receipt keyed by
+        # source_event_id, which claimLogicalTurn honours for as long as the first attempt's
+        # receipt is retained (300 s in both job stores). While the receipt survives, a repeat is
+        # handed the old stream and nothing re-runs, so the attempt is spent. A readmitted attempt
+        # must clear both gates and reach a stream of its own.
+        receipts = {}
+        dispatch_records = {}
+        sent = []
+
+        def core_post(_url, payload, _headers, _timeout_s):
+            sent.append(payload)
+            admission = payload.get('idempotencyKey')
+            turn = payload.get('source_event_id')
+            if admission in dispatch_records:
+                return {**dispatch_records[admission], 'duplicate': True}
+            if turn in receipts:
+                return {**receipts[turn], 'duplicate': True}
+            stream = {
+                'streamId': f'stream-{len(receipts) + 1}',
+                'conversationId': 'conversation-turn',
+            }
+            receipts[turn] = stream
+            dispatch_records[admission] = stream
+            return stream
+
+        def run(task):
+            with patch.object(dispatch, '_post_json', side_effect=core_post), patch.object(
+                dispatch, '_compose_prompt', return_value='composed prompt'
+            ), patch.object(dispatch, '_get_json', return_value={}), patch.object(
+                dispatch, '_stream_scheduler_response', return_value=('text', 'msg', '')
+            ), patch.object(
+                dispatch,
+                '_poll_scheduler_followup',
+                return_value={'followup_text': '', 'canonical_text': '', 'canonical_text_source': ''},
+            ):
+                return dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'new')
+
+        attempt_one = {
+            'id': 'task-turn-receipt',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'synthetic prompt',
+            'channel': 'librechat',
+            'conversation_policy': 'new',
+            '_scheduled_prompt_occurrence_key': 'occurrence-turn-1',
+            'metadata': None,
+        }
+        run(attempt_one)
+        run({**attempt_one, '_scheduled_prompt_readmit_attempt': 1})
+
+        self.assertEqual(sent[0]['source_event_id'], 'occurrence-turn-1')
+        self.assertEqual(sent[1]['source_event_id'], 'occurrence-turn-1#r1')
+        self.assertEqual(len(receipts), 2, 'the retry must claim its own turn, not reuse attempt 1')
+        self.assertNotEqual(
+            receipts['occurrence-turn-1']['streamId'],
+            receipts['occurrence-turn-1#r1']['streamId'],
+        )
+
+    def test_readmitted_occurrence_keeps_the_conversation_its_failed_attempt_reached(self):
+        # A fresh turn identity must not strand the answer in a different thread from the error the
+        # owner already saw, so a readmitted occurrence names that conversation explicitly instead
+        # of resolving "new" again.
+        task = {
+            'id': 'task-readmit-conversation',
+            'user_id': 'user_1',
+            'conversation_policy': 'new',
+            '_scheduled_prompt_readmit_conversation_id': 'conversation-from-attempt-1',
+        }
+        self.assertEqual(
+            dispatch._resolve_conversation_id(task), 'conversation-from-attempt-1'
+        )
+        self.assertEqual(
+            dispatch._resolve_conversation_id(
+                {'id': 't', 'user_id': 'user_1', 'conversation_policy': 'new'}
+            ),
+            'new',
+        )
 
     def test_scheduler_generation_keeps_logical_turn_from_chat_accept_response(self):
         task = {
@@ -1036,6 +1304,33 @@ class DispatchTelegramTests(unittest.TestCase):
             self.assertTrue(voice_preferences['always_voice_response'])
             self.assertTrue(voice_preferences['voice_responses_enabled'])
 
+    def test_resolve_telegram_identity_unlinked_owner_is_typed(self):
+        task = {'user_id': 'user_1', 'metadata': None}
+        not_found = dispatch.HttpJsonError(
+            'Telegram mapping not found',
+            status=404,
+            method='POST',
+            path='/api/viventium/scheduler/telegram/resolve',
+        )
+
+        with patch.object(dispatch, '_post_json', side_effect=not_found):
+            with self.assertRaises(dispatch.TelegramChannelNotLinked):
+                dispatch._resolve_telegram_identity(task, 'http://localhost:3080', 10)
+
+    def test_resolve_telegram_identity_resolver_failure_is_not_unlinked(self):
+        task = {'user_id': 'user_1', 'metadata': None}
+        unavailable = dispatch.HttpJsonError(
+            'Failed to resolve Telegram mapping',
+            status=500,
+            method='POST',
+            path='/api/viventium/scheduler/telegram/resolve',
+        )
+
+        with patch.object(dispatch, '_post_json', side_effect=unavailable):
+            with self.assertRaises(dispatch.HttpJsonError) as raised:
+                dispatch._resolve_telegram_identity(task, 'http://localhost:3080', 10)
+        self.assertNotIsInstance(raised.exception, dispatch.TelegramChannelNotLinked)
+
     # === VIVENTIUM NOTE ===
     # Feature: Inject configurable prefix for scheduled prompts.
     def test_compose_prompt_injects_prefix(self):
@@ -1089,7 +1384,8 @@ class DispatchTelegramTests(unittest.TestCase):
         self.assertIn('schedule_timezone: America/Los_Angeles', composed)
         self.assertIn('calendar_window_utc_start: 2026-06-15T07:00:00Z', composed)
         self.assertIn('calendar_window_utc_end_exclusive: 2026-06-16T07:00:00Z', composed)
-        self.assertIn('Do not carry forward dates', composed)
+        if callable(dispatch.render_scheduler_prompt):
+            self.assertIn('Do not carry forward dates', composed)
         self.assertIn('calendar, email, tasks', composed)
 
     def test_scheduled_date_guard_corrects_opening_wrong_day(self):
@@ -1308,6 +1604,78 @@ class DispatchTelegramTests(unittest.TestCase):
             self.assertEqual(result.get('conversation_id'), 'new')
             self.assertEqual(result.get('delivery', {}).get('outcome'), 'sent')
             self.assertEqual(result.get('delivery', {}).get('generated_text'), 'final response')
+
+    def test_dispatch_task_skips_unlinked_telegram_without_partial_failure(self):
+        from scheduling_cortex.scheduler import dispatch_run_ledger_updates
+
+        task = {
+            'id': 'task-unlinked-telegram',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'hello',
+            'channel': ['telegram', 'librechat'],
+            'conversation_policy': 'same',
+            'metadata': None,
+        }
+
+        with patch.object(
+            dispatch,
+            '_run_scheduler_generation',
+            return_value={
+                'conversation_id': 'conv-1',
+                'response_message_id': 'msg-1',
+                'final_text': 'final response',
+                'followup_text': '',
+            },
+        ), patch.object(
+            dispatch,
+            '_resolve_telegram_identity',
+            side_effect=dispatch.TelegramChannelNotLinked('telegram_not_linked'),
+        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+            result = dispatch.dispatch_task(task)
+
+        mock_send.assert_not_called()
+        self.assertNotIn('channel_errors', result)
+        self.assertEqual(result['delivery']['outcome'], 'sent')
+        self.assertEqual(result['delivery']['channels']['librechat']['outcome'], 'sent')
+        self.assertEqual(
+            result['delivery']['channels']['telegram'],
+            {
+                'channel': 'telegram',
+                'outcome': 'skipped',
+                'reason': 'telegram_not_linked',
+                'generated_text': None,
+            },
+        )
+        self.assertEqual(dispatch_run_ledger_updates(task, result)['disposition'], 'delivered')
+
+    def test_dispatch_task_with_only_unlinked_telegram_fails_typed(self):
+        task = {
+            'id': 'task-only-unlinked-telegram',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'hello',
+            'channel': 'telegram',
+            'conversation_policy': 'new',
+            'metadata': None,
+        }
+
+        with patch.object(
+            dispatch,
+            '_run_scheduler_generation',
+            return_value={
+                'conversation_id': 'new',
+                'response_message_id': 'msg-1',
+                'final_text': 'final response',
+                'followup_text': '',
+            },
+        ), patch.object(
+            dispatch,
+            '_resolve_telegram_identity',
+            side_effect=dispatch.TelegramChannelNotLinked('telegram_not_linked'),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'telegram_not_linked'):
+                dispatch.dispatch_task(task)
 
     def test_post_json_surfaces_scheduler_auth_reason(self):
         error = HTTPError(
@@ -3301,6 +3669,35 @@ class DispatchBestEffortFanoutTests(unittest.TestCase):
             result = dispatch.scheduled_failure_result(task, 'RuntimeError')
 
         self.assertEqual(result['delivery']['channels']['telegram']['outcome'], 'failed')
+        self.assertEqual(
+            result['generation_failure']['transition']['reported_failure_classes'],
+            [],
+        )
+
+    def test_failure_notice_skips_unlinked_telegram_without_channel_error(self):
+        task = {
+            'id': 'task-failure-notice-unlinked-telegram',
+            'user_id': 'user_1',
+            'agent_id': 'agent-1',
+            'prompt': 'perform required external work',
+            'channel': ['telegram', 'librechat'],
+            'conversation_policy': 'new',
+            'schedule': {'type': 'interval', 'interval': {'every': 1, 'unit': 'hour'}},
+            'metadata': {},
+        }
+
+        with patch.object(
+            dispatch,
+            '_resolve_telegram_identity',
+            side_effect=dispatch.TelegramChannelNotLinked('telegram_not_linked'),
+        ), patch.object(dispatch, '_send_telegram_voice_or_text') as send:
+            result = dispatch.scheduled_failure_result(task, 'RuntimeError')
+
+        send.assert_not_called()
+        self.assertNotIn('channel_errors', result)
+        self.assertEqual(result['delivery']['channels']['telegram']['outcome'], 'skipped')
+        self.assertEqual(result['delivery']['channels']['telegram']['reason'], 'telegram_not_linked')
+        self.assertEqual(result['delivery']['channels']['librechat']['outcome'], 'failed')
         self.assertEqual(
             result['generation_failure']['transition']['reported_failure_classes'],
             [],

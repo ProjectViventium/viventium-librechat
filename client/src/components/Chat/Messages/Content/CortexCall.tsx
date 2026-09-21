@@ -28,6 +28,7 @@ export default function CortexCall({
   no_response = false,
   fallback_used = false,
   fallback_reason_class,
+  status_changed_at,
   isLast = false,
 }: {
   cortex_id: string;

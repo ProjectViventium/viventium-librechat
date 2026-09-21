@@ -1660,6 +1660,149 @@ class StorageScheduledPromptLifecycleTests(unittest.TestCase):
             self.assertEqual(parent["last_error"], "provider_response_failed")
             self.assertEqual(parent["last_delivery_reason"], "provider_response_failed")
 
+    # === VIVENTIUM START ===
+    # Purpose: A restart-reconciled occurrence tells its owner channels the real outcome.
+    def test_restart_reconcile_resolves_waiting_owner_channels_with_the_actual_terminal_reason(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"SCHEDULING_STALE_PROMPT_RUN_SECONDS": ""},
+        ):
+            db_path = str(Path(tmpdir) / "schedules.db")
+            storage = ScheduleStorage(StorageConfig(db_path=db_path))
+            now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+                "+00:00", "Z"
+            )
+            stale_at = (
+                datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=30)
+            ).isoformat().replace("+00:00", "Z")
+
+            def stale_run(task_id: str, executor: str, updates: dict) -> dict:
+                task = _build_task(task_id, created_at=stale_at)
+                task["last_status"] = "running"
+                storage.create_task(task)
+                claimed = storage.claim_scheduled_prompt_occurrence(
+                    task_id=task_id,
+                    user_id=task["user_id"],
+                    executor=executor,
+                    due_at=stale_at,
+                    lease_owner="scheduler:abandoned",
+                    now=stale_at,
+                    lease_seconds=24 * 60 * 60,
+                )
+                storage.update_scheduled_prompt_run(
+                    claimed["run"]["run_id"],
+                    {"status": "running", "updated_at": stale_at, **updates},
+                )
+                return claimed["run"]
+
+            waiting = {"outcome": "queued", "reason": "glasshive_host_run_queued"}
+            signed = stale_run(
+                "task-signed-failure",
+                "glasshive_host",
+                {
+                    "glasshive_run_id": "worker-run-failed",
+                    "channel_outcomes": {
+                        "workbench": {**waiting, "glasshive_run_id": "worker-run-failed"},
+                        "telegram": {"outcome": "sent", "reason": "delivered"},
+                    },
+                },
+            )
+            storage.accept_scheduled_terminal_callback_result(
+                owner_id="user-1",
+                work_id=signed["run_id"],
+                callback_contract="glasshive_terminal_result_v1",
+                payload={
+                    "callback_contract": "glasshive_terminal_result_v1",
+                    "callback_id": "cb_terminal_" + "c" * 64,
+                    "event": "run.failed",
+                    "failure_class": "provider_response_failed",
+                    "failure_retryable": True,
+                    "occurrence_key": signed["occurrence_key"],
+                    "result_digest": "sha256:" + "d" * 64,
+                    "result_revision": 1,
+                    "user_id": "user-1",
+                },
+            )
+            unbound = stale_run(
+                "task-unbound-worker",
+                "glasshive_host",
+                {"channel_outcomes": {"workbench": dict(waiting)}},
+            )
+            no_channels = stale_run("task-no-channels", "viventium_agent", {})
+            held = stale_run(
+                "task-needs-input-then-failed",
+                "glasshive_host",
+                {
+                    "status": "queued",
+                    "glasshive_run_id": "worker-run-held",
+                    "channel_outcomes": {
+                        "workbench": {"outcome": "action_required", "reason": "needs_input"},
+                    },
+                },
+            )
+            storage.accept_scheduled_terminal_callback_result(
+                owner_id="user-1",
+                work_id=held["run_id"],
+                callback_contract="glasshive_terminal_result_v1",
+                payload={
+                    "callback_contract": "glasshive_terminal_result_v1",
+                    "callback_id": "cb_terminal_" + "e" * 64,
+                    "event": "run.failed",
+                    "failure_class": "provider_response_failed",
+                    "failure_retryable": True,
+                    "occurrence_key": held["occurrence_key"],
+                    "result_digest": "sha256:" + "f" * 64,
+                    "result_revision": 1,
+                    "user_id": "user-1",
+                },
+            )
+
+            restarted = ScheduleStorage(StorageConfig(db_path=db_path))
+            signed_run = restarted.get_scheduled_prompt_run(signed["run_id"])
+            unbound_run = restarted.get_scheduled_prompt_run(unbound["run_id"])
+            no_channel_run = restarted.get_scheduled_prompt_run(no_channels["run_id"])
+            held_run = restarted.get_scheduled_prompt_run(held["run_id"])
+            self.assertEqual(held_run["error_class"], "provider_response_failed")
+            self.assertEqual(
+                held_run["channel_outcomes"]["workbench"],
+                {"outcome": "failed", "reason": "provider_response_failed"},
+            )
+            replay = restarted.claim_scheduled_prompt_occurrence(
+                task_id="task-signed-failure",
+                user_id="user-1",
+                executor="glasshive_host",
+                due_at=stale_at,
+                lease_owner="scheduler:restarted",
+                now=now_iso,
+                lease_seconds=15 * 60,
+            )
+
+            self.assertEqual(signed_run["error_class"], "provider_response_failed")
+            self.assertEqual(
+                signed_run["channel_outcomes"]["workbench"],
+                {
+                    "outcome": "failed",
+                    "reason": "provider_response_failed",
+                    "glasshive_run_id": "worker-run-failed",
+                },
+            )
+            self.assertEqual(
+                signed_run["channel_outcomes"]["telegram"],
+                {"outcome": "sent", "reason": "delivered"},
+            )
+            self.assertEqual(unbound_run["error_class"], "stale_run_reconciled")
+            self.assertEqual(
+                unbound_run["channel_outcomes"]["workbench"],
+                {"outcome": "failed", "reason": "stale_run_reconciled"},
+            )
+            self.assertEqual(no_channel_run["status"], "failed")
+            self.assertFalse(no_channel_run.get("channel_outcomes"))
+            self.assertFalse(replay["claimed"])
+            self.assertEqual(
+                len(restarted.list_scheduled_prompt_runs(task_id="task-signed-failure")), 1
+            )
+    # === VIVENTIUM END ===
+
     def test_restart_preserves_proven_live_external_work_after_heartbeat_window(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
             os.environ,

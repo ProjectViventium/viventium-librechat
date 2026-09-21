@@ -1,3 +1,4 @@
+// VIVENTIUM START: verify Viventium agent validation extensions.
 import { ErrorTypes } from 'librechat-data-provider';
 import type { Agent, TModelsConfig } from 'librechat-data-provider';
 import type { Request, Response } from 'express';
@@ -62,6 +63,7 @@ describe('background cortex result evidence validation', () => {
     expect(() => cortexResultEvidencePolicySchema.parse(policy)).toThrow();
   });
 });
+// VIVENTIUM END
 
 const providerRegistry = {
   'harness-provider': {

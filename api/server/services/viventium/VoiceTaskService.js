@@ -12,6 +12,7 @@ const {
   deferGlassHiveTerminalCallbackAfterAbort,
   deferGlassHiveTerminalCallbackAfterCommit,
 } = require('./GlassHiveTerminalCallbackTransaction');
+const { recordVoiceOrchestrationTraceBestEffort } = require('./VoiceOrchestrationTraceService');
 
 const TERMINAL_STATES = new Set([
   'completed',
@@ -2157,6 +2158,25 @@ function observeGenerationEvent(taskId, generationEvent) {
     const toolName =
       toolCalls.map((call) => safeText(call?.function?.name || call?.name, 160)).find(Boolean) ||
       safeText(toolResult?.tool_call?.name, 160);
+    const isCompletedToolCall =
+      eventType === 'on_run_step_completed' &&
+      String(toolResult?.type || '')
+        .trim()
+        .toLowerCase() === 'tool_call';
+    if (isCompletedToolCall && ownerEventId) {
+      void recordVoiceOrchestrationTraceBestEffort({
+        ownerId: task.userId,
+        callSessionId: task.callSessionId,
+        turnId: task.turnId,
+        eventRef: ownerEventId,
+        stage: 'tool.completed',
+        facts: {
+          taskRef: task.taskId,
+          ...(task.streamId ? { streamRef: task.streamId } : {}),
+          effectCount: 1,
+        },
+      });
+    }
     return nextEvent(task, {
       type: 'progress',
       phase: eventType === 'on_run_step_completed' ? 'tool_completed' : 'tool',
@@ -2213,6 +2233,25 @@ function observeGenerationEvent(taskId, generationEvent) {
       : null;
   }
   if (eventType === 'on_cortex_update') {
+    if (
+      ownerEventId &&
+      String(data.status || '')
+        .trim()
+        .toLowerCase() === 'completed'
+    ) {
+      void recordVoiceOrchestrationTraceBestEffort({
+        ownerId: task.userId,
+        callSessionId: task.callSessionId,
+        turnId: task.turnId,
+        eventRef: ownerEventId,
+        stage: 'cortex.completed',
+        facts: {
+          taskRef: task.taskId,
+          ...(task.streamId ? { streamRef: task.streamId } : {}),
+          effectCount: 1,
+        },
+      });
+    }
     return nextEvent(task, {
       type: 'progress',
       phase: 'cortex',
@@ -2221,6 +2260,20 @@ function observeGenerationEvent(taskId, generationEvent) {
     });
   }
   if (eventType === 'on_cortex_followup') {
+    if (ownerEventId) {
+      void recordVoiceOrchestrationTraceBestEffort({
+        ownerId: task.userId,
+        callSessionId: task.callSessionId,
+        turnId: task.turnId,
+        eventRef: ownerEventId,
+        stage: 'cortex.completed',
+        facts: {
+          taskRef: task.taskId,
+          ...(task.streamId ? { streamRef: task.streamId } : {}),
+          effectCount: 1,
+        },
+      });
+    }
     return nextEvent(task, {
       type: 'progress',
       phase: 'follow_up',

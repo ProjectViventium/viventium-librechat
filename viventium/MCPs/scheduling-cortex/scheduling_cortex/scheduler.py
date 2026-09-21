@@ -18,6 +18,9 @@ from typing import Any, Dict, Optional
 from croniter import croniter
 
 from .dispatch import (
+    SCHEDULED_FAILURE_CONTRACT,
+    SchedulerAdmissionRefused,
+    deliver_unconfirmed_delivery_notice,
     dispatch_task,
     normalized_scheduled_generation_failure_class,
     resolve_scheduled_failure_transition,
@@ -31,6 +34,7 @@ from .storage import (
     SCHEDULER_RETRY_OCCURRENCE_KEY,
     ScheduleStorage,
     scheduled_prompt_stale_seconds,
+    unconfirmed_delivery_reason,
 )
 from .workspace_recurrence import (
     deterministic_jitter_seconds,
@@ -46,6 +50,9 @@ DEFAULT_CATCH_UP_MAX_LATE_S = 12 * 60 * 60
 HARD_CATCH_UP_MAX_LATE_S = 24 * 60 * 60
 DEFAULT_OCCURRENCE_LEASE_SECONDS = 15 * 60
 MISFIRE_POLICY_KEY = "misfire_policy"
+# Core reports this class before dispatch as {"deferred": True} and after dispatch as a typed
+# generation failure; both shapes keep the same occurrence under the contract's retry budget.
+SESSION_AUTHORITY_CONFLICT_CLASS = "conversation_session_authority_conflict"
 GLASSHIVE_WORKSPACE_METADATA_KEY = "glasshive_workspace_schedule"
 GLASSHIVE_PENDING_OCCURRENCE_KEY = "pending_occurrence_key"
 STALE_INTERNAL_METADATA_KEYS = frozenset(
@@ -155,6 +162,15 @@ def dispatch_run_ledger_updates(
     required_total = max(0, int(external_work.get("requiredTotal") or 0))
     all_required_terminal = external_work.get("allRequiredTerminal") is True
     required_failed = max(0, int(external_work.get("requiredFailed") or 0))
+    # === VIVENTIUM START ===
+    # Purpose: A destination whose receipt is uncertain makes the run partial and owes the owner
+    # one notice; a notice already closed on this run is never reopened.
+    unconfirmed_channels = (
+        [str(channel) for channel in delivery["unconfirmed_channels"] if str(channel).strip()]
+        if isinstance(delivery.get("unconfirmed_channels"), list)
+        else []
+    )
+    # === VIVENTIUM END ===
 
     if queued:
         disposition = "running"
@@ -163,7 +179,7 @@ def dispatch_run_ledger_updates(
     elif channel_errors:
         disposition = "partial"
     elif delivery_outcome in {"sent", "fallback_delivered"}:
-        disposition = "delivered"
+        disposition = "partial" if unconfirmed_channels else "delivered"
     elif delivery_outcome in {"suppressed", "audit_only"}:
         disposition = "silent"
     else:
@@ -234,6 +250,11 @@ def dispatch_run_ledger_updates(
             "lease_until": None,
             "updated_at": to_utc_iso(finished),
         }
+    if unconfirmed_channels and not queued:
+        execution_snapshot.setdefault(
+            "unconfirmed_delivery_notice",
+            {"state": "pending", "channels": unconfirmed_channels},
+        )
     updates: Dict[str, object] = {
         "status": "queued" if queued else "completed",
         "disposition": disposition,
@@ -695,6 +716,7 @@ class SchedulerEngine:
     def _tick(self) -> None:
         now = datetime.now(timezone.utc)
         now_iso = to_utc_iso(now)
+        self._deliver_pending_unconfirmed_notices(now)
         due_tasks = self._storage.get_due_tasks(now_iso)
         if not due_tasks:
             return
@@ -713,6 +735,42 @@ class SchedulerEngine:
             with self._futures_lock:
                 self._futures.add(future)
             future.add_done_callback(self._release_worker_capacity)
+
+    # === VIVENTIUM START ===
+    # Purpose: Tell the owner once about each scheduled delivery that could not be confirmed, from
+    # both the dispatch path and restart recovery. The notice's own ledger key makes a repeat of
+    # this sweep, a crash mid-notice or a replay send nothing further.
+    def _deliver_pending_unconfirmed_notices(self, now: datetime) -> None:
+        try:
+            pending = self._storage.list_pending_unconfirmed_delivery_notices(limit=1)
+        except Exception:
+            logger.exception("Pending unconfirmed-delivery notices could not be listed")
+            return
+        for run in pending:
+            run_id = str(run.get("run_id") or "")
+            task = self._storage.get_task(str(run.get("user_id") or ""), str(run.get("task_id") or ""))
+            if task is None:
+                result = {"outcome": "skipped", "reason": "task_missing"}
+            else:
+                notice_task = dict(task)
+                notice_task["_scheduled_prompt_run_id"] = run_id
+                notice_task["_scheduled_prompt_occurrence_key"] = run.get("occurrence_key")
+                try:
+                    result = deliver_unconfirmed_delivery_notice(
+                        notice_task,
+                        conversation_saved=str(run.get("interaction_ref") or "").startswith(
+                            "conversation:"
+                        ),
+                    )
+                except Exception as exc:
+                    result = {"outcome": "failed", "reason": type(exc).__name__}
+            self._storage.record_unconfirmed_delivery_notice(
+                run_id,
+                outcome=str(result.get("outcome") or "failed"),
+                reason=str(result.get("reason") or ""),
+                now=to_utc_iso(now),
+            )
+    # === VIVENTIUM END ===
 
     def _release_worker_capacity(self, future: Future[None]) -> None:
         with self._futures_lock:
@@ -777,21 +835,18 @@ class SchedulerEngine:
             next_run_dt = _latest_due_occurrence(schedule, next_run_dt, now)
         occurrence_due_dt = next_run_dt
         retry_occurrence = metadata.get(SCHEDULER_RETRY_OCCURRENCE_KEY)
-        if (
-            str(schedule.get("type") or "") == "once"
-            and isinstance(retry_occurrence, dict)
+        if str(schedule.get("type") or "") == "once" and isinstance(
+            retry_occurrence, dict
         ):
             try:
                 retry_due_dt = parse_iso(
-                    str(retry_occurrence.get("due_at") or ""),
-                    timezone.utc,
+                    str(retry_occurrence.get("due_at") or ""), timezone.utc
                 )
             except (TypeError, ValueError):
                 retry_due_dt = None
             expected_occurrence_key = (
                 self._storage.scheduled_prompt_occurrence_key(
-                    str(task_id or ""),
-                    to_utc_iso(retry_due_dt),
+                    str(task_id or ""), to_utc_iso(retry_due_dt)
                 )
                 if retry_due_dt is not None
                 else ""
@@ -858,6 +913,18 @@ class SchedulerEngine:
             else ""
         )
         is_deferred_overlap = deferred_due_at == to_utc_iso(next_run_dt)
+        # Carried before the deferral is cleared: it survives only as this attempt's Core admission
+        # and turn identity, and is written solely by a requeue that holds a definite typed failure.
+        readmit_attempt = (
+            int(deferred.get("readmit_attempt") or 0) if isinstance(deferred, dict) else 0
+        )
+        if readmit_attempt > 0:
+            task["_scheduled_prompt_readmit_attempt"] = readmit_attempt
+            readmit_conversation_id = str(
+                deferred.get("readmit_conversation_id") or ""
+            ).strip()
+            if readmit_conversation_id:
+                task["_scheduled_prompt_readmit_conversation_id"] = readmit_conversation_id
         if isinstance(deferred, dict):
             cleaned_metadata = dict(metadata)
             cleaned_metadata.pop(SCHEDULER_DEFERRED_OCCURRENCE_KEY, None)
@@ -921,9 +988,7 @@ class SchedulerEngine:
             preparation = self._storage.begin_scheduled_prompt_run_dispatch(
                 run_id,
                 expected_lease_owner=self._lease_owner,
-                expected_attempt=max(
-                    1, int(task.get("_scheduled_prompt_attempt") or 0)
-                ),
+                expected_attempt=max(1, int(task.get("_scheduled_prompt_attempt") or 0)),
                 now=to_utc_iso(dispatch_now),
                 lease_seconds=self._occurrence_lease_s,
                 task_metadata=(
@@ -962,42 +1027,25 @@ class SchedulerEngine:
             try:
                 dispatch_result = dispatch_task(scheduled_task)
                 if isinstance(dispatch_result, dict) and dispatch_result.get("deferred") is True:
-                    retry_at = to_utc_iso(now + timedelta(seconds=self._retry_delay_s))
-                    deferred_metadata = dict(task.get("metadata") or {})
-                    deferred_metadata[SCHEDULER_DEFERRED_OCCURRENCE_KEY] = {
-                        "version": 1,
-                        "due_at": to_utc_iso(next_run_dt),
-                        "retry_at": retry_at,
-                        "blocked_at": to_utc_iso(now),
-                    }
-                    self._storage.update_scheduled_prompt_run(run_id, {
-                        "status": "queued",
-                        "disposition": "queued",
-                        "lease_owner": None,
-                        "lease_until": retry_at,
-                        "error_class": None,
-                        "updated_at": to_utc_iso(now),
-                    })
-                    self._storage.update_task(str(task["user_id"]), str(task_id), {
-                        "last_status": "waiting",
-                        "last_error": None,
-                        "metadata": deferred_metadata,
-                        "next_run_at": retry_at,
-                        "updated_at": to_utc_iso(now),
-                    })
+                    self._requeue_occurrence(task, run_id, next_run_dt, now)
+                    return
+                if self._retry_session_authority_conflict(
+                    task, run_id, next_run_dt, now, dispatch_result
+                ):
                     return
             except Exception as exc:
                 logger.exception("Task %s failed: %s", task_id, exc)
                 failure = scheduled_exception_failure(scheduled_task, exc)
                 failure_class = failure["error_class"]
                 failure_retryable = failure.get("failure_retryable")
+                if self._retry_refused_admission(task, run_id, next_run_dt, now, exc):
+                    return
                 execution = {
                     **(
                         {"source_prompt_id": source_prompt_id}
                         if (
                             source_prompt_id := str(
-                                (scheduled_task.get("metadata") or {}).get("source_prompt_id")
-                                or ""
+                                (scheduled_task.get("metadata") or {}).get("source_prompt_id") or ""
                             ).strip()
                         )
                         else {}
@@ -1040,6 +1088,174 @@ class SchedulerEngine:
             lease_stopped.set()
             lease_thread.join(timeout=1)
 
+    def _requeue_occurrence(
+        self,
+        task: Dict[str, object],
+        run_id: str,
+        due_dt: datetime,
+        now: datetime,
+        *,
+        error_class: Optional[str] = None,
+        failure_transition: Optional[Dict[str, object]] = None,
+        readmit_attempt: int = 0,
+        readmit_conversation_id: Optional[str] = None,
+    ) -> None:
+        retry_at = to_utc_iso(now + timedelta(seconds=self._retry_delay_s))
+        deferred_metadata = dict(task.get("metadata") or {})
+        deferred_occurrence: Dict[str, object] = {
+            "version": 1,
+            "due_at": to_utc_iso(due_dt),
+            "retry_at": retry_at,
+            "blocked_at": to_utc_iso(now),
+            **({"error_class": error_class} if error_class else {}),
+        }
+        task_updates: Dict[str, object] = {
+            "last_status": "waiting",
+            "last_error": error_class,
+            "next_run_at": retry_at,
+            "updated_at": to_utc_iso(now),
+        }
+        if failure_transition is not None:
+            # This attempt genuinely failed, so the contract's health epoch has to survive the
+            # requeue. resolve_scheduled_failure_transition only carries consecutive_count forward
+            # while last_status is "error"; leaving "waiting" here would restart the count on every
+            # attempt and the one-shot cap could never be reached. A deferral that never dispatched
+            # is not a failure and keeps the "waiting" status it has always had.
+            task_updates["last_status"] = "error"
+            deferred_metadata["scheduled_failure_state_v1"] = dict(failure_transition)
+        if readmit_attempt > 0:
+            deferred_occurrence["readmit_attempt"] = readmit_attempt
+            if readmit_conversation_id:
+                deferred_occurrence["readmit_conversation_id"] = readmit_conversation_id
+        deferred_metadata[SCHEDULER_DEFERRED_OCCURRENCE_KEY] = deferred_occurrence
+        task_updates["metadata"] = deferred_metadata
+        self._storage.update_scheduled_prompt_run(run_id, {
+            "status": "queued",
+            "disposition": "queued",
+            "lease_owner": None,
+            "lease_until": retry_at,
+            "error_class": error_class,
+            "updated_at": to_utc_iso(now),
+        })
+        self._storage.update_task(str(task["user_id"]), str(task["id"]), task_updates)
+
+    def _retry_refused_admission(
+        self,
+        task: Dict[str, object],
+        run_id: str,
+        due_dt: datetime,
+        now: datetime,
+        error: BaseException,
+    ) -> bool:
+        """Requeue an occurrence Core never admitted, within the contract attempt budget."""
+        if not isinstance(error, SchedulerAdmissionRefused):
+            return False
+        run = self._storage.get_scheduled_prompt_run(run_id) or {}
+        max_attempts = max(1, int(SCHEDULED_FAILURE_CONTRACT.get("one_time_max_attempts") or 3))
+        if int(run.get("attempt") or 0) >= max_attempts:
+            return False
+        schedule = task.get("schedule") if isinstance(task.get("schedule"), dict) else {}
+        if schedule.get("type") != "once":
+            next_regular = compute_next_run(schedule, due_dt, due_dt)
+            if next_regular is not None and next_regular <= now + timedelta(seconds=self._retry_delay_s):
+                return False
+        self._requeue_occurrence(
+            task, run_id, due_dt, now, error_class=SchedulerAdmissionRefused.failure_class
+        )
+        return True
+
+    @staticmethod
+    def _failure_notice_reached_owner(dispatch_result: Dict[str, object]) -> bool:
+        """True when the failure notice for this attempt already reached a channel.
+
+        scheduled_failure_result may deliver the typed notice (Telegram) before returning, and
+        records the class in reported_failure_classes. Retrying such an occurrence would show the
+        owner a second notice for the same attempt, so it stays terminal.
+        """
+
+        delivery = (
+            dispatch_result.get("delivery")
+            if isinstance(dispatch_result.get("delivery"), dict)
+            else {}
+        )
+        if delivery.get("generated_text"):
+            return True
+        channels = delivery.get("channels") if isinstance(delivery.get("channels"), dict) else {}
+        for detail in channels.values():
+            if not isinstance(detail, dict):
+                continue
+            if str(detail.get("outcome") or "") in {"sent", "fallback_delivered"}:
+                return True
+        failure = (
+            dispatch_result.get("generation_failure")
+            if isinstance(dispatch_result.get("generation_failure"), dict)
+            else {}
+        )
+        transition = failure.get("transition") if isinstance(failure.get("transition"), dict) else {}
+        return bool(transition.get("reported_failure_classes"))
+
+    def _retry_session_authority_conflict(
+        self,
+        task: Dict[str, object],
+        run_id: str,
+        due_dt: datetime,
+        now: datetime,
+        dispatch_result: Optional[Dict[str, object]],
+    ) -> bool:
+        """Preserve an occurrence Core refused for a session-authority conflict after dispatch.
+
+        Core reports this conflict before dispatch as {"deferred": True} and after dispatch as a
+        typed generation failure. Only the shape differs, so the occurrence is requeued through the
+        same typed owner rather than abandoned for a replacement with a new identity.
+
+        The contract's own transition decides whether a retry is owed: "retry_scheduled" (a one-shot
+        schedule, whose occurrence has no later slot to fall back on) keeps this occurrence, while
+        "next_occurrence_only" (a recurring schedule) stays terminal because its next regular
+        occurrence is the recovery. The attempt budget is the one the refused-admission path uses.
+        """
+
+        if not isinstance(dispatch_result, dict):
+            return False
+        failure = (
+            dispatch_result.get("generation_failure")
+            if isinstance(dispatch_result.get("generation_failure"), dict)
+            else None
+        )
+        if failure is None:
+            return False
+        error_class = normalized_scheduled_generation_failure_class(failure.get("error_class"))
+        if error_class != SESSION_AUTHORITY_CONFLICT_CLASS:
+            return False
+        transition = (
+            failure.get("transition")
+            if isinstance(failure.get("transition"), dict)
+            else resolve_scheduled_failure_transition(
+                task, error_class, failure.get("failure_retryable")
+            )
+        )
+        if str(transition.get("retry_disposition") or "") != "retry_scheduled":
+            return False
+        if self._failure_notice_reached_owner(dispatch_result):
+            return False
+        run = self._storage.get_scheduled_prompt_run(run_id) or {}
+        max_attempts = max(1, int(SCHEDULED_FAILURE_CONTRACT.get("one_time_max_attempts") or 3))
+        if int(run.get("attempt") or 0) >= max_attempts:
+            return False
+        self._requeue_occurrence(
+            task,
+            run_id,
+            due_dt,
+            now,
+            error_class=SESSION_AUTHORITY_CONFLICT_CLASS,
+            failure_transition=transition,
+            readmit_attempt=int(task.get("_scheduled_prompt_readmit_attempt") or 0) + 1,
+            readmit_conversation_id=str(
+                dispatch_result.get("conversation_id") or ""
+            ).strip()
+            or None,
+        )
+        return True
+
     def _update_run_after_dispatch(
         self,
         run_id: str,
@@ -1067,9 +1283,7 @@ class SchedulerEngine:
                 run_id,
                 updates,
                 expected_lease_owner=self._lease_owner,
-                expected_attempt=max(
-                    1, int(task.get("_scheduled_prompt_attempt") or 0)
-                ),
+                expected_attempt=max(1, int(task.get("_scheduled_prompt_attempt") or 0)),
                 expected_status="dispatching",
                 task_transition=task_transition,
                 reopen_for_retry=reopen_for_retry,
@@ -1419,7 +1633,9 @@ class SchedulerEngine:
         updates["last_delivery_outcome"] = delivery_outcome
         updates["last_delivery_reason"] = delivery_reason
         updates["last_generated_text"] = generated_text
-        current_metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        current_metadata = _pruned_internal_metadata(task) or (
+            task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        )
         cleaned_metadata = {
             key: value
             for key, value in current_metadata.items()
@@ -1454,6 +1670,25 @@ class SchedulerEngine:
         )
         if degradation is not None:
             base_delivery["degradation"] = degradation
+        superseded_channels = (
+            delivery_detail.get("channels")
+            if isinstance(delivery_detail.get("channels"), dict)
+            else {}
+        )
+        superseded_without_delivery = (
+            delivery_outcome == "superseded"
+            and not generated_text
+            and not any(
+                isinstance(detail, dict)
+                and str(detail.get("outcome") or "") in {"sent", "fallback_delivered"}
+                for detail in superseded_channels.values()
+            )
+        )
+        unconfirmed_channels = (
+            delivery_detail.get("unconfirmed_channels")
+            if isinstance(delivery_detail.get("unconfirmed_channels"), list)
+            else []
+        )
         if isinstance(channel_errors, dict) and channel_errors:
             base_delivery["channel_errors"] = channel_errors
             updates["last_status"] = "partial_success"
@@ -1461,6 +1696,19 @@ class SchedulerEngine:
                 f"{delivery_reason}; channel_errors: "
                 + "; ".join(f"{ch}: {err}" for ch, err in channel_errors.items())
             )
+        elif unconfirmed_channels:
+            updates["last_status"] = "partial_success"
+            updates["last_delivery_reason"] = unconfirmed_delivery_reason(
+                delivery_reason, unconfirmed_channels
+            )
+        elif superseded_without_delivery:
+            # This occurrence generated nothing and delivered nothing: Core dropped its turn for a
+            # newer one sharing the conversation's logical-turn scope. That is neither a right
+            # result nor justified silence, so the task ledger must not claim success. Suppressed
+            # and audit-only deliveries are untouched: those ran, produced a result, and chose
+            # silence. "error" is deliberately not used, because the contract's health epoch keys
+            # on it and supersession is not a typed failure class.
+            updates["last_status"] = "superseded"
         late_delivery = _scheduler_late_delivery(task)
         if late_delivery is not None:
             base_delivery["late_delivery"] = late_delivery
@@ -1690,9 +1938,7 @@ class SchedulerEngine:
         dispatch_result: Dict[str, object],
     ) -> None:
         updates, _transition = self._generation_failure_task_transition(
-            task,
-            now,
-            dispatch_result,
+            task, now, dispatch_result
         )
         self._storage.update_task(task["user_id"], task["id"], updates)
 
@@ -1704,26 +1950,45 @@ class SchedulerEngine:
         dispatch_result: Dict[str, object],
     ) -> bool:
         task_transition, transition = self._generation_failure_task_transition(
-            task,
-            now,
-            dispatch_result,
+            task, now, dispatch_result
         )
         failure = (
             dispatch_result.get("generation_failure")
             if isinstance(dispatch_result.get("generation_failure"), dict)
             else {}
         )
+        error_class = normalized_scheduled_generation_failure_class(
+            failure.get("error_class")
+        )
+        if (
+            error_class == SESSION_AUTHORITY_CONFLICT_CLASS
+            and self._failure_notice_reached_owner(dispatch_result)
+        ):
+            # The owner already received the failure notice. Close this occurrence instead of
+            # reopening it and producing a duplicate notice from the same one-shot attempt.
+            transition["retry_disposition"] = "no_retry"
+            transition["next_attempt_at"] = None
+            task_transition["active"] = 0
+            task_transition["next_run_at"] = None
+            metadata = (
+                dict(task_transition.get("metadata") or {})
+                if isinstance(task_transition.get("metadata"), dict)
+                else {}
+            )
+            metadata.pop(SCHEDULER_RETRY_OCCURRENCE_KEY, None)
+            metadata["scheduled_failure_state_v1"] = dict(transition)
+            task_transition["metadata"] = metadata
+            if isinstance(task_transition.get("last_delivery"), dict):
+                task_transition["last_delivery"]["failure_transition_v1"] = dict(
+                    transition
+                )
         ledger_result = {
             **dispatch_result,
-            "generation_failure": {
-                **failure,
-                "transition": dict(transition),
-            },
+            "generation_failure": {**failure, "transition": dict(transition)},
         }
         retry_same_occurrence = (
             str((task.get("schedule") or {}).get("type") or "") == "once"
-            and str(transition.get("retry_disposition") or "")
-            == "retry_scheduled"
+            and str(transition.get("retry_disposition") or "") == "retry_scheduled"
         )
         return self._update_run_after_dispatch(
             run_id,

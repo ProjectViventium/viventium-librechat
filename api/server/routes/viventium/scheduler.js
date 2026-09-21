@@ -51,9 +51,7 @@ const {
 } = require('~/server/services/viventium/gateway/streamExtractors');
 const { getCortexMessageState } = require('~/server/services/viventium/cortexMessageState');
 const {
-  normalizeScheduledAgentExecution,
-} = require('~/server/services/viventium/scheduledAgentOverride');
-const {
+  attachLogicalTurnMetadata,
   createSchedulerInteractionContext,
   setTrustedInteractionContext,
 } = require('~/server/services/viventium/interactionContext');
@@ -61,6 +59,9 @@ const {
   buildScheduledGlassHiveCapabilityBundle,
   revokeScheduledGlassHiveCapabilityGrant,
 } = require('~/server/services/viventium/GlassHiveCapabilityBootstrapService');
+const {
+  getSchedulerExternalWorkSummary,
+} = require('~/server/services/viventium/GlassHiveCallbackBindingService');
 
 const router = express.Router();
 const SCHEDULER_SECRET_HEADER = 'x-viventium-scheduler-secret';
@@ -97,6 +98,21 @@ function normalizeSchedulerIdempotencyKey(value) {
 
 function schedulerDispatchDocumentId(userId, idempotencyKey) {
   return crypto.createHash('sha256').update(`${userId}\0${idempotencyKey}`).digest('hex');
+}
+
+const SCHEDULER_MESSAGE_UUID_NAMESPACE = Buffer.from('6ba7b8119dad11d180b400c04fd430c8', 'hex');
+
+function schedulerMessageId(userId, streamId) {
+  const digest = crypto
+    .createHash('sha1')
+    .update(SCHEDULER_MESSAGE_UUID_NAMESPACE)
+    .update(JSON.stringify(['viventium-scheduler-message', String(userId || ''), streamId]), 'utf8')
+    .digest();
+  const bytes = Buffer.from(digest.subarray(0, 16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function schedulerDispatchCollection() {
@@ -280,6 +296,31 @@ function schedulerFinalFailure(event) {
   };
 }
 
+function schedulerFinalExecution(event) {
+  const execution = event?.responseMessage?.metadata?.viventium?.scheduledExecution;
+  if (
+    !execution ||
+    execution.version !== 1 ||
+    typeof execution.provider !== 'string' ||
+    !execution.provider.trim() ||
+    typeof execution.model !== 'string' ||
+    !execution.model.trim() ||
+    typeof execution.fallbackUsed !== 'boolean'
+  ) {
+    return null;
+  }
+  const reasoningEffort = String(execution.reasoningEffort || '').trim();
+  const fallbackReason = String(execution.fallbackReason || '').trim();
+  return {
+    version: 1,
+    provider: execution.provider.trim(),
+    model: execution.model.trim(),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    fallbackUsed: execution.fallbackUsed,
+    ...(execution.fallbackUsed && fallbackReason ? { fallbackReason } : {}),
+  };
+}
+
 function getSchedulerUserId(req = {}) {
   const body = req.body ?? {};
   const query = req.query ?? {};
@@ -338,6 +379,15 @@ function resolveLingerMs(req) {
 }
 
 async function resolveAgentId({ req, conversationId, requestedAgentId, userId }) {
+  const config = req.config || {};
+  const configuredMainAgentId =
+    config.interface?.defaultAgent ||
+    config.endpoints?.agents?.defaultId ||
+    process.env.VIVENTIUM_MAIN_AGENT_ID ||
+    '';
+  if (typeof configuredMainAgentId === 'string' && configuredMainAgentId.trim()) {
+    return configuredMainAgentId.trim();
+  }
   if (conversationId && conversationId !== 'new') {
     try {
       const convo = await getConvo(userId, conversationId);
@@ -353,13 +403,7 @@ async function resolveAgentId({ req, conversationId, requestedAgentId, userId })
     return requestedAgentId;
   }
 
-  const config = req.config || {};
-  return (
-    config.interface?.defaultAgent ||
-    config.endpoints?.agents?.defaultId ||
-    process.env.VIVENTIUM_MAIN_AGENT_ID ||
-    ''
-  );
+  return '';
 }
 
 async function schedulerAuth(req, res, next) {
@@ -500,23 +544,57 @@ router.post(
     const sanitizedIncoming = { ...incoming };
     delete sanitizedIncoming.interactionContext;
     delete sanitizedIncoming.viventiumInteractionContext;
+    delete sanitizedIncoming.viventiumSchedulerExternalWorkRequired;
+    delete sanitizedIncoming.externalWorkRequired;
     delete sanitizedIncoming.titleText;
-    req.viventiumSchedulerTitleSource = schedulerTitleSource(incoming.titleText);
-    let scheduledAgentExecution;
-    try {
-      scheduledAgentExecution = normalizeScheduledAgentExecution(
-        incoming.scheduledAgentExecution,
-        req.config?.endpoints?.agents,
-      );
-    } catch (error) {
+    for (const field of [
+      'scheduledAgentExecution',
+      'provider',
+      'model',
+      'effort',
+      'reasoning_effort',
+      'reasoningEffort',
+      'model_parameters',
+      'modelParameters',
+      'fallback_llm_provider',
+      'fallback_llm_model',
+      'fallback_llm_model_parameters',
+      'fallback',
+      'fallbackProvider',
+      'fallbackModel',
+      'fallbackReasoningEffort',
+      'fallback_reasoning_effort',
+      'glasshive_options',
+      'glasshiveOptions',
+    ]) {
+      delete sanitizedIncoming[field];
+    }
+    if (
+      incoming.externalWorkRequired != null &&
+      typeof incoming.externalWorkRequired !== 'boolean'
+    ) {
       return _res.status(400).json({
-        error: error.message,
-        reason: 'invalid_scheduled_agent_execution',
+        error: 'externalWorkRequired must be a boolean',
+        reason: 'invalid_external_work_policy',
       });
     }
-    if (scheduledAgentExecution) {
-      req.viventiumScheduledAgentExecution = scheduledAgentExecution;
+    if (incoming.viventiumQaRun != null && typeof incoming.viventiumQaRun !== 'boolean') {
+      return _res.status(400).json({
+        error: 'viventiumQaRun must be a boolean',
+        reason: 'invalid_qa_provenance',
+      });
     }
+    if (
+      incoming.viventiumQaRunId != null &&
+      (typeof incoming.viventiumQaRunId !== 'string' || incoming.viventiumQaRunId.length > 128)
+    ) {
+      return _res.status(400).json({
+        error: 'viventiumQaRunId must be a bounded string',
+        reason: 'invalid_qa_provenance',
+      });
+    }
+    req.viventiumSchedulerExternalWorkRequired = incoming.externalWorkRequired !== false;
+    req.viventiumSchedulerTitleSource = schedulerTitleSource(incoming.titleText);
     const text = typeof incoming.text === 'string' ? incoming.text : '';
     const requestedConversationId =
       typeof incoming.conversationId === 'string' ? incoming.conversationId : 'new';
@@ -564,6 +642,7 @@ router.post(
       (idempotencyKey
         ? `scheduler-${crypto.createHash('sha256').update(dispatchDocumentId).digest('hex').slice(0, 32)}`
         : `scheduler-${crypto.randomUUID()}`);
+    const messageId = schedulerMessageId(req.user?.id, streamId);
     const validatedConversationId = await normalizeSchedulerConversationId({
       conversationId: requestedConversationId,
       userId: req.user?.id,
@@ -624,6 +703,11 @@ router.post(
         source_event_id: incoming.source_event_id || incoming.sourceEventId || streamId,
         schedule_id: scheduleId,
         schedule_run_id: typeof incoming.scheduleRunId === 'string' ? incoming.scheduleRunId : '',
+        qa_run: incoming.viventiumQaRun === true,
+        qa_run_id:
+          incoming.viventiumQaRun === true && typeof incoming.viventiumQaRunId === 'string'
+            ? incoming.viventiumQaRunId
+            : '',
       }),
       {
         segment_stability: 'immediate',
@@ -662,13 +746,8 @@ router.post(
       parentMessageId,
       agent_id: agentId,
       streamId,
+      messageId,
       scheduleId,
-      ...(scheduledAgentExecution
-        ? {
-            model: scheduledAgentExecution.model,
-            reasoning_effort: scheduledAgentExecution.reasoning_effort,
-          }
-        : {}),
     };
     if (resolvedSpec) {
       req.body.spec = resolvedSpec;
@@ -709,11 +788,17 @@ router.get('/dispatches/:idempotencyKey', schedulerAuth, async (req, res) => {
     return res.status(404).json({ error: 'Scheduler dispatch not found' });
   }
   const job = await GenerationJobManager.getJob(dispatch.streamId);
+  const externalWork = await getSchedulerExternalWorkSummary({
+    ownerId: String(req.user?.id || ''),
+    schedulerDispatchDocumentId: documentId,
+    scheduleOccurrenceKey: idempotencyKey,
+  });
   return res.json({
     streamId: dispatch.streamId,
     conversationId: dispatch.conversationId,
     idempotencyKey,
     state: job ? 'accepted' : 'reserved',
+    externalWork,
   });
 });
 
@@ -731,7 +816,7 @@ router.post('/stream/:streamId/cancel', schedulerAuth, async (req, res) => {
     return res.status(404).json({ error: 'Scheduler stream not found' });
   }
   if (job.metadata?.userId && String(job.metadata.userId) !== userId) {
-    return res.status(403).json({ error: 'Unauthorized scheduler stream' });
+    return res.status(404).json({ error: 'Scheduler stream not found' });
   }
   const context = job.metadata?.interactionContext;
   if (context?.actor_kind !== 'system' || context?.origin !== 'scheduler') {
@@ -907,12 +992,20 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
     streamId,
     (event) => {
       if (!res.writableEnded) {
-        writeSseEvent(res, 'message', event);
+        writeSseEvent(
+          res,
+          'message',
+          attachLogicalTurnMetadata(event, job.metadata?.interactionContext),
+        );
       }
     },
     (event) => {
       if (!res.writableEnded) {
-        writeSseEvent(res, 'message', event);
+        writeSseEvent(
+          res,
+          'message',
+          attachLogicalTurnMetadata(event, job.metadata?.interactionContext),
+        );
         scheduleEnd();
       }
     },
@@ -1087,9 +1180,11 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
           });
         }
 
+        const finalExecution = schedulerFinalExecution(event);
         writeSseEvent(res, 'done', {
           final: true,
           messageId: responseMessageId,
+          ...(finalExecution ? { execution: finalExecution } : {}),
         });
         res.end();
       },

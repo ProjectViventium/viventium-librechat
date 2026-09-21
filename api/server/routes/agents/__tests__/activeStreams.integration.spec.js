@@ -67,9 +67,14 @@ describe('actual agent route with native active stream owner', () => {
   it('rejects a replacement owner after active-index discovery', async () => {
     await mockManager.createJob('stream-a', 'owner-a', 'conversation-a');
     const readIds = store.getActiveJobIdsByUser.bind(store);
+    const readJob = store.getJob.bind(store);
     jest.spyOn(store, 'getActiveJobIdsByUser').mockImplementationOnce(async (userId) => {
       const ids = await readIds(userId);
-      await store.createJob('stream-a', 'owner-b', 'conversation-other');
+      jest.spyOn(store, 'getJob').mockImplementationOnce(async (streamId) => ({
+        ...(await readJob(streamId)),
+        userId: 'owner-b',
+        conversationId: 'conversation-other',
+      }));
       return ids;
     });
     const response = await request(app).get('/chat/active');

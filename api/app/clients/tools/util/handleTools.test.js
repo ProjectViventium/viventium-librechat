@@ -196,6 +196,151 @@ describe('Tool Handlers', () => {
     });
   });
 
+  describe('Viventium universal Main orchestration facade', () => {
+    const requestForTurn = ({ available = true, personalization } = {}) => ({
+      _viventiumParallelWorkTurnAvailable: available,
+      user: {
+        id: String(fakeUser._id),
+        role: 'USER',
+        ...(personalization ? { personalization } : {}),
+      },
+    });
+
+    beforeEach(() => {
+      require('~/server/services/viventium/GlassHiveOrchestrationReadinessService').resetOrchestrationReadinessForTests(
+        { ownerId: String(fakeUser._id), status: 'ready', checkedAtMs: Date.now() },
+      );
+    });
+
+    afterAll(() => {
+      require('~/server/services/viventium/GlassHiveOrchestrationReadinessService').resetOrchestrationReadinessForTests();
+    });
+
+    it('substitutes the Core facade for a default OpenAI Main without raw MCP discovery', async () => {
+      const toolMap = await loadTools({
+        user: fakeUser._id,
+        agent: {
+          id: 'main-agent',
+          provider: 'openAI',
+          glasshive_options: { orchestration: { parallel_available: true } },
+        },
+        endpoint: 'openAI',
+        tools: ['worker_delegate_once_mcp_glasshive-workers-projects'],
+        options: { req: requestForTurn() },
+        returnMap: true,
+      });
+
+      expect(toolMap).toHaveProperty('worker_delegate_once_mcp_glasshive-workers-projects');
+      const facade = await toolMap['worker_delegate_once_mcp_glasshive-workers-projects']();
+      expect(facade.name).toBe('worker_delegate_once_mcp_glasshive-workers-projects');
+      expect(
+        facade.schema.safeParse({
+          title: 'A',
+          instruction: 'Research A',
+          resourceClass: 'standard',
+        }).success,
+      ).toBe(true);
+    });
+
+    it('does not expose launch or work controls to a mission/root Agent', async () => {
+      const toolMap = await loadTools({
+        user: fakeUser._id,
+        agent: { id: 'mission-root', provider: 'openAI' },
+        endpoint: 'openAI',
+        tools: [
+          'worker_delegate_once_mcp_glasshive-workers-projects',
+          'active_work_list',
+          'active_work_action',
+        ],
+        options: { req: requestForTurn() },
+        returnMap: true,
+      });
+
+      expect(toolMap).toEqual({});
+    });
+
+    it('keeps only existing-work list/action available to Main during readiness rollback', async () => {
+      require('~/server/services/viventium/GlassHiveOrchestrationReadinessService').resetOrchestrationReadinessForTests(
+        { ownerId: String(fakeUser._id), status: 'unready', checkedAtMs: Date.now() },
+      );
+
+      const toolMap = await loadTools({
+        user: fakeUser._id,
+        agent: {
+          id: 'main-agent',
+          provider: 'openAI',
+          glasshive_options: { orchestration: { parallel_available: true } },
+        },
+        endpoint: 'openAI',
+        tools: [
+          'worker_delegate_once_mcp_glasshive-workers-projects',
+          'active_work_list',
+          'active_work_action',
+        ],
+        options: {
+          req: requestForTurn({
+            available: false,
+            personalization: { parallel_work_known: true },
+          }),
+        },
+        returnMap: true,
+      });
+
+      expect(toolMap).not.toHaveProperty('worker_delegate_once_mcp_glasshive-workers-projects');
+      expect(toolMap).toHaveProperty('active_work_list');
+      expect(toolMap).toHaveProperty('active_work_action');
+    });
+
+    it('keeps rollback focused+known-false and mission roots capability-empty', async () => {
+      require('~/server/services/viventium/GlassHiveOrchestrationReadinessService').resetOrchestrationReadinessForTests(
+        { ownerId: String(fakeUser._id), status: 'unavailable', checkedAtMs: Date.now() },
+      );
+      const requestedTools = [
+        'worker_delegate_once_mcp_glasshive-workers-projects',
+        'active_work_list',
+        'active_work_action',
+      ];
+      const req = requestForTurn({
+        available: false,
+        personalization: { orchestration_mode: 'focused', parallel_work_known: false },
+      });
+
+      const focusedMain = await loadTools({
+        user: fakeUser._id,
+        agent: {
+          id: 'main-agent',
+          provider: 'openAI',
+          glasshive_options: { orchestration: { parallel_available: true } },
+        },
+        endpoint: 'openAI',
+        tools: requestedTools,
+        options: { req },
+        returnMap: true,
+      });
+      const missionRoot = await loadTools({
+        user: fakeUser._id,
+        agent: { id: 'mission-root', provider: 'openAI' },
+        endpoint: 'openAI',
+        tools: requestedTools,
+        options: {
+          req: {
+            ...req,
+            user: {
+              ...req.user,
+              personalization: { parallel_work_known: true },
+            },
+          },
+        },
+        returnMap: true,
+      });
+
+      expect(focusedMain).toEqual({});
+      expect(missionRoot).toEqual({});
+    });
+  });
+
+  /* === VIVENTIUM END === */
+
   describe('loadTools', () => {
     let toolFunctions;
     let loadTool1;

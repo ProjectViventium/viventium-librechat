@@ -83,6 +83,13 @@ jest.mock('~/server/services/viventium/GlassHiveCapabilityDirectIssuerAuth', () 
   verifyDirectIssuerAssertion: jest.fn(),
 }));
 
+jest.mock('~/server/services/viventium/GlassHiveConversationOrchestration', () => ({
+  canonicalConversationOrchestrationArguments: jest.fn((_toolName, args) => args),
+  isConversationOrchestrationMutationTool: jest.fn(() => false),
+  isConversationOrchestrationTool: jest.fn(() => false),
+  mainOrchestrationInvocationIdentity: jest.fn(() => ''),
+}));
+
 function appWithRoute({ requestSignal } = {}) {
   const app = express();
   app.use(express.json());
@@ -155,6 +162,7 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     mockGetAppConfig.mockResolvedValue({
       webSearch: { searchProvider: 'searxng', searxngInstanceUrl: 'http://127.0.0.1:18082' },
     });
+    mockVerifyAndConsumeAdmission.mockReset();
     mockVerifyAndConsumeAdmission.mockResolvedValue(undefined);
     mockAssertActiveCapabilityAuthorizationGrant.mockResolvedValue(undefined);
     mockRevokeCapabilityAuthorizationGrant.mockResolvedValue(undefined);

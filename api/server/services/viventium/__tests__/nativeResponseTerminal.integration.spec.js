@@ -33,7 +33,6 @@ const {
   recoverNativeResponse,
   getService,
 } = require('../nativeResponseService');
-const { sanitizeVoiceAssistantMessageForPersistence } = require('../voiceArtifactText');
 let server, methods, store, transport, identity, job;
 const user = new mongoose.Types.ObjectId().toString();
 const transaction = (operation) => mongoose.connection.transaction(operation);
@@ -181,8 +180,7 @@ test.each(['failed', 'cancelled'])(
       finalReplayStoredAt: expect.any(Number),
     });
     expect(row.nativeResponse.stopSnapshotStoredAt).toBeUndefined();
-    expect((await store.getJob('stream')).status).not.toBe('running');
-    expect((await store.getJob('stream')).finalEvent).toBe(JSON.stringify(final));
+    expect(await store.getJob('stream')).toBeNull();
     expect(mockDependencies.fetch).toHaveBeenCalledTimes(1);
   },
 );
@@ -219,7 +217,7 @@ test.each(['failed', 'cancelled'])(
     const row = await methods.getNativeResponse(user, 'answer');
     expect(row.nativeResponse.terminalSnapshotStoredAt).toEqual(expect.any(Number));
     expect(row.nativeResponse.finalReplayStoredAt).toEqual(expect.any(Number));
-    expect((await store.getJob('stream')).finalEvent).toBeTruthy();
+    expect(await store.getJob('stream')).toBeNull();
     expect(mockDependencies.fetch.mock.calls.every(([, init]) => init.method === 'GET')).toBe(true);
     expect(mockDependencies.fetch).toHaveBeenCalledTimes(1);
   },
@@ -239,7 +237,8 @@ test('recovers after Mongo acceptance and failed transport with the same canonic
   expect(before.nativeResponse.finalReplayStoredAt).toBeUndefined();
   const firstFinal = (await store.getJob('stream')).finalEvent;
   expect(await recoverNativeResponse(identity)).toBe(true);
-  expect((await store.getJob('stream')).finalEvent).toBe(firstFinal);
+  expect(await store.getJob('stream')).toBeNull();
+  expect(JSON.stringify(transport.emitDone.mock.calls.at(-1)[1])).toBe(firstFinal);
   expect(mockDependencies.fetch).toHaveBeenCalledTimes(1);
 });
 

@@ -131,7 +131,7 @@ describe('Viventium prompt source contracts', () => {
 
     expect(agentsSource.mainAgent.hide_sequential_outputs).toBe(true);
     expect(deepMemoryCortex).toMatchObject({
-      activation: { enabled: true, mode: 'classified' },
+      activation: { enabled: true, mode: 'always' },
       result_evidence: {
         visible_insight_requires: [{ tool: 'file_search', receipt: 'non_empty_sources' }],
       },

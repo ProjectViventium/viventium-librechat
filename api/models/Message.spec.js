@@ -228,6 +228,7 @@ describe('Message Operations', () => {
           interactionContext: claim.interactionContext,
           userMessage: { messageId: 'native-source' },
         });
+        const admittedAt = Date.now();
         identity = {
           userId: user,
           conversationId,
@@ -242,8 +243,8 @@ describe('Message Operations', () => {
           agentId: 'native-agent',
           originSha256: 'c'.repeat(64),
           source: await methods.captureNativeResponseSource(user, conversationId, 'native-source'),
-          admittedAt: Date.now(),
-          recoverUntil: Date.now() + 86_400_000,
+          admittedAt,
+          recoverUntil: admittedAt + 86_400_000,
         };
         const transaction = (operation) => mongoose.connection.transaction(operation);
         mongoose.set('transactionAsyncLocalStorage', true);

@@ -728,6 +728,15 @@ runtime = snapshot.parent
 gates = gate._serialized_gate_list(payload.get('gates'))
 current = gate._remeasure_storage_pressure(payload.get('readiness_facts'), runtime / 'prompt-bundle.json')
 checks = gate._typed_readiness_checks(current, runtime / 'prompt-bundle.json')
+projection = payload['owner_binding']
+owner_state = (runtime.parent / 'state' / 'runtime' / projection['runtimeProfile'] / 'stack-owner.json').resolve()
+owner = json.loads(owner_state.read_text())
+installed_root = Path(owner['repoRoot']).resolve()
+live_readiness = json.loads((runtime / 'parallel-work-readiness-facts.json').read_text())
+live_identity = json.loads((runtime / 'parallel-work-artifact-identity.json').read_text())
+measured_identity = gate._public_artifact_identity(gate._measured_artifact_identity(installed_root, runtime / 'prompt-bundle.json', installed_root, owner_state))
+expected_identity = payload['artifact_identity']
+source_defaults_valid, _ = gate._source_default_records(installed_root)
 print(json.dumps({
     'serialized_storage': payload['readiness_facts']['storagePressure']['status'],
     'current_storage': current['storagePressure']['status'],
@@ -736,13 +745,20 @@ print(json.dumps({
     'receipts': gate._live_qa_receipt_contract_matches(payload, gates, runtime),
     'owner': gate._owner_projection_matches_live_runtime(payload.get('owner_binding'), runtime),
     'inputs': gate._live_runtime_claim_inputs_match(payload, runtime),
+    'readiness_policy_match': gate._stable_readiness_claim_inputs(gate._remeasure_storage_pressure(live_readiness, runtime / 'prompt-bundle.json')) == gate._stable_readiness_claim_inputs(payload.get('readiness_facts')),
+    'identity_file_match': gate._public_artifact_identity(live_identity) == expected_identity,
+    'measured_identity_mismatch_keys': [key for key in expected_identity if measured_identity.get(key) != expected_identity[key]],
+    'installed_mismatch_keys': [key for key in expected_identity['installed'] if measured_identity['installed'].get(key) != expected_identity['installed'][key]],
+    'source_defaults_match': source_defaults_valid is payload.get('source_defaults_valid'),
     'artifact_shape': gate._artifact_identity_shape_valid(payload.get('artifact_identity')),
 }))
 `;
   try {
-    const diagnostic = execFileSync('/usr/bin/python3', ['-c', script, installedGateScript, releasePath], {
-      encoding: 'utf8',
-    });
+    const diagnostic = execFileSync(
+      '/usr/bin/python3',
+      ['-c', script, installedGateScript, releasePath],
+      { encoding: 'utf8' },
+    );
     process.stderr.write(`local QA fixture validation: ${diagnostic}`);
   } catch (error) {
     process.stderr.write(`local QA fixture diagnosis unavailable: ${error?.name || 'error'}\n`);

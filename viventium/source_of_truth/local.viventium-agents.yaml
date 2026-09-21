@@ -212,21 +212,7 @@ mainAgent:
     - agent_id: agent_viventium_deep_memory_95aeb3
       activation:
         enabled: true
-        mode: classified
-        prompt:
-          promptRef: cortex.deep_memory.activation
-        confidence_threshold: 0.65
-        fallbacks:
-          - provider: xai
-            model: grok-4.20-non-reasoning
-          - provider: anthropic
-            model: claude-haiku-4-5
-          - provider: openai
-            model: gpt-5.4
-        model: qwen/qwen3.6-27b
-        provider: groq
-        cooldown_ms: 30000
-        max_history: 6
+        mode: always
       result_evidence:
         visible_insight_requires:
           - tool: file_search
@@ -525,6 +511,7 @@ backgroundAgents:
     model_parameters:
       reasoning_effort: medium
       useResponsesApi: true
+      resendFiles: true
       model: gpt-5.6-terra
     end_after_tools: false
     hide_sequential_outputs: false

@@ -82,9 +82,14 @@ def _glasshive_callback_reconciliation_allowed(run: dict[str, Any], event: str) 
     if current_status not in {"completed", "failed"}:
         return True
     error_class = str(run.get("error_class") or "")
+    try:
+        prior_callback = json.loads(str(run.get("callback_payload_json") or "{}"))
+    except json.JSONDecodeError:
+        prior_callback = {}
     return current_status == "failed" and event == "run.completed" and (
         error_class == "stale_run_reconciled"
         or error_class in ISOLATED_ARTIFACT_RETRYABLE_ERRORS
+        or (isinstance(prior_callback, dict) and prior_callback.get("event") == "run.needs_input")
     )
 
 
@@ -123,11 +128,10 @@ def _glasshive_callback_lifecycle(
         disposition = "failed" if event == "run.failed" else "cancelled"
         return "failed", disposition, now, error_class
     if event == "run.needs_input":
-        # GlassHive holds this work until the owner acts, so it stays resumable with its typed reason.
         return (
-            "queued",
-            "running",
-            run.get("completed_at"),
+            "failed",
+            "failed",
+            now,
             _callback_failure_class(payload, "needs_input"),
         )
     if event == "run.queued":
@@ -991,12 +995,15 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         event = str(payload.get("event") or "").strip()
         if status == "completed":
             return "GlassHive run completed. Private details are stored in the run detail file."
+        if event == "run.needs_input":
+            return (
+                "GlassHive run needs owner action; it can resume when required input is "
+                "provided or a connection is reconnected."
+            )
         if status == "failed":
             raw = str(payload.get("error") or error_class or event or "GlassHive run failed").strip()
         elif event == "run.waiting_on_capacity":
             raw = "GlassHive run is waiting for host worker capacity and will retry."
-        elif event == "run.needs_input":
-            raw = f"GlassHive run needs owner action before it can start: {error_class or 'needs_input'}."
         elif status == "running":
             raw = "GlassHive run started."
         else:
@@ -1319,6 +1326,33 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             run = storage.get_scheduled_prompt_run(callback_run_id)
         if not run:
             return JSONResponse({"status": "error", "reason": "unknown_run"}, status_code=404)
+
+        if event not in {"run.completed", "run.failed", "run.cancelled", "run.interrupted"}:
+            task_id = str(run.get("task_id") or "")
+            expected_identity = {
+                "worker_id": run.get("glasshive_worker_id"),
+                "run_id": run.get("glasshive_run_id"),
+                "message_id": run.get("run_id"),
+                "user_id": run.get("user_id"),
+                "project_id": run.get("glasshive_project_id"),
+            }
+            if run.get("executor") == "glasshive_host":
+                expected_identity.update(
+                    conversation_id=f"workbench-scheduled-prompt:{task_id}",
+                    parent_message_id=f"scheduled-prompt:{task_id}",
+                    surface="workbench",
+                )
+            if any(
+                field in payload
+                and not _constant_time_text_equal(
+                    str(expected or ""), str(payload.get(field) or "")
+                )
+                for field, expected in expected_identity.items()
+            ):
+                return JSONResponse(
+                    {"status": "error", "reason": "callback_identity_mismatch"},
+                    status_code=409,
+                )
 
         terminal_events = {
             "run.completed",
@@ -1654,13 +1688,6 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
 
         if not receiver_effect_is_current():
             return receiver_lost_response()
-        if callback_reconciliation_allowed and terminal_receiver is None:
-            private_detail = _append_private_callback(
-                run,
-                payload,
-                now,
-                callback_identity=str((terminal_receiver or {}).get("callback_id") or ""),
-            )
         artifact_import = (
             _import_isolated_callback_artifacts(run, private_detail, payload)
             if artifact_import_requested
@@ -1700,6 +1727,7 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
             "event": event,
             "received_at": now,
             "status": status,
+            "failure_class": error_class,
             "message_hash": _hash_payload_text(payload),
             "has_private_payload": bool(payload.get("message") or payload.get("full_message") or payload.get("error")),
             "memory_apply_reason": None,
@@ -1745,22 +1773,48 @@ def build_server(storage: ScheduleStorage) -> FastMCP:
         if terminal_receiver is None:
             callback_persisted = False
             if not terminal_before_callback or callback_reconciliation_allowed:
-                callback_persisted = bool(
-                    storage.update_scheduled_prompt_run(
-                        str(run["run_id"]), updates
+                applied = storage.update_scheduled_prompt_run_if_current(
+                    str(run["run_id"]),
+                    updates,
+                    expected_status=str(run.get("status") or "queued"),
+                    expected_error_class=run.get("error_class"),
+                    expected_glasshive_run_id=run_id,
+                )
+                callback_persisted = bool(applied.get("updated"))
+                if callback_persisted:
+                    _append_private_callback(run, payload, now, callback_identity="")
+                    _update_parent_task_for_glasshive_callback(
+                        run,
+                        status=status,
+                        result_summary=result_summary
+                        or str(run.get("result_summary") or ""),
+                        error_class=error_class,
+                        payload=payload,
+                        received_at=now,
                     )
-                )
-                _update_parent_task_for_glasshive_callback(
-                    run,
-                    status=status,
-                    result_summary=result_summary
-                    or str(run.get("result_summary") or ""),
-                    error_class=error_class,
-                    payload=payload,
-                    received_at=now,
-                )
+                else:
+                    current = applied.get("run") or {}
+                    try:
+                        prior = json.loads(str(current.get("callback_payload_json") or "{}"))
+                    except json.JSONDecodeError:
+                        prior = {}
+                    if not (
+                        isinstance(prior, dict)
+                        and prior.get("event") == event
+                        and prior.get("status") == status
+                        and prior.get("failure_class") == error_class
+                        and prior.get("message_hash") == callback_summary["message_hash"]
+                    ):
+                        return JSONResponse(
+                            {"status": "error", "reason": "callback_effect_not_persisted"},
+                            status_code=503,
+                        )
             return JSONResponse(
-                {"status": "http_accepted", "run_id": run["run_id"]},
+                {
+                    "status": "http_accepted",
+                    "run_id": run["run_id"],
+                    "callback_persisted": callback_persisted,
+                },
                 status_code=(
                     503
                     if callback_persisted

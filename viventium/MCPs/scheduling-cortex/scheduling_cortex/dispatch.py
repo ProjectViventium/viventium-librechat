@@ -4188,17 +4188,18 @@ def _dispatch_glasshive_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 else {}
             ),
         }
-        storage.update_scheduled_prompt_run(
-            run_id,
-            {
-                "status": "failed",
-                "completed_at": to_utc_iso(datetime.now(timezone.utc)),
-                "error_class": _scheduled_prompt_error_class(exc, task),
-                "result_summary": _safe_result_summary(str(exc)),
-                "execution_snapshot": failure_snapshot,
-                "updated_at": to_utc_iso(datetime.now(timezone.utc)),
-            },
-        )
+        if not preclaimed_run_id:
+            storage.update_scheduled_prompt_run(
+                run_id,
+                {
+                    "status": "failed",
+                    "completed_at": to_utc_iso(datetime.now(timezone.utc)),
+                    "error_class": _scheduled_prompt_error_class(exc, task),
+                    "result_summary": _safe_result_summary(str(exc)),
+                    "execution_snapshot": failure_snapshot,
+                    "updated_at": to_utc_iso(datetime.now(timezone.utc)),
+                },
+            )
         raise
 
 

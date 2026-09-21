@@ -36,6 +36,7 @@ describe('viventium-agent-runtime-models', () => {
       'glasshive-harness::codex-cli:gpt-5.6-sol',
       'openAI::gpt-5.6-sol',
       'openAI::gpt-5.6-terra',
+      'glasshive-harness::codex-cli:gpt-5.6-luna',
       'anthropic::claude-opus-5',
     ]);
     expect(CANONICAL_BUILT_IN_MAIN_MODEL_PARAMETERS).toEqual({

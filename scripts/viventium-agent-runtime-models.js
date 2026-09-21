@@ -25,6 +25,7 @@ const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
   `${GLASSHIVE_MAIN_PROVIDER}::${GLASSHIVE_MAIN_MODEL}`,
   'openAI::gpt-5.6-sol',
   'openAI::gpt-5.6-terra',
+  'glasshive-harness::codex-cli:gpt-5.6-luna',
   'anthropic::claude-opus-5',
 ]);
 

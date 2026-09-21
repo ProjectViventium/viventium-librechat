@@ -1541,9 +1541,19 @@ export class RedisJobStore implements IJobStore {
     const acknowledgementInput = { ...acknowledgement };
     delete acknowledgementInput.presentation_committed_at;
     const result = (await this.redis.eval(
-      `if redis.call('EXISTS', KEYS[1]) == 0 then return {'not_found', '', '', '0'} end
+      `${NATIVE_RETENTION_LUA}
+       if redis.call('EXISTS', KEYS[1]) == 0 then return {'not_found', '', '', '0'} end
        if ARGV[2] == '' then
          redis.call('HSET', KEYS[1], 'deliveryAcknowledgement', ARGV[1])
+         if redis.call('HGET', KEYS[1], 'nativeResponseSettled') == '1' then
+           local clock = redis.call('TIME')
+           local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+           if retain_native_response(KEYS[1], now) then
+             redis.call('PEXPIREAT', KEYS[1], tonumber(redis.call('HGET', KEYS[1], 'nativeRecoverUntil')))
+           else
+             redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
+           end
+         end
          return {'recorded', '', ARGV[1], '0'}
        end
        local current_json = redis.call('HGET', KEYS[1], 'cortexPresentation')
@@ -1601,6 +1611,7 @@ export class RedisJobStore implements IJobStore {
       JSON.stringify(acknowledgement),
       expectedCortexPresentation ? JSON.stringify(expectedCortexPresentation) : '',
       JSON.stringify(acknowledgementInput),
+      this.ttl.completed,
     )) as [string, string, string, string];
     if (!['recorded', 'recorded_new'].includes(result[0])) {
       return {
@@ -1746,7 +1757,18 @@ export class RedisJobStore implements IJobStore {
       if (ownerStreamId !== streamId) {
         return { status: 'conflict' };
       }
-      return this.acknowledgeDelivery(acknowledgement);
+      const recorded = await this.acknowledgeDelivery(acknowledgement);
+      if (recorded.status !== 'recorded' || !recorded.acknowledgement) {
+        return recorded;
+      }
+      const bound = await this.bindJobDeliveryAcknowledgement(
+        streamId,
+        recorded.acknowledgement,
+        null,
+      );
+      return bound.status === 'recorded'
+        ? { ...bound, idempotent: recorded.idempotent, ownerStreamId: recorded.ownerStreamId }
+        : bound;
     }
 
     const scopeDigest = logicalTurnScopeDigestFromKey(ownerScopeKey);

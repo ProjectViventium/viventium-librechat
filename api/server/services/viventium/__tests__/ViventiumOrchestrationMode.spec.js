@@ -584,6 +584,31 @@ function openGate(caseId) {
   };
 }
 
+function measuredStoragePressure(status = 'healthy') {
+  const disk = fs.statfsSync(releaseDir);
+  const usedPercent = Math.round(((disk.blocks - disk.bfree) / disk.blocks) * 100000) / 1000;
+  const availableBytes = disk.bavail * disk.bsize;
+  // Isolate the policy state under test from the runner's unrelated disk occupancy.
+  let thresholdPercent = 100;
+  let warningMarginPercent = 0.001;
+  if (status === 'warning') {
+    const gap = Math.min(1, usedPercent / 2, (100 - usedPercent) / 2);
+    thresholdPercent = usedPercent + gap;
+    warningMarginPercent = gap * 2;
+  } else if (status === 'critical') {
+    thresholdPercent = usedPercent - Math.min(1, usedPercent / 2);
+    warningMarginPercent = Math.min(1, thresholdPercent / 2);
+  }
+  return {
+    version: 1,
+    status,
+    usedPercent,
+    availableBytes,
+    thresholdPercent,
+    warningMarginPercent,
+  };
+}
+
 function validReadinessFacts() {
   return {
     contractVersion: 1,
@@ -598,14 +623,7 @@ function validReadinessFacts() {
       layerNames: ['main'],
       registryHash: VALID_PROMPT_REGISTRY_HASH,
     },
-    storagePressure: {
-      version: 1,
-      status: 'healthy',
-      usedPercent: 40,
-      availableBytes: 20 * 1024 * 1024 * 1024,
-      thresholdPercent: 90,
-      warningMarginPercent: 10,
-    },
+    storagePressure: measuredStoragePressure(),
   };
 }
 
@@ -2208,6 +2226,9 @@ describe('ViventiumOrchestrationMode', () => {
   test('allows explicit local QA with shaped dirty artifacts but blocks every non-local mode', () => {
     const dirtyPath = path.join(ownerRepo, 'dirty-local-qa.txt');
     fs.writeFileSync(dirtyPath, 'intentional local QA drift\n');
+    const readinessFacts = JSON.parse(
+      fs.readFileSync(path.join(releaseDir, 'parallel-work-readiness-facts.json'), 'utf8'),
+    );
     const artifactIdentity = measuredArtifactIdentityFromPython();
     const artifactChecks = [
       { check_id: 'SOURCE-IDENTITY', status: 'FAIL', reason: 'source_dirty' },
@@ -2229,6 +2250,7 @@ describe('ViventiumOrchestrationMode', () => {
         artifact_checks: artifactChecks,
         blocking_artifact_checks: [artifactChecks[0], artifactChecks[3]],
         artifact_identity: artifactIdentity,
+        readiness_facts: readinessFacts,
       });
       const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
 
@@ -2245,6 +2267,7 @@ describe('ViventiumOrchestrationMode', () => {
           artifact_checks: artifactChecks,
           blocking_artifact_checks: [artifactChecks[0], artifactChecks[3]],
           artifact_identity: artifactIdentity,
+          readiness_facts: readinessFacts,
         });
         expect(parallelWorkReleaseGateSnapshot()).toEqual(
           expect.objectContaining({
@@ -2301,14 +2324,7 @@ describe('ViventiumOrchestrationMode', () => {
         ],
         readiness_facts: {
           ...validReadinessFacts(),
-          storagePressure: {
-            version: 1,
-            status: 'warning',
-            usedPercent: 85,
-            availableBytes: 100 * 1024 ** 3,
-            thresholdPercent: 90,
-            warningMarginPercent: 10,
-          },
+          storagePressure: measuredStoragePressure('warning'),
         },
       },
     ],
@@ -2325,14 +2341,7 @@ describe('ViventiumOrchestrationMode', () => {
         ],
         readiness_facts: {
           ...validReadinessFacts(),
-          storagePressure: {
-            version: 1,
-            status: 'critical',
-            usedPercent: 95,
-            availableBytes: 1024,
-            thresholdPercent: 90,
-            warningMarginPercent: 10,
-          },
+          storagePressure: measuredStoragePressure('critical'),
         },
       },
     ],

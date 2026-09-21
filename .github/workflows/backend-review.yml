@@ -265,7 +265,7 @@ jobs:
 
       - name: Run unit tests
         # VIVENTIUM START — split coverage across isolated jobs; bound each job to one recyclable worker.
-        run: cd api && npm run test:ci -- --shard=${{ matrix.shard }} --maxWorkers=1 --workerIdleMemoryLimit=1GB --testPathIgnorePatterns='/node_modules/|/__tests__/fixtures/|/server/services/viventium/__tests__/ViventiumOrchestrationMode.spec.js$'
+        run: cd api && npm run test:ci -- --shard=${{ matrix.shard }} --maxWorkers=1 --workerIdleMemoryLimit=1GB --testPathIgnorePatterns='/node_modules/|/__tests__/fixtures/|/server/services/viventium/__tests__/ViventiumOrchestrationMode.spec.js$|/server/routes/viventium/__tests__/telegram.spec.js$'
         # VIVENTIUM END
 
       - name: Run orchestration contracts in bounded processes
@@ -308,6 +308,48 @@ jobs:
             process.exit(1);
           }
           console.log(`Verified ${[...passed.values()].reduce((sum, count) => sum + count, 0)} orchestration tests exactly once`);
+          NODE
+
+      - name: Run Telegram contracts in bounded processes
+        if: matrix.shard == '1/4'
+        run: |
+          cd api
+          suite=server/routes/viventium/__tests__/telegram.spec.js
+          patterns=(
+            '^/api/viventium/telegram POST /chat'
+            '^/api/viventium/telegram POST (?:/source-order|glasshive|cortex|orchestration|/call-link)'
+            '^/api/viventium/telegram POST (?!/chat|/source-order|glasshive|cortex|orchestration|/call-link)'
+            '^/api/viventium/telegram (?!POST )'
+          )
+          for index in "${!patterns[@]}"; do
+            npm run test:ci -- --runInBand "$suite" --testNamePattern="${patterns[$index]}" --json --outputFile="$RUNNER_TEMP/telegram-$index.json"
+          done
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const expected = new Map();
+          const passed = new Map();
+          for (let index = 0; index < 4; index += 1) {
+            const file = path.join(process.env.RUNNER_TEMP, `telegram-${index}.json`);
+            const results = JSON.parse(fs.readFileSync(file, 'utf8')).testResults[0].assertionResults;
+            if (index === 0) {
+              for (const result of results) {
+                expected.set(result.fullName, (expected.get(result.fullName) || 0) + 1);
+              }
+            }
+            for (const result of results) {
+              if (result.status === 'passed') {
+                passed.set(result.fullName, (passed.get(result.fullName) || 0) + 1);
+              }
+            }
+          }
+          const complete = [...expected].every(([name, count]) => passed.get(name) === count)
+            && [...passed].every(([name, count]) => expected.get(name) === count);
+          if (!complete) {
+            console.error('Telegram suite partition omitted or repeated a test');
+            process.exit(1);
+          }
+          console.log(`Verified ${[...passed.values()].reduce((sum, count) => sum + count, 0)} Telegram tests exactly once`);
           NODE
 
   test-data-provider:

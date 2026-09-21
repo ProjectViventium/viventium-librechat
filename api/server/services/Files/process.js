@@ -160,7 +160,11 @@ function isProviderNativeMessageAttachment({
   endpointType,
   currentProvider,
   useResponsesApi,
+  nativeWorkspace,
 }) {
+  if (nativeWorkspace) {
+    return true;
+  }
   const isAzureWithResponsesApi =
     currentProvider === EModelEndpoint.azureOpenAI && useResponsesApi === true;
   const isBedrock =
@@ -694,6 +698,11 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
         endpointType,
         currentProvider,
         useResponsesApi,
+        nativeWorkspace:
+          req.config?.endpoints?.agents?.providerCapabilities?.[currentProvider]
+            ?.workspace_binding === true &&
+          req.config?.endpoints?.agents?.providerCapabilities?.[currentProvider]
+            ?.worker_native_tools === true,
       });
 
       if (providerNativeAttachment) {
@@ -1305,7 +1314,11 @@ function filterFile({ req, image, isAvatar }) {
   );
 
   if (!isSupportedMimeType) {
-    throw new Error('Unsupported file type');
+    throw Object.assign(new Error('Unsupported file type'), {
+      code: 'unsupported_file_type',
+      status: 415,
+      retryable: false,
+    });
   }
 
   if (!image || isAvatar === true) {

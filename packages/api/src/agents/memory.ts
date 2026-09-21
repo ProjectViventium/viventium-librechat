@@ -1,10 +1,10 @@
 /** Memories */
 import { z } from 'zod';
 import { createHmac, randomBytes } from 'crypto';
-import { tool } from '@langchain/core/tools';
+import { tool } from '@librechat/agents/langchain/tools';
 import { Tools, supportsAdaptiveThinking } from 'librechat-data-provider';
 import { logger } from '@librechat/data-schemas';
-import { HumanMessage } from '@langchain/core/messages';
+import { HumanMessage } from '@librechat/agents/langchain/messages';
 import { Run, Providers, GraphEvents } from '@librechat/agents';
 import type { MemoryKeyLimits } from '~/memory';
 import type {
@@ -18,7 +18,7 @@ import type {
 } from '@librechat/agents';
 import type { ObjectId, MemoryMethods, IUser } from '@librechat/data-schemas';
 import type { TAttachment, MemoryArtifact } from 'librechat-data-provider';
-import type { BaseMessage, ToolMessage } from '@langchain/core/messages';
+import type { BaseMessage, ToolMessage } from '@librechat/agents/langchain/messages';
 import type { Response as ServerResponse } from 'express';
 import { GenerationJobManager } from '~/stream/GenerationJobManager';
 import {
@@ -1224,7 +1224,7 @@ function logMemoryWriteAudit({
   userId: string | ObjectId;
   key: string;
   action: 'set' | 'delete';
-  status: 'applied' | 'conflict' | 'failed';
+  status: 'applied' | 'unchanged' | 'conflict' | 'failed';
   beforeHash?: string;
   afterHash?: string;
   auditContext?: MemoryWriteAuditContext;
@@ -1397,9 +1397,11 @@ export const createMemoryTool = ({
           attemptState.storageUncertain = false;
         }
         if (result.ok) {
-          if (attemptState) {
+          const changed = result.changed !== false;
+          if (attemptState && changed) {
             attemptState.storageApplied = true;
           }
+          artifact[Tools.memory].type = changed ? 'update' : 'unchanged';
           runtimeState.tokenCounts[key] = tokenCount;
           runtimeState.runningTotalTokens += tokenDelta;
           runtimeState.valueHashes[key] = hashMemoryAuditValue(nextValue);
@@ -1411,13 +1413,16 @@ export const createMemoryTool = ({
             userId,
             key,
             action: 'set',
-            status: 'applied',
+            status: changed ? 'applied' : 'unchanged',
             beforeHash,
             afterHash: runtimeState.valueHashes[key],
             auditContext,
           });
           logger.debug(`Memory set for key "${key}" (${tokenCount} tokens)`);
-          return [`Memory set for key "${key}" (${tokenCount} tokens)`, artifact];
+          return [
+            `Memory ${changed ? 'set' : 'unchanged'} for key "${key}" (${tokenCount} tokens)`,
+            artifact,
+          ];
         }
         if (result.conflict) {
           const message = `Memory key "${key}" changed while this memory update was running; the stale update was not applied.`;
@@ -1573,9 +1578,11 @@ const createDeleteMemoryTool = ({
           attemptState.storageUncertain = false;
         }
         if (result.ok) {
-          if (attemptState) {
+          const changed = result.changed !== false;
+          if (attemptState && changed) {
             attemptState.storageApplied = true;
           }
+          artifact[Tools.memory].type = changed ? 'delete' : 'unchanged';
           const previousTokenCount = runtimeState.tokenCounts[key] ?? 0;
           delete runtimeState.tokenCounts[key];
           /* === VIVENTIUM START === Keep the tombstone revision for later same-run CAS writes. === */
@@ -1593,12 +1600,12 @@ const createDeleteMemoryTool = ({
             userId,
             key,
             action: 'delete',
-            status: 'applied',
+            status: changed ? 'applied' : 'unchanged',
             beforeHash,
             auditContext,
           });
           logger.debug(`Memory deleted for key "${key}"`);
-          return [`Memory deleted for key "${key}"`, artifact];
+          return [`Memory ${changed ? 'deleted' : 'unchanged'} for key "${key}"`, artifact];
         }
         if (result.conflict) {
           const message = `Memory key "${key}" changed while this memory update was running; the stale delete was not applied.`;
@@ -1752,6 +1759,7 @@ export const createApplyMemoryChangesTool = ({
 
       const summaries: string[] = [];
       let primaryArtifact: Record<Tools.memory, MemoryArtifact> | undefined;
+      let unchangedArtifact: Record<Tools.memory, MemoryArtifact> | undefined;
       let errorArtifact: Record<Tools.memory, MemoryArtifact> | undefined;
       let appliedCount = 0;
 
@@ -1827,6 +1835,8 @@ export const createApplyMemoryChangesTool = ({
         } else if (memoryArtifact?.type === 'update' || memoryArtifact?.type === 'delete') {
           appliedCount += 1;
           primaryArtifact ??= result[1];
+        } else if (memoryArtifact?.type === 'unchanged') {
+          unchangedArtifact ??= result[1];
         } else if ((action === 'set' || action === 'delete') && result[1] == null) {
           errorArtifact ??= buildGenericMemoryErrorArtifact(
             result[0] || `Failed to ${action} memory`,
@@ -1845,7 +1855,7 @@ export const createApplyMemoryChangesTool = ({
         summaries.filter(Boolean).join('\n') || 'No durable memory update needed for this turn',
         errorArtifact != null
           ? markMemoryErrorPartialApply(errorArtifact, appliedCount > 0)
-          : primaryArtifact,
+          : (primaryArtifact ?? unchangedArtifact),
       ];
     },
     {

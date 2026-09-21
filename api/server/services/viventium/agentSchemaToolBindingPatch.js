@@ -33,6 +33,7 @@ const GRAPH_FALLBACK_CONTEXT = Symbol.for('viventium.agent.graph.fallback.runtim
 const MODEL_ROUTE_CAPABILITY_REFRESH = Symbol.for(
   'viventium.agent.model.route.capability.refresh.v1',
 );
+const MODERN_GRAPH_FALLBACK_OWNER = Symbol.for('viventium.agent.modern.graph.fallback.patch.v1');
 const MODEL_ROUTE_NATIVE_AUTHORITY_OBSERVER = Symbol.for(
   'viventium.agent.model.route.native.authority.observer.v1',
 );
@@ -767,6 +768,9 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
 
     return async (state, config) => {
       const invokeWithFallbackPolicy = () => {
+        if (proto[MODERN_GRAPH_FALLBACK_OWNER] === true) {
+          return originalCallModel(state, config);
+        }
         const policy = {
           attemptCount: 0,
           blockedError: null,

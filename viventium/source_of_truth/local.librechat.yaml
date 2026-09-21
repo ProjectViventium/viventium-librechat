@@ -1107,11 +1107,6 @@ mcpServers:
       X-Viventium-File-Ids: "{{LIBRECHAT_BODY_FILE_IDS_JSON_B64}}"
       X-Viventium-Storage-User-Id: "{{LIBRECHAT_USER_ID}}"
       X-WPR-Token: ${GLASSHIVE_PROVIDER_API_KEY}
-      X-Viventium-Voice-Call-Session-Id: "{{LIBRECHAT_BODY_VIVENTIUMVOICECALLSESSIONID}}"
-      X-Viventium-Voice-Request-Id: "{{LIBRECHAT_BODY_VIVENTIUMVOICEREQUESTID}}"
-      X-Viventium-Telegram-Chat-Id: "{{LIBRECHAT_BODY_VIVENTIUMTELEGRAMCHATID}}"
-      X-Viventium-Telegram-User-Id: "{{LIBRECHAT_BODY_VIVENTIUMTELEGRAMUSERID}}"
-      X-Viventium-Telegram-Message-Id: "{{LIBRECHAT_BODY_VIVENTIUMTELEGRAMMESSAGEID}}"
 speech:
   tts: {}
   stt: {}

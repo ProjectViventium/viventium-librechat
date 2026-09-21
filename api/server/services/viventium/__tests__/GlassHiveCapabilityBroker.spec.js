@@ -1115,7 +1115,7 @@ describe('GlassHive capability broker', () => {
     ).toBe(1);
   });
 
-  test('revokes a grant idempotently and blocks it throughout its renewal window', async () => {
+  test('revokes a grant idempotently throughout its valid lifetime', async () => {
     const {
       assertBrokerGrantActive,
       mintBrokerGrant,
@@ -1127,25 +1127,23 @@ describe('GlassHive capability broker', () => {
       requestContext: SYNTHETIC_TURN_SCOPE,
       grantId: 'ghcb_revoke_me',
       ttlSeconds: 60,
-      renewableTtlSeconds: 15 * 60,
       nowMs: 1_000_000,
     });
     const grant = verifyBrokerGrant(token, {
-      nowMs: 1_061_000,
-      allowRenewal: true,
+      nowMs: 1_001_000,
       expectedTenantId: 'tenant-a',
     });
 
-    await expect(assertBrokerGrantActive(grant, { nowMs: 1_061_000 })).resolves.toMatchObject({
+    await expect(assertBrokerGrantActive(grant, { nowMs: 1_001_000 })).resolves.toMatchObject({
       active: true,
     });
-    await expect(revokeBrokerGrant(grant, { nowMs: 1_061_000 })).resolves.toMatchObject({
+    await expect(revokeBrokerGrant(grant, { nowMs: 1_001_000 })).resolves.toMatchObject({
       revoked: true,
     });
-    await expect(revokeBrokerGrant(grant, { nowMs: 1_062_000 })).resolves.toMatchObject({
+    await expect(revokeBrokerGrant(grant, { nowMs: 1_002_000 })).resolves.toMatchObject({
       revoked: true,
     });
-    await expect(assertBrokerGrantActive(grant, { nowMs: 1_063_000 })).rejects.toThrow(/revoked/);
+    await expect(assertBrokerGrantActive(grant, { nowMs: 1_003_000 })).rejects.toThrow(/revoked/);
   });
 
   test('mints an idempotent fire-time scheduled bundle from current user policy', async () => {

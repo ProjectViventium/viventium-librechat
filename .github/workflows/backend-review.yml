@@ -173,6 +173,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
+      VIVENTIUM_TEST_PRODUCTION_ROOT: ${{ github.workspace }}/parent-viventium
       MONGO_URI: ${{ secrets.MONGO_URI }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       JWT_SECRET: ${{ secrets.JWT_SECRET }}
@@ -186,6 +187,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: ProjectViventium/viventium
+          path: parent-viventium
       # VIVENTIUM END
 
       # VIVENTIUM START — exact release toolchain.

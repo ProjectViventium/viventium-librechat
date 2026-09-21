@@ -174,7 +174,7 @@ function isVoiceModelValid(voiceLlmModel, voiceProvider, req, modelsConfig) {
   if (!model || !provider) {
     return false;
   }
-  if (!providerAllowsRealtimeVoice(provider, req)) {
+  if (!providerSupportsVoicePipeline(provider, req)) {
     return false;
   }
 
@@ -330,7 +330,7 @@ function applyVoiceModelOverride(agent, req, modelsConfig) {
 
   if (!voiceLlmModel || !voiceProvider) {
     // No voice override configured — use main model
-    if (!providerAllowsRealtimeVoice(agent.provider, req)) {
+    if (!providerSupportsVoicePipeline(agent.provider, req)) {
       throw new Error(
         `Agent ${agent.id || 'unknown'} requires a configured real-time Voice LLM before joining a call`,
       );
@@ -342,7 +342,7 @@ function applyVoiceModelOverride(agent, req, modelsConfig) {
     logger.warn(
       `[voiceLlmOverride] Invalid ${assignment?.source || 'configured'} voice model ${voiceProvider}/${voiceLlmModel} for agent ${agent.id} — falling back to main model`,
     );
-    if (!providerAllowsRealtimeVoice(agent.provider, req)) {
+    if (!providerSupportsVoicePipeline(agent.provider, req)) {
       throw new Error(
         `Agent ${agent.id || 'unknown'} has no valid real-time Voice LLM for this call`,
       );

@@ -291,9 +291,13 @@ const {
 const { setTrustedInteractionContext } = require('~/server/services/viventium/interactionContext');
 
 const priorPromptBundlePath = process.env[PROMPT_BUNDLE_ENV];
-const defaultPromptBundleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-cortex-test-prompts-'));
+const defaultPromptBundleDir = fs.mkdtempSync(
+  path.join(os.tmpdir(), 'viventium-cortex-test-prompts-'),
+);
 const defaultPromptBundlePath = path.join(defaultPromptBundleDir, 'prompt-bundle.json');
-fs.writeFileSync(defaultPromptBundlePath, JSON.stringify({
+fs.writeFileSync(
+  defaultPromptBundlePath,
+  JSON.stringify({
     prompt_count: 1,
     prompts: {
       'cortex.execution_subject': {
@@ -301,7 +305,8 @@ fs.writeFileSync(defaultPromptBundlePath, JSON.stringify({
         metadata: {},
       },
     },
-}));
+  }),
+);
 process.env[PROMPT_BUNDLE_ENV] = defaultPromptBundlePath;
 resetPromptRegistryForTests();
 afterAll(() => {

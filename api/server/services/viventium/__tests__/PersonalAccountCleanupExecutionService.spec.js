@@ -86,8 +86,9 @@ describe('PersonalAccountCleanupExecutionService', () => {
       status: 'verified',
     });
 
-    expect(mockModels.ViventiumPersonalAccountCleanupReceipt.configureCleanupRecoveryVerifier)
-      .toHaveBeenCalledWith(expect.any(Function));
+    expect(
+      mockModels.ViventiumPersonalAccountCleanupReceipt.configureCleanupRecoveryVerifier,
+    ).toHaveBeenCalledWith(expect.any(Function));
     expect(mockCreateExecutor).toHaveBeenCalledTimes(1);
     expect(mockCreateExecutor).toHaveBeenCalledWith(
       expect.objectContaining({

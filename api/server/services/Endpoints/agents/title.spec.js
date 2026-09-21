@@ -126,10 +126,14 @@ describe('agents addTitle', () => {
 
     expect(getLogStores).toHaveBeenCalled();
     expect(mockSet).toHaveBeenCalledWith('user-1-convo-1', 'check my ms365 inbox', 120000);
-    expect(saveConvo).toHaveBeenCalledWith(req, {
-      conversationId: 'convo-1',
-      title: 'check my ms365 inbox',
-    }, { context: 'api/server/services/Endpoints/agents/title.js' });
+    expect(saveConvo).toHaveBeenCalledWith(
+      req,
+      {
+        conversationId: 'convo-1',
+        title: 'check my ms365 inbox',
+      },
+      { context: 'api/server/services/Endpoints/agents/title.js' },
+    );
     expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });
 
@@ -154,10 +158,14 @@ describe('agents addTitle', () => {
       'this is a deliberately long title see...',
       120000,
     );
-    expect(saveConvo).toHaveBeenCalledWith(req, {
-      conversationId: 'convo-2',
-      title: 'this is a deliberately long title see...',
-    }, { context: 'api/server/services/Endpoints/agents/title.js' });
+    expect(saveConvo).toHaveBeenCalledWith(
+      req,
+      {
+        conversationId: 'convo-2',
+        title: 'this is a deliberately long title see...',
+      },
+      { context: 'api/server/services/Endpoints/agents/title.js' },
+    );
     expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });
 });

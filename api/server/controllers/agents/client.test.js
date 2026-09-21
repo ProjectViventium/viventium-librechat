@@ -5807,14 +5807,14 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     jest.clearAllMocks();
     require('@librechat/api').GenerationJobManager.getJob.mockResolvedValue({ status: 'running' });
     mockEmitChunk.mockImplementation(async (streamId, event, options) => {
-      const fence = await options.verifyCortexPresentation();
+      const fence = await options?.verifyCortexPresentation?.();
       return {
         delivered: true,
         streamId,
         target: 'subscriber_transport',
         presentationRef: `sse:${streamId}:${event.data.messageId}`,
-        claimToken: fence.claimToken,
-        presentationLeaseToken: fence.presentationLeaseToken,
+        claimToken: fence?.claimToken,
+        presentationLeaseToken: fence?.presentationLeaseToken,
       };
     });
     mockPersistCortexPartsToCanonicalMessage.mockResolvedValue(undefined);

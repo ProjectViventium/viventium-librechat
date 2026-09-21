@@ -136,7 +136,9 @@ const {
   getActiveWorkInteractiveSnapshot,
   getActiveWorkPage,
 } = require('~/server/services/viventium/GlassHiveAccountService');
-const { executeGlassHiveWorkAction } = require('~/server/services/viventium/GlassHiveWorkActionService');
+const {
+  executeGlassHiveWorkAction,
+} = require('~/server/services/viventium/GlassHiveWorkActionService');
 
 const EXTRACTED_DOCUMENT_IMAGE_MAX_DIMENSION = 768;
 /* === VIVENTIUM START ===
@@ -330,11 +332,24 @@ async function bindTelegramIngressAuthority({
     throw error;
   }
   const result = await ViventiumTelegramIngressEvent.updateOne(
-    { _id: recordId, dedupeKey, telegramUserId, telegramChatId, telegramMessageId, authorityBoundAt: null },
+    {
+      _id: recordId,
+      dedupeKey,
+      telegramUserId,
+      telegramChatId,
+      telegramMessageId,
+      authorityBoundAt: null,
+    },
     {
       $set: {
-        libreChatUserId, conversationId, streamId, telegramMessageThreadId,
-        sourceSequence, sourceOrderScope, sourceEventId, authorityBoundAt: new Date(),
+        libreChatUserId,
+        conversationId,
+        streamId,
+        telegramMessageThreadId,
+        sourceSequence,
+        sourceOrderScope,
+        sourceEventId,
+        authorityBoundAt: new Date(),
       },
     },
   );
@@ -755,11 +770,13 @@ async function uploadTelegramFiles({ req, files, agentId }) {
   const originalFile = req.file;
   const originalBody = req.body;
   const hadDocumentImageExtraction = Object.prototype.hasOwnProperty.call(
-    req, '_viventiumBridgeDocumentImageExtraction',
+    req,
+    '_viventiumBridgeDocumentImageExtraction',
   );
   const originalDocumentImageExtraction = req._viventiumBridgeDocumentImageExtraction;
   const hadDurableMissionAttachment = Object.prototype.hasOwnProperty.call(
-    req, '_viventiumBridgeDurableMissionAttachment',
+    req,
+    '_viventiumBridgeDurableMissionAttachment',
   );
   const originalDurableMissionAttachment = req._viventiumBridgeDurableMissionAttachment;
 

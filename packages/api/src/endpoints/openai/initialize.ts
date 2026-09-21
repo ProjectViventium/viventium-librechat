@@ -8,6 +8,7 @@ import type {
 } from '~/types';
 import { getAzureCredentials, resolveHeaders, isUserProvided, checkUserKeyExpiry } from '~/utils';
 import { getOpenAIConfig } from './config';
+import { resolveConnectedAccountCredentialPolicy } from '../connectedAccounts/policy';
 import {
   forceRefreshOpenAISubscriptionUserValues,
   resolveOpenAISubscriptionUserValues,
@@ -124,6 +125,13 @@ export async function initializeOpenAI({
 
   const { key: expiresAt } = req.body;
   const modelName = model_parameters?.model as string | undefined;
+  const personalCredentialsRequired =
+    endpoint === EModelEndpoint.openAI &&
+    (await resolveConnectedAccountCredentialPolicy({
+      userId: req.user?.id ?? '',
+      provider: 'openai',
+      db,
+    })) === 'personal_required';
 
   const credentials = {
     [EModelEndpoint.openAI]: OPENAI_API_KEY,
@@ -149,17 +157,25 @@ export async function initializeOpenAI({
     if (isNoUserKeyError(error)) {
       userValues = null;
     } else if (isOpenAIConnectedAccountReadError(error)) {
-      if (isConnectedAccountAuthMode()) {
+      if (personalCredentialsRequired || isConnectedAccountAuthMode()) {
         throw openAIConnectedAccountReconnectError();
       }
       userValues = null;
     } else if (isOpenAIConnectedAccountReconnectFailure(error)) {
-      if (isConnectedAccountAuthMode() || !allowPlatformFallbackOnOAuthFailure(req)) {
+      if (
+        personalCredentialsRequired ||
+        isConnectedAccountAuthMode() ||
+        !allowPlatformFallbackOnOAuthFailure(req)
+      ) {
         throw openAIConnectedAccountReconnectError();
       }
       userValues = null;
     } else if (isOpenAIConnectedAccountTransientFailure(error)) {
-      if (isConnectedAccountAuthMode() || !allowPlatformFallbackOnOAuthFailure(req)) {
+      if (
+        personalCredentialsRequired ||
+        isConnectedAccountAuthMode() ||
+        !allowPlatformFallbackOnOAuthFailure(req)
+      ) {
         throw error;
       }
       userValues = null;
@@ -174,7 +190,7 @@ export async function initializeOpenAI({
   const isOpenAIOAuthSubscription = userValues?.oauthProvider === 'openai-codex';
 
   let apiKey = credentials[endpoint as keyof typeof credentials];
-  if (userProvidesKey) {
+  if (userProvidesKey || personalCredentialsRequired) {
     apiKey = undefined;
   }
   if (hasUserApiKey) {
@@ -292,8 +308,8 @@ export async function initializeOpenAI({
     apiKey = clientOptions.azure ? clientOptions.azure.azureOpenAIApiKey : undefined;
   }
 
-  if (userProvidesKey && !apiKey) {
-    if (isConnectedAccountAuthMode()) {
+  if ((userProvidesKey || personalCredentialsRequired) && !apiKey) {
+    if (personalCredentialsRequired || isConnectedAccountAuthMode()) {
       throw new Error(
         JSON.stringify({
           type: ErrorTypes.CONNECTED_ACCOUNT_REQUIRED,

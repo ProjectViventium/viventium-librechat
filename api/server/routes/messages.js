@@ -102,12 +102,22 @@ const sanitizePublicMessageContent = (value, ancestors = new WeakSet()) => {
 };
 
 const sanitizeMessageForPublicResponse = (message) => {
-  if (!message || typeof message !== 'object' || !Object.hasOwn(message, 'content')) {
+  if (!message || typeof message !== 'object') {
     return message;
   }
+  const {
+    _id: _id,
+    __v: _version,
+    user: _user,
+    savedMemoryWrite: _savedMemoryWrite,
+    nativeResponse: _nativeResponse,
+    ...publicMessage
+  } = message;
   return {
-    ...message,
-    content: sanitizePublicMessageContent(message.content),
+    ...publicMessage,
+    ...(Object.hasOwn(publicMessage, 'content')
+      ? { content: sanitizePublicMessageContent(publicMessage.content) }
+      : {}),
   };
 };
 

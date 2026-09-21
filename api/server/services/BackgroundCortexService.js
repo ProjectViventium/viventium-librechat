@@ -1237,7 +1237,9 @@ function bindCortexMainContextSnapshot(req, targetAgent, { required = false } = 
         String(existingHeaders[key]) !== String(expectedHeaders[key] || ''),
     )
   ) {
-    const error = new Error('Background cortex Main context binding does not match the accepted snapshot.');
+    const error = new Error(
+      'Background cortex Main context binding does not match the accepted snapshot.',
+    );
     error.code = 'phase_b_main_context_binding_failed';
     throw error;
   }

@@ -66,6 +66,10 @@ describe('useSideNavLinks Feelings discovery', () => {
 
   it('puts Active work in the Control Panel before reference tools', () => {
     mockUseGetStartupConfig.mockReturnValue({ data: { viventiumParallelWorkAvailable: true } });
+    mockUseOrchestrationPreferenceQuery.mockReturnValue({
+      data: { available: true, hasKnownWork: false },
+      isError: false,
+    });
     const { result } = renderHook(() => useSideNavLinks(baseArguments));
     const linkIds = result.current.map((link) => link.id);
     const activeWork = result.current.find((link) => link.id === 'active-work');
@@ -76,7 +80,7 @@ describe('useSideNavLinks Feelings discovery', () => {
     expect(linkIds.indexOf('active-work')).toBeLessThan(linkIds.indexOf('prompts'));
     expect(linkIds.indexOf('active-work')).toBeLessThan(linkIds.indexOf('feelings'));
     expect(linkIds.indexOf('active-work')).toBeLessThan(linkIds.indexOf('memories'));
-    expect(mockUseOrchestrationPreferenceQuery).toHaveBeenCalledWith({ enabled: false });
+    expect(mockUseOrchestrationPreferenceQuery).toHaveBeenCalledWith();
   });
 
   it('keeps the dark empty feature out of the Control Panel', () => {
@@ -84,7 +88,7 @@ describe('useSideNavLinks Feelings discovery', () => {
     const { result } = renderHook(() => useSideNavLinks(baseArguments));
 
     expect(result.current.some((link) => link.id === 'active-work')).toBe(false);
-    expect(mockUseOrchestrationPreferenceQuery).toHaveBeenCalledWith({ enabled: true });
+    expect(mockUseOrchestrationPreferenceQuery).toHaveBeenCalledWith();
   });
 
   it('does not substitute deployment readiness for an unavailable owner', () => {

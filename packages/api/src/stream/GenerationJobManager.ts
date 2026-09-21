@@ -6,7 +6,7 @@ import type {
   NativeResponseMessageProjection,
 } from '@librechat/data-schemas';
 import { nativePredecessorSupersession } from '../glasshive/nativeSupersession';
-import type { NativeAcceptedSource } from '../glasshive/nativeSupersession';
+import type { NativeAcceptedSource, NativePredecessor } from '../glasshive/nativeSupersession';
 import {
   nativeIdentityJson,
   nativeJobMatches,
@@ -2015,11 +2015,31 @@ class GenerationJobManagerClass {
     logger.debug(`[GenerationJobManager] Created job ${streamLogRef(streamId)}`);
 
     const supersededPresentations: NonNullable<t.GenerationJob['supersededPresentations']> = [];
+    let nativePredecessor: NativePredecessor | undefined;
     for (const supersededStreamId of supersededStreamIds) {
       const supersededJob =
         supersededStreamId === streamId && sameStreamSupersededJob
           ? sameStreamSupersededJob
           : await this.jobStore.getJob(supersededStreamId);
+      const previousNative = supersededJob?.nativeResponse;
+      if (
+        supersededStreamIds.length === 1 &&
+        supersededStreamId !== streamId &&
+        previousNative &&
+        interactionContext &&
+        supersededJob.userId === userId &&
+        supersededJob.conversationId === conversationId &&
+        previousNative.logicalTurnId === interactionContext?.logical_turn_id &&
+        previousNative.revision + 1 === interactionContext.revision &&
+        supersededJob.responseMessageId === previousNative.responseMessageId
+      ) {
+        nativePredecessor = {
+          streamId: supersededStreamId,
+          createdAt: supersededJob.createdAt,
+          responseMessageId: previousNative.responseMessageId,
+          invocationId: previousNative.invocationId,
+        };
+      }
       if (
         !['committed', 'committed_effect'].includes(
           supersededJob?.deliveryAcknowledgement?.state ?? '',
@@ -2031,6 +2051,10 @@ class GenerationJobManagerClass {
           userMessageId: supersededJob?.userMessage?.messageId,
           interactionContext: supersededJob?.interactionContext,
         });
+      }
+      if (nativePredecessor) {
+        await this.jobStore.updateJob(streamId, { nativePredecessor });
+        jobData.nativePredecessor = nativePredecessor;
       }
       if (supersededStreamId !== streamId) {
         await this.supersedeJob(supersededStreamId);

@@ -1,8 +1,8 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Run, Providers, Constants, StandardGraph } from '@librechat/agents';
 import { providerEndpointMap, KnownEndpoints } from 'librechat-data-provider';
-import { SystemMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
+import { SystemMessage } from '@librechat/agents/langchain/messages';
+import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { Callbacks } from '@langchain/core/callbacks/manager';
 import type {
   MultiAgentGraphConfig,

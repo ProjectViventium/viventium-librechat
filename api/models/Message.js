@@ -902,12 +902,8 @@ async function deleteMessagesSince(req, { messageId, conversationId }) {
 async function getMessages(filter, select) {
   try {
     if (select) {
-      const rows = await Message.find(filter)
-        .select('+savedMemoryWrite')
-        .select(select)
-        .sort({ createdAt: 1 })
-        .lean();
-      return rows.map(projectMemoryWriteStatus);
+      const rows = await Message.find(filter).select(select).sort({ createdAt: 1 }).lean();
+      return rows;
     }
 
     // Exclude private writer input in Mongo itself, then expose only its existing state.

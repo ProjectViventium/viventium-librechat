@@ -713,58 +713,6 @@ function measuredArtifactIdentityFromPython() {
   );
 }
 
-function diagnoseLocalQaFailure(result) {
-  if (result.available) return;
-  const script = `
-import importlib.util, json, sys
-from pathlib import Path
-spec = importlib.util.spec_from_file_location('gate_diag', sys.argv[1])
-gate = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = gate
-spec.loader.exec_module(gate)
-snapshot = Path(sys.argv[2])
-payload = json.loads(snapshot.read_text())
-runtime = snapshot.parent
-gates = gate._serialized_gate_list(payload.get('gates'))
-current = gate._remeasure_storage_pressure(payload.get('readiness_facts'), runtime / 'prompt-bundle.json')
-checks = gate._typed_readiness_checks(current, runtime / 'prompt-bundle.json')
-projection = payload['owner_binding']
-owner_state = (runtime.parent / 'state' / 'runtime' / projection['runtimeProfile'] / 'stack-owner.json').resolve()
-owner = json.loads(owner_state.read_text())
-installed_root = Path(owner['repoRoot']).resolve()
-live_readiness = json.loads((runtime / 'parallel-work-readiness-facts.json').read_text())
-live_identity = json.loads((runtime / 'parallel-work-artifact-identity.json').read_text())
-measured_identity = gate._public_artifact_identity(gate._measured_artifact_identity(installed_root, runtime / 'prompt-bundle.json', installed_root, owner_state))
-expected_identity = payload['artifact_identity']
-source_defaults_valid, _ = gate._source_default_records(installed_root)
-print(json.dumps({
-    'serialized_storage': payload['readiness_facts']['storagePressure']['status'],
-    'current_storage': current['storagePressure']['status'],
-    'storage_no_worse': gate._storage_pressure_did_not_worsen(current, payload.get('readiness_facts')),
-    'readiness_conservative': gate._serialized_readiness_remains_conservative(checks, payload.get('readiness_checks'), allow_storage_improvement=True),
-    'receipts': gate._live_qa_receipt_contract_matches(payload, gates, runtime),
-    'owner': gate._owner_projection_matches_live_runtime(payload.get('owner_binding'), runtime),
-    'inputs': gate._live_runtime_claim_inputs_match(payload, runtime),
-    'readiness_policy_match': gate._stable_readiness_claim_inputs(gate._remeasure_storage_pressure(live_readiness, runtime / 'prompt-bundle.json')) == gate._stable_readiness_claim_inputs(payload.get('readiness_facts')),
-    'identity_file_match': gate._public_artifact_identity(live_identity) == expected_identity,
-    'measured_identity_mismatch_keys': [key for key in expected_identity if measured_identity.get(key) != expected_identity[key]],
-    'installed_mismatch_keys': [key for key in expected_identity['installed'] if measured_identity['installed'].get(key) != expected_identity['installed'][key]],
-    'source_defaults_match': source_defaults_valid is payload.get('source_defaults_valid'),
-    'artifact_shape': gate._artifact_identity_shape_valid(payload.get('artifact_identity')),
-}))
-`;
-  try {
-    const diagnostic = execFileSync(
-      '/usr/bin/python3',
-      ['-c', script, installedGateScript, releasePath],
-      { encoding: 'utf8' },
-    );
-    process.stderr.write(`local QA fixture validation: ${diagnostic}`);
-  } catch (error) {
-    process.stderr.write(`local QA fixture diagnosis unavailable: ${error?.name || 'error'}\n`);
-  }
-}
-
 function validArtifactChecks() {
   return [
     { check_id: 'SOURCE-IDENTITY', status: 'PASS', reason: '' },
@@ -819,7 +767,9 @@ function writeReleaseSnapshot(overrides = {}) {
     readiness_facts: validReadinessFacts(),
     artifact_checks: validArtifactChecks(),
     blocking_artifact_checks: [],
-    artifact_identity: validArtifactIdentity(),
+    artifact_identity: Object.hasOwn(overrides, 'artifact_identity')
+      ? overrides.artifact_identity
+      : validArtifactIdentity(),
     owner_binding: ownerBinding,
     ...overrides,
   };
@@ -2278,8 +2228,10 @@ describe('ViventiumOrchestrationMode', () => {
   test('allows explicit local QA with shaped dirty artifacts but blocks every non-local mode', () => {
     const dirtyPath = path.join(ownerRepo, 'dirty-local-qa.txt');
     fs.writeFileSync(dirtyPath, 'intentional local QA drift\n');
-    const readinessFacts = JSON.parse(
-      fs.readFileSync(path.join(releaseDir, 'parallel-work-readiness-facts.json'), 'utf8'),
+    const readinessFacts = validReadinessFacts();
+    fs.writeFileSync(
+      path.join(releaseDir, 'parallel-work-readiness-facts.json'),
+      `${JSON.stringify(readinessFacts)}\n`,
     );
     const artifactIdentity = measuredArtifactIdentityFromPython();
     const artifactChecks = [
@@ -2306,9 +2258,7 @@ describe('ViventiumOrchestrationMode', () => {
       });
       const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
 
-      const localQaResult = parallelWorkReleaseGateSnapshot();
-      diagnoseLocalQaFailure(localQaResult);
-      expect(localQaResult).toEqual(
+      expect(parallelWorkReleaseGateSnapshot()).toEqual(
         expect.objectContaining({
           available: true,
           label: 'PRE-GATE / NOT READY',
@@ -2356,13 +2306,13 @@ describe('ViventiumOrchestrationMode', () => {
             reason: 'prompt_layer_hash_mismatch',
           },
         ],
-        readiness_facts: {
+        readiness_facts: () => ({
           ...validReadinessFacts(),
           promptLayers: {
             ...validReadinessFacts().promptLayers,
             registryHash: '9'.repeat(64),
           },
-        },
+        }),
       },
     ],
     [
@@ -2376,10 +2326,10 @@ describe('ViventiumOrchestrationMode', () => {
         blocking_checks: [
           { check_id: 'STORAGE-PRESSURE', status: 'FAIL', reason: 'storage_pressure' },
         ],
-        readiness_facts: {
+        readiness_facts: () => ({
           ...validReadinessFacts(),
           storagePressure: measuredStoragePressure('warning'),
-        },
+        }),
       },
     ],
     [
@@ -2393,15 +2343,21 @@ describe('ViventiumOrchestrationMode', () => {
         blocking_checks: [
           { check_id: 'STORAGE-PRESSURE', status: 'FAIL', reason: 'storage_pressure' },
         ],
-        readiness_facts: {
+        readiness_facts: () => ({
           ...validReadinessFacts(),
           storagePressure: measuredStoragePressure('critical'),
-        },
+        }),
       },
     ],
   ])(
     'allows explicit shaped local QA with %s while every non-local mode remains blocked',
     (_caseName, blocker, degraded) => {
+      const readinessFacts = degraded.readiness_facts();
+      fs.writeFileSync(
+        path.join(releaseDir, 'parallel-work-readiness-facts.json'),
+        `${JSON.stringify(readinessFacts)}\n`,
+      );
+      const artifactIdentity = measuredArtifactIdentityFromPython();
       writeReleaseSnapshot({
         mode: 'local-qa',
         label: 'PRE-GATE / NOT READY',
@@ -2409,11 +2365,11 @@ describe('ViventiumOrchestrationMode', () => {
         exposure_allowed: true,
         local_qa_override: true,
         ...degraded,
+        readiness_facts: readinessFacts,
+        artifact_identity: artifactIdentity,
       });
       const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
-      const localQaResult = parallelWorkReleaseGateSnapshot();
-      diagnoseLocalQaFailure(localQaResult);
-      expect(localQaResult).toEqual(
+      expect(parallelWorkReleaseGateSnapshot()).toEqual(
         expect.objectContaining({
           available: true,
           label: 'PRE-GATE / NOT READY',
@@ -2425,6 +2381,8 @@ describe('ViventiumOrchestrationMode', () => {
         writeBlockedReleaseSnapshot({
           mode,
           ...degraded,
+          readiness_facts: readinessFacts,
+          artifact_identity: artifactIdentity,
         });
         expect(parallelWorkReleaseGateSnapshot()).toEqual(
           expect.objectContaining({

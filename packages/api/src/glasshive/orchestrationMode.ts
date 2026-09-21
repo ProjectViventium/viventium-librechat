@@ -1114,6 +1114,21 @@ function normalizedProcessValue(value: unknown): string {
     .join(' ');
 }
 
+function liveProcessCwd(pid: string): string {
+  if (process.platform === 'linux') {
+    return fs.realpathSync(`/proc/${pid}/cwd`);
+  }
+  const cwdLines = String(
+    execFileSync('/usr/sbin/lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], {
+      encoding: 'utf8',
+    }),
+  )
+    .split('\n')
+    .filter((line) => line.startsWith('n') && line.length > 1);
+  if (cwdLines.length !== 1) throw new Error('live process cwd unavailable');
+  return fs.realpathSync(cwdLines[0].slice(1));
+}
+
 function canonicalOwnerProcessProof(ownerPath: string, repoRoot: string): boolean {
   try {
     const gateScript = fs.realpathSync(
@@ -1218,18 +1233,7 @@ function liveRuntimeOwnerMatches(snapshot: ValueRecord, runtimeDir: string): boo
     const command = normalizedProcessValue(
       execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' }),
     );
-    const cwdOutput = execFileSync(
-      '/usr/sbin/lsof',
-      ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'],
-      {
-        encoding: 'utf8',
-      },
-    );
-    const cwdLines = cwdOutput
-      .split('\n')
-      .filter((line: string) => line.startsWith('n') && line.length > 1);
-    if (cwdLines.length !== 1) return false;
-    const liveCwd = fs.realpathSync(cwdLines[0].slice(1));
+    const liveCwd = liveProcessCwd(String(pid));
     const ownerStartedAt = normalizedProcessValue(owner.ownerProcessStartedAt);
     const ownerCommand = normalizedProcessValue(owner.ownerProcessCommand);
     const binding = {
@@ -2012,15 +2016,12 @@ function rawReleaseSnapshotExposureFingerprint(): string {
     const command = normalizedProcessValue(
       execFileSync('ps', ['-p', pid, '-o', 'command='], { encoding: 'utf8' }),
     );
-    const cwdLines = String(execFileSync('/usr/sbin/lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], {
-      encoding: 'utf8',
-    })).split('\n').filter((line) => line.startsWith('n') && line.length > 1);
+    const liveCwd = liveProcessCwd(pid);
     if (
-      cwdLines.length !== 1 ||
       startedAt !== normalizedProcessValue(projection.ownerProcessStartedAt) ||
       command !== normalizedProcessValue(JSON.parse(ownerText.toString('utf8')).ownerProcessCommand) ||
       sha256Text(command) !== projection.ownerProcessCommandSha256 ||
-      sha256Text(fs.realpathSync(cwdLines[0].slice(1))) !== projection.ownerProcessCwdSha256
+      sha256Text(liveCwd) !== projection.ownerProcessCwdSha256
     ) return '';
     return sha256Text(Buffer.concat([contents, Buffer.from([0]), ownerText]));
   } catch (_error) {

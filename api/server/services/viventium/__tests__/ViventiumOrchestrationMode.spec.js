@@ -713,6 +713,42 @@ function measuredArtifactIdentityFromPython() {
   );
 }
 
+function diagnoseLocalQaFailure(result) {
+  if (result.available) return;
+  const script = `
+import importlib.util, json, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('gate_diag', sys.argv[1])
+gate = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = gate
+spec.loader.exec_module(gate)
+snapshot = Path(sys.argv[2])
+payload = json.loads(snapshot.read_text())
+runtime = snapshot.parent
+gates = gate._serialized_gate_list(payload.get('gates'))
+current = gate._remeasure_storage_pressure(payload.get('readiness_facts'), runtime / 'prompt-bundle.json')
+checks = gate._typed_readiness_checks(current, runtime / 'prompt-bundle.json')
+print(json.dumps({
+    'serialized_storage': payload['readiness_facts']['storagePressure']['status'],
+    'current_storage': current['storagePressure']['status'],
+    'storage_no_worse': gate._storage_pressure_did_not_worsen(current, payload.get('readiness_facts')),
+    'readiness_conservative': gate._serialized_readiness_remains_conservative(checks, payload.get('readiness_checks'), allow_storage_improvement=True),
+    'receipts': gate._live_qa_receipt_contract_matches(payload, gates, runtime),
+    'owner': gate._owner_projection_matches_live_runtime(payload.get('owner_binding'), runtime),
+    'inputs': gate._live_runtime_claim_inputs_match(payload, runtime),
+    'artifact_shape': gate._artifact_identity_shape_valid(payload.get('artifact_identity')),
+}))
+`;
+  try {
+    const diagnostic = execFileSync('/usr/bin/python3', ['-c', script, installedGateScript, releasePath], {
+      encoding: 'utf8',
+    });
+    process.stderr.write(`local QA fixture validation: ${diagnostic}`);
+  } catch (error) {
+    process.stderr.write(`local QA fixture diagnosis unavailable: ${error?.name || 'error'}\n`);
+  }
+}
+
 function validArtifactChecks() {
   return [
     { check_id: 'SOURCE-IDENTITY', status: 'PASS', reason: '' },
@@ -2254,7 +2290,9 @@ describe('ViventiumOrchestrationMode', () => {
       });
       const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
 
-      expect(parallelWorkReleaseGateSnapshot()).toEqual(
+      const localQaResult = parallelWorkReleaseGateSnapshot();
+      diagnoseLocalQaFailure(localQaResult);
+      expect(localQaResult).toEqual(
         expect.objectContaining({
           available: true,
           label: 'PRE-GATE / NOT READY',
@@ -2357,7 +2395,9 @@ describe('ViventiumOrchestrationMode', () => {
         ...degraded,
       });
       const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
-      expect(parallelWorkReleaseGateSnapshot()).toEqual(
+      const localQaResult = parallelWorkReleaseGateSnapshot();
+      diagnoseLocalQaFailure(localQaResult);
+      expect(localQaResult).toEqual(
         expect.objectContaining({
           available: true,
           label: 'PRE-GATE / NOT READY',

@@ -6,7 +6,7 @@ const { execFileSync, spawn } = require('child_process');
 
 const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 const SERVICE_ACK_CASES = new Set([
-  'TR-014',
+  'TR-026',
   'EMO-UC-047',
   'EMO-UC-048',
   'PWK-UC-016',
@@ -16,17 +16,17 @@ const SERVICE_ACK_CASES = new Set([
 const RECEIPT_VERIFIER_IDS = Object.freeze({
   'EMO-UC-047': 'emo047-semantic-v1',
   'EMO-UC-048': 'emo048-semantic-v1',
-  'MPV-054': 'mpv054-semantic-v1',
+  'MPV-061': 'mpv061-semantic-v1',
   'PWK-UC-014': 'pwk-installed-journey-v1',
   'REL-UC-004': 'rel004-semantic-v1',
   'TGDOC-010': 'tgd010-semantic-v1',
-  'TR-014': 'tr014-semantic-v1',
+  'TR-026': 'tr026-semantic-v1',
 });
 const EXTERNAL_FIXTURE_SERVICE_PRODUCERS = Object.freeze({
   'EMO-UC-047': ['glasshive-runtime', 'librechat-core'],
   'EMO-UC-048': ['librechat-core', 'telegram-bot'],
   'REL-UC-004': ['librechat-core'],
-  'TR-014': ['librechat-core', 'telegram-bot'],
+  'TR-026': ['librechat-core', 'telegram-bot'],
 });
 const EXTERNAL_FIXTURE_SIGNERS = Object.freeze([
   'publisher',
@@ -380,7 +380,7 @@ function installExternalReleaseFixtureAuthority({ installedGateScript, ownerRepo
       Object.entries(RECEIPT_VERIFIER_IDS).map(([caseId, verifierId]) => [
         caseId,
         {
-          surface: caseId === 'MPV-054' ? 'voice' : 'telegram',
+          surface: caseId === 'MPV-061' ? 'voice' : 'telegram',
           verifierId,
           producerIds: ['observation-producer'],
           serviceProducerIds: EXTERNAL_FIXTURE_SERVICE_PRODUCERS[caseId] || [],
@@ -536,6 +536,7 @@ function createParallelWorkReleaseFixture(prefix) {
   const helperSourceFiles = [
     'Package.swift',
     'Sources/ViventiumHelper/ViventiumHelperApp.swift',
+    'Sources/ViventiumHelper/LifeSetup.swift',
     'Sources/ViventiumHelper/Resources/Info.plist',
   ];
   const helperSourceDigest = crypto.createHash('sha256');
@@ -570,6 +571,10 @@ function createParallelWorkReleaseFixture(prefix) {
   fs.copyFileSync(
     path.join(productionRoot, 'scripts', 'viventium', 'qa_release_attestation.py'),
     path.join(ownerRepo, 'scripts', 'viventium', 'qa_release_attestation.py'),
+  );
+  fs.copyFileSync(
+    path.join(productionRoot, 'scripts', 'viventium', 'helper_artifact_verify.py'),
+    path.join(ownerRepo, 'scripts', 'viventium', 'helper_artifact_verify.py'),
   );
   fs.copyFileSync(
     path.join(productionRoot, 'scripts', 'viventium', 'runtime_owner_command_contract.json'),
@@ -663,11 +668,11 @@ function createParallelWorkReleaseFixture(prefix) {
 | --- | --- |
 | \`TGDOC-010\` | NOT RUN |
 `,
-    'qa/telegram-runtime/cases.md': `## Case TR-014: Source-order race
+    'qa/telegram-runtime/cases.md': `## Case TR-026: Source-order race
 
 - **Last run:** NOT RUN
 `,
-    'qa/modern-playground-voice/cases.md': `## MPV-054: Trusted Wing Worker control
+    'qa/modern-playground-voice/cases.md': `## MPV-061: Trusted Wing Worker control
 
 - **Last run:** NOT RUN
 `,
@@ -813,11 +818,11 @@ function createParallelWorkReleaseFixture(prefix) {
     return [
       ['EMO-UC-047', 'qa/emotional-cortex/cases.md'],
       ['EMO-UC-048', 'qa/emotional-cortex/cases.md'],
-      ['MPV-054', 'qa/modern-playground-voice/cases.md'],
+      ['MPV-061', 'qa/modern-playground-voice/cases.md'],
       ['PWK-UC-014', 'qa/parallel-orchestrator/cases.md'],
       ['REL-UC-004', 'qa/release-readiness/cases.md'],
       ['TGDOC-010', 'qa/telegram-document-attachments/cases.md'],
-      ['TR-014', 'qa/telegram-runtime/cases.md'],
+      ['TR-026', 'qa/telegram-runtime/cases.md'],
     ].map(([case_id, source]) => ({ case_id, status: 'PASS', source, detail: '[redacted]' }));
   }
 
@@ -1039,6 +1044,7 @@ function createParallelWorkReleaseFixture(prefix) {
       exposure_allowed: true,
       local_qa_override: false,
       source_defaults_dark: true,
+      source_defaults_valid: true,
       gate_count: validGates().length,
       open_gate_count: 0,
       gates: validGates(),
@@ -1081,7 +1087,7 @@ function createParallelWorkReleaseFixture(prefix) {
           candidateDigest,
           artifactDigest,
           evidenceDigest: sha256(`fixture:${gate.case_id}`),
-          surface: gate.case_id === 'MPV-054' ? 'voice' : 'telegram',
+          surface: gate.case_id === 'MPV-061' ? 'voice' : 'telegram',
           status: 'PASS',
           ownerBindingSha256: stableReceiptOwnerBinding(ownerBinding),
           receiptNonce: crypto.randomBytes(16).toString('hex'),

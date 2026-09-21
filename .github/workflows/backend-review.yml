@@ -173,6 +173,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
+      # The Telegram, scheduling, and orchestration suites exceed a 6 GiB V8 heap
+      # when each complete file runs in one worker. Keep all tests enabled.
+      NODE_OPTIONS: '--max-old-space-size=12288'
       VIVENTIUM_TEST_PRODUCTION_ROOT: ${{ github.workspace }}/parent-viventium
       MONGO_URI: ${{ secrets.MONGO_URI }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -197,7 +200,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ProjectViventium/GlassHive
-          ref: codex/public-main-glasshive-sanitized
           path: parent-viventium/viventium_v0_4/GlassHive
       # VIVENTIUM END
 

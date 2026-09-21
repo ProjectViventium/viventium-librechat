@@ -193,6 +193,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ProjectViventium/viventium
+          ref: ${{ vars.VIVENTIUM_PARENT_CI_REF || 'main' }}
           path: parent-viventium
       - uses: actions/checkout@v4
         with:

@@ -888,6 +888,11 @@ jest.mock('../GlassHiveOrchestrationReadinessService', () => ({
   }),
 }));
 
+afterAll(() => {
+  ownerProcess.kill();
+  fs.rmSync(releaseRoot, { recursive: true, force: true });
+});
+
 describe('ViventiumOrchestrationMode', () => {
   beforeEach(() => {
     jest.resetModules();
@@ -908,8 +913,6 @@ describe('ViventiumOrchestrationMode', () => {
 
   afterAll(() => {
     process.env = ORIGINAL_ENV;
-    ownerProcess.kill();
-    fs.rmSync(releaseRoot, { recursive: true, force: true });
   });
 
   test('new accounts use automatic work while an explicit focused preference survives', () => {

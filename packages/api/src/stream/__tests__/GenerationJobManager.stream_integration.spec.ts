@@ -94,13 +94,22 @@ describe('GenerationJobManager Integration Tests', () => {
     process.env.REDIS_KEY_PREFIX = testPrefix;
 
     await resetStreamModules();
-    const candidate = new IoRedis(process.env.REDIS_URI, {
+    const redisOptions = {
       keyPrefix: `${testPrefix}::`,
       lazyConnect: true,
       connectTimeout: 1000,
       enableOfflineQueue: true,
       maxRetriesPerRequest: 3,
-    });
+    };
+    const candidate = process.env.USE_REDIS_CLUSTER === 'true'
+      ? new IoRedis.Cluster(
+          process.env.REDIS_URI.split(',').map((entry) => {
+            const url = new URL(entry);
+            return { host: url.hostname, port: Number(url.port) || 6379 };
+          }),
+          { redisOptions, lazyConnect: true },
+        )
+      : new IoRedis(process.env.REDIS_URI, redisOptions);
     candidate.on('error', () => {});
     try {
       await candidate.connect();

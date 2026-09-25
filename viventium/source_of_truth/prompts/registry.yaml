@@ -43,19 +43,19 @@ related_config:
     worker.host_harness_composition:
       title: Host Worker Harness Frame
       summary: The host file producer consumes the registered frame with current operating, capability, completion and safety text in the existing order.
-      path: viventium_v0_4/GlassHive/runtime_phase1/src/workers_projects_runtime/profile_runtime.py
+      path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/profile_runtime.py
       selector: _host_harness_prompt
       source: worker.compiled_prompt_contract
     worker.compiled_bootstrap:
-      title: GlassHive Compiled Worker Instructions
-      summary: Managed Viventium loads the required compiled worker sources; standalone GlassHive retains its explicit compatibility defaults.
-      path: viventium_v0_4/GlassHive/runtime_phase1/src/workers_projects_runtime/bootstrap.py
+      title: xPerfect Compiled Worker Instructions
+      summary: Managed Viventium loads the required compiled worker sources; standalone xPerfect retains its explicit compatibility defaults.
+      path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/bootstrap.py
       selector: _worker_prompt
       source: worker.compiled_prompt_contract
     worker.native_composition:
       title: Host And Sandbox Worker Composition
       summary: Existing harness, project and run instruction producers consume the same resolved completion and capability text.
-      path: viventium_v0_4/GlassHive/runtime_phase1/src/workers_projects_runtime/profile_runtime.py
+      path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/profile_runtime.py
       selector: _instruction_with_completion_contract
       source: worker.compiled_prompt_contract
     feelings.numeric_kernel:

@@ -676,7 +676,7 @@ endpoints:
     iconURL: /assets/logo.svg
     providerCapabilities:
       glasshive-harness:
-        label: GlassHive
+        label: xPerfect
         main_chat: true
         cortex_execution: true
         phase_b_followup: true
@@ -818,7 +818,7 @@ endpoints:
       titleEndpoint: openAI
       titleModel: gpt-5.6-terra
       summarize: false
-      modelDisplayLabel: GlassHive
+      modelDisplayLabel: xPerfect
       dropParams:
         - stop
         - temperature

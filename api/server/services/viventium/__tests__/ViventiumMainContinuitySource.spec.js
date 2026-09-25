@@ -6,15 +6,11 @@ jest.mock('@librechat/api', () => ({
   createMainContinuityService: (dependencies) => dependencies,
 }));
 jest.mock('@librechat/data-schemas', () => ({ logger: { warn: jest.fn() } }));
-jest.mock(
-  '~/db/models',
-  () => ({
-    Message: { find: (...args) => mockMessageFind(...args) },
-    Conversation: { find: (...args) => mockConversationFind(...args) },
-    ViventiumMainContinuityState: {},
-  }),
-  { virtual: true },
-);
+jest.mock('~/db/models', () => ({
+  Message: { find: (...args) => mockMessageFind(...args) },
+  Conversation: { find: (...args) => mockConversationFind(...args) },
+  ViventiumMainContinuityState: {},
+}));
 
 const { loadPresentations } = require('../ViventiumMainContinuityService');
 

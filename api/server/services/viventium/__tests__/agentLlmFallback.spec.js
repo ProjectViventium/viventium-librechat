@@ -558,6 +558,19 @@ describe('agentLlmFallback', () => {
     ).toBe(false);
   });
 
+  test('never retries a missing old Main source through a fallback model', () => {
+    expect(
+      shouldRetryWithFallback([
+        {
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]:
+            'The conversation context could not be preserved. Please retry this turn.',
+          error_class: 'source_context_unavailable',
+        },
+      ]),
+    ).toBe(false);
+  });
+
   test('retries wrapped provider authentication errors that begin with an HTTP status', () => {
     expect(
       shouldRetryWithFallback([

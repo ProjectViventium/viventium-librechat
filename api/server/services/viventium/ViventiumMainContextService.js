@@ -7,6 +7,7 @@
  * === VIVENTIUM END === */
 
 const crypto = require('crypto');
+const { Constants } = require('librechat-data-provider');
 const { getTrustedInteractionContext } = require('./interactionContext');
 
 const SNAPSHOT_SLOT = '_viventiumMainContextSnapshotV1';
@@ -282,16 +283,161 @@ function messageManifest(messages = []) {
   });
 }
 
-function visibleMessageChain(messages = []) {
-  const chain = (Array.isArray(messages) ? messages : [])
+function unreconciledSourceError() {
+  const error = new Error('Prior accepted Main history cannot be carried intact.');
+  error.code = 'source_context_unavailable';
+  error.status = 413;
+  return error;
+}
+
+function hasCoreMainContextStamp(message) {
+  const stamp = message?.metadata?.viventium?.mainContext;
+  return (
+    stamp?.version === 1 &&
+    ['continuityDomainId', 'contextEpoch', 'stableAuthoritySha256', 'snapshotSha256'].every((key) =>
+      /^[a-f0-9]{64}$/.test(String(stamp?.[key] || '')),
+    ) &&
+    typeof stamp.agentId === 'string' &&
+    Boolean(stamp.agentId)
+  );
+}
+
+function traceMainHistoryAncestry({
+  messages,
+  headId,
+  ownerId = '',
+  conversationId = '',
+  isSkippable,
+} = {}) {
+  const rows = new Map();
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const id = String(message?.messageId || '');
+    if (!id) continue;
+    if (rows.has(id)) rows.set(id, null);
+    else rows.set(id, message);
+  }
+  const selected = [];
+  const selectedRows = [];
+  const skipped = [];
+  const seen = new Set();
+  const head = String(headId || '');
+  let cursor = head;
+  while (cursor && cursor !== Constants.NO_PARENT) {
+    if (seen.has(cursor)) return Object.freeze({ complete: false, reason: 'cycle' });
+    seen.add(cursor);
+    const message = rows.get(cursor);
+    if (!message) return Object.freeze({ complete: false, reason: 'missing_or_duplicate' });
+    if (ownerId && String(message.user || '') !== String(ownerId))
+      return Object.freeze({ complete: false, reason: 'foreign_owner' });
+    if (conversationId && String(message.conversationId || '') !== String(conversationId))
+      return Object.freeze({ complete: false, reason: 'foreign_conversation' });
+    selected.push(cursor);
+    selectedRows.push(message);
+    if (isSkippable?.(message)) skipped.push(cursor);
+    cursor = String(message.parentMessageId || '');
+  }
+  return Object.freeze({
+    complete: true,
+    ownerId: String(ownerId || ''),
+    conversationId: String(conversationId || ''),
+    headId: head,
+    messageIds: Object.freeze(selected.reverse()),
+    parentLinks: Object.freeze(
+      selectedRows.map((message) =>
+        Object.freeze({
+          id: String(message.messageId),
+          parentId: String(message.parentMessageId || ''),
+        }),
+      ),
+    ),
+    skippedMessageIds: Object.freeze(skipped),
+    hasUnreconciledSource:
+      selectedRows.some(
+        (message) => message.isCreatedByUser === false && !hasCoreMainContextStamp(message),
+      ) ||
+      (selectedRows.every((message) => message.isCreatedByUser !== false) &&
+        selectedRows.length > 0),
+  });
+}
+
+function assertMainHistoryAncestry(ownerId, conversationId, visibleMessages, proof, protect) {
+  if (proof?.complete === false) throw unreconciledSourceError();
+  const visible = (Array.isArray(visibleMessages) ? visibleMessages : []).filter(
+    (message) =>
+      message?.messageId &&
+      !['system', 'developer'].includes(String(message?.role || '').toLowerCase()),
+  );
+  if (!visible.length) {
+    if (protect) throw unreconciledSourceError();
+    return;
+  }
+  if (proof?.complete === true) {
+    if (
+      (proof.ownerId && proof.ownerId !== ownerId) ||
+      (proof.conversationId && proof.conversationId !== conversationId)
+    )
+      throw unreconciledSourceError();
+    if (protect) {
+      if (
+        !Array.isArray(proof.messageIds) ||
+        !Array.isArray(proof.skippedMessageIds) ||
+        !Array.isArray(proof.parentLinks)
+      )
+        throw unreconciledSourceError();
+      const visibleById = new Map(visible.map((message) => [String(message.messageId), message]));
+      const accounted = new Set([...visibleById.keys(), ...proof.skippedMessageIds]);
+      if (!proof.messageIds.every((id) => accounted.has(id))) throw unreconciledSourceError();
+      const selectedIds = new Set(proof.messageIds);
+      if (visible.slice(0, -1).some((message) => !selectedIds.has(String(message.messageId))))
+        throw unreconciledSourceError();
+      if (
+        proof.parentLinks.some(
+          ({ id, parentId }) =>
+            visibleById.has(id) && String(visibleById.get(id).parentMessageId || '') !== parentId,
+        )
+      )
+        throw unreconciledSourceError();
+    }
+    return;
+  }
+  // Without a raw-history proof, only history being carried as accepted Main context must be a
+  // complete chain; an ordinary snapshot may hold just the current turn.
+  if (!protect) return;
+  const result = traceMainHistoryAncestry({
+    messages: visible,
+    headId: visible.at(-1).messageId,
+  });
+  if (!result.complete) throw unreconciledSourceError();
+}
+
+function hasUnreconciledMainHistory(messages) {
+  if (!Array.isArray(messages)) return false;
+  const prior = messages.slice(0, -1).filter((message) => {
+    const role = String(
+      message?.role || (message?.isCreatedByUser === true ? 'user' : 'assistant'),
+    ).toLowerCase();
+    return message?.messageId && !['system', 'developer'].includes(role);
+  });
+  const answers = prior.filter(
+    (message) =>
+      String(
+        message?.role || (message?.isCreatedByUser === true ? 'user' : 'assistant'),
+      ).toLowerCase() === 'assistant',
+  );
+  // Core stamps accepted answers, not the user rows that led to them.
+  const candidates = answers.length ? answers : prior;
+  return candidates.some((message) => !hasCoreMainContextStamp(message));
+}
+
+function visibleMessageChain(messages = [], protectUnreconciledHistory = false) {
+  const source = (Array.isArray(messages) ? messages : [])
     .filter((message) => {
       const role = String(
         message?.role || (message?.isCreatedByUser === true ? 'user' : 'assistant'),
       ).toLowerCase();
       return message?.messageId && role !== 'system' && role !== 'developer';
     })
-    .slice(-128)
-    .map((message) => {
+    .map((message, index, visible) => {
       const text = contentText(message?.content ?? message?.text);
       return Object.freeze({
         id: String(message.messageId).slice(0, 160),
@@ -301,16 +447,104 @@ function visibleMessageChain(messages = []) {
         ).slice(0, 24),
         bytes: Buffer.byteLength(text, 'utf8'),
         sha256: crypto.createHash('sha256').update(text, 'utf8').digest('hex'),
+        ...(protectUnreconciledHistory && index < visible.length - 1
+          ? { accepted_source: true }
+          : {}),
       });
     });
+  const originalIds = (Array.isArray(messages) ? messages : [])
+    .filter(
+      (message) =>
+        message?.messageId &&
+        !['system', 'developer'].includes(String(message?.role || '').toLowerCase()),
+    )
+    .map((message) => String(message.messageId));
+  if (
+    protectUnreconciledHistory &&
+    (source.length > 128 ||
+      (source.length > 1 && source.at(-1)?.role !== 'user') ||
+      originalIds.some((id) => id.length > 160) ||
+      (Array.isArray(messages) ? messages : []).some(
+        (message) => String(message?.parentMessageId || '').length > 160,
+      ) ||
+      new Set(originalIds).size !== originalIds.length)
+  ) {
+    throw unreconciledSourceError();
+  }
+  const chain = source.slice(-128);
   while (
     chain.length > 1 &&
     Buffer.byteLength(Buffer.from(JSON.stringify(chain), 'utf8').toString('base64'), 'utf8') >
       VISIBLE_MESSAGE_CHAIN_MAX_ENCODED_BYTES
   ) {
+    if (protectUnreconciledHistory) throw unreconciledSourceError();
     chain.shift();
   }
   return chain;
+}
+
+function assertUnreconciledHistoryCarrier(
+  ownerId,
+  conversationId,
+  visibleMessages,
+  finalMessages,
+  chain,
+) {
+  if (chain.length < 2) return;
+  const originals = visibleMessages.filter(
+    (message) =>
+      message?.messageId &&
+      !['system', 'developer'].includes(String(message.role || '').toLowerCase()),
+  );
+  const final = Array.isArray(finalMessages) ? finalMessages : [];
+  let position = 0;
+  for (let index = 0; index < chain.length - 1; index += 1) {
+    const source = originals[index];
+    const expected = chain[index];
+    const sourceText = contentText(source?.content ?? source?.text);
+    if (
+      String(source?.user || '') !== ownerId ||
+      String(source?.conversationId || '') !== conversationId ||
+      source?.deletedAt != null ||
+      source?.error === true ||
+      source?.unfinished === true ||
+      source?.metadata?.viventium?.visibility === 'internal' ||
+      (typeof source?.text === 'string' &&
+        source.text.trim() &&
+        !sourceText.includes(source.text.trim())) ||
+      (expected.role === 'user' && source?.isCreatedByUser !== true) ||
+      (expected.role === 'assistant' && source?.isCreatedByUser !== false) ||
+      !['user', 'assistant'].includes(expected.role)
+    )
+      throw unreconciledSourceError();
+    const matched = final.findIndex((message, candidate) => {
+      const role = String(message?.role || message?._getType?.() || '').toLowerCase();
+      const normalizedRole = role === 'human' ? 'user' : role === 'ai' ? 'assistant' : role;
+      const text = contentText(message?.content ?? message?.text);
+      // Provider formatting removes Mongo message IDs. Match the complete ordered text and
+      // role sequence here; the source rows themselves are checked against the owner and branch.
+      return (
+        candidate >= position &&
+        normalizedRole === expected.role &&
+        crypto.createHash('sha256').update(text, 'utf8').digest('hex') === expected.sha256
+      );
+    });
+    if (matched < 0) throw unreconciledSourceError();
+    position = matched + 1;
+  }
+  const current = chain.at(-1);
+  if (
+    !final.some((message, index) => {
+      const role = String(message?.role || message?._getType?.() || '').toLowerCase();
+      const text = contentText(message?.content ?? message?.text);
+      return (
+        index >= position &&
+        (role === 'human' ? 'user' : role) === 'user' &&
+        crypto.createHash('sha256').update(text, 'utf8').digest('hex') === current.sha256
+      );
+    })
+  )
+    throw unreconciledSourceError();
 }
 
 function stableAuthorityDigest(agent) {
@@ -335,6 +569,8 @@ function captureMainContextSnapshot(
     attemptState = {},
     routeFacts = {},
     feelingsReceipt,
+    protectUnreconciledHistory = false,
+    historyAncestry,
   } = {},
 ) {
   if (!req || typeof req !== 'object') return null;
@@ -343,6 +579,13 @@ function captureMainContextSnapshot(
   const ownerId = String(req.user?.id || '');
   const agentId = String(agent?.id || '');
   const stableAuthoritySha256 = stableAuthorityDigest(agent);
+  assertMainHistoryAncestry(
+    ownerId,
+    String(interaction.conversation_id || req.body?.conversationId || ''),
+    visibleMessages,
+    historyAncestry,
+    protectUnreconciledHistory,
+  );
   const sectionManifest = Object.fromEntries(
     Object.entries(sections)
       .filter(([, value]) => typeof value === 'string' && value.length > 0)
@@ -373,9 +616,20 @@ function captureMainContextSnapshot(
     stableAuthoritySha256,
     capabilityFingerprint: digest({ tools: agent?.tools || [], mcp: agent?.mcp || [] }),
     messages: Object.freeze(messageManifest(messages)),
-    visibleMessageChain: Object.freeze(visibleMessageChain(visibleMessages)),
+    visibleMessageChain: Object.freeze(
+      visibleMessageChain(visibleMessages, protectUnreconciledHistory),
+    ),
     sections: Object.freeze(sectionManifest),
   };
+  if (protectUnreconciledHistory) {
+    assertUnreconciledHistoryCarrier(
+      ownerId,
+      body.conversationId,
+      visibleMessages,
+      messages,
+      body.visibleMessageChain,
+    );
+  }
   const snapshot = {
     ...body,
     snapshotSha256: digest(body),
@@ -697,6 +951,8 @@ module.exports = {
   createMainAttemptFacts,
   getMainContextAttemptState,
   getMainContextSnapshot,
+  hasUnreconciledMainHistory,
+  traceMainHistoryAncestry,
   renderMainAttemptFactsAuthorityBlock,
   mainRouteTargetForAgent,
   stableAuthorityDigest,

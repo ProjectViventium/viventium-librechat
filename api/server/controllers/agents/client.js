@@ -167,6 +167,7 @@ const {
   bindMainContextSnapshot,
   buildMainAttemptFactsForAgent,
   captureMainContextSnapshot,
+  hasUnreconciledMainHistory,
   mainRouteTargetForAgent,
   renderMainAttemptFactsAuthorityBlock,
   stableAuthorityDigest,
@@ -8462,6 +8463,12 @@ class AgentClient extends BaseClient {
             agent: agents[0],
             messages,
             visibleMessages: this._viventiumVisibleMessagesV1,
+            historyAncestry: this._viventiumHistoryAncestryV1,
+            protectUnreconciledHistory:
+              (acceptedMainContext.status === 'empty' &&
+                this._viventiumVisibleMessagesV1?.length > 1) ||
+              this._viventiumHistoryAncestryV1?.hasUnreconciledSource === true ||
+              hasUnreconciledMainHistory(this._viventiumVisibleMessagesV1),
             sections: {
               finalPrimaryInstructions: agents[0]?.instructions || '',
               telegramReplyContext: surfacePromptLayers.telegram_reply_context || '',

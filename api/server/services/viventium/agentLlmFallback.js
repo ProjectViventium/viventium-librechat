@@ -27,6 +27,7 @@ const NON_RETRYABLE_FALLBACK_ERROR_CLASSES = new Set([
   'missing_tool_auth',
   'tool_auth_required',
   'provider_response_deadline_exceeded',
+  'source_context_unavailable',
 ]);
 const RECOVERABLE_PROVIDER_CONNECTION_CODES = new Set([
   'ECONNABORTED',

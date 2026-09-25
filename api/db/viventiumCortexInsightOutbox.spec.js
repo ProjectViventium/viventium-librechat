@@ -179,6 +179,7 @@ describe('Viventium completed Cortex insight outbox', () => {
       surface: 'web',
       streamId: 'stream-overdue',
       messageRevision: 1,
+      nextAttemptAt: currentTime,
       retentionAlertAt: new Date('2026-09-22T12:00:00.000Z'),
     });
     const warn = jest.spyOn(logger, 'warn').mockImplementation(() => {});

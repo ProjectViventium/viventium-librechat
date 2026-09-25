@@ -400,6 +400,9 @@ function assertMainHistoryAncestry(ownerId, conversationId, visibleMessages, pro
     }
     return;
   }
+  // Without a raw-history proof, only history being carried as accepted Main context must be a
+  // complete chain; an ordinary snapshot may hold just the current turn.
+  if (!protect) return;
   const result = traceMainHistoryAncestry({
     messages: visible,
     headId: visible.at(-1).messageId,

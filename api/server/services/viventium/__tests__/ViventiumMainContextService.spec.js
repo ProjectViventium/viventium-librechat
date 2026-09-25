@@ -5,6 +5,7 @@ const {
   buildMainAttemptFactsForAgent,
   captureMainContextSnapshot,
   createMainAttemptFacts,
+  hasUnreconciledMainHistory,
   renderMainAttemptFactsAuthorityBlock,
 } = require('../ViventiumMainContextService');
 const { applyTimeContextDelivery } = require('../surfacePrompts');
@@ -476,7 +477,7 @@ describe('ViventiumMainContextService', () => {
       visibleMessages: [
         {
           messageId: 'user-message-1',
-          parentMessageId: 'assistant-message-0',
+          parentMessageId: '',
           isCreatedByUser: true,
           text: 'private-content',
         },
@@ -501,7 +502,7 @@ describe('ViventiumMainContextService', () => {
     expect(visibleChain).toEqual([
       expect.objectContaining({
         id: 'user-message-1',
-        parentId: 'assistant-message-0',
+        parentId: '',
         role: 'user',
         sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       }),
@@ -1159,5 +1160,276 @@ describe('ViventiumMainContextService', () => {
     ).toBe(true);
     expect(primary.instructions).toBe(`Stable Main policy.\n\n${turnContext}\n\n${authority}`);
     expect(requestBody).not.toHaveProperty('viventiumGlassHiveTurnContextB64');
+  });
+
+  test('protects an unstamped accepted Mongo branch on its first Core-owned V1 turn', () => {
+    const req = { user: { id: 'owner-legacy' }, body: { conversationId: 'conversation-legacy' } };
+    const primary = agent();
+    primary.provider = 'glasshive-harness';
+    primary.model = 'codex-cli:gpt-5.6-sol';
+    const history = [
+      {
+        messageId: 'old-user',
+        parentMessageId: '',
+        role: 'user',
+        isCreatedByUser: true,
+        content: 'Retain this prior decision.',
+        user: 'owner-legacy',
+        conversationId: 'conversation-legacy',
+      },
+      {
+        messageId: 'old-answer',
+        parentMessageId: 'old-user',
+        role: 'assistant',
+        isCreatedByUser: false,
+        content: 'Wait for approval.',
+        user: 'owner-legacy',
+        conversationId: 'conversation-legacy',
+      },
+      { messageId: 'new-user', parentMessageId: 'old-answer', role: 'user', content: 'What next?' },
+    ];
+    const snapshot = captureMainContextSnapshot(req, {
+      agent: primary,
+      messages: history,
+      visibleMessages: history,
+      routeFacts: { primary: { provider: primary.provider, model: primary.model } },
+      protectUnreconciledHistory: true,
+    });
+    expect(snapshot.routeFacts.primary).toMatchObject({
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-5.6-sol',
+    });
+    expect(bindMainContextSnapshot(primary, snapshot)).toBe(true);
+    const headers = primary.model_parameters.configuration.defaultHeaders;
+    expect(headers['X-Viventium-Main-Context-Owner']).toBe('core');
+    const chain = JSON.parse(
+      Buffer.from(headers['X-Viventium-Visible-Message-Chain-B64'], 'base64'),
+    );
+    expect(chain.map(({ id, accepted_source }) => [id, accepted_source === true])).toEqual([
+      ['old-user', true],
+      ['old-answer', true],
+      ['new-user', false],
+    ]);
+  });
+
+  test('keeps protecting old history after a new Core-stamped turn and reload', () => {
+    const stamped = {
+      version: 1,
+      agentId: 'main-agent',
+      continuityDomainId: 'a'.repeat(64),
+      contextEpoch: 'a'.repeat(64),
+      stableAuthoritySha256: 'a'.repeat(64),
+      snapshotSha256: 'b'.repeat(64),
+    };
+    const branch = [
+      { messageId: 'old-user', isCreatedByUser: true },
+      { messageId: 'old-answer', isCreatedByUser: false },
+      {
+        messageId: 'new-user-1',
+        isCreatedByUser: true,
+        metadata: { viventium: { mainContext: stamped } },
+      },
+      {
+        messageId: 'new-answer-1',
+        isCreatedByUser: false,
+        metadata: { viventium: { mainContext: stamped } },
+      },
+      { messageId: 'new-user-2', isCreatedByUser: true },
+    ];
+    expect(hasUnreconciledMainHistory(branch)).toBe(true);
+    expect(hasUnreconciledMainHistory(branch.slice(2))).toBe(false);
+    expect(hasUnreconciledMainHistory(branch.slice(-1))).toBe(false);
+  });
+
+  test('rejects a pruned unstamped prior turn before claiming Core-owned V1', () => {
+    const history = [
+      {
+        messageId: 'old-user',
+        role: 'user',
+        isCreatedByUser: true,
+        content: 'Material prior fact.',
+        user: 'owner-legacy',
+        conversationId: 'conversation-legacy',
+      },
+      {
+        messageId: 'old-answer',
+        role: 'assistant',
+        isCreatedByUser: false,
+        content: 'Approved only after review.',
+        user: 'owner-legacy',
+        conversationId: 'conversation-legacy',
+      },
+      { messageId: 'new-user', role: 'user', content: 'Continue.' },
+    ];
+    expect(() =>
+      captureMainContextSnapshot(
+        { user: { id: 'owner-legacy' }, body: { conversationId: 'conversation-legacy' } },
+        {
+          agent: agent(),
+          visibleMessages: history,
+          messages: history.slice(1),
+          protectUnreconciledHistory: true,
+        },
+      ),
+    ).toThrow(expect.objectContaining({ code: 'source_context_unavailable', status: 413 }));
+  });
+
+  test('rejects a protected old branch when no visible source reaches the snapshot', () => {
+    expect(() =>
+      captureMainContextSnapshot(
+        { user: { id: 'owner-legacy' }, body: { conversationId: 'conversation-legacy' } },
+        { agent: agent(), visibleMessages: [], messages: [], protectUnreconciledHistory: true },
+      ),
+    ).toThrow(expect.objectContaining({ code: 'source_context_unavailable', status: 413 }));
+  });
+
+  test('does not let repeated current text impersonate a missing old source', () => {
+    const history = [
+      {
+        messageId: 'old-user',
+        role: 'user',
+        isCreatedByUser: true,
+        user: 'owner-legacy',
+        conversationId: 'conversation-legacy',
+        content: 'Repeat.',
+      },
+      { messageId: 'new-user', role: 'user', isCreatedByUser: true, content: 'Repeat.' },
+    ];
+    expect(() =>
+      captureMainContextSnapshot(
+        { user: { id: 'owner-legacy' }, body: { conversationId: 'conversation-legacy' } },
+        {
+          agent: agent(),
+          visibleMessages: history,
+          messages: history.slice(1),
+          protectUnreconciledHistory: true,
+        },
+      ),
+    ).toThrow(expect.objectContaining({ code: 'source_context_unavailable', status: 413 }));
+  });
+
+  test('rejects an unstamped branch beyond the bounded identity carrier', () => {
+    const history = Array.from({ length: 129 }, (_, index) => ({
+      messageId: `message-${index}`,
+      role: index % 2 ? 'assistant' : 'user',
+      isCreatedByUser: index % 2 === 0,
+      user: 'owner-legacy',
+      conversationId: 'conversation-legacy',
+      content: `Synthetic accepted message ${index}`,
+    }));
+    expect(() =>
+      captureMainContextSnapshot(
+        { user: { id: 'owner-legacy' }, body: { conversationId: 'conversation-legacy' } },
+        {
+          agent: agent(),
+          visibleMessages: history,
+          messages: history,
+          protectUnreconciledHistory: true,
+        },
+      ),
+    ).toThrow(expect.objectContaining({ code: 'source_context_unavailable', status: 413 }));
+  });
+
+  test('rejects ambiguous old message identity before publishing protected sources', () => {
+    const history = [
+      {
+        messageId: 'same',
+        role: 'user',
+        isCreatedByUser: true,
+        user: 'owner-legacy',
+        conversationId: 'conversation-legacy',
+        content: 'First.',
+      },
+      {
+        messageId: 'same',
+        role: 'assistant',
+        isCreatedByUser: false,
+        user: 'owner-legacy',
+        conversationId: 'conversation-legacy',
+        content: 'Second.',
+      },
+      { messageId: 'current', role: 'user', content: 'Continue.' },
+    ];
+    expect(() =>
+      captureMainContextSnapshot(
+        { user: { id: 'owner-legacy' }, body: { conversationId: 'conversation-legacy' } },
+        {
+          agent: agent(),
+          visibleMessages: history,
+          messages: history,
+          protectUnreconciledHistory: true,
+        },
+      ),
+    ).toThrow(expect.objectContaining({ code: 'source_context_unavailable', status: 413 }));
+  });
+
+  test.each([
+    ['foreign owner', { user: 'other-owner' }],
+    ['foreign conversation', { conversationId: 'other-conversation' }],
+    ['unfinished answer', { unfinished: true }],
+    ['internal answer', { metadata: { viventium: { visibility: 'internal' } } }],
+    ['visible text missing from content', { text: 'Prior answer.', content: [] }],
+  ])('refuses %s as old accepted Main evidence', (_case, altered) => {
+    const prior = {
+      user: 'owner-legacy',
+      conversationId: 'conversation-legacy',
+      messageId: 'old-answer',
+      role: 'assistant',
+      isCreatedByUser: false,
+      content: 'Prior answer.',
+      ...altered,
+    };
+    const history = [prior, { messageId: 'new-user', role: 'user', content: 'Continue.' }];
+    expect(() =>
+      captureMainContextSnapshot(
+        { user: { id: 'owner-legacy' }, body: { conversationId: 'conversation-legacy' } },
+        {
+          agent: agent(),
+          visibleMessages: history,
+          messages: history,
+          protectUnreconciledHistory: true,
+        },
+      ),
+    ).toThrow(expect.objectContaining({ code: 'source_context_unavailable', status: 413 }));
+  });
+
+  test('reloaded Core snapshot preserves the same exact old branch and route', () => {
+    const history = [
+      {
+        user: 'owner-legacy',
+        conversationId: 'conversation-legacy',
+        messageId: 'old-user',
+        role: 'user',
+        isCreatedByUser: true,
+        content: 'Keep the option open.',
+      },
+      {
+        user: 'owner-legacy',
+        conversationId: 'conversation-legacy',
+        messageId: 'old-answer',
+        role: 'assistant',
+        isCreatedByUser: false,
+        content: 'Approval remains pending.',
+      },
+      { messageId: 'new-user', role: 'user', content: 'Continue.' },
+    ];
+    const capture = () =>
+      captureMainContextSnapshot(
+        { user: { id: 'owner-legacy' }, body: { conversationId: 'conversation-legacy' } },
+        {
+          agent: agent(),
+          visibleMessages: history,
+          messages: history,
+          routeFacts: {
+            primary: { provider: 'glasshive-harness', model: 'codex-cli:gpt-5.6-sol' },
+          },
+          protectUnreconciledHistory: true,
+        },
+      );
+    const before = capture();
+    const after = capture();
+    expect(after.snapshotSha256).toBe(before.snapshotSha256);
+    expect(after.visibleMessageChain).toEqual(before.visibleMessageChain);
+    expect(after.routeFacts.primary).toEqual(before.routeFacts.primary);
   });
 });

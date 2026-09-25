@@ -13,7 +13,6 @@ jest.mock(
     Conversation: { find: (...args) => mockConversationFind(...args) },
     ViventiumMainContinuityState: {},
   }),
-  { virtual: true },
 );
 
 const { loadPresentations } = require('../ViventiumMainContinuityService');

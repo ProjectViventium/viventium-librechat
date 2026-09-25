@@ -43,6 +43,11 @@ const {
 const {
   isPassiveVoiceTranscriptMessage,
 } = require('~/server/services/viventium/listenOnlyTranscript');
+/* === VIVENTIUM START === Preserve raw Mongo ancestry before legacy traversal can shorten it. === */
+const {
+  traceMainHistoryAncestry,
+} = require('~/server/services/viventium/ViventiumMainContextService');
+/* === VIVENTIUM END === */
 /* === VIVENTIUM START ===
  * Feature: Voice message correlation metadata.
  * Purpose: Normal BaseClient message persistence is the hot path for voice user and
@@ -966,6 +971,17 @@ class BaseClient {
     );
 
     const messages = (await getMessages({ conversationId })) ?? [];
+    /* === VIVENTIUM START === A missing or cyclic ancestor must remain visible to Main V1 admission. === */
+    if (this.clientName === EModelEndpoint.agents) {
+      this._viventiumHistoryAncestryV1 = traceMainHistoryAncestry({
+        messages,
+        headId: parentMessageId,
+        ownerId: this.user,
+        conversationId,
+        isSkippable: isPassiveVoiceTranscriptMessage,
+      });
+    }
+    /* === VIVENTIUM END === */
 
     /* === VIVENTIUM START === Freeze authored parent evidence before mapping or file hydration. === */
     const sourceParent = messages.find((message) => message.messageId === sourceParentMessageId);

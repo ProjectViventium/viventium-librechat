@@ -202,6 +202,25 @@ jobs:
         with:
           repository: ProjectViventium/GlassHive
           path: parent-viventium/viventium_v0_4/GlassHive
+      # The parent release manifest names its worker-harness component by its locked path.
+      - name: Resolve the parent-locked xPerfect component
+        id: xperfect
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          lock = json.load(open('parent-viventium/components.lock.json', encoding='utf-8'))
+          component = next(item for item in lock['components'] if item['name'] == 'xPerfect')
+          origin = component['origin']
+          repository = origin.removeprefix('https://github.com/').removesuffix('.git')
+          print(f"repository={repository}")
+          print(f"ref={component['ref']}")
+          print(f"path={component['path']}")
+          PY
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.xperfect.outputs.repository }}
+          ref: ${{ steps.xperfect.outputs.ref }}
+          path: parent-viventium/${{ steps.xperfect.outputs.path }}
       # VIVENTIUM END
 
       # VIVENTIUM START — exact release toolchain.

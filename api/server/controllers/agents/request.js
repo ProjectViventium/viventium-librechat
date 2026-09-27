@@ -243,6 +243,17 @@ function acceptedInteractionSourceId(req) {
   );
 }
 
+/* === VIVENTIUM START ===
+ * Feature: One user message per accepted interactive input.
+ * Purpose: The accepted input is persisted before initialization under its stable source id; the
+ * send must save the same message rather than a random sibling of it.
+ */
+function acceptedUserMessageId(req) {
+  const accepted = acceptedInteractionInputs.get(req);
+  return accepted?.persisted ? accepted.source.messageId : null;
+}
+/* === VIVENTIUM END === */
+
 async function retainAcceptedInteractionInput(req, { conversationId, text, parentMessageId } = {}) {
   let context = getTrustedInteractionContext(req);
   if (
@@ -1809,7 +1820,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           conversationId,
           parentMessageId,
           abortController: job.abortController,
-          overrideParentMessageId,
+          overrideParentMessageId: overrideParentMessageId ?? acceptedUserMessageId(req),
           isEdited: !!editedContent,
           userMCPAuthMap: result.userMCPAuthMap,
           responseMessageId: editedResponseMessageId,

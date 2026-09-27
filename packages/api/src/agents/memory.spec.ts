@@ -1244,6 +1244,27 @@ describe('Memory snapshot loading', () => {
     expect(methods.getAllUserMemories).toHaveBeenCalledTimes(2);
   });
 
+  it('gates a configured writer route whose per-user key is absent as authentication', () => {
+    const route = { userId: 'no-user-key-owner', provider: 'openai', model: 'memory-model' };
+    clearMemoryWriterHealth(route);
+    const error = new Error(JSON.stringify({ type: 'no_user_key' }));
+    expect(markMemoryWriterFailure({ ...route, error })).toMatchObject({
+      reason: 'auth',
+      errorType: 'provider_auth',
+    });
+    expect(getMemoryWriterHealthGate(route)).toMatchObject({ blocked: true, reason: 'auth' });
+    clearMemoryWriterHealth(route);
+    expect(getMemoryWriterHealthGate(route)).toEqual({ blocked: false });
+  });
+
+  it('keeps an untyped JSON failure out of authentication suppression', () => {
+    const route = { userId: 'other-json-owner', provider: 'openai', model: 'memory-model' };
+    clearMemoryWriterHealth(route);
+    const error = new Error(JSON.stringify({ type: 'invalid_request' }));
+    expect(markMemoryWriterFailure({ ...route, error })).toBeUndefined();
+    expect(getMemoryWriterHealthGate(route)).toEqual({ blocked: false });
+  });
+
   it.each([
     { type: 'provider_access_denied' },
     { error: { code: 'provider_access_denied' } },
@@ -1513,11 +1534,79 @@ describe('Memory snapshot loading', () => {
       memoryTokenMap: { core: 42 },
       memoryRevisionMap: {},
       memoryValueHashMap: {},
+      memoryWriterEffectMap: {},
     });
     expect(methods.getFormattedMemories).toHaveBeenCalledWith({
       userId: 'user-123',
       memories: [],
     });
+  });
+
+  it('carries every automated writer marker the admission check compares', async () => {
+    const effect = { messageId: 'earlier-response', owner: 'writer-a', operationId: 'op-1' };
+    const methods = {
+      setMemory: jest.fn().mockResolvedValue({ ok: true }),
+      deleteMemory: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([]),
+      getAllUserMemoryStates: jest.fn().mockResolvedValue([
+        {
+          key: 'context',
+          value: 'Written by the writer.',
+          tokenCount: 4,
+          __v: 2,
+          writerEffect: effect,
+        },
+        { key: 'core', value: 'Edited in the panel.', tokenCount: 4, __v: 5 },
+        {
+          key: 'moments',
+          value: '',
+          tokenCount: 0,
+          __v: 7,
+          deletedAt: new Date(),
+          writerEffect: { ...effect, operationId: 'op-2' },
+        },
+      ]),
+      getFormattedMemories: jest.fn(async () => ({
+        withKeys: '',
+        withoutKeys: '',
+        totalTokens: 0,
+        memoryTokenMap: {},
+      })),
+    };
+
+    const snapshot = await loadMemorySnapshot({
+      userId: 'user-123',
+      memoryMethods: methods,
+      config: { validKeys: ['context', 'core', 'moments'] },
+    });
+
+    expect(snapshot.memoryRevisionMap).toEqual({ context: 2, core: 5, moments: 7 });
+    expect(snapshot.memoryWriterEffectMap).toEqual({
+      context: effect,
+      moments: { ...effect, operationId: 'op-2' },
+    });
+  });
+
+  it('gives a user without memories empty maps rather than missing ones', async () => {
+    const snapshot = await loadMemorySnapshot({
+      userId: 'user-123',
+      memoryMethods: {
+        setMemory: jest.fn(),
+        deleteMemory: jest.fn(),
+        getAllUserMemories: jest.fn().mockResolvedValue([]),
+        getAllUserMemoryStates: jest.fn().mockResolvedValue([]),
+        getFormattedMemories: jest.fn(async () => ({
+          withKeys: '',
+          withoutKeys: '',
+          totalTokens: 0,
+          memoryTokenMap: {},
+        })),
+      },
+      config: { validKeys: ['context'] },
+    });
+
+    expect(snapshot.memoryRevisionMap).toEqual({});
+    expect(snapshot.memoryWriterEffectMap).toEqual({});
   });
 
   it('derives prompt content and CAS revisions from the same state query', async () => {

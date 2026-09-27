@@ -397,7 +397,13 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     });
     const client = makeClient(Promise.resolve());
 
-    await AgentController(req, makeRes(), jest.fn(), jest.fn(async () => ({ client })), jest.fn());
+    await AgentController(
+      req,
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => ({ client })),
+      jest.fn(),
+    );
     await jest.advanceTimersByTimeAsync(120);
 
     const acceptedSaves = mockSaveMessage.mock.calls.filter(

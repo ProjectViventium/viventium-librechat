@@ -1549,7 +1549,13 @@ describe('Memory snapshot loading', () => {
       deleteMemory: jest.fn(),
       getAllUserMemories: jest.fn().mockResolvedValue([]),
       getAllUserMemoryStates: jest.fn().mockResolvedValue([
-        { key: 'context', value: 'Written by the writer.', tokenCount: 4, __v: 2, writerEffect: effect },
+        {
+          key: 'context',
+          value: 'Written by the writer.',
+          tokenCount: 4,
+          __v: 2,
+          writerEffect: effect,
+        },
         { key: 'core', value: 'Edited in the panel.', tokenCount: 4, __v: 5 },
         {
           key: 'moments',

@@ -3962,6 +3962,26 @@ function memoryWriterRoutes(memoryConfig) {
   return routes;
 }
 
+function memoryWriterHealthNoticeState(attachment) {
+  try {
+    const details = JSON.parse(String(attachment?.[Tools.memory]?.value ?? ''));
+    return details?.healthState?.kind === 'memory_writer_health'
+      ? { errorType: details.errorType, status: details.healthState.status }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function isMemoryWriterHealthNotice(attachment) {
+  return memoryWriterHealthNoticeState(attachment) != null;
+}
+
+function isMemoryWriterRecoveryNotice(attachment) {
+  const notice = memoryWriterHealthNoticeState(attachment);
+  return notice?.status === 'recovered' && notice.errorType === 'writer_recovered';
+}
+
 async function persistMemoryReceipt(writerContext, attachments) {
   const identity = writerContext?.memoryWriteIdentity;
   if (!identity || identity.userId !== String(writerContext.req?.user?.id || '')) return false;
@@ -3972,8 +3992,18 @@ async function persistMemoryReceipt(writerContext, attachments) {
       messageId: identity.messageId,
       conversationId: writerContext.conversationId,
     }));
+  const failed =
+    writerContext.memoryWriterBlocked === true ||
+    receipts.some(
+      (receipt) =>
+        receipt[Tools.memory]?.type === 'error' && !isMemoryWriterRecoveryNotice(receipt),
+    );
   try {
-    return await db.completeMemoryWrite({ ...identity, receipts });
+    return await db.completeMemoryWrite({
+      ...identity,
+      receipts,
+      status: failed ? 'failed' : 'completed',
+    });
   } catch (error) {
     logger.warn(
       '[AgentClient] Memory receipt persistence failed',
@@ -5088,22 +5118,62 @@ class AgentClient extends BaseClient {
     }
   }
 
-  createMemoryWriterStatusAttachment({ message, errorType = 'provider_auth', provider }) {
-    return {
-      type: Tools.memory,
-      messageId: this.responseMessageId + '',
-      conversationId: this.conversationId + '',
-      [Tools.memory]: {
-        type: 'error',
-        key: 'system',
-        value: JSON.stringify({
-          errorType,
-          ...(provider ? { provider } : {}),
-          message,
-        }),
+  createMemoryWriterStatusAttachment({
+    message,
+    errorType = 'provider_auth',
+    provider,
+    healthState,
+    visibleTransition,
+  }) {
+    return bindMemoryWriterVisibleTransition(
+      {
+        type: Tools.memory,
+        messageId: this.responseMessageId + '',
+        conversationId: this.conversationId + '',
+        [Tools.memory]: {
+          type: 'error',
+          key: 'system',
+          value: JSON.stringify({
+            errorType,
+            ...(provider ? { provider } : {}),
+            message,
+            ...(healthState ? { healthState } : {}),
+          }),
+        },
       },
+      visibleTransition,
+    );
+  }
+
+  /* === VIVENTIUM START ===
+   * Feature: One announcing notice per unchanged blocked memory writer route.
+   * Purpose: The first delivered notice for a typed auth/quota block carries the reconnect guidance.
+   * Later blocked turns on the unchanged route carry a compact typed repeat, so a save requested on
+   * any of them is still reported as not saved, and every blocked write records a failed outcome.
+   */
+  memoryWriterHealthBlockedOutcome({ userId, provider, model, healthEntry }) {
+    const errorType =
+      healthEntry.errorType ||
+      (healthEntry.reason === 'quota' ? 'provider_quota_exhausted' : 'provider_auth');
+    const transition = memoryWriterDegradationTransition({ userId, provider, model, healthEntry });
+    const healthState =
+      transition.healthState && !transition.visible
+        ? { ...transition.healthState, repeat: true }
+        : transition.healthState;
+    return {
+      ok: false,
+      healthBlocked: true,
+      healthErrorType: errorType,
+      attachment: this.createMemoryWriterStatusAttachment({
+        message: healthEntry.message,
+        errorType,
+        provider: healthEntry.provider || provider,
+        healthState,
+        visibleTransition: transition.visible ? transition : undefined,
+      }),
     };
   }
+  /* === VIVENTIUM END === */
 
   createMemoryWriterDegradedAttachment({ userId, provider, model, healthEntry }) {
     const transition = memoryWriterDegradationTransition({
@@ -5120,6 +5190,7 @@ class AgentClient extends BaseClient {
       errorType:
         healthEntry.errorType ||
         (healthEntry.reason === 'quota' ? 'provider_quota_exhausted' : 'provider_auth'),
+      provider: healthEntry.provider || provider,
       healthState: transition.healthState,
       visibleTransition: transition,
     });
@@ -5399,6 +5470,7 @@ class AgentClient extends BaseClient {
       };
     }
     let lastAttachment = null;
+    let healthBlocked = null;
     for (const route of routeCandidates) {
       const outcome = await this.initializeMemoryWriterRoute(route, {
         req,
@@ -5423,15 +5495,27 @@ class AgentClient extends BaseClient {
             },
           );
         }
-        return { ok: true, route: this.memoryWriterRoute };
+        return {
+          ok: true,
+          route: this.memoryWriterRoute,
+          recoveryAttachment: outcome.recoveryAttachment,
+        };
       }
       if (outcome?.attachment) {
         lastAttachment = outcome.attachment;
       }
+      if (outcome?.healthBlocked) {
+        healthBlocked = healthBlocked || outcome;
+      }
     }
     return {
       ok: false,
-      attachment: lastAttachment || this.createMemoryWriterUnavailableAttachment(),
+      attachment:
+        lastAttachment ||
+        (healthBlocked ? undefined : this.createMemoryWriterUnavailableAttachment()),
+      ...(healthBlocked
+        ? { healthBlocked: true, healthErrorType: healthBlocked.healthErrorType }
+        : {}),
     };
   }
 
@@ -5510,9 +5594,12 @@ class AgentClient extends BaseClient {
         );
       }
       if (!writerInit?.ok || this.processMemory == null) {
-        const writerFailure = classifyMemoryWriterResult(
-          writerInit?.attachment ? [writerInit.attachment] : undefined,
-        );
+        if (writerInit?.healthBlocked) {
+          writerContext.memoryWriterBlocked = true;
+        }
+        const writerFailure =
+          writerInit?.healthErrorType ||
+          classifyMemoryWriterResult(writerInit?.attachment ? [writerInit.attachment] : undefined);
         void recordMemoryContinuityHealth({
           userId,
           path: 'writer',
@@ -5591,6 +5678,19 @@ class AgentClient extends BaseClient {
           memStart,
           memoryFailure ? `status=error failure=${memoryFailure}` : 'status=ok',
         );
+      }
+      if (result == null) {
+        // The processor already caught its failure; the save still did not happen.
+        return [
+          this.createMemoryWriterStatusAttachment({
+            message:
+              'Saved memory could not be updated after this turn because the memory writer failed.',
+            errorType: 'writer_exception',
+          }),
+        ];
+      }
+      if (writerInit.recoveryAttachment && !memoryFailure) {
+        return [...(Array.isArray(result) ? result : []), writerInit.recoveryAttachment];
       }
       return result;
     } catch (error) {
@@ -9721,16 +9821,12 @@ class AgentClient extends BaseClient {
             },
           );
         }
-        return {
-          ok: false,
-          attachment: this.createMemoryWriterStatusAttachment({
-            message: gate.message,
-            errorType:
-              gate.errorType ||
-              (gate.reason === 'quota' ? 'provider_quota_exhausted' : 'provider_auth'),
-            provider: gate.provider || configuredProvider,
-          }),
-        };
+        return this.memoryWriterHealthBlockedOutcome({
+          userId,
+          provider: configuredProvider,
+          model: configuredModel,
+          healthEntry: gate,
+        });
       }
     }
 
@@ -9854,15 +9950,17 @@ class AgentClient extends BaseClient {
             : undefined,
         },
       );
+      if (healthEntry) {
+        return this.memoryWriterHealthBlockedOutcome({
+          userId,
+          provider: configuredProvider,
+          model: configuredModel,
+          healthEntry,
+        });
+      }
       return {
         ok: false,
-        attachment: healthEntry
-          ? this.createMemoryWriterStatusAttachment({
-              message: healthEntry.message,
-              errorType: healthEntry.errorType,
-              provider: healthEntry.provider || configuredProvider,
-            })
-          : this.createMemoryWriterUnavailableAttachment(undefined, configuredProvider),
+        attachment: this.createMemoryWriterUnavailableAttachment(undefined, configuredProvider),
       };
     }
 
@@ -9908,16 +10006,12 @@ class AgentClient extends BaseClient {
           reason: gate.reason,
         });
       }
-      return {
-        ok: false,
-        attachment: this.createMemoryWriterStatusAttachment({
-          message: gate.message,
-          errorType:
-            gate.errorType ||
-            (gate.reason === 'quota' ? 'provider_quota_exhausted' : 'provider_auth'),
-          provider: gate.provider || configuredProvider,
-        }),
-      };
+      return this.memoryWriterHealthBlockedOutcome({
+        userId,
+        provider: configuredProvider || llmConfig.provider,
+        model: configuredModel || llmConfig.model,
+        healthEntry: gate,
+      });
     }
 
     /** @type {import('@librechat/api').MemoryConfig} */
@@ -10053,20 +10147,31 @@ class AgentClient extends BaseClient {
             : undefined,
         },
       );
+      if (healthEntry) {
+        return this.memoryWriterHealthBlockedOutcome({
+          userId,
+          provider: configuredProvider || llmConfig.provider,
+          model: configuredModel || llmConfig.model,
+          healthEntry,
+        });
+      }
       return {
         ok: false,
-        attachment: healthEntry
-          ? this.createMemoryWriterStatusAttachment({
-              message: healthEntry.message,
-              errorType: healthEntry.errorType,
-              provider: healthEntry.provider || configuredProvider,
-            })
-          : this.createMemoryWriterUnavailableAttachment(undefined, configuredProvider),
+        attachment: this.createMemoryWriterUnavailableAttachment(undefined, configuredProvider),
       };
     }
 
     this.processMemory = processMemory;
-    return { ok: true, provider: llmConfig.provider, model: llmConfig.model };
+    return {
+      ok: true,
+      provider: llmConfig.provider,
+      model: llmConfig.model,
+      recoveryAttachment: this.createMemoryWriterRecoveryAttachment({
+        userId,
+        provider: configuredProvider || llmConfig.provider,
+        model: configuredModel || llmConfig.model,
+      }),
+    };
   }
 
   prepareMemoryWriterBuffer(messages, memoryConfig) {
@@ -10145,20 +10250,27 @@ class AgentClient extends BaseClient {
         attachments = (attachments || []).filter(Boolean);
         if (writerContext.memoryMutationApplied || writerContext.memoryMutationUncertain) {
           attachments = attachments.map((attachment) => {
-            if (attachment[Tools.memory]?.type !== 'error') return attachment;
+            if (
+              attachment[Tools.memory]?.type !== 'error' ||
+              isMemoryWriterHealthNotice(attachment)
+            )
+              return attachment;
             let details = {};
             try {
               details = JSON.parse(attachment[Tools.memory].value || '{}');
             } catch {
               /* Keep public fallback. */
             }
-            return {
-              ...attachment,
-              [Tools.memory]: {
-                ...attachment[Tools.memory],
-                value: JSON.stringify({ ...details, partialApplied: true }),
+            return bindMemoryWriterVisibleTransition(
+              {
+                ...attachment,
+                [Tools.memory]: {
+                  ...attachment[Tools.memory],
+                  value: JSON.stringify({ ...details, partialApplied: true }),
+                },
               },
-            };
+              attachment[MEMORY_WRITER_VISIBLE_TRANSITION],
+            );
           });
         }
         if (attachments.length > 0) {
@@ -10175,7 +10287,9 @@ class AgentClient extends BaseClient {
           }
         }
         // Empty completion records that the model chose no memory change; it is not a saved claim.
-        if (!(await persistMemoryReceipt(writerContext, attachments))) {
+        if (await persistMemoryReceipt(writerContext, attachments)) {
+          commitMemoryWriterVisibleTransitions(attachments);
+        } else {
           logger.warn('[AgentClient] Saved-memory receipt awaits durable reconciliation');
         }
         if (isDeepTimingEnabled(req)) {

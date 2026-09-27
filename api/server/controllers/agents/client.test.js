@@ -4943,6 +4943,228 @@ describe('AgentClient - titleConvo', () => {
       expect(client.scheduleMemoryWriter([])).toBeUndefined();
       expect(client.runMemory).not.toHaveBeenCalled();
     });
+
+    describe('saved memory writer health visibility', () => {
+      const authMessage =
+        'Saved memory writer authentication failed. Reconnect the memory provider account before retrying durable memory writes.';
+      const blockedGate = (model, blockedUntil) => ({
+        blocked: true,
+        shouldLog: false,
+        reason: 'auth',
+        errorType: 'provider_auth',
+        provider: 'openai',
+        model,
+        message: authMessage,
+        blockedUntil,
+      });
+      const updateArtifact = {
+        type: Tools.memory,
+        [Tools.memory]: { type: 'update', key: 'core', value: 'Likes tea.', tokenCount: 3 },
+      };
+      const useRoute = (model, gate, processor = async () => []) => {
+        const api = require('@librechat/api');
+        mockReq.config.memory = {
+          validKeys: ['core'],
+          agent: { provider: 'openai', model, instructions: 'memory instructions' },
+        };
+        api.getMemoryWriterHealthGate.mockImplementation(({ model: routeModel }) =>
+          routeModel === model && gate() ? gate() : { blocked: false },
+        );
+        api.initializeAgent.mockImplementation(async ({ agent }) => ({ ...agent }));
+        api.createMemoryProcessor.mockImplementation(async ({ memoryMethods }) => [
+          null,
+          () => processor(memoryMethods),
+        ]);
+      };
+      const writerTurn = async () => {
+        const { HumanMessage } = require('@librechat/agents/langchain/messages');
+        const writer = new AgentClient(mockOptions);
+        writer.conversationId = client.conversationId;
+        writer.responseMessageId = client.responseMessageId;
+        writer.parentMessageId = client.parentMessageId;
+        writer.memoryWriterSourceMessageIds = client.memoryWriterSourceMessageIds;
+        writer.memoryWriterSourceMessageDigests = client.memoryWriterSourceMessageDigests;
+        writer.memoryWriterState = {
+          appConfig: mockReq.config,
+          userId: 'user-123',
+          memoryConfig: mockReq.config.memory,
+          memoryMethods: { setMemory: jest.fn().mockResolvedValue({ ok: true }) },
+          memoryPolicyConfig: { tokenLimit: 8000 },
+        };
+        db.completeMemoryWrite.mockClear();
+        const pending = writer.scheduleMemoryWriter([
+          new HumanMessage('Remember that I like tea.'),
+        ]);
+        await writer.admitMemoryWriter();
+        await pending;
+        expect(db.completeMemoryWrite).toHaveBeenCalledTimes(1);
+        const [{ status, receipts }] = db.completeMemoryWrite.mock.calls[0];
+        return {
+          status,
+          notices: receipts.map((receipt) =>
+            receipt.memory.type === 'error' ? JSON.parse(receipt.memory.value) : receipt.memory,
+          ),
+          types: receipts.map((receipt) => receipt.memory.type),
+        };
+      };
+
+      it('announces a blocked route once, then reports each later blocked save compactly', async () => {
+        const blockedUntil = Date.now() + 60_000;
+        useRoute('visibility-blocked-model', () =>
+          blockedGate('visibility-blocked-model', blockedUntil),
+        );
+
+        const first = await writerTurn();
+        const second = await writerTurn();
+
+        expect(first.status).toBe('failed');
+        expect(first.notices).toEqual([
+          expect.objectContaining({
+            errorType: 'provider_auth',
+            provider: 'openai',
+            message: authMessage,
+            healthState: expect.objectContaining({
+              kind: 'memory_writer_health',
+              status: 'degraded',
+              reason: 'auth',
+              model: 'visibility-blocked-model',
+              cooldownUntil: new Date(blockedUntil).toISOString(),
+            }),
+          }),
+        ]);
+        expect(first.notices[0].healthState.repeat).toBeUndefined();
+        expect(second.status).toBe('failed');
+        expect(second.notices).toEqual([
+          expect.objectContaining({
+            errorType: 'provider_auth',
+            healthState: expect.objectContaining({ status: 'degraded', repeat: true }),
+          }),
+        ]);
+      });
+
+      it('announces again when the first notice was not durably delivered', async () => {
+        const blockedUntil = Date.now() + 60_000;
+        useRoute('visibility-undelivered-model', () =>
+          blockedGate('visibility-undelivered-model', blockedUntil),
+        );
+        db.completeMemoryWrite.mockResolvedValueOnce(false);
+
+        await writerTurn();
+        const retried = await writerTurn();
+
+        expect(retried.status).toBe('failed');
+        expect(retried.notices[0].healthState).toMatchObject({ status: 'degraded' });
+        expect(retried.notices[0].healthState.repeat).toBeUndefined();
+      });
+
+      it('does not announce recovery on a writer run that failed after authorization returned', async () => {
+        let blocked = true;
+        let processorFails = true;
+        const blockedUntil = Date.now() + 60_000;
+        useRoute(
+          'visibility-failed-recovery-model',
+          () => (blocked ? blockedGate('visibility-failed-recovery-model', blockedUntil) : null),
+          async () =>
+            processorFails
+              ? [
+                  {
+                    type: Tools.memory,
+                    [Tools.memory]: {
+                      type: 'error',
+                      key: 'system',
+                      value: JSON.stringify({ errorType: 'provider_temporarily_unavailable' }),
+                    },
+                  },
+                ]
+              : [],
+        );
+
+        await writerTurn();
+        blocked = false;
+        const failedRun = await writerTurn();
+        processorFails = false;
+        const recovered = await writerTurn();
+
+        expect(failedRun.status).toBe('failed');
+        expect(failedRun.notices.map((notice) => notice.errorType)).toEqual([
+          'provider_temporarily_unavailable',
+        ]);
+        expect(recovered.notices).toEqual([
+          expect.objectContaining({
+            errorType: 'writer_recovered',
+            healthState: expect.objectContaining({ status: 'recovered' }),
+          }),
+        ]);
+      });
+
+      it('commits recovery delivered alongside a real saved change, so it is announced once', async () => {
+        let blocked = true;
+        const blockedUntil = Date.now() + 60_000;
+        useRoute(
+          'visibility-mutation-recovery-model',
+          () => (blocked ? blockedGate('visibility-mutation-recovery-model', blockedUntil) : null),
+          async (memoryMethods) => {
+            await memoryMethods.setMemory({ key: 'core', value: 'Likes tea.', tokenCount: 3 });
+            return [updateArtifact];
+          },
+        );
+
+        await writerTurn();
+        blocked = false;
+        const recovered = await writerTurn();
+        const settled = await writerTurn();
+
+        expect(recovered.status).toBe('completed');
+        expect(recovered.types).toEqual(['update', 'error']);
+        expect(recovered.notices[1]).toMatchObject({
+          errorType: 'writer_recovered',
+          healthState: expect.objectContaining({ status: 'recovered' }),
+        });
+        expect(recovered.notices[1].partialApplied).toBeUndefined();
+        expect(settled.status).toBe('completed');
+        expect(settled.types).toEqual(['update']);
+      });
+
+      it('reports a processor that failed internally as a failed save, not a completed one', async () => {
+        useRoute(
+          'visibility-processor-failure-model',
+          () => null,
+          async () => undefined,
+        );
+
+        const failed = await writerTurn();
+
+        expect(failed.status).toBe('failed');
+        expect(failed.types).toEqual(['error']);
+        expect(failed.notices).toEqual([
+          expect.objectContaining({ errorType: 'writer_exception' }),
+        ]);
+      });
+
+      it('keeps a no-change writer run completed without a receipt', async () => {
+        useRoute(
+          'visibility-no-change-model',
+          () => null,
+          async () => [],
+        );
+
+        expect(await writerTurn()).toEqual({ status: 'completed', notices: [], types: [] });
+      });
+
+      it('announces a changed block for the same route even after its earlier notice', async () => {
+        let blockedUntil = Date.now() + 60_000;
+        useRoute('visibility-changed-model', () =>
+          blockedGate('visibility-changed-model', blockedUntil),
+        );
+
+        await writerTurn();
+        blockedUntil += 60_000;
+        const changed = await writerTurn();
+
+        expect(changed.status).toBe('failed');
+        expect(changed.notices[0].healthState.repeat).toBeUndefined();
+      });
+    });
   });
 
   describe('getMessagesForConversation - mapMethod and mapCondition', () => {

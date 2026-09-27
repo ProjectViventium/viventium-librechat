@@ -218,18 +218,60 @@ describe('MemoryArtifacts', () => {
       expect(screen.queryByText('Memory · Unavailable')).not.toBeInTheDocument();
     });
 
-    test('displays a typed writer recovery as a normal saved-memory transition', () => {
+    test('displays a typed writer recovery as restored availability, not a saved change', () => {
       render(<MemoryArtifacts attachments={[createMemoryHealthAttachment('recovered')]} />);
 
-      const button = screen.getByRole('button', { name: 'Updated saved memory' });
+      const button = screen.getByRole('button', { name: 'Memory available again' });
       expect(button).toHaveClass('text-text-secondary-alt');
       expect(button).not.toHaveClass('text-red-500');
       expect(screen.queryByText('Memory Error')).not.toBeInTheDocument();
+      expect(screen.queryByText('Updated saved memory')).not.toBeInTheDocument();
 
       fireEvent.click(button);
       expect(screen.getByTestId('memory-health-recovered')).toHaveTextContent(
-        'Updated saved memory',
+        'Memory available again',
       );
+    });
+
+    test('keeps the saved-change label when a recovery arrives with a real update', () => {
+      render(
+        <MemoryArtifacts
+          attachments={[
+            createMemoryAttachment('update', 'core'),
+            createMemoryHealthAttachment('recovered'),
+          ]}
+        />,
+      );
+
+      const button = screen.getByRole('button', { name: 'Updated saved memory' });
+      fireEvent.click(button);
+      expect(screen.getByTestId('memory-health-recovered')).toHaveTextContent(
+        'Memory available again',
+      );
+      expect(screen.getByTestId('memory-artifact-update')).toBeInTheDocument();
+    });
+
+    test('reports a later blocked save compactly without repeating the reconnect notice', () => {
+      const repeat = createMemoryHealthAttachment('degraded');
+      const artifact = repeat[Tools.memory] as MemoryArtifact;
+      const details = JSON.parse(String(artifact.value));
+      artifact.value = JSON.stringify({
+        ...details,
+        healthState: { ...details.healthState, repeat: true },
+      });
+      render(<MemoryArtifacts attachments={[repeat]} />);
+
+      const button = screen.getByRole('button', { name: 'Memory · Unavailable' });
+      expect(button).toHaveClass('text-text-warning');
+      expect(button).not.toHaveClass('text-red-500');
+
+      fireEvent.click(button);
+      const notice = screen.getByTestId('memory-health-degraded-repeat');
+      expect(notice).toHaveTextContent('Not saved while memory is unavailable.');
+      expect(notice).not.toHaveAttribute('role', 'status');
+      expect(
+        screen.queryByText('OpenAI needs sign-in. Reconnect it in Connected Accounts.'),
+      ).not.toBeInTheDocument();
     });
 
     test('keeps an incomplete health payload on the genuine error path', () => {

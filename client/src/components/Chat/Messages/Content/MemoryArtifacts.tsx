@@ -20,6 +20,8 @@ type MemoryWriterHealthState = {
   model: string;
   cooldownUntil: string;
   errorType?: string;
+  /** A later blocked turn on an unchanged route: this turn's save did not run. */
+  repeat?: boolean;
 };
 
 type MemoryWriterHealthNotice = MemoryWriterHealthState;
@@ -80,6 +82,7 @@ function parseMemoryWriterHealthNotice(artifact: MemoryArtifact): MemoryWriterHe
       model: healthState.model,
       cooldownUntil: healthState.cooldownUntil,
       ...(typeof healthState.errorType === 'string' ? { errorType: healthState.errorType } : {}),
+      ...(healthState.status === 'degraded' && healthState.repeat === true ? { repeat: true } : {}),
     };
   } catch {
     return null;
@@ -134,8 +137,16 @@ export default function MemoryArtifacts({ attachments }: { attachments?: TAttach
     auth: `${localize('com_ui_reconnect')} ${localize('com_ui_memory')}`,
     quota: `${localize('com_ui_provider')} · ${localize('com_ui_unavailable')}`,
   };
+  const recoveredLabel = localize('com_ui_memory_available_again');
   let buttonLabel = localize('com_ui_memory_updated');
   let buttonStateClass = 'text-text-secondary-alt hover:text-text-primary';
+  // Restored availability is not a saved change: only a real update may claim one.
+  if (
+    memoryArtifacts.length === 0 &&
+    healthNotices.some((notice) => notice.status === 'recovered')
+  ) {
+    buttonLabel = recoveredLabel;
+  }
   if (hasDegraded) {
     buttonLabel = degradedLabel;
     buttonStateClass = 'text-text-warning hover:text-text-primary';
@@ -265,14 +276,12 @@ export default function MemoryArtifacts({ attachments }: { attachments?: TAttach
                   <div className="space-y-2 p-4">
                     {healthNotices.map((notice, index) => {
                       const isDegraded = notice.status === 'degraded';
-                      const noticeLabel = isDegraded
-                        ? degradedLabel
-                        : localize('com_ui_memory_updated');
+                      const noticeLabel = isDegraded ? degradedLabel : recoveredLabel;
                       return (
                         <div
                           key={`${notice.status}-${notice.provider ?? ''}-${notice.model ?? ''}-${notice.cooldownUntil ?? ''}-${index}`}
-                          data-testid={`memory-health-${notice.status}`}
-                          role="status"
+                          data-testid={`memory-health-${notice.status}${notice.repeat ? '-repeat' : ''}`}
+                          role={notice.repeat ? undefined : 'status'}
                           className={cn(
                             'rounded-md p-3 text-sm',
                             isDegraded
@@ -281,7 +290,12 @@ export default function MemoryArtifacts({ attachments }: { attachments?: TAttach
                           )}
                         >
                           <div className="font-semibold">{noticeLabel}</div>
-                          {isDegraded && (
+                          {isDegraded && notice.repeat && (
+                            <div className="mt-1">
+                              {localize('com_ui_memory_not_saved_unavailable')}
+                            </div>
+                          )}
+                          {isDegraded && !notice.repeat && (
                             <div className="mt-1">
                               {localize(
                                 memoryProviderFailureCopy(

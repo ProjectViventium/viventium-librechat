@@ -206,6 +206,25 @@ describe('durable saved-memory admission', () => {
     expect(row.attachments).toEqual([{ type: 'file', file_id: 'artifact' }]);
   });
 
+  it('records a blocked write as failed without adding a repeated visible receipt', async () => {
+    await writes.admitMemoryWrite(admission);
+    await writes.startMemoryWrite(admission);
+    expect(await writes.completeMemoryWrite({ ...admission, receipts: [], status: 'failed' })).toBe(true);
+    expect(await writes.getMemoryWriteStatus(admission)).toBe('failed');
+    const row = await mongoose.models.Message.findOne({ messageId: 'answer' }).lean();
+    expect(row.attachments).toEqual([{ type: 'file', file_id: 'artifact' }]);
+  });
+
+  it('keeps a completed write completed when it carries a recovery notice', async () => {
+    const notice = { type: 'memory', messageId: 'answer', conversationId: 'conversation',
+      memory: { type: 'error', key: 'system', value: JSON.stringify({ errorType: 'writer_recovered' }) } };
+    await writes.admitMemoryWrite(admission);
+    await writes.startMemoryWrite(admission);
+    expect(await writes.completeMemoryWrite({ ...admission, receipts: [notice], status: 'completed' }))
+      .toBe(true);
+    expect(await writes.getMemoryWriteStatus(admission)).toBe('completed');
+  });
+
   it('preserves file attachments whose optional memory field is null', async () => {
     await mongoose.models.Message.updateOne({ messageId: 'answer' }, { $set: {
       attachments: [{ type: 'file', file_id: 'artifact', memory: null }],

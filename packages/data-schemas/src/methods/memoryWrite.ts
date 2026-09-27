@@ -117,9 +117,11 @@ export function createMemoryWriteMethods(mongoose: typeof import('mongoose')) {
 
   async function completeMemoryWrite(params: MemoryWriteIdentity & {
     receipts: MemoryWriteReceipt[];
+    /** The writer's own terminal outcome: a blocked write fails even without a visible receipt. */
+    status?: 'completed' | 'failed';
   }): Promise<boolean> {
-    const status = params.receipts.some((receipt) => receipt.memory?.type === 'error')
-      ? 'failed' : 'completed';
+    const status = params.status
+      ?? (params.receipts.some((receipt) => receipt.memory?.type === 'error') ? 'failed' : 'completed');
     const result = await mongoose.models.Message.updateOne({
       ...identityFilter(params), 'savedMemoryWrite.status': 'running',
     }, receiptUpdate(params.receipts, status));

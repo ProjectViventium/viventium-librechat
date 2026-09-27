@@ -1513,11 +1513,73 @@ describe('Memory snapshot loading', () => {
       memoryTokenMap: { core: 42 },
       memoryRevisionMap: {},
       memoryValueHashMap: {},
+      memoryWriterEffectMap: {},
     });
     expect(methods.getFormattedMemories).toHaveBeenCalledWith({
       userId: 'user-123',
       memories: [],
     });
+  });
+
+  it('carries every automated writer marker the admission check compares', async () => {
+    const effect = { messageId: 'earlier-response', owner: 'writer-a', operationId: 'op-1' };
+    const methods = {
+      setMemory: jest.fn().mockResolvedValue({ ok: true }),
+      deleteMemory: jest.fn(),
+      getAllUserMemories: jest.fn().mockResolvedValue([]),
+      getAllUserMemoryStates: jest.fn().mockResolvedValue([
+        { key: 'context', value: 'Written by the writer.', tokenCount: 4, __v: 2, writerEffect: effect },
+        { key: 'core', value: 'Edited in the panel.', tokenCount: 4, __v: 5 },
+        {
+          key: 'moments',
+          value: '',
+          tokenCount: 0,
+          __v: 7,
+          deletedAt: new Date(),
+          writerEffect: { ...effect, operationId: 'op-2' },
+        },
+      ]),
+      getFormattedMemories: jest.fn(async () => ({
+        withKeys: '',
+        withoutKeys: '',
+        totalTokens: 0,
+        memoryTokenMap: {},
+      })),
+    };
+
+    const snapshot = await loadMemorySnapshot({
+      userId: 'user-123',
+      memoryMethods: methods,
+      config: { validKeys: ['context', 'core', 'moments'] },
+    });
+
+    expect(snapshot.memoryRevisionMap).toEqual({ context: 2, core: 5, moments: 7 });
+    expect(snapshot.memoryWriterEffectMap).toEqual({
+      context: effect,
+      moments: { ...effect, operationId: 'op-2' },
+    });
+  });
+
+  it('gives a user without memories empty maps rather than missing ones', async () => {
+    const snapshot = await loadMemorySnapshot({
+      userId: 'user-123',
+      memoryMethods: {
+        setMemory: jest.fn(),
+        deleteMemory: jest.fn(),
+        getAllUserMemories: jest.fn().mockResolvedValue([]),
+        getAllUserMemoryStates: jest.fn().mockResolvedValue([]),
+        getFormattedMemories: jest.fn(async () => ({
+          withKeys: '',
+          withoutKeys: '',
+          totalTokens: 0,
+          memoryTokenMap: {},
+        })),
+      },
+      config: { validKeys: ['context'] },
+    });
+
+    expect(snapshot.memoryRevisionMap).toEqual({});
+    expect(snapshot.memoryWriterEffectMap).toEqual({});
   });
 
   it('derives prompt content and CAS revisions from the same state query', async () => {

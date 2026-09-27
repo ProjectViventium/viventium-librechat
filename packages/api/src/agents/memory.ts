@@ -16,7 +16,7 @@ import type {
   ToolEndData,
   LLMConfig,
 } from '@librechat/agents';
-import type { ObjectId, MemoryMethods, IUser } from '@librechat/data-schemas';
+import type { ObjectId, MemoryMethods, IUser, MemoryWriterEffect } from '@librechat/data-schemas';
 import type { TAttachment, MemoryArtifact } from 'librechat-data-provider';
 import type { BaseMessage, ToolMessage } from '@librechat/agents/langchain/messages';
 import type { Response as ServerResponse } from 'express';
@@ -67,6 +67,8 @@ export interface MemorySnapshot {
   memoryTokenMap: Record<string, number>;
   memoryRevisionMap: Record<string, number>;
   memoryValueHashMap: Record<string, string>;
+  /** Automated-writer markers the admission check needs for each key the writer changed. */
+  memoryWriterEffectMap?: Record<string, MemoryWriterEffect>;
 }
 
 export interface MemoryWriteAuditContext {
@@ -2442,11 +2444,15 @@ export async function loadMemorySnapshot({
   const formatted = await memoryMethods.getFormattedMemories({ userId, memories: entries });
   const memoryRevisionMap: Record<string, number> = {};
   const memoryValueHashMap: Record<string, string> = {};
+  const memoryWriterEffectMap: Record<string, MemoryWriterEffect> = {};
   for (const entry of states ?? []) {
     if (!entry?.key) {
       continue;
     }
     memoryRevisionMap[entry.key] = Number(entry.__v ?? 0);
+    if (entry.writerEffect) {
+      memoryWriterEffectMap[entry.key] = entry.writerEffect;
+    }
     if (!entry.deletedAt) {
       memoryValueHashMap[entry.key] = hashMemoryAuditValue(entry.value);
     }
@@ -2458,6 +2464,7 @@ export async function loadMemorySnapshot({
     memoryTokenMap: formatted.memoryTokenMap ?? {},
     memoryRevisionMap,
     memoryValueHashMap,
+    memoryWriterEffectMap,
   };
   /* === VIVENTIUM END === */
 }

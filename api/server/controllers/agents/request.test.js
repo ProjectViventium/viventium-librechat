@@ -384,6 +384,32 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     },
   );
 
+  test('saves an accepted interactive input and its send as one user message', async () => {
+    const req = makeReq();
+    setTrustedInteractionContext(req, {
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'web',
+      conversation_id: 'conv-1',
+      source_event_id: 'web-source-1',
+      source_order_scope: 'b'.repeat(64),
+      source_sequence: 1,
+    });
+    const client = makeClient(Promise.resolve());
+
+    await AgentController(req, makeRes(), jest.fn(), jest.fn(async () => ({ client })), jest.fn());
+    await jest.advanceTimersByTimeAsync(120);
+
+    const acceptedSaves = mockSaveMessage.mock.calls.filter(
+      ([, message]) => message.isCreatedByUser === true,
+    );
+    expect(acceptedSaves).toHaveLength(1);
+    expect(client.sendMessage).toHaveBeenCalledWith(
+      'hello',
+      expect.objectContaining({ overrideParentMessageId: acceptedSaves[0][1].messageId }),
+    );
+  });
+
   test('settles a completed superseded voice generation without reviving its presentation', async () => {
     const req = makeReq();
     req.viventiumCallSession = { callSessionId: 'call-1' };

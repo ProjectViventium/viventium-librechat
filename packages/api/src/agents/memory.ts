@@ -2,7 +2,7 @@
 import { z } from 'zod';
 import { createHmac, randomBytes } from 'crypto';
 import { tool } from '@librechat/agents/langchain/tools';
-import { Tools, supportsAdaptiveThinking } from 'librechat-data-provider';
+import { ErrorTypes, Tools, supportsAdaptiveThinking } from 'librechat-data-provider';
 import { logger } from '@librechat/data-schemas';
 import { HumanMessage } from '@librechat/agents/langchain/messages';
 import { Run, Providers, GraphEvents } from '@librechat/agents';
@@ -549,7 +549,22 @@ function getErrorField(error: unknown, key: string): unknown {
   return (error as Record<string, unknown>)[key];
 }
 
+function isNoUserKeyError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  try {
+    return (JSON.parse(error.message) as { type?: string }).type === ErrorTypes.NO_USER_KEY;
+  } catch {
+    return false;
+  }
+}
+
 function errorContainsAuthFailure(error: unknown): boolean {
+  // A configured provider whose per-user key is absent is a missing credential, not an outage.
+  if (isNoUserKeyError(error)) {
+    return true;
+  }
   const response = getErrorField(error, 'response');
   const responseData = getErrorField(response, 'data');
   const responseError = getErrorField(responseData, 'error');

@@ -1244,6 +1244,27 @@ describe('Memory snapshot loading', () => {
     expect(methods.getAllUserMemories).toHaveBeenCalledTimes(2);
   });
 
+  it('gates a configured writer route whose per-user key is absent as authentication', () => {
+    const route = { userId: 'no-user-key-owner', provider: 'openai', model: 'memory-model' };
+    clearMemoryWriterHealth(route);
+    const error = new Error(JSON.stringify({ type: 'no_user_key' }));
+    expect(markMemoryWriterFailure({ ...route, error })).toMatchObject({
+      reason: 'auth',
+      errorType: 'provider_auth',
+    });
+    expect(getMemoryWriterHealthGate(route)).toMatchObject({ blocked: true, reason: 'auth' });
+    clearMemoryWriterHealth(route);
+    expect(getMemoryWriterHealthGate(route)).toEqual({ blocked: false });
+  });
+
+  it('keeps an untyped JSON failure out of authentication suppression', () => {
+    const route = { userId: 'other-json-owner', provider: 'openai', model: 'memory-model' };
+    clearMemoryWriterHealth(route);
+    const error = new Error(JSON.stringify({ type: 'invalid_request' }));
+    expect(markMemoryWriterFailure({ ...route, error })).toBeUndefined();
+    expect(getMemoryWriterHealthGate(route)).toEqual({ blocked: false });
+  });
+
   it.each([
     { type: 'provider_access_denied' },
     { error: { code: 'provider_access_denied' } },

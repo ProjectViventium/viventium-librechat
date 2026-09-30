@@ -113,6 +113,28 @@ jest.mock('~/server/services/viventium/VoiceTaskService', () => ({
 describe('request persistence helpers', () => {
   const { __testables } = require('../request');
 
+  it('cleans a rejected snapshot while preserving its failure for the caller', async () => {
+    const inFlight = new Set();
+    const failure = new Error('synthetic storage failure');
+    const snapshot = __testables.trackInFlightSnapshot(inFlight, async () => {
+      throw failure;
+    });
+    expect(inFlight.has(snapshot)).toBe(true);
+    await expect(snapshot).rejects.toBe(failure);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(inFlight.size).toBe(0);
+  });
+
+  it('cleans a completed snapshot and returns its persisted result', async () => {
+    const inFlight = new Set();
+    const persisted = { messageId: 'synthetic-persisted-message' };
+    const snapshot = __testables.trackInFlightSnapshot(inFlight, () => persisted);
+    expect(inFlight.has(snapshot)).toBe(true);
+    await expect(snapshot).resolves.toBe(persisted);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(inFlight.size).toBe(0);
+  });
+
   it('retains the canonical completed-native disposition despite a conflicting live capture', () => {
     const canonical = { version: 1, audio: 'skip', required: true, valid: true, source: 'model' };
     const req = {

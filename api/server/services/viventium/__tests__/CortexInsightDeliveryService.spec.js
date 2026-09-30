@@ -1492,6 +1492,51 @@ describe('CortexInsightDeliveryService', () => {
     expect(new Set(state.map((row) => row.claimToken)).size).toBe(1);
   });
 
+  test('returns the committed claim result after the transaction callback retries', async () => {
+    const rows = ['a', 'b'].map((suffix) => ({
+      deliveryId: `cidl_delivery-${suffix}`,
+      userId: 'owner-a',
+      parentMessageId: 'parent-a',
+      cortexId: `review-${suffix}`,
+      insight: 'Synthetic pending result.',
+      status: 'pending',
+      attemptNumber: 0,
+      claimGeneration: 0,
+      surface: 'web',
+    }));
+    const { Model, state } = createBatchStateModel(rows);
+    let attempt = 0;
+    const session = {
+      withTransaction: jest.fn(async (operation) => {
+        attempt = 1;
+        await operation();
+        // The driver discards aborted writes before retrying the callback.
+        state.splice(0, state.length, ...rows.map((row) => ({ ...row, claimGeneration: 4 })));
+        attempt = 2;
+        await operation();
+      }),
+      endSession: jest.fn(),
+    };
+    Model.db = { startSession: jest.fn(async () => session) };
+    const service = createCortexInsightDeliveryService({
+      DeliveryModel: Model,
+      now: () => new Date('2026-08-22T12:00:00.000Z'),
+      randomUUID: () => 'synthetic-retry',
+    });
+    const batch = await service.claimPendingByParent({
+      ownerId: 'owner-a',
+      parentMessageId: 'parent-a',
+      surface: 'web',
+    });
+    expect(batch.claimed).toHaveLength(2);
+    expect(attempt).toBe(2);
+    expect(batch.claimed.map((row) => row.claimGeneration)).toEqual(
+      state.map((row) => row.claimGeneration),
+    );
+    expect(batch.claimed.map((row) => row.claimGeneration)).toEqual([5, 5]);
+    expect(session.endSession).toHaveBeenCalledTimes(1);
+  });
+
   test('rolls back every sibling lease when one parent batch claim conflicts', async () => {
     const { Model, state } = createBatchStateModel(
       [

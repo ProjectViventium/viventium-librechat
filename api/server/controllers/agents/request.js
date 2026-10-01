@@ -1456,12 +1456,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
      */
     let assistantTerminalPersistenceStarted = false;
     const inFlightAssistantSnapshots = new Set();
-    const trackAssistantSnapshot = (createSnapshot) => {
-      const snapshotPromise = Promise.resolve().then(createSnapshot);
-      inFlightAssistantSnapshots.add(snapshotPromise);
-      snapshotPromise.finally(() => inFlightAssistantSnapshots.delete(snapshotPromise));
-      return snapshotPromise;
-    };
+    const trackAssistantSnapshot = (createSnapshot) =>
+      trackInFlightSnapshot(inFlightAssistantSnapshots, createSnapshot);
     const beginAssistantTerminalPersistence = async () => {
       assistantTerminalPersistenceStarted = true;
       stopPartialCheckpointing();
@@ -3027,6 +3023,17 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
   }
 };
 
+/* === VIVENTIUM START ===
+ * Preserve the snapshot failure for its caller without rejecting the cleanup chain.
+ */
+function trackInFlightSnapshot(inFlight, createSnapshot) {
+  const snapshotPromise = Promise.resolve().then(createSnapshot);
+  inFlight.add(snapshotPromise);
+  snapshotPromise.finally(() => inFlight.delete(snapshotPromise)).catch(() => undefined);
+  return snapshotPromise;
+}
+/* === VIVENTIUM END === */
+
 module.exports = AgentController;
 module.exports.ResumableAgentController = ResumableAgentController;
 module.exports.captureAcceptedInteractionInput = captureAcceptedInteractionInput;
@@ -3040,6 +3047,7 @@ module.exports.__testables = {
   normalizeAssistantResponseForTransmit,
   normalizeDurableWorkReceiptResponse,
   persistAssistantSnapshot,
+  trackInFlightSnapshot,
   timedSaveMessage,
   getExactDurableEffectReceipt,
   hasExactDurableEffectReceipt,

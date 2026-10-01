@@ -1671,7 +1671,7 @@ export function createCortexInsightDeliveryService({
         results.push(await work(session));
       });
       TRANSACTION_SUPPORT.set(DeliveryModel, true);
-      return { used: true, result: results[0] };
+      return { used: true, result: results[results.length - 1] };
     } catch (error) {
       if (isTransactionUnsupported(error)) {
         TRANSACTION_SUPPORT.set(DeliveryModel, false);

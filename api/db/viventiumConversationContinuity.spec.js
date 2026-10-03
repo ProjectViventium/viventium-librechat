@@ -255,7 +255,11 @@ describe('Conversation legacy continuity', () => {
     expect(projection.capsule).toContain('reviewed summary of the 92 oldest visible messages');
     expect(projection.capsule).toContain('94 per booklet');
 
-    const reconciled = withReconciledHistoryAncestry(proof, projection.coveredIds, projection.messages);
+    const reconciled = withReconciledHistoryAncestry(
+      proof,
+      projection.coveredIds,
+      projection.messages,
+    );
     const snapshot = admit(req, projection.messages, reconciled);
     expect(snapshot.visibleMessageChain).toHaveLength(49);
     expect(snapshot.visibleMessageChain.at(-1)).toMatchObject({ id: 'current-prompt' });
@@ -271,11 +275,16 @@ describe('Conversation legacy continuity', () => {
     const rows = await seed(140);
     const carried = carriedChain(rows);
     await resolve(schedulerRequest(), carried, []);
-    const record = await Continuity.findOne({ ownerId: OWNER, conversationId: CONVERSATION }).lean();
+    const record = await Continuity.findOne({
+      ownerId: OWNER,
+      conversationId: CONVERSATION,
+    }).lean();
     expect(record).toMatchObject({ status: 'ready', throughMessageId: 'answer-91' });
 
     const edited = carried.map((message) =>
-      message.messageId === 'answer-10' ? { ...message, text: 'Review 10: rate withdrawn.' } : message,
+      message.messageId === 'answer-10'
+        ? { ...message, text: 'Review 10: rate withdrawn.' }
+        : message,
     );
     const projection = projectConversationContinuity(record, edited);
     expect(projection).toMatchObject({ stale: true, coveredIds: [] });
@@ -292,7 +301,10 @@ describe('Conversation legacy continuity', () => {
 
     expect(calls.filter((call) => call.stage === 'review').length).toBeGreaterThan(0);
     expect(projection).toBeNull();
-    const record = await Continuity.findOne({ ownerId: OWNER, conversationId: CONVERSATION }).lean();
+    const record = await Continuity.findOne({
+      ownerId: OWNER,
+      conversationId: CONVERSATION,
+    }).lean();
     expect(record).toMatchObject({ status: 'degraded' });
     const proof = traceMainHistoryAncestry({
       messages: rows,

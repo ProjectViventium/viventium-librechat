@@ -416,10 +416,20 @@ function logFeelingsEvent(logger, req, event, fields = {}, level = 'info') {
   const correlation = {};
   if (interaction?.surface) correlation.surface = interaction.surface;
   if (interaction?.logical_turn_id) {
-    correlation.turnRefHash = fingerprintTraceReference('logical_turn', interaction.logical_turn_id).slice(7);
+    correlation.turnRefHash = fingerprintTraceReference(
+      'logical_turn',
+      interaction.logical_turn_id,
+    ).slice(7);
   }
-  if (interaction?.surface === 'voice' && req?.body?.voiceMode === true && req?.body?.viventiumCallSessionId) {
-    correlation.callRefHash = fingerprintTraceReference('call_session', req.body.viventiumCallSessionId).slice(7);
+  if (
+    interaction?.surface === 'voice' &&
+    req?.body?.voiceMode === true &&
+    req?.body?.viventiumCallSessionId
+  ) {
+    correlation.callRefHash = fingerprintTraceReference(
+      'call_session',
+      req.body.viventiumCallSessionId,
+    ).slice(7);
   }
   // Correlation is owned by trusted request provenance, never a caller-supplied log field.
   const { surface, callRefHash, turnRefHash, ...eventFields } = fields;

@@ -964,14 +964,17 @@ describe('stripVoiceControlTagsForDisplay', () => {
     );
   });
 
-  test('strips citation, source, and link artifacts for voice display persistence', () => {
+  test('preserves public links while stripping private contact and citation artifacts for display', () => {
     const result = stripVoiceControlTagsForDisplay(
       'Sources: https://example.com/report Read [brief](https://example.com/brief). Email qa@example.com. Answer [12].',
     );
-    expect(result).toBe('link available Read brief. Email address available. Answer.');
+    expect(result).toBe(
+      'Sources: https://example.com/report Read [brief](https://example.com/brief). Email address available. Answer.',
+    );
     expect(result).not.toMatch(/\b([A-Za-z][A-Za-z']{1,})\b[\s.,!?;:]+\1\b/i);
-    expect(result).not.toContain('Sources:');
-    expect(result).not.toContain('https://');
+    expect(result).toContain('Sources: https://example.com/report');
+    expect(result).toContain('[brief](https://example.com/brief)');
+    expect(result).not.toContain('qa@example.com');
     expect(result).not.toContain('[12]');
   });
 

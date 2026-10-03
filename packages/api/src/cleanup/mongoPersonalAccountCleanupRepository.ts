@@ -1,4 +1,4 @@
-import type { Model } from 'mongoose';
+import type { FilterQuery, Model } from 'mongoose';
 import type { IConversation, IMessage } from '@librechat/data-schemas';
 import type {
   ApplyCleanupTombstoneInput,
@@ -33,6 +33,11 @@ interface MongoCleanupDependencies {
   Message: Model<IMessage>;
   Conversation: Model<IConversation>;
   ledger: CleanupLedgerAdapter;
+  mutateMessageSources: (
+    filter: FilterQuery<IMessage>,
+    mutate: () => Promise<CleanupMessage | null>,
+    kind: 'delete',
+  ) => Promise<CleanupMessage | null>;
 }
 
 function jsonValue(value: unknown): CleanupJsonValue {
@@ -137,7 +142,11 @@ export function createMongoPersonalAccountCleanupRepository({
   Message,
   Conversation,
   ledger,
+  mutateMessageSources,
 }: MongoCleanupDependencies): CleanupRepository {
+  if (typeof mutateMessageSources !== 'function') {
+    throw new Error('cleanup_message_source_mutator_required');
+  }
   async function readActiveTarget(
     kind: 'message' | 'conversation',
     ownerId: string,
@@ -217,27 +226,33 @@ export function createMongoPersonalAccountCleanupRepository({
     let updated: CleanupMessage | CleanupConversation | null;
     if (input.source.kind === 'message') {
       filter.messageId = input.source.resourceId;
-      updated = (await Message.findOneAndReplace(
+      updated = await mutateMessageSources(
         filter,
-        {
-          messageId: input.source.resourceId,
-          conversationId: String(
-            (input.source.payload as { conversationId?: CleanupJsonValue }).conversationId || '',
-          ),
-          user: input.source.ownerId,
-          text: '',
-          summary: '',
-          content: [],
-          files: [],
-          attachments: [],
-          isCreatedByUser: false,
-          deletedAt: at,
-          cleanupTombstone: marker,
-          _meiliIndex: false,
-          __v: input.source.revision + 1,
-        },
-        { new: true, runValidators: true },
-      ).lean()) as CleanupMessage | null;
+        async () =>
+          (await Message.findOneAndReplace(
+            filter,
+            {
+              messageId: input.source.resourceId,
+              conversationId: String(
+                (input.source.payload as { conversationId?: CleanupJsonValue }).conversationId ||
+                  '',
+              ),
+              user: input.source.ownerId,
+              text: '',
+              summary: '',
+              content: [],
+              files: [],
+              attachments: [],
+              isCreatedByUser: false,
+              deletedAt: at,
+              cleanupTombstone: marker,
+              _meiliIndex: false,
+              __v: input.source.revision + 1,
+            },
+            { new: true, runValidators: true },
+          ).lean()) as CleanupMessage | null,
+        'delete',
+      );
     } else if (input.source.kind === 'conversation') {
       filter.conversationId = input.source.resourceId;
       updated = (await Conversation.findOneAndReplace(

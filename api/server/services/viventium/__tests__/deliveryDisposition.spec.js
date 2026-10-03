@@ -240,8 +240,9 @@ describe('structured messaging delivery disposition', () => {
 
     expect(req._viventiumDeliveryDispositionRequired).toBe(false);
     expect(getDeliveryDispositionCapture(req)).toEqual({ status: 'missing' });
-    expect(attachEffectiveDeliveryDisposition(req, { text: 'Final answer from a legacy provider.' }))
-      .toEqual({ text: 'Final answer from a legacy provider.' });
+    expect(
+      attachEffectiveDeliveryDisposition(req, { text: 'Final answer from a legacy provider.' }),
+    ).toEqual({ text: 'Final answer from a legacy provider.' });
   });
 
   it('applies legacy, structured, and fail-closed precedence without intent inference', () => {

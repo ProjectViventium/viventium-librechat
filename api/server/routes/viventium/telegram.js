@@ -2343,9 +2343,10 @@ router.post('/orchestration/work/:workRef/actions', telegramAuth, async (req, re
   const action = String(req.body?.action || '').trim();
   const instruction = String(req.body?.instruction || '').trim();
   const operationId = String(req.body?.operationId || '').trim();
-  const nativeResponse = req.body?.nativeInput == null
-    ? null
-    : nativeWorkInputResponseSchema.safeParse(req.body.nativeInput);
+  const nativeResponse =
+    req.body?.nativeInput == null
+      ? null
+      : nativeWorkInputResponseSchema.safeParse(req.body.nativeInput);
   if (
     !WORK_REF_PATTERN.test(workRef) ||
     (nativeResponse && (!nativeResponse.success || action !== 'resume')) ||

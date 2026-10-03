@@ -109,8 +109,8 @@ describe('Viventium prompt source contracts', () => {
     const capability = librechatSource.endpoints.agents.providerCapabilities['glasshive-harness'];
 
     expect(agentsSource.mainAgent.fallback_llm_model_parameters).toEqual({
-      model: 'claude-code:claude-opus-5',
-      reasoning_effort: 'low',
+      model: 'claude-code:claude-opus-5-5',
+      reasoning_effort: 'high',
     });
     expect(capability).toMatchObject({
       default_access: 'full',

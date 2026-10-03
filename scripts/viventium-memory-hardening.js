@@ -969,13 +969,13 @@ function scheduleEventAttestation(event, options = {}) {
   const objectProof = proof && typeof proof === 'object' && !Array.isArray(proof) ? proof : {};
   const verified = Boolean(
     schemaVersion >= 3 &&
-      objectProof.version === 1 &&
-      objectProof.method === 'launchctl_job_pid' &&
-      objectProof.verified === true &&
-      objectProof.launchctl_status === 'ok' &&
-      Number(objectProof.pid) === Number(event.pid) &&
-      Number(objectProof.observed_job_pid) === Number(event.pid) &&
-      Number(objectProof.parent_pid) === 1,
+    objectProof.version === 1 &&
+    objectProof.method === 'launchctl_job_pid' &&
+    objectProof.verified === true &&
+    objectProof.launchctl_status === 'ok' &&
+    Number(objectProof.pid) === Number(event.pid) &&
+    Number(objectProof.observed_job_pid) === Number(event.pid) &&
+    Number(objectProof.parent_pid) === 1,
   );
   return {
     verified,
@@ -987,7 +987,9 @@ function scheduleEventAttestation(event, options = {}) {
 function publicScheduleEvent(event, scheduleWindowAlignedValue, attestation = null) {
   if (!event) return null;
   return {
-    schema_version: Number.isFinite(Number(event.schemaVersion)) ? Number(event.schemaVersion) : null,
+    schema_version: Number.isFinite(Number(event.schemaVersion))
+      ? Number(event.schemaVersion)
+      : null,
     status: event.status || null,
     trigger_source: event.trigger_source || null,
     trigger_attested: attestation?.verified === true,
@@ -1002,10 +1004,16 @@ function publicScheduleEvent(event, scheduleWindowAlignedValue, attestation = nu
     run_status: event.run_status || null,
     requested_provider: normalizeProvider(event.requested_provider) || null,
     requested_model: String(event.requested_model || '').trim() || null,
-    requested_effort: String(event.requested_effort || '').trim().toLowerCase() || null,
+    requested_effort:
+      String(event.requested_effort || '')
+        .trim()
+        .toLowerCase() || null,
     effective_provider: normalizeProvider(event.effective_provider) || null,
     effective_model: String(event.effective_model || '').trim() || null,
-    effective_effort: String(event.effective_effort || '').trim().toLowerCase() || null,
+    effective_effort:
+      String(event.effective_effort || '')
+        .trim()
+        .toLowerCase() || null,
   };
 }
 
@@ -1042,9 +1050,7 @@ function buildScheduleHealth(paths, options = {}) {
   const hasSchemaV3Observation = schemaV3ObservationPersisted || hasSchemaV3Receipt;
   const allowLegacyV2 = !hasSchemaV3Observation && legacyV2Events.length === 1;
   const attestEvent = (event) => scheduleEventAttestation(event, { allowLegacyV2 });
-  const attestedLaunchdEvents = launchdEvents.filter(
-    (event) => attestEvent(event).verified,
-  );
+  const attestedLaunchdEvents = launchdEvents.filter((event) => attestEvent(event).verified);
   const scheduledEvents = attestedLaunchdEvents.filter((event) =>
     scheduleWindowAligned(event, { schedule, timeZone: systemTimeZone }),
   );
@@ -1072,9 +1078,7 @@ function buildScheduleHealth(paths, options = {}) {
   const effectiveEffort = String(latestEvent?.effective_effort || '')
     .trim()
     .toLowerCase();
-  const configuredProvider = normalizeProvider(
-    process.env.VIVENTIUM_MEMORY_HARDENING_PROVIDER,
-  );
+  const configuredProvider = normalizeProvider(process.env.VIVENTIUM_MEMORY_HARDENING_PROVIDER);
   const configuredModel = String(process.env.VIVENTIUM_MEMORY_HARDENING_MODEL || '').trim();
   const configuredEffort = String(process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT || '')
     .trim()
@@ -1111,38 +1115,37 @@ function buildScheduleHealth(paths, options = {}) {
   );
   const configuredExecutionTupleComplete = Boolean(
     configuredExecutionRequired &&
-      configuredProvider &&
-      configuredModel &&
-      configuredEffort &&
-      requestedProvider &&
-      requestedModel &&
-      requestedEffort,
+    configuredProvider &&
+    configuredModel &&
+    configuredEffort &&
+    requestedProvider &&
+    requestedModel &&
+    requestedEffort,
   );
   const configuredProviderMismatch = Boolean(
     latestStatus === 'success' &&
-      configuredProvider &&
-      requestedProvider &&
-      configuredProvider !== requestedProvider,
+    configuredProvider &&
+    requestedProvider &&
+    configuredProvider !== requestedProvider,
   );
   const configuredModelMismatch = Boolean(
     latestStatus === 'success' &&
-      configuredModel &&
-      requestedModel &&
-      configuredModel !== requestedModel,
+    configuredModel &&
+    requestedModel &&
+    configuredModel !== requestedModel,
   );
   const configuredEffortMismatch = Boolean(
     latestStatus === 'success' &&
-      configuredEffort &&
-      requestedEffort &&
-      configuredEffort !== requestedEffort,
+    configuredEffort &&
+    requestedEffort &&
+    configuredEffort !== requestedEffort,
   );
   const configuredExecutionMismatch =
     configuredProviderMismatch || configuredModelMismatch || configuredEffortMismatch;
   const executionMismatch = receiptExecutionMismatch || configuredExecutionMismatch;
   const executionUnverified = Boolean(
     latestStatus === 'success' &&
-      (!executionTupleComplete ||
-        (configuredExecutionRequired && !configuredExecutionTupleComplete)),
+    (!executionTupleComplete || (configuredExecutionRequired && !configuredExecutionTupleComplete)),
   );
   let state = 'awaiting_first_run';
   if (missedWindow) {
@@ -2717,13 +2720,15 @@ function resolveProvider(options = {}) {
     });
   }
   if (providers.includes('anthropic')) {
+    const selectedModel =
+      process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-5-5';
     return withResolvedCandidates({
       provider: 'anthropic',
-      model: process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-5-5',
+      model: selectedModel,
       effort:
         process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT ||
         process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT ||
-        'xhigh',
+        defaultEffortForProvider('anthropic', selectedModel),
       source: 'configured',
     });
   }

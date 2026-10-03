@@ -361,15 +361,14 @@ async function runEmotionalReaction(
       const attemptStarted = Date.now();
       const result = await deps.executeCortex({
         agent: buildEmotionalReactionAgent(config, snapshot, nativeWorkspace),
-        messages:
-          !parseFailure
-            ? [userMessage]
-            : [
-                userMessage,
-                new HumanMessage(
-                  `Retry the same appraisal. The prior response failed the required JSON schema.\n\n${buildReactionOutputContract()}`,
-                ),
-              ],
+        messages: !parseFailure
+          ? [userMessage]
+          : [
+              userMessage,
+              new HumanMessage(
+                `Retry the same appraisal. The prior response failed the required JSON schema.\n\n${buildReactionOutputContract()}`,
+              ),
+            ],
         runId: `${stimulusId || 'turn'}-feelings-reaction-${attempt}`,
         conversationId,
         req: reactionReq,
@@ -390,10 +389,14 @@ async function runEmotionalReaction(
         ) ||
           (result?.errorClass === 'recoverable_provider_error' &&
             result?.nativeOwnership === 'released'));
-      const selectedModel = result?.fallbackUsed === true
-        ? result?.fallbackModel || config.reaction.fallbackModel : config.reaction.model;
-      const selectedProvider = result?.fallbackUsed === true
-        ? result?.fallbackProvider || config.reaction.fallbackProvider : config.reaction.provider;
+      const selectedModel =
+        result?.fallbackUsed === true
+          ? result?.fallbackModel || config.reaction.fallbackModel
+          : config.reaction.model;
+      const selectedProvider =
+        result?.fallbackUsed === true
+          ? result?.fallbackProvider || config.reaction.fallbackProvider
+          : config.reaction.provider;
       const modelReceipt = reactionReq._viventiumProviderModelReceipts?.get(REACTION_AGENT_ID);
       usedRoute = {
         fallbackUsed: result?.fallbackUsed === true,
@@ -403,9 +406,11 @@ async function runEmotionalReaction(
             : config.reaction.provider,
         model: modelReceipt?.requestedModel === selectedModel ? modelReceipt.model : selectedModel,
         serviceTier:
-          selectedProvider === 'glasshive-harness' ? null : result?.fallbackUsed === true
-            ? result?.fallbackServiceTier || null
-            : config.reaction.serviceTier,
+          selectedProvider === 'glasshive-harness'
+            ? null
+            : result?.fallbackUsed === true
+              ? result?.fallbackServiceTier || null
+              : config.reaction.serviceTier,
         primaryErrorClass: result?.primaryErrorClass || null,
       };
       logFeelingsEvent(logger, req, 'feelings.reaction.model', {
@@ -622,8 +627,11 @@ async function runEmotionalReaction(
       {
         errorClass,
         failureStage,
-        errorType: ['TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'Error'].includes(error?.name)
-          ? error.name : 'Error',
+        errorType: ['TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'Error'].includes(
+          error?.name,
+        )
+          ? error.name
+          : 'Error',
         durationMs: completedAt.getTime() - startMs,
         fallbackUsed: usedRoute?.fallbackUsed ?? null,
         usedProvider: usedRoute?.provider || null,

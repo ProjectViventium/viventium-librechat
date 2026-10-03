@@ -20,9 +20,9 @@ describe('voice linked-chat formatting', () => {
 
   test('preserves URL bytes while stripping adjacent display controls', () => {
     const url = 'https://docs.example.test/_Section_/File.PDF?part=A_B#Result';
-    expect(sanitizeVoiceSurfaceTextForDisplay(`<soft>**Done.**</soft> [Report](${url}) {NTA}`)).toBe(
-      `Done. [Report](${url})`,
-    );
+    expect(
+      sanitizeVoiceSurfaceTextForDisplay(`<soft>**Done.**</soft> [Report](${url}) {NTA}`),
+    ).toBe(`Done. [Report](${url})`);
   });
 
   test.each([
@@ -31,7 +31,10 @@ describe('voice linked-chat formatting', () => {
     ['~~[Report](https://docs.example.test/a_b)~~', '[Report](https://docs.example.test/a_b)'],
     ['**https://docs.example.test/_Section_**', 'https://docs.example.test/_Section_'],
     ['_https://docs.example.test/a_b_', 'https://docs.example.test/a_b'],
-    ['**Read https://docs.example.test/_Section_ now.**', 'Read https://docs.example.test/_Section_ now.'],
+    [
+      '**Read https://docs.example.test/_Section_ now.**',
+      'Read https://docs.example.test/_Section_ now.',
+    ],
   ])('strips outer Markdown while preserving the public URL: %s', (text, expected) => {
     expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(expected);
     expect(

@@ -154,20 +154,37 @@ describe('CallButton voice readiness', () => {
   });
 
   it('saves call choices as defaults only after the user requests it', async () => {
-    mockFetch.mockResolvedValue({ ok: true, status: 200,
-      json: async () => ({ callSessionId: 'call-fixture', playgroundUrl: 'https://calls.example.com/?callSessionId=call-fixture' }) });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        callSessionId: 'call-fixture',
+        playgroundUrl: 'https://calls.example.com/?callSessionId=call-fixture',
+      }),
+    });
     renderCallButton();
     fireEvent.click(screen.getByRole('button', { name: 'Voice settings' }));
-    const save = await screen.findByRole('button', { name: 'Save these voice choices as my default' });
+    const save = await screen.findByRole('button', {
+      name: 'Save these voice choices as my default',
+    });
     expect(mockFetch).toHaveBeenCalledTimes(1);
-    mockFetch.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({
-      savedVoiceRoute: { stt: { provider: 'assemblyai', variant: 'u3-rt-pro' },
-        tts: { provider: 'xai', variant: 'Eve' } },
-    }) });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        savedVoiceRoute: {
+          stt: { provider: 'assemblyai', variant: 'u3-rt-pro' },
+          tts: { provider: 'xai', variant: 'Eve' },
+        },
+      }),
+    });
     fireEvent.click(save);
-    await screen.findByText('Voice defaults saved. Listening: assemblyai · u3-rt-pro. Speaking: xai · Eve.');
+    await screen.findByText(
+      'Voice defaults saved. Listening: assemblyai · u3-rt-pro. Speaking: xai · Eve.',
+    );
     expect(mockFetch).toHaveBeenLastCalledWith('/api/viventium/calls/call-fixture/voice-defaults', {
-      method: 'POST', headers: { Authorization: 'Bearer browser-token-fixture' },
+      method: 'POST',
+      headers: { Authorization: 'Bearer browser-token-fixture' },
     });
   });
 

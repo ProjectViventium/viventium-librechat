@@ -4779,6 +4779,42 @@ describe('viventium-memory-hardening', () => {
     }
   });
 
+  test('implicit Anthropic selection uses the current default while preserving explicit effort', () => {
+    const oldEnv = { ...process.env };
+    process.env.VIVENTIUM_PRIMARY_PROVIDER = 'anthropic';
+    process.env.VIVENTIUM_SECONDARY_PROVIDER = '';
+    for (const name of [
+      'VIVENTIUM_MEMORY_HARDENING_PROVIDER',
+      'VIVENTIUM_MEMORY_HARDENING_MODEL',
+      'VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL',
+      'VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT',
+      'VIVENTIUM_MEMORY_HARDENING_EFFORT',
+      'VIVENTIUM_MEMORY_HARDENING_MODEL_FALLBACKS',
+    ]) {
+      delete process.env[name];
+    }
+    try {
+      expect(resolveProvider({})).toMatchObject({
+        provider: 'anthropic',
+        model: 'claude-opus-5-5',
+        effort: 'high',
+      });
+      process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT = 'medium';
+      expect(resolveProvider({})).toMatchObject({
+        model: 'claude-opus-5-5',
+        effort: 'medium',
+      });
+      delete process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT;
+      process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT = 'xhigh';
+      expect(resolveProvider({})).toMatchObject({
+        model: 'claude-opus-5-5',
+        effort: 'xhigh',
+      });
+    } finally {
+      process.env = oldEnv;
+    }
+  });
+
   test('default model selection changes only through explicitly configured fallbacks', () => {
     const oldEnv = { ...process.env };
     process.env.VIVENTIUM_PRIMARY_PROVIDER = 'anthropic';
@@ -4787,7 +4823,11 @@ describe('viventium-memory-hardening', () => {
     process.env.VIVENTIUM_MEMORY_HARDENING_MODEL_FALLBACKS = '';
     try {
       expect(resolveProvider({}).candidates).toEqual([
-        expect.objectContaining({ provider: 'anthropic', model: 'claude-opus-5', effort: 'xhigh' }),
+        expect.objectContaining({
+          provider: 'anthropic',
+          model: 'claude-opus-5-5',
+          effort: 'high',
+        }),
       ]);
       expect(resolveProvider({}).candidates).toEqual(
         expect.not.arrayContaining([expect.objectContaining({ provider: 'openai' })]),

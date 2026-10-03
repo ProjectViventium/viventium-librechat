@@ -282,8 +282,21 @@ function contentText(content) {
       if (text) return text;
       // Typed media payloads carry bytes, not authored prose. This text projection leaves those
       // payloads intact; an unknown content type still cannot silently disappear.
-      if (['image_url', 'image', 'input_image', 'file', 'input_file', 'document',
-        'media', 'audio', 'input_audio', 'video'].includes(part.type)) return '';
+      if (
+        [
+          'image_url',
+          'image',
+          'input_image',
+          'file',
+          'input_file',
+          'document',
+          'media',
+          'audio',
+          'input_audio',
+          'video',
+        ].includes(part.type)
+      )
+        return '';
       return String(part.type || '');
     })
     .filter(Boolean)

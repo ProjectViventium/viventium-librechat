@@ -6096,24 +6096,82 @@ describe('/api/viventium/voice/chat', () => {
   });
 
   test('keeps a native mission input HTTP response pending and retries the exact operation under current call ownership', async () => {
-    require('~/server/services/viventium/CallSessionService').assertCallSessionSecret.mockResolvedValue({ callSessionId: 'call_session_1', userId: 'user_1', ownerParticipantIdentity: 'owner-participant', mode: 'call' });
+    require('~/server/services/viventium/CallSessionService').assertCallSessionSecret.mockResolvedValue(
+      {
+        callSessionId: 'call_session_1',
+        userId: 'user_1',
+        ownerParticipantIdentity: 'owner-participant',
+        mode: 'call',
+      },
+    );
     const service = require('~/server/services/viventium/VoiceTaskService');
-    const task = service.createVoiceTask({ callSessionId: 'call_session_1', userId: 'user_1', streamId: 'glasshive:run-native', owner: { kind: 'glasshive_run', id: 'run-native' } });
-    const binding = { version: 1, requestId: 'permission-1', requestFingerprint: 'a'.repeat(64), runId: 'run-native', attemptId: 'attempt-1', sessionId: 'session-1', expiresAt: '2099-01-01T00:00:00Z', taskId: task.taskId, workRef: 'work-native', userId: 'user_1', callSessionId: 'call_session_1' };
-    const provideInput = jest.fn().mockResolvedValueOnce({ accepted: false, confirmationPending: true }).mockResolvedValueOnce({ accepted: true });
-    service.registerVoiceTaskOwnerAdapter(task.taskId, { kind: 'glasshive_run', provideInput, nativeMissionInputBinding: binding });
-    service.observeGenerationEvent(task.taskId, { event: 'needs_input', data: { prompt: 'Permit?', inputType: 'choice', choices: [{ value: 'allow_once', label: 'Allow once' }] } });
+    const task = service.createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: 'glasshive:run-native',
+      owner: { kind: 'glasshive_run', id: 'run-native' },
+    });
+    const binding = {
+      version: 1,
+      requestId: 'permission-1',
+      requestFingerprint: 'a'.repeat(64),
+      runId: 'run-native',
+      attemptId: 'attempt-1',
+      sessionId: 'session-1',
+      expiresAt: '2099-01-01T00:00:00Z',
+      taskId: task.taskId,
+      workRef: 'work-native',
+      userId: 'user_1',
+      callSessionId: 'call_session_1',
+    };
+    const provideInput = jest
+      .fn()
+      .mockResolvedValueOnce({ accepted: false, confirmationPending: true })
+      .mockResolvedValueOnce({ accepted: true });
+    service.registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'glasshive_run',
+      provideInput,
+      nativeMissionInputBinding: binding,
+    });
+    service.observeGenerationEvent(task.taskId, {
+      event: 'needs_input',
+      data: {
+        prompt: 'Permit?',
+        inputType: 'choice',
+        choices: [{ value: 'allow_once', label: 'Allow once' }],
+      },
+    });
     const app = createTestApp(require('../voice'));
-    const request = () => createMockReq({ method: 'POST', url: `/api/viventium/voice/tasks/${task.taskId}/input`, headers: { 'x-viventium-call-secret': 'secret', 'x-viventium-call-session': 'call_session_1' }, body: { input: 'allow_once' } });
+    const request = () =>
+      createMockReq({
+        method: 'POST',
+        url: `/api/viventium/voice/tasks/${task.taskId}/input`,
+        headers: {
+          'x-viventium-call-secret': 'secret',
+          'x-viventium-call-session': 'call_session_1',
+        },
+        body: { input: 'allow_once' },
+      });
     const pending = createMockRes();
     await dispatch(app, request(), pending);
     expect(pending.statusCode).toBe(200);
-    expect(pending.body).toMatchObject({ outcome: 'pending', confirmationPending: true, task: { state: 'needs_input' } });
-    expect(provideInput.mock.calls[0][0]).toMatchObject({ voiceAuthorityContext: { callSessionId: 'call_session_1', binding: { callSessionId: 'call_session_1', userId: 'user_1', kind: 'participant_text' } } });
+    expect(pending.body).toMatchObject({
+      outcome: 'pending',
+      confirmationPending: true,
+      task: { state: 'needs_input' },
+    });
+    expect(provideInput.mock.calls[0][0]).toMatchObject({
+      voiceAuthorityContext: {
+        callSessionId: 'call_session_1',
+        binding: { callSessionId: 'call_session_1', userId: 'user_1', kind: 'participant_text' },
+      },
+    });
     const accepted = createMockRes();
     await dispatch(app, request(), accepted);
     expect(accepted.body).toMatchObject({ outcome: 'accepted', task: { state: 'running' } });
-    expect(provideInput.mock.calls[1][0].operationId).toBe(provideInput.mock.calls[0][0].operationId);
+    expect(provideInput.mock.calls[1][0].operationId).toBe(
+      provideInput.mock.calls[0][0].operationId,
+    );
   });
 
   test('retries a failed task only through its installed owner adapter', async () => {
@@ -7400,7 +7458,11 @@ describe('/api/viventium/voice/chat', () => {
     mockClaimGlassHiveDeliveries.mockResolvedValueOnce([
       {
         deliveryId: 'ghcd_voice',
-        callbackId: require('crypto').createHash('sha256').update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'),
+        callbackId: require('crypto')
+          .createHash('sha256')
+          .update('cb_voice')
+          .digest('hex')
+          .replace(/^/, 'callback_sha256:'),
         text: 'Worker finished.',
         claimId: 'claim_voice',
         userId: 'user_1',
@@ -7433,9 +7495,29 @@ describe('/api/viventium/voice/chat', () => {
 
   test('POST glasshive delivery claim rejects a substituted callback or a different owner/call', async () => {
     for (const mismatch of [
-      { callbackId: 'callback_sha256:' + 'b'.repeat(64), userId: 'user_1', voiceCallSessionId: 'call_session_1' },
-      { callbackId: require('crypto').createHash('sha256').update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'), userId: 'different_owner', voiceCallSessionId: 'call_session_1' },
-      { callbackId: require('crypto').createHash('sha256').update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'), userId: 'user_1', voiceCallSessionId: 'different_call' },
+      {
+        callbackId: 'callback_sha256:' + 'b'.repeat(64),
+        userId: 'user_1',
+        voiceCallSessionId: 'call_session_1',
+      },
+      {
+        callbackId: require('crypto')
+          .createHash('sha256')
+          .update('cb_voice')
+          .digest('hex')
+          .replace(/^/, 'callback_sha256:'),
+        userId: 'different_owner',
+        voiceCallSessionId: 'call_session_1',
+      },
+      {
+        callbackId: require('crypto')
+          .createHash('sha256')
+          .update('cb_voice')
+          .digest('hex')
+          .replace(/^/, 'callback_sha256:'),
+        userId: 'user_1',
+        voiceCallSessionId: 'different_call',
+      },
     ]) {
       mockClaimGlassHiveDeliveries.mockResolvedValueOnce([
         { deliveryId: 'ghcd_voice', claimId: 'claim_voice', ...mismatch },
@@ -7459,7 +7541,11 @@ describe('/api/viventium/voice/chat', () => {
     const exact = {
       deliveryId: 'ghcd_voice',
       claimId: 'claim_voice',
-      callbackId: require('crypto').createHash('sha256').update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'),
+      callbackId: require('crypto')
+        .createHash('sha256')
+        .update('cb_voice')
+        .digest('hex')
+        .replace(/^/, 'callback_sha256:'),
       userId: 'user_1',
       voiceCallSessionId: 'call_session_1',
     };
@@ -7890,5 +7976,4 @@ describe('/api/viventium/voice/chat', () => {
     },
   );
   /* === VIVENTIUM END === */
-
 });

@@ -249,7 +249,9 @@ describe('ViventiumMainCompactionService', () => {
         // The whole-proposal overflow names where its bytes are, so the repair can target them.
         const proposal = JSON.parse(rejected);
         const { issue } = payloads[1].priorRejection;
-        expect(issue.excessBytes).toBe(issue.actual - mainCompactionOutputConstraints.maxJsonUtf8Bytes);
+        expect(issue.excessBytes).toBe(
+          issue.actual - mainCompactionOutputConstraints.maxJsonUtf8Bytes,
+        );
         expect(issue.excessBytes).toBeGreaterThan(0);
         expect(payloads[1].priorRejection.issue).toMatchObject({
           path: '',
@@ -408,7 +410,10 @@ describe('ViventiumMainCompactionService', () => {
         await ensureAcceptedMainCompaction({ ...identity, executeCompactor: failing });
       }
       const before = calls;
-      const repeated = await ensureAcceptedMainCompaction({ ...identity, executeCompactor: failing });
+      const repeated = await ensureAcceptedMainCompaction({
+        ...identity,
+        executeCompactor: failing,
+      });
       expect(callsAfterFirst).toBeGreaterThan(0);
       expect(calls).toBe(before);
       expect(repeated).toMatchObject({ status: 'degraded', attempts: 0, reason: 'schema_invalid' });
@@ -922,12 +927,14 @@ describe('ViventiumMainCompactionService', () => {
       });
     }
     const backgroundCortexService = require('../../BackgroundCortexService');
-    const executeCortexSpy = jest.spyOn(backgroundCortexService, 'executeCortex').mockResolvedValueOnce({
-      insight: null,
-      errorClass: 'recoverable_provider_error',
-      errorStatus: 503,
-      nativeOwnership: 'unresolved',
-    });
+    const executeCortexSpy = jest
+      .spyOn(backgroundCortexService, 'executeCortex')
+      .mockResolvedValueOnce({
+        insight: null,
+        errorClass: 'recoverable_provider_error',
+        errorStatus: 503,
+        nativeOwnership: 'unresolved',
+      });
     const sleep = jest.fn().mockResolvedValue(undefined);
     try {
       // A 503 alone would back off and retry; the unreleased native request forbids any overlap.

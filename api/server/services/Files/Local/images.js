@@ -95,8 +95,10 @@ function encodeImage(imagePath) {
  */
 async function prepareImagesLocal(req, file) {
   /* === VIVENTIUM START: Read the same storage root used to save and serve images. === */
-  if (typeof file.filepath !== 'string' ||
-    !['/images/', '/uploads/'].some((route) => file.filepath.startsWith(route))) {
+  if (
+    typeof file.filepath !== 'string' ||
+    !['/images/', '/uploads/'].some((route) => file.filepath.startsWith(route))
+  ) {
     throw new Error('Invalid image file path');
   }
   const stream = await getLocalFileStream(req, file.filepath);

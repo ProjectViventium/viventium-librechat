@@ -566,7 +566,10 @@ describe('forced follow-up onto an empty primary answer', () => {
           conversationId: 'synthetic-conversation',
           parentMessageId: 'synthetic-answer',
           agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
-          insightsData: { cortexCount: 1, insights: [{ cortexName: 'Synthetic', insight: 'Fact.' }] },
+          insightsData: {
+            cortexCount: 1,
+            insights: [{ cortexName: 'Synthetic', insight: 'Fact.' }],
+          },
         },
         { text: 'The recovered answer.', shouldForceVisibleFollowUp: true },
       );

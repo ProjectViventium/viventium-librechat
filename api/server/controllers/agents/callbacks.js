@@ -503,11 +503,7 @@ class ModelEndHandler {
       context?.clientOptions?.[VIVENTIUM_DELIVERY_DISPOSITION_CAPABILITY_OWNER] ||
       context?.provider;
     const capability = this.req?.config?.endpoints?.agents?.providerCapabilities?.[owner];
-    if (
-      capability?.workspace_binding !== true ||
-      capability?.conversation_session !== true
-    )
-      return;
+    if (capability?.workspace_binding !== true || capability?.conversation_session !== true) return;
     let carrier;
     try {
       carrier = inspectNativeOutputFileCarrier(chunk);
@@ -659,7 +655,10 @@ class ModelEndHandler {
             agentContext.agentId,
             currentOutput.carrier.requestId || outputKey,
           ]);
-          transfers.set(identity, { carrier: currentOutput.carrier, agentId: agentContext.agentId });
+          transfers.set(identity, {
+            carrier: currentOutput.carrier,
+            agentId: agentContext.agentId,
+          });
         }
         // The original publisher remains the import authority. The existing consumer checks
         // the current logical turn, owner, run and attempt; a handoff cannot rebind a file.

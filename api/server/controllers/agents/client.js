@@ -2494,8 +2494,7 @@ function createCompletionErrorContentPart(err) {
       "The model response exceeded this turn's configured deadline and was stopped. Please retry the turn.",
     provider_temporarily_unavailable:
       'The model provider is temporarily overloaded. Please try again shortly.',
-    host_capacity:
-      'Local AI capacity is busy. Please try again shortly.',
+    host_capacity: 'Local AI capacity is busy. Please try again shortly.',
     provider_auth_missing:
       'The configured model provider authentication is unavailable. Reconnect it, then try again.',
     provider_connected_account_reconnect_required: getPublicConnectedAccountReconnectMessage(err),
@@ -3391,12 +3390,16 @@ function voiceProviderTraceRoute(req, agent, { isFallback = false, fallbackReaso
   const model = String(attemptFacts?.model || direct.model || '').trim();
   const receipt = req?._viventiumProviderModelReceipts?.get(agent?.id);
   const actualModel = receipt?.requestedModel === model ? receipt.model : model;
-  const reasoningEffort = agent?.model_parameters?.reasoning_effort ||
-    agent?.model_parameters?.reasoningEffort;
-  return provider && model ? {
-    provider, model: actualModel, requestedModel: model,
-    ...(reasoningEffort ? { reasoningEffort } : {}),
-  } : null;
+  const reasoningEffort =
+    agent?.model_parameters?.reasoning_effort || agent?.model_parameters?.reasoningEffort;
+  return provider && model
+    ? {
+        provider,
+        model: actualModel,
+        requestedModel: model,
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+      }
+    : null;
 }
 
 function voiceProviderFailureStatus(error, fallbackReason = '') {
@@ -7947,8 +7950,11 @@ class AgentClient extends BaseClient {
             facts: {
               responseRef: this.responseMessageId,
               cortexRef: cortex.agent_id,
-              cortexStatus: wingModeActive ? 'wing_mode'
-                : suppressBackgroundCortices ? 'insight_delivery' : 'budget_disabled',
+              cortexStatus: wingModeActive
+                ? 'wing_mode'
+                : suppressBackgroundCortices
+                  ? 'insight_delivery'
+                  : 'budget_disabled',
             },
           });
         }

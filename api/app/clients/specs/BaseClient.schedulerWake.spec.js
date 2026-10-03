@@ -187,7 +187,10 @@ test('the first scheduled occurrence has no prior source and is admitted', async
 
 test.each([
   ['an interactive turn', {}],
-  ['a body that only claims scheduler origin', { viventiumOrigin: 'scheduler', viventiumActorKind: 'system' }],
+  [
+    'a body that only claims scheduler origin',
+    { viventiumOrigin: 'scheduler', viventiumActorKind: 'system' },
+  ],
 ])('%s on a scheduled thread keeps its existing history and guard', async (_label, body) => {
   mockGetMessages.mockResolvedValue(legacyScheduledThread(10));
   const req = { user: { id: OWNER }, body: { conversationId: CONVERSATION, ...body } };

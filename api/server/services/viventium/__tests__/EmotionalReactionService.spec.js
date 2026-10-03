@@ -29,7 +29,11 @@ jest.mock('@librechat/data-schemas', () => ({
   logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
 }));
 
-const { buildFeelingCapsule, createDefaultFeelingBands, parseFeelingReactionOutput } = require('@librechat/api');
+const {
+  buildFeelingCapsule,
+  createDefaultFeelingBands,
+  parseFeelingReactionOutput,
+} = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const {
   buildEmotionalReactionAgent,
@@ -100,16 +104,29 @@ describe('EmotionalReactionService', () => {
       const deps = depsFor(state);
       deps.executeCortex.mockImplementation(async ({ req, agent }) => {
         req._viventiumProviderModelReceipts.set(agent.id, {
-          requestedModel: 'grok-build:grok-4.7-build-fast', model: 'grok-build:grok-4.7',
+          requestedModel: 'grok-build:grok-4.7-build-fast',
+          model: 'grok-build:grok-4.7',
         });
         return { insight: reactionInsight() };
       });
-      const result = await runEmotionalReaction({ req: { user: { id: 'user-1' }, body: {} },
-        userText: 'A synthetic moment.', stimulusId: 'native-model', scheduledSnapshot: state }, deps);
+      const result = await runEmotionalReaction(
+        {
+          req: { user: { id: 'user-1' }, body: {} },
+          userText: 'A synthetic moment.',
+          stimulusId: 'native-model',
+          scheduledSnapshot: state,
+        },
+        deps,
+      );
       expect(result.status).toBe('healthy');
-      expect(deps.commitFeelingReaction).toHaveBeenCalledWith(expect.objectContaining({
-        health: expect.objectContaining({ lastUsedModel: 'grok-build:grok-4.7', lastUsedServiceTier: null }),
-      }));
+      expect(deps.commitFeelingReaction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          health: expect.objectContaining({
+            lastUsedModel: 'grok-build:grok-4.7',
+            lastUsedServiceTier: null,
+          }),
+        }),
+      );
     } finally {
       if (priorProvider === undefined) delete process.env.VIVENTIUM_FEELINGS_REACTION_PROVIDER;
       else process.env.VIVENTIUM_FEELINGS_REACTION_PROVIDER = priorProvider;
@@ -359,20 +376,41 @@ describe('EmotionalReactionService', () => {
     deps.executeCortex
       .mockResolvedValueOnce({ insight: '{"changes":[]}' })
       .mockImplementationOnce(async ({ agent, messages }) => {
-        const shapeLine = messages[1].content.split('\n').find((line) => line.startsWith('{"changes":'));
+        const shapeLine = messages[1].content
+          .split('\n')
+          .find((line) => line.startsWith('{"changes":'));
         emittedRetryShape = shapeLine && JSON.parse(shapeLine);
-        const systemShape = agent.instructions.split('\n').find((line) => line.startsWith('{"changes":'));
+        const systemShape = agent.instructions
+          .split('\n')
+          .find((line) => line.startsWith('{"changes":'));
         expect(shapeLine).toBe(systemShape);
         expect(Object.keys(emittedRetryShape).sort()).toEqual(['changes', 'innerState']);
-        const output = JSON.stringify({ ...emittedRetryShape, changes: [], innerState: 'I feel steady and present.' });
-        expect(parseFeelingReactionOutput(output)).toEqual({ changes: [], innerState: 'I feel steady and present.' });
+        const output = JSON.stringify({
+          ...emittedRetryShape,
+          changes: [],
+          innerState: 'I feel steady and present.',
+        });
+        expect(parseFeelingReactionOutput(output)).toEqual({
+          changes: [],
+          innerState: 'I feel steady and present.',
+        });
         return { insight: output };
       });
-    const result = await runEmotionalReaction({
-      req: { user: { id: 'user-1' }, body: {} }, userText: 'The status indicator is green.',
-      stimulusId: 'neutral-schema-retry', scheduledSnapshot: state,
-    }, deps);
-    expect(result).toEqual({ status: 'healthy', changedBandIds: [], operations: 0, innerStateUpdated: true });
+    const result = await runEmotionalReaction(
+      {
+        req: { user: { id: 'user-1' }, body: {} },
+        userText: 'The status indicator is green.',
+        stimulusId: 'neutral-schema-retry',
+        scheduledSnapshot: state,
+      },
+      deps,
+    );
+    expect(result).toEqual({
+      status: 'healthy',
+      changedBandIds: [],
+      operations: 0,
+      innerStateUpdated: true,
+    });
     expect(deps.executeCortex).toHaveBeenCalledTimes(2);
     expect(deps.commitFeelingReaction).toHaveBeenCalledTimes(1);
     expect(emittedRetryShape).toHaveProperty('innerState');
@@ -464,15 +502,21 @@ describe('EmotionalReactionService', () => {
       const deps = depsFor(state);
       deps.executeCortex
         .mockResolvedValueOnce({
-          insight: '', errorClass: 'recoverable_provider_error', nativeOwnership, fallbackUsed,
+          insight: '',
+          errorClass: 'recoverable_provider_error',
+          nativeOwnership,
+          fallbackUsed,
         })
         .mockResolvedValueOnce({ insight: reactionInsight() });
-      const result = await runEmotionalReaction({
-        req: { user: { id: 'user-1' }, body: {} },
-        userText: 'A synthetic appraisal.',
-        stimulusId: `capacity-${nativeOwnership}-${fallbackUsed}`,
-        scheduledSnapshot: state,
-      }, deps);
+      const result = await runEmotionalReaction(
+        {
+          req: { user: { id: 'user-1' }, body: {} },
+          userText: 'A synthetic appraisal.',
+          stimulusId: `capacity-${nativeOwnership}-${fallbackUsed}`,
+          scheduledSnapshot: state,
+        },
+        deps,
+      );
       expect(result.status).toBe(status);
       expect(deps.executeCortex).toHaveBeenCalledTimes(calls);
       expect(deps.commitFeelingReaction).toHaveBeenCalledTimes(status === 'healthy' ? 1 : 0);
@@ -492,22 +536,34 @@ describe('EmotionalReactionService', () => {
     const state = snapshot();
     const deps = depsFor(state);
     deps.executeCortex.mockResolvedValue({
-      insight: '', errorClass: 'recoverable_provider_error', nativeOwnership: 'released',
+      insight: '',
+      errorClass: 'recoverable_provider_error',
+      nativeOwnership: 'released',
     });
-    await expect(runEmotionalReaction({
-      req: { user: { id: 'user-1' }, body: {} },
-      userText: 'A synthetic appraisal.',
-      stimulusId: 'capacity-exhausted',
-      scheduledSnapshot: state,
-    }, deps)).resolves.toEqual({ status: 'degraded', errorClass: 'recoverable_provider_error' });
+    await expect(
+      runEmotionalReaction(
+        {
+          req: { user: { id: 'user-1' }, body: {} },
+          userText: 'A synthetic appraisal.',
+          stimulusId: 'capacity-exhausted',
+          scheduledSnapshot: state,
+        },
+        deps,
+      ),
+    ).resolves.toEqual({ status: 'degraded', errorClass: 'recoverable_provider_error' });
     expect(deps.executeCortex).toHaveBeenCalledTimes(2);
     expect(deps.executeCortex.mock.calls[1][0].messages).toEqual(
       deps.executeCortex.mock.calls[0][0].messages,
     );
     expect(deps.commitFeelingReaction).not.toHaveBeenCalled();
-    expect(deps.updateFeelingReactionHealth).toHaveBeenLastCalledWith(expect.objectContaining({
-      health: expect.objectContaining({ status: 'degraded', lastErrorClass: 'recoverable_provider_error' }),
-    }));
+    expect(deps.updateFeelingReactionHealth).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        health: expect.objectContaining({
+          status: 'degraded',
+          lastErrorClass: 'recoverable_provider_error',
+        }),
+      }),
+    );
   });
 
   test.each([

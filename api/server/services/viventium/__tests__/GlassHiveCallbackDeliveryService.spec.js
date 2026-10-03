@@ -1842,36 +1842,57 @@ describe('GlassHiveCallbackDeliveryService', () => {
 
   test('retains exact issued Telegram receipts after expiry without granting settlement or replay', async () => {
     const fixture = workerCompletionFixture();
-    const candidate = { ...fixture.row, surface: 'telegram', telegramChatId: 'chat-1',
-      telegramUserId: 'telegram-1', telegramMessageThreadId: '9', logicalMessageId: 'follow-up-coalesced',
-      dispatchPermitExpiresAt: new Date(Date.now() - 1000) };
+    const candidate = {
+      ...fixture.row,
+      surface: 'telegram',
+      telegramChatId: 'chat-1',
+      telegramUserId: 'telegram-1',
+      telegramMessageThreadId: '9',
+      logicalMessageId: 'follow-up-coalesced',
+      dispatchPermitExpiresAt: new Date(Date.now() - 1000),
+    };
     const dispatchPermit = { ...fixture.dispatchPermit, surface: 'telegram' };
     mockFindOne.mockReturnValueOnce(leanResult(candidate));
-    await expect(markGlassHiveCallbackDeliveryUnknown({
-      deliveryId: candidate.deliveryId, claimId: candidate.claimId, dispatchPermit,
-      telegramMessageIds: ['701', '701', '702'],
-    })).resolves.toBeNull();
-    expect(mockUpdateOne).toHaveBeenCalledWith(expect.objectContaining({
-      status: 'claimed', deliveryId: candidate.deliveryId, claimId: candidate.claimId,
-      userId: candidate.userId, telegramChatId: 'chat-1', telegramMessageThreadId: '9',
-      callbackMessageId: candidate.callbackMessageId,
-      dispatchPermitId: candidate.dispatchPermitId,
-      dispatchPermitGeneration: candidate.dispatchPermitGeneration,
-      terminalCallbackResultDigest: candidate.terminalCallbackResultDigest,
-      workerCompletionPresentation: candidate.workerCompletionPresentation,
-    }), {
-      $addToSet: { telegramSentMessageIds: { $each: ['701', '702'] } },
-      $set: { telegramMessageId: '702', transportReceiptVersion: 1 },
-    });
+    await expect(
+      markGlassHiveCallbackDeliveryUnknown({
+        deliveryId: candidate.deliveryId,
+        claimId: candidate.claimId,
+        dispatchPermit,
+        telegramMessageIds: ['701', '701', '702'],
+      }),
+    ).resolves.toBeNull();
+    expect(mockUpdateOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'claimed',
+        deliveryId: candidate.deliveryId,
+        claimId: candidate.claimId,
+        userId: candidate.userId,
+        telegramChatId: 'chat-1',
+        telegramMessageThreadId: '9',
+        callbackMessageId: candidate.callbackMessageId,
+        dispatchPermitId: candidate.dispatchPermitId,
+        dispatchPermitGeneration: candidate.dispatchPermitGeneration,
+        terminalCallbackResultDigest: candidate.terminalCallbackResultDigest,
+        workerCompletionPresentation: candidate.workerCompletionPresentation,
+      }),
+      {
+        $addToSet: { telegramSentMessageIds: { $each: ['701', '702'] } },
+        $set: { telegramMessageId: '702', transportReceiptVersion: 1 },
+      },
+    );
     expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
     expect(mockFenceEffectTransaction).not.toHaveBeenCalled();
     expect(mockReleaseEffectLease).not.toHaveBeenCalled();
     mockUpdateOne.mockClear();
     mockFindOne.mockReturnValueOnce(leanResult({ ...candidate, dispatchPermitGeneration: 2 }));
-    await expect(markGlassHiveCallbackDeliveryUnknown({
-      deliveryId: candidate.deliveryId, claimId: candidate.claimId, dispatchPermit,
-      telegramMessageIds: ['703'],
-    })).resolves.toBeNull();
+    await expect(
+      markGlassHiveCallbackDeliveryUnknown({
+        deliveryId: candidate.deliveryId,
+        claimId: candidate.claimId,
+        dispatchPermit,
+        telegramMessageIds: ['703'],
+      }),
+    ).resolves.toBeNull();
     expect(mockUpdateOne).not.toHaveBeenCalled();
   });
 

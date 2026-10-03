@@ -15,10 +15,7 @@
 const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
 const { MAIN_COMPACTION_SOURCE_TARGET_BYTES } = require('@librechat/api');
-const {
-  hasUnreconciledMainHistory,
-  messageContentText,
-} = require('./ViventiumMainContextService');
+const { hasUnreconciledMainHistory, messageContentText } = require('./ViventiumMainContextService');
 
 /** Newer visible rows always carried intact after a reconciliation. */
 const TAIL_TARGET_ROWS = 48;
@@ -267,7 +264,11 @@ function createConversationContinuityStore({ Model, MessageModel, now = () => ne
   async function complete({ ownerId, conversationId, plan, leaseId, semanticCompaction, review }) {
     // Promote only while every covered row still has the exact content the summary was built on.
     const ids = plan.coveredSource.map((row) => row.id);
-    const stored = await MessageModel.find({ user: ownerId, conversationId, messageId: { $in: ids } })
+    const stored = await MessageModel.find({
+      user: ownerId,
+      conversationId,
+      messageId: { $in: ids },
+    })
       .select('messageId role isCreatedByUser text content metadata')
       .lean();
     const byId = new Map((stored || []).map((row) => [String(row.messageId), row]));

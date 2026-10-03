@@ -302,7 +302,9 @@ describe('BackgroundCortexService activation policy helpers', () => {
     const debugSpy = jest.spyOn(logger, 'debug').mockImplementation(() => undefined);
     const req = requestWithMainSnapshot();
     req.config = {
-      endpoints: { agents: { providerCapabilities: { 'native-test': { workspace_binding: true } } } },
+      endpoints: {
+        agents: { providerCapabilities: { 'native-test': { workspace_binding: true } } },
+      },
     };
     try {
       await executeCortexOnce(
@@ -331,7 +333,9 @@ describe('BackgroundCortexService activation policy helpers', () => {
           createRunFn: jest.fn(async () => ({ processStream: jest.fn(async () => '{NTA}') })),
         },
       );
-      const trace = debugSpy.mock.calls.find(([message]) => message === '[PromptFrameTraceTelemetry]');
+      const trace = debugSpy.mock.calls.find(
+        ([message]) => message === '[PromptFrameTraceTelemetry]',
+      );
       expect(trace).toBeDefined();
       const frame = JSON.parse(trace[1]);
       const { buildPromptFrameRequestIdentityHash } = require('../viventium/promptFrameTelemetry');
@@ -1749,7 +1753,9 @@ describe('BackgroundCortexService activation policy helpers', () => {
   });
 
   test('binds exact native release using the initialized attempt configuration split', async () => {
-    const { bindHarnessCancellation } = require('../viventium/GlassHiveConversationProviderService');
+    const {
+      bindHarnessCancellation,
+    } = require('../viventium/GlassHiveConversationProviderService');
     const fetchImpl = jest.fn().mockResolvedValue({
       ok: true,
       json: jest.fn().mockResolvedValue({ capacityReleased: true }),
@@ -1799,12 +1805,16 @@ describe('BackgroundCortexService activation policy helpers', () => {
   });
 
   test('reports a missing native release binding without exporting the initialized config', async () => {
-    const { bindHarnessCancellation } = require('../viventium/GlassHiveConversationProviderService');
+    const {
+      bindHarnessCancellation,
+    } = require('../viventium/GlassHiveConversationProviderService');
     const warn = jest.spyOn(logger, 'warn');
     try {
       const req = { user: { id: 'owner-synthetic' }, body: {} };
       await prepareCortexConversationProviderCapability({
-        targetAgent: { model_parameters: { configuration: { baseURL: 'http://native.example/v1' } } },
+        targetAgent: {
+          model_parameters: { configuration: { baseURL: 'http://native.example/v1' } },
+        },
         req,
         capability: { workspace_binding: true },
         requestBody: { viventiumGlassHiveIdempotencyKey: 'cortex:unbound:attempt-1' },

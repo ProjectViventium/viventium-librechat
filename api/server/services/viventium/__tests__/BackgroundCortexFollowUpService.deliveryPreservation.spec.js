@@ -509,11 +509,17 @@ test('promoting a new completed result invalidates an older delivery acknowledge
       },
     );
     expect(message.metadata.viventium.messageRevision).toBe(6);
-    expect(prepareAttachments).toHaveBeenCalledWith(expect.objectContaining({
-      messageId: 'parent-promoted', conversationId: 'conversation-promoted',
-      agent_id: 'main-promoted',
-    }));
-    expect(message.attachments).toEqual([{ file_id: 'prior-file', filename: 'prior.png' }, ...attachments]);
+    expect(prepareAttachments).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: 'parent-promoted',
+        conversationId: 'conversation-promoted',
+        agent_id: 'main-promoted',
+      }),
+    );
+    expect(message.attachments).toEqual([
+      { file_id: 'prior-file', filename: 'prior.png' },
+      ...attachments,
+    ]);
     expect(message.metadata.viventium).not.toHaveProperty('deliveryAcknowledgement');
     expect(update).toHaveBeenCalledWith(
       expect.anything(),

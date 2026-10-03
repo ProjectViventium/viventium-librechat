@@ -2404,13 +2404,23 @@ async function recordObservedTelegramMessageIds(candidate, filter, dispatchPermi
     !messageIds.length ||
     candidate?.surface !== 'telegram' ||
     !presentedDispatchPermitMatches(candidate, dispatchPermit)
-  ) return;
+  )
+    return;
   const issuedIdentity = { ...filter, surface: 'telegram' };
   for (const field of [
-    'userId', 'telegramChatId', 'telegramUserId', 'telegramMessageThreadId',
-    'callbackMessageId', 'logicalMessageId', 'dispatchPermitId', 'dispatchPermitGeneration',
-    'terminalCallbackResultKey', 'terminalCallbackAcceptedOperationId', 'terminalCallbackId',
-    'terminalCallbackResultRevision', 'terminalCallbackResultDigest',
+    'userId',
+    'telegramChatId',
+    'telegramUserId',
+    'telegramMessageThreadId',
+    'callbackMessageId',
+    'logicalMessageId',
+    'dispatchPermitId',
+    'dispatchPermitGeneration',
+    'terminalCallbackResultKey',
+    'terminalCallbackAcceptedOperationId',
+    'terminalCallbackId',
+    'terminalCallbackResultRevision',
+    'terminalCallbackResultDigest',
   ]) {
     issuedIdentity[field] = candidate[field] === undefined ? { $exists: false } : candidate[field];
   }

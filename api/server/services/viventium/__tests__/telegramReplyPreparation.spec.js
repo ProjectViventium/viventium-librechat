@@ -52,14 +52,21 @@ describe('preparedTelegramReplyDescriptor', () => {
     });
     const adapter = {
       repliedTelegramMessageId: '12',
-      attachments: [{ kind: 'document', fileId: 'doc-1', extractedText: 'Willow 4.10 per booklet' }],
+      attachments: [
+        { kind: 'document', fileId: 'doc-1', extractedText: 'Willow 4.10 per booklet' },
+      ],
     };
     // What the ready record keeps from the first admission's adapter descriptor.
     const stored = quotedAttachmentTexts(quoted, adapter);
     expect(stored).toEqual([{ fileId: 'doc-1', extractedText: 'Willow 4.10 per booklet' }]);
     // The actual identity-only continuation carries no descriptor.
     expect(preparedTelegramReplyDescriptor(quoted, OWNER, undefined, stored).attachments).toEqual([
-      { kind: 'document', fileId: 'doc-1', filename: 'rates.pdf', extractedText: 'Willow 4.10 per booklet' },
+      {
+        kind: 'document',
+        fileId: 'doc-1',
+        filename: 'rates.pdf',
+        extractedText: 'Willow 4.10 per booklet',
+      },
     ]);
     // Stored text of another file never attaches to this one.
     expect(

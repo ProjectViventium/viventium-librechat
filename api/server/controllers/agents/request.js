@@ -170,12 +170,15 @@ function scheduleAcceptedMainCompaction(req, client, commitResult) {
  */
 function retainAcceptedMainFollowUps(req, client, userId, responseMessageId) {
   const compactionClient = { options: { agent: client?.options?.agent } };
-  const admitMemory = req._viventiumMemoryWriterAwaitingAcceptance === true
-    ? client.admitMemoryWriter?.bind(client) : null;
+  const admitMemory =
+    req._viventiumMemoryWriterAwaitingAcceptance === true
+      ? client.admitMemoryWriter?.bind(client)
+      : null;
   return retainExternalAcceptanceFollowUps({
     userId,
     responseMessageId,
-    scheduleCompaction: (commitResult) => scheduleAcceptedMainCompaction(req, compactionClient, commitResult),
+    scheduleCompaction: (commitResult) =>
+      scheduleAcceptedMainCompaction(req, compactionClient, commitResult),
     admitMemory,
     onMemoryError: (error) => {
       logger.warn('[VIVENTIUM][memory] Accepted turn writer could not start', {
@@ -190,7 +193,9 @@ async function startPersistedMainMemory(req, client, awaitExternalAcceptance) {
     awaitExternalAcceptance,
     prepare: client.prepareDeferredMemoryWriter?.bind(client),
     start: client.startDeferredMemoryWriter?.bind(client),
-    onPrepared: () => { req._viventiumMemoryWriterAwaitingAcceptance = true; },
+    onPrepared: () => {
+      req._viventiumMemoryWriterAwaitingAcceptance = true;
+    },
   });
 }
 /* === VIVENTIUM END === */
@@ -2058,7 +2063,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           ) {
             /* === VIVENTIUM END === */
             const memoryWriterAdmission = await startPersistedMainMemory(
-              req, client, requiresExternalDeliveryAcknowledgement && !deliveryWasCommittedBeforePersistence,
+              req,
+              client,
+              requiresExternalDeliveryAcknowledgement && !deliveryWasCommittedBeforePersistence,
             );
             if (memoryWriterAdmission) {
               responseForCommit.memoryWriteStatus = 'pending';
@@ -2170,7 +2177,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               !unsupportedPersistence.suppressed &&
               !wasAbortedBeforeComplete &&
               (await startPersistedMainMemory(
-                req, client, requiresExternalDeliveryAcknowledgement && !deliveryWasCommittedBeforePersistence,
+                req,
+                client,
+                requiresExternalDeliveryAcknowledgement && !deliveryWasCommittedBeforePersistence,
               ))
             ) {
               responseForCommit.memoryWriteStatus = 'pending';
@@ -2305,7 +2314,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             title: conversation.title,
             requestMessage: sanitizeMessageForTransmit(userMessage),
             responseMessage: responseMessageForTransmit,
-            memoryWriterScheduled: req._viventiumMemoryWriterScheduled === true ||
+            memoryWriterScheduled:
+              req._viventiumMemoryWriterScheduled === true ||
               req._viventiumMemoryWriterAwaitingAcceptance === true,
             ...(admissionReceipt
               ? { memoryReceipt: memoryReceiptFromAttachments([admissionReceipt]) }
@@ -3141,7 +3151,9 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
         );
         if (assistantPersistence && !assistantPersistence.suppressed) {
           const memoryWriterAdmission = await startPersistedMainMemory(
-            req, client, requiresExternalDeliveryAcknowledgement,
+            req,
+            client,
+            requiresExternalDeliveryAcknowledgement,
           );
           if (memoryWriterAdmission) {
             finalResponse.memoryWriteStatus = 'pending';
@@ -3159,7 +3171,8 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
         title: conversation.title,
         requestMessage: sanitizeMessageForTransmit(userMessage),
         responseMessage: finalResponse,
-        memoryWriterScheduled: req._viventiumMemoryWriterScheduled === true ||
+        memoryWriterScheduled:
+          req._viventiumMemoryWriterScheduled === true ||
           req._viventiumMemoryWriterAwaitingAcceptance === true,
       });
       res.end();

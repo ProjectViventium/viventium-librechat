@@ -18,7 +18,9 @@ const {
 const {
   recoverPendingCortexInsightDeliveries,
 } = require('../server/services/viventium/staleCortexMessageRecovery');
-const { persistCompletedCortexGraphInsight } = require('../server/services/BackgroundCortexService');
+const {
+  persistCompletedCortexGraphInsight,
+} = require('../server/services/BackgroundCortexService');
 
 const CORTICES = [
   { agent: { id: 'deep-memory', name: 'Deep Memory Search' }, insight: 'First exact insight.' },
@@ -95,7 +97,12 @@ describe('Phase B owner-batched Cortex insight delivery', () => {
   }
 
   async function persistAndPresent(service, ownerId, claims, messageId) {
-    await service.markPersisted({ ownerId, claims, persistedMessageId: messageId, messageRevision: 1 });
+    await service.markPersisted({
+      ownerId,
+      claims,
+      persistedMessageId: messageId,
+      messageRevision: 1,
+    });
     const fence = await service.fencePresentation({
       ownerId,
       claims,
@@ -256,7 +263,10 @@ describe('Phase B owner-batched Cortex insight delivery', () => {
 
     // The released owner's follow-up failed before recording: its rows become one grouped batch.
     await expect(
-      outbox.releaseOwnedInsights({ ownerId: 'owner-released', parentMessageId: 'answer-released' }),
+      outbox.releaseOwnedInsights({
+        ownerId: 'owner-released',
+        parentMessageId: 'answer-released',
+      }),
     ).resolves.toEqual({ released: 2 });
     await expect(otherSlot.replayPending({ recordBatch: service.recordBatch })).resolves.toEqual({
       scanned: 2,
@@ -271,9 +281,9 @@ describe('Phase B owner-batched Cortex insight delivery', () => {
 
     // The sibling answer's live owner keeps its accepted insight out of every other path.
     expect(await Delivery.countDocuments({ parentMessageId: 'answer-sibling' })).toBe(0);
-    expect(
-      await Outbox.countDocuments({ userId: 'owner-sibling', replayState: 'pending' }),
-    ).toBe(1);
+    expect(await Outbox.countDocuments({ userId: 'owner-sibling', replayState: 'pending' })).toBe(
+      1,
+    );
     await expect(
       outbox.settleOwnedInsights({
         ownerId: 'owner-released',
@@ -362,7 +372,10 @@ describe('Phase B owner-batched Cortex insight delivery', () => {
         (row) => row.deliveryKey,
       ),
     });
-    await outbox.releaseOwnedInsights({ ownerId: 'owner-closed', parentMessageId: 'answer-closed' });
+    await outbox.releaseOwnedInsights({
+      ownerId: 'owner-closed',
+      parentMessageId: 'answer-closed',
+    });
 
     await expect(acceptOne(outbox, 'closed', CORTICES[1])).rejects.toMatchObject({
       code: 'cortex_insight_owner_closed',

@@ -578,7 +578,10 @@ describe('Feelings agent scope', () => {
     client.responseMessageId = 'current-assistant-reply';
     await client.scheduleFeelingsReaction({});
     expect(mockScheduleEmotionalReaction).toHaveBeenCalledWith(
-      expect.objectContaining({ stimulusId: 'current-user-message', userText: 'new voice stimulus' }),
+      expect.objectContaining({
+        stimulusId: 'current-user-message',
+        userText: 'new voice stimulus',
+      }),
     );
   });
 
@@ -1606,8 +1609,7 @@ describe('late completion error content parts', () => {
     };
     expect(AgentClient.createCompletionErrorContentPart(localCapacity)).toEqual({
       type: ContentTypes.ERROR,
-      [ContentTypes.ERROR]:
-        'Local AI capacity is busy. Please try again shortly.',
+      [ContentTypes.ERROR]: 'Local AI capacity is busy. Please try again shortly.',
       error_class: 'host_capacity',
       retryable: true,
       retry_after_seconds: 7,
@@ -5157,7 +5159,9 @@ describe('AgentClient - titleConvo', () => {
 
     it('captures a deferred external writer before cleanup and admits the captured source only once', async () => {
       const { HumanMessage } = require('@librechat/agents/langchain/messages');
-      client.deferredMemoryWriterMessages = [new HumanMessage('Remember this accepted preference.')];
+      client.deferredMemoryWriterMessages = [
+        new HumanMessage('Remember this accepted preference.'),
+      ];
       expect(client.prepareDeferredMemoryWriter()).toBe(true);
       expect(db.admitMemoryWrite).not.toHaveBeenCalled();
       const pending = client.memoryWriterPromise;

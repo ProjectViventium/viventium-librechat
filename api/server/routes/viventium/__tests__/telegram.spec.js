@@ -3823,15 +3823,21 @@ describe('/api/viventium/telegram', () => {
     mockResolveVoiceContextKeyterms.mockResolvedValueOnce(['Example Meeting']);
     const app = createTestApp(require('../telegram'));
     const req = createMockReq({
-      method: 'GET', url: '/api/viventium/telegram/voice-route',
+      method: 'GET',
+      url: '/api/viventium/telegram/voice-route',
       headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
-      query: { telegramUserId: 'tg-1', conversationId: 'conversation-topic', userId: 'forged-owner' },
+      query: {
+        telegramUserId: 'tg-1',
+        conversationId: 'conversation-topic',
+        userId: 'forged-owner',
+      },
     });
     const res = createMockRes();
     await dispatch(app, req, res);
     expect(res.statusCode).toBe(200);
     expect(mockResolveVoiceContextKeyterms).toHaveBeenCalledWith({
-      userId: 'user_1', conversationId: 'conversation-topic',
+      userId: 'user_1',
+      conversationId: 'conversation-topic',
     });
     expect(res.body.voiceRoute.contextualKeyterms).toEqual(['Example Meeting']);
   });
@@ -3839,7 +3845,8 @@ describe('/api/viventium/telegram', () => {
   test('GET /voice-route rejects unauthenticated contextual lookup', async () => {
     const app = createTestApp(require('../telegram'));
     const req = createMockReq({
-      method: 'GET', url: '/api/viventium/telegram/voice-route',
+      method: 'GET',
+      url: '/api/viventium/telegram/voice-route',
       query: { telegramUserId: 'tg-1', conversationId: 'conversation-topic' },
     });
     const res = createMockRes();
@@ -4454,22 +4461,67 @@ describe('/api/viventium/telegram', () => {
   });
 
   test('POST native owner input preserves the exact response and pending ACK under normal linked auth', async () => {
-    const nativeInput = { version: 1, requestId: 'permission-1', requestFingerprint: 'a'.repeat(64), action: 'accept', content: { optionId: 'reject_once' } };
+    const nativeInput = {
+      version: 1,
+      requestId: 'permission-1',
+      requestFingerprint: 'a'.repeat(64),
+      action: 'accept',
+      content: { optionId: 'reject_once' },
+    };
     mockRequestAccountApi.mockResolvedValue({ status: 'pending', confirmationPending: true });
-    const req = createMockReq({ url: '/api/viventium/telegram/orchestration/work/ghw_test/actions', headers: { 'x-viventium-telegram-secret': 'telegram_secret' }, body: { telegramUserId: 'tg-1', action: 'resume', operationId: '018f47d3-8965-7f6a-a826-7c06afedc003', nativeInput } });
+    const req = createMockReq({
+      url: '/api/viventium/telegram/orchestration/work/ghw_test/actions',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        telegramUserId: 'tg-1',
+        action: 'resume',
+        operationId: '018f47d3-8965-7f6a-a826-7c06afedc003',
+        nativeInput,
+      },
+    });
     const res = createMockRes();
     await dispatch(createTestApp(require('../telegram')), req, res);
     expect(res.statusCode).toBe(202);
     expect(res.body).toEqual({ status: 'pending', confirmationPending: true });
-    expect(mockRequestAccountApi).toHaveBeenLastCalledWith(expect.objectContaining({ ownerId: 'user_1', ownerNativeInput: nativeInput, body: expect.objectContaining({ action: 'resume', nativeInput }) }));
+    expect(mockRequestAccountApi).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        ownerId: 'user_1',
+        ownerNativeInput: nativeInput,
+        body: expect.objectContaining({ action: 'resume', nativeInput }),
+      }),
+    );
   });
 
   test.each([
-    { action: 'stop', nativeInput: { version: 1, requestId: 'permission-1', requestFingerprint: 'a'.repeat(64), action: 'decline' } },
-    { action: 'resume', nativeInput: { version: 1, requestId: 'permission-1', requestFingerprint: 'foreign', action: 'decline' } },
+    {
+      action: 'stop',
+      nativeInput: {
+        version: 1,
+        requestId: 'permission-1',
+        requestFingerprint: 'a'.repeat(64),
+        action: 'decline',
+      },
+    },
+    {
+      action: 'resume',
+      nativeInput: {
+        version: 1,
+        requestId: 'permission-1',
+        requestFingerprint: 'foreign',
+        action: 'decline',
+      },
+    },
     { action: 'resume', ownerInputControl: true },
   ])('POST rejects forged or incompatible native owner input %#', async (body) => {
-    const req = createMockReq({ url: '/api/viventium/telegram/orchestration/work/ghw_test/actions', headers: { 'x-viventium-telegram-secret': 'telegram_secret' }, body: { telegramUserId: 'tg-1', operationId: '018f47d3-8965-7f6a-a826-7c06afedc003', ...body } });
+    const req = createMockReq({
+      url: '/api/viventium/telegram/orchestration/work/ghw_test/actions',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        telegramUserId: 'tg-1',
+        operationId: '018f47d3-8965-7f6a-a826-7c06afedc003',
+        ...body,
+      },
+    });
     const res = createMockRes();
     await dispatch(createTestApp(require('../telegram')), req, res);
     expect(res.statusCode).toBe(400);

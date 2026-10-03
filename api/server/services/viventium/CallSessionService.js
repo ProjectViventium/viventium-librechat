@@ -378,8 +378,7 @@ async function resolveUserVoiceRoute(userId, { includeSources = false } = {}) {
   if (includeSources) {
     for (const modality of ['stt', 'tts']) {
       const selection = normalizeVoiceRouteSelection(savedVoiceRoute?.[modality]);
-      route[modality].source =
-        selection.provider || selection.variant ? 'saved' : 'default';
+      route[modality].source = selection.provider || selection.variant ? 'saved' : 'default';
     }
   }
   return route;

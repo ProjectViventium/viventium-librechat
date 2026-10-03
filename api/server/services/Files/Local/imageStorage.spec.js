@@ -140,7 +140,10 @@ test('image reads and deletes reject traversal and sibling-account prefix paths'
 
 test('retained channel images in uploads are read without moving or changing their bytes', async () => {
   const url = await crud.saveLocalBuffer({
-    userId: 'owner', buffer: image, fileName: 'retained-channel.png', basePath: 'uploads',
+    userId: 'owner',
+    buffer: image,
+    fileName: 'retained-channel.png',
+    basePath: 'uploads',
   });
   expect(url).toBe('/uploads/owner/retained-channel.png');
   const [, encoded] = await images.prepareImagesLocal(req, { file_id: 'retained', filepath: url });
@@ -149,18 +152,26 @@ test('retained channel images in uploads are read without moving or changing the
 });
 
 test.each(['/uploads/../../outside.png', '/images/../../outside.png'])(
-  'retained image preparation rejects traversal %s', async (filepath) => {
-    await expect(images.prepareImagesLocal(req, { file_id: 'escape', filepath }))
-      .rejects.toThrow('Invalid file path');
+  'retained image preparation rejects traversal %s',
+  async (filepath) => {
+    await expect(images.prepareImagesLocal(req, { file_id: 'escape', filepath })).rejects.toThrow(
+      'Invalid file path',
+    );
   },
 );
 
-test.each([null, '', '/uploads', '/images', '/other/uploads/owner/x.png', 'https://example.test/images/x.png'])(
-  'retained image preparation rejects an invalid storage route %s', async (filepath) => {
-    await expect(images.prepareImagesLocal(req, { file_id: 'invalid', filepath }))
-      .rejects.toThrow('Invalid image file path');
-  },
-);
+test.each([
+  null,
+  '',
+  '/uploads',
+  '/images',
+  '/other/uploads/owner/x.png',
+  'https://example.test/images/x.png',
+])('retained image preparation rejects an invalid storage route %s', async (filepath) => {
+  await expect(images.prepareImagesLocal(req, { file_id: 'invalid', filepath })).rejects.toThrow(
+    'Invalid image file path',
+  );
+});
 
 test('Stable Diffusion markdown is a public image URL independent of the storage directory', () => {
   const StableDiffusion = require('~/app/clients/tools/structured/StableDiffusion');

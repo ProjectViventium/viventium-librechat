@@ -25,7 +25,11 @@ describe('viventium-agent-runtime-models', () => {
   });
 
   test('defaults current provider classes to high and retains prior supported families', () => {
-    expect(DEFAULT_MODELS).toMatchObject({ openAI: 'gpt-6.1-sol', anthropic: 'claude-opus-5-5', xai: 'grok-4.7' });
+    expect(DEFAULT_MODELS).toMatchObject({
+      openAI: 'gpt-6.1-sol',
+      anthropic: 'claude-opus-5-5',
+      xai: 'grok-4.7',
+    });
     for (const families of [APPROVED_MAIN_RUNTIME_FAMILIES, APPROVED_BACKGROUND_RUNTIME_FAMILIES]) {
       expect(families.has('openAI::gpt-5.6-sol')).toBe(true);
       expect(families.has('glasshive-harness::codex-cli:gpt-6.1-sol')).toBe(true);
@@ -255,7 +259,10 @@ describe('viventium-agent-runtime-models', () => {
         },
       },
     );
-    expect(anthropic.mainAgent.model_parameters).toEqual({ model: 'claude-opus-5', effort: 'high' });
+    expect(anthropic.mainAgent.model_parameters).toEqual({
+      model: 'claude-opus-5',
+      effort: 'high',
+    });
   });
 
   test('does not invent classifier fields for unconditional activation modes', () => {
@@ -451,20 +458,31 @@ describe('viventium-agent-runtime-models', () => {
 
   test.each([
     ['agent_viventium_main_95aeb3', 'openAI', 'gpt-6.1-sol', 'reasoning_effort'],
-    ['agent_viventium_main_95aeb3', 'glasshive-harness', 'codex-cli:gpt-6.1-sol', 'reasoning_effort'],
+    [
+      'agent_viventium_main_95aeb3',
+      'glasshive-harness',
+      'codex-cli:gpt-6.1-sol',
+      'reasoning_effort',
+    ],
     ['agent_viventium_main_95aeb3', 'anthropic', 'claude-opus-5-5', 'effort'],
     ['agent_viventium_red_team_95aeb3', 'openAI', 'gpt-6.1-sol', 'reasoning_effort'],
-    ['agent_viventium_red_team_95aeb3', 'glasshive-harness', 'grok-build:grok-4.7-build-fast', 'reasoning_effort'],
+    [
+      'agent_viventium_red_team_95aeb3',
+      'glasshive-harness',
+      'grok-build:grok-4.7-build-fast',
+      'reasoning_effort',
+    ],
     ['agent_viventium_red_team_95aeb3', 'anthropic', 'claude-opus-5-5', 'effort'],
   ])('preserves explicit effort in unchanged %s %s routes', (id, provider, model, effortField) => {
     const agent = { id, provider, model, model_parameters: { model, [effortField]: 'medium' } };
-    const bundle = id === 'agent_viventium_main_95aeb3'
-      ? { mainAgent: agent } : { backgroundAgents: [agent] };
+    const bundle =
+      id === 'agent_viventium_main_95aeb3' ? { mainAgent: agent } : { backgroundAgents: [agent] };
     const normalized = normalizeBundleForRuntime(bundle, { env: { START_GLASSHIVE: 'true' } });
     const effective = normalized.mainAgent || normalized.backgroundAgents[0];
     expect(effective.model).toBe(model);
     expect(effective.model_parameters[effortField]).toBe('medium');
-    const patch = buildCanonicalPersistedAgentFields(agent, { ...agent,
+    const patch = buildCanonicalPersistedAgentFields(agent, {
+      ...agent,
       model_parameters: { model, [effortField]: 'low' },
     });
     expect(patch.model_parameters[effortField]).toBe('medium');

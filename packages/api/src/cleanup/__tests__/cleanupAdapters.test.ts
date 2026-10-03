@@ -1,9 +1,11 @@
+import * as childProcess from 'child_process';
 import { createCleanupLedgerAdapter } from '../cleanupLedgerAdapter';
 import {
   createExactMeiliCleanupAdapter,
   meiliCleanupDocumentId,
 } from '../exactMeiliCleanupAdapter';
 import { ownerScopeSha256, targetSetSha256 } from '../personalAccountCleanup';
+import { createScheduleCleanupProcessAdapter } from '../scheduleCleanupProcessAdapter';
 
 const OWNER = 'owner-cleanup-1';
 const OPERATION = 'cleanup-operation-1';
@@ -19,6 +21,32 @@ const TARGET = {
   reviewBindingSha256: HASH_B,
   runNonceHash: `sha256:${HASH_B}`,
 };
+
+describe('schedule cleanup process adapter', () => {
+  test('an empty target set verifies without spawning the unused native bridge', async () => {
+    const spawn = jest.spyOn(childProcess, 'spawn').mockImplementation(() => {
+      throw new Error('unused_native_bridge_spawned');
+    });
+    try {
+      const adapter = createScheduleCleanupProcessAdapter({
+        pythonExecutable: '/synthetic/unused-python',
+        bridgeModuleRoot: '/synthetic/unused-scheduling',
+        environment: {},
+      });
+      await expect(
+        adapter.verifyOperation({
+          ownerId: OWNER,
+          operationId: OPERATION,
+          targets: [],
+          nonceHash: `sha256:${HASH_B}`,
+        }),
+      ).resolves.toEqual({ verifiedCount: 0 });
+      expect(spawn).not.toHaveBeenCalled();
+    } finally {
+      spawn.mockRestore();
+    }
+  });
+});
 
 describe('cleanup ledger adapter', () => {
   test('accepts only the exact verified owner and backup binding', async () => {

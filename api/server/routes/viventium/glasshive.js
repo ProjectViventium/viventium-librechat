@@ -17,6 +17,7 @@ const {
   acquireGlassHiveTerminalCallbackResultEffectLease,
   fenceGlassHiveTerminalCallbackResultEffectTransaction,
   receiveGlassHiveTerminalCallbackResult,
+  isGlassHiveCleanupSourceTombstoned,
   releaseGlassHiveTerminalCallbackResultEffectLease,
   renewGlassHiveTerminalCallbackResultEffectLease,
 } = require('@librechat/api');
@@ -34,6 +35,7 @@ const {
   confirmGlassHiveCallbackContext,
   notifySchedulerExternalWorkSummary,
   recordGlassHiveCallbackExternalState,
+  recordGlassHiveAdjudicationOutcome,
   recordGlassHiveSurfaceDeliveryOutcome,
   isGlassHiveWorkTerminalCallback,
   resolveGlassHiveCallbackContext,
@@ -1346,6 +1348,39 @@ async function handleGlassHiveCallback(req, res) {
     logger.warn('[VIVENTIUM][glasshive] Callback receiver missing getConvo ownership check.');
     return res.status(500).json({ error: 'ownership_check_unavailable' });
   }
+  const cleanupSource = {
+    mongoose,
+    ownerId: userId,
+    conversationId,
+    anchorMessageId,
+  };
+  const suppressCleanupCallback = async () => {
+    await runTerminalEffect(async (effectFence, effectSession) => {
+      await reconcileCallbackExternalWork({
+        deliveryContext,
+        body: callbackBody,
+        effectFence,
+        effectSession,
+      });
+      await recordGlassHiveAdjudicationOutcome({
+        originRef: deliveryContext.originRef,
+        state: 'silent',
+        errorCode: 'mission_origin_cleanup_tombstoned',
+        effectSession,
+      });
+    });
+    return res
+      .status(202)
+      .json(
+        withTerminalResultReceipt(
+          { status: 'suppressed', reason: 'mission_origin_cleanup_tombstoned' },
+          terminalResultReceipt,
+        ),
+      );
+  };
+  if (await runTerminalEffect(() => isGlassHiveCleanupSourceTombstoned(cleanupSource))) {
+    return suppressCleanupCallback();
+  }
   const conversation = await db.getConvo(
     String(deliveryContext.ownerId || '').trim(),
     String(deliveryContext.conversationId || '').trim(),
@@ -1701,22 +1736,24 @@ async function handleGlassHiveCallback(req, res) {
       );
   }
   try {
-    if (priorStatusMessage && typeof db.updateMessage === 'function') {
-      await runTerminalEffect(() =>
-        db.updateMessage({ user: { id: userId } }, followUpMessage, {
+    await runTerminalEffect(async () => {
+      if (await isGlassHiveCleanupSourceTombstoned(cleanupSource)) {
+        throw Object.assign(new Error('mission_origin_cleanup_tombstoned'), {
+          code: 'mission_origin_cleanup_tombstoned',
+        });
+      }
+      if (priorStatusMessage && typeof db.updateMessage === 'function') {
+        return db.updateMessage({ user: { id: userId } }, followUpMessage, {
           operationKind: 'system',
           context: 'viventium/routes/glasshive.callback.update',
           overrideTimestamp: true,
-        }),
-      );
-    } else {
-      await runTerminalEffect(() =>
-        db.saveMessage({ user: { id: userId } }, followUpMessage, {
-          operationKind: 'system',
-          context: 'viventium/routes/glasshive.callback',
-        }),
-      );
-    }
+        });
+      }
+      return db.saveMessage({ user: { id: userId } }, followUpMessage, {
+        operationKind: 'system',
+        context: 'viventium/routes/glasshive.callback',
+      });
+    });
     await runTerminalEffect(() =>
       touchCallbackConversation({
         userId,
@@ -1744,6 +1781,7 @@ async function handleGlassHiveCallback(req, res) {
     }
   } catch (err) {
     if (err instanceof TerminalCallbackEffectFenceError) throw err;
+    if (err?.code === 'mission_origin_cleanup_tombstoned') return suppressCleanupCallback();
     logger.warn(
       '[VIVENTIUM][glasshive] Failed to persist callback message:',
       sanitizeCallbackErrorForLog(err),

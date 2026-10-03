@@ -266,6 +266,35 @@ export interface GlassHiveMissionAdjudicationDependencies {
   getTerminalCallbackResultModel: () => Model<IGlassHiveTerminalCallbackResult>;
 }
 
+export async function isGlassHiveCleanupSourceTombstoned({
+  mongoose,
+  ownerId,
+  conversationId,
+  anchorMessageId,
+}: GlassHiveMissionBinding & { mongoose: MissionMongoose }): Promise<boolean> {
+  const user = String(ownerId || '').trim();
+  const origin = String(conversationId || '').trim();
+  const anchor = String(anchorMessageId || '').trim();
+  if (!user || !origin || !anchor) throw new Error('glasshive_cleanup_source_scope_invalid');
+  const session = mongoose.transactionAsyncLocalStorage?.getStore()?.session;
+  const filter = {
+    user,
+    conversationId: origin,
+    deletedAt: { $type: 'date' },
+    'cleanupTombstone.operationId': { $type: 'string', $ne: '' },
+    'cleanupTombstone.tombstonedAt': { $type: 'date' },
+  };
+  const options = { projection: { _id: 1 }, ...(session ? { session } : {}) };
+  const conversation = await mongoose.connection
+    .collection('conversations')
+    .findOne(filter, options);
+  if (conversation) return true;
+  const message = await mongoose.connection
+    .collection('messages')
+    .findOne({ ...filter, messageId: anchor }, options);
+  return Boolean(message);
+}
+
 export function createGlassHiveMissionAdjudicationService(
   dependencies: GlassHiveMissionAdjudicationDependencies,
 ): GlassHiveMissionAdjudicationService {
@@ -1003,6 +1032,18 @@ async function loadMainAuthorContext(first: RuntimeRecord): Promise<RuntimeRecor
 async function resolveMissionContinuationTarget(rows: RuntimeRecord[]): Promise<RuntimeRecord> {
   const first = rows[rows.length - 1];
   const prior = first.priorScopedAdjudication || null;
+  if (
+    await isGlassHiveCleanupSourceTombstoned({
+      mongoose,
+      ownerId: first.ownerId,
+      conversationId: first.conversationId,
+      anchorMessageId: first.anchorMessageId,
+    })
+  ) {
+    throw Object.assign(new Error('mission_origin_cleanup_tombstoned'), {
+      code: 'mission_origin_cleanup_tombstoned',
+    });
+  }
   const originConversation = await getConvo(first.ownerId, first.conversationId, 'conversationId');
   if (originConversation) {
     const deliveryParentMessageId = await pinMissionDeliveryParent(
@@ -1760,6 +1801,11 @@ async function flushGlassHiveMissionAdjudications({
       summary[completedState === 'completed' ? 'visible' : 'silent'] += rows.length;
     } catch (error) {
       const runtimeError = error as RuntimeError;
+      if (runtimeError.code === 'mission_origin_cleanup_tombstoned') {
+        await finishRows(rows, { state: 'silent', errorCode: runtimeError.code });
+        summary.silent += rows.length;
+        continue;
+      }
       if (runtimeError.code === 'glasshive_mission_evidence_superseded') {
         await Promise.all(
           rows.map((row) =>

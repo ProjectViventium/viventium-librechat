@@ -162,12 +162,12 @@ test('old Mongo history survives Core V1 capture and reload with same route and 
     }),
   ).toMatchObject({ status: 'empty' });
   const beforeRows = await Message.find({ user: owner, conversationId })
-    .sort({ createdAt: 1 })
+    .sort({ createdAt: 1, _id: 1 })
     .lean();
   const first = await captureReloaded();
   const after = await captureReloaded();
   const afterRows = await Message.find({ user: owner, conversationId })
-    .sort({ createdAt: 1 })
+    .sort({ createdAt: 1, _id: 1 })
     .lean();
   const chain = JSON.parse(
     Buffer.from(first.headers['X-Viventium-Visible-Message-Chain-B64'], 'base64'),

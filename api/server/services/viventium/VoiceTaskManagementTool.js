@@ -6,17 +6,10 @@
  * === VIVENTIUM END === */
 
 const { z } = require('zod');
+const { zodToJsonSchema } = require('zod-to-json-schema');
+const VOICE_TASK_TOOL_NAME = 'manage_active_tasks';
 const { DynamicStructuredTool } = require('@langchain/core/tools');
 const { GenerationJobManager } = require('@librechat/api');
-const {
-  canConfirmVoiceTaskCancellation,
-  getVoiceTask,
-  listVoiceTasks,
-  retryVoiceTask,
-  requestVoiceTaskOwnerCancellation,
-  settleVoiceTaskCancellation,
-  submitVoiceTaskInput,
-} = require('./VoiceTaskService');
 
 const operationSchema = z
   .object({
@@ -49,8 +42,20 @@ function createManageActiveTasksTool(req) {
     return null;
   }
 
+  const {
+    canConfirmVoiceTaskCancellation,
+    getVoiceTask,
+    hydrateVoiceTask,
+    hydrateVoiceTasksForCall,
+    listVoiceTasks,
+    retryVoiceTask,
+    requestVoiceTaskOwnerCancellation,
+    settleVoiceTaskCancellation,
+    submitVoiceTaskInput,
+  } = require('./VoiceTaskService');
+
   return new DynamicStructuredTool({
-    name: 'manage_active_tasks',
+    name: VOICE_TASK_TOOL_NAME,
     description:
       'List, inspect, cancel, retry, or provide requested input to active call tasks. Operations are available only when the task owner advertises a real capability. Use task IDs returned by this tool.',
     schema: operationSchema,
@@ -58,11 +63,13 @@ function createManageActiveTasksTool(req) {
       const userId = String(req.user.id);
       const callSessionId = req.viventiumCallSession.callSessionId;
       if (operation === 'list') {
+        await hydrateVoiceTasksForCall({ userId, callSessionId });
         return publicResult({
           ok: true,
           tasks: listVoiceTasks({ userId, callSessionId }),
         });
       }
+      await hydrateVoiceTask(taskId, { userId, callSessionId });
       const task = getVoiceTask(taskId);
       if (!ownsTask(req, task)) {
         return publicResult({ ok: false, code: 'task_not_found', message: 'Task not found.' });
@@ -79,7 +86,19 @@ function createManageActiveTasksTool(req) {
             task,
           });
         }
-        return publicResult(await submitVoiceTaskInput(task.taskId, input, { userId }));
+        return publicResult(
+          await submitVoiceTaskInput(task.taskId, input, {
+            userId,
+            ...(req.viventiumVoiceWorkAuthority
+              ? {
+                  voiceAuthorityContext: {
+                    callSessionId,
+                    binding: req.viventiumVoiceWorkAuthority,
+                  },
+                }
+              : {}),
+          }),
+        );
       }
       if (operation === 'retry') {
         return publicResult(await retryVoiceTask(task.taskId, { userId }));
@@ -127,7 +146,47 @@ function createManageActiveTasksTool(req) {
   });
 }
 
+// Reuse the owner-authorized tool through the native capability broker. Only the
+// accepted voice turn can mint this resource; invocation rechecks its authority.
+function voiceTaskBrokerResources(req) {
+  if (!req?.viventiumVoiceWorkAuthority || !createManageActiveTasksTool(req)) return null;
+  return { version: 1, authority: req.viventiumVoiceWorkAuthority };
+}
+
+async function invokeVoiceTaskBrokerTool({ user, resources, args }) {
+  const authority = resources?.authority;
+  if (resources?.version !== 1 || authority?.userId !== String(user?.id || '')) {
+    throw new Error('voice_work_authority_stale');
+  }
+  await require('./VoiceWorkAuthorityService').assertVoiceWorkAuthority(authority, String(user.id));
+  const session = await require('./CallSessionService').getCallSession(authority.callSessionId);
+  const tool = createManageActiveTasksTool({
+    user,
+    viventiumCallSession: session,
+    viventiumVoiceWorkAuthority: authority,
+    body: {
+      mode: session?.mode,
+      viventiumActorTrust: 'owner_participant',
+      viventiumCanAuthorizeSideEffects: true,
+    },
+  });
+  if (!tool) throw new Error('voice_work_authority_stale');
+  return { status: 'ok', tool: VOICE_TASK_TOOL_NAME, result: JSON.parse(await tool.invoke(args)) };
+}
+
+const voiceTaskBrokerDefinition = Object.freeze({
+  name: VOICE_TASK_TOOL_NAME,
+  description:
+    'List, inspect, cancel, retry, or provide requested input to active tasks in this owner-authorized call. Use task IDs returned by this tool.',
+  inputSchema: zodToJsonSchema(operationSchema, { $refStrategy: 'none' }),
+  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+});
+
 module.exports = {
   createManageActiveTasksTool,
   operationSchema,
+  VOICE_TASK_TOOL_NAME,
+  voiceTaskBrokerResources,
+  voiceTaskBrokerDefinition,
+  invokeVoiceTaskBrokerTool,
 };

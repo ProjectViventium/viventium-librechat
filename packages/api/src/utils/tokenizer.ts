@@ -50,12 +50,10 @@ class Tokenizer {
   }
 
   resetTokenizersIfNecessary(): void {
-    if (this.tokenizerCallsCount >= 25) {
-      if (this.options?.debug) {
-        logger.debug('[Tokenizer] freeAndResetAllEncoders: reached 25 encodings, resetting...');
-      }
-      this.freeAndResetAllEncoders();
-    }
+    /* === VIVENTIUM START ===
+     * Reuse active encoders across successful counts. Per-call WASM output buffers are freed
+     * by tiktoken; explicit disposal and encode-error recovery still release cached encoders.
+     * === VIVENTIUM END === */
     this.tokenizerCallsCount++;
   }
 

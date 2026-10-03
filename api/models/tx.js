@@ -300,6 +300,11 @@ const tokenValues = Object.assign(
     'qwen3-coder-plus': { prompt: 1, completion: 5 },
     'qwen3-coder-flash': { prompt: 0.3, completion: 1.5 },
     'qwen3-next-80b-a3b': { prompt: 0.1, completion: 0.8 },
+    /* === VIVENTIUM START === Current provider model accounting. === */
+    'gpt-6.1-sol': { prompt: 2, completion: 10 },
+    'claude-opus-5-5': { prompt: 4, completion: 20 },
+    'grok-4.7': { prompt: 2, completion: 6 },
+    /* === VIVENTIUM END === */
   },
   bedrockValues,
 );
@@ -332,6 +337,7 @@ const cacheTokenValues = {
    */
   'claude-opus-4-8': { write: 6.25, read: 0.5 },
   'claude-opus-5': { write: 6.25, read: 0.5 },
+  'claude-opus-5-5': { write: 5, read: 0.4 },
   /* === VIVENTIUM END === */
   // DeepSeek models - cache hit: $0.028/1M, cache miss: $0.28/1M
   deepseek: { write: 0.28, read: 0.028 },

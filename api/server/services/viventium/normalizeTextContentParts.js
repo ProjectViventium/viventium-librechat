@@ -20,7 +20,59 @@
 
 'use strict';
 
-const { ContentTypes } = require('librechat-data-provider');
+const { ContentTypes, Tools } = require('librechat-data-provider');
+const { normalizeHydratedMediaText } = require('@librechat/api');
+
+// These delivery/status parts already stay outside model history.
+const INTERNAL_CONTENT_TYPES = new Set([
+  ContentTypes.CORTEX_ACTIVATION,
+  ContentTypes.CORTEX_BREWING,
+  ContentTypes.CORTEX_INSIGHT,
+  ContentTypes.AGENT_UPDATE,
+  ContentTypes.ERROR,
+  ContentTypes.THINK,
+  ContentTypes.HARNESS_ACTIVITY,
+]);
+
+function isRuntimeOnlyAssistantMessage(message) {
+  const internalWorkerStatus =
+    message?.metadata?.viventium?.type === 'glasshive_worker_callback' &&
+    message?.metadata?.viventium?.visibility === 'internal';
+  /* === VIVENTIUM START ===
+   * Fix: an answer its adapter acknowledged `failed` was declared undeliverable; the user saw a
+   * failure instead. The row stays as an honest record but is never accepted Main history.
+   * === VIVENTIUM END === */
+  if (
+    message?.isCreatedByUser === false &&
+    message.metadata?.viventium?.deliveryAcknowledgement?.state === 'failed'
+  ) {
+    return true;
+  }
+  return (
+    message?.isCreatedByUser === false &&
+    message.unfinished !== true &&
+    !message.files?.length &&
+    !message.image_urls?.length &&
+    // A memory status receipt is not a user file or model answer. Unknown and
+    // file-bearing attachment types stay in history under the existing guard.
+    !message.attachments?.some((attachment) => attachment?.type !== Tools.memory) &&
+    (internalWorkerStatus ||
+      (!message.text &&
+        Array.isArray(message.content) &&
+        message.content.length > 0 &&
+        message.content.every(
+          (part) =>
+            part &&
+            (INTERNAL_CONTENT_TYPES.has(part.type) ||
+              // A failed turn with no answer can retain tool audit parts. Those
+              // records stay persisted; they are not an accepted Main answer.
+              (message.error === true && part.type === ContentTypes.TOOL_CALL) ||
+              /* VIVENTIUM: an empty text block reaches no provider (normalizeTextContentParts). */
+              (part.type === ContentTypes.TEXT &&
+                !coerceTextToString(part.text ?? part[ContentTypes.TEXT]).trim())),
+        )))
+  );
+}
 
 /**
  * @param {unknown} text
@@ -204,6 +256,16 @@ function normalizeTextPartsInPayload(payload) {
   // Return original reference when no normalization was needed.
   return changed ? normalized : payload;
 }
+
+/* === VIVENTIUM START ===
+ * The native formatter's hydrated user-media branch accepts authored prose as a string.
+ * Project text-only arrays before that branch; the same native formatter still owns every
+ * hydrated media payload. Unknown/non-text array content stays intact for validation.
+ */
+function normalizeMediaTextForFormatter(message) {
+  return normalizeHydratedMediaText(message, coerceTextToString);
+}
+/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
  * Feature: Preserve LangChain message prototypes during Anthropic sanitization.
@@ -459,10 +521,13 @@ function sanitizeProviderFormattedMessages(provider, messages) {
 }
 
 module.exports = {
+  INTERNAL_CONTENT_TYPES,
+  isRuntimeOnlyAssistantMessage,
   coerceTextToString,
   normalizeUserMessageContent,
   normalizeTextContentParts,
   normalizeTextPartsInPayload,
+  normalizeMediaTextForFormatter,
   normalizeProviderKey,
   providerNeedsStrictTextSanitizer,
   sanitizeAnthropicFormattedMessages,

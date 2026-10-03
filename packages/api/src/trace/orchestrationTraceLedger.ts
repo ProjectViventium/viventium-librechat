@@ -4,6 +4,7 @@
  * === VIVENTIUM END === */
 
 import { createHash } from 'crypto';
+import { ORCHESTRATION_TRACE_REASONING_EFFORTS, ORCHESTRATION_TRACE_CORTEX_STATUSES } from '@librechat/data-schemas';
 
 export type TraceStage =
   | 'source.bound'
@@ -36,12 +37,16 @@ export type TraceStage =
   | 'tool.completed'
   | 'controller.completed'
   | 'cortex.completed'
+  | 'cortex.activation.completed'
   | 'live_memory.completed'
   | 'recall.completed'
   | 'title_model.completed'
   | 'response.completed'
   | 'tts.completed'
   | 'audio.completed'
+  | 'audio.failed'
+  | 'audio.interrupted'
+  | 'audio.superseded'
   | 'provider.attempt.completed'
   | 'provider.fallback.completed';
 
@@ -63,6 +68,7 @@ export interface TraceEventFactsInput {
   fallbackAttemptRef?: string;
   responseRef?: string;
   presentationRef?: string;
+  cortexRef?: string;
   state?: string;
   surface?: string;
   callbackEvent?: string;
@@ -89,6 +95,9 @@ export interface TraceEventFactsInput {
   action?: string;
   provider?: string;
   model?: string;
+  requestedModel?: string;
+  reasoningEffort?: string;
+  cortexStatus?: string;
   providerStatus?: string;
   attemptRole?: string;
   primaryProvider?: string;
@@ -120,6 +129,7 @@ export interface RedactedTraceEventFacts {
   fallbackAttemptRefHash?: string;
   responseRefHash?: string;
   presentationRefHash?: string;
+  cortexRefHash?: string;
   state?: string;
   surface?: string;
   callbackEvent?: string;
@@ -146,6 +156,9 @@ export interface RedactedTraceEventFacts {
   action?: string;
   provider?: string;
   model?: string;
+  requestedModel?: string;
+  reasoningEffort?: string;
+  cortexStatus?: string;
   providerStatus?: string;
   attemptRole?: string;
   primaryProvider?: string;
@@ -374,12 +387,16 @@ const TRACE_STAGES = new Set<TraceStage>([
   'tool.completed',
   'controller.completed',
   'cortex.completed',
+  'cortex.activation.completed',
   'live_memory.completed',
   'recall.completed',
   'title_model.completed',
   'response.completed',
   'tts.completed',
   'audio.completed',
+  'audio.failed',
+  'audio.interrupted',
+  'audio.superseded',
   'provider.attempt.completed',
   'provider.fallback.completed',
 ]);
@@ -391,6 +408,8 @@ const FIRST_OBSERVATION_REPLAY_STAGES = new Set<TraceStage>([
   'launch.accepted',
   'callback.accepted',
 ]);
+const CORTEX_STATUSES: ReadonlySet<string> = new Set(ORCHESTRATION_TRACE_CORTEX_STATUSES);
+const REASONING_EFFORTS: ReadonlySet<string> = new Set(ORCHESTRATION_TRACE_REASONING_EFFORTS);
 const FACT_KEYS = new Set<keyof TraceEventFactsInput>([
   'sourceEventRef',
   'logicalTurnRef',
@@ -409,6 +428,7 @@ const FACT_KEYS = new Set<keyof TraceEventFactsInput>([
   'fallbackAttemptRef',
   'responseRef',
   'presentationRef',
+  'cortexRef',
   'state',
   'surface',
   'callbackEvent',
@@ -435,6 +455,9 @@ const FACT_KEYS = new Set<keyof TraceEventFactsInput>([
   'action',
   'provider',
   'model',
+  'requestedModel',
+  'reasoningEffort',
+  'cortexStatus',
   'providerStatus',
   'attemptRole',
   'primaryProvider',
@@ -465,6 +488,7 @@ const REDACTED_FACT_KEYS = new Set<keyof RedactedTraceEventFacts>([
   'fallbackAttemptRefHash',
   'responseRefHash',
   'presentationRefHash',
+  'cortexRefHash',
   'state',
   'surface',
   'callbackEvent',
@@ -491,6 +515,9 @@ const REDACTED_FACT_KEYS = new Set<keyof RedactedTraceEventFacts>([
   'action',
   'provider',
   'model',
+  'requestedModel',
+  'reasoningEffort',
+  'cortexStatus',
   'providerStatus',
   'attemptRole',
   'primaryProvider',
@@ -521,6 +548,7 @@ const REDACTED_REFERENCE_KEYS = [
   'fallbackAttemptRefHash',
   'responseRefHash',
   'presentationRefHash',
+  'cortexRefHash',
 ] as const;
 const PRODUCER_HASH_KEYS = [
   'producerLifecycleHash',
@@ -553,6 +581,7 @@ const REFERENCE_FACTS = [
   ['fallbackAttemptRef', 'provider_attempt', 'fallbackAttemptRefHash'],
   ['responseRef', 'response', 'responseRefHash'],
   ['presentationRef', 'voice_presentation', 'presentationRefHash'],
+  ['cortexRef', 'cortex', 'cortexRefHash'],
 ] as const;
 
 export class OrchestrationTraceValidationError extends Error {
@@ -651,7 +680,7 @@ export function fingerprintTraceReference(kind: string, value: string): string {
   );
 }
 
-function redactFacts(input: TraceEventFactsInput = {}): RedactedTraceEventFacts {
+export function redactOrchestrationTraceFacts(input: TraceEventFactsInput = {}): RedactedTraceEventFacts {
   const unknownKeys = Object.keys(input).filter(
     (key) => !FACT_KEYS.has(key as keyof TraceEventFactsInput),
   );
@@ -759,6 +788,12 @@ function redactFacts(input: TraceEventFactsInput = {}): RedactedTraceEventFacts 
   if (action) facts.action = action;
   if (provider) facts.provider = provider;
   if (model) facts.model = model;
+  const requestedModel = safeToken(input.requestedModel, 'orchestration_trace_requested_model_invalid');
+  const reasoningEffort = safeEnum(input.reasoningEffort, REASONING_EFFORTS, 'orchestration_trace_effort_invalid');
+  const cortexStatus = safeEnum(input.cortexStatus, CORTEX_STATUSES, 'orchestration_trace_cortex_status_invalid');
+  if (requestedModel) facts.requestedModel = requestedModel;
+  if (reasoningEffort) facts.reasoningEffort = reasoningEffort;
+  if (cortexStatus) facts.cortexStatus = cortexStatus;
   if (providerStatus) facts.providerStatus = providerStatus;
   if (attemptRole) facts.attemptRole = attemptRole;
   if (primaryProvider) facts.primaryProvider = primaryProvider;
@@ -820,7 +855,7 @@ export async function appendOrchestrationTraceEvent(
     originRefHash: fingerprintTraceReference('origin', originRef),
   };
   const eventKeyHash = fingerprintTraceReference('event_key', eventKey);
-  const facts = redactFacts(input.facts);
+  const facts = redactOrchestrationTraceFacts(input.facts);
   const expectedContentHash = contentHash(input.stage, facts);
   const at = eventTimestamp(input.at);
 
@@ -957,6 +992,8 @@ function persistedRowValid(row: OrchestrationTraceEventRow, scope: TraceScopeQue
   ) {
     return false;
   }
+  if (row.facts.reasoningEffort != null && !REASONING_EFFORTS.has(row.facts.reasoningEffort)) return false;
+  if (row.facts.cortexStatus != null && !CORTEX_STATUSES.has(row.facts.cortexStatus)) return false;
   if (row.facts.state != null && !STATES.has(row.facts.state)) return false;
   if (row.facts.surface != null && !SURFACES.has(row.facts.surface)) return false;
   if (row.facts.callbackEvent != null && !CALLBACK_EVENTS.has(row.facts.callbackEvent))
@@ -982,6 +1019,7 @@ function persistedRowValid(row: OrchestrationTraceEventRow, scope: TraceScopeQue
   for (const key of [
     'provider',
     'model',
+    'requestedModel',
     'primaryProvider',
     'primaryModel',
     'fallbackProvider',

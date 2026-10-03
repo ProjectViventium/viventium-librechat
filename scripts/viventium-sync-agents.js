@@ -334,6 +334,7 @@ const DEFAULT_ACTIVATION_CONFIG_FIELDS = [
   'confidence_threshold',
   'model',
   'provider',
+  'reasoning_effort',
   'fallbacks',
   'cooldown_ms',
   'max_history',
@@ -2310,7 +2311,7 @@ function printUsage() {
     '  --agent-ids=...   Optional comma-separated background agent ids to update surgically',
   );
   console.log(
-    '  --activation-fields=...   Comma-separated activation fields for safe modes (enabled,mode,prompt,confidence_threshold,fallbacks,activation_failure_visibility,model,provider,cooldown_ms,max_history,intent_scope)',
+    '  --activation-fields=...   Comma-separated activation fields for safe modes (enabled,mode,prompt,confidence_threshold,fallbacks,activation_failure_visibility,model,provider,reasoning_effort,cooldown_ms,max_history,intent_scope)',
   );
   console.log(
     '  --schedules       Also pull/push Scheduling Cortex tasks for this user (via viv-schedule-sync.js)',

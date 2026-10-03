@@ -2,7 +2,7 @@ const { AgentCapabilities, defaultAgentCapabilities } = require('librechat-data-
 
 const mockEffectiveOrchestrationMode = jest.fn();
 const mockParallelWorkClaimStateAsync = jest.fn();
-const mockWaitForOrchestrationReadiness = jest.fn();
+const mockAuthoringOrchestrationReadiness = jest.fn();
 const mockStartActiveWorkContext = jest.fn();
 
 jest.mock('~/server/services/viventium/GlassHiveAccountService', () => ({
@@ -14,7 +14,7 @@ jest.mock('~/server/services/viventium/ViventiumOrchestrationMode', () => ({
   parallelWorkClaimStateAsync: (...args) => mockParallelWorkClaimStateAsync(...args),
 }));
 jest.mock('~/server/services/viventium/GlassHiveOrchestrationReadinessService', () => ({
-  waitForOrchestrationReadiness: (...args) => mockWaitForOrchestrationReadiness(...args),
+  authoringOrchestrationReadiness: (...args) => mockAuthoringOrchestrationReadiness(...args),
 }));
 
 const { __testables } = require('../ToolService');
@@ -34,7 +34,7 @@ describe('ToolService - Capability Checking', () => {
     beforeEach(() => {
       jest.clearAllMocks();
       mockEffectiveOrchestrationMode.mockReturnValue('parallel');
-      mockWaitForOrchestrationReadiness.mockResolvedValue({ available: true, status: 'ready' });
+      mockAuthoringOrchestrationReadiness.mockResolvedValue({ available: true, status: 'ready' });
       delete process.env.VIVENTIUM_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS;
     });
 
@@ -60,8 +60,8 @@ describe('ToolService - Capability Checking', () => {
       await expect(first).resolves.toBe(true);
       expect(mockParallelWorkClaimStateAsync).toHaveBeenCalledTimes(1);
       expect(mockParallelWorkClaimStateAsync).toHaveBeenCalledWith('owner-1');
-      expect(mockWaitForOrchestrationReadiness).toHaveBeenCalledTimes(1);
-      expect(mockWaitForOrchestrationReadiness).toHaveBeenCalledWith(
+      expect(mockAuthoringOrchestrationReadiness).toHaveBeenCalledTimes(1);
+      expect(mockAuthoringOrchestrationReadiness).toHaveBeenCalledWith(
         expect.objectContaining({ ownerId: 'owner-1' }),
       );
       expect(req._viventiumParallelWorkTurnAvailable).toBe(true);
@@ -100,8 +100,47 @@ describe('ToolService - Capability Checking', () => {
       ).resolves.toBe(false);
 
       expect(mockParallelWorkClaimStateAsync).not.toHaveBeenCalled();
-      expect(mockWaitForOrchestrationReadiness).not.toHaveBeenCalled();
+      expect(mockAuthoringOrchestrationReadiness).not.toHaveBeenCalled();
       expect(req._viventiumParallelWorkTurnAvailable).toBe(false);
+    });
+
+    test('pins fresh unready authoring false without borrowing a later recovered claim', async () => {
+      mockAuthoringOrchestrationReadiness.mockResolvedValue({
+        available: false,
+        status: 'unready',
+      });
+      mockParallelWorkClaimStateAsync.mockResolvedValue({ available: true });
+      const req = { user: { id: 'owner-1' } };
+      await expect(
+        __testables.startParallelWorkTurnAuthority(req, orchestrationAgent),
+      ).resolves.toBe(false);
+      expect(mockParallelWorkClaimStateAsync).not.toHaveBeenCalled();
+      expect(req._viventiumParallelWorkTurnClaim).toBeUndefined();
+      mockAuthoringOrchestrationReadiness.mockResolvedValue({ available: true, status: 'ready' });
+      await expect(
+        __testables.startParallelWorkTurnAuthority(req, orchestrationAgent),
+      ).resolves.toBe(false);
+      expect(mockAuthoringOrchestrationReadiness).toHaveBeenCalledTimes(1);
+    });
+
+    test.each([false, true])(
+      'preserves an already pinned %s turn without a new readiness decision',
+      async (available) => {
+        const req = { user: { id: 'owner-1' }, _viventiumParallelWorkTurnAvailable: available };
+        await expect(
+          __testables.startParallelWorkTurnAuthority(req, orchestrationAgent),
+        ).resolves.toBe(available);
+        expect(mockAuthoringOrchestrationReadiness).not.toHaveBeenCalled();
+        expect(mockParallelWorkClaimStateAsync).not.toHaveBeenCalled();
+      },
+    );
+
+    test('does no readiness work for agents without declared orchestration tools', async () => {
+      await expect(
+        __testables.startParallelWorkTurnAuthority({ user: { id: 'owner-1' } }, { tools: [] }),
+      ).resolves.toBe(false);
+      expect(mockAuthoringOrchestrationReadiness).not.toHaveBeenCalled();
+      expect(mockStartActiveWorkContext).not.toHaveBeenCalled();
     });
   });
 

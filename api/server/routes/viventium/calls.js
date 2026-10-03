@@ -151,9 +151,10 @@ router.post('/', requireJwtAuth, async (req, res) => {
     }
     const normalizedConversationId = typeof conversationId === 'string' ? conversationId : 'new';
 
-    // Prefer the conversation's persisted agent_id when calling from an existing conversation.
-    // This avoids frontend state mismatches and guarantees the "brain" matches what the user is viewing.
+    // Keep the existing conversation access gate, then honor the currently selected agent.
+    // A saved conversation supplies the route only when the client has not selected one.
     let effectiveAgentId = typeof agentId === 'string' ? agentId : '';
+    let persistedAgentId = '';
     if (normalizedConversationId !== 'new') {
       try {
         const convo = await getConvo(userId, normalizedConversationId);
@@ -162,12 +163,16 @@ router.post('/', requireJwtAuth, async (req, res) => {
           return res.status(404).json({ error: 'Conversation not found' });
         }
         if (typeof convo.agent_id === 'string' && convo.agent_id.length > 0) {
-          effectiveAgentId = convo.agent_id;
+          persistedAgentId = convo.agent_id;
+          if (!effectiveAgentId) effectiveAgentId = persistedAgentId;
         }
       } catch (e) {
         logCallRouteError('conversation route lookup failed', e);
         return res.status(500).json({ error: 'Failed to load conversation' });
       }
+    }
+    if (persistedAgentId && persistedAgentId !== effectiveAgentId) {
+      await assertVoiceAgentAccess({ req, agentId: persistedAgentId });
     }
     if (typeof effectiveAgentId !== 'string' || effectiveAgentId.length === 0) {
       logger.info('[VIVENTIUM][calls] call_rejected', { reason: 'agent_required' });
@@ -388,6 +393,28 @@ router.get('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => {
   }
 });
 
+router.post('/:callSessionId/voice-defaults', requireJwtAuth, async (req, res) => {
+  try {
+    const session = await getCallSession(req.params.callSessionId);
+    if (!session || session.userId !== req.user?.id) {
+      return res.status(404).json({ error: 'Call session not found.' });
+    }
+    const updated = await updateCallSessionVoiceSettings({
+      callSessionId: session.callSessionId,
+      touch: false,
+      persistToUserDefaults: true,
+      requestedVoiceRoute: session.requestedVoiceRoute,
+      capabilityRequiredProviders: req.config?.endpoints?.agents?.capabilityRequiredProviders || [],
+    });
+    if (!updated) return res.status(410).json({ error: 'Call session expired.' });
+    return res.json(updated);
+  } catch (err) {
+    const status = err?.status || 500;
+    logger.warn('[VIVENTIUM][calls] voice_defaults_update_failed', { status });
+    return res.status(status).json({ error: 'Could not save voice defaults.' });
+  }
+});
+
 router.post('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => {
   try {
     const session = req.viventiumCallSession;
@@ -396,7 +423,7 @@ router.post('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => 
       callSessionId: session.callSessionId,
       touch: body.touch !== false,
       // A per-call browser capability may change only this call. Durable account defaults remain
-      // behind the authenticated LibreChat user-settings surface.
+      // behind the authenticated voice-defaults route.
       persistToUserDefaults: false,
       requestedVoiceRoute: body.requestedVoiceRoute,
       capabilityRequiredProviders: req.config?.endpoints?.agents?.capabilityRequiredProviders || [],

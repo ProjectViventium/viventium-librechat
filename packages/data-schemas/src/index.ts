@@ -30,6 +30,7 @@ export {
   CORTEX_INSIGHT_RECOVERY_DEFERRAL_REASONS,
 } from './types/cortexInsightDelivery';
 export { createViventiumOrchestrationTraceEventModel } from './models/orchestrationTraceEvent';
+export { ORCHESTRATION_TRACE_REASONING_EFFORTS, ORCHESTRATION_TRACE_CORTEX_STATUSES } from './types/orchestrationTraceEvent';
 export { createViventiumPersonalAccountCleanupReceiptSchema } from './schema/personalAccountCleanupReceipt';
 /* === VIVENTIUM END === */
 export {

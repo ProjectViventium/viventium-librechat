@@ -2,7 +2,6 @@
 const {
   createTelegramInputService,
   telegramIngressDedupeTtlSeconds,
-  telegramInputConversationGeneration,
   GenerationJobManager,
 } = require('@librechat/api');
 const { ViventiumTelegramIngressEvent: Ingress, Message } = require('~/db/models');
@@ -12,6 +11,7 @@ const {
   runGlassHiveTerminalCallbackTransaction,
 } = require('./GlassHiveTerminalCallbackTransaction');
 const { mutateNativeResponseSources } = require('./nativeResponseService');
+const { committedDeliveryFilter } = require('./telegramCommittedDelivery');
 
 const fields = {
   state: 'inputState',
@@ -86,6 +86,68 @@ async function resolvePendingConversation(identity) {
   );
   if (!record || !(await verifyOwner(record))) return null;
   return { conversationId: record.conversationId };
+}
+/* === VIVENTIUM START ===
+ * Fix: source-ordered turn membership. Rapid inputs of one Telegram conversation join one logical
+ * turn in source order; their durable intake records decide which input is earlier or unanswered.
+ */
+function conversationSiblingFilter(record) {
+  return {
+    libreChatUserId: record.libreChatUserId,
+    telegramUserId: record.telegramUserId,
+    telegramChatId: record.telegramChatId,
+    telegramMessageThreadId: record.telegramMessageThreadId,
+    sourceOrderScope: record.sourceOrderScope,
+    conversationGeneration: record.conversationGeneration,
+    conversationId: record.conversationId,
+  };
+}
+/** An earlier input of this conversation is still being prepared under a live lease. */
+async function hasEarlierPreparingInput(record) {
+  return Boolean(
+    await Ingress.exists({
+      ...conversationSiblingFilter(record),
+      sourceSequence: { $lt: record.sourceSequence },
+      inputState: 'preparing',
+      inputLeaseUntil: { $gt: Date.now() },
+    }),
+  );
+}
+/** A newer input of this conversation has not been answered yet. */
+async function hasNewerUnresolvedInput(record) {
+  return Boolean(
+    await Ingress.exists({
+      ...conversationSiblingFilter(record),
+      sourceSequence: { $gt: record.sourceSequence },
+      inputState: { $in: ['preparing', 'ready', 'admitted'] },
+    }),
+  );
+}
+/* === VIVENTIUM END === */
+/* VIVENTIUM: a committed answer's delivery coverage names this exact source. */
+async function hasCommittedDelivery(record) {
+  return Boolean(await Message.exists(committedDeliveryFilter(record)));
+}
+/** A newer input of this conversation was already answered. */
+async function hasNewerCompletedInput(record) {
+  return Boolean(
+    await Ingress.exists({
+      ...conversationSiblingFilter(record),
+      sourceSequence: { $gt: record.sourceSequence },
+      inputState: 'completed',
+    }),
+  );
+}
+/* VIVENTIUM: a newer input was admitted to a stream (carrying earlier inputs) and then failed. */
+async function hasNewerFailedAdmittedInput(record) {
+  return Boolean(
+    await Ingress.exists({
+      ...conversationSiblingFilter(record),
+      sourceSequence: { $gt: record.sourceSequence },
+      inputState: 'failed',
+      streamId: { $nin: ['', null] },
+    }),
+  );
 }
 async function readPrepared(record) {
   const message = await Message.findOne(messageFilter(record)).lean();
@@ -166,7 +228,9 @@ const service = createTelegramInputService({
           telegramUserId: record.telegramUserId,
           telegramChatId: record.telegramChatId,
           telegramMessageThreadId: record.telegramMessageThreadId,
+          sourceOrderScope: record.sourceOrderScope,
           conversationGeneration: record.conversationGeneration,
+          conversationId: record.conversationId,
           mediaGroupId: record.mediaGroupId,
           inputState: { $in: ['preparing', 'failed'] },
           $expr: { $eq: ['$inputPrimarySourceEventId', '$sourceEventId'] },
@@ -199,6 +263,12 @@ const service = createTelegramInputService({
             image_url: { url, detail: 'auto' },
           })),
           'metadata.viventium.telegramInput.state': 'ready',
+          ...(Array.isArray(input.quotedAttachmentTexts) && input.quotedAttachmentTexts.length
+            ? {
+                'metadata.viventium.telegramInput.quotedAttachmentTexts':
+                  input.quotedAttachmentTexts,
+              }
+            : {}),
         },
       }),
     );
@@ -208,53 +278,7 @@ const service = createTelegramInputService({
       });
   },
   readPrepared,
-  hasCommittedDelivery: async (record) =>
-    Boolean(
-      await Message.exists({
-        user: record.libreChatUserId,
-        conversationId: record.conversationId,
-        isCreatedByUser: false,
-        unfinished: { $ne: true },
-        'metadata.viventium.deliveryAcknowledgement.state': 'committed',
-        'metadata.viventium.deliverySourceCoverage.source_order_scope': record.sourceOrderScope,
-        'metadata.viventium.deliverySourceCoverage.source_conversation_generation': {
-          $in: [
-            ...new Set([
-              telegramInputConversationGeneration(record),
-              // The same fresh conversation is subsequently addressed by its canonical
-              // ID. Both names belong to this retained source and captured generation.
-              telegramInputConversationGeneration({
-                ...record,
-                requestedConversationId: record.conversationId,
-              }),
-            ]),
-          ],
-        },
-        'metadata.viventium.deliverySourceCoverage.sources': {
-          $elemMatch: {
-            source_event_id: record.sourceEventId,
-            source_message_id: record.sourceMessageId,
-            source_sequence: record.sourceSequence,
-          },
-        },
-        $expr: {
-          $and: [
-            {
-              $eq: [
-                '$metadata.viventium.deliverySourceCoverage.logical_turn_id',
-                '$metadata.viventium.deliveryAcknowledgement.logical_turn_id',
-              ],
-            },
-            {
-              $eq: [
-                '$metadata.viventium.deliverySourceCoverage.revision',
-                '$metadata.viventium.deliveryAcknowledgement.revision',
-              ],
-            },
-          ],
-        },
-      }),
-    ),
+  hasCommittedDelivery,
   verifyStream: async (record, streamId) => {
     const job = await GenerationJobManager.getJob(streamId);
     const context = job?.metadata?.interactionContext;
@@ -271,6 +295,8 @@ const service = createTelegramInputService({
     if (!job || job.metadata?.userId !== ownerId) return 'missing';
     const ack = job.metadata?.deliveryAcknowledgement;
     if (ack?.state === 'committed') return 'completed';
+    // VIVENTIUM: the adapter's failed acknowledgement is terminal for this stream's answer.
+    if (ack?.state === 'failed') return 'failed';
     return ['error', 'aborted', 'superseded'].includes(job.status) ? 'failed' : 'pending';
   },
 });
@@ -280,6 +306,7 @@ async function inputEnvelope(record) {
   return {
     ...record,
     preparation: message.metadata?.viventium?.telegramInput?.preparation,
+    quotedAttachmentTexts: message.metadata?.viventium?.telegramInput?.quotedAttachmentTexts,
     text: message.text || '',
     inputClaim: {
       sourceEventId: record.sourceEventId,
@@ -293,5 +320,10 @@ module.exports = {
   inputEnvelope,
   messageFilter,
   resolvePendingConversation,
+  hasEarlierPreparingInput,
+  hasNewerUnresolvedInput,
+  hasNewerCompletedInput,
+  hasNewerFailedAdmittedInput,
+  hasCommittedDelivery,
 };
 /* VIVENTIUM END */

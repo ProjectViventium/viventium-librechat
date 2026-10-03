@@ -8,6 +8,12 @@ const {
   createToolExecuteHandler,
   nativeJobMatches,
   nativeIdentityJson,
+  createDeliveryDispositionStreamHandler,
+  getStreamDeliveryDisposition,
+  supportsMessagingDeliveryDisposition,
+  isAudioDeliveryRequested,
+  inspectNativeOutputFileCarrier,
+  nativeOutputFilePublisherFromContext,
 } = require('@librechat/api');
 const {
   Tools,
@@ -31,6 +37,7 @@ const { saveBase64Image } = require('~/server/services/Files/process');
 /* === VIVENTIUM START === Versioned final-model delivery disposition. === */
 const {
   captureFinalModelDeliveryDisposition,
+  inspectProviderDeliveryDisposition,
 } = require('~/server/services/viventium/deliveryDisposition');
 /* === VIVENTIUM END === */
 const VIVENTIUM_DELIVERY_DISPOSITION_CAPABILITY_OWNER = Symbol.for(
@@ -441,12 +448,129 @@ class ModelEndHandler {
    * @param {Array<UsageMetadata>} collectedUsage
    * @param {import('http').IncomingMessage | undefined} req
    */
-  constructor(collectedUsage, req) {
+  constructor(collectedUsage, req, nativeOutputCallback) {
     if (!Array.isArray(collectedUsage)) {
       throw new Error('collectedUsage must be an array');
     }
     this.collectedUsage = collectedUsage;
     this.req = req;
+    // LangChain concatenates scalar protocol metadata along with text. Preserve whole validated
+    // chunk envelopes only for their exact graph invocation; never share a live request decision.
+    this.deliveryDispositionCaptures = new WeakMap();
+    this.nativeOutputCallback = nativeOutputCallback;
+    this.outputFileCaptures = new WeakMap();
+    this.transferredOutputFileCaptures = new WeakMap();
+  }
+  /* === VIVENTIUM END === */
+
+  /* === VIVENTIUM START === Keep whole delivery envelopes through SDK chunk concatenation. === */
+  dispositionInvocationKey(metadata, graph) {
+    if (!metadata || typeof graph?.getBaseKeyList !== 'function') return null;
+    const key = graph.getBaseKeyList(metadata);
+    if (
+      !Array.isArray(key) ||
+      key.length === 0 ||
+      !key.every(
+        (part) => typeof part === 'string' || (typeof part === 'number' && Number.isFinite(part)),
+      )
+    )
+      return null;
+    return JSON.stringify(key);
+  }
+
+  dispositionOwner(context) {
+    return JSON.stringify([
+      context?.clientOptions?.[VIVENTIUM_DELIVERY_DISPOSITION_CAPABILITY_OWNER] ||
+        context?.provider,
+      context?.provider,
+      context?.clientOptions?.model,
+    ]);
+  }
+
+  resetDispositionInvocation(metadata, graph) {
+    const key = this.dispositionInvocationKey(metadata, graph);
+    if (key != null) {
+      this.deliveryDispositionCaptures.get(graph)?.delete(key);
+      this.outputFileCaptures.get(graph)?.delete(key);
+    }
+  }
+
+  captureOutputFileChunk(chunk, metadata, graph) {
+    const key = this.dispositionInvocationKey(metadata, graph);
+    if (key == null || !this.nativeOutputCallback) return;
+    const context = graph.getAgentContext(metadata);
+    const owner =
+      context?.clientOptions?.[VIVENTIUM_DELIVERY_DISPOSITION_CAPABILITY_OWNER] ||
+      context?.provider;
+    const capability = this.req?.config?.endpoints?.agents?.providerCapabilities?.[owner];
+    if (
+      capability?.workspace_binding !== true ||
+      capability?.conversation_session !== true
+    )
+      return;
+    let carrier;
+    try {
+      carrier = inspectNativeOutputFileCarrier(chunk);
+    } catch {
+      carrier = { error: true };
+    }
+    if (!carrier) return;
+    const publisher = nativeOutputFilePublisherFromContext({
+      providerId: owner,
+      baseURL: context?.clientOptions?.configuration?.baseURL,
+      capability,
+    });
+    if (publisher) carrier = { ...carrier, publisher };
+    let captures = this.outputFileCaptures.get(graph);
+    if (!captures) {
+      captures = new Map();
+      this.outputFileCaptures.set(graph, captures);
+    }
+    captures.set(key, { owner: this.dispositionOwner(context), carrier });
+  }
+
+  captureDispositionChunk(chunk, metadata, graph) {
+    const key = this.dispositionInvocationKey(metadata, graph);
+    if (key == null || !isAudioDeliveryRequested(this.req)) return;
+    const context = graph.getAgentContext(metadata);
+    const owner =
+      context?.clientOptions?.[VIVENTIUM_DELIVERY_DISPOSITION_CAPABILITY_OWNER] ||
+      context?.provider;
+    if (
+      !supportsMessagingDeliveryDisposition(
+        this.req?.config?.endpoints?.agents?.providerCapabilities?.[owner],
+      )
+    )
+      return;
+    const captured = inspectProviderDeliveryDisposition(chunk);
+    if (captured.status === 'missing') return;
+    let captures = this.deliveryDispositionCaptures.get(graph);
+    if (!captures) {
+      captures = new Map();
+      this.deliveryDispositionCaptures.set(graph, captures);
+    }
+    const identity = this.dispositionOwner(context);
+    const previous = captures.get(key);
+    const sameOwner = previous?.owner === identity ? previous.captured : null;
+    captures.set(key, {
+      owner: identity,
+      captured:
+        sameOwner?.status === 'malformed'
+          ? sameOwner
+          : captured.status === 'malformed'
+            ? captured
+            : sameOwner?.disposition?.audio === 'skip'
+              ? sameOwner
+              : captured,
+    });
+  }
+
+  takeDispositionCapture(metadata, graph, context) {
+    const key = this.dispositionInvocationKey(metadata, graph);
+    const captures = key == null ? null : this.deliveryDispositionCaptures.get(graph);
+    const saved = captures?.get(key);
+    captures?.delete(key);
+    return saved?.owner === this.dispositionOwner(context) ? saved.captured : undefined;
   }
   /* === VIVENTIUM END === */
 
@@ -474,6 +598,17 @@ class ModelEndHandler {
     let errorMessage;
     try {
       const agentContext = graph.getAgentContext(metadata);
+      /* === VIVENTIUM START === Report the provider-returned model, including native catalog resolution. === */
+      const returnedModel =
+        data?.output?.response_metadata?.model_name || data?.output?.response_metadata?.model;
+      if (this.req && agentContext.agentId && typeof returnedModel === 'string') {
+        this.req._viventiumProviderModelReceipts ||= new Map();
+        this.req._viventiumProviderModelReceipts.set(agentContext.agentId, {
+          requestedModel: agentContext.clientOptions?.model,
+          model: returnedModel,
+        });
+      }
+      /* === VIVENTIUM END === */
       const isGoogle = agentContext.provider === Providers.GOOGLE;
       const streamingDisabled = !!agentContext.clientOptions?.disableStreaming;
       if (data?.output?.additional_kwargs?.stop_reason === 'refusal') {
@@ -491,10 +626,53 @@ class ModelEndHandler {
       }
 
       const toolCalls = data?.output?.tool_calls;
+      /* === VIVENTIUM START === Keep selected transfer files for the visible final attachment path. === */
+      if (streamingDisabled) this.captureOutputFileChunk(data?.output, metadata, graph);
+      const outputKey = this.dispositionInvocationKey(metadata, graph);
+      const outputCapture =
+        outputKey == null ? null : this.outputFileCaptures.get(graph)?.get(outputKey);
+      if (outputKey != null) this.outputFileCaptures.get(graph)?.delete(outputKey);
+      const currentOutput =
+        outputCapture?.owner === this.dispositionOwner(agentContext) ? outputCapture : null;
+      if (errorMessage) {
+        this.transferredOutputFileCaptures.delete(graph);
+      } else if (data?.output && toolCalls?.length && currentOutput) {
+        let transfers = this.transferredOutputFileCaptures.get(graph);
+        if (!transfers) {
+          transfers = new Map();
+          this.transferredOutputFileCaptures.set(graph, transfers);
+        }
+        const identity = JSON.stringify([
+          agentContext.agentId,
+          currentOutput.carrier.requestId || outputKey,
+        ]);
+        transfers.set(identity, { carrier: currentOutput.carrier, agentId: agentContext.agentId });
+      } else if (
+        data?.output &&
+        !toolCalls?.length &&
+        shouldEmitAgentOutput(metadata, agentContext.agentId)
+      ) {
+        const transfers = this.transferredOutputFileCaptures.get(graph) || new Map();
+        this.transferredOutputFileCaptures.delete(graph);
+        if (currentOutput) {
+          const identity = JSON.stringify([
+            agentContext.agentId,
+            currentOutput.carrier.requestId || outputKey,
+          ]);
+          transfers.set(identity, { carrier: currentOutput.carrier, agentId: agentContext.agentId });
+        }
+        // The original publisher remains the import authority. The existing consumer checks
+        // the current logical turn, owner, run and attempt; a handoff cannot rebind a file.
+        for (const transfer of transfers.values()) {
+          this.nativeOutputCallback?.(transfer.carrier, transfer.agentId);
+        }
+      }
+      /* === VIVENTIUM END === */
       /* === VIVENTIUM START === Capture only the capable winning model's disposition. === */
       captureFinalModelDeliveryDisposition({
         req: this.req,
         output: data?.output,
+        captured: this.takeDispositionCapture(metadata, graph, agentContext),
         capabilityOwner:
           agentContext.clientOptions?.[VIVENTIUM_DELIVERY_DISPOSITION_CAPABILITY_OWNER] ||
           agentContext.provider,
@@ -690,6 +868,7 @@ function getDefaultHandlers({
   streamId = null,
   toolExecuteOptions = null,
   messageDeltaMode = 'incremental',
+  nativeOutputCallback,
 }) {
   if (!res || !aggregateContent) {
     throw new Error(
@@ -871,7 +1050,7 @@ function getDefaultHandlers({
     const stepId = eventStepId(data);
     return data?.result?.groupId ?? data?.groupId ?? (stepId ? groupIdByStepId.get(stepId) : null);
   };
-  const modelEndHandler = new ModelEndHandler(collectedUsage, req);
+  const modelEndHandler = new ModelEndHandler(collectedUsage, req, nativeOutputCallback);
   const toolEndHandler = new ToolEndHandler(toolEndCallback, logger);
   const recordPassiveTextTiming = (record) => {
     try {
@@ -887,16 +1066,31 @@ function getDefaultHandlers({
      * the typed activity of the chunk; the library's own stream path still dispatches the content
      * and reasoning deltas, so nothing here may dispatch them a second time.
      * === VIVENTIUM END === */
-    [GraphEvents.CHAT_MODEL_STREAM]: {
-      handle: async (_event, data, metadata) => {
+    [GraphEvents.CHAT_MODEL_STREAM]: createDeliveryDispositionStreamHandler({
+      required: (_event, _data, metadata, graph) => {
+        const context = graph?.getAgentContext(metadata);
+        const owner =
+          context?.clientOptions?.[VIVENTIUM_DELIVERY_DISPOSITION_CAPABILITY_OWNER] ||
+          context?.provider;
+        const required =
+          isAudioDeliveryRequested(req) &&
+          supportsMessagingDeliveryDisposition(
+            req?.config?.endpoints?.agents?.providerCapabilities?.[owner],
+          );
+        return required;
+      },
+      beforeHandle: async (_event, data, metadata, graph) => {
+        modelEndHandler.captureOutputFileChunk(data?.chunk, metadata, graph);
+        modelEndHandler.captureDispositionChunk(data?.chunk, metadata, graph);
         await emitAuthoredPreview(data, metadata);
         if (req?._viventiumHarnessActivityEnabled === true) {
           stashTypedHarnessActivity(req, data);
         }
       },
-    },
+    }),
     [GraphEvents.CHAT_MODEL_START]: {
-      handle: async (_event, _data, metadata) => {
+      handle: async (_event, _data, metadata, graph) => {
+        modelEndHandler.resetDispositionInvocation(metadata, graph);
         /* === VIVENTIUM START ===
          * Feature: Parallel text provider-attempt timing.
          * Purpose: Correlate each structural Main graph invocation without conflating re-entry.
@@ -1263,7 +1457,29 @@ function getDefaultHandlers({
             : null;
         const emitStartedAt = shouldEmit ? voiceLatencyNow() : null;
         const normalizedEvent = normalizeMessageDeltaAtBoundary({ event, data });
-        const eventData = { event: normalizedEvent.event, data: normalizedEvent.data };
+        /* === VIVENTIUM START === Carry the exact chunk's audio control with its text. === */
+        const disposition = getStreamDeliveryDisposition(metadata);
+        const delta = normalizedEvent.data?.delta;
+        const eventData = {
+          event: normalizedEvent.event,
+          data:
+            disposition && delta
+              ? {
+                  ...normalizedEvent.data,
+                  delta: {
+                    ...delta,
+                    metadata: {
+                      ...delta.metadata,
+                      viventium: {
+                        ...delta.metadata?.viventium,
+                        deliveryDisposition: disposition,
+                      },
+                    },
+                  },
+                }
+              : normalizedEvent.data,
+        };
+        /* === VIVENTIUM END === */
         /* === VIVENTIUM START ===
          * Feature: Visible delta aggregation.
          * Purpose: Track whether a streamed delta was actually visible to the user so later repair

@@ -6,6 +6,8 @@
 
 import crypto from 'node:crypto';
 import { safeErrorCode } from '../logging/safeError';
+import { getTrustedInteractionContext } from '../agents/interactionContext';
+import { fingerprintTraceReference, redactOrchestrationTraceFacts } from './orchestrationTraceLedger';
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -17,6 +19,18 @@ export interface VoiceOrchestrationTraceDependencies {
   logger: LoggerAdapter;
   recordOrchestrationTraceEvent(input: UnknownRecord): Promise<unknown>;
   orchestrationRuntimeTraceBinding(): unknown;
+  logLocalTrace?(event: UnknownRecord): void;
+}
+
+export function writeBoundedVoiceTraceLog(logger: LoggerAdapter, event: UnknownRecord) {
+  const serialized = JSON.stringify(event);
+  const id = crypto.randomBytes(4).toString('hex');
+  const parts = Math.ceil(serialized.length / 32);
+  for (let index = 0; index < parts; index++) {
+    logger.warn(`[VIVENTIUM][voice-trace] ${JSON.stringify({
+      i: id, p: index + 1, n: parts, s: serialized.slice(index * 32, (index + 1) * 32),
+    })}`, {});
+  }
 }
 
 const HASH = /^sha256:[a-f0-9]{64}$/;
@@ -26,12 +40,16 @@ export const VOICE_TRACE_STAGE_PLANES = Object.freeze({
   'tool.completed': 'tool',
   'controller.completed': 'controller',
   'cortex.completed': 'cortex',
+  'cortex.activation.completed': 'cortex',
   'live_memory.completed': 'liveMemory',
   'recall.completed': 'recall',
   'title_model.completed': 'titleModel',
   'response.completed': 'response',
   'tts.completed': 'tts',
   'audio.completed': 'audio',
+  'audio.failed': 'audio',
+  'audio.interrupted': 'audio',
+  'audio.superseded': 'audio',
   'provider.attempt.completed': 'provider',
   'provider.fallback.completed': 'provider',
   'provider.request.forwarded': 'provider',
@@ -132,10 +150,13 @@ function normalizedVoiceTraceFacts(stage: string, input: UnknownRecord): Unknown
 }
 
 export function createVoiceOrchestrationTraceService(deps: VoiceOrchestrationTraceDependencies) {
+  let runtimeBindingWarningEmitted = false;
   function currentVoiceOrchestrationTraceBinding() {
     const runtimeBinding = deps.orchestrationRuntimeTraceBinding();
     if (!exactRuntimeBinding(runtimeBinding)) {
-      throw new Error('voice_trace_runtime_binding_unavailable');
+      throw Object.assign(new Error('voice_trace_runtime_binding_unavailable'), {
+        code: 'voice_trace_runtime_binding_unavailable',
+      });
     }
     return Object.freeze({
       contractVersion: 1,
@@ -180,7 +201,9 @@ export function createVoiceOrchestrationTraceService(deps: VoiceOrchestrationTra
         outcome:
           stage === 'action.accepted' || stage === 'provider.request.forwarded'
             ? 'accepted'
-            : 'completed',
+            : stage === 'audio.failed' ? 'failed'
+              : stage === 'audio.interrupted' || stage === 'audio.superseded' ? 'skipped'
+                : 'completed',
       },
     });
   }
@@ -191,12 +214,56 @@ export function createVoiceOrchestrationTraceService(deps: VoiceOrchestrationTra
     try {
       return await recordVoiceOrchestrationTrace(input);
     } catch (error) {
-      deps.logger.warn('[VIVENTIUM][voice-trace] production_trace_unavailable', {
-        stage: String(input.stage || '').slice(0, 80),
-        code: safeErrorCode(error, 'trace_unavailable'),
-      });
+      const code = safeErrorCode(error, 'trace_unavailable');
+      const stage = String(input.stage || '').trim();
+      // The ledger's identity gate still applies. Local diagnostics use its same positive
+      // fact contract and domain hashes, but never claim a release-bound durable event.
+      try {
+        const owner = requiredTraceText(input.ownerId, 'voice_trace_owner_required');
+        const call = requiredTraceText(input.callSessionId, 'voice_trace_call_session_required');
+        const turn = requiredTraceText(input.turnId, 'voice_trace_turn_required');
+        const event = requiredTraceText(input.eventRef, 'voice_trace_event_required');
+        const effectPlane = VOICE_TRACE_STAGE_PLANES[stage as keyof typeof VOICE_TRACE_STAGE_PLANES];
+        if (!effectPlane) throw new Error('voice_trace_stage_invalid');
+        const facts = normalizedVoiceTraceFacts(stage, isRecord(input.facts) ? input.facts : {});
+        if (Object.keys(facts).some((key) => RESERVED_FACTS.has(key))) {
+          throw new Error('voice_trace_reserved_fact');
+        }
+        const redacted = redactOrchestrationTraceFacts({ ...facts, effectPlane,
+          sourceEventRef: event, callSessionRef: call, logicalTurnRef: turn });
+        deps.logLocalTrace?.({ stage, durableTrace: 'unavailable', code,
+          ownerScopeHash: fingerprintTraceReference('owner', owner), ...redacted });
+      } catch {
+        // Invalid facts cannot enter either the durable store or the diagnostic log.
+      }
+      if (code !== 'voice_trace_runtime_binding_unavailable' || !runtimeBindingWarningEmitted) {
+        deps.logger.warn(`[VIVENTIUM][voice-trace] unavailable ${JSON.stringify({
+          stage: VOICE_TRACE_STAGE_PLANES[stage as keyof typeof VOICE_TRACE_STAGE_PLANES] ? stage : 'invalid',
+          code,
+        })}`, {});
+        if (code === 'voice_trace_runtime_binding_unavailable') runtimeBindingWarningEmitted = true;
+      }
       return null;
     }
+  }
+
+  async function recordVoiceRequestTrace(
+    request: UnknownRecord,
+    input: { eventRef: string; stage: string; facts?: UnknownRecord },
+  ) {
+    const interaction = getTrustedInteractionContext(request);
+    const body = isRecord(request.body) ? request.body : {};
+    const user = isRecord(request.user) ? request.user : {};
+    if (interaction?.surface !== 'voice' || body.voiceMode !== true ||
+        !interaction.logical_turn_id || !body.viventiumCallSessionId || !(user.id || user._id)) {
+      return null;
+    }
+    return recordVoiceOrchestrationTraceBestEffort({
+      ...input,
+      ownerId: user.id || user._id,
+      callSessionId: body.viventiumCallSessionId,
+      turnId: interaction.logical_turn_id,
+    });
   }
 
   return {
@@ -204,5 +271,6 @@ export function createVoiceOrchestrationTraceService(deps: VoiceOrchestrationTra
     currentVoiceOrchestrationTraceBinding,
     recordVoiceOrchestrationTrace,
     recordVoiceOrchestrationTraceBestEffort,
+    recordVoiceRequestTrace,
   };
 }

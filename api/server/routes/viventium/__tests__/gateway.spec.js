@@ -1800,4 +1800,40 @@ describe('/api/viventium/gateway', () => {
     expect(writes).toContain('event: done');
     expect(mockSubscribe).not.toHaveBeenCalled();
   });
+  /* === VIVENTIUM START: Preserve the shared public stream failure contract. === */
+
+  test.each(['source_context_unavailable', undefined])(
+    'GET stream preserves optional typed generation failure %s',
+    async (errorClass) => {
+      const error = 'The conversation context could not be preserved. Please retry this turn.';
+      mockSubscribe.mockImplementation(async (_id, _event, _done, onError) => {
+        onError(error, errorClass);
+        return { unsubscribe: jest.fn() };
+      });
+      const query = { channel: 'discord', accountId: 'acct-1', externalUserId: 'ext-1' };
+      const req = createMockReq({
+        method: 'GET',
+        url: '/api/viventium/gateway/stream/typed-failure?channel=discord&accountId=acct-1&externalUserId=ext-1',
+        headers: signedGatewayHeaders({
+          secret: 'gateway_secret',
+          method: 'GET',
+          path: '/api/viventium/gateway/stream/typed-failure',
+          body: {},
+        }),
+        query,
+      });
+      const res = createMockRes();
+      await dispatch(createTestApp(require('../gateway')), req, res);
+      const errorFrames = res.write.mock.calls
+        .map(([value]) => value)
+        .filter((value) => value.startsWith('event: error\ndata: '));
+      expect(errorFrames).toHaveLength(1);
+      expect(JSON.parse(errorFrames[0].slice('event: error\ndata: '.length))).toEqual({
+        error,
+        ...(errorClass ? { error_class: errorClass } : {}),
+      });
+    },
+  );
+  /* === VIVENTIUM END === */
+
 });

@@ -1820,6 +1820,30 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(runInstance.processStream).toHaveBeenCalled();
   });
 
+  test('OpenAI follow-up retains the subscription initializer transport and refresh fetch', async () => {
+    const transport = {
+      baseURL: 'https://chatgpt.com/backend-api/codex',
+      defaultHeaders: { 'chatgpt-account-id': 'synthetic-account' },
+      fetch: jest.fn(),
+    };
+    initializeOpenAI.mockResolvedValueOnce({
+      llmConfig: { model: 'gpt-6.1-sol', useResponsesApi: true, reasoning_effort: 'high' },
+      configOptions: transport,
+    });
+
+    await generateFollowUpText({
+      req: { user: { id: 'u1' }, body: {} },
+      agent: { provider: 'openai', model: 'gpt-6.1-sol' },
+      insightsData: { insights: [{ cortexName: 'Memory', insight: 'Synthetic evidence.' }] },
+      recentResponse: 'Checking now.',
+      runId: 'synthetic-follow-up',
+    });
+
+    const config = Run.create.mock.calls[0][0].graphConfig.llmConfig;
+    expect(config.configuration).toBe(transport);
+    expect(config.reasoning_effort).toBe('high');
+  });
+
   test.each(['low', 'high'])(
     'generateFollowUpText preserves saved %s effort through final persisted hydration',
     async (effort) => {
@@ -2178,7 +2202,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeOpenAI).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'gpt-5.6-sol',
+          model: 'gpt-6.1-sol',
         }),
       }),
     );
@@ -2187,7 +2211,7 @@ describe('BackgroundCortexFollowUpService', () => {
         graphConfig: expect.objectContaining({
           llmConfig: expect.objectContaining({
             provider: 'openai',
-            model: 'gpt-5.6-sol',
+            model: 'gpt-6.1-sol',
           }),
         }),
       }),
@@ -2214,7 +2238,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
         model_parameters: expect.objectContaining({
-          model: 'claude-opus-5',
+          model: 'claude-opus-5-5',
         }),
       }),
     );

@@ -40,6 +40,7 @@ const {
   mergeCapturedHarnessActivityParts,
   isHarnessInvocationLocked,
   shouldLockFallbackForToolStart,
+  primaryNativeResponseFetch,
   shouldRunOnePassNonblockingPhaseA,
   resolveParallelDetectionNoticeMode,
   resolveOnePassPhaseBPlan,
@@ -207,8 +208,11 @@ jest.mock('@librechat/agents', () => ({
   }),
 }));
 
+const mockActualCreateRun = (...args) => jest.requireActual('@librechat/api').createRun(...args);
+let mockCreateRun = mockActualCreateRun;
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  createRun: (...args) => mockCreateRun(...args),
   getRequiredPromptText: jest.fn((key, ...args) =>
     key === 'main.user_fact_guard'
       ? require('fs').readFileSync(
@@ -276,6 +280,16 @@ jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => ({
   }),
   markCortexInsightDeliveryBatchPresented: jest.fn(async ({ claims }) => claims),
   markCortexInsightDeliveryBatchFailed: jest.fn(async ({ claims }) => claims),
+}));
+
+jest.mock('~/server/services/viventium/ViventiumConversationContinuityService', () => ({
+  ...jest.requireActual('~/server/services/viventium/ViventiumConversationContinuityService'),
+  resolveConversationContinuity: jest.fn(async () => null),
+}));
+
+jest.mock('~/server/services/viventium/CortexInsightOutboxService', () => ({
+  ...jest.requireActual('~/server/services/viventium/CortexInsightOutboxService'),
+  sealOwnedCompletedCortexInsights: jest.fn(async () => []),
 }));
 
 jest.mock('~/server/services/viventium/BackgroundCortexFollowUpService', () => ({
@@ -546,6 +560,28 @@ describe('Feelings agent scope', () => {
     );
   });
 
+  it('binds a voice reaction to the current user message rather than the previous reply', async () => {
+    mockScheduleEmotionalReaction.mockClear();
+    const client = new AgentClient({
+      agent: { model_parameters: { model: 'gpt-test' } },
+      req: {
+        user: { id: 'user-1' },
+        body: { text: 'new voice stimulus', parentMessageId: 'previous-assistant-reply' },
+        _viventiumFeelingSnapshot: snapshot,
+      },
+      res: {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+    });
+    client.parentMessageId = 'current-user-message';
+    client.responseMessageId = 'current-assistant-reply';
+    await client.scheduleFeelingsReaction({});
+    expect(mockScheduleEmotionalReaction).toHaveBeenCalledWith(
+      expect.objectContaining({ stimulusId: 'current-user-message', userText: 'new voice stimulus' }),
+    );
+  });
+
   it('removes tools and cortices from an unverified shared-mic voice turn without mutating source agent', () => {
     const sourceAgent = {
       model_parameters: { model: 'gpt-test' },
@@ -629,6 +665,156 @@ describe('Detached memory writer result classification', () => {
     ).toBeNull();
   });
 });
+
+/* === VIVENTIUM START ===
+ * Purpose: a combined turn gives Main each source input's own quote, labelled with the S-number the
+ * rapid source selection uses, and never lets a quote enter the strict native delegation contract.
+ * === VIVENTIUM END === */
+describe('buildTurnReplyContextCapsules', () => {
+  const quoteA = {
+    version: 1,
+    provenanceStatus: 'verified',
+    senderRole: 'assistant_self',
+    repliedTelegramMessageId: '14384',
+    quoteText: 'Willow is cheaper by $15.',
+    logicalMessageId: 'addition-message',
+  };
+  const quoteB = {
+    version: 1,
+    provenanceStatus: 'verified',
+    senderRole: 'assistant_self',
+    repliedTelegramMessageId: '14382',
+    quoteText: 'Willow fits 450 with 8 left.',
+    logicalMessageId: 'main-answer',
+  };
+  const capsuleData = (capsules) =>
+    capsules
+      .split('</viventium_reply_context_v1>')
+      .filter((capsule) => capsule.includes('<viventium_reply_context_v1>'))
+      .map((capsule) =>
+        JSON.parse(
+          capsule.split('\n').find((line) => line.includes('"replied_telegram_message_id"')),
+        ),
+      );
+  /** The adapter capabilities the Telegram route binds to every input. */
+  const telegramCapabilities = { segment_stability: 'immediate', supersede_scope: 'response_only' };
+  const combined = (currentReply, segmentReplies, authoring = {}) => ({
+    source_event_id: 'source-b',
+    ...(authoring.revision ? { revision: authoring.revision } : {}),
+    ...(currentReply ? { reply_context: currentReply } : {}),
+    source_segments: [
+      {
+        ordinal: 0,
+        source_event_id: 'source-a',
+        source_index: 0,
+        text: 'Does it still fit?',
+        ...(authoring.a ? { authoring_revision: authoring.a } : {}),
+        ...(segmentReplies.a ? { reply_context: segmentReplies.a } : {}),
+      },
+      {
+        ordinal: 1,
+        source_event_id: 'source-b',
+        source_index: 0,
+        text: 'And the total?',
+        ...(authoring.b ? { authoring_revision: authoring.b } : {}),
+        ...(segmentReplies.b ? { reply_context: segmentReplies.b } : {}),
+      },
+    ],
+  });
+
+  test('an input deferred to an additive Telegram turn keeps its own quote, labelled by its source', () => {
+    const data = capsuleData(
+      AgentClient.buildTurnReplyContextCapsules(
+        combined(null, { a: quoteA }, { revision: 1, a: 1, b: 1 }),
+        telegramCapabilities,
+      ),
+    );
+    expect(data).toEqual([
+      expect.objectContaining({
+        source_label: 'S1',
+        replied_telegram_message_id: '14384',
+        logical_message_id: 'addition-message',
+        quote_text: 'Willow is cheaper by $15.',
+      }),
+    ]);
+  });
+
+  test('an additive Telegram turn labels its own quote beside a deferred input quote', () => {
+    const data = capsuleData(
+      AgentClient.buildTurnReplyContextCapsules(
+        combined(quoteB, { a: quoteA, b: quoteB }, { revision: 1, a: 1, b: 1 }),
+        telegramCapabilities,
+      ),
+    );
+    expect(data.map((item) => [item.source_label, item.replied_telegram_message_id])).toEqual([
+      ['S2', '14382'],
+      ['S1', '14384'],
+    ]);
+  });
+
+  test('an additive Telegram turn leaves an earlier revision input quote to that revision', () => {
+    const data = capsuleData(
+      AgentClient.buildTurnReplyContextCapsules(
+        combined(quoteB, { a: quoteA, b: quoteB }, { revision: 2, a: 1, b: 2 }),
+        telegramCapabilities,
+      ),
+    );
+    expect(data).toEqual([expect.objectContaining({ replied_telegram_message_id: '14382' })]);
+    expect(data[0]).not.toHaveProperty('source_label');
+  });
+
+  test('a web turn keeps each quoted input’s own quote, the current input first', () => {
+    const data = capsuleData(
+      AgentClient.buildTurnReplyContextCapsules(combined(quoteB, { a: quoteA, b: quoteB }), {}),
+    );
+    expect(data.map((item) => [item.source_label, item.replied_telegram_message_id])).toEqual([
+      ['S2', '14382'],
+      ['S1', '14384'],
+    ]);
+  });
+
+  test('an additive invocation keeps only its current input’s quote from unmarked sources', () => {
+    const data = capsuleData(
+      AgentClient.buildTurnReplyContextCapsules(combined(quoteB, { a: quoteA, b: quoteB }), {
+        supersede_scope: 'response_only',
+      }),
+    );
+    expect(data).toEqual([expect.objectContaining({ replied_telegram_message_id: '14382' })]);
+    expect(data[0]).not.toHaveProperty('source_label');
+  });
+
+  test('a single-input turn keeps its one unlabelled quote', () => {
+    const data = capsuleData(
+      AgentClient.buildTurnReplyContextCapsules(
+        { source_event_id: 'source-b', reply_context: quoteB },
+        {},
+      ),
+    );
+    expect(data).toEqual([expect.objectContaining({ replied_telegram_message_id: '14382' })]);
+    expect(data[0]).not.toHaveProperty('source_label');
+  });
+
+  test('the native delegation projection carries source text without any quote', () => {
+    const req = { body: {} };
+    setTrustedInteractionContext(req, {
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      conversation_id: 'conv-1',
+      source_event_id: 'source-b',
+      source_segments: combined(null, { a: quoteA }).source_segments,
+    });
+    const body = AgentClient.buildViventiumMcpRequestBody({
+      messageId: 'assistant-1',
+      conversationId: 'conv-1',
+      parentMessageId: 'user-1',
+      req,
+    });
+    expect(body.viventiumTriggeringSourceSegments).toHaveLength(2);
+    expect(JSON.stringify(body.viventiumTriggeringSourceSegments)).not.toContain('Willow');
+  });
+});
+/* === VIVENTIUM END === */
 
 describe('buildViventiumMcpRequestBody', () => {
   test('projects only server-stamped voice authority and fails closed when its binding is absent', () => {
@@ -758,6 +944,7 @@ describe('buildViventiumMcpRequestBody', () => {
         telegramChatId: 'chat-1',
         telegramUserId: 'tg-user-1',
         telegramMessageId: 'tg-msg-1',
+        externalThreadId: '9',
         telegramAudioRequested: true,
       },
     };
@@ -792,6 +979,7 @@ describe('buildViventiumMcpRequestBody', () => {
     expect(body.viventiumGlassHiveIdempotencyKey).toBe('main:assistant-1');
     expect(body.viventiumStreamId).toBe('stream-1');
     expect(body.viventiumTelegramChatId).toBe('chat-1');
+    expect(body.viventiumTelegramMessageThreadId).toBe('9');
     expect(body.telegramAudioRequested).toBe(true);
     expect(
       resolveHeaders({
@@ -1247,6 +1435,22 @@ describe('GlassHive harness activity persistence', () => {
     );
   });
 
+  test('wires the primary Main route to its exact native response fetch', () => {
+    const nativeResponseService = require('~/server/services/viventium/nativeResponseService');
+    const wrapped = jest.fn();
+    const spy = jest
+      .spyOn(nativeResponseService, 'wrapNativeResponseFetch')
+      .mockReturnValue(wrapped);
+    const req = { user: { id: 'owner' } };
+    const baseFetch = jest.fn();
+    const route = { agentId: 'agent-main', provider: 'openAI', endpoint: 'glasshive' };
+    try {
+      expect(primaryNativeResponseFetch(req, 'agent-main')(baseFetch, route)).toBe(wrapped);
+      expect(spy).toHaveBeenCalledWith(req, 'agent-main', baseFetch, route);
+    } finally {
+      spy.mockRestore();
+    }
+  });
   test('allows structurally declared read-only tools while mutating and unknown tools lock fallback', () => {
     const callbackArgs = (effectClass) => [
       { name: 'synthetic-tool-name-is-not-authority' },
@@ -1269,6 +1473,19 @@ describe('GlassHive harness activity persistence', () => {
     ).toBe(true);
     expect(shouldLockFallbackForToolStart(callbackArgs(undefined))).toBe(true);
     expect(shouldLockFallbackForToolStart(callbackArgs('read_only'))).toBe(true);
+
+    const {
+      isGraphCoordinationToolMetadata,
+    } = require('~/server/services/viventium/toolEffectMetadata');
+    const coordination = Symbol.for('viventium.agent.graph.coordination.effect.token.v1');
+    expect(isGraphCoordinationToolMetadata(callbackArgs(coordination)[5])).toBe(true);
+    expect(shouldLockFallbackForToolStart(callbackArgs(coordination))).toBe(false);
+    expect(
+      isGraphCoordinationToolMetadata(
+        callbackArgs(Symbol.for('viventium.agent.tool.effect.read_only.v1'))[5],
+      ),
+    ).toBe(false);
+    expect(isGraphCoordinationToolMetadata(callbackArgs('graph_coordination')[5])).toBe(false);
   });
   test('keeps harness activity out of later provider history while preserving its answer', () => {
     expect(
@@ -1390,7 +1607,7 @@ describe('late completion error content parts', () => {
     expect(AgentClient.createCompletionErrorContentPart(localCapacity)).toEqual({
       type: ContentTypes.ERROR,
       [ContentTypes.ERROR]:
-        'Local AI capacity is busy. Interactive work has priority; retry after the indicated delay.',
+        'Local AI capacity is busy. Please try again shortly.',
       error_class: 'host_capacity',
       retryable: true,
       retry_after_seconds: 7,
@@ -3929,6 +4146,59 @@ describe('AgentClient - titleConvo', () => {
       expect(AgentClient.memoryWriterSourceDigest(response)).not.toBe(beforeDigest);
     });
 
+    /* === VIVENTIUM START === A native answer that is not final yet was never admitted. === */
+    it('reports an unfinished native answer as not saved without attempting admission', async () => {
+      const { HumanMessage } = require('@librechat/agents/langchain/messages');
+      const response = {
+        messageId: 'response-123',
+        user: 'user-123',
+        conversationId: 'convo-123',
+        parentMessageId: 'persisted-user-message',
+        isCreatedByUser: false,
+        error: false,
+        text: 'The review is ready.',
+        content: [{ type: ContentTypes.TEXT, text: 'The review is ready.' }],
+      };
+      // The canonical save precedes native materialization, so the row is still prepared.
+      db.getNativeResponse = jest.fn().mockResolvedValue({
+        ...response,
+        unfinished: true,
+        nativeResponse: {
+          userId: 'user-123',
+          conversationId: 'convo-123',
+          responseMessageId: 'response-123',
+          status: 'prepared',
+        },
+      });
+      const nativeReader = require('@librechat/api').createNativeResponseRecoveryService({
+        db,
+        resolveRoute: async () => ({ baseURL: 'https://runtime.example.test/v1', headers: {} }),
+        fetch: jest.fn(),
+      });
+      jest
+        .spyOn(require('~/server/services/viventium/nativeResponseService'), 'getService')
+        .mockReturnValueOnce(nativeReader);
+      const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+      try {
+        const pending = client.scheduleMemoryWriter([new HumanMessage('Remember this.')]);
+        db.getMessage.mockResolvedValue(response);
+        expect(await client.admitMemoryWriter()).toBe(false);
+        await pending;
+        expect(db.admitMemoryWrite).not.toHaveBeenCalled();
+        expect(JSON.parse(mockReq._viventiumMemoryAdmissionReceipt.memory.value)).toMatchObject({
+          errorType: 'writer_unavailable',
+          partialApplied: false,
+        });
+        // No writer record exists, so the typed stage and reason must survive in the log text.
+        expect(warnSpy).toHaveBeenCalledWith(
+          '[AgentClient] Saved-memory admission failed {"name":"Error","stage":"preparation","reason":"native_graph_tool_evidence_parent_unfinished"}',
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+    /* === VIVENTIUM END === */
+
     it.each([
       null,
       { user: 'another-owner' },
@@ -4885,6 +5155,27 @@ describe('AgentClient - titleConvo', () => {
       );
     });
 
+    it('captures a deferred external writer before cleanup and admits the captured source only once', async () => {
+      const { HumanMessage } = require('@librechat/agents/langchain/messages');
+      client.deferredMemoryWriterMessages = [new HumanMessage('Remember this accepted preference.')];
+      expect(client.prepareDeferredMemoryWriter()).toBe(true);
+      expect(db.admitMemoryWrite).not.toHaveBeenCalled();
+      const pending = client.memoryWriterPromise;
+      client.runMemory = jest.fn(async (_messages, writerContext) => {
+        expect(writerContext.req).toBe(mockReq);
+        expect(writerContext.agent).toBe(mockAgent);
+        expect(writerContext.bufferMessage.content).toContain('Remember this accepted preference.');
+        return [];
+      });
+      client.options = null;
+      client.artifactPromises = null;
+      expect(await client.admitMemoryWriter()).toBe(true);
+      expect(await client.admitMemoryWriter()).toBe(false);
+      await pending;
+      expect(db.admitMemoryWrite).toHaveBeenCalledTimes(1);
+      expect(client.runMemory).toHaveBeenCalledTimes(1);
+    });
+
     it('does not clear the global memory read cache when detached writer lacks a user id', async () => {
       const { HumanMessage } = require('@librechat/agents/langchain/messages');
       const mockClearMemoryReadContextCache = require('@librechat/api').clearMemoryReadContextCache;
@@ -5447,6 +5738,109 @@ describe('AgentClient - titleConvo', () => {
       client.maxContextTokens = 4096;
     });
 
+    /* === VIVENTIUM START ===
+     * Purpose: Main receives exactly what it is admitted with: a reviewed conversation summary
+     * replaces only its covered rows, and a trusted scheduler wake omits transport rows by type
+     * while carrying every visible answer (the loaded chain keeps them walkable).
+     * === VIVENTIUM END === */
+    it('carries a reviewed conversation summary plus only the intact newer rows', async () => {
+      client.useMemory = jest.fn().mockResolvedValue(undefined);
+      const continuity = require('~/server/services/viventium/ViventiumConversationContinuityService');
+      const rows = [
+        { messageId: 'old-user', parentMessageId: null, isCreatedByUser: true, text: 'Old ask.' },
+        {
+          messageId: 'old-answer',
+          parentMessageId: 'old-user',
+          isCreatedByUser: false,
+          text: 'Old answer.',
+        },
+        {
+          messageId: 'new-user',
+          parentMessageId: 'old-answer',
+          isCreatedByUser: true,
+          text: 'New ask.',
+        },
+      ];
+      client._viventiumHistoryAncestryV1 = Object.freeze({
+        complete: true,
+        messageIds: ['old-user', 'old-answer', 'new-user'],
+        skippedMessageIds: [],
+        parentLinks: [],
+        hasUnreconciledSource: true,
+      });
+      continuity.resolveConversationContinuity.mockResolvedValueOnce({
+        messages: [rows[2]],
+        coveredIds: ['old-user', 'old-answer'],
+        capsule:
+          '<viventium_conversation_continuity_v1>synthetic</viventium_conversation_continuity_v1>',
+      });
+
+      const result = await client.buildMessages(rows, 'new-user', {});
+
+      expect(continuity.resolveConversationContinuity).toHaveBeenCalledWith(
+        expect.objectContaining({ conversationId: 'convo-123', orderedMessages: rows }),
+      );
+      expect(result.prompt.map((message) => message.messageId)).toEqual(['new-user']);
+      expect(client._viventiumVisibleMessagesV1.map((message) => message.messageId)).toEqual([
+        'new-user',
+      ]);
+      expect(client._viventiumConversationContinuityCapsule).toContain('synthetic');
+      expect(client._viventiumHistoryAncestryV1).toMatchObject({
+        reconciledMessageIds: ['old-user', 'old-answer'],
+        hasUnreconciledSource: false,
+      });
+    });
+
+    it('carries every visible answer of a trusted scheduler wake and omits its transport rows', async () => {
+      client.useMemory = jest.fn().mockResolvedValue(undefined);
+      setTrustedInteractionContext(
+        mockReq,
+        createSchedulerInteractionContext({
+          conversation_id: 'convo-123',
+          source_event_id: 'scheduler-stream',
+          schedule_id: 'schedule-daily-review',
+          schedule_run_id: 'run-next',
+        }),
+        { segment_stability: 'immediate', supersede_scope: 'response_only' },
+        { commit_authority: 'server' },
+      );
+      const internal = (context) => ({ viventium: { visibility: 'internal', ...context } });
+      const rows = [
+        {
+          messageId: 'envelope-0',
+          parentMessageId: null,
+          isCreatedByUser: true,
+          text: 'Run the private daily review.',
+          metadata: internal({
+            interactionContext: { actor_kind: 'system', origin: 'scheduler' },
+          }),
+        },
+        {
+          messageId: 'answer-0',
+          parentMessageId: 'envelope-0',
+          isCreatedByUser: false,
+          text: 'Review 0: printer rate is 3 per booklet.',
+        },
+        {
+          messageId: 'hidden-0',
+          parentMessageId: 'answer-0',
+          isCreatedByUser: false,
+          text: '{NTA}',
+          metadata: internal({}),
+        },
+        {
+          messageId: 'current',
+          parentMessageId: 'hidden-0',
+          isCreatedByUser: true,
+          text: 'Run the private daily review.',
+        },
+      ];
+
+      const result = await client.buildMessages(rows, 'current', {});
+
+      expect(result.prompt.map((message) => message.messageId)).toEqual(['answer-0', 'current']);
+    });
+
     it('preserves stored user text before upstream formatting drops an empty content array', async () => {
       client.useMemory = jest.fn().mockResolvedValue(undefined);
       const original = {
@@ -5554,6 +5948,45 @@ describe('AgentClient - titleConvo', () => {
       expect(client.glasshiveWorkerMemory).toBe(memory);
       expect(mockReq.viventiumTimeContextDelivery).toBe('per_turn_header');
     });
+
+    /* === VIVENTIUM START === S0215: native Main must receive its saved-memory snapshot. === */
+    it('gives the per-turn-header primary its saved-memory snapshot through the dynamic tail only', async () => {
+      const memory = 'Synthetic saved rate: 4 per booklet.';
+      client.useMemory = jest.fn(async () => {
+        client.memoryReadAvailability = 'available';
+        return memory;
+      });
+      mockReq.config.endpoints = {
+        agents: {
+          providerCapabilities: {
+            [EModelEndpoint.openAI]: {
+              workspace_binding: true,
+              conversation_session: true,
+              time_context_delivery: 'per_turn_header',
+            },
+          },
+        },
+      };
+      await client.buildMessages(
+        [{ messageId: 'user', sender: 'User', text: 'Hello', isCreatedByUser: true }],
+        null,
+        {},
+      );
+
+      // Stable authority stays free of current memory; the snapshot is per-turn tail content.
+      expect(client.options.agent.instructions).not.toContain(memory);
+      expect(client.savedMemoryTailForAgent(client.options.agent.id)).toBe(
+        `# Current saved-memory snapshot\n${JSON.stringify({ status: 'available', text: memory })}`,
+      );
+      expect(client.savedMemoryTailForAgent('parallel')).toBe('');
+      client.memoryReadAvailability = 'unavailable';
+      expect(client.savedMemoryTailForAgent(client.options.agent.id)).toBe(
+        '# Current saved-memory snapshot\n{"status":"unavailable"}',
+      );
+      mockReq.viventiumTimeContextDelivery = 'developer';
+      expect(client.savedMemoryTailForAgent(client.options.agent.id)).toBe('');
+    });
+    /* === VIVENTIUM END === */
 
     it('should inject conversation recall instructions for all participating agents', async () => {
       const recallPrompt = 'CONVERSATION RECALL:\n- Use `file_search` for prior-chat questions.';
@@ -6070,6 +6503,32 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     client.responseMessageId = 'resp-1';
   });
 
+  test('the real Main createRun caller installs the exact primary native response fetch', async () => {
+    const stopAtRun = Object.assign(new Error('synthetic stop at run creation'), { status: 400 });
+    let runOptions;
+    mockCreateRun = jest.fn(async (options) => {
+      runOptions = options;
+      throw stopAtRun;
+    });
+    const nativeResponseService = require('~/server/services/viventium/nativeResponseService');
+    const wrapped = jest.fn();
+    const spy = jest
+      .spyOn(nativeResponseService, 'wrapNativeResponseFetch')
+      .mockReturnValue(wrapped);
+    try {
+      await client.sendCompletion({ messages: [] }).catch(() => undefined);
+      expect(mockCreateRun).toHaveBeenCalled();
+      expect(runOptions.nativeResponseFetch).toEqual(expect.any(Function));
+      const baseFetch = jest.fn();
+      const route = { agentId: 'agent-primary', provider: EModelEndpoint.openAI };
+      expect(runOptions.nativeResponseFetch(baseFetch, route)).toBe(wrapped);
+      expect(spy).toHaveBeenCalledWith(req, 'agent-primary', baseFetch, route);
+    } finally {
+      spy.mockRestore();
+      mockCreateRun = mockActualCreateRun;
+    }
+  });
+
   test('actual fallback context loading retains the captured authored Main identity', async () => {
     const captured = req._viventiumAcceptedMainCompactionIdentityV1;
     primaryAgent.viventiumFallbackLlm = {
@@ -6508,6 +6967,143 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
   });
 
+  /* === VIVENTIUM START ===
+   * Purpose: The owner batch carries every insight its cortices durably accepted, including one
+   * whose acceptance finished after the cortex guard reported, exactly once.
+   * === VIVENTIUM END === */
+  test('forms the owner batch from the sealed accepted set without duplicating guarded insights', async () => {
+    const outbox = require('~/server/services/viventium/CortexInsightOutboxService');
+    const phaseB = deferred();
+    outbox.sealOwnedCompletedCortexInsights.mockResolvedValueOnce([
+      {
+        cortexId: 'agent-background',
+        cortexName: 'Background',
+        insight: 'Background result.',
+        status: 'completed',
+      },
+      { cortexId: 'agent-late', cortexName: 'Late', insight: 'Late result.', status: 'completed' },
+    ]);
+    client.contentParts.push({ type: ContentTypes.TEXT, text: 'Primary answer.' });
+
+    const attached = client.attachBackgroundCortexCompletionPipeline({
+      cortexExecutionPromise: phaseB.promise,
+      pendingCortexParts: [],
+      req,
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-1',
+      agent: primaryAgent,
+      getResponseContentParts: () => client.contentParts,
+      responseController: null,
+      turnUserInputTime: 0,
+      followupGraceMs: 0,
+      shouldDeferMainResponse: false,
+      getActivatedCorticesList: () => [],
+    });
+    phaseB.resolve({
+      insights: [
+        { cortexId: 'agent-background', cortexName: 'Background', insight: 'Background result.' },
+      ],
+      mergedPrompt: 'Background result.',
+      cortexCount: 1,
+    });
+    await attached;
+
+    expect(outbox.sealOwnedCompletedCortexInsights).toHaveBeenCalledWith({
+      ownerId: 'user-1',
+      parentMessageId: 'resp-1',
+    });
+    const { insightsData } = mockCreateCortexFollowUpMessage.mock.calls[0][0];
+    expect(insightsData.insights.map((item) => [item.cortexId, item.insight])).toEqual([
+      ['agent-background', 'Background result.'],
+      ['agent-late', 'Late result.'],
+    ]);
+    expect(insightsData.cortexCount).toBe(2);
+    expect(insightsData.mergedPrompt).toContain('Late result.');
+  });
+
+  /* === VIVENTIUM START ===
+   * Purpose: S0215 and the Web-only listener case. After this emit presents Web, every
+   * still-unpresented required surface goes to its durable dispatcher, whatever the receipt
+   * target: a subscriber receipt cannot show that a Telegram listener holds the lease.
+   * === VIVENTIUM END === */
+  test.each([
+    ['runtime_replay_buffer', ['web'], 1],
+    ['durable_replay_store', ['web'], 1],
+    ['subscriber_transport', ['web'], 1],
+    ['runtime_replay_buffer', ['web', 'telegram'], 0],
+    ['subscriber_transport', ['web', 'telegram'], 0],
+  ])(
+    'receipt target %s with presented surfaces %j hands over %i time(s)',
+    async (target, presentedSurfaces, handovers) => {
+      const ledger = require('~/server/services/viventium/CortexInsightDeliveryService');
+      const phaseB = deferred();
+      mockEmitChunk.mockImplementation(async (streamId, event, options) => {
+        const fence = await options?.verifyCortexPresentation?.();
+        return {
+          delivered: true,
+          streamId,
+          target,
+          presentationRef: `replay:${streamId}:${event.data.messageId}`,
+          claimToken: fence?.claimToken,
+          presentationLeaseToken: fence?.presentationLeaseToken,
+        };
+      });
+      ledger.markCortexInsightDeliveryBatchPresented.mockImplementationOnce(async ({ claims }) =>
+        claims.map((claim) => ({
+          ...claim,
+          status: presentedSurfaces.length === 2 ? 'presented' : 'claimed',
+          requiredSurfaces: ['web', 'telegram'],
+          presentedSurfaces,
+        })),
+      );
+      mockCreateCortexFollowUpMessage.mockResolvedValue({
+        messageId: 'follow-up-1',
+        parentMessageId: 'resp-1',
+        text: 'Corrected answer.',
+        metadata: {
+          viventium: {
+            messageRevision: 1,
+            cortexInsightDeliveryIds: ['delivery-phase-b'],
+            cortexPresentationGeneration: 2,
+            cortexPresentationClaimToken: 'claim-phase-b',
+          },
+        },
+      });
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Primary answer.' });
+
+      const attached = client.attachBackgroundCortexCompletionPipeline({
+        cortexExecutionPromise: phaseB.promise,
+        pendingCortexParts: [],
+        req,
+        conversationId: 'conv-1',
+        responseMessageId: 'resp-1',
+        agent: primaryAgent,
+        getResponseContentParts: () => client.contentParts,
+        responseController: null,
+        turnUserInputTime: 0,
+        followupGraceMs: 0,
+        shouldDeferMainResponse: false,
+        getActivatedCorticesList: () => [],
+      });
+      phaseB.resolve({
+        insights: [{ cortexId: 'agent-background', insight: 'Background result.' }],
+        mergedPrompt: 'Background result.',
+        cortexCount: 1,
+      });
+      await attached;
+
+      expect(ledger.markCortexInsightDeliveryBatchPresented).toHaveBeenCalledTimes(1);
+      expect(ledger.markCortexInsightDeliveryBatchFailed).toHaveBeenCalledTimes(handovers);
+      if (handovers > 0) {
+        expect(ledger.markCortexInsightDeliveryBatchFailed).toHaveBeenCalledWith({
+          ownerId: 'user-1',
+          claims: [{ deliveryId: 'delivery-phase-b', claimGeneration: 2 }],
+          reason: 'presentation_failed',
+        });
+      }
+    },
+  );
+
   test('persists terminal Phase B errors even when no follow-up should be shown', async () => {
     const phaseB = deferred();
     const pendingCortexParts = [
@@ -6853,6 +7449,92 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(primaryAgent.viventiumFallbackLlmInitializer).not.toHaveBeenCalled();
   });
 
+  test('preserves a participant reconnect failure instead of replaying a harness Main that handed off', async () => {
+    req._viventiumHarnessExecutionEnabled = true;
+    req._viventiumGraphHandoffStarted = true;
+    primaryAgent.viventiumFallbackLlmInitializer = jest.fn();
+    const reconnectError = Object.assign(
+      new Error(
+        'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.',
+      ),
+      {
+        code: 'MODEL_AUTHENTICATION',
+        viventiumConnectedAccountReconnectRequired: true,
+        viventiumConnectedAccountProvider: 'Anthropic',
+      },
+    );
+    client.chatCompletion = jest.fn(async () => {
+      throw reconnectError;
+    });
+
+    await expect(client.sendCompletion({ text: 'Ask the specialist.' })).rejects.toBe(
+      reconnectError,
+    );
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
+    expect(primaryAgent.viventiumFallbackLlmInitializer).not.toHaveBeenCalled();
+    expect(AgentClient.createCompletionErrorContentPart(reconnectError)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]:
+        'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts. Reconnect Anthropic, then try again.',
+      error_class: 'provider_connected_account_reconnect_required',
+    });
+  });
+
+  test('keeps outer fallback replay after a coordination handoff for a direct-provider Main', async () => {
+    req._viventiumGraphHandoffStarted = true;
+    const fallbackAgent = {
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    };
+    primaryAgent.viventiumFallbackLlmInitializer = jest.fn(async () => fallbackAgent);
+    let calls = 0;
+    client.chatCompletion = jest.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        client.contentParts.push({
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: 'provider temporarily unavailable',
+        });
+        return;
+      }
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+    });
+
+    await client.sendCompletion({ text: 'hello' });
+
+    expect(client.chatCompletion).toHaveBeenCalledTimes(2);
+    expect(req._viventiumGraphHandoffStarted).toBe(false);
+  });
+
+  test('adds one reconnect notice when a participant answered through its configured fallback', async () => {
+    req._viventiumParticipantReconnectRecovery = {
+      provider: 'Anthropic',
+      model: 'claude-code:opus',
+    };
+    client.chatCompletion = jest.fn(async () => {
+      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Recovered specialist answer.' });
+    });
+
+    const { completion } = await client.sendCompletion({ text: 'hello' });
+
+    expect(completion).toEqual([
+      {
+        type: ContentTypes.HARNESS_ACTIVITY,
+        harness_activity: {
+          event: 'fallback-recovery',
+          summary:
+            'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts. I completed this response with your configured fallback model (claude-code:opus).',
+          provider: 'Anthropic',
+          model: 'claude-code:opus',
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'Recovered specialist answer.' },
+    ]);
+  });
+
   test('materializes lazy fallback only after primary fails before assistant text', async () => {
     const fallbackAgent = {
       id: 'agent-fallback',
@@ -6883,6 +7565,29 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
     expect(fallbackSawUserMcpAuthMap).toEqual(fallbackAgent.userMCPAuthMap);
     expectFallbackCompletion(result.completion, 'Fallback answer.', 'gpt-5.4');
+  });
+
+  test('never starts a fallback model run for a revision already replaced by newer input', async () => {
+    require('@librechat/api').GenerationJobManager.getJob.mockResolvedValue({
+      status: 'superseded',
+    });
+    primaryAgent.viventiumFallbackLlmInitializer = jest.fn(async () => ({
+      id: 'agent-fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'gpt-5.4',
+      model_parameters: { model: 'gpt-5.4' },
+    }));
+    client.chatCompletion = jest.fn(async () => {
+      client.contentParts.push({
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'provider temporarily unavailable',
+      });
+    });
+
+    await client.sendCompletion({ text: 'hello' });
+
+    expect(primaryAgent.viventiumFallbackLlmInitializer).not.toHaveBeenCalled();
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
   });
 
   test('materializes lazy fallback for a nested provider access denial before assistant text', async () => {
@@ -7765,5 +8470,29 @@ describe('Phase B follow-up input recovery', () => {
         errorClass: 'provider_timeout',
       }),
     ]);
+  });
+});
+
+describe('native owner input outcome presentation', () => {
+  test.each([
+    'native_input_declined',
+    'native_input_expired',
+    'native_input_cancelled',
+    'native_turn_cancelled',
+  ])('keeps %s separate from provider failure and never selects a fallback', (code) => {
+    const declared = APIError.generate(
+      502,
+      { error: { code, message: 'Synthetic private detail' } },
+      undefined,
+      new Headers(),
+    );
+    const part = AgentClient.createCompletionErrorContentPart(
+      new Error('Outer', { cause: declared }),
+    );
+    expect(part.error_class).toBe(code);
+    expect(part.error).not.toContain('Synthetic private detail');
+    expect(
+      require('~/server/services/viventium/agentLlmFallback').shouldRetryWithFallback([part]),
+    ).toBe(false);
   });
 });

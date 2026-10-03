@@ -24,10 +24,15 @@ function isFallbackReplaySafeToolMetadata(metadata) {
   );
 }
 
+function isGraphCoordinationToolMetadata(metadata) {
+  return metadata?.viventiumToolEffectClass === TOOL_EFFECT_CLASSES.graphCoordination;
+}
+
 module.exports = {
   TOOL_EFFECT_CLASSES,
   toolEffectMetadata,
   isFallbackReplaySafeToolMetadata,
+  isGraphCoordinationToolMetadata,
 };
 
 /* === VIVENTIUM END === */

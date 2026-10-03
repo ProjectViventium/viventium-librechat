@@ -231,6 +231,67 @@ test('Phase B Main completion cannot cache an unaccepted native final for reconn
   await manager.destroy();
 });
 
+test('a current native answer revoked by a source change ends its stream with a typed error', async () => {
+  const store = new InMemoryJobStore();
+  const transport = new InMemoryEventTransport();
+  const manager = new GenerationJobManagerClass({ jobStore: store, eventTransport: transport });
+  manager.initialize();
+  try {
+    const { identity } = await admitted(store);
+    await manager.bindNativeResponse(identity);
+    const errors = jest.spyOn(transport, 'emitError');
+    expect(await manager.failRevokedNativeResponse(identity, 'native_response_revoked')).toBe(
+      false,
+    );
+    await manager.revokeNativeResponse(identity);
+    // The ordinary error path stays silent for a cancelled native answer (Stop owns its FINAL)...
+    await manager.emitError(identity.streamId, 'native_response_final_pending');
+    await manager.completeJob(identity.streamId, 'native_response_final_pending');
+    expect(errors).not.toHaveBeenCalled();
+    // ...so the owner that proved a source revocation ends this exact stream.
+    expect(await manager.failRevokedNativeResponse(identity, 'native_response_revoked')).toBe(true);
+    expect(errors).toHaveBeenCalledWith(identity.streamId, 'native_response_revoked');
+    expect(await store.getJob(identity.streamId)).toMatchObject({
+      status: 'error',
+      error: 'native_response_revoked',
+    });
+  } finally {
+    await manager.destroy();
+  }
+});
+
+test('a committed native answer or a finished Stop is never failed as revoked', async () => {
+  const store = new InMemoryJobStore();
+  const transport = new InMemoryEventTransport();
+  const manager = new GenerationJobManagerClass({ jobStore: store, eventTransport: transport });
+  manager.initialize();
+  try {
+    const errors = jest.spyOn(transport, 'emitError');
+    const committed = (await admitted(store, 'stream-committed')).identity;
+    await manager.bindNativeResponse(committed);
+    await manager.commitNativeResponse(committed, digest);
+    expect(await manager.failRevokedNativeResponse(committed, 'native_response_revoked')).toBe(
+      false,
+    );
+    const stopped = (await admitted(store, 'stream-stopped')).identity;
+    await manager.bindNativeResponse(stopped);
+    await manager.revokeNativeResponse(stopped);
+    expect(
+      await manager.finishNativeResponse(
+        stopped,
+        { final: true, responseMessage: { text: 'Stopped partial.' } } as never,
+        'cancelled',
+      ),
+    ).toBe(true);
+    expect(await manager.failRevokedNativeResponse(stopped, 'native_response_revoked')).toBe(
+      false,
+    );
+    expect(errors).not.toHaveBeenCalled();
+  } finally {
+    await manager.destroy();
+  }
+});
+
 test('late transport error cannot replace an accepted saved native final', async () => {
   const store = new InMemoryJobStore();
   const transport = new InMemoryEventTransport();
@@ -617,6 +678,71 @@ test('received native event proof follows late binding but cannot reach a replac
     await manager.destroy();
   }
 });
+
+/* === VIVENTIUM START === An adapter subscribed at stream start receives the native FINAL. === */
+test('an early subscriber receives the actual native final after late response binding', async () => {
+  // Redis returns detached job copies; the subscription snapshot predates response binding.
+  class DetachedJobStore extends InMemoryJobStore {
+    async createJob(...args: Parameters<InMemoryJobStore['createJob']>) {
+      return structuredClone(await super.createJob(...args));
+    }
+
+    async getJob(stream: string): Promise<SerializableJobData | null> {
+      return structuredClone(await super.getJob(stream));
+    }
+  }
+  const store = new DetachedJobStore();
+  const transport = new InMemoryEventTransport();
+  const manager = new GenerationJobManagerClass({ jobStore: store, eventTransport: transport });
+  manager.initialize();
+  try {
+    await manager.createJob('early', 'owner', 'conversation', {
+      interactionContext: {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'telegram',
+        conversation_id: 'conversation',
+        source_event_id: 'early',
+        revision: 1,
+      },
+    });
+    // Telegram subscribes as soon as chat start returns, before the response identity exists.
+    const delivered = jest.fn();
+    await manager.subscribe('early', jest.fn(), delivered);
+    await manager.updateMetadata('early', {
+      responseMessageId: 'answer',
+      userMessage: { messageId: 'source' },
+    });
+    const data = (await store.getJob('early'))!;
+    const admittedAt = Date.now();
+    const identity = {
+      userId: 'owner',
+      conversationId: 'conversation',
+      responseMessageId: 'answer',
+      streamId: 'early',
+      jobCreatedAt: data.createdAt,
+      logicalTurnId: data.interactionContext!.logical_turn_id!,
+      revision: data.interactionContext!.revision,
+      invocationId: 'invocation',
+      bodySha256: digest,
+      originSha256: digest,
+      providerId: 'provider',
+      agentId: 'agent',
+      source: { id: 'source-id', messageId: 'source', digest },
+      admittedAt,
+      recoverUntil: admittedAt + 86400000,
+    };
+    expect(await manager.bindNativeResponse(identity)).toBe(true);
+    await manager.commitNativeResponse(identity, digest);
+    const final = { final: true, responseMessage: { messageId: 'answer', text: 'Answer.' } };
+    expect(await manager.finishNativeResponse(identity, final as never)).toBe(true);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(delivered).toHaveBeenCalledWith(final);
+  } finally {
+    await manager.destroy();
+  }
+});
+/* === VIVENTIUM END === */
 
 test('a late producer cannot finish, error, or clean up while Stop awaits its snapshot', async () => {
   const store = new InMemoryJobStore();

@@ -169,7 +169,7 @@ describe('GenerationJobManager logical turns', () => {
     }
   });
 
-  test('rejects source N presentation when N+1 was observed 280ms earlier without aborting response_only authoring', async () => {
+  test('rejects source N presentation when N+1 was observed 280ms earlier and revokes only its obsolete authoring', async () => {
     const manager = new GenerationJobManagerClass({
       jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
       eventTransport: new InMemoryEventTransport(),
@@ -238,7 +238,9 @@ describe('GenerationJobManager logical turns', () => {
       revision: 2,
       source_sequence: 12347,
     });
-    expect(first.abortController.signal.aborted).toBe(false);
+    // Supersession revokes the obsolete Main operation; durable work keeps its owners.
+    expect(first.abortController.signal.aborted).toBe(true);
+    expect(first.abortController.signal.reason).toBe('superseded');
     await manager.destroy();
   });
 
@@ -312,7 +314,9 @@ describe('GenerationJobManager logical turns', () => {
           revision: 2,
           source_sequence: 12347,
         });
-        expect(first.abortController.signal.aborted).toBe(false);
+        // Supersession revokes the obsolete Main operation; durable work keeps its owners.
+        expect(first.abortController.signal.aborted).toBe(true);
+        expect(first.abortController.signal.reason).toBe('superseded');
         await expect(
           manager.acknowledgeDelivery(
             {
@@ -455,6 +459,135 @@ describe('GenerationJobManager logical turns', () => {
         committed.metadata.interactionContext?.logical_turn_id,
       );
       expect(committed.abortController.signal.aborted).toBe(false);
+    } finally {
+      await manager.destroy();
+    }
+  });
+  /* === VIVENTIUM END === */
+
+  /* === VIVENTIUM START === A reset conversation never continues another conversation's turn. === */
+  test('a newer source from another conversation supersedes the active turn without inheriting it', async () => {
+    const manager = new GenerationJobManagerClass({
+      jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
+      eventTransport: new InMemoryEventTransport(),
+      cleanupOnComplete: false,
+    });
+    manager.initialize();
+    const sourceOrderScope = 'f'.repeat(64);
+    const orderedContext = (
+      conversationId: string,
+      sourceEventId: string,
+      sourceSequence: number,
+    ): InteractionContext => ({
+      ...telegramContext(conversationId, sourceEventId),
+      source_order_scope: sourceOrderScope,
+      source_sequence: sourceSequence,
+      source_segments: [
+        { ordinal: 0, source_event_id: sourceEventId, source_index: 0, text: sourceEventId },
+      ],
+    });
+    const responseOnly = {
+      segment_stability: 'immediate' as const,
+      supersede_scope: 'response_only' as const,
+    };
+    try {
+      const old = await manager.createJob('telegram-old-conversation', 'user-1', 'conversation-old', {
+        interactionContext: orderedContext('conversation-old', 'old-replay', 1),
+        adapterCapabilities: responseOnly,
+        deliveryPolicy: externalDelivery,
+      });
+      const fresh = await manager.createJob(
+        'telegram-reset-conversation',
+        'user-1',
+        'conversation-new',
+        {
+          interactionContext: orderedContext('conversation-new', 'fresh-task', 2),
+          adapterCapabilities: responseOnly,
+          deliveryPolicy: externalDelivery,
+        },
+      );
+      expect(fresh.metadata.interactionContext).toMatchObject({
+        conversation_id: 'conversation-new',
+        revision: 1,
+      });
+      expect(fresh.metadata.interactionContext?.logical_turn_id).not.toBe(
+        old.metadata.interactionContext?.logical_turn_id,
+      );
+      expect(
+        fresh.metadata.interactionContext?.source_segments?.map((source) => source.source_event_id),
+      ).toEqual(['fresh-task']);
+      // The newest source in the chat still wins over the older in-flight turn.
+      expect(old.abortController.signal.aborted).toBe(true);
+      expect((await manager.getJob('telegram-old-conversation'))?.status).toBe('superseded');
+      expect((await manager.getJob('telegram-reset-conversation'))?.status).toBe('running');
+    } finally {
+      await manager.destroy();
+    }
+  });
+  /* === VIVENTIUM END === */
+
+  /* === VIVENTIUM START === Typed admission results never become an unclaimed generation. === */
+  test('an earlier ready input waits or is superseded instead of running beside the active turn', async () => {
+    const manager = new GenerationJobManagerClass({
+      jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
+      eventTransport: new InMemoryEventTransport(),
+      cleanupOnComplete: false,
+    });
+    manager.initialize();
+    const sourceOrderScope = 'c'.repeat(64);
+    const responseOnly = {
+      segment_stability: 'immediate' as const,
+      supersede_scope: 'response_only' as const,
+    };
+    const ordered = (
+      sourceEventId: string,
+      sourceSequence: number,
+      extra: Partial<InteractionContext> = {},
+    ): InteractionContext => ({
+      ...telegramContext('conversation-admission', sourceEventId),
+      source_order_scope: sourceOrderScope,
+      source_sequence: sourceSequence,
+      ...extra,
+    });
+    const options = (context: InteractionContext) => ({
+      interactionContext: context,
+      adapterCapabilities: responseOnly,
+      deliveryPolicy: externalDelivery,
+    });
+    try {
+      await manager.observeSourceOrder({ source_order_scope: sourceOrderScope, source_sequence: 2 });
+      await manager.createJob(
+        'telegram-newer-active',
+        'user-1',
+        'conversation-admission',
+        options(ordered('newer-source', 2)),
+      );
+      await expect(
+        manager.createJob(
+          'telegram-earlier-continuation',
+          'user-1',
+          'conversation-admission',
+          options(
+            ordered('earlier-source', 1, {
+              ready_input_continuation: {
+                source_message_id: 'earlier-message',
+                presentation_source_sequence: 2,
+              },
+            }),
+          ),
+        ),
+      ).rejects.toMatchObject({ code: 'source_input_waiting' });
+      await expect(
+        manager.createJob(
+          'telegram-earlier-fresh',
+          'user-1',
+          'conversation-admission',
+          options(ordered('earlier-fresh-source', 1)),
+        ),
+      ).rejects.toMatchObject({ code: 'source_order_superseded' });
+      expect((await manager.getJob('telegram-newer-active'))?.status).toBe('running');
+      expect(await manager.getJob('telegram-earlier-continuation')).toBeUndefined();
+      expect(await manager.getJob('telegram-earlier-fresh')).toBeUndefined();
     } finally {
       await manager.destroy();
     }
@@ -753,7 +886,7 @@ describe('GenerationJobManager logical turns', () => {
     },
   );
 
-  test('revises one unresolved Telegram reply in source order without aborting accepted work', async () => {
+  test('revises one unresolved Telegram reply in source order, revoking only its obsolete authoring', async () => {
     const manager = new GenerationJobManagerClass({
       jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
       eventTransport: new InMemoryEventTransport(),
@@ -795,7 +928,9 @@ describe('GenerationJobManager logical turns', () => {
     expect(first.metadata.interactionContext?.logical_turn_id).toBe(
       second.metadata.interactionContext?.logical_turn_id,
     );
-    expect(first.abortController.signal.aborted).toBe(false);
+    // Supersession revokes the obsolete Main operation; durable work keeps its owners.
+    expect(first.abortController.signal.aborted).toBe(true);
+    expect(first.abortController.signal.reason).toBe('superseded');
     expect((await manager.getJob('telegram-independent-a'))?.status).toBe('superseded');
     expect((await manager.getJob('telegram-independent-b'))?.status).toBe('running');
     await manager.destroy();
@@ -845,6 +980,7 @@ describe('GenerationJobManager logical turns', () => {
     });
 
     expect(replay.duplicateOfStreamId).toBe('source-b');
+    // Each source keeps the revision whose Main invocation authors it.
     expect(third.metadata.interactionContext?.source_segments).toEqual([
       {
         ordinal: 0,
@@ -854,9 +990,22 @@ describe('GenerationJobManager logical turns', () => {
         source_files: [
           { file_id: 'file-a', filename: 'a.png', type: 'image/png', media_group_index: 0 },
         ],
+        authoring_revision: 1,
       },
-      { ordinal: 1, source_event_id: 'event-b', source_index: 0, text: 'same exact request' },
-      { ordinal: 2, source_event_id: 'event-c', source_index: 0, text: 'third request' },
+      {
+        ordinal: 1,
+        source_event_id: 'event-b',
+        source_index: 0,
+        text: 'same exact request',
+        authoring_revision: 2,
+      },
+      {
+        ordinal: 2,
+        source_event_id: 'event-c',
+        source_index: 0,
+        text: 'third request',
+        authoring_revision: 3,
+      },
     ]);
     expect(first.metadata.interactionContext?.source_segments).toHaveLength(1);
     expect(second.metadata.interactionContext?.source_segments).toHaveLength(2);
@@ -1823,6 +1972,181 @@ describe('GenerationJobManager logical turns', () => {
     await manager.destroy();
   });
 
+  /* === VIVENTIUM START ===
+   * Fix: a typed abort follows its durable supersession publication, before completion cleanup.
+   */
+  test.each([false, true])(
+    'initialization completion cannot overtake pending supersession (late receipt=%s)',
+    async (lateReceipt) => {
+      const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+      const manager = new GenerationJobManagerClass({
+        jobStore: store,
+        eventTransport: new InMemoryEventTransport(),
+        cleanupOnComplete: false,
+      });
+      manager.initialize();
+      const responseOnly = {
+        segment_stability: 'immediate' as const,
+        supersede_scope: 'response_only' as const,
+      };
+      const first = await manager.createJob('init-old', 'owner', 'conversation-init', {
+        interactionContext: telegramContext('conversation-init', 'source-old'),
+        adapterCapabilities: responseOnly,
+        deliveryPolicy: externalDelivery,
+      });
+      await manager.updateMetadata('init-old', { responseMessageId: 'answer-old' });
+      const terminals: unknown[] = [];
+      await manager.subscribe(
+        'init-old',
+        () => {},
+        (event) => terminals.push(event),
+      );
+      let release!: () => void;
+      let reached!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const started = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      const update = store.updateJob.bind(store);
+      jest.spyOn(store, 'updateJob').mockImplementation(async (streamId, patch, expected) => {
+        if (streamId === 'init-old' && patch.status === 'superseded') {
+          reached();
+          await gate;
+        }
+        return update(streamId, patch, expected);
+      });
+      let completion: Promise<void> | undefined;
+      first.abortController.signal.addEventListener(
+        'abort',
+        () => {
+          if (first.abortController.signal.reason !== 'superseded') return;
+          completion = manager.completeJob('init-old');
+          void completion.catch(() => {});
+        },
+        { once: true },
+      );
+      const successor = manager.createJob('init-new', 'owner', 'conversation-init', {
+        interactionContext: telegramContext('conversation-init', 'source-new'),
+        adapterCapabilities: responseOnly,
+        deliveryPolicy: externalDelivery,
+      });
+      try {
+        await started;
+        expect(first.abortController.signal.aborted).toBe(false);
+        expect(await store.getJob('init-old')).toMatchObject({
+          status: 'running',
+          nativeResponseCancelled: true,
+        });
+        if (lateReceipt) {
+          expect(await store.getJob('init-old')).toMatchObject({
+            userId: 'owner',
+            responseMessageId: 'answer-old',
+            interactionContext: expect.objectContaining({ source_event_id: 'source-old' }),
+          });
+          expect(
+            await manager.markDurableEffectReceipt({
+              streamId: 'init-old',
+              userId: 'owner',
+              sourceEventId: 'source-old',
+              responseMessageId: 'answer-old',
+              effectKind: 'durable_work_accepted',
+              effectRef: 'effect-old',
+            }),
+          ).toBe(true);
+        }
+        release();
+        const second = await successor;
+        await completion;
+        expect(first.abortController.signal.reason).toBe('superseded');
+        expect(second.abortController.signal.aborted).toBe(false);
+        expect(await store.getJob('init-old')).toMatchObject({
+          status: 'superseded',
+          generationCompleted: true,
+        });
+        expect(await store.getJob('init-new')).toMatchObject({ status: 'running' });
+        expect(terminals).toHaveLength(1);
+        expect(terminals[0]).toMatchObject(
+          lateReceipt
+            ? {
+                responseMessage: {
+                  messageId: 'answer-old',
+                  text: 'Background work started. Open Active Work to view or steer it.',
+                },
+              }
+            : { final: true, superseded: true },
+        );
+      } finally {
+        release();
+        await successor.catch(() => {});
+        await completion?.catch(() => {});
+        await manager.destroy();
+      }
+    },
+  );
+
+  test.each(['status', 'receipt'])(
+    'failed durable supersession %s write still aborts obsolete authoring and propagates the store error',
+    async (failedWrite) => {
+      const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+      const manager = new GenerationJobManagerClass({
+        jobStore: store,
+        eventTransport: new InMemoryEventTransport(),
+        cleanupOnComplete: false,
+      });
+      manager.initialize();
+      try {
+        const responseOnly = {
+          segment_stability: 'immediate' as const,
+          supersede_scope: 'response_only' as const,
+        };
+        const first = await manager.createJob('failed-old', 'owner', 'conversation-failed', {
+          interactionContext: telegramContext('conversation-failed', 'source-old'),
+          adapterCapabilities: responseOnly,
+          deliveryPolicy: externalDelivery,
+        });
+        await manager.updateMetadata('failed-old', { responseMessageId: 'answer-old' });
+        const error = new Error('Synthetic store failure');
+        const update = store.updateJob.bind(store);
+        jest.spyOn(store, 'updateJob').mockImplementation(async (streamId, patch, expected) => {
+          if (streamId === 'failed-old' && patch.status === 'superseded') {
+            if (failedWrite === 'status') throw error;
+            expect(
+              await manager.markDurableEffectReceipt({
+                streamId: 'failed-old',
+                userId: 'owner',
+                sourceEventId: 'source-old',
+                responseMessageId: 'answer-old',
+                effectKind: 'durable_work_accepted',
+                effectRef: 'effect-old',
+              }),
+            ).toBe(true);
+          }
+          if (streamId === 'failed-old' && patch.finalEvent && failedWrite === 'receipt')
+            throw error;
+          return update(streamId, patch, expected);
+        });
+        await expect(
+          manager.createJob('failed-new', 'owner', 'conversation-failed', {
+            interactionContext: telegramContext('conversation-failed', 'source-new'),
+            adapterCapabilities: responseOnly,
+            deliveryPolicy: externalDelivery,
+          }),
+        ).rejects.toBe(error);
+        expect(first.abortController.signal.reason).toBe('superseded');
+        expect(await store.getJob('failed-old')).toMatchObject({
+          status: failedWrite === 'status' ? 'running' : 'superseded',
+          nativeResponseCancelled: true,
+        });
+        expect(await store.getJob('failed-new')).toMatchObject({ status: 'running' });
+      } finally {
+        await manager.destroy();
+      }
+    },
+  );
+  /* === VIVENTIUM END === */
+
   test('normal completion terminalizes an already-superseded response-only stream without a receipt', async () => {
     const manager = new GenerationJobManagerClass({
       jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
@@ -2059,7 +2383,7 @@ describe('GenerationJobManager logical turns', () => {
     await manager.destroy();
   });
 
-  test('response_only supersession suppresses stale presentation without aborting durable work', async () => {
+  test('response_only supersession revokes the stale Main operation and suppresses its presentation', async () => {
     const manager = new GenerationJobManagerClass({
       jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
       eventTransport: new InMemoryEventTransport(),
@@ -2097,13 +2421,178 @@ describe('GenerationJobManager logical turns', () => {
       responseMessage: { text: 'stale durable completion prose' },
     } as never);
 
-    expect(first.abortController.signal.aborted).toBe(false);
+    // Supersession revokes the obsolete Main operation; durable work keeps its owners.
+    expect(first.abortController.signal.aborted).toBe(true);
+    expect(first.abortController.signal.reason).toBe('superseded');
     expect((await manager.getJob('voice-a'))?.status).toBe('superseded');
     expect(chunks).toEqual([]);
     expect(terminals).toEqual([
       expect.objectContaining({ final: true, superseded: true, revision: 1 }),
     ]);
     await manager.destroy();
+  });
+
+  test('carries a superseded native Main operation to release across a never-admitted revision', async () => {
+    const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const manager = new GenerationJobManagerClass({
+      jobStore: store,
+      eventTransport: new InMemoryEventTransport(),
+      cleanupOnComplete: false,
+    });
+    manager.initialize();
+    const responseOnly = {
+      segment_stability: 'immediate' as const,
+      supersede_scope: 'response_only' as const,
+    };
+    const create = (streamId: string, sourceEventId: string) =>
+      manager.createJob(streamId, 'user-1', 'conversation-release', {
+        interactionContext: telegramContext('conversation-release', sourceEventId),
+        adapterCapabilities: responseOnly,
+        deliveryPolicy: externalDelivery,
+      });
+    const a = await create('telegram-release-a', 'event-a');
+    await store.updateJob('telegram-release-a', {
+      responseMessageId: 'response-a',
+      userMessage: { messageId: 'source-a' },
+    });
+    const aJob = (await store.getJob('telegram-release-a'))!;
+    const admittedAt = Date.now();
+    const digest = 'a'.repeat(64);
+    expect(
+      await store.bindNativeResponse({
+        userId: 'user-1',
+        conversationId: 'conversation-release',
+        responseMessageId: 'response-a',
+        streamId: 'telegram-release-a',
+        jobCreatedAt: aJob.createdAt,
+        logicalTurnId: aJob.interactionContext!.logical_turn_id!,
+        revision: aJob.interactionContext!.revision,
+        invocationId: 'invocation-a',
+        bodySha256: digest,
+        providerId: 'provider',
+        agentId: 'agent',
+        originSha256: digest,
+        source: { id: 'source-db-id', messageId: 'source-a', digest },
+        admittedAt,
+        recoverUntil: admittedAt + 86_400_000,
+      }),
+    ).toBe(true);
+
+    // B never reaches native admission; C must still wait for A's exact release.
+    await create('telegram-release-b', 'event-b');
+    const c = await create('telegram-release-c', 'event-c');
+
+    expect((await store.getJob('telegram-release-b'))?.nativeReleaseTargets).toEqual(['response-a']);
+    expect((await store.getJob('telegram-release-c'))?.nativeReleaseTargets).toEqual(['response-a']);
+    expect((await store.getJob('telegram-release-c'))?.nativePredecessor).toBeUndefined();
+    expect(c.metadata.interactionContext).toMatchObject({ revision: 3 });
+    expect(a.abortController.signal.reason).toBe('superseded');
+    expect((await manager.getJob('telegram-release-a'))?.status).toBe('superseded');
+    await manager.destroy();
+  });
+
+  test('recovers a release-gated revision whose generator died before native dispatch', async () => {
+    const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const replica = () => {
+      const manager = new GenerationJobManagerClass({
+        jobStore: store,
+        eventTransport: new InMemoryEventTransport(),
+        cleanupOnComplete: false,
+      });
+      manager.initialize();
+      return manager;
+    };
+    const responseOnly = {
+      segment_stability: 'immediate' as const,
+      supersede_scope: 'response_only' as const,
+    };
+    const create = (manager: GenerationJobManagerClass, streamId: string, sourceEventId: string) =>
+      manager.createJob(streamId, 'user-1', 'conversation-restart', {
+        interactionContext: telegramContext('conversation-restart', sourceEventId),
+        adapterCapabilities: responseOnly,
+        deliveryPolicy: externalDelivery,
+      });
+    const original = replica();
+    await create(original, 'telegram-restart-a', 'event-a');
+    await store.updateJob('telegram-restart-a', {
+      responseMessageId: 'response-a',
+      userMessage: { messageId: 'source-a' },
+    });
+    const aJob = (await store.getJob('telegram-restart-a'))!;
+    const digest = 'a'.repeat(64);
+    const nativeIdentity = (job: typeof aJob, responseMessageId: string, invocationId: string) => ({
+      userId: 'user-1',
+      conversationId: 'conversation-restart',
+      responseMessageId,
+      streamId: job.streamId,
+      jobCreatedAt: job.createdAt,
+      logicalTurnId: job.interactionContext!.logical_turn_id!,
+      revision: job.interactionContext!.revision,
+      invocationId,
+      bodySha256: digest,
+      providerId: 'provider',
+      agentId: 'agent',
+      originSha256: digest,
+      source: { id: 'source-db-id', messageId: 'source-a', digest },
+      admittedAt: Date.now(),
+      recoverUntil: Date.now() + 86_400_000,
+    });
+    expect(await store.bindNativeResponse(nativeIdentity(aJob, 'response-a', 'invocation-a'))).toBe(
+      true,
+    );
+
+    // B waits for A's release, holding its pre-dispatch lease.
+    await create(original, 'telegram-restart-b', 'event-b');
+    const waiting = { ...(await store.getJob('telegram-restart-b'))! };
+    expect(waiting.nativeDispatchOwner).toEqual(expect.any(String));
+    expect(waiting.nativeDispatchLeaseUntil).toBeGreaterThan(Date.now());
+
+    // A retained-input continue on another replica never takes a live generation.
+    const restarted = replica();
+    const live = await create(restarted, 'telegram-restart-retry-1', 'event-b');
+    expect(live.duplicateOfStreamId).toBe('telegram-restart-b');
+
+    // The original generator dies before dispatch; its lease expires without renewal.
+    (await store.getJob('telegram-restart-b'))!.nativeDispatchLeaseUntil = Date.now() - 1;
+    const recovered = await create(restarted, 'telegram-restart-retry-2', 'event-b');
+    expect(recovered.duplicateOfStreamId).toBeUndefined();
+    expect(recovered.streamId).toBe('telegram-restart-b');
+    expect(recovered.createdAt).toBe(waiting.createdAt);
+    expect(recovered.metadata.interactionContext).toMatchObject({ revision: 2 });
+    expect((await store.getJob('telegram-restart-b'))?.nativeReleaseTargets).toEqual([
+      'response-a',
+    ]);
+    const recoveredOwner = (await store.getJob('telegram-restart-b'))!.nativeDispatchOwner;
+    expect(recoveredOwner).not.toBe(waiting.nativeDispatchOwner);
+
+    // Exactly one generator owns the revision now; a second recovery stays a duplicate.
+    expect(await original.renewNativeDispatchLease('telegram-restart-b', waiting.createdAt)).toBe(
+      false,
+    );
+    expect(await restarted.renewNativeDispatchLease('telegram-restart-b', waiting.createdAt)).toBe(
+      true,
+    );
+    const third = replica();
+    const again = await create(third, 'telegram-restart-retry-3', 'event-b');
+    expect(again.duplicateOfStreamId).toBe('telegram-restart-b');
+
+    // Once natively admitted, recovery belongs to native response recovery, never a takeover.
+    const current = (await store.getJob('telegram-restart-b'))!;
+    await store.updateJob('telegram-restart-b', {
+      responseMessageId: 'response-b',
+      userMessage: { messageId: 'source-a' },
+    });
+    expect(
+      await store.bindNativeResponse(
+        nativeIdentity({ ...current, responseMessageId: 'response-b' }, 'response-b', 'inv-b'),
+      ),
+    ).toBe(true);
+    (await store.getJob('telegram-restart-b'))!.nativeDispatchLeaseUntil = Date.now() - 1;
+    const dispatched = await create(replica(), 'telegram-restart-retry-4', 'event-b');
+    expect(dispatched.duplicateOfStreamId).toBe('telegram-restart-b');
+    await original.destroy();
+    await restarted.destroy();
+    await third.destroy();
   });
 
   test('response_only supersession closes the stale adapter when authoring later fails', async () => {

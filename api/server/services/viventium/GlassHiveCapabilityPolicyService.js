@@ -154,12 +154,17 @@ function shouldGrantContentReadScope(allowedServerEntries = []) {
   return allowedServerEntries.some(({ policy }) => policyCanReceiveContentReadGrant(policy));
 }
 
-function brokerToolName(serverName, toolName) {
+function brokerToolName(serverName, toolName, { legacy = false } = {}) {
   const rawServer = String(serverName || '');
   const rawTool = String(toolName || '');
-  const safeServer = rawServer.replace(/[^A-Za-z0-9_]+/g, '_');
-  const safeTool = rawTool.replace(/[^A-Za-z0-9_]+/g, '_');
-  const candidate = `gh_${safeServer}__${safeTool}`;
+  const safePart = (value) =>
+    legacy
+      ? value.replace(/[^A-Za-z0-9_]+/g, '_')
+      : value.replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  const safeServer = safePart(rawServer);
+  const safeTool = safePart(rawTool);
+  // A server-local MCP name must not contain the qualified-name separator.
+  const candidate = legacy ? `gh_${safeServer}__${safeTool}` : `gh_${safeServer}_tool_${safeTool}`;
   if (candidate.length <= 120) {
     return candidate;
   }
@@ -168,11 +173,12 @@ function brokerToolName(serverName, toolName) {
     .update(`${rawServer}\0${rawTool}`)
     .digest('hex')
     .slice(0, 12);
-  return `${candidate.slice(0, 107)}_${digest}`;
+  const prefix = candidate.slice(0, 107);
+  return `${legacy ? prefix : prefix.replace(/_+$/g, '')}_${digest}`;
 }
 
-function collisionSafeBrokerToolName(serverName, toolName, claimedNames = new Map()) {
-  const baseName = brokerToolName(serverName, toolName);
+function collisionSafeBrokerToolName(serverName, toolName, claimedNames = new Map(), options = {}) {
+  const baseName = brokerToolName(serverName, toolName, options);
   const identity = `${String(serverName || '')}\0${String(toolName || '')}`;
   const claimedIdentity = claimedNames.get(baseName);
   if (!claimedIdentity || claimedIdentity === identity) {
@@ -180,7 +186,8 @@ function collisionSafeBrokerToolName(serverName, toolName, claimedNames = new Ma
     return baseName;
   }
   const digest = crypto.createHash('sha256').update(identity).digest('hex').slice(0, 12);
-  const collisionSafeName = `${baseName.slice(0, 107)}_${digest}`;
+  const prefix = baseName.slice(0, 107);
+  const collisionSafeName = `${options.legacy ? prefix : prefix.replace(/_+$/g, '')}_${digest}`;
   claimedNames.set(collisionSafeName, identity);
   return collisionSafeName;
 }

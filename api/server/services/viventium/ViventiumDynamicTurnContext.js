@@ -11,7 +11,6 @@ const {
   consumeTrustedParallelWorkClaimState,
   effectiveOrchestrationMode,
   parallelWorkClaimState,
-  parallelWorkReleaseGateSnapshotAsync,
 } = require('./ViventiumOrchestrationMode');
 
 async function defaultGetUserById(...args) {
@@ -110,9 +109,7 @@ function encodedUntrustedRoster(work) {
 }
 
 async function resolveParallelAvailabilityForTurn({ ownerId, user } = {}) {
-  const releaseGate = await parallelWorkReleaseGateSnapshotAsync();
-  if (releaseGate.available !== true) return false;
-  if (parallelWorkClaimState(ownerId, releaseGate).available === true) return true;
+  if (parallelWorkClaimState(ownerId).available === true) return true;
   const {
     orchestrationReadinessSnapshot,
     refreshOrchestrationReadiness,
@@ -130,8 +127,7 @@ async function resolveParallelAvailabilityForTurn({ ownerId, user } = {}) {
   }
   snapshot = await refreshOrchestrationReadiness({ ownerId });
   if (snapshot.available !== true) return false;
-  const refreshedReleaseGate = await parallelWorkReleaseGateSnapshotAsync();
-  return parallelWorkClaimState(ownerId, refreshedReleaseGate).available === true;
+  return parallelWorkClaimState(ownerId).available === true;
 }
 
 function voiceCapsule({ mode, snapshot }) {

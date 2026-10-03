@@ -5,6 +5,11 @@
  * === VIVENTIUM END === */
 
 const crypto = require('crypto');
+const {
+  voiceTaskPublicFailure,
+  nativeMissionVoiceBinding,
+  retainedVoiceInputOperation,
+} = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { ViventiumVoiceTask, ViventiumVoiceTaskSuppression } = require('~/db/models');
 const {
@@ -93,6 +98,7 @@ function serializeTask(task) {
     conversationId: task.conversationId,
     turnId: task.turnId,
     streamId: task.streamId,
+    logicalTurnId: task.logicalTurnId || '',
     parentTaskId: task.parentTaskId,
     state: task.state,
     sequence: task.sequence,
@@ -118,6 +124,10 @@ function serializeTask(task) {
     ownerDeliveryPending: task.ownerDeliveryPending === true,
     ownerCancellationAccepted: task.ownerCancellationAccepted === true,
     ownerOperationId: safeText(task.ownerOperationId, 160),
+    nativeMissionInputBinding: nativeMissionVoiceBinding(task.nativeMissionInputBinding, task),
+    inputOperation: task.nativeMissionInputBinding
+      ? retainedVoiceInputOperation(task.inputOperation)
+      : null,
     owner: { ...task.owner },
     events: task.events.slice(-MAX_EVENTS_PER_TASK),
     observedEventKeys: [...task.observedEventKeys].slice(-MAX_EVENTS_PER_TASK),
@@ -141,14 +151,26 @@ function restoreTask(payload) {
   ) {
     return null;
   }
+  const nativeMissionInputBinding = nativeMissionVoiceBinding(
+    payload.nativeMissionInputBinding,
+    payload,
+  );
+  const inputOperation = nativeMissionInputBinding
+    ? retainedVoiceInputOperation(payload.inputOperation)
+    : null;
   return {
     ...payload,
+    nativeMissionInputBinding,
+    inputOperation: inputOperation
+      ? { ...inputOperation, promise: null, result: { ok: true, confirmationPending: true } }
+      : null,
     taskId: safeText(payload.taskId, 160),
     callSessionId: safeText(payload.callSessionId, 160),
     userId: safeText(payload.userId, 160),
     conversationId: safeText(payload.conversationId, 160),
     turnId: safeText(payload.turnId, 160),
     streamId: safeText(payload.streamId, 160),
+    logicalTurnId: safeText(payload.logicalTurnId, 160),
     parentTaskId: safeText(payload.parentTaskId, 160),
     events: Array.isArray(payload.events) ? payload.events.slice(-MAX_EVENTS_PER_TASK) : [],
     observedEventKeys: new Set(
@@ -351,6 +373,10 @@ async function hydrateVoiceTasksForCall({ callSessionId, userId } = {}) {
       });
     }
   }
+  for (const task of tasks.values()) {
+    if (task.callSessionId === normalizedCallSessionId && task.userId === normalizedUserId)
+      await refreshNativeMissionInputOwner(task);
+  }
   return listVoiceTasks({ callSessionId: normalizedCallSessionId, userId: normalizedUserId });
 }
 
@@ -371,6 +397,9 @@ async function hydrateVoiceTask(taskId, { callSessionId, userId } = {}) {
     }
   }
   await hydrateVoiceTaskSuppression(normalizedTaskId, { callSessionId, userId });
+  const task = tasks.get(normalizedTaskId);
+  if (task?.userId === String(userId) && task?.callSessionId === String(callSessionId))
+    await refreshNativeMissionInputOwner(task);
   return getVoiceTask(normalizedTaskId);
 }
 
@@ -774,6 +803,29 @@ function ownerAdapterKey(kind, taskId) {
   return normalizedKind && normalizedTaskId ? `${normalizedKind}:${normalizedTaskId}` : '';
 }
 
+async function refreshNativeMissionInputOwner(task) {
+  const binding = nativeMissionVoiceBinding(task?.nativeMissionInputBinding, task || {});
+  if (
+    !binding ||
+    task.state !== 'needs_input' ||
+    task.suppressed ||
+    getOwnerAdapter(task)?.provideInput ||
+    (Date.parse(binding.expiresAt) <= Date.now() &&
+      !task.inputOperation?.result?.confirmationPending)
+  )
+    return;
+  await require('./GlassHiveVoiceTaskActionService').registerGlassHiveVoiceTaskActionCapabilities({
+    task: publicTask(task),
+    ownerId: task.userId,
+    workRef: binding.workRef,
+    retainedInputOperation: task.inputOperation?.result?.confirmationPending
+      ? retainedVoiceInputOperation(task.inputOperation)
+      : null,
+    retainedNativeInputBinding: binding,
+    body: { event: 'run.needs_input', run_id: binding.runId, pending_native_input: binding },
+  });
+}
+
 function getOwnerAdapter(task) {
   const key = ownerAdapterKey(task?.owner?.kind, task?.taskId);
   const adapter = key ? ownerAdapters.get(key) || null : null;
@@ -786,6 +838,15 @@ function getOwnerAdapter(task) {
     task.retryable = false;
     task.cancellationConfirmable = false;
     return null;
+  }
+  if (
+    Number.isFinite(adapter.inputExpiresAtMs) &&
+    adapter.inputExpiresAtMs <= Date.now() &&
+    !(task.nativeMissionInputBinding && task.inputOperation?.result?.confirmationPending)
+  ) {
+    const { provideInput, ...remaining } = adapter;
+    task.acceptsInput = false;
+    return remaining;
   }
   return adapter;
 }
@@ -869,7 +930,7 @@ function sanitizeSource(data) {
 }
 
 function sanitizeNeedsInput(data) {
-  const prompt = safeText(data?.prompt || data?.message, 300);
+  const prompt = safeText(data?.prompt || data?.message, 8000);
   if (!prompt) {
     return null;
   }
@@ -877,7 +938,21 @@ function sanitizeNeedsInput(data) {
   const inputType = new Set(['text', 'choice', 'confirm']).has(requestedType)
     ? requestedType
     : 'text';
-  return { prompt, inputType };
+  const choices =
+    Array.isArray(data?.choices) && data.choices.length <= 16
+      ? data.choices
+          .filter(
+            (item) =>
+              typeof item?.value === 'string' &&
+              item.value.length > 0 &&
+              item.value.length <= 160 &&
+              typeof item.label === 'string' &&
+              item.label.length > 0 &&
+              item.label.length <= 160,
+          )
+          .map(({ value, label }) => ({ value, label }))
+      : [];
+  return { prompt, inputType, ...(choices.length ? { choices } : {}) };
 }
 
 function sanitizeProgress(data) {
@@ -939,7 +1014,7 @@ function nextEvent(task, fields) {
         : {}),
     ...(fields.detail
       ? { detail: event.detail }
-      : task.current?.detail
+      : task.current?.detail && (!fields.phase || fields.phase === task.current.phase)
         ? { detail: task.current.detail }
         : {}),
     ...(fields.progress ? { progress: event.progress } : {}),
@@ -1094,7 +1169,11 @@ function getVoiceTaskByStreamId(streamId) {
   return taskId ? getVoiceTask(taskId) : null;
 }
 
-function bindVoiceTaskStream(taskId, streamId, { callSessionId, userId, conversationId } = {}) {
+function bindVoiceTaskStream(
+  taskId,
+  streamId,
+  { callSessionId, userId, conversationId, logicalTurnId } = {},
+) {
   const task = tasks.get(String(taskId || ''));
   const normalizedStreamId = safeText(streamId, 160);
   if (!task || !normalizedStreamId) {
@@ -1102,27 +1181,48 @@ function bindVoiceTaskStream(taskId, streamId, { callSessionId, userId, conversa
   }
   const canonicalConversationId = safeText(conversationId, 160);
   const hasCanonicalConversation = canonicalConversationId && canonicalConversationId !== 'new';
+  const canonicalTurnId = safeText(logicalTurnId, 160);
   if (
-    hasCanonicalConversation &&
+    (hasCanonicalConversation || canonicalTurnId) &&
     (task.callSessionId !== safeText(callSessionId, 160) ||
       task.userId !== safeText(userId, 160) ||
-      (task.conversationId &&
+      (hasCanonicalConversation &&
+        task.conversationId &&
         task.conversationId !== 'new' &&
-        task.conversationId !== canonicalConversationId))
+        task.conversationId !== canonicalConversationId) ||
+      (task.streamId === normalizedStreamId &&
+        task.logicalTurnId &&
+        canonicalTurnId &&
+        task.logicalTurnId !== canonicalTurnId))
   ) {
     return null;
   }
   const conversationBound =
     hasCanonicalConversation && task.conversationId !== canonicalConversationId;
+  const turnBound = canonicalTurnId && task.logicalTurnId !== canonicalTurnId;
   if (conversationBound) task.conversationId = canonicalConversationId;
   if (task.streamId && task.streamId !== normalizedStreamId) {
     taskIdByStreamId.delete(task.streamId);
+    task.logicalTurnId = '';
   }
   task.streamId = normalizedStreamId;
+  if (canonicalTurnId) task.logicalTurnId = canonicalTurnId;
   task.owner = { kind: 'generation_job', id: normalizedStreamId };
   taskIdByStreamId.set(normalizedStreamId, task.taskId);
-  if (conversationBound) nextEvent(task, { ...task.current, type: 'snapshot' });
+  if (conversationBound || turnBound) nextEvent(task, { ...task.current, type: 'snapshot' });
   return publicTask(task);
+}
+
+function getVoiceTaskTraceBinding(taskId) {
+  const task = tasks.get(String(taskId || ''));
+  if (!task?.logicalTurnId) return null;
+  return Object.freeze({
+    taskId: task.taskId,
+    callSessionId: task.callSessionId,
+    userId: task.userId,
+    streamId: task.streamId,
+    logicalTurnId: task.logicalTurnId,
+  });
 }
 
 function setVoiceTaskOwnerCapabilities(taskId, { kind, ownerId, cancellationConfirmable } = {}) {
@@ -1160,7 +1260,17 @@ function setVoiceTaskOwnerCapabilities(taskId, { kind, ownerId, cancellationConf
  */
 function registerVoiceTaskOwnerAdapter(
   taskId,
-  { kind, provideInput, retry, cancel, cancellationConfirmable, expiresAtMs } = {},
+  {
+    kind,
+    provideInput,
+    retry,
+    cancel,
+    cancellationConfirmable,
+    expiresAtMs,
+    inputExpiresAtMs,
+    nativeMissionInputBinding,
+    preserveExisting = false,
+  } = {},
 ) {
   const task = tasks.get(String(taskId || ''));
   const normalizedKind = safeText(kind, 80);
@@ -1173,17 +1283,27 @@ function registerVoiceTaskOwnerAdapter(
     return null;
   }
   const adapter = {
+    ...(preserveExisting ? getOwnerAdapter(task) : {}),
     kind: normalizedKind,
     ...(typeof provideInput === 'function' ? { provideInput } : {}),
     ...(typeof retry === 'function' ? { retry } : {}),
     ...(typeof cancel === 'function' ? { cancel } : {}),
     ...(Number.isFinite(Number(expiresAtMs)) ? { expiresAtMs: Number(expiresAtMs) } : {}),
+    ...(Number.isFinite(Number(inputExpiresAtMs))
+      ? { inputExpiresAtMs: Number(inputExpiresAtMs) }
+      : {}),
   };
   const key = ownerAdapterKey(normalizedKind, task.taskId);
   if (!adapter.provideInput && !adapter.retry && !adapter.cancel) {
     ownerAdapters.delete(key);
   } else {
     ownerAdapters.set(key, adapter);
+  }
+  if (nativeMissionInputBinding) {
+    const binding = nativeMissionVoiceBinding(nativeMissionInputBinding, task);
+    if (binding?.requestFingerprint !== task.nativeMissionInputBinding?.requestFingerprint)
+      task.inputOperation = null;
+    task.nativeMissionInputBinding = binding;
   }
   task.acceptsInput = typeof adapter.provideInput === 'function';
   task.retryable = task.state === 'failed' && typeof adapter.retry === 'function';
@@ -1203,7 +1323,7 @@ function operationFailure(task, code, message, extra = {}) {
   };
 }
 
-async function submitVoiceTaskInput(taskId, input, { userId } = {}) {
+async function submitVoiceTaskInput(taskId, input, { userId, voiceAuthorityContext } = {}) {
   const task = tasks.get(String(taskId || ''));
   if (!task || (userId && task.userId !== String(userId))) {
     return operationFailure(null, 'task_not_found', 'Task not found.');
@@ -1216,22 +1336,41 @@ async function submitVoiceTaskInput(taskId, input, { userId } = {}) {
   if (!normalizedInput) {
     return operationFailure(task, 'input_required', 'Input is required.');
   }
+  if (
+    task.nativeMissionInputBinding &&
+    !task.current?.needsInput?.choices?.some((choice) => choice.value === normalizedInput)
+  )
+    return operationFailure(task, 'input_invalid_choice', 'Choose one of the offered options.');
   const inputHash = crypto.createHash('sha256').update(normalizedInput).digest('hex');
   if (task.inputOperation?.hash === inputHash) {
     if (task.inputOperation.promise) {
       return task.inputOperation.promise;
     }
-    if (task.inputOperation.result?.ok) {
+    if (task.inputOperation.result?.ok && !task.inputOperation.result.confirmationPending) {
       return task.inputOperation.result;
     }
   }
   if (task.inputOperation?.promise) {
     return operationFailure(task, 'input_in_progress', 'Another input is already being delivered.');
   }
+  if (
+    (task.inputOperation?.result?.confirmationPending || task.nativeMissionInputBinding) &&
+    task.inputOperation &&
+    task.inputOperation.hash !== inputHash
+  ) {
+    return operationFailure(
+      task,
+      'input_confirmation_pending',
+      'The previous input is awaiting confirmation.',
+    );
+  }
   if (task.state !== 'needs_input') {
     return operationFailure(task, 'input_invalid_state', 'The task is not waiting for input.');
   }
 
+  const confirmationOperation = task.inputOperation?.result?.confirmationPending
+    ? retainedVoiceInputOperation(task.inputOperation)
+    : null;
   const operationId =
     task.inputOperation?.hash === inputHash ? task.inputOperation.operationId : crypto.randomUUID();
   const operation = {
@@ -1240,14 +1379,46 @@ async function submitVoiceTaskInput(taskId, input, { userId } = {}) {
     promise: null,
     result: null,
   };
+  task.inputOperation = operation;
   const delivery = (async () => {
     try {
+      if (
+        task.nativeMissionInputBinding &&
+        !persistenceAvailable(ViventiumVoiceTask) &&
+        !isTestRuntime()
+      )
+        throw new Error('input_durability_unavailable');
+      if (task.nativeMissionInputBinding && persistenceAvailable(ViventiumVoiceTask)) {
+        nextEvent(task, {
+          type: 'state',
+          phase: 'needs_input',
+          label: 'Waiting for input confirmation',
+          needsInput: task.current.needsInput,
+        });
+        const entry = taskPersistenceEntry(task);
+        await withPersistenceDeadline(
+          ViventiumVoiceTask.bulkWrite([taskPersistenceOperation(entry)], { ordered: false }),
+        );
+        if (task.state !== 'needs_input' || task.suppressed || task.inputOperation !== operation)
+          throw new Error('input_invalid_state');
+      }
       const ownerResult = await adapter.provideInput({
         taskId: task.taskId,
         owner: { ...task.owner },
         operationId,
         input: normalizedInput,
+        ...(voiceAuthorityContext ? { voiceAuthorityContext } : {}),
+        ...(confirmationOperation ? { confirmationOperation } : {}),
       });
+      if (task.state !== 'needs_input' || task.suppressed || task.inputOperation !== operation)
+        return operationFailure(
+          task,
+          'input_invalid_state',
+          'The task is no longer waiting for input.',
+        );
+      if (ownerResult?.confirmationPending === true && ownerResult.accepted !== true) {
+        return { ok: true, confirmationPending: true, task: publicTask(task) };
+      }
       if (ownerResult?.accepted !== true) {
         throw new Error('owner_rejected_input');
       }
@@ -1271,10 +1442,17 @@ async function submitVoiceTaskInput(taskId, input, { userId } = {}) {
       });
       return { ok: true, task: publicTask(task), event };
     } catch {
+      if (task.state !== 'needs_input' || task.suppressed || task.inputOperation !== operation)
+        return operationFailure(
+          task,
+          'input_invalid_state',
+          'The task is no longer waiting for input.',
+        );
       const event = nextEvent(task, {
         type: 'error',
         phase: 'needs_input',
         label: 'Input delivery failed',
+        ...(task.nativeMissionInputBinding ? { needsInput: task.current.needsInput } : {}),
         error: {
           code: 'owner_input_failed',
           message: 'The task owner could not accept input.',
@@ -1289,10 +1467,10 @@ async function submitVoiceTaskInput(taskId, input, { userId } = {}) {
     }
   })();
   operation.promise = delivery;
-  task.inputOperation = operation;
   const result = await delivery;
   operation.promise = null;
-  operation.result = result;
+  operation.result =
+    !result.ok && confirmationOperation ? { ...result, confirmationPending: true } : result;
   return result;
 }
 
@@ -2233,25 +2411,7 @@ function observeGenerationEvent(taskId, generationEvent) {
       : null;
   }
   if (eventType === 'on_cortex_update') {
-    if (
-      ownerEventId &&
-      String(data.status || '')
-        .trim()
-        .toLowerCase() === 'completed'
-    ) {
-      void recordVoiceOrchestrationTraceBestEffort({
-        ownerId: task.userId,
-        callSessionId: task.callSessionId,
-        turnId: task.turnId,
-        eventRef: ownerEventId,
-        stage: 'cortex.completed',
-        facts: {
-          taskRef: task.taskId,
-          ...(task.streamId ? { streamRef: task.streamId } : {}),
-          effectCount: 1,
-        },
-      });
-    }
+    // Cortex lifecycle traces are recorded by their owner after Main task settlement too.
     return nextEvent(task, {
       type: 'progress',
       phase: 'cortex',
@@ -2260,20 +2420,7 @@ function observeGenerationEvent(taskId, generationEvent) {
     });
   }
   if (eventType === 'on_cortex_followup') {
-    if (ownerEventId) {
-      void recordVoiceOrchestrationTraceBestEffort({
-        ownerId: task.userId,
-        callSessionId: task.callSessionId,
-        turnId: task.turnId,
-        eventRef: ownerEventId,
-        stage: 'cortex.completed',
-        facts: {
-          taskRef: task.taskId,
-          ...(task.streamId ? { streamRef: task.streamId } : {}),
-          effectCount: 1,
-        },
-      });
-    }
+    // Cortex lifecycle traces are recorded by their owner after Main task settlement too.
     return nextEvent(task, {
       type: 'progress',
       phase: 'follow_up',
@@ -2309,7 +2456,7 @@ function observeGenerationEvent(taskId, generationEvent) {
         },
       });
     }
-    task.inputOperation = null;
+    if (!task.nativeMissionInputBinding) task.inputOperation = null;
     task.state = 'needs_input';
     task.retryable = false;
     return nextEvent(task, {
@@ -2508,15 +2655,16 @@ function failVoiceTask(taskId, error) {
   task.state = 'failed';
   task.cancellable = false;
   task.retryOperation = null;
-  task.retryable = Boolean(getOwnerAdapter(task)?.retry);
+  const failure = voiceTaskPublicFailure(error);
+  task.retryable = failure.retryAllowed && Boolean(getOwnerAdapter(task)?.retry);
   task.expiresAtMs = Date.now() + TERMINAL_TASK_TTL_MS;
   return nextEvent(task, {
     type: 'error',
     phase: 'failed',
     label: 'Failed',
     error: {
-      code: safeText(error?.code, 80) || 'generation_failed',
-      message: safeText(error?.message || error, 300) || 'The task failed.',
+      code: failure.code,
+      message: failure.message,
     },
   });
 }
@@ -2876,6 +3024,7 @@ module.exports = {
   failVoiceTask,
   getVoiceTask,
   getVoiceTaskByStreamId,
+  getVoiceTaskTraceBinding,
   getVoiceTaskOwnerCapabilityInventory,
   getDurableVoiceTaskContinuationState,
   getVoiceTaskRegistryStats,

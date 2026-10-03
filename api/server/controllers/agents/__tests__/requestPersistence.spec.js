@@ -20,13 +20,16 @@ jest.mock('@librechat/data-schemas', () => ({
 jest.mock('librechat-data-provider', () => ({
   ...jest.requireActual('librechat-data-provider'),
   Constants: {},
-  ContentTypes: { THINK: 'think' },
+  ContentTypes: { THINK: 'think', ERROR: 'error' },
   FileContext: { execute_code: 'execute_code' },
   FileSources: { local: 'local' },
   ViolationTypes: {},
 }));
 
 jest.mock('@librechat/api', () => ({
+  isAudioDeliveryRequested: (req) =>
+    (req?._viventiumTelegram === true && req?.body?.telegramAudioRequested === true) ||
+    (req?.body?.voiceMode === true && Boolean(req?.viventiumCallSession?.callSessionId)),
   attachInteractionContextMetadata: (_req, message) => message,
   getTrustedInteractionContext: () => null,
   isInternalOrigin: () => false,
@@ -135,6 +138,36 @@ describe('request persistence helpers', () => {
     expect(inFlight.size).toBe(0);
   });
 
+  it('settles a typed context failure as failed even when the response error flag is absent', () => {
+    expect(
+      __testables.voiceGenerationOutcome({
+        messageId: 'synthetic-reply',
+        error: false,
+        content: [
+          {
+            type: 'error',
+            error_class: 'source_context_unavailable',
+            error: 'The conversation context could not be preserved.',
+          },
+        ],
+      }),
+    ).toEqual({
+      resultMessageId: 'synthetic-reply',
+      error: {
+        code: 'source_context_unavailable',
+        message: 'The conversation context could not be preserved.',
+      },
+    });
+    expect(
+      __testables.voiceGenerationOutcome({
+        messageId: 'normal-reply',
+        content: [{ type: 'text', text: 'Synthetic answer' }],
+      }),
+    ).toEqual({
+      resultMessageId: 'normal-reply',
+    });
+  });
+
   it('retains the canonical completed-native disposition despite a conflicting live capture', () => {
     const canonical = { version: 1, audio: 'skip', required: true, valid: true, source: 'model' };
     const req = {
@@ -167,6 +200,37 @@ describe('request persistence helpers', () => {
         .deliveryDisposition.audio,
     ).toBe('eligible');
   });
+
+  it.each(['eligible', 'skip'])(
+    'retains model %s after an authenticated live-call graph roundtrip',
+    (audio) => {
+      const disposition = { version: 1, audio, required: true, valid: true, source: 'model' };
+      const req = {
+        viventiumCallSession: { callSessionId: 'synthetic-call' },
+        body: { voiceMode: true },
+        _viventiumDeliveryDispositionRequired: true,
+        _viventiumDeliveryDispositionCapture: { status: 'valid', disposition },
+      };
+      const response = {
+        text: 'Verified result.',
+        content: [{ type: 'text', text: 'Verified result.' }],
+      };
+      expect(
+        __testables.normalizePersistedAssistantResponse(req, response).metadata.viventium
+          .deliveryDisposition,
+      ).toEqual(disposition);
+      expect(
+        __testables.normalizeAssistantResponseForTransmit(req, response).metadata.viventium
+          .deliveryDisposition,
+      ).toEqual(disposition);
+      expect(
+        __testables.normalizePersistedAssistantResponse(
+          { ...req, viventiumCallSession: undefined },
+          response,
+        ),
+      ).not.toHaveProperty('metadata.viventium.deliveryDisposition');
+    },
+  );
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -786,3 +850,28 @@ describe('superseded Web presentation removal receipt', () => {
     expect(await remove()).toBe(true);
   });
 });
+
+/* === VIVENTIUM START === A failed start snapshot rejects only to its awaiting owner. === */
+describe('in-flight snapshot tracking', () => {
+  test('a rejected start snapshot reaches its owner without an unobserved rejection', async () => {
+    const { trackInFlightSnapshot } = require('../request').__testables;
+    const unobserved = [];
+    const onUnhandled = (reason) => unobserved.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const inFlight = new Set();
+      const failure = new Error('native_response_parent_not_captured');
+      const started = trackInFlightSnapshot(inFlight, async () => {
+        throw failure;
+      });
+      await expect(started).rejects.toBe(failure);
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(inFlight.size).toBe(0);
+      expect(unobserved).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+});
+/* === VIVENTIUM END === */

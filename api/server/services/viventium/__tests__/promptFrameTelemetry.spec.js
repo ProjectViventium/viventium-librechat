@@ -94,6 +94,27 @@ describe('promptFrameTelemetry', () => {
     });
   });
 
+  test('registers saved memory writer context without contaminating later surface readiness', () => {
+    const context = 'synthetic saved memory writer context';
+    const normalized = normalizeLayersToContract({ saved_memory_writer: context });
+    expect(normalized.layers.memory_context).toBe(context);
+    expect(normalized.unknown_layer_names).toEqual([]);
+
+    const textFrame = buildPromptFrame({
+      promptFamily: 'main_runtime',
+      surface: 'text',
+      layers: { saved_memory_writer: context },
+    });
+    const voiceFrame = buildPromptFrame({
+      promptFamily: 'main_runtime',
+      surface: 'voice_call',
+      layers: { memory_context: 'synthetic current memory context' },
+    });
+    expect(textFrame.unknown_layer_names).toEqual([]);
+    expect(voiceFrame.unknown_layer_names).toEqual([]);
+    expect(promptLayerIntegritySnapshot().unknownLayerNames).toEqual([]);
+  });
+
   test('redacts private prompt debug values without classifying user intent', () => {
     const userHome = '/' + ['Users', 'someone'].join('/');
     const linuxHome = '/' + ['home', 'someone', '.config', 'viventium', 'private.log'].join('/');

@@ -28,6 +28,7 @@ const {
   telegramIngressDedupeTtlSeconds,
   bindInteractionSourceSegments,
   bindCanonicalInteractionConversation,
+  nativeWorkInputResponseSchema,
 } = require('@librechat/api');
 const { EnvVar } = require('@librechat/agents');
 const { logger } = require('@librechat/data-schemas');
@@ -48,12 +49,23 @@ const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
 const {
+  bindRetainedTelegramIngressAuthority,
+} = require('~/server/services/viventium/TelegramIngressAuthorityService');
+const {
   captureAcceptedInteractionInput,
   retainAcceptedInteractionInput,
   acceptedInteractionSourceId,
   resolveCanonicalConversationId,
 } = AgentController;
 const TelegramInput = require('~/server/services/viventium/TelegramInputService');
+const {
+  normalizeTelegramReplyDescriptor,
+  resolveTelegramReplyContext,
+} = require('~/server/services/viventium/TelegramReplyProvenanceService');
+const {
+  preparedTelegramReplyDescriptor,
+  quotedAttachmentTexts,
+} = require('~/server/services/viventium/telegramReplyPreparation');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const { fileAccess } = require('~/server/middleware/accessResources/fileAccess');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
@@ -125,12 +137,12 @@ const {
   effectiveOrchestrationMode,
   parallelWorkClaimState,
   parallelWorkClaimStateAsync,
-  parallelWorkReleaseGateSnapshotAsync,
+  preferredOrchestrationMode,
 } = require('~/server/services/viventium/ViventiumOrchestrationMode');
 const {
   observeOrchestrationOwner,
+  authoringOrchestrationReadiness,
   refreshOrchestrationReadiness,
-  waitForOrchestrationReadiness,
 } = require('~/server/services/viventium/GlassHiveOrchestrationReadinessService');
 const {
   getActiveWorkInteractiveSnapshot,
@@ -149,6 +161,7 @@ const {
   createCallBrowserLaunch,
   createCallSession,
   resolveUserVoiceRoute,
+  resolveVoiceContextKeyterms,
 } = require('~/server/services/viventium/CallSessionService');
 const {
   buildCallLaunchResponse,
@@ -1040,7 +1053,17 @@ router.post('/call-link', telegramAuth, configMiddleware, async (req, res) => {
  * === VIVENTIUM END === */
 router.get('/voice-route', telegramAuth, async (req, res) => {
   try {
-    const voiceRoute = await resolveUserVoiceRoute(req.user?.id);
+    if (effectiveOrchestrationMode(req.user, { available: true }) === 'parallel') {
+      observeOrchestrationOwner(String(req.user.id));
+    }
+    const voiceRoute = await resolveUserVoiceRoute(req.user?.id, { includeSources: true });
+    const contextualKeyterms = await resolveVoiceContextKeyterms({
+      userId: req.user?.id,
+      conversationId: typeof req.query.conversationId === 'string' ? req.query.conversationId : '',
+    });
+    if (contextualKeyterms.length) {
+      voiceRoute.contextualKeyterms = contextualKeyterms;
+    }
     return res.json({ voiceRoute });
   } catch (err) {
     logger.error('[VIVENTIUM][telegram/voice-route] Failed to resolve voice route:', err);
@@ -1251,27 +1274,98 @@ router.post('/inputs/status', telegramAuth, async (req, res, next) => {
   }
 });
 
+/* === VIVENTIUM START ===
+ * Fix: source-ordered turn membership. Bounded like Main's input-persistence wait; an earlier input
+ * that fails, is cancelled, or loses its lease stops holding the newer one.
+ */
+async function waitForEarlierTelegramInputs(record, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (await TelegramInput.hasEarlierPreparingInput(record)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return true;
+}
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START ===
+ * Feature: Telegram reply provenance at admission.
+ * Purpose: A quoted Telegram message reaches Main only as typed evidence that Core resolved against
+ * this owner's and chat's durable delivery receipts, never as user-authored text. A retained input
+ * takes its reply from its durable ingress preparation (preparedTelegramReplyDescriptor).
+ * === VIVENTIUM END === */
+async function resolveAdmittedTelegramReplyContext({ ownerId, telegramChatId, descriptor }) {
+  if (!descriptor) return null;
+  try {
+    return await resolveTelegramReplyContext({ userId: ownerId, telegramChatId, descriptor });
+  } catch (error) {
+    logger.warn('[VIVENTIUM][telegram/chat] Reply provenance lookup unavailable', {
+      error: error?.name || 'Error',
+    });
+    // Without receipts the quote still reaches Main, but only as unverified platform evidence.
+    return resolveTelegramReplyContext({
+      userId: ownerId,
+      telegramChatId,
+      descriptor,
+      ReceiptModel: null,
+      MessageModel: null,
+    });
+  }
+}
+/* === VIVENTIUM END === */
+
 router.post(
   ['/chat', '/inputs/continue'],
   telegramAuth,
   configMiddleware,
   async (req, _res, next) => {
+    if (effectiveOrchestrationMode(req.user, { available: true }) === 'parallel') {
+      observeOrchestrationOwner(String(req.user.id));
+    }
     let incoming = req.body ?? {};
     let retainedInput = incoming.inputClaim
       ? await TelegramInput.read(req.user.id, incoming.inputClaim)
       : null;
     let preparedInput = null;
+    let retainedPreparation;
+    let retainedQuotedAttachmentTexts;
+    let recoveredStreamId = '';
     if (req.path === '/inputs/continue') {
       if (!retainedInput || !['ready', 'admitted', 'completed'].includes(retainedInput.state)) {
         return _res.status(409).json({ code: 'source_input_not_ready', retryable: true });
       }
       const envelope = await TelegramInput.inputEnvelope(retainedInput);
+      retainedPreparation = envelope?.preparation;
+      retainedQuotedAttachmentTexts = envelope?.quotedAttachmentTexts;
+      let job = null;
       if (retainedInput.state === 'admitted' || retainedInput.state === 'completed') {
-        const job = await GenerationJobManager.getJob(retainedInput.streamId);
+        job = await GenerationJobManager.getJob(retainedInput.streamId);
         if (!job || job.metadata?.userId !== req.user.id)
           return _res
             .status(503)
             .json({ code: 'source_input_response_unavailable', retryable: true });
+        /* === VIVENTIUM START ===
+         * Fix: an admitted input whose generator died before native dispatch continues under its
+         * own stream once that pre-dispatch lease expired. The job manager's atomic takeover
+         * decides; a live or already-dispatched generation stays the duplicate it is.
+         * === VIVENTIUM END === */
+        const persisted =
+          retainedInput.state === 'admitted'
+            ? await GenerationJobManager.getJobStore().getJob(retainedInput.streamId)
+            : null;
+        if (
+          persisted?.status === 'running' &&
+          !persisted.nativeResponse &&
+          persisted.nativeDispatchOwner &&
+          (persisted.nativeDispatchLeaseUntil ?? 0) <= Date.now()
+        ) {
+          recoveredStreamId = retainedInput.streamId;
+        }
+      }
+      if (
+        (retainedInput.state === 'admitted' || retainedInput.state === 'completed') &&
+        !recoveredStreamId
+      ) {
         return _res.json({
           ...envelope,
           prepared: await TelegramInput.readPrepared(retainedInput),
@@ -1370,7 +1464,7 @@ router.post(
      * Feature: Telegram stream isolation
      * Purpose: Ensure each Telegram request has a unique streamId (prevents stream collisions).
      * === VIVENTIUM NOTE === */
-    const streamId = `telegram-${crypto.randomUUID()}`;
+    const streamId = recoveredStreamId || `telegram-${crypto.randomUUID()}`;
     const sourceSequence = parseTelegramSourceSequence(telegramMessageId);
     const telegramMessageThreadId = normalizeTelegramThreadId(
       incoming.telegramMessageThreadId ?? incoming.telegram_message_thread_id,
@@ -1424,25 +1518,50 @@ router.post(
     }
     req._viventiumParallelWorkTurnAvailable = false;
     if (effectiveOrchestrationMode(req.user, { available: true }) === 'parallel') {
-      const releaseGate = await parallelWorkReleaseGateSnapshotAsync();
-      if (releaseGate.available === true) {
-        const readiness = await waitForOrchestrationReadiness({ ownerId: String(req.user.id) });
-        const claimState = parallelWorkClaimState(String(req.user.id), releaseGate);
-        req._viventiumParallelWorkTurnClaim = claimState;
-        req._viventiumParallelWorkTurnAvailable = Boolean(
-          readiness.requested && readiness.available && claimState.available,
-        );
-        if (readiness.requested && req._viventiumParallelWorkTurnAvailable) {
-          const sourceOrderCapabilities = GenerationJobManager.getSourceOrderCapabilities();
-          if (sourceOrderCapabilities.replica_safe !== true) {
-            req._viventiumParallelWorkTurnAvailable = false;
-          }
+      const readinessStartedAt = performance.now();
+      const readiness = await authoringOrchestrationReadiness({
+        ownerId: String(req.user.id),
+        sourceId: orderedEvent || declaredEvent,
+        consumer: 'telegram',
+      });
+      logTelegramTiming(
+        traceId,
+        'parallel_work_readiness',
+        readinessStartedAt,
+        `status=${readiness.status} available=${readiness.available}`,
+      );
+      const claimState = parallelWorkClaimState(String(req.user.id));
+      req._viventiumParallelWorkTurnClaim = claimState;
+      req._viventiumParallelWorkTurnAvailable = Boolean(
+        readiness.requested && readiness.available && claimState.available,
+      );
+      if (readiness.requested && req._viventiumParallelWorkTurnAvailable) {
+        const sourceOrderCapabilities = GenerationJobManager.getSourceOrderCapabilities();
+        if (sourceOrderCapabilities.replica_safe !== true) {
+          req._viventiumParallelWorkTurnAvailable = false;
         }
       }
     }
     // Legacy ingress without an ordered Telegram message keeps its existing opaque event identity.
     const sourceEventId =
       orderedEvent || declaredEvent || telegramMessageId || telegramUpdateId || streamId;
+    if (retainedInput && retainedPreparation === undefined) {
+      const envelope = await TelegramInput.inputEnvelope(retainedInput);
+      retainedPreparation = envelope?.preparation;
+      retainedQuotedAttachmentTexts = envelope?.quotedAttachmentTexts;
+    }
+    const replyContext = await resolveAdmittedTelegramReplyContext({
+      ownerId: req.user.id,
+      telegramChatId: identity.telegramChatId,
+      descriptor: retainedInput
+        ? preparedTelegramReplyDescriptor(
+            retainedPreparation,
+            retainedInput.telegramUserId,
+            incoming.replyContextV1,
+            retainedQuotedAttachmentTexts,
+          )
+        : normalizeTelegramReplyDescriptor(incoming.replyContextV1),
+    });
     setTrustedInteractionContext(
       req,
       createTelegramInteractionContext({
@@ -1452,6 +1571,7 @@ router.post(
         ...(sourceOrderScope
           ? { source_order_scope: sourceOrderScope, source_sequence: sourceSequence }
           : {}),
+        ...(replyContext ? { reply_context: replyContext } : {}),
       }),
       {
         segment_stability: 'immediate',
@@ -1546,6 +1666,21 @@ router.post(
     });
     let conversationId = retainedInput?.conversationId || conversationState.conversationId;
     let parentMessageId = conversationState.parentMessageId;
+    /* === VIVENTIUM START ===
+     * Fix: exact source-parent ownership. A persisted retained source keeps its recorded parent
+     * whatever the conversation head is now; re-anchoring it under a later answer can make the
+     * source its own ancestor and removes it from its original branch.
+     */
+    let retainedSourceParent;
+    if (retainedInput) {
+      const source = await Message.findOne(TelegramInput.messageFilter(retainedInput))
+        .select('parentMessageId metadata.viventium.telegramInput.originalParentMessageId')
+        .lean();
+      retainedSourceParent = source?.parentMessageId;
+      const originalParent = source?.metadata?.viventium?.telegramInput?.originalParentMessageId;
+      if (typeof originalParent === 'string' && originalParent) parentMessageId = originalParent;
+    }
+    /* === VIVENTIUM END === */
     parentMessageId = normalizeGatewayParentMessageId({ conversationId, parentMessageId });
     const acceptedContext = retainedInput
       ? bindCanonicalInteractionConversation(req, conversationId)
@@ -1675,7 +1810,14 @@ router.post(
       logger.warn('[VIVENTIUM][telegram/chat] Attachment processing failed: %s', reason);
       logTelegramTiming(traceId, 'upload_files', uploadStartTs, 'failed=1');
       if (retainedInput && err?.code === 'unsupported_file_type' && err?.retryable === false) {
-        await TelegramInput.status(req.user.id, incoming.inputClaim, 'failed', err.code);
+        await TelegramInput.status(
+          req.user.id,
+          incoming.inputClaim,
+          'failed',
+          err.code,
+          false,
+          Array.isArray(incoming.inputClaims) ? incoming.inputClaims : [],
+        );
         return _res.status(415).json({
           attachmentProcessingError: true,
           code: err.code,
@@ -1691,16 +1833,69 @@ router.post(
     const allFormattedImages = [...formattedImages, ...extractedDocumentImages];
     const hasImages = allFormattedImages.length > 0;
     if (retainedInput) {
-      retainedInput = await TelegramInput.ready(
-        req.user.id,
-        incoming.inputClaim,
-        {
-          text,
-          fileIds: uploadedFiles.map((file) => file.file_id),
-          imageUrls: allFormattedImages.map((image) => image.image_url.url),
-        },
-        Array.isArray(incoming.inputClaims) ? incoming.inputClaims : [],
-      );
+      // A recovered admitted input keeps its admitted, already-prepared source unchanged.
+      if (!recoveredStreamId) {
+        /* === VIVENTIUM START ===
+         * Fix: source-ordered turn membership. A fresh input first lets an earlier input of this
+         * conversation finish preparing, then joins the logical turn before it stops preparing, so
+         * a newer input's claim always merges it in source order.
+         */
+        if (retainedInput.state === 'preparing') {
+          await waitForEarlierTelegramInputs(retainedInput);
+          await GenerationJobManager.retainLogicalTurnInput(
+            req.user.id,
+            bindInteractionSourceSegments(req, text, uploadedFiles, {
+              messageId: retainedInput.sourceMessageId,
+              parentMessageId: parentMessageId || Constants.NO_PARENT,
+              persisted: true,
+            }),
+          );
+        }
+        /* === VIVENTIUM END === */
+        const readyQuotedAttachmentTexts = quotedAttachmentTexts(
+          retainedPreparation,
+          incoming.replyContextV1,
+        );
+        try {
+          retainedInput = await TelegramInput.ready(
+            req.user.id,
+            incoming.inputClaim,
+            {
+              text,
+              fileIds: uploadedFiles.map((file) => file.file_id),
+              imageUrls: allFormattedImages.map((image) => image.image_url.url),
+              // A later identity-only continuation keeps the quoted document's extracted text.
+              ...(readyQuotedAttachmentTexts.length
+                ? { quotedAttachmentTexts: readyQuotedAttachmentTexts }
+                : {}),
+            },
+            Array.isArray(incoming.inputClaims) ? incoming.inputClaims : [],
+          );
+        } catch (err) {
+          if (
+            err?.code !== 'source_input_group_failed' &&
+            err?.code !== 'source_input_group_conflict'
+          ) {
+            throw err;
+          }
+          if (err.code === 'source_input_group_conflict') {
+            await TelegramInput.status(
+              req.user.id,
+              incoming.inputClaim,
+              'failed',
+              err.code,
+              false,
+              [incoming.inputClaim],
+            );
+          }
+          return _res.status(409).json({
+            attachmentProcessingError: true,
+            code: err.code,
+            retryable: false,
+            error: 'This attachment group was not accepted. Please resend the whole group.',
+          });
+        }
+      }
       const observation = await GenerationJobManager.observeSourceOrder({
         source_order_scope: sourceOrderScope,
         source_sequence: sourceSequence,
@@ -1711,6 +1906,27 @@ router.post(
           retainedInput.sourceMessageId,
           observation.latest_source_sequence,
         );
+        /* === VIVENTIUM START ===
+         * Fix: lossless settlement of an earlier input. Only actual committed coverage settles it.
+         * A newer unanswered source carries the combined turn; a newer source answered without
+         * this input, or admitted with it and then failed, leaves an honest historical failure,
+         * never a standalone obsolete answer.
+         */
+        if (!recoveredStreamId) {
+          if (
+            (await TelegramInput.hasNewerUnresolvedInput(retainedInput)) ||
+            (await TelegramInput.hasCommittedDelivery(retainedInput))
+          ) {
+            req._viventiumTelegramInputSettlement = 'defer';
+          } else if (
+            (await TelegramInput.hasNewerCompletedInput(retainedInput)) ||
+            // A newer input admitted with this one failed; its accepted answer is unavailable.
+            (await TelegramInput.hasNewerFailedAdmittedInput(retainedInput))
+          ) {
+            req._viventiumTelegramInputSettlement = 'uncovered';
+          }
+        }
+        /* === VIVENTIUM END === */
       }
       req._viventiumTelegramInput = retainedInput;
       req._viventiumTelegramPrepared = {
@@ -1752,13 +1968,20 @@ router.post(
     if (retainedInput) {
       req.body.overrideUserMessageId = `${retainedInput.sourceMessageId}${Constants.COMMON_DIVIDER}1`;
       const sourceFilter = TelegramInput.messageFilter(retainedInput);
-      await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
-        sourceFilter,
-        () =>
-          Message.updateOne(sourceFilter, {
-            $set: { parentMessageId: parentMessageId || Constants.NO_PARENT },
-          }),
-      );
+      /* === VIVENTIUM START ===
+       * Fix: an unchanged parent is not a source edit. Re-anchoring it through the native source
+       * fence would revoke the live native answer of a newer input that descends from this source.
+       */
+      if (retainedSourceParent !== (parentMessageId || Constants.NO_PARENT)) {
+        /* === VIVENTIUM END === */
+        await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+          sourceFilter,
+          () =>
+            Message.updateOne(sourceFilter, {
+              $set: { parentMessageId: parentMessageId || Constants.NO_PARENT },
+            }),
+        );
+      }
       const enriched = bindInteractionSourceSegments(req, text, uploadedFiles, {
         messageId: retainedInput.sourceMessageId,
         parentMessageId: parentMessageId || Constants.NO_PARENT,
@@ -1854,6 +2077,11 @@ router.post(
       if (payload?.pending === true) return TelegramInput.defer(req.user.id, claim);
       if (!payload?.streamId) return;
       await TelegramInput.bindStream(req.user.id, claim, payload.streamId);
+      await bindRetainedTelegramIngressAuthority({
+        ownerId: req.user.id,
+        sourceEventId: claim.sourceEventId,
+        streamId: payload.streamId,
+      });
       await Message.updateOne(TelegramInput.messageFilter(req._viventiumTelegramInput), {
         $set: { 'metadata.viventium.telegramInput.state': 'admitted' },
       });
@@ -1904,6 +2132,37 @@ router.post(
       }
       return originalJson(withLogicalTurn);
     };
+    /* === VIVENTIUM START ===
+     * Fix: lossless settlement of an earlier input. It joined the logical turn of a newer, still
+     * unanswered source (which answers both) or its coverage is already committed; either way it
+     * settles through that coverage instead of answering alone. An input a newer answer did not
+     * cover keeps its source and records a typed failure; no obsolete answer is presented.
+     */
+    if (req._viventiumTelegramInputSettlement === 'defer') {
+      const pendingReceipt = {
+        code: 'source_input_pending',
+        pending: true,
+        conversationId: req.body?.conversationId,
+      };
+      await req._viventiumBeforeGenerationReceipt(pendingReceipt);
+      return res.status(202).json(pendingReceipt);
+    }
+    if (req._viventiumTelegramInputSettlement === 'uncovered') {
+      const record = req._viventiumTelegramInput;
+      await TelegramInput.status(
+        req.user.id,
+        { sourceEventId: record.sourceEventId, claimToken: record.claimToken },
+        'failed',
+        'source_input_uncovered',
+        false,
+      );
+      return res.status(202).json({
+        code: 'source_order_superseded',
+        superseded: true,
+        conversationId: req.body?.conversationId,
+      });
+    }
+    /* === VIVENTIUM END === */
     const controllerStartTs = performance.now();
     const result = await AgentController(req, res, next, initializeClient, addTitle);
     const traceId = typeof req.body?.traceId === 'string' ? req.body.traceId : '';
@@ -1984,14 +2243,13 @@ const OPERATION_ID_PATTERN =
 
 async function telegramOrchestrationResponse(user, ownerId, admittedClaimState) {
   const claimState = admittedClaimState || (await parallelWorkClaimStateAsync(ownerId));
-  const releaseGate = await parallelWorkReleaseGateSnapshotAsync();
   return {
     available: claimState.available,
-    mode: effectiveOrchestrationMode(user, { available: claimState.available }),
+    mode: preferredOrchestrationMode(user),
     hasKnownWork: user?.personalization?.parallel_work_known === true,
-    ...(releaseGate.label === 'READY'
+    ...(claimState.label === 'READY'
       ? {}
-      : { releaseGate: { label: releaseGate.label, blockers: releaseGate.blockers } }),
+      : { releaseGate: { label: claimState.label, blockers: claimState.blockers } }),
   };
 }
 
@@ -2085,8 +2343,13 @@ router.post('/orchestration/work/:workRef/actions', telegramAuth, async (req, re
   const action = String(req.body?.action || '').trim();
   const instruction = String(req.body?.instruction || '').trim();
   const operationId = String(req.body?.operationId || '').trim();
+  const nativeResponse = req.body?.nativeInput == null
+    ? null
+    : nativeWorkInputResponseSchema.safeParse(req.body.nativeInput);
   if (
     !WORK_REF_PATTERN.test(workRef) ||
+    (nativeResponse && (!nativeResponse.success || action !== 'resume')) ||
+    Object.hasOwn(req.body || {}, 'ownerInputControl') ||
     !PARALLEL_WORK_ACTIONS.has(action) ||
     !OPERATION_ID_PATTERN.test(operationId) ||
     (PARALLEL_WORK_INSTRUCTION_ACTIONS.has(action) && !instruction) ||
@@ -2107,6 +2370,9 @@ router.post('/orchestration/work/:workRef/actions', telegramAuth, async (req, re
       instruction,
       operationId,
       sourceSurface: 'telegram',
+      ...(nativeResponse?.success
+        ? { nativeInput: nativeResponse.data, ownerInputControl: true }
+        : {}),
     });
     return res.status(202).json(result);
   } catch (error) {
@@ -2281,9 +2547,11 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
           scheduleEnd();
         }
       },
-      (error) => {
+      (error, errorClass) => {
         if (!res.writableEnded) {
-          res.write(`event: error\ndata: ${JSON.stringify({ error })}\n\n`);
+          res.write(
+            `event: error\ndata: ${JSON.stringify({ error, ...(errorClass ? { error_class: errorClass } : {}) })}\n\n`,
+          );
           if (typeof res.flush === 'function') {
             res.flush();
           }
@@ -2633,6 +2901,9 @@ router.post('/glasshive/deliveries/:deliveryId/status', telegramBridgeAuth, asyn
         claimId,
         dispatchPermit: req.body.dispatchPermit,
         reason: req.body?.reason || 'telegram_receipt_missing',
+        ...(Array.isArray(req.body?.telegramMessageIds)
+          ? { telegramMessageIds: req.body.telegramMessageIds }
+          : {}),
       });
     } else {
       return res.status(400).json({ error: 'Unsupported delivery status' });

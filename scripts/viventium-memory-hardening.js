@@ -96,12 +96,11 @@ const STABLE_TRANSCRIPT_MEMORY_KEYS = new Set([
 ]);
 const MODEL_FALLBACK_SEPARATOR = /[,;]/;
 const DEFAULT_MEMORY_HARDENING_MODEL_FALLBACKS = [
-  { provider: 'openai', model: 'gpt-5.6-luna', effort: 'medium', source: 'default' },
-  { provider: 'openai', model: 'gpt-5.6-sol', effort: 'xhigh', source: 'default' },
-  { provider: 'anthropic', model: 'claude-opus-5', effort: 'xhigh', source: 'default' },
-  { provider: 'anthropic', model: 'opus', effort: 'xhigh', source: 'default' },
+  { provider: 'openai', model: 'gpt-6.1-sol', effort: 'high', source: 'default' },
+  { provider: 'anthropic', model: 'claude-opus-5-5', effort: 'high', source: 'default' },
 ];
 const DEFAULT_OPENAI_MEMORY_EFFORT_BY_MODEL = Object.freeze({
+  'gpt-6.1-sol': 'high',
   'gpt-5.5': 'xhigh',
   'gpt-5.6-sol': 'xhigh',
   'gpt-5.6-terra': 'high',
@@ -2580,7 +2579,7 @@ function normalizeProvider(provider) {
 }
 
 function defaultEffortForProvider(provider, model = '') {
-  if (normalizeProvider(provider) === 'anthropic') return 'xhigh';
+  if (normalizeProvider(provider) === 'anthropic') return 'high';
   return (
     DEFAULT_OPENAI_MEMORY_EFFORT_BY_MODEL[String(model || '').trim()] ||
     DEFAULT_OPENAI_MEMORY_EFFORT
@@ -2688,8 +2687,8 @@ function resolveProvider(options = {}) {
       options.model ||
       selectedModelFromCompiler ||
       (explicit === 'anthropic'
-        ? process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-5'
-        : process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.6-luna');
+        ? process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-5-5'
+        : process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-6.1-sol');
     return withResolvedCandidates({
       provider: explicit,
       model: selectedModel,
@@ -2706,7 +2705,7 @@ function resolveProvider(options = {}) {
   }
   const providers = configuredProviders();
   if (providers.includes('openai')) {
-    const selectedModel = process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-5.6-luna';
+    const selectedModel = process.env.VIVENTIUM_MEMORY_HARDENING_OPENAI_MODEL || 'gpt-6.1-sol';
     return withResolvedCandidates({
       provider: 'openai',
       model: selectedModel,
@@ -2720,7 +2719,7 @@ function resolveProvider(options = {}) {
   if (providers.includes('anthropic')) {
     return withResolvedCandidates({
       provider: 'anthropic',
-      model: process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-5',
+      model: process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL || 'claude-opus-5-5',
       effort:
         process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT ||
         process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT ||
@@ -2976,7 +2975,7 @@ function probeModel(
         '--model',
         model,
         '--effort',
-        effort || 'xhigh',
+        effort || 'high',
         '--json-schema',
         JSON.stringify(schema),
       ],
@@ -3018,7 +3017,7 @@ function invokeStructuredModel({ prompt, provider, model, effort, schema, timeou
         '--model',
         model,
         '--effort',
-        effort || process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT || 'xhigh',
+        effort || process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT || 'high',
         '--json-schema',
         JSON.stringify(schema),
       ],

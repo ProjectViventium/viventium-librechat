@@ -13,6 +13,7 @@ const { createParallelWorkReleaseFixture } = require('../testFixtures/parallelWo
 const releaseFixture = createParallelWorkReleaseFixture('viventium-telegram-release-gate-');
 const { openGate, releaseDir, releasePath, validGates, writeReleaseSnapshot } = releaseFixture;
 let lastAgentId = null;
+let mockGetPersistedJob = jest.fn().mockResolvedValue(null);
 let lastStreamId = null;
 let lastParentMessageId = null;
 let lastSpec = null;
@@ -26,6 +27,10 @@ let mockLastInteractionContext = null;
 let mockInputService;
 let mockSaveInput;
 let mockInputMessageUpdate;
+let mockInputMessageRead;
+let mockReplyReceiptFindOne;
+let mockRetainLogicalTurnInput;
+let mockMutateNativeResponseSources;
 let mockLastPreparedBody;
 let mockCaptureAcceptedInteractionInput;
 let mockRetainAcceptedInteractionInput;
@@ -44,6 +49,7 @@ let mockGetMessage;
 let mockGetConvo;
 let mockGetAgent;
 let mockResolveUserVoiceRoute;
+let mockResolveVoiceContextKeyterms;
 let mockTelegramMappingFindOne;
 let mockTelegramMappingUpdateOne;
 let mockTelegramLinkTokenCreate;
@@ -80,7 +86,7 @@ let mockGetCoreWorkDelivery;
 let mockGetCoreWorkOriginRef;
 let mockReauthorizeCapabilityAuthorization;
 let mockRefreshOrchestrationReadiness;
-let mockWaitForOrchestrationReadiness;
+let mockAuthoringOrchestrationReadiness;
 let mockGetCortexInsightDeliveriesForParent;
 let mockClaimCortexTelegramDeliveries;
 let mockAuthorizeCortexTelegramDeliveryClaim;
@@ -195,7 +201,7 @@ jest.mock(
     ),
 );
 jest.mock('~/server/services/viventium/nativeResponseService', () => ({
-  mutateNativeResponseSources: async (_filter, operation) => operation(),
+  mutateNativeResponseSources: (...args) => mockMutateNativeResponseSources(...args),
 }));
 
 jest.mock('~/models', () => ({
@@ -238,7 +244,7 @@ jest.mock('~/server/services/viventium/GlassHiveOrchestrationReadinessService', 
     available: process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE === 'true',
   })),
   refreshOrchestrationReadiness: (...args) => mockRefreshOrchestrationReadiness(...args),
-  waitForOrchestrationReadiness: (...args) => mockWaitForOrchestrationReadiness(...args),
+  authoringOrchestrationReadiness: (...args) => mockAuthoringOrchestrationReadiness(...args),
 }));
 
 jest.mock('~/server/middleware/accessResources/fileAccess', () => ({
@@ -279,6 +285,7 @@ jest.mock('~/server/services/viventium/CallSessionService', () => ({
   createCallBrowserLaunch: (...args) => mockCreateCallBrowserLaunch(...args),
   createCallSession: (...args) => mockCreateCallSession(...args),
   resolveUserVoiceRoute: (...args) => mockResolveUserVoiceRoute(...args),
+  resolveVoiceContextKeyterms: (...args) => mockResolveVoiceContextKeyterms(...args),
 }));
 
 jest.mock('~/server/services/viventium/VoiceAgentAuthorizationService', () => ({
@@ -323,15 +330,18 @@ jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   GenerationJobManager: {
     getJob: (...args) => mockGetJob(...args),
+    getJobStore: () => ({ getJob: (...args) => mockGetPersistedJob(...args) }),
     getResumeState: (...args) => mockGetResumeState(...args),
     observeSourceOrder: (...args) => mockObserveSourceOrder(...args),
     getSourceOrderCapabilities: (...args) => mockGetSourceOrderCapabilities(...args),
     subscribe: (...args) => mockSubscribe(...args),
+    retainLogicalTurnInput: (...args) => mockRetainLogicalTurnInput(...args),
   },
 }));
 
 jest.mock('~/db/models', () => ({
   Message: {
+    findOne: (...args) => mockInputMessageRead(...args),
     exists: jest.fn().mockResolvedValue(false),
     updateOne: (...args) => mockInputMessageUpdate(...args),
   },
@@ -352,6 +362,9 @@ jest.mock('~/db/models', () => ({
     create: (...args) => mockTelegramIngressCreate(...args),
     updateOne: (...args) => mockTelegramIngressUpdateOne(...args),
     deleteOne: (...args) => mockTelegramIngressDeleteOne(...args),
+  },
+  ViventiumGlassHiveCallbackDelivery: {
+    findOne: (...args) => mockReplyReceiptFindOne(...args),
   },
 }));
 
@@ -578,8 +591,18 @@ describe('/api/viventium/telegram', () => {
       inputEnvelope: jest.fn(),
       readPrepared: jest.fn(),
       messageFilter: jest.fn().mockReturnValue({ messageId: 'source-message' }),
+      hasEarlierPreparingInput: jest.fn().mockResolvedValue(false),
+      hasNewerUnresolvedInput: jest.fn().mockResolvedValue(false),
+      hasNewerCompletedInput: jest.fn().mockResolvedValue(false),
+      hasNewerFailedAdmittedInput: jest.fn().mockResolvedValue(false),
+      hasCommittedDelivery: jest.fn().mockResolvedValue(false),
+      defer: jest.fn().mockResolvedValue(undefined),
     };
+    mockRetainLogicalTurnInput = jest.fn().mockResolvedValue({});
+    mockReplyReceiptFindOne = jest.fn(() => ({ lean: async () => null }));
+    mockMutateNativeResponseSources = jest.fn(async (_filter, operation) => operation());
     mockSaveInput = jest.fn().mockResolvedValue({});
+    mockInputMessageRead = jest.fn(() => ({ select: () => ({ lean: async () => null }) }));
     mockInputMessageUpdate = jest.fn().mockResolvedValue({ matchedCount: 1 });
     mockLastPreparedBody = null;
     lastAgentId = null;
@@ -603,6 +626,7 @@ describe('/api/viventium/telegram', () => {
     mockUserCountDocuments = jest.fn().mockResolvedValue(0);
     mockSubscribe = jest.fn();
     mockGetJob = jest.fn().mockResolvedValue({ metadata: { userId: 'user_1' } });
+    mockGetPersistedJob = jest.fn().mockResolvedValue(null);
     mockGetResumeState = jest.fn().mockResolvedValue(null);
     mockObserveSourceOrder = jest.fn().mockResolvedValue({
       latest_source_sequence: 12347,
@@ -657,6 +681,7 @@ describe('/api/viventium/telegram', () => {
         variant: 'mlx-community/chatterbox-turbo-8bit',
       },
     });
+    mockResolveVoiceContextKeyterms = jest.fn().mockResolvedValue([]);
     mockClaimGlassHiveDeliveries = jest.fn().mockResolvedValue([]);
     mockAuthorizeGlassHiveDeliveryDispatch = jest.fn().mockResolvedValue({
       deliveryId: 'ghcd_1',
@@ -719,7 +744,7 @@ describe('/api/viventium/telegram', () => {
     mockGetCoreWorkDelivery = jest.fn().mockResolvedValue({ state: 'delivered' });
     mockGetCoreWorkOriginRef = jest.fn().mockResolvedValue('ghi_original_telegram_launch');
     mockRefreshOrchestrationReadiness = jest.fn().mockResolvedValue({ available: false });
-    mockWaitForOrchestrationReadiness = jest.fn().mockResolvedValue({
+    mockAuthoringOrchestrationReadiness = jest.fn().mockResolvedValue({
       requested: true,
       available: true,
       status: 'ready',
@@ -1192,6 +1217,8 @@ describe('/api/viventium/telegram', () => {
     mockGetMessages.mockResolvedValue([
       { messageId: 'later-answer', parentMessageId: 'later-correction', createdAt: new Date() },
     ]);
+    // This prepared source has no persisted row yet, so it continues at the current head.
+    mockInputMessageRead = jest.fn(() => ({ select: () => ({ lean: async () => null }) }));
     const app = createTestApp(require('../telegram')),
       res = createMockRes();
     await dispatch(
@@ -1231,6 +1258,449 @@ describe('/api/viventium/telegram', () => {
     });
     expect(res.body.prepared.text).toBe('Original voice goal');
   });
+  test('prepared recovery does not reparent a source under its own transient response', async () => {
+    const row = { ...inputIdentity(), state: 'ready' };
+    mockInputService.read.mockResolvedValue(row);
+    mockInputService.ready.mockResolvedValue(row);
+    mockInputService.inputEnvelope.mockResolvedValue({
+      ...row,
+      preparation: { message: { date: 1700000000 } },
+    });
+    mockInputService.readPrepared.mockResolvedValue({
+      text: 'Original voice goal',
+      fileIds: [],
+      imageUrls: [],
+    });
+    mockObserveSourceOrder.mockResolvedValue({
+      latest_source_sequence: 13,
+      observed_at: 1700000000000,
+      stale: true,
+    });
+    mockGetConvo.mockResolvedValue({
+      conversationId: row.conversationId,
+      endpoint: 'agents',
+      agent_id: 'agent_default',
+    });
+    mockGetMessages.mockResolvedValue([
+      {
+        messageId: 'transient-response',
+        parentMessageId: row.sourceMessageId,
+        createdAt: new Date(),
+      },
+    ]);
+    mockInputMessageRead = jest.fn(() => ({
+      select: () => ({
+        lean: async () => ({
+          metadata: {
+            viventium: { telegramInput: { originalParentMessageId: 'original-answer' } },
+          },
+        }),
+      }),
+    }));
+    const app = createTestApp(require('../telegram')),
+      res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/telegram/inputs/continue',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: {
+          telegramUserId: 'tg-1',
+          inputClaim: { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+        },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(mockLastInteractionContext).toMatchObject({
+      source_sequence: 12,
+      source_event_id: row.sourceEventId,
+      ready_input_continuation: {
+        source_message_id: 'source-message',
+        presentation_source_sequence: 13,
+      },
+    });
+    expect(lastParentMessageId).toBe('original-answer');
+    expect(mockInputMessageRead).toHaveBeenCalledWith(mockInputService.messageFilter(row));
+    expect(mockLastPreparedBody.text).toBe('Original voice goal');
+    expect(mockLastPreparedBody.clientTimestamp).toBe('2023-11-14T22:13:20.000Z');
+    expect(mockProcessAgentFileUpload).not.toHaveBeenCalled();
+    expect(mockCaptureAcceptedInteractionInput).not.toHaveBeenCalled();
+    expect(mockInputService.bindStream).toHaveBeenCalledWith(
+      'user_1',
+      expect.objectContaining({ sourceEventId: row.sourceEventId }),
+      'stream_1',
+    );
+    expect(res.body.inputPresentation).toMatchObject({
+      sourceSequence: 12,
+      presentationSourceSequence: 13,
+    });
+    expect(res.body.prepared.text).toBe('Original voice goal');
+  });
+  /* === VIVENTIUM START ===
+   * Purpose: a retained input's ingress row becomes its turn's durable source authority once its
+   * exact stream is admitted, so the Telegram dispatcher may present a late follow-up of the turn.
+   * === VIVENTIUM END === */
+  function continueRetainedInput(
+    row,
+    { preparation = { message: { date: 1700000000 } }, body = {}, envelope = {} } = {},
+  ) {
+    mockInputService.read.mockResolvedValue(row);
+    mockInputService.ready.mockResolvedValue(row);
+    mockInputService.inputEnvelope.mockResolvedValue({ ...row, preparation, ...envelope });
+    mockInputService.readPrepared.mockResolvedValue({
+      text: 'Original voice goal',
+      fileIds: [],
+      imageUrls: [],
+    });
+    mockObserveSourceOrder.mockResolvedValue({
+      latest_source_sequence: 13,
+      observed_at: 1700000000000,
+      stale: true,
+    });
+    mockGetConvo.mockResolvedValue({
+      conversationId: row.conversationId,
+      endpoint: 'agents',
+      agent_id: 'agent_default',
+    });
+    mockGetMessages.mockResolvedValue([]);
+    mockInputMessageRead = jest.fn(() => ({ select: () => ({ lean: async () => null }) }));
+    const res = createMockRes();
+    const done = dispatch(
+      createTestApp(require('../telegram')),
+      createMockReq({
+        url: '/api/viventium/telegram/inputs/continue',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: {
+          telegramUserId: 'tg-1',
+          inputClaim: { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+          ...body,
+        },
+      }),
+      res,
+    );
+    return { res, done };
+  }
+
+  const retainedAuthorityBinding = (row) => [
+    { sourceEventId: row.sourceEventId, libreChatUserId: 'user_1', streamId: 'stream_1' },
+    [{ $set: { authorityBoundAt: { $ifNull: ['$authorityBoundAt', '$$NOW'] } } }],
+  ];
+
+  test('a retained input binds its ingress authority to exactly its admitted stream', async () => {
+    const row = { ...inputIdentity(), state: 'ready' };
+    const { res, done } = continueRetainedInput(row);
+    await done;
+
+    expect(res.statusCode).toBe(200);
+    const calls = mockTelegramIngressUpdateOne.mock.calls;
+    const index = calls.findIndex(([filter]) => filter?.streamId === 'stream_1');
+    expect(calls[index]).toEqual(retainedAuthorityBinding(row));
+    // The input's stream is admitted first, then its authority binds to that same stream.
+    expect(mockInputService.bindStream.mock.invocationCallOrder[0]).toBeLessThan(
+      mockTelegramIngressUpdateOne.mock.invocationCallOrder[index],
+    );
+  });
+
+  test('a retained input whose ingress row is not its source on that stream fails closed', async () => {
+    mockTelegramIngressUpdateOne.mockResolvedValue({
+      acknowledged: true,
+      matchedCount: 0,
+      modifiedCount: 0,
+    });
+    const row = { ...inputIdentity(), state: 'ready' };
+    const { res, done } = continueRetainedInput(row);
+
+    await expect(done).rejects.toMatchObject({ code: 'TELEGRAM_INGRESS_AUTHORITY_UNAVAILABLE' });
+    expect(mockTelegramIngressUpdateOne).toHaveBeenCalledWith(...retainedAuthorityBinding(row));
+    // No started receipt is sent for a turn whose durable authority is unavailable.
+    expect(res.body?.streamId).toBeUndefined();
+  });
+  /* === VIVENTIUM START ===
+   * Purpose: a Telegram reply reaches Main as typed evidence that Core resolved against this owner's
+   * and chat's durable delivery receipts. A retained input's quote comes from its own durable
+   * ingress preparation, so a request can neither substitute nor add one.
+   * === VIVENTIUM END === */
+  const repliedPreparation = (replied) => ({
+    message: {
+      message_id: 12,
+      date: 1700000000,
+      text: 'Does it still fit?',
+      from: { id: 'tg-1', is_bot: false, first_name: 'Owner' },
+      ...(replied ? { reply_to_message: replied } : {}),
+    },
+  });
+  const deliveredAnswer = {
+    message_id: 14382,
+    date: 1700000000,
+    text: 'Willow fits 450 with 8 left.',
+    from: { id: 5550001, is_bot: true, first_name: 'Viventium' },
+    chat: { id: -100123, type: 'supergroup' },
+  };
+  const deliveredReceipt = (filter) => ({
+    lean: async () =>
+      filter?.telegramSentMessageIds === '14382'
+        ? {
+            userId: 'user_1',
+            conversationId: 'canonical-conversation',
+            logicalMessageId: 'main-answer',
+            sourceKind: 'assistant_message',
+            telegramSentMessageIds: ['14382'],
+            status: 'sent',
+          }
+        : null,
+  });
+
+  test('a retained reply to a delivered answer reaches Main as its verified quote', async () => {
+    mockReplyReceiptFindOne.mockImplementation(deliveredReceipt);
+    const row = { ...inputIdentity(), state: 'ready' };
+    const { res, done } = continueRetainedInput(row, {
+      preparation: repliedPreparation(deliveredAnswer),
+      body: {
+        replyContextV1: {
+          version: 1,
+          repliedTelegramMessageId: '777',
+          quoteText: 'A different quote',
+          senderKind: 'owner_candidate',
+        },
+      },
+    });
+    await done;
+
+    expect(res.statusCode).toBe(200);
+    expect(mockReplyReceiptFindOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'user_1',
+        telegramChatId: '-100123',
+        telegramSentMessageIds: '14382',
+        status: 'sent',
+      }),
+    );
+    expect(mockLastInteractionContext.reply_context).toEqual({
+      version: 1,
+      provenanceStatus: 'verified',
+      senderRole: 'assistant_self',
+      repliedTelegramMessageId: '14382',
+      quoteText: 'Willow fits 450 with 8 left.',
+      logicalMessageId: 'main-answer',
+      conversationId: 'canonical-conversation',
+      sourceKind: 'assistant_message',
+    });
+  });
+
+  test('a retained reply to the owner’s own message stays the owner’s, whatever the adapter claims', async () => {
+    const row = { ...inputIdentity(), state: 'ready' };
+    const { res, done } = continueRetainedInput(row, {
+      preparation: repliedPreparation({
+        message_id: 14380,
+        date: 1700000000,
+        text: '108 booklets, $450 budget.',
+        from: { id: 'tg-1', is_bot: false, first_name: 'Owner' },
+      }),
+      body: {
+        replyContextV1: {
+          version: 1,
+          repliedTelegramMessageId: '14380',
+          quoteText: '108 booklets, $450 budget.',
+          senderKind: 'assistant_candidate',
+        },
+      },
+    });
+    await done;
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastInteractionContext.reply_context).toEqual({
+      version: 1,
+      provenanceStatus: 'platform_verified',
+      senderRole: 'owner_self',
+      repliedTelegramMessageId: '14380',
+      quoteText: '108 booklets, $450 budget.',
+    });
+  });
+
+  test('a retained input that replies to nothing carries no quote, whatever the request adds', async () => {
+    mockReplyReceiptFindOne.mockImplementation(deliveredReceipt);
+    const row = { ...inputIdentity(), state: 'ready' };
+    const { res, done } = continueRetainedInput(row, {
+      preparation: repliedPreparation(null),
+      body: {
+        replyContextV1: { version: 1, repliedTelegramMessageId: '14382', quoteText: 'Added' },
+      },
+    });
+    await done;
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastInteractionContext.reply_context).toBeUndefined();
+    expect(mockReplyReceiptFindOne).not.toHaveBeenCalled();
+  });
+
+  test('an identity-only continuation keeps its ready record’s quoted document text, for that file only', async () => {
+    const row = { ...inputIdentity(), state: 'ready' };
+    // The actual bot continuation sends only the input identity, never a reply descriptor.
+    const { res, done } = continueRetainedInput(row, {
+      preparation: repliedPreparation({
+        message_id: 14390,
+        date: 1700000000,
+        caption: 'Rate card',
+        from: { id: 5550001, is_bot: true, first_name: 'Viventium' },
+        document: { file_id: 'doc-1', file_name: 'rates.pdf' },
+      }),
+      envelope: {
+        quotedAttachmentTexts: [
+          { fileId: 'doc-1', extractedText: 'Willow 4.10 per booklet' },
+          { fileId: 'doc-other', extractedText: 'Unrelated text' },
+        ],
+      },
+    });
+    await done;
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastInteractionContext.reply_context).toMatchObject({
+      provenanceStatus: 'unverified',
+      senderRole: 'unknown',
+      repliedTelegramMessageId: '14390',
+      quoteText: 'Rate card',
+      attachments: [
+        {
+          kind: 'document',
+          fileId: 'doc-1',
+          filename: 'rates.pdf',
+          extractedText: 'Willow 4.10 per booklet',
+        },
+      ],
+    });
+  });
+
+  test('the passage the user selected in Telegram is the admitted quote', async () => {
+    mockReplyReceiptFindOne.mockImplementation(deliveredReceipt);
+    const row = { ...inputIdentity(), state: 'ready' };
+    const preparation = repliedPreparation(deliveredAnswer);
+    preparation.message.quote = { text: '8 left', position: 22, is_manual: true };
+    const { res, done } = continueRetainedInput(row, { preparation });
+    await done;
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastInteractionContext.reply_context).toMatchObject({
+      provenanceStatus: 'verified',
+      repliedTelegramMessageId: '14382',
+      logicalMessageId: 'main-answer',
+      quoteText: '8 left',
+    });
+  });
+
+  test('an unavailable receipt lookup keeps the quote only as unverified evidence', async () => {
+    mockReplyReceiptFindOne.mockImplementation(() => {
+      throw new Error('receipts unavailable');
+    });
+    const row = { ...inputIdentity(), state: 'ready' };
+    const { res, done } = continueRetainedInput(row, {
+      preparation: repliedPreparation(deliveredAnswer),
+    });
+    await done;
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastInteractionContext.reply_context).toEqual({
+      version: 1,
+      provenanceStatus: 'unverified',
+      senderRole: 'unknown',
+      repliedTelegramMessageId: '14382',
+      quoteText: 'Willow fits 450 with 8 left.',
+    });
+  });
+
+  test('POST /chat resolves a fresh Telegram reply against this owner’s delivered receipts', async () => {
+    mockReplyReceiptFindOne.mockImplementation(deliveredReceipt);
+    mockInputMessageRead = jest.fn(() => ({ select: () => ({ lean: async () => null }) }));
+    const req = createMockReq({
+      url: '/api/viventium/telegram/chat',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        text: 'Does it still fit?',
+        conversationId: 'new',
+        telegramUserId: 'tg-1',
+        telegramChatId: '-100123',
+        telegramMessageId: '42',
+        sourceOrderScope: trustedTelegramSourceScope(),
+        sourceEventId: trustedTelegramSourceEventId(),
+        replyContextV1: {
+          version: 1,
+          repliedTelegramMessageId: '14382',
+          quoteText: 'Willow fits 450 with 8 left.',
+          senderKind: 'assistant_candidate',
+        },
+      },
+    });
+    const res = createMockRes();
+
+    await dispatch(createTestApp(require('../telegram')), req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockLastInteractionContext.reply_context).toMatchObject({
+      provenanceStatus: 'verified',
+      senderRole: 'assistant_self',
+      repliedTelegramMessageId: '14382',
+      logicalMessageId: 'main-answer',
+    });
+  });
+  /* === VIVENTIUM END === */
+
+  /* === VIVENTIUM START === A recovered source keeps its own parent after later answers. === */
+  test('prepared recovery keeps a persisted source under its original parent after a later answer', async () => {
+    const row = { ...inputIdentity(), state: 'ready' };
+    mockInputService.read.mockResolvedValue(row);
+    mockInputService.ready.mockResolvedValue(row);
+    mockInputService.inputEnvelope.mockResolvedValue({
+      ...row,
+      preparation: { message: { date: 1700000000 } },
+    });
+    mockInputService.readPrepared.mockResolvedValue({
+      text: 'Original voice goal',
+      fileIds: [],
+      imageUrls: [],
+    });
+    mockObserveSourceOrder.mockResolvedValue({
+      latest_source_sequence: 13,
+      observed_at: 1700000000000,
+      stale: true,
+    });
+    mockGetConvo.mockResolvedValue({
+      conversationId: row.conversationId,
+      endpoint: 'agents',
+      agent_id: 'agent_default',
+    });
+    // A later source's answer is the head; re-anchoring under it would make this source its own
+    // ancestor once that later source already descends from it.
+    mockGetMessages.mockResolvedValue([
+      { messageId: 'later-answer', parentMessageId: 'later-source', createdAt: new Date() },
+    ]);
+    mockInputMessageRead = jest.fn(() => ({
+      select: () => ({
+        lean: async () => ({
+          metadata: {
+            viventium: { telegramInput: { originalParentMessageId: 'original-answer' } },
+          },
+        }),
+      }),
+    }));
+    const app = createTestApp(require('../telegram')),
+      res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/telegram/inputs/continue',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: {
+          telegramUserId: 'tg-1',
+          inputClaim: { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+        },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(lastParentMessageId).toBe('original-answer');
+    expect(mockInputMessageRead).toHaveBeenCalledWith(mockInputService.messageFilter(row));
+  });
+  /* === VIVENTIUM END === */
   test('admitted input recovery returns the same existing stream without preparing or invoking Main again', async () => {
     const row = { ...inputIdentity(), state: 'admitted', streamId: 'retained-stream' };
     mockInputService.read.mockResolvedValue(row);
@@ -1268,6 +1738,62 @@ describe('/api/viventium/telegram', () => {
     });
     expect(lastAgentId).toBeNull();
     expect(mockInputService.ready).not.toHaveBeenCalled();
+  });
+
+  test('admitted input whose generator died before dispatch continues on its own stream', async () => {
+    const row = { ...inputIdentity(), state: 'admitted', streamId: 'retained-stream' };
+    mockInputService.read.mockResolvedValue(row);
+    mockInputService.inputEnvelope.mockResolvedValue(row);
+    mockInputService.readPrepared.mockResolvedValue({ text: 'goal', fileIds: [], imageUrls: [] });
+    mockGetJob.mockResolvedValue({
+      metadata: {
+        userId: 'user_1',
+        conversationId: row.conversationId,
+        interactionContext: { logical_turn_id: 'turn', revision: 2 },
+      },
+    });
+    const orphan = {
+      status: 'running',
+      nativeDispatchOwner: 'dead-generator',
+      nativeDispatchLeaseUntil: Date.now() - 1,
+    };
+    const continueInput = async () => {
+      const app = createTestApp(require('../telegram')),
+        res = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/telegram/inputs/continue',
+          headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+          body: {
+            telegramUserId: 'tg-1',
+            inputClaim: { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+          },
+        }),
+        res,
+      );
+      return res;
+    };
+
+    // A live lease or an already-dispatched revision stays the existing duplicate.
+    for (const persisted of [
+      { ...orphan, nativeDispatchLeaseUntil: Date.now() + 60_000 },
+      { ...orphan, nativeResponse: { invocationId: 'dispatched' } },
+      { ...orphan, nativeDispatchOwner: undefined },
+    ]) {
+      mockGetPersistedJob.mockResolvedValueOnce(persisted);
+      const res = await continueInput();
+      expect(res.body).toMatchObject({ streamId: 'retained-stream', duplicate: true });
+      expect(lastAgentId).toBeNull();
+    }
+
+    mockGetPersistedJob.mockResolvedValueOnce(orphan);
+    await continueInput();
+    expect(mockGetPersistedJob).toHaveBeenLastCalledWith('retained-stream');
+    expect(lastStreamId).toBe('retained-stream');
+    expect(mockInputService.ready).not.toHaveBeenCalled();
+    expect(mockLastPreparedBody.text).toBe('goal');
+    expect(mockLastInteractionContext).toMatchObject({ source_event_id: row.sourceEventId });
   });
 
   test('POST /source-order records the authenticated Telegram source before chat admission', async () => {
@@ -1393,7 +1919,7 @@ describe('/api/viventium/telegram', () => {
       role: 'USER',
       personalization: { orchestration_mode: 'parallel' },
     });
-    mockWaitForOrchestrationReadiness.mockResolvedValueOnce({
+    mockAuthoringOrchestrationReadiness.mockResolvedValueOnce({
       requested: true,
       available: false,
       status: 'unready',
@@ -1420,14 +1946,17 @@ describe('/api/viventium/telegram', () => {
 
     expect(res.statusCode).toBe(200);
     expect(req._viventiumParallelWorkTurnAvailable).toBe(false);
-    expect(mockWaitForOrchestrationReadiness).toHaveBeenCalledWith({
-      ownerId: 'user_1',
-    });
+    expect(mockAuthoringOrchestrationReadiness).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerId: 'user_1',
+        consumer: 'telegram',
+      }),
+    );
     expect(mockTelegramIngressCreate).toHaveBeenCalledTimes(1);
     expect(lastStreamId).not.toBeNull();
   });
 
-  test('POST validates one unchanged release gate away from the request event loop', async () => {
+  test('POST reuses operational owner authority without a release verifier subprocess', async () => {
     mockGetUserById.mockResolvedValueOnce({
       _id: 'user_1',
       role: 'USER',
@@ -1482,7 +2011,7 @@ describe('/api/viventium/telegram', () => {
   });
 
   test.each(['open', 'missing'])(
-    'POST keeps Main available and Parallel tools hidden when the release gate is %s',
+    'POST admits operational owner Parallel work when the release gate is %s',
     async (releaseState) => {
       mockGetUserById.mockResolvedValueOnce({
         _id: 'user_1',
@@ -1524,8 +2053,13 @@ describe('/api/viventium/telegram', () => {
       await dispatch(app, req, res);
 
       expect(res.statusCode).toBe(200);
-      expect(req._viventiumParallelWorkTurnAvailable).toBe(false);
-      expect(mockWaitForOrchestrationReadiness).not.toHaveBeenCalled();
+      expect(req._viventiumParallelWorkTurnAvailable).toBe(true);
+      expect(req._viventiumParallelWorkTurnClaim).toEqual(
+        expect.objectContaining({ available: true }),
+      );
+      expect(mockAuthoringOrchestrationReadiness).toHaveBeenCalledWith(
+        expect.objectContaining({ ownerId: 'user_1', consumer: 'telegram' }),
+      );
       expect(mockTelegramIngressCreate).toHaveBeenCalledTimes(1);
       expect(lastStreamId).not.toBeNull();
     },
@@ -1562,7 +2096,9 @@ describe('/api/viventium/telegram', () => {
 
     expect(res.statusCode).toBe(200);
     expect(req._viventiumParallelWorkTurnAvailable).toBe(false);
-    expect(mockWaitForOrchestrationReadiness).toHaveBeenCalledWith({ ownerId: 'user_1' });
+    expect(mockAuthoringOrchestrationReadiness).toHaveBeenCalledWith(
+      expect.objectContaining({ ownerId: 'user_1', consumer: 'telegram' }),
+    );
     expect(mockTelegramIngressCreate).toHaveBeenCalledTimes(1);
     expect(lastStreamId).not.toBeNull();
   });
@@ -1614,7 +2150,7 @@ describe('/api/viventium/telegram', () => {
             retryable: true,
           },
     );
-    expect(mockWaitForOrchestrationReadiness).not.toHaveBeenCalled();
+    expect(mockAuthoringOrchestrationReadiness).not.toHaveBeenCalled();
     expect(mockTelegramIngressCreate).not.toHaveBeenCalled();
   });
 
@@ -1678,7 +2214,7 @@ describe('/api/viventium/telegram', () => {
       role: 'USER',
       personalization: { orchestration_mode: 'parallel' },
     });
-    mockWaitForOrchestrationReadiness.mockResolvedValueOnce({
+    mockAuthoringOrchestrationReadiness.mockResolvedValueOnce({
       requested: false,
       available: false,
       status: 'disabled',
@@ -2165,6 +2701,539 @@ describe('/api/viventium/telegram', () => {
     );
   });
 
+  /* === VIVENTIUM START === Rapid inputs of one conversation join one turn in source order. === */
+  const postRetainedInput = async (row, text, extraBody = {}) => {
+    mockInputMessageRead = jest.fn(() => ({ select: () => ({ lean: async () => null }) }));
+    const app = createTestApp(require('../telegram')),
+      res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/telegram/chat',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: {
+          text,
+          conversationId: row.requestedConversationId,
+          conversationGeneration: row.conversationGeneration,
+          telegramUserId: row.telegramUserId,
+          telegramChatId: row.telegramChatId,
+          telegramMessageId: String(row.sourceSequence),
+          telegramMessageThreadId: row.telegramMessageThreadId,
+          inputClaim: { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+          ...extraBody,
+        },
+      }),
+      res,
+    );
+    return res;
+  };
+  test('a fresh input lets an earlier input finish preparing and joins the turn before it is ready', async () => {
+    const row = inputIdentity();
+    mockInputService.read.mockResolvedValue(row);
+    mockInputService.ready.mockResolvedValue({ ...row, state: 'ready' });
+    mockInputService.hasEarlierPreparingInput
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValue(false);
+    await postRetainedInput(row, 'Correction: use 80 booklets.');
+    expect(mockInputService.hasEarlierPreparingInput).toHaveBeenCalledTimes(3);
+    expect(mockRetainLogicalTurnInput).toHaveBeenCalledWith(
+      'user_1',
+      expect.objectContaining({
+        source_segments: expect.arrayContaining([
+          expect.objectContaining({ source_message_id: row.sourceMessageId }),
+        ]),
+      }),
+    );
+    expect(mockRetainLogicalTurnInput.mock.invocationCallOrder[0]).toBeLessThan(
+      mockInputService.ready.mock.invocationCallOrder[0],
+    );
+    expect(lastAgentId).not.toBeNull();
+  });
+  /* === VIVENTIUM START ===
+   * Purpose: a first admission keeps its quoted document's extracted text in the ready record for
+   * an identity-only continuation, and a deferred quoted input takes its own quote into the turn a
+   * newer unquoted input will combine.
+   * === VIVENTIUM END === */
+  const documentReplyPreparation = () => ({
+    message: {
+      message_id: 12,
+      date: 1700000000,
+      text: 'Is this still right?',
+      from: { id: 'tg-1', is_bot: false },
+      reply_to_message: {
+        message_id: 14390,
+        date: 1700000000,
+        caption: 'Rate card',
+        from: { id: 5550001, is_bot: true },
+        document: { file_id: 'doc-1', file_name: 'rates.pdf' },
+      },
+    },
+  });
+  test('a first admission keeps its quoted document text in the ready record', async () => {
+    const row = inputIdentity();
+    mockInputService.read.mockResolvedValue(row);
+    mockInputService.ready.mockResolvedValue({ ...row, state: 'ready' });
+    mockInputService.inputEnvelope.mockResolvedValue({
+      ...row,
+      preparation: documentReplyPreparation(),
+    });
+    await postRetainedInput(row, 'Is this still right?', {
+      replyContextV1: {
+        version: 1,
+        repliedTelegramMessageId: '14390',
+        quoteText: 'Rate card',
+        senderKind: 'assistant_candidate',
+        attachments: [
+          { kind: 'document', fileId: 'doc-1', extractedText: 'Willow 4.10 per booklet' },
+          { kind: 'document', fileId: 'doc-other', extractedText: 'Unrelated text' },
+        ],
+      },
+    });
+    expect(mockInputService.ready).toHaveBeenCalledWith(
+      'user_1',
+      expect.objectContaining({ sourceEventId: row.sourceEventId }),
+      expect.objectContaining({
+        quotedAttachmentTexts: [{ fileId: 'doc-1', extractedText: 'Willow 4.10 per booklet' }],
+      }),
+      [],
+    );
+  });
+  test('a deferred quoted input takes its own quote into the turn it will join', async () => {
+    mockReplyReceiptFindOne.mockImplementation(deliveredReceipt);
+    const row = inputIdentity();
+    mockInputService.read.mockResolvedValue(row);
+    mockInputService.ready.mockResolvedValue({ ...row, state: 'ready' });
+    mockInputService.hasNewerUnresolvedInput.mockResolvedValue(true);
+    mockInputService.inputEnvelope.mockResolvedValue({
+      ...row,
+      preparation: {
+        message: {
+          message_id: 12,
+          date: 1700000000,
+          text: 'Does it still fit?',
+          from: { id: 'tg-1', is_bot: false },
+          reply_to_message: {
+            message_id: 14382,
+            date: 1700000000,
+            text: 'Willow fits 450 with 8 left.',
+            from: { id: 5550001, is_bot: true },
+          },
+        },
+      },
+    });
+    mockObserveSourceOrder.mockResolvedValue({
+      latest_source_sequence: row.sourceSequence + 1,
+      observed_at: 1_725_000_000_000,
+      stale: true,
+    });
+    const res = await postRetainedInput(row, 'Does it still fit?');
+
+    expect(res.statusCode).toBe(202);
+    const retained = mockRetainLogicalTurnInput.mock.calls[0][1];
+    expect(retained.source_segments[0]).toMatchObject({
+      source_event_id: row.sourceEventId,
+      reply_context: {
+        provenanceStatus: 'verified',
+        repliedTelegramMessageId: '14382',
+        quoteText: 'Willow fits 450 with 8 left.',
+        logicalMessageId: 'main-answer',
+      },
+    });
+  });
+  const turnOwner = async () => {
+    const { GenerationJobManagerClass, InMemoryEventTransport, InMemoryJobStore } =
+      jest.requireActual('@librechat/api');
+    const jobStore = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const manager = new GenerationJobManagerClass({
+      jobStore,
+      eventTransport: new InMemoryEventTransport(),
+      cleanupOnComplete: false,
+    });
+    await manager.initialize();
+    return { manager, jobStore };
+  };
+  test('a deferred quoted input reaches Main with its quote when an unquoted successor claims the turn', async () => {
+    const {
+      bindLogicalTurnContext,
+      buildTelegramSourceEventId,
+      getTrustedAdapterCapabilities,
+      getTrustedInteractionContext,
+      setTrustedInteractionContext,
+    } = require('~/server/services/viventium/interactionContext');
+    mockReplyReceiptFindOne.mockImplementation(deliveredReceipt);
+    const quoted = inputIdentity();
+    const successor = {
+      ...inputIdentity(),
+      sourceSequence: 13,
+      sourceEventId: buildTelegramSourceEventId({
+        source_order_scope: quoted.sourceOrderScope,
+        source_sequence: 13,
+      }),
+      sourceMessageId: 'source-message-successor',
+    };
+    const telegramMessage = (row, text, extra = {}) => ({
+      message: {
+        message_id: row.sourceSequence,
+        date: 1700000000,
+        text,
+        from: { id: 'tg-1', is_bot: false },
+        ...extra,
+      },
+    });
+    const admit = async (row, text, preparation, newer) => {
+      mockInputService.read.mockResolvedValue(row);
+      mockInputService.ready.mockResolvedValue({ ...row, state: 'ready' });
+      mockInputService.hasNewerUnresolvedInput.mockResolvedValue(newer);
+      mockInputService.inputEnvelope.mockResolvedValue({ ...row, preparation });
+      mockObserveSourceOrder.mockResolvedValue({
+        latest_source_sequence: successor.sourceSequence,
+        observed_at: 1_725_000_000_000,
+        stale: newer,
+      });
+      return postRetainedInput(row, text);
+    };
+
+    // The route defers the quoted input to its newer unanswered successor.
+    const quotedText = 'Copy only the two totals from this quoted answer.';
+    const deferredRes = await admit(
+      quoted,
+      quotedText,
+      telegramMessage(quoted, quotedText, {
+        reply_to_message: {
+          message_id: 14382,
+          date: 1700000000,
+          text: 'Willow fits 450 with 8 left.',
+          from: { id: 5550001, is_bot: true },
+        },
+      }),
+      true,
+    );
+    expect(deferredRes.statusCode).toBe(202);
+    expect(lastAgentId).toBeNull();
+    const deferred = mockRetainLogicalTurnInput.mock.calls[0][1];
+
+    // The route admits the unquoted successor to Main with its own adapter capabilities.
+    const successorText = 'Also subtract the smaller from the larger, using that quoted answer.';
+    await admit(successor, successorText, telegramMessage(successor, successorText), false);
+    expect(lastAgentId).not.toBeNull();
+    const admitted = mockLastInteractionContext;
+    const capabilities = mockLastAdapterCapabilities;
+    expect(capabilities).toMatchObject({ supersede_scope: 'response_only' });
+    expect(admitted.reply_context).toBeUndefined();
+
+    // The turn owner claims, admits and commits the successor's turn with the deferred input
+    // still pending; at its generation handoff Main commits authorship and binds that context,
+    // the way request.js does.
+    const { manager, jobStore } = await turnOwner();
+    await jobStore.retainLogicalTurnInput('user_1', deferred);
+    await manager.createJob('successor-stream', 'user_1', admitted.conversation_id, {
+      interactionContext: admitted,
+      adapterCapabilities: capabilities,
+      deliveryPolicy: mockLastDeliveryPolicy,
+    });
+    const authored = await manager.commitLogicalTurnAuthor('successor-stream', 'user_1');
+    const req = {};
+    setTrustedInteractionContext(req, admitted, capabilities);
+    expect(bindLogicalTurnContext(req, authored)).toMatchObject({
+      source_event_id: successor.sourceEventId,
+      revision: authored.revision,
+    });
+
+    // Main's turn context carries the deferred input's quote under its source label.
+    const {
+      buildTurnReplyContextCapsules,
+    } = require('~/server/services/viventium/ViventiumTurnReplyContext');
+    const {
+      buildSourceSelectionCapsule,
+    } = require('~/server/services/viventium/ViventiumSourceSelectionContext');
+    const replyCapsules = buildTurnReplyContextCapsules(
+      getTrustedInteractionContext(req),
+      getTrustedAdapterCapabilities(req),
+    );
+    const quotes = replyCapsules
+      .split('\n')
+      .filter((line) => line.includes('"replied_telegram_message_id"'))
+      .map((line) => JSON.parse(line));
+    expect(quotes).toEqual([
+      expect.objectContaining({
+        source_label: 'S1',
+        replied_telegram_message_id: '14382',
+        logical_message_id: 'main-answer',
+        quote_text: 'Willow fits 450 with 8 left.',
+      }),
+    ]);
+    const selection = buildSourceSelectionCapsule(req);
+    const encoded = selection.split('\n').find((line) => /^[A-Za-z0-9_-]+$/.test(line));
+    expect(
+      JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')).sources.map(
+        (source) => source.label,
+      ),
+    ).toEqual(['S1', 'S2']);
+    expect(selection).not.toContain('owns only the current accepted input');
+    await manager.destroy();
+  });
+  test('an older quoted input that loses its admission race reaches the winning Main with its quote', async () => {
+    const {
+      bindLogicalTurnContext,
+      buildTelegramSourceEventId,
+      getTrustedAdapterCapabilities,
+      getTrustedInteractionContext,
+      setTrustedInteractionContext,
+    } = require('~/server/services/viventium/interactionContext');
+    mockReplyReceiptFindOne.mockImplementation(deliveredReceipt);
+    const older = inputIdentity();
+    const newer = {
+      ...inputIdentity(),
+      sourceSequence: 13,
+      sourceEventId: buildTelegramSourceEventId({
+        source_order_scope: older.sourceOrderScope,
+        source_sequence: 13,
+      }),
+      sourceMessageId: 'source-message-newer',
+    };
+    const admitToMain = async (row, text, extra = {}) => {
+      mockInputService.read.mockResolvedValue(row);
+      mockInputService.ready.mockResolvedValue({ ...row, state: 'ready' });
+      mockInputService.hasNewerUnresolvedInput.mockResolvedValue(false);
+      mockInputService.inputEnvelope.mockResolvedValue({
+        ...row,
+        preparation: {
+          message: {
+            message_id: row.sourceSequence,
+            date: 1700000000,
+            text,
+            from: { id: 'tg-1', is_bot: false },
+            ...extra,
+          },
+        },
+      });
+      mockObserveSourceOrder.mockResolvedValue({
+        latest_source_sequence: row.sourceSequence,
+        observed_at: 1_725_000_000_000,
+        stale: false,
+      });
+      lastAgentId = null;
+      await postRetainedInput(row, text);
+      expect(lastAgentId).not.toBeNull();
+      return { context: mockLastInteractionContext, capabilities: mockLastAdapterCapabilities };
+    };
+
+    // The route admits both inputs to Main; the older one carries the quote.
+    const quotedText = 'Copy only the two totals from this quoted answer.';
+    const olderAdmission = await admitToMain(older, quotedText, {
+      reply_to_message: {
+        message_id: 14382,
+        date: 1700000000,
+        text: 'Willow fits 450 with 8 left.',
+        from: { id: 5550001, is_bot: true },
+      },
+    });
+    const newerAdmission = await admitToMain(
+      newer,
+      'Also subtract the smaller from the larger, using that quoted answer.',
+    );
+    expect(newerAdmission.capabilities).toMatchObject({ supersede_scope: 'response_only' });
+
+    // The older reservation is still admitting when the newer admission commits.
+    const { manager, jobStore } = await turnOwner();
+    const createJob = jobStore.createJob.bind(jobStore);
+    let releaseOlder;
+    const olderReleased = new Promise((resolve) => {
+      releaseOlder = resolve;
+    });
+    let markOlderReserved;
+    const olderReserved = new Promise((resolve) => {
+      markOlderReserved = resolve;
+    });
+    jest.spyOn(jobStore, 'createJob').mockImplementationOnce(async (...args) => {
+      markOlderReserved();
+      await olderReleased;
+      return createJob(...args);
+    });
+    const admit = async (streamId, { context, capabilities }) => {
+      await manager.createJob(streamId, 'user_1', context.conversation_id, {
+        interactionContext: context,
+        adapterCapabilities: capabilities,
+        deliveryPolicy: mockLastDeliveryPolicy,
+      });
+      return manager.commitLogicalTurnAuthor(streamId, 'user_1');
+    };
+    await manager.observeSourceOrder({
+      source_order_scope: older.sourceOrderScope,
+      source_sequence: older.sourceSequence,
+    });
+    const olderJob = admit('older-stream', olderAdmission);
+    await olderReserved;
+    await manager.observeSourceOrder({
+      source_order_scope: older.sourceOrderScope,
+      source_sequence: newer.sourceSequence,
+    });
+    const authored = await admit('newer-stream', newerAdmission);
+    releaseOlder();
+    await expect(olderJob).rejects.toMatchObject({ code: 'source_order_superseded' });
+
+    // The winning Main owns the older input and receives its quote under its source label.
+    const req = {};
+    setTrustedInteractionContext(req, newerAdmission.context, newerAdmission.capabilities);
+    bindLogicalTurnContext(req, authored);
+    const {
+      buildTurnReplyContextCapsules,
+    } = require('~/server/services/viventium/ViventiumTurnReplyContext');
+    const {
+      buildSourceSelectionCapsule,
+    } = require('~/server/services/viventium/ViventiumSourceSelectionContext');
+    const quotes = buildTurnReplyContextCapsules(
+      getTrustedInteractionContext(req),
+      getTrustedAdapterCapabilities(req),
+    )
+      .split('\n')
+      .filter((line) => line.includes('"replied_telegram_message_id"'))
+      .map((line) => JSON.parse(line));
+    expect(quotes).toEqual([
+      expect.objectContaining({
+        source_label: 'S1',
+        replied_telegram_message_id: '14382',
+        quote_text: 'Willow fits 450 with 8 left.',
+      }),
+    ]);
+    const selection = buildSourceSelectionCapsule(req);
+    const encoded = selection.split('\n').find((line) => /^[A-Za-z0-9_-]+$/.test(line));
+    expect(
+      JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')).sources.map(
+        (source) => source.label,
+      ),
+    ).toEqual(['S1', 'S2']);
+    await manager.destroy();
+  });
+  /* === VIVENTIUM END === */
+  test('a stale earlier input joins the turn and defers to its newer unanswered source', async () => {
+    const row = inputIdentity();
+    mockInputService.read.mockResolvedValue(row);
+    mockInputService.ready.mockResolvedValue({ ...row, state: 'ready' });
+    mockInputService.hasNewerUnresolvedInput.mockResolvedValue(true);
+    mockObserveSourceOrder.mockResolvedValue({
+      latest_source_sequence: row.sourceSequence + 1,
+      observed_at: 1_725_000_000_000,
+      stale: true,
+    });
+    const res = await postRetainedInput(row, 'Compare the original quotes.');
+    expect(mockRetainLogicalTurnInput).toHaveBeenCalledTimes(1);
+    expect(mockInputService.hasNewerUnresolvedInput).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceEventId: row.sourceEventId }),
+    );
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toMatchObject({ code: 'source_input_pending', pending: true });
+    expect(mockInputService.defer).toHaveBeenCalledWith('user_1', {
+      sourceEventId: row.sourceEventId,
+      claimToken: row.claimToken,
+    });
+    expect(lastAgentId).toBeNull();
+  });
+  const recoverStaleInput = async (row, source = null) => {
+    mockInputService.read.mockResolvedValue({ ...row, state: 'ready' });
+    mockInputService.ready.mockResolvedValue({ ...row, state: 'ready' });
+    mockInputService.inputEnvelope.mockResolvedValue({
+      ...row,
+      preparation: { message: { date: 1700000000 } },
+    });
+    mockInputService.readPrepared.mockResolvedValue({
+      text: 'Compare the original quotes.',
+      fileIds: [],
+      imageUrls: [],
+    });
+    mockObserveSourceOrder.mockResolvedValue({
+      latest_source_sequence: row.sourceSequence + 1,
+      observed_at: 1_725_000_000_000,
+      stale: true,
+    });
+    mockGetConvo.mockResolvedValue({
+      conversationId: row.conversationId,
+      endpoint: 'agents',
+      agent_id: 'agent_default',
+    });
+    mockGetMessages.mockResolvedValue([]);
+    mockInputMessageRead = jest.fn(() => ({ select: () => ({ lean: async () => source }) }));
+    const app = createTestApp(require('../telegram')),
+      res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/telegram/inputs/continue',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: {
+          telegramUserId: 'tg-1',
+          inputClaim: { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+        },
+      }),
+      res,
+    );
+    return res;
+  };
+  test('an earlier input a newer completed answer did not cover records a typed failure, not a standalone answer', async () => {
+    const row = inputIdentity();
+    mockInputService.hasNewerCompletedInput.mockResolvedValue(true);
+    mockInputService.hasCommittedDelivery.mockResolvedValue(false);
+    const res = await recoverStaleInput(row);
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toMatchObject({ code: 'source_order_superseded', superseded: true });
+    expect(mockInputService.status).toHaveBeenCalledWith(
+      'user_1',
+      { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+      'failed',
+      'source_input_uncovered',
+      false,
+    );
+    expect(mockInputService.defer).not.toHaveBeenCalled();
+    expect(lastAgentId).toBeNull();
+  });
+  test('an earlier input whose newer carrier was admitted and then failed records a typed failure, not a standalone answer', async () => {
+    const row = inputIdentity();
+    mockInputService.hasNewerFailedAdmittedInput.mockResolvedValue(true);
+    const res = await recoverStaleInput(row);
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toMatchObject({ code: 'source_order_superseded', superseded: true });
+    expect(mockInputService.status).toHaveBeenCalledWith(
+      'user_1',
+      { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+      'failed',
+      'source_input_uncovered',
+      false,
+    );
+    expect(mockInputService.defer).not.toHaveBeenCalled();
+    expect(lastAgentId).toBeNull();
+  });
+  test('a recovered input whose source parent is unchanged never edits its native-fenced source', async () => {
+    const row = inputIdentity();
+    const source = {
+      parentMessageId: 'original-answer',
+      metadata: { viventium: { telegramInput: { originalParentMessageId: 'original-answer' } } },
+    };
+    await recoverStaleInput(row, source);
+    // A live native answer of a newer input descends from this source; a no-op re-anchor through
+    // the native source fence would revoke it.
+    expect(mockMutateNativeResponseSources).not.toHaveBeenCalled();
+    expect(lastParentMessageId).toBe('original-answer');
+    await recoverStaleInput(row, { ...source, parentMessageId: 'another-parent' });
+    expect(mockMutateNativeResponseSources).toHaveBeenCalledTimes(1);
+    expect(mockMutateNativeResponseSources).toHaveBeenCalledWith(
+      mockInputService.messageFilter(row),
+      expect.any(Function),
+    );
+  });
+  test('an earlier input whose committed coverage names it settles through that coverage', async () => {
+    const row = inputIdentity();
+    mockInputService.hasNewerCompletedInput.mockResolvedValue(true);
+    mockInputService.hasCommittedDelivery.mockResolvedValue(true);
+    const res = await recoverStaleInput(row);
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toMatchObject({ code: 'source_input_pending', pending: true });
+    expect(mockInputService.defer).toHaveBeenCalledTimes(1);
+    expect(mockInputService.status).not.toHaveBeenCalled();
+    expect(lastAgentId).toBeNull();
+  });
+  /* === VIVENTIUM END === */
+
   test.each([false, true])(
     'retained attachment rejection settles only a typed permanent failure (%s)',
     async (permanent) => {
@@ -2210,6 +3279,8 @@ describe('/api/viventium/telegram', () => {
           { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
           'failed',
           'unsupported_file_type',
+          false,
+          [],
         );
         expect(res.body).toMatchObject({ code: 'unsupported_file_type', retryable: false });
       } else expect(mockInputService.status).not.toHaveBeenCalled();
@@ -2217,6 +3288,157 @@ describe('/api/viventium/telegram', () => {
       expect(lastAgentId).toBeNull();
     },
   );
+
+  test('permanent grouped upload failure passes every exact source claim to one lifecycle settlement', async () => {
+    const row = inputIdentity();
+    const inputClaims = [
+      { sourceEventId: 'b'.repeat(64), claimToken: '22222222-2222-4222-8222-222222222222' },
+      { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+    ];
+    mockInputService.read.mockResolvedValue(row);
+    mockProcessAgentFileUpload.mockRejectedValueOnce(
+      Object.assign(new Error('Unsupported group member'), {
+        code: 'unsupported_file_type',
+        status: 415,
+        retryable: false,
+      }),
+    );
+    const app = createTestApp(require('../telegram'));
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/telegram/chat',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: {
+          text: 'Review this upload group',
+          conversationId: row.requestedConversationId,
+          conversationGeneration: row.conversationGeneration,
+          telegramUserId: row.telegramUserId,
+          telegramChatId: row.telegramChatId,
+          telegramMessageId: String(row.sourceSequence),
+          telegramMessageThreadId: row.telegramMessageThreadId,
+          inputClaim: { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+          inputClaims,
+          files: [
+            {
+              filename: 'attachment.bin',
+              mime_type: 'application/octet-stream',
+              data: Buffer.from('synthetic bytes').toString('base64'),
+            },
+          ],
+        },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(415);
+    expect(mockInputService.status).toHaveBeenCalledTimes(1);
+    expect(mockInputService.status).toHaveBeenCalledWith(
+      'user_1',
+      { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+      'failed',
+      'unsupported_file_type',
+      false,
+      inputClaims,
+    );
+    expect(mockInputService.ready).not.toHaveBeenCalled();
+    expect(lastAgentId).toBeNull();
+  });
+
+  test.each(['source_input_group_failed', 'source_input_group_conflict'])(
+    'retained group ready rejection has one non-retryable attachment result (%s)',
+    async (code) => {
+      const row = { ...inputIdentity(), mediaGroupId: 'synthetic-group' };
+      mockInputService.read.mockResolvedValue(row);
+      mockInputService.ready.mockRejectedValueOnce(
+        Object.assign(new Error('The saved input changed; retry from its current state.'), {
+          code,
+          statusCode: 409,
+          body: { code, retryable: true },
+        }),
+      );
+
+      const res = await postRetainedInput(row, 'Review this upload group.');
+
+      expect(res.statusCode).toBe(409);
+      expect(res.body).toEqual({
+        attachmentProcessingError: true,
+        code,
+        retryable: false,
+        error: 'This attachment group was not accepted. Please resend the whole group.',
+      });
+      expect(res.json).toHaveBeenCalledTimes(1);
+      expect(mockInputService.ready).toHaveBeenCalledTimes(1);
+      if (code === 'source_input_group_conflict') {
+        expect(mockInputService.status).toHaveBeenCalledTimes(1);
+        expect(mockInputService.status).toHaveBeenCalledWith(
+          'user_1',
+          { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+          'failed',
+          code,
+          false,
+          [{ sourceEventId: row.sourceEventId, claimToken: row.claimToken }],
+        );
+      } else {
+        expect(mockInputService.status).not.toHaveBeenCalled();
+      }
+      expect(mockInputService.bindStream).not.toHaveBeenCalled();
+      expect(lastAgentId).toBeNull();
+    },
+  );
+
+  test.each(['source_input_claim_conflict', 'source_input_claim_expired'])(
+    'a refused group conflict settlement preserves the exact status guard (%s)',
+    async (code) => {
+      const row = { ...inputIdentity(), mediaGroupId: 'synthetic-group' };
+      const error = Object.assign(new Error('The saved input changed.'), { code, statusCode: 409 });
+      mockInputService.read.mockResolvedValue(row);
+      mockInputService.ready.mockRejectedValueOnce(
+        Object.assign(new Error('Conflicting source group.'), {
+          code: 'source_input_group_conflict',
+          statusCode: 409,
+        }),
+      );
+      mockInputService.status.mockRejectedValueOnce(error);
+
+      await expect(
+        postRetainedInput(row, 'Review this upload group.', {
+          inputClaims: [{ sourceEventId: 'f'.repeat(64), claimToken: 'foreign-claim' }],
+        }),
+      ).rejects.toBe(error);
+
+      expect(mockInputService.status).toHaveBeenCalledWith(
+        'user_1',
+        { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+        'failed',
+        'source_input_group_conflict',
+        false,
+        [{ sourceEventId: row.sourceEventId, claimToken: row.claimToken }],
+      );
+      expect(mockInputService.bindStream).not.toHaveBeenCalled();
+      expect(lastAgentId).toBeNull();
+    },
+  );
+
+  test.each([
+    'source_input_claim_expired',
+    'source_input_owner_changed',
+    'source_input_already_admitted',
+  ])('other retained ready rejections preserve their original guard (%s)', async (code) => {
+    const row = inputIdentity();
+    const error = Object.assign(
+      new Error('The saved input changed; retry from its current state.'),
+      { code, statusCode: 409, body: { code, retryable: true } },
+    );
+    mockInputService.read.mockResolvedValue(row);
+    mockInputService.ready.mockRejectedValueOnce(error);
+
+    await expect(postRetainedInput(row, 'Review this upload.')).rejects.toBe(error);
+
+    expect(mockInputService.status).not.toHaveBeenCalled();
+    expect(mockInputService.bindStream).not.toHaveBeenCalled();
+    expect(lastAgentId).toBeNull();
+  });
 
   test('POST injects extracted document images from Telegram file uploads into the vision payload', async () => {
     const telegramRouter = require('../telegram');
@@ -2590,11 +3812,40 @@ describe('/api/viventium/telegram', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(200);
-    expect(mockResolveUserVoiceRoute).toHaveBeenCalledWith('user_1');
+    expect(mockResolveUserVoiceRoute).toHaveBeenCalledWith('user_1', { includeSources: true });
     expect(res.body.voiceRoute).toEqual({
       stt: { provider: 'assemblyai', variant: 'universal-streaming' },
       tts: { provider: 'cartesia', variant: '6ccbfb76-1fc6-48f7-b71d-91ac6298247b' },
     });
+  });
+
+  test('GET /voice-route carries only authenticated owner conversation keyterms', async () => {
+    mockResolveVoiceContextKeyterms.mockResolvedValueOnce(['Example Meeting']);
+    const app = createTestApp(require('../telegram'));
+    const req = createMockReq({
+      method: 'GET', url: '/api/viventium/telegram/voice-route',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { telegramUserId: 'tg-1', conversationId: 'conversation-topic', userId: 'forged-owner' },
+    });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.statusCode).toBe(200);
+    expect(mockResolveVoiceContextKeyterms).toHaveBeenCalledWith({
+      userId: 'user_1', conversationId: 'conversation-topic',
+    });
+    expect(res.body.voiceRoute.contextualKeyterms).toEqual(['Example Meeting']);
+  });
+
+  test('GET /voice-route rejects unauthenticated contextual lookup', async () => {
+    const app = createTestApp(require('../telegram'));
+    const req = createMockReq({
+      method: 'GET', url: '/api/viventium/telegram/voice-route',
+      query: { telegramUserId: 'tg-1', conversationId: 'conversation-topic' },
+    });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.statusCode).toBe(401);
+    expect(mockResolveVoiceContextKeyterms).not.toHaveBeenCalled();
   });
 
   test('GET /voice-route returns xAI voice variants for Telegram TTS parity', async () => {
@@ -2616,7 +3867,7 @@ describe('/api/viventium/telegram', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(200);
-    expect(mockResolveUserVoiceRoute).toHaveBeenCalledWith('user_1');
+    expect(mockResolveUserVoiceRoute).toHaveBeenCalledWith('user_1', { includeSources: true });
     expect(res.body.voiceRoute).toEqual({
       stt: { provider: 'pywhispercpp', variant: 'base.en' },
       tts: { provider: 'xai', variant: 'Rex' },
@@ -2944,7 +4195,7 @@ describe('/api/viventium/telegram', () => {
     expect(res.headers['Cache-Control']).toContain('no-store');
   });
 
-  test('GET and PATCH expose fully-gated explicit local QA without claiming readiness', async () => {
+  test('GET and PATCH expose operational owner readiness independently of local QA certification', async () => {
     writeReleaseSnapshot({
       mode: 'local-qa',
       label: 'PRE-GATE / NOT READY',
@@ -2970,16 +4221,7 @@ describe('/api/viventium/telegram', () => {
     await dispatch(app, readReq, readRes);
 
     expect(readRes.statusCode).toBe(200);
-    expect(readRes.body).toEqual(
-      expect.objectContaining({
-        available: true,
-        mode: 'parallel',
-        releaseGate: {
-          label: 'PRE-GATE / NOT READY',
-          blockers: expect.arrayContaining(['local_qa_override_active']),
-        },
-      }),
-    );
+    expect(readRes.body).toEqual({ available: true, mode: 'parallel', hasKnownWork: false });
 
     const writeReq = createMockReq({
       method: 'PATCH',
@@ -2990,20 +4232,11 @@ describe('/api/viventium/telegram', () => {
     const writeRes = createMockRes();
     await dispatch(app, writeReq, writeRes);
     expect(writeRes.statusCode).toBe(200);
-    expect(writeRes.body).toEqual(
-      expect.objectContaining({
-        available: true,
-        mode: 'parallel',
-        releaseGate: {
-          label: 'PRE-GATE / NOT READY',
-          blockers: expect.arrayContaining(['local_qa_override_active']),
-        },
-      }),
-    );
+    expect(writeRes.body).toEqual({ available: true, mode: 'parallel', hasKnownWork: false });
     expect(mockUpdateOrchestrationPreferences).toHaveBeenCalledTimes(1);
   });
 
-  test('GET and PATCH allow explicit pre-gate local QA while a release gate remains open', async () => {
+  test('GET and PATCH preserve operational owner readiness while a release gate remains open', async () => {
     const gate = openGate('PWK-UC-014');
     const gates = validGates().map((item) => (item.case_id === gate.case_id ? gate : item));
     writeReleaseSnapshot({
@@ -3034,16 +4267,7 @@ describe('/api/viventium/telegram', () => {
 
     await dispatch(app, readReq, readRes);
 
-    expect(readRes.body).toEqual(
-      expect.objectContaining({
-        available: true,
-        mode: 'parallel',
-        releaseGate: {
-          label: 'PRE-GATE / NOT READY',
-          blockers: expect.arrayContaining(['PWK-UC-014']),
-        },
-      }),
-    );
+    expect(readRes.body).toEqual({ available: true, mode: 'parallel', hasKnownWork: false });
 
     const writeReq = createMockReq({
       method: 'PATCH',
@@ -3055,16 +4279,7 @@ describe('/api/viventium/telegram', () => {
     await dispatch(app, writeReq, writeRes);
 
     expect(writeRes.statusCode).toBe(200);
-    expect(writeRes.body).toEqual(
-      expect.objectContaining({
-        available: true,
-        mode: 'parallel',
-        releaseGate: {
-          label: 'PRE-GATE / NOT READY',
-          blockers: expect.arrayContaining(['PWK-UC-014']),
-        },
-      }),
-    );
+    expect(writeRes.body).toEqual({ available: true, mode: 'parallel', hasKnownWork: false });
     expect(mockUpdateOrchestrationPreferences).toHaveBeenCalledTimes(1);
   });
 
@@ -3090,6 +4305,35 @@ describe('/api/viventium/telegram', () => {
       mode: 'focused',
     });
     expect(mockRequestAccountApi).not.toHaveBeenCalled();
+  });
+
+  test('GET preserves the saved Parallel preference and known work during an owner outage', async () => {
+    process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'false';
+    fs.unlinkSync(releasePath);
+    mockGetUserById.mockResolvedValue({
+      _id: 'user_1',
+      role: 'USER',
+      personalization: { orchestration_mode: 'parallel', parallel_work_known: true },
+    });
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/telegram/orchestration?telegramUserId=tg-1',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: { telegramUserId: 'tg-1' },
+    });
+    const res = createMockRes();
+
+    await dispatch(app, req, res);
+
+    expect(res.body).toEqual({
+      available: false,
+      mode: 'parallel',
+      hasKnownWork: true,
+      releaseGate: { label: 'NOT READY', blockers: ['operational_readiness_unavailable'] },
+    });
+    expect(mockUpdateOrchestrationPreferences).not.toHaveBeenCalled();
   });
 
   test('PATCH orchestration refreshes stale readiness before rejecting a linked enable', async () => {
@@ -3207,6 +4451,29 @@ describe('/api/viventium/telegram', () => {
         },
       },
     });
+  });
+
+  test('POST native owner input preserves the exact response and pending ACK under normal linked auth', async () => {
+    const nativeInput = { version: 1, requestId: 'permission-1', requestFingerprint: 'a'.repeat(64), action: 'accept', content: { optionId: 'reject_once' } };
+    mockRequestAccountApi.mockResolvedValue({ status: 'pending', confirmationPending: true });
+    const req = createMockReq({ url: '/api/viventium/telegram/orchestration/work/ghw_test/actions', headers: { 'x-viventium-telegram-secret': 'telegram_secret' }, body: { telegramUserId: 'tg-1', action: 'resume', operationId: '018f47d3-8965-7f6a-a826-7c06afedc003', nativeInput } });
+    const res = createMockRes();
+    await dispatch(createTestApp(require('../telegram')), req, res);
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toEqual({ status: 'pending', confirmationPending: true });
+    expect(mockRequestAccountApi).toHaveBeenLastCalledWith(expect.objectContaining({ ownerId: 'user_1', ownerNativeInput: nativeInput, body: expect.objectContaining({ action: 'resume', nativeInput }) }));
+  });
+
+  test.each([
+    { action: 'stop', nativeInput: { version: 1, requestId: 'permission-1', requestFingerprint: 'a'.repeat(64), action: 'decline' } },
+    { action: 'resume', nativeInput: { version: 1, requestId: 'permission-1', requestFingerprint: 'foreign', action: 'decline' } },
+    { action: 'resume', ownerInputControl: true },
+  ])('POST rejects forged or incompatible native owner input %#', async (body) => {
+    const req = createMockReq({ url: '/api/viventium/telegram/orchestration/work/ghw_test/actions', headers: { 'x-viventium-telegram-secret': 'telegram_secret' }, body: { telegramUserId: 'tg-1', operationId: '018f47d3-8965-7f6a-a826-7c06afedc003', ...body } });
+    const res = createMockRes();
+    await dispatch(createTestApp(require('../telegram')), req, res);
+    expect(res.statusCode).toBe(400);
+    expect(mockRequestAccountApi).not.toHaveBeenCalled();
   });
 
   test('POST orchestration dismiss cannot bypass unsettled Core delivery truth', async () => {
@@ -3700,6 +4967,7 @@ describe('/api/viventium/telegram', () => {
         status: 'delivery_unknown',
         dispatchPermit: { permitId: 'a'.repeat(32), permitGeneration: 2 },
         reason: 'telegram_receipt_missing_after_send',
+        telegramMessageIds: ['701'],
       },
     });
     const res = createMockRes();
@@ -3712,6 +4980,7 @@ describe('/api/viventium/telegram', () => {
       claimId: 'claim-unknown',
       dispatchPermit: { permitId: 'a'.repeat(32), permitGeneration: 2 },
       reason: 'telegram_receipt_missing_after_send',
+      telegramMessageIds: ['701'],
     });
   });
 
@@ -3916,4 +5185,34 @@ Holding Examples
     expect(Buffer.concat(res.chunks).toString('utf-8')).toBe('code-bytes');
     expect(mockLoadAuthValues).toHaveBeenCalled();
   });
+  /* === VIVENTIUM START: Preserve the shared public stream failure contract. === */
+
+  test.each(['source_context_unavailable', undefined])(
+    'GET stream preserves optional typed generation failure %s',
+    async (errorClass) => {
+      const error = 'The conversation context could not be preserved. Please retry this turn.';
+      mockSubscribe.mockImplementation(async (_id, _event, _done, onError) => {
+        onError(error, errorClass);
+        return { unsubscribe: jest.fn() };
+      });
+      const app = createTestApp(require('../telegram'));
+      const req = createMockReq({
+        method: 'GET',
+        url: '/api/viventium/telegram/stream/typed-failure?telegramUserId=tg-1',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        query: { telegramUserId: 'tg-1' },
+      });
+      const res = createMockRes();
+      await dispatch(app, req, res);
+      const errorFrames = res.write.mock.calls
+        .map(([value]) => value)
+        .filter((value) => value.startsWith('event: error\ndata: '));
+      expect(errorFrames).toHaveLength(1);
+      expect(JSON.parse(errorFrames[0].slice('event: error\ndata: '.length))).toEqual({
+        error,
+        ...(errorClass ? { error_class: errorClass } : {}),
+      });
+    },
+  );
+  /* === VIVENTIUM END === */
 });

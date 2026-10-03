@@ -1,5 +1,78 @@
 import { ContentTypes } from 'librechat-data-provider';
-import type { TMessageContentParts } from 'librechat-data-provider';
+import type { TMessage, TMessageContentParts } from 'librechat-data-provider';
+
+/* === VIVENTIUM START ===
+ * The native hydrated-media formatter needs authored text as a string. Keep its media bytes and
+ * unknown content intact; the existing legacy coercer owns persisted text shapes.
+ */
+type HydratedUserMessage = Pick<Partial<TMessage>, 'sender'> & {
+  role?: string;
+  content?:
+    | string
+    | readonly (
+        | string
+        | {
+            type?: string;
+            text?: unknown;
+            input_text?: unknown;
+            output_text?: unknown;
+          }
+      )[];
+  image_urls?: readonly object[];
+  documents?: readonly object[];
+  audios?: readonly object[];
+  videos?: readonly object[];
+};
+const nativeMediaFields = {
+  image_url: 'image_urls',
+  file: 'documents',
+  input_audio: 'audios',
+  video: 'videos',
+} as const;
+type NativeMediaField = (typeof nativeMediaFields)[keyof typeof nativeMediaFields];
+
+export function normalizeHydratedMediaText<T extends HydratedUserMessage | null | undefined>(
+  message: T,
+  coerceText: (text: unknown) => string,
+): T {
+  const role =
+    message?.role ??
+    (typeof message?.sender === 'string' && message.sender.toLowerCase() === 'user'
+      ? 'user'
+      : 'assistant');
+  if (
+    role !== 'user' ||
+    !Array.isArray(message?.content) ||
+    ![message.image_urls, message.documents, message.audios, message.videos].some(
+      (media) => media?.length,
+    )
+  ) {
+    return message;
+  }
+  const text: string[] = [];
+  const carried: Partial<Pick<HydratedUserMessage, NativeMediaField>> = {};
+  for (const part of message.content) {
+    if (typeof part === 'string') {
+      if (part) text.push(part);
+      continue;
+    }
+    if (![ContentTypes.TEXT, 'input_text', 'output_text'].includes(part?.type)) {
+      if (!Object.prototype.hasOwnProperty.call(nativeMediaFields, part?.type ?? '')) return message;
+      const field = nativeMediaFields[part?.type as keyof typeof nativeMediaFields];
+      if (!field || !part || typeof part !== 'object') return message;
+      const media = carried[field] ?? message[field] ?? [];
+      const bytes = JSON.stringify(part);
+      if (!media.some((item) => item === part || JSON.stringify(item) === bytes)) {
+        carried[field] = [...media, part];
+      }
+      continue;
+    }
+    const value = coerceText(part.text ?? part.input_text ?? part.output_text);
+    if (value) text.push(value);
+  }
+  return { ...message, ...carried, content: text.join('\n') };
+}
+/* === VIVENTIUM END === */
 
 /**
  * Filters out malformed tool call content parts that don't have the required tool_call property.

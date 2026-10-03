@@ -165,6 +165,24 @@ export function createServiceAssertion({
   return `${encoded}.${signature}`;
 }
 
+/** Resolve the same trusted account transport for signed artifact grants. */
+export function createAccountApiRoute({
+  ownerId,
+  nativeInputDigest,
+}: {
+  ownerId?: unknown;
+  nativeInputDigest?: string;
+}) {
+  return {
+    baseURL: glassHiveAccountUrl(requiredEnv('GLASSHIVE_PROVIDER_BASE_URL'), '/v1/'),
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Bearer ${requiredEnv('WPR_API_TOKEN')}`,
+      'X-Viventium-Service-Assertion': createServiceAssertion({ ownerId, nativeInputDigest }),
+    },
+  };
+}
+
 export async function requestAccountApi({
   ownerId,
   path,
@@ -192,11 +210,10 @@ export async function requestAccountApi({
     ownerNativeInput && serializedBody
       ? crypto.createHash('sha256').update(serializedBody, 'utf8').digest('hex')
       : undefined;
-  const headers: Record<string, string> = {
-    Accept: 'application/json',
-    Authorization: `Bearer ${requiredEnv('WPR_API_TOKEN')}`,
-    'X-Viventium-Service-Assertion': createServiceAssertion({ ownerId, nativeInputDigest }),
-  };
+  const headers: Record<string, string> = createAccountApiRoute({
+    ownerId,
+    nativeInputDigest,
+  }).headers;
   if (body != null) {
     headers['Content-Type'] = 'application/json';
   }

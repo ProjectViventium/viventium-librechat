@@ -37,7 +37,7 @@ export class InMemoryEventTransport implements IEventTransport {
     handlers: {
       onChunk: (event: unknown) => void;
       onDone?: (event: unknown, nativeJobProof?: string) => void;
-      onError?: (error: string) => void;
+      onError?: (error: string, errorClass?: string) => void;
     },
   ): { unsubscribe: () => void; ready?: Promise<void> } {
     const state = this.getOrCreateStream(streamId);
@@ -45,7 +45,8 @@ export class InMemoryEventTransport implements IEventTransport {
     const chunkHandler = (event: unknown) => handlers.onChunk(event);
     const doneHandler = (event: unknown, proof?: string) =>
       proof === undefined ? handlers.onDone?.(event) : handlers.onDone?.(event, proof);
-    const errorHandler = (error: string) => handlers.onError?.(error);
+    const errorHandler = (error: string, errorClass?: string) =>
+      errorClass === undefined ? handlers.onError?.(error) : handlers.onError?.(error, errorClass);
 
     state.emitter.on('chunk', chunkHandler);
     state.emitter.on('done', doneHandler);
@@ -107,12 +108,13 @@ export class InMemoryEventTransport implements IEventTransport {
     if (nativeReplay) return true;
   }
 
-  emitError(streamId: string, error: string): void {
+  emitError(streamId: string, error: string, errorClass?: string): void {
     const state = this.streams.get(streamId);
     // Only emit if there are listeners - Node.js throws on unhandled 'error' events
     // This is intentional for the race condition where error occurs before client connects
     if (state?.emitter.listenerCount('error') ?? 0 > 0) {
-      state?.emitter.emit('error', error);
+      if (errorClass === undefined) state?.emitter.emit('error', error);
+      else state?.emitter.emit('error', error, errorClass);
     }
   }
 

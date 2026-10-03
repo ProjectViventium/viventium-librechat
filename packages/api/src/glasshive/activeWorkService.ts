@@ -1,3 +1,4 @@
+import { logger } from '@librechat/data-schemas';
 import { requestAccountApi } from './accountClient';
 import type { AccountFetch } from './accountClient';
 
@@ -78,6 +79,10 @@ function recordFrom(value: unknown): UnknownRecord {
 function positiveIntEnv(name: string, fallback: number): number {
   const value = Number(process.env[name]);
   return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+export function activeWorkColdTimeoutMs(): number {
+  return positiveIntEnv('VIVENTIUM_ACTIVE_WORK_COLD_TIMEOUT_MS', DEFAULT_COLD_TIMEOUT_MS);
 }
 
 function configuredTenantId(): string {
@@ -399,7 +404,7 @@ export function createGlassHiveActiveWorkService(dependencies: ActiveWorkService
     ownerId,
     fetchImpl = globalThis.fetch,
     forceRefresh = false,
-    timeoutMs = positiveIntEnv('VIVENTIUM_ACTIVE_WORK_COLD_TIMEOUT_MS', DEFAULT_COLD_TIMEOUT_MS),
+    timeoutMs = activeWorkColdTimeoutMs(),
   }: ActiveWorkSnapshotOptions): Promise<UnknownRecord> {
     const normalizedOwnerId = String(ownerId || '').trim();
     if (!normalizedOwnerId) {
@@ -465,7 +470,13 @@ export function createGlassHiveActiveWorkService(dependencies: ActiveWorkService
     }
     try {
       return await refresh();
-    } catch {
+    } catch (error) {
+      logger.warn('[VIVENTIUM][active-work] Snapshot refresh failed', {
+        stage: forceRefresh ? 'interactive_refresh' : 'snapshot_refresh',
+        errorClass:
+          error instanceof Error || error instanceof DOMException ? error.name : 'unknown_error',
+        elapsedMs: Date.now() - now,
+      });
       if (cached) {
         return { ...cached.value, snapshot: 'stale' };
       }

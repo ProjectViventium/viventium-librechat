@@ -22,6 +22,7 @@ const crypto = require('crypto');
 const express = require('express');
 const { HumanMessage } = require('@langchain/core/messages');
 const {
+  canonicalizeGlassHiveCallbackRef,
   canonicalVoiceOwnerUtterance,
   canonicalVoiceSessionMode,
   GenerationJobManager,
@@ -73,6 +74,10 @@ const { getUserById, saveMessage } = require('~/models');
 const {
   getCompletedCortexInsightsForMessage,
 } = require('~/server/services/viventium/VoiceCortexInsightsService');
+const {
+  confirmCortexVoicePresentation,
+  prepareCortexVoicePresentation,
+} = require('~/server/services/viventium/CortexInsightDeliveryService');
 const {
   getGlassHiveCallbackStateForMessage,
 } = require('~/server/services/viventium/GlassHiveCallbackMessageService');
@@ -132,6 +137,7 @@ const {
   flushVoiceTaskPersistence,
   getVoiceTask,
   getVoiceTaskByStreamId,
+  getVoiceTaskTraceBinding,
   getVoiceTaskOwnerCapabilityInventory,
   hydrateVoiceTask,
   hydrateVoiceTaskByStreamId,
@@ -1741,7 +1747,13 @@ function createVoiceAuth({ allowEnded = false } = {}) {
 const voiceAuth = createVoiceAuth();
 const voiceTerminalStateAuth = createVoiceAuth({ allowEnded: true });
 
-const VOICE_GATEWAY_TRACE_STAGES = new Set(['tts.completed', 'audio.completed']);
+const VOICE_GATEWAY_TRACE_STAGES = new Set([
+  'tts.completed',
+  'audio.completed',
+  'audio.failed',
+  'audio.interrupted',
+  'audio.superseded',
+]);
 const VOICE_GATEWAY_TRACE_KEYS = new Set([
   'version',
   'callSessionId',
@@ -1917,26 +1929,87 @@ router.post('/trace/stages', voiceAuth, async (req, res) => {
     ]);
     const metadata = job?.metadata;
     const interactionContext = metadata?.interactionContext;
+    // Speech ends after the generation job can be cleaned up. Its canonical turn binding
+    // stays with the existing durable Voice task; client input cannot author this binding.
+    const retainedBinding = getVoiceTaskTraceBinding(input.taskId);
+    const exactGeneration = job
+      ? Boolean(
+          metadata?.userId === userId &&
+          metadata?.viventiumCallSessionId === callSessionId &&
+          metadata?.viventiumVoiceTaskId === input.taskId &&
+          interactionContext?.surface === 'voice' &&
+          interactionContext?.logical_turn_id === input.turnId,
+        )
+      : Boolean(
+          retainedBinding?.userId === userId &&
+          retainedBinding?.callSessionId === callSessionId &&
+          retainedBinding?.streamId === input.streamId &&
+          retainedBinding?.logicalTurnId === input.turnId,
+        );
     const exactAuthority = Boolean(
       task &&
-      job &&
       task.taskId === input.taskId &&
       task.callSessionId === callSessionId &&
       task.streamId === input.streamId &&
-      metadata?.userId === userId &&
-      metadata?.viventiumCallSessionId === callSessionId &&
-      metadata?.viventiumVoiceTaskId === input.taskId &&
-      interactionContext?.surface === 'voice' &&
-      interactionContext?.logical_turn_id === input.turnId,
+      exactGeneration,
     );
     if (!exactAuthority) {
+      logger.warn(
+        `[VIVENTIUM][voice-trace] gateway_authority_rejected ${JSON.stringify({
+          stage: input.stage,
+          taskBound: Boolean(task),
+          jobBound: Boolean(job),
+          taskRefMatches: task?.taskId === input.taskId,
+          taskCallMatches: task?.callSessionId === callSessionId,
+          taskStreamMatches: task?.streamId === input.streamId,
+          jobOwnerMatches: metadata?.userId === userId,
+          jobCallMatches: metadata?.viventiumCallSessionId === callSessionId,
+          jobTaskMatches: metadata?.viventiumVoiceTaskId === input.taskId,
+          jobSurfaceMatches: interactionContext?.surface === 'voice',
+          jobTurnMatches: interactionContext?.logical_turn_id === input.turnId,
+          retainedMatches: Boolean(
+            retainedBinding &&
+            retainedBinding.userId === userId &&
+            retainedBinding.callSessionId === callSessionId &&
+            retainedBinding.streamId === input.streamId &&
+            retainedBinding.logicalTurnId === input.turnId,
+          ),
+        })}`,
+      );
       return res.status(403).json({
         code: 'voice_trace_not_authorized',
         message: 'The Voice trace stage is not authorized.',
         retryable: false,
       });
     }
-    await recordVoiceOrchestrationTrace({
+    /* === VIVENTIUM START === A trace is not a durable playout acknowledgement. === */
+    let presentationError = null;
+    if (input.stage === 'audio.completed') {
+      try {
+        const presented = await confirmCortexVoicePresentation({
+          ownerId: userId,
+          conversationId: task.conversationId || '',
+          parentMessageId: snapshotEvent(task.taskId)?.resultMessageId || '',
+          callSessionId,
+          taskId: task.taskId,
+          streamId: input.streamId,
+          turnId: input.turnId,
+          presentationRef: input.presentationRef,
+          stage: input.stage,
+        });
+        if (presented)
+          logger.info(
+            `[VIVENTIUM][voice] cortex_playout_acknowledged ${JSON.stringify({
+              count: presented.length,
+              sent: presented.every((row) => row.status === 'sent'),
+            })}`,
+          );
+      } catch (error) {
+        presentationError = error;
+      }
+    }
+    /* === VIVENTIUM END === */
+    const traceInput = {
       ownerId: userId,
       callSessionId,
       turnId: input.turnId,
@@ -1946,14 +2019,41 @@ router.post('/trace/stages', voiceAuth, async (req, res) => {
         streamRef: input.streamId,
         taskRef: input.taskId,
         presentationRef: input.presentationRef,
-        effectCount: 1,
+        effectCount: input.stage === 'tts.completed' || input.stage === 'audio.completed' ? 1 : 0,
       },
-    });
+    };
+    let traceDurable = true;
+    try {
+      await recordVoiceOrchestrationTrace(traceInput);
+    } catch (error) {
+      if (error?.code !== 'voice_trace_runtime_binding_unavailable') throw error;
+      await recordVoiceOrchestrationTraceBestEffort(traceInput);
+      traceDurable = false;
+    }
+    if (presentationError) {
+      const deterministic = [
+        'cortex_voice_presentation_receipt_conflict',
+        'cortex_insight_delivery_settlement_conflict',
+        'cortex_insight_delivery_batch_conflict',
+      ].includes(presentationError.code);
+      return res.status(deterministic ? 409 : 503).json({
+        code: 'voice_cortex_presentation_unavailable',
+        message: 'The Cortex playout receipt could not be confirmed.',
+        retryable: !deterministic,
+      });
+    }
+    if (!traceDurable)
+      return res
+        .status(202)
+        .json({ version: 1, accepted: true, durable: false, stage: input.stage });
     return res.json({ version: 1, accepted: true, stage: input.stage });
   } catch (error) {
     logger.warn('[VIVENTIUM][voice-trace] gateway_stage_rejected', {
       stage: input.stage,
-      code: String(error?.code || error?.message || 'trace_unavailable').slice(0, 120),
+      code:
+        error?.code === 'voice_trace_runtime_binding_unavailable'
+          ? 'voice_trace_runtime_binding_unavailable'
+          : 'trace_unavailable',
     });
     return res.status(503).json({
       code: 'voice_trace_unavailable',
@@ -3035,6 +3135,7 @@ router.post(
             callSessionId: session?.callSessionId,
             userId: req.user?.id,
             conversationId: payload.conversationId,
+            logicalTurnId: getTrustedInteractionContext(req)?.logical_turn_id,
           });
         }
         const convoId = payload?.conversationId;
@@ -3454,8 +3555,14 @@ router.post('/tasks/:taskId/input', voiceSessionCapabilityAuth, async (req, res)
   if (typeof req.body?.input !== 'string' || !req.body.input.trim()) {
     return res.status(400).json({ error: 'input is required' });
   }
+  const binding = createVoiceWorkAuthorityBinding({
+    session: req.viventiumCallSession, segments: [], typedInput: { kind: 'participant_text' },
+  });
   const result = await submitVoiceTaskInput(task.taskId, req.body.input, {
     userId: req.user?.id,
+    ...(binding ? { voiceAuthorityContext: {
+      callSessionId: req.viventiumCallSession.callSessionId, binding,
+    } } : {}),
   });
   if (!result.ok) {
     const status = result.code === 'owner_input_failed' ? 503 : 409;
@@ -3469,7 +3576,8 @@ router.post('/tasks/:taskId/input', voiceSessionCapabilityAuth, async (req, res)
   }
   return res.json({
     version: 1,
-    outcome: 'accepted',
+    outcome: result.confirmationPending ? 'pending' : 'accepted',
+    ...(result.confirmationPending ? { confirmationPending: true } : {}),
     task: result.task,
     event: result.event,
   });
@@ -3666,9 +3774,20 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
       enqueueOutput(async () => {
         const suppressed = await outputIsSuppressed();
         if (voiceTask && !suppressed && event?.superseded !== true) {
-          completeVoiceTask(voiceTask.taskId, {
-            resultMessageId: event?.responseMessage?.messageId,
-          });
+          const content = event?.responseMessage?.content;
+          const terminalError = Array.isArray(content)
+            ? content.find((part) => part?.type === 'error')
+            : null;
+          if (terminalError) {
+            failVoiceTask(voiceTask.taskId, {
+              code: terminalError.error_class,
+              message: terminalError.error,
+            });
+          } else {
+            completeVoiceTask(voiceTask.taskId, {
+              resultMessageId: event?.responseMessage?.messageId,
+            });
+          }
         }
         if (!res.writableEnded) {
           if (!suppressed) {
@@ -3681,15 +3800,17 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
         }
       });
     },
-    (error) => {
+    (error, errorClass) => {
       enqueueOutput(async () => {
         const suppressed = await outputIsSuppressed();
         if (voiceTask && !suppressed) {
-          failVoiceTask(voiceTask.taskId, error);
+          failVoiceTask(voiceTask.taskId, errorClass ? { code: errorClass, message: error } : error);
         }
         if (!res.writableEnded) {
           if (!suppressed) {
-            res.write(`event: error\ndata: ${JSON.stringify({ error })}\n\n`);
+            res.write(
+              `event: error\ndata: ${JSON.stringify({ error, ...(errorClass ? { error_class: errorClass } : {}) })}\n\n`,
+            );
           }
           if (typeof res.flush === 'function') {
             res.flush();
@@ -3884,6 +4005,43 @@ router.get('/cortex/:messageId', voiceAuth, async (req, res) => {
       return res.status(404).json({ error: 'Message not found' });
     }
 
+    /* === VIVENTIUM START === Seal the canonical source before the worker receives its text. === */
+    if (result.followUp && result.presentationRequired === true) {
+      const context = result.presentationContext;
+      const task = await hydrateVoiceTask(context?.taskId, {
+        callSessionId: session.callSessionId,
+        userId,
+        requireDurable: true,
+      });
+      const binding = getVoiceTaskTraceBinding(context?.taskId);
+      if (
+        !task ||
+        !binding ||
+        context.callSessionId !== session.callSessionId ||
+        binding.userId !== userId ||
+        binding.callSessionId !== session.callSessionId ||
+        binding.logicalTurnId !== context.turnId ||
+        task.conversationId !== session.conversationId ||
+        snapshotEvent(task.taskId)?.resultMessageId !== messageId
+      ) {
+        return res.status(403).json({ error: 'Cortex presentation is not authorized' });
+      }
+      const deliverable = await prepareCortexVoicePresentation({
+        ownerId: userId,
+        conversationId: session.conversationId,
+        parentMessageId: messageId,
+        callSessionId: session.callSessionId,
+        taskId: task.taskId,
+        streamId: binding.streamId,
+        turnId: context.turnId,
+        presentationRef: result.followUp.messageId,
+        text: result.followUp.text,
+        leaseMs: Number(session.expiresAtMs) - Date.now(),
+      });
+      if (!deliverable) result.followUp = null;
+    }
+    /* === VIVENTIUM END === */
+
     return res.json({
       messageId: result.messageId,
       conversationId: result.conversationId,
@@ -3960,6 +4118,7 @@ router.post('/glasshive/deliveries/claim', voiceAuth, async (req, res) => {
   if (!expectedCallbackId || !expectedUserId || !expectedCallSessionId) {
     return res.status(400).json({ error: 'callbackId and authenticated call scope are required' });
   }
+  const expectedCallbackRef = canonicalizeGlassHiveCallbackRef(expectedCallbackId);
   try {
     const deliveries = await claimPendingGlassHiveCallbackDeliveries({
       surface: 'voice',
@@ -3977,7 +4136,7 @@ router.post('/glasshive/deliveries/claim', voiceAuth, async (req, res) => {
       deliveries.some(
         (delivery) =>
           !delivery ||
-          delivery.callbackId !== expectedCallbackId ||
+          delivery.callbackId !== expectedCallbackRef ||
           String(delivery.userId || '') !== expectedUserId ||
           delivery.voiceCallSessionId !== expectedCallSessionId ||
           !String(delivery.deliveryId || '').trim() ||

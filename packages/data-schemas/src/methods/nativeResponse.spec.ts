@@ -4,7 +4,11 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { NativeResponseIdentity, NativeResponseCommit } from '~/types/nativeResponse';
 import type { IMessage } from '~/types/message';
 import { createModels } from '~/models';
-import { createNativeResponseMethods, normalizeNativeResponseIdentity, nativeResponseParentSource } from './nativeResponse';
+import {
+  createNativeResponseMethods,
+  normalizeNativeResponseIdentity,
+  nativeResponseParentSource,
+} from './nativeResponse';
 
 describe('native response source and final persistence', () => {
   let server: MongoMemoryReplSet;
@@ -78,21 +82,166 @@ describe('native response source and final persistence', () => {
     };
     commit.mockClear();
   });
+  it('stores native ordered narration and final text once and rejects late partial replacement', async () => {
+    const narration = 'I will inspect the synthetic state.';
+    const finalText = 'The state is green.';
+    const orderedText = `${narration}\n\n${finalText}`;
+    await methods.admitNativeResponse(identity, transaction);
+    await methods.saveNativeResponseSnapshot(
+      user,
+      {
+        messageId: 'answer',
+        text: narration,
+        content: [{ type: 'text', text: narration }],
+        unfinished: true,
+      },
+      identity,
+    );
+    const orderedCandidate = {
+      ...candidate,
+      text: orderedText,
+      responseJson: JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: orderedText } }],
+      }),
+    };
+    const digest = await methods.prepareNativeResponse(identity, orderedCandidate, transaction);
+    const saved = await methods.materializeNativeResponse(identity, digest, commit, transaction);
+    expect(saved?.text).toBe(orderedText);
+    expect(saved?.content?.filter((part) => part.type === 'text')).toEqual([
+      { type: 'text', text: orderedText },
+    ]);
+    expect(saved?.attachments).toEqual([{ type: 'file', file_id: 'kept' }]);
+    expect(saved?.unfinished).toBe(false);
+    const retained = await methods.getNativeResponse(user, 'answer');
+    expect(retained?.nativeResponse?.candidateSha256).toBe(digest);
+    expect(JSON.parse(retained?.nativeResponse?.candidateJson || '{}').text).toBe(orderedText);
+    const late = await methods.saveNativeResponseSnapshot(
+      user,
+      {
+        messageId: 'answer',
+        text: narration,
+        content: [{ type: 'text', text: narration }],
+        unfinished: true,
+      },
+      identity,
+    );
+    expect(late?.text).toBe(orderedText);
+    expect((await methods.getNativeResponse(user, 'answer'))?.nativeResponse?.candidateSha256).toBe(
+      digest,
+    );
+    expect(commit).toHaveBeenCalledTimes(1);
+  });
+  it('imports selected attachments once outside transaction retries and persists unavailable truth', async () => {
+    await methods.admitNativeResponse(identity, transaction);
+    const digest = await methods.prepareNativeResponse(identity, candidate, transaction);
+    const attachments = [
+      { file_id: 'selected', filename: 'result.csv' },
+      {
+        filename: 'large.csv',
+        messageId: 'answer',
+        nativeOutputFile: {
+          version: 1,
+          status: 'unavailable',
+          code: 'native_output_file_size_limit',
+        },
+      },
+    ];
+    let activeTransaction = false;
+    const wrappedTransaction = async <T>(operation: () => Promise<T>): Promise<T> => {
+      activeTransaction = true;
+      try {
+        return await transaction(operation);
+      } finally {
+        activeTransaction = false;
+      }
+    };
+    const prepare = jest.fn(async () => {
+      expect(activeTransaction).toBe(false);
+      expect(commit).toHaveBeenCalled();
+      return attachments;
+    });
+    const saved = await methods.materializeNativeResponse(
+      identity,
+      digest,
+      commit,
+      wrappedTransaction,
+      undefined,
+      prepare,
+    );
+    expect(saved?.attachments).toEqual([{ type: 'file', file_id: 'kept' }, ...attachments]);
+    expect((await methods.getNativeResponse(user, 'answer'))?.attachments).toEqual(
+      saved?.attachments,
+    );
+    expect(prepare).toHaveBeenCalledTimes(1);
+  });
+  it('does not prepare or publish attachments after rejected authority or source change during import', async () => {
+    await methods.admitNativeResponse(identity, transaction);
+    const digest = await methods.prepareNativeResponse(identity, candidate, transaction);
+    const prepare = jest.fn(async () => [{ file_id: 'selected' }]);
+    await expect(
+      methods.materializeNativeResponse(
+        identity,
+        digest,
+        async () => ({ status: 'revoked' }),
+        transaction,
+        undefined,
+        prepare,
+      ),
+    ).rejects.toThrow('native_response_publication_revoked');
+    expect(prepare).not.toHaveBeenCalled();
+    prepare.mockImplementationOnce(async () => {
+      await mongoose.models.Message.updateOne(
+        { messageId: 'question' },
+        { $set: { text: 'Edited.' } },
+      );
+      return [{ file_id: 'selected' }];
+    });
+    await expect(
+      methods.materializeNativeResponse(identity, digest, commit, transaction, undefined, prepare),
+    ).rejects.toThrow();
+    const row = await methods.getNativeResponse(user, 'answer');
+    expect(row?.nativeResponse?.status).toBe('prepared');
+    expect(row?.attachments).toEqual([{ type: 'file', file_id: 'kept' }]);
+  });
   it('checks native evidence source without writes and rejects changed or foreign source bytes', async () => {
     const before = await mongoose.models.Message.findOne({ messageId: 'question' }).lean();
     expect(await methods.nativeResponseSourceMatches(identity)).toBe(true);
     expect(await mongoose.models.Message.findOne({ messageId: 'question' }).lean()).toEqual(before);
-    expect(await methods.nativeResponseSourceMatches({ ...identity, userId: new mongoose.Types.ObjectId().toString() })).toBe(false);
-    await mongoose.models.Message.updateOne({ messageId: 'question' }, { $set: { text: 'Changed input.' } });
+    expect(
+      await methods.nativeResponseSourceMatches({
+        ...identity,
+        userId: new mongoose.Types.ObjectId().toString(),
+      }),
+    ).toBe(false);
+    await mongoose.models.Message.updateOne(
+      { messageId: 'question' },
+      { $set: { text: 'Changed input.' } },
+    );
     expect(await methods.nativeResponseSourceMatches(identity)).toBe(false);
   });
   it('rejects an edited selected parent when reading graph evidence', async () => {
-    const parent = await mongoose.models.Message.create({ user, messageId: 'selected-parent',
-      conversationId: 'conversation', isCreatedByUser: false, text: 'Original context.' });
-    await mongoose.models.Message.updateOne({ messageId: 'question' }, { $set: { parentMessageId: 'selected-parent' } });
-    identity.source = await methods.captureNativeResponseSource(user, 'conversation', 'question', nativeResponseParentSource(parent));
+    const parent = await mongoose.models.Message.create({
+      user,
+      messageId: 'selected-parent',
+      conversationId: 'conversation',
+      isCreatedByUser: false,
+      text: 'Original context.',
+    });
+    await mongoose.models.Message.updateOne(
+      { messageId: 'question' },
+      { $set: { parentMessageId: 'selected-parent' } },
+    );
+    identity.source = await methods.captureNativeResponseSource(
+      user,
+      'conversation',
+      'question',
+      nativeResponseParentSource(parent),
+    );
     expect(await methods.nativeResponseSourceMatches(identity)).toBe(true);
-    await mongoose.models.Message.updateOne({ messageId: 'selected-parent' }, { $set: { text: 'Changed context.' } });
+    await mongoose.models.Message.updateOne(
+      { messageId: 'selected-parent' },
+      { $set: { text: 'Changed context.' } },
+    );
     expect(await methods.nativeResponseSourceMatches(identity)).toBe(false);
   });
   it.each(['failed', 'cancelled'] as const)(
@@ -775,31 +924,59 @@ describe('native response source and final persistence', () => {
         await methods.materializeNativeResponse(identity, digest, commit, transaction);
       }
       const complete = {
-        type: 'cortex_insight', cortex_id: 'background-source', status: 'complete',
+        type: 'cortex_insight',
+        cortex_id: 'background-source',
+        status: 'complete',
         insight: 'A verified earlier constraint.',
       };
-      await methods.saveNativeResponseSnapshot(user, {
-        messageId: 'answer', content: [complete],
-      }, identity, 'augmentation');
+      await methods.saveNativeResponseSnapshot(
+        user,
+        {
+          messageId: 'answer',
+          content: [complete],
+        },
+        identity,
+        'augmentation',
+      );
       // Both a snapshot that predates activation and one that predates completion can arrive late.
-      for (const oldParts of [[], [{
-        type: 'cortex_brewing', cortex_id: 'background-source', status: 'running',
-      }]]) {
-        await methods.saveNativeResponseSnapshot(user, {
-          messageId: 'answer', unfinished: true,
-          content: [{ type: 'text', text: 'Final streamed answer.' }, ...oldParts],
-        }, identity);
+      for (const oldParts of [
+        [],
+        [
+          {
+            type: 'cortex_brewing',
+            cortex_id: 'background-source',
+            status: 'running',
+          },
+        ],
+      ]) {
+        await methods.saveNativeResponseSnapshot(
+          user,
+          {
+            messageId: 'answer',
+            unfinished: true,
+            content: [{ type: 'text', text: 'Final streamed answer.' }, ...oldParts],
+          },
+          identity,
+        );
         const saved = await methods.getNativeResponse(user, 'answer');
         const cortex = saved?.content?.filter((part) => part.cortex_id === 'background-source');
         expect(cortex).toEqual([complete]);
         if (state === 'completed') expect(saved?.text).toBe(candidate.text);
       }
       const updated = { ...complete, insight: 'A later authoritative result.' };
-      await methods.saveNativeResponseSnapshot(user, {
-        messageId: 'answer', content: [updated],
-      }, identity, 'augmentation');
+      await methods.saveNativeResponseSnapshot(
+        user,
+        {
+          messageId: 'answer',
+          content: [updated],
+        },
+        identity,
+        'augmentation',
+      );
       const saved = await methods.getNativeResponse(user, 'answer');
-      expect(saved?.content?.filter((part) => part.cortex_id === 'background-source')).toEqual([updated]);
+      expect(saved?.content?.filter((part) => part.cortex_id === 'background-source')).toEqual([
+        updated,
+      ]);
     },
   );
 
@@ -807,35 +984,63 @@ describe('native response source and final persistence', () => {
     await methods.admitNativeResponse(identity, transaction);
     const digest = await methods.prepareNativeResponse(identity, candidate, transaction);
     await methods.materializeNativeResponse(identity, digest, commit, transaction);
-    const contribution = { type: 'cortex_insight', cortex_id: 'source', status: 'complete', insight: 'Verified finding.' };
+    const contribution = {
+      type: 'cortex_insight',
+      cortex_id: 'source',
+      status: 'complete',
+      insight: 'Verified finding.',
+    };
     let release!: () => void;
     let entered!: () => void;
-    const held = new Promise<void>((resolve) => { release = resolve; });
-    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
     const Message = mongoose.models.Message;
     const update = Message.findOneAndUpdate.bind(Message);
-    const intercepted = jest.spyOn(Message, 'findOneAndUpdate').mockImplementationOnce((...args) => {
-      entered();
-      return held.then(() => update(...args)) as ReturnType<typeof Message.findOneAndUpdate>;
-    });
+    const intercepted = jest
+      .spyOn(Message, 'findOneAndUpdate')
+      .mockImplementationOnce((...args) => {
+        entered();
+        return held.then(() => update(...args)) as ReturnType<typeof Message.findOneAndUpdate>;
+      });
     let attempts = 0;
     const saving = transaction(() => {
       attempts++;
-      return methods.saveNativeResponseSnapshot(user, {
-        messageId: 'answer', unfinished: true, content: [{ type: 'text', text: 'Stream text.' }],
-      }, identity);
+      return methods.saveNativeResponseSnapshot(
+        user,
+        {
+          messageId: 'answer',
+          unfinished: true,
+          content: [{ type: 'text', text: 'Stream text.' }],
+        },
+        identity,
+      );
     });
     await started;
     try {
-      await transaction(() => methods.saveNativeResponseSnapshot(user, {
-        messageId: 'answer', content: [contribution],
-      }, identity, 'augmentation'));
-    } finally { release(); }
+      await transaction(() =>
+        methods.saveNativeResponseSnapshot(
+          user,
+          {
+            messageId: 'answer',
+            content: [contribution],
+          },
+          identity,
+          'augmentation',
+        ),
+      );
+    } finally {
+      release();
+    }
     await saving;
     intercepted.mockRestore();
     expect(attempts).toBeGreaterThan(1);
     expect((await methods.getNativeResponse(user, 'answer'))?.content).toEqual([
-      { type: 'text', text: candidate.text }, contribution,
+      { type: 'text', text: candidate.text },
+      contribution,
     ]);
   });
 
@@ -959,20 +1164,35 @@ describe('native response source and final persistence', () => {
       });
     },
   );
-  it.each([true, false])('snapshot preserves native tool evidence presence: %s', async (present) => {
-    await methods.admitNativeResponse(identity, transaction);
-    const digest = await methods.prepareNativeResponse(identity, candidate, transaction);
-    await methods.materializeNativeResponse(identity, digest, commit, transaction);
-    const evidence = { logicalTurnId: 'turn', revision: 1, evidence: { run_id: 'current' } };
-    await mongoose.models.Message.updateOne({ messageId: 'answer' }, {
-      metadata: { viventium: { ...(present ? { nativeToolEvidence: evidence } : {}) } },
-    });
-    await methods.saveNativeResponseSnapshot(user, { messageId: 'answer', metadata: { viventium: {
-      nativeToolEvidence: { evidence: { run_id: 'foreign' } }, sibling: 'kept',
-    } } });
-    const saved = await methods.getNativeResponse(user, 'answer');
-    expect(saved?.metadata?.viventium).toEqual({ sibling: 'kept', ...(present ? { nativeToolEvidence: evidence } : {}) });
-  });
+  it.each([true, false])(
+    'snapshot preserves native tool evidence presence: %s',
+    async (present) => {
+      await methods.admitNativeResponse(identity, transaction);
+      const digest = await methods.prepareNativeResponse(identity, candidate, transaction);
+      await methods.materializeNativeResponse(identity, digest, commit, transaction);
+      const evidence = { logicalTurnId: 'turn', revision: 1, evidence: { run_id: 'current' } };
+      await mongoose.models.Message.updateOne(
+        { messageId: 'answer' },
+        {
+          metadata: { viventium: { ...(present ? { nativeToolEvidence: evidence } : {}) } },
+        },
+      );
+      await methods.saveNativeResponseSnapshot(user, {
+        messageId: 'answer',
+        metadata: {
+          viventium: {
+            nativeToolEvidence: { evidence: { run_id: 'foreign' } },
+            sibling: 'kept',
+          },
+        },
+      });
+      const saved = await methods.getNativeResponse(user, 'answer');
+      expect(saved?.metadata?.viventium).toEqual({
+        sibling: 'kept',
+        ...(present ? { nativeToolEvidence: evidence } : {}),
+      });
+    },
+  );
   it('a late checkpoint cannot upsert an assistant deleted after dispatch', async () => {
     await methods.admitNativeResponse(identity, transaction);
     await mongoose.models.Message.deleteOne({ messageId: 'answer' });

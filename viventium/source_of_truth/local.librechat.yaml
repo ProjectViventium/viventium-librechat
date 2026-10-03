@@ -158,7 +158,7 @@ viventium:
   installMode: native
   consciousAgent:
     provider: glasshive-harness
-    model: codex-cli:gpt-6-astra
+    model: codex-cli:gpt-6.1-sol
 balance:
   enabled: false
   startBalance: 200000
@@ -261,15 +261,15 @@ modelSpecs:
       preset:
         endpoint: agents
         agent_id: agent_8Y1d7JNhpubtvzYz3hvEv
-    - name: grok-4.5
-      label: Grok 4.5
+    - name: grok-4.7
+      label: Grok 4.7
       description: xAI Grok
       group: xai
       groupIcon: xai
       iconURL: xai
       preset:
         endpoint: xai
-        model: grok-4.5
+        model: grok-4.7
     - name: gemini-3-flash-preview
       label: Gemini 3 Flash
       description: Google Gemini
@@ -297,15 +297,15 @@ modelSpecs:
       preset:
         endpoint: google
         model: gemini-3.1-pro-preview
-    - name: claude-opus-5
-      label: Claude Opus 5
+    - name: claude-opus-5-5
+      label: Claude Opus 5.5
       description: Anthropic Direct
       group: anthropic
       groupIcon: anthropic
       iconURL: anthropic
       preset:
         endpoint: anthropic
-        model: claude-opus-5
+        model: claude-opus-5-5
   addedEndpoints:
     - agents
     - anthropic
@@ -656,7 +656,7 @@ ocr:
 endpoints:
   anthropic:
     titleEndpoint: anthropic
-    titleModel: claude-opus-5
+    titleModel: claude-opus-5-5
     titlePrompt: |-
       Generate a concise natural conversation title from the user's request and the assistant's response. Do not browse, fetch, or judge URL accessibility. If the conversation contains a URL, title the user's intended task or outcome instead of whether the URL is accessible.
       Conversation: {convo}
@@ -665,9 +665,11 @@ endpoints:
       User: {input}
       AI: {output}
     summarize: false
-    summaryModel: claude-opus-5
+    summaryModel: claude-opus-5-5
     modelDisplayLabel: Azure AI Foundry (Claude)
   agents:
+    capabilityRequiredProviders:
+      - glasshive-harness
     order: -1
     recursionLimit: 2000
     maxRecursionLimit: 2000
@@ -682,6 +684,7 @@ endpoints:
         phase_b_followup: true
         activation_classifier: false
         realtime_voice: false
+        voice_pipeline_llm: true
         automatic_fallback_target: true
         serial_model_fallback: true
         workspace_binding: true
@@ -711,79 +714,122 @@ endpoints:
         excluded_mcp_servers:
           - glasshive-workers-projects
         models:
-          - id: codex-cli:gpt-6-astra
-            label: Codex / GPT-6 Astra
-            harnessProfile: codex-cli
-            effortChoices:
-              - low
-              - medium
-              - high
-              - xhigh
-              - max
-              - ultra
-            recommendedEffort: medium
-            contextLimit: 272000
-          - id: claude-code:claude-opus-5
-            label: Claude / Opus 5
-            harnessProfile: claude-code
-            effortChoices:
-              - default
-              - low
-              - medium
-              - high
-              - xhigh
-              - max
-            recommendedEffort: medium
-            contextLimit: 1000000
-          - id: codex-cli:gpt-5.6-sol
-            label: Codex / GPT-5.6 Sol
-            harnessProfile: codex-cli
-            effortChoices:
-              - low
-              - medium
-              - high
-              - xhigh
-              - max
-              - ultra
-            recommendedEffort: medium
-            contextLimit: 272000
-          - id: claude-code:opus
-            label: Claude / Opus
-            harnessProfile: claude-code
-            effortChoices:
-              - default
-              - low
-              - medium
-              - high
-              - xhigh
-              - max
-            recommendedEffort: high
-            contextLimit: 200000
-          - id: codex-cli:gpt-5.6-luna
-            label: Codex / GPT-5.6 Luna
-            harnessProfile: codex-cli
-            effortChoices:
-              - low
-              - medium
-              - high
-              - xhigh
-              - max
-            recommendedEffort: medium
-            contextLimit: 272000
-          - id: codex-cli:gpt-5.6-terra
-            label: Codex / GPT-5.6 Terra
-            harnessProfile: codex-cli
-            effortChoices:
-              - low
-              - medium
-              - high
-              - xhigh
-              - max
-              - ultra
-            recommendedEffort: medium
-            contextLimit: 272000
-    capabilityRequiredProviders:
-      - glasshive-harness
+        - id: codex-cli:gpt-6.1-sol
+          label: OpenAI / GPT-6.1 Sol
+          harnessProfile: codex-cli
+          effortChoices:
+          - low
+          - medium
+          - high
+          - xhigh
+          - max
+          recommendedEffort: high
+          contextLimit: 1050000
+        - id: claude-code:claude-opus-5-5
+          label: Anthropic / Opus 5.5
+          harnessProfile: claude-code
+          effortChoices:
+          - default
+          - low
+          - medium
+          - high
+          - xhigh
+          - max
+          recommendedEffort: high
+          contextLimit: 1000000
+        - id: grok-build:grok-4.7
+          label: Grok / Grok 4.7
+          harnessProfile: grok-build
+          effortChoices:
+          - default
+          - low
+          - medium
+          - high
+          - xhigh
+          recommendedEffort: high
+          contextLimit: 500000
+        - id: grok-build:grok-4.7-build-fast
+          label: Grok / Grok 4.7 Fast
+          harnessProfile: grok-build
+          effortChoices:
+          - default
+          - low
+          - medium
+          - high
+          - xhigh
+          recommendedEffort: high
+          contextLimit: 500000
+        - id: codex-cli:gpt-6-astra
+          label: Codex / GPT-6 Astra
+          harnessProfile: codex-cli
+          effortChoices:
+          - low
+          - medium
+          - high
+          - xhigh
+          - max
+          - ultra
+          recommendedEffort: medium
+          contextLimit: 272000
+        - id: claude-code:claude-opus-5
+          label: Claude / Opus 5
+          harnessProfile: claude-code
+          effortChoices:
+          - default
+          - low
+          - medium
+          - high
+          - xhigh
+          - max
+          recommendedEffort: medium
+          contextLimit: 1000000
+        - id: codex-cli:gpt-5.6-sol
+          label: Codex / GPT-5.6 Sol
+          harnessProfile: codex-cli
+          effortChoices:
+          - low
+          - medium
+          - high
+          - xhigh
+          - max
+          - ultra
+          recommendedEffort: medium
+          contextLimit: 272000
+        - id: claude-code:opus
+          label: Claude / Opus
+          harnessProfile: claude-code
+          effortChoices:
+          - default
+          - low
+          - medium
+          - high
+          - xhigh
+          - max
+          recommendedEffort: high
+          contextLimit: 200000
+        - id: codex-cli:gpt-5.6-luna
+          label: Codex / GPT-5.6 Luna
+          harnessProfile: codex-cli
+          effortChoices:
+          - low
+          - medium
+          - high
+          - xhigh
+          - max
+          recommendedEffort: medium
+          contextLimit: 272000
+        - id: codex-cli:gpt-5.6-terra
+          label: Codex / GPT-5.6 Terra
+          harnessProfile: codex-cli
+          effortChoices:
+          - low
+          - medium
+          - high
+          - xhigh
+          - max
+          - ultra
+          recommendedEffort: medium
+          contextLimit: 272000
     capabilities:
       - deferred_tools
       - programmatic_tools
@@ -808,15 +854,20 @@ endpoints:
       baseURL: ${GLASSHIVE_PROVIDER_BASE_URL}
       models:
         default:
+          - codex-cli:gpt-6.1-sol
+          - claude-code:claude-opus-5-5
+          - grok-build:grok-4.7
+          - grok-build:grok-4.7-build-fast
           - codex-cli:gpt-6-astra
-          - codex-cli:gpt-5.6-sol
-          - codex-cli:gpt-5.6-luna
           - claude-code:claude-opus-5
+          - codex-cli:gpt-5.6-sol
           - claude-code:opus
+          - codex-cli:gpt-5.6-luna
+          - codex-cli:gpt-5.6-terra
         fetch: false
       titleConvo: true
       titleEndpoint: openAI
-      titleModel: gpt-5.6-terra
+      titleModel: gpt-6.1-sol
       summarize: false
       modelDisplayLabel: xPerfect
       dropParams:
@@ -864,6 +915,7 @@ endpoints:
       baseURL: ${XAI_BASE_URL}
       models:
         default:
+          - grok-4.7
           - grok-4.5
           - grok-4.20-non-reasoning
           - grok-4.20-multi-agent-0309
@@ -873,9 +925,9 @@ endpoints:
           - grok-2-image-1212
         fetch: true
       titleConvo: true
-      titleModel: grok-4.5
+      titleModel: grok-4.7
       summarize: false
-      summaryModel: grok-4.5
+      summaryModel: grok-4.7
       modelDisplayLabel: Grok
       titleMethod: completion
       forcePrompt: false
@@ -1164,10 +1216,10 @@ memory:
   personalize: true
   agent:
     provider: openai
-    model: gpt-5.6-luna
+    model: gpt-6.1-sol
     instructions:
       promptRef: memory.archivist
     model_parameters:
-      reasoning_effort: medium
+      reasoning_effort: high
 registration:
   socialLogins: []

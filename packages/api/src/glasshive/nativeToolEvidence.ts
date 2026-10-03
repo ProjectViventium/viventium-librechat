@@ -285,7 +285,7 @@ export function nativeGraphToolEvidenceContent(
 }
 export function nativeToolEvidenceUnavailableContent(
   identity: NativeResponseIdentity,
-  reason: 'saved_result_missing' | 'graph_evidence_missing',
+  reason: 'saved_result_missing' | 'graph_evidence_missing' | 'parent_uncommitted' | 'native_attempt_incomplete',
 ) {
   return [
     {

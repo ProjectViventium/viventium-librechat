@@ -1393,6 +1393,8 @@ export const alternateName = {
 };
 
 const sharedOpenAIModels = [
+  'gpt-6.1-sol',
+  'gpt-6-sol',
   // === VIVENTIUM START ===
   // Feature: GPT-5.6 fallback inventory for chat, Assistants, and Agent Builder.
   // Source: https://developers.openai.com/api/docs/guides/latest-model
@@ -1435,6 +1437,7 @@ const sharedOpenAIModels = [
 ];
 
 const sharedAnthropicModels = [
+  'claude-opus-5-5',
   /* === VIVENTIUM START ===
    * Feature: Claude Opus 5 direct endpoint.
    * Purpose: Publish the canonical direct-API model while retaining explicit Opus 4.8 overrides.

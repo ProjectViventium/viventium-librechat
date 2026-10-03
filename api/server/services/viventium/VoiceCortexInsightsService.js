@@ -66,6 +66,9 @@ async function getFollowUpMessageForParent({ userId, conversationId, parentMessa
   return {
     messageId: followUp.messageId,
     text,
+    presentationRequired:
+      Array.isArray(followUp.metadata?.viventium?.cortexInsightDeliveryIds) &&
+      followUp.metadata.viventium.cortexInsightDeliveryIds.length > 0,
   };
 }
 
@@ -116,8 +119,14 @@ async function getCompletedCortexInsightsForMessage({ userId, messageId, convers
     messageId: msg.messageId,
     conversationId: msg.conversationId,
     insights,
-    followUp,
+    followUp: followUp ? { messageId: followUp.messageId, text: followUp.text } : null,
+    presentationRequired: followUp?.presentationRequired === true,
     followUpDecision: getFollowUpDecisionForMessage(msg),
+    presentationContext: {
+      callSessionId: msg.metadata?.viventium?.callSessionId,
+      taskId: msg.metadata?.viventium?.voiceTaskId,
+      turnId: msg.metadata?.viventium?.interactionContext?.logical_turn_id,
+    },
   };
 }
 

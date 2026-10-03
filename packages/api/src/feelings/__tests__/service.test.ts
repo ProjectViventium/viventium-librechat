@@ -14,6 +14,7 @@ import {
   parseFeelingReactionOutput,
   prepareManualFeelingPatch,
 } from '../service';
+import { normalizeCortexFeelingSnapshot } from '../../cortex/insightDeliveryService';
 
 describe('Feelings state service', () => {
   beforeEach(() => clearFeelingsReadCache());
@@ -32,6 +33,8 @@ describe('Feelings state service', () => {
     expect(snapshot.enabled).toBe(false);
     expect(snapshot.capsule).toBe('');
     expect(snapshot.version).toBe(0);
+    expect(snapshot.snapshotHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(normalizeCortexFeelingSnapshot(snapshot)?.snapshotHash).toBe(snapshot.snapshotHash);
     expect(snapshot.innerState).toBeNull();
     expect(snapshot.rangePromptOverrides).toEqual({});
     expect(snapshot.rangePromptOverrideCount).toBe(0);

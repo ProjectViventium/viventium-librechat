@@ -4,9 +4,11 @@
 const {
   installLibreChatAgentsGraphStartPatch: installTypedGraphStartPatch,
   sourceComponentStartAgentIds,
+  installLibreChatAgentsHandoffResultPatch,
 } = require('@librechat/api');
 
 function installLibreChatAgentsGraphStartPatch(agentsModule = require('@librechat/agents')) {
+  installLibreChatAgentsHandoffResultPatch(agentsModule);
   return installTypedGraphStartPatch(agentsModule);
 }
 

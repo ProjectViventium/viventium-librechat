@@ -1,5 +1,9 @@
-import { createTelegramInputService, TELEGRAM_INPUT_LEASE_MS,
-  telegramInputDeliveryCoverage, telegramInputConversationGeneration } from './telegramInput';
+import {
+  createTelegramInputService,
+  TELEGRAM_INPUT_LEASE_MS,
+  telegramInputDeliveryCoverage,
+  telegramInputConversationGeneration,
+} from './telegramInput';
 import type { DeliveryAcknowledgementResult } from '../stream/interfaces/IJobStore';
 import type {
   TelegramInputIdentity,
@@ -35,7 +39,8 @@ function fixture() {
             row.primarySourceEventId === row.sourceEventId &&
             !['completed', 'cancelled'].includes(row.state) &&
             row.leaseUntil <= now &&
-            row.retryAt <= now,
+            row.retryAt <= now &&
+            (row.state !== 'failed' || row.retryAt > 0),
         )
         .slice(0, limit)
         .map((row) => structuredClone(row)),
@@ -71,7 +76,7 @@ function fixture() {
         throw error;
       }
     },
-    verifyOwner: async () => authorized,
+    verifyOwner: async (_record?: TelegramInputIdentity) => authorized,
     verifyStream: async () => true,
     hasCommittedDelivery: jest.fn(async (_record: TelegramInputIdentity) => false),
     readPrepared: async (record: TelegramInputIdentity) =>
@@ -161,24 +166,84 @@ test('a ready source covered by the newer response settles without admitting its
 
 function committedCoverage(): DeliveryAcknowledgementResult {
   const original = id();
-  return { status: 'recorded', acknowledgement: { state: 'committed', logical_turn_id: 'turn', revision: 2 },
-    presentation: { userId: 'owner', conversationId: 'conversation', responseMessageId: 'answer',
-      interactionContext: { actor_kind: 'external_user', origin: 'interactive', surface: 'telegram',
-        conversation_id: 'conversation', logical_turn_id: 'turn', revision: 2,
-        source_event_id: id(2).sourceEventId, source_order_scope: original.sourceOrderScope,
+  return {
+    status: 'recorded',
+    acknowledgement: { state: 'committed', logical_turn_id: 'turn', revision: 2 },
+    presentation: {
+      userId: 'owner',
+      conversationId: 'conversation',
+      responseMessageId: 'answer',
+      interactionContext: {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'telegram',
+        conversation_id: 'conversation',
+        logical_turn_id: 'turn',
+        revision: 2,
+        source_event_id: id(2).sourceEventId,
+        source_order_scope: original.sourceOrderScope,
         source_conversation_generation: telegramInputConversationGeneration(original),
-        source_segments: [{ ordinal: 0, source_index: 0, source_event_id: original.sourceEventId,
-          source_message_id: original.sourceMessageId, source_sequence: original.sourceSequence,
-          source_persisted: true, text: 'Private original goal', source_files: [{ file_id: 'private-file' }] }] } } };
+        source_segments: [
+          {
+            ordinal: 0,
+            source_index: 0,
+            source_event_id: original.sourceEventId,
+            source_message_id: original.sourceMessageId,
+            source_sequence: original.sourceSequence,
+            source_persisted: true,
+            text: 'Private original goal',
+            source_files: [{ file_id: 'private-file' }],
+          },
+        ],
+      },
+    },
+  };
 }
 test('a committed Main receipt retains exact source references without text or attachment data', () => {
   const result = committedCoverage();
-  expect(telegramInputDeliveryCoverage(result)).toEqual({ logical_turn_id: 'turn', revision: 2,
+  expect(telegramInputDeliveryCoverage(result)).toEqual({
+    logical_turn_id: 'turn',
+    revision: 2,
     source_order_scope: id().sourceOrderScope,
     source_conversation_generation: telegramInputConversationGeneration(id()),
-    sources: [{ source_event_id: id().sourceEventId, source_message_id: id().sourceMessageId, source_sequence: 1 }] });
-  expect(telegramInputConversationGeneration({ ...id(), conversationGeneration: 'c'.repeat(64) }))
-    .not.toBe(telegramInputConversationGeneration(id()));
+    sources: [
+      {
+        source_event_id: id().sourceEventId,
+        source_message_id: id().sourceMessageId,
+        source_sequence: 1,
+        owned: true,
+      },
+    ],
+  });
+  expect(
+    telegramInputConversationGeneration({ ...id(), conversationGeneration: 'c'.repeat(64) }),
+  ).not.toBe(telegramInputConversationGeneration(id()));
+});
+/* VIVENTIUM: a receipt records which covered sources its revision authored. */
+test('a committed receipt marks the sources its revision authored', () => {
+  const result = committedCoverage();
+  const [original] = result.presentation!.interactionContext!.source_segments!;
+  const later = id(2);
+  result.presentation!.interactionContext!.source_segments = [
+    { ...original, authoring_revision: 1 },
+    {
+      ...original,
+      ordinal: 1,
+      source_event_id: later.sourceEventId,
+      source_message_id: later.sourceMessageId,
+      source_sequence: later.sourceSequence,
+      authoring_revision: 2,
+    },
+  ];
+  expect(
+    telegramInputDeliveryCoverage(result)?.sources.map(({ source_event_id, owned }) => [
+      source_event_id,
+      owned,
+    ]),
+  ).toEqual([
+    [original.source_event_id, false],
+    [later.sourceEventId, true],
+  ]);
 });
 test('partial, stale, wrong-conversation, internal, unpersisted and non-Main receipts attest no source completion', () => {
   const original = committedCoverage();
@@ -188,12 +253,27 @@ test('partial, stale, wrong-conversation, internal, unpersisted and non-Main rec
     { ...original, acknowledgement: { ...original.acknowledgement!, state: 'committed_effect' } },
     { ...original, acknowledgement: { ...original.acknowledgement!, revision: 1 } },
     { ...original, acknowledgement: { ...original.acknowledgement!, source_kind: 'callback' } },
-    ...[{ conversation_id: 'other' }, { origin: 'callback' }, { actor_kind: 'system' },
-      { source_segments: [{ ...original.presentation!.interactionContext!.source_segments![0], source_persisted: undefined }] }]
-      .map(context => ({ ...original, presentation: { ...original.presentation!,
-        interactionContext: { ...original.presentation!.interactionContext!, ...context } } })),
+    ...[
+      { conversation_id: 'other' },
+      { origin: 'callback' },
+      { actor_kind: 'system' },
+      {
+        source_segments: [
+          {
+            ...original.presentation!.interactionContext!.source_segments![0],
+            source_persisted: undefined,
+          },
+        ],
+      },
+    ].map((context) => ({
+      ...original,
+      presentation: {
+        ...original.presentation!,
+        interactionContext: { ...original.presentation!.interactionContext!, ...context },
+      },
+    })),
   ] as DeliveryAcknowledgementResult[];
-  invalid.forEach(result => expect(telegramInputDeliveryCoverage(result)).toBeNull());
+  invalid.forEach((result) => expect(telegramInputDeliveryCoverage(result)).toBeNull());
 });
 
 test('a repeated observation retains one input and distinguishes a second preparation owner', async () => {
@@ -402,3 +482,341 @@ test('ready input yields its preparation lease promptly and a trailing heartbeat
   });
   expect(next.claimToken).not.toBe(row.claimToken);
 });
+
+/* VIVENTIUM: permanent preparation failure belongs to the whole verified upload group. */
+async function registerAlbum(f: ReturnType<typeof fixture>, count = 8) {
+  const members: TelegramInputRecord[] = [];
+  for (let sequence = 1; sequence <= count; sequence++)
+    members.push(await f.service.register(id(sequence, 'album'), registration));
+  return members;
+}
+
+test('permanent pre-ready upload failure terminalizes all eight original group claims exactly once', async () => {
+  const f = fixture();
+  const members = await registerAlbum(f);
+  const primary = members[7];
+  await f.service.status(
+    'owner',
+    claim(primary),
+    'failed',
+    'unsupported_file_type',
+    false,
+    members.map(claim),
+  );
+  for (const original of members) {
+    expect(f.rows.get(original.sourceEventId)).toMatchObject({
+      ...id(original.sourceSequence, 'album'),
+      state: 'failed',
+      streamId: '',
+      preparedDigest: '',
+      failureCode: 'unsupported_file_type',
+      retryAt: 0,
+      leaseUntil: 0,
+      failures: [{ code: 'unsupported_file_type', at: expect.any(Number) }],
+    });
+  }
+  await f.service.status(
+    'owner',
+    claim(primary),
+    'failed',
+    'unsupported_file_type',
+    false,
+    members.map(claim),
+  );
+  expect([...f.rows.values()].every((row) => row.failures.length === 1)).toBe(true);
+  f.advance();
+  expect(await f.service.claimPending(1)).toEqual([]);
+  expect(f.messages.size).toBe(0);
+});
+
+test('restart reconciles an old permanent failed group and releases independent committed settlement', async () => {
+  const f = fixture();
+  const members = await registerAlbum(f);
+  await f.service.status('owner', claim(members[7]), 'failed', 'unsupported_file_type');
+  const later = await f.service.register(id(9), registration);
+  await f.service.ready('owner', claim(later), input);
+  await f.service.bindStream('owner', claim(later), 'accepted-later');
+  f.streams.set('accepted-later', 'completed');
+  f.advance();
+  const restarted = createTelegramInputService(f.deps);
+  expect(await restarted.claimPending(1)).toEqual([]);
+  expect(members.every((row) => f.rows.get(row.sourceEventId)?.state === 'failed')).toBe(true);
+  expect(f.rows.get(later.sourceEventId)?.state).toBe('admitted');
+  expect(await restarted.claimPending(1)).toEqual([]);
+  expect(f.rows.get(later.sourceEventId)?.state).toBe('completed');
+  expect(f.persistPrepared).toHaveBeenCalledTimes(1);
+});
+
+test.each([
+  'libreChatUserId',
+  'telegramUserId',
+  'telegramChatId',
+  'telegramMessageThreadId',
+  'conversationId',
+  'conversationGeneration',
+  'sourceOrderScope',
+  'mediaGroupId',
+] as const)('group failure refuses a different %s before any member is changed', async (field) => {
+  const f = fixture();
+  const a = await f.service.register(id(1, 'album'), registration);
+  const foreignIdentity = {
+    ...id(2, 'album'),
+    [field]:
+      field === 'conversationGeneration' || field === 'sourceOrderScope' ? 'c'.repeat(64) : 'other',
+  };
+  const b = await f.service.register(foreignIdentity, registration);
+  await expect(
+    f.service.status('owner', claim(a), 'failed', 'unsupported_file_type', false, [
+      claim(a),
+      claim(b),
+    ]),
+  ).rejects.toMatchObject({ statusCode: 409 });
+  expect([...f.rows.values()].every((row) => row.state === 'preparing')).toBe(true);
+});
+
+test('group failure rejects an expired or rotated source claim without partial settlement', async () => {
+  const f = fixture();
+  const [a, b] = await registerAlbum(f, 2);
+  f.advance();
+  await expect(
+    f.service.status('owner', claim(b), 'failed', 'unsupported_file_type', false, [
+      claim(a),
+      claim(b),
+    ]),
+  ).rejects.toMatchObject({ code: 'source_input_claim_expired' });
+  const recovered = await f.service.claimPending(1);
+  await expect(
+    f.service.status('owner', claim(recovered[1]), 'failed', 'unsupported_file_type', false, [
+      claim(a),
+      claim(recovered[1]),
+    ]),
+  ).rejects.toMatchObject({ code: 'source_input_claim_conflict' });
+  expect([...f.rows.values()].every((row) => row.state === 'preparing')).toBe(true);
+});
+
+test('a late member cannot prepare a fragment of a permanently failed group and recovery retains its source', async () => {
+  const f = fixture();
+  const [a] = await registerAlbum(f, 1);
+  await f.service.status('owner', claim(a), 'failed', 'unsupported_file_type');
+  const late = await f.service.register(id(2, 'album'), registration);
+  await expect(f.service.ready('owner', claim(late), input)).rejects.toMatchObject({
+    code: 'source_input_group_failed',
+  });
+  expect(f.persistPrepared).not.toHaveBeenCalled();
+  f.advance();
+  expect(await f.service.claimPending(1)).toEqual([]);
+  expect(f.rows.get(late.sourceEventId)).toMatchObject({
+    ...id(2, 'album'),
+    state: 'failed',
+    failureCode: 'unsupported_file_type',
+    streamId: '',
+  });
+});
+
+test('terminal group reconciliation protects a separately admitted or prepared source and never replays it', async () => {
+  const f = fixture();
+  const [a, b, c] = await registerAlbum(f, 3);
+  await f.service.ready('owner', claim(a), input);
+  await f.service.bindStream('owner', claim(a), 'accepted');
+  await f.service.ready('owner', claim(b), input);
+  const failure = await f.service.register(id(4, 'album'), registration);
+  await f.service.status('owner', claim(failure), 'failed', 'unsupported_file_type');
+  f.streams.set('accepted', 'pending');
+  f.advance();
+  await f.service.claimPending();
+  expect(f.rows.get(a.sourceEventId)).toMatchObject({ state: 'admitted', streamId: 'accepted' });
+  expect(f.rows.get(b.sourceEventId)?.state).toBe('ready');
+  expect(f.rows.get(c.sourceEventId)).toMatchObject({ state: 'failed', streamId: '' });
+  expect(f.persistPrepared).toHaveBeenCalledTimes(2);
+});
+
+test('permanent group status cannot revoke a source that already became ready or admitted', async () => {
+  const f = fixture();
+  const [a, b] = await registerAlbum(f, 2);
+  await f.service.ready('owner', claim(a), input);
+  await f.service.bindStream('owner', claim(a), 'accepted');
+  await expect(
+    f.service.status('owner', claim(b), 'failed', 'unsupported_file_type', false, [
+      claim(a),
+      claim(b),
+    ]),
+  ).rejects.toMatchObject({ code: 'source_input_already_admitted' });
+  expect(f.rows.get(a.sourceEventId)).toMatchObject({ state: 'admitted', streamId: 'accepted' });
+  expect(f.rows.get(b.sourceEventId)?.state).toBe('preparing');
+});
+
+test('a raced group source change rolls back all permanent failure updates', async () => {
+  const f = fixture();
+  const [a, b] = await registerAlbum(f, 2);
+  const replace = f.deps.repository.replace;
+  f.deps.repository.replace = async (prior, next) =>
+    prior.sourceEventId === b.sourceEventId ? false : replace(prior, next);
+  await expect(
+    f.service.status('owner', claim(a), 'failed', 'unsupported_file_type', false, [
+      claim(a),
+      claim(b),
+    ]),
+  ).rejects.toMatchObject({ code: 'source_input_claim_conflict' });
+  expect(
+    [...f.rows.values()].every((row) => row.state === 'preparing' && !row.failures.length),
+  ).toBe(true);
+});
+
+test('recovery verifies every terminal group member owner before updating any source', async () => {
+  const f = fixture();
+  const [a, b] = await registerAlbum(f, 2);
+  await f.service.status('owner', claim(b), 'failed', 'unsupported_file_type');
+  f.deps.verifyOwner = async (record) => record?.sourceEventId !== b.sourceEventId;
+  f.advance();
+  await expect(f.service.claimPending(1)).rejects.toMatchObject({
+    code: 'source_input_owner_changed',
+  });
+  expect(f.rows.get(a.sourceEventId)?.state).toBe('preparing');
+  expect(f.rows.get(b.sourceEventId)?.state).toBe('failed');
+});
+
+test('a transient eight-member group retries as one group instead of becoming a permanent failure', async () => {
+  const f = fixture();
+  const members = await registerAlbum(f);
+  for (const member of members)
+    await f.service.status('owner', claim(member), 'failed', 'download_unavailable', true);
+  f.advance();
+  const recovered = await f.service.claimPending(1);
+  expect(recovered).toHaveLength(8);
+  expect(recovered.every((row) => row.state === 'preparing' && row.attempts === 1)).toBe(true);
+  expect(await f.service.claimPending(1)).toEqual([]);
+});
+
+test('exhausted pre-admission retries settle the group and no longer block a later accepted input', async () => {
+  const f = fixture();
+  const [a, b] = await registerAlbum(f, 2);
+  await f.service.status('owner', claim(b), 'failed', 'download_unavailable', true);
+  const failed = f.rows.get(b.sourceEventId)!;
+  f.rows.set(b.sourceEventId, { ...failed, attempts: 3 });
+  const later = await f.service.register(id(3), registration);
+  await f.service.ready('owner', claim(later), input);
+  await f.service.bindStream('owner', claim(later), 'accepted-later');
+  f.streams.set('accepted-later', 'completed');
+  f.advance();
+  expect(await f.service.claimPending(1)).toEqual([]);
+  expect(f.rows.get(a.sourceEventId)?.state).toBe('failed');
+  expect(f.rows.get(b.sourceEventId)).toMatchObject({ state: 'failed', retryAt: 0 });
+  expect(await f.service.claimPending(1)).toEqual([]);
+  expect(f.rows.get(later.sourceEventId)?.state).toBe('completed');
+});
+
+test('simultaneous permanent failure retries retain one terminal history event per source', async () => {
+  const f = fixture();
+  const members = await registerAlbum(f, 2);
+  const nativeTransaction = f.deps.transaction;
+  let held = Promise.resolve();
+  f.deps.transaction = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const previous = held;
+    let release = () => {};
+    held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await nativeTransaction(operation);
+    } finally {
+      release();
+    }
+  };
+  await Promise.all(
+    members.map((member) =>
+      f.service.status(
+        'owner',
+        claim(member),
+        'failed',
+        'unsupported_file_type',
+        false,
+        members.map(claim),
+      ),
+    ),
+  );
+  expect(
+    [...f.rows.values()].every((row) => row.state === 'failed' && row.failures.length === 1),
+  ).toBe(true);
+  expect(f.persistPrepared).not.toHaveBeenCalled();
+});
+
+test('recovery cannot use a permanent failure from a different conversation or source scope', async () => {
+  const f = fixture();
+  const a = await f.service.register(id(1, 'album'), registration);
+  const b = await f.service.register(
+    { ...id(2, 'album'), sourceOrderScope: 'c'.repeat(64) },
+    registration,
+  );
+  await f.service.status('owner', claim(b), 'failed', 'unsupported_file_type');
+  f.advance();
+  await expect(f.service.claimPending(1)).rejects.toMatchObject({
+    code: 'source_input_group_conflict',
+  });
+  expect(f.rows.get(a.sourceEventId)?.state).toBe('preparing');
+});
+
+test('a refused group settles only its verified primary and never recovers it after lease expiry', async () => {
+  const f = fixture();
+  const [primary, sibling] = await registerAlbum(f, 2);
+  const other = await f.service.register(id(3, 'other-group'), registration);
+  await f.service.ready('owner', claim(other), input);
+  await f.service.bindStream('owner', claim(other), 'other-accepted');
+  f.streams.set('other-accepted', 'completed');
+  const otherBefore = structuredClone(f.rows.get(other.sourceEventId));
+
+  await expect(
+    f.service.ready('owner', claim(primary), input, [claim(other)]),
+  ).rejects.toMatchObject({ code: 'source_input_group_conflict' });
+  await f.service.status('owner', claim(primary), 'failed', 'source_input_group_conflict', false, [
+    claim(primary),
+  ]);
+
+  expect(f.rows.get(primary.sourceEventId)).toMatchObject({
+    state: 'failed',
+    failureCode: 'source_input_group_conflict',
+    retryAt: 0,
+    streamId: '',
+  });
+  expect(f.rows.get(sibling.sourceEventId)?.state).toBe('preparing');
+  expect(f.rows.get(other.sourceEventId)).toEqual(otherBefore);
+  f.advance();
+  expect(await f.service.claimPending(1)).toEqual([]);
+  expect(f.rows.get(sibling.sourceEventId)).toMatchObject({
+    state: 'failed',
+    failureCode: 'source_input_group_conflict',
+    streamId: '',
+  });
+  expect(await f.service.claimPending(1)).toEqual([]);
+  expect(f.rows.get(other.sourceEventId)?.state).toBe('completed');
+  expect(f.persistPrepared).toHaveBeenCalledTimes(1);
+});
+
+test.each([
+  ['owner', 'source_input_claim_conflict'],
+  ['claim', 'source_input_claim_conflict'],
+  ['lease', 'source_input_claim_expired'],
+  ['prepared', 'source_input_already_admitted'],
+])(
+  'primary-only group failure preserves the exact %s guard without mutations',
+  async (guard, expectedCode) => {
+    const f = fixture();
+    const [primary, sibling] = await registerAlbum(f, 2);
+    let ownerId = 'owner';
+    let ownedClaim = claim(primary);
+    if (guard === 'owner') ownerId = 'other-owner';
+    if (guard === 'claim') ownedClaim = { ...ownedClaim, claimToken: registration };
+    if (guard === 'lease') f.advance();
+    if (guard === 'prepared') await f.service.ready('owner', claim(primary), input);
+    const before = JSON.stringify([...f.rows]);
+
+    await expect(
+      f.service.status(ownerId, ownedClaim, 'failed', 'source_input_group_conflict', false, [
+        ownedClaim,
+      ]),
+    ).rejects.toMatchObject({ code: expectedCode });
+
+    expect(JSON.stringify([...f.rows])).toBe(before);
+    expect(f.rows.get(sibling.sourceEventId)?.state).toBe('preparing');
+  },
+);

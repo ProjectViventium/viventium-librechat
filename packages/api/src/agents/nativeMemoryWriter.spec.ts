@@ -246,11 +246,16 @@ describe('typed memory-tool completion without an authored chat answer', () => {
       const { tool, func, authorize, onResult } = fixture();
       let active: ReturnType<typeof createNativeMemoryToolBinding>;
       const unregister = jest.fn();
+      if (outcome === 'completed') func.mockResolvedValue(['No durable memory update needed', undefined]);
       if (outcome === 'apply_failed') func.mockRejectedValue(new Error('storage uncertain'));
       if (outcome === 'receipt_failed') onResult.mockRejectedValue(new Error('receipt unavailable'));
       if (outcome === 'partial_result') func.mockResolvedValue(['Partial', { memory: { type: 'error', value: '{"partialApplied":true}' } }]);
       const providerError = Object.assign(new Error('No authored response'), {
-        code: outcome === 'other_failure' ? 'server_error' : 'missing_terminal_response',
+        code: outcome === 'other_failure'
+          ? 'server_error'
+          : ['completed', 'no_tool', 'receipt_failed'].includes(outcome)
+            ? 'provider_response_failed'
+            : 'missing_terminal_response',
       });
       const executor = createNativeMemoryExecutor({
         identity, authorize, user: { id: identity.userId } as never, requestBody: {},
@@ -276,6 +281,7 @@ describe('typed memory-tool completion without an authored chat answer', () => {
       else await expect(result).rejects.toBe(providerError);
       expect(func).toHaveBeenCalledTimes(outcome === 'no_tool' ? 0 : 1);
       expect(onResult).toHaveBeenCalledTimes(['no_tool', 'apply_failed'].includes(outcome) ? 0 : 1);
+      if (outcome === 'completed') expect(onResult.mock.calls[0][0][1]).toBeUndefined();
       if (outcome === 'partial_result') expect(onResult.mock.calls[0][0][1].memory.type).toBe('error');
       expect(unregister).toHaveBeenCalledTimes(1);
     },

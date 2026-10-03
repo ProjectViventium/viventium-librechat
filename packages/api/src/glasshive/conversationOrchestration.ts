@@ -51,6 +51,7 @@ export const MAIN_DELEGATION_STRING_LIMITS = Object.freeze({
 export const MAIN_DELEGATION_PROFILES = Object.freeze([
   'codex-cli',
   'claude-code',
+  'grok-build',
   'openclaw-general',
 ]);
 export const MAIN_DELEGATION_RESOURCE_CLASSES = Object.freeze(['standard', 'light']);

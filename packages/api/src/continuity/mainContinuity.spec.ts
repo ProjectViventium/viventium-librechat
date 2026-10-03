@@ -16,10 +16,111 @@ import {
   canDeferAcceptedMainCompaction,
 } from './mainContinuity';
 import type { AcceptedMainTurn, MainContinuityState } from './mainContinuity';
+import { isContextOnlyMainHistory } from './mainContext';
 import { ChatOpenAI } from '@langchain/openai';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import { formatAgentMessages, formatContentStrings } from '@librechat/agents';
+import { createHash } from 'node:crypto';
+
+describe('saved failed and restricted Main history', () => {
+  const restricted = {
+    metadata: {
+      viventium: {
+        callSessionId: 'synthetic-call',
+        inputMode: 'voice_call',
+        actorTrust: 'unknown',
+      },
+    },
+  };
+  test.each(['unknown', 'authenticated_participant', 'shared_mic_unverified'])(
+    'uses saved %s call authority as context without changing it',
+    (actorTrust) => {
+      const message = {
+        ...restricted,
+        metadata: {
+          viventium: {
+            ...restricted.metadata.viventium,
+            actorTrust,
+          },
+        },
+      };
+      const before = JSON.stringify(message);
+      expect(isContextOnlyMainHistory(message)).toBe(true);
+      expect(JSON.stringify(message)).toBe(before);
+    },
+  );
+  test('requires literal saved failure or complete typed restricted call facts', () => {
+    expect(isContextOnlyMainHistory({ error: true })).toBe(true);
+    for (const message of [
+      null,
+      {},
+      { error: 'true' },
+      { metadata: { viventium: { actorTrust: 'unknown' } } },
+      { metadata: { viventium: { ...restricted.metadata.viventium, callSessionId: '' } } },
+      { metadata: { viventium: { ...restricted.metadata.viventium, inputMode: 'voice_note' } } },
+      {
+        metadata: {
+          viventium: { ...restricted.metadata.viventium, actorTrust: 'owner_participant' },
+        },
+      },
+      { metadata: { viventium: { ...restricted.metadata.viventium, actorTrust: 'unrecognized' } } },
+    ])
+      expect(isContextOnlyMainHistory(message)).toBe(false);
+  });
+  test('the second chain producer keeps failed and restricted historical bodies unaccepted', () => {
+    const messages = [
+      { messageId: 'accepted', role: 'assistant', content: 'Healthy answer.' },
+      { messageId: 'failed', role: 'assistant', content: 'Delivered partial answer.', error: true },
+      {
+        messageId: 'restricted',
+        role: 'user',
+        content: 'Unverified earlier speech.',
+        ...restricted,
+      },
+      { messageId: 'current', role: 'user', content: 'Owner followup.' },
+    ];
+    const before = JSON.stringify(messages);
+    const headers = buildMainContinuityHeaders({
+      context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
+      messages,
+      sourceMessageIds: ['accepted', 'failed', 'restricted'],
+      logicalTurnId: 'turn',
+      deliverySources: [
+        {
+          messageId: 'failed',
+          delivery: {
+            version: 1,
+            surface: 'voice',
+            acknowledgement: 'committed',
+          },
+        },
+      ],
+    });
+    const chain = JSON.parse(
+      Buffer.from(headers['X-Viventium-Visible-Message-Chain-B64'], 'base64').toString(),
+    );
+    expect(
+      chain.map((entry: { id: string; accepted_source: boolean }) => [
+        entry.id,
+        entry.accepted_source,
+      ]),
+    ).toEqual([
+      ['accepted', true],
+      ['failed', false],
+      ['restricted', false],
+      ['current', false],
+    ]);
+    expect(chain[1].delivery).toEqual({
+      version: 1,
+      surface: 'voice',
+      acknowledgement: 'committed',
+    });
+    expect(chain[1].sha256).toBe(createHash('sha256').update(messages[1].content).digest('hex'));
+    expect(JSON.stringify(messages)).toBe(before);
+    assertMainContinuityCarrier(messages, headers['X-Viventium-Visible-Message-Chain-B64'], true);
+  });
+});
 
 describe('native source carrier preparation', () => {
   test('preserves tool results and non-text blocks and leaves other routes untouched', () => {
@@ -336,6 +437,49 @@ describe('model-owned reference materiality and structural feedback', () => {
     };
     expect(prepareMainCompactionCandidate(candidate, source)).toEqual(candidate);
   });
+  test('reports how many bytes a whole-proposal overflow must lose and where they are', () => {
+    const candidate = {
+      ...faithful,
+      pendingAsks: Array.from({ length: 8 }, (_, index) => `${index}:${'a'.repeat(900)}`),
+    };
+    const result = inspectMainCompactionCandidate(candidate);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), 'utf8');
+    expect(result.issue).toMatchObject({
+      path: '',
+      constraint: 'max_bytes',
+      limit: mainCompactionOutputConstraints.maxJsonUtf8Bytes,
+      unit: 'utf8_bytes',
+    });
+    expect(result.issue.excessBytes).toBe(
+      (result.issue.actual as number) - mainCompactionOutputConstraints.maxJsonUtf8Bytes,
+    );
+    expect(result.issue.fieldBytes).toMatchObject({
+      summary: bytes(candidate.summary),
+      pendingAsks: bytes(candidate.pendingAsks),
+    });
+  });
+  test('a field size rejection also shows the whole-proposal size when that is over budget', () => {
+    const candidate = {
+      ...faithful,
+      summary: 'a'.repeat(mainCompactionOutputConstraints.maxJsonUtf8Bytes + 200),
+      pendingAsks: ['Keep the draft unchanged.'],
+    };
+    const result = inspectMainCompactionCandidate(candidate);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.issue).toMatchObject({ path: 'summary', constraint: 'max_bytes' });
+    expect(result.issue.proposalBytes).toBeGreaterThan(
+      mainCompactionOutputConstraints.maxJsonUtf8Bytes,
+    );
+    expect(result.issue.excessBytes).toBe(
+      (result.issue.proposalBytes as number) - mainCompactionOutputConstraints.maxJsonUtf8Bytes,
+    );
+    expect(result.issue.fieldBytes).toMatchObject({
+      summary: Buffer.byteLength(JSON.stringify(candidate.summary), 'utf8'),
+    });
+  });
   test('reports the actual array constraint without truncating an invalid proposal', () => {
     const candidate = {
       ...faithful,
@@ -499,9 +643,65 @@ describe('automatic compaction pressure', () => {
       attempts: 0,
     });
     expect((await service.loadAcceptedMainContext(identity)).capsule).toContain(sourceText);
-    expect(await service.claimAcceptedMainCompaction(identity)).toMatchObject({
-      status: 'claimed',
+    const before = Date.now();
+    const claim = await service.claimAcceptedMainCompaction(identity);
+    expect(claim).toMatchObject({ status: 'claimed' });
+    // The claim exposes the store-owned lease expiry for bounded work.
+    const expiresAt = new Date(claim.leaseExpiresAt as Date).getTime();
+    expect(expiresAt).toBeGreaterThan(before);
+    expect(expiresAt).toBeLessThanOrEqual(Date.now() + 5 * 60 * 1000);
+  });
+  test('a smaller claim source target defers the rest of the accepted prefix, not drops it', async () => {
+    const { service, identity } = fixture();
+    for (let index = 0; index < 6; index += 1) {
+      await service.commitAcceptedMainTurn({ ...identity, ...turn(index) });
+    }
+    const small = await service.claimAcceptedMainCompaction({ ...identity, sourceTargetBytes: 1 });
+    expect(small).toMatchObject({ status: 'claimed' });
+    // One indivisible whole turn at least; the claim reports the source volume it took.
+    expect(small.sourceTurns as unknown[]).toHaveLength(1);
+    expect(small.sourceBytes).toBeGreaterThan(0);
+    const rejected = await service.rejectAcceptedMainCompaction({
+      ...identity,
+      leaseId: small.leaseId,
+      reason: 'schema_invalid',
     });
+    expect(rejected).toMatchObject({ status: 'rejected' });
+    // The default target takes the whole claimable prefix (recent turns stay protected).
+    const full = await service.claimAcceptedMainCompaction(identity);
+    expect((full.sourceTurns as unknown[]).length).toBeGreaterThan(1);
+    expect(full.sourceBytes as number).toBeGreaterThan(small.sourceBytes as number);
+  });
+  test('a durably degraded unaccepted proposal makes the next claim start with half the source', async () => {
+    const { service, identity } = fixture();
+    for (let index = 0; index < 10; index += 1) {
+      await service.commitAcceptedMainTurn({
+        ...identity,
+        ...turn(index, `Request ${index}: ${'x'.repeat(14 * 1024)}`),
+      });
+    }
+    const first = await service.claimAcceptedMainCompaction(identity);
+    expect(first.sourceBytes as number).toBeGreaterThan(40 * 1024);
+    await service.rejectAcceptedMainCompaction({
+      ...identity,
+      leaseId: first.leaseId,
+      reason: 'schema_invalid',
+    });
+    const next = await service.claimAcceptedMainCompaction(identity);
+    expect(next.sourceBytes as number).toBeLessThanOrEqual(40 * 1024 + 15 * 1024);
+    expect((next.sourceTurns as unknown[]).length).toBeLessThan(
+      (first.sourceTurns as unknown[]).length,
+    );
+    await service.rejectAcceptedMainCompaction({
+      ...identity,
+      leaseId: next.leaseId,
+      reason: 'provider_http_503',
+    });
+    // A provider failure is not an unaccepted proposal: the default source target applies.
+    const afterTransport = await service.claimAcceptedMainCompaction(identity);
+    expect((afterTransport.sourceTurns as unknown[]).length).toBe(
+      (first.sourceTurns as unknown[]).length,
+    );
   });
   test('short accepted turns create bounded batches rather than a new compaction on every turn', async () => {
     const { service, identity } = fixture();
@@ -903,6 +1103,49 @@ describe('accepted source message delivery', () => {
       ),
     ).toThrow('removed or changed');
   });
+
+  test.each([
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+    { type: 'file', file: { filename: 'report.pdf', file_data: 'AA==' } },
+    { type: 'input_audio', input_audio: { data: 'AA==', format: 'wav' } },
+    { type: 'video', video: { url: 'data:video/mp4;base64,AA==' } },
+  ])('keeps the Core authored-text source hash through $type serialization', (media) => {
+    const caption = 'Describe the source and keep its caption.';
+    const message = {
+      messageId: 'retained-media', role: 'user',
+      content: [{ type: 'text', text: caption }, media],
+    };
+    // Core's original source has authored prose beside owner-scoped media, not an invented label.
+    const original = Buffer.from(JSON.stringify([{
+      id: message.messageId, role: 'user', accepted_source: true,
+      sha256: createHash('sha256').update(caption).digest('hex'),
+    }])).toString('base64');
+    expect(() => assertMainContinuityCarrier([message], original)).not.toThrow();
+    expect(() => assertMainContinuityCarrier([{ ...message,
+      content: [{ type: 'text', text: 'Changed caption.' }, media],
+    }], original)).toThrow('removed or changed');
+    expect(() => assertMainContinuityCarrier([], original)).toThrow('removed or changed');
+
+    const bound = buildMainContinuityHeaders({
+      context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
+      messages: [message], sourceMessageIds: [message.messageId], logicalTurnId: 'turn',
+    })['X-Viventium-Visible-Message-Chain-B64'];
+    expect(() => assertMainContinuityCarrier([message], bound, true)).not.toThrow();
+    expect(() => assertMainContinuityCarrier([{ ...message,
+      content: [{ type: 'text', text: caption }, { ...media, changed: true }],
+    }], bound, true)).toThrow('removed or changed');
+  });
+
+  test.each(['Original prose.', { type: 'output_text', output_text: 'Original prose.' }])(
+    'keeps supported authored prose shapes through the serialized text guard', (part) => {
+      const original = Buffer.from(JSON.stringify([{
+        id: 'source', role: 'user', accepted_source: true,
+        sha256: createHash('sha256').update('Original prose.').digest('hex'),
+      }])).toString('base64');
+      expect(() => assertMainContinuityCarrier([{ role: 'user', content: [part] }], original))
+        .not.toThrow();
+    },
+  );
 
   test('final fetch preserves the exact request and refuses a dropped source before dispatch', async () => {
     const projected = projectAcceptedMainMessages(

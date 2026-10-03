@@ -13,9 +13,13 @@ const {
   recordCompletedCortexInsightDeliveryBatch,
   requireExactCortexInsightDeliveryAcceptance,
   requireExactCortexInsightPersistenceEnvelope,
+  resolveCortexRuntimeSlotIdentity,
 } = require('~/server/services/viventium/CortexInsightDeliveryService');
 
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/* VIVENTIUM: a live Phase B owner holds its accepted rows no longer than a live ledger claim lease. */
+const OWNER_LEASE_MS = 60 * 60 * 1000;
+const PROCESS_OWNER_EPOCH = `boot_${crypto.randomUUID()}`;
 const MIN_REPLAY_BACKOFF_MS = 1_000;
 const MAX_REPLAY_BACKOFF_MS = 60_000;
 const MAX_BATCH_ENTRIES = 256;
@@ -125,7 +129,16 @@ function createCortexInsightOutboxService({
   OutboxModel = createViventiumCortexInsightOutbox(mongoose),
   now = () => new Date(),
   randomUUID = () => crypto.randomUUID(),
+  runtimeSlot = '',
+  runtimeEpoch = PROCESS_OWNER_EPOCH,
+  DeliveryModel = null,
 } = {}) {
+  let resolvedOwnerSlot = normalizeText(runtimeSlot);
+  function ownerSlot() {
+    if (!resolvedOwnerSlot) resolvedOwnerSlot = resolveCortexRuntimeSlotIdentity();
+    return resolvedOwnerSlot;
+  }
+
   function lacksEmbeddedBatch(row) {
     return !Array.isArray(row?.batchEntries) || row.batchEntries.length === 0;
   }
@@ -781,10 +794,214 @@ function createCortexInsightOutboxService({
     return { deleted: Number(result?.deletedCount) || 0 };
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Phase B owner-batched acceptance.
+   * Purpose: A parent admits exactly one delivery envelope, but its cortices finish one by one. Each
+   * completed insight is therefore accepted here exactly and durably without batch membership, held
+   * for its live owner. The owner records the parent's one batch from every accepted insight and
+   * settles these rows; rows it released, or rows whose runtime slot restarted, replay as one
+   * grouped batch per parent turn through the existing undeclared-row path.
+   * === VIVENTIUM END === */
+  /* Phase B owner lifecycle per parent turn in this process: open -> sealed -> closed. */
+  const ownerStates = new Map();
+
+  function ownerStateKey(ownerId, parentMessageId) {
+    return `${normalizeText(ownerId)}\u0000${normalizeText(parentMessageId)}`;
+  }
+
+  function ownerClosedError() {
+    const error = new Error('Phase B owner already closed this parent turn');
+    error.code = 'cortex_insight_owner_closed';
+    return error;
+  }
+
+  function pruneClosedOwnerStates() {
+    const cutoff = now().getTime() - OWNER_LEASE_MS;
+    for (const [key, state] of ownerStates) {
+      if (state.phase === 'closed' && state.closedAt < cutoff) ownerStates.delete(key);
+    }
+  }
+
+  async function parentHasLedgerRows(userId, parentMessageId) {
+    const model = DeliveryModel || require('~/db/models').ViventiumCortexInsightDelivery;
+    if (typeof model?.exists !== 'function') return false;
+    return Boolean(await model.exists({ userId, parentMessageId }));
+  }
+
+  /** The Phase B owner opens its parent turn before any of its cortices can finish. */
+  function registerOwnedParent({ ownerId, parentMessageId } = {}) {
+    const key = ownerStateKey(ownerId, parentMessageId);
+    if (!normalizeText(ownerId) || !normalizeText(parentMessageId) || ownerStates.has(key)) return;
+    pruneClosedOwnerStates();
+    ownerStates.set(key, { phase: 'open', inflight: new Set(), closedAt: 0 });
+  }
+
+  async function acceptOwnedInsight(params) {
+    const insights = (Array.isArray(params?.insights) ? params.insights : []).filter((insight) =>
+      exactInsightText(insight?.insight),
+    );
+    if (insights.length !== 1) throw outboxConflictError();
+    const [candidate] = buildCortexInsightDeliveryCandidates({ ...params, insights });
+    if (!candidate) return { outboxKeys: [] };
+    const state = ownerStates.get(ownerStateKey(candidate.userId, candidate.parentMessageId));
+    // A sealing owner has fixed its accepted set; a closed or absent owner can no longer form it.
+    if (state?.phase === 'sealed') throw ownerClosedError();
+    const owned = state?.phase === 'open';
+    const write = (async () => {
+      if (!owned && (await parentHasLedgerRows(candidate.userId, candidate.parentMessageId))) {
+        throw ownerClosedError();
+      }
+      const acceptedAt = now();
+      const feelingSnapshot = normalizeCortexFeelingSnapshot(params?.feelingSnapshot);
+      const entry = {
+        outboxKey: candidate.deliveryKey,
+        deliveryId: candidate.deliveryId,
+        userId: candidate.userId,
+        conversationId: candidate.conversationId,
+        parentMessageId: candidate.parentMessageId,
+        cortexId: candidate.cortexId,
+        cortexName: candidate.cortexName,
+        insight: exactInsightText(insights[0].insight),
+        insightHash: candidate.insightHash,
+        graphResultHash: candidate.graphResultHash,
+        surface: candidate.surface,
+        streamId: candidate.streamId,
+        sourceRevision: candidate.sourceRevision,
+        messageRevision: candidate.messageRevision,
+        ...(feelingSnapshot ? { feelingSnapshot } : {}),
+        // Held for a live owner; otherwise due now as its own grouped replay batch.
+        nextAttemptAt: owned ? new Date(acceptedAt.getTime() + OWNER_LEASE_MS) : acceptedAt,
+        replayAttempts: 0,
+        replayState: REPLAY_STATE_PENDING,
+        lastFailureCode: '',
+        lastFailureAt: null,
+        quarantinedAt: null,
+        retentionAlertAt: new Date(acceptedAt.getTime() + RETENTION_MS),
+        ownerRuntimeSlot: owned ? ownerSlot() : '',
+        ownerRuntimeEpoch: owned ? runtimeEpoch : '',
+      };
+      try {
+        await OutboxModel.updateOne(
+          { outboxKey: entry.outboxKey },
+          { $setOnInsert: entry },
+          { upsert: true },
+        );
+      } catch (error) {
+        if (Number(error?.code) !== 11000) throw error;
+      }
+      const [persisted] = await readEntries([entry]);
+      if (!persisted || !isUndeclaredLegacyRow(persisted)) throw outboxConflictError();
+      try {
+        requireExactCortexInsightPersistenceEnvelope(entry, persisted);
+      } catch (_error) {
+        throw outboxConflictError();
+      }
+      return { outboxKeys: [entry.outboxKey] };
+    })();
+    if (owned) state.inflight.add(write);
+    try {
+      return await write;
+    } finally {
+      if (owned) state.inflight.delete(write);
+    }
+  }
+
+  /**
+   * The owner fixes its accepted set before it records the parent's batch: no new acceptance can
+   * join, every acceptance already writing completes, and the exact accepted insights are returned.
+   */
+  async function sealOwnedInsights({ ownerId, parentMessageId } = {}) {
+    const userId = normalizeText(ownerId);
+    const parent = normalizeText(parentMessageId);
+    if (!userId || !parent) return [];
+    const key = ownerStateKey(userId, parent);
+    const state = ownerStates.get(key) || { phase: 'open', inflight: new Set(), closedAt: 0 };
+    state.phase = 'sealed';
+    ownerStates.set(key, state);
+    await Promise.allSettled([...state.inflight]);
+    if (storeDisconnected()) return [];
+    const rows = await OutboxModel.find({
+      userId,
+      parentMessageId: parent,
+      ownerRuntimeSlot: ownerSlot(),
+      ownerRuntimeEpoch: runtimeEpoch,
+    })
+      .select('+insight +streamId +feelingSnapshot +graphResultHash')
+      .sort({ createdAt: 1, _id: 1 })
+      .lean();
+    return (Array.isArray(rows) ? rows : []).map((row) => ({
+      cortexId: row.cortexId,
+      cortexName: row.cortexName,
+      insight: row.insight,
+      status: 'completed',
+    }));
+  }
+
+  /** Settlement and release are best effort; a disconnected store leaves rows owned until restart. */
+  function storeDisconnected() {
+    return Boolean(OutboxModel?.db) && OutboxModel.db.readyState !== 1;
+  }
+
+  async function settleOwnedInsights({ ownerId, parentMessageId, outboxKeys = [] } = {}) {
+    const keys = [
+      ...new Set((Array.isArray(outboxKeys) ? outboxKeys : []).map(normalizeText).filter(Boolean)),
+    ];
+    if (keys.length === 0 || storeDisconnected()) return { deleted: 0 };
+    const result = await OutboxModel.deleteMany({
+      userId: normalizeText(ownerId),
+      parentMessageId: normalizeText(parentMessageId),
+      outboxKey: { $in: keys },
+      ownerRuntimeSlot: ownerSlot(),
+      ownerRuntimeEpoch: runtimeEpoch,
+    });
+    return { deleted: Number(result?.deletedCount) || 0 };
+  }
+
+  async function releaseOwnedInsights({ ownerId, parentMessageId } = {}) {
+    const userId = normalizeText(ownerId);
+    const parent = normalizeText(parentMessageId);
+    const state = ownerStates.get(ownerStateKey(userId, parent));
+    if (state) {
+      state.phase = 'closed';
+      state.closedAt = now().getTime();
+    }
+    if (!userId || !parent || storeDisconnected()) return { released: 0 };
+    const result = await OutboxModel.updateMany(
+      {
+        userId,
+        parentMessageId: parent,
+        ownerRuntimeSlot: ownerSlot(),
+        ownerRuntimeEpoch: runtimeEpoch,
+      },
+      { $set: { nextAttemptAt: now(), ownerRuntimeSlot: '', ownerRuntimeEpoch: '' } },
+    );
+    return { released: Number(result?.modifiedCount) || 0 };
+  }
+
+  /** A row owned by an earlier boot of this runtime slot has no live owner left. */
+  async function releaseOrphanedOwnedInsights() {
+    if (typeof OutboxModel?.updateMany !== 'function') return;
+    let slot;
+    try {
+      slot = ownerSlot();
+    } catch (_error) {
+      return;
+    }
+    await OutboxModel.updateMany(
+      {
+        ownerRuntimeSlot: slot,
+        ownerRuntimeEpoch: { $exists: true, $nin: ['', runtimeEpoch] },
+      },
+      { $set: { nextAttemptAt: now(), ownerRuntimeSlot: '', ownerRuntimeEpoch: '' } },
+    );
+  }
+  /* === VIVENTIUM END === */
+
   async function replayPending({
     limit = 100,
     recordBatch = recordCompletedCortexInsightDeliveryBatch,
   } = {}) {
+    await releaseOrphanedOwnedInsights();
     const replayStartedAt = now();
     const dueFilter = {
       $and: [
@@ -954,7 +1171,16 @@ function createCortexInsightOutboxService({
     return summary;
   }
 
-  return { enqueueBatch, settleBatch, replayPending };
+  return {
+    enqueueBatch,
+    settleBatch,
+    replayPending,
+    registerOwnedParent,
+    acceptOwnedInsight,
+    sealOwnedInsights,
+    settleOwnedInsights,
+    releaseOwnedInsights,
+  };
 }
 
 const defaultService = createCortexInsightOutboxService();
@@ -964,4 +1190,9 @@ module.exports = {
   enqueueCompletedCortexInsightOutboxBatch: defaultService.enqueueBatch,
   settleCompletedCortexInsightOutboxBatch: defaultService.settleBatch,
   replayCompletedCortexInsightOutbox: defaultService.replayPending,
+  registerOwnedCompletedCortexParent: defaultService.registerOwnedParent,
+  acceptOwnedCompletedCortexInsight: defaultService.acceptOwnedInsight,
+  sealOwnedCompletedCortexInsights: defaultService.sealOwnedInsights,
+  settleOwnedCompletedCortexInsights: defaultService.settleOwnedInsights,
+  releaseOwnedCompletedCortexInsights: defaultService.releaseOwnedInsights,
 };

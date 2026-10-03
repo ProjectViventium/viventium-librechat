@@ -1,6 +1,14 @@
 /* === VIVENTIUM START === Durable VoiceTask/restart/cancellation regression tests. === VIVENTIUM END === */
 const mongoose = require('mongoose');
 const { MongoMemoryServer } = require('mongodb-memory-server');
+const mockNativeAccount = jest.fn();
+const mockNativeWorkAction = jest.fn();
+jest.mock('../GlassHiveAccountService', () => ({
+  requestAccountApi: (...args) => mockNativeAccount(...args),
+}));
+jest.mock('../GlassHiveWorkActionService', () => ({
+  executeGlassHiveWorkAction: (...args) => mockNativeWorkAction(...args),
+}));
 const service = require('../VoiceTaskService');
 
 describe('VoiceTask durable replay and suppression', () => {
@@ -25,6 +33,185 @@ describe('VoiceTask durable replay and suppression', () => {
     service.setVoiceTaskSuppressionPersistenceForTests(null);
     await ViventiumVoiceTask.deleteMany({});
     await ViventiumVoiceTaskSuppression.deleteMany({});
+  });
+
+  function nativePermission() {
+    return {
+      version: 1,
+      kind: 'permission',
+      state: 'pending',
+      mode: 'form',
+      runtimeName: 'Native runtime',
+      requestId: 'permission-1',
+      requestFingerprint: 'a'.repeat(64),
+      runId: 'run-native',
+      attemptId: 'attempt-1',
+      sessionId: 'session-1',
+      expiresAt: '2099-01-01T00:00:00Z',
+      message: 'Permit this operation?',
+      requestedSchema: {
+        type: 'object',
+        required: ['optionId'],
+        properties: {
+          optionId: {
+            type: 'string',
+            enum: ['allow_once', 'reject_once'],
+            enumNames: ['Allow once', 'Reject once'],
+          },
+        },
+      },
+    };
+  }
+
+  async function prepareNativeInput(expiresAt) {
+    const scope = { userId: 'native-owner', callSessionId: 'native-call' };
+    const task = service.createVoiceTask({
+      ...scope,
+      streamId: 'glasshive:run-native',
+      owner: { kind: 'glasshive_run', id: 'run-native' },
+    });
+    const pending = { ...nativePermission(), ...(expiresAt ? { expiresAt } : {}) };
+    mockNativeAccount.mockResolvedValue({ workRef: 'work-native', pendingNativeInput: pending });
+    await require('../GlassHiveVoiceTaskActionService').registerGlassHiveVoiceTaskActionCapabilities(
+      {
+        task,
+        ownerId: scope.userId,
+        workRef: 'work-native',
+        body: { event: 'run.needs_input', run_id: 'run-native', pending_native_input: pending },
+      },
+    );
+    await service.flushVoiceTaskPersistence();
+    return {
+      task,
+      scope,
+      pending,
+      authority: {
+        callSessionId: scope.callSessionId,
+        binding: { callSessionId: scope.callSessionId, userId: scope.userId },
+      },
+    };
+  }
+
+  test('commits exact native retry identity before the effect and restores the same owner operation after restart', async () => {
+    const { task, scope, authority } = await prepareNativeInput();
+    let originalOperation;
+    mockNativeWorkAction.mockImplementationOnce(async (input) => {
+      originalOperation = input;
+      const row = await ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean();
+      expect(row.payload.inputOperation).toEqual({
+        hash: require('crypto').createHash('sha256').update('allow_once').digest('hex'),
+        operationId: input.operationId,
+      });
+      expect(row.payload.nativeMissionInputBinding).toMatchObject({
+        taskId: task.taskId,
+        workRef: 'work-native',
+        requestFingerprint: 'a'.repeat(64),
+        userId: scope.userId,
+        callSessionId: scope.callSessionId,
+      });
+      expect(JSON.stringify(row.payload.inputOperation)).not.toContain('allow_once');
+      return { status: 'pending', confirmationPending: true };
+    });
+    expect(
+      await service.submitVoiceTaskInput(task.taskId, 'allow_once', {
+        userId: scope.userId,
+        voiceAuthorityContext: authority,
+      }),
+    ).toMatchObject({ ok: true, confirmationPending: true, task: { state: 'needs_input' } });
+    await service.flushVoiceTaskPersistence();
+    service.resetVoiceTasksForTests();
+    mockNativeAccount.mockClear();
+    expect(
+      await service.hydrateVoiceTask(task.taskId, { ...scope, userId: 'foreign-owner' }),
+    ).toBeNull();
+    expect(mockNativeAccount).not.toHaveBeenCalled();
+    await service.hydrateVoiceTask(task.taskId, scope);
+    expect(mockNativeAccount).toHaveBeenCalledWith({
+      ownerId: scope.userId,
+      path: '/v1/work/work-native',
+    });
+    expect(
+      await service.submitVoiceTaskInput(task.taskId, 'reject_once', {
+        userId: scope.userId,
+        voiceAuthorityContext: authority,
+      }),
+    ).toMatchObject({ ok: false, code: 'input_confirmation_pending' });
+    mockNativeWorkAction.mockResolvedValueOnce({
+      status: 'already_accepted',
+      confirmationPending: false,
+    });
+    expect(
+      await service.submitVoiceTaskInput(task.taskId, 'allow_once', {
+        userId: scope.userId,
+        voiceAuthorityContext: authority,
+      }),
+    ).toMatchObject({ ok: true, task: { state: 'running' } });
+    expect(mockNativeWorkAction.mock.calls.at(-1)[0]).toEqual(originalOperation);
+  });
+
+  test('restart after expiry reconciles only the previously retained native operation when the live question has gone', async () => {
+    const expiresAtMs = Date.now() + 10000;
+    const { task, scope, authority, pending } = await prepareNativeInput(
+      new Date(expiresAtMs).toISOString(),
+    );
+    mockNativeWorkAction.mockResolvedValueOnce({ status: 'pending', confirmationPending: true });
+    expect(
+      await service.submitVoiceTaskInput(task.taskId, 'allow_once', {
+        userId: scope.userId,
+        voiceAuthorityContext: authority,
+      }),
+    ).toMatchObject({ ok: true, confirmationPending: true, task: { state: 'needs_input' } });
+    const submitted = mockNativeWorkAction.mock.calls.at(-1)[0];
+    await service.flushVoiceTaskPersistence();
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(expiresAtMs + 1);
+    try {
+      service.resetVoiceTasksForTests();
+      mockNativeAccount.mockResolvedValue({ workRef: 'work-native', pendingNativeInput: null });
+      await service.hydrateVoiceTask(task.taskId, scope);
+      expect(
+        await service.submitVoiceTaskInput(task.taskId, 'reject_once', {
+          userId: scope.userId,
+          voiceAuthorityContext: authority,
+        }),
+      ).toMatchObject({ ok: false, code: 'input_confirmation_pending' });
+      mockNativeWorkAction.mockResolvedValueOnce({
+        status: 'already_accepted',
+        confirmationPending: false,
+      });
+      expect(
+        await service.submitVoiceTaskInput(task.taskId, 'allow_once', {
+          userId: scope.userId,
+          voiceAuthorityContext: authority,
+        }),
+      ).toMatchObject({ ok: true, task: { state: 'running' } });
+      expect(mockNativeWorkAction.mock.calls.at(-1)[0]).toEqual(submitted);
+      expect(submitted.nativeInput.requestFingerprint).toBe(pending.requestFingerprint);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test('native durability failure stops the owner effect and the same operation can retry', async () => {
+    const { task, scope, authority } = await prepareNativeInput();
+    const bulkWrite = jest
+      .spyOn(ViventiumVoiceTask, 'bulkWrite')
+      .mockRejectedValue(new Error('synthetic storage outage'));
+    mockNativeWorkAction.mockClear();
+    expect(
+      await service.submitVoiceTaskInput(task.taskId, 'allow_once', {
+        userId: scope.userId,
+        voiceAuthorityContext: authority,
+      }),
+    ).toMatchObject({ ok: false, code: 'owner_input_failed' });
+    expect(mockNativeWorkAction).not.toHaveBeenCalled();
+    bulkWrite.mockRestore();
+    mockNativeWorkAction.mockResolvedValueOnce({ status: 'accepted', confirmationPending: false });
+    expect(
+      await service.submitVoiceTaskInput(task.taskId, 'allow_once', {
+        userId: scope.userId,
+        voiceAuthorityContext: authority,
+      }),
+    ).toMatchObject({ ok: true, task: { state: 'running' } });
   });
 
   test('persists the canonical ready binding without another generation event and hydrates it after restart', async () => {

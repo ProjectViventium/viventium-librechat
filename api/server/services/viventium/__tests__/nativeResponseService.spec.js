@@ -1,8 +1,12 @@
 const mockCommitProjection = jest.fn();
 const mockProjectionComplete = jest.fn();
 const mockRecover = jest.fn();
+const mockConfig = jest.fn();
+const mockLoadAgent = jest.fn();
+const mockPermission = jest.fn();
 let mockTransactionDepth = 0;
 const mockModels = {
+  findUser: jest.fn(),
   getNativeResponse: jest.fn(),
   getMessages: jest.fn(),
   getMessage: jest.fn(),
@@ -14,7 +18,9 @@ const mockJobs = {
   finishNativeResponse: jest.fn(),
   settleNativeResponse: jest.fn(),
   getJob: jest.fn(),
+  getJobStore: jest.fn(),
   acknowledgeStreamDelivery: jest.fn(),
+  renewNativeDispatchLease: jest.fn(async () => true),
 };
 
 jest.mock('@librechat/api', () => ({
@@ -27,6 +33,11 @@ jest.mock('@librechat/api', () => ({
   sanitizeMessageForTransmit: (message) => message,
 }));
 jest.mock('~/models', () => mockModels);
+jest.mock('~/server/services/Config', () => ({ getAppConfig: (...args) => mockConfig(...args) }));
+jest.mock('~/models/Agent', () => ({ loadAgent: (...args) => mockLoadAgent(...args) }));
+jest.mock('~/server/services/PermissionService', () => ({
+  checkPermission: (...args) => mockPermission(...args),
+}));
 jest.mock('../ViventiumMainContinuityService', () => ({
   commitAcceptedMainTurnFromPresentation: (...args) => mockCommitProjection(...args),
 }));
@@ -42,11 +53,69 @@ jest.mock('../GlassHiveTerminalCallbackTransaction', () => ({
 }));
 
 const {
+  resolveNativeResponseRoute,
   recoverSavedNativeResponse,
   recoverNativeResponse,
   markNativeResponseReplayStored,
   mutateNativeResponseSources,
 } = require('../nativeResponseService');
+
+describe('existing native route authorization reuse', () => {
+  const identity = { userId: 'owner', agentId: 'agent_synthetic', providerId: 'native-provider' };
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockModels.findUser.mockResolvedValue({ _id: 'owner', role: 'USER' });
+    mockLoadAgent.mockResolvedValue({ _id: 'agent-record' });
+    mockPermission.mockResolvedValue(true);
+    mockConfig.mockResolvedValue({
+      endpoints: {
+        agents: {
+          providerCapabilities: {
+            'native-provider': { conversation_session: true, workspace_binding: true },
+          },
+        },
+        custom: [
+          { name: 'native-provider', baseURL: 'http://127.0.0.1:8766/v1', apiKey: 'synthetic-key' },
+        ],
+      },
+    });
+  });
+  test('reuses owner-scoped configured provider and existing agent VIEW permission', async () => {
+    expect(await resolveNativeResponseRoute(identity)).toEqual({
+      baseURL: 'http://127.0.0.1:8766/v1',
+      headers: { Authorization: 'Bearer synthetic-key', 'X-Viventium-User-Id': 'owner' },
+    });
+    expect(mockModels.findUser).toHaveBeenCalledWith({ _id: 'owner' });
+    expect(mockPermission).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: 'owner', resourceId: 'agent-record' }),
+    );
+  });
+  test('absent owner never resolves another user route', async () => {
+    mockModels.findUser.mockResolvedValue(null);
+    await expect(resolveNativeResponseRoute(identity)).rejects.toThrow(
+      'native_response_owner_unavailable',
+    );
+    expect(mockLoadAgent).not.toHaveBeenCalled();
+  });
+  test('existing denied agent permission remains denied', async () => {
+    mockPermission.mockResolvedValue(false);
+    await expect(resolveNativeResponseRoute(identity)).rejects.toThrow(
+      'native_response_agent_unavailable',
+    );
+  });
+  test('nonconversation provider cannot become artifact transport', async () => {
+    await expect(
+      resolveNativeResponseRoute({ ...identity, providerId: 'foreign-provider' }),
+    ).rejects.toThrow('native_response_provider_unavailable');
+  });
+  test('missing provider credential stays unavailable', async () => {
+    const config = await mockConfig();
+    config.endpoints.custom[0].apiKey = '';
+    await expect(resolveNativeResponseRoute(identity)).rejects.toThrow(
+      'native_response_auth_unavailable',
+    );
+  });
+});
 
 describe('native final presentation handoff', () => {
   const identity = {
@@ -207,5 +276,183 @@ describe('shared source mutation boundary', () => {
       },
     );
     expect(await mutateNativeResponseSources({ user: 'owner' }, async () => true)).toBe(true);
+  });
+});
+
+describe('release-gated current revision', () => {
+  const { createNativeResponseRelease } = require('../nativeResponseService');
+  const context = { streamId: 'stream-c', jobCreatedAt: 3, userId: 'owner-1' };
+  const req = {
+    user: { id: 'owner-1' },
+    config: {
+      endpoints: {
+        custom: [
+          { name: 'glasshive', baseURL: 'http://glasshive.test/v1', apiKey: 'provider-key' },
+        ],
+      },
+    },
+  };
+  const route = { endpoint: 'glasshive' };
+  let job;
+  let current;
+
+  beforeEach(() => {
+    job = {
+      createdAt: 3,
+      userId: 'owner-1',
+      status: 'running',
+      nativeReleaseTargets: ['response-a'],
+    };
+    current = true;
+    mockJobs.renewNativeDispatchLease.mockReset().mockResolvedValue(true);
+    mockJobs.getJobStore.mockReturnValue({
+      getJob: jest.fn(async () => job),
+      isCurrentLogicalTurn: jest.fn(async () => current),
+    });
+  });
+
+  const pending = { released: false, reachable: true, responseTimeoutS: 660 };
+  const releasedEvidence = { released: true, reachable: true, responseTimeoutS: 660 };
+
+  it('waits for every carried predecessor family to release before dispatch', async () => {
+    const probe = jest.fn().mockResolvedValueOnce(pending).mockResolvedValueOnce(releasedEvidence);
+    const sleep = jest.fn(async () => undefined);
+    const release = createNativeResponseRelease(req, route, { probe, sleep, now: () => 0 });
+
+    await release.beforeDispatch(context);
+
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(probe).toHaveBeenCalledWith({
+      baseURL: 'http://glasshive.test/v1',
+      apiKey: 'provider-key',
+      ownerId: 'owner-1',
+      messageId: 'response-a',
+    });
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispatches at once when the revision replaced no native operation', async () => {
+    job = { ...job, nativeReleaseTargets: undefined };
+    const probe = jest.fn();
+    const release = createNativeResponseRelease(req, route, {
+      probe,
+      sleep: jest.fn(),
+      now: () => 0,
+    });
+
+    await release.beforeDispatch(context);
+
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it('never dispatches a revision replaced while it waited', async () => {
+    const probe = jest.fn(async () => {
+      job = { ...job, status: 'superseded' };
+      return pending;
+    });
+    const release = createNativeResponseRelease(req, route, {
+      probe,
+      sleep: async () => undefined,
+      now: () => 0,
+    });
+
+    await expect(release.beforeDispatch(context)).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('keeps a retained predecessor lease pending past any poll budget until the host deadline', async () => {
+    let clock = context.jobCreatedAt;
+    const probe = jest.fn(async () => pending);
+    const release = createNativeResponseRelease(req, route, {
+      probe,
+      sleep: async () => {
+        clock += 5000;
+      },
+      now: () => clock,
+    });
+
+    await expect(release.beforeDispatch(context)).rejects.toMatchObject({
+      code: 'provider_response_deadline_exceeded',
+    });
+    expect(clock).toBeGreaterThanOrEqual(context.jobCreatedAt + 660_000);
+    expect(clock - 5000).toBeLessThan(context.jobCreatedAt + 660_000);
+    expect(probe.mock.calls.length).toBeGreaterThan(100);
+  });
+
+  it('refuses an unroutable release as the typed occupied condition without asking', async () => {
+    const probe = jest.fn();
+    const release = createNativeResponseRelease(
+      { ...req, config: { endpoints: { custom: [] } } },
+      route,
+      { probe, sleep: jest.fn(), now: () => 0 },
+    );
+
+    await expect(release.beforeDispatch(context)).rejects.toMatchObject({
+      code: 'conversation_session_authority_conflict',
+    });
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unreachable host pending instead of granting dispatch', async () => {
+    let probes = 0;
+    const probe = jest.fn(async () => {
+      probes += 1;
+      if (probes === 4) job = { ...job, status: 'superseded' };
+      if (probes === 2) throw new Error('synthetic probe failure');
+      return { released: false, reachable: false, responseTimeoutS: null };
+    });
+    const release = createNativeResponseRelease(req, route, {
+      probe,
+      sleep: async () => undefined,
+      // Past any former poll budget, but before a host-reported deadline.
+      now: () => context.jobCreatedAt + 30_000,
+    });
+
+    await expect(release.beforeDispatch(context)).rejects.toMatchObject({
+      name: 'AbortError',
+      code: 'superseded',
+    });
+    expect(probe).toHaveBeenCalledTimes(4);
+  });
+
+  it('never dispatches after another generator recovered the revision', async () => {
+    const probe = jest.fn(async () => releasedEvidence);
+    mockJobs.renewNativeDispatchLease.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    const release = createNativeResponseRelease(req, route, {
+      probe,
+      sleep: async () => undefined,
+      now: () => 0,
+    });
+
+    await expect(release.beforeDispatch(context)).rejects.toMatchObject({
+      name: 'AbortError',
+      code: 'superseded',
+    });
+    expect(mockJobs.renewNativeDispatchLease).toHaveBeenCalledWith('stream-c', 3);
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports whether the revision still owns its running turn', async () => {
+    const release = createNativeResponseRelease(req, route, {
+      probe: jest.fn(),
+      sleep: jest.fn(),
+      now: () => 0,
+    });
+
+    await expect(release.isCurrent(context)).resolves.toBe(true);
+    current = false;
+    await expect(release.isCurrent(context)).resolves.toBe(false);
+  });
+
+  it('keeps typed occupancy pending only while the revision stays current', async () => {
+    const probe = jest.fn(async () => releasedEvidence);
+    const release = createNativeResponseRelease(req, route, {
+      probe,
+      sleep: async () => undefined,
+      now: () => 0,
+    });
+
+    await expect(release.whileOccupied(context)).resolves.toBe(true);
+    current = false;
+    await expect(release.whileOccupied(context)).resolves.toBe(false);
   });
 });

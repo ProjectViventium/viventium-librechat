@@ -10,6 +10,7 @@ const mockMessageFindOne = jest.fn();
 const mockConversationUpdateOne = jest.fn();
 const mockRecordTelegramTransportReceipt = jest.fn();
 const mockCommitAcceptedMainTurnFromPresentation = jest.fn();
+const mockScheduleExternallyAcceptedMainCompaction = jest.fn();
 const mockMarkCortexTelegramPresentation = jest.fn();
 const mockMarkCortexTelegramPresentationFailed = jest.fn();
 const mockConsumeLocalQaCortexFault = jest.fn();
@@ -21,6 +22,8 @@ jest.mock('@librechat/data-schemas', () => ({
 
 jest.mock('@librechat/api', () => ({
   telegramInputDeliveryCoverage: (...args) => mockTelegramInputDeliveryCoverage(...args),
+  scheduleExternallyAcceptedMainCompaction: (...args) =>
+    mockScheduleExternallyAcceptedMainCompaction(...args),
   GenerationJobManager: {
     acknowledgeDelivery: (...args) => mockAcknowledgeDelivery(...args),
     acknowledgeDurableEffectDelivery: (...args) => mockAcknowledgeDurableEffectDelivery(...args),
@@ -142,6 +145,7 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
     mockCommitAcceptedMainTurnFromPresentation.mockReset().mockResolvedValue({
       status: 'committed',
     });
+    mockScheduleExternallyAcceptedMainCompaction.mockReset().mockReturnValue(true);
     mockMarkCortexTelegramPresentation.mockReset().mockResolvedValue([]);
     mockMarkCortexTelegramPresentationFailed.mockReset().mockResolvedValue([]);
     mockConsumeLocalQaCortexFault.mockReset().mockResolvedValue({
@@ -367,6 +371,11 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
         presentationCommittedAt: 1725000000123,
       }),
     );
+    // External acceptance schedules the accepted turn's semantic compaction.
+    expect(mockScheduleExternallyAcceptedMainCompaction).toHaveBeenCalledWith(
+      expect.objectContaining({ responseMessageId: 'server-response' }),
+      { status: 'committed' },
+    );
   });
 
   test('passes an exact bounded Cortex presentation assertion to the owner store', async () => {
@@ -407,6 +416,143 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
       cortexPresentation,
     );
   });
+
+  /* === VIVENTIUM START ===
+   * Purpose: a Cortex receipt settles only the message it presented. A separate addition or a
+   * Cortex removal never writes, deletes or accepts the turn's Main message; a promoted empty
+   * answer is Main's own message and keeps Main's persistence and acceptance.
+   * === VIVENTIUM END === */
+  const cortexEnvelope = (messageId) => ({
+    ownerId: 'server-user',
+    messageId,
+    parentMessageId: 'server-response',
+    revision: 3,
+    generation: 7,
+    claimToken: 'claim-7',
+    presentationLeaseToken: 'lease-7',
+    deliveryIds: ['delivery-7'],
+    deliveryReceipts: [{ deliveryId: 'delivery-7', graphResultHash: 'a'.repeat(64) }],
+  });
+  const recordedCortexReceipt = (messageId, state = 'committed') => ({
+    status: 'recorded',
+    acknowledgement: {
+      logical_turn_id: 'turn-1',
+      revision: 2,
+      state,
+      presentation_refs: ['telegram:1:11'],
+    },
+    idempotent: false,
+    presentation: {
+      userId: 'server-user',
+      conversationId: 'server-conversation',
+      responseMessageId: 'server-response',
+      interactionContext: { logical_turn_id: 'turn-1', revision: 2 },
+      ...(state === 'committed' ? { cortexPresentation: cortexEnvelope(messageId) } : {}),
+    },
+  });
+  const cortexRequest = (messageId, state = 'committed', extra = {}) =>
+    request({
+      headers: { 'x-viventium-adapter-secret': 'adapter-secret' },
+      body: {
+        logical_turn_id: 'turn-1',
+        revision: 2,
+        state,
+        presentation_refs: ['telegram:1:11'],
+        cortex_presentation: cortexEnvelope(messageId),
+        ...extra,
+      },
+    });
+  const mainMessageWrites = () =>
+    mockMessageUpdateOne.mock.calls.filter(([query]) => query?.messageId === 'server-response');
+
+  test('a separate Cortex addition settles only its own message and Telegram mapping', async () => {
+    mockAcknowledgeDelivery.mockResolvedValueOnce(recordedCortexReceipt('follow-up-7'));
+    mockMarkCortexTelegramPresentation.mockResolvedValueOnce([
+      { deliveryId: 'delivery-7', claimGeneration: 7 },
+    ]);
+    const router = require('../interactions');
+    const res = response();
+
+    await dispatch(createApp(router), cortexRequest('follow-up-7'), res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mainMessageWrites()).toEqual([]);
+    expect(mockMessageUpdateOne).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: 'follow-up-7' }),
+      expect.anything(),
+    );
+    expect(mockRecordTelegramTransportReceipt).toHaveBeenCalledWith(
+      expect.objectContaining({ logicalMessageId: 'follow-up-7', telegramSentMessageIds: ['11'] }),
+    );
+    expect(mockCommitAcceptedMainTurnFromPresentation).not.toHaveBeenCalled();
+    expect(mockScheduleExternallyAcceptedMainCompaction).not.toHaveBeenCalled();
+    expect(mockMarkCortexTelegramPresentation).toHaveBeenCalledTimes(1);
+  });
+
+  test('a promoted empty answer keeps Main persistence and acceptance for its own message', async () => {
+    mockAcknowledgeDelivery.mockResolvedValueOnce(recordedCortexReceipt('server-response'));
+    mockMarkCortexTelegramPresentation.mockResolvedValueOnce([
+      { deliveryId: 'delivery-7', claimGeneration: 7 },
+    ]);
+    const router = require('../interactions');
+    const res = response();
+
+    await dispatch(createApp(router), cortexRequest('server-response'), res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockMessageUpdateOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: 'server-response',
+        'metadata.viventium.interactionContext.logical_turn_id': 'turn-1',
+      }),
+      expect.anything(),
+    );
+    expect(mockRecordTelegramTransportReceipt).toHaveBeenCalledWith(
+      expect.objectContaining({ logicalMessageId: 'server-response' }),
+    );
+    expect(mockCommitAcceptedMainTurnFromPresentation).toHaveBeenCalledTimes(1);
+  });
+
+  test('a Cortex removal settles its presentation without deleting or writing Main', async () => {
+    mockAcknowledgeDelivery.mockResolvedValueOnce(
+      recordedCortexReceipt('follow-up-7', 'partial_removed'),
+    );
+    const router = require('../interactions');
+    const res = response();
+
+    await dispatch(createApp(router), cortexRequest('follow-up-7', 'partial_removed'), res);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockAcknowledgeDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({ state: 'partial_removed' }),
+      'telegram',
+      cortexEnvelope('follow-up-7'),
+    );
+    expect(mockMessageFindOneAndDelete).not.toHaveBeenCalled();
+    expect(mockMessageUpdateOne).not.toHaveBeenCalled();
+    expect(mockRecordTelegramTransportReceipt).not.toHaveBeenCalled();
+    expect(mockCommitAcceptedMainTurnFromPresentation).not.toHaveBeenCalled();
+  });
+
+  test('a Cortex receipt never takes Main durable-effect or stale-revision authority', async () => {
+    const router = require('../interactions');
+    const withEffect = response();
+    await dispatch(
+      createApp(router),
+      cortexRequest('follow-up-7', 'committed', { effect_ref: 'effect-1' }),
+      withEffect,
+    );
+    expect(withEffect.statusCode).toBe(400);
+    expect(withEffect.body).toEqual({ error: 'invalid_delivery_ack', field: 'cortex_presentation' });
+
+    mockAcknowledgeDelivery.mockResolvedValueOnce({ status: 'stale_revision' });
+    const stale = response();
+    await dispatch(createApp(router), cortexRequest('follow-up-7'), stale);
+    expect(stale.statusCode).toBe(409);
+    expect(mockAcknowledgeDurableEffectDelivery).not.toHaveBeenCalled();
+    expect(mockMessageUpdateOne).not.toHaveBeenCalled();
+  });
+  /* === VIVENTIUM END === */
 
   test('rejects a partial Cortex presentation assertion before owner lookup', async () => {
     const router = require('../interactions');

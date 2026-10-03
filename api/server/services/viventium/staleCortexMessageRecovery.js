@@ -1001,6 +1001,48 @@ async function loadCortexRecoveryParentState({ ownerId, conversationId, parentMe
   return typeof selected?.lean === 'function' ? selected.lean() : selected;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Deliveries whose parent answer no longer exists settle instead of retrying forever.
+ * Purpose: A parent row can be gone for good (its conversation deleted, the answer replaced).
+ * Recovery used to defer such a parent on every tick without end, appending one ledger event each
+ * time. Once every open row of that parent is older than the stale window and has used all the
+ * recovery attempts the ledger allows, it is settled `dropped` (`delivery_attempts_exhausted`).
+ * Nothing is presented; the follow-up message stays as it is and records the outcome.
+ * === VIVENTIUM END === */
+const RECOVERY_ATTEMPT_LIMIT =
+  Number(ViventiumCortexInsightDelivery?.schema?.path?.('recoveryAttemptNumber')?.options?.max) ||
+  16;
+
+async function loadCortexRecoveryParentDeliveries({ deliveryModel, ownerId, parentMessageId }) {
+  if (typeof deliveryModel?.find !== 'function') return [];
+  const query = deliveryModel.find({
+    userId: String(ownerId || '').trim(),
+    parentMessageId: String(parentMessageId || '').trim(),
+    status: { $in: ['pending', 'claimed'] },
+  });
+  const selected =
+    typeof query?.select === 'function' ? query.select('createdAt recoveryAttemptNumber') : query;
+  const rows = typeof selected?.lean === 'function' ? await selected.lean() : await selected;
+  return Array.isArray(rows) ? rows : [];
+}
+
+function isExhaustedOrphanedParent(rows, orphanedBefore) {
+  if (!(orphanedBefore instanceof Date) || !Number.isFinite(orphanedBefore.getTime())) {
+    return false;
+  }
+  return (
+    rows.length > 0 &&
+    rows.every((row) => {
+      const createdAt = new Date(row?.createdAt);
+      return (
+        Number.isFinite(createdAt.getTime()) &&
+        createdAt.getTime() < orphanedBefore.getTime() &&
+        Number(row?.recoveryAttemptNumber) >= RECOVERY_ATTEMPT_LIMIT
+      );
+    })
+  );
+}
+
 async function hasBoundDurableTelegramDispatchAuthority({
   ownerId,
   conversationId,
@@ -1055,6 +1097,9 @@ async function recoverPendingCortexInsightDeliveries({
   replayMessageFallbacks = replayCompletedCortexMessageFallbacks,
   replayOutbox = replayCompletedCortexInsightOutbox,
   limit = 100,
+  orphanedBefore = null,
+  deliveryModel = ViventiumCortexInsightDelivery,
+  loadParentDeliveries = loadCortexRecoveryParentDeliveries,
 } = {}) {
   const summary = {
     scanned: 0,
@@ -1107,6 +1152,42 @@ async function recoverPendingCortexInsightDeliveries({
       });
     }
   };
+  /* === VIVENTIUM START === Exhausted rows of a vanished parent settle `dropped`, once. === */
+  const settleExhaustedOrphanedParent = async (parent) => {
+    try {
+      const rows = await loadParentDeliveries({
+        deliveryModel,
+        ownerId: parent.ownerId,
+        parentMessageId: parent.parentMessageId,
+      });
+      if (!isExhaustedOrphanedParent(rows, orphanedBefore)) return 0;
+      // The bot dispatcher owns a bound Telegram gap; general recovery never settles over it.
+      if (await hasDurableTelegramDispatchAuthority(parent)) return 0;
+      const batch = await deliveryService.claimPendingByParent({
+        ownerId: parent.ownerId,
+        parentMessageId: parent.parentMessageId,
+        surface: parent.surface,
+      });
+      if (!batch?.claimed?.length) return 0;
+      const dropped = await deliveryService.markDropped({
+        ownerId: parent.ownerId,
+        claims: batch.claimed,
+        dropReason: 'delivery_attempts_exhausted',
+      });
+      const count = (dropped || []).filter((row) => row?.status === 'dropped').length;
+      logger.warn('[staleCortexMessageRecovery] Settled Cortex deliveries of an absent parent', {
+        dropped: count,
+        reason: 'delivery_attempts_exhausted',
+      });
+      return count;
+    } catch (error) {
+      logger.warn('[staleCortexMessageRecovery] Absent-parent settlement failed', {
+        code: String(error?.code || error?.name || 'absent_parent_settlement_failed').slice(0, 120),
+      });
+      return 0;
+    }
+  };
+  /* === VIVENTIUM END === */
   for (const parent of parents) {
     let parentState;
     try {
@@ -1120,6 +1201,13 @@ async function recoverPendingCortexInsightDeliveries({
       continue;
     }
     if (!parentState) {
+      /* === VIVENTIUM START === A permanently absent parent settles once, never retries forever. */
+      const settled = await settleExhaustedOrphanedParent(parent);
+      if (settled > 0) {
+        summary.dropped += settled;
+        continue;
+      }
+      /* === VIVENTIUM END === */
       summary.pending += 1;
       await deferParentClaim(parent, 'parent_state_unavailable');
       continue;
@@ -1397,6 +1485,8 @@ async function recoverPendingCortexInsightDeliveries({
 async function recoverStaleCortexMessages({
   now = new Date(),
   recoverInsightDeliveries = recoverPendingCortexInsightDeliveries,
+  reconcileTerminalOutcomes = (options) =>
+    require('./CortexInsightDeliveryService').reconcileCortexFollowUpTerminalOutcomes(options),
 } = {}) {
   /* === VIVENTIUM START === Same recovery pass; native GET never starts or repeats a turn. === */
   await require('./nativeResponseService').recoverNativeResponses();
@@ -1463,7 +1553,24 @@ async function recoverStaleCortexMessages({
 
   const recoveredErrorCards = await recoverVisibleFollowUpErrorCards({ limit });
   const deferredHoldParentErrorCards = await recoverDeferredHoldParentErrorCards({ limit });
-  const recoveredInsightDeliveries = await recoverInsightDeliveries({ limit });
+  // The same age cutoff: work created by this process is never judged permanently orphaned.
+  const recoveredInsightDeliveries = await recoverInsightDeliveries({
+    limit,
+    orphanedBefore: cutoff,
+  });
+  /* === VIVENTIUM START === Settled deliveries converge their follow-up metadata, never resend. === */
+  let reconciledTerminalOutcomes = { scanned: 0, reconciled: 0 };
+  try {
+    reconciledTerminalOutcomes = await reconcileTerminalOutcomes({ limit });
+  } catch (error) {
+    logger.warn('[staleCortexMessageRecovery] Follow-up terminal outcome reconciliation failed', {
+      code: String(error?.code || error?.name || 'terminal_outcome_reconciliation_failed').slice(
+        0,
+        120,
+      ),
+    });
+  }
+  /* === VIVENTIUM END === */
 
   return {
     scanned: messages.length,
@@ -1471,6 +1578,7 @@ async function recoverStaleCortexMessages({
     recoveredErrorCards,
     deferredHoldParentErrorCards,
     recoveredInsightDeliveries,
+    reconciledTerminalOutcomes,
     timeoutMs,
     limit,
     cortexExecutionTimeoutMs,

@@ -11,6 +11,7 @@
     "build:ci": "cross-env NODE_ENV=development vite build --mode ci",
     "dev": "node ./scripts/prepare-local-sandpack-bundler.cjs && cross-env NODE_ENV=development vite",
     "preview-prod": "cross-env NODE_ENV=development vite preview",
+    "serve:compiled": "cross-env NODE_ENV=production vite preview",
     "test": "cross-env NODE_ENV=development jest --watch",
     "test:ci": "cross-env NODE_ENV=development jest --ci --logHeapUsage",
     "b:test": "NODE_ENV=test bunx jest --watch",

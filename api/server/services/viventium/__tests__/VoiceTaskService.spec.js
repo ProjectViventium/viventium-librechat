@@ -17,6 +17,7 @@ const {
   failVoiceTask,
   flushVoiceTaskOwnerOperations,
   getVoiceTask,
+  getVoiceTaskTraceBinding,
   getVoiceTaskOwnerCapabilityInventory,
   getVoiceTaskRegistryStats,
   isVoiceTaskSuppressed,
@@ -39,6 +40,294 @@ describe('VoiceTaskService', () => {
     jest.clearAllMocks();
     mockRecordVoiceOrchestrationTraceBestEffort.mockResolvedValue({ sequence: 1 });
     resetVoiceTasksForTests();
+  });
+
+  test('native input does not retain the previous cortex status as approval detail', () => {
+    const task = createVoiceTask({
+      callSessionId: 'call-input',
+      userId: 'user-input',
+      streamId: 'stream-input',
+    });
+    registerVoiceTaskOwnerAdapter(task.taskId, { kind: 'generation_job', provideInput: jest.fn() });
+    observeGenerationEvent(task.taskId, {
+      event: 'on_cortex_update',
+      data: { name: 'Synthetic cortex', status: 'error' },
+    });
+    observeGenerationEvent(task.taskId, {
+      event: 'needs_input',
+      data: {
+        prompt: 'Approve synthetic write?',
+        inputType: 'choice',
+        choices: [{ value: 'allow', label: 'Allow once' }],
+      },
+    });
+    const snapshot = snapshotEvent(task.taskId);
+    expect(snapshot.phase).toBe('needs_input');
+    expect(snapshot.detail).toBeUndefined();
+  });
+
+  test('native pending ACK retains one operation and permits only its exact choice retry', async () => {
+    const task = createVoiceTask({
+      callSessionId: 'call-input',
+      userId: 'user-1',
+      streamId: 'mission-run',
+      owner: { kind: 'glasshive_run', id: 'run-1' },
+    });
+    const provideInput = jest
+      .fn()
+      .mockResolvedValueOnce({ accepted: false, confirmationPending: true })
+      .mockResolvedValueOnce({ accepted: true });
+    registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'glasshive_run',
+      provideInput,
+      nativeMissionInputBinding: {
+        version: 1,
+        requestId: 'permission-1',
+        requestFingerprint: 'a'.repeat(64),
+        runId: 'run-1',
+        attemptId: 'attempt-1',
+        sessionId: 'session-1',
+        expiresAt: '2099-01-01T00:00:00Z',
+        workRef: 'work-1',
+        taskId: task.taskId,
+        userId: 'user-1',
+        callSessionId: 'call-input',
+      },
+    });
+    const request = {
+      event: 'needs_input',
+      data: {
+        prompt: 'Choose',
+        inputType: 'choice',
+        choices: [
+          { value: 'allow_once', label: 'Allow once' },
+          { value: 'reject_once', label: 'Reject once' },
+        ],
+      },
+    };
+    observeGenerationEvent(task.taskId, request);
+    const authority = { callSessionId: 'call-input', binding: { userId: 'user-1' } };
+    const first = await submitVoiceTaskInput(task.taskId, 'allow_once', {
+      userId: 'user-1',
+      voiceAuthorityContext: authority,
+    });
+    expect(first).toMatchObject({
+      ok: true,
+      confirmationPending: true,
+      task: { state: 'needs_input' },
+    });
+    expect(snapshotEvent(task.taskId)).not.toHaveProperty('error');
+    observeGenerationEvent(task.taskId, request);
+    expect(
+      await submitVoiceTaskInput(task.taskId, 'reject_once', { userId: 'user-1' }),
+    ).toMatchObject({ ok: false, code: 'input_confirmation_pending' });
+    expect(provideInput).toHaveBeenCalledTimes(1);
+    const second = await submitVoiceTaskInput(task.taskId, 'allow_once', {
+      userId: 'user-1',
+      voiceAuthorityContext: authority,
+    });
+    expect(second).toMatchObject({ ok: true, task: { state: 'running' } });
+    expect(provideInput.mock.calls[1][0]).toMatchObject(provideInput.mock.calls[0][0]);
+  });
+
+  test('an exact replacement permission resets the retained choice even when its wording is unchanged', async () => {
+    const task = createVoiceTask({
+      callSessionId: 'call-input',
+      userId: 'user-1',
+      streamId: 'mission-run',
+      owner: { kind: 'glasshive_run', id: 'run-1' },
+    });
+    const binding = {
+      version: 1,
+      requestId: 'permission-1',
+      requestFingerprint: 'a'.repeat(64),
+      runId: 'run-1',
+      attemptId: 'attempt-1',
+      sessionId: 'session-1',
+      expiresAt: '2099-01-01T00:00:00Z',
+      workRef: 'work-1',
+      taskId: task.taskId,
+      userId: 'user-1',
+      callSessionId: 'call-input',
+    };
+    const provideInput = jest
+      .fn()
+      .mockResolvedValue({ accepted: false, confirmationPending: true });
+    const request = {
+      event: 'needs_input',
+      data: {
+        prompt: 'Choose',
+        inputType: 'choice',
+        choices: [
+          { value: 'allow_once', label: 'Allow once' },
+          { value: 'reject_once', label: 'Reject once' },
+        ],
+      },
+    };
+    registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'glasshive_run',
+      provideInput,
+      nativeMissionInputBinding: binding,
+    });
+    observeGenerationEvent(task.taskId, request);
+    await submitVoiceTaskInput(task.taskId, 'allow_once', { userId: 'user-1' });
+    registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'glasshive_run',
+      provideInput,
+      nativeMissionInputBinding: {
+        ...binding,
+        requestId: 'permission-2',
+        requestFingerprint: 'b'.repeat(64),
+      },
+    });
+    observeGenerationEvent(task.taskId, request);
+    expect(
+      await submitVoiceTaskInput(task.taskId, 'reject_once', { userId: 'user-1' }),
+    ).toMatchObject({ ok: true, confirmationPending: true });
+    expect(provideInput.mock.calls[1][0].operationId).not.toBe(
+      provideInput.mock.calls[0][0].operationId,
+    );
+  });
+
+  test('a late acknowledgement of the previous question cannot clear a replacement permission', async () => {
+    const task = createVoiceTask({
+      callSessionId: 'call-input',
+      userId: 'user-1',
+      streamId: 'mission-run',
+      owner: { kind: 'glasshive_run', id: 'run-1' },
+    });
+    const binding = {
+      version: 1,
+      requestId: 'permission-1',
+      requestFingerprint: 'a'.repeat(64),
+      runId: 'run-1',
+      attemptId: 'attempt-1',
+      sessionId: 'session-1',
+      expiresAt: '2099-01-01T00:00:00Z',
+      workRef: 'work-1',
+      taskId: task.taskId,
+      userId: 'user-1',
+      callSessionId: 'call-input',
+    };
+    let acknowledge;
+    const provideInput = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          acknowledge = resolve;
+        }),
+    );
+    const request = {
+      event: 'needs_input',
+      data: {
+        prompt: 'Choose',
+        inputType: 'choice',
+        choices: [{ value: 'allow_once', label: 'Allow once' }],
+      },
+    };
+    registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'glasshive_run',
+      provideInput,
+      nativeMissionInputBinding: binding,
+    });
+    observeGenerationEvent(task.taskId, request);
+    const pending = submitVoiceTaskInput(task.taskId, 'allow_once', { userId: 'user-1' });
+    registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'glasshive_run',
+      provideInput,
+      nativeMissionInputBinding: {
+        ...binding,
+        requestId: 'permission-2',
+        requestFingerprint: 'b'.repeat(64),
+      },
+    });
+    observeGenerationEvent(task.taskId, request);
+    acknowledge({ accepted: true });
+    expect(await pending).toMatchObject({
+      ok: false,
+      code: 'input_invalid_state',
+      task: { state: 'needs_input' },
+    });
+    expect(snapshotEvent(task.taskId)).toMatchObject({
+      state: 'needs_input',
+      needsInput: { prompt: 'Choose' },
+    });
+  });
+
+  test('input registration and expiry preserve the existing exact-run Stop adapter', async () => {
+    const task = createVoiceTask({
+      callSessionId: 'call-input',
+      userId: 'user-1',
+      streamId: 'mission-run',
+      owner: { kind: 'glasshive_run', id: 'run-1' },
+    });
+    const cancel = jest.fn().mockResolvedValue({ accepted: true });
+    registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'glasshive_run',
+      cancel,
+      cancellationConfirmable: true,
+    });
+    registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'glasshive_run',
+      preserveExisting: true,
+      provideInput: jest.fn(),
+      inputExpiresAtMs: Date.now() - 1,
+    });
+    expect(
+      getVoiceTaskOwnerCapabilityInventory({ userId: 'user-1', callSessionId: 'call-input' })
+        .owners,
+    ).toEqual([{ kind: 'glasshive_run', acceptsInput: false }]);
+    await requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'user-1' });
+    await flushVoiceTaskOwnerOperations();
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  test('retains canonical trace identity after completion and rejects a same-stream turn change', () => {
+    const scope = {
+      callSessionId: 'call-trace',
+      userId: 'user-trace',
+      conversationId: 'convo-trace',
+    };
+    const task = createVoiceTask({ ...scope, streamId: 'stream-trace' });
+    bindVoiceTaskStream(task.taskId, 'stream-trace', { ...scope, logicalTurnId: 'logical-trace' });
+    completeVoiceTask(task.taskId, { resultMessageId: 'result-trace' });
+    expect(getVoiceTaskTraceBinding(task.taskId)).toEqual({
+      taskId: task.taskId,
+      callSessionId: scope.callSessionId,
+      userId: scope.userId,
+      streamId: 'stream-trace',
+      logicalTurnId: 'logical-trace',
+    });
+    expect(
+      bindVoiceTaskStream(task.taskId, 'stream-trace', {
+        ...scope,
+        logicalTurnId: 'other-turn',
+      }),
+    ).toBeNull();
+    expect(
+      bindVoiceTaskStream(task.taskId, 'stream-trace', {
+        ...scope,
+        userId: 'other-owner',
+        logicalTurnId: 'logical-trace',
+      }),
+    ).toBeNull();
+    expect(getVoiceTaskTraceBinding(task.taskId).logicalTurnId).toBe('logical-trace');
+  });
+
+  test.each([
+    'native_input_declined',
+    'native_input_expired',
+    'native_input_cancelled',
+    'native_turn_cancelled',
+  ])('never retries native terminal stop %s or stores raw error text', (code) => {
+    const task = createVoiceTask({
+      callSessionId: 'call-stop',
+      userId: 'user-stop',
+      streamId: 'stream-stop',
+    });
+    registerVoiceTaskOwnerAdapter(task.taskId, { kind: 'generation_job', retry: jest.fn() });
+    const failed = failVoiceTask(task.taskId, { code, message: 'PRIVATE-PROVIDER-ERROR' });
+    expect(failed).toMatchObject({ state: 'failed', retryable: false, error: { code } });
+    expect(JSON.stringify(failed)).not.toContain('PRIVATE-PROVIDER-ERROR');
   });
 
   test('binds the ready receipt conversation once without changing current task state', () => {
@@ -109,7 +398,7 @@ describe('VoiceTaskService', () => {
     });
   });
 
-  test('records only authoritative completed tool and cortex producer events', () => {
+  test('records tools while cortex tracing stays with the detached owner', () => {
     const task = createVoiceTask({
       callSessionId: 'call-trace-1',
       userId: 'user-trace-1',
@@ -146,25 +435,13 @@ describe('VoiceTaskService', () => {
       data: { id: 'cortex-1-followup', status: 'completed', text: 'private insight text' },
     });
 
-    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledTimes(2);
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledTimes(1);
     expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenNthCalledWith(1, {
       ownerId: 'user-trace-1',
       callSessionId: 'call-trace-1',
       turnId: 'turn-trace-1',
       eventRef: 'tool-step-1',
       stage: 'tool.completed',
-      facts: {
-        taskRef: task.taskId,
-        streamRef: 'stream-trace-1',
-        effectCount: 1,
-      },
-    });
-    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenNthCalledWith(2, {
-      ownerId: 'user-trace-1',
-      callSessionId: 'call-trace-1',
-      turnId: 'turn-trace-1',
-      eventRef: 'cortex-1-followup',
-      stage: 'cortex.completed',
       facts: {
         taskRef: task.taskId,
         streamRef: 'stream-trace-1',

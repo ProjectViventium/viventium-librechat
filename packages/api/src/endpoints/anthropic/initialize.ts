@@ -97,8 +97,7 @@ const isAnthropicConnectedAccountReadError = (error: unknown): boolean => {
 };
 
 const isAnthropicConnectedAccountReconnectFailure = (error: unknown): boolean =>
-  error instanceof Error &&
-  error.message.includes('Anthropic connected account needs reconnect');
+  error instanceof Error && error.message === ANTHROPIC_CONNECTED_ACCOUNT_RECONNECT_MESSAGE;
 
 const isConnectedAccountAuthMode = (): boolean => {
   const values = [
@@ -214,6 +213,12 @@ export async function initializeAnthropic({
           throw anthropicConnectedAccountReconnectError();
         }
         /* === VIVENTIUM END === */
+      } else if (isAnthropicConnectedAccountReconnectFailure(error)) {
+        /* === VIVENTIUM START ===
+         * Fix: the subscription resolver's reconnect decision keeps its typed auth identity, so
+         * the configured fallback and reconnect guidance see it. It never selects a platform key.
+         * === VIVENTIUM END === */
+        throw anthropicConnectedAccountReconnectError();
       } else if (!isNoUserKeyError(error)) {
         throw error;
       }

@@ -1526,6 +1526,15 @@ describe('zero-input graph handoffs', () => {
   });
 
   it.each([
+    ...[
+      'native_input_declined',
+      'native_input_expired',
+      'native_input_cancelled',
+      'native_turn_cancelled',
+    ].map((code) => [
+      code,
+      () => Object.assign(new Error('Synthetic native owner input stop'), { status: 502, code }),
+    ]),
     [
       'invalid request',
       () => Object.assign(new Error('synthetic invalid request'), { status: 400 }),

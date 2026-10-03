@@ -187,8 +187,10 @@ export interface ActivationConfig {
   model?: string;
   /** Provider for the activation model (e.g., "openai") */
   provider?: string;
+  /** Native provider reasoning effort for activation detection */
+  reasoning_effort?: string;
   /** Ordered recovery routes for activation detection */
-  fallbacks?: Array<{ provider: string; model: string }>;
+  fallbacks?: Array<{ provider: string; model: string; reasoning_effort?: string }>;
   /** Whether an exhausted detector route should be surfaced to the user */
   activation_failure_visibility?: 'silent' | 'visible';
   /** System prompt for making activation decisions */

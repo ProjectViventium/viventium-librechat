@@ -102,7 +102,7 @@ const {
   parallelWorkClaimStateAsync,
 } = require('~/server/services/viventium/ViventiumOrchestrationMode');
 const {
-  waitForOrchestrationReadiness,
+  authoringOrchestrationReadiness,
 } = require('~/server/services/viventium/GlassHiveOrchestrationReadinessService');
 const {
   appendGlassHiveMainOrchestrationFacade,
@@ -186,8 +186,16 @@ function startParallelWorkTurnAuthority(req, agent) {
     timeout.unref?.();
   });
   const claimPromise = Promise.resolve()
-    .then(() => waitForOrchestrationReadiness({ ownerId, timeoutMs: authorityTimeoutMs }))
-    .then(() => parallelWorkClaimStateAsync(ownerId));
+    .then(() =>
+      authoringOrchestrationReadiness({
+        ownerId,
+        sourceId: req.body?.messageId,
+        consumer: 'tool_discovery',
+      }),
+    )
+    .then((readiness) =>
+      readiness.available === true ? parallelWorkClaimStateAsync(ownerId) : null,
+    );
   const authority = Promise.race([claimPromise, timeoutPromise])
     .then((claimState) => {
       if (typeof req._viventiumParallelWorkTurnAvailable === 'boolean') {

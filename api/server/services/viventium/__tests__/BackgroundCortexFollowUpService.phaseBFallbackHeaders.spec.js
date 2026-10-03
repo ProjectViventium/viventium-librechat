@@ -210,3 +210,86 @@ describe('verified mission image input', () => {
     }
   });
 });
+
+describe('Phase B follow-up carrier', () => {
+  test('does not forward the Main turn carrier binding to its own follow-up carrier', async () => {
+    const processStream = jest.fn().mockResolvedValue('The reading list card is ready.');
+    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    const mainTurnBinding = {
+      'X-Viventium-Main-Context-Protocol': 'main_context_v1',
+      'X-Viventium-Main-Context-Owner': 'core',
+      'X-Viventium-Main-Context-Snapshot-SHA256': 'a'.repeat(64),
+      'X-Viventium-Main-Context-Epoch': 'b'.repeat(64),
+      'X-Viventium-Continuity-Domain-Id': 'c'.repeat(64),
+      'X-Viventium-Continuity-Agent-Id': 'agent-main',
+      'X-Viventium-Logical-Turn-Id': 'turn-1',
+      'X-Viventium-Logical-Turn-Revision': '1',
+      'X-Viventium-Visible-Message-Chain-B64': Buffer.from(
+        JSON.stringify([{ id: 'user-1' }, { id: 'assistant-1' }, { id: 'user-2' }]),
+      ).toString('base64'),
+      'X-GlassHive-Developer-Instruction-Tail-B64': Buffer.from('Main-only tail').toString('base64'),
+    };
+    try {
+      const req = {
+        id: 'synthetic-phase-b-carrier',
+        body: { conversationId: 'conv-1', messageId: 'msg-1' },
+        user: { id: 'user-1' },
+        config: {
+          endpoints: {
+            agents: {
+              providerCapabilities: {
+                'glasshive-harness': {
+                  workspace_binding: true,
+                  default_access: 'workspace',
+                  phase_b_followup: true,
+                  responses_api: false,
+                },
+              },
+            },
+          },
+        },
+      };
+      setTrustedInteractionContext(req, {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'web',
+        conversation_id: 'conv-1',
+        source_event_id: 'root-event',
+      });
+      await generateFollowUpText({
+        req,
+        agent: {
+          id: 'agent-main',
+          provider: 'glasshive-harness',
+          endpoint: 'glasshive-harness',
+          model: 'codex-cli:gpt-5.6-sol',
+          model_parameters: {
+            model: 'codex-cli:gpt-5.6-sol',
+            reasoning_effort: 'medium',
+            configuration: { defaultHeaders: mainTurnBinding },
+          },
+          glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
+        },
+        insightsData: {
+          insights: [{ cortexName: 'Worker', insight: 'The reading list card is complete.' }],
+        },
+        recentResponse: 'The Worker is preparing the card.',
+        runId: 'synthetic-run',
+        conversationId: 'conv-1',
+        parentMessageId: 'msg-1',
+      });
+      expect(createRun).toHaveBeenCalledTimes(1);
+      const headers =
+        createRun.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders;
+      const sent = Object.keys(headers).map((name) => name.toLowerCase());
+      for (const name of Object.keys(mainTurnBinding)) {
+        expect(sent).not.toContain(name.toLowerCase());
+      }
+      expect(headers['X-Viventium-Origin']).toBe('interactive');
+      expect(headers['X-Synthetic-Endpoint']).toBe('keep-endpoint-header');
+      expect(headers['X-GlassHive-Agent-Id']).toContain('agent-main');
+    } finally {
+      createRun.mockRestore();
+    }
+  });
+});

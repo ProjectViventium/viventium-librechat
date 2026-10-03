@@ -42,7 +42,7 @@ export type NativeResponseDeliveryContext =
 
 export type NativeResponseMessageProjection = Pick<
   import('./message').IMessage,
-  'text' | 'content' | 'metadata'
+  'text' | 'content' | 'metadata' | 'attachments'
 >;
 
 export interface NativeResponseAdmission extends NativeResponseIdentity {

@@ -1,4 +1,9 @@
 const crypto = require('crypto');
+/* === VIVENTIUM START ===
+ * Preserve BSON identities in the detached graph configuration snapshot.
+ */
+const cloneDeep = require('lodash/cloneDeep');
+/* === VIVENTIUM END === */
 const { logger } = require('@librechat/data-schemas');
 /* === VIVENTIUM START ===
  * Feature: Deep Telegram timing instrumentation (toggleable)
@@ -25,6 +30,8 @@ const {
   createEdgeCollector,
   filterOrphanedEdges,
   GenerationJobManager,
+  observeOrchestrationOwner,
+  effectiveOrchestrationMode,
   getCustomEndpointConfig,
   createSequentialChainEdges,
   applyAgentProviderCapabilityDefaults,
@@ -279,6 +286,16 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * or native workspace capability can be initialized for an unverified speaker.
    * === VIVENTIUM END === */
   const sideEffectsRestricted = enforceRestrictedVoiceRequest(req);
+
+  /* === VIVENTIUM START === Early owner readiness observation for Web/Voice authoring. === */
+  // Start the existing owner probe while agent and file initialization proceed in parallel.
+  if (
+    !sideEffectsRestricted &&
+    effectiveOrchestrationMode(req.user, { available: true }) === 'parallel'
+  ) {
+    observeOrchestrationOwner(req.user?.id || req.user?._id);
+  }
+  /* === VIVENTIUM END === */
 
   /* === VIVENTIUM START ===
    * Feature: Decouple persisted-agent tools from ephemeral UI toggles
@@ -823,6 +840,33 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     streamId,
     messageDeltaMode:
       effectivePrimaryCapability?.message_delta_mode === 'snapshot' ? 'snapshot' : 'incremental',
+    /* === VIVENTIUM START === Import only typed, selected output from a visible current invocation. === */
+    nativeOutputCallback: (carrier, agentId) => {
+      artifactPromises.push(
+        require('~/server/services/viventium/nativeOutputFiles')
+          .prepareCurrentNativeOutputFiles(req, carrier, agentId, streamId)
+          .catch(() => [
+            {
+              filename: 'File',
+              messageId: req._viventiumNativeResponseSource?.responseMessageId,
+              nativeOutputFile: {
+                version: 1,
+                status: 'unavailable',
+                code: 'native_output_file_unavailable',
+              },
+            },
+          ])
+          .then((attachments) => {
+            for (const attachment of attachments) {
+              if (streamId)
+                GenerationJobManager.emitChunk(streamId, { event: 'attachment', data: attachment });
+              else res.write(`event: attachment\ndata: ${JSON.stringify(attachment)}\n\n`);
+            }
+            return attachments;
+          }),
+      );
+    },
+    /* === VIVENTIUM END === */
   });
   req._viventiumFallbackLlmAttempt = primaryInitializationFallbackUsed === true;
   if (primaryInitializationFallbackUsed === true) {
@@ -867,7 +911,11 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * owner-attributed Call/Wing turn. The factory fails closed for every other ingress.
    * === VIVENTIUM END === */
   const manageActiveTasksTool = createManageActiveTasksTool(req);
-  if (manageActiveTasksTool) {
+  if (
+    manageActiveTasksTool &&
+    effectivePrimaryCapability?.native_tools !== true &&
+    effectivePrimaryCapability?.worker_native_tools !== true
+  ) {
     const toolDefinition = {
       name: manageActiveTasksTool.name,
       description: manageActiveTasksTool.description,
@@ -1148,7 +1196,8 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
      * author because the graph invocation seam requires successful hydration first.
      * === VIVENTIUM END === */
     if (deferTools) {
-      const lazyMaterializationAgent = structuredClone(agent);
+      // The detached declaration must retain BSON IDs for the ACL check during hydration.
+      const lazyMaterializationAgent = cloneDeep(agent);
       const shellModelParameters = structuredClone(
         agent.model_parameters ?? { model: agent.model },
       );
@@ -1356,6 +1405,21 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       logger.warn(
         `[agentLlmFallback] Handoff provider initialization recovered through configured fallback for agent ${agentId}: ${handoffFallbackAssignment.provider}/${handoffFallbackAssignment.model}`,
       );
+      /* === VIVENTIUM START ===
+       * Feature: Participant reconnect disclosure.
+       * Purpose: When a participant answers through its configured fallback because its own
+       * connected account needs reconnect, the turn carries one actionable notice with the answer.
+       * === VIVENTIUM END === */
+      const participantPrimaryError = handoffInitialization.primaryError;
+      if (
+        participantPrimaryError?.viventiumConnectedAccountReconnectRequired === true &&
+        !req._viventiumParticipantReconnectRecovery
+      ) {
+        req._viventiumParticipantReconnectRecovery = Object.freeze({
+          provider: String(participantPrimaryError.viventiumConnectedAccountProvider || '').trim(),
+          model: handoffFallbackAssignment.model,
+        });
+      }
     }
     if (materializeInto) {
       Object.defineProperties(materializeInto, Object.getOwnPropertyDescriptors(config));

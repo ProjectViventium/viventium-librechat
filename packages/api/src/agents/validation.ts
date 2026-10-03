@@ -78,6 +78,7 @@ export const activationConfigSchema = z
     mode: z.enum(['classified', 'always', 'disabled']).optional(),
     model: z.string().optional(),
     provider: z.string().optional(),
+    reasoning_effort: z.string().optional(),
     prompt: z.string().optional(),
     intent_scope: z.string().optional(),
     activation_failure_visibility: z.enum(['silent', 'visible']).optional(),
@@ -89,6 +90,7 @@ export const activationConfigSchema = z
         z.object({
           provider: z.string(),
           model: z.string(),
+          reasoning_effort: z.string().optional(),
         }),
       )
       .optional(),

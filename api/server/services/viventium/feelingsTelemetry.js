@@ -5,6 +5,8 @@
  * === VIVENTIUM END === */
 
 const crypto = require('crypto');
+const { fingerprintTraceReference } = require('@librechat/api');
+const { getTrustedInteractionContext } = require('./interactionContext');
 
 function feelingsRequestId(req) {
   return (
@@ -91,6 +93,9 @@ const NONNEGATIVE_NUMBER_FIELDS = new Set([
   'version',
 ]);
 const ENUM_FIELDS = Object.freeze({
+  failureStage: new Set(['request', 'activation', 'model', 'parse', 'commit']),
+  errorType: new Set(['TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'Error']),
+  surface: new Set(['web', 'telegram', 'voice', 'workbench']),
   scope: new Set(['all_agents', 'conscious_agent', 'unknown']),
   placement: new Set(['absent', 'final_instruction_layer', 'followed_by_runtime_contracts']),
   activationMode: new Set(['always', 'classified', 'disabled']),
@@ -161,6 +166,8 @@ const COUNT_MAP_FIELDS = new Set(['causeCounts', 'deltaMagnitudeCounts', 'streng
 /* This is deliberately a positive allowlist, not a blacklist. A new telemetry field must be
  * reviewed here before it can reach either the structured transport or the formatted log line. */
 const SAFE_FEELINGS_TELEMETRY_FIELDS = new Set([
+  'failureStage',
+  'errorType',
   'absoluteDeltaCounts',
   'activationMode',
   'activeRangePromptOverrideChars',
@@ -216,6 +223,9 @@ const SAFE_FEELINGS_TELEMETRY_FIELDS = new Set([
   'shouldActivate',
   'skippedAgentCount',
   'snapshotHash',
+  'surface',
+  'callRefHash',
+  'turnRefHash',
   'strengthCounts',
   // Legacy input is still accepted by the public-safe logger, but runtime emitters use
   // `absoluteDeltaCounts` as the canonical field.
@@ -275,7 +285,7 @@ function sanitizeTelemetryField(key, value) {
   if (TOKEN_FIELDS.has(key)) {
     return safeToken(value) ? { value } : { invalid: true };
   }
-  if (key === 'snapshotHash') {
+  if (key === 'snapshotHash' || key === 'callRefHash' || key === 'turnRefHash') {
     return typeof value === 'string' && /^(?:[a-f0-9]{64}|none)$/.test(value)
       ? { value }
       : { invalid: true };
@@ -402,7 +412,18 @@ function logFeelingsEvent(logger, req, event, fields = {}, level = 'info') {
   const method = typeof logger?.[level] === 'function' ? logger[level].bind(logger) : logger?.info;
   if (typeof method !== 'function') return;
   const safeEvent = SAFE_FEELINGS_EVENTS.has(event) ? event : 'feelings.telemetry.rejected';
-  const safeFields = sanitizeTelemetryFields(fields);
+  const interaction = getTrustedInteractionContext(req);
+  const correlation = {};
+  if (interaction?.surface) correlation.surface = interaction.surface;
+  if (interaction?.logical_turn_id) {
+    correlation.turnRefHash = fingerprintTraceReference('logical_turn', interaction.logical_turn_id).slice(7);
+  }
+  if (interaction?.surface === 'voice' && req?.body?.voiceMode === true && req?.body?.viventiumCallSessionId) {
+    correlation.callRefHash = fingerprintTraceReference('call_session', req.body.viventiumCallSessionId).slice(7);
+  }
+  // Correlation is owned by trusted request provenance, never a caller-supplied log field.
+  const { surface, callRefHash, turnRefHash, ...eventFields } = fields;
+  const safeFields = sanitizeTelemetryFields({ ...eventFields, ...correlation });
   if (safeEvent !== event) {
     safeFields.telemetryFieldDropCodes = [
       'event_invalid',

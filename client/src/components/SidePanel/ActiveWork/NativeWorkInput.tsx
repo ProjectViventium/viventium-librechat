@@ -1,3 +1,4 @@
+/* === VIVENTIUM START === Native owner input form; keep uncertain responses retryable until native ACK. === VIVENTIUM END === */
 import { useRef, useState } from 'react';
 import { Button } from '@librechat/client';
 import type { NativeWorkInputResponse, PendingNativeWorkInput } from 'librechat-data-provider';
@@ -16,6 +17,7 @@ export default function NativeWorkInput({
   const mutation = useWorkActionMutation();
   const [values, setValues] = useState<NonNullable<NativeWorkInputResponse['content']>>({});
   const [error, setError] = useState<'invalid' | 'unconfirmed' | null>(null);
+  const [acknowledged, setAcknowledged] = useState(false);
   const retained = useRef<{ operationId: string; nativeInput: NativeWorkInputResponse }>();
   const fields = Object.entries(input.requestedSchema?.properties ?? {});
   const required = new Set(input.requestedSchema?.required ?? []);
@@ -42,6 +44,15 @@ export default function NativeWorkInput({
     mutation.mutate(
       { workRef, action: 'resume', ...operation },
       {
+        onSuccess: (result) => {
+          const receipt = result as { status?: string; confirmationPending?: boolean } | null;
+          const accepted =
+            receipt != null &&
+            ['accepted', 'already_accepted'].includes(receipt.status ?? '') &&
+            receipt.confirmationPending !== true;
+          setAcknowledged(accepted);
+          if (!accepted) setError('unconfirmed');
+        },
         onError: (failure) => {
           const status = (failure as Error & { response?: { status?: number } }).response?.status;
           if (status === 400 || status === 422) retained.current = undefined;
@@ -60,7 +71,9 @@ export default function NativeWorkInput({
       }}
     >
       <p className="whitespace-pre-wrap text-sm text-text-primary">{input.message}</p>
-      <p className="text-xs text-text-secondary">{input.mcpServerName}</p>
+      <p className="text-xs text-text-secondary">
+        {input.kind === 'permission' ? input.runtimeName : input.mcpServerName}
+      </p>
       {input.mode === 'url' && externalUrl && (
         <a href={externalUrl} target="_blank" rel="noopener noreferrer" className="underline">
           {localize('com_ui_work_input_open')}
@@ -184,7 +197,7 @@ export default function NativeWorkInput({
           type="submit"
           disabled={
             mutation.isLoading ||
-            mutation.isSuccess ||
+            acknowledged ||
             (input.mode === 'url' && !externalUrl) ||
             Boolean(retained.current && retained.current.nativeInput.action !== 'accept')
           }
@@ -195,7 +208,7 @@ export default function NativeWorkInput({
           type="button"
           disabled={
             mutation.isLoading ||
-            mutation.isSuccess ||
+            acknowledged ||
             Boolean(retained.current && retained.current.nativeInput.action !== 'decline')
           }
           onClick={() => submit('decline')}

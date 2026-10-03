@@ -114,4 +114,21 @@ describe('Feeling prompt tail', () => {
     expect(twice.match(/Use only facts from the user's current request/g)).toHaveLength(1);
     expect(twice.match(/<viventium_feeling_state>/g)).toHaveLength(1);
   });
+
+  test('carries a saved-memory snapshot before the fact guard, with the capsule still last', () => {
+    const memory = '# Current saved-memory snapshot\n{"status":"available","text":"Saved rate."}';
+    const tail = buildViventiumDynamicTail({ memory, capsule });
+    const once = pinViventiumDynamicTailLast({
+      instructions: `base\n\n${memory}\n\nlater structural rule`,
+      memory,
+      capsule,
+    });
+    const twice = pinViventiumDynamicTailLast({ instructions: once, memory, capsule });
+
+    expect(tail).toBe(`${memory}\n\n${getViventiumUserFactGuard()}\n\n${capsule}`);
+    expect(once).toBe(`base\n\nlater structural rule\n\n${tail}`);
+    expect(twice).toBe(once);
+    expect(twice.match(/Current saved-memory snapshot/g)).toHaveLength(1);
+    expect(twice.endsWith(capsule)).toBe(true);
+  });
 });

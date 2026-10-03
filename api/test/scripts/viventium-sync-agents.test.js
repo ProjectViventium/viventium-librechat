@@ -443,6 +443,7 @@ describe('viventium-sync-agents args', () => {
       'confidence_threshold',
       'model',
       'provider',
+      'reasoning_effort',
       'fallbacks',
       'cooldown_ms',
       'max_history',
@@ -459,6 +460,20 @@ describe('viventium-sync-agents args', () => {
       'confidence_threshold',
       'fallbacks',
       'activation_failure_visibility',
+    ]);
+  });
+
+  test('activation-only sync preserves unselected fields while replacing native effort', () => {
+    const existing = [{ agent_id: 'agent-a', activation: {
+      provider: 'openai', model: 'gpt-5.4', reasoning_effort: 'medium', prompt: 'Live owner prompt',
+    } }];
+    const incoming = [{ agent_id: 'agent-a', activation: {
+      provider: 'openai', model: 'gpt-6.1-sol', reasoning_effort: 'high', prompt: 'Source prompt',
+    } }];
+    expect(mergeBackgroundCorticesActivationFields(existing, incoming, ['reasoning_effort'])).toEqual([
+      { agent_id: 'agent-a', activation: {
+        provider: 'openai', model: 'gpt-5.4', reasoning_effort: 'high', prompt: 'Live owner prompt',
+      } },
     ]);
   });
 

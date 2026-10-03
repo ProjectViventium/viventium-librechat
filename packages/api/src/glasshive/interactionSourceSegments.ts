@@ -1,6 +1,11 @@
 /* === VIVENTIUM START === Bounded trusted interaction-source projection for delegation. === */
 import { createHash } from 'crypto';
 
+import {
+  normalizeInteractionReplyContext,
+  type InteractionReplyContext,
+} from '../agents/interactionReplyContext';
+
 const SOURCE_SEGMENT_MAX_BYTES = 32 * 1024;
 const SOURCE_SEGMENTS_MAX_BYTES = 64 * 1024;
 const SOURCE_SEGMENTS_MAX_COUNT = 32;
@@ -51,6 +56,10 @@ export interface InteractionSourceSegment {
   source_parent_message_id?: string;
   text: string;
   source_files?: readonly InteractionSourceFile[];
+  /** The quoted message this source input replied to, resolved when it was admitted. */
+  reply_context?: InteractionReplyContext;
+  /** The revision authoring this source: set by the claim admitting it, fixed at admission commit. */
+  authoring_revision?: number;
   truncated?: true;
   original_sha256?: string;
 }
@@ -107,6 +116,7 @@ export function normalizeInteractionSourceSegments(
     if (!clipped.text.length && sourceFiles.length === 0) continue;
     const suppliedDigest = boundedIdentifier(candidate.original_sha256, 64).toLowerCase();
     const truncated = candidate.truncated === true || clipped.truncated;
+    const replyContext = normalizeInteractionReplyContext(candidate.reply_context);
     result.push(
       Object.freeze({
         ordinal: 0,
@@ -119,6 +129,11 @@ export function normalizeInteractionSourceSegments(
         ...(boundedIdentifier(candidate.source_parent_message_id) ? { source_parent_message_id: boundedIdentifier(candidate.source_parent_message_id) } : {}),
         text: clipped.text,
         ...(sourceFiles.length ? { source_files: sourceFiles } : {}),
+        ...(replyContext ? { reply_context: replyContext } : {}),
+        ...(Number.isSafeInteger(candidate.authoring_revision) &&
+        Number(candidate.authoring_revision) > 0
+          ? { authoring_revision: Number(candidate.authoring_revision) }
+          : {}),
         ...(truncated
           ? {
               truncated: true as const,

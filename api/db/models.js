@@ -52,6 +52,8 @@ const createViventiumGlassHiveCallbackEffectOutbox = require('./viventiumGlassHi
 const createViventiumCortexInsightDelivery = require('./viventiumCortexInsightDelivery');
 /* === VIVENTIUM START === Provider-neutral accepted Main continuity state. === VIVENTIUM END === */
 const createViventiumMainContinuityState = require('./viventiumMainContinuityState');
+/* === VIVENTIUM START === Reviewed legacy conversation continuity. === VIVENTIUM END === */
+const createViventiumConversationContinuity = require('./viventiumConversationContinuity');
 /* === VIVENTIUM START === Append-only orchestration trace ledger. === VIVENTIUM END === */
 const createViventiumOrchestrationTraceEvent = require('./viventiumOrchestrationTraceEvent');
 /* === VIVENTIUM START === Owner-bound personal-account cleanup receipt ledger. === */
@@ -81,6 +83,7 @@ module.exports = {
   ViventiumGlassHiveCallbackEffectOutbox: createViventiumGlassHiveCallbackEffectOutbox(mongoose),
   ViventiumCortexInsightDelivery: createViventiumCortexInsightDelivery(mongoose),
   ViventiumMainContinuityState: createViventiumMainContinuityState(mongoose),
+  ViventiumConversationContinuity: createViventiumConversationContinuity(mongoose),
   ViventiumOrchestrationTraceEvent: createViventiumOrchestrationTraceEvent(mongoose),
   ViventiumPersonalAccountCleanupReceipt: createViventiumPersonalAccountCleanupReceipt(mongoose),
 };

@@ -14,6 +14,7 @@ import {
 } from './modelSelection';
 import ModelParametersSection from './ModelParametersSection';
 import CapabilityProviderOptions from './CapabilityProviderOptions';
+import AgentModelPicker from './AgentModelPicker';
 import BackgroundWorkerOptions from './BackgroundWorkerOptions';
 
 type ProviderReadiness = {
@@ -162,7 +163,9 @@ export default function ModelPanel({
               const display =
                 typeof field.value === 'string'
                   ? (providerCapabilities[value]?.label ?? field.value)
-                  : ((field.value as StringOption)?.label ?? '');
+                  : (providerCapabilities[value]?.label ??
+                    (field.value as StringOption)?.label ??
+                    '');
 
               return (
                 <>
@@ -210,7 +213,8 @@ export default function ModelPanel({
             render={({ field, fieldState: { error } }) => {
               return (
                 <>
-                  <ControlCombobox
+                  <AgentModelPicker
+                    modelCapabilities={providerCapability?.models}
                     selectedValue={field.value || ''}
                     displayValue={
                       providerCapability?.models?.find((item) => item.id === field.value)?.label ??

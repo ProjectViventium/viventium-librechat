@@ -181,19 +181,34 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
   }
 
   async function nativeResponseSourceMatches(identity: NativeResponseIdentity): Promise<boolean> {
-    const source = await messages().findOne({
-      _id: identity.source.id, user: identity.userId, conversationId: identity.conversationId,
-      messageId: identity.source.messageId, isCreatedByUser: true, deletedAt: null,
-    }).lean();
+    const source = await messages()
+      .findOne({
+        _id: identity.source.id,
+        user: identity.userId,
+        conversationId: identity.conversationId,
+        messageId: identity.source.messageId,
+        isCreatedByUser: true,
+        deletedAt: null,
+      })
+      .lean();
     if (!source || nativeResponseSource(source).digest !== identity.source.digest) return false;
     const expected = identity.source.parent;
     if (!expected) return true;
-    const parent = await messages().findOne({
-      _id: expected.id, user: identity.userId, conversationId: identity.conversationId,
-      messageId: expected.messageId, isCreatedByUser: expected.isCreatedByUser === true, deletedAt: null,
-    }).lean();
-    return Boolean(parent && source.parentMessageId === expected.messageId &&
-      nativeResponseParentSource(parent).digest === expected.digest);
+    const parent = await messages()
+      .findOne({
+        _id: expected.id,
+        user: identity.userId,
+        conversationId: identity.conversationId,
+        messageId: expected.messageId,
+        isCreatedByUser: expected.isCreatedByUser === true,
+        deletedAt: null,
+      })
+      .lean();
+    return Boolean(
+      parent &&
+      source.parentMessageId === expected.messageId &&
+      nativeResponseParentSource(parent).digest === expected.digest,
+    );
   }
 
   async function captureNativeResponseSource(
@@ -315,11 +330,14 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
       candidate: NativeResponseCandidate,
       message: NativeResponseMessageProjection,
     ) => NativeResponseMessageProjection,
+    prepareAttachments?: () => Promise<NativeResponseMessageProjection['attachments']>,
   ) {
     const committed = await commit(identity, digest);
     if (committed.status !== 'committed' || committed.candidateSha256 !== digest) {
       throw new Error('native_response_publication_revoked');
     }
+    // Verified File I/O stays outside transaction retries and follows the publication fence.
+    const preparedAttachments = prepareAttachments ? await prepareAttachments() : undefined;
     return transaction(async () => {
       const row = await messages()
         .findOne(responseFilter(identity))
@@ -342,6 +360,19 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
         text: candidate.text,
         content,
         metadata: row.metadata,
+        attachments:
+          preparedAttachments == null
+            ? row.attachments
+            : Array.from(
+                new Map(
+                  [...(row.attachments || []), ...preparedAttachments].map((item) => [
+                    typeof (item as { file_id?: unknown })?.file_id === 'string'
+                      ? (item as { file_id: string }).file_id
+                      : JSON.stringify(item),
+                    item,
+                  ]),
+                ).values(),
+              ),
       };
       const projected = projectMessage ? projectMessage(candidate, rawMessage) : rawMessage;
       const saved = await messages().findOneAndUpdate(
@@ -354,6 +385,7 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
           $set: {
             text: projected.text,
             content: projected.content,
+            ...(preparedAttachments != null ? { attachments: projected.attachments } : {}),
             unfinished: false,
             error: false,
             finish_reason: 'stop',
@@ -531,7 +563,19 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
     authorize: (identity: NativeResponseIdentity) => Promise<boolean>,
     transaction: Transaction,
     project: (message: NativeResponseMessageProjection) => NativeResponseMessageProjection,
+    failureClass?: string,
   ) {
+    const nativeStopMessages: Record<string, string> = {
+      native_input_declined: 'You declined that action. It was stopped.',
+      native_input_expired:
+        'The approval request expired, so that action was stopped. Please retry.',
+      native_input_cancelled: 'That action was cancelled.',
+      native_turn_cancelled: 'That action was cancelled.',
+    };
+    const nativeStopMessage =
+      typeof failureClass === 'string' && Object.hasOwn(nativeStopMessages, failureClass)
+        ? nativeStopMessages[failureClass]
+        : undefined;
     return transaction(async () => {
       const row = await messages()
         .findOne(responseFilter(identity))
@@ -570,11 +614,12 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
                 ...(projected.content || []).filter((part) => String(part.type) !== 'error'),
                 {
                   type: 'error',
-                  error_class: `native_response_${status}`,
+                  error_class: nativeStopMessage ? failureClass : `native_response_${status}`,
                   error:
-                    status === 'cancelled'
+                    nativeStopMessage ||
+                    (status === 'cancelled'
                       ? 'The response was cancelled before completion.'
-                      : 'The response could not be completed.',
+                      : 'The response could not be completed.'),
                 },
               ],
               metadata: projected.metadata,
@@ -688,12 +733,16 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
       // Background augmentation owns these rows. A foreground snapshot may predate their
       // activation or completion, so it cannot remove or regress an already persisted result.
       const cortexTypes = new Set([
-        ContentTypes.CORTEX_ACTIVATION, ContentTypes.CORTEX_BREWING, ContentTypes.CORTEX_INSIGHT,
+        ContentTypes.CORTEX_ACTIVATION,
+        ContentTypes.CORTEX_BREWING,
+        ContentTypes.CORTEX_INSIGHT,
       ]);
       const savedCortices = (row.content || []).filter((part) => cortexTypes.has(part.type));
       const savedIds = new Set(savedCortices.map((part) => part.cortex_id));
       guarded.content = [
-        ...update.content.filter((part) => !cortexTypes.has(part.type) || !savedIds.has(part.cortex_id)),
+        ...update.content.filter(
+          (part) => !cortexTypes.has(part.type) || !savedIds.has(part.cortex_id),
+        ),
         ...savedCortices,
       ];
     }

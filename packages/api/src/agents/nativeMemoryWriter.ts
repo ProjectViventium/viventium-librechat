@@ -275,8 +275,10 @@ export function createNativeMemoryExecutor({
       unregister();
     }
     const providerCode = (providerError as { code?: unknown } | undefined)?.code;
+    const responseFailure =
+      providerCode === 'missing_terminal_response' || providerCode === 'provider_response_failed';
     // The signed memory tool owns its completed effect; it does not require an authored chat answer.
-    if (providerError && !(toolCompleted && providerCode === 'missing_terminal_response')) {
+    if (providerError && !(toolCompleted && responseFailure)) {
       throw providerError;
     }
   };

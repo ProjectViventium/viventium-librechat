@@ -6,6 +6,7 @@
 import crypto from 'crypto';
 import { Schema } from 'mongoose';
 import type { Model } from 'mongoose';
+import { ORCHESTRATION_TRACE_REASONING_EFFORTS, ORCHESTRATION_TRACE_CORTEX_STATUSES } from '~/types/orchestrationTraceEvent';
 import type {
   IOrchestrationTraceFacts,
   IViventiumOrchestrationTraceEvent,
@@ -47,6 +48,7 @@ const TRACE_STAGES = [
   'control.completed',
   'tool.completed',
   'controller.completed',
+  'cortex.activation.completed',
   'cortex.completed',
   'live_memory.completed',
   'recall.completed',
@@ -54,6 +56,9 @@ const TRACE_STAGES = [
   'response.completed',
   'tts.completed',
   'audio.completed',
+  'audio.failed',
+  'audio.interrupted',
+  'audio.superseded',
   'provider.request.forwarded',
   'provider.attempt.completed',
   'provider.fallback.completed',
@@ -185,6 +190,7 @@ const factsSchema = new Schema<IOrchestrationTraceFacts>(
     fallbackAttemptRefHash: hashField(),
     responseRefHash: hashField(),
     presentationRefHash: hashField(),
+    cortexRefHash: hashField(),
     state: { type: String, enum: STATES, immutable: true },
     surface: { type: String, enum: SURFACES, immutable: true },
     callbackEvent: { type: String, enum: CALLBACK_EVENTS, immutable: true },
@@ -215,6 +221,17 @@ const factsSchema = new Schema<IOrchestrationTraceFacts>(
     action: { type: String, enum: VOICE_ACTIONS, immutable: true },
     provider: safeTokenField(),
     model: safeTokenField(),
+    requestedModel: safeTokenField(),
+    reasoningEffort: {
+      type: String,
+      enum: ORCHESTRATION_TRACE_REASONING_EFFORTS,
+      immutable: true,
+    },
+    cortexStatus: {
+      type: String,
+      enum: ORCHESTRATION_TRACE_CORTEX_STATUSES,
+      immutable: true,
+    },
     providerStatus: { type: String, enum: PROVIDER_STATUSES, immutable: true },
     attemptRole: { type: String, enum: ATTEMPT_ROLES, immutable: true },
     primaryProvider: safeTokenField(),

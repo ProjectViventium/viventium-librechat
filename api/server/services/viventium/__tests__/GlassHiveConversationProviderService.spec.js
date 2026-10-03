@@ -38,6 +38,8 @@ const {
   captureConversationProviderStableAuthority,
   conversationProviderStableAuthorityDigest,
   bindHarnessCancellation,
+  CORTEX_ATTEMPT_DEADLINE_REASON,
+  probeHarnessFamilyRelease,
   buildHarnessAgentIdempotencyKeys,
   buildHarnessAttemptIdempotencyKey,
   buildHarnessIdempotencyKey,
@@ -51,6 +53,7 @@ const {
   resolveConversationProviderId,
   resolvedConversationOrchestrationToolNames,
   setConversationProviderCapability,
+  restrictedConversationProviderBootstrapHeaders,
 } = require('../GlassHiveConversationProviderService');
 
 describe('GlassHiveConversationProviderService', () => {
@@ -61,6 +64,23 @@ describe('GlassHiveConversationProviderService', () => {
     getMessages.mockResolvedValue([]);
     getFiles.mockResolvedValue([]);
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-bundle-secret';
+  });
+
+  test('signs the minimal native restriction with the existing bootstrap protocol', () => {
+    const headers = restrictedConversationProviderBootstrapHeaders();
+    const encoded = headers['X-GlassHive-Bootstrap-Bundle-B64'];
+    const issuedAt = headers['X-GlassHive-Bootstrap-Timestamp'];
+    expect(JSON.parse(Buffer.from(encoded, 'base64'))).toEqual({
+      provider_capabilities: { native_tools: false },
+    });
+    expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(
+      `sha256=${crypto
+        .createHmac('sha256', 'synthetic-bundle-secret')
+        .update(`v1\n${issuedAt}\n${encoded}`)
+        .digest('hex')}`,
+    );
+    delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+    expect(restrictedConversationProviderBootstrapHeaders).toThrow('signature secret');
   });
 
   test('signs safe current attachment identities without requiring a broker tool', async () => {
@@ -874,6 +894,100 @@ describe('GlassHiveConversationProviderService', () => {
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
+
+  /* === VIVENTIUM START ===
+   * Purpose: A cortex attempt's deadline is an owned cancellation of its exact native request,
+   * acknowledged only when the native capacity is actually released.
+   * === VIVENTIUM END === */
+  test.each([
+    [true, true],
+    [false, false],
+  ])(
+    'delivers an attempt deadline to the exact native request (released=%s acknowledged=%s)',
+    async (capacityReleased, acknowledged) => {
+      const abortController = new AbortController();
+      const fetchImpl = jest.fn().mockResolvedValue({
+        ok: true,
+        json: jest.fn().mockResolvedValue({ capacityReleased }),
+      });
+      const req = {
+        _viventiumHarnessExecutionEnabled: true,
+        _viventiumHarnessIdempotencyKey: 'cortex:deadline-run:cortex-agent',
+        body: {},
+        user: { id: 'user-synthetic' },
+      };
+
+      bindHarnessCancellation({
+        req,
+        signal: abortController.signal,
+        endpointConfig: { baseURL: 'http://glasshive.local/v1', apiKey: 'synthetic-key' },
+        fetchImpl,
+        onDeliveryError: jest.fn(),
+      });
+      abortController.abort(CORTEX_ATTEMPT_DEADLINE_REASON);
+      const outcome = await req._viventiumHarnessCancellationDeliveryPromise;
+
+      expect(fetchImpl).toHaveBeenCalledWith(
+        'http://glasshive.local/v1/requests/by-idempotency/cortex%3Adeadline-run%3Acortex-agent/cancel',
+        expect.objectContaining({ method: 'POST' }),
+      );
+      expect(outcome.acknowledged).toBe(acknowledged);
+    },
+  );
+
+  /* === VIVENTIUM START ===
+   * Purpose: An attempt that ends without its accepted result releases its exact native request
+   * with no abort, acknowledged only when GlassHive reports the capacity released.
+   * === VIVENTIUM END === */
+  test.each([
+    [true, true],
+    [false, false],
+  ])(
+    'releases an attempt that ended without an abort (released=%s acknowledged=%s)',
+    async (capacityReleased, acknowledged) => {
+      jest.useFakeTimers();
+      try {
+        const abortController = new AbortController();
+        const fetchImpl = jest.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          json: jest.fn().mockResolvedValue({ capacityReleased }),
+        });
+        const req = {
+          _viventiumHarnessExecutionEnabled: true,
+          _viventiumHarnessIdempotencyKey: 'cortex:ended-run:cortex-agent',
+          body: {},
+          user: { id: 'user-synthetic' },
+        };
+        bindHarnessCancellation({
+          req,
+          signal: abortController.signal,
+          endpointConfig: { baseURL: 'http://glasshive.local/v1', apiKey: 'synthetic-key' },
+          fetchImpl,
+          onDeliveryError: jest.fn(),
+        });
+        expect(fetchImpl).not.toHaveBeenCalled();
+
+        const delivery = req._viventiumHarnessReleaseAttempt();
+        await jest.runAllTimersAsync();
+        const outcome = await delivery;
+
+        expect(abortController.signal.aborted).toBe(false);
+        expect(fetchImpl).toHaveBeenCalledWith(
+          'http://glasshive.local/v1/requests/by-idempotency/cortex%3Aended-run%3Acortex-agent/cancel',
+          expect.objectContaining({ method: 'POST' }),
+        );
+        expect(outcome).toMatchObject({
+          acknowledged,
+          outcomes: [expect.objectContaining({ acknowledged })],
+        });
+        expect(outcome.outcomes[0].capacityReleased === true).toBe(capacityReleased);
+        expect(req._viventiumHarnessCancellationDeliveryPromise).toBe(delivery);
+      } finally {
+        jest.useRealTimers();
+      }
+    },
+  );
 
   test('does not acknowledge maintenance yield without explicit capacity release', async () => {
     jest.useFakeTimers();
@@ -1751,6 +1865,44 @@ describe('GlassHiveConversationProviderService', () => {
     );
   });
 
+  test('keeps call task controls on the owner provider without granting them to delegated workers', async () => {
+    const originalEnabled = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED;
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED = 'true';
+    try {
+      const actualBootstrap = jest.requireActual('../GlassHiveCapabilityBootstrapService');
+      const { verifyBrokerGrant, hydrateBrokerGrantResources } = jest.requireActual(
+        '../GlassHiveCapabilityBrokerAuth',
+      );
+      const { DELEGATION_TOOL_NAME } = jest.requireActual('../GlassHiveConversationOrchestration');
+      const authority = { userId: 'owner-synthetic', callSessionId: 'call-synthetic' };
+      const bundle = await actualBootstrap.buildConversationProviderBootstrapBundle({
+        user: { id: authority.userId },
+        requestBody: { messageId: 'voice-turn-synthetic' },
+        allowedHostTools: ['manage_active_tasks', 'web_search'],
+        hostToolResources: {
+          manage_active_tasks: { version: 1, authority },
+          web_search: { version: 1 },
+        },
+        allowedConversationOrchestrationTools: [DELEGATION_TOOL_NAME],
+      });
+      const grant = await hydrateBrokerGrantResources(
+        verifyBrokerGrant(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN, {
+          expectedUserId: authority.userId,
+          requireTurnScope: true,
+        }),
+      );
+      expect(grant.allowed_host_tools).toContain('manage_active_tasks');
+      expect(grant.host_tool_resources.manage_active_tasks).toEqual({ version: 1, authority });
+      const delegated = grant.host_tool_resources[DELEGATION_TOOL_NAME];
+      expect(delegated.mission_host_tools).toEqual(['web_search']);
+      expect(delegated.mission_host_tool_resources).toEqual({ web_search: { version: 1 } });
+    } finally {
+      if (originalEnabled === undefined)
+        delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED;
+      else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED = originalEnabled;
+    }
+  });
+
   test('keeps one exact first-message scope across primary, fallback, and delayed re-entry bundles', async () => {
     const originalEnabled = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED;
     const originalTtl = process.env.VIVENTIUM_GLASSHIVE_PROVIDER_BROKER_TTL_SECONDS;
@@ -2079,5 +2231,169 @@ describe('GlassHiveConversationProviderService', () => {
     ).resolves.toBe(false);
 
     expect(targetAgent.model_parameters.configuration.defaultHeaders).toEqual({});
+  });
+});
+
+describe('superseded Main family release probe', () => {
+  const released = (capacityReleased) =>
+    jest.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ state: 'cancelled', capacityReleased, responseTimeoutS: 660 }),
+    }));
+
+  test('stops each exact owner-scoped family and requires every release acknowledgement', async () => {
+    const fetchImpl = released(true);
+
+    await expect(
+      probeHarnessFamilyRelease({
+        baseURL: 'http://glasshive.test/v1/',
+        apiKey: 'provider-key',
+        ownerId: 'owner-1',
+        messageId: 'response-a',
+        fetchImpl,
+      }),
+    ).resolves.toEqual({ released: true, reachable: true, responseTimeoutS: 660 });
+
+    expect(fetchImpl.mock.calls.map(([url]) => url)).toEqual([
+      'http://glasshive.test/v1/requests/by-idempotency/main%3Aresponse-a/cancel',
+      'http://glasshive.test/v1/requests/by-idempotency/main-fallback%3Aresponse-a/cancel',
+    ]);
+    expect(fetchImpl.mock.calls[0][1]).toMatchObject({
+      method: 'POST',
+      headers: { Authorization: 'Bearer provider-key', 'X-Viventium-User-Id': 'owner-1' },
+    });
+  });
+
+  test('never reports release while execution is retained, unreachable or unscoped', async () => {
+    const pending = released(false);
+    const probe = (overrides) =>
+      probeHarnessFamilyRelease({
+        baseURL: 'http://glasshive.test/v1',
+        apiKey: 'provider-key',
+        ownerId: 'owner-1',
+        messageId: 'response-a',
+        fetchImpl: pending,
+        ...overrides,
+      });
+
+    await expect(probe()).resolves.toEqual({
+      released: false,
+      reachable: true,
+      responseTimeoutS: 660,
+    });
+    expect(pending).toHaveBeenCalledTimes(1);
+    await expect(
+      probe({
+        fetchImpl: jest.fn(async () => {
+          throw new Error('offline');
+        }),
+      }),
+    ).resolves.toEqual({ released: false, reachable: false, responseTimeoutS: null });
+    await expect(
+      probe({ fetchImpl: jest.fn(async () => ({ ok: false, status: 503 })) }),
+    ).resolves.toEqual({ released: false, reachable: false, responseTimeoutS: null });
+    await expect(probe({ ownerId: '' })).resolves.toMatchObject({ released: false });
+    await expect(probe({ messageId: '' })).resolves.toMatchObject({ released: false });
+  });
+});
+
+describe('native Voice input binding', () => {
+  const tasks = require('../VoiceTaskService');
+  const authorityService = require('../VoiceWorkAuthorityService');
+  beforeEach(() => tasks.resetVoiceTasksForTests());
+
+  test.each(['generation_job', 'remote_generation'])(
+    'relays offered responses through %s to the exact owner request',
+    async (ownerKind) => {
+      const task = tasks.createVoiceTask({
+        userId: 'owner-native',
+        callSessionId: 'call-native',
+        streamId: 'stream-native',
+        owner: { kind: ownerKind, id: 'stream-native' },
+      });
+      const request = {
+        requestId: 'request-native',
+        requestFingerprint: 'a'.repeat(64),
+        runId: 'run-native',
+        attemptId: 'attempt-native',
+        expiresAt: new Date(Date.now() + 60000).toISOString(),
+        prompt: 'Write the requested scratch file',
+        choices: [
+          { value: 'allow-once', label: 'Allow once' },
+          { value: 'deny', label: 'Deny' },
+        ],
+      };
+      const authority = { callSessionId: 'call-native' };
+      const check = jest.spyOn(authorityService, 'assertVoiceWorkAuthority').mockResolvedValue({});
+      const fetchImpl = jest.fn(async (_url, options) => ({
+        ok: true,
+        json: async () =>
+          options.method === 'POST'
+            ? { version: 1, accepted: true, requestId: request.requestId }
+            : { version: 1, state: 'running', pending: [request] },
+      }));
+      const controller = new AbortController();
+      const req = {
+        _viventiumHarnessExecutionEnabled: true,
+        _viventiumHarnessIdempotencyKey: 'voice:exact',
+        user: { id: 'owner-native' },
+        body: { voiceMode: true, viventiumVoiceTaskId: task.taskId },
+        viventiumVoiceWorkAuthority: authority,
+      };
+      bindHarnessCancellation({
+        req,
+        signal: controller.signal,
+        endpointConfig: { baseURL: 'http://native.local/v1', apiKey: 'synthetic-key' },
+        fetchImpl,
+      });
+      await new Promise(setImmediate);
+      expect(tasks.snapshotEvent(task.taskId)).toMatchObject({
+        state: 'needs_input',
+        needsInput: { choices: request.choices },
+      });
+      const result = await tasks.submitVoiceTaskInput(task.taskId, 'allow-once', {
+        userId: 'owner-native',
+      });
+      expect(result).toMatchObject({ ok: true, task: { state: 'running' } });
+      expect(check).toHaveBeenCalledWith(authority, 'owner-native');
+      const posted = fetchImpl.mock.calls.find(([, options]) => options.method === 'POST');
+      expect(posted[0]).toBe(
+        'http://native.local/v1/requests/by-idempotency/voice%3Aexact/native-input',
+      );
+      expect(JSON.parse(posted[1].body)).toMatchObject({
+        requestId: request.requestId,
+        runId: request.runId,
+        attemptId: request.attemptId,
+        input: 'allow-once',
+      });
+      controller.abort('completed');
+      await req._viventiumNativeVoiceInputPolling;
+      check.mockRestore();
+    },
+  );
+
+  test('does not poll a task from another owner', () => {
+    const task = tasks.createVoiceTask({
+      userId: 'other-owner',
+      callSessionId: 'call-native',
+      streamId: 'stream-native',
+      owner: { kind: 'generation_job', id: 'stream-native' },
+    });
+    const fetchImpl = jest.fn();
+    const req = {
+      _viventiumHarnessExecutionEnabled: true,
+      user: { id: 'owner-native' },
+      body: { voiceMode: true, viventiumVoiceTaskId: task.taskId },
+      viventiumVoiceWorkAuthority: { callSessionId: 'call-native' },
+    };
+    bindHarnessCancellation({
+      req,
+      signal: new AbortController().signal,
+      endpointConfig: { baseURL: 'http://native.local/v1', apiKey: 'synthetic-key' },
+      fetchImpl,
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(req._viventiumNativeVoiceInputPolling).toBeUndefined();
   });
 });

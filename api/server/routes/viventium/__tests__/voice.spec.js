@@ -69,6 +69,8 @@ let mockRecordVoiceOrchestrationTrace;
 let mockRecordVoiceOrchestrationTraceBestEffort;
 let mockRunVoiceClassifierFaultControl;
 let mockCurrentVoiceOrchestrationTraceBinding;
+let mockConfirmCortexVoicePresentation;
+let mockPrepareCortexVoicePresentation;
 let mockActualApi;
 
 jest.mock(
@@ -222,6 +224,10 @@ jest.mock('~/db/models', () => ({
 
 jest.mock('~/server/services/viventium/VoiceCortexInsightsService', () => ({
   getCompletedCortexInsightsForMessage: jest.fn(),
+}));
+jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => ({
+  confirmCortexVoicePresentation: (...args) => mockConfirmCortexVoicePresentation(...args),
+  prepareCortexVoicePresentation: (...args) => mockPrepareCortexVoicePresentation(...args),
 }));
 
 jest.mock('~/server/services/viventium/SpeakerSegmentService', () => {
@@ -544,6 +550,8 @@ describe('/api/viventium/voice/chat', () => {
     mockRequireVoiceAgentAccess = jest.fn((_req, _res, next) => next());
     mockRecordVoiceOrchestrationTrace = jest.fn().mockResolvedValue({ accepted: true });
     mockRecordVoiceOrchestrationTraceBestEffort = jest.fn().mockResolvedValue({ accepted: true });
+    mockConfirmCortexVoicePresentation = jest.fn().mockResolvedValue(null);
+    mockPrepareCortexVoicePresentation = jest.fn().mockResolvedValue(true);
     mockRunVoiceClassifierFaultControl = jest.fn().mockResolvedValue({ active: false });
     mockCurrentVoiceOrchestrationTraceBinding = jest.fn().mockReturnValue({
       contractVersion: 1,
@@ -666,6 +674,7 @@ describe('/api/viventium/voice/chat', () => {
     });
     mockAssertVoiceGatewayAuth = jest.fn().mockResolvedValue({
       callSessionId: 'call_session_1',
+      expiresAtMs: Date.now() + 900000,
       ownerParticipantIdentity: 'owner-participant',
       userId: 'user_1',
       agentId: 'agent_voice',
@@ -3379,32 +3388,91 @@ describe('/api/viventium/voice/chat', () => {
     );
   });
 
-  test.each(['tts.completed', 'audio.completed'])(
-    'records %s only for the exact leased Voice task and logical turn',
-    async (stage) => {
-      const { GenerationJobManager } = require('@librechat/api');
-      const voiceTaskService = require('~/server/services/viventium/VoiceTaskService');
-      const task = voiceTaskService.createVoiceTask({
-        callSessionId: 'call_session_1',
+  test.each([
+    'tts.completed',
+    'audio.completed',
+    'audio.failed',
+    'audio.interrupted',
+    'audio.superseded',
+  ])('records %s only for the exact leased Voice task and logical turn', async (stage) => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const voiceTaskService = require('~/server/services/viventium/VoiceTaskService');
+    const task = voiceTaskService.createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      conversationId: 'conv-voice-1',
+      turnId: 'speaker-turn-1',
+      streamId: 'stream-trace-1',
+      owner: { kind: 'generation_job', id: 'stream-trace-1' },
+    });
+    GenerationJobManager.getJob.mockResolvedValueOnce({
+      metadata: {
         userId: 'user_1',
-        conversationId: 'conv-voice-1',
-        turnId: 'speaker-turn-1',
-        streamId: 'stream-trace-1',
-        owner: { kind: 'generation_job', id: 'stream-trace-1' },
-      });
-      GenerationJobManager.getJob.mockResolvedValueOnce({
-        metadata: {
-          userId: 'user_1',
-          viventiumCallSessionId: 'call_session_1',
-          viventiumVoiceTaskId: task.taskId,
-          interactionContext: {
-            surface: 'voice',
-            logical_turn_id: 'logical-turn-1',
-          },
+        viventiumCallSessionId: 'call_session_1',
+        viventiumVoiceTaskId: task.taskId,
+        interactionContext: {
+          surface: 'voice',
+          logical_turn_id: 'logical-turn-1',
         },
-      });
-      const response = createMockRes();
+      },
+    });
+    const response = createMockRes();
 
+    await dispatch(
+      createTestApp(require('../voice')),
+      createMockReq({
+        url: '/api/viventium/voice/trace/stages',
+        headers: { 'x-viventium-call-secret': 'secret' },
+        body: {
+          version: 1,
+          callSessionId: 'call_session_1',
+          turnId: 'logical-turn-1',
+          streamId: 'stream-trace-1',
+          taskId: task.taskId,
+          presentationRef: 'speech-presentation-1',
+          stage,
+        },
+      }),
+      response,
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toEqual({ version: 1, accepted: true, stage });
+    expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledWith({
+      ownerId: 'user_1',
+      callSessionId: 'call_session_1',
+      turnId: 'logical-turn-1',
+      eventRef: 'speech-presentation-1',
+      stage,
+      facts: {
+        streamRef: 'stream-trace-1',
+        taskRef: task.taskId,
+        presentationRef: 'speech-presentation-1',
+        effectCount: stage === 'tts.completed' || stage === 'audio.completed' ? 1 : 0,
+      },
+    });
+  });
+
+  test('records late audio using the retained canonical task binding after job cleanup', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const service = require('~/server/services/viventium/VoiceTaskService');
+    const scope = {
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      conversationId: 'conv-voice-1',
+    };
+    const task = service.createVoiceTask({ ...scope, streamId: 'late-audio-stream' });
+    service.bindVoiceTaskStream(task.taskId, 'late-audio-stream', {
+      ...scope,
+      logicalTurnId: 'late-turn',
+    });
+    service.completeVoiceTask(task.taskId, { resultMessageId: 'late-response' });
+    for (const [turnId, expectedStatus] of [
+      ['late-turn', 200],
+      ['other-turn', 403],
+    ]) {
+      GenerationJobManager.getJob.mockResolvedValueOnce(null);
+      const response = createMockRes();
       await dispatch(
         createTestApp(require('../voice')),
         createMockReq({
@@ -3412,32 +3480,245 @@ describe('/api/viventium/voice/chat', () => {
           headers: { 'x-viventium-call-secret': 'secret' },
           body: {
             version: 1,
-            callSessionId: 'call_session_1',
-            turnId: 'logical-turn-1',
-            streamId: 'stream-trace-1',
+            callSessionId: scope.callSessionId,
+            turnId,
+            streamId: 'late-audio-stream',
             taskId: task.taskId,
-            presentationRef: 'speech-presentation-1',
-            stage,
+            presentationRef: 'late-speech',
+            stage: 'audio.completed',
           },
         }),
         response,
       );
+      expect(response.statusCode).toBe(expectedStatus);
+    }
+    expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledTimes(1);
+  });
 
-      expect(response.statusCode).toBe(200);
-      expect(response.body).toEqual({ version: 1, accepted: true, stage });
-      expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledWith({
-        ownerId: 'user_1',
+  test('reports local diagnostics explicitly when a release trace binding is unavailable', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const service = require('~/server/services/viventium/VoiceTaskService');
+    const scope = {
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      conversationId: 'conv-voice-1',
+    };
+    const task = service.createVoiceTask({ ...scope, streamId: 'local-trace-stream' });
+    service.bindVoiceTaskStream(task.taskId, 'local-trace-stream', {
+      ...scope,
+      logicalTurnId: 'local-turn',
+    });
+    GenerationJobManager.getJob.mockResolvedValueOnce(null);
+    mockRecordVoiceOrchestrationTrace.mockRejectedValueOnce(
+      Object.assign(new Error('binding'), {
+        code: 'voice_trace_runtime_binding_unavailable',
+      }),
+    );
+    const response = createMockRes();
+    await dispatch(
+      createTestApp(require('../voice')),
+      createMockReq({
+        url: '/api/viventium/voice/trace/stages',
+        headers: { 'x-viventium-call-secret': 'secret' },
+        body: {
+          version: 1,
+          callSessionId: scope.callSessionId,
+          turnId: 'local-turn',
+          streamId: 'local-trace-stream',
+          taskId: task.taskId,
+          presentationRef: 'local-speech',
+          stage: 'tts.completed',
+        },
+      }),
+      response,
+    );
+    expect(response.statusCode).toBe(202);
+    expect(response.body).toMatchObject({ accepted: true, durable: false });
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledTimes(1);
+  });
+
+  test('completed child playout settles independently of an unavailable telemetry binding and retains canonical task parent', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const service = require('~/server/services/viventium/VoiceTaskService');
+    const scope = {
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      conversationId: 'conv-voice-1',
+    };
+    const task = service.createVoiceTask({ ...scope, streamId: 'child-audio-stream' });
+    service.bindVoiceTaskStream(task.taskId, 'child-audio-stream', {
+      ...scope,
+      logicalTurnId: 'child-turn',
+    });
+    service.completeVoiceTask(task.taskId, { resultMessageId: 'canonical-parent' });
+    GenerationJobManager.getJob.mockResolvedValueOnce(null);
+    mockConfirmCortexVoicePresentation.mockResolvedValueOnce([{ status: 'sent' }]);
+    mockRecordVoiceOrchestrationTrace.mockRejectedValueOnce(
+      Object.assign(new Error('binding'), {
+        code: 'voice_trace_runtime_binding_unavailable',
+      }),
+    );
+    const response = createMockRes();
+    await dispatch(
+      createTestApp(require('../voice')),
+      createMockReq({
+        url: '/api/viventium/voice/trace/stages',
+        headers: { 'x-viventium-call-secret': 'secret' },
+        body: {
+          version: 1,
+          callSessionId: scope.callSessionId,
+          turnId: 'child-turn',
+          streamId: 'child-audio-stream',
+          taskId: task.taskId,
+          presentationRef: 'persisted-cortex-child',
+          stage: 'audio.completed',
+        },
+      }),
+      response,
+    );
+    expect(mockConfirmCortexVoicePresentation).toHaveBeenCalledWith({
+      ownerId: scope.userId,
+      conversationId: scope.conversationId,
+      parentMessageId: 'canonical-parent',
+      callSessionId: scope.callSessionId,
+      taskId: task.taskId,
+      streamId: 'child-audio-stream',
+      turnId: 'child-turn',
+      presentationRef: 'persisted-cortex-child',
+      stage: 'audio.completed',
+    });
+    expect(mockConfirmCortexVoicePresentation.mock.invocationCallOrder[0]).toBeLessThan(
+      mockRecordVoiceOrchestrationTrace.mock.invocationCallOrder[0],
+    );
+    expect(response.statusCode).toBe(202);
+    expect(response.body).toMatchObject({ accepted: true, durable: false });
+  });
+
+  test.each(['transient', 'conflict'])(
+    'a child durable receipt %s cannot be accepted as successful trace-only delivery',
+    async (kind) => {
+      const { GenerationJobManager } = require('@librechat/api');
+      const service = require('~/server/services/viventium/VoiceTaskService');
+      const scope = {
         callSessionId: 'call_session_1',
-        turnId: 'logical-turn-1',
-        eventRef: 'speech-presentation-1',
-        stage,
-        facts: {
-          streamRef: 'stream-trace-1',
-          taskRef: task.taskId,
-          presentationRef: 'speech-presentation-1',
-          effectCount: 1,
+        userId: 'user_1',
+        conversationId: 'conv-voice-1',
+      };
+      const task = service.createVoiceTask({ ...scope, streamId: 'child-failed-stream' });
+      service.bindVoiceTaskStream(task.taskId, 'child-failed-stream', {
+        ...scope,
+        logicalTurnId: 'child-turn',
+      });
+      service.completeVoiceTask(task.taskId, { resultMessageId: 'canonical-parent' });
+      GenerationJobManager.getJob.mockResolvedValueOnce(null);
+      mockConfirmCortexVoicePresentation.mockRejectedValueOnce(
+        Object.assign(
+          new Error('persistence unavailable'),
+          kind === 'conflict' ? { code: 'cortex_voice_presentation_receipt_conflict' } : {},
+        ),
+      );
+      const response = createMockRes();
+      await dispatch(
+        createTestApp(require('../voice')),
+        createMockReq({
+          url: '/api/viventium/voice/trace/stages',
+          headers: { 'x-viventium-call-secret': 'secret' },
+          body: {
+            version: 1,
+            callSessionId: scope.callSessionId,
+            turnId: 'child-turn',
+            streamId: 'child-failed-stream',
+            taskId: task.taskId,
+            presentationRef: 'persisted-cortex-child',
+            stage: 'audio.completed',
+          },
+        }),
+        response,
+      );
+      expect(response.statusCode).toBe(kind === 'conflict' ? 409 : 503);
+      expect(response.body.retryable).toBe(kind !== 'conflict');
+      expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledWith(
+        expect.objectContaining({ stage: 'audio.completed' }),
+      );
+    },
+  );
+
+  test.each(['current', 'already-presented', 'wrong-call', 'wrong-parent', 'store-failed'])(
+    'Cortex fetch seals its source before exposing text: %s',
+    async (variant) => {
+      const service = require('~/server/services/viventium/VoiceTaskService');
+      const {
+        getCompletedCortexInsightsForMessage,
+      } = require('~/server/services/viventium/VoiceCortexInsightsService');
+      const scope = {
+        callSessionId: 'call_session_1',
+        userId: 'user_1',
+        conversationId: 'conv-voice-1',
+      };
+      const task = service.createVoiceTask({ ...scope, streamId: 'cortex-sealed-stream' });
+      service.bindVoiceTaskStream(task.taskId, 'cortex-sealed-stream', {
+        ...scope,
+        logicalTurnId: 'cortex-turn',
+      });
+      service.completeVoiceTask(task.taskId, {
+        resultMessageId: variant === 'wrong-parent' ? 'another-parent' : 'canonical-parent',
+      });
+      getCompletedCortexInsightsForMessage.mockResolvedValueOnce({
+        messageId: 'canonical-parent',
+        conversationId: scope.conversationId,
+        insights: [],
+        followUp: { messageId: 'canonical-child', text: 'Useful additional result.' },
+        presentationRequired: true,
+        presentationContext: {
+          callSessionId: variant === 'wrong-call' ? 'another-call' : scope.callSessionId,
+          taskId: task.taskId,
+          turnId: 'cortex-turn',
         },
       });
+      if (variant === 'store-failed')
+        mockPrepareCortexVoicePresentation.mockRejectedValueOnce(
+          new Error('durable store unavailable'),
+        );
+      if (variant === 'already-presented')
+        mockPrepareCortexVoicePresentation.mockResolvedValueOnce(false);
+      const response = createMockRes();
+      await dispatch(
+        createTestApp(require('../voice')),
+        createMockReq({
+          method: 'GET',
+          url: '/api/viventium/voice/cortex/canonical-parent',
+          headers: { 'x-viventium-call-secret': 'secret' },
+        }),
+        response,
+      );
+      if (variant === 'current' || variant === 'already-presented') {
+        expect(response.statusCode).toBe(200);
+        expect(response.body.followUp).toEqual(
+          variant === 'already-presented'
+            ? null
+            : {
+                messageId: 'canonical-child',
+                text: 'Useful additional result.',
+              },
+        );
+        expect(mockPrepareCortexVoicePresentation).toHaveBeenCalledWith({
+          ownerId: scope.userId,
+          conversationId: scope.conversationId,
+          parentMessageId: 'canonical-parent',
+          callSessionId: scope.callSessionId,
+          taskId: task.taskId,
+          streamId: 'cortex-sealed-stream',
+          turnId: 'cortex-turn',
+          presentationRef: 'canonical-child',
+          text: 'Useful additional result.',
+          leaseMs: expect.any(Number),
+        });
+        expect(response.body.presentationContext).toBeUndefined();
+      } else {
+        expect(response.statusCode).toBe(variant === 'store-failed' ? 500 : 403);
+        expect(response.body.followUp).toBeUndefined();
+        expect(mockConfirmCortexVoicePresentation).not.toHaveBeenCalled();
+      }
     },
   );
 
@@ -3492,6 +3773,7 @@ describe('/api/viventium/voice/chat', () => {
     }
 
     expect(mockRecordVoiceOrchestrationTrace).not.toHaveBeenCalled();
+    expect(mockConfirmCortexVoicePresentation).not.toHaveBeenCalled();
   });
 
   test('gateway verification rejects a forged decision and a concurrently downgraded session', async () => {
@@ -4979,6 +5261,51 @@ describe('/api/viventium/voice/chat', () => {
     expect(mockSaveMessage).not.toHaveBeenCalled();
   });
 
+  test.each([
+    ['native_input_declined', 'You declined that action. It was stopped.'],
+    [
+      'native_input_expired',
+      'The approval request expired, so that action was stopped. Please retry.',
+    ],
+    ['native_input_cancelled', 'That action was cancelled.'],
+    ['native_turn_cancelled', 'That action was cancelled.'],
+  ])('Voice SSE final preserves the typed failed task %s', async (code, publicMessage) => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const { GenerationJobManager } = require('@librechat/api');
+    const task = taskService.createVoiceTask({
+      callSessionId: 'call_session_1',
+      userId: 'user_1',
+      streamId: 'native-stop-stream',
+    });
+    GenerationJobManager.getJob.mockResolvedValue({ metadata: { userId: 'user_1' } });
+    GenerationJobManager.subscribe.mockImplementationOnce((_id, _event, done) => {
+      done({
+        final: true,
+        responseMessage: {
+          messageId: 'stopped-result',
+          error: true,
+          content: [{ type: 'error', error_class: code, error: 'Public stop message.' }],
+        },
+      });
+      return { unsubscribe: jest.fn() };
+    });
+    const app = createTestApp(require('../voice'));
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/stream/native-stop-stream',
+      headers: { 'x-viventium-call-secret': 'secret' },
+    });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.write).toHaveBeenCalledWith(expect.stringContaining('"error_class":"' + code + '"'));
+    expect(taskService.getVoiceTask(task.taskId).state).toBe('failed');
+    expect(taskService.snapshotEvent(task.taskId)).toMatchObject({
+      type: 'snapshot',
+      state: 'failed',
+      error: { code, message: publicMessage },
+    });
+  });
+
   test('a superseded SSE presentation does not complete still-running voice work', async () => {
     const taskService = require('~/server/services/viventium/VoiceTaskService');
     const { GenerationJobManager } = require('@librechat/api');
@@ -5766,6 +6093,27 @@ describe('/api/viventium/voice/chat', () => {
     expect(provideInput).toHaveBeenCalledWith(
       expect.objectContaining({ input: 'Example scope', operationId: expect.any(String) }),
     );
+  });
+
+  test('keeps a native mission input HTTP response pending and retries the exact operation under current call ownership', async () => {
+    require('~/server/services/viventium/CallSessionService').assertCallSessionSecret.mockResolvedValue({ callSessionId: 'call_session_1', userId: 'user_1', ownerParticipantIdentity: 'owner-participant', mode: 'call' });
+    const service = require('~/server/services/viventium/VoiceTaskService');
+    const task = service.createVoiceTask({ callSessionId: 'call_session_1', userId: 'user_1', streamId: 'glasshive:run-native', owner: { kind: 'glasshive_run', id: 'run-native' } });
+    const binding = { version: 1, requestId: 'permission-1', requestFingerprint: 'a'.repeat(64), runId: 'run-native', attemptId: 'attempt-1', sessionId: 'session-1', expiresAt: '2099-01-01T00:00:00Z', taskId: task.taskId, workRef: 'work-native', userId: 'user_1', callSessionId: 'call_session_1' };
+    const provideInput = jest.fn().mockResolvedValueOnce({ accepted: false, confirmationPending: true }).mockResolvedValueOnce({ accepted: true });
+    service.registerVoiceTaskOwnerAdapter(task.taskId, { kind: 'glasshive_run', provideInput, nativeMissionInputBinding: binding });
+    service.observeGenerationEvent(task.taskId, { event: 'needs_input', data: { prompt: 'Permit?', inputType: 'choice', choices: [{ value: 'allow_once', label: 'Allow once' }] } });
+    const app = createTestApp(require('../voice'));
+    const request = () => createMockReq({ method: 'POST', url: `/api/viventium/voice/tasks/${task.taskId}/input`, headers: { 'x-viventium-call-secret': 'secret', 'x-viventium-call-session': 'call_session_1' }, body: { input: 'allow_once' } });
+    const pending = createMockRes();
+    await dispatch(app, request(), pending);
+    expect(pending.statusCode).toBe(200);
+    expect(pending.body).toMatchObject({ outcome: 'pending', confirmationPending: true, task: { state: 'needs_input' } });
+    expect(provideInput.mock.calls[0][0]).toMatchObject({ voiceAuthorityContext: { callSessionId: 'call_session_1', binding: { callSessionId: 'call_session_1', userId: 'user_1', kind: 'participant_text' } } });
+    const accepted = createMockRes();
+    await dispatch(app, request(), accepted);
+    expect(accepted.body).toMatchObject({ outcome: 'accepted', task: { state: 'running' } });
+    expect(provideInput.mock.calls[1][0].operationId).toBe(provideInput.mock.calls[0][0].operationId);
   });
 
   test('retries a failed task only through its installed owner adapter', async () => {
@@ -7052,7 +7400,7 @@ describe('/api/viventium/voice/chat', () => {
     mockClaimGlassHiveDeliveries.mockResolvedValueOnce([
       {
         deliveryId: 'ghcd_voice',
-        callbackId: 'cb_voice',
+        callbackId: require('crypto').createHash('sha256').update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'),
         text: 'Worker finished.',
         claimId: 'claim_voice',
         userId: 'user_1',
@@ -7085,9 +7433,9 @@ describe('/api/viventium/voice/chat', () => {
 
   test('POST glasshive delivery claim rejects a substituted callback or a different owner/call', async () => {
     for (const mismatch of [
-      { callbackId: 'different_callback', userId: 'user_1', voiceCallSessionId: 'call_session_1' },
-      { callbackId: 'cb_voice', userId: 'different_owner', voiceCallSessionId: 'call_session_1' },
-      { callbackId: 'cb_voice', userId: 'user_1', voiceCallSessionId: 'different_call' },
+      { callbackId: 'callback_sha256:' + 'b'.repeat(64), userId: 'user_1', voiceCallSessionId: 'call_session_1' },
+      { callbackId: require('crypto').createHash('sha256').update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'), userId: 'different_owner', voiceCallSessionId: 'call_session_1' },
+      { callbackId: require('crypto').createHash('sha256').update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'), userId: 'user_1', voiceCallSessionId: 'different_call' },
     ]) {
       mockClaimGlassHiveDeliveries.mockResolvedValueOnce([
         { deliveryId: 'ghcd_voice', claimId: 'claim_voice', ...mismatch },
@@ -7111,7 +7459,7 @@ describe('/api/viventium/voice/chat', () => {
     const exact = {
       deliveryId: 'ghcd_voice',
       claimId: 'claim_voice',
-      callbackId: 'cb_voice',
+      callbackId: require('crypto').createHash('sha256').update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'),
       userId: 'user_1',
       voiceCallSessionId: 'call_session_1',
     };
@@ -7499,4 +7847,48 @@ describe('/api/viventium/voice/chat', () => {
       }
     },
   );
+  /* === VIVENTIUM START: Preserve the shared public stream failure contract. === */
+
+  test.each(['source_context_unavailable', undefined])(
+    'Voice SSE preserves optional typed generation failure %s',
+    async (errorClass) => {
+      const error = 'The conversation context could not be preserved. Please retry this turn.';
+      const taskService = require('~/server/services/viventium/VoiceTaskService');
+      const { GenerationJobManager } = require('@librechat/api');
+      const task = taskService.createVoiceTask({
+        callSessionId: 'call_session_1',
+        userId: 'user_1',
+        streamId: 'typed-failure',
+      });
+      GenerationJobManager.getJob.mockResolvedValue({ metadata: { userId: 'user_1' } });
+      GenerationJobManager.subscribe.mockImplementationOnce((_id, _event, _done, onError) => {
+        onError(error, errorClass);
+        return { unsubscribe: jest.fn() };
+      });
+      const req = createMockReq({
+        method: 'GET',
+        url: '/api/viventium/voice/stream/typed-failure',
+        headers: { 'x-viventium-call-secret': 'secret' },
+      });
+      const res = createMockRes();
+      await dispatch(createTestApp(require('../voice')), req, res);
+      const errorFrames = res.write.mock.calls
+        .map(([value]) => value)
+        .filter((value) => value.startsWith('event: error\ndata: '));
+      expect(errorFrames).toHaveLength(1);
+      expect(JSON.parse(errorFrames[0].slice('event: error\ndata: '.length))).toEqual({
+        error,
+        ...(errorClass ? { error_class: errorClass } : {}),
+      });
+      expect(taskService.getVoiceTask(task.taskId).state).toBe('failed');
+      if (errorClass) {
+        expect(taskService.snapshotEvent(task.taskId).error).toEqual({
+          code: errorClass,
+          message: 'The conversation context is unavailable.',
+        });
+      }
+    },
+  );
+  /* === VIVENTIUM END === */
+
 });

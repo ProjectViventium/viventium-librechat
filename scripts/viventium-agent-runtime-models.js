@@ -1,37 +1,51 @@
 'use strict';
 
 const DEFAULT_MODELS = {
-  openAI: 'gpt-5.6-sol',
-  anthropic: 'claude-opus-5',
-  xai: 'grok-4.20-non-reasoning',
+  openAI: 'gpt-6.1-sol',
+  anthropic: 'claude-opus-5-5',
+  xai: 'grok-4.7',
   groq: 'qwen/qwen3.6-27b',
 };
 
 const MAIN_AGENT_ID = 'agent_viventium_main_95aeb3';
 const GLASSHIVE_MAIN_PROVIDER = 'glasshive-harness';
-const GLASSHIVE_MAIN_MODEL = 'codex-cli:gpt-5.6-sol';
-const GLASSHIVE_MAIN_REASONING_EFFORT = 'medium';
-const GLASSHIVE_FALLBACK_MODEL = 'claude-code:opus';
+const GLASSHIVE_MAIN_MODEL = 'codex-cli:gpt-6.1-sol';
+const GLASSHIVE_MAIN_REASONING_EFFORT = 'high';
+const GLASSHIVE_FALLBACK_MODEL = 'claude-code:claude-opus-5-5';
 const DIRECT_ANTHROPIC_FALLBACK_MODEL = DEFAULT_MODELS.anthropic;
-const DIRECT_OPENAI_FALLBACK_MODEL = 'gpt-5.6-sol';
+const DIRECT_OPENAI_FALLBACK_MODEL = 'gpt-6.1-sol';
 
 const APPROVED_MAIN_RUNTIME_FAMILIES = new Set([
-  `${GLASSHIVE_MAIN_PROVIDER}::${GLASSHIVE_MAIN_MODEL}`,
   'openAI::gpt-5.6-sol',
   'anthropic::claude-opus-5',
+  'glasshive-harness::codex-cli:gpt-5.6-sol',
+  'glasshive-harness::grok-build:grok-4.7',
+  'glasshive-harness::grok-build:grok-4.7-build-fast',
+  'xai::grok-4.7',
+  `${GLASSHIVE_MAIN_PROVIDER}::${GLASSHIVE_MAIN_MODEL}`,
+  'openAI::gpt-6.1-sol',
+  'anthropic::claude-opus-5-5',
 ]);
 
 const APPROVED_BACKGROUND_RUNTIME_FAMILIES = new Set([
-  `${GLASSHIVE_MAIN_PROVIDER}::${GLASSHIVE_MAIN_MODEL}`,
   'openAI::gpt-5.6-sol',
   'openAI::gpt-5.6-terra',
   'glasshive-harness::codex-cli:gpt-5.6-luna',
   'anthropic::claude-opus-5',
+  'glasshive-harness::codex-cli:gpt-5.6-sol',
+  'glasshive-harness::grok-build:grok-4.7',
+  'glasshive-harness::grok-build:grok-4.7-build-fast',
+  'xai::grok-4.7',
+  `${GLASSHIVE_MAIN_PROVIDER}::${GLASSHIVE_MAIN_MODEL}`,
+  'openAI::gpt-6.1-sol',
+  'openAI::gpt-6.1-sol',
+  'glasshive-harness::codex-cli:gpt-6.1-sol',
+  'anthropic::claude-opus-5-5',
 ]);
 
 const APPROVED_BACKGROUND_ACTIVATION_FAMILIES = new Set([
   'groq::qwen/qwen3.6-27b',
-  'xai::grok-4.20-non-reasoning',
+  'xai::grok-4.7',
 ]);
 
 /* === VIVENTIUM START ===
@@ -66,15 +80,11 @@ const TOOL_RUNTIME_GATES = Object.freeze([
   },
 ]);
 
-/* === VIVENTIUM NOTE ===
- * Voice-fast defaults are a separate latency policy, not the built-in background-agent governance
- * baseline. Keeping OpenAI voice on a lighter realtime-friendly family must not be misread as a
- * license to drift text/background agents back to stale 4o-era execution models.
- * === VIVENTIUM NOTE === */
+/* Voice and text provider defaults share the same current model generation. */
 const DEFAULT_VOICE_MODELS = {
-  openAI: 'gpt-4o-mini',
-  anthropic: 'claude-opus-5',
-  xai: 'grok-4.20-non-reasoning',
+  openAI: 'gpt-6.1-sol',
+  anthropic: 'claude-opus-5-5',
+  xai: 'grok-4.7',
 };
 
 const AGENT_RUNTIME_ENV_BY_ID = {
@@ -140,90 +150,90 @@ const BUILT_IN_BACKGROUND_AGENT_IDS = Object.freeze(
 
 const CANONICAL_BUILT_IN_MAIN_MODEL_PARAMETERS = Object.freeze({
   openAI: Object.freeze({
-    reasoning_effort: 'medium',
+    reasoning_effort: 'high',
     useResponsesApi: true,
   }),
-  anthropic: Object.freeze({}),
-  'glasshive-harness': Object.freeze({ reasoning_effort: 'medium' }),
+  anthropic: Object.freeze({ effort: 'high' }),
+  'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
 });
 
 const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
   agent_viventium_background_analysis_95aeb3: Object.freeze({
     openAI: Object.freeze({
-      reasoning_effort: 'medium',
+      reasoning_effort: 'high',
       useResponsesApi: true,
     }),
-    'glasshive-harness': Object.freeze({ reasoning_effort: 'medium' }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_viventium_deep_memory_95aeb3: Object.freeze({
     'glasshive-harness': Object.freeze({
-      reasoning_effort: 'medium',
+      reasoning_effort: 'high',
     }),
     openAI: Object.freeze({
-      reasoning_effort: 'medium',
+      reasoning_effort: 'high',
       useResponsesApi: true,
     }),
   }),
   agent_viventium_confirmation_bias_95aeb3: Object.freeze({
     openAI: Object.freeze({
-      reasoning_effort: 'medium',
+      reasoning_effort: 'high',
       useResponsesApi: true,
     }),
     anthropic: Object.freeze({
-      thinking: false,
+      effort: 'high',
     }),
-    'glasshive-harness': Object.freeze({ reasoning_effort: 'medium' }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_viventium_red_team_95aeb3: Object.freeze({
     openAI: Object.freeze({
-      reasoning_effort: 'xhigh',
+      reasoning_effort: 'high',
       useResponsesApi: true,
     }),
     anthropic: Object.freeze({
-      thinkingBudget: 4000,
+      effort: 'high',
     }),
     'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_viventium_deep_research_95aeb3: Object.freeze({
     openAI: Object.freeze({
-      reasoning_effort: 'xhigh',
+      reasoning_effort: 'high',
       useResponsesApi: true,
     }),
     anthropic: Object.freeze({
-      thinkingBudget: 4000,
+      effort: 'high',
     }),
-    'glasshive-harness': Object.freeze({ reasoning_effort: 'xhigh' }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_viventium_online_tool_use_95aeb3: Object.freeze({
     openAI: Object.freeze({
-      reasoning_effort: 'low',
+      reasoning_effort: 'high',
       useResponsesApi: true,
     }),
-    'glasshive-harness': Object.freeze({ reasoning_effort: 'low' }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_viventium_parietal_cortex_95aeb3: Object.freeze({
     openAI: Object.freeze({
-      reasoning_effort: 'medium',
+      reasoning_effort: 'high',
       useResponsesApi: true,
     }),
-    'glasshive-harness': Object.freeze({ reasoning_effort: 'medium' }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_viventium_pattern_recognition_95aeb3: Object.freeze({
     openAI: Object.freeze({
-      reasoning_effort: 'medium',
+      reasoning_effort: 'high',
       useResponsesApi: true,
     }),
-    'glasshive-harness': Object.freeze({ reasoning_effort: 'medium' }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_viventium_emotional_resonance_95aeb3: Object.freeze({
     openAI: Object.freeze({
-      reasoning_effort: 'low',
+      reasoning_effort: 'high',
       useResponsesApi: true,
     }),
     anthropic: Object.freeze({
-      thinking: false,
+      effort: 'high',
     }),
-    'glasshive-harness': Object.freeze({ reasoning_effort: 'low' }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_viventium_strategic_planning_95aeb3: Object.freeze({
     openAI: Object.freeze({
@@ -231,23 +241,23 @@ const CANONICAL_BUILT_IN_BACKGROUND_MODEL_PARAMETERS = Object.freeze({
       useResponsesApi: true,
     }),
     anthropic: Object.freeze({
-      thinkingBudget: 2000,
+      effort: 'high',
     }),
     'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_viventium_support_95aeb3: Object.freeze({
     openAI: Object.freeze({
-      reasoning_effort: 'low',
+      reasoning_effort: 'high',
       useResponsesApi: true,
     }),
-    'glasshive-harness': Object.freeze({ reasoning_effort: 'low' }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
   agent_8Y1d7JNhpubtvzYz3hvEv: Object.freeze({
     openAI: Object.freeze({
-      reasoning_effort: 'low',
+      reasoning_effort: 'high',
       useResponsesApi: true,
     }),
-    'glasshive-harness': Object.freeze({ reasoning_effort: 'low' }),
+    'glasshive-harness': Object.freeze({ reasoning_effort: 'high' }),
   }),
 });
 
@@ -437,34 +447,23 @@ function canonicalBuiltInBackgroundModelParameters(agentId, provider) {
 }
 
 function canonicalBuiltInModelParameters(agentId, provider, incomingParameters = {}) {
-  if (agentId === 'agent_viventium_main_95aeb3') {
-    const normalizedProvider = normalizeProvider(provider);
-    const canonical = CANONICAL_BUILT_IN_MAIN_MODEL_PARAMETERS[normalizedProvider];
-    if (canonical == null) {
-      return null;
-    }
-    if (normalizedProvider === 'anthropic') {
-      const providerNative = deepClone(incomingParameters || {});
-      delete providerNative.reasoning_effort;
-      delete providerNative.useResponsesApi;
-      return providerNative;
-    }
-    return deepClone(canonical);
-  }
-  const canonical = canonicalBuiltInBackgroundModelParameters(agentId, provider);
+  const normalizedProvider = normalizeProvider(provider);
+  const canonical = agentId === MAIN_AGENT_ID
+    ? CANONICAL_BUILT_IN_MAIN_MODEL_PARAMETERS[normalizedProvider]
+    : canonicalBuiltInBackgroundModelParameters(agentId, provider);
   if (canonical == null) {
     return null;
   }
-  if (normalizeProvider(provider) === 'anthropic') {
-    const providerNative = {
-      ...canonical,
-      ...deepClone(incomingParameters || {}),
-    };
+  const providerNative = { ...deepClone(canonical), ...deepClone(incomingParameters || {}) };
+  if (normalizedProvider === 'anthropic') {
     delete providerNative.reasoning_effort;
     delete providerNative.useResponsesApi;
-    return providerNative;
+  } else {
+    delete providerNative.effort;
+    delete providerNative.thinking;
+    delete providerNative.thinkingBudget;
   }
-  return canonical;
+  return providerNative;
 }
 
 function isGlassHiveMainFamily(provider, model) {
@@ -503,7 +502,11 @@ function rewriteBuiltInFallbackForRuntime(agent, { env = process.env } = {}) {
     ...agent,
     fallback_llm_provider: directFallback.provider,
     fallback_llm_model: directFallback.model,
-    fallback_llm_model_parameters: { model: directFallback.model },
+    fallback_llm_model_parameters: {
+      model: directFallback.model,
+      ...(directFallback.provider === 'anthropic'
+        ? { effort: 'high' } : { reasoning_effort: 'high', useResponsesApi: true }),
+    },
   };
 }
 
@@ -536,16 +539,19 @@ function rewriteAgentForRuntime(
             ...envMap,
             fallbackProvider: rewritten.provider,
             fallbackModel: rewritten.model,
-            approvedFamilies: approvedRuntimeFamiliesForAgent(rewritten.id, { env }),
           });
     if (assignment) {
       rewritten.provider = assignment.provider;
       rewritten.model = assignment.model;
     }
+    const runtimeFamilyChanged = assignment && (
+      normalizeProvider(agent.provider) !== assignment.provider ||
+      String(agent.model || agent.model_parameters?.model || '').trim() !== assignment.model
+    );
     const canonicalBuiltInParameters = canonicalBuiltInModelParameters(
       rewritten.id,
       rewritten.provider,
-      assignment ? {} : rewritten.model_parameters,
+      runtimeFamilyChanged ? {} : rewritten.model_parameters,
     );
     if (canonicalBuiltInParameters !== null) {
       rewritten.model_parameters = {
@@ -635,7 +641,6 @@ function rewriteBackgroundCortices(backgroundCortices, { env = process.env } = {
       ...envMap,
       fallbackProvider: cortex.activation.provider || 'groq',
       fallbackModel: cortex.activation.model || DEFAULT_MODELS.groq,
-      approvedFamilies: APPROVED_BACKGROUND_ACTIVATION_FAMILIES,
     });
     if (!assignment) {
       return cortex;

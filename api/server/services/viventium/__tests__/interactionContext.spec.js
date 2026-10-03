@@ -336,6 +336,69 @@ describe('trusted InteractionContext', () => {
     expect(getTrustedInteractionContext(req)).toBe(bound);
   });
 
+  /* === VIVENTIUM START ===
+   * Purpose: a quoted input's quote travels with its own source segment, so a later combined turn
+   * keeps each input's quote; the claim keeps an earlier source's quote alongside the current one.
+   * === VIVENTIUM END === */
+  test('a quoted input keeps its quote on its own source segment through a combined claim', () => {
+    const quote = {
+      version: 1,
+      provenanceStatus: 'verified',
+      senderRole: 'assistant_self',
+      repliedTelegramMessageId: '14382',
+      quoteText: 'Willow fits 450 with 8 left.',
+      logicalMessageId: 'main-answer',
+    };
+    const earlierQuote = {
+      ...quote,
+      repliedTelegramMessageId: '14384',
+      quoteText: 'Cheaper by $15.',
+    };
+    const req = {};
+    setTrustedInteractionContext(
+      req,
+      createTelegramInteractionContext({
+        conversation_id: 'conversation-1',
+        source_event_id: 'event-b',
+        reply_context: quote,
+      }),
+    );
+    bindInteractionSourceSegments(req, ['Does it still fit?', 'And the total?']);
+    const current = getTrustedInteractionContext(req);
+    expect(current.source_segments.map((segment) => segment.reply_context ?? null)).toEqual([
+      quote,
+      null,
+    ]);
+
+    const claimed = bindLogicalTurnContext(req, {
+      ...current,
+      logical_turn_id: 'logical-1',
+      revision: 2,
+      source_segments: [
+        {
+          ordinal: 0,
+          source_event_id: 'event-a',
+          source_index: 0,
+          text: 'Earlier quoted input',
+          reply_context: earlierQuote,
+        },
+        ...current.source_segments,
+      ],
+    });
+    expect(claimed.reply_context).toEqual(quote);
+    expect(
+      claimed.source_segments.map((segment) => [
+        segment.source_event_id,
+        segment.reply_context?.repliedTelegramMessageId ?? null,
+      ]),
+    ).toEqual([
+      ['event-a', '14384'],
+      ['event-b', '14382'],
+      ['event-b', null],
+    ]);
+  });
+  /* === VIVENTIUM END === */
+
   test('binds exact bounded source text internally but omits it from ordinary message metadata', () => {
     const req = {};
     setTrustedInteractionContext(

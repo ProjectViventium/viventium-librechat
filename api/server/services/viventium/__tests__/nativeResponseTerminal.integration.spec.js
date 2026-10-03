@@ -483,3 +483,35 @@ test('overlapping recovery passes share one scan and close after a handler failu
   expect(listing).toHaveBeenCalledTimes(2);
   expect(cursors[1].close).toHaveBeenCalledTimes(1);
 });
+
+
+test.each([
+  ['native_input_declined', 'You declined that action. It was stopped.'],
+  ['native_input_expired', 'The approval request expired, so that action was stopped. Please retry.'],
+  ['native_input_cancelled', 'That action was cancelled.'],
+  ['native_turn_cancelled', 'That action was cancelled.'],
+  ['private provider prose', 'The response could not be completed.'],
+])('saved native terminal keeps the public typed stop %s through Mongo and replay', async (failureClass, message) => {
+  await admit();
+  mockDependencies.fetch = jest.fn(async () => new Response(JSON.stringify({
+    version: 1, object: 'glasshive.request.result', state: 'failed',
+    invocation_id: identity.invocationId, stream_id: identity.streamId,
+    message_id: identity.responseMessageId, body_sha256: identity.bodySha256,
+    agent_id: identity.agentId, conversation_id: identity.conversationId,
+    request_id: 'request', run_id: 'run', failure_class: failureClass,
+    private_message: 'private provider prose',
+  })));
+  const done = jest.spyOn(transport, 'emitDone');
+  expect(await recoverNativeResponse(identity)).toBe(true);
+  const errorClass = failureClass === 'private provider prose' ? 'native_response_failed' : failureClass;
+  expect(done.mock.calls[0][1].responseMessage.content).toEqual(expect.arrayContaining([
+    {type: 'error', error_class: errorClass, error: message},
+  ]));
+  const saved = await methods.getNativeResponse(user, 'answer');
+  expect(saved.content).toEqual(expect.arrayContaining([
+    {type: 'error', error_class: errorClass, error: message},
+  ]));
+  expect(JSON.stringify(saved.content)).not.toContain('private provider prose');
+  expect(saved.nativeResponse.terminalSnapshotStoredAt).toEqual(expect.any(Number));
+  expect(mockDependencies.fetch).toHaveBeenCalledTimes(1);
+});

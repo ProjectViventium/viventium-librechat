@@ -8,6 +8,10 @@
 const { ContentTypes } = require('librechat-data-provider');
 const RUNTIME_HOLD_TEXT_FLAG = 'viventium_runtime_hold';
 const NON_RETRYABLE_FALLBACK_ERROR_CLASSES = new Set([
+  'native_input_declined',
+  'native_input_expired',
+  'native_input_cancelled',
+  'native_turn_cancelled',
   'host_capacity',
   'provider_request_rejected',
   'bad_request',

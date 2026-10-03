@@ -162,7 +162,10 @@ function parseDeliveryAcknowledgement(body) {
   if (body.cortex_presentation !== undefined) {
     cortexPresentation = parseCortexPresentation(body.cortex_presentation);
     if (!cortexPresentation) return { error: 'cortex_presentation' };
-    if (body.state !== 'committed' || sourceKind === 'schedule_result') {
+    // A Cortex receipt names its presentation in every state, so a removal settles that
+    // presentation instead of the turn's Main receipt. It never carries Main's effect or
+    // schedule authority.
+    if (effectRef || sourceKind === 'schedule_result') {
       return { error: 'cortex_presentation' };
     }
   }

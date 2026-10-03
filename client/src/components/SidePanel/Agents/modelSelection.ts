@@ -99,6 +99,8 @@ export function didAgentProviderChange({
  * Source: https://developers.openai.com/api/docs/guides/latest-model
  * === VIVENTIUM END === */
 const OPENAI_GPT_56_AGENT_MODELS = new Set([
+  'gpt-6.1-sol',
+  'gpt-6-sol',
   'gpt-5.6',
   'gpt-5.6-sol',
   'gpt-5.6-terra',

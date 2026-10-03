@@ -7,7 +7,8 @@
  * - Keep one product-owned source of truth for text artifacts that must not reach
  *   voice-facing display, persistence, or TTS surfaces.
  * - Preserve semantic text while stripping transport/formatting syntax such as Markdown
- *   emphasis markers, citation markers, provider voice-control tags, code fences, and raw links.
+ *   emphasis markers, citation markers, provider voice-control tags and code fences.
+ * - Preserve public links in display and persistence; speech owns URL removal.
  * - Let QA import the same detector/forbidden-key contract that runtime uses.
  *
  * Added: 2026-05-31
@@ -225,14 +226,11 @@ const MARKDOWN_SPACED_DECORATION_STRIP_RE =
 const MARKDOWN_EMPHASIS_STRIP_RE =
   /(^|[^\w])(?:\*{1,3}|_{1,3}|~~)(?=\S)([^\n]*?\S)(?:\*{1,3}|_{1,3}|~~)(?!\w)/g;
 const MARKDOWN_MARKER_ONLY_LINE_RE = /(^|\n)\s*(?:[*_~]\s*)+\s*(?=\n|$)/g;
-const MARKDOWN_IMAGE_RE = /!\[([^\]]*)\]\(([^)]+)\)/g;
-const MARKDOWN_LINK_RE = /\[([^\]]+)\]\(([^)]+)\)/g;
+const MARKDOWN_LINK_TARGET_RE = /(!?\[[^\]]*\]\()((?:https?:\/\/|www\.)[^)\s]+)(\))/gi;
+const MARKDOWN_URL_EMPHASIS_RE =
+  /(^|[^\w])(\*{1,3}|_{1,3}|~~)(?=\S)([^\n]*?(?:https?:\/\/|www\.)[^\n]*?\S)\2(?!\w)/gi;
 const CODE_BLOCK_RE = /```[\s\S]*?```/g;
 const INLINE_CODE_RE = /`([^`\n]+)`/g;
-const REFERENCE_DEF_RE = /^\s*\[[^\]]+\]:\s+\S+.*$/gm;
-const SOURCE_REFERENCE_LINK_LINE_RE =
-  /^\s*(?:sources?|references?|citations?)\s*:\s*(?:(?:https?:\/\/\S+|\[[^\]]+\]\([^)]+\)|\S+\.\S+)(?:\s*,?\s*)?)+\s*$\n?/gim;
-const SOURCE_REFERENCE_LABEL_RE = /\b(?:sources?|references?|citations?)\s*:/gi;
 const EMAIL_RE = /\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/g;
 const URL_RE = /\b(?:https?:\/\/|www\.)\S+/gi;
 const GENERIC_ANGLE_TAG_RE = /<\/?[A-Za-z][A-Za-z0-9_-]*(?:\s+[^<>]*)?>/g;
@@ -355,6 +353,7 @@ function stripBracketStageDirections(text) {
     const right = closing + 1 < text.length ? text[closing + 1] : '';
     if (
       isBracketStageDirection(content) &&
+      right !== '(' &&
       isDisplayStageDirectionBoundary(left) &&
       isDisplayStageDirectionBoundary(right)
     ) {
@@ -452,21 +451,35 @@ function sanitizeVoiceSurfaceTextForDisplay(text) {
     match.replace(/```[A-Za-z0-9_-]*[ \t]*/g, '').replace(/```/g, ' '),
   );
   cleaned = cleaned.replace(INLINE_CODE_RE, '$1');
-  cleaned = cleaned.replace(REFERENCE_DEF_RE, ' ');
-  cleaned = cleaned.replace(SOURCE_REFERENCE_LINK_LINE_RE, ' ');
-  cleaned = cleaned.replace(SOURCE_REFERENCE_LABEL_RE, '');
-  cleaned = cleaned.replace(MARKDOWN_IMAGE_RE, (_match, label) => label || 'image available');
-  cleaned = cleaned.replace(MARKDOWN_LINK_RE, '$1');
-  cleaned = stripMarkdownEmphasisSyntax(cleaned);
   cleaned = stripVoiceControlTags(cleaned);
   cleaned = cleaned.replace(PRIVATE_USE_CITATION_RE, '');
   cleaned = cleaned.replace(INTERNAL_TURN_ID_RE, '');
   cleaned = cleaned.replace(NUMERIC_CITATION_RE, '');
-  cleaned = cleaned.replace(EMAIL_RE, 'address available');
-  cleaned = cleaned.replace(URL_RE, 'link available');
   cleaned = cleaned.replace(GENERIC_ANGLE_TAG_RE, '');
+  const links = [];
+  let linkTokenPrefix = '\u0000VIVENTIUM_VOICE_LINK_';
+  while (cleaned.includes(linkTokenPrefix)) {
+    linkTokenPrefix += '_';
+  }
+  const protectUrl = (url) => {
+    links.push(url);
+    return `${linkTokenPrefix}${links.length - 1}\u0000`;
+  };
+  cleaned = cleaned.replace(
+    MARKDOWN_LINK_TARGET_RE,
+    (_match, prefix, url, suffix) => `${prefix}${protectUrl(url)}${suffix}`,
+  );
+  cleaned = cleaned.replace(
+    MARKDOWN_URL_EMPHASIS_RE,
+    (_match, prefix, marker, inner) =>
+      `${prefix}${marker}${inner.replace(URL_RE, protectUrl)}${marker}`,
+  );
+  cleaned = cleaned.replace(URL_RE, protectUrl);
+  cleaned = cleaned.replace(EMAIL_RE, 'address available');
+  cleaned = stripMarkdownEmphasisSyntax(cleaned);
   cleaned = normalizeVoiceSurfaceWhitespace(cleaned);
-  return cleaned;
+  const linkTokenRe = new RegExp(`${escapeRegExp(linkTokenPrefix)}(\\d+)\u0000`, 'g');
+  return cleaned.replace(linkTokenRe, (_match, index) => links[Number(index)]);
 }
 
 function extractVoiceTextFromContentParts(contentParts = []) {

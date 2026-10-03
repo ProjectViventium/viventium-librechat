@@ -75,9 +75,9 @@ export interface GenerationJob {
 }
 
 export type ContentPart = Agents.ContentPart;
-export type ResumeState = Agents.ResumeState;
+export type ResumeState = Agents.ResumeState & { finalEvent?: ServerSentEvent };
 
 export type ChunkHandler = (event: ServerSentEvent) => void;
 export type DoneHandler = (event: ServerSentEvent) => void;
-export type ErrorHandler = (error: string) => void;
+export type ErrorHandler = (error: string, errorClass?: string) => void;
 export type UnsubscribeFn = () => void;

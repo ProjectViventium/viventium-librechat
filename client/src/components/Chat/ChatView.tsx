@@ -58,12 +58,13 @@ function ChatView({ index = 0 }: { index?: number }) {
       },
       [fileMap],
     ),
-    enabled: Boolean(fileMap && conversationId && conversationId !== Constants.NEW_CONVO),
     /* === VIVENTIUM START ===
+     * New chats have no saved messages to fetch.
      * Scheduled and other-channel messages can arrive after all local work has settled.
      * Reuse the visible page's message query; active streams retain their existing SSE owner.
      * React Query pauses interval fetches in hidden tabs and deduplicates active refreshes.
      */
+    enabled: Boolean(fileMap && conversationId && conversationId !== Constants.NEW_CONVO),
     refetchInterval: chatHelpers.isSubmitting ? false : 10_000,
     refetchOnWindowFocus: !chatHelpers.isSubmitting,
     refetchOnReconnect: !chatHelpers.isSubmitting,
@@ -120,7 +121,9 @@ function ChatView({ index = 0 }: { index?: number }) {
         <AddedChatContext.Provider value={addedChatHelpers}>
           <Presentation>
             <div className="relative flex h-full w-full flex-col">
-              {!isLoading && <Header />}
+              {/* === VIVENTIUM START === Keep navigation available while new-chat history is idle. */}
+              {(!isLoading || isLandingPage) && <Header />}
+              {/* === VIVENTIUM END === */}
               <>
                 <div
                   className={cn(

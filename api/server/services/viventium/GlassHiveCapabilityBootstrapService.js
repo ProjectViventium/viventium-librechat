@@ -1,3 +1,4 @@
+const { VOICE_TASK_TOOL_NAME } = require('./VoiceTaskManagementTool');
 const { backgroundWorkerResources } = require('@librechat/api');
 /* === VIVENTIUM START ===
  * Feature: GlassHive capability broker bootstrap injection
@@ -1006,6 +1007,39 @@ function mergeWorkerContextBundle({
   return pinWorkerFeelingBlockLast(bundle, feelingBlock);
 }
 
+/* === VIVENTIUM START ===
+ * Native dontAsk rules describe only Core-authorized host reads. The broker token and ACL still
+ * authorize execution, including when a deferred bundle receives its exact grant at admission.
+ */
+function applyHostReadPermissionRules(bundle, allowedHostTools) {
+  // Resolve after module initialization because the broker also imports this bootstrap service.
+  const { readOnlyHostToolNames } = require('./GlassHiveCapabilityBrokerService');
+  const readRules = readOnlyHostToolNames(allowedHostTools).map(
+    (name) => `mcp__${bundle.glasshive_capability_broker.name}__${name}`,
+  );
+  if (readRules.length > 0) {
+    const settings = bundle.claude_settings_local || {};
+    const permissions = settings.permissions === undefined ? {} : settings.permissions;
+    if (
+      typeof settings === 'object' &&
+      !Array.isArray(settings) &&
+      permissions !== null &&
+      typeof permissions === 'object' &&
+      !Array.isArray(permissions) &&
+      (permissions.allow === undefined || Array.isArray(permissions.allow))
+    ) {
+      bundle.claude_settings_local = {
+        ...settings,
+        permissions: {
+          ...permissions,
+          allow: [...new Set([...(permissions.allow || []), ...readRules])],
+        },
+      };
+    }
+  }
+}
+/* === VIVENTIUM END === */
+
 function mergeBrokerBundle({
   existingBundle,
   brokerUrl,
@@ -1053,6 +1087,7 @@ function mergeBrokerBundle({
     ...(bundle.claude_project_mcp || {}),
     'glasshive-user-capabilities': serverConfig,
   };
+  applyHostReadPermissionRules(bundle, allowedHostTools);
   const codexBlock = [
     '[mcp_servers.glasshive-user-capabilities]',
     `url = ${tomlString(brokerUrl)}`,
@@ -1132,6 +1167,7 @@ function mergePendingBrokerAuthorizationBundle({
     ...(bundle.claude_project_mcp || {}),
     'glasshive-user-capabilities': serverConfig,
   };
+  applyHostReadPermissionRules(bundle, allowedHostTools);
   const codexBlock = [
     '[mcp_servers.glasshive-user-capabilities]',
     `url = ${tomlString(brokerUrl)}`,
@@ -1225,7 +1261,35 @@ async function maybeInjectGlassHiveCapabilityBroker({
     throw new Error('glasshive_launch_origin_not_bound');
   }
   const originalWasString = typeof toolArguments === 'string';
-  const finalizeTrustedLaunchArgs = async () => {
+  const finalizeTrustedLaunchArgs = async (reason = 'injected') => {
+    const capsule = workerFeelingBlock(workerFeelings);
+    const enabled = workerFeelingsScope === 'all_agents' && Boolean(capsule);
+    const bundle = args.bootstrap_bundle_json;
+    for (const field of WORKER_INSTRUCTION_FIELDS) {
+      if (capsule && typeof bundle[field] === 'string') {
+        bundle[field] = bundle[field].split(capsule).join('').trim();
+      }
+    }
+    if (enabled) {
+      bundle.agents_md = pinFeelingCapsuleLast({ instructions: bundle.agents_md, capsule });
+    }
+    bundle.viventium_feelings_projection = {
+      version: 1,
+      enabled,
+      scope: workerFeelingsScope,
+      canonical_instruction_field: 'agents_md',
+      snapshot_sha256: enabled ? crypto.createHash('sha256').update(capsule).digest('hex') : '',
+      expected_capsule_count: enabled ? 1 : 0,
+    };
+    logWorkerFeelingPlacement({
+      requestBody: config?.configurable?.requestBody,
+      bundle,
+      feelingBlock: enabled ? capsule : '',
+      snapshotHash: bundle.viventium_feelings_projection.snapshot_sha256,
+      scope: workerFeelingsScope,
+      ...workerFeelingRangeTelemetry,
+      reason,
+    });
     const trustedLaunchArgs = attachGlassHiveTrustedLaunchMetadata(
       args,
       launchContext,
@@ -1281,15 +1345,6 @@ async function maybeInjectGlassHiveCapabilityBroker({
       };
     }
     applyUnavailableContextBrief(args, toolName, reason);
-    logWorkerFeelingPlacement({
-      requestBody: config?.configurable?.requestBody,
-      bundle: args.bootstrap_bundle_json,
-      feelingBlock: workerFeelingBlock(workerFeelings),
-      snapshotHash: workerFeelingsHash,
-      scope: workerFeelingsScope,
-      ...workerFeelingRangeTelemetry,
-      reason,
-    });
     logger.info('[VIVENTIUM][Feelings]', {
       event: 'feelings.worker.inject',
       injected: Boolean(workerFeelings),
@@ -1297,7 +1352,7 @@ async function maybeInjectGlassHiveCapabilityBroker({
       toolName,
       brokerStatus: reason,
     });
-    return finalizeTrustedLaunchArgs();
+    return finalizeTrustedLaunchArgs(reason);
   };
   if (!shouldInjectForTool({ serverName, toolName })) {
     return await returnWorkerContextOnly('broker_disabled');
@@ -1370,15 +1425,6 @@ async function maybeInjectGlassHiveCapabilityBroker({
     workerFeelings,
     launchAuthorityKind,
     workerRoute,
-  });
-  logWorkerFeelingPlacement({
-    requestBody,
-    bundle: args.bootstrap_bundle_json,
-    feelingBlock: workerFeelingBlock(workerFeelings),
-    snapshotHash: workerFeelingsHash,
-    scope: workerFeelingsScope,
-    ...workerFeelingRangeTelemetry,
-    reason: 'injected',
   });
   logger.info('[VIVENTIUM][Feelings]', {
     event: 'feelings.worker.inject',
@@ -1456,13 +1502,18 @@ async function buildConversationProviderBootstrapBundle({
   const allProviderHostTools = Array.from(
     new Set([...normalizedHostTools, ...normalizedConversationOrchestrationTools]),
   ).sort();
+  // Resolved tool evidence has its own authorized resource scope below. Do not duplicate
+  // the host's raw tool_resources in each turn envelope: those are not launch inputs and
+  // can make one normal file-search context disable every capability at the cache bound.
+  const orchestrationRequestBody = { ...requestBody };
+  delete orchestrationRequestBody.tool_resources;
   const delegationResources = normalizedConversationOrchestrationTools.includes(
     DELEGATION_TOOL_NAME,
   )
     ? {
         [DELEGATION_TOOL_NAME]: {
           version: 1,
-          request_body: requestBody,
+          request_body: orchestrationRequestBody,
           worker_memory: String(workerMemory || ''),
           worker_feelings: String(workerFeelings || ''),
           worker_feelings_enabled: workerFeelingsEnabled === true,
@@ -1477,8 +1528,10 @@ async function buildConversationProviderBootstrapBundle({
           worker_feelings_active_range_prompt_override_chars: Number(
             workerFeelingsActiveRangePromptOverrideChars || 0,
           ),
-          mission_host_tools: normalizedHostTools,
-          mission_host_tool_resources: hostToolResources,
+          mission_host_tools: normalizedHostTools.filter((name) => name !== VOICE_TASK_TOOL_NAME),
+          mission_host_tool_resources: Object.fromEntries(
+            Object.entries(hostToolResources).filter(([name]) => name !== VOICE_TASK_TOOL_NAME),
+          ),
           capability_dependency:
             capabilityDependency &&
             typeof capabilityDependency === 'object' &&
@@ -1499,7 +1552,7 @@ async function buildConversationProviderBootstrapBundle({
   const orchestrationResources = {
     ...delegationResources,
     ...(normalizedConversationOrchestrationTools.includes('active_work_action')
-      ? { active_work_action: { version: 1, request_body: requestBody } }
+      ? { active_work_action: { version: 1, request_body: orchestrationRequestBody } }
       : {}),
   };
   const allProviderHostToolResources = {
@@ -1589,7 +1642,11 @@ async function buildConversationProviderBootstrapBundle({
     await persistBrokerGrantResources(mintedGrant);
   } catch (error) {
     logger.warn('[VIVENTIUM][glasshive-capability-broker] Provider bundle grant unavailable', {
-      message: error?.message,
+      message: error?.resourceBytes
+        ? `${error.message} ${JSON.stringify({ bytes: error.resourceBytes, limit: error.resourceLimitBytes })}`
+        : error?.message,
+      resourceBytes: error?.resourceBytes,
+      resourceLimitBytes: error?.resourceLimitBytes,
     });
     return degradedConversationCapabilityBundle('grant_unavailable');
   }

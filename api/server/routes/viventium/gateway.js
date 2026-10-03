@@ -1312,13 +1312,16 @@ router.get('/stream/:streamId', gatewayAuth, async (req, res) => {
         });
         res.end();
       },
-      (error) => {
+      (error, errorClass) => {
         ViventiumGatewayIngressEvent.updateOne(
           { streamId },
           { $set: { state: 'failed', failureCode: 'stream_error', leaseExpiresAt: new Date(0) } },
         ).catch(() => undefined);
         if (!res.writableEnded) {
-          writeSseEvent(res, 'error', { error: String(error || 'Stream error') });
+          writeSseEvent(res, 'error', {
+            error: String(error || 'Stream error'),
+            ...(errorClass ? { error_class: errorClass } : {}),
+          });
           res.end();
         }
       },

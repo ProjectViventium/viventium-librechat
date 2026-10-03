@@ -12,6 +12,7 @@ const {
   canonicalizeGlassHiveCallbackRef,
   fenceGlassHiveTerminalCallbackAcceptedOperation,
   verifyVoiceWorkerCompletionPresentation,
+  nativeWorkInputBinding,
 } = require('@librechat/api');
 const {
   acquireGlassHiveTerminalCallbackAcceptedOperationEffectLease,
@@ -27,10 +28,11 @@ const {
 } = require('~/db/models');
 const { getCallSession } = require('./CallSessionService');
 const { recordOrchestrationTraceDelivery } = require('./OrchestrationTraceLedgerService');
-const { recordVoiceOrchestrationTrace } = require('./VoiceOrchestrationTraceService');
+const { recordVoiceOrchestrationTraceBestEffort } = require('./VoiceOrchestrationTraceService');
 const { resolveTelegramMappingByUserId } = require('~/server/services/TelegramLinkService');
 const {
   currentGlassHiveTerminalCallbackTransaction,
+  deferGlassHiveTerminalCallbackAfterCommit,
   runGlassHiveTerminalCallbackTransaction,
 } = require('./GlassHiveTerminalCallbackTransaction');
 
@@ -479,9 +481,12 @@ function toDispatchPayload(delivery) {
     surface: delivery.surface,
     text: delivery.text || '',
     fullText: delivery.fullText || '',
+    attachments: delivery.attachments || [],
     telegramChatId: delivery.telegramChatId || '',
     telegramUserId: delivery.telegramUserId || '',
     telegramMessageId: delivery.telegramMessageId || '',
+    telegramMessageThreadId: delivery.telegramMessageThreadId || '',
+    nativeInputBinding: delivery.nativeInputBinding || null,
     telegramSentMessageIds: normalizeTelegramMessageIds(delivery.telegramSentMessageIds),
     voiceCallSessionId: delivery.voiceCallSessionId || '',
     voiceRequestId: delivery.voiceRequestId || '',
@@ -590,26 +595,18 @@ async function exactWorkerCompletionPresentation({
 
 async function recordWorkerCompletionResponseTrace({ delivery, presentation }) {
   if (!delivery?.deliveryId || !presentation) return;
-  for (const binding of presentation.bindings) {
-    await recordVoiceOrchestrationTrace({
-      ownerId: normalizeText(delivery.userId),
-      callSessionId: presentation.callSessionId,
-      turnId: presentation.turnId,
-      eventRef: `${presentation.presentationRef}:${binding.workRef}`,
-      stage: 'response.completed',
-      facts: {
-        workRef: binding.workRef,
-        runRef: binding.runId,
-        callbackRef: binding.callbackRef,
-        deliveryRef: normalizeText(delivery.deliveryId),
-        attemptRef: `${binding.runId}:${binding.attemptNumber}`,
-        responseRef: presentation.responseMessageId,
-        presentationRef: presentation.presentationRef,
-        surface: 'voice',
-        effectCount: 1,
-      },
-    });
-  }
+  const inputs = presentation.bindings.map((binding) => ({
+    ownerId: normalizeText(delivery.userId),
+    callSessionId: presentation.callSessionId,
+    turnId: presentation.turnId,
+    eventRef: `${presentation.presentationRef}:${binding.workRef}`,
+    stage: 'response.completed',
+    facts: workerCompletionTraceFacts(delivery, presentation, binding),
+  }));
+  const record = async () => {
+    for (const input of inputs) await recordVoiceOrchestrationTraceBestEffort(input);
+  };
+  if (!deferGlassHiveTerminalCallbackAfterCommit(record)) await record();
 }
 
 function deliveryTerminalState(event) {
@@ -1234,6 +1231,10 @@ async function enqueueGlassHiveCallbackDelivery({
   const callbackKey = normalizeText(message?.metadata?.viventium?.callbackKey);
   const originRef = normalizeText(deliveryContext?.originRef || body.origin_ref);
   const now = nowDate();
+  const pendingInputBinding =
+    event === 'run.needs_input'
+      ? nativeWorkInputBinding(body.pending_native_input, normalizeText(body.run_id))
+      : null;
   const expiresAt = new Date(now.getTime() + DELIVERY_RETENTION_MS);
   const preview = normalizeText(text || message.text);
   // The callback route sanitizes/redacts `fullText` before enqueueing. Do not
@@ -1328,6 +1329,8 @@ async function enqueueGlassHiveCallbackDelivery({
             telegramChatId: normalizeText(destination.telegramChatId),
             telegramUserId: normalizeText(destination.telegramUserId),
             telegramMessageId: normalizeText(destination.telegramMessageId),
+            telegramMessageThreadId: normalizeText(destination.telegramMessageThreadId),
+            ...(pendingInputBinding ? { nativeInputBinding: pendingInputBinding } : {}),
             voiceCallSessionId: normalizeText(destination.voiceCallSessionId),
             voiceRequestId: normalizeText(destination.voiceRequestId),
             retryCount: 0,
@@ -1353,6 +1356,7 @@ async function enqueueGlassHiveCallbackDelivery({
           $set: {
             text: preview,
             fullText: completeText && completeText !== preview ? completeText : '',
+            attachments: Array.isArray(message.attachments) ? message.attachments : [],
             expiresAt,
           },
         },
@@ -2019,17 +2023,19 @@ function workerCompletionTraceFacts(delivery, presentation, binding) {
 }
 
 async function recordWorkerCompletionStageTrace({ delivery, presentation, stage, at }) {
-  for (const binding of presentation.bindings) {
-    await recordVoiceOrchestrationTrace({
-      ownerId: normalizeText(delivery.userId),
-      callSessionId: presentation.callSessionId,
-      turnId: presentation.turnId,
-      eventRef: `${presentation.presentationRef}:${binding.workRef}:${stage}`,
-      stage,
-      at,
-      facts: workerCompletionTraceFacts(delivery, presentation, binding),
-    });
-  }
+  const inputs = presentation.bindings.map((binding) => ({
+    ownerId: normalizeText(delivery.userId),
+    callSessionId: presentation.callSessionId,
+    turnId: presentation.turnId,
+    eventRef: `${presentation.presentationRef}:${binding.workRef}:${stage}`,
+    stage,
+    at: new Date(at.getTime()),
+    facts: workerCompletionTraceFacts(delivery, presentation, binding),
+  }));
+  const record = async () => {
+    for (const input of inputs) await recordVoiceOrchestrationTraceBestEffort(input);
+  };
+  if (!deferGlassHiveTerminalCallbackAfterCommit(record)) await record();
 }
 
 async function completeGlassHiveWorkerCompletionPresentation({
@@ -2393,6 +2399,33 @@ async function settleWorkerCompletionWithoutAudio({
   return payload;
 }
 
+async function recordObservedTelegramMessageIds(candidate, filter, dispatchPermit, messageIds) {
+  if (
+    !messageIds.length ||
+    candidate?.surface !== 'telegram' ||
+    !presentedDispatchPermitMatches(candidate, dispatchPermit)
+  ) return;
+  const issuedIdentity = { ...filter, surface: 'telegram' };
+  for (const field of [
+    'userId', 'telegramChatId', 'telegramUserId', 'telegramMessageThreadId',
+    'callbackMessageId', 'logicalMessageId', 'dispatchPermitId', 'dispatchPermitGeneration',
+    'terminalCallbackResultKey', 'terminalCallbackAcceptedOperationId', 'terminalCallbackId',
+    'terminalCallbackResultRevision', 'terminalCallbackResultDigest',
+  ]) {
+    issuedIdentity[field] = candidate[field] === undefined ? { $exists: false } : candidate[field];
+  }
+  issuedIdentity.workerCompletionPresentation = candidate.workerCompletionPresentation ?? null;
+  // An observed receipt is data about an issued transport attempt, not permission to send
+  // or settle. Preserve it before an expired/fenced settlement clears its issued proof.
+  await ViventiumGlassHiveCallbackDelivery.updateOne(issuedIdentity, {
+    $addToSet: { telegramSentMessageIds: { $each: messageIds } },
+    $set: {
+      telegramMessageId: messageIds[messageIds.length - 1],
+      transportReceiptVersion: 1,
+    },
+  });
+}
+
 async function markGlassHiveCallbackDeliveryUnknown({
   deliveryId,
   claimId,
@@ -2400,11 +2433,14 @@ async function markGlassHiveCallbackDeliveryUnknown({
   reason = 'telegram_delivery_status_unknown',
   userId = '',
   voiceCallSessionId = '',
+  telegramMessageIds = [],
 }) {
   const now = nowDate();
+  const normalizedMessageIds = normalizeTelegramMessageIds(telegramMessageIds);
   const filter = deliveryConstraintFilter({ deliveryId, claimId, userId, voiceCallSessionId });
   const candidateQuery = ViventiumGlassHiveCallbackDelivery.findOne(filter);
   const candidate = candidateQuery?.lean ? await candidateQuery.lean() : await candidateQuery;
+  await recordObservedTelegramMessageIds(candidate, filter, dispatchPermit, normalizedMessageIds);
   if (plainWorkerCompletionPresentation(candidate)) {
     return settleWorkerCompletionWithoutAudio({
       candidate,

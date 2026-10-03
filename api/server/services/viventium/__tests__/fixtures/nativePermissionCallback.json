@@ -1,0 +1,18 @@
+{
+  "callback_id": "cb_native_input_1af9be8e8fa3fa44ee6cca30bdb2c31cde8fc27526de87f9ff5873e0723378ad",
+  "event": "run.needs_input",
+  "worker_id": "wrk_7fc5753d6a",
+  "run_id": "run_ffad2defee",
+  "pending_native_input": {
+    "version": 1,
+    "requestId": "question-a",
+    "requestFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "runId": "run_ffad2defee",
+    "attemptId": "att_c9da9f99ed3d4429b9a5e61d2696384b",
+    "sessionId": "session-a",
+    "expiresAt": "2099-01-01T00:00:00+00:00",
+    "kind": "permission",
+    "state": "pending",
+    "mode": "form"
+  }
+}

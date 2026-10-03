@@ -4,7 +4,7 @@ import { createHmac, randomBytes } from 'crypto';
 import { tool } from '@librechat/agents/langchain/tools';
 import { ErrorTypes, Tools, supportsAdaptiveThinking } from 'librechat-data-provider';
 import { logger } from '@librechat/data-schemas';
-import { HumanMessage } from '@librechat/agents/langchain/messages';
+import { HumanMessage, ToolMessage } from '@librechat/agents/langchain/messages';
 import { Run, Providers, GraphEvents } from '@librechat/agents';
 import type { MemoryKeyLimits } from '~/memory';
 import type {
@@ -18,8 +18,9 @@ import type {
 } from '@librechat/agents';
 import type { ObjectId, MemoryMethods, IUser, MemoryWriterEffect } from '@librechat/data-schemas';
 import type { TAttachment, MemoryArtifact } from 'librechat-data-provider';
-import type { BaseMessage, ToolMessage } from '@librechat/agents/langchain/messages';
+import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { Response as ServerResponse } from 'express';
+import type { NativeMemoryExecutor } from './nativeMemoryWriter';
 import { GenerationJobManager } from '~/stream/GenerationJobManager';
 import {
   evaluateMemoryWrite,
@@ -58,6 +59,9 @@ export interface MemoryConfig {
   keyLimits?: MemoryKeyLimits;
   maintenanceThresholdPercent?: number;
   readProfile?: MemoryReadProfileConfig;
+  /* === VIVENTIUM START === Use the admitted broker-only native writer when supplied. === */
+  nativeExecutor?: NativeMemoryExecutor;
+  /* === VIVENTIUM END === */
 }
 
 export interface MemorySnapshot {
@@ -69,6 +73,8 @@ export interface MemorySnapshot {
   memoryValueHashMap: Record<string, string>;
   /** Automated-writer markers the admission check needs for each key the writer changed. */
   memoryWriterEffectMap?: Record<string, MemoryWriterEffect>;
+  /** Read-only snapshots only: latest stored mutation time, `Infinity` when one is undated. */
+  latestMutationAt?: number;
 }
 
 export interface MemoryWriteAuditContext {
@@ -2022,6 +2028,7 @@ export async function processMemory({
   streamId = null,
   deferArtifactDelivery = false,
   user,
+  nativeExecutor,
 }: {
   res: ServerResponse;
   setMemory: MemoryMethods['setMemory'];
@@ -2044,6 +2051,7 @@ export async function processMemory({
   streamId?: string | null;
   deferArtifactDelivery?: boolean;
   user?: IUser;
+  nativeExecutor?: NativeMemoryExecutor;
 }): Promise<(TAttachment | null)[] | undefined> {
   const attemptState: MemoryProcessingAttemptState = {
     storageApplied: false,
@@ -2237,6 +2245,35 @@ ${memory ?? 'No existing memories'}`;
       streamId,
       deferDelivery: deferArtifactDelivery,
     });
+    /* === VIVENTIUM START === Reuse the native executor with the same CAS tool and artifacts. === */
+    if (nativeExecutor) {
+      await nativeExecutor({
+        tool: applyMemoryChangesTool,
+        messages,
+        instructions: [instructions, memoryStatus].filter(Boolean).join('\n\n'),
+        onResult: async (result, callId) => {
+          await memoryCallback(
+            {
+              input: {},
+              output: new ToolMessage({
+                content: result[0],
+                artifact: result[1],
+                tool_call_id: callId,
+                name: applyMemoryChangesTool.name,
+              }),
+            },
+            { run_id: messageId, thread_id: conversationId },
+          );
+        },
+      });
+      clearMemoryWriterHealth({
+        userId,
+        provider: llmConfig?.provider,
+        model: llmConfig != null && 'model' in llmConfig ? llmConfig.model : undefined,
+      });
+      return await Promise.all(artifactPromises);
+    }
+    /* === VIVENTIUM END === */
     const customHandlers = {
       [GraphEvents.TOOL_END]: new BasicToolEndHandler(memoryCallback),
     };
@@ -2415,10 +2452,13 @@ export async function loadMemorySnapshot({
   userId,
   memoryMethods,
   config = {},
+  readOnly = false,
 }: {
   userId: string | ObjectId;
   memoryMethods: RequiredMemoryMethods;
   config?: MemoryConfig;
+  /** Admission, validation and recovery read the store; they never run maintenance writes. */
+  readOnly?: boolean;
 }): Promise<MemorySnapshot> {
   const { validKeys, tokenLimit, keyLimits, maintenanceThresholdPercent } = config;
   /* === VIVENTIUM START ===
@@ -2432,24 +2472,32 @@ export async function loadMemorySnapshot({
    *
    * Added: 2026-03-09
    * === VIVENTIUM END === */
-  await runMemoryMaintenance({
-    userId: String(userId),
-    getAllUserMemories: async (resolvedUserId) => memoryMethods.getAllUserMemories(resolvedUserId),
-    setMemory: async ({ userId: maintenanceUserId, key, value, tokenCount, expectedRevision }) =>
-      memoryMethods.setMemory({
-        userId: maintenanceUserId,
-        key,
-        value,
-        tokenCount,
-        expectedRevision,
-      }),
-    policy: {
-      validKeys,
-      tokenLimit,
-      keyLimits,
-      maintenanceThresholdPercent,
-    },
-  });
+  /* === VIVENTIUM START ===
+   * Fix: a read-only snapshot never rewrites memory. Maintenance writes carry no writer effect, so
+   * running it while admitting or validating a writer erased an earlier accepted writer's marker
+   * and refused the later writer's legitimate save.
+   * === VIVENTIUM END === */
+  if (!readOnly) {
+    await runMemoryMaintenance({
+      userId: String(userId),
+      getAllUserMemories: async (resolvedUserId) =>
+        memoryMethods.getAllUserMemories(resolvedUserId),
+      setMemory: async ({ userId: maintenanceUserId, key, value, tokenCount, expectedRevision }) =>
+        memoryMethods.setMemory({
+          userId: maintenanceUserId,
+          key,
+          value,
+          tokenCount,
+          expectedRevision,
+        }),
+      policy: {
+        validKeys,
+        tokenLimit,
+        keyLimits,
+        maintenanceThresholdPercent,
+      },
+    });
+  }
 
   /* === VIVENTIUM START ===
    * User prompt text sees active rows only; writer CAS state also retains deleted-key revisions.
@@ -2480,6 +2528,18 @@ export async function loadMemorySnapshot({
     memoryRevisionMap,
     memoryValueHashMap,
     memoryWriterEffectMap,
+    /* VIVENTIUM: pending-write recovery refuses a store changed after its admission. */
+    ...(readOnly
+      ? {
+          latestMutationAt: Math.max(
+            0,
+            ...(states ?? []).map((entry) => {
+              const timestamp = new Date(entry.updated_at ?? '').getTime();
+              return Number.isFinite(timestamp) ? timestamp : Infinity;
+            }),
+          ),
+        }
+      : {}),
   };
   /* === VIVENTIUM END === */
 }
@@ -2507,7 +2567,7 @@ export async function createMemoryProcessor({
   snapshot?: MemorySnapshot;
   auditSource?: string;
 }): Promise<[string, (messages: BaseMessage[]) => Promise<(TAttachment | null)[] | undefined>]> {
-  const { validKeys, instructions, llmConfig, tokenLimit, keyLimits } = config;
+  const { validKeys, instructions, llmConfig, tokenLimit, keyLimits, nativeExecutor } = config;
   const finalInstructions = [
     instructions || getDefaultInstructions(validKeys, tokenLimit),
     getMemoryToolProtocolInstructions(),
@@ -2561,6 +2621,7 @@ export async function createMemoryProcessor({
             setMemory: memoryMethods.setMemory,
             deleteMemory: memoryMethods.deleteMemory,
             user,
+            nativeExecutor,
           });
 
         let attachments = await runAttempt(messages);

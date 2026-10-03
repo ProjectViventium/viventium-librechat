@@ -125,19 +125,19 @@ describe('Tokenizer', () => {
       tokenizer.encode = originalEncode;
     });
 
-    it('should reset tokenizers after 25 calls', () => {
-      // Spy on freeAndResetAllEncoders
+    /* === VIVENTIUM START === Successful counts retain their existing encoder. */
+    it('should retain the cached encoder and exact counts beyond 25 successful calls', () => {
       const resetSpy = jest.spyOn(Tokenizer, 'freeAndResetAllEncoders');
+      const encoder = Tokenizer.getTokenizer('cl100k_base');
+      const text = 'Café 東京 🙂: review the plan.\nPreserve useful context.';
+      const expectedCount = encoder.encode(text, 'all').length;
 
-      // Make 24 calls; should NOT reset yet
-      for (let i = 0; i < 24; i++) {
-        Tokenizer.getTokenCount('test text', 'cl100k_base');
+      for (let i = 0; i < 64; i++) {
+        expect(Tokenizer.getTokenCount(text, 'cl100k_base')).toBe(expectedCount);
       }
       expect(resetSpy).not.toHaveBeenCalled();
-
-      // 25th call triggers the reset
-      Tokenizer.getTokenCount('the 25th call!', 'cl100k_base');
-      expect(resetSpy).toHaveBeenCalledTimes(1);
+      expect(Tokenizer.getTokenizer('cl100k_base')).toBe(encoder);
     });
+    /* === VIVENTIUM END === */
   });
 });

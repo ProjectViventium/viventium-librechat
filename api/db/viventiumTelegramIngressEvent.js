@@ -33,8 +33,35 @@ module.exports = function createViventiumTelegramIngressEvent(db) {
       sourceOrderScope: { type: String, default: '' },
       sourceEventId: { type: String, default: '', index: true },
       authorityBoundAt: { type: Date, default: null, index: true },
+      requestedConversationId: { type: String },
+      conversationGeneration: { type: String },
+      sourceMessageId: { type: String },
+      mediaGroupId: { type: String },
+      inputState: {
+        type: String,
+        enum: ['preparing', 'ready', 'admitted', 'failed', 'completed', 'cancelled'],
+      },
+      inputClaimToken: { type: String },
+      inputLeaseUntil: { type: Number, min: 0 },
+      inputRetryAt: { type: Number, min: 0 },
+      inputAttempts: { type: Number, min: 0 },
+      inputFailureCode: { type: String },
+      inputPreparedDigest: { type: String },
+      inputRegistrationId: { type: String },
+      inputPrimarySourceEventId: { type: String },
+      inputRelatedSourceEventIds: { type: [String], default: undefined },
+      inputFailures: {
+        type: [new mongoose.Schema({ code: String, at: Number }, { _id: false })],
+        default: undefined,
+      },
       /* === VIVENTIUM END === */
-      expiresAt: { type: Date, required: true, index: { expireAfterSeconds: 0 } },
+      expiresAt: {
+        type: Date,
+        required: function () {
+          return !this.inputState || ['completed', 'cancelled'].includes(this.inputState);
+        },
+        index: { expireAfterSeconds: 0 },
+      },
     },
     { timestamps: true },
   );

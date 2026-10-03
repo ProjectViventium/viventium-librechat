@@ -1,3 +1,11 @@
+const mockAssertVoiceAuthority = jest.fn();
+const mockGetCallSession = jest.fn();
+jest.mock('../VoiceWorkAuthorityService', () => ({
+  assertVoiceWorkAuthority: (...args) => mockAssertVoiceAuthority(...args),
+}));
+jest.mock('../CallSessionService', () => ({
+  getCallSession: (...args) => mockGetCallSession(...args),
+}));
 /* === VIVENTIUM START === manage_active_tasks policy/tool tests. === VIVENTIUM END === */
 
 const mockAbortJob = jest.fn();
@@ -15,7 +23,12 @@ const {
   registerVoiceTaskOwnerAdapter,
   resetVoiceTasksForTests,
 } = require('../VoiceTaskService');
-const { createManageActiveTasksTool, operationSchema } = require('../VoiceTaskManagementTool');
+const {
+  createManageActiveTasksTool,
+  operationSchema,
+  voiceTaskBrokerResources,
+  invokeVoiceTaskBrokerTool,
+} = require('../VoiceTaskManagementTool');
 
 function ownerRequest(overrides = {}) {
   return {
@@ -191,5 +204,65 @@ describe('manage_active_tasks', () => {
         }),
       ),
     ).toBeNull();
+  });
+});
+
+describe('native voice task broker parity', () => {
+  beforeEach(() => {
+    resetVoiceTasksForTests();
+    mockAssertVoiceAuthority.mockReset().mockResolvedValue(undefined);
+    mockGetCallSession
+      .mockReset()
+      .mockResolvedValue({ callSessionId: 'call-1', userId: 'user-1', mode: 'call' });
+  });
+  const authority = {
+    version: 1,
+    userId: 'user-1',
+    callSessionId: 'call-1',
+    kind: 'participant_text',
+    turnIds: [],
+  };
+  test('projects only a server-authorized owner turn with pinned authority', () => {
+    expect(voiceTaskBrokerResources(ownerRequest())).toBeNull();
+    expect(
+      voiceTaskBrokerResources(ownerRequest({ viventiumVoiceWorkAuthority: authority })),
+    ).toEqual({ version: 1, authority });
+    expect(
+      voiceTaskBrokerResources(
+        ownerRequest({ viventiumVoiceWorkAuthority: authority, body: { mode: 'listen_only' } }),
+      ),
+    ).toBeNull();
+  });
+  test('reuses the same owner task list after checking live voice authority', async () => {
+    createVoiceTask({ userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-broker' });
+    const result = await invokeVoiceTaskBrokerTool({
+      user: { id: 'user-1' },
+      resources: { version: 1, authority },
+      args: { operation: 'list' },
+    });
+    expect(mockAssertVoiceAuthority).toHaveBeenCalledWith(authority, 'user-1');
+    expect(result.status).toBe('ok');
+    expect(result.result.tasks).toHaveLength(1);
+  });
+  test('rejects another owner before invoking task control', async () => {
+    await expect(
+      invokeVoiceTaskBrokerTool({
+        user: { id: 'other' },
+        resources: { version: 1, authority },
+        args: { operation: 'list' },
+      }),
+    ).rejects.toThrow('voice_work_authority_stale');
+    expect(mockAssertVoiceAuthority).not.toHaveBeenCalled();
+  });
+  test('rejects stale accepted-turn authority before invoking task control', async () => {
+    mockAssertVoiceAuthority.mockRejectedValue(new Error('voice_work_authority_stale'));
+    await expect(
+      invokeVoiceTaskBrokerTool({
+        user: { id: 'user-1' },
+        resources: { version: 1, authority },
+        args: { operation: 'list' },
+      }),
+    ).rejects.toThrow('voice_work_authority_stale');
+    expect(mockGetCallSession).not.toHaveBeenCalled();
   });
 });

@@ -43,11 +43,15 @@ export interface TelegramPreparedInput {
   text: string;
   fileIds: string[];
   imageUrls: string[];
+  /** Text the adapter extracted from the document this input quoted, by its Telegram file ID. */
+  quotedAttachmentTexts?: ReadonlyArray<{ fileId: string; extractedText: string }>;
 }
 export interface TelegramInputSourceReference {
   source_event_id: string;
   source_message_id: string;
   source_sequence: number;
+  /** Whether the delivering revision authored this source; absent on legacy coverage. */
+  owned?: boolean;
 }
 export interface TelegramInputDeliveryCoverage {
   logical_turn_id: string;
@@ -65,37 +69,61 @@ export function telegramInputDeliveryCoverage(
   const presentation = result.presentation;
   const context = presentation?.interactionContext;
   if (
-    result.status !== 'recorded' || result.transportOnly || presentation?.cortexPresentation ||
+    result.status !== 'recorded' ||
+    result.transportOnly ||
+    presentation?.cortexPresentation ||
     acknowledgement?.state !== 'committed' ||
     (acknowledgement.source_kind && acknowledgement.source_kind !== 'assistant_message') ||
-    !presentation?.userId || !presentation.responseMessageId ||
-    context?.actor_kind !== 'external_user' || context.origin !== 'interactive' ||
-    context.surface !== 'telegram' || context.conversation_id !== presentation.conversationId ||
+    !presentation?.userId ||
+    !presentation.responseMessageId ||
+    context?.actor_kind !== 'external_user' ||
+    context.origin !== 'interactive' ||
+    context.surface !== 'telegram' ||
+    context.conversation_id !== presentation.conversationId ||
     context.logical_turn_id !== acknowledgement.logical_turn_id ||
     context.revision !== acknowledgement.revision ||
     !/^[a-f0-9]{64}$/.test(context.source_order_scope || '') ||
     !/^[a-f0-9]{64}$/.test(context.source_conversation_generation || '')
-  ) return null;
+  )
+    return null;
   const sources: TelegramInputSourceReference[] = [];
   for (const segment of context.source_segments || []) {
     if (
-      segment.source_persisted !== true || !segment.source_message_id ||
+      segment.source_persisted !== true ||
+      !segment.source_message_id ||
       !/^[a-f0-9]{64}$/.test(segment.source_event_id) ||
-      !Number.isSafeInteger(segment.source_sequence) || (segment.source_sequence || 0) < 1
-    ) continue;
-    sources.push({ source_event_id: segment.source_event_id,
-      source_message_id: segment.source_message_id, source_sequence: segment.source_sequence! });
+      !Number.isSafeInteger(segment.source_sequence) ||
+      (segment.source_sequence || 0) < 1
+    )
+      continue;
+    sources.push({
+      source_event_id: segment.source_event_id,
+      source_message_id: segment.source_message_id,
+      source_sequence: segment.source_sequence!,
+      owned:
+        segment.authoring_revision == null ||
+        segment.authoring_revision === context.revision ||
+        segment.source_event_id === context.source_event_id,
+    });
   }
-  return sources.length ? {
-    logical_turn_id: acknowledgement.logical_turn_id, revision: acknowledgement.revision,
-    source_order_scope: context.source_order_scope!,
-    source_conversation_generation: context.source_conversation_generation!, sources,
-  } : null;
+  return sources.length
+    ? {
+        logical_turn_id: acknowledgement.logical_turn_id,
+        revision: acknowledgement.revision,
+        source_order_scope: context.source_order_scope!,
+        source_conversation_generation: context.source_conversation_generation!,
+        sources,
+      }
+    : null;
 }
 
 export function telegramInputConversationGeneration(record: TelegramInputIdentity): string {
-  return createTelegramInteractionContext({ conversation_id: record.requestedConversationId,
-    conversation_generation: record.conversationGeneration }).source_conversation_generation || '';
+  return (
+    createTelegramInteractionContext({
+      conversation_id: record.requestedConversationId,
+      conversation_generation: record.conversationGeneration,
+    }).source_conversation_generation || ''
+  );
 }
 export interface TelegramInputRepository {
   read(
@@ -163,6 +191,29 @@ function digestPrepared(input: TelegramPreparedInput): string {
     .digest('hex');
 }
 
+function sameInputGroup(a: TelegramInputIdentity, b: TelegramInputIdentity): boolean {
+  return (
+    Boolean(a.mediaGroupId) &&
+    a.mediaGroupId === b.mediaGroupId &&
+    a.libreChatUserId === b.libreChatUserId &&
+    a.telegramUserId === b.telegramUserId &&
+    a.telegramChatId === b.telegramChatId &&
+    a.telegramMessageThreadId === b.telegramMessageThreadId &&
+    a.sourceOrderScope === b.sourceOrderScope &&
+    a.conversationGeneration === b.conversationGeneration &&
+    a.conversationId === b.conversationId
+  );
+}
+
+function terminalPreparationFailure(row: TelegramInputRecord): boolean {
+  return (
+    row.state === 'failed' &&
+    !row.streamId &&
+    !row.preparedDigest &&
+    (!row.retryAt || row.attempts >= 3)
+  );
+}
+
 export function createTelegramInputService(deps: TelegramInputDependencies) {
   const now = deps.now ?? Date.now;
   const repository = deps.repository;
@@ -189,6 +240,54 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
     if (!(await repository.replace(previous, next)))
       throw inputConflict('source_input_claim_conflict');
     return next;
+  }
+  async function relatedInputs(
+    ownerId: string,
+    record: TelegramInputRecord,
+    claims: TelegramInputClaim[],
+  ): Promise<TelegramInputRecord[]> {
+    const related: TelegramInputRecord[] = [];
+    const seen = new Set([record.sourceEventId]);
+    for (const item of claims) {
+      if (!item) throw inputConflict('source_input_claim_conflict');
+      if (seen.has(item.sourceEventId)) continue;
+      const row = await exact(ownerId, item);
+      if (!sameInputGroup(record, row)) throw inputConflict('source_input_group_conflict');
+      seen.add(row.sourceEventId);
+      related.push(row);
+    }
+    return related;
+  }
+  function failedPreparation(row: TelegramInputRecord, code: string): Partial<TelegramInputRecord> {
+    return {
+      state: 'failed',
+      failureCode: code,
+      retryAt: 0,
+      leaseUntil: 0,
+      failures: [...row.failures, { code, at: now() }],
+    };
+  }
+  async function reconcileFailedGroup(record: TelegramInputRecord): Promise<boolean> {
+    return deps.transaction(async () => {
+      const group = await repository.group(record);
+      const failure = group.find(terminalPreparationFailure);
+      if (!failure) return false;
+      for (const row of group) {
+        if (!sameInputGroup(record, row)) throw inputConflict('source_input_group_conflict');
+        if (!(await deps.verifyOwner(row))) throw inputConflict('source_input_owner_changed');
+      }
+      for (const row of group) {
+        if (
+          !['preparing', 'failed'].includes(row.state) ||
+          row.streamId ||
+          row.preparedDigest ||
+          (terminalPreparationFailure(row) && !row.retryAt)
+        )
+          continue;
+        await replace(row, failedPreparation(row, failure.failureCode));
+      }
+      return true;
+    });
   }
   return {
     async register(
@@ -251,27 +350,12 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
             throw inputConflict('source_input_already_admitted');
           return record;
         }
-        const related: TelegramInputRecord[] = [];
-        for (const item of relatedClaims) {
-          if (
-            item.sourceEventId === claim.sourceEventId ||
-            related.some((row) => row.sourceEventId === item.sourceEventId)
-          )
-            continue;
-          const row = await exact(ownerId, item);
-          if (
-            !record.mediaGroupId ||
-            row.mediaGroupId !== record.mediaGroupId ||
-            row.telegramChatId !== record.telegramChatId ||
-            row.telegramUserId !== record.telegramUserId ||
-            row.telegramMessageThreadId !== record.telegramMessageThreadId ||
-            row.conversationGeneration !== record.conversationGeneration ||
-            row.conversationId !== record.conversationId
-          ) {
-            throw inputConflict('source_input_group_conflict');
-          }
-          related.push(row);
-        }
+        const related = await relatedInputs(ownerId, record, relatedClaims);
+        if (
+          record.mediaGroupId &&
+          (await repository.group(record)).some(terminalPreparationFailure)
+        )
+          throw inputConflict('source_input_group_failed');
         for (const row of [record, ...related]) {
           if (!['preparing', 'ready'].includes(row.state) || row.leaseUntil <= now())
             throw inputConflict('source_input_claim_expired');
@@ -334,16 +418,38 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
       state: 'renew' | 'failed' | 'cancelled',
       failureCode = '',
       retryable = false,
+      relatedClaims: TelegramInputClaim[] = [],
     ) {
+      const code = /^[a-z0-9_]{1,80}$/.test(failureCode)
+        ? failureCode
+        : 'source_input_preparation_failed';
+      if (relatedClaims.length) {
+        if (state !== 'failed' || retryable) throw inputConflict('source_input_group_conflict');
+        return deps.transaction(async () => {
+          const record = await exact(ownerId, claim);
+          const related = await relatedInputs(ownerId, record, relatedClaims);
+          const members = [record, ...related];
+          for (const row of members) {
+            if (terminalPreparationFailure(row) && row.failureCode === code) continue;
+            if (row.state !== 'preparing' || row.streamId || row.preparedDigest)
+              throw inputConflict('source_input_already_admitted');
+            if (row.leaseUntil <= now()) throw inputConflict('source_input_claim_expired');
+          }
+          let result = record;
+          for (const row of members) {
+            if (terminalPreparationFailure(row)) continue;
+            const next = await replace(row, failedPreparation(row, code));
+            if (row.sourceEventId === record.sourceEventId) result = next;
+          }
+          return result;
+        });
+      }
       const record = await exact(ownerId, claim);
       if (['completed', 'cancelled'].includes(record.state)) return record;
       if (state === 'renew' && record.state === 'ready' && record.leaseUntil === 0) return record;
       if (state === 'renew')
         return replace(record, { leaseUntil: now() + TELEGRAM_INPUT_LEASE_MS });
       if (record.state === 'admitted') throw inputConflict('source_input_already_admitted');
-      const code = /^[a-z0-9_]{1,80}$/.test(failureCode)
-        ? failureCode
-        : 'source_input_preparation_failed';
       return replace(record, {
         state,
         failureCode: state === 'failed' ? code : '',
@@ -357,11 +463,12 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
       for (const record of await repository.due(now(), Math.max(1, Math.min(25, limit)))) {
         if (!(await deps.verifyOwner(record))) continue;
         if (record.state === 'ready' || record.state === 'admitted') {
-          const stream = await deps.hasCommittedDelivery(record)
+          const committed = await deps.hasCommittedDelivery(record);
+          let stream: Awaited<ReturnType<typeof deps.readStream>> = committed
             ? 'completed'
-            : record.state === 'admitted'
-              ? await deps.readStream(record.streamId, record.libreChatUserId)
-              : 'pending';
+            : 'pending';
+          if (!committed && record.state === 'admitted')
+            stream = await deps.readStream(record.streamId, record.libreChatUserId);
           if (stream === 'completed') {
             await deps.transaction(async () => {
               for (const sourceEventId of record.relatedSourceEventIds) {
@@ -392,7 +499,11 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
             continue;
           }
         }
-        if (record.state === 'failed' && (!record.retryAt || record.attempts >= 3)) continue;
+        if (record.state === 'failed' && (!record.retryAt || record.attempts >= 3)) {
+          if (record.mediaGroupId && terminalPreparationFailure(record))
+            await reconcileFailedGroup(record);
+          continue;
+        }
         if (record.state === 'ready' && !(await deps.readPrepared(record))) {
           await repository.replace(record, {
             ...record,
@@ -407,6 +518,12 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
           record.mediaGroupId && ['preparing', 'failed'].includes(record.state)
             ? await repository.group(record)
             : [record];
+        if (
+          record.mediaGroupId &&
+          group.some(terminalPreparationFailure) &&
+          (await reconcileFailedGroup(record))
+        )
+          continue;
         if (
           group.some(
             (row) =>

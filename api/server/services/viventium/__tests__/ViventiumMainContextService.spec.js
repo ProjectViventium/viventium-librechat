@@ -1848,8 +1848,11 @@ describe('persisted Main history projection', () => {
       isCreatedByUser: false,
       text: '',
       error: true,
-      content: [{ type: 'error', error: 'Unavailable.' }, { type: 'cortex_insight' },
-        { type: 'tool_call', tool_call: { id: 'synthetic-call', type: 'tool_call' } }],
+      content: [
+        { type: 'error', error: 'Unavailable.' },
+        { type: 'cortex_insight' },
+        { type: 'tool_call', tool_call: { id: 'synthetic-call', type: 'tool_call' } },
+      ],
       attachments: [{ type: 'memory', memory: { type: 'update', key: 'context' } }],
     };
     const current = {

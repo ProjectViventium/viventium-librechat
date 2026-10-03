@@ -1200,7 +1200,10 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         reason === 'superseded'
           ? {}
           : {
-              error: { code: 'generation_aborted', message: 'Request aborted during initialization' },
+              error: {
+                code: 'generation_aborted',
+                message: 'Request aborted during initialization',
+              },
             },
       );
       expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith(
@@ -1547,14 +1550,26 @@ describe('ResumableAgentController Phase B stream completion window', () => {
 
   test('an externally delivered graph prepares its writer before FINAL and admits it once after acceptance', async () => {
     const req = makeReq();
-    setTrustedInteractionContext(req, {
-      actor_kind: 'external_user', origin: 'interactive', surface: 'telegram',
-      conversation_id: 'conv-1', revision: 1, source_event_id: 'telegram-graph-source',
-    }, { segment_stability: 'immediate', supersede_scope: 'response_and_authoring' },
-    { commit_authority: 'external_adapter' });
-    Object.defineProperty(req, '_viventiumAcceptedMainCompactionIdentityV1', { value: {
-      ownerId: req.user.id, agentId: 'agent', stableAuthoritySha256: 'a'.repeat(64),
-    } });
+    setTrustedInteractionContext(
+      req,
+      {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'telegram',
+        conversation_id: 'conv-1',
+        revision: 1,
+        source_event_id: 'telegram-graph-source',
+      },
+      { segment_stability: 'immediate', supersede_scope: 'response_and_authoring' },
+      { commit_authority: 'external_adapter' },
+    );
+    Object.defineProperty(req, '_viventiumAcceptedMainCompactionIdentityV1', {
+      value: {
+        ownerId: req.user.id,
+        agentId: 'agent',
+        stableAuthoritySha256: 'a'.repeat(64),
+      },
+    });
     req._viventiumNativeResponseIdentity = { invocationId: 'unsupported-graph' };
     mockRecoverSavedNativeResponse.mockResolvedValueOnce(null);
     mockGetNativeResponse.mockResolvedValueOnce({ nativeResponse: { status: 'unsupported' } });
@@ -1568,8 +1583,10 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     expect(client.prepareDeferredMemoryWriter).toHaveBeenCalledTimes(1);
     expect(client.startDeferredMemoryWriter).not.toHaveBeenCalled();
     expect(client.admitMemoryWriter).not.toHaveBeenCalled();
-    expect(mockGenerationJobManager.emitDone).toHaveBeenCalledWith(expect.any(String),
-      expect.objectContaining({ memoryWriterScheduled: true }));
+    expect(mockGenerationJobManager.emitDone).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ memoryWriterScheduled: true }),
+    );
     // Disposal happens before the authenticated adapter ACK. Both captured follow-ups survive it.
     client.options = null;
     const { scheduleExternallyAcceptedMainCompaction } = require('@librechat/api');
@@ -1577,13 +1594,21 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     for (const status of ['failed', 'partial', 'removed']) {
       expect(scheduleExternallyAcceptedMainCompaction(presentation, { status })).toBe(false);
     }
-    expect(scheduleExternallyAcceptedMainCompaction({ ...presentation, userId: 'foreign' },
-      { status: 'committed' })).toBe(false);
-    expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'committed' })).toBe(true);
+    expect(
+      scheduleExternallyAcceptedMainCompaction(
+        { ...presentation, userId: 'foreign' },
+        { status: 'committed' },
+      ),
+    ).toBe(false);
+    expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'committed' })).toBe(
+      true,
+    );
     await Promise.resolve();
     expect(client.admitMemoryWriter).toHaveBeenCalledTimes(1);
     expect(mockEnsureAcceptedMainCompaction).toHaveBeenCalledTimes(1);
-    expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'already_committed' })).toBe(false);
+    expect(
+      scheduleExternallyAcceptedMainCompaction(presentation, { status: 'already_committed' }),
+    ).toBe(false);
     expect(client.admitMemoryWriter).toHaveBeenCalledTimes(1);
   });
 

@@ -88,7 +88,11 @@ describe('Cortex follow-up terminal outcome', () => {
 
   /** Seeds a parent answer and its follow-up; `ids` lets another owner reuse the same decision. */
   async function seedMessages(suffix, owner = `owner-${suffix}`, ids = suffix) {
-    const shared = { conversationId: `conversation-${suffix}`, user: owner, isCreatedByUser: false };
+    const shared = {
+      conversationId: `conversation-${suffix}`,
+      user: owner,
+      isCreatedByUser: false,
+    };
     await Message.create([
       {
         ...shared,
@@ -102,7 +106,9 @@ describe('Cortex follow-up terminal outcome', () => {
         messageId: `follow-up-${ids}`,
         parentMessageId: `answer-${ids}`,
         text: 'Corrected exact total.',
-        metadata: { viventium: { type: 'cortex_followup', cortexFollowUpDecision: decision(suffix) } },
+        metadata: {
+          viventium: { type: 'cortex_followup', cortexFollowUpDecision: decision(suffix) },
+        },
       },
     ]);
   }
@@ -152,7 +158,10 @@ describe('Cortex follow-up terminal outcome', () => {
     const { settled, presentation } = await persistAndPresentWeb(service, 'web', claimed);
 
     expect(settled.map((row) => row.status)).toEqual(['sent']);
-    const [sentRow] = await service.listByParent({ ownerId: 'owner-web', parentMessageId: 'answer-web' });
+    const [sentRow] = await service.listByParent({
+      ownerId: 'owner-web',
+      parentMessageId: 'answer-web',
+    });
     for (const record of await decisions('web')) {
       expect(record).toMatchObject({
         result: 'persisted',

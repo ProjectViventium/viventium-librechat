@@ -7,15 +7,30 @@ const { GraphEvents, GraphNodeKeys } = require('@librechat/agents');
 test('records the native provider-returned model separately from the requested model', async () => {
   const { getDefaultHandlers } = require('../callbacks');
   const req = { body: {} };
-  const handlers = getDefaultHandlers({ req, res: {}, aggregateContent: jest.fn(),
-    toolEndCallback: jest.fn(), collectedUsage: [], streamId: null });
-  const graph = { getAgentContext: () => ({ agentId: 'agent-main', provider: 'openAI',
-    clientOptions: { model: 'grok-build:grok-4.7-build-fast' } }) };
-  await handlers[GraphEvents.CHAT_MODEL_END].handle(GraphEvents.CHAT_MODEL_END,
+  const handlers = getDefaultHandlers({
+    req,
+    res: {},
+    aggregateContent: jest.fn(),
+    toolEndCallback: jest.fn(),
+    collectedUsage: [],
+    streamId: null,
+  });
+  const graph = {
+    getAgentContext: () => ({
+      agentId: 'agent-main',
+      provider: 'openAI',
+      clientOptions: { model: 'grok-build:grok-4.7-build-fast' },
+    }),
+  };
+  await handlers[GraphEvents.CHAT_MODEL_END].handle(
+    GraphEvents.CHAT_MODEL_END,
     { output: { content: 'Ready.', response_metadata: { model_name: 'grok-build:grok-4.7' } } },
-    { langgraph_node: 'agent_agent-main' }, graph);
+    { langgraph_node: 'agent_agent-main' },
+    graph,
+  );
   expect(req._viventiumProviderModelReceipts.get('agent-main')).toEqual({
-    requestedModel: 'grok-build:grok-4.7-build-fast', model: 'grok-build:grok-4.7',
+    requestedModel: 'grok-build:grok-4.7-build-fast',
+    model: 'grok-build:grok-4.7',
   });
 });
 
@@ -29,10 +44,8 @@ jest.mock('@librechat/api', () => ({
   nativeOutputFilePublisherFromContext: jest.fn(),
   createDeliveryDispositionStreamHandler:
     jest.requireActual('@librechat/api').createDeliveryDispositionStreamHandler,
-  getStreamDeliveryDisposition:
-    jest.requireActual('@librechat/api').getStreamDeliveryDisposition,
-  isAudioDeliveryRequested:
-    jest.requireActual('@librechat/api').isAudioDeliveryRequested,
+  getStreamDeliveryDisposition: jest.requireActual('@librechat/api').getStreamDeliveryDisposition,
+  isAudioDeliveryRequested: jest.requireActual('@librechat/api').isAudioDeliveryRequested,
   inspectProviderDeliveryDisposition:
     jest.requireActual('@librechat/api').inspectProviderDeliveryDisposition,
   resolveEffectiveDeliveryDisposition:
@@ -1362,148 +1375,327 @@ describe('authored native preview presentation', () => {
 });
 /* === VIVENTIUM END === */
 
-
 describe('exact chunk delivery carrier to real SDK message delta', () => {
-  it.each(['skip', 'eligible', 'missing'])('keeps %s text visible and marks audio before emission', async (audio) => {
+  it.each(['skip', 'eligible', 'missing'])(
+    'keeps %s text visible and marks audio before emission',
+    async (audio) => {
+      const { getDefaultHandlers } = require('../callbacks');
+      const { GenerationJobManager } = require('@librechat/api');
+      const aggregateContent = jest.fn();
+      const req = {
+        body: { voiceMode: true },
+        viventiumCallSession: { callSessionId: 'synthetic' },
+        _viventiumDeliveryDispositionRequired: audio === 'skip' ? false : true,
+        config: {
+          endpoints: {
+            agents: {
+              providerCapabilities: {
+                native: {
+                  messaging_delivery_disposition: true,
+                  messaging_delivery_disposition_version: 1,
+                },
+              },
+            },
+          },
+        },
+      };
+      const handlers = getDefaultHandlers({
+        req,
+        res: {},
+        aggregateContent,
+        toolEndCallback: jest.fn(),
+        collectedUsage: [],
+        streamId: 'stream-carrier',
+      });
+      const graph = {
+        config: {},
+        prelimMessageIdsByStepKey: new Map(),
+        messageIdsByStepKey: new Map(),
+        getAgentContext: () => ({ provider: 'native', currentTokenType: 'text' }),
+        dispatchRunStep: jest.fn(async () => 'step-carrier'),
+        getStepKey: () => 'step-key',
+        getStepIdByKey: () => 'step-carrier',
+        getRunStep: () => ({ type: 'message_creation' }),
+        dispatchMessageDelta: (id, delta, metadata) =>
+          handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+            GraphEvents.ON_MESSAGE_DELTA,
+            { id, delta, agentId: 'main' },
+            metadata,
+          ),
+      };
+      const disposition = { version: 1, audio, required: true, valid: true, source: 'model' };
+      const chunk = {
+        content: 'Report ready.',
+        additional_kwargs:
+          audio === 'missing'
+            ? {}
+            : {
+                provider_specific_fields: { viventium: { delivery_disposition: disposition } },
+              },
+      };
+      await handlers[GraphEvents.CHAT_MODEL_STREAM].handle(
+        GraphEvents.CHAT_MODEL_STREAM,
+        { chunk },
+        { agentId: 'main' },
+        graph,
+      );
+      const event = GenerationJobManager.emitChunk.mock.calls.find(
+        ([, payload]) => payload.event === GraphEvents.ON_MESSAGE_DELTA,
+      )?.[1];
+      expect(event.data.delta.content).toEqual([{ type: 'text', text: 'Report ready.' }]);
+      expect(event.data.delta.metadata.viventium.deliveryDisposition).toEqual(
+        audio === 'missing'
+          ? { version: 1, audio: 'skip', required: true, valid: false, source: 'required_missing' }
+          : disposition,
+      );
+      expect(aggregateContent).toHaveBeenCalledWith(expect.objectContaining({ data: event.data }));
+      expect(req._viventiumDeliveryDispositionCapture).toBeUndefined();
+    },
+  );
+});
+
+it.each(['eligible', 'skip', 'legacy'])(
+  'preserves %s through actual ChatOpenAI raw chunks and SDK dispatch',
+  async (audio) => {
+    const { initializeModel } = require('@librechat/agents');
     const { getDefaultHandlers } = require('../callbacks');
     const { GenerationJobManager } = require('@librechat/api');
-    const aggregateContent = jest.fn();
-    const req = { body: { voiceMode: true }, viventiumCallSession: { callSessionId: 'synthetic' },
+    const {
+      attachEffectiveDeliveryDisposition,
+    } = require('~/server/services/viventium/deliveryDisposition');
+    const words = Array.from({ length: 20 }, (_, index) => `word${index} `);
+    const modelDisposition = { version: 1, audio, required: true, valid: true, source: 'model' };
+    const chunks = words.map((content) => ({
+      id: 'synthetic',
+      object: 'chat.completion.chunk',
+      model: 'synthetic',
+      choices: [
+        {
+          index: 0,
+          delta: {
+            content,
+            ...(audio === 'legacy'
+              ? {}
+              : {
+                  provider_specific_fields: {
+                    viventium: {
+                      delivery_disposition: modelDisposition,
+                    },
+                  },
+                }),
+          },
+          finish_reason: null,
+        },
+      ],
+    }));
+    chunks.unshift({
+      id: 'synthetic',
+      object: 'chat.completion.chunk',
+      model: 'synthetic',
+      choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+    });
+    const body =
+      chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n';
+    const model = initializeModel({
+      provider: 'openAI',
+      clientOptions: {
+        apiKey: 'synthetic-key',
+        model: 'synthetic',
+        streaming: true,
+        __includeRawResponse: true,
+        streamUsage: false,
+        maxRetries: 0,
+        configuration: {
+          baseURL: 'http://synthetic.invalid/v1',
+          fetch: async () =>
+            new Response(body, { headers: { 'Content-Type': 'text/event-stream' } }),
+        },
+      },
+    });
+    const req = {
+      body: { voiceMode: true },
+      viventiumCallSession: { callSessionId: 'synthetic' },
       _viventiumDeliveryDispositionRequired: audio === 'skip' ? false : true,
-      config: { endpoints: { agents: { providerCapabilities: { native: {
-        messaging_delivery_disposition: true, messaging_delivery_disposition_version: 1,
-      } } } } } };
-    const handlers = getDefaultHandlers({ req, res: {}, aggregateContent,
-      toolEndCallback: jest.fn(), collectedUsage: [], streamId: 'stream-carrier' });
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              native: {
+                messaging_delivery_disposition: true,
+                messaging_delivery_disposition_version: 1,
+              },
+            },
+          },
+        },
+      },
+    };
+    const aggregateContent = jest.fn();
+    const handlers = getDefaultHandlers({
+      req,
+      res: {},
+      aggregateContent,
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      streamId: 'stream-real-adapter',
+    });
     const graph = {
       config: {},
       prelimMessageIdsByStepKey: new Map(),
       messageIdsByStepKey: new Map(),
-      getAgentContext: () => ({ provider: 'native', currentTokenType: 'text' }),
-      dispatchRunStep: jest.fn(async () => 'step-carrier'),
+      getAgentContext: () => ({
+        provider: audio === 'legacy' ? 'legacy' : 'native',
+        currentTokenType: 'text',
+        clientOptions: {},
+      }),
+      getBaseKeyList: (metadata) => [
+        metadata.run_id,
+        metadata.thread_id,
+        metadata.langgraph_node,
+        metadata.langgraph_step,
+        metadata.langgraph_checkpoint_ns,
+      ],
       getStepKey: () => 'step-key',
-      getStepIdByKey: () => 'step-carrier',
+      getStepIdByKey: () => 'step-real',
       getRunStep: () => ({ type: 'message_creation' }),
-      dispatchMessageDelta: (id, delta, metadata) => handlers[GraphEvents.ON_MESSAGE_DELTA]
-        .handle(GraphEvents.ON_MESSAGE_DELTA, { id, delta, agentId: 'main' }, metadata),
+      dispatchRunStep: jest.fn(),
+      dispatchMessageDelta: (id, delta, metadata) =>
+        handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+          GraphEvents.ON_MESSAGE_DELTA,
+          { id, delta, agentId: 'main' },
+          metadata,
+        ),
     };
-    const disposition = { version: 1, audio, required: true, valid: true, source: 'model' };
-    const chunk = { content: 'Report ready.', additional_kwargs: audio === 'missing' ? {} : {
-      provider_specific_fields: { viventium: { delivery_disposition: disposition } },
-    } };
-    await handlers[GraphEvents.CHAT_MODEL_STREAM].handle(
-      GraphEvents.CHAT_MODEL_STREAM, { chunk }, { agentId: 'main' }, graph);
-    const event = GenerationJobManager.emitChunk.mock.calls.find(([, payload]) =>
-      payload.event === GraphEvents.ON_MESSAGE_DELTA)?.[1];
-    expect(event.data.delta.content).toEqual([{ type: 'text', text: 'Report ready.' }]);
-    expect(event.data.delta.metadata.viventium.deliveryDisposition).toEqual(
-      audio === 'missing' ? { version: 1, audio: 'skip', required: true,
-        valid: false, source: 'required_missing' } : disposition);
-    expect(aggregateContent).toHaveBeenCalledWith(expect.objectContaining({ data: event.data }));
-    expect(req._viventiumDeliveryDispositionCapture).toBeUndefined();
-  });
-});
-
-
-it.each(['eligible', 'skip', 'legacy'])('preserves %s through actual ChatOpenAI raw chunks and SDK dispatch', async (audio) => {
-  const { initializeModel } = require('@librechat/agents');
-  const { getDefaultHandlers } = require('../callbacks');
-  const { GenerationJobManager } = require('@librechat/api');
-  const { attachEffectiveDeliveryDisposition } = require('~/server/services/viventium/deliveryDisposition');
-  const words = Array.from({ length: 20 }, (_, index) => `word${index} `);
-  const modelDisposition = { version: 1, audio, required: true, valid: true, source: 'model' };
-  const chunks = words.map((content) => ({ id: 'synthetic', object: 'chat.completion.chunk',
-    model: 'synthetic', choices: [{ index: 0, delta: { content,
-      ...(audio === 'legacy' ? {} : { provider_specific_fields: { viventium: {
-        delivery_disposition: modelDisposition,
-      } } }),
-    }, finish_reason: null }] }));
-  chunks.unshift({ id: 'synthetic', object: 'chat.completion.chunk', model: 'synthetic',
-    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] });
-  const body = chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n';
-  const model = initializeModel({ provider: 'openAI', clientOptions: { apiKey: 'synthetic-key', model: 'synthetic', streaming: true,
-    __includeRawResponse: true, streamUsage: false, maxRetries: 0,
-    configuration: { baseURL: 'http://synthetic.invalid/v1',
-      fetch: async () => new Response(body, { headers: { 'Content-Type': 'text/event-stream' } }),
-    } } });
-  const req = { body: { voiceMode: true }, viventiumCallSession: { callSessionId: 'synthetic' },
-      _viventiumDeliveryDispositionRequired: audio === 'skip' ? false : true,
-    config: { endpoints: { agents: { providerCapabilities: { native: {
-      messaging_delivery_disposition: true, messaging_delivery_disposition_version: 1,
-    } } } } } };
-  const aggregateContent = jest.fn();
-  const handlers = getDefaultHandlers({ req, res: {}, aggregateContent,
-    toolEndCallback: jest.fn(), collectedUsage: [], streamId: 'stream-real-adapter' });
-  const graph = { config: {}, prelimMessageIdsByStepKey: new Map(), messageIdsByStepKey: new Map(),
-    getAgentContext: () => ({ provider: audio === 'legacy' ? 'legacy' : 'native', currentTokenType: 'text', clientOptions: {} }),
-    getBaseKeyList: (metadata) => [metadata.run_id, metadata.thread_id, metadata.langgraph_node,
-      metadata.langgraph_step, metadata.langgraph_checkpoint_ns],
-    getStepKey: () => 'step-key', getStepIdByKey: () => 'step-real',
-    getRunStep: () => ({ type: 'message_creation' }), dispatchRunStep: jest.fn(),
-    dispatchMessageDelta: (id, delta, metadata) => handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
-      GraphEvents.ON_MESSAGE_DELTA, { id, delta, agentId: 'main' }, metadata),
-  };
-  const metadata = { agentId: 'main', run_id: 'model-run', thread_id: 'thread',
-    langgraph_node: 'agent_main', langgraph_step: 3, langgraph_checkpoint_ns: 'checkpoint' };
-  let finalChunk;
-  for await (const chunk of await model.stream('Synthetic question.')) {
-    finalChunk = finalChunk ? finalChunk.concat(chunk) : chunk;
-    await handlers[GraphEvents.CHAT_MODEL_STREAM].handle(GraphEvents.CHAT_MODEL_STREAM,
-      { chunk }, metadata, graph);
-  }
-  await handlers[GraphEvents.CHAT_MODEL_END].handle(GraphEvents.CHAT_MODEL_END,
-    { output: finalChunk }, metadata, graph);
-  const persisted = attachEffectiveDeliveryDisposition(req, { text: words.join(''), isCreatedByUser: false });
-  if (audio === 'legacy') {
-    expect(persisted.metadata).toBeUndefined();
-  } else {
-    expect(persisted.metadata.viventium.deliveryDisposition).toEqual(modelDisposition);
-  }
-  const emitted = GenerationJobManager.emitChunk.mock.calls.map(([, event]) => event)
-    .filter((event) => event.event === GraphEvents.ON_MESSAGE_DELTA);
-  expect(emitted).toHaveLength(20);
-  expect(emitted.flatMap((event) => event.data.delta.content).map((part) => part.text).join(''))
-    .toBe(words.join(''));
-  for (const event of emitted) {
-    if (audio === 'legacy') expect(event.data.delta.metadata).toBeUndefined();
-    else expect(event.data.delta.metadata.viventium.deliveryDisposition).toEqual(modelDisposition);
-  }
-});
-
+    const metadata = {
+      agentId: 'main',
+      run_id: 'model-run',
+      thread_id: 'thread',
+      langgraph_node: 'agent_main',
+      langgraph_step: 3,
+      langgraph_checkpoint_ns: 'checkpoint',
+    };
+    let finalChunk;
+    for await (const chunk of await model.stream('Synthetic question.')) {
+      finalChunk = finalChunk ? finalChunk.concat(chunk) : chunk;
+      await handlers[GraphEvents.CHAT_MODEL_STREAM].handle(
+        GraphEvents.CHAT_MODEL_STREAM,
+        { chunk },
+        metadata,
+        graph,
+      );
+    }
+    await handlers[GraphEvents.CHAT_MODEL_END].handle(
+      GraphEvents.CHAT_MODEL_END,
+      { output: finalChunk },
+      metadata,
+      graph,
+    );
+    const persisted = attachEffectiveDeliveryDisposition(req, {
+      text: words.join(''),
+      isCreatedByUser: false,
+    });
+    if (audio === 'legacy') {
+      expect(persisted.metadata).toBeUndefined();
+    } else {
+      expect(persisted.metadata.viventium.deliveryDisposition).toEqual(modelDisposition);
+    }
+    const emitted = GenerationJobManager.emitChunk.mock.calls
+      .map(([, event]) => event)
+      .filter((event) => event.event === GraphEvents.ON_MESSAGE_DELTA);
+    expect(emitted).toHaveLength(20);
+    expect(
+      emitted
+        .flatMap((event) => event.data.delta.content)
+        .map((part) => part.text)
+        .join(''),
+    ).toBe(words.join(''));
+    for (const event of emitted) {
+      if (audio === 'legacy') expect(event.data.delta.metadata).toBeUndefined();
+      else
+        expect(event.data.delta.metadata.viventium.deliveryDisposition).toEqual(modelDisposition);
+    }
+  },
+);
 
 it('does not mute a legacy final after a capable reasoning-only attempt fails', async () => {
   const { getDefaultHandlers } = require('../callbacks');
-  const { attachEffectiveDeliveryDisposition } = require('~/server/services/viventium/deliveryDisposition');
+  const {
+    attachEffectiveDeliveryDisposition,
+  } = require('~/server/services/viventium/deliveryDisposition');
   const { GenerationJobManager } = require('@librechat/api');
-  const req = { body: { voiceMode: true }, viventiumCallSession: { callSessionId: 'synthetic' },
+  const req = {
+    body: { voiceMode: true },
+    viventiumCallSession: { callSessionId: 'synthetic' },
     _viventiumDeliveryDispositionRequired: true,
-    config: { endpoints: { agents: { providerCapabilities: { native: {
-      messaging_delivery_disposition: true, messaging_delivery_disposition_version: 1,
-    } } } } } };
-  const handlers = getDefaultHandlers({ req, res: {}, aggregateContent: jest.fn(),
-    toolEndCallback: jest.fn(), collectedUsage: [], streamId: 'stream-fallback' });
-  let provider = 'native';
-  const graph = { config: {}, prelimMessageIdsByStepKey: new Map(), messageIdsByStepKey: new Map(),
-    getAgentContext: () => ({ provider, currentTokenType: 'text', clientOptions: {} }),
-    getStepKey: () => 'step-key', getStepIdByKey: () => 'step-fallback',
-    getRunStep: () => ({ type: 'message_creation' }), dispatchRunStep: jest.fn(),
-    dispatchMessageDelta: (id, delta, metadata) => handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
-      GraphEvents.ON_MESSAGE_DELTA, { id, delta, agentId: 'main' }, metadata),
+    config: {
+      endpoints: {
+        agents: {
+          providerCapabilities: {
+            native: {
+              messaging_delivery_disposition: true,
+              messaging_delivery_disposition_version: 1,
+            },
+          },
+        },
+      },
+    },
   };
-  await handlers[GraphEvents.CHAT_MODEL_STREAM].handle(GraphEvents.CHAT_MODEL_STREAM,
-    { chunk: { content: '', additional_kwargs: { reasoning_content: 'Synthetic internal reasoning.' } } },
-    { agentId: 'main' }, graph);
+  const handlers = getDefaultHandlers({
+    req,
+    res: {},
+    aggregateContent: jest.fn(),
+    toolEndCallback: jest.fn(),
+    collectedUsage: [],
+    streamId: 'stream-fallback',
+  });
+  let provider = 'native';
+  const graph = {
+    config: {},
+    prelimMessageIdsByStepKey: new Map(),
+    messageIdsByStepKey: new Map(),
+    getAgentContext: () => ({ provider, currentTokenType: 'text', clientOptions: {} }),
+    getStepKey: () => 'step-key',
+    getStepIdByKey: () => 'step-fallback',
+    getRunStep: () => ({ type: 'message_creation' }),
+    dispatchRunStep: jest.fn(),
+    dispatchMessageDelta: (id, delta, metadata) =>
+      handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+        GraphEvents.ON_MESSAGE_DELTA,
+        { id, delta, agentId: 'main' },
+        metadata,
+      ),
+  };
+  await handlers[GraphEvents.CHAT_MODEL_STREAM].handle(
+    GraphEvents.CHAT_MODEL_STREAM,
+    {
+      chunk: {
+        content: '',
+        additional_kwargs: { reasoning_content: 'Synthetic internal reasoning.' },
+      },
+    },
+    { agentId: 'main' },
+    graph,
+  );
   expect(req._viventiumDeliveryDispositionCapture).toBeUndefined();
   // The capable attempt throws before ModelEnd; the installed SDK then switches context.
   provider = 'legacy';
-  await handlers[GraphEvents.CHAT_MODEL_STREAM].handle(GraphEvents.CHAT_MODEL_STREAM,
-    { chunk: { content: 'Fallback answer.', additional_kwargs: {} } }, { agentId: 'main' }, graph);
-  await handlers[GraphEvents.CHAT_MODEL_END].handle(GraphEvents.CHAT_MODEL_END,
-    { output: { content: 'Fallback answer.' } }, { agentId: 'main' }, graph);
+  await handlers[GraphEvents.CHAT_MODEL_STREAM].handle(
+    GraphEvents.CHAT_MODEL_STREAM,
+    { chunk: { content: 'Fallback answer.', additional_kwargs: {} } },
+    { agentId: 'main' },
+    graph,
+  );
+  await handlers[GraphEvents.CHAT_MODEL_END].handle(
+    GraphEvents.CHAT_MODEL_END,
+    { output: { content: 'Fallback answer.' } },
+    { agentId: 'main' },
+    graph,
+  );
   expect(req._viventiumDeliveryDispositionRequired).toBe(false);
   expect(req._viventiumDeliveryDispositionCapture).toBeUndefined();
-  const lastText = GenerationJobManager.emitChunk.mock.calls.map(([, event]) => event)
-    .filter((event) => event.event === GraphEvents.ON_MESSAGE_DELTA).at(-1);
+  const lastText = GenerationJobManager.emitChunk.mock.calls
+    .map(([, event]) => event)
+    .filter((event) => event.event === GraphEvents.ON_MESSAGE_DELTA)
+    .at(-1);
   expect(lastText.data.delta.metadata).toBeUndefined();
   const durable = { text: 'Fallback answer.', isCreatedByUser: false };
   expect(attachEffectiveDeliveryDisposition(req, durable)).toEqual(durable);
@@ -1511,49 +1703,120 @@ it('does not mute a legacy final after a capable reasoning-only attempt fails', 
 
 /* === VIVENTIUM START === Final delivery uses exact invocation chunk envelopes. === */
 describe('whole delivery envelopes at ModelEnd', () => {
-  const contract = (audio = 'eligible') => ({ version: 1, audio, required: true, valid: true,
-    source: 'model' });
+  const contract = (audio = 'eligible') => ({
+    version: 1,
+    audio,
+    required: true,
+    valid: true,
+    source: 'model',
+  });
   const setup = () => {
     const { getDefaultHandlers } = require('../callbacks');
-    const req = { body: { voiceMode: true }, viventiumCallSession: { callSessionId: 'synthetic' },
-      config: { endpoints: { agents: { providerCapabilities: { native: {
-        messaging_delivery_disposition: true, messaging_delivery_disposition_version: 1,
-      } } } } } };
+    const req = {
+      body: { voiceMode: true },
+      viventiumCallSession: { callSessionId: 'synthetic' },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              native: {
+                messaging_delivery_disposition: true,
+                messaging_delivery_disposition_version: 1,
+              },
+            },
+          },
+        },
+      },
+    };
     let provider = 'native';
-    const handlers = getDefaultHandlers({ req, res: {}, aggregateContent: jest.fn(),
-      toolEndCallback: jest.fn(), collectedUsage: [], streamId: null });
-    const graph = { config: {}, prelimMessageIdsByStepKey: new Map(), messageIdsByStepKey: new Map(),
+    const handlers = getDefaultHandlers({
+      req,
+      res: {},
+      aggregateContent: jest.fn(),
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      streamId: null,
+    });
+    const graph = {
+      config: {},
+      prelimMessageIdsByStepKey: new Map(),
+      messageIdsByStepKey: new Map(),
       getAgentContext: () => ({ provider, currentTokenType: 'text', clientOptions: {} }),
-      getBaseKeyList: (metadata) => [metadata.run_id, metadata.thread_id, metadata.langgraph_node,
-        metadata.langgraph_step, metadata.langgraph_checkpoint_ns],
-      getStepKey: () => 'step-key', getStepIdByKey: () => 'step-final',
-      getRunStep: () => ({ type: 'message_creation' }), dispatchRunStep: jest.fn(),
+      getBaseKeyList: (metadata) => [
+        metadata.run_id,
+        metadata.thread_id,
+        metadata.langgraph_node,
+        metadata.langgraph_step,
+        metadata.langgraph_checkpoint_ns,
+      ],
+      getStepKey: () => 'step-key',
+      getStepIdByKey: () => 'step-final',
+      getRunStep: () => ({ type: 'message_creation' }),
+      dispatchRunStep: jest.fn(),
       dispatchMessageDelta: jest.fn(),
     };
-    const meta = (agent, step) => ({ agentId: agent, run_id: 'run', thread_id: 'thread',
-      langgraph_node: `agent_${agent}`, langgraph_step: step, langgraph_checkpoint_ns: 'checkpoint' });
+    const meta = (agent, step) => ({
+      agentId: agent,
+      run_id: 'run',
+      thread_id: 'thread',
+      langgraph_node: `agent_${agent}`,
+      langgraph_step: step,
+      langgraph_checkpoint_ns: 'checkpoint',
+    });
     const stream = async (metadata, disposition) => {
       const { AIMessageChunk } = require('@langchain/core/messages');
-      const chunk = () => new AIMessageChunk({ content: 'Result. ', additional_kwargs: {
-        provider_specific_fields: { viventium: { delivery_disposition: disposition } },
-      } });
+      const chunk = () =>
+        new AIMessageChunk({
+          content: 'Result. ',
+          additional_kwargs: {
+            provider_specific_fields: { viventium: { delivery_disposition: disposition } },
+          },
+        });
       const first = chunk();
       const second = chunk();
-      for (const value of [first, second]) await handlers[GraphEvents.CHAT_MODEL_STREAM]
-        .handle(GraphEvents.CHAT_MODEL_STREAM, { chunk: value }, metadata, graph);
+      for (const value of [first, second])
+        await handlers[GraphEvents.CHAT_MODEL_STREAM].handle(
+          GraphEvents.CHAT_MODEL_STREAM,
+          { chunk: value },
+          metadata,
+          graph,
+        );
       return first.concat(second);
     };
-    const end = (metadata, output) => handlers[GraphEvents.CHAT_MODEL_END]
-      .handle(GraphEvents.CHAT_MODEL_END, { output }, metadata, graph);
-    const start = (metadata) => handlers[GraphEvents.CHAT_MODEL_START]
-      .handle(GraphEvents.CHAT_MODEL_START, {}, metadata, graph);
-    return { req, meta, stream, end, start, setProvider: (value) => { provider = value; } };
+    const end = (metadata, output) =>
+      handlers[GraphEvents.CHAT_MODEL_END].handle(
+        GraphEvents.CHAT_MODEL_END,
+        { output },
+        metadata,
+        graph,
+      );
+    const start = (metadata) =>
+      handlers[GraphEvents.CHAT_MODEL_START].handle(
+        GraphEvents.CHAT_MODEL_START,
+        {},
+        metadata,
+        graph,
+      );
+    return {
+      req,
+      meta,
+      stream,
+      end,
+      start,
+      setProvider: (value) => {
+        provider = value;
+      },
+    };
   };
 
-  it.each(['eligible', 'skip'])('keeps final %s through Main → specialist → Main tool invocations',
+  it.each(['eligible', 'skip'])(
+    'keeps final %s through Main → specialist → Main tool invocations',
     async (audio) => {
       const { req, meta, stream, end, start } = setup();
-      for (const [agent, step] of [['main', 0], ['specialist', 1]]) {
+      for (const [agent, step] of [
+        ['main', 0],
+        ['specialist', 1],
+      ]) {
         const metadata = meta(agent, step);
         await start(metadata);
         const output = await stream(metadata, contract('skip'));
@@ -1564,12 +1827,15 @@ describe('whole delivery envelopes at ModelEnd', () => {
       const final = meta('main', 2);
       await start(final);
       await end(final, await stream(final, contract(audio)));
-      expect(req._viventiumDeliveryDispositionCapture).toEqual({ status: 'valid',
-        disposition: contract(audio) });
+      expect(req._viventiumDeliveryDispositionCapture).toEqual({
+        status: 'valid',
+        disposition: contract(audio),
+      });
       // Consuming an invocation cannot feed a later same-agent missing contract.
       await end(meta('main', 3), { content: 'A later result with no contract.' });
       expect(req._viventiumDeliveryDispositionCapture).toEqual({ status: 'missing' });
-    });
+    },
+  );
 
   it('retains malformed and skip precedence within one invocation', async () => {
     const { req, meta, stream, end, start } = setup();
@@ -1577,8 +1843,10 @@ describe('whole delivery envelopes at ModelEnd', () => {
     await start(first);
     await stream(first, contract('skip'));
     await end(first, await stream(first, contract('eligible')));
-    expect(req._viventiumDeliveryDispositionCapture).toEqual({ status: 'valid',
-      disposition: contract('skip') });
+    expect(req._viventiumDeliveryDispositionCapture).toEqual({
+      status: 'valid',
+      disposition: contract('skip'),
+    });
     const next = meta('main', 1);
     await start(next);
     await stream(next, { ...contract(), version: 2 });
@@ -1586,7 +1854,8 @@ describe('whole delivery envelopes at ModelEnd', () => {
     expect(req._viventiumDeliveryDispositionCapture).toEqual({ status: 'malformed' });
   });
 
-  it.each(['native', 'legacy'])('drops an interrupted attempt before its %s replacement',
+  it.each(['native', 'legacy'])(
+    'drops an interrupted attempt before its %s replacement',
     async (provider) => {
       const { req, meta, stream, end, start, setProvider } = setup();
       const metadata = meta('main', 0);
@@ -1598,8 +1867,10 @@ describe('whole delivery envelopes at ModelEnd', () => {
       await end(metadata, { content: 'Replacement response.' });
       expect(req._viventiumDeliveryDispositionRequired).toBe(provider === 'native');
       expect(req._viventiumDeliveryDispositionCapture).toEqual(
-        provider === 'native' ? { status: 'missing' } : undefined);
-    });
+        provider === 'native' ? { status: 'missing' } : undefined,
+      );
+    },
+  );
 });
 /* === VIVENTIUM END === */
 
@@ -1619,43 +1890,101 @@ describe('typed native output attachments at the actual SDK callback boundary', 
       if (raw.id !== envelope.request_id) throw new Error('invalid');
       return { envelope, requestId: raw.id };
     });
-    const callback = jest.fn(); let provider = 'native';
-    const req = { body: {}, config: { endpoints: { agents: { providerCapabilities: {
-      native: { workspace_binding: true, conversation_session: true },
-    } } } } };
-    const handlers = getDefaultHandlers({ req, res: {}, aggregateContent: jest.fn(),
-      toolEndCallback: jest.fn(), collectedUsage: [], nativeOutputCallback: callback });
-    const graph = { config: {}, prelimMessageIdsByStepKey: new Map(), messageIdsByStepKey: new Map(),
-      getAgentContext: (metadata) => ({ provider, agentId: metadata.agentId, currentTokenType: 'text', clientOptions: {} }),
+    const callback = jest.fn();
+    let provider = 'native';
+    const req = {
+      body: {},
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              native: { workspace_binding: true, conversation_session: true },
+            },
+          },
+        },
+      },
+    };
+    const handlers = getDefaultHandlers({
+      req,
+      res: {},
+      aggregateContent: jest.fn(),
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      nativeOutputCallback: callback,
+    });
+    const graph = {
+      config: {},
+      prelimMessageIdsByStepKey: new Map(),
+      messageIdsByStepKey: new Map(),
+      getAgentContext: (metadata) => ({
+        provider,
+        agentId: metadata.agentId,
+        currentTokenType: 'text',
+        clientOptions: {},
+      }),
       getBaseKeyList: (metadata) => [metadata.agentId, metadata.langgraph_step],
-      getStepKey: () => 'step', getStepIdByKey: () => 'step-id', getRunStep: () => ({ type: 'message_creation' }),
-      dispatchRunStep: jest.fn(), dispatchMessageDelta: jest.fn() };
+      getStepKey: () => 'step',
+      getStepIdByKey: () => 'step-id',
+      getRunStep: () => ({ type: 'message_creation' }),
+      dispatchRunStep: jest.fn(),
+      dispatchMessageDelta: jest.fn(),
+    };
     const metadata = { agentId: 'main', langgraph_node: 'agent_main', langgraph_step: 1 };
     const envelope = { request_id: 'request-one', files: [{ filename: 'result.csv' }] };
     const { AIMessageChunk } = require('@langchain/core/messages');
-    const chunk = (carrier = envelope) => new AIMessageChunk({ content: 'Useful. ', additional_kwargs: {
-      __raw_response: { id: carrier.request_id, object: 'chat.completion.chunk', glasshive: { output_files: carrier } },
-    } });
-    const stream = async (meta = metadata, carrier = envelope) => { const first = chunk(carrier), second = chunk(carrier);
-      for (const item of [first, second]) await handlers[GraphEvents.CHAT_MODEL_STREAM].handle('', { chunk: item }, meta, graph);
-      return first.concat(second); };
-    const end = (output, meta = metadata) => handlers[GraphEvents.CHAT_MODEL_END].handle('', { output }, meta, graph);
-    return { handlers, graph, metadata, envelope, callback, stream, end, provider: (value) => { provider = value; } };
+    const chunk = (carrier = envelope) =>
+      new AIMessageChunk({
+        content: 'Useful. ',
+        additional_kwargs: {
+          __raw_response: {
+            id: carrier.request_id,
+            object: 'chat.completion.chunk',
+            glasshive: { output_files: carrier },
+          },
+        },
+      });
+    const stream = async (meta = metadata, carrier = envelope) => {
+      const first = chunk(carrier),
+        second = chunk(carrier);
+      for (const item of [first, second])
+        await handlers[GraphEvents.CHAT_MODEL_STREAM].handle('', { chunk: item }, meta, graph);
+      return first.concat(second);
+    };
+    const end = (output, meta = metadata) =>
+      handlers[GraphEvents.CHAT_MODEL_END].handle('', { output }, meta, graph);
+    return {
+      handlers,
+      graph,
+      metadata,
+      envelope,
+      callback,
+      stream,
+      end,
+      provider: (value) => {
+        provider = value;
+      },
+    };
   };
   test('visible final uses whole current carrier once without trusting aggregate identity', async () => {
-    const t = setup(); const aggregate = await t.stream();
+    const t = setup();
+    const aggregate = await t.stream();
     // The public SDK reducer retains an aggregate; only pre-merge observations own this receipt.
     aggregate.additional_kwargs.__raw_response.id = 'aggregate-identity';
     await t.end(aggregate);
     expect(t.callback).toHaveBeenCalledTimes(1);
-    expect(t.callback).toHaveBeenCalledWith({ envelope: t.envelope, requestId: 'request-one' }, 'main');
+    expect(t.callback).toHaveBeenCalledWith(
+      { envelope: t.envelope, requestId: 'request-one' },
+      'main',
+    );
     await t.end(aggregate);
     expect(t.callback).toHaveBeenCalledTimes(1);
   });
   test('handoff tool calls do not publish their incidental file references', async () => {
-    const t = setup(); const aggregate = await t.stream();
+    const t = setup();
+    const aggregate = await t.stream();
     aggregate.tool_calls = [{ id: 'handoff', name: 'transfer', args: {} }];
-    await t.end(aggregate); expect(t.callback).not.toHaveBeenCalled();
+    await t.end(aggregate);
+    expect(t.callback).not.toHaveBeenCalled();
   });
   test('native consultant seals its own route before a non-native Main flushes the carrier', async () => {
     const t = setup();
@@ -1691,24 +2020,42 @@ describe('typed native output attachments at the actual SDK callback boundary', 
   });
   test('selected transfer files wait for visible Main and retain the original publisher', async () => {
     const t = setup();
-    const hidden = { ...t.metadata, agentId: 'specialist', langgraph_node: 'agent_specialist',
-      hide_sequential_outputs: true, visible_agent_ids: ['main'], last_agent_id: 'main' };
+    const hidden = {
+      ...t.metadata,
+      agentId: 'specialist',
+      langgraph_node: 'agent_specialist',
+      hide_sequential_outputs: true,
+      visible_agent_ids: ['main'],
+      last_agent_id: 'main',
+    };
     const transfer = await t.stream(hidden);
     transfer.tool_calls = [{ id: 'handoff', name: 'transfer', args: {} }];
     await t.end(transfer, hidden);
     expect(t.callback).not.toHaveBeenCalled();
     await t.end({ content: 'The requested result is ready.' });
     expect(t.callback).toHaveBeenCalledTimes(1);
-    expect(t.callback).toHaveBeenCalledWith({ envelope: t.envelope, requestId: 'request-one' }, 'specialist');
+    expect(t.callback).toHaveBeenCalledWith(
+      { envelope: t.envelope, requestId: 'request-one' },
+      'specialist',
+    );
     await t.end({ content: 'The requested result is ready.' });
     expect(t.callback).toHaveBeenCalledTimes(1);
   });
   test('duplicate transfer carriers flush once and preserve distinct published requests', async () => {
     const t = setup();
-    for (const [step, carrier] of [[1, t.envelope], [2, t.envelope],
-      [3, { request_id: 'request-two', files: [{ filename: 'second.csv' }] }]]) {
-      const metadata = { ...t.metadata, agentId: 'specialist', langgraph_node: 'agent_specialist',
-        langgraph_step: step, hide_sequential_outputs: true, visible_agent_ids: ['main'] };
+    for (const [step, carrier] of [
+      [1, t.envelope],
+      [2, t.envelope],
+      [3, { request_id: 'request-two', files: [{ filename: 'second.csv' }] }],
+    ]) {
+      const metadata = {
+        ...t.metadata,
+        agentId: 'specialist',
+        langgraph_node: 'agent_specialist',
+        langgraph_step: step,
+        hide_sequential_outputs: true,
+        visible_agent_ids: ['main'],
+      };
       const output = await t.stream(metadata, carrier);
       output.tool_calls = [{ id: 'handoff', name: 'transfer', args: {} }];
       await t.end(output, metadata);
@@ -1716,26 +2063,39 @@ describe('typed native output attachments at the actual SDK callback boundary', 
     expect(t.callback).not.toHaveBeenCalled();
     await t.end({ content: 'Both results are ready.' });
     expect(t.callback).toHaveBeenCalledTimes(2);
-    expect(t.callback.mock.calls.map(([carrier]) => carrier.requestId)).toEqual(['request-one', 'request-two']);
+    expect(t.callback.mock.calls.map(([carrier]) => carrier.requestId)).toEqual([
+      'request-one',
+      'request-two',
+    ]);
   });
   test('a hidden final cannot emit a retained transfer carrier', async () => {
-    const t = setup(); const transfer = await t.stream();
+    const t = setup();
+    const transfer = await t.stream();
     transfer.tool_calls = [{ id: 'handoff', name: 'transfer', args: {} }];
     await t.end(transfer);
-    const hidden = { ...t.metadata, agentId: 'specialist', langgraph_node: 'agent_specialist',
-      hide_sequential_outputs: true, visible_agent_ids: ['main'] };
+    const hidden = {
+      ...t.metadata,
+      agentId: 'specialist',
+      langgraph_node: 'agent_specialist',
+      hide_sequential_outputs: true,
+      visible_agent_ids: ['main'],
+    };
     await t.end({ content: 'Private specialist result.' }, hidden);
     expect(t.callback).not.toHaveBeenCalled();
   });
   test('a refused final cannot emit a retained transfer carrier', async () => {
-    const t = setup(); const transfer = await t.stream();
+    const t = setup();
+    const transfer = await t.stream();
     transfer.tool_calls = [{ id: 'handoff', name: 'transfer', args: {} }];
     await t.end(transfer);
-    await expect(t.end({ content: '', additional_kwargs: { stop_reason: 'refusal' } })).rejects.toThrow();
+    await expect(
+      t.end({ content: '', additional_kwargs: { stop_reason: 'refusal' } }),
+    ).rejects.toThrow();
     expect(t.callback).not.toHaveBeenCalled();
   });
   test('an interrupted graph never emits its transfer carrier into another graph', async () => {
-    const interrupted = setup(); const transfer = await interrupted.stream();
+    const interrupted = setup();
+    const transfer = await interrupted.stream();
     transfer.tool_calls = [{ id: 'handoff', name: 'transfer', args: {} }];
     await interrupted.end(transfer);
     const replacement = setup();
@@ -1744,18 +2104,31 @@ describe('typed native output attachments at the actual SDK callback boundary', 
     expect(replacement.callback).not.toHaveBeenCalled();
   });
   test('hidden specialist output never exports selected files', async () => {
-    const t = setup(); const metadata = { ...t.metadata, agentId: 'specialist', langgraph_node: 'agent_specialist',
-      hide_sequential_outputs: true, visible_agent_ids: ['main'], last_agent_id: 'main' };
-    await t.end(await t.stream(metadata), metadata); expect(t.callback).not.toHaveBeenCalled();
+    const t = setup();
+    const metadata = {
+      ...t.metadata,
+      agentId: 'specialist',
+      langgraph_node: 'agent_specialist',
+      hide_sequential_outputs: true,
+      visible_agent_ids: ['main'],
+      last_agent_id: 'main',
+    };
+    await t.end(await t.stream(metadata), metadata);
+    expect(t.callback).not.toHaveBeenCalled();
   });
   test('provider replacement cannot reuse a captured file carrier from the failed attempt', async () => {
-    const t = setup(); const aggregate = await t.stream(); t.provider('legacy');
-    await t.end(aggregate); expect(t.callback).not.toHaveBeenCalled();
+    const t = setup();
+    const aggregate = await t.stream();
+    t.provider('legacy');
+    await t.end(aggregate);
+    expect(t.callback).not.toHaveBeenCalled();
   });
   test('next model start clears old carrier even when the graph key is reused', async () => {
-    const t = setup(); await t.stream();
+    const t = setup();
+    await t.stream();
     await t.handlers[GraphEvents.CHAT_MODEL_START].handle('', {}, t.metadata, t.graph);
-    await t.end({ content: 'Replacement result.' }); expect(t.callback).not.toHaveBeenCalled();
+    await t.end({ content: 'Replacement result.' });
+    expect(t.callback).not.toHaveBeenCalled();
   });
 });
 /* === VIVENTIUM END === */

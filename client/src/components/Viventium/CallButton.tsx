@@ -802,9 +802,9 @@ export default function CallButton({ className }: { className?: string }) {
     ? 'End voice call'
     : isSettings
       ? 'Close voice settings'
-    : state === 'error'
-      ? 'Retry voice call'
-      : 'Start voice call';
+      : state === 'error'
+        ? 'Retry voice call'
+        : 'Start voice call';
   const title =
     error ||
     (state === 'idle'
@@ -815,7 +815,7 @@ export default function CallButton({ className }: { className?: string }) {
           ? 'End voice call'
           : state === 'settings'
             ? 'Close voice settings'
-          : 'Voice could not start');
+            : 'Voice could not start');
 
   return (
     <div className="flex items-center gap-2">
@@ -893,7 +893,11 @@ export default function CallButton({ className }: { className?: string }) {
           {savingDefaults ? 'Saving…' : 'Save these voice choices as my default'}
         </button>
       ) : null}
-      {defaultsStatus ? <span role="status" className="text-xs">{defaultsStatus}</span> : null}
+      {defaultsStatus ? (
+        <span role="status" className="text-xs">
+          {defaultsStatus}
+        </span>
+      ) : null}
       {error ? (
         <span id={errorId} role="alert" className="max-w-64 text-xs leading-tight text-red-500">
           {error}

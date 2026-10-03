@@ -496,6 +496,7 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
                 }
               : {}),
           },
+          { timestamps: false },
         );
       }
       return mutate();

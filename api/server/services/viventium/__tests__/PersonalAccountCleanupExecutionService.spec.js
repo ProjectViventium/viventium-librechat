@@ -10,6 +10,7 @@ const mockCreateSearchAdapter = jest.fn();
 const mockCreateScheduleAdapter = jest.fn();
 const mockLoadVerifier = jest.fn();
 const mockHealth = jest.fn();
+const mockMutateMessageSources = jest.fn();
 
 const mockModels = {
   Conversation: { modelName: 'Conversation' },
@@ -42,6 +43,9 @@ jest.mock('@librechat/api', () => ({
 }));
 jest.mock('~/db/models', () => mockModels);
 jest.mock('~/server/services/viventium/conversationRecallService', () => mockRecall);
+jest.mock('~/server/services/viventium/nativeResponseService', () => ({
+  mutateNativeResponseSources: (...args) => mockMutateMessageSources(...args),
+}));
 
 describe('PersonalAccountCleanupExecutionService', () => {
   beforeEach(() => {
@@ -109,6 +113,20 @@ describe('PersonalAccountCleanupExecutionService', () => {
         residue: { name: 'residue-adapter' },
       }),
     );
+    const repositoryDependencies = mockCreateRepository.mock.calls[0][0];
+    expect(repositoryDependencies).toEqual({
+      Message: mockModels.Message,
+      Conversation: mockModels.Conversation,
+      ledger: { name: 'ledger-adapter' },
+      mutateMessageSources: expect.any(Function),
+    });
+    const filter = { user: 'owner-cleanup-1', messageId: 'message-cleanup-1', __v: 3 };
+    const mutate = jest.fn();
+    mockMutateMessageSources.mockResolvedValue({ applied: true });
+    await expect(
+      repositoryDependencies.mutateMessageSources(filter, mutate, 'delete'),
+    ).resolves.toEqual({ applied: true });
+    expect(mockMutateMessageSources).toHaveBeenCalledWith(filter, mutate, 'delete');
     expect(mockExecute).toHaveBeenCalledWith(input);
     expect(mockSweep).toHaveBeenCalledWith(input);
   });

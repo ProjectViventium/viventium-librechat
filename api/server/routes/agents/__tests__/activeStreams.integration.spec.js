@@ -146,5 +146,4 @@ describe('actual agent route with native active stream owner', () => {
     },
   );
   /* === VIVENTIUM END === */
-
 });

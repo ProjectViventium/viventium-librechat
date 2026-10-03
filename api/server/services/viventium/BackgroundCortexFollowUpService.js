@@ -3074,11 +3074,15 @@ async function generateFollowUpText({
   if (req?.user?.id && conversationId && parentMessageId) {
     try {
       const evidenceService = require('./nativeResponseService').getService();
-      nativeToolEvidence = getTrustedDeliveryPolicy(req)?.commit_authority === 'external_adapter'
-        ? await evidenceService.readToolEvidenceForPresentation(
-            req.user.id, conversationId, parentMessageId, getCortexFollowupGraceMs(),
-          )
-        : await evidenceService.readToolEvidence(req.user.id, conversationId, parentMessageId);
+      nativeToolEvidence =
+        getTrustedDeliveryPolicy(req)?.commit_authority === 'external_adapter'
+          ? await evidenceService.readToolEvidenceForPresentation(
+              req.user.id,
+              conversationId,
+              parentMessageId,
+              getCortexFollowupGraceMs(),
+            )
+          : await evidenceService.readToolEvidence(req.user.id, conversationId, parentMessageId);
     } catch (error) {
       // Accepted worker results carry their own fenced authority. A failed or
       // replaced foreground reply cannot block their delivery; its optional

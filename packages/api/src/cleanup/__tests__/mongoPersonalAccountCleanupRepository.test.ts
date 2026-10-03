@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server';
-import { createModels } from '@librechat/data-schemas';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { createModels, createMethods } from '@librechat/data-schemas';
 import { cleanupStateSha256, ownerScopeSha256 } from '../personalAccountCleanup';
 import { createMongoPersonalAccountCleanupRepository } from '../mongoPersonalAccountCleanupRepository';
 import type { CleanupLedgerAdapter, CleanupOperationState, CleanupReceiptInput } from '../types';
@@ -13,16 +13,22 @@ const HASH_A = 'a'.repeat(64);
 const HASH_B = 'b'.repeat(64);
 
 describe('Mongo personal-account cleanup repository', () => {
-  let mongoServer: MongoMemoryServer;
+  let mongoServer: MongoMemoryReplSet;
   let models: ReturnType<typeof createModels>;
+  let methods: ReturnType<typeof createMethods>;
+  let mutateMessageSources: jest.MockedFunction<
+    Parameters<typeof createMongoPersonalAccountCleanupRepository>[0]['mutateMessageSources']
+  >;
   let state: CleanupOperationState;
   let receipts: CleanupReceiptInput[];
   let ledger: CleanupLedgerAdapter;
 
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create();
+    mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     await mongoose.connect(mongoServer.getUri());
+    mongoose.set('transactionAsyncLocalStorage', true);
     models = createModels(mongoose);
+    methods = createMethods(mongoose);
     await Promise.all([models.Message.init(), models.Conversation.init()]);
   });
 
@@ -36,6 +42,7 @@ describe('Mongo personal-account cleanup repository', () => {
       models.Message.collection.deleteMany({}),
       models.Conversation.collection.deleteMany({}),
     ]);
+    mutateMessageSources = jest.fn(async (_filter, mutate) => mutate());
     receipts = [];
     state = {
       operationId: OPERATION,
@@ -116,6 +123,7 @@ describe('Mongo personal-account cleanup repository', () => {
       Message: models.Message,
       Conversation: models.Conversation,
       ledger,
+      mutateMessageSources,
     });
     const source = await repository.readActiveTarget('message', OWNER, 'message-cleanup-1');
     expect(source).not.toBeNull();
@@ -131,6 +139,17 @@ describe('Mongo personal-account cleanup repository', () => {
     });
 
     expect(result).toEqual({ applied: true, revision: 1, tombstonedAt: AT });
+    expect(mutateMessageSources).toHaveBeenCalledWith(
+      {
+        user: OWNER,
+        messageId: source!.resourceId,
+        deletedAt: null,
+        updatedAt: new Date(source!.updatedAt),
+        $or: [{ __v: 0 }, { __v: { $exists: false } }],
+      },
+      expect.any(Function),
+      'delete',
+    );
     expect(
       await models.Message.findOne({ user: OWNER, messageId: 'message-cleanup-1' }),
     ).toBeNull();
@@ -172,6 +191,7 @@ describe('Mongo personal-account cleanup repository', () => {
       Message: models.Message,
       Conversation: models.Conversation,
       ledger,
+      mutateMessageSources,
     });
     const source = await repository.readActiveTarget('message', OWNER, 'message-cleanup-1');
     await models.Message.findOneAndUpdate(
@@ -195,6 +215,103 @@ describe('Mongo personal-account cleanup repository', () => {
     ).toEqual(expect.objectContaining({ text: 'newer genuine edit' }));
   });
 
+  test.each(['current', 'stale'] as const)(
+    'native assistant cleanup keeps reviewed source CAS intact when %s',
+    async (sourceState) => {
+      await models.Message.create([
+        {
+          messageId: 'native-parent',
+          conversationId: 'conversation-cleanup-1',
+          user: OWNER,
+          text: 'synthetic request',
+          isCreatedByUser: true,
+        },
+        {
+          messageId: 'native-answer',
+          conversationId: 'conversation-cleanup-1',
+          user: OWNER,
+          parentMessageId: 'native-parent',
+          text: 'synthetic answer',
+          isCreatedByUser: false,
+          unfinished: true,
+        },
+      ]);
+      const transaction = <T>(operation: () => Promise<T>) =>
+        mongoose.connection.transaction(operation);
+      const identity = {
+        userId: OWNER,
+        conversationId: 'conversation-cleanup-1',
+        responseMessageId: 'native-answer',
+        streamId: 'cleanup-stream',
+        jobCreatedAt: 1,
+        logicalTurnId: 'cleanup-logical-turn',
+        revision: 1,
+        invocationId: 'cleanup-invocation',
+        bodySha256: HASH_A,
+        providerId: 'synthetic-provider',
+        agentId: 'synthetic-agent',
+        originSha256: HASH_B,
+        source: await methods.captureNativeResponseSource(
+          OWNER,
+          'conversation-cleanup-1',
+          'native-parent',
+        ),
+        admittedAt: Date.now(),
+        recoverUntil: Date.now() + 86_400_000,
+      };
+      await methods.admitNativeResponse(identity, transaction);
+      await models.Message.collection.updateOne(
+        { user: OWNER, messageId: 'native-answer' },
+        { $set: { updatedAt: new Date('2026-08-25T15:00:00.000Z') } },
+      );
+      const retire = jest.fn(async () => undefined);
+      const revoke = jest.fn(async () => ({ status: 'revoked' as const }));
+      mutateMessageSources.mockImplementation((filter, mutate, kind) =>
+        methods.mutateNativeResponseSources(filter, mutate, revoke, transaction, retire, kind),
+      );
+      const repository = createMongoPersonalAccountCleanupRepository({
+        Message: models.Message,
+        Conversation: models.Conversation,
+        ledger,
+        mutateMessageSources,
+      });
+      const source = await repository.readActiveTarget('message', OWNER, 'native-answer');
+      if (sourceState === 'stale') {
+        await models.Message.updateOne(
+          { user: OWNER, messageId: 'native-answer' },
+          { $set: { text: 'newer genuine correction' } },
+        );
+      }
+      const before = await models.Message.collection.findOne({
+        user: OWNER,
+        messageId: 'native-answer',
+      });
+      const result = await repository.applyTombstone({
+        source: source!,
+        operationId: OPERATION,
+        ownerScopeHash: ownerScopeSha256(OWNER),
+        reviewBindingSha256: HASH_A,
+        preimageSha256: cleanupStateSha256(source!),
+        runNonceHash: `sha256:${HASH_B}`,
+        tombstonedAt: AT,
+      });
+      if (sourceState === 'current') {
+        expect(result).toEqual({ applied: true, revision: 1, tombstonedAt: AT });
+        expect(retire).toHaveBeenCalledWith(
+          expect.objectContaining({ invocationId: 'cleanup-invocation' }),
+        );
+        expect(await repository.readActiveTarget('message', OWNER, 'native-answer')).toBeNull();
+      } else {
+        expect(result).toEqual({ applied: false, revision: 0, tombstonedAt: AT });
+        expect(retire).not.toHaveBeenCalled();
+        expect(revoke).not.toHaveBeenCalled();
+        expect(
+          await models.Message.collection.findOne({ user: OWNER, messageId: 'native-answer' }),
+        ).toEqual(before);
+      }
+    },
+  );
+
   test('conversation tombstone scrubs private configuration only after children are gone', async () => {
     await models.Conversation.create({
       conversationId: 'conversation-cleanup-1',
@@ -217,6 +334,7 @@ describe('Mongo personal-account cleanup repository', () => {
       Message: models.Message,
       Conversation: models.Conversation,
       ledger,
+      mutateMessageSources,
     });
     const source = await repository.readActiveTarget(
       'conversation',
@@ -234,6 +352,7 @@ describe('Mongo personal-account cleanup repository', () => {
     });
 
     expect(result.applied).toBe(true);
+    expect(mutateMessageSources).not.toHaveBeenCalled();
     const retained = await models.Conversation.collection.findOne({
       user: OWNER,
       conversationId: 'conversation-cleanup-1',
@@ -274,6 +393,7 @@ describe('Mongo personal-account cleanup repository', () => {
       Message: models.Message,
       Conversation: models.Conversation,
       ledger,
+      mutateMessageSources,
     });
 
     await expect(
@@ -302,6 +422,7 @@ describe('Mongo personal-account cleanup repository', () => {
       Message: models.Message,
       Conversation: models.Conversation,
       ledger,
+      mutateMessageSources,
     });
     const binding = {
       operationId: OPERATION,
@@ -337,6 +458,7 @@ describe('Mongo personal-account cleanup repository', () => {
       Message: models.Message,
       Conversation: models.Conversation,
       ledger,
+      mutateMessageSources,
     });
 
     await expect(repository.listOperationTombstones(OWNER, OPERATION)).resolves.toEqual([]);

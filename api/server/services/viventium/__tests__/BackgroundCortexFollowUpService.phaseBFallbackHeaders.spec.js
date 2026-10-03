@@ -227,7 +227,8 @@ describe('Phase B follow-up carrier', () => {
       'X-Viventium-Visible-Message-Chain-B64': Buffer.from(
         JSON.stringify([{ id: 'user-1' }, { id: 'assistant-1' }, { id: 'user-2' }]),
       ).toString('base64'),
-      'X-GlassHive-Developer-Instruction-Tail-B64': Buffer.from('Main-only tail').toString('base64'),
+      'X-GlassHive-Developer-Instruction-Tail-B64':
+        Buffer.from('Main-only tail').toString('base64'),
     };
     try {
       const req = {
@@ -279,8 +280,7 @@ describe('Phase B follow-up carrier', () => {
         parentMessageId: 'msg-1',
       });
       expect(createRun).toHaveBeenCalledTimes(1);
-      const headers =
-        createRun.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders;
+      const headers = createRun.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders;
       const sent = Object.keys(headers).map((name) => name.toLowerCase());
       for (const name of Object.keys(mainTurnBinding)) {
         expect(sent).not.toContain(name.toLowerCase());

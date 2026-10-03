@@ -245,7 +245,13 @@ const {
   isBackgroundCortexCancellationSignal,
 } = require('~/server/services/BackgroundCortexService');
 const { Run, createContentAggregator } = require('@librechat/agents');
-const { initializeAgent, initializeAnthropic, initializeOpenAI, createRun, checkAccess } = require('@librechat/api');
+const {
+  initializeAgent,
+  initializeAnthropic,
+  initializeOpenAI,
+  createRun,
+  checkAccess,
+} = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { getAppConfig } = require('~/server/services/Config/app');
 const { loadAgent } = require('~/models/Agent');
@@ -1158,32 +1164,55 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
   test.each([
     ['anthropic', 'claude-opus-5-5'],
     ['openai', 'gpt-6.1-sol'],
-  ])('preserves configured high effort through the %s activation recovery initializer', async (provider, model) => {
-    Run.create
-      .mockRejectedValueOnce(Object.assign(new Error('Provider unavailable'), { status: 503 }))
-      .mockResolvedValueOnce({ processStream: jest.fn(async () => JSON.stringify({
-        should_activate: true, confidence: 0.9, reason: 'configured recovery',
-      })) });
-    const result = await checkCortexActivation({
-      cortexConfig: { agent_id: 'recovery-cortex', activation: {
-        enabled: true, provider: 'groq', model: 'qwen/qwen3.6-27b',
-        fallbacks: [{ provider, model, reasoning_effort: 'high' }],
-        prompt: 'Activate for a relevant request.',
-      } },
-      messages: [{ role: 'user', content: 'Review the evidence.' }],
-      runId: `run-configured-${provider}-effort`,
-      req: { body: {}, user: { id: 'recovery-owner', role: 'USER' }, config: {} },
-    });
-    const initializer = provider === 'anthropic' ? initializeAnthropic : initializeOpenAI;
-    const parameters = initializer.mock.calls.at(-1)[0].model_parameters;
-    expect(parameters).toMatchObject(provider === 'anthropic'
-      ? { model, effort: 'high', thinking: true }
-      : { model, reasoning_effort: 'high' });
-    expect(parameters).not.toHaveProperty('maxOutputTokens');
-    expect(parameters).not.toHaveProperty('max_output_tokens');
-    expect(result).toMatchObject({ providerUsed: provider, modelUsed: model, reasoningEffortUsed: 'high' });
-    expect(result.providerAttempts.at(-1)).toMatchObject({ reasoning_effort: 'high', status: 'completed' });
-  });
+  ])(
+    'preserves configured high effort through the %s activation recovery initializer',
+    async (provider, model) => {
+      Run.create
+        .mockRejectedValueOnce(Object.assign(new Error('Provider unavailable'), { status: 503 }))
+        .mockResolvedValueOnce({
+          processStream: jest.fn(async () =>
+            JSON.stringify({
+              should_activate: true,
+              confidence: 0.9,
+              reason: 'configured recovery',
+            }),
+          ),
+        });
+      const result = await checkCortexActivation({
+        cortexConfig: {
+          agent_id: 'recovery-cortex',
+          activation: {
+            enabled: true,
+            provider: 'groq',
+            model: 'qwen/qwen3.6-27b',
+            fallbacks: [{ provider, model, reasoning_effort: 'high' }],
+            prompt: 'Activate for a relevant request.',
+          },
+        },
+        messages: [{ role: 'user', content: 'Review the evidence.' }],
+        runId: `run-configured-${provider}-effort`,
+        req: { body: {}, user: { id: 'recovery-owner', role: 'USER' }, config: {} },
+      });
+      const initializer = provider === 'anthropic' ? initializeAnthropic : initializeOpenAI;
+      const parameters = initializer.mock.calls.at(-1)[0].model_parameters;
+      expect(parameters).toMatchObject(
+        provider === 'anthropic'
+          ? { model, effort: 'high', thinking: true }
+          : { model, reasoning_effort: 'high' },
+      );
+      expect(parameters).not.toHaveProperty('maxOutputTokens');
+      expect(parameters).not.toHaveProperty('max_output_tokens');
+      expect(result).toMatchObject({
+        providerUsed: provider,
+        modelUsed: model,
+        reasoningEffortUsed: 'high',
+      });
+      expect(result.providerAttempts.at(-1)).toMatchObject({
+        reasoning_effort: 'high',
+        status: 'completed',
+      });
+    },
+  );
 
   test('carries the connected-account OpenAI backend and recovery adapter into activation inference', async () => {
     const subscriptionFetch = jest.fn();

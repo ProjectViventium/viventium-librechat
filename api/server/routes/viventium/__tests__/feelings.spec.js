@@ -45,6 +45,8 @@ const snapshot = {
 };
 
 jest.mock('@librechat/api', () => ({
+  getTrustedInteractionContext: jest.requireActual('@librechat/api').getTrustedInteractionContext,
+  fingerprintTraceReference: jest.requireActual('@librechat/api').fingerprintTraceReference,
   FEELING_BANDS: definitions,
   FEELING_BAND_IDS: definitions.map((definition) => definition.id),
   FEELING_LEVEL_IDS: ['level_0', 'level_1', 'level_2', 'level_3', 'level_4'],
@@ -74,6 +76,7 @@ jest.mock('~/server/middleware', () => ({
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
 }));
 

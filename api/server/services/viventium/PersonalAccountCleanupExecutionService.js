@@ -87,6 +87,8 @@ function buildExecutor() {
     Message,
     Conversation,
     ledger,
+    mutateMessageSources: (filter, mutate, kind) =>
+      require('./nativeResponseService').mutateNativeResponseSources(filter, mutate, kind),
   });
   const cleanup = createPersonalAccountCleanupService({
     repository,

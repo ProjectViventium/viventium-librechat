@@ -3556,13 +3556,20 @@ router.post('/tasks/:taskId/input', voiceSessionCapabilityAuth, async (req, res)
     return res.status(400).json({ error: 'input is required' });
   }
   const binding = createVoiceWorkAuthorityBinding({
-    session: req.viventiumCallSession, segments: [], typedInput: { kind: 'participant_text' },
+    session: req.viventiumCallSession,
+    segments: [],
+    typedInput: { kind: 'participant_text' },
   });
   const result = await submitVoiceTaskInput(task.taskId, req.body.input, {
     userId: req.user?.id,
-    ...(binding ? { voiceAuthorityContext: {
-      callSessionId: req.viventiumCallSession.callSessionId, binding,
-    } } : {}),
+    ...(binding
+      ? {
+          voiceAuthorityContext: {
+            callSessionId: req.viventiumCallSession.callSessionId,
+            binding,
+          },
+        }
+      : {}),
   });
   if (!result.ok) {
     const status = result.code === 'owner_input_failed' ? 503 : 409;
@@ -3804,7 +3811,10 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
       enqueueOutput(async () => {
         const suppressed = await outputIsSuppressed();
         if (voiceTask && !suppressed) {
-          failVoiceTask(voiceTask.taskId, errorClass ? { code: errorClass, message: error } : error);
+          failVoiceTask(
+            voiceTask.taskId,
+            errorClass ? { code: errorClass, message: error } : error,
+          );
         }
         if (!res.writableEnded) {
           if (!suppressed) {

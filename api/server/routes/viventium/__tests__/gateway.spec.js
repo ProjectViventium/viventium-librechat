@@ -1835,5 +1835,4 @@ describe('/api/viventium/gateway', () => {
     },
   );
   /* === VIVENTIUM END === */
-
 });

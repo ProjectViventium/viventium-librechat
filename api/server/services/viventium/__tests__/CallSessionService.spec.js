@@ -1851,7 +1851,9 @@ describe('CallSessionService', () => {
         livekitPlayground: { tts: { provider: 'xai', variant: 'Sal' } },
       },
     });
-    expect(await resolveUserVoiceRoute(user._id.toString(), { includeSources: true })).toMatchObject({
+    expect(
+      await resolveUserVoiceRoute(user._id.toString(), { includeSources: true }),
+    ).toMatchObject({
       stt: {
         provider: 'assemblyai',
         variant: 'universal-streaming-multilingual',
@@ -1861,11 +1863,18 @@ describe('CallSessionService', () => {
     });
     await User.updateOne(
       { _id: user._id },
-      { $set: { 'viventiumVoicePreferences.livekitPlayground.stt': {
-        provider: 'openai', variant: 'whisper-1',
-      } } },
+      {
+        $set: {
+          'viventiumVoicePreferences.livekitPlayground.stt': {
+            provider: 'openai',
+            variant: 'whisper-1',
+          },
+        },
+      },
     );
-    expect(await resolveUserVoiceRoute(user._id.toString(), { includeSources: true })).toMatchObject({
+    expect(
+      await resolveUserVoiceRoute(user._id.toString(), { includeSources: true }),
+    ).toMatchObject({
       stt: { provider: 'openai', variant: 'whisper-1', source: 'saved' },
     });
     expect(await resolveUserVoiceRoute(user._id.toString())).toMatchObject({
@@ -2162,8 +2171,9 @@ describe('CallSessionService', () => {
       ]),
     );
     expect(created.contextualKeyterms).toHaveLength(3);
-    expect(await resolveVoiceContextKeyterms({ userId: user._id.toString(), conversationId }))
-      .toEqual(created.contextualKeyterms);
+    expect(
+      await resolveVoiceContextKeyterms({ userId: user._id.toString(), conversationId }),
+    ).toEqual(created.contextualKeyterms);
     expect(created.contextualKeyterms.join(' ')).not.toContain('Other Owner');
     expect(created.contextualKeyterms.join(' ')).not.toContain('not-forwarded');
     expect((await getCallSession(created.callSessionId)).contextualKeyterms).toEqual(
@@ -2233,14 +2243,33 @@ describe('CallSessionService', () => {
   });
 
   test('shared voice keyterms require an existing owner conversation', async () => {
-    const owner = await User.create({ name: 'Owner', email: 'owner-keyterms@example.com', provider: 'local' });
-    const foreign = await User.create({ name: 'Foreign', email: 'foreign-keyterms@example.com', provider: 'local' });
-    await Conversation.create({ conversationId: 'foreign-keyterm-conversation',
-      user: foreign._id.toString(), endpoint: 'agents', files: [] });
+    const owner = await User.create({
+      name: 'Owner',
+      email: 'owner-keyterms@example.com',
+      provider: 'local',
+    });
+    const foreign = await User.create({
+      name: 'Foreign',
+      email: 'foreign-keyterms@example.com',
+      provider: 'local',
+    });
+    await Conversation.create({
+      conversationId: 'foreign-keyterm-conversation',
+      user: foreign._id.toString(),
+      endpoint: 'agents',
+      files: [],
+    });
     const nativeLookup = jest.spyOn(Message, 'find');
     try {
-      for (const conversationId of ['', 'new', 'missing-keyterm-conversation', 'foreign-keyterm-conversation']) {
-        expect(await resolveVoiceContextKeyterms({ userId: owner._id.toString(), conversationId })).toEqual([]);
+      for (const conversationId of [
+        '',
+        'new',
+        'missing-keyterm-conversation',
+        'foreign-keyterm-conversation',
+      ]) {
+        expect(
+          await resolveVoiceContextKeyterms({ userId: owner._id.toString(), conversationId }),
+        ).toEqual([]);
       }
       expect(nativeLookup).not.toHaveBeenCalled();
     } finally {
@@ -2249,11 +2278,23 @@ describe('CallSessionService', () => {
   });
 
   test('shared voice keyterms return empty for an owned empty conversation', async () => {
-    const owner = await User.create({ name: 'Empty', email: 'empty-keyterms@example.com', provider: 'local' });
-    await Conversation.create({ conversationId: 'empty-keyterm-conversation',
-      user: owner._id.toString(), endpoint: 'agents', files: [] });
-    expect(await resolveVoiceContextKeyterms({ userId: owner._id.toString(),
-      conversationId: 'empty-keyterm-conversation' })).toEqual([]);
+    const owner = await User.create({
+      name: 'Empty',
+      email: 'empty-keyterms@example.com',
+      provider: 'local',
+    });
+    await Conversation.create({
+      conversationId: 'empty-keyterm-conversation',
+      user: owner._id.toString(),
+      endpoint: 'agents',
+      files: [],
+    });
+    expect(
+      await resolveVoiceContextKeyterms({
+        userId: owner._id.toString(),
+        conversationId: 'empty-keyterm-conversation',
+      }),
+    ).toEqual([]);
   });
 
   test('resolves only one exact owner/conversation session with a current gateway lease', async () => {

@@ -429,90 +429,185 @@ test('failed projection leaves no partial public completion; a later explicit ed
   expect(mockJobs.finishNativeResponse).not.toHaveBeenCalled();
 });
 
-
-describe.each([false, true])('capable fallback identity after initial noncapable route (prepared: %s)', (prepared) => {
-  test.each([
-    ['voice', 'Text kept on resume.', 'Text kept on resume.'],
-    ['telegram', 'Text kept on resume.', 'Text kept on resume.'],
-    ['voice loop_skip', '{NTA}', ''],
-  ])('preserves model Skip during interrupted %s recovery and resume', async (label, text, visibleText) => {
-    const surface = label === 'voice loop_skip' ? 'voice' : label;
-    const { setTrustedInteractionContext } = jest.requireActual('@librechat/api');
-    const req = { user: { id: user },
-      body: { voiceMode: surface === 'voice', viventiumSurface: surface,
-        telegramAudioRequested: surface === 'telegram' },
-      _viventiumTelegram: surface === 'telegram',
-      viventiumCallSession: surface === 'voice' ? { callSessionId: 'synthetic-call' } : undefined,
-      _viventiumDeliveryDispositionRequired: false,
-      _resumableStreamId: identity.streamId,
-      _viventiumNativeResponseSource: { conversationId: identity.conversationId,
-        responseMessageId: identity.responseMessageId, proof: identity.source },
-      config: { endpoints: { agents: { providerCapabilities: { native: {
-        conversation_session: true, workspace_binding: true,
-        messaging_delivery_disposition: true, messaging_delivery_disposition_version: 1,
-      } } } } },
-    };
-    setTrustedInteractionContext(req, { actor_kind: 'external_user', origin: 'interactive',
-      surface, source_event_id: 'question', logical_turn_id: 'logical', revision: 1 });
-    mockJobs.getJob.mockResolvedValue({ createdAt: identity.jobCreatedAt });
-    wrapNativeResponseFetch(req, 'main', jest.fn(), { endpoint: 'native', agentId: 'main' });
-    const bound = await mockResolveFetchIdentity();
-    expect(bound.deliveryDispositionRequired).toBe(true);
-    expect(req._viventiumDeliveryDispositionRequired).toBe(false);
-    identity = { ...identity, ...bound };
-    const response = { id: 'native-request', object: 'chat.completion', choices: [{
-      finish_reason: 'stop', message: { role: 'assistant', content: text,
-        provider_specific_fields: { viventium: { delivery_disposition: modelDisposition('skip') } },
+describe.each([false, true])(
+  'capable fallback identity after initial noncapable route (prepared: %s)',
+  (prepared) => {
+    test.each([
+      ['voice', 'Text kept on resume.', 'Text kept on resume.'],
+      ['telegram', 'Text kept on resume.', 'Text kept on resume.'],
+      ['voice loop_skip', '{NTA}', ''],
+    ])(
+      'preserves model Skip during interrupted %s recovery and resume',
+      async (label, text, visibleText) => {
+        const surface = label === 'voice loop_skip' ? 'voice' : label;
+        const { setTrustedInteractionContext } = jest.requireActual('@librechat/api');
+        const req = {
+          user: { id: user },
+          body: {
+            voiceMode: surface === 'voice',
+            viventiumSurface: surface,
+            telegramAudioRequested: surface === 'telegram',
+          },
+          _viventiumTelegram: surface === 'telegram',
+          viventiumCallSession:
+            surface === 'voice' ? { callSessionId: 'synthetic-call' } : undefined,
+          _viventiumDeliveryDispositionRequired: false,
+          _resumableStreamId: identity.streamId,
+          _viventiumNativeResponseSource: {
+            conversationId: identity.conversationId,
+            responseMessageId: identity.responseMessageId,
+            proof: identity.source,
+          },
+          config: {
+            endpoints: {
+              agents: {
+                providerCapabilities: {
+                  native: {
+                    conversation_session: true,
+                    workspace_binding: true,
+                    messaging_delivery_disposition: true,
+                    messaging_delivery_disposition_version: 1,
+                  },
+                },
+              },
+            },
+          },
+        };
+        setTrustedInteractionContext(req, {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface,
+          source_event_id: 'question',
+          logical_turn_id: 'logical',
+          revision: 1,
+        });
+        mockJobs.getJob.mockResolvedValue({ createdAt: identity.jobCreatedAt });
+        wrapNativeResponseFetch(req, 'main', jest.fn(), { endpoint: 'native', agentId: 'main' });
+        const bound = await mockResolveFetchIdentity();
+        expect(bound.deliveryDispositionRequired).toBe(true);
+        expect(req._viventiumDeliveryDispositionRequired).toBe(false);
+        identity = { ...identity, ...bound };
+        const response = {
+          id: 'native-request',
+          object: 'chat.completion',
+          choices: [
+            {
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: text,
+                provider_specific_fields: {
+                  viventium: { delivery_disposition: modelDisposition('skip') },
+                },
+              },
+            },
+          ],
+        };
+        const result = {
+          version: 1,
+          object: 'glasshive.request.result',
+          state: 'completed',
+          invocation_id: identity.invocationId,
+          stream_id: identity.streamId,
+          message_id: identity.responseMessageId,
+          body_sha256: identity.bodySha256,
+          authority_sha256: 'a'.repeat(64),
+          agent_id: identity.agentId,
+          conversation_id: identity.conversationId,
+          request_id: response.id,
+          run_id: 'native-run',
+          response,
+        };
+        const fetchResult = jest.fn(
+          async () => new Response(JSON.stringify(result), { status: 200 }),
+        );
+        const recovery = createNativeResponseRecoveryService({
+          db: methods,
+          transaction,
+          commit,
+          bind: async () => true,
+          revoke: async () => ({ status: 'revoked' }),
+          resolveRoute: async () => ({ baseURL: 'http://native.test/v1', headers: {} }),
+          fetch: fetchResult,
+          projectMessage,
+        });
+        await recovery.admit(identity);
+        if (prepared)
+          await methods.prepareNativeResponse(
+            identity,
+            {
+              text: response.choices[0].message.content,
+              authoritySha256: result.authority_sha256,
+              requestId: response.id,
+              runId: result.run_id,
+              responseJson: JSON.stringify(response),
+            },
+            transaction,
+          );
+        const recovered = await recovery.recover(identity);
+        expect(recovered.text).toBe(visibleText);
+        expect(recovered.metadata.viventium.deliveryDisposition).toEqual(modelDisposition('skip'));
+        const resumed = await recovery.projectForTransmit(identity, recovered);
+        expect(resumed.metadata.viventium.deliveryDisposition).toEqual(modelDisposition('skip'));
+        expect(resumed.text).toBe(visibleText);
+        const durable = await methods.getNativeResponse(user, 'answer');
+        expect(durable.nativeResponse.deliveryDispositionRequired).toBe(true);
+        expect(durable.metadata.viventium.deliveryDisposition).toEqual(modelDisposition('skip'));
+        expect(fetchResult).toHaveBeenCalledTimes(prepared ? 0 : 1);
       },
-    }] };
-    const result = { version: 1, object: 'glasshive.request.result', state: 'completed',
-      invocation_id: identity.invocationId, stream_id: identity.streamId,
-      message_id: identity.responseMessageId, body_sha256: identity.bodySha256,
-      authority_sha256: 'a'.repeat(64), agent_id: identity.agentId,
-      conversation_id: identity.conversationId, request_id: response.id, run_id: 'native-run', response };
-    const fetchResult = jest.fn(async () => new Response(JSON.stringify(result), { status: 200 }));
-    const recovery = createNativeResponseRecoveryService({ db: methods, transaction, commit,
-      bind: async () => true, revoke: async () => ({ status: 'revoked' }),
-      resolveRoute: async () => ({ baseURL: 'http://native.test/v1', headers: {} }),
-      fetch: fetchResult, projectMessage });
-    await recovery.admit(identity);
-    if (prepared) await methods.prepareNativeResponse(identity, { text: response.choices[0].message.content,
-      authoritySha256: result.authority_sha256, requestId: response.id, runId: result.run_id,
-      responseJson: JSON.stringify(response) }, transaction);
-    const recovered = await recovery.recover(identity);
-    expect(recovered.text).toBe(visibleText);
-    expect(recovered.metadata.viventium.deliveryDisposition).toEqual(modelDisposition('skip'));
-    const resumed = await recovery.projectForTransmit(identity, recovered);
-    expect(resumed.metadata.viventium.deliveryDisposition).toEqual(modelDisposition('skip'));
-    expect(resumed.text).toBe(visibleText);
-    const durable = await methods.getNativeResponse(user, 'answer');
-    expect(durable.nativeResponse.deliveryDispositionRequired).toBe(true);
-    expect(durable.metadata.viventium.deliveryDisposition).toEqual(modelDisposition('skip'));
-    expect(fetchResult).toHaveBeenCalledTimes(prepared ? 0 : 1);
-  });
-});
-
+    );
+  },
+);
 
 test.each([
   ['current noncapable route', true, false, false],
   ['voice audio not requested', false, true, false],
   ['current capable route with audio', true, true, true],
-])('native identity uses %s instead of an earlier route flag', async (_label, audioRequested, capable, expected) => {
-  const { setTrustedInteractionContext } = jest.requireActual('@librechat/api');
-  const req = { user: { id: user }, body: { voiceMode: audioRequested },
-    viventiumCallSession: { callSessionId: 'synthetic-call' },
-    _viventiumDeliveryDispositionRequired: !expected, _resumableStreamId: identity.streamId,
-    _viventiumNativeResponseSource: { conversationId: identity.conversationId,
-      responseMessageId: identity.responseMessageId, proof: identity.source },
-    config: { endpoints: { agents: { providerCapabilities: { native: {
-      conversation_session: true, workspace_binding: true,
-      ...(capable ? { messaging_delivery_disposition: true, messaging_delivery_disposition_version: 1 } : {}),
-    } } } } },
-  };
-  setTrustedInteractionContext(req, { actor_kind: 'external_user', origin: 'interactive',
-    surface: 'voice', source_event_id: 'question', logical_turn_id: 'logical', revision: 1 });
-  mockJobs.getJob.mockResolvedValue({ createdAt: identity.jobCreatedAt });
-  wrapNativeResponseFetch(req, 'main', jest.fn(), { endpoint: 'native', agentId: 'main' });
-  expect((await mockResolveFetchIdentity()).deliveryDispositionRequired).toBe(expected);
-  expect(req._viventiumDeliveryDispositionRequired).toBe(!expected);
-});
+])(
+  'native identity uses %s instead of an earlier route flag',
+  async (_label, audioRequested, capable, expected) => {
+    const { setTrustedInteractionContext } = jest.requireActual('@librechat/api');
+    const req = {
+      user: { id: user },
+      body: { voiceMode: audioRequested },
+      viventiumCallSession: { callSessionId: 'synthetic-call' },
+      _viventiumDeliveryDispositionRequired: !expected,
+      _resumableStreamId: identity.streamId,
+      _viventiumNativeResponseSource: {
+        conversationId: identity.conversationId,
+        responseMessageId: identity.responseMessageId,
+        proof: identity.source,
+      },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              native: {
+                conversation_session: true,
+                workspace_binding: true,
+                ...(capable
+                  ? {
+                      messaging_delivery_disposition: true,
+                      messaging_delivery_disposition_version: 1,
+                    }
+                  : {}),
+              },
+            },
+          },
+        },
+      },
+    };
+    setTrustedInteractionContext(req, {
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'voice',
+      source_event_id: 'question',
+      logical_turn_id: 'logical',
+      revision: 1,
+    });
+    mockJobs.getJob.mockResolvedValue({ createdAt: identity.jobCreatedAt });
+    wrapNativeResponseFetch(req, 'main', jest.fn(), { endpoint: 'native', agentId: 'main' });
+    expect((await mockResolveFetchIdentity()).deliveryDispositionRequired).toBe(expected);
+    expect(req._viventiumDeliveryDispositionRequired).toBe(!expected);
+  },
+);

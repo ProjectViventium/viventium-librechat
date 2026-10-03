@@ -39,6 +39,7 @@ describe('glassHiveOrchestrationTools', () => {
     expect(definitions[0].parameters.properties.profile.enum).toEqual([
       'codex-cli',
       'claude-code',
+      'grok-build',
       'openclaw-general',
     ]);
     expect(definitions[0].parameters.properties.resourceClass.enum).toEqual(['standard', 'light']);

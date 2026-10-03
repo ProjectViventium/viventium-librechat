@@ -28,6 +28,9 @@ type ReadyScheduleCleanupAdapter = ScheduleCleanupAdapter & { assertReady(): voi
 export interface PersonalAccountCleanupRuntimeDependencies {
   Message: MessageModel;
   Conversation: ConversationModel;
+  mutateMessageSources: Parameters<
+    typeof createMongoPersonalAccountCleanupRepository
+  >[0]['mutateMessageSources'];
   MemoryEntry: MemoryModel;
   receiptModel: ViventiumPersonalAccountCleanupReceiptModel;
   verifyRecoveryReceipt: CleanupRecoveryVerifier;
@@ -86,6 +89,7 @@ export function createPersonalAccountCleanupRuntime(
     repository: createMongoPersonalAccountCleanupRepository({
       Message: dependencies.Message,
       Conversation: dependencies.Conversation,
+      mutateMessageSources: dependencies.mutateMessageSources,
       ledger,
     }),
     search: dependencies.search,

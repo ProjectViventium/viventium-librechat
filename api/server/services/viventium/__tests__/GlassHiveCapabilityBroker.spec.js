@@ -2399,7 +2399,9 @@ describe('GlassHive capability broker', () => {
     expect(result.bootstrap_bundle_json.glasshive_capability_broker.allowed_host_tools).toEqual([
       'file_search',
     ]);
-    expect(result.bootstrap_bundle_json.glasshive_capability_broker.status).toBe('pending_admission');
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker.status).toBe(
+      'pending_admission',
+    );
     expect(result.bootstrap_bundle_json.env?.GLASSHIVE_CAPABILITY_BROKER_TOKEN).toBeUndefined();
     expect(result.bootstrap_bundle_json.claude_settings_local?.permissions?.allow).toEqual([
       'mcp__glasshive-user-capabilities__file_search',
@@ -3670,7 +3672,9 @@ describe('Claude exact granted host read permissions', () => {
   test.each(['Bootstrap', 'Broker'])('supports the existing %s-first import order', (first) => {
     jest.isolateModules(() => {
       require(`../GlassHiveCapability${first}Service`);
-      const { mergeBrokerBundle: initializedMerge } = require('../GlassHiveCapabilityBootstrapService');
+      const {
+        mergeBrokerBundle: initializedMerge,
+      } = require('../GlassHiveCapabilityBootstrapService');
       const bundle = initializedMerge({
         existingBundle: {},
         brokerUrl: 'http://localhost:9000/broker',

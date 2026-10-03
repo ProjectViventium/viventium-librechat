@@ -407,15 +407,24 @@ describe('/api/viventium/calls', () => {
     const app = express();
     app.use(express.json());
     app.use('/api/viventium/calls', require('../calls'));
-    await request(app).post('/api/viventium/calls').send({
-      conversationId: 'conversation-existing', agentId: 'agent_selected',
-    }).expect(200);
-    expect(mockAssertVoiceAgentAccess).toHaveBeenNthCalledWith(1,
-      expect.objectContaining({ agentId: 'agent_previous' }));
-    expect(mockAssertVoiceAgentAccess).toHaveBeenNthCalledWith(2,
-      expect.objectContaining({ agentId: 'agent_selected' }));
-    expect(require('~/server/services/viventium/CallSessionService').createCallSession)
-      .toHaveBeenCalledWith(expect.objectContaining({ agentId: 'agent_selected' }));
+    await request(app)
+      .post('/api/viventium/calls')
+      .send({
+        conversationId: 'conversation-existing',
+        agentId: 'agent_selected',
+      })
+      .expect(200);
+    expect(mockAssertVoiceAgentAccess).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ agentId: 'agent_previous' }),
+    );
+    expect(mockAssertVoiceAgentAccess).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ agentId: 'agent_selected' }),
+    );
+    expect(
+      require('~/server/services/viventium/CallSessionService').createCallSession,
+    ).toHaveBeenCalledWith(expect.objectContaining({ agentId: 'agent_selected' }));
   });
 
   test('POST fails closed when the configured playground has no listener', async () => {
@@ -1012,23 +1021,37 @@ describe('/api/viventium/calls', () => {
 
   test('JWT owner explicitly saves the persisted call choices as account defaults', async () => {
     const service = require('~/server/services/viventium/CallSessionService');
-    const route = { stt: { provider: 'assemblyai', variant: 'u3-rt-pro' },
-      tts: { provider: 'xai', variant: 'eve' } };
-    service.getCallSession.mockResolvedValue({ callSessionId: 'call_session_test',
-      userId: 'user_1', requestedVoiceRoute: route });
+    const route = {
+      stt: { provider: 'assemblyai', variant: 'u3-rt-pro' },
+      tts: { provider: 'xai', variant: 'eve' },
+    };
+    service.getCallSession.mockResolvedValue({
+      callSessionId: 'call_session_test',
+      userId: 'user_1',
+      requestedVoiceRoute: route,
+    });
     const app = express();
     app.use(express.json());
     app.use('/api/viventium/calls', require('../calls'));
-    await request(app).post('/api/viventium/calls/call_session_test/voice-defaults')
-      .send({ requestedVoiceRoute: { stt: { provider: 'untrusted' } } }).expect(200);
+    await request(app)
+      .post('/api/viventium/calls/call_session_test/voice-defaults')
+      .send({ requestedVoiceRoute: { stt: { provider: 'untrusted' } } })
+      .expect(200);
     expect(service.updateCallSessionVoiceSettings).toHaveBeenCalledWith(
-      expect.objectContaining({ requestedVoiceRoute: route, persistToUserDefaults: true, touch: false }),
+      expect.objectContaining({
+        requestedVoiceRoute: route,
+        persistToUserDefaults: true,
+        touch: false,
+      }),
     );
   });
 
   test('account defaults cannot be saved from another owner call', async () => {
     const service = require('~/server/services/viventium/CallSessionService');
-    service.getCallSession.mockResolvedValue({ callSessionId: 'call_session_test', userId: 'other' });
+    service.getCallSession.mockResolvedValue({
+      callSessionId: 'call_session_test',
+      userId: 'other',
+    });
     const app = express();
     app.use(express.json());
     app.use('/api/viventium/calls', require('../calls'));

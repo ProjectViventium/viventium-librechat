@@ -1090,6 +1090,9 @@ describe('GlassHiveMissionAdjudicationService', () => {
         message: {
           messageId: first.followUpMessageId,
           text: first.followUpText,
+          user: first.ownerId,
+          conversationId: first.accountContinuationConversationId || first.conversationId,
+          isCreatedByUser: false,
         },
       }),
     );
@@ -1831,7 +1834,13 @@ describe('GlassHiveMissionAdjudicationService', () => {
     expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
     expect(mockEnqueueDelivery).toHaveBeenCalledWith(
       expect.objectContaining({
-        message: { messageId: 'already-authored-result', text: 'The useful guide is ready.' },
+        message: {
+          messageId: 'already-authored-result',
+          text: 'The useful guide is ready.',
+          user: retained.ownerId,
+          conversationId: retained.accountContinuationConversationId || retained.conversationId,
+          isCreatedByUser: false,
+        },
         deliveryContext: expect.objectContaining({
           destinations: [telegram, { surface: 'librechat' }],
         }),
@@ -2503,6 +2512,9 @@ describe('GlassHiveMissionAdjudicationService', () => {
         message: {
           messageId: 'follow-up-1',
           text: 'Main-authored synthetic follow-up.',
+          user: retry.ownerId,
+          conversationId: retry.accountContinuationConversationId || retry.conversationId,
+          isCreatedByUser: false,
         },
       }),
     );
@@ -2635,7 +2647,13 @@ describe('GlassHiveMissionAdjudicationService', () => {
       expect(mockFind.mock.results[0].value.limit).toHaveBeenCalledWith(7);
       expect(mockEnqueueDelivery).toHaveBeenCalledWith(
         expect.objectContaining({
-          message: { messageId: completed.followUpMessageId, text: completed.followUpText },
+          message: {
+            messageId: completed.followUpMessageId,
+            text: completed.followUpText,
+            user: completed.ownerId,
+            conversationId: completed.accountContinuationConversationId || completed.conversationId,
+            isCreatedByUser: false,
+          },
         }),
       );
       expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();

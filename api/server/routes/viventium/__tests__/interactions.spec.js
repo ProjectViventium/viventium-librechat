@@ -543,7 +543,10 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
       withEffect,
     );
     expect(withEffect.statusCode).toBe(400);
-    expect(withEffect.body).toEqual({ error: 'invalid_delivery_ack', field: 'cortex_presentation' });
+    expect(withEffect.body).toEqual({
+      error: 'invalid_delivery_ack',
+      field: 'cortex_presentation',
+    });
 
     mockAcknowledgeDelivery.mockResolvedValueOnce({ status: 'stale_revision' });
     const stale = response();

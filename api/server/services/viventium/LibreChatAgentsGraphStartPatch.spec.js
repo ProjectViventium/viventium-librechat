@@ -92,7 +92,6 @@ test('patch installs against the bundled LibreChat agents runtime', () => {
   expect(graph.getParallelGroupId('main____1')).toBe(1);
 });
 
-
 test('compiled adapter preserves actual installed streaming handoff messages as a paired result', () => {
   const { AIMessageChunk, HumanMessage, ToolMessage } = require('@langchain/core/messages');
   const agents = require('@librechat/agents');
@@ -100,18 +99,33 @@ test('compiled adapter preserves actual installed streaming handoff messages as 
   const graph = Object.create(agents.MultiAgentGraph.prototype);
   graph.agentContexts = new Map();
   const call = (id, from, to, content = '') => [
-    new AIMessageChunk({ id: id + '-ai', content,
-      tool_calls: [{ id, name: 'lc_transfer_to_' + to, args: {} }] }),
-    new ToolMessage({ id: id + '-tool', name: 'lc_transfer_to_' + to, tool_call_id: id,
-      content: 'Transferred.', additional_kwargs: {
-        handoff_source_agent_id: from, handoff_destination: to,
-      } }),
+    new AIMessageChunk({
+      id: id + '-ai',
+      content,
+      tool_calls: [{ id, name: 'lc_transfer_to_' + to, args: {} }],
+    }),
+    new ToolMessage({
+      id: id + '-tool',
+      name: 'lc_transfer_to_' + to,
+      tool_call_id: id,
+      content: 'Transferred.',
+      additional_kwargs: {
+        handoff_source_agent_id: from,
+        handoff_destination: to,
+      },
+    }),
   ];
-  const messages = [new HumanMessage({ id: 'user', content: 'Create and verify the scratch file.' }),
+  const messages = [
+    new HumanMessage({ id: 'user', content: 'Create and verify the scratch file.' }),
     ...call('consult', 'main', 'specialist'),
-    ...call('return', 'specialist', 'main', 'Created and verified Amber River, 11 bytes.')];
+    ...call('return', 'specialist', 'main', 'Created and verified Amber River, 11 bytes.'),
+  ];
   const context = graph.processHandoffReception(messages, 'main');
-  expect(context.filteredMessages.map((message) => message.getType())).toEqual(['human', 'ai', 'tool']);
+  expect(context.filteredMessages.map((message) => message.getType())).toEqual([
+    'human',
+    'ai',
+    'tool',
+  ]);
   expect(context.filteredMessages[1].tool_calls[0].id).toBe('consult');
   expect(context.filteredMessages[2].tool_call_id).toBe('consult');
   expect(context.filteredMessages[2].content).toBe('Created and verified Amber River, 11 bytes.');

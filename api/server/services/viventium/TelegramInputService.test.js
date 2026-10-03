@@ -339,14 +339,24 @@ test('a ready input waiting for Main preserves its conversation after releasing 
 });
 
 test('preparation group lookup binds owner, sender, chat, thread, source scope and exact conversation generation', async () => {
-  const group = { ...row, telegramChatId: 'chat', telegramMessageThreadId: 'thread',
-    conversationGeneration: 'generation', mediaGroupId: 'album' };
+  const group = {
+    ...row,
+    telegramChatId: 'chat',
+    telegramMessageThreadId: 'thread',
+    conversationGeneration: 'generation',
+    mediaGroupId: 'album',
+  };
   mockIngress.find.mockReturnValue({ sort: jest.fn().mockReturnValue({ lean: async () => [] }) });
   expect(await mockDependencies.repository.group(group)).toEqual([]);
   expect(mockIngress.find).toHaveBeenCalledWith({
-    libreChatUserId: 'owner', telegramUserId: 'sender', telegramChatId: 'chat',
-    telegramMessageThreadId: 'thread', sourceOrderScope: row.sourceOrderScope,
-    conversationGeneration: 'generation', conversationId: 'conversation', mediaGroupId: 'album',
+    libreChatUserId: 'owner',
+    telegramUserId: 'sender',
+    telegramChatId: 'chat',
+    telegramMessageThreadId: 'thread',
+    sourceOrderScope: row.sourceOrderScope,
+    conversationGeneration: 'generation',
+    conversationId: 'conversation',
+    mediaGroupId: 'album',
     inputState: { $in: ['preparing', 'failed'] },
     $expr: { $eq: ['$inputPrimarySourceEventId', '$sourceEventId'] },
   });

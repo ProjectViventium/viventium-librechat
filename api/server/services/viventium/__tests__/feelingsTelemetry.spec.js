@@ -12,41 +12,79 @@ const {
 describe('Feelings telemetry', () => {
   test('reports bounded reaction failure diagnostics and drops private exception text', () => {
     const logger = { error: jest.fn() };
-    logFeelingsEvent(logger, {}, 'feelings.reaction.failure', {
-      errorClass: 'reaction_failed', failureStage: 'request', errorType: 'TypeError',
-      message: 'PRIVATE-EXCEPTION-CANARY', stack: 'PRIVATE-STACK-CANARY',
-    }, 'error');
+    logFeelingsEvent(
+      logger,
+      {},
+      'feelings.reaction.failure',
+      {
+        errorClass: 'reaction_failed',
+        failureStage: 'request',
+        errorType: 'TypeError',
+        message: 'PRIVATE-EXCEPTION-CANARY',
+        stack: 'PRIVATE-STACK-CANARY',
+      },
+      'error',
+    );
     const messages = logger.error.mock.calls.map(([message]) => message);
-    const facts = Object.assign({}, ...messages.map(message => JSON.parse(message.replace('[VIVENTIUM][Feelings] ', ''))));
+    const facts = Object.assign(
+      {},
+      ...messages.map((message) => JSON.parse(message.replace('[VIVENTIUM][Feelings] ', ''))),
+    );
     expect(facts).toMatchObject({ failureStage: 'request', errorType: 'TypeError' });
     expect(messages.join('\n')).not.toContain('CANARY');
-    expect(messages.every(message => message.length <= 150)).toBe(true);
+    expect(messages.every((message) => message.length <= 150)).toBe(true);
   });
   test('joins trusted Voice Feelings events to the ledger without raw identifiers', () => {
     const logger = { info: jest.fn() };
-    const req = { id: 'http-request', body: { voiceMode: true, viventiumCallSessionId: 'PRIVATE-CALL-CANARY' } };
+    const req = {
+      id: 'http-request',
+      body: { voiceMode: true, viventiumCallSessionId: 'PRIVATE-CALL-CANARY' },
+    };
     setTrustedInteractionContext(req, {
-      actor_kind: 'external_user', origin: 'interactive', surface: 'voice',
-      conversation_id: 'synthetic-conversation', source_event_id: 'synthetic-source',
-      logical_turn_id: 'PRIVATE-TURN-CANARY', revision: 1,
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'voice',
+      conversation_id: 'synthetic-conversation',
+      source_event_id: 'synthetic-source',
+      logical_turn_id: 'PRIVATE-TURN-CANARY',
+      revision: 1,
     });
     logFeelingsEvent(logger, req, 'feelings.reaction.write', { version: 2, callRefHash: 'forged' });
     const messages = logger.info.mock.calls.map(([message]) => message);
-    const facts = Object.assign({}, ...messages.map(message => JSON.parse(message.replace('[VIVENTIUM][Feelings] ', ''))));
+    const facts = Object.assign(
+      {},
+      ...messages.map((message) => JSON.parse(message.replace('[VIVENTIUM][Feelings] ', ''))),
+    );
     expect(facts).toMatchObject({
-      surface: 'voice', version: 2,
+      surface: 'voice',
+      version: 2,
       callRefHash: fingerprintTraceReference('call_session', 'PRIVATE-CALL-CANARY').slice(7),
       turnRefHash: fingerprintTraceReference('logical_turn', 'PRIVATE-TURN-CANARY').slice(7),
     });
-    expect(messages.every(message => message.length <= 150)).toBe(true);
+    expect(messages.every((message) => message.length <= 150)).toBe(true);
     expect(messages.join('\n')).not.toMatch(/PRIVATE-|forged/);
   });
 
   test('does not infer trusted surface or turn authority from incoming body fields', () => {
     const logger = { info: jest.fn() };
-    logFeelingsEvent(logger, { body: { voiceMode: true, viventiumCallSessionId: 'private', viventiumLogicalTurnId: 'private' } },
-      'feelings.read.complete', { surface: 'voice', turnRefHash: 'a'.repeat(64) });
-    const facts = Object.assign({}, ...logger.info.mock.calls.map(([message]) => JSON.parse(message.replace('[VIVENTIUM][Feelings] ', ''))));
+    logFeelingsEvent(
+      logger,
+      {
+        body: {
+          voiceMode: true,
+          viventiumCallSessionId: 'private',
+          viventiumLogicalTurnId: 'private',
+        },
+      },
+      'feelings.read.complete',
+      { surface: 'voice', turnRefHash: 'a'.repeat(64) },
+    );
+    const facts = Object.assign(
+      {},
+      ...logger.info.mock.calls.map(([message]) =>
+        JSON.parse(message.replace('[VIVENTIUM][Feelings] ', '')),
+      ),
+    );
     expect(facts).not.toHaveProperty('surface');
     expect(facts).not.toHaveProperty('turnRefHash');
     expect(facts).not.toHaveProperty('callRefHash');

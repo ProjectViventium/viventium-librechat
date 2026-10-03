@@ -9,6 +9,7 @@ const path = require('path');
 const express = require('express');
 
 let mockSaveMessage;
+let mockCleanupSourceTombstoned;
 let mockUpdateMessage;
 let mockGetConvo;
 let mockGetMessages;
@@ -17,6 +18,7 @@ let mockEnqueueGlassHiveCallbackDelivery;
 let mockResolveGlassHiveCallbackContext;
 let mockConfirmGlassHiveCallbackContext;
 let mockRecordGlassHiveCallbackExternalState;
+let mockRecordGlassHiveAdjudicationOutcome;
 let mockNotifySchedulerExternalWorkSummary;
 let mockEnqueueGlassHiveMissionAdjudication;
 let mockRecordGlassHiveSurfaceDeliveryOutcome;
@@ -25,6 +27,11 @@ let mockConversationUpdateOne;
 let mockGetCallSession;
 let mockClaimOrReplaceCallSessionConversationId;
 let mockRecordTraceDelivery;
+
+jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
+  isGlassHiveCleanupSourceTombstoned: (...args) => mockCleanupSourceTombstoned(...args),
+}));
 
 jest.mock('@librechat/data-schemas', () => {
   const actual = jest.requireActual('@librechat/data-schemas');
@@ -66,6 +73,7 @@ jest.mock('~/server/services/viventium/OrchestrationTraceLedgerService', () => (
 jest.mock('~/server/services/viventium/GlassHiveCallbackBindingService', () => ({
   resolveGlassHiveCallbackContext: (...args) => mockResolveGlassHiveCallbackContext(...args),
   confirmGlassHiveCallbackContext: (...args) => mockConfirmGlassHiveCallbackContext(...args),
+  recordGlassHiveAdjudicationOutcome: (...args) => mockRecordGlassHiveAdjudicationOutcome(...args),
   recordGlassHiveCallbackExternalState: (...args) =>
     mockRecordGlassHiveCallbackExternalState(...args),
   notifySchedulerExternalWorkSummary: (...args) => mockNotifySchedulerExternalWorkSummary(...args),
@@ -239,6 +247,7 @@ function dispatch(app, req, res) {
 
 describe('/api/viventium/glasshive/callback', () => {
   beforeEach(() => {
+    mockCleanupSourceTombstoned = jest.fn().mockResolvedValue(false);
     mockSaveMessage = jest.fn().mockResolvedValue({});
     mockUpdateMessage = jest.fn().mockResolvedValue({});
     mockDeleteMessages = jest.fn().mockResolvedValue({ deletedCount: 1 });
@@ -275,6 +284,7 @@ describe('/api/viventium/glasshive/callback', () => {
       };
     });
     mockConfirmGlassHiveCallbackContext = jest.fn().mockResolvedValue({});
+    mockRecordGlassHiveAdjudicationOutcome = jest.fn().mockResolvedValue(null);
     mockRecordGlassHiveCallbackExternalState = jest.fn().mockResolvedValue(null);
     mockNotifySchedulerExternalWorkSummary = jest.fn().mockResolvedValue(null);
     mockEnqueueGlassHiveMissionAdjudication = jest.fn().mockResolvedValue(null);
@@ -3398,6 +3408,50 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(second.statusCode).toBe(200);
     expect(mockSaveMessage).toHaveBeenCalledTimes(2);
   });
+
+  test.each([false, true])(
+    'suppresses cleanup callback before live status persistence (late=%s)',
+    async (late) => {
+      mockCleanupSourceTombstoned.mockResolvedValue(true);
+      if (late) mockCleanupSourceTombstoned.mockResolvedValueOnce(false);
+      const router = require('../glasshive');
+      const app = createTestApp(router);
+      const body = callbackBody({ callback_id: 'cb_cleanup_anchor', surface: 'telegram' });
+      const req = createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      });
+      const res = createMockRes();
+
+      await dispatch(app, req, res);
+
+      expect(res.statusCode).toBe(202);
+      expect(res.body).toEqual(
+        expect.objectContaining({
+          status: 'suppressed',
+          reason: 'mission_origin_cleanup_tombstoned',
+        }),
+      );
+      expect(mockCleanupSourceTombstoned).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ownerId: 'user-1',
+          conversationId: 'conv-1',
+          anchorMessageId: 'msg-anchor',
+        }),
+      );
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockUpdateMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+      expect(mockRecordGlassHiveAdjudicationOutcome).toHaveBeenCalledWith(
+        expect.objectContaining({
+          originRef: 'ghi-test-origin',
+          state: 'silent',
+          errorCode: 'mission_origin_cleanup_tombstoned',
+        }),
+      );
+    },
+  );
 
   test('accepts a verified deleted-origin callback for account-level Main adjudication', async () => {
     mockGetConvo.mockResolvedValueOnce(null);

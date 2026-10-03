@@ -2502,6 +2502,33 @@ describe('GlassHiveCallbackBindingService', () => {
     );
   });
 
+  test('settles typed cleanup suppression without inventing an enqueued delivery', async () => {
+    mockExternalFindOneAndUpdate.mockResolvedValueOnce({
+      _id: 'work-cleanup',
+      deliveryState: 'suppressed',
+      attentionPending: false,
+    });
+
+    await recordGlassHiveAdjudicationOutcome({
+      originRef: 'work-cleanup',
+      state: 'silent',
+      errorCode: 'mission_origin_cleanup_tombstoned',
+    });
+
+    expect(mockExternalFindOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ _id: 'work-cleanup', deliveryState: expect.any(Object) }),
+      {
+        $set: expect.objectContaining({
+          adjudicationState: 'silent',
+          deliveryState: 'suppressed',
+          attentionPending: false,
+          adjudicationErrorCode: 'mission_origin_cleanup_tombstoned',
+        }),
+      },
+      expect.any(Object),
+    );
+  });
+
   test('keeps an unresolved terminal surface visible after adjudication bookkeeping', async () => {
     mockExternalFindOneAndUpdate.mockResolvedValue({
       _id: 'work-unresolved',

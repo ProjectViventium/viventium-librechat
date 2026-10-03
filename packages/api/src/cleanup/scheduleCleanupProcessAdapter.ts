@@ -168,6 +168,7 @@ export function createScheduleCleanupProcessAdapter({
       targets: CleanupTargetRef[];
       nonceHash: string;
     }) {
+      if (input.targets.length === 0) return { verifiedCount: 0 };
       const response = await invoke('verify_operation', input);
       if (!Number.isSafeInteger(response.result?.verifiedCount)) {
         throw new Error('cleanup_schedule_bridge_verification_invalid');

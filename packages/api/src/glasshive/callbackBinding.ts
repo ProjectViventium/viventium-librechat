@@ -2582,7 +2582,13 @@ async function recordGlassHiveAdjudicationOutcome({
     updatedAt: now,
   };
   const deliveryState =
-    normalizedState === 'failed' ? (unresolvedDelivery ? 'unresolved' : 'failed') : 'enqueued';
+    normalizedState === 'silent' && normalizedErrorCode === 'mission_origin_cleanup_tombstoned'
+      ? 'suppressed'
+      : normalizedState === 'failed'
+        ? unresolvedDelivery
+          ? 'unresolved'
+          : 'failed'
+        : 'enqueued';
   effectSession ||= mongoose.transactionAsyncLocalStorage?.getStore()?.session || null;
   const collection = externalWorkCollection();
   const unsettledResult = await collection.findOneAndUpdate(

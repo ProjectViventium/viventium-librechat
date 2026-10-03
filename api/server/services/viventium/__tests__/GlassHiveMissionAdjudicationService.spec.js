@@ -5,6 +5,7 @@
 let mockUpdateOne;
 let mockMessageUpdateOne;
 let mockMessageFindOne;
+let mockConversationFindOne;
 let mockStoredMessages;
 let mockFindOneAndUpdate;
 let mockFindOne;
@@ -41,12 +42,14 @@ jest.mock('mongoose', () => {
               updateOne: (...args) => mockMessageUpdateOne(...args),
               findOne: (...args) => mockMessageFindOne(...args),
             }
-          : {
-              updateOne: (...args) => mockUpdateOne(...args),
-              findOneAndUpdate: (...args) => mockFindOneAndUpdate(...args),
-              findOne: (...args) => mockFindOne(...args),
-              find: (...args) => mockFind(...args),
-            },
+          : name === 'conversations'
+            ? { findOne: (...args) => mockConversationFindOne(...args) }
+            : {
+                updateOne: (...args) => mockUpdateOne(...args),
+                findOneAndUpdate: (...args) => mockFindOneAndUpdate(...args),
+                findOne: (...args) => mockFindOne(...args),
+                find: (...args) => mockFind(...args),
+              },
     },
   };
 });
@@ -207,6 +210,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       ...row({ _id: filter._id }),
       state: 'processing',
     }));
+    mockConversationFindOne = jest.fn().mockResolvedValue(null);
     mockFindOne = jest.fn().mockResolvedValue(null);
     mockFind = jest.fn().mockReturnValue(cursor([]));
     mockGetUserById = jest.fn().mockResolvedValue({ id: 'user-1', role: 'USER' });
@@ -2227,6 +2231,163 @@ describe('GlassHiveMissionAdjudicationService', () => {
     for (const [input] of mockCreateCortexFollowUpMessage.mock.calls) {
       expect(input.parentMessageId).toBe(noParentMessageId);
     }
+  });
+
+  test('settles cleanup-tombstoned origin evidence without synthesis or a new continuation', async () => {
+    mockFind.mockReturnValueOnce(cursor([row()]));
+    mockConversationFindOne.mockResolvedValue({ _id: 'cleanup-origin' });
+    mockGetConvo.mockResolvedValue(null);
+
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+      expect.objectContaining({ silent: 1, visible: 0, failed: 0 }),
+    );
+
+    expect(mockConversationFindOne).toHaveBeenCalledWith(
+      {
+        user: 'user-1',
+        conversationId: 'conversation-1',
+        deletedAt: { $type: 'date' },
+        'cleanupTombstone.operationId': { $type: 'string', $ne: '' },
+        'cleanupTombstone.tombstonedAt': { $type: 'date' },
+      },
+      { projection: { _id: 1 } },
+    );
+    expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockSaveConvo).not.toHaveBeenCalled();
+    expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+    expect(mockRecordOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({ state: 'silent', errorCode: 'mission_origin_cleanup_tombstoned' }),
+    );
+  });
+
+  test('rechecks a cleanup tombstone after synthesis within the authored transaction', async () => {
+    const fenced = row({
+      terminalCallbackResultKey: `ghtr_${'a'.repeat(64)}`,
+      terminalCallbackAcceptedOperationId: 'b'.repeat(32),
+      terminalCallbackId: `cb_terminal_${'c'.repeat(64)}`,
+      terminalCallbackResultDigest: `sha256:${'d'.repeat(64)}`,
+      terminalCallbackResultRevision: 1,
+      terminalCallbackEffectGeneration: 1,
+    });
+    mockFind.mockReturnValueOnce(cursor([fenced]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...fenced, state: 'processing' });
+    const activeSession = { id: 'synthetic-cleanup-session' };
+    mockRunTransaction = async (operation) => {
+      mockTransactionSession = activeSession;
+      try {
+        return await operation(activeSession);
+      } finally {
+        mockTransactionSession = null;
+      }
+    };
+    mockConversationFindOne
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ _id: 'cleanup-origin' });
+
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+      expect.objectContaining({ silent: 1, visible: 0, failed: 0 }),
+    );
+
+    expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    expect(mockConversationFindOne).toHaveBeenLastCalledWith(
+      expect.objectContaining({ user: 'user-1', conversationId: 'conversation-1' }),
+      { projection: { _id: 1 }, session: activeSession },
+    );
+    expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockSaveConvo).not.toHaveBeenCalled();
+    expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+    expect(mockRecordOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({ state: 'silent', errorCode: 'mission_origin_cleanup_tombstoned' }),
+    );
+  });
+
+  test('suppresses an anchor cleanup tombstone inside a live personal conversation', async () => {
+    mockFind.mockReturnValueOnce(cursor([row()]));
+    mockMessageFindOne.mockImplementation(async (filter) =>
+      filter.messageId === 'assistant-anchor' && filter.deletedAt?.$type === 'date'
+        ? { _id: 'cleanup-anchor' }
+        : null,
+    );
+
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+      expect.objectContaining({ silent: 1, visible: 0, failed: 0 }),
+    );
+
+    expect(mockMessageFindOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        user: 'user-1',
+        conversationId: 'conversation-1',
+        messageId: 'assistant-anchor',
+        deletedAt: { $type: 'date' },
+        'cleanupTombstone.operationId': { $type: 'string', $ne: '' },
+        'cleanupTombstone.tombstonedAt': { $type: 'date' },
+      }),
+      { projection: { _id: 1 } },
+    );
+    expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockSaveConvo).not.toHaveBeenCalled();
+    expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+  });
+
+  test('keeps a foreign-owner cleanup tombstone outside this mission scope', async () => {
+    mockFind.mockReturnValueOnce(cursor([row()]));
+    mockConversationFindOne.mockImplementation(async (filter) =>
+      filter.user === 'other-user' ? { _id: 'foreign-cleanup-origin' } : null,
+    );
+    mockGetConvo.mockResolvedValue(null);
+
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+      expect.objectContaining({ visible: 1, silent: 0, failed: 0 }),
+    );
+    expect(mockConversationFindOne).toHaveBeenCalledWith(
+      expect.objectContaining({ user: 'user-1', conversationId: 'conversation-1' }),
+      { projection: { _id: 1 } },
+    );
+    expect(mockSaveConvo).toHaveBeenCalledTimes(1);
+  });
+
+  test('settles a legacy redrive from a cleanup-tombstoned origin without replaying it', async () => {
+    const legacy = row({
+      _id: 'ghe_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      evidenceId: 'ghe_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      state: 'deadletter',
+      attempts: 10,
+      errorCode: 'mission_adjudication_retry_exhausted',
+      adjudicationGroupId: 'ghag_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      adjudicationGroupMemberIds: ['ghe_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+      terminalCallbackResultKey: `ghtr_${'c'.repeat(64)}`,
+      terminalCallbackAcceptedOperationId: 'd'.repeat(32),
+      terminalCallbackId: `cb_terminal_${'e'.repeat(64)}`,
+      terminalCallbackResultDigest: `sha256:${'f'.repeat(64)}`,
+      terminalCallbackResultRevision: 1,
+      terminalCallbackEffectGeneration: 1,
+    });
+    mockFind.mockReturnValueOnce(cursor([legacy]));
+    mockGetConvo.mockResolvedValue(null);
+    mockUpdateOne.mockResolvedValue({ acknowledged: true, matchedCount: 1, modifiedCount: 1 });
+    await expect(redriveLegacyDeletedOriginMissionAdjudications()).resolves.toEqual(
+      expect.objectContaining({ redriven: 1, failed: 0 }),
+    );
+    const redriven = { ...legacy, state: 'pending', attempts: 0 };
+    mockFind.mockReturnValueOnce(cursor([redriven]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...redriven, state: 'processing' });
+    mockConversationFindOne.mockResolvedValue({ _id: 'cleanup-origin' });
+
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+      expect.objectContaining({ silent: 1, visible: 0, failed: 0 }),
+    );
+    mockFind.mockReturnValueOnce(cursor([]));
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+      expect.objectContaining({ claimed: 0, visible: 0, failed: 0 }),
+    );
+    expect(mockRecordOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({ state: 'silent', errorCode: 'mission_origin_cleanup_tombstoned' }),
+    );
+    expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockSaveConvo).not.toHaveBeenCalled();
+    expect(mockEnqueueDelivery).not.toHaveBeenCalled();
   });
 
   test('uses a new account continuation when the origin conversation was deleted', async () => {

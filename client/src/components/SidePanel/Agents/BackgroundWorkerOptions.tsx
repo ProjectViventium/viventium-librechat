@@ -4,6 +4,7 @@ import { Controller, useFormContext, useWatch } from 'react-hook-form';
 import type { TAgentProviderCapability } from 'librechat-data-provider';
 import type { AgentForm } from '~/common';
 import { useLocalize } from '~/hooks';
+import AgentModelPicker from './AgentModelPicker';
 
 export default function BackgroundWorkerOptions({
   providerCapability,
@@ -53,14 +54,35 @@ export default function BackgroundWorkerOptions({
               name={modelField}
               control={control}
               render={({ field }) => (
-                <select
-                  {...field}
-                  id={model}
-                  value={selected}
-                  className="h-10 w-full rounded-lg border border-border-light bg-surface-primary px-3"
-                  onChange={(event) => {
-                    field.onChange(event);
-                    const next = models.find((candidate) => candidate.id === event.target.value);
+                <AgentModelPicker
+                  selectedValue={selected}
+                  displayValue={
+                    capability?.label ?? (selected || localize('com_ui_worker_profile_default'))
+                  }
+                  ariaLabel={label}
+                  harnessLabel={
+                    model === 'worker_model'
+                      ? 'Background provider'
+                      : 'Background fallback provider'
+                  }
+                  modelCapabilities={models}
+                  selectPlaceholder={label}
+                  searchPlaceholder={label}
+                  items={[
+                    { value: '', label: localize('com_ui_worker_profile_default') },
+                    ...(selected && !capability
+                      ? [
+                          {
+                            value: selected,
+                            label: `${selected} (${localize('com_ui_model_unavailable')})`,
+                          },
+                        ]
+                      : []),
+                    ...models.map((candidate) => ({ value: candidate.id, label: candidate.label })),
+                  ]}
+                  setValue={(value: string) => {
+                    field.onChange(value);
+                    const next = models.find((candidate) => candidate.id === value);
                     if (next?.harnessProfile) {
                       setValue(`glasshive_options.orchestration.${profile}`, next.harnessProfile, {
                         shouldDirty: true,
@@ -70,19 +92,9 @@ export default function BackgroundWorkerOptions({
                       setValue(effortField, next?.recommendedEffort ?? '', { shouldDirty: true });
                     }
                   }}
-                >
-                  <option value="">{localize('com_ui_worker_profile_default')}</option>
-                  {selected && !capability && (
-                    <option value={selected}>
-                      {selected} ({localize('com_ui_model_unavailable')})
-                    </option>
-                  )}
-                  {models.map((candidate) => (
-                    <option key={candidate.id} value={candidate.id}>
-                      {candidate.label}
-                    </option>
-                  ))}
-                </select>
+                  isCollapsed={false}
+                  showCarat={true}
+                />
               )}
             />
             {selected && (

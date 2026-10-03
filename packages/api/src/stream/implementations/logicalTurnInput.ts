@@ -36,6 +36,7 @@ export function mergeLogicalTurnInput(
         } : {}),
         ...(segment.source_files ? { source_files: segment.source_files } : {}),
         ...(segment.source_persisted === true ? { source_persisted: true as const } : {}),
+        ...(!original.reply_context && segment.reply_context ? { reply_context: segment.reply_context } : {}),
       } : segment);
     }
   }
@@ -48,6 +49,44 @@ export function mergeLogicalTurnInput(
   return { ...incoming,
     ...(normalized.segments.length ? { source_segments: normalized.segments } : {}),
     ...(normalized.overflowCount ? { source_segments_overflow_count: normalized.overflowCount } : {}),
+  };
+}
+
+/** The earlier revisions whose commits decide who authors this context's sources. */
+export function earlierAuthoringRevisions(context: InteractionContext): number[] {
+  const marks = (context.source_segments ?? []).flatMap((segment) => {
+    const mark = segment.authoring_revision;
+    return mark != null && Number.isSafeInteger(mark) && mark < context.revision ? [mark] : [];
+  });
+  if (!marks.length) return [];
+  const first = Math.min(...marks);
+  return Array.from({ length: context.revision - first }, (_unused, index) => first + index);
+}
+
+/**
+ * A claim only reserves a revision, so a source's claim mark is provisional. When this revision's
+ * admission commits, the source's author is the earliest committed revision that carried it, else
+ * this revision. Unmarked (legacy) sources keep their earlier meaning.
+ */
+export function commitSourceAuthors(
+  context: InteractionContext,
+  committed: (revision: number) => boolean,
+): InteractionContext {
+  if (!context.source_segments?.length) return context;
+  return {
+    ...context,
+    source_segments: context.source_segments.map((segment) => {
+      const claimed = segment.authoring_revision;
+      if (claimed == null || !Number.isSafeInteger(claimed)) return segment;
+      let author = context.revision;
+      for (let revision = claimed; revision < context.revision; revision += 1) {
+        if (committed(revision)) {
+          author = revision;
+          break;
+        }
+      }
+      return { ...segment, authoring_revision: author };
+    }),
   };
 }
 /* VIVENTIUM END */

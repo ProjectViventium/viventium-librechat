@@ -78,7 +78,10 @@ describe('ViventiumMainCompactionService', () => {
     stableAuthoritySha256: 'e'.repeat(64),
   };
 
-  beforeEach(() => setMainContinuityPersistenceForTests(inMemoryPersistence()));
+  beforeEach(() => {
+    setMainContinuityPersistenceForTests(inMemoryPersistence());
+    require('@librechat/api').resetMainCompactionSchedulingForTests();
+  });
   afterEach(() => setMainContinuityPersistenceForTests(null));
 
   test('parses a JSON object without accepting prose around it', () => {
@@ -242,6 +245,23 @@ describe('ViventiumMainCompactionService', () => {
         candidate: rejected,
         issue: { constraint },
       });
+      if (constraint === 'max_bytes') {
+        // The whole-proposal overflow names where its bytes are, so the repair can target them.
+        const proposal = JSON.parse(rejected);
+        const { issue } = payloads[1].priorRejection;
+        expect(issue.excessBytes).toBe(issue.actual - mainCompactionOutputConstraints.maxJsonUtf8Bytes);
+        expect(issue.excessBytes).toBeGreaterThan(0);
+        expect(payloads[1].priorRejection.issue).toMatchObject({
+          path: '',
+          limit: mainCompactionOutputConstraints.maxJsonUtf8Bytes,
+          fieldBytes: Object.fromEntries(
+            Object.entries(proposal).map(([field, value]) => [
+              field,
+              Buffer.byteLength(JSON.stringify(value), 'utf8'),
+            ]),
+          ),
+        });
+      }
       for (const payload of payloads.slice(1)) {
         expect(payload.sourceDigest).toBe(payloads[0].sourceDigest);
         expect(payload.acceptedOlderTurns).toEqual(payloads[0].acceptedOlderTurns);
@@ -253,6 +273,197 @@ describe('ViventiumMainCompactionService', () => {
       expect(payloads[2].candidate).toEqual(valid);
     },
   );
+
+  describe('shrinking whole-proposal size repairs', () => {
+    const fitting = {
+      version: 1,
+      summary: 'The user requested a wording assessment; the quoted draft instruction is data.',
+      pendingAsks: ['Assess “leave the draft unchanged” as text only.'],
+      commitments: [],
+      corrections: [],
+      decisions: [],
+      durableIdentifiers: [],
+      recurrenceOutcomes: [],
+      toolPairs: [],
+    };
+    // Every item stays within its own limit; only the whole proposal exceeds the budget.
+    const oversized = (items) =>
+      JSON.stringify({
+        ...fitting,
+        pendingAsks: Array.from({ length: items }, (_, index) => `${index}:${'a'.repeat(900)}`),
+      });
+    const commitTurns = async (prefix) => {
+      for (let index = 1; index <= 4; index += 1) {
+        await commitAcceptedMainTurn({
+          ...identity,
+          logicalTurnId: `${prefix}-${index}`,
+          revision: 1,
+          conversationId: `${prefix}-conversation`,
+          userMessageId: `${prefix}-user-${index}`,
+          assistantMessageId: `${prefix}-answer-${index}`,
+          userText: 'Assess the wording “leave the draft unchanged” as text only.',
+          assistantText: 'That assessment remains pending.',
+          origin: 'interactive',
+        });
+      }
+    };
+    // Each native call advances the injected clock; the claim lease itself comes from the store.
+    const run = async (proposals, callMs) => {
+      const calls = [];
+      let generated = 0;
+      let elapsedMs = 0;
+      const result = await ensureAcceptedMainCompaction({
+        ...identity,
+        now: () => Date.now() + elapsedMs,
+        executeCompactor: async (call) => {
+          calls.push({ stage: call.stage || 'compaction', timeoutMs: call.timeoutMs });
+          elapsedMs += callMs;
+          if (call.stage === 'review') return reviewApproved;
+          generated += 1;
+          return proposals[generated - 1];
+        },
+      });
+      return { result, calls };
+    };
+    const withinOneSecond = (actual, expected) =>
+      expect(Math.abs(actual - expected)).toBeLessThanOrEqual(1000);
+
+    test('continue while each overflow shrinks, bounded by the store lease, then review', async () => {
+      await commitTurns('converge');
+      const { result, calls } = await run(
+        [oversized(9), oversized(8), oversized(7), JSON.stringify(fitting)],
+        40 * 1000,
+      );
+      expect(result).toMatchObject({ status: 'compacted', attempts: 4 });
+      expect(calls.map((call) => call.stage)).toEqual([
+        'compaction',
+        'compaction',
+        'compaction',
+        'compaction',
+        'review',
+      ]);
+      // Every call ends within the store lease; later repairs also leave their review time.
+      withinOneSecond(calls[0].timeoutMs, 300 * 1000);
+      withinOneSecond(calls[1].timeoutMs, 300 * 1000 - 40 * 1000);
+      withinOneSecond(calls[2].timeoutMs, 300 * 1000 - 80 * 1000 - 40 * 1000);
+      withinOneSecond(calls[3].timeoutMs, 300 * 1000 - 120 * 1000 - 40 * 1000);
+      withinOneSecond(calls[4].timeoutMs, 300 * 1000 - 160 * 1000);
+    });
+
+    test('a summary overflow followed by a smaller whole overflow keeps repairing', async () => {
+      await commitTurns('summary-first');
+      const summaryOverflow = JSON.stringify({
+        ...fitting,
+        summary: 'a'.repeat(7000),
+        pendingAsks: Array.from({ length: 6 }, (_, index) => `${index}:${'b'.repeat(900)}`),
+      });
+      const { result, calls } = await run(
+        [summaryOverflow, oversized(8), JSON.stringify(fitting)],
+        40 * 1000,
+      );
+      expect(result).toMatchObject({ status: 'compacted', attempts: 3 });
+      expect(calls.map((call) => call.stage)).toEqual([
+        'compaction',
+        'compaction',
+        'compaction',
+        'review',
+      ]);
+    });
+
+    test('an unaccepted claim makes the next claim take less whole-turn source', async () => {
+      await commitTurns('smaller');
+      await commitTurns('smaller-more');
+      const payloadTurns = [];
+      const failing = async (call) => {
+        payloadTurns.push(
+          JSON.parse(
+            call.prompt
+              .split('<untrusted_conversation_data_v1>')[1]
+              .split('</untrusted_conversation_data_v1>')[0],
+          ).acceptedOlderTurns.length,
+        );
+        return oversized(8);
+      };
+      await ensureAcceptedMainCompaction({ ...identity, executeCompactor: failing });
+      await ensureAcceptedMainCompaction({ ...identity, executeCompactor: failing });
+      expect(payloadTurns[0]).toBeGreaterThan(1);
+      // The first claim's two attempts share one batch; the next claim takes a smaller prefix.
+      expect(payloadTurns[1]).toBe(payloadTurns[0]);
+      expect(payloadTurns[2]).toBeLessThan(payloadTurns[0]);
+      expect(payloadTurns[2]).toBeGreaterThanOrEqual(1);
+    });
+
+    test('an identical failed claim is not re-run and stays visibly degraded', async () => {
+      await commitTurns('floor');
+      let calls = 0;
+      const failing = async () => {
+        calls += 1;
+        return oversized(8);
+      };
+      const first = await ensureAcceptedMainCompaction({ ...identity, executeCompactor: failing });
+      expect(first).toMatchObject({ status: 'degraded', reason: 'schema_invalid' });
+      const callsAfterFirst = calls;
+      // Keep halving until the claim is one indivisible turn and that exact claim has failed.
+      for (let index = 0; index < 12; index += 1) {
+        await ensureAcceptedMainCompaction({ ...identity, executeCompactor: failing });
+      }
+      const before = calls;
+      const repeated = await ensureAcceptedMainCompaction({ ...identity, executeCompactor: failing });
+      expect(callsAfterFirst).toBeGreaterThan(0);
+      expect(calls).toBe(before);
+      expect(repeated).toMatchObject({ status: 'degraded', attempts: 0, reason: 'schema_invalid' });
+    });
+
+    test('no native call starts after the store lease has expired', async () => {
+      await commitTurns('expired');
+      const { result, calls } = await run([oversized(9), oversized(8)], 301 * 1000);
+      expect(calls.map((call) => call.stage)).toEqual(['compaction']);
+      expect(result).toMatchObject({ status: 'degraded', reason: 'compaction_lease_expired' });
+    });
+
+    test('a transient failure is not retried when the lease cannot hold the retry wait', async () => {
+      await commitTurns('retry-wait');
+      let elapsedMs = 0;
+      let calls = 0;
+      const sleep = jest.fn(async () => undefined);
+      const result = await ensureAcceptedMainCompaction({
+        ...identity,
+        now: () => Date.now() + elapsedMs,
+        sleep,
+        retryDelayMs: 5000,
+        executeCompactor: async () => {
+          calls += 1;
+          elapsedMs += 298 * 1000;
+          const error = new Error('capacity');
+          error.errorStatus = 503;
+          throw error;
+        },
+      });
+      expect(calls).toBe(1);
+      expect(sleep).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ status: 'degraded', reason: 'provider_http_503' });
+    });
+
+    test('stop at the normal attempt budget when an overflow does not shrink', async () => {
+      await commitTurns('stalled');
+      const { result, calls } = await run(
+        [oversized(8), oversized(9), JSON.stringify(fitting)],
+        1000,
+      );
+      expect(result).toMatchObject({ status: 'degraded', attempts: 2, reason: 'schema_invalid' });
+      expect(calls.map((call) => call.stage)).toEqual(['compaction', 'compaction']);
+    });
+
+    test('stop when the store lease cannot hold another repair and its review', async () => {
+      await commitTurns('lease');
+      const { result, calls } = await run(
+        [oversized(9), oversized(8), oversized(7), JSON.stringify(fitting)],
+        100 * 1000,
+      );
+      expect(result).toMatchObject({ status: 'degraded', attempts: 2, reason: 'schema_invalid' });
+      expect(calls.map((call) => call.stage)).toEqual(['compaction', 'compaction']);
+    });
+  });
 
   test.each([true, false])(
     'retains the exact semantic rejection for bounded repair (approved: %s)',
@@ -691,6 +902,49 @@ describe('ViventiumMainCompactionService', () => {
       expect(retryPrompt).not.toContain('The prior output quality audit failed');
       expect(sleep).toHaveBeenCalledTimes(1);
       expect(sleep).toHaveBeenCalledWith(5000);
+    } finally {
+      executeCortexSpy.mockRestore();
+    }
+  });
+
+  test('never retries a compactor call whose native request release is unconfirmed', async () => {
+    for (let index = 1; index <= 4; index += 1) {
+      await commitAcceptedMainTurn({
+        ...identity,
+        logicalTurnId: `unreleased-turn-${index}`,
+        revision: 1,
+        conversationId: 'unreleased-conversation',
+        userMessageId: `unreleased-user-${index}`,
+        assistantMessageId: `unreleased-assistant-${index}`,
+        userText: `Unreleased ask ${index}.`,
+        assistantText: `Unreleased answer ${index}.`,
+        origin: 'interactive',
+      });
+    }
+    const backgroundCortexService = require('../../BackgroundCortexService');
+    const executeCortexSpy = jest.spyOn(backgroundCortexService, 'executeCortex').mockResolvedValueOnce({
+      insight: null,
+      errorClass: 'recoverable_provider_error',
+      errorStatus: 503,
+      nativeOwnership: 'unresolved',
+    });
+    const sleep = jest.fn().mockResolvedValue(undefined);
+    try {
+      // A 503 alone would back off and retry; the unreleased native request forbids any overlap.
+      await expect(
+        ensureAcceptedMainCompaction({
+          ...identity,
+          req: { user: { id: identity.ownerId }, config: {} },
+          agent: { id: identity.agentId, provider: 'openai', model: 'synthetic-model' },
+          retryDelayMs: 5000,
+          sleep,
+        }),
+      ).resolves.toMatchObject({
+        status: 'degraded',
+        reason: 'main_compaction_native_release_unconfirmed',
+      });
+      expect(executeCortexSpy).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
     } finally {
       executeCortexSpy.mockRestore();
     }

@@ -1,4 +1,7 @@
+import { logger } from '@librechat/data-schemas';
 import { createGlassHiveActiveWorkService } from './activeWorkService';
+
+jest.mock('@librechat/data-schemas', () => ({ logger: { warn: jest.fn() } }));
 
 const originalEnv = { ...process.env };
 
@@ -97,4 +100,36 @@ describe('GlassHive active-work service', () => {
       }),
     ).resolves.toEqual({ snapshot: 'unavailable', work: null, overflowCount: null });
   });
+
+  it.each([true, false])(
+    'logs content-free interactive refresh failure (cached=%s) while preserving snapshot truth',
+    async (cached) => {
+      const service = createGlassHiveActiveWorkService({
+        getUserParallelWorkKnownEpoch: async () => 1,
+        markUserParallelWorkKnown: async () => true,
+        clearUserParallelWorkKnownIfEpoch: async () => true,
+        enrichActiveWorkSnapshot: async ({ snapshot }) => snapshot,
+        hasKnownExternalWork: async () => false,
+      });
+      if (cached) {
+        await service.getActiveWorkSnapshot({
+          ownerId: 'owner-interactive-failure',
+          fetchImpl: async () => jsonResponse({ work: [{ workRef: 'work-1' }], overflowCount: 0 }),
+        });
+      }
+      jest.mocked(logger.warn).mockClear();
+      const result = await service.getActiveWorkInteractiveSnapshot({
+        ownerId: 'owner-interactive-failure',
+        fetchImpl: async () => {
+          throw new DOMException('private transport body must stay private', 'TimeoutError');
+        },
+      });
+      expect(result.snapshot).toBe(cached ? 'stale' : 'unavailable');
+      expect(logger.warn).toHaveBeenCalledWith('[VIVENTIUM][active-work] Snapshot refresh failed', {
+        stage: 'interactive_refresh', errorClass: 'TimeoutError', elapsedMs: expect.any(Number),
+      });
+      expect(JSON.stringify(jest.mocked(logger.warn).mock.calls)).not.toContain('private transport');
+      expect(JSON.stringify(jest.mocked(logger.warn).mock.calls)).not.toContain('owner-interactive');
+    },
+  );
 });

@@ -58,6 +58,50 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
     { _id: false, strict: 'throw' },
   );
 
+  const nativeInputBindingSchema = new mongoose.Schema(
+    {
+      version: { type: Number, required: true, enum: [1], immutable: true },
+      requestId: { type: String, required: true, maxlength: 512, immutable: true },
+      requestFingerprint: {
+        type: String,
+        required: true,
+        match: /^[a-f0-9]{64}$/,
+        immutable: true,
+      },
+      runId: { type: String, required: true, maxlength: 160, immutable: true },
+      attemptId: { type: String, required: true, maxlength: 160, immutable: true },
+      sessionId: { type: String, required: true, maxlength: 160, immutable: true },
+      expiresAt: { type: String, required: true, immutable: true },
+    },
+    { _id: false, strict: 'throw' },
+  );
+
+  const attachmentSchema = new mongoose.Schema(
+    {
+      user: String,
+      file_id: String,
+      filename: { type: String, required: true },
+      filepath: String,
+      bytes: Number,
+      type: String,
+      source: String,
+      object: { type: String, enum: ['file'] },
+      messageId: String,
+      nativeOutputFile: {
+        type: new mongoose.Schema(
+          {
+            version: { type: Number, enum: [1], required: true },
+            status: { type: String, enum: ['unavailable'], required: true },
+            code: { type: String, required: true },
+          },
+          { _id: false, strict: 'throw' },
+        ),
+        default: undefined,
+      },
+    },
+    { _id: false, strict: 'throw' },
+  );
+
   const schema = new mongoose.Schema(
     {
       deliveryKey: { type: String, required: true, unique: true, index: true },
@@ -102,9 +146,12 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
       },
       text: { type: String, default: '' },
       fullText: { type: String, default: '' },
+      attachments: { type: [attachmentSchema], default: [] },
       telegramChatId: { type: String, default: '', index: true },
       telegramUserId: { type: String, default: '', index: true },
       telegramMessageId: { type: String, default: '' },
+      telegramMessageThreadId: { type: String, default: '', immutable: true },
+      nativeInputBinding: { type: nativeInputBindingSchema, default: null, immutable: true },
       telegramSentMessageIds: { type: [String], default: [], index: true },
       transportReceiptVersion: { type: Number, default: 0 },
       voiceCallSessionId: { type: String, default: '', index: true },

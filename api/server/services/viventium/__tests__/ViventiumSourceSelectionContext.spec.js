@@ -109,4 +109,84 @@ describe('ViventiumSourceSelectionContext', () => {
     expect(capsule).not.toContain('First accepted mission');
     expect(capsule).not.toContain('Second accepted mission');
   });
+
+  /* === VIVENTIUM START ===
+   * Purpose: an additive Telegram turn owns the inputs deferred to it (admitted by its own claim)
+   * and lists them with their turn S-numbers; an earlier revision's input keeps its own author.
+   * === VIVENTIUM END === */
+  const telegramCapabilities = { segment_stability: 'immediate', supersede_scope: 'response_only' };
+  const decodedLabels = (capsule) =>
+    JSON.parse(
+      Buffer.from(
+        capsule.split('\n').find((line) => /^[A-Za-z0-9_-]+$/.test(line)),
+        'base64url',
+      ).toString('utf8'),
+    ).sources.map((source) => source.label);
+  const additiveTurn = (revision, segments) => {
+    const req = {};
+    setTrustedInteractionContext(
+      req,
+      {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'telegram',
+        conversation_id: 'conversation-additive',
+        logical_turn_id: 'logical-turn-additive',
+        revision,
+        source_event_id: segments[segments.length - 1][0],
+        source_segments: segments.map(([id, authoringRevision, text]) => ({
+          source_event_id: id,
+          source_index: 0,
+          text,
+          authoring_revision: authoringRevision,
+        })),
+      },
+      telegramCapabilities,
+    );
+    return buildSourceSelectionCapsule(req);
+  };
+
+  test('lists an input deferred to the additive turn beside its current input', () => {
+    const capsule = additiveTurn(1, [
+      ['source-a', 1, 'Copy only the two totals from this quoted answer.'],
+      ['source-b', 1, 'Also subtract the smaller from the larger.'],
+    ]);
+
+    expect(decodedLabels(capsule)).toEqual(['S1', 'S2']);
+    expect(capsule).toContain('earlier inputs deferred to it');
+    expect(capsule).not.toContain('owns only the current accepted input');
+    expect(capsule).not.toContain('Unlisted earlier inputs');
+    expect(capsule).not.toContain('Copy only the two totals');
+  });
+
+  test('leaves an input an earlier revision authors out of the additive turn', () => {
+    const capsule = additiveTurn(2, [
+      ['source-a', 1, 'First accepted mission'],
+      ['source-c', 2, 'Deferred question'],
+      ['source-b', 2, 'Current question'],
+    ]);
+
+    expect(decodedLabels(capsule)).toEqual(['S2', 'S3']);
+    expect(capsule).toContain('Unlisted earlier inputs already have independent authoring owners');
+  });
+
+  test('keeps the current input owned even when an earlier claim marked it', () => {
+    const capsule = additiveTurn(2, [
+      ['source-a', 2, 'Deferred question'],
+      ['source-b', 1, 'Current question'],
+    ]);
+
+    expect(decodedLabels(capsule)).toEqual(['S1', 'S2']);
+  });
+
+  test('keeps the current-input-only text when the earlier input has its own author', () => {
+    const capsule = additiveTurn(2, [
+      ['source-a', 1, 'First accepted mission'],
+      ['source-b', 2, 'Current question'],
+    ]);
+
+    expect(capsule).toContain('owns only the current accepted input');
+    expect(capsule).not.toContain('sourceOrdinals');
+  });
+  /* === VIVENTIUM END === */
 });

@@ -773,6 +773,7 @@ export default function AgentPanel() {
             key={`fallback-llm-${agent_id}`}
             models={models}
             providers={fallbackProviders}
+            providerCapabilities={agentsConfig?.providerCapabilities ?? {}}
             setActivePanel={setActivePanel}
           />
         )}
@@ -782,6 +783,7 @@ export default function AgentPanel() {
             <VoiceFallbackLlmPanel
               key={`voice-fallback-llm-${agent_id}`}
               models={models}
+              providerCapabilities={agentsConfig?.providerCapabilities ?? {}}
               providers={voiceProviders.filter(({ value }) =>
                 fallbackProviders.some((provider) => provider.value === value),
               )}

@@ -6,6 +6,9 @@ const {
   captureMainContextSnapshot,
   createMainAttemptFacts,
   hasUnreconciledMainHistory,
+  traceMainHistoryAncestry,
+  withReconciledHistoryAncestry,
+  recoverRetainedTelegramHistory,
   renderMainAttemptFactsAuthorityBlock,
 } = require('../ViventiumMainContextService');
 const { applyTimeContextDelivery } = require('../surfacePrompts');
@@ -19,6 +22,74 @@ const {
 } = require('../interactionContext');
 
 describe('ViventiumMainContextService', () => {
+  test('recovers a retained input anchor after interrupted replay without changing stored rows', () => {
+    const source = {
+      messageId: 'source',
+      parentMessageId: 'lost-response',
+      user: 'owner',
+      conversationId: 'conv',
+      isCreatedByUser: true,
+      text: 'Complete original input.',
+      metadata: {
+        viventium: {
+          telegramInput: {
+            state: 'admitted',
+            sourceEventId: 'a'.repeat(64),
+            originalParentMessageId: 'prior',
+          },
+          interactionContext: {
+            source_event_id: 'a'.repeat(64),
+            surface: 'telegram',
+            actor_kind: 'external_user',
+          },
+        },
+      },
+    };
+    const prior = {
+      messageId: 'prior',
+      parentMessageId: '00000000-0000-0000-0000-000000000000',
+      user: 'owner',
+      conversationId: 'conv',
+      isCreatedByUser: false,
+      text: 'Prior answer.',
+    };
+    for (const response of [
+      [],
+      [
+        {
+          messageId: 'lost-response',
+          parentMessageId: 'source',
+          user: 'owner',
+          conversationId: 'conv',
+        },
+      ],
+    ]) {
+      const rows = recoverRetainedTelegramHistory([prior, source, ...response], 'owner', 'conv');
+      expect(rows[1]).toEqual({ ...source, parentMessageId: 'prior' });
+      expect(source.parentMessageId).toBe('lost-response');
+      expect(
+        traceMainHistoryAncestry({
+          messages: rows,
+          headId: 'source',
+          ownerId: 'owner',
+          conversationId: 'conv',
+        }).complete,
+      ).toBe(true);
+    }
+    for (const foreign of [
+      { ...prior, user: 'other' },
+      { ...prior, conversationId: 'other' },
+      { ...prior, deletedAt: new Date() },
+    ]) {
+      expect(recoverRetainedTelegramHistory([foreign, source], 'owner', 'conv')[1]).toBe(source);
+    }
+    expect(recoverRetainedTelegramHistory([source], 'owner', 'conv')[0]).toBe(source);
+    const untrusted = { ...source, metadata: {} };
+    expect(recoverRetainedTelegramHistory([prior, untrusted], 'owner', 'conv')[1]).toBe(untrusted);
+    const healthy = { ...source, parentMessageId: 'prior' };
+    expect(recoverRetainedTelegramHistory([prior, healthy], 'owner', 'conv')[1]).toBe(healthy);
+  });
+
   function agent(instructions = 'Stable Main policy.') {
     return {
       id: 'main-agent',
@@ -1241,6 +1312,197 @@ describe('ViventiumMainContextService', () => {
     expect(hasUnreconciledMainHistory(branch.slice(-1))).toBe(false);
   });
 
+  function failedCallHistory() {
+    const roles = [
+      'user',
+      'assistant',
+      'assistant',
+      'assistant',
+      'user',
+      'assistant',
+      'user',
+      'assistant',
+      'assistant',
+      'assistant',
+      'user',
+      'assistant',
+      'assistant',
+      'user',
+      'assistant',
+      'user',
+      'user',
+      'assistant',
+      'user',
+      'assistant',
+      'user',
+      'assistant',
+      'user',
+      'assistant',
+      'user',
+      'assistant',
+      'user',
+    ];
+    return roles.map((role, index) => ({
+      messageId: `source-${index}`,
+      parentMessageId: index ? `source-${index - 1}` : '00000000-0000-0000-0000-000000000000',
+      role,
+      user: 'owner',
+      conversationId: 'conversation',
+      isCreatedByUser: role === 'user',
+      unfinished: false,
+      error: index === 25,
+      text: `Synthetic source ${index}.`,
+      content:
+        role === 'user'
+          ? []
+          : [
+              { type: 'text', text: `Synthetic source ${index}.` },
+              ...(index === 25 ? [{ type: 'error', error: 'Native turn failed.' }] : []),
+            ],
+      metadata: {
+        viventium: {
+          ...([2, 8].includes(index)
+            ? {
+                type: 'glasshive_worker_callback',
+                visibility: 'internal',
+              }
+            : {}),
+          ...(index >= 22 && index <= 25
+            ? {
+                callSessionId: 'synthetic-call',
+                inputMode: 'voice_call',
+                actorTrust: 'unknown',
+              }
+            : {}),
+          ...(index === 25 ? { deliveryAcknowledgement: { state: 'committed' } } : {}),
+        },
+      },
+    }));
+  }
+
+  function captureFailedCall(raw = failedCallHistory(), changeMessages = (messages) => messages) {
+    const { formatAgentMessages } = require('@librechat/agents');
+    const {
+      isRuntimeOnlyAssistantMessage,
+      normalizeUserMessageContent,
+    } = require('../normalizeTextContentParts');
+    const visible = raw.filter((row) => !isRuntimeOnlyAssistantMessage(row));
+    const proof = traceMainHistoryAncestry({
+      messages: raw.slice(0, -1),
+      headId: raw.at(-1).parentMessageId,
+      ownerId: 'owner',
+      conversationId: 'conversation',
+    });
+    const providerMessages = formatAgentMessages(visible.map(normalizeUserMessageContent)).messages;
+    return captureMainContextSnapshot(
+      { user: { id: 'owner' }, body: { conversationId: 'conversation' } },
+      {
+        agent: agent(),
+        visibleMessages: visible,
+        messages: changeMessages(providerMessages),
+        historyAncestry: proof,
+        protectUnreconciledHistory:
+          hasUnreconciledMainHistory(visible) || proof.hasUnreconciledSource,
+      },
+    );
+  }
+
+  test('carries the 26-row failed call ancestry through the real formatter without accepting its partial answer', () => {
+    const raw = failedCallHistory();
+    const before = JSON.stringify(raw);
+    const snapshot = captureFailedCall(raw);
+    expect(snapshot.visibleMessageChain).toHaveLength(25);
+    expect(snapshot.visibleMessageChain.find((row) => row.id === 'source-25')).toMatchObject({
+      accepted_source: false,
+      role: 'assistant',
+      bytes: 20,
+    });
+    expect(
+      snapshot.visibleMessageChain
+        .filter((row) => row.accepted_source === false)
+        .map((row) => row.id),
+    ).toEqual(['source-22', 'source-23', 'source-24', 'source-25']);
+    expect(raw[25]).toMatchObject({
+      error: true,
+      unfinished: false,
+      metadata: { viventium: { deliveryAcknowledgement: { state: 'committed' } } },
+    });
+    expect(JSON.stringify(raw)).toBe(before);
+  });
+
+  test.each([
+    ['foreign owner', { user: 'other' }],
+    ['foreign conversation', { conversationId: 'other' }],
+    ['deleted', { deletedAt: new Date() }],
+    ['unfinished', { unfinished: true }],
+    ['internal', { metadata: { viventium: { visibility: 'internal' } } }],
+    ['role mismatch', { role: 'user' }],
+    ['missing prose', { content: [] }],
+  ])('keeps %s rejection for failed visible context', (_case, changes) => {
+    const raw = failedCallHistory();
+    raw[25] = { ...raw[25], ...changes };
+    expect(() => captureFailedCall(raw)).toThrow(
+      expect.objectContaining({ code: 'source_context_unavailable', status: 413 }),
+    );
+  });
+
+  test.each(['missing', 'truncated', 'reordered'])(
+    'rejects %s formatted failed context',
+    (change) => {
+      expect(() =>
+        captureFailedCall(undefined, (messages) => {
+          const altered = [...messages];
+          if (change === 'missing') altered.splice(-2, 1);
+          if (change === 'truncated') altered[altered.length - 2].content = 'Short.';
+          if (change === 'reordered')
+            [altered[0], altered[altered.length - 2]] = [altered[altered.length - 2], altered[0]];
+          return altered;
+        }),
+      ).toThrow(expect.objectContaining({ code: 'source_context_unavailable', status: 413 }));
+    },
+  );
+
+  test('restricted history does not force legacy protection or block a bounded long-call carrier', () => {
+    const history = Array.from({ length: 261 }, (_, index) => ({
+      messageId: `restricted-${index}`,
+      parentMessageId: index ? `restricted-${index - 1}` : '00000000-0000-0000-0000-000000000000',
+      user: 'owner',
+      conversationId: 'conversation',
+      role: index % 2 ? 'assistant' : 'user',
+      isCreatedByUser: index % 2 === 0,
+      content: `Synthetic restricted source ${index}.`,
+      metadata: {
+        viventium: {
+          callSessionId: 'synthetic-call',
+          inputMode: 'voice_call',
+          actorTrust: 'shared_mic_unverified',
+        },
+      },
+    }));
+    const proof = traceMainHistoryAncestry({
+      messages: history.slice(0, -1),
+      headId: history.at(-1).parentMessageId,
+      ownerId: 'owner',
+      conversationId: 'conversation',
+    });
+    expect(proof.hasUnreconciledSource).toBe(false);
+    expect(hasUnreconciledMainHistory(history)).toBe(false);
+    expect(withReconciledHistoryAncestry(proof, [], history).hasUnreconciledSource).toBe(false);
+    const snapshot = captureMainContextSnapshot(
+      { user: { id: 'owner' }, body: { conversationId: 'conversation' } },
+      {
+        agent: agent(),
+        visibleMessages: history,
+        messages: history,
+        historyAncestry: proof,
+        protectUnreconciledHistory: false,
+      },
+    );
+    expect(snapshot.visibleMessageChain.length).toBeLessThanOrEqual(128);
+    expect(snapshot.visibleMessageChain.every((row) => row.accepted_source !== true)).toBe(true);
+    expect(snapshot.visibleMessageChain.at(-1).id).toBe('restricted-260');
+  });
+
   test('rejects a pruned unstamped prior turn before claiming Core-owned V1', () => {
     const history = [
       {
@@ -1431,5 +1693,326 @@ describe('ViventiumMainContextService', () => {
     expect(after.snapshotSha256).toBe(before.snapshotSha256);
     expect(after.visibleMessageChain).toEqual(before.visibleMessageChain);
     expect(after.routeFacts.primary).toEqual(before.routeFacts.primary);
+  });
+});
+
+describe('persisted Main history projection', () => {
+  const {
+    normalizeUserMessageContent,
+    isRuntimeOnlyAssistantMessage,
+  } = require('../normalizeTextContentParts');
+  test('preserves an accepted answer while excluding its typed delivery status from the text carrier', () => {
+    const base = { user: 'owner', conversationId: 'conversation' };
+    const first = {
+      ...base,
+      messageId: 'first',
+      parentMessageId: '',
+      isCreatedByUser: true,
+      text: 'Calculate.',
+      content: [],
+    };
+    const answer = {
+      ...base,
+      messageId: 'answer',
+      parentMessageId: 'first',
+      isCreatedByUser: false,
+      text: '391',
+      content: [
+        { type: 'cortex_insight' },
+        { type: 'harness_activity' },
+        { type: 'text', text: '391' },
+      ],
+    };
+    const current = {
+      ...base,
+      messageId: 'current',
+      parentMessageId: 'answer',
+      isCreatedByUser: true,
+      text: 'Continue.',
+      content: [],
+    };
+    const visible = [first, answer, current];
+    const proof = traceMainHistoryAncestry({
+      messages: visible,
+      headId: 'answer',
+      ownerId: 'owner',
+      conversationId: 'conversation',
+    });
+    const messages = [
+      { role: 'user', content: 'Calculate.' },
+      { role: 'assistant', content: '391' },
+      { role: 'user', content: 'Continue.' },
+    ];
+    const capture = (final) =>
+      captureMainContextSnapshot(
+        { user: { id: 'owner' }, body: { conversationId: 'conversation' } },
+        {
+          agent: { id: 'main' },
+          visibleMessages: visible,
+          messages: final,
+          historyAncestry: proof,
+          protectUnreconciledHistory: true,
+        },
+      );
+    expect(capture(messages).visibleMessageChain.map((row) => row.id)).toEqual([
+      'first',
+      'answer',
+      'current',
+    ]);
+    expect(proof.skippedMessageIds).toEqual([]);
+    expect(() => capture([messages[0], messages[2]])).toThrow(
+      expect.objectContaining({ code: 'source_context_unavailable' }),
+    );
+    expect(() =>
+      capture([messages[0], { role: 'assistant', content: 'changed' }, messages[2]]),
+    ).toThrow(expect.objectContaining({ code: 'source_context_unavailable' }));
+  });
+  test('carries history through internal worker status without calling it an accepted answer', () => {
+    const base = { user: 'owner', conversationId: 'conversation' };
+    const first = {
+      ...base,
+      messageId: 'first',
+      parentMessageId: '',
+      isCreatedByUser: true,
+      text: 'Compare these offers.',
+    };
+    const status = {
+      ...base,
+      messageId: 'status',
+      parentMessageId: 'first',
+      isCreatedByUser: false,
+      text: 'Mission completed.',
+      content: [{ type: 'text', text: 'Mission completed.' }],
+      metadata: { viventium: { type: 'glasshive_worker_callback', visibility: 'internal' } },
+    };
+    const current = {
+      ...base,
+      messageId: 'current',
+      parentMessageId: 'status',
+      isCreatedByUser: true,
+      text: 'Show the result.',
+    };
+    const proof = traceMainHistoryAncestry({
+      messages: [first, status],
+      headId: 'status',
+      ownerId: 'owner',
+      conversationId: 'conversation',
+    });
+    expect(proof.messageIds).toEqual(['first', 'status']);
+    expect(proof.skippedMessageIds).toEqual(['status']);
+    const visible = [first, status, current].filter((row) => !isRuntimeOnlyAssistantMessage(row));
+    const snapshot = captureMainContextSnapshot(
+      { user: { id: 'owner' }, body: { conversationId: 'conversation' } },
+      {
+        agent: { id: 'main' },
+        visibleMessages: visible,
+        messages: visible.map((row) => ({ role: 'user', content: row.text })),
+        historyAncestry: proof,
+        protectUnreconciledHistory: true,
+      },
+    );
+    expect(snapshot.visibleMessageChain.map((row) => row.id)).toEqual(['first', 'current']);
+    for (const change of [
+      { metadata: {} },
+      { isCreatedByUser: true },
+      { unfinished: true },
+      { files: ['file'] },
+      { attachments: [{ type: 'file' }] },
+    ]) {
+      expect(isRuntimeOnlyAssistantMessage({ ...status, ...change })).toBe(false);
+    }
+    expect(
+      traceMainHistoryAncestry({
+        messages: [first, { ...status, user: 'foreign' }],
+        headId: 'status',
+        ownerId: 'owner',
+        conversationId: 'conversation',
+      }).complete,
+    ).toBe(false);
+  });
+
+  test('carries stored user text across a failed tool receipt without shortening raw ancestry', () => {
+    const base = { user: 'owner', conversationId: 'conversation' };
+    const first = {
+      ...base,
+      messageId: 'first',
+      parentMessageId: '',
+      isCreatedByUser: true,
+      text: 'Keep this exact fact.',
+      content: [],
+    };
+    const receipt = {
+      ...base,
+      messageId: 'failure',
+      parentMessageId: 'first',
+      isCreatedByUser: false,
+      text: '',
+      error: true,
+      content: [{ type: 'error', error: 'Unavailable.' }, { type: 'cortex_insight' },
+        { type: 'tool_call', tool_call: { id: 'synthetic-call', type: 'tool_call' } }],
+      attachments: [{ type: 'memory', memory: { type: 'update', key: 'context' } }],
+    };
+    const current = {
+      ...base,
+      messageId: 'current',
+      parentMessageId: 'failure',
+      isCreatedByUser: true,
+      text: 'Continue.',
+      content: [],
+    };
+    const raw = [first, receipt];
+    const proof = traceMainHistoryAncestry({
+      messages: raw,
+      headId: 'failure',
+      ownerId: 'owner',
+      conversationId: 'conversation',
+    });
+    expect(proof.messageIds).toEqual(['first', 'failure']);
+    expect(proof.skippedMessageIds).toEqual(['failure']);
+    const visible = [...raw, current].filter((row) => !isRuntimeOnlyAssistantMessage(row));
+    const providerMessages = visible.map((row) => ({
+      role: 'user',
+      content: normalizeUserMessageContent(row).content,
+    }));
+    const capture = (messages) =>
+      captureMainContextSnapshot(
+        { user: { id: 'owner' }, body: { conversationId: 'conversation' } },
+        {
+          agent: { id: 'main' },
+          visibleMessages: visible,
+          messages,
+          historyAncestry: proof,
+          protectUnreconciledHistory: true,
+        },
+      );
+    expect(capture(providerMessages).visibleMessageChain.map((row) => row.id)).toEqual([
+      'first',
+      'current',
+    ]);
+    expect(() => capture(providerMessages.slice(1))).toThrow(
+      expect.objectContaining({ code: 'source_context_unavailable' }),
+    );
+    expect(isRuntimeOnlyAssistantMessage({ ...receipt, text: 'Actual answer' })).toBe(false);
+    expect(isRuntimeOnlyAssistantMessage({ ...receipt, error: false })).toBe(false);
+    expect(
+      isRuntimeOnlyAssistantMessage({
+        ...receipt,
+        content: [...receipt.content, { type: 'text', text: 'Actual answer' }],
+      }),
+    ).toBe(false);
+    expect(isRuntimeOnlyAssistantMessage({ ...receipt, files: ['file'] })).toBe(false);
+    expect(
+      isRuntimeOnlyAssistantMessage({
+        ...receipt,
+        attachments: [{ type: 'file', file_id: 'file' }],
+      }),
+    ).toBe(false);
+    expect(isRuntimeOnlyAssistantMessage({ ...receipt, attachments: [{}] })).toBe(false);
+    expect(isRuntimeOnlyAssistantMessage({ ...receipt, unfinished: true })).toBe(false);
+    expect(
+      isRuntimeOnlyAssistantMessage({
+        ...receipt,
+        content: [...receipt.content, { type: 'text', text: '  ' }],
+      }),
+    ).toBe(true);
+    expect(
+      isRuntimeOnlyAssistantMessage({
+        ...receipt,
+        text: 'Partial answer the user never saw.',
+        unfinished: true,
+        metadata: { viventium: { deliveryAcknowledgement: { state: 'failed' } } },
+      }),
+    ).toBe(true);
+    expect(
+      isRuntimeOnlyAssistantMessage({
+        ...first,
+        metadata: { viventium: { deliveryAcknowledgement: { state: 'failed' } } },
+      }),
+    ).toBe(false);
+    expect(
+      traceMainHistoryAncestry({
+        messages: [{ ...first, user: 'foreign' }, receipt],
+        headId: 'failure',
+        ownerId: 'owner',
+        conversationId: 'conversation',
+      }).complete,
+    ).toBe(false);
+  });
+
+  test('an emptied or adapter-failed answer stays honest without poisoning the next turn', () => {
+    const base = { user: 'owner', conversationId: 'conversation' };
+    const user = (messageId, parentMessageId, text) => ({
+      ...base,
+      messageId,
+      parentMessageId,
+      isCreatedByUser: true,
+      text,
+      content: [],
+    });
+    const first = user('first', '', 'Compare two quotes.');
+    // A native answer revoked before it finished: only an empty text block beside internal parts.
+    const emptied = {
+      ...base,
+      messageId: 'emptied',
+      parentMessageId: 'first',
+      isCreatedByUser: false,
+      text: '',
+      content: [
+        { type: 'text', text: '' },
+        { type: 'think', think: 'Working.' },
+        { type: 'cortex_insight' },
+      ],
+    };
+    const second = user('second', 'emptied', 'Use sixty.');
+    // An answer whose adapter showed a failure and acknowledged it `failed`.
+    const failed = {
+      ...base,
+      messageId: 'failed',
+      parentMessageId: 'second',
+      isCreatedByUser: false,
+      text: '',
+      unfinished: true,
+      content: [{ type: 'cortex_insight' }, { type: 'error', error: 'Unavailable.' }],
+      metadata: { viventium: { deliveryAcknowledgement: { state: 'failed', revision: 1 } } },
+    };
+    const current = user('current', 'failed', 'Try again.');
+    const raw = [first, emptied, second, failed];
+    const proof = traceMainHistoryAncestry({
+      messages: raw,
+      headId: 'failed',
+      ownerId: 'owner',
+      conversationId: 'conversation',
+    });
+    expect(proof.skippedMessageIds).toEqual(['failed', 'emptied']);
+    const capture = (visible) =>
+      captureMainContextSnapshot(
+        { user: { id: 'owner' }, body: { conversationId: 'conversation' } },
+        {
+          agent: { id: 'main' },
+          visibleMessages: visible,
+          // The provider formatter carries only rows with model-visible content.
+          messages: [first, second, current].map((row) => ({
+            role: 'user',
+            content: normalizeUserMessageContent(row).content,
+          })),
+          historyAncestry: proof,
+          protectUnreconciledHistory: true,
+        },
+      );
+    const visible = [...raw, current].filter((row) => !isRuntimeOnlyAssistantMessage(row));
+    expect(capture(visible).visibleMessageChain.map((row) => row.id)).toEqual([
+      'first',
+      'second',
+      'current',
+    ]);
+    // Carrying either row as accepted history is still refused.
+    for (const carried of [emptied, failed]) {
+      const withCarried = [first, emptied, second, failed, current].filter(
+        (row) => row === carried || !isRuntimeOnlyAssistantMessage(row),
+      );
+      expect(() => capture(withCarried)).toThrow(
+        expect.objectContaining({ code: 'source_context_unavailable' }),
+      );
+    }
   });
 });

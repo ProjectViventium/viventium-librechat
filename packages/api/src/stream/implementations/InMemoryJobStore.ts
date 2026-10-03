@@ -20,7 +20,12 @@ import type {
   CortexPresentationBinding,
 } from '~/stream/interfaces/IJobStore';
 import { mergeSourceSegmentsWithOverflow } from '~/stream/sourceSegments';
-import { retainLogicalTurnInput, mergeLogicalTurnInput } from './logicalTurnInput';
+import {
+  commitSourceAuthors,
+  earlierAuthoringRevisions,
+  retainLogicalTurnInput,
+  mergeLogicalTurnInput,
+} from './logicalTurnInput';
 import { streamLogRef } from '~/stream/logPrivacy';
 import {
   nativeIdentityJson,
@@ -49,6 +54,16 @@ interface LogicalTurnState {
   pendingInputs?: InteractionContext[];
   completedAt?: number;
 }
+
+/** Who authors a logical turn's sources; kept past the turn's retirement for late commits. */
+interface AuthorLedger {
+  reservations: Map<number, string>;
+  authors: Set<number>;
+  takenOver: Set<number>;
+  touchedAt: number;
+}
+
+const AUTHOR_LEDGER_RETENTION_MS = 20 * 60 * 1000;
 
 function logicalTurnScope(userId: string, interactionContext: InteractionContext): string {
   if (interactionContext.source_order_scope) {
@@ -180,6 +195,7 @@ export class InMemoryJobStore implements IJobStore {
 
   /** Reverse owner index; callers never supply user or conversation authority. */
   private logicalTurnIndex = new Map<string, LogicalTurnState>();
+  private authorLedgers = new Map<string, AuthorLedger>();
   private streamScopes = new Map<string, string>();
 
   /** Time to keep completed jobs before cleanup (0 = immediate) */
@@ -412,6 +428,7 @@ export class InMemoryJobStore implements IJobStore {
     job.status = mode === 'cancelled' ? 'aborted' : 'complete';
     job.completedAt = Date.now();
     delete job.error;
+    delete job.errorClass;
     return true;
   }
 
@@ -691,8 +708,19 @@ export class InMemoryJobStore implements IJobStore {
     }
 
     const activeStreamId = existing?.active ? existing.currentStreamId : undefined;
-    const continuesTurn = activeStreamId != null;
-    const continuesPending = !continuesTurn && Boolean(existing?.pendingInputs?.length);
+    /* === VIVENTIUM START ===
+     * Fix: a newer source from another conversation still supersedes the active stream in this
+     * source-order scope, but it starts its own logical turn without the other turn's sources.
+     */
+    const turnConversationId =
+      existing?.currentContext?.conversation_id ?? existing?.pendingInputs?.[0]?.conversation_id;
+    const sameConversation =
+      turnConversationId === undefined ||
+      turnConversationId === interactionContext.conversation_id;
+    const continuesTurn = activeStreamId != null && sameConversation;
+    const continuesPending =
+      !continuesTurn && sameConversation && Boolean(existing?.pendingInputs?.length);
+    /* === VIVENTIUM END === */
     if (!continuesTurn && existing && !continuesPending) {
       this.retireLogicalTurnState(existing);
     }
@@ -716,9 +744,14 @@ export class InMemoryJobStore implements IJobStore {
           };
     state.completedAt = undefined;
     state.revision += 1;
+    // A source this claim first admits is provisionally this revision's until an admission commit
+    // fixes its author; sources of earlier revisions keep their marks through the identity dedupe.
     const mergedSourceSegments = mergeSourceSegmentsWithOverflow(
       continuesTurn ? state.sourceSegments : [],
-      mergedInput.source_segments ? [...mergedInput.source_segments] : undefined,
+      mergedInput.source_segments?.map((segment) => ({
+        ...segment,
+        authoring_revision: state.revision,
+      })),
       continuesTurn ? state.sourceSegmentsOverflowCount : 0,
       mergedInput.source_segments_overflow_count,
     );
@@ -736,12 +769,13 @@ export class InMemoryJobStore implements IJobStore {
         ? { source_segments_overflow_count: state.sourceSegmentsOverflowCount }
         : {}),
     });
-    const supersededStreamIds = continuesTurn && activeStreamId ? [activeStreamId] : [];
+    const supersededStreamIds = activeStreamId ? [activeStreamId] : [];
     state.currentContext = claimedContext;
     state.pendingInputs = [];
     state.currentStreamId = streamId;
     state.active = true;
     state.revisionStreams.set(state.revision, streamId);
+    this.authorLedger(state.logicalTurnId).reservations.set(state.revision, streamId);
     state.revisionSourceSegments.set(
       state.revision,
       state.sourceSegments.map((segment) => ({ ...segment })),
@@ -810,6 +844,70 @@ export class InMemoryJobStore implements IJobStore {
     };
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Admission-committed source authors.
+   * Purpose: Only a revision whose admission completed authors sources. Its commit is atomic here:
+   * each carried source belongs to the earliest committed revision that carried it, else to this
+   * one, and every earlier revision without a commit is taken over and can never commit. The
+   * ledger outlives the turn's retirement, so a late commit still sees who authors what.
+   * === VIVENTIUM END === */
+  private authorLedger(logicalTurnId: string): AuthorLedger {
+    let ledger = this.authorLedgers.get(logicalTurnId);
+    if (!ledger) {
+      ledger = { reservations: new Map(), authors: new Set(), takenOver: new Set(), touchedAt: 0 };
+      this.authorLedgers.set(logicalTurnId, ledger);
+    }
+    ledger.touchedAt = Date.now();
+    return ledger;
+  }
+
+  async commitLogicalTurnAdmission(
+    streamId: string,
+    userId: string,
+    interactionContext: InteractionContext,
+  ): Promise<InteractionContext> {
+    const { logical_turn_id: logicalTurnId, revision } = interactionContext;
+    const ledger = logicalTurnId ? this.authorLedgers.get(logicalTurnId) : undefined;
+    const job = this.jobs.get(streamId);
+    if (
+      !ledger ||
+      !job ||
+      job.userId !== userId ||
+      job.interactionContext?.logical_turn_id !== logicalTurnId ||
+      job.interactionContext?.revision !== revision ||
+      ledger.reservations.get(revision) !== streamId ||
+      ledger.takenOver.has(revision)
+    ) {
+      throw streamIdConflictError();
+    }
+    if (ledger.authors.has(revision)) {
+      return job.interactionContext;
+    }
+    const committed = commitSourceAuthors(interactionContext, (earlier) =>
+      ledger.authors.has(earlier),
+    );
+    for (const earlier of earlierAuthoringRevisions(interactionContext)) {
+      if (!ledger.authors.has(earlier)) ledger.takenOver.add(earlier);
+    }
+    ledger.authors.add(revision);
+    ledger.touchedAt = Date.now();
+    job.interactionContext = committed;
+    return committed;
+  }
+
+  async relinquishLogicalTurnAuthor(
+    streamId: string,
+    _userId: string,
+    interactionContext: InteractionContext,
+  ): Promise<void> {
+    const { logical_turn_id: logicalTurnId, revision } = interactionContext;
+    const ledger = logicalTurnId ? this.authorLedgers.get(logicalTurnId) : undefined;
+    if (ledger?.reservations.get(revision) !== streamId) return;
+    ledger.authors.delete(revision);
+    ledger.takenOver.add(revision);
+    ledger.touchedAt = Date.now();
+  }
+
   async rollbackLogicalTurnClaim(
     streamId: string,
     interactionContext: InteractionContext,
@@ -833,6 +931,7 @@ export class InMemoryJobStore implements IJobStore {
       state.receipts.delete(interactionContext.source_event_id);
     }
     state.revisionStreams.delete(interactionContext.revision);
+    this.authorLedgers.get(state.logicalTurnId)?.reservations.delete(interactionContext.revision);
     state.revisionSourceSegments.delete(interactionContext.revision);
     state.revisionSourceSegmentsOverflowCounts.delete(interactionContext.revision);
     state.revisionSourceOrders.delete(interactionContext.revision);
@@ -1013,6 +1112,35 @@ export class InMemoryJobStore implements IJobStore {
     return this.jobs.get(streamId) ?? null;
   }
 
+  async claimNativeDispatchLease(
+    streamId: string,
+    claim: { createdAt: number; owner: string; leaseMs: number; mode: 'renew' | 'takeover' },
+  ): Promise<boolean> {
+    const job = this.jobs.get(streamId);
+    if (
+      !job ||
+      !claim.owner ||
+      job.createdAt !== claim.createdAt ||
+      job.status !== 'running' ||
+      job.nativeResponse
+    ) {
+      return false;
+    }
+    const now = Date.now();
+    const refused =
+      claim.mode === 'renew'
+        ? Boolean(job.nativeDispatchOwner) && job.nativeDispatchOwner !== claim.owner
+        : !job.nativeDispatchOwner ||
+          job.nativeDispatchOwner === claim.owner ||
+          (job.nativeDispatchLeaseUntil ?? 0) > now;
+    if (refused) {
+      return false;
+    }
+    job.nativeDispatchOwner = claim.owner;
+    job.nativeDispatchLeaseUntil = now + claim.leaseMs;
+    return true;
+  }
+
   async updateJob(
     streamId: string,
     updates: Partial<SerializableJobData>,
@@ -1050,6 +1178,7 @@ export class InMemoryJobStore implements IJobStore {
       if (job.nativeResponseFinished) {
         delete safe.status;
         delete safe.error;
+        delete safe.errorClass;
         delete safe.completedAt;
       }
     }
@@ -1134,12 +1263,52 @@ export class InMemoryJobStore implements IJobStore {
         };
       }
     }
+    const turn = this.logicalTurnIndex.get(acknowledgement.logical_turn_id);
+    const turnState =
+      turn &&
+      this.logicalTurns.get(turn.scope) === turn &&
+      turn.revisionStreams.get(acknowledgement.revision) === streamId
+        ? turn
+        : undefined;
+    const sourceOrder = turnState?.revisionSourceOrders.get(acknowledgement.revision);
+    const latestSourceOrder = sourceOrder
+      ? this.sourceOrderWatermarks.get(sourceOrder.source_order_scope)
+      : undefined;
+    if (
+      ['committed', 'committed_effect'].includes(acknowledgement.state) &&
+      sourceOrder &&
+      latestSourceOrder &&
+      latestSourceOrder.latestSourceSequence > sourceOrder.source_sequence
+    ) {
+      // Input newer than this turn's source withdraws the presentation before it commits.
+      return { status: 'stale_source_order' };
+    }
     const recordedAcknowledgement = { ...acknowledgement };
     delete recordedAcknowledgement.presentation_committed_at;
     recordedAcknowledgement.presentation_committed_at = Date.now();
     Object.freeze(recordedAcknowledgement);
     job.cortexDeliveryAcknowledgement = recordedAcknowledgement;
     job.cortexDeliveryAcknowledgementPresentation = expectedCortexPresentation;
+    // Only a presentation of the parent message itself (a promoted empty answer) is also the
+    // turn's Main receipt, while Main has none; a separate addition never touches it.
+    if (
+      turnState &&
+      expectedCortexPresentation.messageId === expectedCortexPresentation.parentMessageId &&
+      !turnState.deliveryAcknowledgements.has(acknowledgement.revision)
+    ) {
+      turnState.deliveryAcknowledgements.set(acknowledgement.revision, recordedAcknowledgement);
+      job.deliveryAcknowledgement = recordedAcknowledgement;
+      if (
+        acknowledgement.revision === turnState.revision &&
+        (acknowledgement.state === 'committed' || acknowledgement.state === 'failed')
+      ) {
+        turnState.active = false;
+        turnState.completedAt = Date.now();
+        if (latestSourceOrder) {
+          latestSourceOrder.expiresAt = Date.now() + this.sourceOrderTtl;
+        }
+      }
+    }
     return {
       status: 'recorded',
       acknowledgement: recordedAcknowledgement,
@@ -1234,6 +1403,14 @@ export class InMemoryJobStore implements IJobStore {
         this.nativePublications.delete(key);
       }
     }
+    for (const [logicalTurnId, ledger] of this.authorLedgers) {
+      if (
+        !this.logicalTurnIndex.has(logicalTurnId) &&
+        now - ledger.touchedAt > AUTHOR_LEDGER_RETENTION_MS
+      ) {
+        this.authorLedgers.delete(logicalTurnId);
+      }
+    }
 
     if (toDelete.length > 0) {
       logger.debug(`[InMemoryJobStore] Cleaned up ${toDelete.length} expired jobs`);
@@ -1300,6 +1477,7 @@ export class InMemoryJobStore implements IJobStore {
     this.sourceOrderWatermarks.clear();
     this.nativePublications.clear();
     this.logicalTurnIndex.clear();
+    this.authorLedgers.clear();
     this.streamScopes.clear();
     logger.debug('[InMemoryJobStore] Destroyed');
   }

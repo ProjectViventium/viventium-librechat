@@ -1,9 +1,14 @@
+const mockRecordVoiceRequestTrace = jest.fn(async () => null);
+jest.mock('../viventium/VoiceOrchestrationTraceService', () => ({
+  recordVoiceRequestTrace: (...args) => mockRecordVoiceRequestTrace(...args),
+}));
 // VIVENTIUM START: verify Viventium background-cortex activation policy behavior.
 jest.mock('../viventium/CortexInsightOutboxService', () => ({
   enqueueCompletedCortexInsightOutboxBatch: jest.fn(async () => ({
     outboxKeys: ['test-cortex-outbox'],
   })),
   settleCompletedCortexInsightOutboxBatch: jest.fn(async () => ({ deleted: 1 })),
+  registerOwnedCompletedCortexParent: jest.fn(),
 }));
 
 const mockPersistCortexPartsToCanonicalMessage = jest.fn(async () => []);
@@ -217,6 +222,64 @@ describe('BackgroundCortexService activation policy helpers', () => {
     ).toBe('core');
   });
 
+  test('keeps an isolated internal worker from forwarding the triggering Main turn context', async () => {
+    // The Main continuity compactor inherits Main's request by prototype and sends one message.
+    const mainReq = requestWithMainSnapshot();
+    const run = async (mainContextBinding) => {
+      const safeReq = Object.create(mainReq);
+      safeReq.body = { conversationId: 'c43-compaction' };
+      safeReq.config = {
+        endpoints: { agents: { allowedProviders: ['openai'], providerCapabilities: {} } },
+      };
+      let headers;
+      await executeCortexOnce(
+        {
+          agent: {
+            id: 'main-continuity-compactor-c43-compaction',
+            provider: 'openai',
+            model: 'test-model',
+            model_parameters: { model: 'test-model' },
+            tools: [],
+          },
+          messages: [],
+          runId: 'c43-compaction-run',
+          conversationId: 'c43-compaction',
+          req: safeReq,
+          contextMode: 'minimal',
+          completedResultPolicy: 'internal',
+          insightMode: 'structured',
+          ...(mainContextBinding ? { mainContextBinding } : {}),
+        },
+        {
+          initializeAgentFn: jest.fn(async ({ agent }) => ({
+            ...agent,
+            instructions: '',
+            model_parameters: { model: 'test-model', configuration: { defaultHeaders: {} } },
+          })),
+          createRunFn: jest.fn(async ({ agents }) => {
+            headers = { ...agents[0].model_parameters.configuration.defaultHeaders };
+            return { processStream: jest.fn(async () => [{ type: 'text', text: 'done' }]) };
+          }),
+        },
+      );
+      return headers;
+    };
+
+    const inherited = await run();
+    expect(inherited['X-Viventium-Visible-Message-Chain-B64']).toEqual(expect.any(String));
+    expect(inherited['X-Viventium-Logical-Turn-Id']).toBe('c43-turn');
+
+    const isolated = await run('isolated');
+    expect(Object.keys(isolated).filter((name) => name in inherited)).toEqual([]);
+    await expect(
+      executeCortexOnce({
+        agent: { id: 'x', tools: [] },
+        runId: 'x',
+        mainContextBinding: 'shared',
+      }),
+    ).rejects.toThrow(TypeError);
+  });
+
   test('binds prompt telemetry to the actual cortex agent identity', () => {
     const frame = buildCortexPromptFrame({
       agentId: 'agent_synthetic_cortex',
@@ -231,6 +294,64 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(frame.agent_id_hash).not.toBe('missing');
     expect(frame.decision_state.agent_id_hash).toBe(frame.agent_id_hash);
     expect(JSON.stringify(frame)).not.toContain('agent_synthetic_cortex');
+  });
+
+  test('records trusted request identity and resolved Cortex effort in actual execution telemetry', async () => {
+    const priorLog = process.env.VIVENTIUM_PROMPT_FRAME_LOG;
+    process.env.VIVENTIUM_PROMPT_FRAME_LOG = '1';
+    const debugSpy = jest.spyOn(logger, 'debug').mockImplementation(() => undefined);
+    const req = requestWithMainSnapshot();
+    req.config = {
+      endpoints: { agents: { providerCapabilities: { 'native-test': { workspace_binding: true } } } },
+    };
+    try {
+      await executeCortexOnce(
+        {
+          agent: {
+            id: 'native-telemetry-cortex',
+            provider: 'native-test',
+            model: 'configured-model',
+            model_parameters: { reasoning_effort: 'low' },
+            tools: [],
+          },
+          messages: [],
+          runId: 'native-telemetry-run',
+          conversationId: 'c43-conversation',
+          req,
+          contextMode: 'minimal',
+          completedResultPolicy: 'internal',
+        },
+        {
+          initializeAgentFn: jest.fn(async ({ agent }) => ({
+            ...agent,
+            instructions: '',
+            model_parameters: { model: 'resolved-model', reasoning_effort: 'high' },
+          })),
+          prepareCapabilityFn: jest.fn(async () => undefined),
+          createRunFn: jest.fn(async () => ({ processStream: jest.fn(async () => '{NTA}') })),
+        },
+      );
+      const trace = debugSpy.mock.calls.find(([message]) => message === '[PromptFrameTraceTelemetry]');
+      expect(trace).toBeDefined();
+      const frame = JSON.parse(trace[1]);
+      const { buildPromptFrameRequestIdentityHash } = require('../viventium/promptFrameTelemetry');
+      const { getTrustedInteractionContext } = require('../viventium/interactionContext');
+      expect(frame).toMatchObject({
+        family: 'cortex_execution',
+        request_identity_hash: buildPromptFrameRequestIdentityHash({
+          ownerId: req.user.id,
+          interactionContext: getTrustedInteractionContext(req),
+        }),
+        requested_effort: 'low',
+        effective_effort: 'high',
+      });
+      expect(JSON.stringify(frame)).not.toContain(req.user.id);
+      expect(JSON.stringify(frame)).not.toContain('c43-event');
+    } finally {
+      debugSpy.mockRestore();
+      if (priorLog === undefined) delete process.env.VIVENTIUM_PROMPT_FRAME_LOG;
+      else process.env.VIVENTIUM_PROMPT_FRAME_LOG = priorLog;
+    }
   });
 
   test('preserves structured internal cortex output without applying user-facing summary extraction', () => {
@@ -283,6 +404,248 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(JSON.stringify(result)).not.toContain('internal-only-detail');
   });
 
+  /* === VIVENTIUM START ===
+   * Purpose: A cortex attempt's lifetime is joined to its deadline. The guard that stops waiting
+   * for an attempt aborts it, and an aborted attempt never accepts a result that still arrives,
+   * so no producer outlives its Phase B owner and no fallback overlaps a live primary.
+   * === VIVENTIUM END === */
+  test('an attempt aborted by its guard never accepts a result that completes afterwards', async () => {
+    const attemptController = new AbortController();
+    const persistCompletedInsightFn = jest.fn(async () => ({ durableAcceptance: 'outbox' }));
+    const result = await executeCortexOnce(
+      {
+        agent: { id: 'late-cortex', name: 'Late', provider: 'anthropic', tools: [] },
+        messages: [],
+        runId: 'late-parent',
+        conversationId: 'late-conversation',
+        contextMode: 'minimal',
+        completedResultPolicy: 'owner_batch',
+        attemptSignal: attemptController.signal,
+        req: {
+          user: { id: 'late-owner', role: 'USER' },
+          body: { conversationId: 'late-conversation' },
+          config: {},
+        },
+      },
+      {
+        initializeAgentFn: jest.fn(async ({ agent }) => ({
+          ...agent,
+          instructions: '',
+          tools: [],
+          recursion_limit: 4,
+        })),
+        createRunFn: jest.fn(async () => ({
+          processStream: jest.fn(async () => {
+            attemptController.abort('attempt_deadline');
+            return 'A useful result that arrived after its guard.';
+          }),
+        })),
+        persistCompletedInsightFn,
+      },
+    );
+
+    expect(persistCompletedInsightFn).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ insight: null, errorClass: 'timeout' });
+  });
+
+  test('an aborted attempt cancels its run with the owned deadline reason', async () => {
+    const attemptController = new AbortController();
+    let runSignal = null;
+    const result = await executeCortexOnce(
+      {
+        agent: { id: 'deadline-cortex', name: 'Deadline', provider: 'anthropic', tools: [] },
+        messages: [],
+        runId: 'deadline-parent',
+        conversationId: 'deadline-conversation',
+        contextMode: 'minimal',
+        completedResultPolicy: 'owner_batch',
+        attemptSignal: attemptController.signal,
+        req: {
+          user: { id: 'deadline-owner', role: 'USER' },
+          body: { conversationId: 'deadline-conversation' },
+          config: {},
+        },
+      },
+      {
+        initializeAgentFn: jest.fn(async ({ agent }) => ({
+          ...agent,
+          instructions: '',
+          tools: [],
+          recursion_limit: 4,
+        })),
+        createRunFn: jest.fn(async ({ signal }) => {
+          runSignal = signal;
+          return {
+            processStream: jest.fn(async () => {
+              attemptController.abort('synthetic_guard');
+              throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+            }),
+          };
+        }),
+        persistCompletedInsightFn: jest.fn(),
+      },
+    );
+
+    // The native harness contract cancels and releases a request only for an owned reason.
+    expect(runSignal.aborted).toBe(true);
+    expect(runSignal.reason).toBe('cortex_attempt_deadline');
+    expect(result).toMatchObject({ insight: null, errorClass: 'timeout' });
+  });
+
+  describe('attempt guard', () => {
+    const previous = {};
+    const cortexAgent = {
+      id: 'slow-cortex',
+      name: 'Slow',
+      provider: 'anthropic',
+      tools: [],
+      fallback_llm_provider: 'openai',
+      fallback_llm_model: 'synthetic-fallback-model',
+    };
+    beforeEach(() => {
+      for (const name of [
+        'VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS',
+        'VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS',
+        'VIVENTIUM_CORTEX_ATTEMPT_JOIN_MS',
+      ]) {
+        previous[name] = process.env[name];
+      }
+      process.env.VIVENTIUM_CORTEX_EXECUTION_TIMEOUT_MS = '20';
+      process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS = '10';
+      process.env.VIVENTIUM_CORTEX_ATTEMPT_JOIN_MS = '200';
+    });
+    afterEach(() => {
+      for (const [name, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    });
+
+    function runActivated(executeCortexFn) {
+      return executeActivated(
+        {
+          req: {
+            user: { id: 'guard-owner', role: 'USER' },
+            body: { conversationId: 'guard-conversation' },
+            config: {},
+          },
+          res: createBackgroundRes(),
+          mainAgent: { provider: 'agents' },
+          messages: [],
+          runId: 'guard-parent',
+          conversationId: 'guard-conversation',
+          activatedCortices: [
+            {
+              agentId: cortexAgent.id,
+              cortexName: cortexAgent.name,
+              confidence: 0.9,
+              reason: 'synthetic-attempt-guard',
+            },
+          ],
+        },
+        {
+          loadAgentFn: jest.fn(async () => cortexAgent),
+          loadModelsConfigFn: jest.fn(async () => ({})),
+          resolveFallbackAgentFn: jest.fn(async () => ({
+            ...cortexAgent,
+            id: 'slow-cortex-fallback',
+            provider: 'openai',
+          })),
+          executeCortexFn,
+        },
+      );
+    }
+
+    /** A primary that settles, with its resolved native ownership, only after its cancellation. */
+    function primarySettlingOnCancellation(
+      attempts,
+      { harnessInvocationStarted, nativeOwnership = 'released' },
+    ) {
+      return jest.fn((params) => {
+        const attempt = { agentId: params.agent.id, settled: false };
+        attempts.push(attempt);
+        if (attempts.length > 1) {
+          attempt.primarySettledAtStart = attempts[0].settled;
+          attempt.settled = true;
+          return Promise.resolve({
+            agentId: params.agent.id,
+            insight: null,
+            error: 'fallback failed',
+          });
+        }
+        return new Promise((resolve) => {
+          params.attemptSignal.addEventListener('abort', () => {
+            setTimeout(() => {
+              attempt.settled = true;
+              attempt.reason = params.attemptSignal.reason;
+              resolve({
+                agentId: params.agent.id,
+                agentName: 'Slow',
+                insight: null,
+                error: 'timeout',
+                harnessInvocationStarted,
+                nativeOwnership,
+              });
+            }, 20);
+          });
+        });
+      });
+    }
+
+    test('a primary whose native harness started settles through cancellation and gets no fallback', async () => {
+      const attempts = [];
+      await runActivated(
+        primarySettlingOnCancellation(attempts, { harnessInvocationStarted: true }),
+      );
+
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]).toMatchObject({ settled: true, reason: 'cortex_attempt_deadline' });
+    });
+
+    test('a primary released without output falls back only after it settled', async () => {
+      const attempts = [];
+      const execute = primarySettlingOnCancellation(attempts, { harnessInvocationStarted: false });
+      await runActivated(execute);
+
+      expect(attempts).toHaveLength(2);
+      expect(attempts[1].primarySettledAtStart).toBe(true);
+      // The fallback is its own native request, never a replay of the stopped primary's identity.
+      expect(execute.mock.calls.map(([params]) => params.harnessAttemptRole)).toEqual([
+        'primary',
+        'fallback',
+      ]);
+    });
+
+    test('a primary with no output whose native release is unconfirmed gets no fallback', async () => {
+      const attempts = [];
+      const result = await runActivated(
+        primarySettlingOnCancellation(attempts, {
+          harnessInvocationStarted: false,
+          nativeOwnership: 'unresolved',
+        }),
+      );
+
+      // Absent output is not release: the unresolved native request forbids an overlapping fallback.
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]).toMatchObject({ settled: true, reason: 'cortex_attempt_deadline' });
+      expect(result.insights || []).toEqual([]);
+    });
+
+    test('a primary that does not settle after cancellation is treated as running: no fallback', async () => {
+      const attempts = [];
+      const result = await runActivated(
+        jest.fn((params) => {
+          attempts.push({ signal: params.attemptSignal });
+          return new Promise(() => {});
+        }),
+      );
+
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0].signal.aborted).toBe(true);
+      expect(result.insights || []).toEqual([]);
+    });
+  });
+
   test('preserves the authoritative structured graph for an internal compaction caller', async () => {
     const structured = JSON.stringify({
       version: 1,
@@ -320,6 +683,253 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(result.insight).toBe(structured);
     expect(persistCompletedInsightFn).not.toHaveBeenCalled();
   });
+
+  test.each(['{NTA}', ''])(
+    'a successful native silent result %p ends its exact attempt ownership',
+    async (content) => {
+      const release = jest.fn();
+      const params = {
+        agent: { id: 'native-silent', provider: 'native-test', tools: [] },
+        messages: [],
+        runId: 'native-silent-parent',
+        conversationId: 'native-silent-conversation',
+        contextMode: 'minimal',
+        mainContextBinding: 'isolated',
+        completedResultPolicy: 'internal',
+        req: {
+          user: { id: 'native-silent-owner' },
+          body: {},
+          config: {
+            endpoints: {
+              agents: {
+                providerCapabilities: { 'native-test': { workspace_binding: true } },
+              },
+            },
+          },
+        },
+      };
+      const result = await executeCortexOnce(params, {
+        initializeAgentFn: jest.fn(async ({ agent }) => ({
+          ...agent,
+          instructions: '',
+          tools: [],
+        })),
+        prepareCapabilityFn: jest.fn(async ({ req, requestBody }) => {
+          req._viventiumHarnessExecutionEnabled = true;
+          req._viventiumHarnessIdempotencyKey = requestBody.viventiumGlassHiveIdempotencyKey;
+          req._viventiumHarnessReleaseAttempt = release;
+        }),
+        createRunFn: jest.fn(async () => ({ processStream: jest.fn(async () => content) })),
+      });
+      expect(result.insight).toBe('');
+      expect(result.nativeOwnership).toBe('ended');
+      expect(release).not.toHaveBeenCalled();
+    },
+  );
+
+  test('eight workspace-native cortex siblings complete within the same four-slot capacity', async () => {
+    let active = 0;
+    let peak = 0;
+    const calls = new Map();
+    const nativeFetch = jest.fn(async (_input, init) => {
+      const id = JSON.parse(init.body).agent;
+      const prior = calls.get(id);
+      if (prior) expect(init).toBe(prior);
+      else calls.set(id, init);
+      if (active >= 4)
+        return new Response(JSON.stringify({ error: { code: 'host_capacity' } }), {
+          status: 503,
+          headers: { 'Retry-After': '1' },
+        });
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      active -= 1;
+      return new Response('verified ' + id);
+    });
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, index) => {
+        const agent = { id: 'capacity-sibling-' + index, provider: 'native-test', tools: [] };
+        return executeCortexOnce(
+          {
+            agent,
+            messages: [],
+            runId: 'capacity-parent',
+            conversationId: 'capacity-conversation',
+            contextMode: 'minimal',
+            mainContextBinding: 'isolated',
+            completedResultPolicy: 'internal',
+            executionTimeoutMs: 4000,
+            req: {
+              user: { id: 'capacity-owner' },
+              body: {},
+              config: {
+                endpoints: {
+                  agents: {
+                    providerCapabilities: { 'native-test': { workspace_binding: true } },
+                  },
+                },
+              },
+            },
+          },
+          {
+            initializeAgentFn: jest.fn(async ({ agent }) => ({
+              ...agent,
+              instructions: '',
+              tools: [],
+              model_parameters: { configuration: { fetch: nativeFetch } },
+            })),
+            prepareCapabilityFn: jest.fn(async () => undefined),
+            createRunFn: jest.fn(async ({ agents, signal }) => ({
+              processStream: jest.fn(async () => {
+                const response = await agents[0].model_parameters.configuration.fetch(
+                  'http://native.test/v1/chat/completions',
+                  { body: JSON.stringify({ agent: agent.id }), signal },
+                );
+                if (!response.ok)
+                  throw Object.assign(new Error('native rejected before compute'), {
+                    status: response.status,
+                    code: (await response.json()).error.code,
+                  });
+                return response.text();
+              }),
+            })),
+          },
+        );
+      }),
+    );
+    expect(peak).toBe(4);
+    expect(results).toHaveLength(8);
+    for (let index = 0; index < results.length; index += 1) {
+      expect(results[index]).toMatchObject({ insight: 'verified capacity-sibling-' + index });
+      expect(results[index].errorClass).toBeUndefined();
+    }
+    expect(active).toBe(0);
+  });
+
+  test.each(['user_cancelled', 'maintenance_yield'])(
+    'a queued native owner %s is intentional cancellation, not a timeout',
+    async (reason) => {
+      let releaseFirst;
+      let markEntered;
+      const firstHold = new Promise((resolve) => {
+        releaseFirst = resolve;
+      });
+      const entered = new Promise((resolve) => {
+        markEntered = resolve;
+      });
+      const params = {
+        agent: { id: 'queued-native-' + reason, provider: 'native-test', tools: [] },
+        messages: [],
+        runId: 'queued-parent',
+        conversationId: 'queued-conversation',
+        contextMode: 'minimal',
+        mainContextBinding: 'isolated',
+        completedResultPolicy: 'internal',
+        req: {
+          user: { id: 'queued-owner' },
+          body: {},
+          config: {
+            endpoints: {
+              agents: {
+                providerCapabilities: { 'native-test': { workspace_binding: true } },
+              },
+            },
+          },
+        },
+      };
+      const initializeAgentFn = jest.fn(async ({ agent }) => ({
+        ...agent,
+        instructions: '',
+        tools: [],
+      }));
+      const first = executeCortexOnce(params, {
+        initializeAgentFn,
+        createRunFn: jest.fn(async () => ({
+          processStream: jest.fn(async () => {
+            markEntered();
+            await firstHold;
+            return '{NTA}';
+          }),
+        })),
+      });
+      await entered;
+      const owner = new AbortController();
+      const queuedInitialize = jest.fn();
+      const queued = executeCortexOnce(
+        { ...params, signal: owner.signal },
+        {
+          initializeAgentFn: queuedInitialize,
+        },
+      );
+      owner.abort(reason);
+      const result = await queued;
+      expect(result.errorClass).toBe('background_agent_error');
+      expect(result.errorCode).toBe('native_session_admission_cancelled');
+      expect(result.harnessInvocationStarted).toBe(false);
+      expect(result.nativeOwnership).toBe('none');
+      expect(queuedInitialize).not.toHaveBeenCalled();
+      releaseFirst();
+      await first;
+    },
+  );
+
+  test.each(['typed-error', 'cancelled'])(
+    'native %s must resolve release rather than claim silent completion',
+    async (scenario) => {
+      const controller = new AbortController();
+      const release = jest.fn(async () => ({
+        acknowledged: true,
+        outcomes: [{ acknowledged: true, capacityReleased: true }],
+      }));
+      const result = await executeCortexOnce(
+        {
+          agent: { id: 'native-failed-' + scenario, provider: 'native-test', tools: [] },
+          messages: [],
+          runId: 'native-failed-parent',
+          conversationId: 'native-failed-conversation',
+          contextMode: 'minimal',
+          mainContextBinding: 'isolated',
+          completedResultPolicy: 'internal',
+          attemptSignal: controller.signal,
+          req: {
+            user: { id: 'native-failed-owner' },
+            body: {},
+            config: {
+              endpoints: {
+                agents: {
+                  providerCapabilities: { 'native-test': { workspace_binding: true } },
+                },
+              },
+            },
+          },
+        },
+        {
+          initializeAgentFn: jest.fn(async ({ agent }) => ({
+            ...agent,
+            instructions: '',
+            tools: [],
+          })),
+          prepareCapabilityFn: jest.fn(async ({ req, requestBody }) => {
+            req._viventiumHarnessExecutionEnabled = true;
+            req._viventiumHarnessIdempotencyKey = requestBody.viventiumGlassHiveIdempotencyKey;
+            req._viventiumHarnessReleaseAttempt = release;
+          }),
+          createRunFn: jest.fn(async () => ({
+            processStream: jest.fn(async () => {
+              if (scenario === 'cancelled') {
+                controller.abort('attempt_deadline');
+                return '{NTA}';
+              }
+              return [{ type: 'error', error: 'A typed provider failure.' }];
+            }),
+          })),
+        },
+      );
+      expect(result.nativeOwnership).toBe('released');
+      expect(release).toHaveBeenCalledTimes(1);
+    },
+  );
 
   test('rejects an unknown completed-graph insight mode before provider execution', async () => {
     const initializeAgentFn = jest.fn();
@@ -848,6 +1458,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
     const insight = 'PRIVATE_SYNTHETIC_PRODUCTION_WIRING_INSIGHT';
     const recordBatch = jest.fn().mockRejectedValue(new Error('ledger unavailable'));
     const enqueueOutbox = jest.fn().mockRejectedValue(new Error('outbox unavailable'));
+    const acceptOwned = jest.fn().mockRejectedValue(new Error('outbox unavailable'));
     const initializeAgentFn = jest.fn(async ({ agent }) => ({
       ...agent,
       id: agent.id,
@@ -870,7 +1481,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
       }),
     }));
     const persistCompletedInsightFn = jest.fn((params) =>
-      persistCompletedCortexGraphInsight(params, { recordBatch, enqueueOutbox }),
+      persistCompletedCortexGraphInsight(params, { recordBatch, enqueueOutbox, acceptOwned }),
     );
     const productionExecuteOnce = jest.fn((params) =>
       executeCortexOnce(
@@ -938,8 +1549,10 @@ describe('BackgroundCortexService activation policy helpers', () => {
 
     expect(result).toEqual({ insights: [] });
     expect(productionExecuteOnce).toHaveBeenCalledTimes(1);
-    expect(recordBatch).toHaveBeenCalledTimes(1);
-    expect(enqueueOutbox).toHaveBeenCalledTimes(1);
+    // Phase B accepts once for its owner batch; it never writes a per-cortex ledger batch.
+    expect(acceptOwned).toHaveBeenCalledTimes(1);
+    expect(recordBatch).not.toHaveBeenCalled();
+    expect(enqueueOutbox).not.toHaveBeenCalled();
     expect(onCortexComplete).toHaveBeenCalledWith(
       expect.objectContaining({
         status: 'error',
@@ -979,6 +1592,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
     const insight = 'SYNTHETIC_ACCEPTED_PRODUCTION_WIRING_INSIGHT';
     const recordBatch = jest.fn().mockRejectedValue(new Error('ledger unavailable'));
     const enqueueOutbox = jest.fn(async (batch) => exactOutboxReceipt(batch));
+    const acceptOwned = jest.fn(async (batch) => exactOutboxReceipt(batch));
     const initializeAgentFn = jest.fn(async ({ agent }) => ({
       ...agent,
       instructions: '',
@@ -999,7 +1613,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
       }),
     }));
     const persistCompletedInsightFn = jest.fn((params) =>
-      persistCompletedCortexGraphInsight(params, { recordBatch, enqueueOutbox }),
+      persistCompletedCortexGraphInsight(params, { recordBatch, enqueueOutbox, acceptOwned }),
     );
     const productionExecuteOnce = jest.fn((params) =>
       executeCortexOnce(
@@ -1134,6 +1748,81 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(installRefresher).toHaveBeenCalledWith(args);
   });
 
+  test('binds exact native release using the initialized attempt configuration split', async () => {
+    const { bindHarnessCancellation } = require('../viventium/GlassHiveConversationProviderService');
+    const fetchImpl = jest.fn().mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ capacityReleased: true }),
+    });
+    const targetAgent = {
+      id: 'initialized-cortex',
+      provider: 'openai',
+      model_parameters: {
+        apiKey: 'synthetic-attempt-key',
+        configuration: { baseURL: 'http://native.example/v1' },
+      },
+    };
+    const req = { user: { id: 'owner-synthetic' }, body: {} };
+    const bindCancellation = jest.fn((args) => bindHarnessCancellation({ ...args, fetchImpl }));
+    await prepareCortexConversationProviderCapability({
+      targetAgent,
+      declaredAgent: { provider: 'native-declared-endpoint' },
+      req,
+      cancellationReq: req,
+      capability: { workspace_binding: true },
+      requestBody: { viventiumGlassHiveIdempotencyKey: 'cortex:initialized:attempt-1' },
+      signal: new AbortController().signal,
+      attachBundle: jest.fn(async () => true),
+      installRefresher: jest.fn(),
+      bindCancellation,
+    });
+    expect(bindCancellation.mock.calls[0][0].endpointConfig).toEqual({
+      baseURL: 'http://native.example/v1',
+      apiKey: 'synthetic-attempt-key',
+    });
+    expect(targetAgent.model_parameters.configuration).not.toHaveProperty('apiKey');
+    expect(fetchImpl).not.toHaveBeenCalled();
+    await expect(req._viventiumHarnessReleaseAttempt()).resolves.toMatchObject({
+      acknowledged: true,
+      outcomes: [{ acknowledged: true, capacityReleased: true }],
+    });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://native.example/v1/requests/by-idempotency/cortex%3Ainitialized%3Aattempt-1/cancel',
+      expect.objectContaining({
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer synthetic-attempt-key',
+          'X-Viventium-User-Id': 'owner-synthetic',
+        },
+      }),
+    );
+  });
+
+  test('reports a missing native release binding without exporting the initialized config', async () => {
+    const { bindHarnessCancellation } = require('../viventium/GlassHiveConversationProviderService');
+    const warn = jest.spyOn(logger, 'warn');
+    try {
+      const req = { user: { id: 'owner-synthetic' }, body: {} };
+      await prepareCortexConversationProviderCapability({
+        targetAgent: { model_parameters: { configuration: { baseURL: 'http://native.example/v1' } } },
+        req,
+        capability: { workspace_binding: true },
+        requestBody: { viventiumGlassHiveIdempotencyKey: 'cortex:unbound:attempt-1' },
+        signal: new AbortController().signal,
+        attachBundle: jest.fn(async () => true),
+        installRefresher: jest.fn(),
+        bindCancellation: bindHarnessCancellation,
+      });
+      expect(req._viventiumHarnessReleaseAttempt).toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(
+        '[GlassHiveProvider] Native cortex cancellation binding unavailable',
+        { stage: 'cortex_attempt_binding', errorClass: 'native_cancellation_binding_unavailable' },
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   test('keeps detached Phase B alive after Main cleanup but honors intentional Stop', () => {
     expect(
       isBackgroundCortexCancellationSignal({ aborted: true, reason: 'generation_completed' }),
@@ -1245,6 +1934,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
   });
 
   test('first activation notice returns early while final detection continues', async () => {
+    mockRecordVoiceRequestTrace.mockClear();
     jest.useFakeTimers();
     const events = [];
     const detectPromise = detectActivations({
@@ -1296,6 +1986,11 @@ describe('BackgroundCortexService activation policy helpers', () => {
       'agent_slow',
     ]);
     expect(events).toEqual([]);
+    const activationTraces = mockRecordVoiceRequestTrace.mock.calls
+      .map(([, event]) => event)
+      .filter((event) => event.stage === 'cortex.activation.completed');
+    expect(activationTraces).toHaveLength(2);
+    expect(new Set(activationTraces.map((event) => event.eventRef)).size).toBe(2);
     jest.useRealTimers();
   });
 
@@ -1406,6 +2101,45 @@ describe('BackgroundCortexService activation policy helpers', () => {
         source: 'fallback',
       },
     ]);
+  });
+
+  test('preserves explicit activation effort across ordered primary and fallback attempts', () => {
+    expect(
+      buildActivationProviderAttempts({
+        provider: 'groq',
+        model: 'qwen/qwen3.6-27b',
+        reasoning_effort: 'none',
+        fallbacks: [
+          { provider: 'xai', model: 'grok-4.7', reasoning_effort: 'high' },
+          { provider: 'anthropic', model: 'claude-opus-5-5', reasoning_effort: 'high' },
+          { provider: 'openai', model: 'gpt-6.1-sol', reasoning_effort: 'high' },
+          { provider: 'openai', model: 'gpt-5.4', reasoning_effort: 'medium' },
+        ],
+      }),
+    ).toEqual([
+      { provider: 'groq', model: 'qwen/qwen3.6-27b', reasoning_effort: 'none', source: 'primary' },
+      { provider: 'xai', model: 'grok-4.7', reasoning_effort: 'high', source: 'fallback' },
+      {
+        provider: 'anthropic',
+        model: 'claude-opus-5-5',
+        reasoning_effort: 'high',
+        source: 'fallback',
+      },
+      { provider: 'openai', model: 'gpt-6.1-sol', reasoning_effort: 'high', source: 'fallback' },
+      { provider: 'openai', model: 'gpt-5.4', reasoning_effort: 'medium', source: 'fallback' },
+    ]);
+  });
+
+  test('uses the provider output budget when explicit activation reasoning is configured', async () => {
+    const llmConfig = await buildActivationLlmConfig({
+      providerName: 'openai',
+      model: 'gpt-6.1-sol',
+      reasoning_effort: 'high',
+      req: null,
+    });
+    expect(llmConfig.reasoning_effort).toBe('high');
+    expect(llmConfig.maxTokens).toBeUndefined();
+    expect(llmConfig.temperature).toBeUndefined();
   });
 
   test('retries activation fallbacks when the selected model is removed or rejects JSON output', () => {
@@ -1967,6 +2701,37 @@ describe('BackgroundCortexService activation policy helpers', () => {
         class: 'provider_access_denied',
       }),
     );
+  });
+
+  test('keeps typed reconnect failures user-scoped and eligible for configured fallback', () => {
+    const error = { code: 'MODEL_AUTHENTICATION', message: 'Reconnect the connected account.' };
+    const summary = summarizeActivationError(error);
+    expect(summary).toMatchObject({
+      code: 'MODEL_AUTHENTICATION',
+      status: null,
+      class: 'provider_unauthorized',
+    });
+    expect(isActivationFallbackCandidate(error, summary)).toBe(true);
+    markActivationProviderUnhealthy({
+      provider: 'anthropic',
+      model: 'claude-opus-5-5',
+      req: { user: { id: 'reconnect-owner' } },
+      errorSummary: summary,
+    });
+    expect(
+      getActivationProviderSuppression({
+        provider: 'anthropic',
+        model: 'claude-opus-5-5',
+        req: { user: { id: 'reconnect-owner' } },
+      }),
+    ).toBeTruthy();
+    expect(
+      getActivationProviderSuppression({
+        provider: 'anthropic',
+        model: 'claude-opus-5-5',
+        req: { user: { id: 'other-owner' } },
+      }),
+    ).toBeNull();
   });
 
   test('temporarily suppresses unhealthy activation providers without prompt heuristics', () => {

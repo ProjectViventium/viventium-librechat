@@ -6,6 +6,62 @@ const {
 } = require('../voiceArtifactText');
 
 describe('voice linked-chat formatting', () => {
+  test.each([
+    '[Download report](https://files.example.test/api/files/download/report_01.pdf)',
+    'See https://docs.example.test/Guide/A_B?part=One&section=Two#Result.',
+    'Sources: [Documentation](https://docs.example.test/reference)\nhttps://docs.example.test/guide',
+  ])('preserves complete public links in display and persisted content: %s', (text) => {
+    expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(text);
+    const message = { text, content: [{ type: 'text', text }] };
+    expect(
+      sanitizeVoiceAssistantMessageForPersistence({ body: { voiceMode: true } }, message),
+    ).toEqual(message);
+  });
+
+  test('preserves URL bytes while stripping adjacent display controls', () => {
+    const url = 'https://docs.example.test/_Section_/File.PDF?part=A_B#Result';
+    expect(sanitizeVoiceSurfaceTextForDisplay(`<soft>**Done.**</soft> [Report](${url}) {NTA}`)).toBe(
+      `Done. [Report](${url})`,
+    );
+  });
+
+  test.each([
+    ['**[Report](https://docs.example.test/a_b)**', '[Report](https://docs.example.test/a_b)'],
+    ['_[Report](https://docs.example.test/a_b)_', '[Report](https://docs.example.test/a_b)'],
+    ['~~[Report](https://docs.example.test/a_b)~~', '[Report](https://docs.example.test/a_b)'],
+    ['**https://docs.example.test/_Section_**', 'https://docs.example.test/_Section_'],
+    ['_https://docs.example.test/a_b_', 'https://docs.example.test/a_b'],
+    ['**Read https://docs.example.test/_Section_ now.**', 'Read https://docs.example.test/_Section_ now.'],
+  ])('strips outer Markdown while preserving the public URL: %s', (text, expected) => {
+    expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(expected);
+    expect(
+      sanitizeVoiceAssistantMessageForPersistence(
+        { body: { voiceMode: true } },
+        { text, content: [{ type: 'text', text }] },
+      ),
+    ).toEqual({ text: expected, content: [{ type: 'text', text: expected }] });
+  });
+
+  test('preserves email query bytes inside a public link', () => {
+    const text = '[Report](https://docs.example.test/report?contact=qa@example.test)';
+    expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(text);
+  });
+
+  test('continues to mask standalone email text beside a public link', () => {
+    const text = 'Email qa@example.test or open https://docs.example.test/report.';
+    expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(
+      'Email address available or open https://docs.example.test/report.',
+    );
+  });
+
+  test('preserves a lowercase Markdown label while stripping a standalone stage direction', () => {
+    expect(
+      sanitizeVoiceSurfaceTextForDisplay(
+        '[thinking] See [report](https://docs.example.test/report).',
+      ),
+    ).toBe('See [report](https://docs.example.test/report).');
+  });
+
   const markdown = [
     '## Repair checklist',
     '',

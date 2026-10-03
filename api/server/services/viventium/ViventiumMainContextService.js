@@ -8,7 +8,14 @@
 
 const crypto = require('crypto');
 const { Constants } = require('librechat-data-provider');
+const { isContextOnlyMainHistory } = require('@librechat/api');
 const { getTrustedInteractionContext } = require('./interactionContext');
+const {
+  coerceTextToString,
+  normalizeUserMessageContent,
+  isRuntimeOnlyAssistantMessage,
+  INTERNAL_CONTENT_TYPES,
+} = require('./normalizeTextContentParts');
 
 const SNAPSHOT_SLOT = '_viventiumMainContextSnapshotV1';
 const LOCAL_ATTEMPT_STATE = Symbol('viventiumMainContextLocalAttemptStateV1');
@@ -27,6 +34,8 @@ const TURN_CONTEXT_REQUIRED_SECTIONS = new Set([
   'feelings',
   'telegramReplyContext',
   'recurrenceState',
+  // A reviewed conversation summary replaces carried source rows; it is never silently dropped.
+  'conversationContinuity',
 ]);
 
 function canonical(value) {
@@ -266,14 +275,35 @@ function contentText(content) {
     .map((part) => {
       if (typeof part === 'string') return part;
       if (!part || typeof part !== 'object') return '';
-      return String(part.text || part.input_text || part.type || '');
+      if (['text', 'input_text', 'output_text'].includes(part.type)) {
+        return coerceTextToString(part.text ?? part.input_text ?? part.output_text);
+      }
+      const text = coerceTextToString(part.text ?? part.input_text);
+      if (text) return text;
+      // Typed media payloads carry bytes, not authored prose. This text projection leaves those
+      // payloads intact; an unknown content type still cannot silently disappear.
+      if (['image_url', 'image', 'input_image', 'file', 'input_file', 'document',
+        'media', 'audio', 'input_audio', 'video'].includes(part.type)) return '';
+      return String(part.type || '');
     })
+    .filter(Boolean)
     .join('\n');
+}
+
+function messageContentText(message) {
+  const normalized = normalizeUserMessageContent(message);
+  const content = normalized?.content ?? normalized?.text;
+  // Match the provider formatter's existing exclusion of delivery/status parts.
+  return contentText(
+    Array.isArray(content)
+      ? content.filter((part) => part != null && !INTERNAL_CONTENT_TYPES.has(part?.type))
+      : content,
+  );
 }
 
 function messageManifest(messages = []) {
   return (Array.isArray(messages) ? messages : []).map((message, index) => {
-    const text = contentText(message?.content ?? message?.text);
+    const text = messageContentText(message);
     return Object.freeze({
       index,
       role: String(message?.role || 'unknown'),
@@ -290,6 +320,28 @@ function unreconciledSourceError() {
   return error;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Scheduling is Main later.
+ * Purpose: Trusted scheduler control envelopes and hidden scheduler outputs are transport and
+ * audit metadata, never user-visible source (CC-035), so a trusted scheduler wake does not replay
+ * them. Every visible prior answer remains source under the protected-history guard: the wake
+ * carries it faithfully or fails typed when it cannot be carried.
+ * === VIVENTIUM END === */
+function isTrustedSchedulerWake(req) {
+  const context = getTrustedInteractionContext(req);
+  return context?.actor_kind === 'system' && context?.origin === 'scheduler';
+}
+
+function isSchedulerTransportRow(message) {
+  const viventium = message?.metadata?.viventium;
+  if (viventium?.visibility !== 'internal') return false;
+  if (message?.isCreatedByUser === true) {
+    const context = viventium?.interactionContext;
+    return context?.actor_kind === 'system' && context?.origin === 'scheduler';
+  }
+  return message?.isCreatedByUser === false;
+}
+
 function hasCoreMainContextStamp(message) {
   const stamp = message?.metadata?.viventium?.mainContext;
   return (
@@ -300,6 +352,42 @@ function hasCoreMainContextStamp(message) {
     typeof stamp.agentId === 'string' &&
     Boolean(stamp.agentId)
   );
+}
+
+function recoverRetainedTelegramHistory(messages, ownerId, conversationId) {
+  const rows = new Map(messages.map((message) => [String(message.messageId || ''), message]));
+  return messages.map((message) => {
+    const input = message?.metadata?.viventium?.telegramInput;
+    const context = message?.metadata?.viventium?.interactionContext;
+    if (
+      message.isCreatedByUser !== true ||
+      String(message.user || '') !== String(ownerId) ||
+      message.conversationId !== conversationId ||
+      message.deletedAt != null ||
+      !['ready', 'admitted'].includes(input?.state) ||
+      !/^[a-f0-9]{64}$/.test(String(input?.sourceEventId || '')) ||
+      context?.source_event_id !== input.sourceEventId ||
+      context?.surface !== 'telegram' ||
+      context?.actor_kind !== 'external_user'
+    )
+      return message;
+    const original = input.originalParentMessageId;
+    const current = rows.get(message.parentMessageId);
+    if (current && current.parentMessageId !== message.messageId) return message;
+    if (message.parentMessageId === Constants.NO_PARENT) return message;
+    const anchor = rows.get(original);
+    if (
+      original !== Constants.NO_PARENT &&
+      (!anchor ||
+        anchor.messageId === message.messageId ||
+        String(anchor.user || '') !== String(ownerId) ||
+        anchor.conversationId !== conversationId ||
+        anchor.deletedAt != null ||
+        anchor.parentMessageId === message.messageId)
+    )
+      return message;
+    return { ...message, parentMessageId: original };
+  });
 }
 
 function traceMainHistoryAncestry({
@@ -333,7 +421,7 @@ function traceMainHistoryAncestry({
       return Object.freeze({ complete: false, reason: 'foreign_conversation' });
     selected.push(cursor);
     selectedRows.push(message);
-    if (isSkippable?.(message)) skipped.push(cursor);
+    if (isSkippable?.(message) || isRuntimeOnlyAssistantMessage(message)) skipped.push(cursor);
     cursor = String(message.parentMessageId || '');
   }
   return Object.freeze({
@@ -353,10 +441,13 @@ function traceMainHistoryAncestry({
     skippedMessageIds: Object.freeze(skipped),
     hasUnreconciledSource:
       selectedRows.some(
-        (message) => message.isCreatedByUser === false && !hasCoreMainContextStamp(message),
+        (message) =>
+          message.isCreatedByUser === false &&
+          !isContextOnlyMainHistory(message) &&
+          !hasCoreMainContextStamp(message),
       ) ||
       (selectedRows.every((message) => message.isCreatedByUser !== false) &&
-        selectedRows.length > 0),
+        selectedRows.some((message) => !isContextOnlyMainHistory(message))),
   });
 }
 
@@ -385,7 +476,12 @@ function assertMainHistoryAncestry(ownerId, conversationId, visibleMessages, pro
       )
         throw unreconciledSourceError();
       const visibleById = new Map(visible.map((message) => [String(message.messageId), message]));
-      const accounted = new Set([...visibleById.keys(), ...proof.skippedMessageIds]);
+      const accounted = new Set([
+        ...visibleById.keys(),
+        ...proof.skippedMessageIds,
+        // Rows replaced by an exact reviewed conversation summary are reconciled, not missing.
+        ...(Array.isArray(proof.reconciledMessageIds) ? proof.reconciledMessageIds : []),
+      ]);
       if (!proof.messageIds.every((id) => accounted.has(id))) throw unreconciledSourceError();
       const selectedIds = new Set(proof.messageIds);
       if (visible.slice(0, -1).some((message) => !selectedIds.has(String(message.messageId))))
@@ -410,13 +506,38 @@ function assertMainHistoryAncestry(ownerId, conversationId, visibleMessages, pro
   if (!result.complete) throw unreconciledSourceError();
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Conversation legacy continuity in the ancestry proof.
+ * Purpose: Rows covered by an exact reviewed conversation summary are accounted as reconciled
+ * source; only the intact carried tail decides whether unreconciled answers remain.
+ * === VIVENTIUM END === */
+function withReconciledHistoryAncestry(proof, reconciledMessageIds, carriedMessages) {
+  if (!proof || proof.complete !== true || !Array.isArray(reconciledMessageIds)) return proof;
+  const carried = Array.isArray(carriedMessages) ? carriedMessages : [];
+  return Object.freeze({
+    ...proof,
+    reconciledMessageIds: Object.freeze(reconciledMessageIds.map(String)),
+    hasUnreconciledSource: carried.some(
+      (message) =>
+        message?.isCreatedByUser === false &&
+        message?.metadata?.viventium?.visibility !== 'internal' &&
+        !isContextOnlyMainHistory(message) &&
+        !hasCoreMainContextStamp(message),
+    ),
+  });
+}
+
 function hasUnreconciledMainHistory(messages) {
   if (!Array.isArray(messages)) return false;
   const prior = messages.slice(0, -1).filter((message) => {
     const role = String(
       message?.role || (message?.isCreatedByUser === true ? 'user' : 'assistant'),
     ).toLowerCase();
-    return message?.messageId && !['system', 'developer'].includes(role);
+    return (
+      message?.messageId &&
+      !['system', 'developer'].includes(role) &&
+      !isContextOnlyMainHistory(message)
+    );
   });
   const answers = prior.filter(
     (message) =>
@@ -438,7 +559,7 @@ function visibleMessageChain(messages = [], protectUnreconciledHistory = false) 
       return message?.messageId && role !== 'system' && role !== 'developer';
     })
     .map((message, index, visible) => {
-      const text = contentText(message?.content ?? message?.text);
+      const text = messageContentText(message);
       return Object.freeze({
         id: String(message.messageId).slice(0, 160),
         parentId: String(message.parentMessageId || '').slice(0, 160),
@@ -448,7 +569,7 @@ function visibleMessageChain(messages = [], protectUnreconciledHistory = false) 
         bytes: Buffer.byteLength(text, 'utf8'),
         sha256: crypto.createHash('sha256').update(text, 'utf8').digest('hex'),
         ...(protectUnreconciledHistory && index < visible.length - 1
-          ? { accepted_source: true }
+          ? { accepted_source: !isContextOnlyMainHistory(message) }
           : {}),
       });
     });
@@ -501,12 +622,12 @@ function assertUnreconciledHistoryCarrier(
   for (let index = 0; index < chain.length - 1; index += 1) {
     const source = originals[index];
     const expected = chain[index];
-    const sourceText = contentText(source?.content ?? source?.text);
+    const sourceText = messageContentText(source);
     if (
       String(source?.user || '') !== ownerId ||
       String(source?.conversationId || '') !== conversationId ||
       source?.deletedAt != null ||
-      source?.error === true ||
+      (source?.error === true && !isContextOnlyMainHistory(source)) ||
       source?.unfinished === true ||
       source?.metadata?.viventium?.visibility === 'internal' ||
       (typeof source?.text === 'string' &&
@@ -520,7 +641,7 @@ function assertUnreconciledHistoryCarrier(
     const matched = final.findIndex((message, candidate) => {
       const role = String(message?.role || message?._getType?.() || '').toLowerCase();
       const normalizedRole = role === 'human' ? 'user' : role === 'ai' ? 'assistant' : role;
-      const text = contentText(message?.content ?? message?.text);
+      const text = messageContentText(message);
       // Provider formatting removes Mongo message IDs. Match the complete ordered text and
       // role sequence here; the source rows themselves are checked against the owner and branch.
       return (
@@ -536,7 +657,7 @@ function assertUnreconciledHistoryCarrier(
   if (
     !final.some((message, index) => {
       const role = String(message?.role || message?._getType?.() || '').toLowerCase();
-      const text = contentText(message?.content ?? message?.text);
+      const text = messageContentText(message);
       return (
         index >= position &&
         (role === 'human' ? 'user' : role) === 'user' &&
@@ -951,8 +1072,14 @@ module.exports = {
   createMainAttemptFacts,
   getMainContextAttemptState,
   getMainContextSnapshot,
+  hasCoreMainContextStamp,
   hasUnreconciledMainHistory,
+  isSchedulerTransportRow,
+  isTrustedSchedulerWake,
+  messageContentText,
+  withReconciledHistoryAncestry,
   traceMainHistoryAncestry,
+  recoverRetainedTelegramHistory,
   renderMainAttemptFactsAuthorityBlock,
   mainRouteTargetForAgent,
   stableAuthorityDigest,

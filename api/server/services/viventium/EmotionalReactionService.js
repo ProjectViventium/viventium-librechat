@@ -19,6 +19,8 @@ const {
   REACTION_TRAIL_CONTEXT_LIMIT,
   parseFeelingReactionOutput,
   resolveFeelingsRuntimeConfig,
+  createFeelingReactionRequest,
+  feelingReactionNativeOptions,
 } = require('@librechat/api');
 const db = require('~/models');
 const {
@@ -104,7 +106,7 @@ function reactionDistribution(trail) {
   return { strengthCounts, absoluteDeltaCounts };
 }
 
-function buildEmotionalReactionAgent(config, snapshot) {
+function buildEmotionalReactionAgent(config, snapshot, nativeWorkspace) {
   const executionPrompt = getPromptText(
     'cortex.emotional_reaction.execution',
     DEFAULT_EXECUTION_PROMPT,
@@ -128,6 +130,7 @@ function buildEmotionalReactionAgent(config, snapshot) {
       .filter(Boolean)
       .join('\n\n'),
     tools: [],
+    ...feelingReactionNativeOptions(config.reaction.provider, nativeWorkspace),
     background_cortices: [],
     model_parameters: {
       model: config.reaction.model,
@@ -212,7 +215,7 @@ async function writeHealth({ deps, userId, config, fields }) {
 }
 
 async function runEmotionalReaction(
-  { req, userText, stimulusId, conversationId, scheduledSnapshot },
+  { req, userText, stimulusId, conversationId, scheduledSnapshot, nativeWorkspace },
   injectedDeps = {},
 ) {
   const deps = { ...defaultDeps(), ...injectedDeps };
@@ -224,6 +227,7 @@ async function runEmotionalReaction(
   const startMs = startedAtDate.getTime();
   let snapshot = scheduledSnapshot;
   let usedRoute = null;
+  let failureStage = 'request';
 
   if (!userId || !config.available || !snapshot?.enabled || !String(userText || '').trim()) {
     let skipReason = 'empty_stimulus';
@@ -292,14 +296,11 @@ async function runEmotionalReaction(
   });
 
   try {
-    const reactionReq = {
-      ...req,
-      body: { ...(req?.body || {}), files: [], text: String(userText) },
-      _viventiumFeelingSnapshot: snapshot,
-    };
+    const reactionReq = createFeelingReactionRequest(req, String(userText));
     const userMessage = new HumanMessage(buildEmotionalReactionInput(snapshot, userText));
 
     if (mode === 'classified') {
+      failureStage = 'activation';
       const activationStarted = Date.now();
       const activation = await deps.checkCortexActivation({
         cortexConfig: {
@@ -356,16 +357,17 @@ async function runEmotionalReaction(
     let parsed = null;
     let parseFailure = null;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
+      failureStage = 'model';
       const attemptStarted = Date.now();
       const result = await deps.executeCortex({
-        agent: buildEmotionalReactionAgent(config, snapshot),
+        agent: buildEmotionalReactionAgent(config, snapshot, nativeWorkspace),
         messages:
-          attempt === 1
+          !parseFailure
             ? [userMessage]
             : [
                 userMessage,
                 new HumanMessage(
-                  'Retry the same appraisal. The prior response failed the required JSON schema. Return only a schema-valid object; use {"changes":[]} when no band should move.',
+                  `Retry the same appraisal. The prior response failed the required JSON schema.\n\n${buildReactionOutputContract()}`,
                 ),
               ],
         runId: `${stimulusId || 'turn'}-feelings-reaction-${attempt}`,
@@ -373,27 +375,35 @@ async function runEmotionalReaction(
         req: reactionReq,
         res: createBackgroundRes(),
         contextMode: 'minimal',
+        mainContextBinding: 'isolated',
+        insightMode: 'structured',
         completedResultPolicy: 'internal',
         executionTimeoutMs: config.reaction.timeoutMs,
       });
       const canRetryEmptyModel =
         attempt === 1 &&
         result?.fallbackUsed !== true &&
-        ['timeout', 'provider_rate_limited', 'empty_output'].includes(
+        // A native request whose release is unconfirmed may still run; a retry would overlap it.
+        result?.nativeOwnership !== 'unresolved' &&
+        (['timeout', 'provider_rate_limited', 'empty_output'].includes(
           result?.errorClass || 'empty_output',
-        );
+        ) ||
+          (result?.errorClass === 'recoverable_provider_error' &&
+            result?.nativeOwnership === 'released'));
+      const selectedModel = result?.fallbackUsed === true
+        ? result?.fallbackModel || config.reaction.fallbackModel : config.reaction.model;
+      const selectedProvider = result?.fallbackUsed === true
+        ? result?.fallbackProvider || config.reaction.fallbackProvider : config.reaction.provider;
+      const modelReceipt = reactionReq._viventiumProviderModelReceipts?.get(REACTION_AGENT_ID);
       usedRoute = {
         fallbackUsed: result?.fallbackUsed === true,
         provider:
           result?.fallbackUsed === true
             ? result?.fallbackProvider || config.reaction.fallbackProvider
             : config.reaction.provider,
-        model:
-          result?.fallbackUsed === true
-            ? result?.fallbackModel || config.reaction.fallbackModel
-            : config.reaction.model,
+        model: modelReceipt?.requestedModel === selectedModel ? modelReceipt.model : selectedModel,
         serviceTier:
-          result?.fallbackUsed === true
+          selectedProvider === 'glasshive-harness' ? null : result?.fallbackUsed === true
             ? result?.fallbackServiceTier || null
             : config.reaction.serviceTier,
         primaryErrorClass: result?.primaryErrorClass || null,
@@ -405,18 +415,9 @@ async function runEmotionalReaction(
         attempt,
         retrying: !result?.insight && canRetryEmptyModel,
         fallbackUsed: result?.fallbackUsed === true,
-        usedProvider:
-          result?.fallbackUsed === true
-            ? result?.fallbackProvider || config.reaction.fallbackProvider
-            : config.reaction.provider,
-        usedModel:
-          result?.fallbackUsed === true
-            ? result?.fallbackModel || config.reaction.fallbackModel
-            : config.reaction.model,
-        usedServiceTier:
-          result?.fallbackUsed === true
-            ? result?.fallbackServiceTier || null
-            : config.reaction.serviceTier,
+        usedProvider: usedRoute.provider,
+        usedModel: usedRoute.model,
+        usedServiceTier: usedRoute.serviceTier,
         primaryErrorClass: result?.primaryErrorClass || null,
       });
       if (!result?.insight) {
@@ -429,6 +430,7 @@ async function runEmotionalReaction(
         });
       }
       try {
+        failureStage = 'parse';
         parsed = parseFeelingReactionOutput(result.insight);
         logFeelingsEvent(logger, req, 'feelings.reaction.parse', {
           ok: true,
@@ -469,6 +471,7 @@ async function runEmotionalReaction(
       });
     }
 
+    failureStage = 'commit';
     for (let commitAttempt = 1; commitAttempt <= MAX_COMMIT_ATTEMPTS; commitAttempt += 1) {
       const persisted = await deps.getFeelingState(userId);
       if (persisted?.processedStimulusKeys?.includes(stimulusKey)) {
@@ -618,6 +621,9 @@ async function runEmotionalReaction(
       'feelings.reaction.failure',
       {
         errorClass,
+        failureStage,
+        errorType: ['TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'Error'].includes(error?.name)
+          ? error.name : 'Error',
         durationMs: completedAt.getTime() - startMs,
         fallbackUsed: usedRoute?.fallbackUsed ?? null,
         usedProvider: usedRoute?.provider || null,

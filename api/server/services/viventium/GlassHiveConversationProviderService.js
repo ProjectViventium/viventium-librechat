@@ -1,3 +1,4 @@
+const { VOICE_TASK_TOOL_NAME, voiceTaskBrokerResources } = require('./VoiceTaskManagementTool');
 const { configuredBackgroundWorkerRoute } = require('@librechat/api');
 /* === VIVENTIUM START ===
  * Feature: GlassHive core-provider capability projection
@@ -37,10 +38,27 @@ const MAINTENANCE_CANCELLATION_TOTAL_TIMEOUT_MS = 5500;
 const MAINTENANCE_CANCELLATION_RETRY_DELAYS_MS = Object.freeze([100, 250, 500]);
 const HARNESS_CANCELLATION_RETRY_DELAYS_MS = Object.freeze([100, 300]);
 const HARNESS_CANCELLATION_RETRYABLE_STATUSES = new Set([408, 425, 429]);
+/* === VIVENTIUM START ===
+ * Fix: A cortex attempt that reaches its execution deadline, or whose guard stops waiting for it,
+ * is an owned cancellation of that exact native request, which must release its capacity before
+ * its owner treats the attempt as ended.
+ * === VIVENTIUM END === */
+const CORTEX_ATTEMPT_DEADLINE_REASON = 'cortex_attempt_deadline';
 const HARNESS_CANCELLATION_ABORT_REASONS = new Set([
   'user_cancelled',
   'superseded',
   'maintenance_yield',
+  CORTEX_ATTEMPT_DEADLINE_REASON,
+]);
+/* === VIVENTIUM START ===
+ * Fix: An attempt that ends without its accepted result releases its exact native request before
+ * any fallback or retry, even when nothing aborted it (a provider error, an empty result).
+ * === VIVENTIUM END === */
+const CORTEX_ATTEMPT_RELEASE_REASON = 'cortex_attempt_release';
+const HARNESS_RELEASE_REASONS = new Set([
+  'maintenance_yield',
+  CORTEX_ATTEMPT_DEADLINE_REASON,
+  CORTEX_ATTEMPT_RELEASE_REASON,
 ]);
 
 function waitForHarnessCancellationRetry(delayMs) {
@@ -107,6 +125,7 @@ async function deliverHarnessCancellation({
       return { acknowledged: true };
     }
     let capacityReleasePending = false;
+    let responseTimeoutS = null;
     if (response?.ok && requireCapacityRelease) {
       let body = null;
       try {
@@ -114,8 +133,11 @@ async function deliverHarnessCancellation({
       } catch (_) {
         body = null;
       }
+      const reportedTimeoutS = Number(body?.responseTimeoutS);
+      responseTimeoutS =
+        Number.isFinite(reportedTimeoutS) && reportedTimeoutS > 0 ? reportedTimeoutS : null;
       if (body?.capacityReleased === true) {
-        return { acknowledged: true, capacityReleased: true };
+        return { acknowledged: true, capacityReleased: true, responseTimeoutS };
       }
       capacityReleasePending = true;
     }
@@ -127,7 +149,12 @@ async function deliverHarnessCancellation({
         ? numericStatus
         : null;
     if (!isRetryableHarnessCancellationStatus(lastStatus) || index === retryDelaysMs.length) {
-      throw buildHarnessCancellationDeliveryError({ attempts, status: lastStatus });
+      const deliveryError = buildHarnessCancellationDeliveryError({ attempts, status: lastStatus });
+      if (capacityReleasePending) {
+        deliveryError.capacityReleasePending = true;
+        deliveryError.responseTimeoutS = responseTimeoutS;
+      }
+      throw deliveryError;
     }
     const remainingBeforeDelay =
       totalTimeoutMs > 0 ? totalTimeoutMs - (Date.now() - startedAt) : retryDelaysMs[index];
@@ -160,6 +187,61 @@ function reportHarnessCancellationDeliveryError(onDeliveryError, error) {
   }
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Release acknowledgement for a superseded Main family.
+ * Purpose: The current revision may take the native conversation only after the exact
+ * owner-scoped family of a superseded Main operation is stopped and GlassHive acknowledges that
+ * every request and run in it is terminal with no retained lease. One idempotent Stop per probe.
+ * The evidence also carries GlassHive's effective response timeout, the owner of the deadline.
+ * An unreachable or unconfirmed host is never reported as released.
+ * === VIVENTIUM END === */
+async function probeHarnessFamilyRelease({
+  baseURL,
+  apiKey,
+  ownerId,
+  messageId,
+  fetchImpl = globalThis.fetch,
+}) {
+  const releaseBaseURL = String(baseURL || '').replace(/\/$/, '');
+  const releaseOwnerId = String(ownerId || '').trim();
+  const keys = ['main', 'main-fallback']
+    .map((role) => buildHarnessIdempotencyKey(role, messageId))
+    .filter(Boolean);
+  let responseTimeoutS = null;
+  if (
+    !releaseBaseURL ||
+    !apiKey ||
+    !releaseOwnerId ||
+    keys.length === 0 ||
+    typeof fetchImpl !== 'function'
+  ) {
+    return { released: false, reachable: false, responseTimeoutS };
+  }
+  for (const key of keys) {
+    try {
+      const outcome = await deliverHarnessCancellation({
+        url: `${releaseBaseURL}/requests/by-idempotency/${encodeURIComponent(key)}/cancel`,
+        headers: { Authorization: `Bearer ${apiKey}`, 'X-Viventium-User-Id': releaseOwnerId },
+        fetchImpl,
+        requireCapacityRelease: true,
+        retryDelaysMs: [],
+      });
+      responseTimeoutS = outcome?.responseTimeoutS ?? responseTimeoutS;
+      if (outcome?.capacityReleased !== true) {
+        return { released: false, reachable: true, responseTimeoutS };
+      }
+    } catch (error) {
+      const pending = error?.capacityReleasePending === true;
+      return {
+        released: false,
+        reachable: pending,
+        responseTimeoutS: (pending ? error.responseTimeoutS : null) ?? responseTimeoutS,
+      };
+    }
+  }
+  return { released: true, reachable: true, responseTimeoutS };
+}
+
 function signBootstrapBundle(encodedBundle, issuedAt) {
   const secret = String(process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET || '').trim();
   if (!secret) {
@@ -169,6 +251,19 @@ function signBootstrapBundle(encodedBundle, issuedAt) {
     .createHmac('sha256', secret)
     .update(`v1\n${issuedAt}\n${encodedBundle}`)
     .digest('hex')}`;
+}
+
+function restrictedConversationProviderBootstrapHeaders() {
+  const encodedBundle = Buffer.from(
+    JSON.stringify({ provider_capabilities: { native_tools: false } }),
+    'utf8',
+  ).toString('base64');
+  const issuedAt = String(Math.floor(Date.now() / 1000));
+  return {
+    'X-GlassHive-Bootstrap-Bundle-B64': encodedBundle,
+    'X-GlassHive-Bootstrap-Timestamp': issuedAt,
+    'X-GlassHive-Bootstrap-Signature': signBootstrapBundle(encodedBundle, issuedAt),
+  };
 }
 
 function buildHarnessIdempotencyKey(role, messageId, agentId = '') {
@@ -450,6 +545,91 @@ function bindHarnessCancellation({
   ) {
     return false;
   }
+  // Foreground native input uses the same authenticated owner and exact response key as Stop.
+  if (
+    req.body?.voiceMode === true &&
+    req.viventiumVoiceWorkAuthority &&
+    req.body?.viventiumVoiceTaskId &&
+    !req._viventiumNativeVoiceInputPolling
+  ) {
+    const {
+      listVoiceTasks,
+      registerVoiceTaskOwnerAdapter,
+      observeGenerationEvent,
+    } = require('./VoiceTaskService');
+    const taskId = req.body.viventiumVoiceTaskId;
+    const authority = req.viventiumVoiceWorkAuthority;
+    const ownsTask = () => {
+      const task = listVoiceTasks({
+        userId: cancelOwnerId,
+        callSessionId: authority.callSessionId,
+      }).find((item) => item.taskId === taskId);
+      return (
+        task?.callSessionId === authority.callSessionId &&
+        ['generation_job', 'remote_generation'].includes(task.owner?.kind) &&
+        !['completed', 'failed', 'cancelled_confirmed', 'cancelled_unenforceable'].includes(
+          task.state,
+        )
+      );
+    };
+    if (ownsTask()) {
+      const { createNativeVoiceInputClient } = require('@librechat/api');
+      const client = createNativeVoiceInputClient({
+        baseURL: cancelBaseURL,
+        apiKey: cancelApiKey,
+        userId: cancelOwnerId,
+        fetchImpl,
+      });
+      req._viventiumNativeVoiceInputPolling = client
+        .poll({
+          signal,
+          key: () =>
+            String(req._viventiumHarnessIdempotencyKey || '').trim() ||
+            buildHarnessAttemptIdempotencyKey(req, req.body?.responseMessageId),
+          isActive: ownsTask,
+          onInput: (request, key) => {
+            if (!ownsTask()) return;
+            const owner = listVoiceTasks({
+              userId: cancelOwnerId,
+              callSessionId: authority.callSessionId,
+            }).find((item) => item.taskId === taskId)?.owner;
+            if (!owner) return;
+            registerVoiceTaskOwnerAdapter(taskId, {
+              kind: owner.kind,
+              expiresAtMs: Date.parse(request.expiresAt),
+              provideInput: async ({ input }) => {
+                const current = listVoiceTasks({
+                  userId: cancelOwnerId,
+                  callSessionId: authority.callSessionId,
+                }).find((item) => item.taskId === taskId);
+                if (
+                  !ownsTask() ||
+                  current?.owner?.kind !== owner.kind ||
+                  current?.owner?.id !== owner.id
+                )
+                  throw new Error('voice_native_input_owner_changed');
+                await require('./VoiceWorkAuthorityService').assertVoiceWorkAuthority(
+                  authority,
+                  cancelOwnerId,
+                );
+                return client.submit(key, request, input);
+              },
+            });
+            observeGenerationEvent(taskId, {
+              event: 'needs_input',
+              data: {
+                prompt: request.prompt,
+                inputType: 'choice',
+                choices: request.choices,
+              },
+            });
+          },
+        })
+        .catch((error) => {
+          if (!signal.aborted) reportHarnessCancellationDeliveryError(onDeliveryError, error);
+        });
+    }
+  }
   const boundBaseURLs =
     req._viventiumHarnessCancellationBoundBaseURLs instanceof Set
       ? req._viventiumHarnessCancellationBoundBaseURLs
@@ -460,7 +640,7 @@ function bindHarnessCancellation({
     return true;
   }
   boundBaseURLs.add(cancelBaseURL);
-  const deliverCancellation = () => {
+  const deliverCancellation = (reason) => {
     if (req._viventiumHarnessCancellationActiveBaseURL !== cancelBaseURL) {
       return;
     }
@@ -481,14 +661,15 @@ function bindHarnessCancellation({
       ),
     );
     if (
-      !HARNESS_CANCELLATION_ABORT_REASONS.has(signal.reason) ||
+      !(HARNESS_CANCELLATION_ABORT_REASONS.has(reason) || HARNESS_RELEASE_REASONS.has(reason)) ||
       cancelIdempotencyKeys.length === 0 ||
       !cancelOwnerId ||
       typeof fetchImpl !== 'function'
     ) {
       return;
     }
-    const maintenanceYield = signal.reason === 'maintenance_yield';
+    // Maintenance, an attempt deadline and an attempt release require native capacity release.
+    const requireRelease = HARNESS_RELEASE_REASONS.has(reason);
     const deliveries = cancelIdempotencyKeys.map(async (cancelIdempotencyKey) => {
       try {
         return await deliverHarnessCancellation({
@@ -498,7 +679,7 @@ function bindHarnessCancellation({
             'X-Viventium-User-Id': cancelOwnerId,
           },
           fetchImpl,
-          ...(maintenanceYield
+          ...(requireRelease
             ? {
                 attemptTimeoutMs: MAINTENANCE_CANCELLATION_ATTEMPT_TIMEOUT_MS,
                 retryDelaysMs: MAINTENANCE_CANCELLATION_RETRY_DELAYS_MS,
@@ -520,9 +701,12 @@ function bindHarnessCancellation({
       acknowledged: outcomes.every((outcome) => outcome?.acknowledged === true),
       outcomes,
     }));
+    return req._viventiumHarnessCancellationDeliveryPromise;
   };
-  if (signal.aborted) deliverCancellation();
-  else signal.addEventListener('abort', deliverCancellation, { once: true });
+  // The attempt boundary's own release: the same exact keys, owner and capacity-release answer.
+  req._viventiumHarnessReleaseAttempt = () => deliverCancellation(CORTEX_ATTEMPT_RELEASE_REASON);
+  if (signal.aborted) deliverCancellation(signal.reason);
+  else signal.addEventListener('abort', () => deliverCancellation(signal.reason), { once: true });
   return true;
 }
 
@@ -895,6 +1079,11 @@ async function resolveHostToolCapabilityState({
       capability,
     ).filter((name) => enabled.has(name));
   }
+  const voiceTaskResources =
+    capability?.native_tools === true || capability?.worker_native_tools === true
+      ? voiceTaskBrokerResources(req)
+      : null;
+  if (voiceTaskResources) allowedHostTools.push(VOICE_TASK_TOOL_NAME);
   // Selected conversation attachments are a declared native capability, independent of semantic routing.
   if (
     capability?.workspace_binding === true &&
@@ -918,6 +1107,7 @@ async function resolveHostToolCapabilityState({
       message: error?.message,
     });
   }
+  if (voiceTaskResources) hostToolResources[VOICE_TASK_TOOL_NAME] = voiceTaskResources;
   const authorizedHostTools = allowedHostTools.filter(
     (toolName) => !hostToolRequiresResources(toolName) || hostToolResources[toolName],
   );
@@ -1196,6 +1386,7 @@ function attachConversationProviderBootstrapBundle({
 }
 
 module.exports = {
+  restrictedConversationProviderBootstrapHeaders,
   attachConversationProviderBootstrapBundle,
   applyHostEvidenceBoundaryInstructions,
   applyCapabilityBrokerUnavailableInstructions,
@@ -1205,6 +1396,8 @@ module.exports = {
   bindConversationProviderStableAuthorityDigest,
   captureConversationProviderStableAuthority,
   bindHarnessCancellation,
+  CORTEX_ATTEMPT_DEADLINE_REASON,
+  probeHarnessFamilyRelease,
   buildHarnessAgentIdempotencyKeys,
   buildHarnessAttemptIdempotencyKey,
   configuredBrokerHostTools,

@@ -24,6 +24,7 @@ let mockGetActiveCallSessionForConversation;
 let mockDeferAfterCommit;
 let mockTransactionSession;
 let mockRunTransaction;
+let mockPrepareMissionOutputFiles;
 
 jest.mock('mongoose', () => {
   const actual = jest.requireActual('mongoose');
@@ -101,6 +102,10 @@ jest.mock('../GlassHiveCallbackDeliveryService', () => ({
   enqueueGlassHiveCallbackDelivery: (...args) => mockEnqueueDelivery(...args),
 }));
 
+jest.mock('../nativeOutputFiles', () => ({
+  prepareMissionOutputFiles: (...args) => mockPrepareMissionOutputFiles(...args),
+}));
+
 jest.mock('../OrchestrationTraceLedgerService', () => ({
   recordOrchestrationTraceDelivery: (...args) => mockRecordTraceDelivery(...args),
 }));
@@ -136,6 +141,7 @@ function storeAuthoredMessage(input, message) {
       messageId: message.messageId,
       isCreatedByUser: false,
       text: message.text,
+      ...(message.attachments ? { attachments: message.attachments } : {}),
     });
   }
   return message;
@@ -225,6 +231,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
     mockDeferAfterCommit = jest.fn().mockReturnValue(false);
     mockTransactionSession = null;
     mockRunTransaction = (operation) => operation(null);
+    mockPrepareMissionOutputFiles = jest.fn().mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -321,6 +328,92 @@ describe('GlassHiveMissionAdjudicationService', () => {
       }),
     ).rejects.toThrow('mission_input_identity_invalid');
     expect(mockUpdateOne.mock.calls).toHaveLength(count);
+  });
+
+  test('binds accepted terminal files to the actual Main follow-up and retains its carrier', async () => {
+    const callbackId = `cb_terminal_${'c'.repeat(64)}`;
+    const resultDigest = `sha256:${'d'.repeat(64)}`;
+    const outputFiles = {
+      version: 1,
+      owner_id: 'user-1',
+      run_id: 'run-1',
+      attempt_id: 'attempt-1',
+      callback_id: callbackId,
+      origin_ref: 'ghi-origin-1',
+      work_ref: 'gh-work-1',
+      result_revision: 1,
+      result_digest: resultDigest,
+      files: [
+        {
+          filename: 'result.png',
+          mime_type: 'image/png',
+          bytes: 3,
+          sha256: 'a'.repeat(64),
+          download_url: 'https://native.example.test/v1/link-refs/ghr_1234567890abcdef',
+        },
+      ],
+    };
+    await enqueueGlassHiveMissionAdjudication({
+      binding: { ...row(), runId: 'run-1', attemptId: 'attempt-1' },
+      body: {
+        callback_id: callbackId,
+        run_id: 'run-1',
+        attempt_id: 'attempt-1',
+        event: 'run.completed',
+        work_state: 'completed',
+        work_terminal: true,
+        message: 'The result is ready.',
+        output_files: outputFiles,
+      },
+      effectFence: {
+        resultKey: `ghtr_${'a'.repeat(64)}`,
+        acceptedOperationId: 'b'.repeat(32),
+        callbackId,
+        resultDigest,
+        resultRevision: 1,
+        generation: 1,
+      },
+    });
+    const stored = mockUpdateOne.mock.calls[0][1].$setOnInsert;
+    expect(stored).toMatchObject({ attemptId: 'attempt-1', outputFiles });
+    mockFind.mockReturnValueOnce(cursor([stored]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...stored, state: 'processing' });
+    const attachments = [
+      { filename: 'result.png', file_id: 'file-1', filepath: '/uploads/result.png' },
+    ];
+    mockPrepareMissionOutputFiles.mockResolvedValueOnce(attachments);
+    mockPersistPreparedCortexFollowUpMessage.mockImplementationOnce(async (input) => {
+      const message = {
+        conversationId: input.conversationId,
+        messageId: 'actual-main-message',
+        agent_id: input.agent.id,
+        text: 'Here is the result.',
+      };
+      message.attachments = await input.dependencies.prepareAttachments(message);
+      return storeAuthoredMessage(input, message);
+    });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({
+      visible: 1,
+      failed: 0,
+    });
+    expect(
+      mockPrepareCortexFollowUpMessage.mock.calls[0][0].insightsData.insights[0].insight,
+    ).toContain('"files":[{"filename":"result.png","mime_type":"image/png","bytes":3}]');
+    expect(mockPrepareMissionOutputFiles).toHaveBeenCalledWith(
+      expect.objectContaining({
+        rows: [expect.objectContaining({ outputFiles })],
+        message: expect.objectContaining({
+          messageId: 'actual-main-message',
+          agent_id: 'main-agent',
+        }),
+      }),
+    );
+    expect(mockEnqueueDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ event: 'main.followup' }),
+        message: expect.objectContaining({ messageId: 'actual-main-message', attachments }),
+      }),
+    );
   });
 
   test('passes each accepted run input with its exact synthesis authority', async () => {
@@ -1052,6 +1145,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
 
     expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
     expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+    expect(mockPrepareMissionOutputFiles).not.toHaveBeenCalled();
     expect(mockRecordOutcome).toHaveBeenCalledWith(
       expect.objectContaining({
         state: 'failed',

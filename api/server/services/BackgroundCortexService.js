@@ -7,6 +7,7 @@
  * === VIVENTIUM END === */
 
 const crypto = require('crypto');
+const { recordVoiceRequestTrace } = require('./viventium/VoiceOrchestrationTraceService');
 const { logger } = require('@librechat/data-schemas');
 /* === VIVENTIUM NOTE ===
  * Feature: Enable token counting for background cortex context pruning.
@@ -33,6 +34,8 @@ const {
   countTokens,
   checkAccess,
   createCortexToolEvidence,
+  withNativeConversationAdmission,
+  createNativeCapacityFetch,
 } = require('@librechat/api');
 const { loadAgent } = require('~/models/Agent');
 const { getAppConfig } = require('./Config/app');
@@ -69,6 +72,8 @@ const {
   requireExactCortexInsightDeliveryAcceptance,
 } = require('~/server/services/viventium/CortexInsightDeliveryService');
 const {
+  acceptOwnedCompletedCortexInsight,
+  registerOwnedCompletedCortexParent,
   enqueueCompletedCortexInsightOutboxBatch,
   settleCompletedCortexInsightOutboxBatch,
 } = require('~/server/services/viventium/CortexInsightOutboxService');
@@ -122,12 +127,14 @@ const {
   attachConversationProviderCapabilityBundle,
   bindHarnessCancellation,
   buildHarnessIdempotencyKey,
+  CORTEX_ATTEMPT_DEADLINE_REASON,
   installConversationProviderCapabilityRefresher,
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
 
 const {
   bindMainContextSnapshot,
   getMainContextSnapshot,
+  mainRouteTargetForAgent,
 } = require('~/server/services/viventium/ViventiumMainContextService');
 const {
   getTrustedInteractionContext,
@@ -388,6 +395,16 @@ function getCortexExecutionTimeoutMs() {
 
 function getCortexExecutionGuardGraceMs() {
   const raw = String(process.env.VIVENTIUM_CORTEX_EXECUTION_GUARD_GRACE_MS || '').trim();
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return 15_000;
+  }
+  return Math.min(parsed, 60_000);
+}
+
+/** How long a guard waits for an attempt it aborted to settle through its native cancellation. */
+function getCortexAttemptJoinMs() {
+  const raw = String(process.env.VIVENTIUM_CORTEX_ATTEMPT_JOIN_MS || '').trim();
   const parsed = parseInt(raw, 10);
   if (!Number.isFinite(parsed) || parsed < 0) {
     return 15_000;
@@ -1346,7 +1363,7 @@ function applyActivationJsonMode({ providerName, model, llmConfig }) {
   };
 }
 
-function applyGroqActivationModelDefaults({ providerName, model, llmConfig }) {
+function applyGroqActivationModelDefaults({ providerName, model, llmConfig, reasoningEffort }) {
   if (!llmConfig || typeof llmConfig !== 'object') {
     return llmConfig;
   }
@@ -1368,10 +1385,10 @@ function applyGroqActivationModelDefaults({ providerName, model, llmConfig }) {
 
   if (normalizedModel.startsWith('openai/gpt-oss-')) {
     delete llmConfig.temperature;
-    modelKwargs.reasoning_effort = 'low';
+    modelKwargs.reasoning_effort = reasoningEffort || 'low';
     modelKwargs.reasoning_format = 'hidden';
   } else if (normalizedModel.startsWith('qwen/qwen3.6-')) {
-    modelKwargs.reasoning_effort = 'none';
+    modelKwargs.reasoning_effort = reasoningEffort || 'none';
     modelKwargs.reasoning_format = 'hidden';
   }
 
@@ -1859,11 +1876,17 @@ function failClosedCortexResult(result, error) {
   };
 }
 
+/* VIVENTIUM: `owner_batch` results are accepted for the Phase B owner, which forms the parent's one batch. */
+const COMPLETED_RESULT_ACCEPTANCE_POLICIES = new Set(['deliver', 'owner_batch']);
+
 async function finalizeCortexResultDelivery(
   result,
   { completedResultPolicy = 'deliver', persist },
 ) {
-  if (completedResultPolicy !== 'deliver' || !isDeliverableCortexResult(result)) {
+  if (
+    !COMPLETED_RESULT_ACCEPTANCE_POLICIES.has(completedResultPolicy) ||
+    !isDeliverableCortexResult(result)
+  ) {
     return result;
   }
   try {
@@ -2019,6 +2042,7 @@ const RETRYABLE_ACTIVATION_ERROR_CODES = new Set([
   'ETIMEDOUT',
   'JSON_PARSE_FAILED',
   'JSON_VALIDATE_FAILED',
+  'MODEL_AUTHENTICATION',
   'MODEL_DECOMMISSIONED',
   'MODEL_DEPRECATED',
   'MODEL_NOT_FOUND',
@@ -2324,7 +2348,11 @@ function classifyActivationError({ status, code, message }) {
     return 'provider_invalid_response';
   }
 
-  if (status === 401 || normalizedMessage.includes('unauthorized')) {
+  if (
+    status === 401 ||
+    normalizedCode === 'MODEL_AUTHENTICATION' ||
+    normalizedMessage.includes('unauthorized')
+  ) {
     return 'provider_unauthorized';
   }
   if (
@@ -2443,6 +2471,7 @@ function shouldSurfaceActivationTimeout({ activationResult, cortexConfig }) {
 function normalizeActivationFallbacks(activation = {}) {
   const primaryProvider = String(activation?.provider || '').trim();
   const primaryModel = String(activation?.model || '').trim();
+  const primaryEffort = String(activation?.reasoning_effort || '').trim();
   const fallbacks = Array.isArray(activation?.fallbacks) ? activation.fallbacks : [];
   const normalized = [];
   const seen = new Set();
@@ -2458,17 +2487,27 @@ function normalizeActivationFallbacks(activation = {}) {
       continue;
     }
 
-    const dedupeKey = `${provider.toLowerCase()}::${model}`;
+    const reasoningEffort =
+      typeof entry.reasoning_effort === 'string' ? entry.reasoning_effort.trim() : '';
+    const dedupeKey = `${provider.toLowerCase()}::${model}::${reasoningEffort}`;
     if (seen.has(dedupeKey)) {
       continue;
     }
     seen.add(dedupeKey);
 
-    if (provider.toLowerCase() === primaryProvider.toLowerCase() && model === primaryModel) {
+    if (
+      provider.toLowerCase() === primaryProvider.toLowerCase() &&
+      model === primaryModel &&
+      reasoningEffort === primaryEffort
+    ) {
       continue;
     }
 
-    normalized.push({ provider, model });
+    normalized.push({
+      provider,
+      model,
+      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+    });
   }
 
   return normalized;
@@ -2479,6 +2518,9 @@ function buildActivationProviderAttempts(activation = {}) {
     {
       provider: String(activation?.provider || '').trim(),
       model: String(activation?.model || '').trim(),
+      ...(typeof activation.reasoning_effort === 'string' && activation.reasoning_effort.trim()
+        ? { reasoning_effort: activation.reasoning_effort.trim() }
+        : {}),
       source: 'primary',
     },
     ...normalizeActivationFallbacks(activation).map((entry) => ({
@@ -2814,12 +2856,13 @@ function sanitizeOpenAIReasoningSampling(agentForRun, safeReq) {
   }
 }
 
-async function buildActivationLlmConfig({ providerName, model, req }) {
+async function buildActivationLlmConfig({ providerName, model, reasoning_effort, req }) {
   /* === VIVENTIUM START ===
    * Feature: Capability-enforced Phase A provider boundary.
    * Purpose: Classifier execution follows compiled capability metadata even when configuration was
    * written outside Agent Builder.
    * === VIVENTIUM END === */
+  const reasoningEffort = typeof reasoning_effort === 'string' ? reasoning_effort.trim() : '';
   const agentsConfig = req?.config?.endpoints?.agents || {};
   const activationCapability = agentsConfig.providerCapabilities?.[providerName];
   if (activationCapability?.activation_classifier === false) {
@@ -2846,7 +2889,7 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
   const llmConfig = {
     provider: mappedProvider || (openAICompatibleProvider ? Providers.OPENAI : mappedProvider),
     model,
-    maxTokens: 100,
+    ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : { maxTokens: 100 }),
     streaming: false,
     disableStreaming: true,
   };
@@ -2880,7 +2923,7 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
   if (req && configuredCustomEndpoint) {
     const modelParameters = {
       model,
-      max_tokens: 100,
+      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : { max_tokens: 100 }),
       ...(providerName === 'perplexity' || isOpenAIReasoningModelWithoutSampling(model)
         ? {}
         : { temperature: 0.1 }),
@@ -2906,6 +2949,7 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
       llmConfig: applyGroqActivationModelDefaults({
         providerName,
         model,
+        reasoningEffort,
         llmConfig: customLlmConfig,
       }),
     });
@@ -2954,8 +2998,9 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
       endpoint: EModelEndpoint.anthropic,
       model_parameters: {
         model,
-        maxOutputTokens: 100,
-        thinking: false,
+        ...(reasoningEffort
+          ? { effort: reasoningEffort, thinking: true }
+          : { maxOutputTokens: 100, thinking: false }),
         ...(usesAdaptiveAnthropicTemperatureRules ? {} : { temperature: 0.1 }),
       },
       db: {
@@ -2993,7 +3038,7 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
 
     const modelParameters = {
       model,
-      max_output_tokens: 100,
+      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : { max_output_tokens: 100 }),
       ...(isOpenAIReasoningModelWithoutSampling(model) ? {} : { temperature: 0.1 }),
     };
     const removedFromModelParameters = sanitizeOpenAIReasoningSamplingParams(modelParameters, {
@@ -3014,6 +3059,7 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
 
     const openAILlmConfig = {
       ...initialized.llmConfig,
+      ...(initialized.configOptions ? { configuration: initialized.configOptions } : {}),
       provider: Providers.OPENAI,
       model,
       streaming: false,
@@ -3045,7 +3091,12 @@ async function buildActivationLlmConfig({ providerName, model, req }) {
   return applyActivationJsonMode({
     providerName,
     model,
-    llmConfig: applyGroqActivationModelDefaults({ providerName, model, llmConfig }),
+    llmConfig: applyGroqActivationModelDefaults({
+      providerName,
+      model,
+      llmConfig,
+      reasoningEffort,
+    }),
   });
 }
 
@@ -3065,12 +3116,13 @@ async function invokeActivationClassifierAttempt({
   agentId,
   providerName,
   model,
+  reasoning_effort,
   fullPrompt,
   runId,
   req,
   abortController,
 }) {
-  const llmConfig = await buildActivationLlmConfig({ providerName, model, req });
+  const llmConfig = await buildActivationLlmConfig({ providerName, model, reasoning_effort, req });
   const runIdSuffix = `${providerName}-${model}`.replace(/[^a-z0-9_-]+/gi, '_');
   logPromptFrame(
     logger,
@@ -3080,6 +3132,11 @@ async function invokeActivationClassifierAttempt({
       surface: resolveViventiumSurface(req),
       provider: providerName,
       model,
+      reasoningEffort: reasoning_effort,
+      requestIdentity: {
+        ownerId: String(req?.user?.id || req?.user?._id || ''),
+        interactionContext: getTrustedInteractionContext(req),
+      },
       authClass: 'user_runtime',
       layers: {
         activation_system: ACTIVATION_SYSTEM_PROMPT,
@@ -3186,6 +3243,7 @@ async function checkCortexActivation({
   const {
     prompt: activationPrompt,
     model = 'qwen/qwen3.6-27b', // Evaluated Groq classifier default; thinking is disabled in buildActivationLlmConfig.
+    reasoning_effort,
     provider = 'groq', // Default to Groq for cost-effectiveness
     fallbacks = [],
     confidence_threshold = 0.7,
@@ -3277,7 +3335,12 @@ ${activationFormat}`;
 
   try {
     const startTime = Date.now();
-    const attempts = buildActivationProviderAttempts({ provider, model, fallbacks });
+    const attempts = buildActivationProviderAttempts({
+      provider,
+      model,
+      reasoning_effort,
+      fallbacks,
+    });
     const providerAttempts = [];
     const suppressionsByAttempt = attempts.map((attempt) =>
       getActivationProviderSuppression({
@@ -3324,6 +3387,7 @@ ${activationFormat}`;
               provider: providerName,
               model: attempt.model,
               source: attempt.source,
+              ...(attempt.reasoning_effort ? { reasoning_effort: attempt.reasoning_effort } : {}),
               status: 'skipped_unhealthy',
               error: providerSuppression.error,
               retryAfterMs,
@@ -3383,6 +3447,7 @@ ${activationFormat}`;
           agentId: agent_id,
           providerName,
           model: attempt.model,
+          reasoning_effort: attempt.reasoning_effort,
           fullPrompt,
           runId,
           req,
@@ -3405,6 +3470,7 @@ ${activationFormat}`;
           provider: providerName,
           model: attempt.model,
           source: attempt.source,
+          ...(attempt.reasoning_effort ? { reasoning_effort: attempt.reasoning_effort } : {}),
           status: 'completed',
           activate: parsed.activate,
           shouldActivate,
@@ -3442,6 +3508,7 @@ ${activationFormat}`;
             })),
           providerUsed: providerName,
           modelUsed: attempt.model,
+          ...(attempt.reasoning_effort ? { reasoningEffortUsed: attempt.reasoning_effort } : {}),
           providerAttempts,
         };
       } catch (error) {
@@ -3453,6 +3520,7 @@ ${activationFormat}`;
             provider: providerName,
             model: attempt.model,
             source: attempt.source,
+            ...(attempt.reasoning_effort ? { reasoning_effort: attempt.reasoning_effort } : {}),
             status: 'error',
             error: sanitizeActivationErrorForLog(errorSummary),
             markedUnhealthy: false,
@@ -3494,6 +3562,7 @@ ${activationFormat}`;
           provider: providerName,
           model: attempt.model,
           source: attempt.source,
+          ...(attempt.reasoning_effort ? { reasoning_effort: attempt.reasoning_effort } : {}),
           status: 'error',
           error: sanitizeActivationErrorForLog(errorSummary),
           markedUnhealthy,
@@ -3670,19 +3739,64 @@ async function prepareCortexConversationProviderCapability({
     cancellationReq._viventiumHarnessIdempotencyKey = idempotencyKey;
   }
   if (signal && idempotencyKey) {
-    bindCancellation({
+    const cancellationBound = bindCancellation({
       req: cancellationReq,
       signal,
-      endpointConfig: targetAgent?.model_parameters?.configuration,
+      endpointConfig: {
+        baseURL: targetAgent?.model_parameters?.configuration?.baseURL,
+        apiKey: targetAgent?.model_parameters?.apiKey,
+      },
       onDeliveryError: (error) => {
         logger.warn('[GlassHiveProvider] Native cortex cancellation delivery failed', {
           error: error?.message || 'provider_unreachable',
         });
       },
     });
+    if (capability?.workspace_binding === true && cancellationBound !== true) {
+      logger.warn('[GlassHiveProvider] Native cortex cancellation binding unavailable', {
+        stage: 'cortex_attempt_binding',
+        errorClass: 'native_cancellation_binding_unavailable',
+      });
+    }
   }
   installRefresher(args);
   return attached;
+}
+
+/* === VIVENTIUM START ===
+ * Fix: One cortex attempt's exact native ownership, resolved at the attempt boundary.
+ * Purpose: A fallback or retry may start only when the attempt's own native request is proven
+ * gone. `none`: no native request was bound for this attempt. `ended`: the provider completed it
+ * with the attempt's result. `released`: GlassHive acknowledged every exact bound request and run
+ * terminal with no retained lease; the same idempotent Stop also fences a request that was never
+ * admitted. Anything else is `unresolved`: an unreachable or unconfirmed host, local Promise
+ * settlement and absent output are never release, and nothing may overlap the request.
+ * === VIVENTIUM END === */
+async function settleCortexAttemptNativeOwnership({ req, completed }) {
+  if (
+    req?._viventiumHarnessExecutionEnabled !== true ||
+    !String(req?._viventiumHarnessIdempotencyKey || '').trim()
+  ) {
+    return { state: 'none', outcome: null };
+  }
+  if (completed === true) {
+    return { state: 'ended', outcome: null };
+  }
+  try {
+    let delivery = req._viventiumHarnessCancellationDeliveryPromise;
+    if (!delivery && typeof req._viventiumHarnessReleaseAttempt === 'function') {
+      delivery = req._viventiumHarnessReleaseAttempt();
+    }
+    const outcome = delivery ? await delivery : null;
+    const outcomes = Array.isArray(outcome?.outcomes) ? outcome.outcomes : [];
+    const released =
+      outcome?.acknowledged === true &&
+      outcomes.length > 0 &&
+      outcomes.every((entry) => entry?.acknowledged === true && entry?.capacityReleased === true);
+    return { state: released ? 'released' : 'unresolved', outcome };
+  } catch (_error) {
+    return { state: 'unresolved', outcome: null };
+  }
 }
 
 /**
@@ -3695,10 +3809,84 @@ async function prepareCortexConversationProviderCapability({
  * @param {object} [params.req] - Express request object (required for custom endpoints and tool loading)
  * @param {object} [params.res] - Express response object (for tool streaming if needed)
  * @param {'full'|'minimal'} [params.contextMode='full'] - Minimal mode is for compact internal workers.
+ * @param {'inherited'|'isolated'} [params.mainContextBinding='inherited'] - Isolated internal workers
+ *   carry their own evidence and never claim the triggering Main turn's Core context.
  * @param {number|null} [params.executionTimeoutMs=null] - Optional bounded timeout override.
  * @returns {Promise<{ agentId: string, agentName: string, insight: string }>}
  */
-async function executeCortexOnce(
+async function executeCortexOnce(params, dependencies) {
+  /* === VIVENTIUM START ===
+   * Fix: When a native request was bound, the result carries its resolved ownership, so every
+   * fallback and retry decides from the attempt's own answer, not an observer or output marker.
+   * === VIVENTIUM END === */
+  const nativeOwnership = { state: 'none' };
+  const invoke = () => runCortexAttempt(params, dependencies, nativeOwnership);
+  const ownerId = String(params?.req?.user?.id || '').trim();
+  const conversationId = String(
+    params?.conversationId || params?.req?.body?.conversationId || '',
+  ).trim();
+  const agentId = String(params?.agent?.id || '').trim();
+  const capability =
+    params?.req?.config?.endpoints?.agents?.providerCapabilities?.[params?.agent?.provider];
+  const ownerSignal = params?.signal || params?.req?._viventiumVoiceAbortSignal;
+  const attemptSignal = params?.attemptSignal;
+  let result;
+  if (capability?.workspace_binding === true && ownerId && conversationId && agentId) {
+    const queuedAt = Date.now();
+    const executionTimeoutMs =
+      params.executionTimeoutMs > 0 ? params.executionTimeoutMs : getCortexExecutionTimeoutMs();
+    const timeoutMs = executionTimeoutMs || 3_600_000;
+    try {
+      result = await withNativeConversationAdmission(
+        {
+          sessionKey: JSON.stringify([ownerId, conversationId, agentId]),
+          timeoutMs,
+          signals: [ownerSignal, attemptSignal].filter(Boolean),
+          isCancelled: () =>
+            isBackgroundCortexCancellationSignal(ownerSignal) || attemptSignal?.aborted === true,
+        },
+        () => {
+          const waitMs = Date.now() - queuedAt;
+          if (waitMs > 1)
+            logger.info(
+              `[BackgroundCortexService] Native session admission wait: agent=${agentId} wait_ms=${waitMs}`,
+            );
+          return runCortexAttempt(
+            {
+              ...params,
+              executionTimeoutMs:
+                executionTimeoutMs > 0 ? Math.max(1, executionTimeoutMs - waitMs) : 0,
+            },
+            dependencies,
+            nativeOwnership,
+          );
+        },
+      );
+    } catch (error) {
+      if (error?.name !== 'AbortError') throw error;
+      const intentionallyCancelled = isBackgroundCortexCancellationSignal(ownerSignal);
+      result = {
+        agentId,
+        agentName: params.agent.name || agentId,
+        insight: null,
+        error: intentionallyCancelled
+          ? PUBLIC_CORTEX_ERROR_MESSAGES.background_agent_error
+          : 'timeout',
+        errorClass: intentionallyCancelled ? 'background_agent_error' : 'timeout',
+        errorCode: error.code || 'native_session_admission_cancelled',
+        harnessInvocationStarted: false,
+        nativeOwnership: 'none',
+      };
+    }
+  } else {
+    result = await invoke();
+  }
+  return nativeOwnership.state !== 'none' && result && typeof result === 'object'
+    ? { ...result, nativeOwnership: nativeOwnership.state }
+    : result;
+}
+
+async function runCortexAttempt(
   {
     agent,
     messages,
@@ -3709,9 +3897,11 @@ async function executeCortexOnce(
     res,
     activationScope = null,
     contextMode = 'full',
+    mainContextBinding = 'inherited',
     completedResultPolicy = 'deliver',
     executionTimeoutMs = null,
     signal = null,
+    attemptSignal = null,
     insightMode = 'user_facing',
     harnessAttemptRole = 'primary',
     resultEvidence = null,
@@ -3722,13 +3912,18 @@ async function executeCortexOnce(
     initializeAgentFn = initializeAgent,
     createRunFn = createRun,
     persistCompletedInsightFn = persistCompletedCortexGraphInsight,
+    prepareCapabilityFn = prepareCortexConversationProviderCapability,
   } = {},
+  nativeOwnership = { state: 'none' },
 ) {
-  if (!['deliver', 'internal'].includes(completedResultPolicy)) {
-    throw new TypeError('completedResultPolicy must be "deliver" or "internal"');
+  if (!['deliver', 'owner_batch', 'internal'].includes(completedResultPolicy)) {
+    throw new TypeError('completedResultPolicy must be "deliver", "owner_batch" or "internal"');
   }
   if (!['user_facing', 'structured'].includes(insightMode)) {
     throw new TypeError('insightMode must be "user_facing" or "structured"');
+  }
+  if (!['inherited', 'isolated'].includes(mainContextBinding)) {
+    throw new TypeError('mainContextBinding must be "inherited" or "isolated"');
   }
   const startTime = Date.now();
   /** @type {AbortController | null} */
@@ -3740,6 +3935,7 @@ async function executeCortexOnce(
    * === VIVENTIUM END === */
   let deadlineTimerFired = false;
   let removeExternalAbortListener = null;
+  let removeAttemptAbortListener = null;
   /* === VIVENTIUM START ===
    * Fix: Preserve Phase B metadata through provider failures so UI cards, DB parts, and fallback
    * routing can distinguish provider-stage failures from missing tools or auth.
@@ -3750,11 +3946,79 @@ async function executeCortexOnce(
   let harnessInvocationReq = null;
   let cortexCancellationReq = null;
   let toolEvidence = null;
+  let attemptCompleted = false;
 
   try {
     const safeReq = req || { body: {}, user: {} };
     safeReq.body = safeReq.body || {};
     safeReq.user = safeReq.user || {};
+    /* === VIVENTIUM START ===
+     * Fix: This attempt's lifetime starts at entry. Its execution deadline also covers context
+     * preparation, so it cannot run past the guard that its Phase B owner waits on.
+     * === VIVENTIUM END === */
+    abortController = new AbortController();
+    /* === VIVENTIUM START ===
+     * Feature: composed voice-task cancellation
+     * Purpose: Bind the owning generation signal to background cortex tools/providers so a task
+     * cancellation does not merely hide a late result while avoidable work keeps running.
+     * Fix: Only an intentional cancellation reason propagates. GenerationJobManager also aborts the
+     * owning request signal with `generation_completed` when the main turn finishes, and a detached
+     * cortex (for example the Emotional Reaction cortex scheduled after the main turn) must run to
+     * its own terminal result instead of failing immediately as a false `timeout`.
+     * === VIVENTIUM END === */
+    const ownerSignal = signal || safeReq?._viventiumVoiceAbortSignal || null;
+    if (ownerSignal?.aborted) {
+      if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+        abortController.abort(ownerSignal.reason);
+      }
+    } else if (typeof ownerSignal?.addEventListener === 'function') {
+      const abortFromOwner = () => {
+        if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+          abortController?.abort(ownerSignal.reason);
+        }
+      };
+      ownerSignal.addEventListener('abort', abortFromOwner, { once: true });
+      removeExternalAbortListener = () =>
+        ownerSignal.removeEventListener?.('abort', abortFromOwner);
+    }
+    const effectiveExecutionTimeoutMs =
+      Number.isFinite(executionTimeoutMs) && executionTimeoutMs > 0
+        ? Math.floor(executionTimeoutMs)
+        : getCortexExecutionTimeoutMs();
+    if (effectiveExecutionTimeoutMs > 0) {
+      abortTimer = setTimeout(() => {
+        try {
+          /* === VIVENTIUM START ===
+           * Fix: Record the deadline as the abort cause only when this timer performs the abort,
+           * so an earlier intentional cancellation is never relabelled as a timeout.
+           * === VIVENTIUM END === */
+          if (abortController?.signal?.aborted !== true) {
+            deadlineTimerFired = true;
+            // An owned deadline cancellation: a native request is cancelled and released.
+            abortController?.abort(CORTEX_ATTEMPT_DEADLINE_REASON);
+          }
+        } catch (_e) {
+          // Ignore abort errors; we just need the run to unwind.
+        }
+      }, effectiveExecutionTimeoutMs);
+    }
+    /* === VIVENTIUM START ===
+     * Fix: The guard that stops waiting for this attempt aborts it; the attempt then records the
+     * deadline as its cause and can no longer accept a result.
+     * === VIVENTIUM END === */
+    const abortFromAttemptGuard = () => {
+      if (abortController?.signal?.aborted !== true) {
+        deadlineTimerFired = true;
+        abortController?.abort(CORTEX_ATTEMPT_DEADLINE_REASON);
+      }
+    };
+    if (attemptSignal?.aborted) {
+      abortFromAttemptGuard();
+    } else if (typeof attemptSignal?.addEventListener === 'function') {
+      attemptSignal.addEventListener('abort', abortFromAttemptGuard, { once: true });
+      removeAttemptAbortListener = () =>
+        attemptSignal.removeEventListener?.('abort', abortFromAttemptGuard);
+    }
     safeReq.config = safeReq.config || (await getAppConfig({ role: safeReq.user?.role }));
     const resolvedConversationId = conversationId || safeReq.body.conversationId;
     const minimalContext = contextMode === 'minimal';
@@ -3934,51 +4198,6 @@ async function executeCortexOnce(
       return baseToolEndCallback(data, metadata);
     };
 
-    abortController = new AbortController();
-    /* === VIVENTIUM START ===
-     * Feature: composed voice-task cancellation
-     * Purpose: Bind the owning generation signal to background cortex tools/providers so a task
-     * cancellation does not merely hide a late result while avoidable work keeps running.
-     * Fix: Only an intentional cancellation reason propagates. GenerationJobManager also aborts the
-     * owning request signal with `generation_completed` when the main turn finishes, and a detached
-     * cortex (for example the Emotional Reaction cortex scheduled after the main turn) must run to
-     * its own terminal result instead of failing immediately as a false `timeout`.
-     * === VIVENTIUM END === */
-    const ownerSignal = signal || safeReq?._viventiumVoiceAbortSignal || null;
-    if (ownerSignal?.aborted) {
-      if (isBackgroundCortexCancellationSignal(ownerSignal)) {
-        abortController.abort(ownerSignal.reason);
-      }
-    } else if (typeof ownerSignal?.addEventListener === 'function') {
-      const abortFromOwner = () => {
-        if (isBackgroundCortexCancellationSignal(ownerSignal)) {
-          abortController?.abort(ownerSignal.reason);
-        }
-      };
-      ownerSignal.addEventListener('abort', abortFromOwner, { once: true });
-      removeExternalAbortListener = () =>
-        ownerSignal.removeEventListener?.('abort', abortFromOwner);
-    }
-    const effectiveExecutionTimeoutMs =
-      Number.isFinite(executionTimeoutMs) && executionTimeoutMs > 0
-        ? Math.floor(executionTimeoutMs)
-        : getCortexExecutionTimeoutMs();
-    if (effectiveExecutionTimeoutMs > 0) {
-      abortTimer = setTimeout(() => {
-        try {
-          /* === VIVENTIUM START ===
-           * Fix: Record the deadline as the abort cause only when this timer performs the abort,
-           * so an earlier intentional cancellation is never relabelled as a timeout.
-           * === VIVENTIUM END === */
-          if (abortController?.signal?.aborted !== true) {
-            deadlineTimerFired = true;
-            abortController?.abort();
-          }
-        } catch (_e) {
-          // Ignore abort errors; we just need the run to unwind.
-        }
-      }, effectiveExecutionTimeoutMs);
-    }
     const loadTools = createToolLoader(abortController.signal, streamId);
     const allowedProviders = new Set(
       safeReq.config?.endpoints?.[EModelEndpoint.agents]?.allowedProviders,
@@ -4026,9 +4245,16 @@ async function executeCortexOnce(
       },
     );
 
-    bindCortexMainContextSnapshot(safeReq, initializedAgent, {
-      required: cortexCapability?.workspace_binding === true,
-    });
+    /* === VIVENTIUM START ===
+     * Fix: an isolated internal worker (the Main continuity compactor) sends its own one-message
+     * carrier. Binding the triggering Main turn's snapshot would forward that turn's visible chain
+     * and logical-turn identity for a different carrier, which the native provider rejects.
+     * === VIVENTIUM END === */
+    if (mainContextBinding === 'inherited') {
+      bindCortexMainContextSnapshot(safeReq, initializedAgent, {
+        required: cortexCapability?.workspace_binding === true,
+      });
+    }
 
     const backgroundFeelingTail = feelingTailForBackgroundAgent(safeReq._viventiumFeelingSnapshot);
     if (backgroundFeelingTail) {
@@ -4217,6 +4443,12 @@ async function executeCortexOnce(
           initializedAgent.model ||
           agentForRun.model_parameters?.model ||
           agentForRun.model,
+        requestedEffort: mainRouteTargetForAgent(agentForRun)?.effort,
+        reasoningEffort: mainRouteTargetForAgent(initializedAgent)?.effort,
+        requestIdentity: {
+          ownerId: String(safeReq.user?.id || safeReq.user?._id || ''),
+          interactionContext: getTrustedInteractionContext(safeReq),
+        },
         authClass: initializedAgent.userMCPAuthMap ? 'connected_account_runtime' : 'user_runtime',
         layers: {
           cortex_instructions: initializedAgent.instructions || agentForRun.instructions || '',
@@ -4278,7 +4510,11 @@ async function executeCortexOnce(
     cortexCancellationReq._viventiumHarnessIdempotencyKeys = new Set();
     cortexCancellationReq._viventiumHarnessCancellationBoundBaseURLs = new Set();
     cortexCancellationReq._viventiumHarnessCancellationActiveBaseURL = '';
-    await prepareCortexConversationProviderCapability({
+    // This attempt's own native identity and release state; nothing is inherited from its owner.
+    cortexCancellationReq._viventiumHarnessIdempotencyKey = '';
+    cortexCancellationReq._viventiumHarnessCancellationDeliveryPromise = null;
+    cortexCancellationReq._viventiumHarnessReleaseAttempt = null;
+    await prepareCapabilityFn({
       targetAgent: initializedAgent,
       declaredAgent: agentForRun,
       req: harnessInvocationReq,
@@ -4287,6 +4523,23 @@ async function executeCortexOnce(
       signal: abortController.signal,
       cancellationReq: cortexCancellationReq,
     });
+    if (cortexCapability?.workspace_binding === true) {
+      const parameters = initializedAgent.model_parameters || {};
+      const configuration = parameters.configuration || {};
+      initializedAgent.model_parameters = {
+        ...parameters,
+        configuration: {
+          ...configuration,
+          fetch: createNativeCapacityFetch(configuration.fetch || globalThis.fetch, {
+            signal: abortController.signal,
+            deadlineAt:
+              effectiveExecutionTimeoutMs > 0 ? startTime + effectiveExecutionTimeoutMs : undefined,
+            streamId: safeReq._resumableStreamId || safeReq.body?.streamId || runId,
+            role: 'cortex',
+          }),
+        },
+      };
+    }
     const disableStreaming = cortexProvider === 'anthropic';
     const runOptions = {
       agents: [initializedAgent],
@@ -4342,6 +4595,12 @@ async function executeCortexOnce(
 
     executionStage = 'stream';
     const content = await run.processStream({ messages: providerSafeInputMessages }, config);
+    // Successful native transport may intentionally produce no insight. Typed provider errors
+    // and cancellation still require exact native release, independent of the model's prose.
+    attemptCompleted =
+      abortController?.signal?.aborted !== true &&
+      !contentParts.some((part) => part?.type === ContentTypes.ERROR) &&
+      !(Array.isArray(content) && content.some((part) => part?.type === ContentTypes.ERROR));
     executionStage = 'postprocess';
     const duration = Date.now() - startTime;
 
@@ -4439,6 +4698,16 @@ async function executeCortexOnce(
           }
         : {}),
     };
+    /* === VIVENTIUM START ===
+     * Fix: An attempt aborted by its deadline, its guard or its owner never accepts a result,
+     * even when the provider stream still completed; its owner has already recorded its outcome.
+     * === VIVENTIUM END === */
+    if (abortController?.signal?.aborted === true) {
+      const abortedAttemptError = new Error('Cortex attempt ended before its result was accepted');
+      abortedAttemptError.name = 'AbortError';
+      throw abortedAttemptError;
+    }
+    // The provider completed this request with a result: its native request has ended.
     executionStage = 'completed_result_acceptance';
     return await finalizeCortexResultDelivery(cortexResult, {
       completedResultPolicy,
@@ -4450,6 +4719,7 @@ async function executeCortexOnce(
           agent,
           insight,
           surface,
+          ...(completedResultPolicy === 'owner_batch' ? { ownerBatch: true } : {}),
         }),
     });
   } catch (error) {
@@ -4510,32 +4780,39 @@ async function executeCortexOnce(
       harnessInvocationStarted: harnessInvocationReq?._viventiumHarnessInvocationStarted === true,
     };
   } finally {
-    if (abortController?.signal.aborted && typeof onHarnessCancellationOutcome === 'function') {
-      const deliveryPromise = cortexCancellationReq?._viventiumHarnessCancellationDeliveryPromise;
-      if (deliveryPromise) {
-        const outcome = await deliveryPromise;
-        onHarnessCancellationOutcome(outcome);
-      } else {
-        const cancellationWasExpected =
-          cortexCancellationReq?._viventiumHarnessExecutionEnabled === true &&
-          Boolean(String(cortexCancellationReq?._viventiumHarnessIdempotencyKey || '').trim());
-        onHarnessCancellationOutcome({ acknowledged: !cancellationWasExpected });
-      }
+    /* === VIVENTIUM START ===
+     * Fix: This boundary resolves its native ownership itself, with or without an observer, and
+     * settles only after that answer (see settleCortexAttemptNativeOwnership).
+     * === VIVENTIUM END === */
+    const settledOwnership = await settleCortexAttemptNativeOwnership({
+      req: cortexCancellationReq,
+      completed: attemptCompleted,
+    });
+    nativeOwnership.state = settledOwnership.state;
+    if (
+      typeof onHarnessCancellationOutcome === 'function' &&
+      (abortController?.signal.aborted || settledOwnership.outcome)
+    ) {
+      onHarnessCancellationOutcome(
+        settledOwnership.outcome || { acknowledged: settledOwnership.state !== 'unresolved' },
+      );
     }
     if (abortTimer) {
       clearTimeout(abortTimer);
     }
     removeExternalAbortListener?.();
+    removeAttemptAbortListener?.();
     toolEvidence?.close();
   }
 }
 
 async function persistCompletedCortexGraphInsight(
-  { req, conversationId, parentMessageId, agent, insight, surface },
+  { req, conversationId, parentMessageId, agent, insight, surface, ownerBatch = false },
   {
     recordBatch = recordCompletedCortexInsightDeliveryBatch,
     enqueueOutbox = enqueueCompletedCortexInsightOutboxBatch,
     settleOutbox = settleCompletedCortexInsightOutboxBatch,
+    acceptOwned = acceptOwnedCompletedCortexInsight,
   } = {},
 ) {
   const exactInsight = insight == null ? '' : String(insight);
@@ -4595,6 +4872,39 @@ async function persistCompletedCortexGraphInsight(
   }
   const graphResultHashes = expectedDeliveries.map((delivery) => delivery.graphResultHash);
   const expectedOutboxKeys = expectedDeliveries.map((delivery) => delivery.deliveryKey);
+  /* === VIVENTIUM START ===
+   * Fix: A parent admits one delivery envelope, and its cortices finish one at a time. A Phase B
+   * insight is accepted exactly and durably into the write-ahead outbox for its live owner, which
+   * records the parent's one batch from every accepted insight. A per-cortex ledger batch here made
+   * any second visible insight on the same answer unrecordable (mixed envelope, then quarantine).
+   * === VIVENTIUM END === */
+  if (ownerBatch === true) {
+    let accepted;
+    try {
+      accepted = await acceptOwned(batch);
+    } catch (error) {
+      const code = String(error?.code || error?.name || 'outbox_write_failed').slice(0, 120);
+      logger.warn(`[BackgroundCortexService] Owner-batched insight acceptance failed: ${code}`);
+      throw acceptanceUnavailableError();
+    }
+    const outboxKeys = Array.isArray(accepted?.outboxKeys) ? accepted.outboxKeys : [];
+    if (
+      outboxKeys.length !== expectedOutboxKeys.length ||
+      expectedOutboxKeys.some((key) => !outboxKeys.includes(key))
+    ) {
+      throw acceptanceUnavailableError();
+    }
+    return {
+      deliveries: [],
+      durableAcceptance: 'outbox',
+      ownerBatch: true,
+      deliveryPending: true,
+      outboxPending: true,
+      outboxKeys,
+      graphResultHashes,
+    };
+  }
+  /* === VIVENTIUM END === */
   const requireExactOutboxAcceptance = (receipt) => {
     const outboxKeys = Array.isArray(receipt?.outboxKeys) ? receipt.outboxKeys : [];
     const accepted =
@@ -4703,10 +5013,19 @@ async function executeCortex(params, { executeOnce = executeCortexOnce } = {}) {
   const primaryAgent = params?.agent;
   const primaryResult = await executeOnce(params);
   const ownerSignal = params?.signal || params?.req?._viventiumVoiceAbortSignal;
+  if (primaryResult?.nativeOwnership === 'unresolved') {
+    logger.warn(
+      `[BackgroundCortexService] Direct cortex ${primaryAgent?.id || 'unknown'} native request ` +
+        'release is unconfirmed; no fallback or retry may overlap it',
+    );
+  }
   if (
     isBackgroundCortexCancellationSignal(ownerSignal) ||
+    params?.attemptSignal?.aborted === true ||
     !resolveFallbackAssignment(primaryAgent) ||
     primaryResult?.harnessInvocationStarted === true ||
+    // The primary's native request may still run: no fallback may overlap it.
+    primaryResult?.nativeOwnership === 'unresolved' ||
     !shouldRetryCortexResultWithFallback(primaryResult)
   ) {
     return primaryResult;
@@ -4796,6 +5115,8 @@ async function detectActivations({
 
   const startTime = voiceLatencyNow();
   const deadline = Date.now() + timeBudgetMs;
+  const activationTraceRef = crypto.randomUUID();
+  const tracedActivationAgents = new Set();
   logVoicePhaseAStage(
     req,
     'activation_detect_start',
@@ -5011,6 +5332,26 @@ async function detectActivations({
     } = {},
   ) => {
     const activationResults = rawActivationResults.map(applyDirectActionOwnershipGate);
+    for (const result of activationResults) {
+      if (tracedActivationAgents.has(result.agentId)) continue;
+      tracedActivationAgents.add(result.agentId);
+      void recordVoiceRequestTrace(req, {
+        stage: 'cortex.activation.completed',
+        eventRef: `activation:${runId}:${activationTraceRef}:${result.agentId}`,
+        facts: {
+          responseRef: runId,
+          cortexRef: result.agentId,
+          cortexStatus:
+            result.activationProviderUnavailable === true
+              ? 'unavailable'
+              : result.activationTimedOut === true || result.reason === 'global_timeout'
+                ? 'timeout'
+                : result.shouldActivate === true
+                  ? 'activated'
+                  : 'not_activated',
+        },
+      });
+    }
     logVoicePhaseAStage(
       req,
       collectStage,
@@ -5314,6 +5655,8 @@ async function executeActivated(
   if (isBackgroundCortexCancellationSignal(ownerSignal)) {
     return { insights: [], cancelled: true };
   }
+  // The Phase B completion owner forms this parent's delivery batch from what its cortices accept.
+  registerOwnedCompletedCortexParent({ ownerId: req?.user?.id, parentMessageId: runId });
   let modelsConfigPromise = null;
   const getModelsConfigOnce = () => {
     if (!modelsConfigPromise) {
@@ -5327,9 +5670,23 @@ async function executeActivated(
     }
     return modelsConfigPromise;
   };
-  const runCortexWithGuard = async ({ agent, activationResult }) => {
+  /* === VIVENTIUM START ===
+   * Fix: The guard owns the attempt it stops waiting for. It aborts it as an owned deadline
+   * cancellation, then waits for the attempt to settle, which happens only after the attempt has
+   * resolved its native ownership (see settleCortexAttemptNativeOwnership). The settled result
+   * carries that ownership, which decides fallback. An attempt that still has not settled is
+   * reported as possibly running, so no fallback can overlap it, and it can never accept a result.
+   * === VIVENTIUM END === */
+  const runCortexWithGuard = async ({
+    agent,
+    activationResult,
+    harnessAttemptRole = 'primary',
+  }) => {
+    const attemptController = new AbortController();
     const cortexPromise = executeCortexFn({
       agent,
+      // A fallback is its own native request: its own idempotency identity, never the primary's.
+      harnessAttemptRole,
       messages,
       runId,
       conversationId,
@@ -5339,6 +5696,9 @@ async function executeActivated(
       activationScope: activationResult.activationScope || null,
       resultEvidence: activationResult.resultEvidence || null,
       signal: ownerSignal,
+      attemptSignal: attemptController.signal,
+      // The Phase B completion owner forms this parent's delivery batch from what its cortices accept.
+      completedResultPolicy: 'owner_batch',
     });
     const guardTimeoutMs = getCortexAttemptGuardTimeoutMs(executionTimeoutMs);
     if (!guardTimeoutMs) {
@@ -5347,17 +5707,35 @@ async function executeActivated(
     let timeoutId = null;
     const timeoutPromise = new Promise((resolve) => {
       timeoutId = setTimeout(() => {
-        resolve({
-          agentId: activationResult.agentId,
-          agentName: agent.name || activationResult.agentId,
-          insight: null,
-          error: 'timeout',
-        });
+        attemptController.abort(CORTEX_ATTEMPT_DEADLINE_REASON);
+        // The race now takes the aborted attempt's own settled result; only an attempt that has
+        // not settled within the join window resolves here, as possibly still running.
+        timeoutId = setTimeout(() => {
+          logger.warn(
+            `[BackgroundCortexService] Cortex ${activationResult.agentId} did not settle after its ` +
+              'deadline cancellation; treating it as possibly running',
+          );
+          resolve({
+            agentId: activationResult.agentId,
+            agentName: agent.name || activationResult.agentId,
+            insight: null,
+            error: 'timeout',
+            harnessInvocationStarted: true,
+            attemptUnjoined: true,
+            nativeOwnership: 'unresolved',
+          });
+        }, getCortexAttemptJoinMs());
       }, guardTimeoutMs);
     });
     const result = await Promise.race([cortexPromise, timeoutPromise]);
     if (timeoutId) {
       clearTimeout(timeoutId);
+    }
+    if (result?.nativeOwnership === 'unresolved') {
+      logger.warn(
+        `[BackgroundCortexService] Cortex ${activationResult.agentId} native request release is ` +
+          'unconfirmed; no fallback may overlap it',
+      );
     }
     return result;
   };
@@ -5492,6 +5870,8 @@ async function executeActivated(
         !isBackgroundCortexCancellationSignal(ownerSignal) &&
         result?.fallbackUsed !== true &&
         result?.harnessInvocationStarted !== true &&
+        result?.attemptUnjoined !== true &&
+        result?.nativeOwnership !== 'unresolved' &&
         shouldRetryCortexResultWithFallback(result)
       ) {
         const primaryProvider = cortexAgent.provider || 'unknown';
@@ -5513,7 +5893,11 @@ async function executeActivated(
             `${primaryProvider}/${primaryModel} failed before insight (${publicPrimaryError.errorClass}); ` +
             `retrying fallback ${fallbackProvider}/${fallbackModel}`,
         );
-        const fallbackResult = await runCortexWithGuard({ agent: fallbackAgent, activationResult });
+        const fallbackResult = await runCortexWithGuard({
+          agent: fallbackAgent,
+          activationResult,
+          harnessAttemptRole: 'fallback',
+        });
         result = {
           ...fallbackResult,
           fallbackUsed: true,
@@ -5596,6 +5980,31 @@ async function executeActivated(
    * downstream code stays unchanged.
    */
   const settledResults = await Promise.allSettled(executionPromises);
+  for (const [index, settled] of settledResults.entries()) {
+    const result = settled.status === 'fulfilled' ? settled.value : null;
+    void recordVoiceRequestTrace(req, {
+      stage: 'cortex.completed',
+      eventRef: `execution:${runId}:${activatedCortices[index].agentId}`,
+      facts: {
+        responseRef: runId,
+        cortexRef: activatedCortices[index].agentId,
+        cortexStatus: isBackgroundCortexCancellationSignal(ownerSignal)
+          ? 'cancelled'
+          : result?.nativeOwnership === 'unresolved'
+            ? 'unresolved'
+            : result?.errorClass === 'timeout' || result?.error === 'timeout'
+              ? 'timeout'
+              : result?.errorClass === 'activation_provider_unavailable'
+                ? 'unavailable'
+                : !result || result.error
+                  ? 'failed'
+                  : hasVisibleCortexInsight(result.insight)
+                    ? 'completed'
+                    : 'no_insight',
+        effectCount: result?.completedToolCalls || 0,
+      },
+    });
+  }
   if (isBackgroundCortexCancellationSignal(ownerSignal)) {
     return { insights: [], cancelled: true };
   }

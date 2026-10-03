@@ -75,6 +75,7 @@ interface GlassHiveAccountApiInput {
 }
 
 interface GlassHiveAccountApiResult {
+  attemptId?: string;
   valid?: boolean;
   originRef?: string;
   workRef?: string;
@@ -125,6 +126,7 @@ export interface GlassHiveDestination {
   telegramChatId?: string;
   telegramUserId?: string;
   telegramMessageId?: string;
+  telegramMessageThreadId?: string;
   voiceCallSessionId?: string;
   voiceRequestId?: string;
   unresolvedReason?: string;
@@ -146,6 +148,7 @@ export interface GlassHiveLaunchRequestBody {
   viventiumTelegramChatId?: string;
   viventiumTelegramUserId?: string;
   viventiumTelegramMessageId?: string;
+  viventiumTelegramMessageThreadId?: string;
   viventiumVoiceCallSessionId?: string;
   viventiumVoiceRequestId?: string;
   viventiumSchedulerDispatchDocumentId?: string;
@@ -200,6 +203,8 @@ export interface GlassHiveCallbackBody {
   work_state?: string;
   work_terminal?: boolean;
   attempt_number?: number;
+  attempt_id?: string;
+  output_files?: unknown;
   failure_code?: string;
   failure_class?: string;
   error_code?: string;
@@ -232,6 +237,8 @@ export interface GlassHiveCallbackContext {
   scheduleOccurrenceKey: string;
   scheduleId: string;
   mainAgentId: string;
+  runId?: string;
+  attemptId?: string;
   traceIdentity?: { callbackRef: string; attemptNumber: number | null };
   destinations: GlassHiveDestination[];
 }
@@ -765,6 +772,7 @@ function configuredDestinationsFromRequest(requestBody: RuntimeRecord = {}): Run
       telegramChatId: normalizeText(requestBody.viventiumTelegramChatId),
       telegramUserId: normalizeText(requestBody.viventiumTelegramUserId),
       telegramMessageId: normalizeText(requestBody.viventiumTelegramMessageId),
+      telegramMessageThreadId: normalizeText(requestBody.viventiumTelegramMessageThreadId),
     });
   } else if (surface === 'voice') {
     destinations.push({
@@ -1380,6 +1388,9 @@ async function resolveTelegramDestination(
       surface: 'telegram',
       telegramChatId: boundChatId || boundUserId,
       telegramUserId: boundUserId || boundChatId,
+      ...(destination.telegramMessageThreadId
+        ? { telegramMessageThreadId: normalizeText(destination.telegramMessageThreadId) }
+        : {}),
       ...(destination.telegramMessageId
         ? { telegramMessageId: normalizeText(destination.telegramMessageId) }
         : {}),
@@ -1831,6 +1842,11 @@ async function resolveGlassHiveCallbackContext(
   ) {
     return null;
   }
+  if (body.output_files != null && (
+    normalizeText(association?.runId, 160) !== runId ||
+    !normalizeText(body.attempt_id, 160) ||
+    normalizeText(association?.attemptId, 160) !== normalizeText(body.attempt_id, 160)
+  )) return null;
 
   const destinations = [];
   for (const destination of Array.isArray(binding.configuredDestinations)
@@ -1868,6 +1884,7 @@ async function resolveGlassHiveCallbackContext(
     scheduleOccurrenceKey: normalizeText(binding.scheduleOccurrenceKey),
     scheduleId: normalizeText(binding.scheduleId),
     mainAgentId: normalizeText(binding.mainAgentId, 160),
+    ...(body.output_files != null ? { runId, attemptId: normalizeText(association?.attemptId, 160) } : {}),
     ...(traceIdentity ? { traceIdentity } : {}),
     destinations,
   };

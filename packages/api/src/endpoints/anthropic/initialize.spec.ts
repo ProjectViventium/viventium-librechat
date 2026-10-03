@@ -493,9 +493,13 @@ describe('initializeAnthropic', () => {
       },
     });
 
-    await expect(initializeAnthropic(params)).rejects.toThrow(
-      'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.',
-    );
+    await expect(initializeAnthropic(params)).rejects.toMatchObject({
+      message:
+        'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.',
+      code: 'MODEL_AUTHENTICATION',
+      viventiumConnectedAccountReconnectRequired: true,
+      viventiumConnectedAccountProvider: 'Anthropic',
+    });
 
     expect(mockFetch).toHaveBeenCalledTimes(1);
     expect(mockGetLLMConfig).not.toHaveBeenCalled();
@@ -516,6 +520,31 @@ describe('initializeAnthropic', () => {
       oauthType: 'subscription',
       oauthReconnectRequired: true,
     });
+  });
+
+  it('keeps a stored reconnect-required subscription typed and never selects the platform key', async () => {
+    const params = createParams({
+      dbOverrides: {
+        getUserKeyValues: jest.fn().mockResolvedValue({
+          authToken: 'revoked-access-token',
+          apiKey: 'revoked-access-token',
+          oauthProvider: 'anthropic',
+          oauthType: 'subscription',
+          oauthReconnectRequired: true,
+        }),
+      },
+    });
+
+    await expect(initializeAnthropic(params)).rejects.toMatchObject({
+      message:
+        'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.',
+      code: 'MODEL_AUTHENTICATION',
+      viventiumConnectedAccountReconnectRequired: true,
+      viventiumConnectedAccountProvider: 'Anthropic',
+    });
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(mockGetLLMConfig).not.toHaveBeenCalled();
+    expect(params.db.updateUserKey).not.toHaveBeenCalled();
   });
 
   it('should preserve transient Anthropic refresh failures without marking reconnect required', async () => {

@@ -78,9 +78,11 @@ export default function CapabilityProviderOptions({
           ? localize('com_ui_glasshive_checking')
           : localize('com_ui_unavailable');
   const readinessDetail =
-    selectedReadiness?.detail ||
-    readinessQuery.data?.detail ||
-    localize('com_ui_glasshive_unreachable');
+    readinessStatus === 'checking'
+      ? ''
+      : selectedReadiness?.detail ||
+        readinessQuery.data?.detail ||
+        localize('com_ui_glasshive_unreachable');
 
   useEffect(() => {
     const effort = resolveCapabilityEffort(parameters?.reasoning_effort, modelCapability);

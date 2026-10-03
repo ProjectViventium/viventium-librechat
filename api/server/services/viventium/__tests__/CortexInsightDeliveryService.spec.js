@@ -33,6 +33,10 @@ const {
   resolveCortexRuntimeSlotIdentity,
   selectClaimedCortexInsights,
 } = require('../CortexInsightDeliveryService');
+const {
+  prepareVoiceCortexPresentation,
+  confirmVoiceCortexPresentation,
+} = require('@librechat/api');
 
 function exactFeelingSnapshot(overrides = {}) {
   return {
@@ -107,6 +111,9 @@ function createBatchStateModel(initialRows, { failClaimFor = '', failSettlementF
       const values = Array.isArray(row[key]) ? row[key] : [];
       if (!values.includes(value)) values.push(value);
       row[key] = values;
+    }
+    for (const [key, value] of Object.entries(update.$push || {})) {
+      row[key] = [...(Array.isArray(row[key]) ? row[key] : []), value];
     }
     return row;
   };
@@ -2081,5 +2088,107 @@ describe('CortexInsightDeliveryService', () => {
       }),
     ).rejects.toMatchObject({ code: 'cortex_insight_delivery_settlement_conflict' });
     expect(state).toEqual([expect.objectContaining(sent)]);
+  });
+
+  test('Voice child completion settles the actual fenced ledger once and exact terminal replay remains idempotent', async () => {
+    const { Model, state } = createBatchStateModel([
+      {
+        deliveryId: 'voice-delivery',
+        userId: 'owner-a',
+        conversationId: 'conv-a',
+        parentMessageId: 'parent-a',
+        status: 'claimed',
+        persistenceStatus: 'persisted',
+        persistedMessageId: 'message-a',
+        messageRevision: 1,
+        claimToken: 'claim-a',
+        claimGeneration: 1,
+        attemptNumber: 1,
+        graphResultHash: 'a'.repeat(64),
+        requiredSurfaces: ['voice'],
+        presentedSurfaces: [],
+        leaseExpiresAt: new Date('2026-08-22T13:00:00.000Z'),
+      },
+    ]);
+    let nowMs = Date.parse('2026-08-22T12:00:00.000Z');
+    const service = createCortexInsightDeliveryService({
+      DeliveryModel: Model,
+      now: () => new Date(nowMs),
+      randomUUID: () => 'voice-lease',
+    });
+    const parent = {
+      user: 'owner-a',
+      messageId: 'parent-a',
+      conversationId: 'conv-a',
+      text: 'Primary reply.',
+      isCreatedByUser: false,
+      metadata: {
+        viventium: {
+          callSessionId: 'call-a',
+          voiceTaskId: 'task-a',
+          interactionContext: {
+            surface: 'voice',
+            logical_turn_id: 'turn-a',
+          },
+        },
+      },
+    };
+    const child = {
+      user: 'owner-a',
+      messageId: 'message-a',
+      conversationId: 'conv-a',
+      text: 'Useful additional result.',
+      isCreatedByUser: false,
+      metadata: {
+        viventium: {
+          parentMessageId: 'parent-a',
+          cortexPresentationParentMessageId: 'parent-a',
+          cortexInsightDeliveryIds: ['voice-delivery'],
+          messageRevision: 1,
+          cortexPresentationGeneration: 1,
+          cortexPresentationClaimToken: 'claim-a',
+        },
+      },
+    };
+    const deps = {
+      fencePresentationByParent: service.fencePresentationByParent,
+      listByParent: service.listByParent,
+      markPresentationByParent: service.markPresentationByParent,
+      readMessage: async ({ messageId }) => (messageId === 'message-a' ? child : parent),
+      recordReceipt: async (message, receipt) => {
+        message.metadata.viventium.deliveryAcknowledgement = { cortexPresentation: receipt };
+        return true;
+      },
+    };
+    const input = {
+      ownerId: 'owner-a',
+      conversationId: 'conv-a',
+      parentMessageId: 'parent-a',
+      callSessionId: 'call-a',
+      taskId: 'task-a',
+      streamId: 'stream-a',
+      turnId: 'turn-a',
+      presentationRef: 'message-a',
+      stage: 'audio.completed',
+    };
+    await prepareVoiceCortexPresentation({ ...input, text: child.text, leaseMs: 900000 }, deps);
+    expect(state[0]).toMatchObject({ status: 'claimed', presentedSurfaces: [] });
+    nowMs += 31000;
+    await confirmVoiceCortexPresentation(input, deps);
+    expect(state[0]).toMatchObject({
+      status: 'sent',
+      presentedSurfaces: ['voice'],
+      sentAt: new Date('2026-08-22T12:00:31.000Z'),
+    });
+    const settledEvents = JSON.stringify(state[0].events);
+    await confirmVoiceCortexPresentation(input, deps);
+    expect(JSON.stringify(state[0].events)).toBe(settledEvents);
+    expect(
+      await prepareVoiceCortexPresentation({ ...input, text: child.text, leaseMs: 900000 }, deps),
+    ).toBe(false);
+    state[0].graphResultHash = 'b'.repeat(64);
+    await expect(confirmVoiceCortexPresentation(input, deps)).rejects.toMatchObject({
+      code: 'cortex_insight_delivery_settlement_conflict',
+    });
   });
 });

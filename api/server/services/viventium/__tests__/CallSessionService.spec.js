@@ -21,6 +21,7 @@ const {
   markVoiceSessionReady,
   reportVoiceSessionFailure,
   resolveUserVoiceRoute,
+  resolveVoiceContextKeyterms,
   syncCallSessionState,
   updateCallSessionVoiceSettings,
   claimOrReplaceCallSessionConversationId,
@@ -74,6 +75,7 @@ describe('CallSessionService', () => {
     delete process.env.OPENAI_API_KEY;
     process.env.VIVENTIUM_STT_PROVIDER = 'assemblyai';
     delete process.env.VIVENTIUM_STT_MODEL;
+    delete process.env.VIVENTIUM_ASSEMBLYAI_STT_MODEL;
     delete process.env.STT_PROVIDER;
     delete process.env.LOCAL_WHISPER_MODEL_NAME;
     process.env.VIVENTIUM_VOICE_GATEWAY_AGENT_NAME = 'librechat-voice-gateway';
@@ -1839,6 +1841,50 @@ describe('CallSessionService', () => {
     });
   });
 
+  test('pre-transcription route distinguishes saved choices from current defaults', async () => {
+    process.env.VIVENTIUM_ASSEMBLYAI_STT_MODEL = 'universal-streaming-multilingual';
+    const user = await User.create({
+      name: 'Route User',
+      email: 'route-source@example.test',
+      provider: 'local',
+      viventiumVoicePreferences: {
+        livekitPlayground: { tts: { provider: 'xai', variant: 'Sal' } },
+      },
+    });
+    expect(await resolveUserVoiceRoute(user._id.toString(), { includeSources: true })).toMatchObject({
+      stt: {
+        provider: 'assemblyai',
+        variant: 'universal-streaming-multilingual',
+        source: 'default',
+      },
+      tts: { provider: 'xai', variant: 'Sal', source: 'saved' },
+    });
+    await User.updateOne(
+      { _id: user._id },
+      { $set: { 'viventiumVoicePreferences.livekitPlayground.stt': {
+        provider: 'openai', variant: 'whisper-1',
+      } } },
+    );
+    expect(await resolveUserVoiceRoute(user._id.toString(), { includeSources: true })).toMatchObject({
+      stt: { provider: 'openai', variant: 'whisper-1', source: 'saved' },
+    });
+    expect(await resolveUserVoiceRoute(user._id.toString())).toMatchObject({
+      stt: { provider: 'openai', variant: 'whisper-1' },
+    });
+    expect((await resolveUserVoiceRoute(user._id.toString())).stt.source).toBeUndefined();
+  });
+
+  test('AssemblyAI unsaved default is the current streaming engine', async () => {
+    const user = await User.create({
+      name: 'Default Route',
+      email: 'default-route@example.test',
+      provider: 'local',
+    });
+    expect(await resolveUserVoiceRoute(user._id.toString())).toMatchObject({
+      stt: { provider: 'assemblyai', variant: 'u3-rt-pro' },
+    });
+  });
+
   test('updateCallSessionVoiceSettings persists both session route and saved defaults', async () => {
     const user = await User.create({
       name: 'Voice Settings User',
@@ -1884,11 +1930,11 @@ describe('CallSessionService', () => {
         tts: { provider: 'elevenlabs', variant: 'voice_123' },
       },
       assistantRoute: {
-        primary: { provider: 'anthropic', model: 'claude-opus-5' },
+        primary: { provider: 'openAI', model: 'gpt-5.4' },
         voiceCallLlm: null,
         fallbackLlm: null,
         voiceFallbackLlm: null,
-        effective: { provider: 'anthropic', model: 'claude-opus-5' },
+        effective: { provider: 'openAI', model: 'gpt-5.4' },
         inheritsPrimary: true,
       },
     });
@@ -1923,6 +1969,7 @@ describe('CallSessionService', () => {
       model_parameters: { model: 'gpt-5.4' },
       voice_llm_provider: 'openAI',
       voice_llm_model: 'gpt-5.4',
+      voice_llm_model_parameters: { model: 'gpt-5.4', reasoning_effort: 'high' },
       fallback_llm_provider: 'openAI',
       fallback_llm_model: 'gpt-5.4',
       voice_fallback_llm_provider: 'anthropic',
@@ -1960,11 +2007,11 @@ describe('CallSessionService', () => {
         tts: { provider: 'cartesia', variant: 'sonic-2' },
       },
       assistantRoute: {
-        primary: { provider: 'anthropic', model: 'claude-opus-5' },
-        voiceCallLlm: { provider: 'openAI', model: 'gpt-5.4' },
+        primary: { provider: 'openAI', model: 'gpt-5.4' },
+        voiceCallLlm: { provider: 'openAI', model: 'gpt-5.4', effort: 'high' },
         fallbackLlm: { provider: 'anthropic', model: 'claude-haiku-4-5' },
         voiceFallbackLlm: { provider: 'anthropic', model: 'claude-haiku-4-5' },
-        effective: { provider: 'openAI', model: 'gpt-5.4' },
+        effective: { provider: 'openAI', model: 'gpt-5.4', effort: 'high' },
         inheritsPrimary: false,
       },
     });
@@ -2001,6 +2048,54 @@ describe('CallSessionService', () => {
     expect(settings.assistantRoute.primary).toEqual({
       provider: 'glasshive-harness',
       model: 'codex-cli:gpt-5.6-sol',
+      effort: 'medium',
+    });
+  });
+
+  test('discloses all configured native model efforts without changing the selections', async () => {
+    const user = await User.create({
+      name: 'Native Route User',
+      email: 'native-route@example.com',
+      provider: 'local',
+    });
+    await Agent.create({
+      id: 'agent-native-route',
+      name: 'Main',
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-6.1-sol',
+      model_parameters: { reasoning_effort: 'high' },
+      voice_llm_provider: 'glasshive-harness',
+      voice_llm_model: 'grok-build:grok-4.7-build-fast',
+      voice_llm_model_parameters: { reasoning_effort: 'high' },
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'claude-code:claude-opus-5-5',
+      fallback_llm_model_parameters: { reasoning_effort: 'high' },
+      voice_fallback_llm_provider: 'glasshive-harness',
+      voice_fallback_llm_model: 'claude-code:claude-opus-5-5',
+      voice_fallback_llm_model_parameters: { reasoning_effort: 'medium' },
+      author: user._id.toString(),
+      versions: [],
+    });
+    const created = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent-native-route',
+      conversationId: 'new',
+    });
+    const settings = await getCallSessionVoiceSettings(created.callSessionId);
+    expect(settings.assistantRoute.primary).toEqual({
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-6.1-sol',
+      effort: 'high',
+    });
+    expect(settings.assistantRoute.effective).toEqual({
+      provider: 'glasshive-harness',
+      model: 'grok-build:grok-4.7-build-fast',
+      effort: 'high',
+    });
+    expect(settings.assistantRoute.voiceFallbackLlm).toEqual({
+      provider: 'glasshive-harness',
+      model: 'claude-code:claude-opus-5-5',
+      effort: 'medium',
     });
   });
 
@@ -2067,6 +2162,8 @@ describe('CallSessionService', () => {
       ]),
     );
     expect(created.contextualKeyterms).toHaveLength(3);
+    expect(await resolveVoiceContextKeyterms({ userId: user._id.toString(), conversationId }))
+      .toEqual(created.contextualKeyterms);
     expect(created.contextualKeyterms.join(' ')).not.toContain('Other Owner');
     expect(created.contextualKeyterms.join(' ')).not.toContain('not-forwarded');
     expect((await getCallSession(created.callSessionId)).contextualKeyterms).toEqual(
@@ -2133,6 +2230,30 @@ describe('CallSessionService', () => {
     expect(created.contextualKeyterms.join(' ')).not.toContain('private');
     expect(created.contextualKeyterms.join(' ')).not.toContain('not-forwarded');
     expect(created.contextualKeyterms.join(' ')).not.toContain('other-owner');
+  });
+
+  test('shared voice keyterms require an existing owner conversation', async () => {
+    const owner = await User.create({ name: 'Owner', email: 'owner-keyterms@example.com', provider: 'local' });
+    const foreign = await User.create({ name: 'Foreign', email: 'foreign-keyterms@example.com', provider: 'local' });
+    await Conversation.create({ conversationId: 'foreign-keyterm-conversation',
+      user: foreign._id.toString(), endpoint: 'agents', files: [] });
+    const nativeLookup = jest.spyOn(Message, 'find');
+    try {
+      for (const conversationId of ['', 'new', 'missing-keyterm-conversation', 'foreign-keyterm-conversation']) {
+        expect(await resolveVoiceContextKeyterms({ userId: owner._id.toString(), conversationId })).toEqual([]);
+      }
+      expect(nativeLookup).not.toHaveBeenCalled();
+    } finally {
+      nativeLookup.mockRestore();
+    }
+  });
+
+  test('shared voice keyterms return empty for an owned empty conversation', async () => {
+    const owner = await User.create({ name: 'Empty', email: 'empty-keyterms@example.com', provider: 'local' });
+    await Conversation.create({ conversationId: 'empty-keyterm-conversation',
+      user: owner._id.toString(), endpoint: 'agents', files: [] });
+    expect(await resolveVoiceContextKeyterms({ userId: owner._id.toString(),
+      conversationId: 'empty-keyterm-conversation' })).toEqual([]);
   });
 
   test('resolves only one exact owner/conversation session with a current gateway lease', async () => {

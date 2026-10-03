@@ -161,6 +161,9 @@ const anthropicModels = {
    * Purpose: Advertise the verified context windows for supported Opus 4.8 and Opus 5.
    */
   'claude-opus-4-8': 1000000,
+  'claude-opus-5-5': 1000000,
+  'gpt-6.1-sol': 1050000,
+  'grok-4.7': 500000,
   'claude-opus-5': 1000000,
   /* === VIVENTIUM END === */
 };
@@ -416,6 +419,8 @@ const anthropicMaxOutputs = {
    * Purpose: Advertise verified maximum outputs for supported Opus 4.8 and Opus 5.
    */
   'claude-opus-4-8': 128000,
+  'claude-opus-5-5': 128000,
+  'gpt-6.1-sol': 128000,
   'claude-opus-5': 128000,
   /* === VIVENTIUM END === */
   'claude-3.5-sonnet': 8192,

@@ -310,7 +310,7 @@ describe('buildVoiceModeInstructions', () => {
     '%s lets an injected feeling state shape spoken delivery without forcing a performance',
     (provider) => {
       const result = buildVoiceModeInstructions(provider);
-      expect(result).toContain('If a <viventium_feeling_state> is present');
+      expect(result).toContain('If a Viventium Feeling state capsule is present');
       expect(result).toContain(
         'silently appraise whether the current state and moment call for expressive or restrained delivery',
       );
@@ -716,7 +716,7 @@ describe('buildTelegramAudioOutputInstructions', () => {
     '%s audio output treats Feelings as a delivery cause while preserving natural restraint',
     (provider) => {
       const result = buildTelegramAudioOutputInstructions(provider);
-      expect(result).toContain('If a <viventium_feeling_state> is present');
+      expect(result).toContain('If a Viventium Feeling state capsule is present');
       expect(result).toContain(
         'silently appraise whether the current state and moment call for expressive or restrained delivery',
       );

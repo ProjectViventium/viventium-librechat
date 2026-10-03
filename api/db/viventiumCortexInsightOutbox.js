@@ -315,6 +315,21 @@ module.exports = function createViventiumCortexInsightOutbox(db) {
         default: null,
         select: false,
       },
+      /* === VIVENTIUM START ===
+       * Feature: Phase B owner fence.
+       * Purpose: An insight accepted for a live Phase B owner stays out of replay until that owner
+       * forms the parent's one batch or releases it, or its runtime slot restarts.
+       * === VIVENTIUM END === */
+      ownerRuntimeSlot: {
+        type: String,
+        default: '',
+        select: false,
+      },
+      ownerRuntimeEpoch: {
+        type: String,
+        default: '',
+        select: false,
+      },
       retentionAlertAt: {
         type: Date,
         required: true,

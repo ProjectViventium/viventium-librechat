@@ -1,4 +1,5 @@
 import type { Redis } from 'ioredis';
+import type { SerializableJobData } from '../interfaces/IJobStore';
 import { RedisJobStore } from '../implementations/RedisJobStore';
 
 /* === VIVENTIUM START ===
@@ -6,6 +7,18 @@ import { RedisJobStore } from '../implementations/RedisJobStore';
  * Purpose: Guard the exact Redis hash serialization boundary without requiring a live Redis server.
  */
 describe('RedisJobStore job serialization', () => {
+  it('retains the server-held Voice task, call, and effect authority across Redis hydration', () => {
+    const store = new RedisJobStore({} as Redis);
+    const codec = store as unknown as {
+      serializeJob(value: Record<string, unknown>): Record<string, string>;
+      deserializeJob(value: Record<string, string>): Record<string, unknown>;
+    };
+    const identity = { viventiumCallSessionId: 'voice-call', viventiumVoiceTaskId: 'voice-task',
+      viventiumVoiceEffectAuthority: { version: 1, mode: 'call', source: 'synthetic' } };
+    const restored = codec.deserializeJob(codec.serializeJob({ streamId: 'voice-stream',
+      userId: 'voice-owner', createdAt: 1, status: 'complete', ...identity }));
+    expect(restored).toMatchObject(identity);
+  });
   it('uses Redis TIME and co-slotted TTL fencing for durable source-order observation', async () => {
     const redis = {
       eval: jest.fn().mockResolvedValue(['12347', '1725000000123', '1']),
@@ -359,5 +372,35 @@ describe('RedisJobStore job serialization', () => {
       acknowledgement: storedAcknowledgement,
     });
   });
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === */
+describe('Redis typed terminal error hydration', () => {
+  it.each([['source_context_unavailable'], [undefined]])(
+    'round-trips an optional public failure class %s',
+    (errorClass) => {
+      const store = new RedisJobStore({} as Redis);
+      const serialize = Reflect.get(store, 'serializeJob') as (
+        value: SerializableJobData,
+      ) => Record<string, string>;
+      const deserialize = Reflect.get(store, 'deserializeJob') as (
+        value: Record<string, string>,
+      ) => SerializableJobData;
+      const restored = deserialize.call(
+        store,
+        serialize.call(store, {
+          streamId: 'failed-stream',
+          userId: 'synthetic-owner',
+          createdAt: 1,
+          status: 'error',
+          error: 'Public failure.',
+          errorClass,
+        }),
+      );
+      expect(restored.error).toBe('Public failure.');
+      expect(restored.errorClass).toBe(errorClass);
+    },
+  );
 });
 /* === VIVENTIUM END === */

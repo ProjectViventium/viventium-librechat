@@ -1089,7 +1089,7 @@ describe('viventium-seed-agents', () => {
       model: 'claude-opus-5',
       model_parameters: {
         model: 'claude-opus-5',
-        thinkingBudget: 4000,
+        effort: 'high',
       },
     });
   });

@@ -3,8 +3,9 @@ import type { PendingNativeWorkInput } from 'librechat-data-provider';
 import NativeWorkInput from '../NativeWorkInput';
 
 const mockMutate = jest.fn();
+let mockMutationSuccess = false;
 jest.mock('~/data-provider/ViventiumOrchestration', () => ({
-  useWorkActionMutation: () => ({ mutate: mockMutate, isLoading: false, isSuccess: false }),
+  useWorkActionMutation: () => ({ mutate: mockMutate, isLoading: false, isSuccess: mockMutationSuccess }),
 }));
 jest.mock('~/hooks', () => ({ useLocalize: () => (key: string) => key }));
 jest.mock('@librechat/client', () => ({
@@ -25,6 +26,7 @@ const input: PendingNativeWorkInput = {
 };
 beforeEach(() => {
   mockMutate.mockReset();
+  mockMutationSuccess = false;
   Object.defineProperty(globalThis.crypto, 'randomUUID', {
     configurable: true,
     value: () => 'f120c93a-14d3-42bd-b8e2-fbd59bfb058c',
@@ -143,4 +145,49 @@ it('omits cleared optional typed fields instead of inventing false or an invalid
   fireEvent.change(screen.getByLabelText('Scope'), { target: { value: '' } });
   fireEvent.submit(screen.getByRole('form'));
   expect(mockMutate.mock.calls[0][0].nativeInput.content).toEqual({});
+});
+
+
+it('renders a native permission honestly with its offered enum labels and no default approval', () => {
+  const permission: PendingNativeWorkInput = {
+    ...input, kind: 'permission', runtimeName: 'Native runtime', mode: 'form',
+    runId: 'run-1', attemptId: 'attempt-1', sessionId: 'session-1', expiresAt: '2099-01-01T00:00:00Z',
+    requestedSchema: { type: 'object', required: ['optionId'], properties: {
+      optionId: { type: 'string', title: 'Choice', enum: ['allow_once', 'reject_once'], enumNames: ['Allow once', 'Reject once'] },
+    } },
+  };
+  render(<NativeWorkInput workRef="work-1" input={permission} />);
+  expect(screen.getByText('Native runtime')).toBeVisible();
+  expect(screen.getByLabelText('Choice')).toHaveValue('');
+  expect(mockMutate).not.toHaveBeenCalled();
+  fireEvent.change(screen.getByLabelText('Choice'), { target: { value: 'reject_once' } });
+  fireEvent.submit(screen.getByRole('form'));
+  expect(mockMutate.mock.calls[0][0].nativeInput).toMatchObject({ action: 'accept', content: { optionId: 'reject_once' } });
+});
+
+it('does not consume a successful HTTP response while the native ACK is pending', () => {
+  const view = render(<NativeWorkInput workRef="work-1" input={input} />);
+  fireEvent.click(screen.getByText('com_ui_continue'));
+  const first = mockMutate.mock.calls[0][0];
+  mockMutationSuccess = true;
+  act(() => mockMutate.mock.calls[0][1].onSuccess({ status: 'pending', confirmationPending: true }));
+  view.rerender(<NativeWorkInput workRef="work-1" input={input} />);
+  expect(screen.getByRole('alert')).toBeVisible();
+  expect(screen.getByText('com_ui_continue')).not.toBeDisabled();
+  expect(screen.getByText('com_ui_decline')).toBeDisabled();
+  fireEvent.click(screen.getByText('com_ui_continue'));
+  expect(mockMutate.mock.calls[1][0]).toEqual(first);
+  act(() => mockMutate.mock.calls[1][1].onSuccess({ status: 'already_accepted', confirmationPending: false }));
+  expect(screen.getByText('com_ui_continue')).toBeDisabled();
+  expect(screen.getByText('com_ui_decline')).toBeDisabled();
+});
+
+it('does not claim approval from an untyped successful transport response', () => {
+  render(<NativeWorkInput workRef="work-1" input={input} />);
+  fireEvent.click(screen.getByText('com_ui_decline'));
+  act(() => mockMutate.mock.calls[0][1].onSuccess({ status: 'queued' }));
+  expect(screen.getByRole('alert')).toBeVisible();
+  expect(screen.getByText('com_ui_decline')).not.toBeDisabled();
+  fireEvent.click(screen.getByText('com_ui_decline'));
+  expect(mockMutate.mock.calls[1][0]).toEqual(mockMutate.mock.calls[0][0]);
 });

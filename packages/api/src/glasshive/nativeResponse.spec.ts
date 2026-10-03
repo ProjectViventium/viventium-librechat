@@ -1,6 +1,6 @@
 /* === VIVENTIUM START === Saved-result lookup is read-only and exact invocation scoped. === */
 import type { MainContinuityFetch } from '../continuity/mainContinuity';
-import { nativeResponseDigest } from '@librechat/data-schemas';
+import { logger, nativeResponseDigest } from '@librechat/data-schemas';
 import {
   nativeIdentityJson,
   nativeIdentityValid,
@@ -10,6 +10,7 @@ import type { NativeResponseIdentity } from '@librechat/data-schemas';
 import type { SerializableJobData } from '../stream/interfaces/IJobStore';
 import {
   createNativeResponseFetch,
+  createNativeCapacityFetch,
   createNativeResponseRecoveryService,
   nativeResponseOrigin,
   nativeResponseSha256,
@@ -130,6 +131,145 @@ describe('native response binding and recovery', () => {
       expect(d.db.nativeResponseSourceMatches).toHaveBeenCalledTimes(2);
     },
   );
+  it.each([false, true])(
+    'keeps the ordered answer digest fence for narration and final text: %s',
+    async (changed) => {
+      const d = deps();
+      const orderedText = 'I will inspect the synthetic state.\n\nThe state is green.';
+      const row = {
+        user: 'owner',
+        conversationId: 'conversation',
+        messageId: 'answer',
+        text: orderedText,
+        content: [{ type: 'text', text: orderedText }],
+        unfinished: false,
+        error: false,
+        nativeResponse: { ...identity, status: 'completed' },
+      };
+      d.fetch.mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({
+              ...result,
+              graph_tool_evidence: {
+                version: 1,
+                owner_id: 'owner',
+                conversation_id: 'conversation',
+                message_id: 'answer',
+                stream_id: 'stream',
+                anchor_invocation_id: 'invocation',
+                logical_turn_id: 'scope.turn',
+                logical_turn_revision: 1,
+                main_context_snapshot_sha256: 'a'.repeat(64),
+                context_epoch: 'b'.repeat(64),
+                requests: [],
+                omitted_requests: 0,
+              },
+            }),
+          ),
+      );
+      d.db.getNativeResponse.mockResolvedValueOnce(row as never).mockResolvedValueOnce(
+        (changed
+          ? {
+              ...row,
+              text: 'The state is green.',
+              content: [{ type: 'text', text: 'The state is green.' }],
+            }
+          : row) as never,
+      );
+      const reading = createNativeResponseRecoveryService(d).readToolEvidence(
+        'owner',
+        'conversation',
+        'answer',
+      );
+      if (changed)
+        await expect(reading).rejects.toThrow('native_graph_tool_evidence_parent_changed');
+      else await expect(reading).resolves.toEqual(expect.any(Array));
+      expect(d.db.prepareNativeResponse).not.toHaveBeenCalled();
+    },
+  );
+  it('prepares canonical selected-file attachments only through the accepted materialization callback', async () => {
+    const d = deps();
+    const response = { ...result.response, glasshive: { output_files: { version: 1 } } };
+    const candidate = {
+      text: 'Canonical answer.',
+      authoritySha256: result.authority_sha256,
+      requestId: result.request_id,
+      runId: result.run_id,
+      responseJson: JSON.stringify(response),
+    };
+    d.fetch.mockResolvedValue(new Response(JSON.stringify({ ...result, response })));
+    d.db.prepareNativeResponse.mockResolvedValue(nativeResponseDigest(candidate));
+    const attachments = [{ file_id: 'selected' }];
+    const prepareAttachments = jest.fn(async () => attachments);
+    d.db.materializeNativeResponse.mockImplementationOnce(async (...args) => {
+      expect(prepareAttachments).not.toHaveBeenCalled();
+      return { text: 'Canonical answer.', attachments: await args[5]() };
+    });
+    const saved = await createNativeResponseRecoveryService({ ...d, prepareAttachments }).recover(
+      identity,
+    );
+    expect(saved?.attachments).toEqual(attachments);
+    expect(prepareAttachments).toHaveBeenCalledWith(identity, response, candidate);
+  });
+  it('preserves canonical attachments on completed transmit/reload without fetching again', async () => {
+    const d = deps();
+    const candidate = {
+      text: 'Canonical answer.',
+      authoritySha256: 'authority',
+      requestId: 'request',
+      runId: 'run',
+      responseJson: JSON.stringify(result.response),
+    };
+    const attachments = [
+      { filename: 'result.csv', file_id: 'selected' },
+      {
+        filename: 'large.csv',
+        nativeOutputFile: {
+          version: 1,
+          status: 'unavailable',
+          code: 'native_output_file_size_limit',
+        },
+      },
+    ];
+    d.db.getNativeResponse.mockResolvedValue({
+      text: candidate.text,
+      attachments,
+      nativeResponse: {
+        ...identity,
+        status: 'completed',
+        candidateJson: JSON.stringify(candidate),
+        candidateSha256: nativeResponseDigest(candidate),
+      },
+    });
+    const service = createNativeResponseRecoveryService(d);
+    expect(
+      (
+        await service.projectForTransmit(identity, {
+          text: 'old',
+          attachments: undefined as unknown[] | undefined,
+        })
+      )?.attachments,
+    ).toEqual(attachments);
+    expect((await service.recover(identity))?.attachments).toEqual(attachments);
+    expect(d.fetch).not.toHaveBeenCalled();
+  });
+  it('does not admit changing early spoken text to terminal evidence or memory', async () => {
+    const d = deps();
+    d.db.getNativeResponse.mockResolvedValue({
+      user: 'owner',
+      conversationId: 'conversation',
+      messageId: 'answer',
+      text: 'I will inspect the synthetic state.',
+      unfinished: true,
+      error: false,
+      nativeResponse: { ...identity, status: 'pending' },
+    } as never);
+    await expect(
+      createNativeResponseRecoveryService(d).readToolEvidence('owner', 'conversation', 'answer'),
+    ).rejects.toMatchObject({ code: 'native_graph_tool_evidence_parent_unfinished' });
+    expect(d.fetch).not.toHaveBeenCalled();
+  });
   it.each([true, false])(
     'missing saved coverage is explicit without blocking valid memory input: %s',
     async (missingResult) => {
@@ -160,18 +300,285 @@ describe('native response binding and recovery', () => {
       expect(d.db.materializeNativeResponse).not.toHaveBeenCalled();
     },
   );
+  it.each([
+    ['a Phase B cortex part completes', true],
+    ['the answer text changes', false],
+  ])('reads evidence of an unchanged answer while %s between reads', async (_label, accepted) => {
+    const d = deps();
+    const row = {
+      user: 'owner',
+      conversationId: 'conversation',
+      messageId: 'answer',
+      text: 'Host answer',
+      unfinished: false,
+      error: false,
+      nativeResponse: { ...identity, status: 'completed' },
+      content: [
+        { type: 'text', text: 'Host answer' },
+        { type: 'cortex_insight', cortex_id: 'parietal', status: 'brewing' },
+      ],
+    };
+    const current = accepted
+      ? {
+          ...row,
+          content: [
+            { type: 'text', text: 'Host answer' },
+            { type: 'cortex_insight', cortex_id: 'parietal', status: 'complete', insight: 'Fact.' },
+          ],
+        }
+      : { ...row, text: 'Another answer', content: [{ type: 'text', text: 'Another answer' }] };
+    d.db.getNativeResponse
+      .mockResolvedValueOnce(row as never)
+      .mockResolvedValueOnce(current as never);
+    const reading = createNativeResponseRecoveryService(d).readToolEvidence(
+      'owner',
+      'conversation',
+      'answer',
+    );
+    if (accepted) {
+      await expect(reading).resolves.toEqual(expect.any(Array));
+    } else {
+      await expect(reading).rejects.toThrow('native_graph_tool_evidence_parent_changed');
+    }
+  });
   it('reports a typed unavailable-parent error without reading or accepting its evidence', async () => {
     const d = deps();
     d.db.getNativeResponse.mockResolvedValue({
-      user: 'owner', conversationId: 'conversation', messageId: 'answer',
-      unfinished: false, error: true,
+      user: 'owner',
+      conversationId: 'conversation',
+      messageId: 'answer',
+      unfinished: false,
+      error: true,
       nativeResponse: { ...identity, status: 'unsupported' },
     } as never);
-    await expect(createNativeResponseRecoveryService(d).readToolEvidence(
-      'owner', 'conversation', 'answer',
-    )).rejects.toMatchObject({ code: 'native_graph_tool_evidence_parent_unfinished' });
+    await expect(
+      createNativeResponseRecoveryService(d).readToolEvidence('owner', 'conversation', 'answer'),
+    ).rejects.toMatchObject({ code: 'native_graph_tool_evidence_parent_unfinished' });
     expect(d.fetch).not.toHaveBeenCalled();
     expect(d.db.materializeNativeResponse).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['pending', true],
+    ['prepared', true],
+    ['pending', false],
+    ['prepared', false],
+  ])(
+    'waits for exact native %s publication before Phase B evidence (unfinished=%s)',
+    async (status, unfinished) => {
+      const d = deps();
+      let clock = 0;
+      let row = {
+        user: 'owner',
+        conversationId: 'conversation',
+        messageId: 'answer',
+        text: 'Canonical answer.',
+        unfinished,
+        error: false,
+        nativeResponse: { ...identity, status },
+      };
+      d.db.getNativeResponse.mockImplementation(async () => row as never);
+      d.fetch.mockImplementation(async () => {
+        expect(clock).toBeGreaterThanOrEqual(53);
+        expect(row.unfinished).toBe(false);
+        expect(row.nativeResponse.status).toBe('completed');
+        return new Response(JSON.stringify(result));
+      });
+      const wait = jest.fn(async (ms: number) => {
+        clock += ms;
+        if (clock >= 53) {
+          row = { ...row, unfinished: false, nativeResponse: { ...identity, status: 'completed' } };
+        }
+      });
+      const content = await createNativeResponseRecoveryService({
+        ...d,
+        now: () => clock,
+        wait,
+      }).readToolEvidenceForPresentation('owner', 'conversation', 'answer', 1000);
+      expect(content.length).toBeGreaterThan(0);
+      expect(wait).toHaveBeenCalledTimes(1);
+      expect(clock).toBe(100);
+      expect(d.db.materializeNativeResponse).not.toHaveBeenCalled();
+    },
+  );
+  it.each(['pending', 'prepared'])(
+    'returns unavailable without reading evidence if native %s publication times out',
+    async (status) => {
+      const d = deps();
+      let clock = 0;
+      d.db.getNativeResponse.mockResolvedValue({
+        user: 'owner',
+        conversationId: 'conversation',
+        messageId: 'answer',
+        unfinished: true,
+        error: false,
+        nativeResponse: { ...identity, status },
+      } as never);
+      const content = await createNativeResponseRecoveryService({
+        ...d,
+        now: () => clock,
+        wait: async (ms: number) => {
+          clock += ms;
+        },
+      }).readToolEvidenceForPresentation('owner', 'conversation', 'answer', 250);
+      expect(JSON.parse(content[0].text).native_tool_evidence).toMatchObject({
+        evidence_available: false,
+        reason: 'parent_uncommitted',
+      });
+      expect(clock).toBe(250);
+      expect(d.fetch).not.toHaveBeenCalled();
+    },
+  );
+  it.each(['failed', 'cancelled'])(
+    'never waits for terminal %s native parent evidence',
+    async (status) => {
+      const d = deps();
+      const wait = jest.fn();
+      d.db.getNativeResponse.mockResolvedValue({
+        user: 'owner',
+        conversationId: 'conversation',
+        messageId: 'answer',
+        unfinished: true,
+        error: false,
+        nativeResponse: { ...identity, status },
+      } as never);
+      await expect(
+        createNativeResponseRecoveryService({ ...d, wait }).readToolEvidenceForPresentation(
+          'owner',
+          'conversation',
+          'answer',
+          1000,
+        ),
+      ).rejects.toMatchObject({ code: 'native_graph_tool_evidence_parent_unfinished' });
+      expect(wait).not.toHaveBeenCalled();
+      expect(d.fetch).not.toHaveBeenCalled();
+    },
+  );
+  it.each(['failed', 'cancelled', 'error', 'source_changed', 'owner_changed'])(
+    'keeps the %s fence during native publication wait',
+    async (transition) => {
+      const d = deps();
+      let row = {
+        user: 'owner',
+        conversationId: 'conversation',
+        messageId: 'answer',
+        unfinished: true,
+        error: false,
+        nativeResponse: { ...identity, status: 'prepared' },
+      };
+      d.db.getNativeResponse.mockImplementation(async () => row as never);
+      const wait = jest.fn(async () => {
+        if (transition === 'source_changed')
+          d.db.nativeResponseSourceMatches.mockResolvedValue(false);
+        else if (transition === 'owner_changed') row = { ...row, user: 'other-owner' };
+        else if (transition === 'error') row = { ...row, error: true };
+        else row = { ...row, nativeResponse: { ...identity, status: transition } };
+      });
+      const expected =
+        transition === 'source_changed'
+          ? 'native_graph_tool_evidence_source_changed'
+          : transition === 'owner_changed'
+            ? 'native_graph_tool_evidence_identity_mismatch'
+            : 'native_graph_tool_evidence_parent_unfinished';
+      await expect(
+        createNativeResponseRecoveryService({ ...d, wait }).readToolEvidenceForPresentation(
+          'owner',
+          'conversation',
+          'answer',
+          1000,
+        ),
+      ).rejects.toThrow(expected);
+      expect(wait).toHaveBeenCalledTimes(1);
+      expect(d.fetch).not.toHaveBeenCalled();
+    },
+  );
+  it.each(['already', 'after'])(
+    'waits for exact external presentation %s Main completion',
+    async (timing) => {
+      const d = deps();
+      let clock = 0;
+      let row = {
+        user: 'owner',
+        conversationId: 'conversation',
+        messageId: 'answer',
+        text: 'Fallback answer',
+        unfinished: timing !== 'already',
+        error: false,
+        nativeResponse: { ...identity, status: 'unsupported' },
+      };
+      d.db.getNativeResponse.mockImplementation(async () => row as never);
+      d.fetch.mockImplementation(
+        async () => new Response(JSON.stringify({ ...result, state: 'failed' })),
+      );
+      const wait = jest.fn(async (ms: number) => {
+        clock += ms;
+        row = { ...row, unfinished: false };
+      });
+      const content = await createNativeResponseRecoveryService({
+        ...d,
+        now: () => clock,
+        wait,
+      }).readToolEvidenceForPresentation('owner', 'conversation', 'answer', 3000);
+      expect(JSON.parse(content[0].text).native_tool_evidence.reason).toBe(
+        'native_attempt_incomplete',
+      );
+      expect(wait).toHaveBeenCalledTimes(timing === 'already' ? 0 : 1);
+      expect(d.db.materializeNativeResponse).not.toHaveBeenCalled();
+    },
+  );
+  it.each(['timeout', 'partial_removed', 'failed'])(
+    'does not read uncommitted evidence after %s',
+    async (state) => {
+      const d = deps();
+      let clock = 0;
+      d.db.getNativeResponse.mockResolvedValue({
+        user: 'owner',
+        conversationId: 'conversation',
+        messageId: 'answer',
+        text: 'Undelivered answer',
+        unfinished: true,
+        error: false,
+        nativeResponse: { ...identity, status: 'unsupported' },
+        metadata: {
+          viventium: {
+            deliveryAcknowledgement: { state },
+          },
+        },
+      } as never);
+      const content = await createNativeResponseRecoveryService({
+        ...d,
+        now: () => clock,
+        wait: async (ms) => {
+          clock += ms;
+        },
+      }).readToolEvidenceForPresentation('owner', 'conversation', 'answer', 1000);
+      expect(JSON.parse(content[0].text).native_tool_evidence).toMatchObject({
+        evidence_available: false,
+        reason: 'parent_uncommitted',
+      });
+      expect(d.fetch).not.toHaveBeenCalled();
+      expect(d.db.materializeNativeResponse).not.toHaveBeenCalled();
+    },
+  );
+  it('keeps the source fence while waiting for an external acknowledgement', async () => {
+    const d = deps();
+    d.db.getNativeResponse.mockResolvedValue({
+      user: 'owner',
+      conversationId: 'conversation',
+      messageId: 'answer',
+      unfinished: true,
+      error: false,
+      nativeResponse: { ...identity, status: 'unsupported' },
+    } as never);
+    d.db.nativeResponseSourceMatches.mockResolvedValue(false);
+    await expect(
+      createNativeResponseRecoveryService(d).readToolEvidenceForPresentation(
+        'owner',
+        'conversation',
+        'answer',
+        1000,
+      ),
+    ).rejects.toThrow('native_graph_tool_evidence_source_changed');
+    expect(d.fetch).not.toHaveBeenCalled();
   });
   it.each(['owner', 'conversation', 'source', 'body', 'changed-source'])(
     'rejects graph evidence on %s mismatch',
@@ -410,14 +817,414 @@ describe('native response binding and recovery', () => {
     const bound = jest.fn();
     const wrapped = createNativeResponseFetch(send, async () => context, admit, bound);
     await wrapped('http://native.test/v1/chat/completions', { method: 'POST', body });
+    // The final body carries the revision start that anchors its absolute provider deadline.
+    const finalBody = JSON.stringify({
+      messages: [{ role: 'user', content: 'Source.' }],
+      metadata: {
+        visible_message_chain: [{ id: 'question', sha256: 'source' }],
+        response_started_at: new Date(context.jobCreatedAt).toISOString(),
+      },
+    });
     expect(order).toEqual(['admit', 'send']);
     expect(admit).toHaveBeenCalledWith(
-      expect.objectContaining({ bodySha256: nativeResponseSha256(body) }),
+      expect.objectContaining({ bodySha256: nativeResponseSha256(finalBody) }),
     );
-    expect(send.mock.calls[0][1]?.body).toBe(body);
+    expect(send.mock.calls[0][1]?.body).toBe(finalBody);
     expect(new Headers(send.mock.calls[0][1]?.headers).get('X-Viventium-Native-Body-SHA256')).toBe(
-      nativeResponseSha256(body),
+      nativeResponseSha256(finalBody),
     );
+  });
+  it('admits and dispatches the current revision only after its predecessors release', async () => {
+    const order: string[] = [];
+    const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
+      async () => {
+        order.push('send');
+        return new Response('{}');
+      },
+    );
+    const release = {
+      beforeDispatch: jest.fn(async () => {
+        order.push('release');
+      }),
+      whileOccupied: jest.fn(async () => true),
+      isCurrent: jest.fn(async () => true),
+    };
+    const wrapped = createNativeResponseFetch(
+      send,
+      async () => context,
+      async () => {
+        order.push('admit');
+        return true;
+      },
+      jest.fn(),
+      release,
+    );
+    await wrapped('http://native.test/v1/chat/completions', { method: 'POST', body: '{}' });
+    expect(order).toEqual(['release', 'admit', 'send']);
+    expect(release.whileOccupied).not.toHaveBeenCalled();
+  });
+  it('never admits or dispatches a revision replaced while it waited for release', async () => {
+    const send = jest.fn();
+    const admit = jest.fn(async () => true);
+    const wrapped = createNativeResponseFetch(send, async () => context, admit, jest.fn(), {
+      beforeDispatch: async () => {
+        throw Object.assign(new Error('operation was aborted'), { name: 'AbortError' });
+      },
+      whileOccupied: async () => true,
+      isCurrent: async () => false,
+    });
+    await expect(
+      wrapped('http://native.test/v1/chat/completions', { method: 'POST', body: '{}' }),
+    ).rejects.toThrow('operation was aborted');
+    expect(admit).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+  it('makes zero provider calls when the revision is replaced between release and admission', async () => {
+    const send = jest.fn();
+    let current = true;
+    const release = {
+      beforeDispatch: jest.fn(async () => {
+        // Release is confirmed, then newer input replaces this revision before admission.
+        current = false;
+      }),
+      whileOccupied: jest.fn(async () => true),
+      isCurrent: jest.fn(async () => current),
+    };
+    const admit = jest.fn(async () => false);
+    const wrapped = createNativeResponseFetch(send, async () => context, admit, jest.fn(), release);
+    await expect(
+      wrapped('http://native.test/v1/chat/completions', { method: 'POST', body: '{}' }),
+    ).rejects.toMatchObject({ name: 'AbortError', code: 'superseded' });
+    expect(release.beforeDispatch).toHaveBeenCalledTimes(1);
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
+  });
+  it('continues a later invocation of the current revision unbound after a rejected admission', async () => {
+    const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
+      async () => new Response('{}'),
+    );
+    const release = {
+      beforeDispatch: jest.fn(async () => undefined),
+      whileOccupied: jest.fn(async () => true),
+      isCurrent: jest.fn(async () => true),
+    };
+    const wrapped = createNativeResponseFetch(
+      send,
+      async () => context,
+      async () => false,
+      jest.fn(),
+      release,
+    );
+    await wrapped('http://native.test/v1/chat/completions', { method: 'POST', body: '{}' });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(
+      new Headers(send.mock.calls[0][1]?.headers).get('X-Viventium-Native-Invocation-Id'),
+    ).toBe(null);
+  });
+  it('cortex capacity recovery respects its remaining execution deadline', async () => {
+    const failure = new Response(JSON.stringify({ error: { code: 'host_capacity' } }), {
+      status: 503,
+      headers: { 'Retry-After': '1' },
+    });
+    const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
+      async () => failure,
+    );
+    const wrapped = createNativeCapacityFetch(send, {
+      signal: new AbortController().signal,
+      deadlineAt: Date.now() + 100,
+    });
+    expect(await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).toBe(failure);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['main', 'cortex'] as const)(
+    'keeps %s capacity timing and hashed scope in the rendered log message',
+    async (role) => {
+      const info = jest.spyOn(logger, 'info').mockImplementation(() => logger);
+      const scope = 'synthetic-private-stream';
+      const send = jest
+        .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ error: { code: 'host_capacity' } }), {
+            status: 503,
+            headers: { 'Retry-After': '0.001' },
+          }),
+        )
+        .mockResolvedValueOnce(new Response('{}'));
+      try {
+        const wrapped =
+          role === 'main'
+            ? createNativeResponseFetch(
+                send,
+                async () => ({ ...context, streamId: scope }),
+                async () => true,
+                jest.fn(),
+              )
+            : createNativeCapacityFetch(send, {
+                signal: new AbortController().signal,
+                streamId: scope,
+                role,
+              });
+        expect(
+          (await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).status,
+        ).toBe(200);
+        const call = info.mock.calls.find(([message]) =>
+          String(message).includes('Host capacity admission wait'),
+        );
+        expect(call).toBeDefined();
+        const message = String(call?.[0]);
+        expect(message).toContain(`\"role\":\"${role}\"`);
+        expect(message).toContain(`\"streamHash\":\"${nativeResponseSha256(scope).slice(0, 16)}\"`);
+        expect(message).toContain('\"retryAfterMs\":1');
+        expect(message).toMatch(/\"waitedMs\":\d+/);
+        expect(message).not.toContain(scope);
+        expect(JSON.stringify(call)).not.toContain(scope);
+      } finally {
+        info.mockRestore();
+      }
+    },
+  );
+
+  it.each(['owner', 'transport'])(
+    'cortex capacity waiting observes the %s abort signal',
+    async (which) => {
+      const owner = new AbortController();
+      const transport = new AbortController();
+      let markSent: () => void = () => {};
+      const firstSent = new Promise<void>((resolve) => {
+        markSent = resolve;
+      });
+      const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
+        async () => {
+          markSent();
+          return new Response(JSON.stringify({ error: { code: 'host_capacity' } }), {
+            status: 503,
+            headers: { 'Retry-After': '1' },
+          });
+        },
+      );
+      const wrapped = createNativeCapacityFetch(send, { signal: owner.signal });
+      const request = wrapped('http://native.test/v1/chat/completions', {
+        body: '{}',
+        signal: transport.signal,
+      });
+      const stopped = expect(request).rejects.toMatchObject({ name: 'AbortError' });
+      await firstSent;
+      (which === 'owner' ? owner : transport).abort('user_cancelled');
+      await stopped;
+      expect(send).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('retries exact typed native host capacity with the identical admitted dispatch', async () => {
+    const capacity = new Response(JSON.stringify({ error: { code: 'host_capacity' } }), {
+      status: 503,
+      headers: { 'Retry-After': '1' },
+    });
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockResolvedValueOnce(capacity)
+      .mockResolvedValueOnce(new Response('{}'));
+    const admit = jest.fn(async () => true);
+    const current = jest.fn(async () => true);
+    const wrapped = createNativeResponseFetch(send, async () => context, admit, jest.fn(), {
+      beforeDispatch: async () => undefined,
+      whileOccupied: async () => true,
+      isCurrent: current,
+    });
+    const response = await wrapped('http://native.test/v1/chat/completions', {
+      method: 'POST',
+      body: '{}',
+    });
+    expect(response.status).toBe(200);
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1][1]).toBe(send.mock.calls[0][1]);
+    expect(current).toHaveBeenCalled();
+  });
+
+  it.each([
+    ['budget exhausted', 'host_capacity', '60'],
+    ['no retry signal', 'host_capacity', ''],
+    ['different typed failure', 'provider_request_rejected', '1'],
+  ])('returns unchanged native failure when %s', async (_label, code, retryAfter) => {
+    const failure = new Response(JSON.stringify({ error: { code } }), {
+      status: 503,
+      headers: retryAfter ? { 'Retry-After': retryAfter } : {},
+    });
+    const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
+      async () => failure,
+    );
+    const wrapped = createNativeResponseFetch(
+      send,
+      async () => context,
+      async () => true,
+      jest.fn(),
+    );
+    expect(await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).toBe(failure);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns the unchanged capacity failure when the bounded wait is exhausted after retry', async () => {
+    let clock = 1000;
+    const now = jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    const capacity = () =>
+      new Response(JSON.stringify({ error: { code: 'host_capacity' } }), {
+        status: 503,
+        headers: { 'Retry-After': '1' },
+      });
+    const lastFailure = capacity();
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockResolvedValueOnce(capacity())
+      .mockImplementationOnce(async () => {
+        clock += 30_000;
+        return lastFailure;
+      });
+    try {
+      const wrapped = createNativeResponseFetch(
+        send,
+        async () => context,
+        async () => true,
+        jest.fn(),
+      );
+      expect(await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).toBe(
+        lastFailure,
+      );
+      expect(send).toHaveBeenCalledTimes(2);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('does not retry capacity for a superseded revision', async () => {
+    const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
+      async () =>
+        new Response(JSON.stringify({ error: { code: 'host_capacity' } }), {
+          status: 503,
+          headers: { 'Retry-After': '1' },
+        }),
+    );
+    const wrapped = createNativeResponseFetch(
+      send,
+      async () => context,
+      async () => true,
+      jest.fn(),
+      {
+        beforeDispatch: async () => undefined,
+        whileOccupied: async () => true,
+        isCurrent: async () => false,
+      },
+    );
+    await expect(
+      wrapped('http://native.test/v1/chat/completions', { body: '{}' }),
+    ).rejects.toMatchObject({ name: 'AbortError', code: 'superseded' });
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels native capacity waiting without a second invocation', async () => {
+    const controller = new AbortController();
+    let sent: () => void = () => {};
+    const firstSent = new Promise<void>((resolve) => {
+      sent = resolve;
+    });
+    const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
+      async () => {
+        sent();
+        return new Response(JSON.stringify({ error: { code: 'host_capacity' } }), {
+          status: 503,
+          headers: { 'Retry-After': '1' },
+        });
+      },
+    );
+    const wrapped = createNativeResponseFetch(
+      send,
+      async () => context,
+      async () => true,
+      jest.fn(),
+    );
+    const request = wrapped('http://native.test/v1/chat/completions', {
+      body: '{}',
+      signal: controller.signal,
+    });
+    const stopped = expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    await firstSent;
+    controller.abort('user_cancelled');
+    await stopped;
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers the identical invocation again only while typed occupancy is pending', async () => {
+    const occupied = () =>
+      new Response(JSON.stringify({ error: { code: 'conversation_session_authority_conflict' } }), {
+        status: 409,
+      });
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockResolvedValueOnce(occupied())
+      .mockResolvedValueOnce(new Response('{}'));
+    const admit = jest.fn(async () => true);
+    const whileOccupied = jest.fn(async () => true);
+    const wrapped = createNativeResponseFetch(send, async () => context, admit, jest.fn(), {
+      beforeDispatch: async () => undefined,
+      whileOccupied,
+      isCurrent: async () => true,
+    });
+    const response = await wrapped('http://native.test/v1/chat/completions', {
+      method: 'POST',
+      body: '{}',
+    });
+    expect(response.status).toBe(200);
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(whileOccupied).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1][1]?.body).toBe(send.mock.calls[0][1]?.body);
+    const firstHeaders = new Headers(send.mock.calls[0][1]?.headers);
+    const secondHeaders = new Headers(send.mock.calls[1][1]?.headers);
+    expect(secondHeaders.get('X-Viventium-Native-Invocation-Id')).toBe(
+      firstHeaders.get('X-Viventium-Native-Invocation-Id'),
+    );
+
+    // A replaced revision, or any other typed conflict, returns the provider's answer unchanged.
+    const stale = createNativeResponseFetch(
+      jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(async () =>
+        occupied(),
+      ),
+      async () => context,
+      async () => true,
+      jest.fn(),
+      {
+        beforeDispatch: async () => undefined,
+        whileOccupied: async () => false,
+        isCurrent: async () => true,
+      },
+    );
+    expect((await stale('http://native.test/v1/chat/completions', { body: '{}' })).status).toBe(
+      409,
+    );
+    const deadlineSend = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
+      async () =>
+        new Response(JSON.stringify({ error: { code: 'provider_response_deadline_exceeded' } }), {
+          status: 409,
+        }),
+    );
+    const deadlineWait = jest.fn(async () => true);
+    const deadline = createNativeResponseFetch(
+      deadlineSend,
+      async () => context,
+      async () => true,
+      jest.fn(),
+      {
+        beforeDispatch: async () => undefined,
+        whileOccupied: deadlineWait,
+        isCurrent: async () => true,
+      },
+    );
+    expect((await deadline('http://native.test/v1/chat/completions', { body: '{}' })).status).toBe(
+      409,
+    );
+    expect(deadlineSend).toHaveBeenCalledTimes(1);
+    expect(deadlineWait).not.toHaveBeenCalled();
   });
   it('freezes the authored parent proof before an awaited admission can change request context', async () => {
     const parent = { id: 'parent-id', messageId: 'prior', digest: 'd'.repeat(64) };

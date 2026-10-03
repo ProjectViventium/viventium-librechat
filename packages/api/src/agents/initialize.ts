@@ -73,6 +73,7 @@ import {
   type ProviderCapabilityRegistry,
 } from './validation';
 import { isConversationOrchestrationTool } from '../glasshive/conversationOrchestration';
+import { isAudioDeliveryRequested } from '../channels/deliveryDisposition';
 /* === VIVENTIUM END === */
 
 /**
@@ -213,6 +214,8 @@ export interface InitializeAgentDbMethods extends EndpointDbMethods {
  * Source: https://developers.openai.com/api/docs/guides/latest-model
  * === VIVENTIUM END === */
 const OPENAI_GPT_56_AGENT_MODELS = new Set([
+  'gpt-6.1-sol',
+  'gpt-6-sol',
   'gpt-5.6',
   'gpt-5.6-sol',
   'gpt-5.6-terra',
@@ -244,6 +247,15 @@ export function applyOpenAIGPT56AgentDefaults({
     nextModelOptions.useResponsesApi = true;
   }
 
+  const currentDefaults: Record<string, string> = {
+    'openai:gpt-6.1-sol': 'reasoning_effort',
+    'anthropic:claude-opus-5-5': 'effort',
+    'xai:grok-4.7': 'reasoning_effort',
+  };
+  const effortKey = currentDefaults[`${normalizedProvider}:${normalizedModel}`];
+  if (effortKey && nextModelOptions[effortKey] == null) {
+    nextModelOptions[effortKey] = 'high';
+  }
   return nextModelOptions;
 }
 /* === VIVENTIUM END === */
@@ -909,7 +921,7 @@ export async function initializeAgent(
     const configuredHeaders = (llmConfiguration.defaultHeaders ?? {}) as Record<string, string>;
     llmConfiguration.defaultHeaders = {
       ...configuredHeaders,
-      'X-Viventium-Audio-Eligible': '{{LIBRECHAT_BODY_TELEGRAMAUDIOREQUESTED}}',
+      'X-Viventium-Audio-Eligible': String(isAudioDeliveryRequested(req)),
     };
     (agent.model_parameters as Record<string, unknown>).__includeRawResponse = true;
     (agent.model_parameters as Record<string, unknown>).configuration = llmConfiguration;
@@ -921,6 +933,9 @@ export async function initializeAgent(
    * at run time, when the conversation/message/surface are known.
    * === VIVENTIUM END === */
   if (providerCapability?.workspace_binding === true) {
+    // Keep current published-file protocol metadata through the normal provider adapter.
+    if (providerCapability.conversation_session === true)
+      (agent.model_parameters as Record<string, unknown>).__includeRawResponse = true;
     const providerDefaultAccess =
       providerCapability.default_access === 'full' ? ('full' as const) : ('workspace' as const);
     const configuredOptions = (

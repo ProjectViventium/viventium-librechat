@@ -45,7 +45,10 @@ const {
 } = require('~/server/services/viventium/listenOnlyTranscript');
 /* === VIVENTIUM START === Preserve raw Mongo ancestry before legacy traversal can shorten it. === */
 const {
+  isSchedulerTransportRow,
+  isTrustedSchedulerWake,
   traceMainHistoryAncestry,
+  recoverRetainedTelegramHistory,
 } = require('~/server/services/viventium/ViventiumMainContextService');
 /* === VIVENTIUM END === */
 /* === VIVENTIUM START ===
@@ -861,7 +864,11 @@ class BaseClient {
     }
 
     if (this.artifactPromises) {
-      responseMessage.attachments = (await Promise.all(this.artifactPromises)).filter((a) => a);
+      /* === VIVENTIUM START === Native selected files resolve as one verified batch. === */
+      responseMessage.attachments = (await Promise.all(this.artifactPromises))
+        .flat()
+        .filter((a) => a);
+      /* === VIVENTIUM END === */
     }
 
     if (this.options.attachments) {
@@ -970,7 +977,21 @@ class BaseClient {
       `[BaseClient] DEBUG LOAD_HISTORY: conversationId=${conversationId}, parentMessageId=${parentMessageId}`,
     );
 
-    const messages = (await getMessages({ conversationId })) ?? [];
+    let messages = (await getMessages({ conversationId })) ?? [];
+    /* === VIVENTIUM START === Recover only the host-retained input anchor after interrupted replay. === */
+    if (this.clientName === EModelEndpoint.agents) {
+      messages = recoverRetainedTelegramHistory(messages, this.user, conversationId);
+    }
+    /* === VIVENTIUM END === */
+    /* === VIVENTIUM START ===
+     * A trusted scheduler wake omits scheduler transport rows only. They stay in the returned chain
+     * so the agent's own parent walk can pass through them to the visible answers; the ancestry
+     * proof accounts them as skipped, and the agent message builder omits them by the same type.
+     * === VIVENTIUM END === */
+    const skipHistoryRow =
+      this.clientName === EModelEndpoint.agents && isTrustedSchedulerWake(this.options?.req)
+        ? (message) => isPassiveVoiceTranscriptMessage(message) || isSchedulerTransportRow(message)
+        : isPassiveVoiceTranscriptMessage;
     /* === VIVENTIUM START === A missing or cyclic ancestor must remain visible to Main V1 admission. === */
     if (this.clientName === EModelEndpoint.agents) {
       this._viventiumHistoryAncestryV1 = traceMainHistoryAncestry({
@@ -978,7 +999,7 @@ class BaseClient {
         headId: parentMessageId,
         ownerId: this.user,
         conversationId,
-        isSkippable: isPassiveVoiceTranscriptMessage,
+        isSkippable: skipHistoryRow,
       });
     }
     /* === VIVENTIUM END === */

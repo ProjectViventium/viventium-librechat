@@ -1476,7 +1476,9 @@ async function handleGlassHiveCallback(req, res) {
   if (voiceTask) {
     await runTerminalEffect(() =>
       runVoiceTaskTerminalCallbackMutation(voiceTask.taskId, () =>
-        registerGlassHiveVoiceTaskActionCapabilities({ body: callbackBody, task: voiceTask }),
+        registerGlassHiveVoiceTaskActionCapabilities({
+          body: callbackBody, task: voiceTask, workRef: deliveryContext.workRef, ownerId: deliveryContext.ownerId,
+        }),
       ),
     );
   }

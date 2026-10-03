@@ -11,14 +11,25 @@ const {
   flushVoiceTaskOwnerOperations,
   getVoiceTask,
   getVoiceTaskByStreamId,
+  getVoiceTaskOwnerCapabilityInventory,
   requestVoiceTaskOwnerCancellation,
   resetVoiceTasksForTests,
   retryVoiceTask,
+  submitVoiceTaskInput,
   snapshotEvent,
 } = require('../VoiceTaskService');
 const {
   registerGlassHiveVoiceTaskActionCapabilities,
 } = require('../GlassHiveVoiceTaskActionService');
+
+const mockRequestAccountApi = jest.fn();
+const mockExecuteGlassHiveWorkAction = jest.fn();
+jest.mock('../GlassHiveAccountService', () => ({
+  requestAccountApi: (...args) => mockRequestAccountApi(...args),
+}));
+jest.mock('../GlassHiveWorkActionService', () => ({
+  executeGlassHiveWorkAction: (...args) => mockExecuteGlassHiveWorkAction(...args),
+}));
 
 function capability(overrides = {}) {
   return {
@@ -56,6 +67,8 @@ describe('GlassHiveVoiceTaskActionService', () => {
 
   beforeEach(() => {
     resetVoiceTasksForTests();
+    mockRequestAccountApi.mockReset();
+    mockExecuteGlassHiveWorkAction.mockReset();
     process.env.GLASSHIVE_PROVIDER_BASE_URL = 'http://glasshive.example.test:8766/v1';
   });
 
@@ -65,6 +78,125 @@ describe('GlassHiveVoiceTaskActionService', () => {
     } else {
       process.env.GLASSHIVE_PROVIDER_BASE_URL = originalBaseUrl;
     }
+  });
+
+  test('refreshes the exact owner question, exposes real choices and keeps pending ACK retry intact', async () => {
+    const task = createVoiceTask({
+      callSessionId: 'call-1',
+      userId: 'user-1',
+      streamId: 'glasshive:run-1',
+      owner: { kind: 'glasshive_run', id: 'run-1' },
+    });
+    const pending = {
+      version: 1,
+      requestId: 'permission-1',
+      requestFingerprint: 'a'.repeat(64),
+      runId: 'run-1',
+      attemptId: 'attempt-1',
+      sessionId: 'session-1',
+      expiresAt: '2099-01-01T00:00:00Z',
+      kind: 'permission',
+      state: 'pending',
+      mode: 'form',
+      runtimeName: 'Native runtime',
+      message: 'Permit?',
+      requestedSchema: {
+        type: 'object',
+        required: ['optionId'],
+        properties: {
+          optionId: {
+            type: 'string',
+            enum: ['allow_once', 'reject_once'],
+            enumNames: ['Allow once', 'Reject once'],
+          },
+        },
+      },
+    };
+    mockRequestAccountApi.mockResolvedValueOnce({ workRef: 'work-1', pendingNativeInput: pending });
+    mockExecuteGlassHiveWorkAction
+      .mockResolvedValueOnce({ status: 'pending', confirmationPending: true })
+      .mockResolvedValueOnce({ status: 'already_accepted', confirmationPending: false });
+    expect(
+      await registerGlassHiveVoiceTaskActionCapabilities({
+        task,
+        workRef: 'work-1',
+        ownerId: 'user-1',
+        body: {
+          event: 'run.needs_input',
+          run_id: 'run-1',
+          callback_id: 'callback-1',
+          pending_native_input: pending,
+        },
+      }),
+    ).toMatchObject({ input: true });
+    expect(mockRequestAccountApi).toHaveBeenCalledWith({
+      ownerId: 'user-1',
+      path: '/v1/work/work-1',
+    });
+    expect(snapshotEvent(task.taskId)).toMatchObject({
+      state: 'needs_input',
+      needsInput: {
+        choices: [
+          { value: 'allow_once', label: 'Allow once' },
+          { value: 'reject_once', label: 'Reject once' },
+        ],
+      },
+    });
+    const context = {
+      callSessionId: 'call-1',
+      binding: {
+        version: 1,
+        userId: 'user-1',
+        callSessionId: 'call-1',
+        kind: 'participant_text',
+        fingerprint: 'b'.repeat(64),
+        turnIds: [],
+      },
+    };
+    expect(
+      await submitVoiceTaskInput(task.taskId, 'reject_once', {
+        userId: 'user-1',
+        voiceAuthorityContext: context,
+      }),
+    ).toMatchObject({ ok: true, confirmationPending: true, task: { state: 'needs_input' } });
+    expect(
+      await submitVoiceTaskInput(task.taskId, 'reject_once', {
+        userId: 'user-1',
+        voiceAuthorityContext: context,
+      }),
+    ).toMatchObject({ ok: true, task: { state: 'running' } });
+    expect(mockExecuteGlassHiveWorkAction.mock.calls[1]).toEqual(
+      mockExecuteGlassHiveWorkAction.mock.calls[0],
+    );
+    expect(mockExecuteGlassHiveWorkAction.mock.calls[0][0]).toMatchObject({
+      ownerId: 'user-1',
+      workRef: 'work-1',
+      ownerInputControl: true,
+      nativeInput: { action: 'accept', content: { optionId: 'reject_once' } },
+      voiceAuthorityContext: context,
+    });
+  });
+
+  test('does not expose choices from a replacement current native request', async () => {
+    const task = createVoiceTask({
+      callSessionId: 'call-1',
+      userId: 'user-1',
+      streamId: 'glasshive:run-1',
+      owner: { kind: 'glasshive_run', id: 'run-1' },
+    });
+    mockRequestAccountApi.mockResolvedValueOnce({ workRef: 'work-1', pendingNativeInput: null });
+    expect(
+      await registerGlassHiveVoiceTaskActionCapabilities({
+        task,
+        workRef: 'work-1',
+        ownerId: 'user-1',
+        body: { event: 'run.needs_input', run_id: 'run-1', pending_native_input: {} },
+      }),
+    ).toEqual({ cancel: false, retry: false });
+    expect(
+      getVoiceTaskOwnerCapabilityInventory({ userId: 'user-1', callSessionId: 'call-1' }).owners,
+    ).toEqual([{ kind: 'glasshive_run', acceptsInput: false }]);
+    expect(mockExecuteGlassHiveWorkAction).not.toHaveBeenCalled();
   });
 
   test.each(['accepted', 'pending'])(

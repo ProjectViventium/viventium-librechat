@@ -14,6 +14,7 @@
 #   --clean         Clean all dist folders and force rebuild (includes --build)
 #   --backend-only  Only start the backend server
 #   --frontend-only Only start the frontend dev server
+#   --print-serve-plan  Print the serving profile and scripts a start would run, then exit
 #   --help          Show this help message
 #
 
@@ -44,6 +45,7 @@ BUILD_PACKAGES=false
 CLEAN_BUILD=false
 BACKEND_ONLY=false
 FRONTEND_ONLY=false
+PRINT_SERVE_PLAN=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -65,8 +67,12 @@ while [[ $# -gt 0 ]]; do
             FRONTEND_ONLY=true
             shift
             ;;
+        --print-serve-plan)
+            PRINT_SERVE_PLAN=true
+            shift
+            ;;
         --help)
-            head -20 "$0" | tail -17
+            head -21 "$0" | tail -18
             exit 0
             ;;
         *)
@@ -208,6 +214,33 @@ elif [ -f ".env" ]; then
 else
     echo -e "${YELLOW}Warning: .env file not found. Environment variables may not be loaded correctly.${NC}"
 fi
+
+# === VIVENTIUM START ===
+# Feature: Compiled serving profile for source installs.
+# Purpose: `VIVENTIUM_LIBRECHAT_SERVE_MODE=compiled` (compiled from `runtime.librechat_serve_mode`)
+# runs the production API and serves the built client bundle on the same ports, instead of the
+# nodemon API and the Vite dev server. Any other value keeps the development servers. It is read
+# only after every supported env source above, so a direct start honors the generated runtime env
+# exactly as a launcher start that exported it first.
+LIBRECHAT_SERVE_MODE=development
+if [[ "$(printf '%s' "${VIVENTIUM_LIBRECHAT_SERVE_MODE:-}" | tr '[:upper:]' '[:lower:]')" == "compiled" ]]; then
+    LIBRECHAT_SERVE_MODE=compiled
+fi
+if [ "$LIBRECHAT_SERVE_MODE" = compiled ]; then
+    BACKEND_NPM_SCRIPT=backend
+    FRONTEND_NPM_SCRIPT=serve:compiled
+    FRONTEND_PORT_POLICY=--strictPort
+else
+    BACKEND_NPM_SCRIPT=backend:dev
+    FRONTEND_NPM_SCRIPT=dev
+    FRONTEND_PORT_POLICY=
+fi
+if [ "$PRINT_SERVE_PLAN" = true ]; then
+    printf 'serve_mode=%s backend_script=%s frontend_script=%s\n' \
+        "$LIBRECHAT_SERVE_MODE" "$BACKEND_NPM_SCRIPT" "$FRONTEND_NPM_SCRIPT"
+    exit 0
+fi
+# === VIVENTIUM END ===
 
 # === VIVENTIUM START ===
 # Feature: Reuse Viventium's validated Python for prompt compilation.
@@ -672,6 +705,24 @@ build_client_bundle() {
 # Check if client is built (required for backend to start)
 if [ ! -f "client/dist/index.html" ]; then
     build_client_bundle || exit 1
+# === VIVENTIUM START === A compiled start never serves a bundle older than its client inputs. ===
+elif [ "$LIBRECHAT_SERVE_MODE" = compiled ] && newer_source=$(find_newer_source "client/dist/index.html" \
+    "package-lock.json" \
+    "package.json" \
+    "client/src" \
+    "client/public" \
+    "client/scripts" \
+    "client/index.html" \
+    "client/package.json" \
+    "client/vite.config.ts" \
+    "client/tsconfig.json" \
+    "client/tailwind.config.cjs" \
+    "client/postcss.config.cjs" \
+    "packages/client/dist" \
+    "packages/data-provider/dist"); then
+    echo -e "${YELLOW}Compiled client bundle is older than ${newer_source}; rebuilding${NC}"
+    build_client_bundle || exit 1
+# === VIVENTIUM END ===
 fi
 
 # Prepare the privacy-checked runtime synchronously before either server can read it.
@@ -704,25 +755,25 @@ if [ "$FRONTEND_ONLY" = true ]; then
     echo -e "${BLUE}Starting frontend only...${NC}"
     # Use --host to ensure frontend URL works on systems where localhost resolves to IPv4 first.
     # Ensure Vite proxy routes /api to the active LibreChat API port.
-    cd client && exec env BACKEND_PORT="$LC_API_PORT" VIVENTIUM_LC_API_PORT="$LC_API_PORT" npm run dev -- --host "${HOST}" --port "$LC_FRONTEND_PORT"
+    cd client && exec env BACKEND_PORT="$LC_API_PORT" VIVENTIUM_LC_API_PORT="$LC_API_PORT" npm run "$FRONTEND_NPM_SCRIPT" -- --host "${HOST}" --port "$LC_FRONTEND_PORT" $FRONTEND_PORT_POLICY
 elif [ "$BACKEND_ONLY" = true ]; then
     echo -e "${BLUE}Starting backend only...${NC}"
     run_local_search_backfill_nonblocking
-    exec npm run backend:dev
+    exec npm run "$BACKEND_NPM_SCRIPT"
 else
     # Start both backend and frontend
     run_local_search_backfill_nonblocking
     echo -e "${BLUE}Starting backend server...${NC}"
-    npm run backend:dev &
+    npm run "$BACKEND_NPM_SCRIPT" &
     BACKEND_PID=$!
 
     # Wait for backend to be ready
     echo -e "${YELLOW}Waiting for backend to start...${NC}"
     sleep 5
 
-    echo -e "${BLUE}Starting frontend dev server...${NC}"
+    echo -e "${BLUE}Starting frontend server (${LIBRECHAT_SERVE_MODE})...${NC}"
     # Use --host/--port to ensure frontend is reachable via LC_FRONTEND_URL.
-    (cd client && exec env BACKEND_PORT="$LC_API_PORT" VIVENTIUM_LC_API_PORT="$LC_API_PORT" npm run dev -- --host "${HOST}" --port "$LC_FRONTEND_PORT") &
+    (cd client && exec env BACKEND_PORT="$LC_API_PORT" VIVENTIUM_LC_API_PORT="$LC_API_PORT" npm run "$FRONTEND_NPM_SCRIPT" -- --host "${HOST}" --port "$LC_FRONTEND_PORT" $FRONTEND_PORT_POLICY) &
     FRONTEND_PID=$!
 
     echo ""
@@ -730,7 +781,7 @@ else
     echo -e "${GREEN}  Servers running!${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
-    echo -e "  ${BLUE}Frontend (dev):${NC} ${LC_FRONTEND_URL}"
+    echo -e "  ${BLUE}Frontend (${LIBRECHAT_SERVE_MODE}):${NC} ${LC_FRONTEND_URL}"
     echo -e "  ${BLUE}Backend API:${NC}    ${LC_API_URL}/api"
     echo ""
     echo -e "${YELLOW}Open ${LC_FRONTEND_URL} in your browser${NC}"

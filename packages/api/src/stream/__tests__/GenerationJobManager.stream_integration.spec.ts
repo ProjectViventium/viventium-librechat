@@ -1,6 +1,7 @@
 import IoRedis from 'ioredis';
 import type { Redis, Cluster } from 'ioredis';
 import type { RedisClientType, RedisClusterType } from '@redis/client';
+import type { InteractionContext } from '../interfaces/IJobStore';
 
 /**
  * Integration tests for GenerationJobManager.
@@ -10,6 +11,475 @@ import type { RedisClientType, RedisClusterType } from '@redis/client';
  *
  * Run with: USE_REDIS=true npx jest GenerationJobManager.stream_integration
  */
+/* === VIVENTIUM START ===
+ * Purpose: one Cortex receipt contract through the manager in every job store. Input newer than
+ * the turn withdraws a late addition before its receipt commits, and the withdrawal settles only
+ * that presentation; a promoted empty answer's presentation is also the turn's Main receipt.
+ * === VIVENTIUM END === */
+type StreamServicesForTest = ReturnType<
+  typeof import('../createStreamServices')['createStreamServices']
+>;
+
+async function orderedExternalTurn(services: StreamServicesForTest, label: string) {
+  const { GenerationJobManager } = await import('../GenerationJobManager');
+  const { createHash } = await import('crypto');
+  GenerationJobManager.configure(services);
+  await GenerationJobManager.initialize();
+  const suffix = `${label}-${Date.now()}`;
+  const sourceOrderScope = createHash('sha256').update(`order-${suffix}`).digest('hex');
+  const streamId = `cortex-receipt-${suffix}`;
+  const ownerId = `owner-${suffix}`;
+  const sourceEventId = `source-${suffix}`;
+  const job = await GenerationJobManager.createJob(streamId, ownerId, `conversation-${suffix}`, {
+    interactionContext: {
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      conversation_id: `conversation-${suffix}`,
+      revision: 1,
+      source_event_id: sourceEventId,
+      source_order_scope: sourceOrderScope,
+      source_sequence: 1,
+      source_segments: [
+        { ordinal: 0, source_event_id: sourceEventId, source_index: 0, text: 'Question.' },
+      ],
+    },
+    deliveryPolicy: { commit_authority: 'external_adapter' },
+  });
+  await GenerationJobManager.updateMetadata(streamId, { responseMessageId: `parent-${suffix}` });
+  const main = {
+    logical_turn_id: job.metadata.interactionContext!.logical_turn_id!,
+    revision: 1,
+    state: 'committed' as const,
+    presentation_ref: 'telegram:1:main-answer',
+  };
+  const receipt = (messageId: string) => ({
+    ownerId,
+    messageId,
+    parentMessageId: `parent-${suffix}`,
+    revision: 1,
+    generation: 2,
+    deliveryIds: ['delivery-receipt'],
+    deliveryReceipts: [{ deliveryId: 'delivery-receipt', graphResultHash: 'c'.repeat(64) }],
+    claimToken: 'claim-receipt',
+    presentationLeaseToken: 'lease-receipt',
+  });
+  const newerInput = () =>
+    GenerationJobManager.observeSourceOrder({
+      source_order_scope: sourceOrderScope,
+      source_sequence: 2,
+    });
+  return { GenerationJobManager, streamId, suffix, main, receipt, newerInput };
+}
+
+async function expectNewerInputWithdrawsLateAddition(services: StreamServicesForTest) {
+  const { GenerationJobManager, streamId, suffix, main, receipt, newerInput } =
+    await orderedExternalTurn(services, 'newer-input');
+  await expect(GenerationJobManager.acknowledgeDelivery(main, 'telegram')).resolves.toMatchObject(
+    { status: 'recorded' },
+  );
+  const addition = receipt(`follow-up-${suffix}`);
+  await GenerationJobManager.bindCortexPresentation(streamId, addition);
+  await newerInput();
+  const additionAcknowledgement = { ...main, presentation_ref: 'telegram:1:addition' };
+
+  await expect(
+    GenerationJobManager.acknowledgeDelivery(additionAcknowledgement, 'telegram', addition),
+  ).resolves.toMatchObject({ status: 'stale_source_order' });
+  await expect(
+    GenerationJobManager.acknowledgeDelivery(
+      { ...additionAcknowledgement, state: 'partial_removed' },
+      'telegram',
+      addition,
+    ),
+  ).resolves.toMatchObject({ status: 'recorded', idempotent: false });
+  const stored = await services.jobStore.getJob(streamId);
+  expect(stored?.deliveryAcknowledgement).toMatchObject(main);
+  expect(stored?.cortexDeliveryAcknowledgement).toMatchObject({
+    state: 'partial_removed',
+    presentation_ref: 'telegram:1:addition',
+  });
+  await GenerationJobManager.destroy();
+}
+
+async function expectPromotedAnswerSettlesMainReceipt(services: StreamServicesForTest) {
+  const { GenerationJobManager, streamId, suffix, main, receipt } = await orderedExternalTurn(
+    services,
+    'promoted',
+  );
+  const promoted = receipt(`parent-${suffix}`);
+  await GenerationJobManager.bindCortexPresentation(streamId, promoted);
+  const promotedAcknowledgement = { ...main, presentation_ref: 'telegram:1:promoted-answer' };
+
+  const recorded = await GenerationJobManager.acknowledgeDelivery(
+    promotedAcknowledgement,
+    'telegram',
+    promoted,
+  );
+  expect(recorded).toMatchObject({ status: 'recorded', idempotent: false });
+  await expect(services.jobStore.getJob(streamId)).resolves.toMatchObject({
+    deliveryAcknowledgement: expect.objectContaining(promotedAcknowledgement),
+    cortexDeliveryAcknowledgement: expect.objectContaining(promotedAcknowledgement),
+  });
+  // The presented parent is Main's first presentation; another Main receipt conflicts with it.
+  await expect(GenerationJobManager.acknowledgeDelivery(main, 'telegram')).resolves.toMatchObject({
+    status: 'conflict',
+  });
+  await GenerationJobManager.destroy();
+}
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START ===
+ * Purpose: through the manager, a claim only reserves a revision. When a newer revision's
+ * admission wins before an older reservation admits, the older input and its quote belong to the
+ * newer answer and the older admission is refused; an older revision that committed its admission
+ * first keeps authoring its own input.
+ * === VIVENTIUM END === */
+async function expectAdmissionDecidesSourceAuthors(
+  services: StreamServicesForTest,
+  olderAdmitsFirst: boolean,
+) {
+  const { GenerationJobManager } = await import('../GenerationJobManager');
+  const { ownedInteractionSources } = await import('../../agents/sourceSelectionContext');
+  const { createHash } = await import('crypto');
+  GenerationJobManager.configure({ ...services, cleanupOnComplete: false });
+  await GenerationJobManager.initialize();
+  const suffix = `${olderAdmitsFirst ? 'older-first' : 'newer-first'}-${Date.now()}`;
+  const scope = createHash('sha256').update(`admission-${suffix}`).digest('hex');
+  const telegram = { segment_stability: 'immediate', supersede_scope: 'response_only' } as const;
+  const quoteText = 'Willow 427 / Elm 441';
+  const input = (id: string, sequence: number, quote?: string): InteractionContext => ({
+    actor_kind: 'external_user',
+    origin: 'interactive',
+    surface: 'telegram',
+    conversation_id: `conversation-${suffix}`,
+    revision: 1,
+    source_event_id: `${id}-${suffix}`,
+    source_order_scope: scope,
+    source_sequence: sequence,
+    source_segments: [
+      {
+        ordinal: 0,
+        source_event_id: `${id}-${suffix}`,
+        source_index: 0,
+        source_sequence: sequence,
+        text: `${id} goal`,
+        ...(quote
+          ? {
+              reply_context: {
+                version: 1 as const,
+                provenanceStatus: 'verified' as const,
+                senderRole: 'assistant_self' as const,
+                repliedTelegramMessageId: '14378',
+                quoteText: quote,
+                logicalMessageId: 'main-answer',
+              },
+            }
+          : {}),
+      },
+    ],
+  });
+  const admit = async (id: string, sequence: number, quote?: string) => {
+    await GenerationJobManager.createJob(
+      `${id}-${suffix}`,
+      `owner-${suffix}`,
+      `conversation-${suffix}`,
+      {
+        interactionContext: input(id, sequence, quote),
+        adapterCapabilities: telegram,
+        deliveryPolicy: { commit_authority: 'external_adapter' },
+      },
+    );
+    return GenerationJobManager.commitLogicalTurnAuthor(`${id}-${suffix}`, `owner-${suffix}`);
+  };
+  const originalCreate = services.jobStore.createJob.bind(services.jobStore);
+  let releaseOlder!: () => void;
+  const olderReleased = new Promise<void>((resolve) => {
+    releaseOlder = resolve;
+  });
+  let markOlderReserved!: () => void;
+  const olderReserved = new Promise<void>((resolve) => {
+    markOlderReserved = resolve;
+  });
+  const hold = jest
+    .spyOn(services.jobStore, 'createJob')
+    .mockImplementationOnce(async (...args) => {
+      markOlderReserved();
+      if (!olderAdmitsFirst) await olderReleased;
+      return originalCreate(...args);
+    });
+
+  await GenerationJobManager.observeSourceOrder({ source_order_scope: scope, source_sequence: 1 });
+  const older = admit('older', 1, quoteText);
+  if (olderAdmitsFirst) await older;
+  else await olderReserved;
+  await GenerationJobManager.observeSourceOrder({ source_order_scope: scope, source_sequence: 2 });
+  const newer = await admit('newer', 2);
+  const authors = ownedInteractionSources(newer!, telegram).map(({ sourceOrdinal, segment }) => [
+    sourceOrdinal,
+    segment.reply_context?.quoteText ?? null,
+  ]);
+
+  if (olderAdmitsFirst) {
+    expect(authors).toEqual([[2, null]]);
+  } else {
+    expect(authors).toEqual([
+      [1, quoteText],
+      [2, null],
+    ]);
+    releaseOlder();
+    await expect(older).rejects.toMatchObject({ code: 'source_order_superseded' });
+    await expect(services.jobStore.getJob(`older-${suffix}`)).resolves.toBeNull();
+  }
+  await expect(services.jobStore.getJob(`newer-${suffix}`)).resolves.toMatchObject({
+    interactionContext: newer,
+  });
+  hold.mockRestore();
+  await GenerationJobManager.destroy();
+}
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START ===
+ * Purpose: an admission lifecycle interrupted after the job exists never leaves an author, and a
+ * winner's commit still decides authorship after another conversation retires the turn.
+ * === VIVENTIUM END === */
+async function expectInterruptedAdmissionsKeepOneAuthor(
+  services: StreamServicesForTest,
+  interruption: 'older-commit-held' | 'turn-retired',
+) {
+  const { GenerationJobManager } = await import('../GenerationJobManager');
+  const { ownedInteractionSources } = await import('../../agents/sourceSelectionContext');
+  const { createHash } = await import('crypto');
+  GenerationJobManager.configure({ ...services, cleanupOnComplete: false });
+  await GenerationJobManager.initialize();
+  const suffix = `${interruption}-${Date.now()}`;
+  const scope = createHash('sha256').update(`interrupted-${suffix}`).digest('hex');
+  const telegram = { segment_stability: 'immediate', supersede_scope: 'response_only' } as const;
+  const quoteText = 'Willow 427 / Elm 441';
+  const input = (id: string, sequence: number, conversation = `conversation-${suffix}`) =>
+    ({
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      conversation_id: conversation,
+      revision: 1,
+      source_event_id: `${id}-${suffix}`,
+      source_order_scope: scope,
+      source_sequence: sequence,
+      source_segments: [
+        {
+          ordinal: 0,
+          source_event_id: `${id}-${suffix}`,
+          source_index: 0,
+          source_sequence: sequence,
+          text: `${id} goal`,
+          ...(id === 'older'
+            ? {
+                reply_context: {
+                  version: 1 as const,
+                  provenanceStatus: 'verified' as const,
+                  senderRole: 'assistant_self' as const,
+                  repliedTelegramMessageId: '14378',
+                  quoteText,
+                  logicalMessageId: 'main-answer',
+                },
+              }
+            : {}),
+        },
+      ],
+    }) as InteractionContext;
+  const admit = async (id: string, sequence: number) => {
+    await GenerationJobManager.createJob(
+      `${id}-${suffix}`,
+      `owner-${suffix}`,
+      `conversation-${suffix}`,
+      {
+        interactionContext: input(id, sequence),
+        adapterCapabilities: telegram,
+        deliveryPolicy: { commit_authority: 'external_adapter' },
+      },
+    );
+    return GenerationJobManager.commitLogicalTurnAuthor(`${id}-${suffix}`, `owner-${suffix}`);
+  };
+  const gate = () => {
+    let release!: () => void;
+    let markReached!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const reached = new Promise<void>((resolve) => {
+      markReached = resolve;
+    });
+    return { release, released, markReached, reached };
+  };
+  const olderGate = gate();
+  const newerGate = gate();
+  const createJob = services.jobStore.createJob.bind(services.jobStore);
+  const commit = services.jobStore.commitLogicalTurnAdmission!.bind(services.jobStore);
+  const holds: jest.SpyInstance[] = [];
+  if (interruption === 'older-commit-held') {
+    // The older job exists and passed its admission checks; only its commit is still pending.
+    holds.push(
+      jest
+        .spyOn(services.jobStore, 'commitLogicalTurnAdmission')
+        .mockImplementationOnce(async (...args) => {
+          olderGate.markReached();
+          await olderGate.released;
+          return commit(...args);
+        }),
+    );
+  } else {
+    // The older input only reserves; the newer admission waits at its commit while another
+    // conversation retires the turn.
+    holds.push(
+      jest.spyOn(services.jobStore, 'createJob').mockImplementationOnce(async (...args) => {
+        olderGate.markReached();
+        await olderGate.released;
+        return createJob(...args);
+      }),
+    );
+  }
+
+  await GenerationJobManager.observeSourceOrder({ source_order_scope: scope, source_sequence: 1 });
+  const older = admit('older', 1);
+  await olderGate.reached;
+  if (interruption === 'turn-retired') {
+    holds.push(
+      jest
+        .spyOn(services.jobStore, 'commitLogicalTurnAdmission')
+        .mockImplementationOnce(async (...args) => {
+          newerGate.markReached();
+          await newerGate.released;
+          return commit(...args);
+        }),
+    );
+  }
+  await GenerationJobManager.observeSourceOrder({ source_order_scope: scope, source_sequence: 2 });
+  const newerJob = admit('newer', 2);
+  if (interruption === 'turn-retired') {
+    await newerGate.reached;
+    const other = await services.jobStore.claimLogicalTurn(
+      `other-${suffix}`,
+      `owner-${suffix}`,
+      input('other', 3, `other-conversation-${suffix}`),
+    );
+    expect(other.interactionContext.source_segments?.map((s) => s.source_event_id)).toEqual([
+      `other-${suffix}`,
+    ]);
+    newerGate.release();
+  }
+  const newer = await newerJob;
+  expect(
+    ownedInteractionSources(newer!, telegram).map(({ sourceOrdinal, segment }) => [
+      sourceOrdinal,
+      segment.reply_context?.quoteText ?? null,
+    ]),
+  ).toEqual([
+    [1, quoteText],
+    [2, null],
+  ]);
+  olderGate.release();
+  await expect(older).rejects.toMatchObject({ code: 'source_order_superseded' });
+  await expect(services.jobStore.getJob(`older-${suffix}`)).resolves.toBeNull();
+  await expect(services.jobStore.getJob(`newer-${suffix}`)).resolves.toMatchObject({
+    interactionContext: newer,
+  });
+  holds.forEach((hold) => hold.mockRestore());
+  await GenerationJobManager.destroy();
+}
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START ===
+ * Purpose: a revision authors only at its request's generation handoff. A request that fails
+ * before that handoff never authors, and one whose started receipt fails gives authorship back,
+ * so the next commit owns their inputs and quotes.
+ * === VIVENTIUM END === */
+async function expectFailedHandoffLeavesNoAuthor(
+  services: StreamServicesForTest,
+  failure: 'before-commit' | 'receipt-failed',
+) {
+  const { GenerationJobManager } = await import('../GenerationJobManager');
+  const { ownedInteractionSources } = await import('../../agents/sourceSelectionContext');
+  const { createHash } = await import('crypto');
+  GenerationJobManager.configure({ ...services, cleanupOnComplete: false });
+  await GenerationJobManager.initialize();
+  const suffix = `${failure}-${Date.now()}`;
+  const owner = `owner-${suffix}`;
+  const scope = createHash('sha256').update(`handoff-${suffix}`).digest('hex');
+  const telegram = { segment_stability: 'immediate', supersede_scope: 'response_only' } as const;
+  const quoteText = 'Willow 427 / Elm 441';
+  const input = (id: string, sequence: number) =>
+    ({
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      conversation_id: `conversation-${suffix}`,
+      revision: 1,
+      source_event_id: `${id}-${suffix}`,
+      source_order_scope: scope,
+      source_sequence: sequence,
+      source_segments: [
+        {
+          ordinal: 0,
+          source_event_id: `${id}-${suffix}`,
+          source_index: 0,
+          source_sequence: sequence,
+          text: `${id} goal`,
+          ...(id === 'older'
+            ? {
+                reply_context: {
+                  version: 1 as const,
+                  provenanceStatus: 'verified' as const,
+                  senderRole: 'assistant_self' as const,
+                  repliedTelegramMessageId: '14378',
+                  quoteText,
+                  logicalMessageId: 'main-answer',
+                },
+              }
+            : {}),
+        },
+      ],
+    }) as InteractionContext;
+  const create = (id: string, sequence: number) =>
+    GenerationJobManager.createJob(`${id}-${suffix}`, owner, `conversation-${suffix}`, {
+      interactionContext: input(id, sequence),
+      adapterCapabilities: telegram,
+      deliveryPolicy: { commit_authority: 'external_adapter' },
+    });
+
+  await GenerationJobManager.observeSourceOrder({ source_order_scope: scope, source_sequence: 1 });
+  await create('older', 1);
+  if (failure === 'receipt-failed') {
+    const olderAuthored = await GenerationJobManager.commitLogicalTurnAuthor(
+      `older-${suffix}`,
+      owner,
+    );
+    expect(ownedInteractionSources(olderAuthored!, telegram).map((o) => o.sourceOrdinal)).toEqual([
+      1,
+    ]);
+  }
+  await GenerationJobManager.observeSourceOrder({ source_order_scope: scope, source_sequence: 2 });
+  await create('newer', 2);
+  if (failure === 'receipt-failed') {
+    // The started receipt failed after the commit: the request gives the authorship back.
+    await GenerationJobManager.relinquishLogicalTurnAuthor(`older-${suffix}`, owner);
+  }
+  // The request's failure path ends the older job without ever starting its Main.
+  await GenerationJobManager.completeJob(`older-${suffix}`, 'request failed');
+  const newer = await GenerationJobManager.commitLogicalTurnAuthor(`newer-${suffix}`, owner);
+  expect(
+    ownedInteractionSources(newer!, telegram).map(({ sourceOrdinal, segment }) => [
+      sourceOrdinal,
+      segment.reply_context?.quoteText ?? null,
+    ]),
+  ).toEqual([
+    [1, quoteText],
+    [2, null],
+  ]);
+  await GenerationJobManager.destroy();
+}
+/* === VIVENTIUM END === */
+
 describe('GenerationJobManager Integration Tests', () => {
   /* === VIVENTIUM START ===
    * Purpose: Modified Redis transport teardown sites await their asynchronous
@@ -144,6 +614,58 @@ describe('GenerationJobManager Integration Tests', () => {
   });
 
   describe('In-Memory Mode', () => {
+    test('newer input withdraws a late Cortex addition before its receipt commits', async () => {
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectNewerInputWithdrawsLateAddition(createStreamServices({ useRedis: false }));
+    });
+
+    test('a promoted empty answer’s presentation is also its turn’s Main receipt', async () => {
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectPromotedAnswerSettlesMainReceipt(createStreamServices({ useRedis: false }));
+    });
+
+    test('a newer admission that wins the race owns the older reserved input and quote', async () => {
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectAdmissionDecidesSourceAuthors(createStreamServices({ useRedis: false }), false);
+    });
+
+    test('an older revision admitted first keeps authoring its own input', async () => {
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectAdmissionDecidesSourceAuthors(createStreamServices({ useRedis: false }), true);
+    });
+
+    test('an older admission still before its commit leaves its input to the newer commit', async () => {
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectInterruptedAdmissionsKeepOneAuthor(
+        createStreamServices({ useRedis: false }),
+        'older-commit-held',
+      );
+    });
+
+    test('a winner still owns a fenced reservation after another conversation retires the turn', async () => {
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectInterruptedAdmissionsKeepOneAuthor(
+        createStreamServices({ useRedis: false }),
+        'turn-retired',
+      );
+    });
+
+    test('a request that fails before its author commit leaves its input to the next commit', async () => {
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectFailedHandoffLeavesNoAuthor(
+        createStreamServices({ useRedis: false }),
+        'before-commit',
+      );
+    });
+
+    test('a request whose started receipt fails gives its input to the next commit', async () => {
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectFailedHandoffLeavesNoAuthor(
+        createStreamServices({ useRedis: false }),
+        'receipt-failed',
+      );
+    });
+
     /* === VIVENTIUM START ===
      * Feature: Owner-safe stream identity.
      * Purpose: A caller-controlled key must never overwrite an existing generation job.
@@ -1606,11 +2128,209 @@ describe('GenerationJobManager Integration Tests', () => {
         presentation: { cortexPresentation: first.presentation!.cortexPresentation },
       });
       await expect(GenerationJobManager.getJob(streamId)).resolves.toMatchObject({
-        metadata: {
-          deliveryAcknowledgement: expect.objectContaining(acknowledgement),
-          cortexPresentation: first.presentation!.cortexPresentation,
-        },
+        metadata: { cortexPresentation: first.presentation!.cortexPresentation },
       });
+      // The Cortex receipt is its own record; it never stands in for the turn's Main receipt.
+      const stored = await services.jobStore.getJob(streamId);
+      expect(stored?.deliveryAcknowledgement).toBeUndefined();
+      expect(stored).toMatchObject({
+        cortexDeliveryAcknowledgement: expect.objectContaining(acknowledgement),
+        cortexDeliveryAcknowledgementPresentation: first.presentation!.cortexPresentation,
+      });
+      await GenerationJobManager.destroy();
+    });
+
+    test('newer input withdraws a late Cortex addition before its Redis receipt commits', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectNewerInputWithdrawsLateAddition(
+        createStreamServices({ useRedis: true, redisClient: ioredisClient }),
+      );
+    });
+
+    test('a promoted empty answer’s Redis presentation is also its turn’s Main receipt', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectPromotedAnswerSettlesMainReceipt(
+        createStreamServices({ useRedis: true, redisClient: ioredisClient }),
+      );
+    });
+
+    test('a newer Redis admission that wins the race owns the older reserved input and quote', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectAdmissionDecidesSourceAuthors(
+        createStreamServices({ useRedis: true, redisClient: ioredisClient }),
+        false,
+      );
+    });
+
+    test('an older Redis revision admitted first keeps authoring its own input', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectAdmissionDecidesSourceAuthors(
+        createStreamServices({ useRedis: true, redisClient: ioredisClient }),
+        true,
+      );
+    });
+
+    test('an older Redis admission still before its commit leaves its input to the newer commit', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectInterruptedAdmissionsKeepOneAuthor(
+        createStreamServices({ useRedis: true, redisClient: ioredisClient }),
+        'older-commit-held',
+      );
+    });
+
+    test('a Redis winner still owns a fenced reservation after another conversation retires the turn', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectInterruptedAdmissionsKeepOneAuthor(
+        createStreamServices({ useRedis: true, redisClient: ioredisClient }),
+        'turn-retired',
+      );
+    });
+
+    test('a Redis request that fails before its author commit leaves its input to the next commit', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectFailedHandoffLeavesNoAuthor(
+        createStreamServices({ useRedis: true, redisClient: ioredisClient }),
+        'before-commit',
+      );
+    });
+
+    test('a Redis request whose started receipt fails gives its input to the next commit', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+      const { createStreamServices } = await import('../createStreamServices');
+      await expectFailedHandoffLeavesNoAuthor(
+        createStreamServices({ useRedis: true, redisClient: ioredisClient }),
+        'receipt-failed',
+      );
+    });
+
+    test('a late Cortex addition acknowledges after its turn’s committed Main receipt', async () => {
+      if (!ioredisClient) {
+        console.warn('Redis not available, skipping test');
+        return;
+      }
+
+      const { GenerationJobManager } = await import('../GenerationJobManager');
+      const { createStreamServices } = await import('../createStreamServices');
+      const services = createStreamServices({
+        useRedis: true,
+        redisClient: ioredisClient,
+      });
+      GenerationJobManager.configure(services);
+      await GenerationJobManager.initialize();
+
+      const streamId = `redis-cortex-late-${Date.now()}`;
+      const job = await GenerationJobManager.createJob(
+        streamId,
+        'redis-late-owner',
+        'redis-late-conversation',
+        {
+          interactionContext: {
+            actor_kind: 'external_user',
+            origin: 'interactive',
+            surface: 'telegram',
+            conversation_id: 'redis-late-conversation',
+            revision: 1,
+            source_event_id: 'redis-late-source',
+          },
+          deliveryPolicy: { commit_authority: 'external_adapter' },
+        },
+      );
+      await GenerationJobManager.updateMetadata(streamId, {
+        responseMessageId: 'redis-late-parent',
+      });
+      const mainAcknowledgement = {
+        logical_turn_id: job.metadata.interactionContext!.logical_turn_id!,
+        revision: 1,
+        state: 'committed' as const,
+        presentation_ref: 'telegram:synthetic-chat:main-message',
+      };
+      await expect(
+        GenerationJobManager.acknowledgeDelivery(mainAcknowledgement, 'telegram'),
+      ).resolves.toMatchObject({ status: 'recorded', idempotent: false });
+
+      const additionAcknowledgement = {
+        ...mainAcknowledgement,
+        presentation_ref: 'telegram:synthetic-chat:addition-message',
+      };
+      const receipt = {
+        ownerId: 'redis-late-owner',
+        messageId: 'redis-late-follow-up',
+        parentMessageId: 'redis-late-parent',
+        revision: 1,
+        generation: 2,
+        deliveryIds: ['redis-late-delivery'],
+        deliveryReceipts: [{ deliveryId: 'redis-late-delivery', graphResultHash: 'b'.repeat(64) }],
+        claimToken: 'redis-late-claim',
+        presentationLeaseToken: 'redis-late-lease',
+      };
+      const boundPresentation = await GenerationJobManager.bindCortexPresentation(
+        streamId,
+        receipt,
+      );
+      const addition = await GenerationJobManager.acknowledgeDelivery(
+        additionAcknowledgement,
+        'telegram',
+        receipt,
+      );
+      expect(addition).toMatchObject({
+        status: 'recorded',
+        idempotent: false,
+        acknowledgement: expect.objectContaining(additionAcknowledgement),
+        presentation: { cortexPresentation: boundPresentation },
+      });
+      await expect(
+        GenerationJobManager.acknowledgeDelivery(additionAcknowledgement, 'telegram', receipt),
+      ).resolves.toMatchObject({ status: 'recorded', idempotent: true });
+      await expect(
+        GenerationJobManager.acknowledgeDelivery(
+          { ...additionAcknowledgement, presentation_ref: 'telegram:synthetic-chat:other' },
+          'telegram',
+          receipt,
+        ),
+      ).resolves.toMatchObject({ status: 'conflict' });
+      await expect(
+        GenerationJobManager.acknowledgeDelivery(additionAcknowledgement, 'telegram', {
+          ...receipt,
+          presentationLeaseToken: 'redis-late-stale-lease',
+        }),
+      ).resolves.toMatchObject({ status: 'conflict' });
+      await expect(
+        GenerationJobManager.acknowledgeDelivery(mainAcknowledgement, 'telegram'),
+      ).resolves.toMatchObject({ status: 'recorded', idempotent: true });
+      const stored = await services.jobStore.getJob(streamId);
+      expect(stored?.deliveryAcknowledgement).toMatchObject(mainAcknowledgement);
+      expect(stored?.cortexDeliveryAcknowledgement).toMatchObject(additionAcknowledgement);
       await GenerationJobManager.destroy();
     });
 

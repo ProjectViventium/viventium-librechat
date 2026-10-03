@@ -83,7 +83,7 @@ function normalizeVoiceProvider(voiceProvider) {
  * Added: 2026-07-11
  * === VIVENTIUM END === */
 const FEELING_AWARE_VOICE_EXPRESSION_RULES = [
-  '- If a <viventium_feeling_state> is present, let it remain a private cause and shape how the spoken delivery sounds as well as what you say.',
+  '- If a Viventium Feeling state capsule is present, let it remain a private cause and shape how the spoken delivery sounds as well as what you say.',
   '- For each voice-capable reply, silently appraise whether the current state and moment call for expressive or restrained delivery.',
   "- Use the state's expression tendency and the moment together for that appraisal. A strongly outward state in an emotionally meaningful or relational reply is expressive even when the draft already sounds natural; a containing state or neutral mechanical task can be restrained.",
   "- If delivery should be expressive and at least one of the selected provider's supported voice controls fits, the raw voice-capable response is incomplete unless it contains a fitting documented control. Natural wording alone does not satisfy expressive spoken delivery; use the smallest fitting control without waiting for the user to ask.",
@@ -126,6 +126,8 @@ function buildVoiceModeInstructions(voiceProvider) {
     ...FEELING_AWARE_VOICE_EXPRESSION_RULES,
     'VOICE MODE:',
     '- Respond as spoken audio. Use short sentences. No markdown, lists, or code blocks.',
+    '- Live-call responses are audio eligible by default. Set structured voice=eligible for ordinary answers and for drafts, lists, or code requests. Set voice=skip only when the user explicitly asks for text-only or silent delivery. Keep {NTA} for the existing no-response cases.',
+    '- For a written artifact, give a concise spoken summary or pointer to the complete artifact when reading it all would not help.',
     '- Do not output planning steps or tool instructions.',
     '- Do not read URLs or email addresses aloud; offer to send details instead.',
     '- Use natural language for dates/times (no raw timestamps).',

@@ -48,7 +48,7 @@ export type MCPServerDBObjectResponse = {
 
 export type MCPServersListResponse = Record<string, MCPServerDBObjectResponse>;
 
-/** Owner response to one pending native MCP request; never inferred from a Resume action. */
+/** Owner response to one pending native request; never inferred from a Resume action. */
 export type NativeWorkInputResponse = {
   version: 1;
   requestId: string;
@@ -57,12 +57,10 @@ export type NativeWorkInputResponse = {
   content?: Record<string, string | number | boolean | string[]>;
 };
 
-export type PendingNativeWorkInput = {
+type PendingNativeWorkInputBase = {
   version: 1;
   requestId: string;
   requestFingerprint: string;
-  kind: 'elicitation';
-  mcpServerName: string;
   message: string;
   mode: 'form' | 'url';
   requestedSchema?: import('@modelcontextprotocol/sdk/types.js').ElicitRequestFormParams['requestedSchema'];
@@ -71,3 +69,18 @@ export type PendingNativeWorkInput = {
   title?: string;
   state: 'pending';
 };
+
+/* === VIVENTIUM START === Native permission and MCP forms share the existing owner response UI. === VIVENTIUM END === */
+export type PendingNativeWorkInput = PendingNativeWorkInputBase &
+  (
+    | { kind: 'elicitation'; mcpServerName: string }
+    | {
+        kind: 'permission';
+        runtimeName: string;
+        mode: 'form';
+        runId: string;
+        attemptId: string;
+        sessionId: string;
+        expiresAt: string;
+      }
+  );

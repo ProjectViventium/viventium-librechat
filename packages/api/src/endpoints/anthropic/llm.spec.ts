@@ -1496,6 +1496,16 @@ describe('getLLMConfig', () => {
         },
       );
 
+      it('should preserve Opus 5.5 high effort and adaptive thinking in the native request', () => {
+        const result = getLLMConfig('test-key', {
+          modelOptions: { model: 'claude-opus-5-5', thinking: true, effort: AnthropicEffort.high },
+        });
+        expect(result.llmConfig.thinking).toEqual({ type: 'adaptive' });
+        expect(result.llmConfig.invocationKwargs?.output_config).toEqual({ effort: 'high' });
+        expect(result.llmConfig.maxTokens).not.toBe(100);
+        expect(result.llmConfig.temperature).toBeUndefined();
+      });
+
       it('should fail clearly before sending xhigh to an unsupported Anthropic model', () => {
         expect(() =>
           getLLMConfig('test-key', {

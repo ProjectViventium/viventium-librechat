@@ -29,6 +29,8 @@ const OPENAI_REASONING_MODEL_IDS_WITHOUT_SAMPLING = Object.freeze(
   new Set([
     // Runtime evidence: the configured Viventium OpenAI reasoning endpoint rejected this model bag
     // with sampling controls during background cortex execution.
+    'gpt-6.1-sol',
+    'gpt-6-sol',
     'gpt-5.4',
   ]),
 );

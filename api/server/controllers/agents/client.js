@@ -36,10 +36,12 @@ const {
   getProviderConfig,
   memoryInstructions,
   applyContextToAgent,
+  buildSavedMemoryTurnContext,
   GenerationJobManager,
   getTransactionsConfig,
   createMemoryProcessor,
   mainMessageDelivery,
+  isContextOnlyMainHistory,
   loadMemorySnapshot,
   validatePendingMemoryRecovery,
   isCurrentMemoryWriterResponse,
@@ -160,18 +162,24 @@ const {
   mainDelegationTurnTruth,
 } = require('~/server/services/viventium/GlassHiveConversationOrchestration');
 const {
-  buildTelegramReplyContextCapsule,
-} = require('~/server/services/viventium/TelegramReplyProvenanceService');
+  buildTurnReplyContextCapsules,
+} = require('~/server/services/viventium/ViventiumTurnReplyContext');
 const {
   applyMainContextAttempt,
   bindMainContextSnapshot,
   buildMainAttemptFactsForAgent,
   captureMainContextSnapshot,
   hasUnreconciledMainHistory,
+  isSchedulerTransportRow,
+  isTrustedSchedulerWake,
   mainRouteTargetForAgent,
   renderMainAttemptFactsAuthorityBlock,
   stableAuthorityDigest,
+  withReconciledHistoryAncestry,
 } = require('~/server/services/viventium/ViventiumMainContextService');
+const {
+  resolveConversationContinuity,
+} = require('~/server/services/viventium/ViventiumConversationContinuityService');
 const {
   loadAcceptedMainContext,
 } = require('~/server/services/viventium/ViventiumMainContinuityService');
@@ -245,8 +253,9 @@ function activeWorkTurnContextByteBudgetForComponents(
 }
 
 function activeWorkTurnContextByteBudget(req) {
-  const replyContext = buildTelegramReplyContextCapsule(
-    getTrustedInteractionContext(req)?.reply_context,
+  const replyContext = buildTurnReplyContextCapsules(
+    getTrustedInteractionContext(req),
+    getTrustedAdapterCapabilities(req),
   );
   return activeWorkTurnContextByteBudgetForComponents(
     buildTimeContextInstructions(req),
@@ -315,9 +324,11 @@ function combineTurnContextInstructions(
   mainContinuityContext,
   recurrenceStateContext,
   savedMemoryWriterContext,
+  conversationContinuityContext = '',
 ) {
   const ordered = [
     replyContext,
+    conversationContinuityContext,
     mainContinuityContext,
     savedMemoryWriterContext,
     recurrenceStateContext,
@@ -361,11 +372,28 @@ function combineTurnContextInstructions(
     [timeContext, sourceSelectionContext],
     [timeContext],
   ];
-  for (const candidate of candidates) {
-    const value = candidate.filter((part) => typeof part === 'string' && part.trim()).join('\n\n');
+  /* === VIVENTIUM START ===
+   * A reviewed conversation summary replaces carried source rows, so every candidate keeps it and
+   * a turn that cannot carry it fails typed instead of silently losing that source.
+   * === VIVENTIUM END === */
+  const hasConversationContinuity =
+    typeof conversationContinuityContext === 'string' && conversationContinuityContext.trim();
+  for (const candidate of [...candidates, []]) {
+    const value = [
+      ...(hasConversationContinuity ? [conversationContinuityContext] : []),
+      ...candidate,
+    ]
+      .filter((part) => typeof part === 'string' && part.trim())
+      .join('\n\n');
     if (value && Buffer.byteLength(value, 'utf8') <= MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES) {
       return value;
     }
+  }
+  if (hasConversationContinuity) {
+    const error = new Error('Prior accepted Main history cannot be carried intact.');
+    error.code = 'source_context_unavailable';
+    error.status = 413;
+    throw error;
   }
   return '';
 }
@@ -740,6 +768,10 @@ const {
   requireExactCortexInsightDeliverySettlement,
 } = require('~/server/services/viventium/CortexInsightDeliveryService');
 const {
+  releaseOwnedCompletedCortexInsights,
+  sealOwnedCompletedCortexInsights,
+} = require('~/server/services/viventium/CortexInsightOutboxService');
+const {
   consumeLocalQaCortexFault,
 } = require('~/server/services/viventium/LocalQaCortexFaultService');
 const {
@@ -799,15 +831,6 @@ const {
  * Feature: Strip internal content parts before agent formatting.
  * Purpose: Prevent provider errors from unsupported content part types (cortex, think, etc).
  */
-const INTERNAL_CONTENT_TYPES = new Set([
-  ContentTypes.CORTEX_ACTIVATION,
-  ContentTypes.CORTEX_BREWING,
-  ContentTypes.CORTEX_INSIGHT,
-  ContentTypes.AGENT_UPDATE,
-  ContentTypes.ERROR,
-  ContentTypes.THINK,
-  ContentTypes.HARNESS_ACTIVITY,
-]);
 
 const CORTEX_CONTENT_TYPES = new Set([
   ContentTypes.CORTEX_ACTIVATION,
@@ -965,6 +988,39 @@ function createCortexPersistenceCoordinator({ persistSnapshot, onError } = {}) {
   };
 }
 
+/* === VIVENTIUM START ===
+ * Fix: The Phase B owner forms its batch from the exact insights its cortices durably accepted,
+ * including one whose acceptance finished after the cortex guard reported it, never a subset.
+ * === VIVENTIUM END === */
+function mergeAcceptedCortexInsights(insightsData, accepted) {
+  const acceptedInsights = (Array.isArray(accepted) ? accepted : []).filter(
+    (item) => typeof item?.insight === 'string' && item.insight.trim() && item?.cortexId,
+  );
+  if (acceptedInsights.length === 0) return insightsData;
+  const base =
+    insightsData && typeof insightsData === 'object'
+      ? insightsData
+      : { insights: [], errors: [], mergedPrompt: '', cortexCount: 0 };
+  const current = Array.isArray(base.insights) ? base.insights : [];
+  const identity = (item) => `${String(item?.cortexId || '')}\u0000${String(item?.insight || '')}`;
+  const seen = new Set(current.map(identity));
+  const joined = acceptedInsights
+    .filter((item) => !seen.has(identity(item)))
+    .map((item) => ({
+      cortexId: item.cortexId,
+      cortexName: item.cortexName || item.cortexId,
+      insight: item.insight,
+    }));
+  if (joined.length === 0) return base;
+  const insights = [...current, ...joined];
+  return {
+    ...base,
+    insights,
+    cortexCount: insights.length,
+    mergedPrompt: formatInsightsForContext(insights),
+  };
+}
+
 function buildMergedInsightsDataFromCortexParts(cortexParts) {
   const parts = Array.isArray(cortexParts) ? cortexParts : [];
   const insights = parts
@@ -1024,8 +1080,11 @@ function buildMergedInsightsDataFromCortexParts(cortexParts) {
  */
 const {
   normalizeTextContentParts,
+  INTERNAL_CONTENT_TYPES,
+  isRuntimeOnlyAssistantMessage,
   normalizeUserMessageContent,
   normalizeTextPartsInPayload,
+  normalizeMediaTextForFormatter,
   sanitizeProviderFormattedMessages,
 } = require('~/server/services/viventium/normalizeTextContentParts');
 const {
@@ -2025,6 +2084,10 @@ function classifyCompletionErrorForLog(err) {
    * Preserve known structured classes directly so fallback policy never depends on error prose.
    * === VIVENTIUM END === */
   for (const structuredCode of [
+    'native_input_declined',
+    'native_input_expired',
+    'native_input_cancelled',
+    'native_turn_cancelled',
     'source_context_unavailable',
     'provider_quota_exhausted',
     'provider_auth_missing',
@@ -2413,6 +2476,10 @@ function shouldSuppressCompletionErrorContentPart(contentParts, err) {
 function createCompletionErrorContentPart(err) {
   const errorClass = classifyCompletionErrorForLog(err);
   const publicMessageByClass = {
+    native_input_declined: 'You declined that action. It was stopped.',
+    native_input_expired: 'The approval request expired, so that action was stopped. Please retry.',
+    native_input_cancelled: 'That action was cancelled.',
+    native_turn_cancelled: 'That action was cancelled.',
     late_stream_termination: 'The model stream ended before a response was available.',
     local_retrieval_timeout:
       'Local retrieval timed out before the model response could be completed.',
@@ -2428,7 +2495,7 @@ function createCompletionErrorContentPart(err) {
     provider_temporarily_unavailable:
       'The model provider is temporarily overloaded. Please try again shortly.',
     host_capacity:
-      'Local AI capacity is busy. Interactive work has priority; retry after the indicated delay.',
+      'Local AI capacity is busy. Please try again shortly.',
     provider_auth_missing:
       'The configured model provider authentication is unavailable. Reconnect it, then try again.',
     provider_connected_account_reconnect_required: getPublicConnectedAccountReconnectMessage(err),
@@ -2438,7 +2505,7 @@ function createCompletionErrorContentPart(err) {
     conversation_capability_grant_required:
       'This turn needs a fresh connected-tool authorization. Retry the turn to continue.',
     conversation_session_authority_conflict:
-      'A conflicting background request was stopped without interrupting the active response.',
+      'This conversation was still finishing an earlier reply, so this request did not start.',
     source_context_unavailable:
       'The conversation context could not be preserved. Please retry this turn.',
     completion_error: 'The model provider could not complete this request.',
@@ -2605,8 +2672,7 @@ function handleCompletionErrorContentPart({ contentParts, err, abortController, 
   }
   const errorClass = classifyCompletionErrorForLog(err);
   log.error(
-    `[api/server/controllers/agents/client.js #sendCompletion] Completion failed class=${errorClass}`,
-    sanitizeCompletionErrorForLog(err),
+    `[api/server/controllers/agents/client.js #sendCompletion] Completion failed class=${errorClass} ${JSON.stringify(sanitizeCompletionErrorForLog(err))}`,
   );
   if (errorClass === 'completion_error') {
     log.error(
@@ -2938,6 +3004,24 @@ async function hasDurableEffectFallbackLock(req) {
     });
     /* === VIVENTIUM END === */
     return true;
+  }
+}
+
+/* === VIVENTIUM START ===
+ * Feature: Current-revision fallback fence.
+ * Purpose: Only the current logical-turn revision may start a fallback model run. The durable job
+ * status is the same typed fence Phase B uses; unreadable state keeps the existing fallback path.
+ * === VIVENTIUM END === */
+async function isResumableRevisionSuperseded(req) {
+  const streamId = String(req?.body?.streamId || req?._resumableStreamId || '').trim();
+  if (!streamId) {
+    return false;
+  }
+  try {
+    const job = await GenerationJobManager.getJob(streamId);
+    return (job?.metadata ?? job)?.status === 'superseded' || job?.status === 'superseded';
+  } catch {
+    return false;
   }
 }
 
@@ -3305,7 +3389,14 @@ function voiceProviderTraceRoute(req, agent, { isFallback = false, fallbackReaso
   const direct = mainRouteTargetForAgent(agent) || {};
   const provider = String(attemptFacts?.provider || direct.provider || '').trim();
   const model = String(attemptFacts?.model || direct.model || '').trim();
-  return provider && model ? { provider, model } : null;
+  const receipt = req?._viventiumProviderModelReceipts?.get(agent?.id);
+  const actualModel = receipt?.requestedModel === model ? receipt.model : model;
+  const reasoningEffort = agent?.model_parameters?.reasoning_effort ||
+    agent?.model_parameters?.reasoningEffort;
+  return provider && model ? {
+    provider, model: actualModel, requestedModel: model,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+  } : null;
 }
 
 function voiceProviderFailureStatus(error, fallbackReason = '') {
@@ -3377,6 +3468,8 @@ async function recordCompletedVoiceProviderTrace({
     attemptNumber: attemptRole === 'fallback' ? 2 : 1,
     provider: route.provider,
     model: route.model,
+    requestedModel: route.requestedModel,
+    ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
     providerStatus: 'completed',
     attemptRole,
     ...(snapshotHash ? { contextSnapshotHash: snapshotHash } : {}),
@@ -3430,11 +3523,38 @@ async function recordCompletedVoiceProviderTrace({
  */
 const {
   isFallbackReplaySafeToolMetadata,
+  isGraphCoordinationToolMetadata,
 } = require('~/server/services/viventium/toolEffectMetadata');
 
 function shouldLockFallbackForToolStart(callbackArgs = []) {
   const callbackMetadata = callbackArgs[5];
   return !isFallbackReplaySafeToolMetadata(callbackMetadata);
+}
+
+/* === VIVENTIUM START ===
+ * Fix: a harness-executed Main that handed off through the graph already authored this turn, and
+ * the host accepted that native input on completion. Replaying Main through the outer fallback
+ * would be a second author the host refuses, so the participant's own failure is preserved.
+ * === VIVENTIUM END === */
+/* === VIVENTIUM START ===
+ * Fix: the primary Main route binds its exact native response identity, waits for any superseded
+ * Main operation of its logical turn to release, and anchors its deadline. Participants and
+ * non-native routes pass through unchanged inside the wrapper.
+ * === VIVENTIUM END === */
+function primaryNativeResponseFetch(req, primaryAgentId) {
+  return (baseFetch, route) =>
+    require('~/server/services/viventium/nativeResponseService').wrapNativeResponseFetch(
+      req,
+      primaryAgentId,
+      baseFetch,
+      route,
+    );
+}
+
+function isHostAcceptedNativeHandoff(req) {
+  return (
+    req?._viventiumHarnessExecutionEnabled === true && req?._viventiumGraphHandoffStarted === true
+  );
 }
 /* === VIVENTIUM END === */
 
@@ -3689,6 +3809,7 @@ function buildViventiumMcpRequestBody({
     viventiumTelegramChatId: req?.body?.telegramChatId,
     viventiumTelegramUserId: req?.body?.telegramUserId,
     viventiumTelegramMessageId: req?.body?.telegramMessageId,
+    viventiumTelegramMessageThreadId: req?.body?.externalThreadId,
     telegramAudioRequested: req?.body?.telegramAudioRequested === true,
     ...(schedulerOwned
       ? {
@@ -3705,7 +3826,10 @@ function buildViventiumMcpRequestBody({
     viventiumAuthoringSourceEventId: interactionContext?.source_event_id,
     viventiumAuthoringSourceRevision: interactionContext?.revision,
     viventiumAuthoringSurface: interactionContext?.surface,
-    viventiumTriggeringSourceSegments: sourceSegments,
+    // The native delegation contract carries source text only; quotes reach Main per turn.
+    viventiumTriggeringSourceSegments: sourceSegments.map(
+      ({ reply_context: _replyContext, ...segment }) => segment,
+    ),
     viventiumTriggeringSourceSegmentsOverflowCount:
       interactionContext?.source_segments_overflow_count,
     viventiumLogicalTurnId: interactionContext?.logical_turn_id,
@@ -4382,14 +4506,48 @@ class AgentClient extends BaseClient {
       logDeepTiming(req, 'build_messages_start', null, `count=${messages?.length ?? 0}`);
     }
     /** Always pass mapMethod; getMessagesForConversation applies it only to messages with addedConvo flag */
-    const orderedMessages = this.constructor.getMessagesForConversation({
+    /* === VIVENTIUM START === A trusted scheduler wake omits scheduler transport rows by type. === */
+    const trustedSchedulerWake = isTrustedSchedulerWake(req);
+    /* === VIVENTIUM END === */
+    let orderedMessages = this.constructor.getMessagesForConversation({
       messages,
       parentMessageId,
       summary: this.shouldSummarize,
       mapMethod: createMultiAgentMapper(this.options.agent, this.agentConfigs),
       mapCondition: (message) => message.addedConvo === true,
-      skipCondition: isListenOnlyTranscriptMessage,
+      skipCondition: (message) =>
+        isListenOnlyTranscriptMessage(message) ||
+        isRuntimeOnlyAssistantMessage(message) ||
+        (trustedSchedulerWake && isSchedulerTransportRow(message)),
     });
+    /* === VIVENTIUM START ===
+     * Feature: Conversation legacy continuity.
+     * Purpose: When unstamped legacy history cannot fit the protected carrier, its oldest
+     * whole-turn prefix is carried as an exact reviewed summary and the newer rows intact.
+     * === VIVENTIUM END === */
+    this._viventiumConversationContinuityCapsule = '';
+    // The compactor runs isolated on a background response, never on this turn's live stream.
+    const conversationContinuity = await resolveConversationContinuity({
+      req,
+      agent: this.options.agent,
+      ownerId: String(req?.user?.id || '').trim(),
+      conversationId: String(this.conversationId || req?.body?.conversationId || '').trim(),
+      orderedMessages,
+    }).catch((error) => {
+      logger.warn('[AgentClient] Conversation legacy continuity unavailable', {
+        code: String(error?.code || error?.name || 'conversation_continuity_failed').slice(0, 120),
+      });
+      return null;
+    });
+    if (conversationContinuity) {
+      orderedMessages = conversationContinuity.messages;
+      this._viventiumConversationContinuityCapsule = conversationContinuity.capsule;
+      this._viventiumHistoryAncestryV1 = withReconciledHistoryAncestry(
+        this._viventiumHistoryAncestryV1,
+        conversationContinuity.coveredIds,
+        orderedMessages,
+      );
+    }
     this.memoryWriterSourceMessageIds = orderedMessages
       .map((message) => message.messageId)
       .filter(Boolean);
@@ -4618,7 +4776,7 @@ class AgentClient extends BaseClient {
 
     const formattedMessages = orderedMessages.map((message, i) => {
       const formattedMessage = formatMessage({
-        message: normalizeUserMessageContent(message),
+        message: normalizeMediaTextForFormatter(normalizeUserMessageContent(message)),
         userName: this.options?.name,
         assistantName: this.options?.modelLabel,
       });
@@ -5828,6 +5986,12 @@ class AgentClient extends BaseClient {
       }
     };
     this.pendingMemoryWriterAdmission = async () => {
+      /* === VIVENTIUM START ===
+       * Fix: truthful admission outcome. Only an attempted admission can leave an accepted write
+       * whose result is unknown; a failure while preparing it means nothing was admitted.
+       */
+      let admissionAttempted = false;
+      /* === VIVENTIUM END === */
       try {
         // This seam runs after the canonical response is saved and the controller checks its job.
         // Capture that response now; the earlier frozen input cannot contain its result.
@@ -5895,6 +6059,7 @@ class AgentClient extends BaseClient {
             agentDigest: await memoryWriterAgentDigest(req),
           },
         };
+        admissionAttempted = true;
         const admitted = await db.admitMemoryWrite({
           ...writerContext.memoryWriteIdentity,
           conversationId: writerContext.conversationId,
@@ -5940,8 +6105,21 @@ class AgentClient extends BaseClient {
           });
         return true;
       } catch (error) {
-        logger.warn('[AgentClient] Saved-memory admission failed', { name: error?.name });
-        await reportAdmissionFailure(true);
+        const reason =
+          typeof error?.code === 'string'
+            ? error.code
+            : /^[a-z][a-z0-9_]{2,80}$/.test(String(error?.message || ''))
+              ? error.message
+              : undefined;
+        const failure = {
+          name: error?.name,
+          stage: admissionAttempted ? 'admission' : 'preparation',
+          ...(reason ? { reason: reason.slice(0, 80) } : {}),
+        };
+        /* VIVENTIUM: a preparation failure leaves no writer record, so its typed stage and reason
+         * go in the message text, which every log transport keeps. */
+        logger.warn(`[AgentClient] Saved-memory admission failed ${JSON.stringify(failure)}`);
+        await reportAdmissionFailure(admissionAttempted);
         finish();
         return false;
       }
@@ -5958,10 +6136,17 @@ class AgentClient extends BaseClient {
    * assistant row. The writer must not publish a lifecycle receipt for a message that failed or
    * was suppressed during authoritative persistence.
    */
-  startDeferredMemoryWriter() {
+  // Capture the existing writer while request resources are live. External delivery may only
+  // admit it after the canonical presentation acknowledgement has closed its source.
+  prepareDeferredMemoryWriter() {
     const messages = this.deferredMemoryWriterMessages;
     this.deferredMemoryWriterMessages = null;
     if (messages) this.scheduleMemoryWriter(messages);
+    return typeof this.pendingMemoryWriterAdmission === 'function';
+  }
+
+  startDeferredMemoryWriter() {
+    this.prepareDeferredMemoryWriter();
     return this.admitMemoryWriter();
   }
 
@@ -5989,9 +6174,9 @@ class AgentClient extends BaseClient {
       return this.feelingsReactionPromise;
     }
     const stimulusId = String(
-      req?.body?.messageId ||
+      this.parentMessageId ||
+        req?.body?.messageId ||
         req?.body?.userMessageId ||
-        req?.body?.parentMessageId ||
         this.responseMessageId ||
         'turn',
     );
@@ -6000,6 +6185,7 @@ class AgentClient extends BaseClient {
       userText,
       stimulusId,
       scheduledSnapshot: snapshot,
+      nativeWorkspace: this.options?.agent?.glasshive_options?.workspace,
     })
       .catch((error) => {
         logFeelingsEvent(
@@ -6086,7 +6272,16 @@ class AgentClient extends BaseClient {
         (!harnessInvocationLocked ||
           (this.options.req?._viventiumToolInvocationStarted !== true && !visibleAssistantText))
       ) {
-        harnessInvocationLocked = await hasDurableEffectFallbackLock(this.options.req);
+        harnessInvocationLocked =
+          isHostAcceptedNativeHandoff(this.options.req) ||
+          (await hasDurableEffectFallbackLock(this.options.req));
+        /* === VIVENTIUM START ===
+         * Fix: a revision already replaced by newer input never starts another model run; the
+         * surviving revision answers every retained input instead.
+         * === VIVENTIUM END === */
+        if (!harnessInvocationLocked && (await isResumableRevisionSuperseded(this.options.req))) {
+          harnessInvocationLocked = true;
+        }
       }
       if (
         !fallbackAborted &&
@@ -6168,6 +6363,7 @@ class AgentClient extends BaseClient {
             fallbackReq._viventiumFallbackLlmAttempt = true;
             fallbackReq._viventiumFallbackReason = fallbackReason;
             fallbackReq._viventiumHarnessInvocationStarted = false;
+            fallbackReq._viventiumGraphHandoffStarted = false;
             /* === VIVENTIUM START ===
              * Feature: Fallback graph-family identity and Stop parity.
              * Purpose: Replace workspace-bound identity on workspace fallbacks, while preserving
@@ -6353,6 +6549,13 @@ class AgentClient extends BaseClient {
     if (graphFallbackRecoveryReceipt && hasVisibleAssistantText(this.contentParts)) {
       insertFallbackRecoveryNotice(this.contentParts, graphFallbackRecoveryReceipt);
     }
+    const participantReconnectRecovery = this.options.req?._viventiumParticipantReconnectRecovery;
+    if (participantReconnectRecovery && hasVisibleAssistantText(this.contentParts)) {
+      insertFallbackRecoveryNotice(this.contentParts, {
+        ...participantReconnectRecovery,
+        reconnectRequired: true,
+      });
+    }
     if (hasVisibleAssistantText(this.contentParts)) {
       if (providerTraceFallbackCompletion) {
         await recordCompletedVoiceProviderTrace({
@@ -6522,6 +6725,21 @@ class AgentClient extends BaseClient {
    * - Attach the DB/follow-up pipeline as soon as Phase B exists, then wait for
    *   the final primary-or-fallback answer before follow-up synthesis.
    * === VIVENTIUM END === */
+  /* === VIVENTIUM START ===
+   * Fix: A per-turn-header Main (native GlassHive) keeps current memory out of its stable authority,
+   * so the request-pinned saved-memory snapshot, with its explicit availability status, is delivered
+   * in the per-turn developer tail. #116 dropped this snapshot, and Main then answered without the
+   * user's saved facts. Other providers already carry memory in their shared run context.
+   * === VIVENTIUM END === */
+  savedMemoryTailForAgent(agentId) {
+    if (this.options?.req?.viventiumTimeContextDelivery !== 'per_turn_header') return '';
+    if (!agentId || agentId !== this.options?.agent?.id) return '';
+    return buildSavedMemoryTurnContext(
+      this.memoryReadAvailability,
+      this.memoryReadAvailability === 'available' ? this.glasshiveWorkerMemory || '' : '',
+    );
+  }
+
   attachBackgroundCortexCompletionPipeline({
     cortexExecutionPromise,
     pendingCortexParts,
@@ -6628,6 +6846,23 @@ class AgentClient extends BaseClient {
             sanitizeCompletionErrorForLog(err),
           );
         });
+
+        /* === VIVENTIUM START ===
+         * Fix: Seal this parent's accepted set before any delivery claim. Acceptances already
+         * writing complete and join it, later producers are refused with a typed reason, and the
+         * batch carries every accepted insight instead of stranding a late one.
+         * === VIVENTIUM END === */
+        const acceptedInsights = await sealOwnedCompletedCortexInsights({
+          ownerId: req?.user?.id,
+          parentMessageId: responseMessageId,
+        }).catch((err) => {
+          logger.warn(
+            '[AgentClient] Phase B accepted-set seal failed',
+            sanitizeCompletionErrorForLog(err),
+          );
+          return [];
+        });
+        mergedInsightsData = mergeAcceptedCortexInsights(mergedInsightsData, acceptedInsights);
 
         if (await isPhaseBOwnerSuperseded()) {
           logger.info('[AgentClient] Suppressing Phase B for superseded logical-turn revision');
@@ -7054,6 +7289,34 @@ class AgentClient extends BaseClient {
                 presentationFence.claims,
                 settledPresentations,
               );
+              /* === VIVENTIUM START ===
+               * Fix: Each required surface has its own delivery owner. This emit presents Web; a
+               * subscriber receipt cannot show whether any listener can present another surface
+               * (a Web tab and the bot look alike), and holding the lease let it expire into
+               * delivery_outcome_unknown (S0215). Every still-unpresented required surface goes to
+               * its durable dispatcher now, which authorizes and acknowledges under its own lease.
+               * === VIVENTIUM END === */
+              const awaitsDurableSurface = settledPresentations.some(
+                (row) =>
+                  row?.status === 'claimed' &&
+                  (row.requiredSurfaces || []).some(
+                    (item) => !(row.presentedSurfaces || []).includes(item),
+                  ),
+              );
+              if (awaitsDurableSurface) {
+                try {
+                  await markCortexInsightDeliveryBatchFailed({
+                    ownerId: String(req?.user?.id || '').trim(),
+                    claims: presentationFence.claims,
+                    reason: 'presentation_failed',
+                  });
+                } catch (handoverErr) {
+                  logger.warn(
+                    '[AgentClient] Cortex follow-up durable surface handover failed',
+                    sanitizeCompletionErrorForLog(handoverErr),
+                  );
+                }
+              }
             } catch (err) {
               if (Array.isArray(presentationFence?.claims) && presentationFence.claims.length > 0) {
                 await markCortexInsightDeliveryBatchFailed({
@@ -7082,7 +7345,23 @@ class AgentClient extends BaseClient {
           '[AgentClient] Phase B background completion pipeline failed',
           sanitizeCompletionErrorForLog(err),
         );
-      });
+      })
+      /* === VIVENTIUM START ===
+       * Feature: Phase B owner release.
+       * Purpose: Insights this owner accepted but did not settle into the parent's ledger batch, for
+       * example after a failed follow-up, become one grouped replay batch now instead of at lease end.
+       * === VIVENTIUM END === */
+      .finally(() =>
+        releaseOwnedCompletedCortexInsights({
+          ownerId: req?.user?.id,
+          parentMessageId: responseMessageId,
+        }).catch((err) => {
+          logger.warn(
+            '[AgentClient] Phase B owned insight release failed',
+            sanitizeCompletionErrorForLog(err),
+          );
+        }),
+      );
 
     return this._phaseBPromise;
   }
@@ -7315,7 +7594,10 @@ class AgentClient extends BaseClient {
        * === VIVENTIUM END === */
       const telegramReplyContext = replaysPinnedMainContext
         ? ''
-        : buildTelegramReplyContextCapsule(trustedInteractionContext?.reply_context);
+        : buildTurnReplyContextCapsules(
+            trustedInteractionContext,
+            getTrustedAdapterCapabilities(this.options.req),
+          );
       if (telegramReplyContext) {
         surfacePromptLayers.telegram_reply_context = telegramReplyContext;
       }
@@ -7503,6 +7785,7 @@ class AgentClient extends BaseClient {
         acceptedMainContextInstructions,
         recurrenceStateInstructions,
         savedMemoryWriterTurnContext,
+        replaysPinnedMainContext ? '' : this._viventiumConversationContinuityCapsule || '',
       );
       if (turnContextInstructions) {
         surfacePromptLayers.time_context = timeContextInstructions;
@@ -7655,6 +7938,22 @@ class AgentClient extends BaseClient {
         !suppressBackgroundCortices &&
         !wingModeActive &&
         this.options.agent.background_cortices?.length > 0;
+      /* === VIVENTIUM START === Explicitly account for configured cortices skipped by surface policy. === */
+      if (!hasBackgroundCortices) {
+        for (const cortex of this.options.agent.background_cortices || []) {
+          void recordVoiceClientTrace(req, {
+            stage: 'cortex.activation.completed',
+            eventRef: `activation:${this.responseMessageId}:${cortex.agent_id}`,
+            facts: {
+              responseRef: this.responseMessageId,
+              cortexRef: cortex.agent_id,
+              cortexStatus: wingModeActive ? 'wing_mode'
+                : suppressBackgroundCortices ? 'insight_delivery' : 'budget_disabled',
+            },
+          });
+        }
+      }
+      /* === VIVENTIUM END === */
       if (voiceLatencyEnabled) {
         const cortexCount = Array.isArray(this.options.agent.background_cortices)
           ? this.options.agent.background_cortices.length
@@ -8518,9 +8817,11 @@ class AgentClient extends BaseClient {
             agentId: agent.id,
             primaryAgentId: this.options.agent.id,
           });
-          const dynamicTail = buildViventiumDynamicTail({ capsule });
+          const memory = this.savedMemoryTailForAgent(agent.id);
+          const dynamicTail = buildViventiumDynamicTail({ memory, capsule });
           agent.instructions = pinViventiumDynamicTailLast({
             instructions: agent.instructions || '',
+            memory,
             capsule,
           });
           bindConversationProviderDeveloperInstructionTail({
@@ -8566,7 +8867,9 @@ class AgentClient extends BaseClient {
             historyAncestry: this._viventiumHistoryAncestryV1,
             protectUnreconciledHistory:
               (acceptedMainContext.status === 'empty' &&
-                this._viventiumVisibleMessagesV1?.length > 1) ||
+                this._viventiumVisibleMessagesV1
+                  ?.slice(0, -1)
+                  .some((message) => !isContextOnlyMainHistory(message))) ||
               this._viventiumHistoryAncestryV1?.hasUnreconciledSource === true ||
               hasUnreconciledMainHistory(this._viventiumVisibleMessagesV1),
             sections: {
@@ -8579,6 +8882,8 @@ class AgentClient extends BaseClient {
               }),
               mainContinuity: acceptedMainContextInstructions,
               recurrenceState: recurrenceStateInstructions,
+              savedMemory: this.savedMemoryTailForAgent(agents[0]?.id),
+              conversationContinuity: this._viventiumConversationContinuityCapsule || '',
             },
             routeFacts: {
               configuredPath: [surface || 'web', 'librechat'],
@@ -8651,13 +8956,15 @@ class AgentClient extends BaseClient {
             agentId: agent?.id,
             primaryAgentId: this.options.agent.id,
           });
+          const memory = this.savedMemoryTailForAgent(agent?.id);
           agent.instructions = pinViventiumDynamicTailLast({
             instructions: agent.instructions || '',
+            memory,
             capsule,
           });
           bindConversationProviderDeveloperInstructionTail({
             targetAgent: agent,
-            tail: buildViventiumDynamicTail({ capsule }),
+            tail: buildViventiumDynamicTail({ memory, capsule }),
           });
         }
         const finalFeelingCapsule = feelingTailForAgent({
@@ -8766,6 +9073,7 @@ class AgentClient extends BaseClient {
         run = await createRun({
           agents,
           indexTokenCountMap,
+          nativeResponseFetch: primaryNativeResponseFetch(req, this.options.agent.id),
           runId: this.responseMessageId,
           signal: activeRunSignal,
           customHandlers: this.options.eventHandlers,
@@ -8864,6 +9172,9 @@ class AgentClient extends BaseClient {
                  * === VIVENTIUM END === */
                 if (req && shouldLockFallbackForToolStart(callbackArgs)) {
                   req._viventiumToolInvocationStarted = true;
+                }
+                if (req && isGraphCoordinationToolMetadata(callbackArgs[5])) {
+                  req._viventiumGraphHandoffStarted = true;
                 }
                 if (!voiceLatencyEnabled) {
                   return;
@@ -10350,6 +10661,7 @@ module.exports.buildUntrustedAmbientVoiceContextInstructions =
   buildUntrustedAmbientVoiceContextInstructions;
 module.exports.stripInternalContentParts = stripInternalContentParts;
 module.exports.buildViventiumMcpRequestBody = buildViventiumMcpRequestBody;
+module.exports.buildTurnReplyContextCapsules = buildTurnReplyContextCapsules;
 module.exports.isLateStreamTerminationError = isLateStreamTerminationError;
 module.exports.hasRuntimeHoldAssistantText = hasRuntimeHoldAssistantText;
 module.exports.shouldSuppressCompletionErrorContentPart = shouldSuppressCompletionErrorContentPart;
@@ -10395,6 +10707,7 @@ module.exports.finalizeHarnessActivityPartsForPersistence =
 module.exports.mergeCapturedHarnessActivityParts = mergeCapturedHarnessActivityParts;
 module.exports.isHarnessInvocationLocked = isHarnessInvocationLocked;
 module.exports.shouldLockFallbackForToolStart = shouldLockFallbackForToolStart;
+module.exports.primaryNativeResponseFetch = primaryNativeResponseFetch;
 module.exports.isCancelledVoiceTask = isCancelledVoiceTask;
 module.exports.startActiveWorkTurnContext = startActiveWorkTurnContext;
 module.exports.resolveActiveWorkTurnContext = resolveActiveWorkTurnContext;

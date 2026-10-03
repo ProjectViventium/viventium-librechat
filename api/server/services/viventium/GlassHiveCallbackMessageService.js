@@ -71,6 +71,7 @@ function toPublicCallback(message) {
     messageId: message?.messageId,
     callbackId: metadata.callbackId || null,
     text: textOf(message),
+    attachments: Array.isArray(message?.attachments) ? message.attachments : [],
     event: metadata.event || null,
     surface: metadata.surface || null,
     deliverable: metadata.deliverable || null,

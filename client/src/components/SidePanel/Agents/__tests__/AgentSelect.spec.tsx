@@ -81,6 +81,38 @@ jest.mock('~/data-provider', () => ({
 import AgentSelect from '../AgentSelect';
 
 describe('AgentSelect', () => {
+  it('keeps explicitly cleared optional routes when reloading the form', async () => {
+    const agent = {
+      id: 'agent_cleared',
+      name: 'Cleared routes',
+      provider: 'glasshive-harness',
+      model: 'grok-build:grok-4.7',
+      tools: [],
+      fallback_llm_provider: null,
+      fallback_llm_model: null,
+      fallback_llm_model_parameters: {},
+      voice_fallback_llm_provider: null,
+      voice_fallback_llm_model: null,
+      voice_fallback_llm_model_parameters: {},
+    };
+    render(
+      <AgentSelect
+        agentQuery={{ data: agent, isSuccess: true } as any}
+        selectedAgentId={null}
+        setCurrentAgentId={jest.fn()}
+        createMutation={{ reset: jest.fn() } as any}
+        providerCapabilities={{}}
+      />,
+    );
+    await waitFor(() => expect(mockReset).toHaveBeenCalledTimes(1));
+    expect(mockReset.mock.calls[0][0]).toMatchObject({
+      fallback_llm_provider: null,
+      fallback_llm_model: null,
+      voice_fallback_llm_provider: null,
+      voice_fallback_llm_model: null,
+    });
+  });
+
   beforeEach(() => {
     mockReset.mockReset();
   });

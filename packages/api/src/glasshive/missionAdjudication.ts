@@ -19,6 +19,8 @@ import type { GlassHiveNativeMedia } from './nativeMedia';
 import { normalizeGlassHiveRunInput } from './missionInput';
 import type { GlassHiveRunInput } from './missionInput';
 import { evidenceId, legacyEvidenceId } from './missionEvidenceIdentity';
+import { normalizeNativeCallbackOutputFiles } from './nativeOutputFiles';
+import type { NativeCallbackOutputFiles, NativeOutputDeliveryAttachment } from './nativeOutputFiles';
 
 import type { Logger } from 'winston';
 import type { ClientSession, Model } from 'mongoose';
@@ -72,6 +74,8 @@ export interface GlassHiveMissionBinding {
   anchorMessageId?: string;
   workRef?: string;
   mainAgentId?: string;
+  runId?: string;
+  attemptId?: string;
   destinations?: readonly GlassHiveMissionDestination[];
   traceIdentity?: GlassHiveMissionTraceIdentity;
 }
@@ -82,6 +86,8 @@ export interface GlassHiveMissionCallbackBody {
   work_ref?: string;
   worker_id?: string;
   run_id?: string;
+  attempt_id?: string;
+  output_files?: unknown;
   event?: string;
   callback_ts?: string;
   work_state?: string;
@@ -120,6 +126,7 @@ export interface GlassHiveMissionEvidence {
   workRef: string;
   workerId: string;
   runId: string;
+  attemptId?: string;
   event: string;
   workState: string;
   workTerminal: boolean;
@@ -132,6 +139,7 @@ export interface GlassHiveMissionEvidence {
   evidence: string;
   nativeMedia?: GlassHiveNativeMedia;
   runInput?: GlassHiveRunInput;
+  outputFiles?: NativeCallbackOutputFiles;
   state: string;
   attempts: number;
   createdAt: Date;
@@ -237,6 +245,11 @@ export interface GlassHiveMissionAdjudicationDependencies {
     input: object,
     prepared: RuntimeRecord,
   ) => Promise<MissionFollowUp>;
+  prepareMissionOutputFiles?: (input: {
+    req: RuntimeRecord;
+    rows: RuntimeRecord[];
+    message: RuntimeRecord;
+  }) => Promise<NativeOutputDeliveryAttachment[]>;
   isGlassHiveWorkTerminalCallback: (body: GlassHiveMissionCallbackBody) => boolean;
   recordGlassHiveAdjudicationOutcome: (input: object) => Promise<object | null>;
   recordOrchestrationTraceDelivery: (input: object) => Promise<object | null>;
@@ -268,6 +281,7 @@ export function createGlassHiveMissionAdjudicationService(
     getAppConfig,
     prepareCortexFollowUpMessage,
     persistPreparedCortexFollowUpMessage,
+    prepareMissionOutputFiles,
     isGlassHiveWorkTerminalCallback,
     recordGlassHiveAdjudicationOutcome,
     recordOrchestrationTraceDelivery,
@@ -487,6 +501,19 @@ async function persistGlassHiveMissionEvidence({
     workTerminal: body.work_terminal === true,
   } as RuntimeRecord);
   const callbackReference = terminalCallbackReference(effectFence);
+  const outputFiles = body.output_files == null ? undefined : normalizeNativeCallbackOutputFiles(
+    body.output_files,
+    {
+      ownerId,
+      originRef,
+      workRef: safeText(binding?.workRef, 160),
+      runId: safeText(binding?.runId, 160),
+      attemptId: safeText(binding?.attemptId, 160),
+      callbackId: callbackReference?.callbackId || '',
+      resultRevision: callbackReference?.resultRevision || 0,
+      resultDigest: callbackReference?.resultDigest || '',
+    },
+  );
   const nativeMedia = normalizeGlassHiveNativeMedia(body.native_media, safeText(body.run_id, 160));
   const runInput = normalizeGlassHiveRunInput(body.run_input, safeText(body.run_id, 160));
   const row: GlassHiveMissionEvidence = {
@@ -496,6 +523,7 @@ async function persistGlassHiveMissionEvidence({
     workRef: safeText(binding?.workRef || body.work_ref, 160),
     workerId: safeText(body.worker_id, 160),
     runId: safeText(body.run_id, 160),
+    ...(outputFiles ? { attemptId: outputFiles.attempt_id, outputFiles } : {}),
     event: safeText(body.event, 64),
     workState: safeText(body.work_state, 32),
     workTerminal: body.work_terminal === true,
@@ -1131,7 +1159,15 @@ function groupFollowUpInput(
     insightsData: {
       insights: rows.map((row) => ({
         cortexName: 'Mission evidence',
-        insight: row.evidence,
+        insight: row.outputFiles ? `${JSON.stringify({
+          output_files: {
+            count: row.outputFiles.files.length,
+            files: row.outputFiles.files.map((file: NativeCallbackOutputFiles['files'][number]) => ({
+              filename: file.filename, mime_type: file.mime_type, bytes: file.bytes,
+            })),
+            rejected: row.outputFiles.rejected || [],
+          },
+        })}\n\n${row.evidence}` : row.evidence,
         ...(row.nativeMedia ? { nativeMedia: row.nativeMedia } : {}),
         ...(row.runInput ? { runInput: row.runInput } : {}),
         maxPromptChars: 12_000,
@@ -1167,7 +1203,16 @@ async function persistPreparedGroupSynthesis(
   prepared: RuntimeRecord,
 ): Promise<RuntimeRecord> {
   const followUp = await persistPreparedCortexFollowUpMessage(
-    groupFollowUpInput(rows, context),
+    {
+      ...groupFollowUpInput(rows, context),
+      dependencies: {
+        prepareAttachments: async (message: RuntimeRecord) => {
+          if (!rows.some((row) => row.outputFiles)) return [];
+          if (!prepareMissionOutputFiles) throw new Error('native_output_file_storage_unavailable');
+          return prepareMissionOutputFiles({ req: context.authorContext.req, rows, message });
+        },
+      },
+    },
     prepared,
   );
   if (followUp?.messageId) {
@@ -1337,7 +1382,7 @@ async function reconcilePersistedGroupFollowUp(
     row.followUpText = text;
     row.authoredAt = authoredAt;
   }
-  return { messageId, text };
+  return { ...persistedMessage, messageId, text };
 }
 
 async function persistAuthoredFollowUp(

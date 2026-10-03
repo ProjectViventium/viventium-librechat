@@ -1,6 +1,7 @@
 'use strict';
 
 const {
+  attachEffectiveDeliveryDisposition,
   captureFinalModelDeliveryDisposition,
   getDeliveryDispositionCapture,
   inspectProviderDeliveryDisposition,
@@ -52,6 +53,27 @@ const streamOutput = (disposition) => ({
 });
 
 describe('structured messaging delivery disposition', () => {
+  it.each([true, false])(
+    'captures voice disposition only for authenticated audio requests: %s',
+    (authenticated) => {
+      const req = capableTelegramRequest();
+      delete req._viventiumTelegram;
+      req.body = { voiceMode: true, viventiumSurface: 'voice' };
+      if (authenticated) req.viventiumCallSession = { callSessionId: 'synthetic-call' };
+      captureFinalModelDeliveryDisposition({
+        req,
+        output: streamOutput(modelDisposition('skip')),
+        capabilityOwner: 'harness',
+      });
+      expect(getDeliveryDispositionCapture(req)).toEqual(
+        authenticated
+          ? { status: 'valid', disposition: modelDisposition('skip') }
+          : { status: 'missing' },
+      );
+      expect(req._viventiumDeliveryDispositionRequired).toBe(authenticated ? true : undefined);
+    },
+  );
+
   it('accepts the exact versioned non-streaming and streaming provider contracts', () => {
     const nonStreaming = inspectProviderDeliveryDisposition({
       choices: [
@@ -193,11 +215,11 @@ describe('structured messaging delivery disposition', () => {
       capabilityOwner: 'legacy',
     });
 
-    expect(req._viventiumDeliveryDispositionRequired).toBeUndefined();
+    expect(req._viventiumDeliveryDispositionRequired).toBe(false);
     expect(getDeliveryDispositionCapture(req)).toEqual({ status: 'missing' });
   });
 
-  it('invalidates an earlier required capture when the final non-tool provider is not capable', () => {
+  it('clears an earlier required capture when the final non-tool provider is not capable', () => {
     const req = capableTelegramRequest();
 
     captureFinalModelDeliveryDisposition({
@@ -216,8 +238,10 @@ describe('structured messaging delivery disposition', () => {
       capabilityOwner: 'legacy',
     });
 
-    expect(req._viventiumDeliveryDispositionRequired).toBe(true);
+    expect(req._viventiumDeliveryDispositionRequired).toBe(false);
     expect(getDeliveryDispositionCapture(req)).toEqual({ status: 'missing' });
+    expect(attachEffectiveDeliveryDisposition(req, { text: 'Final answer from a legacy provider.' }))
+      .toEqual({ text: 'Final answer from a legacy provider.' });
   });
 
   it('applies legacy, structured, and fail-closed precedence without intent inference', () => {

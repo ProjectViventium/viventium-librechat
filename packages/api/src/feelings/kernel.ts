@@ -450,5 +450,6 @@ export function hashFeelingSnapshot({
       FEELING_LEVEL_IDS.map((levelId) => normalizedOverrides[definition.id]?.[levelId] ?? ''),
     ]),
   });
-  return createHash('sha256').update(canonical).digest('hex').slice(0, 16);
+  // VIVENTIUM: Delivery receipts and native projections require the complete SHA-256 identity.
+  return createHash('sha256').update(canonical).digest('hex');
 }

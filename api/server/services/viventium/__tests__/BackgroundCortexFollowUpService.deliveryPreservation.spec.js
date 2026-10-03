@@ -484,10 +484,14 @@ test('promoting a new completed result invalidates an older delivery acknowledge
     messageId: 'parent-promoted',
     parentMessageId: 'user-parent',
     conversationId: 'conversation-promoted',
+    agent_id: 'main-promoted',
+    attachments: [{ file_id: 'prior-file', filename: 'prior.png' }],
     content: [{ type: 'cortex_insight', insight: 'Completed insight.' }],
     metadata: { viventium: { messageRevision: 2, deliveryAcknowledgement: { revision: 5 } } },
   });
   const update = jest.spyOn(db, 'updateMessage').mockResolvedValue({});
+  const attachments = [{ file_id: 'new-file', filename: 'result.csv' }];
+  const prepareAttachments = jest.fn().mockResolvedValue(attachments);
   try {
     const message = await persistPreparedCortexFollowUpMessage(
       {
@@ -495,6 +499,7 @@ test('promoting a new completed result invalidates an older delivery acknowledge
         conversationId: 'conversation-promoted',
         parentMessageId: 'parent-promoted',
         insightsData: { cortexCount: 1 },
+        dependencies: { prepareAttachments },
       },
       {
         text: 'Completed visible result.',
@@ -504,17 +509,72 @@ test('promoting a new completed result invalidates an older delivery acknowledge
       },
     );
     expect(message.metadata.viventium.messageRevision).toBe(6);
+    expect(prepareAttachments).toHaveBeenCalledWith(expect.objectContaining({
+      messageId: 'parent-promoted', conversationId: 'conversation-promoted',
+      agent_id: 'main-promoted',
+    }));
+    expect(message.attachments).toEqual([{ file_id: 'prior-file', filename: 'prior.png' }, ...attachments]);
     expect(message.metadata.viventium).not.toHaveProperty('deliveryAcknowledgement');
     expect(update).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
         messageId: 'parent-promoted',
         text: 'Completed visible result.',
+        attachments: message.attachments,
       }),
       expect.objectContaining({ operationKind: 'system' }),
     );
   } finally {
     get.mockRestore();
     update.mockRestore();
+  }
+});
+
+test('prepares files for the actual visible follow-up before saving and skips a silent result', async () => {
+  const db = require('~/models');
+  const { persistPreparedCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
+  const attachments = [
+    { filename: 'result.png', file_id: 'file-1', filepath: '/uploads/result.png' },
+  ];
+  const prepareAttachments = jest.fn().mockResolvedValue(attachments);
+  const save = jest.spyOn(db, 'saveMessage').mockResolvedValue({});
+  const input = {
+    req: { user: { id: 'owner-files' } },
+    conversationId: 'conversation-files',
+    parentMessageId: 'parent-files',
+    agent: { id: 'main-files' },
+    insightsData: { cortexCount: 1 },
+    dependencies: { prepareAttachments },
+  };
+  const prepared = {
+    text: 'Here is the result.',
+    shouldForceVisibleFollowUp: false,
+    finalContinuationContext: { hasMovedOn: false },
+    conversationMessages: [],
+  };
+  try {
+    const message = await persistPreparedCortexFollowUpMessage(input, prepared);
+    expect(prepareAttachments).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: message.messageId,
+        conversationId: 'conversation-files',
+        agent_id: 'main-files',
+      }),
+    );
+    expect(save).toHaveBeenCalledWith(
+      input.req,
+      expect.objectContaining({
+        messageId: message.messageId,
+        attachments,
+      }),
+      expect.anything(),
+    );
+    await expect(
+      persistPreparedCortexFollowUpMessage(input, { ...prepared, text: '' }),
+    ).resolves.toBeNull();
+    expect(prepareAttachments).toHaveBeenCalledTimes(1);
+    expect(save).toHaveBeenCalledTimes(1);
+  } finally {
+    save.mockRestore();
   }
 });

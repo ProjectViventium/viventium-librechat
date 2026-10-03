@@ -114,6 +114,18 @@ const base = {
 };
 
 describe('orchestration trace ledger', () => {
+  test('retains joined cortex states and actual route facts without raw cortex identity', async () => {
+    const store = new MemoryLedgerStore();
+    await appendOrchestrationTraceEvent({ store, ...base, stage: 'cortex.completed', facts: {
+      cortexRef: 'private-cortex-id', cortexStatus: 'no_insight',
+      model: 'grok-build:grok-4.7', requestedModel: 'grok-build:grok-4.7-build-fast', reasoningEffort: 'high',
+    } });
+    const page = await readOrchestrationTraceLedger({ store, ownerId: base.ownerId, originRef: base.originRef });
+    expect(page.events[0].facts).toMatchObject({ cortexStatus: 'no_insight', reasoningEffort: 'high',
+      model: 'grok-build:grok-4.7', requestedModel: 'grok-build:grok-4.7-build-fast',
+      cortexRefHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) });
+    expect(JSON.stringify(page)).not.toContain('private-cortex-id');
+  });
   test('stores only fingerprints and a verifiable hash chain', async () => {
     const store = new MemoryLedgerStore();
     await appendOrchestrationTraceEvent({ store, ...base });

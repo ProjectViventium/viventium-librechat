@@ -22,6 +22,7 @@ export * from './nativeMedia';
 export * from './callbackSanitizer';
 export * from './terminalCallbackTransaction';
 export * from './nativeResponse';
+export * from './nativeOutputFiles';
 export * from './nativeToolEvidence';
 export * from './terminalCallbackOutbox';
 export * from './callbackBinding';
@@ -31,3 +32,6 @@ export * from './launchReconciliation';
 /* === VIVENTIUM END === */
 
 export * from './backgroundWorkerRoute';
+
+export * from './nativeVoiceInput';
+export * from './nativeWorkInput';

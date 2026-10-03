@@ -506,6 +506,33 @@ describe('getOpenAILLMConfig', () => {
       expect(params).not.toHaveProperty('reasoning');
     });
 
+    it.each(['high', 'medium', 'xhigh'])(
+      'sends the configured Grok 4.7 effort %s through ChatOpenAI',
+      (effort) => {
+        const result = getOpenAILLMConfig({
+          apiKey: 'test-api-key',
+          streaming: true,
+          endpoint: 'xai',
+          modelOptions: {
+            model: 'grok-4.7',
+            reasoning_effort: effort as ReasoningEffort,
+            frequency_penalty: 0,
+            presence_penalty: 0,
+            stop: ['stop-here'],
+            temperature: 0.7,
+          },
+        });
+        const params = new ChatOpenAI(
+          result.llmConfig as ConstructorParameters<typeof ChatOpenAI>[0],
+        ).invocationParams();
+        expect(params.reasoning_effort).toBe(effort);
+        expect(params.temperature).toBe(0.7);
+        expect(params.frequency_penalty).toBeUndefined();
+        expect(params.presence_penalty).toBeUndefined();
+        expect(params.stop).toBeUndefined();
+      },
+    );
+
     it('should use reasoning_effort for xAI Grok 4.3 aliases', () => {
       for (const model of ['grok-4.3-latest', 'grok-latest', 'xai/grok-4.3']) {
         const result = getOpenAILLMConfig({

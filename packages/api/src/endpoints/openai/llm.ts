@@ -79,13 +79,15 @@ function hasReasoningParams({
 /* === VIVENTIUM START ===
  * Feature: xAI Chat Completions reasoning ownership.
  * Purpose: xAI's OpenAI-compatible Chat Completions route expects `reasoning_effort`
- * for Grok 4.3 and aliases, but older xAI non-reasoning slugs reject the parameter.
+ * for supported Grok reasoning models; older non-reasoning slugs reject it.
  * LangChain's ChatOpenAI only forwards that snake_case field reliably through
  * modelKwargs for non-OpenAI reasoning models. Generic custom endpoints still
  * use the Responses-style `reasoning` object when configured that way.
  * === VIVENTIUM END === */
 function isXAIEndpoint(endpoint?: EModelEndpoint | string | null): boolean {
-  const normalized = String(endpoint || '').trim().toLowerCase();
+  const normalized = String(endpoint || '')
+    .trim()
+    .toLowerCase();
   return normalized === 'xai' || normalized === 'x_ai';
 }
 
@@ -94,7 +96,7 @@ function supportsXAIChatCompletionsReasoningEffort(model?: string | null): boole
     .trim()
     .toLowerCase()
     .replace(/^xai\//, '');
-  return normalized === 'grok-4.3' || normalized === 'grok-4.3-latest' || normalized === 'grok-latest';
+  return ['grok-4.7', 'grok-4.3', 'grok-4.3-latest', 'grok-latest'].includes(normalized);
 }
 
 /**
@@ -285,6 +287,31 @@ export function getOpenAILLMConfig({
     ) as OpenAI.Reasoning;
   } else if (hasReasoningParams({ reasoning_effort })) {
     llmConfig.reasoning_effort = reasoning_effort;
+  }
+
+  /* === VIVENTIUM START ===
+   * Grok 4.7 rejects penalty and stop parameters, including zero penalties.
+   * Source: https://docs.x.ai/developers/model-capabilities/text/reasoning
+   * === VIVENTIUM END === */
+  if (
+    !useOpenRouter &&
+    isXAIEndpoint(endpoint) &&
+    ['grok-4.7', 'xai/grok-4.7'].includes(
+      String(llmConfig.model || '')
+        .trim()
+        .toLowerCase(),
+    )
+  ) {
+    for (const key of [
+      'frequencyPenalty',
+      'frequency_penalty',
+      'presencePenalty',
+      'presence_penalty',
+      'stop',
+    ]) {
+      delete (llmConfig as Record<string, unknown>)[key];
+      delete modelKwargs[key];
+    }
   }
 
   if (llmConfig.max_tokens != null) {

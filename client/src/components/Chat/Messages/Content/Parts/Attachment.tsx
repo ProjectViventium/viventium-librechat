@@ -5,6 +5,10 @@ import FileContainer from '~/components/Chat/Input/Files/FileContainer';
 import Image from '~/components/Chat/Messages/Content/Image';
 import { useAttachmentLink } from './LogLink';
 import { cn } from '~/utils';
+import { useLocalize } from '~/hooks';
+/* === VIVENTIUM START === Reuse the existing error presentation for unavailable selected files. === */
+import { ErrorMessage } from '../MessageContent';
+/* === VIVENTIUM END === */
 
 const FileAttachment = memo(({ attachment }: { attachment: Partial<TAttachment> }) => {
   const [isVisible, setIsVisible] = useState(false);
@@ -85,9 +89,30 @@ const ImageAttachment = memo(({ attachment }: { attachment: TAttachment }) => {
 });
 
 export default function Attachment({ attachment }: { attachment?: TAttachment }) {
+  const localize = useLocalize();
   if (!attachment) {
     return null;
   }
+  /* === VIVENTIUM START === Keep unavailable file truth visible without a fake download. === */
+  if (
+    attachment.nativeOutputFile?.version === 1 &&
+    attachment.nativeOutputFile.status === 'unavailable'
+  ) {
+    return (
+      <ErrorMessage
+        text={
+          attachment.nativeOutputFile.code === 'native_output_file_size_limit'
+            ? localize('com_ui_native_file_size_limit', {
+                0: attachment.filename || localize('com_ui_attachment'),
+              })
+            : localize('com_ui_native_file_unavailable', {
+                0: attachment.filename || localize('com_ui_attachment'),
+              })
+        }
+      />
+    );
+  }
+  /* === VIVENTIUM END === */
   if (attachment.type === Tools.web_search) {
     return null;
   }
@@ -133,11 +158,9 @@ export function AttachmentGroup({ attachments }: { attachments?: TAttachment[] }
     <>
       {fileAttachments.length > 0 && (
         <div className="my-2 flex flex-wrap items-center gap-2.5">
-          {fileAttachments.map((attachment, index) =>
-            attachment.filepath ? (
-              <FileAttachment attachment={attachment} key={`file-${index}`} />
-            ) : null,
-          )}
+          {fileAttachments.map((attachment, index) => (
+            <Attachment attachment={attachment} key={`file-${index}`} />
+          ))}
         </div>
       )}
       {imageAttachments.length > 0 && (

@@ -767,6 +767,10 @@ async function prepareModernRouteMessages({
  * into the compiled TypeScript package.
  */
 const nonRetryableGraphFallbackClasses = new Set([
+  'native_input_declined',
+  'native_input_expired',
+  'native_input_cancelled',
+  'native_turn_cancelled',
   'host_capacity',
   'provider_request_rejected',
   'bad_request',

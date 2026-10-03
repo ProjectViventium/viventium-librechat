@@ -2172,4 +2172,49 @@ Holding Examples
     expect(res.body.followUp).toBeNull();
     expect(res.body.canonicalText).toBe('Canonical replacement text');
   });
+  /* === VIVENTIUM START: Preserve the shared public stream failure contract. === */
+
+  test.each([
+    [
+      'stream',
+      'source_context_unavailable',
+      'The conversation context could not be preserved. Please retry this turn.',
+    ],
+    [
+      'events',
+      'source_context_unavailable',
+      'The conversation context could not be preserved. Please retry this turn.',
+    ],
+    ['stream', 'provider_quota_exhausted', 'The selected model provider quota is exhausted.'],
+    ['events', 'provider_quota_exhausted', 'The selected model provider quota is exhausted.'],
+    ['stream', 'synthetic_unknown', 'The scheduled model response could not be completed.'],
+    ['events', 'synthetic_unknown', 'The scheduled model response could not be completed.'],
+  ])(
+    'preserves typed generation failure on %s scheduler stream (%s)',
+    async (endpoint, code, expected) => {
+      mockSubscribe.mockImplementation(async (_id, _event, _done, onError) => {
+        onError('synthetic-private-diagnostic', code);
+        return { unsubscribe: jest.fn() };
+      });
+      const req = createMockReq({
+        method: 'GET',
+        url: '/api/viventium/scheduler/' + endpoint + '/typed-failure',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        query: { userId: 'user_1' },
+      });
+      const res = createMockRes();
+      await dispatch(createTestApp(require('../scheduler')), req, res);
+      const errorFrames = res.write.mock.calls
+        .map(([value]) => value)
+        .filter((value) => value.startsWith('event: error\ndata: '));
+      expect(errorFrames).toHaveLength(1);
+      expect(JSON.parse(errorFrames[0].slice('event: error\ndata: '.length))).toEqual({
+        error: expected,
+        error_class: code === 'synthetic_unknown' ? 'completion_error' : code,
+      });
+      expect(errorFrames[0]).not.toContain('synthetic-private-diagnostic');
+    },
+  );
+  /* === VIVENTIUM END === */
+
 });

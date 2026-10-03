@@ -61,5 +61,16 @@ describe('ViventiumOrchestrationTraceEvent model', () => {
     await expect(
       new TraceEvent({ ...valid, facts: { ...valid.facts, rawPrompt: 'reject' } }).validate(),
     ).rejects.toThrow();
+    for (const stage of ['cortex.activation.completed', 'cortex.completed', 'audio.failed', 'audio.interrupted', 'audio.superseded']) {
+      await expect(new TraceEvent({ ...valid, stage, facts: {
+        cortexRefHash: hash('c'), cortexStatus: 'no_insight',
+        model: 'grok-build:grok-4.7', requestedModel: 'grok-build:grok-4.7-fast',
+        reasoningEffort: 'high',
+      } }).validate()).resolves.toBeUndefined();
+    }
+    await expect(new TraceEvent({ ...valid, facts: {
+      cortexRefHash: 'raw-private-cortex', cortexStatus: 'arbitrary-prose',
+      reasoningEffort: 'unbounded',
+    } }).validate()).rejects.toThrow();
   });
 });

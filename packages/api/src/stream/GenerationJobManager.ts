@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { logger } from '@librechat/data-schemas';
 import type {
   IMessage,
@@ -260,6 +261,36 @@ function hasResponseOnlySupersededFinalEvent(job: SerializableJobData): boolean 
  * Feature: Durable source-event idempotency.
  * Purpose: A retry must not erase the first creator's receipt during its claim-to-job window.
  * === VIVENTIUM END === */
+/* === VIVENTIUM START ===
+ * Fix: a subscriber that attached before response binding still receives its exact native FINAL.
+ * The producer clears its runtime binding before publishing, so the subscription snapshot is the
+ * only local evidence; every field it already knows must match the published incarnation proof.
+ */
+function nativeProofMatchesSubscription(
+  proof: string,
+  job: SerializableJobData | null,
+  producerResponseMessageId?: string,
+): boolean {
+  if (!job) return false;
+  const responseMessageId = producerResponseMessageId ?? job.responseMessageId;
+  if (proof === nativeJobProofJson({ ...job, responseMessageId })) return true;
+  if (responseMessageId) return false;
+  let bound: unknown;
+  try {
+    bound = JSON.parse(proof);
+  } catch {
+    return false;
+  }
+  const lateResponseMessageId = (bound as { responseMessageId?: unknown } | null)
+    ?.responseMessageId;
+  return (
+    typeof lateResponseMessageId === 'string' &&
+    lateResponseMessageId !== '' &&
+    proof === nativeJobProofJson({ ...job, responseMessageId: lateResponseMessageId })
+  );
+}
+/* === VIVENTIUM END === */
+
 function streamCreationPendingError(): Error & { code: string } {
   return Object.assign(new Error('Generation stream creation is still pending'), {
     code: 'stream_creation_pending',
@@ -281,6 +312,25 @@ function sourceOrderSupersededError(): Error & { code: string } {
     code: 'source_order_superseded',
   });
 }
+
+/* === VIVENTIUM START ===
+ * Fix: typed logical-turn admission results, restored after the #116 integration dropped them.
+ */
+function sourceInputPersistencePendingError(): Error & { code: string } {
+  return Object.assign(
+    new Error('Accepted input persistence is still pending; retry the request'),
+    {
+      code: 'source_input_persistence_pending',
+    },
+  );
+}
+
+function sourceInputWaitingError(): Error & { code: string } {
+  return Object.assign(new Error('The current response is still active'), {
+    code: 'source_input_waiting',
+  });
+}
+/* === VIVENTIUM END === */
 
 function sourceOrderObservationFromContext(
   context: InteractionContext | undefined,
@@ -310,6 +360,10 @@ function streamManagerUnavailableError(): Error & { code: string } {
  * Purpose: Shutdown must cancel a transport handshake instead of waiting forever on old state.
  */
 const LIFECYCLE_ABORTED = Symbol('lifecycle_aborted');
+/** Bounds the superseded native operations one logical-turn revision waits to release. */
+const MAX_NATIVE_RELEASE_TARGETS = 8;
+/** A live generator renews this far ahead while its revision waits before native dispatch. */
+const NATIVE_DISPATCH_LEASE_MS = 60_000;
 const lifecycleAbortPromises = new WeakMap<AbortSignal, Promise<typeof LIFECYCLE_ABORTED>>();
 
 function lifecycleAbortPromise(signal: AbortSignal): Promise<typeof LIFECYCLE_ABORTED> {
@@ -363,6 +417,7 @@ interface RuntimeJobState {
   resolveReady: () => void;
   finalEvent?: t.ServerSentEvent;
   errorEvent?: string;
+  errorClass?: string;
   syncSent: boolean;
   earlyEventBuffer: t.ServerSentEvent[];
   hasSubscriber: boolean;
@@ -371,6 +426,8 @@ interface RuntimeJobState {
   presentationOnly?: boolean;
   /** Shared readiness for a lazily-created cross-replica runtime. */
   initializationReady?: Promise<void>;
+  /** This generator's pre-dispatch lease token for a release-gated revision. */
+  nativeDispatchOwner?: string;
 }
 
 /* === VIVENTIUM START ===
@@ -846,6 +903,135 @@ class GenerationJobManagerClass {
     this.nativeResponseCancellation = handler;
   }
 
+  /* === VIVENTIUM START ===
+   * Feature: Pre-dispatch lease of a release-gated revision.
+   * Purpose: While a revision waits for its predecessors to release, its generator renews a
+   * store-held lease. The renewal fails once another generator took the revision over, so the
+   * waiting generator never dispatches after losing it. Stores without leases keep prior behavior.
+   * === VIVENTIUM END === */
+  async renewNativeDispatchLease(streamId: string, createdAt: number): Promise<boolean> {
+    const runtime = this.runtimeState.get(streamId);
+    if (!runtime || runtime.nativeProducer?.createdAt !== createdAt) {
+      return false;
+    }
+    if (!this.jobStore.claimNativeDispatchLease) {
+      return true;
+    }
+    runtime.nativeDispatchOwner ??= randomUUID();
+    return this.jobStore.claimNativeDispatchLease(streamId, {
+      createdAt,
+      owner: runtime.nativeDispatchOwner,
+      leaseMs: NATIVE_DISPATCH_LEASE_MS,
+      mode: 'renew',
+    });
+  }
+
+  /**
+   * A generator that died before native dispatch left its revision running with an expired lease.
+   * Exactly one successor generator (the store's atomic takeover decides) continues that same
+   * job, revision and deadline anchor; a live, local or already-dispatched owner is never taken.
+   */
+  private async takeOverOrphanedNativeDispatch(
+    streamId: string,
+    persistedJob: SerializableJobData,
+  ): Promise<boolean> {
+    const runtime = this.runtimeState.get(streamId);
+    if (
+      !this.jobStore.claimNativeDispatchLease ||
+      persistedJob.status !== 'running' ||
+      persistedJob.nativeResponse ||
+      !persistedJob.nativeDispatchOwner ||
+      (persistedJob.nativeDispatchLeaseUntil ?? 0) > Date.now() ||
+      !runtime ||
+      runtime.nativeProducer
+    ) {
+      return false;
+    }
+    const owner = randomUUID();
+    const claimed = await this.jobStore.claimNativeDispatchLease(streamId, {
+      createdAt: persistedJob.createdAt,
+      owner,
+      leaseMs: NATIVE_DISPATCH_LEASE_MS,
+      mode: 'takeover',
+    });
+    if (!claimed) {
+      return false;
+    }
+    runtime.nativeProducer = {
+      createdAt: persistedJob.createdAt,
+      responseMessageId: persistedJob.responseMessageId,
+    };
+    runtime.nativeDispatchOwner = owner;
+    logger.info(
+      `[GenerationJobManager] Recovered pre-dispatch generation ${streamLogRef(streamId)}`,
+    );
+    return true;
+  }
+  /* === VIVENTIUM END === */
+
+  /* === VIVENTIUM START ===
+   * Feature: Source authors committed at the generation handoff.
+   * Purpose: A revision authors its sources only when its Main is about to start, after every
+   * admission and request step that can fail. The request commits here immediately before binding
+   * its input and starting generation. A refused commit, or one whose outcome stays unknown,
+   * removes the admitted job and returns the claim; it never leaves an author without a Main.
+   * === VIVENTIUM END === */
+  async commitLogicalTurnAuthor(
+    streamId: string,
+    userId: string,
+  ): Promise<InteractionContext | undefined> {
+    const job = await this.jobStore.getJob(streamId);
+    const context = job?.interactionContext;
+    if (!context?.logical_turn_id || !this.jobStore.commitLogicalTurnAdmission) {
+      return context;
+    }
+    try {
+      return await this.jobStore.commitLogicalTurnAdmission(streamId, userId, context);
+    } catch (error) {
+      const uncertain = (error as { code?: string })?.code === 'author_commit_uncertain';
+      const runtime = this.runtimeState.get(streamId);
+      if (runtime && !runtime.abortController.signal.aborted) {
+        runtime.abortController.abort('admission_failed');
+      }
+      this.runtimeState.delete(streamId);
+      this.eventTransport.cleanup(streamId);
+      if (uncertain) {
+        await this.relinquishLogicalTurnAuthor(streamId, userId, context);
+      }
+      await this.jobStore.deleteJob(streamId).catch(() => undefined);
+      await this.jobStore.rollbackLogicalTurnClaim(streamId, context).catch(() => false);
+      const sourceOrderObservation = sourceOrderObservationFromContext(context);
+      if (
+        !uncertain &&
+        sourceOrderObservation &&
+        (await this.jobStore.observeSourceOrder(sourceOrderObservation)).stale
+      ) {
+        throw sourceOrderSupersededError();
+      }
+      throw uncertain ? streamManagerUnavailableError() : error;
+    }
+  }
+
+  /** A committed revision whose Main cannot start gives up authorship so its sources move on. */
+  async relinquishLogicalTurnAuthor(
+    streamId: string,
+    userId: string,
+    context?: InteractionContext,
+  ): Promise<void> {
+    const interactionContext =
+      context ?? (await this.jobStore.getJob(streamId))?.interactionContext;
+    if (!interactionContext?.logical_turn_id || !this.jobStore.relinquishLogicalTurnAuthor) return;
+    await this.jobStore
+      .relinquishLogicalTurnAuthor(streamId, userId, interactionContext)
+      .catch((error) =>
+        logger.warn(
+          `[GenerationJobManager] Author relinquish failed ${streamLogRef(streamId)}`,
+          safeStreamLogError(error),
+        ),
+      );
+  }
+  /* === VIVENTIUM END === */
+
   hasLocalNativeResponseProducer(identity: NativeResponseIdentity): boolean {
     const producer = this.runtimeState.get(identity.streamId)?.nativeProducer;
     return Boolean(
@@ -976,6 +1162,73 @@ class GenerationJobManagerClass {
     }
   }
 
+  /* === VIVENTIUM START ===
+   * Fix: a current native answer that a source change revoked before it finished has no terminal
+   * publisher: Stop publishes its own cancelled FINAL, and a newer revision supersedes its stream.
+   * The owner that proved the revocation ends this exact stream with a typed error instead of
+   * leaving subscribers to wait for a FINAL that can never be committed.
+   */
+  async failRevokedNativeResponse(
+    identity: NativeResponseIdentity,
+    error: string,
+  ): Promise<boolean> {
+    const lifecycle = this.captureLifecycle();
+    const streamId = identity.streamId;
+    const runtime = this.runtimeState.get(streamId);
+    const job = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getJob(streamId),
+      streamId,
+      runtime,
+    );
+    const receipt = await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.jobStore.getNativeResponseCommit(identity),
+      streamId,
+      runtime,
+    );
+    if (
+      !nativeJobMatches(job, identity) ||
+      !job.nativeResponse ||
+      nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity) ||
+      !job.nativeResponseCancelled ||
+      job.nativeResponseFinished ||
+      receipt.status !== 'revoked' ||
+      !(await this.runLifecycleOperation(
+        lifecycle,
+        () => lifecycle.jobStore.isCurrentLogicalTurn(streamId),
+        streamId,
+        runtime,
+      ))
+    ) {
+      return false;
+    }
+    if (runtime) {
+      runtime.errorEvent = error;
+      runtime.errorClass = undefined;
+    }
+    await this.runLifecycleOperation(
+      lifecycle,
+      () =>
+        lifecycle.jobStore.updateJob(streamId, {
+          status: 'error',
+          completedAt: Date.now(),
+          error,
+          errorClass: '',
+        }),
+      streamId,
+      runtime,
+    );
+    await this.runLifecycleOperation(
+      lifecycle,
+      () => lifecycle.eventTransport.emitError(streamId, error),
+      streamId,
+      runtime,
+    );
+    return true;
+  }
+  /* === VIVENTIUM END === */
+
   async finishNativeResponse(
     identity: NativeResponseIdentity,
     finalEvent: t.ServerSentEvent,
@@ -1028,6 +1281,7 @@ class GenerationJobManagerClass {
       return false;
     runtime.finalEvent = acceptedEvent;
     runtime.errorEvent = undefined;
+    runtime.errorClass = undefined;
     runtime.nativeProducer = undefined;
     const published = await services.eventTransport.emitDone(identity.streamId, acceptedEvent, {
       identity,
@@ -1068,6 +1322,7 @@ class GenerationJobManagerClass {
     if (runtime && this.runtimeState.get(identity.streamId) === runtime) {
       runtime.finalEvent = undefined;
       runtime.errorEvent = undefined;
+    runtime.errorClass = undefined;
       runtime.nativeProducer = undefined;
       this.runtimeState.delete(identity.streamId);
       this.runStepBuffers?.delete(identity.streamId);
@@ -1734,6 +1989,23 @@ class GenerationJobManagerClass {
     if (interactionContext) {
       const baseInteractionContext = interactionContext;
       let claim = await this.jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
+      /* === VIVENTIUM START ===
+       * Fix: an accepted input that is still being persisted gets Main's bounded wait; an active or
+       * newer turn yields a typed pending or superseded result, never an unclaimed generation.
+       */
+      const inputDeadline = Date.now() + 10_000;
+      while (
+        claim.status === 'initializing' &&
+        Date.now() < inputDeadline &&
+        !lifecycleSignal.aborted
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        claim = await this.jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
+      }
+      if (claim.status === 'initializing') {
+        throw sourceInputPersistencePendingError();
+      }
+      /* === VIVENTIUM END === */
       if (claim.status === 'stale_source_order') {
         throw sourceOrderSupersededError();
       }
@@ -1770,6 +2042,13 @@ class GenerationJobManagerClass {
           });
           claim = await this.jobStore.claimLogicalTurn(streamId, userId, baseInteractionContext);
         }
+      }
+      /* VIVENTIUM: typed pending and superseded admission results (see above). */
+      if (claim.status === 'busy') {
+        throw sourceInputWaitingError();
+      }
+      if (claim.status === 'superseded') {
+        throw sourceOrderSupersededError();
       }
       interactionContext = claim.interactionContext;
       if (claim.status === 'duplicate') {
@@ -1810,6 +2089,9 @@ class GenerationJobManagerClass {
           throw sourceOrderSupersededError();
         }
         /* === VIVENTIUM END === */
+        if (await this.takeOverOrphanedNativeDispatch(claim.streamId, persistedJob)) {
+          return duplicateJob;
+        }
         duplicateJob.duplicateOfStreamId = claim.streamId;
         return duplicateJob;
       }
@@ -2051,9 +2333,36 @@ class GenerationJobManagerClass {
         await this.jobStore.updateJob(streamId, { nativePredecessor });
         jobData.nativePredecessor = nativePredecessor;
       }
+      /* === VIVENTIUM START ===
+       * Fix: the current revision dispatches only after every superseded native Main operation of
+       * this logical turn releases, including one behind a revision that never reached native
+       * admission (A -> B -> C). Only exact response ids of the same owner/conversation carry over.
+       * === VIVENTIUM END === */
+      if (
+        supersededStreamId !== streamId &&
+        supersededJob &&
+        supersededJob.userId === userId &&
+        supersededJob.conversationId === conversationId
+      ) {
+        const targets = [
+          ...(jobData.nativeReleaseTargets ?? []),
+          ...(supersededJob.nativeReleaseTargets ?? []),
+          ...(supersededJob.nativeResponse && supersededJob.responseMessageId
+            ? [supersededJob.responseMessageId]
+            : []),
+        ].filter((target): target is string => typeof target === 'string' && target.length > 0);
+        const nativeReleaseTargets = [...new Set(targets)].slice(-MAX_NATIVE_RELEASE_TARGETS);
+        if (nativeReleaseTargets.length > 0) {
+          await this.jobStore.updateJob(streamId, { nativeReleaseTargets });
+          jobData.nativeReleaseTargets = nativeReleaseTargets;
+        }
+      }
       if (supersededStreamId !== streamId) {
         await this.supersedeJob(supersededStreamId);
       }
+    }
+    if (jobData.nativeReleaseTargets?.length) {
+      await this.renewNativeDispatchLease(streamId, jobData.createdAt);
     }
 
     // Return facade for backwards compatibility
@@ -2228,6 +2537,7 @@ class GenerationJobManagerClass {
       hasSubscriber: false,
       finalEvent,
       errorEvent: jobData.error,
+      errorClass: jobData.errorClass || undefined,
       presentationOnly:
         jobData.generationCompleted === true &&
         jobData.deliveryPolicy?.commit_authority === 'external_adapter' &&
@@ -2452,47 +2762,62 @@ class GenerationJobManagerClass {
       : terminalEvent;
     const waitsForDurableEffectDecision =
       !stopsAuthoring && jobData.status === 'running' && !durableReceipt;
-    if (stopsAuthoring && runtime && !runtime.abortController.signal.aborted) {
-      runtime.abortController.abort('superseded');
-    }
+    /* === VIVENTIUM START ===
+     * Fix: supersession revokes the exact obsolete presentation-producing Main operation on every
+     * adapter; the 'superseded' reason delivers its owner-scoped native cancellation. response_only
+     * still never cancels accepted missions, reserved or committed effects, background work or
+     * receipts: those have their own durable owners and reach the surviving revision or a follow-up.
+     * === VIVENTIUM END === */
     if (runtime) {
       runtime.nativeProducer = undefined;
       if (!waitsForDurableEffectDecision) {
         runtime.finalEvent = presentationEvent;
       }
     }
-    await this.jobStore.updateJob(streamId, {
-      status: 'superseded',
-      completedAt: Date.now(),
-      ...(waitsForDurableEffectDecision ? {} : { finalEvent: JSON.stringify(presentationEvent) }),
-    });
-    if (waitsForDurableEffectDecision) {
-      const supersededJob = await this.jobStore.getJob(streamId);
-      const supersededReceipt = supersededJob?.durableEffectReceipt;
-      if (
-        supersededJob?.status === 'superseded' &&
-        supersededReceipt &&
-        !hasDurableWorkReceiptFinalEvent(supersededJob)
-      ) {
-        const receiptEvent = buildDurableWorkReceiptFinalEvent(
-          supersededJob,
-          supersededReceipt.response_message_id,
-        );
-        if (runtime) {
-          runtime.finalEvent = receiptEvent;
-        }
-        await this.jobStore.updateJob(streamId, {
-          finalEvent: JSON.stringify(receiptEvent),
-        });
-        try {
-          await this.eventTransport.emitDone(streamId, receiptEvent);
-        } catch {
-          logger.warn(
-            '[GenerationJobManager] Durable receipt notification unavailable after supersession',
+    /* === VIVENTIUM START ===
+     * Fix: completion on typed abort must observe the durable supersession and receipt decision.
+     * Store failure still stops revoked authoring and propagates to the admitting owner.
+     */
+    const stopsActiveAuthoring = stopsAuthoring || jobData.status === 'running';
+    try {
+      await this.jobStore.updateJob(streamId, {
+        status: 'superseded',
+        completedAt: Date.now(),
+        ...(waitsForDurableEffectDecision ? {} : { finalEvent: JSON.stringify(presentationEvent) }),
+      });
+      if (waitsForDurableEffectDecision) {
+        const supersededJob = await this.jobStore.getJob(streamId);
+        const supersededReceipt = supersededJob?.durableEffectReceipt;
+        if (
+          supersededJob?.status === 'superseded' &&
+          supersededReceipt &&
+          !hasDurableWorkReceiptFinalEvent(supersededJob)
+        ) {
+          const receiptEvent = buildDurableWorkReceiptFinalEvent(
+            supersededJob,
+            supersededReceipt.response_message_id,
           );
+          if (runtime) {
+            runtime.finalEvent = receiptEvent;
+          }
+          await this.jobStore.updateJob(streamId, {
+            finalEvent: JSON.stringify(receiptEvent),
+          });
+          try {
+            await this.eventTransport.emitDone(streamId, receiptEvent);
+          } catch {
+            logger.warn(
+              '[GenerationJobManager] Durable receipt notification unavailable after supersession',
+            );
+          }
         }
       }
+    } finally {
+      if (runtime && !runtime.abortController.signal.aborted && stopsActiveAuthoring) {
+        runtime.abortController.abort('superseded');
+      }
     }
+    /* === VIVENTIUM END === */
     if (stopsAuthoring) {
       try {
         await this.eventTransport.emitAbort?.(streamId, 'superseded');
@@ -3296,7 +3621,12 @@ class GenerationJobManagerClass {
             logger.debug(
               `[GenerationJobManager] Sending stored error to late subscriber ${streamLogRef(streamId)}`,
             );
-            onError?.(errorToSend);
+            const errorClass = runtime.errorEvent ? runtime.errorClass : jobData.errorClass;
+            if (errorClass) {
+              onError?.(errorToSend, errorClass);
+            } else {
+              onError?.(errorToSend);
+            }
           }
         } else if (runtime.finalEvent) {
           onDone?.(runtime.finalEvent);
@@ -3317,22 +3647,26 @@ class GenerationJobManagerClass {
       },
       onDone: (event, proof) => {
         const currentRuntime = this.runtimeState.get(streamId);
-        const expectedProof = nativeJobProofJson({
-          ...jobData!,
-          responseMessageId:
-            currentRuntime?.nativeProducer?.responseMessageId ?? jobData?.responseMessageId,
-        });
         if (
           this.isLifecycleCurrent(lifecycle) &&
           currentRuntime === runtime &&
-          (proof === undefined || proof === expectedProof)
+          (proof === undefined ||
+            nativeProofMatchesSubscription(
+              proof,
+              jobData,
+              currentRuntime?.nativeProducer?.responseMessageId,
+            ))
         ) {
           onDone?.(event as t.ServerSentEvent);
         }
       },
-      onError: (error) => {
+      onError: (error, errorClass) => {
         if (this.isLifecycleCurrent(lifecycle) && this.runtimeState.get(streamId) === runtime) {
-          onError?.(error);
+          if (errorClass === undefined) {
+            onError?.(error);
+          } else {
+            onError?.(error, errorClass);
+          }
         }
       },
     });
@@ -4040,6 +4374,7 @@ class GenerationJobManagerClass {
     const aggregatedContent = result?.content ?? [];
     const runSteps = await services.jobStore.getRunSteps(streamId);
     this.assertServiceGeneration(services.generation);
+    const finalEvent = parseStoredFinalEvent(jobData);
 
     logger.debug(`[GenerationJobManager] getResumeState ${streamLogRef(streamId)}`, {
       runStepsLength: runSteps.length,
@@ -4056,6 +4391,9 @@ class GenerationJobManagerClass {
       /* === VIVENTIUM END === */
       conversationId: jobData.conversationId,
       sender: jobData.sender,
+      /* === VIVENTIUM START === Resume uses the accepted terminal delivery decision. === */
+      ...(finalEvent ? { finalEvent: finalEvent as t.ServerSentEvent } : {}),
+      /* === VIVENTIUM END === */
     };
   }
 
@@ -4093,8 +4431,9 @@ class GenerationJobManagerClass {
 
   /* === VIVENTIUM START ===
    * Feature: Durable cross-replica cancellation.
-   * Purpose: Stop a stale local generator when durable ownership is gone, while preserving the
-   * response-only adapter contract that suppresses presentation but allows background authoring.
+   * Purpose: Stop a stale local generator when durable ownership is gone. A superseded revision
+   * stops with the exact 'superseded' reason so its native Main operation is revoked; accepted
+   * missions, effects and receipts of a response-only adapter keep their own durable owners.
    * === VIVENTIUM END === */
   private async stopRuntimeAfterDurableFence(
     streamId: string,
@@ -4110,13 +4449,11 @@ class GenerationJobManagerClass {
       streamId,
       runtime,
     );
-    if (
-      persisted?.status === 'superseded' &&
-      persisted.adapterCapabilities?.supersede_scope === 'response_only'
-    ) {
-      return;
-    }
-    runtime.abortController.abort('durable_stream_terminal');
+    // A superseded revision's obsolete Main operation is revoked exactly; its accepted durable work
+    // keeps its own owners, so no adapter scope keeps the stale generator running.
+    runtime.abortController.abort(
+      persisted?.status === 'superseded' ? 'superseded' : 'durable_stream_terminal',
+    );
   }
 
   /**
@@ -4226,7 +4563,8 @@ class GenerationJobManagerClass {
    * Stores the error for late-connecting subscribers (race condition where error
    * occurs before client connects to SSE stream).
    */
-  async emitError(streamId: string, error: string): Promise<void> {
+  async emitError(streamId: string, error: string, errorClass?: string): Promise<void> {
+    errorClass = errorClass?.trim() || undefined;
     const lifecycle = this.captureLifecycle();
     const runtime = this.runtimeState.get(streamId);
     const nativeJob = await this.runLifecycleOperation(
@@ -4258,10 +4596,11 @@ class GenerationJobManagerClass {
     }
     if (runtime) {
       runtime.errorEvent = error;
+      runtime.errorClass = errorClass;
     }
     // Terminal delivery remains available when best-effort replay persistence fails.
     try {
-      await lifecycle.jobStore.updateJob(streamId, { error });
+      await lifecycle.jobStore.updateJob(streamId, { error, errorClass: errorClass || '' });
     } catch (persistError) {
       this.assertLifecycleOperation(lifecycle, streamId, runtime);
       logger.error(
@@ -4272,7 +4611,10 @@ class GenerationJobManagerClass {
     this.assertLifecycleOperation(lifecycle, streamId, runtime);
     await this.runLifecycleOperation(
       lifecycle,
-      () => lifecycle.eventTransport.emitError(streamId, error),
+      () =>
+        errorClass === undefined
+          ? lifecycle.eventTransport.emitError(streamId, error)
+          : lifecycle.eventTransport.emitError(streamId, error, errorClass),
       streamId,
       runtime,
     );

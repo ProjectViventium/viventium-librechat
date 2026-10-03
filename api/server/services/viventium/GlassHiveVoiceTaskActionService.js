@@ -4,7 +4,13 @@
  * without persisting, logging, or relaying the opaque capability token.
  * === VIVENTIUM END === */
 
-const { registerVoiceTaskOwnerAdapter } = require('./VoiceTaskService');
+const {
+  createNativeMissionVoiceInput,
+  createNativeMissionVoiceAcknowledgement,
+} = require('@librechat/api');
+const { registerVoiceTaskOwnerAdapter, observeGenerationEvent } = require('./VoiceTaskService');
+const { executeGlassHiveWorkAction } = require('./GlassHiveWorkActionService');
+const { requestAccountApi } = require('./GlassHiveAccountService');
 
 const ACTION_PATH = '/v1/run-actions';
 const ACTION_TIMEOUT_MS = 5000;
@@ -182,11 +188,57 @@ function registerGlassHiveVoiceTaskActionCapabilities({
   body = {},
   task,
   fetchImpl = globalThis.fetch,
+  workRef,
+  ownerId,
+  retainedInputOperation,
+  retainedNativeInputBinding,
 }) {
   if (!task?.taskId || task.owner?.kind !== 'glasshive_run' || typeof fetchImpl !== 'function') {
     return { cancel: false, retry: false };
   }
   const event = String(body.event || '').trim();
+  if (event === 'run.needs_input') {
+    if (!safeId(ownerId) || !safeId(workRef) || body.run_id !== task.owner.id)
+      return { cancel: false, retry: false };
+    return requestAccountApi({ ownerId, path: `/v1/work/${encodeURIComponent(workRef)}` }).then(
+      (current) => {
+        if (current?.workRef !== workRef) return { cancel: false, retry: false };
+        const nativeInput =
+          createNativeMissionVoiceInput({
+            pendingInput: current?.pendingNativeInput,
+            pendingBinding: body.pending_native_input,
+            workRef,
+            task: { ...task, userId: ownerId },
+            executeWorkAction: executeGlassHiveWorkAction,
+          }) ||
+          createNativeMissionVoiceAcknowledgement({
+            binding: retainedNativeInputBinding,
+            operation: retainedInputOperation,
+            task: { ...task, userId: ownerId },
+            executeWorkAction: executeGlassHiveWorkAction,
+          });
+        if (!nativeInput) return { cancel: false, retry: false };
+        registerVoiceTaskOwnerAdapter(task.taskId, {
+          kind: 'glasshive_run',
+          preserveExisting: true,
+          inputExpiresAtMs: nativeInput.expiresAtMs,
+          nativeMissionInputBinding: nativeInput.binding,
+          provideInput: nativeInput.provideInput,
+        });
+        if (nativeInput.prompt)
+          observeGenerationEvent(task.taskId, {
+            event: 'needs_input',
+            data: {
+              eventId: body.callback_id,
+              prompt: nativeInput.prompt,
+              inputType: 'choice',
+              choices: nativeInput.choices,
+            },
+          });
+        return { cancel: false, retry: false, input: true };
+      },
+    );
+  }
   if (event !== 'run.started' && event !== 'run.failed') {
     return { cancel: false, retry: false };
   }

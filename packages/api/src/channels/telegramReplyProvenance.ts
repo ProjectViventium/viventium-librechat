@@ -105,6 +105,7 @@ export interface TelegramReplyProvenanceService {
 
 interface ReplyCapsuleData extends UnknownRecord {
   version: 1;
+  source_label?: string;
   provenance_status: string;
   sender_role: string;
   replied_telegram_message_id: string;
@@ -379,6 +380,9 @@ function buildTelegramReplyContextCapsuleWithLogger(
     });
   const data: ReplyCapsuleData = {
     version: 1,
+    ...(boundedId(contextValue.sourceLabel)
+      ? { source_label: boundedId(contextValue.sourceLabel) }
+      : {}),
     provenance_status: boundedId(contextValue.provenanceStatus),
     sender_role: boundedId(contextValue.senderRole),
     replied_telegram_message_id: boundedId(contextValue.repliedTelegramMessageId),

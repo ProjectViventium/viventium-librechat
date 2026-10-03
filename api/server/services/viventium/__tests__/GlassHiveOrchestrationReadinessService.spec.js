@@ -553,6 +553,67 @@ describe('GlassHiveOrchestrationReadinessService', () => {
     expect(mockRequestAccountApi).not.toHaveBeenCalled();
   });
 
+  test.each([
+    'isolated_parallel_policy_disabled',
+    'parallel_clean_room_network_unconfigured',
+    'parallel_clean_room_provider_proxy_unconfigured',
+    'parallel_clean_room_broker_proxy_unconfigured',
+    'parallel_clean_room_provider_egress_network_unconfigured',
+    'parallel_clean_room_proxy_image_unconfigured',
+    'parallel_clean_room_proxy_upstream_unconfigured',
+  ])('returns a fresh definitive rejection without polling: %s', async (reason) => {
+    mockRequestAccountApi.mockResolvedValue(
+      readyCapability({ isolatedParallelReady: false, isolatedParallelReason: reason }),
+    );
+    await expect(
+      waitForOrchestrationReadiness({ ownerId: 'user-1', timeoutMs: 15_000 }),
+    ).resolves.toMatchObject({ available: false, status: 'unready', reason });
+    expect(mockRequestAccountApi).toHaveBeenCalledTimes(1);
+    mockRequestAccountApi.mockClear();
+    await waitForOrchestrationReadiness({ ownerId: 'user-1' });
+    expect(mockRequestAccountApi).not.toHaveBeenCalled();
+  });
+
+  test.each(['parallel_clean_room_proxy_unhealthy', 'host_missions_active'])(
+    'keeps polling transient readiness: %s',
+    async (reason) => {
+      mockRequestAccountApi
+        .mockResolvedValueOnce(
+          readyCapability({ isolatedParallelReady: false, isolatedParallelReason: reason }),
+        )
+        .mockResolvedValueOnce(readyCapability());
+      await expect(
+        waitForOrchestrationReadiness({ ownerId: 'user-1', timeoutMs: 100, pollIntervalMs: 1 }),
+      ).resolves.toMatchObject({ available: true, status: 'ready' });
+      expect(mockRequestAccountApi).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  test('keeps polling unavailable transport and retries a stale configuration rejection', async () => {
+    mockRequestAccountApi.mockRejectedValueOnce(new Error('synthetic_unavailable'));
+    await expect(
+      waitForOrchestrationReadiness({ ownerId: 'user-1', timeoutMs: 100, pollIntervalMs: 1 }),
+    ).resolves.toMatchObject({ available: true });
+    expect(mockRequestAccountApi).toHaveBeenCalledTimes(2);
+    mockRequestAccountApi.mockResolvedValueOnce(
+      readyCapability({
+        isolatedParallelReady: false,
+        isolatedParallelReason: 'parallel_clean_room_network_unconfigured',
+      }),
+    );
+    await refreshOrchestrationReadiness({ ownerId: 'user-1' });
+    const now = Date.now();
+    jest.spyOn(Date, 'now').mockReturnValue(now + 2_001);
+    try {
+      await expect(waitForOrchestrationReadiness({ ownerId: 'user-1' })).resolves.toMatchObject({
+        available: true,
+      });
+      expect(mockRequestAccountApi).toHaveBeenCalledTimes(4);
+    } finally {
+      Date.now.mockRestore();
+    }
+  });
+
   test('does not share readiness or in-flight truth between owners', async () => {
     await refreshOrchestrationReadiness({ ownerId: 'user-1' });
     mockRequestAccountApi.mockResolvedValueOnce(

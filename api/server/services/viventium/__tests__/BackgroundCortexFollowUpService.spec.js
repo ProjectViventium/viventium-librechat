@@ -532,6 +532,67 @@ describe('Phase B prepare/persist boundary', () => {
   });
 });
 
+describe('forced follow-up onto an empty primary answer', () => {
+  const parent = (acknowledgement) => ({
+    messageId: 'synthetic-answer',
+    parentMessageId: 'synthetic-source',
+    conversationId: 'synthetic-conversation',
+    isCreatedByUser: false,
+    text: '',
+    unfinished: true,
+    content: [
+      { type: 'cortex_insight', cortex_id: 'synthetic', status: 'complete', insight: 'Fact.' },
+      { type: 'error', error_class: 'source_context_unavailable', error: 'Unavailable.' },
+    ],
+    metadata: { viventium: acknowledgement ? { deliveryAcknowledgement: acknowledgement } : {} },
+  });
+
+  test.each([
+    ['promotes the insight onto an empty primary answer', null, true],
+    ['keeps an answer acknowledged failed and gives the insight its own message', 'failed', false],
+  ])('%s', async (_label, acknowledgementState, promoted) => {
+    const getMessage = jest
+      .spyOn(db, 'getMessage')
+      .mockResolvedValue(
+        parent(acknowledgementState ? { state: acknowledgementState, revision: 1 } : null),
+      );
+    const getMessages = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
+    const updateMessage = jest.spyOn(db, 'updateMessage').mockResolvedValue({});
+    const saveMessage = jest.spyOn(db, 'saveMessage').mockResolvedValue({});
+    try {
+      await persistPreparedCortexFollowUpMessage(
+        {
+          req: { user: { id: 'owner' }, body: {} },
+          conversationId: 'synthetic-conversation',
+          parentMessageId: 'synthetic-answer',
+          agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
+          insightsData: { cortexCount: 1, insights: [{ cortexName: 'Synthetic', insight: 'Fact.' }] },
+        },
+        { text: 'The recovered answer.', shouldForceVisibleFollowUp: true },
+      );
+      const promotion = updateMessage.mock.calls.find(
+        ([, update]) => update?.metadata?.viventium?.promotedToEmptyParent === true,
+      );
+      if (promoted) {
+        expect(promotion).toBeDefined();
+        expect(saveMessage).not.toHaveBeenCalled();
+      } else {
+        expect(promotion).toBeUndefined();
+        expect(saveMessage).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({ text: 'The recovered answer.' }),
+          expect.anything(),
+        );
+      }
+    } finally {
+      getMessage.mockRestore();
+      getMessages.mockRestore();
+      updateMessage.mockRestore();
+      saveMessage.mockRestore();
+    }
+  });
+});
+
 describe('formatFollowUpPrompt', () => {
   const missionInsight = (runId, instruction, insight) => ({
     cortexName: 'Mission evidence',
@@ -1399,6 +1460,57 @@ describe('shouldForceVisibleFollowUpForEmptyPrimary', () => {
 });
 
 describe('resolveFollowUpContinuationContext', () => {
+  test('does not treat a worker status card as a delivered answer, while retaining its descendants', () => {
+    const anchor = {
+      messageId: 'anchor',
+      parentMessageId: 'request',
+      sender: 'AI',
+      text: 'Working.',
+    };
+    const status = {
+      messageId: 'status',
+      parentMessageId: 'anchor',
+      sender: 'AI',
+      text: 'Mission completed.',
+      isCreatedByUser: false,
+      metadata: {
+        viventium: {
+          type: 'glasshive_worker_callback',
+          event: 'run.completed',
+          visibility: 'internal',
+        },
+      },
+    };
+    const statusOnly = resolveFollowUpContinuationContext([anchor, status], 'anchor');
+    expect(statusOnly).toMatchObject({
+      hasMovedOn: false,
+      contextText: '',
+      messageCount: 0,
+      currentLeafMessageId: 'status',
+    });
+    const continued = resolveFollowUpContinuationContext(
+      [
+        anchor,
+        status,
+        {
+          messageId: 'user',
+          parentMessageId: 'status',
+          sender: 'User',
+          isCreatedByUser: true,
+          text: 'Use the other offer.',
+        },
+        { messageId: 'answer', parentMessageId: 'user', sender: 'AI', text: 'Mission completed.' },
+      ],
+      'anchor',
+    );
+    expect(continued).toMatchObject({
+      hasMovedOn: true,
+      messageCount: 2,
+      currentLeafMessageId: 'answer',
+    });
+    expect(continued.contextText).toBe('User: Use the other offer.\nAssistant: Mission completed.');
+  });
+
   test('builds current conversation context from newer user and assistant descendants', () => {
     const result = resolveFollowUpContinuationContext(
       [

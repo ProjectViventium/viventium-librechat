@@ -5,8 +5,11 @@
  * snapshot; startup/periodic refresh owns the service-authenticated probe.
  * === VIVENTIUM END === */
 
-const { PermissionBits, ResourceType } = require('librechat-data-provider');
+import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import type { Document } from 'mongodb';
+import { PermissionBits, ResourceType } from 'librechat-data-provider';
+import { activeWorkColdTimeoutMs } from './activeWorkService';
 import {
   CONVERSATION_ORCHESTRATION_TOOLS,
   isDeclaredConversationOrchestrator,
@@ -61,7 +64,10 @@ export interface OrchestrationReadinessSnapshot {
 }
 
 export interface OrchestrationReadinessDependencies {
-  logger: { warn(message: string, details?: ValueRecord): void };
+  logger: {
+    warn(message: string, details?: ValueRecord): void;
+    info?(message: string): void;
+  };
   getSourceOrderCapabilities(): ValueRecord;
   findUser(filter: ValueRecord, projection: string): Promise<ValueRecord | null>;
   getAgent(filter: ValueRecord): Promise<ReadinessAgent | null>;
@@ -88,6 +94,7 @@ function runtimeDependencies(): OrchestrationReadinessDependencies {
 const logger = {
   warn: (message: string, details?: ValueRecord) =>
     runtimeDependencies().logger.warn(message, details),
+  info: (message: string) => runtimeDependencies().logger.info?.(message),
 };
 const GenerationJobManager = {
   getSourceOrderCapabilities: () => runtimeDependencies().getSourceOrderCapabilities(),
@@ -124,6 +131,36 @@ let startupOwnerResolution: Promise<string> | null = null;
 let deploymentReadiness: InternalReadiness | null = null;
 let deploymentInFlight: Promise<OrchestrationReadinessSnapshot> | null = null;
 let timer: ReturnType<typeof setInterval> | null = null;
+let capabilityRequestOrdinal = 0;
+
+async function requestReadinessCapability(ownerId: string, scope: 'owner' | 'deployment') {
+  const startedAtMs = Date.now();
+  const started = performance.now();
+  const requestOrdinal = ++capabilityRequestOrdinal;
+  let errorClass = '';
+  try {
+    return await requestAccountApi({
+      ownerId,
+      path: '/v1/orchestration-capabilities',
+      timeoutMs: 1000,
+    });
+  } catch (cause) {
+    errorClass = cause instanceof Error ? cause.name : 'Error';
+    throw cause;
+  } finally {
+    logger.info(
+      `[VIVENTIUM][parallel-work-timing] ${JSON.stringify({
+        stage: 'readiness_capability_request',
+        scope,
+        requestOrdinal,
+        startedAtMs,
+        ownerHash: createHash('sha256').update(ownerId).digest('hex'),
+        durationMs: performance.now() - started,
+        errorClass,
+      })}`,
+    );
+  }
+}
 
 export function parallelWorkRequested(): boolean {
   return process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE === 'true';
@@ -359,6 +396,17 @@ function safeDiagnosticCode(value: unknown, fallback = 'readiness_unavailable'):
   return /^[a-z0-9_.-]{1,120}$/.test(code) ? code : fallback;
 }
 
+function logReadinessStage(ownerId: string, stage: string, details: ValueRecord): void {
+  // Serialize into the message: the host logger may discard a second metadata argument.
+  logger.info(
+    `[VIVENTIUM][parallel-work-timing] ${JSON.stringify({
+      stage,
+      ownerHash: ownerId ? createHash('sha256').update(ownerId).digest('hex') : null,
+      ...details,
+    })}`,
+  );
+}
+
 function resolvedAgentToolNames(agent: ReadinessAgent | null): Set<string> {
   const names = new Set<string>();
   for (const tool of agent?.tools || []) {
@@ -562,13 +610,20 @@ export async function refreshOrchestrationReadiness({
     return probeCapacitySnapshot(normalizedOwnerId);
   }
   const mainAgentId = String(process.env.VIVENTIUM_MAIN_AGENT_ID || '').trim();
+  const probeStartedAt = performance.now();
+  let capabilityMs: number | null = null;
+  let mainAgentMs: number | null = null;
+  let errorClass = '';
   const operation = Promise.all([
-    requestAccountApi({
-      ownerId: normalizedOwnerId,
-      path: '/v1/orchestration-capabilities',
-      timeoutMs: 1000,
+    requestReadinessCapability(normalizedOwnerId, 'owner').finally(() => {
+      capabilityMs = performance.now() - probeStartedAt;
     }),
-    mainAgentId ? accessibleMainAgent(mainAgentId, normalizedOwnerId) : Promise.resolve(null),
+    (mainAgentId
+      ? accessibleMainAgent(mainAgentId, normalizedOwnerId)
+      : Promise.resolve(null)
+    ).finally(() => {
+      mainAgentMs = performance.now() - probeStartedAt;
+    }),
   ])
     .then(([capability, mainAgent]) => {
       const isolationReady = validReadyCapability(capability);
@@ -657,6 +712,7 @@ export async function refreshOrchestrationReadiness({
       const runtimeError = error as { code?: string; name?: string };
       const previous = readinessRecord(normalizedOwnerId);
       const diagnosticCode = safeDiagnosticCode(runtimeError.code || runtimeError.name);
+      errorClass = safeDiagnosticCode(runtimeError.name, 'unknown');
       const next: InternalReadiness = {
         status: 'unavailable',
         reason: 'readiness_unavailable',
@@ -677,6 +733,19 @@ export async function refreshOrchestrationReadiness({
       return orchestrationReadinessSnapshot({ ownerId: normalizedOwnerId });
     })
     .finally(() => {
+      const observed = readinessRecord(normalizedOwnerId);
+      logReadinessStage(normalizedOwnerId, 'readiness_probe', {
+        elapsedMs: performance.now() - probeStartedAt,
+        capabilityMs,
+        mainAgentMs,
+        capabilityTimeoutMs: 1000,
+        status: observed.status,
+        reason: observed.reason,
+        checkedAtMs: observed.checkedAtMs,
+        diagnosticCode: observed.diagnosticCode || '',
+        errorClass,
+        storagePressure: observed.storagePressure,
+      });
       if (inFlightByOwner.get(normalizedOwnerId) === operation) {
         inFlightByOwner.delete(normalizedOwnerId);
       }
@@ -696,6 +765,63 @@ export function observeOrchestrationOwner(ownerId: unknown): OrchestrationReadin
     void refreshOrchestrationReadiness({ ownerId: normalizedOwnerId, observed: false });
   }
   return snapshot;
+}
+
+/* === VIVENTIUM START ===
+ * Main authoring reuses fresh owner observations. A cold/stale owner gets only the existing
+ * Active Work cold budget to join its deduplicated probe; explicit warm-up retains the long wait.
+ * Native execution still owns admission, storage, capacity, ACL and atomic lease checks.
+ * === VIVENTIUM END === */
+export async function authoringOrchestrationReadiness({
+  ownerId,
+  sourceId,
+  consumer,
+  timeoutMs = activeWorkColdTimeoutMs(),
+}: {
+  ownerId?: unknown;
+  sourceId?: unknown;
+  consumer?: 'telegram' | 'tool_discovery';
+  timeoutMs?: number;
+} = {}): Promise<OrchestrationReadinessSnapshot> {
+  const normalizedOwnerId = String(ownerId || '').trim();
+  const startedAt = performance.now();
+  const budgetMs = Math.max(0, Number(timeoutMs) || 0);
+  let probeCount = 0;
+  const complete = (snapshot: OrchestrationReadinessSnapshot, outcome: string) => {
+    logReadinessStage(normalizedOwnerId, 'turn_readiness', {
+      sourceHash: sourceId ? createHash('sha256').update(String(sourceId)).digest('hex') : null,
+      consumer: consumer || 'unknown',
+      elapsedMs: performance.now() - startedAt,
+      timeoutMs: budgetMs,
+      probeCount,
+      outcome,
+      requested: snapshot.requested,
+      available: snapshot.available,
+      status: snapshot.status,
+      reason: snapshot.reason,
+      checkedAtMs: snapshot.checkedAtMs,
+      ageMs: snapshot.checkedAtMs > 0 ? Math.max(0, Date.now() - snapshot.checkedAtMs) : null,
+      storagePressure: snapshot.storagePressure,
+    });
+    return snapshot;
+  };
+  if (normalizedOwnerId) observeOwner(normalizedOwnerId);
+  const snapshot = orchestrationReadinessSnapshot({ ownerId: normalizedOwnerId });
+  if (!snapshot.requested || !normalizedOwnerId) return complete(snapshot, 'not_requested');
+  if (!['unknown', 'stale'].includes(snapshot.status)) return complete(snapshot, 'fresh_snapshot');
+
+  observeOrchestrationOwner(normalizedOwnerId);
+  const probe = inFlightByOwner.get(normalizedOwnerId);
+  if (!probe || budgetMs <= 0) return complete(snapshot, 'cold_budget');
+  probeCount = 1;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const observed = await Promise.race([
+    probe,
+    new Promise<OrchestrationReadinessSnapshot>((resolve) => {
+      timeout = setTimeout(() => resolve(snapshot), budgetMs);
+    }),
+  ]).finally(() => clearTimeout(timeout));
+  return complete(observed, observed === snapshot ? 'cold_budget' : 'refreshed_snapshot');
 }
 
 async function resolveStartupOwnerId(): Promise<string> {
@@ -732,11 +858,7 @@ export async function refreshStartupOrchestrationReadiness(): Promise<Orchestrat
     };
     return orchestrationDeploymentReadinessSnapshot();
   }
-  const operation = requestAccountApi({
-    ownerId,
-    path: '/v1/orchestration-capabilities',
-    timeoutMs: 1000,
-  })
+  const operation = requestReadinessCapability(ownerId, 'deployment')
     .then((capability) => {
       const previous = deploymentReadiness || unknownReadiness();
       const deploymentScoped = hasTypedDeploymentScope(capability);
@@ -836,6 +958,24 @@ export async function refreshStartupOrchestrationReadiness(): Promise<Orchestrat
   return operation;
 }
 
+const DEFINITIVE_READINESS_REJECTIONS = new Set([
+  'isolated_parallel_policy_disabled',
+  'native_parallel_not_authorized',
+  'parallel_clean_room_network_unconfigured',
+  'parallel_clean_room_provider_proxy_unconfigured',
+  'parallel_clean_room_broker_proxy_unconfigured',
+  'parallel_clean_room_provider_egress_network_unconfigured',
+  'parallel_clean_room_proxy_image_unconfigured',
+  'parallel_clean_room_proxy_upstream_unconfigured',
+  'main_agent_unconfigured',
+  'main_agent_undeclared',
+  'main_agent_tools_missing',
+]);
+
+function definitiveReadinessRejection(snapshot: OrchestrationReadinessSnapshot): boolean {
+  return snapshot.status === 'unready' && DEFINITIVE_READINESS_REJECTIONS.has(snapshot.reason);
+}
+
 export async function waitForOrchestrationReadiness({
   ownerId,
   timeoutMs = positiveBoundedMs(
@@ -860,14 +1000,15 @@ export async function waitForOrchestrationReadiness({
   let snapshot = orchestrationReadinessSnapshot({ ownerId: normalizedOwnerId });
   if (!snapshot.requested) return snapshot;
   if (!normalizedOwnerId) return snapshot;
-  if (snapshot.available) return snapshot;
+  if (snapshot.available || definitiveReadinessRejection(snapshot)) return snapshot;
   const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
   do {
     snapshot = await refreshOrchestrationReadiness({
       ownerId: normalizedOwnerId,
       observed: false,
     });
-    if (snapshot.available || Date.now() >= deadline) return snapshot;
+    if (snapshot.available || definitiveReadinessRejection(snapshot) || Date.now() >= deadline)
+      return snapshot;
     await new Promise((resolve) =>
       setTimeout(
         resolve,

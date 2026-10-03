@@ -9,7 +9,7 @@ import type {
 import { MessageContext, SearchContext } from '~/Providers';
 import { ParallelContentRenderer, type PartWithIndex } from './ParallelContent';
 import { mapAttachments } from '~/utils';
-import { EditTextPart, EmptyText } from './Parts';
+import { AttachmentGroup, EditTextPart, EmptyText } from './Parts';
 import MemoryArtifacts from './MemoryArtifacts';
 import { HarnessActivityPanel } from './HarnessActivity';
 import Sources from '~/components/Web/Sources';
@@ -82,6 +82,12 @@ const ContentParts = memo(function ContentParts({
   isLatestMessage,
 }: ContentPartsProps) {
   const attachmentMap = useMemo(() => mapAttachments(attachments ?? []), [attachments]);
+  /* === VIVENTIUM START === Message files need no invented tool-call identity. === */
+  const messageAttachments = useMemo(
+    () => attachments?.filter((attachment) => !attachment.toolCallId),
+    [attachments],
+  );
+  /* === VIVENTIUM END === */
   const effectiveIsSubmitting = isLatestMessage ? isSubmitting : false;
   const cortexTypes = useMemo(
     () =>
@@ -294,15 +300,20 @@ const ContentParts = memo(function ContentParts({
   );
   if (hasParallelContent) {
     return (
-      <ParallelContentRenderer
-        content={displayContent}
-        messageId={messageId}
-        conversationId={conversationId}
-        attachments={attachments}
-        searchResults={searchResults}
-        isSubmitting={effectiveIsSubmitting}
-        renderPart={renderPart}
-      />
+      <>
+        <ParallelContentRenderer
+          content={displayContent}
+          messageId={messageId}
+          conversationId={conversationId}
+          attachments={attachments}
+          searchResults={searchResults}
+          isSubmitting={effectiveIsSubmitting}
+          renderPart={renderPart}
+        />
+        {/* === VIVENTIUM START === Keep message files outside tool-owned attachment groups. === */}
+        <AttachmentGroup attachments={messageAttachments} />
+        {/* === VIVENTIUM END === */}
+      </>
     );
   }
 
@@ -347,6 +358,9 @@ const ContentParts = memo(function ContentParts({
         </Container>
       )}
       {sequentialParts.map(({ part, idx }) => renderPart(part, idx, idx === lastSequentialIdx))}
+      {/* === VIVENTIUM START === Reuse normal file download and unavailable presentation. === */}
+      <AttachmentGroup attachments={messageAttachments} />
+      {/* === VIVENTIUM END === */}
     </SearchContext.Provider>
   );
 });

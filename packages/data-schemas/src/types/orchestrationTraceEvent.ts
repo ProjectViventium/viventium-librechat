@@ -1,4 +1,9 @@
 /* === VIVENTIUM START === Append-only redacted orchestration trace event types. === VIVENTIUM END === */
+export const ORCHESTRATION_TRACE_REASONING_EFFORTS = ['default', 'none', 'minimal', 'low',
+  'medium', 'high', 'xhigh', 'max', 'extra', 'ultra', 'auto', 'adaptive'] as const;
+export const ORCHESTRATION_TRACE_CORTEX_STATUSES = ['activated', 'not_activated', 'timeout',
+  'unavailable', 'completed', 'failed', 'no_insight', 'cancelled', 'unresolved',
+  'wing_mode', 'insight_delivery', 'budget_disabled'] as const;
 
 export interface IOrchestrationTraceFacts {
   sourceEventRefHash?: string;
@@ -18,6 +23,7 @@ export interface IOrchestrationTraceFacts {
   fallbackAttemptRefHash?: string;
   responseRefHash?: string;
   presentationRefHash?: string;
+  cortexRefHash?: string;
   state?: string;
   surface?: string;
   callbackEvent?: string;
@@ -44,6 +50,9 @@ export interface IOrchestrationTraceFacts {
   action?: string;
   provider?: string;
   model?: string;
+  requestedModel?: string;
+  reasoningEffort?: string;
+  cortexStatus?: string;
   providerStatus?: string;
   attemptRole?: string;
   primaryProvider?: string;

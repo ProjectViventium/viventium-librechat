@@ -1,10 +1,30 @@
+import { ChatModelStreamHandler } from '@librechat/agents';
+import { getTrustedInteractionContext } from '../agents/interactionContext';
+
+interface AudioDeliveryRequest {
+  readonly _viventiumTelegram?: boolean;
+  readonly viventiumCallSession?: { readonly callSessionId?: string };
+  readonly body?: { readonly telegramAudioRequested?: boolean; readonly voiceMode?: boolean };
+}
+
+/** Audio eligibility comes from an authenticated adapter, never a client surface label. */
+export function isAudioDeliveryRequested(
+  request: AudioDeliveryRequest | null | undefined,
+): boolean {
+  if (request?._viventiumTelegram === true && request.body?.telegramAudioRequested === true) {
+    return true;
+  }
+  return (
+    request?.body?.voiceMode === true &&
+    (getTrustedInteractionContext(request)?.surface === 'voice' ||
+      Boolean(request.viventiumCallSession?.callSessionId))
+  );
+}
+
 export type DeliveryDispositionAudio = 'skip' | 'eligible';
 
 export type DeliveryDispositionSource =
-  | 'model'
-  | 'legacy_marker'
-  | 'required_missing'
-  | 'required_malformed';
+  'model' | 'legacy_marker' | 'required_missing' | 'required_malformed';
 
 export interface DeliveryDisposition {
   version: 1;
@@ -134,4 +154,40 @@ export function supportsMessagingDeliveryDisposition(capability: unknown): boole
     capability.messaging_delivery_disposition === true &&
     capability.messaging_delivery_disposition_version === 1
   );
+}
+
+/** The SDK dispatches a message delta inside this handler, before stream consumers run. */
+export function createDeliveryDispositionStreamHandler({
+  required,
+  beforeHandle,
+}: {
+  required: (...args: Parameters<ChatModelStreamHandler['handle']>) => boolean;
+  beforeHandle: ChatModelStreamHandler['handle'];
+}): ChatModelStreamHandler {
+  return new (class extends ChatModelStreamHandler {
+    async handle(...args: Parameters<ChatModelStreamHandler['handle']>): Promise<void> {
+      await beforeHandle(...args);
+      if (!args[3]) return;
+      if (!required(...args)) {
+        return super.handle(...args);
+      }
+      const captured = inspectProviderDeliveryDisposition(args[1]?.chunk);
+      const disposition = resolveEffectiveDeliveryDisposition({
+        audioEligible: true,
+        legacySkipVoice: false,
+        captured,
+      });
+      const metadata = { ...args[2] };
+      if (disposition) streamDeliveryDispositions.set(metadata, disposition);
+      return super.handle(args[0], args[1], metadata, args[3]);
+    }
+  })();
+}
+
+const streamDeliveryDispositions = new WeakMap<object, DeliveryDisposition>();
+
+export function getStreamDeliveryDisposition(
+  metadata?: Record<string, unknown>,
+): DeliveryDisposition | null {
+  return metadata ? streamDeliveryDispositions.get(metadata) ?? null : null;
 }

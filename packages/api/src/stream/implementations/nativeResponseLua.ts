@@ -120,7 +120,7 @@ if mode == 'finish' or mode == 'finish-cancelled' then
   end
   redis.call('HSET', KEYS[1], 'nativeResponseFinished', '1', 'generationCompleted', '1',
     'status', mode == 'finish-cancelled' and 'aborted' or 'complete', 'completedAt', now, 'finalEvent', ARGV[5])
-  redis.call('HDEL', KEYS[1], 'error')
+  redis.call('HDEL', KEYS[1], 'error', 'errorClass')
   return 1
 end
 return 1

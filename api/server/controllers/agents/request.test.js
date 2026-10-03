@@ -27,8 +27,11 @@ const mockReleaseInteractiveMainAdmissionFence = jest.fn();
 const mockGenerationJobManager = {
   retainLogicalTurnInput: jest.fn(async (_user, context) => context),
   createJob: jest.fn(),
+  commitLogicalTurnAuthor: jest.fn(),
+  relinquishLogicalTurnAuthor: jest.fn(),
   markMainResponseComplete: jest.fn(),
   finishNativeResponse: jest.fn(),
+  failRevokedNativeResponse: jest.fn(),
   acknowledgeStreamDelivery: jest.fn(),
   completeJob: jest.fn(),
   emitDone: jest.fn(),
@@ -86,6 +89,8 @@ jest.mock('~/models', () => ({
 }));
 
 jest.mock('~/db/models', () => ({
+  // The completion-error factory loads the existing Cortex service but performs no model I/O.
+  ViventiumCortexInsightDelivery: {},
   Message: {
     exists: (...args) => mockMessageExists(...args),
     updateOne: jest.fn(async () => ({ matchedCount: 1, modifiedCount: 1 })),
@@ -384,6 +389,39 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     },
   );
 
+  test.each([
+    [
+      'source_context_unavailable',
+      'The conversation context could not be preserved. Please retry this turn.',
+    ],
+    [undefined, 'The model provider could not complete this request.'],
+  ])(
+    'relays a public typed generation failure without internal diagnostic text (%s)',
+    async (code, expected) => {
+      const error = Object.assign(new Error('synthetic-private-diagnostic'), code ? { code } : {});
+      const client = makeClient(Promise.resolve());
+      client.sendMessage.mockRejectedValue(error);
+      const req = makeReq();
+      req.body.streamId = 'stream-1';
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        jest.fn(),
+      );
+      await jest.advanceTimersByTimeAsync(120);
+      expect(mockGenerationJobManager.emitError).toHaveBeenCalledWith(
+        'conv-1',
+        expected,
+        code || 'completion_error',
+      );
+      expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith('conv-1', expected);
+      expect(JSON.stringify(mockGenerationJobManager.emitError.mock.calls)).not.toContain(
+        'synthetic-private-diagnostic',
+      );
+    },
+  );
   test('saves an accepted interactive input and its send as one user message', async () => {
     const req = makeReq();
     setTrustedInteractionContext(req, {
@@ -530,7 +568,8 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       if (expectedError) {
         expect(mockGenerationJobManager.emitError).toHaveBeenCalledWith(
           expect.any(String),
-          expectedError,
+          hasError ? expectedError : 'The model provider could not complete this request.',
+          hasError ? 'provider_temporarily_unavailable' : 'completion_error',
         );
         expect(mockGenerationJobManager.finishNativeResponse).not.toHaveBeenCalled();
         expect(mockMarkNativeReplayStored).not.toHaveBeenCalled();
@@ -545,6 +584,83 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       }
     },
   );
+
+  test.each([
+    ['a source change revoked it before it finished', { status: 'cancelled' }, true],
+    ['Stop saved its snapshot', { status: 'cancelled', stopSnapshotStoredAt: 1 }, false],
+    ['it is still pending', { status: 'pending' }, false],
+  ])(
+    'ends a native stream with a typed failure only when %s',
+    async (_label, admission, revoked) => {
+      const req = makeReq();
+      req._viventiumNativeResponseIdentity = { invocationId: 'exact-native' };
+      const identity = req._viventiumNativeResponseIdentity;
+      mockRecoverSavedNativeResponse.mockResolvedValueOnce(null);
+      mockGetNativeResponse.mockResolvedValueOnce({ nativeResponse: admission });
+      mockGenerationJobManager.failRevokedNativeResponse.mockResolvedValueOnce(true);
+
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client: makeClient(Promise.resolve()) })),
+        jest.fn(),
+      );
+      await jest.advanceTimersByTimeAsync(120);
+      await Promise.resolve();
+
+      if (revoked) {
+        expect(mockGenerationJobManager.failRevokedNativeResponse).toHaveBeenCalledWith(
+          identity,
+          'native_response_revoked',
+        );
+      } else {
+        expect(mockGenerationJobManager.failRevokedNativeResponse).not.toHaveBeenCalled();
+      }
+      expect(mockGenerationJobManager.emitError).toHaveBeenCalledWith(
+        expect.any(String),
+        'The model provider could not complete this request.',
+        'completion_error',
+      );
+      expect(mockGenerationJobManager.finishNativeResponse).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each([
+    'native_input_declined',
+    'native_input_expired',
+    'native_input_cancelled',
+    'native_turn_cancelled',
+  ])('native terminal settles the Voice task with its typed failure %s', async (code) => {
+    const req = makeReq();
+    req.viventiumCallSession = { callSessionId: 'call-1' };
+    req.body.viventiumVoiceTaskId = 'task-1';
+    req.body.streamId = 'stream-1';
+    req._viventiumNativeResponseIdentity = { invocationId: 'exact-native' };
+    mockRecoverSavedNativeResponse.mockImplementationOnce(async (_identity, onTerminal) => {
+      onTerminal('failed');
+      return {
+        messageId: 'resp-msg-1',
+        error: true,
+        unfinished: false,
+        content: [{ type: 'error', error_class: code, error: 'Public stop message.' }],
+      };
+    });
+    await AgentController(
+      req,
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => ({ client: makeClient(Promise.resolve()) })),
+      jest.fn(),
+    );
+    await jest.advanceTimersByTimeAsync(120);
+    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+      'task-1',
+      { userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-1' },
+      { resultMessageId: 'resp-msg-1', error: { code, message: 'Public stop message.' } },
+    );
+    expect(mockGenerationJobManager.emitError).not.toHaveBeenCalled();
+  });
 
   test('authoritative native terminal bypasses memory, accepted continuity, and title success paths', async () => {
     const req = makeReq();
@@ -621,7 +737,8 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         expect(mockMarkNativeReplayStored).not.toHaveBeenCalled();
         expect(mockGenerationJobManager.emitError).toHaveBeenCalledWith(
           'conv-1',
-          'native_response_presentation_pending',
+          'The model provider could not complete this request.',
+          'completion_error',
         );
       }
     },
@@ -643,7 +760,8 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     expect(mockMarkNativeReplayStored).toHaveBeenCalled();
     expect(mockGenerationJobManager.emitError).toHaveBeenCalledWith(
       'conv-1',
-      'native_response_replay_pending',
+      'The model provider could not complete this request.',
+      'completion_error',
     );
   });
 
@@ -930,6 +1048,9 @@ describe('ResumableAgentController Phase B stream completion window', () => {
 
   test('persists the user source segment before superseded generation can exit', async () => {
     const req = makeReq();
+    req.viventiumCallSession = { callSessionId: 'call-1' };
+    req.body.viventiumVoiceTaskId = 'task-1';
+    req.body.streamId = 'stream-1';
     const abortSignal = { aborted: false, reason: undefined };
     mockGenerationJobManager.createJob.mockResolvedValueOnce({
       createdAt: 1,
@@ -977,7 +1098,320 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         context: expect.stringContaining('user source segment'),
       }),
     );
+    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledTimes(1);
+    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+      'task-1',
+      { userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-1' },
+      {},
+    );
   });
+
+  test('finishes a revision replaced while its obsolete operation failed, without an error answer', async () => {
+    const req = makeReq();
+    req.viventiumCallSession = { callSessionId: 'call-1' };
+    req.body.viventiumVoiceTaskId = 'task-1';
+    req.body.streamId = 'stream-1';
+    const abortSignal = { aborted: false, reason: undefined };
+    mockGenerationJobManager.createJob.mockResolvedValueOnce({
+      createdAt: 1,
+      abortController: { signal: abortSignal, abort: jest.fn() },
+      readyPromise: Promise.resolve(),
+      emitter: new EventEmitter(),
+    });
+    mockGenerationJobManager.getJob.mockResolvedValue({ createdAt: 1, status: 'superseded' });
+    const client = makeClient(Promise.resolve());
+    client.sendMessage.mockImplementationOnce(async (_text, options) => {
+      await options.onStart(
+        {
+          messageId: 'user-msg-a',
+          parentMessageId: '00000000-0000-0000-0000-000000000000',
+          conversationId: 'conv-1',
+          text: 'A',
+          isCreatedByUser: true,
+        },
+        'response-a',
+        true,
+      );
+      throw Object.assign(new Error('provider_response_failed'), { status: 409 });
+    });
+
+    await AgentController(
+      req,
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => ({ client })),
+      jest.fn(),
+    );
+    await jest.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockGenerationJobManager.emitError).not.toHaveBeenCalled();
+    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledTimes(1);
+    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+      'task-1',
+      { userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-1' },
+      {},
+    );
+    // Finished as superseded (no error argument), never as a failed answer.
+    expect(mockGenerationJobManager.completeJob).toHaveBeenCalled();
+    expect(mockGenerationJobManager.completeJob.mock.calls.every((call) => call.length === 1)).toBe(
+      true,
+    );
+    expect(mockSaveMessage).not.toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({ messageId: 'response-a', error: true }),
+      expect.anything(),
+    );
+  });
+
+  /* === VIVENTIUM START === Exact supersession task settlement and retained effect receipts. */
+  test.each(['superseded', 'user_cancelled'])(
+    'settles initialization abort %s through its existing typed outcome',
+    async (reason) => {
+      const req = makeReq();
+      req.viventiumCallSession = { callSessionId: 'call-1' };
+      req.body.viventiumVoiceTaskId = 'task-1';
+      req.body.streamId = 'stream-1';
+      const signal = { aborted: false, reason: undefined };
+      mockGenerationJobManager.createJob.mockResolvedValueOnce({
+        createdAt: 1,
+        abortController: { signal, abort: jest.fn() },
+        readyPromise: Promise.resolve(),
+        emitter: new EventEmitter(),
+      });
+      const client = makeClient(Promise.resolve());
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        async () => {
+          signal.aborted = true;
+          signal.reason = reason;
+          return { client };
+        },
+        jest.fn(),
+      );
+
+      expect(client.sendMessage).not.toHaveBeenCalled();
+      expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+        'task-1',
+        { userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-1' },
+        reason === 'superseded'
+          ? {}
+          : {
+              error: { code: 'generation_aborted', message: 'Request aborted during initialization' },
+            },
+      );
+      expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith(
+        ...(reason === 'superseded'
+          ? ['stream-1']
+          : ['stream-1', 'Request aborted during initialization']),
+      );
+    },
+  );
+
+  test.each([
+    ['superseded', 'running'],
+    ['user_cancelled', 'running'],
+    ['superseded', 'missing'],
+  ])(
+    'settles normal aborted return %s with durable job %s before a delayed status update',
+    async (reason, durableState) => {
+      const req = makeReq();
+      req.viventiumCallSession = { callSessionId: 'call-1' };
+      req.body.viventiumVoiceTaskId = 'task-1';
+      req.body.streamId = 'stream-1';
+      const signal = { aborted: false, reason: undefined };
+      mockGenerationJobManager.createJob.mockResolvedValueOnce({
+        createdAt: 1,
+        abortController: { signal, abort: jest.fn() },
+        readyPromise: Promise.resolve(),
+        emitter: new EventEmitter(),
+      });
+      mockGenerationJobManager.getJob.mockResolvedValue(
+        durableState === 'missing'
+          ? null
+          : {
+              createdAt: 1,
+              status: 'running',
+              adapterCapabilities: { supersede_scope: 'response_only' },
+            },
+      );
+      const client = makeClient(Promise.resolve());
+      const send = client.sendMessage.getMockImplementation();
+      client.sendMessage.mockImplementationOnce(async (...args) => {
+        const result = await send(...args);
+        signal.aborted = true;
+        signal.reason = reason;
+        return result;
+      });
+      await AgentController(req, makeRes(), jest.fn(), async () => ({ client }), jest.fn());
+      await jest.advanceTimersByTimeAsync(120);
+
+      expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledTimes(1);
+      expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+        'task-1',
+        { userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-1' },
+        reason === 'superseded'
+          ? {}
+          : { error: { code: 'generation_aborted', message: 'Request aborted' } },
+      );
+      if (reason === 'superseded') {
+        expect(mockGenerationJobManager.emitDone).not.toHaveBeenCalled();
+        if (durableState === 'missing') {
+          expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
+        } else {
+          expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith('stream-1');
+        }
+        expect(mockMessageFindOneAndDelete).toHaveBeenCalledWith(
+          expect.objectContaining({ messageId: 'resp-msg-1', user: 'user-1' }),
+        );
+      }
+    },
+  );
+
+  test.each([
+    [true, 'running', true],
+    [false, 'running', true],
+    [true, 'superseded', false],
+  ])(
+    'retains only an exact committed effect receipt during supersession (exact=%s, status=%s, signal=%s)',
+    async (exact, status, signalAborted) => {
+      const req = makeReq();
+      req.viventiumCallSession = { callSessionId: 'call-1' };
+      req.body.viventiumVoiceTaskId = 'task-1';
+      req.body.streamId = 'stream-1';
+      if (!signalAborted) req.body.conversationId = 'new';
+      const signal = { aborted: false, reason: undefined };
+      mockGenerationJobManager.createJob.mockResolvedValueOnce({
+        createdAt: 1,
+        abortController: { signal, abort: jest.fn() },
+        readyPromise: Promise.resolve(),
+        emitter: new EventEmitter(),
+      });
+      mockGenerationJobManager.getJob.mockImplementation(async () => {
+        const interactionContext = getTrustedInteractionContext(req);
+        return {
+          createdAt: 1,
+          status,
+          adapterCapabilities: { supersede_scope: 'response_only' },
+          deliveryPolicy: { commit_authority: 'external_adapter' },
+          responseMessageId: 'resp-msg-1',
+          interactionContext,
+          durableEffectReceipt: {
+            effect_kind: 'durable_work_accepted',
+            effect_ref: 'effect-1',
+            committed_at: 1,
+            response_message_id: 'resp-msg-1',
+            source_event_id: exact ? interactionContext?.source_event_id : 'foreign-source',
+          },
+        };
+      });
+      const client = makeClient(Promise.resolve());
+      client.startDeferredMemoryWriter = jest.fn(async () => ({ status: 'admitted' }));
+      client.admitMemoryWriter = jest.fn();
+      const addTitle = jest.fn(async () => undefined);
+      const send = client.sendMessage.getMockImplementation();
+      client.sendMessage.mockImplementationOnce(async (...args) => {
+        const result = await send(...args);
+        if (signalAborted) {
+          signal.aborted = true;
+          signal.reason = 'superseded';
+        }
+        return result;
+      });
+      await AgentController(req, makeRes(), jest.fn(), async () => ({ client }), addTitle);
+      await jest.advanceTimersByTimeAsync(120);
+
+      expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledTimes(1);
+      expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+        'task-1',
+        { userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-1' },
+        {},
+      );
+      expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith('stream-1');
+      if (!signalAborted) {
+        expect(client.startDeferredMemoryWriter).not.toHaveBeenCalled();
+        expect(client.admitMemoryWriter).not.toHaveBeenCalled();
+        expect(addTitle).not.toHaveBeenCalled();
+        expect(mockGenerationJobManager.markMainResponseComplete).not.toHaveBeenCalled();
+        expect(mockCommitAcceptedMainTurn).not.toHaveBeenCalled();
+      }
+      if (exact) {
+        expect(mockMessageFindOneAndDelete).not.toHaveBeenCalled();
+        expect(mockGenerationJobManager.emitDone).toHaveBeenCalledWith(
+          'stream-1',
+          expect.objectContaining({
+            responseMessage: expect.objectContaining({ messageId: 'resp-msg-1' }),
+          }),
+        );
+      } else {
+        expect(mockMessageFindOneAndDelete).toHaveBeenCalledWith(
+          expect.objectContaining({ messageId: 'resp-msg-1', user: 'user-1' }),
+        );
+        expect(mockGenerationJobManager.emitDone).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  test('a superseded unsupported-native graph return cannot start a deferred writer before its signal', async () => {
+    const req = makeReq();
+    req.viventiumCallSession = { callSessionId: 'call-1' };
+    req.body.viventiumVoiceTaskId = 'task-1';
+    req.body.streamId = 'stream-1';
+    req._viventiumNativeResponseIdentity = { invocationId: 'exact-native' };
+    mockGenerationJobManager.getJob.mockResolvedValue({
+      createdAt: 1,
+      status: 'superseded',
+      adapterCapabilities: { supersede_scope: 'response_only' },
+    });
+    mockRecoverSavedNativeResponse.mockResolvedValueOnce(null);
+    mockGetNativeResponse.mockResolvedValueOnce({ nativeResponse: { status: 'unsupported' } });
+    const client = makeClient(Promise.resolve());
+    client.startDeferredMemoryWriter = jest.fn(async () => ({ status: 'admitted' }));
+    await AgentController(req, makeRes(), jest.fn(), async () => ({ client }), jest.fn());
+    await jest.advanceTimersByTimeAsync(120);
+
+    expect(client.startDeferredMemoryWriter).not.toHaveBeenCalled();
+    expect(mockMessageFindOneAndDelete).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: 'resp-msg-1', user: 'user-1' }),
+    );
+    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+      'task-1',
+      { userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-1' },
+      {},
+    );
+    expect(mockGenerationJobManager.emitError).not.toHaveBeenCalled();
+    expect(mockGenerationJobManager.markMainResponseComplete).not.toHaveBeenCalled();
+  });
+
+  test('a real provider failure is not superseded by another job generation or error wording', async () => {
+    const req = makeReq();
+    req.viventiumCallSession = { callSessionId: 'call-1' };
+    req.body.viventiumVoiceTaskId = 'task-1';
+    req.body.streamId = 'stream-1';
+    mockGenerationJobManager.getJob.mockResolvedValue({ createdAt: 2, status: 'superseded' });
+    const error = Object.assign(new Error('superseded provider request failed'), {
+      code: 'provider_failure',
+    });
+    const client = makeClient(Promise.resolve());
+    client.sendMessage.mockRejectedValueOnce(error);
+    await AgentController(req, makeRes(), jest.fn(), async () => ({ client }), jest.fn());
+    await jest.advanceTimersByTimeAsync(120);
+    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+      'task-1',
+      { userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-1' },
+      { error },
+    );
+    expect(mockGenerationJobManager.emitError).toHaveBeenCalledWith(
+      'stream-1',
+      'The model provider could not complete this request.',
+      'completion_error',
+    );
+  });
+
+  /* === VIVENTIUM END === */
 
   test('initial root placeholder alone carries the exact captured Main write binding', async () => {
     const req = makeReq();
@@ -1057,6 +1491,101 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         );
     },
   );
+
+  test('an external adapter turn schedules Main compaction when its acceptance commits', async () => {
+    const req = makeReq();
+    setTrustedInteractionContext(
+      req,
+      {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'telegram',
+        conversation_id: 'conv-1',
+        revision: 1,
+        source_event_id: 'telegram-update-7',
+      },
+      { segment_stability: 'immediate', supersede_scope: 'response_and_authoring' },
+      { commit_authority: 'external_adapter' },
+    );
+    const identity = Object.freeze({
+      ownerId: req.user.id,
+      agentId: 'agent',
+      stableAuthoritySha256: 'a'.repeat(64),
+    });
+    Object.defineProperty(req, '_viventiumAcceptedMainCompactionIdentityV1', { value: identity });
+    const client = makeClient(Promise.resolve());
+    client.options.agent = { id: 'agent' };
+    await AgentController(
+      req,
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => ({ client })),
+      jest.fn(),
+    );
+    await jest.advanceTimersByTimeAsync(120);
+    await Promise.resolve();
+    // Delivery is still provisional: nothing is accepted, so nothing is compacted yet.
+    expect(mockEnsureAcceptedMainCompaction).not.toHaveBeenCalled();
+
+    const { scheduleExternallyAcceptedMainCompaction } = require('@librechat/api');
+    expect(
+      scheduleExternallyAcceptedMainCompaction(
+        { userId: req.user.id, responseMessageId: 'resp-msg-1' },
+        { status: 'committed' },
+      ),
+    ).toBe(true);
+    expect(mockEnsureAcceptedMainCompaction).toHaveBeenCalledTimes(1);
+    expect(mockEnsureAcceptedMainCompaction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ...identity,
+        trigger: 'accepted_turn',
+        req,
+        agent: client.options.agent,
+      }),
+    );
+  });
+
+  test('an externally delivered graph prepares its writer before FINAL and admits it once after acceptance', async () => {
+    const req = makeReq();
+    setTrustedInteractionContext(req, {
+      actor_kind: 'external_user', origin: 'interactive', surface: 'telegram',
+      conversation_id: 'conv-1', revision: 1, source_event_id: 'telegram-graph-source',
+    }, { segment_stability: 'immediate', supersede_scope: 'response_and_authoring' },
+    { commit_authority: 'external_adapter' });
+    Object.defineProperty(req, '_viventiumAcceptedMainCompactionIdentityV1', { value: {
+      ownerId: req.user.id, agentId: 'agent', stableAuthoritySha256: 'a'.repeat(64),
+    } });
+    req._viventiumNativeResponseIdentity = { invocationId: 'unsupported-graph' };
+    mockRecoverSavedNativeResponse.mockResolvedValueOnce(null);
+    mockGetNativeResponse.mockResolvedValueOnce({ nativeResponse: { status: 'unsupported' } });
+    const client = makeClient(Promise.resolve());
+    client.options.agent = { id: 'agent' };
+    client.prepareDeferredMemoryWriter = jest.fn(() => true);
+    client.startDeferredMemoryWriter = jest.fn(async () => true);
+    client.admitMemoryWriter = jest.fn(async () => true);
+    await AgentController(req, makeRes(), jest.fn(), async () => ({ client }), jest.fn());
+    await jest.advanceTimersByTimeAsync(120);
+    expect(client.prepareDeferredMemoryWriter).toHaveBeenCalledTimes(1);
+    expect(client.startDeferredMemoryWriter).not.toHaveBeenCalled();
+    expect(client.admitMemoryWriter).not.toHaveBeenCalled();
+    expect(mockGenerationJobManager.emitDone).toHaveBeenCalledWith(expect.any(String),
+      expect.objectContaining({ memoryWriterScheduled: true }));
+    // Disposal happens before the authenticated adapter ACK. Both captured follow-ups survive it.
+    client.options = null;
+    const { scheduleExternallyAcceptedMainCompaction } = require('@librechat/api');
+    const presentation = { userId: req.user.id, responseMessageId: 'resp-msg-1' };
+    for (const status of ['failed', 'partial', 'removed']) {
+      expect(scheduleExternallyAcceptedMainCompaction(presentation, { status })).toBe(false);
+    }
+    expect(scheduleExternallyAcceptedMainCompaction({ ...presentation, userId: 'foreign' },
+      { status: 'committed' })).toBe(false);
+    expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'committed' })).toBe(true);
+    await Promise.resolve();
+    expect(client.admitMemoryWriter).toHaveBeenCalledTimes(1);
+    expect(mockEnsureAcceptedMainCompaction).toHaveBeenCalledTimes(1);
+    expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'already_committed' })).toBe(false);
+    expect(client.admitMemoryWriter).toHaveBeenCalledTimes(1);
+  });
 
   test('durably removes an unfinished older assistant revision when the next revision starts', async () => {
     const persistedRows = [
@@ -1184,6 +1713,106 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       );
     },
   );
+
+  test.each([
+    ['Telegram audio with a versioned disposition provider', true, 'telegram'],
+    ['Telegram text', false, 'telegram'],
+    ['authenticated voice audio', true, 'voice'],
+    ['untrusted voice audio flag', false, 'voice-untrusted'],
+  ])(
+    'binds the adapter input to its stream before a %s started receipt',
+    async (_mode, dispositionRequired, surface) => {
+      const req = makeReq();
+      if (surface === 'telegram') {
+        req._viventiumTelegram = true;
+        req.body.telegramAudioRequested = dispositionRequired;
+      } else {
+        req.body.voiceMode = true;
+        if (surface === 'voice') req.viventiumCallSession = { callSessionId: 'synthetic-call' };
+      }
+      req.body.endpointOption.agent = { provider: 'disposition-provider' };
+      req.config = {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              'disposition-provider': {
+                messaging_delivery_disposition: true,
+                messaging_delivery_disposition_version: 1,
+              },
+            },
+          },
+        },
+      };
+      const order = [];
+      req._viventiumBeforeGenerationReceipt = jest.fn(async () => {
+        order.push('bind');
+      });
+      const res = makeRes();
+      res.json.mockImplementation(() => {
+        order.push('started');
+      });
+
+      await AgentController(
+        req,
+        res,
+        jest.fn(),
+        jest.fn(async () => ({ client: makeClient(Promise.resolve()) })),
+        jest.fn(),
+      );
+
+      const [streamId] = mockGenerationJobManager.createJob.mock.calls[0];
+      expect(req._viventiumBeforeGenerationReceipt).toHaveBeenCalledWith({
+        streamId,
+        conversationId: 'conv-1',
+      });
+      expect(order.slice(0, 2)).toEqual(['bind', 'started']);
+      const started = res.json.mock.calls[0][0];
+      expect(started).toMatchObject({ streamId, status: 'started' });
+      // The started receipt carries the same typed delivery contract a duplicate receipt carries.
+      expect(started.deliveryDispositionRequired).toBe(dispositionRequired ? true : undefined);
+    },
+  );
+
+  /* === VIVENTIUM START ===
+   * Purpose: a revision becomes its sources' author just before its input binds to the stream,
+   * after every step that can fail, and gives the authorship back if that binding fails.
+   * === VIVENTIUM END === */
+  test('commits authorship before binding the adapter input and gives it back when binding fails', async () => {
+    const order = [];
+    mockGenerationJobManager.commitLogicalTurnAuthor.mockImplementation(async () => {
+      order.push('author');
+    });
+    mockGenerationJobManager.relinquishLogicalTurnAuthor.mockImplementation(async () => {
+      order.push('relinquish');
+    });
+    const initialize = jest.fn(async () => ({ client: makeClient(Promise.resolve()) }));
+    const req = makeReq();
+    req._viventiumBeforeGenerationReceipt = jest.fn(async () => {
+      order.push('bind');
+    });
+    const res = makeRes();
+    res.json.mockImplementation(() => {
+      order.push('started');
+    });
+    await AgentController(req, res, jest.fn(), initialize, jest.fn());
+    const [streamId, userId] = mockGenerationJobManager.createJob.mock.calls[0];
+    expect(mockGenerationJobManager.commitLogicalTurnAuthor).toHaveBeenCalledWith(streamId, userId);
+    expect(order.slice(0, 3)).toEqual(['author', 'bind', 'started']);
+
+    order.length = 0;
+    const failing = makeReq();
+    failing._viventiumBeforeGenerationReceipt = jest.fn(async () => {
+      order.push('bind');
+      throw new Error('input binding failed');
+    });
+    await AgentController(failing, makeRes(), jest.fn(), initialize, jest.fn());
+    expect(order).toEqual(['author', 'bind', 'relinquish']);
+    expect(mockGenerationJobManager.relinquishLogicalTurnAuthor).toHaveBeenCalledWith(
+      mockGenerationJobManager.createJob.mock.calls[1][0],
+      userId,
+    );
+  });
+  /* === VIVENTIUM END === */
 
   test('keeps external-adapter output unfinished until its authenticated delivery acknowledgement', async () => {
     const req = makeReq();
@@ -1567,12 +2196,11 @@ describe('rapid input before asynchronous initialization', () => {
       text: 'First goal',
       parentMessageId: null,
     });
-    const canonical = AgentController.__testables.resolveCanonicalConversationId(
-      req,
-      req.user.id,
-      'new',
-    );
+    const canonical = AgentController.resolveCanonicalConversationId(req, req.user.id, 'new');
     expect(early.conversation_id).toBe(canonical);
+    expect(AgentController.acceptedInteractionSourceId(req)).toBe(
+      mockSaveMessage.mock.calls[0][1].messageId,
+    );
     expect(mockSaveMessage).toHaveBeenCalledWith(
       req,
       expect.objectContaining({
@@ -1616,6 +2244,9 @@ describe('rapid input before asynchronous initialization', () => {
   });
   test('stale initialization sends the existing supersession receipt without initializing or cancelling work', async () => {
     const req = makeReq();
+    req.viventiumCallSession = { callSessionId: 'call-1' };
+    req.body.viventiumVoiceTaskId = 'task-1';
+    req.body.streamId = 'stream-1';
     trusted(req, 'source-a');
     const res = makeRes();
     const init = jest.fn();
@@ -1635,6 +2266,11 @@ describe('rapid input before asynchronous initialization', () => {
       conversationId: 'conv-1',
     });
     expect(init).not.toHaveBeenCalled();
+    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+      'task-1',
+      { userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-1' },
+      {},
+    );
     expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
   });
   test('a ready older input releases its preparation receipt when current Main is busy without cancelling work', async () => {

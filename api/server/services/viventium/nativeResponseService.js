@@ -10,6 +10,8 @@ const {
   nativeJobMatches,
   interactionPresentationSequence,
   projectNativeToolEvidence,
+  isAudioDeliveryRequested,
+  supportsMessagingDeliveryDisposition,
 } = require('@librechat/api');
 const {
   extractEnvVariable,
@@ -58,6 +60,48 @@ function projectNativeMessage(identity, response, message, purpose, candidate) {
   return sanitizeVoiceAssistantMessageForPersistence(req, message);
 }
 
+async function resolveNativeResponseRoute(identity) {
+  const db = require('~/models');
+  const user = await db.findUser({ _id: identity.userId });
+  if (!user) throw new Error('native_response_owner_unavailable');
+  const config = await require('~/server/services/Config').getAppConfig({ role: user.role });
+  const req = { user: { ...user, id: identity.userId }, config };
+  const agent = await require('~/models/Agent').loadAgent({
+    req,
+    agent_id: identity.agentId,
+    endpoint: EModelEndpoint.agents,
+  });
+  if (
+    !agent ||
+    (!isEphemeralAgentId(identity.agentId) &&
+      user.role !== SystemRoles.ADMIN &&
+      (!agent._id ||
+        !(await require('~/server/services/PermissionService').checkPermission({
+          userId: identity.userId,
+          role: user.role,
+          resourceType: ResourceType.AGENT,
+          resourceId: agent._id,
+          requiredPermission: PermissionBits.VIEW,
+        }))))
+  )
+    throw new Error('native_response_agent_unavailable');
+  const capability = config?.endpoints?.agents?.providerCapabilities?.[identity.providerId];
+  const endpoint = config?.endpoints?.custom?.find((entry) => entry.name === identity.providerId);
+  if (
+    !endpoint ||
+    capability?.conversation_session !== true ||
+    capability?.workspace_binding !== true
+  ) {
+    throw new Error('native_response_provider_unavailable');
+  }
+  const apiKey = extractEnvVariable(endpoint.apiKey || '');
+  if (!apiKey || apiKey.includes('${')) throw new Error('native_response_auth_unavailable');
+  return {
+    baseURL: extractEnvVariable(endpoint.baseURL || ''),
+    headers: { Authorization: `Bearer ${apiKey}`, 'X-Viventium-User-Id': identity.userId },
+  };
+}
+
 let service;
 function getService() {
   if (service) return service;
@@ -65,6 +109,27 @@ function getService() {
   service = createNativeResponseRecoveryService({
     db,
     projectMessage: projectNativeMessage,
+    prepareAttachments: async (identity, response, candidate) => {
+      const user = await db.findUser({ _id: identity.userId });
+      if (!user) throw new Error('native_response_owner_unavailable');
+      const config = await require('~/server/services/Config').getAppConfig({ role: user.role });
+      const context = identity.deliveryContext;
+      return require('./nativeOutputFiles').prepareNativeOutputFiles(
+        {
+          user: { ...user, id: identity.userId },
+          config,
+          _viventiumTelegram: context?.surface === 'telegram' && context.authenticated === true,
+          body: { endpoint: 'agents', viventiumSurface: context?.surface },
+        },
+        response.glasshive.output_files,
+        {
+          ...identity,
+          requestId: candidate.requestId,
+          runId: candidate.runId,
+          invocationId: identity.invocationId,
+        },
+      );
+    },
     transaction: runNativeResponseTransaction,
     bind: (identity) => GenerationJobManager.bindNativeResponse(identity),
     commit: (identity, digest) => GenerationJobManager.commitNativeResponse(identity, digest),
@@ -80,51 +145,142 @@ function getService() {
     authorizeTerminal: async (identity) =>
       (await GenerationJobManager.revokeNativeResponse(identity, true)).status === 'revoked',
     release: (identity) => GenerationJobManager.settleNativeResponse(identity, 'unsupported'),
-    resolveRoute: async (identity) => {
-      const user = await db.findUser({ _id: identity.userId });
-      if (!user) throw new Error('native_response_owner_unavailable');
-      const config = await require('~/server/services/Config').getAppConfig({ role: user.role });
-      const req = { user: { ...user, id: identity.userId }, config };
-      const agent = await require('~/models/Agent').loadAgent({
-        req,
-        agent_id: identity.agentId,
-        endpoint: EModelEndpoint.agents,
-      });
-      if (
-        !agent ||
-        (!isEphemeralAgentId(identity.agentId) &&
-          user.role !== SystemRoles.ADMIN &&
-          (!agent._id ||
-            !(await require('~/server/services/PermissionService').checkPermission({
-              userId: identity.userId,
-              role: user.role,
-              resourceType: ResourceType.AGENT,
-              resourceId: agent._id,
-              requiredPermission: PermissionBits.VIEW,
-            }))))
-      )
-        throw new Error('native_response_agent_unavailable');
-      const capability = config?.endpoints?.agents?.providerCapabilities?.[identity.providerId];
-      const endpoint = config?.endpoints?.custom?.find(
-        (entry) => entry.name === identity.providerId,
-      );
-      if (
-        !endpoint ||
-        capability?.conversation_session !== true ||
-        capability?.workspace_binding !== true
-      ) {
-        throw new Error('native_response_provider_unavailable');
-      }
-      const apiKey = extractEnvVariable(endpoint.apiKey || '');
-      if (!apiKey || apiKey.includes('${')) throw new Error('native_response_auth_unavailable');
-      return {
-        baseURL: extractEnvVariable(endpoint.baseURL || ''),
-        headers: { Authorization: `Bearer ${apiKey}`, 'X-Viventium-User-Id': identity.userId },
-      };
-    },
+    resolveRoute: resolveNativeResponseRoute,
   });
   return service;
 }
+
+/* === VIVENTIUM START ===
+ * Feature: Release-gated current revision.
+ * Purpose: A newer revision of the same logical turn waits, while it stays current, for every
+ * superseded native Main operation it carries to release before Core admits it. Only GlassHive's
+ * release acknowledgement grants dispatch. Its reported response timeout, anchored at the
+ * revision's start, ends the wait truthfully; an unreachable host keeps the revision pending, and
+ * a route that cannot be asked is the typed occupied condition. Typed native occupancy after
+ * dispatch stays pending the same way until GlassHive's own anchored deadline ends it.
+ * === VIVENTIUM END === */
+const NATIVE_RELEASE_POLL_DELAYS_MS = Object.freeze([150, 300, 600, 1000, 2000]);
+let lastReportedResponseTimeoutMs = 0;
+
+function waitForNativeRelease(delayMs) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, delayMs);
+    timer.unref?.();
+  });
+}
+
+function supersededDispatchError() {
+  const error = new Error('operation was aborted');
+  error.name = 'AbortError';
+  error.code = 'superseded';
+  return error;
+}
+
+function releaseUnconfirmedError(code, message) {
+  return Object.assign(new Error(message), { code, errorClass: code });
+}
+
+function createNativeResponseRelease(req, route, deps = {}) {
+  const probe =
+    deps.probe || require('./GlassHiveConversationProviderService').probeHarnessFamilyRelease;
+  const sleep = deps.sleep || waitForNativeRelease;
+  const now = deps.now || Date.now;
+  const providerId = route.endpoint || route.provider;
+  const endpoint = req.config?.endpoints?.custom?.find((entry) => entry.name === providerId);
+  const baseURL = extractEnvVariable(endpoint?.baseURL || '');
+  const apiKey = extractEnvVariable(endpoint?.apiKey || '');
+  const ownerId = String(req.user?.id || '').trim();
+  const routable = Boolean(
+    baseURL && !baseURL.includes('${') && apiKey && !apiKey.includes('${') && ownerId,
+  );
+  let occupiedWaits = 0;
+
+  const currentTargets = async (context) => {
+    const store = GenerationJobManager.getJobStore();
+    const job = await store.getJob(context.streamId);
+    if (
+      !job ||
+      job.createdAt !== context.jobCreatedAt ||
+      job.userId !== context.userId ||
+      job.status !== 'running' ||
+      !(await store.isCurrentLogicalTurn(context.streamId))
+    ) {
+      return null;
+    }
+    return (job.nativeReleaseTargets || []).filter(
+      (target) => typeof target === 'string' && target.length > 0,
+    );
+  };
+  const released = async (targets) => {
+    for (const messageId of targets) {
+      const evidence = await Promise.resolve()
+        .then(() => probe({ baseURL, apiKey, ownerId, messageId }))
+        .catch(() => null);
+      const timeoutS = Number(evidence?.responseTimeoutS);
+      if (Number.isFinite(timeoutS) && timeoutS > 0) {
+        lastReportedResponseTimeoutMs = timeoutS * 1000;
+      }
+      if (evidence?.released !== true) return false;
+    }
+    return true;
+  };
+
+  // The waiting generator keeps its pre-dispatch lease; once another generator recovered this
+  // revision after a restart, it never dispatches.
+  const ownsDispatch = (context) =>
+    GenerationJobManager.renewNativeDispatchLease(context.streamId, context.jobCreatedAt);
+
+  return {
+    async beforeDispatch(context) {
+      for (let attempt = 0; ; attempt += 1) {
+        const targets = await currentTargets(context);
+        if (!targets) throw supersededDispatchError();
+        if (targets.length === 0) return;
+        if (!(await ownsDispatch(context))) throw supersededDispatchError();
+        if (!routable) {
+          throw releaseUnconfirmedError(
+            'conversation_session_authority_conflict',
+            'The earlier reply could not be confirmed as released',
+          );
+        }
+        if (await released(targets)) {
+          if (!(await ownsDispatch(context))) throw supersededDispatchError();
+          return;
+        }
+        if (
+          lastReportedResponseTimeoutMs > 0 &&
+          now() >= context.jobCreatedAt + lastReportedResponseTimeoutMs
+        ) {
+          throw releaseUnconfirmedError(
+            'provider_response_deadline_exceeded',
+            'The turn reached its response deadline before the earlier reply released',
+          );
+        }
+        await sleep(
+          NATIVE_RELEASE_POLL_DELAYS_MS[
+            Math.min(attempt, NATIVE_RELEASE_POLL_DELAYS_MS.length - 1)
+          ],
+        );
+      }
+    },
+    async whileOccupied(context) {
+      const targets = await currentTargets(context);
+      if (!targets) return false;
+      if (routable && targets.length > 0) await released(targets);
+      await sleep(
+        NATIVE_RELEASE_POLL_DELAYS_MS[
+          Math.min(occupiedWaits, NATIVE_RELEASE_POLL_DELAYS_MS.length - 1)
+        ],
+      );
+      occupiedWaits += 1;
+      return Boolean(await currentTargets(context));
+    },
+    async isCurrent(context) {
+      return Boolean(await currentTargets(context));
+    },
+  };
+}
+/* === VIVENTIUM END === */
 
 function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
   if (route.agentId !== primaryAgentId) return baseFetch;
@@ -167,7 +323,8 @@ function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
         revision: context.revision,
         sourceOrderScope: context.source_order_scope,
         sourceSequence: interactionPresentationSequence(context),
-        deliveryDispositionRequired: req._viventiumDeliveryDispositionRequired === true,
+        deliveryDispositionRequired:
+          isAudioDeliveryRequested(req) && supportsMessagingDeliveryDisposition(capability),
         deliveryContext,
         providerId,
         agentId: route.agentId,
@@ -178,6 +335,7 @@ function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
     (identity) => {
       req._viventiumNativeResponseIdentity = identity;
     },
+    createNativeResponseRelease(req, route),
   );
 }
 
@@ -352,7 +510,9 @@ const mutateNativeResponseSources = (filter, operation, kind = 'edit') =>
   );
 
 module.exports = {
+  resolveNativeResponseRoute,
   getService,
+  createNativeResponseRelease,
   wrapNativeResponseFetch,
   recoverSavedNativeResponse,
   markNativeResponseReplayStored,

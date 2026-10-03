@@ -1,4 +1,9 @@
 const {
+  VOICE_TASK_TOOL_NAME,
+  voiceTaskBrokerDefinition,
+  invokeVoiceTaskBrokerTool,
+} = require('./VoiceTaskManagementTool');
+const {
   backgroundWorkerResources,
   resolveBackgroundWorkerRoute,
   mainDelegationJsonSchema,
@@ -108,6 +113,7 @@ function hostToolAnnotations({ access, riskClass, openWorldDefault }) {
 }
 
 const HOST_TOOL_DEFINITIONS = Object.freeze({
+  [VOICE_TASK_TOOL_NAME]: voiceTaskBrokerDefinition,
   transcribe_audio: Object.freeze({
     ...audioTranscriptionDefinition,
     annotations: Object.freeze(mcpToolAnnotations({ access: 'read', openWorldDefault: false })),
@@ -177,6 +183,15 @@ const HOST_TOOL_DEFINITIONS = Object.freeze({
     }),
   }),
 });
+
+/* === VIVENTIUM START === Native permission hints remain inside the exact granted host scope. === */
+function readOnlyHostToolNames(allowedHostTools = []) {
+  return [...new Set(allowedHostTools)].filter((name) => {
+    const annotations = HOST_TOOL_DEFINITIONS[name]?.annotations;
+    return annotations?.readOnlyHint === true && annotations?.destructiveHint !== true;
+  });
+}
+/* === VIVENTIUM END === */
 
 function nativeConversationMutationDefinition(definition) {
   return Object.freeze({
@@ -430,6 +445,7 @@ async function buildCapabilityCatalog({ grant, signal, requestedServerNames, app
   const omissions = [];
   const hostTools = [];
   const claimedBrokerToolNames = new Map();
+  const claimedLegacyBrokerToolNames = new Map();
 
   for (const toolName of grant?.allowed_host_tools || []) {
     if (
@@ -457,6 +473,13 @@ async function buildCapabilityCatalog({ grant, signal, requestedServerNames, app
         : baseDefinition;
     if (!definition) {
       omissions.push({ reason: 'unsupported_host_tool', tool: toolName });
+      continue;
+    }
+    if (
+      toolName === VOICE_TASK_TOOL_NAME &&
+      (resources?.version !== 1 || resources.authority?.userId !== String(user.id))
+    ) {
+      omissions.push({ reason: 'missing_host_tool_resources', tool: toolName });
       continue;
     }
     if (toolName === 'file_search' && !Array.isArray(resources?.files)) {
@@ -563,6 +586,12 @@ async function buildCapabilityCatalog({ grant, signal, requestedServerNames, app
         serverName,
         toolName: name,
         brokerName,
+        legacyBrokerName: collisionSafeBrokerToolName(
+          serverName,
+          name,
+          claimedLegacyBrokerToolNames,
+          { legacy: true },
+        ),
         policy,
         mcpTool: tool,
         definition: auditSafeToolSummary({
@@ -1148,6 +1177,9 @@ async function invokeConversationOrchestrationTool({
 }
 
 async function invokeHostTool({ grant, catalog, hostTool, args = {}, invocationId, signal } = {}) {
+  if (hostTool.toolName === VOICE_TASK_TOOL_NAME) {
+    return invokeVoiceTaskBrokerTool({ user: catalog.user, resources: hostTool.resources, args });
+  }
   const memoryBinding = activeMemoryWriterTool(grant);
   if (memoryBinding?.definition.name === hostTool.toolName) {
     return memoryBinding.invoke(grant, args);
@@ -1265,7 +1297,10 @@ async function invokeHostTool({ grant, catalog, hostTool, args = {}, invocationI
 }
 
 function findNativeTool(catalog, brokerToolNameValue) {
-  return catalog.tools.find((item) => item.brokerName === brokerToolNameValue);
+  return catalog.tools.find(
+    (item) =>
+      item.brokerName === brokerToolNameValue || item.legacyBrokerName === brokerToolNameValue,
+  );
 }
 
 function findNativeToolByServerTool(catalog, serverName, toolName) {
@@ -1636,5 +1671,6 @@ module.exports = {
   executeMainDelegation,
   handleToolCall,
   publicCatalog,
+  readOnlyHostToolNames,
   toolDefinitionsForMcp,
 };

@@ -174,7 +174,7 @@ export default function AgentSelect({
           return;
         }
 
-        if (typeof value !== 'number' && typeof value !== 'object') {
+        if (value === null || (typeof value !== 'number' && typeof value !== 'object')) {
           formValues[name] = value;
         }
       });

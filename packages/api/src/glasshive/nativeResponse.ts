@@ -2,11 +2,13 @@ import { GenerationJobManager } from '../stream/GenerationJobManager';
 import { getVerifiedNativeSources, stripNativePredecessorSupersession } from './nativeSupersession';
 /* === VIVENTIUM START === Exact native invocation binding and saved-result recovery. === */
 import { createHash } from 'node:crypto';
+import { setTimeout as wait } from 'node:timers/promises';
 import {
   NATIVE_RESPONSE_RECOVERY_WINDOW_MS,
   nativeIdentityJson,
 } from '../stream/implementations/nativeResponse';
-import { nativeResponseDigest } from '@librechat/data-schemas';
+import { logger, nativeResponseDigest } from '@librechat/data-schemas';
+import { ContentTypes } from 'librechat-data-provider';
 import {
   nativeGraphToolEvidenceContent,
   nativeToolEvidenceForMemory,
@@ -26,6 +28,22 @@ import type {
 } from '@librechat/data-schemas';
 
 type Methods = ReturnType<typeof createNativeResponseMethods>;
+
+/* === VIVENTIUM START ===
+ * Fix: Phase B writes its cortex lifecycle parts onto the same answer row while the answer's
+ * evidence is read. They are not the answer, so they cannot make an unchanged answer look replaced.
+ * === VIVENTIUM END === */
+const CORTEX_LIFECYCLE_PARTS = new Set<string>([
+  ContentTypes.CORTEX_ACTIVATION,
+  ContentTypes.CORTEX_BREWING,
+  ContentTypes.CORTEX_INSIGHT,
+]);
+function nativeAnswerDigest(row: { text?: unknown; content?: unknown }): string {
+  const content = Array.isArray(row.content)
+    ? row.content.filter((part) => !CORTEX_LIFECYCLE_PARTS.has(part?.type))
+    : row.content;
+  return nativeResponseDigest({ text: row.text, content });
+}
 type Transaction = <T>(operation: () => Promise<T>) => Promise<T>;
 type NativeResult = {
   version: number;
@@ -41,9 +59,11 @@ type NativeResult = {
   request_id: string;
   run_id: string;
   graph_tool_evidence?: unknown;
+  failure_class?: string;
   response?: {
     id: string;
     object: string;
+    glasshive?: { output_files?: unknown };
     choices: Array<{
       finish_reason: string;
       message: { role: string; content: string | null; tool_calls?: object[] };
@@ -75,6 +95,11 @@ export interface NativeResponseDependencies {
   authorizeTerminal: (identity: NativeResponseIdentity) => Promise<boolean>;
   release?: (identity: NativeResponseIdentity) => Promise<boolean>;
   resolveRoute: (identity: NativeResponseIdentity) => Promise<NativeResponseRoute>;
+  prepareAttachments?: (
+    identity: NativeResponseIdentity,
+    response: NonNullable<NativeResult['response']>,
+    candidate: NativeResponseCandidate,
+  ) => Promise<NativeResponseMessageProjection['attachments']>;
   projectMessage?: (
     identity: NativeResponseIdentity,
     response: NonNullable<NativeResult['response']>,
@@ -83,6 +108,8 @@ export interface NativeResponseDependencies {
     candidate?: Pick<NativeResponseCandidate, 'requestId' | 'runId'>,
   ) => NativeResponseMessageProjection;
   fetch?: MainContinuityFetch;
+  now?: () => number;
+  wait?: (milliseconds: number) => Promise<void>;
 }
 
 export function nativeResponseSha256(value: string): string {
@@ -239,7 +266,11 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
       throw new Error('native_graph_tool_evidence_source_changed');
     }
     const result = await readResult(identity, true);
-    if (result && (result.state !== 'completed' || !result.authority_sha256)) {
+    if (
+      result &&
+      ((result.state !== 'completed' && identity.status !== 'unsupported') ||
+        (result.state === 'completed' && !result.authority_sha256))
+    ) {
       throw new Error('native_graph_tool_evidence_unavailable');
     }
     const current = await deps.db.getNativeResponse(userId, responseMessageId);
@@ -249,13 +280,15 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
       current.nativeResponse.status !== identity.status ||
       current.unfinished !== false ||
       current.error === true ||
-      nativeResponseDigest({ text: current.text, content: current.content }) !==
-        nativeResponseDigest({ text: row.text, content: row.content })
+      nativeAnswerDigest(current) !== nativeAnswerDigest(row)
     ) {
       throw new Error('native_graph_tool_evidence_parent_changed');
     }
     if (!(await deps.db.nativeResponseSourceMatches(identity))) {
       throw new Error('native_graph_tool_evidence_source_changed');
+    }
+    if (identity.status === 'unsupported' && result && result.state !== 'completed') {
+      return nativeToolEvidenceUnavailableContent(identity, 'native_attempt_incomplete');
     }
     if (result?.graph_tool_evidence == null) {
       const retained =
@@ -273,6 +306,65 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
       ];
     }
     return nativeGraphToolEvidenceContent(identity, result.graph_tool_evidence);
+  }
+
+  // Native publication and external presentation can finish after Main generation. Wait for
+  // their exact persisted completion; never read a pending or unfinished parent's graph evidence.
+  async function readToolEvidenceForPresentation(
+    userId: string,
+    conversationId: string,
+    responseMessageId: string,
+    waitMs: number,
+  ) {
+    const now = deps.now || Date.now;
+    const wait =
+      deps.wait || ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const deadline = now() + Math.max(0, Number.isFinite(waitMs) ? waitMs : 0);
+    for (;;) {
+      try {
+        return await readToolEvidence(userId, conversationId, responseMessageId);
+      } catch (error) {
+        if ((error as { code?: string }).code !== 'native_graph_tool_evidence_parent_unfinished')
+          throw error;
+        const row = await deps.db.getNativeResponse(userId, responseMessageId);
+        const identity = row?.nativeResponse;
+        if (
+          !identity ||
+          identity.userId !== userId ||
+          identity.conversationId !== conversationId ||
+          identity.responseMessageId !== responseMessageId ||
+          String(row.user) !== userId ||
+          row.conversationId !== conversationId ||
+          row.messageId !== responseMessageId
+        )
+          throw error;
+        if (
+          row.error === true ||
+          !['pending', 'prepared', 'completed', 'unsupported'].includes(identity.status)
+        )
+          throw error;
+        if (!(await deps.db.nativeResponseSourceMatches(identity)))
+          throw new Error('native_graph_tool_evidence_source_changed');
+        if (row.unfinished === false && ['completed', 'unsupported'].includes(identity.status))
+          continue;
+        const acknowledgement = (
+          row as unknown as {
+            metadata?: {
+              viventium?: {
+                deliveryAcknowledgement?: { state?: string };
+              };
+            };
+          }
+        ).metadata?.viventium?.deliveryAcknowledgement?.state;
+        if (
+          now() >= deadline ||
+          acknowledgement === 'failed' ||
+          acknowledgement === 'partial_removed'
+        )
+          return nativeToolEvidenceUnavailableContent(identity, 'parent_uncommitted');
+        await wait(Math.min(100, Math.max(1, deadline - now())));
+      }
+    }
   }
 
   async function recover(
@@ -313,6 +405,9 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
     }
     if (['failed', 'cancelled'].includes(admission.status) && !(await deps.isCurrent(identity)))
       return null;
+    let candidateForFiles: NativeResponseCandidate | undefined = admission.candidateJson
+      ? JSON.parse(admission.candidateJson)
+      : undefined;
     let digest = ['pending', 'prepared'].includes(admission.status)
       ? admission.candidateSha256
       : undefined;
@@ -338,6 +433,7 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
                 )
               : projected;
           },
+          result.failure_class,
         );
         if (saved?.nativeResponse?.terminalSnapshotStoredAt) onTerminal?.(status);
         return visible(saved);
@@ -361,17 +457,14 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
         await releaseUnsupported(identity);
         return null;
       }
-      digest = await deps.db.prepareNativeResponse(
-        identity,
-        {
-          text: choice.message.content,
-          authoritySha256: result.authority_sha256,
-          requestId: result.request_id,
-          runId: result.run_id,
-          responseJson: JSON.stringify(result.response),
-        },
-        deps.transaction,
-      );
+      candidateForFiles = {
+        text: choice.message.content,
+        authoritySha256: result.authority_sha256,
+        requestId: result.request_id,
+        runId: result.run_id,
+        responseJson: JSON.stringify(result.response),
+      };
+      digest = await deps.db.prepareNativeResponse(identity, candidateForFiles, deps.transaction);
     }
     if (
       (identity.deliveryDispositionRequired || identity.deliveryContext) &&
@@ -379,6 +472,16 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
     ) {
       throw new Error('native_response_delivery_projection_unavailable');
     }
+    const fileResponse = candidateForFiles ? JSON.parse(candidateForFiles.responseJson) : undefined;
+    if (
+      fileResponse?.glasshive?.output_files != null &&
+      nativeResponseDigest(candidateForFiles!) !== digest
+    )
+      throw new Error('native_response_candidate_mismatch');
+    const prepareFiles =
+      fileResponse?.glasshive?.output_files != null && deps.prepareAttachments
+        ? () => deps.prepareAttachments!(identity, fileResponse, candidateForFiles!)
+        : undefined;
     return visible(
       await deps.db.materializeNativeResponse(
         identity,
@@ -397,6 +500,7 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
               )
             : projected;
         },
+        ...(prepareFiles ? [prepareFiles] : []),
       ),
     );
   }
@@ -425,6 +529,7 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
         unfinished: row.unfinished,
         error: row.error,
         finish_reason: row.finish_reason,
+        attachments: row.attachments,
       };
     }
     if (admission.status !== 'completed') return null;
@@ -441,6 +546,7 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
         ),
       ]),
       metadata: row.metadata,
+      attachments: row.attachments,
     };
     const projected = deps.projectMessage
       ? deps.projectMessage(
@@ -456,10 +562,19 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
       text: projected.text,
       content: projected.content,
       metadata: projected.metadata,
+      attachments: projected.attachments,
     };
   }
 
-  return { admit, readResult, readToolEvidence, recover, projectForTransmit, scanRecoverable };
+  return {
+    admit,
+    readResult,
+    readToolEvidence,
+    readToolEvidenceForPresentation,
+    recover,
+    projectForTransmit,
+    scanRecoverable,
+  };
 }
 
 function visible<T extends { nativeResponse?: object; savedMemoryWrite?: object }>(
@@ -487,14 +602,143 @@ export interface NativeResponseFetchContext {
   source: NativeResponseSource;
 }
 
+/**
+ * The current logical-turn revision owns the native conversation only after its superseded
+ * predecessors release. Both hooks are owned by the host adapter, which knows the provider route.
+ */
+export interface NativeResponseRelease {
+  /** Wait for superseded native Main operations of this logical turn to release. */
+  beforeDispatch: (context: NativeResponseFetchContext) => Promise<void>;
+  /**
+   * The native session reported typed occupancy before admission. Resolve true to dispatch the
+   * same invocation again (still current, not stopped), false to return the typed condition.
+   */
+  whileOccupied: (context: NativeResponseFetchContext) => Promise<boolean>;
+  /** Whether this revision still owns its running logical turn. */
+  isCurrent: (context: NativeResponseFetchContext) => Promise<boolean>;
+}
+
+function nativeDispatchSupersededError(): Error {
+  return Object.assign(new Error('operation was aborted'), {
+    name: 'AbortError',
+    code: 'superseded',
+  });
+}
+
+const NATIVE_SESSION_OCCUPIED = 'conversation_session_authority_conflict';
+const NATIVE_CAPACITY_WAIT_MS = 30_000;
+
+async function nativeCapacityRetryDelay(response: Response): Promise<number | null> {
+  if (response.status !== 503) return null;
+  const seconds = Number(response.headers.get('Retry-After'));
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  try {
+    const body = (await response.clone().json()) as { error?: { code?: string } };
+    return body?.error?.code === 'host_capacity' ? seconds * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+interface NativeCapacityRecovery {
+  waitUntil: number;
+  startedAt: number;
+  signal?: AbortSignal | null;
+  isCurrent?: () => Promise<boolean>;
+  streamId?: string;
+  invocationId?: string;
+  role?: 'main' | 'cortex';
+}
+
+async function recoverNativeCapacityResponse(
+  response: Response,
+  dispatch: () => Promise<Response>,
+  recovery: NativeCapacityRecovery,
+): Promise<Response> {
+  while (true) {
+    const capacityDelay = await nativeCapacityRetryDelay(response);
+    if (capacityDelay === null || Date.now() + capacityDelay > recovery.waitUntil) return response;
+    if (recovery.isCurrent && !(await recovery.isCurrent())) throw nativeDispatchSupersededError();
+    const timing = {
+      role: recovery.role || 'unspecified',
+      streamHash: recovery.streamId ? nativeResponseSha256(recovery.streamId).slice(0, 16) : null,
+      retryAfterMs: capacityDelay,
+      waitedMs: Date.now() - recovery.startedAt,
+    };
+    // The shared log formatter renders message text. Keep timing visible without raw identities.
+    logger.info(
+      `[VIVENTIUM][native-response] Host capacity admission wait ${JSON.stringify(timing)}`,
+    );
+    await wait(capacityDelay, undefined, { signal: recovery.signal || undefined });
+    if (recovery.isCurrent && !(await recovery.isCurrent())) throw nativeDispatchSupersededError();
+    response = await dispatch();
+  }
+}
+
+export function createNativeCapacityFetch(
+  baseFetch: MainContinuityFetch,
+  {
+    signal,
+    deadlineAt,
+    streamId,
+    role,
+  }: {
+    signal: AbortSignal;
+    deadlineAt?: number;
+    streamId?: string;
+    role?: 'main' | 'cortex';
+  },
+): MainContinuityFetch {
+  return async (input, init) => {
+    const requestUrl =
+      typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+    if (!new URL(requestUrl).pathname.endsWith('/chat/completions')) return baseFetch(input, init);
+    if (input instanceof Request && init?.body == null) {
+      init = { ...init, headers: init?.headers || input.headers, body: await input.clone().text() };
+    }
+    const signals = [signal, init?.signal].filter((value): value is AbortSignal => Boolean(value));
+    const dispatch = {
+      ...init,
+      signal: (
+        AbortSignal as typeof AbortSignal & { any(signals: AbortSignal[]): AbortSignal }
+      ).any(signals),
+    };
+    const startedAt = Date.now();
+    return recoverNativeCapacityResponse(
+      await baseFetch(input, dispatch),
+      () => baseFetch(input, dispatch),
+      {
+        signal: dispatch.signal,
+        startedAt,
+        waitUntil: Math.min(startedAt + NATIVE_CAPACITY_WAIT_MS, deadlineAt ?? Infinity),
+        streamId,
+        role,
+      },
+    );
+  };
+}
+
+async function isNativeSessionOccupied(response: Response): Promise<boolean> {
+  if (response.status !== 409) return false;
+  try {
+    const body = (await response.clone().json()) as { error?: { code?: unknown } };
+    return body?.error?.code === NATIVE_SESSION_OCCUPIED;
+  } catch {
+    return false;
+  }
+}
+
 export function createNativeResponseFetch(
   baseFetch: MainContinuityFetch,
   getContext: () => Promise<NativeResponseFetchContext | null>,
   admit: (identity: NativeResponseIdentity) => Promise<boolean>,
   onBound: (identity: NativeResponseIdentity) => void,
+  release?: NativeResponseRelease,
 ): MainContinuityFetch {
   let bound: NativeResponseIdentity | undefined;
-  let boundPredecessor: Awaited<ReturnType<typeof GenerationJobManager.getNativePredecessorSupersession>>;
+  let boundPredecessor: Awaited<
+    ReturnType<typeof GenerationJobManager.getNativePredecessorSupersession>
+  >;
   return async (input, init) => {
     const verifiedSources = getVerifiedNativeSources(init);
     if (input instanceof Request && init?.body == null && !['GET', 'HEAD'].includes(input.method)) {
@@ -520,12 +764,20 @@ export function createNativeResponseFetch(
         : {}),
     };
     if (typeof init?.body !== 'string') throw new Error('native_response_serialized_body_required');
-    const predecessor = bound ? boundPredecessor : verifiedSources
-      ? await GenerationJobManager.getNativePredecessorSupersession(context, verifiedSources)
-      : undefined;
-    if (predecessor) {
+    if (!bound && release) await release.beforeDispatch(context);
+    const predecessor = bound
+      ? boundPredecessor
+      : verifiedSources
+        ? await GenerationJobManager.getNativePredecessorSupersession(context, verifiedSources)
+        : undefined;
+    {
       const payload = JSON.parse(init.body);
-      payload.metadata = { ...payload.metadata, native_predecessor_supersession: predecessor };
+      payload.metadata = {
+        ...payload.metadata,
+        ...(predecessor ? { native_predecessor_supersession: predecessor } : {}),
+        // The revision's absolute deadline starts when it began, however long it waited.
+        response_started_at: new Date(context.jobCreatedAt).toISOString(),
+      };
       init = { ...init, body: JSON.stringify(payload) };
     }
     const bodySha256 = nativeResponseSha256(init.body as string);
@@ -547,8 +799,14 @@ export function createNativeResponseFetch(
             admittedAt,
             recoverUntil: admittedAt + NATIVE_RESPONSE_RECOVERY_WINDOW_MS,
           };
-    if (!(await admit(identity))) return baseFetch(input, stripNativePredecessorSupersession(init));
-    if (verifiedSources) await GenerationJobManager.retainNativeAcceptedSources(identity, verifiedSources);
+    if (!(await admit(identity))) {
+      // A later invocation of the current revision continues unbound; a revision replaced after
+      // its release check makes no provider call.
+      if (release && !(await release.isCurrent(context))) throw nativeDispatchSupersededError();
+      return baseFetch(input, stripNativePredecessorSupersession(init));
+    }
+    if (verifiedSources)
+      await GenerationJobManager.retainNativeAcceptedSources(identity, verifiedSources);
     bound = identity;
     boundPredecessor = predecessor;
     onBound(identity);
@@ -557,7 +815,34 @@ export function createNativeResponseFetch(
     );
     headers.set('X-Viventium-Native-Invocation-Id', invocationId);
     headers.set('X-Viventium-Native-Body-SHA256', bodySha256);
-    return baseFetch(input, { ...init, headers });
+    const dispatch = { ...init, headers };
+    let response = await baseFetch(input, dispatch);
+    const capacityWaitUntil = Date.now() + NATIVE_CAPACITY_WAIT_MS;
+    // Typed occupancy is refused before native admission, so the identical invocation may be
+    // offered again once released. Its anchored deadline still ends the wait truthfully.
+    while (true) {
+      if (release && (await isNativeSessionOccupied(response))) {
+        if (dispatch.signal?.aborted || !(await release.whileOccupied(context))) break;
+        response = await baseFetch(input, dispatch);
+        continue;
+      }
+      const recovered = await recoverNativeCapacityResponse(
+        response,
+        () => baseFetch(input, dispatch),
+        {
+          waitUntil: capacityWaitUntil,
+          startedAt: capacityWaitUntil - NATIVE_CAPACITY_WAIT_MS,
+          signal: dispatch.signal,
+          isCurrent: release ? () => release.isCurrent(context) : undefined,
+          streamId: context.streamId,
+          invocationId,
+          role: 'main',
+        },
+      );
+      if (recovered === response) break;
+      response = recovered;
+    }
+    return response;
   };
 }
 /* === VIVENTIUM END === */

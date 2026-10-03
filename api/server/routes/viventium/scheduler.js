@@ -161,6 +161,7 @@ const SCHEDULER_PUBLIC_FAILURES = Object.freeze({
   provider_response_deadline_exceeded: 'The model provider response exceeded its deadline.',
   provider_temporarily_unavailable: 'The model provider is temporarily unavailable.',
   conversation_session_authority_conflict: 'The conversation is busy with an active response.',
+  source_context_unavailable: 'The conversation context could not be preserved. Please retry this turn.',
   completion_error: 'The scheduled model response could not be completed.',
 });
 
@@ -1009,9 +1010,9 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
         scheduleEnd();
       }
     },
-    (error) => {
+    (error, errorClass) => {
       if (!res.writableEnded) {
-        writeSseEvent(res, 'error', schedulerSafeFailure(error));
+        writeSseEvent(res, 'error', schedulerSafeFailure(errorClass ? { code: errorClass } : error));
         endStream();
       }
     },
@@ -1188,9 +1189,9 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
         });
         res.end();
       },
-      (error) => {
+      (error, errorClass) => {
         if (!res.writableEnded) {
-          writeSseEvent(res, 'error', schedulerSafeFailure(error));
+          writeSseEvent(res, 'error', schedulerSafeFailure(errorClass ? { code: errorClass } : error));
           res.end();
         }
       },

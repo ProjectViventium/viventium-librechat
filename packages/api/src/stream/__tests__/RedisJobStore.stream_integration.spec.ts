@@ -1,6 +1,7 @@
 import { StepTypes } from 'librechat-data-provider';
 import type { Agents } from 'librechat-data-provider';
 import type { Redis, Cluster } from 'ioredis';
+import type { InteractionContext, LogicalTurnClaim } from '../interfaces/IJobStore';
 import { StandardGraph } from '@librechat/agents';
 
 /**
@@ -119,6 +120,49 @@ describe('RedisJobStore Integration Tests', () => {
         userId,
         status: 'running',
       });
+
+      await store.destroy();
+    });
+
+    test('grants one pre-dispatch takeover only after the Redis-timed lease expires', async () => {
+      if (!ioredisClient) {
+        return;
+      }
+
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const store = new RedisJobStore(ioredisClient);
+      await store.initialize();
+      const streamId = `lease-stream-${Date.now()}`;
+      const job = await store.createJob(streamId, 'lease-user', streamId);
+      const claim = (
+        owner: string,
+        mode: 'renew' | 'takeover',
+        leaseMs = 60_000,
+        createdAt = job.createdAt,
+      ) => store.claimNativeDispatchLease(streamId, { createdAt, owner, leaseMs, mode });
+
+      expect(await claim('owner-a', 'renew')).toBe(true);
+      expect(await claim('owner-a', 'renew')).toBe(true);
+      expect(await claim('owner-b', 'renew')).toBe(false);
+      expect(await claim('owner-b', 'takeover')).toBe(false);
+      expect(await claim('owner-a', 'renew', 1)).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(await claim('owner-b', 'takeover', 60_000, job.createdAt + 1)).toBe(false);
+      expect(await claim('owner-a', 'takeover')).toBe(false);
+      expect(await claim('owner-b', 'takeover')).toBe(true);
+      expect(await claim('owner-c', 'takeover')).toBe(false);
+      expect(await claim('owner-a', 'renew')).toBe(false);
+      expect(await store.getJob(streamId)).toMatchObject({
+        createdAt: job.createdAt,
+        nativeDispatchOwner: 'owner-b',
+      });
+
+      const redis = (store as unknown as { redis: typeof ioredisClient }).redis!;
+      await redis.hset(`stream:{${streamId}}:job`, 'nativeResponse', '{}');
+      expect(await claim('owner-b', 'renew')).toBe(false);
+      await redis.hdel(`stream:{${streamId}}:job`, 'nativeResponse');
+      await store.updateJob(streamId, { status: 'complete' });
+      expect(await claim('owner-b', 'renew')).toBe(false);
 
       await store.destroy();
     });
@@ -254,6 +298,698 @@ describe('RedisJobStore Integration Tests', () => {
       await store.destroy();
     });
 
+    /* === VIVENTIUM START ===
+     * Purpose: on a logical turn, a late Cortex addition's receipt is its own record. Main's
+     * committed receipt is neither compared nor replaced, in either order, while the exact
+     * presentation fence, replay idempotency and different-receipt conflict still hold. Input
+     * newer than the turn's source withdraws a presentation before its receipt commits, and a
+     * presentation of the parent itself (a promoted empty answer) is also Main's receipt.
+     * === VIVENTIUM END === */
+    async function claimedLogicalTurn(
+      label: string,
+      options: { ordered?: boolean; promoted?: boolean } = {},
+    ) {
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const { createHash } = await import('crypto');
+      const store = new RedisJobStore(ioredisClient!);
+      await store.initialize();
+      const suffix = `${label}-${Date.now()}`;
+      const streamId = `cortex-addition-${suffix}`;
+      const ownerId = `owner-${suffix}`;
+      const conversationId = `conversation-${suffix}`;
+      const sourceEventId = `source-${suffix}`;
+      const sourceOrderScope = createHash('sha256').update(`order-${suffix}`).digest('hex');
+      const claim = await store.claimLogicalTurn(streamId, ownerId, {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'telegram',
+        conversation_id: conversationId,
+        revision: 1,
+        source_event_id: sourceEventId,
+        ...(options.ordered
+          ? {
+              source_order_scope: sourceOrderScope,
+              source_sequence: 1,
+              source_segments: [
+                { ordinal: 0, source_event_id: sourceEventId, source_index: 0, text: 'Question.' },
+              ],
+            }
+          : {}),
+      });
+      await store.createJob(streamId, ownerId, conversationId, {
+        interactionContext: claim.interactionContext,
+      });
+      const revision = claim.interactionContext.revision!;
+      const mainAcknowledgement = {
+        logical_turn_id: claim.interactionContext.logical_turn_id!,
+        revision,
+        state: 'committed' as const,
+        presentation_ref: 'telegram:1:main-answer',
+      };
+      const binding = {
+        ownerId,
+        messageId: options.promoted ? `parent-${suffix}` : `follow-up-${suffix}`,
+        parentMessageId: `parent-${suffix}`,
+        revision,
+        generation: 2,
+        deliveryIds: ['delivery-addition'],
+        deliveryReceipts: [{ deliveryId: 'delivery-addition', graphResultHash: 'a'.repeat(64) }],
+        claimToken: 'claim-2',
+        presentationLeaseToken: 'lease-2',
+        boundAt: 1_725_000_000_100,
+      };
+      const cortexAcknowledgement = {
+        ...mainAcknowledgement,
+        presentation_ref: 'telegram:1:late-addition',
+      };
+      const logicalTurnKey = `stream:logical:{${mainAcknowledgement.logical_turn_id.split('.')[0]}}`;
+      const turnActive = () => ioredisClient!.hget(logicalTurnKey, 'active');
+      const newerInput = () =>
+        store.observeSourceOrder({ source_order_scope: sourceOrderScope, source_sequence: 2 });
+      return {
+        store,
+        streamId,
+        mainAcknowledgement,
+        binding,
+        cortexAcknowledgement,
+        turnActive,
+        newerInput,
+      };
+    }
+
+    test('a late Cortex addition acknowledges beside the committed Main receipt of its logical turn', async () => {
+      if (!ioredisClient) return;
+      const { store, streamId, mainAcknowledgement, binding, cortexAcknowledgement } =
+        await claimedLogicalTurn('main-first');
+
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, mainAcknowledgement, null),
+      ).resolves.toMatchObject({ status: 'recorded' });
+      await expect(store.bindCortexPresentation(streamId, binding)).resolves.toBe(true);
+
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, cortexAcknowledgement, binding),
+      ).resolves.toMatchObject({
+        status: 'recorded',
+        idempotent: false,
+        acknowledgement: { ...cortexAcknowledgement, presentation_committed_at: expect.any(Number) },
+        cortexPresentation: binding,
+      });
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, cortexAcknowledgement, binding),
+      ).resolves.toMatchObject({ status: 'recorded', idempotent: true });
+      await expect(
+        store.bindDeliveryAcknowledgement(
+          streamId,
+          { ...cortexAcknowledgement, presentation_ref: 'telegram:1:other-addition' },
+          binding,
+        ),
+      ).resolves.toEqual({ status: 'conflict' });
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, cortexAcknowledgement, {
+          ...binding,
+          claimToken: 'claim-stale',
+        }),
+      ).resolves.toEqual({ status: 'retryable_conflict' });
+
+      // Main's committed receipt is untouched: its replay stays idempotent and the job keeps it.
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, mainAcknowledgement, null),
+      ).resolves.toMatchObject({
+        status: 'recorded',
+        acknowledgement: expect.objectContaining({ presentation_ref: 'telegram:1:main-answer' }),
+      });
+      await expect(store.getJob(streamId)).resolves.toMatchObject({
+        deliveryAcknowledgement: expect.objectContaining({
+          presentation_ref: 'telegram:1:main-answer',
+        }),
+        cortexDeliveryAcknowledgement: expect.objectContaining({
+          presentation_ref: 'telegram:1:late-addition',
+        }),
+        cortexDeliveryAcknowledgementPresentation: binding,
+      });
+      await store.destroy();
+    });
+
+    test('a Cortex receipt recorded first never pre-empts its logical turn’s Main receipt', async () => {
+      if (!ioredisClient) return;
+      const { store, streamId, mainAcknowledgement, binding, cortexAcknowledgement, turnActive } =
+        await claimedLogicalTurn('cortex-first');
+      await expect(store.bindCortexPresentation(streamId, binding)).resolves.toBe(true);
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, cortexAcknowledgement, binding),
+      ).resolves.toMatchObject({ status: 'recorded', idempotent: false });
+      // The addition settles nothing of Main's: the turn stays active and has no Main receipt.
+      await expect(turnActive()).resolves.toBe('1');
+      expect((await store.getJob(streamId))?.deliveryAcknowledgement).toBeUndefined();
+
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, mainAcknowledgement, null),
+      ).resolves.toMatchObject({
+        status: 'recorded',
+        acknowledgement: expect.objectContaining({ presentation_ref: 'telegram:1:main-answer' }),
+      });
+      await expect(store.getJob(streamId)).resolves.toMatchObject({
+        deliveryAcknowledgement: expect.objectContaining({
+          presentation_ref: 'telegram:1:main-answer',
+        }),
+        cortexDeliveryAcknowledgement: expect.objectContaining({
+          presentation_ref: 'telegram:1:late-addition',
+        }),
+      });
+      await store.destroy();
+    });
+
+    test('input newer than its turn withdraws a late Cortex addition before the receipt commits', async () => {
+      if (!ioredisClient) return;
+      const {
+        store,
+        streamId,
+        mainAcknowledgement,
+        binding,
+        cortexAcknowledgement,
+        newerInput,
+      } = await claimedLogicalTurn('newer-input', { ordered: true });
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, mainAcknowledgement, null),
+      ).resolves.toMatchObject({ status: 'recorded' });
+      await expect(store.bindCortexPresentation(streamId, binding)).resolves.toBe(true);
+      await newerInput();
+
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, cortexAcknowledgement, binding),
+      ).resolves.toEqual({ status: 'stale_source_order' });
+      expect((await store.getJob(streamId))?.cortexDeliveryAcknowledgement).toBeUndefined();
+      // The adapter's withdrawal of that presentation still settles it, and only it.
+      const withdrawal = { ...cortexAcknowledgement, state: 'partial_removed' as const };
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, withdrawal, binding),
+      ).resolves.toMatchObject({ status: 'recorded', idempotent: false });
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, mainAcknowledgement, null),
+      ).resolves.toMatchObject({ status: 'recorded', idempotent: true });
+      await expect(store.getJob(streamId)).resolves.toMatchObject({
+        deliveryAcknowledgement: expect.objectContaining({
+          state: 'committed',
+          presentation_ref: 'telegram:1:main-answer',
+        }),
+        cortexDeliveryAcknowledgement: expect.objectContaining({ state: 'partial_removed' }),
+      });
+      await store.destroy();
+    });
+
+    test('a committed Cortex receipt stays replayable after newer input', async () => {
+      if (!ioredisClient) return;
+      const {
+        store,
+        streamId,
+        mainAcknowledgement,
+        binding,
+        cortexAcknowledgement,
+        newerInput,
+      } = await claimedLogicalTurn('replay-after-input', { ordered: true });
+      await store.bindDeliveryAcknowledgement(streamId, mainAcknowledgement, null);
+      await store.bindCortexPresentation(streamId, binding);
+      const first = await store.bindDeliveryAcknowledgement(
+        streamId,
+        cortexAcknowledgement,
+        binding,
+      );
+      expect(first).toMatchObject({ status: 'recorded', idempotent: false });
+      await newerInput();
+
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, cortexAcknowledgement, binding),
+      ).resolves.toMatchObject({
+        status: 'recorded',
+        idempotent: true,
+        acknowledgement: first.acknowledgement,
+      });
+      await expect(
+        store.bindDeliveryAcknowledgement(
+          streamId,
+          { ...cortexAcknowledgement, presentation_ref: 'telegram:1:other-addition' },
+          binding,
+        ),
+      ).resolves.toEqual({ status: 'conflict' });
+      await store.destroy();
+    });
+
+    test('a promoted empty answer’s presentation is also its turn’s Main receipt', async () => {
+      if (!ioredisClient) return;
+      const { store, streamId, mainAcknowledgement, binding, cortexAcknowledgement, turnActive } =
+        await claimedLogicalTurn('promoted', { ordered: true, promoted: true });
+      await expect(store.bindCortexPresentation(streamId, binding)).resolves.toBe(true);
+
+      const first = await store.bindDeliveryAcknowledgement(
+        streamId,
+        cortexAcknowledgement,
+        binding,
+      );
+      expect(first).toMatchObject({ status: 'recorded', idempotent: false });
+      // The presented parent settles the turn exactly as Main's own receipt would.
+      await expect(turnActive()).resolves.toBe('0');
+      await expect(store.getJob(streamId)).resolves.toMatchObject({
+        deliveryAcknowledgement: first.acknowledgement,
+        cortexDeliveryAcknowledgement: first.acknowledgement,
+      });
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, mainAcknowledgement, null),
+      ).resolves.toEqual({ status: 'conflict' });
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, cortexAcknowledgement, binding),
+      ).resolves.toMatchObject({ status: 'recorded', idempotent: true });
+      await store.destroy();
+    });
+
+    test('newer input withdraws a promoted empty answer before it becomes Main’s receipt', async () => {
+      if (!ioredisClient) return;
+      const { store, streamId, binding, cortexAcknowledgement, turnActive, newerInput } =
+        await claimedLogicalTurn('promoted-stale', { ordered: true, promoted: true });
+      await store.bindCortexPresentation(streamId, binding);
+      await newerInput();
+
+      await expect(
+        store.bindDeliveryAcknowledgement(streamId, cortexAcknowledgement, binding),
+      ).resolves.toEqual({ status: 'stale_source_order' });
+      await expect(turnActive()).resolves.toBe('1');
+      const job = await store.getJob(streamId);
+      expect(job?.deliveryAcknowledgement).toBeUndefined();
+      expect(job?.cortexDeliveryAcknowledgement).toBeUndefined();
+      await store.destroy();
+    });
+
+    /* === VIVENTIUM START ===
+     * Purpose: a deferred quoted input keeps its own quote when an unquoted successor claims the
+     * combined turn, on the Redis store's own claim path.
+     * === VIVENTIUM END === */
+    test('a deferred quoted input keeps its own quote when an unquoted successor claims the turn', async () => {
+      if (!ioredisClient) return;
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const { createHash } = await import('crypto');
+      const store = new RedisJobStore(ioredisClient);
+      await store.initialize();
+      const suffix = `${Date.now()}`;
+      const scope = createHash('sha256').update(`deferred-quote-${suffix}`).digest('hex');
+      const quote = {
+        version: 1 as const,
+        provenanceStatus: 'verified' as const,
+        senderRole: 'assistant_self' as const,
+        repliedTelegramMessageId: '14384',
+        quoteText: 'Willow is cheaper by $15.',
+        logicalMessageId: 'addition-message',
+      };
+      const input = (id: string, sequence: number, replyContext?: typeof quote) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'telegram' as const,
+        conversation_id: `conversation-${suffix}`,
+        revision: 1,
+        source_event_id: `${id}-${suffix}`,
+        source_order_scope: scope,
+        source_sequence: sequence,
+        source_segments: [
+          {
+            ordinal: 0,
+            source_event_id: `${id}-${suffix}`,
+            source_index: 0,
+            source_sequence: sequence,
+            source_message_id: `input-${id}-${suffix}`,
+            source_persisted: true as const,
+            text: `${id} goal`,
+            ...(replyContext ? { reply_context: replyContext } : {}),
+          },
+        ],
+      });
+      const a = input('a', 1, quote),
+        b = input('b', 2);
+      await store.retainLogicalTurnInput('owner', a);
+      await store.retainLogicalTurnInput('owner', b);
+      const combined = await store.claimLogicalTurn(`b-stream-${suffix}`, 'owner', b);
+
+      expect(combined.status).toBe('claimed');
+      expect(
+        combined.interactionContext.source_segments?.map((segment) => [
+          segment.source_event_id,
+          segment.reply_context ?? null,
+        ]),
+      ).toEqual([
+        [`a-${suffix}`, quote],
+        [`b-${suffix}`, null],
+      ]);
+      await store.destroy();
+    });
+
+    /* Purpose: a Redis claim only reserves a revision; its admission commit fixes each source's
+     * author. An additive (response_only) Telegram turn owns the inputs deferred to it and the
+     * inputs of revisions that never committed, and leaves an input that an earlier committed
+     * revision carried to that revision. */
+    const additiveTurn = async (label: string) => {
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const { ownedInteractionSources } = await import('../../agents/sourceSelectionContext');
+      const { createHash } = await import('crypto');
+      const store = new RedisJobStore(ioredisClient!);
+      await store.initialize();
+      const suffix = `${label}-${Date.now()}`;
+      const scope = createHash('sha256').update(suffix).digest('hex');
+      const stream = (id: string) => `${id}-stream-${suffix}`;
+      /** The adapter capabilities the Telegram route binds to every input. */
+      const telegramCapabilities = {
+        segment_stability: 'immediate',
+        supersede_scope: 'response_only',
+      } as const;
+      const input = (id: string, sequence: number, quoteText?: string): InteractionContext => ({
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'telegram',
+        conversation_id: `conversation-${suffix}`,
+        revision: 1,
+        source_event_id: `${id}-${suffix}`,
+        source_order_scope: scope,
+        source_sequence: sequence,
+        source_segments: [
+          {
+            ordinal: 0,
+            source_event_id: `${id}-${suffix}`,
+            source_index: 0,
+            source_sequence: sequence,
+            text: `${id} goal`,
+            ...(quoteText
+              ? {
+                  source_message_id: `input-${id}-${suffix}`,
+                  source_persisted: true as const,
+                  reply_context: {
+                    version: 1 as const,
+                    provenanceStatus: 'verified' as const,
+                    senderRole: 'assistant_self' as const,
+                    repliedTelegramMessageId: '14378',
+                    quoteText,
+                    logicalMessageId: 'main-answer',
+                  },
+                }
+              : {}),
+          },
+        ],
+      });
+      return {
+        store,
+        stream,
+        input,
+        claim: (id: string, sequence: number, quoteText?: string) =>
+          store.claimLogicalTurn(stream(id), 'owner', input(id, sequence, quoteText)),
+        admit: (id: string, claimed: LogicalTurnClaim) =>
+          store.createJob(stream(id), 'owner', `conversation-${suffix}`, {
+            interactionContext: claimed.interactionContext,
+          }),
+        commit: (id: string, claimed: LogicalTurnClaim) =>
+          store.commitLogicalTurnAdmission(stream(id), 'owner', claimed.interactionContext),
+        owned: (context: InteractionContext) =>
+          ownedInteractionSources(context, telegramCapabilities).map(
+            ({ sourceOrdinal, segment }) => [
+              sourceOrdinal,
+              segment.reply_context?.quoteText ?? null,
+            ],
+          ),
+      };
+    };
+
+    test('an additive Redis turn owns the quoted input deferred to it', async () => {
+      if (!ioredisClient) return;
+      const turn = await additiveTurn('deferred');
+      await turn.store.retainLogicalTurnInput('owner', turn.input('a', 1, 'Willow 427 / Elm 441'));
+      const combined = await turn.claim('b', 2);
+      await turn.admit('b', combined);
+      const committed = await turn.commit('b', combined);
+      expect(turn.owned(committed)).toEqual([
+        [1, 'Willow 427 / Elm 441'],
+        [2, null],
+      ]);
+      await turn.store.destroy();
+    });
+
+    test('an input an earlier committed Redis revision carried stays with that revision', async () => {
+      if (!ioredisClient) return;
+      const turn = await additiveTurn('committed');
+      const first = await turn.claim('a', 1);
+      await turn.admit('a', first);
+      await turn.commit('a', first);
+      await turn.store.retainLogicalTurnInput('owner', turn.input('c', 2));
+      const combined = await turn.claim('b', 3);
+      await turn.admit('b', combined);
+      await turn.store.fenceSupersededLogicalTurnClaims(combined);
+      const committed = await turn.commit('b', combined);
+      expect(committed.source_segments?.map((s) => s.authoring_revision)).toEqual([1, 2, 2]);
+      expect(turn.owned(committed)).toEqual([
+        [2, null],
+        [3, null],
+      ]);
+      await turn.store.destroy();
+    });
+
+    test('a Redis reservation that never admits leaves its input and quote to the winner', async () => {
+      if (!ioredisClient) return;
+      const turn = await additiveTurn('reservation');
+      const reserved = await turn.claim('a', 1, 'Willow 427 / Elm 441');
+      const winner = await turn.claim('b', 2);
+      await turn.admit('b', winner);
+      await turn.store.fenceSupersededLogicalTurnClaims(winner);
+      const committed = await turn.commit('b', winner);
+      expect(turn.owned(committed)).toEqual([
+        [1, 'Willow 427 / Elm 441'],
+        [2, null],
+      ]);
+      expect((await turn.store.getJob(turn.stream('b')))?.interactionContext).toEqual(committed);
+      await expect(turn.admit('a', reserved)).rejects.toMatchObject({ code: 'stream_id_conflict' });
+      await expect(turn.commit('a', reserved)).rejects.toMatchObject({
+        code: 'stream_id_conflict',
+      });
+      await turn.store.destroy();
+    });
+
+    test('an admitted Redis revision whose commit loses to a newer commit is taken over', async () => {
+      if (!ioredisClient) return;
+      const turn = await additiveTurn('taken-over');
+      const older = await turn.claim('a', 1, 'Willow 427 / Elm 441');
+      const winner = await turn.claim('b', 2);
+      await turn.admit('a', older);
+      await turn.admit('b', winner);
+      await turn.store.fenceSupersededLogicalTurnClaims(winner);
+      const committed = await turn.commit('b', winner);
+      expect(turn.owned(committed)).toEqual([
+        [1, 'Willow 427 / Elm 441'],
+        [2, null],
+      ]);
+      await expect(turn.commit('a', older)).rejects.toMatchObject({ code: 'stream_id_conflict' });
+      await turn.store.destroy();
+    });
+
+    test('a Redis admission whose turn another conversation retired still commits on its own ledger', async () => {
+      if (!ioredisClient) return;
+      const turn = await additiveTurn('retired');
+      const claimed = await turn.claim('a', 1, 'Willow 427 / Elm 441');
+      await turn.admit('a', claimed);
+      const other = await turn.store.claimLogicalTurn(turn.stream('s'), 'owner', {
+        ...turn.input('s', 2),
+        conversation_id: 'other-conversation',
+      });
+      expect(other.interactionContext.logical_turn_id).not.toBe(
+        claimed.interactionContext.logical_turn_id,
+      );
+      await expect(turn.commit('a', claimed)).resolves.toEqual(claimed.interactionContext);
+      await turn.store.destroy();
+    });
+
+    test('a Redis winner whose turn another conversation retires still owns the reservation it fenced', async () => {
+      if (!ioredisClient) return;
+      const turn = await additiveTurn('retired-winner');
+      const reserved = await turn.claim('a', 1, 'Willow 427 / Elm 441');
+      const winner = await turn.claim('b', 2);
+      await turn.admit('b', winner);
+      await turn.store.fenceSupersededLogicalTurnClaims(winner);
+      const other = await turn.store.claimLogicalTurn(turn.stream('c'), 'owner', {
+        ...turn.input('c', 3),
+        conversation_id: 'other-conversation',
+      });
+      expect(other.interactionContext.logical_turn_id).not.toBe(
+        winner.interactionContext.logical_turn_id,
+      );
+      const committed = await turn.commit('b', winner);
+      expect(turn.owned(committed)).toEqual([
+        [1, 'Willow 427 / Elm 441'],
+        [2, null],
+      ]);
+      await expect(turn.admit('a', reserved)).rejects.toMatchObject({ code: 'stream_id_conflict' });
+      await expect(turn.commit('a', reserved)).rejects.toMatchObject({
+        code: 'stream_id_conflict',
+      });
+      await turn.store.destroy();
+    });
+
+    test('a Redis revision whose job-context write fails before its commit leaves no author', async () => {
+      if (!ioredisClient) return;
+      const { createHash } = await import('crypto');
+      const turn = await additiveTurn('write-failure');
+      const older = await turn.claim('a', 1, 'Willow 427 / Elm 441');
+      await turn.admit('a', older);
+      const winner = await turn.claim('b', 2);
+      jest
+        .spyOn(turn.store, 'updateJob')
+        .mockRejectedValueOnce(new Error('job context write failed'));
+      await expect(turn.commit('a', older)).rejects.toThrow('job context write failed');
+      await turn.admit('b', winner);
+      await turn.store.fenceSupersededLogicalTurnClaims(winner);
+      const committed = await turn.commit('b', winner);
+      expect(turn.owned(committed)).toEqual([
+        [1, 'Willow 427 / Elm 441'],
+        [2, null],
+      ]);
+      const logicalTurnId = older.interactionContext.logical_turn_id!;
+      const ledger = `stream:logical-author:{${logicalTurnId.split('.')[0]}}:${createHash('sha256')
+        .update(logicalTurnId)
+        .digest('hex')
+        .slice(0, 32)}`;
+      await expect(ioredisClient.hget(ledger, 'author:1')).resolves.toBeNull();
+      await expect(turn.commit('a', older)).rejects.toMatchObject({ code: 'stream_id_conflict' });
+      await turn.store.destroy();
+    });
+
+    test('a Redis commit whose replies are all lost is reconciled from the ledger', async () => {
+      if (!ioredisClient) return;
+      const turn = await additiveTurn('lost-replies');
+      const claimed = await turn.claim('a', 1, 'Willow 427 / Elm 441');
+      await turn.admit('a', claimed);
+      const client = ioredisClient as unknown as { eval: (...args: unknown[]) => Promise<unknown> };
+      const evaluate = client.eval.bind(client);
+      let commits = 0;
+      const lost = jest.spyOn(client, 'eval').mockImplementation(async (...args: unknown[]) => {
+        if (String(args[0]).includes("redis.call('HSET', KEYS[1], 'author:' .. ARGV[1], '1')")) {
+          commits += 1;
+          // The first commit lands in Redis; every reply is lost on the way back.
+          if (commits === 1) await evaluate(...args);
+          throw new Error('reply lost');
+        }
+        return evaluate(...args);
+      });
+      const committed = await turn.commit('a', claimed);
+      lost.mockRestore();
+      expect(commits).toBe(3);
+      expect(turn.owned(committed)).toEqual([[1, 'Willow 427 / Elm 441']]);
+      await expect(turn.store.getJob(turn.stream('a'))).resolves.toMatchObject({
+        interactionContext: committed,
+      });
+      await turn.store.destroy();
+    });
+
+    test('a Redis commit whose outcome stays unknown is uncertain, never a refusal', async () => {
+      if (!ioredisClient) return;
+      const turn = await additiveTurn('unknown-commit');
+      const claimed = await turn.claim('a', 1);
+      await turn.admit('a', claimed);
+      const client = ioredisClient as unknown as {
+        eval: (...args: unknown[]) => Promise<unknown>;
+        hmget: (...args: unknown[]) => Promise<unknown>;
+      };
+      const evaluate = client.eval.bind(client);
+      const read = client.hmget.bind(client);
+      const lost = jest.spyOn(client, 'eval').mockImplementation(async (...args: unknown[]) => {
+        if (String(args[0]).includes("redis.call('HSET', KEYS[1], 'author:' .. ARGV[1], '1')")) {
+          throw new Error('reply lost');
+        }
+        return evaluate(...args);
+      });
+      const unreadable = jest
+        .spyOn(client, 'hmget')
+        .mockImplementation(async (...args: unknown[]) => {
+          if (String(args[1]).startsWith('author:')) throw new Error('read lost');
+          return read(...args);
+        });
+      await expect(turn.commit('a', claimed)).rejects.toMatchObject({
+        code: 'author_commit_uncertain',
+      });
+      lost.mockRestore();
+      unreadable.mockRestore();
+      await turn.store.destroy();
+    });
+
+    test('a Redis commit for a mismatched reservation writes nothing', async () => {
+      if (!ioredisClient) return;
+      const turn = await additiveTurn('mismatched');
+      const older = await turn.claim('a', 1, 'Willow 427 / Elm 441');
+      await turn.admit('a', older);
+      const winner = await turn.claim('b', 2);
+      const before = (await turn.store.getJob(turn.stream('a')))?.interactionContext;
+      await expect(
+        turn.store.commitLogicalTurnAdmission(turn.stream('a'), 'owner', winner.interactionContext),
+      ).rejects.toMatchObject({ code: 'stream_id_conflict' });
+      expect((await turn.store.getJob(turn.stream('a')))?.interactionContext).toEqual(before);
+      await turn.store.destroy();
+    });
+
+    test('a Redis bare legacy reservation keeps its disposition after the turn retires', async () => {
+      if (!ioredisClient) return;
+      const { createHash } = await import('crypto');
+      const turn = await additiveTurn('legacy-retired');
+      const legacy = await turn.claim('a', 1, 'Willow 427 / Elm 441');
+      const logicalTurnId = legacy.interactionContext.logical_turn_id!;
+      const ledger = `stream:logical-author:{${logicalTurnId.split('.')[0]}}:${createHash('sha256')
+        .update(logicalTurnId)
+        .digest('hex')
+        .slice(0, 32)}`;
+      await ioredisClient.hdel(ledger, 'reservation:1');
+      const winner = await turn.claim('b', 2);
+      await turn.admit('b', winner);
+      await turn.store.fenceSupersededLogicalTurnClaims(winner);
+      await turn.store.claimLogicalTurn(turn.stream('c'), 'owner', {
+        ...turn.input('c', 3),
+        conversation_id: 'other-conversation',
+      });
+      await expect(ioredisClient.hget(ledger, 'legacy:1')).resolves.toContain(turn.stream('a'));
+      expect(turn.owned(await turn.commit('b', winner))).toEqual([
+        [1, 'Willow 427 / Elm 441'],
+        [2, null],
+      ]);
+      await turn.store.destroy();
+    });
+
+    test('a Redis revision claimed before author ledgers existed keeps authoring only with a job', async () => {
+      if (!ioredisClient) return;
+      const { createHash } = await import('crypto');
+      const ledgerOf = (claimed: LogicalTurnClaim) => {
+        const logicalTurnId = claimed.interactionContext.logical_turn_id!;
+        return `stream:logical-author:{${logicalTurnId.split('.')[0]}}:${createHash('sha256')
+          .update(logicalTurnId)
+          .digest('hex')
+          .slice(0, 32)}`;
+      };
+
+      // A pre-upgrade revision with its job keeps authoring its input.
+      const admitted = await additiveTurn('legacy-admitted');
+      const legacyJob = await admitted.claim('a', 1, 'Willow 427 / Elm 441');
+      await admitted.admit('a', legacyJob);
+      await ioredisClient.hdel(ledgerOf(legacyJob), 'reservation:1');
+      const afterJob = await admitted.claim('b', 2);
+      await admitted.admit('b', afterJob);
+      await admitted.store.fenceSupersededLogicalTurnClaims(afterJob);
+      expect(admitted.owned(await admitted.commit('b', afterJob))).toEqual([[2, null]]);
+      await admitted.store.destroy();
+
+      // A pre-upgrade bare reservation is fenced and its input belongs to the winner.
+      const bare = await additiveTurn('legacy-bare');
+      const legacyReservation = await bare.claim('a', 1, 'Willow 427 / Elm 441');
+      await ioredisClient.hdel(ledgerOf(legacyReservation), 'reservation:1');
+      const afterReservation = await bare.claim('b', 2);
+      await bare.admit('b', afterReservation);
+      expect(bare.owned(await bare.commit('b', afterReservation))).toEqual([
+        [1, 'Willow 427 / Elm 441'],
+        [2, null],
+      ]);
+      await expect(bare.admit('a', legacyReservation)).rejects.toMatchObject({
+        code: 'stream_id_conflict',
+      });
+      await bare.store.destroy();
+    });
+    /* === VIVENTIUM END === */
+
     test('should update job status', async () => {
       if (!ioredisClient) {
         return;
@@ -383,6 +1119,140 @@ describe('RedisJobStore Integration Tests', () => {
       await first.destroy();
       await second.destroy();
     });
+
+    /* === VIVENTIUM START === An adapter subscribed at stream start receives the native FINAL. === */
+    test('an early subscriber receives the actual native final through Redis', async () => {
+      if (!ioredisClient || !('duplicate' in ioredisClient)) return;
+
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const { RedisEventTransport } = await import('../implementations/RedisEventTransport');
+      const { GenerationJobManagerClass } = await import('../GenerationJobManager');
+      const subscriber = ioredisClient.duplicate();
+      const store = new RedisJobStore(ioredisClient);
+      const transport = new RedisEventTransport(ioredisClient as never, subscriber as never);
+      const manager = new GenerationJobManagerClass();
+      manager.configure({ jobStore: store, eventTransport: transport, isRedis: true });
+      manager.initialize();
+      const suffix = `${Date.now()}`;
+      const streamId = `native-early-${suffix}`;
+      const userId = `owner-${suffix}`;
+      const conversationId = `conversation-${suffix}`;
+      const digest = 'd'.repeat(64);
+      try {
+        await manager.createJob(streamId, userId, conversationId, {
+          interactionContext: {
+            actor_kind: 'external_user',
+            origin: 'interactive',
+            surface: 'telegram',
+            conversation_id: conversationId,
+            revision: 1,
+            source_event_id: `source-${suffix}`,
+          },
+        });
+        // Telegram subscribes as soon as chat start returns, before the response identity exists.
+        const delivered = jest.fn();
+        const subscription = await manager.subscribe(streamId, jest.fn(), delivered);
+        await manager.updateMetadata(streamId, {
+          responseMessageId: `answer-${suffix}`,
+          userMessage: { messageId: `source-${suffix}` },
+        });
+        const data = (await store.getJob(streamId))!;
+        const admittedAt = Date.now();
+        const identity = {
+          userId,
+          conversationId,
+          responseMessageId: `answer-${suffix}`,
+          streamId,
+          jobCreatedAt: data.createdAt,
+          logicalTurnId: data.interactionContext!.logical_turn_id!,
+          revision: data.interactionContext!.revision,
+          invocationId: `invocation-${suffix}`,
+          bodySha256: digest,
+          originSha256: digest,
+          providerId: 'provider',
+          agentId: 'agent',
+          source: { id: `source-id-${suffix}`, messageId: `source-${suffix}`, digest },
+          admittedAt,
+          recoverUntil: admittedAt + 86400000,
+        };
+        expect(await manager.bindNativeResponse(identity)).toBe(true);
+        await manager.commitNativeResponse(identity, digest);
+        const final = {
+          final: true,
+          responseMessage: { messageId: `answer-${suffix}`, text: 'Answer.' },
+        };
+        expect(await manager.finishNativeResponse(identity, final as never)).toBe(true);
+        const deadline = Date.now() + 3000;
+        while (!delivered.mock.calls.length && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        expect(delivered).toHaveBeenCalledWith(final);
+        subscription?.unsubscribe();
+      } finally {
+        await manager.destroy();
+        subscriber.disconnect();
+      }
+    });
+    /* === VIVENTIUM END === */
+
+    /* === VIVENTIUM START === A reset conversation never continues another conversation's turn. === */
+    test('a newer source from another conversation supersedes the active turn without inheriting it', async () => {
+      if (!ioredisClient) return;
+
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const store = new RedisJobStore(ioredisClient);
+      const suffix = `${Date.now()}`;
+      const userId = `owner-${suffix}`;
+      // A unique source-order scope keeps this proof independent of earlier watermarks.
+      const { createHash } = await import('crypto');
+      const sourceOrderScope = createHash('sha256').update(`reset-${suffix}`).digest('hex');
+      const context = (conversation_id: string, source_event_id: string, source_sequence: number) => ({
+        actor_kind: 'external_user' as const,
+        origin: 'interactive' as const,
+        surface: 'telegram' as const,
+        conversation_id,
+        revision: 1,
+        source_event_id,
+        source_order_scope: sourceOrderScope,
+        source_sequence,
+        source_segments: [
+          { ordinal: 0, source_event_id, source_index: 0, text: source_event_id },
+        ],
+      });
+      const old = await store.claimLogicalTurn(
+        `old-${suffix}`,
+        userId,
+        context(`conversation-old-${suffix}`, `old-replay-${suffix}`, 1),
+      );
+      await store.createJob(`old-${suffix}`, userId, `conversation-old-${suffix}`, {
+        interactionContext: old.interactionContext,
+      });
+      // A source of the old conversation is retained but not yet admitted.
+      await store.retainLogicalTurnInput(
+        userId,
+        context(`conversation-old-${suffix}`, `old-pending-${suffix}`, 2),
+      );
+      const fresh = await store.claimLogicalTurn(
+        `fresh-${suffix}`,
+        userId,
+        context(`conversation-new-${suffix}`, `fresh-task-${suffix}`, 3),
+      );
+      expect(fresh.status).toBe('claimed');
+      expect(fresh.interactionContext).toMatchObject({
+        conversation_id: `conversation-new-${suffix}`,
+        revision: 1,
+      });
+      expect(fresh.interactionContext.logical_turn_id).not.toBe(
+        old.interactionContext.logical_turn_id,
+      );
+      expect(
+        fresh.interactionContext.source_segments?.map((source) => source.source_event_id),
+      ).toEqual([`fresh-task-${suffix}`]);
+      // The newest source in the chat still supersedes the older in-flight turn.
+      expect(fresh.supersededStreamIds).toEqual([`old-${suffix}`]);
+      await store.destroy();
+    });
+    /* === VIVENTIUM END === */
 
     test('newer revision accepts an already-retired predecessor without restoring its authority', async () => {
       if (!ioredisClient) return;

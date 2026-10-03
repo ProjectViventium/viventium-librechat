@@ -31,9 +31,11 @@ const {
 const db = require('~/models');
 const { Conversation, Message } = require('~/db/models');
 const { isVoiceTaskSuppressedDurably } = require('./VoiceTaskService');
+const { isRuntimeOnlyAssistantMessage } = require('./normalizeTextContentParts');
 
 const {
   CORTEX_INSIGHT_RETRYABLE_FAILURE_REASONS,
+  buildCortexInsightDeliveryCandidates,
   claimCortexInsightDeliveryBatch,
   markCortexInsightDeliveryBatchDropped,
   markCortexInsightDeliveryBatchFailed,
@@ -43,8 +45,33 @@ const {
   renewCortexInsightDeliveryBatchClaim,
   selectClaimedCortexInsights,
 } = require('./CortexInsightDeliveryService');
+const { settleOwnedCompletedCortexInsights } = require('./CortexInsightOutboxService');
 
-const { getTrustedInteractionContext } = require('./interactionContext');
+const { getTrustedInteractionContext, getTrustedDeliveryPolicy } = require('./interactionContext');
+const { getCortexFollowupGraceMs } = require('./cortexFollowupGrace');
+
+/* === VIVENTIUM START ===
+ * Feature: Phase B owner-batched acceptance settlement.
+ * Purpose: The owner's claim has just recorded this parent's one batch in the delivery ledger, so
+ * the insights it accepted into the write-ahead outbox are represented there. Anything this batch
+ * did not cover stays owned until the completion pipeline releases it for grouped replay.
+ * === VIVENTIUM END === */
+async function settleOwnedCortexInsightAcceptance(claimInput, dependencies = {}) {
+  try {
+    const outboxKeys = buildCortexInsightDeliveryCandidates(claimInput).map(
+      (candidate) => candidate.deliveryKey,
+    );
+    await (dependencies.settleOwnedInsights || settleOwnedCompletedCortexInsights)({
+      ownerId: claimInput.ownerId,
+      parentMessageId: claimInput.parentMessageId,
+      outboxKeys,
+    });
+  } catch (error) {
+    logger.warn('[BackgroundCortexFollowUpService] Owned insight settlement deferred to release', {
+      code: String(error?.code || error?.name || 'owned_insight_settlement_failed').slice(0, 120),
+    });
+  }
+}
 
 async function isFollowUpVoiceTaskSuppressed(req, taskId) {
   return isVoiceTaskSuppressedDurably(taskId, {
@@ -148,6 +175,31 @@ const PLACEHOLDER_RESPONSE_PATTERNS = [
  * === VIVENTIUM END === */
 const DURABLE_FOLLOW_UP_RECONNECT_DELAYS_MS = Object.freeze([0, 250, 500, 1000, 2000, 4000]);
 const PHASE_B_PROVIDER_SESSION_LANE = 'phase_b:followup';
+/* === VIVENTIUM START ===
+ * Fix: Phase B authors its own follow-up carrier. The resolved Main agent can still hold the Main
+ * turn's Core context binding, visible-message chain and developer-instruction tail; they describe
+ * the Main request's carrier, so the native provider rejected follow-ups that forwarded them.
+ * === VIVENTIUM END === */
+const MAIN_TURN_CARRIER_HEADERS = new Set([
+  'x-viventium-main-context-protocol',
+  'x-viventium-main-context-owner',
+  'x-viventium-main-context-snapshot-sha256',
+  'x-viventium-main-context-epoch',
+  'x-viventium-continuity-domain-id',
+  'x-viventium-continuity-agent-id',
+  'x-viventium-logical-turn-id',
+  'x-viventium-logical-turn-revision',
+  'x-viventium-visible-message-chain-b64',
+  'x-glasshive-developer-instruction-tail-b64',
+]);
+
+function withoutMainTurnCarrierHeaders(headers) {
+  return Object.fromEntries(
+    Object.entries(headers || {}).filter(
+      ([name]) => !MAIN_TURN_CARRIER_HEADERS.has(String(name).toLowerCase()),
+    ),
+  );
+}
 const RETRYABLE_FOLLOW_UP_TRANSPORT_CODES = new Set([
   'ECONNREFUSED',
   'ECONNRESET',
@@ -747,7 +799,7 @@ async function settleSuppressedCortexInsightDeliveries({
   const voiceMode = isVoiceMode(req);
   const surface = resolveViventiumSurface(req);
   const feelingSnapshot = normalizeCortexFeelingSnapshot(req?._viventiumFeelingSnapshot);
-  const deliveryBatch = await claimBatch({
+  const claimInput = {
     ownerId: req?.user?.id,
     conversationId,
     parentMessageId,
@@ -761,7 +813,9 @@ async function settleSuppressedCortexInsightDeliveries({
     ),
     ...(feelingSnapshot ? { feelingSnapshot } : {}),
     insights,
-  });
+  };
+  const deliveryBatch = await claimBatch(claimInput);
+  await settleOwnedCortexInsightAcceptance(claimInput, dependencies);
   const claims = claimedCortexInsightDeliveryClaims(deliveryBatch);
   if (claims.length === 0) {
     return { claimed: 0, dropped: 0, dropReason };
@@ -1540,6 +1594,10 @@ function resolveFollowUpContinuationContext(messages, parentMessageId, options =
 
   const visibleContinuation = orderedContinuation
     .filter((message) => message.messageId !== parentMessageId)
+    // Callback cards describe execution state, not an answer authored by Main.
+    // Keep them in the tree so newer real turns remain reachable, but do not
+    // present their status text as an answer already delivered to the user.
+    .filter((message) => !isRuntimeOnlyAssistantMessage(message))
     .filter((message) => {
       const timeline = getMessageTimelineValue(message);
       return parentTimeline === 0 || timeline >= parentTimeline;
@@ -1639,7 +1697,7 @@ async function loadFollowUpContinuationContext({ req, conversationId, parentMess
   try {
     const messages = await db.getMessages(
       { user: req.user.id, conversationId },
-      'messageId parentMessageId createdAt updatedAt text content sender isCreatedByUser metadata',
+      'messageId parentMessageId createdAt updatedAt text content sender isCreatedByUser metadata unfinished files image_urls attachments',
     );
     return {
       messages,
@@ -1775,6 +1833,7 @@ async function resolveFollowUpLLMConfig({
 
     return {
       ...initialized.llmConfig,
+      ...(initialized.configOptions ? { configuration: initialized.configOptions } : {}),
       provider: Providers.OPENAI,
       streaming: false,
       disableStreaming: true,
@@ -1874,7 +1933,7 @@ async function resolveFollowUpLLMConfig({
         resolvedAgent?.model_parameters?.configuration?.defaultHeaders ||
         customConfig.defaultHeaders ||
         {};
-      let runtimeHeaders = { ...existingHeaders };
+      let runtimeHeaders = withoutMainTurnCarrierHeaders(existingHeaders);
       if (followUpCapability?.workspace_binding === true) {
         const providerDefaultAccess =
           followUpCapability.default_access === 'full' ? 'full' : 'workspace';
@@ -2663,6 +2722,7 @@ async function promoteForcedFollowUpToEmptyParent({
   scheduleId,
   continuationContext,
   deliveryBatch,
+  dependencies = {},
 }) {
   const normalizedText = typeof text === 'string' ? text.trim() : '';
   if (!forceVisibleFollowUp || !normalizedText || scheduleId) {
@@ -2678,6 +2738,14 @@ async function promoteForcedFollowUpToEmptyParent({
   try {
     const existing = await db.getMessage({ user: req.user.id, messageId: parentMessageId });
     if (!existing) {
+      return null;
+    }
+    /* === VIVENTIUM START ===
+     * Fix: the adapter already presented this turn's failure and acknowledged it `failed`. A
+     * promotion can no longer be presented and would erase that record, so the follow-up keeps
+     * its own message instead of rewriting the failed answer.
+     * === VIVENTIUM END === */
+    if (existing.metadata?.viventium?.deliveryAcknowledgement?.state === 'failed') {
       return null;
     }
 
@@ -2732,6 +2800,23 @@ async function promoteForcedFollowUpToEmptyParent({
       },
     };
 
+    const promotedMessage = {
+      ...existing,
+      conversationId: existing.conversationId || conversationId,
+      messageId: parentMessageId,
+      parentMessageId: existing.parentMessageId,
+      text: normalizedText,
+      content: nextContent,
+      metadata: nextMetadata,
+      unfinished: false,
+      error: false,
+    };
+    if (typeof dependencies.prepareAttachments === 'function') {
+      const attachments = await dependencies.prepareAttachments(promotedMessage);
+      if (attachments.length)
+        promotedMessage.attachments = [...(existing.attachments || []), ...attachments];
+    }
+
     await db.updateMessage(
       req,
       {
@@ -2741,6 +2826,7 @@ async function promoteForcedFollowUpToEmptyParent({
         metadata: nextMetadata,
         unfinished: false,
         error: false,
+        ...(promotedMessage.attachments ? { attachments: promotedMessage.attachments } : {}),
       },
       {
         operationKind: 'system',
@@ -2753,17 +2839,7 @@ async function promoteForcedFollowUpToEmptyParent({
       `[BackgroundCortexFollowUpService] Promoted forced Phase B follow-up onto empty canonical parent: conversationId=${conversationId || ''} parent=${parentMessageId || ''}`,
     );
 
-    return {
-      ...existing,
-      conversationId: existing.conversationId || conversationId,
-      messageId: parentMessageId,
-      parentMessageId: existing.parentMessageId,
-      text: normalizedText,
-      content: nextContent,
-      metadata: nextMetadata,
-      unfinished: false,
-      error: false,
-    };
+    return promotedMessage;
   } catch (err) {
     logger.warn(
       '[BackgroundCortexFollowUpService] Failed to promote forced follow-up onto empty parent',
@@ -2997,9 +3073,12 @@ async function generateFollowUpText({
   let nativeToolEvidence = [];
   if (req?.user?.id && conversationId && parentMessageId) {
     try {
-      nativeToolEvidence = await require('./nativeResponseService')
-        .getService()
-        .readToolEvidence(req.user.id, conversationId, parentMessageId);
+      const evidenceService = require('./nativeResponseService').getService();
+      nativeToolEvidence = getTrustedDeliveryPolicy(req)?.commit_authority === 'external_adapter'
+        ? await evidenceService.readToolEvidenceForPresentation(
+            req.user.id, conversationId, parentMessageId, getCortexFollowupGraceMs(),
+          )
+        : await evidenceService.readToolEvidence(req.user.id, conversationId, parentMessageId);
     } catch (error) {
       // Accepted worker results carry their own fenced authority. A failed or
       // replaced foreground reply cannot block their delivery; its optional
@@ -3318,6 +3397,7 @@ async function persistPreparedCortexFollowUpMessage(
     scheduleId,
     continuationContext: finalContinuationContext,
     deliveryBatch,
+    dependencies,
   });
   if (promotedParentMessage) {
     if (deliveryBatch?.claimed?.length) {
@@ -3420,6 +3500,10 @@ async function persistPreparedCortexFollowUpMessage(
     isCreatedByUser: false,
     metadata,
   };
+  if (typeof dependencies.prepareAttachments === 'function') {
+    const attachments = await dependencies.prepareAttachments(followUpMessage);
+    if (attachments.length) followUpMessage.attachments = attachments;
+  }
 
   if (deliveryBatch?.claimed?.length) {
     const persisted = await persistCortexFollowUpMessageWithLedger({
@@ -3477,7 +3561,7 @@ async function createCortexFollowUpMessage(input) {
   let deliveryBatch = claimedDeliveryBatch || null;
   if (insights.length && !deliveryBatch) {
     const feelingSnapshot = normalizeCortexFeelingSnapshot(req?._viventiumFeelingSnapshot);
-    deliveryBatch = await (dependencies.claimBatch || claimCortexInsightDeliveryBatch)({
+    const claimInput = {
       ownerId: req?.user?.id,
       conversationId,
       parentMessageId: deliveryParentMessageId || parentMessageId,
@@ -3491,7 +3575,9 @@ async function createCortexFollowUpMessage(input) {
       ),
       ...(feelingSnapshot ? { feelingSnapshot } : {}),
       insights,
-    });
+    };
+    deliveryBatch = await (dependencies.claimBatch || claimCortexInsightDeliveryBatch)(claimInput);
+    await settleOwnedCortexInsightAcceptance(claimInput, dependencies);
   }
   if (insights.length && !deliveryBatch?.claimed?.length) return null;
   const claimedInput = {

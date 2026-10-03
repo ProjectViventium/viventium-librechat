@@ -2,7 +2,7 @@ import { logger } from '@librechat/data-schemas';
 import { resolveFeelingsRuntimeConfig } from '../config';
 
 describe('Feelings runtime config', () => {
-  it('defaults to all agents and the approved GPT-5.6 Fast reaction route', () => {
+  it('defaults to all agents and the current provider reaction models', () => {
     const config = resolveFeelingsRuntimeConfig({});
 
     expect(config.available).toBe(true);
@@ -11,13 +11,13 @@ describe('Feelings runtime config', () => {
     expect(config.reaction).toMatchObject({
       activationMode: 'always',
       provider: 'openai',
-      model: 'gpt-5.6-terra',
+      model: 'gpt-6.1-sol',
       useResponsesApi: true,
-      reasoningEffort: 'none',
+      reasoningEffort: 'high',
       serviceTier: 'priority',
       timeoutMs: 15000,
       fallbackProvider: 'anthropic',
-      fallbackModel: 'claude-opus-5',
+      fallbackModel: 'claude-opus-5-5',
       activationModel: 'qwen/qwen3.6-27b',
     });
   });

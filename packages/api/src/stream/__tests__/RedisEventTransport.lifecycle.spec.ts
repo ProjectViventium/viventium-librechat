@@ -68,6 +68,31 @@ function createSubscriber(initialStatus: string = 'ready') {
 }
 
 describe('RedisEventTransport subscription lifecycle', () => {
+  test('preserves typed failures across Redis delivery and retains the legacy single-argument callback', async () => {
+    const { publisher, subscriber } = createSubscriber();
+    const transport = new RedisEventTransport(publisher as never, subscriber as never);
+    const received = jest.fn();
+    const subscription = transport.subscribe('typed-error', {
+      onChunk: () => undefined,
+      onError: received,
+    });
+    await subscription.ready;
+    await transport.emitError('typed-error', 'Public failure.', 'source_context_unavailable');
+    const first = publisher.publish.mock.calls[0];
+    expect(JSON.parse(first[1] as string)).toMatchObject({
+      error: 'Public failure.',
+      errorClass: 'source_context_unavailable',
+    });
+    subscriber.emit('message', first[0], first[1]);
+    expect(received).toHaveBeenLastCalledWith('Public failure.', 'source_context_unavailable');
+    await transport.emitError('typed-error', 'Legacy failure.');
+    const second = publisher.publish.mock.calls[1];
+    subscriber.emit('message', second[0], second[1]);
+    expect(received).toHaveBeenLastCalledWith('Legacy failure.');
+    subscription.unsubscribe();
+    await transport.destroy();
+  });
+
   test('uses the handler acknowledgement when Redis Cluster publish reports zero local subscribers', async () => {
     const { publisher, subscriber } = createSubscriber();
     publisher.publish.mockImplementation(async (channel: string, message: string) => {

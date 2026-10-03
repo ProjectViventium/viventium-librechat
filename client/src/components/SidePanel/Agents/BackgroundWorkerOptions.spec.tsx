@@ -5,6 +5,32 @@ import type { TAgentProviderCapability } from 'librechat-data-provider';
 import type { AgentForm } from '~/common';
 import BackgroundWorkerOptions from './BackgroundWorkerOptions';
 
+jest.mock('@librechat/client', () => ({
+  ControlCombobox: ({
+    items,
+    selectedValue,
+    setValue,
+    ariaLabel,
+  }: {
+    items: Array<{ label: string; value: string }>;
+    selectedValue: string;
+    setValue: (value: string) => void;
+    ariaLabel: string;
+  }) => (
+    <select
+      aria-label={ariaLabel}
+      value={selectedValue}
+      onChange={(event) => setValue(event.target.value)}
+    >
+      {items.map((item) => (
+        <option key={item.value} value={item.value}>
+          {item.label}
+        </option>
+      ))}
+    </select>
+  ),
+}));
+
 jest.mock('~/hooks', () => ({
   useLocalize: () => (key: string) =>
     jest.requireActual('~/locales/en/translation.json')[key] || key,
@@ -109,12 +135,24 @@ it('clears only worker preference when choosing profile defaults', () => {
 it('uses declared harness metadata on an explicit model change', () => {
   const snapshot = jest.fn();
   render(<Harness snapshot={snapshot} />);
-  fireEvent.change(screen.getByLabelText('Background model'), {
-    target: { value: 'model-fallback' },
+  fireEvent.change(screen.getByLabelText('Background provider'), {
+    target: { value: 'claude-code' },
   });
   fireEvent.click(screen.getByText('Save snapshot'));
   expect(snapshot.mock.calls[0][0].glasshive_options.orchestration.worker_profile).toBe(
     'claude-code',
   );
   expect(snapshot.mock.calls[0][0].model).toBe('main-model');
+});
+
+it('groups provider models and retains older supported efforts', () => {
+  render(<Harness snapshot={jest.fn()} />);
+  const model = screen.getByLabelText('Background model');
+  expect(model.querySelector('option[value="model-fallback"]')).toBeNull();
+  fireEvent.change(screen.getByLabelText('Background provider'), {
+    target: { value: 'claude-code' },
+  });
+  expect(screen.getByLabelText('Background model')).toHaveValue('model-fallback');
+  fireEvent.change(screen.getByLabelText('Background model effort'), { target: { value: 'low' } });
+  expect(screen.getByLabelText('Background model effort')).toHaveValue('low');
 });

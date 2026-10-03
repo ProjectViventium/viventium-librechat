@@ -1167,7 +1167,12 @@ describe('staleCortexMessageRecovery', () => {
       recoverInsightDeliveries,
     });
 
-    expect(recoverInsightDeliveries).toHaveBeenCalledWith({ limit: 100 });
+    // Orphan settlement uses the pass's own cutoff: older than the stale window and this process.
+    const [[options]] = recoverInsightDeliveries.mock.calls;
+    expect(options).toEqual({ limit: 100, orphanedBefore: expect.any(Date) });
+    expect(options.orphanedBefore.getTime()).toBeLessThanOrEqual(
+      new Date('2026-05-06T12:00:00.000Z').getTime() - result.timeoutMs,
+    );
     expect(result.recoveredInsightDeliveries).toEqual(
       expect.objectContaining({ scanned: 2, sent: 2, pending: 0 }),
     );

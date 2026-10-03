@@ -316,7 +316,7 @@ export const isImageVisionTool = (tool: FunctionTool | FunctionToolCall) =>
 
 export const openAISettings = {
   model: {
-    default: 'gpt-4o-mini' as const,
+    default: 'gpt-6.1-sol' as const,
   },
   temperature: {
     min: 0 as const,
@@ -690,6 +690,9 @@ export type UIResource = {
 };
 
 export type TAttachmentMetadata = {
+  /* === VIVENTIUM START === An unavailable native selection is not a downloadable File. === */
+  nativeOutputFile?: { version: 1; status: 'unavailable'; code: string };
+  /* === VIVENTIUM END === */
   type?: Tools;
   messageId: string;
   toolCallId: string;
@@ -734,12 +737,7 @@ export const coerceNumber = z.union([z.number(), z.string()]).transform((val) =>
 });
 
 type DocumentTypeValue =
-  | null
-  | boolean
-  | number
-  | string
-  | DocumentTypeValue[]
-  | { [key: string]: DocumentTypeValue };
+  null | boolean | number | string | DocumentTypeValue[] | { [key: string]: DocumentTypeValue };
 
 const DocumentType: z.ZodType<DocumentTypeValue> = z.lazy(() =>
   z.union([

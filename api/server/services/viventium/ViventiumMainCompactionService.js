@@ -12,6 +12,16 @@ const {
   inspectMainCompactionCandidate,
   mainCompactionOutputConstraints,
   mainCompactionCandidateDigest,
+  MAIN_COMPACTION_SOURCE_TARGET_BYTES,
+  forgetFailedMainCompaction,
+  mainCompactionLeaseRemainingMs,
+  mainCompactionSizeRepairBudget,
+  mainCompactionSourceTargetBytes,
+  recordAcceptedMainCompactionClaim,
+  recordMainCompactionRejection,
+  recordUnacceptedMainCompactionClaim,
+  rememberFailedMainCompaction,
+  repeatedFailedMainCompaction,
 } = require('@librechat/api');
 const { getRequiredPromptText } = require('./promptRegistry');
 const { logger } = require('@librechat/data-schemas');
@@ -138,6 +148,23 @@ function parseSemanticCompactionOutput(value) {
   }
 }
 
+/** One epoch's compaction work: owner, Main agent and its stable authority. */
+function compactionEpochKey(input) {
+  return [input.ownerId, input.agentId, input.stableAuthoritySha256]
+    .map((value) => String(value || '').trim())
+    .join('\n');
+}
+
+/** The approved contract and exact compactor route a failed claim was produced under. */
+function compactionContractKey(agent) {
+  return JSON.stringify({
+    constraints: mainCompactionOutputConstraints,
+    provider: String(agent?.endpoint || agent?.provider || ''),
+    model: String(agent?.model_parameters?.model || agent?.model || ''),
+    effort: String(agent?.model_parameters?.reasoning_effort || ''),
+  });
+}
+
 function buildCompactionPrompt(claim, correctionReason = '', candidate = null) {
   const payload = JSON.stringify({
     version: 1,
@@ -216,6 +243,7 @@ async function defaultExecuteCompactor({
   signal,
   reportCapacityRelease,
   stage = 'compaction',
+  timeoutMs,
 }) {
   if (!req || !agent) throw new Error('main_compaction_runtime_unavailable');
   const { createBackgroundRes, executeCortex } = require('../BackgroundCortexService');
@@ -245,9 +273,16 @@ async function defaultExecuteCompactor({
       req: safeReq,
       res: res || createBackgroundRes(),
       contextMode: 'minimal',
+      // The claim carries the accepted evidence; the triggering Main turn's Core context and
+      // visible chain describe a different message carrier and must not be forwarded.
+      mainContextBinding: 'isolated',
       completedResultPolicy: 'internal',
       insightMode: 'structured',
-      executionTimeoutMs: COMPACTOR_TIMEOUT_MS,
+      // A repair bounded by the claim lease never outlives it; native cancellation stays owned here.
+      executionTimeoutMs:
+        Number.isFinite(timeoutMs) && timeoutMs > 0
+          ? Math.min(timeoutMs, COMPACTOR_TIMEOUT_MS)
+          : COMPACTOR_TIMEOUT_MS,
       signal,
       onHarnessCancellationOutcome: (outcome) => {
         capacityReleaseReported = true;
@@ -264,6 +299,12 @@ async function defaultExecuteCompactor({
       // released. Only the cancellation endpoint may positively acknowledge that boundary.
       reportCapacityRelease(false);
     }
+  }
+  if (result?.nativeOwnership === 'unresolved') {
+    // The compactor's native request may still run: no transport retry or next stage overlaps it.
+    const error = new Error('main_compaction_native_release_unconfirmed');
+    error.code = 'main_compaction_native_release_unconfirmed';
+    throw error;
   }
   if (!result?.insight) {
     const error = new Error(String(result?.errorClass || result?.error || 'compaction_failed'));
@@ -297,6 +338,17 @@ async function ensureAcceptedMainCompaction(input = {}) {
   if (inputSignal?.aborted) abortFromInput();
   else inputSignal?.addEventListener?.('abort', abortFromInput, { once: true });
   const executeCompactor = input.executeCompactor || defaultExecuteCompactor;
+  /* === VIVENTIUM START ===
+   * Feature: One compaction runner for accepted Main turns and legacy conversation source.
+   * Purpose: A caller may supply its own claim/complete/reject store; attempts, repair, fidelity
+   * review and failure memory stay identical. A foreground claim runs inside the owner's own turn,
+   * which is waiting on it, so it does not yield to that turn's interactive admission fence.
+   * === VIVENTIUM END === */
+  const claimCompaction = input.claimCompaction || claimAcceptedMainCompaction;
+  const completeCompaction = input.completeCompaction || completeAcceptedMainCompaction;
+  const rejectCompaction = input.rejectCompaction || rejectAcceptedMainCompaction;
+  const yieldToInteractive = () =>
+    input.foreground !== true && yieldToInteractiveMainAdmission(ownerId, controller);
   const retrySleep = typeof input.sleep === 'function' ? input.sleep : sleep;
   const configuredRetryDelayMs = Number(input.retryDelayMs);
   const retryDelayMs = Number.isFinite(configuredRetryDelayMs)
@@ -306,16 +358,57 @@ async function ensureAcceptedMainCompaction(input = {}) {
   let transportRetries = 0;
   let correctionReason = '';
   let terminalReason = '';
+  const now = typeof input.now === 'function' ? input.now : Date.now;
+  // A shrinking whole-proposal overflow may be repaired again within the store-owned claim lease.
+  let sizeRepair = null;
+  let sizeRepairTimeoutMs = 0;
+  let slowestCallMs = 0;
   try {
-    if (yieldToInteractiveMainAdmission(ownerId, controller)) {
+    if (yieldToInteractive()) {
       return { status: 'degraded', attempts: 0, reason: 'interactive_priority' };
     }
-    const claim = await claimAcceptedMainCompaction(input);
+    const epochKey = compactionEpochKey(input);
+    // After an unaccepted proposal the next claim takes less whole-turn source; none is dropped.
+    const learnedSourceTarget = mainCompactionSourceTargetBytes(epochKey);
+    const claim = await claimCompaction({
+      ...input,
+      ...(learnedSourceTarget < MAIN_COMPACTION_SOURCE_TARGET_BYTES
+        ? { sourceTargetBytes: learnedSourceTarget }
+        : {}),
+    });
     if (claim.status !== 'claimed') return claim;
-    if (yieldToInteractiveMainAdmission(ownerId, controller)) {
+    const contractKey = compactionContractKey(input.agent);
+    // An identical claim that already failed under the same contract is not re-run; its
+    // degraded reason stays visible until the source, contract or compactor changes.
+    const repeatedReason = repeatedFailedMainCompaction({
+      domainEpochKey: claim.domainEpochKey,
+      sourceDigest: claim.sourceDigest,
+      contractKey,
+    });
+    if (repeatedReason) {
+      terminalReason = repeatedReason;
+      logger.info('[VIVENTIUM][main-continuity] Unchanged failed compaction claim not repeated', {
+        sourceBytes: claim.sourceBytes,
+      });
+    }
+    const mayRepairSize = () => {
+      const budget = mainCompactionSizeRepairBudget({
+        state: sizeRepair,
+        attempts: semanticAttempts,
+        leaseExpiresAt: claim.leaseExpiresAt,
+        now: now(),
+        slowestCallMs,
+        maxCallMs: COMPACTOR_TIMEOUT_MS,
+      });
+      sizeRepairTimeoutMs = budget.timeoutMs;
+      return budget.allowed;
+    };
+    // Every native call and retry wait ends within the store-owned claim lease.
+    const leaseRemainingMs = () => mainCompactionLeaseRemainingMs(claim.leaseExpiresAt, now());
+    if (yieldToInteractive()) {
       terminalReason = 'interactive_priority';
     }
-    while (!terminalReason && semanticAttempts < MAX_ATTEMPTS) {
+    while (!terminalReason && (semanticAttempts < MAX_ATTEMPTS || mayRepairSize())) {
       if (controller.signal.aborted) {
         terminalReason =
           controller.signal.reason === 'maintenance_yield'
@@ -327,15 +420,22 @@ async function ensureAcceptedMainCompaction(input = {}) {
       let raw;
       try {
         const prompt = buildCompactionPrompt(claim, correctionReason);
-        if (yieldToInteractiveMainAdmission(ownerId, controller)) {
+        if (yieldToInteractive()) {
           terminalReason = 'interactive_priority';
           break;
         }
+        const callTimeoutMs = attempt > MAX_ATTEMPTS ? sizeRepairTimeoutMs : leaseRemainingMs();
+        if (callTimeoutMs <= 0) {
+          terminalReason = 'compaction_lease_expired';
+          break;
+        }
         active.capacityReleaseAcknowledged = null;
+        const callStartedMs = now();
         raw = await executeCompactor({
           claim,
           prompt,
           attempt,
+          timeoutMs: callTimeoutMs,
           req: input.req,
           res: input.res,
           agent: input.agent,
@@ -344,6 +444,7 @@ async function ensureAcceptedMainCompaction(input = {}) {
             active.capacityReleaseAcknowledged = acknowledged === true;
           },
         });
+        slowestCallMs = Math.max(slowestCallMs, now() - callStartedMs);
       } catch (error) {
         if (controller.signal.aborted) {
           terminalReason =
@@ -355,7 +456,9 @@ async function ensureAcceptedMainCompaction(input = {}) {
         const errorClass = providerErrorReason(error);
         const errorStatus = providerErrorStatus(error);
         const willRetryTransport =
-          isTransientProviderError(error) && transportRetries < MAX_TRANSPORT_RETRIES;
+          isTransientProviderError(error) &&
+          transportRetries < MAX_TRANSPORT_RETRIES &&
+          leaseRemainingMs() > retryDelayMs;
         logger.warn('[VIVENTIUM][main-continuity] Compactor transport attempt failed', {
           attempt,
           transportRetries,
@@ -372,15 +475,28 @@ async function ensureAcceptedMainCompaction(input = {}) {
         break;
       }
       semanticAttempts += 1;
-      const prepared = inspectMainCompactionCandidate(parseSemanticCompactionOutput(raw));
+      const proposal = parseSemanticCompactionOutput(raw);
+      const prepared = inspectMainCompactionCandidate(proposal);
       if (!prepared.ok) {
+        sizeRepair = recordMainCompactionRejection(
+          sizeRepair,
+          prepared.issue,
+          semanticAttempts,
+          proposal,
+        );
         correctionReason = { code: 'schema_invalid', issue: prepared.issue, candidate: raw };
         continue;
       }
+      sizeRepair = null;
       const parsed = prepared.candidate;
       let review;
+      const reviewTimeoutMs = leaseRemainingMs();
+      if (reviewTimeoutMs <= 0) {
+        terminalReason = 'compaction_lease_expired';
+        break;
+      }
       try {
-        if (yieldToInteractiveMainAdmission(ownerId, controller)) continue;
+        if (yieldToInteractive()) continue;
         active.capacityReleaseAcknowledged = null;
         review = parseSemanticCompactionOutput(
           await executeCompactor({
@@ -388,6 +504,7 @@ async function ensureAcceptedMainCompaction(input = {}) {
             prompt: buildCompactionPrompt(claim, '', parsed),
             attempt,
             stage: 'review',
+            timeoutMs: reviewTimeoutMs,
             req: input.req,
             res: input.res,
             agent: input.agent,
@@ -424,7 +541,7 @@ async function ensureAcceptedMainCompaction(input = {}) {
         };
         continue;
       }
-      const completed = await completeAcceptedMainCompaction({
+      const completed = await completeCompaction({
         ...input,
         leaseId: claim.leaseId,
         sourceDigest: claim.sourceDigest,
@@ -437,6 +554,8 @@ async function ensureAcceptedMainCompaction(input = {}) {
         },
       });
       if (completed.status === 'compacted') {
+        recordAcceptedMainCompactionClaim(epochKey);
+        forgetFailedMainCompaction(claim.domainEpochKey);
         return {
           ...completed,
           attempts: semanticAttempts,
@@ -461,7 +580,17 @@ async function ensureAcceptedMainCompaction(input = {}) {
           ? `${correctionReason.code}: ${correctionReason.reason}`
           : correctionReason.code) ||
       'quality_gate';
-    await rejectAcceptedMainCompaction({
+    if (!terminalReason) {
+      // The bounded model-owned attempts ended without an accepted proposal.
+      recordUnacceptedMainCompactionClaim({ key: epochKey, sourceBytes: claim.sourceBytes });
+      rememberFailedMainCompaction({
+        domainEpochKey: claim.domainEpochKey,
+        sourceDigest: claim.sourceDigest,
+        contractKey,
+        reason: finalReason,
+      });
+    }
+    await rejectCompaction({
       ...input,
       leaseId: claim.leaseId,
       reason: finalReason,

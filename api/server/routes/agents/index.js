@@ -138,9 +138,11 @@ router.get('/chat/stream/:streamId', async (req, res) => {
         res.end();
       }
     },
-    (error) => {
+    (error, errorClass) => {
       if (!res.writableEnded) {
-        res.write(`event: error\ndata: ${JSON.stringify({ error })}\n\n`);
+        res.write(
+          `event: error\ndata: ${JSON.stringify({ error, ...(errorClass ? { error_class: errorClass } : {}) })}\n\n`,
+        );
         if (typeof res.flush === 'function') {
           res.flush();
         }

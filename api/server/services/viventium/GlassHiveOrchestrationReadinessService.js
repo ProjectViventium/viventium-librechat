@@ -3,6 +3,7 @@
 const { logger } = require('@librechat/data-schemas');
 const {
   GenerationJobManager,
+  authoringOrchestrationReadiness,
   configureOrchestrationReadiness,
   observeOrchestrationOwner,
   orchestrationDeploymentReadinessSnapshot,
@@ -31,6 +32,7 @@ configureOrchestrationReadiness({
 });
 
 module.exports = {
+  authoringOrchestrationReadiness,
   observeOrchestrationOwner,
   orchestrationDeploymentReadinessSnapshot,
   orchestrationReadinessSnapshot,

@@ -21,6 +21,19 @@ describe('background cortex activation mode validation', () => {
     },
   );
 
+  it('preserves native reasoning effort when Agent Builder saves activation routes', () => {
+    const activation = {
+      enabled: true, provider: 'groq', model: 'qwen/qwen3.6-27b',
+      prompt: 'Use the relevant evidence.', confidence_threshold: 0.7, cooldown_ms: 0, max_history: 6,
+      reasoning_effort: 'none',
+      fallbacks: [
+        { provider: 'anthropic', model: 'claude-opus-5-5', reasoning_effort: 'high' },
+        { provider: 'openai', model: 'gpt-5.4', reasoning_effort: 'medium' },
+      ],
+    };
+    expect(activationConfigSchema.parse(activation)).toEqual(activation);
+  });
+
   it('keeps absent mode backward-compatible with classified activation', () => {
     expect(() =>
       activationConfigSchema.parse({

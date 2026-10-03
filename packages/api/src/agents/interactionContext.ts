@@ -12,6 +12,23 @@ import {
   type InteractionSourceSegment,
 } from '../glasshive/interactionSourceSegments';
 import { isNoResponseOnly } from './noResponseTag';
+import {
+  normalizeInteractionReplyContext,
+  type InteractionReplyAttachment,
+  type InteractionReplyContext,
+  type ReplyProvenanceStatus,
+  type ReplySenderRole,
+  type ReplySourceKind,
+} from './interactionReplyContext';
+
+export {
+  normalizeInteractionReplyContext,
+  type InteractionReplyAttachment,
+  type InteractionReplyContext,
+  type ReplyProvenanceStatus,
+  type ReplySenderRole,
+  type ReplySourceKind,
+};
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -22,30 +39,7 @@ export type InteractionSegmentStability = 'immediate' | 'provisional';
 export type InteractionSupersedeScope = 'response_and_authoring' | 'response_only';
 export type InteractionTurnScope = 'conversation' | 'source_event';
 export type InteractionCommitAuthority = 'server' | 'external_adapter';
-export type ReplyProvenanceStatus = 'verified' | 'platform_verified' | 'unverified';
-export type ReplySenderRole = 'assistant_self' | 'owner_self' | 'third_party' | 'unknown';
-export type ReplySourceKind = 'assistant_message' | 'schedule_result' | 'callback';
 
-export interface InteractionReplyAttachment {
-  readonly fileId?: string;
-  readonly filename?: string;
-  readonly kind?: string;
-  readonly extractedText?: string;
-}
-
-export interface InteractionReplyContext {
-  readonly version: 1;
-  readonly provenanceStatus: ReplyProvenanceStatus;
-  readonly senderRole: ReplySenderRole;
-  readonly repliedTelegramMessageId: string;
-  readonly quoteText: string;
-  readonly logicalMessageId?: string;
-  readonly conversationId?: string;
-  readonly sourceKind?: ReplySourceKind;
-  readonly scheduleId?: string;
-  readonly scheduleRunId?: string;
-  readonly attachments?: readonly InteractionReplyAttachment[];
-}
 
 export interface ReadyInputContinuation {
   readonly source_message_id: string;
@@ -186,22 +180,6 @@ const SUPERSEDE_SCOPES = new Set<InteractionSupersedeScope>([
 ]);
 const TURN_SCOPES = new Set<InteractionTurnScope>(['conversation', 'source_event']);
 const COMMIT_AUTHORITIES = new Set<InteractionCommitAuthority>(['server', 'external_adapter']);
-const REPLY_PROVENANCE_STATUSES = new Set<ReplyProvenanceStatus>([
-  'verified',
-  'platform_verified',
-  'unverified',
-]);
-const REPLY_SENDER_ROLES = new Set<ReplySenderRole>([
-  'assistant_self',
-  'owner_self',
-  'third_party',
-  'unknown',
-]);
-const REPLY_SOURCE_KINDS = new Set<ReplySourceKind>([
-  'assistant_message',
-  'schedule_result',
-  'callback',
-]);
 const TRUSTED_SLOT = '_viventiumInteractionContext';
 const LOCAL_PRESENTATION_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 const LOCAL_PRESENTATION_PEERS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
@@ -291,76 +269,6 @@ export function buildTelegramSourceEventId(input: TelegramSourceEventInput = {})
       ['viventium.telegram-source-event.v1', sourceOrderScope, String(sourceSequence)].join('\0'),
     )
     .digest('hex');
-}
-
-export function normalizeInteractionReplyContext(
-  candidateValue: unknown,
-): InteractionReplyContext | null {
-  const candidate = recordFrom(candidateValue);
-  const repliedTelegramMessageId = boundedIdentifier(candidate.repliedTelegramMessageId, 256);
-  if (!repliedTelegramMessageId) return null;
-  const provenanceStatus = enumValue(
-    candidate.provenanceStatus,
-    REPLY_PROVENANCE_STATUSES,
-    'unverified',
-  );
-  const senderRole = enumValue(candidate.senderRole, REPLY_SENDER_ROLES, 'unknown');
-  const sourceKind = enumValue(candidate.sourceKind, REPLY_SOURCE_KINDS, 'assistant_message');
-  const attachments: InteractionReplyAttachment[] = [];
-  for (const attachmentValue of Array.isArray(candidate.attachments)
-    ? candidate.attachments.slice(0, 16)
-    : []) {
-    const attachment = recordFrom(attachmentValue);
-    if (!Object.keys(attachment).length) continue;
-    attachments.push(
-      Object.freeze({
-        ...(boundedIdentifier(attachment.fileId || attachment.file_id, 256)
-          ? { fileId: boundedIdentifier(attachment.fileId || attachment.file_id, 256) }
-          : {}),
-        ...(boundedIdentifier(attachment.filename, 256)
-          ? { filename: boundedIdentifier(attachment.filename, 256) }
-          : {}),
-        ...(boundedIdentifier(attachment.kind || attachment.type, 256)
-          ? { kind: boundedIdentifier(attachment.kind || attachment.type, 256) }
-          : {}),
-        ...(attachment.extractedText || attachment.extracted_text
-          ? {
-              extractedText: clipUtf8(
-                String(attachment.extractedText || attachment.extracted_text),
-                32 * 1024,
-              ).text,
-            }
-          : {}),
-      }),
-    );
-  }
-  const normalized: InteractionReplyContext = {
-    version: 1,
-    provenanceStatus,
-    senderRole:
-      provenanceStatus === 'verified' ||
-      (provenanceStatus === 'platform_verified' && senderRole === 'owner_self') ||
-      senderRole === 'third_party'
-        ? senderRole
-        : 'unknown',
-    repliedTelegramMessageId,
-    quoteText: clipUtf8(String(candidate.quoteText || ''), 8 * 1024).text,
-    ...(boundedIdentifier(candidate.logicalMessageId, 256)
-      ? { logicalMessageId: boundedIdentifier(candidate.logicalMessageId, 256) }
-      : {}),
-    ...(boundedIdentifier(candidate.conversationId, 256)
-      ? { conversationId: boundedIdentifier(candidate.conversationId, 256) }
-      : {}),
-    ...(candidate.sourceKind ? { sourceKind } : {}),
-    ...(boundedIdentifier(candidate.scheduleId, 256)
-      ? { scheduleId: boundedIdentifier(candidate.scheduleId, 256) }
-      : {}),
-    ...(boundedIdentifier(candidate.scheduleRunId, 256)
-      ? { scheduleRunId: boundedIdentifier(candidate.scheduleRunId, 256) }
-      : {}),
-    ...(attachments.length ? { attachments: Object.freeze(attachments) } : {}),
-  };
-  return Object.freeze(normalized);
 }
 
 export function normalizeInteractionContext(
@@ -644,6 +552,8 @@ export function bindInteractionSourceSegments(
     ...(sourceMessage ? { source_message_id: sourceMessage.messageId, source_parent_message_id: sourceMessage.parentMessageId, ...(sourceMessage.persisted ? { source_persisted: true } : {}) } : {}),
     text: value,
     ...(sourceIndex === 0 && sourceFiles.length ? { source_files: sourceFiles } : {}),
+    // The quote belongs to this source input, so a later combined turn keeps it with the input.
+    ...(sourceIndex === 0 && current.reply_context ? { reply_context: current.reply_context } : {}),
   }));
   const normalized = normalizeInteractionContext({
     ...current,

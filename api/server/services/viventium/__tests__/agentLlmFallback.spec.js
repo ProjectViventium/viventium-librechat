@@ -341,6 +341,13 @@ describe('agentLlmFallback', () => {
     },
   );
 
+  test('never routes a reconnect sentence without its typed auth identity', () => {
+    const untyped = new Error(
+      'Anthropic connected account needs reconnect in Settings > Account > Connected Accounts.',
+    );
+    expect(isRecoverableProviderFallbackError(untyped)).toBe(false);
+  });
+
   test('does not hide a non-provider primary initialization failure behind model fallback', async () => {
     const primaryError = new Error('tool registry invariant failed');
     primaryError.code = 'TOOL_REGISTRY_FAILURE';

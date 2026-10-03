@@ -21,6 +21,21 @@ const record = (value: unknown): Document =>
 const atPath = (value: Document, key: string): unknown =>
   key.split('.').reduce<unknown>((current, part) => record(current)[part], value);
 
+/** Saved failed or unverified call turns are context, never accepted Main authority. */
+export function isContextOnlyMainHistory(value: unknown): boolean {
+  const message = record(value);
+  if (message.error === true) return true;
+  const voice = record(record(message.metadata).viventium);
+  return (
+    typeof voice.callSessionId === 'string' &&
+    Boolean(voice.callSessionId.trim()) &&
+    voice.inputMode === 'voice_call' &&
+    ['unknown', 'authenticated_participant', 'shared_mic_unverified'].includes(
+      String(voice.actorTrust),
+    )
+  );
+}
+
 function stampFrom(value: unknown): MainContextStamp | undefined {
   const stamp = record(value);
   return typeof stamp.agentId === 'string' &&

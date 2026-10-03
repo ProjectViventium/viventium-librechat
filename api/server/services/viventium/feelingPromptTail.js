@@ -12,9 +12,15 @@ function getViventiumUserFactGuard() {
   return getRequiredPromptText('main.user_fact_guard');
 }
 
-function buildViventiumDynamicTail({ capsule } = {}) {
+/* === VIVENTIUM START ===
+ * Fix: A per-turn-header Main keeps its request-pinned saved-memory snapshot out of stable
+ * authority, so it rides in this per-turn developer tail: facts first, then the fact guard, with
+ * the exact Feeling capsule last.
+ * === VIVENTIUM END === */
+function buildViventiumDynamicTail({ memory, capsule } = {}) {
+  const exactMemory = typeof memory === 'string' ? memory.trim() : '';
   const exactCapsule = typeof capsule === 'string' ? capsule.trim() : '';
-  return [getViventiumUserFactGuard(), exactCapsule].filter(Boolean).join('\n\n');
+  return [exactMemory, getViventiumUserFactGuard(), exactCapsule].filter(Boolean).join('\n\n');
 }
 
 function pinFeelingCapsuleLast({ instructions, capsule }) {
@@ -30,16 +36,20 @@ function pinFeelingCapsuleLast({ instructions, capsule }) {
   return [withoutCapsule, exactCapsule].filter(Boolean).join('\n\n');
 }
 
-function pinViventiumDynamicTailLast({ instructions, capsule } = {}) {
+function pinViventiumDynamicTailLast({ instructions, memory, capsule } = {}) {
   const current = typeof instructions === 'string' ? instructions : '';
+  const exactMemory = typeof memory === 'string' ? memory.trim() : '';
   const exactCapsule = typeof capsule === 'string' ? capsule.trim() : '';
   const factGuard = getViventiumUserFactGuard();
   let withoutTail = current.split(factGuard).join('');
+  if (exactMemory) {
+    withoutTail = withoutTail.split(exactMemory).join('');
+  }
   if (exactCapsule) {
     withoutTail = withoutTail.split(exactCapsule).join('');
   }
   withoutTail = withoutTail.replace(/\n{3,}/g, '\n\n').trim();
-  return [withoutTail, [factGuard, exactCapsule].filter(Boolean).join('\n\n')]
+  return [withoutTail, [exactMemory, factGuard, exactCapsule].filter(Boolean).join('\n\n')]
     .filter(Boolean)
     .join('\n\n');
 }

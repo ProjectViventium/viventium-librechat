@@ -120,4 +120,31 @@ describe('actual agent route with native active stream owner', () => {
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ activeJobIds: [], activeStreams: [] });
   });
+  /* === VIVENTIUM START: Preserve the shared public stream failure contract. === */
+
+  it.each(['source_context_unavailable', undefined])(
+    'Web SSE preserves optional typed generation failure %s',
+    async (errorClass) => {
+      await mockManager.createJob('typed-failure', 'owner-a', 'conversation-a');
+      const error = 'The conversation context could not be preserved. Please retry this turn.';
+      jest
+        .spyOn(mockManager, 'subscribe')
+        .mockImplementation(async (_id, _event, _done, onError) => {
+          onError(error, errorClass);
+          return { unsubscribe: jest.fn() };
+        });
+      const response = await request(app).get('/chat/stream/typed-failure');
+      expect(response.status).toBe(200);
+      const frames = response.text
+        .split('\n\n')
+        .filter((value) => value.startsWith('event: error\ndata: '));
+      expect(frames).toHaveLength(1);
+      expect(JSON.parse(frames[0].slice('event: error\ndata: '.length))).toEqual({
+        error,
+        ...(errorClass ? { error_class: errorClass } : {}),
+      });
+    },
+  );
+  /* === VIVENTIUM END === */
+
 });

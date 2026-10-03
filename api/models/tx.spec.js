@@ -13,6 +13,10 @@ const {
 } = require('./tx');
 
 describe('getValueKey', () => {
+  it.each(['gpt-6.1-sol', 'claude-opus-5-5', 'grok-4.7'])('keeps the exact current model rate for %s', (model) => {
+    expect(getValueKey(model)).toBe(model);
+  });
+
   it('should return "16k" for model name containing "gpt-3.5-turbo-16k"', () => {
     expect(getValueKey('gpt-3.5-turbo-16k-some-other-info')).toBe('16k');
   });

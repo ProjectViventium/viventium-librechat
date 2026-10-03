@@ -1262,6 +1262,47 @@ describe('GlassHiveCallbackBindingService', () => {
     expect(JSON.stringify(resolved)).not.toContain('attacker-user');
   });
 
+  test('requires independent exact Native run and attempt proof for a file-bearing callback', async () => {
+    mockBindingFindOne.mockResolvedValue({
+      _id: 'ghi-origin-1',
+      originRef: 'ghi-origin-1',
+      ownerId: 'user-1',
+      conversationId: 'conversation-1',
+      anchorMessageId: 'assistant-anchor',
+      configuredDestinations: [{ surface: 'librechat' }],
+    });
+    const callback = {
+      origin_ref: 'ghi-origin-1',
+      work_ref: 'gh-work-1',
+      worker_id: 'worker-1',
+      run_id: 'run-1',
+      attempt_id: 'attempt-1',
+      callback_id: 'callback-1',
+      output_files: {},
+    };
+    mockRequestAccountApi.mockResolvedValue({
+      valid: true,
+      originRef: 'ghi-origin-1',
+      workRef: 'gh-work-1',
+      runId: 'run-1',
+      attemptId: 'attempt-1',
+    });
+    await expect(
+      resolveGlassHiveCallbackContext(callback, { deferConfirmation: true }),
+    ).resolves.toMatchObject({ runId: 'run-1', attemptId: 'attempt-1' });
+    mockRequestAccountApi.mockResolvedValueOnce({
+      valid: true,
+      originRef: 'ghi-origin-1',
+      workRef: 'gh-work-1',
+      runId: 'run-1',
+      attemptId: 'another-attempt',
+    });
+    await expect(
+      resolveGlassHiveCallbackContext(callback, { deferConfirmation: true }),
+    ).resolves.toBeNull();
+    expect(mockBindingUpdateOne).not.toHaveBeenCalled();
+  });
+
   test('can defer all callback-confirmation writes until the route result CAS succeeds', async () => {
     mockBindingFindOne.mockResolvedValue({
       _id: 'ghi-origin-1',

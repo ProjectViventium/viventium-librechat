@@ -7,7 +7,11 @@
  * === VIVENTIUM END === */
 
 const express = require('express');
-const { GenerationJobManager, telegramInputDeliveryCoverage } = require('@librechat/api');
+const {
+  GenerationJobManager,
+  scheduleExternallyAcceptedMainCompaction,
+  telegramInputDeliveryCoverage,
+} = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { Message, Conversation } = require('~/db/models');
 const {
@@ -125,11 +129,15 @@ async function persistTelegramTransportReceipt(result, adapterSurface) {
   if (parsed.length === 0) return;
   const chatId = parsed[0][1];
   const sameChatIds = parsed.filter((match) => match[1] === chatId).map((match) => match[2]);
+  // A Cortex presentation maps its own Telegram messages to the message it presented.
+  const presentedMessageId =
+    String(presentation.cortexPresentation?.messageId || '').trim() ||
+    presentation.responseMessageId;
   await recordTelegramTransportReceipt({
     sourceKind: result.acknowledgement.source_kind || 'assistant_message',
     userId: presentation.userId,
     conversationId: presentation.conversationId,
-    logicalMessageId: presentation.responseMessageId,
+    logicalMessageId: presentedMessageId,
     telegramChatId: chatId,
     telegramSentMessageIds: sameChatIds,
     scheduleId: result.acknowledgement.schedule_id || '',
@@ -305,7 +313,11 @@ router.post('/delivery-ack', async (req, res) => {
      * Feature: Restart-safe durable-effect delivery acknowledgement.
      * Purpose: Commit exact Mongo authority before projecting Redis or terminal Message state.
      */
-    if (parsed.acknowledgement.state === 'committed' && parsed.acknowledgement.effect_ref) {
+    if (
+      parsed.acknowledgement.state === 'committed' &&
+      parsed.acknowledgement.effect_ref &&
+      !parsed.cortexPresentation
+    ) {
       result = await acknowledgeMongoDurableEffectDelivery(parsed.acknowledgement, adapterSurface);
       if (result.status === 'recorded') {
         try {
@@ -333,7 +345,11 @@ router.post('/delivery-ack', async (req, res) => {
                   parsed.cortexPresentation,
                 )
               : GenerationJobManager.acknowledgeDelivery(parsed.acknowledgement, adapterSurface));
-      if (result.status === 'stale_revision' && parsed.acknowledgement.state === 'committed') {
+      if (
+        result.status === 'stale_revision' &&
+        parsed.acknowledgement.state === 'committed' &&
+        !parsed.cortexPresentation
+      ) {
         result = await GenerationJobManager.acknowledgeDurableEffectDelivery(
           parsed.acknowledgement,
           adapterSurface,
@@ -342,20 +358,28 @@ router.post('/delivery-ack', async (req, res) => {
     }
     /* === VIVENTIUM END === */
     if (result.status === 'recorded') {
-      await persistPresentationOutcome(result);
+      const committed = ['committed', 'committed_effect'].includes(result.acknowledgement?.state);
+      // A Cortex receipt settles only the message it presented. A separate addition, or any
+      // Cortex removal or failure, never writes, deletes or accepts the turn's Main message;
+      // only a committed presentation of the parent itself (a promoted empty answer) does.
+      const cortexReceipt = parsed.cortexPresentation;
+      const presentsMainMessage =
+        !cortexReceipt || (committed && cortexReceipt.messageId === cortexReceipt.parentMessageId);
+      if (presentsMainMessage) {
+        await persistPresentationOutcome(result);
+      }
       await persistTelegramTransportReceipt(result, adapterSurface);
       await persistCortexTelegramPresentationReceipt(result, adapterSurface);
-      if (
-        result.transportOnly !== true &&
-        ['committed', 'committed_effect'].includes(result.acknowledgement?.state)
-      ) {
+      if (presentsMainMessage && result.transportOnly !== true && committed) {
         const presentationCommittedAt = result.acknowledgement.presentation_committed_at;
-        await commitAcceptedMainTurnFromPresentation({
+        const accepted = await commitAcceptedMainTurnFromPresentation({
           ...result.presentation,
           ...(Number.isSafeInteger(presentationCommittedAt) && presentationCommittedAt > 0
             ? { presentationCommittedAt }
             : {}),
         });
+        // Acceptance by the external adapter schedules the turn's semantic compaction.
+        scheduleExternallyAcceptedMainCompaction(result.presentation, accepted);
       }
       return res.json({ acknowledged: true, idempotent: result.idempotent === true });
     }

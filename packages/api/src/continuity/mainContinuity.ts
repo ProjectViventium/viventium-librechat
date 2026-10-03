@@ -1,4 +1,5 @@
 import { retainVerifiedNativeSources } from '../glasshive/nativeSupersession';
+import { isContextOnlyMainHistory } from './mainContext';
 /* === VIVENTIUM START ===
  * Feature: Provider-neutral accepted Main continuity.
  * Purpose: Keep bounded, owner-scoped accepted state authoritative across primary, fallback,
@@ -255,6 +256,27 @@ const MAX_TURNS = 3;
 const MAX_TEXT_BYTES = 5 * 1024;
 const MAX_CAPSULE_BYTES = 12 * 1024;
 const COMPACTION_SOURCE_BATCH_BYTES = 80 * 1024;
+/** Default whole-turn source target of one compaction claim. */
+export const MAIN_COMPACTION_SOURCE_TARGET_BYTES = COMPACTION_SOURCE_BATCH_BYTES;
+
+/**
+ * A claim may take less source than the default target; it always takes at least one whole turn,
+ * and never more than the default target. Unreviewed source is only deferred, never dropped.
+ */
+/** Durable reasons for a claim whose model-owned proposal was not accepted. */
+const UNACCEPTED_PROPOSAL_REASONS = ['schema_invalid', 'semantic_fidelity', 'quality_gate'];
+
+function unacceptedProposalReason(reason: unknown): boolean {
+  const code = String(reason || '').split(':', 1)[0].trim();
+  return UNACCEPTED_PROPOSAL_REASONS.includes(code);
+}
+
+export function boundedMainCompactionSourceTarget(value: unknown): number {
+  const requested = Math.floor(Number(value));
+  return Number.isFinite(requested) && requested > 0
+    ? Math.min(COMPACTION_SOURCE_BATCH_BYTES, requested)
+    : COMPACTION_SOURCE_BATCH_BYTES;
+}
 const MAX_PENDING_CAPSULE_TURNS = 4;
 const MAX_SUMMARY_BYTES = 6 * 1024;
 const MAX_SUMMARY_ITEMS = 32;
@@ -491,6 +513,8 @@ interface ContinuityCarrierMessage {
   messageId?: string;
   role?: string;
   content: unknown;
+  error?: boolean;
+  metadata?: TMessage['metadata'];
   _getType?: () => string;
 }
 
@@ -506,11 +530,12 @@ function carrierText(content: unknown): string {
   if (!Array.isArray(content)) return String(content || '');
   return content
     .map((part: unknown) => {
+      if (typeof part === 'string') return part;
       if (!isRecord(part)) return '';
       if (['text', 'input_text', 'output_text'].includes(String(part.type)))
-        return String(part.text || part.input_text || '');
-      if (['image_url', 'input_image', 'file', 'input_file'].includes(String(part.type)))
-        return `[Attached ${String(part.name || part.filename || part.type)}]`;
+        return String(part.text ?? part.input_text ?? part.output_text ?? '');
+      // Core's original source manifest hashes authored prose. Media remains in the payload;
+      // identity-mode checks separately hash complete content, rather than an invented label.
       return '';
     })
     .filter(Boolean)
@@ -530,6 +555,7 @@ function visibleMessageChain(
     const role = carrierRole(message);
     const id = message.messageId || message.id;
     if (!id || !['user', 'assistant', 'tool', 'function'].includes(role)) return [];
+    const contextOnly = isContextOnlyMainHistory(message);
     return [
       {
         id,
@@ -537,8 +563,8 @@ function visibleMessageChain(
         sha256: createHash('sha256').update(carrierText(message.content), 'utf8').digest('hex'),
         content_sha256: contentDigest(message.content),
         ...(role === 'assistant' && deliveryById.has(id) ? { delivery: deliveryById.get(id) } : {}),
-        accepted_source: protectedIds.has(id) || currentInputIds.has(id),
-        ...(currentInputIds.has(id) ? { current_input: true } : {}),
+        accepted_source: !contextOnly && (protectedIds.has(id) || currentInputIds.has(id)),
+        ...(currentInputIds.has(id) && !contextOnly ? { current_input: true } : {}),
         ...(currentInputIds.has(id) && sourceOrdinalsById.has(id)
           ? { source_ordinals: [...sourceOrdinalsById.get(id)!] } : {}),
       },
@@ -992,6 +1018,54 @@ export interface MainCompactionStructuralIssue {
   readonly actual?: number;
   readonly limit?: number;
   readonly unit?: 'items' | 'utf8_bytes' | 'characters';
+  /** Size rejections while the whole proposal is over budget: its bytes, excess and field bytes. */
+  readonly proposalBytes?: number;
+  readonly excessBytes?: number;
+  readonly fieldBytes?: Readonly<Record<string, number>>;
+}
+
+const MAIN_COMPACTION_FIELDS = [
+  'version',
+  'summary',
+  'pendingAsks',
+  'commitments',
+  'corrections',
+  'decisions',
+  'recurrenceOutcomes',
+  'toolPairs',
+  'durableIdentifiers',
+] as const;
+
+/** UTF-8 JSON bytes of a proposal's contract fields, as the whole-proposal budget measures them. */
+export function mainCompactionProposalBytes(value: unknown): number {
+  if (!isRecord(value)) return 0;
+  const fields = Object.fromEntries(
+    MAIN_COMPACTION_FIELDS.filter((field) => value[field] !== undefined).map((field) => [
+      field,
+      value[field],
+    ]),
+  );
+  return Buffer.byteLength(JSON.stringify(fields), 'utf8');
+}
+
+function withWholeProposalSize(
+  issue: MainCompactionStructuralIssue,
+  value: unknown,
+): MainCompactionStructuralIssue {
+  if (issue.constraint !== 'max_bytes' || issue.path === '' || !isRecord(value)) return issue;
+  const proposalBytes = mainCompactionProposalBytes(value);
+  if (proposalBytes <= MAX_SUMMARY_BYTES) return issue;
+  return {
+    ...issue,
+    proposalBytes,
+    excessBytes: proposalBytes - MAX_SUMMARY_BYTES,
+    fieldBytes: Object.fromEntries(
+      MAIN_COMPACTION_FIELDS.filter((field) => value[field] !== undefined).map((field) => [
+        field,
+        Buffer.byteLength(JSON.stringify(value[field]), 'utf8'),
+      ]),
+    ),
+  };
 }
 
 /** One structural validator supplies both acceptance and bounded repair feedback. */
@@ -1000,7 +1074,11 @@ export function inspectMainCompactionCandidate(
 ):
   | { ok: true; candidate: MainSemanticCompaction }
   | { ok: false; issue: MainCompactionStructuralIssue } {
-  const invalid = (issue: MainCompactionStructuralIssue) => ({ ok: false as const, issue });
+  // A field size rejection also shows whole-proposal size when the proposal exceeds its budget.
+  const invalid = (issue: MainCompactionStructuralIssue) => ({
+    ok: false as const,
+    issue: withWholeProposalSize(issue, value),
+  });
   const normalized = normalizeStoredSemanticCompaction(value);
   if (!normalized || !isRecord(value)) return invalid({ path: '', constraint: 'shape' });
   const stringIssue = (
@@ -1088,6 +1166,14 @@ export function inspectMainCompactionCandidate(
         actual,
         limit: MAX_SUMMARY_BYTES,
         unit: 'utf8_bytes',
+        proposalBytes: actual,
+        excessBytes: actual - MAX_SUMMARY_BYTES,
+        fieldBytes: Object.fromEntries(
+          Object.entries(candidate).map(([field, item]) => [
+            field,
+            Buffer.byteLength(JSON.stringify(item), 'utf8'),
+          ]),
+        ),
       })
     : { ok: true, candidate };
 }
@@ -1356,6 +1442,7 @@ export function createMainContinuityService(
     identity: MainContinuityIdentity,
     cache: MainContinuityState,
     exactRange?: IMainContinuityLegacySourceRange,
+    sourceTarget: number = COMPACTION_SOURCE_BATCH_BYTES,
   ) {
     const unchanged = {
       inputs: [] as UnknownRecord[],
@@ -1408,7 +1495,7 @@ export function createMainContinuityService(
       const hydrated = await hydrateTurns(identity, [reference]);
       if (!hydrated) break;
       const size = Buffer.byteLength(JSON.stringify(hydrated[0]), 'utf8');
-      if (!exactRange && sourceTurns.length && bytes + size > COMPACTION_SOURCE_BATCH_BYTES) break;
+      if (!exactRange && sourceTurns.length && bytes + size > sourceTarget) break;
       sourceTurns.push(hydrated[0]);
       bytes += size;
       consumed++;
@@ -1465,6 +1552,15 @@ export function createMainContinuityService(
       const cache = validCache(identity, stored, head);
       if (cache.compactionLease && new Date(cache.compactionLease.expiresAt).getTime() > Date.now())
         return { status: 'busy' };
+      // An explicit target comes from what this process learned; otherwise a durably degraded
+      // epoch whose last proposal was not accepted starts with half the default source.
+      const sourceTarget =
+        input.sourceTargetBytes != null
+          ? boundedMainCompactionSourceTarget(input.sourceTargetBytes)
+          : cache.compactionStatus === 'degraded' &&
+              unacceptedProposalReason(cache.lastCompactionError)
+            ? boundedMainCompactionSourceTarget(COMPACTION_SOURCE_BATCH_BYTES / 2)
+            : COMPACTION_SOURCE_BATCH_BYTES;
       const through = references[0]?.acceptedPosition
         ? references[0].acceptedPosition - 1
         : head.position;
@@ -1473,7 +1569,7 @@ export function createMainContinuityService(
         through,
         limit: 64,
       });
-      const legacy = await legacySource(identity, cache);
+      const legacy = await legacySource(identity, cache, undefined, sourceTarget);
       if (legacy.unavailable) {
         if (
           !(await store.compareAndSwap(identity.domainEpochKey, stored.version, {
@@ -1558,11 +1654,7 @@ export function createMainContinuityService(
       );
       for (const turn of pendingTurns) {
         const size = Buffer.byteLength(JSON.stringify(turn), 'utf8');
-        if (
-          (sourceTurns.length || legacy.inputs.length) &&
-          bytes + size > COMPACTION_SOURCE_BATCH_BYTES
-        )
-          break;
+        if ((sourceTurns.length || legacy.inputs.length) && bytes + size > sourceTarget) break;
         sourceTurns.push(turn);
         bytes += size;
       }
@@ -1572,7 +1664,8 @@ export function createMainContinuityService(
         ...(legacy.inputs.length ? { legacyInputs: legacy.inputs } : {}),
       };
       const sourceDigest = digestSource(identity, source, head.generation),
-        leaseId = `mcc_${randomUUID().replaceAll('-', '')}`;
+        leaseId = `mcc_${randomUUID().replaceAll('-', '')}`,
+        leaseExpiresAt = new Date(Date.now() + COMPACTION_LEASE_MS);
       const next: MainContinuityState = {
         ...cache,
         compactionStatus: 'running',
@@ -1589,11 +1682,20 @@ export function createMainContinuityService(
           legacySourceOffset: legacy.sourceOffset,
           legacySourceRange: legacy.sourceRange,
           claimedAt: new Date(),
-          expiresAt: new Date(Date.now() + COMPACTION_LEASE_MS),
+          expiresAt: leaseExpiresAt,
         },
       };
+      // The claim carries the store-owned lease expiry so bounded work never outlives its lease.
       if (await store.compareAndSwap(identity.domainEpochKey, stored.version, next))
-        return { status: 'claimed', ...identity, leaseId, sourceDigest, ...source };
+        return {
+          status: 'claimed',
+          ...identity,
+          leaseId,
+          sourceDigest,
+          leaseExpiresAt,
+          sourceBytes: bytes,
+          ...source,
+        };
     }
     return legacyAdvanced ? { status: 'deferred', reason: 'legacy_progress' } : { status: 'busy' };
   }

@@ -13,6 +13,7 @@ const {
   normalizeUserMessageContent,
   normalizeTextContentParts,
   normalizeTextPartsInPayload,
+  normalizeMediaTextForFormatter,
   normalizeProviderKey,
   providerNeedsStrictTextSanitizer,
   sanitizeAnthropicFormattedMessages,
@@ -24,6 +25,83 @@ const { filterMalformedContentParts, buildMainContinuityHeaders } = require('@li
 const { ContentTypes } = require('librechat-data-provider');
 
 describe('normalizeTextContentParts', () => {
+  describe('authored text with hydrated native media', () => {
+    const { messageContentText, captureMainContextSnapshot, traceMainHistoryAncestry } =
+      require('../ViventiumMainContextService');
+    const media = {
+      image_urls: { type: 'image_url', image_url: { url: 'data:image/png;base64,eHl6' } },
+      documents: { type: 'file', file: { filename: 'note.pdf', file_data: 'data:application/pdf;base64,eHl6' } },
+      audios: { type: 'input_audio', input_audio: { data: 'eHl6', format: 'wav' } },
+      videos: { type: 'video', video: { url: 'data:video/mp4;base64,eHl6' } },
+    };
+    test.each(Object.keys(media))('preserves the exact caption and %s bytes', (key) => {
+      const payload = media[key];
+      const source = { user: 'owner', conversationId: 'conversation', messageId: 'input',
+        parentMessageId: '', isCreatedByUser: true, role: 'user', text: 'Read the source, please.',
+        content: [{ type: 'text', text: { value: 'Read the source, please.' } }], [key]: [payload] };
+      const normalized = normalizeMediaTextForFormatter(source);
+      expect(normalized.content).toBe(source.text);
+      expect(normalized[key][0]).toBe(payload);
+      const formatted = formatMessage({ message: normalized });
+      expect(messageContentText(formatted)).toBe(source.text);
+      expect(formatted.content).toContainEqual(payload);
+      expect(source.content[0].text).toEqual({ value: source.text });
+      const proof = traceMainHistoryAncestry({ messages: [source], headId: 'input',
+        ownerId: 'owner', conversationId: 'conversation' });
+      const current = { ...source, messageId: 'current', parentMessageId: 'input', text: 'Subtract the numbers.', content: 'Subtract the numbers.' };
+      const currentFormatted = { role: 'user', content: current.text };
+      const capture = (messages) => captureMainContextSnapshot(
+        { user: { id: 'owner' }, body: { conversationId: 'conversation' } },
+        { agent: { id: 'main' }, visibleMessages: [source, current], messages: [...messages, currentFormatted], historyAncestry: proof,
+          protectUnreconciledHistory: true });
+      expect(() => capture([formatted])).not.toThrow();
+      expect(() => capture([{ ...formatted, content: [{ type: 'text', text: 'Changed caption' }, payload] }]))
+        .toThrow(expect.objectContaining({ code: 'source_context_unavailable' }));
+    });
+    test('uses the native sender role for persisted user media without an explicit role', () => {
+      const message = { sender: 'User', isCreatedByUser: true, text: 'Retained caption.',
+        content: [], image_urls: [media.image_urls] };
+      const normalized = normalizeMediaTextForFormatter(normalizeUserMessageContent(message));
+      expect(normalized.content).toBe(message.text);
+      expect(messageContentText(formatMessage({ message: normalized }))).toBe(message.text);
+    });
+    test.each(Object.keys(media))('retained inline %s keeps caption and exact media once after hydration', (key) => {
+      const payload = media[key];
+      const source = { sender: 'User', isCreatedByUser: true, text: 'Retained caption.',
+        content: [JSON.parse(JSON.stringify(payload))], [key]: [payload] };
+      const normalized = normalizeMediaTextForFormatter(normalizeUserMessageContent(source));
+      const formatted = formatMessage({ message: normalized });
+      expect(messageContentText(formatted)).toBe(source.text);
+      expect(formatted.content.filter((part) => part.type === payload.type)).toEqual([payload]);
+      expect(normalized[key]).toBe(source[key]);
+      expect(source.content).toEqual([payload]);
+    });
+    test('distinct inline native media is carried without replacing the hydrated bytes', () => {
+      const inline = { type: 'image_url', image_url: { url: 'data:image/png;base64,YWJj' } };
+      const source = { role: 'user', text: 'Compare both images.', isCreatedByUser: true,
+        content: [inline], image_urls: [media.image_urls] };
+      const formatted = formatMessage({ message: normalizeMediaTextForFormatter(normalizeUserMessageContent(source)) });
+      expect(messageContentText(formatted)).toBe(source.text);
+      expect(formatted.content).toContainEqual(inline);
+      expect(formatted.content).toContainEqual(media.image_urls);
+      expect(source.image_urls).toEqual([media.image_urls]);
+    });
+    test('unknown non-text arrays and assistant media are not flattened', () => {
+      const unknown = { role: 'user', content: [{ type: 'unknown', value: 'must stay' }], documents: [media.documents] };
+      expect(normalizeMediaTextForFormatter(unknown)).toBe(unknown);
+      const inheritedKey = { ...unknown, content: [{ type: 'constructor', value: 'must stay' }] };
+      expect(normalizeMediaTextForFormatter(inheritedKey)).toBe(inheritedKey);
+      const assistant = { role: 'assistant', content: [{ type: 'text', text: 'Caption' }], image_urls: [media.image_urls] };
+      expect(normalizeMediaTextForFormatter(assistant)).toBe(assistant);
+      expect(messageContentText({ content: [{ type: 'unknown' }] })).toBe('unknown');
+    });
+    test('media-only input keeps bytes without inventing prose', () => {
+      const source = { role: 'user', content: [], documents: [media.documents] };
+      const formatted = formatMessage({ message: normalizeMediaTextForFormatter(source) });
+      expect(messageContentText(formatted)).toBe('');
+      expect(formatted.content).toContainEqual(media.documents);
+    });
+  });
   test('coerceTextToString unwraps { value }', () => {
     expect(coerceTextToString({ value: 'hi' })).toBe('hi');
   });

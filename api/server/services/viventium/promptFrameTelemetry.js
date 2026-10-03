@@ -86,6 +86,7 @@ const PROMPT_FRAME_LAYER_ALIASES = Object.freeze({
   no_response_instructions: 'global_no_response',
   memory: 'memory_context',
   memory_context: 'memory_context',
+  saved_memory_writer: 'memory_context',
   feelings: 'viventium_feeling_state',
   feeling_state: 'viventium_feeling_state',
   viventium_feeling_state: 'viventium_feeling_state',

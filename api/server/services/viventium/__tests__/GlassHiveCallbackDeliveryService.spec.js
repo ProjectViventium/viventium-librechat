@@ -21,7 +21,9 @@ let mockRenewEffectLease;
 let mockRecordGlassHiveSurfaceDeliveryOutcome;
 let mockResolveTelegramMappingByUserId;
 let mockRecordTraceDelivery;
+let mockRecordVoiceOrchestrationTraceBestEffort;
 let mockRecordVoiceOrchestrationTrace;
+let mockTerminalTransactionService;
 
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
@@ -55,7 +57,14 @@ jest.mock('~/db/models', () => ({
 }));
 
 jest.mock('../GlassHiveTerminalCallbackTransaction', () => ({
-  runGlassHiveTerminalCallbackTransaction: (operation) => operation({ inTransaction: () => true }),
+  currentGlassHiveTerminalCallbackTransaction: () =>
+    mockTerminalTransactionService?.currentGlassHiveTerminalCallbackTransaction() ?? null,
+  runGlassHiveTerminalCallbackTransaction: (operation) =>
+    mockTerminalTransactionService
+      ? mockTerminalTransactionService.runGlassHiveTerminalCallbackTransaction(operation)
+      : operation({ inTransaction: () => true }),
+  deferGlassHiveTerminalCallbackAfterCommit: (operation) =>
+    mockTerminalTransactionService?.deferGlassHiveTerminalCallbackAfterCommit(operation) ?? false,
 }));
 
 jest.mock('../GlassHiveCallbackBindingService', () => ({
@@ -69,6 +78,8 @@ jest.mock('../OrchestrationTraceLedgerService', () => ({
 
 jest.mock('../VoiceOrchestrationTraceService', () => ({
   recordVoiceOrchestrationTrace: (...args) => mockRecordVoiceOrchestrationTrace(...args),
+  recordVoiceOrchestrationTraceBestEffort: (...args) =>
+    mockRecordVoiceOrchestrationTraceBestEffort(...args),
 }));
 
 jest.mock('~/server/services/TelegramLinkService', () => ({
@@ -186,6 +197,95 @@ function workerCompletionFixture() {
   return { bindings, dispatchPermit, leases, presentation, row };
 }
 
+function completionDiagnosticFixture(mode) {
+  const { AsyncLocalStorage } = require('async_hooks');
+  const {
+    createGlassHiveTerminalCallbackTransactionService,
+    createVoiceOrchestrationTraceService,
+  } = require('@librechat/api');
+  const storage = new AsyncLocalStorage();
+  const createSession = () => {
+    let active = false;
+    return {
+      startTransaction: jest.fn(() => {
+        active = true;
+      }),
+      inTransaction: () => active,
+      commitTransaction: jest.fn(async () => {
+        active = false;
+      }),
+      abortTransaction: jest.fn(async () => {
+        active = false;
+      }),
+      endSession: jest.fn(async () => {}),
+    };
+  };
+  const session = createSession();
+  let starts = 0;
+  mockTerminalTransactionService = createGlassHiveTerminalCallbackTransactionService({
+    transactionAsyncLocalStorage: storage,
+    set: jest.fn(),
+    startSession: async () => (starts++ === 0 ? session : createSession()),
+  });
+  const durable = jest.fn(async (input) => {
+    expect(storage.getStore()).toBeUndefined();
+    expect(session.inTransaction()).toBe(false);
+    if (mode === 'store_failure') {
+      throw Object.assign(new Error('trace store unavailable'), {
+        code: 'trace_store_unavailable',
+      });
+    }
+    return input;
+  });
+  const local = jest.fn();
+  const service = createVoiceOrchestrationTraceService({
+    logger: { warn: jest.fn() },
+    recordOrchestrationTraceEvent: durable,
+    orchestrationRuntimeTraceBinding: () =>
+      mode === 'missing_identity'
+        ? null
+        : {
+            contractVersion: 1,
+            candidateDigest: `sha256:${'1'.repeat(64)}`,
+            installedArtifactDigest: `sha256:${'2'.repeat(64)}`,
+            runtimeOwnerBindingHash: `sha256:${'3'.repeat(64)}`,
+          },
+    logLocalTrace: (event) => {
+      expect(storage.getStore()).toBeUndefined();
+      expect(session.inTransaction()).toBe(false);
+      local(event);
+    },
+  });
+  mockRecordVoiceOrchestrationTrace = jest.fn(service.recordVoiceOrchestrationTrace);
+  mockRecordVoiceOrchestrationTraceBestEffort = jest.fn(
+    service.recordVoiceOrchestrationTraceBestEffort,
+  );
+  return {
+    session,
+    durable,
+    local,
+    run: mockTerminalTransactionService.runGlassHiveTerminalCallbackTransaction,
+    assertTraceCount(count) {
+      expect(session.commitTransaction).toHaveBeenCalled();
+      expect(session.abortTransaction).not.toHaveBeenCalled();
+      expect(mockRecordVoiceOrchestrationTrace).not.toHaveBeenCalled();
+      expect(durable).toHaveBeenCalledTimes(mode === 'missing_identity' ? 0 : count);
+      expect(local).toHaveBeenCalledTimes(mode === 'healthy' ? 0 : count);
+      if (mode !== 'healthy') {
+        expect(local).toHaveBeenCalledWith(
+          expect.objectContaining({
+            durableTrace: 'unavailable',
+            code:
+              mode === 'missing_identity'
+                ? 'voice_trace_runtime_binding_unavailable'
+                : 'trace_store_unavailable',
+          }),
+        );
+      }
+    },
+  };
+}
+
 describe('GlassHiveCallbackDeliveryService', () => {
   beforeEach(() => {
     mockFindOneAndUpdate = jest.fn();
@@ -199,7 +299,9 @@ describe('GlassHiveCallbackDeliveryService', () => {
     mockRecordGlassHiveSurfaceDeliveryOutcome = jest.fn().mockResolvedValue(null);
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue(null);
     mockRecordTraceDelivery = jest.fn().mockResolvedValue(null);
+    mockRecordVoiceOrchestrationTraceBestEffort = jest.fn().mockResolvedValue(null);
     mockRecordVoiceOrchestrationTrace = jest.fn().mockResolvedValue(null);
+    mockTerminalTransactionService = undefined;
     mockMessageFindOne = jest.fn().mockReturnValue(leanResult(null));
     mockAcquireEffectLease = jest.fn();
     mockFenceEffectTransaction = jest.fn().mockResolvedValue(true);
@@ -259,6 +361,48 @@ describe('GlassHiveCallbackDeliveryService', () => {
       deliveries: [],
       deferredToMain: true,
     });
+  });
+
+  test('retains the authored file carrier through the existing Main delivery projection', async () => {
+    mockFindOneAndUpdate.mockImplementation((_query, update) =>
+      leanResult({ ...update.$setOnInsert, ...update.$set }),
+    );
+    const attachments = [
+      {
+        user: 'user_1',
+        file_id: 'file-1',
+        filename: 'result.png',
+        filepath: '/uploads/result.png',
+        bytes: 3,
+        type: 'image/png',
+        source: 'local',
+        object: 'file',
+      },
+      {
+        filename: 'unavailable.csv',
+        messageId: 'main-message',
+        nativeOutputFile: {
+          version: 1,
+          status: 'unavailable',
+          code: 'native_output_file_digest_mismatch',
+        },
+      },
+    ];
+    const result = await enqueueGlassHiveCallbackDelivery({
+      body: { callback_id: 'callback-main', event: 'main.followup' },
+      deliveryContext: {
+        ownerId: 'user_1',
+        conversationId: 'conv_1',
+        anchorMessageId: 'anchor-1',
+        destinations: [
+          { surface: 'telegram', telegramChatId: 'chat-1', telegramUserId: 'telegram-1' },
+        ],
+      },
+      message: { messageId: 'main-message', text: 'Here is the result.', attachments },
+      text: 'Here is the result.',
+    });
+    expect(mockFindOneAndUpdate.mock.calls[0][1].$set.attachments).toEqual(attachments);
+    expect(result.deliveries[0].attachments).toEqual(attachments);
   });
 
   test('immediate neutral attention status never falls back to raw callback full_message text', async () => {
@@ -324,6 +468,95 @@ describe('GlassHiveCallbackDeliveryService', () => {
       expect(mockFindOneAndUpdate).toHaveBeenCalledTimes(1);
     },
   );
+
+  test('native attention preserves only exact identity and the Core-bound Telegram topic', async () => {
+    mockFindOneAndUpdate.mockImplementation((_query, update) =>
+      leanResult({ ...update.$setOnInsert, ...update.$set }),
+    );
+    const nativeCallback = require('./fixtures/nativePermissionCallback.json');
+    const pending = {
+      ...nativeCallback.pending_native_input,
+      message: 'not persisted',
+      arguments: 'not persisted',
+    };
+    const result = await enqueueGlassHiveCallbackDelivery({
+      body: {
+        ...nativeCallback,
+        pending_native_input: pending,
+        telegram_message_thread_id: 'attacker-topic',
+      },
+      deliveryContext: {
+        ownerId: 'owner-1',
+        conversationId: 'conversation-1',
+        workRef: 'work-1',
+        destinations: [
+          {
+            surface: 'telegram',
+            telegramChatId: 'chat-1',
+            telegramUserId: 'telegram-1',
+            telegramMessageThreadId: '9',
+          },
+        ],
+      },
+      message: { messageId: 'callback-1', text: 'Input needed.' },
+      text: 'Input needed.',
+    });
+    expect(result.deliveries[0]).toMatchObject({
+      workRef: 'work-1',
+      runId: nativeCallback.run_id,
+      telegramUserId: 'telegram-1',
+      telegramMessageThreadId: '9',
+      nativeInputBinding: {
+        version: 1,
+        requestId: pending.requestId,
+        requestFingerprint: pending.requestFingerprint,
+        runId: nativeCallback.run_id,
+        attemptId: pending.attemptId,
+        sessionId: pending.sessionId,
+        expiresAt: pending.expiresAt,
+      },
+    });
+    expect(result.deliveries[0].nativeInputBinding).not.toHaveProperty('message');
+    expect(result.deliveries[0].nativeInputBinding).not.toHaveProperty('arguments');
+    expect(mockFindOneAndUpdate.mock.calls[0][1].$setOnInsert.nativeInputBinding).toEqual(
+      result.deliveries[0].nativeInputBinding,
+    );
+  });
+
+  test('a different-run attention binding cannot become actionable callback identity', async () => {
+    mockFindOneAndUpdate.mockImplementation((_query, update) =>
+      leanResult({ ...update.$setOnInsert, ...update.$set }),
+    );
+    const result = await enqueueGlassHiveCallbackDelivery({
+      body: {
+        callback_id: 'cb_foreign_permission',
+        event: 'run.needs_input',
+        run_id: 'run-1',
+        nativeextras: {
+          pending_native_input: {
+            version: 1,
+            requestId: 'input-1',
+            requestFingerprint: 'a'.repeat(64),
+            runId: 'run-other',
+            attemptId: 'attempt-1',
+            sessionId: 'session-1',
+            expiresAt: '2099-01-01T00:00:00Z',
+          },
+        },
+      },
+      deliveryContext: {
+        ownerId: 'owner-1',
+        conversationId: 'conversation-1',
+        destinations: [
+          { surface: 'telegram', telegramChatId: 'chat-1', telegramUserId: 'telegram-1' },
+        ],
+      },
+      message: { messageId: 'callback-other', text: 'Input needed.' },
+      text: 'Input needed.',
+    });
+    expect(result.deliveries[0]).not.toHaveProperty('nativeInputBinding');
+    expect(result.deliveries[0].telegramMessageThreadId).toBe('');
+  });
 
   test('semantic silence persists one suppressed row for a resolved terminal Telegram destination', async () => {
     mockFindOneAndUpdate.mockImplementation((_query, update) =>
@@ -863,148 +1096,251 @@ describe('GlassHiveCallbackDeliveryService', () => {
     }
   });
 
-  test('persists one typed Voice presentation and records its response for every bound Worker', async () => {
-    const { buildVoiceWorkerCompletionPresentation } = require('@librechat/api');
-    const binding = (suffix) => ({
-      originRef: `origin-${suffix}`,
-      workRef: `work-${suffix}`,
-      workerId: `worker-${suffix}`,
-      runId: `run-${suffix}`,
-      callbackRef: canonicalCallbackRef(`cb_terminal_${suffix.repeat(64)}`),
-      attemptNumber: 1,
-      resultKey: `ghtr_${suffix.repeat(64)}`,
-      acceptedOperationId: suffix.repeat(32),
-      terminalCallbackId: `cb_terminal_${suffix.repeat(64)}`,
-      resultDigest: `sha256:${suffix.repeat(64)}`,
-      resultRevision: 1,
-      effectGeneration: 1,
-    });
-    const bindings = [binding('a'), binding('b')];
-    const presentation = buildVoiceWorkerCompletionPresentation({
-      ownerId: 'owner-coalesced',
-      conversationId: 'conversation-coalesced',
-      callSessionId: 'call-coalesced',
-      responseMessageId: 'follow-up-coalesced',
-      responseText: 'Both Workers completed.',
-      bindings,
-    });
-    mockFindTerminalCallbackResult.mockImplementation((query) => {
-      const binding = bindings.find(
-        (candidate) =>
-          candidate.resultKey === query._id ||
-          (candidate.originRef === query.originRef && candidate.workRef === query.workRef),
+  test.each(['healthy', 'missing_identity', 'store_failure'])(
+    'persists one typed Voice presentation and records its response for every bound Worker (%s)',
+    async (mode) => {
+      const diagnostics = completionDiagnosticFixture(mode);
+      const { buildVoiceWorkerCompletionPresentation } = require('@librechat/api');
+      const binding = (suffix) => ({
+        originRef: `origin-${suffix}`,
+        workRef: `work-${suffix}`,
+        workerId: `worker-${suffix}`,
+        runId: `run-${suffix}`,
+        callbackRef: canonicalCallbackRef(`cb_terminal_${suffix.repeat(64)}`),
+        attemptNumber: 1,
+        resultKey: `ghtr_${suffix.repeat(64)}`,
+        acceptedOperationId: suffix.repeat(32),
+        terminalCallbackId: `cb_terminal_${suffix.repeat(64)}`,
+        resultDigest: `sha256:${suffix.repeat(64)}`,
+        resultRevision: 1,
+        effectGeneration: 1,
+      });
+      const bindings = [binding('a'), binding('b')];
+      const presentation = JSON.parse(
+        JSON.stringify(
+          buildVoiceWorkerCompletionPresentation({
+            ownerId: 'owner-coalesced',
+            conversationId: 'conversation-coalesced',
+            callSessionId: 'call-coalesced',
+            responseMessageId: 'follow-up-coalesced',
+            responseText: 'Both Workers completed.',
+            bindings,
+          }),
+        ),
       );
-      return leanResult(
-        binding
-          ? {
-              _id: binding.resultKey,
-              ownerId: 'owner-coalesced',
-              ...binding,
-              callbackId: binding.terminalCallbackId,
-              resultState: 'completed',
-              acceptedOperationGeneration: binding.effectGeneration,
-            }
-          : null,
-      );
-    });
-    mockFindOneAndUpdate.mockImplementation((_query, update) =>
-      leanResult({ ...update.$setOnInsert, ...update.$set }),
-    );
-
-    await enqueueGlassHiveCallbackDelivery({
-      body: {
-        callback_id: bindings[0].callbackRef,
-        attempt_number: 1,
-        event: 'main.followup',
-        origin_ref: bindings[0].originRef,
-        work_ref: bindings[0].workRef,
-        worker_id: bindings[0].workerId,
-        run_id: bindings[0].runId,
-      },
-      deliveryContext: {
-        ownerId: 'owner-coalesced',
-        originRef: bindings[0].originRef,
-        workRef: bindings[0].workRef,
-        conversationId: 'conversation-coalesced',
-        traceIdentity: { callbackRef: bindings[0].callbackRef, attemptNumber: 1 },
-        traceCallbackEvent: 'run.completed',
-        traceSurface: 'voice',
-        destinations: [{ surface: 'voice', voiceCallSessionId: 'call-coalesced' }],
-        workerCompletionPresentation: presentation,
-      },
-      message: { messageId: 'follow-up-coalesced', text: 'Both Workers completed.' },
-      text: 'Both Workers completed.',
-    });
-
-    const inserted = mockFindOneAndUpdate.mock.calls[0][1].$setOnInsert;
-    expect(inserted.workerCompletionPresentation).toEqual(presentation);
-    expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledTimes(2);
-    expect(
-      mockRecordVoiceOrchestrationTrace.mock.calls.map(([input]) => input.facts.workRef),
-    ).toEqual(['work-a', 'work-b']);
-    expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledWith(
-      expect.objectContaining({
-        callSessionId: 'call-coalesced',
+      const expectedTrace = {
+        callSessionId: presentation.callSessionId,
         turnId: presentation.turnId,
-        stage: 'response.completed',
-        facts: expect.objectContaining({
-          presentationRef: presentation.presentationRef,
-          responseRef: 'follow-up-coalesced',
-        }),
-      }),
-    );
-  });
+        presentationRef: presentation.presentationRef,
+      };
+      let insertedDelivery;
+      mockFindTerminalCallbackResult.mockImplementation((query) => {
+        const binding = bindings.find(
+          (candidate) =>
+            candidate.resultKey === query._id ||
+            (candidate.originRef === query.originRef && candidate.workRef === query.workRef),
+        );
+        return leanResult(
+          binding
+            ? {
+                _id: binding.resultKey,
+                ownerId: 'owner-coalesced',
+                ...binding,
+                callbackId: binding.terminalCallbackId,
+                resultState: 'completed',
+                acceptedOperationGeneration: binding.effectGeneration,
+              }
+            : null,
+        );
+      });
+      mockFindOneAndUpdate.mockImplementation((_query, update) => {
+        insertedDelivery = { ...update.$setOnInsert, ...update.$set };
+        return leanResult(insertedDelivery);
+      });
 
-  test('settles one exact coalesced Voice response through TTS and audio exactly once', async () => {
+      await diagnostics.run(async () => {
+        await enqueueGlassHiveCallbackDelivery({
+          body: {
+            callback_id: bindings[0].callbackRef,
+            attempt_number: 1,
+            event: 'main.followup',
+            origin_ref: bindings[0].originRef,
+            work_ref: bindings[0].workRef,
+            worker_id: bindings[0].workerId,
+            run_id: bindings[0].runId,
+          },
+          deliveryContext: {
+            ownerId: 'owner-coalesced',
+            originRef: bindings[0].originRef,
+            workRef: bindings[0].workRef,
+            conversationId: 'conversation-coalesced',
+            traceIdentity: { callbackRef: bindings[0].callbackRef, attemptNumber: 1 },
+            traceCallbackEvent: 'run.completed',
+            traceSurface: 'voice',
+            destinations: [{ surface: 'voice', voiceCallSessionId: 'call-coalesced' }],
+            workerCompletionPresentation: presentation,
+          },
+          message: { messageId: 'follow-up-coalesced', text: 'Both Workers completed.' },
+          text: 'Both Workers completed.',
+        });
+        expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
+        expect(insertedDelivery.workerCompletionPresentation).toEqual(presentation);
+        expectedTrace.deliveryRef = insertedDelivery.deliveryId;
+        insertedDelivery.userId = 'changed-after-defer';
+        insertedDelivery.deliveryId = 'changed-after-defer';
+        presentation.callSessionId = 'changed-after-defer';
+        presentation.turnId = 'changed-after-defer';
+        presentation.presentationRef = 'changed-after-defer';
+        presentation.bindings[0].workRef = 'changed-after-defer';
+        presentation.bindings.pop();
+      });
+      diagnostics.assertTraceCount(2);
+
+      expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledTimes(2);
+      expect(
+        mockRecordVoiceOrchestrationTraceBestEffort.mock.calls.map(
+          ([input]) => input.facts.workRef,
+        ),
+      ).toEqual(['work-a', 'work-b']);
+      expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ownerId: 'owner-coalesced',
+          callSessionId: expectedTrace.callSessionId,
+          turnId: expectedTrace.turnId,
+          stage: 'response.completed',
+          facts: expect.objectContaining({
+            deliveryRef: expectedTrace.deliveryRef,
+            presentationRef: expectedTrace.presentationRef,
+            responseRef: 'follow-up-coalesced',
+          }),
+        }),
+      );
+    },
+  );
+
+  test.each(['healthy', 'missing_identity', 'store_failure'])(
+    'settles one exact coalesced Voice response through TTS and audio exactly once (%s)',
+    async (mode) => {
+      const diagnostics = completionDiagnosticFixture(mode);
+      const fixture = workerCompletionFixture();
+      fixture.presentation = JSON.parse(JSON.stringify(fixture.presentation));
+      fixture.row.workerCompletionPresentation = fixture.presentation;
+      const expectedTrace = {
+        callSessionId: fixture.presentation.callSessionId,
+        turnId: fixture.presentation.turnId,
+        presentationRef: fixture.presentation.presentationRef,
+      };
+      const completedRow = {
+        ...fixture.row,
+        status: 'sent',
+        workerCompletionTtsCompletedAt: new Date(),
+        workerCompletionAudioCompletedAt: new Date(),
+        workerCompletionEffectLeases: [],
+      };
+      mockFindOne.mockReturnValueOnce(leanResult(fixture.row));
+      mockMessageFindOne.mockReturnValueOnce(
+        leanResult({ messageId: 'follow-up-coalesced', text: 'Both Workers completed.' }),
+      );
+      mockFindOneAndUpdate.mockReturnValueOnce(leanResult(completedRow));
+
+      let settlementTimestamp;
+      await diagnostics.run(async () => {
+        await expect(
+          completeGlassHiveWorkerCompletionPresentation({
+            deliveryId: fixture.row.deliveryId,
+            claimId: fixture.row.claimId,
+            dispatchPermit: fixture.dispatchPermit,
+            presentationRef: fixture.presentation.presentationRef,
+            userId: fixture.row.userId,
+            voiceCallSessionId: fixture.row.voiceCallSessionId,
+          }),
+        ).resolves.toMatchObject({ status: 'sent' });
+        expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
+        const at = mockFindOneAndUpdate.mock.calls[0][1].$set.workerCompletionTtsCompletedAt;
+        settlementTimestamp = at.getTime();
+        at.setTime(0);
+        completedRow.userId = 'changed-after-defer';
+        completedRow.deliveryId = 'changed-after-defer';
+        fixture.presentation.callSessionId = 'changed-after-defer';
+        fixture.presentation.turnId = 'changed-after-defer';
+        fixture.presentation.presentationRef = 'changed-after-defer';
+        fixture.presentation.bindings[0].workRef = 'changed-after-defer';
+        fixture.presentation.bindings.pop();
+      });
+
+      diagnostics.assertTraceCount(4);
+      expect(mockFenceEffectTransaction).toHaveBeenCalledTimes(2);
+      expect(mockReleaseEffectLease).toHaveBeenCalledTimes(2);
+      expect(mockRecordVoiceOrchestrationTraceBestEffort).toHaveBeenCalledTimes(4);
+      expect(
+        mockRecordVoiceOrchestrationTraceBestEffort.mock.calls.map(([input]) => input.stage),
+      ).toEqual(['tts.completed', 'tts.completed', 'audio.completed', 'audio.completed']);
+      for (const [input] of mockRecordVoiceOrchestrationTraceBestEffort.mock.calls) {
+        expect(input).toMatchObject({
+          ownerId: 'owner-coalesced',
+          callSessionId: expectedTrace.callSessionId,
+          turnId: expectedTrace.turnId,
+          facts: {
+            deliveryRef: 'ghcd-coalesced',
+            presentationRef: expectedTrace.presentationRef,
+            responseRef: 'follow-up-coalesced',
+          },
+        });
+        expect(input.at.getTime()).toBe(settlementTimestamp);
+      }
+      expect(
+        mockRecordVoiceOrchestrationTraceBestEffort.mock.calls.map(
+          ([input]) => input.facts.workRef,
+        ),
+      ).toEqual(['work-a', 'work-b', 'work-a', 'work-b']);
+
+      mockFindOne.mockReturnValueOnce(leanResult(null));
+      mockRecordVoiceOrchestrationTraceBestEffort.mockClear();
+      await expect(
+        completeGlassHiveWorkerCompletionPresentation({
+          deliveryId: fixture.row.deliveryId,
+          claimId: fixture.row.claimId,
+          dispatchPermit: fixture.dispatchPermit,
+          presentationRef: fixture.presentation.presentationRef,
+          userId: fixture.row.userId,
+          voiceCallSessionId: fixture.row.voiceCallSessionId,
+        }),
+      ).resolves.toBeNull();
+      expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
+    },
+  );
+
+  test('aborted callback discards deferred completion diagnostics', async () => {
+    const diagnostics = completionDiagnosticFixture('healthy');
     const fixture = workerCompletionFixture();
     mockFindOne.mockReturnValueOnce(leanResult(fixture.row));
     mockMessageFindOne.mockReturnValueOnce(
       leanResult({ messageId: 'follow-up-coalesced', text: 'Both Workers completed.' }),
     );
     mockFindOneAndUpdate.mockReturnValueOnce(
-      leanResult({
-        ...fixture.row,
-        status: 'sent',
-        workerCompletionTtsCompletedAt: new Date(),
-        workerCompletionAudioCompletedAt: new Date(),
-        workerCompletionEffectLeases: [],
-      }),
+      leanResult({ ...fixture.row, status: 'sent', workerCompletionEffectLeases: [] }),
     );
 
     await expect(
-      completeGlassHiveWorkerCompletionPresentation({
-        deliveryId: fixture.row.deliveryId,
-        claimId: fixture.row.claimId,
-        dispatchPermit: fixture.dispatchPermit,
-        presentationRef: fixture.presentation.presentationRef,
-        userId: fixture.row.userId,
-        voiceCallSessionId: fixture.row.voiceCallSessionId,
+      diagnostics.run(async () => {
+        await completeGlassHiveWorkerCompletionPresentation({
+          deliveryId: fixture.row.deliveryId,
+          claimId: fixture.row.claimId,
+          dispatchPermit: fixture.dispatchPermit,
+          presentationRef: fixture.presentation.presentationRef,
+          userId: fixture.row.userId,
+          voiceCallSessionId: fixture.row.voiceCallSessionId,
+        });
+        expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
+        throw new Error('callback aborted');
       }),
-    ).resolves.toMatchObject({ status: 'sent' });
+    ).rejects.toThrow('callback aborted');
 
-    expect(mockFenceEffectTransaction).toHaveBeenCalledTimes(2);
-    expect(mockReleaseEffectLease).toHaveBeenCalledTimes(2);
-    expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledTimes(4);
-    expect(mockRecordVoiceOrchestrationTrace.mock.calls.map(([input]) => input.stage)).toEqual([
-      'tts.completed',
-      'tts.completed',
-      'audio.completed',
-      'audio.completed',
-    ]);
-
-    mockFindOne.mockReturnValueOnce(leanResult(null));
-    mockRecordVoiceOrchestrationTrace.mockClear();
-    await expect(
-      completeGlassHiveWorkerCompletionPresentation({
-        deliveryId: fixture.row.deliveryId,
-        claimId: fixture.row.claimId,
-        dispatchPermit: fixture.dispatchPermit,
-        presentationRef: fixture.presentation.presentationRef,
-        userId: fixture.row.userId,
-        voiceCallSessionId: fixture.row.voiceCallSessionId,
-      }),
-    ).resolves.toBeNull();
-    expect(mockRecordVoiceOrchestrationTrace).not.toHaveBeenCalled();
+    expect(diagnostics.session.commitTransaction).not.toHaveBeenCalled();
+    expect(diagnostics.session.abortTransaction).toHaveBeenCalledTimes(1);
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
+    expect(diagnostics.durable).not.toHaveBeenCalled();
+    expect(diagnostics.local).not.toHaveBeenCalled();
   });
 
   test.each([
@@ -1037,7 +1373,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
       }),
     ).resolves.toBeNull();
     expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
-    expect(mockRecordVoiceOrchestrationTrace).not.toHaveBeenCalled();
+    expect(mockRecordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });
 
   test.each([
@@ -1428,6 +1764,50 @@ describe('GlassHiveCallbackDeliveryService', () => {
     expect(update.$set.leaseExpiresAt.getTime()).toBeGreaterThan(Date.now() + 9 * 60 * 1000);
   });
 
+  test('claim projects the exact retained native attention identity and signed topic without private form data', async () => {
+    const binding = {
+      version: 1,
+      requestId: 'permission-1',
+      requestFingerprint: 'a'.repeat(64),
+      runId: 'run-1',
+      attemptId: 'attempt-1',
+      sessionId: 'session-1',
+      expiresAt: '2099-01-01T00:00:00Z',
+    };
+    mockFindOneAndUpdate
+      .mockReturnValueOnce(
+        leanResult({
+          deliveryId: 'attention-1',
+          event: 'run.needs_input',
+          surface: 'telegram',
+          status: 'claimed',
+          claimId: 'claim-1',
+          workRef: 'work-1',
+          runId: 'run-1',
+          telegramUserId: 'telegram-1',
+          telegramMessageThreadId: '9',
+          nativeInputBinding: binding,
+        }),
+      )
+      .mockReturnValueOnce(leanResult(null));
+    const rows = await claimPendingGlassHiveCallbackDeliveries({
+      surface: 'telegram',
+      limit: 1,
+      claimOwner: 'telegram-dispatcher',
+    });
+    expect(rows).toEqual([
+      expect.objectContaining({
+        workRef: 'work-1',
+        runId: 'run-1',
+        telegramUserId: 'telegram-1',
+        telegramMessageThreadId: '9',
+        nativeInputBinding: binding,
+      }),
+    ]);
+    expect(rows[0]).not.toHaveProperty('requestedSchema');
+    expect(rows[0]).not.toHaveProperty('nativeextras');
+  });
+
   test('marks an ambiguous Telegram send without making it retryable', async () => {
     mockFindOneAndUpdate.mockReturnValueOnce(
       leanResult({
@@ -1458,6 +1838,41 @@ describe('GlassHiveCallbackDeliveryService', () => {
       originRef: 'ghi_unknown',
       state: 'unknown',
     });
+  });
+
+  test('retains exact issued Telegram receipts after expiry without granting settlement or replay', async () => {
+    const fixture = workerCompletionFixture();
+    const candidate = { ...fixture.row, surface: 'telegram', telegramChatId: 'chat-1',
+      telegramUserId: 'telegram-1', telegramMessageThreadId: '9', logicalMessageId: 'follow-up-coalesced',
+      dispatchPermitExpiresAt: new Date(Date.now() - 1000) };
+    const dispatchPermit = { ...fixture.dispatchPermit, surface: 'telegram' };
+    mockFindOne.mockReturnValueOnce(leanResult(candidate));
+    await expect(markGlassHiveCallbackDeliveryUnknown({
+      deliveryId: candidate.deliveryId, claimId: candidate.claimId, dispatchPermit,
+      telegramMessageIds: ['701', '701', '702'],
+    })).resolves.toBeNull();
+    expect(mockUpdateOne).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'claimed', deliveryId: candidate.deliveryId, claimId: candidate.claimId,
+      userId: candidate.userId, telegramChatId: 'chat-1', telegramMessageThreadId: '9',
+      callbackMessageId: candidate.callbackMessageId,
+      dispatchPermitId: candidate.dispatchPermitId,
+      dispatchPermitGeneration: candidate.dispatchPermitGeneration,
+      terminalCallbackResultDigest: candidate.terminalCallbackResultDigest,
+      workerCompletionPresentation: candidate.workerCompletionPresentation,
+    }), {
+      $addToSet: { telegramSentMessageIds: { $each: ['701', '702'] } },
+      $set: { telegramMessageId: '702', transportReceiptVersion: 1 },
+    });
+    expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+    expect(mockFenceEffectTransaction).not.toHaveBeenCalled();
+    expect(mockReleaseEffectLease).not.toHaveBeenCalled();
+    mockUpdateOne.mockClear();
+    mockFindOne.mockReturnValueOnce(leanResult({ ...candidate, dispatchPermitGeneration: 2 }));
+    await expect(markGlassHiveCallbackDeliveryUnknown({
+      deliveryId: candidate.deliveryId, claimId: candidate.claimId, dispatchPermit,
+      telegramMessageIds: ['703'],
+    })).resolves.toBeNull();
+    expect(mockUpdateOne).not.toHaveBeenCalled();
   });
 
   test('refuses an ambiguous Telegram settlement without the exact dispatch permit', async () => {

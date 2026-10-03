@@ -91,12 +91,12 @@ export function resolveFeelingsRuntimeConfig(env: Env = process.env): FeelingsRu
       provider: String(env.VIVENTIUM_FEELINGS_REACTION_PROVIDER || 'openai')
         .trim()
         .toLowerCase(),
-      model: String(env.VIVENTIUM_FEELINGS_REACTION_MODEL || 'gpt-5.6-terra').trim(),
+      model: String(env.VIVENTIUM_FEELINGS_REACTION_MODEL || 'gpt-6.1-sol').trim(),
       useResponsesApi: boolValue(env.VIVENTIUM_FEELINGS_REACTION_USE_RESPONSES_API, true),
       reasoningEffort: enumValue(
         env.VIVENTIUM_FEELINGS_REACTION_REASONING_EFFORT,
         ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
-        'none',
+        'high',
       ),
       fast,
       serviceTier: enumValue(
@@ -109,7 +109,7 @@ export function resolveFeelingsRuntimeConfig(env: Env = process.env): FeelingsRu
         .trim()
         .toLowerCase(),
       fallbackModel: String(
-        env.VIVENTIUM_FEELINGS_REACTION_FALLBACK_MODEL || 'claude-opus-5',
+        env.VIVENTIUM_FEELINGS_REACTION_FALLBACK_MODEL || 'claude-opus-5-5',
       ).trim(),
       activationProvider: String(env.VIVENTIUM_FEELINGS_REACTION_ACTIVATION_PROVIDER || 'groq')
         .trim()

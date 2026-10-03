@@ -4,6 +4,7 @@
  * === VIVENTIUM END === */
 
 import { z } from 'zod';
+import { nativeWorkInputResponseSchema } from './nativeWorkInput';
 import { safeErrorCode, safeErrorLogFields } from '../logging/safeError';
 
 type ValueRecord = Record<string, unknown>;
@@ -83,18 +84,7 @@ const actionSchema = z
     action: z.enum(['queue', 'message', 'steer', 'pause', 'resume', 'stop', 'retry', 'dismiss']),
     instruction: z.string().trim().min(1).max(8000).optional(),
     operationId: z.string().uuid(),
-    nativeInput: z
-      .object({
-        version: z.literal(1),
-        requestId: z.string().min(1).max(512),
-        requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
-        action: z.enum(['accept', 'decline', 'cancel']),
-        content: z
-          .record(z.union([z.string(), z.number().finite(), z.boolean(), z.array(z.string())]))
-          .optional(),
-      })
-      .strict()
-      .optional(),
+    nativeInput: nativeWorkInputResponseSchema.optional(),
   })
   .strict()
   .superRefine((value, context) => {

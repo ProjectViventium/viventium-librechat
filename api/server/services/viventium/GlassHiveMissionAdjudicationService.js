@@ -10,6 +10,7 @@ const { logger } = require('@librechat/data-schemas');
 const { getConvo, getUserById, saveConvo } = require('~/models');
 const { getAgent } = require('~/models/Agent');
 const { getAppConfig } = require('~/server/services/Config');
+const { prepareMissionOutputFiles } = require('./nativeOutputFiles');
 const {
   prepareCortexFollowUpMessage,
   persistPreparedCortexFollowUpMessage,
@@ -38,6 +39,7 @@ module.exports = createGlassHiveMissionAdjudicationService({
   getAppConfig,
   prepareCortexFollowUpMessage,
   persistPreparedCortexFollowUpMessage,
+  prepareMissionOutputFiles,
   isGlassHiveWorkTerminalCallback,
   recordGlassHiveAdjudicationOutcome,
   recordOrchestrationTraceDelivery,

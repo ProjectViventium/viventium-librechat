@@ -6,6 +6,7 @@
  * === VIVENTIUM END === */
 
 const { Constants } = require('librechat-data-provider');
+const { Types } = require('mongoose');
 
 const mockInitializeAgent = jest.fn();
 const mockGetAgent = jest.fn();
@@ -21,6 +22,8 @@ const mockPrimeFiles = jest.fn(async () => ({ files: [], toolContext: '' }));
 const mockLoadAgentTools = jest.fn(async () => ({ toolDefinitions: [] }));
 const mockStartParallelWorkTurnAuthority = jest.fn();
 const mockApplyVoiceModelOverride = jest.fn();
+const mockObserveOrchestrationOwner = jest.fn();
+const mockEffectiveOrchestrationMode = jest.fn(() => 'parallel');
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
@@ -47,6 +50,8 @@ jest.mock('@librechat/api', () => ({
   resolveSelectedHistoryAttachments: jest.fn(async () => []),
   configuredBackgroundWorkerRoute: jest.fn(() => null),
   GenerationJobManager: { setCollectedUsage: jest.fn() },
+  observeOrchestrationOwner: (...args) => mockObserveOrchestrationOwner(...args),
+  effectiveOrchestrationMode: (...args) => mockEffectiveOrchestrationMode(...args),
   applyAgentProviderCapabilityDefaults: jest.fn((agent) => ({ ...agent })),
   createEdgeCollector: jest.fn((checkAgentInit) => {
     const edgeMap = new Map();
@@ -248,6 +253,7 @@ describe('initializeClient handoff capability projection', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockEffectiveOrchestrationMode.mockReturnValue('parallel');
     mockValidateAgentModel.mockResolvedValue({ isValid: true });
     mockCheckPermission.mockResolvedValue(true);
     mockResolveFallbackCandidates.mockReturnValue([]);
@@ -308,6 +314,34 @@ describe('initializeClient handoff capability projection', () => {
       process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = originalBrokerSecret;
     }
   });
+
+  test('observes authenticated Parallel readiness before primary initialization', async () => {
+    await initializeWithHandoff({ ...primaryAgent, id: 'synthetic-handoff', edges: [] });
+    expect(mockObserveOrchestrationOwner).toHaveBeenCalledWith('user-synthetic');
+    expect(mockObserveOrchestrationOwner.mock.invocationCallOrder[0]).toBeLessThan(
+      mockInitializeAgent.mock.invocationCallOrder[0],
+    );
+  });
+
+  test.each(['focused', 'restricted-voice'])(
+    'does not start a readiness probe for %s initialization',
+    async (state) => {
+      const req = makeRequest();
+      if (state === 'focused') mockEffectiveOrchestrationMode.mockReturnValue('focused');
+      else req.body.voiceMode = true;
+      mockInitializeAgent.mockImplementation(async ({ agent }) => makeInitializedConfig(agent));
+      await initializeClient({
+        req,
+        res: {},
+        signal: null,
+        endpointOption: {
+          agent: Promise.resolve({ ...primaryAgent, edges: [] }),
+          model_parameters: {},
+        },
+      });
+      expect(mockObserveOrchestrationOwner).not.toHaveBeenCalled();
+    },
+  );
 
   test('passes the effective provider adapter delta contract to stream callbacks', async () => {
     const req = makeRequest();
@@ -1045,9 +1079,10 @@ describe('initializeClient handoff capability projection', () => {
       agent: Promise.resolve({ ...primaryAgent }),
       model_parameters: { model: primaryAgent.model },
     };
+    const req = makeRequest();
 
     const { client } = await initializeClient({
-      req: makeRequest(),
+      req,
       res: {},
       signal: null,
       endpointOption,
@@ -1063,6 +1098,62 @@ describe('initializeClient handoff capability projection', () => {
     });
     expect(initializedHandoff.viventiumGraphLlmFallbacks).toBeUndefined();
     expect(mockInitializeAgent).toHaveBeenCalledTimes(3);
+    expect(req._viventiumParticipantReconnectRecovery).toBeUndefined();
+  });
+
+  test('discloses a participant reconnect once when its configured fallback answers', async () => {
+    const handoffAgent = {
+      id: 'handoff-agent',
+      provider: 'anthropic',
+      model: 'synthetic-primary-model',
+      tools: ['synthetic-target-tool'],
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'synthetic-fallback-model',
+      edges: [],
+    };
+    const assignment = {
+      provider: 'glasshive-harness',
+      model: 'synthetic-fallback-model',
+      source: 'agent',
+      parametersField: 'fallback_llm_model_parameters',
+    };
+    mockResolveFallbackCandidates.mockImplementation((agent) =>
+      agent.id === handoffAgent.id ? [assignment] : [],
+    );
+    mockGetAgent.mockResolvedValue(handoffAgent);
+    mockInitializeAgent.mockImplementation(async ({ agent }) => {
+      if (agent.id === handoffAgent.id && agent.provider === handoffAgent.provider) {
+        throw Object.assign(new Error('synthetic reconnect required'), {
+          code: 'MODEL_AUTHENTICATION',
+          viventiumConnectedAccountReconnectRequired: true,
+          viventiumConnectedAccountProvider: 'Anthropic',
+        });
+      }
+      return makeInitializedConfig(agent);
+    });
+    const req = makeRequest();
+
+    const { client } = await initializeClient({
+      req,
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve({ ...primaryAgent }),
+        model_parameters: { model: primaryAgent.model },
+      },
+    });
+    expect(req._viventiumParticipantReconnectRecovery).toBeUndefined();
+    const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    await initializedHandoff.viventiumConnectedAgentInitializer();
+
+    expect(initializedHandoff).toMatchObject({
+      provider: assignment.provider,
+      model: assignment.model,
+    });
+    expect(req._viventiumParticipantReconnectRecovery).toEqual({
+      provider: 'Anthropic',
+      model: assignment.model,
+    });
   });
 
   test('ignores same-route and invalid handoff fallback candidates without preparing either', async () => {
@@ -1213,6 +1304,40 @@ describe('initializeClient handoff capability projection', () => {
     fallbackReleases.get('handoff-b')();
     await Promise.all([initializeA, initializeB]);
     expect(req.viventiumAllowOpenAIPlatformFallbackOnOAuthFailure).toBeUndefined();
+  });
+
+  test('retains BSON identity and detached authority while materializing a connected participant', async () => {
+    const resourceId = new Types.ObjectId();
+    const handoffAgent = {
+      _id: resourceId,
+      id: 'handoff-agent',
+      provider: 'openAI',
+      model: 'synthetic-connected-model',
+      model_parameters: {
+        model: 'synthetic-connected-model',
+        configuration: { scope: 'captured' },
+      },
+      edges: [],
+    };
+    mockCheckPermission.mockImplementation(async ({ resourceId: requestedId }) => {
+      if (!Types.ObjectId.isValid(requestedId)) {
+        throw new Error('ACL resource ID lost its BSON type');
+      }
+      return String(requestedId) === String(resourceId);
+    });
+    const { client } = await initializeWithHandoff(handoffAgent);
+    handoffAgent.model_parameters.configuration.scope = 'changed-after-capture';
+    await client.options.agentConfigs.get(handoffAgent.id).viventiumConnectedAgentInitializer();
+
+    expect(mockCheckPermission).toHaveBeenCalledTimes(2);
+    for (const [permission] of mockCheckPermission.mock.calls) {
+      expect(permission.resourceId).toBeInstanceOf(Types.ObjectId);
+      expect(String(permission.resourceId)).toBe(String(resourceId));
+    }
+    const hydratedAgent = mockInitializeAgent.mock.calls.find(
+      ([params]) => params.agent?.id === handoffAgent.id,
+    )[0].agent;
+    expect(hydratedAgent.model_parameters.configuration.scope).toBe('captured');
   });
 
   test('defers connected participant tools until first use and singleflights materialization', async () => {

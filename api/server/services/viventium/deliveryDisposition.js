@@ -9,6 +9,7 @@ const {
   inspectProviderDeliveryDisposition,
   resolveEffectiveDeliveryDisposition,
   supportsMessagingDeliveryDisposition,
+  isAudioDeliveryRequested,
 } = require('@librechat/api');
 
 const CAPTURE_KEY = '_viventiumDeliveryDispositionCapture';
@@ -18,19 +19,18 @@ function resetDeliveryDispositionCapture(req) {
   if (req && typeof req === 'object') delete req[CAPTURE_KEY];
 }
 
-function captureFinalModelDeliveryDisposition({ req, output, capabilityOwner }) {
+function captureFinalModelDeliveryDisposition({ req, output, capabilityOwner, captured }) {
   if (!req) return;
   if (Array.isArray(output?.tool_calls) && output.tool_calls.length > 0) return;
   const capability = req?.config?.endpoints?.agents?.providerCapabilities?.[capabilityOwner];
-  if (req._viventiumTelegram !== true || req?.body?.telegramAudioRequested !== true) return;
+  if (!isAudioDeliveryRequested(req)) return;
   if (!supportsMessagingDeliveryDisposition(capability)) {
-    if (req._viventiumDeliveryDispositionRequired === true) {
-      req[CAPTURE_KEY] = { status: 'missing' };
-    }
+    req._viventiumDeliveryDispositionRequired = false;
+    resetDeliveryDispositionCapture(req);
     return;
   }
   req._viventiumDeliveryDispositionRequired = true;
-  req[CAPTURE_KEY] = inspectProviderDeliveryDisposition(output);
+  req[CAPTURE_KEY] = captured ?? inspectProviderDeliveryDisposition(output);
 }
 
 function getDeliveryDispositionCapture(req) {
@@ -77,6 +77,7 @@ module.exports = {
   captureFinalModelDeliveryDisposition,
   getDeliveryDispositionCapture,
   inspectProviderDeliveryDisposition,
+  isAudioDeliveryRequested,
   resetDeliveryDispositionCapture,
   resolveEffectiveDeliveryDisposition,
 };

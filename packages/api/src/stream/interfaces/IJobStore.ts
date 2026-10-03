@@ -5,6 +5,7 @@ import type { InteractionSourceSegment } from '../../glasshive/interactionSource
 export type { InteractionSourceSegment } from '../../glasshive/interactionSourceSegments';
 import type { ReadyInputContinuation } from '../../agents/interactionContext';
 import type { NativeResponseIdentity, NativeResponseCommit } from '@librechat/data-schemas';
+import type { ServerSentEvent } from '../../types/events';
 
 /* === VIVENTIUM START === EMO-UC-048 typed local-QA fault boundary. === */
 import type { CortexLocalQaFaultBoundary } from '../../localQa';
@@ -222,6 +223,8 @@ export interface SerializableJobData {
   completedAt?: number;
   conversationId?: string;
   error?: string;
+  /** Public typed failure retained for terminal replay. */
+  errorClass?: string;
 
   /** User message metadata */
   userMessage?: {
@@ -271,6 +274,12 @@ export interface SerializableJobData {
   /** Immutable native admission; only the typed publication owner may change it. */
   nativeResponse?: NativeResponseIdentity;
   nativePredecessor?: NativePredecessor;
+  /** Response ids of superseded native Main operations in this logical turn; each must release first. */
+  nativeReleaseTargets?: string[];
+  /** Generator that holds this release-gated revision before its native dispatch. */
+  nativeDispatchOwner?: string;
+  /** Epoch ms until which that generator is known alive before its native dispatch. */
+  nativeDispatchLeaseUntil?: number;
   nativeAcceptedSources?: { invocationId: string; sources: NativeAcceptedSource[] };
   nativeResponseCancelled?: boolean;
   nativeResponseFinished?: boolean;
@@ -362,6 +371,7 @@ export interface ResumeState {
   conversationId?: string;
   sender?: string;
   clientPresentation?: ClientPresentation;
+  finalEvent?: ServerSentEvent;
 }
 
 /**
@@ -419,6 +429,36 @@ export interface IJobStore {
 
   /** Fence any older claimed stream slots after this revision's job is durably admitted. */
   fenceSupersededLogicalTurnClaims?(claim: LogicalTurnClaim): Promise<void>;
+
+  /**
+   * Commit this revision as an author immediately before its Main starts. The job first persists
+   * its context with each source's final author (the earliest committed revision that carried it,
+   * else this one); then the commit is recorded, and every earlier revision it takes over can
+   * never commit afterwards. These facts outlive the turn's retirement. A commit whose outcome
+   * stays unknown rejects with `author_commit_uncertain`, never as a refusal.
+   */
+  commitLogicalTurnAdmission?(
+    streamId: string,
+    userId: string,
+    interactionContext: InteractionContext,
+  ): Promise<InteractionContext>;
+
+  /** A committed revision that cannot start its Main gives up authorship and can never commit. */
+  relinquishLogicalTurnAuthor?(
+    streamId: string,
+    userId: string,
+    interactionContext: InteractionContext,
+  ): Promise<void>;
+
+  /**
+   * Hold the pre-dispatch lease of a running revision that has no native admission yet. `renew`
+   * succeeds for an unowned or self-owned lease; `takeover` only after another owner's lease
+   * expired. Both require the exact job creation, so identity and deadline anchor stay unchanged.
+   */
+  claimNativeDispatchLease?(
+    streamId: string,
+    claim: { createdAt: number; owner: string; leaseMs: number; mode: 'renew' | 'takeover' },
+  ): Promise<boolean>;
 
   /** Remove only a source-event receipt that points at a confirmed missing owner job. */
   forgetMissingSourceEventReceipt(
@@ -621,7 +661,7 @@ export interface IEventTransport {
     handlers: {
       onChunk: (event: unknown) => void;
       onDone?: (event: unknown, nativeJobProof?: string) => void;
-      onError?: (error: string) => void;
+      onError?: (error: string, errorClass?: string) => void;
     },
   ): { unsubscribe: () => void; ready?: Promise<void> };
 
@@ -640,7 +680,7 @@ export interface IEventTransport {
   ): void | boolean | Promise<void | boolean>;
 
   /** Publish an error event - returns Promise in Redis mode for ordered delivery */
-  emitError(streamId: string, error: string): void | Promise<void>;
+  emitError(streamId: string, error: string, errorClass?: string): void | Promise<void>;
 
   /**
    * Publish an abort signal to all replicas (Redis mode).

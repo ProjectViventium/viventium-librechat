@@ -41,21 +41,47 @@ function stripGlassHiveHeaders(headers) {
   );
 }
 
+function restrictGlassHiveHeaders(headers) {
+  const sanitized = stripGlassHiveHeaders(headers);
+  if (!headers || typeof headers !== 'object' || Array.isArray(headers)) {
+    return sanitized;
+  }
+  const nativeTransport = Object.keys(headers).some((name) =>
+    ['x-glasshive-agent-id', 'x-glasshive-bootstrap-bundle-b64'].includes(
+      String(name).toLowerCase(),
+    ),
+  );
+  if (!nativeTransport) {
+    return sanitized;
+  }
+  // Core initializes these canonical courier fields; neither grants native execution.
+  const transportHeaders = Object.fromEntries(
+    Object.entries(headers).filter(
+      ([name]) => name === 'X-GlassHive-Agent-Id' || name === 'X-GlassHive-Turn-Context-B64',
+    ),
+  );
+  // The provider service imports this authority owner. Resolve its signer only after initialization.
+  const {
+    restrictedConversationProviderBootstrapHeaders,
+  } = require('./GlassHiveConversationProviderService');
+  return { ...sanitized, ...transportHeaders, ...restrictedConversationProviderBootstrapHeaders() };
+}
+
 function sanitizeModelParameters(modelParameters) {
   if (!modelParameters || typeof modelParameters !== 'object') {
     return modelParameters;
   }
   const sanitized = { ...modelParameters };
   if (sanitized.defaultHeaders && typeof sanitized.defaultHeaders === 'object') {
-    sanitized.defaultHeaders = stripGlassHiveHeaders(sanitized.defaultHeaders);
+    sanitized.defaultHeaders = restrictGlassHiveHeaders(sanitized.defaultHeaders);
   }
   if (sanitized.configuration && typeof sanitized.configuration === 'object') {
     const configuration = { ...sanitized.configuration };
     if (configuration.defaultHeaders && typeof configuration.defaultHeaders === 'object') {
-      configuration.defaultHeaders = stripGlassHiveHeaders(configuration.defaultHeaders);
+      configuration.defaultHeaders = restrictGlassHiveHeaders(configuration.defaultHeaders);
     }
     if (configuration.headers && typeof configuration.headers === 'object') {
-      configuration.headers = stripGlassHiveHeaders(configuration.headers);
+      configuration.headers = restrictGlassHiveHeaders(configuration.headers);
     }
     sanitized.configuration = configuration;
   }

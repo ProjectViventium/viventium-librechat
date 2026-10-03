@@ -768,3 +768,77 @@ describe('GenerationJobManager subscription readiness', () => {
 
   /* === VIVENTIUM END === */
 });
+
+/* === VIVENTIUM START: Typed failure survives live delivery and durable reconnect. === */
+describe('typed stream error delivery', () => {
+  test('preserves a typed failure for live and late subscribers without changing legacy callbacks', async () => {
+    const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const manager = new GenerationJobManagerClass({
+      jobStore: store,
+      eventTransport: new InMemoryEventTransport(),
+    });
+    await manager.initialize();
+    await manager.createJob('typed-failure', 'synthetic-owner');
+    const live = jest.fn();
+    const subscription = await manager.subscribe('typed-failure', () => undefined, undefined, live);
+    const message = 'The conversation context could not be preserved. Please retry this turn.';
+    await manager.emitError('typed-failure', message, 'source_context_unavailable');
+    await manager.completeJob('typed-failure', message);
+    expect(live).toHaveBeenCalledWith(message, 'source_context_unavailable');
+    const durable = await store.getJob('typed-failure');
+    expect(durable).toMatchObject({
+      status: 'error',
+      error: message,
+      errorClass: 'source_context_unavailable',
+    });
+    subscription?.unsubscribe();
+    await manager.destroy();
+
+    const restartedStore = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    await restartedStore.createJob('typed-failure', 'synthetic-owner');
+    await restartedStore.updateJob('typed-failure', durable ?? {});
+    const restarted = new GenerationJobManagerClass({
+      jobStore: restartedStore,
+      eventTransport: new InMemoryEventTransport(),
+    });
+    await restarted.initialize();
+    const late = jest.fn();
+    const resumed = await restarted.subscribe('typed-failure', () => undefined, undefined, late);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(late).toHaveBeenCalledWith(message, 'source_context_unavailable');
+    resumed?.unsubscribe();
+    await restarted.destroy();
+  });
+  test('does not pair an untyped runtime error with a stale durable class after failed replay persistence', async () => {
+    const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const manager = new GenerationJobManagerClass({
+      jobStore: store,
+      eventTransport: new InMemoryEventTransport(),
+    });
+    await manager.initialize();
+    await manager.createJob('typed-failure-replaced', 'synthetic-owner');
+    await manager.emitError(
+      'typed-failure-replaced',
+      'Earlier public failure.',
+      'source_context_unavailable',
+    );
+    const update = jest.spyOn(store, 'updateJob');
+    update.mockRejectedValueOnce(new Error('synthetic replay persistence failure'));
+    await manager.emitError('typed-failure-replaced', 'Later legacy failure.');
+    await manager.completeJob('typed-failure-replaced', 'Later legacy failure.');
+    const durable = await store.getJob('typed-failure-replaced');
+    expect(durable?.errorClass).toBe('source_context_unavailable');
+    const late = jest.fn();
+    const subscription = await manager.subscribe(
+      'typed-failure-replaced',
+      () => undefined,
+      undefined,
+      late,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(late).toHaveBeenCalledWith('Later legacy failure.');
+    subscription?.unsubscribe();
+    await manager.destroy();
+  });
+});
+/* === VIVENTIUM END === */

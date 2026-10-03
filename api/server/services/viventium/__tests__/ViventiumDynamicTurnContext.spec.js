@@ -206,6 +206,11 @@ describe('ViventiumDynamicTurnContext', () => {
     writeValidReleaseSnapshot();
   });
 
+  afterEach(() => {
+    require('../GlassHiveOrchestrationReadinessService').resetOrchestrationReadinessForTests();
+    jest.restoreAllMocks();
+  });
+
   afterAll(() => {
     if (originalReleasePath === undefined) {
       delete process.env.VIVENTIUM_PARALLEL_WORK_RELEASE_GATE_FILE;
@@ -628,7 +633,7 @@ describe('ViventiumDynamicTurnContext', () => {
     expect(getActiveWorkSnapshotImpl).not.toHaveBeenCalled();
   });
 
-  test('reuses a server-authenticated owner claim without resolving release authority again', async () => {
+  test('reuses a server-authenticated owner claim without resolving readiness again', async () => {
     const request = { _viventiumParallelWorkTurnClaim: { available: true } };
     const resolveParallelAvailabilityImpl = jest.fn();
     const consumeTrustedParallelWorkClaimStateImpl = jest.fn().mockReturnValue(true);
@@ -660,7 +665,7 @@ describe('ViventiumDynamicTurnContext', () => {
   });
 
   test.each(['open', 'missing'])(
-    'caller availability cannot bypass an %s release gate or cache true on the request',
+    'Voice uses ready owner authority while an %s release gate stays uncertified',
     async (releaseState) => {
       if (releaseState === 'open') {
         const snapshot = JSON.parse(fs.readFileSync(releasePath, 'utf8'));
@@ -676,22 +681,46 @@ describe('ViventiumDynamicTurnContext', () => {
         fs.unlinkSync(releasePath);
       }
       const request = {};
-      const getActiveWorkSnapshotImpl = jest.fn();
-
-      const capsule = await loadActiveWorkTurnContext({
-        userId: 'owner-release-blocked',
-        user: {
-          id: 'owner-release-blocked',
-          personalization: { orchestration_mode: 'parallel', parallel_work_known: false },
-        },
-        available: true,
-        request,
-        getActiveWorkSnapshotImpl,
+      const ownerId = 'owner-operational';
+      const originalFlag = process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE;
+      process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'true';
+      const readiness = require('../GlassHiveOrchestrationReadinessService');
+      readiness.resetOrchestrationReadinessForTests({
+        ownerId,
+        status: 'ready',
+        checkedAtMs: Date.now(),
+      });
+      const refresh = jest.spyOn(readiness, 'refreshOrchestrationReadiness');
+      const getActiveWorkSnapshotImpl = jest.fn().mockResolvedValue({
+        snapshot: 'fresh',
+        work: [],
+        overflowCount: 0,
       });
 
-      expect(capsule).toBe('');
-      expect(request._viventiumParallelWorkTurnAvailable).toBe(false);
-      expect(getActiveWorkSnapshotImpl).not.toHaveBeenCalled();
+      let capsule;
+      try {
+        capsule = await loadActiveWorkTurnContext({
+          userId: ownerId,
+          user: {
+            id: ownerId,
+            personalization: { orchestration_mode: 'parallel', parallel_work_known: false },
+          },
+          available: true,
+          voice: true,
+          request,
+          getActiveWorkSnapshotImpl,
+        });
+      } finally {
+        if (originalFlag === undefined) delete process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE;
+        else process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = originalFlag;
+      }
+
+      expect(capsule).toContain('Mode: parallel');
+      expect(request._viventiumParallelWorkTurnAvailable).toBe(true);
+      expect(getActiveWorkSnapshotImpl).toHaveBeenCalledWith({ ownerId });
+      expect(refresh).not.toHaveBeenCalled();
+      const { parallelWorkReleaseGateSnapshotAsync } = require('../ViventiumOrchestrationMode');
+      expect((await parallelWorkReleaseGateSnapshotAsync()).available).toBe(false);
     },
   );
 
@@ -773,6 +802,97 @@ describe('ViventiumDynamicTurnContext', () => {
     });
     expect(capsule).toContain('Mode: parallel');
     expect(getActiveWorkSnapshotImpl).toHaveBeenCalledWith({ ownerId: 'owner-stale-turn' });
+  });
+
+  test.each([true, false])(
+    'default stale owner refresh is one-shot and rechecks its claim (%s)',
+    async (recovers) => {
+      fs.unlinkSync(releasePath);
+      const originalFlag = process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE;
+      process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'true';
+      const readiness = require('../GlassHiveOrchestrationReadinessService');
+      const ownerId = 'owner-stale-default';
+      readiness.resetOrchestrationReadinessForTests({
+        ownerId,
+        status: 'ready',
+        checkedAtMs: Date.now() - 120_000,
+      });
+      const refresh = jest
+        .spyOn(readiness, 'refreshOrchestrationReadiness')
+        .mockImplementation(async () => {
+          readiness.resetOrchestrationReadinessForTests({
+            ownerId,
+            status: recovers ? 'ready' : 'unready',
+            checkedAtMs: Date.now(),
+          });
+          return { available: recovers };
+        });
+      const request = {};
+      const getActiveWorkSnapshotImpl = jest.fn().mockResolvedValue({
+        snapshot: 'fresh',
+        work: [],
+        overflowCount: 0,
+      });
+      try {
+        const capsule = await loadActiveWorkTurnContext({
+          userId: ownerId,
+          user: {
+            id: ownerId,
+            personalization: { orchestration_mode: 'parallel', parallel_work_known: false },
+          },
+          request,
+          getActiveWorkSnapshotImpl,
+        });
+        if (recovers) expect(capsule).toContain('Mode: parallel');
+        else expect(capsule).toBe('');
+        expect(request._viventiumParallelWorkTurnAvailable).toBe(recovers);
+        expect(refresh).toHaveBeenCalledTimes(1);
+        expect(refresh).toHaveBeenCalledWith({ ownerId });
+        expect(getActiveWorkSnapshotImpl).toHaveBeenCalledTimes(recovers ? 1 : 0);
+      } finally {
+        if (originalFlag === undefined) delete process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE;
+        else process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = originalFlag;
+      }
+    },
+  );
+
+  test('a foreign authenticated owner claim cannot enable an unready owner', async () => {
+    const originalFlag = process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE;
+    process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'true';
+    const readiness = require('../GlassHiveOrchestrationReadinessService');
+    readiness.resetOrchestrationReadinessForTests({
+      ownerId: 'owner-other',
+      status: 'ready',
+      checkedAtMs: Date.now(),
+    });
+    const { parallelWorkClaimState } = require('../ViventiumOrchestrationMode');
+    const request = { _viventiumParallelWorkTurnClaim: parallelWorkClaimState('owner-other') };
+    readiness.resetOrchestrationReadinessForTests({
+      ownerId: 'owner-current',
+      status: 'unready',
+      checkedAtMs: Date.now(),
+    });
+    const refresh = jest.spyOn(readiness, 'refreshOrchestrationReadiness');
+    const getActiveWorkSnapshotImpl = jest.fn();
+    try {
+      expect(
+        await loadActiveWorkTurnContext({
+          userId: 'owner-current',
+          user: {
+            id: 'owner-current',
+            personalization: { orchestration_mode: 'parallel', parallel_work_known: false },
+          },
+          request,
+          getActiveWorkSnapshotImpl,
+        }),
+      ).toBe('');
+      expect(request._viventiumParallelWorkTurnAvailable).toBe(false);
+      expect(refresh).not.toHaveBeenCalled();
+      expect(getActiveWorkSnapshotImpl).not.toHaveBeenCalled();
+    } finally {
+      if (originalFlag === undefined) delete process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE;
+      else process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = originalFlag;
+    }
   });
 
   test('starts preference and Core-local known-work reads together before loading the roster', async () => {

@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { normalizeInteractionReplyContext } from '../agents/interactionReplyContext';
 import type {
   InteractionSourceFile,
   InteractionSourceSegment,
@@ -95,6 +96,8 @@ export function normalizeSourceSegmentsWithOverflow(
       .slice(0, 256);
     const sourceSequence = Number(candidate.source_sequence);
     const truncated = candidate.truncated === true || clipped.truncated;
+    // The quote this source input replied to stays with the input it belongs to.
+    const replyContext = normalizeInteractionReplyContext(candidate.reply_context);
     result.push({
       ordinal: 0,
       source_event_id: sourceEventId,
@@ -107,6 +110,11 @@ export function normalizeSourceSegmentsWithOverflow(
       ...(sourceParentMessageId ? { source_parent_message_id: sourceParentMessageId } : {}),
       text: clipped.text,
       ...(sourceFiles.length ? { source_files: sourceFiles } : {}),
+      ...(replyContext ? { reply_context: replyContext } : {}),
+      ...(Number.isSafeInteger(candidate.authoring_revision) &&
+      Number(candidate.authoring_revision) > 0
+        ? { authoring_revision: Number(candidate.authoring_revision) }
+        : {}),
       ...(truncated
         ? {
             truncated: true,

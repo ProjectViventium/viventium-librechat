@@ -114,6 +114,10 @@ jest.mock('~/server/services/Tools/mcp', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  getTrustedInteractionContext: (...args) =>
+    jest.requireActual('@librechat/api').getTrustedInteractionContext(...args),
+  fingerprintTraceReference: (...args) =>
+    jest.requireActual('@librechat/api').fingerprintTraceReference(...args),
   mainDelegationJsonSchema: (...args) =>
     jest.requireActual('@librechat/api').mainDelegationJsonSchema(...args),
   resolveBackgroundWorkerRoute: (...args) =>
@@ -586,6 +590,68 @@ describe('GlassHive capability broker', () => {
       },
     });
     expect(bundle.glasshive_capability_broker.allowed_host_tools).toEqual(grant.allowed_host_tools);
+  });
+
+  test('keeps large authorized evidence without duplicating raw tool resources in launch envelopes', async () => {
+    const {
+      buildConversationProviderBootstrapBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    const {
+      hydrateBrokerGrantResources,
+      verifyBrokerGrant,
+      mintBrokerGrant,
+    } = require('../GlassHiveCapabilityBrokerAuth');
+    const delegationTool = 'worker_delegate_once_mcp_glasshive-workers-projects';
+    const files = [{ file_id: 'synthetic-recall', text: 'e'.repeat(140000) }];
+    const hostToolResources = { file_search: { entity_id: 'main', files } };
+    const requestBody = {
+      conversationId: 'conv-1',
+      messageId: 'msg-1',
+      parentMessageId: 'parent-1',
+      viventiumSourceEventId: 'source-1',
+      viventiumTriggeringSourceSegments: [
+        { source_event_id: 'source-1', text: 'Keep this exact goal.' },
+      ],
+      files: [{ file_id: 'current-upload', filename: 'input.txt' }],
+      viventiumGlassHiveTurnContextB64: 'exact-trusted-turn-context',
+      tool_resources: hostToolResources,
+    };
+    const bundle = await buildConversationProviderBootstrapBundle({
+      user: { id: 'user-1', role: 'USER' },
+      requestBody,
+      allowedHostTools: ['file_search'],
+      hostToolResources,
+      allowedConversationOrchestrationTools: [delegationTool, 'active_work_action'],
+      workerProfile: 'codex-cli',
+      workerMemory: 'Keep the complete authorized memory.',
+    });
+    const grant = await hydrateBrokerGrantResources(
+      verifyBrokerGrant(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN, {
+        requireTurnScope: true,
+        expectedUserId: 'user-1',
+        expectedTenantId: 'tenant-a',
+      }),
+    );
+    const expectedBody = { ...requestBody };
+    delete expectedBody.tool_resources;
+    expect(grant.host_tool_resources[delegationTool].request_body).toEqual(expectedBody);
+    expect(grant.host_tool_resources.active_work_action.request_body).toEqual(expectedBody);
+    expect(grant.host_tool_resources.file_search).toEqual(hostToolResources.file_search);
+    expect(grant.host_tool_resources[delegationTool].mission_host_tool_resources).toEqual(
+      hostToolResources,
+    );
+    expect(grant.host_tool_resources[delegationTool].worker_memory).toBe(
+      'Keep the complete authorized memory.',
+    );
+    expect(requestBody.tool_resources).toBe(hostToolResources);
+    expect(() =>
+      mintBrokerGrant({
+        user: { id: 'user-1' },
+        requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
+        allowedHostTools: ['file_search'],
+        hostToolResources: { file_search: { text: 'x'.repeat(524288) } },
+      }),
+    ).toThrow(/resource scope exceeds/);
   });
 
   test('exposes the three broker-native facades only to conversation-orchestrator grants', async () => {
@@ -2333,9 +2399,14 @@ describe('GlassHive capability broker', () => {
     expect(result.bootstrap_bundle_json.glasshive_capability_broker.allowed_host_tools).toEqual([
       'file_search',
     ]);
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker.status).toBe('pending_admission');
+    expect(result.bootstrap_bundle_json.env?.GLASSHIVE_CAPABILITY_BROKER_TOKEN).toBeUndefined();
+    expect(result.bootstrap_bundle_json.claude_settings_local?.permissions?.allow).toEqual([
+      'mcp__glasshive-user-capabilities__file_search',
+    ]);
   });
 
-  test('injects run memory and the pinned feeling capsule into every worker instruction bundle', async () => {
+  test('projects one exact worker feeling capsule with its pinned hash and preserves memory', async () => {
     const {
       maybeInjectGlassHiveCapabilityBroker,
     } = require('../GlassHiveCapabilityBootstrapService');
@@ -2387,12 +2458,19 @@ describe('GlassHive capability broker', () => {
     expect(withMemory.bootstrap_bundle_json.claude_md).toContain('Sam (intro)');
     expect(withMemory.bootstrap_bundle_json.codex_md).toContain('Prefers concise summaries');
     expect(withMemory.bootstrap_bundle_json.agents_md).toContain('You, Viventium, are a being');
-    expect(withMemory.bootstrap_bundle_json.claude_md).toContain('- Energy: steady');
-    expect(withMemory.bootstrap_bundle_json.codex_md).toContain('</viventium_feeling_state>');
-    for (const field of ['agents_md', 'claude_md', 'codex_md']) {
-      expect(withMemory.bootstrap_bundle_json[field].trim().endsWith(feelings)).toBe(true);
-      expect(withMemory.bootstrap_bundle_json[field].split(feelings)).toHaveLength(2);
+    expect(withMemory.bootstrap_bundle_json.agents_md.trim().endsWith(feelings)).toBe(true);
+    expect(withMemory.bootstrap_bundle_json.agents_md.split(feelings)).toHaveLength(2);
+    for (const field of ['claude_md', 'codex_md']) {
+      expect(withMemory.bootstrap_bundle_json[field]).not.toContain('<viventium_feeling_state>');
     }
+    expect(withMemory.bootstrap_bundle_json.viventium_feelings_projection).toEqual({
+      version: 1,
+      enabled: true,
+      scope: 'all_agents',
+      canonical_instruction_field: 'agents_md',
+      snapshot_sha256: require('crypto').createHash('sha256').update(feelings).digest('hex'),
+      expected_capsule_count: 1,
+    });
     const { logger } = require('@librechat/data-schemas');
     const placementLogs = logger.info.mock.calls
       .map(([message]) => String(message))
@@ -2446,12 +2524,44 @@ describe('GlassHive capability broker', () => {
     expect(result.instruction).toContain('host capability broker is unavailable');
     expect(result.instruction).toContain('broker_disabled');
     expect(result.bootstrap_bundle_json.agents_md).toContain(capsule);
-    expect(result.bootstrap_bundle_json.claude_md).toContain(capsule);
-    expect(result.bootstrap_bundle_json.codex_md).toContain(capsule);
+    expect(result.bootstrap_bundle_json.claude_md).not.toContain(capsule);
+    expect(result.bootstrap_bundle_json.codex_md).not.toContain(capsule);
     expect(result.bootstrap_bundle_json.agents_md.trim().endsWith(capsule)).toBe(true);
-    expect(result.bootstrap_bundle_json.claude_md.trim().endsWith(capsule)).toBe(true);
-    expect(result.bootstrap_bundle_json.codex_md.trim().endsWith(capsule)).toBe(true);
+    expect(result.bootstrap_bundle_json.viventium_feelings_projection.enabled).toBe(true);
+    expect(result.bootstrap_bundle_json.viventium_feelings_projection.expected_capsule_count).toBe(
+      1,
+    );
     expect(result.bootstrap_bundle_json.glasshive_capability_broker).toBeUndefined();
+  });
+
+  test.each(['conscious_agent', 'unknown'])('keeps %s worker Feeling scope off', async (scope) => {
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_ENABLED = 'false';
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    const capsule = '<viventium_feeling_state>\nenergy: steady\n</viventium_feeling_state>';
+    const result = await maybeInjectGlassHiveCapabilityBroker({
+      serverName: 'glasshive-workers-projects',
+      toolName: 'worker_delegate_once',
+      toolArguments: { instruction: 'Compare synthetic quotes.' },
+      config: {
+        configurable: {
+          glasshive_worker_feelings: capsule,
+          glasshive_worker_feelings_scope: scope,
+        },
+      },
+    });
+    for (const field of ['agents_md', 'claude_md', 'codex_md']) {
+      expect(result.bootstrap_bundle_json[field]).not.toContain(capsule);
+    }
+    expect(result.bootstrap_bundle_json.viventium_feelings_projection).toEqual({
+      version: 1,
+      enabled: false,
+      scope,
+      canonical_instruction_field: 'agents_md',
+      snapshot_sha256: '',
+      expected_capsule_count: 0,
+    });
   });
 
   test('injects broker MCP config into GlassHive continue calls without replacing user instructions', async () => {
@@ -2812,11 +2922,13 @@ describe('GlassHive capability broker', () => {
 
     const catalog = await buildCapabilityCatalog({ grant });
     const definitions = toolDefinitionsForMcp(catalog);
-    expect(definitions.map((tool) => tool.name)).toContain('gh_google_workspace__calendar_create');
+    expect(definitions.map((tool) => tool.name)).toContain(
+      'gh_google_workspace_tool_calendar_create',
+    );
 
     const blocked = await handleToolCall({
       grant,
-      toolName: 'gh_google_workspace__calendar_create',
+      toolName: 'gh_google_workspace_tool_calendar_create',
       args: { title: 'Planning' },
     });
     expect(blocked).toEqual(
@@ -2924,7 +3036,7 @@ describe('GlassHive capability broker', () => {
 
     const catalog = await buildCapabilityCatalog({ grant });
     const definition = toolDefinitionsForMcp(catalog).find(
-      (tool) => tool.name === 'gh_scheduling_cortex__schedule_create',
+      (tool) => tool.name === 'gh_scheduling_cortex_tool_schedule_create',
     );
     expect(definition.inputSchema.properties.invocation_id).toEqual(
       expect.objectContaining({ type: 'string' }),
@@ -3042,9 +3154,11 @@ describe('GlassHive capability broker', () => {
     const catalog = await buildCapabilityCatalog({ grant });
     const definitions = toolDefinitionsForMcp(catalog);
     expect(
-      definitions.find((tool) => tool.name === 'gh_ms_365__mail_search')?.annotations.access,
+      definitions.find((tool) => tool.name === 'gh_ms_365_tool_mail_search')?.annotations.access,
     ).toBe('content_read');
-    expect(definitions.find((tool) => tool.name === 'gh_ms_365__mail_search')?.annotations).toEqual(
+    expect(
+      definitions.find((tool) => tool.name === 'gh_ms_365_tool_mail_search')?.annotations,
+    ).toEqual(
       expect.objectContaining({
         readOnlyHint: true,
         destructiveHint: false,
@@ -3053,10 +3167,11 @@ describe('GlassHive capability broker', () => {
       }),
     );
     expect(
-      definitions.find((tool) => tool.name === 'gh_ms_365__calendar_delete')?.annotations.access,
+      definitions.find((tool) => tool.name === 'gh_ms_365_tool_calendar_delete')?.annotations
+        .access,
     ).toBe('write');
     expect(
-      definitions.find((tool) => tool.name === 'gh_ms_365__calendar_delete')?.annotations,
+      definitions.find((tool) => tool.name === 'gh_ms_365_tool_calendar_delete')?.annotations,
     ).toEqual(
       expect.objectContaining({
         readOnlyHint: false,
@@ -3306,7 +3421,7 @@ describe('GlassHive capability broker', () => {
       }),
     );
     expect(definitions.map((tool) => tool.name)).toContain(
-      'gh_google_workspace__search_gmail_messages',
+      'gh_google_workspace_tool_search_gmail_messages',
     );
     expect(catalog.omissions).toEqual([]);
   });
@@ -3467,4 +3582,106 @@ describe('GlassHive capability broker', () => {
     expect(JSON.stringify(userTwo)).not.toMatch(/credential_present|missing_auth/);
   });
   /* === VIVENTIUM END === */
+});
+
+describe('Native MCP broker name compatibility', () => {
+  const {
+    brokerToolName,
+    collisionSafeBrokerToolName,
+  } = require('../GlassHiveCapabilityPolicyService');
+
+  test.each([
+    ['scheduling-cortex', 'schedule_list'],
+    ['_synthetic__server_', '__synthetic__tool_'],
+    ['a'.repeat(100), 'b'.repeat(100)],
+  ])('exports a bounded server-local name without a qualified separator', (server, tool) => {
+    const name = brokerToolName(server, tool);
+    expect(name).not.toContain('__');
+    expect(name).toMatch(/^[A-Za-z0-9_]+$/);
+    expect(name.length).toBeLessThanOrEqual(120);
+  });
+
+  test('preserves legacy lookup names and separates normalized collisions', () => {
+    expect(brokerToolName('scheduling-cortex', 'schedule_list', { legacy: true })).toBe(
+      'gh_scheduling_cortex__schedule_list',
+    );
+    const names = new Map();
+    const first = collisionSafeBrokerToolName('synthetic-server', 'list', names);
+    const second = collisionSafeBrokerToolName('synthetic_server', 'list', names);
+    expect(first).not.toBe(second);
+    expect(collisionSafeBrokerToolName('synthetic_server', 'list', names)).toBe(second);
+    expect(second).not.toContain('__');
+  });
+});
+
+describe('Claude exact granted host read permissions', () => {
+  const { mergeBrokerBundle } = require('../GlassHiveCapabilityBootstrapService');
+  const merge = (allowedHostTools, existingBundle = {}) =>
+    mergeBrokerBundle({
+      existingBundle,
+      brokerUrl: 'http://localhost:9000/broker',
+      grantToken: 'synthetic-grant',
+      grantPayload: { grant_id: 'ghcb_synthetic_scope', exp: 2000000000, scopes: {} },
+      allowedServers: [],
+      allowedHostTools,
+    });
+
+  test('carries exact granted host reads into the native dontAsk allowlist', () => {
+    const bundle = merge(['file_search', 'web_search', 'file_search']);
+    expect(bundle.claude_settings_local?.permissions?.allow).toEqual([
+      'mcp__glasshive-user-capabilities__file_search',
+      'mcp__glasshive-user-capabilities__web_search',
+    ]);
+  });
+
+  test('keeps writes, ungranted reads and unknown definitions out of that allowlist', () => {
+    const bundle = merge(['file_search', 'active_work_action', 'manage_active_tasks', 'unknown']);
+    expect(bundle.claude_settings_local?.permissions?.allow).toEqual([
+      'mcp__glasshive-user-capabilities__file_search',
+    ]);
+  });
+
+  test('preserves explicit existing settings and denials without duplicate rules', () => {
+    const settings = {
+      permissions: {
+        defaultMode: 'dontAsk',
+        allow: ['Read', 'mcp__glasshive-user-capabilities__file_search'],
+        deny: ['mcp__glasshive-user-capabilities__file_search'],
+      },
+      autoMemoryEnabled: false,
+    };
+    const bundle = merge(['file_search'], { claude_settings_local: settings });
+    expect(bundle.claude_settings_local).toEqual(settings);
+    expect(settings.permissions.allow).toHaveLength(2);
+  });
+
+  test.each([
+    'invalid',
+    { permissions: 'invalid' },
+    { permissions: null },
+    { permissions: [] },
+    { permissions: { allow: 'invalid' } },
+    { permissions: { allow: null } },
+  ])('does not repair malformed explicit settings into automatic permissions', (settings) => {
+    const bundle = merge(['file_search'], { claude_settings_local: settings });
+    expect(bundle.claude_settings_local).toEqual(settings);
+  });
+
+  test.each(['Bootstrap', 'Broker'])('supports the existing %s-first import order', (first) => {
+    jest.isolateModules(() => {
+      require(`../GlassHiveCapability${first}Service`);
+      const { mergeBrokerBundle: initializedMerge } = require('../GlassHiveCapabilityBootstrapService');
+      const bundle = initializedMerge({
+        existingBundle: {},
+        brokerUrl: 'http://localhost:9000/broker',
+        grantToken: 'synthetic-grant',
+        grantPayload: { grant_id: 'ghcb_synthetic_scope', exp: 2000000000, scopes: {} },
+        allowedServers: [],
+        allowedHostTools: ['file_search'],
+      });
+      expect(bundle.claude_settings_local.permissions.allow).toEqual([
+        'mcp__glasshive-user-capabilities__file_search',
+      ]);
+    });
+  });
 });

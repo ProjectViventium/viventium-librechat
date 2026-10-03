@@ -36,6 +36,7 @@ interface PubSubMessage {
   seq?: number;
   data?: unknown;
   error?: string;
+  errorClass?: string;
   reason?: string;
   presentationReceiptId?: string;
   /** Internal incarnation evidence, never copied into the user event payload. */
@@ -73,7 +74,7 @@ interface StreamSubscribers {
     {
       onChunk: (event: unknown) => void;
       onDone?: (event: unknown, nativeJobProof?: string) => void;
-      onError?: (error: string) => void;
+      onError?: (error: string, errorClass?: string) => void;
     }
   >;
   allSubscribersLeftCallbacks: Array<() => void>;
@@ -798,7 +799,8 @@ export class RedisEventTransport implements IEventTransport {
             else handlers.onDone?.(message.data, message.nativeJobProof);
             break;
           case EventTypes.ERROR:
-            handlers.onError?.(message.error ?? 'Unknown error');
+            if (message.errorClass === undefined) handlers.onError?.(message.error ?? 'Unknown error');
+            else handlers.onError?.(message.error ?? 'Unknown error', message.errorClass);
             break;
           case EventTypes.ABORT:
             break;
@@ -875,7 +877,7 @@ export class RedisEventTransport implements IEventTransport {
     handlers: {
       onChunk: (event: unknown) => void;
       onDone?: (event: unknown, nativeJobProof?: string) => void;
-      onError?: (error: string) => void;
+      onError?: (error: string, errorClass?: string) => void;
     },
   ): { unsubscribe: () => void; ready: Promise<void> } {
     const channel = CHANNELS.events(streamId);
@@ -1078,10 +1080,10 @@ export class RedisEventTransport implements IEventTransport {
    * Publish an error event to all subscribers.
    * Includes sequence number to ensure delivery after all chunks.
    */
-  async emitError(streamId: string, error: string): Promise<void> {
+  async emitError(streamId: string, error: string, errorClass?: string): Promise<void> {
     const channel = CHANNELS.events(streamId);
     const seq = this.getNextSequence(streamId);
-    const message: PubSubMessage = { type: EventTypes.ERROR, seq, error };
+    const message: PubSubMessage = { type: EventTypes.ERROR, seq, error, ...(errorClass ? { errorClass } : {}) };
 
     try {
       await this.publisher.publish(channel, JSON.stringify(message));

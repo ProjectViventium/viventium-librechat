@@ -14,18 +14,19 @@
  */
 
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
-import { Phone, PhoneOff, Loader2 } from 'lucide-react';
+import { Phone, PhoneOff, Loader2, SlidersHorizontal } from 'lucide-react';
 import { useRecoilValue } from 'recoil';
 import { useQueryClient } from '@tanstack/react-query';
 import { TooltipAnchor } from '@librechat/client';
 import { QueryKeys, request } from 'librechat-data-provider';
 import { useAuthContext } from '~/hooks/AuthContext';
+import useLocalize from '~/hooks/useLocalize';
 import { useGetStartupConfig } from '~/data-provider';
 import store from '~/store';
 import { cn } from '~/utils';
 import { readVoiceCallFailureMessage } from './voiceCallError';
 
-type CallState = 'idle' | 'connecting' | 'active' | 'error';
+type CallState = 'idle' | 'connecting' | 'settings' | 'active' | 'error';
 type CallFailureCode =
   | 'auth_expired'
   | 'mic_denied'
@@ -471,6 +472,7 @@ export function shouldContinueCallTaskPolling(state: CallTaskContinuationState) 
 }
 
 export default function CallButton({ className }: { className?: string }) {
+  const localize = useLocalize();
   const conversation = useRecoilValue(store.conversationByIndex(0));
   const agentId = conversation?.agent_id;
   const conversationId = conversation?.conversationId;
@@ -481,6 +483,8 @@ export default function CallButton({ className }: { className?: string }) {
 
   const [state, setState] = useState<CallState>('idle');
   const [error, setError] = useState<string | null>(null);
+  const [defaultsStatus, setDefaultsStatus] = useState('');
+  const [savingDefaults, setSavingDefaults] = useState(false);
   const callWindowRef = useRef<Window | null>(null);
   const callSessionIdRef = useRef<string>('');
   const playgroundOriginRef = useRef<string>('');
@@ -677,89 +681,99 @@ export default function CallButton({ className }: { className?: string }) {
         setState('idle');
         setError(null);
         markCallEndedAndPoll(endedCallSessionId);
+      } else if (event.data.event === 'result') {
+        setState('active');
       }
     };
     window.addEventListener('message', onCallMessage);
     return () => window.removeEventListener('message', onCallMessage);
   }, [conversationId, markCallEndedAndPoll, queryClient]);
 
-  const startCall = useCallback(async () => {
-    if (!enabled || state === 'connecting') {
-      return;
-    }
+  const startCall = useCallback(
+    async (autoConnect = true) => {
+      if (!enabled || state === 'connecting') {
+        return;
+      }
 
-    // If a call tab is already open, focus it.
-    if (callWindowRef.current && !callWindowRef.current.closed) {
-      callWindowRef.current.focus();
-      return;
-    }
+      // If a call tab is already open, focus it.
+      if (callWindowRef.current && !callWindowRef.current.closed) {
+        callWindowRef.current.focus();
+        return;
+      }
 
-    // Open synchronously in the originating click so browser popup policy never turns a successful
-    // signed session into a manual copy/paste recovery flow.
-    const pendingWindow = window.open('', '_blank');
-    if (!pendingWindow) {
-      setState('error');
-      setError(
-        'Your browser blocked the call window. Allow popups for this site and click Call again.',
-      );
-      return;
-    }
-    callWindowRef.current = pendingWindow;
-    renderPendingCallWindow(pendingWindow, 'connecting');
-    setState('connecting');
-    setError(null);
+      // Open synchronously in the originating click so browser popup policy never turns a successful
+      // signed session into a manual copy/paste recovery flow.
+      const pendingWindow = window.open('', '_blank');
+      if (!pendingWindow) {
+        setState('error');
+        setError(
+          'Your browser blocked the call window. Allow popups for this site and click Call again.',
+        );
+        return;
+      }
+      callWindowRef.current = pendingWindow;
+      renderPendingCallWindow(pendingWindow, 'connecting');
+      setState('connecting');
+      setError(null);
+      setDefaultsStatus('');
 
-    try {
-      const makeRequest = async (bearerToken?: string) => {
-        return await fetch('/api/viventium/calls', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {}),
-          },
-          body: JSON.stringify({
-            conversationId: conversationId ?? 'new',
-            agentId,
-          }),
-        });
-      };
+      try {
+        const makeRequest = async (bearerToken?: string) => {
+          return await fetch('/api/viventium/calls', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {}),
+            },
+            body: JSON.stringify({
+              conversationId: conversationId ?? 'new',
+              agentId,
+            }),
+          });
+        };
 
-      let resp = await makeRequest(token);
-      if (resp.status === 401) {
-        // Match existing SSE behavior: refresh token and retry once.
-        const refreshResponse = await request.refreshToken();
-        const newToken = refreshResponse?.token ?? '';
-        if (newToken) {
-          request.dispatchTokenUpdatedEvent(newToken);
-          resp = await makeRequest(newToken);
+        let resp = await makeRequest(token);
+        if (resp.status === 401) {
+          // Match existing SSE behavior: refresh token and retry once.
+          const refreshResponse = await request.refreshToken();
+          const newToken = refreshResponse?.token ?? '';
+          if (newToken) {
+            request.dispatchTokenUpdatedEvent(newToken);
+            resp = await makeRequest(newToken);
+          }
         }
+
+        if (!resp.ok) {
+          throw new Error(await readVoiceCallFailureMessage(resp));
+        }
+
+        const data = await resp.json();
+
+        const url = data?.playgroundUrl;
+        if (typeof url !== 'string' || url.length === 0) {
+          throw new Error('Missing playgroundUrl');
+        }
+
+        const resolvedUrl = new URL(url, window.location.href);
+        if (!autoConnect) {
+          resolvedUrl.searchParams.set('autoConnect', '0');
+        }
+        playgroundOriginRef.current = resolvedUrl.origin;
+        callSessionIdRef.current =
+          typeof data?.callSessionId === 'string' ? data.callSessionId : '';
+        pendingWindow.location.replace(resolvedUrl.href);
+        setState(autoConnect ? 'active' : 'settings');
+        pendingWindow.focus();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : 'Call failed';
+        renderPendingCallWindow(pendingWindow, 'error', msg);
+        callWindowRef.current = null;
+        setState('error');
+        setError(msg);
       }
-
-      if (!resp.ok) {
-        throw new Error(await readVoiceCallFailureMessage(resp));
-      }
-
-      const data = await resp.json();
-
-      const url = data?.playgroundUrl;
-      if (typeof url !== 'string' || url.length === 0) {
-        throw new Error('Missing playgroundUrl');
-      }
-
-      const resolvedUrl = new URL(url, window.location.href);
-      playgroundOriginRef.current = resolvedUrl.origin;
-      callSessionIdRef.current = typeof data?.callSessionId === 'string' ? data.callSessionId : '';
-      pendingWindow.location.replace(resolvedUrl.href);
-      setState('active');
-      pendingWindow.focus();
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Call failed';
-      renderPendingCallWindow(pendingWindow, 'error', msg);
-      callWindowRef.current = null;
-      setState('error');
-      setError(msg);
-    }
-  }, [agentId, conversationId, enabled, state, token]);
+    },
+    [agentId, conversationId, enabled, state, token],
+  );
 
   const endCall = useCallback(() => {
     const callSessionId = callSessionIdRef.current;
@@ -782,9 +796,12 @@ export default function CallButton({ className }: { className?: string }) {
 
   const isConnecting = state === 'connecting';
   const isActive = state === 'active';
+  const isSettings = state === 'settings';
 
   const label = isActive
     ? 'End voice call'
+    : isSettings
+      ? 'Close voice settings'
     : state === 'error'
       ? 'Retry voice call'
       : 'Start voice call';
@@ -796,6 +813,8 @@ export default function CallButton({ className }: { className?: string }) {
         ? 'Connecting…'
         : state === 'active'
           ? 'End voice call'
+          : state === 'settings'
+            ? 'Close voice settings'
           : 'Voice could not start');
 
   return (
@@ -805,7 +824,7 @@ export default function CallButton({ className }: { className?: string }) {
         render={
           <button
             type="button"
-            onClick={isActive ? endCall : startCall}
+            onClick={isActive || isSettings ? endCall : () => void startCall()}
             disabled={isConnecting}
             aria-label={label}
             aria-describedby={error ? errorId : undefined}
@@ -830,6 +849,51 @@ export default function CallButton({ className }: { className?: string }) {
           </button>
         }
       />
+      {state === 'idle' || state === 'error' ? (
+        <button
+          type="button"
+          onClick={() => void startCall(false)}
+          aria-label={localize('com_ui_voice_settings')}
+          aria-describedby={error ? errorId : undefined}
+          className="flex items-center gap-1.5 rounded-lg px-2 py-2 text-xs text-text-secondary transition-colors hover:bg-surface-secondary focus:outline-none focus:ring-2 focus:ring-offset-2"
+        >
+          <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
+          {localize('com_ui_voice_settings')}
+        </button>
+      ) : null}
+      {isSettings ? (
+        <button
+          type="button"
+          disabled={savingDefaults}
+          onClick={async () => {
+            setSavingDefaults(true);
+            setDefaultsStatus('');
+            try {
+              const response = await fetch(
+                `/api/viventium/calls/${encodeURIComponent(callSessionIdRef.current)}/voice-defaults`,
+                { method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {} },
+              );
+              if (!response.ok) throw new Error('Could not save voice defaults.');
+              const saved = (await response.json()).savedVoiceRoute;
+              const describe = (choice?: { provider?: string; variant?: string }) =>
+                [choice?.provider || 'Default', choice?.variant].filter(Boolean).join(' · ');
+              setDefaultsStatus(
+                saved
+                  ? `Voice defaults saved. Listening: ${describe(saved.stt)}. Speaking: ${describe(saved.tts)}.`
+                  : 'Voice defaults saved.',
+              );
+            } catch {
+              setDefaultsStatus('Could not save voice defaults. Try again.');
+            } finally {
+              setSavingDefaults(false);
+            }
+          }}
+          className="rounded-lg px-2 py-2 text-xs text-text-secondary hover:bg-surface-secondary"
+        >
+          {savingDefaults ? 'Saving…' : 'Save these voice choices as my default'}
+        </button>
+      ) : null}
+      {defaultsStatus ? <span role="status" className="text-xs">{defaultsStatus}</span> : null}
       {error ? (
         <span id={errorId} role="alert" className="max-w-64 text-xs leading-tight text-red-500">
           {error}

@@ -33,7 +33,10 @@ const {
   voiceContextKeytermsFromFiles,
   voiceContextKeytermsFromNativeFiles,
 } = require('./VoiceContextKeyterms');
-const { resolveVoiceOverrideAssignment } = require('./voiceLlmOverride');
+const {
+  resolveVoiceOverrideAssignment,
+  resolveVoiceModelParameters,
+} = require('./voiceLlmOverride');
 const { rewriteAgentForRuntime } = require('../../../../scripts/viventium-agent-runtime-models');
 
 const DEFAULT_TTL_MS = 15 * 60 * 1000; // 15 minutes
@@ -264,7 +267,10 @@ function getDefaultVoiceRouteSelection(modality) {
     if (provider === 'assemblyai') {
       return {
         provider,
-        variant: normalizeVoiceRouteText('universal-streaming', MAX_VARIANT_LENGTH),
+        variant: normalizeVoiceRouteText(
+          process.env.VIVENTIUM_ASSEMBLYAI_STT_MODEL || 'u3-rt-pro',
+          MAX_VARIANT_LENGTH,
+        ),
       };
     }
     if (provider === 'openai') {
@@ -353,9 +359,9 @@ function resolveVoiceRouteSelection(savedSelection, fallbackSelection, modality)
   };
 }
 
-async function resolveUserVoiceRoute(userId) {
+async function resolveUserVoiceRoute(userId, { includeSources = false } = {}) {
   const savedVoiceRoute = await getUserSavedVoiceRoute(userId);
-  return normalizeVoiceRouteState({
+  const route = normalizeVoiceRouteState({
     stt: resolveVoiceRouteSelection(
       savedVoiceRoute?.stt,
       getDefaultVoiceRouteSelection('stt'),
@@ -367,6 +373,17 @@ async function resolveUserVoiceRoute(userId) {
       'tts',
     ),
   });
+  /* === VIVENTIUM START === The pre-transcription courier must distinguish a
+   * saved choice from a global default before applying its surface default. === */
+  if (includeSources) {
+    for (const modality of ['stt', 'tts']) {
+      const selection = normalizeVoiceRouteSelection(savedVoiceRoute?.[modality]);
+      route[modality].source =
+        selection.provider || selection.variant ? 'saved' : 'default';
+    }
+  }
+  return route;
+  /* === VIVENTIUM END === */
 }
 
 function normalizeSession(session) {
@@ -526,15 +543,22 @@ function normalizeAssistantRouteText(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
-function buildAssistantRouteAssignment(provider, model) {
+function buildAssistantRouteAssignment(provider, model, parameters) {
   const normalizedProvider = normalizeAssistantRouteText(provider);
   const normalizedModel = normalizeAssistantRouteText(model);
   if (!normalizedProvider || !normalizedModel) {
     return null;
   }
+  const effort = normalizeAssistantRouteText(
+    parameters?.reasoning_effort ||
+      parameters?.reasoning?.effort ||
+      parameters?.effort ||
+      parameters?.output_config?.effort,
+  );
   return {
     provider: normalizedProvider,
     model: normalizedModel,
+    ...(effort ? { effort } : {}),
   };
 }
 
@@ -561,12 +585,14 @@ async function resolveCallSessionAssistantRoute(
     return null;
   }
 
-  const runtimeAgent = rewriteAgentForRuntime(persistedAgent, {
-    capabilityRequiredProviders,
-  });
+  const runtimeAgent =
+    persistedAgent.provider && (persistedAgent.model || persistedAgent.model_parameters?.model)
+      ? persistedAgent
+      : rewriteAgentForRuntime(persistedAgent, { capabilityRequiredProviders });
   const primary = buildAssistantRouteAssignment(
     runtimeAgent?.provider,
     runtimeAgent?.model || runtimeAgent?.model_parameters?.model,
+    runtimeAgent?.model_parameters,
   );
   if (!primary) {
     return null;
@@ -576,15 +602,20 @@ async function resolveCallSessionAssistantRoute(
   const voiceCallLlm = buildAssistantRouteAssignment(
     voiceAssignment?.provider,
     voiceAssignment?.model,
+    voiceAssignment
+      ? resolveVoiceModelParameters(runtimeAgent, voiceAssignment.model, voiceAssignment.provider)
+      : undefined,
   );
   const fallbackLlm = buildAssistantRouteAssignment(
     runtimeAgent?.fallback_llm_provider,
     runtimeAgent?.fallback_llm_model || runtimeAgent?.fallback_llm_model_parameters?.model,
+    runtimeAgent?.fallback_llm_model_parameters,
   );
   const voiceFallbackLlm = buildAssistantRouteAssignment(
     runtimeAgent?.voice_fallback_llm_provider,
     runtimeAgent?.voice_fallback_llm_model ||
       runtimeAgent?.voice_fallback_llm_model_parameters?.model,
+    runtimeAgent?.voice_fallback_llm_model_parameters,
   );
 
   return {
@@ -605,6 +636,9 @@ async function resolveVoiceContextKeyterms({ userId, conversationId }) {
 
   try {
     const conversation = await getConvo(userId, normalizedConversationId, 'files');
+    if (!conversation) {
+      return [];
+    }
     const fileIds = Array.isArray(conversation?.files)
       ? conversation.files.filter((fileId) => typeof fileId === 'string' && fileId.trim())
       : [];
@@ -1841,6 +1875,7 @@ module.exports = {
   normalizeVoiceRouteState,
   resolveCallMode,
   resolveUserVoiceRoute,
+  resolveVoiceContextKeyterms,
   syncCallSessionState,
   updateCallSessionVoiceSettings,
   claimOrReplaceCallSessionConversationId,

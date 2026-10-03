@@ -1,10 +1,26 @@
 /* eslint-disable jest/no-export -- Shared contract helper excluded from test discovery. */
 import { GenerationJobManagerClass } from '../GenerationJobManager';
 import { InMemoryEventTransport } from '../implementations/InMemoryEventTransport';
+import {
+  buildTrustedSourceSelectionCapsule,
+  ownedInteractionSources,
+} from '../../agents/sourceSelectionContext';
 import type { NativeResponseIdentity } from '@librechat/data-schemas';
-import type { IJobStore, InteractionContext } from '../interfaces/IJobStore';
+import type { IJobStore, InteractionContext, LogicalTurnClaim } from '../interfaces/IJobStore';
 
 const scope = 'a'.repeat(64);
+/** The adapter capabilities the Telegram route binds to every input. */
+const telegramCapabilities = {
+  segment_stability: 'immediate',
+  supersede_scope: 'response_only',
+} as const;
+const decodedSources = (capsule: string) =>
+  JSON.parse(
+    Buffer.from(
+      capsule.split('\n').find((line) => /^[A-Za-z0-9_-]+$/.test(line)) ?? '',
+      'base64url',
+    ).toString('utf8'),
+  ).sources as { label: string }[];
 const context = (id: string, sequence?: number): InteractionContext => ({
   actor_kind: 'external_user',
   origin: 'interactive',
@@ -173,6 +189,217 @@ export function rapidInputContract(createStore: () => IJobStore) {
       'a',
       'b',
     ]);
+  });
+  /* VIVENTIUM: a deferred quoted input keeps its own quote inside a combined turn. */
+  test('a deferred quoted input keeps its own quote when an unquoted successor combines it', async () => {
+    const quote = {
+      version: 1 as const,
+      provenanceStatus: 'verified' as const,
+      senderRole: 'assistant_self' as const,
+      repliedTelegramMessageId: '14384',
+      quoteText: 'Willow is cheaper by $15.',
+      logicalMessageId: 'addition-message',
+    };
+    const a = context('a', 1),
+      b = context('b', 2);
+    a.source_segments = [
+      {
+        ...a.source_segments![0],
+        source_message_id: 'input-a',
+        source_persisted: true,
+        reply_context: quote,
+      },
+    ];
+    await store.retainLogicalTurnInput('owner', a);
+    await store.retainLogicalTurnInput('owner', b);
+    const combined = await store.claimLogicalTurn('b-stream', 'owner', b);
+    expect(combined.status).toBe('claimed');
+    expect(
+      combined.interactionContext.source_segments?.map((segment) => [
+        segment.source_event_id,
+        segment.reply_context ?? null,
+      ]),
+    ).toEqual([
+      ['a', quote],
+      ['b', null],
+    ]);
+  });
+  /* VIVENTIUM: a claim only reserves a revision; the admission commit fixes each source's author. */
+  const admitAndCommit = async (streamId: string, claim: LogicalTurnClaim) => {
+    await store.createJob(streamId, 'owner', 'conversation', {
+      interactionContext: claim.interactionContext,
+    });
+    await store.fenceSupersededLogicalTurnClaims?.(claim);
+    return store.commitLogicalTurnAdmission!(streamId, 'owner', claim.interactionContext);
+  };
+  const quoted = (id: string, sequence: number) => {
+    const input = context(id, sequence);
+    input.source_segments = [
+      {
+        ...input.source_segments![0],
+        source_message_id: `input-${id}`,
+        source_persisted: true,
+        reply_context: {
+          version: 1,
+          provenanceStatus: 'verified',
+          senderRole: 'assistant_self',
+          repliedTelegramMessageId: '14378',
+          quoteText: 'Willow 427 / Elm 441',
+          logicalMessageId: 'main-answer',
+        },
+      },
+    ];
+    return input;
+  };
+  const owned = (committed: InteractionContext) =>
+    ownedInteractionSources(committed, telegramCapabilities).map(({ sourceOrdinal, segment }) => [
+      sourceOrdinal,
+      segment.source_event_id,
+      segment.reply_context?.quoteText ?? null,
+    ]);
+  test('an additive combined turn owns the quoted input deferred to it', async () => {
+    const a = quoted('a', 1),
+      b = context('b', 2);
+    await store.retainLogicalTurnInput('owner', a);
+    await store.retainLogicalTurnInput('owner', b);
+    const combined = await store.claimLogicalTurn('b-stream', 'owner', b);
+    expect(combined.status).toBe('claimed');
+    const committed = await admitAndCommit('b-stream', combined);
+    expect(owned(committed)).toEqual([
+      [1, 'a', 'Willow 427 / Elm 441'],
+      [2, 'b', null],
+    ]);
+    const capsule = buildTrustedSourceSelectionCapsule(committed, telegramCapabilities);
+    expect(decodedSources(capsule).map((source) => source.label)).toEqual(['S1', 'S2']);
+    expect(capsule).not.toContain('owns only the current accepted input');
+  });
+  test('an additive combined turn leaves an input an admitted earlier revision authors to it', async () => {
+    const a = context('a', 1),
+      c = context('c', 2),
+      b = context('b', 3);
+    const first = await store.claimLogicalTurn('a-stream', 'owner', a);
+    await admitAndCommit('a-stream', first);
+    await store.retainLogicalTurnInput('owner', c);
+    const combined = await store.claimLogicalTurn('b-stream', 'owner', b);
+    expect(combined).toMatchObject({ status: 'claimed', supersededStreamIds: ['a-stream'] });
+    const committed = await admitAndCommit('b-stream', combined);
+    const { revision } = committed;
+    expect(revision).toBe(first.interactionContext.revision + 1);
+    expect(
+      committed.source_segments?.map((s) => [s.source_event_id, s.authoring_revision]),
+    ).toEqual([
+      ['a', revision - 1],
+      ['c', revision],
+      ['b', revision],
+    ]);
+    expect(owned(committed).map(([ordinal]) => ordinal)).toEqual([2, 3]);
+    const capsule = buildTrustedSourceSelectionCapsule(committed, telegramCapabilities);
+    expect(decodedSources(capsule).map((source) => source.label)).toEqual(['S2', 'S3']);
+    expect(capsule).toContain('Unlisted earlier inputs already have independent authoring owners');
+    expect(
+      ownedInteractionSources(committed, { supersede_scope: 'response_and_authoring' }).map(
+        ({ sourceOrdinal }) => sourceOrdinal,
+      ),
+    ).toEqual([1, 2, 3]);
+  });
+  test('a reservation that never admits leaves its input and quote to the admitted winner', async () => {
+    const reserved = await store.claimLogicalTurn('a-stream', 'owner', quoted('a', 1));
+    const winner = await store.claimLogicalTurn('b-stream', 'owner', context('b', 2));
+    expect(winner.supersededStreamIds).toEqual(['a-stream']);
+    // The newer claim alone decides nothing: its marks still name the reservation.
+    expect(winner.interactionContext.source_segments?.map((s) => s.authoring_revision)).toEqual([
+      reserved.interactionContext.revision,
+      winner.interactionContext.revision,
+    ]);
+    const committed = await admitAndCommit('b-stream', winner);
+    expect(owned(committed)).toEqual([
+      [1, 'a', 'Willow 427 / Elm 441'],
+      [2, 'b', null],
+    ]);
+    await expect(
+      store.createJob('a-stream', 'owner', 'conversation', {
+        interactionContext: reserved.interactionContext,
+      }),
+    ).rejects.toMatchObject({ code: 'stream_id_conflict' });
+    await expect(
+      store.commitLogicalTurnAdmission!('a-stream', 'owner', reserved.interactionContext),
+    ).rejects.toMatchObject({ code: 'stream_id_conflict' });
+    expect((await store.getJob('b-stream'))?.interactionContext).toEqual(committed);
+  });
+  test('an admitted revision that never commits is taken over by the winning commit', async () => {
+    const older = await store.claimLogicalTurn('a-stream', 'owner', quoted('a', 1));
+    const winner = await store.claimLogicalTurn('b-stream', 'owner', context('b', 2));
+    await store.createJob('a-stream', 'owner', 'conversation', {
+      interactionContext: older.interactionContext,
+    });
+    const committed = await admitAndCommit('b-stream', winner);
+    expect(owned(committed)).toEqual([
+      [1, 'a', 'Willow 427 / Elm 441'],
+      [2, 'b', null],
+    ]);
+    await expect(
+      store.commitLogicalTurnAdmission!('a-stream', 'owner', older.interactionContext),
+    ).rejects.toMatchObject({ code: 'stream_id_conflict' });
+  });
+  test('a winner whose turn another conversation retires still owns the reservation it fenced', async () => {
+    const reserved = await store.claimLogicalTurn('a-stream', 'owner', quoted('a', 1));
+    const winner = await store.claimLogicalTurn('b-stream', 'owner', context('b', 2));
+    await store.createJob('b-stream', 'owner', 'conversation', {
+      interactionContext: winner.interactionContext,
+    });
+    await store.fenceSupersededLogicalTurnClaims?.(winner);
+    const other = await store.claimLogicalTurn('c-stream', 'owner', {
+      ...context('c', 3),
+      conversation_id: 'other-conversation',
+    });
+    expect(other.interactionContext.logical_turn_id).not.toBe(
+      winner.interactionContext.logical_turn_id,
+    );
+    const committed = await store.commitLogicalTurnAdmission!(
+      'b-stream',
+      'owner',
+      winner.interactionContext,
+    );
+    expect(owned(committed)).toEqual([
+      [1, 'a', 'Willow 427 / Elm 441'],
+      [2, 'b', null],
+    ]);
+    expect(other.interactionContext.source_segments?.map((s) => s.source_event_id)).toEqual(['c']);
+    await expect(
+      store.createJob('a-stream', 'owner', 'conversation', {
+        interactionContext: reserved.interactionContext,
+      }),
+    ).rejects.toMatchObject({ code: 'stream_id_conflict' });
+  });
+  test('a relinquished author gives its input and quote to the next commit', async () => {
+    const older = await store.claimLogicalTurn('a-stream', 'owner', quoted('a', 1));
+    await admitAndCommit('a-stream', older);
+    const winner = await store.claimLogicalTurn('b-stream', 'owner', context('b', 2));
+    await store.relinquishLogicalTurnAuthor!('a-stream', 'owner', older.interactionContext);
+    const committed = await admitAndCommit('b-stream', winner);
+    expect(owned(committed)).toEqual([
+      [1, 'a', 'Willow 427 / Elm 441'],
+      [2, 'b', null],
+    ]);
+    await expect(
+      store.commitLogicalTurnAdmission!('a-stream', 'owner', older.interactionContext),
+    ).rejects.toMatchObject({ code: 'stream_id_conflict' });
+  });
+  test('an admission whose turn another conversation retired still commits on its own ledger', async () => {
+    const claimed = await store.claimLogicalTurn('a-stream', 'owner', quoted('a', 1));
+    await store.createJob('a-stream', 'owner', 'conversation', {
+      interactionContext: claimed.interactionContext,
+    });
+    const other = await store.claimLogicalTurn('s-stream', 'owner', {
+      ...context('s', 2),
+      conversation_id: 'other-conversation',
+    });
+    expect(other.interactionContext.logical_turn_id).not.toBe(
+      claimed.interactionContext.logical_turn_id,
+    );
+    await expect(
+      store.commitLogicalTurnAdmission!('a-stream', 'owner', claimed.interactionContext),
+    ).resolves.toEqual(claimed.interactionContext);
   });
   test('ordinary supersession inherits exact prior source and owned uploaded files once', async () => {
     const a = context('a'),

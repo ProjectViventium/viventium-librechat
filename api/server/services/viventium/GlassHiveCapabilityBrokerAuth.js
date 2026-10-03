@@ -174,7 +174,12 @@ function resourceRecordForGrant({ grantId, resources, expiresAt, nowMs = Date.no
   const serialized = stableJson(resources);
   const sizeBytes = Buffer.byteLength(serialized, 'utf8');
   if (sizeBytes > grantResourceMaxBytes()) {
-    throw new Error('GlassHive capability broker resource scope exceeds the configured limit');
+    const error = new Error(
+      'GlassHive capability broker resource scope exceeds the configured limit',
+    );
+    error.resourceBytes = sizeBytes;
+    error.resourceLimitBytes = grantResourceMaxBytes();
+    throw error;
   }
   return {
     grant_id: grantId,

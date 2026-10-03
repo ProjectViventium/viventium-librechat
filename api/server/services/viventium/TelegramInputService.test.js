@@ -72,6 +72,7 @@ test('coverage recovery binds the exact original owner, conversation, generation
         source_event_id: row.sourceEventId,
         source_message_id: row.sourceMessageId,
         source_sequence: 12,
+        owned: { $ne: false },
       },
     },
     $expr: {
@@ -93,6 +94,17 @@ test('coverage recovery binds the exact original owner, conversation, generation
   });
   mockMessage.exists.mockResolvedValueOnce(false);
   expect(await mockDependencies.hasCommittedDelivery(row)).toBe(false);
+});
+/* VIVENTIUM: only an input bound to its own started stream accepts another answer's coverage. */
+test('coverage by an answer that did not author the input settles only an admitted input', async () => {
+  mockMessage.exists.mockResolvedValue(true);
+  await mockDependencies.hasCommittedDelivery({ ...row, state: 'ready' });
+  await mockDependencies.hasCommittedDelivery({ ...row, state: 'admitted' });
+  const [ready, admitted] = mockMessage.exists.mock.calls.map(
+    ([filter]) => filter['metadata.viventium.deliverySourceCoverage.sources'].$elemMatch,
+  );
+  expect(ready).toMatchObject({ owned: { $ne: false } });
+  expect(admitted).not.toHaveProperty('owned');
 });
 beforeEach(() => {
   jest.clearAllMocks();
@@ -137,6 +149,31 @@ test('ready persistence uses owned attachments, the existing Message, and the na
     },
   });
 });
+/* VIVENTIUM: a ready input keeps its quoted document's text for an identity-only continuation. */
+test('a ready input keeps its quoted document text, which its envelope returns for continuation', async () => {
+  const quotedAttachmentTexts = [
+    { fileId: 'quoted-doc', extractedText: 'Willow 4.10 per booklet' },
+  ];
+  await mockDependencies.persistPrepared(row, { ...prepared, quotedAttachmentTexts });
+  expect(mockMessage.updateOne).toHaveBeenCalledWith(expect.anything(), {
+    $set: expect.objectContaining({
+      'metadata.viventium.telegramInput.state': 'ready',
+      'metadata.viventium.telegramInput.quotedAttachmentTexts': quotedAttachmentTexts,
+    }),
+  });
+  mockMessage.findOne.mockReturnValueOnce({
+    lean: async () => ({
+      text: prepared.text,
+      metadata: {
+        viventium: { telegramInput: { preparation: { message: {} }, quotedAttachmentTexts } },
+      },
+    }),
+  });
+  await expect(inputService.inputEnvelope(row)).resolves.toMatchObject({
+    preparation: { message: {} },
+    quotedAttachmentTexts,
+  });
+});
 test('missing attachments or a removed original Message cannot be accepted as ready', async () => {
   mockGetFiles.mockResolvedValueOnce([]);
   await expect(mockDependencies.persistPrepared(row, prepared)).rejects.toMatchObject({
@@ -169,6 +206,35 @@ test('stream binding requires original source ownership; completion requires the
   job.metadata.interactionContext.source_sequence = 13;
   expect(await mockDependencies.verifyStream(row, 'stream')).toBe(false);
   expect(await mockDependencies.readStream('stream', 'other')).toBe('missing');
+});
+test('an adapter failed acknowledgement ends its stream answer instead of waiting on the job', async () => {
+  mockGetJob.mockResolvedValue({
+    status: 'running',
+    metadata: { userId: 'owner', deliveryAcknowledgement: { state: 'failed' } },
+  });
+  expect(await mockDependencies.readStream('stream', 'owner')).toBe('failed');
+});
+test('a failed carrier is only a newer input of the same conversation that was admitted to a stream', async () => {
+  mockIngress.exists = jest.fn().mockResolvedValue(true);
+  const sibling = {
+    ...row,
+    telegramChatId: 'chat',
+    telegramMessageThreadId: 'thread',
+    conversationGeneration: 'generation',
+  };
+  expect(await inputService.hasNewerFailedAdmittedInput(sibling)).toBe(true);
+  expect(mockIngress.exists).toHaveBeenCalledWith({
+    libreChatUserId: 'owner',
+    telegramUserId: 'sender',
+    telegramChatId: 'chat',
+    telegramMessageThreadId: 'thread',
+    sourceOrderScope: row.sourceOrderScope,
+    conversationGeneration: 'generation',
+    conversationId: 'conversation',
+    sourceSequence: { $gt: 12 },
+    inputState: 'failed',
+    streamId: { $nin: ['', null] },
+  });
 });
 /* VIVENTIUM END */
 
@@ -245,6 +311,7 @@ test('committed coverage permits only the retained source original and canonical
           source_event_id: row.sourceEventId,
           source_message_id: row.sourceMessageId,
           source_sequence: 12,
+          owned: { $ne: false },
         },
       },
     }),
@@ -269,4 +336,18 @@ test('a ready input waiting for Main preserves its conversation after releasing 
       $or: [{ inputState: 'ready' }, { inputLeaseUntil: { $gt: expect.any(Number) } }],
     }),
   );
+});
+
+test('preparation group lookup binds owner, sender, chat, thread, source scope and exact conversation generation', async () => {
+  const group = { ...row, telegramChatId: 'chat', telegramMessageThreadId: 'thread',
+    conversationGeneration: 'generation', mediaGroupId: 'album' };
+  mockIngress.find.mockReturnValue({ sort: jest.fn().mockReturnValue({ lean: async () => [] }) });
+  expect(await mockDependencies.repository.group(group)).toEqual([]);
+  expect(mockIngress.find).toHaveBeenCalledWith({
+    libreChatUserId: 'owner', telegramUserId: 'sender', telegramChatId: 'chat',
+    telegramMessageThreadId: 'thread', sourceOrderScope: row.sourceOrderScope,
+    conversationGeneration: 'generation', conversationId: 'conversation', mediaGroupId: 'album',
+    inputState: { $in: ['preparing', 'failed'] },
+    $expr: { $eq: ['$inputPrimarySourceEventId', '$sourceEventId'] },
+  });
 });

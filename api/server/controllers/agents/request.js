@@ -30,6 +30,8 @@ const {
   sanitizeFileForTransmit,
   sanitizeMessageForTransmit,
   checkAndIncrementPendingRequest,
+  retainExternalAcceptanceFollowUps,
+  startAcceptedMainMemory,
 } = require('@librechat/api');
 const { disposeClient, clientRegistry, requestDataMap } = require('~/server/cleanup');
 const { handleAbortError } = require('~/server/middleware');
@@ -105,6 +107,7 @@ const {
 } = require('~/server/services/viventium/ViventiumMainCompactionService');
 const {
   attachEffectiveDeliveryDisposition,
+  isAudioDeliveryRequested,
 } = require('~/server/services/viventium/deliveryDisposition');
 const {
   isVoiceActorSideEffectRestricted,
@@ -160,6 +163,37 @@ function scheduleAcceptedMainCompaction(req, client, commitResult) {
   }
   return true;
 }
+
+/* === VIVENTIUM START ===
+ * The one external-acceptance callback owns both follow-ups. Capture the compaction agent and
+ * prepared writer before cleanup; registration must not replace one with a second callback.
+ */
+function retainAcceptedMainFollowUps(req, client, userId, responseMessageId) {
+  const compactionClient = { options: { agent: client?.options?.agent } };
+  const admitMemory = req._viventiumMemoryWriterAwaitingAcceptance === true
+    ? client.admitMemoryWriter?.bind(client) : null;
+  return retainExternalAcceptanceFollowUps({
+    userId,
+    responseMessageId,
+    scheduleCompaction: (commitResult) => scheduleAcceptedMainCompaction(req, compactionClient, commitResult),
+    admitMemory,
+    onMemoryError: (error) => {
+      logger.warn('[VIVENTIUM][memory] Accepted turn writer could not start', {
+        errorClass: String(error?.name || 'PersistenceError').slice(0, 80),
+      });
+    },
+  });
+}
+
+async function startPersistedMainMemory(req, client, awaitExternalAcceptance) {
+  return startAcceptedMainMemory({
+    awaitExternalAcceptance,
+    prepare: client.prepareDeferredMemoryWriter?.bind(client),
+    start: client.startDeferredMemoryWriter?.bind(client),
+    onPrepared: () => { req._viventiumMemoryWriterAwaitingAcceptance = true; },
+  });
+}
+/* === VIVENTIUM END === */
 
 async function commitAcceptedMainTurnAndScheduleCompaction({ presentation, req, client }) {
   try {
@@ -531,11 +565,7 @@ async function resolveRequestStreamId(req, userId, conversationId) {
 }
 
 async function resolveDeliveryDispositionRequirement(req, endpointOption) {
-  if (
-    req?._viventiumTelegram !== true ||
-    req?.body?.telegramAudioRequested !== true ||
-    !endpointOption?.agent
-  ) {
+  if (!isAudioDeliveryRequested(req) || !endpointOption?.agent) {
     return false;
   }
   const agent = await endpointOption.agent;
@@ -561,6 +591,23 @@ async function settleVoiceGenerationForRequest(req, outcome) {
     { userId: req.user?.id, callSessionId, streamId: req._resumableStreamId },
     outcome,
   );
+}
+
+function voiceGenerationOutcome(response) {
+  const terminalError = Array.isArray(response?.content)
+    ? response.content.find((part) => part?.type === ContentTypes.ERROR)
+    : null;
+  return {
+    resultMessageId: response?.messageId,
+    ...(terminalError
+      ? {
+          error: {
+            code: terminalError.error_class,
+            message: terminalError.error,
+          },
+        }
+      : {}),
+  };
 }
 
 async function isVoiceTaskOutputSuppressedDurably(req) {
@@ -940,13 +987,10 @@ function sanitizePersistedAssistantContent(req, content) {
  * Added: 2026-05-15
  */
 function normalizePersistedAssistantResponse(req, response) {
-  const telegramText =
-    req?._viventiumTelegram === true &&
-    req?.body?.viventiumSurface === 'telegram' &&
-    req?.body?.voiceMode !== true;
-  const withDisposition = telegramText
-    ? attachEffectiveDeliveryDisposition(req, response)
-    : response;
+  const withDisposition =
+    isAudioDeliveryRequested(req) && req?._viventiumNativeResponseCompleted !== true
+      ? attachEffectiveDeliveryDisposition(req, response)
+      : response;
   const persistedResponse = sanitizeVoiceAssistantMessageForPersistence(req, withDisposition);
   if (req?.body?.voiceMode === true) {
     return persistedResponse;
@@ -1007,6 +1051,18 @@ function hasCommittedExternalDelivery(job) {
     (job?.metadata ?? job)?.deliveryAcknowledgement?.state,
   );
 }
+
+/* === VIVENTIUM START ===
+ * Fix: a tracked start/checkpoint snapshot rejects only to the owner that awaits it. The
+ * bookkeeping chain must not create a second, unobserved rejection that terminates the process.
+ */
+function trackInFlightSnapshot(inFlight, createSnapshot) {
+  const snapshotPromise = Promise.resolve().then(createSnapshot);
+  inFlight.add(snapshotPromise);
+  snapshotPromise.finally(() => inFlight.delete(snapshotPromise)).catch(() => undefined);
+  return snapshotPromise;
+}
+/* === VIVENTIUM END === */
 
 function withCommittedDeliveryAudit(response, job) {
   if (!hasCommittedExternalDelivery(job)) return response;
@@ -1404,13 +1460,36 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     // Send JSON response IMMEDIATELY so client can connect to SSE stream
     // This is critical: tool loading (MCP OAuth) may emit events that the client needs to receive
     const voiceReadyJsonStart = voiceLatencyEnabled ? voiceLatencyNow() : 0;
-    res.json({
+    /* === VIVENTIUM START ===
+     * Fix: the adapter's durable input is bound to the stream that answers it before the client
+     * is told the generation started, so recovery follows that stream instead of re-driving it.
+     * This revision becomes its sources' author just before that binding, after every step that
+     * can fail; if the binding or the started receipt then fails, it gives the authorship back.
+     * === VIVENTIUM END === */
+    const authoredInteractionContext = await GenerationJobManager.commitLogicalTurnAuthor?.(
       streamId,
-      conversationId,
-      status: 'started',
-      logical_turn_id: claimedInteractionContext?.logical_turn_id,
-      revision: claimedInteractionContext?.revision,
-    });
+      userId,
+    );
+    if (authoredInteractionContext?.logical_turn_id) {
+      bindLogicalTurnContext(req, authoredInteractionContext);
+    }
+    try {
+      await req._viventiumBeforeGenerationReceipt?.({ streamId, conversationId });
+      res.json({
+        streamId,
+        conversationId,
+        status: 'started',
+        logical_turn_id: claimedInteractionContext?.logical_turn_id,
+        revision: claimedInteractionContext?.revision,
+        // VIVENTIUM: the started receipt carries the same typed delivery contract as a duplicate.
+        ...(req._viventiumDeliveryDispositionRequired === true
+          ? { deliveryDispositionRequired: true }
+          : {}),
+      });
+    } catch (error) {
+      await GenerationJobManager.relinquishLogicalTurnAuthor?.(streamId, userId);
+      throw error;
+    }
     if (voiceLatencyEnabled) {
       logVoiceLatencyStage(
         req,
@@ -1568,10 +1647,19 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
     if (job.abortController.signal.aborted) {
       completeInteractiveMainAdmission();
-      await settleVoiceGenerationForRequest(req, {
-        error: { code: 'generation_aborted', message: 'Request aborted during initialization' },
-      });
-      GenerationJobManager.completeJob(streamId, 'Request aborted during initialization');
+      /* === VIVENTIUM START ===
+       * Fix: exact source supersession is a benign generation settlement.
+       */
+      if (job.abortController.signal.reason === 'superseded') {
+        await settleVoiceGenerationForRequest(req, {});
+        GenerationJobManager.completeJob(streamId);
+      } else {
+        await settleVoiceGenerationForRequest(req, {
+          error: { code: 'generation_aborted', message: 'Request aborted during initialization' },
+        });
+        GenerationJobManager.completeJob(streamId, 'Request aborted during initialization');
+      }
+      /* === VIVENTIUM END === */
       await maybeDecrement();
       return;
     }
@@ -1891,20 +1979,24 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           delete userMessage.image_urls;
         }
 
-        // Check abort state BEFORE calling completeJob (which triggers abort signal for cleanup)
-        const wasAbortedBeforeComplete = job.abortController.signal.aborted;
+        // Save user message BEFORE sending final event to avoid race condition
+        // where client refetch happens before database is updated
+        await ensureUserSourceSegmentPersisted();
+
+        const preCommitJob = await GenerationJobManager.getJob(streamId);
+        /* === VIVENTIUM START ===
+         * Fix: durable supersession can precede the signal; neither timing starts normal writers.
+         */
+        const wasAbortedBeforeComplete =
+          job.abortController.signal.aborted ||
+          (preCommitJob?.status === 'superseded' && preCommitJob.createdAt === jobCreatedAt);
         const isNewConvo = !reqConversationId || reqConversationId === 'new';
         const shouldGenerateTitle =
           addTitle &&
           parentMessageId === Constants.NO_PARENT &&
           isNewConvo &&
           !wasAbortedBeforeComplete;
-
-        // Save user message BEFORE sending final event to avoid race condition
-        // where client refetch happens before database is updated
-        await ensureUserSourceSegmentPersisted();
-
-        const preCommitJob = await GenerationJobManager.getJob(streamId);
+        /* === VIVENTIUM END === */
         const durableWorkReceipt = getExactDurableEffectReceipt(
           preCommitJob,
           req,
@@ -1920,6 +2012,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         const requiresExternalDeliveryAcknowledgement =
           getTrustedDeliveryPolicy(req)?.commit_authority === 'external_adapter';
         const deliveryWasCommittedBeforePersistence = hasCommittedExternalDelivery(preCommitJob);
+        /* VIVENTIUM: the canonical save's suppression outcome also governs a native answer. */
+        let assistantPersistenceAdmissible = false;
         /* === VIVENTIUM START ===
          * Feature: Authoritative terminal assistant persistence.
          * Purpose: `savedMessageIds` means a row exists, not that its unfinished/commit state is
@@ -1950,8 +2044,22 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             { context: 'api/server/controllers/agents/request.js - resumable response end' },
             'db_save_response',
           );
-          if (assistantPersistence && !assistantPersistence.suppressed) {
-            const memoryWriterAdmission = await client.startDeferredMemoryWriter?.();
+          /* === VIVENTIUM START ===
+           * Fix: a native-bound answer is final only after its native publication materializes.
+           * Its saved-memory admission reads that completed answer, so it starts below instead.
+           */
+          assistantPersistenceAdmissible = Boolean(
+            assistantPersistence && !assistantPersistence.suppressed,
+          );
+          if (
+            assistantPersistenceAdmissible &&
+            !wasAbortedBeforeComplete &&
+            !req._viventiumNativeResponseIdentity
+          ) {
+            /* === VIVENTIUM END === */
+            const memoryWriterAdmission = await startPersistedMainMemory(
+              req, client, requiresExternalDeliveryAcknowledgement && !deliveryWasCommittedBeforePersistence,
+            );
             if (memoryWriterAdmission) {
               responseForCommit.memoryWriteStatus = 'pending';
             }
@@ -1974,7 +2082,18 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               req._viventiumNativeResponseIdentity,
             );
             if (!finished) throw new Error('native_response_terminal_pending');
-            await settleVoiceGenerationForRequest(req, { resultMessageId: saved.messageId });
+            const terminalError = saved.content?.find((part) => part?.type === ContentTypes.ERROR);
+            await settleVoiceGenerationForRequest(req, {
+              resultMessageId: saved.messageId,
+              ...(terminalError
+                ? {
+                    error: {
+                      code: terminalError.error_class,
+                      message: terminalError.error,
+                    },
+                  }
+                : {}),
+            });
             stopPartialCheckpointing();
             await maybeDecrement();
             if (client) disposeClient(client);
@@ -1986,6 +2105,11 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               ? normalizeDurableWorkReceiptResponse(response, durableWorkReceipt)
               : response;
             req._viventiumNativeResponseCompleted = true;
+            /* === VIVENTIUM START === The completed native answer is now the memory source. === */
+            if (assistantPersistenceAdmissible && (await client.startDeferredMemoryWriter?.())) {
+              responseForCommit.memoryWriteStatus = 'pending';
+            }
+            /* === VIVENTIUM END === */
           } else {
             const nativeRow = await require('~/models').getNativeResponse(userId, messageId);
             if (nativeRow?.nativeResponse?.status !== 'unsupported') {
@@ -2002,18 +2126,56 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                   code: completionError.error_class,
                 });
               }
+              /* === VIVENTIUM START ===
+               * Fix: a source change revoked this answer before it finished. No Stop snapshot or
+               * terminal owns it, so its stream ends with a typed failure instead of waiting.
+               */
+              const admission = nativeRow?.nativeResponse;
+              if (
+                admission?.status === 'cancelled' &&
+                !admission.stopSnapshotStoredAt &&
+                !admission.terminalSnapshotStoredAt &&
+                (await GenerationJobManager.failRevokedNativeResponse(
+                  req._viventiumNativeResponseIdentity,
+                  'native_response_revoked',
+                ))
+              ) {
+                throw Object.assign(new Error('native_response_revoked'), {
+                  code: 'native_response_revoked',
+                });
+              }
+              /* === VIVENTIUM END === */
               throw new Error('native_response_final_pending');
             }
-            await timedSaveMessage(
+            const unsupportedPersistence = await timedSaveMessage(
               req,
-              normalizePersistedAssistantResponse(req, {
-                ...responseForCommit,
-                user: userId,
-                unfinished: wasAbortedBeforeComplete || requiresExternalDeliveryAcknowledgement,
-              }),
+              withCommittedDeliveryAudit(
+                normalizePersistedAssistantResponse(req, {
+                  ...responseForCommit,
+                  user: userId,
+                  isCreatedByUser: false,
+                  unfinished:
+                    wasAbortedBeforeComplete ||
+                    (requiresExternalDeliveryAcknowledgement &&
+                      !deliveryWasCommittedBeforePersistence),
+                }),
+                preCommitJob,
+              ),
               { context: 'native graph continuation owned by the host' },
               'db_save_response',
             );
+            /* === VIVENTIUM START === An unsupported native route persists as ordinary Main. === */
+            if (
+              unsupportedPersistence &&
+              !unsupportedPersistence.suppressed &&
+              !wasAbortedBeforeComplete &&
+              (await startPersistedMainMemory(
+                req, client, requiresExternalDeliveryAcknowledgement && !deliveryWasCommittedBeforePersistence,
+              ))
+            ) {
+              responseForCommit.memoryWriteStatus = 'pending';
+            }
+            /* === VIVENTIUM END === */
           }
         }
 
@@ -2041,21 +2203,28 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             'db_reconcile_delivery_ack',
           );
         }
-        const exactDurableEffectReceipt = getExactDurableEffectReceipt(
-          currentJob,
-          req,
-          response?.messageId,
-        );
         const transmittableDurableEffectReceipt = getExactDurableEffectReceipt(
           currentJob,
           req,
           response?.messageId,
           { requireSuperseded: false },
         );
+        /* === VIVENTIUM START ===
+         * Fix: abort can precede the durable supersession status update. Keep exact committed
+         * effect receipts for the same generation while suppressing obsolete response prose.
+         */
+        const abortedBySupersession =
+          job.abortController.signal.reason === 'superseded' ||
+          (currentJob?.status === 'superseded' && currentJob.createdAt === jobCreatedAt);
+        const exactDurableEffectReceipt =
+          abortedBySupersession && currentJob?.createdAt === jobCreatedAt
+            ? transmittableDurableEffectReceipt
+            : getExactDurableEffectReceipt(currentJob, req, response?.messageId);
         const jobWasReplaced =
           !currentJob ||
           currentJob.createdAt !== jobCreatedAt ||
-          (currentJob.status === 'superseded' && !exactDurableEffectReceipt);
+          ((abortedBySupersession || currentJob.status === 'superseded') &&
+            !exactDurableEffectReceipt);
 
         if (jobWasReplaced) {
           stopPartialCheckpointing();
@@ -2065,14 +2234,17 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             currentCreatedAt: currentJob?.createdAt,
           });
           // Still decrement pending request since we incremented at start
-          if (currentJob?.status === 'superseded' && !exactDurableEffectReceipt) {
+          if (
+            (abortedBySupersession || currentJob?.status === 'superseded') &&
+            !exactDurableEffectReceipt
+          ) {
             await removeSupersededAssistantMessage(req, {
               messageId,
               conversationId,
               isCreatedByUser: false,
             });
             if (
-              currentJob.createdAt === jobCreatedAt &&
+              currentJob?.createdAt === jobCreatedAt &&
               (currentJob.metadata ?? currentJob).adapterCapabilities?.supersede_scope ===
                 'response_only'
             ) {
@@ -2083,8 +2255,15 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           await maybeDecrement();
           return;
         }
+        /* === VIVENTIUM END === */
 
-        if (!wasAbortedBeforeComplete && !(await isVoiceTaskOutputSuppressedDurably(req))) {
+        /* === VIVENTIUM START === Keep a durably superseded receipt out of normal completion. */
+        if (
+          !wasAbortedBeforeComplete &&
+          !abortedBySupersession &&
+          !(await isVoiceTaskOutputSuppressedDurably(req))
+        ) {
+          /* === VIVENTIUM END === */
           if (!client.startDeferredMemoryWriter) {
             await client.admitMemoryWriter?.();
           }
@@ -2126,7 +2305,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             title: conversation.title,
             requestMessage: sanitizeMessageForTransmit(userMessage),
             responseMessage: responseMessageForTransmit,
-            memoryWriterScheduled: req._viventiumMemoryWriterScheduled === true,
+            memoryWriterScheduled: req._viventiumMemoryWriterScheduled === true ||
+              req._viventiumMemoryWriterAwaitingAcceptance === true,
             ...(admissionReceipt
               ? { memoryReceipt: memoryReceiptFromAttachments([admissionReceipt]) }
               : {}),
@@ -2147,6 +2327,13 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             conversationId: conversation?.conversationId,
           });
 
+          /* === VIVENTIUM START ===
+           * Fix: an external adapter accepts this turn later, through its authenticated delivery
+           * acknowledgement. Register this turn's compaction schedule before FINAL reaches it.
+           * === VIVENTIUM END === */
+          if (getTrustedDeliveryPolicy(req)?.commit_authority === 'external_adapter') {
+            retainAcceptedMainFollowUps(req, client, userId, response?.messageId);
+          }
           /* Main is complete even while Phase B continues. Mark the job non-active immediately so
            * reload/resume cannot present a destructive Stop action against a persisted final answer.
            * The existing Phase B poller remains the durable out-of-band delivery path. */
@@ -2220,7 +2407,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               );
             if (!replayStored) throw new Error('native_response_replay_pending');
           }
-          await settleVoiceGenerationForRequest(req, { resultMessageId: response.messageId });
+          await settleVoiceGenerationForRequest(req, voiceGenerationOutcome(responseForCommit));
           await maybeDecrement();
 
           /* === VIVENTIUM START ===
@@ -2349,10 +2536,19 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
           await GenerationJobManager.emitDone(streamId, finalEvent);
           stopPartialCheckpointing();
-          await settleVoiceGenerationForRequest(req, {
-            error: { code: 'generation_aborted', message: 'Request aborted' },
-          });
-          GenerationJobManager.completeJob(streamId, 'Request aborted');
+          /* === VIVENTIUM START ===
+           * Fix: a retained exact effect receipt does not turn source supersession into failure.
+           */
+          if (abortedBySupersession) {
+            await settleVoiceGenerationForRequest(req, {});
+            GenerationJobManager.completeJob(streamId);
+          } else {
+            await settleVoiceGenerationForRequest(req, {
+              error: { code: 'generation_aborted', message: 'Request aborted' },
+            });
+            GenerationJobManager.completeJob(streamId, 'Request aborted');
+          }
+          /* === VIVENTIUM END === */
           await maybeDecrement();
         } else {
           stopPartialCheckpointing();
@@ -2364,7 +2560,13 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           await maybeDecrement();
         }
 
-        if (shouldGenerateTitle && !(await isVoiceTaskOutputSuppressedDurably(req))) {
+        /* === VIVENTIUM START === Superseded completion does not start title generation. */
+        if (
+          shouldGenerateTitle &&
+          !abortedBySupersession &&
+          !(await isVoiceTaskOutputSuppressedDurably(req))
+        ) {
+          /* === VIVENTIUM END === */
           addTitle(req, {
             text,
             response: { ...response },
@@ -2386,19 +2588,32 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       } catch (error) {
         completeInteractiveMainAdmission();
         stopPartialCheckpointing();
-        await settleVoiceGenerationForRequest(req, { error });
         // Check if this was an abort (not a real error)
         const wasAborted = job.abortController.signal.aborted || error.message?.includes('abort');
+        /* === VIVENTIUM START ===
+         * Fix: a revision replaced by newer input is finished as superseded, never persisted as a
+         * failed answer, even when its obsolete operation ended with an error instead of an abort.
+         */
+        const durableJob = await Promise.resolve()
+          .then(() => GenerationJobManager.getJob(streamId))
+          .catch(() => null);
+        const wasSuperseded =
+          job.abortController.signal.reason === 'superseded' ||
+          (durableJob?.status === 'superseded' && durableJob.createdAt === jobCreatedAt);
+        await settleVoiceGenerationForRequest(req, wasSuperseded ? {} : { error });
+        /* === VIVENTIUM END === */
 
-        if (wasAborted) {
+        if (wasAborted || wasSuperseded) {
           logger.debug(`[ResumableAgentController] Generation aborted for ${streamId}`);
-          if (job.abortController.signal.reason === 'superseded') {
+          if (wasSuperseded) {
             await ensureUserSourceSegmentPersisted();
             await removeSupersededAssistantMessage(req, {
               messageId: responseMessageId,
               conversationId,
               isCreatedByUser: false,
             });
+            // A response-only presentation closes with its accepted receipt or superseded final.
+            await GenerationJobManager.completeJob(streamId);
           }
           // abortJob already handled emitDone and completeJob
         } else {
@@ -2441,8 +2656,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               snapshotError,
             );
           }
-          await GenerationJobManager.emitError(streamId, error.message || 'Generation failed');
-          GenerationJobManager.completeJob(streamId, error.message);
+          // Use the same public typed failure as FINAL; raw internal diagnostics stay in logs.
+          const failure = require('./client').createCompletionErrorContentPart(error);
+          await GenerationJobManager.emitError(streamId, failure.error, failure.error_class);
+          GenerationJobManager.completeJob(streamId, failure.error);
         }
 
         await maybeDecrement();
@@ -2494,7 +2711,14 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     });
   } catch (error) {
     completeInteractiveMainAdmission();
-    await settleVoiceGenerationForRequest(req, { error });
+    /* === VIVENTIUM START ===
+     * Fix: typed source-order admission supersession uses the existing benign task outcome.
+     */
+    await settleVoiceGenerationForRequest(
+      req,
+      error?.code === 'source_order_superseded' ? {} : { error },
+    );
+    /* === VIVENTIUM END === */
     if (
       ['source_input_persistence_pending', 'source_input_capacity'].includes(error?.code) &&
       !res.headersSent
@@ -2589,13 +2813,14 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         logger.error('[ResumableAgentController] Initialization cause stack:', error.cause.stack);
       }
     }
+    const failure = require('./client').createCompletionErrorContentPart(error);
     if (!res.headersSent) {
-      res.status(500).json({ error: error.message || 'Failed to start generation' });
+      res.status(500).json({ error: failure.error, error_class: failure.error_class });
     } else {
-      // JSON already sent, emit error to stream so client can receive it
-      await GenerationJobManager.emitError(streamId, error.message || 'Failed to start generation');
+      // JSON already sent, emit the same public typed failure to the stream.
+      await GenerationJobManager.emitError(streamId, failure.error, failure.error_class);
     }
-    GenerationJobManager.completeJob(streamId, error.message);
+    GenerationJobManager.completeJob(streamId, failure.error);
     await maybeDecrement();
     if (client) {
       disposeClient(client);
@@ -2915,7 +3140,9 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
           'db_save_response',
         );
         if (assistantPersistence && !assistantPersistence.suppressed) {
-          const memoryWriterAdmission = client.startDeferredMemoryWriter?.();
+          const memoryWriterAdmission = await startPersistedMainMemory(
+            req, client, requiresExternalDeliveryAcknowledgement,
+          );
           if (memoryWriterAdmission) {
             finalResponse.memoryWriteStatus = 'pending';
           }
@@ -2923,12 +3150,17 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
       }
       /* === VIVENTIUM END === */
 
+      if (requiresExternalDeliveryAcknowledgement) {
+        retainAcceptedMainFollowUps(req, client, userId, response?.messageId);
+      }
       sendEvent(res, {
         final: true,
         conversation,
         title: conversation.title,
         requestMessage: sanitizeMessageForTransmit(userMessage),
         responseMessage: finalResponse,
+        memoryWriterScheduled: req._viventiumMemoryWriterScheduled === true ||
+          req._viventiumMemoryWriterAwaitingAcceptance === true,
       });
       res.end();
       if (!requiresExternalDeliveryAcknowledgement) {
@@ -3023,22 +3255,16 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
   }
 };
 
-/* === VIVENTIUM START ===
- * Preserve the snapshot failure for its caller without rejecting the cleanup chain.
- */
-function trackInFlightSnapshot(inFlight, createSnapshot) {
-  const snapshotPromise = Promise.resolve().then(createSnapshot);
-  inFlight.add(snapshotPromise);
-  snapshotPromise.finally(() => inFlight.delete(snapshotPromise)).catch(() => undefined);
-  return snapshotPromise;
-}
-/* === VIVENTIUM END === */
-
 module.exports = AgentController;
 module.exports.ResumableAgentController = ResumableAgentController;
 module.exports.captureAcceptedInteractionInput = captureAcceptedInteractionInput;
 module.exports.retainAcceptedInteractionInput = retainAcceptedInteractionInput;
+module.exports.acceptedInteractionSourceId = acceptedInteractionSourceId;
+module.exports.resolveCanonicalConversationId = resolveCanonicalConversationId;
 module.exports.__testables = {
+  voiceGenerationOutcome,
+  retainAcceptedMainFollowUps,
+  startPersistedMainMemory,
   LegacyAgentController: _LegacyAgentController,
   extractTextFromContentParts,
   sanitizePersistedAssistantContent,

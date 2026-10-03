@@ -21,6 +21,7 @@ import {
 } from './modelSelection';
 import ModelParametersSection from './ModelParametersSection';
 import CapabilityProviderOptions from './CapabilityProviderOptions';
+import AgentModelPicker from './AgentModelPicker';
 
 type OptionalLlmFieldNames = {
   provider: 'voice_llm_provider' | 'fallback_llm_provider' | 'voice_fallback_llm_provider';
@@ -195,7 +196,8 @@ export default function OptionalLlmPanel({
             control={control}
             render={({ field }) => {
               return (
-                <ControlCombobox
+                <AgentModelPicker
+                  modelCapabilities={providerCapability?.models}
                   selectedValue={field.value || ''}
                   displayValue={resolveAgentModelDisplayLabel({
                     provider,

@@ -121,7 +121,13 @@ describe('VoiceCortexInsightsService', () => {
           },
         ],
         followUp: null,
+        presentationRequired: false,
         followUpDecision: null,
+        presentationContext: {
+          callSessionId: undefined,
+          taskId: undefined,
+          turnId: undefined,
+        },
       });
     });
   });

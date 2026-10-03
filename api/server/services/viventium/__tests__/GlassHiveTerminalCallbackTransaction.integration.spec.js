@@ -1747,7 +1747,10 @@ describe('GlassHive terminal callback all-destination transaction fence', () => 
     expect(getVoiceTask(task.taskId)).toMatchObject({ state: 'failed', retryable: true });
     expect(published).toHaveLength(1);
     expect(published[0]).toMatchObject({
-      error: expect.objectContaining({ code: 'failure-B', message: 'Synthetic failure B.' }),
+      error: expect.objectContaining({
+        code: 'generation_failed',
+        message: 'The task failed. Please try again.',
+      }),
     });
     await expect(ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean()).resolves.toMatchObject(
       {
@@ -1755,7 +1758,10 @@ describe('GlassHive terminal callback all-destination transaction fence', () => 
           state: 'failed',
           retryable: true,
           current: expect.objectContaining({
-            error: expect.objectContaining({ code: 'failure-B', message: 'Synthetic failure B.' }),
+            error: expect.objectContaining({
+              code: 'generation_failed',
+              message: 'The task failed. Please try again.',
+            }),
           }),
         }),
       },

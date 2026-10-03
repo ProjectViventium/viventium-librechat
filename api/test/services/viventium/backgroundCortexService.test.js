@@ -131,7 +131,11 @@ jest.mock('~/server/controllers/ModelController', () => ({
 }));
 
 jest.mock('~/server/services/viventium/GlassHiveConversationProviderService', () => {
+  const actual = jest.requireActual(
+    '~/server/services/viventium/GlassHiveConversationProviderService',
+  );
   return {
+    CORTEX_ATTEMPT_DEADLINE_REASON: actual.CORTEX_ATTEMPT_DEADLINE_REASON,
     attachConversationProviderCapabilityBundle: jest.fn(async () => true),
     // The real cancellation and release delivery: exact keys, owner and capacity-release answer.
     bindHarnessCancellation: jest.fn((args) =>
@@ -447,7 +451,12 @@ describe('BackgroundCortexService GlassHive request identity', () => {
     };
 
     await prepareCortexConversationProviderCapability({
-      targetAgent: { model_parameters: { configuration: endpointConfig } },
+      targetAgent: {
+        model_parameters: {
+          apiKey: endpointConfig.apiKey,
+          configuration: { baseURL: endpointConfig.baseURL },
+        },
+      },
       declaredAgent: { provider: 'glasshive-harness' },
       req,
       capability: { workspace_binding: true, cortex_execution: true },
@@ -487,9 +496,9 @@ describe('BackgroundCortexService GlassHive request identity', () => {
       await prepareCortexConversationProviderCapability({
         targetAgent: {
           model_parameters: {
+            apiKey: 'synthetic-key',
             configuration: {
               baseURL: 'http://glasshive.local/v1',
-              apiKey: 'synthetic-key',
             },
           },
         },
@@ -1978,9 +1987,9 @@ describe('BackgroundCortexService.executeCortex', () => {
       userMCPAuthMap: null,
       model_parameters: {
         model: 'synthetic-model',
+        apiKey: 'synthetic-key',
         configuration: {
           baseURL: 'http://glasshive.local/v1',
-          apiKey: 'synthetic-key',
         },
       },
     };
@@ -2095,7 +2104,8 @@ describe('BackgroundCortexService.executeCortex', () => {
       userMCPAuthMap: null,
       model_parameters: {
         model: 'synthetic-model',
-        configuration: { baseURL: 'http://glasshive.local/v1', apiKey: 'synthetic-key' },
+        apiKey: 'synthetic-key',
+        configuration: { baseURL: 'http://glasshive.local/v1' },
       },
     });
     const fallbackAgent = () => ({

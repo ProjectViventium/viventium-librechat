@@ -488,8 +488,9 @@ describe('importChatGptConvo', () => {
 
     // Test missing model slug (should default to openAISettings.model.default)
     const noModel = savedMessages.find((msg) => msg.text === 'No model slug response');
-    // When no model slug is provided, it defaults to gpt-4o-mini which gets formatted to GPT-4o-mini
-    expect(noModel.sender).toBe('GPT-4o-mini');
+    // VIVENTIUM START — Missing model metadata uses the shipped current default.
+    expect(noModel.sender).toBe('GPT-6.1-sol');
+    // VIVENTIUM END
     expect(noModel.model).toBe(openAISettings.model.default);
 
     // Verify user message is unaffected

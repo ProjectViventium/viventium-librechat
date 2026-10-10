@@ -179,7 +179,7 @@ function classifyVoiceMemoryEvidence(message) {
   };
 }
 
-function durableVoiceMemoryFinalization(message) {
+function voiceMemoryFinalization(message, state = 'finalized') {
   const metadata = message?.metadata?.viventium;
   const finalization = metadata?.memoryFinalization;
   const callSessionId =
@@ -187,7 +187,7 @@ function durableVoiceMemoryFinalization(message) {
   if (
     !callSessionId ||
     Number(finalization?.version) !== 3 ||
-    finalization?.state !== 'finalized' ||
+    finalization?.state !== state ||
     finalization?.callSessionId !== callSessionId ||
     !['owner_call', 'soft_voice'].includes(finalization?.classification) ||
     !Number.isSafeInteger(finalization?.evidenceEpoch) ||
@@ -4339,11 +4339,19 @@ async function selectUsers(db, options) {
   return users.filter((user) => user?.personalization?.memories !== false);
 }
 
-async function fetchRecentMemoryMessages({ db, userId, since, persistFinalizationMarkers = true }) {
+async function fetchRecentMemoryMessages({
+  db,
+  userId,
+  since,
+  persistFinalizationMarkers = true,
+  messageIds,
+  expectedVoiceEvidenceProofs,
+}) {
   let messages = await db
     .collection('messages')
     .find({
       user: userId,
+      ...(messageIds ? { messageId: { $in: messageIds } } : {}),
       createdAt: { $gte: since },
       'metadata.viventium.memoryEligible': { $ne: false },
       'metadata.viventium.qaRun': { $ne: true },
@@ -4437,6 +4445,7 @@ async function fetchRecentMemoryMessages({ db, userId, since, persistFinalizatio
         .project({
           _id: 0,
           callSessionId: 1,
+          userId: 1,
           callStatus: 1,
           expiresAt: 1,
           speakerSessionRevision: 1,
@@ -4461,7 +4470,7 @@ async function fetchRecentMemoryMessages({ db, userId, since, persistFinalizatio
       const sessionsById = new Map(sessions.map((session) => [session.callSessionId, session]));
       terminalSessionsById = new Map(
         sessions
-          .filter((session) => session?.callStatus === 'ended')
+          .filter((session) => session?.callStatus === 'ended' && session.userId === String(userId))
           .map((session) => [session.callSessionId, session]),
       );
       messages = messages.filter((message) => {
@@ -4469,7 +4478,9 @@ async function fetchRecentMemoryMessages({ db, userId, since, persistFinalizatio
         return (
           !callSessionId ||
           terminalSessionsById.has(callSessionId) ||
-          Boolean(durableVoiceMemoryFinalization(message))
+          ((!sessionsById.has(callSessionId) ||
+            sessionsById.get(callSessionId)?.userId === String(userId)) &&
+            Boolean(voiceMemoryFinalization(message)))
         );
       });
       messages = messages.map((message) => {
@@ -4517,14 +4528,11 @@ async function fetchRecentMemoryMessages({ db, userId, since, persistFinalizatio
       .map((segment) => ({ callSessionId, segmentId: segment.segmentId }));
   });
   const persistFinalizations = async (reconciledMessages) => {
-    if (!persistFinalizationMarkers) {
-      return reconciledMessages;
-    }
     const pending = reconciledMessages.filter((message) =>
       terminalSessionsById.has(message?.metadata?.viventium?.callSessionId),
     );
     if (pending.length === 0) {
-      return reconciledMessages;
+      return expectedVoiceEvidenceProofs ? [] : reconciledMessages;
     }
     const finalizedAt = new Date().toISOString();
     const finalized = pending.map((message) => {
@@ -4536,7 +4544,7 @@ async function fetchRecentMemoryMessages({ db, userId, since, persistFinalizatio
       const classification = classifyVoiceMemoryEvidence(message).kind;
       const memoryFinalization = {
         version: 3,
-        state: 'finalized',
+        state: persistFinalizationMarkers ? 'finalized' : 'proposed',
         callSessionId,
         classification,
         evidenceEpoch,
@@ -4556,6 +4564,27 @@ async function fetchRecentMemoryMessages({ db, userId, since, persistFinalizatio
         preimage: voiceEvidencePreimageByMessageId.get(message.messageId) || {},
       };
     });
+    if (expectedVoiceEvidenceProofs) {
+      const current = new Map(finalized.map((entry) => [entry.message.messageId, entry]));
+      const matches = expectedVoiceEvidenceProofs.every((proof) => {
+        const finalization = current.get(proof.messageId)?.memoryFinalization;
+        return (
+          finalization?.callSessionId === proof.callSessionId &&
+          finalization?.classification === proof.classification &&
+          finalization?.evidenceEpoch === proof.evidenceEpoch &&
+          finalization?.evidenceHash === proof.evidenceHash
+        );
+      });
+      if (!matches) return [];
+    }
+    if (!persistFinalizationMarkers) {
+      const proposedByMessageId = new Map(
+        finalized.map((entry) => [entry.message.messageId, entry.message]),
+      );
+      return reconciledMessages.map(
+        (message) => proposedByMessageId.get(message.messageId) || message,
+      );
+    }
     const finalizedByMessageId = new Map();
     const groups = new Map();
     for (const entry of finalized) {
@@ -4640,6 +4669,7 @@ async function fetchRecentMemoryMessages({ db, userId, since, persistFinalizatio
       try {
         const leaseWrite = await db.collection('viventiumcallsessions').updateOne(
           {
+            userId,
             callSessionId,
             callStatus: 'ended',
             ...epochFilter,
@@ -4697,6 +4727,7 @@ async function fetchRecentMemoryMessages({ db, userId, since, persistFinalizatio
         }
         const sessionWrite = await db.collection('viventiumcallsessions').updateOne(
           {
+            userId,
             callSessionId,
             callStatus: 'ended',
             memoryFinalizationLeaseId: leaseId,
@@ -4759,7 +4790,7 @@ async function fetchRecentMemoryMessages({ db, userId, since, persistFinalizatio
       } finally {
         try {
           await db.collection('viventiumcallsessions').updateOne(
-            { callSessionId, memoryFinalizationLeaseId: leaseId },
+            { userId, callSessionId, memoryFinalizationLeaseId: leaseId },
             {
               $unset: {
                 memoryFinalizationLeaseId: '',
@@ -5414,9 +5445,12 @@ async function buildUserProposal({ db, methods, user, options, memoryConfig, now
         const message = promptSelection.messages.find(
           (candidate) => String(candidate.messageId || '') === item.messageId,
         );
-        const finalization = durableVoiceMemoryFinalization(message);
+        const finalization =
+          voiceMemoryFinalization(message) ||
+          (options.mode === 'dry-run' ? voiceMemoryFinalization(message, 'proposed') : null);
         if (!finalization) return null;
         return {
+          ...(finalization.state === 'proposed' ? { state: 'proposed' } : {}),
           messageId: item.messageId,
           callSessionId: finalization.callSessionId,
           classification: finalization.classification,
@@ -5565,6 +5599,7 @@ async function acquireVoiceEvidenceApplyLease({ db, userId, proofs }) {
             : { speakerEvidenceEpoch: evidenceEpoch };
         return db.collection('viventiumcallsessions').updateOne(
           {
+            userId,
             callSessionId,
             callStatus: 'ended',
             memoryFinalizedEvidenceEpoch: evidenceEpoch,
@@ -5603,7 +5638,7 @@ async function acquireVoiceEvidenceApplyLease({ db, userId, proofs }) {
     await Promise.allSettled(
       leases.map(({ callSessionId, leaseId }) =>
         db.collection('viventiumcallsessions').updateOne(
-          { callSessionId, memoryFinalizationLeaseId: leaseId },
+          { userId, callSessionId, memoryFinalizationLeaseId: leaseId },
           {
             $unset: {
               memoryFinalizationLeaseId: '',
@@ -5634,6 +5669,7 @@ async function acquireVoiceEvidenceApplyLease({ db, userId, proofs }) {
       const now = new Date();
       const leaseWrite = await db.collection('viventiumcallsessions').updateOne(
         {
+          userId,
           callSessionId,
           callStatus: 'ended',
           memoryFinalizedEvidenceEpoch: evidenceEpoch,
@@ -5684,7 +5720,7 @@ async function acquireVoiceEvidenceApplyLease({ db, userId, proofs }) {
     const rowsByMessageId = new Map(rows.map((row) => [String(row.messageId || ''), row]));
     const current = proofs.every((proof) => {
       const row = rowsByMessageId.get(proof.messageId);
-      const finalization = durableVoiceMemoryFinalization(row);
+      const finalization = voiceMemoryFinalization(row);
       return (
         finalization?.callSessionId === proof.callSessionId &&
         finalization?.classification === proof.classification &&
@@ -5806,10 +5842,73 @@ async function applyUserProposal({ db, methods, userProposal, user, memoryConfig
       conflicts.push({ key: operation.key, action: operation.action, reason: 'revision_missing' });
       continue;
     }
+    const proofs = operation.voiceEvidenceProofs || [];
+    const conversationIds = (operation.evidence || [])
+      .filter((item) => item.source === 'conversation')
+      .map((item) => item.messageId);
+    if (conversationIds.length > 0) {
+      if (!db) {
+        conflicts.push({
+          key: operation.key,
+          action: operation.action,
+          reason: 'voice_evidence_store_unavailable',
+        });
+        continue;
+      }
+      const citedRows = await db
+        .collection('messages')
+        .find({
+          user: userId,
+          messageId: { $in: conversationIds },
+        })
+        .project({ _id: 0, messageId: 1, isCreatedByUser: 1, metadata: 1 })
+        .toArray();
+      if (citedRows.length !== new Set(conversationIds).size) {
+        conflicts.push({
+          key: operation.key,
+          action: operation.action,
+          reason: 'voice_evidence_stale',
+        });
+        continue;
+      }
+      const proofMessageIds = new Set(proofs.map((proof) => proof?.messageId));
+      if (
+        citedRows.some(
+          (row) =>
+            (row.metadata?.viventium?.callSessionId ||
+              classifyVoiceMemoryEvidence(row).kind !== 'ordinary') &&
+            !proofMessageIds.has(row.messageId),
+        )
+      ) {
+        conflicts.push({
+          key: operation.key,
+          action: operation.action,
+          reason: 'voice_evidence_proof_invalid',
+        });
+        continue;
+      }
+    }
+    if (proofs.some((proof) => proof?.state === 'proposed')) {
+      const finalizedMessages = await fetchRecentMemoryMessages({
+        db,
+        userId,
+        since: new Date(0),
+        messageIds: proofs.map((proof) => proof.messageId),
+        expectedVoiceEvidenceProofs: proofs,
+      });
+      if (finalizedMessages.length !== new Set(proofs.map((proof) => proof.messageId)).size) {
+        conflicts.push({
+          key: operation.key,
+          action: operation.action,
+          reason: 'voice_evidence_stale',
+        });
+        continue;
+      }
+    }
     const voiceEvidenceLease = await acquireVoiceEvidenceApplyLease({
       db,
       userId,
-      proofs: operation.voiceEvidenceProofs,
+      proofs,
     });
     if (!voiceEvidenceLease.ok) {
       conflicts.push({

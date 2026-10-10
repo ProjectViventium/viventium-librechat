@@ -1,6 +1,7 @@
 /* eslint-disable jest/no-export -- Shared contract helper excluded from test discovery. */
 import { GenerationJobManagerClass } from '../GenerationJobManager';
 import { InMemoryEventTransport } from '../implementations/InMemoryEventTransport';
+import { prepareNativeSourceRecovery } from '../../glasshive/nativeSupersession';
 import {
   buildTrustedSourceSelectionCapsule,
   ownedInteractionSources,
@@ -425,6 +426,156 @@ export function rapidInputContract(createStore: () => IJobStore) {
       'b',
     ]);
   });
+  /* === VIVENTIUM START ===
+   * Feature: Exact cancelled Main source-author reconciliation.
+   * Purpose: A revoked Main cannot keep unresolved input, while other owners and committed work
+   * retain their author claims. The same contract runs against memory and owned Redis storage.
+   */
+  test('a superseded running Main returns both exact pending sources to its successor', async () => {
+    const manager = new GenerationJobManagerClass({
+      jobStore: store,
+      eventTransport: new InMemoryEventTransport(),
+      cleanupOnComplete: false,
+    });
+    await manager.initialize();
+    try {
+      const first = await manager.createJob('a-stream', 'owner', 'conversation', {
+        interactionContext: quoted('a', 1),
+        adapterCapabilities: telegramCapabilities,
+      });
+      const authored = await manager.commitLogicalTurnAuthor('a-stream', 'owner');
+      expect(owned(authored!)).toEqual([[1, 'a', 'Willow 427 / Elm 441']]);
+      const next = await manager.createJob('b-stream', 'owner', 'conversation', {
+        interactionContext: context('b', 2),
+        adapterCapabilities: telegramCapabilities,
+      });
+      expect(first.abortController.signal.aborted).toBe(true);
+      expect(first.abortController.signal.reason).toBe('superseded');
+      expect(next.abortController.signal.aborted).toBe(false);
+      const facts = { effects: [], work: [] };
+      const relinquish = jest.spyOn(store, 'relinquishLogicalTurnAuthor');
+      const readFacts = jest.fn(async () => {
+        expect(relinquish).not.toHaveBeenCalled();
+        return { facts, pending: false };
+      });
+      // The runtime installs this release/fresh-facts barrier before authoring starts.
+      manager.setNativeSourceRecovery((current, previous) =>
+        prepareNativeSourceRecovery(current, previous, {
+          beforeCapture: async () => Date.now() + 1000,
+          getJob: (id) => store.getJob(id),
+          isUnboundCancelled: (job) => store.isNativeResponseUnboundCancelled!(job),
+          readFacts,
+          sleep: async () => {
+            throw new Error('Unexpected pending recovery');
+          },
+        }),
+      );
+      const committed = await manager.commitLogicalTurnAuthor('b-stream', 'owner');
+      expect(readFacts).toHaveBeenCalledTimes(1);
+      expect(readFacts).toHaveBeenCalledWith({
+        ownerId: 'owner',
+        conversationId: 'conversation',
+        logicalTurnId: committed!.logical_turn_id,
+        sourceEventIds: ['a', 'b'],
+      });
+      expect(committed!.source_recovery_facts).toEqual(facts);
+      expect(relinquish).toHaveBeenCalledTimes(1);
+      expect(owned(committed!)).toEqual([
+        [1, 'a', 'Willow 427 / Elm 441'],
+        [2, 'b', null],
+      ]);
+      expect(committed!.source_segments?.map((source) => source.authoring_revision)).toEqual([2, 2]);
+      await expect(
+        store.commitLogicalTurnAdmission!('a-stream', 'owner', authored!),
+      ).rejects.toMatchObject({ code: 'stream_id_conflict' });
+      expect(await store.getJob('a-stream')).toMatchObject({
+        status: 'superseded',
+        nativeResponseCancelled: true,
+      });
+    } finally {
+      await manager.destroy();
+    }
+  });
+  test.each([
+    ['other owner', 'other-owner', {}],
+    ['other source', 'owner', { source_event_id: 'wrong-source' }],
+    ['other revision', 'owner', { revision: 2 }],
+    ['other logical turn', 'owner', { logical_turn_id: 'wrong-turn' }],
+    ['other conversation', 'owner', { conversation_id: 'wrong-conversation' }],
+    ['other source scope', 'owner', { source_order_scope: 'b'.repeat(64) }],
+    ['other actor', 'owner', { actor_kind: 'system' as const }],
+    ['other origin', 'owner', { origin: 'scheduler' as const }],
+    ['other surface', 'owner', { surface: 'web' as const }],
+  ])('author relinquish rejects %s without releasing the admitted source', async (_, owner, change) => {
+    const first = await store.claimLogicalTurn('a-stream', 'owner', quoted('a', 1));
+    const authored = await admitAndCommit('a-stream', first);
+    await store.relinquishLogicalTurnAuthor!('a-stream', owner, { ...authored, ...change });
+    const successor = await store.claimLogicalTurn('b-stream', 'owner', context('b', 2));
+    const committed = await admitAndCommit('b-stream', successor);
+    expect(owned(committed)).toEqual([[2, 'b', null]]);
+    await expect(
+      store.commitLogicalTurnAdmission!('a-stream', 'owner', authored),
+    ).resolves.toEqual(authored);
+  });
+  test('a completed Main remains historical after a stale relinquish call', async () => {
+    const first = await store.claimLogicalTurn('a-stream', 'owner', quoted('a', 1));
+    const authored = await admitAndCommit('a-stream', first);
+    await store.updateJob('a-stream', { status: 'complete', completedAt: Date.now() });
+    await store.relinquishLogicalTurnAuthor!('a-stream', 'owner', authored);
+    const successor = await store.claimLogicalTurn('b-stream', 'owner', context('b', 2));
+    const committed = await admitAndCommit('b-stream', successor);
+    expect(owned(committed)).toEqual([[2, 'b', null]]);
+  });
+  test('an older release cannot relinquish a newer revision author', async () => {
+    const first = await store.claimLogicalTurn('a-stream', 'owner', quoted('a', 1));
+    const authored = await admitAndCommit('a-stream', first);
+    const successor = await store.claimLogicalTurn('b-stream', 'owner', context('b', 2));
+    const committed = await admitAndCommit('b-stream', successor);
+    await store.relinquishLogicalTurnAuthor!('b-stream', 'owner', authored);
+    await expect(
+      store.commitLogicalTurnAdmission!('b-stream', 'owner', committed),
+    ).resolves.toEqual(committed);
+  });
+  test('superseding accepted durable work retains its exact independent author and receipt', async () => {
+    const manager = new GenerationJobManagerClass({
+      jobStore: store,
+      eventTransport: new InMemoryEventTransport(),
+      cleanupOnComplete: false,
+    });
+    await manager.initialize();
+    try {
+      const first = await manager.createJob('a-stream', 'owner', 'conversation', {
+        interactionContext: quoted('a', 1),
+        adapterCapabilities: telegramCapabilities,
+        deliveryPolicy: { commit_authority: 'external_adapter' },
+      });
+      await manager.commitLogicalTurnAuthor('a-stream', 'owner');
+      await manager.updateMetadata('a-stream', { responseMessageId: 'response-a' });
+      expect(await manager.markDurableEffectReceipt({
+        streamId: 'a-stream',
+        userId: 'owner',
+        sourceEventId: 'a',
+        responseMessageId: 'response-a',
+        effectKind: 'durable_work_accepted',
+        effectRef: 'durable-worker-a',
+      })).toBe(true);
+      const before = await store.getJob('a-stream');
+      await manager.createJob('b-stream', 'owner', 'conversation', {
+        interactionContext: context('b', 2),
+        adapterCapabilities: telegramCapabilities,
+        deliveryPolicy: { commit_authority: 'external_adapter' },
+      });
+      const committed = await manager.commitLogicalTurnAuthor('b-stream', 'owner');
+      expect(owned(committed!)).toEqual([[2, 'b', null]]);
+      const after = await store.getJob('a-stream');
+      expect(after?.durableEffectReceipt).toEqual(before?.durableEffectReceipt);
+      expect(after?.durableEffectReceipts).toEqual(before?.durableEffectReceipts);
+      expect(first.abortController.signal.aborted).toBe(true);
+    } finally {
+      await manager.destroy();
+    }
+  });
+  /* === VIVENTIUM END === */
   test('completed turn does not replay its old goals into the next turn', async () => {
     const a = await store.claimLogicalTurn('a-stream', 'owner', context('a'));
     await store.createJob('a-stream', 'owner', 'conversation', {

@@ -285,3 +285,59 @@ describe('ToolService - Capability Checking', () => {
     });
   });
 });
+
+describe('readiness capsule facts: same authority decision', () => {
+  const agent = { tools: ['worker_delegate_once_mcp_glasshive-workers-projects'] };
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockEffectiveOrchestrationMode.mockReturnValue('parallel');
+  });
+  test('pins the actual storage refusal without borrowing later readiness', async () => {
+    mockAuthoringOrchestrationReadiness.mockResolvedValue({
+      available: false,
+      status: 'unready',
+      reason: 'storage_pressure_critical',
+    });
+    const req = { user: { id: 'owner-a' } };
+    expect(await __testables.startParallelWorkTurnAuthority(req, agent)).toBe(false);
+    expect(req._viventiumParallelWorkTurnReadiness).toEqual({
+      status: 'unready',
+      reason: 'storage_pressure_critical',
+    });
+    mockAuthoringOrchestrationReadiness.mockResolvedValue({
+      available: true,
+      status: 'ready',
+      reason: '',
+    });
+    expect(await __testables.startParallelWorkTurnAuthority(req, agent)).toBe(false);
+    expect(req._viventiumParallelWorkTurnReadiness.reason).toBe('storage_pressure_critical');
+    expect(mockAuthoringOrchestrationReadiness).toHaveBeenCalledTimes(1);
+    expect(mockParallelWorkClaimStateAsync).not.toHaveBeenCalled();
+  });
+  test('late probe completion cannot fabricate a fact after authority timeout', async () => {
+    jest.useFakeTimers();
+    const old = process.env.VIVENTIUM_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS;
+    process.env.VIVENTIUM_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS = '25';
+    let finish;
+    mockAuthoringOrchestrationReadiness.mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const req = { user: { id: 'owner-a' } };
+    try {
+      const decision = __testables.startParallelWorkTurnAuthority(req, agent);
+      await jest.advanceTimersByTimeAsync(25);
+      expect(await decision).toBe(false);
+      finish({ available: false, status: 'unready', reason: 'storage_pressure_critical' });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(req._viventiumParallelWorkTurnReadiness).toBeUndefined();
+      expect(req._viventiumParallelWorkTurnAvailable).toBe(false);
+    } finally {
+      jest.useRealTimers();
+      if (old === undefined) delete process.env.VIVENTIUM_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS;
+      else process.env.VIVENTIUM_PARALLEL_WORK_TURN_AUTHORITY_TIMEOUT_MS = old;
+    }
+  });
+});

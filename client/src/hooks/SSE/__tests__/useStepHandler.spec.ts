@@ -145,6 +145,15 @@ describe('useStepHandler', () => {
   });
 
   describe('on_run_step event', () => {
+    it('ignores a missing streamed step payload without changing messages', () => {
+      const responseMessage = createResponseMessage();
+      mockGetMessages.mockReturnValue([responseMessage]);
+      const { result } = renderHook(() => useStepHandler(createHookParams()));
+      const event = { event: 'on_run_step' } as Parameters<typeof result.current.stepHandler>[0];
+      expect(() => act(() => result.current.stepHandler(event, createSubmission()))).not.toThrow();
+      expect(mockSetMessages).not.toHaveBeenCalled();
+    });
+
     it('should create response message when not in messageMap', () => {
       const responseMessage = createResponseMessage();
       mockGetMessages.mockReturnValue([responseMessage]);

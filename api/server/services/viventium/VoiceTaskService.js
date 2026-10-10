@@ -5,13 +5,20 @@
  * === VIVENTIUM END === */
 
 const crypto = require('crypto');
+const { StepTypes, ToolCallTypes } = require('librechat-data-provider');
 const {
   voiceTaskPublicFailure,
   nativeMissionVoiceBinding,
   retainedVoiceInputOperation,
+  voiceTaskCommittedPresentationKey,
+  verifyVoiceWorkerCompletionPresentation,
 } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
-const { ViventiumVoiceTask, ViventiumVoiceTaskSuppression } = require('~/db/models');
+const {
+  ViventiumVoiceTask,
+  ViventiumVoiceTaskSuppression,
+  ViventiumCallSession,
+} = require('~/db/models');
 const {
   currentGlassHiveTerminalCallbackTransaction,
   deferGlassHiveTerminalCallbackAfterAbort,
@@ -113,6 +120,7 @@ function serializeTask(task) {
     ownerChildLinked: task.ownerChildLinked === true,
     completionPending: task.completionPending === true,
     pendingCompletionResultMessageId: safeText(task.pendingCompletionResultMessageId, 160),
+    pendingCompletionDeliveryErrorCode: safeText(task.pendingCompletionDeliveryErrorCode, 80),
     continuationOverflow: task.continuationOverflow === true,
     earlyOwnerLinkCredits: Math.min(64, Math.max(0, Number(task.earlyOwnerLinkCredits) || 0)),
     pendingOwnerResultKeys: [...(task.pendingOwnerResultKeys || [])].slice(-64),
@@ -172,6 +180,9 @@ function restoreTask(payload) {
     streamId: safeText(payload.streamId, 160),
     logicalTurnId: safeText(payload.logicalTurnId, 160),
     parentTaskId: safeText(payload.parentTaskId, 160),
+    pendingCompletionDeliveryErrorCode: payload.pendingCompletionDeliveryErrorCode
+      ? voiceTaskPublicFailure({ code: payload.pendingCompletionDeliveryErrorCode }).code
+      : '',
     events: Array.isArray(payload.events) ? payload.events.slice(-MAX_EVENTS_PER_TASK) : [],
     observedEventKeys: new Set(
       Array.isArray(payload.observedEventKeys)
@@ -557,6 +568,26 @@ function restoreTaskFromSuppression(tombstone) {
   };
 }
 
+function applyTaskSuppression(task, suppressionTask) {
+  if (
+    !task ||
+    !suppressionTask ||
+    task.taskId !== suppressionTask.taskId ||
+    task.userId !== suppressionTask.userId ||
+    task.callSessionId !== suppressionTask.callSessionId ||
+    task.streamId !== suppressionTask.streamId ||
+    task.owner?.kind !== suppressionTask.owner?.kind ||
+    task.owner?.id !== suppressionTask.owner?.id
+  )
+    return suppressionTask;
+  const createdAt = task.createdAt;
+  const events = task.events.some((event) => event.eventId === suppressionTask.lastEvent?.eventId)
+    ? task.events
+    : [...task.events, ...suppressionTask.events].slice(-MAX_EVENTS_PER_TASK);
+  Object.assign(task, suppressionTask, { createdAt, events });
+  return task;
+}
+
 async function persistVoiceTaskSuppression(task) {
   if (!task) throw new Error('Task is required for cancellation suppression');
   // A cancellation without exact terminal owner proof must outlive any configured owner runtime,
@@ -645,7 +676,7 @@ async function hydrateVoiceTaskSuppression(taskId, { callSessionId, userId, stre
     let task = tasks.get(normalizedTaskId);
     const cachedTask = restoreTaskFromSuppression(cached);
     if (!task || (cachedTask && cachedTask.sequence >= task.sequence)) {
-      task = cachedTask;
+      task = applyTaskSuppression(task, cachedTask);
       if (task) {
         tasks.set(task.taskId, task);
         if (task.streamId) taskIdByStreamId.set(task.streamId, task.taskId);
@@ -704,7 +735,7 @@ async function hydrateVoiceTaskSuppression(taskId, { callSessionId, userId, stre
   let task = tasks.get(normalizedTaskId);
   const suppressionTask = restoreTaskFromSuppression(tombstone);
   if (!task || (suppressionTask && suppressionTask.sequence >= task.sequence)) {
-    task = suppressionTask;
+    task = applyTaskSuppression(task, suppressionTask);
     if (task) {
       tasks.set(task.taskId, task);
       if (task.streamId) taskIdByStreamId.set(task.streamId, task.taskId);
@@ -867,10 +898,30 @@ function publicTask(task) {
     sequence: task.sequence,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
-    cancellable: task.cancellable,
+    cancellable:
+      task.state === 'failed' ? canCancelFailedProviderAttention(task) : task.cancellable,
     retryable: task.retryable,
     owner: { ...task.owner },
+    ...(task.current?.presentation ? { presentation: { ...task.current.presentation } } : {}),
   };
+}
+
+function canCancelFailedProviderAttention(task, code = task?.current?.error?.code) {
+  const failedAttention = task?.state === 'failed' && code === 'provider_progress_stalled';
+  const recoveringStop =
+    task?.state === 'recovering' &&
+    task.suppressed === true &&
+    task.cancelOperation?.failedProviderCode === 'provider_progress_stalled' &&
+    task.cancelOperation.operationId === task.ownerOperationId;
+  if (
+    (!failedAttention && !recoveringStop) ||
+    !['generation_job', 'remote_generation'].includes(task.owner?.kind) ||
+    !task.streamId ||
+    task.owner.id !== task.streamId
+  )
+    return false;
+  const adapter = getOwnerAdapter(task);
+  return adapter?.cancelFailedProviderAttention === true && typeof adapter.cancel === 'function';
 }
 
 function cleanupVoiceTasks(now = Date.now()) {
@@ -979,6 +1030,7 @@ function nextEvent(task, fields) {
     eventId: safeText(fields.eventId, 160) || crypto.randomUUID(),
     sequence: task.sequence,
     emittedAt: task.updatedAt,
+    createdAt: task.createdAt,
     callSessionId: task.callSessionId,
     ...(task.conversationId ? { conversationId: task.conversationId } : {}),
     ...(task.turnId ? { turnId: task.turnId } : {}),
@@ -999,6 +1051,9 @@ function nextEvent(task, fields) {
     ...(fields.needsInput ? { needsInput: fields.needsInput } : {}),
     ...(fields.resultMessageId ? { resultMessageId: fields.resultMessageId } : {}),
     owner: { ...task.owner },
+    ...(fields.presentation || task.current?.presentation
+      ? { presentation: { ...(fields.presentation || task.current.presentation) } }
+      : {}),
     ...(fields.error ? { error: fields.error } : {}),
   };
   task.current = {
@@ -1020,7 +1075,13 @@ function nextEvent(task, fields) {
     ...(fields.progress ? { progress: event.progress } : {}),
     ...(fields.needsInput ? { needsInput: event.needsInput } : {}),
     ...(fields.resultMessageId ? { resultMessageId: event.resultMessageId } : {}),
+    ...(fields.phase === 'follow_up' && fields.source
+      ? { source: { ...fields.source } }
+      : !fields.phase && task.current?.source
+        ? { source: { ...task.current.source } }
+        : {}),
     ...(fields.error ? { error: event.error } : {}),
+    ...(event.presentation ? { presentation: { ...event.presentation } } : {}),
   };
   if (fields.source) {
     const sourceKey = fields.source.url || fields.source.id || fields.source.title;
@@ -1176,7 +1237,7 @@ function bindVoiceTaskStream(
 ) {
   const task = tasks.get(String(taskId || ''));
   const normalizedStreamId = safeText(streamId, 160);
-  if (!task || !normalizedStreamId) {
+  if (!task || !normalizedStreamId || task.suppressed || task.state === 'cancelling') {
     return null;
   }
   const canonicalConversationId = safeText(conversationId, 160);
@@ -1225,6 +1286,19 @@ function getVoiceTaskTraceBinding(taskId) {
   });
 }
 
+// A saved result belongs to its task owner even when no generation turn exists.
+// Keep this read identity separate from the trace binding used for Voice effect authority.
+function getVoiceTaskOwnerBinding(taskId) {
+  const task = tasks.get(String(taskId || ''));
+  if (!task?.userId || !task.callSessionId) return null;
+  return Object.freeze({
+    taskId: task.taskId,
+    callSessionId: task.callSessionId,
+    userId: task.userId,
+    conversationId: task.conversationId,
+  });
+}
+
 function setVoiceTaskOwnerCapabilities(taskId, { kind, ownerId, cancellationConfirmable } = {}) {
   const task = tasks.get(String(taskId || ''));
   if (!task || TERMINAL_STATES.has(task.state)) {
@@ -1233,8 +1307,8 @@ function setVoiceTaskOwnerCapabilities(taskId, { kind, ownerId, cancellationConf
   const normalizedKind = safeText(kind, 80);
   const normalizedOwnerId = safeText(ownerId, 160);
   if (normalizedKind) {
-    const previousAdapterKey = ownerAdapterKey(task.owner?.kind, task.taskId);
-    task.owner = {
+    const previousOwner = task.owner;
+    const nextOwner = {
       kind: normalizedKind,
       ...(normalizedOwnerId
         ? { id: normalizedOwnerId }
@@ -1242,10 +1316,30 @@ function setVoiceTaskOwnerCapabilities(taskId, { kind, ownerId, cancellationConf
           ? { id: task.owner.id }
           : {}),
     };
-    if (previousAdapterKey !== ownerAdapterKey(task.owner.kind, task.taskId)) {
+    const ownerChanged =
+      previousOwner?.kind !== nextOwner.kind || previousOwner?.id !== nextOwner.id;
+    // Stop fixes the executing owner before any durable cancellation write can yield.
+    if (ownerChanged && (task.suppressed || task.state === 'cancelling')) return null;
+    const previousAdapterKey = ownerAdapterKey(previousOwner?.kind, task.taskId);
+    const previousAdapter = ownerChanged ? getOwnerAdapter(task) : null;
+    task.owner = nextOwner;
+    if (ownerChanged) {
       ownerAdapters.delete(previousAdapterKey);
-      task.acceptsInput = false;
-      task.retryable = false;
+      // Initialization can classify the same stream as remote without changing its capability.
+      const sameGenerationOwner =
+        ['generation_job', 'remote_generation'].includes(previousOwner?.kind) &&
+        ['generation_job', 'remote_generation'].includes(nextOwner.kind) &&
+        Boolean(previousOwner?.id) &&
+        previousOwner.id === nextOwner.id;
+      if (sameGenerationOwner && previousAdapter) {
+        ownerAdapters.set(ownerAdapterKey(nextOwner.kind, task.taskId), {
+          ...previousAdapter,
+          kind: nextOwner.kind,
+        });
+      } else {
+        task.acceptsInput = false;
+        task.retryable = false;
+      }
     }
   }
   if (typeof cancellationConfirmable === 'boolean') {
@@ -1265,6 +1359,7 @@ function registerVoiceTaskOwnerAdapter(
     provideInput,
     retry,
     cancel,
+    cancelFailedProviderAttention,
     cancellationConfirmable,
     expiresAtMs,
     inputExpiresAtMs,
@@ -1288,6 +1383,9 @@ function registerVoiceTaskOwnerAdapter(
     ...(typeof provideInput === 'function' ? { provideInput } : {}),
     ...(typeof retry === 'function' ? { retry } : {}),
     ...(typeof cancel === 'function' ? { cancel } : {}),
+    ...(typeof cancelFailedProviderAttention === 'boolean'
+      ? { cancelFailedProviderAttention }
+      : {}),
     ...(Number.isFinite(Number(expiresAtMs)) ? { expiresAtMs: Number(expiresAtMs) } : {}),
     ...(Number.isFinite(Number(inputExpiresAtMs))
       ? { inputExpiresAtMs: Number(inputExpiresAtMs) }
@@ -1306,7 +1404,11 @@ function registerVoiceTaskOwnerAdapter(
     task.nativeMissionInputBinding = binding;
   }
   task.acceptsInput = typeof adapter.provideInput === 'function';
-  task.retryable = task.state === 'failed' && typeof adapter.retry === 'function';
+  task.retryable =
+    task.state === 'failed' &&
+    voiceTaskPublicFailure(task.current?.error).retryAllowed &&
+    typeof adapter.retry === 'function';
+  if (task.state === 'failed') task.cancellable = canCancelFailedProviderAttention(task);
   if (typeof cancellationConfirmable === 'boolean') {
     task.cancellationConfirmable = cancellationConfirmable;
   }
@@ -1479,6 +1581,9 @@ async function retryVoiceTask(taskId, { userId } = {}) {
   if (!task || (userId && task.userId !== String(userId))) {
     return operationFailure(null, 'task_not_found', 'Task not found.');
   }
+  if (!voiceTaskPublicFailure(task.current?.error).retryAllowed) {
+    return operationFailure(task, 'retry_unsupported', 'This task outcome does not support retry.');
+  }
   const adapter = getOwnerAdapter(task);
   if (!adapter?.retry) {
     return operationFailure(task, 'retry_unsupported', 'This task owner does not support retry.');
@@ -1638,6 +1743,7 @@ function snapshotEventForTask(task) {
     eventId: crypto.randomUUID(),
     sequence: task.sequence,
     emittedAt: new Date().toISOString(),
+    createdAt: task.createdAt,
     callSessionId: task.callSessionId,
     ...(task.conversationId ? { conversationId: task.conversationId } : {}),
     ...(task.turnId ? { turnId: task.turnId } : {}),
@@ -1652,9 +1758,12 @@ function snapshotEventForTask(task) {
     ...(task.current?.progress ? { progress: task.current.progress } : {}),
     ...(task.current?.needsInput ? { needsInput: task.current.needsInput } : {}),
     ...(task.current?.resultMessageId ? { resultMessageId: task.current.resultMessageId } : {}),
+    ...(task.current?.source ? { source: { ...task.current.source } } : {}),
     ...(task.current?.error ? { error: task.current.error } : {}),
+    ...(task.current?.presentation ? { presentation: { ...task.current.presentation } } : {}),
     ...(task.sources?.length ? { sources: task.sources.map((source) => ({ ...source })) } : {}),
-    cancellable: task.cancellable,
+    cancellable:
+      task.state === 'failed' ? canCancelFailedProviderAttention(task) : task.cancellable,
     retryable: task.retryable,
     owner: { ...task.owner },
   };
@@ -1788,6 +1897,7 @@ async function reconcileExpiredOwnerContinuations({ callSessionId, userId, nowMs
       task.ownerChildLinked = false;
       task.completionPending = false;
       task.pendingCompletionResultMessageId = '';
+      task.pendingCompletionDeliveryErrorCode = '';
       task.cancellable = false;
       task.retryable = false;
       task.expiresAtMs = normalizedNowMs + TERMINAL_TASK_TTL_MS;
@@ -2220,14 +2330,29 @@ function createDurableCallTail({ callSessionId, userId, pollIntervalMs }) {
   state.scan = () => {
     if (state.stopped || state.listeners.size === 0) return Promise.resolve();
     if (state.inflight) return state.inflight;
+    if (!persistenceAvailable(ViventiumCallSession)) {
+      return Promise.reject(durableTailUnavailable());
+    }
     const scanStartedAtMs = Date.now();
     const updatedSince = new Date(Math.max(0, state.lastScanAtMs - DURABLE_TAIL_OVERLAP_MS));
-    state.inflight = readDurableVoiceTaskChanges({
-      callSessionId: state.callSessionId,
-      userId: state.userId,
-      updatedSince,
-    })
-      .then((events) => {
+    state.inflight = Promise.all([
+      ViventiumCallSession.exists({
+        callSessionId: state.callSessionId,
+        userId: state.userId,
+        callStatus: 'ended',
+        expiresAt: { $gt: new Date() },
+      }).then((ended) => {
+        if (!ended || state.stopped) return;
+        state.stopped = true;
+        for (const listener of state.listeners) listener.onCallEnded?.();
+      }),
+      readDurableVoiceTaskChanges({
+        callSessionId: state.callSessionId,
+        userId: state.userId,
+        updatedSince,
+      }),
+    ])
+      .then(([, events]) => {
         if (state.stopped) return;
         state.scanCount += 1;
         state.failures = 0;
@@ -2254,6 +2379,7 @@ function subscribeDurableVoiceTaskEventsForCall({
   userId,
   onEvent,
   onError,
+  onCallEnded,
   pollIntervalMs = DURABLE_TAIL_POLL_MS,
 } = {}) {
   const key = durableTailKey(callSessionId, userId);
@@ -2272,7 +2398,7 @@ function subscribeDurableVoiceTaskEventsForCall({
     state.pollIntervalMs,
     Math.max(25, Number(pollIntervalMs) || DURABLE_TAIL_POLL_MS),
   );
-  const listener = { onEvent, onError };
+  const listener = { onEvent, onError, onCallEnded };
   state.listeners.add(listener);
   const ready = state.scan();
   let active = true;
@@ -2306,14 +2432,35 @@ function observeGenerationEvent(taskId, generationEvent) {
     task?.state === 'completed' &&
     task?.awaitingOwnerResult === true &&
     ['on_source', 'source', 'on_citation', 'citation'].includes(eventType);
-  if (!task || task.suppressed || (TERMINAL_STATES.has(task.state) && !isDelayedOwnerSource)) {
+  // A persisted Main-authored child can arrive after its generation stream has closed.
+  // Keep the parent result and exact generation owner; this is a wake, not task execution.
+  const followUpData = generationEvent?.data || {};
+  const isPersistedFollowUp =
+    eventType === 'on_cortex_followup' &&
+    task?.state === 'completed' &&
+    ['generation_job', 'remote_generation'].includes(task?.owner?.kind) &&
+    task?.owner?.id === task?.streamId &&
+    safeText(followUpData.messageId, 160) &&
+    followUpData.messageId !== task?.current?.resultMessageId &&
+    followUpData.parentMessageId === task?.current?.resultMessageId &&
+    followUpData.conversationId === task?.conversationId;
+  if (
+    !task ||
+    task.suppressed ||
+    (TERMINAL_STATES.has(task.state) && !isDelayedOwnerSource && !isPersistedFollowUp)
+  ) {
     return null;
   }
   const data =
     generationEvent?.data && typeof generationEvent.data === 'object' ? generationEvent.data : {};
   const toolResult = data?.result && typeof data.result === 'object' ? data.result : null;
   const ownerEventId = safeText(
-    data.id || data.runId || data.eventId || toolResult?.id || toolResult?.tool_call?.id,
+    (isPersistedFollowUp ? data.messageId : '') ||
+      data.id ||
+      data.runId ||
+      data.eventId ||
+      toolResult?.id ||
+      toolResult?.tool_call?.id,
     160,
   );
   const observedKey = ownerEventId
@@ -2355,10 +2502,28 @@ function observeGenerationEvent(taskId, generationEvent) {
         },
       });
     }
+    const isToolStep =
+      data.type === StepTypes.TOOL_CALLS ||
+      data.type === ToolCallTypes.TOOL_CALL ||
+      data.stepDetails?.type === StepTypes.TOOL_CALLS ||
+      toolCalls.length > 0 ||
+      isCompletedToolCall ||
+      toolResult?.type === ToolCallTypes.TOOL_CALL;
     return nextEvent(task, {
       type: 'progress',
-      phase: eventType === 'on_run_step_completed' ? 'tool_completed' : 'tool',
-      label: toolName || safeText(data.name, 160) || safeText(data.type, 160) || 'Working',
+      phase: isToolStep
+        ? eventType === 'on_run_step_completed'
+          ? 'tool_completed'
+          : 'tool'
+        : 'agent',
+      label:
+        toolName ||
+        safeText(data.name, 160) ||
+        (data.type === StepTypes.MESSAGE_CREATION ||
+        data.stepDetails?.type === StepTypes.MESSAGE_CREATION
+          ? 'Writing reply'
+          : safeText(data.type, 160)) ||
+        'Working',
       detail: eventType === 'on_run_step_completed' ? 'Step completed' : 'Step started',
       ...(progress ? { progress } : {}),
     });
@@ -2415,8 +2580,11 @@ function observeGenerationEvent(taskId, generationEvent) {
     return nextEvent(task, {
       type: 'progress',
       phase: 'cortex',
-      label: safeText(data.cortex_name, 160) || 'Background analysis',
-      detail: safeText(data.status, 80),
+      // A cortex reports activity within this generation; it does not become its task owner.
+      label: task.current?.label || 'Working',
+      detail: [safeText(data.cortex_name, 160) || 'Background analysis', safeText(data.status, 80)]
+        .filter(Boolean)
+        .join(': '),
     });
   }
   if (eventType === 'on_cortex_followup') {
@@ -2426,6 +2594,9 @@ function observeGenerationEvent(taskId, generationEvent) {
       phase: 'follow_up',
       label: 'Follow-up ready',
       detail: 'Background analysis completed',
+      ...(isPersistedFollowUp
+        ? { source: { id: followUpData.messageId }, resultMessageId: task.current.resultMessageId }
+        : {}),
     });
   }
   if (eventType === 'on_agent_update') {
@@ -2492,11 +2663,11 @@ async function settleVoiceTaskGeneration(taskId, { userId, callSessionId, stream
     return null;
   const event = outcome.error
     ? failVoiceTask(taskId, outcome.error)
-    : completeVoiceTask(taskId, { resultMessageId: outcome.resultMessageId });
+    : completeVoiceTask(taskId, outcome);
   return event;
 }
 
-function completeVoiceTask(taskId, { resultMessageId } = {}) {
+function completeVoiceTask(taskId, { resultMessageId, deliveryError } = {}) {
   const task = tasks.get(String(taskId || ''));
   const attachingDelayedOwnerResult =
     task?.state === 'completed' && task?.awaitingOwnerResult === true;
@@ -2507,9 +2678,12 @@ function completeVoiceTask(taskId, { resultMessageId } = {}) {
   ) {
     return null;
   }
+  const publicDeliveryError = deliveryError ? voiceTaskPublicFailure(deliveryError) : null;
+  if (publicDeliveryError) task.retryable = false;
   if (task.state !== 'completed' && task.awaitingOwnerResult === true && !task.ownerChildLinked) {
     task.completionPending = true;
     task.pendingCompletionResultMessageId = safeText(resultMessageId, 160);
+    task.pendingCompletionDeliveryErrorCode = publicDeliveryError?.code || '';
     task.cancellable = true;
     task.expiresAtMs = UNCONFIRMED_OWNER_RESULT_EXPIRES_AT_MS;
     return nextEvent(task, {
@@ -2524,6 +2698,7 @@ function completeVoiceTask(taskId, { resultMessageId } = {}) {
   task.ownerChildLinked = false;
   task.completionPending = false;
   task.pendingCompletionResultMessageId = '';
+  task.pendingCompletionDeliveryErrorCode = '';
   task.cancellable = false;
   task.expiresAtMs = Date.now() + TERMINAL_TASK_TTL_MS;
   return nextEvent(task, {
@@ -2531,6 +2706,219 @@ function completeVoiceTask(taskId, { resultMessageId } = {}) {
     phase: 'completed',
     label: 'Completed',
     resultMessageId: safeText(resultMessageId, 160),
+    ...(publicDeliveryError
+      ? { error: { code: publicDeliveryError.code, message: publicDeliveryError.message } }
+      : {}),
+  });
+}
+
+async function refreshVoiceTaskCommittedPresentation(result, adapterSurface) {
+  if (adapterSurface !== 'voice' || !result?.ownerStreamId || !result.presentation?.userId)
+    return null;
+  const hydrated = await hydrateVoiceTaskByStreamId(result.ownerStreamId, {
+    userId: result.presentation.userId,
+    requireDurable: true,
+  });
+  const task = tasks.get(hydrated?.taskId);
+  const key = voiceTaskCommittedPresentationKey(result, task);
+  if (!key || task.observedEventKeys.has(key)) return null;
+  task.observedEventKeys.add(key);
+  while (task.observedEventKeys.size > MAX_EVENTS_PER_TASK) {
+    task.observedEventKeys.delete(task.observedEventKeys.values().next().value);
+  }
+  return nextEvent(task, { ...task.current, type: 'snapshot' });
+}
+
+/* === VIVENTIUM START === A delivery task owns only its exact followup speech, never Main work. === */
+function registerVoiceTaskDeliveryPresentation(delivery, { userId, callSessionId } = {}) {
+  const deliveryId = safeText(delivery?.deliveryId, 120);
+  const turnId = safeText(delivery?.voiceRequestId, 160);
+  const resultMessageId = safeText(delivery?.callbackMessageId, 160);
+  const conversationId = safeText(delivery?.conversationId, 160);
+  const callbackRef = safeText(delivery?.callbackId, 160);
+  const pendingPublication =
+    delivery?.status === 'pending' &&
+    /^callback_sha256:[a-f0-9]{64}$/.test(callbackRef) &&
+    verifyVoiceWorkerCompletionPresentation(delivery.workerCompletionPresentation, {
+      ownerId: userId,
+      conversationId,
+      callSessionId,
+      responseMessageId: resultMessageId,
+      responseText: delivery.text,
+    });
+  if (
+    !deliveryId ||
+    !turnId ||
+    !resultMessageId ||
+    !conversationId ||
+    !userId ||
+    !callSessionId ||
+    delivery?.surface !== 'voice' ||
+    delivery.userId !== userId ||
+    delivery.voiceCallSessionId !== callSessionId ||
+    (!pendingPublication && (delivery.status !== 'claimed' || !safeText(delivery.claimId, 160)))
+  )
+    return null;
+  const streamId = `glasshive-delivery:${deliveryId}`;
+  const existingId = taskIdByStreamId.get(streamId);
+  const existing = tasks.get(existingId);
+  if (
+    existing &&
+    (existing.userId !== userId ||
+      existing.callSessionId !== callSessionId ||
+      existing.conversationId !== conversationId ||
+      existing.turnId !== turnId ||
+      existing.owner?.kind !== 'glasshive_delivery' ||
+      existing.owner.id !== deliveryId ||
+      existing.current?.resultMessageId !== resultMessageId)
+  )
+    return null;
+  const publish = (task) => {
+    if (pendingPublication && task.current?.source?.id !== callbackRef) {
+      nextEvent(task, {
+        ...task.current,
+        type: 'snapshot',
+        phase: 'follow_up',
+        source: { id: callbackRef },
+      });
+    }
+    return publicTask(task);
+  };
+  if (existing) return publish(existing);
+  const bindings = delivery.workerCompletionPresentation?.bindings || [{ runId: delivery.runId }];
+  const parents = new Set();
+  let allRunsBound = Array.isArray(bindings) && bindings.length > 0;
+  for (const binding of Array.isArray(bindings) ? bindings : []) {
+    const child = tasks.get(taskIdByStreamId.get(`glasshive:${safeText(binding?.runId, 160)}`));
+    const parent = tasks.get(child?.parentTaskId);
+    if (
+      !child ||
+      child.userId !== userId ||
+      child.callSessionId !== callSessionId ||
+      child.conversationId !== conversationId ||
+      child.owner?.kind !== 'glasshive_run' ||
+      child.owner.id !== binding.runId ||
+      !parent ||
+      parent.userId !== userId ||
+      parent.callSessionId !== callSessionId ||
+      parent.conversationId !== conversationId
+    ) {
+      allRunsBound = false;
+      continue;
+    }
+    parents.add(parent.taskId);
+  }
+  let parentTaskId = allRunsBound && parents.size === 1 ? [...parents][0] : '';
+  const anchor = safeText(delivery.anchorMessageId, 160);
+  const anchored =
+    anchor &&
+    [...tasks.values()].find(
+      (task) =>
+        task.userId === userId &&
+        task.callSessionId === callSessionId &&
+        task.conversationId === conversationId &&
+        task.current?.resultMessageId === anchor,
+    );
+  if (anchored && anchored.taskId !== parentTaskId) parentTaskId = '';
+  const task = createVoiceTask({
+    userId,
+    callSessionId,
+    conversationId,
+    turnId,
+    streamId,
+    ...(parentTaskId ? { parentTaskId } : {}),
+    owner: { kind: 'glasshive_delivery', id: deliveryId },
+  });
+  completeVoiceTask(task.taskId, { resultMessageId });
+  return publish(tasks.get(task.taskId));
+}
+
+function recordVoiceTaskDeliveryPresentation(taskId, input) {
+  const task = tasks.get(String(taskId || ''));
+  if (
+    !task ||
+    !input.deliveryId ||
+    task.owner?.kind !== 'glasshive_delivery' ||
+    task.owner.id !== input.deliveryId ||
+    task.streamId !== `glasshive-delivery:${input.deliveryId}`
+  )
+    return null;
+  return recordTaskSpeechPresentation(task, input);
+}
+/* === VIVENTIUM END === */
+
+function recordVoiceTaskPresentation(taskId, input) {
+  const task = tasks.get(String(taskId || ''));
+  if (
+    !task ||
+    task.owner?.id !== input.streamId ||
+    !['generation_job', 'remote_generation'].includes(task.owner?.kind)
+  )
+    return null;
+  return recordTaskSpeechPresentation(task, input);
+}
+
+function recordTaskSpeechPresentation(
+  task,
+  { userId, callSessionId, streamId, presentationRef, stage, startedAtMs },
+) {
+  const ref = safeText(presentationRef, 160);
+  const states = {
+    'audio.started': 'speaking',
+    'audio.completed': 'completed',
+    'audio.interrupted': 'interrupted',
+    'audio.superseded': 'superseded',
+    'audio.failed': 'failed',
+  };
+  const state = states[stage];
+  if (
+    !task ||
+    !ref ||
+    !state ||
+    task.userId !== userId ||
+    task.callSessionId !== callSessionId ||
+    !streamId ||
+    task.streamId !== streamId
+  )
+    return null;
+  const current = task.current?.presentation;
+  if (stage === 'audio.started') {
+    if (!Number.isSafeInteger(startedAtMs) || startedAtMs <= 0) return null;
+    if (current?.ref === ref) return task.lastEvent;
+    for (const other of tasks.values()) {
+      if (other.callSessionId !== callSessionId) continue;
+      const previous = other.current?.presentation;
+      if (previous && previous.startedAtMs >= startedAtMs) return null;
+    }
+    for (const other of tasks.values()) {
+      if (other.callSessionId !== callSessionId) continue;
+      const previous = other.current?.presentation;
+      if (previous && ['speaking', 'stop_requested'].includes(previous.state)) {
+        nextEvent(other, {
+          ...other.current,
+          type: 'snapshot',
+          presentation: { ...previous, state: 'superseded' },
+        });
+      }
+    }
+  } else if (current?.ref !== ref) {
+    if (
+      !Number.isSafeInteger(startedAtMs) ||
+      startedAtMs <= 0 ||
+      (current && current.startedAtMs >= startedAtMs)
+    )
+      return null;
+  } else if (current.state === state) {
+    return task.lastEvent;
+  }
+  return nextEvent(task, {
+    ...task.current,
+    type: 'snapshot',
+    presentation: {
+      ref,
+      state,
+      startedAtMs: current?.ref === ref ? current.startedAtMs : startedAtMs,
+    },
   });
 }
 
@@ -2637,6 +3025,11 @@ function linkVoiceTaskOwnerChild(
   if (task.completionPending) {
     return completeVoiceTask(task.taskId, {
       resultMessageId: task.pendingCompletionResultMessageId,
+      ...(task.pendingCompletionDeliveryErrorCode
+        ? {
+            deliveryError: { code: task.pendingCompletionDeliveryErrorCode },
+          }
+        : {}),
     });
   }
   return nextEvent(task, {
@@ -2653,9 +3046,9 @@ function failVoiceTask(taskId, error) {
     return null;
   }
   task.state = 'failed';
-  task.cancellable = false;
   task.retryOperation = null;
   const failure = voiceTaskPublicFailure(error);
+  task.cancellable = canCancelFailedProviderAttention(task, failure.code);
   task.retryable = failure.retryAllowed && Boolean(getOwnerAdapter(task)?.retry);
   task.expiresAtMs = Date.now() + TERMINAL_TASK_TTL_MS;
   return nextEvent(task, {
@@ -2683,7 +3076,7 @@ function cancelVoiceTask(taskId, { userId, deferEvent = false } = {}) {
   if (task.state === 'completed') {
     return { task: publicTask(task), event: task.lastEvent, alreadyCompleted: true };
   }
-  if (task.state === 'failed') {
+  if (task.state === 'failed' && !canCancelFailedProviderAttention(task)) {
     return { task: publicTask(task), event: task.lastEvent, alreadyInactive: true };
   }
   task.suppressed = true;
@@ -2701,10 +3094,65 @@ function cancelVoiceTask(taskId, { userId, deferEvent = false } = {}) {
   return { task: publicTask(task), event };
 }
 
-async function requestVoiceTaskOwnerCancellation(taskId, { userId } = {}) {
+async function restoreCompletedVoiceTaskAfterCancellation(task) {
+  await clearVoiceTaskSuppression(task.taskId);
+  task.suppressed = false;
+  task.state = 'completed';
+  task.awaitingOwnerResult = true;
+  task.cancellable = false;
+  task.retryable = false;
+  task.ownerDeliveryPending = false;
+  ownerAdapters.delete(ownerAdapterKey(task.owner?.kind, task.taskId));
+  return nextEvent(task, {
+    type: 'state',
+    phase: 'already_completed',
+    label: 'Already completed',
+    detail: 'The owner completed before cancellation; the final result is arriving.',
+  });
+}
+
+async function requestVoiceTaskOwnerCancellation(
+  taskId,
+  {
+    userId,
+    deferUnsupportedSettlement = false,
+    stopPresentationIfCompleted = false,
+    presentationRef,
+  } = {},
+) {
   const task = tasks.get(String(taskId || ''));
   if (!task || (userId && task.userId !== String(userId))) {
     return null;
+  }
+  const failedProviderCode = canCancelFailedProviderAttention(task)
+    ? 'provider_progress_stalled'
+    : null;
+  const presentation = task.current?.presentation;
+  if (
+    stopPresentationIfCompleted &&
+    task.state === 'completed' &&
+    ['speaking', 'stop_requested'].includes(presentation?.state) &&
+    (!presentationRef || presentationRef === presentation.ref) &&
+    task.streamId &&
+    ((task.owner?.id === task.streamId &&
+      ['generation_job', 'remote_generation'].includes(task.owner?.kind)) ||
+      (task.owner?.kind === 'glasshive_delivery' &&
+        task.owner.id &&
+        task.streamId === `glasshive-delivery:${task.owner.id}`))
+  ) {
+    // A retry must cross the event-ID/sequence gate even if the speech state is unchanged.
+    const event = nextEvent(task, {
+      ...task.current,
+      type: 'state',
+      presentation: { ...presentation, state: 'stop_requested' },
+    });
+    return {
+      task: publicTask(task),
+      event,
+      presentationStopRequested: true,
+      ownerSupported: false,
+      ownerAccepted: false,
+    };
   }
   const cancellation = cancelVoiceTask(taskId, { userId, deferEvent: true });
   if (cancellation?.alreadyCompleted) {
@@ -2727,6 +3175,12 @@ async function requestVoiceTaskOwnerCancellation(taskId, { userId } = {}) {
   }
   const adapter = getOwnerAdapter(task);
   task.ownerOperationId = task.ownerOperationId || crypto.randomUUID();
+  if (failedProviderCode)
+    task.cancelOperation = {
+      ...task.cancelOperation,
+      operationId: task.ownerOperationId,
+      failedProviderCode,
+    };
   task.ownerDeliveryPending = Boolean(adapter?.cancel);
   task.ownerCancellationAccepted = false;
   // The local barrier is authoritative only after the independent 24-hour durable tombstone is
@@ -2774,12 +3228,14 @@ async function requestVoiceTaskOwnerCancellation(taskId, { userId } = {}) {
   };
   void queueTaskPersistence(task);
   if (!adapter?.cancel) {
-    queueMicrotask(() => {
-      void settleVoiceTaskCancellation(task.taskId, {
-        confirmed: false,
-        detail: 'This task owner cannot confirm cancellation; late output remains suppressed.',
-      }).catch(() => undefined);
-    });
+    if (!deferUnsupportedSettlement) {
+      queueMicrotask(() => {
+        void settleVoiceTaskCancellation(task.taskId, {
+          confirmed: false,
+          detail: 'This task owner cannot confirm cancellation; late output remains suppressed.',
+        }).catch(() => undefined);
+      });
+    }
     return {
       ...committedCancellation,
       ownerSupported: false,
@@ -2800,29 +3256,22 @@ async function requestVoiceTaskOwnerCancellation(taskId, { userId } = {}) {
   }
 
   const operationId = task.ownerOperationId;
-  const operation = { operationId, promise: null, result: null };
+  const operation = {
+    operationId,
+    promise: null,
+    result: null,
+    ...(failedProviderCode ? { failedProviderCode } : {}),
+  };
   const delivery = (async () => {
     try {
       const ownerResult = await adapter.cancel({
         taskId: task.taskId,
         owner: { ...task.owner },
         operationId,
+        ...(failedProviderCode ? { failedProviderCode } : {}),
       });
       if (ownerResult?.alreadyCompleted === true) {
-        await clearVoiceTaskSuppression(task.taskId);
-        task.suppressed = false;
-        task.state = 'completed';
-        task.awaitingOwnerResult = true;
-        task.cancellable = false;
-        task.retryable = false;
-        task.ownerDeliveryPending = false;
-        ownerAdapters.delete(ownerAdapterKey(task.owner?.kind, task.taskId));
-        const event = nextEvent(task, {
-          type: 'state',
-          phase: 'already_completed',
-          label: 'Already completed',
-          detail: 'The owner completed before cancellation; the final result is arriving.',
-        });
+        const event = await restoreCompletedVoiceTaskAfterCancellation(task);
         const result = {
           ...committedCancellation,
           task: publicTask(task),
@@ -2880,6 +3329,113 @@ async function requestVoiceTaskOwnerCancellation(taskId, { userId } = {}) {
     ownerAccepted: false,
     ownerPending: true,
   };
+}
+
+/** Reuse the task owner for linked-chat Stop; every binding comes from the current server job. */
+async function requestVoiceTaskOwnerCancellationForJob(job, { streamId, userId } = {}) {
+  const metadata = job?.metadata;
+  const taskId = metadata?.viventiumVoiceTaskId;
+  const callSessionId = metadata?.viventiumCallSessionId;
+  if (!taskId && !callSessionId) return null;
+  const unavailable = () =>
+    Object.assign(new Error('Voice task is unavailable'), {
+      status: 404,
+      code: 'voice_task_unavailable',
+    });
+  if (
+    !streamId ||
+    !userId ||
+    !taskId ||
+    !callSessionId ||
+    metadata.userId !== userId ||
+    job.streamId !== streamId ||
+    !metadata.conversationId
+  )
+    throw unavailable();
+  await hydrateVoiceTask(taskId, { userId, callSessionId });
+  const task = tasks.get(taskId);
+  const taskCreatedAt = task?.createdAt;
+  const ownerKind = task?.owner?.kind;
+  const ownsTask = () =>
+    tasks.get(taskId) === task &&
+    task?.createdAt === taskCreatedAt &&
+    task?.userId === userId &&
+    task.callSessionId === callSessionId &&
+    task.conversationId === metadata.conversationId &&
+    task.streamId === streamId &&
+    task.owner?.id === streamId &&
+    task.owner?.kind === ownerKind &&
+    ['generation_job', 'remote_generation'].includes(task.owner?.kind);
+  if (!ownsTask()) throw unavailable();
+  // Local generations keep the normal chat abort path; Native requires its capacity ACK owner.
+  if (task.owner.kind !== 'remote_generation') return null;
+  const { GenerationJobManager } = require('@librechat/api');
+  const ownsJob = (current) =>
+    ownsTask() &&
+    current?.createdAt === job.createdAt &&
+    current?.abortController?.signal === job.abortController?.signal &&
+    current?.metadata?.responseMessageId === metadata.responseMessageId &&
+    current?.metadata?.userId === userId &&
+    current?.metadata?.conversationId === metadata.conversationId &&
+    current?.metadata?.viventiumCallSessionId === callSessionId &&
+    current?.metadata?.viventiumVoiceTaskId === taskId;
+  if (!ownsJob(await GenerationJobManager.getJob(streamId))) throw unavailable();
+  const cancellation = await requestVoiceTaskOwnerCancellation(taskId, {
+    userId,
+    deferUnsupportedSettlement: true,
+  });
+  if (
+    cancellation?.ownerSupported === false &&
+    !cancellation.alreadyCompleted &&
+    !cancellation.alreadyCancelled &&
+    !cancellation.alreadyInactive &&
+    !cancellation.alreadyCancelling
+  ) {
+    // Match the existing Voice route/tool fallback after the durable barrier. A local abort
+    // cannot prove Native capacity release. Recheck the pinned job after persistence yields.
+    const operation = { operationId: cancellation.operationId, promise: null, result: null };
+    const delivery = (async () => {
+      try {
+        const current = await GenerationJobManager.getJob(streamId);
+        const stopped = ownsJob(current)
+          ? await GenerationJobManager.abortJob(streamId, 'user_cancelled', userId)
+          : null;
+        const stoppedJob = stopped?.jobData;
+        if (
+          ownsTask() &&
+          ['committed', 'pending'].includes(stopped?.nativeResponse) &&
+          stoppedJob?.createdAt === job.createdAt &&
+          stoppedJob.streamId === streamId &&
+          stoppedJob.userId === userId &&
+          stoppedJob.conversationId === metadata.conversationId &&
+          stoppedJob.responseMessageId === metadata.responseMessageId &&
+          stoppedJob.viventiumCallSessionId === callSessionId &&
+          stoppedJob.viventiumVoiceTaskId === taskId
+        ) {
+          await restoreCompletedVoiceTaskAfterCancellation(task);
+          return;
+        }
+        await settleVoiceTaskCancellation(taskId, {
+          confirmed: false,
+          detail:
+            stopped?.success === true
+              ? 'Local generation stopped, but remote owner cancellation could not be confirmed; late output remains suppressed.'
+              : 'The owner could not confirm cancellation; late output remains suppressed.',
+        });
+      } catch {
+        await settleVoiceTaskCancellation(taskId, {
+          confirmed: false,
+          detail: 'The owner could not confirm cancellation; late output remains suppressed.',
+        }).catch(() => undefined);
+      }
+    })();
+    operation.promise = delivery;
+    task.cancelOperation = operation;
+    void delivery.finally(() => {
+      operation.promise = null;
+    });
+  }
+  return cancellation;
 }
 
 async function flushVoiceTaskOwnerOperations() {
@@ -3019,12 +3575,17 @@ module.exports = {
   cancelVoiceTask,
   completeVoiceTask,
   settleVoiceTaskGeneration,
+  refreshVoiceTaskCommittedPresentation,
+  recordVoiceTaskPresentation,
+  registerVoiceTaskDeliveryPresentation,
+  recordVoiceTaskDeliveryPresentation,
   confirmVoiceTaskOwnerCancellation,
   createVoiceTask,
   failVoiceTask,
   getVoiceTask,
   getVoiceTaskByStreamId,
   getVoiceTaskTraceBinding,
+  getVoiceTaskOwnerBinding,
   getVoiceTaskOwnerCapabilityInventory,
   getDurableVoiceTaskContinuationState,
   getVoiceTaskRegistryStats,
@@ -3044,6 +3605,7 @@ module.exports = {
   observeGenerationEvent,
   registerVoiceTaskOwnerAdapter,
   requestVoiceTaskOwnerCancellation,
+  requestVoiceTaskOwnerCancellationForJob,
   resetVoiceTasksForTests,
   retryVoiceTask,
   runVoiceTaskTerminalCallbackMutation,

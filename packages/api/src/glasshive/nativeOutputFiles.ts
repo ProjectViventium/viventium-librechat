@@ -209,6 +209,12 @@ export interface NativeOutputAttachment {
   type: string;
   source: string;
   object: 'file';
+  nativeOutputFile?: {
+    version: 1;
+    status: 'available';
+    messageId: string;
+    downloadUrl: string;
+  };
 }
 export interface NativeOutputStoredFile extends Omit<NativeOutputAttachment, 'user'> {
   user: unknown;
@@ -403,6 +409,17 @@ function attachment(row: NativeOutputStoredFile): NativeOutputAttachment {
   };
 }
 
+function fileFingerprint(envelope: NativeOutputFiles, file: NativeOutputFile): string {
+  return createHash('sha256')
+    .update(JSON.stringify([
+      envelope.owner_id, envelope.conversation_id, envelope.message_id, envelope.stream_id,
+      envelope.agent_id, envelope.logical_turn_id, envelope.logical_turn_revision,
+      envelope.request_id, envelope.run_id, envelope.attempt_id,
+      file.filename, file.mime_type, file.bytes, file.sha256,
+    ]))
+    .digest('hex');
+}
+
 /** Capture before SDK concatenation; a merged stream ID is not an invocation identity. */
 export function inspectNativeOutputFileCarrier(value: unknown):
   | {
@@ -528,26 +545,7 @@ export async function importNativeOutputFiles(
       continue;
     }
     try {
-      const fingerprint = createHash('sha256')
-        .update(
-          JSON.stringify([
-            envelope.owner_id,
-            envelope.conversation_id,
-            envelope.message_id,
-            envelope.stream_id,
-            envelope.agent_id,
-            envelope.logical_turn_id,
-            envelope.logical_turn_revision,
-            envelope.request_id,
-            envelope.run_id,
-            envelope.attempt_id,
-            file.filename,
-            file.mime_type,
-            file.bytes,
-            file.sha256,
-          ]),
-        )
-        .digest('hex');
+      const fingerprint = fileFingerprint(envelope, file);
       const keys = {
         fileId: `native_${fingerprint}`,
         objectId: fingerprint.slice(0, 24),
@@ -581,7 +579,16 @@ export async function importNativeOutputFiles(
       }
       if (!matches(row)) throw error('native_output_file_storage_conflict');
       if (!returned.has(row.file_id)) {
-        result.push(attachment(row));
+        // UI binds this exact verified grant to its existing owner File. Authored history stays intact.
+        result.push({
+          ...attachment(row),
+          nativeOutputFile: {
+            version: 1,
+            status: 'available',
+            messageId: identity.responseMessageId,
+            downloadUrl: preparation.url!,
+          },
+        });
         returned.add(row.file_id);
       }
     } catch (cause) {

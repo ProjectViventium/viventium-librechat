@@ -1,7 +1,10 @@
 /* === VIVENTIUM START === Native Message owns accepted history; continuity owns derived state. === */
 import { createHash } from 'crypto';
 import { mainContinuityMessageEvidence } from './mainContinuityEvidence';
-export { mainContinuityMessageEvidence } from './mainContinuityEvidence';
+export {
+  mainContinuityMessageEvidence,
+  normalizeMainBackgroundInputs,
+} from './mainContinuityEvidence';
 import type { FilterQuery } from 'mongoose';
 import type { IMessage } from '~/types/message';
 import type { IConversation } from '~/types/convo';

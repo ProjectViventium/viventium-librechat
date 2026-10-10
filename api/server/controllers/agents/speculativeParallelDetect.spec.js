@@ -57,13 +57,19 @@ const FLAG = 'VIVENTIUM_CORTEX_SPECULATIVE_PARALLEL_DETECT';
 
 describe('speculative parallel cortex detection — decision primitives', () => {
   let originalFlag;
+  let originalCanonicalFlag;
+  const canonicalFlag = 'VIVENTIUM_TEXT_BACKGROUND_AGENT_DETECTION_ASYNC';
 
   beforeEach(() => {
     originalFlag = process.env[FLAG];
     delete process.env[FLAG];
+    originalCanonicalFlag = process.env[canonicalFlag];
+    delete process.env[canonicalFlag];
   });
 
   afterEach(() => {
+    if (originalCanonicalFlag === undefined) delete process.env[canonicalFlag];
+    else process.env[canonicalFlag] = originalCanonicalFlag;
     if (originalFlag === undefined) {
       delete process.env[FLAG];
     } else {

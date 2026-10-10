@@ -153,6 +153,11 @@ const startServer = async () => {
     upgradeFinalization.recordCompleted('database-seed-ready');
   }
   const appConfig = await getAppConfig();
+  /* === VIVENTIUM START ===
+   * Reuse the loaded public Agent Builder registry for advisory Voice settings without a lookup.
+   */
+  app.locals.agentProviderCapabilities = appConfig.endpoints?.agents?.providerCapabilities || {};
+  /* === VIVENTIUM END === */
   initializeFileStorage(appConfig);
   await performStartupChecks(appConfig);
   upgradeFinalization.recordCompleted('startup-checks-ready');

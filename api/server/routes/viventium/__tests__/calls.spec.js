@@ -569,6 +569,25 @@ describe('/api/viventium/calls', () => {
     expect(createCallSession).not.toHaveBeenCalled();
   });
 
+  test('POST carries an owned existing chat only in the same-browser launch URL', async () => {
+    require('~/models').getConvo.mockResolvedValueOnce({ agent_id: 'agent_123' });
+    const app = express();
+    app.use(express.json());
+    app.use('/api/viventium/calls', require('../calls'));
+    const res = await request(app)
+      .post('/api/viventium/calls')
+      .send({ conversationId: 'conversation-existing', agentId: 'agent_123' })
+      .expect(200);
+    const url = new URL(res.body.playgroundUrl);
+    expect(url.searchParams.get('conversationId')).toBe('conversation-existing');
+    expect(url.searchParams.get('callSessionId')).toBe(res.body.callSessionId);
+    expect(url.hash).toBe(`#viventiumCallCapability=${'A'.repeat(43)}`);
+    expect(require('~/models').getConvo).toHaveBeenCalledWith('user_1', 'conversation-existing');
+    expect(mockAssertVoiceAgentAccess).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: 'agent_123' }),
+    );
+  });
+
   test('POST creates a call session and returns a deep-link url', async () => {
     const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
     const callsRouter = require('../calls');
@@ -943,6 +962,71 @@ describe('/api/viventium/calls', () => {
     expect(confirmDispatch).not.toHaveBeenCalled();
   });
 
+  test.each(['get', 'post'])(
+    'browser %s voice-settings opts into exact catalog labels',
+    async (method) => {
+      const service = require('~/server/services/viventium/CallSessionService');
+      const effective = {
+        provider: 'glasshive-harness',
+        model: 'grok-build:grok-4.7-build-fast',
+        effort: 'high',
+        providerLabel: 'xPerfect',
+        modelLabel: 'Grok / Grok 4.7 Fast',
+      };
+      const providerCapabilities = {
+        'glasshive-harness': {
+          label: 'xPerfect',
+          models: [{ id: effective.model, label: effective.modelLabel }],
+        },
+      };
+      const settings = {
+        callSessionId: 'call_session_test',
+        assistantRoute: { primary: effective, effective, inheritsPrimary: true },
+      };
+      if (method === 'get') {
+        service.getCallSessionVoiceSettings.mockImplementationOnce(async (_id, options) => ({
+          ...settings,
+          assistantRoute:
+            options?.assistantProviderCapabilities === providerCapabilities
+              ? settings.assistantRoute
+              : null,
+        }));
+      } else {
+        service.updateCallSessionVoiceSettings.mockImplementationOnce(async (options) => ({
+          ...settings,
+          assistantRoute:
+            options?.assistantProviderCapabilities === providerCapabilities
+              ? settings.assistantRoute
+              : null,
+        }));
+      }
+      const app = express();
+      app.locals.agentProviderCapabilities = providerCapabilities;
+      app.use(express.json());
+      app.use('/api/viventium/calls', require('../calls'));
+      const req = request(app)
+        [method]('/api/viventium/calls/call_session_test/voice-settings')
+        .set('x-viventium-call-secret', 'secret')
+        .set('x-viventium-call-capability', 'A'.repeat(43));
+      if (method === 'post') req.send({ assistantProviderCapabilities: { untrusted: {} } });
+      const res = await req.expect(200);
+      expect(res.body.assistantRoute.effective).toEqual(effective);
+      if (method === 'get') {
+        expect(service.getCallSessionVoiceSettings).toHaveBeenCalledWith(
+          'call_session_test',
+          expect.objectContaining({ assistantProviderCapabilities: providerCapabilities }),
+        );
+      } else {
+        expect(service.updateCallSessionVoiceSettings).toHaveBeenCalledWith(
+          expect.objectContaining({
+            assistantProviderCapabilities: providerCapabilities,
+            persistToUserDefaults: false,
+          }),
+        );
+      }
+    },
+  );
+
   test('GET voice-settings returns both saved defaults and requested route', async () => {
     const callsRouter = require('../calls');
 
@@ -1042,6 +1126,7 @@ describe('/api/viventium/calls', () => {
         requestedVoiceRoute: route,
         persistToUserDefaults: true,
         touch: false,
+        assistantProviderCapabilities: {},
       }),
     );
   });
@@ -1409,4 +1494,43 @@ describe('/api/viventium/calls', () => {
     ).toHaveBeenCalledWith('call_session_test', 'L'.repeat(43), 'I'.repeat(43));
     expect(JSON.stringify(response.body)).not.toContain('L'.repeat(43));
   });
+
+  test.each([false, true])(
+    'retains bounded readiness rejection diagnostics in the warning message (public=%s)',
+    async (preferPublicPlayground) => {
+      if (preferPublicPlayground) {
+        process.env.VIVENTIUM_PUBLIC_CLIENT_URL = 'https://example.test';
+        process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice.example.test';
+      }
+      let now = 1000;
+      const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+      global.fetch.mockImplementationOnce(async () => {
+        now = 3007;
+        throw new Error('synthetic private transport detail');
+      });
+      try {
+        const app = express();
+        app.use(express.json());
+        app.use('/api/viventium/calls', require('../calls'));
+        let post = request(app).post('/api/viventium/calls');
+        if (preferPublicPlayground) post = post.set('origin', 'https://example.test');
+        const response = await post.send({ conversationId: 'new', agentId: 'agent_123' });
+        expect(response.status).toBe(503);
+        expect(response.body.reason).toBe('playground_unreachable');
+        expect(
+          require('~/server/services/viventium/CallSessionService').createCallSession,
+        ).not.toHaveBeenCalled();
+        const { logger } = require('@librechat/data-schemas');
+        expect(logger.warn).toHaveBeenCalledWith(
+          `[VIVENTIUM][calls] call_rejected ${JSON.stringify({
+            reason: 'playground_unreachable',
+            preferPublicPlayground,
+            durationMs: 2007,
+          })}`,
+        );
+      } finally {
+        nowSpy.mockRestore();
+      }
+    },
+  );
 });

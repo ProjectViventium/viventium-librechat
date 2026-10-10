@@ -448,9 +448,10 @@ function canonicalBuiltInBackgroundModelParameters(agentId, provider) {
 
 function canonicalBuiltInModelParameters(agentId, provider, incomingParameters = {}) {
   const normalizedProvider = normalizeProvider(provider);
-  const canonical = agentId === MAIN_AGENT_ID
-    ? CANONICAL_BUILT_IN_MAIN_MODEL_PARAMETERS[normalizedProvider]
-    : canonicalBuiltInBackgroundModelParameters(agentId, provider);
+  const canonical =
+    agentId === MAIN_AGENT_ID
+      ? CANONICAL_BUILT_IN_MAIN_MODEL_PARAMETERS[normalizedProvider]
+      : canonicalBuiltInBackgroundModelParameters(agentId, provider);
   if (canonical == null) {
     return null;
   }
@@ -505,7 +506,8 @@ function rewriteBuiltInFallbackForRuntime(agent, { env = process.env } = {}) {
     fallback_llm_model_parameters: {
       model: directFallback.model,
       ...(directFallback.provider === 'anthropic'
-        ? { effort: 'high' } : { reasoning_effort: 'high', useResponsesApi: true }),
+        ? { effort: 'high' }
+        : { reasoning_effort: 'high', useResponsesApi: true }),
     },
   };
 }
@@ -544,10 +546,10 @@ function rewriteAgentForRuntime(
       rewritten.provider = assignment.provider;
       rewritten.model = assignment.model;
     }
-    const runtimeFamilyChanged = assignment && (
-      normalizeProvider(agent.provider) !== assignment.provider ||
-      String(agent.model || agent.model_parameters?.model || '').trim() !== assignment.model
-    );
+    const runtimeFamilyChanged =
+      assignment &&
+      (normalizeProvider(agent.provider) !== assignment.provider ||
+        String(agent.model || agent.model_parameters?.model || '').trim() !== assignment.model);
     const canonicalBuiltInParameters = canonicalBuiltInModelParameters(
       rewritten.id,
       rewritten.provider,
@@ -645,12 +647,28 @@ function rewriteBackgroundCortices(backgroundCortices, { env = process.env } = {
     if (!assignment) {
       return cortex;
     }
+    const assignmentChanged =
+      normalizeProvider(cortex.activation.provider) !== normalizeProvider(assignment.provider) ||
+      String(cortex.activation.model || '').trim() !== assignment.model;
+    // An explicit provider/model selector can promote an already declared fallback. Keep that
+    // route's explicit effort with its identity; unchanged primary choices keep their own effort.
+    const selectedFallback =
+      assignmentChanged && Array.isArray(cortex.activation.fallbacks)
+        ? cortex.activation.fallbacks.find(
+            (fallback) =>
+              normalizeProvider(fallback?.provider) === normalizeProvider(assignment.provider) &&
+              String(fallback?.model || '').trim() === assignment.model,
+          )
+        : null;
     return {
       ...deepClone(cortex),
       activation: {
         ...deepClone(cortex.activation),
         provider: assignment.provider,
         model: assignment.model,
+        ...(typeof selectedFallback?.reasoning_effort === 'string'
+          ? { reasoning_effort: selectedFallback.reasoning_effort }
+          : {}),
       },
     };
   });

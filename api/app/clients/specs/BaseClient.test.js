@@ -1345,3 +1345,230 @@ describe('BaseClient', () => {
     });
   });
 });
+/* === VIVENTIUM START === Persisted source provenance survives the normal client writer. === */
+describe('normal client source provenance', () => {
+  const {
+    setTrustedInteractionContext,
+    attachInteractionContextMetadata,
+    createGlassHiveCallbackBindingService,
+    normalizeInteractionSourceSegments,
+    selectTrustedLaunchRequestBody,
+  } = require('@librechat/api');
+  const get = require('lodash/get');
+  function request(surface, sourceEventId, revision = 1) {
+    const req = {
+      user: { id: 'owner-source' },
+      body: {},
+      ...(surface === 'voice' ? { viventiumCallSession: { callSessionId: 'call-source' } } : {}),
+    };
+    setTrustedInteractionContext(
+      req,
+      {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface,
+        conversation_id: 'conversation-source',
+        logical_turn_id: 'turn-source',
+        revision,
+        source_event_id: sourceEventId,
+      },
+      { segment_stability: 'provisional', supersede_scope: 'response_only' },
+    );
+    return req;
+  }
+  function client(req) {
+    const instance = initializeFakeClient(apiKey, { endpoint: 'agents', req }, []);
+    instance.skipSaveConvo = true;
+    return instance;
+  }
+  test.each(['voice', 'web', 'telegram'])(
+    'retains trusted source metadata on the normal user writer (%s)',
+    async (surface) => {
+      const req = request(surface, 'source-a');
+      const input = {
+        messageId: 'user-a',
+        parentMessageId: 'root',
+        conversationId: 'conversation-source',
+        text: 'First accepted input.',
+        isCreatedByUser: true,
+        metadata: { retained: 'existing', viventium: { retained: true } },
+      };
+      const controllerRow = attachInteractionContextMetadata(req, input);
+      let row = controllerRow;
+      saveMessage.mockImplementation(async (_req, saved) => {
+        row = { ...row, ...saved };
+        return row;
+      });
+      await client(req).saveMessageToDatabase(input, {}, req.user.id);
+      expect(row.metadata.viventium.interactionContext).toEqual(
+        controllerRow.metadata.viventium.interactionContext,
+      );
+      expect(row.metadata.viventium.adapterCapabilities).toEqual(
+        controllerRow.metadata.viventium.adapterCapabilities,
+      );
+      expect(row.metadata.viventium.deliveryPolicy).toEqual(
+        controllerRow.metadata.viventium.deliveryPolicy,
+      );
+      expect(row.metadata.retained).toBe('existing');
+      expect(row.metadata.viventium.retained).toBe(true);
+      expect(row.text).toBe(input.text);
+      if (surface === 'voice') expect(row.metadata.viventium.callSessionId).toBe('call-source');
+    },
+  );
+  test.each([
+    ['system', 'scheduler', true],
+    ['system', 'scheduler', false],
+    ['worker', 'callback', true],
+    ['worker', 'callback', false],
+  ])(
+    'preserves scheduler and callback source disposition (%s/%s/user=%s)',
+    async (actor, origin, isCreatedByUser) => {
+      const req = { user: { id: 'owner-source' }, body: {} };
+      setTrustedInteractionContext(req, {
+        actor_kind: actor,
+        origin,
+        surface: 'web',
+        conversation_id: 'conversation-source',
+        logical_turn_id: 'turn-source',
+        revision: 1,
+        source_event_id: 'internal-source',
+      });
+      saveMessage.mockResolvedValue({});
+      await client(req).saveMessageToDatabase(
+        {
+          messageId: 'internal-message',
+          conversationId: 'conversation-source',
+          text: 'Internal accepted input.',
+          isCreatedByUser,
+        },
+        {},
+        req.user.id,
+      );
+      const metadata = saveMessage.mock.calls.at(-1)[1].metadata.viventium;
+      expect(metadata.interactionContext).toMatchObject({
+        actor_kind: actor,
+        origin,
+        source_event_id: 'internal-source',
+      });
+      expect(metadata.memoryEligible).toBe(actor === 'system' ? false : undefined);
+      expect(metadata.recallEligible).toBe(actor === 'system' ? !isCreatedByUser : undefined);
+      expect(metadata.visibility).toBe(
+        actor === 'system' && isCreatedByUser ? 'internal' : undefined,
+      );
+    },
+  );
+  test('does not promote body-supplied context without a trusted request', async () => {
+    const req = {
+      user: { id: 'owner-source' },
+      body: {
+        interactionContext: { actor_kind: 'external_user', source_event_id: 'forged-source' },
+      },
+    };
+    saveMessage.mockResolvedValue({});
+    await client(req).saveMessageToDatabase(
+      {
+        messageId: 'plain-user',
+        conversationId: 'conversation-source',
+        text: 'Ordinary input.',
+        isCreatedByUser: true,
+      },
+      {},
+      req.user.id,
+    );
+    expect(
+      saveMessage.mock.calls.at(-1)[1].metadata?.viventium?.interactionContext,
+    ).toBeUndefined();
+  });
+  test('resolves selected recovered inputs through the real launch anchor after the normal writer', async () => {
+    const rows = new Map();
+    saveMessage.mockImplementation(async (_req, saved) => {
+      const row = { ...rows.get(saved.messageId), ...saved };
+      rows.set(row.messageId, row);
+      return row;
+    });
+    for (const [id, sourceEventId, revision, parentMessageId] of [
+      ['user-a', 'source-a', 1, 'root'],
+      ['user-b', 'source-b', 2, 'user-a'],
+    ]) {
+      const req = request('voice', sourceEventId, revision);
+      const input = {
+        user: req.user.id,
+        messageId: id,
+        parentMessageId,
+        conversationId: 'conversation-source',
+        text: 'Accepted synthetic input.',
+        isCreatedByUser: true,
+      };
+      rows.set(id, attachInteractionContextMetadata(req, input));
+      await client(req).saveMessageToDatabase(input, {}, req.user.id);
+    }
+    rows.set(
+      'assistant-b',
+      attachInteractionContextMetadata(request('voice', 'source-b', 2), {
+        user: 'owner-source',
+        messageId: 'assistant-b',
+        parentMessageId: 'user-b',
+        conversationId: 'conversation-source',
+        isCreatedByUser: false,
+        unfinished: true,
+      }),
+    );
+    const updateOne = jest.fn().mockResolvedValue({ acknowledged: true, matchedCount: 1 });
+    const queryMessages = jest.fn(async (filter) =>
+      [...rows.values()].filter((row) =>
+        Object.entries(filter).every(([key, value]) => get(row, key) === value),
+      ),
+    );
+    const service = createGlassHiveCallbackBindingService({
+      mongoose: { connection: { collection: () => ({ updateOne }) } },
+      logger: { info: jest.fn(), warn: jest.fn() },
+      getMessages: queryMessages,
+      normalizeInteractionSourceSegments,
+      buildTrustedDelegationIdentity: () => ({
+        goalDigest: 'a'.repeat(64),
+        idempotencyKey: 'b'.repeat(64),
+      }),
+      promptLayerIntegritySnapshot: () => [],
+      recordOrchestrationTraceLaunch: jest.fn(),
+    });
+    const body = {
+      messageId: 'assistant-b',
+      parentMessageId: 'user-b',
+      conversationId: 'conversation-source',
+      viventiumAuthoringSourceEventId: 'source-b',
+      viventiumSourceEventId: 'source-b',
+      viventiumSurface: 'voice',
+      viventiumTriggeringSourceSegments: [
+        { ordinal: 0, source_event_id: 'source-a', source_index: 0, text: 'First input.' },
+        { ordinal: 1, source_event_id: 'source-b', source_index: 0, text: 'Continuation.' },
+      ],
+    };
+    for (const ordinals of [[1], [1, 2]]) {
+      const selection = selectTrustedLaunchRequestBody(body, ordinals);
+      const binding = await service.registerGlassHiveLaunchContext({
+        user: { id: 'owner-source' },
+        requestBody: selection.requestBody,
+        toolName: 'workspace_launch',
+        toolArguments: { description: 'Complete the accepted objective.' },
+        toolCall: { id: 'call-' + ordinals.join('-') },
+      });
+      expect(binding.sourceEventId).toBe('source-a');
+      expect(updateOne.mock.calls.at(-1)[1].$setOnInsert).toMatchObject({
+        sourceEventId: 'source-a',
+        anchorMessageId: 'assistant-b',
+        requestedParentMessageId: 'user-b',
+        launchState: 'prepared',
+        workRef: '',
+      });
+    }
+    expect(queryMessages).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: 'user-b',
+        'metadata.viventium.interactionContext.source_event_id': 'source-b',
+      }),
+      'messageId parentMessageId isCreatedByUser createdAt',
+    );
+    expect(updateOne).toHaveBeenCalledTimes(4);
+  });
+});
+/* === VIVENTIUM END === */

@@ -13,6 +13,97 @@ const {
 } = require('../../../scripts/viventium-agent-runtime-models');
 
 describe('viventium-agent-runtime-models', () => {
+  test('explicit activation assignment carries the matching declared fallback effort from the canonical bundle', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const yaml = require('js-yaml');
+    const bundle = yaml.load(
+      fs.readFileSync(
+        path.resolve(__dirname, '../../../viventium/source_of_truth/local.viventium-agents.yaml'),
+        'utf8',
+      ),
+    );
+    const env = { START_GLASSHIVE: 'true' };
+    for (const map of Object.values(ACTIVATION_RUNTIME_ENV_BY_AGENT_ID)) {
+      env[map.providerEnv] = 'xai';
+      env[map.modelEnv] = 'grok-4.7';
+    }
+    const normalized = normalizeBundleForRuntime(bundle, { env });
+    const classified = normalized.mainAgent.background_cortices.filter(
+      (cortex) =>
+        cortex.activation.enabled !== false &&
+        cortex.activation.mode !== 'always' &&
+        cortex.activation.mode !== 'disabled',
+    );
+    expect(classified.length).toBeGreaterThan(0);
+    for (const cortex of classified)
+      expect(cortex.activation).toMatchObject({
+        provider: 'xai',
+        model: 'grok-4.7',
+        reasoning_effort: 'high',
+      });
+    expect(normalized.mainAgent.provider).toBe(bundle.mainAgent.provider);
+    expect(normalized.mainAgent.model).toBe(bundle.mainAgent.model);
+    expect(bundle.mainAgent.background_cortices[0].activation.provider).toBe('groq');
+  });
+
+  test('unchanged explicit activation assignment keeps the selected alternative effort', () => {
+    const bundle = {
+      mainAgent: {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'openAI',
+        model: 'gpt-6.1-sol',
+        background_cortices: [
+          {
+            agent_id: 'agent_viventium_red_team_95aeb3',
+            activation: {
+              provider: 'xai',
+              model: 'grok-4.7',
+              reasoning_effort: 'low',
+              fallbacks: [{ provider: 'xai', model: 'grok-4.7', reasoning_effort: 'high' }],
+            },
+          },
+        ],
+      },
+    };
+    const normalized = normalizeBundleForRuntime(bundle, {
+      env: {
+        VIVENTIUM_BACKGROUND_ACTIVATION_PROVIDER: 'xai',
+        VIVENTIUM_BACKGROUND_ACTIVATION_MODEL: 'grok-4.7',
+      },
+    });
+    expect(normalized.mainAgent.background_cortices[0].activation.reasoning_effort).toBe('low');
+  });
+
+  test('activation assignment cannot inherit effort from another provider with the same model label', () => {
+    const bundle = {
+      mainAgent: {
+        id: 'agent_viventium_main_95aeb3',
+        provider: 'openAI',
+        model: 'gpt-6.1-sol',
+        background_cortices: [
+          {
+            agent_id: 'agent_viventium_red_team_95aeb3',
+            activation: {
+              provider: 'groq',
+              model: 'qwen/qwen3.6-27b',
+              fallbacks: [
+                { provider: 'other-provider', model: 'grok-4.7', reasoning_effort: 'high' },
+              ],
+            },
+          },
+        ],
+      },
+    };
+    const normalized = normalizeBundleForRuntime(bundle, {
+      env: {
+        VIVENTIUM_BACKGROUND_ACTIVATION_PROVIDER: 'xai',
+        VIVENTIUM_BACKGROUND_ACTIVATION_MODEL: 'grok-4.7',
+      },
+    });
+    expect(normalized.mainAgent.background_cortices[0].activation.reasoning_effort).toBeUndefined();
+  });
+
   test('gives every classified built-in cortex an env-driven activation route', () => {
     const nonClassifiedAgentIds = ['agent_viventium_deep_memory_95aeb3'];
     const classifiedAgentIds = BUILT_IN_BACKGROUND_AGENT_IDS.filter(

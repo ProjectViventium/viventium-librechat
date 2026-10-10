@@ -247,3 +247,27 @@ describe('authenticated typed Call authority', () => {
     expect(resolve({ ...input, session: { ...call, status } }).canAuthorizeSideEffects).toBe(false);
   });
 });
+
+
+describe('proposed normal Call participant-track boundary', () => {
+  const trackSegment = { ...segment, speaker: { ...segment.speaker, source: 'participant_track' } };
+  const service = createVoiceEngagementAuthorityService({
+    getCallSession: jest.fn(), listSpeakerSegments: jest.fn(),
+    voiceTurnAuthority: jest.fn(() => ({ canAuthorizeSideEffects: true })),
+    verifyVoiceEngagementAttestation: jest.fn(),
+  });
+  test('normal Call keeps the existing exact owner authority', () => {
+    expect(service.finalizedOwnerSpeakerAuthority([trackSegment], { ...session, mode: 'call' })).toBe(true);
+  });
+  test.each(['wing', 'listen_only'])('track-only input cannot become %s authority', (mode) => {
+    expect(service.finalizedOwnerSpeakerAuthority([trackSegment], { ...session, mode })).toBe(false);
+  });
+  test.each([
+    { isFinal: false }, { overlap: true }, { uncertain: true },
+    { speaker: { ...trackSegment.speaker, participantIdentity: 'guest' } },
+    { speaker: { ...trackSegment.speaker, attribution: 'unknown' } },
+  ])('retains restrictive finality and identity checks: %j', (change) => {
+    expect(service.finalizedOwnerSpeakerAuthority([{ ...trackSegment, ...change }],
+      { ...session, mode: 'call' })).toBe(false);
+  });
+});

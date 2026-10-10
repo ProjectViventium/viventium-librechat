@@ -10,6 +10,7 @@ export const INTERACTION_DURABLE_EFFECT_STATES = [
 export const INTERACTION_DURABLE_EFFECT_KINDS = [
   'durable_work_accepted',
   'durable_work_action_accepted',
+  'provider_mutation_returned',
 ] as const;
 
 export const INTERACTION_DURABLE_EFFECT_SURFACES = [
@@ -81,7 +82,7 @@ export interface IInteractionDurableEffect {
   voiceAuthorityRef?: string;
   voice?: InteractionDurableVoiceAuthority;
   providerIdempotencyKey: string;
-  providerIdempotencyMode: 'native_key' | 'deterministic_reconciliation';
+  providerIdempotencyMode: 'native_key' | 'deterministic_reconciliation' | 'none';
   runtimeBindingAtReserve?: InteractionDurableEffectRuntimeBinding;
   status: InteractionDurableEffectState;
   claimRevision: number;

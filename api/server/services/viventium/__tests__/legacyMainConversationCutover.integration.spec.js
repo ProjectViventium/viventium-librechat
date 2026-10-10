@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const { createModels } = require('@librechat/data-schemas');
 const { Constants, EModelEndpoint } = require('librechat-data-provider');
-const { formatAgentMessages } = require('~/app/clients/prompts/formatMessages');
+const { formatAgentMessages } = require('@librechat/agents');
 const BaseClient = require('~/app/clients/BaseClient');
 const {
   captureMainContextSnapshot,
@@ -102,8 +102,9 @@ async function storedBranch() {
 
 async function captureReloaded({ prune = false } = {}) {
   const branch = await storedBranch();
-  const formatted = formatAgentMessages(
+  const { messages: formatted } = formatAgentMessages(
     (prune ? branch.slice(1) : branch).map((row) => ({
+      messageId: row.messageId,
       role: row.isCreatedByUser ? 'user' : 'assistant',
       content: row.text,
     })),
@@ -135,8 +136,9 @@ async function captureFromLoadedHistory() {
     messageId: 'new-user',
   }).lean();
   const branch = [...prior, current];
-  const formatted = formatAgentMessages(
+  const { messages: formatted } = formatAgentMessages(
     branch.map((row) => ({
+      messageId: row.messageId,
       role: row.isCreatedByUser ? 'user' : 'assistant',
       content: row.text,
     })),
@@ -280,7 +282,9 @@ test('a new root conversation still binds Core V1 with an empty ancestry proof',
     {
       agent: agent(),
       visibleMessages: [fresh],
-      messages: formatAgentMessages([{ role: 'user', content: fresh.text }]),
+      messages: formatAgentMessages([
+        { messageId: fresh.messageId, role: 'user', content: fresh.text },
+      ]).messages,
       historyAncestry: client._viventiumHistoryAncestryV1,
     },
   );

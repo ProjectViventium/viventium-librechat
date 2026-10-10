@@ -1,7 +1,7 @@
 import { InMemoryJobStore } from '../implementations/InMemoryJobStore';
 import { GenerationJobManagerClass } from '../GenerationJobManager';
 import { InMemoryEventTransport } from '../implementations/InMemoryEventTransport';
-import { nativeJobProofJson } from '../implementations/nativeResponse';
+import { nativeJobProofJson, nativeJobMatches, nativeIdentityValid } from '../implementations/nativeResponse';
 import type { SerializableJobData } from '../interfaces/IJobStore';
 
 import { admitted, nativeStoreContract } from './nativeResponse.helper';
@@ -932,3 +932,287 @@ test('Web removal acknowledgement validates presentation and fences a replacemen
     expect((await store.getJob(identity.streamId))?.deliveryAcknowledgement).toBeUndefined();
   } finally { await manager.destroy(); }
 });
+
+
+describe('delivery removal retains the exact live result producer', () => {
+  async function fixture() {
+    const store = new InMemoryJobStore();
+    const transport = new InMemoryEventTransport();
+    const manager = new GenerationJobManagerClass({ jobStore: store, eventTransport: transport });
+    await manager.initialize();
+    const streamId = 'producer-liveness-stream';
+    await manager.observeSourceOrder({ source_order_scope: 'd'.repeat(64), source_sequence: 1 });
+    const job = await manager.createJob(streamId, 'producer-owner', 'producer-conversation', {
+      interactionContext: {
+        actor_kind: 'external_user', origin: 'interactive', surface: 'voice',
+        conversation_id: 'producer-conversation', revision: 1, source_event_id: 'producer-source',
+        source_order_scope: 'd'.repeat(64), source_sequence: 1,
+        source_segments: [{ ordinal: 0, source_event_id: 'producer-source', source_index: 0, text: 'Question.' }],
+      },
+      deliveryPolicy: { commit_authority: 'external_adapter' },
+      userMessage: { messageId: 'producer-source' },
+    });
+    await manager.updateMetadata(streamId, { responseMessageId: 'producer-response' });
+    const context = job.metadata.interactionContext!;
+    return { manager, store, streamId, ack: {
+      logical_turn_id: context.logical_turn_id!, revision: context.revision, state: 'partial_removed' as const,
+      presentation_ref: 'speech-presentation',
+    } };
+  }
+
+  test('proves a pre-admission live producer from existing reads and preserves duplicate ACK truth', async () => {
+    const { manager, store, streamId, ack } = await fixture();
+    try {
+      const read = jest.spyOn(store, 'getJob');
+      const result = await manager.acknowledgeDelivery(ack, 'voice');
+      expect(result).toMatchObject({ status: 'recorded', presentation: {
+        userId: 'producer-owner', conversationId: 'producer-conversation',
+        responseMessageId: 'producer-response', producerPending: true,
+      } });
+      expect(result.acknowledgement?.state).toBe('partial_removed');
+      expect(read).toHaveBeenCalledTimes(3);
+      expect((await store.getJob(streamId))?.nativeResponse).toBeUndefined();
+      read.mockClear();
+      const duplicate = await manager.acknowledgeDelivery(ack, 'voice');
+      expect(duplicate).toMatchObject({ status: 'recorded', idempotent: true, presentation: { producerPending: true } });
+      expect(read).toHaveBeenCalledTimes(3);
+    } finally { await manager.destroy(); }
+  });
+
+  test.each([
+    ['completed', { generationCompleted: true }],
+    ['finished', { status: 'completed' }],
+    ['failed', { status: 'failed' }],
+    ['cancelled', { nativeResponseCancelled: true }],
+    ['aborted', { status: 'aborted' }],
+    ['superseded', { status: 'superseded' }],
+    ['unknown', { status: undefined }],
+  ])('does not grant producer retention to %s generation', async (_label, update) => {
+    const { manager, store, streamId, ack } = await fixture();
+    try {
+      if ('nativeResponseCancelled' in update) {
+        const { identity } = await admitted(store, 'cancelled-producer', true, 'voice' as never, true);
+        expect(await store.bindNativeResponse(identity)).toBe(true);
+        expect(await store.revokeNativeResponse(identity)).toEqual({ status: 'revoked' });
+        const result = await manager.acknowledgeDelivery({
+          ...ack, logical_turn_id: identity.logicalTurnId, revision: identity.revision,
+        }, 'voice');
+        expect(result.status).toBe('recorded');
+        expect(result.presentation?.producerPending).not.toBe(true);
+        return;
+      } else await store.updateJob(streamId, update as never);
+      const result = await manager.acknowledgeDelivery(ack, 'voice');
+      expect(result.status).toBe('recorded');
+      expect(result.presentation?.producerPending).not.toBe(true);
+    } finally { await manager.destroy(); }
+  });
+
+  test.each([
+    ['owner', { userId: 'another-owner' }],
+    ['conversation', { conversationId: 'another-conversation' }],
+    ['result', { responseMessageId: 'another-response' }],
+    ['generation', { createdAt: 123 }],
+    ['stream', { streamId: 'another-stream' }],
+    ['logical turn', { interactionContext: { logical_turn_id: 'another-turn', revision: 1 } }],
+    ['revision', { interactionContext: { logical_turn_id: 'another-turn', revision: 2 } }],
+  ])('does not grant retention when the post-ACK %s binding differs', async (_label, changed) => {
+    const { manager, store, ack } = await fixture();
+    try {
+      const read = store.getJob.bind(store);
+      let count = 0;
+      jest.spyOn(store, 'getJob').mockImplementation(async (id) => {
+        const row = await read(id);
+        count += 1;
+        const patch = _label === 'revision' && row
+          ? { interactionContext: { ...row.interactionContext!, revision: row.interactionContext!.revision + 1 } }
+          : changed;
+        return row && count === 3 ? { ...row, ...patch } as SerializableJobData : row;
+      });
+      const result = await manager.acknowledgeDelivery(ack, 'voice');
+      expect(result.status).toBe('recorded');
+      expect(result.presentation?.producerPending).not.toBe(true);
+    } finally { await manager.destroy(); }
+  });
+});
+
+/* === VIVENTIUM START === Released Main public parts remain owned by the live Core turn. === */
+describe('released Main public-part owner', () => {
+  async function subject() {
+    const manager = new GenerationJobManagerClass();
+    const store = new InMemoryJobStore();
+    const transport = new InMemoryEventTransport();
+    manager.configure({ jobStore: store, eventTransport: transport, cleanupOnComplete: false });
+    await manager.initialize();
+    const scope = 'b'.repeat(64);
+    await manager.observeSourceOrder({ source_order_scope: scope, source_sequence: 1 });
+    const job = await manager.createJob('part-stream', 'part-owner', 'part-conversation', {
+      interactionContext: {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'voice',
+        conversation_id: 'part-conversation',
+        revision: 1,
+        source_event_id: 'part-source',
+        source_order_scope: scope,
+        source_sequence: 1,
+      },
+    });
+    await manager.updateMetadata('part-stream', {
+      responseMessageId: 'part-answer',
+      userMessage: { messageId: 'part-source' },
+    });
+    const admittedAt = Date.now();
+    const identity = {
+      userId: 'part-owner',
+      conversationId: 'part-conversation',
+      responseMessageId: 'part-answer',
+      streamId: 'part-stream',
+      jobCreatedAt: job.createdAt,
+      logicalTurnId: job.metadata.interactionContext!.logical_turn_id!,
+      revision: 1,
+      sourceOrderScope: scope,
+      sourceSequence: 1,
+      invocationId: 'part-invocation',
+      bodySha256: 'a'.repeat(64),
+      originSha256: 'a'.repeat(64),
+      providerId: 'part-provider',
+      agentId: 'part-agent',
+      source: { id: 'part-source-db', messageId: 'part-source', digest: 'a'.repeat(64) },
+      admittedAt,
+      recoverUntil: admittedAt + 86_400_000,
+    };
+    expect(nativeIdentityValid(identity)).toBe(true);
+    expect(nativeJobMatches(await store.getJob(identity.streamId), identity)).toBe(true);
+    expect(await manager.bindNativeResponse(identity)).toBe(true);
+    expect((await manager.revokeNativeResponse(identity)).status).toBe('revoked');
+    expect(await manager.settleNativeResponse(identity, 'unsupported')).toBe(true);
+    expect((await store.getJob(identity.streamId))?.nativeResponse).toBeUndefined();
+    const event = {
+      event: 'on_public_content_part_complete',
+      data: {
+        completion: {
+          version: 1,
+          complete: true,
+          request_id: 'later-request',
+          run_id: 'later-run',
+          part_id: 'later-run:1',
+          message_id: identity.responseMessageId,
+          stream_id: identity.streamId,
+        },
+        deliveryDisposition: {
+          version: 1,
+          audio: 'eligible',
+          required: true,
+          valid: true,
+          source: 'model',
+        },
+      },
+    };
+    const publicPartOwner = { identity, verifySource: jest.fn(async () => true) };
+    const delivered = jest.fn();
+    transport.subscribe(identity.streamId, { onChunk: delivered });
+    return { manager, store, transport, job, identity, event, publicPartOwner, delivered };
+  }
+  it('emits the later control after the real unsupported store transition without rebinding Native', async () => {
+    const s = await subject();
+    try {
+      await expect(
+        s.manager.emitChunk(s.identity.streamId, s.event as never, s.identity),
+      ).resolves.toMatchObject({ delivered: false });
+      await expect(
+        s.manager.emitChunk(s.identity.streamId, s.event as never, {
+          publicPartOwner: s.publicPartOwner,
+        }),
+      ).resolves.toMatchObject({ delivered: true });
+      expect(s.delivered).toHaveBeenCalledTimes(1);
+      expect((await s.store.getJob(s.identity.streamId))?.nativeResponse).toBeUndefined();
+    } finally {
+      await s.manager.destroy();
+    }
+  });
+  it.each([
+    'source',
+    'completed',
+    'cancelled',
+    'conflicting_native',
+    'owner',
+    'incarnation',
+    'response',
+    'revision',
+    'newer_source',
+    'arbitrary_event',
+    'skip',
+    'foreign_marker',
+  ])('refuses %s', async (kind) => {
+    const s = await subject();
+    try {
+      if (kind === 'source') s.publicPartOwner.verifySource.mockResolvedValue(false);
+      if (kind === 'completed')
+        await s.store.updateJob(s.identity.streamId, { generationCompleted: true });
+      if (kind === 'cancelled')
+        await s.store.cancelNativeResponse((await s.store.getJob(s.identity.streamId))!);
+      if (kind === 'conflicting_native') {
+        const current = await s.store.getJob(s.identity.streamId);
+        jest
+          .spyOn(s.store, 'getJob')
+          .mockResolvedValue({
+            ...current!,
+            nativeResponse: { ...s.identity, invocationId: 'foreign' },
+          });
+      }
+      if (kind === 'owner') s.publicPartOwner.identity = { ...s.identity, userId: 'foreign' };
+      if (kind === 'incarnation')
+        s.publicPartOwner.identity = { ...s.identity, jobCreatedAt: s.identity.jobCreatedAt + 1 };
+      if (kind === 'response')
+        s.publicPartOwner.identity = { ...s.identity, responseMessageId: 'foreign' };
+      if (kind === 'revision') s.publicPartOwner.identity = { ...s.identity, revision: 2 };
+      if (kind === 'newer_source')
+        await s.store.observeSourceOrder({
+          source_order_scope: s.identity.sourceOrderScope,
+          source_sequence: 2,
+        });
+      if (kind === 'arbitrary_event') s.event.event = 'on_cortex_followup';
+      if (kind === 'skip') s.event.data.deliveryDisposition.audio = 'skip';
+      if (kind === 'foreign_marker') s.event.data.completion.stream_id = 'foreign';
+      await expect(
+        s.manager.emitChunk(s.identity.streamId, s.event as never, {
+          publicPartOwner: s.publicPartOwner,
+        }),
+      ).resolves.toMatchObject({ delivered: false });
+      expect(s.delivered).not.toHaveBeenCalled();
+    } finally {
+      await s.manager.destroy();
+    }
+  });
+  it.each(['stop', 'replace', 'source_advance'])(
+    'rechecks after delayed source lookup: %s',
+    async (kind) => {
+      const s = await subject();
+      try {
+        s.publicPartOwner.verifySource.mockImplementationOnce(async () => {
+          if (kind === 'stop')
+            await s.manager.abortJob(s.identity.streamId, 'user_cancelled', s.identity.userId);
+          if (kind === 'replace')
+            await s.store.updateJob(s.identity.streamId, {
+              createdAt: s.identity.jobCreatedAt + 1,
+            });
+          if (kind === 'source_advance')
+            await s.store.observeSourceOrder({
+              source_order_scope: s.identity.sourceOrderScope,
+              source_sequence: 2,
+            });
+          return true;
+        });
+        await expect(
+          s.manager.emitChunk(s.identity.streamId, s.event as never, {
+            publicPartOwner: s.publicPartOwner,
+          }),
+        ).resolves.toMatchObject({ delivered: false });
+        expect(s.delivered).not.toHaveBeenCalled();
+      } finally {
+        await s.manager.destroy();
+      }
+    },
+  );
+});
+/* === VIVENTIUM END === */

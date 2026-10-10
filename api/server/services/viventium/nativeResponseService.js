@@ -12,6 +12,8 @@ const {
   projectNativeToolEvidence,
   isAudioDeliveryRequested,
   supportsMessagingDeliveryDisposition,
+  prepareNativeSourceRecovery,
+  deliverCortexBatchToRunningMain,
 } = require('@librechat/api');
 const {
   extractEnvVariable,
@@ -53,7 +55,19 @@ function projectNativeMessage(identity, response, message, purpose, candidate) {
     { ...message, metadata },
     inspectProviderDeliveryDisposition(response),
   );
-  if (purpose === 'transmit' && context?.surface === 'telegram' && context.authenticated) {
+  if (
+    purpose === 'transmit' &&
+    context?.authenticated === true &&
+    (context.surface === 'telegram' || context.surface === 'voice')
+  ) {
+    if (context.surface === 'voice' && Array.isArray(message.content)) {
+      message = {
+        ...message,
+        content: message.content.filter(
+          (part) => part?.type !== 'think' && part?.type !== 'reasoning',
+        ),
+      };
+    }
     // The authenticated bridge consumes original structural controls; Mongo stays clean.
     return message;
   }
@@ -65,26 +79,28 @@ async function resolveNativeResponseRoute(identity) {
   const user = await db.findUser({ _id: identity.userId });
   if (!user) throw new Error('native_response_owner_unavailable');
   const config = await require('~/server/services/Config').getAppConfig({ role: user.role });
-  const req = { user: { ...user, id: identity.userId }, config };
-  const agent = await require('~/models/Agent').loadAgent({
-    req,
-    agent_id: identity.agentId,
-    endpoint: EModelEndpoint.agents,
-  });
-  if (
-    !agent ||
-    (!isEphemeralAgentId(identity.agentId) &&
-      user.role !== SystemRoles.ADMIN &&
-      (!agent._id ||
-        !(await require('~/server/services/PermissionService').checkPermission({
-          userId: identity.userId,
-          role: user.role,
-          resourceType: ResourceType.AGENT,
-          resourceId: agent._id,
-          requiredPermission: PermissionBits.VIEW,
-        }))))
-  )
-    throw new Error('native_response_agent_unavailable');
+  // Ephemeral identity belongs to the original request; only saved agents need a VIEW lookup.
+  if (!identity.agentId || !isEphemeralAgentId(identity.agentId)) {
+    const req = { user: { ...user, id: identity.userId }, config };
+    const agent = await require('~/models/Agent').loadAgent({
+      req,
+      agent_id: identity.agentId,
+      endpoint: EModelEndpoint.agents,
+    });
+    if (
+      !agent ||
+      (user.role !== SystemRoles.ADMIN &&
+        (!agent._id ||
+          !(await require('~/server/services/PermissionService').checkPermission({
+            userId: identity.userId,
+            role: user.role,
+            resourceType: ResourceType.AGENT,
+            resourceId: agent._id,
+            requiredPermission: PermissionBits.VIEW,
+          }))))
+    )
+      throw new Error('native_response_agent_unavailable');
+  }
   const capability = config?.endpoints?.agents?.providerCapabilities?.[identity.providerId];
   const endpoint = config?.endpoints?.custom?.find((entry) => entry.name === identity.providerId);
   if (
@@ -160,7 +176,6 @@ function getService() {
  * dispatch stays pending the same way until GlassHive's own anchored deadline ends it.
  * === VIVENTIUM END === */
 const NATIVE_RELEASE_POLL_DELAYS_MS = Object.freeze([150, 300, 600, 1000, 2000]);
-let lastReportedResponseTimeoutMs = 0;
 
 function waitForNativeRelease(delayMs) {
   return new Promise((resolve) => {
@@ -187,13 +202,14 @@ function createNativeResponseRelease(req, route, deps = {}) {
   const now = deps.now || Date.now;
   const providerId = route.endpoint || route.provider;
   const endpoint = req.config?.endpoints?.custom?.find((entry) => entry.name === providerId);
-  const baseURL = extractEnvVariable(endpoint?.baseURL || '');
-  const apiKey = extractEnvVariable(endpoint?.apiKey || '');
+  const baseURL = deps.baseURL || extractEnvVariable(endpoint?.baseURL || '');
+  const apiKey = deps.apiKey || extractEnvVariable(endpoint?.apiKey || '');
   const ownerId = String(req.user?.id || '').trim();
   const routable = Boolean(
     baseURL && !baseURL.includes('${') && apiKey && !apiKey.includes('${') && ownerId,
   );
   let occupiedWaits = 0;
+  let lastReportedResponseTimeoutMs = 0;
 
   const currentTargets = async (context) => {
     const store = GenerationJobManager.getJobStore();
@@ -231,6 +247,9 @@ function createNativeResponseRelease(req, route, deps = {}) {
     GenerationJobManager.renewNativeDispatchLease(context.streamId, context.jobCreatedAt);
 
   return {
+    get responseTimeoutMs() {
+      return lastReportedResponseTimeoutMs;
+    },
     async beforeDispatch(context) {
       for (let attempt = 0; ; attempt += 1) {
         const targets = await currentTargets(context);
@@ -283,10 +302,63 @@ function createNativeResponseRelease(req, route, deps = {}) {
 /* === VIVENTIUM END === */
 
 function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
-  if (route.agentId !== primaryAgentId) return baseFetch;
+  if (route.agentId !== primaryAgentId) {
+    // Participants own their provider invocation and effects. Only the current shared turn's
+    // provenance follows them, so their native files retain their original author identity.
+    return async (input, init) => {
+      const requestUrl =
+        typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+      if (!new URL(requestUrl).pathname.endsWith('/chat/completions'))
+        return baseFetch(input, init);
+      const source = req._viventiumNativeResponseSource;
+      const context = require('./interactionContext').getTrustedInteractionContext(req);
+      const providerId = route.endpoint || route.provider;
+      const capability = req.config?.endpoints?.agents?.providerCapabilities?.[providerId];
+      if (
+        !context?.logical_turn_id ||
+        context.origin !== 'interactive' ||
+        context.actor_kind !== 'external_user' ||
+        capability?.conversation_session !== true ||
+        capability?.workspace_binding !== true
+      )
+        return baseFetch(input, init);
+      const store = GenerationJobManager.getJobStore();
+      const streamId = req._resumableStreamId;
+      const job = await store.getJob(streamId);
+      const conversationId = source ? source.conversationId : job?.conversationId;
+      const responseMessageId = source ? source.responseMessageId : job?.responseMessageId;
+      const sourceMessageId = source ? source.proof?.messageId : job?.userMessage?.messageId;
+      if (
+        !job ||
+        !req.user?.id ||
+        !conversationId ||
+        !responseMessageId ||
+        !sourceMessageId ||
+        job.userId !== req.user.id ||
+        job.streamId !== streamId ||
+        job.status !== 'running' ||
+        job.conversationId !== conversationId ||
+        context.conversation_id !== conversationId ||
+        job.responseMessageId !== responseMessageId ||
+        job.userMessage?.messageId !== sourceMessageId ||
+        job.interactionContext?.logical_turn_id !== context.logical_turn_id ||
+        job.interactionContext?.revision !== context.revision ||
+        !(await store.isCurrentLogicalTurn(streamId))
+      )
+        throw supersededDispatchError();
+      const headers = new Headers(input instanceof Request ? input.headers : undefined);
+      new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+      headers.set('X-Viventium-Logical-Turn-Id', context.logical_turn_id);
+      headers.set('X-Viventium-Logical-Turn-Revision', String(context.revision));
+      return baseFetch(input, { ...init, headers });
+    };
+  }
   return createNativeResponseFetch(
     baseFetch,
     async () => {
+      /* === VIVENTIUM START === Each Main attempt owns its current admission proof. */
+      delete req._viventiumNativeResponseUnaccepted;
+      /* === VIVENTIUM END === */
       const source = req._viventiumNativeResponseSource;
       const context = require('./interactionContext').getTrustedInteractionContext(req);
       const providerId = route.endpoint || route.provider;
@@ -336,7 +408,93 @@ function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
       req._viventiumNativeResponseIdentity = identity;
     },
     createNativeResponseRelease(req, route),
+    /* === VIVENTIUM START === Retain proof only after the exact recovery fence was released. */
+    async (identity) => {
+      await getService().rejectUnaccepted(identity);
+      req._viventiumNativeResponseUnaccepted = identity;
+    },
+    /* === VIVENTIUM END === */
   );
+}
+
+/* VIVENTIUM: The original native Main may have handed off before its cohort sealed. Later
+ * primary graph dispatches read the immutable accepted data from that exact parent, while
+ * foreground instructions and history remain request-pinned. This read never changes receipts. */
+async function readCurrentMainBackgroundInputs(req, primaryAgentId) {
+  if (!/^[a-f0-9]{64}$/.test(process.env.WPR_GROK_REVIEWED_BINARY_SHA256 || '')) return [];
+  const identity = req._viventiumNativeResponseIdentity;
+  if (!identity) return [];
+  const source = req._viventiumNativeResponseSource;
+  const context = require('./interactionContext').getTrustedInteractionContext(req);
+  const invalid = () =>
+    Object.assign(new Error('Current Main background source is unavailable'), {
+      code: 'main_background_source_unavailable',
+    });
+  if (
+    !source ||
+    !context ||
+    identity.userId !== req.user?.id ||
+    identity.agentId !== primaryAgentId ||
+    identity.streamId !== req._resumableStreamId ||
+    identity.conversationId !== source.conversationId ||
+    identity.responseMessageId !== source.responseMessageId ||
+    identity.source.messageId !== source.proof?.messageId ||
+    identity.source.id !== source.proof?.id ||
+    identity.source.digest !== source.proof?.digest ||
+    context.conversation_id !== identity.conversationId ||
+    context.logical_turn_id !== identity.logicalTurnId ||
+    context.revision !== identity.revision ||
+    context.source_order_scope !== identity.sourceOrderScope ||
+    interactionPresentationSequence(context) !== identity.sourceSequence
+  )
+    throw invalid();
+  const store = GenerationJobManager.getJobStore();
+  const assertCurrent = async () => {
+    if (!(await store.isCurrentLogicalTurn(identity.streamId))) throw supersededDispatchError();
+    if (identity.sourceOrderScope && identity.sourceSequence != null) {
+      const observed = await GenerationJobManager.observeSourceOrder({
+        source_order_scope: identity.sourceOrderScope,
+        source_sequence: identity.sourceSequence,
+      });
+      if (observed.stale || observed.latest_source_sequence !== identity.sourceSequence)
+        throw supersededDispatchError();
+    }
+    const job = await store.getJob(identity.streamId);
+    if (
+      !nativeJobMatches(job, identity) ||
+      job.status !== 'running' ||
+      job.generationCompleted ||
+      job.nativeResponseCancelled ||
+      (job.nativeResponse &&
+        nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity))
+    )
+      throw supersededDispatchError();
+  };
+  await assertCurrent();
+  const db = require('~/models');
+  const row = await db.getNativeResponse(identity.userId, identity.responseMessageId);
+  if (
+    !row ||
+    String(row.user) !== identity.userId ||
+    row.deletedAt ||
+    (row.error === true && row.nativeResponse?.status !== 'unsupported') ||
+    row.isCreatedByUser !== false ||
+    row.conversationId !== identity.conversationId ||
+    row.messageId !== identity.responseMessageId ||
+    row.parentMessageId !== identity.source.messageId ||
+    !row.nativeResponse ||
+    nativeIdentityJson(row.nativeResponse) !== nativeIdentityJson(identity) ||
+    !['pending', 'unsupported'].includes(row.nativeResponse.status)
+  )
+    throw invalid();
+  const inputs = require('@librechat/data-schemas').normalizeMainBackgroundInputs(
+    row.metadata?.viventium?.backgroundInputs,
+  );
+  if (inputs.some((value) => value.invocationId !== identity.invocationId)) throw invalid();
+  if (inputs.length && !(await db.nativeResponseSourceMatches(identity))) throw invalid();
+  // Revalidate after every canonical source lookup; Core can move on before Native sees it.
+  await assertCurrent();
+  return inputs;
 }
 
 async function recoverSavedNativeResponse(identity, onTerminal) {
@@ -471,6 +629,52 @@ async function installNativeResponseRecovery() {
   await require('~/models').ensureNativeResponseIndexes();
   GenerationJobManager.setNativeResponseRecovery(recoverNativeResponse);
   GenerationJobManager.setNativeResponseCancellation(persistNativeResponseCancellation);
+  GenerationJobManager.setNativeSourceRecovery(async (current, previous) => {
+    const route = previous.nativeResponse
+      ? await resolveNativeResponseRoute(previous.nativeResponse)
+      : null;
+    const release = createNativeResponseRelease(
+      { user: { id: current.userId } },
+      {},
+      {
+        baseURL: route?.baseURL,
+        apiKey: route?.headers.Authorization.slice('Bearer '.length),
+      },
+    );
+    return prepareNativeSourceRecovery(current, previous, {
+      isUnboundCancelled: (job) =>
+        GenerationJobManager.getJobStore().isNativeResponseUnboundCancelled(job),
+      beforeCapture: async (job) => {
+        const callId = job.viventiumCallSessionId || job.voiceCallSessionId;
+        if (job.interactionContext?.surface === 'voice' && callId) {
+          const call = await require('./CallSessionService').getCallSession(callId);
+          if (!call || call.userId !== job.userId || call.conversationId !== job.conversationId) {
+            throw releaseUnconfirmedError(
+              'native_source_delivery_unavailable',
+              'The owning call could not be confirmed',
+            );
+          }
+          if (['ended', 'failed'].includes(call.status)) {
+            throw releaseUnconfirmedError(
+              'native_source_delivery_terminal',
+              'The owning call has ended or failed',
+            );
+          }
+        }
+        await release.beforeDispatch({
+          streamId: job.streamId,
+          jobCreatedAt: job.createdAt,
+          userId: job.userId,
+        });
+        return release.responseTimeoutMs > 0
+          ? job.createdAt + release.responseTimeoutMs
+          : undefined;
+      },
+      getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
+      readFacts: require('./InteractionDurableEffectService').getSourceRecoverySnapshot,
+      sleep: waitForNativeRelease,
+    });
+  });
 }
 
 async function recoverNativeResponses() {
@@ -510,6 +714,29 @@ const mutateNativeResponseSources = (filter, operation, kind = 'edit') =>
   );
 
 module.exports = {
+  deliverCompletedCortexBatchToRunningMain: (input, isEligible) =>
+    deliverCortexBatchToRunningMain(input, {
+      // Canonical opt-in only; the producer still verifies the exact active artifact/capability.
+      liveContextEnabled: /^[a-f0-9]{64}$/.test(process.env.WPR_GROK_REVIEWED_BINARY_SHA256 || ''),
+      getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
+      readAdmission: async (ownerId, messageId) =>
+        (await require('~/models').getNativeResponse(ownerId, messageId))?.nativeResponse || null,
+      resolveRoute: resolveNativeResponseRoute,
+      isEligible,
+      isCurrentLogicalTurn: (streamId) =>
+        GenerationJobManager.getJobStore().isCurrentLogicalTurn(streamId),
+      observeSourceOrder: (context) => GenerationJobManager.observeSourceOrder(context),
+      prepareInput: (identity, input, mode) =>
+        require('~/models').prepareNativeMainBackgroundInput(
+          identity,
+          input,
+          runNativeResponseTransaction,
+          mode,
+        ),
+      recordInputReceipt: (identity, receipt) =>
+        require('~/models').recordNativeMainBackgroundInputReceipt(identity, receipt),
+    }),
+  readCurrentMainBackgroundInputs,
   resolveNativeResponseRoute,
   getService,
   createNativeResponseRelease,

@@ -11,6 +11,7 @@ let mockFindOneAndUpdate;
 let mockFindOne;
 let mockFind;
 let mockGetUserById;
+let mockGetFeelingState;
 let mockGetConvo;
 let mockSaveConvo;
 let mockGetAgent;
@@ -66,6 +67,7 @@ jest.mock('@librechat/api', () => ({
 
 jest.mock('~/models', () => ({
   getUserById: (...args) => mockGetUserById(...args),
+  getFeelingState: (...args) => mockGetFeelingState(...args),
   getConvo: (...args) => mockGetConvo(...args),
   saveConvo: (...args) => mockSaveConvo(...args),
 }));
@@ -194,6 +196,35 @@ function row(overrides = {}) {
   };
 }
 
+let feelingPromptFixtureDirectory;
+let previousFeelingPromptBundle;
+beforeAll(() => {
+  const fs = require('fs');
+  const path = require('path');
+  const {
+    buildPromptBundleFixture,
+  } = require('../../../../../scripts/test-support/promptBundle.cjs');
+  feelingPromptFixtureDirectory = fs.mkdtempSync(
+    path.join(require('os').tmpdir(), 'mission-feelings-test-'),
+  );
+  const bundle = path.join(feelingPromptFixtureDirectory, 'bundle.json');
+  fs.writeFileSync(
+    bundle,
+    JSON.stringify(
+      buildPromptBundleFixture(
+        path.resolve(__dirname, '../../../../../viventium/source_of_truth/prompts'),
+      ),
+    ),
+  );
+  previousFeelingPromptBundle = process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+  process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundle;
+});
+afterAll(() => {
+  if (previousFeelingPromptBundle === undefined) delete process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+  else process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = previousFeelingPromptBundle;
+  require('fs').rmSync(feelingPromptFixtureDirectory, { recursive: true, force: true });
+});
+
 describe('GlassHiveMissionAdjudicationService', () => {
   beforeEach(() => {
     clearAdjudicationTimersForTests();
@@ -214,6 +245,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
     mockFindOne = jest.fn().mockResolvedValue(null);
     mockFind = jest.fn().mockReturnValue(cursor([]));
     mockGetUserById = jest.fn().mockResolvedValue({ id: 'user-1', role: 'USER' });
+    mockGetFeelingState = jest.fn().mockResolvedValue(null);
     mockGetConvo = jest
       .fn()
       .mockResolvedValue({ conversationId: 'conversation-1', user: 'user-1' });
@@ -241,6 +273,167 @@ describe('GlassHiveMissionAdjudicationService', () => {
   afterEach(() => {
     clearAdjudicationTimersForTests();
     jest.useRealTimers();
+  });
+
+  test.each(['web', 'voice', 'telegram'])(
+    'reads a fresh exact owner version for %s mission synthesis',
+    async (surface) => {
+      const { loadFeelingsReadContext, clearFeelingsReadCache } = require('@librechat/api');
+      clearFeelingsReadCache('user-1');
+      mockGetFeelingState.mockResolvedValueOnce({ enabled: true, version: 1 });
+      await loadFeelingsReadContext({ userId: 'user-1', getFeelingState: mockGetFeelingState });
+      mockGetFeelingState.mockResolvedValue({ enabled: true, version: 2 });
+      const evidence = row({ surface });
+      mockFind.mockReturnValueOnce(cursor([evidence]));
+      mockFindOneAndUpdate.mockResolvedValueOnce({ ...evidence, state: 'processing' });
+      await expect(
+        flushGlassHiveMissionAdjudications({ ownerId: 'user-1' }),
+      ).resolves.toMatchObject({ visible: 1, failed: 0 });
+      const req = mockPrepareCortexFollowUpMessage.mock.calls[0][0].req;
+      expect(mockGetFeelingState).toHaveBeenNthCalledWith(2, 'user-1');
+      expect(req._viventiumFeelingSnapshot).toEqual(
+        expect.objectContaining({ enabled: true, version: 2, cacheHit: false }),
+      );
+      expect(req._viventiumFeelingSnapshot.capsule).toContain('<viventium_feeling_state');
+      expect(req._viventiumFeelingReadFailureClass).toBe('');
+    },
+  );
+
+  test.each([undefined, false, true])(
+    'retains explicit isolation %s while old rows remain ordinary',
+    async (feelingsIsolated) => {
+      mockGetFeelingState.mockResolvedValue({ enabled: true, version: 2 });
+      const evidence = row({ feelingsIsolated });
+      mockFind.mockReturnValueOnce(cursor([evidence]));
+      mockFindOneAndUpdate.mockResolvedValueOnce({ ...evidence, state: 'processing' });
+      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      const req = mockPrepareCortexFollowUpMessage.mock.calls[0][0].req;
+      if (feelingsIsolated === true) {
+        expect(mockGetFeelingState).not.toHaveBeenCalled();
+        expect(req._viventiumFeelingSnapshot).toBeNull();
+        expect(req._viventiumFeelingReadFailureClass).toBe('temporary_eval_isolation');
+      } else {
+        expect(mockGetFeelingState).toHaveBeenCalledWith('user-1');
+        expect(req._viventiumFeelingSnapshot.enabled).toBe(true);
+      }
+    },
+  );
+
+  test('does not attach affect when the current owner disables Feelings', async () => {
+    mockGetFeelingState.mockResolvedValue({ enabled: false, version: 3 });
+    mockFind.mockReturnValueOnce(cursor([row()]));
+    await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+    expect(mockPrepareCortexFollowUpMessage.mock.calls[0][0].req._viventiumFeelingSnapshot).toEqual(
+      expect.objectContaining({ enabled: false, version: 3, capsule: '' }),
+    );
+  });
+
+  test.each(['state_read_failed', 'state_read_timeout'])(
+    'fails open to ordinary synthesis on %s',
+    async (failureClass) => {
+      const previous = process.env.VIVENTIUM_FEELINGS_READ_TIMEOUT_MS;
+      process.env.VIVENTIUM_FEELINGS_READ_TIMEOUT_MS = '25';
+      mockGetFeelingState =
+        failureClass === 'state_read_timeout'
+          ? jest.fn(() => new Promise(() => {}))
+          : jest.fn().mockRejectedValue(new Error('synthetic read failure'));
+      try {
+        mockFind.mockReturnValueOnce(cursor([row()]));
+        await expect(
+          flushGlassHiveMissionAdjudications({ ownerId: 'user-1' }),
+        ).resolves.toMatchObject({ visible: 1, failed: 0 });
+        const req = mockPrepareCortexFollowUpMessage.mock.calls[0][0].req;
+        expect(req._viventiumFeelingSnapshot).toBeNull();
+        expect(req._viventiumFeelingReadFailureClass).toBe(failureClass);
+      } finally {
+        if (previous === undefined) delete process.env.VIVENTIUM_FEELINGS_READ_TIMEOUT_MS;
+        else process.env.VIVENTIUM_FEELINGS_READ_TIMEOUT_MS = previous;
+      }
+    },
+  );
+
+  test('does not coalesce isolated and ordinary new callback consumers', async () => {
+    mockGetFeelingState.mockResolvedValue({ enabled: true, version: 2 });
+    const rows = [
+      row({ feelingsIsolated: true }),
+      row({
+        _id: 'cb-2',
+        evidenceId: 'cb-2',
+        originRef: 'ghi-origin-2',
+        anchorMessageId: 'anchor-2',
+        feelingsIsolated: false,
+      }),
+    ];
+    mockFind.mockReturnValueOnce(cursor(rows));
+    mockFindOneAndUpdate.mockImplementation(async (filter) => ({
+      ...rows.find((item) => item._id === filter._id),
+      state: 'processing',
+    }));
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({
+      groups: 2,
+      failed: 0,
+    });
+    const requests = mockPrepareCortexFollowUpMessage.mock.calls.map(([input]) => input.req);
+    expect(requests.filter((req) => req._viventiumFeelingSnapshot === null)).toHaveLength(1);
+    expect(requests.filter((req) => req._viventiumFeelingSnapshot?.enabled === true)).toHaveLength(
+      1,
+    );
+    expect(mockGetFeelingState).toHaveBeenCalledTimes(1);
+  });
+
+  test('fails open without owner affect for a persisted mixed isolation group', async () => {
+    const groupId = `ghag_${'9'.repeat(32)}`;
+    const members = ['cb-1', 'cb-2'];
+    const pinned = {
+      adjudicationGroupId: groupId,
+      adjudicationGroupMemberIds: members,
+      adjudicationGroupPinnedAt: new Date('2026-01-01T12:00:00.000Z'),
+    };
+    const rows = [
+      row({ ...pinned, feelingsIsolated: true }),
+      row({
+        ...pinned,
+        _id: 'cb-2',
+        evidenceId: 'cb-2',
+        originRef: 'ghi-origin-2',
+        feelingsIsolated: false,
+      }),
+    ];
+    mockFind.mockReturnValueOnce(cursor(rows));
+    mockFindOneAndUpdate.mockImplementation(async (filter) => ({
+      ...rows.find((item) => item._id === filter._id),
+      state: 'processing',
+    }));
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({
+      groups: 1,
+      failed: 0,
+    });
+    expect(mockGetFeelingState).not.toHaveBeenCalled();
+    expect(
+      mockPrepareCortexFollowUpMessage.mock.calls[0][0].req._viventiumFeelingSnapshot,
+    ).toBeNull();
+  });
+
+  test('persists isolation from its verified binding only', async () => {
+    await enqueueGlassHiveMissionAdjudication({
+      binding: {
+        originRef: 'ghi-origin-1',
+        ownerId: 'user-1',
+        conversationId: 'conversation-1',
+        anchorMessageId: 'assistant-anchor',
+        mainAgentId: 'main-agent',
+        feelingsIsolated: true,
+      },
+      body: {
+        callback_id: 'cb-isolated',
+        event: 'run.completed',
+        work_terminal: true,
+        work_state: 'completed',
+        message: 'Verified result.',
+        feelingsIsolated: false,
+      },
+    });
+    expect(mockUpdateOne.mock.calls[0][1].$setOnInsert.feelingsIsolated).toBe(true);
   });
 
   test('persists exact terminal evidence idempotently before scheduling synthesis', async () => {
@@ -487,6 +680,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
 
   test('defers account adjudication until callback commit and schedules nothing after abort', async () => {
     jest.useFakeTimers();
+    const scheduleTimer = jest.spyOn(global, 'setTimeout');
     const afterCommit = [];
     mockDeferAfterCommit.mockImplementation((operation) => {
       afterCommit.push(operation);
@@ -518,7 +712,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
 
     expect(mockUpdateOne).toHaveBeenCalledTimes(1);
     expect(afterCommit).toHaveLength(1);
-    expect(jest.getTimerCount()).toBe(0);
+    expect(scheduleTimer).not.toHaveBeenCalled();
 
     await afterCommit[0]();
     await jest.advanceTimersByTimeAsync(COALESCE_MS);
@@ -528,10 +722,12 @@ describe('GlassHiveMissionAdjudicationService', () => {
     await enqueue('aborted-owner');
     expect(mockUpdateOne).toHaveBeenCalledTimes(2);
     expect(afterCommit).toHaveLength(2);
-    expect(jest.getTimerCount()).toBe(0);
+    expect(scheduleTimer).toHaveBeenCalledTimes(1);
+    expect(scheduleTimer).toHaveBeenCalledWith(expect.any(Function), COALESCE_MS);
 
     await jest.runOnlyPendingTimersAsync();
     expect(mockFind).toHaveBeenCalledTimes(1);
+    scheduleTimer.mockRestore();
   });
 
   test('serializes one owner flush and schedules one lossless follow-up flush', async () => {
@@ -1324,6 +1520,73 @@ describe('GlassHiveMissionAdjudicationService', () => {
     },
   );
 
+  test.each([
+    ['pending', false, false, false],
+    ['processing', false, false, false],
+    ['failed', false, false, false],
+    ['deadletter', false, false, true],
+    ['deadletter', true, false, true],
+    ['deadletter', false, true, true],
+  ])(
+    'terminal predecessor ordering: %s / authored=%s / older=%s',
+    async (state, authored, olderVisible, eligible) => {
+      const newer = row({
+        _id: 'cb-newer-terminal',
+        evidenceId: 'cb-newer-terminal',
+        createdAt: new Date('2026-08-28T04:56:13.000Z'),
+      });
+      const predecessor = row({
+        _id: 'cb-prior-terminal',
+        state,
+        attempts: state === 'deadletter' ? 10 : 1,
+        errorCode: state === 'deadletter' ? 'mission_adjudication_retry_exhausted' : '',
+        followUpMessageId: authored ? 'follow-up-prior-authored' : '',
+        adjudicationGroupId: `ghag_${'a'.repeat(32)}`,
+        createdAt: new Date('2026-08-28T04:55:13.000Z'),
+      });
+      const older = row({
+        _id: 'cb-older-authored',
+        state: 'completed',
+        followUpMessageId: 'follow-up-older-authored',
+        adjudicationGroupId: `ghag_${'b'.repeat(32)}`,
+        createdAt: new Date('2026-08-28T04:54:13.000Z'),
+      });
+      const retained = olderVisible ? [predecessor, older] : [predecessor];
+      const matches = require('sift').default;
+      mockFind.mockReturnValueOnce(cursor([newer]));
+      mockFindOne.mockImplementation(async (filter) => retained.find(matches(filter)) || null);
+      mockFindOneAndUpdate.mockResolvedValueOnce({ ...newer, state: 'processing' });
+      const result = await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      expect(result).toEqual({
+        claimed: eligible ? 1 : 0,
+        groups: eligible ? 1 : 0,
+        visible: eligible ? 1 : 0,
+        silent: 0,
+        failed: 0,
+      });
+      expect(mockFindOneAndUpdate).toHaveBeenCalledTimes(eligible ? 1 : 0);
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(eligible ? 1 : 0);
+      expect(mockEnqueueDelivery).toHaveBeenCalledTimes(eligible ? 1 : 0);
+      if (eligible) {
+        expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledWith(
+          expect.objectContaining({
+            deliveryParentMessageId: authored
+              ? 'follow-up-prior-authored'
+              : olderVisible
+                ? 'follow-up-older-authored'
+                : 'assistant-anchor',
+          }),
+        );
+      }
+      expect(mockUpdateOne).not.toHaveBeenCalledWith(
+        expect.objectContaining({ _id: predecessor._id }),
+        expect.anything(),
+      );
+      expect(predecessor.state).toBe(state);
+      expect(predecessor.followUpMessageId).toBe(authored ? 'follow-up-prior-authored' : '');
+    },
+  );
+
   test('holds a newer group behind a failed predecessor without consuming an attempt', async () => {
     const newer = row({
       _id: 'cb-held-newer',
@@ -1777,7 +2040,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       ...rows.find((item) => item._id === filter._id),
       state: 'processing',
     }));
-    mockGetActiveCallSessionForConversation.mockResolvedValueOnce({
+    mockGetActiveCallSessionForConversation.mockResolvedValue({
       callSessionId: 'reconnected-call',
       userId: 'user-1',
       conversationId: 'conversation-1',
@@ -1812,6 +2075,212 @@ describe('GlassHiveMissionAdjudicationService', () => {
       ],
     });
     expect(input.body.work_ref).toBe('work-a');
+  });
+
+  describe('Worker completion Voice brain propagation', () => {
+    const savedAgent = {
+      id: 'main-agent',
+      provider: 'glasshive',
+      model: 'synthetic-main-model',
+      model_parameters: { model: 'synthetic-main-model', reasoning_effort: 'high' },
+      voice_llm_provider: 'glasshive',
+      voice_llm_model: 'synthetic-voice-model',
+      voice_llm_model_parameters: { reasoning_effort: 'high' },
+      voice_fallback_llm_provider: 'glasshive',
+      voice_fallback_llm_model: 'synthetic-voice-fallback',
+      voice_fallback_llm_model_parameters: { reasoning_effort: 'high' },
+      glasshive_options: { access: 'full', fallback_model: 'synthetic-fallback' },
+    };
+
+    function pendingCompletion(overrides = {}) {
+      const pending = row({
+        surface: 'voice',
+        destinations: [{ surface: 'voice', voiceCallSessionId: 'historical-call' }],
+        terminalCallbackResultKey: `ghtr_${'a'.repeat(64)}`,
+        terminalCallbackAcceptedOperationId: 'b'.repeat(32),
+        terminalCallbackId: `cb_terminal_${'c'.repeat(64)}`,
+        terminalCallbackResultDigest: `sha256:${'d'.repeat(64)}`,
+        terminalCallbackResultRevision: 1,
+        terminalCallbackEffectGeneration: 1,
+        ...overrides,
+      });
+      mockFind.mockReturnValueOnce(cursor([pending]));
+      mockFindOneAndUpdate.mockResolvedValueOnce({ ...pending, state: 'processing' });
+      mockGetAgent.mockResolvedValue(savedAgent);
+      return pending;
+    }
+
+    function voiceActive(input) {
+      return jest.requireActual('../voiceLlmOverride').isVoiceCallActive(input.req);
+    }
+
+    test('propagates canonical Call context to the existing Voice activation consumer', async () => {
+      pendingCompletion();
+      const before = JSON.stringify(savedAgent);
+      mockGetActiveCallSessionForConversation.mockResolvedValue({ callSessionId: 'live-call' });
+      await expect(
+        flushGlassHiveMissionAdjudications({ ownerId: 'user-1' }),
+      ).resolves.toMatchObject({
+        visible: 1,
+        failed: 0,
+      });
+      const input = mockPrepareCortexFollowUpMessage.mock.calls[0][0];
+      expect(input.req.body).toEqual({
+        viventiumSurface: 'voice',
+        voiceMode: true,
+        viventiumInputMode: 'voice_call',
+        viventiumCallSessionId: 'live-call',
+      });
+      expect(input.req.viventiumCallSession).toEqual({ callSessionId: 'live-call' });
+      expect(require('@librechat/api').isAudioDeliveryRequested(input.req)).toBe(true);
+      expect(voiceActive(input)).toBe(true);
+      expect(input.agent).toEqual(savedAgent);
+      expect(JSON.stringify(savedAgent)).toBe(before);
+      expect(mockGetActiveCallSessionForConversation).toHaveBeenCalledTimes(2);
+      expect(mockGetActiveCallSessionForConversation).toHaveBeenNthCalledWith(1, {
+        userId: 'user-1',
+        conversationId: 'conversation-1',
+      });
+    });
+
+    test('overlaps the canonical Call lookup with validated user and agent reads', async () => {
+      pendingCompletion();
+      let userRequested;
+      let releaseUser;
+      let releaseAgent;
+      const userStarted = new Promise((resolve) => {
+        userRequested = resolve;
+      });
+      const userRead = new Promise((resolve) => {
+        releaseUser = resolve;
+      });
+      const agentRead = new Promise((resolve) => {
+        releaseAgent = resolve;
+      });
+      mockGetUserById.mockImplementationOnce(() => {
+        userRequested();
+        return userRead;
+      });
+      mockGetAgent.mockReturnValueOnce(agentRead);
+      mockGetActiveCallSessionForConversation.mockResolvedValue({ callSessionId: 'live-call' });
+      const flushing = flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      try {
+        await userStarted;
+        expect(mockGetActiveCallSessionForConversation).toHaveBeenCalledTimes(1);
+        expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+      } finally {
+        releaseUser({ id: 'user-1', role: 'USER' });
+        releaseAgent(savedAgent);
+        await flushing;
+      }
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    });
+
+    test('preserves an unset Voice assignment for the existing Main inheritance', async () => {
+      pendingCompletion();
+      mockGetAgent.mockResolvedValue({
+        ...savedAgent,
+        voice_llm_provider: '',
+        voice_llm_model: '',
+      });
+      mockGetActiveCallSessionForConversation.mockResolvedValue({ callSessionId: 'live-call' });
+      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      const input = mockPrepareCortexFollowUpMessage.mock.calls[0][0];
+      expect(voiceActive(input)).toBe(true);
+      expect(input.agent).toMatchObject({
+        provider: savedAgent.provider,
+        model: savedAgent.model,
+        voice_llm_provider: '',
+        voice_llm_model: '',
+        model_parameters: { reasoning_effort: 'high' },
+      });
+    });
+
+    test.each(['web', 'telegram', 'wing'])(
+      'keeps %s synthesis on the Main route without a Call lookup',
+      async (surface) => {
+        pendingCompletion({ surface, destinations: [{ surface }] });
+        await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+        const input = mockPrepareCortexFollowUpMessage.mock.calls[0][0];
+        expect(input.req.body).toEqual({ viventiumSurface: surface });
+        expect(voiceActive(input)).toBe(false);
+        expect(mockGetActiveCallSessionForConversation).not.toHaveBeenCalled();
+      },
+    );
+
+    test('a Voice destination alone cannot select the Voice brain without an eligible canonical Call', async () => {
+      pendingCompletion();
+      mockGetActiveCallSessionForConversation.mockResolvedValue(null);
+      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      const input = mockPrepareCortexFollowUpMessage.mock.calls[0][0];
+      expect(input.req.body).toEqual({ viventiumSurface: 'voice' });
+      expect(voiceActive(input)).toBe(false);
+      expect(input.req.viventiumCallSession).toBeUndefined();
+      expect(require('@librechat/api').isAudioDeliveryRequested(input.req)).toBe(false);
+      expect(mockEnqueueDelivery.mock.calls[0][0].deliveryContext.destinations).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ surface: 'voice' })]),
+      );
+    });
+
+    test('checks the resolved account continuation instead of an ended origin conversation', async () => {
+      pendingCompletion();
+      mockGetConvo.mockResolvedValue(null);
+      mockGetActiveCallSessionForConversation.mockImplementation(async ({ conversationId }) =>
+        conversationId === 'conversation-1' ? { callSessionId: 'origin-call' } : null,
+      );
+      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      const input = mockPrepareCortexFollowUpMessage.mock.calls[0][0];
+      expect(input.conversationId).not.toBe('conversation-1');
+      expect(mockGetActiveCallSessionForConversation).toHaveBeenNthCalledWith(1, {
+        userId: 'user-1',
+        conversationId: input.conversationId,
+      });
+      expect(input.req.body).toEqual({ viventiumSurface: 'voice' });
+      expect(voiceActive(input)).toBe(false);
+      expect(input.req.viventiumCallSession).toBeUndefined();
+      expect(require('@librechat/api').isAudioDeliveryRequested(input.req)).toBe(false);
+    });
+
+    test('rechecks delivery after the Call ends during synthesis and retains linked text', async () => {
+      pendingCompletion();
+      mockGetActiveCallSessionForConversation
+        .mockResolvedValueOnce({ callSessionId: 'live-call' })
+        .mockResolvedValueOnce(null);
+      await expect(
+        flushGlassHiveMissionAdjudications({ ownerId: 'user-1' }),
+      ).resolves.toMatchObject({
+        visible: 1,
+        failed: 0,
+      });
+      expect(voiceActive(mockPrepareCortexFollowUpMessage.mock.calls[0][0])).toBe(true);
+      expect(mockGetActiveCallSessionForConversation).toHaveBeenCalledTimes(2);
+      const delivered = mockEnqueueDelivery.mock.calls[0][0];
+      expect(delivered.deliveryContext.workerCompletionPresentation).toBeUndefined();
+      expect(delivered.deliveryContext.destinations).toEqual([{ surface: 'librechat' }]);
+      expect(mockStoredMessages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            messageId: 'follow-up-1',
+            text: 'Main-authored synthetic follow-up.',
+          }),
+        ]),
+      );
+    });
+
+    test('delivery uses the current reconnected Call rather than reusing the synthesis snapshot', async () => {
+      pendingCompletion();
+      mockGetActiveCallSessionForConversation
+        .mockResolvedValueOnce({ callSessionId: 'first-call' })
+        .mockResolvedValueOnce({ callSessionId: 'reconnected-call' });
+      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      expect(
+        mockPrepareCortexFollowUpMessage.mock.calls[0][0].req.body.viventiumCallSessionId,
+      ).toBe('first-call');
+      expect(
+        mockEnqueueDelivery.mock.calls[0][0].deliveryContext.workerCompletionPresentation
+          .callSessionId,
+      ).toBe('reconnected-call');
+    });
   });
 
   test('ended Call completion keeps the authored linked result and other destinations without regeneration', async () => {

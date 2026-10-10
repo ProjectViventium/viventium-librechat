@@ -361,3 +361,89 @@ test('preparation group lookup binds owner, sender, chat, thread, source scope a
     $expr: { $eq: ['$inputPrimarySourceEventId', '$sourceEventId'] },
   });
 });
+
+/* VIVENTIUM START: terminal effect receipts settle their own accepted input, not another source. */
+test.each(['committed', 'committed_effect'])(
+  'owned %s acknowledgement is terminal for input recovery',
+  async (state) => {
+    mockGetJob.mockResolvedValue({
+      status: 'completed',
+      metadata: { userId: 'owner', deliveryAcknowledgement: { state, revision: 1 } },
+    });
+    expect(await mockDependencies.readStream('stream', 'owner')).toBe('completed');
+    expect(await mockDependencies.readStream('stream', 'other')).toBe('missing');
+  },
+);
+test.each([undefined, 'partial_removed', 'unknown'])(
+  'unfinished %s acknowledgement does not suppress recovery',
+  async (state) => {
+    mockGetJob.mockResolvedValue({
+      status: 'completed',
+      metadata: { userId: 'owner', deliveryAcknowledgement: { state } },
+    });
+    expect(await mockDependencies.readStream('stream', 'owner')).toBe('pending');
+  },
+);
+test('effect-committed input settles once instead of reopening the saved receipt each lease', async () => {
+  const { createTelegramInputService } = jest.requireActual('@librechat/api');
+  let clock = 1_000_000;
+  let retained = {
+    ...row,
+    telegramChatId: 'chat',
+    telegramMessageThreadId: '',
+    requestedConversationId: 'conversation',
+    conversationGeneration: 'c'.repeat(64),
+    state: 'admitted',
+    claimToken: '00000000-0000-4000-8000-000000000001',
+    registrationId: '00000000-0000-4000-8000-000000000002',
+    leaseUntil: 0,
+    retryAt: 0,
+    attempts: 0,
+    streamId: 'stream',
+    failureCode: '',
+    preparedDigest: 'd'.repeat(64),
+    failures: [],
+    primarySourceEventId: row.sourceEventId,
+    relatedSourceEventIds: [],
+    mediaGroupId: '',
+  };
+  mockGetJob.mockResolvedValue({
+    status: 'completed',
+    metadata: {
+      userId: 'owner',
+      deliveryAcknowledgement: {
+        state: 'committed_effect',
+        revision: 1,
+        effect_ref: 'work-reference',
+      },
+    },
+  });
+  const writes = [];
+  const service = createTelegramInputService({
+    ...mockDependencies,
+    now: () => clock,
+    verifyOwner: async () => true,
+    hasCommittedDelivery: async () => false,
+    transaction: async (operation) => operation(),
+    repository: {
+      read: async () => structuredClone(retained),
+      due: async () =>
+        retained.state === 'admitted' && retained.leaseUntil <= clock
+          ? [structuredClone(retained)]
+          : [],
+      replace: async (previous, next) => {
+        if (JSON.stringify(previous) !== JSON.stringify(retained)) return false;
+        writes.push(next.state);
+        retained = structuredClone(next);
+        return true;
+      },
+    },
+  });
+  expect(await service.claimPending(1)).toEqual([]);
+  expect(retained.state).toBe('completed');
+  expect(retained.leaseUntil).toBe(0);
+  clock += 120_001;
+  expect(await service.claimPending(1)).toEqual([]);
+  expect(writes).toEqual(['completed']);
+});
+/* VIVENTIUM END */

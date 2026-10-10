@@ -690,8 +690,10 @@ export type UIResource = {
 };
 
 export type TAttachmentMetadata = {
-  /* === VIVENTIUM START === An unavailable native selection is not a downloadable File. === */
-  nativeOutputFile?: { version: 1; status: 'unavailable'; code: string };
+  /* === VIVENTIUM START === Verified grants bind UI downloads without changing authored history. === */
+  nativeOutputFile?:
+    | { version: 1; status: 'unavailable'; code: string }
+    | { version: 1; status: 'available'; messageId: string; downloadUrl: string };
   /* === VIVENTIUM END === */
   type?: Tools;
   messageId: string;

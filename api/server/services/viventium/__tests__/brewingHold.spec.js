@@ -5,6 +5,7 @@
 
 const {
   collectConfiguredHoldScopeKeys,
+  isToolHoldCandidate,
   collectDirectActionScopeKeysFromCortices,
   collectEffectiveDirectActionScopeKeys,
   pickHoldText,
@@ -85,6 +86,29 @@ describe('brewingHold', () => {
         },
       ]),
     ).toEqual(['productivity_ms365', 'productivity_google_workspace']);
+  });
+
+  test.each([{ enabled: false }, { mode: 'disabled' }])(
+    'disabled activation cannot declare a holding scope: %j',
+    (disabled) => {
+      const cortex = {
+        agent_id: 'disabled-productivity-cortex',
+        activation: { intent_scope: 'productivity_ms365', ...disabled },
+      };
+      expect(isToolHoldCandidate(cortex)).toBe(false);
+      expect(collectConfiguredHoldScopeKeys([cortex])).toEqual([]);
+      expect(shouldDeferMainResponse({ activatedCortices: [cortex] })).toBe(false);
+    },
+  );
+
+  test('enabled always activation keeps its declared holding scope', () => {
+    const cortex = {
+      agent_id: 'active-productivity-cortex',
+      activation: { enabled: true, mode: 'always', intent_scope: 'productivity_ms365' },
+    };
+    expect(isToolHoldCandidate(cortex)).toBe(true);
+    expect(collectConfiguredHoldScopeKeys([cortex])).toEqual(['productivity_ms365']);
+    expect(shouldDeferMainResponse({ activatedCortices: [cortex] })).toBe(true);
   });
 
   test('shouldDeferMainResponse does not infer default hold ownership from bare names or ids', () => {

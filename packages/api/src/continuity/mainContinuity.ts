@@ -13,11 +13,16 @@ import type { TMessage } from 'librechat-data-provider';
 import type { InteractionContext } from '../stream/interfaces/IJobStore';
 import { formatContentStrings } from '@librechat/agents';
 import type { Callbacks } from '@langchain/core/callbacks/manager';
-import { mainContinuityStorageKey, mainContinuityMessageEvidence } from '@librechat/data-schemas';
+import {
+  mainContinuityStorageKey,
+  mainContinuityMessageEvidence,
+  normalizeMainBackgroundInputs,
+} from '@librechat/data-schemas';
 
 import type {
   IMainContinuityLegacyCursor,
   IMainContinuityLegacySourceRange,
+  IMainContinuityBackgroundInput,
 } from '@librechat/data-schemas';
 
 type UnknownRecord = Record<string, unknown>;
@@ -86,6 +91,7 @@ export interface AcceptedMainTurn {
   readonly userText: string;
   readonly assistantText: string;
   readonly toolPairs: readonly MainContinuityToolPair[];
+  readonly backgroundInputs?: readonly IMainContinuityBackgroundInput[];
   readonly committedAt: Date;
   readonly sourceDeletedAt?: Date;
   /** Rehydrated from Message on each read; never a second delivery owner. */
@@ -417,6 +423,7 @@ function acceptedTurnFrom(value: unknown): AcceptedMainTurn | null {
     userText: String(value.userText || ''),
     assistantText,
     toolPairs: acceptedToolPairs(value.toolPairs),
+    ...backgroundInputFields(value.backgroundInputs),
     committedAt: value.committedAt instanceof Date ? value.committedAt : new Date(),
   };
 }
@@ -437,10 +444,68 @@ function buildAcceptedTurnBlock(turn: AcceptedMainTurn, pending: boolean): strin
     ...(turn.toolPairs.length
       ? [`<tool_pairs>${escapeEvidence(JSON.stringify(turn.toolPairs))}</tool_pairs>`]
       : []),
+    renderMainBackgroundInputs(turn.backgroundInputs),
     `</${tag}>`,
   ]
     .filter(Boolean)
     .join('\n');
+}
+
+function backgroundInputFields(value: unknown): {
+  backgroundInputs?: IMainContinuityBackgroundInput[];
+} {
+  const inputs = normalizeMainBackgroundInputs(value);
+  return inputs.length ? { backgroundInputs: inputs } : {};
+}
+
+/** Structural quoted evidence inside the existing historical source carrier. */
+export function renderMainBackgroundInputs(value: unknown): string {
+  const inputs = normalizeMainBackgroundInputs(value);
+  return inputs.length
+    ? `<accepted_background_inputs>${escapeEvidence(JSON.stringify(inputs))}</accepted_background_inputs>`
+    : '';
+}
+
+const backgroundProjection = new WeakMap<
+  object,
+  { inputDigest: string; contentDigest: string; originalContent: unknown }
+>();
+
+function projectBackgroundInputs<T extends { role: string; content: unknown }>(
+  message: T,
+  value: unknown,
+): T {
+  const inputs = normalizeMainBackgroundInputs(value);
+  const inputDigest = contentDigest(inputs);
+  const prior = backgroundProjection.get(message);
+  if (prior?.inputDigest === inputDigest && prior.contentDigest === contentDigest(message.content))
+    return message;
+  if (prior && prior.contentDigest !== contentDigest(message.content))
+    throw new Error('Background source projection changed before replacement');
+  if (!inputs.length && !prior) return message;
+  if (message.role !== 'assistant')
+    throw new Error('Background source requires its assistant parent');
+  const originalContent = prior ? prior.originalContent : message.content;
+  const evidence = renderMainBackgroundInputs(inputs);
+  const content = !inputs.length
+    ? originalContent
+    : typeof originalContent === 'string'
+      ? [originalContent, evidence].filter(Boolean).join('\n\n')
+      : Array.isArray(originalContent)
+        ? [...originalContent, { type: 'text', text: evidence }]
+        : (() => {
+            throw new Error('Background source carrier content is unavailable');
+          })();
+  const projected = Object.assign(Object.create(Object.getPrototypeOf(message)), message, {
+    content,
+  }) as T;
+  if (inputs.length)
+    backgroundProjection.set(projected, {
+      inputDigest,
+      contentDigest: contentDigest(content),
+      originalContent,
+    });
+  return projected;
 }
 
 /** Project hydrated Message evidence through the native message carrier, never instruction authority. */
@@ -471,12 +536,18 @@ export function projectAcceptedMainMessages<
     const toolEvidence = turn.toolPairs.length
       ? `<accepted_tool_results>${escapeEvidence(JSON.stringify(turn.toolPairs))}</accepted_tool_results>`
       : '';
-    sourceMessages.set(turn.assistantMessageId, {
-      messageId: turn.assistantMessageId,
-      role: 'assistant',
-      content: [turn.assistantText, toolEvidence].filter(Boolean).join('\n\n'),
-      ...(turn.delivery ? { delivery: turn.delivery } : {}),
-    });
+    sourceMessages.set(
+      turn.assistantMessageId,
+      projectBackgroundInputs(
+        {
+          messageId: turn.assistantMessageId,
+          role: 'assistant',
+          content: [turn.assistantText, toolEvidence].filter(Boolean).join('\n\n'),
+          ...(turn.delivery ? { delivery: turn.delivery } : {}),
+        },
+        turn.backgroundInputs,
+      ),
+    );
   }
   sourceMessages.delete('');
   const current: Array<T | { messageId: string; role: string; content: string; delivery?: MainMessageDelivery }> = [...messages];
@@ -495,6 +566,9 @@ export function projectAcceptedMainMessages<
           status: 413,
         });
       cursor = existing + 1;
+      const turn = sourceTurns.find((turn) => turn.assistantMessageId === id);
+      if (turn)
+        current[existing] = projectBackgroundInputs(current[existing], turn.backgroundInputs);
       continue;
     }
     current.splice(cursor, 0, source);
@@ -543,8 +617,26 @@ function carrierText(content: unknown): string {
 }
 
 export const MAIN_CONTINUITY_CHAIN_HEADER = 'X-Viventium-Visible-Message-Chain-B64';
+// Native fetch moves this invocation-local context into the existing JSON body lane.
+// Keep the legacy wire-header bound separate from the declared native body budget.
+export const NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES = 128 * 1024;
+const MAIN_CONTINUITY_AUTHORITY_HEADERS = new Set([
+  'x-viventium-main-context-protocol',
+  'x-viventium-main-context-owner',
+  'x-viventium-main-context-snapshot-sha256',
+  'x-viventium-main-context-epoch',
+  'x-viventium-continuity-domain-id',
+  'x-viventium-continuity-agent-id',
+  'x-viventium-logical-turn-id',
+  'x-viventium-logical-turn-revision',
+  'x-viventium-actor-kind',
+  'x-viventium-origin',
+  'x-viventium-surface',
+  'x-viventium-memory-eligible',
+  'x-glasshive-stable-authority-sha256',
+]);
 
-function visibleMessageChain(
+export function visibleMessageChain(
   messages: readonly ContinuityCarrierMessage[],
   protectedIds: ReadonlySet<string>,
   currentInputIds: ReadonlySet<string> = new Set(),
@@ -561,7 +653,9 @@ function visibleMessageChain(
         id,
         role,
         sha256: createHash('sha256').update(carrierText(message.content), 'utf8').digest('hex'),
-        content_sha256: contentDigest(message.content),
+        ...(protectedIds.has(id) || currentInputIds.has(id) ||
+          (role === 'assistant' && deliveryById.has(id))
+          ? { content_sha256: contentDigest(message.content) } : {}),
         ...(role === 'assistant' && deliveryById.has(id) ? { delivery: deliveryById.get(id) } : {}),
         accepted_source: !contextOnly && (protectedIds.has(id) || currentInputIds.has(id)),
         ...(currentInputIds.has(id) && !contextOnly ? { current_input: true } : {}),
@@ -779,7 +873,12 @@ export function withMainContinuityCallbacks(
       const sourceOrdinalsById = new Map(original
         .filter((item) => item.current_input === true && Array.isArray(item.source_ordinals))
         .map((item) => [item.id, item.source_ordinals!] as const));
-      const chain = visibleMessageChain(messageBatches[0], protectedIds, currentInputIds, new Map(), sourceOrdinalsById);
+      const deliveryById = new Map<string, MainMessageDelivery>();
+      for (const source of original) {
+        const delivery = normalizedDelivery(source.delivery);
+        if (source.role === 'assistant' && delivery) deliveryById.set(source.id, delivery);
+      }
+      const chain = visibleMessageChain(messageBatches[0], protectedIds, currentInputIds, deliveryById, sourceOrdinalsById);
       const sourcesById = new Map(original.map((item) => [item.id, item]));
       for (const item of chain) {
         const source = sourcesById.get(item.id);
@@ -787,6 +886,9 @@ export function withMainContinuityCallbacks(
         if (delivery && item.role === 'assistant' && source?.role === item.role &&
             source.sha256 === item.sha256 && source.content_sha256 === item.content_sha256) {
           item.delivery = delivery;
+        } else {
+          delete item.delivery;
+          if (!item.accepted_source) delete item.content_sha256;
         }
       }
       const encoded = Buffer.from(JSON.stringify(chain), 'utf8').toString('base64');
@@ -807,10 +909,14 @@ export function withMainContinuityCallbacks(
   return [...(callbacks || []), guard];
 }
 
+/** Read only the exact current parent; receipts never determine source inclusion. */
+export type MainBackgroundInputsReader = () => Promise<readonly IMainContinuityBackgroundInput[]>;
+
 export function createMainContinuityFetch(
   baseFetch: MainContinuityFetch,
   encodedChain: string,
   authorityHeaders: Readonly<Record<string, string>> = {},
+  readMainBackgroundInputs?: MainBackgroundInputsReader,
 ): MainContinuityFetch {
   return async (input, init) => {
     const method = init?.method || (input instanceof Request ? input.method : 'GET');
@@ -828,7 +934,7 @@ export function createMainContinuityFetch(
     assertMainContinuityCarrier(payload.messages, finalChain);
     headers.delete(MAIN_CONTINUITY_CHAIN_HEADER);
     for (const [key, value] of Object.entries(authorityHeaders)) {
-      if (key.toLowerCase() !== MAIN_CONTINUITY_CHAIN_HEADER.toLowerCase()) headers.set(key, value);
+      if (MAIN_CONTINUITY_AUTHORITY_HEADERS.has(key.toLowerCase())) headers.set(key, value);
     }
     const encodedTurnContext = headers.get('X-GlassHive-Turn-Context-B64');
     const turnContextBytes = encodedTurnContext ? Buffer.from(encodedTurnContext, 'base64') : null;
@@ -839,10 +945,57 @@ export function createMainContinuityFetch(
       : null;
     headers.delete('X-GlassHive-Turn-Context-B64');
     headers.delete('content-length');
+    const metadata = isRecord(payload.metadata) ? payload.metadata : {};
+    let currentTurnContext = encodedTurnContext ? turnContext! : String(metadata.turn_context || '');
+    const requestUrl = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+    let backgroundSourceFields: UnknownRecord = {};
+    if (readMainBackgroundInputs && new URL(requestUrl).pathname.endsWith('/chat/completions')) {
+      const inputs = normalizeMainBackgroundInputs(await readMainBackgroundInputs());
+      const prior = normalizeMainBackgroundInputs(metadata.main_background_inputs);
+      const sourceKey = (value: IMainContinuityBackgroundInput) =>
+        JSON.stringify([value.invocationId, value.deliveryId]);
+      const digest = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
+      if (prior.length && metadata.main_background_inputs_context_sha256 !== digest(currentTurnContext))
+        throw Object.assign(new Error('Current background source carrier changed'), {
+          code: 'main_background_source_conflict',
+        });
+      const acceptedByKey = new Map(inputs.map((value) => [sourceKey(value), value]));
+      if (prior.some((value) => {
+        const accepted = acceptedByKey.get(sourceKey(value));
+        return !accepted || contentDigest(accepted) !== contentDigest(value);
+      })) throw Object.assign(new Error('Current background source identity conflicts'), {
+        code: 'main_background_source_conflict',
+      });
+      const byKey = new Map(prior.map((value) => [sourceKey(value), value]));
+      const added: IMainContinuityBackgroundInput[] = [];
+      for (const value of inputs) {
+        const existing = byKey.get(sourceKey(value));
+        if (existing && contentDigest(existing) !== contentDigest(value))
+          throw Object.assign(new Error('Current background source identity conflicts'), {
+            code: 'main_background_source_conflict',
+          });
+        if (existing) continue;
+        byKey.set(sourceKey(value), value);
+        added.push(value);
+      }
+      if (added.length)
+        currentTurnContext = [currentTurnContext, renderMainBackgroundInputs(added)]
+          .filter(Boolean).join('\n\n');
+      if (byKey.size && Buffer.byteLength(currentTurnContext, 'utf8') > NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES)
+        throw Object.assign(new Error('Current background source exceeds the native context budget'), {
+          code: 'source_context_unavailable', status: 413,
+        });
+      if (byKey.size) backgroundSourceFields = {
+        main_background_inputs: [...byKey.values()],
+        main_background_inputs_context_sha256: digest(currentTurnContext),
+      };
+    }
     payload.metadata = {
-      ...(isRecord(payload.metadata) ? payload.metadata : {}),
+      ...metadata,
       visible_message_chain: JSON.parse(Buffer.from(finalChain, 'base64').toString('utf8')),
-      ...(encodedTurnContext ? { turn_context: turnContext } : {}),
+      ...(encodedTurnContext || backgroundSourceFields.main_background_inputs
+        ? { turn_context: currentTurnContext } : {}),
+      ...backgroundSourceFields,
     };
     const nativeInit = { ...init, headers, body: JSON.stringify(payload) };
     retainVerifiedNativeSources(nativeInit, JSON.parse(Buffer.from(finalChain, 'base64').toString('utf8')));
@@ -1008,6 +1161,7 @@ function normalizedTurn(input: UnknownRecord): AcceptedMainTurn | null {
     userText: origin === 'scheduler' ? '' : String(input.userText || ''),
     assistantText,
     toolPairs: acceptedToolPairs(input.toolPairs),
+    ...backgroundInputFields(input.backgroundInputs),
     committedAt: input.committedAt instanceof Date ? input.committedAt : new Date(),
   };
 }
@@ -1307,6 +1461,7 @@ function sourceTurnFromPresentation(
     assistantText,
     delivery: mainMessageDelivery(assistant, identity.ownerId),
     toolPairs: messageToolPairs(assistant),
+    ...backgroundInputFields(mainContinuityMessageEvidence(assistant).backgroundInputs),
   };
 }
 
@@ -1854,6 +2009,7 @@ export function createMainContinuityService(
       userText: messageText(userMessage),
       assistantText: messageText(assistant),
       toolPairs: messageToolPairs(assistant),
+      ...backgroundInputFields(mainContinuityMessageEvidence(assistant).backgroundInputs),
       origin: context.origin || 'interactive',
       scheduleId: context.schedule_id || '',
       scheduleRunId: context.schedule_run_id || '',

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import OpenAI from 'openai';
 import type { DynamicStructuredTool } from '@librechat/agents/langchain/tools';
 import { createNativeMemoryToolBinding, createNativeMemoryExecutor } from './nativeMemoryWriter';
 
@@ -223,6 +224,7 @@ describe('native memory inference uses the existing provider run and broker', ()
           additional_instructions: 'Unrelated instructions.',
         } as never,
         createProviderRun: createProviderRun as never,
+        prepareProviderAttempt: async () => async () => undefined,
       });
       const result = executor({
         tool,
@@ -263,6 +265,7 @@ describe('typed memory-tool completion without an authored chat answer', () => {
         register: (binding) => { active = binding; return unregister; },
         buildBundle: async () => ({ glasshive_capability_broker: { synthetic: true } }),
         attachBundle: () => true,
+        prepareProviderAttempt: async () => async () => undefined,
         createProviderRun: (async () => ({ processStream: async () => {
           if (outcome !== 'no_tool') {
             try {
@@ -286,4 +289,244 @@ describe('typed memory-tool completion without an authored chat answer', () => {
       expect(unregister).toHaveBeenCalledTimes(1);
     },
   );
+});
+
+
+describe('internal memory transport preserves the signed caller provenance', () => {
+  it('sets the isolated system actor after bundle replacement without changing Main or its grant', async () => {
+    const { tool, onResult, authorize } = fixture();
+    let active: ReturnType<typeof createNativeMemoryToolBinding>;
+    const unregister = jest.fn();
+    const main = {
+      id: 'main',
+      provider: 'openai',
+      endpoint: 'glasshive-harness',
+      model: 'codex-cli:gpt-6.1-sol',
+      tools: [],
+      model_parameters: {
+        model: 'codex-cli:gpt-6.1-sol',
+        reasoning_effort: 'high',
+        configuration: {
+          baseURL: 'https://synthetic.invalid/v1',
+          defaultHeaders: {
+            'X-Viventium-Actor-Kind': 'external_user',
+            'X-Viventium-Origin': 'interactive',
+            'X-Viventium-Owner-Id': identity.userId,
+          },
+        },
+      },
+      agent_ids: ['worker'],
+      edges: [{ from: 'main', to: 'worker' }],
+      viventiumGraphLlmFallbacks: [{}],
+      viventiumFallbackLlm: {},
+      toolDefinitions: [{ name: 'unrelated_tool' }],
+    };
+    const mainBefore = JSON.stringify(main);
+    const attachedHeaders = {
+      'X-Viventium-Actor-Kind': 'external_user',
+      'X-Viventium-Origin': 'interactive',
+      'X-Viventium-Owner-Id': identity.userId,
+      'X-GlassHive-Bootstrap-Bundle-B64': 'synthetic-signed-bundle',
+      'X-GlassHive-Bootstrap-Timestamp': '123',
+      'X-GlassHive-Bootstrap-Signature': 'synthetic-signature',
+    };
+    const createProviderRun = jest.fn(async (config) => {
+      const native = config.agents[0];
+      expect(native.model).toBe(main.model);
+      expect(native.model_parameters.reasoning_effort).toBe('high');
+      expect(native.model_parameters.configuration).toEqual({
+        baseURL: 'https://synthetic.invalid/v1',
+        defaultHeaders: { ...attachedHeaders, 'X-Viventium-Actor-Kind': 'system' },
+        fetch: expect.any(Function),
+      });
+      expect(native.tools).toEqual([]);
+      expect(native.toolDefinitions).toEqual([]);
+      expect(native.agent_ids).toBeUndefined();
+      expect(native.edges).toBeUndefined();
+      expect(native.viventiumGraphLlmFallbacks).toBeUndefined();
+      expect(native.viventiumFallbackLlm).toBeUndefined();
+      expect(JSON.stringify(main)).toBe(mainBefore);
+      expect(attachedHeaders['X-Viventium-Actor-Kind']).toBe('external_user');
+      return { processStream: async () => {
+        await active.invoke({
+          user_id: identity.userId,
+          message_id: identity.messageId,
+          conversation_id: identity.conversationId,
+          allowed_servers: [],
+          allowed_host_tools: [tool.name],
+          allow_dynamic_policy_servers: false,
+          host_tool_resources: { [tool.name]: active.resource },
+        }, operations);
+      } };
+    });
+    const executor = createNativeMemoryExecutor({
+      identity, authorize, user: { id: identity.userId } as never, requestBody: {},
+      agent: main as never,
+      register: (binding) => { active = binding; return unregister; },
+      buildBundle: async (args) => {
+        expect(args.allowedHostTools).toEqual([tool.name]);
+        expect(args.allowedServerNames).toEqual([]);
+        expect(args.hostToolResources[tool.name]).toEqual(active.resource);
+        return { glasshive_capability_broker: { synthetic: true } };
+      },
+      attachBundle: ({ targetAgent, bundle }) => {
+        expect(bundle.provider_capabilities?.native_tools).toBe(false);
+        // Production attachment replaces all three objects after projecting the trusted caller.
+        targetAgent.model_parameters = {
+          ...targetAgent.model_parameters,
+          configuration: {
+            baseURL: 'https://synthetic.invalid/v1',
+            defaultHeaders: attachedHeaders,
+          },
+        } as never;
+        return true;
+      },
+      createProviderRun: createProviderRun as never,
+      prepareProviderAttempt: async () => async () => undefined,
+    });
+    await expect(executor({
+      tool, messages: [], instructions: 'Existing memory instructions.', onResult,
+    })).resolves.toBeUndefined();
+    expect(onResult).toHaveBeenCalledTimes(1);
+    expect(unregister).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(main)).toBe(mainBefore);
+  });
+});
+
+describe('native memory capacity and request lifecycle', () => {
+  function transportFixture({
+    responses,
+    failAfterApply = false,
+    releaseError,
+    revokeAfterFirst = false,
+    abortTransport = false,
+    sdkRetries = false,
+  }: {
+    responses: Response[];
+    failAfterApply?: boolean;
+    releaseError?: Error;
+    revokeAfterFirst?: boolean;
+    abortTransport?: boolean;
+    sdkRetries?: boolean;
+  }) {
+    const { tool, func, authorize, onResult } = fixture();
+    let active: ReturnType<typeof createNativeMemoryToolBinding>;
+    const unregister = jest.fn();
+    const register = jest.fn((binding) => { active = binding; return unregister; });
+    const transport = new AbortController();
+    const send = jest.fn(async () => {
+      const response = responses.shift()!;
+      if (revokeAfterFirst) authorize.mockRejectedValue(new Error('writer owner changed'));
+      if (abortTransport) transport.abort('writer stopped');
+      return response;
+    });
+    const release = jest.fn(async () => {
+      expect(unregister).not.toHaveBeenCalled();
+      expect(active.accepts({})).toBe(false);
+      if (releaseError) throw releaseError;
+    });
+    const prepareProviderAttempt = jest.fn(async (input) => {
+      expect(input.requestBody.viventiumGlassHiveIdempotencyKey).toBe(active.identity
+        ? `memory_${active.resource.bindingId}` : 'missing');
+      expect(input.identity).toEqual(identity);
+      return release;
+    });
+    const createProviderRun = jest.fn(async (config) => ({
+      processStream: async () => {
+        const native = config.agents[0];
+        if (sdkRetries) {
+          const sdk = new OpenAI({ apiKey: 'synthetic-key', baseURL: 'https://synthetic.invalid/v1',
+            fetch: native.model_parameters.configuration.fetch });
+          await sdk.chat.completions.create({ model: native.model,
+            messages: [{ role: 'user', content: 'Synthetic memory source.' }] });
+          throw new Error('expected capacity exhaustion');
+        }
+        const response = await native.model_parameters.configuration.fetch(
+          'https://synthetic.invalid/v1/chat/completions',
+          { method: 'POST', body: '{"synthetic":"same admitted request"}', signal: transport.signal },
+        );
+        if (!response.ok) throw Object.assign(new Error('capacity refused'), { code: 'host_capacity' });
+        await active.invoke({
+          user_id: identity.userId, message_id: identity.messageId,
+          conversation_id: identity.conversationId, allowed_servers: [],
+          allowed_host_tools: [tool.name], allow_dynamic_policy_servers: false,
+          host_tool_resources: { [tool.name]: active.resource },
+        }, operations);
+        if (failAfterApply) throw Object.assign(new Error('provider interrupted'), { code: 'host_capacity' });
+      },
+    }));
+    const executor = createNativeMemoryExecutor({
+      identity, authorize, user: { id: identity.userId } as never, requestBody: {},
+      agent: { id: 'writer', provider: 'openai', model: 'codex-cli:gpt-6.1-sol',
+        model_parameters: { model: 'codex-cli:gpt-6.1-sol', reasoning_effort: 'high',
+          configuration: { fetch: send } } } as never,
+      register,
+      buildBundle: async () => ({ glasshive_capability_broker: {} }),
+      attachBundle: () => true,
+      createProviderRun: createProviderRun as never,
+      prepareProviderAttempt,
+    });
+    const result = executor({ tool, messages: [], instructions: 'Existing memory instructions.', onResult });
+    return { result, send, release, register, createProviderRun, prepareProviderAttempt, unregister, func, onResult };
+  }
+  const capacity = (retryAfter = '0.001') => new Response(
+    JSON.stringify({ error: { code: 'host_capacity' } }),
+    { status: 503, headers: { 'Retry-After': retryAfter } },
+  );
+
+  it('recovers capacity on the same provider request, signed binding and snapshot', async () => {
+    const f = transportFixture({ responses: [capacity(), new Response('{}')] });
+    await expect(f.result).resolves.toBeUndefined();
+    expect(f.send).toHaveBeenCalledTimes(2);
+    expect(f.send.mock.calls[0]).toEqual(f.send.mock.calls[1]);
+    expect(f.register).toHaveBeenCalledTimes(1);
+    expect(f.createProviderRun).toHaveBeenCalledTimes(1);
+    expect(f.prepareProviderAttempt).toHaveBeenCalledTimes(1);
+    expect(f.func).toHaveBeenCalledTimes(1);
+    expect(f.onResult).toHaveBeenCalledTimes(1);
+    expect(f.release).not.toHaveBeenCalled();
+    expect(f.unregister).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['exhausted', 'hard_failure', 'after_apply', 'owner_changed', 'aborted'])(
+    'releases its exact failed native request before unregistering: %s', async (outcome) => {
+      const f = transportFixture({
+        responses: outcome === 'after_apply' ? [new Response('{}')] :
+          outcome === 'hard_failure' ? [new Response('{}', { status: 503 })] :
+            [capacity(outcome === 'exhausted' ? '31' : '0.001')],
+        failAfterApply: outcome === 'after_apply',
+        revokeAfterFirst: outcome === 'owner_changed',
+        abortTransport: outcome === 'aborted',
+      });
+      await expect(f.result).rejects.toThrow();
+      expect(f.send).toHaveBeenCalledTimes(1);
+      expect(f.release).toHaveBeenCalledTimes(1);
+      expect(f.createProviderRun).toHaveBeenCalledTimes(1);
+      expect(f.func).toHaveBeenCalledTimes(outcome === 'after_apply' ? 1 : 0);
+      expect(f.onResult).toHaveBeenCalledTimes(outcome === 'after_apply' ? 1 : 0);
+      expect(f.unregister).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('keeps the original provider error when native release cannot be confirmed', async () => {
+    const f = transportFixture({ responses: [capacity('31')], releaseError: new Error('ACK unavailable') });
+    await expect(f.result).rejects.toMatchObject({ code: 'host_capacity', nativeMemoryReleaseConfirmed: false });
+    expect(f.release).toHaveBeenCalledTimes(1);
+    expect(f.unregister).toHaveBeenCalledTimes(1);
+    expect(f.func).not.toHaveBeenCalled();
+  });
+
+  it('releases after the existing SDK retry policy exhausts the same capacity-blocked request', async () => {
+    const refusal = () => new Response(JSON.stringify({ error: { code: 'host_capacity',
+      message: 'Synthetic capacity refusal' } }), { status: 503,
+      headers: { 'Retry-After': '31', 'retry-after-ms': '1' } });
+    const f = transportFixture({ responses: [refusal(), refusal(), refusal()], sdkRetries: true });
+    await expect(f.result).rejects.toMatchObject({ code: 'host_capacity' });
+    expect(f.send).toHaveBeenCalledTimes(3);
+    expect(f.release).toHaveBeenCalledTimes(1);
+    expect(f.register).toHaveBeenCalledTimes(1);
+    expect(f.createProviderRun).toHaveBeenCalledTimes(1);
+    expect(f.func).not.toHaveBeenCalled();
+    expect(f.unregister).toHaveBeenCalledTimes(1);
+  });
 });

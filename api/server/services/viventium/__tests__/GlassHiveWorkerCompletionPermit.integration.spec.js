@@ -21,6 +21,7 @@ const mockRecordGlassHiveSurfaceDeliveryOutcome = jest.fn().mockResolvedValue({ 
 const mockRecordVoiceOrchestrationTrace = jest.fn().mockResolvedValue(null);
 
 jest.mock('../GlassHiveCallbackBindingService', () => ({
+  ...jest.requireActual('../GlassHiveCallbackBindingService'),
   recordGlassHiveSurfaceDeliveryOutcome: (...args) =>
     mockRecordGlassHiveSurfaceDeliveryOutcome(...args),
 }));

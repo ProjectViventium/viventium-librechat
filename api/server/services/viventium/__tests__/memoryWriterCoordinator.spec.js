@@ -10,7 +10,118 @@ const {
   startMemoryWriterRecovery,
   memoryWriterOwner,
   resetMemoryWriterCoordinatorForTests,
+  bindNativeMemoryWriterAttempt,
 } = require('../memoryWriterCoordinator');
+
+describe('isolated memory native request ownership', () => {
+  const identity = {
+    userId: 'writer-owner',
+    messageId: 'answer',
+    conversationId: 'chat',
+    owner: 'process',
+  };
+  const agent = {
+    id: 'memory_attempt',
+    model_parameters: {
+      apiKey: 'synthetic-key',
+      configuration: { baseURL: 'https://native.invalid/v1' },
+    },
+  };
+  const requestBody = {
+    messageId: 'answer',
+    conversationId: 'chat',
+    viventiumGlassHiveIdempotencyKey: 'memory_attempt',
+    voiceMode: true,
+    viventiumActorTrust: 'unknown',
+    viventiumCallSessionId: 'old-call',
+  };
+
+  it('binds only the exact internal writer key and requires native capacity-release acknowledgment', async () => {
+    let retained;
+    const binding = jest.fn(({ req, signal, endpointConfig }) => {
+      retained = req;
+      expect(signal).toBe(controller.signal);
+      expect(endpointConfig).toEqual({
+        baseURL: 'https://native.invalid/v1',
+        apiKey: 'synthetic-key',
+      });
+      req._viventiumHarnessReleaseAttempt = jest.fn(async () => ({
+        acknowledged: true,
+        outcomes: [{ acknowledged: true, capacityReleased: true }],
+      }));
+      return true;
+    });
+    const controller = new AbortController();
+    const release = await bindNativeMemoryWriterAttempt({
+      identity,
+      agent,
+      requestBody,
+      signal: controller.signal,
+      bindCancellation: binding,
+    });
+    expect(retained.user).toEqual({ id: identity.userId });
+    expect(retained.body).toEqual({
+      conversationId: identity.conversationId,
+      responseMessageId: identity.messageId,
+    });
+    expect([...retained._viventiumHarnessIdempotencyKeys]).toEqual(['memory_attempt']);
+    expect(retained._viventiumHarnessIdempotencyKey).toBe(agent.id);
+    expect(requestBody.voiceMode).toBe(true);
+    expect(retained.viventiumCallSession).toBeUndefined();
+    await expect(release()).resolves.toBeUndefined();
+  });
+
+  it.each([
+    { messageId: 'foreign-answer' },
+    { conversationId: 'foreign-chat' },
+    { viventiumGlassHiveIdempotencyKey: 'foreign-key' },
+  ])('rejects mismatched admitted source before any cancellation binding: %j', async (change) => {
+    const bindCancellation = jest.fn();
+    await expect(
+      bindNativeMemoryWriterAttempt({
+        identity,
+        agent,
+        requestBody: { ...requestBody, ...change },
+        signal: new AbortController().signal,
+        bindCancellation,
+      }),
+    ).rejects.toThrow('identity_mismatch');
+    expect(bindCancellation).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    null,
+    { acknowledged: false, outcomes: [] },
+    { acknowledged: true, outcomes: [] },
+    { acknowledged: true, outcomes: [{ capacityReleased: false }] },
+    { acknowledged: true, outcomes: [{ capacityReleased: true }] },
+    { acknowledged: true, outcomes: [{ capacityReleased: true }, { capacityReleased: true }] },
+  ])('does not treat unresolved or unrelated native ownership as released: %j', async (outcome) => {
+    const release = await bindNativeMemoryWriterAttempt({
+      identity,
+      agent,
+      requestBody,
+      signal: new AbortController().signal,
+      bindCancellation: ({ req }) => {
+        req._viventiumHarnessReleaseAttempt = async () => outcome;
+        return true;
+      },
+    });
+    await expect(release()).rejects.toMatchObject({ code: 'HARNESS_CANCELLATION_DELIVERY_FAILED' });
+  });
+
+  it('fails before provider execution when native cancellation cannot be bound', async () => {
+    await expect(
+      bindNativeMemoryWriterAttempt({
+        identity,
+        agent,
+        requestBody,
+        signal: new AbortController().signal,
+        bindCancellation: () => false,
+      }),
+    ).rejects.toThrow('cancellation_binding_unavailable');
+  });
+});
 
 describe('memoryWriterCoordinator', () => {
   afterEach(() => {

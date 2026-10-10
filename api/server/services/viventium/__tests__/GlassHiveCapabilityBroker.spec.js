@@ -1,4 +1,14 @@
+const mockPrepareDurableEffect = jest.fn();
+const mockCommitDurableEffect = jest.fn();
+const mockSettleDurableEffectFailure = jest.fn();
+const mockMarkDurableEffectReceipt = jest.fn();
+jest.mock('../InteractionDurableEffectService', () => ({
+  prepareDurableEffect: (...args) => mockPrepareDurableEffect(...args),
+  commitDurableEffect: (...args) => mockCommitDurableEffect(...args),
+  settleDurableEffectFailure: (...args) => mockSettleDurableEffectFailure(...args),
+}));
 const mockAssertVoiceWorkAuthority = jest.fn();
+const mockAssertCurrentGlassHiveSourceAuthor = jest.fn();
 jest.mock('../VoiceWorkAuthorityService', () => ({
   assertVoiceWorkAuthority: (...args) => mockAssertVoiceWorkAuthority(...args),
 }));
@@ -114,6 +124,44 @@ jest.mock('~/server/services/Tools/mcp', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  assertCurrentGlassHiveSourceAuthor: (...args) => mockAssertCurrentGlassHiveSourceAuthor(...args),
+  GenerationJobManager: {
+    getJobStore: jest.fn(),
+    markDurableEffectReceipt: (...args) => mockMarkDurableEffectReceipt(...args),
+  },
+  isManagedSourceMutation: (...args) =>
+    jest.requireActual('@librechat/api').isManagedSourceMutation(...args),
+  executeManagedSourceMutation: async (options) => {
+    const api = jest.requireActual('@librechat/api');
+    if (!api.isManagedSourceMutation(options.requestBody)) return (await options.dispatch()).result;
+    return api.executeSourceMutation({
+      input: {
+        streamId: options.requestBody.viventiumStreamId,
+        userId: options.userId,
+        sourceEventId: options.requestBody.viventiumSourceEventId,
+        adapterId: options.adapterId,
+        routeId: options.routeId,
+        operation: options.operation,
+        effectKind: options.effectKind,
+        effectOrdinal: 0,
+        effectOccurrenceRef: options.occurrenceId,
+        providerIdempotencyKey: options.providerIdempotencyKey,
+        providerIdempotencyMode: options.providerIdempotencyMode,
+        canonicalArgs: options.canonicalArgs,
+      },
+      service: options.service,
+      dispatch: options.dispatch,
+      recordReceipt: options.recordReceipt,
+      assertAuthor: async () => {
+        try {
+          await mockAssertCurrentGlassHiveSourceAuthor(options);
+        } catch (error) {
+          await options.rejectDispatch?.(error);
+          throw error;
+        }
+      },
+    });
+  },
   getTrustedInteractionContext: (...args) =>
     jest.requireActual('@librechat/api').getTrustedInteractionContext(...args),
   fingerprintTraceReference: (...args) =>
@@ -233,6 +281,8 @@ jest.mock('~/app/clients/tools/util/viventiumSearchTool', () => ({
 }));
 
 jest.mock('../GlassHiveAccountService', () => ({
+  buildTrustedActionIdempotencyKey: (...args) =>
+    jest.requireActual('@librechat/api').buildTrustedActionIdempotencyKey(...args),
   getActiveWorkPage: (...args) => mockGetActiveWorkPage(...args),
   getActiveWorkHistoryPage: (...args) => mockGetActiveWorkHistoryPage(...args),
   invalidateActiveWorkSnapshot: (...args) => mockInvalidateActiveWorkSnapshot(...args),
@@ -264,6 +314,21 @@ describe('GlassHive capability broker', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockPrepareDurableEffect
+      .mockReset()
+      .mockResolvedValue({ decision: 'dispatch', effectKey: 'effect', claimToken: 'claim' });
+    mockCommitDurableEffect.mockReset().mockImplementation(async (input) => ({
+      ownerId: 'user-1',
+      sourceEventId: 'source-1',
+      responseMessageId: 'msg-1',
+      effectKind: 'durable_work_accepted',
+      providerReceiptRef: input.providerReceiptRef,
+    }));
+    mockSettleDurableEffectFailure
+      .mockReset()
+      .mockResolvedValue({ status: 'provider_outcome_unknown' });
+    mockMarkDurableEffectReceipt.mockReset().mockResolvedValue({ status: 'recorded' });
+    mockAssertCurrentGlassHiveSourceAuthor.mockReset().mockResolvedValue(undefined);
     mockGetLogStores.mockImplementation(() => {
       const store = new Map();
       return {
@@ -2225,6 +2290,319 @@ describe('GlassHive capability broker', () => {
       }
     },
   );
+
+  const managedAuthorBody = {
+    conversationId: 'conv-1',
+    messageId: 'msg-1',
+    viventiumStreamId: 'stream-1',
+    viventiumLogicalTurnId: 'turn-1',
+    viventiumLogicalTurnRevision: '1',
+    viventiumAuthoringSourceEventId: 'source-1',
+    viventiumAuthoringSourceRevision: 1,
+  };
+  const supersededAuthorError = () =>
+    Object.assign(new Error('source_authority_superseded'), {
+      code: 'source_authority_superseded',
+      retryable: false,
+    });
+
+  test('source authority rejects a stale broker author before a launch is reserved', async () => {
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({}),
+    });
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    mockAssertCurrentGlassHiveSourceAuthor.mockRejectedValueOnce(supersededAuthorError());
+    await expect(
+      maybeInjectGlassHiveCapabilityBroker({
+        serverName: 'glasshive-workers-projects',
+        toolName: 'worker_delegate_once',
+        toolArguments: { instruction: 'Independent synthetic research.' },
+        config: { configurable: { user: { id: 'user-1' }, requestBody: managedAuthorBody } },
+      }),
+    ).rejects.toMatchObject({ code: 'source_authority_superseded' });
+    expect(mockRegisterGlassHiveLaunchContext).not.toHaveBeenCalled();
+  });
+
+  test('source authority closes a launch if supersession wins during preparation', async () => {
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({}),
+    });
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    mockAssertCurrentGlassHiveSourceAuthor
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(supersededAuthorError());
+    await expect(
+      maybeInjectGlassHiveCapabilityBroker({
+        serverName: 'glasshive-workers-projects',
+        toolName: 'worker_delegate_once',
+        toolArguments: { instruction: 'Independent synthetic research.' },
+        config: { configurable: { user: { id: 'user-1' }, requestBody: managedAuthorBody } },
+      }),
+    ).rejects.toMatchObject({ code: 'source_authority_superseded' });
+    expect(mockRegisterGlassHiveLaunchContext).toHaveBeenCalledTimes(1);
+    expect(mockMarkGlassHiveLaunchPreDispatchFailed).toHaveBeenCalledWith(
+      expect.objectContaining({ originRef: 'ghi-synthetic' }),
+      expect.objectContaining({ code: 'source_authority_superseded' }),
+    );
+    expect(mockMarkGlassHiveLaunchDispatchReady).not.toHaveBeenCalled();
+  });
+
+  test('source authority closes a dispatch-ready launch revoked before its MCP call', async () => {
+    const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({}),
+    });
+    const callTool = jest
+      .fn()
+      .mockResolvedValue({ structuredContent: { status: 'accepted', work_ref: 'work-1' } });
+    mockGetMCPManager.mockReturnValue({ callTool });
+    mockAssertCurrentGlassHiveSourceAuthor
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(supersededAuthorError());
+    const result = await executeMainDelegation({
+      user: { id: 'user-1', role: 'USER' },
+      requestBody: managedAuthorBody,
+      args: {
+        title: 'Synthetic research',
+        instruction: 'Independent synthetic research.',
+        resourceClass: 'standard',
+      },
+      invocationId: 'call-synthetic',
+    });
+    expect(result).toMatchObject({ status: 'blocked', reason: 'source_authority_superseded' });
+    expect(mockMarkGlassHiveLaunchDispatchReady).toHaveBeenCalledTimes(1);
+    expect(mockMarkGlassHiveLaunchDispatchRejected).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ code: 'source_authority_superseded' }),
+    );
+    expect(callTool).not.toHaveBeenCalled();
+    expect(mockMarkGlassHiveLaunchDispatchUnknown).not.toHaveBeenCalled();
+  });
+
+  test('closes a rejected dispatch-ready CAS before any Worker provider call', async () => {
+    const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({}),
+    });
+    const callTool = jest.fn();
+    mockGetMCPManager.mockReturnValue({ callTool });
+    const error = Object.assign(new Error('glasshive_launch_dispatch_fenced'), {
+      code: 'glasshive_launch_dispatch_fenced',
+      retryable: false,
+    });
+    mockMarkGlassHiveLaunchDispatchReady.mockRejectedValueOnce(error);
+
+    const result = await executeMainDelegation({
+      user: { id: 'user-1', role: 'USER' },
+      requestBody: managedAuthorBody,
+      args: {
+        title: 'Synthetic research',
+        instruction: 'Independent synthetic research.',
+        resourceClass: 'standard',
+      },
+      invocationId: 'call-synthetic',
+    });
+
+    expect(result).toMatchObject({ status: 'blocked', reason: error.code, retryable: false });
+    expect(mockMarkGlassHiveLaunchPreDispatchFailed).toHaveBeenCalledWith(
+      expect.objectContaining({ originRef: 'ghi-synthetic' }),
+      error,
+    );
+    expect(callTool).not.toHaveBeenCalled();
+    expect(mockMarkGlassHiveLaunchDispatchUnknown).not.toHaveBeenCalled();
+  });
+
+  test('source authority refuses a late native work action without mutating the existing work', async () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({}),
+    });
+    const grant = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      requestContext: SYNTHETIC_TURN_SCOPE,
+      authorityKind: 'conversation_orchestrator',
+      allowedHostTools: ['active_work_action'],
+      hostToolResources: { active_work_action: { version: 1, request_body: managedAuthorBody } },
+    }).payload;
+    mockAssertCurrentGlassHiveSourceAuthor.mockRejectedValueOnce(supersededAuthorError());
+    const result = await handleToolCall({
+      grant,
+      toolName: 'active_work_action',
+      args: { action: 'stop', workRef: 'work-1' },
+    });
+    expect(result).toMatchObject({ status: 'blocked', reason: 'source_authority_superseded' });
+    expect(mockExecuteGlassHiveWorkAction).not.toHaveBeenCalled();
+  });
+
+  test('source authority refuses a late managed connected write before provider dispatch', async () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getServerConfig: jest.fn().mockResolvedValue({
+        source: 'config',
+        viventiumGlassHive: {
+          version: 1,
+          permitsAutonomousWorker: true,
+          hostAllowed: true,
+          defaultToolAccess: 'none',
+          writePolicy: 'allow',
+          toolPolicies: { schedule_create: { access: 'write' } },
+        },
+      }),
+    });
+    mockReinitMCPServer.mockResolvedValue({
+      success: true,
+      oauthRequired: false,
+      tools: [{ name: 'schedule_create', inputSchema: { type: 'object' } }],
+    });
+    const callTool = jest.fn().mockResolvedValue({ success: true });
+    mockGetMCPManager.mockReturnValue({ callTool });
+    const grant = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      requestContext: SYNTHETIC_TURN_SCOPE,
+      authorityKind: 'conversation_orchestrator',
+      allowedServers: ['scheduling-cortex'],
+      allowedHostTools: ['active_work_action'],
+      hostToolResources: { active_work_action: { version: 1, request_body: managedAuthorBody } },
+    }).payload;
+    mockAssertCurrentGlassHiveSourceAuthor.mockRejectedValueOnce(supersededAuthorError());
+    const result = await handleToolCall({
+      grant,
+      toolName: 'gh_scheduling_cortex_tool_schedule_create',
+      args: { prompt: 'Synthetic reminder', invocation_id: 'write-1' },
+    });
+    expect(result).toMatchObject({ status: 'blocked', reason: 'source_authority_superseded' });
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  test('managed Worker acceptance reserves before dispatch and saves the exact result', async () => {
+    const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({}),
+    });
+    const callTool = jest
+      .fn()
+      .mockResolvedValue({ structuredContent: { status: 'accepted', work_ref: 'work-1' } });
+    mockGetMCPManager.mockReturnValue({ callTool });
+    mockReconcileGlassHiveLaunchResult.mockResolvedValueOnce({ workRef: 'work-1' });
+    const result = await executeMainDelegation({
+      user: { id: 'user-1', role: 'USER' },
+      requestBody: managedAuthorBody,
+      args: {
+        title: 'Synthetic research',
+        instruction: 'Independent synthetic research.',
+        resourceClass: 'standard',
+      },
+      invocationId: 'call-synthetic',
+    });
+    expect(result).toMatchObject({ status: 'ok', workRef: 'work-1' });
+    expect(mockPrepareDurableEffect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adapterId: 'glasshive.worker_delegate.v1',
+        providerIdempotencyKey: 'a'.repeat(64),
+      }),
+    );
+    expect(mockPrepareDurableEffect.mock.invocationCallOrder[0]).toBeLessThan(
+      callTool.mock.invocationCallOrder[0],
+    );
+    expect(mockCommitDurableEffect).toHaveBeenCalledWith(
+      expect.objectContaining({ providerReceiptRef: 'work-1', replayResult: result }),
+    );
+    expect(mockMarkDurableEffectReceipt).toHaveBeenCalledWith(
+      expect.objectContaining({ streamId: 'stream-1', effectRef: 'work-1' }),
+    );
+  });
+
+  test('managed work action reserves and commits one authoritative operation result', async () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({}),
+    });
+    mockExecuteGlassHiveWorkAction.mockResolvedValueOnce({ state: 'paused', workRef: 'work-1' });
+    const grant = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      requestContext: SYNTHETIC_TURN_SCOPE,
+      authorityKind: 'conversation_orchestrator',
+      allowedHostTools: ['active_work_action'],
+      hostToolResources: { active_work_action: { version: 1, request_body: managedAuthorBody } },
+    }).payload;
+    const result = await handleToolCall({
+      grant,
+      toolName: 'active_work_action',
+      args: { action: 'pause', workRef: 'work-1', invocation_id: 'action-1' },
+    });
+    expect(result).toMatchObject({ status: 'ok', result: { state: 'paused' } });
+    expect(mockPrepareDurableEffect).toHaveBeenCalledWith(
+      expect.objectContaining({ adapterId: 'glasshive.work_action.v1', operation: 'pause' }),
+    );
+    expect(mockPrepareDurableEffect.mock.invocationCallOrder[0]).toBeLessThan(
+      mockExecuteGlassHiveWorkAction.mock.invocationCallOrder[0],
+    );
+    expect(mockCommitDurableEffect).toHaveBeenCalledWith(
+      expect.objectContaining({ replayResult: result }),
+    );
+  });
+
+  test('managed connected writes persist an exact returned outcome without claiming provider idempotency', async () => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+    mockGetMCPServersRegistry.mockReturnValue({
+      getServerConfig: jest.fn().mockResolvedValue({
+        source: 'config',
+        viventiumGlassHive: {
+          version: 1,
+          permitsAutonomousWorker: true,
+          hostAllowed: true,
+          defaultToolAccess: 'none',
+          writePolicy: 'allow',
+          toolPolicies: { schedule_create: { access: 'write' } },
+        },
+      }),
+    });
+    mockReinitMCPServer.mockResolvedValue({
+      success: true,
+      oauthRequired: false,
+      tools: [{ name: 'schedule_create', inputSchema: { type: 'object' } }],
+    });
+    const returned = { success: true, result: { scheduleId: 'synthetic-schedule' } };
+    const callTool = jest.fn().mockResolvedValue(returned);
+    mockGetMCPManager.mockReturnValue({ callTool });
+    const grant = mintBrokerGrant({
+      user: { id: 'user-1', role: 'USER' },
+      requestContext: SYNTHETIC_TURN_SCOPE,
+      authorityKind: 'conversation_orchestrator',
+      allowedServers: ['scheduling-cortex'],
+      allowedHostTools: ['active_work_action'],
+      hostToolResources: { active_work_action: { version: 1, request_body: managedAuthorBody } },
+    }).payload;
+    expect(
+      await handleToolCall({
+        grant,
+        toolName: 'gh_scheduling_cortex_tool_schedule_create',
+        args: { prompt: 'Synthetic reminder', invocation_id: 'write-1' },
+      }),
+    ).toEqual(returned);
+    expect(mockPrepareDurableEffect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adapterId: 'mcp.provider_mutation.v1',
+        providerIdempotencyMode: 'none',
+        effectKind: 'provider_mutation_returned',
+      }),
+    );
+    expect(mockPrepareDurableEffect.mock.invocationCallOrder[0]).toBeLessThan(
+      callTool.mock.invocationCallOrder[0],
+    );
+    expect(mockCommitDurableEffect).toHaveBeenCalledWith(
+      expect.objectContaining({ replayResult: returned }),
+    );
+  });
 
   test('does not register launch intent after its authoring signal is superseded', async () => {
     const {

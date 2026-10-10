@@ -1,4 +1,5 @@
 /* === VIVENTIUM START === Saved-result lookup is read-only and exact invocation scoped. === */
+import { APIError } from 'openai';
 import type { MainContinuityFetch } from '../continuity/mainContinuity';
 import { logger, nativeResponseDigest } from '@librechat/data-schemas';
 import {
@@ -9,12 +10,188 @@ import {
 import type { NativeResponseIdentity } from '@librechat/data-schemas';
 import type { SerializableJobData } from '../stream/interfaces/IJobStore';
 import {
+  createNativeBootstrapFetch,
   createNativeResponseFetch,
+  isNativeCapacityRefusal,
   createNativeCapacityFetch,
   createNativeResponseRecoveryService,
   nativeResponseOrigin,
   nativeResponseSha256,
 } from './nativeResponse';
+
+/* === VIVENTIUM START === Phase B retains native admission while its session is occupied. === */
+describe('Phase B native occupied admission', () => {
+  const occupied = () =>
+    new Response(JSON.stringify({ error: { code: 'conversation_session_authority_conflict' } }), {
+      status: 409,
+    });
+
+  it('offers the identical signed request after the existing session becomes available', async () => {
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockResolvedValueOnce(occupied())
+      .mockResolvedValueOnce(occupied())
+      .mockResolvedValueOnce(new Response('{}'));
+    const wrapped = createNativeCapacityFetch(send, {
+      waitForOccupiedSession: true,
+      role: 'cortex',
+    });
+    const body = '{"metadata":{"bootstrap_bundle_b64":"synthetic-signed-carrier"}}';
+    const headers = { 'X-GlassHive-Idempotency-Key': 'synthetic-phase-b' };
+    expect(
+      (
+        await wrapped('http://native.test/v1/chat/completions', {
+          method: 'POST',
+          headers,
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    expect(send).toHaveBeenCalledTimes(3);
+    for (const [, dispatch] of send.mock.calls) {
+      expect(dispatch?.body).toBe(body);
+      expect(dispatch?.headers).toEqual(headers);
+    }
+  });
+
+  it.each([
+    ['no opt-in', 'conversation_session_authority_conflict', false],
+    ['different authority failure', 'native_response_authority_mismatch', true],
+    ['untyped conflict', '', true],
+  ])('returns %s without another dispatch', async (_label, code, waitForOccupiedSession) => {
+    const conflict = new Response(JSON.stringify({ error: { code } }), { status: 409 });
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockResolvedValue(conflict);
+    const wrapped = createNativeCapacityFetch(send, { waitForOccupiedSession });
+    expect(await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).toBe(conflict);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains the caller deadline rather than renewing it while occupied', async () => {
+    const conflict = occupied();
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockResolvedValue(conflict);
+    const wrapped = createNativeCapacityFetch(send, {
+      waitForOccupiedSession: true,
+      deadlineAt: Date.now() + 100,
+    });
+    expect(await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).toBe(conflict);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('ends at the existing thirty-second admission budget', async () => {
+    let now = 1_000;
+    const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const conflict = occupied();
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockImplementation(async () => {
+        now += 10_000;
+        return conflict;
+      });
+    try {
+      const wrapped = createNativeCapacityFetch(send, { waitForOccupiedSession: true });
+      expect(await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).toBe(
+        conflict,
+      );
+      expect(send).toHaveBeenCalledTimes(3);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each(['owner', 'transport'])(
+    'keeps the %s cancellation signal while occupied',
+    async (which) => {
+      const owner = new AbortController();
+      const transport = new AbortController();
+      let markSent: () => void = () => {};
+      const firstSent = new Promise<void>((resolve) => {
+        markSent = resolve;
+      });
+      const send = jest
+        .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+        .mockImplementation(async () => {
+          markSent();
+          return occupied();
+        });
+      const wrapped = createNativeCapacityFetch(send, {
+        signal: owner.signal,
+        waitForOccupiedSession: true,
+      });
+      const request = wrapped('http://native.test/v1/chat/completions', {
+        body: '{}',
+        signal: transport.signal,
+      });
+      const stopped = expect(request).rejects.toMatchObject({ name: 'AbortError' });
+      await firstSent;
+      (which === 'owner' ? owner : transport).abort('user_cancelled');
+      await stopped;
+      expect(send).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('retains a Request cancellation signal without an optional owner signal', async () => {
+    const controller = new AbortController();
+    let markSent: () => void = () => {};
+    const firstSent = new Promise<void>((resolve) => {
+      markSent = resolve;
+    });
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockImplementationOnce(async () => {
+        markSent();
+        return occupied();
+      })
+      .mockResolvedValue(new Response('{}'));
+    const wrapped = createNativeCapacityFetch(send, { waitForOccupiedSession: true });
+    const request = wrapped(
+      new Request('http://native.test/v1/chat/completions', {
+        method: 'POST',
+        body: '{}',
+        signal: controller.signal,
+      }),
+    );
+    const stopped = expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    await firstSent;
+    controller.abort('user_cancelled');
+    await stopped;
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps an explicit init signal as the Request signal override', async () => {
+    const requestController = new AbortController();
+    const overrideController = new AbortController();
+    let markSent: () => void = () => {};
+    const firstSent = new Promise<void>((resolve) => {
+      markSent = resolve;
+    });
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockImplementationOnce(async () => {
+        markSent();
+        return occupied();
+      })
+      .mockResolvedValue(new Response('{}'));
+    const wrapped = createNativeCapacityFetch(send, { waitForOccupiedSession: true });
+    const request = wrapped(
+      new Request('http://native.test/v1/chat/completions', {
+        method: 'POST',
+        body: '{}',
+        signal: requestController.signal,
+      }),
+      { signal: overrideController.signal },
+    );
+    await firstSent;
+    requestController.abort('replaced_request_signal');
+    expect((await request).status).toBe(200);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1][1]?.signal?.aborted).toBe(false);
+  });
+});
+/* === VIVENTIUM END === */
 
 describe('native response binding and recovery', () => {
   const context = {
@@ -732,7 +909,7 @@ describe('native response binding and recovery', () => {
       authenticated: true,
       audioRequested: false,
     };
-    const admit = jest.fn(async () => true);
+    const admit = jest.fn<Promise<boolean>, [NativeResponseIdentity]>(async () => true);
     const bound = jest.fn();
     const wrapped = createNativeResponseFetch(
       async () => new Response('{}'),
@@ -798,6 +975,115 @@ describe('native response binding and recovery', () => {
       candidate,
     );
   });
+  describe('signed bootstrap body delivery', () => {
+    const bundle = {
+      viventium_upload_context: {
+        selected_uploads: [
+          { file_id: 'first', filename: '01-first.txt', text: 'a'.repeat(200 * 1024) },
+          { file_id: 'second', filename: '02-second.txt', text: 'b'.repeat(200 * 1024) },
+        ],
+      },
+    };
+    const encoded = Buffer.from(JSON.stringify(bundle)).toString('base64');
+    const headers = {
+      'X-GlassHive-Bootstrap-Bundle-B64': encoded,
+      'X-GlassHive-Bootstrap-Timestamp': '1234',
+      'X-GlassHive-Bootstrap-Signature': 'sha256=synthetic-signature',
+      'Content-Length': '1',
+    };
+    const body = JSON.stringify({
+      messages: [{ role: 'user', content: 'Use both saved files.' }],
+      metadata: { visible_message_chain: [{ id: 'question', sha256: 'source' }] },
+    });
+
+    it('moves both200KiB texts before invocation admission and keeps retry identity exact', async () => {
+      const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
+        async () => new Response('{}'),
+      );
+      const admit = jest.fn<Promise<boolean>, [NativeResponseIdentity]>(async () => true);
+      const wrapped = createNativeBootstrapFetch(
+        createNativeResponseFetch(send, async () => context, admit, jest.fn()),
+      );
+      await wrapped('http://native.test/v1/chat/completions', { method: 'POST', headers, body });
+      await wrapped('http://native.test/v1/chat/completions', { method: 'POST', headers, body });
+      const dispatch = send.mock.calls[0][1];
+      const delivered = JSON.parse(String(dispatch?.body));
+      const finalHeaders = new Headers(dispatch?.headers);
+      expect(delivered.metadata.bootstrap_bundle_b64).toBe(encoded);
+      expect(
+        JSON.parse(Buffer.from(delivered.metadata.bootstrap_bundle_b64, 'base64').toString()),
+      ).toEqual(bundle);
+      expect(delivered.messages).toEqual(JSON.parse(body).messages);
+      expect(finalHeaders.has('X-GlassHive-Bootstrap-Bundle-B64')).toBe(false);
+      expect(finalHeaders.has('Content-Length')).toBe(false);
+      expect(finalHeaders.get('X-GlassHive-Bootstrap-Timestamp')).toBe(
+        headers['X-GlassHive-Bootstrap-Timestamp'],
+      );
+      expect(finalHeaders.get('X-GlassHive-Bootstrap-Signature')).toBe(
+        headers['X-GlassHive-Bootstrap-Signature'],
+      );
+      expect(admit.mock.calls[0][0].bodySha256).toBe(nativeResponseSha256(String(dispatch?.body)));
+      expect(finalHeaders.get('X-Viventium-Native-Body-SHA256')).toBe(
+        nativeResponseSha256(String(dispatch?.body)),
+      );
+      expect(send.mock.calls[1][1]?.body).toBe(dispatch?.body);
+      expect(
+        new Headers(send.mock.calls[1][1]?.headers).get('X-Viventium-Native-Invocation-Id'),
+      ).toBe(finalHeaders.get('X-Viventium-Native-Invocation-Id'));
+    });
+
+    it('detects the digest mismatch when relocation follows invocation admission', async () => {
+      const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
+        async () => new Response('{}'),
+      );
+      const admit = jest.fn<Promise<boolean>, [NativeResponseIdentity]>(async () => true);
+      const wrongOrder = createNativeResponseFetch(
+        createNativeBootstrapFetch(send),
+        async () => context,
+        admit,
+        jest.fn(),
+      );
+      await wrongOrder('http://native.test/v1/chat/completions', { method: 'POST', headers, body });
+      expect(admit.mock.calls[0][0].bodySha256).not.toBe(
+        nativeResponseSha256(String(send.mock.calls[0][1]?.body)),
+      );
+    });
+
+    it.each(['absent', 'other endpoint', 'other method'])(
+      'keeps existing fetch arguments unchanged for %s',
+      async (mode) => {
+        const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
+          async () => new Response('{}'),
+        );
+        const input =
+          mode === 'other endpoint'
+            ? 'http://native.test/v1/models'
+            : 'http://native.test/v1/chat/completions';
+        const init = {
+          method: mode === 'other method' ? 'GET' : 'POST',
+          body,
+          headers: mode === 'absent' ? {} : headers,
+        };
+        await createNativeBootstrapFetch(send)(input, init);
+        expect(send).toHaveBeenCalledWith(input, init);
+      },
+    );
+
+    it('rejects two signed carriers before dispatch', async () => {
+      const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
+        async () => new Response('{}'),
+      );
+      await expect(
+        createNativeBootstrapFetch(send)('http://native.test/v1/chat/completions', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ metadata: { bootstrap_bundle_b64: encoded } }),
+        }),
+      ).rejects.toThrow('Native bootstrap must use one carrier');
+      expect(send).not.toHaveBeenCalled();
+    });
+  });
+
   it('binds exact final body before sending and preserves it through the native fetch', async () => {
     const body = JSON.stringify({
       messages: [{ role: 'user', content: 'Source.' }],
@@ -865,7 +1151,7 @@ describe('native response binding and recovery', () => {
   });
   it('never admits or dispatches a revision replaced while it waited for release', async () => {
     const send = jest.fn();
-    const admit = jest.fn(async () => true);
+    const admit = jest.fn<Promise<boolean>, [NativeResponseIdentity]>(async () => true);
     const wrapped = createNativeResponseFetch(send, async () => context, admit, jest.fn(), {
       beforeDispatch: async () => {
         throw Object.assign(new Error('operation was aborted'), { name: 'AbortError' });
@@ -1025,7 +1311,7 @@ describe('native response binding and recovery', () => {
       .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
       .mockResolvedValueOnce(capacity)
       .mockResolvedValueOnce(new Response('{}'));
-    const admit = jest.fn(async () => true);
+    const admit = jest.fn<Promise<boolean>, [NativeResponseIdentity]>(async () => true);
     const current = jest.fn(async () => true);
     const wrapped = createNativeResponseFetch(send, async () => context, admit, jest.fn(), {
       beforeDispatch: async () => undefined,
@@ -1163,7 +1449,7 @@ describe('native response binding and recovery', () => {
       .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
       .mockResolvedValueOnce(occupied())
       .mockResolvedValueOnce(new Response('{}'));
-    const admit = jest.fn(async () => true);
+    const admit = jest.fn<Promise<boolean>, [NativeResponseIdentity]>(async () => true);
     const whileOccupied = jest.fn(async () => true);
     const wrapped = createNativeResponseFetch(send, async () => context, admit, jest.fn(), {
       beforeDispatch: async () => undefined,
@@ -1401,7 +1687,93 @@ describe('native response binding and recovery', () => {
       d.transaction,
       expect.any(Function),
     );
-  });
+  });  it.each(['valid', 'accepted', 'unknown', 'wrong_invocation', 'wrong_body', 'wrong_stream', 'wrong_message', 'wrong_version', 'other_error', 'success'])(
+    'releases only the final exact definitive capacity refusal: %s', async (mode) => {
+      let bound = identity;
+      const reject = jest.fn(async () => undefined);
+      const send = jest.fn(async () => {
+        const proof = { version: 1, accepted: false, invocation_id: bound.invocationId,
+          body_sha256: bound.bodySha256, stream_id: bound.streamId, message_id: bound.responseMessageId };
+        if (mode === 'accepted') proof.accepted = true;
+        if (mode === 'wrong_version') proof.version = 2;
+        if (mode === 'wrong_invocation') proof.invocation_id = 'foreign';
+        if (mode === 'wrong_body') proof.body_sha256 = 'foreign';
+        if (mode === 'wrong_stream') proof.stream_id = 'foreign';
+        if (mode === 'wrong_message') proof.message_id = 'foreign';
+        return new Response(JSON.stringify({ error: { code: mode === 'other_error' ? 'upstream_unavailable' : 'host_capacity',
+          ...(mode === 'unknown' ? {} : { native_admission: proof }) } }),
+          { status: mode === 'success' ? 200 : 503, headers: { 'Retry-After': '60' } });
+      });
+      const wrapped = createNativeResponseFetch(send, async () => context, async () => true,
+        (value) => { bound = value; }, undefined, reject);
+      expect((await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).status)
+        .toBe(mode === 'success' ? 200 : 503);
+      expect(send).toHaveBeenCalledTimes(1);
+      if (mode === 'valid') expect(reject).toHaveBeenCalledWith(bound);
+      else expect(reject).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['valid', 'accepted', 'unknown', 'foreign', 'other_error'])(
+    'validates refusal metadata preserved by the actual OpenAI SDK error: %s', (mode) => {
+      const proof = { version: 1, accepted: mode === 'accepted', invocation_id: identity.invocationId,
+        body_sha256: identity.bodySha256, stream_id: identity.streamId, message_id: identity.responseMessageId };
+      if (mode === 'foreign') proof.invocation_id = 'foreign';
+      const failure = { code: mode === 'other_error' ? 'upstream_unavailable' : 'host_capacity',
+        ...(mode === 'unknown' ? {} : { native_admission: proof }) };
+      const sdkError = APIError.generate(503, { error: failure }, 'Unavailable.', new Headers());
+      expect(sdkError.error).toBe(failure);
+      expect(isNativeCapacityRefusal(sdkError.error as typeof failure, identity)).toBe(mode === 'valid');
+    },
+  );
+
+  it.each(['queued_after_retry', 'transport_after_retry'])(
+    'keeps recovery fenced when an early refusal becomes %s', async (mode) => {
+      let bound = identity;
+      const reject = jest.fn(async () => undefined);
+      const send = jest.fn().mockImplementationOnce(async () => new Response(JSON.stringify({ error: {
+        code: 'host_capacity', native_admission: { version: 1, accepted: false,
+          invocation_id: bound.invocationId, body_sha256: bound.bodySha256,
+          stream_id: bound.streamId, message_id: bound.responseMessageId },
+      } }), { status: 503, headers: { 'Retry-After': '0.001' } }))
+        .mockImplementationOnce(async () => {
+          if (mode === 'transport_after_retry') throw new Error('transport unavailable');
+          return new Response(JSON.stringify({ error: { code: 'host_capacity' } }),
+            { status: 503, headers: { 'Retry-After': '60' } });
+        });
+      const wrapped = createNativeResponseFetch(send, async () => context, async () => true,
+        (value) => { bound = value; }, undefined, reject);
+      if (mode === 'transport_after_retry')
+        await expect(wrapped('http://native.test/v1/chat/completions', { body: '{}' })).rejects.toThrow('transport unavailable');
+      else expect((await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).status).toBe(503);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(reject).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['pending', 'prepared', 'completed', 'cancelled', 'foreign', 'stale', 'revoke_refused'])(
+    'uses the existing exact release fences for unaccepted %s', async (mode) => {
+      const d = deps();
+      d.db.getNativeResponse.mockResolvedValue({ nativeResponse: { ...identity,
+        status: mode === 'foreign' || mode === 'stale' || mode === 'revoke_refused' ? 'pending' : mode,
+        ...(mode === 'foreign' ? { invocationId: 'other' } : {}) } });
+      if (mode === 'stale') d.isCurrent.mockResolvedValue(false);
+      if (mode === 'revoke_refused') d.revoke.mockResolvedValue({ status: 'committed' });
+      const service = createNativeResponseRecoveryService(d);
+      if (mode === 'pending') {
+        await expect(service.rejectUnaccepted(identity)).resolves.toBeUndefined();
+        expect(d.revoke).toHaveBeenCalledWith(identity);
+        expect(d.db.settleNativeResponse).toHaveBeenCalledWith(identity, 'unsupported');
+        expect(d.release).toHaveBeenCalledWith(identity);
+      } else {
+        await expect(service.rejectUnaccepted(identity)).rejects.toThrow();
+        expect(d.release).not.toHaveBeenCalled();
+        expect(d.db.settleNativeResponse).not.toHaveBeenCalled();
+      }
+      expect(d.fetch).not.toHaveBeenCalled();
+    },
+  );
+
 });
 
 describe('native identity across BSON optional-field representation', () => {
@@ -1479,5 +1851,6 @@ describe('native identity across BSON optional-field representation', () => {
     expect(nativeJobMatches(job, { ...identity, sourceSequence: 0 })).toBe(false);
     expect(nativeJobMatches(job, { ...identity, userId: 'another' })).toBe(false);
   });
+
 });
 /* === VIVENTIUM END === */

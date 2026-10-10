@@ -163,6 +163,7 @@ export const ACTIVE_WORK_ACTION_JSON_SCHEMA = Object.freeze({
       description: ACTIVE_WORK_ACTION_SEMANTICS,
     },
     instruction: { type: 'string', minLength: 1, maxLength: 8000 },
+    fileIds: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1, maxLength: 256 }, description: 'For Steer, Queue, or Message only: exact authorized Core file IDs to attach to this target. Original bytes and extracted text keep their declared input kind; no files go to other work.' },
   },
   required: ['workRef', 'action'],
   additionalProperties: false,
@@ -239,10 +240,17 @@ export function canonicalConversationOrchestrationArguments(
   }
   if (toolName === 'active_work_action') {
     const instruction = boundedString(input.instruction, 8000);
+    const fileIds = input.fileIds;
+    if (fileIds !== undefined && (!Array.isArray(fileIds) || !fileIds.length ||
+        fileIds.some((id) => typeof id !== 'string' || !id.trim() || id.length > 256) ||
+        new Set(fileIds).size !== fileIds.length || !['steer', 'queue', 'message'].includes(String(input.action)))) {
+      throw new TypeError('fileIds require exact unique follow-up file references');
+    }
     return {
       workRef: boundedString(input.workRef, 160),
       action: boundedString(input.action, 32).toLowerCase(),
       ...(instruction ? { instruction } : {}),
+      ...(fileIds ? { fileIds: [...fileIds as string[]] } : {}),
     };
   }
   if (toolName === 'active_work_list') {

@@ -10,6 +10,8 @@ const {
   nativeIdentityJson,
   createDeliveryDispositionStreamHandler,
   getStreamDeliveryDisposition,
+  inspectProviderPublicPartCompletion,
+  createReleasedMainPublicPartOwner,
   supportsMessagingDeliveryDisposition,
   isAudioDeliveryRequested,
   inspectNativeOutputFileCarrier,
@@ -54,6 +56,7 @@ const {
 } = require('~/server/services/viventium/telegramTimingDeep');
 const {
   formatVoiceLatencyTiming,
+  logVoiceLatencyNumericStage,
   voiceLatencyNow,
 } = require('~/server/services/viventium/voiceLatencyTiming');
 const {
@@ -98,6 +101,7 @@ const logVoiceLatencyStage = (req, stage, stageStartAt = null, details = '') => 
   logger.info(
     `[VoiceLatency][LC] stage=${stage} request_id=${requestId} ${timingPart}${detailPart}`,
   );
+  logVoiceLatencyNumericStage(logger, req, 'callback', stage, stageStartAt);
 };
 
 /* === VIVENTIUM START ===
@@ -632,7 +636,11 @@ class ModelEndHandler {
         outputCapture?.owner === this.dispositionOwner(agentContext) ? outputCapture : null;
       if (errorMessage) {
         this.transferredOutputFileCaptures.delete(graph);
-      } else if (data?.output && toolCalls?.length && currentOutput) {
+      } else if (
+        data?.output &&
+        currentOutput &&
+        (toolCalls?.length || !shouldEmitAgentOutput(metadata, agentContext.agentId))
+      ) {
         let transfers = this.transferredOutputFileCaptures.get(graph);
         if (!transfers) {
           transfers = new Map();
@@ -1020,6 +1028,74 @@ function getDefaultHandlers({
     );
     tracePreview('emit_returned');
   };
+  /* === VIVENTIUM START === Native completion is an ordered audio control, not final text. === */
+  const completedPublicParts = new Set();
+  const emitPublicPartCompletion = async (_event, data, metadata, graph) => {
+    const completion = inspectProviderPublicPartCompletion(data?.chunk);
+    const deliveryDisposition = getStreamDeliveryDisposition(metadata);
+    if (
+      !completion ||
+      deliveryDisposition?.audio !== 'eligible' ||
+      deliveryDisposition.valid !== true ||
+      deliveryDisposition.source !== 'model'
+    )
+      return;
+    const identity = req?._viventiumNativeResponseIdentity;
+    const interaction =
+      require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(req);
+    if (
+      !identity ||
+      !streamId ||
+      req?._viventiumHarnessExecutionEnabled !== true ||
+      !isAudioDeliveryRequested(req) ||
+      interaction?.actor_kind !== 'external_user' ||
+      interaction?.origin !== 'interactive' ||
+      interaction.logical_turn_id !== identity.logicalTurnId ||
+      interaction.revision !== identity.revision ||
+      req.user?.id !== identity.userId ||
+      identity.streamId !== streamId ||
+      completion.stream_id !== streamId ||
+      completion.message_id !== identity.responseMessageId ||
+      metadata?.agentId !== identity.agentId ||
+      !shouldEmitAgentOutput(metadata, identity.agentId) ||
+      graph?.getAgentContext(metadata)?.currentTokenType !== ContentTypes.TEXT
+    )
+      return;
+    const stepKey = graph.getStepKey(metadata);
+    if (graph.getRunStep(graph.getStepIdByKey(stepKey))?.type !== StepTypes.MESSAGE_CREATION)
+      return;
+    const key = JSON.stringify([
+      identity.invocationId,
+      completion.request_id,
+      completion.run_id,
+      completion.part_id,
+    ]);
+    if (completedPublicParts.has(key)) return;
+    const job = await GenerationJobManager.getJobStore().getJob(streamId);
+    if (
+      !nativeJobMatches(job, identity) ||
+      job.status !== 'running' ||
+      job.generationCompleted === true ||
+      job.nativeResponseCancelled === true ||
+      (job.nativeResponse &&
+        (job.nativeResponseSettled === true ||
+          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity))) ||
+      completedPublicParts.has(key)
+    )
+      return;
+    completedPublicParts.add(key);
+    await GenerationJobManager.emitChunk(
+      streamId,
+      {
+        event: 'on_public_content_part_complete',
+        data: { completion, deliveryDisposition },
+      },
+      job.nativeResponse
+        ? identity
+        : { publicPartOwner: createReleasedMainPublicPartOwner(identity, require('~/models')) },
+    );
+  };
+  /* === VIVENTIUM END === */
   /* === VIVENTIUM START ===
    * Feature: Exact visible-agent ownership under parallel graph execution.
    * Purpose: The upstream graph runner reuses mutable runnable metadata while source components
@@ -1066,6 +1142,7 @@ function getDefaultHandlers({
      * and reasoning deltas, so nothing here may dispatch them a second time.
      * === VIVENTIUM END === */
     [GraphEvents.CHAT_MODEL_STREAM]: createDeliveryDispositionStreamHandler({
+      afterHandle: emitPublicPartCompletion,
       required: (_event, _data, metadata, graph) => {
         const context = graph?.getAgentContext(metadata);
         const owner =

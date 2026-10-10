@@ -294,7 +294,9 @@ const service = createTelegramInputService({
     const job = await GenerationJobManager.getJob(streamId);
     if (!job || job.metadata?.userId !== ownerId) return 'missing';
     const ack = job.metadata?.deliveryAcknowledgement;
-    if (ack?.state === 'committed') return 'completed';
+    // VIVENTIUM: a committed durable effect also settles its own accepted source.
+    // Reopening that terminal stream would resend its persisted memory receipt.
+    if (['committed', 'committed_effect'].includes(ack?.state)) return 'completed';
     // VIVENTIUM: the adapter's failed acknowledgement is terminal for this stream's answer.
     if (ack?.state === 'failed') return 'failed';
     return ['error', 'aborted', 'superseded'].includes(job.status) ? 'failed' : 'pending';

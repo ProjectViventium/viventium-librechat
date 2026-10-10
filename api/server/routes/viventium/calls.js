@@ -184,11 +184,16 @@ router.post('/', requireJwtAuth, async (req, res) => {
     }
 
     const preferPublicPlayground = shouldPreferPublicPlaygroundForRequest(req);
+    const readinessStartedAt = Date.now();
     const readiness = await verifyPlaygroundReadiness({ preferPublicPlayground });
     if (!readiness.ready) {
-      logger.warn('[VIVENTIUM][calls] call_rejected', {
-        reason: readiness.reason,
-      });
+      logger.warn(
+        `[VIVENTIUM][calls] call_rejected ${JSON.stringify({
+          reason: readiness.reason,
+          preferPublicPlayground,
+          durationMs: Date.now() - readinessStartedAt,
+        })}`,
+      );
       return res.status(503).json({
         error: 'voice_runtime_not_ready',
         reason: readiness.reason,
@@ -206,6 +211,7 @@ router.post('/', requireJwtAuth, async (req, res) => {
 
     const response = buildCallLaunchResponse(session, {
       preferPublicPlayground,
+      includeConversationId: true,
     });
 
     logger.info('[VIVENTIUM][calls] call_session_created');
@@ -377,6 +383,7 @@ router.get('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => {
     const session = req.viventiumCallSession;
     const settings = await getCallSessionVoiceSettings(session.callSessionId, {
       capabilityRequiredProviders: req.config?.endpoints?.agents?.capabilityRequiredProviders || [],
+      assistantProviderCapabilities: req.app?.locals?.agentProviderCapabilities || {},
     });
 
     if (!settings) {
@@ -405,6 +412,7 @@ router.post('/:callSessionId/voice-defaults', requireJwtAuth, async (req, res) =
       persistToUserDefaults: true,
       requestedVoiceRoute: session.requestedVoiceRoute,
       capabilityRequiredProviders: req.config?.endpoints?.agents?.capabilityRequiredProviders || [],
+      assistantProviderCapabilities: req.app?.locals?.agentProviderCapabilities || {},
     });
     if (!updated) return res.status(410).json({ error: 'Call session expired.' });
     return res.json(updated);
@@ -427,6 +435,7 @@ router.post('/:callSessionId/voice-settings', dispatchAuth, async (req, res) => 
       persistToUserDefaults: false,
       requestedVoiceRoute: body.requestedVoiceRoute,
       capabilityRequiredProviders: req.config?.endpoints?.agents?.capabilityRequiredProviders || [],
+      assistantProviderCapabilities: req.app?.locals?.agentProviderCapabilities || {},
     });
 
     if (!updated) {

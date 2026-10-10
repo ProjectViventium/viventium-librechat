@@ -1,9 +1,17 @@
 /* === VIVENTIUM START === Native final persistence shares the source's Mongo transaction. === */
 import { createHash } from 'node:crypto';
 import { Constants, ContentTypes } from 'librechat-data-provider';
-import { mainContinuityMessageEvidence } from './mainContinuityEvidence';
-import type { FilterQuery } from 'mongoose';
-import type { IMessage } from '~/types/message';
+import {
+  mainContinuityMessageEvidence,
+  normalizeMainBackgroundInputs,
+} from './mainContinuityEvidence';
+import { createMainContinuityMethods } from './mainContinuity';
+import type {
+  IMainContinuityBackgroundInput,
+  IMainContinuityBackgroundInputReceipt,
+} from '../types/mainContinuityState';
+import type { Document, FilterQuery, Query, Types, UpdateResult } from 'mongoose';
+import type { IMessage } from '../types/message';
 import type {
   NativeResponseAdmission,
   NativeResponseCandidate,
@@ -12,11 +20,20 @@ import type {
   NativeResponseSource,
   NativeResponseMessageProjection,
   NativeResponseMutationKind,
-} from '~/types/nativeResponse';
+} from '../types/nativeResponse';
 
 type Transaction = <T>(operation: () => Promise<T>) => Promise<T>;
 type Commit = (identity: NativeResponseIdentity, digest: string) => Promise<NativeResponseCommit>;
 type Revoke = (identity: NativeResponseIdentity) => Promise<NativeResponseCommit>;
+type NamedMembers<T> = {
+  [Key in keyof T as string extends Key ? never : number extends Key ? never :
+    symbol extends Key ? never : Key]: T[Key];
+};
+type NativeResponseRow = Omit<NamedMembers<IMessage>, keyof NamedMembers<Document>> & {
+  _id: Types.ObjectId;
+  __v?: number;
+};
+type NativeResponseList = Query<NativeResponseRow[], IMessage, {}, IMessage, 'find'>;
 
 /** BSON can retain absent optional values as null; identity semantics keep them absent. */
 export function normalizeNativeResponseIdentity<T extends NativeResponseIdentity>(identity: T): T {
@@ -130,6 +147,150 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
     'nativeResponse.jobCreatedAt': identity.jobCreatedAt,
     'nativeResponse.bodySha256': identity.bodySha256,
   });
+
+  const backgroundInputFilter = (identity: NativeResponseIdentity) => ({
+    ...responseFilter(identity),
+    parentMessageId: identity.source.messageId,
+    'nativeResponse.streamId': identity.streamId,
+    'nativeResponse.logicalTurnId': identity.logicalTurnId,
+    'nativeResponse.revision': identity.revision,
+    'nativeResponse.providerId': identity.providerId,
+    'nativeResponse.agentId': identity.agentId,
+    'nativeResponse.originSha256': identity.originSha256,
+    'nativeResponse.source.id': identity.source.id,
+    'nativeResponse.source.digest': identity.source.digest,
+  });
+
+  /** Persist source before transport under the existing acceptance lock. current_main preserves
+   * data after Native release; it grants no Native control/publication authority. */
+  async function prepareNativeMainBackgroundInput(
+    identity: NativeResponseIdentity,
+    input: IMainContinuityBackgroundInput,
+    transaction: Transaction = (operation) => mongoose.connection.transaction(operation),
+    mode?: 'current_main',
+  ): Promise<boolean> {
+    const [normalized] = normalizeMainBackgroundInputs([input]);
+    if (normalized.invocationId !== identity.invocationId) return false;
+    const filter = backgroundInputFilter(identity);
+    return transaction(() =>
+      createMainContinuityMethods(mongoose).mutateAcceptedMainContinuitySources(
+        filter,
+        async () => {
+          const row = await messages().findOne(filter).select('+nativeResponse').lean();
+          const admission = row?.nativeResponse;
+          if (
+            !row || !admission ||
+            !(mode === 'current_main' ? ['pending', 'unsupported'] : ['pending'])
+              .includes(admission.status) ||
+            admission.recoverUntil <= Date.now()
+          )
+            return false;
+          await lockSource(identity);
+          const inputs = normalizeMainBackgroundInputs(
+            metadataRecord(row.metadata?.viventium).backgroundInputs,
+          );
+          const existing = inputs.find(
+            (value) =>
+              value.invocationId === normalized.invocationId &&
+              value.deliveryId === normalized.deliveryId,
+          );
+          if (existing) return nativeResponseDigest(existing) === nativeResponseDigest(normalized);
+          normalizeMainBackgroundInputs([...inputs, normalized]);
+          const saved = await messages().updateOne(
+            { ...filter, 'nativeResponse.status': admission.status },
+            {
+              $addToSet: {
+                'metadata.viventium.backgroundInputs': normalized,
+                'metadata.viventium.backgroundInputReceipts': {
+                  version: 1,
+                  invocationId: identity.invocationId,
+                  deliveryId: normalized.deliveryId,
+                  textSha256: normalized.textSha256,
+                  status: 'offered',
+                },
+              },
+            },
+          );
+          return saved.matchedCount === 1;
+        },
+      ),
+    );
+  }
+
+  /** Receipt mutation does not alter accepted source or assert consumption/presentation. */
+  async function recordNativeMainBackgroundInputReceipt(
+    identity: NativeResponseIdentity,
+    receipt: IMainContinuityBackgroundInputReceipt,
+  ): Promise<boolean> {
+    if (!['offered', 'queued', 'pending', 'unavailable'].includes(receipt.status)) return false;
+    const id = (value: unknown): value is string =>
+      typeof value === 'string' && !!value.trim() && value.length <= 256;
+    if (
+      ['queued', 'pending'].includes(receipt.status) &&
+      (!id(receipt.runId) || !id(receipt.attemptId) || !id(receipt.messageId))
+    )
+      return false;
+    const filter = backgroundInputFilter(identity);
+    const row = await messages().findOne(filter).select('+nativeResponse').lean();
+    if (!row) return false;
+    const metadata = metadataRecord(row.metadata?.viventium);
+    const input = normalizeMainBackgroundInputs(metadata.backgroundInputs).find(
+      (value) =>
+        value.invocationId === identity.invocationId &&
+        value.deliveryId === receipt.deliveryId &&
+        value.textSha256 === receipt.textSha256,
+    );
+    if (!input) return false;
+    const prior = (
+      Array.isArray(metadata.backgroundInputReceipts) ? metadata.backgroundInputReceipts : []
+    )
+      .map(metadataRecord)
+      .find(
+        (value) =>
+          value.invocationId === identity.invocationId && value.deliveryId === receipt.deliveryId,
+      );
+    if (!prior || prior.textSha256 !== receipt.textSha256) return false;
+    if (['queued', 'pending'].includes(String(prior.status))) {
+      if (receipt.status === 'offered' || receipt.status === 'unavailable') return true;
+      if (
+        prior.runId !== receipt.runId ||
+        prior.attemptId !== receipt.attemptId ||
+        prior.messageId !== receipt.messageId
+      )
+        return false;
+      if (prior.status === 'queued' && receipt.status === 'pending') return true;
+    }
+    const saved = await messages().updateOne(
+      {
+        ...filter,
+        'metadata.viventium.backgroundInputReceipts': {
+          $elemMatch: {
+            version: 1,
+            invocationId: identity.invocationId,
+            deliveryId: receipt.deliveryId,
+            textSha256: receipt.textSha256,
+            status: prior.status,
+          },
+        },
+      },
+      {
+        $set: {
+          'metadata.viventium.backgroundInputReceipts.$': {
+            version: 1,
+            invocationId: identity.invocationId,
+            deliveryId: receipt.deliveryId,
+            textSha256: receipt.textSha256,
+            status: receipt.status,
+            ...(['queued', 'pending'].includes(receipt.status)
+              ? { runId: receipt.runId, attemptId: receipt.attemptId, messageId: receipt.messageId }
+              : {}),
+          },
+        },
+      },
+      { timestamps: false },
+    );
+    return saved.matchedCount === 1;
+  }
 
   async function lockSource(identity: NativeResponseIdentity, historical = false): Promise<void> {
     const source = await messages()
@@ -277,7 +438,7 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
     });
   }
 
-  async function getNativeResponse(userId: string, responseMessageId: string) {
+  async function getNativeResponse(userId: string, responseMessageId: string): Promise<NativeResponseRow | null> {
     return messages()
       .findOne({ user: userId, messageId: responseMessageId, deletedAt: null })
       .select('+nativeResponse')
@@ -331,7 +492,7 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
       message: NativeResponseMessageProjection,
     ) => NativeResponseMessageProjection,
     prepareAttachments?: () => Promise<NativeResponseMessageProjection['attachments']>,
-  ) {
+  ): Promise<NativeResponseRow | null> {
     const committed = await commit(identity, digest);
     if (committed.status !== 'committed' || committed.candidateSha256 !== digest) {
       throw new Error('native_response_publication_revoked');
@@ -503,11 +664,21 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
     });
   }
 
+  function settleNativeResponse(
+    identity: NativeResponseIdentity,
+    status: 'cancelled' | 'failed' | 'unsupported',
+    snapshot: NativeResponseMessageProjection,
+  ): Promise<NativeResponseRow | null>;
+  function settleNativeResponse(
+    identity: NativeResponseIdentity,
+    status: 'cancelled' | 'failed' | 'unsupported',
+    snapshot?: undefined,
+  ): Promise<UpdateResult>;
   async function settleNativeResponse(
     identity: NativeResponseIdentity,
     status: 'cancelled' | 'failed' | 'unsupported',
     snapshot?: NativeResponseMessageProjection,
-  ) {
+  ): Promise<NativeResponseRow | UpdateResult | null> {
     const filter = {
       ...responseFilter(identity),
       'nativeResponse.status': { $in: ['pending', 'prepared'] },
@@ -565,13 +736,14 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
     transaction: Transaction,
     project: (message: NativeResponseMessageProjection) => NativeResponseMessageProjection,
     failureClass?: string,
-  ) {
+  ): Promise<NativeResponseRow | null> {
     const nativeStopMessages: Record<string, string> = {
       native_input_declined: 'You declined that action. It was stopped.',
       native_input_expired:
         'The approval request expired, so that action was stopped. Please retry.',
       native_input_cancelled: 'That action was cancelled.',
       native_turn_cancelled: 'That action was cancelled.',
+      provider_progress_stalled: 'The model needs attention because progress stopped.',
     };
     const nativeStopMessage =
       typeof failureClass === 'string' && Object.hasOwn(nativeStopMessages, failureClass)
@@ -639,7 +811,7 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
     });
   }
 
-  function listNativeResponses(limit = 100) {
+  function listNativeResponses(limit = 100): NativeResponseList {
     return messages()
       .find({
         deletedAt: null,
@@ -666,7 +838,7 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
       .select('+nativeResponse')
       .sort({ 'nativeResponse.admittedAt': 1 })
       .limit(limit)
-      .lean();
+      .lean<NativeResponseRow[]>();
   }
 
   async function markNativeResponseReplayStored(identity: NativeResponseIdentity) {
@@ -708,13 +880,16 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
     update: Partial<IMessage>,
     expected?: NativeResponseIdentity,
     mode: 'snapshot' | 'augmentation' = 'snapshot',
-  ) {
+  ): Promise<NativeResponseRow | undefined> {
     const row = await getNativeResponse(userId, String(update.messageId || ''));
     if (expected?.responseMessageId === update.messageId && !row) {
       throw new Error('native_response_message_deleted');
     }
     const admission = row?.nativeResponse;
-    if (!row || !admission || admission.status === 'unsupported') return undefined;
+    if (!row || !admission) return undefined;
+    // An unsupported Native step can release to the still-running host graph. Its snapshots
+    // own foreground text and completion, while the canonical source and receipts stay owned here.
+    const hostGraph = admission.status === 'unsupported';
     const visibleRow = { ...row };
     delete visibleRow.nativeResponse;
     delete visibleRow.savedMemoryWrite;
@@ -723,13 +898,30 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
     if (
       admission.status !== 'pending' &&
       admission.status !== 'completed' &&
+      !hostGraph &&
       !(mode === 'augmentation' && admission.status === 'prepared') &&
       !terminalAugmentation
     )
       return visibleRow;
     if (mode === 'snapshot' && admission.status === 'pending' && update.unfinished !== true)
       return visibleRow;
-    const guarded = { ...update, unfinished: row.unfinished };
+    const guarded = { ...update, ...(hostGraph ? {} : { unfinished: row.unfinished }) };
+    if (update.metadata !== undefined) {
+      const savedViventium = metadataRecord(row.metadata?.viventium);
+      const incoming = metadataRecord(update.metadata);
+      const viventium = { ...metadataRecord(incoming.viventium) };
+      const canonicalKeys = ['backgroundInputs', 'backgroundInputReceipts'];
+      // Foreground snapshots cannot undo presentation receipts. Failed presentation also
+      // survives augmentation; successful empty-parent promotion may start a new presentation.
+      if (mode === 'snapshot' || metadataRecord(savedViventium.deliveryAcknowledgement).state === 'failed')
+        canonicalKeys.push('deliveryAcknowledgement');
+      for (const key of canonicalKeys) {
+        if (Object.prototype.hasOwnProperty.call(savedViventium, key))
+          viventium[key] = savedViventium[key];
+        else delete viventium[key];
+      }
+      guarded.metadata = { ...incoming, viventium };
+    }
     if (mode === 'snapshot' && Array.isArray(update.content)) {
       // Background augmentation owns these rows. A foreground snapshot may predate their
       // activation or completion, so it cannot remove or regress an already persisted result.
@@ -752,7 +944,7 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
     if (admission.status === 'completed' || terminalAugmentation) {
       if (update.metadata !== undefined) {
         const savedViventium = metadataRecord(row.metadata?.viventium);
-        const viventium = { ...savedViventium, ...metadataRecord(update.metadata?.viventium) };
+        const viventium = { ...savedViventium, ...metadataRecord(guarded.metadata?.viventium) };
         for (const key of ['deliveryDisposition', 'nativeToolEvidence']) {
           if (Object.prototype.hasOwnProperty.call(savedViventium, key)) {
             viventium[key] = savedViventium[key];
@@ -795,6 +987,8 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
     admitNativeResponse,
     getNativeResponse,
     prepareNativeResponse,
+    prepareNativeMainBackgroundInput,
+    recordNativeMainBackgroundInputReceipt,
     materializeNativeResponse,
     materializeNativeResponseTerminal,
     mutateNativeResponseSources,

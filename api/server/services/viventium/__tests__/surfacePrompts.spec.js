@@ -327,18 +327,17 @@ describe('buildVoiceModeInstructions', () => {
   );
 
   test.each(['cartesia', 'xai', 'local_chatterbox_turbo_mlx_8bit', 'openai', 'unknown'])(
-    '%s keeps unsolicited foreground research off the live voice answer path',
+    '%s preserves authorized work without a voice-only research restriction',
     (provider) => {
       const result = buildVoiceModeInstructions(provider);
-      expect(result).toContain(
+      expect(result).not.toContain(
         'Unless the user explicitly asks for a lookup or tool action now, do not start foreground research or tool work during a live voice call.',
       );
       expect(result).toContain(
-        'give the best bounded immediate answer, state what remains unverified, and let nonblocking background work surface later value through Phase B',
+        'Foreground tool or consultant work during a call stays interruptible and cancellable; never claim a result before its authoritative evidence returns.',
       );
-      expect(result).toContain(
-        'When the user explicitly asks for a lookup or tool action now, the current voice task may do it',
-      );
+      expect(result).toContain('Keep responses concise (1-4 sentences)');
+      expect(result).toContain('Keep {NTA} for the existing no-response cases');
     },
   );
 
@@ -462,6 +461,19 @@ describe('buildVoiceModeInstructions', () => {
     expect(result).toContain('identifiers');
   });
   // === VIVENTIUM END ===
+
+  test.each(['cartesia', 'xai', 'local_chatterbox_turbo_mlx_8bit', 'openai', 'unknown'])(
+    '%s retains interruptible tools and authoritative results during the live voice path',
+    (provider) => {
+      const result = buildVoiceModeInstructions(provider);
+      expect(result).toContain(
+        'Foreground tool or consultant work during a call stays interruptible and cancellable; never claim a result before its authoritative evidence returns.',
+      );
+      expect(result).not.toContain(
+        'Unless the user explicitly asks for a lookup or tool action now, do not start foreground research or tool work during a live voice call.',
+      );
+    },
+  );
 });
 
 describe('buildWingModeInstructions', () => {
@@ -964,7 +976,7 @@ describe('stripVoiceControlTagsForDisplay', () => {
     );
   });
 
-  test('preserves public links while stripping private contact and citation artifacts for display', () => {
+  test('preserves public links while cleaning citations and email for voice display persistence', () => {
     const result = stripVoiceControlTagsForDisplay(
       'Sources: https://example.com/report Read [brief](https://example.com/brief). Email qa@example.com. Answer [12].',
     );
@@ -972,9 +984,8 @@ describe('stripVoiceControlTagsForDisplay', () => {
       'Sources: https://example.com/report Read [brief](https://example.com/brief). Email address available. Answer.',
     );
     expect(result).not.toMatch(/\b([A-Za-z][A-Za-z']{1,})\b[\s.,!?;:]+\1\b/i);
-    expect(result).toContain('Sources: https://example.com/report');
+    expect(result).toContain('https://example.com/report');
     expect(result).toContain('[brief](https://example.com/brief)');
-    expect(result).not.toContain('qa@example.com');
     expect(result).not.toContain('[12]');
   });
 
@@ -1000,4 +1011,18 @@ describe('stripVoiceControlTagsForDisplay', () => {
     expect(sanitizeVoiceSurfaceTextForDisplay('<custom>Hi</custom> **there**')).toBe('Hi there');
   });
   // === VIVENTIUM END ===
+
+  test('preserves public links while stripping private contact and citation artifacts for display', () => {
+    const result = stripVoiceControlTagsForDisplay(
+      'Sources: https://example.com/report Read [brief](https://example.com/brief). Email qa@example.com. Answer [12].',
+    );
+    expect(result).toBe(
+      'Sources: https://example.com/report Read [brief](https://example.com/brief). Email address available. Answer.',
+    );
+    expect(result).not.toMatch(/\b([A-Za-z][A-Za-z']{1,})\b[\s.,!?;:]+\1\b/i);
+    expect(result).toContain('Sources: https://example.com/report');
+    expect(result).toContain('[brief](https://example.com/brief)');
+    expect(result).not.toContain('qa@example.com');
+    expect(result).not.toContain('[12]');
+  });
 });

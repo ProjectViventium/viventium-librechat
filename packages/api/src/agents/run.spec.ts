@@ -3,7 +3,17 @@ import { ToolMessage, AIMessage, AIMessageChunk, HumanMessage } from '@langchain
 import { RunnableLambda } from '@langchain/core/runnables';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { getChatModelClass, GraphEvents, MultiAgentGraph, Providers, Run } from '@librechat/agents';
+import type { NativeResponseIdentity } from '@librechat/data-schemas';
 import { installUnifiedSchemaToolBindingPatch } from '../../../../api/server/services/viventium/agentSchemaToolBindingPatch';
+import { applyTimeContextDelivery } from '../../../../api/server/services/viventium/surfacePrompts';
+import { getVerifiedNativeSources } from '../glasshive/nativeSupersession';
+import { createNativeResponseFetch, nativeResponseSha256 } from '../glasshive/nativeResponse';
+import { GenerationJobManager } from '../stream/GenerationJobManager';
+import {
+  buildMainContinuityHeaders,
+  MAIN_CONTINUITY_CHAIN_HEADER,
+  renderMainBackgroundInputs,
+} from '../continuity/mainContinuity';
 import {
   applyDeclaredProviderTransport,
   buildRunAgentSystemInstructions,
@@ -1467,7 +1477,11 @@ describe('zero-input graph handoffs', () => {
     dateNowSpy.mockRestore();
   });
 
-  it('uses a participant fallback for a structured recoverable 429', async () => {
+  it.each([
+    { status: 429 },
+    { status: 500 },
+    { code: 'provider_auth_missing', state: 'needs_input' },
+  ])('uses a participant fallback for a structured recoverable %j', async (failure) => {
     const graph = new MultiAgentGraph({
       runId: 'synthetic-recoverable-fallback-run',
       agents: [
@@ -1500,7 +1514,7 @@ describe('zero-input graph handoffs', () => {
       stream: jest
         .fn()
         .mockImplementationOnce(async () => {
-          throw Object.assign(new Error('synthetic provider rate limit'), { status: 429 });
+          throw Object.assign(new Error('synthetic recoverable provider failure'), failure);
         })
         .mockImplementation(fallbackStream),
     };
@@ -1535,6 +1549,22 @@ describe('zero-input graph handoffs', () => {
       code,
       () => Object.assign(new Error('Synthetic native owner input stop'), { status: 502, code }),
     ]),
+    [
+      'provider_progress_stalled',
+      () =>
+        Object.assign(new Error('Synthetic native attention'), {
+          status: 502,
+          code: 'provider_progress_stalled',
+        }),
+    ],
+    [
+      'wrapped provider_progress_stalled',
+      () =>
+        Object.assign(new Error('Synthetic provider boundary'), {
+          viventiumCompletionPhase: 'provider_response',
+          cause: { code: 'provider_progress_stalled' },
+        }),
+    ],
     [
       'invalid request',
       () => Object.assign(new Error('synthetic invalid request'), { status: 400 }),
@@ -1583,9 +1613,9 @@ describe('zero-input graph handoffs', () => {
         bindTools() {
           return scriptedModel;
         },
-        async stream() {
+        stream: jest.fn(async () => {
           throw primaryError;
-        },
+        }),
       };
       const fallbackStream = jest.fn(() =>
         (async function* streamFallback() {
@@ -1610,6 +1640,7 @@ describe('zero-input graph handoffs', () => {
           },
         ),
       ).rejects.toBe(primaryError);
+      expect(scriptedModel.stream).toHaveBeenCalledTimes(1);
       expect(fallbackStream).not.toHaveBeenCalled();
     },
   );
@@ -1725,6 +1756,64 @@ describe('zero-input graph handoffs', () => {
       ),
     ).rejects.toBe(primaryError);
     expect(fallbackStream).not.toHaveBeenCalled();
+  });
+
+it('uses a participant fallback for a structured recoverable 429', async () => {
+    const graph = new MultiAgentGraph({
+      runId: 'synthetic-recoverable-fallback-run',
+      agents: [
+        {
+          agentId: 'main',
+          name: 'Main',
+          provider: Providers.OPENAI,
+          clientOptions: {
+            model: 'synthetic-primary-model',
+            fallbacks: [
+              {
+                provider: Providers.GOOGLE,
+                clientOptions: { model: 'synthetic-fallback-model' },
+              },
+            ],
+          },
+        },
+      ],
+      edges: [],
+    });
+    const fallbackStream = jest.fn(() =>
+      (async function* streamFallback() {
+        yield new AIMessageChunk({ content: 'Fallback completed the recoverable request.' });
+      })(),
+    );
+    const scriptedModel = {
+      bindTools() {
+        return scriptedModel;
+      },
+      stream: jest
+        .fn()
+        .mockImplementationOnce(async () => {
+          throw Object.assign(new Error('synthetic provider rate limit'), { status: 429 });
+        })
+        .mockImplementation(fallbackStream),
+    };
+    graph.overrideModel = scriptedModel as never;
+
+    const result = await graph.createWorkflow().invoke(
+      {
+        messages: [new HumanMessage('Complete this request through the configured model route.')],
+        agentMessages: [],
+      },
+      {
+        recursionLimit: 4,
+        metadata: {
+          run_id: 'synthetic-recoverable-fallback-run',
+          thread_id: 'synthetic-recoverable-fallback-thread',
+        },
+        configurable: { thread_id: 'synthetic-recoverable-fallback-thread' },
+      },
+    );
+
+    expect(fallbackStream).toHaveBeenCalledTimes(1);
+    expect(result.messages.at(-1)?.content).toBe('Fallback completed the recoverable request.');
   });
 });
 
@@ -1954,6 +2043,662 @@ it('keeps native dispatch wrappers out of source agent configuration and compose
     expect(configuration.fetch).toBe(baseFetch);
     expect(configuration.defaultHeaders).toEqual({ 'X-GlassHive-Agent-Id': 'main' });
     expect(parameters).not.toHaveProperty('callbacks');
+  } finally {
+    createSpy.mockRestore();
+  }
+});
+
+it.each([false, true])(
+  'keeps Main continuity out of handoff routes (native=%s)',
+  async (native) => {
+    const createSpy = jest.spyOn(Run, 'create').mockResolvedValue({ run: 'synthetic' } as never);
+    const existingCallback = { name: 'handoff-existing-callback' };
+    const baseFetch = jest.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) => new Response('{}'),
+    );
+    const main = {
+      id: 'main',
+      provider: Providers.OPENAI,
+      tools: [],
+      model_parameters: {
+        model: 'synthetic-main',
+        configuration: {
+          fetch: baseFetch,
+          defaultHeaders: { 'X-GlassHive-Agent-Id': 'main', 'X-Synthetic-Route': 'main' },
+        },
+      },
+    };
+    const handoffHeaders = {
+      'X-Synthetic-Route': 'handoff',
+      'X-Synthetic-Broker': 'handoff-broker',
+      ...(native ? { 'X-GlassHive-Agent-Id': 'handoff' } : {}),
+    };
+    const handoff = {
+      id: 'handoff',
+      provider: Providers.OPENAI,
+      tools: [],
+      model_parameters: {
+        model: 'synthetic-handoff',
+        callbacks: [existingCallback],
+        configuration: { fetch: baseFetch, defaultHeaders: handoffHeaders },
+      },
+    };
+    const authority = buildMainContinuityHeaders({
+      context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
+      messages: [new HumanMessage({ id: 'main-source', content: 'Accepted Main input.' })],
+      sourceMessageIds: ['main-source'],
+      logicalTurnId: 'turn',
+    });
+    try {
+      await createRun({
+        agents: [main, handoff],
+        signal: new AbortController().signal,
+        mainContinuityHeaders: authority,
+      } as never);
+      const projected = createSpy.mock.calls[0][0].graphConfig.agents;
+      expect(projected[0].clientOptions?.callbacks).toEqual([
+        expect.objectContaining({ awaitHandlers: true, raiseError: true }),
+      ]);
+      expect(projected[1].clientOptions?.callbacks).toEqual([existingCallback]);
+      expect(projected[1].clientOptions?.configuration?.defaultHeaders).toEqual(handoffHeaders);
+      if (!native) expect(projected[1].clientOptions?.configuration?.fetch).toBe(baseFetch);
+      await projected[1].clientOptions?.configuration?.fetch?.('https://synthetic.invalid/v1', {
+        method: 'POST',
+        headers: handoffHeaders,
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'Separate handoff input.' }] }),
+      });
+      expect(new Headers(baseFetch.mock.calls[0][1]?.headers).get('X-Synthetic-Route')).toBe(
+        'handoff',
+      );
+      const sentHeaders = new Headers(baseFetch.mock.calls[0][1]?.headers);
+      for (const [key, value] of Object.entries(handoffHeaders)) {
+        expect(sentHeaders.get(key)).toBe(value);
+      }
+      expect(sentHeaders.has('X-Viventium-Main-Context-Owner')).toBe(false);
+      expect(sentHeaders.has(MAIN_CONTINUITY_CHAIN_HEADER)).toBe(false);
+      expect(JSON.parse(String(baseFetch.mock.calls[0][1]?.body))).toEqual({
+        messages: [{ role: 'user', content: 'Separate handoff input.' }],
+      });
+      expect(main.model_parameters).not.toHaveProperty('callbacks');
+      expect(handoff.model_parameters.callbacks).toEqual([existingCallback]);
+    } finally {
+      createSpy.mockRestore();
+    }
+  },
+);
+
+it('preserves exact fallback route authority and required Main continuity stamps at dispatch', async () => {
+  const createSpy = jest.spyOn(Run, 'create').mockResolvedValue({ run: 'synthetic' } as never);
+  const sent: Headers[] = [];
+  const baseFetch = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    sent.push(new Headers(init?.headers));
+    return new Response('{}');
+  });
+  const source = new HumanMessage({ id: 'main-source', content: 'Accepted Main input.' });
+  const authority = {
+    ...buildMainContinuityHeaders({
+      context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
+      messages: [source],
+      sourceMessageIds: ['main-source'],
+      logicalTurnId: 'turn',
+      revision: 2,
+    }),
+    'X-Viventium-Actor-Kind': 'external_user',
+    'X-Viventium-Origin': 'interactive',
+    'X-GlassHive-Agent-Id': 'main',
+    'X-Synthetic-Route': 'main',
+    'X-Synthetic-Broker': 'main-broker',
+    'X-GlassHive-Idempotency-Key': 'main-occurrence',
+  };
+  const routeHeaders = {
+    'X-GlassHive-Agent-Id': 'fallback',
+    'X-Synthetic-Route': 'fallback',
+    'X-Synthetic-Broker': 'fallback-broker',
+    'X-GlassHive-Idempotency-Key': 'fallback-occurrence',
+  };
+  try {
+    await createRun({
+      agents: [
+        {
+          id: 'main',
+          provider: Providers.OPENAI,
+          tools: [],
+          model_parameters: {
+            model: 'synthetic-main',
+            configuration: { fetch: baseFetch, defaultHeaders: authority },
+          },
+          viventiumGraphLlmFallbacks: [
+            {
+              id: 'main',
+              provider: Providers.OPENAI,
+              model_parameters: {
+                model: 'synthetic-fallback',
+                configuration: { fetch: baseFetch, defaultHeaders: routeHeaders },
+              },
+            },
+          ],
+        },
+      ],
+      signal: new AbortController().signal,
+      mainContinuityHeaders: authority,
+    } as never);
+    const primary = createSpy.mock.calls[0][0].graphConfig.agents[0].clientOptions;
+    const fallback = (
+      primary as typeof primary & { fallbacks: Array<{ clientOptions: typeof primary }> }
+    ).fallbacks[0].clientOptions;
+    expect(fallback?.callbacks).toEqual([
+      expect.objectContaining({ awaitHandlers: true, raiseError: true }),
+    ]);
+    await fallback?.configuration?.fetch?.('https://synthetic.invalid/v1', {
+      method: 'POST',
+      headers: {
+        ...routeHeaders,
+        [MAIN_CONTINUITY_CHAIN_HEADER]: authority[MAIN_CONTINUITY_CHAIN_HEADER],
+      },
+      body: JSON.stringify({ messages: [{ role: 'user', content: source.content }] }),
+    });
+    expect(sent).toHaveLength(1);
+    for (const [key, value] of Object.entries(routeHeaders)) expect(sent[0].get(key)).toBe(value);
+    for (const key of [
+      'X-Viventium-Main-Context-Owner',
+      'X-Viventium-Main-Context-Protocol',
+      'X-Viventium-Main-Context-Snapshot-SHA256',
+      'X-Viventium-Continuity-Domain-Id',
+      'X-Viventium-Logical-Turn-Id',
+      'X-Viventium-Logical-Turn-Revision',
+      'X-Viventium-Actor-Kind',
+      'X-Viventium-Origin',
+    ])
+      expect(sent[0].get(key)).toBe(authority[key]);
+  } finally {
+    createSpy.mockRestore();
+  }
+});
+
+it.each([false, true])(
+  'preserves request-resolved factual context through Main and fallback SDK dispatch (stream=%s)',
+  async (streaming) => {
+    const createSpy = jest.spyOn(Run, 'create').mockResolvedValue({ run: 'synthetic' } as never);
+    const source = new HumanMessage({
+      id: 'accepted-source',
+      content: 'Accepted synthetic input.',
+    });
+    const context = 'Current time: synthetic. Décision suivante. 次の行動を確認する。';
+    const requestBody = {
+      conversationId: 'conversation',
+      messageId: source.id,
+      viventiumSurface: 'voice',
+      viventiumInputMode: 'voice_call',
+      viventiumGlassHiveTurnContextB64: '',
+    };
+    applyTimeContextDelivery({
+      req: { body: requestBody },
+      requestBody,
+      instructions: '',
+      timeContextInstructions: context,
+      providerCapability: { workspace_binding: true, conversation_session: true },
+    });
+    const stamps = {
+      ...buildMainContinuityHeaders({
+        context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
+        messages: [source],
+        sourceMessageIds: [source.id!],
+        logicalTurnId: 'turn',
+        revision: 1,
+      }),
+      'X-Viventium-Actor-Kind': 'external_user',
+      'X-Viventium-Origin': 'interactive',
+      'X-Viventium-Surface': 'voice',
+      'X-Viventium-Memory-Eligible': 'true',
+    };
+    const rawHeaders = {
+      ...stamps,
+      'X-GlassHive-Agent-Id': 'main',
+      'X-GlassHive-Turn-Context-B64': '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVETURNCONTEXTB64}}',
+    };
+    const baseFetch = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const payload = JSON.parse(String(init?.body));
+      expect(payload.metadata.turn_context).toBe(context);
+      expect(payload.messages).toEqual([{ role: 'user', content: source.content }]);
+      expect(payload.reasoning_effort).toBe('high');
+      expect(getVerifiedNativeSources(init)).toEqual([
+        {
+          id: source.id,
+          sha256: payload.metadata.visible_message_chain[0].sha256,
+        },
+      ]);
+      const headers = new Headers(init?.headers);
+      expect(headers.has('X-GlassHive-Turn-Context-B64')).toBe(false);
+      for (const [key, value] of Object.entries(stamps)) {
+        if (key !== MAIN_CONTINUITY_CHAIN_HEADER) expect(headers.get(key)).toBe(value);
+      }
+      if (streaming)
+        return new Response(
+          'data: {"id":"synthetic","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Kept."},"finish_reason":null}]}\n\n' +
+            'data: {"id":"synthetic","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n' +
+            'data: [DONE]\n\n',
+          { headers: { 'content-type': 'text/event-stream' } },
+        );
+      return new Response(
+        JSON.stringify({
+          id: 'synthetic',
+          object: 'chat.completion',
+          model: payload.model,
+          choices: [
+            { index: 0, message: { role: 'assistant', content: 'Kept.' }, finish_reason: 'stop' },
+          ],
+        }),
+        { headers: { 'content-type': 'application/json' } },
+      );
+    });
+    const route = (model: string, routeId: string) => ({
+      id: 'main',
+      provider: Providers.OPENAI,
+      endpoint: 'glasshive-harness',
+      tools: [],
+      declaredProviderTransport: { mode: 'chat_completions', reasoningEffort: 'high' },
+      model_parameters: {
+        model,
+        apiKey: 'synthetic',
+        maxRetries: 0,
+        configuration: {
+          baseURL: 'https://synthetic.invalid/v1',
+          fetch: baseFetch,
+          defaultHeaders: {
+            ...rawHeaders,
+            'X-Synthetic-Route': routeId,
+            'X-GlassHive-Tool-Grant': `${routeId}-grant`,
+          },
+        },
+      },
+    });
+    const main = route('grok-build:grok-4.7-build-fast', 'primary');
+    try {
+      await createRun({
+        agents: [
+          {
+            ...main,
+            viventiumGraphLlmFallbacks: [route('claude-code:claude-opus-5-5', 'fallback')],
+          },
+        ],
+        requestBody,
+        user: { id: 'owner' },
+        streaming,
+        signal: new AbortController().signal,
+        mainContinuityHeaders: rawHeaders,
+      } as never);
+      const primary = createSpy.mock.calls[0][0].graphConfig.agents[0].clientOptions;
+      const fallback = (
+        primary as typeof primary & {
+          fallbacks: Array<{ clientOptions: typeof primary }>;
+        }
+      ).fallbacks[0].clientOptions;
+      for (const [routeId, options] of [
+        ['primary', primary],
+        ['fallback', fallback],
+      ] as const) {
+        expect(options.configuration?.defaultHeaders?.['X-GlassHive-Turn-Context-B64']).toBe(
+          requestBody.viventiumGlassHiveTurnContextB64,
+        );
+        const Model = getChatModelClass(Providers.OPENAI);
+        const model = new Model(options as never);
+        if (streaming)
+          for await (const _chunk of await model.stream([source])) {
+            /* consume */
+          }
+        else await model.invoke([source]);
+        const sent = new Headers(baseFetch.mock.calls.at(-1)?.[1]?.headers);
+        expect(sent.get('X-Synthetic-Route')).toBe(routeId);
+        expect(sent.get('X-GlassHive-Tool-Grant')).toBe(`${routeId}-grant`);
+        expect(JSON.parse(String(baseFetch.mock.calls.at(-1)?.[1]?.body)).model).toBe(
+          routeId === 'primary' ? 'grok-build:grok-4.7-build-fast' : 'claude-code:claude-opus-5-5',
+        );
+      }
+      expect(baseFetch).toHaveBeenCalledTimes(2);
+      expect(rawHeaders['X-GlassHive-Turn-Context-B64']).toBe(
+        '{{LIBRECHAT_BODY_VIVENTIUMGLASSHIVETURNCONTEXTB64}}',
+      );
+    } finally {
+      createSpy.mockRestore();
+    }
+  },
+);
+
+it.each([false, true])(
+  'relocates signed bootstrap before Native response admission through Main and fallback (continuity=%s)',
+  async (continuity) => {
+    const createSpy = jest.spyOn(Run, 'create').mockResolvedValue({ run: 'synthetic' } as never);
+    const predecessorSpy = jest
+      .spyOn(GenerationJobManager, 'getNativePredecessorSupersession')
+      .mockResolvedValue(undefined);
+    const retainSpy = jest
+      .spyOn(GenerationJobManager, 'retainNativeAcceptedSources')
+      .mockResolvedValue(undefined);
+    const source = new HumanMessage({ id: 'source', content: 'Read both selected notes.' });
+    const sourceHeaders = continuity
+      ? buildMainContinuityHeaders({
+          context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
+          messages: [source],
+          sourceMessageIds: ['source'],
+          logicalTurnId: 'turn',
+          revision: 1,
+        })
+      : undefined;
+    const files = [
+      { path: 'alpha.txt', content: 'a'.repeat(200 * 1024) },
+      { path: 'bravo.txt', content: 'b'.repeat(200 * 1024) },
+    ];
+    const encoded = Buffer.from(JSON.stringify({ files })).toString('base64');
+    const body = JSON.stringify({
+      model: 'synthetic',
+      messages: [{ role: 'user', content: source.content }],
+    });
+    const baseFetch = jest.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) => new Response('{}'),
+    );
+    const admit = jest.fn(async (_identity: NativeResponseIdentity) => true);
+    const onBound = jest.fn();
+    const context = {
+      userId: 'owner',
+      conversationId: 'conversation',
+      responseMessageId: 'answer',
+      streamId: 'stream',
+      jobCreatedAt: 1,
+      logicalTurnId: 'scope.turn',
+      revision: 1,
+      providerId: 'native',
+      agentId: 'main',
+      source: { id: 'source-id', messageId: 'source', digest: 'source-digest' },
+    };
+    const headers = {
+      'X-GlassHive-Agent-Id': 'main',
+      'X-GlassHive-Bootstrap-Bundle-B64': encoded,
+      'X-GlassHive-Bootstrap-Signature': 'synthetic-signature',
+      'X-GlassHive-Bootstrap-Timestamp': '123',
+      Authorization: 'Bearer synthetic',
+      ...sourceHeaders,
+    };
+    const route = (name: string) => ({
+      id: 'main',
+      provider: Providers.OPENAI,
+      endpoint: 'synthetic-native',
+      tools: [],
+      model_parameters: {
+        model: name,
+        configuration: { fetch: baseFetch, defaultHeaders: headers },
+      },
+    });
+    try {
+      await createRun({
+        agents: [{ ...route('primary'), viventiumGraphLlmFallbacks: [route('fallback')] }],
+        signal: new AbortController().signal,
+        mainContinuityHeaders: sourceHeaders,
+        nativeResponseFetch: (fetch: typeof baseFetch) =>
+          createNativeResponseFetch(fetch, async () => context, admit, onBound),
+      } as never);
+      const primary = createSpy.mock.calls[0][0].graphConfig.agents[0].clientOptions;
+      const fallback = (
+        primary as typeof primary & { fallbacks: Array<{ clientOptions: typeof primary }> }
+      ).fallbacks[0].clientOptions;
+      for (const options of [primary, fallback]) {
+        await options.configuration?.fetch?.('https://synthetic.invalid/v1/chat/completions', {
+          method: 'POST',
+          headers: options.configuration.defaultHeaders,
+          body,
+        });
+        const dispatched = baseFetch.mock.calls[baseFetch.mock.calls.length - 1];
+        const sent = new Headers(dispatched[1].headers);
+        const wire = String(dispatched[1].body);
+        const payload = JSON.parse(wire);
+        expect(sent.has('X-GlassHive-Bootstrap-Bundle-B64')).toBe(false);
+        expect(sent.get('X-GlassHive-Bootstrap-Signature')).toBe('synthetic-signature');
+        expect(sent.get('X-GlassHive-Bootstrap-Timestamp')).toBe('123');
+        expect(sent.get('Authorization')).toBe('Bearer synthetic');
+        expect(payload.metadata.bootstrap_bundle_b64).toBe(encoded);
+        expect(
+          JSON.parse(Buffer.from(payload.metadata.bootstrap_bundle_b64, 'base64').toString()).files,
+        ).toEqual(files);
+        expect(payload.messages).toEqual([{ role: 'user', content: source.content }]);
+        expect(sent.get('X-Viventium-Native-Body-SHA256')).toBe(nativeResponseSha256(wire));
+        expect(admit.mock.calls.at(-1)?.[0].bodySha256).toBe(nativeResponseSha256(wire));
+        if (continuity) {
+          expect(payload.metadata.visible_message_chain).toHaveLength(1);
+          expect(sent.get('X-Viventium-Main-Context-Owner')).toBe(
+            sourceHeaders?.['X-Viventium-Main-Context-Owner'],
+          );
+        }
+      }
+      expect(baseFetch).toHaveBeenCalledTimes(2);
+      expect(onBound).toHaveBeenCalledTimes(2);
+      expect(headers['X-GlassHive-Bootstrap-Bundle-B64']).toBe(encoded);
+    } finally {
+      createSpy.mockRestore();
+      predecessorSpy.mockRestore();
+      retainSpy.mockRestore();
+    }
+  },
+);
+
+it.each([false, true])(
+  'refreshes late source through actual primary and fallback SDK dispatch (stream=%s)',
+  async (streaming) => {
+    const createSpy = jest.spyOn(Run, 'create').mockResolvedValue({ run: 'synthetic' } as never);
+    const source = new HumanMessage({ id: 'source', content: 'Accepted foreground input.' });
+    const context = 'Frozen time and memory.';
+    const headers = {
+      ...buildMainContinuityHeaders({
+        context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
+        messages: [source],
+        sourceMessageIds: ['source'],
+        logicalTurnId: 'turn',
+        revision: 1,
+      }),
+      'X-GlassHive-Agent-Id': 'main',
+      'X-GlassHive-Turn-Context-B64': Buffer.from(context).toString('base64'),
+    };
+    const text = 'Completed late exact evidence.';
+    const input = {
+      version: 1 as const,
+      invocationId: 'first-native-invocation',
+      deliveryId: 'd'.repeat(64),
+      text,
+      textSha256: nativeResponseSha256(text),
+      sources: [{ cortexId: 'cortex', insightSha256: 'e'.repeat(64) }],
+    };
+    let inputs: (typeof input)[] = [];
+    const read = jest.fn(async () => inputs);
+    const contextIdentity = {
+      userId: 'owner',
+      conversationId: 'conversation',
+      responseMessageId: 'answer',
+      streamId: 'stream',
+      jobCreatedAt: 1,
+      logicalTurnId: 'turn',
+      revision: 1,
+      providerId: 'native',
+      agentId: 'main',
+      source: { id: 'source-row', messageId: 'source', digest: 'f'.repeat(64) },
+    };
+    let admissions = 0;
+    const admit = jest.fn(async (_identity: NativeResponseIdentity) => ++admissions === 1);
+    const predecessor = jest
+      .spyOn(GenerationJobManager, 'getNativePredecessorSupersession')
+      .mockResolvedValue(undefined);
+    const retain = jest
+      .spyOn(GenerationJobManager, 'retainNativeAcceptedSources')
+      .mockResolvedValue(undefined);
+    const actualNativeBoundary = jest.fn(
+      async (_url: string | URL | Request, init?: RequestInit) => {
+        const payload = JSON.parse(String(init?.body));
+        expect(payload.metadata.turn_context).toBe(
+          inputs.length ? context + '\n\n' + renderMainBackgroundInputs([input]) : context,
+        );
+        expect(payload.metadata.main_background_inputs).toEqual(
+          inputs.length ? [input] : undefined,
+        );
+        expect(payload.messages).toEqual([{ role: 'user', content: source.content }]);
+        expect(payload.reasoning_effort).toBe('high');
+        expect(payload.metadata.visible_message_chain[0]).toMatchObject({
+          id: source.id,
+          accepted_source: true,
+        });
+        if (streaming)
+          return new Response(
+            'data: {"id":"synthetic","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Kept."},"finish_reason":null}]}\n\n' +
+              'data: {"id":"synthetic","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n' +
+              'data: [DONE]\n\n',
+            { headers: { 'content-type': 'text/event-stream' } },
+          );
+        return new Response(
+          JSON.stringify({
+            id: 'synthetic',
+            object: 'chat.completion',
+            model: payload.model,
+            choices: [
+              { index: 0, message: { role: 'assistant', content: 'Kept.' }, finish_reason: 'stop' },
+            ],
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        );
+      },
+    );
+    const route = (model: string) => ({
+      id: 'main',
+      provider: Providers.OPENAI,
+      endpoint: 'native',
+      tools: [],
+      instructions: 'Frozen Main authority.',
+      declaredProviderTransport: { mode: 'chat_completions', reasoningEffort: 'high' },
+      model_parameters: {
+        model,
+        apiKey: 'synthetic',
+        maxRetries: 0,
+        configuration: {
+          baseURL: 'https://provider.invalid/v1',
+          fetch: actualNativeBoundary,
+          defaultHeaders: headers,
+        },
+      },
+    });
+    try {
+      await createRun({
+        agents: [
+          {
+            ...route('synthetic-primary'),
+            viventiumGraphLlmFallbacks: [route('synthetic-fallback')],
+          },
+        ],
+        user: { id: 'owner' },
+        signal: new AbortController().signal,
+        streaming,
+        mainContinuityHeaders: headers,
+        readMainBackgroundInputs: read,
+        nativeResponseFetch: (fetch: typeof actualNativeBoundary) => {
+          const native = createNativeResponseFetch(
+            fetch,
+            async () => contextIdentity,
+            admit,
+            () => undefined,
+          );
+          return (url, init) => {
+            const payload = JSON.parse(String(init?.body));
+            expect(getVerifiedNativeSources(init)).toEqual([
+              {
+                id: source.id,
+                sha256: payload.metadata.visible_message_chain[0].sha256,
+              },
+            ]);
+            return native(url, init);
+          };
+        },
+      } as never);
+      const primary = createSpy.mock.calls[0][0].graphConfig.agents[0].clientOptions;
+      const fallback = (
+        primary as typeof primary & { fallbacks: Array<{ clientOptions: typeof primary }> }
+      ).fallbacks[0].clientOptions;
+      for (const options of [primary, primary, fallback]) {
+        const Model = getChatModelClass(Providers.OPENAI);
+        const model = new Model(options as never);
+        if (streaming)
+          for await (const _chunk of await model.stream([source])) {
+            /* consume */
+          }
+        else await model.invoke([source]);
+        inputs = [input];
+      }
+      expect(actualNativeBoundary).toHaveBeenCalledTimes(3);
+      expect(read).toHaveBeenCalledTimes(3);
+      expect(admit).toHaveBeenCalledTimes(3);
+      for (const [index, call] of actualNativeBoundary.mock.calls.entries())
+        expect(admit.mock.calls[index][0].bodySha256).toBe(
+          nativeResponseSha256(String(call[1]?.body)),
+        );
+      expect(admit.mock.calls[0][0].bodySha256).not.toBe(admit.mock.calls[1][0].bodySha256);
+      expect(
+        new Headers(actualNativeBoundary.mock.calls[1][1]?.headers).has(
+          'X-Viventium-Native-Invocation-Id',
+        ),
+      ).toBe(false);
+      expect(createSpy.mock.calls[0][0].graphConfig.agents[0].instructions).toBe(
+        'Frozen Main authority.',
+      );
+      expect(headers['X-GlassHive-Turn-Context-B64']).toBe(Buffer.from(context).toString('base64'));
+    } finally {
+      createSpy.mockRestore();
+      predecessor.mockRestore();
+      retain.mockRestore();
+    }
+  },
+);
+
+it('does not read current Main data for another native graph participant or ordinary API transport', async () => {
+  const createSpy = jest.spyOn(Run, 'create').mockResolvedValue({ run: 'synthetic' } as never);
+  const source = new HumanMessage({ id: 'source', content: 'Foreground.' });
+  const headers = buildMainContinuityHeaders({
+    context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
+    messages: [source],
+    sourceMessageIds: ['source'],
+    logicalTurnId: 'turn',
+    revision: 1,
+  });
+  const read = jest.fn(async () => []);
+  const baseFetch = jest.fn(async () => new Response('{}'));
+  try {
+    await createRun({
+      agents: [
+        {
+          id: 'main',
+          provider: Providers.OPENAI,
+          tools: [],
+          model_parameters: {
+            model: 'ordinary',
+            configuration: { fetch: baseFetch, defaultHeaders: headers },
+          },
+        },
+        {
+          id: 'participant',
+          provider: Providers.OPENAI,
+          tools: [],
+          model_parameters: {
+            model: 'native',
+            configuration: {
+              fetch: baseFetch,
+              defaultHeaders: { 'X-GlassHive-Agent-Id': 'participant' },
+            },
+          },
+        },
+      ],
+      signal: new AbortController().signal,
+      mainContinuityHeaders: headers,
+      readMainBackgroundInputs: read,
+    } as never);
+    const agents = createSpy.mock.calls[0][0].graphConfig.agents;
+    for (const agent of agents)
+      await agent.clientOptions.configuration?.fetch?.(
+        'https://provider.invalid/v1/chat/completions',
+        { method: 'POST', body: '{"messages":[]}' },
+      );
+    expect(read).not.toHaveBeenCalled();
   } finally {
     createSpy.mockRestore();
   }

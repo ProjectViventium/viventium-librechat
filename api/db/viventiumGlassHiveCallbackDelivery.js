@@ -91,8 +91,25 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
         type: new mongoose.Schema(
           {
             version: { type: Number, enum: [1], required: true },
-            status: { type: String, enum: ['unavailable'], required: true },
-            code: { type: String, required: true },
+            status: { type: String, enum: ['available', 'unavailable'], required: true },
+            code: {
+              type: String,
+              required() {
+                return this.status === 'unavailable';
+              },
+            },
+            messageId: {
+              type: String,
+              required() {
+                return this.status === 'available';
+              },
+            },
+            downloadUrl: {
+              type: String,
+              required() {
+                return this.status === 'available';
+              },
+            },
           },
           { _id: false, strict: 'throw' },
         ),

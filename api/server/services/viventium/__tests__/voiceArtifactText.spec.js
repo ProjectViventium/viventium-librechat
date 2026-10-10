@@ -3,9 +3,46 @@
 const {
   sanitizeVoiceAssistantMessageForPersistence,
   sanitizeVoiceSurfaceTextForDisplay,
+  artifactCounts,
+  sumForbiddenArtifacts,
+  DEFAULT_VISIBLE_FORBIDDEN_ARTIFACT_KEYS,
 } = require('../voiceArtifactText');
 
 describe('voice linked-chat formatting', () => {
+  test.each([
+    ['voice', { body: { voiceMode: true } }],
+    ['telegram audio', { body: { viventiumSurface: 'telegram', telegramAudioRequested: true } }],
+  ])('drops raw ranges only when %s persistence changes their text', (_surface, req) => {
+    const range = { start: 0, end: 31, disposition: { audio: 'eligible' } };
+    const raw = '<whisper>Public 🟢.</whisper>';
+    const part = { type: 'text', text: raw, deliveryDispositionRanges: [range], agentId: 'main' };
+    const result = sanitizeVoiceAssistantMessageForPersistence(req, { content: [part] });
+    expect(result.content[0]).toEqual({ type: 'text', text: 'Public 🟢.', agentId: 'main' });
+    expect(part.text).toBe(raw);
+    expect(part.deliveryDispositionRanges).toEqual([range]);
+    const unchanged = { ...part, text: 'Public 🟢.' };
+    expect(
+      sanitizeVoiceAssistantMessageForPersistence(req, { content: [unchanged] }).content[0],
+    ).toBe(unchanged);
+  });
+
+  test.each(['value', 'text'])('drops invalid ranges on nested %s display text', (key) => {
+    const result = sanitizeVoiceAssistantMessageForPersistence(
+      { body: { voiceMode: true } },
+      {
+        content: [
+          {
+            type: 'text',
+            text: { [key]: '**Public**', annotations: [] },
+            deliveryDispositionRanges: [{ start: 0, end: 10 }],
+          },
+        ],
+      },
+    );
+    expect(result.content[0]).not.toHaveProperty('deliveryDispositionRanges');
+    expect(result.content[0].text[key]).toBe('Public');
+    expect(result.content[0].text.annotations).toEqual([]);
+  });
   test.each([
     '[Download report](https://files.example.test/api/files/download/report_01.pdf)',
     'See https://docs.example.test/Guide/A_B?part=One&section=Two#Result.',
@@ -131,5 +168,26 @@ describe('voice linked-chat formatting', () => {
     expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(
       'Example:\n\n\n    first\n        second\n    ; comment\n\n\nDone.',
     );
+  });
+});
+
+describe('authored repetition artifact contract', () => {
+  test.each([
+    'Nine. Almost ten. Ten. Nineteen. Nearly twenty. Twenty. Twenty-five. Five to go.',
+    'No, no, no. Please please please. Never never again.',
+  ])('preserves authored words across display, persistence and artifact checks: %s', (text) => {
+    expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(text);
+    for (const req of [
+      { body: { voiceMode: true } },
+      { body: { viventiumSurface: 'telegram', telegramAudioRequested: true } },
+      { body: {} },
+    ]) {
+      const message = { text, content: [{ type: 'text', text }] };
+      expect(sanitizeVoiceAssistantMessageForPersistence(req, message)).toEqual(message);
+    }
+    expect(sumForbiddenArtifacts(artifactCounts(text))).toBe(0);
+    expect(
+      sumForbiddenArtifacts(artifactCounts(text), DEFAULT_VISIBLE_FORBIDDEN_ARTIFACT_KEYS),
+    ).toBe(0);
   });
 });

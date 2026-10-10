@@ -7,7 +7,8 @@ const {
   sanitizeGlassHiveCallbackText,
 } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
-const { getConvo, getUserById, saveConvo } = require('~/models');
+const { getConvo, getUserById, getFeelingState, saveConvo } = require('~/models');
+const { logFeelingsEvent } = require('./feelingsTelemetry');
 const { getAgent } = require('~/models/Agent');
 const { getAppConfig } = require('~/server/services/Config');
 const { prepareMissionOutputFiles } = require('./nativeOutputFiles');
@@ -34,6 +35,8 @@ module.exports = createGlassHiveMissionAdjudicationService({
   fenceGlassHiveTerminalCallbackAcceptedOperation,
   getConvo,
   getUserById,
+  getFeelingState,
+  logFeelingsEvent,
   saveConvo,
   getAgent,
   getAppConfig,

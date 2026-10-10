@@ -152,3 +152,20 @@ describe('createActiveWorkTools', () => {
     expect(executeGlassHiveWorkAction).not.toHaveBeenCalled();
   });
 });
+
+
+describe('actual eager action caller selected file handoff', () => {
+  it('passes selected IDs with trusted request resources to the shared owner executor', async () => {
+    const execute=jest.fn(async()=>({state:'queued'}));
+    const req={user:{id:'owner-1'},config:{paths:{}}};
+    const {action}=createActiveWorkTools({userId:'owner-1',req},{getActiveWorkPage:async()=>({}),getActiveWorkHistoryPage:async()=>({}),getGlassHiveWorkResult:async()=>({}),executeGlassHiveWorkAction:execute});
+    const body={conversationId:'conversation-1',messageId:'message-1',files:[{file_id:'a'}]};
+    await action.invoke({workRef:'work-1',action:'steer',instruction:'Use this exact file',fileIds:['a']},{toolCall:{id:'native-1'},configurable:{requestBody:body}});
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({ownerId:'owner-1',fileIds:['a'],requestBody:body,serverReq:req}));
+  });
+  it('rejects file arguments on unsupported follow-up action without sending an action', async () => {
+    const execute=jest.fn(async()=>({}));const {action}=createActiveWorkTools({userId:'owner-1'},{getActiveWorkPage:async()=>({}),getActiveWorkHistoryPage:async()=>({}),getGlassHiveWorkResult:async()=>({}),executeGlassHiveWorkAction:execute});
+    await expect(action.invoke({workRef:'work-1',action:'pause',instruction:'Use files',fileIds:['a']},{toolCall:{id:'native-1'},configurable:{requestBody:{conversationId:'conversation-1',messageId:'message-1'}}})).rejects.toThrow();
+    expect(execute).not.toHaveBeenCalled();
+  });
+});

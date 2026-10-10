@@ -1,11 +1,13 @@
 /* === VIVENTIUM START === Broker transport for the existing admitted memory writer. === */
 import { randomUUID } from 'crypto';
+import { logger } from '@librechat/data-schemas';
 import { isZodSchema, toJsonSchema } from '@librechat/agents';
 import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { DynamicStructuredTool } from '@librechat/agents/langchain/tools';
 import type { MemoryArtifact, Tools } from 'librechat-data-provider';
 import type { OpenAIConfiguration, RequestBody } from '~/types';
 import type { createRun } from './run';
+import { createNativeCapacityFetch } from '../glasshive/nativeResponse';
 
 export interface NativeMemoryWriterIdentity {
   userId: string;
@@ -159,6 +161,7 @@ export function createNativeMemoryExecutor({
   buildBundle,
   attachBundle,
   createProviderRun,
+  prepareProviderAttempt,
 }: {
   identity: NativeMemoryWriterIdentity;
   agent: RunAgent;
@@ -169,6 +172,12 @@ export function createNativeMemoryExecutor({
   buildBundle: (args: BundleInput) => Promise<NativeMemoryBundle | null>;
   attachBundle: (args: { targetAgent: RunAgent; bundle: NativeMemoryBundle }) => boolean;
   createProviderRun: typeof createRun;
+  prepareProviderAttempt: (args: {
+    identity: NativeMemoryWriterIdentity;
+    agent: RunAgent;
+    requestBody: RequestBody;
+    signal: AbortSignal;
+  }) => Promise<() => Promise<void>>;
 }): NativeMemoryExecutor {
   return async ({ tool, messages, instructions, onResult }) => {
     await authorize();
@@ -181,6 +190,8 @@ export function createNativeMemoryExecutor({
     const unregister = register(binding);
     let providerError: unknown;
     let toolCompleted = false;
+    let releaseProviderAttempt: (() => Promise<void>) | undefined;
+    const controller = new AbortController();
     try {
       const invocationId = `memory_${binding.resource.bindingId}`;
       const body = {
@@ -240,12 +251,41 @@ export function createNativeMemoryExecutor({
       if (!attachBundle({ targetAgent: nativeAgent, bundle: restrictedBundle })) {
         throw new Error('native_memory_broker_unavailable');
       }
+      // Bundle attachment reprojects the caller; this isolated writer is the internal producer.
+      const attachedParameters = nativeAgent.model_parameters as RunAgent['model_parameters'] & {
+        configuration?: OpenAIConfiguration;
+      };
+      const writerParameters: typeof attachedParameters = {
+        ...attachedParameters,
+        configuration: {
+          ...(attachedParameters.configuration ?? {}),
+          defaultHeaders: {
+            ...(attachedParameters.configuration?.defaultHeaders ?? {}),
+            'X-Viventium-Actor-Kind': 'system',
+          },
+        },
+      };
+      const baseFetch = writerParameters.configuration?.fetch || globalThis.fetch;
+      writerParameters.configuration!.fetch = createNativeCapacityFetch(
+        async (input, init) => {
+          await authorize();
+          return baseFetch(input, init);
+        },
+        { signal: controller.signal, streamId: invocationId, role: 'cortex' },
+      );
+      nativeAgent.model_parameters = writerParameters;
+      releaseProviderAttempt = await prepareProviderAttempt({
+        identity,
+        agent: nativeAgent,
+        requestBody: body,
+        signal: controller.signal,
+      });
       const run = await createProviderRun({
         agents: [nativeAgent],
         requestBody: body,
         user,
         runId: invocationId,
-        signal: new AbortController().signal,
+        signal: controller.signal,
         streaming: false,
         streamUsage: false,
         customHandlers: {},
@@ -272,6 +312,21 @@ export function createNativeMemoryExecutor({
       } catch (error) {
         providerError ??= error;
       }
+      if (providerError && releaseProviderAttempt) {
+        try {
+          await releaseProviderAttempt();
+        } catch (error) {
+          // Preserve the provider failure; a local settlement is not a native release ACK.
+          if (providerError && typeof providerError === 'object') {
+            Object.assign(providerError, { nativeMemoryReleaseConfirmed: false });
+          }
+          logger.warn('[MemoryAgent] Native memory request release was not confirmed', {
+            stage: 'native_memory_attempt_release',
+            errorCode: (error as { code?: string })?.code || 'native_release_unconfirmed',
+          });
+        }
+      }
+      controller.abort('memory_attempt_settled');
       unregister();
     }
     const providerCode = (providerError as { code?: unknown } | undefined)?.code;

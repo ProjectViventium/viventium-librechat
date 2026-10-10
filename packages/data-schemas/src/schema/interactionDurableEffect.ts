@@ -153,7 +153,7 @@ const interactionDurableEffectSchema = new Schema<IInteractionDurableEffect>(
     providerIdempotencyMode: {
       type: String,
       required: true,
-      enum: ['native_key', 'deterministic_reconciliation'],
+      enum: ['native_key', 'deterministic_reconciliation', 'none'],
       immutable: true,
     },
     runtimeBindingAtReserve: { type: runtimeBindingSchema, immutable: true },

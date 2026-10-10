@@ -86,6 +86,44 @@ describe('messages route content sanitization', () => {
     jest.clearAllMocks();
   });
 
+  test.each(['conversation-authored', 'conversation-authored/assistant-authored'])(
+    'retains authored words on normal message read/reload: %s',
+    async (route) => {
+      const text =
+        'Nine. Almost ten. Ten. Nineteen. Nearly twenty. Twenty. Twenty-five. Five to go.';
+      const stored = {
+        messageId: 'assistant-authored',
+        conversationId: 'conversation-authored',
+        isCreatedByUser: false,
+        text,
+        nativeResponse: { candidateJson: 'private canonical source' },
+        content: [
+          { type: ContentTypes.TEXT, text },
+          {
+            type: ContentTypes.CORTEX_INSIGHT,
+            insight: 'Accepted context remains.',
+            cortex_delivery_acceptance: 'accepted',
+            [PRIVATE_FEELING_FIELD]: { capsule: 'PRIVATE_SYNTHETIC_AUTHORED_CANARY' },
+          },
+        ],
+      };
+      const before = JSON.stringify(stored);
+      getMessages.mockResolvedValue([stored]);
+      const res = await request(createApp()).get(`/api/messages/${route}`).expect(200);
+      expect(res.body[0].text).toBe(text);
+      expect(res.body[0].content[0].text).toBe(text);
+      expect(res.body[0].content[1].insight).toBe('Accepted context remains.');
+      expect(res.body[0]).not.toHaveProperty('nativeResponse');
+      expectPrivateFeelingAbsent(res.body, 'PRIVATE_SYNTHETIC_AUTHORED_CANARY');
+      expect(JSON.stringify(stored)).toBe(before);
+      expect(saveMessage).not.toHaveBeenCalled();
+      expect(updateMessage).not.toHaveBeenCalled();
+      expect(getMessages).toHaveBeenCalledWith(
+        expect.objectContaining({ user: 'user-public-safe' }),
+      );
+    },
+  );
+
   it('sanitizes duplicate tool snapshots on the conversation message route', async () => {
     getMessages.mockResolvedValue([
       {

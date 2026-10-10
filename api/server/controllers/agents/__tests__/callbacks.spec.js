@@ -34,6 +34,11 @@ test('records the native provider-returned model separately from the requested m
   });
 });
 
+jest.mock('~/models', () => ({
+  getNativeResponse: jest.fn(),
+  nativeResponseSourceMatches: jest.fn(),
+}));
+
 // Mock all dependencies before requiring the module
 jest.mock('nanoid', () => ({
   nanoid: jest.fn(() => 'mock-id'),
@@ -45,6 +50,12 @@ jest.mock('@librechat/api', () => ({
   createDeliveryDispositionStreamHandler:
     jest.requireActual('@librechat/api').createDeliveryDispositionStreamHandler,
   getStreamDeliveryDisposition: jest.requireActual('@librechat/api').getStreamDeliveryDisposition,
+  inspectProviderPublicPartCompletion:
+    jest.requireActual('@librechat/api').inspectProviderPublicPartCompletion,
+  createReleasedMainPublicPartOwner: jest.fn((identity) => ({
+    identity,
+    verifySource: jest.fn(async () => true),
+  })),
   isAudioDeliveryRequested: jest.requireActual('@librechat/api').isAudioDeliveryRequested,
   inspectProviderDeliveryDisposition:
     jest.requireActual('@librechat/api').inspectProviderDeliveryDisposition,
@@ -69,6 +80,7 @@ jest.mock('@librechat/api', () => ({
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
   logger: {
+    debug: jest.fn(),
     info: jest.fn(),
     error: jest.fn(),
   },
@@ -1376,6 +1388,97 @@ describe('authored native preview presentation', () => {
 /* === VIVENTIUM END === */
 
 describe('exact chunk delivery carrier to real SDK message delta', () => {
+  test('a hidden specialist and stale metadata cannot enter Main resume text', async () => {
+    const { getDefaultHandlers } = require('../callbacks');
+    const { GenerationJobManager } = require('@librechat/api');
+    jest.clearAllMocks();
+    const aggregateContent = jest.fn();
+    const req = {
+      body: { voiceMode: true },
+      viventiumCallSession: { callSessionId: 'synthetic' },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              native: {
+                messaging_delivery_disposition: true,
+                messaging_delivery_disposition_version: 1,
+              },
+            },
+          },
+        },
+      },
+    };
+    const handlers = getDefaultHandlers({
+      req,
+      res: {},
+      aggregateContent,
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      streamId: 'visible-only-resume',
+    });
+    const hidden = {
+      agentId: 'specialist',
+      hide_sequential_outputs: true,
+      visible_agent_ids: ['main'],
+    };
+    const graph = {
+      config: {},
+      prelimMessageIdsByStepKey: new Map(),
+      messageIdsByStepKey: new Map(),
+      getAgentContext: () => ({ provider: 'native', currentTokenType: 'text' }),
+      dispatchRunStep: jest.fn(async () => 'hidden-step'),
+      getStepKey: () => 'hidden-key',
+      getStepIdByKey: () => 'hidden-step',
+      getRunStep: () => ({ type: 'message_creation' }),
+      dispatchMessageDelta: (id, delta, metadata) =>
+        handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+          GraphEvents.ON_MESSAGE_DELTA,
+          { id, delta, agentId: 'specialist' },
+          metadata,
+        ),
+    };
+    await handlers[GraphEvents.CHAT_MODEL_STREAM].handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: 'Private specialist evidence.',
+          additional_kwargs: {
+            provider_specific_fields: {
+              viventium: {
+                delivery_disposition: {
+                  version: 1,
+                  audio: 'eligible',
+                  source: 'model',
+                  required: true,
+                  valid: true,
+                },
+              },
+            },
+          },
+        },
+      },
+      hidden,
+      graph,
+    );
+    // The exact event actor is still hidden when a stale Main label reaches the callback.
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      {
+        id: 'hidden-step',
+        agentId: 'specialist',
+        delta: { content: [{ type: 'text', text: 'Private stale role evidence.' }] },
+      },
+      { ...hidden, agentId: 'main' },
+    );
+    expect(
+      GenerationJobManager.emitChunk.mock.calls.filter(
+        ([, event]) => event.event === GraphEvents.ON_MESSAGE_DELTA,
+      ),
+    ).toEqual([]);
+    expect(aggregateContent).not.toHaveBeenCalled();
+  });
+
   it.each(['skip', 'eligible', 'missing'])(
     'keeps %s text visible and marks audio before emission',
     async (audio) => {
@@ -2103,6 +2206,59 @@ describe('typed native output attachments at the actual SDK callback boundary', 
     expect(interrupted.callback).not.toHaveBeenCalled();
     expect(replacement.callback).not.toHaveBeenCalled();
   });
+  test('a selected hidden terminal waits for Main and keeps its exact publisher carrier', async () => {
+    const t = setup();
+    const hidden = {
+      ...t.metadata,
+      agentId: 'specialist',
+      langgraph_node: 'agent_specialist',
+      hide_sequential_outputs: true,
+      visible_agent_ids: ['main'],
+    };
+    const final = await t.stream(hidden);
+    final.tool_calls = [];
+    await t.end(final, hidden);
+    expect(t.callback).not.toHaveBeenCalled();
+    await t.end({ content: 'The requested artifact is verified.' });
+    expect(t.callback).toHaveBeenCalledTimes(1);
+    expect(t.callback).toHaveBeenCalledWith(
+      { envelope: t.envelope, requestId: 'request-one' },
+      'specialist',
+    );
+    await t.end({ content: 'The requested artifact is verified.' });
+    expect(t.callback).toHaveBeenCalledTimes(1);
+  });
+  test('a refused Main clears a selected hidden terminal without publishing it', async () => {
+    const t = setup();
+    const hidden = {
+      ...t.metadata,
+      agentId: 'specialist',
+      langgraph_node: 'agent_specialist',
+      hide_sequential_outputs: true,
+      visible_agent_ids: ['main'],
+    };
+    await t.end(await t.stream(hidden), hidden);
+    await expect(
+      t.end({ content: '', additional_kwargs: { stop_reason: 'refusal' } }),
+    ).rejects.toThrow();
+    await t.end({ content: 'Another final.' });
+    expect(t.callback).not.toHaveBeenCalled();
+  });
+  test('a provider replacement cannot retain a hidden terminal carrier', async () => {
+    const t = setup();
+    const hidden = {
+      ...t.metadata,
+      agentId: 'specialist',
+      langgraph_node: 'agent_specialist',
+      hide_sequential_outputs: true,
+      visible_agent_ids: ['main'],
+    };
+    const final = await t.stream(hidden);
+    t.provider('legacy');
+    await t.end(final, hidden);
+    await t.end({ content: 'No selected output.' });
+    expect(t.callback).not.toHaveBeenCalled();
+  });
   test('hidden specialist output never exports selected files', async () => {
     const t = setup();
     const metadata = {
@@ -2129,6 +2285,411 @@ describe('typed native output attachments at the actual SDK callback boundary', 
     await t.handlers[GraphEvents.CHAT_MODEL_START].handle('', {}, t.metadata, t.graph);
     await t.end({ content: 'Replacement result.' });
     expect(t.callback).not.toHaveBeenCalled();
+  });
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Complete public parts use the existing native producer fence. === */
+describe('native public content part completion', () => {
+  const { getDefaultHandlers } = require('../callbacks');
+  const { GenerationJobManager, createReleasedMainPublicPartOwner } = require('@librechat/api');
+  const identity = {
+    userId: 'owner-a',
+    conversationId: 'conversation-a',
+    responseMessageId: 'answer-a',
+    streamId: 'stream-a',
+    jobCreatedAt: 1,
+    logicalTurnId: 'turn-a',
+    revision: 1,
+    invocationId: 'invocation-a',
+    agentId: 'agent-a',
+    source: { id: 'source-a', messageId: 'question-a', digest: 'a'.repeat(64) },
+    deliveryContext: { surface: 'voice' },
+  };
+  const disposition = {
+    version: 1,
+    audio: 'eligible',
+    required: true,
+    valid: true,
+    source: 'model',
+  };
+  const completion = {
+    version: 1,
+    complete: true,
+    request_id: 'request-a',
+    run_id: 'run-a',
+    part_id: 'run-a:0',
+    message_id: 'answer-a',
+    stream_id: 'stream-a',
+  };
+  const makeChunk = (text = '', marker = completion, audio = disposition) => ({
+    chunk: {
+      content: text,
+      additional_kwargs: {
+        __raw_response: {
+          id: marker.request_id,
+          object: 'chat.completion.chunk',
+          choices: [
+            {
+              index: 0,
+              finish_reason: null,
+              delta: {
+                content: text,
+                provider_specific_fields: {
+                  viventium: {
+                    public_part_complete: marker,
+                    delivery_disposition: audio,
+                  },
+                },
+              },
+            },
+          ],
+        },
+      },
+    },
+  });
+  const setup = (interactionOverrides = {}) => {
+    jest.clearAllMocks();
+    const req = {
+      user: { id: 'owner-a' },
+      body: { voiceMode: true },
+      viventiumCallSession: { callSessionId: 'call-a' },
+      _viventiumHarnessExecutionEnabled: true,
+      _viventiumNativeResponseIdentity: identity,
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              native: {
+                messaging_delivery_disposition: true,
+                messaging_delivery_disposition_version: 1,
+              },
+            },
+          },
+        },
+      },
+    };
+    require('~/server/services/viventium/interactionContext').setTrustedInteractionContext(req, {
+      version: 1,
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      logical_turn_id: 'turn-a',
+      revision: 1,
+      source_event_id: 'source-a',
+      surface: 'voice',
+      ...interactionOverrides,
+    });
+    const job = {
+      userId: identity.userId,
+      streamId: identity.streamId,
+      createdAt: 1,
+      conversationId: identity.conversationId,
+      responseMessageId: identity.responseMessageId,
+      userMessage: { messageId: 'question-a' },
+      status: 'running',
+      interactionContext: { logical_turn_id: 'turn-a', revision: 1 },
+      nativeResponse: identity,
+    };
+    const getJob = jest.fn(async () => job);
+    GenerationJobManager.getJobStore.mockReturnValue({ getJob });
+    const aggregateContent = jest.fn();
+    const handlers = getDefaultHandlers({
+      req,
+      res: {},
+      streamId: 'stream-a',
+      aggregateContent,
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+    });
+    const metadata = { agentId: 'agent-a' };
+    const context = { provider: 'native', currentTokenType: 'text', clientOptions: {} };
+    const graph = {
+      config: {},
+      prelimMessageIdsByStepKey: new Map(),
+      messageIdsByStepKey: new Map(),
+      getAgentContext: () => context,
+      getStepKey: () => 'step-key',
+      getStepIdByKey: () => 'public-step',
+      getRunStep: () => ({ type: 'message_creation' }),
+      dispatchRunStep: jest.fn(),
+      dispatchReasoningDelta: jest.fn(),
+      dispatchMessageDelta: (id, delta, meta) =>
+        handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+          GraphEvents.ON_MESSAGE_DELTA,
+          { id, delta, agentId: 'agent-a' },
+          meta,
+        ),
+    };
+    const emit = (data = makeChunk(), meta = metadata) =>
+      handlers[GraphEvents.CHAT_MODEL_STREAM].handle(
+        GraphEvents.CHAT_MODEL_STREAM,
+        data,
+        meta,
+        graph,
+      );
+    const controls = () =>
+      GenerationJobManager.emitChunk.mock.calls.filter(
+        ([, event]) => event.event === 'on_public_content_part_complete',
+      );
+    return { req, job, getJob, aggregateContent, metadata, context, graph, emit, controls };
+  };
+  it('awaits the final public bytes, then emits once without aggregating the control', async () => {
+    const { req, job, getJob, emit, controls, aggregateContent } = setup();
+    expect(
+      require('@librechat/api').inspectProviderPublicPartCompletion(makeChunk().chunk),
+    ).toEqual(completion);
+    expect(require('@librechat/api').isAudioDeliveryRequested(req)).toBe(true);
+    expect(
+      require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(req),
+    ).toMatchObject({
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      logical_turn_id: 'turn-a',
+      revision: 1,
+    });
+    expect(require('@librechat/api').nativeJobMatches(job, identity)).toBe(true);
+    const order = [];
+    GenerationJobManager.emitChunk.mockImplementation(async (_stream, event) => {
+      await Promise.resolve();
+      order.push(event.event);
+      return { delivered: true };
+    });
+    await emit(makeChunk('<emphasis>Cobalt blue.</emphasis>'));
+    await emit();
+    expect(getJob).toHaveBeenCalled();
+    expect(order).toEqual([GraphEvents.ON_MESSAGE_DELTA, 'on_public_content_part_complete']);
+    expect(controls()).toEqual([
+      [
+        'stream-a',
+        {
+          event: 'on_public_content_part_complete',
+          data: { completion, deliveryDisposition: disposition },
+        },
+        identity,
+      ],
+    ]);
+    expect(aggregateContent).toHaveBeenCalledTimes(1);
+    expect(aggregateContent.mock.calls[0][0].data.delta.content).toEqual([
+      { type: 'text', text: '<emphasis>Cobalt blue.</emphasis>' },
+    ]);
+  });
+  it('keeps completion-only chunks, later parts, and a new native graph invocation', async () => {
+    const { req, job, emit, controls } = setup();
+    await emit();
+    await emit(makeChunk('Later answer.', { ...completion, part_id: 'run-a:1' }));
+    req._viventiumNativeResponseIdentity = { ...identity, invocationId: 'invocation-next' };
+    job.nativeResponse = req._viventiumNativeResponseIdentity;
+    await emit(
+      makeChunk('', {
+        ...completion,
+        request_id: 'request-next',
+        run_id: 'run-next',
+        part_id: 'run-next:0',
+      }),
+    );
+    expect(controls()).toHaveLength(3);
+    expect(controls().at(-1)[2].invocationId).toBe('invocation-next');
+  });
+  it('deduplicates concurrent repeated complete chunks after the job read', async () => {
+    const { emit, controls } = setup();
+    await Promise.all([emit(), emit(), emit()]);
+    expect(controls()).toHaveLength(1);
+  });
+  it.each([
+    'foreign-owner',
+    'foreign-stream',
+    'foreign-message',
+    'foreign-request',
+    'other-agent',
+    'hidden-agent',
+    'background',
+    'old-turn',
+    'disabled',
+    'text-only',
+    'job-missing',
+    'job-binding',
+    'aborted',
+    'superseded',
+    'error',
+    'settled',
+    'skip',
+    'malformed-disposition',
+    'tool-step',
+    'reasoning',
+    'tool-envelope',
+  ])('rejects invalid completion: %s', async (kind) => {
+    const f = setup(kind === 'background' ? { actor_kind: 'system', origin: 'scheduler' } : {});
+    const data = makeChunk();
+    const raw = data.chunk.additional_kwargs.__raw_response;
+    let meta = f.metadata;
+    if (kind === 'foreign-owner') f.req.user.id = 'other';
+    if (kind === 'foreign-stream')
+      raw.choices[0].delta.provider_specific_fields.viventium.public_part_complete = {
+        ...completion,
+        stream_id: 'other',
+      };
+    if (kind === 'foreign-message')
+      raw.choices[0].delta.provider_specific_fields.viventium.public_part_complete = {
+        ...completion,
+        message_id: 'other',
+      };
+    if (kind === 'foreign-request') raw.id = 'other';
+    if (kind === 'other-agent') meta = { agentId: 'other' };
+    if (kind === 'hidden-agent')
+      meta = {
+        agentId: 'agent-a',
+        hide_sequential_outputs: true,
+        visible_agent_ids: ['different-main'],
+      };
+    if (kind === 'old-turn') f.job.interactionContext.revision = 2;
+    if (kind === 'disabled') f.req._viventiumHarnessExecutionEnabled = false;
+    if (kind === 'text-only') f.req.body.voiceMode = false;
+    if (kind === 'job-missing') f.getJob.mockResolvedValue(null);
+    if (kind === 'job-binding') f.job.nativeResponse = { ...identity, invocationId: 'other' };
+    if (['aborted', 'superseded', 'error'].includes(kind)) f.job.status = kind;
+    if (kind === 'settled') f.job.nativeResponseSettled = true;
+    if (kind === 'skip')
+      raw.choices[0].delta.provider_specific_fields.viventium.delivery_disposition = {
+        ...disposition,
+        audio: 'skip',
+      };
+    if (kind === 'malformed-disposition')
+      raw.choices[0].delta.provider_specific_fields.viventium.delivery_disposition = {
+        audio: 'eligible',
+      };
+    if (kind === 'tool-step') f.graph.getRunStep = () => ({ type: 'tool_calls' });
+    if (kind === 'reasoning') f.context.currentTokenType = 'thinking';
+    if (kind === 'tool-envelope') raw.choices[0].delta.tool_calls = [{ id: 'tool-a' }];
+    await f.emit(data, meta);
+    expect(f.controls()).toHaveLength(0);
+    expect(f.aggregateContent).not.toHaveBeenCalled();
+  });
+  it('keeps the later Main marker after the real unsupported-release job shape', async () => {
+    const f = setup();
+    delete f.job.nativeResponse;
+    f.job.nativeResponseSettled = true;
+    f.job.generationCompleted = false;
+    f.job.nativeResponseCancelled = false;
+    await f.emit(makeChunk('Later Main narration.'));
+    expect(f.controls()).toHaveLength(1);
+    expect(createReleasedMainPublicPartOwner).toHaveBeenCalledWith(
+      identity,
+      expect.objectContaining({
+        getNativeResponse: expect.any(Function),
+        nativeResponseSourceMatches: expect.any(Function),
+      }),
+    );
+    expect(f.controls()[0][2].publicPartOwner.identity).toEqual(identity);
+    expect(f.aggregateContent).toHaveBeenCalledTimes(1);
+  });
+  it.each(['cancelled', 'generation-complete', 'replaced'])(
+    'keeps released Core %s fenced',
+    async (kind) => {
+      const f = setup();
+      delete f.job.nativeResponse;
+      f.job.nativeResponseSettled = true;
+      if (kind === 'cancelled') f.job.nativeResponseCancelled = true;
+      if (kind === 'generation-complete') f.job.generationCompleted = true;
+      if (kind === 'replaced') f.job.createdAt = identity.jobCreatedAt + 1;
+      await f.emit();
+      expect(f.controls()).toHaveLength(0);
+    },
+  );
+  it.each(['web', 'telegram'])('keeps ordinary %s delivery unchanged', async (surface) => {
+    const { req, emit, controls } = setup();
+    req.body.voiceMode = false;
+    req._viventiumNativeResponseIdentity = { ...identity, deliveryContext: { surface } };
+    await emit(makeChunk('Normal answer.'));
+    expect(controls()).toHaveLength(0);
+    expect(GenerationJobManager.emitChunk.mock.calls.map(([, event]) => event.event)).toEqual([
+      GraphEvents.ON_MESSAGE_DELTA,
+    ]);
+  });
+  it('keeps raw completion-only chunks through the real model adapter and SDK, then delivers later text', async () => {
+    const { initializeModel } = require('@librechat/agents');
+    const { emit, controls, aggregateContent } = setup();
+    const words = Array.from({ length: 32 }, (_, index) => `word${index} `);
+    const raw = (content, marker) => ({
+      id: 'request-a',
+      object: 'chat.completion.chunk',
+      model: 'synthetic',
+      choices: [
+        {
+          index: 0,
+          finish_reason: null,
+          delta: {
+            content,
+            provider_specific_fields: {
+              viventium: {
+                delivery_disposition: disposition,
+                ...(marker ? { public_part_complete: marker } : {}),
+              },
+            },
+          },
+        },
+      ],
+    });
+    const chunks = [
+      raw(''),
+      ...words.map((text) => raw(text)),
+      raw('', completion),
+      raw('<emphasis>Later words.</emphasis>', { ...completion, part_id: 'run-a:1' }),
+      raw('The file could not be delivered.'),
+    ];
+    chunks[0].choices[0].delta.role = 'assistant';
+    const body =
+      chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n';
+    const model = initializeModel({
+      provider: 'openAI',
+      clientOptions: {
+        apiKey: 'synthetic-key',
+        model: 'synthetic',
+        streaming: true,
+        __includeRawResponse: true,
+        streamUsage: false,
+        maxRetries: 0,
+        configuration: {
+          baseURL: 'http://synthetic.invalid/v1',
+          fetch: async () =>
+            new Response(body, { headers: { 'Content-Type': 'text/event-stream' } }),
+        },
+      },
+    });
+    const eventOrder = [];
+    GenerationJobManager.emitChunk.mockImplementation(async (_stream, event) => {
+      eventOrder.push(event.event);
+      return { delivered: true };
+    });
+    for await (const chunk of await model.stream([['human', 'Synthetic request.']])) {
+      const marker =
+        chunk.additional_kwargs.__raw_response?.choices?.[0]?.delta?.provider_specific_fields
+          ?.viventium?.public_part_complete;
+      if (marker) {
+        expect(require('@librechat/api').inspectProviderPublicPartCompletion(chunk)).toEqual(
+          marker,
+        );
+      }
+      await emit({ chunk });
+    }
+    const visibleText = aggregateContent.mock.calls
+      .map(([event]) => event.data.delta.content)
+      .flat()
+      .map((part) => part.text || '')
+      .join('');
+    expect(visibleText).toBe(
+      words.join('') + '<emphasis>Later words.</emphasis>' + 'The file could not be delivered.',
+    );
+    expect(controls().map(([, event]) => event.data.completion.part_id)).toEqual([
+      'run-a:0',
+      'run-a:1',
+    ]);
+    expect(eventOrder.slice(0, 32)).toEqual(Array(32).fill(GraphEvents.ON_MESSAGE_DELTA));
+    expect(eventOrder.slice(32)).toEqual([
+      'on_public_content_part_complete',
+      GraphEvents.ON_MESSAGE_DELTA,
+      'on_public_content_part_complete',
+      GraphEvents.ON_MESSAGE_DELTA,
+    ]);
   });
 });
 /* === VIVENTIUM END === */

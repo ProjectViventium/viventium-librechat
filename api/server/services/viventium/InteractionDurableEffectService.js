@@ -6,9 +6,16 @@
  * === VIVENTIUM END === */
 
 const crypto = require('crypto');
+const {
+  SOURCE_MUTATION_ADAPTERS,
+  SOURCE_MUTATION_EFFECT_KINDS,
+  readSourceEffectFacts,
+  readSourceRecoverySnapshot,
+  resolveManagedMutationSource,
+} = require('@librechat/api');
 
-const SUPPORTED_ADAPTERS = new Set(['glasshive.work_action.v1', 'glasshive.worker_delegate.v1']);
-const SUPPORTED_EFFECT_KINDS = new Set(['durable_work_accepted', 'durable_work_action_accepted']);
+const SUPPORTED_ADAPTERS = new Set(SOURCE_MUTATION_ADAPTERS);
+const SUPPORTED_EFFECT_KINDS = new Set(SOURCE_MUTATION_EFFECT_KINDS);
 const SUPPORTED_SURFACES = new Set(['web', 'telegram', 'voice', 'workbench']);
 const SENSITIVE_RESULT_KEY = /password|secret|token|authorization|cookie|credential/i;
 const DEFAULT_CLAIM_DURATION_MS = 30_000;
@@ -248,6 +255,8 @@ function createInteractionDurableEffectService({
   generationJobManager,
   getCallSession,
   listSpeakerSegments,
+  assertVoiceWorkAuthority = (...args) =>
+    require('./VoiceWorkAuthorityService').assertVoiceWorkAuthority(...args),
   now = () => new Date(),
   createClaimToken = () => crypto.randomUUID(),
   claimDurationMs = DEFAULT_CLAIM_DURATION_MS,
@@ -308,7 +317,9 @@ function createInteractionDurableEffectService({
       !operation ||
       !effectOccurrenceRef ||
       !providerIdempotencyKey ||
-      !['native_key', 'deterministic_reconciliation'].includes(input?.providerIdempotencyMode) ||
+      !['native_key', 'deterministic_reconciliation', 'none'].includes(
+        input?.providerIdempotencyMode,
+      ) ||
       !input?.canonicalArgs ||
       typeof input.canonicalArgs !== 'object'
     ) {
@@ -320,7 +331,10 @@ function createInteractionDurableEffectService({
     const conversationId = boundedText(metadata.conversationId || interaction.conversation_id, 256);
     const responseMessageId = boundedText(metadata.responseMessageId, 256);
     const logicalTurnId = boundedText(interaction.logical_turn_id, 256);
-    const sourceEventId = boundedText(interaction.source_event_id, 512);
+    const sourceEventId = boundedText(
+      resolveManagedMutationSource(interaction, input.sourceEventId),
+      512,
+    );
     const revision = Number(interaction.revision);
     const surface = boundedText(interaction.surface, 32);
     if (!job) throw durableEffectError('durable_effect_job_missing', 409, true);
@@ -339,7 +353,20 @@ function createInteractionDurableEffectService({
       throw durableEffectError('durable_effect_job_binding_incomplete', 409, true);
     }
     const voiceAuthority = surface === 'voice' ? metadata.viventiumVoiceEffectAuthority : null;
-    if (surface === 'voice') await assertFreshVoiceAuthority(voiceAuthority, ownerId);
+    const typedWorkAuthority =
+      surface === 'voice' && metadata.viventiumVoiceWorkAuthority?.kind === 'participant_text'
+        ? metadata.viventiumVoiceWorkAuthority
+        : null;
+    let voiceAuthorityRef = voiceAuthority?.voiceAuthorityRef;
+    if (typedWorkAuthority) {
+      if (voiceAuthority || metadata.viventiumCallSessionId !== typedWorkAuthority.callSessionId) {
+        throw durableEffectError('durable_effect_voice_authority_stale', 409, false);
+      }
+      await assertVoiceWorkAuthority(typedWorkAuthority, ownerId);
+      voiceAuthorityRef = `voice_authority_${sha256(canonicalJson(typedWorkAuthority)).slice('sha256:'.length)}`;
+    } else if (surface === 'voice') {
+      await assertFreshVoiceAuthority(voiceAuthority, ownerId);
+    }
     const canonicalArgsSha256 = sha256(canonicalJson(input.canonicalArgs));
     const effectIdentity = {
       ownerId,
@@ -365,10 +392,10 @@ function createInteractionDurableEffectService({
       effectKind: input.effectKind,
       providerIdempotencyKey,
       providerIdempotencyMode: input.providerIdempotencyMode,
-      ...(voiceAuthority
+      ...(voiceAuthorityRef
         ? {
-            voiceAuthorityRef: voiceAuthority.voiceAuthorityRef,
-            voice: voiceAuthority.voice,
+            voiceAuthorityRef,
+            ...(voiceAuthority?.voice ? { voice: voiceAuthority.voice } : {}),
           }
         : {}),
       ...(input.runtimeBinding ? { runtimeBindingAtReserve: input.runtimeBinding } : {}),
@@ -628,6 +655,7 @@ function createInteractionDurableEffectService({
   }
 
   return {
+    readSourceEffectFacts: (scope) => readSourceEffectFacts(scope, EffectModel),
     acknowledgeDurableEffectDelivery,
     prepareDurableEffect,
     commitDurableEffect,
@@ -664,6 +692,14 @@ async function settleDurableEffectFailure(input) {
   return getDefaultService().settleDurableEffectFailure(input);
 }
 
+const getSourceEffectFacts = (scope) => getDefaultService().readSourceEffectFacts(scope);
+const getSourceRecoverySnapshot = (scope) =>
+  readSourceRecoverySnapshot(
+    scope,
+    require('~/db/models').InteractionDurableEffect,
+    require('mongoose').connection.collection('viventium_external_work'),
+  );
+
 async function acknowledgeDurableEffectDelivery(acknowledgement, adapterSurface) {
   return getDefaultService().acknowledgeDurableEffectDelivery(acknowledgement, adapterSurface);
 }
@@ -674,6 +710,8 @@ async function ensureInteractionDurableEffectIndexes() {
 }
 
 module.exports = {
+  getSourceEffectFacts,
+  getSourceRecoverySnapshot,
   acknowledgeDurableEffectDelivery,
   commitDurableEffect,
   createInteractionDurableEffectService,

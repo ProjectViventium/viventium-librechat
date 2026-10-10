@@ -5,6 +5,7 @@
  * === VIVENTIUM END === */
 
 import { createHash } from 'crypto';
+import type { SourceRecoveryFacts } from '../glasshive/sourceMutation';
 
 import {
   normalizeInteractionSourceSegments,
@@ -74,6 +75,7 @@ export interface TrustedInteractionContext {
   readonly reply_context?: InteractionReplyContext;
   readonly source_segments?: readonly InteractionSourceSegment[];
   readonly source_segments_overflow_count?: number;
+  readonly source_recovery_facts?: SourceRecoveryFacts;
 }
 
 export interface InteractionContextInput {
@@ -592,7 +594,7 @@ export function bindCanonicalInteractionConversation(
 
 export function bindLogicalTurnContext(
   request: object | null | undefined,
-  claimedContext: InteractionContextInput,
+  claimedContext: InteractionContextInput & { source_recovery_facts?: SourceRecoveryFacts },
 ): TrustedInteractionContext | null {
   const req = objectKey(request);
   const current = req ? trustedContexts.get(req) || null : null;
@@ -622,8 +624,12 @@ export function bindLogicalTurnContext(
     ),
   );
   if (!preservesCurrentSegments) return current;
-  trustedContexts.set(req, claimed);
-  return claimed;
+  // Outcome facts enter only through this server-owned claim, never raw context normalization.
+  const bound = claimedContext.source_recovery_facts
+    ? Object.freeze({ ...claimed, source_recovery_facts: claimedContext.source_recovery_facts })
+    : claimed;
+  trustedContexts.set(req, bound);
+  return bound;
 }
 
 export function isInternalOrigin(request: object | null | undefined): boolean {

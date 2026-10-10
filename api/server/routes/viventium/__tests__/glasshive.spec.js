@@ -71,8 +71,10 @@ jest.mock('~/server/services/viventium/OrchestrationTraceLedgerService', () => (
 }));
 
 jest.mock('~/server/services/viventium/GlassHiveCallbackBindingService', () => ({
+  ...jest.requireActual('~/server/services/viventium/GlassHiveCallbackBindingService'),
   resolveGlassHiveCallbackContext: (...args) => mockResolveGlassHiveCallbackContext(...args),
   confirmGlassHiveCallbackContext: (...args) => mockConfirmGlassHiveCallbackContext(...args),
+  fenceGlassHiveCallbackRunState: jest.fn(async () => null),
   recordGlassHiveAdjudicationOutcome: (...args) => mockRecordGlassHiveAdjudicationOutcome(...args),
   recordGlassHiveCallbackExternalState: (...args) =>
     mockRecordGlassHiveCallbackExternalState(...args),
@@ -82,6 +84,11 @@ jest.mock('~/server/services/viventium/GlassHiveCallbackBindingService', () => (
   isGlassHiveWorkTerminalCallback: (body = {}) =>
     body.work_terminal === true &&
     ['completed', 'failed', 'cancelled'].includes(String(body.work_state || '').toLowerCase()),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveTerminalCallbackTransaction', () => ({
+  ...jest.requireActual('~/server/services/viventium/GlassHiveTerminalCallbackTransaction'),
+  runGlassHiveTerminalCallbackTransaction: async (operation) => operation(null),
 }));
 
 jest.mock('~/server/services/viventium/GlassHiveMissionAdjudicationService', () => ({
@@ -227,8 +234,9 @@ function createMockRes() {
       return res;
     }),
   };
-  res._done = new Promise((resolve) => {
+  res._done = new Promise((resolve, reject) => {
     res._resolve = resolve;
+    res._reject = reject;
   });
   return res;
 }
@@ -236,7 +244,8 @@ function createMockRes() {
 function dispatch(app, req, res) {
   app.handle(req, res, (err) => {
     if (err) {
-      throw err;
+      res._reject(err);
+      return;
     }
     if (!res.writableEnded) {
       res._resolve();
@@ -319,6 +328,35 @@ describe('/api/viventium/glasshive/callback', () => {
     ]);
     process.env.VIVENTIUM_GLASSHIVE_CALLBACK_SECRET = 'callback-secret';
     require('~/server/services/viventium/VoiceTaskService').resetVoiceTasksForTests();
+  });
+
+  test.each([
+    ['run.completed', 'internal'],
+    ['run.failed', undefined],
+    ['run.needs_input', undefined],
+    ['artifact.created', undefined],
+  ])('keeps %s lifecycle visibility correct at first persistence', async (event, visibility) => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({ event });
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.metadata.viventium.visibility).toBe(visibility);
+    expect(message.metadata.viventium.hasFullText).toBe(false);
+    expect(message.metadata.viventium.event).toBe(event);
+    expect(message.metadata.viventium.workRef).toBe(body.work_ref);
+    expect(message.content[0].text).toBe(message.text);
   });
 
   test('maps signed voice worker callbacks into one monotonic run-scoped task', async () => {

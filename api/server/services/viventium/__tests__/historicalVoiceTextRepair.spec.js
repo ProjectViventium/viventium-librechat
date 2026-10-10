@@ -1,5 +1,4 @@
 const {
-  countDuplicateArtifacts,
   normalizeHistoricalVoiceText,
   normalizeHistoricalVoiceMessageForRead,
 } = require('../historicalVoiceTextRepair');
@@ -10,17 +9,17 @@ describe('historical voice text repair', () => {
     expect(normalizeHistoricalVoiceText('{NTA}')).toBe('');
   });
 
-  it('normalizes obvious cumulative snapshot word duplication', () => {
+  it('does not infer historical transport duplication from word spelling', () => {
     expect(
       normalizeHistoricalVoiceText(
         "I'mI'm here here.. Tell Tell me me what's what's going going on on..",
       ),
-    ).toBe("I'm here. Tell me what's going on.");
+    ).toBe("I'mI'm here here.. Tell Tell me me what's what's going going on on..");
     expect(
       normalizeHistoricalVoiceText(
         'ThatThat hits hits hard hard.. Leaving Leaving a a place place you you love love.',
       ),
-    ).toBe('That hits hard. Leaving a place you love.');
+    ).toBe('ThatThat hits hits hard hard.. Leaving Leaving a a place place you you love love.');
   });
 
   it('does not rewrite ordinary emphasis with a single repeated word', () => {
@@ -33,7 +32,6 @@ describe('historical voice text repair', () => {
     const text =
       'The line was "no no no no no no", and the repetition is the point. Then continue.';
 
-    expect(countDuplicateArtifacts(text)).toBe(0);
     expect(normalizeHistoricalVoiceText(text)).toBe(text);
   });
 
@@ -57,15 +55,15 @@ describe('historical voice text repair', () => {
     expect(normalizeHistoricalVoiceText(fenced)).toBe(fenced);
   });
 
-  it('repairs unquoted corruption while preserving quoted repetition', () => {
+  it('preserves unquoted and quoted repetition without transport proof', () => {
     expect(
       normalizeHistoricalVoiceText(
         'Tell Tell me me what what happened happened. She said "no no no no no no."',
       ),
-    ).toBe('Tell me what happened. She said "no no no no no no."');
+    ).toBe('Tell Tell me me what what happened happened. She said "no no no no no no."');
   });
 
-  it('repairs assistant message text and text content parts without touching cortex cards', () => {
+  it('keeps assistant text and content parts intact without touching cortex cards', () => {
     const original = {
       isCreatedByUser: false,
       text: 'Tell Tell me me what what happened happened.',
@@ -75,13 +73,25 @@ describe('historical voice text repair', () => {
       ],
     };
 
-    expect(normalizeHistoricalVoiceMessageForRead(original)).toEqual({
+    expect(normalizeHistoricalVoiceMessageForRead(original)).toBe(original);
+  });
+});
+
+describe('authored words remain source content', () => {
+  test.each([
+    'Nine. Almost ten. Ten. Nineteen. Nearly twenty. Twenty. Twenty-five. Five to go.',
+    'No, no, no. Please please please. Never never again.',
+    'A playful refrain: mama papa dada. Repeat repeat repeat.',
+  ])('preserves authored repetition without inferring transport corruption: %s', (text) => {
+    expect(normalizeHistoricalVoiceText(text)).toBe(text);
+    const message = {
       isCreatedByUser: false,
-      text: 'Tell me what happened.',
+      text,
       content: [
-        { type: 'cortex_insight', insight: 'keep me' },
-        { type: 'text', text: 'Tell me what happened.' },
+        { type: 'text', text },
+        { type: 'cortex_insight', insight: 'Accepted context remains.' },
       ],
-    });
+    };
+    expect(normalizeHistoricalVoiceMessageForRead(message)).toBe(message);
   });
 });

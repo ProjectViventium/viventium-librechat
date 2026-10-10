@@ -287,7 +287,7 @@ function resolveVoiceAgentName() {
 
 function buildPlaygroundUrl(
   session,
-  { preferPublicPlayground = false, launchCapability = '' } = {},
+  { preferPublicPlayground = false, launchCapability = '', includeConversationId = false } = {},
 ) {
   const playgroundBase = resolvePlaygroundBaseUrl({ preferPublicPlayground });
   const url = new URL(playgroundBase);
@@ -296,6 +296,14 @@ function buildPlaygroundUrl(
 
   url.searchParams.set('callSessionId', session.callSessionId);
   url.searchParams.set('autoConnect', '1');
+  if (
+    includeConversationId === true &&
+    typeof session.conversationId === 'string' &&
+    session.conversationId !== 'new' &&
+    /^[A-Za-z0-9_-]{1,160}$/.test(session.conversationId)
+  ) {
+    url.searchParams.set('conversationId', session.conversationId);
+  }
   if (typeof launchCapability === 'string' && launchCapability) {
     const fragment = new URLSearchParams();
     fragment.set('viventiumCallLaunch', launchCapability);

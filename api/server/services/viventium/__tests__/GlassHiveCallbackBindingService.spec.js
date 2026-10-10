@@ -143,7 +143,7 @@ function canonicalCallbackRef(value) {
 describe('GlassHiveCallbackBindingService', () => {
   beforeEach(() => {
     mockBindingFindOne = jest.fn();
-    mockBindingUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true });
+    mockBindingUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true, matchedCount: 1 });
     mockExternalCursor = {
       sort: jest.fn(() => mockExternalCursor),
       limit: jest.fn(() => mockExternalCursor),
@@ -152,7 +152,7 @@ describe('GlassHiveCallbackBindingService', () => {
     mockExternalFind = jest.fn().mockReturnValue(mockExternalCursor);
     mockExternalFindOne = jest.fn();
     mockExternalFindOneAndUpdate = jest.fn();
-    mockExternalUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true });
+    mockExternalUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true, matchedCount: 1 });
     mockResolveTelegramMappingByUserId = jest.fn().mockResolvedValue({
       telegramUserId: 'telegram-authoritative',
     });
@@ -419,6 +419,60 @@ describe('GlassHiveCallbackBindingService', () => {
     expect(mockBindingUpdateOne).not.toHaveBeenCalled();
     expect(mockExternalUpdateOne).not.toHaveBeenCalled();
   });
+
+  test.each([
+    [{ isTemporary: true, viventiumEvalIsolation: { feelings: true } }, true],
+    [{ viventiumQaRun: true, viventiumEvalIsolation: { feelings: true } }, true],
+    [{ viventiumEvalIsolation: { feelings: true } }, false],
+    [{ isTemporary: true, viventiumEvalIsolation: { feelings: false } }, false],
+    [{}, false],
+  ])('retains only the existing structured isolation decision %j', async (flags, expected) => {
+    await registerGlassHiveLaunchContext({
+      user: { id: 'user-1' },
+      toolName: 'workspace_launch',
+      toolArguments: { goal: 'Create the synthetic report.' },
+      toolCall: { id: 'synthetic-isolation' },
+      requestBody: {
+        messageId: 'assistant-anchor',
+        parentMessageId: 'user-message',
+        conversationId: 'conversation-1',
+        viventiumSourceEventId: 'synthetic-source',
+        ...flags,
+      },
+    });
+    const inserted = mockBindingUpdateOne.mock.calls.find(([, update]) => update.$setOnInsert)?.[1]
+      .$setOnInsert;
+    expect(inserted.feelingsIsolated === true).toBe(expected);
+    expect(inserted).not.toHaveProperty('_viventiumFeelingSnapshot');
+  });
+
+  test.each([undefined, false, true])(
+    'uses stored isolation %s and ignores callback-supplied state',
+    async (feelingsIsolated) => {
+      mockBindingFindOne.mockResolvedValue({
+        _id: 'ghi-origin-1',
+        originRef: 'ghi-origin-1',
+        workRef: '',
+        ownerId: 'user-1',
+        conversationId: 'conversation-1',
+        anchorMessageId: 'assistant-anchor',
+        requestedParentMessageId: 'user-message',
+        configuredDestinations: [{ surface: 'librechat' }],
+        feelingsIsolated,
+      });
+      const result = await resolveGlassHiveCallbackContext({
+        origin_ref: 'ghi-origin-1',
+        work_ref: 'gh-work-1',
+        worker_id: 'worker-1',
+        run_id: 'run-1',
+        user_id: 'user-1',
+        conversation_id: 'conversation-1',
+        message_id: 'assistant-anchor',
+        feelingsIsolated: feelingsIsolated !== true,
+      });
+      expect(result.feelingsIsolated === true).toBe(feelingsIsolated === true);
+    },
+  );
 
   test('persists a Core-owned target binding and required schedule relation before launch', async () => {
     const launch = await registerGlassHiveLaunchContext({
@@ -1515,8 +1569,9 @@ describe('GlassHiveCallbackBindingService', () => {
     expect(mockBindingUpdateOne).toHaveBeenCalledWith(
       {
         _id: 'ghi-prepared',
+        ownerId: 'owner-ready',
         workRef: '',
-        launchState: { $in: ['prepared', 'not_dispatched'] },
+        launchState: 'prepared',
       },
       expect.objectContaining({
         $set: expect.objectContaining({ launchState: 'dispatch_ready' }),

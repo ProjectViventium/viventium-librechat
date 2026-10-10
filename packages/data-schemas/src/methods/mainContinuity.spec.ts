@@ -93,6 +93,53 @@ describe('native accepted history storage', () => {
       async () => ({ status: 'committed' }),
       transaction,
     );
+  test('background source changes advance generation; native receipts and after-Main NTA do not', async () => {
+    const turn = await source('background');
+    await accept(turn);
+    const text = 'Exact quoted background fact.';
+    const input = {
+      version: 1,
+      invocationId: 'invocation',
+      deliveryId: 'd'.repeat(64),
+      text,
+      textSha256: sha(text),
+      sources: [{ cortexId: 'cortex', insightSha256: sha('fact') }],
+    };
+    const filter = { user: ownerId, messageId: turn.assistantMessageId };
+    await transaction(() =>
+      methods.mutateAcceptedMainContinuitySources(filter, () =>
+        messages().updateOne(filter, { $set: { 'metadata.viventium.backgroundInputs': [input] } }),
+      ),
+    );
+    expect((await methods.readAcceptedMainHistory(identity)).generation).toBe(1);
+    await transaction(() =>
+      methods.mutateAcceptedMainContinuitySources(filter, () =>
+        messages().updateOne(filter, {
+          $set: {
+            'metadata.viventium.backgroundInputReceipts': [{ status: 'queued' }],
+            'metadata.viventium.cortexFollowUpDecision': { result: 'suppressed', llmResult: 'nta' },
+          },
+        }),
+      ),
+    );
+    expect((await methods.readAcceptedMainHistory(identity)).generation).toBe(1);
+    expect(
+      mainContinuityMessageEvidence(await messages().findOne(filter).lean()).backgroundInputs,
+    ).toEqual([input]);
+    const changedText = 'A corrected background fact.';
+    await transaction(() =>
+      methods.mutateAcceptedMainContinuitySources(filter, () =>
+        messages().updateOne(filter, {
+          $set: {
+            'metadata.viventium.backgroundInputs': [
+              { ...input, text: changedText, textSha256: sha(changedText) },
+            ],
+          },
+        }),
+      ),
+    );
+    expect((await methods.readAcceptedMainHistory(identity)).generation).toBe(2);
+  });
   test('acceptance and fenced history reads do not overlap queries in one session', async () => {
     const turn = await source('serial');
     const execute = mongoose.Query.prototype.exec;

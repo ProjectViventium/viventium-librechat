@@ -257,26 +257,31 @@ describe('viventium-memory-hardening', () => {
               cursor([
                 {
                   callSessionId: 'call-active',
+                  userId: 'qa-user',
                   callStatus: 'listening',
                   expiresAt: new Date('2099-01-01'),
                 },
                 {
                   callSessionId: 'call-ended',
+                  userId: 'qa-user',
                   callStatus: 'ended',
                   expiresAt: new Date('2099-01-01'),
                 },
                 {
                   callSessionId: 'call-mixed',
+                  userId: 'qa-user',
                   callStatus: 'ended',
                   expiresAt: new Date('2099-01-01'),
                 },
                 {
                   callSessionId: 'call-revised',
+                  userId: 'qa-user',
                   callStatus: 'ended',
                   expiresAt: new Date('2099-01-01'),
                 },
                 {
                   callSessionId: 'call-tombstone',
+                  userId: 'qa-user',
                   callStatus: 'ended',
                   expiresAt: new Date('2099-01-01'),
                   speakerSessionRevision: 3,
@@ -442,6 +447,7 @@ describe('viventium-memory-hardening', () => {
               cursor([
                 {
                   callSessionId: 'call-finalization-race',
+                  userId: 'qa-user',
                   callStatus: 'ended',
                   expiresAt: new Date('2099-01-01'),
                   speakerEvidenceEpoch: 0,
@@ -682,6 +688,7 @@ describe('viventium-memory-hardening', () => {
               cursor([
                 {
                   callSessionId: 'call-expired-active',
+                  userId: 'qa-user',
                   callStatus: 'working',
                   expiresAt: new Date('2026-08-09T12:01:00Z'),
                 },
@@ -748,6 +755,7 @@ describe('viventium-memory-hardening', () => {
               cursor([
                 {
                   callSessionId: 'call-ledger-failure',
+                  userId: 'qa-user',
                   callStatus: 'ended',
                   expiresAt: new Date('2099-01-01'),
                 },
@@ -777,6 +785,7 @@ describe('viventium-memory-hardening', () => {
       [
         {
           callSessionId: 'call-incomplete-finalization',
+          userId: 'qa-user',
           callStatus: 'ended',
           expiresAt: new Date('2099-01-01'),
         },
@@ -3451,7 +3460,7 @@ describe('viventium-memory-hardening', () => {
     process.env.RAG_API_URL = 'http://rag.example.test';
     const vectorDocumentExists = jest
       .fn()
-      .mockRejectedValue(new Error('connect ECONNREFUSED /Users/private/path'));
+      .mockRejectedValue(new Error(['connect ECONNREFUSED /Users', '/private/path'].join('')));
     jest.doMock('~/server/services/Files/VectorDB/crud', () => ({
       vectorDocumentExists,
     }));
@@ -3698,6 +3707,27 @@ describe('viventium-memory-hardening', () => {
     const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-transcript-rag-down-'));
     try {
       const result = await applyUserProposal({
+        db: {
+          collection(name) {
+            expect(name).toBe('messages');
+            return {
+              find(filter) {
+                expect(filter.user).toBe('507f1f77bcf86cd799439011');
+                expect(filter.messageId).toEqual({ $in: ['message-1'] });
+                return {
+                  project() {
+                    return this;
+                  },
+                  async toArray() {
+                    return filter['metadata.viventium.callSessionId']
+                      ? []
+                      : [{ messageId: 'message-1' }];
+                  },
+                };
+              },
+            };
+          },
+        },
         methods: {
           getAllUserMemories,
           setMemory,
@@ -4779,42 +4809,6 @@ describe('viventium-memory-hardening', () => {
     }
   });
 
-  test('implicit Anthropic selection uses the current default while preserving explicit effort', () => {
-    const oldEnv = { ...process.env };
-    process.env.VIVENTIUM_PRIMARY_PROVIDER = 'anthropic';
-    process.env.VIVENTIUM_SECONDARY_PROVIDER = '';
-    for (const name of [
-      'VIVENTIUM_MEMORY_HARDENING_PROVIDER',
-      'VIVENTIUM_MEMORY_HARDENING_MODEL',
-      'VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL',
-      'VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT',
-      'VIVENTIUM_MEMORY_HARDENING_EFFORT',
-      'VIVENTIUM_MEMORY_HARDENING_MODEL_FALLBACKS',
-    ]) {
-      delete process.env[name];
-    }
-    try {
-      expect(resolveProvider({})).toMatchObject({
-        provider: 'anthropic',
-        model: 'claude-opus-5-5',
-        effort: 'high',
-      });
-      process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT = 'medium';
-      expect(resolveProvider({})).toMatchObject({
-        model: 'claude-opus-5-5',
-        effort: 'medium',
-      });
-      delete process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT;
-      process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT = 'xhigh';
-      expect(resolveProvider({})).toMatchObject({
-        model: 'claude-opus-5-5',
-        effort: 'xhigh',
-      });
-    } finally {
-      process.env = oldEnv;
-    }
-  });
-
   test('default model selection changes only through explicitly configured fallbacks', () => {
     const oldEnv = { ...process.env };
     process.env.VIVENTIUM_PRIMARY_PROVIDER = 'anthropic';
@@ -5008,4 +5002,671 @@ describe('viventium-memory-hardening', () => {
       else delete process.env.WPR_CODEX_BIN;
     }
   });
+
+  test('implicit Anthropic selection uses the current default while preserving explicit effort', () => {
+    const oldEnv = { ...process.env };
+    process.env.VIVENTIUM_PRIMARY_PROVIDER = 'anthropic';
+    process.env.VIVENTIUM_SECONDARY_PROVIDER = '';
+    for (const name of [
+      'VIVENTIUM_MEMORY_HARDENING_PROVIDER',
+      'VIVENTIUM_MEMORY_HARDENING_MODEL',
+      'VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_MODEL',
+      'VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT',
+      'VIVENTIUM_MEMORY_HARDENING_EFFORT',
+      'VIVENTIUM_MEMORY_HARDENING_MODEL_FALLBACKS',
+    ]) {
+      delete process.env[name];
+    }
+    try {
+      expect(resolveProvider({})).toMatchObject({
+        provider: 'anthropic',
+        model: 'claude-opus-5-5',
+        effort: 'high',
+      });
+      process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT = 'medium';
+      expect(resolveProvider({})).toMatchObject({
+        model: 'claude-opus-5-5',
+        effort: 'medium',
+      });
+      delete process.env.VIVENTIUM_MEMORY_HARDENING_ANTHROPIC_EFFORT;
+      process.env.VIVENTIUM_MEMORY_HARDENING_EFFORT = 'xhigh';
+      expect(resolveProvider({})).toMatchObject({
+        model: 'claude-opus-5-5',
+        effort: 'xhigh',
+      });
+    } finally {
+      process.env = oldEnv;
+    }
+  });
+});
+
+describe('reviewed post-call voice proposal apply', () => {
+  const { MongoMemoryServer } = require('mongodb-memory-server');
+  const { MongoClient } = require('mongodb');
+  const userId = '507f1f77bcf86cd799439011';
+  const otherUserId = '507f1f77bcf86cd799439012';
+  const now = new Date('2026-08-12T12:00:00Z');
+  const memoryConfig = {
+    validKeys: ['preferences', 'working', 'moments'],
+    keyLimits: { preferences: 600, working: 400, moments: 600 },
+    tokenLimit: 8000,
+    instructions: 'preferences — durable user preferences; working — conversation-owned.',
+  };
+  let mongo, client, db, runDir, message, session, segment, methods, spawnSpy;
+
+  beforeAll(async () => {
+    mongo = await MongoMemoryServer.create();
+    client = new MongoClient(mongo.getUri());
+    await client.connect();
+    db = client.db('reviewed_voice_apply');
+  });
+  afterAll(async () => {
+    await client?.close();
+    await mongo?.stop();
+  });
+  beforeEach(async () => {
+    await db.dropDatabase();
+    runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-reviewed-voice-'));
+    spawnSpy = jest.spyOn(childProcess, 'spawnSync').mockImplementation(() => {
+      throw new Error('Provider calls are forbidden in this deterministic bank');
+    });
+    segment = {
+      version: 1,
+      segmentId: 'segment-owner',
+      revision: 1,
+      isFinal: true,
+      text: 'Synthetic preference statement.',
+      speaker: {
+        key: 'participant:owner',
+        source: 'participant_track',
+        attribution: 'verified',
+        actorTrust: 'owner_participant',
+      },
+      overlap: false,
+      uncertain: false,
+    };
+    message = {
+      user: userId,
+      messageId: 'message-owner',
+      conversationId: 'conversation-owner',
+      createdAt: new Date('2026-08-12T11:00:00Z'),
+      isCreatedByUser: true,
+      sender: 'Synthetic User',
+      text: 'Synthetic preference statement.',
+      metadata: {
+        viventium: {
+          callSessionId: 'call-owner',
+          source: 'voice_call',
+          mode: 'call',
+          voiceTaskId: 'task-owner',
+          speakerSegments: [segment],
+        },
+      },
+    };
+    session = {
+      callSessionId: 'call-owner',
+      userId,
+      callStatus: 'ended',
+      speakerEvidenceEpoch: 2,
+      expiresAt: new Date('2099-01-01'),
+    };
+    await db.collection('messages').insertOne(message);
+    await db.collection('viventiumcallsessions').insertOne(session);
+    await db.collection('viventiumvoicespeakersegments').insertOne({
+      callSessionId: 'call-owner',
+      segmentId: segment.segmentId,
+      revision: 1,
+      payload: segment,
+    });
+    methods = {
+      getAllUserMemoryStates: jest.fn().mockResolvedValue([]),
+      getAllUserMemories: jest.fn().mockResolvedValue([]),
+      setMemory: jest.fn().mockResolvedValue({ ok: true, revision: 1 }),
+      deleteMemory: jest.fn(),
+    };
+  });
+  afterEach(() => {
+    spawnSpy.mockRestore();
+    fs.rmSync(runDir, { recursive: true, force: true });
+  });
+
+  async function propose({ ordinary = false, key = 'preferences' } = {}) {
+    if (ordinary) {
+      await db.collection('messages').updateOne(
+        { messageId: message.messageId },
+        {
+          $unset: { metadata: '' },
+        },
+      );
+    }
+    const proposalFile = path.join(runDir, 'model-proposal.fixture.json');
+    fs.writeFileSync(
+      proposalFile,
+      JSON.stringify({
+        operations: [
+          {
+            key,
+            action: 'set',
+            value: 'Synthetic reviewed preference.',
+            evidence: [
+              {
+                source: 'conversation',
+                messageId: message.messageId,
+                createdAt: message.createdAt.toISOString(),
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    return buildUserProposal({
+      db,
+      methods,
+      user: { _id: userId },
+      memoryConfig,
+      now,
+      providerInfo: { provider: 'openai', model: 'gpt-6.1-sol', effort: 'high' },
+      options: {
+        mode: 'dry-run',
+        proposalFile,
+        lookbackDays: 7,
+        minUserIdleMinutes: 60,
+        maxChangesPerUser: 1,
+        maxInputChars: 500000,
+        requireFullLookback: true,
+        ignoreIdleGate: true,
+        transcriptsDir: '',
+      },
+    });
+  }
+  async function apply(proposal, user = userId, store = db) {
+    return applyUserProposal({
+      db: store,
+      methods,
+      user: { _id: user },
+      memoryConfig,
+      runDir,
+      userProposal: proposal.privateProposal,
+    });
+  }
+  async function expectNoWriteAfter(change, reason = 'voice_evidence_stale') {
+    const proposal = await propose();
+    await change();
+    const result = await apply(proposal);
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(result.changed).toEqual([]);
+    expect(result.conflicts).toEqual([{ key: 'preferences', action: 'set', reason }]);
+  }
+
+  test('read-only dry-run retains prospective proof from the final authoritative sidecar', async () => {
+    const proposal = await propose();
+    expect(proposal.privateProposal.accepted).toHaveLength(1);
+    expect(proposal.privateProposal.accepted[0].voiceEvidenceProofs).toEqual([
+      expect.objectContaining({
+        state: 'proposed',
+        messageId: 'message-owner',
+        callSessionId: 'call-owner',
+        classification: 'owner_call',
+        evidenceEpoch: 2,
+        evidenceHash: voiceMemoryEvidenceHash(message),
+      }),
+    ]);
+    const storedMessage = await db.collection('messages').findOne({ messageId: message.messageId });
+    const storedSession = await db
+      .collection('viventiumcallsessions')
+      .findOne({ callSessionId: session.callSessionId });
+    expect(storedMessage.metadata.viventium.memoryFinalization).toBeUndefined();
+    expect(storedSession.memoryFinalizedEvidenceEpoch).toBeUndefined();
+    expect(storedSession.memoryFinalizationLeaseId).toBeUndefined();
+    expect(spawnSpy).not.toHaveBeenCalled();
+  });
+  test('reviewed apply finalizes exact voice evidence and holds its lease before the existing memory method', async () => {
+    const proposal = await propose();
+    let leaseHeldAtWrite = false;
+    methods.setMemory.mockImplementation(async () => {
+      const m = await db.collection('messages').findOne({ messageId: message.messageId });
+      const s = await db
+        .collection('viventiumcallsessions')
+        .findOne({ callSessionId: session.callSessionId });
+      leaseHeldAtWrite =
+        m.metadata.viventium.memoryFinalization?.state === 'finalized' &&
+        m.metadata.viventium.memoryFinalization.evidenceHash === voiceMemoryEvidenceHash(message) &&
+        s.memoryFinalizedEvidenceEpoch === 2 &&
+        typeof s.memoryFinalizationLeaseId === 'string';
+      return { ok: true, revision: 1 };
+    });
+    const result = await apply(proposal);
+    expect(result.changed).toHaveLength(1);
+    expect(result.conflicts).toEqual([]);
+    expect(leaseHeldAtWrite).toBe(true);
+    expect(methods.setMemory).toHaveBeenCalledTimes(1);
+    expect(
+      (
+        await db
+          .collection('viventiumcallsessions')
+          .findOne({ callSessionId: session.callSessionId })
+      ).memoryFinalizationLeaseId,
+    ).toBeUndefined();
+    expect(spawnSpy).not.toHaveBeenCalled();
+  });
+  test('a changed speaker epoch refuses a reviewed voice write', async () => {
+    await expectNoWriteAfter(() =>
+      db
+        .collection('viventiumcallsessions')
+        .updateOne({ callSessionId: session.callSessionId }, { $inc: { speakerEvidenceEpoch: 1 } }),
+    );
+  });
+  test('a changed authoritative sidecar refuses a reviewed voice write even without an epoch advance', async () => {
+    await expectNoWriteAfter(() =>
+      db.collection('viventiumvoicespeakersegments').updateOne(
+        { callSessionId: session.callSessionId },
+        {
+          $set: {
+            revision: 2,
+            'payload.revision': 2,
+            'payload.uncertain': true,
+          },
+        },
+      ),
+    );
+  });
+  test('a durable cancellation suppression refuses a reviewed voice write', async () => {
+    await expectNoWriteAfter(() =>
+      db
+        .collection('viventiumvoicetasksuppressions')
+        .insertOne({ taskId: 'task-owner', expiresAt: null }),
+    );
+  });
+  test('missing authoritative sidecar refuses a reviewed voice write', async () => {
+    await expectNoWriteAfter(() => db.collection('viventiumvoicespeakersegments').deleteMany({}));
+  });
+  test('nonterminal call state refuses a reviewed voice write', async () => {
+    await expectNoWriteAfter(() =>
+      db
+        .collection('viventiumcallsessions')
+        .updateOne({ callSessionId: session.callSessionId }, { $set: { callStatus: 'listening' } }),
+    );
+  });
+  test('wrong user cannot finalize or write another user reviewed voice evidence', async () => {
+    const proposal = await propose();
+    const result = await apply(proposal, otherUserId);
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(result.changed).toEqual([]);
+    expect(result.conflicts[0].reason).toBe('voice_evidence_stale');
+    expect(
+      (await db.collection('messages').findOne({ messageId: message.messageId })).metadata.viventium
+        .memoryFinalization,
+    ).toBeUndefined();
+  });
+  test('old empty-proof voice proposal cannot bypass speaker revalidation', async () => {
+    const proposal = await propose();
+    proposal.privateProposal.accepted[0].voiceEvidenceProofs = [];
+    const result = await apply(proposal);
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(result.conflicts).toEqual([
+      { key: 'preferences', action: 'set', reason: 'voice_evidence_proof_invalid' },
+    ]);
+  });
+  test('partial voice proofs cannot omit a second cited voice message', async () => {
+    const proposal = await propose();
+    const second = { ...message, _id: undefined, messageId: 'message-second-owner' };
+    await db.collection('messages').insertOne(second);
+    proposal.privateProposal.accepted[0].evidence.push({
+      source: 'conversation',
+      messageId: second.messageId,
+      createdAt: second.createdAt.toISOString(),
+    });
+    const result = await apply(proposal);
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(result.conflicts).toEqual([
+      { key: 'preferences', action: 'set', reason: 'voice_evidence_proof_invalid' },
+    ]);
+  });
+  test('wrong call proof cannot finalize evidence or acquire another call lease', async () => {
+    const proposal = await propose();
+    await db
+      .collection('viventiumcallsessions')
+      .insertOne({ ...session, _id: undefined, callSessionId: 'call-other', userId: otherUserId });
+    proposal.privateProposal.accepted[0].voiceEvidenceProofs[0] = {
+      state: 'proposed',
+      messageId: message.messageId,
+      callSessionId: 'call-other',
+      classification: 'owner_call',
+      evidenceEpoch: 2,
+      evidenceHash: voiceMemoryEvidenceHash(message),
+    };
+    const result = await apply(proposal);
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(result.conflicts[0].reason).toBe('voice_evidence_stale');
+    const other = await db
+      .collection('viventiumcallsessions')
+      .findOne({ callSessionId: 'call-other' });
+    expect(other.memoryFinalizationLeaseId).toBeUndefined();
+    expect(other.memoryFinalizedEvidenceEpoch).toBeUndefined();
+    expect(
+      (await db.collection('messages').findOne({ messageId: message.messageId })).metadata.viventium
+        .memoryFinalization,
+    ).toBeUndefined();
+  });
+  test('proposal replay retains the existing memory revision refusal', async () => {
+    const proposal = await propose();
+    methods.setMemory
+      .mockResolvedValueOnce({ ok: true, revision: 1 })
+      .mockResolvedValueOnce({ ok: false, conflict: true });
+    expect((await apply(proposal)).changed).toHaveLength(1);
+    const replay = await apply(proposal);
+    expect(replay.changed).toEqual([]);
+    expect(replay.conflicts).toEqual([
+      { key: 'preferences', action: 'set', reason: 'revision_conflict' },
+    ]);
+    expect(methods.setMemory).toHaveBeenCalledTimes(2);
+  });
+  test('ordinary conversation apply retains the existing method and has no voice finalization', async () => {
+    const proposal = await propose({ ordinary: true });
+    expect(proposal.privateProposal.accepted[0].voiceEvidenceProofs).toEqual([]);
+    const result = await apply(proposal);
+    expect(result.changed).toHaveLength(1);
+    expect(result.conflicts).toEqual([]);
+    expect(methods.setMemory).toHaveBeenCalledTimes(1);
+    expect(
+      (
+        await db
+          .collection('viventiumcallsessions')
+          .findOne({ callSessionId: session.callSessionId })
+      ).memoryFinalizedEvidenceEpoch,
+    ).toBeUndefined();
+  });
+  test('critic: removed cited voice message cannot bypass an old empty proof', async () => {
+    const proposal = await propose();
+    proposal.privateProposal.accepted[0].voiceEvidenceProofs = [];
+    await db.collection('messages').deleteOne({ messageId: message.messageId });
+    const result = await apply(proposal);
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(result.changed).toEqual([]);
+  });
+  test('critic: foreign cited voice message cannot bypass an old empty proof', async () => {
+    const proposal = await propose();
+    proposal.privateProposal.accepted[0].voiceEvidenceProofs = [];
+    await db
+      .collection('messages')
+      .updateOne({ messageId: message.messageId }, { $set: { user: otherUserId } });
+    const result = await apply(proposal);
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(result.changed).toEqual([]);
+  });
+  test('critic: foreign session owner cannot finalize or write reviewed voice evidence', async () => {
+    const proposal = await propose();
+    await db
+      .collection('viventiumcallsessions')
+      .updateOne({ callSessionId: session.callSessionId }, { $set: { userId: otherUserId } });
+    const result = await apply(proposal);
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(result.changed).toEqual([]);
+  });
+
+  test('a foreign call session cannot enter read-only prospective voice evidence', async () => {
+    await db
+      .collection('viventiumcallsessions')
+      .updateOne({ callSessionId: session.callSessionId }, { $set: { userId: otherUserId } });
+    const eligible = await fetchRecentMemoryMessages({
+      db,
+      userId,
+      since: new Date(0),
+      persistFinalizationMarkers: false,
+    });
+    expect(eligible).toEqual([]);
+    const stored = await db
+      .collection('viventiumcallsessions')
+      .findOne({ callSessionId: session.callSessionId });
+    expect(stored.memoryFinalizedEvidenceEpoch).toBeUndefined();
+    expect(stored.memoryFinalizationLeaseId).toBeUndefined();
+    expect(spawnSpy).not.toHaveBeenCalled();
+  });
+  test('a durable proof cannot acquire a foreign call session apply lease', async () => {
+    const proposal = await propose();
+    await fetchRecentMemoryMessages({ db, userId, since: new Date(0) });
+    delete proposal.privateProposal.accepted[0].voiceEvidenceProofs[0].state;
+    await db
+      .collection('viventiumcallsessions')
+      .updateOne({ callSessionId: session.callSessionId }, { $set: { userId: otherUserId } });
+    const before = await db
+      .collection('viventiumcallsessions')
+      .findOne({ callSessionId: session.callSessionId });
+    const result = await apply(proposal);
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(result.changed).toEqual([]);
+    expect(result.conflicts[0].reason).toBe('voice_evidence_stale');
+    expect(
+      await db
+        .collection('viventiumcallsessions')
+        .findOne({ callSessionId: session.callSessionId }),
+    ).toEqual(before);
+  });
+  test('an ownership change between reconciliation and finalization cannot mutate the foreign call', async () => {
+    const proposal = await propose();
+    const collection = db.collection('viventiumcallsessions');
+    let changedOwner = false;
+    const store = {
+      collection(name) {
+        const target = db.collection(name);
+        if (name !== 'viventiumcallsessions') return target;
+        return new Proxy(target, {
+          get(value, property) {
+            if (property === 'updateOne') {
+              return async (filter, update) => {
+                if (!changedOwner && update.$set?.memoryFinalizationLeaseId) {
+                  changedOwner = true;
+                  await collection.updateOne(
+                    { callSessionId: session.callSessionId },
+                    { $set: { userId: otherUserId } },
+                  );
+                }
+                return target.updateOne(filter, update);
+              };
+            }
+            const member = value[property];
+            return typeof member === 'function' ? member.bind(value) : member;
+          },
+        });
+      },
+    };
+    const result = await apply(proposal, userId, store);
+    expect(changedOwner).toBe(true);
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(result.changed).toEqual([]);
+    expect(result.conflicts[0].reason).toBe('voice_evidence_stale');
+    const foreign = await collection.findOne({ callSessionId: session.callSessionId });
+    expect(foreign.userId).toBe(otherUserId);
+    expect(foreign.memoryFinalizedEvidenceEpoch).toBeUndefined();
+    expect(foreign.memoryFinalizationLeaseId).toBeUndefined();
+    expect(
+      (await db.collection('messages').findOne({ messageId: message.messageId })).metadata.viventium
+        .memoryFinalization,
+    ).toBeUndefined();
+  });
+  test('an ownership change during a memory write loses the lease and rolls back the exact value', async () => {
+    methods.getAllUserMemories.mockResolvedValue([
+      { key: 'preferences', value: 'Prior synthetic preference.', tokenCount: 4, __v: 0 },
+    ]);
+    const proposal = await propose();
+    methods.setMemory
+      .mockImplementationOnce(async () => {
+        await db
+          .collection('viventiumcallsessions')
+          .updateOne({ callSessionId: session.callSessionId }, { $set: { userId: otherUserId } });
+        return { ok: true, revision: 1 };
+      })
+      .mockResolvedValueOnce({ ok: true, revision: 2 });
+    const result = await apply(proposal);
+    expect(result.changed).toEqual([]);
+    expect(result.conflicts[0].reason).toBe('voice_evidence_stale');
+    expect(methods.setMemory).toHaveBeenCalledTimes(2);
+    expect(methods.setMemory).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        userId,
+        key: 'preferences',
+        value: 'Prior synthetic preference.',
+        expectedRevision: 1,
+      }),
+    );
+    const foreign = await db
+      .collection('viventiumcallsessions')
+      .findOne({ callSessionId: session.callSessionId });
+    expect(foreign.userId).toBe(otherUserId);
+    expect(typeof foreign.memoryFinalizationLeaseId).toBe('string');
+  });
+  test('critic: typed voice without call identity cannot bypass post-call proof', async () => {
+    await db
+      .collection('messages')
+      .updateOne(
+        { messageId: message.messageId },
+        { $unset: { 'metadata.viventium.callSessionId': '' } },
+      );
+    const proposal = await propose();
+    expect(proposal.privateProposal.accepted).toHaveLength(1);
+    expect(proposal.privateProposal.accepted[0].voiceEvidenceProofs).toEqual([]);
+    const result = await apply(proposal);
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(result.changed).toEqual([]);
+  });
+  test.each([null, '', '   ', 1])(
+    'typed Call with invalid identity %p cannot bypass post-call proof',
+    async (callSessionId) => {
+      await db
+        .collection('messages')
+        .updateOne(
+          { messageId: message.messageId },
+          { $set: { 'metadata.viventium.callSessionId': callSessionId } },
+        );
+      const proposal = await propose();
+      expect(proposal.privateProposal.accepted).toHaveLength(1);
+      expect(proposal.privateProposal.accepted[0].voiceEvidenceProofs).toEqual([]);
+      const result = await apply(proposal);
+      expect(methods.setMemory).not.toHaveBeenCalled();
+      expect(result.changed).toEqual([]);
+      expect(result.conflicts[0].reason).toBe('voice_evidence_proof_invalid');
+    },
+  );
+  test('native voice_call input mode without call identity also requires a proof', async () => {
+    await db.collection('messages').updateOne(
+      { messageId: message.messageId },
+      {
+        $unset: { 'metadata.viventium.callSessionId': '', 'metadata.viventium.source': '' },
+        $set: { 'metadata.viventium.inputMode': 'voice_call' },
+      },
+    );
+    const proposal = await propose();
+    expect(proposal.privateProposal.accepted).toHaveLength(1);
+    const result = await apply(proposal);
+    expect(methods.setMemory).not.toHaveBeenCalled();
+    expect(result.changed).toEqual([]);
+    expect(result.conflicts[0].reason).toBe('voice_evidence_proof_invalid');
+  });
+  test.each(['wing', 'listen_only'])(
+    'malformed %s Call cannot bypass proof through a scoped memory key',
+    async (mode) => {
+      await db.collection('messages').updateOne(
+        { messageId: message.messageId },
+        {
+          $unset: { 'metadata.viventium.callSessionId': '' },
+          $set: { 'metadata.viventium.mode': mode },
+        },
+      );
+      const proposal = await propose({ key: 'moments' });
+      expect(proposal.privateProposal.accepted).toHaveLength(1);
+      const result = await apply(proposal);
+      expect(methods.setMemory).not.toHaveBeenCalled();
+      expect(result.changed).toEqual([]);
+      expect(result.conflicts[0].reason).toBe('voice_evidence_proof_invalid');
+    },
+  );
+  test.each([
+    ['web', 'text'],
+    ['telegram', 'text'],
+    ['telegram', 'voice_note'],
+  ])(
+    'ordinary %s %s input retains the normal writer without Call proof',
+    async (surface, inputMode) => {
+      await db
+        .collection('messages')
+        .updateOne(
+          { messageId: message.messageId },
+          { $set: { 'metadata.viventium': { surface, inputMode } } },
+        );
+      const proposal = await propose();
+      expect(proposal.privateProposal.accepted).toHaveLength(1);
+      expect(proposal.privateProposal.accepted[0].voiceEvidenceProofs).toEqual([]);
+      const result = await apply(proposal);
+      expect(result.changed).toHaveLength(1);
+      expect(result.conflicts).toEqual([]);
+      expect(methods.setMemory).toHaveBeenCalledTimes(1);
+    },
+  );
+  test('legacy scalar owner Call with valid identity retains existing finalization and apply', async () => {
+    await db.collection('messages').updateOne(
+      { messageId: message.messageId },
+      {
+        $unset: { 'metadata.viventium.speakerSegments': '' },
+        $set: {
+          'metadata.viventium.speakerLabel': 'Synthetic Owner',
+          'metadata.viventium.actorTrust': 'owner_participant',
+        },
+      },
+    );
+    const proposal = await propose();
+    expect(proposal.privateProposal.accepted).toHaveLength(1);
+    expect(proposal.privateProposal.accepted[0].voiceEvidenceProofs).toEqual([
+      expect.objectContaining({
+        state: 'proposed',
+        callSessionId: session.callSessionId,
+        classification: 'owner_call',
+      }),
+    ]);
+    const result = await apply(proposal);
+    expect(result.changed).toHaveLength(1);
+    expect(result.conflicts).toEqual([]);
+    expect(methods.setMemory).toHaveBeenCalledTimes(1);
+  });
+  test('legacy noncall audio metadata retains ordinary evidence without inventing Call identity', async () => {
+    await db.collection('messages').updateOne(
+      { messageId: message.messageId },
+      {
+        $set: {
+          'metadata.viventium': {
+            surface: 'voice',
+            inputMode: 'voice_note',
+            speakerLabel: 'Synthetic Owner',
+            actorTrust: 'owner_participant',
+          },
+        },
+      },
+    );
+    const proposal = await propose();
+    expect(proposal.privateProposal.accepted).toHaveLength(1);
+    expect(proposal.privateProposal.accepted[0].voiceEvidenceProofs).toEqual([]);
+    const result = await apply(proposal);
+    expect(result.changed).toHaveLength(1);
+    expect(result.conflicts).toEqual([]);
+    expect(methods.setMemory).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(['   ', 1])(
+    'a malformed retained identity %p cannot weaken the existing proof guard',
+    async (callSessionId) => {
+      await db
+        .collection('messages')
+        .updateOne(
+          { messageId: message.messageId },
+          { $set: { 'metadata.viventium': { callSessionId } } },
+        );
+      const proposal = await propose();
+      expect(proposal.privateProposal.accepted).toHaveLength(1);
+      expect(proposal.privateProposal.accepted[0].voiceEvidenceProofs).toEqual([]);
+      const result = await apply(proposal);
+      expect(methods.setMemory).not.toHaveBeenCalled();
+      expect(result.changed).toEqual([]);
+      expect(result.conflicts[0].reason).toBe('voice_evidence_proof_invalid');
+    },
+  );
 });

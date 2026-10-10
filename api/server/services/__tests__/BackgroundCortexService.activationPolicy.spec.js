@@ -88,6 +88,78 @@ const exactOutboxReceipt = (batch) => ({
 });
 
 describe('BackgroundCortexService activation policy helpers', () => {
+  test('read-only text compactor preserves zero-tool option through the real cortex attempt', async () => {
+    const prepareCapabilityFn = jest.fn(async () => undefined);
+    const agent = {
+      id: 'synthetic-compactor',
+      provider: 'openai',
+      model: 'test-model',
+      tools: [],
+      instructions: '',
+      model_parameters: { model: 'test-model' },
+    };
+    const result = await executeCortexOnce(
+      {
+        agent,
+        messages: [],
+        runId: 'synthetic-compact-run',
+        conversationId: 'synthetic-compaction',
+        contextMode: 'minimal',
+        mainContextBinding: 'isolated',
+        completedResultPolicy: 'internal',
+        nativeTools: false,
+        req: {
+          user: { id: 'owner-synthetic' },
+          body: {},
+          config: {
+            endpoints: {
+              agents: {
+                allowedProviders: ['openai'],
+                providerCapabilities: {},
+              },
+            },
+          },
+        },
+      },
+      {
+        initializeAgentFn: jest.fn(async () => ({
+          ...agent,
+          model_parameters: { model: 'test-model', configuration: { defaultHeaders: {} } },
+        })),
+        createRunFn: jest.fn(async () => ({
+          processStream: jest.fn(async () => [{ type: 'text', text: 'done' }]),
+        })),
+        prepareCapabilityFn,
+      },
+    );
+    expect(result.error).toBeUndefined();
+    expect(prepareCapabilityFn).toHaveBeenCalledWith(
+      expect.objectContaining({ nativeTools: false }),
+    );
+  });
+  test('read-only text compactor carries explicit zero-tool option to attach and refresh', async () => {
+    const attachBundle = jest.fn(async () => true),
+      installRefresher = jest.fn();
+    const targetAgent = { tools: [] },
+      declaredAgent = { tools: [], viventiumProviderSessionMode: 'stateless' };
+    await prepareCortexConversationProviderCapability({
+      targetAgent,
+      declaredAgent,
+      req: {},
+      capability: { workspace_binding: true },
+      requestBody: {},
+      nativeTools: false,
+      attachBundle,
+      installRefresher,
+    });
+    expect(attachBundle).toHaveBeenCalledWith(expect.objectContaining({ nativeTools: false }));
+    expect(installRefresher).toHaveBeenCalledWith(expect.objectContaining({ nativeTools: false }));
+    expect(targetAgent.model_parameters.configuration.defaultHeaders).toMatchObject({
+      'X-GlassHive-Access': 'read_only',
+      'X-GlassHive-Provider-Session-Mode': 'stateless',
+    });
+  });
+
   beforeEach(() => {
     mockPersistCortexPartsToCanonicalMessage.mockClear();
   });
@@ -133,7 +205,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
     };
     captureMainContextSnapshot(req, {
       agent: mainAgent,
-      messages: [{ role: 'user', content: 'Current user input.' }],
+      messages: [{ messageId: 'c43-current-input', role: 'user', content: 'Current user input.' }],
       visibleMessages: [
         {
           messageId: 'c43-current-input',

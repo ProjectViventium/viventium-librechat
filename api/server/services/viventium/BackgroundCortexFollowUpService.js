@@ -17,9 +17,15 @@ const {
   applyDeclaredProviderTransport,
   buildGlassHiveNativeMediaContent,
   createSafeUser,
+  createNativeBootstrapFetch,
+  createNativeCapacityFetch,
   initializeAnthropic,
   initializeOpenAI,
+  inspectProviderDeliveryDisposition,
+  isAudioDeliveryRequested,
   renderGlassHiveNativeMediaLinks,
+  resolveEffectiveDeliveryDisposition,
+  supportsMessagingDeliveryDisposition,
   resolveHeaders,
 } = require('@librechat/api');
 const { HumanMessage } = require('@librechat/agents/langchain/messages');
@@ -143,10 +149,15 @@ const {
   logFeelingsEvent,
   summarizeFeelingCapsulePlacement,
 } = require('~/server/services/viventium/feelingsTelemetry');
-const { pinFeelingCapsuleLast } = require('~/server/services/viventium/feelingPromptTail');
+const {
+  buildViventiumDynamicTail,
+  pinViventiumDynamicTailLast,
+} = require('~/server/services/viventium/feelingPromptTail');
 const {
   attachConversationProviderCapabilityBundle,
   buildHarnessIdempotencyKey,
+  bindConversationProviderDeveloperInstructionTail,
+  restrictedConversationProviderBootstrapHeaders,
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
 const { parseDeliveryControls } = require('~/server/services/viventium/deliveryControls');
 /* === VIVENTIUM NOTE === */
@@ -157,6 +168,42 @@ const { parseDeliveryControls } = require('~/server/services/viventium/deliveryC
 const { buildNoResponseInstructions } = require('~/server/services/viventium/noResponsePrompt');
 /* === VIVENTIUM NOTE === */
 /* === VIVENTIUM NOTE === */
+
+/* === VIVENTIUM START === Owned recovery after a refused Native admission. === */
+const occupiedCortexRecovery = Symbol('occupiedCortexRecovery');
+const OCCUPIED_CORTEX_FAILURE = Object.freeze({
+  status: 409,
+  code: 'conversation_session_authority_conflict',
+});
+function bindOccupiedCortexRecovery(req, recheck) {
+  if (!req || typeof recheck !== 'function')
+    throw new TypeError('Cortex recovery requires its owner check');
+  Object.defineProperty(req, occupiedCortexRecovery, { value: recheck });
+}
+async function refreshOccupiedCortexRecovery(req, { allowWaiting = false } = {}) {
+  const recheck = req?.[occupiedCortexRecovery];
+  if (!recheck) return false;
+  const authority = await recheck();
+  if (authority?.state === 'suppressed') return authority.dropReason || 'voice_task_suppressed';
+  if (authority?.state === 'waiting' && !allowWaiting) {
+    throw Object.assign(new Error('The original Call is waiting for its gateway lease'), {
+      code: 'cortex_voice_recovery_authority_pending',
+    });
+  }
+  if (!['live', 'linked_text', 'waiting'].includes(authority?.state)) {
+    throw Object.assign(new Error('Cortex recovery authority is unavailable'), {
+      code: 'cortex_voice_recovery_scope_mismatch',
+    });
+  }
+  req.body.viventiumCallSessionId = authority.callSessionId;
+  req.body.viventiumVoiceTaskId = authority.taskId;
+  req.body.voiceMode = authority.state === 'live';
+  req.body.viventiumInputMode = authority.state === 'live' ? 'voice_call' : 'text';
+  if (authority.state === 'live') req.viventiumCallSession = authority.session;
+  else delete req.viventiumCallSession;
+  return false;
+}
+/* === VIVENTIUM END === */
 
 const CORTEX_TYPES = new Set([
   ContentTypes.CORTEX_ACTIVATION,
@@ -190,7 +237,9 @@ const MAIN_TURN_CARRIER_HEADERS = new Set([
   'x-viventium-logical-turn-id',
   'x-viventium-logical-turn-revision',
   'x-viventium-visible-message-chain-b64',
+  'x-viventium-audio-eligible',
   'x-glasshive-developer-instruction-tail-b64',
+  'x-glasshive-stable-authority-sha256',
 ]);
 
 function withoutMainTurnCarrierHeaders(headers) {
@@ -565,7 +614,14 @@ function claimedCortexPresentationClaimToken(deliveryBatch) {
   return tokens.size === 1 ? [...tokens][0] : '';
 }
 
-function resolveCortexInsightDropReason({ decision } = {}) {
+function resolveCortexInsightDropReason({ decision, generationFailure } = {}) {
+  if (
+    decision?.generationFailed === true &&
+    generationFailure?.status === OCCUPIED_CORTEX_FAILURE.status &&
+    generationFailure?.code === OCCUPIED_CORTEX_FAILURE.code
+  ) {
+    return 'native_session_occupied';
+  }
   if (decision?.generationFailed === true) {
     return 'generation_failed_without_fallback';
   }
@@ -1966,6 +2022,11 @@ async function resolveFollowUpLLMConfig({
           'X-GlassHive-Fallback-Reasoning-Effort': String(options?.fallback_reasoning_effort ?? ''),
         };
       }
+      if (req[occupiedCortexRecovery] && followUpCapability?.workspace_binding === true) {
+        // Recovery holds source/read authority, never a reconstructed microphone action grant.
+        // The existing signed zero-tool bundle overrides any inherited executable bootstrap.
+        runtimeHeaders = { ...runtimeHeaders, ...restrictedConversationProviderBootstrapHeaders() };
+      }
       llmConfig.provider = Providers.OPENAI;
       llmConfig.apiKey = customConfig.apiKey;
       llmConfig.configuration = {
@@ -2532,7 +2593,7 @@ function buildFollowUpSystemPrompt({
     continuation_contract: continuationContract,
     no_response_instructions: noResponseInstructions || '',
   });
-  return pinFeelingCapsuleLast({
+  return pinViventiumDynamicTailLast({
     instructions: registeredPrompt,
     capsule: feelingCapsule,
   });
@@ -2610,20 +2671,9 @@ function resolvePhaseBFeelingContext(snapshot) {
   };
 }
 
-/* A same-session continuation already retains the capsule from the authored main turn. */
-function resolvePhaseBFeelingInjection({
-  feelingContext,
-  providerCapability,
-  primaryResponseMode = false,
-} = {}) {
+/* This injector authors the distinct phase_b:followup session, including its current state. */
+function resolvePhaseBFeelingInjection({ feelingContext } = {}) {
   const capsule = String(feelingContext?.capsule || '');
-  if (
-    capsule &&
-    primaryResponseMode !== true &&
-    providerCapability?.conversation_session === true
-  ) {
-    return { capsule: '', reason: 'preserved_in_conversation_session' };
-  }
   return { capsule, reason: feelingContext?.reason || 'capsule_unavailable' };
 }
 /* === VIVENTIUM END === */
@@ -2717,6 +2767,7 @@ async function promoteForcedFollowUpToEmptyParent({
   parentMessageId,
   text,
   telegramDeliveryControls,
+  deliveryDisposition,
   insightsData,
   forceVisibleFollowUp,
   scheduleId,
@@ -2765,7 +2816,11 @@ async function promoteForcedFollowUpToEmptyParent({
       dropErrorParts: true,
     });
     const existingViventium = existing.metadata?.viventium || {};
-    const { deliveryAcknowledgement: _staleAcknowledgement, ...priorMetadata } = existingViventium;
+    const {
+      deliveryAcknowledgement: _staleAcknowledgement,
+      deliveryDisposition: _staleDisposition,
+      ...priorMetadata
+    } = existingViventium;
     const nextRevision =
       Math.max(
         1,
@@ -2795,6 +2850,7 @@ async function promoteForcedFollowUpToEmptyParent({
             }
           : {}),
         telegramDeliveryControls: telegramDeliveryControls || undefined,
+        ...(deliveryDisposition ? { deliveryDisposition } : {}),
         recoveredPrimaryErrorClasses:
           recoveredPrimaryErrorClasses.length > 0 ? recoveredPrimaryErrorClasses : undefined,
       },
@@ -2822,7 +2878,7 @@ async function promoteForcedFollowUpToEmptyParent({
       {
         messageId: parentMessageId,
         text: normalizedText,
-        content: nextContent,
+        content: promotedMessage.content,
         metadata: nextMetadata,
         unfinished: false,
         error: false,
@@ -2886,6 +2942,7 @@ async function generateFollowUpText({
   primaryResponseMode = false,
   conversationId = '',
   parentMessageId = '',
+  onDeliveryDisposition,
 }) {
   if (!agent) {
     return '';
@@ -2983,10 +3040,23 @@ async function generateFollowUpText({
   const phaseBFeelingContext = resolvePhaseBFeelingContext(req?._viventiumFeelingSnapshot);
   const followUpProviderCapability =
     req?.config?.endpoints?.agents?.providerCapabilities?.[providerName];
+  const supportsDeliveryDisposition = supportsMessagingDeliveryDisposition(
+    followUpProviderCapability,
+  );
+  const audioEligible = supportsDeliveryDisposition && isAudioDeliveryRequested(req);
+  let capturedDeliveryDisposition = { status: 'missing' };
+  if (supportsDeliveryDisposition) {
+    llmConfig.configuration = {
+      ...(llmConfig.configuration || {}),
+      defaultHeaders: {
+        ...(llmConfig.configuration?.defaultHeaders || {}),
+        'X-Viventium-Audio-Eligible': String(isAudioDeliveryRequested(req)),
+      },
+    };
+    llmConfig.__includeRawResponse = true;
+  }
   const phaseBFeelingInjection = resolvePhaseBFeelingInjection({
     feelingContext: phaseBFeelingContext,
-    providerCapability: followUpProviderCapability,
-    primaryResponseMode,
   });
   const systemPrompt = buildFollowUpSystemPrompt({
     primaryResponseMode,
@@ -2994,6 +3064,12 @@ async function generateFollowUpText({
     noResponseInstructions,
     feelingCapsule: phaseBFeelingInjection.capsule,
   });
+  const followUpAuthority = { model_parameters: { configuration: llmConfig.configuration } };
+  bindConversationProviderDeveloperInstructionTail({
+    targetAgent: followUpAuthority,
+    tail: buildViventiumDynamicTail({ capsule: phaseBFeelingInjection.capsule }),
+  });
+  llmConfig.configuration = followUpAuthority.model_parameters.configuration;
   const feelingPlacement = summarizeFeelingCapsulePlacement({
     instructions: systemPrompt,
     capsule: phaseBFeelingInjection.capsule,
@@ -3049,6 +3125,20 @@ async function generateFollowUpText({
   );
   /* === VIVENTIUM END === */
 
+  /* === VIVENTIUM START === Signed Native bootstrap precedes dispatch identity. === */
+  if (llmConfig.configuration?.defaultHeaders?.['X-GlassHive-Agent-Id']) {
+    let nativeFetch = llmConfig.configuration.fetch || globalThis.fetch;
+    if (hasDurableFollowUpReattachContract(followUpProviderCapability, llmConfig)) {
+      nativeFetch = createNativeCapacityFetch(nativeFetch, {
+        waitForOccupiedSession: true,
+        streamId: req?._resumableStreamId || runId,
+        role: 'cortex',
+      });
+    }
+    llmConfig.configuration.fetch = createNativeBootstrapFetch(nativeFetch);
+  }
+  /* === VIVENTIUM END === */
+
   const run = await Run.create({
     runId: `${runId || 'followup'}-followup`,
     graphConfig: {
@@ -3057,6 +3147,19 @@ async function generateFollowUpText({
       tools: [],
       instructions: systemPrompt,
     },
+    ...(audioEligible
+      ? {
+          customHandlers: {
+            on_chat_model_end: {
+              handle: (_event, data) => {
+                if (Array.isArray(data?.output?.tool_calls) && data.output.tool_calls.length > 0)
+                  return;
+                capturedDeliveryDisposition = inspectProviderDeliveryDisposition(data?.output);
+              },
+            },
+          },
+        }
+      : {}),
     returnContent: true,
   });
 
@@ -3130,6 +3233,12 @@ async function generateFollowUpText({
   }
 
   const rawText = String(text || '').trim();
+  const deliveryDisposition = resolveEffectiveDeliveryDisposition({
+    audioEligible,
+    legacySkipVoice: parseDeliveryControls(rawText).skipVoice,
+    captured: capturedDeliveryDisposition,
+  });
+  if (typeof onDeliveryDisposition === 'function') onDeliveryDisposition(deliveryDisposition);
   if (rawText.length === 0) {
     return '';
   }
@@ -3166,12 +3275,18 @@ async function prepareCortexFollowUpMessage({
   recentResponse,
   forceVisibleFollowUp = false,
 }) {
+  const recoverySuppression = req?.[occupiedCortexRecovery]
+    ? await refreshOccupiedCortexRecovery(req)
+    : false;
+  if (recoverySuppression) return { suppressed: true, dropReason: recoverySuppression };
   const voiceTaskId = String(req?.body?.viventiumVoiceTaskId || '').trim();
   if (voiceTaskId && (await isFollowUpVoiceTaskSuppressed(req, voiceTaskId))) {
     return { suppressed: true };
   }
   let text = '';
+  let deliveryDisposition = null;
   let generationFailed = false;
+  let generationFailure;
   const hasInsights = Array.isArray(insightsData?.insights) && insightsData.insights.length > 0;
   const voiceMode = isVoiceMode(req);
   const surface = resolveViventiumSurface(req);
@@ -3242,9 +3357,18 @@ async function prepareCortexFollowUpMessage({
         primaryResponseMode: shouldForceVisibleFollowUp,
         conversationId,
         parentMessageId,
+        onDeliveryDisposition: (disposition) => {
+          deliveryDisposition = disposition;
+        },
       });
     } catch (err) {
       generationFailed = true;
+      if (
+        getFollowUpErrorStatus(err) === 409 &&
+        getFollowUpErrorCode(err) === 'CONVERSATION_SESSION_AUTHORITY_CONFLICT'
+      ) {
+        generationFailure = { ...OCCUPIED_CORTEX_FAILURE };
+      }
       const failure = sanitizeFollowUpErrorForLog(err);
       logger.warn(
         `[BackgroundCortexFollowUpService] Failed to generate LLM follow-up text: name=${failure.name || 'unknown'} status=${failure.status ?? 'none'} code=${failure.code || 'none'}`,
@@ -3270,7 +3394,11 @@ async function prepareCortexFollowUpMessage({
       (finalContinuationContext.currentLeafMessageId !== continuationContext.currentLeafMessageId ||
         finalContinuationContext.contextText !== continuationContext.contextText ||
         finalContinuationContext.messageCount !== continuationContext.messageCount);
-    if (contextChangedDuringGeneration && shouldForceVisibleFollowUp !== true) {
+    if (
+      contextChangedDuringGeneration &&
+      shouldForceVisibleFollowUp !== true &&
+      !durableMissionEvidence
+    ) {
       logger.info(
         `[BackgroundCortexFollowUpService] Suppressing generated follow-up because conversation moved during follow-up generation: conversationId=${conversationId || ''} parent=${parentMessageId || ''} currentLeaf=${finalContinuationContext.currentLeafMessageId || ''}`,
       );
@@ -3302,6 +3430,10 @@ async function prepareCortexFollowUpMessage({
     };
   }
 
+  const lateRecoverySuppression = req?.[occupiedCortexRecovery]
+    ? await refreshOccupiedCortexRecovery(req, { allowWaiting: true })
+    : false;
+  if (lateRecoverySuppression) return { suppressed: true, dropReason: lateRecoverySuppression };
   const followUpDecisionRecord = buildFollowUpDecisionRecord({
     req,
     conversationId,
@@ -3316,19 +3448,66 @@ async function prepareCortexFollowUpMessage({
     finalContinuationContext,
   });
 
+  if (generationFailure) followUpDecisionRecord.generationFailure = generationFailure;
+  if (req?.[occupiedCortexRecovery])
+    followUpDecisionRecord.recoveryCause = { ...OCCUPIED_CORTEX_FAILURE };
+
   return {
     suppressed: false,
     voiceTaskId,
     text,
     telegramDeliveryControls,
+    deliveryDisposition,
     followUpDecisionRecord,
     conversationMessages,
     finalContinuationContext,
     shouldForceVisibleFollowUp,
+    durableMissionEvidence,
     scheduleId,
     decision,
   };
 }
+
+/* === VIVENTIUM START === Retry the existing exact child wake without claiming speech. === */
+async function publishCortexVoiceFollowUp({
+  ownerId,
+  callSessionId,
+  voiceTaskId,
+  conversationId,
+  parentMessageId,
+  messageId,
+  dependencies = null,
+}) {
+  if (!ownerId || !callSessionId || !voiceTaskId || !messageId || messageId === parentMessageId)
+    return false;
+  const tasks = dependencies || require('./VoiceTaskService');
+  const task = await tasks.hydrateVoiceTask(voiceTaskId, {
+    callSessionId,
+    userId: ownerId,
+    requireDurable: true,
+  });
+  const owner = tasks.getVoiceTaskOwnerBinding(voiceTaskId);
+  if (
+    !task ||
+    task.taskId !== voiceTaskId ||
+    task.callSessionId !== callSessionId ||
+    task.conversationId !== conversationId ||
+    !owner ||
+    owner.taskId !== voiceTaskId ||
+    owner.userId !== ownerId ||
+    owner.callSessionId !== callSessionId ||
+    owner.conversationId !== conversationId
+  )
+    return false;
+  tasks.observeGenerationEvent(voiceTaskId, {
+    event: 'on_cortex_followup',
+    data: { messageId, parentMessageId, conversationId },
+  });
+  // The existing event key deduplicates this child. Still retry a failed durable flush.
+  await tasks.flushVoiceTaskPersistence();
+  return true;
+}
+/* === VIVENTIUM END === */
 
 async function persistPreparedCortexFollowUpMessage(
   {
@@ -3342,13 +3521,18 @@ async function persistPreparedCortexFollowUpMessage(
   },
   prepared,
 ) {
-  if (!prepared || prepared.suppressed === true) {
+  const recoverySuppression =
+    prepared?.dropReason ||
+    (req?.[occupiedCortexRecovery]
+      ? await refreshOccupiedCortexRecovery(req, { allowWaiting: true })
+      : false);
+  if (!prepared || prepared.suppressed === true || recoverySuppression) {
     if (deliveryBatch?.claimed?.length) {
       await dropCortexInsightDeliveryBatch({
         req,
         parentMessageId,
         deliveryBatch,
-        dropReason: 'voice_task_suppressed',
+        dropReason: recoverySuppression || 'voice_task_suppressed',
       });
     }
     return null;
@@ -3357,10 +3541,12 @@ async function persistPreparedCortexFollowUpMessage(
     voiceTaskId,
     text,
     telegramDeliveryControls,
+    deliveryDisposition,
     followUpDecisionRecord,
     conversationMessages,
     finalContinuationContext,
     shouldForceVisibleFollowUp,
+    durableMissionEvidence,
     scheduleId,
   } = prepared;
   logFollowUpDecisionRecord(req, followUpDecisionRecord);
@@ -3377,7 +3563,10 @@ async function persistPreparedCortexFollowUpMessage(
         parentMessageId,
         deliveryBatch,
         decisionRecord: followUpDecisionRecord,
-        dropReason: resolveCortexInsightDropReason({ decision: prepared.decision }),
+        dropReason: resolveCortexInsightDropReason({
+          decision: prepared.decision,
+          generationFailure: followUpDecisionRecord?.generationFailure,
+        }),
       });
     }
     return null;
@@ -3396,6 +3585,7 @@ async function persistPreparedCortexFollowUpMessage(
     parentMessageId,
     text,
     telegramDeliveryControls,
+    deliveryDisposition,
     insightsData,
     forceVisibleFollowUp: shouldForceVisibleFollowUp,
     scheduleId,
@@ -3471,6 +3661,8 @@ async function persistPreparedCortexFollowUpMessage(
   const metadata = {
     viventium: {
       type: 'cortex_followup',
+      ...(deliveryDisposition ? { deliveryDisposition } : {}),
+      ...(durableMissionEvidence === true ? { followUpSource: 'durable_terminal_callback' } : {}),
       parentMessageId,
       cortexCount: insightsData?.cortexCount ?? undefined,
       replacedParentMessage: false,
@@ -3548,6 +3740,34 @@ async function persistPreparedCortexFollowUpMessage(
     return null;
   }
 
+  /* === VIVENTIUM START === Persisted Cortex publication wakes the existing call task tail. === */
+  if (
+    voiceTaskId &&
+    durableMissionEvidence !== true &&
+    followUpMessage.messageId !== parentMessageId
+  ) {
+    try {
+      await publishCortexVoiceFollowUp({
+        ownerId: String(req?.user?.id || '').trim(),
+        callSessionId: String(
+          req?.viventiumCallSession?.callSessionId || req?.body?.viventiumCallSessionId || '',
+        ).trim(),
+        voiceTaskId,
+        conversationId,
+        parentMessageId,
+        messageId: followUpMessage.messageId,
+      });
+    } catch (error) {
+      logger.warn('[BackgroundCortexFollowUpService] Voice publication wake deferred', {
+        code: String(error?.code || error?.name || 'voice_task_publication_unavailable').slice(
+          0,
+          120,
+        ),
+      });
+    }
+  }
+  /* === VIVENTIUM END === */
+
   return followUpMessage;
 }
 
@@ -3602,6 +3822,8 @@ async function createCortexFollowUpMessage(input) {
 }
 
 module.exports = {
+  publishCortexVoiceFollowUp,
+  bindOccupiedCortexRecovery,
   persistCortexFollowUpMessageWithLedger,
   resolveCortexInsightDropReason,
   settleSuppressedCortexInsightDeliveries,

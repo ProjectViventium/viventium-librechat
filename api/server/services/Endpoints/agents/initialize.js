@@ -21,6 +21,7 @@ const { performance } = require('perf_hooks');
 const {
   calcVoiceLatencyDurationMs,
   formatVoiceLatencyTiming,
+  logVoiceLatencyNumericStage,
   voiceLatencyNow,
 } = require('~/server/services/viventium/voiceLatencyTiming');
 const { createContentAggregator } = require('@librechat/agents');
@@ -35,6 +36,7 @@ const {
   getCustomEndpointConfig,
   createSequentialChainEdges,
   applyAgentProviderCapabilityDefaults,
+  retainAggregatedDeliveryDisposition,
 } = require('@librechat/api');
 const {
   EModelEndpoint,
@@ -102,6 +104,7 @@ const {
   attachConversationProviderCapabilityBundle,
   bindConversationProviderStableAuthorityDigest,
   bindHarnessCancellation,
+  prepareRestrictedVoiceCancellation,
   conversationProviderStableAuthorityDigest,
   installConversationProviderCapabilityRefresher,
   resolveConversationProviderId,
@@ -114,6 +117,7 @@ const {
   emptyToolLoadResult,
   enforceRestrictedVoiceRequest,
   isVoiceActorSideEffectRestricted,
+  markServerValidatedRestrictedVoiceFallback,
   sanitizeAgentForRestrictedVoiceTurn,
 } = require('~/server/services/viventium/VoiceActorAuthorityService');
 /* === VIVENTIUM END === */
@@ -147,6 +151,7 @@ const logVoiceInitLatencyStage = (req, stage, stageStartAt = null, details = '')
   logger.info(
     `[VoiceLatency][LC] stage=${stage} request_id=${requestId} ${timingPart}${detailPart}`,
   );
+  logVoiceLatencyNumericStage(logger, req, 'initialize', stage, stageStartAt);
 };
 
 const hashToolNames = (names) => {
@@ -448,7 +453,9 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     const shouldRepairVoiceDelta = req?.body?.voiceMode === true;
     const shouldRepairVisibleDelta = event?.visibleToUser === true;
     const beforeContentParts =
-      shouldRepairVoiceDelta || shouldRepairVisibleDelta ? contentParts.slice() : null;
+      shouldRepairVoiceDelta || shouldRepairVisibleDelta || event?.event === 'on_message_delta'
+        ? contentParts.slice()
+        : [];
     const beforeVoiceText = shouldRepairVoiceDelta
       ? extractVisibleTextFromContentParts(contentParts)
       : '';
@@ -507,6 +514,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         }
       }
     }
+    retainAggregatedDeliveryDisposition(contentParts, beforeContentParts, event);
   };
   const toolEndCallback = createToolEndCallback({ req, res, artifactPromises, streamId });
 
@@ -554,15 +562,18 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     throw new Error('No agent promise provided');
   }
 
-  /* === VIVENTIUM NOTE ===
-   * Proposal F: agent promise and modelsConfig are independent — resolve in parallel.
-   * validateAgentModel depends on both, so it runs after the parallel await.
+  /* === VIVENTIUM START ===
+   * Reuse the complete catalog read started by buildOptions. Direct callers still load it here;
+   * model validation and capability authority continue to wait for both independent inputs.
    */
+  /** @type {Promise<import('librechat-data-provider').TModelsConfig> | undefined} */
+  const modelsConfigPromise = endpointOption.modelsConfigPromise;
+  /* === VIVENTIUM END === */
   const parallelInitStart = nowIfDeep();
   const voiceAgentAndModelsStart = voiceLatencyEnabled ? voiceLatencyNow() : null;
   const [loadedPrimaryAgent, modelsConfig] = await Promise.all([
     endpointOption.agent,
-    getModelsConfig(req),
+    modelsConfigPromise ?? getModelsConfig(req),
   ]);
   const agentAndModelsMs = setVoiceStageMs('agent_and_models', voiceAgentAndModelsStart);
   if (voiceLatencyEnabled) {
@@ -575,6 +586,9 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   }
   logDeep('agent_and_models_config_parallel', parallelInitStart);
   delete endpointOption.agent;
+  /* === VIVENTIUM START === */
+  delete endpointOption.modelsConfigPromise;
+  /* === VIVENTIUM END === */
   if (!loadedPrimaryAgent) {
     throw new Error('Agent not found');
   }
@@ -763,6 +777,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       enumerable: false,
       writable: false,
     });
+    return cancellationEndpointConfig;
   };
 
   const { fallbackAgent, fallbackAssignment } = await resolveValidatedFallbackRoute(primaryAgent);
@@ -1002,6 +1017,14 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       )
         .then(async (fallbackConfig) => {
           if (sideEffectsRestricted) {
+            await prepareRestrictedVoiceCancellation({
+              req,
+              signal,
+              endpointConfig: attachHarnessCancellationConfig(fallbackConfig, 'agentLlmFallback'),
+              providerId: resolveConversationProviderId(fallbackAgent),
+              fallback: true,
+              activate: false,
+            });
             fallbackConfig = sanitizeAgentForRestrictedVoiceTurn(fallbackConfig);
           }
           inheritResolvedAgentGraph(fallbackConfig, primaryConfig);
@@ -1083,6 +1106,9 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       enumerable: false,
       writable: false,
     });
+    if (sideEffectsRestricted) {
+      markServerValidatedRestrictedVoiceFallback(primaryConfig, req, fallbackAgent);
+    }
     logger.info(
       `[agentLlmFallback] Validated lazy fallback model for agent ${primaryConfig.id}: ${fallbackAssignment.provider}/${fallbackAssignment.model}`,
     );
@@ -1579,7 +1605,15 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * resumable-stream reconnects leave the run alive. The idempotency key is the authenticated
    * assistant response ID already sent to the provider; no provider internals are read.
    * === VIVENTIUM END === */
-  if (!sideEffectsRestricted) {
+  if (sideEffectsRestricted) {
+    await prepareRestrictedVoiceCancellation({
+      req,
+      signal,
+      endpointConfig,
+      providerId: effectivePrimaryProvider,
+      fallback: primaryInitializationFallbackUsed === true,
+    });
+  } else {
     bindHarnessCancellation({
       req,
       signal,

@@ -367,6 +367,46 @@ describe('agentLlmFallback', () => {
     expect(initializeFallback).not.toHaveBeenCalled();
   });
 
+  test.each([
+    { code: 'provider_progress_stalled', status: 502 },
+    { viventiumCompletionPhase: 'provider_response', cause: { code: 'provider_progress_stalled' } },
+  ])(
+    'preserves native attention instead of initializing or selecting a fallback: %j',
+    async (detail) => {
+      const primaryError = Object.assign(new Error('Synthetic private attention detail'), detail);
+      const initializeFallback = jest.fn();
+      expect(isRecoverableProviderFallbackError(primaryError)).toBe(false);
+      expect(
+        shouldRetryWithFallback([
+          {
+            type: ContentTypes.ERROR,
+            error_class: 'provider_progress_stalled',
+            error: 'provider temporarily unavailable',
+          },
+        ]),
+      ).toBe(false);
+      await expect(
+        initializePrimaryAgentWithFallback({
+          primaryAgent: { id: 'main', provider: 'openAI', model: 'synthetic-primary' },
+          fallbackAgent: { id: 'main', provider: 'xai', model: 'synthetic-fallback' },
+          fallbackAssignment: { provider: 'xai', model: 'synthetic-fallback' },
+          initializePrimary: async () => {
+            throw primaryError;
+          },
+          initializeFallback,
+        }),
+      ).rejects.toBe(primaryError);
+      expect(initializeFallback).not.toHaveBeenCalled();
+    },
+  );
+
+  test('retains ordinary provider recovery without a blanket needs_input exemption', () => {
+    expect(isRecoverableProviderFallbackError({ status: 500 })).toBe(true);
+    expect(
+      isRecoverableProviderFallbackError({ code: 'provider_auth_missing', state: 'needs_input' }),
+    ).toBe(true);
+  });
+
   test('allows graph fallback only for structured recoverable provider failures', () => {
     expect(isRecoverableProviderFallbackError({ status: 429 })).toBe(true);
     expect(isRecoverableProviderFallbackError({ errorClass: 'provider_quota_exhausted' })).toBe(

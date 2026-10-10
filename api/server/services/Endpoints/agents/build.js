@@ -14,7 +14,17 @@ const {
 } = require('librechat-data-provider');
 /* === VIVENTIUM END === */
 const { loadAgent } = require('~/models/Agent');
+/* === VIVENTIUM START ===
+ * Reuse the request's complete model catalog during agent initialization.
+ */
+const { getModelsConfig } = require('~/server/controllers/ModelController');
+/* === VIVENTIUM END === */
 
+/**
+ * @returns {Promise<import('librechat-data-provider').TEndpointOption & {
+ *   modelsConfigPromise: Promise<import('librechat-data-provider').TModelsConfig>
+ * }>}
+ */
 const buildOptions = async (req, endpoint, parsedBody, endpointType) => {
   const { spec, iconURL: parsedIconURL, agent_id, ...model_parameters } = parsedBody;
   /* === VIVENTIUM START ===
@@ -53,6 +63,14 @@ const buildOptions = async (req, endpoint, parsedBody, endpointType) => {
   });
   /* === VIVENTIUM END === */
 
+  /* === VIVENTIUM START ===
+   * Start the independent catalog read while the agent loads. Keep its original rejection for
+   * initializeClient, but observe it now if the request ends before that consumer runs.
+   */
+  const modelsConfigPromise = getModelsConfig(req);
+  void modelsConfigPromise.catch(() => undefined);
+  /* === VIVENTIUM END === */
+
   const agent = await agentPromise;
 
   /* === VIVENTIUM START ===
@@ -81,6 +99,9 @@ const buildOptions = async (req, endpoint, parsedBody, endpointType) => {
     endpointType,
     model_parameters,
     agent: Promise.resolve(agent),
+    /* === VIVENTIUM START === */
+    modelsConfigPromise,
+    /* === VIVENTIUM END === */
     addedConvo,
   });
 };

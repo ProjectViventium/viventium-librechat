@@ -9,6 +9,7 @@
  * - Preserve semantic text while stripping transport/formatting syntax such as Markdown
  *   emphasis markers, citation markers, provider voice-control tags and code fences.
  * - Preserve public links in display and persistence; speech owns URL removal.
+ * - Preserve authored repetition; only typed stream identity can prove a repeated transport part.
  * - Let QA import the same detector/forbidden-key contract that runtime uses.
  *
  * Added: 2026-05-31
@@ -17,7 +18,7 @@
 const XAI_TTS_CAPABILITIES = require('../../../../shared/voice/xai_tts_capabilities.json');
 const { parseDeliveryControls } = require('./deliveryControls');
 
-const ARTIFACT_CONTRACT_VERSION = '2026-07-13.4';
+const ARTIFACT_CONTRACT_VERSION = '2026-10-09.1';
 
 const KNOWN_MISSING_SPACE_JOINS = Object.freeze([]);
 
@@ -105,11 +106,6 @@ const ARTIFACT_CONDITIONS = Object.freeze([
     key: 'internalNoResponseMarker',
     description: 'Exact or malformed internal no-response markers leak to the user.',
   },
-  {
-    key: 'adjacentDuplicateWord',
-    description:
-      'Adjacent duplicate words caused by cumulative stream snapshots leak outside protected text.',
-  },
 ]);
 
 const DEFAULT_TTS_FORBIDDEN_ARTIFACT_KEYS = Object.freeze(
@@ -125,7 +121,6 @@ const DEFAULT_VISIBLE_FORBIDDEN_ARTIFACT_KEYS = Object.freeze([
   'knownMissingSpaceJoin',
   'markdownEmphasis',
   'internalNoResponseMarker',
-  'adjacentDuplicateWord',
 ]);
 
 const SYNTHETIC_FORBIDDEN_ARTIFACT_CASES = Object.freeze([
@@ -155,7 +150,6 @@ const SYNTHETIC_FORBIDDEN_ARTIFACT_CASES = Object.freeze([
   { key: 'internalNoResponseMarker', text: 'The marker {NTA leaked.' },
   { key: 'internalNoResponseMarker', text: 'The marker {N{NTA leaked.' },
   { key: 'internalNoResponseMarker', text: 'The marker {N{N{NTA}}} leaked.' },
-  { key: 'adjacentDuplicateWord', text: 'Tell Tell me me what what happened happened.' },
 ]);
 
 function escapeRegExp(value) {
@@ -219,7 +213,6 @@ const INLINE_MARKDOWN_EMPHASIS_RE =
 const SPACED_MARKDOWN_DECORATION_RE =
   /(^|[^\w])(?:\*{3}|_{3}|~{3})\s+[^*_~\n]+?\s+(?:\*{3}|_{3}|~{3})(?!\w)/;
 const MARKDOWN_MARKER_ONLY_RE = /^\s*(?:[*_~]\s*)+\s*$/;
-const LEGITIMATE_ADJACENT_DUPLICATE_WORDS = new Set(['had had', 'is is', 'that that']);
 
 const MARKDOWN_SPACED_DECORATION_STRIP_RE =
   /(^|[^\w])(?:\*{3}|_{3}|~{3})\s+([^*_~\n]+?)\s+(?:\*{3}|_{3}|~{3})(?!\w)/g;
@@ -242,20 +235,6 @@ const INTERNAL_NO_RESPONSE_RE =
   /(^|[^$])\{(?:[NTA{}]*)N(?:[NTA{}]*)T(?:[NTA{}]*)A(?:[NTA{}]*)\}?/gi;
 const WHITESPACE_BEFORE_PUNCT_RE = /(?<=\S)[ \t]+([.,!?;:])/g;
 const SENTENCE_SPACE_RE = /([.!?])([A-Z])/g;
-
-function countAdjacentDuplicateWords(text) {
-  const value = String(text || '');
-  const regex = /\b([A-Za-z][A-Za-z']{1,})\b[\s.,!?;:]+\1\b/gi;
-  let count = 0;
-  let match;
-  while ((match = regex.exec(value))) {
-    const pair = `${match[1]} ${match[1]}`.toLowerCase();
-    if (!LEGITIMATE_ADJACENT_DUPLICATE_WORDS.has(pair)) {
-      count += 1;
-    }
-  }
-  return count;
-}
 
 function artifactCounts(text) {
   const value = String(text || '');
@@ -285,7 +264,6 @@ function artifactCounts(text) {
     internalNoResponseMarker: /(^|[^$])\{(?:[NTA{}]*)N(?:[NTA{}]*)T(?:[NTA{}]*)A/i.test(value)
       ? 1
       : 0,
-    adjacentDuplicateWord: countAdjacentDuplicateWords(unprotectedValue) > 0 ? 1 : 0,
   };
 }
 
@@ -541,16 +519,18 @@ function sanitizeVoiceContentPartsForPersistence(contentParts = []) {
     }
 
     changed = true;
+    const cleanedPart = { ...part };
+    delete cleanedPart.deliveryDispositionRanges;
     if (typeof part.text === 'string') {
       sanitized.push({
-        ...part,
+        ...cleanedPart,
         text: cleanedText,
       });
       continue;
     }
     if (part.text && typeof part.text === 'object') {
       sanitized.push({
-        ...part,
+        ...cleanedPart,
         text: {
           ...part.text,
           value:
@@ -563,7 +543,7 @@ function sanitizeVoiceContentPartsForPersistence(contentParts = []) {
       continue;
     }
     sanitized.push({
-      ...part,
+      ...cleanedPart,
       text: cleanedText,
     });
   }
@@ -602,7 +582,11 @@ function sanitizeVoiceAssistantMessageForPersistence(req, message) {
           return part;
         }
         if (typeof part.text === 'string') {
-          return { ...part, text: cleanTelegramText(part.text) };
+          const cleaned = cleanTelegramText(part.text);
+          if (cleaned === part.text) return part;
+          const cleanedPart = { ...part };
+          delete cleanedPart.deliveryDispositionRanges;
+          return { ...cleanedPart, text: cleaned };
         }
         if (part.text && typeof part.text === 'object') {
           const raw =
@@ -612,8 +596,11 @@ function sanitizeVoiceAssistantMessageForPersistence(req, message) {
                 ? part.text.text
                 : '';
           const cleaned = cleanTelegramText(raw);
+          if (cleaned === raw) return part;
+          const cleanedPart = { ...part };
+          delete cleanedPart.deliveryDispositionRanges;
           return {
-            ...part,
+            ...cleanedPart,
             text: {
               ...part.text,
               value: typeof part.text.value === 'string' ? cleaned : part.text.value,

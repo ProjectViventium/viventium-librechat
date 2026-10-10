@@ -16,6 +16,13 @@ const {
 describe('voicePhaseAPolicy', () => {
   const originalEnv = { ...process.env };
 
+  beforeEach(() => {
+    delete process.env.VIVENTIUM_VOICE_BACKGROUND_AGENT_DETECTION_ASYNC;
+    delete process.env.VIVENTIUM_VOICE_PHASE_A_ASYNC_ALLOW_TOOL_HOLD;
+    delete process.env.VIVENTIUM_TEXT_BACKGROUND_AGENT_DETECTION_ASYNC;
+    delete process.env.VIVENTIUM_CORTEX_SPECULATIVE_PARALLEL_DETECT;
+  });
+
   afterEach(() => {
     for (const key of Object.keys(process.env)) {
       if (!(key in originalEnv)) {
@@ -168,6 +175,34 @@ describe('voicePhaseAPolicy', () => {
       toolHoldScopeKeys: ['productivity_ms365'],
       unownedToolHoldScopeKeys: ['productivity_ms365'],
     });
+  });
+
+  test('disabled tool scopes cannot delay early notice or force synchronous Main', () => {
+    process.env.VIVENTIUM_VOICE_BACKGROUND_AGENT_DETECTION_ASYNC = 'true';
+    process.env.VIVENTIUM_VOICE_PHASE_A_ASYNC_ALLOW_TOOL_HOLD = 'false';
+    const agent = {
+      background_cortices: [
+        {
+          agent_id: 'disabled-a',
+          activation: { enabled: false, intent_scope: 'productivity_ms365' },
+        },
+        {
+          agent_id: 'disabled-b',
+          activation: { mode: 'disabled', intent_scope: 'productivity_google_workspace' },
+        },
+        { agent_id: 'always-memory', activation: { enabled: true, mode: 'always' } },
+      ],
+    };
+    const asyncPolicy = resolveVoicePhaseAAsyncPolicy({ voiceMode: true, agent });
+    expect(asyncPolicy).toMatchObject({ enabled: true, forcedOff: false, toolHoldScopeKeys: [] });
+    expect(
+      resolvePhaseANoticeToolHoldGuard({
+        requestedPhaseANoticeMode: 'first_activation_continue',
+        voiceMode: true,
+        agent,
+        asyncPolicy,
+      }),
+    ).toMatchObject({ guarded: false, toolHoldScopeKeys: [], unownedToolHoldScopeKeys: [] });
   });
 
   test('keeps early Phase A notice when configured tool-hold scope is owned', () => {

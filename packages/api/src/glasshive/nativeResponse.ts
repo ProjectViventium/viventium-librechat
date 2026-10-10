@@ -28,6 +28,10 @@ import type {
 } from '@librechat/data-schemas';
 
 type Methods = ReturnType<typeof createNativeResponseMethods>;
+type NativeRecoveredResponse = Omit<
+  NonNullable<Awaited<ReturnType<Methods['getNativeResponse']>>>,
+  'nativeResponse' | 'savedMemoryWrite'
+>;
 
 /* === VIVENTIUM START ===
  * Fix: Phase B writes its cortex lifecycle parts onto the same answer row while the answer's
@@ -159,6 +163,16 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
     }
     if (!deps.release || !(await deps.release(identity)))
       throw new Error('native_response_handoff_unavailable');
+  }
+  async function rejectUnaccepted(identity: NativeResponseIdentity) {
+    if (!(await deps.isCurrent(identity))) throw new Error('native_response_job_revoked');
+    const row = await deps.db.getNativeResponse(identity.userId, identity.responseMessageId);
+    if (
+      row?.nativeResponse?.status !== 'pending' ||
+      nativeIdentityJson(row.nativeResponse) !== nativeIdentityJson(identity)
+    )
+      throw new Error('native_response_handoff_unavailable');
+    await releaseUnsupported(identity);
   }
   async function admit(identity: NativeResponseIdentity): Promise<boolean> {
     await currentRoute(identity);
@@ -370,7 +384,7 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
   async function recover(
     identity: NativeResponseIdentity,
     onTerminal?: (status: 'failed' | 'cancelled') => void,
-  ) {
+  ): Promise<NativeRecoveredResponse | null> {
     const row = await deps.db.getNativeResponse(identity.userId, identity.responseMessageId);
     const admission = row?.nativeResponse;
     if (!admission || nativeIdentityJson(admission) !== nativeIdentityJson(identity)) return null;
@@ -568,6 +582,7 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
 
   return {
     admit,
+    rejectUnaccepted,
     readResult,
     readToolEvidence,
     readToolEvidenceForPresentation,
@@ -648,6 +663,7 @@ interface NativeCapacityRecovery {
   streamId?: string;
   invocationId?: string;
   role?: 'main' | 'cortex';
+  waitForOccupiedSession?: boolean;
 }
 
 async function recoverNativeCapacityResponse(
@@ -657,19 +673,26 @@ async function recoverNativeCapacityResponse(
 ): Promise<Response> {
   while (true) {
     const capacityDelay = await nativeCapacityRetryDelay(response);
-    if (capacityDelay === null || Date.now() + capacityDelay > recovery.waitUntil) return response;
+    /* === VIVENTIUM START === Native occupancy refuses admission; retry the same signed body. === */
+    const occupied =
+      capacityDelay === null &&
+      recovery.waitForOccupiedSession === true &&
+      (await isNativeSessionOccupied(response));
+    const retryDelay = occupied ? 1_000 : capacityDelay;
+    if (retryDelay === null || Date.now() + retryDelay > recovery.waitUntil) return response;
+    /* === VIVENTIUM END === */
     if (recovery.isCurrent && !(await recovery.isCurrent())) throw nativeDispatchSupersededError();
     const timing = {
       role: recovery.role || 'unspecified',
       streamHash: recovery.streamId ? nativeResponseSha256(recovery.streamId).slice(0, 16) : null,
-      retryAfterMs: capacityDelay,
+      retryAfterMs: retryDelay,
       waitedMs: Date.now() - recovery.startedAt,
     };
     // The shared log formatter renders message text. Keep timing visible without raw identities.
     logger.info(
-      `[VIVENTIUM][native-response] Host capacity admission wait ${JSON.stringify(timing)}`,
+      `[VIVENTIUM][native-response] ${occupied ? 'Native session' : 'Host capacity'} admission wait ${JSON.stringify(timing)}`,
     );
-    await wait(capacityDelay, undefined, { signal: recovery.signal || undefined });
+    await wait(retryDelay, undefined, { signal: recovery.signal || undefined });
     if (recovery.isCurrent && !(await recovery.isCurrent())) throw nativeDispatchSupersededError();
     response = await dispatch();
   }
@@ -682,11 +705,13 @@ export function createNativeCapacityFetch(
     deadlineAt,
     streamId,
     role,
+    waitForOccupiedSession,
   }: {
-    signal: AbortSignal;
+    signal?: AbortSignal;
     deadlineAt?: number;
     streamId?: string;
     role?: 'main' | 'cortex';
+    waitForOccupiedSession?: boolean;
   },
 ): MainContinuityFetch {
   return async (input, init) => {
@@ -696,7 +721,8 @@ export function createNativeCapacityFetch(
     if (input instanceof Request && init?.body == null) {
       init = { ...init, headers: init?.headers || input.headers, body: await input.clone().text() };
     }
-    const signals = [signal, init?.signal].filter((value): value is AbortSignal => Boolean(value));
+    const transportSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    const signals = [signal, transportSignal].filter((value): value is AbortSignal => Boolean(value));
     const dispatch = {
       ...init,
       signal: (
@@ -713,6 +739,7 @@ export function createNativeCapacityFetch(
         waitUntil: Math.min(startedAt + NATIVE_CAPACITY_WAIT_MS, deadlineAt ?? Infinity),
         streamId,
         role,
+        waitForOccupiedSession,
       },
     );
   };
@@ -728,12 +755,83 @@ async function isNativeSessionOccupied(response: Response): Promise<boolean> {
   }
 }
 
+interface NativeCapacityFailure {
+  code?: string;
+  native_admission?: {
+    version?: number;
+    accepted?: boolean;
+    invocation_id?: string;
+    body_sha256?: string;
+    stream_id?: string;
+    message_id?: string;
+  };
+}
+
+export function isNativeCapacityRefusal(
+  error: NativeCapacityFailure | undefined,
+  identity: NativeResponseIdentity,
+): boolean {
+  const proof = error?.native_admission;
+  return (
+    error?.code === 'host_capacity' &&
+    proof?.version === 1 &&
+    proof.accepted === false &&
+    proof.invocation_id === identity.invocationId &&
+    proof.body_sha256 === identity.bodySha256 &&
+    proof.stream_id === identity.streamId &&
+    proof.message_id === identity.responseMessageId
+  );
+}
+
+async function isUnacceptedNativeCapacity(
+  response: Response,
+  identity: NativeResponseIdentity,
+): Promise<boolean> {
+  if (response.status !== 503) return false;
+  try {
+    const body = (await response.clone().json()) as { error?: NativeCapacityFailure };
+    return isNativeCapacityRefusal(body.error, identity);
+  } catch {
+    return false;
+  }
+}
+
+/** Carry the existing opaque signed bootstrap in the native body before invocation hashing. */
+export function createNativeBootstrapFetch(baseFetch: MainContinuityFetch): MainContinuityFetch {
+  return async (input, init) => {
+    const method = init?.method || (input instanceof Request ? input.method : 'GET');
+    const url = new URL(
+      typeof input === 'string' || input instanceof URL ? String(input) : input.url,
+    );
+    if (method.toUpperCase() !== 'POST' || !url.pathname.endsWith('/chat/completions'))
+      return baseFetch(input, init);
+    const headers = new Headers(
+      init?.headers || (input instanceof Request ? input.headers : undefined),
+    );
+    const encoded = headers.get('X-GlassHive-Bootstrap-Bundle-B64');
+    if (!encoded) return baseFetch(input, init);
+    let body = '';
+    if (typeof init?.body === 'string') body = init.body;
+    else if (input instanceof Request) body = await input.clone().text();
+    const payload = JSON.parse(body);
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload))
+      throw new Error('Invalid native completion body');
+    if (payload.metadata?.bootstrap_bundle_b64)
+      throw new Error('Native bootstrap must use one carrier');
+    payload.metadata = { ...payload.metadata, bootstrap_bundle_b64: encoded };
+    headers.delete('X-GlassHive-Bootstrap-Bundle-B64');
+    headers.delete('content-length');
+    return baseFetch(input, { ...init, headers, body: JSON.stringify(payload) });
+  };
+}
+
 export function createNativeResponseFetch(
   baseFetch: MainContinuityFetch,
   getContext: () => Promise<NativeResponseFetchContext | null>,
   admit: (identity: NativeResponseIdentity) => Promise<boolean>,
   onBound: (identity: NativeResponseIdentity) => void,
   release?: NativeResponseRelease,
+  rejectUnaccepted?: (identity: NativeResponseIdentity) => Promise<void>,
 ): MainContinuityFetch {
   let bound: NativeResponseIdentity | undefined;
   let boundPredecessor: Awaited<
@@ -842,6 +940,8 @@ export function createNativeResponseFetch(
       if (recovered === response) break;
       response = recovered;
     }
+    if (rejectUnaccepted && (await isUnacceptedNativeCapacity(response, identity)))
+      await rejectUnaccepted(identity);
     return response;
   };
 }

@@ -134,6 +134,7 @@ interface BatchDescriptor extends DataRecord {
   reason?: string;
   receiptHash?: string;
   receipt?: PresentationFence;
+  dropPresentation?: PresentationDropFence;
   renewedAt?: Date | string;
   leaseExpiresAt?: Date | string;
   presentation?: PresentationLeaseFence | null;
@@ -275,6 +276,11 @@ interface ClaimPendingByParentInput {
   terminalSettlement?: boolean;
 }
 
+interface PresentationDropFence extends PresentationFence {
+  deliveryReceipts: CortexDeliveryReceipt[];
+  expiredBefore?: Date;
+}
+
 interface SettleOneInput {
   ownerId: unknown;
   claim: CortexClaimInput;
@@ -284,6 +290,7 @@ interface SettleOneInput {
   receiptHash?: string;
   intentToken?: string;
   allowExpiredLease?: boolean;
+  dropPresentation?: PresentationDropFence;
   session?: ClientSession | null;
 }
 
@@ -309,6 +316,7 @@ interface SettleClaimsInput {
   reason?: string;
   receiptHash?: string;
   allowExpiredLease?: boolean;
+  dropPresentation?: PresentationDropFence;
 }
 
 interface OwnerClaimsInput {
@@ -371,6 +379,7 @@ interface MarkFailedInput extends OwnerClaimsInput {
 interface MarkDroppedInput extends OwnerClaimsInput {
   dropReason: unknown;
   allowExpiredLease?: boolean;
+  presentation?: PresentationDropFence;
 }
 
 interface RenewOneInput {
@@ -503,6 +512,7 @@ export interface CortexInsightDeliveryServiceOptions {
   afterStandaloneMutation?: StandaloneMutationHook | null;
   afterStandaloneRecordWrite?: StandaloneRecordWriteHook | null;
   consumeFault?: (input: DataRecord) => Promise<DataRecord | null>;
+  readAcceptedVoiceDispatch?: (row: CortexDeliveryLike) => Promise<PresentationDropFence | null>;
 }
 
 export const CORTEX_INSIGHT_DROP_REASONS = Object.freeze([...DROP_REASONS]);
@@ -1459,10 +1469,48 @@ export function createCortexInsightDeliveryService({
   afterStandaloneMutation = null,
   afterStandaloneRecordWrite = null,
   consumeFault = async () => null,
+  readAcceptedVoiceDispatch,
 }: CortexInsightDeliveryServiceOptions) {
   if (!DeliveryModel) throw new Error('cortex_insight_delivery_model_unavailable');
   const normalizedRuntimeSlot = normalizeText(runtimeSlot) || resolveCortexRuntimeSlotIdentity();
   const normalizedRuntimeEpoch = normalizeText(runtimeEpoch) || PROCESS_RUNTIME_EPOCH;
+
+  async function acceptedVoiceDispatch(
+    row: CortexDeliveryLike,
+  ): Promise<PresentationDropFence | null> {
+    if (
+      !readAcceptedVoiceDispatch ||
+      row.status !== 'claimed' ||
+      row.persistenceStatus !== 'persisted' ||
+      !row.requiredSurfaces?.includes('voice') ||
+      !row.presentationLeaseToken
+    )
+      return null;
+    const receipt = await readAcceptedVoiceDispatch(row);
+    if (!receipt) return null;
+    const graphReceipt = receipt.deliveryReceipts.find(
+      (item) => item.deliveryId === row.deliveryId,
+    );
+    if (
+      receipt.surface !== 'voice' ||
+      receipt.parentMessageId !== row.parentMessageId ||
+      receipt.persistedMessageId !== row.persistedMessageId ||
+      receipt.presentationRef !== row.persistedMessageId ||
+      receipt.messageRevision !== presentationRevisionOf(row) ||
+      receipt.claimGeneration !== row.claimGeneration ||
+      receipt.presentationClaimToken !== row.claimToken ||
+      receipt.presentationLeaseToken !== row.presentationLeaseToken ||
+      graphReceipt?.graphResultHash !== row.graphResultHash ||
+      row.presentationLeaseOwnerId !== row.userId ||
+      row.presentationLeaseClaimToken !== row.claimToken ||
+      row.presentationLeaseGeneration !== row.claimGeneration ||
+      !Number.isFinite(new Date(row.leaseExpiresAt || '').getTime()) ||
+      !Number.isFinite(new Date(row.presentationLeaseExpiresAt || '').getTime())
+    ) {
+      throw settlementConflictError('Cortex accepted Voice dispatch fence did not match');
+    }
+    return receipt;
+  }
 
   function recoveryEligibilityFilter(checkedAt: Date): DataRecord {
     return {
@@ -2043,7 +2091,11 @@ export function createCortexInsightDeliveryService({
       }
       for (const claim of claims) {
         const current = await readOwnedDelivery(ownerId, claim.deliveryId);
-        if (current && normalizeText(current.lastBatchIntentToken) === intentToken) {
+        if (
+          current &&
+          !descriptor.dropPresentation &&
+          normalizeText(current.lastBatchIntentToken) === intentToken
+        ) {
           results.push(redactDelivery(current));
           continue;
         }
@@ -2054,6 +2106,7 @@ export function createCortexInsightDeliveryService({
           projection: descriptor.projection,
           reason: descriptor.reason,
           receiptHash: descriptor.receiptHash,
+          dropPresentation: descriptor.dropPresentation,
           intentToken,
           allowExpiredLease,
         });
@@ -2366,6 +2419,7 @@ export function createCortexInsightDeliveryService({
     if (!row || TERMINAL_STATUSES.has(row.status)) {
       return null;
     }
+    if (await acceptedVoiceDispatch(row)) return null;
     row = await initializeLegacySourceRevision(row, session);
     if (!row || TERMINAL_STATUSES.has(row.status)) return null;
     const claimedAt = batchClaimedAt || now();
@@ -2972,6 +3026,29 @@ export function createCortexInsightDeliveryService({
     if (!batchInspection.complete) {
       return hiddenNoClaimResult(RECOVERY_NO_CLAIM_REASONS.INCOMPLETE_BATCH);
     }
+    const accepted = await Promise.all(nonterminalRows.map(acceptedVoiceDispatch));
+    if (accepted.some(Boolean)) {
+      if (
+        accepted.some((receipt) => !receipt) ||
+        nonterminalRows.some(
+          (row) =>
+            !row.leaseExpiresAt ||
+            new Date(row.leaseExpiresAt).getTime() > checkedAt.getTime() ||
+            !row.presentationLeaseExpiresAt ||
+            new Date(row.presentationLeaseExpiresAt).getTime() > checkedAt.getTime(),
+        )
+      ) {
+        return noClaimResult(parentRows, RECOVERY_NO_CLAIM_REASONS.NOT_CLAIMABLE);
+      }
+      const settled = await markDropped({
+        ownerId: userId,
+        claims: nonterminalRows.map((row) => normalizeClaim(row)),
+        dropReason: 'delivery_outcome_unknown',
+        allowExpiredLease: true,
+        presentation: accepted[0] ? { ...accepted[0], expiredBefore: checkedAt } : undefined,
+      });
+      return noClaimResult(settled, RECOVERY_NO_CLAIM_REASONS.TERMINAL);
+    }
     const pinnedFeelingSnapshot = recoveryFeelingSnapshot(parentRows);
     const eligibility = nonterminalRows.map((row) => isRecoveryEligible(row, checkedAt));
     if (eligibility.some(Boolean) && eligibility.some((eligible) => !eligible)) {
@@ -3038,6 +3115,7 @@ export function createCortexInsightDeliveryService({
     receiptHash = '',
     intentToken = '',
     allowExpiredLease = false,
+    dropPresentation,
     session = null,
   }: SettleOneInput): Promise<CortexDeliveryLike> {
     const userId = normalizeText(ownerId);
@@ -3056,6 +3134,83 @@ export function createCortexInsightDeliveryService({
         normalizeText(existing?.persistedMessageId) !== normalizeText(projection.persistedMessageId)
       ) {
         throw settlementConflictError();
+      }
+    }
+    let presentationFilter: DataRecord = {};
+    if (dropPresentation) {
+      const graphResultHash = normalizeText(
+        dropPresentation.deliveryReceipts.find((receipt) => receipt.deliveryId === fence.deliveryId)
+          ?.graphResultHash,
+      );
+      const presentationLeaseToken = normalizeText(dropPresentation.presentationLeaseToken);
+      const revision = Number(dropPresentation.messageRevision);
+      if (
+        transition !== 'dropped' ||
+        reason !== 'delivery_outcome_unknown' ||
+        dropPresentation.surface !== 'voice' ||
+        !dropPresentation.parentMessageId ||
+        !dropPresentation.persistedMessageId ||
+        !dropPresentation.presentationRef ||
+        !Number.isSafeInteger(revision) ||
+        revision < 1 ||
+        !/^[a-f0-9]{64}$/.test(graphResultHash) ||
+        !presentationLeaseToken ||
+        dropPresentation.presentationClaimToken !== fence.claimToken ||
+        dropPresentation.claimGeneration !== fence.claimGeneration ||
+        !existing ||
+        normalizeText(existing.parentMessageId) !== dropPresentation.parentMessageId ||
+        normalizeText(existing.persistedMessageId) !== dropPresentation.persistedMessageId ||
+        existing.persistenceStatus !== 'persisted' ||
+        presentationRevisionOf(existing) !== revision ||
+        normalizeText(existing.graphResultHash) !== graphResultHash ||
+        Number(existing.claimGeneration) !== fence.claimGeneration ||
+        !existing.requiredSurfaces?.includes('voice')
+      ) {
+        throw settlementConflictError('Cortex interrupted presentation fence did not match');
+      }
+      const expiredBefore = dropPresentation.expiredBefore
+        ? new Date(dropPresentation.expiredBefore)
+        : null;
+      if (
+        expiredBefore &&
+        existing.status !== 'dropped' &&
+        (!Number.isFinite(expiredBefore.getTime()) ||
+          expiredBefore.getTime() > eventAt.getTime() ||
+          !Number.isFinite(new Date(existing.leaseExpiresAt || '').getTime()) ||
+          !Number.isFinite(new Date(existing.presentationLeaseExpiresAt || '').getTime()) ||
+          new Date(existing.leaseExpiresAt || '').getTime() > expiredBefore.getTime() ||
+          new Date(existing.presentationLeaseExpiresAt || '').getTime() > expiredBefore.getTime())
+      ) {
+        throw settlementConflictError('Cortex accepted dispatch lease was renewed');
+      }
+      receiptHash = presentationReceiptHash({ ...dropPresentation, graphResultHash });
+      presentationFilter = {
+        parentMessageId: dropPresentation.parentMessageId,
+        persistedMessageId: dropPresentation.persistedMessageId,
+        persistenceStatus: 'persisted',
+        ...presentationRevisionCasFilter(existing, revision),
+        graphResultHash,
+        presentationLeaseToken,
+        presentationLeaseOwnerId: userId,
+        presentationLeaseClaimToken: fence.claimToken,
+        presentationLeaseGeneration: fence.claimGeneration,
+        presentationLeaseExpiresAt: {
+          $eq: existing.presentationLeaseExpiresAt,
+          ...(expiredBefore ? { $lte: expiredBefore } : {}),
+        },
+        ...(expiredBefore
+          ? { leaseExpiresAt: { $eq: existing.leaseExpiresAt, $lte: expiredBefore } }
+          : {}),
+      };
+      if (
+        existing.status !== 'dropped' &&
+        (normalizeText(existing.presentationLeaseToken) !== presentationLeaseToken ||
+          normalizeText(existing.presentationLeaseOwnerId) !== userId ||
+          normalizeText(existing.presentationLeaseClaimToken) !== fence.claimToken ||
+          Number(existing.presentationLeaseGeneration) !== fence.claimGeneration ||
+          !existing.presentationLeaseExpiresAt)
+      ) {
+        throw settlementConflictError('Cortex interrupted presentation lease did not match');
       }
     }
     const liveLease = existing?.leaseExpiresAt ? new Date(existing.leaseExpiresAt) : null;
@@ -3078,7 +3233,15 @@ export function createCortexInsightDeliveryService({
     const sameDroppedReason =
       transition === 'dropped' &&
       existing?.status === 'dropped' &&
-      normalizeText(existing?.dropReason) === normalizeText(projection.dropReason);
+      normalizeText(existing?.dropReason) === normalizeText(projection.dropReason) &&
+      (!dropPresentation ||
+        existing?.events?.some(
+          (event) =>
+            event.transition === 'dropped' &&
+            event.claimToken === fence.claimToken &&
+            event.claimGeneration === fence.claimGeneration &&
+            event.receiptHash === receiptHash,
+        ));
     if (existing && samePersistedReceipt) {
       if (!exactFence) throw settlementConflictError();
       return redactDelivery(existing);
@@ -3099,6 +3262,7 @@ export function createCortexInsightDeliveryService({
       leaseExpiresAt: allowExpiredLease
         ? { $eq: existing.leaseExpiresAt }
         : { $eq: existing.leaseExpiresAt, $gt: eventAt },
+      ...presentationFilter,
       ...(transition === 'persisted'
         ? {
             ...presentationRevisionCasFilter(existing, currentPresentationRevision),
@@ -3336,6 +3500,7 @@ export function createCortexInsightDeliveryService({
     reason,
     receiptHash,
     allowExpiredLease = false,
+    dropPresentation,
   }: SettleClaimsInput): Promise<CortexDeliveryLike[]> {
     const settled = await runAtomicClaimBatch({
       ownerId,
@@ -3347,13 +3512,18 @@ export function createCortexInsightDeliveryService({
         reason,
         receiptHash,
         allowExpiredLease,
+        dropPresentation,
       },
       operation: async ({ claims: normalizedClaims, beforeRows, changedIds, session }) => {
         const settled: CortexDeliveryLike[] = [];
         const beforeById = new Map(beforeRows.map((row) => [row.deliveryId, row]));
         for (const claim of normalizedClaims) {
           const existing = beforeById.get(claim.deliveryId);
-          if (existing && settlementAlreadyApplied(existing, transition, projection, claim)) {
+          if (
+            existing &&
+            !dropPresentation &&
+            settlementAlreadyApplied(existing, transition, projection, claim)
+          ) {
             settled.push(redactDelivery(existing));
             continue;
           }
@@ -3365,6 +3535,7 @@ export function createCortexInsightDeliveryService({
             reason,
             receiptHash,
             allowExpiredLease,
+            dropPresentation,
             session,
           });
           changedIds.add(claim.deliveryId);
@@ -3883,6 +4054,7 @@ export function createCortexInsightDeliveryService({
     claims,
     dropReason,
     allowExpiredLease = false,
+    presentation,
   }: MarkDroppedInput): Promise<CortexDeliveryLike[]> {
     const normalizedReason = normalizeText(dropReason);
     if (!CORTEX_INSIGHT_DROP_REASONS.some((value) => value === normalizedReason)) {
@@ -3891,6 +4063,19 @@ export function createCortexInsightDeliveryService({
     if (allowExpiredLease && normalizedReason !== 'delivery_outcome_unknown') {
       throw new Error('Only an expired claim with an unknown transport outcome can be quarantined');
     }
+    if (presentation) {
+      const claimIds = (claims || []).map((claim) => normalizeClaim(claim).deliveryId).sort();
+      const receiptIds = presentation.deliveryReceipts.map((receipt) => receipt.deliveryId).sort();
+      if (
+        normalizedReason !== 'delivery_outcome_unknown' ||
+        claimIds.length === 0 ||
+        claimIds.length !== receiptIds.length ||
+        new Set(receiptIds).size !== receiptIds.length ||
+        claimIds.some((id, index) => id !== receiptIds[index])
+      ) {
+        throw settlementConflictError('Cortex interrupted presentation batch did not match');
+      }
+    }
     const droppedAt = now();
     const settled = await settleClaims({
       ownerId,
@@ -3898,6 +4083,7 @@ export function createCortexInsightDeliveryService({
       transition: 'dropped',
       reason: normalizedReason,
       allowExpiredLease,
+      dropPresentation: presentation,
       projection: {
         status: 'dropped',
         claimToken: '',

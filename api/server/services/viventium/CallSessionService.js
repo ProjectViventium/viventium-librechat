@@ -542,7 +542,7 @@ function normalizeAssistantRouteText(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
-function buildAssistantRouteAssignment(provider, model, parameters) {
+function buildAssistantRouteAssignment(provider, model, parameters, providerCapabilities = {}) {
   const normalizedProvider = normalizeAssistantRouteText(provider);
   const normalizedModel = normalizeAssistantRouteText(model);
   if (!normalizedProvider || !normalizedModel) {
@@ -554,10 +554,18 @@ function buildAssistantRouteAssignment(provider, model, parameters) {
       parameters?.effort ||
       parameters?.output_config?.effort,
   );
+  const capability = providerCapabilities?.[normalizedProvider];
+  const modelCapability = Array.isArray(capability?.models)
+    ? capability.models.find((candidate) => candidate?.id === normalizedModel)
+    : null;
+  const providerLabel = normalizeAssistantRouteText(capability?.label);
+  const modelLabel = normalizeAssistantRouteText(modelCapability?.label);
   return {
     provider: normalizedProvider,
     model: normalizedModel,
     ...(effort ? { effort } : {}),
+    ...(providerLabel ? { providerLabel } : {}),
+    ...(modelLabel ? { modelLabel } : {}),
   };
 }
 
@@ -568,7 +576,7 @@ function buildAssistantRouteAssignment(provider, model, parameters) {
  * === VIVENTIUM END === */
 async function resolveCallSessionAssistantRoute(
   agentId,
-  { capabilityRequiredProviders = [] } = {},
+  { capabilityRequiredProviders = [], assistantProviderCapabilities = {} } = {},
 ) {
   if (!agentId) {
     return null;
@@ -588,10 +596,12 @@ async function resolveCallSessionAssistantRoute(
     persistedAgent.provider && (persistedAgent.model || persistedAgent.model_parameters?.model)
       ? persistedAgent
       : rewriteAgentForRuntime(persistedAgent, { capabilityRequiredProviders });
+  // Presentation callers may supply the already loaded registry; shared Wing reads use raw IDs.
   const primary = buildAssistantRouteAssignment(
     runtimeAgent?.provider,
     runtimeAgent?.model || runtimeAgent?.model_parameters?.model,
     runtimeAgent?.model_parameters,
+    assistantProviderCapabilities,
   );
   if (!primary) {
     return null;
@@ -604,17 +614,20 @@ async function resolveCallSessionAssistantRoute(
     voiceAssignment
       ? resolveVoiceModelParameters(runtimeAgent, voiceAssignment.model, voiceAssignment.provider)
       : undefined,
+    assistantProviderCapabilities,
   );
   const fallbackLlm = buildAssistantRouteAssignment(
     runtimeAgent?.fallback_llm_provider,
     runtimeAgent?.fallback_llm_model || runtimeAgent?.fallback_llm_model_parameters?.model,
     runtimeAgent?.fallback_llm_model_parameters,
+    assistantProviderCapabilities,
   );
   const voiceFallbackLlm = buildAssistantRouteAssignment(
     runtimeAgent?.voice_fallback_llm_provider,
     runtimeAgent?.voice_fallback_llm_model ||
       runtimeAgent?.voice_fallback_llm_model_parameters?.model,
     runtimeAgent?.voice_fallback_llm_model_parameters,
+    assistantProviderCapabilities,
   );
 
   return {
@@ -775,6 +788,7 @@ async function getActiveCallSessionForConversation({ userId, conversationId, now
     conversationId: normalizedConversationId,
     mode: 'call',
     callStatus: { $in: ['listening', 'speaking', 'working', 'needs_input', 'degraded'] },
+    'callFailure.fatal': { $ne: true },
     expiresAt: { $gt: observedAt },
     activeJobId: { $type: 'string', $ne: '' },
     activeWorkerId: { $type: 'string', $ne: '' },
@@ -933,7 +947,7 @@ async function syncCallSessionState({
 
   const now = Number.isFinite(Number(nowMs)) ? new Date(Number(nowMs)) : new Date();
   const set = {};
-  if (touch !== false) {
+  if (touch !== false && status !== 'ended') {
     set.expiresAt = new Date(now.getTime() + getCallSessionTtlMs());
     set.browserCapabilityExpiresAt = set.expiresAt;
   }
@@ -942,7 +956,7 @@ async function syncCallSessionState({
   }
   if (status === 'ended') {
     set.expiresAt = new Date(now.getTime() + POST_CALL_MEMORY_EVIDENCE_TTL_MS);
-    set.browserCapabilityExpiresAt = now;
+    // Keep the existing browser deadline for terminal-state reads; never renew it on End.
   }
 
   if (CALL_MODES.has(mode)) {
@@ -1080,7 +1094,7 @@ async function heartbeatCallSession({ callSessionId, currentSession, nowMs } = {
 
 async function getCallSessionVoiceSettings(
   callSessionId,
-  { capabilityRequiredProviders = [] } = {},
+  { capabilityRequiredProviders = [], assistantProviderCapabilities = {} } = {},
 ) {
   const session = await getCallSession(callSessionId);
   if (!session) {
@@ -1089,6 +1103,7 @@ async function getCallSessionVoiceSettings(
 
   const assistantRoute = await resolveCallSessionAssistantRoute(session.agentId, {
     capabilityRequiredProviders,
+    assistantProviderCapabilities,
   });
 
   return {
@@ -1113,6 +1128,7 @@ async function updateCallSessionVoiceSettings({
   touch = true,
   persistToUserDefaults = true,
   capabilityRequiredProviders = [],
+  assistantProviderCapabilities = {},
 }) {
   if (!callSessionId) {
     throw new Error('updateCallSessionVoiceSettings requires callSessionId');
@@ -1158,6 +1174,7 @@ async function updateCallSessionVoiceSettings({
 
   const assistantRoute = await resolveCallSessionAssistantRoute(normalizedSession.agentId, {
     capabilityRequiredProviders,
+    assistantProviderCapabilities,
   });
 
   return {
@@ -1222,9 +1239,9 @@ async function claimVoiceSession({
 }
 
 /* === VIVENTIUM START ===
- * Feature: Voice gateway failed-start lease release
- * Purpose: Let the exact worker that owns a pre-connect claim abandon it after owner timeout,
- * mismatch, or initialization failure. The compare-and-clear cannot release another worker and
+ * Feature: Exact voice gateway lease release
+ * Purpose: Let the exact worker release its claim after startup failure or after terminal media
+ * failure and local authenticated couriers have stopped. The compare-and-clear cannot release another worker and
  * never changes call status, conversation work, dispatch state, or task state.
  * === VIVENTIUM END === */
 async function abandonVoiceSessionClaim({ callSessionId, jobId, workerId }) {
@@ -1296,6 +1313,8 @@ async function reportVoiceSessionFailure({
       callStatus: { $ne: 'ended' },
       activeJobId: String(jobId),
       activeWorkerId: String(workerId),
+      // A later provider degradation cannot erase an accepted terminal failure.
+      ...(fatal === true ? {} : { 'callFailure.fatal': { $ne: true } }),
     },
     {
       $set: {
@@ -1561,8 +1580,10 @@ async function assertVoiceGatewayAuth(req, { nowMs, allowEnded = false } = {}) {
           activeJobId: normalizedJobId,
           $or: [{ activeWorkerId: normalizedWorkerId }, { activeWorkerId: null }],
         },
-        { activeJobId: null },
-        { leaseExpiresAt: { $lt: now } },
+        // A terminal worker's late request cannot reclaim an abandoned lease.
+        // Retry uses the explicit claim route before its ready handshake.
+        { activeJobId: null, 'callFailure.fatal': { $ne: true } },
+        { leaseExpiresAt: { $lt: now }, 'callFailure.fatal': { $ne: true } },
       ],
     },
     {

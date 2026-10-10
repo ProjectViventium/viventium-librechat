@@ -33,6 +33,8 @@ const {
 } = require('~/server/services/viventium/GlassHiveCallbackDeliveryService');
 const {
   confirmGlassHiveCallbackContext,
+  fenceGlassHiveCallbackRunState,
+  isGlassHiveNonterminalAttentionCallback,
   notifySchedulerExternalWorkSummary,
   recordGlassHiveCallbackExternalState,
   recordGlassHiveAdjudicationOutcome,
@@ -1006,6 +1008,10 @@ function buildCallbackMetadata({
     viventium: {
       ...previousViventium,
       type: GLASSHIVE_CALLBACK_TYPE,
+      // Keep the neutral completion receipt internal while Main authors the result.
+      ...(body?.event === 'run.completed' && isGlassHiveWorkTerminalCallback(body) && !hasFullText
+        ? { visibility: 'internal' }
+        : {}),
       parentMessageId: requestedParentMessageId || parentMessageId,
       treeParentMessageId,
       requestedParentMessageId,
@@ -1178,6 +1184,7 @@ class TerminalCallbackEffectFenceError extends Error {
 async function handleGlassHiveCallback(req, res) {
   let terminalEffectScope = null;
   let terminalEffectLease = null;
+  let nonterminalAttentionScope = null;
   res.locals.releaseGlassHiveTerminalEffectLease = async () => {
     const lease = terminalEffectLease;
     terminalEffectLease = null;
@@ -1215,17 +1222,22 @@ async function handleGlassHiveCallback(req, res) {
       return null;
     };
     try {
-      if (!terminalEffectLease) {
+      if (!terminalEffectLease && !nonterminalAttentionScope) {
         result = await effect(null, null, (operation) => operation());
       } else {
         await runGlassHiveTerminalCallbackTransaction(async (session) => {
           effectSession = session;
+          if (nonterminalAttentionScope) {
+            await fenceGlassHiveCallbackRunState({ ...nonterminalAttentionScope, effectSession });
+          }
           result = await effect(terminalEffectLease, effectSession, stageAfterCommit);
-          const stillCurrent = await fenceGlassHiveTerminalCallbackResultEffectTransaction({
-            ResultModel: GlassHiveTerminalCallbackResult,
-            lease: terminalEffectLease,
-            session: effectSession,
-          });
+          const stillCurrent =
+            !terminalEffectLease ||
+            (await fenceGlassHiveTerminalCallbackResultEffectTransaction({
+              ResultModel: GlassHiveTerminalCallbackResult,
+              lease: terminalEffectLease,
+              session: effectSession,
+            }));
           if (!stillCurrent) {
             throw Object.assign(new Error('glasshive_callback_effect_fenced'), {
               code: 'glasshive_callback_effect_fenced',
@@ -1238,6 +1250,18 @@ async function handleGlassHiveCallback(req, res) {
         }
       }
     } catch (err) {
+      if (err?.code === 'glasshive_callback_notice_superseded') {
+        throw new TerminalCallbackEffectFenceError({
+          httpStatus: 202,
+          receipt: { status: 'suppressed', reason: 'callback_notice_superseded' },
+        });
+      }
+      if (err?.code === 'glasshive_callback_run_binding_not_ready') {
+        throw new TerminalCallbackEffectFenceError({
+          httpStatus: 425,
+          error: 'callback_run_binding_not_ready',
+        });
+      }
       const transactionConflict =
         [112, 244, 251].includes(Number(err?.code)) ||
         err?.hasErrorLabel?.('TransientTransactionError') === true;
@@ -1280,25 +1304,39 @@ async function handleGlassHiveCallback(req, res) {
   const requestedParentMessageId = String(deliveryContext.requestedParentMessageId || '').trim();
   const anchorMessageId = String(deliveryContext.anchorMessageId || '').trim();
   const event = String(callbackBody.event || '').trim();
+  if (isGlassHiveNonterminalAttentionCallback(callbackBody)) {
+    nonterminalAttentionScope = { binding: deliveryContext, body: callbackBody };
+  }
   if (!userId || !conversationId || !requestedParentMessageId || !anchorMessageId) {
     return res.status(425).json({ error: 'callback_delivery_binding_not_ready' });
   }
   let terminalResultReceipt = null;
   try {
-    const terminalResultGate = await receiveGlassHiveTerminalCallbackResult({
-      ResultModel: GlassHiveTerminalCallbackResult,
-      body: rawBody,
-      headers: {
-        callbackId: req.get('x-glasshive-callback-id'),
-        resultRevision: req.get('x-glasshive-result-revision'),
-        resultDigest: req.get('x-glasshive-result-digest'),
-      },
-      trustedScope: {
-        ownerId: deliveryContext.ownerId,
-        originRef: deliveryContext.originRef,
-        workRef: deliveryContext.workRef,
-      },
-    });
+    const receiveTerminalResult = () =>
+      receiveGlassHiveTerminalCallbackResult({
+        ResultModel: GlassHiveTerminalCallbackResult,
+        body: rawBody,
+        headers: {
+          callbackId: req.get('x-glasshive-callback-id'),
+          resultRevision: req.get('x-glasshive-result-revision'),
+          resultDigest: req.get('x-glasshive-result-digest'),
+        },
+        trustedScope: {
+          ownerId: deliveryContext.ownerId,
+          originRef: deliveryContext.originRef,
+          workRef: deliveryContext.workRef,
+        },
+      });
+    const terminalResultGate = isGlassHiveWorkTerminalCallback(callbackBody)
+      ? await runGlassHiveTerminalCallbackTransaction(async (effectSession) => {
+          await fenceGlassHiveCallbackRunState({
+            binding: deliveryContext,
+            body: callbackBody,
+            effectSession,
+          });
+          return receiveTerminalResult();
+        })
+      : await receiveTerminalResult();
     if (terminalResultGate.applies && 'error' in terminalResultGate) {
       return res.status(terminalResultGate.httpStatus).json({ error: terminalResultGate.error });
     }

@@ -539,6 +539,11 @@ async function saveMessage(req, params, metadata) {
 
     return typeof message.toObject === 'function' ? message.toObject() : message;
   } catch (err) {
+    /* === VIVENTIUM START === Preserve the shared Native model's internal missing-row type. === */
+    if (err.message === 'native_response_message_deleted') {
+      err.code = 'native_response_message_deleted';
+    }
+    /* === VIVENTIUM END === */
     logger.error('Error saving message:', err);
     logger.info(`---\`saveMessage\` context: ${metadata?.context}`);
 

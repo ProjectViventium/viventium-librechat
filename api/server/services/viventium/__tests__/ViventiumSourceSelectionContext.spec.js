@@ -153,7 +153,9 @@ describe('ViventiumSourceSelectionContext', () => {
     ]);
 
     expect(decodedLabels(capsule)).toEqual(['S1', 'S2']);
-    expect(capsule).toContain('earlier inputs deferred to it');
+    expect(capsule).toContain(
+      'earlier unanswered inputs whose prior presentation was removed or that were deferred to it',
+    );
     expect(capsule).not.toContain('owns only the current accepted input');
     expect(capsule).not.toContain('Unlisted earlier inputs');
     expect(capsule).not.toContain('Copy only the two totals');

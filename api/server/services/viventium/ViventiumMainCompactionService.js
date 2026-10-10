@@ -224,6 +224,9 @@ function compactorAgent(agent, domainEpochKey, stage = 'compaction') {
     agent_ids: [],
     edges: [],
     tools: [],
+    declaredToolNames: [],
+    toolDefinitions: [],
+    toolRegistry: new Map(),
     mcp: [],
     tool_resources: {},
     tool_options: {},
@@ -248,6 +251,9 @@ async function defaultExecuteCompactor({
   if (!req || !agent) throw new Error('main_compaction_runtime_unavailable');
   const { createBackgroundRes, executeCortex } = require('../BackgroundCortexService');
   const safeReq = Object.create(req);
+  // This internal read-only, tool-less actor owns the accepted claim, not the triggering call.
+  // Inheriting a call session would misclassify its isolated body as an unverified voice turn.
+  safeReq.viventiumCallSession = null;
   safeReq.body = {
     conversationId: `main-continuity-compaction-${claim.domainEpochKey.slice(0, 24)}`,
   };
@@ -278,6 +284,8 @@ async function defaultExecuteCompactor({
       mainContextBinding: 'isolated',
       completedResultPolicy: 'internal',
       insightMode: 'structured',
+      // This owner is a pure text actor; reuse the signed native zero-tool capability.
+      nativeTools: false,
       // A repair bounded by the claim lease never outlives it; native cancellation stays owned here.
       executionTimeoutMs:
         Number.isFinite(timeoutMs) && timeoutMs > 0

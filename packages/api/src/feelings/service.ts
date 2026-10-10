@@ -194,6 +194,16 @@ function normalizedReactionInstruction(value: StoredFeelingState['reactionInstru
   return instruction;
 }
 
+/** The existing temporary/explicit-QA boundary owns isolation, never prompt contents. */
+export function isFeelingsReadIsolated(body?: {
+  isTemporary?: boolean;
+  viventiumQaRun?: boolean;
+  viventiumEvalIsolation?: { feelings?: boolean };
+}): boolean {
+  return (body?.isTemporary === true || body?.viventiumQaRun === true)
+    && body?.viventiumEvalIsolation?.feelings === true;
+}
+
 export async function loadFeelingsReadContext({
   userId,
   getFeelingState,

@@ -170,7 +170,8 @@ export function createVoiceWorkAuthorityBinding(input: {
   const kind = input.typedInput ? 'participant_text' : 'audio';
   const modeRevision = Number(session.revision ?? session.callModeRevision ?? 0);
   const speakerRevision = Number(session.speakerSessionRevision ?? 0);
-  const segments = recordsFrom(input.segments)
+  const rawSegments = recordsFrom(input.segments);
+  const segments = rawSegments
     .map((segment) => ({
       segmentId: segment.segmentId,
       turnId: segment.turnId,
@@ -196,7 +197,9 @@ export function createVoiceWorkAuthorityBinding(input: {
     !Number.isSafeInteger(speakerRevision) ||
     speakerRevision < 0 ||
     (kind === 'audio' &&
-      (!segments.length ||
+      ((mode !== 'call' &&
+        rawSegments.some((segment) => recordFrom(segment.speaker).source === 'participant_track')) ||
+        !segments.length ||
         segments.some(
           (segment) =>
             !segment.segmentId ||
@@ -274,6 +277,7 @@ export function createVoiceEngagementAuthorityService(deps: VoiceEngagementAutho
   function finalizedOwnerSpeakerAuthority(segments: unknown, session: unknown): boolean {
     const values = recordsFrom(segments);
     const sessionRecord = recordFrom(session);
+    const mode = canonicalVoiceSessionMode(sessionRecord);
     const expectedOwner = String(sessionRecord.ownerParticipantIdentity || '');
     const authority = recordFrom(
       deps.voiceTurnAuthority(values, {
@@ -293,6 +297,7 @@ export function createVoiceEngagementAuthorityService(deps: VoiceEngagementAutho
           speaker.participantIdentity === expectedOwner &&
           speaker.attribution === 'verified' &&
           speaker.actorTrust === 'owner_participant' &&
+          (speaker.source !== 'participant_track' || mode === 'call') &&
           segment.overlap !== true &&
           segment.uncertain !== true
         );

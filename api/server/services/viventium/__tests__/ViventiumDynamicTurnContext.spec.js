@@ -380,7 +380,7 @@ describe('ViventiumDynamicTurnContext', () => {
     expect(capsule).toContain(
       'Main opening delivered artifacts after callbacks is presentation work, not Worker host access',
     );
-    expect(capsule).toContain(
+    expect(capsule).not.toContain(
       'If the first mission launch is blocked, do not attempt later sibling launches in that turn',
     );
   });
@@ -424,39 +424,67 @@ describe('ViventiumDynamicTurnContext', () => {
     expect(capsule).not.toContain('No active work is present in this fresh authoritative snapshot');
   });
 
-  test('voice gets only count and urgent attention, with full roster on demand', () => {
-    const capsule = buildActiveWorkCapsule({
-      mode: 'parallel',
-      voice: true,
-      snapshot: {
+  test.each(['focused', 'parallel'])(
+    'voice %s retains the same bounded work facts and action semantics',
+    (mode) => {
+      const snapshot = {
         snapshot: 'fresh',
         overflowCount: 0,
         work: [
           {
             workRef: 'work-1',
-            title: 'Long private title not needed in voice capsule',
+            title: 'Needs approval',
             state: 'needs_input',
             attention: { kind: 'auth', summary: 'Reconnect the account' },
             actions: ['resume'],
           },
-          { workRef: 'work-2', title: 'Another mission', state: 'running', actions: ['stop'] },
+          {
+            workRef: 'work-2',
+            title: 'Ordinary running mission',
+            state: 'running',
+            actions: ['message', 'stop'],
+          },
         ],
-      },
-    });
+      };
+      const capsule = buildActiveWorkCapsule({ mode, voice: true, snapshot });
+      expect(capsule).toEqual(buildActiveWorkCapsule({ mode, snapshot }));
+      expect(decodeUntrustedRoster(capsule).work).toEqual([
+        expect.objectContaining({ workRef: 'work-1', state: 'needs_input' }),
+        expect.objectContaining({
+          workRef: 'work-2',
+          state: 'running',
+          actions: ['message', 'stop'],
+        }),
+      ]);
+      expect(capsule).toContain('active_work_list');
+      expect(capsule).toContain('Message delivers noninterrupting guidance');
+      expect(capsule).not.toContain('Reconnect the account');
+    },
+  );
 
-    expect(capsule).toContain('Active count: 2');
-    expect(capsule).not.toContain('Reconnect the account');
-    expect(decodeUntrustedRoster(capsule).work).toEqual([
-      expect.objectContaining({
-        workRef: 'work-1',
-        attention: { kind: 'auth', summary: 'Reconnect the account' },
-      }),
-    ]);
-    expect(capsule).toContain('active_work_list');
-    expect(capsule).toContain('Queue persists a follow-up behind the current objective');
-    expect(capsule).toContain('Message delivers noninterrupting guidance');
-    expect(capsule).not.toContain('Long private title');
-  });
+  test.each(['focused', 'parallel'])(
+    'voice %s preserves shared unavailable, stale and readiness truth',
+    (mode) => {
+      for (const snapshot of [
+        { snapshot: 'unavailable', work: null, overflowCount: null },
+        { snapshot: 'stale', work: [], overflowCount: 3 },
+      ]) {
+        const args = {
+          mode,
+          requestedMode: 'parallel',
+          available: false,
+          readiness: { status: 'unready', reason: 'storage_pressure_critical' },
+          snapshot,
+        };
+        const capsule = buildActiveWorkCapsule({ ...args, voice: true });
+        expect(capsule).toEqual(buildActiveWorkCapsule(args));
+        expect(capsule).not.toContain(
+          'No active work is present in this fresh authoritative snapshot',
+        );
+        expect(capsule).toContain('active_work_list');
+      }
+    },
+  );
 
   test('prioritizes attention and stopping work before recent ordinary work under the byte cap', () => {
     const ordinary = Array.from({ length: 120 }, (_, index) => ({
@@ -492,31 +520,35 @@ describe('ViventiumDynamicTurnContext', () => {
     expect(Buffer.byteLength(capsule, 'utf8')).toBeLessThanOrEqual(16 * 1024);
   });
 
-  test('honors the caller-owned shared turn-context byte budget without splitting roster data', () => {
-    const capsule = buildActiveWorkCapsule({
-      mode: 'parallel',
-      maxBytes: 7 * 1024,
-      snapshot: {
-        snapshot: 'fresh',
-        overflowCount: 0,
-        work: Array.from({ length: 100 }, (_, index) => ({
-          workRef: `work-${index}`,
-          title: `Mission ${index} ${'x'.repeat(500)}`,
-          state: index === 99 ? 'needs_input' : 'running',
-          attention: index === 99 ? { kind: 'approval', summary: 'Review required' } : undefined,
-          actions: ['message', 'stop'],
-          updatedAt: new Date(2_000_000_000_000 - index * 1000).toISOString(),
-        })),
-      },
-    });
+  test.each([false, true])(
+    'honors the caller-owned shared turn-context byte budget without splitting roster data (voice=%s)',
+    (voice) => {
+      const capsule = buildActiveWorkCapsule({
+        mode: 'parallel',
+        maxBytes: 7 * 1024,
+        voice,
+        snapshot: {
+          snapshot: 'fresh',
+          overflowCount: 0,
+          work: Array.from({ length: 100 }, (_, index) => ({
+            workRef: `work-${index}`,
+            title: `Mission ${index} ${'x'.repeat(500)}`,
+            state: index === 99 ? 'needs_input' : 'running',
+            attention: index === 99 ? { kind: 'approval', summary: 'Review required' } : undefined,
+            actions: ['message', 'stop'],
+            updatedAt: new Date(2_000_000_000_000 - index * 1000).toISOString(),
+          })),
+        },
+      });
 
-    expect(Buffer.byteLength(capsule, 'utf8')).toBeLessThanOrEqual(7 * 1024);
-    expect(decodeUntrustedRoster(capsule).work[0]).toEqual(
-      expect.objectContaining({ workRef: 'work-99', state: 'needs_input' }),
-    );
-    expect(capsule).toContain('</viventium_untrusted_active_work_data>');
-    expect(capsule).toContain('Roster truncated');
-  });
+      expect(Buffer.byteLength(capsule, 'utf8')).toBeLessThanOrEqual(7 * 1024);
+      expect(decodeUntrustedRoster(capsule).work[0]).toEqual(
+        expect.objectContaining({ workRef: 'work-99', state: 'needs_input' }),
+      );
+      expect(capsule).toContain('</viventium_untrusted_active_work_data>');
+      expect(capsule).toContain('Roster truncated');
+    },
+  );
 
   test('focused mode with no known work performs no GlassHive snapshot call', async () => {
     const getActiveWorkSnapshotImpl = jest.fn();
@@ -629,7 +661,8 @@ describe('ViventiumDynamicTurnContext', () => {
       available: false,
     });
 
-    expect(capsule).toBe('');
+    expect(capsule).toContain('Mode: focused');
+    expect(capsule).toContain('"requestedMode":"parallel","available":false');
     expect(getActiveWorkSnapshotImpl).not.toHaveBeenCalled();
   });
 
@@ -769,7 +802,8 @@ describe('ViventiumDynamicTurnContext', () => {
         getActiveWorkSnapshotImpl,
       });
 
-      expect(capsule).toBe('');
+      expect(capsule).toContain('Mode: focused');
+      expect(capsule).toContain('"requestedMode":"parallel","available":false');
       expect(getActiveWorkSnapshotImpl).not.toHaveBeenCalled();
     } finally {
       resetOrchestrationReadinessForTests();
@@ -844,7 +878,10 @@ describe('ViventiumDynamicTurnContext', () => {
           getActiveWorkSnapshotImpl,
         });
         if (recovers) expect(capsule).toContain('Mode: parallel');
-        else expect(capsule).toBe('');
+        else {
+          expect(capsule).toContain('Mode: focused');
+          expect(capsule).toContain('"requestedMode":"parallel","available":false');
+        }
         expect(request._viventiumParallelWorkTurnAvailable).toBe(recovers);
         expect(refresh).toHaveBeenCalledTimes(1);
         expect(refresh).toHaveBeenCalledWith({ ownerId });
@@ -885,7 +922,7 @@ describe('ViventiumDynamicTurnContext', () => {
           request,
           getActiveWorkSnapshotImpl,
         }),
-      ).toBe('');
+      ).toContain('"requestedMode":"parallel","available":false');
       expect(request._viventiumParallelWorkTurnAvailable).toBe(false);
       expect(refresh).not.toHaveBeenCalled();
       expect(getActiveWorkSnapshotImpl).not.toHaveBeenCalled();
@@ -929,5 +966,156 @@ describe('ViventiumDynamicTurnContext', () => {
       expect.objectContaining({ workRef: 'work-1' }),
     ]);
     expect(getActiveWorkSnapshotImpl).toHaveBeenCalledTimes(1);
+  });
+
+  test('honors the caller-owned shared turn-context byte budget without splitting roster data', () => {
+    const capsule = buildActiveWorkCapsule({
+      mode: 'parallel',
+      maxBytes: 7 * 1024,
+      snapshot: {
+        snapshot: 'fresh',
+        overflowCount: 0,
+        work: Array.from({ length: 100 }, (_, index) => ({
+          workRef: `work-${index}`,
+          title: `Mission ${index} ${'x'.repeat(500)}`,
+          state: index === 99 ? 'needs_input' : 'running',
+          attention: index === 99 ? { kind: 'approval', summary: 'Review required' } : undefined,
+          actions: ['message', 'stop'],
+          updatedAt: new Date(2_000_000_000_000 - index * 1000).toISOString(),
+        })),
+      },
+    });
+
+    expect(Buffer.byteLength(capsule, 'utf8')).toBeLessThanOrEqual(7 * 1024);
+    expect(decodeUntrustedRoster(capsule).work[0]).toEqual(
+      expect.objectContaining({ workRef: 'work-99', state: 'needs_input' }),
+    );
+    expect(capsule).toContain('</viventium_untrusted_active_work_data>');
+    expect(capsule).toContain('Roster truncated');
+  });
+
+  test('voice retains the complete same owner-scoped roster and worker action context', () => {
+    const capsule = buildActiveWorkCapsule({
+      mode: 'parallel',
+      voice: true,
+      snapshot: {
+        snapshot: 'fresh',
+        overflowCount: 0,
+        work: [
+          {
+            workRef: 'work-1',
+            title: 'Long private title not needed in voice capsule',
+            state: 'needs_input',
+            attention: { kind: 'auth', summary: 'Reconnect the account' },
+            actions: ['resume'],
+          },
+          { workRef: 'work-2', title: 'Another mission', state: 'running', actions: ['stop'] },
+        ],
+      },
+    });
+
+    expect(decodeUntrustedRoster(capsule).work).toHaveLength(2);
+    expect(capsule).not.toContain('Reconnect the account');
+    expect(decodeUntrustedRoster(capsule).work).toEqual([
+      expect.objectContaining({
+        workRef: 'work-1',
+        attention: { kind: 'auth', summary: 'Reconnect the account' },
+        actions: ['resume'],
+      }),
+      expect.objectContaining({ workRef: 'work-2', state: 'running', actions: ['stop'] }),
+    ]);
+    expect(capsule).toContain('active_work_list');
+    expect(capsule).toContain('Queue persists a follow-up behind the current objective');
+    expect(capsule).toContain('Message delivers noninterrupting guidance');
+    expect(capsule).not.toContain('Long private title');
+  });
+});
+
+describe('readiness capsule facts: requested preference and capability truth', () => {
+  const read = (capsule) =>
+    JSON.parse(
+      capsule
+        .split('\n')
+        .find((line) => line.startsWith('New work readiness: '))
+        .slice('New work readiness: '.length),
+    );
+  test.each([false, true])(
+    'unready requested Parallel retains reason on voice=%s without a new roster read',
+    async (voice) => {
+      const request = {
+        _viventiumParallelWorkTurnAvailable: false,
+        _viventiumParallelWorkTurnReadiness: {
+          status: 'unready',
+          reason: 'storage_pressure_critical',
+        },
+      };
+      const resolve = jest.fn();
+      const roster = jest.fn();
+      const capsule = await loadActiveWorkTurnContext({
+        userId: 'owner-a',
+        user: { personalization: { orchestration_mode: 'parallel', parallel_work_known: false } },
+        available: false,
+        request,
+        voice,
+        resolveParallelAvailabilityImpl: resolve,
+        getActiveWorkSnapshotImpl: roster,
+      });
+      expect(read(capsule)).toEqual({
+        requestedMode: 'parallel',
+        available: false,
+        status: 'unready',
+        reason: 'storage_pressure_critical',
+      });
+      expect(capsule).toContain('Mode: focused');
+      expect(capsule).toContain('Roster: unavailable');
+      expect(request._viventiumParallelWorkTurnAvailable).toBe(false);
+      expect(resolve).not.toHaveBeenCalled();
+      expect(roster).not.toHaveBeenCalled();
+    },
+  );
+  test('available Parallel and intentionally Focused are different facts', () => {
+    const snapshot = { snapshot: 'fresh', work: [], overflowCount: 0 };
+    const ready = buildActiveWorkCapsule({
+      mode: 'parallel',
+      requestedMode: 'parallel',
+      available: true,
+      readiness: { status: 'ready', reason: '' },
+      snapshot,
+      voice: true,
+    });
+    const focused = buildActiveWorkCapsule({
+      mode: 'focused',
+      requestedMode: 'focused',
+      available: false,
+      snapshot,
+      voice: true,
+    });
+    expect(ready).not.toContain('New work readiness:');
+    expect(focused).not.toContain('New work readiness:');
+    expect(focused).not.toContain('storage_pressure_critical');
+  });
+  test('accepted work and its actions survive unavailable new delegation', async () => {
+    const capsule = await loadActiveWorkTurnContext({
+      userId: 'owner-a',
+      user: { personalization: { orchestration_mode: 'parallel', parallel_work_known: true } },
+      available: false,
+      request: {
+        _viventiumParallelWorkTurnReadiness: {
+          status: 'unready',
+          reason: 'storage_pressure_critical',
+        },
+      },
+      getActiveWorkSnapshotImpl: async () => ({
+        snapshot: 'fresh',
+        work: [{ workRef: 'work-a', title: 'Synthetic work', state: 'running', actions: ['stop'] }],
+        overflowCount: 0,
+      }),
+    });
+    expect(read(capsule).available).toBe(false);
+    expect(decodeUntrustedRoster(capsule).work[0]).toMatchObject({
+      workRef: 'work-a',
+      state: 'running',
+      actions: ['stop'],
+    });
   });
 });

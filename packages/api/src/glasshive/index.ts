@@ -1,6 +1,7 @@
 /* === VIVENTIUM START === Durable GlassHive terminal-result receiver CAS === */
 export * from './terminalCallbackResultCas';
 export * from './sourceSelection';
+export * from './sourceAuthor';
 export * from './accountUrl';
 export * from './accountClient';
 export * from './activeWorkService';
@@ -35,3 +36,5 @@ export * from './backgroundWorkerRoute';
 
 export * from './nativeVoiceInput';
 export * from './nativeWorkInput';
+export * from './sourceMutation';
+export { prepareNativeSourceRecovery } from './nativeSupersession';

@@ -176,6 +176,7 @@ const ContentParts = memo(function ContentParts({
             isLatestMessage,
             viventiumPartId: renderIdentity.partId,
             viventiumAgentId: renderIdentity.agentId,
+            viventiumFileAttachments: attachments,
           }}
         >
           <Part
@@ -193,6 +194,7 @@ const ContentParts = memo(function ContentParts({
     },
     [
       attachmentMap,
+      attachments,
       displayContent,
       conversationId,
       effectiveIsSubmitting,

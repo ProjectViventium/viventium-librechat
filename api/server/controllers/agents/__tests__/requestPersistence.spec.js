@@ -9,6 +9,7 @@ jest.mock('~/server/services/viventium/VoiceOrchestrationTraceService', () => ({
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: {
     debug: jest.fn(),
     info: jest.fn(),
@@ -27,6 +28,7 @@ jest.mock('librechat-data-provider', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   isAudioDeliveryRequested: (req) =>
     (req?._viventiumTelegram === true && req?.body?.telegramAudioRequested === true) ||
     (req?.body?.voiceMode === true && Boolean(req?.viventiumCallSession?.callSessionId)),
@@ -116,26 +118,55 @@ jest.mock('~/server/services/viventium/VoiceTaskService', () => ({
 describe('request persistence helpers', () => {
   const { __testables } = require('../request');
 
-  it('cleans a rejected snapshot while preserving its failure for the caller', async () => {
-    const inFlight = new Set();
-    const failure = new Error('synthetic storage failure');
-    const snapshot = __testables.trackInFlightSnapshot(inFlight, async () => {
-      throw failure;
-    });
-    expect(inFlight.has(snapshot)).toBe(true);
-    await expect(snapshot).rejects.toBe(failure);
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(inFlight.size).toBe(0);
+  it('preserves authenticated Voice raw public ranges and excludes private content', () => {
+    const req = {
+      viventiumCallSession: { callSessionId: 'synthetic-call' },
+      body: { voiceMode: true },
+    };
+    const text = 'Secret.One <whisper>Public 🟢.</whisper>';
+    const part = {
+      type: 'text',
+      text,
+      deliveryDispositionRanges: [
+        { start: 0, end: 10 },
+        { start: 10, end: text.length },
+      ],
+    };
+    const response = {
+      text,
+      content: [
+        { type: 'think', think: 'Synthetic private block.' },
+        part,
+        { type: 'reasoning', text: 'Synthetic private block.' },
+      ],
+    };
+    const transmitted = __testables.normalizeAssistantResponseForTransmit(req, response);
+    expect(transmitted.text).toBe(text);
+    expect(transmitted.content).toEqual([part]);
+    expect(response.content).toHaveLength(3);
+    const persisted = __testables.normalizePersistedAssistantResponse(req, response);
+    expect(persisted.content[0]).not.toHaveProperty('deliveryDispositionRanges');
+    expect(persisted.text).toBe('Secret. One Public 🟢.');
+    const unauthenticated = __testables.normalizeAssistantResponseForTransmit(
+      { body: { voiceMode: true } },
+      response,
+    );
+    expect(unauthenticated.content[0]).not.toHaveProperty('deliveryDispositionRanges');
+    expect(unauthenticated.content).toHaveLength(1);
   });
 
-  it('cleans a completed snapshot and returns its persisted result', async () => {
-    const inFlight = new Set();
-    const persisted = { messageId: 'synthetic-persisted-message' };
-    const snapshot = __testables.trackInFlightSnapshot(inFlight, () => persisted);
-    expect(inFlight.has(snapshot)).toBe(true);
-    await expect(snapshot).resolves.toBe(persisted);
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(inFlight.size).toBe(0);
+  it('invalidates ranges at the first interrupted snapshot cleanup pass', () => {
+    const raw = '<emotion value="calm"/>Public.';
+    const part = {
+      type: 'text',
+      text: raw,
+      deliveryDispositionRanges: [{ start: 0, end: raw.length }],
+    };
+    const result = __testables.sanitizePersistedAssistantContent({ body: { voiceMode: true } }, [
+      part,
+    ]);
+    expect(result[0]).toEqual({ type: 'text', text: 'Public.' });
+    expect(part.deliveryDispositionRanges).toHaveLength(1);
   });
 
   it('settles a typed context failure as failed even when the response error flag is absent', () => {
@@ -789,6 +820,28 @@ describe('request persistence helpers', () => {
       expect.objectContaining({ context: 'test-explicit-state' }),
     );
   });
+
+  it('cleans a completed snapshot and returns its persisted result', async () => {
+    const inFlight = new Set();
+    const persisted = { messageId: 'synthetic-persisted-message' };
+    const snapshot = __testables.trackInFlightSnapshot(inFlight, () => persisted);
+    expect(inFlight.has(snapshot)).toBe(true);
+    await expect(snapshot).resolves.toBe(persisted);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(inFlight.size).toBe(0);
+  });
+
+  it('cleans a rejected snapshot while preserving its failure for the caller', async () => {
+    const inFlight = new Set();
+    const failure = new Error('synthetic storage failure');
+    const snapshot = __testables.trackInFlightSnapshot(inFlight, async () => {
+      throw failure;
+    });
+    expect(inFlight.has(snapshot)).toBe(true);
+    await expect(snapshot).rejects.toBe(failure);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(inFlight.size).toBe(0);
+  });
 });
 
 describe('superseded Web presentation removal receipt', () => {
@@ -845,6 +898,63 @@ describe('superseded Web presentation removal receipt', () => {
     ).toBe(true);
     expect(mockAcknowledgeStreamDelivery).not.toHaveBeenCalled();
   });
+
+  function bindStoredRow(nativeResponse, patch = {}) {
+    const row = {
+      _id: 'row',
+      user: 'owner',
+      messageId: 'old-response',
+      isCreatedByUser: false,
+      unfinished: true,
+      metadata: { viventium: { interactionContext: context } },
+      nativeResponse,
+      ...patch,
+    };
+    const matches = (query) =>
+      Object.entries(query).every(([key, expected]) => {
+        if (key === '$nor') return expected.every((clause) => !matches(clause));
+        const actual = key.split('.').reduce((value, field) => value?.[field], row);
+        if (expected && typeof expected === 'object') {
+          if ('$ne' in expected) return actual !== expected.$ne;
+          if ('$gt' in expected) return typeof actual === 'number' && actual > expected.$gt;
+        }
+        return actual === expected;
+      });
+    require('~/db/models').Message.findOneAndDelete.mockImplementation(async (query) =>
+      matches(query) ? row : null,
+    );
+  }
+  test('a confirmed Stop remains durable when its presentation appears in a successor list', async () => {
+    bindStoredRow({ status: 'cancelled', stopSnapshotStoredAt: 100 });
+    expect(await remove()).toBe(false);
+    expect(mockAcknowledgeStreamDelivery).not.toHaveBeenCalled();
+    expect(require('~/db/models').Conversation.collection.updateOne).not.toHaveBeenCalled();
+  });
+  test.each([
+    { status: 'pending' },
+    { status: 'prepared' },
+    { status: 'cancelled' },
+    { status: 'cancelled', stopSnapshotStoredAt: 0 },
+    { status: 'cancelled', stopSnapshotStoredAt: -1 },
+    { status: 'cancelled', stopSnapshotStoredAt: null },
+    { status: 'failed', stopSnapshotStoredAt: 100 },
+  ])('ordinary unfinished supersession remains removable: %p', async (admission) => {
+    bindStoredRow(admission);
+    expect(await remove()).toBe(true);
+    expect(mockAcknowledgeStreamDelivery).toHaveBeenCalledTimes(1);
+  });
+  test.each([
+    { user: 'foreign' },
+    { messageId: 'other-response' },
+    { metadata: { viventium: { interactionContext: { ...context, revision: 2 } } } },
+    { isCreatedByUser: true },
+    { unfinished: false },
+  ])('Stop exclusion keeps the existing exact deletion guards: %p', async (patch) => {
+    bindStoredRow({ status: 'cancelled' }, patch);
+    expect(await remove()).toBe(false);
+    expect(mockAcknowledgeStreamDelivery).not.toHaveBeenCalled();
+  });
+
   test('optional receipt failure does not undo successful deletion', async () => {
     mockAcknowledgeStreamDelivery.mockRejectedValue(new Error('store unavailable'));
     expect(await remove()).toBe(true);

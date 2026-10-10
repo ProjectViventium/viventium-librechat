@@ -1,4 +1,5 @@
 import { interactionPresentationSequence } from '../../agents/interactionContext';
+import { nativeSourceRecoveryUnconfirmed } from '../../glasshive/nativeSupersession';
 import type { NativeResponseIdentity, NativeResponseCommit } from '@librechat/data-schemas';
 import {
   nativeIdentityJson,
@@ -19,6 +20,7 @@ import {
 import { normalizeInteractionSourceSegments } from '../../glasshive/interactionSourceSegments';
 import { createHash, randomUUID } from 'crypto';
 import { createContentAggregator } from '@librechat/agents';
+import { retainAggregatedDeliveryDisposition } from '../../channels/deliveryDisposition';
 import type { StandardGraph } from '@librechat/agents';
 import type { Agents } from 'librechat-data-provider';
 import type { Redis, Cluster } from 'ioredis';
@@ -313,7 +315,13 @@ export class RedisJobStore implements IJobStore {
    * Enables fast reconnects when client returns to the same server.
    * Uses WeakRef to allow garbage collection when graph is no longer needed.
    */
-  private localGraphCache = new Map<string, WeakRef<StandardGraph>>();
+  private localGraphCache = new Map<
+    string,
+    {
+      graphRef?: WeakRef<StandardGraph>;
+      contentPartsRef?: WeakRef<Agents.MessageContentComplex[]>;
+    }
+  >();
 
   /**
    * Local cache for collectedUsage arrays.
@@ -418,7 +426,7 @@ export class RedisJobStore implements IJobStore {
 
   /* VIVENTIUM START: co-slotted publication authority with a fixed recovery deadline. */
   private async nativePublication(
-    mode: 'bind' | 'commit' | 'revoke' | 'cancel' | 'read',
+    mode: 'bind' | 'commit' | 'revoke' | 'cancel' | 'read' | 'read-unbound',
     job: NativeJobOwner,
     identity?: NativeResponseIdentity,
     candidateSha256 = '',
@@ -1302,12 +1310,71 @@ export class RedisJobStore implements IJobStore {
     });
   }
 
+  async isNativeResponseUnboundCancelled(expected: SerializableJobData): Promise<boolean> {
+    const job = await this.getJob(expected.streamId);
+    if (!job || job.createdAt !== expected.createdAt || job.userId !== expected.userId ||
+      job.responseMessageId !== expected.responseMessageId || job.conversationId !== expected.conversationId ||
+      job.status !== 'superseded' || job.nativeResponseCancelled !== true ||
+      job.interactionContext?.logical_turn_id !== expected.interactionContext?.logical_turn_id ||
+      job.interactionContext?.revision !== expected.interactionContext?.revision) return false;
+    return (await this.nativePublication('read-unbound', job)).status === 'revoked';
+  }
+
+  async getLogicalTurnSourcePredecessors(
+    streamId: string, userId: string, interactionContext: InteractionContext,
+  ): Promise<SerializableJobData[]> {
+    const current = await this.getJob(streamId);
+    if (!interactionContext.logical_turn_id || !current || current.userId !== userId ||
+      current.interactionContext?.logical_turn_id !== interactionContext.logical_turn_id || current.interactionContext?.revision !== interactionContext.revision) throw streamIdConflictError();
+    const scope = logicalTurnScopeDigest(userId, interactionContext);
+    const ledger = KEYS.authorLedger(scope, interactionContext.logical_turn_id);
+    const revisions = [interactionContext.revision, ...earlierAuthoringRevisions(interactionContext)];
+    const reservations = await this.redis.hmget(ledger, ...revisions.map((revision) => `reservation:${revision}`));
+    if (reservations[0] !== `${streamId}\n${streamClaimIdentity(scope, interactionContext.source_event_id)}`) throw streamIdConflictError();
+    const jobs: SerializableJobData[] = [];
+    for (let index = 1; index < revisions.length; index++) {
+      const reserved = reservations[index];
+      if (!reserved) continue;
+      const predecessorStream = reserved.split('\n')[0];
+      const job = await this.getJob(predecessorStream);
+      const source = job?.interactionContext?.source_event_id;
+      if (!job || !source || job.userId !== userId || job.conversationId !== current.conversationId ||
+        job.interactionContext?.logical_turn_id !== interactionContext.logical_turn_id || job.interactionContext?.revision !== revisions[index] ||
+        reserved !== `${predecessorStream}\n${streamClaimIdentity(scope, source)}` ||
+        !interactionContext.source_segments?.some((segment) => segment.source_event_id === source && segment.authoring_revision === revisions[index])) {
+        throw nativeSourceRecoveryUnconfirmed('author_lookup', current, job);
+      }
+      jobs.push(job);
+    }
+    return jobs;
+  }
+
   async relinquishLogicalTurnAuthor(
     streamId: string,
     userId: string,
     interactionContext: InteractionContext,
   ): Promise<void> {
     if (!interactionContext.logical_turn_id) return;
+    /* === VIVENTIUM START ===
+     * Fix: a source-order scope does not replace the exact persisted stream owner and revision.
+     * The ledger CAS below still binds only this reservation, never a newer revision's author.
+     */
+    const job = await this.getJob(streamId);
+    const current = job?.interactionContext;
+    if (
+      !job ||
+      !['running', 'superseded'].includes(job.status) ||
+      job.userId !== userId ||
+      current?.actor_kind !== interactionContext.actor_kind ||
+      current?.origin !== interactionContext.origin ||
+      current?.surface !== interactionContext.surface ||
+      current?.logical_turn_id !== interactionContext.logical_turn_id ||
+      current?.revision !== interactionContext.revision ||
+      current?.source_event_id !== interactionContext.source_event_id ||
+      current?.conversation_id !== interactionContext.conversation_id ||
+      current?.source_order_scope !== interactionContext.source_order_scope
+    ) return;
+    /* === VIVENTIUM END === */
     const scopeDigest = logicalTurnScopeDigest(userId, interactionContext);
     await this.redis.eval(
       RELINQUISH_AUTHOR_SCRIPT,
@@ -2359,8 +2426,8 @@ export class RedisJobStore implements IJobStore {
     let cleaned = 0;
 
     // Clean up stale local graph cache entries (WeakRefs that were collected)
-    for (const [streamId, graphRef] of this.localGraphCache) {
-      if (!graphRef.deref()) {
+    for (const [streamId, state] of this.localGraphCache) {
+      if (!state.graphRef?.deref() && !state.contentPartsRef?.deref()) {
         this.localGraphCache.delete(streamId);
       }
     }
@@ -2506,16 +2573,22 @@ export class RedisJobStore implements IJobStore {
    * @param graph - The graph instance (stored as WeakRef)
    */
   setGraph(streamId: string, graph: StandardGraph): void {
-    this.localGraphCache.set(streamId, new WeakRef(graph));
+    this.localGraphCache.set(streamId, {
+      ...this.localGraphCache.get(streamId),
+      graphRef: new WeakRef(graph),
+    });
   }
 
   /**
-   * No-op for Redis - content parts are reconstructed from chunks.
-   * Metadata (agentId, groupId) is embedded directly on content parts by the agent runtime.
+   * Reuse Core's visible aggregate for local resume. The raw graph may contain
+   * hidden specialist evidence and does not retain per-envelope audio choices.
+   * Cross-instance resume reconstructs the same emitted chunks from Redis.
    */
-  setContentParts(): void {
-    // Content parts are reconstructed from chunks during getContentParts
-    // No separate storage needed
+  setContentParts(streamId: string, contentParts: Agents.MessageContentComplex[]): void {
+    this.localGraphCache.set(streamId, {
+      ...this.localGraphCache.get(streamId),
+      contentPartsRef: new WeakRef(contentParts),
+    });
   }
 
   /**
@@ -2538,7 +2611,7 @@ export class RedisJobStore implements IJobStore {
   /**
    * Get aggregated content - tries local cache first, falls back to Redis reconstruction.
    *
-   * Optimization: If this instance has the live graph (same-instance reconnect),
+   * Optimization: If this instance has the visible aggregate (same-instance reconnect),
    * we return the content directly without Redis round-trip.
    * For cross-instance reconnects, we reconstruct from Redis Streams.
    *
@@ -2548,21 +2621,10 @@ export class RedisJobStore implements IJobStore {
   async getContentParts(streamId: string): Promise<{
     content: Agents.MessageContentComplex[];
   } | null> {
-    // 1. Try local graph cache first (fast path for same-instance reconnect)
-    const graphRef = this.localGraphCache.get(streamId);
-    if (graphRef) {
-      const graph = graphRef.deref();
-      if (graph) {
-        const localParts = graph.getContentParts();
-        if (localParts && localParts.length > 0) {
-          return {
-            content: localParts,
-          };
-        }
-      } else {
-        // WeakRef was collected, remove from cache
-        this.localGraphCache.delete(streamId);
-      }
+    // 1. Use the public aggregate, including an empty one before Main responds.
+    const localParts = this.localGraphCache.get(streamId)?.contentPartsRef?.deref();
+    if (localParts) {
+      return { content: localParts };
     }
 
     // 2. Fall back to Redis chunk reconstruction (cross-instance reconnect)
@@ -2591,8 +2653,10 @@ export class RedisJobStore implements IJobStore {
       }
 
       // Pass event string directly - GraphEvents values are lowercase strings
+      const beforeParts = event.event === 'on_message_delta' ? contentParts.slice() : [];
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       aggregateContent({ event: event.event as any, data: event.data as any });
+      retainAggregatedDeliveryDisposition(contentParts, beforeParts, event);
     }
 
     // Filter out undefined entries
@@ -2619,7 +2683,7 @@ export class RedisJobStore implements IJobStore {
    */
   async getRunSteps(streamId: string): Promise<Agents.RunStep[]> {
     // 1. Try local graph cache first (fast path for same-instance reconnect)
-    const graphRef = this.localGraphCache.get(streamId);
+    const graphRef = this.localGraphCache.get(streamId)?.graphRef;
     if (graphRef) {
       const graph = graphRef.deref();
       if (graph) {
@@ -2975,6 +3039,9 @@ export class RedisJobStore implements IJobStore {
       viventiumVoiceEffectAuthority: data.viventiumVoiceEffectAuthority
         ? JSON.parse(data.viventiumVoiceEffectAuthority)
         : undefined,
+      viventiumVoiceWorkAuthority: data.viventiumVoiceWorkAuthority
+        ? JSON.parse(data.viventiumVoiceWorkAuthority)
+        : undefined,
       interactionContext: data.interactionContext
         ? (JSON.parse(data.interactionContext) as InteractionContext)
         : undefined,
@@ -2991,6 +3058,16 @@ export class RedisJobStore implements IJobStore {
       cortexDeliveryAcknowledgementPresentation: data.cortexDeliveryAcknowledgementPresentation
         ? JSON.parse(data.cortexDeliveryAcknowledgementPresentation)
         : undefined,
+      /* === VIVENTIUM START ===
+       * Fix: hydrate exact durable-effect proofs so supersession retains independent work owners.
+       */
+      durableEffectReceipt: data.durableEffectReceipt
+        ? JSON.parse(data.durableEffectReceipt)
+        : undefined,
+      durableEffectReceipts: data.durableEffectReceipts
+        ? JSON.parse(data.durableEffectReceipts)
+        : undefined,
+      /* === VIVENTIUM END === */
       nativeResponse: data.nativeResponse ? JSON.parse(data.nativeResponse) : undefined,
       nativePredecessor: data.nativePredecessor ? JSON.parse(data.nativePredecessor) : undefined,
       nativeReleaseTargets: data.nativeReleaseTargets

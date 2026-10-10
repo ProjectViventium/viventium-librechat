@@ -48,6 +48,7 @@ const {
 } = require('~/server/services/viventium/telegramTimingDeep');
 const {
   formatVoiceLatencyTiming,
+  logVoiceLatencyNumericStage,
   voiceLatencyNow,
 } = require('~/server/services/viventium/voiceLatencyTiming');
 const {
@@ -58,6 +59,24 @@ const { getCortexFollowupGraceMs } = require('~/server/services/viventium/cortex
 const { memoryReceiptFromAttachments } = require('~/server/services/viventium/memoryReceipt');
 const { attachVoiceMessageMetadata } = require('~/server/services/viventium/voiceMessageMetadata');
 /* === VIVENTIUM NOTE END === */
+
+/* === VIVENTIUM START ===
+ * An exact current refusal may close only after Native admission ownership was released.
+ */
+function isReleasedNativeRefusal(req, streamId, jobCreatedAt, userId, responseMessageId) {
+  const refused = req._viventiumNativeResponseUnaccepted;
+  const current = req._viventiumNativeResponseIdentity;
+  return (
+    refused?.terminalErrorConfirmed === true &&
+    refused.streamId === streamId &&
+    refused.jobCreatedAt === jobCreatedAt &&
+    refused.userId === userId &&
+    refused.responseMessageId === responseMessageId &&
+    current?.invocationId === refused.invocationId &&
+    current?.bodySha256 === refused.bodySha256
+  );
+}
+/* === VIVENTIUM END === */
 
 function recordPassiveTextTurnBoundary(req, stage, options) {
   try {
@@ -602,6 +621,13 @@ function voiceGenerationOutcome(response) {
   const terminalError = Array.isArray(response?.content)
     ? response.content.find((part) => part?.type === ContentTypes.ERROR)
     : null;
+  const unavailableFile = Array.isArray(response?.attachments)
+    ? response.attachments.find(
+        (attachment) =>
+          attachment?.nativeOutputFile?.version === 1 &&
+          attachment.nativeOutputFile.status === 'unavailable',
+      )
+    : null;
   return {
     resultMessageId: response?.messageId,
     ...(terminalError
@@ -611,7 +637,9 @@ function voiceGenerationOutcome(response) {
             message: terminalError.error,
           },
         }
-      : {}),
+      : unavailableFile
+        ? { deliveryError: { code: 'native_output_file_unavailable' } }
+        : {}),
   };
 }
 
@@ -728,6 +756,11 @@ async function removeSupersededAssistantMessage(req, message, interactionContext
     unfinished: true,
     'metadata.viventium.interactionContext.logical_turn_id': interactionContext?.logical_turn_id,
     'metadata.viventium.interactionContext.revision': interactionContext?.revision,
+    /* === VIVENTIUM START === Keep a confirmed Stop snapshot in durable chat history. === */
+    $nor: [
+      { 'nativeResponse.status': 'cancelled', 'nativeResponse.stopSnapshotStoredAt': { $gt: 0 } },
+    ],
+    /* === VIVENTIUM END === */
   });
   if (removed?._id && message?.conversationId) {
     await pullConversationMessageReference(req, message.conversationId, removed._id);
@@ -956,9 +989,11 @@ function sanitizePersistedAssistantContent(req, content) {
     }
 
     changed = true;
+    const cleanedPart = { ...part };
+    delete cleanedPart.deliveryDispositionRanges;
     if (typeof part.text === 'string') {
       sanitized.push({
-        ...part,
+        ...cleanedPart,
         text: cleanedText,
       });
       continue;
@@ -966,7 +1001,7 @@ function sanitizePersistedAssistantContent(req, content) {
 
     if (part.text && typeof part.text === 'object') {
       sanitized.push({
-        ...part,
+        ...cleanedPart,
         text: {
           ...part.text,
           value: cleanedText,
@@ -976,7 +1011,7 @@ function sanitizePersistedAssistantContent(req, content) {
     }
 
     sanitized.push({
-      ...part,
+      ...cleanedPart,
       text: cleanedText,
     });
   }
@@ -992,6 +1027,17 @@ function sanitizePersistedAssistantContent(req, content) {
  * Added: 2026-05-15
  */
 function normalizePersistedAssistantResponse(req, response) {
+  /* === VIVENTIUM START ===
+   * A typed terminal failure remains failed when retained cortex parts arrive later.
+   * Preserve partial authored content without admitting it as a successful answer.
+   */
+  if (
+    Array.isArray(response?.content) &&
+    response.content.some((part) => part?.type === ContentTypes.ERROR)
+  ) {
+    response = { ...response, error: true };
+  }
+  /* === VIVENTIUM END === */
   const withDisposition =
     isAudioDeliveryRequested(req) && req?._viventiumNativeResponseCompleted !== true
       ? attachEffectiveDeliveryDisposition(req, response)
@@ -1018,10 +1064,19 @@ function normalizeAssistantResponseForTransmit(req, response) {
     req?._viventiumTelegram === true &&
     String(req?.body?.viventiumSurface || '').toLowerCase() === 'telegram' &&
     req?.body?.voiceMode !== true;
-  if (!isTelegramText) {
+  const isAuthenticatedVoice = req?.body?.voiceMode === true && isAudioDeliveryRequested(req);
+  if (!isTelegramText && !isAuthenticatedVoice) {
     return normalizePersistedAssistantResponse(req, response);
   }
   response = attachEffectiveDeliveryDisposition(req, response);
+  if (isAuthenticatedVoice && Array.isArray(response?.content)) {
+    response = {
+      ...response,
+      content: response.content.filter(
+        (part) => part?.type !== ContentTypes.THINK && part?.type !== 'reasoning',
+      ),
+    };
+  }
   const currentText = typeof response?.text === 'string' ? response.text : '';
   const contentText = extractTextFromContentParts(response?.content);
   if (!currentText && contentText) {
@@ -1247,6 +1302,7 @@ const logVoiceLatencyStage = (req, stage, stageStartAt = null, details = '') => 
   logger.info(
     `[VoiceLatency][LC] stage=${stage} request_id=${requestId} ${timingPart}${detailPart}`,
   );
+  logVoiceLatencyNumericStage(logger, req, 'request', stage, stageStartAt);
 };
 /* === VIVENTIUM NOTE END === */
 
@@ -1448,6 +1504,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           : {}),
         ...(req?.body?.viventiumVoiceEffectAuthority
           ? { viventiumVoiceEffectAuthority: req.body.viventiumVoiceEffectAuthority }
+          : {}),
+        ...(req.viventiumVoiceWorkAuthority
+          ? { viventiumVoiceWorkAuthority: req.viventiumVoiceWorkAuthority }
           : {}),
       });
     }
@@ -1752,7 +1811,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
           // Register the whole start sequence synchronously. Some clients invoke `onStart`
           // without awaiting it, so terminal persistence must still see and drain this work.
-          return trackAssistantSnapshot(async () => {
+          const preparationStartedAt = voiceLatencyEnabled ? voiceLatencyNow() : null;
+          const preparation = trackAssistantSnapshot(async () => {
             await ensureUserSourceSegmentPersisted();
 
             if (!assistantTerminalPersistenceStarted) {
@@ -1829,6 +1889,35 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               streamId,
             });
           });
+          if (!voiceLatencyEnabled) return preparation;
+          return preparation.then(
+            (value) => {
+              try {
+                logVoiceLatencyStage(
+                  req,
+                  'message_on_start_persistence',
+                  preparationStartedAt,
+                  'status=completed',
+                );
+              } catch {
+                // Timing telemetry must not fail message preparation.
+              }
+              return value;
+            },
+            (error) => {
+              try {
+                logVoiceLatencyStage(
+                  req,
+                  'message_on_start_persistence',
+                  preparationStartedAt,
+                  'status=failed',
+                );
+              } catch {
+                // Timing telemetry must not fail message preparation.
+              }
+              throw error;
+            },
+          );
         };
 
         const startPartialCheckpointing = () => {
@@ -2154,6 +2243,17 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               /* === VIVENTIUM END === */
               throw new Error('native_response_final_pending');
             }
+            /* === VIVENTIUM START ===
+             * Refusal follows the existing error lifecycle, never accepted Main completion.
+             */
+            if (isReleasedNativeRefusal(req, streamId, jobCreatedAt, userId, responseMessageId)) {
+              const refusal = responseForCommit.content?.find(
+                (part) => part?.type === ContentTypes.ERROR && part.error_class === 'host_capacity',
+              );
+              if (refusal)
+                throw Object.assign(new Error(refusal.error), { code: refusal.error_class });
+            }
+            /* === VIVENTIUM END === */
             const unsupportedPersistence = await timedSaveMessage(
               req,
               withCommittedDeliveryAudit(
@@ -2636,25 +2736,51 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             );
           }
           logger.error(`[ResumableAgentController] Generation error for ${streamId}:`, error);
+          const failure = require('./client').createCompletionErrorContentPart(error);
+          /* === VIVENTIUM START === Exact refusal closes the failed durable snapshot. */
+          const nativeUnaccepted = isReleasedNativeRefusal(
+            req,
+            streamId,
+            jobCreatedAt,
+            userId,
+            responseMessageId,
+          );
+          /* === VIVENTIUM END === */
           try {
             const contentParts = Array.isArray(client?.contentParts)
               ? client.contentParts.filter(Boolean)
               : [];
             const hasMeaningfulContent =
               contentParts.length > 0 || extractTextFromContentParts(contentParts).length > 0;
+            /* === VIVENTIUM START === Preserve one typed failure after released admission. */
+            const snapshotContent =
+              nativeUnaccepted &&
+              !contentParts.some(
+                (part) =>
+                  part.type === ContentTypes.ERROR &&
+                  part.error_class === failure.error_class &&
+                  part.error === failure.error,
+              )
+                ? [...contentParts, failure]
+                : contentParts;
+            /* === VIVENTIUM END === */
             const snapshot = await persistAssistantSnapshot({
               req,
               streamId,
               userId,
               client,
               conversationId,
-              aggregatedContent: contentParts,
+              /* === VIVENTIUM START === Reuse the existing error presentation. */
+              aggregatedContent: snapshotContent,
+              /* === VIVENTIUM END === */
               userMessage,
               responseMessageId,
               sender,
               fallbackText: hasMeaningfulContent ? '' : 'Generation interrupted before completion.',
-              unfinished: hasMeaningfulContent,
-              error: !hasMeaningfulContent,
+              /* === VIVENTIUM START === Released refusal has no pending Native completion. */
+              unfinished: hasMeaningfulContent && !nativeUnaccepted,
+              /* === VIVENTIUM END === */
+              error: true,
               context: 'api/server/controllers/agents/request.js - generation error snapshot',
             });
             if (snapshot.persisted) {
@@ -2666,10 +2792,23 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               snapshotError,
             );
           }
-          // Use the same public typed failure as FINAL; raw internal diagnostics stay in logs.
-          const failure = require('./client').createCompletionErrorContentPart(error);
-          await GenerationJobManager.emitError(streamId, failure.error, failure.error_class);
+          // Reuse the same typed failure retained in the failed snapshot.
+          /* === VIVENTIUM START ===
+           * A deleted canonical Native row has no Stop FINAL owner. Reuse the exact revoked
+           * identity fence to end that stream; ordinary cancelled answers retain Stop ownership.
+           */
+          const revokedNativeFailed =
+            error?.code === 'native_response_message_deleted' &&
+            req._viventiumNativeResponseIdentity?.streamId === streamId &&
+            (await GenerationJobManager.failRevokedNativeResponse(
+              req._viventiumNativeResponseIdentity,
+              failure.error,
+            ));
+          if (!revokedNativeFailed) {
+            await GenerationJobManager.emitError(streamId, failure.error, failure.error_class);
+          }
           GenerationJobManager.completeJob(streamId, failure.error);
+          /* === VIVENTIUM END === */
         }
 
         await maybeDecrement();
@@ -3017,7 +3156,7 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
     req._viventiumVoiceAbortSignal = job.abortController.signal;
 
     // Store endpoint metadata for abort handling
-    GenerationJobManager.updateMetadata(streamId, {
+    await GenerationJobManager.updateMetadata(streamId, {
       endpoint: endpointOption.endpoint,
       iconURL: endpointOption.iconURL,
       model: endpointOption.modelOptions?.model || endpointOption.model_parameters?.model,
@@ -3030,6 +3169,9 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
               : {}),
             ...(req?.body?.viventiumVoiceEffectAuthority
               ? { viventiumVoiceEffectAuthority: req.body.viventiumVoiceEffectAuthority }
+              : {}),
+            ...(req.viventiumVoiceWorkAuthority
+              ? { viventiumVoiceWorkAuthority: req.viventiumVoiceWorkAuthority }
               : {}),
           }
         : {}),
@@ -3060,7 +3202,7 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
       responseMessageId = respMsgId;
 
       // Store metadata for abort handling (conversationId is pre-generated)
-      GenerationJobManager.updateMetadata(streamId, {
+      return GenerationJobManager.updateMetadata(streamId, {
         responseMessageId: respMsgId,
         userMessage: {
           messageId: userMsg.messageId,
@@ -3270,6 +3412,7 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
 
 module.exports = AgentController;
 module.exports.ResumableAgentController = ResumableAgentController;
+module.exports.voiceGenerationOutcome = voiceGenerationOutcome;
 module.exports.captureAcceptedInteractionInput = captureAcceptedInteractionInput;
 module.exports.retainAcceptedInteractionInput = retainAcceptedInteractionInput;
 module.exports.acceptedInteractionSourceId = acceptedInteractionSourceId;
@@ -3279,6 +3422,7 @@ module.exports.__testables = {
   retainAcceptedMainFollowUps,
   startPersistedMainMemory,
   LegacyAgentController: _LegacyAgentController,
+  trackInFlightSnapshot,
   extractTextFromContentParts,
   sanitizePersistedAssistantContent,
   sanitizePersistedAssistantText,
@@ -3286,7 +3430,6 @@ module.exports.__testables = {
   normalizeAssistantResponseForTransmit,
   normalizeDurableWorkReceiptResponse,
   persistAssistantSnapshot,
-  trackInFlightSnapshot,
   timedSaveMessage,
   getExactDurableEffectReceipt,
   hasExactDurableEffectReceipt,

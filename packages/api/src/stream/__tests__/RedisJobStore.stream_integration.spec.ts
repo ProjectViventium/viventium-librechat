@@ -2790,6 +2790,7 @@ describe('RedisJobStore Integration Tests', () => {
 
       // Set graph reference (will be cached locally)
       store.setGraph(streamId, mockGraph as unknown as StandardGraph);
+      store.setContentParts(streamId, mockContentParts);
 
       // Get content - should come from local cache, not Redis
       const result = await store.getContentParts(streamId);

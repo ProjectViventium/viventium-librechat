@@ -11,7 +11,11 @@ import { createMemoryMethods, type MemoryMethods } from './memory';
 import { createMemoryWriteMethods, type MemoryWriteMethods } from './memoryWrite';
 import { createNativeResponseMethods } from './nativeResponse';
 import { createMainContinuityMethods } from './mainContinuity';
-export { mainContinuityStorageKey, mainContinuityMessageEvidence } from './mainContinuity';
+export {
+  mainContinuityStorageKey,
+  mainContinuityMessageEvidence,
+  normalizeMainBackgroundInputs,
+} from './mainContinuity';
 import type { MainContinuityMethods } from './mainContinuity';
 import { createFeelingStateMethods, type FeelingStateMethods } from './feelingState';
 /* Agent Categories */

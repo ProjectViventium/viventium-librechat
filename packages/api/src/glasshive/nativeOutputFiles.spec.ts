@@ -10,7 +10,7 @@ import {
   nativeCallbackOutputFilesForMessage,
 } from './nativeOutputFiles';
 import { nativeResponseOrigin } from './nativeResponse';
-import type { NativeOutputFiles, NativeOutputStoredFile } from './nativeOutputFiles';
+import type { NativeOutputFiles, NativeOutputStoredFile, NativeOutputAttachment } from './nativeOutputFiles';
 const bytes = Buffer.from('item,value\nAster,10\n');
 const identity = {
   userId: 'owner-one',
@@ -226,6 +226,48 @@ function fixture() {
     options: { artifactBaseURL: base, maxBytes: 10_485_760, fetchFile, store: { find, save } },
   };
 }
+
+describe('verified native grant presentation bindings', () => {
+  test('binds each verified import and replay to its own canonical grant and message', async () => {
+    const f = fixture();
+    const second = { ...envelope.files[0], filename: 'copy [final].md', download_url: `${base}/v1/link-refs/ghr_abcdef1234567890` };
+    const source = { ...envelope, files: [...envelope.files, second] };
+    const before = JSON.stringify(source);
+    const imported = await importNativeOutputFiles(source, identity, f.options);
+    expect(imported).toHaveLength(2);
+    for (const [index, item] of imported.entries()) {
+      expect(item).toMatchObject({ user: identity.userId, filename: source.files[index].filename,
+        nativeOutputFile: { version: 1, status: 'available', messageId: identity.responseMessageId,
+          downloadUrl: source.files[index].download_url } });
+    }
+    expect(await importNativeOutputFiles(source, identity, f.options)).toEqual(imported);
+    expect(f.fetchFile).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(source)).toBe(before);
+  });
+  test.each(['user', 'file_id', 'conversationId', 'messageId', 'filename', 'bytes', 'type', 'metadata'])(
+    'does not bind a stored File with mismatched %s', async (field) => {
+      const f = fixture();
+      const imported = await importNativeOutputFiles(envelope, identity, f.options);
+      const row = f.rows.get((imported[0] as NativeOutputAttachment).file_id)!;
+      f.rows.set(row.file_id, { ...row, [field]: field === 'bytes' ? 1 : field === 'metadata' ? {} : 'foreign' });
+      const unavailable = await importNativeOutputFiles(envelope, identity, { ...f.options, recoverUnavailable: true });
+      expect(unavailable[0]).toMatchObject({ nativeOutputFile: { status: 'unavailable', code: 'native_output_file_storage_conflict' } });
+      expect(unavailable[0].nativeOutputFile).not.toHaveProperty('downloadUrl');
+    },
+  );
+  test('unavailable or foreign-origin imports never acquire a presentation binding', async () => {
+    const f = fixture();
+    for (const options of [
+      { ...f.options, fetchFile: async () => { throw new Error('Unavailable'); } },
+      { ...f.options, artifactBaseURL: 'https://foreign.example.test' },
+    ]) {
+      const unavailable = await importNativeOutputFiles(envelope, identity, { ...options, recoverUnavailable: true });
+      expect(unavailable[0]).toMatchObject({ nativeOutputFile: { status: 'unavailable' } });
+      expect(unavailable[0].nativeOutputFile).not.toHaveProperty('downloadUrl');
+      expect(unavailable[0]).not.toHaveProperty('file_id');
+    }
+  });
+});
 
 describe('authenticated native artifact transport', () => {
   const route = {
@@ -505,6 +547,7 @@ test('exact selected bytes become one reusable normal attachment', async () => {
       type: 'text/csv',
       source: 'local',
       object: 'file',
+      nativeOutputFile: { version: 1, status: 'available', messageId: identity.responseMessageId, downloadUrl: envelope.files[0].download_url },
     },
   ]);
   expect(await importNativeOutputFiles(envelope, identity, f.options)).toEqual(first);

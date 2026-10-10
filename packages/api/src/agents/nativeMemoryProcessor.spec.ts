@@ -2,7 +2,7 @@
 import { Run, Providers } from '@librechat/agents';
 import { HumanMessage } from '@librechat/agents/langchain/messages';
 import { Tools } from 'librechat-data-provider';
-import type { Response } from 'express';
+import type { Response as ServerResponse } from 'express';
 import type { createRun } from './run';
 import type { NativeMemoryToolBinding } from './nativeMemoryWriter';
 import { createNativeMemoryExecutor } from './nativeMemoryWriter';
@@ -41,11 +41,13 @@ function fixture({
   failure,
   failAfterEffect = false,
   repeat = false,
+  capacityResponses,
 }: {
   operations?: Operations;
   failure?: Error;
   failAfterEffect?: boolean;
   repeat?: boolean;
+  capacityResponses?: Response[];
 } = {}) {
   const authorize = jest.fn(async () => undefined);
   const unregister = jest.fn();
@@ -56,6 +58,9 @@ function fixture({
   });
   const buildBundle = jest.fn(async () => ({ glasshive_capability_broker: {} }));
   const attachBundle = jest.fn(() => true);
+  const send = jest.fn(async () => capacityResponses!.shift()!);
+  const release = jest.fn(async () => undefined);
+  const prepareProviderAttempt = jest.fn(async () => release);
   const invoke = async () => {
     const grant = {
       user_id: identity.userId,
@@ -69,8 +74,18 @@ function fixture({
     await binding.invoke(grant, operations);
     if (repeat) await binding.invoke(grant, operations);
   };
-  const createProviderRunMock = jest.fn(async (_config: Parameters<typeof createRun>[0]) => ({
+  const createProviderRunMock = jest.fn(async (config: Parameters<typeof createRun>[0]) => ({
     processStream: jest.fn(async () => {
+      if (capacityResponses) {
+        const route = config.agents[0].model_parameters as {
+          configuration: { fetch: typeof fetch };
+        };
+        const response = await route.configuration.fetch('https://synthetic.invalid/v1/chat/completions',
+          { method: 'POST', body: '{"source":"same-memory-turn"}' });
+        if (!response.ok) throw Object.assign(new Error('Native host capacity unavailable'), {
+          code: 'host_capacity', status: 503,
+        });
+      }
       if (failure && !failAfterEffect) throw failure;
       await invoke();
       if (failure) throw failure;
@@ -82,7 +97,7 @@ function fixture({
       id: 'native-writer',
       provider: Providers.OPENAI,
       model: 'codex-cli:gpt-6.1-sol',
-      model_parameters: { reasoning_effort: 'high' },
+      model_parameters: { reasoning_effort: 'high', configuration: { fetch: send } },
     } as Parameters<typeof createRun>[0]['agents'][number],
     user: { id: identity.userId } as Parameters<typeof createRun>[0]['user'],
     requestBody: {},
@@ -91,6 +106,7 @@ function fixture({
     buildBundle,
     attachBundle,
     createProviderRun: createProviderRunMock as unknown as typeof createRun,
+    prepareProviderAttempt,
   });
   const setMemory: jest.Mock = jest.fn(async () => ({
     ok: true,
@@ -99,7 +115,7 @@ function fixture({
   }));
   const deleteMemory = jest.fn(async () => ({ ok: true, changed: true }));
   const params: Parameters<typeof processMemory>[0] = {
-    res: { headersSent: false, write: jest.fn() } as unknown as Response,
+    res: { headersSent: false, write: jest.fn() } as unknown as ServerResponse,
     userId: identity.userId,
     messageId: identity.messageId,
     conversationId: identity.conversationId,
@@ -124,11 +140,36 @@ function fixture({
     createProviderRunMock,
     setMemory,
     deleteMemory,
+    send,
+    release,
+    prepareProviderAttempt,
   };
 }
 
 describe('native memory processor wiring', () => {
   beforeEach(() => jest.clearAllMocks());
+
+  it.each(['recovered', 'exhausted'])(
+    'keeps the actual memory processor receipt and exact native attempt truthful: %s', async (outcome) => {
+      const f = fixture({ capacityResponses: [
+        new Response(JSON.stringify({ error: { code: 'host_capacity' } }), {
+          status: 503, headers: { 'Retry-After': outcome === 'recovered' ? '0.001' : '31' },
+        }),
+        ...(outcome === 'recovered' ? [new Response('{}')] : []),
+      ] });
+      const attachments = await processMemory(f.params);
+      if (outcome === 'recovered') expect(attachments).toEqual([]);
+      else expect(JSON.parse(attachments![0]!.memory!.value)).toMatchObject({ errorType: 'host_capacity' });
+      expect(f.send).toHaveBeenCalledTimes(outcome === 'recovered' ? 2 : 1);
+      expect(f.register).toHaveBeenCalledTimes(1);
+      expect(f.buildBundle).toHaveBeenCalledTimes(1);
+      expect(f.createProviderRunMock).toHaveBeenCalledTimes(1);
+      expect(f.prepareProviderAttempt).toHaveBeenCalledTimes(1);
+      expect(f.release).toHaveBeenCalledTimes(outcome === 'recovered' ? 0 : 1);
+      expect(f.setMemory).not.toHaveBeenCalled();
+      expect(f.unregister).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it('uses only the supplied native broker executor for a truthful noop', async () => {
     const f = fixture();

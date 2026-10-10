@@ -48,3 +48,4 @@ export * from './orchestrationTraceEvent';
 export * from './personalAccountCleanupReceipt';
 /* === VIVENTIUM END === */
 export * from './nativeResponse';
+export * from './interactionDurableEffect';

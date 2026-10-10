@@ -4,7 +4,10 @@ import { useRecoilValue } from 'recoil';
 import { type TMessage } from 'librechat-data-provider';
 import type { TMessageProps, TMessageIcon } from '~/common';
 import MessageContent from '~/components/Chat/Messages/Content/MessageContent';
-import { useLocalize, useMessageActions, useContentMetadata } from '~/hooks';
+import { useAttachments, useLocalize, useMessageActions, useContentMetadata } from '~/hooks';
+/* === VIVENTIUM START === Reuse message-file delivery for replies without a content array. === */
+import { AttachmentGroup } from '~/components/Chat/Messages/Content/Parts/Attachment';
+/* === VIVENTIUM END === */
 import PlaceholderRow from '~/components/Chat/Messages/ui/PlaceholderRow';
 import SiblingSwitch from '~/components/Chat/Messages/SiblingSwitch';
 import HoverButtons from '~/components/Chat/Messages/HoverButtons';
@@ -33,6 +36,16 @@ const MessageRender = memo(function MessageRender({
   isSubmitting = false,
 }: MessageRenderProps) {
   const localize = useLocalize();
+  /* === VIVENTIUM START === Keep tool-owned files with their existing content part. === */
+  const { attachments } = useAttachments({
+    messageId: msg?.messageId,
+    attachments: msg?.attachments,
+  });
+  const messageAttachments = useMemo(
+    () => attachments?.filter((attachment) => !attachment.toolCallId),
+    [attachments],
+  );
+  /* === VIVENTIUM END === */
   const {
     ask,
     edit,
@@ -94,8 +107,9 @@ const MessageRender = memo(function MessageRender({
       isExpanded: false as const,
       isSubmitting: effectiveIsSubmitting,
       conversationId: conversation?.conversationId,
+      viventiumFileAttachments: attachments,
     }),
-    [messageId, conversation?.conversationId, effectiveIsSubmitting, isLatestMessage],
+    [messageId, conversation?.conversationId, effectiveIsSubmitting, isLatestMessage, attachments],
   );
 
   if (!msg) {
@@ -117,7 +131,8 @@ const MessageRender = memo(function MessageRender({
    * Purpose: Keep callback/content-array text readable instead of letting flex sizing collapse it.
    * === VIVENTIUM END === */
   const baseClasses = {
-    common: 'group mx-auto flex w-full min-w-0 flex-1 gap-3 transition-all duration-300 transform-gpu ',
+    common:
+      'group mx-auto flex w-full min-w-0 flex-1 gap-3 transition-all duration-300 transform-gpu ',
     chat: getChatWidthClass(),
   };
 
@@ -156,7 +171,7 @@ const MessageRender = memo(function MessageRender({
         )}
 
         <div className="flex min-w-0 flex-col gap-1">
-          <div className="flex min-h-[20px] max-w-full min-w-0 flex-grow flex-col gap-0">
+          <div className="flex min-h-[20px] min-w-0 max-w-full flex-grow flex-col gap-0">
             <MessageContext.Provider value={messageContextValue}>
               <MessageContent
                 ask={ask}
@@ -172,6 +187,9 @@ const MessageRender = memo(function MessageRender({
                 siblingIdx={siblingIdx ?? 0}
                 setSiblingIdx={setSiblingIdx ?? (() => ({}))}
               />
+              {/* === VIVENTIUM START === Match the content-array attachment presentation. === */}
+              {!edit && <AttachmentGroup attachments={messageAttachments} />}
+              {/* === VIVENTIUM END === */}
             </MessageContext.Provider>
           </div>
           {hasNoChildren && effectiveIsSubmitting ? (

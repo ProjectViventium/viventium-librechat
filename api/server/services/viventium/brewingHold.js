@@ -37,6 +37,10 @@ function isEnvDisabled(name) {
 }
 
 function resolveConfiguredHoldScopeKey(cortex) {
+  if (cortex?.activation?.enabled === false || cortex?.activation?.mode === 'disabled') {
+    return null;
+  }
+
   const scope = resolveProductivitySpecialistScope(cortex);
   if (typeof scope !== 'string' || scope.length === 0) {
     return null;

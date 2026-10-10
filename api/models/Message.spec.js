@@ -461,6 +461,32 @@ describe('Message Operations', () => {
         },
       );
 
+      test('a deleted canonical Native row raises a typed failure without resurrection', async () => {
+        await Message.deleteOne({ messageId: identity.responseMessageId, user: identity.userId });
+        await expect(
+          saveMessage(
+            { ...mockReq, _viventiumNativeResponseIdentity: identity },
+            {
+              messageId: identity.responseMessageId,
+              conversationId: identity.conversationId,
+              parentMessageId: identity.source.messageId,
+              isCreatedByUser: false,
+              text: 'An obsolete snapshot.',
+            },
+            { operationKind: 'system' },
+          ),
+        ).rejects.toMatchObject({
+          message: 'native_response_message_deleted',
+          code: 'native_response_message_deleted',
+        });
+        expect(
+          await Message.findOne({
+            messageId: identity.responseMessageId,
+            user: identity.userId,
+          }).lean(),
+        ).toBeNull();
+      });
+
       test('a system snapshot returns the native owner result without a second save', async () => {
         const saved = await saveMessage(
           mockReq,

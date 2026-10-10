@@ -3486,12 +3486,17 @@ async function publishCortexVoiceFollowUp({
     userId: ownerId,
     requireDurable: true,
   });
+  const owner = tasks.getVoiceTaskOwnerBinding(voiceTaskId);
   if (
     !task ||
     task.taskId !== voiceTaskId ||
-    task.userId !== ownerId ||
     task.callSessionId !== callSessionId ||
-    task.conversationId !== conversationId
+    task.conversationId !== conversationId ||
+    !owner ||
+    owner.taskId !== voiceTaskId ||
+    owner.userId !== ownerId ||
+    owner.callSessionId !== callSessionId ||
+    owner.conversationId !== conversationId
   )
     return false;
   tasks.observeGenerationEvent(voiceTaskId, {

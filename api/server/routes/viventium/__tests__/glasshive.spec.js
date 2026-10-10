@@ -71,8 +71,10 @@ jest.mock('~/server/services/viventium/OrchestrationTraceLedgerService', () => (
 }));
 
 jest.mock('~/server/services/viventium/GlassHiveCallbackBindingService', () => ({
+  ...jest.requireActual('~/server/services/viventium/GlassHiveCallbackBindingService'),
   resolveGlassHiveCallbackContext: (...args) => mockResolveGlassHiveCallbackContext(...args),
   confirmGlassHiveCallbackContext: (...args) => mockConfirmGlassHiveCallbackContext(...args),
+  fenceGlassHiveCallbackRunState: jest.fn(async () => null),
   recordGlassHiveAdjudicationOutcome: (...args) => mockRecordGlassHiveAdjudicationOutcome(...args),
   recordGlassHiveCallbackExternalState: (...args) =>
     mockRecordGlassHiveCallbackExternalState(...args),
@@ -82,6 +84,11 @@ jest.mock('~/server/services/viventium/GlassHiveCallbackBindingService', () => (
   isGlassHiveWorkTerminalCallback: (body = {}) =>
     body.work_terminal === true &&
     ['completed', 'failed', 'cancelled'].includes(String(body.work_state || '').toLowerCase()),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveTerminalCallbackTransaction', () => ({
+  ...jest.requireActual('~/server/services/viventium/GlassHiveTerminalCallbackTransaction'),
+  runGlassHiveTerminalCallbackTransaction: async (operation) => operation(null),
 }));
 
 jest.mock('~/server/services/viventium/GlassHiveMissionAdjudicationService', () => ({
@@ -227,8 +234,9 @@ function createMockRes() {
       return res;
     }),
   };
-  res._done = new Promise((resolve) => {
+  res._done = new Promise((resolve, reject) => {
     res._resolve = resolve;
+    res._reject = reject;
   });
   return res;
 }
@@ -236,7 +244,8 @@ function createMockRes() {
 function dispatch(app, req, res) {
   app.handle(req, res, (err) => {
     if (err) {
-      throw err;
+      res._reject(err);
+      return;
     }
     if (!res.writableEnded) {
       res._resolve();

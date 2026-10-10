@@ -135,6 +135,7 @@ jest.mock('@librechat/api', () => ({
 }));
 
 jest.mock('~/server/services/viventium/GlassHiveConversationProviderService', () => ({
+  ...jest.requireActual('~/server/services/viventium/GlassHiveConversationProviderService'),
   attachConversationProviderCapabilityBundle: jest.fn(async () => false),
   buildHarnessIdempotencyKey: jest.fn((role, messageId, agentId = '') =>
     [role, agentId, messageId].filter(Boolean).join(':'),

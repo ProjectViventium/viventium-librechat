@@ -5,7 +5,7 @@ import Nav from './Nav';
 jest.mock('~/hooks', () => ({ useLocalize: () => (value) => value }));
 jest.mock('~/utils', () => ({ cn: (...values) => values.filter(Boolean).join(' ') }));
 jest.mock('~/Providers', () => {
-  const React = require('react');
+  const React = jest.requireActual('react');
   const Context = React.createContext(null);
   return {
     ActivePanelProvider: ({ children, defaultActive }) => {
@@ -17,8 +17,18 @@ jest.mock('~/Providers', () => {
 });
 
 const icon = () => <span aria-hidden="true" />;
-const memory = { id: 'memories', title: 'Memories', icon, Component: () => <p>Saved memory</p> };
-const active = { id: 'active-work', title: 'Active work', icon, Component: () => <p>Working</p> };
+const memory = {
+  id: 'memories',
+  title: 'Memories',
+  icon,
+  Component: () => <p>{'Saved memory'}</p>,
+};
+const active = {
+  id: 'active-work',
+  title: 'Active work',
+  icon,
+  Component: () => <p>{'Working'}</p>,
+};
 
 describe('right-nav pending target identity while readiness inserts a link', () => {
   it.each([true, false])(
@@ -26,7 +36,7 @@ describe('right-nav pending target identity while readiness inserts a link', () 
     (isCollapsed) => {
       const feelings = jest.fn();
       const links = [
-        { id: 'prompts', title: 'Prompts', icon, Component: () => <p>Prompts panel</p> },
+        { id: 'prompts', title: 'Prompts', icon, Component: () => <p>{'Prompts panel'}</p> },
         { id: 'feelings', title: 'Feelings', icon, onClick: feelings },
         memory,
       ];

@@ -1899,7 +1899,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                   preparationStartedAt,
                   'status=completed',
                 );
-              } catch {}
+              } catch {
+                // Timing telemetry must not fail message preparation.
+              }
               return value;
             },
             (error) => {
@@ -1910,7 +1912,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                   preparationStartedAt,
                   'status=failed',
                 );
-              } catch {}
+              } catch {
+                // Timing telemetry must not fail message preparation.
+              }
               throw error;
             },
           );

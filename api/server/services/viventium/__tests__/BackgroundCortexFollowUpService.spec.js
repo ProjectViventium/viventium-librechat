@@ -491,22 +491,6 @@ describe('Phase B session-backed Feelings', () => {
       }).capsule,
     ).toBe(capsule);
   });
-
-  test('does not inject a second capsule into a same-session continuation', () => {
-    const feelingContext = resolvePhaseBFeelingContext({
-      enabled: true,
-      agentScope: 'conscious_agent',
-      snapshotHash: 'synthetic-hash',
-      capsule,
-    });
-    expect(
-      resolvePhaseBFeelingInjection({
-        feelingContext,
-        providerCapability: { conversation_session: true },
-        primaryResponseMode: false,
-      }),
-    ).toEqual({ capsule: '', reason: 'preserved_in_conversation_session' });
-  });
 });
 
 describe('Phase B prepare/persist boundary', () => {

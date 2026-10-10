@@ -9328,12 +9328,15 @@
       "predecessor_managed_bundle_sha256": "ad506e54ecc1044d4ab8f0f84014730d43221221d98de6a6619ed8428d92ea8f",
       "baseline": {
         "schema_version": 1,
-        "bundle_sha256": "a0fb2f066294253a600bc7800a62f81eea6d385ab4a771a52f5a66d2a5a93306",
+        "bundle_sha256": "f41fb10b35c0a04fdf42b13a2803de543197d3b01e4450d2b01ec2377e042a15",
         "agents": {
           "agent_viventium_main_95aeb3": {
             "fields": {
               "description": {
                 "$viventium_managed_sha256": "12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+              },
+              "instructions": {
+                "$viventium_managed_sha256": "77fa0e5436f5e6e512797c6f51be8273782e0ce6cf3b90a17c29978ff1a808b5"
               },
               "model": {
                 "$viventium_managed_sha256": "d55d2786776b3f525755f26b82d35dba39debb359da901e6b5d27bfdbd1a58a4"
@@ -9601,5 +9604,5 @@
       }
     }
   ],
-  "artifact_sha256": "ec9b8989ff030e28cb0ee49b6c4270480d396d38062761d5466c8c2fd3b313bb"
+  "artifact_sha256": "ad4c27708dca58f3d1cda09edd2646122abdead0f4973f988f2d8ac8d489f88d"
 }

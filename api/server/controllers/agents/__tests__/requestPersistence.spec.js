@@ -9,6 +9,7 @@ jest.mock('~/server/services/viventium/VoiceOrchestrationTraceService', () => ({
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: {
     debug: jest.fn(),
     info: jest.fn(),
@@ -27,6 +28,7 @@ jest.mock('librechat-data-provider', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   isAudioDeliveryRequested: (req) =>
     (req?._viventiumTelegram === true && req?.body?.telegramAudioRequested === true) ||
     (req?.body?.voiceMode === true && Boolean(req?.viventiumCallSession?.callSessionId)),

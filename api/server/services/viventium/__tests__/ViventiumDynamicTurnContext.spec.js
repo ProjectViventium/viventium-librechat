@@ -994,7 +994,7 @@ describe('ViventiumDynamicTurnContext', () => {
     expect(capsule).toContain('Roster truncated');
   });
 
-  test('voice gets only count and urgent attention, with full roster on demand', () => {
+  test('voice retains the complete same owner-scoped roster and worker action context', () => {
     const capsule = buildActiveWorkCapsule({
       mode: 'parallel',
       voice: true,
@@ -1014,13 +1014,15 @@ describe('ViventiumDynamicTurnContext', () => {
       },
     });
 
-    expect(capsule).toContain('Active count: 2');
+    expect(decodeUntrustedRoster(capsule).work).toHaveLength(2);
     expect(capsule).not.toContain('Reconnect the account');
     expect(decodeUntrustedRoster(capsule).work).toEqual([
       expect.objectContaining({
         workRef: 'work-1',
         attention: { kind: 'auth', summary: 'Reconnect the account' },
+        actions: ['resume'],
       }),
+      expect.objectContaining({ workRef: 'work-2', state: 'running', actions: ['stop'] }),
     ]);
     expect(capsule).toContain('active_work_list');
     expect(capsule).toContain('Queue persists a follow-up behind the current objective');

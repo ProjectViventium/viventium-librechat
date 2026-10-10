@@ -125,6 +125,7 @@ function admit(req, instance, carried) {
   return captureMainContextSnapshot(req, {
     agent: { id: 'agent' },
     messages: carried.map((message) => ({
+      messageId: message.messageId,
       role: message.isCreatedByUser ? 'user' : 'assistant',
       content: message.text,
     })),

@@ -46,7 +46,9 @@ test.each([
   window.URL.revokeObjectURL = jest.fn();
   try {
     render(
-      <MarkdownAnchor href={`/files/owner/native_imported/${segment}`}>Download</MarkdownAnchor>,
+      <MarkdownAnchor href={`/files/owner/native_imported/${segment}`}>
+        {'Download'}
+      </MarkdownAnchor>,
     );
     fireEvent.click(screen.getByRole('link', { name: 'Download' }));
     await waitFor(() => expect(downloads).toEqual([expected]));
@@ -73,7 +75,7 @@ function renderGrant(attachments: TAttachment[] = [owned], href = grant, message
     <MessageContext.Provider
       value={{ messageId, isExpanded: true, viventiumFileAttachments: attachments }}
     >
-      <MarkdownAnchor href={href}>Download</MarkdownAnchor>
+      <MarkdownAnchor href={href}>{'Download'}</MarkdownAnchor>
     </MessageContext.Provider>,
   );
 }

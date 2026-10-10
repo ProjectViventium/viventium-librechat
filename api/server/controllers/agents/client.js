@@ -4707,7 +4707,9 @@ class AgentClient extends BaseClient {
     if (voiceBuildStartedAt !== null) {
       try {
         logVoiceLatencyStage(req, 'build_messages_continuity_done', voiceBuildStartedAt);
-      } catch {}
+      } catch {
+        // Timing telemetry must not fail message preparation.
+      }
     }
     if (conversationContinuity) {
       orderedMessages = conversationContinuity.messages;
@@ -5029,7 +5031,9 @@ class AgentClient extends BaseClient {
     if (voiceFormatStartedAt !== null) {
       try {
         logVoiceLatencyStage(req, 'build_messages_format_tokens_done', voiceFormatStartedAt);
-      } catch {}
+      } catch {
+        // Timing telemetry must not fail message preparation.
+      }
     }
     const memoryRecallStart = startDeepTiming(req);
     const memoryResult = await (async () => {

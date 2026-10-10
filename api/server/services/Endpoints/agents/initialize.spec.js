@@ -27,6 +27,7 @@ const mockObserveOrchestrationOwner = jest.fn();
 const mockEffectiveOrchestrationMode = jest.fn(() => 'parallel');
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: {
     debug: jest.fn(),
     error: jest.fn(),

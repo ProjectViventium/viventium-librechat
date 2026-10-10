@@ -1,6 +1,7 @@
 /* eslint-disable jest/no-export -- Shared contract helper excluded from test discovery. */
 import { GenerationJobManagerClass } from '../GenerationJobManager';
 import { InMemoryEventTransport } from '../implementations/InMemoryEventTransport';
+import { prepareNativeSourceRecovery } from '../../glasshive/nativeSupersession';
 import {
   buildTrustedSourceSelectionCapsule,
   ownedInteractionSources,
@@ -451,7 +452,34 @@ export function rapidInputContract(createStore: () => IJobStore) {
       expect(first.abortController.signal.aborted).toBe(true);
       expect(first.abortController.signal.reason).toBe('superseded');
       expect(next.abortController.signal.aborted).toBe(false);
+      const facts = { effects: [], work: [] };
+      const relinquish = jest.spyOn(store, 'relinquishLogicalTurnAuthor');
+      const readFacts = jest.fn(async () => {
+        expect(relinquish).not.toHaveBeenCalled();
+        return { facts, pending: false };
+      });
+      // The runtime installs this release/fresh-facts barrier before authoring starts.
+      manager.setNativeSourceRecovery((current, previous) =>
+        prepareNativeSourceRecovery(current, previous, {
+          beforeCapture: async () => Date.now() + 1000,
+          getJob: (id) => store.getJob(id),
+          isUnboundCancelled: (job) => store.isNativeResponseUnboundCancelled!(job),
+          readFacts,
+          sleep: async () => {
+            throw new Error('Unexpected pending recovery');
+          },
+        }),
+      );
       const committed = await manager.commitLogicalTurnAuthor('b-stream', 'owner');
+      expect(readFacts).toHaveBeenCalledTimes(1);
+      expect(readFacts).toHaveBeenCalledWith({
+        ownerId: 'owner',
+        conversationId: 'conversation',
+        logicalTurnId: committed!.logical_turn_id,
+        sourceEventIds: ['a', 'b'],
+      });
+      expect(committed!.source_recovery_facts).toEqual(facts);
+      expect(relinquish).toHaveBeenCalledTimes(1);
       expect(owned(committed!)).toEqual([
         [1, 'a', 'Willow 427 / Elm 441'],
         [2, 'b', null],

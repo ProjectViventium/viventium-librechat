@@ -42,7 +42,11 @@ jest.mock('@librechat/api', () => {
     ...actual,
     receiveGlassHiveTerminalCallbackResult: async (...args) => {
       const result = await actual.receiveGlassHiveTerminalCallbackResult(...args);
-      await mockAfterTerminalCas(args[0]?.body, result);
+      const notify = () => mockAfterTerminalCas(args[0]?.body, result);
+      const { deferGlassHiveTerminalCallbackAfterCommit } = jest.requireActual(
+        '~/server/services/viventium/GlassHiveTerminalCallbackTransaction',
+      );
+      if (!deferGlassHiveTerminalCallbackAfterCommit(notify)) await notify();
       return result;
     },
   };
@@ -267,6 +271,18 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
     await mongoose.connection.db.collection(CALLBACK_RESULTS_COLLECTION).deleteMany({});
     await mongoose.connection.db.collection(CALLBACK_BINDINGS_COLLECTION).deleteMany({});
     await mongoose.connection.db.collection(EXTERNAL_WORK_COLLECTION).deleteMany({});
+    const binding = trustedContext();
+    const dispatched = {
+      _id: binding.originRef,
+      ownerId: binding.ownerId,
+      conversationId: binding.conversationId,
+      anchorMessageId: binding.anchorMessageId,
+      requestedParentMessageId: binding.requestedParentMessageId,
+      workRef: '',
+      launchState: 'dispatch_ready',
+    };
+    await mongoose.connection.db.collection(CALLBACK_BINDINGS_COLLECTION).insertOne(dispatched);
+    await mongoose.connection.db.collection(EXTERNAL_WORK_COLLECTION).insertOne(dispatched);
     mockGetConvo = jest.fn().mockResolvedValue({
       conversationId: 'conv-receiver-cas',
       user: 'owner-receiver-cas',
@@ -442,23 +458,6 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
 
   test('fences A inside the real non-message durable effect after B wins an expired lease', async () => {
     const binding = trustedContext();
-    await mongoose.connection.db.collection(CALLBACK_BINDINGS_COLLECTION).insertOne({
-      _id: binding.originRef,
-      ownerId: binding.ownerId,
-      conversationId: binding.conversationId,
-      anchorMessageId: binding.anchorMessageId,
-      requestedParentMessageId: binding.requestedParentMessageId,
-      workRef: '',
-      launchState: 'dispatch_ready',
-    });
-    await mongoose.connection.db.collection(EXTERNAL_WORK_COLLECTION).insertOne({
-      _id: binding.originRef,
-      ownerId: binding.ownerId,
-      conversationId: binding.conversationId,
-      anchorMessageId: binding.anchorMessageId,
-      workRef: '',
-      launchState: 'dispatch_ready',
-    });
 
     let releaseA;
     let markAEntered;
@@ -523,23 +522,6 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
 
   test('aborts A durable effect when B wins the CAS but is paused before that destination', async () => {
     const binding = trustedContext();
-    await mongoose.connection.db.collection(CALLBACK_BINDINGS_COLLECTION).insertOne({
-      _id: binding.originRef,
-      ownerId: binding.ownerId,
-      conversationId: binding.conversationId,
-      anchorMessageId: binding.anchorMessageId,
-      requestedParentMessageId: binding.requestedParentMessageId,
-      workRef: '',
-      launchState: 'dispatch_ready',
-    });
-    await mongoose.connection.db.collection(EXTERNAL_WORK_COLLECTION).insertOne({
-      _id: binding.originRef,
-      ownerId: binding.ownerId,
-      conversationId: binding.conversationId,
-      anchorMessageId: binding.anchorMessageId,
-      workRef: '',
-      launchState: 'dispatch_ready',
-    });
 
     let releaseA;
     let markAEntered;

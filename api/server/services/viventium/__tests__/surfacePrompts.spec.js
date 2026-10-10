@@ -463,17 +463,14 @@ describe('buildVoiceModeInstructions', () => {
   // === VIVENTIUM END ===
 
   test.each(['cartesia', 'xai', 'local_chatterbox_turbo_mlx_8bit', 'openai', 'unknown'])(
-    '%s keeps unsolicited foreground research off the live voice answer path',
+    '%s retains interruptible tools and authoritative results during the live voice path',
     (provider) => {
       const result = buildVoiceModeInstructions(provider);
       expect(result).toContain(
+        'Foreground tool or consultant work during a call stays interruptible and cancellable; never claim a result before its authoritative evidence returns.',
+      );
+      expect(result).not.toContain(
         'Unless the user explicitly asks for a lookup or tool action now, do not start foreground research or tool work during a live voice call.',
-      );
-      expect(result).toContain(
-        'give the best bounded immediate answer, state what remains unverified, and let nonblocking background work surface later value through Phase B',
-      );
-      expect(result).toContain(
-        'When the user explicitly asks for a lookup or tool action now, the current voice task may do it',
       );
     },
   );

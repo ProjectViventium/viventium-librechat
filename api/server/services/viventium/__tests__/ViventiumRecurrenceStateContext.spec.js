@@ -47,7 +47,11 @@ describe('Main runtime recurrence context wiring', () => {
   const fs = require('fs');
   const path = require('path');
   const vm = require('vm');
+  const { NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES, getCurrentCallContext } = require('@librechat/api');
   const { applyTimeContextDelivery } = require('../surfacePrompts');
+  const {
+    conversationProviderUsesInvocationLocalTime,
+  } = require('../GlassHiveConversationProviderService');
   const source = fs.readFileSync(
     path.join(__dirname, '../../../controllers/agents/client.js'),
     'utf8',
@@ -70,6 +74,7 @@ describe('Main runtime recurrence context wiring', () => {
     if (native) req.viventiumTimeContextDelivery = 'per_turn_header';
     const context = {
       owner,
+      req,
       config: { configurable: { requestBody } },
       surfacePromptLayers,
       voiceMode: false,
@@ -86,6 +91,9 @@ describe('Main runtime recurrence context wiring', () => {
       buildSavedMemoryWriterTurnContext: () => '',
       combineTurnContextInstructions: (...parts) => parts.filter(Boolean).join('\n'),
       buildRecurrenceStateCapsule,
+      NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
+      getCurrentCallContext,
+      conversationProviderUsesInvocationLocalTime,
       applyTimeContextDelivery,
     };
     expect(start).toBeGreaterThan(0);

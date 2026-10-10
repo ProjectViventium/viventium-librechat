@@ -42,8 +42,10 @@ const { logFeelingsEvent, summarizeFeelingCapsulePlacement } = require('./feelin
 const {
   attachGlassHiveTrustedLaunchMetadata,
   markGlassHiveLaunchDispatchReady,
+  markGlassHiveLaunchPreDispatchFailed,
   registerGlassHiveLaunchContext,
 } = require('./GlassHiveCallbackBindingService');
+const { assertCurrentGlassHiveSourceAuthor, GenerationJobManager } = require('@librechat/api');
 
 const WORKER_INSTRUCTION_FIELDS = Object.freeze(['agents_md', 'claude_md', 'codex_md']);
 
@@ -1248,6 +1250,13 @@ async function maybeInjectGlassHiveCapabilityBroker({
   }
   // VIVENTIUM START: Superseded authoring cannot create a new launch intent.
   config?.signal?.throwIfAborted();
+  const assertAuthor = () =>
+    assertCurrentGlassHiveSourceAuthor({
+      userId: String(config?.configurable?.user?.id || config?.configurable?.user?._id || ''),
+      requestBody: config?.configurable?.requestBody,
+      getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
+    });
+  await assertAuthor();
   // VIVENTIUM END
   const launchContext = await registerGlassHiveLaunchContext({
     signal: config?.signal,
@@ -1296,7 +1305,16 @@ async function maybeInjectGlassHiveCapabilityBroker({
       args.bootstrap_bundle_json,
     );
     Object.assign(args, trustedLaunchArgs);
-    await markGlassHiveLaunchDispatchReady(launchContext);
+    /* === VIVENTIUM START === Preparation may outlive its managed Main author. === */
+    try {
+      config?.signal?.throwIfAborted();
+      await assertAuthor();
+      await markGlassHiveLaunchDispatchReady(launchContext);
+    } catch (error) {
+      await markGlassHiveLaunchPreDispatchFailed(launchContext, error);
+      throw error;
+    }
+    /* === VIVENTIUM END === */
     return originalWasString ? JSON.stringify(args) : args;
   };
   const workerMemory = String(config?.configurable?.glasshive_worker_memory || '').trim();

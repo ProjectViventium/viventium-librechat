@@ -560,6 +560,9 @@ describe('ViventiumMainCompactionService', () => {
         agent_ids: ['specialist-agent'],
         edges: [{ from: 'main-agent', to: 'specialist-agent' }],
         tools: ['file_search'],
+        declaredToolNames: ['file_search'],
+        toolDefinitions: [{ name: 'file_search' }],
+        toolRegistry: new Map([['file_search', {}]]),
         mcp: ['connected-account'],
         tool_resources: { file_search: { files: [{ file_id: 'private-recall' }] } },
         tool_options: { file_search: { defer_loading: true } },
@@ -588,6 +591,9 @@ describe('ViventiumMainCompactionService', () => {
     expect(isolated.agent_ids).toEqual([]);
     expect(isolated.edges).toEqual([]);
     expect(isolated.tools).toEqual([]);
+    expect(isolated.declaredToolNames).toEqual([]);
+    expect(isolated.toolDefinitions).toEqual([]);
+    expect(isolated.toolRegistry.size).toBe(0);
     expect(isolated.mcp).toEqual([]);
     expect(isolated.tool_resources).toEqual({});
     expect(isolated.tool_options).toEqual({});
@@ -788,6 +794,305 @@ describe('ViventiumMainCompactionService', () => {
     expect(sleep).not.toHaveBeenCalled();
   });
 
+  describe('internal compactor from a real voice request', () => {
+    const { isVoiceActorSideEffectRestricted } = require('../VoiceActorAuthorityService');
+    const provider = require('../GlassHiveConversationProviderService');
+    const background = require('../../BackgroundCortexService');
+    const crypto = require('crypto');
+    const secret = 'synthetic-owner-compactor-secret';
+    const endpoint = { baseURL: 'https://native.invalid/v1', apiKey: 'synthetic-native-key' };
+    let previousSecret;
+    beforeEach(() => {
+      previousSecret = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+      process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = secret;
+    });
+    afterEach(() => {
+      if (previousSecret === undefined)
+        delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+      else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = previousSecret;
+    });
+
+    function voiceRequest(trust = 'owner_participant', sideEffects = true) {
+      return {
+        user: { id: identity.ownerId, personalization: { memories: true } },
+        config: { ownerFixture: true },
+        viventiumCallSession: {
+          callSessionId: 'synthetic-outer-call',
+          userId: identity.ownerId,
+        },
+        body: {
+          conversationId: 'synthetic-outer-chat',
+          voiceMode: true,
+          viventiumActorTrust: trust,
+          viventiumCanAuthorizeSideEffects: sideEffects,
+          viventiumVoiceTaskId: 'synthetic-outer-task',
+        },
+      };
+    }
+    function input(req) {
+      return {
+        ...identity,
+        req,
+        agent: {
+          id: identity.agentId,
+          provider: 'synthetic-native',
+          model: 'synthetic-exact-model',
+          model_parameters: { reasoning_effort: 'high' },
+        },
+        claimCompaction: jest.fn(async () => ({
+          status: 'claimed',
+          domainEpochKey: 'c'.repeat(64),
+          sourceDigest: 'a'.repeat(64),
+          leaseId: 'synthetic-claim-lease',
+          leaseExpiresAt: new Date(Date.now() + 240000).toISOString(),
+          sourceBytes: 100,
+          sourceTurns: [
+            {
+              logicalTurnId: 'synthetic-accepted-turn',
+              userText: 'Keep the selected accepted source.',
+              assistantText: 'The source stays available.',
+            },
+          ],
+        })),
+        completeCompaction: jest.fn(async () => ({ status: 'compacted' })),
+        rejectCompaction: jest.fn(async () => ({ status: 'rejected' })),
+      };
+    }
+    const structured = JSON.stringify({
+      version: 1,
+      summary: 'The selected accepted source stays available.',
+      pendingAsks: [],
+      commitments: [],
+      corrections: [],
+      decisions: [],
+      durableIdentifiers: [],
+      recurrenceOutcomes: [],
+      toolPairs: [],
+    });
+
+    async function prepareRealBoundary(params, fetchImpl) {
+      // The real initializer rematerializes transport for this isolated agent. No model is invoked.
+      const targetAgent = {
+        ...params.agent,
+        model_parameters: {
+          ...params.agent.model_parameters,
+          apiKey: endpoint.apiKey,
+          configuration: { baseURL: endpoint.baseURL },
+        },
+      };
+      const cancellationReq = Object.create(params.req);
+      cancellationReq._viventiumCortexToolEvidence = {};
+      cancellationReq._viventiumHarnessIdempotencyKeys = new Set();
+      cancellationReq._viventiumHarnessCancellationBoundBaseURLs = new Set();
+      const requestBody = {
+        ...params.req.body,
+        messageId: params.runId,
+        viventiumGlassHiveIdempotencyKey: provider.buildHarnessIdempotencyKey(
+          'cortex',
+          params.runId,
+          params.agent.id,
+        ),
+      };
+      cancellationReq.body = requestBody;
+      let bound;
+      const attached = await background.prepareCortexConversationProviderCapability({
+        targetAgent,
+        declaredAgent: params.agent,
+        req: cancellationReq,
+        cancellationReq,
+        capability: { workspace_binding: true },
+        requestBody,
+        nativeTools: params.nativeTools,
+        signal: params.signal,
+        bindCancellation: (args) => {
+          bound = provider.bindHarnessCancellation({ ...args, fetchImpl });
+          return bound;
+        },
+      });
+      return { attached, bound, targetAgent, cancellationReq, requestBody };
+    }
+
+    test('signs zero tools and binds cancellation for both default voice claim and fidelity review', async () => {
+      const outer = voiceRequest();
+      const originalSession = outer.viventiumCallSession;
+      const originalBody = structuredClone(outer.body);
+      const fetchImpl = jest.fn();
+      const bindings = [];
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async (params) => {
+        bindings.push(await prepareRealBoundary(params, fetchImpl));
+        return {
+          insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
+          nativeOwnership: 'ended',
+        };
+      });
+      const args = input(outer);
+      try {
+        await expect(ensureAcceptedMainCompaction(args)).resolves.toMatchObject({
+          status: 'compacted',
+          attempts: 1,
+        });
+        expect(bindings).toHaveLength(2);
+        for (const binding of bindings) {
+          expect(binding.attached).toBe(true);
+          expect(binding.bound).toBe(true);
+          expect(isVoiceActorSideEffectRestricted(binding.cancellationReq)).toBe(false);
+          expect(Object.hasOwn(binding.cancellationReq, 'viventiumCallSession')).toBe(false);
+          expect(binding.cancellationReq.viventiumCallSession).toBeNull();
+          const headers = binding.targetAgent.model_parameters.configuration.defaultHeaders;
+          const encoded = headers['X-GlassHive-Bootstrap-Bundle-B64'];
+          expect(JSON.parse(Buffer.from(encoded, 'base64').toString())).toEqual({
+            provider_capabilities: { native_tools: false },
+          });
+          expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(
+            'sha256=' +
+              crypto
+                .createHmac('sha256', secret)
+                .update(`v1\n${headers['X-GlassHive-Bootstrap-Timestamp']}\n${encoded}`)
+                .digest('hex'),
+          );
+          expect(headers['X-GlassHive-Access']).toBe('read_only');
+          expect(headers['X-GlassHive-Provider-Session-Mode']).toBe('stateless');
+          expect(binding.targetAgent.model).toBe('synthetic-exact-model');
+          expect(binding.targetAgent.model_parameters.reasoning_effort).toBe('high');
+          expect(binding.targetAgent.tools).toEqual([]);
+          expect(binding.targetAgent.mcp).toEqual([]);
+          expect(binding.requestBody).not.toHaveProperty('voiceMode');
+          expect(binding.requestBody).not.toHaveProperty('viventiumActorTrust');
+          expect(binding.requestBody).not.toHaveProperty('viventiumCanAuthorizeSideEffects');
+        }
+        const [{ req: isolated, messages }] = execute.mock.calls[0];
+        expect(Object.hasOwn(isolated, 'viventiumCallSession')).toBe(true);
+        expect(isolated.user.id).toBe(outer.user.id);
+        expect(isolated.config).toBe(outer.config);
+        expect(isolated.user.personalization).toMatchObject({
+          memories: false,
+          conversation_recall: false,
+        });
+        expect(messages[0].content).toContain('synthetic-accepted-turn');
+        expect(args.completeCompaction).toHaveBeenCalledWith(
+          expect.objectContaining({
+            sourceDigest: 'a'.repeat(64),
+            semanticReview: expect.objectContaining({
+              approved: true,
+              sourceDigest: 'a'.repeat(64),
+              candidateDigest: expect.any(String),
+            }),
+          }),
+        );
+        expect(outer.viventiumCallSession).toBe(originalSession);
+        expect(outer.body).toEqual(originalBody);
+        expect(isVoiceActorSideEffectRestricted(outer)).toBe(false);
+        expect(outer).not.toHaveProperty('_viventiumHarnessExecutionEnabled');
+        expect(fetchImpl).not.toHaveBeenCalled();
+      } finally {
+        execute.mockRestore();
+      }
+    });
+
+    test('maintenance yield releases only the default voice compactor exact native attempt', async () => {
+      const outer = voiceRequest();
+      const originalBody = structuredClone(outer.body);
+      const fetchImpl = jest.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ capacityReleased: true, state: 'cancelled' }),
+      }));
+      let binding;
+      let prepared;
+      const ready = new Promise((resolve) => {
+        prepared = resolve;
+      });
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async (params) => {
+        binding = await prepareRealBoundary(params, fetchImpl);
+        prepared();
+        await new Promise((resolve) =>
+          params.signal.addEventListener('abort', resolve, { once: true }),
+        );
+        const outcome = await binding.cancellationReq._viventiumHarnessCancellationDeliveryPromise;
+        params.onHarnessCancellationOutcome(outcome || { acknowledged: false });
+        return {
+          insight: null,
+          errorClass: 'background_agent_error',
+          nativeOwnership: outcome?.acknowledged === true ? 'released' : 'unresolved',
+        };
+      });
+      const args = input(outer);
+      const running = ensureAcceptedMainCompaction(args);
+      try {
+        await ready;
+        const yielded = await yieldAcceptedMainCompaction(identity.ownerId, { timeoutMs: 1000 });
+        expect(await running).toMatchObject({ status: 'degraded', reason: 'interactive_priority' });
+        expect(binding.bound).toBe(true);
+        expect(yielded).toMatchObject({ status: 'yielded', capacityReleaseAcknowledged: true });
+        expect(fetchImpl).toHaveBeenCalledTimes(1);
+        expect(fetchImpl.mock.calls[0][0]).toBe(
+          `${endpoint.baseURL}/requests/by-idempotency/${encodeURIComponent(
+            binding.requestBody.viventiumGlassHiveIdempotencyKey,
+          )}/cancel`,
+        );
+        expect(fetchImpl.mock.calls[0][1]).toMatchObject({
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer synthetic-native-key',
+            'X-Viventium-User-Id': identity.ownerId,
+          },
+        });
+        expect(args.completeCompaction).not.toHaveBeenCalled();
+        expect(args.rejectCompaction).toHaveBeenCalledWith(
+          expect.objectContaining({ reason: 'interactive_priority' }),
+        );
+        expect(outer.body).toEqual(originalBody);
+        expect(outer.viventiumCallSession.callSessionId).toBe('synthetic-outer-call');
+        expect(outer).not.toHaveProperty('_viventiumHarnessCancellationDeliveryPromise');
+      } finally {
+        await running;
+        execute.mockRestore();
+      }
+    });
+
+    test.each([
+      ['owner_participant', false],
+      ['unknown', false],
+      ['guest', true],
+      [undefined, undefined],
+    ])(
+      'keeps ordinary restricted voice %s/%s closed to signing and cancellation',
+      async (trust, sideEffects) => {
+        const outer = voiceRequest(trust, sideEffects);
+        outer.body.viventiumActorTrust = trust;
+        outer.body.viventiumCanAuthorizeSideEffects = sideEffects;
+        const targetAgent = compactorAgent(input(outer).agent, 'c'.repeat(64));
+        expect(isVoiceActorSideEffectRestricted(outer)).toBe(true);
+        expect(
+          await provider.attachConversationProviderCapabilityBundle({
+            targetAgent,
+            req: outer,
+            capability: { workspace_binding: true },
+            nativeTools: false,
+          }),
+        ).toBe(false);
+        expect(targetAgent.model_parameters.configuration?.defaultHeaders || {}).not.toHaveProperty(
+          'X-GlassHive-Bootstrap-Signature',
+        );
+        const fetchImpl = jest.fn();
+        expect(
+          provider.bindHarnessCancellation({
+            req: outer,
+            signal: new AbortController().signal,
+            endpointConfig: endpoint,
+            fetchImpl,
+          }),
+        ).toBe(false);
+        expect(isVoiceActorSideEffectRestricted(outer)).toBe(true);
+        expect(outer.body).toMatchObject({
+          viventiumDeferVoiceMemory: true,
+          suppressBackgroundCortices: true,
+        });
+        expect(fetchImpl).not.toHaveBeenCalled();
+      },
+    );
+  });
+
   test('uses the real default compactor as an internal caller and preserves its valid result', async () => {
     for (let index = 1; index <= 4; index += 1) {
       await commitAcceptedMainTurn({
@@ -839,6 +1144,7 @@ describe('ViventiumMainCompactionService', () => {
           completedResultPolicy: 'internal',
           conversationId: expect.stringMatching(/^main-continuity-compaction-[a-f0-9]{24}$/),
           insightMode: 'structured',
+          nativeTools: false,
           contextMode: 'minimal',
           executionTimeoutMs: 240 * 1000,
         }),

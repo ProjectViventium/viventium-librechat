@@ -1,4 +1,5 @@
 import { createContext, useContext } from 'react';
+import type { TAttachment } from 'librechat-data-provider';
 
 type MessageContext = {
   messageId: string;
@@ -16,6 +17,8 @@ type MessageContext = {
    * === VIVENTIUM END === */
   viventiumPartId?: string;
   viventiumAgentId?: string;
+  /** Verified message files are presentation bindings, never rewritten source text. */
+  viventiumFileAttachments?: TAttachment[];
 };
 
 export const MessageContext = createContext<MessageContext>({} as MessageContext);

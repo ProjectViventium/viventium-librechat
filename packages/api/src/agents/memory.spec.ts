@@ -1244,6 +1244,79 @@ describe('Memory snapshot loading', () => {
     expect(methods.getAllUserMemories).toHaveBeenCalledTimes(2);
   });
 
+  it.each(['user', 'all'] as const)(
+    'does not republish an in-flight read after a %s cache clear across read profiles',
+    async (clearScope) => {
+      const userId = 'owner-with-pending-memory-read';
+      const pending: Array<(entries: Array<{ key: string; value: string }>) => void> = [];
+      const methods = {
+        setMemory: jest.fn(),
+        deleteMemory: jest.fn(),
+        getFormattedMemories: jest.fn(),
+        getAllUserMemories: jest
+          .fn()
+          .mockImplementationOnce(() => new Promise((resolve) => pending.push(resolve)))
+          .mockImplementationOnce(() => new Promise((resolve) => pending.push(resolve)))
+          .mockResolvedValue([{ key: 'core', value: 'Fresh saved fact.' }]),
+      };
+      const configs = [
+        { validKeys: ['core'], readProfile: { tokenLimit: 200, cacheTtlMs: 10_000 } },
+        { validKeys: ['core'], readProfile: { tokenLimit: 100, cacheTtlMs: 10_000 } },
+      ];
+      const oldReads = configs.map((config) =>
+        loadMemoryReadContext({ userId, memoryMethods: methods, config }),
+      );
+
+      clearMemoryReadContextCache(clearScope === 'user' ? userId : undefined);
+      const freshReads = await Promise.all(
+        configs.map((config) =>
+          loadMemoryReadContext({ userId, memoryMethods: methods, config }),
+        ),
+      );
+      pending.forEach((resolve) => resolve([{ key: 'core', value: 'Old saved fact.' }]));
+      await Promise.all(oldReads);
+      const nextReads = await Promise.all(
+        configs.map((config) =>
+          loadMemoryReadContext({ userId, memoryMethods: methods, config }),
+        ),
+      );
+
+      expect(freshReads.every((context) => context.cacheHit === false)).toBe(true);
+      for (const context of nextReads) {
+        expect(context.cacheHit).toBe(true);
+        expect(context.text).toContain('Fresh saved fact.');
+        expect(context.text).not.toContain('Old saved fact.');
+      }
+      expect(methods.getAllUserMemories).toHaveBeenCalledTimes(4);
+    },
+  );
+
+  it('keeps another user in-flight read cacheable when one user is cleared', async () => {
+    let resolveOtherRead!: (entries: Array<{ key: string; value: string }>) => void;
+    const methods = {
+      setMemory: jest.fn(),
+      deleteMemory: jest.fn(),
+      getFormattedMemories: jest.fn(),
+      getAllUserMemories: jest.fn(
+        () => new Promise((resolve) => { resolveOtherRead = resolve; }),
+      ),
+    };
+    const request = {
+      userId: 'independent-memory-owner',
+      memoryMethods: methods,
+      config: { validKeys: ['core'], readProfile: { tokenLimit: 200, cacheTtlMs: 10_000 } },
+    };
+    const pendingRead = loadMemoryReadContext(request);
+    clearMemoryReadContextCache('different-memory-owner');
+    resolveOtherRead([{ key: 'core', value: 'Independent saved fact.' }]);
+    await pendingRead;
+    const cachedRead = await loadMemoryReadContext(request);
+
+    expect(cachedRead.cacheHit).toBe(true);
+    expect(cachedRead.text).toContain('Independent saved fact.');
+    expect(methods.getAllUserMemories).toHaveBeenCalledTimes(1);
+  });
+
   it('gates a configured writer route whose per-user key is absent as authentication', () => {
     const route = { userId: 'no-user-key-owner', provider: 'openai', model: 'memory-model' };
     clearMemoryWriterHealth(route);

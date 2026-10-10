@@ -4,6 +4,7 @@ import {
   createCortexInsightDeliveryService,
   requireExactCortexInsightDeliverySettlement,
 } from './insightDeliveryService';
+import type { CortexInsightDeliveryServiceOptions } from './insightDeliveryService';
 
 type DeliveryService = ReturnType<typeof createCortexInsightDeliveryService>;
 type Fence = Awaited<ReturnType<DeliveryService['fencePresentationByParent']>>;
@@ -27,6 +28,7 @@ type Receipt = Pick<
   logicalTurnId: string;
   presentationRef: string;
   messageHash: string;
+  dispatchAccepted: true;
 };
 
 export interface VoiceCortexMessage {
@@ -68,7 +70,7 @@ export interface VoiceCortexReceiptInput {
 
 interface Dependencies extends Pick<
   DeliveryService,
-  'fencePresentationByParent' | 'markPresentationByParent' | 'listByParent'
+  'fencePresentationByParent' | 'markPresentationByParent' | 'markDropped' | 'listByParent'
 > {
   readMessage: (scope: {
     ownerId: string;
@@ -97,6 +99,38 @@ function successfulOwnedMessage(message: VoiceCortexMessage, input: VoiceCortexR
     message.unfinished !== true &&
     !message.deletedAt
   );
+}
+
+/** Validate the canonical accepted receipt before its adapter returns a private ledger fence. */
+export function resolveAcceptedVoiceCortexDispatch(
+  message: VoiceCortexMessage | null,
+  scope: Pick<VoiceCortexReceiptInput, 'ownerId' | 'parentMessageId'>,
+): Awaited<ReturnType<NonNullable<CortexInsightDeliveryServiceOptions['readAcceptedVoiceDispatch']>>> {
+  const meta = message?.metadata?.viventium;
+  const receipt = meta?.deliveryAcknowledgement?.cortexPresentation;
+  if (!message || !meta || receipt?.dispatchAccepted !== true) return null;
+  if (
+    receipt.version !== 1 || receipt.surface !== 'voice' || receipt.ownerId !== scope.ownerId ||
+    receipt.messageId !== message.messageId || receipt.parentMessageId !== scope.parentMessageId ||
+    receipt.presentationRef !== message.messageId || receipt.revision !== meta.messageRevision ||
+    receipt.generation !== meta.cortexPresentationGeneration || receipt.claimToken !== meta.cortexPresentationClaimToken ||
+    receipt.parentMessageId !== meta.cortexPresentationParentMessageId ||
+    !Array.isArray(meta.cortexInsightDeliveryIds) || !Array.isArray(receipt.deliveryIds) ||
+    !Array.isArray(receipt.deliveryReceipts) || typeof message.text !== 'string' ||
+    JSON.stringify(receipt.deliveryIds) !== JSON.stringify([...meta.cortexInsightDeliveryIds].sort()) ||
+    receipt.messageHash !== createHash('sha256').update(message.text).digest('hex')
+  ) {
+    throw Object.assign(new Error('Canonical accepted Cortex Voice receipt did not match'), {
+      code: 'cortex_voice_presentation_receipt_conflict',
+    });
+  }
+  return {
+    surface: 'voice', parentMessageId: receipt.parentMessageId,
+    persistedMessageId: receipt.messageId, messageRevision: receipt.revision,
+    presentationClaimToken: receipt.claimToken, claimGeneration: receipt.generation,
+    presentationRef: receipt.presentationRef, presentationLeaseToken: receipt.presentationLeaseToken,
+    deliveryReceipts: receipt.deliveryReceipts,
+  };
 }
 
 /** The authenticated adapter reports playout; canonical messages and ledger fences own its identity. */
@@ -179,7 +213,8 @@ async function applyVoiceCortexPresentation(
   }
   const messageHash = createHash('sha256').update(child.text).digest('hex');
   let receipt = meta.deliveryAcknowledgement?.cortexPresentation;
-  if (!receipt) {
+  const alreadyAccepted = receipt?.dispatchAccepted === true;
+  if (!receipt || (!completed && !alreadyAccepted)) {
     if (completed) conflict();
     const fence = await deps.fencePresentationByParent({
       ownerId: input.ownerId,
@@ -220,6 +255,7 @@ async function applyVoiceCortexPresentation(
       logicalTurnId: input.turnId,
       presentationRef: input.presentationRef,
       messageHash,
+      dispatchAccepted: true,
     };
     if (!(await deps.recordReceipt(child, receipt))) conflict();
   }
@@ -248,7 +284,37 @@ async function applyVoiceCortexPresentation(
     )
   )
     conflict();
-  if (!completed) return true;
+  if (!completed) return !alreadyAccepted;
+  if (input.stage === 'audio.interrupted') {
+    const rows = (await deps.listByParent({
+      ownerId: input.ownerId, parentMessageId: input.parentMessageId,
+    })).filter((row) => ids.includes(String(row.deliveryId)));
+    if (rows.length !== ids.length || rows.some((row) => {
+      return row.persistedMessageId !== child.messageId ||
+        Number(row.claimGeneration) !== generation ||
+        Number(row.presentationRevision || row.messageRevision || row.sourceRevision) !== revision ||
+        (row.status === 'dropped'
+          ? row.dropReason !== 'delivery_outcome_unknown'
+          : row.status !== 'claimed');
+    })) conflict();
+    const dropped = await deps.markDropped({
+      ownerId: input.ownerId,
+      claims: ids.map((deliveryId) => ({ deliveryId, claimToken, claimGeneration: Number(generation) })),
+      dropReason: 'delivery_outcome_unknown', allowExpiredLease: true,
+      presentation: {
+        surface: 'voice', parentMessageId: input.parentMessageId,
+        persistedMessageId: child.messageId, messageRevision: revision,
+        presentationClaimToken: claimToken, claimGeneration: generation,
+        presentationRef: input.presentationRef,
+        presentationLeaseToken: receipt.presentationLeaseToken,
+        deliveryReceipts: receipt.deliveryReceipts,
+      },
+    });
+    requireExactCortexInsightDeliverySettlement(
+      ids.map((deliveryId) => ({ deliveryId, claimGeneration: Number(generation) })), dropped,
+    );
+    return dropped;
+  }
   const settled = await deps.markPresentationByParent({
     ownerId: input.ownerId,
     parentMessageId: input.parentMessageId,
@@ -288,7 +354,7 @@ export async function confirmVoiceCortexPresentation(
   input: VoiceCortexReceiptInput,
   deps: Dependencies,
 ): Promise<Awaited<ReturnType<DeliveryService['markPresentationByParent']>> | null> {
-  if (input.stage !== 'audio.completed') return null;
+  if (!['audio.completed', 'audio.interrupted'].includes(input.stage)) return null;
   const result = await applyVoiceCortexPresentation(input, deps, true);
   return Array.isArray(result) ? result : null;
 }

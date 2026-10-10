@@ -41,7 +41,12 @@ function extractCompletedCortexInsights(content) {
     .filter((p) => p.insight.length > 0);
 }
 
-async function getFollowUpMessageForParent({ userId, conversationId, parentMessageId }) {
+async function getFollowUpMessageForParent({
+  userId,
+  conversationId,
+  parentMessageId,
+  followupMessageId,
+}) {
   if (!conversationId || !parentMessageId) {
     return null;
   }
@@ -51,13 +56,19 @@ async function getFollowUpMessageForParent({ userId, conversationId, parentMessa
     conversationId,
     'metadata.viventium.parentMessageId': parentMessageId,
     'metadata.viventium.type': 'cortex_followup',
+    ...(followupMessageId ? { messageId: followupMessageId } : {}),
   });
 
   if (!Array.isArray(followUps) || followUps.length === 0) {
     return null;
   }
 
-  const followUp = followUps[followUps.length - 1];
+  const cortexFollowUps = followUps.filter(
+    (message) =>
+      message?.metadata?.viventium?.followUpSource !== 'durable_terminal_callback' &&
+      (!followupMessageId || message.messageId === followupMessageId),
+  );
+  const followUp = cortexFollowUps[cortexFollowUps.length - 1];
   const text = typeof followUp?.text === 'string' ? followUp.text.trim() : '';
   if (!text) {
     return null;
@@ -66,6 +77,9 @@ async function getFollowUpMessageForParent({ userId, conversationId, parentMessa
   return {
     messageId: followUp.messageId,
     text,
+    audioSuppressed:
+      followUp.metadata?.viventium?.deliveryDisposition?.version === 1 &&
+      followUp.metadata.viventium.deliveryDisposition.audio === 'skip',
     presentationRequired:
       Array.isArray(followUp.metadata?.viventium?.cortexInsightDeliveryIds) &&
       followUp.metadata.viventium.cortexInsightDeliveryIds.length > 0,
@@ -90,7 +104,12 @@ function getFollowUpDecisionForMessage(message) {
  * @param {string} [params.conversationId]
  * @returns {Promise<null | { messageId: string, conversationId?: string, insights: Array }>}
  */
-async function getCompletedCortexInsightsForMessage({ userId, messageId, conversationId }) {
+async function getCompletedCortexInsightsForMessage({
+  userId,
+  messageId,
+  conversationId,
+  followupMessageId,
+}) {
   if (typeof userId !== 'string' || userId.length === 0) {
     throw new Error('getCompletedCortexInsightsForMessage requires userId');
   }
@@ -113,15 +132,21 @@ async function getCompletedCortexInsightsForMessage({ userId, messageId, convers
     userId,
     conversationId: msg.conversationId,
     parentMessageId: msg.messageId,
+    followupMessageId,
   });
 
   return {
     messageId: msg.messageId,
     conversationId: msg.conversationId,
-    insights,
-    followUp: followUp ? { messageId: followUp.messageId, text: followUp.text } : null,
-    presentationRequired: followUp?.presentationRequired === true,
-    followUpDecision: getFollowUpDecisionForMessage(msg),
+    insights: followUp?.audioSuppressed ? [] : insights,
+    followUp:
+      followUp && !followUp.audioSuppressed
+        ? { messageId: followUp.messageId, text: followUp.text }
+        : null,
+    presentationRequired: !followUp?.audioSuppressed && followUp?.presentationRequired === true,
+    followUpDecision: followUp?.audioSuppressed
+      ? { result: 'suppressed', suppressionReason: 'audio_delivery_disposition' }
+      : getFollowUpDecisionForMessage(msg),
     presentationContext: {
       callSessionId: msg.metadata?.viventium?.callSessionId,
       taskId: msg.metadata?.viventium?.voiceTaskId,

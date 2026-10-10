@@ -9,6 +9,7 @@
  * === VIVENTIUM END === */
 
 import * as crypto from 'crypto';
+import { isFeelingsReadIsolated } from '../feelings/service';
 
 import type { Logger } from 'winston';
 import type { ClientSession } from 'mongoose';
@@ -133,6 +134,9 @@ export interface GlassHiveDestination {
 }
 
 export interface GlassHiveLaunchRequestBody {
+  isTemporary?: boolean;
+  viventiumQaRun?: boolean;
+  viventiumEvalIsolation?: { feelings?: boolean };
   conversationId?: string;
   conversation_id?: string;
   messageId?: string;
@@ -226,6 +230,7 @@ export interface GlassHiveCallbackEffectFence {
 }
 
 export interface GlassHiveCallbackContext {
+  feelingsIsolated?: boolean;
   bindingId: string;
   originRef: string;
   workRef: string;
@@ -296,6 +301,12 @@ export interface GlassHiveCallbackBindingService {
   confirmGlassHiveCallbackContext: (
     input?: GlassHiveCallbackMutationInput,
   ) => Promise<GlassHiveCallbackContext | null>;
+  isGlassHiveNonterminalAttentionCallback: (body?: GlassHiveCallbackBody) => boolean;
+  fenceGlassHiveCallbackRunState: (input: {
+    binding: Pick<GlassHiveCallbackContext, 'ownerId' | 'originRef' | 'workRef'>;
+    body: GlassHiveCallbackBody;
+    effectSession: ClientSession;
+  }) => Promise<void>;
   glassHiveLaunchOriginFromArguments: (toolArguments: unknown) => string;
   getSchedulerExternalWorkSummary: (
     input?: GlassHiveSchedulerBinding & { effectSession?: ClientSession },
@@ -1295,6 +1306,8 @@ async function registerGlassHiveLaunchContext({
           requestBody.agent_id || requestBody.agentId || requestBody.endpointOption?.agent_id,
           160,
         ),
+        ...(isFeelingsReadIsolated(requestBody)
+          ? { feelingsIsolated: true } : {}),
         createdAt: now,
       },
       $set: {
@@ -1594,8 +1607,9 @@ async function markGlassHiveLaunchDispatchReady(
   const dispatchExpiresAt = new Date(now.getTime() + launchDispatchAmbiguityLeaseMs());
   const filter = {
     _id: originRef,
+    ownerId,
     workRef: '',
-    launchState: { $in: ['prepared', 'not_dispatched'] },
+    launchState: 'prepared',
   };
   const bindingUpdate = {
     $set: { launchState: 'dispatch_ready', dispatchExpiresAt, updatedAt: now },
@@ -1615,8 +1629,22 @@ async function markGlassHiveLaunchDispatchReady(
       terminalAt: 1,
     },
   };
-  await callbackBindingCollection().updateOne(filter, bindingUpdate);
-  await externalWorkCollection().updateOne(filter, workUpdate);
+  /* === VIVENTIUM START === A closed reservation cannot regain dispatch authority. === */
+  const bindingResult = await callbackBindingCollection().updateOne(filter, bindingUpdate);
+  if (bindingResult.acknowledged !== true || bindingResult.matchedCount !== 1) {
+    throw Object.assign(new Error('glasshive_launch_dispatch_fenced'), {
+      code: 'glasshive_launch_dispatch_fenced',
+      retryable: false,
+    });
+  }
+  const workResult = await externalWorkCollection().updateOne(filter, workUpdate);
+  if (workResult.acknowledged !== true || workResult.matchedCount !== 1) {
+    throw Object.assign(new Error('glasshive_launch_dispatch_fenced'), {
+      code: 'glasshive_launch_dispatch_fenced',
+      retryable: false,
+    });
+  }
+  /* === VIVENTIUM END === */
   // This hint is set only after every Core-side prerequisite has succeeded. From here onward an
   // MCP transport error is ambiguous and the ordinary dispatch_unknown reconciler owns it.
   await requireParallelWorkPositiveFence(ownerId);
@@ -1721,6 +1749,64 @@ async function markGlassHiveLaunchDispatchRejected(
   const binding = await callbackBindingCollection().findOne({ _id: originRef });
   if (!binding?.ownerId || binding?.workRef) return null;
   return markGlassHiveLaunchPreDispatchFailed(binding, error);
+}
+
+function isGlassHiveNonterminalAttentionCallback(body: GlassHiveCallbackBody = {}): boolean {
+  return (
+    body.work_terminal !== true &&
+    ['run.needs_input', 'run.blocked'].includes(normalizeText(body.event, 64))
+  );
+}
+
+async function fenceGlassHiveCallbackRunState({
+  binding,
+  body,
+  effectSession,
+}: {
+  binding: Pick<GlassHiveCallbackContext, 'ownerId' | 'originRef' | 'workRef'>;
+  body: GlassHiveCallbackBody;
+  effectSession: ClientSession;
+}): Promise<void> {
+  const ownerId = normalizeText(binding.ownerId);
+  const originRef = normalizeText(binding.originRef, 160);
+  const workRef = normalizeText(binding.workRef, 160);
+  const workerId = normalizeText(body.worker_id, 160);
+  const runId = normalizeText(body.run_id, 160);
+  if (!effectSession.inTransaction() || !ownerId || !originRef || !workRef || !workerId || !runId) {
+    throw callbackEffectFenceError('glasshive_callback_run_binding_not_ready');
+  }
+  const attention = isGlassHiveNonterminalAttentionCallback(body);
+  if (attention) {
+    const terminal = await mongoose.connection.collection('viventium_glasshive_callback_results')
+      .findOne(
+        { ownerId, originRef, workRef, workerId, runId, resultRevision: { $gte: 1 } },
+        { session: effectSession },
+      );
+    if (terminal) throw callbackEffectFenceError('glasshive_callback_notice_superseded');
+  }
+  const scope = { _id: originRef, ownerId, $or: [{ workRef: '' }, { workRef }] };
+  const filter = attention
+    ? {
+        $and: [scope, { $nor: [
+          { terminalCallbackRunId: runId },
+          { runId, externalState: { $in: TERMINAL_STATES } },
+        ] }],
+      }
+    : scope;
+  const written = await externalWorkCollection().updateOne(
+    filter, { $set: { updatedAt: new Date() } }, { session: effectSession },
+  );
+  if (Number(written.matchedCount) === 1) return;
+  const current = await externalWorkCollection().findOne(scope, { session: effectSession });
+  if (
+    attention && current && (
+      current.terminalCallbackRunId === runId ||
+      current.runId === runId && TERMINAL_STATES.includes(normalizeText(current.externalState, 32))
+    )
+  ) {
+    throw callbackEffectFenceError('glasshive_callback_notice_superseded');
+  }
+  throw callbackEffectFenceError('glasshive_callback_run_binding_not_ready');
 }
 
 async function confirmGlassHiveCallbackContext({
@@ -1884,6 +1970,7 @@ async function resolveGlassHiveCallbackContext(
     scheduleOccurrenceKey: normalizeText(binding.scheduleOccurrenceKey),
     scheduleId: normalizeText(binding.scheduleId),
     mainAgentId: normalizeText(binding.mainAgentId, 160),
+    ...(binding.feelingsIsolated === true ? { feelingsIsolated: true } : {}),
     ...(body.output_files != null ? { runId, attemptId: normalizeText(association?.attemptId, 160) } : {}),
     ...(traceIdentity ? { traceIdentity } : {}),
     destinations,
@@ -2581,14 +2668,9 @@ async function recordGlassHiveAdjudicationOutcome({
     adjudicatedAt: now,
     updatedAt: now,
   };
-  const deliveryState =
-    normalizedState === 'silent' && normalizedErrorCode === 'mission_origin_cleanup_tombstoned'
-      ? 'suppressed'
-      : normalizedState === 'failed'
-        ? unresolvedDelivery
-          ? 'unresolved'
-          : 'failed'
-        : 'enqueued';
+  const deliveryState = normalizedState === 'silent' && normalizedErrorCode === 'mission_origin_cleanup_tombstoned'
+    ? 'suppressed'
+    : normalizedState === 'failed' ? (unresolvedDelivery ? 'unresolved' : 'failed') : 'enqueued';
   effectSession ||= mongoose.transactionAsyncLocalStorage?.getStore()?.session || null;
   const collection = externalWorkCollection();
   const unsettledResult = await collection.findOneAndUpdate(
@@ -2782,6 +2864,8 @@ async function notifySchedulerExternalWorkSummary(
 }
 
 const service: GlassHiveCallbackBindingService = {
+  isGlassHiveNonterminalAttentionCallback,
+  fenceGlassHiveCallbackRunState,
   attachGlassHiveLaunchOrigin,
   attachGlassHiveTrustedLaunchMetadata: (
     toolArguments,

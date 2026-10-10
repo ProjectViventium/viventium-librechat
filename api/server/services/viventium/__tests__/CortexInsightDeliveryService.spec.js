@@ -21,6 +21,7 @@ jest.mock(
 
 jest.mock('~/db/models', () => ({
   ViventiumCortexInsightDelivery: {},
+  Message: {},
 }));
 
 const {
@@ -58,7 +59,10 @@ function leanResult(value) {
   return { lean: async () => value };
 }
 
-function createBatchStateModel(initialRows, { failClaimFor = '', failSettlementFor = '' } = {}) {
+function createBatchStateModel(
+  initialRows,
+  { failClaimFor = '', failSettlementFor = '', matchFilter } = {},
+) {
   const cloneRow = (row) =>
     Object.fromEntries(
       Object.entries(row).map(([key, value]) => [key, Array.isArray(value) ? [...value] : value]),
@@ -71,6 +75,7 @@ function createBatchStateModel(initialRows, { failClaimFor = '', failSettlementF
   );
   let settlementFailureInjected = false;
   const matches = (row, filter = {}) => {
+    if (matchFilter) return matchFilter(filter)(row);
     for (const [key, expected] of Object.entries(filter)) {
       if (key.startsWith('$')) continue;
       if (expected && typeof expected === 'object' && !Array.isArray(expected)) {
@@ -136,10 +141,10 @@ function createBatchStateModel(initialRows, { failClaimFor = '', failSettlementF
         update?.$set?.status === 'dropped';
       if (
         !row ||
-        (isClaim && row.deliveryId === failClaimFor) ||
-        (isSettlement && row.deliveryId === failSettlementFor && !settlementFailureInjected)
+        (isClaim && row?.deliveryId === failClaimFor) ||
+        (isSettlement && row?.deliveryId === failSettlementFor && !settlementFailureInjected)
       ) {
-        if (isSettlement && row.deliveryId === failSettlementFor) {
+        if (isSettlement && row?.deliveryId === failSettlementFor) {
           settlementFailureInjected = true;
         }
         return query(() => null);
@@ -1499,51 +1504,6 @@ describe('CortexInsightDeliveryService', () => {
     expect(new Set(state.map((row) => row.claimToken)).size).toBe(1);
   });
 
-  test('returns the committed claim result after the transaction callback retries', async () => {
-    const rows = ['a', 'b'].map((suffix) => ({
-      deliveryId: `cidl_delivery-${suffix}`,
-      userId: 'owner-a',
-      parentMessageId: 'parent-a',
-      cortexId: `review-${suffix}`,
-      insight: 'Synthetic pending result.',
-      status: 'pending',
-      attemptNumber: 0,
-      claimGeneration: 0,
-      surface: 'web',
-    }));
-    const { Model, state } = createBatchStateModel(rows);
-    let attempt = 0;
-    const session = {
-      withTransaction: jest.fn(async (operation) => {
-        attempt = 1;
-        await operation();
-        // The driver discards aborted writes before retrying the callback.
-        state.splice(0, state.length, ...rows.map((row) => ({ ...row, claimGeneration: 4 })));
-        attempt = 2;
-        await operation();
-      }),
-      endSession: jest.fn(),
-    };
-    Model.db = { startSession: jest.fn(async () => session) };
-    const service = createCortexInsightDeliveryService({
-      DeliveryModel: Model,
-      now: () => new Date('2026-08-22T12:00:00.000Z'),
-      randomUUID: () => 'synthetic-retry',
-    });
-    const batch = await service.claimPendingByParent({
-      ownerId: 'owner-a',
-      parentMessageId: 'parent-a',
-      surface: 'web',
-    });
-    expect(batch.claimed).toHaveLength(2);
-    expect(attempt).toBe(2);
-    expect(batch.claimed.map((row) => row.claimGeneration)).toEqual(
-      state.map((row) => row.claimGeneration),
-    );
-    expect(batch.claimed.map((row) => row.claimGeneration)).toEqual([5, 5]);
-    expect(session.endSession).toHaveBeenCalledTimes(1);
-  });
-
   test('rolls back every sibling lease when one parent batch claim conflicts', async () => {
     const { Model, state } = createBatchStateModel(
       [
@@ -2191,4 +2151,581 @@ describe('CortexInsightDeliveryService', () => {
       code: 'cortex_insight_delivery_settlement_conflict',
     });
   });
+
+  test('returns the committed claim result after the transaction callback retries', async () => {
+    const rows = ['a', 'b'].map((suffix) => ({
+      deliveryId: `cidl_delivery-${suffix}`,
+      userId: 'owner-a',
+      parentMessageId: 'parent-a',
+      cortexId: `review-${suffix}`,
+      insight: 'Synthetic pending result.',
+      status: 'pending',
+      attemptNumber: 0,
+      claimGeneration: 0,
+      surface: 'web',
+    }));
+    const { Model, state } = createBatchStateModel(rows);
+    let attempt = 0;
+    const session = {
+      withTransaction: jest.fn(async (operation) => {
+        attempt = 1;
+        await operation();
+        // The driver discards aborted writes before retrying the callback.
+        state.splice(0, state.length, ...rows.map((row) => ({ ...row, claimGeneration: 4 })));
+        attempt = 2;
+        await operation();
+      }),
+      endSession: jest.fn(),
+    };
+    Model.db = { startSession: jest.fn(async () => session) };
+    const service = createCortexInsightDeliveryService({
+      DeliveryModel: Model,
+      now: () => new Date('2026-08-22T12:00:00.000Z'),
+      randomUUID: () => 'synthetic-retry',
+    });
+    const batch = await service.claimPendingByParent({
+      ownerId: 'owner-a',
+      parentMessageId: 'parent-a',
+      surface: 'web',
+    });
+    expect(batch.claimed).toHaveLength(2);
+    expect(attempt).toBe(2);
+    expect(batch.claimed.map((row) => row.claimGeneration)).toEqual(
+      state.map((row) => row.claimGeneration),
+    );
+    expect(batch.claimed.map((row) => row.claimGeneration)).toEqual([5, 5]);
+    expect(session.endSession).toHaveBeenCalledTimes(1);
+  });
 });
+
+/* === VIVENTIUM START === Exact interrupted presentation fences survive expired leases. === */
+describe('canonical interrupted Cortex presentation settlement', () => {
+  const checkedAt = new Date('2026-08-22T12:00:00.000Z');
+  const row = (overrides = {}) => ({
+    deliveryId: 'cidl_interrupted',
+    userId: 'owner-a',
+    parentMessageId: 'parent-a',
+    conversationId: 'conversation-a',
+    cortexId: 'review-a',
+    insight: 'Retained insight.',
+    status: 'claimed',
+    persistenceStatus: 'persisted',
+    persistedMessageId: 'child-a',
+    sourceRevision: 1,
+    presentationRevision: 1,
+    messageRevision: 1,
+    requiredSurfaces: ['voice'],
+    presentedSurfaces: [],
+    presentationReceiptHashes: [],
+    claimToken: 'claim-a',
+    claimGeneration: 2,
+    attemptNumber: 1,
+    claimedAt: new Date('2026-08-22T11:58:00.000Z'),
+    leaseExpiresAt: new Date('2026-08-22T11:59:00.000Z'),
+    graphResultHash: 'a'.repeat(64),
+    presentationLeaseToken: 'old-presentation',
+    presentationLeaseOwnerId: 'owner-a',
+    presentationLeaseClaimToken: 'claim-a',
+    presentationLeaseGeneration: 2,
+    presentationLeaseExpiresAt: new Date('2026-08-22T11:59:00.000Z'),
+    events: [],
+    ...overrides,
+  });
+  const input = () => ({
+    ownerId: 'owner-a',
+    claims: [{ deliveryId: 'cidl_interrupted', claimToken: 'claim-a', claimGeneration: 2 }],
+    dropReason: 'delivery_outcome_unknown',
+    allowExpiredLease: true,
+    presentation: {
+      surface: 'voice',
+      parentMessageId: 'parent-a',
+      persistedMessageId: 'child-a',
+      messageRevision: 1,
+      presentationClaimToken: 'claim-a',
+      claimGeneration: 2,
+      presentationRef: 'child-a',
+      presentationLeaseToken: 'old-presentation',
+      deliveryReceipts: [{ deliveryId: 'cidl_interrupted', graphResultHash: 'a'.repeat(64) }],
+    },
+  });
+  const setup = (rows = [row()]) => {
+    const model = createBatchStateModel(rows, { matchFilter: require('sift').default });
+    const service = createCortexInsightDeliveryService({
+      DeliveryModel: model.Model,
+      now: () => checkedAt,
+    });
+    return { ...model, service };
+  };
+  test('exact expired interrupted receipt drops once, preserves the insight and cannot be claimed again', async () => {
+    const { service, state } = setup();
+    await expect(service.markDropped(input())).resolves.toHaveLength(1);
+    await expect(service.markDropped(input())).resolves.toHaveLength(1);
+    expect(state[0]).toMatchObject({
+      status: 'dropped',
+      dropReason: 'delivery_outcome_unknown',
+      insight: 'Retained insight.',
+      persistedMessageId: 'child-a',
+      graphResultHash: 'a'.repeat(64),
+    });
+    expect(state[0].events.filter((event) => event.transition === 'dropped')).toHaveLength(1);
+    await expect(
+      service.claimPendingByParent({
+        ownerId: 'owner-a',
+        parentMessageId: 'parent-a',
+        surface: 'voice',
+      }),
+    ).resolves.toMatchObject({ claimed: [] });
+  });
+  test('actual same-generation renewed presentation rejects the old interrupted receipt', async () => {
+    const { service, state } = setup([
+      row({ leaseExpiresAt: new Date(checkedAt.getTime() + 30_000) }),
+    ]);
+    await service.renewClaim({
+      ownerId: 'owner-a',
+      claims: input().claims,
+      leaseMs: 30_000,
+      presentation: {
+        surface: 'voice',
+        parentMessageId: 'parent-a',
+        persistedMessageId: 'child-a',
+        messageRevision: 1,
+        ownerId: 'owner-a',
+        token: 'new-presentation',
+        expiresAt: new Date(checkedAt.getTime() + 30_000),
+      },
+    });
+    expect(state[0].claimGeneration).toBe(2);
+    const renewedToken = state[0].presentationLeaseToken;
+    expect(renewedToken).not.toBe('old-presentation');
+    await expect(service.markDropped(input())).rejects.toMatchObject({
+      code: 'cortex_insight_delivery_settlement_conflict',
+    });
+    expect(state[0]).toMatchObject({ status: 'claimed', presentationLeaseToken: renewedToken });
+  });
+  test.each([
+    ['owner', { userId: 'other-owner' }],
+    ['parent', { parentMessageId: 'other-parent' }],
+    ['message', { persistedMessageId: 'other-child' }],
+    ['revision', { presentationRevision: 2 }],
+    ['graph', { graphResultHash: 'b'.repeat(64) }],
+    ['claim', { claimGeneration: 3 }],
+    ['lease-owner', { presentationLeaseOwnerId: 'other-owner' }],
+    ['lease-token', { presentationLeaseToken: 'new-presentation' }],
+    ['lease-generation', { presentationLeaseGeneration: 3 }],
+    ['surface', { requiredSurfaces: ['telegram'] }],
+  ])('rejects %s fence changes without dropping the retained result', async (_field, changes) => {
+    const { service, state } = setup([row(changes)]);
+    await expect(service.markDropped(input())).rejects.toMatchObject({
+      code: expect.stringMatching(/^cortex_insight_delivery_/),
+    });
+    expect(state[0].status).toBe('claimed');
+    expect(state[0].insight).toBe('Retained insight.');
+  });
+  test('atomic write rejects a lease rotated between the canonical read and settlement', async () => {
+    const { service, Model, state } = setup();
+    const original = Model.findOneAndUpdate.getMockImplementation();
+    Model.findOneAndUpdate.mockImplementation((filter, update, options) => {
+      if (update.$set?.status === 'dropped')
+        state[0].presentationLeaseToken = 'racing-presentation';
+      return original(filter, update, options);
+    });
+    await expect(service.markDropped(input())).rejects.toMatchObject({
+      code: 'cortex_insight_delivery_settlement_conflict',
+    });
+    expect(state[0]).toMatchObject({
+      status: 'claimed',
+      presentationLeaseToken: 'racing-presentation',
+    });
+  });
+  test('a duplicate with another presentation ref or lease cannot reuse the terminal receipt', async () => {
+    const { service, state } = setup();
+    await service.markDropped(input());
+    for (const change of [
+      { presentationRef: 'other-ref' },
+      { presentationLeaseToken: 'other-lease' },
+    ]) {
+      const changed = input();
+      changed.presentation = { ...changed.presentation, ...change };
+      await expect(service.markDropped(changed)).rejects.toMatchObject({
+        code: 'cortex_insight_delivery_settlement_conflict',
+      });
+    }
+    expect(state[0].events.filter((event) => event.transition === 'dropped')).toHaveLength(1);
+  });
+
+  const acceptedHandoff = () => {
+    const model = createBatchStateModel(
+      [
+        row({
+          leaseExpiresAt: new Date(checkedAt.getTime() + 30_000),
+          presentationLeaseExpiresAt: null,
+          presentationLeaseToken: '',
+          presentationLeaseOwnerId: '',
+          presentationLeaseClaimToken: '',
+          presentationLeaseGeneration: 0,
+        }),
+      ],
+      { matchFilter: require('sift').default },
+    );
+    const child = {
+      user: 'owner-a',
+      messageId: 'child-a',
+      conversationId: 'conversation-a',
+      text: 'Retained insight.',
+      isCreatedByUser: false,
+      metadata: {
+        viventium: {
+          parentMessageId: 'parent-a',
+          cortexInsightDeliveryIds: ['cidl_interrupted'],
+          messageRevision: 1,
+          cortexPresentationParentMessageId: 'parent-a',
+          cortexPresentationGeneration: 2,
+          cortexPresentationClaimToken: 'claim-a',
+          deliveryAcknowledgement: {},
+        },
+      },
+    };
+    const parent = {
+      user: 'owner-a',
+      messageId: 'parent-a',
+      conversationId: 'conversation-a',
+      text: 'Retained answer.',
+      isCreatedByUser: false,
+      metadata: {
+        viventium: {
+          callSessionId: 'call-a',
+          voiceTaskId: 'task-a',
+          interactionContext: { surface: 'voice', logical_turn_id: 'turn-a' },
+        },
+      },
+    };
+    const MessageModel = {
+      findOne: jest.fn((filter) =>
+        leanResult(structuredClone([child, parent].find(require('sift').default(filter)) || null)),
+      ),
+      updateOne: jest.fn(async (filter, update) => {
+        if (!require('sift').default(filter)(child)) return { acknowledged: true, matchedCount: 0 };
+        child.metadata.viventium.deliveryAcknowledgement.cortexPresentation = structuredClone(
+          update.$set['metadata.viventium.deliveryAcknowledgement.cortexPresentation'],
+        );
+        return { acknowledged: true, matchedCount: 1 };
+      }),
+      updateMany: jest.fn().mockResolvedValue({ modifiedCount: 0 }),
+    };
+    const models = require('~/db/models');
+    const adapter = require('../CortexInsightDeliveryService');
+    Object.assign(models.ViventiumCortexInsightDelivery, model.Model);
+    Object.assign(models.Message, MessageModel);
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+    jest.setSystemTime(checkedAt);
+    const prepared = {
+      ownerId: 'owner-a',
+      conversationId: 'conversation-a',
+      parentMessageId: 'parent-a',
+      callSessionId: 'call-a',
+      taskId: 'task-a',
+      streamId: 'stream-a',
+      turnId: 'turn-a',
+      presentationRef: 'child-a',
+      text: child.text,
+      leaseMs: 30_000,
+    };
+    const close = () => {
+      jest.useRealTimers();
+      for (const object of [models.ViventiumCortexInsightDelivery, models.Message]) {
+        for (const key of Object.keys(object)) delete object[key];
+      }
+    };
+    const expire = () => jest.setSystemTime(new Date(checkedAt.getTime() + 31_000));
+    return { ...model, child, MessageModel, adapter, prepared, close, expire };
+  };
+
+  test('accepted handoff with both start and terminal writes lost settles unknown at expiry, never replays on any surface', async () => {
+    const f = acceptedHandoff();
+    try {
+      await expect(f.adapter.prepareCortexVoicePresentation(f.prepared)).resolves.toBe(true);
+      expect(
+        f.child.metadata.viventium.deliveryAcknowledgement.cortexPresentation.dispatchAccepted,
+      ).toBe(true);
+      await expect(f.adapter.prepareCortexVoicePresentation(f.prepared)).resolves.toBe(false);
+      expect(f.MessageModel.updateOne).toHaveBeenCalledTimes(1);
+      expect(f.state[0].status).toBe('claimed');
+      f.expire();
+      for (const surface of ['voice', 'web', 'telegram']) {
+        await expect(
+          f.adapter.claimPendingCortexInsightDeliveriesForParent({
+            ownerId: 'owner-a',
+            parentMessageId: 'parent-a',
+            surface,
+          }),
+        ).resolves.toMatchObject({ claimed: [] });
+      }
+      expect(f.state[0]).toMatchObject({
+        status: 'dropped',
+        dropReason: 'delivery_outcome_unknown',
+        persistedMessageId: 'child-a',
+        insight: 'Retained insight.',
+      });
+      expect(f.state[0].events.filter((event) => event.transition === 'dropped')).toHaveLength(1);
+      expect(f.child.text).toBe('Retained insight.');
+      expect(f.state[0].presentedSurfaces).toEqual([]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test('only completed accepted playout marks the actual ledger heard and Sent', async () => {
+    const f = acceptedHandoff();
+    try {
+      await f.adapter.prepareCortexVoicePresentation(f.prepared);
+      await expect(
+        f.adapter.confirmCortexVoicePresentation({ ...f.prepared, stage: 'audio.completed' }),
+      ).resolves.toEqual([
+        expect.objectContaining({ status: 'sent', presentedSurfaces: ['voice'] }),
+      ]);
+      expect(f.state[0].status).toBe('sent');
+      f.expire();
+      await expect(
+        f.adapter.claimPendingCortexInsightDeliveriesForParent({
+          ownerId: 'owner-a',
+          parentMessageId: 'parent-a',
+          surface: 'telegram',
+        }),
+      ).resolves.toMatchObject({ claimed: [] });
+      expect(f.state[0].status).toBe('sent');
+      expect(f.child.text).toBe('Retained insight.');
+    } finally {
+      f.close();
+    }
+  });
+
+  test('concurrent fresh prepare calls commit one acceptance and return only one handoff', async () => {
+    const f = acceptedHandoff();
+    try {
+      await f.adapter.fenceCortexInsightDeliveryPresentationByParent({
+        ownerId: 'owner-a',
+        parentMessageId: 'parent-a',
+        surface: 'voice',
+        persistedMessageId: 'child-a',
+        messageRevision: 1,
+        expectedDeliveryIds: ['cidl_interrupted'],
+        expectedGeneration: 2,
+        leaseMs: 30_000,
+      });
+      let readCount = 0;
+      let release;
+      const bothRead = new Promise((resolve) => {
+        release = resolve;
+      });
+      const original = f.MessageModel.findOne.getMockImplementation();
+      f.MessageModel.findOne.mockImplementation((filter) => ({
+        lean: async () => {
+          const snapshot = await original(filter).lean();
+          if (
+            snapshot?.messageId === 'child-a' &&
+            !snapshot.metadata.viventium.deliveryAcknowledgement.cortexPresentation &&
+            readCount < 2
+          ) {
+            readCount += 1;
+            if (readCount === 2) release();
+            await bothRead;
+          }
+          return snapshot;
+        },
+      }));
+      const results = await Promise.allSettled([
+        f.adapter.prepareCortexVoicePresentation(f.prepared),
+        f.adapter.prepareCortexVoicePresentation(f.prepared),
+      ]);
+      expect(
+        results.filter((result) => result.status === 'fulfilled' && result.value === true),
+      ).toHaveLength(1);
+      expect(
+        results.filter(
+          (result) =>
+            result.status === 'rejected' &&
+            result.reason.code === 'cortex_voice_presentation_receipt_conflict',
+        ),
+      ).toHaveLength(1);
+      expect(
+        f.child.metadata.viventium.deliveryAcknowledgement.cortexPresentation.dispatchAccepted,
+      ).toBe(true);
+      expect(f.MessageModel.updateOne).toHaveBeenCalledTimes(2);
+      expect(f.state[0].presentedSurfaces).toEqual([]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test('failed acceptance CAS returns no handoff and unaccepted expiry remains recoverable', async () => {
+    const f = acceptedHandoff();
+    try {
+      f.MessageModel.updateOne.mockResolvedValueOnce({ acknowledged: true, matchedCount: 0 });
+      await expect(f.adapter.prepareCortexVoicePresentation(f.prepared)).rejects.toMatchObject({
+        code: 'cortex_voice_presentation_receipt_conflict',
+      });
+      expect(f.child.metadata.viventium.deliveryAcknowledgement.cortexPresentation).toBeUndefined();
+      f.expire();
+      await expect(
+        f.adapter.claimPendingCortexInsightDeliveriesForParent({
+          ownerId: 'owner-a',
+          parentMessageId: 'parent-a',
+          surface: 'voice',
+        }),
+      ).resolves.toMatchObject({
+        claimed: [expect.objectContaining({ deliveryId: 'cidl_interrupted' })],
+      });
+      expect(f.state[0].status).toBe('claimed');
+      expect(f.state[0].dropReason).toBe('');
+    } finally {
+      f.close();
+    }
+  });
+
+  test('lost interrupted terminal write still cannot replay after the accepted lease expires', async () => {
+    const f = acceptedHandoff();
+    try {
+      await f.adapter.prepareCortexVoicePresentation(f.prepared);
+      const original = f.Model.findOneAndUpdate.getMockImplementation();
+      f.Model.findOneAndUpdate.mockImplementation((filter, update, options) =>
+        update.$set?.status === 'dropped' ? leanResult(null) : original(filter, update, options),
+      );
+      await expect(
+        f.adapter.confirmCortexVoicePresentation({ ...f.prepared, stage: 'audio.interrupted' }),
+      ).rejects.toMatchObject({ code: 'cortex_insight_delivery_settlement_conflict' });
+      f.Model.findOneAndUpdate.mockImplementation(original);
+      f.expire();
+      await expect(
+        f.adapter.claimPendingCortexInsightDeliveriesForParent({
+          ownerId: 'owner-a',
+          parentMessageId: 'parent-a',
+          surface: 'telegram',
+        }),
+      ).resolves.toMatchObject({ claimed: [] });
+      expect(f.state[0]).toMatchObject({
+        status: 'dropped',
+        dropReason: 'delivery_outcome_unknown',
+      });
+      expect(f.state[0].presentedSurfaces).toEqual([]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test.each([
+    ['renewed lease', { presentationLeaseToken: 'new-presentation' }],
+    ['new claim', { claimGeneration: 3 }],
+    ['new revision', { presentationRevision: 2 }],
+    ['changed graph', { graphResultHash: 'b'.repeat(64) }],
+    ['invalid claim expiry', { leaseExpiresAt: 'invalid' }],
+    ['invalid presentation expiry', { presentationLeaseExpiresAt: 'invalid' }],
+  ])(
+    'accepted recovery rejects %s without dropping a changed claim or returning work',
+    async (_name, changes) => {
+      const f = acceptedHandoff();
+      try {
+        await f.adapter.prepareCortexVoicePresentation(f.prepared);
+        Object.assign(f.state[0], changes);
+        f.expire();
+        await expect(
+          f.adapter.claimPendingCortexInsightDeliveriesForParent({
+            ownerId: 'owner-a',
+            parentMessageId: 'parent-a',
+            surface: 'web',
+          }),
+        ).rejects.toMatchObject({ code: 'cortex_insight_delivery_settlement_conflict' });
+        expect(f.state[0]).toMatchObject({ status: 'claimed', insight: 'Retained insight.' });
+        expect(f.state[0].events.some((event) => event.transition === 'dropped')).toBe(false);
+      } finally {
+        f.close();
+      }
+    },
+  );
+
+  test.each(['read', 'write'])(
+    'expiry recovery cannot consume a concurrent same-token extension at %s',
+    async (boundary) => {
+      const f = acceptedHandoff();
+      try {
+        await f.adapter.prepareCortexVoicePresentation(f.prepared);
+        const oldToken = f.state[0].presentationLeaseToken;
+        let renewed = false;
+        const extend = () => {
+          renewed = true;
+          const future = new Date(checkedAt.getTime() + 90_000);
+          f.state[0].leaseExpiresAt = future;
+          f.state[0].presentationLeaseExpiresAt = future;
+        };
+        if (boundary === 'read') {
+          const original = f.Model.findOne.getMockImplementation();
+          f.Model.findOne.mockImplementation((filter) => {
+            if (!renewed) extend();
+            return original(filter);
+          });
+        } else {
+          const original = f.Model.findOneAndUpdate.getMockImplementation();
+          f.Model.findOneAndUpdate.mockImplementation((filter, update, options) => {
+            if (!renewed && update.$set?.status === 'dropped') extend();
+            return original(filter, update, options);
+          });
+        }
+        f.expire();
+        await expect(
+          f.adapter.claimPendingCortexInsightDeliveriesForParent({
+            ownerId: 'owner-a',
+            parentMessageId: 'parent-a',
+            surface: 'telegram',
+          }),
+        ).rejects.toMatchObject({ code: 'cortex_insight_delivery_settlement_conflict' });
+        expect(renewed).toBe(true);
+        expect(f.state[0]).toMatchObject({ status: 'claimed', presentationLeaseToken: oldToken });
+        expect(f.state[0].events.some((event) => event.transition === 'dropped')).toBe(false);
+        expect(f.state[0].presentedSurfaces).toEqual([]);
+      } finally {
+        f.close();
+      }
+    },
+  );
+
+  test('live accepted leases hold work without marking it heard or dropping it', async () => {
+    const f = acceptedHandoff();
+    try {
+      await f.adapter.prepareCortexVoicePresentation(f.prepared);
+      await expect(
+        f.adapter.claimPendingCortexInsightDeliveriesForParent({
+          ownerId: 'owner-a',
+          parentMessageId: 'parent-a',
+          surface: 'voice',
+        }),
+      ).resolves.toMatchObject({ claimed: [] });
+      expect(f.state[0].status).toBe('claimed');
+      expect(f.state[0].presentedSurfaces).toEqual([]);
+      expect(f.state[0].events.some((event) => event.transition === 'dropped')).toBe(false);
+    } finally {
+      f.close();
+    }
+  });
+
+  test('a failed exact terminal write leaves prepared unspoken work recoverable', async () => {
+    const { service, Model, state } = setup();
+    const original = Model.findOneAndUpdate.getMockImplementation();
+    Model.findOneAndUpdate.mockImplementation((filter, update, options) =>
+      update.$set?.status === 'dropped' ? leanResult(null) : original(filter, update, options),
+    );
+    await expect(service.markDropped(input())).rejects.toMatchObject({
+      code: 'cortex_insight_delivery_settlement_conflict',
+    });
+    expect(state[0].status).toBe('claimed');
+    Model.findOneAndUpdate.mockImplementation(original);
+    await expect(
+      service.claimPendingByParent({
+        ownerId: 'owner-a',
+        parentMessageId: 'parent-a',
+        surface: 'voice',
+      }),
+    ).resolves.toMatchObject({
+      claimed: [expect.objectContaining({ deliveryId: 'cidl_interrupted' })],
+    });
+  });
+});
+/* === VIVENTIUM END === */

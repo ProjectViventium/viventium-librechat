@@ -23,6 +23,11 @@ local clock = redis.call('TIME')
 local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
 if deadline <= now then return {'unavailable', ''} end
 local state = redis.call('HGET', KEYS[3], 'state')
+if mode == 'read-unbound' then
+  if state == 'revoked' and redis.call('HGET', KEYS[3], 'proof') == proof and
+     redis.call('HEXISTS', KEYS[3], 'identity') == 0 then return {'revoked', ''} end
+  return {'unavailable', ''}
+end
 if state then
   if redis.call('HGET', KEYS[3], 'proof') ~= proof then return {'revoked', ''} end
   local bound = redis.call('HGET', KEYS[3], 'identity')
@@ -118,8 +123,12 @@ if mode == 'finish' or mode == 'finish-cancelled' then
   if redis.call('HGET', KEYS[1], 'nativeResponseFinished') == '1' then
     if redis.call('HGET', KEYS[1], 'finalEvent') == ARGV[5] then return 1 else return 0 end
   end
+  local status = 'complete'
+  if mode == 'finish-cancelled' then
+    status = redis.call('HGET', KEYS[1], 'status') == 'superseded' and 'superseded' or 'aborted'
+  end
   redis.call('HSET', KEYS[1], 'nativeResponseFinished', '1', 'generationCompleted', '1',
-    'status', mode == 'finish-cancelled' and 'aborted' or 'complete', 'completedAt', now, 'finalEvent', ARGV[5])
+    'status', status, 'completedAt', now, 'finalEvent', ARGV[5])
   redis.call('HDEL', KEYS[1], 'error', 'errorClass')
   return 1
 end

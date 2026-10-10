@@ -94,6 +94,7 @@ export async function readActiveWork(
 const controlSchema = z
   .object({
     workRef: workRefSchema.describe('Opaque workRef returned by active_work_list'),
+    fileIds: z.array(z.string().min(1).max(256)).min(1).optional(),
     action: z
       .enum(['queue', 'message', 'steer', 'pause', 'resume', 'stop', 'retry', 'dismiss'])
       .describe(ACTIVE_WORK_ACTION_SEMANTICS),
@@ -101,6 +102,9 @@ const controlSchema = z
   })
   .strict()
   .superRefine((value, ctx) => {
+    if (value.fileIds && (!['steer', 'queue', 'message'].includes(value.action) || new Set(value.fileIds).size !== value.fileIds.length)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['fileIds'], message: 'fileIds require exact unique follow-up file references' });
+    }
     if (['queue', 'message', 'steer'].includes(value.action) && !value.instruction) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -161,6 +165,7 @@ export function createActiveWorkTools(
           workRef: input.workRef,
           action: input.action,
           operationId,
+          ...(input.fileIds ? { fileIds: input.fileIds, requestBody, serverReq: options.req } : {}),
           ...(requestBody.viventiumVoiceCallSessionId
             ? {
                 voiceAuthorityContext: {

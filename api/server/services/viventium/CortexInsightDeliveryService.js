@@ -7,6 +7,7 @@ const {
   buildCortexInsightDeliveryCandidates,
   cortexInsightPersistenceEnvelopeIdentity,
   createCortexInsightDeliveryService,
+  resolveAcceptedVoiceCortexDispatch,
   confirmVoiceCortexPresentation,
   prepareVoiceCortexPresentation,
   normalizeCortexFeelingSnapshot,
@@ -205,12 +206,30 @@ async function reconcileFollowUpTerminalOutcomes({
   return { scanned: followUps.size, reconciled };
 }
 
+/** Reads the existing canonical receipt that accepted this exact Voice handoff. */
+async function readAcceptedVoiceDispatch(row) {
+  const message = await Message.findOne({
+    user: row.userId,
+    conversationId: row.conversationId,
+    messageId: row.persistedMessageId,
+    isCreatedByUser: false,
+    error: { $ne: true },
+    unfinished: { $ne: true },
+    deletedAt: null,
+  }).lean();
+  return resolveAcceptedVoiceCortexDispatch(message, {
+    ownerId: String(row.userId),
+    parentMessageId: row.parentMessageId,
+  });
+}
+
 const defaultService = withFollowUpTerminalOutcome(
   createCortexInsightDeliveryService({
     DeliveryModel: ViventiumCortexInsightDelivery,
     mongooseInstance: mongoose,
     consumeFault: (...args) =>
       require('./LocalQaCortexFaultService').consumeLocalQaCortexFault(...args),
+    readAcceptedVoiceDispatch,
   }),
   { MessageModel: Message },
 );
@@ -220,6 +239,7 @@ const voicePresentationDependencies = {
   listByParent: defaultService.listByParent,
   fencePresentationByParent: defaultService.fencePresentationByParent,
   markPresentationByParent: defaultService.markPresentationByParent,
+  markDropped: defaultService.markDropped,
   readMessage: ({ ownerId, conversationId, messageId }) =>
     Message.findOne({
       user: ownerId,
@@ -243,10 +263,8 @@ const voicePresentationDependencies = {
         'metadata.viventium.cortexPresentationParentMessageId': receipt.parentMessageId,
         'metadata.viventium.cortexInsightDeliveryIds':
           message.metadata.viventium.cortexInsightDeliveryIds,
-        $or: [
-          { 'metadata.viventium.deliveryAcknowledgement.cortexPresentation': { $exists: false } },
-          { 'metadata.viventium.deliveryAcknowledgement.cortexPresentation': receipt },
-        ],
+        'metadata.viventium.deliveryAcknowledgement.cortexPresentation': message.metadata?.viventium
+          ?.deliveryAcknowledgement?.cortexPresentation || { $exists: false },
       },
       { $set: { 'metadata.viventium.deliveryAcknowledgement.cortexPresentation': receipt } },
     );

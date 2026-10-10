@@ -18,6 +18,14 @@ const base = {
 };
 
 describe('ViventiumCortexInsightDelivery model', () => {
+  test('preserves exact native occupancy as a strict retryable row event', async () => {
+    const document = new Delivery({ ...base, events: [{ transition: 'failure',
+      attemptNumber: 1, claimToken: 'claim-synthetic', claimGeneration: 1,
+      reason: 'native_session_occupied', eventAt: new Date() }] });
+    await expect(document.validate()).resolves.toBeUndefined();
+    expect(document.events[0].reason).toBe('native_session_occupied');
+  });
+
   test('keeps private payloads excluded and terminal TTL limited to closed rows', () => {
     expect(Delivery.schema.path('insight').options.select).toBe(false);
     expect(Delivery.schema.path('feelingSnapshot').options.select).toBe(false);

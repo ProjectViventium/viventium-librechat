@@ -74,10 +74,55 @@ function formatVoiceLatencyDurationFields(prefix, value) {
   return `${prefix}_ms=${Math.round(value)} ${prefix}_ms_f=${formatVoiceMs(value)}`;
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Content-free numeric Voice stage telemetry.
+ * Purpose: Retain timing fields when the existing info message is truncated.
+ */
+function logVoiceLatencyNumericStage(
+  logger,
+  req,
+  source,
+  stage,
+  stageStartAt = null,
+  requestSha256 = null,
+) {
+  if (req?.viventiumVoiceLogLatency !== true) {
+    return;
+  }
+  const totalMs = getVoiceLatencyTotalMs(req);
+  const stageMs = calcVoiceLatencyDurationMs(stageStartAt);
+  logger.debug('[VoiceLatency][LC][Timing]', {
+    source,
+    stage,
+    ...(typeof requestSha256 === 'string'
+      ? { request_sha256: requestSha256 }
+      : {
+          request_id:
+            typeof req.viventiumVoiceRequestId === 'string'
+              ? req.viventiumVoiceRequestId
+              : 'unknown',
+        }),
+    ...(totalMs == null
+      ? {}
+      : {
+          total_ms: Math.round(totalMs),
+          total_ms_f: Number(totalMs.toFixed(3)),
+        }),
+    ...(stageMs == null
+      ? {}
+      : {
+          stage_ms: Math.round(stageMs),
+          stage_ms_f: Number(stageMs.toFixed(3)),
+        }),
+  });
+}
+/* === VIVENTIUM END === */
+
 module.exports = {
   calcVoiceLatencyDurationMs,
   formatVoiceLatencyDurationFields,
   formatVoiceLatencyTiming,
+  logVoiceLatencyNumericStage,
   getVoiceLatencyTotalMs,
   markVoiceLatencyStart,
   voiceLatencyNow,

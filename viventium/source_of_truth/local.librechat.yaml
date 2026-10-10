@@ -714,122 +714,133 @@ endpoints:
         excluded_mcp_servers:
           - glasshive-workers-projects
         models:
-        - id: codex-cli:gpt-6.1-sol
-          label: OpenAI / GPT-6.1 Sol
-          harnessProfile: codex-cli
-          effortChoices:
-          - low
-          - medium
-          - high
-          - xhigh
-          - max
-          recommendedEffort: high
-          contextLimit: 1050000
-        - id: claude-code:claude-opus-5-5
-          label: Anthropic / Opus 5.5
-          harnessProfile: claude-code
-          effortChoices:
-          - default
-          - low
-          - medium
-          - high
-          - xhigh
-          - max
-          recommendedEffort: high
-          contextLimit: 1000000
-        - id: grok-build:grok-4.7
-          label: Grok / Grok 4.7
-          harnessProfile: grok-build
-          effortChoices:
-          - default
-          - low
-          - medium
-          - high
-          - xhigh
-          recommendedEffort: high
-          contextLimit: 500000
-        - id: grok-build:grok-4.7-build-fast
-          label: Grok / Grok 4.7 Fast
-          harnessProfile: grok-build
-          effortChoices:
-          - default
-          - low
-          - medium
-          - high
-          - xhigh
-          recommendedEffort: high
-          contextLimit: 500000
-        - id: codex-cli:gpt-6-astra
-          label: Codex / GPT-6 Astra
-          harnessProfile: codex-cli
-          effortChoices:
-          - low
-          - medium
-          - high
-          - xhigh
-          - max
-          - ultra
-          recommendedEffort: medium
-          contextLimit: 272000
-        - id: claude-code:claude-opus-5
-          label: Claude / Opus 5
-          harnessProfile: claude-code
-          effortChoices:
-          - default
-          - low
-          - medium
-          - high
-          - xhigh
-          - max
-          recommendedEffort: medium
-          contextLimit: 1000000
-        - id: codex-cli:gpt-5.6-sol
-          label: Codex / GPT-5.6 Sol
-          harnessProfile: codex-cli
-          effortChoices:
-          - low
-          - medium
-          - high
-          - xhigh
-          - max
-          - ultra
-          recommendedEffort: medium
-          contextLimit: 272000
-        - id: claude-code:opus
-          label: Claude / Opus
-          harnessProfile: claude-code
-          effortChoices:
-          - default
-          - low
-          - medium
-          - high
-          - xhigh
-          - max
-          recommendedEffort: high
-          contextLimit: 200000
-        - id: codex-cli:gpt-5.6-luna
-          label: Codex / GPT-5.6 Luna
-          harnessProfile: codex-cli
-          effortChoices:
-          - low
-          - medium
-          - high
-          - xhigh
-          - max
-          recommendedEffort: medium
-          contextLimit: 272000
-        - id: codex-cli:gpt-5.6-terra
-          label: Codex / GPT-5.6 Terra
-          harnessProfile: codex-cli
-          effortChoices:
-          - low
-          - medium
-          - high
-          - xhigh
-          - max
-          - ultra
-          recommendedEffort: medium
-          contextLimit: 272000
+          - id: codex-cli:gpt-6.1-sol
+            label: OpenAI / GPT-6.1 Sol
+            harnessProfile: codex-cli
+            effortChoices:
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+            recommendedEffort: high
+            contextLimit: 1050000
+          - id: claude-code:claude-opus-5-5
+            label: Anthropic / Opus 5.5
+            harnessProfile: claude-code
+            effortChoices:
+              - default
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+            recommendedEffort: high
+            contextLimit: 1000000
+          - id: grok-build:grok-4.7
+            label: Grok / Grok 4.7
+            harnessProfile: grok-build
+            effortChoices:
+              - default
+              - low
+              - medium
+              - high
+              - xhigh
+            recommendedEffort: high
+            contextLimit: 500000
+          - id: grok-build:grok-4.7-build-fast
+            label: Grok / Grok 4.7 Fast
+            harnessProfile: grok-build
+            effortChoices:
+              - default
+              - low
+              - medium
+              - high
+              - xhigh
+            recommendedEffort: high
+            contextLimit: 500000
+          - id: codex-cli:gpt-6-astra
+            label: Codex / GPT-6 Astra
+            harnessProfile: codex-cli
+            effortChoices:
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+              - ultra
+            recommendedEffort: medium
+            contextLimit: 272000
+          - id: claude-code:claude-opus-5
+            label: Claude / Opus 5
+            harnessProfile: claude-code
+            effortChoices:
+              - default
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+            recommendedEffort: medium
+            contextLimit: 1000000
+          - id: codex-cli:gpt-5.6-sol
+            label: Codex / GPT-5.6 Sol
+            harnessProfile: codex-cli
+            effortChoices:
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+              - ultra
+            recommendedEffort: medium
+            contextLimit: 272000
+          - id: claude-code:opus
+            label: Claude / Opus
+            harnessProfile: claude-code
+            effortChoices:
+              - default
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+            recommendedEffort: high
+            contextLimit: 200000
+          - id: codex-cli:gpt-5.6-luna
+            label: Codex / GPT-5.6 Luna
+            harnessProfile: codex-cli
+            effortChoices:
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+            recommendedEffort: medium
+            contextLimit: 272000
+          - id: codex-cli:gpt-5.6-terra
+            label: Codex / GPT-5.6 Terra
+            harnessProfile: codex-cli
+            effortChoices:
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+              - ultra
+            recommendedEffort: medium
+            contextLimit: 272000
+          - id: codex-cli:gpt-6-sol
+            label: Codex / GPT-6 Sol
+            harnessProfile: codex-cli
+            effortChoices:
+              - low
+              - medium
+              - high
+              - xhigh
+              - max
+            recommendedEffort: medium
+            contextLimit: 1050000
     capabilities:
       - deferred_tools
       - programmatic_tools
@@ -864,6 +875,7 @@ endpoints:
           - claude-code:opus
           - codex-cli:gpt-5.6-luna
           - codex-cli:gpt-5.6-terra
+          - codex-cli:gpt-6-sol
         fetch: false
       titleConvo: true
       titleEndpoint: openAI
@@ -1084,17 +1096,17 @@ mcpServers:
     command: npx
     args:
       - -y
-      - "@modelcontextprotocol/server-sequential-thinking"
+      - '@modelcontextprotocol/server-sequential-thinking'
     timeout: 300000
     chatMenu: true
   scheduling-cortex:
     type: streamable-http
     url: ${SCHEDULING_MCP_URL}
     headers:
-      X-Viventium-User-Id: "{{LIBRECHAT_USER_ID}}"
-      X-Viventium-Storage-User-Id: "{{LIBRECHAT_USER_ID}}"
+      X-Viventium-User-Id: '{{LIBRECHAT_USER_ID}}'
+      X-Viventium-Storage-User-Id: '{{LIBRECHAT_USER_ID}}'
       X-Viventium-Agent-Id: agent_viventium_main_95aeb3
-      X-Viventium-Conversation-Id: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+      X-Viventium-Conversation-Id: '{{LIBRECHAT_BODY_CONVERSATIONID}}'
     startup: false
     chatMenu: true
     timeout: 120000
@@ -1143,21 +1155,21 @@ mcpServers:
     serverInstructions: true
     viventiumTrustedServerInstructions: true
     headers:
-      X-Viventium-User-Id: "{{LIBRECHAT_USER_ID}}"
+      X-Viventium-User-Id: '{{LIBRECHAT_USER_ID}}'
       X-Viventium-Agent-Id: agent_viventium_main_95aeb3
-      X-Viventium-Conversation-Id: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
-      X-Viventium-Parent-Message-Id: "{{LIBRECHAT_BODY_PARENTMESSAGEID}}"
-      X-Viventium-Message-Id: "{{LIBRECHAT_BODY_MESSAGEID}}"
-      X-Viventium-Surface: "{{LIBRECHAT_BODY_VIVENTIUMSURFACE}}"
-      X-Viventium-Input-Mode: "{{LIBRECHAT_BODY_VIVENTIUMINPUTMODE}}"
-      X-Viventium-Stream-Id: "{{LIBRECHAT_BODY_VIVENTIUMSTREAMID}}"
-      X-Viventium-Logical-Turn-Id: "{{LIBRECHAT_BODY_VIVENTIUMLOGICALTURNID}}"
-      X-Viventium-Logical-Turn-Revision: "{{LIBRECHAT_BODY_VIVENTIUMLOGICALTURNREVISION}}"
-      X-Viventium-Request-Files: "{{LIBRECHAT_BODY_FILES_JSON_B64}}"
-      X-Viventium-Request-Attachments: "{{LIBRECHAT_BODY_ATTACHMENTS_JSON_B64}}"
-      X-Viventium-Tool-Resources: "{{LIBRECHAT_BODY_TOOL_RESOURCES_JSON_B64}}"
-      X-Viventium-File-Ids: "{{LIBRECHAT_BODY_FILE_IDS_JSON_B64}}"
-      X-Viventium-Storage-User-Id: "{{LIBRECHAT_USER_ID}}"
+      X-Viventium-Conversation-Id: '{{LIBRECHAT_BODY_CONVERSATIONID}}'
+      X-Viventium-Parent-Message-Id: '{{LIBRECHAT_BODY_PARENTMESSAGEID}}'
+      X-Viventium-Message-Id: '{{LIBRECHAT_BODY_MESSAGEID}}'
+      X-Viventium-Surface: '{{LIBRECHAT_BODY_VIVENTIUMSURFACE}}'
+      X-Viventium-Input-Mode: '{{LIBRECHAT_BODY_VIVENTIUMINPUTMODE}}'
+      X-Viventium-Stream-Id: '{{LIBRECHAT_BODY_VIVENTIUMSTREAMID}}'
+      X-Viventium-Logical-Turn-Id: '{{LIBRECHAT_BODY_VIVENTIUMLOGICALTURNID}}'
+      X-Viventium-Logical-Turn-Revision: '{{LIBRECHAT_BODY_VIVENTIUMLOGICALTURNREVISION}}'
+      X-Viventium-Request-Files: '{{LIBRECHAT_BODY_FILES_JSON_B64}}'
+      X-Viventium-Request-Attachments: '{{LIBRECHAT_BODY_ATTACHMENTS_JSON_B64}}'
+      X-Viventium-Tool-Resources: '{{LIBRECHAT_BODY_TOOL_RESOURCES_JSON_B64}}'
+      X-Viventium-File-Ids: '{{LIBRECHAT_BODY_FILE_IDS_JSON_B64}}'
+      X-Viventium-Storage-User-Id: '{{LIBRECHAT_USER_ID}}'
       X-WPR-Token: ${GLASSHIVE_PROVIDER_API_KEY}
 speech:
   tts: {}

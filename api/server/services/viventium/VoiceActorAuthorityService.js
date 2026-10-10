@@ -6,6 +6,7 @@
  * === VIVENTIUM END === */
 
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
+const serverValidatedRestrictedFallback = Symbol('serverValidatedRestrictedVoiceFallback');
 
 function isVoiceActorSideEffectRestricted(req) {
   const body = req?.body;
@@ -114,6 +115,94 @@ function sanitizeAgentForRestrictedVoiceTurn(agent) {
   return sanitized;
 }
 
+// Only initializeClient may mark the configured recovery after model/route validation. The
+// private, non-enumerable marker cannot arrive through a loaded agent or a request body.
+function markServerValidatedRestrictedVoiceFallback(agent, req, declaredFallbackAgent) {
+  const initializer = Object.getOwnPropertyDescriptor(agent, 'viventiumFallbackLlmInitializer');
+  if (!isVoiceActorSideEffectRestricted(req) || typeof initializer?.value !== 'function') {
+    return;
+  }
+  const { resolveConversationProviderId } = require('./GlassHiveConversationProviderService');
+  Object.defineProperty(agent, serverValidatedRestrictedFallback, {
+    enumerable: false,
+    configurable: false,
+    writable: false,
+    value: Object.freeze({
+      request: req,
+      declaredProvider: resolveConversationProviderId(declaredFallbackAgent),
+      initialize: initializer.value,
+      assignment: Object.freeze({ ...agent.viventiumFallbackLlmAssignment }),
+    }),
+  });
+}
+
+function retainServerValidatedRestrictedVoiceFallback(sanitized, source, req) {
+  if (!source || typeof source !== 'object') return sanitized;
+  const marker = Object.getOwnPropertyDescriptor(source, serverValidatedRestrictedFallback)?.value;
+  if (!marker || marker.request !== req) {
+    return sanitized;
+  }
+  sanitized.viventiumFallbackLlmAssignment = { ...marker.assignment };
+  let fallbackPromise;
+  const initialize = () => {
+    if (!fallbackPromise) {
+      fallbackPromise = Promise.resolve()
+        .then(() => source.viventiumFallbackLlm || marker.initialize())
+        .then((fallback) => {
+          sanitized.viventiumFallbackLlmInitializationError =
+            source.viventiumFallbackLlmInitializationError || null;
+          if (!fallback) return null;
+          const restricted = sanitizeAgentForRestrictedVoiceTurn(fallback);
+          // Initialized configs may use a generic transport endpoint. Authority follows the
+          // validated declared route, as it does for the normal capability bundle attachment.
+          const capability =
+            req?.config?.endpoints?.agents?.providerCapabilities?.[marker.declaredProvider];
+          if (capability?.workspace_binding === true) {
+            const headers =
+              restricted.model_parameters?.configuration?.defaultHeaders ||
+              restricted.model_parameters?.defaultHeaders;
+            let nativeToolsDisabled = false;
+            try {
+              const bundle = JSON.parse(
+                Buffer.from(headers?.['X-GlassHive-Bootstrap-Bundle-B64'] || '', 'base64').toString(
+                  'utf8',
+                ),
+              );
+              nativeToolsDisabled = bundle?.provider_capabilities?.native_tools === false;
+            } catch {
+              // Missing or malformed signed authority is unavailable, never a deployment default.
+            }
+            if (
+              !restricted.id ||
+              headers?.['X-GlassHive-Agent-Id'] !== restricted.id ||
+              !headers?.['X-GlassHive-Bootstrap-Timestamp'] ||
+              !headers?.['X-GlassHive-Bootstrap-Signature'] ||
+              !nativeToolsDisabled
+            ) {
+              throw Object.assign(new Error('Configured recovery is unavailable.'), {
+                code: 'restricted_fallback_authority_unavailable',
+              });
+            }
+          }
+          sanitized.viventiumFallbackLlm = restricted;
+          return restricted;
+        })
+        .catch((error) => {
+          sanitized.viventiumFallbackLlmInitializationError = error;
+          return null;
+        });
+    }
+    return fallbackPromise;
+  };
+  Object.defineProperty(sanitized, 'viventiumFallbackLlmInitializer', {
+    value: initialize,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return sanitized;
+}
+
 function enforceRestrictedVoiceRequest(req) {
   if (!isVoiceActorSideEffectRestricted(req)) {
     return false;
@@ -144,6 +233,8 @@ module.exports = {
   emptyToolLoadResult,
   enforceRestrictedVoiceRequest,
   isVoiceActorSideEffectRestricted,
+  markServerValidatedRestrictedVoiceFallback,
+  retainServerValidatedRestrictedVoiceFallback,
   sanitizeAgentForRestrictedVoiceTurn,
   stripGlassHiveHeaders,
 };

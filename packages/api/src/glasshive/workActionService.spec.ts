@@ -236,3 +236,108 @@ it('rechecks voice authority after async preparation and before dispatch', async
   ).rejects.toMatchObject({ code: 'voice_work_authority_stale' });
   expect(deps.requestAccountApi).not.toHaveBeenCalled();
 });
+
+
+describe('selected files on the actual shared action executor', () => {
+  const crypto = require('node:crypto');
+  const saved = { ...process.env };
+  beforeAll(() => {
+    process.env.WPR_API_TOKEN = 'synthetic-test-token';
+    process.env.VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET = 'synthetic-test-secret';
+    process.env.GLASSHIVE_PROVIDER_BASE_URL = 'http://127.0.0.1:9766/v1';
+  });
+  afterAll(() => { process.env = saved; });
+  function fixture() {
+    const deps = dependencies();
+    const blobs = new Map();
+    const keys = new Map();
+    const puts = [];
+    const actions = [];
+    const source = (id, content, kind = 'original') => ({
+      fileId: id, filename: `${id}.csv`, sizeBytes: Buffer.byteLength(content), inputKind: kind, mediaGroupIndex: id === 'a' ? 0 : 1,
+      openStream: async () => (async function* () { yield Buffer.from(content); })(),
+    });
+    const sources = [source('a', 'x,y\na,1\n'), source('b', 'x,y\nb,2\n')];
+    deps.getActionFileSources = jest.fn(async (input) => input.fileIds.map(id => sources.find(file => file.fileId === id)));
+    deps.requestAccountApi.mockImplementation(async (input) => {
+      if (input.method !== 'POST') return {workRef:'work-1', actions:['steer','message','queue','stop']};
+      if (input.path === '/v1/file-uploads') {
+        const body = input.body;
+        if (keys.has(body.idempotency_key)) return blobs.get(keys.get(body.idempotency_key));
+        const upload_id = `fil_${crypto.createHash('sha256').update(body.idempotency_key).digest('hex').slice(0,16)}`;
+        const receipt = {upload_id, name:body.name,size_bytes:body.size_bytes,state:'pending'};
+        keys.set(body.idempotency_key, upload_id);blobs.set(upload_id, receipt);
+        return receipt;
+      }
+      actions.push(input);return {workRef:'work-1', state:'queued'};
+    });
+    deps.fetchImpl = jest.fn(async (url, init) => {
+      const reader = init.body.getReader();const chunks=[];
+      for (;;) { const next=await reader.read();if(next.done)break;chunks.push(Buffer.from(next.value)); }
+      const bytes = Buffer.concat(chunks);
+      const id = String(url).split('/').at(-2);
+      const old=blobs.get(id);
+      const receipt={...old,state:'ready',revision:'ready-r1',received_bytes:bytes.length,sha256:crypto.createHash('sha256').update(bytes).digest('hex')};
+      blobs.set(id,receipt);puts.push({url,init,bytes});
+      return new Response(JSON.stringify(receipt), {status:200,headers:{'Content-Type':'application/json'}});
+    });
+    const input = {ownerId:'owner-1',workRef:'work-1',action:'steer',instruction:'Use these selected inputs.',operationId:'files-op',fileIds:['a','b']};
+    return {deps,blobs,puts,actions,sources,input};
+  }
+  it('uses only the lean current action projection before selected file transfer', async () => {
+    const f=fixture();
+    await createGlassHiveWorkActionService(f.deps).executeGlassHiveWorkAction(f.input);
+    const reads=f.deps.requestAccountApi.mock.calls.map(([input])=>input).filter(input=>input.method !== 'POST');
+    expect(reads).toEqual([{ownerId:'owner-1',path:'/v1/work/work-1?projection=actions'}]);
+    expect(f.deps.requestAccountApi.mock.invocationCallOrder[0]).toBeLessThan(f.deps.getActionFileSources.mock.invocationCallOrder[0]);
+    expect(f.deps.getActionFileSources.mock.invocationCallOrder[0]).toBeLessThan(f.deps.fetchImpl.mock.invocationCallOrder[0]);
+  });
+  it('carries exact original byte receipts in selected order to the existing action', async () => {
+    const f=fixture();await createGlassHiveWorkActionService(f.deps).executeGlassHiveWorkAction(f.input);
+    expect(f.puts.map(x=>x.bytes.toString())).toEqual(['x,y\na,1\n','x,y\nb,2\n']);
+    expect(f.actions[0].body.fileInputs.map(x=>[x.sourceFileId,x.inputKind,x.mediaGroupIndex])).toEqual([['a','original',0],['b','original',1]]);
+    expect(f.actions[0].body.fileInputs.every(x=>x.uploadId.startsWith('fil_') && x.revision==='ready-r1')).toBe(true);
+    expect(f.puts.every(x=>x.init.redirect==='error' && x.init.headers['Content-Type']==='application/octet-stream')).toBe(true);
+  });
+  it.each(['queue', 'message'])('keeps completed-draft %s explicit and carries exact selected inputs', async (action) => {
+    const f=fixture();f.input.action=action;
+    await createGlassHiveWorkActionService(f.deps).executeGlassHiveWorkAction(f.input);
+    expect(f.actions[0].body.action).toBe(action);expect(f.actions[0].body.fileInputs.map(x=>x.sourceFileId)).toEqual(['a','b']);
+  });
+  it('reuses durable begin keys and exact ready IDs without another PUT', async () => {
+    const f=fixture();const svc=createGlassHiveWorkActionService(f.deps);
+    await svc.executeGlassHiveWorkAction(f.input);await svc.executeGlassHiveWorkAction(f.input);
+    expect(f.puts).toHaveLength(2);expect(f.actions[0].body.fileInputs).toEqual(f.actions[1].body.fileInputs);
+  });
+  it('records Upload-as-Text bytes as extracted rather than original', async () => {
+    const f=fixture();f.sources[0].inputKind='extracted_text';f.input.fileIds=['a'];
+    await createGlassHiveWorkActionService(f.deps).executeGlassHiveWorkAction(f.input);
+    expect(f.actions[0].body.fileInputs[0].inputKind).toBe('extracted_text');
+  });
+  it('does not prepare or bind files on an unavailable/completed Steer', async () => {
+    const f=fixture();f.deps.requestAccountApi.mockResolvedValue({state:'completed',actions:['message','queue','dismiss']});
+    await expect(createGlassHiveWorkActionService(f.deps).executeGlassHiveWorkAction(f.input)).rejects.toThrow('active_work_action_not_available');
+    expect(f.deps.getActionFileSources).not.toHaveBeenCalled();expect(f.puts).toHaveLength(0);
+  });
+  it('rejects unselected/foreign owner data before any byte transfer', async () => {
+    const f=fixture();f.deps.getActionFileSources.mockRejectedValue(new Error('active_work_file_selection_unauthorized'));
+    await expect(createGlassHiveWorkActionService(f.deps).executeGlassHiveWorkAction(f.input)).rejects.toThrow('active_work_file_selection_unauthorized');
+    expect(f.puts).toHaveLength(0);expect(f.actions).toHaveLength(0);
+  });
+  it('rejects a source whose actual bytes do not match its durable size', async () => {
+    const f=fixture();f.sources[0].sizeBytes++;
+    await expect(createGlassHiveWorkActionService(f.deps).executeGlassHiveWorkAction(f.input)).rejects.toThrow('active_work_file_source_changed');
+    expect(f.puts).toHaveLength(0);expect(f.actions).toHaveLength(0);
+  });
+  it('rejects ready receipt hash drift and admits no action', async () => {
+    const f=fixture();await createGlassHiveWorkActionService(f.deps).executeGlassHiveWorkAction(f.input);
+    f.actions.length=0;for(const row of f.blobs.values()) row.sha256='0'.repeat(64);
+    await expect(createGlassHiveWorkActionService(f.deps).executeGlassHiveWorkAction(f.input)).rejects.toThrow('active_work_upload_content_unconfirmed');
+    expect(f.actions).toHaveLength(0);
+  });
+  it('rejects files on unsupported action without re-routing it', async () => {
+    const f=fixture();f.input.action='pause';
+    await expect(createGlassHiveWorkActionService(f.deps).executeGlassHiveWorkAction(f.input)).rejects.toThrow('active_work_file_selection_invalid');
+    expect(f.puts).toHaveLength(0);expect(f.actions).toHaveLength(0);
+  });
+});

@@ -180,3 +180,25 @@ describe('trusted delegation source schema', () => {
     expect(MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals.maxItems).toBe(32);
   });
 });
+
+
+describe('typed existing-work file selection', () => {
+  it('retains the exact selected opaque IDs and their order', () => {
+    expect(canonicalConversationOrchestrationArguments('active_work_action', {workRef:'work-1',action:'steer',instruction:'Use the selected files',fileIds:['b','a']})).toEqual({workRef:'work-1',action:'steer',instruction:'Use the selected files',fileIds:['b','a']});
+    expect(ACTIVE_WORK_ACTION_JSON_SCHEMA.properties.fileIds.items.type).toBe('string');
+  });
+  it('rejects duplicate references and unsupported action without renaming the action', () => {
+    expect(()=>canonicalConversationOrchestrationArguments('active_work_action',{workRef:'work-1',action:'steer',fileIds:['a','a']})).toThrow();
+    expect(()=>canonicalConversationOrchestrationArguments('active_work_action',{workRef:'work-1',action:'pause',fileIds:['a']})).toThrow();
+  });
+  it('changes the existing occurrence identity when file selection changes', () => {
+    const base={userId:'owner-1',requestBody:{conversationId:'conversation-1',messageId:'message-1'},toolName:'active_work_action'};
+    expect(mainOrchestrationInvocationIdentity({...base,args:{workRef:'work-1',action:'steer',instruction:'Use files',fileIds:['a']}})).not.toBe(mainOrchestrationInvocationIdentity({...base,args:{workRef:'work-1',action:'steer',instruction:'Use files',fileIds:['b']}}));
+  });
+});
+
+ it('preserves selected identity/order above64 without adding a file-count policy', () => {
+   const fileIds=Array.from({length:65},(_,i)=>'selected-file-'+i);
+   expect(canonicalConversationOrchestrationArguments('active_work_action',{workRef:'work-1',action:'queue',instruction:'Use these files',fileIds}).fileIds).toEqual(fileIds);
+   expect(ACTIVE_WORK_ACTION_JSON_SCHEMA.properties.fileIds).not.toHaveProperty('maxItems');
+ });

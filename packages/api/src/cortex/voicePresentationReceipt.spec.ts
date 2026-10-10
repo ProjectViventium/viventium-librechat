@@ -1,6 +1,7 @@
 import {
   confirmVoiceCortexPresentation,
   prepareVoiceCortexPresentation,
+  resolveAcceptedVoiceCortexDispatch,
 } from './voicePresentationReceipt';
 import type { VoiceCortexMessage, VoiceCortexReceiptInput } from './voicePresentationReceipt';
 
@@ -95,6 +96,17 @@ function fixture() {
       return true;
     }),
     fencePresentationByParent: jest.fn().mockResolvedValue(fence),
+    markDropped: jest
+      .fn()
+      .mockResolvedValue([
+        {
+          deliveryId: 'delivery',
+          claimGeneration: 1,
+          status: 'dropped',
+          dropReason: 'delivery_outcome_unknown',
+          presentedSurfaces: [],
+        },
+      ]),
     markPresentationByParent: jest.fn().mockResolvedValue([
       {
         deliveryId: 'delivery',
@@ -157,7 +169,6 @@ test('duplicate completion and a retry after settlement failure reuse the durabl
 test.each([
   'tts.completed',
   'audio.failed',
-  'audio.interrupted',
   'audio.superseded',
   'audio.started',
   'audio.cancelled',
@@ -336,3 +347,204 @@ test('a new canonical generation must replace old receipt metadata before recove
     }),
   );
 });
+
+/* === VIVENTIUM START === Interruption consumes only the canonical issued Cortex claim. === */
+test('interrupted child drops exact claims without marking a surface presented or losing its result', async () => {
+  const { input, child, deps } = fixture();
+  await prepareVoiceCortexPresentation({ ...input, text: child.text, leaseMs: 900000 }, deps);
+  expect(
+    await confirmVoiceCortexPresentation({ ...input, stage: 'audio.interrupted' }, deps),
+  ).toEqual([
+    expect.objectContaining({ status: 'dropped', dropReason: 'delivery_outcome_unknown' }),
+  ]);
+  expect(deps.markDropped).toHaveBeenCalledWith({
+    ownerId: input.ownerId,
+    claims: [{ deliveryId: 'delivery', claimToken: 'claim', claimGeneration: 1 }],
+    dropReason: 'delivery_outcome_unknown',
+    allowExpiredLease: true,
+    presentation: {
+      surface: 'voice',
+      parentMessageId: input.parentMessageId,
+      persistedMessageId: child.messageId,
+      messageRevision: 1,
+      presentationClaimToken: 'claim',
+      claimGeneration: 1,
+      presentationRef: input.presentationRef,
+      presentationLeaseToken: 'lease',
+      deliveryReceipts: [{ deliveryId: 'delivery', graphResultHash: 'a'.repeat(64) }],
+    },
+  });
+  expect(deps.markPresentationByParent).not.toHaveBeenCalled();
+  expect(child.text).toBe('Useful additional result.');
+});
+
+test.each([
+  'ownerId',
+  'conversationId',
+  'parentMessageId',
+  'callSessionId',
+  'taskId',
+  'streamId',
+  'turnId',
+  'presentationRef',
+] as const)('interruption with foreign %s cannot consume a claim', async (field) => {
+  const { input, child, deps } = fixture();
+  await prepareVoiceCortexPresentation({ ...input, text: child.text, leaseMs: 900000 }, deps);
+  if (field === 'presentationRef') deps.readMessage.mockResolvedValueOnce(null);
+  const attempt = confirmVoiceCortexPresentation(
+    { ...input, stage: 'audio.interrupted', [field]: 'foreign' },
+    deps,
+  );
+  if (field === 'presentationRef') expect(await attempt).toBeNull();
+  else
+    await expect(attempt).rejects.toMatchObject({
+      code: 'cortex_voice_presentation_receipt_conflict',
+    });
+  expect(deps.markDropped).not.toHaveBeenCalled();
+});
+
+test.each(['new-generation', 'new-revision', 'already-sent', 'unrelated-drop'])(
+  '%s is not consumed by an old interruption',
+  async (fault) => {
+    const { input, child, deps } = fixture();
+    await prepareVoiceCortexPresentation({ ...input, text: child.text, leaseMs: 900000 }, deps);
+    deps.listByParent.mockResolvedValueOnce([
+      {
+        deliveryId: 'delivery',
+        persistedMessageId: child.messageId,
+        claimGeneration: fault === 'new-generation' ? 2 : 1,
+        messageRevision: fault === 'new-revision' ? 2 : 1,
+        status:
+          fault === 'already-sent' ? 'sent' : fault === 'unrelated-drop' ? 'dropped' : 'claimed',
+        dropReason: fault === 'unrelated-drop' ? 'stale_generation' : '',
+        presentedSurfaces: [],
+      },
+    ]);
+    await expect(
+      confirmVoiceCortexPresentation({ ...input, stage: 'audio.interrupted' }, deps),
+    ).rejects.toMatchObject({ code: 'cortex_voice_presentation_receipt_conflict' });
+    expect(deps.markDropped).not.toHaveBeenCalled();
+  },
+);
+
+test('interrupted drop is idempotent and later Voice fetch cannot re-play it', async () => {
+  const { input, child, deps } = fixture();
+  await prepareVoiceCortexPresentation({ ...input, text: child.text, leaseMs: 900000 }, deps);
+  await confirmVoiceCortexPresentation({ ...input, stage: 'audio.interrupted' }, deps);
+  deps.listByParent.mockResolvedValue([
+    {
+      deliveryId: 'delivery',
+      persistedMessageId: child.messageId,
+      claimGeneration: 1,
+      messageRevision: 1,
+      status: 'dropped',
+      dropReason: 'delivery_outcome_unknown',
+      presentedSurfaces: [],
+    },
+  ]);
+  await confirmVoiceCortexPresentation({ ...input, stage: 'audio.interrupted' }, deps);
+  expect(
+    await prepareVoiceCortexPresentation({ ...input, text: child.text, leaseMs: 900000 }, deps),
+  ).toBe(false);
+  expect(deps.markPresentationByParent).not.toHaveBeenCalled();
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === The existing prepare receipt accepts one Voice dispatch, not heard audio. === */
+test('accepted handoff is returned only once and does not mark any delivery heard', async () => {
+  const { input, child, deps } = fixture();
+  const prepared = { ...input, text: child.text, leaseMs: 900000 };
+  expect(await prepareVoiceCortexPresentation(prepared, deps)).toBe(true);
+  expect(child.metadata?.viventium?.deliveryAcknowledgement?.cortexPresentation).toMatchObject({
+    dispatchAccepted: true,
+  });
+  expect(await prepareVoiceCortexPresentation(prepared, deps)).toBe(false);
+  expect(deps.recordReceipt).toHaveBeenCalledTimes(1);
+  expect(deps.fencePresentationByParent).toHaveBeenCalledTimes(1);
+  expect(deps.markPresentationByParent).not.toHaveBeenCalled();
+  expect(deps.markDropped).not.toHaveBeenCalled();
+});
+
+test('a failed prepare receipt CAS cannot authorize a handoff', async () => {
+  const { input, child, deps } = fixture();
+  deps.recordReceipt.mockResolvedValueOnce(false);
+  await expect(
+    prepareVoiceCortexPresentation({ ...input, text: child.text, leaseMs: 900000 }, deps),
+  ).rejects.toMatchObject({ code: 'cortex_voice_presentation_receipt_conflict' });
+  expect(child.metadata?.viventium?.deliveryAcknowledgement?.cortexPresentation).toBeUndefined();
+  expect(deps.markPresentationByParent).not.toHaveBeenCalled();
+  expect(deps.markDropped).not.toHaveBeenCalled();
+});
+
+test('a legacy unaccepted receipt is resealed by the existing CAS before its single handoff', async () => {
+  const { input, child, deps } = fixture();
+  const prepared = { ...input, text: child.text, leaseMs: 900000 };
+  await prepareVoiceCortexPresentation(prepared, deps);
+  Reflect.deleteProperty(
+    child.metadata!.viventium!.deliveryAcknowledgement!.cortexPresentation!,
+    'dispatchAccepted',
+  );
+  expect(await prepareVoiceCortexPresentation(prepared, deps)).toBe(true);
+  expect(child.metadata?.viventium?.deliveryAcknowledgement?.cortexPresentation).toMatchObject({
+    dispatchAccepted: true,
+  });
+  expect(await prepareVoiceCortexPresentation(prepared, deps)).toBe(false);
+  expect(deps.recordReceipt).toHaveBeenCalledTimes(2);
+  expect(deps.markPresentationByParent).not.toHaveBeenCalled();
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Canonical accepted-dispatch checks remain in the typed owner. === */
+test('the typed accepted-dispatch reader preserves the exact private fence without another write', async () => {
+  const { input, child, fence, deps } = fixture();
+  await prepareVoiceCortexPresentation({ ...input, text: child.text, leaseMs: 30000 }, deps);
+  const result = resolveAcceptedVoiceCortexDispatch(child, input);
+  expect(result).toEqual({
+    surface: 'voice',
+    parentMessageId: 'parent',
+    persistedMessageId: 'child',
+    messageRevision: 1,
+    presentationClaimToken: 'claim',
+    claimGeneration: 1,
+    presentationRef: 'child',
+    presentationLeaseToken: 'lease',
+    deliveryReceipts: fence.deliveryReceipts,
+  });
+  expect(deps.recordReceipt).toHaveBeenCalledTimes(1);
+  expect(deps.markPresentationByParent).not.toHaveBeenCalled();
+});
+
+test('the typed reader leaves missing or unaccepted messages recoverable', () => {
+  const { input, child } = fixture();
+  expect(resolveAcceptedVoiceCortexDispatch(null, input)).toBeNull();
+  expect(resolveAcceptedVoiceCortexDispatch(child, input)).toBeNull();
+});
+
+test.each([
+  'owner',
+  'parent',
+  'message',
+  'revision',
+  'generation',
+  'claim',
+  'ids',
+  'hash',
+] as const)('the typed reader rejects an accepted receipt with changed %s', async (field) => {
+  const { input, child, deps } = fixture();
+  await prepareVoiceCortexPresentation({ ...input, text: child.text, leaseMs: 30000 }, deps);
+  const meta = child.metadata!.viventium!;
+  const receipt = meta.deliveryAcknowledgement!.cortexPresentation!;
+  if (field === 'owner') receipt.ownerId = 'foreign';
+  if (field === 'parent') receipt.parentMessageId = 'other-parent';
+  if (field === 'message') receipt.messageId = 'other-child';
+  if (field === 'revision') receipt.revision = 2;
+  if (field === 'generation') receipt.generation = 2;
+  if (field === 'claim') receipt.claimToken = 'other-claim';
+  if (field === 'ids') receipt.deliveryIds = ['other-delivery'];
+  if (field === 'hash') child.text = 'Changed result.';
+  expect(() => resolveAcceptedVoiceCortexDispatch(child, input)).toThrow(
+    'Canonical accepted Cortex Voice receipt did not match',
+  );
+  expect(deps.markPresentationByParent).not.toHaveBeenCalled();
+});
+/* === VIVENTIUM END === */

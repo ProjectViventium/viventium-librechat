@@ -19,7 +19,8 @@ import type { IUser } from '@librechat/data-schemas';
 import type { Agent, AgentModelParameters } from 'librechat-data-provider';
 import type * as t from '~/types';
 import { resolveHeaders, createSafeUser } from '~/utils/env';
-import type { MainContinuityFetch } from '~/continuity';
+import type { MainContinuityFetch, MainBackgroundInputsReader } from '~/continuity';
+import { createNativeBootstrapFetch } from '../glasshive/nativeResponse';
 import {
   withMainContinuityCallbacks,
   createMainContinuityFetch,
@@ -771,6 +772,7 @@ const nonRetryableGraphFallbackClasses = new Set([
   'native_input_expired',
   'native_input_cancelled',
   'native_turn_cancelled',
+  'provider_progress_stalled',
   'host_capacity',
   'provider_request_rejected',
   'bad_request',
@@ -1463,6 +1465,7 @@ export async function createRun({
   nativeRequestAuthorityObserver,
   mainContinuityHeaders,
   nativeResponseFetch,
+  readMainBackgroundInputs,
   streaming = true,
   streamUsage = true,
 }: {
@@ -1479,6 +1482,8 @@ export async function createRun({
   messages?: BaseMessage[];
   /** Request-local accepted source manifest, checked after graph pruning on every selected route. */
   mainContinuityHeaders?: Readonly<Record<string, string>>;
+  /** Invocation-fresh quoted data; the foreground and stable authority stay request-pinned. */
+  readMainBackgroundInputs?: MainBackgroundInputsReader;
   nativeResponseFetch?: (
     baseFetch: MainContinuityFetch,
     route: { agentId: string; provider: string; endpoint?: string },
@@ -1536,7 +1541,8 @@ export async function createRun({
       streamUsage,
     });
     // Keep accepted source guards local to this run and each exact selected route.
-    const sourceChain = mainContinuityHeaders?.[MAIN_CONTINUITY_CHAIN_HEADER];
+    const sourceChain = agent === agents[0]
+      ? mainContinuityHeaders?.[MAIN_CONTINUITY_CHAIN_HEADER] : undefined;
     const selectedRoutes = [agent, ...(agent.viventiumGraphLlmFallbacks || [])];
     const selectedOptions = [
       llmConfig,
@@ -1569,9 +1575,12 @@ export async function createRun({
             endpoint: route.endpoint ?? undefined,
           })
         : baseFetch;
-      configuration.fetch = sourceChain
-        ? createMainContinuityFetch(boundFetch, sourceChain, mainContinuityHeaders)
-        : boundFetch;
+      configuration.fetch = createNativeBootstrapFetch(
+        sourceChain
+          ? createMainContinuityFetch(boundFetch, sourceChain, mainContinuityHeaders,
+              agent === agents[0] ? readMainBackgroundInputs : undefined)
+          : boundFetch,
+      );
     }
     if (graphFallbacks.length > 0) {
       (

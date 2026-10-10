@@ -6,8 +6,14 @@ import type {
   NativeResponseCommit,
   NativeResponseMessageProjection,
 } from '@librechat/data-schemas';
-import { nativePredecessorSupersession } from '../glasshive/nativeSupersession';
+import {
+  nativePredecessorSourceRecovery,
+  nativeSourceRecoveryUnconfirmed,
+  unboundPredecessorSourceRecovery,
+  nativePredecessorSupersession,
+} from '../glasshive/nativeSupersession';
 import type { NativeAcceptedSource, NativePredecessor } from '../glasshive/nativeSupersession';
+import type { SourceRecoveryFacts } from '../glasshive/sourceMutation';
 import {
   nativeIdentityJson,
   nativeJobMatches,
@@ -15,6 +21,7 @@ import {
 } from './implementations/nativeResponse';
 import type { StandardGraph } from '@librechat/agents';
 import { parseTextParts } from 'librechat-data-provider';
+import { convertHarnessActivityParts } from '../utils/content';
 import type { Agents, TMessageContentParts } from 'librechat-data-provider';
 import type {
   SerializableJobData,
@@ -40,6 +47,7 @@ import type * as t from '~/types';
 import { InMemoryEventTransport } from './implementations/InMemoryEventTransport';
 import { InMemoryJobStore } from './implementations/InMemoryJobStore';
 import { safeStreamLogError, streamLogRef } from './logPrivacy';
+import { publicPartEventMatchesOwner } from '../channels/deliveryDisposition';
 
 /**
  * Configuration options for GenerationJobManager
@@ -532,6 +540,10 @@ class GenerationJobManagerClass {
   private unavailable = false;
   private lifecycleAbortController = new AbortController();
   private nativeResponseRecovery?: (identity: NativeResponseIdentity) => Promise<boolean>;
+  private nativeSourceRecovery?: (
+    current: SerializableJobData,
+    previous: SerializableJobData,
+  ) => Promise<SourceRecoveryFacts>;
   private nativeResponseCancellation?: (
     identity: NativeResponseIdentity,
     snapshot: NativeResponseMessageProjection,
@@ -903,6 +915,13 @@ class GenerationJobManagerClass {
     this.nativeResponseCancellation = handler;
   }
 
+  /** Reuse the native release gate before committing and capturing a successor's current inputs. */
+  setNativeSourceRecovery(
+    handler: NonNullable<GenerationJobManagerClass['nativeSourceRecovery']>,
+  ): void {
+    this.nativeSourceRecovery = handler;
+  }
+
   /* === VIVENTIUM START ===
    * Feature: Pre-dispatch lease of a release-gated revision.
    * Purpose: While a revision waits for its predecessors to release, its generator renews a
@@ -980,12 +999,83 @@ class GenerationJobManagerClass {
     streamId: string,
     userId: string,
   ): Promise<InteractionContext | undefined> {
-    const job = await this.jobStore.getJob(streamId);
-    const context = job?.interactionContext;
-    if (!context?.logical_turn_id || !this.jobStore.commitLogicalTurnAdmission) {
+    let job = await this.jobStore.getJob(streamId);
+    let context = job?.interactionContext;
+    if (!job || !context?.logical_turn_id || !this.jobStore.commitLogicalTurnAdmission) {
       return context;
     }
     try {
+      const predecessors = this.nativeSourceRecovery && job.adapterCapabilities?.supersede_scope === 'response_only'
+        ? await this.jobStore.getLogicalTurnSourcePredecessors?.(streamId, userId, context) ?? [] : [];
+      const unbound: SerializableJobData[] = [];
+      for (const previous of predecessors) {
+        if (unboundPredecessorSourceRecovery(job, previous, await this.jobStore.isNativeResponseUnboundCancelled?.(previous))) unbound.push(previous);
+      }
+      const unboundIds = new Set(unbound.map((previous) => previous.streamId));
+      if (unbound.length) {
+        const noNativeTargets = new Set(unbound.map((previous) => previous.responseMessageId));
+        const nativeReleaseTargets = (job.nativeReleaseTargets ?? []).filter((target) => !noNativeTargets.has(target));
+        await this.jobStore.updateJob(streamId, { nativeReleaseTargets });
+        job = { ...job, nativeReleaseTargets };
+      }
+      const bound = predecessors.filter((previous) => previous.nativeResponse && !unboundIds.has(previous.streamId)).sort((a, b) => b.interactionContext!.revision - a.interactionContext!.revision)[0];
+      const anchor = job.nativePredecessor && !unboundIds.has(job.nativePredecessor.streamId) ? await this.jobStore.getJob(job.nativePredecessor.streamId) : bound;
+      if (anchor?.nativeResponse && (anchor.nativeResponse.jobCreatedAt !== anchor.createdAt ||
+        (job.nativePredecessor && !unboundIds.has(job.nativePredecessor.streamId) && (job.nativePredecessor.createdAt !== anchor.createdAt || job.nativePredecessor.invocationId !== anchor.nativeResponse.invocationId)))) {
+        throw nativeSourceRecoveryUnconfirmed('native_identity', job, anchor);
+      }
+      if (anchor?.nativeResponse && anchor.status === 'superseded' && anchor.nativeResponseCancelled === true) {
+        const before = anchor.nativeResponse.revision;
+        const skipped = Array.from({ length: Math.min(9, Math.max(0, context.revision - before - 1)) }, (_, index) => before + index + 1);
+        if (context.revision - before > 9 || skipped.some((revision) => !unbound.some((previous) => previous.interactionContext?.revision === revision))) {
+          throw Object.assign(new Error('native_source_recovery_predecessor_unavailable'), { code: 'native_source_recovery_predecessor_unavailable' });
+        }
+        const nativePredecessor: NativePredecessor = {
+          streamId: anchor.streamId, createdAt: anchor.createdAt,
+          responseMessageId: anchor.nativeResponse.responseMessageId, invocationId: anchor.nativeResponse.invocationId,
+          ...(skipped.length ? { unadmittedRevisions: skipped } : {}),
+        };
+        const nativeReleaseTargets = [...new Set([...(job.nativeReleaseTargets ?? []), anchor.nativeResponse.responseMessageId])];
+        await this.jobStore.updateJob(streamId, { nativePredecessor, nativeReleaseTargets });
+        job = { ...job, nativePredecessor, nativeReleaseTargets };
+      }
+      if (this.nativeSourceRecovery && job.adapterCapabilities?.supersede_scope === 'response_only' && job.nativeReleaseTargets?.length && !job.nativePredecessor) {
+        throw Object.assign(new Error('native_source_recovery_predecessor_unavailable'), { code: 'native_source_recovery_predecessor_unavailable' });
+      }
+      const committedAnchor = anchor?.nativeResponse && anchor.nativeResponseCancelled !== true &&
+        anchor.userId === job.userId && anchor.conversationId === job.conversationId &&
+        anchor.nativeResponse.logicalTurnId === context.logical_turn_id &&
+        (await this.jobStore.getNativeResponseCommit(anchor.nativeResponse)).status === 'committed';
+      const predecessorStream = committedAnchor
+        ? unbound.at(-1)?.streamId
+        : anchor?.streamId ?? unbound.at(-1)?.streamId;
+      if (predecessorStream && this.nativeSourceRecovery &&
+        job.adapterCapabilities?.supersede_scope === 'response_only') {
+        const previous = await this.jobStore.getJob(predecessorStream);
+        if (!previous) throw Object.assign(new Error('native_source_recovery_unavailable'), {
+          code: 'native_source_recovery_unavailable',
+        });
+        const facts = await this.nativeSourceRecovery(job, previous);
+        const current = await this.jobStore.getJob(streamId);
+        const released = await this.jobStore.getJob(previous.streamId);
+        const currentLogicalTurn = await this.jobStore.isCurrentLogicalTurn(streamId);
+        if (!current || current.createdAt !== job.createdAt || current.userId !== userId ||
+          (!nativePredecessorSourceRecovery(current, released) &&  !unboundPredecessorSourceRecovery(current, released, released ? await this.jobStore.isNativeResponseUnboundCancelled?.(released) : false)) ||
+          !currentLogicalTurn ||
+          !this.jobStore.relinquishLogicalTurnAuthor) {
+          throw nativeSourceRecoveryUnconfirmed('author_commit', current, released, currentLogicalTurn);
+        }
+        for (const stopped of [...unbound, released].filter((value, index, rows) => rows.findIndex((row) => row.streamId === value.streamId) === index)) {
+          const exact = await this.jobStore.getJob(stopped.streamId);
+          if (!exact || exact.createdAt !== stopped.createdAt ||
+            (!nativePredecessorSourceRecovery(current, exact) && !unboundPredecessorSourceRecovery(current, exact, await this.jobStore.isNativeResponseUnboundCancelled?.(exact)))) {
+            throw nativeSourceRecoveryUnconfirmed('author_relinquish', current, exact, currentLogicalTurn);
+          }
+          await this.jobStore.relinquishLogicalTurnAuthor(exact.streamId, userId, exact.interactionContext!);
+        }
+        context = { ...context, source_recovery_facts: facts };
+        await this.jobStore.updateJob(streamId, { interactionContext: context });
+      }
       return await this.jobStore.commitLogicalTurnAdmission(streamId, userId, context);
     } catch (error) {
       const uncertain = (error as { code?: string })?.code === 'author_commit_uncertain';
@@ -1637,10 +1727,16 @@ class GenerationJobManagerClass {
     if (!job) return reject('job_missing');
     if (job.userId !== userId) return reject('owner_mismatch');
     if (job.responseMessageId !== responseMessageId) return reject('response_mismatch');
-    if (job.interactionContext?.source_event_id !== sourceEventId) {
+    const currentSource = job.interactionContext?.source_event_id === sourceEventId;
+    const ownedEarlierSource = job.interactionContext?.source_segments?.some(
+      (source) => source.source_event_id === sourceEventId &&
+        source.authoring_revision === job.interactionContext?.revision,
+    );
+    if (!currentSource && !ownedEarlierSource) {
       return reject('source_mismatch');
     }
     const canPresentDurableReceipt =
+      currentSource &&
       job.deliveryPolicy?.commit_authority === 'external_adapter' &&
       job.adapterCapabilities?.supersede_scope === 'response_only';
     let existingReceipts = job.durableEffectReceipts ?? [];
@@ -1841,21 +1937,40 @@ class GenerationJobManagerClass {
       ['committed', 'committed_effect'].includes(result.acknowledgement?.state || '')
         ? cortexPresentation
         : undefined;
-    const presentation = ownerJob
-      ? {
-          userId: ownerJob.userId,
-          conversationId: ownerJob.conversationId,
-          responseMessageId: ownerJob.responseMessageId,
-          interactionContext: ownerJob.interactionContext,
-          ...(verifiedCortexPresentation ? { cortexPresentation: verifiedCortexPresentation } : {}),
-        }
-      : undefined;
     const job = await this.runLifecycleOperation(
       lifecycle,
       () => lifecycle.jobStore.getJob(ownerStreamId),
       ownerStreamId,
       runtime,
     );
+    // Existing post-ACK state proves whether this exact result still has a live producer.
+    const producerPending = Boolean(
+      ownerJob &&
+        job &&
+        job.streamId === ownerStreamId &&
+        job.createdAt === ownerJob.createdAt &&
+        job.userId === ownerJob.userId &&
+        job.conversationId === ownerJob.conversationId &&
+        Boolean(ownerJob.responseMessageId) &&
+        job.responseMessageId === ownerJob.responseMessageId &&
+        job.interactionContext?.logical_turn_id === acknowledgement.logical_turn_id &&
+        job.interactionContext?.revision === acknowledgement.revision &&
+        ownerJob.interactionContext?.logical_turn_id === acknowledgement.logical_turn_id &&
+        ownerJob.interactionContext?.revision === acknowledgement.revision &&
+        job.status === 'running' &&
+        job.generationCompleted !== true &&
+        job.nativeResponseCancelled !== true,
+    );
+    const presentation = ownerJob
+      ? {
+          userId: ownerJob.userId,
+          conversationId: ownerJob.conversationId,
+          responseMessageId: ownerJob.responseMessageId,
+          interactionContext: ownerJob.interactionContext,
+          producerPending,
+          ...(verifiedCortexPresentation ? { cortexPresentation: verifiedCortexPresentation } : {}),
+        }
+      : undefined;
     if (
       ['committed', 'committed_effect'].includes(acknowledgement.state) &&
       job?.generationCompleted === true
@@ -2450,6 +2565,7 @@ class GenerationJobManagerClass {
         durableEffectReceipt: jobData.durableEffectReceipt,
         durableEffectReceipts: jobData.durableEffectReceipts,
         viventiumVoiceEffectAuthority: jobData.viventiumVoiceEffectAuthority,
+        viventiumVoiceWorkAuthority: jobData.viventiumVoiceWorkAuthority,
         viventiumCallSessionId: jobData.viventiumCallSessionId,
         viventiumVoiceTaskId: jobData.viventiumVoiceTaskId,
         generationCompleted: jobData.generationCompleted,
@@ -3275,7 +3391,9 @@ class GenerationJobManagerClass {
         if (!cancellationHandler) return cancellationUnavailable();
         const currentContent = await jobStore.getContentParts(streamId);
         this.assertServiceGeneration(generation);
-        const content = JSON.parse(JSON.stringify(currentContent?.content || []));
+        const content = convertHarnessActivityParts(
+          JSON.parse(JSON.stringify(currentContent?.content || [])),
+        );
         const saved = await cancellationHandler(nativeIdentity, {
           text: parseTextParts(content),
           content,
@@ -3416,6 +3534,9 @@ class GenerationJobManagerClass {
         if (!nativePublished) throw error;
         logger.warn('[GenerationJobManager] Stop activity acknowledgement unavailable');
       }
+      // A same-stream successor can be admitted while the old Stop waits for its ACK.
+      // Preserve that job's content, final event, and cleanup authority.
+      if (!(await sameJob())) return cancellationUnavailable();
     }
 
     /** Content before clearing state */
@@ -3809,6 +3930,68 @@ class GenerationJobManagerClass {
       }
     }
 
+    /* === VIVENTIUM START === Audio-part control after an unsupported Native graph handoff. === */
+    const verifyPublicPartOwner = async () => {
+      const owner = options.publicPartOwner;
+      if (!owner) return true;
+      try {
+        const identity = owner.identity;
+        if (
+          !publicPartEventMatchesOwner(event, identity) ||
+          identity.streamId !== streamId ||
+          !this.hasLocalNativeResponseProducer(identity) ||
+          this.runtimeState.get(streamId) !== runtime ||
+          runtime.abortController.signal.aborted ||
+          !(await this.runLifecycleOperation(lifecycle, owner.verifySource, streamId, runtime))
+        )
+          return false;
+        if (identity.sourceOrderScope && identity.sourceSequence != null) {
+          const observed = await this.runLifecycleOperation(
+            lifecycle,
+            () =>
+              lifecycle.jobStore.observeSourceOrder({
+                source_order_scope: identity.sourceOrderScope!,
+                source_sequence: identity.sourceSequence!,
+              }),
+            streamId,
+            runtime,
+          );
+          if (observed.stale || observed.latest_source_sequence !== identity.sourceSequence)
+            return false;
+        }
+        if (
+          !(await this.runLifecycleOperation(
+            lifecycle,
+            () => lifecycle.jobStore.isCurrentLogicalTurn(streamId),
+            streamId,
+            runtime,
+          ))
+        )
+          return false;
+        const job = await this.runLifecycleOperation(
+          lifecycle,
+          () => lifecycle.jobStore.getJob(streamId),
+          streamId,
+          runtime,
+        );
+        return (
+          nativeJobMatches(job, identity) &&
+          job.status === 'running' &&
+          !job.generationCompleted &&
+          !job.nativeResponseCancelled &&
+          !job.nativeResponse &&
+          this.hasLocalNativeResponseProducer(identity) &&
+          this.runtimeState.get(streamId) === runtime &&
+          !runtime.abortController.signal.aborted
+        );
+      } catch {
+        return false;
+      }
+    };
+    if (!(await verifyPublicPartOwner()))
+      return { delivered: false, streamId, reason: 'runtime_unavailable' };
+    /* === VIVENTIUM END === */
+
     const messageId = String(cortexEvent.data?.messageId || '').trim();
     const parentMessageId = String(
       cortexEvent.data?.presentationParentMessageId || cortexEvent.data?.parentMessageId || '',
@@ -4005,7 +4188,7 @@ class GenerationJobManagerClass {
     if (isCortexPresentation && !(await verifyCurrentCortexPresentation('publish'))) {
       return { delivered: false, streamId, reason: 'presentation_unconfirmed' };
     }
-    if (!runtime.hasSubscriber && canUseRuntimeReplayBuffer) {
+    if (!options.publicPartOwner && !runtime.hasSubscriber && canUseRuntimeReplayBuffer) {
       runtime.earlyEventBuffer.push(authorizedEvent);
     }
 
@@ -4013,6 +4196,14 @@ class GenerationJobManagerClass {
     /* === VIVENTIUM START === EMO-UC-048 Redis publish/ack fault boundary. === */
     const publishFaultInjected =
       lifecycle.isRedis && (await consumeCortexFault('web_redis_publish_ack'));
+    /* === VIVENTIUM END === */
+    /* === VIVENTIUM START === Recheck the released Core owner after every earlier async lookup. === */
+    if (options.publicPartOwner) {
+      if (!(await verifyPublicPartOwner()))
+        return { delivered: false, streamId, reason: 'runtime_unavailable' };
+      if (!runtime.hasSubscriber && canUseRuntimeReplayBuffer)
+        runtime.earlyEventBuffer.push(authorizedEvent);
+    }
     /* === VIVENTIUM END === */
     const transportReceipt = publishFaultInjected
       ? {
@@ -4313,6 +4504,9 @@ class GenerationJobManagerClass {
     }
     if (metadata.viventiumVoiceEffectAuthority) {
       updates.viventiumVoiceEffectAuthority = metadata.viventiumVoiceEffectAuthority;
+    }
+    if (metadata.viventiumVoiceWorkAuthority) {
+      updates.viventiumVoiceWorkAuthority = metadata.viventiumVoiceWorkAuthority;
     }
     if (metadata.viventiumCallSessionId) {
       updates.viventiumCallSessionId = metadata.viventiumCallSessionId;
@@ -4820,6 +5014,7 @@ class GenerationJobManagerClass {
       }
     }
     this.nativeResponseRecovery = undefined;
+    this.nativeSourceRecovery = undefined;
     this.nativeResponseCancellation = undefined;
     this.runtimeState.clear();
     this.runStepBuffers?.clear();

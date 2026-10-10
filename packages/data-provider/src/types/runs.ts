@@ -22,7 +22,7 @@ export enum ContentTypes {
 /**
  * Status of a background cortex during processing
  */
-export type CortexStatus = 'activating' | 'brewing' | 'complete' | 'skipped' | 'error';
+export type CortexStatus = 'activating' | 'brewing' | 'complete' | 'skipped' | 'error' | 'cancelled';
 
 /**
  * Content part for cortex activation events

@@ -1,5 +1,6 @@
 const { EventEmitter } = require('events');
 
+const mockIsNativeCapacityRefusal = jest.fn();
 const mockSettleVoiceTaskGeneration = jest.fn(async () => null);
 const mockDisposeClient = jest.fn();
 const mockGetFiles = jest.fn(async () => []);
@@ -59,6 +60,7 @@ jest.mock('@librechat/api', () => ({
   sendEvent: jest.fn(),
   getViolationInfo: jest.fn(() => ({ score: 0 })),
   GenerationJobManager: mockGenerationJobManager,
+  isNativeCapacityRefusal: (...args) => mockIsNativeCapacityRefusal(...args),
   decrementPendingRequest: (...args) => mockDecrementPendingRequest(...args),
   sanitizeFileForTransmit: (f) => f,
   sanitizeMessageForTransmit: (m) => m,
@@ -334,6 +336,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     mockGenerationJobManager.markMainResponseComplete.mockResolvedValue(true);
     mockGenerationJobManager.finishNativeResponse.mockResolvedValue(true);
     mockCommitAcceptedMainTurn.mockResolvedValue({ status: 'committed' });
+    mockGetNativeResponse.mockResolvedValue({ nativeResponse: { status: 'pending' } });
     mockRecoverSavedNativeResponse.mockResolvedValue({
       messageId: 'resp-msg-1',
       text: 'Canonical native answer.',
@@ -349,6 +352,251 @@ describe('ResumableAgentController Phase B stream completion window', () => {
   afterEach(() => {
     jest.useRealTimers();
   });
+
+  test.each([
+    'released',
+    'released_existing_error',
+    'unknown',
+    'wrong_stream',
+    'wrong_owner',
+    'wrong_message',
+    'wrong_generation',
+    'fallback_other_error',
+    'fallback_without_proof',
+    'fallback_foreign_proof',
+  ])(
+    'persists a closed failed snapshot only for an exact Native refusal release: %s',
+    async (mode) => {
+      const released = mode === 'released' || mode === 'released_existing_error';
+      const req = makeReq();
+      req.body.streamId = 'stream-1';
+      mockIsNativeCapacityRefusal.mockReturnValue(released);
+      const marker = {
+        invocationId: 'invocation',
+        bodySha256: 'a'.repeat(64),
+        streamId: 'stream-1',
+        userId: 'user-1',
+        responseMessageId: 'resp-msg-1',
+        jobCreatedAt: 1,
+      };
+      if (mode === 'wrong_stream') marker.streamId = 'foreign';
+      if (mode === 'wrong_owner') marker.userId = 'foreign';
+      if (mode === 'wrong_message') marker.responseMessageId = 'foreign';
+      if (mode === 'wrong_generation') marker.jobCreatedAt = 2;
+      if (mode !== 'unknown') req._viventiumNativeResponseUnaccepted = marker;
+      let existingErrorPart;
+      const client = makeClient(Promise.resolve());
+      client.contentParts = [{ type: 'text', text: 'Known partial progress.' }];
+      const original = client.sendMessage.getMockImplementation();
+      client.sendMessage.mockImplementation(async (...args) => {
+        await original(...args);
+        if (mode !== 'unknown')
+          req._viventiumNativeResponseUnaccepted = {
+            ...marker,
+            streamId: mode === 'wrong_stream' ? 'foreign' : req._resumableStreamId,
+          };
+        const failure = {
+          code: mode === 'fallback_other_error' ? 'upstream_unavailable' : 'host_capacity',
+        };
+        if (mode !== 'fallback_without_proof')
+          failure.native_admission = {
+            version: 1,
+            accepted: false,
+            invocation_id: mode === 'fallback_foreign_proof' ? 'foreign' : marker.invocationId,
+            body_sha256: marker.bodySha256,
+            stream_id: req._resumableStreamId,
+            message_id: marker.responseMessageId,
+          };
+        req._viventiumNativeResponseIdentity = {
+          ...marker,
+          streamId: req._resumableStreamId,
+          userId: 'user-1',
+          responseMessageId: 'resp-msg-1',
+          jobCreatedAt: 1,
+        };
+        const error = require('openai').APIError.generate(
+          503,
+          { error: failure },
+          undefined,
+          new Headers(),
+        );
+        require('./client').handleCompletionErrorContentPart({
+          contentParts: mode === 'released_existing_error' ? client.contentParts : [],
+          err: error,
+          req,
+          abortController: { signal: { aborted: false } },
+          log: { warn: jest.fn(), error: jest.fn() },
+        });
+        if (mode === 'released_existing_error') {
+          existingErrorPart = client.contentParts.find((part) => part.type === 'error');
+          Object.assign(existingErrorPart, {
+            retry_after_seconds: 5,
+            capacity_class: 'resource_pressure',
+          });
+        }
+        throw error;
+      });
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        jest.fn(),
+      );
+      await jest.advanceTimersByTimeAsync(120);
+      await Promise.resolve();
+      const save = mockSaveMessage.mock.calls.find(
+        ([, message, context]) =>
+          message.messageId === 'resp-msg-1' &&
+          message.error === true &&
+          context.context ===
+            'api/server/controllers/agents/request.js - generation error snapshot',
+      );
+      expect(save).toBeDefined();
+      expect(save[1]).toMatchObject({
+        error: true,
+        text: 'Known partial progress.',
+        unfinished: !released,
+      });
+      if (released)
+        expect(save[1].content).toContainEqual(
+          expect.objectContaining({
+            type: 'error',
+            error_class: 'host_capacity',
+            error: 'Local AI capacity is busy. Please try again shortly.',
+          }),
+        );
+      else expect(save[1].content.some((part) => part.type === 'error')).toBe(false);
+      if (mode === 'released_existing_error') {
+        const capacityErrors = save[1].content.filter(
+          (part) => part.type === 'error' && part.error_class === 'host_capacity',
+        );
+        expect(capacityErrors).toHaveLength(1);
+        expect(capacityErrors[0]).toEqual(existingErrorPart);
+        expect(capacityErrors[0]).toMatchObject({
+          retry_after_seconds: 5,
+          capacity_class: 'resource_pressure',
+        });
+        expect(save[1].text).not.toContain('Generation interrupted before completion.');
+      }
+      if (released || mode.startsWith('fallback_')) {
+        expect(mockIsNativeCapacityRefusal).toHaveBeenCalledWith(
+          expect.objectContaining({
+            code: mode === 'fallback_other_error' ? 'upstream_unavailable' : 'host_capacity',
+          }),
+          expect.objectContaining({
+            invocationId: marker.invocationId,
+            bodySha256: marker.bodySha256,
+          }),
+        );
+      }
+      expect(mockGenerationJobManager.completeJob).toHaveBeenCalled();
+      expect(mockGenerationJobManager.failRevokedNativeResponse).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each([
+    'released',
+    'unknown',
+    'wrong_stream',
+    'wrong_owner',
+    'wrong_message',
+    'wrong_generation',
+    'new_invocation',
+    'new_body',
+    'healthy_fallback',
+  ])(
+    'persists the actual unsupported Native completion with exact refusal ownership: %s',
+    async (mode) => {
+      const req = makeReq();
+      req.body.voiceMode = true;
+      setTrustedInteractionContext(
+        req,
+        {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'voice',
+          conversation_id: 'conv-1',
+          revision: 1,
+          source_event_id: 'voice-source',
+        },
+        { segment_stability: 'immediate', supersede_scope: 'response_only' },
+        { commit_authority: 'external_adapter' },
+      );
+      mockRecoverSavedNativeResponse.mockResolvedValueOnce(null);
+      const client = makeClient(Promise.resolve());
+      client.contentParts = [{ type: 'text', text: 'Known partial progress.' }];
+      const original = client.sendMessage.getMockImplementation();
+      client.sendMessage.mockImplementation(async (...args) => {
+        const result = await original(...args);
+        const identity = {
+          streamId: req._resumableStreamId,
+          jobCreatedAt: 1,
+          userId: 'user-1',
+          responseMessageId: 'resp-msg-1',
+          invocationId: 'current',
+          bodySha256: 'a'.repeat(64),
+        };
+        req._viventiumNativeResponseIdentity = identity;
+        if (mode !== 'unknown')
+          req._viventiumNativeResponseUnaccepted = {
+            ...identity,
+            terminalErrorConfirmed: true,
+            ...(mode === 'wrong_stream' ? { streamId: 'foreign' } : {}),
+            ...(mode === 'wrong_owner' ? { userId: 'foreign' } : {}),
+            ...(mode === 'wrong_message' ? { responseMessageId: 'foreign' } : {}),
+            ...(mode === 'wrong_generation' ? { jobCreatedAt: 2 } : {}),
+            ...(mode === 'new_invocation' ? { invocationId: 'prior' } : {}),
+            ...(mode === 'new_body' ? { bodySha256: 'b'.repeat(64) } : {}),
+          };
+        mockGetNativeResponse.mockResolvedValue({
+          nativeResponse: { ...identity, status: 'unsupported' },
+        });
+        result.content =
+          mode === 'healthy_fallback'
+            ? [{ type: 'text', text: 'The answer.' }]
+            : [
+                {
+                  type: 'error',
+                  error_class: 'host_capacity',
+                  error: 'Local AI capacity is busy. Please try again shortly.',
+                },
+              ];
+        return result;
+      });
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        jest.fn(),
+      );
+      await jest.advanceTimersByTimeAsync(120);
+      const save = mockSaveMessage.mock.calls.find(
+        ([, , context]) =>
+          context.context ===
+          (mode === 'released'
+            ? 'api/server/controllers/agents/request.js - generation error snapshot'
+            : 'native graph continuation owned by the host'),
+      );
+      expect(save).toBeDefined();
+      if (mode === 'released') {
+        expect(save[1].unfinished).toBe(false);
+        expect(save[1].error).toBe(true);
+        expect(mockGenerationJobManager.markMainResponseComplete).not.toHaveBeenCalled();
+        expect(mockCommitAcceptedMainTurn).not.toHaveBeenCalled();
+      } else {
+        expect(
+          mockSaveMessage.mock.calls.some(
+            ([, , context]) =>
+              context.context ===
+              'api/server/controllers/agents/request.js - generation error snapshot',
+          ),
+        ).toBe(false);
+      }
+      expect(mockGenerationJobManager.failRevokedNativeResponse).not.toHaveBeenCalled();
+    },
+  );
 
   test.each(['no subscriber', 'disconnected subscriber'])(
     'settles voice generation with %s after actual completion',
@@ -419,6 +667,68 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith('conv-1', expected);
       expect(JSON.stringify(mockGenerationJobManager.emitError.mock.calls)).not.toContain(
         'synthetic-private-diagnostic',
+      );
+    },
+  );
+  test('a typed completion failure persists as failed with its original content', async () => {
+    const req = makeReq();
+    const client = makeClient(Promise.resolve());
+    const original = client.sendMessage.getMockImplementation();
+    const content = [
+      { type: 'error', error_class: 'source_context_unavailable', error: 'Public failure.' },
+      { type: 'cortex_insight', cortex_id: 'synthetic-cortex', insight: 'Retained insight.' },
+    ];
+    client.sendMessage.mockImplementation(async (...args) => ({
+      ...(await original(...args)),
+      text: '',
+      content,
+      error: false,
+    }));
+    await AgentController(
+      req,
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => ({ client })),
+      jest.fn(),
+    );
+    await jest.advanceTimersByTimeAsync(120);
+    expect(mockSaveMessage).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({ messageId: 'resp-msg-1', content, error: true }),
+      expect.any(Object),
+    );
+  });
+
+  test.each(['', 'Partial authored words.'])(
+    'a thrown completion failure retains failed truth and authored text (%s)',
+    async (text) => {
+      const req = makeReq();
+      const client = makeClient(Promise.resolve());
+      const original = client.sendMessage.getMockImplementation();
+      client.contentParts = [
+        ...(text ? [{ type: 'text', text }] : []),
+        { type: 'error', error_class: 'source_context_unavailable', error: 'Public failure.' },
+      ];
+      client.sendMessage.mockImplementation(async (...args) => {
+        await original(...args);
+        throw Object.assign(new Error('Public failure.'), { code: 'source_context_unavailable' });
+      });
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        jest.fn(),
+      );
+      await jest.advanceTimersByTimeAsync(120);
+      expect(mockSaveMessage).toHaveBeenCalledWith(
+        req,
+        expect.objectContaining({
+          messageId: 'resp-msg-1',
+          error: true,
+          ...(text ? { text } : {}),
+        }),
+        expect.any(Object),
       );
     },
   );
@@ -584,6 +894,219 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       }
     },
   );
+
+  test.each([
+    ['current revoked Native identity', 'current', true],
+    ['current Voice Native identity', 'current_voice', true],
+    ['current Telegram Native identity', 'current_telegram', true],
+    ['wrong Native owner', 'wrong_owner', false],
+    ['wrong Native invocation', 'wrong_invocation', false],
+    ['wrong job incarnation', 'wrong_incarnation', false],
+    ['another exact Native stream', 'other_stream', false],
+    ['a superseded revision', 'superseded', false],
+    ['an unrevoked Native publication', 'unrevoked', false],
+    ['an accepted final owner', 'committed', false],
+    ['an accepted final before publication', 'committed_pending', false],
+    ['a finished Stop owner', 'stopped', false],
+    ['an untyped lookalike error', 'untyped', false],
+    ['a different typed failure', 'different_error', false],
+    ['a non-Native request', 'non_native', false],
+  ])('missing canonical row finalization preserves %s', async (_label, mode, shouldFailRevoked) => {
+    const { GenerationJobManagerClass, InMemoryJobStore, InMemoryEventTransport } =
+      jest.requireActual('@librechat/api');
+    const store = new InMemoryJobStore();
+    const transport = new InMemoryEventTransport();
+    const manager = new GenerationJobManagerClass({ jobStore: store, eventTransport: transport });
+    const streamId = 'conv-1';
+    await manager.createJob(streamId, 'user-1', 'conv-1', {
+      interactionContext: {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface:
+          mode === 'current_voice' ? 'voice' : mode === 'current_telegram' ? 'telegram' : 'web',
+        conversation_id: 'conv-1',
+        revision: 1,
+        source_event_id: 'user-msg-1',
+      },
+    });
+    await manager.updateMetadata(streamId, {
+      responseMessageId: 'resp-msg-1',
+      userMessage: { messageId: 'user-msg-1' },
+    });
+    const job = await store.getJob(streamId);
+    const claim = { interactionContext: job.interactionContext };
+    const identity = {
+      userId: 'user-1',
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-msg-1',
+      streamId,
+      jobCreatedAt: job.createdAt,
+      logicalTurnId: claim.interactionContext.logical_turn_id,
+      revision: claim.interactionContext.revision,
+      invocationId: 'native-invocation',
+      bodySha256: 'a'.repeat(64),
+      providerId: 'synthetic-provider',
+      agentId: 'synthetic-agent',
+      originSha256: 'b'.repeat(64),
+      source: { id: 'synthetic-source-id', messageId: 'user-msg-1', digest: 'c'.repeat(64) },
+      admittedAt: Date.now(),
+      recoverUntil: Date.now() + 86_400_000,
+    };
+    expect(await manager.bindNativeResponse(identity)).toBe(true);
+    if (mode === 'committed' || mode === 'committed_pending') {
+      await manager.commitNativeResponse(identity, 'd'.repeat(64));
+      if (mode === 'committed') {
+        await manager.finishNativeResponse(identity, {
+          final: true,
+          responseMessage: { messageId: identity.responseMessageId, text: 'Accepted answer.' },
+        });
+      }
+    } else if (mode !== 'unrevoked') {
+      await manager.revokeNativeResponse(identity);
+      if (mode === 'stopped') {
+        await manager.finishNativeResponse(
+          identity,
+          {
+            final: true,
+            responseMessage: { messageId: identity.responseMessageId, text: 'Stopped partial.' },
+          },
+          'cancelled',
+        );
+      }
+    }
+    let supplied = { ...identity };
+    if (mode === 'wrong_owner') supplied.userId = 'another-owner';
+    if (mode === 'wrong_invocation') supplied.invocationId = 'another-invocation';
+    if (mode === 'wrong_incarnation') supplied.jobCreatedAt += 1;
+    if (mode === 'other_stream') {
+      const otherClaim = await store.claimLogicalTurn('another-stream', 'user-1', {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'web',
+        conversation_id: 'another-conversation',
+        revision: 1,
+        source_event_id: 'another-source',
+      });
+      const other = await store.createJob('another-stream', 'user-1', 'another-conversation', {
+        responseMessageId: 'another-answer',
+        interactionContext: otherClaim.interactionContext,
+        userMessage: { messageId: 'user-msg-1' },
+      });
+      supplied = {
+        ...identity,
+        streamId: other.streamId,
+        jobCreatedAt: other.createdAt,
+        conversationId: other.conversationId,
+        responseMessageId: other.responseMessageId,
+        logicalTurnId: otherClaim.interactionContext.logical_turn_id,
+        revision: otherClaim.interactionContext.revision,
+      };
+      expect(await manager.bindNativeResponse(supplied)).toBe(true);
+      await manager.revokeNativeResponse(supplied);
+    }
+    if (mode === 'superseded') {
+      await store.claimLogicalTurn('newer-stream', 'user-1', {
+        ...claim.interactionContext,
+        revision: claim.interactionContext.revision + 1,
+        source_event_id: 'newer-source',
+      });
+    }
+    const before = JSON.stringify(await store.getJob(streamId));
+    const publicErrors = jest.spyOn(transport, 'emitError');
+    const publicFinals = jest.spyOn(transport, 'emitDone');
+    if (shouldFailRevoked) expect(manager.hasLocalNativeResponseProducer(identity)).toBe(true);
+    const req = makeReq();
+    if (mode === 'current_voice') {
+      req.viventiumCallSession = { callSessionId: 'call-1' };
+      req.body.voiceMode = true;
+      req.body.viventiumVoiceTaskId = 'task-1';
+      req.body.streamId = streamId;
+    }
+    if (mode === 'current_telegram') {
+      req._viventiumTelegram = true;
+      req.body.viventiumSurface = 'telegram';
+      req.body.streamId = streamId;
+    }
+    if (mode !== 'non_native') req._viventiumNativeResponseIdentity = supplied;
+    const code =
+      mode === 'untyped'
+        ? undefined
+        : mode === 'different_error'
+          ? 'source_context_unavailable'
+          : 'native_response_message_deleted';
+    const error = Object.assign(new Error('native_response_message_deleted'), code ? { code } : {});
+    const client = makeClient(Promise.resolve());
+    client.sendMessage.mockRejectedValueOnce(error);
+    mockGenerationJobManager.createJob.mockResolvedValueOnce({
+      createdAt: job.createdAt,
+      abortController: { signal: { aborted: false }, abort: jest.fn() },
+      readyPromise: Promise.resolve(),
+      emitter: new EventEmitter(),
+    });
+    mockGenerationJobManager.getJob.mockImplementation(async () => ({ createdAt: job.createdAt }));
+    // Use the actual identity fence and producer cleanup for revoked and Stop owners. Other
+    // refusals keep generic finalization mocked to isolate this candidate's store mutation.
+    mockGenerationJobManager.failRevokedNativeResponse.mockImplementationOnce((...args) =>
+      manager.failRevokedNativeResponse(...args),
+    );
+    if (shouldFailRevoked || mode === 'stopped') {
+      mockGenerationJobManager.completeJob.mockImplementationOnce((...args) =>
+        manager.completeJob(...args),
+      );
+    }
+    await AgentController(
+      req,
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => ({ client })),
+      jest.fn(),
+    );
+    await jest.advanceTimersByTimeAsync(120);
+    await Promise.resolve();
+    if (shouldFailRevoked) {
+      expect(await store.getJob(streamId)).toMatchObject({
+        status: 'error',
+        error: 'The model provider could not complete this request.',
+      });
+      expect(publicErrors).toHaveBeenCalledTimes(1);
+      expect(publicErrors).toHaveBeenCalledWith(
+        streamId,
+        'The model provider could not complete this request.',
+      );
+      expect(mockGenerationJobManager.emitError).not.toHaveBeenCalled();
+      expect(manager.hasLocalNativeResponseProducer(identity)).toBe(false);
+    } else {
+      expect(JSON.stringify(await store.getJob(streamId))).toBe(before);
+      expect(publicErrors).not.toHaveBeenCalled();
+      expect(mockGenerationJobManager.emitError).toHaveBeenCalled();
+    }
+    expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith(
+      streamId,
+      mode === 'different_error'
+        ? 'The conversation context could not be preserved. Please retry this turn.'
+        : 'The model provider could not complete this request.',
+    );
+    expect(publicFinals).not.toHaveBeenCalled();
+    if (mode === 'stopped') {
+      expect((await store.getJob(streamId)).finalEvent).toBe(JSON.parse(before).finalEvent);
+    }
+    if (['untyped', 'different_error', 'non_native', 'other_stream'].includes(mode)) {
+      expect(mockGenerationJobManager.failRevokedNativeResponse).not.toHaveBeenCalled();
+    } else if (shouldFailRevoked) {
+      expect(mockGenerationJobManager.failRevokedNativeResponse).toHaveBeenCalledWith(
+        supplied,
+        'The model provider could not complete this request.',
+      );
+    }
+    if (mode === 'other_stream') {
+      expect(await store.getJob('another-stream')).toMatchObject({ status: 'running' });
+    }
+    expect(JSON.stringify(publicErrors.mock.calls)).not.toContain(
+      'native_response_message_deleted',
+    );
+    mockGenerationJobManager.getJob.mockResolvedValue({ createdAt: 1 });
+    mockGenerationJobManager.failRevokedNativeResponse.mockReset();
+  });
 
   test.each([
     ['a source change revoked it before it finished', { status: 'cancelled' }, true],
@@ -1672,6 +2195,12 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       unfinished: true,
       'metadata.viventium.interactionContext.logical_turn_id': 'logical-a-c',
       'metadata.viventium.interactionContext.revision': 1,
+      $nor: [
+        {
+          'nativeResponse.status': 'cancelled',
+          'nativeResponse.stopSnapshotStoredAt': { $gt: 0 },
+        },
+      ],
     });
     expect(mockConversationUpdateOne).toHaveBeenCalledWith(
       { user: 'user-1', conversationId: 'conv-1' },
@@ -2439,5 +2968,48 @@ describe('rapid input before asynchronous initialization', () => {
     expect(resolve(expiredA)).toBe(resolve(expiredB));
     expect(resolve(expiredA)).not.toBe('previous-chat');
     expect(resolve(expiredA)).not.toBe(resolve(a));
+  });
+});
+
+describe('Voice file delivery outcome', () => {
+  const outcome = AgentController.__testables.voiceGenerationOutcome;
+  const unavailable = { nativeOutputFile: { version: 1, status: 'unavailable' } };
+
+  test.each([
+    ['unavailable', [unavailable]],
+    ['mixed', [{ file_id: 'delivered-file' }, unavailable]],
+  ])('keeps the result and exposes the %s delivery failure', (_name, attachments) => {
+    const response = { messageId: 'file-result', attachments };
+    const before = JSON.stringify(response);
+    expect(outcome(response)).toEqual({
+      resultMessageId: 'file-result',
+      deliveryError: { code: 'native_output_file_unavailable' },
+    });
+    expect(response.attachments).toBe(attachments);
+    expect(JSON.stringify(response)).toBe(before);
+  });
+
+  test.each([
+    undefined,
+    [{ file_id: 'delivered-file' }],
+    [{ nativeOutputFile: { version: 2, status: 'unavailable' } }],
+    [{ nativeOutputFile: { version: 1, status: 'available' } }],
+  ])('preserves normal completion for attachments %j', (attachments) => {
+    expect(outcome({ messageId: 'file-result', attachments })).toEqual({
+      resultMessageId: 'file-result',
+    });
+  });
+
+  test('preserves the primary terminal failure when a file is also unavailable', () => {
+    expect(
+      outcome({
+        messageId: 'file-result',
+        attachments: [unavailable],
+        content: [{ type: 'error', error_class: 'provider_timeout', error: 'Provider timed out.' }],
+      }),
+    ).toEqual({
+      resultMessageId: 'file-result',
+      error: { code: 'provider_timeout', message: 'Provider timed out.' },
+    });
   });
 });

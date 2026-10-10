@@ -35,6 +35,9 @@ jest.mock('@librechat/api', () => ({
     deferGlassHiveTerminalCallbackAfterCommit: jest.fn(() => false),
   })),
   initializeAgent: jest.fn(),
+  initializeCustom: jest.fn((...args) =>
+    jest.requireActual('@librechat/api').initializeCustom(...args),
+  ),
   initializeAnthropic: jest.fn(async ({ model_parameters }) => ({
     llmConfig: {
       provider: 'anthropic',
@@ -80,6 +83,10 @@ jest.mock('@librechat/api', () => ({
     getTokenCount: jest.fn(() => 1),
   },
   /* === VIVENTIUM NOTE === */
+}));
+
+jest.mock('~/server/services/viventium/VoiceOrchestrationTraceService', () => ({
+  recordVoiceRequestTrace: jest.fn(async () => null),
 }));
 
 jest.mock('~/server/services/Config/app', () => ({
@@ -131,11 +138,7 @@ jest.mock('~/server/controllers/ModelController', () => ({
 }));
 
 jest.mock('~/server/services/viventium/GlassHiveConversationProviderService', () => {
-  const actual = jest.requireActual(
-    '~/server/services/viventium/GlassHiveConversationProviderService',
-  );
   return {
-    CORTEX_ATTEMPT_DEADLINE_REASON: actual.CORTEX_ATTEMPT_DEADLINE_REASON,
     attachConversationProviderCapabilityBundle: jest.fn(async () => true),
     // The real cancellation and release delivery: exact keys, owner and capacity-release answer.
     bindHarnessCancellation: jest.fn((args) =>
@@ -279,6 +282,9 @@ const {
   captureMainContextSnapshot,
 } = require('~/server/services/viventium/ViventiumMainContextService');
 const { setTrustedInteractionContext } = require('~/server/services/viventium/interactionContext');
+const {
+  recordVoiceRequestTrace,
+} = require('~/server/services/viventium/VoiceOrchestrationTraceService');
 
 const priorPromptBundlePath = process.env[PROMPT_BUNDLE_ENV];
 const defaultPromptBundleDir = fs.mkdtempSync(
@@ -311,6 +317,315 @@ test('treats an interactive-priority maintenance yield as an intentional cortex 
   controller.abort('maintenance_yield');
 
   expect(isBackgroundCortexCancellationSignal(controller.signal)).toBe(true);
+});
+
+describe('owner-cancelled cortex terminal projection', () => {
+  const {
+    upsertCortexParts,
+  } = require('~/server/services/viventium/BackgroundCortexFollowUpService');
+  const { hasActiveCortexParts } = require('~/server/services/viventium/cortexMessageState');
+  const activation = {
+    agentId: 'cancelled-specialist',
+    cortexName: 'Specialist',
+    confidence: 1,
+    reason: 'activation_mode_always',
+  };
+  const makeParams = (controller, onCortexComplete) => ({
+    req: { user: { id: 'cancel-owner' }, _viventiumVoiceAbortSignal: controller.signal },
+    res: null,
+    mainAgent: { provider: 'agents' },
+    messages: [{ role: 'user', content: 'Review the supplied evidence.' }],
+    runId: 'cancel-parent',
+    conversationId: 'cancel-conversation',
+    activatedCortices: [activation],
+    onCortexComplete,
+  });
+  const agent = {
+    id: activation.agentId,
+    name: activation.cortexName,
+    provider: 'openai',
+    fallback_llm_provider: 'anthropic',
+    fallback_llm_model: 'synthetic-fallback',
+  };
+
+  test.each(
+    ['user_cancelled', 'maintenance_yield'].flatMap((reason) =>
+      ['none', 'released', 'unresolved'].map((nativeOwnership) => [reason, nativeOwnership]),
+    ),
+  )(
+    'settled %s preserves terminal truth for native ownership %s',
+    async (reason, nativeOwnership) => {
+      const controller = new AbortController();
+      let content = [{ type: 'text', text: 'Original canonical answer.' }];
+      const onCortexComplete = jest.fn((payload) => {
+        content = upsertCortexParts(content, [{ type: 'cortex_insight', ...payload }]);
+      });
+      const onAllComplete = jest.fn();
+      const executeCortexFn = jest.fn(async () => {
+        controller.abort(reason);
+        return {
+          agentId: activation.agentId,
+          agentName: activation.cortexName,
+          insight: null,
+          error: 'The attempt was stopped.',
+          errorClass: 'background_agent_error',
+          nativeOwnership,
+          completedToolCalls: 1,
+        };
+      });
+      const result = await executeActivated(
+        {
+          ...makeParams(controller, onCortexComplete),
+          onAllComplete,
+          onCortexBrewing: (payload) => {
+            content = upsertCortexParts(content, [{ type: 'cortex_brewing', ...payload }]);
+          },
+        },
+        {
+          loadAgentFn: jest.fn(async () => agent),
+          loadModelsConfigFn: jest.fn(async () => ({})),
+          resolveFallbackAgentFn: jest.fn(async () => ({ ...agent, model: 'synthetic-fallback' })),
+          executeCortexFn,
+        },
+      );
+
+      expect(result).toEqual({ insights: [], cancelled: true });
+      expect(executeCortexFn).toHaveBeenCalledTimes(1);
+      expect(onAllComplete).not.toHaveBeenCalled();
+      expect(onCortexComplete).toHaveBeenCalledTimes(1);
+      const part = content.find((entry) => entry.cortex_id === activation.agentId);
+      expect(part).toMatchObject({
+        type: 'cortex_insight',
+        status: nativeOwnership === 'unresolved' ? 'error' : 'cancelled',
+      });
+      expect(part).not.toHaveProperty('insight');
+      if (nativeOwnership === 'unresolved') {
+        expect(part).toMatchObject({
+          error_code: 'native_release_unconfirmed',
+          error_class: 'background_agent_error',
+        });
+      } else {
+        expect(part).toMatchObject({ silent: true, no_response: true });
+        expect(part).not.toHaveProperty('error');
+      }
+      expect(hasActiveCortexParts([part])).toBe(false);
+      expect(content[0]).toEqual({ type: 'text', text: 'Original canonical answer.' });
+      expect(recordVoiceRequestTrace).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          stage: 'cortex.completed',
+          facts: expect.objectContaining({
+            cortexStatus: nativeOwnership === 'unresolved' ? 'unresolved' : 'cancelled',
+          }),
+        }),
+      );
+    },
+  );
+
+  test.each(['user_cancelled', 'maintenance_yield'])(
+    '%s before execution retires activation without loading tools',
+    async (reason) => {
+      const controller = new AbortController();
+      controller.abort(reason);
+      const onCortexComplete = jest.fn();
+      const loadAgentFn = jest.fn();
+      const executeCortexFn = jest.fn();
+      const result = await executeActivated(makeParams(controller, onCortexComplete), {
+        loadAgentFn,
+        executeCortexFn,
+      });
+      expect(result).toEqual({ insights: [], cancelled: true });
+      expect(loadAgentFn).not.toHaveBeenCalled();
+      expect(executeCortexFn).not.toHaveBeenCalled();
+      expect(onCortexComplete).toHaveBeenCalledTimes(1);
+      expect(onCortexComplete).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cortex_id: activation.agentId,
+          status: 'cancelled',
+          silent: true,
+          no_response: true,
+        }),
+      );
+    },
+  );
+
+  test('Stop during agent loading does not begin fallback or tool execution', async () => {
+    const controller = new AbortController();
+    const onCortexComplete = jest.fn();
+    const executeCortexFn = jest.fn();
+    const resolveFallbackAgentFn = jest.fn();
+    const loadModelsConfigFn = jest.fn();
+    await executeActivated(makeParams(controller, onCortexComplete), {
+      loadAgentFn: jest.fn(async () => {
+        controller.abort('user_cancelled');
+        return agent;
+      }),
+      loadModelsConfigFn,
+      resolveFallbackAgentFn,
+      executeCortexFn,
+    });
+    expect(executeCortexFn).not.toHaveBeenCalled();
+    expect(resolveFallbackAgentFn).not.toHaveBeenCalled();
+    expect(loadModelsConfigFn).not.toHaveBeenCalled();
+    expect(onCortexComplete).toHaveBeenCalledTimes(1);
+    expect(onCortexComplete).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'cancelled', silent: true, no_response: true }),
+    );
+  });
+
+  test('Stop during fallback configuration does not start an attempt', async () => {
+    const controller = new AbortController();
+    const onCortexComplete = jest.fn();
+    const executeCortexFn = jest.fn();
+    await executeActivated(makeParams(controller, onCortexComplete), {
+      loadAgentFn: jest.fn(async () => agent),
+      loadModelsConfigFn: jest.fn(async () => {
+        controller.abort('maintenance_yield');
+        return {};
+      }),
+      resolveFallbackAgentFn: jest.fn(async () => null),
+      executeCortexFn,
+    });
+    expect(executeCortexFn).not.toHaveBeenCalled();
+    expect(onCortexComplete).toHaveBeenCalledTimes(1);
+    expect(onCortexComplete).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'cancelled', silent: true, no_response: true }),
+    );
+  });
+
+  test('a genuine earlier failure keeps its trace after Stop cancels a later cortex', async () => {
+    const controller = new AbortController();
+    const laterActivation = { ...activation, agentId: 'later-specialist' };
+    let reportFirstCompletion;
+    const firstCompletion = new Promise((resolve) => {
+      reportFirstCompletion = resolve;
+    });
+    let settleLater;
+    const laterResult = new Promise((resolve) => {
+      settleLater = resolve;
+    });
+    const onCortexComplete = jest.fn((payload) => {
+      if (payload.cortex_id === activation.agentId) reportFirstCompletion();
+    });
+    const execution = executeActivated(
+      {
+        ...makeParams(controller, onCortexComplete),
+        activatedCortices: [activation, laterActivation],
+      },
+      {
+        loadAgentFn: jest.fn(async ({ agent_id }) => ({
+          ...agent,
+          id: agent_id,
+          fallback_llm_provider: undefined,
+        })),
+        executeCortexFn: jest.fn(async ({ agent: runningAgent }) => {
+          if (runningAgent.id === laterActivation.agentId) return laterResult;
+          return {
+            agentId: activation.agentId,
+            insight: null,
+            error: 'Provider unavailable',
+            errorClass: 'provider_unavailable',
+            nativeOwnership: 'none',
+          };
+        }),
+      },
+    );
+    await firstCompletion;
+    expect(onCortexComplete).toHaveBeenCalledWith(
+      expect.objectContaining({ cortex_id: activation.agentId, status: 'error' }),
+    );
+    controller.abort('user_cancelled');
+    settleLater({
+      agentId: laterActivation.agentId,
+      insight: null,
+      error: 'Stopped',
+      nativeOwnership: 'released',
+    });
+    await execution;
+    expect(onCortexComplete).toHaveBeenCalledTimes(2);
+    expect(recordVoiceRequestTrace).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        stage: 'cortex.completed',
+        facts: expect.objectContaining({ cortexRef: activation.agentId, cortexStatus: 'failed' }),
+      }),
+    );
+    expect(recordVoiceRequestTrace).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        stage: 'cortex.completed',
+        facts: expect.objectContaining({
+          cortexRef: laterActivation.agentId,
+          cortexStatus: 'cancelled',
+        }),
+      }),
+    );
+  });
+
+  test('generation_completed leaves accepted detached results intact', async () => {
+    const controller = new AbortController();
+    controller.abort('generation_completed');
+    const onCortexComplete = jest.fn();
+    const onAllComplete = jest.fn();
+    const executeCortexFn = jest.fn(async () => ({
+      agentId: activation.agentId,
+      agentName: activation.cortexName,
+      insight: 'A useful accepted result.',
+      nativeOwnership: 'ended',
+    }));
+    await executeActivated(
+      { ...makeParams(controller, onCortexComplete), onAllComplete },
+      {
+        loadAgentFn: jest.fn(async () => ({ ...agent, fallback_llm_provider: undefined })),
+        executeCortexFn,
+      },
+    );
+    expect(executeCortexFn).toHaveBeenCalledTimes(1);
+    expect(onCortexComplete).toHaveBeenCalledTimes(1);
+    expect(onCortexComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'complete',
+        insight: 'A useful accepted result.',
+      }),
+    );
+    expect(onAllComplete).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(['A useful accepted result.', ''])(
+    'an already accepted result survives a later owner Stop: %j',
+    async (insight) => {
+      const controller = new AbortController();
+      const onCortexComplete = jest.fn();
+      await executeActivated(makeParams(controller, onCortexComplete), {
+        loadAgentFn: jest.fn(async () => ({ ...agent, fallback_llm_provider: undefined })),
+        executeCortexFn: jest.fn(async () => {
+          controller.abort('user_cancelled');
+          return {
+            agentId: activation.agentId,
+            agentName: activation.cortexName,
+            insight,
+            nativeOwnership: 'ended',
+          };
+        }),
+      });
+      expect(onCortexComplete).toHaveBeenCalledTimes(1);
+      expect(onCortexComplete).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'complete',
+          insight,
+          silent: !insight,
+          no_response: !insight,
+        }),
+      );
+      expect(recordVoiceRequestTrace).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          stage: 'cortex.completed',
+          facts: expect.objectContaining({ cortexStatus: insight ? 'completed' : 'no_insight' }),
+        }),
+      );
+    },
+  );
 });
 
 test('broad harness rejects a wrong delivery key and malformed ledger acceptance', () => {
@@ -452,10 +767,7 @@ describe('BackgroundCortexService GlassHive request identity', () => {
 
     await prepareCortexConversationProviderCapability({
       targetAgent: {
-        model_parameters: {
-          apiKey: endpointConfig.apiKey,
-          configuration: { baseURL: endpointConfig.baseURL },
-        },
+        model_parameters: { apiKey: endpointConfig.apiKey, configuration: endpointConfig },
       },
       declaredAgent: { provider: 'glasshive-harness' },
       req,
@@ -1966,6 +2278,13 @@ describe('BackgroundCortexService.checkCortexActivation', () => {
 describe('BackgroundCortexService.executeCortex', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    initializeAgent.mockReset();
+    createRun.mockReset();
+    getDefaultHandlers.mockReset().mockImplementation(() => ({}));
+    createContentAggregator.mockReset().mockImplementation(() => ({
+      contentParts: [],
+      aggregateContent: jest.fn(),
+    }));
   });
 
   test('reports native capacity release after an active direct cortex yields to Main', async () => {
@@ -2199,6 +2518,37 @@ describe('BackgroundCortexService.executeCortex', () => {
         json: jest.fn().mockResolvedValue({ capacityReleased }),
       }));
     }
+
+    test.each([true, false])(
+      'ordinary Stop asks the existing exact release seam after its transport ACK: %s',
+      async (capacityReleased) => {
+        const ownerController = new AbortController();
+        const fetchSpy = releaseAnswers(capacityReleased);
+        initializeAgent.mockResolvedValueOnce(nativeAgent());
+        createRun.mockResolvedValueOnce({
+          processStream: jest.fn(async () => {
+            ownerController.abort('user_cancelled');
+            throw Object.assign(new Error('Stopped'), { name: 'AbortError' });
+          }),
+        });
+        const call = nativeCall(`native-stop-${capacityReleased}`);
+        call.req._viventiumVoiceAbortSignal = ownerController.signal;
+        try {
+          const result = await executeCortex(call);
+          expect(result.nativeOwnership).toBe(capacityReleased ? 'released' : 'unresolved');
+          expect(createRun).toHaveBeenCalledTimes(1);
+          expect(result.fallbackUsed).toBeUndefined();
+          expect(fetchSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+          for (const [url, options] of fetchSpy.mock.calls) {
+            expect(url).toBe(cancelUrl(call.runId));
+            expect(options.headers['X-Viventium-User-Id']).toBe(call.req.user.id);
+            expect(options.signal).not.toBe(ownerController.signal);
+          }
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      },
+    );
 
     test('a deadline-aborted request with no output and a failed release gets no fallback', async () => {
       const fetchSpy = jest
@@ -4736,3 +5086,180 @@ describe('BackgroundCortexService.executeCortex', () => {
   });
   /* === VIVENTIUM NOTE === */
 });
+
+/* === VIVENTIUM START === Direct classifier signed-body transport parity. === */
+describe('direct activation signed bootstrap body dispatch', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    clearActivationCooldowns();
+    clearActivationProviderHealth();
+  });
+  test.each(['native', 'non-native', 'absent', 'conflicting'])(
+    '%s preserves the configured fetch and body-hash order',
+    async (mode) => {
+      const api = require('@librechat/api');
+      const encoded = Buffer.from(
+        JSON.stringify({
+          version: 1,
+          selected_uploads: [
+            { file_id: 'alpha', text: 'A'.repeat(200 * 1024) },
+            { file_id: 'bravo', text: 'B'.repeat(200 * 1024) },
+          ],
+        }),
+      ).toString('base64');
+      const headers = {
+        ...(mode === 'non-native' ? {} : { 'X-GlassHive-Agent-Id': 'synthetic-classifier' }),
+        ...(mode === 'absent' ? {} : { 'X-GlassHive-Bootstrap-Bundle-B64': encoded }),
+        'X-GlassHive-Bootstrap-Timestamp': '123',
+        'X-GlassHive-Bootstrap-Signature': 'synthetic-signature',
+        'X-Synthetic-Keep': 'keep',
+      };
+      const sent = [];
+      const admitted = [];
+      const context = {
+        userId: 'owner',
+        conversationId: 'conversation',
+        responseMessageId: 'answer',
+        streamId: 'stream',
+        jobCreatedAt: 1,
+        logicalTurnId: 'scope.turn',
+        revision: 1,
+        providerId: 'native',
+        agentId: 'classifier',
+        source: { id: 'source', messageId: 'question', digest: 'digest' },
+      };
+      const bound = api.createNativeResponseFetch(
+        async (_input, init) => {
+          sent.push(init);
+          return new Response('{}', { headers: { 'content-type': 'application/json' } });
+        },
+        async () => context,
+        async (identity) => {
+          admitted.push(identity);
+          return false;
+        },
+        () => {},
+      );
+      const configuration = {
+        baseURL: 'https://native.example.test/v1',
+        defaultHeaders: headers,
+        fetch: bound,
+      };
+      api.initializeCustom.mockResolvedValueOnce({
+        llmConfig: { model: 'synthetic-model', reasoning_effort: 'high' },
+        configOptions: configuration,
+      });
+      Run.create.mockResolvedValueOnce({
+        processStream: jest.fn(async () =>
+          JSON.stringify({
+            should_activate: true,
+            confidence: 0.9,
+            reason: 'Relevant evidence.',
+          }),
+        ),
+      });
+      const result = await checkCortexActivation({
+        cortexConfig: {
+          agent_id: 'synthetic-cortex',
+          activation: {
+            enabled: true,
+            provider: 'synthetic-custom',
+            model: 'synthetic-model',
+            reasoning_effort: 'high',
+            prompt: 'Review the evidence.',
+          },
+        },
+        messages: [{ role: 'user', content: 'Review.' }],
+        runId: 'synthetic-classifier',
+        req: {
+          body: {},
+          user: { id: 'synthetic-owner', role: 'USER' },
+          config: {
+            endpoints: {
+              custom: [{ name: 'synthetic-custom' }],
+              agents: {
+                providerCapabilities: { 'synthetic-custom': { activation_classifier: true } },
+              },
+            },
+          },
+        },
+      });
+      expect(result).toMatchObject({ shouldActivate: true, reasoningEffortUsed: 'high' });
+      const selected = Run.create.mock.calls[0][0].graphConfig.llmConfig;
+      expect(selected.configuration).toBe(configuration);
+      if (mode === 'non-native') expect(selected.configuration.fetch).toBe(bound);
+      const body = JSON.stringify({
+        model: 'synthetic-model',
+        messages: [{ role: 'user', content: 'Review.' }],
+        metadata: {
+          retain: 'original',
+          ...(mode === 'conflicting' ? { bootstrap_bundle_b64: 'other' } : {}),
+        },
+      });
+      const init = {
+        method: 'POST',
+        headers: { ...headers, 'content-length': String(Buffer.byteLength(body)) },
+        body,
+      };
+      if (mode === 'conflicting') {
+        await expect(
+          selected.configuration.fetch('https://native.example.test/v1/chat/completions', init),
+        ).rejects.toThrow('Native bootstrap must use one carrier');
+        expect(sent).toHaveLength(0);
+        expect(admitted).toHaveLength(0);
+        return;
+      }
+      await selected.configuration.fetch('https://native.example.test/v1/chat/completions', init);
+      await selected.configuration.fetch('https://native.example.test/v1/chat/completions', init);
+      const wireHeaders = new Headers(sent[0].headers);
+      const payload = JSON.parse(sent[0].body);
+      if (mode === 'native') {
+        expect(wireHeaders.has('X-GlassHive-Bootstrap-Bundle-B64')).toBe(false);
+        expect(wireHeaders.has('content-length')).toBe(false);
+        expect(payload.metadata.retain).toBe('original');
+        expect(payload.metadata.bootstrap_bundle_b64 === encoded).toBe(true);
+      } else {
+        expect(payload.metadata.retain).toBe('original');
+        expect(payload.metadata.bootstrap_bundle_b64).toBeUndefined();
+        expect(wireHeaders.get('X-GlassHive-Bootstrap-Bundle-B64')).toBe(
+          mode === 'absent' ? null : encoded,
+        );
+      }
+      expect(wireHeaders.get('X-GlassHive-Bootstrap-Signature')).toBe('synthetic-signature');
+      expect(wireHeaders.get('X-GlassHive-Bootstrap-Timestamp')).toBe('123');
+      expect(wireHeaders.get('X-Synthetic-Keep')).toBe('keep');
+      expect(payload.messages).toEqual([{ role: 'user', content: 'Review.' }]);
+      expect(admitted[0].bodySha256).toBe(
+        crypto.createHash('sha256').update(sent[0].body).digest('hex'),
+      );
+      expect(admitted[1].invocationId).toBe(admitted[0].invocationId);
+      expect(sent[1].body).toBe(sent[0].body);
+    },
+  );
+});
+/* === VIVENTIUM END === */
+/* === VIVENTIUM START === Transport reuse does not enable a forbidden classifier. === */
+test('signed body support preserves the declared activation capability denial', async () => {
+  jest.clearAllMocks();
+  await expect(
+    require('~/server/services/BackgroundCortexService').buildActivationLlmConfig({
+      providerName: 'synthetic-native',
+      model: 'synthetic-model',
+      reasoning_effort: 'high',
+      req: {
+        body: {},
+        user: { id: 'synthetic-owner' },
+        config: {
+          endpoints: {
+            agents: {
+              providerCapabilities: { 'synthetic-native': { activation_classifier: false } },
+            },
+          },
+        },
+      },
+    }),
+  ).rejects.toThrow('cannot run activation classification');
+  expect(require('@librechat/api').initializeCustom).not.toHaveBeenCalled();
+  expect(Run.create).not.toHaveBeenCalled();
+});
+/* === VIVENTIUM END === */

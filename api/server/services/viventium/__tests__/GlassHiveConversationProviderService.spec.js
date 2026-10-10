@@ -57,6 +57,103 @@ const {
 } = require('../GlassHiveConversationProviderService');
 
 describe('GlassHiveConversationProviderService', () => {
+  describe('read-only text compactor signed zero-tool capability', () => {
+    function args() {
+      const targetAgent = {
+        provider: 'synthetic-native',
+        tools: [],
+        model_parameters: {
+          configuration: {
+            defaultHeaders: {
+              'X-GlassHive-Access': 'read_only',
+              'X-GlassHive-Provider-Session-Mode': 'stateless',
+            },
+          },
+        },
+      };
+      return {
+        targetAgent,
+        declaredAgent: targetAgent,
+        req: { user: { id: 'owner-synthetic' }, body: {} },
+        capability: { workspace_binding: true },
+        nativeTools: false,
+      };
+    }
+    test('signs only native false and retains read-only exact session scope', async () => {
+      const input = args();
+      expect(await attachConversationProviderCapabilityBundle(input)).toBe(true);
+      const headers = input.targetAgent.model_parameters.configuration.defaultHeaders;
+      const encoded = headers['X-GlassHive-Bootstrap-Bundle-B64'];
+      expect(JSON.parse(Buffer.from(encoded, 'base64').toString())).toEqual({
+        provider_capabilities: { native_tools: false },
+      });
+      expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(
+        'sha256=' +
+          crypto
+            .createHmac('sha256', 'synthetic-bundle-secret')
+            .update(`v1\n${headers['X-GlassHive-Bootstrap-Timestamp']}\n${encoded}`)
+            .digest('hex'),
+      );
+      expect(headers['X-GlassHive-Access']).toBe('read_only');
+      expect(headers['X-GlassHive-Provider-Session-Mode']).toBe('stateless');
+      expect(buildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
+      expect(getMessages).not.toHaveBeenCalled();
+    });
+    test('re-signs at the existing invocation refresh boundary', async () => {
+      const input = args();
+      const now = jest.spyOn(Date, 'now').mockReturnValue(1700000000000);
+      try {
+        await attachConversationProviderCapabilityBundle(input);
+        expect(installConversationProviderCapabilityRefresher(input)).toBe(true);
+        const before = input.targetAgent.model_parameters.configuration.defaultHeaders;
+        now.mockReturnValue(1700000010000);
+        const result = await input.targetAgent.viventiumConversationProviderCapabilityRefresh({
+          messageId: 'fresh-attempt',
+        });
+        expect(result.attached).toBe(true);
+        expect(result.defaultHeaders['X-GlassHive-Bootstrap-Timestamp']).toBe('1700000010');
+        expect(result.defaultHeaders['X-GlassHive-Bootstrap-Signature']).not.toBe(
+          before['X-GlassHive-Bootstrap-Signature'],
+        );
+      } finally {
+        now.mockRestore();
+      }
+    });
+    test.each([
+      ['tools', ['synthetic-tool']],
+      ['declaredToolNames', ['synthetic-tool']],
+      ['toolDefinitions', [{ function: { name: 'synthetic-tool' } }]],
+      ['toolRegistry', new Map([['synthetic-tool', {}]])],
+      ['mcp', ['synthetic-server']],
+      ['agent_ids', ['synthetic-peer']],
+      ['edges', [{ from: 'a', to: 'b' }]],
+    ])('rejects nonzero %s instead of dropping authority', async (key, value) => {
+      const input = args();
+      input.declaredAgent = { [key]: value };
+      await expect(attachConversationProviderCapabilityBundle(input)).rejects.toThrow(
+        'requires a tool-less participant',
+      );
+      expect(input.targetAgent.model_parameters.configuration.defaultHeaders).not.toHaveProperty(
+        'X-GlassHive-Bootstrap-Signature',
+      );
+    });
+    test('unsigned request body cannot opt an ordinary participant into zero-tool mode', async () => {
+      const input = args();
+      delete input.nativeTools;
+      input.req.body.nativeTools = false;
+      input.req.body.provider_capabilities = { native_tools: false };
+      expect(await attachConversationProviderCapabilityBundle(input)).toBe(false);
+      expect(input.targetAgent.model_parameters.configuration.defaultHeaders).not.toHaveProperty(
+        'X-GlassHive-Bootstrap-Signature',
+      );
+    });
+    test('nonboolean internal declaration fails closed', async () => {
+      await expect(
+        attachConversationProviderCapabilityBundle({ ...args(), nativeTools: 'false' }),
+      ).rejects.toThrow('must be a boolean');
+    });
+  });
+
   const originalBrokerSecret = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
 
   beforeEach(() => {
@@ -64,6 +161,58 @@ describe('GlassHiveConversationProviderService', () => {
     getMessages.mockResolvedValue([]);
     getFiles.mockResolvedValue([]);
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-bundle-secret';
+  });
+
+  test('signs selected prior native outputs using current owner File metadata', async () => {
+    const fileId = 'native_' + 'a'.repeat(64);
+    const conversationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const parentMessageId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const earlier = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    const sibling = 'native_' + 'b'.repeat(64);
+    getMessages.mockResolvedValue([
+      { messageId: parentMessageId, parentMessageId: earlier },
+      { messageId: earlier, attachments: [null, { file_id: fileId, filename: 'stale.txt' }] },
+      { messageId: 'another-branch', attachments: [{ file_id: sibling }] },
+    ]);
+    getFiles.mockResolvedValue([
+      { file_id: fileId, filename: 'selected.txt', type: 'text/plain', bytes: 19, source: 'local' },
+    ]);
+    buildConversationProviderBootstrapBundle.mockResolvedValue({});
+    const targetAgent = { model_parameters: {} };
+    const req = { user: { id: 'owner-a' }, body: { conversationId, parentMessageId, files: [] } };
+    expect(
+      await attachConversationProviderCapabilityBundle({
+        targetAgent,
+        req,
+        capability: { workspace_binding: true, worker_native_tools: true },
+      }),
+    ).toBe(true);
+    const headers = targetAgent.model_parameters.configuration.defaultHeaders;
+    const encoded = headers['X-GlassHive-Bootstrap-Bundle-B64'];
+    const bundle = JSON.parse(Buffer.from(encoded, 'base64').toString());
+    expect(bundle.viventium_upload_context.selected_uploads).toEqual([
+      {
+        file_id: fileId,
+        filename: 'selected.txt',
+        type: 'text/plain',
+        bytes: 19,
+        source: 'local',
+        media_group_index: 0,
+      },
+    ]);
+    expect(getFiles).toHaveBeenCalledWith(
+      { user: 'owner-a', file_id: { $in: [fileId] } },
+      null,
+      'file_id filename type bytes source context text',
+    );
+    expect(req.body.files).toEqual([]);
+    expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(
+      'sha256=' +
+        crypto
+          .createHmac('sha256', 'synthetic-bundle-secret')
+          .update('v1\n' + headers['X-GlassHive-Bootstrap-Timestamp'] + '\n' + encoded)
+          .digest('hex'),
+    );
   });
 
   test('signs the minimal native restriction with the existing bootstrap protocol', () => {
@@ -248,12 +397,12 @@ describe('GlassHiveConversationProviderService', () => {
       expect(req.body.files).toEqual(currentFiles);
       expect(getMessages).toHaveBeenCalledWith(
         { user: 'owner', conversationId },
-        'messageId parentMessageId files',
+        'messageId parentMessageId files attachments',
       );
       expect(getFiles).toHaveBeenCalledWith(
         { user: 'owner', file_id: { $in: [historical.file_id] } },
         null,
-        'file_id filename type bytes source context',
+        'file_id filename type bytes source context text',
       );
       const encoded =
         targetAgent.model_parameters.configuration.defaultHeaders[
@@ -2258,12 +2407,44 @@ describe('superseded Main family release probe', () => {
     expect(fetchImpl.mock.calls.map(([url]) => url)).toEqual([
       'http://glasshive.test/v1/requests/by-idempotency/main%3Aresponse-a/cancel',
       'http://glasshive.test/v1/requests/by-idempotency/main-fallback%3Aresponse-a/cancel',
+      'http://glasshive.test/v1/requests/by-idempotency/response-a/cancel',
     ]);
     expect(fetchImpl.mock.calls[0][1]).toMatchObject({
       method: 'POST',
       headers: { Authorization: 'Bearer provider-key', 'X-Viventium-User-Id': 'owner-1' },
     });
   });
+
+  test.each([false, true])(
+    'checks a tool-less response-id family before reporting release (released=%s)',
+    async (capacityReleased) => {
+      const fetchImpl = jest.fn(async (url, request) => {
+        expect(request.headers['X-Viventium-User-Id']).toBe('owner-1');
+        const bareResponse = url.endsWith('/response-a/cancel');
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            state: 'cancelled',
+            capacityReleased: bareResponse ? capacityReleased : true,
+            responseTimeoutS: 660,
+          }),
+        };
+      });
+      await expect(
+        probeHarnessFamilyRelease({
+          baseURL: 'http://glasshive.test/v1',
+          apiKey: 'provider-key',
+          ownerId: 'owner-1',
+          messageId: 'response-a',
+          fetchImpl,
+        }),
+      ).resolves.toEqual({ released: capacityReleased, reachable: true, responseTimeoutS: 660 });
+      expect(fetchImpl.mock.calls.map(([url]) => url)).toContain(
+        'http://glasshive.test/v1/requests/by-idempotency/response-a/cancel',
+      );
+    },
+  );
 
   test('never reports release while execution is retained, unreachable or unscoped', async () => {
     const pending = released(false);
@@ -2303,6 +2484,757 @@ describe('native Voice input binding', () => {
   const authorityService = require('../VoiceWorkAuthorityService');
   beforeEach(() => tasks.resetVoiceTasksForTests());
 
+  function cancellationBinding() {
+    const task = tasks.createVoiceTask({
+      userId: 'owner-native',
+      callSessionId: 'call-native',
+      streamId: 'stream-native',
+      owner: { kind: 'remote_generation', id: 'stream-native' },
+    });
+    const controller = new AbortController();
+    const req = {
+      _viventiumHarnessExecutionEnabled: true,
+      _viventiumHarnessIdempotencyKey: 'voice:exact',
+      _viventiumNativeVoiceInputPolling: Promise.resolve(),
+      user: { id: 'owner-native' },
+      body: {
+        voiceMode: true,
+        viventiumVoiceTaskId: task.taskId,
+        viventiumActorTrust: 'owner_participant',
+        viventiumCanAuthorizeSideEffects: true,
+      },
+      viventiumVoiceWorkAuthority: { callSessionId: 'call-native' },
+    };
+    const bind = (fetchImpl) =>
+      bindHarnessCancellation({
+        req,
+        signal: controller.signal,
+        endpointConfig: { baseURL: 'http://native.local/v1', apiKey: 'synthetic-key' },
+        fetchImpl,
+      });
+    return { task, controller, req, bind };
+  }
+
+  function stopObservations(logger) {
+    return logger.debug.mock.calls
+      .filter(([label]) => label === '[GlassHiveProvider] Voice Stop confirmation')
+      .map(([, data]) => data);
+  }
+
+  function stopDecisions(logger) {
+    const prefix = '[GlassHiveProvider] Voice Stop decision ';
+    return logger.info.mock.calls
+      .filter(([message]) => typeof message === 'string' && message.startsWith(prefix))
+      .map(([message]) => JSON.parse(message.slice(prefix.length)));
+  }
+
+  function stopScopeSha256(task) {
+    return crypto
+      .createHash('sha256')
+      .update(JSON.stringify([task.taskId, task.streamId, task.callSessionId]))
+      .digest('hex');
+  }
+
+  test.each([
+    ['local_stop', false, true, { acknowledged: true, outcomes: [{ capacityReleased: true }] }],
+    ['fresh_delivery', true, false, { acknowledged: true, outcomes: [{ capacityReleased: true }] }],
+    [
+      'delivery_acknowledged',
+      true,
+      true,
+      { acknowledged: false, outcomes: [{ capacityReleased: false }] },
+    ],
+    ['outcomes_present', true, true, { acknowledged: true, outcomes: null }],
+    ['family_nonempty', true, true, { acknowledged: true, outcomes: [] }],
+    [
+      'families_released',
+      true,
+      true,
+      { acknowledged: true, outcomes: [{ capacityReleased: true }, { capacityReleased: false }] },
+    ],
+  ])(
+    'Voice Stop diagnostics identify %s without confirming an unreleased owner',
+    async (failedCheck, success, freshDelivery, delivery) => {
+      const { logger } = require('@librechat/data-schemas');
+      const { GenerationJobManager } = require('@librechat/api');
+      const { task, req, bind } = cancellationBinding();
+      logger.debug.mockClear();
+      logger.info.mockClear();
+      req._viventiumHarnessCancellationDeliveryPromise = Promise.resolve(delivery);
+      const fetchImpl = jest.fn();
+      const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+        if (freshDelivery)
+          req._viventiumHarnessCancellationDeliveryPromise = Promise.resolve(delivery);
+        return { success };
+      });
+      try {
+        bind(fetchImpl);
+        await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+        await tasks.flushVoiceTaskOwnerOperations();
+        expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_unenforceable');
+        expect(tasks.isVoiceTaskSuppressed(task.taskId)).toBe(true);
+        expect(fetchImpl).not.toHaveBeenCalled();
+        expect(stopObservations(logger)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              stage: 'confirmation_checks',
+              failedCheck,
+              confirmed: false,
+            }),
+          ]),
+        );
+        expect(stopDecisions(logger)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              scopeSha256: stopScopeSha256(task),
+              stage: 'confirmation_checks',
+              failedCheck,
+              confirmed: false,
+            }),
+          ]),
+        );
+      } finally {
+        abort.mockRestore();
+      }
+    },
+  );
+
+  test.each([
+    [1, 'owner_before_abort'],
+    [2, 'owner_after_abort'],
+    [3, 'confirmation_checks'],
+  ])(
+    'Voice Stop diagnostics retain an exact owner guard at read %s',
+    async (invalidRead, stage) => {
+      const { logger } = require('@librechat/data-schemas');
+      const { GenerationJobManager } = require('@librechat/api');
+      const { task, req, bind } = cancellationBinding();
+      logger.debug.mockClear();
+      logger.info.mockClear();
+      const get = tasks.getVoiceTask;
+      let reads = 0;
+      const owner = jest.spyOn(tasks, 'getVoiceTask').mockImplementation((id) => {
+        const current = get(id);
+        reads += 1;
+        return reads === invalidRead
+          ? { ...current, owner: { ...current.owner, id: 'foreign-stream' } }
+          : current;
+      });
+      const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+        req._viventiumHarnessCancellationDeliveryPromise = Promise.resolve({
+          acknowledged: true,
+          outcomes: [{ capacityReleased: true }],
+        });
+        return { success: true };
+      });
+      try {
+        bind(jest.fn());
+        await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+        await tasks.flushVoiceTaskOwnerOperations();
+        expect(get(task.taskId).state).toBe('cancelled_unenforceable');
+        expect(stopObservations(logger)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ stage, failedCheck: 'owner_current' }),
+          ]),
+        );
+        expect(stopDecisions(logger)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              scopeSha256: stopScopeSha256(task),
+              stage: 'owner_guard',
+              ownerIdMatches: false,
+              failedCheck: 'owner_current',
+            }),
+          ]),
+        );
+        expect(abort).toHaveBeenCalledTimes(invalidRead === 1 ? 0 : 1);
+      } finally {
+        owner.mockRestore();
+        abort.mockRestore();
+      }
+    },
+  );
+
+  test.each(['abort_job', 'delivery'])(
+    'Voice Stop diagnostics identify an exception at %s without copying its content',
+    async (stage) => {
+      const { logger } = require('@librechat/data-schemas');
+      const { GenerationJobManager } = require('@librechat/api');
+      const { task, req, bind } = cancellationBinding();
+      logger.debug.mockClear();
+      logger.info.mockClear();
+      const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+        if (stage === 'abort_job') throw new Error('synthetic-private-error-argument');
+        req._viventiumHarnessCancellationDeliveryPromise = Promise.reject(
+          new Error('synthetic-private-error-argument'),
+        );
+        return { success: true };
+      });
+      try {
+        bind(jest.fn());
+        await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+        await tasks.flushVoiceTaskOwnerOperations();
+        expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_unenforceable');
+        const entries = stopObservations(logger);
+        expect(entries).toEqual(
+          expect.arrayContaining([expect.objectContaining({ stage, failedCheck: 'exception' })]),
+        );
+        expect(JSON.stringify(entries)).not.toContain('synthetic-private-error-argument');
+        expect(stopDecisions(logger)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              scopeSha256: stopScopeSha256(task),
+              stage,
+              failedCheck: 'exception',
+            }),
+          ]),
+        );
+        expect(JSON.stringify(stopDecisions(logger))).not.toContain(
+          'synthetic-private-error-argument',
+        );
+      } finally {
+        abort.mockRestore();
+      }
+    },
+  );
+
+  test('normal-console Stop decisions exclude transport credentials, keys, prompt and opaque abort reason', async () => {
+    const { logger } = require('@librechat/data-schemas');
+    const { GenerationJobManager } = require('@librechat/api');
+    const { task, req, controller, bind } = cancellationBinding();
+    logger.info.mockClear();
+    req.body.text = 'PRIVATE-PROMPT-SENTINEL';
+    req._viventiumHarnessIdempotencyKey = 'PRIVATE-REQUEST-KEY-SENTINEL';
+    const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+      controller.abort(new Error('PRIVATE-ABORT-SENTINEL'));
+      return { success: true };
+    });
+    try {
+      bind(jest.fn());
+      await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+      await tasks.flushVoiceTaskOwnerOperations();
+      const decisions = stopDecisions(logger);
+      expect(decisions).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            scopeSha256: stopScopeSha256(task),
+            signalAborted: true,
+            signalAbortReason: 'other',
+            stage: 'confirmation_checks',
+            failedCheck: 'fresh_delivery',
+          }),
+        ]),
+      );
+      const encoded = JSON.stringify(decisions);
+      for (const privateValue of [
+        'PRIVATE-PROMPT-SENTINEL',
+        'PRIVATE-REQUEST-KEY-SENTINEL',
+        'PRIVATE-ABORT-SENTINEL',
+        'synthetic-key',
+        'native.local',
+        task.taskId,
+        task.streamId,
+        task.callSessionId,
+        'owner-native',
+      ])
+        expect(encoded).not.toContain(privateValue);
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_unenforceable');
+    } finally {
+      abort.mockRestore();
+    }
+  });
+
+  test('Voice Stop diagnostics preserve all graph families and wait for capacity release', async () => {
+    const { logger } = require('@librechat/data-schemas');
+    const { GenerationJobManager } = require('@librechat/api');
+    const { task, controller, req, bind } = cancellationBinding();
+    logger.debug.mockClear();
+    req._viventiumHarnessIdempotencyKeys = new Set(['voice:main', 'voice:peer']);
+    let release;
+    const released = new Promise((resolve) => {
+      release = resolve;
+    });
+    const fetchImpl = jest.fn(async () => ({
+      ok: true,
+      json: async () => {
+        await released;
+        return { capacityReleased: true };
+      },
+    }));
+    const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+      controller.abort('user_cancelled');
+      return { success: true };
+    });
+    try {
+      bind(fetchImpl);
+      await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+      await new Promise(setImmediate);
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelling');
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      release();
+      await tasks.flushVoiceTaskOwnerOperations();
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_confirmed');
+      const entries = stopObservations(logger);
+      expect(entries).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            stage: 'delivery_started',
+            familyCount: 2,
+            capacityRequired: true,
+          }),
+          expect.objectContaining({
+            stage: 'confirmation_checks',
+            familyCount: 2,
+            releasedFamilyCount: 2,
+            confirmed: true,
+            failedCheck: null,
+          }),
+        ]),
+      );
+      expect(JSON.stringify(entries)).not.toMatch(
+        /owner-native|call-native|stream-native|voice:main|voice:peer|synthetic-key|native\.local/,
+      );
+    } finally {
+      release();
+      abort.mockRestore();
+    }
+  });
+
+  test('Voice Stop diagnostics cannot interrupt confirmation when the observer throws', async () => {
+    const { logger } = require('@librechat/data-schemas');
+    const { GenerationJobManager } = require('@librechat/api');
+    const { task, controller, bind } = cancellationBinding();
+    const observe = jest.spyOn(logger, 'debug').mockImplementation(() => {
+      throw new Error('observer failed');
+    });
+    const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+      controller.abort('user_cancelled');
+      return { success: true };
+    });
+    try {
+      bind(jest.fn(async () => ({ ok: true, json: async () => ({ capacityReleased: true }) })));
+      await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+      await tasks.flushVoiceTaskOwnerOperations();
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_confirmed');
+    } finally {
+      observe.mockRestore();
+      abort.mockRestore();
+    }
+  });
+
+  function cortexCancellationRequest(req) {
+    const child = Object.create(req);
+    child.body = { ...req.body };
+    child._viventiumCortexToolEvidence = require('@librechat/api').createCortexToolEvidence();
+    child._viventiumHarnessIdempotencyKey = 'voice:child';
+    child._viventiumHarnessIdempotencyKeys = new Set();
+    child._viventiumHarnessCancellationBoundBaseURLs = new Set();
+    child._viventiumHarnessCancellationActiveBaseURL = '';
+    child._viventiumHarnessCancellationDeliveryPromise = null;
+    return child;
+  }
+
+  test('foreground Voice Stop retains Main after a completed cortex binds last', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const { task, controller, req, bind } = cancellationBinding();
+    req._viventiumHarnessIdempotencyKeys = new Set(['voice:main', 'voice:peer-a', 'voice:peer-b']);
+    let release;
+    const released = new Promise((resolve) => {
+      release = resolve;
+    });
+    const mainFetch = jest.fn(async () => ({
+      ok: true,
+      json: async () => {
+        await released;
+        return { capacityReleased: true };
+      },
+    }));
+    const child = cortexCancellationRequest(req);
+    const childController = new AbortController();
+    const childFetch = jest.fn();
+    const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+      controller.abort('user_cancelled');
+      return { success: true };
+    });
+    try {
+      bind(mainFetch);
+      bindHarnessCancellation({
+        req: child,
+        signal: childController.signal,
+        endpointConfig: { baseURL: 'http://native.local/v1', apiKey: 'synthetic-key' },
+        fetchImpl: childFetch,
+      });
+      // A completed cortex has removed its owner-abort listener; only Main remains active.
+      await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+      await new Promise(setImmediate);
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelling');
+      expect(childController.signal.aborted).toBe(false);
+      expect(childFetch).not.toHaveBeenCalled();
+      expect(mainFetch).toHaveBeenCalledTimes(3);
+      release();
+      await tasks.flushVoiceTaskOwnerOperations();
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_confirmed');
+      expect(req._viventiumHarnessCancellationDeliveryPromise).not.toBe(
+        child._viventiumHarnessCancellationDeliveryPromise,
+      );
+    } finally {
+      release();
+      abort.mockRestore();
+    }
+  });
+
+  test('foreground Voice Stop retains active cortex cancellation and exact family release', async () => {
+    const { logger } = require('@librechat/data-schemas');
+    logger.debug.mockClear();
+    const { GenerationJobManager } = require('@librechat/api');
+    const { task, controller, req, bind } = cancellationBinding();
+    req._viventiumHarnessIdempotencyKeys = new Set(['voice:main', 'voice:peer']);
+    let releaseMain;
+    const mainReleased = new Promise((resolve) => {
+      releaseMain = resolve;
+    });
+    const mainFetch = jest.fn(async () => ({
+      ok: true,
+      json: async () => {
+        await mainReleased;
+        return { capacityReleased: true };
+      },
+    }));
+    const child = cortexCancellationRequest(req);
+    const childController = new AbortController();
+    const parentAbort = () => childController.abort(controller.signal.reason);
+    controller.signal.addEventListener('abort', parentAbort, { once: true });
+    const childFetch = jest.fn(async () => ({
+      ok: true,
+      json: async () => ({ capacityReleased: true }),
+    }));
+    const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+      controller.abort('user_cancelled');
+      return { success: true };
+    });
+    try {
+      bind(mainFetch);
+      expect(
+        bindHarnessCancellation({
+          req: child,
+          signal: childController.signal,
+          endpointConfig: { baseURL: 'http://native.local/v1', apiKey: 'synthetic-key' },
+          fetchImpl: childFetch,
+        }),
+      ).toBe(true);
+      await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+      await new Promise(setImmediate);
+      expect(childController.signal.reason).toBe('user_cancelled');
+      expect(childFetch).toHaveBeenCalledTimes(1);
+      expect(childFetch.mock.calls[0][0]).toBe(
+        'http://native.local/v1/requests/by-idempotency/voice%3Achild/cancel',
+      );
+      await expect(child._viventiumHarnessCancellationDeliveryPromise).resolves.toEqual({
+        acknowledged: true,
+        outcomes: [{ acknowledged: true, capacityReleased: true, responseTimeoutS: null }],
+      });
+      expect(stopObservations(logger)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            stage: 'delivery_started',
+            cortexAttempt: true,
+            workAuthorityOwn: false,
+            familyCount: 1,
+            capacityRequired: true,
+          }),
+          expect.objectContaining({
+            stage: 'abort_started',
+            cortexAttempt: false,
+            workAuthorityOwn: true,
+          }),
+        ]),
+      );
+      expect(mainFetch).toHaveBeenCalledTimes(2);
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelling');
+      releaseMain();
+      await tasks.flushVoiceTaskOwnerOperations();
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_confirmed');
+    } finally {
+      releaseMain();
+      controller.signal.removeEventListener('abort', parentAbort);
+      abort.mockRestore();
+    }
+  });
+
+  test('foreground Voice Stop accepts Main when the cortex transport bound first', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const { task, controller, req, bind } = cancellationBinding();
+    const child = cortexCancellationRequest(req);
+    const childFetch = jest.fn();
+    const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+      controller.abort('user_cancelled');
+      return { success: true };
+    });
+    try {
+      bindHarnessCancellation({
+        req: child,
+        signal: new AbortController().signal,
+        endpointConfig: { baseURL: 'http://native.local/v1', apiKey: 'synthetic-key' },
+        fetchImpl: childFetch,
+      });
+      bind(jest.fn(async () => ({ ok: true, json: async () => ({ capacityReleased: true }) })));
+      await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+      await tasks.flushVoiceTaskOwnerOperations();
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_confirmed');
+      expect(childFetch).not.toHaveBeenCalled();
+    } finally {
+      abort.mockRestore();
+    }
+  });
+
+  test('foreground Voice Stop never promotes a cortex into the Main task owner or input adapter', async () => {
+    const api = require('@librechat/api');
+    const { task, req } = cancellationBinding();
+    const child = cortexCancellationRequest(req);
+    child._viventiumNativeVoiceInputPolling = null;
+    const childController = new AbortController();
+    const childFetch = jest.fn(async () => ({
+      ok: true,
+      json: async () => ({ capacityReleased: true }),
+    }));
+    const abort = jest.spyOn(api.GenerationJobManager, 'abortJob').mockImplementation(async () => {
+      childController.abort('user_cancelled');
+      return { success: true };
+    });
+    const poll = jest.fn(async () => undefined);
+    const input = jest.spyOn(api, 'createNativeVoiceInputClient').mockReturnValue({ poll });
+    try {
+      expect(
+        bindHarnessCancellation({
+          req: child,
+          signal: childController.signal,
+          endpointConfig: { baseURL: 'http://native.local/v1', apiKey: 'synthetic-key' },
+          fetchImpl: childFetch,
+        }),
+      ).toBe(true);
+      const cancellation = await tasks.requestVoiceTaskOwnerCancellation(task.taskId, {
+        userId: 'owner-native',
+      });
+      await tasks.flushVoiceTaskOwnerOperations();
+      await new Promise(setImmediate);
+      expect(cancellation.ownerSupported).toBe(false);
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_unenforceable');
+      expect(abort).not.toHaveBeenCalled();
+      expect(childFetch).not.toHaveBeenCalled();
+      expect(input).not.toHaveBeenCalled();
+      expect(poll).not.toHaveBeenCalled();
+    } finally {
+      input.mockRestore();
+      abort.mockRestore();
+    }
+  });
+
+  test('native Voice Stop confirms only the exact released native owner', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const { task, controller, bind } = cancellationBinding();
+    const fetchImpl = jest.fn(async () => ({
+      ok: true,
+      json: async () => ({ capacityReleased: true }),
+    }));
+    const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+      controller.abort('user_cancelled');
+      return { success: true };
+    });
+    try {
+      bind(fetchImpl);
+      const result = await tasks.requestVoiceTaskOwnerCancellation(task.taskId, {
+        userId: 'owner-native',
+      });
+      expect(result.ownerSupported).toBe(true);
+      await tasks.flushVoiceTaskOwnerOperations();
+      expect(abort).toHaveBeenCalledWith('stream-native', 'user_cancelled', 'owner-native');
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(fetchImpl).toHaveBeenCalledWith(
+        'http://native.local/v1/requests/by-idempotency/voice%3Aexact/cancel',
+        expect.objectContaining({
+          headers: {
+            Authorization: 'Bearer synthetic-key',
+            'X-Viventium-User-Id': 'owner-native',
+          },
+        }),
+      );
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_confirmed');
+    } finally {
+      abort.mockRestore();
+    }
+  });
+
+  test.each(['no native delivery', 'native rejects Stop'])(
+    'native Voice Stop remains unconfirmed after %s',
+    async (failure) => {
+      const { GenerationJobManager } = require('@librechat/api');
+      const { task, controller, bind } = cancellationBinding();
+      const fetchImpl = jest.fn(async () => ({ ok: false, status: 401 }));
+      const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+        if (failure !== 'no native delivery') controller.abort('user_cancelled');
+        return { success: true };
+      });
+      try {
+        bind(fetchImpl);
+        await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+        await tasks.flushVoiceTaskOwnerOperations();
+        expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_unenforceable');
+        expect(tasks.isVoiceTaskSuppressed(task.taskId)).toBe(true);
+      } finally {
+        abort.mockRestore();
+      }
+    },
+  );
+
+  test.each(['committed', 'pending'])(
+    'native Voice Stop preserves an already committed answer (%s)',
+    async (nativeResponse) => {
+      const { GenerationJobManager } = require('@librechat/api');
+      const { task, bind } = cancellationBinding();
+      const fetchImpl = jest.fn();
+      const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockResolvedValue({
+        success: false,
+        nativeResponse,
+      });
+      try {
+        bind(fetchImpl);
+        await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+        await tasks.flushVoiceTaskOwnerOperations();
+        expect(tasks.getVoiceTask(task.taskId).state).toBe('completed');
+        expect(tasks.isVoiceTaskSuppressed(task.taskId)).toBe(false);
+        expect(fetchImpl).not.toHaveBeenCalled();
+      } finally {
+        abort.mockRestore();
+      }
+    },
+  );
+
+  test('native Voice Stop cannot reuse a prior attempt acknowledgement', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const { task, req, bind } = cancellationBinding();
+    req._viventiumHarnessCancellationDeliveryPromise = Promise.resolve({
+      acknowledged: true,
+      outcomes: [{ capacityReleased: true }],
+    });
+    const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockResolvedValue({ success: true });
+    try {
+      bind(jest.fn());
+      await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+      await tasks.flushVoiceTaskOwnerOperations();
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_unenforceable');
+    } finally {
+      abort.mockRestore();
+    }
+  });
+
+  test.each(['call', 'owner id', 'owner kind'])(
+    'native Voice Stop cannot gain a changed %s',
+    async (changed) => {
+      const { GenerationJobManager } = require('@librechat/api');
+      const { task, req, bind } = cancellationBinding();
+      if (changed === 'call') req.viventiumVoiceWorkAuthority.callSessionId = 'other-call';
+      const fetchImpl = jest.fn();
+      const abort = jest.spyOn(GenerationJobManager, 'abortJob');
+      try {
+        bind(fetchImpl);
+        if (changed !== 'call')
+          tasks.setVoiceTaskOwnerCapabilities(task.taskId, {
+            kind: changed === 'owner kind' ? 'other_owner' : 'remote_generation',
+            ownerId: changed === 'owner id' ? 'other-stream' : 'stream-native',
+          });
+        await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+        await tasks.flushVoiceTaskOwnerOperations();
+        await new Promise(setImmediate);
+        expect(abort).not.toHaveBeenCalled();
+        expect(fetchImpl).not.toHaveBeenCalled();
+        expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_unenforceable');
+      } finally {
+        abort.mockRestore();
+      }
+    },
+  );
+
+  test('native Voice Stop retains the stopped owner while the native request returns', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const { task, controller, bind } = cancellationBinding();
+    const fetchImpl = jest.fn(async () => {
+      expect(
+        tasks.setVoiceTaskOwnerCapabilities(task.taskId, {
+          kind: 'remote_generation',
+          ownerId: 'replacement-stream',
+        }),
+      ).toBeNull();
+      return { ok: true, json: async () => ({ capacityReleased: true }) };
+    });
+    const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+      controller.abort('user_cancelled');
+      return { success: true };
+    });
+    try {
+      bind(fetchImpl);
+      await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+      await tasks.flushVoiceTaskOwnerOperations();
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(tasks.getVoiceTask(task.taskId)).toMatchObject({
+        state: 'cancelled_confirmed',
+        owner: { kind: 'remote_generation', id: 'stream-native' },
+      });
+    } finally {
+      abort.mockRestore();
+    }
+  });
+
+  test('native Voice Stop cannot use an empty acknowledgement as release proof', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const { task, req, bind } = cancellationBinding();
+    const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+      req._viventiumHarnessCancellationDeliveryPromise = Promise.resolve({
+        acknowledged: true,
+        outcomes: [],
+      });
+      return { success: true };
+    });
+    try {
+      bind(jest.fn());
+      await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+      await tasks.flushVoiceTaskOwnerOperations();
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_unenforceable');
+    } finally {
+      abort.mockRestore();
+    }
+  });
+
+  test('native Voice initialization keeps Stop when the same job becomes remote', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const { task, controller, bind } = cancellationBinding();
+    tasks.setVoiceTaskOwnerCapabilities(task.taskId, {
+      kind: 'generation_job',
+      ownerId: 'stream-native',
+    });
+    const fetchImpl = jest.fn(async () => ({
+      ok: true,
+      json: async () => ({ capacityReleased: true }),
+    }));
+    const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+      controller.abort('user_cancelled');
+      return { success: true };
+    });
+    try {
+      bind(fetchImpl);
+      tasks.setVoiceTaskOwnerCapabilities(task.taskId, {
+        kind: 'remote_generation',
+        ownerId: 'stream-native',
+      });
+      await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+      await tasks.flushVoiceTaskOwnerOperations();
+      expect(abort).toHaveBeenCalledWith('stream-native', 'user_cancelled', 'owner-native');
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_confirmed');
+    } finally {
+      abort.mockRestore();
+    }
+  });
+
   test.each(['generation_job', 'remote_generation'])(
     'relays offered responses through %s to the exact owner request',
     async (ownerKind) => {
@@ -2338,7 +3270,12 @@ describe('native Voice input binding', () => {
         _viventiumHarnessExecutionEnabled: true,
         _viventiumHarnessIdempotencyKey: 'voice:exact',
         user: { id: 'owner-native' },
-        body: { voiceMode: true, viventiumVoiceTaskId: task.taskId },
+        body: {
+          voiceMode: true,
+          viventiumVoiceTaskId: task.taskId,
+          viventiumActorTrust: 'owner_participant',
+          viventiumCanAuthorizeSideEffects: true,
+        },
         viventiumVoiceWorkAuthority: authority,
       };
       bindHarnessCancellation({
@@ -2373,6 +3310,53 @@ describe('native Voice input binding', () => {
     },
   );
 
+  test('an expired native input preserves Stop for its current owner', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const { task, controller, req, bind } = cancellationBinding();
+    delete req._viventiumNativeVoiceInputPolling;
+    const now = Date.now();
+    const request = {
+      requestId: 'request-native',
+      requestFingerprint: 'a'.repeat(64),
+      runId: 'run-native',
+      attemptId: 'attempt-native',
+      expiresAt: new Date(now + 60000).toISOString(),
+      prompt: 'Approve synthetic action.',
+      choices: [
+        { value: 'allow-once', label: 'Allow once' },
+        { value: 'deny', label: 'Deny' },
+      ],
+    };
+    const fetchImpl = jest.fn(async (_url, options) => ({
+      ok: true,
+      json: async () =>
+        options.method === 'POST'
+          ? { capacityReleased: true }
+          : { version: 1, state: 'running', pending: [request] },
+    }));
+    const abort = jest.spyOn(GenerationJobManager, 'abortJob').mockImplementation(async () => {
+      controller.abort('user_cancelled');
+      return { success: true };
+    });
+    let clock;
+    try {
+      bind(fetchImpl);
+      await new Promise(setImmediate);
+      expect(tasks.snapshotEvent(task.taskId).needsInput).toBeTruthy();
+      clock = jest.spyOn(Date, 'now').mockReturnValue(now + 61000);
+      await tasks.requestVoiceTaskOwnerCancellation(task.taskId, { userId: 'owner-native' });
+      await tasks.flushVoiceTaskOwnerOperations();
+      await new Promise(setImmediate);
+      expect(abort).toHaveBeenCalledWith('stream-native', 'user_cancelled', 'owner-native');
+      expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_confirmed');
+    } finally {
+      clock?.mockRestore();
+      abort.mockRestore();
+      controller.abort('completed');
+      await req._viventiumNativeVoiceInputPolling;
+    }
+  });
+
   test('does not poll a task from another owner', () => {
     const task = tasks.createVoiceTask({
       userId: 'other-owner',
@@ -2384,7 +3368,12 @@ describe('native Voice input binding', () => {
     const req = {
       _viventiumHarnessExecutionEnabled: true,
       user: { id: 'owner-native' },
-      body: { voiceMode: true, viventiumVoiceTaskId: task.taskId },
+      body: {
+        voiceMode: true,
+        viventiumVoiceTaskId: task.taskId,
+        viventiumActorTrust: 'owner_participant',
+        viventiumCanAuthorizeSideEffects: true,
+      },
       viventiumVoiceWorkAuthority: { callSessionId: 'call-native' },
     };
     bindHarnessCancellation({
@@ -2395,5 +3384,123 @@ describe('native Voice input binding', () => {
     });
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(req._viventiumNativeVoiceInputPolling).toBeUndefined();
+  });
+});
+
+describe('signed text file body parity', () => {
+  const conversationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const parent = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const earlier = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const alpha = {
+    file_id: '11111111-1111-4111-8111-111111111111',
+    filename: '01-first.txt',
+    type: 'text/plain',
+    source: 'text',
+    context: 'message_attachment',
+    text: 'First synthetic note.\n',
+    bytes: 22,
+    media_group_index: 0,
+  };
+  const bravo = {
+    file_id: '22222222-2222-4222-8222-222222222222',
+    filename: '02-second.txt',
+    type: 'text/plain',
+    source: 'text',
+    context: 'message_attachment',
+    text: 'Second synthetic note.\n',
+    bytes: 23,
+    media_group_index: 1,
+  };
+  const sibling = {
+    ...alpha,
+    file_id: '33333333-3333-4333-8333-333333333333',
+    text: 'Unselected sibling body.',
+  };
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-bundle-secret';
+    buildConversationProviderBootstrapBundle.mockResolvedValue({});
+    getMessages.mockResolvedValue([
+      {
+        messageId: parent,
+        parentMessageId: earlier,
+        files: [{ file_id: alpha.file_id }, { file_id: bravo.file_id }],
+      },
+      { messageId: earlier },
+      { messageId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', files: [{ file_id: sibling.file_id }] },
+    ]);
+    getFiles.mockImplementation(async (filter, sort, select) => {
+      if (filter.user !== 'owner') return [];
+      return [alpha, bravo, sibling]
+        .filter((f) => filter.file_id.$in.includes(f.file_id))
+        .map((f) =>
+          Object.fromEntries(
+            select
+              .split(' ')
+              .filter((k) => k in f)
+              .map((k) => [k, f[k]]),
+          ),
+        );
+    });
+  });
+  async function signed(files, surface = 'web', owner = 'owner', parentMessageId = parent) {
+    const targetAgent = { model_parameters: {} };
+    const req = {
+      user: { id: owner },
+      body: { conversationId, parentMessageId, files, viventiumSurface: surface },
+    };
+    const immutable = JSON.stringify(req.body);
+    await attachConversationProviderCapabilityBundle({
+      targetAgent,
+      req,
+      capability: { workspace_binding: true, worker_native_tools: true },
+    });
+    expect(JSON.stringify(req.body)).toBe(immutable);
+    const headers = targetAgent.model_parameters.configuration?.defaultHeaders || {};
+    if (!headers['X-GlassHive-Bootstrap-Bundle-B64']) return [];
+    const bundle = JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64'));
+    const expected =
+      'sha256=' +
+      crypto
+        .createHmac('sha256', 'synthetic-bundle-secret')
+        .update(
+          'v1\n' +
+            headers['X-GlassHive-Bootstrap-Timestamp'] +
+            '\n' +
+            headers['X-GlassHive-Bootstrap-Bundle-B64'],
+        )
+        .digest('hex');
+    expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(expected);
+    return bundle.viventium_upload_context?.selected_uploads || [];
+  }
+  test.each(['web', 'voice', 'telegram'])(
+    'preserves current ordered text despite persisted current ancestry (%s)',
+    async (surface) => {
+      const out = await signed([alpha, bravo], surface);
+      expect(out.map((f) => [f.file_id, f.text, f.media_group_index])).toEqual(
+        [alpha, bravo].map((f) => [f.file_id, f.text, f.media_group_index]),
+      );
+    },
+  );
+  test('keeps owner-selected text available on a later no-reupload turn', async () => {
+    const out = await signed([]);
+    expect(out.map((f) => f.text)).toEqual([alpha.text, bravo.text]);
+    expect(getFiles.mock.calls[0][0]).toEqual({
+      user: 'owner',
+      file_id: { $in: [alpha.file_id, bravo.file_id] },
+    });
+    expect(out.some((f) => f.file_id === sibling.file_id)).toBe(false);
+  });
+  test('denies wrong owner history without requesting unselected bodies', async () => {
+    expect(await signed([], 'web', 'different-owner')).toEqual([]);
+    expect(getFiles.mock.calls[0][0].user).toBe('different-owner');
+  });
+  test('missing selected parent grants no historical body', async () => {
+    expect(await signed([], 'web', 'owner', 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee')).toEqual([]);
+    expect(getFiles).not.toHaveBeenCalled();
+  });
+  test('deleted owner files stay unavailable', async () => {
+    getFiles.mockResolvedValue([]);
+    expect(await signed([])).toEqual([]);
   });
 });

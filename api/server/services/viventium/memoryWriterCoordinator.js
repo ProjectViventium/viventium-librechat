@@ -10,6 +10,58 @@ const memoryWriterOwner = require('crypto').randomUUID();
 const admittedMessages = new Set();
 let recoveryTimer;
 
+// The isolated writer owns one exact native request, including a capacity-blocked pre-run request.
+// Release through the existing cancellation owner before retiring its invocation-local tool grant.
+async function bindNativeMemoryWriterAttempt({
+  identity,
+  agent,
+  requestBody,
+  signal,
+  bindCancellation = require('./GlassHiveConversationProviderService').bindHarnessCancellation,
+}) {
+  const key = String(requestBody?.viventiumGlassHiveIdempotencyKey || '').trim();
+  if (
+    !key ||
+    key !== agent?.id ||
+    requestBody?.messageId !== identity?.messageId ||
+    requestBody?.conversationId !== identity?.conversationId ||
+    !identity?.userId
+  ) {
+    throw new Error('native_memory_attempt_identity_mismatch');
+  }
+  const req = {
+    user: { id: identity.userId },
+    body: { conversationId: identity.conversationId, responseMessageId: identity.messageId },
+    _viventiumHarnessExecutionEnabled: true,
+    _viventiumHarnessIdempotencyKey: key,
+    _viventiumHarnessIdempotencyKeys: new Set([key]),
+  };
+  if (
+    !bindCancellation({
+      req,
+      signal,
+      endpointConfig: {
+        baseURL: agent.model_parameters?.configuration?.baseURL,
+        apiKey: agent.model_parameters?.apiKey,
+      },
+    })
+  )
+    throw new Error('native_memory_cancellation_binding_unavailable');
+  return async () => {
+    const result = await req._viventiumHarnessReleaseAttempt?.();
+    if (
+      result?.acknowledged !== true ||
+      result.outcomes?.length !== 1 ||
+      result.outcomes[0]?.acknowledged !== true ||
+      result.outcomes[0]?.capacityReleased !== true
+    ) {
+      throw Object.assign(new Error('Native memory request release could not be confirmed.'), {
+        code: 'HARNESS_CANCELLATION_DELIVERY_FAILED',
+      });
+    }
+  };
+}
+
 // This timer observes the existing queue. Only provably unstarted work may be recovered. Stop refreshing
 // a row when its closure ends so a failed receipt write is reconciled even without process restart.
 function startMemoryWriterRecovery({ db, logger, recoverPending }) {
@@ -147,6 +199,7 @@ function resetMemoryWriterCoordinatorForTests() {
 }
 
 module.exports = {
+  bindNativeMemoryWriterAttempt,
   bindActiveMemoryWriterTool,
   activeMemoryWriterTool,
   memoryWriterOwner,

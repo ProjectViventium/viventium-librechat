@@ -4,9 +4,11 @@ const PUBLIC_FAILURES: Readonly<Record<string, string>> = Object.freeze({
   native_input_expired: 'The approval request expired, so that action was stopped. Please retry.',
   native_input_cancelled: 'That action was cancelled.',
   native_turn_cancelled: 'That action was cancelled.',
+  provider_progress_stalled: 'The model needs attention because progress stopped.',
   provider_failure: 'Provider unavailable',
   provider_unavailable: 'Provider unavailable',
   provider_unauthorized: 'The model connection needs attention. Please check its connection.',
+  provider_access_denied: 'The model provider denied access to this request.',
   provider_rate_limited: 'The model is busy. Please try again shortly.',
   provider_timeout: 'The model did not respond in time. Please try again.',
   remote_failed: 'The task failed.',
@@ -22,6 +24,7 @@ const PUBLIC_FAILURES: Readonly<Record<string, string>> = Object.freeze({
   unsupported_access_mode: 'This model does not support the configured access mode.',
   invalid_agent_builder_control_output: 'The model returned an invalid harness response.',
   native_output_contract_invalid: 'The model returned an invalid harness response.',
+  native_output_file_unavailable: 'The file could not be attached.',
   source_context_unavailable: 'The conversation context is unavailable.',
   queue_wait_timeout: 'The worker did not start in time.',
   host_worker_busy: 'The worker is busy. Please try again shortly.',
@@ -35,6 +38,13 @@ export function voiceTaskPublicFailure(error: { code?: string } | null | undefin
   const supplied = error?.code;
   const code = supplied && Object.prototype.hasOwnProperty.call(PUBLIC_FAILURES, supplied)
     ? supplied : 'generation_failed';
-  return { code, message: PUBLIC_FAILURES[code], retryAllowed: !NATIVE_STOPS.has(code) };
+  return {
+    code,
+    message: PUBLIC_FAILURES[code],
+    retryAllowed:
+      !NATIVE_STOPS.has(code) &&
+      code !== 'native_output_file_unavailable' &&
+      code !== 'provider_progress_stalled',
+  };
 }
 /* === VIVENTIUM END === */

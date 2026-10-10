@@ -6,6 +6,26 @@ export interface IMainContinuityToolPair {
   outcome: string;
 }
 
+/** Exact background evidence offered to one native Main invocation; never user authority. */
+export interface IMainContinuityBackgroundInput {
+  version: 1;
+  invocationId: string;
+  deliveryId: string;
+  text: string;
+  textSha256: string;
+  sources: { cortexId: string; cortexName?: string; insightSha256: string }[];
+}
+
+/** Native transport acknowledgement only; no consumption or presentation claim. */
+export interface IMainContinuityBackgroundInputReceipt {
+  deliveryId: string;
+  textSha256: string;
+  status: 'offered' | 'queued' | 'pending' | 'unavailable';
+  runId?: string;
+  attemptId?: string;
+  messageId?: string;
+}
+
 export interface IMainContinuityAcceptedTurn {
   acceptedPosition?: number;
   logicalTurnId: string;
@@ -19,6 +39,7 @@ export interface IMainContinuityAcceptedTurn {
   userText: string;
   assistantText: string;
   toolPairs: IMainContinuityToolPair[];
+  backgroundInputs?: IMainContinuityBackgroundInput[];
   committedAt: Date;
   sourceDeletedAt?: Date;
 }

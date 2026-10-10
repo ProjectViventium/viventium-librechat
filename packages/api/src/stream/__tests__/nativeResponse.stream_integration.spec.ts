@@ -8,6 +8,7 @@ import { once } from 'events';
 import type { ChildProcess } from 'child_process';
 import {
   NATIVE_PUBLICATION_LUA,
+  NATIVE_JOB_LUA,
   NATIVE_REPLAY_PUBLISH_LUA,
 } from '../implementations/nativeResponseLua';
 import { RedisJobStore } from '../implementations/RedisJobStore';
@@ -115,6 +116,36 @@ describe('native publication on actual Redis Cluster slots', () => {
   });
 
   nativeStoreContract(() => new RedisJobStore(redis), false, false);
+
+  test('a Redis job-level bind interrupted before publication is positively never admitted', async () => {
+    const store = new RedisJobStore(redis);
+    const { identity, job } = await admitted(store);
+    const evalOriginal = redis.eval.bind(redis);
+    let intercepted = false;
+    const evalSpy = jest.spyOn(redis, 'eval').mockImplementation(async (...args: Parameters<typeof redis.eval>) => {
+      const result = await evalOriginal(...args);
+      if (!intercepted && args[0] === NATIVE_JOB_LUA && args[3] === 'bind') {
+        intercepted = true;
+        expect(result).toBe(1);
+        const halfBound = (await store.getJob(job.streamId))!;
+        expect(halfBound.nativeResponse).toEqual(identity);
+        await store.observeSourceOrder({ source_order_scope: identity.sourceOrderScope!, source_sequence: 2 });
+        await store.claimLogicalTurn('half-bind-successor', 'owner', {
+          ...job.interactionContext!, source_event_id: 'new-source', source_sequence: 2,
+        });
+        expect(await store.cancelNativeResponse(halfBound)).toEqual({ status: 'revoked' });
+        await store.updateJob(job.streamId, { status: 'superseded' });
+      }
+      return result;
+    });
+    try {
+      expect(await store.bindNativeResponse(identity)).toBe(false);
+      const cancelled = (await store.getJob(job.streamId))!;
+      expect(cancelled.nativeResponse).toEqual(identity);
+      expect(await store.isNativeResponseUnboundCancelled(cancelled)).toBe(true);
+      expect(await store.bindNativeResponse(identity)).toBe(false);
+    } finally { evalSpy.mockRestore(); await store.destroy(); }
+  });
 
   test('a new source stream in the same Redis conversation preserves the new revision and output', async () => {
     const store = new RedisJobStore(redis);
@@ -649,3 +680,4 @@ describe('native publication on actual Redis Cluster slots', () => {
     await manager.destroy();
   });
 });
+

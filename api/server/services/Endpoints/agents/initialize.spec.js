@@ -10,6 +10,7 @@ const { Types } = require('mongoose');
 
 const mockInitializeAgent = jest.fn();
 const mockGetAgent = jest.fn();
+const mockLoadAgent = jest.fn();
 const mockBuildConversationProviderBootstrapBundle = jest.fn();
 const mockCheckPermission = jest.fn();
 const mockValidateAgentModel = jest.fn();
@@ -43,13 +44,15 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   projectTrustedNativeInteractionHeaders: jest.fn((_req, headers) => headers ?? {}),
   projectTrustedClientPresentation: jest.fn((body) => body ?? {}),
   trustedUploadedFilesFromRequestBody: jest.fn((body) => body?.files ?? []),
   transcriptionAttachmentReferences: jest.fn(() => []),
   resolveSelectedHistoryAttachments: jest.fn(async () => []),
   configuredBackgroundWorkerRoute: jest.fn(() => null),
-  GenerationJobManager: { setCollectedUsage: jest.fn() },
+  GenerationJobManager: { setCollectedUsage: jest.fn(), getJob: jest.fn(), abortJob: jest.fn() },
+  retainAggregatedDeliveryDisposition: jest.fn(),
   observeOrchestrationOwner: (...args) => mockObserveOrchestrationOwner(...args),
   effectiveOrchestrationMode: (...args) => mockEffectiveOrchestrationMode(...args),
   applyAgentProviderCapabilityDefaults: jest.fn((agent) => ({ ...agent })),
@@ -113,6 +116,7 @@ jest.mock('./addedConvo', () => ({
   processAddedConvo: jest.fn(async ({ userMCPAuthMap }) => ({ userMCPAuthMap })),
 }));
 jest.mock('~/models/Agent', () => ({
+  loadAgent: (...args) => mockLoadAgent(...args),
   getAgent: async (...args) => {
     const agent = await mockGetAgent(...args);
     return agent ? { _id: agent._id ?? agent.id, ...agent } : agent;
@@ -182,8 +186,22 @@ jest.mock('~/server/services/viventium/GlassHiveCapabilityBootstrapService', () 
 jest.mock('~/app/clients/tools/util/fileSearch', () => ({
   primeFiles: (...args) => mockPrimeFiles(...args),
 }));
+jest.mock('~/server/services/viventium/CallSessionService', () => ({
+  getCallSession: jest.fn(),
+}));
+jest.mock('~/db/models', () => ({}));
+jest.mock('~/server/services/viventium/VoiceOrchestrationTraceService', () => ({
+  recordVoiceOrchestrationTraceBestEffort: jest.fn(),
+}));
+jest.mock('~/server/services/viventium/GlassHiveTerminalCallbackTransaction', () => ({
+  currentGlassHiveTerminalCallbackTransaction: jest.fn(() => null),
+  deferGlassHiveTerminalCallbackAfterAbort: jest.fn(() => false),
+  deferGlassHiveTerminalCallbackAfterCommit: jest.fn(() => false),
+}));
 
 const { initializeClient } = require('./initialize');
+const { buildOptions } = require('./build');
+const { getModelsConfig } = require('~/server/controllers/ModelController');
 const {
   conversationProviderStableAuthorityDigest,
 } = require('~/server/services/viventium/GlassHiveConversationProviderService');
@@ -253,6 +271,8 @@ describe('initializeClient handoff capability projection', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockLoadAgent.mockReset();
+    getModelsConfig.mockReset().mockResolvedValue({});
     mockEffectiveOrchestrationMode.mockReturnValue('parallel');
     mockValidateAgentModel.mockResolvedValue({ isValid: true });
     mockCheckPermission.mockResolvedValue(true);
@@ -314,6 +334,61 @@ describe('initializeClient handoff capability projection', () => {
       process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = originalBrokerSecret;
     }
   });
+
+  test.each([true, false])(
+    'retains delivery choices after existing aggregation repair (voice=%s)',
+    async (voice) => {
+      const { createContentAggregator } = require('@librechat/agents');
+      const { retainAggregatedDeliveryDisposition } = require('@librechat/api');
+      const repairs = require('~/server/services/viventium/voiceDeltaAggregation');
+      const contentParts = [{ type: 'text', text: 'Previous.' }];
+      const original = contentParts.slice();
+      createContentAggregator.mockReturnValueOnce({ contentParts, aggregateContent: jest.fn() });
+      const repair = voice
+        ? repairs.repairMissedVoiceMessageDelta
+        : repairs.repairMissedVisibleMessageDelta;
+      repair.mockImplementationOnce(() => {
+        contentParts[0] = { type: 'text', text: 'Previous.Current.' };
+        return true;
+      });
+      const { client } = await initializeWithHandoff({
+        ...primaryAgent,
+        id: 'synthetic-handoff',
+        edges: [],
+      });
+      client.options.req.body.voiceMode = voice;
+      const event = {
+        event: 'on_message_delta',
+        visibleToUser: true,
+        data: {
+          delta: {
+            content: [{ type: 'text', text: 'Current.' }],
+            metadata: {
+              viventium: {
+                deliveryDisposition: {
+                  version: 1,
+                  audio: 'skip',
+                  source: 'model',
+                  valid: true,
+                  required: true,
+                },
+              },
+            },
+          },
+        },
+      };
+      client.options.aggregateContent(event);
+      expect(retainAggregatedDeliveryDisposition).toHaveBeenCalledWith(
+        contentParts,
+        original,
+        event,
+      );
+      expect(retainAggregatedDeliveryDisposition.mock.calls[0][0][0].text).toBe(
+        'Previous.Current.',
+      );
+      expect(repair).toHaveBeenCalled();
+    },
+  );
 
   test('observes authenticated Parallel readiness before primary initialization', async () => {
     await initializeWithHandoff({ ...primaryAgent, id: 'synthetic-handoff', edges: [] });
@@ -521,6 +596,200 @@ describe('initializeClient handoff capability projection', () => {
       effort: 'high',
     });
   });
+
+  test('marks restricted recovery only after server validation and prepares a signed terminal fallback', async () => {
+    const {
+      retainServerValidatedRestrictedVoiceFallback,
+      sanitizeAgentForRestrictedVoiceTurn,
+    } = require('~/server/services/viventium/VoiceActorAuthorityService');
+    const req = makeRequest();
+    req.body.voiceMode = true;
+    req.body.viventiumActorTrust = 'unknown';
+    req.body.viventiumCanAuthorizeSideEffects = false;
+    const nativeMain = {
+      ...primaryAgent,
+      provider: 'glasshive-harness',
+      model: 'grok-build:grok-4.7-build-fast',
+      model_parameters: { model: 'grok-build:grok-4.7-build-fast', reasoning_effort: 'high' },
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'claude-code:claude-opus-5-5',
+      fallback_llm_model_parameters: {
+        model: 'claude-code:claude-opus-5-5',
+        reasoning_effort: 'high',
+      },
+      tools: ['synthetic-write'],
+      background_cortices: [{ agentId: 'synthetic-cortex' }],
+      edges: [],
+    };
+    mockResolveFallbackCandidates.mockReturnValue([
+      {
+        provider: 'glasshive-harness',
+        model: 'claude-code:claude-opus-5-5',
+        parametersField: 'fallback_llm_model_parameters',
+      },
+    ]);
+    mockInitializeAgent.mockImplementation(async ({ agent }) => ({
+      ...makeInitializedConfig(agent),
+      model_parameters: {
+        ...agent.model_parameters,
+        configuration: {
+          defaultHeaders: {
+            'X-GlassHive-Agent-Id': agent.id,
+            'X-GlassHive-Access': 'full',
+            'X-GlassHive-Fallback-Model': 'synthetic-nested-fallback',
+            'X-GlassHive-Capability-Broker-Token': 'synthetic-old-grant',
+          },
+        },
+      },
+    }));
+    const { client } = await initializeClient({
+      req,
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve(nativeMain),
+        model_parameters: { model: nativeMain.model },
+      },
+    });
+    const source = client.options.agent;
+    const genericSanitized = sanitizeAgentForRestrictedVoiceTurn(source);
+    expect(genericSanitized.viventiumFallbackLlmInitializer).toBeUndefined();
+    expect(genericSanitized.viventiumFallbackLlmAssignment).toBeUndefined();
+    const restricted = retainServerValidatedRestrictedVoiceFallback(genericSanitized, source, req);
+    expect(restricted.viventiumFallbackLlmAssignment).toMatchObject({
+      model: 'claude-code:claude-opus-5-5',
+      effort: 'high',
+    });
+    expect(mockInitializeAgent).toHaveBeenCalledTimes(1);
+    const fallback = await restricted.viventiumFallbackLlmInitializer();
+    expect(await restricted.viventiumFallbackLlmInitializer()).toBe(fallback);
+    expect(mockInitializeAgent).toHaveBeenCalledTimes(2);
+    expect(fallback.tools).toEqual([]);
+    expect(fallback.userMCPAuthMap).toEqual({});
+    expect(fallback.background_cortices).toEqual([]);
+    expect(fallback.edges).toEqual([]);
+    expect(fallback.toolRegistry.size).toBe(0);
+    expect(fallback.model_parameters.reasoning_effort).toBe('high');
+    expect(fallback.viventiumFallbackLlmInitializer).toBeUndefined();
+    expect(fallback.viventiumFallbackLlm).toBeUndefined();
+    const headers = fallback.model_parameters.configuration.defaultHeaders;
+    expect(headers['X-GlassHive-Agent-Id']).toBe(nativeMain.id);
+    expect(headers['X-GlassHive-Bootstrap-Signature']).toMatch(/^sha256=[a-f0-9]{64}$/);
+    expect(JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64'))).toEqual({
+      provider_capabilities: { native_tools: false },
+    });
+    expect(headers['X-GlassHive-Access']).toBeUndefined();
+    expect(headers['X-GlassHive-Fallback-Model']).toBeUndefined();
+    expect(headers['X-GlassHive-Capability-Broker-Token']).toBeUndefined();
+    expect(mockBuildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
+  });
+
+  test.each([false, true])(
+    'normal restricted initialization binds only owner Stop, fallback selected=%s',
+    async (useFallback) => {
+      const { GenerationJobManager } = require('@librechat/api');
+      const tasks = require('~/server/services/viventium/VoiceTaskService');
+      const { getCallSession } = require('~/server/services/viventium/CallSessionService');
+      const {
+        bindHarnessCancellation,
+      } = require('~/server/services/viventium/GlassHiveConversationProviderService');
+      tasks.resetVoiceTasksForTests();
+      const task = tasks.createVoiceTask({
+        userId: 'user-synthetic',
+        callSessionId: 'call-synthetic',
+        streamId: 'stream-synthetic',
+        owner: { kind: 'generation_job', id: 'stream-synthetic' },
+      });
+      const controller = new AbortController();
+      const req = makeRequest();
+      Object.assign(req.body, {
+        voiceMode: true,
+        viventiumActorTrust: 'unknown',
+        viventiumCanAuthorizeSideEffects: false,
+        viventiumVoiceTaskId: task.taskId,
+      });
+      req._resumableStreamId = 'stream-synthetic';
+      req.viventiumCallSession = { userId: 'user-synthetic', callSessionId: 'call-synthetic' };
+      req.config.endpoints.agents.providerCapabilities['glasshive-harness'].conversation_session =
+        true;
+      req.config.endpoints['glasshive-harness'] = {
+        baseURL: 'http://native.test/v1',
+        apiKey: 'synthetic-key',
+      };
+      GenerationJobManager.getJob.mockResolvedValue({
+        createdAt: 42,
+        abortController: controller,
+        metadata: {
+          userId: 'user-synthetic',
+          viventiumCallSessionId: 'call-synthetic',
+          viventiumVoiceTaskId: task.taskId,
+          responseMessageId: 'server-response',
+        },
+      });
+      GenerationJobManager.abortJob.mockImplementation(async () => {
+        controller.abort('user_cancelled');
+        return { success: true };
+      });
+      getCallSession.mockResolvedValue({ ...req.viventiumCallSession, callStatus: 'active' });
+      const nativeMain = {
+        ...primaryAgent,
+        provider: 'glasshive-harness',
+        model: 'synthetic-primary-model',
+        model_parameters: { model: 'synthetic-primary-model' },
+        fallback_llm_provider: 'glasshive-harness',
+        fallback_llm_model: 'synthetic-fallback-model',
+        fallback_llm_model_parameters: {
+          model: 'synthetic-fallback-model',
+          reasoning_effort: 'high',
+        },
+      };
+      mockResolveFallbackCandidates.mockReturnValue([
+        {
+          provider: 'glasshive-harness',
+          model: 'synthetic-fallback-model',
+          parametersField: 'fallback_llm_model_parameters',
+        },
+      ]);
+      mockInitializeAgent.mockImplementation(async ({ agent }) => makeInitializedConfig(agent));
+      const fetch = jest
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue({ ok: true, json: async () => ({ capacityReleased: true }) });
+      try {
+        const { client } = await initializeClient({
+          req,
+          res: {},
+          signal: controller.signal,
+          endpointOption: {
+            agent: Promise.resolve(nativeMain),
+            model_parameters: { model: nativeMain.model },
+          },
+        });
+        if (useFallback) {
+          const fallback = await client.options.agent.viventiumFallbackLlmInitializer();
+          expect(fallback.tools).toEqual([]);
+          expect(fallback.viventiumHarnessCancellationEndpointConfig).toBeUndefined();
+          req._viventiumFallbackLlmAttempt = true;
+          expect(bindHarnessCancellation({ req, signal: controller.signal })).toBe(true);
+        }
+        const stop = await tasks.requestVoiceTaskOwnerCancellation(task.taskId, {
+          userId: 'user-synthetic',
+        });
+        expect(stop.ownerSupported).toBe(true);
+        await tasks.flushVoiceTaskOwnerOperations();
+        expect(fetch).toHaveBeenCalledTimes(1);
+        expect(fetch.mock.calls[0][0]).toBe(
+          'http://native.test/v1/requests/by-idempotency/server-response/cancel',
+        );
+        expect(tasks.getVoiceTask(task.taskId).state).toBe('cancelled_confirmed');
+        expect(req._viventiumNativeVoiceInputPolling).toBeUndefined();
+        expect(req.viventiumVoiceWorkAuthority).toBeUndefined();
+        expect(client.options.agent.tools).toEqual([]);
+      } finally {
+        fetch.mockRestore();
+        tasks.resetVoiceTasksForTests();
+      }
+    },
+  );
 
   test('sets native per-turn context delivery before tool initialization builds durable authority', async () => {
     const nativeMain = {
@@ -1440,5 +1709,265 @@ describe('initializeClient handoff capability projection', () => {
       ].join('\n\n'),
     );
     expect(lazyHandoff.additional_instructions).toBe('');
+  });
+
+  describe('request-owned model catalog overlap', () => {
+    function plainMain() {
+      return { ...primaryAgent, edges: [] };
+    }
+
+    function prepareCatalogRequest(agent = plainMain()) {
+      const req = makeRequest();
+      mockLoadAgent.mockResolvedValue(agent);
+      mockInitializeAgent.mockImplementation(async ({ agent: selected }) =>
+        makeInitializedConfig(selected),
+      );
+      return req;
+    }
+
+    async function buildFor(req, agent = plainMain()) {
+      return buildOptions(req, 'agents', { agent_id: agent.id, model: agent.model }, undefined);
+    }
+
+    test.each([
+      ['cold catalog hidden behind existing request work', 35, 184, 185, 220],
+      ['warm catalog', 35, 0, 0, 35],
+      ['catalog remains the critical path', 35, 300, 185, 300],
+    ])(
+      'joins %s without adding a second catalog read',
+      async (_label, agentMs, catalogMs, requestMs, expectedMs) => {
+        jest.useFakeTimers();
+        jest.setSystemTime(0);
+        try {
+          const req = prepareCatalogRequest();
+          const catalog = { openAI: [primaryAgent.model], otherLegalEndpoint: ['other-model'] };
+          mockLoadAgent.mockImplementation(
+            () => new Promise((resolve) => setTimeout(() => resolve(plainMain()), agentMs)),
+          );
+          getModelsConfig.mockImplementation(() =>
+            catalogMs === 0
+              ? Promise.resolve(catalog)
+              : new Promise((resolve) => setTimeout(() => resolve(catalog), catalogMs)),
+          );
+          let completedAt;
+          const pipeline = (async () => {
+            const endpointOption = await buildFor(req);
+            if (requestMs) {
+              await new Promise((resolve) => setTimeout(resolve, requestMs));
+            }
+            const result = await initializeClient({ req, res: {}, signal: null, endpointOption });
+            completedAt = Date.now();
+            return result;
+          })();
+          await jest.advanceTimersByTimeAsync(agentMs + catalogMs + requestMs + 100);
+          await pipeline;
+          expect(getModelsConfig).toHaveBeenCalledTimes(1);
+          expect(getModelsConfig).toHaveBeenCalledWith(req);
+          expect(mockValidateAgentModel.mock.calls[0][0].modelsConfig).toBe(catalog);
+          expect(completedAt).toBe(expectedMs);
+        } finally {
+          jest.useRealTimers();
+        }
+      },
+    );
+
+    test('starts one complete catalog while the agent is pending and reuses it by identity', async () => {
+      const req = prepareCatalogRequest();
+      let releaseAgent;
+      const agent = { ...plainMain(), avatar: { filepath: '/synthetic-avatar' } };
+      mockLoadAgent.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            releaseAgent = resolve;
+          }),
+      );
+      const catalog = {
+        openAI: [agent.model],
+        native: ['legal-native-model'],
+        additional: ['legal-model'],
+      };
+      getModelsConfig.mockResolvedValue(catalog);
+      req.body.addedConvo = { conversationId: 'additional-synthetic' };
+      const pending = buildFor(req, agent);
+      const callsWhileAgentPending = getModelsConfig.mock.calls.length;
+      releaseAgent(agent);
+      const endpointOption = await pending;
+      const carriedPromise = endpointOption.modelsConfigPromise;
+      const { client } = await initializeClient({ req, res: {}, signal: null, endpointOption });
+      expect(callsWhileAgentPending).toBe(1);
+      expect(carriedPromise).toBeDefined();
+      expect(await carriedPromise).toBe(catalog);
+      expect(mockValidateAgentModel.mock.calls[0][0].modelsConfig).toBe(catalog);
+      expect(mockApplyVoiceModelOverride.mock.calls[0][2]).toBe(catalog);
+      expect(getModelsConfig).toHaveBeenCalledTimes(1);
+      expect(mockLoadAgent).toHaveBeenCalledTimes(1);
+      expect(endpointOption).not.toHaveProperty('modelsConfigPromise');
+      expect(endpointOption).not.toHaveProperty('agent');
+      expect(endpointOption.iconURL).toBe('/synthetic-avatar');
+      expect(endpointOption.addedConvo).toBe(req.body.addedConvo);
+      expect(client.options).not.toHaveProperty('modelsConfigPromise');
+    });
+
+    test('legacy resolved-agent initialization loads exactly one catalog', async () => {
+      const req = prepareCatalogRequest();
+      const catalog = { openAI: [primaryAgent.model] };
+      getModelsConfig.mockResolvedValue(catalog);
+      const endpointOption = {
+        agent: Promise.resolve(plainMain()),
+        model_parameters: { model: primaryAgent.model },
+      };
+      await initializeClient({ req, res: {}, signal: null, endpointOption });
+      expect(getModelsConfig).toHaveBeenCalledTimes(1);
+      expect(mockLoadAgent).not.toHaveBeenCalled();
+      expect(mockValidateAgentModel.mock.calls[0][0].modelsConfig).toBe(catalog);
+    });
+
+    test('keeps an early catalog rejection for the consumer without unhandled rejection', async () => {
+      const req = prepareCatalogRequest();
+      const catalogError = new Error('Synthetic catalog unavailable');
+      let releaseAgent;
+      mockLoadAgent.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            releaseAgent = resolve;
+          }),
+      );
+      getModelsConfig.mockImplementation(() => Promise.reject(catalogError));
+      const unhandled = [];
+      const onUnhandled = (reason) => unhandled.push(reason);
+      process.on('unhandledRejection', onUnhandled);
+      try {
+        const pending = buildFor(req);
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+        const callsWhileAgentPending = getModelsConfig.mock.calls.length;
+        releaseAgent(plainMain());
+        const endpointOption = await pending;
+        await expect(initializeClient({ req, res: {}, signal: null, endpointOption })).rejects.toBe(
+          catalogError,
+        );
+        expect(callsWhileAgentPending).toBe(1);
+        expect(unhandled).toEqual([]);
+        expect(getModelsConfig).toHaveBeenCalledTimes(1);
+        expect(mockValidateAgentModel).not.toHaveBeenCalled();
+        expect(mockInitializeAgent).not.toHaveBeenCalled();
+      } finally {
+        process.removeListener('unhandledRejection', onUnhandled);
+      }
+    });
+
+    test('observes catalog rejection when an accepted build never reaches initialization', async () => {
+      const req = prepareCatalogRequest();
+      const catalogError = new Error('Synthetic interrupted catalog');
+      getModelsConfig.mockImplementation(() => Promise.reject(catalogError));
+      const unhandled = [];
+      const onUnhandled = (reason) => unhandled.push(reason);
+      process.on('unhandledRejection', onUnhandled);
+      try {
+        await buildFor(req);
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(getModelsConfig).toHaveBeenCalledTimes(1);
+        expect(unhandled).toEqual([]);
+        expect(mockInitializeAgent).not.toHaveBeenCalled();
+      } finally {
+        process.removeListener('unhandledRejection', onUnhandled);
+      }
+    });
+
+    test.each([false, true])(
+      'retains agent load error and catalog error precedence (catalog rejects=%s)',
+      async (catalogRejects) => {
+        const req = prepareCatalogRequest();
+        const agentError = new Error('Synthetic agent unavailable');
+        const catalogError = new Error('Synthetic catalog unavailable');
+        mockLoadAgent.mockRejectedValue(agentError);
+        getModelsConfig.mockImplementation(() =>
+          catalogRejects ? Promise.reject(catalogError) : Promise.resolve({}),
+        );
+        const endpointOption = await buildFor(req);
+        expect(await endpointOption.agent).toBeUndefined();
+        if (catalogRejects) {
+          await expect(
+            initializeClient({ req, res: {}, signal: null, endpointOption }),
+          ).rejects.toBe(catalogError);
+        } else {
+          await expect(
+            initializeClient({ req, res: {}, signal: null, endpointOption }),
+          ).rejects.toThrow('Agent not found');
+        }
+        const { logger } = require('@librechat/data-schemas');
+        expect(logger.error).toHaveBeenCalledWith(
+          expect.stringContaining('Error retrieving agent during build options step'),
+          agentError,
+        );
+        expect(getModelsConfig).toHaveBeenCalledTimes(1);
+        expect(mockInitializeAgent).not.toHaveBeenCalled();
+      },
+    );
+
+    test('still rejects an unsupported stored selection before native initialization', async () => {
+      const req = prepareCatalogRequest();
+      const validationError = { message: 'Synthetic selection rejected' };
+      mockValidateAgentModel.mockResolvedValue({ isValid: false, error: validationError });
+      const catalog = {
+        openAI: ['different-legal-model'],
+        anotherEndpoint: ['another-legal-model'],
+      };
+      getModelsConfig.mockResolvedValue(catalog);
+      const endpointOption = await buildFor(req);
+      await expect(
+        initializeClient({ req, res: {}, signal: null, endpointOption }),
+      ).rejects.toThrow(validationError.message);
+      expect(mockValidateAgentModel.mock.calls[0][0].modelsConfig).toBe(catalog);
+      expect(mockInitializeAgent).not.toHaveBeenCalled();
+      expect(mockResolveFallbackCandidates).not.toHaveBeenCalled();
+      expect(getModelsConfig).toHaveBeenCalledTimes(1);
+    });
+
+    test('retains High, tools, full workspace authority and the complete native catalog', async () => {
+      const nativeMain = {
+        ...plainMain(),
+        provider: 'glasshive-harness',
+        model: 'synthetic-native-model',
+        instructions: 'Stable native policy.',
+        tools: ['file_search', 'synthetic-connected-tool'],
+        model_parameters: { reasoning_effort: 'high' },
+        glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
+      };
+      const expectedDigest = conversationProviderStableAuthorityDigest(nativeMain);
+      const req = prepareCatalogRequest(nativeMain);
+      const catalog = {
+        'glasshive-harness': [nativeMain.model, 'other-legal-native-model'],
+        openAI: ['other-legal-model'],
+        additionalEndpoint: ['additional-legal-model'],
+      };
+      getModelsConfig.mockResolvedValue(catalog);
+      Object.assign(req.config.endpoints.agents.providerCapabilities['glasshive-harness'], {
+        conversation_session: true,
+        native_session_authority: 'stable_authority_v1',
+      });
+      mockInitializeAgent.mockImplementation(async ({ agent }) => {
+        expect(agent.model_parameters.reasoning_effort).toBe('high');
+        expect(agent.tools).toEqual(nativeMain.tools);
+        expect(agent.glasshive_options).toEqual(nativeMain.glasshive_options);
+        const config = makeInitializedConfig(agent);
+        config.model_parameters.configuration.defaultHeaders['X-GlassHive-Agent-Id'] = agent.id;
+        return config;
+      });
+      const endpointOption = await buildFor(req, nativeMain);
+      const { client } = await initializeClient({ req, res: {}, signal: null, endpointOption });
+      expect(mockValidateAgentModel.mock.calls[0][0].modelsConfig).toBe(catalog);
+      expect(
+        client.options.agent.model_parameters.configuration.defaultHeaders[
+          'X-GlassHive-Stable-Authority-SHA256'
+        ],
+      ).toBe(expectedDigest);
+      expect(client.options.agent.model).toBe(nativeMain.model);
+      expect(getModelsConfig).toHaveBeenCalledTimes(1);
+      expect(mockStartParallelWorkTurnAuthority.mock.invocationCallOrder[0]).toBeLessThan(
+        mockInitializeAgent.mock.invocationCallOrder[0],
+      );
+    });
   });
 });

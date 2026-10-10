@@ -90,3 +90,25 @@ test('preserves authorized participant text without fabricating audio evidence',
     setup({ ...session, revision: 2 }).assertVoiceWorkAuthority(typed, 'owner-1'),
   ).rejects.toThrow();
 });
+
+
+test('track-only Call work remains bound to current owner, call and revision', async () => {
+  const trackSegment = { ...segment, speaker: { ...segment.speaker, source: 'participant_track' } };
+  const trackBinding = createVoiceWorkAuthorityBinding({ session, segments: [trackSegment] })!;
+  expect(trackBinding).not.toBeNull();
+  await expect(setup(session, [trackSegment]).assertVoiceWorkAuthority(trackBinding, 'owner-1')).resolves.toBeUndefined();
+  for (const changed of [ { mode: 'wing' }, { mode: 'listen_only' }, { status: 'ended' },
+    { userId: 'other-owner' }, { callSessionId: 'other-call' }, { revision: 2 },
+    { speakerSessionRevision: 3 } ]) {
+    await expect(setup({ ...session, ...changed }, [trackSegment])
+      .assertVoiceWorkAuthority(trackBinding, 'owner-1')).rejects.toMatchObject({ code: 'voice_work_authority_stale' });
+  }
+  await expect(setup(session, [{ ...trackSegment, revision: 2 }])
+    .assertVoiceWorkAuthority(trackBinding, 'owner-1')).rejects.toMatchObject({ code: 'voice_work_authority_stale' });
+});
+
+test('an unexpired Wing engagement cannot grant track-only work authority', () => {
+  const trackSegment = { ...segment, speaker: { ...segment.speaker, source: 'participant_track' } };
+  expect(createVoiceWorkAuthorityBinding({ session: { ...session, mode: 'wing' },
+    segments: [trackSegment], engagement: { expiresAtMs: Date.now() + 60_000 } })).toBeNull();
+});

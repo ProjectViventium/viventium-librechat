@@ -103,6 +103,13 @@ test('coalesced mission files retain distinct names for the same bytes and dedup
     messageId: 'actual-message',
     conversationId: 'actual-conversation',
     agent_id: 'main',
+    text: '[Download](https://artifacts.example.test/v1/link-refs/ghr_1234567890abcdef)',
+    content: [
+      {
+        type: 'text',
+        text: '[Download](https://artifacts.example.test/v1/link-refs/ghr_1234567890abcdef)',
+      },
+    ],
   };
   const result = await prepareMissionOutputFiles({ req: req(), rows: [row, row], message });
   expect(result).toEqual([{ file_id: 'result.csv' }, { file_id: 'copy.csv' }]);
@@ -120,6 +127,10 @@ test('coalesced mission files retain distinct names for the same bytes and dedup
     attemptId: 'attempt',
   });
   expect(mockImport.mock.calls[0][2].maxBytes).toBe(10_485_760);
+  expect(message.text).toBe(
+    '[Download](https://artifacts.example.test/v1/link-refs/ghr_1234567890abcdef)',
+  );
+  expect(message.content).toEqual([{ type: 'text', text: message.text }]);
 });
 test('uses the configured server and endpoint byte limits', () => {
   expect(nativeOutputFileLimit(req())).toBe(30 * 1024 * 1024);

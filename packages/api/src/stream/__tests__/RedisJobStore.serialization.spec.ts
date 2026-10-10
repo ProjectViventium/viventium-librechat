@@ -1,3 +1,5 @@
+import IoRedis from 'ioredis';
+import type { StandardGraph } from '@librechat/agents';
 import type { Redis } from 'ioredis';
 import type { SerializableJobData } from '../interfaces/IJobStore';
 import { RedisJobStore } from '../implementations/RedisJobStore';
@@ -13,11 +15,50 @@ describe('RedisJobStore job serialization', () => {
       serializeJob(value: Record<string, unknown>): Record<string, string>;
       deserializeJob(value: Record<string, string>): Record<string, unknown>;
     };
-    const identity = { viventiumCallSessionId: 'voice-call', viventiumVoiceTaskId: 'voice-task',
-      viventiumVoiceEffectAuthority: { version: 1, mode: 'call', source: 'synthetic' } };
-    const restored = codec.deserializeJob(codec.serializeJob({ streamId: 'voice-stream',
-      userId: 'voice-owner', createdAt: 1, status: 'complete', ...identity }));
+    const identity = {
+      viventiumCallSessionId: 'voice-call',
+      viventiumVoiceTaskId: 'voice-task',
+      viventiumVoiceEffectAuthority: { version: 1, mode: 'call', source: 'synthetic' },
+      viventiumVoiceWorkAuthority: {
+        version: 1, callSessionId: 'voice-call', userId: 'voice-owner',
+        kind: 'participant_text', fingerprint: 'a'.repeat(64), turnIds: [],
+      },
+    };
+    const restored = codec.deserializeJob(
+      codec.serializeJob({
+        streamId: 'voice-stream',
+        userId: 'voice-owner',
+        createdAt: 1,
+        status: 'complete',
+        ...identity,
+      }),
+    );
     expect(restored).toMatchObject(identity);
+  });
+  it('retains every exact committed effect receipt across Redis hydration', () => {
+    const store = new RedisJobStore({} as Redis);
+    const codec = store as unknown as {
+      serializeJob(value: Record<string, unknown>): Record<string, string>;
+      deserializeJob(value: Record<string, string>): Record<string, unknown>;
+    };
+    const receipt = {
+      effect_kind: 'durable_work_accepted',
+      effect_ref: 'worker-a',
+      source_event_id: 'source-a',
+      response_message_id: 'response-a',
+      committed_at: 1_725_000_000_001,
+    };
+    const sibling = { ...receipt, effect_ref: 'worker-b' };
+    const restored = codec.deserializeJob(codec.serializeJob({
+      streamId: 'effect-stream',
+      userId: 'effect-owner',
+      createdAt: 1,
+      status: 'superseded',
+      durableEffectReceipt: receipt,
+      durableEffectReceipts: [receipt, sibling],
+    }));
+    expect(restored.durableEffectReceipt).toEqual(receipt);
+    expect(restored.durableEffectReceipts).toEqual([receipt, sibling]);
   });
   it('uses Redis TIME and co-slotted TTL fencing for durable source-order observation', async () => {
     const redis = {
@@ -404,3 +445,102 @@ describe('Redis typed terminal error hydration', () => {
   );
 });
 /* === VIVENTIUM END === */
+
+/* Both live memory and cross-instance Redis resume retain the same envelope choices. */
+describe('Redis reconstructed delivery disposition', () => {
+  it.each([
+    ['eligible', 'skip'],
+    ['skip', 'eligible'],
+  ] as const)('retains %s then %s on one native content index', async (first, second) => {
+    const redis = new IoRedis({ lazyConnect: true });
+    const store = new RedisJobStore(redis);
+    const decision = (audio: string) => ({
+      version: 1,
+      audio,
+      source: 'model',
+      valid: true,
+      required: true,
+    });
+    const chunks = [
+      {
+        event: 'on_run_step',
+        data: {
+          id: 'native-main',
+          index: 0,
+          agentId: 'main',
+          stepDetails: { type: 'message_creation' },
+        },
+      },
+      ...[first, second].map((audio, index) => ({
+        event: 'on_message_delta',
+        data: {
+          id: 'native-main',
+          delta: {
+            content: [{ type: 'text', text: index ? 'Result.' : 'Update. ' }],
+            metadata: { viventium: { deliveryDisposition: decision(audio) } },
+          },
+        },
+      })),
+    ];
+    jest
+      .spyOn(redis, 'xrange')
+      .mockResolvedValue(
+        chunks.map((chunk, index) => [`${index + 1}-0`, ['event', JSON.stringify(chunk)]]),
+      );
+    expect((await store.getContentParts('mixed-resume'))?.content).toEqual([
+      {
+        type: 'text',
+        agentId: 'main',
+        text: 'Update. Result.',
+        deliveryDispositionRanges: [
+          { start: 0, end: 8, disposition: decision(first) },
+          { start: 8, end: 15, disposition: decision(second) },
+        ],
+      },
+    ]);
+  });
+});
+
+describe('Redis local visible aggregation', () => {
+  it('uses Core visible text and choices even when the raw graph contains hidden specialist text', async () => {
+    const redis = new IoRedis({ lazyConnect: true });
+    jest.spyOn(redis, 'xrange').mockResolvedValue([]);
+    const store = new RedisJobStore(redis);
+    const decision = { version: 1, audio: 'skip', source: 'model', valid: true, required: true };
+    const publicParts = [
+      {
+        type: 'text' as const,
+        agentId: 'main',
+        text: 'Public text-only result.',
+        deliveryDispositionRanges: [{ start: 0, end: 24, disposition: decision }],
+      },
+    ];
+    const graph = {
+      getContentParts: jest.fn(() => [
+        { type: 'text', agentId: 'specialist', text: 'Hidden specialist evidence.' },
+      ]),
+      getRunSteps: jest.fn(() => [{ id: 'public-step' }]),
+    };
+    store.setContentParts('local-visible', publicParts);
+    store.setGraph('local-visible', graph as unknown as StandardGraph);
+    expect((await store.getContentParts('local-visible'))?.content).toBe(publicParts);
+    expect(graph.getContentParts).not.toHaveBeenCalled();
+    expect(redis.xrange).not.toHaveBeenCalled();
+    expect(await store.getRunSteps('local-visible')).toEqual([{ id: 'public-step' }]);
+    await store.destroy();
+  });
+  it('does not expose raw graph text before the first public delta', async () => {
+    const redis = new IoRedis({ lazyConnect: true });
+    jest.spyOn(redis, 'xrange').mockResolvedValue([]);
+    const store = new RedisJobStore(redis);
+    const graph = {
+      getContentParts: jest.fn(() => [{ type: 'text', text: 'Hidden early evidence.' }]),
+    };
+    store.setGraph('before-visible', graph as unknown as StandardGraph);
+    store.setContentParts('before-visible', []);
+    expect((await store.getContentParts('before-visible'))?.content).toEqual([]);
+    expect(graph.getContentParts).not.toHaveBeenCalled();
+    expect(redis.xrange).not.toHaveBeenCalled();
+    await store.destroy();
+  });
+});

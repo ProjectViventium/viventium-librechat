@@ -4,6 +4,7 @@ let mockAcknowledgeDelivery;
 let mockAcknowledgeDurableEffectDelivery;
 let mockAcknowledgeServerCommittedTransportReceipt;
 let mockHasAcceptedGlassHiveLaunchForPresentation;
+const mockRefreshVoiceTaskCommittedPresentation = jest.fn();
 const mockMessageUpdateOne = jest.fn();
 const mockMessageFindOneAndDelete = jest.fn();
 const mockMessageFindOne = jest.fn();
@@ -15,9 +16,10 @@ const mockMarkCortexTelegramPresentation = jest.fn();
 const mockMarkCortexTelegramPresentationFailed = jest.fn();
 const mockConsumeLocalQaCortexFault = jest.fn();
 const mockTelegramInputDeliveryCoverage = jest.fn(() => null);
+const mockAcknowledgeMongoDurableEffectDelivery = jest.fn();
 
 jest.mock('@librechat/data-schemas', () => ({
-  logger: { error: jest.fn() },
+  logger: { error: jest.fn(), warn: jest.fn() },
 }));
 
 jest.mock('@librechat/api', () => ({
@@ -37,6 +39,11 @@ jest.mock('~/server/services/viventium/GlassHiveCallbackBindingService', () => (
     mockHasAcceptedGlassHiveLaunchForPresentation(...args),
 }));
 
+jest.mock('~/server/services/viventium/VoiceTaskService', () => ({
+  refreshVoiceTaskCommittedPresentation: (...args) =>
+    mockRefreshVoiceTaskCommittedPresentation(...args),
+}));
+
 jest.mock('~/db/models', () => ({
   Message: {
     updateOne: (...args) => mockMessageUpdateOne(...args),
@@ -53,6 +60,10 @@ jest.mock('~/server/services/viventium/TelegramReplyProvenanceService', () => ({
 jest.mock('~/server/services/viventium/ViventiumMainContinuityService', () => ({
   commitAcceptedMainTurnFromPresentation: (...args) =>
     mockCommitAcceptedMainTurnFromPresentation(...args),
+}));
+
+jest.mock('~/server/services/viventium/InteractionDurableEffectService', () => ({
+  acknowledgeDurableEffectDelivery: (...args) => mockAcknowledgeMongoDurableEffectDelivery(...args),
 }));
 
 jest.mock('~/server/services/viventium/CortexInsightDeliveryService', () => ({
@@ -136,8 +147,10 @@ async function dispatch(app, req, res) {
 describe('POST /api/viventium/interactions/delivery-ack', () => {
   beforeEach(() => {
     mockTelegramInputDeliveryCoverage.mockReset().mockReturnValue(null);
+    mockAcknowledgeMongoDurableEffectDelivery.mockReset().mockResolvedValue({ status: 'conflict' });
     jest.resetModules();
     mockMessageUpdateOne.mockReset().mockResolvedValue({ modifiedCount: 1 });
+    mockRefreshVoiceTaskCommittedPresentation.mockReset().mockResolvedValue(null);
     mockMessageFindOneAndDelete.mockReset().mockResolvedValue(null);
     mockMessageFindOne.mockReset().mockReturnValue({ select: () => ({ lean: async () => null }) });
     mockConversationUpdateOne.mockReset().mockResolvedValue({ modifiedCount: 1 });
@@ -186,6 +199,102 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
     delete process.env.VIVENTIUM_VOICE_INTERACTION_ADAPTER_SECRET;
   });
 
+  test('refreshes the Voice snapshot after Message persistence, Main acceptance and compaction', async () => {
+    const order = [];
+    mockMessageUpdateOne.mockImplementation(async () => {
+      order.push('persisted');
+      return { modifiedCount: 1 };
+    });
+    mockCommitAcceptedMainTurnFromPresentation.mockImplementation(async () => {
+      order.push('accepted');
+      return { status: 'committed' };
+    });
+    mockScheduleExternallyAcceptedMainCompaction.mockImplementation(() => {
+      order.push('compaction');
+      return true;
+    });
+    mockRefreshVoiceTaskCommittedPresentation.mockImplementation(async () => {
+      order.push('snapshot');
+      return null;
+    });
+    const router = require('../interactions');
+    const res = response();
+    await dispatch(
+      createApp(router),
+      request({
+        headers: { 'x-viventium-adapter-secret': 'voice-adapter-secret' },
+        body: {
+          logical_turn_id: 'turn-1',
+          revision: 2,
+          state: 'committed',
+          presentation_ref: 'voice-presentation',
+        },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(order).toEqual(['persisted', 'accepted', 'compaction', 'snapshot']);
+    expect(mockCommitAcceptedMainTurnFromPresentation).toHaveBeenCalledTimes(1);
+    expect(mockScheduleExternallyAcceptedMainCompaction).toHaveBeenCalledTimes(1);
+    expect(mockRefreshVoiceTaskCommittedPresentation).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'recorded' }),
+      'voice',
+    );
+  });
+
+  test('a failed Voice projection keeps the committed ACK and accepts Main only once', async () => {
+    const projectionError = new Error('private projection payload must not be logged');
+    projectionError.name = 'ProjectionUnavailable';
+    mockRefreshVoiceTaskCommittedPresentation.mockRejectedValueOnce(projectionError);
+    const router = require('../interactions');
+    const { logger } = require('@librechat/data-schemas');
+    const res = response();
+    await dispatch(
+      createApp(router),
+      request({
+        headers: { 'x-viventium-adapter-secret': 'voice-adapter-secret' },
+        body: {
+          logical_turn_id: 'turn-1',
+          revision: 2,
+          state: 'committed',
+          presentation_ref: 'voice-presentation',
+        },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ acknowledged: true, idempotent: false });
+    expect(mockMessageUpdateOne).toHaveBeenCalledTimes(1);
+    expect(mockCommitAcceptedMainTurnFromPresentation).toHaveBeenCalledTimes(1);
+    expect(mockScheduleExternallyAcceptedMainCompaction).toHaveBeenCalledTimes(1);
+    expect(mockRefreshVoiceTaskCommittedPresentation).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      '[VIVENTIUM][interactions/delivery-ack] Voice task projection unavailable',
+      { error: 'ProjectionUnavailable' },
+    );
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  test.each(['failed', 'partial_removed'])(
+    'does not announce files for %s Voice playback',
+    async (state) => {
+      mockAcknowledgeDelivery.mockResolvedValueOnce({
+        ...(await mockAcknowledgeDelivery()),
+        acknowledgement: { logical_turn_id: 'turn-1', revision: 2, state },
+      });
+      const router = require('../interactions'),
+        res = response();
+      await dispatch(
+        createApp(router),
+        request({
+          headers: { 'x-viventium-adapter-secret': 'voice-adapter-secret' },
+          body: { logical_turn_id: 'turn-1', revision: 2, state },
+        }),
+        res,
+      );
+      expect(mockRefreshVoiceTaskCommittedPresentation).not.toHaveBeenCalled();
+    },
+  );
   test.each([false, true])(
     'an unmatched presentation write only accepts an exact saved terminal receipt: %s',
     async (alreadySaved) => {
@@ -1190,6 +1299,198 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
     expect(res.statusCode).toBe(503);
   });
 
+  test.each([
+    ['finished', false, false, {}, 200],
+    ['unfinished', true, false, {}, 200],
+    ['idempotent', false, true, {}, 200],
+    ['foreign owner', false, false, { user: 'other-owner' }, 503],
+    ['foreign conversation', false, false, { conversationId: 'other-conversation' }, 503],
+    ['foreign response', false, false, { messageId: 'other-response' }, 503],
+    [
+      'foreign turn',
+      false,
+      false,
+      { 'metadata.viventium.interactionContext.logical_turn_id': 'other-turn' },
+      503,
+    ],
+    [
+      'different revision',
+      false,
+      false,
+      { 'metadata.viventium.interactionContext.revision': 3 },
+      503,
+    ],
+    ['user message', false, false, { isCreatedByUser: true }, 503],
+  ])(
+    'Mongo committed_effect persists only the owned %s presentation',
+    async (_case, unfinished, alreadySaved, changes, expectedStatus) => {
+      const acknowledgement = {
+        logical_turn_id: 'turn-1',
+        revision: 2,
+        state: 'committed_effect',
+        effect_ref: 'effect-1',
+        presentation_ref: 'telegram:1:10',
+        presentation_committed_at: 1725000000123,
+      };
+      const row = {
+        _id: 'message-row',
+        user: 'server-user',
+        messageId: 'server-response',
+        conversationId: 'server-conversation',
+        isCreatedByUser: false,
+        unfinished,
+        'metadata.viventium.interactionContext.logical_turn_id': 'turn-1',
+        'metadata.viventium.interactionContext.revision': 2,
+        ...changes,
+      };
+      if (alreadySaved) {
+        for (const [key, value] of Object.entries(acknowledgement)) {
+          row[`metadata.viventium.deliveryAcknowledgement.${key}`] = value;
+        }
+      }
+      const matches = (query) =>
+        Object.entries(query).every(([key, expected]) =>
+          expected?.$ne !== undefined ? row[key] !== expected.$ne : row[key] === expected,
+        );
+      mockMessageUpdateOne.mockImplementation(async (query) => ({
+        matchedCount: alreadySaved ? 0 : Number(matches(query)),
+        modifiedCount: alreadySaved ? 0 : Number(matches(query)),
+      }));
+      mockMessageFindOne.mockImplementation((query) => ({
+        select: () => ({ lean: async () => (matches(query) ? { _id: row._id } : null) }),
+      }));
+      mockAcknowledgeMongoDurableEffectDelivery.mockResolvedValue({
+        status: 'recorded',
+        acknowledgement,
+        idempotent: alreadySaved,
+        presentation: {
+          userId: 'server-user',
+          conversationId: 'server-conversation',
+          responseMessageId: 'server-response',
+          interactionContext: { logical_turn_id: 'turn-1', revision: 2 },
+        },
+      });
+      const res = response();
+      await dispatch(
+        createApp(require('../interactions')),
+        request({
+          headers: { 'x-viventium-adapter-secret': 'adapter-secret' },
+          body: { ...acknowledgement, state: 'committed' },
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(expectedStatus);
+      expect(mockAcknowledgeMongoDurableEffectDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({ effect_ref: 'effect-1', revision: 2 }),
+        'telegram',
+      );
+      expect(mockMessageUpdateOne).toHaveBeenCalledWith(
+        {
+          user: 'server-user',
+          messageId: 'server-response',
+          conversationId: 'server-conversation',
+          isCreatedByUser: { $ne: true },
+          'metadata.viventium.interactionContext.logical_turn_id': 'turn-1',
+          'metadata.viventium.interactionContext.revision': 2,
+        },
+        expect.objectContaining({
+          $set: expect.objectContaining({
+            unfinished: false,
+            'metadata.viventium.deliveryAcknowledgement': acknowledgement,
+          }),
+        }),
+      );
+      expect(mockCommitAcceptedMainTurnFromPresentation).toHaveBeenCalledTimes(
+        expectedStatus === 200 ? 1 : 0,
+      );
+      expect(mockRecordTelegramTransportReceipt).toHaveBeenCalledTimes(
+        expectedStatus === 200 ? 1 : 0,
+      );
+      if (alreadySaved) {
+        expect(mockMessageFindOne).toHaveBeenCalled();
+        expect(res.body).toEqual({ acknowledged: true, idempotent: true });
+      }
+    },
+  );
+
+  test('End failure retains an already completed canonical answer and its background evidence', async () => {
+    const result = await mockAcknowledgeDelivery();
+    result.acknowledgement.state = 'failed';
+    mockAcknowledgeDelivery.mockResolvedValue(result);
+    const canonical = {
+      text: 'Completed canonical answer.',
+      unfinished: false,
+      content: [
+        { type: 'text', text: 'Completed canonical answer.' },
+        ...[1, 2, 3].map((id) => ({
+          type: 'cortex_insight',
+          cortex_id: `cortex-${id}`,
+          insight: `Evidence ${id}.`,
+        })),
+      ],
+      metadata: {
+        viventium: { backgroundInputs: [{ text: 'Exact accepted background evidence.' }] },
+      },
+    };
+    const original = JSON.stringify(canonical);
+    mockMessageUpdateOne.mockImplementation(async (query, update) => {
+      if (query.unfinished === true) return { matchedCount: 0, modifiedCount: 0 };
+      expect(query).toMatchObject({
+        user: result.presentation.userId,
+        messageId: result.presentation.responseMessageId,
+        'metadata.viventium.interactionContext.logical_turn_id':
+          result.presentation.interactionContext.logical_turn_id,
+        'metadata.viventium.interactionContext.revision':
+          result.presentation.interactionContext.revision,
+      });
+      expect(update.$set).toEqual({
+        'metadata.viventium.deliveryAcknowledgement': result.acknowledgement,
+      });
+      return { matchedCount: 1, modifiedCount: 1 };
+    });
+    const res = response();
+    await dispatch(
+      createApp(require('../interactions')),
+      request({
+        headers: { 'x-viventium-adapter-secret': 'adapter-secret' },
+        body: { logical_turn_id: 'turn-1', revision: 2, state: 'failed' },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(JSON.stringify(canonical)).toBe(original);
+    expect(mockMessageFindOneAndDelete).not.toHaveBeenCalled();
+    expect(mockCommitAcceptedMainTurnFromPresentation).not.toHaveBeenCalled();
+    expect(mockRefreshVoiceTaskCommittedPresentation).not.toHaveBeenCalled();
+  });
+
+  test.each([false, true])(
+    'a failed receipt retains canonical completion state: %s',
+    async (unfinished) => {
+      const result = await mockAcknowledgeDelivery();
+      result.acknowledgement.state = 'failed';
+      mockAcknowledgeDelivery.mockResolvedValue(result);
+      mockMessageUpdateOne.mockImplementation(async (query) => ({
+        matchedCount: Number(query.unfinished === undefined),
+        modifiedCount: Number(query.unfinished === undefined),
+      }));
+      const res = response();
+      await dispatch(
+        createApp(require('../interactions')),
+        request({
+          headers: { 'x-viventium-adapter-secret': 'adapter-secret' },
+          body: { logical_turn_id: 'turn-1', revision: 2, state: 'failed' },
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(200);
+      expect(mockMessageUpdateOne.mock.calls[0][0]).not.toHaveProperty('unfinished');
+      expect(mockMessageUpdateOne.mock.calls[0][1].$set).not.toHaveProperty('unfinished');
+      expect(mockCommitAcceptedMainTurnFromPresentation).not.toHaveBeenCalled();
+      expect(mockAcknowledgeMongoDurableEffectDelivery).not.toHaveBeenCalled();
+    },
+  );
+
   test('lets the manager-owned exact receipt authorize an older durable presentation', async () => {
     const presentation = {
       userId: 'server-user',
@@ -1244,7 +1545,7 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
       'telegram',
     );
     expect(mockMessageUpdateOne).toHaveBeenCalledWith(
-      expect.objectContaining({ messageId: 'server-response-old', unfinished: true }),
+      expect.objectContaining({ messageId: 'server-response-old' }),
       expect.objectContaining({
         $set: expect.objectContaining({ unfinished: false }),
       }),
@@ -1392,7 +1693,7 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
 
     expect(res.statusCode).toBe(200);
     expect(mockMessageUpdateOne).toHaveBeenCalledWith(
-      expect.objectContaining({ messageId: 'failed-response', unfinished: true }),
+      expect.objectContaining({ messageId: 'failed-response' }),
       {
         $set: {
           'metadata.viventium.deliveryAcknowledgement': {
@@ -1477,5 +1778,306 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
     expect(res.body).toEqual({ acknowledged: false, error: 'persistence_unavailable' });
     expect(JSON.stringify(res.body)).not.toContain('private backend detail');
     expect(JSON.stringify(res.body)).not.toContain('adapter-secret');
+  });
+
+  describe('Native producer retention after speech removal', () => {
+    function matches(row, query) {
+      if (!row) return false;
+      return Object.entries(query).every(([key, expected]) => {
+        if (key === '$nor') return !expected.some((filter) => matches(row, filter));
+        const actual = key.split('.').reduce((value, part) => value?.[part], row);
+        if (expected && typeof expected === 'object' && !Array.isArray(expected)) {
+          if ('$ne' in expected) return actual !== expected.$ne;
+          if ('$nin' in expected) return !expected.$nin.includes(actual);
+          if ('$in' in expected) return expected.$in.includes(actual);
+          if ('$gt' in expected) return actual > expected.$gt;
+        }
+        return expected === null ? actual == null : actual === expected;
+      });
+    }
+
+    function setupRow(status = 'pending', overrides = {}) {
+      let row = {
+        _id: 'mongo-native-id',
+        user: 'server-user',
+        conversationId: 'server-conversation',
+        messageId: 'native-response',
+        isCreatedByUser: false,
+        unfinished: true,
+        deletedAt: null,
+        text: '',
+        content: [],
+        metadata: { viventium: { interactionContext: { logical_turn_id: 'turn-1', revision: 1 } } },
+        ...(status == null
+          ? {}
+          : {
+              nativeResponse: {
+                userId: 'server-user',
+                conversationId: 'server-conversation',
+                responseMessageId: 'native-response',
+                streamId: 'native-stream',
+                jobCreatedAt: 100,
+                logicalTurnId: 'turn-1',
+                revision: 1,
+                invocationId: 'native-invocation',
+                bodySha256: 'body-sha',
+                status,
+              },
+            }),
+        ...overrides,
+      };
+      const identity = row.nativeResponse;
+      mockMessageFindOneAndDelete.mockImplementation(async (query) => {
+        if (!matches(row, query)) return null;
+        const removed = row;
+        row = null;
+        return removed;
+      });
+      const model = {
+        findOne(query) {
+          return {
+            select: () => ({
+              lean: async () => (matches(row, query) ? structuredClone(row) : null),
+            }),
+          };
+        },
+        async findOneAndUpdate(query, update) {
+          if (!matches(row, query)) return null;
+          row = { ...row, ...structuredClone(update.$set) };
+          return { toObject: () => structuredClone(row) };
+        },
+      };
+      // Exercise the installed canonical Native snapshot method after the actual route ACK.
+      const { createNativeResponseMethods } = jest.requireActual('@librechat/data-schemas');
+      const writer = createNativeResponseMethods({ model: () => model });
+      mockAcknowledgeDelivery.mockResolvedValue({
+        status: 'recorded',
+        ownerStreamId: 'native-stream',
+        acknowledgement: { logical_turn_id: 'turn-1', revision: 1, state: 'partial_removed' },
+        presentation: {
+          userId: 'server-user',
+          conversationId: 'server-conversation',
+          responseMessageId: 'native-response',
+          interactionContext: { logical_turn_id: 'turn-1', revision: 1 },
+        },
+      });
+      return { getRow: () => row, writer, identity };
+    }
+
+    async function removeSpeech() {
+      const router = require('../interactions');
+      const res = response();
+      await dispatch(
+        createApp(router),
+        request({
+          headers: { 'x-viventium-adapter-secret': 'voice-adapter-secret' },
+          body: { logical_turn_id: 'turn-1', revision: 1, state: 'partial_removed' },
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(200);
+      expect(res.body.acknowledged).toBe(true);
+      expect(mockCommitAcceptedMainTurnFromPresentation).not.toHaveBeenCalled();
+      expect(mockScheduleExternallyAcceptedMainCompaction).not.toHaveBeenCalled();
+      expect(mockRefreshVoiceTaskCommittedPresentation).not.toHaveBeenCalled();
+      return res;
+    }
+
+    test.each(['pending', 'prepared'])(
+      'retains %s Native admission and permits canonical snapshots after End speech removal',
+      async (status) => {
+        const fixture = setupRow(status);
+        await removeSpeech();
+        expect(fixture.getRow()).not.toBeNull();
+        expect(fixture.getRow().nativeResponse.status).toBe(status);
+        await expect(
+          fixture.writer.saveNativeResponseSnapshot(
+            'server-user',
+            {
+              messageId: 'native-response',
+              unfinished: true,
+              content: [{ type: 'text', text: 'progress' }],
+            },
+            fixture.identity,
+          ),
+        ).resolves.toEqual(
+          expect.objectContaining({ messageId: 'native-response', unfinished: true }),
+        );
+        expect(mockConversationUpdateOne).not.toHaveBeenCalled();
+        expect(mockMessageUpdateOne).not.toHaveBeenCalled();
+      },
+    );
+
+    test('duplicate partial removal does not destroy or commit the pending Native producer', async () => {
+      const fixture = setupRow();
+      await removeSpeech();
+      await removeSpeech();
+      expect(fixture.getRow()?.nativeResponse.status).toBe('pending');
+      expect(mockConversationUpdateOne).not.toHaveBeenCalled();
+    });
+
+    test.each(['cancelled', 'failed', 'unsupported', null])(
+      'keeps existing cleanup for %s terminal or ordinary unfinished output',
+      async (status) => {
+        const fixture = setupRow(status);
+        await removeSpeech();
+        expect(fixture.getRow()).toBeNull();
+        expect(mockConversationUpdateOne).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    test('does not remove a finished Native answer or resurrect a genuinely deleted answer', async () => {
+      const fixture = setupRow('completed', {
+        unfinished: false,
+        text: 'Completed answer.',
+        attachments: [{ type: 'file', file_id: 'native-file' }],
+      });
+      await removeSpeech();
+      expect(fixture.getRow()?.unfinished).toBe(false);
+      expect(fixture.getRow()?.attachments).toEqual([{ type: 'file', file_id: 'native-file' }]);
+      expect(mockConversationUpdateOne).not.toHaveBeenCalled();
+      await expect(
+        fixture.writer.saveNativeResponseSnapshot(
+          'server-user',
+          {
+            messageId: 'native-response',
+            unfinished: true,
+            text: 'Late partial',
+          },
+          fixture.identity,
+        ),
+      ).resolves.toEqual(
+        expect.objectContaining({
+          unfinished: false,
+          text: 'Completed answer.',
+          attachments: [{ type: 'file', file_id: 'native-file' }],
+        }),
+      );
+      mockMessageFindOneAndDelete.mockImplementation(async () => null);
+      const { createNativeResponseMethods } = jest.requireActual('@librechat/data-schemas');
+      const deletedWriter = createNativeResponseMethods({
+        model: () => ({
+          findOne: () => ({ select: () => ({ lean: async () => null }) }),
+        }),
+      });
+      await expect(
+        deletedWriter.saveNativeResponseSnapshot(
+          'server-user',
+          {
+            messageId: 'native-response',
+            unfinished: true,
+          },
+          fixture.identity,
+        ),
+      ).rejects.toThrow('native_response_message_deleted');
+    });
+
+    test('retains existing removal for inconsistent completed admission still marked unfinished', async () => {
+      // Canonical materialization atomically writes completed plus unfinished:false.
+      // This synthetic violation documents the narrow predicate, not a reachable product state.
+      const fixture = setupRow('completed', {
+        attachments: [{ type: 'file', file_id: 'native-file' }],
+      });
+      await removeSpeech();
+      expect(fixture.getRow()).toBeNull();
+    });
+
+    test.each([
+      { user: 'another-user' },
+      { conversationId: 'another-conversation' },
+      { messageId: 'another-response' },
+      { isCreatedByUser: true },
+      {
+        metadata: {
+          viventium: { interactionContext: { logical_turn_id: 'another-turn', revision: 1 } },
+        },
+      },
+      {
+        metadata: { viventium: { interactionContext: { logical_turn_id: 'turn-1', revision: 2 } } },
+      },
+    ])('retains exact owner and revision fences: %j', async (overrides) => {
+      const fixture = setupRow(null, overrides);
+      await removeSpeech();
+      expect(fixture.getRow()).not.toBeNull();
+      expect(mockConversationUpdateOne).not.toHaveBeenCalled();
+    });
+
+    test('retains the exact live producer placeholder before Native admission', async () => {
+      const fixture = setupRow(null);
+      const result = await mockAcknowledgeDelivery();
+      result.presentation.producerPending = true;
+      mockAcknowledgeDelivery.mockClear();
+      await removeSpeech();
+      expect(fixture.getRow()).not.toBeNull();
+      expect(fixture.getRow().nativeResponse).toBeUndefined();
+      expect(mockMessageFindOneAndDelete).not.toHaveBeenCalled();
+      expect(mockConversationUpdateOne).not.toHaveBeenCalled();
+      await removeSpeech();
+      expect(fixture.getRow()).not.toBeNull();
+      expect(mockMessageFindOneAndDelete).not.toHaveBeenCalled();
+    });
+
+    test.each([false, undefined])(
+      'cleans an ordinary placeholder without proven producer liveness: %s',
+      async (pending) => {
+        const fixture = setupRow(null);
+        const result = await mockAcknowledgeDelivery();
+        result.presentation.producerPending = pending;
+        mockAcknowledgeDelivery.mockClear();
+        await removeSpeech();
+        expect(fixture.getRow()).toBeNull();
+      },
+    );
+
+    test('does not accept producer liveness from the adapter request', async () => {
+      const fixture = setupRow(null);
+      const router = require('../interactions');
+      const res = response();
+      await dispatch(
+        createApp(router),
+        request({
+          headers: { 'x-viventium-adapter-secret': 'voice-adapter-secret' },
+          body: {
+            logical_turn_id: 'turn-1',
+            revision: 1,
+            state: 'partial_removed',
+            producerPending: true,
+          },
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(200);
+      expect(fixture.getRow()).toBeNull();
+    });
+
+    test('retains the canonical cancelled Stop snapshot during FINAL publication and duplicate removal', async () => {
+      const fixture = setupRow('cancelled');
+      fixture.getRow().nativeResponse.stopSnapshotStoredAt = 123;
+      await removeSpeech();
+      await removeSpeech();
+      expect(fixture.getRow()?.nativeResponse).toMatchObject({
+        status: 'cancelled',
+        stopSnapshotStoredAt: 123,
+      });
+      expect(mockConversationUpdateOne).not.toHaveBeenCalled();
+      expect(mockCommitAcceptedMainTurnFromPresentation).not.toHaveBeenCalled();
+    });
+
+    test.each([0, -1, null])(
+      'does not retain arbitrary cancellation with invalid Stop timestamp %s',
+      async (storedAt) => {
+        const fixture = setupRow('cancelled');
+        fixture.getRow().nativeResponse.stopSnapshotStoredAt = storedAt;
+        await removeSpeech();
+        expect(fixture.getRow()).toBeNull();
+      },
+    );
+
+    test('a failed admission cannot claim canonical Stop retention through its timestamp', async () => {
+      const fixture = setupRow('failed');
+      fixture.getRow().nativeResponse.stopSnapshotStoredAt = 123;
+      await removeSpeech();
+      expect(fixture.getRow()).toBeNull();
+    });
   });
 });

@@ -83,6 +83,13 @@ describe('ProgressText and background cortex status layout', () => {
     expect(screen.getByTestId('spinner')).toBeInTheDocument();
   });
 
+  it('renders an owned cancellation as terminal without an active spinner', () => {
+    render(<CortexCall cortex_id="specialist" cortex_name="Specialist" status="cancelled" />);
+    expect(screen.getByRole('button')).toHaveTextContent('Specialist · com_ui_cancelled');
+    expect(screen.queryByTestId('spinner')).not.toBeInTheDocument();
+    expect(screen.getByRole('button')).not.toHaveTextContent('error');
+  });
+
   it('does not mark a brewing background cortex cancelled after the main response finishes', () => {
     render(
       <CortexCall

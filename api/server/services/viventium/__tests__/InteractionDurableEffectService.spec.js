@@ -4,6 +4,10 @@ const mongoose = require('mongoose');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const { createModels } = require('@librechat/data-schemas');
 const {
+  createVoiceEngagementAuthorityService,
+  createVoiceWorkAuthorityBinding,
+} = require('@librechat/api');
+const {
   createInteractionDurableEffectService,
   createVoiceDurableEffectAuthorityBinding,
 } = require('../InteractionDurableEffectService');
@@ -105,6 +109,208 @@ describe('InteractionDurableEffectService', () => {
       ...overrides,
     };
   }
+
+  function typedService() {
+    session = { ...session, mode: 'call', status: 'active' };
+    segments = [];
+    delete job.metadata.viventiumVoiceEffectAuthority;
+    job.metadata.viventiumCallSessionId = session.callSessionId;
+    job.metadata.viventiumVoiceWorkAuthority = createVoiceWorkAuthorityBinding({
+      session,
+      segments: [],
+      typedInput: true,
+    });
+    const dependencies = {
+      getCallSession: jest.fn(async () => session),
+      listSpeakerSegments: jest.fn(async () => segments),
+      voiceTurnAuthority: jest.fn(),
+      verifyVoiceEngagementAttestation: jest.fn(),
+    };
+    const workAuthority = createVoiceEngagementAuthorityService(dependencies);
+    const build = () =>
+      createInteractionDurableEffectService({
+        EffectModel,
+        generationJobManager: { getJob: jest.fn(async () => JSON.parse(JSON.stringify(job))) },
+        getCallSession: dependencies.getCallSession,
+        listSpeakerSegments: dependencies.listSpeakerSegments,
+        assertVoiceWorkAuthority: workAuthority.assertVoiceWorkAuthority,
+        now: () => new Date(observedAt),
+        createClaimToken: () => 'typed-claim-token',
+      });
+    service = build();
+    return { dependencies, build };
+  }
+
+  test.each([
+    ['glasshive.worker_delegate.v1', 'durable_work_accepted', 'worker_delegate_once'],
+    ['glasshive.work_action.v1', 'durable_work_action_accepted', 'steer'],
+    ['mcp.provider_mutation.v1', 'provider_mutation_returned', 'provider_action'],
+  ])(
+    'typed Call reserves %s under existing WorkAuthority without audio evidence',
+    async (adapterId, effectKind, operation) => {
+      const { dependencies } = typedService();
+      const prepared = await service.prepareDurableEffect(
+        input(undefined, {
+          adapterId,
+          effectKind,
+          operation,
+        }),
+      );
+      expect(prepared.decision).toBe('dispatch');
+      const row = await EffectModel.findOne({ effectKey: prepared.effectKey }).lean();
+      expect(row.voiceAuthorityRef).toMatch(/^voice_authority_[a-f0-9]{64}$/);
+      expect(row.voice).toBeUndefined();
+      expect(row).toMatchObject({
+        ownerId: 'owner-1',
+        sourceEventId: 'voice:event-1',
+        surface: 'voice',
+        adapterId,
+        effectKind,
+        operation,
+      });
+      expect(dependencies.listSpeakerSegments).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each([
+    { mode: 'wing' },
+    { mode: 'listen_only' },
+    { status: 'ended' },
+    { status: 'failed' },
+    { revision: 3 },
+    { speakerSessionRevision: 5 },
+    { userId: 'other-owner' },
+    { callSessionId: 'other-call' },
+    { ownerParticipantIdentity: 'replacement-owner' },
+  ])('typed Call rejects changed current authority before creating a row: %j', async (change) => {
+    typedService();
+    session = { ...session, ...change };
+    await expect(service.prepareDurableEffect(input())).rejects.toMatchObject({
+      code: 'voice_work_authority_stale',
+      status: 409,
+      retryable: false,
+    });
+    expect(await EffectModel.countDocuments({})).toBe(0);
+  });
+
+  test.each(['foreign-owner', 'wrong-call', 'forged-fingerprint', 'mixed-audio'])(
+    'typed Call rejects an invalid retained binding: %s',
+    async (change) => {
+      typedService();
+      if (change === 'foreign-owner')
+        job.metadata.viventiumVoiceWorkAuthority.userId = 'other-owner';
+      if (change === 'wrong-call') job.metadata.viventiumCallSessionId = 'other-call';
+      if (change === 'forged-fingerprint')
+        job.metadata.viventiumVoiceWorkAuthority.fingerprint = 'forged';
+      if (change === 'mixed-audio')
+        job.metadata.viventiumVoiceEffectAuthority = { version: 1, voice: {} };
+      await expect(service.prepareDurableEffect(input())).rejects.toMatchObject({ status: 409 });
+      expect(await EffectModel.countDocuments({})).toBe(0);
+    },
+  );
+
+  test('typed Call rechecks restored job authority before committed replay', async () => {
+    const { build } = typedService();
+    const prepared = await service.prepareDurableEffect(input());
+    await service.commitDurableEffect({
+      effectKey: prepared.effectKey,
+      claimToken: prepared.claimToken,
+      providerReceiptRef: 'worker-action-accepted',
+      replayResult: { accepted: true },
+    });
+    service = build();
+    await expect(service.prepareDurableEffect(input())).resolves.toMatchObject({
+      decision: 'return_committed',
+      providerReceiptRef: 'worker-action-accepted',
+    });
+    session = { ...session, mode: 'listen_only' };
+    await expect(service.prepareDurableEffect(input())).rejects.toMatchObject({
+      code: 'voice_work_authority_stale',
+    });
+    expect(await EffectModel.countDocuments({})).toBe(1);
+  });
+
+  test('typed Call records an already accepted provider effect after End without allowing redispatch', async () => {
+    typedService();
+    const prepared = await service.prepareDurableEffect(input());
+    session = { ...session, status: 'ended' };
+    await expect(
+      service.commitDurableEffect({
+        effectKey: prepared.effectKey,
+        claimToken: prepared.claimToken,
+        providerReceiptRef: 'accepted-before-end',
+        replayResult: { accepted: true },
+      }),
+    ).resolves.toMatchObject({ status: 'committed', providerReceiptRef: 'accepted-before-end' });
+    await expect(service.prepareDurableEffect(input())).rejects.toMatchObject({
+      code: 'voice_work_authority_stale',
+    });
+    expect(await EffectModel.countDocuments({})).toBe(1);
+  });
+
+  test('a caller carrier cannot replace a missing server-held typed authority', async () => {
+    typedService();
+    const callerCarrier = job.metadata.viventiumVoiceWorkAuthority;
+    delete job.metadata.viventiumVoiceWorkAuthority;
+    await expect(
+      service.prepareDurableEffect(
+        input(undefined, {
+          viventiumVoiceWorkAuthority: callerCarrier,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'durable_effect_voice_authority_missing', status: 403 });
+    expect(await EffectModel.countDocuments({})).toBe(0);
+  });
+
+  test('a selected earlier source must belong to this current author revision', async () => {
+    job.metadata.interactionContext.source_segments = [
+      { source_event_id: 'earlier-owned', authoring_revision: 3 },
+      { source_event_id: 'foreign-author', authoring_revision: 2 },
+    ];
+    const claim = await service.prepareDurableEffect(
+      input(undefined, { sourceEventId: 'earlier-owned' }),
+    );
+    expect(await EffectModel.findOne({ effectKey: claim.effectKey }).lean()).toMatchObject({
+      sourceEventId: 'earlier-owned',
+      sourceRevision: 3,
+    });
+    await expect(
+      service.prepareDurableEffect(
+        input(undefined, {
+          sourceEventId: 'foreign-author',
+          effectOccurrenceRef: 'distinct-occurrence',
+          providerIdempotencyKey: 'distinct-provider-key',
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'source_mutation_source_not_owned' });
+    expect(await EffectModel.countDocuments({})).toBe(1);
+  });
+
+  test('typed connected mutation results persist without invented native deduplication', async () => {
+    const claim = await service.prepareDurableEffect(
+      input(
+        { synthetic: true },
+        {
+          adapterId: 'mcp.provider_mutation.v1',
+          effectKind: 'provider_mutation_returned',
+          providerIdempotencyMode: 'none',
+          routeId: 'connected-service',
+          operation: 'typed-write',
+        },
+      ),
+    );
+    await service.commitDurableEffect({
+      effectKey: claim.effectKey,
+      claimToken: claim.claimToken,
+      providerReceiptRef: 'core-operation-receipt',
+      replayResult: { result: 'returned' },
+    });
+    expect(await EffectModel.findOne({ effectKey: claim.effectKey }).lean()).toMatchObject({
+      status: 'committed',
+      providerIdempotencyMode: 'none',
+      effectKind: 'provider_mutation_returned',
+    });
+  });
 
   test('reserves in Mongo, commits there, and returns the committed replay', async () => {
     const prepared = await service.prepareDurableEffect(input());

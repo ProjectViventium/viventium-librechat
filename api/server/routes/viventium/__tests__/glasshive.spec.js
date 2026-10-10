@@ -321,6 +321,35 @@ describe('/api/viventium/glasshive/callback', () => {
     require('~/server/services/viventium/VoiceTaskService').resetVoiceTasksForTests();
   });
 
+  test.each([
+    ['run.completed', 'internal'],
+    ['run.failed', undefined],
+    ['run.needs_input', undefined],
+    ['artifact.created', undefined],
+  ])('keeps %s lifecycle visibility correct at first persistence', async (event, visibility) => {
+    const router = require('../glasshive');
+    const app = createTestApp(router);
+    const body = callbackBody({ event });
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.metadata.viventium.visibility).toBe(visibility);
+    expect(message.metadata.viventium.hasFullText).toBe(false);
+    expect(message.metadata.viventium.event).toBe(event);
+    expect(message.metadata.viventium.workRef).toBe(body.work_ref);
+    expect(message.content[0].text).toBe(message.text);
+  });
+
   test('maps signed voice worker callbacks into one monotonic run-scoped task', async () => {
     const {
       getVoiceTaskByStreamId,

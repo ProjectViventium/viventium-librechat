@@ -5,6 +5,7 @@
  * === VIVENTIUM END === */
 
 import crypto from 'node:crypto';
+import { createAccountApiRoute } from './accountClient';
 import type { VoiceWorkAuthorityBinding } from '../voice/engagementAuthority';
 import type { NativeWorkInputResponse } from 'librechat-data-provider';
 import { safeErrorCode } from '../logging/safeError';
@@ -24,6 +25,9 @@ export interface GlassHiveWorkActionInput {
   workRef?: unknown;
   action?: unknown;
   instruction?: unknown;
+  fileIds?: string[];
+  requestBody?: UnknownRecord;
+  serverReq?: unknown;
   nativeInput?: NativeWorkInputResponse;
   ownerInputControl?: boolean;
   operationId?: unknown;
@@ -51,6 +55,8 @@ export interface GlassHiveWorkActionDependencies {
   getActiveWorkSnapshot(input: UnknownRecord): Promise<unknown>;
   invalidateActiveWorkSnapshot(input: UnknownRecord): unknown;
   requestAccountApi(input: UnknownRecord): Promise<unknown>;
+  getActionFileSources?(input: GlassHiveWorkActionInput): Promise<ActionFileSource[]>;
+  fetchImpl?: typeof globalThis.fetch;
   reauthorizeCapabilityAuthorization(input: UnknownRecord): Promise<unknown>;
   dismissCoreOnlyPreDispatchAttention(input: UnknownRecord): Promise<unknown>;
   getCoreWorkDelivery(input: UnknownRecord): Promise<unknown>;
@@ -101,7 +107,72 @@ export function needsCapabilityReauthorization(detail: unknown = {}): boolean {
   return REAUTH_FAILURE_CODES.has(code);
 }
 
+export interface ActionFileSource {
+  fileId: string;
+  filename: string;
+  sizeBytes: number;
+  inputKind: 'original' | 'extracted_text';
+  mediaGroupIndex?: number;
+  openStream(): Promise<AsyncIterable<Uint8Array>>;
+}
+
 export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDependencies) {
+  async function prepareFileInputs(input: GlassHiveWorkActionInput, idempotencyKey: string) {
+    if (!input.fileIds?.length) return [];
+    if (!['steer', 'queue', 'message'].includes(String(input.action)) || new Set(input.fileIds).size !== input.fileIds.length || !deps.getActionFileSources) {
+      throw new Error('active_work_file_selection_invalid');
+    }
+    const detail = recordFrom(await deps.requestAccountApi({ownerId: input.ownerId,
+      path: `/v1/work/${encodeURIComponent(normalizedText(input.workRef))}?projection=actions`}));
+    if (!Array.isArray(detail.actions) || !detail.actions.includes(String(input.action))) {
+      throw new Error('active_work_action_not_available');
+    }
+    const sources = await deps.getActionFileSources(input);
+    if (sources.length !== input.fileIds.length || sources.some((file, index) => file.fileId !== input.fileIds?.[index])) {
+      throw new Error('active_work_file_selection_invalid');
+    }
+    const result: UnknownRecord[] = [];
+    for (const file of sources) {
+      const hash = crypto.createHash('sha256');
+      let size = 0;
+      for await (const chunk of await file.openStream()) { hash.update(chunk); size += chunk.byteLength; }
+      if (size !== file.sizeBytes) throw new Error('active_work_file_source_changed');
+      const sha256 = hash.digest('hex');
+      const uploadKey = crypto.createHash('sha256').update(JSON.stringify([idempotencyKey, file.fileId, file.filename, size, sha256, file.inputKind])).digest('hex');
+      let ready = recordFrom(await deps.requestAccountApi({ownerId: input.ownerId,
+        path: '/v1/file-uploads', method: 'POST', body: {
+          draft_id: `action-${crypto.createHash('sha256').update(idempotencyKey).digest('hex')}`,
+          name: file.filename, size_bytes: size, idempotency_key: uploadKey,
+        }}));
+      const uploadId = normalizedText(ready.upload_id);
+      if (!/^fil_[A-Za-z0-9]+$/.test(uploadId)) throw new Error('active_work_upload_receipt_invalid');
+      if (ready.state !== 'ready') {
+        const iterator = (await file.openStream())[Symbol.asyncIterator]();
+        const body = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            const next = await iterator.next();
+            if (next.done) controller.close(); else controller.enqueue(next.value);
+          },
+          async cancel() { await iterator.return?.(); },
+        });
+        const route = createAccountApiRoute({ ownerId: input.ownerId });
+        const response = await (deps.fetchImpl || globalThis.fetch)(`${route.baseURL}file-uploads/${uploadId}/content`, {
+          method: 'PUT', redirect: 'error', headers: {...route.headers, 'Content-Type': 'application/octet-stream', 'Content-Length': String(size)},
+          body, signal: AbortSignal.timeout(15000), ...{duplex: 'half'},
+        });
+        if (!response.ok) throw new Error('active_work_upload_rejected');
+        ready = recordFrom(await response.json());
+      }
+      if (ready.state !== 'ready' || ready.upload_id !== uploadId || ready.sha256 !== sha256 ||
+          ready.size_bytes !== size || ready.name !== file.filename || !normalizedText(ready.revision)) {
+        throw new Error('active_work_upload_content_unconfirmed');
+      }
+      result.push({ uploadId, revision: ready.revision, sha256, sizeBytes: size, filename: file.filename,
+        sourceFileId: file.fileId, inputKind: file.inputKind, ...(file.mediaGroupIndex === undefined ? {} : {mediaGroupIndex: file.mediaGroupIndex}) });
+    }
+    return result;
+  }
+
   async function trustedActionSourceContext({
     ownerId,
     workRef,
@@ -292,6 +363,8 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
       durableEffectContext,
     });
     await assertCurrentVoiceAuthority();
+    const fileInputs = await prepareFileInputs(input, idempotencyKey);
+    await assertCurrentVoiceAuthority();
     const result = await deps.requestAccountApi({
       ownerId,
       path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}/actions`,
@@ -304,6 +377,7 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
         ...(input.nativeInput ? { nativeInput: input.nativeInput } : {}),
         ...(capabilityReauthorization ? { capabilityReauthorization } : {}),
         ...(sourceContext ? { sourceContext } : {}),
+        ...(fileInputs.length ? { fileInputs } : {}),
       },
     });
     deps.invalidateActiveWorkSnapshot({ ownerId });

@@ -4,6 +4,7 @@ const { logger, nativeResponseParentSource } = require('@librechat/data-schemas'
 const {
   countTokens,
   buildDirectParentTurnContext,
+  attachInteractionContextMetadata,
   getBalanceConfig,
   buildMessageFiles,
   extractFileContext,
@@ -1079,13 +1080,18 @@ class BaseClient {
     }
 
     const hasAddedConvo = this.options?.req?.body?.addedConvo != null;
-    const messageToSave = attachVoiceMessageMetadata(this.options?.req, {
-      ...sanitizeVoiceAssistantMessageForPersistence(this.options?.req, message),
-      endpoint: this.options.endpoint,
-      unfinished: false,
-      user,
-      ...(hasAddedConvo && { addedConvo: true }),
-    });
+    /* === VIVENTIUM START === Preserve trusted source provenance on repeated client saves. === */
+    const messageToSave = attachInteractionContextMetadata(
+      this.options?.req,
+      attachVoiceMessageMetadata(this.options?.req, {
+        ...sanitizeVoiceAssistantMessageForPersistence(this.options?.req, message),
+        endpoint: this.options.endpoint,
+        unfinished: false,
+        user,
+        ...(hasAddedConvo && { addedConvo: true }),
+      }),
+    );
+    /* === VIVENTIUM END === */
     /* === VIVENTIUM START ===
      * Resumable requests persist assistants through the controller's current-revision fence.
      * Keep user input and conversation options under their existing owners.

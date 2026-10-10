@@ -7,6 +7,10 @@ const mongoose = require('mongoose');
 const crypto = require('crypto');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const { agentSchema } = require('@librechat/data-schemas');
+const mockGetAppConfig = jest.fn();
+jest.mock('~/server/services/Config', () => ({
+  getAppConfig: (...args) => mockGetAppConfig(...args),
+}));
 
 const {
   abandonVoiceSessionClaim,
@@ -67,6 +71,7 @@ describe('CallSessionService', () => {
   });
 
   beforeEach(async () => {
+    mockGetAppConfig.mockReset().mockResolvedValue({});
     process.env.VIVENTIUM_CALL_SESSION_SECRET = 'secret';
     process.env.VIVENTIUM_WING_MODE_DEFAULT_ENABLED = 'false';
     process.env.VIVENTIUM_SHADOW_MODE_DEFAULT_ENABLED = 'false';
@@ -143,6 +148,7 @@ describe('CallSessionService', () => {
   test.each([
     { callStatus: 'ended' },
     { callStatus: 'failed' },
+    { callStatus: 'listening', callFailure: { code: 'gateway_down', fatal: true } },
     { callStatus: 'connecting' },
     { expiresAt: new Date(0) },
     { leaseExpiresAt: new Date(0) },
@@ -795,6 +801,122 @@ describe('CallSessionService', () => {
     });
   });
 
+  test.each([false, true])(
+    'End keeps the exact browser deadline for reload with touch=%s',
+    async (touch) => {
+      const user = await User.create({
+        name: 'Terminal User',
+        email: 'terminal@example.com',
+        provider: 'local',
+      });
+      const created = await createCallSession({
+        userId: String(user._id),
+        agentId: 'agent_1',
+        conversationId: 'conversation-terminal',
+      });
+      const deadline = new Date(Date.now() + 60_000);
+      await ViventiumCallSession.updateOne(
+        { callSessionId: created.callSessionId },
+        { $set: { browserCapabilityExpiresAt: deadline } },
+      );
+      const ended = await syncCallSessionState({
+        callSessionId: created.callSessionId,
+        touch,
+        status: 'ended',
+      });
+      const persisted = await ViventiumCallSession.findOne({ callSessionId: created.callSessionId })
+        .select('+browserCapabilityExpiresAt')
+        .lean();
+      expect(persisted.browserCapabilityExpiresAt.getTime()).toBe(deadline.getTime());
+      await expect(
+        assertCallBrowserCapability(created.callSessionId, created.browserCapability, {
+          allowEnded: true,
+        }),
+      ).resolves.toMatchObject({
+        callSessionId: created.callSessionId,
+        userId: String(user._id),
+        conversationId: 'conversation-terminal',
+        status: 'ended',
+      });
+      await expect(
+        assertCallBrowserCapability(created.callSessionId, created.browserCapability),
+      ).rejects.toMatchObject({ status: 410 });
+      const heartbeat = await heartbeatCallSession({
+        callSessionId: created.callSessionId,
+        currentSession: ended,
+      });
+      const delayed = await syncCallSessionState({
+        callSessionId: created.callSessionId,
+        touch: true,
+        status: 'listening',
+        mode: 'wing',
+      });
+      expect(heartbeat.status).toBe('ended');
+      expect(delayed).toMatchObject({
+        status: 'ended',
+        mode: 'call',
+        expiresAtMs: ended.expiresAtMs,
+      });
+      const afterDelayed = await ViventiumCallSession.findOne({
+        callSessionId: created.callSessionId,
+      })
+        .select('+browserCapabilityExpiresAt')
+        .lean();
+      expect(afterDelayed.browserCapabilityExpiresAt.getTime()).toBe(deadline.getTime());
+    },
+  );
+
+  test('terminal reload remains fail-closed for expired and foreign capabilities', async () => {
+    const user = await User.create({
+      name: 'Terminal User',
+      email: 'terminal@example.com',
+      provider: 'local',
+    });
+    const first = await createCallSession({
+      userId: String(user._id),
+      agentId: 'agent_1',
+      conversationId: 'conversation-first',
+    });
+    const second = await createCallSession({
+      userId: String(user._id),
+      agentId: 'agent_1',
+      conversationId: 'conversation-second',
+    });
+    await syncCallSessionState({
+      callSessionId: first.callSessionId,
+      status: 'ended',
+      touch: false,
+    });
+    await expect(
+      assertCallBrowserCapability(first.callSessionId, second.browserCapability, {
+        allowEnded: true,
+      }),
+    ).rejects.toMatchObject({ status: 401 });
+    await expect(
+      assertCallBrowserCapability(second.callSessionId, first.browserCapability, {
+        allowEnded: true,
+      }),
+    ).rejects.toMatchObject({ status: 401 });
+    await ViventiumCallSession.updateOne(
+      { callSessionId: first.callSessionId },
+      { $set: { browserCapabilityExpiresAt: new Date(Date.now() - 1) } },
+    );
+    await expect(
+      assertCallBrowserCapability(first.callSessionId, first.browserCapability, {
+        allowEnded: true,
+      }),
+    ).rejects.toMatchObject({ status: 410 });
+    await ViventiumCallSession.updateOne(
+      { callSessionId: second.callSessionId },
+      { $set: { expiresAt: new Date(Date.now() - 1) } },
+    );
+    await expect(
+      assertCallBrowserCapability(second.callSessionId, second.browserCapability, {
+        allowEnded: true,
+      }),
+    ).rejects.toMatchObject({ status: 410 });
+  });
+
   test('syncCallSessionState refreshes ttl and keeps wing aliases aligned', async () => {
     const user = await User.create({
       name: 'Call User',
@@ -1290,6 +1412,253 @@ describe('CallSessionService', () => {
     expect(listening).toMatchObject({ status: 'listening' });
     expect(listening).not.toHaveProperty('error');
   });
+
+  test.each([
+    ['initialization', 'failed'],
+    ['initialization', 'listening'],
+    ['runtime', 'failed'],
+    ['runtime', 'listening'],
+  ])(
+    'fatal %s failure with %s status fences an accepted auth request after exact release',
+    async (phase, status) => {
+      const user = await User.create({
+        name: 'Terminal Lease User',
+        email: 'terminal-lease@example.com',
+        provider: 'local',
+      });
+      const created = await createCallSession({
+        userId: user._id.toString(),
+        agentId: 'agent_1',
+        conversationId: 'new',
+      });
+      const owner = {
+        callSessionId: created.callSessionId,
+        jobId: 'job_terminal',
+        workerId: 'worker_terminal',
+      };
+      await claimVoiceSession({ ...owner, leaseDurationMs: 10_000 });
+      await reportVoiceSessionFailure({
+        ...owner,
+        classification: 'gateway_down',
+        phase,
+        fatal: true,
+      });
+      if (status === 'listening') {
+        await syncCallSessionState({ callSessionId: created.callSessionId, status, touch: false });
+      }
+      const headers = {
+        'x-viventium-call-session': created.callSessionId,
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-job-id': owner.jobId,
+        'x-viventium-worker-id': owner.workerId,
+      };
+      let readFinished;
+      let resumeAcceptedRequest;
+      const readDone = new Promise((resolve) => {
+        readFinished = resolve;
+      });
+      const resume = new Promise((resolve) => {
+        resumeAcceptedRequest = resolve;
+      });
+      const originalFindOne = ViventiumCallSession.findOne.bind(ViventiumCallSession);
+      const readGate = jest
+        .spyOn(ViventiumCallSession, 'findOne')
+        .mockImplementationOnce((...args) => {
+          const query = originalFindOne(...args);
+          const originalLean = query.lean.bind(query);
+          query.lean = async (...leanArgs) => {
+            const result = await originalLean(...leanArgs);
+            readFinished(result);
+            await resume;
+            return result;
+          };
+          return query;
+        });
+      const pendingAuth = assertVoiceGatewayAuth({
+        get: (name) => headers[name.toLowerCase()] || '',
+      }).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      try {
+        expect(await readDone).toBeNull();
+        await expect(abandonVoiceSessionClaim(owner)).resolves.toBe(true);
+        resumeAcceptedRequest();
+        const outcome = await pendingAuth;
+        expect(outcome).toMatchObject({
+          error: { status: 403, message: 'Unable to claim voice session' },
+        });
+        const stored = await ViventiumCallSession.findOne({
+          callSessionId: created.callSessionId,
+        }).lean();
+        expect(stored).toMatchObject({
+          callStatus: status,
+          callFailure: { fatal: true },
+          activeJobId: null,
+          activeWorkerId: null,
+          leaseExpiresAt: null,
+        });
+      } finally {
+        resumeAcceptedRequest();
+        await pendingAuth;
+        readGate.mockRestore();
+      }
+    },
+  );
+
+  test.each(['initialization', 'runtime'])(
+    'fatal %s retry requires an explicit new claim and permits exact-owner auth before ready',
+    async (phase) => {
+      const user = await User.create({
+        name: 'Retry Lease User',
+        email: 'retry-lease@example.com',
+        provider: 'local',
+      });
+      const created = await createCallSession({
+        userId: user._id.toString(),
+        agentId: 'agent_1',
+        conversationId: 'new',
+      });
+      const oldOwner = {
+        callSessionId: created.callSessionId,
+        jobId: 'job_old',
+        workerId: 'worker_old',
+      };
+      const newOwner = { ...oldOwner, jobId: 'job_retry', workerId: 'worker_retry' };
+      const requestFor = (owner) => ({
+        get: (name) =>
+          ({
+            'x-viventium-call-session': owner.callSessionId,
+            'x-viventium-call-secret': 'secret',
+            'x-viventium-job-id': owner.jobId,
+            'x-viventium-worker-id': owner.workerId,
+          })[name.toLowerCase()] || '',
+      });
+      await claimVoiceSession(oldOwner);
+      await reportVoiceSessionFailure({
+        ...oldOwner,
+        classification: 'gateway_down',
+        phase,
+        fatal: true,
+      });
+      await ViventiumCallSession.updateOne(
+        { callSessionId: created.callSessionId },
+        { $set: { leaseExpiresAt: new Date(Date.now() - 1000) } },
+      );
+      await expect(assertVoiceGatewayAuth(requestFor(newOwner))).rejects.toMatchObject({
+        status: 403,
+      });
+      await expect(assertVoiceGatewayAuth(requestFor(oldOwner))).resolves.toMatchObject({
+        status: 'failed',
+        activeJobId: oldOwner.jobId,
+        activeWorkerId: oldOwner.workerId,
+      });
+      await expect(abandonVoiceSessionClaim(oldOwner)).resolves.toBe(true);
+      await expect(assertVoiceGatewayAuth(requestFor(oldOwner))).rejects.toMatchObject({
+        status: 403,
+      });
+      await expect(claimVoiceSession(newOwner)).resolves.toMatchObject({
+        status: 'failed',
+        activeJobId: newOwner.jobId,
+        activeWorkerId: newOwner.workerId,
+      });
+      await expect(assertVoiceGatewayAuth(requestFor(newOwner))).resolves.toMatchObject({
+        status: 'failed',
+      });
+      await ViventiumCallSession.updateOne(
+        { callSessionId: created.callSessionId },
+        { $set: { leaseExpiresAt: new Date(Date.now() - 1000) } },
+      );
+      await expect(assertVoiceGatewayAuth(requestFor(newOwner))).resolves.toMatchObject({
+        status: 'failed',
+      });
+      await expect(abandonVoiceSessionClaim(oldOwner)).resolves.toBe(false);
+      await expect(
+        reportVoiceSessionFailure({
+          ...oldOwner,
+          classification: 'gateway_down',
+          phase,
+          fatal: true,
+        }),
+      ).resolves.toBeNull();
+      const ready = await markVoiceSessionReady(newOwner);
+      expect(ready).toMatchObject({ status: 'listening' });
+      expect(ready).not.toHaveProperty('error');
+      await syncCallSessionState({
+        callSessionId: created.callSessionId,
+        status: 'ended',
+        touch: false,
+      });
+      await expect(
+        assertVoiceGatewayAuth(requestFor(newOwner), { allowEnded: true }),
+      ).resolves.toMatchObject({ status: 'ended' });
+      await expect(assertVoiceGatewayAuth(requestFor(newOwner))).rejects.toMatchObject({
+        status: 410,
+      });
+      await expect(claimVoiceSession(oldOwner)).resolves.toBeNull();
+      await expect(markVoiceSessionReady(newOwner)).resolves.toBeNull();
+    },
+  );
+
+  test.each(['initialization', 'runtime'])(
+    'fatal %s failure survives late provider degradation until the exact owner reports ready',
+    async (phase) => {
+      const user = await User.create({
+        name: 'Failure Order User',
+        email: 'failure-order@example.com',
+        provider: 'local',
+      });
+      const created = await createCallSession({
+        userId: user._id.toString(),
+        agentId: 'agent_1',
+        conversationId: 'new',
+      });
+      const owner = {
+        callSessionId: created.callSessionId,
+        jobId: 'job_failure_order',
+        workerId: 'worker_failure_order',
+      };
+      const degradation = {
+        ...owner,
+        classification: 'provider_failure',
+        modality: 'tts',
+        provider: 'openai',
+        phase: 'runtime',
+        fatal: false,
+      };
+      await claimVoiceSession(owner);
+      await expect(reportVoiceSessionFailure(degradation)).resolves.toMatchObject({
+        status: 'degraded',
+        error: { code: 'provider_failure' },
+      });
+      const failed = await reportVoiceSessionFailure({
+        ...owner,
+        classification: 'gateway_down',
+        phase,
+        fatal: true,
+      });
+      expect(failed).toMatchObject({ status: 'failed', error: { code: 'gateway_down' } });
+      await expect(reportVoiceSessionFailure(degradation)).resolves.toBeNull();
+      const retained = await ViventiumCallSession.findOne({
+        callSessionId: created.callSessionId,
+      }).lean();
+      expect(retained).toMatchObject({
+        callStatus: 'failed',
+        callFailure: { code: 'gateway_down', phase, fatal: true },
+        callModeRevision: failed.revision,
+      });
+      await expect(
+        markVoiceSessionReady({ ...owner, workerId: 'worker_wrong' }),
+      ).resolves.toBeNull();
+      const ready = await markVoiceSessionReady(owner);
+      expect(ready).toMatchObject({ status: 'listening' });
+      expect(ready).not.toHaveProperty('error');
+      await expect(reportVoiceSessionFailure(degradation)).resolves.toMatchObject({
+        status: 'degraded',
+        error: { code: 'provider_failure' },
+      });
+    },
+  );
 
   test('ready cannot clear failure or reopen an ended call', async () => {
     const user = await User.create({
@@ -2106,6 +2475,167 @@ describe('CallSessionService', () => {
       model: 'claude-code:claude-opus-5-5',
       effort: 'medium',
     });
+  });
+
+  test('settings reads and writes carry only exact capability-owned assistant labels', async () => {
+    const user = await User.create({
+      name: 'Catalog User',
+      email: 'catalog-user@example.com',
+      provider: 'local',
+    });
+    await Agent.create({
+      id: 'agent-catalog',
+      name: 'Catalog Agent',
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-6.1-sol',
+      model_parameters: { reasoning_effort: 'high' },
+      voice_llm_provider: 'glasshive-harness',
+      voice_llm_model: 'grok-build:grok-4.7-build-fast',
+      voice_llm_model_parameters: { reasoning_effort: 'high' },
+      fallback_llm_provider: 'glasshive-harness',
+      fallback_llm_model: 'claude-code:claude-opus-5-5',
+      fallback_llm_model_parameters: { reasoning_effort: 'high' },
+      author: user._id.toString(),
+      versions: [],
+    });
+    const providerCapabilities = {
+      'glasshive-harness': {
+        label: 'xPerfect',
+        models: [
+          { id: 'codex-cli:gpt-6.1-sol', label: 'OpenAI / GPT-6.1 Sol' },
+          { id: 'grok-build:grok-4.7-build-fast', label: 'Grok / Grok 4.7 Fast' },
+          { id: 'claude-code:claude-opus-5-5', label: 'Anthropic / Opus 5.5' },
+        ],
+        privateRuntimeField: 'must-not-leak',
+      },
+    };
+    mockGetAppConfig.mockRejectedValue(new Error('display getter must not run'));
+    const call = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent-catalog',
+      conversationId: 'new',
+    });
+    const settings = await getCallSessionVoiceSettings(call.callSessionId, {
+      assistantProviderCapabilities: providerCapabilities,
+    });
+    expect(settings.assistantRoute.primary).toEqual({
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-6.1-sol',
+      effort: 'high',
+      providerLabel: 'xPerfect',
+      modelLabel: 'OpenAI / GPT-6.1 Sol',
+    });
+    expect(settings.assistantRoute.effective).toEqual({
+      provider: 'glasshive-harness',
+      model: 'grok-build:grok-4.7-build-fast',
+      effort: 'high',
+      providerLabel: 'xPerfect',
+      modelLabel: 'Grok / Grok 4.7 Fast',
+    });
+    expect(settings.assistantRoute.fallbackLlm).toEqual({
+      provider: 'glasshive-harness',
+      model: 'claude-code:claude-opus-5-5',
+      effort: 'high',
+      providerLabel: 'xPerfect',
+      modelLabel: 'Anthropic / Opus 5.5',
+    });
+    const updated = await updateCallSessionVoiceSettings({
+      callSessionId: call.callSessionId,
+      assistantProviderCapabilities: providerCapabilities,
+      persistToUserDefaults: false,
+      requestedVoiceRoute: {
+        stt: { provider: 'openai', variant: 'gpt-4o-transcribe' },
+        tts: { provider: 'openai', variant: 'gpt-4o-mini-tts' },
+      },
+    });
+    expect(updated.assistantRoute).toEqual(settings.assistantRoute);
+    expect(JSON.stringify(updated)).not.toContain('must-not-leak');
+    expect(mockGetAppConfig).not.toHaveBeenCalled();
+    expect((await Agent.findOne({ id: 'agent-catalog' }).lean()).voice_llm_model).toBe(
+      'grok-build:grok-4.7-build-fast',
+    );
+  });
+
+  test.each(['unavailable', 'unregistered', 'malformed'])(
+    'advisory catalog %s preserves raw route IDs and effort',
+    async (mode) => {
+      const user = await User.create({
+        name: 'Raw Route User',
+        email: 'raw-route@example.com',
+        provider: 'local',
+      });
+      await Agent.create({
+        id: 'agent-raw-route',
+        name: 'Raw Route',
+        provider: 'custom-provider',
+        model: 'unknown-model',
+        model_parameters: { reasoning_effort: 'high' },
+        author: user._id.toString(),
+        versions: [],
+      });
+      mockGetAppConfig.mockRejectedValue(new Error('display getter must not run'));
+      const providerCapabilities =
+        mode === 'unregistered'
+          ? {
+              'different-provider': {
+                label: 'Foreign label',
+                models: [{ id: 'unknown-model', label: 'Wrong owner model' }],
+              },
+            }
+          : mode === 'malformed'
+            ? { 'custom-provider': { label: 17, models: 'not-an-array' } }
+            : undefined;
+      const call = await createCallSession({
+        userId: user._id.toString(),
+        agentId: 'agent-raw-route',
+        conversationId: 'new',
+      });
+      const settings = await getCallSessionVoiceSettings(call.callSessionId, {
+        assistantProviderCapabilities: providerCapabilities,
+      });
+      expect(settings.assistantRoute.effective).toEqual({
+        provider: 'custom-provider',
+        model: 'unknown-model',
+        effort: 'high',
+      });
+      expect(mockGetAppConfig).not.toHaveBeenCalled();
+    },
+  );
+
+  test('shared Wing settings reads and writes never resolve presentation metadata', async () => {
+    const user = await User.create({
+      name: 'Shared Route User',
+      email: 'shared-route@example.com',
+      provider: 'local',
+    });
+    await Agent.create({
+      id: 'agent-shared-route',
+      name: 'Shared Route',
+      provider: 'glasshive-harness',
+      model: 'grok-build:grok-4.7-build-fast',
+      model_parameters: { reasoning_effort: 'high' },
+      author: user._id.toString(),
+      versions: [],
+    });
+    mockGetAppConfig.mockRejectedValue(new Error('presentation registry must not run'));
+    const call = await createCallSession({
+      userId: user._id.toString(),
+      agentId: 'agent-shared-route',
+      conversationId: 'new',
+    });
+    // The engagement classifier calls this shared read with only the exact session ID.
+    const settings = await getCallSessionVoiceSettings(call.callSessionId);
+    const updated = await updateCallSessionVoiceSettings({
+      callSessionId: call.callSessionId,
+      persistToUserDefaults: false,
+    });
+    expect(settings.assistantRoute.effective).toEqual({
+      provider: 'glasshive-harness',
+      model: 'grok-build:grok-4.7-build-fast',
+      effort: 'high',
+    });
+    expect(updated.assistantRoute).toEqual(settings.assistantRoute);
+    expect(mockGetAppConfig).not.toHaveBeenCalled();
   });
 
   test('createCallSession carries only current-owner artifact display keyterms', async () => {

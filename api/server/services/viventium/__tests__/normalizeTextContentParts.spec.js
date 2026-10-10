@@ -57,6 +57,7 @@ describe('normalizeTextContentParts', () => {
       expect(normalized.content).toBe(source.text);
       expect(normalized[key][0]).toBe(payload);
       const formatted = formatMessage({ message: normalized });
+      formatted.messageId = source.messageId;
       expect(messageContentText(formatted)).toBe(source.text);
       expect(formatted.content).toContainEqual(payload);
       expect(source.content[0].text).toEqual({ value: source.text });
@@ -73,7 +74,11 @@ describe('normalizeTextContentParts', () => {
         text: 'Subtract the numbers.',
         content: 'Subtract the numbers.',
       };
-      const currentFormatted = { role: 'user', content: current.text };
+      const currentFormatted = {
+        role: 'user',
+        content: current.text,
+        messageId: current.messageId,
+      };
       const capture = (messages) =>
         captureMainContextSnapshot(
           { user: { id: 'owner' }, body: { conversationId: 'conversation' } },

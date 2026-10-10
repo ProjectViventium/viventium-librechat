@@ -279,6 +279,29 @@ test.each([
     });
 });
 
+test('Stop stores native harness progress as activity and keeps authored text', async () => {
+  await admit();
+  store.setContentParts('stream', [
+    { type: 'text', text: partial },
+    { type: 'think', think: 'Synthetic harness progress.' },
+  ]);
+  const result = await mockManager.abortJob('stream', 'user_cancelled');
+  expect(result.success).toBe(true);
+  const row = await methods.getNativeResponse(user, 'answer');
+  expect(row.text).toBe(partial);
+  expect(row.content).toEqual([
+    { type: 'text', text: partial },
+    {
+      type: 'harness_activity',
+      harness_activity: {
+        event: 'reasoning-summary',
+        summary: 'Synthetic harness progress.',
+      },
+    },
+  ]);
+  expect(result.finalEvent.responseMessage.content).toEqual(row.content);
+});
+
 test('a job bound before Mongo admission cannot publish or fabricate a Stop snapshot', async () => {
   expect(await mockManager.bindNativeResponse(identity)).toBe(true);
   const done = jest.spyOn(transport, 'emitDone');

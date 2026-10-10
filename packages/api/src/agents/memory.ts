@@ -174,7 +174,16 @@ type MemoryWriterHealthEntry = {
 };
 
 const memoryReadContextCache = new Map<string, MemoryReadCacheEntry>();
+const memoryReadContextGenerationTokens = new Map<string, object>();
 const memoryWriterHealth = new Map<string, MemoryWriterHealthEntry>();
+
+function memoryReadContextGenerationToken(userId: string): object {
+  const existing = memoryReadContextGenerationTokens.get(userId);
+  if (existing) return existing;
+  const token = {};
+  memoryReadContextGenerationTokens.set(userId, token);
+  return token;
+}
 
 function stableStringify(value: unknown): string {
   if (value == null || typeof value !== 'object') {
@@ -509,9 +518,12 @@ function getMemoryReadCacheKey({
 export function clearMemoryReadContextCache(userId?: string | ObjectId) {
   if (userId == null) {
     memoryReadContextCache.clear();
+    memoryReadContextGenerationTokens.clear();
     return;
   }
-  const prefix = `${String(userId)}:`;
+  const userKey = String(userId);
+  memoryReadContextGenerationTokens.set(userKey, {});
+  const prefix = `${userKey}:`;
   for (const key of memoryReadContextCache.keys()) {
     if (key.startsWith(prefix)) {
       memoryReadContextCache.delete(key);
@@ -536,15 +548,19 @@ export async function loadMemoryReadContext({
     return { ...cached, cacheHit: true };
   }
 
+  const userKey = String(userId);
+  const generationToken = memoryReadContextGenerationToken(userKey);
   const memories = await memoryMethods.getAllUserMemories(userId);
   const context = formatMemoryReadProfile({
     memories: memories as MemoryEntryLeanLike[],
     config: { ...config, readProfile },
   });
-  memoryReadContextCache.set(cacheKey, {
-    ...context,
-    expiresAt: now + readProfile.cacheTtlMs,
-  });
+  if (memoryReadContextGenerationTokens.get(userKey) === generationToken) {
+    memoryReadContextCache.set(cacheKey, {
+      ...context,
+      expiresAt: now + readProfile.cacheTtlMs,
+    });
+  }
   return context;
 }
 

@@ -323,7 +323,9 @@ export default function useStepHandler({
 
       if (event === 'on_run_step') {
         const runStep = data as Agents.RunStep;
-        let responseMessageId = runStep.runId ?? '';
+        /* === VIVENTIUM START === Missing streamed steps use the existing no-id rejection. */
+        let responseMessageId = runStep?.runId ?? '';
+        /* === VIVENTIUM END === */
         if (responseMessageId === Constants.USE_PRELIM_RESPONSE_MESSAGE_ID) {
           responseMessageId = submission?.initialResponse?.messageId ?? '';
           parentMessageId = submission?.initialResponse?.parentMessageId ?? '';

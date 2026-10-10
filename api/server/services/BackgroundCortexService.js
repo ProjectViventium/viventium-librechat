@@ -36,6 +36,7 @@ const {
   createCortexToolEvidence,
   withNativeConversationAdmission,
   createNativeCapacityFetch,
+  createNativeBootstrapFetch,
 } = require('@librechat/api');
 const { loadAgent } = require('~/models/Agent');
 const { getAppConfig } = require('./Config/app');
@@ -1971,6 +1972,10 @@ function buildCortexCompletionPayload(result) {
     basePayload.direct_action_surface_scopes = directActionSurfaceScopes;
   }
 
+  if (result.cancelled === true) {
+    return { ...basePayload, status: 'cancelled', silent: true, no_response: true };
+  }
+
   if (result.error) {
     const publicError = publicCortexError(result, result.errorClass || result.error_class);
     return {
@@ -1998,7 +2003,12 @@ function buildCompletionInputFromActivation({
   result = null,
   error = null,
   errorClass = null,
+  cancelled = false,
 }) {
+  const cancellationApplies = cancelled && (!result || Boolean(result.error));
+  const cancellationUnconfirmed =
+    cancellationApplies &&
+    (result?.nativeOwnership === 'unresolved' || result?.attemptUnjoined === true);
   return {
     agentId: result?.agentId || activationResult.agentId,
     agentName:
@@ -2006,18 +2016,24 @@ function buildCompletionInputFromActivation({
       cortexAgent?.name ||
       activationResult.cortexName ||
       activationResult.agentId,
-    insight: result?.insight ?? null,
-    error: error || result?.error || null,
-    errorClass:
-      errorClass ||
-      result?.errorClass ||
-      result?.error_class ||
-      activationResult.errorClass ||
-      null,
+    insight: cancellationApplies ? null : (result?.insight ?? null),
+    cancelled: cancellationApplies && !cancellationUnconfirmed,
+    error: cancellationUnconfirmed
+      ? 'Native request release is unconfirmed.'
+      : cancellationApplies
+        ? null
+        : error || result?.error || null,
+    errorClass: cancellationUnconfirmed
+      ? 'background_agent_error'
+      : errorClass ||
+        result?.errorClass ||
+        result?.error_class ||
+        activationResult.errorClass ||
+        null,
     activationScope: result?.activationScope || activationResult.activationScope || null,
     configuredTools: result?.configuredTools || 0,
     completedToolCalls: result?.completedToolCalls || 0,
-    errorCode: result?.errorCode || null,
+    errorCode: cancellationUnconfirmed ? 'native_release_unconfirmed' : result?.errorCode || null,
     retryable: result?.retryable === true,
     fallbackUsed: result?.fallbackUsed === true,
     primaryErrorClass: result?.primaryErrorClass || null,
@@ -3151,6 +3167,15 @@ async function invokeActivationClassifierAttempt({
     }),
   );
 
+  /* === VIVENTIUM START === Signed Native bootstrap precedes dispatch identity. === */
+  if (llmConfig.configuration?.defaultHeaders?.['X-GlassHive-Agent-Id']) {
+    llmConfig.configuration.fetch = createNativeBootstrapFetch(
+      llmConfig.configuration.fetch || globalThis.fetch,
+    );
+  }
+  /* === VIVENTIUM END === */
+
+  abortController?.signal?.throwIfAborted();
   const run = await Run.create({
     runId: `${runId}-activation-${agentId}-${runIdSuffix}`,
     graphConfig: {
@@ -3162,6 +3187,7 @@ async function invokeActivationClassifierAttempt({
     returnContent: true,
   });
 
+  abortController?.signal?.throwIfAborted();
   const config = {
     runName: 'CortexActivation',
     configurable: {
@@ -3176,6 +3202,7 @@ async function invokeActivationClassifierAttempt({
   const { HumanMessage } = require('@librechat/agents/langchain/messages');
   const inputMessages = [new HumanMessage(fullPrompt)];
   const content = await run.processStream({ messages: inputMessages }, config);
+  abortController?.signal?.throwIfAborted();
 
   let responseText = '';
   if (typeof content === 'string') {
@@ -3229,6 +3256,10 @@ async function checkCortexActivation({
 
   if (activationMode === 'disabled') {
     return { shouldActivate: false, confidence: 0, reason: 'disabled', agentId: agent_id };
+  }
+  const ownerSignal = req?._viventiumVoiceAbortSignal;
+  if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+    return { shouldActivate: false, confidence: 0, reason: 'cancelled', agentId: agent_id };
   }
   if (activationMode === 'always') {
     return {
@@ -3356,6 +3387,15 @@ ${activationFormat}`;
     let suppressionProbeUsed = false;
 
     for (let i = 0; i < attempts.length; i += 1) {
+      if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+        return {
+          shouldActivate: false,
+          confidence: 0,
+          reason: 'cancelled',
+          agentId: agent_id,
+          providerAttempts,
+        };
+      }
       const attempt = attempts[i];
       const providerName = attempt.provider.toLowerCase();
       const providerSuppression = suppressionsByAttempt[i];
@@ -3419,12 +3459,25 @@ ${activationFormat}`;
         };
       }
 
-      let attemptAbortController = null;
+      const attemptAbortController = new AbortController();
       let attemptAbortTimer = null;
+      let ownerAbortListener = null;
       try {
+        const ownerCancellationPromise = ownerSignal
+          ? new Promise((_, reject) => {
+              ownerAbortListener = () => {
+                if (!isBackgroundCortexCancellationSignal(ownerSignal)) return;
+                attemptAbortController.abort(ownerSignal.reason);
+                const error = new Error('activation classifier owner cancelled');
+                error.name = 'AbortError';
+                reject(error);
+              };
+              ownerSignal.addEventListener('abort', ownerAbortListener);
+              ownerAbortListener();
+            })
+          : null;
         let attemptDeadlinePromise = null;
         if (attemptTimeoutMs > 0) {
-          attemptAbortController = new AbortController();
           // === VIVENTIUM START ===
           // Rationale: some provider clients do not settle their stream promise after abort. Race
           // the request against our own deadline so one non-cooperative provider cannot consume
@@ -3453,9 +3506,11 @@ ${activationFormat}`;
           req,
           abortController: attemptAbortController,
         });
-        const { responseText, parsed } = await (attemptDeadlinePromise
-          ? Promise.race([classifierAttemptPromise, attemptDeadlinePromise])
-          : classifierAttemptPromise);
+        const { responseText, parsed } = await Promise.race(
+          [classifierAttemptPromise, attemptDeadlinePromise, ownerCancellationPromise].filter(
+            Boolean,
+          ),
+        );
 
         if (shouldLogActivationPrompt()) {
           logger.info(
@@ -3512,6 +3567,22 @@ ${activationFormat}`;
           providerAttempts,
         };
       } catch (error) {
+        if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+          providerAttempts.push({
+            provider: providerName,
+            model: attempt.model,
+            source: attempt.source,
+            status: 'cancelled',
+            reason: ownerSignal.reason,
+          });
+          return {
+            shouldActivate: false,
+            confidence: 0,
+            reason: 'cancelled',
+            agentId: agent_id,
+            providerAttempts,
+          };
+        }
         const isAborted =
           attemptAbortController?.signal?.aborted === true || error?.name === 'AbortError';
         if (isAborted) {
@@ -3627,6 +3698,7 @@ ${activationFormat}`;
           providerAttempts,
         };
       } finally {
+        if (ownerAbortListener) ownerSignal.removeEventListener('abort', ownerAbortListener);
         if (attemptAbortTimer) {
           clearTimeout(attemptAbortTimer);
         }
@@ -3700,6 +3772,7 @@ async function prepareCortexConversationProviderCapability({
   req,
   capability,
   requestBody,
+  nativeTools,
   signal = null,
   cancellationReq = req,
   attachBundle = attachConversationProviderCapabilityBundle,
@@ -3731,7 +3804,14 @@ async function prepareCortexConversationProviderCapability({
     modelParameters.configuration = configuration;
     targetAgent.model_parameters = modelParameters;
   }
-  const args = { targetAgent, declaredAgent, req, capability, requestBody };
+  const args = {
+    targetAgent,
+    declaredAgent,
+    req,
+    capability,
+    requestBody,
+    ...(nativeTools !== undefined ? { nativeTools } : {}),
+  };
   const attached = await attachBundle(args);
   const idempotencyKey = String(requestBody?.viventiumGlassHiveIdempotencyKey || '').trim();
   if (cancellationReq && idempotencyKey) {
@@ -3787,12 +3867,23 @@ async function settleCortexAttemptNativeOwnership({ req, completed }) {
     if (!delivery && typeof req._viventiumHarnessReleaseAttempt === 'function') {
       delivery = req._viventiumHarnessReleaseAttempt();
     }
-    const outcome = delivery ? await delivery : null;
-    const outcomes = Array.isArray(outcome?.outcomes) ? outcome.outcomes : [];
-    const released =
+    let outcome = delivery ? await delivery : null;
+    const hasReleasedCapacity = (receipt) => {
+      const outcomes = Array.isArray(receipt?.outcomes) ? receipt.outcomes : [];
+      return (
+        receipt?.acknowledged === true &&
+        outcomes.length > 0 &&
+        outcomes.every((entry) => entry?.acknowledged === true && entry?.capacityReleased === true)
+      );
+    };
+    if (
       outcome?.acknowledged === true &&
-      outcomes.length > 0 &&
-      outcomes.every((entry) => entry?.acknowledged === true && entry?.capacityReleased === true);
+      !hasReleasedCapacity(outcome) &&
+      typeof req._viventiumHarnessReleaseAttempt === 'function'
+    ) {
+      outcome = await req._viventiumHarnessReleaseAttempt();
+    }
+    const released = hasReleasedCapacity(outcome);
     return { state: released ? 'released' : 'unresolved', outcome };
   } catch (_error) {
     return { state: 'unresolved', outcome: null };
@@ -3903,6 +3994,7 @@ async function runCortexAttempt(
     signal = null,
     attemptSignal = null,
     insightMode = 'user_facing',
+    nativeTools,
     harnessAttemptRole = 'primary',
     resultEvidence = null,
     resultEvidencePolicy = null,
@@ -3924,6 +4016,9 @@ async function runCortexAttempt(
   }
   if (!['inherited', 'isolated'].includes(mainContextBinding)) {
     throw new TypeError('mainContextBinding must be "inherited" or "isolated"');
+  }
+  if (nativeTools !== undefined && typeof nativeTools !== 'boolean') {
+    throw new TypeError('nativeTools must be a boolean');
   }
   const startTime = Date.now();
   /** @type {AbortController | null} */
@@ -4520,6 +4615,7 @@ async function runCortexAttempt(
       req: harnessInvocationReq,
       capability: cortexCapability,
       requestBody: cortexRequestBody,
+      nativeTools,
       signal: abortController.signal,
       cancellationReq: cortexCancellationReq,
     });
@@ -5653,6 +5749,21 @@ async function executeActivated(
    * cortex work that outlives the main turn. Every owner-signal gate below uses the same predicate.
    * === VIVENTIUM END === */
   if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+    for (const activationResult of activatedCortices) {
+      if (!onCortexComplete) break;
+      try {
+        onCortexComplete(
+          buildCortexCompletionPayload(
+            buildCompletionInputFromActivation({ activationResult, cancelled: true }),
+          ),
+        );
+      } catch (error) {
+        logger.warn(
+          '[BackgroundCortexService] onCortexComplete cancellation callback failed',
+          sanitizeRuntimeErrorForLog(error),
+        );
+      }
+    }
     return { insights: [], cancelled: true };
   }
   // The Phase B completion owner forms this parent's delivery batch from what its cortices accept.
@@ -5682,6 +5793,9 @@ async function executeActivated(
     activationResult,
     harnessAttemptRole = 'primary',
   }) => {
+    if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+      return { insight: null, error: 'cancelled', nativeOwnership: 'none' };
+    }
     const attemptController = new AbortController();
     const cortexPromise = executeCortexFn({
       agent,
@@ -5741,7 +5855,8 @@ async function executeActivated(
   };
 
   // Execute all activated cortices in parallel
-  const executionPromises = activatedCortices.map(async (activationResult) => {
+  const cancellationAtCompletion = new Array(activatedCortices.length);
+  const executionPromises = activatedCortices.map(async (activationResult, index) => {
     try {
       // Load the cortex agent
       const cortexAgent = await loadAgentFn({
@@ -5749,6 +5864,29 @@ async function executeActivated(
         agent_id: activationResult.agentId,
         endpoint: mainAgent.provider,
       });
+
+      if (isBackgroundCortexCancellationSignal(ownerSignal)) {
+        cancellationAtCompletion[index] = true;
+        if (onCortexComplete) {
+          try {
+            onCortexComplete(
+              buildCortexCompletionPayload(
+                buildCompletionInputFromActivation({
+                  activationResult,
+                  cortexAgent,
+                  cancelled: true,
+                }),
+              ),
+            );
+          } catch (error) {
+            logger.warn(
+              '[BackgroundCortexService] onCortexComplete cancellation callback failed',
+              sanitizeRuntimeErrorForLog(error),
+            );
+          }
+        }
+        return { insight: null, error: 'cancelled', nativeOwnership: 'none' };
+      }
 
       if (!cortexAgent) {
         logger.warn(
@@ -5761,6 +5899,7 @@ async function executeActivated(
                 buildCompletionInputFromActivation({
                   activationResult,
                   error: 'Cortex agent not found',
+                  cancelled: isBackgroundCortexCancellationSignal(ownerSignal),
                 }),
               ),
             );
@@ -5818,6 +5957,7 @@ async function executeActivated(
                   activationResult,
                   cortexAgent,
                   result: unavailableResult,
+                  cancelled: isBackgroundCortexCancellationSignal(ownerSignal),
                 }),
               ),
             );
@@ -5911,14 +6051,16 @@ async function executeActivated(
         };
       }
 
+      cancellationAtCompletion[index] = isBackgroundCortexCancellationSignal(ownerSignal);
       const completionPayload = buildCortexCompletionPayload(
-        buildCompletionInputFromActivation({ activationResult, cortexAgent, result }),
+        buildCompletionInputFromActivation({
+          activationResult,
+          cortexAgent,
+          result,
+          cancelled: cancellationAtCompletion[index],
+        }),
       );
-      if (
-        completionPayload &&
-        onCortexComplete &&
-        !isBackgroundCortexCancellationSignal(ownerSignal)
-      ) {
+      if (completionPayload && onCortexComplete) {
         try {
           onCortexComplete(completionPayload);
         } catch (e) {
@@ -5944,7 +6086,8 @@ async function executeActivated(
       );
 
       // Notify UI of error so it doesn't stay stuck on "Analyzing..."
-      if (onCortexComplete && !isBackgroundCortexCancellationSignal(ownerSignal)) {
+      cancellationAtCompletion[index] = isBackgroundCortexCancellationSignal(ownerSignal);
+      if (onCortexComplete) {
         try {
           onCortexComplete(
             buildCortexCompletionPayload(
@@ -5952,6 +6095,7 @@ async function executeActivated(
                 activationResult,
                 error: publicError.message,
                 errorClass: publicError.errorClass,
+                cancelled: cancellationAtCompletion[index],
               }),
             ),
           );
@@ -5988,19 +6132,20 @@ async function executeActivated(
       facts: {
         responseRef: runId,
         cortexRef: activatedCortices[index].agentId,
-        cortexStatus: isBackgroundCortexCancellationSignal(ownerSignal)
-          ? 'cancelled'
-          : result?.nativeOwnership === 'unresolved'
+        cortexStatus:
+          result?.nativeOwnership === 'unresolved' || result?.attemptUnjoined === true
             ? 'unresolved'
-            : result?.errorClass === 'timeout' || result?.error === 'timeout'
-              ? 'timeout'
-              : result?.errorClass === 'activation_provider_unavailable'
-                ? 'unavailable'
-                : !result || result.error
-                  ? 'failed'
-                  : hasVisibleCortexInsight(result.insight)
-                    ? 'completed'
-                    : 'no_insight',
+            : cancellationAtCompletion[index] && (!result || Boolean(result.error))
+              ? 'cancelled'
+              : result?.errorClass === 'timeout' || result?.error === 'timeout'
+                ? 'timeout'
+                : result?.errorClass === 'activation_provider_unavailable'
+                  ? 'unavailable'
+                  : !result || result.error
+                    ? 'failed'
+                    : hasVisibleCortexInsight(result.insight)
+                      ? 'completed'
+                      : 'no_insight',
         effectCount: result?.completedToolCalls || 0,
       },
     });

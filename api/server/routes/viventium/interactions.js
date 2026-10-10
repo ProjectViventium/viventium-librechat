@@ -41,6 +41,10 @@ const {
 } = require('~/server/services/viventium/LocalQaCortexFaultService');
 /* === VIVENTIUM END === */
 
+const {
+  refreshVoiceTaskCommittedPresentation,
+} = require('~/server/services/viventium/VoiceTaskService');
+
 const router = express.Router();
 
 async function persistPresentationOutcome(result) {
@@ -68,7 +72,13 @@ async function persistPresentationOutcome(result) {
   }
 
   if (acknowledgement.state === 'partial_removed') {
+    if (presentation.producerPending === true) return;
     query.unfinished = true;
+    // Speech removal must retain Native production and its persisted Stop/replay snapshot.
+    query.$nor = [
+      { 'nativeResponse.status': { $in: ['pending', 'prepared'] } },
+      { 'nativeResponse.status': 'cancelled', 'nativeResponse.stopSnapshotStoredAt': { $gt: 0 } },
+    ];
     const removed = await Message.findOneAndDelete(query);
     if (removed?._id && presentation.conversationId) {
       await Conversation.updateOne(
@@ -80,7 +90,7 @@ async function persistPresentationOutcome(result) {
   }
 
   const coverage = telegramInputDeliveryCoverage(result);
-  if (acknowledgement.state !== 'committed') query.unfinished = true;
+  // A failed presentation closes its claim without changing canonical completion or content.
   const persisted = await Message.updateOne(query, {
     $set: {
       ...(['committed', 'committed_effect'].includes(acknowledgement.state)
@@ -380,6 +390,15 @@ router.post('/delivery-ack', async (req, res) => {
         });
         // Acceptance by the external adapter schedules the turn's semantic compaction.
         scheduleExternallyAcceptedMainCompaction(result.presentation, accepted);
+      }
+      if (presentsMainMessage && committed && adapterSurface === 'voice') {
+        try {
+          await refreshVoiceTaskCommittedPresentation(result, adapterSurface);
+        } catch (error) {
+          logger.warn('[VIVENTIUM][interactions/delivery-ack] Voice task projection unavailable', {
+            error: error?.name || 'Error',
+          });
+        }
       }
       return res.json({ acknowledged: true, idempotent: result.idempotent === true });
     }

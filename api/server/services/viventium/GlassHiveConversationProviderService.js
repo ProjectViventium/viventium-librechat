@@ -60,6 +60,219 @@ const HARNESS_RELEASE_REASONS = new Set([
   CORTEX_ATTEMPT_DEADLINE_REASON,
   CORTEX_ATTEMPT_RELEASE_REASON,
 ]);
+const restrictedVoiceCancellationRoutes = Symbol('restrictedVoiceCancellationRoutes');
+
+/* === VIVENTIUM START ===
+ * Feature: Owner Stop for a tool-less Voice reply.
+ * Purpose: Capture only the server-validated native transport on this request. Speaker work
+ * authority, executable keys and agent configs remain subject to the destructive sanitizer.
+ */
+async function prepareRestrictedVoiceCancellation({
+  req,
+  signal,
+  endpointConfig,
+  providerId,
+  fallback = false,
+  activate = true,
+}) {
+  if (!isVoiceActorSideEffectRestricted(req)) return false;
+  const session = req.viventiumCallSession;
+  const ownerId = String(req.user?.id || '').trim();
+  const callSessionId = String(session?.callSessionId || '').trim();
+  if (!session && !req.body?.viventiumCallSessionId && !req.body?.viventiumVoiceTaskId) {
+    // Voice metadata narrows work authority even on an ordinary authenticated chat. Its
+    // server-owned inference still belongs to the same generation job and Stop signal.
+    const { GenerationJobManager } = require('@librechat/api');
+    const streamId = String(req._resumableStreamId || '').trim();
+    const capability = resolveConversationProviderCapability(req, String(providerId || ''));
+    const job = streamId && (await GenerationJobManager.getJob(streamId));
+    const jobCreatedAt = job?.createdAt;
+    const conversationId = String(job?.metadata?.conversationId || '').trim();
+    const ownsJob = (current) =>
+      current?.createdAt === jobCreatedAt &&
+      current?.metadata?.userId === ownerId &&
+      current?.metadata?.conversationId === conversationId &&
+      !current?.metadata?.viventiumCallSessionId &&
+      !current?.metadata?.viventiumVoiceTaskId &&
+      current?.metadata?.interactionContext?.actor_kind === 'external_user' &&
+      current?.metadata?.interactionContext?.origin === 'interactive' &&
+      current?.abortController?.signal === signal;
+    if (
+      !ownerId ||
+      !conversationId ||
+      !signal ||
+      !job ||
+      job.status !== 'running' ||
+      !ownsJob(job) ||
+      (req.body?.conversationId && req.body.conversationId !== conversationId) ||
+      capability?.conversation_session !== true ||
+      capability?.workspace_binding !== true
+    )
+      return false;
+    let responseId = '';
+    const currentScope = async () => {
+      const current = await GenerationJobManager.getJob(streamId);
+      if (
+        String(req.user?.id || '') !== ownerId ||
+        req._resumableStreamId !== streamId ||
+        !ownsJob(current) ||
+        ['complete', 'error', 'superseded'].includes(current.status)
+      )
+        return null;
+      const key = String(current.metadata?.responseMessageId || '').trim();
+      if (!key || (responseId && key !== responseId)) return null;
+      responseId = key;
+      return { responseId };
+    };
+    const routes = req[restrictedVoiceCancellationRoutes] || {};
+    if (!req[restrictedVoiceCancellationRoutes])
+      Object.defineProperty(req, restrictedVoiceCancellationRoutes, {
+        value: routes,
+        enumerable: false,
+      });
+    routes[fallback ? 'fallback' : 'primary'] = Object.freeze({
+      native: true,
+      chat: true,
+      bindingKey: Symbol('restrictedChatCancellationBinding'),
+      request: req,
+      signal,
+      endpointConfig: Object.freeze({
+        baseURL: endpointConfig?.baseURL,
+        apiKey: endpointConfig?.apiKey,
+      }),
+      ownerId,
+      streamId,
+      currentScope,
+    });
+    return activate ? bindHarnessCancellation({ req, signal }) : true;
+  }
+  if (
+    req.body?.voiceMode !== true ||
+    !ownerId ||
+    !callSessionId ||
+    String(session?.userId || '') !== ownerId
+  )
+    return false;
+  const tasks = require('./VoiceTaskService');
+  const task = tasks
+    .listVoiceTasks({ userId: ownerId, callSessionId })
+    .find((item) => item.taskId === req.body.viventiumVoiceTaskId);
+  const streamId = String(req._resumableStreamId || '').trim();
+  if (
+    !task ||
+    task.streamId !== streamId ||
+    task.owner?.id !== streamId ||
+    !['generation_job', 'remote_generation'].includes(task.owner?.kind)
+  )
+    return false;
+  const capability = resolveConversationProviderCapability(req, String(providerId || ''));
+  const native =
+    capability?.conversation_session === true && capability?.workspace_binding === true;
+  const role = fallback ? 'fallback' : 'primary';
+  const routes = req[restrictedVoiceCancellationRoutes] || {};
+  if (!req[restrictedVoiceCancellationRoutes])
+    Object.defineProperty(req, restrictedVoiceCancellationRoutes, {
+      value: routes,
+      enumerable: false,
+    });
+  if (!native) {
+    routes[role] = Object.freeze({
+      native: false,
+      ownerId,
+      callSessionId,
+      taskId: task.taskId,
+      streamId,
+    });
+    return activate ? bindHarnessCancellation({ req, signal }) : false;
+  }
+  // A missing transport or late response identity must never become a local-only confirmation.
+  if (activate)
+    tasks.setVoiceTaskOwnerCapabilities(task.taskId, {
+      kind: 'remote_generation',
+      ownerId: streamId,
+      cancellationConfirmable: false,
+    });
+  const { GenerationJobManager } = require('@librechat/api');
+  const job = await GenerationJobManager.getJob(streamId);
+  const jobCreatedAt = job?.createdAt;
+  const ownsJob = (current) =>
+    current?.createdAt === jobCreatedAt &&
+    current?.metadata?.userId === ownerId &&
+    current?.metadata?.viventiumCallSessionId === callSessionId &&
+    current?.metadata?.viventiumVoiceTaskId === task.taskId;
+  if (!job || !ownsJob(job) || !signal || job.abortController?.signal !== signal) return false;
+  let responseId = '';
+  let stopCompletion;
+  const beginStop = () => {
+    let settle;
+    stopCompletion = new Promise((resolve) => {
+      settle = resolve;
+    });
+    return settle;
+  };
+  const currentScope = async () => {
+    // The ordinary manager may retire the exact job before returning from Stop. Wait for
+    // that server result before the listener reads the store; failed Stop remains closed.
+    const stopped = stopCompletion ? await stopCompletion : null;
+    if (stopCompletion && stopped?.success !== true) return null;
+    const current = tasks
+      .listVoiceTasks({ userId: ownerId, callSessionId })
+      .find((item) => item.taskId === task.taskId);
+    if (
+      current?.createdAt !== task.createdAt ||
+      current?.streamId !== streamId ||
+      current?.owner?.id !== streamId ||
+      !['generation_job', 'remote_generation'].includes(current?.owner?.kind) ||
+      ['completed', 'failed'].includes(current?.state)
+    )
+      return null;
+    const call = await require('./CallSessionService').getCallSession(callSessionId);
+    // Hangup ends presentation, not the owner's authority to Stop this exact accepted reply.
+    if (call?.callSessionId !== callSessionId || String(call?.userId || '') !== ownerId)
+      return null;
+    const currentJob = await GenerationJobManager.getJob(streamId);
+    let key;
+    if (currentJob) {
+      if (!ownsJob(currentJob) || currentJob.abortController?.signal !== signal) return null;
+      key = String(currentJob.metadata?.responseMessageId || '').trim();
+    } else {
+      const retired = stopped?.jobData;
+      if (
+        !retired ||
+        !signal.aborted ||
+        signal.reason !== 'user_cancelled' ||
+        retired.createdAt !== jobCreatedAt ||
+        retired.streamId !== streamId ||
+        retired.userId !== ownerId ||
+        retired.viventiumCallSessionId !== callSessionId ||
+        retired.viventiumVoiceTaskId !== task.taskId ||
+        !responseId ||
+        retired.responseMessageId !== responseId
+      )
+        return null;
+      key = responseId;
+    }
+    if (responseId && key !== responseId) return null;
+    if (key) responseId = key;
+    return { task: current, responseId };
+  };
+  routes[role] = Object.freeze({
+    native: true,
+    bindingKey: Symbol('restrictedVoiceCancellationBinding'),
+    endpointConfig: Object.freeze({
+      baseURL: endpointConfig?.baseURL,
+      apiKey: endpointConfig?.apiKey,
+    }),
+    ownerId,
+    callSessionId,
+    taskId: task.taskId,
+    streamId,
+    currentScope,
+    beginStop,
+  });
+  return activate ? bindHarnessCancellation({ req, signal }) : true;
+}
+/* === VIVENTIUM END === */
 
 function waitForHarnessCancellationRetry(delayMs) {
   return new Promise((resolve) => {
@@ -96,6 +309,7 @@ async function deliverHarnessCancellation({
   attemptTimeoutMs = HARNESS_CANCELLATION_ATTEMPT_TIMEOUT_MS,
   retryDelaysMs = HARNESS_CANCELLATION_RETRY_DELAYS_MS,
   requireCapacityRelease = false,
+  includeRequestState = false,
   totalTimeoutMs = 0,
 }) {
   let attempts = 0;
@@ -137,7 +351,12 @@ async function deliverHarnessCancellation({
       responseTimeoutS =
         Number.isFinite(reportedTimeoutS) && reportedTimeoutS > 0 ? reportedTimeoutS : null;
       if (body?.capacityReleased === true) {
-        return { acknowledged: true, capacityReleased: true, responseTimeoutS };
+        return {
+          acknowledged: true,
+          capacityReleased: true,
+          responseTimeoutS,
+          ...(includeRequestState ? { state: body?.state } : {}),
+        };
       }
       capacityReleasePending = true;
     }
@@ -204,9 +423,15 @@ async function probeHarnessFamilyRelease({
 }) {
   const releaseBaseURL = String(baseURL || '').replace(/\/$/, '');
   const releaseOwnerId = String(ownerId || '').trim();
-  const keys = ['main', 'main-fallback']
-    .map((role) => buildHarnessIdempotencyKey(role, messageId))
-    .filter(Boolean);
+  // Restricted turns omit native idempotency headers. Native then owns the exact bare
+  // response-id family; it must release as well as the two explicit attempt families.
+  const responseId = String(messageId || '').trim();
+  const keys = responseId
+    ? [
+        ...['main', 'main-fallback'].map((role) => buildHarnessIdempotencyKey(role, responseId)),
+        responseId,
+      ]
+    : [];
   let responseTimeoutS = null;
   if (
     !releaseBaseURL ||
@@ -526,12 +751,60 @@ function bindHarnessCancellation({
   fetchImpl = globalThis.fetch,
   onDeliveryError,
 }) {
+  const restricted = isVoiceActorSideEffectRestricted(req);
+  const readOnlyRoute = restricted
+    ? req?.[restrictedVoiceCancellationRoutes]?.[
+        req._viventiumFallbackLlmAttempt === true ? 'fallback' : 'primary'
+      ]
+    : null;
+  if (restricted && !readOnlyRoute) {
+    if (!req._viventiumCortexToolEvidence && req?.[restrictedVoiceCancellationRoutes])
+      req[restrictedVoiceCancellationRoutes].active = null;
+    return false;
+  }
+  if (
+    readOnlyRoute?.chat &&
+    (readOnlyRoute.request !== req ||
+      readOnlyRoute.signal !== signal ||
+      readOnlyRoute.ownerId !== String(req.user?.id || '') ||
+      readOnlyRoute.streamId !== req._resumableStreamId)
+  )
+    return false;
+  if (
+    readOnlyRoute &&
+    !readOnlyRoute.chat &&
+    (readOnlyRoute.ownerId !== String(req.user?.id || '') ||
+      readOnlyRoute.callSessionId !== req.viventiumCallSession?.callSessionId ||
+      readOnlyRoute.ownerId !== String(req.viventiumCallSession?.userId || '') ||
+      readOnlyRoute.taskId !== req.body?.viventiumVoiceTaskId ||
+      readOnlyRoute.streamId !== req._resumableStreamId)
+  )
+    return false;
+  if (readOnlyRoute?.native === false) {
+    if (req._viventiumCortexToolEvidence) return false;
+    const tasks = require('./VoiceTaskService');
+    if (tasks.isVoiceTaskSuppressed(readOnlyRoute.taskId)) return false;
+    req[restrictedVoiceCancellationRoutes].active = null;
+    const directTask = tasks.setVoiceTaskOwnerCapabilities(readOnlyRoute.taskId, {
+      kind: 'generation_job',
+      ownerId: readOnlyRoute.streamId,
+      cancellationConfirmable: true,
+    });
+    if (directTask?.owner?.kind === 'generation_job') {
+      tasks.registerVoiceTaskOwnerAdapter(readOnlyRoute.taskId, { kind: 'generation_job' });
+    }
+    return false;
+  }
+  if (readOnlyRoute) endpointConfig = readOnlyRoute.endpointConfig;
   const hasGraphHarnessKeys =
     (req?._viventiumHarnessIdempotencyKeys instanceof Set &&
       req._viventiumHarnessIdempotencyKeys.size > 0) ||
     (Array.isArray(req?._viventiumHarnessIdempotencyKeys) &&
       req._viventiumHarnessIdempotencyKeys.length > 0);
-  if ((req?._viventiumHarnessExecutionEnabled !== true && !hasGraphHarnessKeys) || !signal) {
+  if (
+    (!readOnlyRoute && req?._viventiumHarnessExecutionEnabled !== true && !hasGraphHarnessKeys) ||
+    !signal
+  ) {
     return false;
   }
   const cancelBaseURL = extractEnvVariable(endpointConfig?.baseURL || '').replace(/\/$/, '');
@@ -545,20 +818,80 @@ function bindHarnessCancellation({
   ) {
     return false;
   }
+  if (readOnlyRoute && cancelOwnerId !== readOnlyRoute.ownerId) return false;
+  let stopDiagnosticOwner = null;
+  // Stop diagnostics expose only structural checks; observing must never change delivery.
+  const observeVoiceStop = (stage, checks = {}) => {
+    if (req.body?.voiceMode !== true && !req.body?.viventiumVoiceTaskId) return;
+    try {
+      const decision = {
+        stage,
+        ...(stopDiagnosticOwner || {}),
+        restrictedRoute: Boolean(readOnlyRoute),
+        voiceMode: req.body?.voiceMode === true,
+        workAuthorityPresent: Boolean(req.viventiumVoiceWorkAuthority),
+        workAuthorityOwn: Object.prototype.hasOwnProperty.call(req, 'viventiumVoiceWorkAuthority'),
+        cortexAttempt: Boolean(req._viventiumCortexToolEvidence),
+        signalAborted: signal.aborted,
+        signalAbortReason: !signal.aborted
+          ? null
+          : HARNESS_CANCELLATION_ABORT_REASONS.has(signal.reason) ||
+              HARNESS_RELEASE_REASONS.has(signal.reason)
+            ? signal.reason
+            : 'other',
+        activeBinding: req._viventiumHarnessCancellationActiveBaseURL === cancelBaseURL,
+        boundListener:
+          req._viventiumHarnessCancellationBoundBaseURLs instanceof Set &&
+          req._viventiumHarnessCancellationBoundBaseURLs.has(
+            readOnlyRoute?.bindingKey || cancelBaseURL,
+          ),
+        ...checks,
+      };
+      logger.debug('[GlassHiveProvider] Voice Stop confirmation', decision);
+      if (
+        checks.failedCheck ||
+        [
+          'abort_started',
+          'confirmation_checks',
+          'confirmation_saved',
+          'already_completed',
+          'delivery_settled',
+          'failed_attention_confirmed',
+        ].includes(stage)
+      ) {
+        logger.info(`[GlassHiveProvider] Voice Stop decision ${JSON.stringify(decision)}`);
+      }
+    } catch (_) {
+      // A diagnostic observer cannot accept, reject or interrupt Stop.
+    }
+  };
+  if (readOnlyRoute && !req._viventiumCortexToolEvidence) {
+    req[restrictedVoiceCancellationRoutes].active = readOnlyRoute;
+    if (!readOnlyRoute.chat) {
+      require('./VoiceTaskService').setVoiceTaskOwnerCapabilities(readOnlyRoute.taskId, {
+        kind: 'remote_generation',
+        ownerId: readOnlyRoute.streamId,
+        cancellationConfirmable: false,
+      });
+    }
+  }
   // Foreground native input uses the same authenticated owner and exact response key as Stop.
+  // Cortices keep their attempt transport; Main owns foreground task Stop and input.
   if (
+    !req._viventiumCortexToolEvidence &&
     req.body?.voiceMode === true &&
-    req.viventiumVoiceWorkAuthority &&
-    req.body?.viventiumVoiceTaskId &&
-    !req._viventiumNativeVoiceInputPolling
+    (req.viventiumVoiceWorkAuthority || readOnlyRoute) &&
+    req.body?.viventiumVoiceTaskId
   ) {
     const {
       listVoiceTasks,
+      getVoiceTask,
       registerVoiceTaskOwnerAdapter,
       observeGenerationEvent,
+      confirmVoiceTaskOwnerCancellation,
     } = require('./VoiceTaskService');
     const taskId = req.body.viventiumVoiceTaskId;
-    const authority = req.viventiumVoiceWorkAuthority;
+    const authority = req.viventiumVoiceWorkAuthority || readOnlyRoute;
     const ownsTask = () => {
       const task = listVoiceTasks({
         userId: cancelOwnerId,
@@ -573,6 +906,197 @@ function bindHarnessCancellation({
       );
     };
     if (ownsTask()) {
+      const boundTask = listVoiceTasks({
+        userId: cancelOwnerId,
+        callSessionId: authority.callSessionId,
+      }).find((item) => item.taskId === taskId);
+      const owner = boundTask.owner;
+      stopDiagnosticOwner = Object.freeze({
+        scopeSha256: crypto
+          .createHash('sha256')
+          .update(JSON.stringify([boundTask.taskId, boundTask.streamId, boundTask.callSessionId]))
+          .digest('hex'),
+      });
+      const failedAttentionKey =
+        String(req._viventiumHarnessIdempotencyKey || '').trim() ||
+        buildHarnessAttemptIdempotencyKey(req, req.body?.responseMessageId);
+      const currentOwnerTask = () => {
+        const current = getVoiceTask(taskId);
+        const checks = {
+          taskPresent: Boolean(current),
+          taskCreatedAtMatches: current?.createdAt === boundTask.createdAt,
+          taskCallMatches: current?.callSessionId === boundTask.callSessionId,
+          authorityCallMatches: authority.callSessionId === boundTask.callSessionId,
+          foregroundOwnerKind: ['generation_job', 'remote_generation'].includes(
+            current?.owner?.kind,
+          ),
+          ownerIdMatches: current?.owner?.id === owner.id,
+          streamIdMatches: current?.streamId === owner.id,
+          taskStateEligible: Boolean(current) && !['completed', 'failed'].includes(current.state),
+        };
+        if (Object.values(checks).every((matched) => matched === true)) return current;
+        observeVoiceStop('owner_guard', { ...checks, failedCheck: 'owner_current' });
+        return null;
+      };
+      registerVoiceTaskOwnerAdapter(taskId, {
+        kind: owner.kind,
+        preserveExisting: true,
+        cancelFailedProviderAttention: Boolean(readOnlyRoute || failedAttentionKey),
+        cancel: async ({ failedProviderCode } = {}) => {
+          let stage = 'owner_before_abort';
+          try {
+            const current = currentOwnerTask();
+            if (!current) {
+              observeVoiceStop(stage, { failedCheck: 'owner_current' });
+              return { accepted: false };
+            }
+            stage = 'scope_before_abort';
+            if (readOnlyRoute && !(await readOnlyRoute.currentScope())) {
+              observeVoiceStop(stage, { failedCheck: 'scope_current' });
+              return { accepted: false };
+            }
+            if (failedProviderCode === 'provider_progress_stalled') {
+              stage = 'failed_attention_release';
+              const scope = readOnlyRoute ? await readOnlyRoute.currentScope() : null;
+              const key = readOnlyRoute ? scope?.responseId : failedAttentionKey;
+              if (
+                !key ||
+                (!readOnlyRoute && req._viventiumHarnessCancellationActiveBaseURL !== cancelBaseURL)
+              ) {
+                observeVoiceStop(stage, { failedCheck: 'exact_request' });
+                return { accepted: false };
+              }
+              const outcome = await deliverHarnessCancellation({
+                url: `${cancelBaseURL}/requests/by-idempotency/${encodeURIComponent(key)}/cancel`,
+                headers: {
+                  Authorization: `Bearer ${cancelApiKey}`,
+                  'X-Viventium-User-Id': cancelOwnerId,
+                },
+                fetchImpl,
+                requireCapacityRelease: true,
+                includeRequestState: true,
+                attemptTimeoutMs: MAINTENANCE_CANCELLATION_ATTEMPT_TIMEOUT_MS,
+                retryDelaysMs: MAINTENANCE_CANCELLATION_RETRY_DELAYS_MS,
+                totalTimeoutMs: MAINTENANCE_CANCELLATION_TOTAL_TIMEOUT_MS,
+              });
+              if (!currentOwnerTask() || (readOnlyRoute && !(await readOnlyRoute.currentScope())))
+                return { accepted: false };
+              if (outcome.state === 'completed') return { alreadyCompleted: true };
+              if (outcome.acknowledged !== true || outcome.capacityReleased !== true)
+                return { accepted: false };
+              const confirmation = await confirmVoiceTaskOwnerCancellation(
+                taskId,
+                'The native owner confirmed Stop.',
+              );
+              observeVoiceStop('failed_attention_confirmed', { accepted: Boolean(confirmation) });
+              return { accepted: Boolean(confirmation) };
+            }
+            const { GenerationJobManager } = require('@librechat/api');
+            const priorDelivery = req._viventiumHarnessCancellationDeliveryPromise;
+            observeVoiceStop('abort_started', { priorDeliveryPresent: Boolean(priorDelivery) });
+            const settleStop = readOnlyRoute?.beginStop();
+            let stopped;
+            stage = 'abort_job';
+            try {
+              stopped = await GenerationJobManager.abortJob(
+                current.streamId,
+                'user_cancelled',
+                cancelOwnerId,
+              );
+            } finally {
+              settleStop?.(stopped);
+            }
+            stage = 'owner_after_abort';
+            if (!currentOwnerTask()) {
+              observeVoiceStop(stage, {
+                failedCheck: 'owner_current',
+                localStopSucceeded: stopped?.success === true,
+              });
+              return { accepted: false };
+            }
+            stage = 'scope_after_abort';
+            if (
+              readOnlyRoute &&
+              !['committed', 'pending'].includes(stopped?.nativeResponse) &&
+              !(await readOnlyRoute.currentScope())
+            ) {
+              observeVoiceStop(stage, {
+                failedCheck: 'scope_current',
+                localStopSucceeded: stopped?.success === true,
+              });
+              return { accepted: false };
+            }
+            if (['committed', 'pending'].includes(stopped?.nativeResponse)) {
+              observeVoiceStop('already_completed');
+              return { alreadyCompleted: true };
+            }
+            stage = 'delivery';
+            const delivery = await req._viventiumHarnessCancellationDeliveryPromise;
+            stage = 'scope_after_delivery';
+            const readOnlyScopeCurrent =
+              !readOnlyRoute || Boolean(await readOnlyRoute.currentScope());
+            let ownerCurrent = null;
+            const confirmed =
+              stopped?.success === true &&
+              req._viventiumHarnessCancellationDeliveryPromise !== priorDelivery &&
+              delivery?.acknowledged === true &&
+              Array.isArray(delivery.outcomes) &&
+              delivery.outcomes.length > 0 &&
+              delivery.outcomes.every((outcome) => outcome?.capacityReleased === true) &&
+              (ownerCurrent = Boolean(currentOwnerTask())) &&
+              readOnlyScopeCurrent;
+            const checks = {
+              localStopSucceeded: stopped?.success === true,
+              nativeResponseState: ['committed', 'pending', 'unavailable'].includes(
+                stopped?.nativeResponse,
+              )
+                ? stopped.nativeResponse
+                : null,
+              freshDelivery: req._viventiumHarnessCancellationDeliveryPromise !== priorDelivery,
+              deliveryAcknowledged: delivery?.acknowledged === true,
+              outcomesPresent: Array.isArray(delivery?.outcomes),
+              familyCount: Array.isArray(delivery?.outcomes) ? delivery.outcomes.length : 0,
+              releasedFamilyCount: Array.isArray(delivery?.outcomes)
+                ? delivery.outcomes.filter((outcome) => outcome?.capacityReleased === true).length
+                : 0,
+              ownerCurrent,
+              scopeCurrent: readOnlyScopeCurrent,
+              confirmed,
+            };
+            const failedCheck = !checks.localStopSucceeded
+              ? 'local_stop'
+              : !checks.freshDelivery
+                ? 'fresh_delivery'
+                : !checks.deliveryAcknowledged
+                  ? 'delivery_acknowledged'
+                  : !checks.outcomesPresent
+                    ? 'outcomes_present'
+                    : checks.familyCount === 0
+                      ? 'family_nonempty'
+                      : checks.releasedFamilyCount !== checks.familyCount
+                        ? 'families_released'
+                        : ownerCurrent !== true
+                          ? 'owner_current'
+                          : !readOnlyScopeCurrent
+                            ? 'scope_current'
+                            : null;
+            observeVoiceStop('confirmation_checks', { ...checks, failedCheck });
+            if (!confirmed) return { accepted: false };
+            stage = 'confirm_owner';
+            const confirmation = await confirmVoiceTaskOwnerCancellation(
+              taskId,
+              'The native owner confirmed Stop.',
+            );
+            observeVoiceStop('confirmation_saved', { accepted: Boolean(confirmation) });
+            return { accepted: Boolean(confirmation) };
+          } catch (error) {
+            observeVoiceStop(stage, { failedCheck: 'exception' });
+            throw error;
+          }
+        },
+      });
+    }
+    if (!readOnlyRoute && ownsTask() && !req._viventiumNativeVoiceInputPolling) {
       const { createNativeVoiceInputClient } = require('@librechat/api');
       const client = createNativeVoiceInputClient({
         baseURL: cancelBaseURL,
@@ -596,7 +1120,8 @@ function bindHarnessCancellation({
             if (!owner) return;
             registerVoiceTaskOwnerAdapter(taskId, {
               kind: owner.kind,
-              expiresAtMs: Date.parse(request.expiresAt),
+              preserveExisting: true,
+              inputExpiresAtMs: Date.parse(request.expiresAt),
               provideInput: async ({ input }) => {
                 const current = listVoiceTasks({
                   userId: cancelOwnerId,
@@ -636,11 +1161,71 @@ function bindHarnessCancellation({
       : new Set();
   req._viventiumHarnessCancellationBoundBaseURLs = boundBaseURLs;
   req._viventiumHarnessCancellationActiveBaseURL = cancelBaseURL;
-  if (boundBaseURLs.has(cancelBaseURL)) {
+  const bindingKey = readOnlyRoute?.bindingKey || cancelBaseURL;
+  if (boundBaseURLs.has(bindingKey)) {
     return true;
   }
-  boundBaseURLs.add(cancelBaseURL);
+  boundBaseURLs.add(bindingKey);
+  let restrictedChatDelivery;
+  let restrictedChatDeliveryFailed = false;
   const deliverCancellation = (reason) => {
+    if (readOnlyRoute) {
+      if (
+        reason !== 'user_cancelled' ||
+        req[restrictedVoiceCancellationRoutes]?.active !== readOnlyRoute
+      )
+        return;
+      req._viventiumHarnessCancellationDeliveryPromise = (async () => {
+        const scope = await readOnlyRoute.currentScope();
+        if (!scope?.responseId || req[restrictedVoiceCancellationRoutes]?.active !== readOnlyRoute)
+          return { acknowledged: false, outcomes: [] };
+        observeVoiceStop('delivery_started', { familyCount: 1, capacityRequired: true });
+        const outcome = await deliverHarnessCancellation({
+          url: `${cancelBaseURL}/requests/by-idempotency/${encodeURIComponent(scope.responseId)}/cancel`,
+          headers: {
+            Authorization: `Bearer ${cancelApiKey}`,
+            'X-Viventium-User-Id': cancelOwnerId,
+          },
+          fetchImpl,
+          requireCapacityRelease: true,
+          attemptTimeoutMs: MAINTENANCE_CANCELLATION_ATTEMPT_TIMEOUT_MS,
+          retryDelaysMs: MAINTENANCE_CANCELLATION_RETRY_DELAYS_MS,
+          totalTimeoutMs: MAINTENANCE_CANCELLATION_TOTAL_TIMEOUT_MS,
+        });
+        observeVoiceStop('delivery_settled', {
+          familyCount: 1,
+          releasedFamilyCount: Number(outcome?.capacityReleased === true),
+          deliveryAcknowledged: outcome?.acknowledged === true,
+        });
+        return { acknowledged: outcome?.acknowledged === true, outcomes: [outcome] };
+      })().catch((error) => {
+        reportHarnessCancellationDeliveryError(onDeliveryError, error);
+        return { acknowledged: false, outcomes: [] };
+      });
+      if (readOnlyRoute.chat) {
+        // Reuse the manager's Stop-delivery seam so it cannot retire this exact job before
+        // the native owner acknowledges capacity release. Restricted activity stays hidden.
+        restrictedChatDeliveryFailed = false;
+        restrictedChatDelivery = req._viventiumHarnessCancellationDeliveryPromise
+          .then((delivery) => {
+            if (
+              delivery?.acknowledged !== true ||
+              delivery.outcomes?.length !== 1 ||
+              delivery.outcomes[0]?.capacityReleased !== true
+            ) {
+              throw Object.assign(new Error('Native cancellation could not be confirmed.'), {
+                code: 'HARNESS_CANCELLATION_DELIVERY_FAILED',
+              });
+            }
+            return { delivered: false };
+          })
+          .catch((error) => {
+            restrictedChatDeliveryFailed = true;
+            throw error;
+          });
+      }
+      return req._viventiumHarnessCancellationDeliveryPromise;
+    }
     if (req._viventiumHarnessCancellationActiveBaseURL !== cancelBaseURL) {
       return;
     }
@@ -669,7 +1254,15 @@ function bindHarnessCancellation({
       return;
     }
     // Maintenance, an attempt deadline and an attempt release require native capacity release.
-    const requireRelease = HARNESS_RELEASE_REASONS.has(reason);
+    const requireRelease =
+      HARNESS_RELEASE_REASONS.has(reason) ||
+      (reason === 'user_cancelled' &&
+        req.body?.voiceMode === true &&
+        Boolean(req.viventiumVoiceWorkAuthority));
+    observeVoiceStop('delivery_started', {
+      familyCount: cancelIdempotencyKeys.length,
+      capacityRequired: requireRelease,
+    });
     const deliveries = cancelIdempotencyKeys.map(async (cancelIdempotencyKey) => {
       try {
         return await deliverHarnessCancellation({
@@ -697,14 +1290,37 @@ function bindHarnessCancellation({
         };
       }
     });
-    req._viventiumHarnessCancellationDeliveryPromise = Promise.all(deliveries).then((outcomes) => ({
-      acknowledged: outcomes.every((outcome) => outcome?.acknowledged === true),
-      outcomes,
-    }));
+    req._viventiumHarnessCancellationDeliveryPromise = Promise.all(deliveries).then((outcomes) => {
+      const acknowledged = outcomes.every((outcome) => outcome?.acknowledged === true);
+      observeVoiceStop('delivery_settled', {
+        familyCount: outcomes.length,
+        releasedFamilyCount: outcomes.filter((outcome) => outcome?.capacityReleased === true)
+          .length,
+        deliveryAcknowledged: acknowledged,
+      });
+      return { acknowledged, outcomes };
+    });
     return req._viventiumHarnessCancellationDeliveryPromise;
   };
   // The attempt boundary's own release: the same exact keys, owner and capacity-release answer.
   req._viventiumHarnessReleaseAttempt = () => deliverCancellation(CORTEX_ATTEMPT_RELEASE_REASON);
+  if (readOnlyRoute?.chat) {
+    Object.defineProperty(signal, '_viventiumHarnessCancellationDelivery', {
+      configurable: true,
+      get() {
+        // A failed native ACK leaves the exact job retained. A fresh owner Stop may retry
+        // its same sealed transport even though the local AbortSignal is already stopped.
+        if (
+          signal.aborted &&
+          signal.reason === 'user_cancelled' &&
+          (!restrictedChatDelivery || restrictedChatDeliveryFailed)
+        ) {
+          deliverCancellation('user_cancelled');
+        }
+        return restrictedChatDelivery;
+      },
+    });
+  }
   if (signal.aborted) deliverCancellation(signal.reason);
   else signal.addEventListener('abort', () => deliverCancellation(signal.reason), { once: true });
   return true;
@@ -947,6 +1563,7 @@ function installConversationProviderCapabilityRefresher({
   req,
   capability,
   requestBody = req?.body || {},
+  nativeTools,
 } = {}) {
   const declaredProvider = resolveConversationProviderId(declaredAgent);
   const resolvedCapability =
@@ -978,6 +1595,7 @@ function installConversationProviderCapabilityRefresher({
       req,
       capability: resolvedCapability,
       requestBody: effectiveRequestBody,
+      nativeTools,
     });
     if (!attached) {
       // Never leave a previously valid but now expired bundle on the next provider attempt.
@@ -1153,13 +1771,43 @@ async function attachConversationProviderCapabilityBundle({
   req,
   capability,
   requestBody = req?.body || {},
+  nativeTools,
 } = {}) {
+  if (nativeTools !== undefined && typeof nativeTools !== 'boolean') {
+    throw new TypeError('nativeTools must be a boolean');
+  }
   if (isVoiceActorSideEffectRestricted(req)) {
     enforceRestrictedVoiceRequest(req);
     return false;
   }
   if (!targetAgent || capability?.workspace_binding !== true) {
     return false;
+  }
+  if (nativeTools === false) {
+    // A signed capability narrows an explicitly tool-less owner. Never silently drop tools.
+    for (const participant of new Set(
+      [targetAgent, declaredAgent, capabilitySourceAgent, mcpCapabilitySourceAgent].filter(Boolean),
+    )) {
+      if (
+        resolvedAgentToolNameSet(participant).size > 0 ||
+        (participant.declaredToolNames || []).length > 0 ||
+        (participant.mcp || []).length > 0 ||
+        (participant.agent_ids || []).length > 0 ||
+        (participant.edges || []).length > 0
+      ) {
+        throw new Error('Native zero-tool capability requires a tool-less participant');
+      }
+    }
+    const headers = restrictedConversationProviderBootstrapHeaders();
+    clearConversationProviderCapabilityBundle(targetAgent);
+    const modelParameters = { ...(targetAgent.model_parameters || {}) };
+    const configuration = { ...(modelParameters.configuration || {}) };
+    configuration.defaultHeaders = {
+      ...projectTrustedNativeInteractionHeaders(req, configuration.defaultHeaders),
+      ...headers,
+    };
+    targetAgent.model_parameters = { ...modelParameters, configuration };
+    return true;
   }
   const modelParameters = { ...(targetAgent.model_parameters || {}) };
   const configuration = { ...(modelParameters.configuration || {}) };
@@ -1199,12 +1847,16 @@ async function attachConversationProviderCapabilityBundle({
           { getMessages, getFiles },
         )
       : [];
-  // Preserve current source inputs; selected history enriches only the signed file/capability view.
+  // Current source records retain their text and order when persisted ancestry repeats their IDs.
+  const currentUploadKeys = new Set(currentUploads.map((file) => file.file_id || file.filename));
   const uploadedFiles = Array.from(
     new Map(
-      trustedUploadedFilesFromRequestBody({ files: [...currentUploads, ...historyUploads] }).map(
-        (file) => [file.file_id || file.filename, file],
-      ),
+      trustedUploadedFilesFromRequestBody({
+        files: [
+          ...currentUploads,
+          ...historyUploads.filter((file) => !currentUploadKeys.has(file.file_id || file.filename)),
+        ],
+      }).map((file) => [file.file_id || file.filename, file]),
     ).values(),
   );
   const hostToolCapabilityState = await resolveHostToolCapabilityState({
@@ -1398,6 +2050,7 @@ module.exports = {
   bindHarnessCancellation,
   CORTEX_ATTEMPT_DEADLINE_REASON,
   probeHarnessFamilyRelease,
+  prepareRestrictedVoiceCancellation,
   buildHarnessAgentIdempotencyKeys,
   buildHarnessAttemptIdempotencyKey,
   configuredBrokerHostTools,

@@ -14,6 +14,7 @@ export const CORTEX_INSIGHT_DROP_REASONS = [
 export const CORTEX_INSIGHT_FAILURE_REASONS = [
   'durable_surface_persistence_failed',
   'generation_failed_without_fallback',
+  'native_session_occupied',
   'presentation_failed',
   'delivery_lease_expired',
   'delivery_runtime_restarted',

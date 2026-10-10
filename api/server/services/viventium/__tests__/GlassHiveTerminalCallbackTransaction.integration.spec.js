@@ -560,6 +560,8 @@ async function authoredDeliveryProof(scope) {
     fenceGlassHiveTerminalCallbackAcceptedOperation,
     getConvo: (ownerId, id) => Conversation.findOne({ user: ownerId, conversationId: id }).lean(),
     getUserById: async () => ({ id: result.ownerId, role: 'USER' }),
+    getFeelingState: async () => null,
+    logFeelingsEvent: jest.fn(),
     saveConvo,
     getAgent: async () => ({ id: 'agent-main' }),
     getAppConfig: async () => ({}),

@@ -1,4 +1,5 @@
 import { interactionPresentationSequence } from '../../agents/interactionContext';
+import { nativeSourceRecoveryUnconfirmed } from '../../glasshive/nativeSupersession';
 import { logger } from '@librechat/data-schemas';
 import type { NativeResponseIdentity, NativeResponseCommit } from '@librechat/data-schemas';
 import { randomUUID } from 'crypto';
@@ -425,7 +426,9 @@ export class InMemoryJobStore implements IJobStore {
     job.finalEvent = finalEvent;
     job.nativeResponseFinished = true;
     job.generationCompleted = true;
-    job.status = mode === 'cancelled' ? 'aborted' : 'complete';
+    job.status = mode === 'cancelled'
+      ? job.status === 'superseded' ? 'superseded' : 'aborted'
+      : 'complete';
     job.completedAt = Date.now();
     delete job.error;
     delete job.errorClass;
@@ -895,14 +898,72 @@ export class InMemoryJobStore implements IJobStore {
     return committed;
   }
 
+  async isNativeResponseUnboundCancelled(expected: SerializableJobData): Promise<boolean> {
+    const job = this.jobs.get(expected.streamId);
+    if (!job || job.createdAt !== expected.createdAt || job.userId !== expected.userId ||
+      job.responseMessageId !== expected.responseMessageId || job.conversationId !== expected.conversationId ||
+      job.status !== 'superseded' || job.nativeResponseCancelled !== true ||
+      job.interactionContext?.logical_turn_id !== expected.interactionContext?.logical_turn_id ||
+      job.interactionContext?.revision !== expected.interactionContext?.revision) return false;
+    const record = job.interactionContext?.logical_turn_id ? this.nativePublications.get(this.nativeKey({
+      logicalTurnId: job.interactionContext.logical_turn_id, revision: job.interactionContext.revision,
+    })) : undefined;
+    return record?.state === 'revoked' && record.identity === undefined;
+  }
+
+  async getLogicalTurnSourcePredecessors(
+    streamId: string, userId: string, interactionContext: InteractionContext,
+  ): Promise<SerializableJobData[]> {
+    const current = this.jobs.get(streamId);
+    const ledger = interactionContext.logical_turn_id
+      ? this.authorLedgers.get(interactionContext.logical_turn_id) : undefined;
+    if (!current || current.userId !== userId || current.interactionContext?.logical_turn_id !== interactionContext.logical_turn_id ||
+      current.interactionContext?.revision !== interactionContext.revision || ledger?.reservations.get(interactionContext.revision) !== streamId) {
+      throw streamIdConflictError();
+    }
+    const jobs: SerializableJobData[] = [];
+    for (const revision of earlierAuthoringRevisions(interactionContext)) {
+      const reserved = ledger.reservations.get(revision);
+      if (!reserved) continue;
+      const job = this.jobs.get(reserved);
+      if (!job || job.userId !== userId || job.conversationId !== current.conversationId ||
+        job.interactionContext?.logical_turn_id !== interactionContext.logical_turn_id || job.interactionContext?.revision !== revision ||
+        !interactionContext.source_segments?.some((source) => source.source_event_id === job.interactionContext?.source_event_id && source.authoring_revision === revision)) {
+        throw nativeSourceRecoveryUnconfirmed('author_lookup', current, job);
+      }
+      jobs.push(await this.getJob(reserved) as SerializableJobData);
+    }
+    return jobs;
+  }
+
   async relinquishLogicalTurnAuthor(
     streamId: string,
-    _userId: string,
+    userId: string,
     interactionContext: InteractionContext,
   ): Promise<void> {
     const { logical_turn_id: logicalTurnId, revision } = interactionContext;
     const ledger = logicalTurnId ? this.authorLedgers.get(logicalTurnId) : undefined;
-    if (ledger?.reservations.get(revision) !== streamId) return;
+    /* === VIVENTIUM START ===
+     * Fix: a source-order scope does not replace the exact persisted stream owner and revision.
+     * Only that Main can relinquish its author claim; newer revisions keep their own reservation.
+     */
+    const job = this.jobs.get(streamId);
+    const current = job?.interactionContext;
+    if (
+      !job ||
+      !['running', 'superseded'].includes(job.status) ||
+      job.userId !== userId ||
+      current?.actor_kind !== interactionContext.actor_kind ||
+      current?.origin !== interactionContext.origin ||
+      current?.surface !== interactionContext.surface ||
+      current?.logical_turn_id !== logicalTurnId ||
+      current?.revision !== revision ||
+      current?.source_event_id !== interactionContext.source_event_id ||
+      current?.conversation_id !== interactionContext.conversation_id ||
+      current?.source_order_scope !== interactionContext.source_order_scope ||
+      ledger?.reservations.get(revision) !== streamId
+    ) return;
+    /* === VIVENTIUM END === */
     ledger.authors.delete(revision);
     ledger.takenOver.add(revision);
     ledger.touchedAt = Date.now();

@@ -126,12 +126,18 @@ it('fails closed if account scope changes while the old read is pending', async 
   expect(facts(await pending).work).toBeNull();
 });
 
-it('limits voice to active count and urgent work, retaining the list tool for details', () => {
+it('gives voice the same known work facts and exact actions as other surfaces', () => {
   const result = facts(
     formatActiveWorkContext({ snapshot, preferredMode: 'parallel', available: true, voice: true }),
   );
   expect(result.activeCount).toBe(2);
-  expect(result.work.map((item: { workRef: string }) => item.workRef)).toEqual(['work-b']);
+  expect(result).toEqual(
+    facts(formatActiveWorkContext({ snapshot, preferredMode: 'parallel', available: true })),
+  );
+  expect(result.work.map((item: { workRef: string }) => item.workRef)).toEqual([
+    'work-b',
+    'work-a',
+  ]);
   expect(result.fullRosterTool).toBe('active_work_list');
 });
 
@@ -178,4 +184,44 @@ it('uses the same existing mutable context delivery for native and ordinary prov
   expect(ordinary).toBe(`STATIC\n\n${context}`);
   expect(nativeReq.body.text).toBe('Please continue');
   expect(ordinaryReq.body).toEqual({ text: 'Please continue' });
+});
+
+describe('readiness capsule facts: native text and voice projection', () => {
+  test.each([false, true])(
+    'pins the refusal instead of inferring focused intent on voice=%s',
+    async (voice) => {
+      const service = createActiveWorkContextService(dependencies());
+      const req = {
+        user: { id: 'owner-a', personalization: { orchestration_mode: 'parallel' as const } },
+        _viventiumParallelWorkTurnAvailable: false,
+        _viventiumParallelWorkTurnReadiness: {
+          status: 'unready',
+          reason: 'storage_pressure_critical',
+        },
+      };
+      const f = facts(await service.getActiveWorkTurnContext(req, agent, { voice }));
+      expect(f).toMatchObject({
+        preferredMode: 'parallel',
+        available: false,
+        readiness: { status: 'unready', reason: 'storage_pressure_critical' },
+      });
+      expect(f.activeCount).toBe(2);
+      expect(f.fullRosterTool).toBe('active_work_list');
+    },
+  );
+  test('an accepted focused roster has no invented refusal reason', () => {
+    expect(
+      facts(formatActiveWorkContext({ snapshot, preferredMode: 'focused', available: false })),
+    ).not.toHaveProperty('readiness');
+    expect(
+      facts(
+        formatActiveWorkContext({
+          snapshot,
+          preferredMode: 'parallel',
+          available: true,
+          readiness: { status: 'ready', reason: '' },
+        }),
+      ),
+    ).not.toHaveProperty('readiness');
+  });
 });

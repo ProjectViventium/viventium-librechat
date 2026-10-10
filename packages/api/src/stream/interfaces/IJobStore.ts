@@ -6,6 +6,8 @@ export type { InteractionSourceSegment } from '../../glasshive/interactionSource
 import type { ReadyInputContinuation } from '../../agents/interactionContext';
 import type { NativeResponseIdentity, NativeResponseCommit } from '@librechat/data-schemas';
 import type { ServerSentEvent } from '../../types/events';
+import type { VoiceWorkAuthorityBinding } from '../../voice/engagementAuthority';
+import type { SourceRecoveryFacts } from '../../glasshive/sourceMutation';
 
 /* === VIVENTIUM START === EMO-UC-048 typed local-QA fault boundary. === */
 import type { CortexLocalQaFaultBoundary } from '../../localQa';
@@ -43,6 +45,8 @@ export interface InteractionContext {
   source_segments?: readonly InteractionSourceSegment[];
   /** Number of oldest source segments evicted from the bounded internal ledger. */
   source_segments_overflow_count?: number;
+  /** Exact Core outcomes captured after predecessor release; never evidence of no Native effects. */
+  source_recovery_facts?: SourceRecoveryFacts;
 }
 
 export interface InteractionAdapterCapabilities {
@@ -164,7 +168,15 @@ export interface CortexPresentationFenceReceipt {
 
 export type CortexPresentationVerificationStage = 'bind' | 'append' | 'publish';
 
+/* === VIVENTIUM START === Released Native handoffs retain their Core speech-control owner. === */
+export interface PublicPartOwner {
+  identity: NativeResponseIdentity;
+  verifySource: () => Promise<boolean>;
+}
+/* === VIVENTIUM END === */
+
 export interface ChunkEmissionOptions {
+  publicPartOwner?: PublicPartOwner;
   verifyCortexPresentation?: (
     stage: CortexPresentationVerificationStage,
   ) => Promise<CortexPresentationFenceReceipt>;
@@ -193,6 +205,8 @@ export interface DeliveryAcknowledgementResult {
     responseMessageId?: string;
     interactionContext?: InteractionContext;
     cortexPresentation?: CortexPresentationBinding;
+    /** Existing server read proves the exact result still has a live producer. */
+    producerPending?: boolean;
   };
 }
 
@@ -269,6 +283,7 @@ export interface SerializableJobData {
   durableEffectReceipts?: DurableEffectReceipt[];
   /** Exact route-captured Voice authority used only for Mongo-before-provider effect admission. */
   viventiumVoiceEffectAuthority?: VoiceDurableEffectAuthorityBinding;
+  viventiumVoiceWorkAuthority?: VoiceWorkAuthorityBinding;
   viventiumCallSessionId?: string;
   viventiumVoiceTaskId?: string;
   /** Immutable native admission; only the typed publication owner may change it. */
@@ -442,6 +457,16 @@ export interface IJobStore {
     userId: string,
     interactionContext: InteractionContext,
   ): Promise<InteractionContext>;
+
+  /** Positive revoked publication with no bound identity; a job-level half bind cannot dispatch. */
+  isNativeResponseUnboundCancelled?(expected: SerializableJobData): Promise<boolean>;
+
+  /** Read predecessor jobs from the existing exact source-author reservations, never a second ledger. */
+  getLogicalTurnSourcePredecessors?(
+    streamId: string,
+    userId: string,
+    interactionContext: InteractionContext,
+  ): Promise<SerializableJobData[]>;
 
   /** A committed revision that cannot start its Main gives up authorship and can never commit. */
   relinquishLogicalTurnAuthor?(

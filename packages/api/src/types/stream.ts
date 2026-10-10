@@ -1,6 +1,7 @@
 import type { EventEmitter } from 'events';
 import type { Agents } from 'librechat-data-provider';
 import type { ServerSentEvent } from '~/types';
+import type { VoiceWorkAuthorityBinding } from '~/voice/engagementAuthority';
 import type {
   AdapterCapabilities,
   ClientPresentation,
@@ -36,6 +37,7 @@ export interface GenerationJobMetadata {
   durableEffectReceipt?: DurableEffectReceipt;
   durableEffectReceipts?: DurableEffectReceipt[];
   viventiumVoiceEffectAuthority?: VoiceDurableEffectAuthorityBinding;
+  viventiumVoiceWorkAuthority?: VoiceWorkAuthorityBinding;
   viventiumCallSessionId?: string;
   viventiumVoiceTaskId?: string;
   generationCompleted?: boolean;

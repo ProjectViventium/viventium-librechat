@@ -10,6 +10,8 @@ const ORIGINAL_ENV = { ...process.env };
 describe('voicePhaseAPolicy', () => {
   beforeEach(() => {
     process.env = { ...ORIGINAL_ENV };
+    delete process.env.VIVENTIUM_TEXT_BACKGROUND_AGENT_DETECTION_ASYNC;
+    delete process.env.VIVENTIUM_CORTEX_SPECULATIVE_PARALLEL_DETECT;
     delete process.env.VIVENTIUM_VOICE_BACKGROUND_AGENT_DETECTION_ASYNC;
     delete process.env.VIVENTIUM_VOICE_PHASE_A_ASYNC_ALLOW_TOOL_HOLD;
     delete process.env.VIVENTIUM_TOOL_CORTEX_HOLD_ENABLED;

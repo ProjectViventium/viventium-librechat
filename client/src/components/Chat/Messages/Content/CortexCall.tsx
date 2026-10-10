@@ -84,13 +84,14 @@ export default function CortexCall({
         return 1;
       case 'skipped':
       case 'error':
+      case 'cancelled':
         return 1;
       default:
         return 0.1;
     }
   }, [displayStatus]);
 
-  const cancelled = isError;
+  const cancelled = isError || displayStatus === 'cancelled';
 
   // Get display text based on status
   const getText = () => {
@@ -105,6 +106,8 @@ export default function CortexCall({
           : cortex_name;
       case 'skipped':
         return `${cortex_name} skipped`;
+      case 'cancelled':
+        return `${cortex_name} · ${localize('com_ui_cancelled')}`;
       case 'error':
         return `${cortex_name} error`;
       default:

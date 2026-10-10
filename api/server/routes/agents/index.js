@@ -10,6 +10,11 @@ const {
   messageUserLimiter,
 } = require('~/server/middleware');
 const { saveMessage } = require('~/models');
+/* === VIVENTIUM START === Linked-chat Stop shares the exact native Voice task owner. === */
+const {
+  requestVoiceTaskOwnerCancellationForJob,
+} = require('~/server/services/viventium/VoiceTaskService');
+/* === VIVENTIUM END === */
 const openai = require('./openai');
 const responses = require('./responses');
 const { v1 } = require('./v1');
@@ -339,6 +344,47 @@ router.post('/chat/abort', async (req, res) => {
       });
     }
 
+    /* === VIVENTIUM START ===
+     * Native Voice Stop must install the task suppression barrier and obtain the owner's fresh
+     * capacity ACK. A raw stream abort bypasses that owner and can retire the job before delivery.
+     */
+    try {
+      const cancellation = await requestVoiceTaskOwnerCancellationForJob(job, {
+        streamId: jobStreamId,
+        userId,
+      });
+      if (cancellation) {
+        const outcome = cancellation.alreadyCompleted
+          ? 'already_completed'
+          : cancellation.alreadyInactive
+            ? 'not_active'
+            : cancellation.alreadyCancelled
+              ? cancellation.task?.state
+              : 'cancelling';
+        return res
+          .status(
+            cancellation.alreadyCompleted || cancellation.alreadyInactive
+              ? 409
+              : cancellation.alreadyCancelled || cancellation.alreadyCancelling
+                ? 200
+                : 202,
+          )
+          .json({
+            version: 1,
+            outcome,
+            operationId: cancellation.operationId,
+            task: cancellation.task,
+            event: cancellation.event,
+          });
+      }
+    } catch (error) {
+      return res.status(error?.status || 503).json({
+        code: error?.code || 'gateway_down',
+        message: 'Cancellation could not be confirmed. Please retry.',
+        retryable: error?.status !== 404,
+      });
+    }
+    /* === VIVENTIUM END === */
     logger.debug(`[AgentStream] Job found, aborting: ${jobStreamId}`);
     /* === VIVENTIUM START ===
      * Feature: Explicit harness cancellation reason.

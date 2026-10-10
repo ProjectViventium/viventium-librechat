@@ -404,7 +404,7 @@ const TELEGRAM_INGRESS_DEDUPE_ENABLED = parseBoolEnv(
 );
 const TELEGRAM_INGRESS_DEDUPE_TTL_S = telegramIngressDedupeTtlSeconds();
 const TELEGRAM_CONVERSATION_IDLE_MAX_M = Math.max(
-  parseIntEnv('VIVENTIUM_TELEGRAM_CONVERSATION_IDLE_MAX_M', 1440),
+  parseIntEnv('VIVENTIUM_TELEGRAM_CONVERSATION_IDLE_MAX_M', 0),
   0,
 );
 const TELEGRAM_CONVERSATION_IDLE_MAX_MS =
@@ -1530,6 +1530,10 @@ router.post(
         readinessStartedAt,
         `status=${readiness.status} available=${readiness.available}`,
       );
+      req._viventiumParallelWorkTurnReadiness = Object.freeze({
+        status: readiness.status,
+        reason: readiness.reason || '',
+      });
       const claimState = parallelWorkClaimState(String(req.user.id));
       req._viventiumParallelWorkTurnClaim = claimState;
       req._viventiumParallelWorkTurnAvailable = Boolean(

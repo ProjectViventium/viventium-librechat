@@ -4,7 +4,9 @@
  * === VIVENTIUM END === */
 
 import { Schema } from 'mongoose';
+import { normalizeMainBackgroundInputs } from '~/methods/mainContinuityEvidence';
 import type {
+  IMainContinuityBackgroundInput,
   IMainContinuityAcceptedRevision,
   IMainContinuityAcceptedTurn,
   IMainContinuityCompactionLease,
@@ -18,6 +20,30 @@ const toolPairSchema = new Schema<IMainContinuityToolPair>(
     callId: { type: String, default: '', maxlength: 256 },
     toolName: { type: String, default: '', maxlength: 256 },
     outcome: { type: String, default: '', maxlength: 1200 },
+  },
+  { _id: false },
+);
+
+const backgroundInputSchema = new Schema<IMainContinuityBackgroundInput>(
+  {
+    version: { type: Number, required: true, enum: [1] },
+    invocationId: { type: String, required: true, maxlength: 160 },
+    deliveryId: { type: String, required: true, match: /^[a-f0-9]{64}$/ },
+    text: { type: String, required: true, maxlength: 65536 },
+    textSha256: { type: String, required: true, match: /^[a-f0-9]{64}$/ },
+    sources: {
+      type: [
+        new Schema(
+          {
+            cortexId: { type: String, required: true, maxlength: 256 },
+            cortexName: { type: String, maxlength: 1024 },
+            insightSha256: { type: String, required: true, match: /^[a-f0-9]{64}$/ },
+          },
+          { _id: false },
+        ),
+      ],
+      required: true,
+    },
   },
   { _id: false },
 );
@@ -36,6 +62,21 @@ const acceptedTurnSchema = new Schema<IMainContinuityAcceptedTurn>(
     userText: { type: String, default: '', maxlength: 6000 },
     assistantText: { type: String, default: '', maxlength: 6000 },
     toolPairs: { type: [toolPairSchema], default: [] },
+    backgroundInputs: {
+      type: [backgroundInputSchema],
+      default: undefined,
+      validate: {
+        validator(value: unknown) {
+          try {
+            normalizeMainBackgroundInputs(value);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        message: 'Accepted Main background input is invalid',
+      },
+    },
     committedAt: { type: Date, required: true },
     sourceDeletedAt: { type: Date, default: undefined },
   },

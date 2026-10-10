@@ -49,6 +49,7 @@ jest.mock('~/server/services/Config', () => ({
 
 jest.mock('~/server/services/viventium/BackgroundCortexFollowUpService', () => ({
   createCortexFollowUpMessage: (...args) => mockCreateCortexFollowUpMessage(...args),
+  bindOccupiedCortexRecovery: jest.fn(),
 }));
 
 const { ContentTypes } = require('librechat-data-provider');
@@ -1974,6 +1975,8 @@ describe('staleCortexMessageRecovery', () => {
     };
     const deliveryService = {
       listRecoverableParents: jest.fn().mockResolvedValue([parent]),
+      listByParent: jest.fn().mockResolvedValue([claimed]),
+      listEvents: jest.fn().mockResolvedValue([]),
       claimPendingByParent: jest.fn().mockResolvedValue({
         claimId: 'cidl_claim',
         deliveries: [claimed],
@@ -2647,3 +2650,65 @@ describe('staleCortexMessageRecovery', () => {
     });
   });
 });
+
+/* === VIVENTIUM START === Recovery author admission reads immutable row cause. === */
+describe('occupied Voice author-entry row evidence', () => {
+  test.each([
+    ['exact', 'delivery-owned', true],
+    ['foreign', 'delivery-foreign', false],
+  ])(
+    '%s immutable event controls the actual recovered author, not parent decision',
+    async (_label, eventId, eligible) => {
+      const service = require('../CortexInsightDeliveryService').cortexInsightDeliveryService;
+      const listEvents = jest
+        .spyOn(service, 'listEvents')
+        .mockResolvedValue([
+          { deliveryId: eventId, transition: 'failure', reason: 'native_session_occupied' },
+        ]);
+      mockFindOneLean({
+        messageId: 'parent-owned',
+        agent_id: 'agent-owned',
+        text: 'A completed reply.',
+        metadata: {
+          viventium: {
+            cortexFollowUpDecision: {
+              generationFailure: {
+                status: 409,
+                code: 'conversation_session_authority_conflict',
+              },
+            },
+          },
+        },
+      });
+      mockGetUserById.mockResolvedValue({ _id: 'owner-owned', role: 'USER' });
+      mockGetAgent.mockResolvedValue({ id: 'agent-owned' });
+      mockGetAppConfig.mockResolvedValue({});
+      mockCreateCortexFollowUpMessage.mockResolvedValue({ messageId: 'child-owned' });
+      try {
+        const run = createRecoveredCortexFollowUp({
+          ownerId: 'owner-owned',
+          conversationId: 'conversation-owned',
+          parentMessageId: 'parent-owned',
+          surface: 'voice',
+          insights: [{ cortexId: 'review', insight: 'Useful.' }],
+          deliveryBatch: { claimed: [{ deliveryId: 'delivery-owned' }] },
+          recoveryContext: {},
+        });
+        if (eligible) {
+          await expect(run).resolves.toMatchObject({ messageId: 'child-owned' });
+          expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+        } else {
+          await expect(run).rejects.toMatchObject({ code: 'cortex_voice_recovery_scope_mismatch' });
+          expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+        }
+        expect(listEvents).toHaveBeenCalledWith({
+          ownerId: 'owner-owned',
+          parentMessageId: 'parent-owned',
+        });
+      } finally {
+        listEvents.mockRestore();
+      }
+    },
+  );
+});
+/* === VIVENTIUM END === */

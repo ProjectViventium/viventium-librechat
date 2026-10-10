@@ -922,11 +922,83 @@ function serializePromptFrameTraceTelemetry(frame) {
 }
 /* === VIVENTIUM END === */
 
-function logPromptFrame(targetLogger, frame) {
+/* === VIVENTIUM START ===
+ * Trace byte retention at the existing Main transport seams without logging source content.
+ * === VIVENTIUM END === */
+const TURN_CONTEXT_RETENTION_KINDS = new Set([
+  'reply',
+  'conversationContinuity',
+  'mainContinuity',
+  'savedMemoryWriter',
+  'recurrenceState',
+  'time',
+  'activeWork',
+  'sourceSelection',
+  'feelings',
+  'telegramReplyContext',
+  'fixedContext',
+  'unclassified',
+]);
+
+function promptFrameLoggingEnabled() {
+  return (
+    process.env[LOG_ENV] !== '0' &&
+    (process.env.NODE_ENV !== 'test' || process.env[LOG_ENV] === '1')
+  );
+}
+
+function logTurnContextRetention(
+  targetLogger,
+  { stage, budgetBytes, outputText, components = [], snapshotSha256 = '' } = {},
+) {
+  if (!promptFrameLoggingEnabled()) return false;
   if (
-    process.env[LOG_ENV] === '0' ||
-    (process.env.NODE_ENV === 'test' && process.env[LOG_ENV] !== '1')
+    !['combine', 'fixed_compact', 'reproject', 'encode'].includes(stage) ||
+    typeof outputText !== 'string' ||
+    !Number.isInteger(budgetBytes) ||
+    budgetBytes < 0 ||
+    !Array.isArray(components)
   ) {
+    return false;
+  }
+  try {
+    const facts = components.map(({ kind, beforeText, afterText }) => {
+      const before = typeof beforeText === 'string' ? beforeText : '';
+      const after = typeof afterText === 'string' ? afterText : '';
+      return {
+        kind: TURN_CONTEXT_RETENTION_KINDS.has(kind) ? kind : 'unclassified',
+        before_bytes: Buffer.byteLength(before, 'utf8'),
+        after_bytes: Buffer.byteLength(after, 'utf8'),
+        component_sha256: crypto.createHash('sha256').update(before, 'utf8').digest('hex'),
+        decision: !before
+          ? 'absent'
+          : !after
+            ? 'dropped'
+            : before === after
+              ? 'retained'
+              : 'changed',
+      };
+    });
+    const serialized = JSON.stringify({
+      v: 1,
+      stage,
+      budget_bytes: budgetBytes,
+      output_bytes: Buffer.byteLength(outputText, 'utf8'),
+      output_sha256: crypto.createHash('sha256').update(outputText, 'utf8').digest('hex'),
+      ...(/^[a-f0-9]{64}$/.test(snapshotSha256) ? { snapshot_sha256: snapshotSha256 } : {}),
+      components: facts,
+    });
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_TRACE_LOG_BYTES) return false;
+    if (!targetLogger || typeof targetLogger.debug !== 'function') return false;
+    targetLogger.debug('[MainTurnContextRetention]', serialized);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function logPromptFrame(targetLogger, frame) {
+  if (!promptFrameLoggingEnabled()) {
     return writePromptFrameFile(frame);
   }
   if (!frame || typeof frame !== 'object') {
@@ -988,6 +1060,8 @@ module.exports = {
   buildPromptFrameTraceTelemetry,
   /* === VIVENTIUM END === */
   logPromptFrame,
+  promptFrameLoggingEnabled,
+  logTurnContextRetention,
   resolvePromptObservabilityDir,
   writePromptFrameFile,
   flushPromptFrameFileWrites,

@@ -8,7 +8,7 @@ import Mermaid from '~/components/Messages/Content/Mermaid';
 import useHasAccess from '~/hooks/Roles/useHasAccess';
 import { useFileDownload, useGetStartupConfig } from '~/data-provider';
 import { resolveAppLink } from '~/utils/appLinks';
-import { useCodeBlockContext } from '~/Providers';
+import { useCodeBlockContext, useMessageContext } from '~/Providers';
 import { handleDoubleClick } from '~/utils';
 import { useLocalize } from '~/hooks';
 import store from '~/store';
@@ -99,6 +99,7 @@ type TAnchorProps = {
 
 export const a: React.ElementType = memo(function MarkdownAnchor({ href, children }: TAnchorProps) {
   const user = useRecoilValue(store.user);
+  const messageContext = useMessageContext();
   /* === VIVENTIUM START === Indexed source URLs must open in the active signed-in session. === */
   const { data: startupConfig } = useGetStartupConfig();
   const linkHref = resolveAppLink(
@@ -115,6 +116,29 @@ export const a: React.ElementType = memo(function MarkdownAnchor({ href, childre
     filename = '',
     filepath,
   } = useMemo(() => {
+    /* === VIVENTIUM START === Present only the exact verified grant through the owner File API. === */
+    const imported = messageContext?.viventiumFileAttachments?.find(
+      (item) =>
+        item.nativeOutputFile?.version === 1 &&
+        item.nativeOutputFile.status === 'available' &&
+        item.nativeOutputFile.messageId === messageContext.messageId &&
+        item.nativeOutputFile.downloadUrl === href &&
+        'user' in item &&
+        item.user === user?.id &&
+        'file_id' in item &&
+        typeof item.file_id === 'string' &&
+        item.file_id.startsWith('native_') &&
+        !!item.filename &&
+        !!item.filepath,
+    );
+    if (imported && 'file_id' in imported && typeof imported.file_id === 'string') {
+      return {
+        file_id: imported.file_id,
+        filename: imported.filename,
+        filepath: `files/${encodeURIComponent(user?.id ?? '')}/${imported.file_id}/${encodeURIComponent(imported.filename ?? '')}`,
+      };
+    }
+    /* === VIVENTIUM END === */
     const pattern = new RegExp(`(?:files|outputs)/${user?.id}/([^\\s]+)`);
     const match = href.match(pattern);
     if (match && match[0]) {
@@ -122,10 +146,18 @@ export const a: React.ElementType = memo(function MarkdownAnchor({ href, childre
       const parts = path.split('/');
       const name = parts.pop();
       const file_id = parts.pop();
-      return { file_id, filename: name, filepath: path };
+      /* === VIVENTIUM START === A URL segment is not the user's download filename. === */
+      let filename = name;
+      try {
+        filename = decodeURIComponent(name ?? '');
+      } catch {
+        // Retain malformed legacy names rather than preventing an authorized download.
+      }
+      return { file_id, filename, filepath: path };
+      /* === VIVENTIUM END === */
     }
     return { file_id: '', filename: '', filepath: '' };
-  }, [user?.id, href]);
+  }, [user?.id, href, messageContext]);
 
   const { refetch: downloadFile } = useFileDownload(user?.id ?? '', file_id);
   const props: { target?: string; onClick?: React.MouseEventHandler } = { target: '_blank' };

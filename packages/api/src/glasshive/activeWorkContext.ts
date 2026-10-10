@@ -28,6 +28,7 @@ interface ContextUser {
 interface ContextRequest {
   user?: ContextUser;
   _viventiumParallelWorkTurnAvailable?: boolean;
+  _viventiumParallelWorkTurnReadiness?: { status?: string; reason?: string };
   _viventiumActiveWorkContext?: { scope: string; promise: Promise<WorkSnapshot | null> };
 }
 
@@ -55,11 +56,12 @@ export function formatActiveWorkContext({
   snapshot,
   preferredMode,
   available,
-  voice = false,
+  readiness,
 }: {
   snapshot: WorkSnapshot;
   preferredMode: 'parallel' | 'focused';
   available: boolean;
+  readiness?: { status?: string; reason?: string };
   voice?: boolean;
 }): string {
   const rows = Array.isArray(snapshot.work)
@@ -70,8 +72,8 @@ export function formatActiveWorkContext({
       Number(attention(right)) - Number(attention(left)) ||
       text(right.updatedAt, 64).localeCompare(text(left.updatedAt, 64)),
   );
-  const selected = voice ? sorted.filter(attention) : sorted;
-  const work = selected.map((item) => ({
+  /* === VIVENTIUM START === Same known work facts for Voice without another roster lookup. === */
+  const work = sorted.map((item) => ({
     workRef: text(item.workRef, 160),
     title: text(item.title, 256),
     state: text(item.state, 40),
@@ -84,9 +86,16 @@ export function formatActiveWorkContext({
       : [],
     ...(item.delivery ? { deliveryState: text(item.delivery.state, 40) } : {}),
   }));
+  /* === VIVENTIUM END === */
   const facts = {
     preferredMode,
     available,
+    ...(preferredMode === 'parallel' && available === false
+      ? { readiness: {
+          status: text(readiness?.status, 40) || 'unknown',
+          reason: text(readiness?.reason, 120) || null,
+        } }
+      : {}),
     snapshot: text(snapshot.snapshot, 32) || 'unavailable',
     activeCount: rows ? rows.filter((item) => !TERMINAL_STATES.has(item.state || '')).length : null,
     work: rows ? work : null,
@@ -160,6 +169,7 @@ export function createActiveWorkContextService(dependencies: ContextDependencies
       snapshot: scope(req) === expectedScope ? snapshot : unavailable(),
       preferredMode: dependencies.preferredMode(req.user),
       available: req._viventiumParallelWorkTurnAvailable === true,
+      readiness: req._viventiumParallelWorkTurnReadiness,
       voice,
     });
   }

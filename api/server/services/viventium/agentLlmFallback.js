@@ -12,6 +12,7 @@ const NON_RETRYABLE_FALLBACK_ERROR_CLASSES = new Set([
   'native_input_expired',
   'native_input_cancelled',
   'native_turn_cancelled',
+  'provider_progress_stalled',
   'host_capacity',
   'provider_request_rejected',
   'bad_request',

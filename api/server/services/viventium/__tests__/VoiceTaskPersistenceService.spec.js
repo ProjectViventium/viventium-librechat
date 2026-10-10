@@ -15,11 +15,16 @@ describe('VoiceTask durable replay and suppression', () => {
   let mongoServer;
   let ViventiumVoiceTask;
   let ViventiumVoiceTaskSuppression;
+  let ViventiumCallSession;
 
   beforeAll(async () => {
     mongoServer = await MongoMemoryServer.create();
     await mongoose.connect(mongoServer.getUri());
-    ({ ViventiumVoiceTask, ViventiumVoiceTaskSuppression } = require('~/db/models'));
+    ({
+      ViventiumVoiceTask,
+      ViventiumVoiceTaskSuppression,
+      ViventiumCallSession,
+    } = require('~/db/models'));
   });
 
   afterAll(async () => {
@@ -33,6 +38,273 @@ describe('VoiceTask durable replay and suppression', () => {
     service.setVoiceTaskSuppressionPersistenceForTests(null);
     await ViventiumVoiceTask.deleteMany({});
     await ViventiumVoiceTaskSuppression.deleteMany({});
+    await ViventiumCallSession.deleteMany({});
+  });
+
+  function nativePermission() {
+    return {
+      version: 1,
+      kind: 'permission',
+      state: 'pending',
+      mode: 'form',
+      runtimeName: 'Native runtime',
+      requestId: 'permission-1',
+      requestFingerprint: 'a'.repeat(64),
+      runId: 'run-native',
+      attemptId: 'attempt-1',
+      sessionId: 'session-1',
+      expiresAt: '2099-01-01T00:00:00Z',
+      message: 'Permit this operation?',
+      requestedSchema: {
+        type: 'object',
+        required: ['optionId'],
+        properties: {
+          optionId: {
+            type: 'string',
+            enum: ['allow_once', 'reject_once'],
+            enumNames: ['Allow once', 'Reject once'],
+          },
+        },
+      },
+    };
+  }
+
+  async function prepareNativeInput(expiresAt) {
+    const scope = { userId: 'native-owner', callSessionId: 'native-call' };
+    const task = service.createVoiceTask({
+      ...scope,
+      streamId: 'glasshive:run-native',
+      owner: { kind: 'glasshive_run', id: 'run-native' },
+    });
+    const pending = { ...nativePermission(), ...(expiresAt ? { expiresAt } : {}) };
+    mockNativeAccount.mockResolvedValue({ workRef: 'work-native', pendingNativeInput: pending });
+    await require('../GlassHiveVoiceTaskActionService').registerGlassHiveVoiceTaskActionCapabilities(
+      {
+        task,
+        ownerId: scope.userId,
+        workRef: 'work-native',
+        body: { event: 'run.needs_input', run_id: 'run-native', pending_native_input: pending },
+      },
+    );
+    await service.flushVoiceTaskPersistence();
+    return {
+      task,
+      scope,
+      pending,
+      authority: {
+        callSessionId: scope.callSessionId,
+        binding: { callSessionId: scope.callSessionId, userId: scope.userId },
+      },
+    };
+  }
+
+  test('restored failed foreground attention hides Cancel until its exact native owner adapter is installed', async () => {
+    const scope = { userId: 'attention-owner', callSessionId: 'attention-call' };
+    const task = service.createVoiceTask({
+      ...scope,
+      streamId: 'attention-stream',
+      owner: { kind: 'remote_generation', id: 'attention-stream' },
+    });
+    const cancel = jest.fn(async () => ({ accepted: false }));
+    service.registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'remote_generation',
+      cancel,
+      cancelFailedProviderAttention: true,
+    });
+    service.failVoiceTask(task.taskId, { code: 'provider_progress_stalled' });
+    expect(service.snapshotEvent(task.taskId).cancellable).toBe(true);
+    await service.flushVoiceTaskPersistence();
+    const row = await ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean();
+    expect(JSON.stringify(row.payload)).not.toContain('cancelFailedProviderAttention');
+    service.resetVoiceTasksForTests();
+    await service.hydrateVoiceTask(task.taskId, scope);
+    expect(service.snapshotEvent(task.taskId)).toMatchObject({
+      state: 'failed',
+      cancellable: false,
+      retryable: false,
+      error: { code: 'provider_progress_stalled' },
+    });
+    expect(await service.requestVoiceTaskOwnerCancellation(task.taskId, scope)).toMatchObject({
+      alreadyInactive: true,
+    });
+    expect(cancel).not.toHaveBeenCalled();
+  });
+
+  test.each(['cached', 'stored'])(
+    'same-owner %s suppression hydration retains task creation and the pending cancellation operation',
+    async (mode) => {
+      const scope = { userId: 'stop-hydrate-owner', callSessionId: 'stop-hydrate-call' };
+      const task = service.createVoiceTask({
+        ...scope,
+        streamId: 'stop-hydrate-stream',
+        owner: { kind: 'remote_generation', id: 'stop-hydrate-stream' },
+      });
+      const createdAt = task.createdAt;
+      let release;
+      const blocked = new Promise((resolve) => {
+        release = resolve;
+      });
+      const cancel = jest.fn(async () => {
+        await blocked;
+        return {
+          accepted: Boolean(
+            await service.confirmVoiceTaskOwnerCancellation(task.taskId, 'Exact owner stopped.'),
+          ),
+        };
+      });
+      service.registerVoiceTaskOwnerAdapter(task.taskId, { kind: 'remote_generation', cancel });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await service.requestVoiceTaskOwnerCancellation(task.taskId, scope);
+      const before = service.snapshotEvent(task.taskId);
+      if (mode === 'stored') {
+        const row = await ViventiumVoiceTaskSuppression.findOne({ taskId: task.taskId }).lean();
+        await service.clearVoiceTaskSuppression(task.taskId);
+        await ViventiumVoiceTaskSuppression.create(row);
+      }
+      try {
+        await service.hydrateVoiceTaskSuppression(task.taskId, scope);
+        expect(service.getVoiceTask(task.taskId)).toMatchObject({ state: 'cancelling', createdAt });
+        expect(service.snapshotEvent(task.taskId).sequence).toBe(before.sequence);
+        expect(await service.requestVoiceTaskOwnerCancellation(task.taskId, scope)).toMatchObject({
+          alreadyCancelling: true,
+          ownerPending: true,
+        });
+        release();
+        await service.flushVoiceTaskOwnerOperations();
+        expect(service.getVoiceTask(task.taskId)).toMatchObject({
+          state: 'cancelled_confirmed',
+          createdAt,
+        });
+        expect(cancel).toHaveBeenCalledTimes(1);
+        const row = await ViventiumVoiceTaskSuppression.findOne({ taskId: task.taskId }).lean();
+        expect(row.state).toBe('cancelled_confirmed');
+      } finally {
+        release();
+        await service.flushVoiceTaskOwnerOperations();
+      }
+    },
+  );
+
+  test('commits exact native retry identity before the effect and restores the same owner operation after restart', async () => {
+    const { task, scope, authority } = await prepareNativeInput();
+    let originalOperation;
+    mockNativeWorkAction.mockImplementationOnce(async (input) => {
+      originalOperation = input;
+      const row = await ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean();
+      expect(row.payload.inputOperation).toEqual({
+        hash: require('crypto').createHash('sha256').update('allow_once').digest('hex'),
+        operationId: input.operationId,
+      });
+      expect(row.payload.nativeMissionInputBinding).toMatchObject({
+        taskId: task.taskId,
+        workRef: 'work-native',
+        requestFingerprint: 'a'.repeat(64),
+        userId: scope.userId,
+        callSessionId: scope.callSessionId,
+      });
+      expect(JSON.stringify(row.payload.inputOperation)).not.toContain('allow_once');
+      return { status: 'pending', confirmationPending: true };
+    });
+    expect(
+      await service.submitVoiceTaskInput(task.taskId, 'allow_once', {
+        userId: scope.userId,
+        voiceAuthorityContext: authority,
+      }),
+    ).toMatchObject({ ok: true, confirmationPending: true, task: { state: 'needs_input' } });
+    await service.flushVoiceTaskPersistence();
+    service.resetVoiceTasksForTests();
+    mockNativeAccount.mockClear();
+    expect(
+      await service.hydrateVoiceTask(task.taskId, { ...scope, userId: 'foreign-owner' }),
+    ).toBeNull();
+    expect(mockNativeAccount).not.toHaveBeenCalled();
+    await service.hydrateVoiceTask(task.taskId, scope);
+    expect(mockNativeAccount).toHaveBeenCalledWith({
+      ownerId: scope.userId,
+      path: '/v1/work/work-native',
+    });
+    expect(
+      await service.submitVoiceTaskInput(task.taskId, 'reject_once', {
+        userId: scope.userId,
+        voiceAuthorityContext: authority,
+      }),
+    ).toMatchObject({ ok: false, code: 'input_confirmation_pending' });
+    mockNativeWorkAction.mockResolvedValueOnce({
+      status: 'already_accepted',
+      confirmationPending: false,
+    });
+    expect(
+      await service.submitVoiceTaskInput(task.taskId, 'allow_once', {
+        userId: scope.userId,
+        voiceAuthorityContext: authority,
+      }),
+    ).toMatchObject({ ok: true, task: { state: 'running' } });
+    expect(mockNativeWorkAction.mock.calls.at(-1)[0]).toEqual(originalOperation);
+  });
+
+  test('restart after expiry reconciles only the previously retained native operation when the live question has gone', async () => {
+    const expiresAtMs = Date.now() + 10000;
+    const { task, scope, authority, pending } = await prepareNativeInput(
+      new Date(expiresAtMs).toISOString(),
+    );
+    mockNativeWorkAction.mockResolvedValueOnce({ status: 'pending', confirmationPending: true });
+    expect(
+      await service.submitVoiceTaskInput(task.taskId, 'allow_once', {
+        userId: scope.userId,
+        voiceAuthorityContext: authority,
+      }),
+    ).toMatchObject({ ok: true, confirmationPending: true, task: { state: 'needs_input' } });
+    const submitted = mockNativeWorkAction.mock.calls.at(-1)[0];
+    await service.flushVoiceTaskPersistence();
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(expiresAtMs + 1);
+    try {
+      service.resetVoiceTasksForTests();
+      mockNativeAccount.mockResolvedValue({ workRef: 'work-native', pendingNativeInput: null });
+      await service.hydrateVoiceTask(task.taskId, scope);
+      expect(
+        await service.submitVoiceTaskInput(task.taskId, 'reject_once', {
+          userId: scope.userId,
+          voiceAuthorityContext: authority,
+        }),
+      ).toMatchObject({ ok: false, code: 'input_confirmation_pending' });
+      mockNativeWorkAction.mockResolvedValueOnce({
+        status: 'already_accepted',
+        confirmationPending: false,
+      });
+      expect(
+        await service.submitVoiceTaskInput(task.taskId, 'allow_once', {
+          userId: scope.userId,
+          voiceAuthorityContext: authority,
+        }),
+      ).toMatchObject({ ok: true, task: { state: 'running' } });
+      expect(mockNativeWorkAction.mock.calls.at(-1)[0]).toEqual(submitted);
+      expect(submitted.nativeInput.requestFingerprint).toBe(pending.requestFingerprint);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test('native durability failure stops the owner effect and the same operation can retry', async () => {
+    const { task, scope, authority } = await prepareNativeInput();
+    const bulkWrite = jest
+      .spyOn(ViventiumVoiceTask, 'bulkWrite')
+      .mockRejectedValue(new Error('synthetic storage outage'));
+    mockNativeWorkAction.mockClear();
+    expect(
+      await service.submitVoiceTaskInput(task.taskId, 'allow_once', {
+        userId: scope.userId,
+        voiceAuthorityContext: authority,
+      }),
+    ).toMatchObject({ ok: false, code: 'owner_input_failed' });
+    expect(mockNativeWorkAction).not.toHaveBeenCalled();
+    bulkWrite.mockRestore();
+    mockNativeWorkAction.mockResolvedValueOnce({ status: 'accepted', confirmationPending: false });
+    expect(
+      await service.submitVoiceTaskInput(task.taskId, 'allow_once', {
+        userId: scope.userId,
+        voiceAuthorityContext: authority,
+      }),
+    ).toMatchObject({ ok: true, task: { state: 'running' } });
   });
 
   function nativePermission() {
@@ -239,32 +511,44 @@ describe('VoiceTask durable replay and suppression', () => {
     });
   });
 
-  test('hydrates bounded task state, events, sources, and result after an API restart', async () => {
-    const task = service.createVoiceTask({
-      callSessionId: 'call-restart',
-      userId: 'user-restart',
-      conversationId: 'conversation-restart',
-      streamId: 'stream-restart',
-    });
-    service.observeGenerationEvent(task.taskId, {
-      event: 'on_source',
-      data: { id: 'source-1', title: 'Source', url: 'https://example.test/source' },
-    });
-    service.completeVoiceTask(task.taskId, { resultMessageId: 'message-result' });
-    await service.flushVoiceTaskPersistence();
-    service.resetVoiceTasksForTests();
+  test.each(['generation_job', 'glasshive_run', 'glasshive_delivery'])(
+    'hydrates saved %s ownership, events, sources, and result after an API restart',
+    async (kind) => {
+      const task = service.createVoiceTask({
+        callSessionId: 'call-restart',
+        userId: 'user-restart',
+        conversationId: 'conversation-restart',
+        streamId: 'stream-restart',
+        owner: { kind, id: 'owner-restart' },
+      });
+      service.observeGenerationEvent(task.taskId, {
+        event: 'on_source',
+        data: { id: 'source-1', title: 'Source', url: 'https://example.test/source' },
+      });
+      service.completeVoiceTask(task.taskId, { resultMessageId: 'message-result' });
+      await service.flushVoiceTaskPersistence();
+      service.resetVoiceTasksForTests();
 
-    await service.hydrateVoiceTasksForCall({
-      callSessionId: 'call-restart',
-      userId: 'user-restart',
-    });
+      await service.hydrateVoiceTasksForCall({
+        callSessionId: 'call-restart',
+        userId: 'user-restart',
+      });
 
-    expect(service.snapshotEvent(task.taskId)).toMatchObject({
-      state: 'completed',
-      resultMessageId: 'message-result',
-      sources: [{ id: 'source-1', title: 'Source', url: 'https://example.test/source' }],
-    });
-  });
+      expect(service.snapshotEvent(task.taskId)).toMatchObject({
+        state: 'completed',
+        resultMessageId: 'message-result',
+        sources: [{ id: 'source-1', title: 'Source', url: 'https://example.test/source' }],
+      });
+      expect(service.getVoiceTaskOwnerBinding(task.taskId)).toEqual({
+        taskId: task.taskId,
+        callSessionId: 'call-restart',
+        userId: 'user-restart',
+        conversationId: 'conversation-restart',
+      });
+      expect(service.getVoiceTaskTraceBinding(task.taskId)).toBeNull();
+      expect(service.getVoiceTask(task.taskId)).not.toHaveProperty('userId');
+    },
+  );
 
   test('generation cleanup does not wait on a failed unrelated durable batch and the queued result recovers', async () => {
     const scope = {
@@ -578,6 +862,38 @@ describe('VoiceTask durable replay and suppression', () => {
       resultMessageId: 'message-dispatch-ack',
     });
   });
+
+  test.each([
+    ['native_output_file_unavailable', 'native_output_file_unavailable'],
+    ['private/path/arbitrary-failure', 'generation_failed'],
+  ])(
+    'retains a safe %s file-delivery warning through pending child links and restart',
+    async (code, expectedCode) => {
+      const scope = { callSessionId: 'call-delivery-restart', userId: 'user-restart' };
+      const task = service.createVoiceTask({ ...scope, streamId: 'stream-delivery-restart' });
+      service.markVoiceTaskAwaitingOwnerResult(task.taskId, 'phase_b:reply-delivery');
+      service.completeVoiceTask(task.taskId, {
+        resultMessageId: 'reply-delivery',
+        deliveryError: { code, message: 'private content' },
+      });
+      await service.flushVoiceTaskPersistence();
+      const pending = await ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean();
+      expect(pending.payload.pendingCompletionDeliveryErrorCode).toBe(expectedCode);
+      service.resetVoiceTasksForTests();
+      await service.hydrateVoiceTask(task.taskId, scope);
+      service.linkVoiceTaskOwnerChild(task.taskId, { continuationKey: 'phase_b:reply-delivery' });
+      await service.flushVoiceTaskPersistence();
+      service.resetVoiceTasksForTests();
+      await service.hydrateVoiceTask(task.taskId, scope);
+      expect(service.snapshotEvent(task.taskId)).toMatchObject({
+        state: 'completed',
+        resultMessageId: 'reply-delivery',
+        retryable: false,
+        error: { code: expectedCode },
+      });
+      expect(JSON.stringify(service.snapshotEvent(task.taskId))).not.toContain('private');
+    },
+  );
 
   test('fails a callback-backed owner task after its durable delivery deadline survives restart', async () => {
     const task = service.createVoiceTask({
@@ -1244,4 +1560,111 @@ describe('VoiceTask durable replay and suppression', () => {
     expect(service.getVoiceTaskRegistryStats().durableCallTails).toBe(0);
     aggregate.mockRestore();
   });
+
+  test.each([true, false])(
+    'canonical End with a blocked shared aggregate: already ended=%s',
+    async (alreadyEnded) => {
+      const scope = { callSessionId: 'call-terminal-replay', userId: '507f1f77bcf86cd799439011' };
+      await ViventiumCallSession.create({
+        ...scope,
+        agentId: 'agent-terminal-replay',
+        conversationId: 'conversation-terminal-replay',
+        roomName: 'room-terminal-replay',
+        callStatus: alreadyEnded ? 'ended' : 'listening',
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      let releaseReplay;
+      let observeAuthority;
+      const blockedReplay = new Promise((resolve) => {
+        releaseReplay = resolve;
+      });
+      const observedAuthority = new Promise((resolve) => {
+        observeAuthority = resolve;
+      });
+      const realAggregate = ViventiumVoiceTask.aggregate.bind(ViventiumVoiceTask);
+      const realExists = ViventiumCallSession.exists.bind(ViventiumCallSession);
+      const aggregate = jest
+        .spyOn(ViventiumVoiceTask, 'aggregate')
+        .mockImplementationOnce((pipeline) => ({
+          option: async (options) => {
+            await blockedReplay;
+            return realAggregate(pipeline).option(options);
+          },
+        }));
+      const exists = jest.spyOn(ViventiumCallSession, 'exists').mockImplementation((filter) =>
+        realExists(filter).then((row) => {
+          observeAuthority(row);
+          return row;
+        }),
+      );
+      const onCallEnded = jest.fn();
+      const onEvent = jest.fn();
+      const tail = service.subscribeDurableVoiceTaskEventsForCall({
+        ...scope,
+        onEvent,
+        onCallEnded,
+      });
+      try {
+        const firstAuthority = await observedAuthority;
+        if (alreadyEnded) {
+          expect(firstAuthority).not.toBeNull();
+          await new Promise((resolve) => setImmediate(resolve));
+          expect(onCallEnded).toHaveBeenCalledTimes(1);
+        } else {
+          expect(firstAuthority).toBeNull();
+          await ViventiumCallSession.updateOne(
+            { callSessionId: scope.callSessionId },
+            { $set: { callStatus: 'ended' } },
+          );
+          expect(tail.catchUp()).toBe(tail.ready);
+          expect(onCallEnded).not.toHaveBeenCalled();
+        }
+        releaseReplay();
+        await tail.ready;
+        await tail.catchUp();
+        expect(onCallEnded).toHaveBeenCalledTimes(1);
+        expect(onEvent).not.toHaveBeenCalled();
+      } finally {
+        releaseReplay();
+        await tail.ready;
+        tail.stop();
+        aggregate.mockRestore();
+        exists.mockRestore();
+      }
+    },
+  );
+
+  test.each([
+    ['active', 'listening', 'user-terminal-scope', false],
+    ['failed', 'failed', 'user-terminal-scope', false],
+    ['foreign owner', 'ended', 'foreign-terminal-owner', false],
+    ['expired', 'ended', 'user-terminal-scope', true],
+  ])(
+    '%s canonical call does not revoke another live task tail',
+    async (_name, callStatus, userId, expired) => {
+      const scope = { callSessionId: 'call-terminal-scope', userId: 'user-terminal-scope' };
+      await ViventiumCallSession.create({
+        ...scope,
+        userId,
+        agentId: 'agent-terminal-scope',
+        conversationId: 'conversation-terminal-scope',
+        roomName: 'room-terminal-scope',
+        callStatus,
+        expiresAt: new Date(Date.now() + (expired ? -60_000 : 60_000)),
+      });
+      const onCallEnded = jest.fn();
+      const tail = service.subscribeDurableVoiceTaskEventsForCall({
+        ...scope,
+        onEvent: jest.fn(),
+        onCallEnded,
+      });
+      try {
+        await tail.ready;
+        await tail.catchUp();
+        expect(onCallEnded).not.toHaveBeenCalled();
+      } finally {
+        tail.stop();
+      }
+    },
+  );
 });

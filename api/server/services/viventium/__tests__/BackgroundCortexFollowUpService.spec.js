@@ -8,6 +8,33 @@
  * Added: 2026-03-06
  * === VIVENTIUM END === */
 
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const {
+  buildPromptBundleFixture,
+} = require('../../../../../scripts/test-support/promptBundle.cjs');
+const previousPromptBundlePath = process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+let promptFixtureDirectory;
+beforeAll(() => {
+  promptFixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'followup-test-prompts-'));
+  const bundlePath = path.join(promptFixtureDirectory, 'bundle.json');
+  fs.writeFileSync(
+    bundlePath,
+    JSON.stringify(
+      buildPromptBundleFixture(
+        path.resolve(__dirname, '../../../../../viventium/source_of_truth/prompts'),
+      ),
+    ),
+  );
+  process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundlePath;
+});
+afterAll(() => {
+  if (previousPromptBundlePath === undefined) delete process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+  else process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = previousPromptBundlePath;
+  fs.rmSync(promptFixtureDirectory, { recursive: true, force: true });
+});
+
 const { logger } = require('@librechat/data-schemas');
 const { Run } = require('@librechat/agents');
 const db = require('~/models');
@@ -181,7 +208,10 @@ describe('Phase B prompt registry ownership', () => {
   test('routes ordinary follow-up user prompts through the prompt registry', () => {
     jest.resetModules();
     const getPromptText = jest.fn((_promptId, fallback) => fallback);
-    jest.doMock('~/server/services/viventium/promptRegistry', () => ({ getPromptText }));
+    jest.doMock('~/server/services/viventium/promptRegistry', () => ({
+      ...jest.requireActual('~/server/services/viventium/promptRegistry'),
+      getPromptText,
+    }));
     const {
       formatFollowUpPrompt: registryFormatFollowUpPrompt,
     } = require('../BackgroundCortexFollowUpService');
@@ -206,7 +236,10 @@ describe('Phase B prompt registry ownership', () => {
   test('routes Phase B system prompts through the prompt registry', () => {
     jest.resetModules();
     const getPromptText = jest.fn((_promptId, fallback) => fallback);
-    jest.doMock('~/server/services/viventium/promptRegistry', () => ({ getPromptText }));
+    jest.doMock('~/server/services/viventium/promptRegistry', () => ({
+      ...jest.requireActual('~/server/services/viventium/promptRegistry'),
+      getPromptText,
+    }));
     const {
       buildFollowUpSystemPrompt: registryBuildFollowUpSystemPrompt,
     } = require('../BackgroundCortexFollowUpService');
@@ -242,7 +275,10 @@ describe('Phase B prompt registry ownership', () => {
   test('routes forced primary follow-up prompts with the user request through the prompt registry', () => {
     jest.resetModules();
     const getPromptText = jest.fn((_promptId, fallback) => fallback);
-    jest.doMock('~/server/services/viventium/promptRegistry', () => ({ getPromptText }));
+    jest.doMock('~/server/services/viventium/promptRegistry', () => ({
+      ...jest.requireActual('~/server/services/viventium/promptRegistry'),
+      getPromptText,
+    }));
     const {
       formatFollowUpPrompt: registryFormatFollowUpPrompt,
     } = require('../BackgroundCortexFollowUpService');
@@ -423,7 +459,7 @@ describe('Phase B session-backed Feelings', () => {
     expect(prompt.match(/<viventium_feeling_state>/g)).toHaveLength(1);
   });
 
-  test('does not inject a second capsule into a same-session continuation', () => {
+  test('a native session capability does not suppress the distinct follow-up state', () => {
     const feelingContext = resolvePhaseBFeelingContext({
       enabled: true,
       agentScope: 'conscious_agent',
@@ -436,7 +472,7 @@ describe('Phase B session-backed Feelings', () => {
         providerCapability: { conversation_session: true },
         primaryResponseMode: false,
       }),
-    ).toEqual({ capsule: '', reason: 'preserved_in_conversation_session' });
+    ).toEqual({ capsule, reason: 'conscious_synthesis' });
   });
 
   test('keeps the capsule for direct providers and a forced primary follow-up', () => {
@@ -455,9 +491,137 @@ describe('Phase B session-backed Feelings', () => {
       }).capsule,
     ).toBe(capsule);
   });
+
+  test('does not inject a second capsule into a same-session continuation', () => {
+    const feelingContext = resolvePhaseBFeelingContext({
+      enabled: true,
+      agentScope: 'conscious_agent',
+      snapshotHash: 'synthetic-hash',
+      capsule,
+    });
+    expect(
+      resolvePhaseBFeelingInjection({
+        feelingContext,
+        providerCapability: { conversation_session: true },
+        primaryResponseMode: false,
+      }),
+    ).toEqual({ capsule: '', reason: 'preserved_in_conversation_session' });
+  });
 });
 
 describe('Phase B prepare/persist boundary', () => {
+  test.each([false, true])(
+    'prepares before persistence and retains declared audio=%s without calling the provider again',
+    async (audioEligible) => {
+      const processStream = jest.fn().mockResolvedValue('A grounded follow-up.');
+      const disposition = {
+        version: 1,
+        audio: 'eligible',
+        required: true,
+        valid: true,
+        source: 'model',
+      };
+      const createRun = jest.spyOn(Run, 'create').mockImplementation(async (options) => ({
+        processStream: async (...args) => {
+          await options.customHandlers?.on_chat_model_end?.handle('on_chat_model_end', {
+            output: {
+              provider_specific_fields: { viventium: { delivery_disposition: disposition } },
+            },
+          });
+          return processStream(...args);
+        },
+      }));
+      const saveMessage = jest.spyOn(db, 'saveMessage').mockResolvedValue({});
+      const originalXaiApiKey = process.env.XAI_API_KEY;
+      const input = {
+        req: {
+          id: 'synthetic-split-request',
+          body: { voiceMode: audioEligible },
+          ...(audioEligible
+            ? { viventiumCallSession: { callSessionId: 'synthetic-owned-call' } }
+            : {}),
+          config: {
+            endpoints: {
+              agents: {
+                providerCapabilities: {
+                  xai: {
+                    messaging_delivery_disposition: true,
+                    messaging_delivery_disposition_version: 1,
+                  },
+                },
+              },
+            },
+          },
+        },
+        conversationId: 'synthetic-conversation',
+        parentMessageId: 'synthetic-parent',
+        runId: 'synthetic-run',
+        agent: {
+          provider: 'xai',
+          model: 'synthetic-model',
+          model_parameters: {},
+        },
+        insightsData: {
+          cortexCount: 1,
+          insights: [{ cortexName: 'Synthetic specialist', insight: 'A new grounded fact.' }],
+        },
+        recentResponse: 'The initial answer is already visible.',
+      };
+
+      try {
+        process.env.XAI_API_KEY = 'synthetic-xai-key';
+
+        const prepared = await prepareCortexFollowUpMessage(input);
+
+        expect(processStream).toHaveBeenCalledTimes(1);
+        expect(saveMessage).not.toHaveBeenCalled();
+        expect(prepared.deliveryDisposition).toEqual(audioEligible ? disposition : null);
+        expect(prepared).toEqual(
+          expect.objectContaining({
+            suppressed: false,
+            text: 'A grounded follow-up.',
+          }),
+        );
+
+        const persisted = await persistPreparedCortexFollowUpMessage(input, prepared);
+
+        expect(processStream).toHaveBeenCalledTimes(1);
+        expect(saveMessage).toHaveBeenCalledTimes(1);
+        expect(persisted.metadata.viventium.deliveryDisposition).toEqual(
+          audioEligible ? disposition : undefined,
+        );
+        expect(saveMessage).toHaveBeenCalledWith(
+          input.req,
+          expect.objectContaining({
+            conversationId: input.conversationId,
+            parentMessageId: input.parentMessageId,
+            text: 'A grounded follow-up.',
+          }),
+          expect.objectContaining({
+            operationKind: 'system',
+            context:
+              'viventium/services/BackgroundCortexFollowUpService.createCortexFollowUpMessage',
+          }),
+        );
+        expect(persisted).toEqual(
+          expect.objectContaining({
+            conversationId: input.conversationId,
+            parentMessageId: input.parentMessageId,
+            text: 'A grounded follow-up.',
+          }),
+        );
+      } finally {
+        if (originalXaiApiKey == null) {
+          delete process.env.XAI_API_KEY;
+        } else {
+          process.env.XAI_API_KEY = originalXaiApiKey;
+        }
+        createRun.mockRestore();
+        saveMessage.mockRestore();
+      }
+    },
+  );
+
   test('prepares with the provider before persistence and persists without calling it again', async () => {
     const processStream = jest.fn().mockResolvedValue('A grounded follow-up.');
     const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
@@ -570,20 +734,71 @@ describe('forced follow-up onto an empty primary answer', () => {
             cortexCount: 1,
             insights: [{ cortexName: 'Synthetic', insight: 'Fact.' }],
           },
+          dependencies: {
+            prepareAttachments: async (message) => {
+              if (Array.isArray(message.content))
+                expect(
+                  message.content.some(
+                    (part) => part.type === 'text' && part.text === message.text,
+                  ),
+                ).toBe(true);
+              return [{ file_id: 'owned-file', filename: 'result.md' }];
+            },
+          },
         },
-        { text: 'The recovered answer.', shouldForceVisibleFollowUp: true },
+        {
+          text: 'The recovered answer.',
+          shouldForceVisibleFollowUp: true,
+          deliveryDisposition: {
+            version: 1,
+            audio: 'skip',
+            required: true,
+            valid: true,
+            source: 'model',
+          },
+        },
       );
       const promotion = updateMessage.mock.calls.find(
         ([, update]) => update?.metadata?.viventium?.promotedToEmptyParent === true,
       );
       if (promoted) {
         expect(promotion).toBeDefined();
+        expect(promotion[1]).toMatchObject({
+          text: 'The recovered answer.',
+          content: expect.arrayContaining([{ type: 'text', text: 'The recovered answer.' }]),
+          attachments: [{ file_id: 'owned-file', filename: 'result.md' }],
+          metadata: {
+            viventium: {
+              deliveryDisposition: {
+                version: 1,
+                audio: 'skip',
+                required: true,
+                valid: true,
+                source: 'model',
+              },
+            },
+          },
+        });
         expect(saveMessage).not.toHaveBeenCalled();
       } else {
         expect(promotion).toBeUndefined();
         expect(saveMessage).toHaveBeenCalledWith(
           expect.anything(),
-          expect.objectContaining({ text: 'The recovered answer.' }),
+          expect.objectContaining({
+            text: 'The recovered answer.',
+            metadata: expect.objectContaining({
+              viventium: expect.objectContaining({
+                deliveryDisposition: {
+                  version: 1,
+                  audio: 'skip',
+                  required: true,
+                  valid: true,
+                  source: 'model',
+                },
+              }),
+            }),
+            attachments: [{ file_id: 'owned-file', filename: 'result.md' }],
+          }),
           expect.anything(),
         );
       }
@@ -803,7 +1018,7 @@ describe('formatFollowUpPrompt', () => {
       'If an insight contains new factual/contextual material followed by a question, keep the new material and drop the question.',
     );
     expect(prompt).toContain(
-      'Use {NTA} only when there is truly no new user-visible content beyond a question or repetition.',
+      'If it is stale, redundant, already resolved, question-only, or would interrupt the current flow, output exactly {NTA}.',
     );
     expect(prompt).toContain(
       'If an insight includes a question, drop the question and keep any accompanying factual material.',
@@ -2010,3 +2225,174 @@ test.each([
     }
   },
 );
+
+/* === VIVENTIUM START === Worker/cortex follow-up ownership persists with the message. === */
+describe('durable callback follow-up ownership', () => {
+  test.each([
+    ['all durable', ['durable_terminal_callback', 'durable_terminal_callback'], true],
+    ['ordinary', ['cortex_insight'], false],
+    ['mixed', ['durable_terminal_callback', 'cortex_insight'], false],
+  ])('persists the source only for %s evidence', async (_label, kinds, durable) => {
+    const processStream = jest.fn().mockResolvedValue('A grounded result.');
+    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    const saveMessage = jest.spyOn(db, 'saveMessage').mockResolvedValue({});
+    const priorKey = process.env.XAI_API_KEY;
+    const input = {
+      req: { id: 'synthetic-ownership-request', body: { voiceMode: true } },
+      conversationId: 'synthetic-conversation',
+      parentMessageId: 'synthetic-parent',
+      runId: 'synthetic-run',
+      agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
+      recentResponse: 'The initial answer is already visible.',
+      insightsData: {
+        cortexCount: kinds.length,
+        insights: kinds.map((kind, index) => ({
+          cortexName: 'Synthetic evidence',
+          insight: `Verified result ${index + 1}.`,
+          authority: { kind },
+        })),
+      },
+    };
+    try {
+      process.env.XAI_API_KEY = 'synthetic-xai-key';
+      const prepared = await prepareCortexFollowUpMessage(input);
+      expect(saveMessage).not.toHaveBeenCalled();
+      const persisted = await persistPreparedCortexFollowUpMessage(input, prepared);
+      expect(processStream).toHaveBeenCalledTimes(1);
+      expect(saveMessage).toHaveBeenCalledTimes(1);
+      const saved = saveMessage.mock.calls[0][1];
+      expect(saved.text).toBe('A grounded result.');
+      expect(saved.metadata.viventium.type).toBe('cortex_followup');
+      expect(saved.metadata.viventium.parentMessageId).toBe(input.parentMessageId);
+      expect(saved.metadata.viventium.cortexCount).toBe(kinds.length);
+      if (durable) {
+        expect(saved.metadata.viventium.followUpSource).toBe('durable_terminal_callback');
+      } else {
+        expect(saved.metadata.viventium).not.toHaveProperty('followUpSource');
+      }
+      expect(persisted.metadata).toEqual(saved.metadata);
+    } finally {
+      if (priorKey == null) delete process.env.XAI_API_KEY;
+      else process.env.XAI_API_KEY = priorKey;
+      createRun.mockRestore();
+      saveMessage.mockRestore();
+    }
+  });
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Preserve durable decisions across foreground movement. === */
+describe('durable follow-up foreground movement', () => {
+  test.each([
+    ['telegram', ['durable_terminal_callback'], 'The result is ready.', true],
+    ['telegram', ['durable_terminal_callback'], '{NTA}', true],
+    ['voice', ['durable_terminal_callback'], 'The result is ready.', true],
+    ['voice', ['durable_terminal_callback'], '{NTA}', true],
+    ['web', ['durable_terminal_callback'], 'The result is ready.', true],
+    ['web', ['durable_terminal_callback'], '{NTA}', true],
+    ['telegram', ['cortex_insight'], 'An optional observation.', false],
+    ['web', ['cortex_insight'], '{NTA}', false],
+    ['voice', ['durable_terminal_callback', 'cortex_insight'], 'A mixed observation.', false],
+    ['telegram', ['durable_terminal_callback', 'cortex_insight'], '{NTA}', false],
+  ])('preserves the typed decision on %s (%s / %s)', async (surface, kinds, generated, durable) => {
+    const before = [
+      {
+        messageId: 'synthetic-user',
+        parentMessageId: null,
+        isCreatedByUser: true,
+        text: 'Keep chatting while the work finishes.',
+        createdAt: new Date(1000),
+      },
+      {
+        messageId: 'synthetic-parent',
+        parentMessageId: 'synthetic-user',
+        isCreatedByUser: false,
+        text: 'The accepted work is running.',
+        createdAt: new Date(2000),
+      },
+    ];
+    const after = [
+      ...before,
+      {
+        messageId: 'synthetic-next',
+        parentMessageId: 'synthetic-parent',
+        isCreatedByUser: true,
+        text: 'A current foreground question.',
+        createdAt: new Date(3000),
+      },
+    ];
+    const getMessages = jest
+      .spyOn(db, 'getMessages')
+      .mockResolvedValueOnce(before)
+      .mockResolvedValue(after);
+    const native = require('../nativeResponseService');
+    const readToolEvidence = jest.fn().mockResolvedValue([]);
+    const service = jest.spyOn(native, 'getService').mockReturnValue({ readToolEvidence });
+    const processStream = jest.fn().mockResolvedValue(generated);
+    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    const saveMessage = jest.spyOn(db, 'saveMessage').mockResolvedValue({});
+    const oldKey = process.env.XAI_API_KEY;
+    try {
+      process.env.XAI_API_KEY = 'synthetic-xai-key';
+      const prepared = await prepareCortexFollowUpMessage({
+        req: {
+          user: { id: 'synthetic-owner' },
+          body: { viventiumSurface: surface, ...(surface === 'voice' ? { voiceMode: true } : {}) },
+        },
+        conversationId: 'synthetic-conversation',
+        parentMessageId: 'synthetic-parent',
+        runId: 'synthetic-run',
+        agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
+        recentResponse: 'The accepted work is running.',
+        insightsData: {
+          cortexCount: kinds.length,
+          insights: kinds.map((kind) => ({
+            cortexName: 'Synthetic evidence',
+            insight: 'A verified accepted result.',
+            authority: {
+              kind,
+              runId: 'synthetic-worker',
+              event: 'run.completed',
+              workState: 'completed',
+            },
+          })),
+        },
+      });
+      expect(prepared.durableMissionEvidence).toBe(durable);
+      expect(prepared.followUpDecisionRecord).toMatchObject({
+        generationFailed: false,
+        movedOnAfterParent: true,
+        forceVisibleFollowUp: false,
+      });
+      expect(processStream).toHaveBeenCalledTimes(1);
+      expect(readToolEvidence).toHaveBeenCalledWith(
+        'synthetic-owner',
+        'synthetic-conversation',
+        'synthetic-parent',
+      );
+      expect(createRun.mock.calls[0][0].graphConfig.tools).toEqual([]);
+      expect(saveMessage).not.toHaveBeenCalled();
+      if (durable) {
+        expect(prepared.text).toBe(generated === '{NTA}' ? '' : generated);
+        expect(prepared.followUpDecisionRecord).toMatchObject({
+          llmResult: generated === '{NTA}' ? 'nta' : 'generated',
+          selectedStrategy: generated === '{NTA}' ? 'no_response_suppressed' : 'llm_generated',
+        });
+      } else {
+        expect(prepared.text).toBe('');
+        expect(prepared.followUpDecisionRecord).toMatchObject({
+          llmResult: 'empty',
+          selectedStrategy: 'moved_on_empty_suppressed',
+        });
+      }
+    } finally {
+      if (oldKey == null) delete process.env.XAI_API_KEY;
+      else process.env.XAI_API_KEY = oldKey;
+      getMessages.mockRestore();
+      service.mockRestore();
+      createRun.mockRestore();
+      saveMessage.mockRestore();
+    }
+  });
+});
+/* === VIVENTIUM END === */

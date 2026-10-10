@@ -185,6 +185,7 @@ function startParallelWorkTurnAuthority(req, agent) {
     timeout = setTimeout(() => resolve(PARALLEL_WORK_AUTHORITY_TIMEOUT), authorityTimeoutMs);
     timeout.unref?.();
   });
+  let readinessFact;
   const claimPromise = Promise.resolve()
     .then(() =>
       authoringOrchestrationReadiness({
@@ -193,9 +194,11 @@ function startParallelWorkTurnAuthority(req, agent) {
         consumer: 'tool_discovery',
       }),
     )
-    .then((readiness) =>
-      readiness.available === true ? parallelWorkClaimStateAsync(ownerId) : null,
-    );
+    .then((readiness) => {
+      // Preserve only the existing owner probe's typed facts for this authority decision.
+      readinessFact = Object.freeze({ status: readiness.status, reason: readiness.reason || '' });
+      return readiness.available === true ? parallelWorkClaimStateAsync(ownerId) : null;
+    });
   const authority = Promise.race([claimPromise, timeoutPromise])
     .then((claimState) => {
       if (typeof req._viventiumParallelWorkTurnAvailable === 'boolean') {
@@ -205,6 +208,7 @@ function startParallelWorkTurnAuthority(req, agent) {
         logger.warn('[VIVENTIUM][parallel-work] Turn authority timed out before tool discovery');
         return pinParallelWorkTurnUnavailable(req);
       }
+      if (readinessFact) req._viventiumParallelWorkTurnReadiness = readinessFact;
       if (!claimState || claimState.available !== true) {
         return pinParallelWorkTurnUnavailable(req);
       }

@@ -799,6 +799,7 @@ describe('/api/viventium/telegram', () => {
     process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'true';
     process.env.VIVENTIUM_PARALLEL_WORK_RELEASE_GATE_FILE = releasePath;
     process.env.VIVENTIUM_RUNTIME_DIR = releaseDir;
+    delete process.env.VIVENTIUM_TELEGRAM_CONVERSATION_IDLE_MAX_M;
     releaseFixture.reset();
   });
 
@@ -1073,6 +1074,61 @@ describe('/api/viventium/telegram', () => {
     expect(mockRetainAcceptedInteractionInput).not.toHaveBeenCalled();
     expect(lastAgentId).toBeNull();
   });
+  test('prepared ingress preserves an idle owned conversation and its original history parent', async () => {
+    const row = inputIdentity();
+    row.conversationId = 'idle-owned-conversation';
+    mockInputService.register.mockImplementation(async (identity) => ({ ...row, ...identity }));
+    mockGetConvo.mockResolvedValue({
+      conversationId: row.conversationId,
+      endpoint: 'agents',
+    });
+    mockGetMessages.mockResolvedValue([
+      {
+        messageId: 'old-worker-answer',
+        parentMessageId: 'old-file-source',
+        createdAt: '2026-01-01T12:00:00.000Z',
+        isCreatedByUser: false,
+      },
+    ]);
+    const res = createMockRes();
+    await dispatch(
+      createTestApp(require('../telegram')),
+      createMockReq({
+        url: '/api/viventium/telegram/source-order',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: {
+          telegramUserId: 'tg-1',
+          telegramChatId: '-100123',
+          telegramMessageThreadId: '77',
+          sourceSequence: 12,
+          input: {
+            text: 'Continue the file-backed work.',
+            conversationId: row.conversationId,
+            conversationGeneration: row.conversationGeneration,
+            preparationId: row.registrationId,
+            preparation: { version: 1, message: { message_id: 12 } },
+          },
+        },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.body.input.conversationId).toBe(row.conversationId);
+    expect(mockSaveInput).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        conversationId: row.conversationId,
+        parentMessageId: 'old-worker-answer',
+      }),
+      expect.anything(),
+    );
+    expect(mockInputService.register).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: row.conversationId }),
+      row.registrationId,
+    );
+    expect(lastAgentId).toBeNull();
+  });
+
   test('rapid prepared inputs reuse their active original conversation before the first answer creates it', async () => {
     const row = inputIdentity();
     row.conversationId = 'first-pending-conversation';
@@ -3598,6 +3654,39 @@ describe('/api/viventium/telegram', () => {
     expect(lastBridgeDocumentImageExtraction).toBeUndefined();
   });
 
+  test('POST keeps an idle owned conversation and its exact history parent by default', async () => {
+    const telegramRouter = require('../telegram');
+    const app = createTestApp(telegramRouter);
+    mockGetConvo.mockResolvedValueOnce({ conversationId: 'conv-idle', endpoint: 'agents' });
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        messageId: 'old-answer',
+        parentMessageId: 'old-source',
+        createdAt: '2026-01-01T12:00:00.000Z',
+        isCreatedByUser: false,
+      },
+    ]);
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/telegram/chat',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: { text: 'Continue this work.', conversationId: 'conv-idle', telegramUserId: 'tg-1' },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.body.conversationId).toBe('conv-idle');
+    expect(lastParentMessageId).toBe('old-answer');
+    expect(mockGetConvo).toHaveBeenCalledWith(
+      'user_1',
+      'conv-idle',
+      'conversationId endpoint agent_id user updatedAt',
+    );
+    expect(mockTelegramIngressUpdateOne.mock.calls[0][1].$set.conversationId).toBe('conv-idle');
+  });
+
   test('POST stale existing convo resets to new for Telegram hidden conversation reuse', async () => {
     process.env.VIVENTIUM_TELEGRAM_CONVERSATION_IDLE_MAX_M = '60';
     const telegramRouter = require('../telegram');
@@ -3741,6 +3830,37 @@ describe('/api/viventium/telegram', () => {
     expect(url.searchParams.get('autoConnect')).toBe('1');
     expect(url.hash).toBe(`#viventiumCallLaunch=${'B'.repeat(43)}`);
     /* === VIVENTIUM END === */
+    expect(mockAssertVoiceAgentAccess).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: 'agent_default' }),
+    );
+  });
+
+  test('POST /call-link keeps an existing conversation out of the Telegram-posted launch URL', async () => {
+    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice.example.test';
+    const app = createTestApp(require('../telegram'));
+    const req = createMockReq({
+      url: '/api/viventium/telegram/call-link',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        conversationId: 'conversation-existing',
+        agentId: 'agent_default',
+        telegramUserId: 'tg-1',
+      },
+    });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.statusCode).toBe(200);
+    expect(mockCreateCallSession).toHaveBeenCalledWith({
+      userId: 'user_1',
+      agentId: 'agent_default',
+      conversationId: 'conversation-existing',
+    });
+    expect(res.body.conversationId).toBe('conversation-existing');
+    const url = new URL(res.body.playgroundUrl);
+    expect(url.searchParams.has('conversationId')).toBe(false);
+    expect(url.searchParams.get('callSessionId')).toBe('call_session_test');
+    expect(url.hash).toBe(`#viventiumCallLaunch=${'B'.repeat(43)}`);
+    expect(res.body.callUrl).toBe(res.body.playgroundUrl);
     expect(mockAssertVoiceAgentAccess).toHaveBeenCalledWith(
       expect.objectContaining({ agentId: 'agent_default' }),
     );

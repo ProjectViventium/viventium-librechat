@@ -145,6 +145,38 @@ describe('GenerationJobManager logical turns', () => {
     await manager.destroy();
   });
 
+  test('retains the accepted participant-text WorkAuthority through job persistence and facade hydration', async () => {
+    const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const manager = new GenerationJobManagerClass({
+      jobStore: store,
+      eventTransport: new InMemoryEventTransport(),
+      cleanupOnComplete: false,
+    });
+    manager.initialize();
+    try {
+      await manager.createJob('typed-voice-authority', 'owner-1', 'conversation-1', {
+        interactionContext: { ...webContext('conversation-1', 'typed:event-1'), surface: 'voice' },
+        deliveryPolicy: externalDelivery,
+      });
+      const authority = {
+        version: 1 as const, callSessionId: 'call-1', userId: 'owner-1',
+        kind: 'participant_text' as const, fingerprint: 'a'.repeat(64), turnIds: [],
+      };
+      await manager.updateMetadata('typed-voice-authority', {
+        viventiumCallSessionId: 'call-1',
+        viventiumVoiceWorkAuthority: authority,
+      });
+      expect(await store.getJob('typed-voice-authority')).toMatchObject({
+        viventiumCallSessionId: 'call-1', viventiumVoiceWorkAuthority: authority,
+      });
+      expect((await manager.getJob('typed-voice-authority'))?.metadata).toMatchObject({
+        viventiumCallSessionId: 'call-1', viventiumVoiceWorkAuthority: authority,
+      });
+    } finally {
+      await manager.destroy();
+    }
+  });
+
   test('hashes stream identity in lifecycle logs', async () => {
     const manager = new GenerationJobManagerClass({
       jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),

@@ -21,6 +21,7 @@ import type { GlassHiveRunInput } from './missionInput';
 import { evidenceId, legacyEvidenceId } from './missionEvidenceIdentity';
 import { normalizeNativeCallbackOutputFiles } from './nativeOutputFiles';
 import type { NativeCallbackOutputFiles, NativeOutputDeliveryAttachment } from './nativeOutputFiles';
+import { loadFeelingsReadContext } from '../feelings/service';
 
 import type { Logger } from 'winston';
 import type { ClientSession, Model } from 'mongoose';
@@ -68,6 +69,7 @@ export interface GlassHiveMissionTraceIdentity {
 }
 
 export interface GlassHiveMissionBinding {
+  feelingsIsolated?: boolean;
   originRef?: string;
   ownerId?: string;
   conversationId?: string;
@@ -120,6 +122,7 @@ export interface GlassHiveMissionAdjudicationInput {
 }
 
 export interface GlassHiveMissionEvidence {
+  feelingsIsolated?: boolean;
   _id: string;
   evidenceId: string;
   originRef: string;
@@ -233,6 +236,14 @@ export interface GlassHiveMissionAdjudicationDependencies {
     lookupField: 'conversationId',
   ) => Promise<object | null>;
   getUserById: (ownerId: string, projection: string) => Promise<MissionUser | null>;
+  getFeelingState: Parameters<typeof loadFeelingsReadContext>[0]['getFeelingState'];
+  logFeelingsEvent: (
+    logger: Pick<Logger, 'info' | 'warn'>,
+    req: object,
+    event: string,
+    fields: object,
+    level?: 'info' | 'warn',
+  ) => void;
   saveConvo: (
     request: object,
     conversation: object,
@@ -285,13 +296,11 @@ export async function isGlassHiveCleanupSourceTombstoned({
     'cleanupTombstone.tombstonedAt': { $type: 'date' },
   };
   const options = { projection: { _id: 1 }, ...(session ? { session } : {}) };
-  const conversation = await mongoose.connection
-    .collection('conversations')
-    .findOne(filter, options);
+  const conversation = await mongoose.connection.collection('conversations').findOne(filter, options);
   if (conversation) return true;
-  const message = await mongoose.connection
-    .collection('messages')
-    .findOne({ ...filter, messageId: anchor }, options);
+  const message = await mongoose.connection.collection('messages').findOne(
+    { ...filter, messageId: anchor }, options,
+  );
   return Boolean(message);
 }
 
@@ -305,6 +314,8 @@ export function createGlassHiveMissionAdjudicationService(
     fenceGlassHiveTerminalCallbackAcceptedOperation,
     getConvo,
     getUserById,
+    getFeelingState,
+    logFeelingsEvent,
     saveConvo,
     getAgent,
     getAppConfig,
@@ -561,6 +572,7 @@ async function persistGlassHiveMissionEvidence({
     conversationId,
     anchorMessageId,
     mainAgentId: safeText(binding?.mainAgentId, 160),
+    ...(binding?.feelingsIsolated === true ? { feelingsIsolated: true } : {}),
     surface: normalizedSurface(binding),
     destinations: safeDestinations(binding),
     evidence,
@@ -650,6 +662,7 @@ function coalescingGroupKey(row: RuntimeRecord): string {
     row.ownerId,
     row.conversationId,
     row.mainAgentId,
+    row.feelingsIsolated === true ? 'isolated' : 'ordinary',
     row.surface,
     row.followUpMessageId || 'new',
   ].join('\0');
@@ -928,6 +941,7 @@ async function findPriorScopedAdjudication(
   const blocking = await collection().findOne(
     {
       ...filter,
+      state: { $nin: ['superseded', 'silent', 'deadletter'] },
       adjudicationGroupId: { $exists: true, $nin: ['', groupId] },
       $or: [
         { followUpMessageId: { $exists: false } },
@@ -999,11 +1013,21 @@ async function claimRows(rows: RuntimeRecord[]): Promise<RuntimeRecord[]> {
   return claimed;
 }
 
-async function loadMainAuthorContext(first: RuntimeRecord): Promise<RuntimeRecord> {
+async function loadMainAuthorContext(
+  first: RuntimeRecord,
+  conversationId: string = safeText(first.conversationId, 160),
+  feelingsIsolated: boolean = first.feelingsIsolated === true,
+): Promise<RuntimeRecord> {
   const mainAgentId = safeText(first.mainAgentId || process.env.VIVENTIUM_MAIN_AGENT_ID, 160);
-  const [user, agent] = await Promise.all([
+  const [user, agent, activeCall] = await Promise.all([
     getUserById(first.ownerId, '-password -__v -totpSecret -backupCodes'),
     mainAgentId ? getAgent({ id: mainAgentId }) : null,
+    safeText(first.surface, 32) === 'voice'
+      ? getActiveCallSessionForConversation({
+          userId: safeText(first.ownerId, 160),
+          conversationId: safeText(conversationId, 160),
+        })
+      : null,
   ]);
   if (!user || !agent) {
     throw Object.assign(new Error('mission_main_author_unavailable'), {
@@ -1017,29 +1041,82 @@ async function loadMainAuthorContext(first: RuntimeRecord): Promise<RuntimeRecor
     ...(typeof user.toObject === 'function' ? user.toObject() : user),
     id: safeText(user.id || user._id, 160),
   };
+  const req: RuntimeRecord = {
+    user: requestUser,
+    body: {
+      viventiumSurface: first.surface,
+      ...(activeCall?.callSessionId
+        ? {
+            voiceMode: true,
+            viventiumInputMode: 'voice_call',
+            viventiumCallSessionId: activeCall.callSessionId,
+          }
+        : {}),
+    },
+    ...(activeCall?.callSessionId
+      ? { viventiumCallSession: { callSessionId: activeCall.callSessionId } }
+      : {}),
+    headers: { 'x-viventium-surface': first.surface },
+    config: await getAppConfig({ role: user.role }),
+  };
+  const startedAt = Date.now();
+  if (feelingsIsolated) {
+    req._viventiumFeelingSnapshot = null;
+    req._viventiumFeelingReadFailureClass = 'temporary_eval_isolation';
+    logFeelingsEvent(logger, req, 'feelings.read.skip', {
+      reason: 'temporary_eval_isolation', durationMs: Date.now() - startedAt,
+    });
+  } else {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const configured = Number(process.env.VIVENTIUM_FEELINGS_READ_TIMEOUT_MS || 4000);
+      const timeoutMs = Number.isFinite(configured)
+        ? Math.min(5000, Math.max(25, configured)) : 4000;
+      // A callback is a new authored turn. Read the current owner version after any reaction.
+      const snapshot = await Promise.race([
+        loadFeelingsReadContext({ userId: requestUser.id, getFeelingState, bypassCache: true }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('feelings_read_timeout')), timeoutMs);
+        }),
+      ]);
+      req._viventiumFeelingSnapshot = snapshot;
+      req._viventiumFeelingReadFailureClass = '';
+      logFeelingsEvent(logger, req, 'feelings.read.complete', {
+        enabled: snapshot.enabled, scope: snapshot.agentScope, version: snapshot.version,
+        snapshotHash: snapshot.snapshotHash, cacheHit: snapshot.cacheHit === true,
+        rangePromptOverrideCount: snapshot.rangePromptOverrideCount,
+        activeRangePromptOverrideCount: snapshot.activeRangePromptOverrideCount,
+        activeRangePromptOverrideChars: snapshot.activeRangePromptOverrideChars,
+        durationMs: Date.now() - startedAt,
+      });
+    } catch (error) {
+      const failureClass = error instanceof Error && error.message === 'feelings_read_timeout'
+        ? 'state_read_timeout' : 'state_read_failed';
+      req._viventiumFeelingSnapshot = null;
+      req._viventiumFeelingReadFailureClass = failureClass;
+      logFeelingsEvent(logger, req, 'feelings.read.failure', {
+        errorClass: failureClass, durationMs: Date.now() - startedAt,
+      }, 'warn');
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
   return {
     user: requestUser,
     agent,
-    req: {
-      user: requestUser,
-      body: { viventiumSurface: first.surface },
-      headers: { 'x-viventium-surface': first.surface },
-      config: await getAppConfig({ role: user.role }),
-    },
+    req,
   };
 }
 
 async function resolveMissionContinuationTarget(rows: RuntimeRecord[]): Promise<RuntimeRecord> {
   const first = rows[rows.length - 1];
   const prior = first.priorScopedAdjudication || null;
-  if (
-    await isGlassHiveCleanupSourceTombstoned({
-      mongoose,
-      ownerId: first.ownerId,
-      conversationId: first.conversationId,
-      anchorMessageId: first.anchorMessageId,
-    })
-  ) {
+  if (await isGlassHiveCleanupSourceTombstoned({
+    mongoose,
+    ownerId: first.ownerId,
+    conversationId: first.conversationId,
+    anchorMessageId: first.anchorMessageId,
+  })) {
     throw Object.assign(new Error('mission_origin_cleanup_tombstoned'), {
       code: 'mission_origin_cleanup_tombstoned',
     });
@@ -1708,7 +1785,11 @@ async function flushGlassHiveMissionAdjudications({
       authoredCommitted = Boolean((followUp as RuntimeRecord | null)?.messageId);
       if (!followUp) {
         stage = 'load_main_author';
-        authorContext = await loadMainAuthorContext(rows[rows.length - 1]);
+        authorContext = await loadMainAuthorContext(
+          rows[rows.length - 1],
+          safeText((target as RuntimeRecord | null)?.conversationId, 160),
+          rows.some((row) => row.feelingsIsolated === true),
+        );
         stage = 'prepare_synthesis';
         preparedFollowUp = await prepareGroupSynthesis(rows, { target, authorContext });
         if (preparedFollowUp?.followUpDecisionRecord?.generationFailed === true) {
@@ -1757,7 +1838,11 @@ async function flushGlassHiveMissionAdjudications({
         }
         if (target.accountContinuation) {
           stage = 'load_main_author_for_account_continuation';
-          authorContext ||= await loadMainAuthorContext(rows[rows.length - 1]);
+          authorContext ||= await loadMainAuthorContext(
+            rows[rows.length - 1],
+            safeText((target as RuntimeRecord | null)?.conversationId, 160),
+            rows.some((row) => row.feelingsIsolated === true),
+          );
           stage = 'persist_account_continuation';
           await ensureAccountContinuationConversation({ target, authorContext, followUp });
         }

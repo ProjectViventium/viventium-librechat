@@ -12,6 +12,7 @@ import type {
   IMainContinuityCompactionLease,
   IMainContinuityToolPair,
   IMainSemanticCompaction,
+  IMainCompactionOutputContract,
   IViventiumMainContinuityState,
 } from '~/types/mainContinuityState';
 
@@ -95,7 +96,7 @@ const acceptedRevisionSchema = new Schema<IMainContinuityAcceptedRevision>(
 const semanticCompactionSchema = new Schema<IMainSemanticCompaction>(
   {
     version: { type: Number, required: true, min: 1, max: 1 },
-    summary: { type: String, required: true, maxlength: 7000 },
+    summary: { type: String, required: true, maxlength: 128 * 1024 },
     pendingAsks: { type: [String], default: [] },
     commitments: { type: [String], default: [] },
     corrections: { type: [String], default: [] },
@@ -109,6 +110,21 @@ const semanticCompactionSchema = new Schema<IMainSemanticCompaction>(
   { _id: false },
 );
 
+const outputContractSchema = new Schema<IMainCompactionOutputContract>(
+  {
+    version: { type: Number, required: true, enum: [1] },
+    consumer: { type: String, required: true, enum: ['accepted_core', 'conversation_legacy'] },
+    carrierMaxUtf8Bytes: { type: Number, required: true, enum: [12 * 1024, 16 * 1024, 128 * 1024] },
+    reservedUtf8Bytes: { type: Number, required: true, min: 0 },
+    maxJsonUtf8Bytes: { type: Number, required: true, min: 1 },
+    maxSummaryUtf8Bytes: { type: Number, required: true, min: 1 },
+    maxItemsPerArray: { type: Number, required: true, enum: [32] },
+    maxStringItemUtf8Bytes: { type: Number, required: true, enum: [1024] },
+    maxToolIdentityCharacters: { type: Number, required: true, enum: [256] },
+  },
+  { _id: false },
+);
+
 const compactionLeaseSchema = new Schema<IMainContinuityCompactionLease>(
   {
     leaseId: { type: String, required: true, maxlength: 96 },
@@ -116,6 +132,7 @@ const compactionLeaseSchema = new Schema<IMainContinuityCompactionLease>(
     sourceTurnKeys: { type: [String], default: [] },
     claimedAt: { type: Date, required: true },
     expiresAt: { type: Date, required: true },
+    outputContract: { type: outputContractSchema, default: undefined },
     sourceGeneration: { type: Number, min: 0 },
     throughPosition: { type: Number, min: 0 },
     legacyStateCursor: String,
@@ -152,6 +169,7 @@ const mainContinuityStateSchema = new Schema<IViventiumMainContinuityState>(
     pendingCompactionTurns: { type: [acceptedTurnSchema], default: [] },
     acceptedRevisions: { type: [acceptedRevisionSchema], default: [] },
     semanticCompaction: { type: semanticCompactionSchema, default: null },
+    semanticCompactionContract: { type: outputContractSchema, default: undefined },
     compactionStatus: {
       type: String,
       enum: ['empty', 'pending', 'running', 'ready', 'degraded'],

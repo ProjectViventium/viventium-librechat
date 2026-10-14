@@ -108,6 +108,7 @@ describe('GlassHiveVoiceTaskActionService', () => {
             type: 'string',
             enum: ['allow_once', 'reject_once'],
             enumNames: ['Allow once', 'Reject once'],
+            description: 'Create synthetic.txt in the working folder.',
           },
         },
       },
@@ -136,6 +137,8 @@ describe('GlassHiveVoiceTaskActionService', () => {
     expect(snapshotEvent(task.taskId)).toMatchObject({
       state: 'needs_input',
       needsInput: {
+        operationTitle: 'Create synthetic.txt in the working folder.',
+        prompt: pending.message,
         choices: [
           { value: 'allow_once', label: 'Allow once' },
           { value: 'reject_once', label: 'Reject once' },

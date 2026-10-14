@@ -35,6 +35,8 @@ export interface TelegramInputRecord extends TelegramInputIdentity {
   failureCode: string;
   preparedDigest: string;
   registrationId: string;
+  /** Immutable original authenticated input receipt, absent on legacy rows. */
+  receivedAt?: number;
   primarySourceEventId: string;
   relatedSourceEventIds: string[];
   failures: Array<{ code: string; at: number }>;
@@ -293,6 +295,7 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
     async register(
       identity: TelegramInputIdentity,
       registrationId: string,
+      receivedAt: number = now(),
     ): Promise<TelegramInputRecord> {
       if (
         !validIdentity(identity) ||
@@ -317,6 +320,7 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
         failureCode: '',
         preparedDigest: '',
         registrationId,
+        ...(Number.isSafeInteger(receivedAt) && receivedAt > 0 ? { receivedAt } : {}),
         failures: [],
         primarySourceEventId: identity.sourceEventId,
         relatedSourceEventIds: [],

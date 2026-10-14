@@ -795,6 +795,7 @@ const nonRetryableGraphFallbackClasses = new Set([
 ]);
 
 const recoverableGraphFallbackClasses = new Set([
+  'native_mcp_unavailable',
   'provider_rate_limited',
   'provider_quota_exhausted',
   'provider_quota_or_billing',
@@ -975,12 +976,41 @@ function isRecoverableProviderFallbackError(error: unknown): boolean {
 }
 /* === VIVENTIUM END === */
 
+const graphFallbackInvocationKey = Symbol.for('viventium.graph.fallback.recovery.invocation.v1');
+type GraphFallbackInvocation = { agentId: string; runId: string; threadId: string };
+
+function beginGraphFallbackInvocation(
+  graph: object,
+  agentId: string,
+  config?: { configurable?: { thread_id?: unknown } },
+): GraphFallbackInvocation | null {
+  const owner = graph as Record<PropertyKey, unknown>;
+  if (agentId !== owner.defaultAgentId) {
+    return null;
+  }
+  delete owner.viventiumGraphFallbackRecoveryReceipt;
+  delete owner[graphFallbackInvocationKey];
+  const runId = owner.runId;
+  const threadId = config?.configurable?.thread_id;
+  if (typeof runId !== 'string' || !runId || typeof threadId !== 'string' || !threadId) {
+    return null;
+  }
+  const invocation = Object.freeze({ agentId, runId, threadId });
+  Object.defineProperty(owner, graphFallbackInvocationKey, {
+    value: invocation,
+    configurable: true,
+    enumerable: false,
+  });
+  return invocation;
+}
+
 async function invokeModernGraphFallbackPolicy(
   graph: object,
   agentContext: object,
   originalCallModel: (state: { messages: BaseMessage[] }, config?: object) => Promise<unknown>,
   state: { messages: BaseMessage[] },
   config: { signal?: AbortSignal },
+  recoveryInvocation: GraphFallbackInvocation | null,
 ): Promise<unknown> {
   if (graphIsAborted(graph, config)) {
     throw graphAbortError();
@@ -1109,15 +1139,27 @@ async function invokeModernGraphFallbackPolicy(
         const fallbackBefore = authoringEvidenceSnapshot(graph);
         try {
           const result = await invokeRoute(fallbackRoute, fallbackMessages);
-          Object.defineProperty(graph, 'viventiumGraphFallbackRecoveryReceipt', {
-            value: Object.freeze({
+          if (
+            recoveryInvocation &&
+            !graphIsAborted(graph, config) &&
+            (graph as Record<PropertyKey, unknown>)[graphFallbackInvocationKey] ===
+              recoveryInvocation
+          ) {
+            const receipt = {
               provider: String(runtimeContext.provider ?? '').trim(),
               model: runtimeContext.model,
-            }),
-            configurable: true,
-            enumerable: false,
-            writable: false,
-          });
+              ...recoveryInvocation,
+            };
+            Object.defineProperty(receipt, graphFallbackInvocationKey, {
+              value: recoveryInvocation,
+            });
+            Object.defineProperty(graph, 'viventiumGraphFallbackRecoveryReceipt', {
+              value: Object.freeze(receipt),
+              configurable: true,
+              enumerable: false,
+              writable: false,
+            });
+          }
           return result;
         } catch (fallbackError) {
           const fallbackAuthored = hasNewAuthoringEvidence(graph, fallbackBefore);
@@ -1162,6 +1204,7 @@ function installModernGraphCompatibilityPatch(): void {
       if (Object.prototype.hasOwnProperty.call(this, 'viventiumGraphFallbackRecoveryReceipt')) {
         delete (this as Record<PropertyKey, unknown>).viventiumGraphFallbackRecoveryReceipt;
       }
+      delete (this as Record<PropertyKey, unknown>)[graphFallbackInvocationKey];
       return originalResetValues.apply(this, args);
     };
   }
@@ -1174,7 +1217,11 @@ function installModernGraphCompatibilityPatch(): void {
     if (typeof originalCallModel !== 'function') {
       return originalCallModel;
     }
-    return async (state: { messages: BaseMessage[] }, config?: { signal?: AbortSignal }) => {
+    return async (
+      state: { messages: BaseMessage[] },
+      config?: { signal?: AbortSignal; configurable?: { thread_id?: unknown } },
+    ) => {
+      const recoveryInvocation = beginGraphFallbackInvocation(this, agentId, config);
       const agentContext = (this as { agentContexts?: Map<string, object> }).agentContexts?.get(
         agentId,
       );
@@ -1193,6 +1240,7 @@ function installModernGraphCompatibilityPatch(): void {
         ) => Promise<unknown>,
         state,
         config ?? {},
+        recoveryInvocation,
       );
     };
   };
@@ -1541,8 +1589,8 @@ export async function createRun({
       streamUsage,
     });
     // Keep accepted source guards local to this run and each exact selected route.
-    const sourceChain = agent === agents[0]
-      ? mainContinuityHeaders?.[MAIN_CONTINUITY_CHAIN_HEADER] : undefined;
+    const sourceChain =
+      agent === agents[0] ? mainContinuityHeaders?.[MAIN_CONTINUITY_CHAIN_HEADER] : undefined;
     const selectedRoutes = [agent, ...(agent.viventiumGraphLlmFallbacks || [])];
     const selectedOptions = [
       llmConfig,
@@ -1575,11 +1623,17 @@ export async function createRun({
             endpoint: route.endpoint ?? undefined,
           })
         : baseFetch;
+      /* === VIVENTIUM START ===
+       * Every native graph participant carries complete factual context in the existing body.
+       * Main source guards, authority and invocation-fresh background inputs stay primary-owned.
+       * === VIVENTIUM END === */
       configuration.fetch = createNativeBootstrapFetch(
-        sourceChain
-          ? createMainContinuityFetch(boundFetch, sourceChain, mainContinuityHeaders,
-              agent === agents[0] ? readMainBackgroundInputs : undefined)
-          : boundFetch,
+        createMainContinuityFetch(
+          boundFetch,
+          sourceChain,
+          sourceChain ? mainContinuityHeaders : undefined,
+          sourceChain ? readMainBackgroundInputs : undefined,
+        ),
       );
     }
     if (graphFallbacks.length > 0) {

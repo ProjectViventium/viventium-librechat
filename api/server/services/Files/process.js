@@ -92,12 +92,14 @@ const parseBooleanFlag = (value) => {
  *   Office/OpenDocument/archive types, or the agent will receive garbage text instead of a clear
  *   error.
  */
-const directTextApplicationMimeTypes =
-  /^(application\/(csv|json|sql|xml|yaml|x-sh|typescript|vnd\.coffeescript))$/;
+/* === VIVENTIUM START: Read structured SVG as literal source through the existing text path. === */
+const directTextStructuredMimeTypes =
+  /^(application\/(csv|json|sql|xml|yaml|x-sh|typescript|vnd\.coffeescript)|image\/svg(?:\+xml)?)$/;
 
 function isDirectTextExtractionMimeType(mimetype = '') {
-  return textMimeTypes.test(mimetype) || directTextApplicationMimeTypes.test(mimetype);
+  return textMimeTypes.test(mimetype) || directTextStructuredMimeTypes.test(mimetype);
 }
+/* === VIVENTIUM END === */
 
 const normalizeMessageAttachmentProvider = (provider) => {
   if (typeof provider !== 'string') {
@@ -422,6 +424,24 @@ const processFileURL = async ({ fileStrategy, userId, URL, fileName, basePath, c
 const processImageFile = async ({ req, res, metadata, returnFile = false }) => {
   const { file } = req;
   const appConfig = req.config;
+  /* === VIVENTIUM START: Provider image messages share the declared native original-file owner. === */
+  if (!returnFile && parseBooleanFlag(metadata.message_file)) {
+    const resolvedAttachmentSurface = await resolveMessageAttachmentSurface({
+      req,
+      agent_id: metadata.agent_id,
+    });
+    const nativeCapabilities =
+      appConfig.endpoints?.agents?.providerCapabilities?.[
+        resolvedAttachmentSurface.currentProvider
+      ];
+    if (
+      nativeCapabilities?.workspace_binding === true &&
+      nativeCapabilities?.worker_native_tools === true
+    ) {
+      return await processAgentFileUpload({ req, res, metadata, resolvedAttachmentSurface });
+    }
+  }
+  /* === VIVENTIUM END === */
   const source = getFileStrategy(appConfig, { isImage: true });
   const { handleImageUpload } = getStrategyFunctions(source);
   const { file_id, temp_file_id, endpoint } = metadata;
@@ -603,7 +623,7 @@ const processFileUpload = async ({ req, res, metadata }) => {
  * @param {FileMetadata} params.metadata - Additional metadata for the file.
  * @returns {Promise<void>}
  */
-const processAgentFileUpload = async ({ req, res, metadata }) => {
+const processAgentFileUpload = async ({ req, res, metadata, resolvedAttachmentSurface }) => {
   const { file } = req;
   const appConfig = req.config;
   const { agent_id, tool_resource, file_id, temp_file_id = null } = metadata;
@@ -633,11 +653,9 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
    * can resolve it through the existing signed bootstrap-source contract.
    * === VIVENTIUM END === */
   const durableBridgeImage = isImage && req._viventiumBridgeDurableMissionAttachment === true;
-  const basePath = durableBridgeImage
-    ? 'uploads'
-    : mime.getType(file.originalname)?.startsWith('image')
-      ? 'images'
-      : 'uploads';
+  /* === VIVENTIUM START: Declared native workspace attachments retain their original file. === */
+  let nativeWorkspaceAttachment = false;
+  /* === VIVENTIUM END === */
   const fileConfig = mergeFileConfig(appConfig.fileConfig);
   const supportsOCRExtraction = fileConfig.checkType(
     file.mimetype,
@@ -688,21 +706,23 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
         originalname: file.originalname,
       });
     } else {
+      /* === VIVENTIUM START: The image route's host-resolved surface avoids a second agent lookup. === */
       const { currentProvider, endpointType, useResponsesApi } =
-        await resolveMessageAttachmentSurface({
-          req,
-          agent_id,
-        });
+        resolvedAttachmentSurface ?? (await resolveMessageAttachmentSurface({ req, agent_id }));
+      /* === VIVENTIUM END === */
+      /* === VIVENTIUM START: Reuse the existing provider lookup and both declared capabilities. === */
+      nativeWorkspaceAttachment =
+        req.config?.endpoints?.agents?.providerCapabilities?.[currentProvider]
+          ?.workspace_binding === true &&
+        req.config?.endpoints?.agents?.providerCapabilities?.[currentProvider]
+          ?.worker_native_tools === true;
+      /* === VIVENTIUM END === */
       const providerNativeAttachment = isProviderNativeMessageAttachment({
         mimetype: file.mimetype,
         endpointType,
         currentProvider,
         useResponsesApi,
-        nativeWorkspace:
-          req.config?.endpoints?.agents?.providerCapabilities?.[currentProvider]
-            ?.workspace_binding === true &&
-          req.config?.endpoints?.agents?.providerCapabilities?.[currentProvider]
-            ?.worker_native_tools === true,
+        nativeWorkspace: nativeWorkspaceAttachment,
       });
 
       if (providerNativeAttachment) {
@@ -916,6 +936,15 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
     return await createTextFile({ text, bytes, type: file.mimetype });
   }
 
+  /* === VIVENTIUM START: Native and bridge image sources use the existing durable upload store. === */
+  const preserveOriginalImage = durableBridgeImage || (isImage && nativeWorkspaceAttachment);
+  const basePath = preserveOriginalImage
+    ? 'uploads'
+    : mime.getType(file.originalname)?.startsWith('image')
+      ? 'images'
+      : 'uploads';
+  /* === VIVENTIUM END === */
+
   // Dual storage pattern for RAG files: Storage + Vector DB
   let storageResult, embeddingResult;
   const isImageFile = file.mimetype.startsWith('image');
@@ -931,6 +960,9 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
       file_id,
       basePath,
       entity_id,
+      /* === VIVENTIUM START: Native image source metadata stays raw. === */
+      nativeOriginalImage: isImage && nativeWorkspaceAttachment,
+      /* === VIVENTIUM END === */
     });
 
     // SECOND: Upload to Vector DB
@@ -955,6 +987,9 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
       file_id,
       basePath,
       entity_id,
+      /* === VIVENTIUM START: Native image source metadata stays raw. === */
+      nativeOriginalImage: isImage && nativeWorkspaceAttachment,
+      /* === VIVENTIUM END === */
     });
   }
 
@@ -977,7 +1012,8 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
     });
   }
 
-  if (isImage && !durableBridgeImage) {
+  /* === VIVENTIUM START: Vision transport must not replace a native original file. === */
+  if (isImage && !preserveOriginalImage) {
     const result = await processImageFile({
       req,
       file,
@@ -986,6 +1022,7 @@ const processAgentFileUpload = async ({ req, res, metadata }) => {
     });
     filepath = result.filepath;
   }
+  /* === VIVENTIUM END === */
 
   const fileInfo = removeNullishValues({
     user: req.user.id,

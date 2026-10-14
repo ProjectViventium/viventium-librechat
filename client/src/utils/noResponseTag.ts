@@ -272,6 +272,36 @@ export function getMessageBranchChoices(messages: TMessage[]): TMessage[] {
   return choices.length > 0 ? choices : messages;
 }
 
+/** Use ordinary branch activity for an unset selection; explicit reverse indexes remain authoritative. */
+export function resolveMessageSiblingIndex(choices: TMessage[], siblingIdx: number): number {
+  if (Number.isInteger(siblingIdx) && siblingIdx >= 0 && siblingIdx < choices.length) {
+    return siblingIdx;
+  }
+  const latestActivity = (message: TMessage, autonomous = false): number => {
+    const ordinaryUser = message.isCreatedByUser && !isTrustedSystemMessageGroup(message);
+    const passive = ordinaryUser ? false : autonomous || isAutonomousMessage(message);
+    const createdAt = Date.parse(message.createdAt ?? '');
+    const updatedAt = Date.parse(message.updatedAt ?? '');
+    let latest = -Infinity;
+    if (!passive) latest = Number.isFinite(createdAt) ? createdAt : updatedAt;
+    if (!Number.isFinite(latest)) latest = -Infinity;
+    for (const child of message.children ?? []) {
+      latest = Math.max(latest, latestActivity(child, passive));
+    }
+    return latest;
+  };
+  let selected = choices.length - 1;
+  let latest = -Infinity;
+  for (let index = 0; index < choices.length; index++) {
+    const activity = latestActivity(choices[index]);
+    if (activity >= latest) {
+      selected = index;
+      latest = activity;
+    }
+  }
+  return choices.length - selected - 1;
+}
+
 /** Keep autonomous responses at the current branch anchor; never traverse another user branch. */
 export function selectVisibleMessageBranches(
   messages: TMessage[],
@@ -288,6 +318,58 @@ export function selectVisibleMessageBranches(
 }
 /* === VIVENTIUM END === */
 
+/* === VIVENTIUM START === Native offers are visible history; status callbacks stay internal. === VIVENTIUM END === */
+export function isTrustedNativeInputMessage(message: TMessage): boolean {
+  const metadata = message.metadata as
+    | {
+        viventium?: {
+          type?: unknown;
+          event?: unknown;
+          runId?: unknown;
+          workRef?: unknown;
+          nativeInputPresentation?: {
+            version?: unknown;
+            kind?: unknown;
+            binding?: {
+              version?: unknown;
+              requestId?: unknown;
+              requestFingerprint?: unknown;
+              runId?: unknown;
+              attemptId?: unknown;
+              sessionId?: unknown;
+              expiresAt?: unknown;
+            };
+          };
+        };
+      }
+    | null
+    | undefined;
+  const native = metadata?.viventium;
+  const offer = native?.nativeInputPresentation;
+  const binding = offer?.binding;
+  const bounded = (value: unknown, max: number) =>
+    typeof value === 'string' && value.length > 0 && value.length <= max;
+  return (
+    message.isCreatedByUser !== true &&
+    native?.type === 'glasshive_worker_callback' &&
+    native.event === 'run.needs_input' &&
+    bounded(native.workRef, 160) &&
+    offer?.version === 1 &&
+    (offer.kind === 'question' || offer.kind === 'permission') &&
+    binding?.version === 1 &&
+    binding.runId === native.runId &&
+    bounded(binding.runId, 160) &&
+    bounded(binding.requestId, 512) &&
+    bounded(binding.attemptId, 160) &&
+    bounded(binding.sessionId, 160) &&
+    typeof binding.requestFingerprint === 'string' &&
+    /^[a-f0-9]{64}$/.test(binding.requestFingerprint) &&
+    typeof binding.expiresAt === 'string' &&
+    Number.isFinite(Date.parse(binding.expiresAt)) &&
+    bounded(message.text?.trim(), 8000)
+  );
+}
+
 /** Remove only rows explicitly marked internal by trusted server metadata. */
 export function filterTrustedInternalMessagesTree(
   messagesTree?: TMessage[] | null,
@@ -300,7 +382,11 @@ export function filterTrustedInternalMessagesTree(
       { viventium?: { visibility?: unknown } } | null | undefined;
     const children = Array.isArray(message.children) ? message.children : [];
     const filteredChildren = filterTrustedInternalMessagesTree(children) ?? [];
-    if (metadata?.viventium?.visibility === 'internal' && !isTrustedSystemMessageGroup(message)) {
+    if (
+      metadata?.viventium?.visibility === 'internal' &&
+      !isTrustedSystemMessageGroup(message) &&
+      !isTrustedNativeInputMessage(message)
+    ) {
       changed = true;
       visible.push(...filteredChildren);
       continue;

@@ -207,10 +207,10 @@ describe('Phase B prompt registry ownership', () => {
 
   test('routes ordinary follow-up user prompts through the prompt registry', () => {
     jest.resetModules();
-    const getPromptText = jest.fn((_promptId, fallback) => fallback);
+    const getRequiredPromptText = jest.fn(() => 'Registered follow-up');
     jest.doMock('~/server/services/viventium/promptRegistry', () => ({
       ...jest.requireActual('~/server/services/viventium/promptRegistry'),
-      getPromptText,
+      getRequiredPromptText,
     }));
     const {
       formatFollowUpPrompt: registryFormatFollowUpPrompt,
@@ -223,9 +223,8 @@ describe('Phase B prompt registry ownership', () => {
       surface: '',
     });
 
-    expect(getPromptText).toHaveBeenCalledWith(
+    expect(getRequiredPromptText).toHaveBeenCalledWith(
       'cortex.follow_up_phase_b.user_message',
-      expect.any(String),
       expect.objectContaining({
         background_insights: expect.stringContaining('The worker found a result.'),
         recent_response_context: expect.stringContaining('Here is the response you JUST sent'),
@@ -257,6 +256,43 @@ describe('Phase B prompt registry ownership', () => {
       }),
     );
   });
+
+  test.each(['user_message', 'system'])(
+    'fails visibly when required ordinary %s is unavailable',
+    (entry) => {
+      jest.resetModules();
+      const error = Object.assign(new Error('required_prompt_invalid'), {
+        code: 'required_prompt_invalid',
+      });
+      const getRequiredPromptText = jest.fn(() => {
+        throw error;
+      });
+      const getPromptText = jest.fn(() => '{NTA}');
+      jest.doMock('~/server/services/viventium/promptRegistry', () => ({
+        ...jest.requireActual('~/server/services/viventium/promptRegistry'),
+        getRequiredPromptText,
+        getPromptText,
+      }));
+      const service = require('../BackgroundCortexFollowUpService');
+      const call =
+        entry === 'system'
+          ? () => service.buildFollowUpSystemPrompt({})
+          : () =>
+              service.formatFollowUpPrompt({
+                insights: [{ cortexName: 'Mission evidence', insight: 'Actual necessary input.' }],
+                recentResponse: 'Accepted.',
+                userRequest: 'Prepare the artifact.',
+              });
+      expect(call).toThrow(error);
+      expect(getRequiredPromptText).toHaveBeenCalledWith(
+        `cortex.follow_up_phase_b.${entry}`,
+        expect.any(Object),
+      );
+      expect(
+        getPromptText.mock.calls.some(([id]) => id.startsWith('cortex.follow_up_phase_b.')),
+      ).toBe(false);
+    },
+  );
 
   test('pins one Feeling capsule as the final system layer for a visible follow-up', () => {
     const capsule =
@@ -495,6 +531,104 @@ describe('Phase B session-backed Feelings', () => {
 
 describe('Phase B prepare/persist boundary', () => {
   test.each([false, true])(
+    'retains native public ranges through saved Phase B and callback metadata, invalid=%s',
+    async (invalid) => {
+      const source = 'Read-first 🧠.\nUseful spoken result.';
+      const common = { version: 1, required: true, valid: true, source: 'model' };
+      const ranges = [
+        { start: 0, end: 'Read-first 🧠.\n'.length, disposition: { ...common, audio: 'skip' } },
+        {
+          start: 'Read-first 🧠.\n'.length,
+          end: source.length,
+          disposition: { ...common, audio: 'eligible' },
+        },
+      ];
+      if (invalid) ranges[1].end -= 1;
+      const output = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: source,
+              provider_specific_fields: {
+                viventium: {
+                  deliveryDispositionRanges: ranges,
+                  delivery_disposition: { ...common, audio: 'eligible' },
+                },
+              },
+            },
+          },
+        ],
+      };
+      const createRun = jest.spyOn(Run, 'create').mockImplementation(async (options) => ({
+        processStream: async () => {
+          options.customHandlers.on_chat_model_start.handle();
+          options.customHandlers.on_chat_model_end.handle('on_chat_model_end', { output });
+          return source;
+        },
+      }));
+      const saveMessage = jest.spyOn(db, 'saveMessage').mockResolvedValue({});
+      const previous = process.env.XAI_API_KEY;
+      try {
+        process.env.XAI_API_KEY = 'synthetic-xai-key';
+        const input = {
+          req: {
+            id: 'synthetic-ranges-request',
+            _viventiumTelegram: true,
+            body: { telegramAudioRequested: true, viventiumSurface: 'telegram' },
+            config: {
+              endpoints: {
+                agents: {
+                  providerCapabilities: {
+                    xai: {
+                      messaging_delivery_disposition: true,
+                      messaging_delivery_disposition_version: 1,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          conversationId: 'synthetic-conversation',
+          parentMessageId: 'synthetic-parent',
+          runId: 'synthetic-run',
+          agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
+          insightsData: {
+            cortexCount: 1,
+            insights: [{ cortexName: 'Synthetic specialist', insight: 'A new fact.' }],
+          },
+          recentResponse: 'The initial answer is visible.',
+        };
+        const prepared = await prepareCortexFollowUpMessage(input);
+        expect(prepared.text).toBe(source);
+        expect(prepared.nativeDeliveryContent[0].text).toBe(source);
+        expect(prepared.nativeDeliveryContent[0].deliveryDispositionRanges).toHaveLength(
+          invalid ? 0 : 2,
+        );
+        expect(prepared.deliveryDisposition.audio).toBe(invalid ? 'skip' : 'eligible');
+        expect(prepared.telegramDeliveryControls.audioContent).toEqual(
+          prepared.nativeDeliveryContent,
+        );
+        expect(prepared.telegramDeliveryControls.sourceTextSha256).toBe(
+          require('node:crypto').createHash('sha256').update(source).digest('hex'),
+        );
+        const persisted = await persistPreparedCortexFollowUpMessage(input, prepared);
+        expect(persisted.text).toBe(source);
+        expect(persisted.content).toEqual(prepared.nativeDeliveryContent);
+        expect(persisted.metadata.viventium.telegramDeliveryControls).toEqual(
+          prepared.telegramDeliveryControls,
+        );
+        expect(createRun).toHaveBeenCalledTimes(1);
+      } finally {
+        if (previous === undefined) delete process.env.XAI_API_KEY;
+        else process.env.XAI_API_KEY = previous;
+        createRun.mockRestore();
+        saveMessage.mockRestore();
+      }
+    },
+  );
+
+  test.each([false, true])(
     'prepares before persistence and retains declared audio=%s without calling the provider again',
     async (audioEligible) => {
       const processStream = jest.fn().mockResolvedValue('A grounded follow-up.');
@@ -699,6 +833,25 @@ describe('forced follow-up onto an empty primary answer', () => {
     ['promotes the insight onto an empty primary answer', null, true],
     ['keeps an answer acknowledged failed and gives the insight its own message', 'failed', false],
   ])('%s', async (_label, acknowledgementState, promoted) => {
+    const nativeDeliveryContent = [
+      {
+        type: 'text',
+        text: 'The recovered answer.',
+        deliveryDispositionRanges: [
+          {
+            start: 0,
+            end: 'The recovered answer.'.length,
+            disposition: {
+              version: 1,
+              audio: 'skip',
+              required: true,
+              valid: true,
+              source: 'model',
+            },
+          },
+        ],
+      },
+    ];
     const getMessage = jest
       .spyOn(db, 'getMessage')
       .mockResolvedValue(
@@ -733,6 +886,7 @@ describe('forced follow-up onto an empty primary answer', () => {
         {
           text: 'The recovered answer.',
           shouldForceVisibleFollowUp: true,
+          nativeDeliveryContent,
           deliveryDisposition: {
             version: 1,
             audio: 'skip',
@@ -749,7 +903,7 @@ describe('forced follow-up onto an empty primary answer', () => {
         expect(promotion).toBeDefined();
         expect(promotion[1]).toMatchObject({
           text: 'The recovered answer.',
-          content: expect.arrayContaining([{ type: 'text', text: 'The recovered answer.' }]),
+          content: expect.arrayContaining(nativeDeliveryContent),
           attachments: [{ file_id: 'owned-file', filename: 'result.md' }],
           metadata: {
             viventium: {
@@ -999,15 +1153,47 @@ describe('formatFollowUpPrompt', () => {
     });
 
     expect(prompt).toContain(
-      'If an insight contains new factual/contextual material followed by a question, keep the new material and drop the question.',
+      'If an insight contains new factual/contextual material followed by an optional generic question, keep the new material and drop that question.',
     );
     expect(prompt).toContain(
-      'If it is stale, redundant, already resolved, question-only, or would interrupt the current flow, output exactly {NTA}.',
+      'If it is stale, redundant, already resolved, or an optional generic background question, output exactly {NTA}.',
     );
     expect(prompt).toContain(
-      'If an insight includes a question, drop the question and keep any accompanying factual material.',
+      'Surface a supplied necessary accepted-mission question once; drop optional generic background questions',
     );
     expect(prompt).not.toContain('If a question seems needed, output {NTA} instead.');
+  });
+
+  test('preserves a necessary question and accepted goal from a completed native mission turn', () => {
+    const prompt = formatFollowUpPrompt({
+      insights: [
+        {
+          cortexName: 'Mission evidence',
+          insight: 'Blue circle or green square? Nothing drawn yet.',
+          authority: {
+            kind: 'durable_terminal_callback',
+            runId: 'run_choice',
+            event: 'run.completed',
+            workState: 'completed',
+          },
+          runInput: {
+            version: 1,
+            run_id: 'run_choice',
+            instruction: 'Ask the owner to choose the badge before drawing.',
+          },
+        },
+      ],
+      recentResponse: 'One worker accepted the task and will wait for your choice.',
+      continuationContext: '',
+      surface: 'telegram',
+    });
+    expect(prompt).toContain('Blue circle or green square? Nothing drawn yet.');
+    expect(prompt).toContain('Ask the owner to choose the badge before drawing.');
+    expect(prompt).toContain('"kind":"durable_terminal_callback"');
+    expect(prompt).toContain('"workState":"completed"');
+    expect(prompt).toContain("does not prove the user's goal is fulfilled");
+    expect(prompt).toContain('A plain report grants no native form or approval authority');
+    expect(prompt).not.toContain('question-only, or would interrupt the current flow');
   });
 
   test('makes the main-agent continuation the adjudicator for background evidence', () => {
@@ -1039,8 +1225,11 @@ describe('formatFollowUpPrompt', () => {
     expect(prompt).toContain('Here is the earlier response this follow-up belongs to');
     expect(prompt).toContain('## Current Conversation State');
     expect(prompt).toContain('User: I am already getting ready now.');
-    expect(prompt).toContain('If the background insights are stale, redundant, already resolved');
-    expect(prompt).toContain('Only surface information that is still useful now');
+    expect(prompt).toContain('If it is stale, redundant, already resolved');
+    expect(prompt).toContain(
+      'These newer visible messages were exchanged before this follow-up decision',
+    );
+    expect(prompt).not.toContain('default to {NTA} unless');
     expect(prompt).toContain('{NTA}');
   });
 
@@ -2118,8 +2307,10 @@ test('Phase B receives verified parent graph records beside the limited parallel
       }),
     },
   ];
-  const readToolEvidence = jest.fn().mockResolvedValue(evidence);
-  const service = jest.spyOn(native, 'getService').mockReturnValue({ readToolEvidence });
+  const readToolEvidenceForPresentation = jest.fn().mockResolvedValue(evidence);
+  const service = jest
+    .spyOn(native, 'getService')
+    .mockReturnValue({ readToolEvidenceForPresentation });
   const processStream = jest.fn().mockResolvedValue('Useful synthesis.');
   const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
   const oldKey = process.env.XAI_API_KEY;
@@ -2141,7 +2332,12 @@ test('Phase B receives verified parent graph records beside the limited parallel
       },
       recentResponse: 'The primary archive read found a record.',
     });
-    expect(readToolEvidence).toHaveBeenCalledWith('owner', 'conversation', 'answer');
+    expect(readToolEvidenceForPresentation).toHaveBeenCalledWith(
+      'owner',
+      'conversation',
+      'answer',
+      expect.any(Number),
+    );
     const transmitted = JSON.stringify(processStream.mock.calls[0][0]);
     expect(transmitted).toContain('Primary archive result');
     expect(transmitted).toContain('Later graph verification');
@@ -2164,8 +2360,12 @@ test.each([
   'Phase B handles %s parent evidence error %s without weakening its guard',
   async (kind, code, allowed) => {
     const native = require('../nativeResponseService');
-    const readToolEvidence = jest.fn().mockRejectedValue(Object.assign(new Error(code), { code }));
-    const service = jest.spyOn(native, 'getService').mockReturnValue({ readToolEvidence });
+    const readToolEvidenceForPresentation = jest
+      .fn()
+      .mockRejectedValue(Object.assign(new Error(code), { code }));
+    const service = jest
+      .spyOn(native, 'getService')
+      .mockReturnValue({ readToolEvidenceForPresentation });
     const processStream = jest.fn().mockResolvedValue('The completed worker result.');
     const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
     const oldKey = process.env.XAI_API_KEY;
@@ -2214,6 +2414,7 @@ test.each([
 describe('durable callback follow-up ownership', () => {
   test.each([
     ['all durable', ['durable_terminal_callback', 'durable_terminal_callback'], true],
+    ['nonterminal attention', ['durable_work_callback'], true],
     ['ordinary', ['cortex_insight'], false],
     ['mixed', ['durable_terminal_callback', 'cortex_insight'], false],
   ])('persists the source only for %s evidence', async (_label, kinds, durable) => {
@@ -2250,7 +2451,11 @@ describe('durable callback follow-up ownership', () => {
       expect(saved.metadata.viventium.parentMessageId).toBe(input.parentMessageId);
       expect(saved.metadata.viventium.cortexCount).toBe(kinds.length);
       if (durable) {
-        expect(saved.metadata.viventium.followUpSource).toBe('durable_terminal_callback');
+        expect(saved.metadata.viventium.followUpSource).toBe(
+          kinds.every((kind) => kind === 'durable_terminal_callback')
+            ? 'durable_terminal_callback'
+            : 'durable_work_callback',
+        );
       } else {
         expect(saved.metadata.viventium).not.toHaveProperty('followUpSource');
       }
@@ -2310,8 +2515,10 @@ describe('durable follow-up foreground movement', () => {
       .mockResolvedValueOnce(before)
       .mockResolvedValue(after);
     const native = require('../nativeResponseService');
-    const readToolEvidence = jest.fn().mockResolvedValue([]);
-    const service = jest.spyOn(native, 'getService').mockReturnValue({ readToolEvidence });
+    const readToolEvidenceForPresentation = jest.fn().mockResolvedValue([]);
+    const service = jest
+      .spyOn(native, 'getService')
+      .mockReturnValue({ readToolEvidenceForPresentation });
     const processStream = jest.fn().mockResolvedValue(generated);
     const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
     const saveMessage = jest.spyOn(db, 'saveMessage').mockResolvedValue({});
@@ -2349,10 +2556,11 @@ describe('durable follow-up foreground movement', () => {
         forceVisibleFollowUp: false,
       });
       expect(processStream).toHaveBeenCalledTimes(1);
-      expect(readToolEvidence).toHaveBeenCalledWith(
+      expect(readToolEvidenceForPresentation).toHaveBeenCalledWith(
         'synthetic-owner',
         'synthetic-conversation',
         'synthetic-parent',
+        expect.any(Number),
       );
       expect(createRun.mock.calls[0][0].graphConfig.tools).toEqual([]);
       expect(saveMessage).not.toHaveBeenCalled();
@@ -2380,3 +2588,197 @@ describe('durable follow-up foreground movement', () => {
   });
 });
 /* === VIVENTIUM END === */
+
+test('terminal mission synthesis27 defers to the current Main and keeps ordinary Cortex immediate', async () => {
+  const native = require('../nativeResponseService');
+  const previous = native.offerMissionEvidenceToCurrentMain;
+  const offer = jest.fn().mockResolvedValue(true);
+  native.offerMissionEvidenceToCurrentMain = offer;
+  const service = jest.spyOn(native, 'getService').mockReturnValue({
+    readToolEvidenceForPresentation: jest.fn().mockResolvedValue([]),
+  });
+  const processStream = jest.fn().mockResolvedValue('{NTA}');
+  const create = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+  const oldKey = process.env.XAI_API_KEY;
+  process.env.XAI_API_KEY = 'synthetic-key';
+  const input = {
+    req: { user: { id: 'owner' }, body: {} },
+    conversationId: 'conversation',
+    parentMessageId: 'old-anchor',
+    recentResponse: 'Old holding reply.',
+    agent: { id: 'main', provider: 'xai', model: 'synthetic', model_parameters: {} },
+    insightsData: {
+      insights: [
+        {
+          cortexName: 'Mission',
+          insight: 'Inspection declined.',
+          authority: { kind: 'durable_terminal_callback' },
+        },
+      ],
+    },
+  };
+  const messages = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
+  try {
+    expect(await prepareCortexFollowUpMessage(input)).toEqual({
+      currentMainPending: true,
+      currentMainReadyAfterRelease: undefined,
+    });
+    expect(create).not.toHaveBeenCalled();
+    offer.mockResolvedValue(false);
+    expect((await prepareCortexFollowUpMessage(input)).followUpDecisionRecord.llmResult).toBe(
+      'nta',
+    );
+    expect(create).toHaveBeenCalledTimes(1);
+    offer.mockClear();
+    await prepareCortexFollowUpMessage({
+      ...input,
+      insightsData: { insights: [{ cortexName: 'Cortex', insight: 'Adjacent useful evidence.' }] },
+    });
+    expect(offer).not.toHaveBeenCalled();
+    expect(create).toHaveBeenCalledTimes(2);
+  } finally {
+    if (previous === undefined) delete native.offerMissionEvidenceToCurrentMain;
+    else native.offerMissionEvidenceToCurrentMain = previous;
+    create.mockRestore();
+    messages.mockRestore();
+    service.mockRestore();
+    if (oldKey == null) delete process.env.XAI_API_KEY;
+    else process.env.XAI_API_KEY = oldKey;
+  }
+});
+
+/* === VIVENTIUM START === Completed native silence preserves model judgment. === */
+describe('native silence persistence decision', () => {
+  test('retains a validated native empty assistant response after an unrelated turn', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText: '',
+      nativeSilentDecision: true,
+      voiceMode: true,
+      movedOnAfterParent: true,
+      insightsData: { insights: [{ insight: 'Accepted blocker.' }] },
+    });
+    expect(result.text).toBe('');
+    expect(result.decision).toMatchObject({
+      nativeSilentDecision: true,
+      llmResult: 'native_silent',
+      selectedStrategy: 'native_silent_suppressed',
+      generationFailed: false,
+    });
+    expect(
+      buildFollowUpDecisionRecord({ generatedText: '', finalText: '', decision: result.decision }),
+    ).toMatchObject({ nativeSilentDecision: true, llmResult: 'native_silent', generatedLength: 0 });
+  });
+  test.each([
+    { nativeSilentDecision: false },
+    { nativeSilentDecision: true, generationFailed: true },
+    { nativeSilentDecision: true, generatedText: 'An actionable question.' },
+  ])(
+    'does not promote arbitrary empty, failed or useful output into native silence: %j',
+    (changes) => {
+      const result = resolveFollowUpPersistenceText({
+        generatedText: '',
+        voiceMode: true,
+        ...changes,
+      });
+      expect(result.decision.nativeSilentDecision).toBeUndefined();
+      expect(result.decision.llmResult).not.toBe('native_silent');
+    },
+  );
+});
+/* === VIVENTIUM END === */
+
+describe('Phase B retained File publication', () => {
+  test.each([
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ])(
+    'normal follow-up persists only after its original File source guard, revoked=%s explicitHook=%s',
+    async (revoked, explicitHook) => {
+      const transaction = require('../GlassHiveTerminalCallbackTransaction');
+      const session = { inTransaction: () => true };
+      const order = [];
+      const runTransaction = jest
+        .spyOn(transaction, 'runGlassHiveTerminalCallbackTransaction')
+        .mockImplementation(async (operation) => {
+          order.push('transaction');
+          return operation(session);
+        });
+      const save = jest.spyOn(db, 'saveMessage').mockImplementation(async (_req, message) => {
+        order.push('save');
+        return message;
+      });
+      const guard = jest.fn(async (currentSession) => {
+        expect(currentSession).toBe(session);
+        order.push('guard');
+        if (revoked) throw new Error('native_output_files_retained_source_invalid');
+      });
+      const attachments = [
+        {
+          user: 'owner',
+          file_id: 'native_' + 'a'.repeat(64),
+          filepath: '/uploads/capture.svg',
+          filename: 'capture.svg',
+          type: 'image/svg+xml',
+          bytes: 6,
+          source: 'local',
+          nativeOutputFile: {
+            version: 1,
+            status: 'available',
+            messageId: 'new-message',
+            downloadUrl: 'https://artifacts.example.test/v1/link-refs/ghr_retained1234567890',
+          },
+        },
+      ];
+      const priorBase = process.env.GLASSHIVE_ARTIFACT_BASE_URL;
+      process.env.GLASSHIVE_ARTIFACT_BASE_URL = 'https://artifacts.example.test';
+      const source = require('../nativeOutputFiles');
+      const prepareFiles = jest
+        .spyOn(source, 'prepareMissionOutputFiles')
+        .mockResolvedValue({ attachments, authorizePublication: guard });
+      try {
+        const operation = persistPreparedCortexFollowUpMessage(
+          {
+            req: { user: { id: 'owner' }, body: {} },
+            conversationId: 'conversation',
+            parentMessageId: 'parent',
+            agent: { id: 'main' },
+            insightsData: { insights: [] },
+            dependencies: explicitHook
+              ? { prepareAttachments: async () => ({ attachments, authorizePublication: guard }) }
+              : {},
+          },
+          {
+            text: '[Original capture](https://artifacts.example.test/v1/link-refs/ghr_retained1234567890)',
+            shouldForceVisibleFollowUp: false,
+            finalContinuationContext: { currentLeafMessageId: 'parent' },
+            followUpDecisionRecord: {},
+            conversationMessages: [],
+          },
+        );
+        if (revoked)
+          await expect(operation).rejects.toThrow('native_output_files_retained_source_invalid');
+        else await expect(operation).resolves.toMatchObject({ attachments });
+        expect(order).toEqual(
+          revoked ? ['transaction', 'guard'] : ['transaction', 'guard', 'save'],
+        );
+        expect(guard).toHaveBeenCalledTimes(1);
+        if (!explicitHook)
+          expect(prepareFiles).toHaveBeenCalledWith(
+            expect.objectContaining({
+              message: expect.objectContaining({
+                text: '[Original capture](https://artifacts.example.test/v1/link-refs/ghr_retained1234567890)',
+              }),
+            }),
+          );
+      } finally {
+        runTransaction.mockRestore();
+        save.mockRestore();
+        prepareFiles.mockRestore();
+        if (priorBase === undefined) delete process.env.GLASSHIVE_ARTIFACT_BASE_URL;
+        else process.env.GLASSHIVE_ARTIFACT_BASE_URL = priorBase;
+      }
+    },
+  );
+});

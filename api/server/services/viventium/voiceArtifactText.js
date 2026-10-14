@@ -557,8 +557,10 @@ function sanitizeVoiceAssistantMessageForPersistence(req, message) {
   }
 
   const isVoiceMode = req?.body?.voiceMode === true;
-  const isTelegram = String(req?.body?.viventiumSurface || '').toLowerCase() === 'telegram';
-  if (!isVoiceMode && !isTelegram) {
+  const surface = String(req?.body?.viventiumSurface || '').toLowerCase();
+  const isTelegram = surface === 'telegram';
+  const isWeb = surface === 'web';
+  if (!isVoiceMode && !isTelegram && !isWeb) {
     return message;
   }
 
@@ -567,12 +569,16 @@ function sanitizeVoiceAssistantMessageForPersistence(req, message) {
    * Purpose: Preserve Markdown/content semantics while removing structural delivery and TTS markup.
    * Added: 2026-07-22
    * === VIVENTIUM END === */
-  if (isTelegram && !isVoiceMode) {
+  if ((isTelegram || isWeb) && !isVoiceMode) {
     const audioRequested =
-      req?.body?.telegramAudioRequested === true ||
-      String(req?.body?.telegramAudioRequested || '').toLowerCase() === 'true';
+      isTelegram &&
+      (req?.body?.telegramAudioRequested === true ||
+        String(req?.body?.telegramAudioRequested || '').toLowerCase() === 'true');
     const cleanTelegramText = (value) => {
-      const deliveryClean = parseDeliveryControls(value).cleanText;
+      const parsed = parseDeliveryControls(value);
+      if (isWeb && !parsed.skipVoiceCount && !parsed.messageBreakCount && !parsed.mergedBreakCount)
+        return value;
+      const deliveryClean = parsed.cleanText;
       return audioRequested ? stripVoiceControlTags(deliveryClean).trim() : deliveryClean;
     };
     const out = { ...message };

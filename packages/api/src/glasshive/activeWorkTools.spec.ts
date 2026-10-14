@@ -1,5 +1,5 @@
 import { TOOL_EFFECT_CLASSES } from '../tools/toolEffectMetadata';
-import { createActiveWorkTools } from './activeWorkTools';
+import { createActiveWorkTools, readActiveWork } from './activeWorkTools';
 
 describe('createActiveWorkTools', () => {
   const getActiveWorkPage = jest.fn();
@@ -25,6 +25,51 @@ describe('createActiveWorkTools', () => {
     );
   }
 
+  test('Main clarification uses the existing action and exact wire values without owner approval authority', async () => {
+    const { action } = create();
+    const nativeInput = {
+      version: 1 as const,
+      requestId: 'question-1',
+      requestFingerprint: 'a'.repeat(64),
+      action: 'accept' as const,
+      content: { answers: { 'Which colour?\n ': ['Blue'] } },
+    };
+    const config = {
+      toolCall: { id: 'answer-1' },
+      configurable: { requestBody: { conversationId: 'conversation-1', messageId: 'message-1' } },
+    };
+    await action.invoke({ workRef: 'work-1', action: 'resume', nativeInput }, config);
+    expect(executeGlassHiveWorkAction).toHaveBeenCalledWith(
+      expect.objectContaining({ ownerId: 'owner-1', nativeInput }),
+    );
+    expect(executeGlassHiveWorkAction.mock.calls[0][0]).not.toHaveProperty('ownerInputControl');
+    await action.invoke(
+      {
+        workRef: 'work-1',
+        action: 'resume',
+        nativeInput: { ...nativeInput, content: { optionId: 'native-choice' } },
+      },
+      config,
+    );
+    expect(executeGlassHiveWorkAction).toHaveBeenCalledTimes(2);
+    expect(executeGlassHiveWorkAction.mock.calls[1][0]).toMatchObject({
+      requestBody: config.configurable.requestBody,
+    });
+    expect(executeGlassHiveWorkAction.mock.calls[1][0]).not.toHaveProperty('ownerInputControl');
+    await expect(
+      action.invoke(
+        { workRef: 'work-1', action: 'resume', nativeInput, ownerInputControl: true },
+        config,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      action.invoke(
+        { workRef: 'work-1', action: 'resume', nativeInput, nativeHumanInput: { receivedAt: 1 } },
+        config,
+      ),
+    ).rejects.toThrow();
+  });
+
   test('lists the authenticated owner roster with bounded defaults', async () => {
     const { list } = create();
 
@@ -37,6 +82,69 @@ describe('createActiveWorkTools', () => {
       cursor: '',
       limit: 50,
     });
+  });
+
+  test('active and history share compact facts while preserving their original pagination', async () => {
+    const value = {
+      snapshot: 'fresh',
+      cursor: 'native.cursor',
+      overflowCount: 9,
+      work: [
+        {
+          workRef: 'work-exact',
+          title: 'Exact work',
+          state: 'needs_input',
+          attention: { kind: 'auth', code: 'capability_authorization_horizon_expired' },
+          actions: ['resume', 'stop'],
+          updatedAt: '2026-01-01T00:00:00Z',
+          artifactLinks: { items: [{ url: 'https://example.invalid/large-file' }] },
+          queue: { pending: 'verbose'.repeat(10000) },
+          route: { privateMetadata: 'not needed' },
+        },
+      ],
+    };
+    getActiveWorkPage.mockResolvedValue(value);
+    getActiveWorkHistoryPage.mockResolvedValue(value);
+    const { list } = create();
+    for (const scope of ['active', 'history'] as const) {
+      const result = JSON.parse(
+        await list.invoke({ scope, cursor: 'previous.cursor', limit: 100 }),
+      );
+      expect(result).toMatchObject({
+        scope,
+        snapshot: 'fresh',
+        cursor: 'native.cursor',
+        overflowCount: 9,
+        omittedVisibleWork: 0,
+        optionalMetadataOmitted: true,
+        work: [
+          {
+            workRef: 'work-exact',
+            title: 'Exact work',
+            state: 'needs_input',
+            attention: value.work[0].attention,
+            actions: ['resume', 'stop'],
+          },
+        ],
+      });
+      expect(result.work[0]).not.toHaveProperty('nativeInputOmitted');
+      expect(result.work[0]).not.toHaveProperty('artifactLinks');
+      expect(result.work[0]).not.toHaveProperty('route');
+      expect(result.work[0]).not.toHaveProperty('queue');
+      expect(result.work[0]).not.toHaveProperty('updatedAt');
+      expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(19 * 1024);
+    }
+    expect(getActiveWorkPage).toHaveBeenCalledWith({
+      ownerId: 'owner-1',
+      cursor: 'previous.cursor',
+      limit: 100,
+    });
+    expect(getActiveWorkHistoryPage).toHaveBeenCalledWith({
+      ownerId: 'owner-1',
+      cursor: 'previous.cursor',
+      limit: 100,
+    });
+    expect(executeGlassHiveWorkAction).not.toHaveBeenCalled();
   });
 
   test('reads retained history and exact results without a mutation', async () => {
@@ -77,6 +185,42 @@ describe('createActiveWorkTools', () => {
 
     expect(list.metadata?.viventiumToolEffectClass).toBe(TOOL_EFFECT_CLASSES.readOnly);
     expect(action.metadata?.viventiumToolEffectClass).toBe(TOOL_EFFECT_CLASSES.externalMutation);
+  });
+
+  test('typed invalid active-work input preserves its schema explanation before any read', async () => {
+    await expect(
+      readActiveWork(
+        'owner-1',
+        { workRef: 'work-1' },
+        {
+          getActiveWorkPage,
+          getActiveWorkHistoryPage,
+          getGlassHiveWorkResult,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'active_work_arguments_invalid',
+      message: 'runId and workRef require result scope',
+    });
+    expect(getActiveWorkPage).not.toHaveBeenCalled();
+    expect(getGlassHiveWorkResult).not.toHaveBeenCalled();
+  });
+
+  test('invalid unexpected input does not echo its private key in validation diagnostics', async () => {
+    await expect(
+      readActiveWork(
+        'owner-1',
+        { synthetic_private_key: 'synthetic-private-value' },
+        {
+          getActiveWorkPage,
+          getActiveWorkHistoryPage,
+          getGlassHiveWorkResult,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'active_work_arguments_invalid',
+      message: 'Invalid active-work arguments',
+    });
   });
 
   test('derives a stable operation id from trusted turn and tool-call identity', async () => {
@@ -153,19 +297,113 @@ describe('createActiveWorkTools', () => {
   });
 });
 
-
 describe('actual eager action caller selected file handoff', () => {
+  it.each(['message', 'queue', 'steer', 'pause'] as const)(
+    'normalizes an optional empty file selection for %s before the owner executor',
+    async (actionName) => {
+      const execute = jest.fn().mockResolvedValue({ state: 'queued' });
+      const { action } = createActiveWorkTools(
+        { userId: 'owner-1' },
+        {
+          getActiveWorkPage: async () => ({}),
+          getActiveWorkHistoryPage: async () => ({}),
+          getGlassHiveWorkResult: async () => ({}),
+          executeGlassHiveWorkAction: execute,
+        },
+      );
+      const input = {
+        workRef: 'work-1',
+        action: actionName,
+        instruction: 'Continue the exact objective',
+      };
+      const config = {
+        toolCall: { id: 'native-1' },
+        configurable: {
+          requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
+        },
+      };
+      await action.invoke({ ...input, fileIds: [] }, config);
+      await action.invoke(input, config);
+      expect(execute.mock.calls[0][0]).not.toHaveProperty('fileIds');
+      expect(execute.mock.calls[0][0]).toEqual(execute.mock.calls[1][0]);
+    },
+  );
+  it.each([
+    { fileIds: [''] },
+    { fileIds: [' padded'] },
+    { fileIds: ['a', 'a'] },
+    { fileIds: [42] },
+  ])(
+    'rejects malformed nonempty file references %j before the owner executor',
+    async ({ fileIds }) => {
+      const execute = jest.fn(async () => ({}));
+      const { action } = createActiveWorkTools(
+        { userId: 'owner-1' },
+        {
+          getActiveWorkPage: async () => ({}),
+          getActiveWorkHistoryPage: async () => ({}),
+          getGlassHiveWorkResult: async () => ({}),
+          executeGlassHiveWorkAction: execute,
+        },
+      );
+      await expect(
+        action.invoke({ workRef: 'work-1', action: 'message', instruction: 'Continue', fileIds }),
+      ).rejects.toThrow();
+      expect(execute).not.toHaveBeenCalled();
+    },
+  );
   it('passes selected IDs with trusted request resources to the shared owner executor', async () => {
-    const execute=jest.fn(async()=>({state:'queued'}));
-    const req={user:{id:'owner-1'},config:{paths:{}}};
-    const {action}=createActiveWorkTools({userId:'owner-1',req},{getActiveWorkPage:async()=>({}),getActiveWorkHistoryPage:async()=>({}),getGlassHiveWorkResult:async()=>({}),executeGlassHiveWorkAction:execute});
-    const body={conversationId:'conversation-1',messageId:'message-1',files:[{file_id:'a'}]};
-    await action.invoke({workRef:'work-1',action:'steer',instruction:'Use this exact file',fileIds:['a']},{toolCall:{id:'native-1'},configurable:{requestBody:body}});
-    expect(execute).toHaveBeenCalledWith(expect.objectContaining({ownerId:'owner-1',fileIds:['a'],requestBody:body,serverReq:req}));
+    const execute = jest.fn(async () => ({ state: 'queued' }));
+    const req = { user: { id: 'owner-1' }, config: { paths: {} } };
+    const { action } = createActiveWorkTools(
+      { userId: 'owner-1', req },
+      {
+        getActiveWorkPage: async () => ({}),
+        getActiveWorkHistoryPage: async () => ({}),
+        getGlassHiveWorkResult: async () => ({}),
+        executeGlassHiveWorkAction: execute,
+      },
+    );
+    const body = {
+      conversationId: 'conversation-1',
+      messageId: 'message-1',
+      files: [{ file_id: 'a' }],
+    };
+    await action.invoke(
+      { workRef: 'work-1', action: 'steer', instruction: 'Use this exact file', fileIds: ['a'] },
+      { toolCall: { id: 'native-1' }, configurable: { requestBody: body } },
+    );
+    expect(execute).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerId: 'owner-1',
+        fileIds: ['a'],
+        requestBody: body,
+        serverReq: req,
+      }),
+    );
   });
   it('rejects file arguments on unsupported follow-up action without sending an action', async () => {
-    const execute=jest.fn(async()=>({}));const {action}=createActiveWorkTools({userId:'owner-1'},{getActiveWorkPage:async()=>({}),getActiveWorkHistoryPage:async()=>({}),getGlassHiveWorkResult:async()=>({}),executeGlassHiveWorkAction:execute});
-    await expect(action.invoke({workRef:'work-1',action:'pause',instruction:'Use files',fileIds:['a']},{toolCall:{id:'native-1'},configurable:{requestBody:{conversationId:'conversation-1',messageId:'message-1'}}})).rejects.toThrow();
+    const execute = jest.fn(async () => ({}));
+    const { action } = createActiveWorkTools(
+      { userId: 'owner-1' },
+      {
+        getActiveWorkPage: async () => ({}),
+        getActiveWorkHistoryPage: async () => ({}),
+        getGlassHiveWorkResult: async () => ({}),
+        executeGlassHiveWorkAction: execute,
+      },
+    );
+    await expect(
+      action.invoke(
+        { workRef: 'work-1', action: 'pause', instruction: 'Use files', fileIds: ['a'] },
+        {
+          toolCall: { id: 'native-1' },
+          configurable: {
+            requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
+          },
+        },
+      ),
+    ).rejects.toThrow();
     expect(execute).not.toHaveBeenCalled();
   });
 });

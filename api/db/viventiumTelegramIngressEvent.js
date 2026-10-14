@@ -48,6 +48,7 @@ module.exports = function createViventiumTelegramIngressEvent(db) {
       inputFailureCode: { type: String },
       inputPreparedDigest: { type: String },
       inputRegistrationId: { type: String },
+      inputReceivedAt: { type: Number, min: 1, immutable: true },
       inputPrimarySourceEventId: { type: String },
       inputRelatedSourceEventIds: { type: [String], default: undefined },
       inputFailures: {

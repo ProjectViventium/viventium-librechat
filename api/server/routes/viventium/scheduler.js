@@ -31,6 +31,7 @@ const { Message, Conversation } = require('~/db/models');
  * Feature: Scheduler <-> Telegram mapping helper import.
  * === VIVENTIUM NOTE === */
 const { resolveTelegramMappingByUserId } = require('~/server/services/TelegramLinkService');
+const { resolveUserVoiceRoute } = require('~/server/services/viventium/CallSessionService');
 /* === VIVENTIUM NOTE ===
  * Feature: Sidebar parity for gateway-created conversations (title + icon).
  * Purpose: Match web UI behavior for new conversations created via scheduler gateway.
@@ -549,6 +550,21 @@ router.post(
     delete sanitizedIncoming.viventiumSchedulerExternalWorkRequired;
     delete sanitizedIncoming.externalWorkRequired;
     delete sanitizedIncoming.titleText;
+    delete sanitizedIncoming.authoringDeadlineAt;
+    if (incoming.authoringDeadlineAt != null) {
+      const deadline = new Date(incoming.authoringDeadlineAt).getTime();
+      if (
+        typeof incoming.authoringDeadlineAt !== 'string' ||
+        !Number.isFinite(deadline) ||
+        deadline <= Date.now()
+      ) {
+        return _res.status(400).json({
+          error: 'A future authoring deadline is required',
+          reason: 'invalid_authoring_deadline',
+        });
+      }
+      req.viventiumSchedulerAuthoringDeadlineAt = new Date(deadline).toISOString();
+    }
     for (const field of [
       'scheduledAgentExecution',
       'provider',
@@ -834,13 +850,31 @@ router.post('/stream/:streamId/cancel', schedulerAuth, async (req, res) => {
     });
   }
 
-  const result = await GenerationJobManager.abortJob(streamId);
-  if (!result?.success) {
+  // The scheduler's existing cancel caller waits at most ten seconds. A child Stop ACK may
+  // remain unresolved or reject after the controller has already been aborted. Reserve two seconds
+  // of the existing ten-second caller budget for cleanup and delivery. Always retract
+  // this exact unfinished presentation; never call that an acknowledged capacity release.
+  let result;
+  let releaseUnconfirmed = false;
+  let acknowledgementTimer;
+  try {
+    result = await Promise.race([
+      GenerationJobManager.abortJob(streamId, 'user_cancelled', userId),
+      new Promise((_, reject) => {
+        acknowledgementTimer = setTimeout(() => reject(new Error('release_unconfirmed')), 8_000);
+      }),
+    ]);
+  } catch {
+    releaseUnconfirmed = true;
+  } finally {
+    clearTimeout(acknowledgementTimer);
+  }
+  if (!releaseUnconfirmed && !result?.success) {
     return res.status(409).json({ error: 'Scheduler authoring could not be cancelled' });
   }
 
-  const responseMessageId = result.jobData?.responseMessageId;
-  const conversationId = result.jobData?.conversationId;
+  const responseMessageId = result?.jobData?.responseMessageId || job.metadata?.responseMessageId;
+  const conversationId = result?.jobData?.conversationId || job.metadata?.conversationId;
   if (responseMessageId) {
     const removed = await Message.findOneAndDelete({
       user: userId,
@@ -858,6 +892,14 @@ router.post('/stream/:streamId/cancel', schedulerAuth, async (req, res) => {
     }
   }
 
+  if (releaseUnconfirmed) {
+    return res.status(202).json({
+      success: false,
+      cancelled: streamId,
+      reason: 'release_unconfirmed',
+      capacityReleased: false,
+    });
+  }
   return res.json({ success: true, cancelled: streamId });
 });
 
@@ -884,7 +926,22 @@ router.post('/telegram/resolve', schedulerAuth, async (req, res) => {
       return res.status(404).json({ error: 'Telegram mapping not found' });
     }
 
+    let voiceRoute = null;
+    let speechUnavailable;
+    if (req.body?.resolveVoice !== false) {
+      try {
+        voiceRoute = await resolveUserVoiceRoute(userId, { includeSources: true });
+      } catch (err) {
+        logger.warn(
+          '[VIVENTIUM][scheduler/telegram] Speaking route unavailable',
+          schedulerSafeFailure(err),
+        );
+        speechUnavailable = 'voice_route_unavailable';
+      }
+    }
     return res.json({
+      voiceRoute,
+      ...(speechUnavailable ? { speech_unavailable: speechUnavailable } : {}),
       telegram_user_id: telegramUserId,
       telegram_chat_id: telegramUserId,
       linked: true,
@@ -898,7 +955,9 @@ router.post('/telegram/resolve', schedulerAuth, async (req, res) => {
       '[VIVENTIUM][scheduler/telegram] Failed to resolve mapping',
       schedulerSafeFailure(err),
     );
-    return res.status(500).json({ error: 'Failed to resolve Telegram mapping' });
+    return res
+      .status(500)
+      .json({ error: 'Failed to resolve Telegram mapping', code: 'telegram_mapping_unavailable' });
   }
 });
 

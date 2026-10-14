@@ -400,16 +400,25 @@ function WorkItem({ work }: { work: WorkSummary }) {
         ...(INSTRUCTION_ACTIONS.has(action) ? { instruction: canonicalInstruction } : {}),
       },
       {
-        onSuccess: () => {
+        onSuccess: (result) => {
           clearActionOperation(accountScope, work.workRef, action, canonicalInstruction);
           delete operations.current[action];
           setUncertainAction(null);
+          const notApplied = result?.controlOutcome === 'terminal_won';
           if (INSTRUCTION_ACTIONS.has(action)) {
-            setInstruction('');
+            if (notApplied) {
+              setInstructionExpanded(true);
+            } else {
+              setInstruction('');
+            }
           }
           showToast({
-            message: localize('com_ui_parallel_work_action_accepted'),
-            status: 'success',
+            message: localize(
+              notApplied
+                ? 'com_ui_parallel_work_action_not_applied'
+                : 'com_ui_parallel_work_action_accepted',
+            ),
+            status: notApplied ? 'error' : 'success',
           });
         },
         onError: (error: unknown) => {

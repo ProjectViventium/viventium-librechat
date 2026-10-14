@@ -1,4 +1,5 @@
 /* === VIVENTIUM START === Existing file limits and storage boundary for native outputs. === */
+const { createHash } = require('node:crypto');
 const mockJob = jest.fn();
 const mockCurrent = jest.fn();
 const mockContext = jest.fn();
@@ -12,7 +13,27 @@ const mockOrigin = jest.fn();
 const mockLog = jest.fn();
 const mockPublisher = jest.fn();
 const mockAccountRoute = jest.fn();
+const mockFollowUpBind = jest.fn();
+let mockSourceRows = [],
+  mockSourceFiles = new Map();
+const mockReadSource = jest.fn();
+const mockDownload = jest.fn();
+jest.mock('~/db/models', () => ({
+  Message: {
+    find: jest.fn(() => ({ select: () => ({ lean: async () => mockSourceRows }) })),
+    findOne: (...args) => ({
+      select: () => ({ session: () => ({ lean: async () => mockReadSource(...args) }) }),
+    }),
+  },
+  File: {
+    findOne: (filter) => ({
+      session: () => ({ lean: async () => mockSourceFiles.get(filter.file_id) }),
+    }),
+  },
+}));
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
+  nativeFollowUpOutputFilesForMessage: (...args) => mockFollowUpBind(...args),
   importNativeOutputFiles: (...args) => mockImport(...args),
   createNativeOutputFileFetch: (...args) => mockFetchFactory(...args),
   nativeResponseOrigin: (...args) => mockOrigin(...args),
@@ -31,7 +52,10 @@ jest.mock('@librechat/api', () => ({
     }),
   },
 }));
-jest.mock('@librechat/data-schemas', () => ({ logger: { debug: (...args) => mockLog(...args) } }));
+jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
+  logger: { debug: (...args) => mockLog(...args) },
+}));
 jest.mock('../nativeResponseService', () => ({
   resolveNativeResponseRoute: (...args) => mockRoute(...args),
 }));
@@ -40,7 +64,7 @@ jest.mock('~/models/File', () => ({
   createFile: (...args) => mockCreate(...args),
 }));
 jest.mock('~/server/services/Files/strategies', () => ({
-  getStrategyFunctions: () => ({ saveBuffer: mockSave }),
+  getStrategyFunctions: () => ({ saveBuffer: mockSave, getDownloadStream: mockDownload }),
 }));
 jest.mock('../interactionContext', () => ({
   getTrustedInteractionContext: (...args) => mockContext(...args),
@@ -51,7 +75,41 @@ const {
   prepareNativeOutputFiles,
   prepareCurrentNativeOutputFiles,
   prepareMissionOutputFiles,
+  prepareRetainedNativeOutputFiles,
 } = require('../nativeOutputFiles');
+// Imported File IDs are owned by the exact native envelope and verified descriptor.
+const importedFixture = (envelope, file, identity) => ({
+  file_id: `native_${createHash('sha256')
+    .update(
+      JSON.stringify([
+        envelope.owner_id,
+        envelope.conversation_id,
+        envelope.message_id,
+        envelope.stream_id,
+        envelope.agent_id,
+        envelope.logical_turn_id,
+        envelope.logical_turn_revision,
+        envelope.request_id,
+        envelope.run_id,
+        envelope.attempt_id,
+        file.filename,
+        file.mime_type,
+        file.bytes,
+        file.sha256,
+      ]),
+    )
+    .digest('hex')}`,
+  user: identity.userId,
+  filename: file.filename,
+  type: file.mime_type,
+  bytes: file.bytes,
+  nativeOutputFile: {
+    version: 1,
+    status: 'available',
+    messageId: identity.responseMessageId,
+    downloadUrl: file.download_url,
+  },
+});
 const req = () => ({
   user: { id: 'owner' },
   config: {
@@ -75,6 +133,7 @@ beforeEach(() => {
   });
   mockOrigin.mockReturnValue('current-origin');
   mockFetchFactory.mockReturnValue(jest.fn());
+  mockFollowUpBind.mockReset();
   mockAccountRoute.mockReturnValue({
     baseURL: 'http://127.0.0.1:8766/v1',
     headers: { Authorization: 'Bearer synthetic' },
@@ -96,8 +155,8 @@ test('coalesced mission files retain distinct names for the same bytes and dedup
     outputFiles: source,
     destinations: [{ surface: 'telegram' }],
   };
-  mockImport.mockImplementation(async (value) =>
-    value.files.map((selected) => ({ file_id: selected.filename })),
+  mockImport.mockImplementation(async (value, identity) =>
+    value.files.map((selected) => importedFixture(value, selected, identity)),
   );
   const message = {
     messageId: 'actual-message',
@@ -112,7 +171,7 @@ test('coalesced mission files retain distinct names for the same bytes and dedup
     ],
   };
   const result = await prepareMissionOutputFiles({ req: req(), rows: [row, row], message });
-  expect(result).toEqual([{ file_id: 'result.csv' }, { file_id: 'copy.csv' }]);
+  expect(result.map((file) => file.filename)).toEqual(['result.csv', 'copy.csv']);
   expect(mockImport.mock.calls[0][0].files).toEqual(source.files);
   expect(mockImport.mock.calls[1][0].files).toEqual([]);
   expect(mockAccountRoute).toHaveBeenCalledWith({ ownerId: 'owner' });
@@ -473,4 +532,423 @@ test('bound initial invocation is checked while current unbound graph return sta
     'stream',
   );
   expect(mockImport.mock.calls[1][1].invocationId).toBeUndefined();
+});
+
+/* === VIVENTIUM START === A failed Main file cannot hide accepted callback bytes. === */
+test.each([true, false])(
+  'mission merge prefers only verified Main import: available=%s',
+  async (available) => {
+    const mainGrant = 'https://artifacts.example.test/v1/link-refs/ghr_main1234567890abcdef';
+    const workerGrant = 'https://artifacts.example.test/v1/link-refs/ghr_worker1234567890abcdef';
+    const file = {
+      filename: 'shape.svg',
+      mime_type: 'image/svg+xml',
+      bytes: 20,
+      sha256: 'a'.repeat(64),
+      download_url: mainGrant,
+    };
+    const identity = {
+      userId: 'owner',
+      conversationId: 'conversation',
+      responseMessageId: 'actual-message',
+    };
+    const selected = { envelope: { files: [file] }, identity };
+    const capture = { publisher: { providerId: 'native-provider' } };
+    mockFollowUpBind.mockReturnValue(selected);
+    mockImport.mockImplementation(async (value, owner) =>
+      value.files.map((item) => {
+        if (item.download_url === mainGrant && !available)
+          return {
+            filename: item.filename,
+            nativeOutputFile: {
+              version: 1,
+              status: 'unavailable',
+              code: 'native_output_file_content_mismatch',
+            },
+          };
+        return importedFixture(value, item, owner);
+      }),
+    );
+    const rows = [
+      {
+        outputFiles: {
+          files: [{ ...file, download_url: workerGrant }],
+          callback_id: 'callback',
+          run_id: 'worker-run',
+          attempt_id: 'worker-attempt',
+        },
+      },
+    ];
+    const message = {
+      messageId: 'actual-message',
+      conversationId: 'conversation',
+      agent_id: 'main',
+    };
+    const result = await prepareMissionOutputFiles({
+      req: req(),
+      rows,
+      message,
+      nativeOutputFiles: capture,
+      sourceMessageId: 'accepted-parent',
+    });
+    expect(
+      result
+        .filter((item) => item.nativeOutputFile.status === 'available')
+        .map((item) => item.nativeOutputFile.downloadUrl),
+    ).toEqual([available ? mainGrant : workerGrant]);
+    expect(mockFollowUpBind).toHaveBeenCalledWith(capture, {
+      userId: 'owner',
+      conversationId: 'conversation',
+      sourceMessageId: 'accepted-parent',
+      responseMessageId: 'actual-message',
+      agentId: 'main',
+    });
+    expect(mockRoute).toHaveBeenCalledWith({
+      userId: 'owner',
+      agentId: 'main',
+      providerId: 'native-provider',
+    });
+    expect(mockImport.mock.calls[1][0].files).toHaveLength(available ? 0 : 1);
+  },
+);
+test('invalid Main source refuses only its carrier and still imports valid callback files', async () => {
+  mockFollowUpBind.mockImplementation(() => {
+    throw new Error('native_output_files_identity_invalid');
+  });
+  mockImport.mockImplementation(async (value, owner) =>
+    value.files.map((item) => importedFixture(value, item, owner)),
+  );
+  const result = await prepareMissionOutputFiles({
+    req: req(),
+    nativeOutputFiles: {},
+    sourceMessageId: 'parent',
+    message: { messageId: 'answer', conversationId: 'conversation', agent_id: 'main' },
+    rows: [
+      {
+        outputFiles: {
+          callback_id: 'callback',
+          run_id: 'run',
+          attempt_id: 'attempt',
+          files: [
+            {
+              filename: 'safe.csv',
+              mime_type: 'text/csv',
+              bytes: 20,
+              sha256: 'a'.repeat(64),
+              download_url: 'worker',
+            },
+          ],
+        },
+      },
+    ],
+  });
+  expect(
+    result.some(
+      (item) => item.filename === 'safe.csv' && item.nativeOutputFile.status === 'available',
+    ),
+  ).toBe(true);
+  expect(result[0].nativeOutputFile.status).toBe('unavailable');
+  expect(mockRoute).not.toHaveBeenCalled();
+  expect(mockImport).toHaveBeenCalledTimes(1);
+});
+
+test('imports only Main-selected accepted native observations through the owner File transport', async () => {
+  const item = {
+    kind: 'image',
+    source: 'native_tool_result',
+    run_id: 'run-selected',
+    artifact_ref: `artifact_sha256:${'a'.repeat(64)}`,
+    tool_call_id: 'call-selected',
+    content_index: 0,
+    mime_type: 'image/png',
+    bytes: 67,
+    sha256: 'a'.repeat(64),
+    download_url: 'https://artifacts.example.test/v1/link-refs/ghr_selected12345678',
+    open_url: 'https://artifacts.example.test/v1/link-refs/ghr_selected12345678',
+  };
+  const row = {
+    ownerId: 'owner',
+    runId: item.run_id,
+    attemptId: 'attempt-selected',
+    terminalCallbackId: `cb_terminal_${'d'.repeat(64)}`,
+    originRef: 'origin-selected',
+    workRef: 'work-selected',
+    attemptNumber: 1,
+    terminalCallbackResultKey: `ghtr_${'e'.repeat(64)}`,
+    terminalCallbackAcceptedOperationId: 'f'.repeat(32),
+    terminalCallbackEffectGeneration: 1,
+    terminalCallbackResultRevision: 2,
+    terminalCallbackResultDigest: `sha256:${'b'.repeat(64)}`,
+    nativeMedia: {
+      observations: [
+        item,
+        {
+          ...item,
+          content_index: 1,
+          artifact_ref: `artifact_sha256:${'c'.repeat(64)}`,
+          sha256: 'c'.repeat(64),
+        },
+      ],
+      omitted_count: 0,
+    },
+  };
+  const selectedNativeMedia = [
+    {
+      run_id: item.run_id,
+      tool_call_id: item.tool_call_id,
+      content_index: item.content_index,
+      artifact_ref: item.artifact_ref,
+      label: 'Selected evidence',
+    },
+  ];
+  const message = {
+    conversationId: 'conversation-selected',
+    messageId: 'answer-selected',
+    agent_id: 'main',
+  };
+  mockImport.mockImplementation(async (envelope, identity) =>
+    envelope.files.map((file) => importedFixture(envelope, file, identity)),
+  );
+  const result = await prepareMissionOutputFiles({
+    req: req(),
+    rows: [row],
+    message,
+    selectedNativeMedia,
+  });
+  expect(result).toHaveLength(1);
+  expect(mockImport.mock.calls[0][0]).toMatchObject({
+    run_id: item.run_id,
+    attempt_id: 'attempt-selected',
+    request_id: row.terminalCallbackId,
+    files: [
+      {
+        filename: 'Selected_evidence.png',
+        mime_type: item.mime_type,
+        bytes: item.bytes,
+        sha256: item.sha256,
+        download_url: item.download_url,
+      },
+    ],
+  });
+  expect(mockImport.mock.calls[0][1]).toMatchObject({
+    userId: 'owner',
+    responseMessageId: message.messageId,
+    requestId: row.terminalCallbackId,
+    runId: item.run_id,
+    attemptId: row.attemptId,
+  });
+  expect(mockFetchFactory).toHaveBeenCalledWith(
+    mockAccountRoute.mock.results[0].value,
+    expect.any(String),
+    expect.any(Function),
+  );
+  await expect(
+    prepareMissionOutputFiles({
+      req: req(),
+      rows: [row],
+      message,
+      selectedNativeMedia: [{ ...selectedNativeMedia[0], tool_call_id: 'stale-call' }],
+    }),
+  ).rejects.toThrow('native_media_selection_unavailable');
+  await expect(
+    prepareMissionOutputFiles({
+      req: req(),
+      rows: [{ ...row, ownerId: 'other' }],
+      message,
+      selectedNativeMedia,
+    }),
+  ).rejects.toThrow('native_media_authority_invalid');
+  mockImport.mockClear();
+  expect(await prepareMissionOutputFiles({ req: req(), rows: [row], message })).toEqual([]);
+  expect(mockImport).not.toHaveBeenCalled();
+});
+
+describe('retained owned native File references', () => {
+  function setupRetained() {
+    const bytes = Buffer.from('<svg/>');
+    const file = {
+      filename: 'capture.svg',
+      mime_type: 'image/svg+xml',
+      bytes: bytes.length,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      download_url: 'https://artifacts.example.test/v1/link-refs/ghr_retained1234567890',
+    };
+    const envelope = {
+      version: 1,
+      owner_id: 'owner',
+      conversation_id: 'conversation',
+      message_id: 'old-message',
+      agent_id: 'main',
+      stream_id: 'old-stream',
+      logical_turn_id: '',
+      logical_turn_revision: 1,
+      request_id: 'old-request',
+      run_id: 'old-run',
+      attempt_id: 'old-attempt',
+      invocation_id: '',
+      files: [file],
+    };
+    const nativeIdentity = {
+      userId: 'owner',
+      conversationId: 'conversation',
+      responseMessageId: 'old-message',
+      agentId: 'main',
+      streamId: 'old-stream',
+      logicalTurnId: '',
+      revision: 1,
+      invocationId: '',
+      providerId: 'native-provider',
+      originSha256: 'a'.repeat(64),
+    };
+    const attachment = {
+      ...importedFixture(envelope, file, nativeIdentity),
+      filepath: '/uploads/old.svg',
+      source: 'local',
+    };
+    const stored = {
+      ...attachment,
+      conversationId: 'conversation',
+      messageId: 'old-message',
+      metadata: { fileIdentifier: `native_output_sha256:${attachment.file_id.slice(7)}` },
+    };
+    const candidate = {
+      text: `[Capture](${file.download_url})`,
+      requestId: 'old-request',
+      runId: 'old-run',
+      authoritySha256: 'b'.repeat(64),
+      responseJson: JSON.stringify({ id: 'old-request', glasshive: { output_files: envelope } }),
+    };
+    const row = {
+      user: 'owner',
+      conversationId: 'conversation',
+      messageId: 'old-message',
+      isCreatedByUser: false,
+      unfinished: false,
+      error: false,
+      attachments: [attachment],
+      nativeResponse: {
+        ...nativeIdentity,
+        status: 'completed',
+        candidateJson: JSON.stringify(candidate),
+        authoritySha256: candidate.authoritySha256,
+        candidateSha256: require('@librechat/data-schemas').nativeResponseDigest(candidate),
+      },
+    };
+    mockSourceRows = [row];
+    mockSourceFiles = new Map([[stored.file_id, stored]]);
+    mockReadSource.mockResolvedValue(row);
+    mockFind.mockResolvedValue(stored);
+    mockDownload.mockImplementation(async () =>
+      (async function* () {
+        yield bytes;
+      })(),
+    );
+    process.env.GLASSHIVE_ARTIFACT_BASE_URL = 'https://artifacts.example.test';
+    mockFollowUpBind.mockImplementation((capture, destination) => ({
+      envelope: { ...capture.envelope, message_id: destination.responseMessageId },
+      identity: {
+        ...capture.identity,
+        ...capture.publisher,
+        responseMessageId: destination.responseMessageId,
+      },
+    }));
+    mockImport.mockImplementation(async (projected, identity, options) => {
+      const response = await options.fetchFile(projected.files[0].download_url);
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes);
+      return projected.files.map((item) => ({
+        ...importedFixture(projected, item, identity),
+        filepath: '/uploads/new.svg',
+        source: 'local',
+      }));
+    });
+    return {
+      row,
+      file,
+      stored,
+      text: candidate.text,
+      identity: {
+        ...nativeIdentity,
+        responseMessageId: 'new-message',
+        requestId: 'new-request',
+        runId: 'new-run',
+      },
+    };
+  }
+  test('imports original stored bytes into current message and rechecks exact source at publication', async () => {
+    const fixture = setupRetained();
+    const result = await prepareRetainedNativeOutputFiles(req(), fixture.identity, fixture.text);
+    expect(result.imports).toHaveLength(1);
+    expect(result.imports[0].identity).toMatchObject({
+      responseMessageId: 'new-message',
+      requestId: 'old-request',
+      runId: 'old-run',
+    });
+    expect(result.imports[0].attachments[0].nativeOutputFile.messageId).toBe('new-message');
+    expect(result.imports[0].attachments[0].file_id).not.toBe(fixture.stored.file_id);
+    expect(mockRoute).not.toHaveBeenCalled();
+    expect(mockDownload).toHaveBeenCalledWith(expect.anything(), '/uploads/old.svg');
+    await expect(
+      result.authorizePublication({ inTransaction: () => true }),
+    ).resolves.toBeUndefined();
+  });
+  test.each(['deleted', 'candidate_changed', 'file_missing', 'file_source_changed'])(
+    'revokes publication when original %s',
+    async (kind) => {
+      const fixture = setupRetained();
+      const result = await prepareRetainedNativeOutputFiles(req(), fixture.identity, fixture.text);
+      if (kind === 'deleted') mockReadSource.mockResolvedValue(null);
+      if (kind === 'candidate_changed') fixture.row.nativeResponse.candidateSha256 = 'f'.repeat(64);
+      if (kind === 'file_missing') mockSourceFiles.clear();
+      if (kind === 'file_source_changed') fixture.stored.filepath = '/uploads/replaced.svg';
+      await expect(result.authorizePublication({ inTransaction: () => true })).rejects.toThrow(
+        'native_output_files_retained_source_invalid',
+      );
+    },
+  );
+  test('preserves unrelated links and ignores unverified old attachment claims', async () => {
+    const fixture = setupRetained();
+    fixture.row.nativeResponse.status = 'failed';
+    const result = await prepareRetainedNativeOutputFiles(req(), fixture.identity, fixture.text);
+    expect(result.imports).toHaveLength(0);
+    expect(mockImport).not.toHaveBeenCalled();
+    const unrelated = await prepareRetainedNativeOutputFiles(
+      req(),
+      fixture.identity,
+      '[Reference](https://www.example.test)',
+    );
+    expect(unrelated.imports).toHaveLength(0);
+  });
+  test('the shared Phase B mission consumer imports a retained grant without a new file envelope', async () => {
+    const fixture = setupRetained();
+    const result = await prepareMissionOutputFiles({
+      req: req(),
+      rows: [],
+      message: {
+        messageId: 'new-message',
+        conversationId: 'conversation',
+        agent_id: 'main',
+        text: fixture.text,
+      },
+    });
+    expect(result.attachments).toHaveLength(1);
+    expect(result.attachments[0].nativeOutputFile.messageId).toBe('new-message');
+    expect(mockImport).toHaveBeenCalledTimes(1);
+    await expect(
+      result.authorizePublication({ inTransaction: () => true }),
+    ).resolves.toBeUndefined();
+  });
+  test('deduplicates a newly emitted identical file before retained import', async () => {
+    const fixture = setupRetained();
+    const originalEnvelope = JSON.parse(
+      JSON.parse(fixture.row.nativeResponse.candidateJson).responseJson,
+    ).glasshive.output_files;
+    const targetEnvelope = { ...originalEnvelope, message_id: 'new-message' };
+    const targetIdentity = { ...fixture.identity, requestId: 'old-request', runId: 'old-run' };
+    const attachment = importedFixture(targetEnvelope, fixture.file, targetIdentity);
+    const result = await prepareRetainedNativeOutputFiles(req(), fixture.identity, fixture.text, [
+      { envelope: targetEnvelope, identity: targetIdentity, attachments: [attachment] },
+    ]);
+    expect(result.imports).toHaveLength(0);
+    expect(mockImport).not.toHaveBeenCalled();
+  });
 });

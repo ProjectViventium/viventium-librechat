@@ -5,7 +5,7 @@ const {
   GenerationJobManager,
   authoringOrchestrationReadiness,
   configureOrchestrationReadiness,
-  observeOrchestrationOwner,
+  observeOrchestrationOwner: observeNativeOrchestrationOwner,
   orchestrationDeploymentReadinessSnapshot,
   orchestrationReadinessSnapshot,
   parallelWorkRequested,
@@ -18,7 +18,7 @@ const {
 const { findUser } = require('~/models');
 const { getAgent } = require('~/models/Agent');
 const { checkPermission } = require('~/server/services/PermissionService');
-const { requestAccountApi } = require('./GlassHiveAccountService');
+const { getActiveWorkSnapshot, requestAccountApi } = require('./GlassHiveAccountService');
 const { promptLayerIntegritySnapshot } = require('./promptFrameTelemetry');
 
 configureOrchestrationReadiness({
@@ -30,6 +30,15 @@ configureOrchestrationReadiness({
   requestAccountApi,
   promptLayerIntegritySnapshot,
 });
+
+function observeOrchestrationOwner(ownerId) {
+  const snapshot = observeNativeOrchestrationOwner(ownerId);
+  const normalizedOwnerId = String(ownerId || '').trim();
+  if (normalizedOwnerId && parallelWorkRequested()) {
+    void getActiveWorkSnapshot({ ownerId: normalizedOwnerId }).catch(() => undefined);
+  }
+  return snapshot;
+}
 
 module.exports = {
   authoringOrchestrationReadiness,

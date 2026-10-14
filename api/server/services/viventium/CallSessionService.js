@@ -38,6 +38,7 @@ const {
   resolveVoiceModelParameters,
 } = require('./voiceLlmOverride');
 const { rewriteAgentForRuntime } = require('../../../../scripts/viventium-agent-runtime-models');
+const { observeOrchestrationOwner } = require('./GlassHiveOrchestrationReadinessService');
 
 const DEFAULT_TTL_MS = 15 * 60 * 1000; // 15 minutes
 // Keep terminal call/speaker authority evidence through the maximum supported task-owner callback
@@ -710,6 +711,7 @@ async function createCallSession({ userId, agentId, conversationId, ttlMs }) {
     throw error;
   }
 
+  observeOrchestrationOwner(userId);
   const contextualKeyterms = await resolveVoiceContextKeyterms({ userId, conversationId });
 
   const callSessionId = crypto.randomUUID();

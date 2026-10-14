@@ -413,6 +413,74 @@ describe('getDefaultHandlers voice reasoning guard', () => {
     logger = require('@librechat/data-schemas').logger;
   });
 
+  test.each([null, 'stream-consultant'])(
+    'hidden consultant emits the shared agent update envelope (%s)',
+    async (streamId) => {
+      const aggregateContent = jest.fn();
+      const res = {};
+      const handlers = getDefaultHandlers({
+        req: { body: {} },
+        res,
+        aggregateContent,
+        toolEndCallback: jest.fn(),
+        collectedUsage: [],
+        streamId,
+      });
+      const step = {
+        id: 'step-consultant',
+        runId: 'response-owner',
+        index: 3,
+        agentId: 'agent-consultant',
+        stepDetails: { type: 'message_creation' },
+      };
+      await handlers[GraphEvents.ON_RUN_STEP].handle(GraphEvents.ON_RUN_STEP, step, {
+        hide_sequential_outputs: true,
+        visible_agent_ids: ['agent-main'],
+        run_id: 'raced-metadata-run',
+        langgraph_node: 'node_agent-main',
+      });
+      const expected = {
+        event: 'on_agent_update',
+        data: {
+          type: 'agent_update',
+          agent_update: { runId: step.runId, index: step.index, agentId: step.agentId },
+        },
+      };
+      if (streamId) expect(GenerationJobManager.emitChunk).toHaveBeenCalledWith(streamId, expected);
+      else expect(sendEvent).toHaveBeenCalledWith(res, expected);
+      expect(aggregateContent).toHaveBeenCalledWith({ event: GraphEvents.ON_RUN_STEP, data: step });
+    },
+  );
+
+  test.each(['message_creation', 'tool_calls'])(
+    'visible message and hidden tool steps retain their original envelope (%s)',
+    async (type) => {
+      const aggregateContent = jest.fn();
+      const handlers = getDefaultHandlers({
+        req: { body: {} },
+        res: {},
+        aggregateContent,
+        toolEndCallback: jest.fn(),
+        collectedUsage: [],
+        streamId: 'stream-owner',
+      });
+      const step = {
+        id: 'step-original',
+        runId: 'response-owner',
+        index: 2,
+        agentId: type === 'tool_calls' ? 'agent-consultant' : 'agent-main',
+        stepDetails: { type, tool_calls: [] },
+      };
+      await handlers[GraphEvents.ON_RUN_STEP].handle(GraphEvents.ON_RUN_STEP, step, {
+        hide_sequential_outputs: true,
+        visible_agent_ids: ['agent-main'],
+      });
+      const original = { event: GraphEvents.ON_RUN_STEP, data: step };
+      expect(GenerationJobManager.emitChunk).toHaveBeenCalledWith('stream-owner', original);
+      expect(aggregateContent).toHaveBeenCalledWith(original);
+    },
+  );
+
   it('suppresses reasoning deltas for voice-mode streams before emit and aggregation', async () => {
     const aggregateContent = jest.fn();
     const handlers = getDefaultHandlers({

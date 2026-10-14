@@ -64,12 +64,26 @@ export interface IMainSemanticCompaction {
   generatedAt: Date;
 }
 
+/** Server-owned carrier allocation, outside the model's nine semantic fields. */
+export interface IMainCompactionOutputContract {
+  version: 1;
+  consumer: 'accepted_core' | 'conversation_legacy';
+  carrierMaxUtf8Bytes: number;
+  reservedUtf8Bytes: number;
+  maxJsonUtf8Bytes: number;
+  maxSummaryUtf8Bytes: number;
+  maxItemsPerArray: number;
+  maxStringItemUtf8Bytes: number;
+  maxToolIdentityCharacters: number;
+}
+
 export interface IMainContinuityCompactionLease {
   leaseId: string;
   sourceDigest: string;
   sourceTurnKeys: string[];
   claimedAt: Date;
   expiresAt: Date;
+  outputContract?: IMainCompactionOutputContract;
   sourceGeneration?: number;
   throughPosition?: number;
   legacyStateCursor?: string;
@@ -109,6 +123,7 @@ export interface IViventiumMainContinuityState {
   pendingCompactionTurns: IMainContinuityAcceptedTurn[];
   acceptedRevisions: IMainContinuityAcceptedRevision[];
   semanticCompaction: IMainSemanticCompaction | null;
+  semanticCompactionContract?: IMainCompactionOutputContract;
   compactionStatus: MainContinuityCompactionStatus;
   compactionLease: IMainContinuityCompactionLease | null;
   lastCompactionError: string;

@@ -56,7 +56,12 @@ export default function useTextarea({
   });
   const entityName = entity?.name ?? '';
 
-  const isNotAppendable = latestMessage?.error === true && !isAssistant;
+  /* === VIVENTIUM START === Settled agent failures retain their answer without locking the next turn. === */
+  const isNotAppendable =
+    latestMessage?.error === true &&
+    !isAssistant &&
+    !(isAgent && latestMessage.unfinished === false);
+  /* === VIVENTIUM END === */
   // && (conversationId?.length ?? 0) > 6; // also ensures that we don't show the wrong placeholder
 
   useEffect(() => {

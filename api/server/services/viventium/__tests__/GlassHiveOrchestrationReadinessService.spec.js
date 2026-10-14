@@ -1,5 +1,6 @@
 const mockFindUser = jest.fn();
 const mockRequestAccountApi = jest.fn();
+const mockGetActiveWorkSnapshot = jest.fn();
 const mockGetAgent = jest.fn();
 const mockCheckPermission = jest.fn();
 const mockPromptLayerIntegritySnapshot = jest.fn();
@@ -24,6 +25,7 @@ jest.mock('@librechat/api', () => ({
 }));
 jest.mock('../GlassHiveAccountService', () => ({
   requestAccountApi: (...args) => mockRequestAccountApi(...args),
+  getActiveWorkSnapshot: (...args) => mockGetActiveWorkSnapshot(...args),
 }));
 jest.mock('../promptFrameTelemetry', () => ({
   promptLayerIntegritySnapshot: (...args) => mockPromptLayerIntegritySnapshot(...args),
@@ -116,6 +118,31 @@ describe('GlassHiveOrchestrationReadinessService', () => {
       ],
     });
     mockRequestAccountApi.mockResolvedValue(readyCapability());
+    mockGetActiveWorkSnapshot.mockReset().mockResolvedValue({ snapshot: 'fresh', work: [] });
+  });
+
+  test('owner observation starts the existing roster without awaiting it or changing readiness', () => {
+    mockGetActiveWorkSnapshot.mockReturnValue(new Promise(() => {}));
+    const before = orchestrationReadinessSnapshot({ ownerId: 'owner-warm' });
+    const observed = observeOrchestrationOwner('  owner-warm  ');
+    expect(observed.available).toBe(before.available);
+    expect(observed.status).toBe(before.status);
+    expect(mockGetActiveWorkSnapshot).toHaveBeenCalledWith({ ownerId: 'owner-warm' });
+    expect(observed).not.toBeInstanceOf(Promise);
+  });
+
+  test('optional roster warm failure does not reject owner observation', async () => {
+    mockGetActiveWorkSnapshot.mockRejectedValue(new Error('native unavailable'));
+    expect(() => observeOrchestrationOwner('owner-warm-failure')).not.toThrow();
+    await Promise.resolve();
+    expect(mockGetActiveWorkSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  test('empty or disabled owner observation does not start roster work', () => {
+    observeOrchestrationOwner('   ');
+    process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'false';
+    observeOrchestrationOwner('owner-disabled');
+    expect(mockGetActiveWorkSnapshot).not.toHaveBeenCalled();
   });
 
   test.each([

@@ -3,6 +3,7 @@ import type { TMessage } from 'librechat-data-provider';
 /* === VIVENTIUM START === Export the same visible autonomous results and selected branches. === */
 import {
   getMessageBranchChoices,
+  resolveMessageSiblingIndex,
   isTrustedSystemMessageGroup,
   selectVisibleMessageBranches,
 } from '~/utils/noResponseTag';
@@ -40,7 +41,10 @@ export default function useBuildMessageTree() {
         Boolean(candidate),
       );
       const choices = getMessageBranchChoices(sourceMessages);
-      const siblingIdx = choices.length > 1 ? await getSiblingIdx(messageId) : 0;
+      const siblingIdx = resolveMessageSiblingIndex(
+        choices,
+        choices.length > 1 ? await getSiblingIdx(messageId) : 0,
+      );
       const selected = choices[choices.length - siblingIdx - 1] ?? choices[choices.length - 1];
       let visible = sourceMessages;
       if (!branches)

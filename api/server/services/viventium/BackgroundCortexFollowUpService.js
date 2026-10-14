@@ -19,10 +19,14 @@ const {
   createSafeUser,
   createNativeBootstrapFetch,
   createNativeCapacityFetch,
+  captureNativeFollowUpOutputFiles,
+  collectGlassHiveNativeMediaReferences,
   initializeAnthropic,
   initializeOpenAI,
   inspectProviderDeliveryDisposition,
+  inspectProviderDeliveryRanges,
   isAudioDeliveryRequested,
+  nativeFollowUpOutputSource,
   renderGlassHiveNativeMediaLinks,
   resolveEffectiveDeliveryDisposition,
   supportsMessagingDeliveryDisposition,
@@ -142,9 +146,12 @@ const {
 /* === VIVENTIUM START ===
  * Feature: Registry-owned Phase B follow-up prompts.
  * Purpose: Keep follow-up system/user prompt contracts in the prompt registry while retaining
- * inline fallbacks for installs that have not loaded the compiled prompt bundle yet.
+ * required registered prompts for ordinary follow-ups. Primary-mode compatibility is unchanged.
  * === VIVENTIUM END === */
-const { getPromptText } = require('~/server/services/viventium/promptRegistry');
+const {
+  getPromptText,
+  getRequiredPromptText,
+} = require('~/server/services/viventium/promptRegistry');
 const {
   logFeelingsEvent,
   summarizeFeelingCapsulePlacement,
@@ -237,6 +244,7 @@ const MAIN_TURN_CARRIER_HEADERS = new Set([
   'x-viventium-logical-turn-id',
   'x-viventium-logical-turn-revision',
   'x-viventium-visible-message-chain-b64',
+  'x-glasshive-turn-context-b64',
   'x-viventium-audio-eligible',
   'x-glasshive-developer-instruction-tail-b64',
   'x-glasshive-stable-authority-sha256',
@@ -287,6 +295,7 @@ function getFollowUpErrorCode(error) {
 }
 
 function isRetryableFollowUpTransportError(error) {
+  if (getFollowUpErrorCode(error) === 'NATIVE_OUTPUT_FILES_IDENTITY_UNAVAILABLE') return false;
   const status = getFollowUpErrorStatus(error);
   if (status != null) {
     return status === 408 || status === 425 || status === 429 || status >= 500;
@@ -927,6 +936,7 @@ function buildFollowUpDecisionRecord({
     generationFailed: decision?.generationFailed === true,
     movedOnAfterParent: decision?.movedOnAfterParent === true,
     llmResult: decision?.llmResult || 'empty',
+    ...(decision?.nativeSilentDecision === true ? { nativeSilentDecision: true } : {}),
     selectedStrategy: decision?.selectedStrategy || 'none',
     suppressionReason: decision?.suppressionReason || '',
     forceVisibleFollowUp: decision?.forceVisibleFollowUp === true,
@@ -1107,6 +1117,7 @@ function shouldForceVisibleFollowUpForEmptyPrimary({
 
 function resolveFollowUpPersistenceText({
   generatedText = '',
+  nativeSilentDecision = false,
   insightsData,
   forceVisibleFollowUp = false,
   voiceMode = false,
@@ -1129,6 +1140,20 @@ function resolveFollowUpPersistenceText({
   };
 
   let text = String(generatedText || '').trim();
+  // The strict native producer represents authored silence as a completed empty
+  // assistant response with validated model skip controls, rather than prose tags.
+  if (
+    !text &&
+    nativeSilentDecision === true &&
+    generationFailed !== true &&
+    shouldForceVisibleFollowUp !== true
+  ) {
+    decision.nativeSilentDecision = true;
+    decision.llmResult = 'native_silent';
+    decision.selectedStrategy = 'native_silent_suppressed';
+    decision.suppressionReason = 'native_authored_silence';
+    return { text: '', decision };
+  }
   if (surface === 'wing' && shouldForceVisibleFollowUp !== true) {
     decision.llmResult = isNoResponseOnly(text) ? 'nta' : text ? 'generated' : 'empty';
     decision.selectedStrategy = 'wing_surface_suppressed';
@@ -1982,6 +2007,7 @@ async function resolveFollowUpLLMConfig({
         parentMessageId: parentMessageId || req.body?.parentMessageId || '',
         messageId: parentMessageId || req.body?.messageId || '',
         viventiumGlassHiveIdempotencyKey: followUpIdempotencyKey,
+        viventiumStreamId: followUpIdempotencyKey,
       },
     });
     if (customConfig?.apiKey && customConfig?.baseURL) {
@@ -2039,6 +2065,7 @@ async function resolveFollowUpLLMConfig({
             conversationId: conversationId || req.body?.conversationId || '',
             messageId: parentMessageId || req.body?.messageId || '',
             viventiumGlassHiveIdempotencyKey: followUpIdempotencyKey,
+            viventiumStreamId: followUpIdempotencyKey,
           },
         }),
       };
@@ -2301,7 +2328,7 @@ function deduplicateInsights(insights) {
 /* === VIVENTIUM END === */
 
 function isDurableMissionInsight(insight) {
-  return insight?.authority?.kind === 'durable_terminal_callback';
+  return ['durable_terminal_callback', 'durable_work_callback'].includes(insight?.authority?.kind);
 }
 
 function boundMissionInput(insight) {
@@ -2493,55 +2520,14 @@ function formatFollowUpPrompt({
   const recentResponseContext = cleanContinuation
     ? `Here is the earlier response this follow-up belongs to:\n---\n${recentBlock}\n---`
     : `Here is the response you JUST sent to the user:\n---\n${recentBlock}\n---`;
-  const originalUserRequestContext = [
-    'Original user request for interpreting response-shape constraints and any explicit permission for a later continuation:',
-    `---\n${userRequestBlock}\n---`,
-    'Do not answer that request again; use it only to decide whether a concise additive continuation is authorized.',
-  ].join('\n');
   const continuationBlock = cleanContinuation
     ? [
         '## Current Conversation State',
         'The conversation continued after that earlier response. These newer visible messages were exchanged before this follow-up decision:',
         `---\n${cleanContinuation.slice(0, 1800)}\n---`,
-        'Use this newer exchange as the current state. If the background insights are stale, redundant, already resolved, or would interrupt the current flow, respond with {NTA}.',
-        'Only surface information that is still useful now and not already addressed by the newer exchange.',
       ].join('\n\n')
     : '';
-  const fallbackPrompt = [
-    'You are the main AI continuing the same conversation.',
-    'This is NOT a new user message. Do NOT start a new turn.',
-    surfaceRules,
-    '## CRITICAL: Do Not Repeat',
-    originalUserRequestContext,
-    recentResponseContext,
-    continuationBlock,
-    'Background agents provide evidence only. You decide whether there is anything worth surfacing.',
-    'You MUST NOT repeat, rephrase, re-ask, or echo any concrete claim or advice from the response above.',
-    'Sharing the same topic is not enough to call an insight redundant. Compare concrete facts, risks, decisions, and actions: surface a new one even when it concerns the same topic.',
-    'Only respond if the insights contain genuinely NEW information not covered above.',
-    'If an insight contains new factual/contextual material followed by a question, keep the new material and drop the question.',
-    'Use {NTA} only when there is truly no new user-visible content beyond a question or repetition.',
-    'Honor strict output shapes and bounded counts from the original request, unless the user explicitly authorized a conditional later continuation; in that case, surface qualifying new evidence in that authorized continuation.',
-    'If the primary answer already fulfilled a requested count or bound and the user did not explicitly authorize a conditional later continuation, respond with {NTA}; do not append optional secondary items.',
-    '',
-    insightLines ? `Background insights that surfaced after your response:\n${insightLines}` : '',
-    limitationLines
-      ? `Background limitations that surfaced after your response:\n${limitationLines}`
-      : '',
-    '',
-    'Decision:',
-    '- If these insights are redundant or already covered by your recent response -> {NTA}',
-    '- If they add meaningful NEW information -> write a brief continuation that adds ONLY the new parts.',
-    '- On web/telegram text surfaces, preserve helpful structure with short paragraphs and bullet lists instead of flattening everything into one dense paragraph.',
-    '- On voice/playground surfaces, keep it in plain conversational sentences.',
-    '- Never ask the user a new question in this follow-up.',
-    '- If an insight includes a question, drop the question and keep any accompanying factual material.',
-    '- Use {NTA} only when nothing new remains after dropping questions and repetition.',
-    'Do not mention internal systems, background processing, or that insights "surfaced".',
-  ]
-    .filter(Boolean)
-    .join('\n\n');
-  return getPromptText('cortex.follow_up_phase_b.user_message', fallbackPrompt, {
+  return getRequiredPromptText('cortex.follow_up_phase_b.user_message', {
     surface_rules: surfaceRules,
     user_request: userRequestBlock,
     recent_response_context: recentResponseContext,
@@ -2555,7 +2541,7 @@ function formatFollowUpPrompt({
 /* === VIVENTIUM START ===
  * Feature: Registry-owned Phase B system prompts.
  * Purpose: Keep the minimal follow-up system prompt contract in source-of-truth Markdown,
- * with identical inline fallbacks when the compiled prompt bundle is not available.
+ * required for ordinary follow-ups, with the existing primary-mode compatibility fallback.
  * === VIVENTIUM END === */
 function buildFollowUpSystemPrompt({
   primaryResponseMode = false,
@@ -2565,34 +2551,29 @@ function buildFollowUpSystemPrompt({
 } = {}) {
   const continuationContract =
     !primaryResponseMode && typeof continuationContext === 'string' && continuationContext.trim()
-      ? 'The conversation may have moved on since the earlier response. Use the newer visible exchange as current state and default to {NTA} unless the background insight is still useful now.'
+      ? 'The conversation continued after the earlier response. Newer visible messages are supplied as the current conversation state.'
       : '';
-  const fallbackParts = primaryResponseMode
-    ? [
-        'You are a conversational AI assistant completing a deferred response after a short holding acknowledgement.',
-        'Your sole job: turn the background insights into the primary answer the user should see for this turn.',
-        'Background agents provide evidence only; you decide the user-visible answer.',
-        'Use the insights as grounding, answer directly, and stay surface-appropriate.',
-        'Do not output {NTA} if the insights contain substantive user-visible information.',
-        'Do not re-ask questions, do not mention background processing, and do not introduce yourself.',
-        noResponseInstructions,
-      ]
-    : [
-        'You are a conversational AI assistant continuing an ongoing conversation.',
-        'Your sole job: if background insights contain genuinely new information that was NOT in your recent response, add it in 1-3 natural sentences. Otherwise respond with exactly {NTA}.',
-        'Background agents provide evidence only; you decide whether to surface a follow-up or stay silent with {NTA}.',
-        'Do not re-ask questions, do not repeat concrete content, and do not introduce yourself.',
-        continuationContract,
-        noResponseInstructions,
-      ];
-  const fallback = fallbackParts.filter(Boolean).join('\n\n');
-  const promptId = primaryResponseMode
-    ? 'cortex.follow_up_phase_b.primary_system'
-    : 'cortex.follow_up_phase_b.system';
-  const registeredPrompt = getPromptText(promptId, fallback, {
+  const variables = {
     continuation_contract: continuationContract,
     no_response_instructions: noResponseInstructions || '',
-  });
+  };
+  const registeredPrompt = primaryResponseMode
+    ? getPromptText(
+        'cortex.follow_up_phase_b.primary_system',
+        [
+          'You are a conversational AI assistant completing a deferred response after a short holding acknowledgement.',
+          'Your sole job: turn the background insights into the primary answer the user should see for this turn.',
+          'Background agents provide evidence only; you decide the user-visible answer.',
+          'Use the insights as grounding, answer directly, and stay surface-appropriate.',
+          'Do not output {NTA} if the insights contain substantive user-visible information.',
+          'Do not re-ask questions, do not mention background processing, and do not introduce yourself.',
+          noResponseInstructions,
+        ]
+          .filter(Boolean)
+          .join('\n\n'),
+        variables,
+      )
+    : getRequiredPromptText('cortex.follow_up_phase_b.system', variables);
   return pinViventiumDynamicTailLast({
     instructions: registeredPrompt,
     capsule: feelingCapsule,
@@ -2768,6 +2749,7 @@ async function promoteForcedFollowUpToEmptyParent({
   text,
   telegramDeliveryControls,
   deliveryDisposition,
+  nativeDeliveryContent,
   insightsData,
   forceVisibleFollowUp,
   scheduleId,
@@ -2815,6 +2797,15 @@ async function promoteForcedFollowUpToEmptyParent({
     const nextContent = mergeVisibleTextIntoMessageContent(existing.content, normalizedText, {
       dropErrorParts: true,
     });
+    if (nativeDeliveryContent) {
+      for (const part of nextContent) {
+        if (part.type === 'text' && part.text === normalizedText)
+          part.deliveryDispositionRanges =
+            nativeDeliveryContent[0]?.text === normalizedText
+              ? nativeDeliveryContent[0].deliveryDispositionRanges
+              : [];
+      }
+    }
     const existingViventium = existing.metadata?.viventium || {};
     const {
       deliveryAcknowledgement: _staleAcknowledgement,
@@ -2867,28 +2858,34 @@ async function promoteForcedFollowUpToEmptyParent({
       unfinished: false,
       error: false,
     };
+    let attachmentPreparation;
     if (typeof dependencies.prepareAttachments === 'function') {
-      const attachments = await dependencies.prepareAttachments(promotedMessage);
+      attachmentPreparation = await dependencies.prepareAttachments(promotedMessage);
+      const attachments = Array.isArray(attachmentPreparation)
+        ? attachmentPreparation
+        : attachmentPreparation?.attachments || [];
       if (attachments.length)
         promotedMessage.attachments = [...(existing.attachments || []), ...attachments];
     }
 
-    await db.updateMessage(
-      req,
-      {
-        messageId: parentMessageId,
-        text: normalizedText,
-        content: promotedMessage.content,
-        metadata: nextMetadata,
-        unfinished: false,
-        error: false,
-        ...(promotedMessage.attachments ? { attachments: promotedMessage.attachments } : {}),
-      },
-      {
-        operationKind: 'system',
-        context:
-          'viventium/services/BackgroundCortexFollowUpService.promoteForcedFollowUpToEmptyParent',
-      },
+    await publishPreparedFollowUpAttachments(attachmentPreparation, () =>
+      db.updateMessage(
+        req,
+        {
+          messageId: parentMessageId,
+          text: normalizedText,
+          content: promotedMessage.content,
+          metadata: nextMetadata,
+          unfinished: false,
+          error: false,
+          ...(promotedMessage.attachments ? { attachments: promotedMessage.attachments } : {}),
+        },
+        {
+          operationKind: 'system',
+          context:
+            'viventium/services/BackgroundCortexFollowUpService.promoteForcedFollowUpToEmptyParent',
+        },
+      ),
     );
 
     logger.info(
@@ -2943,6 +2940,10 @@ async function generateFollowUpText({
   conversationId = '',
   parentMessageId = '',
   onDeliveryDisposition,
+  onNativeOutputFiles,
+  onNativeMediaSelection,
+  onNativeDeliveryOutput,
+  onNativeSilentDecision,
 }) {
   if (!agent) {
     return '';
@@ -3045,6 +3046,7 @@ async function generateFollowUpText({
   );
   const audioEligible = supportsDeliveryDisposition && isAudioDeliveryRequested(req);
   let capturedDeliveryDisposition = { status: 'missing' };
+  let nativeFinalOutput;
   if (supportsDeliveryDisposition) {
     llmConfig.configuration = {
       ...(llmConfig.configuration || {}),
@@ -3055,6 +3057,37 @@ async function generateFollowUpText({
     };
     llmConfig.__includeRawResponse = true;
   }
+  const nativeFileSource = nativeFollowUpOutputSource({
+    headers: llmConfig.configuration?.defaultHeaders || {},
+    userId: String(req?.user?.id || ''),
+    conversationId,
+    sourceMessageId: parentMessageId,
+    agentId: `${runtimeAgent.id}:${PHASE_B_PROVIDER_SESSION_LANE}`,
+    presentationAgentId: String(agent.id || ''),
+    providerId: providerName,
+    baseURL: llmConfig.configuration?.baseURL,
+    capability: followUpProviderCapability,
+  });
+  let nativeOutputFiles;
+  let nativeFileStreamed = false;
+  if (nativeFileSource || audioEligible) llmConfig.__includeRawResponse = true;
+  const captureNativeFiles = (value) => {
+    if (!nativeFileSource || nativeOutputFiles?.error) return;
+    try {
+      const captured = captureNativeFollowUpOutputFiles(value, nativeFileSource);
+      if (!captured) return;
+      if (
+        nativeOutputFiles?.identity &&
+        nativeOutputFiles.identity.requestId !== captured.identity.requestId
+      ) {
+        nativeOutputFiles = { error: true };
+        return;
+      }
+      nativeOutputFiles = captured;
+    } catch {
+      nativeOutputFiles = { error: true };
+    }
+  };
   const phaseBFeelingInjection = resolvePhaseBFeelingInjection({
     feelingContext: phaseBFeelingContext,
   });
@@ -3147,14 +3180,38 @@ async function generateFollowUpText({
       tools: [],
       instructions: systemPrompt,
     },
-    ...(audioEligible
+    ...(audioEligible || nativeFileSource
       ? {
           customHandlers: {
+            on_chat_model_start: {
+              handle: () => {
+                nativeOutputFiles = undefined;
+                nativeFileStreamed = false;
+                capturedDeliveryDisposition = { status: 'missing' };
+                nativeFinalOutput = undefined;
+                if (audioEligible && typeof onNativeDeliveryOutput === 'function')
+                  onNativeDeliveryOutput(undefined);
+              },
+            },
+            on_chat_model_stream: {
+              handle: (_event, data) => {
+                captureNativeFiles(data?.chunk);
+                if (nativeOutputFiles) nativeFileStreamed = true;
+              },
+            },
             on_chat_model_end: {
               handle: (_event, data) => {
-                if (Array.isArray(data?.output?.tool_calls) && data.output.tool_calls.length > 0)
+                if (Array.isArray(data?.output?.tool_calls) && data.output.tool_calls.length > 0) {
+                  nativeOutputFiles = undefined;
+                  nativeFinalOutput = undefined;
                   return;
-                capturedDeliveryDisposition = inspectProviderDeliveryDisposition(data?.output);
+                }
+                if (nativeFileSource) nativeFinalOutput = data?.output;
+                if (!nativeFileStreamed) captureNativeFiles(data?.output);
+                if (audioEligible)
+                  capturedDeliveryDisposition = inspectProviderDeliveryDisposition(data?.output);
+                if (audioEligible && typeof onNativeDeliveryOutput === 'function')
+                  onNativeDeliveryOutput(data?.output);
               },
             },
           },
@@ -3177,15 +3234,12 @@ async function generateFollowUpText({
   if (req?.user?.id && conversationId && parentMessageId) {
     try {
       const evidenceService = require('./nativeResponseService').getService();
-      nativeToolEvidence =
-        getTrustedDeliveryPolicy(req)?.commit_authority === 'external_adapter'
-          ? await evidenceService.readToolEvidenceForPresentation(
-              req.user.id,
-              conversationId,
-              parentMessageId,
-              getCortexFollowupGraceMs(),
-            )
-          : await evidenceService.readToolEvidence(req.user.id, conversationId, parentMessageId);
+      nativeToolEvidence = await evidenceService.readToolEvidenceForPresentation(
+        req.user.id,
+        conversationId,
+        parentMessageId,
+        getCortexFollowupGraceMs(),
+      );
     } catch (error) {
       // Accepted worker results carry their own fenced authority. A failed or
       // replaced foreground reply cannot block their delivery; its optional
@@ -3200,7 +3254,9 @@ async function generateFollowUpText({
       );
     }
   }
-  const mediaContent = await buildGlassHiveNativeMediaContent(prompt, insights);
+  const mediaContent = await buildGlassHiveNativeMediaContent(prompt, insights, {
+    ownerId: String(req?.user?.id || ''),
+  });
   const modelContent =
     nativeToolEvidence.length === 0
       ? mediaContent
@@ -3233,17 +3289,37 @@ async function generateFollowUpText({
   }
 
   const rawText = String(text || '').trim();
+  if (typeof onNativeOutputFiles === 'function') onNativeOutputFiles(nativeOutputFiles);
   const deliveryDisposition = resolveEffectiveDeliveryDisposition({
     audioEligible,
     legacySkipVoice: parseDeliveryControls(rawText).skipVoice,
     captured: capturedDeliveryDisposition,
   });
   if (typeof onDeliveryDisposition === 'function') onDeliveryDisposition(deliveryDisposition);
+  if (typeof onNativeSilentDecision === 'function') {
+    const nativeDecision = inspectProviderDeliveryDisposition(nativeFinalOutput);
+    const nativeMessage =
+      nativeFinalOutput?.additional_kwargs?.__raw_response?.choices?.[0]?.message ??
+      nativeFinalOutput?.__raw_response?.choices?.[0]?.message ??
+      nativeFinalOutput?.choices?.[0]?.message ??
+      nativeFinalOutput;
+    onNativeSilentDecision(
+      Boolean(
+        audioEligible &&
+        nativeFileSource &&
+        nativeMessage?.content === '' &&
+        !nativeMessage?.tool_calls?.length &&
+        rawText.length === 0 &&
+        nativeDecision.status === 'valid' &&
+        nativeDecision.disposition.audio === 'skip',
+      ),
+    );
+  }
   if (rawText.length === 0) {
     return '';
   }
   const sanitizedText = sanitizeFollowUpDisplayText(
-    renderGlassHiveNativeMediaLinks(rawText, insights),
+    renderGlassHiveNativeMediaLinks(rawText, insights, { onSelection: onNativeMediaSelection }),
   );
   const normalizedText = normalizeNoResponseText(sanitizedText).trim();
 
@@ -3285,6 +3361,10 @@ async function prepareCortexFollowUpMessage({
   }
   let text = '';
   let deliveryDisposition = null;
+  let nativeDeliveryOutput;
+  let nativeSilentDecision = false;
+  let nativeOutputFiles;
+  const selectedNativeMedia = new Map();
   let generationFailed = false;
   let generationFailure;
   const hasInsights = Array.isArray(insightsData?.insights) && insightsData.insights.length > 0;
@@ -3298,6 +3378,27 @@ async function prepareCortexFollowUpMessage({
       `[BackgroundCortexFollowUpService] Follow-up conversation moved on: conversationId=${conversationId || ''} parent=${parentMessageId || ''} continuationMessages=${continuationContext.messageCount} currentLeaf=${continuationContext.currentLeafMessageId || ''}`,
     );
   }
+  /* === VIVENTIUM START: Terminal synthesis follows the current Native Main author. === */
+  const durableMissionEvidence =
+    hasInsights && insightsData.insights.every(isDurableMissionInsight);
+  let currentMainReadyAfterRelease;
+  if (
+    durableMissionEvidence &&
+    (await require('./nativeResponseService').offerMissionEvidenceToCurrentMain({
+      ownerId: String(req?.user?.id || ''),
+      conversationId,
+      currentLeafMessageId: continuationContext.currentLeafMessageId,
+      messages: conversationMessages,
+      mainAgentId: agent?.id,
+      insights: insightsData.insights,
+      onPending: (recheck) => {
+        currentMainReadyAfterRelease = recheck;
+      },
+    }))
+  ) {
+    return { currentMainPending: true, currentMainReadyAfterRelease };
+  }
+  /* === VIVENTIUM END === */
   const recentResponseResolution = await resolveRecentResponseText({
     req,
     parentMessageId,
@@ -3313,11 +3414,7 @@ async function prepareCortexFollowUpMessage({
   const followUpRecentResponse = isNoResponseOnly(recentResponseResolution.text)
     ? ''
     : recentResponseResolution.text;
-  const durableMissionEvidence =
-    hasInsights &&
-    insightsData.insights.every(
-      (insight) => insight?.authority?.kind === 'durable_terminal_callback',
-    );
+
   // Durable worker results are separate conversation events, even when their
   // original foreground reply failed. Never promote them into that old branch.
   const shouldForceVisibleFollowUp =
@@ -3359,6 +3456,18 @@ async function prepareCortexFollowUpMessage({
         parentMessageId,
         onDeliveryDisposition: (disposition) => {
           deliveryDisposition = disposition;
+        },
+        onNativeDeliveryOutput: (output) => {
+          nativeDeliveryOutput = output;
+        },
+        onNativeSilentDecision: (silent) => {
+          nativeSilentDecision = silent === true;
+        },
+        onNativeOutputFiles: (capture) => {
+          nativeOutputFiles = capture;
+        },
+        onNativeMediaSelection: (selection) => {
+          selectedNativeMedia.set(JSON.stringify(selection), selection);
         },
       });
     } catch (err) {
@@ -3410,6 +3519,7 @@ async function prepareCortexFollowUpMessage({
   const generatedText = text;
   const { text: resolvedText, decision } = resolveFollowUpPersistenceText({
     generatedText,
+    nativeSilentDecision,
     insightsData,
     forceVisibleFollowUp: shouldForceVisibleFollowUp,
     voiceMode,
@@ -3429,7 +3539,43 @@ async function prepareCortexFollowUpMessage({
       segments: delivery.segments,
     };
   }
+  /* === VIVENTIUM START === Native audio choices survive Phase B text projection. === */
+  const nativeDeliveryRanges = nativeDeliveryOutput
+    ? inspectProviderDeliveryRanges(nativeDeliveryOutput, text, (source) => {
+        const projected = sanitizeFollowUpDisplayText(
+          renderGlassHiveNativeMediaLinks(source, insightsData?.insights || []),
+        ).trim();
+        return surface === 'telegram' && !voiceMode
+          ? parseDeliveryControls(projected).cleanText
+          : projected;
+      })
+    : null;
+  const nativeDeliveryContent =
+    nativeDeliveryRanges === null
+      ? undefined
+      : [{ type: 'text', text, deliveryDispositionRanges: nativeDeliveryRanges }];
+  if (nativeDeliveryContent) {
+    deliveryDisposition = {
+      version: 1,
+      audio: nativeDeliveryRanges.some((range) => range.disposition.audio === 'eligible')
+        ? 'eligible'
+        : 'skip',
+      required: true,
+      valid: nativeDeliveryRanges.length > 0,
+      source: nativeDeliveryRanges.length > 0 ? 'model' : 'required_malformed',
+    };
+    if (telegramDeliveryControls) {
+      telegramDeliveryControls.audioContent = nativeDeliveryContent;
+      telegramDeliveryControls.sourceTextSha256 = crypto
+        .createHash('sha256')
+        .update(text)
+        .digest('hex');
+    }
+  }
+  /* === VIVENTIUM END === */
 
+  if (telegramDeliveryControls && deliveryDisposition)
+    telegramDeliveryControls.deliveryDisposition = deliveryDisposition;
   const lateRecoverySuppression = req?.[occupiedCortexRecovery]
     ? await refreshOccupiedCortexRecovery(req, { allowWaiting: true })
     : false;
@@ -3458,6 +3604,7 @@ async function prepareCortexFollowUpMessage({
     text,
     telegramDeliveryControls,
     deliveryDisposition,
+    ...(nativeDeliveryContent ? { nativeDeliveryContent } : {}),
     followUpDecisionRecord,
     conversationMessages,
     finalContinuationContext,
@@ -3465,6 +3612,8 @@ async function prepareCortexFollowUpMessage({
     durableMissionEvidence,
     scheduleId,
     decision,
+    ...(nativeOutputFiles ? { nativeOutputFiles } : {}),
+    ...(selectedNativeMedia.size ? { selectedNativeMedia: [...selectedNativeMedia.values()] } : {}),
   };
 }
 
@@ -3509,6 +3658,18 @@ async function publishCortexVoiceFollowUp({
 }
 /* === VIVENTIUM END === */
 
+async function publishPreparedFollowUpAttachments(preparation, operation) {
+  const authorize = Array.isArray(preparation) ? undefined : preparation?.authorizePublication;
+  if (typeof authorize !== 'function') return operation();
+  return require('./GlassHiveTerminalCallbackTransaction').runGlassHiveTerminalCallbackTransaction(
+    async (session) => {
+      await authorize(session);
+      return operation();
+    },
+    { retry: 'native' },
+  );
+}
+
 async function persistPreparedCortexFollowUpMessage(
   {
     req,
@@ -3536,6 +3697,24 @@ async function persistPreparedCortexFollowUpMessage(
       });
     }
     return null;
+  }
+  if (
+    (prepared.nativeOutputFiles ||
+      (req?.user?.id &&
+        collectGlassHiveNativeMediaReferences(String(prepared.text || '')).length)) &&
+    typeof dependencies.prepareAttachments !== 'function'
+  ) {
+    dependencies = {
+      ...dependencies,
+      prepareAttachments: (message) =>
+        require('./nativeOutputFiles').prepareMissionOutputFiles({
+          req,
+          rows: [],
+          message,
+          sourceMessageId: parentMessageId,
+          nativeOutputFiles: prepared.nativeOutputFiles,
+        }),
+    };
   }
   const {
     voiceTaskId,
@@ -3586,6 +3765,7 @@ async function persistPreparedCortexFollowUpMessage(
     text,
     telegramDeliveryControls,
     deliveryDisposition,
+    nativeDeliveryContent: prepared.nativeDeliveryContent,
     insightsData,
     forceVisibleFollowUp: shouldForceVisibleFollowUp,
     scheduleId,
@@ -3662,7 +3842,15 @@ async function persistPreparedCortexFollowUpMessage(
     viventium: {
       type: 'cortex_followup',
       ...(deliveryDisposition ? { deliveryDisposition } : {}),
-      ...(durableMissionEvidence === true ? { followUpSource: 'durable_terminal_callback' } : {}),
+      ...(durableMissionEvidence === true
+        ? {
+            followUpSource: insightsData.insights.every(
+              (insight) => insight.authority?.kind === 'durable_terminal_callback',
+            )
+              ? 'durable_terminal_callback'
+              : 'durable_work_callback',
+          }
+        : {}),
       parentMessageId,
       cortexCount: insightsData?.cortexCount ?? undefined,
       replacedParentMessage: false,
@@ -3693,12 +3881,22 @@ async function persistPreparedCortexFollowUpMessage(
     model,
     agent_id: agent?.id,
     text,
+    ...(prepared.nativeDeliveryContent ? { content: prepared.nativeDeliveryContent } : {}),
     isCreatedByUser: false,
     metadata,
   };
   if (typeof dependencies.prepareAttachments === 'function') {
-    const attachments = await dependencies.prepareAttachments(followUpMessage);
+    const preparation = await dependencies.prepareAttachments(followUpMessage);
+    const attachments = Array.isArray(preparation) ? preparation : preparation?.attachments || [];
     if (attachments.length) followUpMessage.attachments = attachments;
+    if (!Array.isArray(preparation) && typeof preparation?.authorizePublication === 'function') {
+      const saveMessage = dependencies.saveMessage || db.saveMessage;
+      dependencies = {
+        ...dependencies,
+        saveMessage: (...args) =>
+          publishPreparedFollowUpAttachments(preparation, () => saveMessage(...args)),
+      };
+    }
   }
 
   if (deliveryBatch?.claimed?.length) {
@@ -3712,7 +3910,7 @@ async function persistPreparedCortexFollowUpMessage(
     });
     if (persisted.dropped) return null;
   } else
-    await db.saveMessage(req, followUpMessage, {
+    await (dependencies.saveMessage || db.saveMessage)(req, followUpMessage, {
       operationKind: 'system',
       context: 'viventium/services/BackgroundCortexFollowUpService.createCortexFollowUpMessage',
     });

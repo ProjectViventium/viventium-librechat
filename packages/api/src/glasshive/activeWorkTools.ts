@@ -6,6 +6,8 @@
 
 import { tool } from '@librechat/agents/langchain/tools';
 import { z } from 'zod';
+import { nativeQueenInputResponseSchema } from './nativeWorkInput';
+import { projectActiveWorkRoster } from './activeWorkContext';
 import { TOOL_EFFECT_CLASSES, toolEffectMetadata } from '../tools/toolEffectMetadata';
 import {
   ACTIVE_WORK_ACTION_DESCRIPTION,
@@ -79,7 +81,16 @@ export async function readActiveWork(
   >,
 ) {
   if (!ownerId.trim()) throw new Error('active_work_owner_required');
-  const parsed = listSchema.parse(input);
+  const validated = listSchema.safeParse(input);
+  if (!validated.success) {
+    const explanation = validated.error.issues.find(
+      (issue) => issue.code === z.ZodIssueCode.custom,
+    )?.message;
+    throw Object.assign(new Error(explanation || 'Invalid active-work arguments'), {
+      code: 'active_work_arguments_invalid',
+    });
+  }
+  const parsed = validated.data;
   if (parsed.scope === 'result') {
     return deps.getGlassHiveWorkResult({
       ownerId,
@@ -89,21 +100,50 @@ export async function readActiveWork(
   }
   const readPage =
     parsed.scope === 'history' ? deps.getActiveWorkHistoryPage : deps.getActiveWorkPage;
-  return readPage({ ownerId, cursor: parsed.cursor || '', limit: parsed.limit || 50 });
+  const page = await readPage({ ownerId, cursor: parsed.cursor || '', limit: parsed.limit || 50 });
+  return projectActiveWorkRoster(page, parsed.scope === 'history' ? 'history' : 'active');
 }
 const controlSchema = z
   .object({
     workRef: workRefSchema.describe('Opaque workRef returned by active_work_list'),
-    fileIds: z.array(z.string().min(1).max(256)).min(1).optional(),
+    fileIds: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(256)
+          .refine((id) => id.trim() === id && !!id.trim()),
+      )
+      .optional()
+      .transform((ids) => (ids?.length ? ids : undefined)),
     action: z
       .enum(['queue', 'message', 'steer', 'pause', 'resume', 'stop', 'retry', 'dismiss'])
       .describe(ACTIVE_WORK_ACTION_SEMANTICS),
     instruction: z.string().trim().min(1).max(8000).optional(),
+    nativeInput: nativeQueenInputResponseSchema.optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
-    if (value.fileIds && (!['steer', 'queue', 'message'].includes(value.action) || new Set(value.fileIds).size !== value.fileIds.length)) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['fileIds'], message: 'fileIds require exact unique follow-up file references' });
+    if (
+      value.nativeInput &&
+      (value.instruction || value.action !== 'resume' || value.nativeInput.action !== 'accept')
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['nativeInput'],
+        message: 'nativeInput requires an exact pending response and Resume',
+      });
+    }
+    if (
+      value.fileIds &&
+      (!['steer', 'queue', 'message'].includes(value.action) ||
+        new Set(value.fileIds).size !== value.fileIds.length)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['fileIds'],
+        message: 'fileIds require exact unique follow-up file references',
+      });
     }
     if (['queue', 'message', 'steer'].includes(value.action) && !value.instruction) {
       ctx.addIssue({
@@ -164,6 +204,8 @@ export function createActiveWorkTools(
           ownerId,
           workRef: input.workRef,
           action: input.action,
+          ...(input.nativeInput ? { nativeInput: input.nativeInput } : {}),
+          ...(input.action === 'resume' ? { requestBody } : {}),
           operationId,
           ...(input.fileIds ? { fileIds: input.fileIds, requestBody, serverReq: options.req } : {}),
           ...(requestBody.viventiumVoiceCallSessionId

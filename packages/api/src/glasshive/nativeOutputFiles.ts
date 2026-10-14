@@ -2,7 +2,12 @@
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { z } from 'zod';
-import type { NativeResponseIdentity } from '@librechat/data-schemas';
+import { nativeResponseDigest } from '@librechat/data-schemas';
+import type {
+  NativeResponseIdentity,
+  NativeResponseAdmission,
+  NativeResponseCandidate,
+} from '@librechat/data-schemas';
 import type { NativeResponseRoute } from './nativeResponse';
 import { nativeResponseOrigin } from './nativeResponse';
 import type { TAgentProviderCapability } from 'librechat-data-provider';
@@ -200,6 +205,125 @@ export type NativeOutputFileIdentity = Pick<
   invocationId?: string;
   attemptId?: string;
 };
+export interface NativeFollowUpOutputSource {
+  identity: Omit<NativeOutputFileIdentity, 'requestId'>;
+  presentationAgentId: string;
+  publisher: NativeOutputFilePublisherIdentity;
+}
+export interface NativeFollowUpOutputFiles extends NativeFollowUpOutputSource {
+  envelope: NativeOutputFiles;
+  identity: NativeOutputFileIdentity;
+}
+
+/** Snapshot only the host-authored dispatch fields, without retaining authorization headers. */
+export function nativeFollowUpOutputSource({
+  headers,
+  userId,
+  conversationId,
+  sourceMessageId,
+  agentId,
+  presentationAgentId,
+  providerId,
+  baseURL,
+  capability,
+}: {
+  headers: HeadersInit;
+  userId: string;
+  conversationId: string;
+  sourceMessageId: string;
+  agentId: string;
+  presentationAgentId: string;
+  providerId: string;
+  baseURL: string;
+  capability?: Pick<TAgentProviderCapability, 'workspace_binding' | 'conversation_session'>;
+}): NativeFollowUpOutputSource | undefined {
+  const values = new Headers(headers);
+  const streamId = values.get('X-Viventium-Stream-Id') || '';
+  const publisher = nativeOutputFilePublisherFromContext({ providerId, baseURL, capability });
+  if (
+    !publisher ||
+    !userId ||
+    !conversationId ||
+    !sourceMessageId ||
+    !agentId ||
+    !presentationAgentId ||
+    !streamId ||
+    values.get('X-Viventium-User-Id') !== userId ||
+    values.get('X-Viventium-Conversation-Id') !== conversationId ||
+    values.get('X-Viventium-Message-Id') !== sourceMessageId ||
+    values.get('X-GlassHive-Agent-Id') !== agentId ||
+    values.get('X-GlassHive-Idempotency-Key') !== streamId
+  )
+    return undefined;
+  return {
+    identity: {
+      userId,
+      conversationId,
+      responseMessageId: sourceMessageId,
+      agentId,
+      streamId,
+      logicalTurnId: values.get('X-Viventium-Logical-Turn-Id') || '',
+      revision: Number(values.get('X-Viventium-Logical-Turn-Revision') || 1),
+    },
+    presentationAgentId,
+    publisher,
+  };
+}
+
+/** The authenticated emitting response owns request/run/attempt; source authority is host-owned. */
+export function captureNativeFollowUpOutputFiles(
+  value: unknown,
+  source: NativeFollowUpOutputSource,
+): NativeFollowUpOutputFiles | undefined {
+  const carrier = inspectNativeOutputFileCarrier(value);
+  if (!carrier) return undefined;
+  const identity = { ...source.identity, requestId: carrier.requestId };
+  const envelope = normalizeNativeOutputFiles(carrier.envelope, identity);
+  if (!envelope) return undefined;
+  return {
+    ...source,
+    identity: {
+      ...identity,
+      runId: envelope.run_id,
+      attemptId: envelope.attempt_id,
+      invocationId: envelope.invocation_id,
+    },
+    envelope,
+  };
+}
+
+/** Verify the accepted source first; then bind only its message to the authored destination. */
+export function nativeFollowUpOutputFilesForMessage(
+  capture: NativeFollowUpOutputFiles,
+  destination: {
+    userId: string;
+    conversationId: string;
+    sourceMessageId: string;
+    responseMessageId: string;
+    agentId: string;
+  },
+): {
+  envelope: NativeOutputFiles;
+  identity: NativeOutputFileIdentity & NativeOutputFilePublisherIdentity;
+} {
+  if (
+    capture.identity.userId !== destination.userId ||
+    capture.identity.conversationId !== destination.conversationId ||
+    capture.identity.responseMessageId !== destination.sourceMessageId ||
+    capture.presentationAgentId !== destination.agentId ||
+    !destination.responseMessageId
+  )
+    throw error('native_output_files_identity_invalid');
+  const source = normalizeNativeOutputFiles(capture.envelope, capture.identity);
+  if (!source) throw error('native_output_files_invalid');
+  const publisher = publisherIdentity.parse(capture.publisher);
+  const identity = {
+    ...capture.identity,
+    ...publisher,
+    responseMessageId: destination.responseMessageId,
+  };
+  return { envelope: { ...source, message_id: destination.responseMessageId }, identity };
+}
 export interface NativeOutputAttachment {
   user: string;
   file_id: string;
@@ -214,6 +338,7 @@ export interface NativeOutputAttachment {
     status: 'available';
     messageId: string;
     downloadUrl: string;
+    selectedReferences?: string[];
   };
 }
 export interface NativeOutputStoredFile extends Omit<NativeOutputAttachment, 'user'> {
@@ -229,6 +354,48 @@ export interface NativeOutputUnavailableAttachment {
 }
 export type NativeOutputDeliveryAttachment =
   NativeOutputAttachment | NativeOutputUnavailableAttachment;
+export function nativeOutputFileDescriptorKey(file: NativeOutputFile): string {
+  return JSON.stringify([file.filename, file.mime_type, file.bytes, file.sha256]);
+}
+
+/** Only a successful exact owner/message/grant import can replace a callback attachment. */
+export function mergeVerifiedNativeOutputFileImports(
+  envelope: NativeOutputFiles,
+  identity: NativeOutputFileIdentity,
+  imported: NativeOutputDeliveryAttachment[],
+  seen: Set<string>,
+): { attachments: NativeOutputDeliveryAttachment[]; count: number; bytes: number } {
+  const attachments: NativeOutputDeliveryAttachment[] = [];
+  let count = 0;
+  let bytes = 0;
+  for (const attachment of imported) {
+    if (attachment.nativeOutputFile?.status !== 'available' || !('user' in attachment)) {
+      attachments.push(attachment);
+      continue;
+    }
+    const file = envelope.files.find(
+      (item) =>
+        item.filename === attachment.filename &&
+        item.mime_type === attachment.type &&
+        item.bytes === attachment.bytes &&
+        item.download_url === attachment.nativeOutputFile?.downloadUrl &&
+        attachment.file_id === `native_${fileFingerprint(envelope, item)}`,
+    );
+    if (
+      !file ||
+      attachment.user !== identity.userId ||
+      attachment.nativeOutputFile.messageId !== identity.responseMessageId
+    )
+      continue;
+    const key = nativeOutputFileDescriptorKey(file);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    attachments.push(attachment);
+    count += 1;
+    bytes += file.bytes;
+  }
+  return { attachments, count, bytes };
+}
 export interface NativeOutputFileStore {
   find: (fileId: string) => Promise<NativeOutputStoredFile | null>;
   save: (
@@ -411,13 +578,157 @@ function attachment(row: NativeOutputStoredFile): NativeOutputAttachment {
 
 function fileFingerprint(envelope: NativeOutputFiles, file: NativeOutputFile): string {
   return createHash('sha256')
-    .update(JSON.stringify([
-      envelope.owner_id, envelope.conversation_id, envelope.message_id, envelope.stream_id,
-      envelope.agent_id, envelope.logical_turn_id, envelope.logical_turn_revision,
-      envelope.request_id, envelope.run_id, envelope.attempt_id,
-      file.filename, file.mime_type, file.bytes, file.sha256,
-    ]))
+    .update(
+      JSON.stringify([
+        envelope.owner_id,
+        envelope.conversation_id,
+        envelope.message_id,
+        envelope.stream_id,
+        envelope.agent_id,
+        envelope.logical_turn_id,
+        envelope.logical_turn_revision,
+        envelope.request_id,
+        envelope.run_id,
+        envelope.attempt_id,
+        file.filename,
+        file.mime_type,
+        file.bytes,
+        file.sha256,
+      ]),
+    )
     .digest('hex');
+}
+
+/** One canonical File proof serves initial import and retained owned-file delivery. */
+export function nativeOutputStoredFileMatches(
+  envelope: NativeOutputFiles,
+  file: NativeOutputFile,
+  identity: NativeOutputFileIdentity,
+  row: NativeOutputStoredFile | null,
+): row is NativeOutputStoredFile {
+  const fingerprint = fileFingerprint(envelope, file);
+  return Boolean(
+    row &&
+    String(row.user) === identity.userId &&
+    row.file_id === `native_${fingerprint}` &&
+    row.conversationId === identity.conversationId &&
+    row.messageId === identity.responseMessageId &&
+    row.metadata?.fileIdentifier === `native_output_sha256:${fingerprint}` &&
+    row.bytes === file.bytes &&
+    row.type === file.mime_type &&
+    row.filename === file.filename,
+  );
+}
+
+export interface RetainedNativeOutputMessage {
+  user: unknown;
+  conversationId: string;
+  messageId: string;
+  isCreatedByUser: boolean;
+  unfinished?: boolean;
+  error?: boolean;
+  deletedAt?: unknown;
+  expiredAt?: unknown;
+  nativeResponse?: NativeResponseAdmission;
+  attachments?: NativeOutputDeliveryAttachment[];
+}
+
+/** Retained grants are usable only through their canonical completed native source and Files. */
+export function retainedNativeOutputFilesForMessage(
+  row: RetainedNativeOutputMessage,
+  storedFiles: readonly NativeOutputStoredFile[],
+  references: readonly string[],
+  destination: {
+    userId: string;
+    conversationId: string;
+    responseMessageId: string;
+    agentId: string;
+  },
+):
+  | {
+      envelope: NativeOutputFiles;
+      identity: NativeOutputFileIdentity & NativeOutputFilePublisherIdentity;
+      sourceFiles: NativeOutputStoredFile[];
+      sourceMessageId: string;
+      candidateSha256: string;
+    }
+  | undefined {
+  const admission = row.nativeResponse;
+  if (
+    String(row.user) !== destination.userId ||
+    row.conversationId !== destination.conversationId ||
+    row.isCreatedByUser !== false ||
+    row.unfinished === true ||
+    row.error === true ||
+    row.deletedAt ||
+    (row.expiredAt &&
+      (!Number.isFinite(new Date(String(row.expiredAt)).getTime()) ||
+        new Date(String(row.expiredAt)).getTime() <= Date.now())) ||
+    !admission ||
+    admission.status !== 'completed' ||
+    admission.userId !== destination.userId ||
+    admission.conversationId !== row.conversationId ||
+    admission.responseMessageId !== row.messageId
+  )
+    throw error('native_output_files_retained_source_invalid');
+  let candidate: NativeResponseCandidate;
+  let response: { id?: unknown; glasshive?: { output_files?: unknown } };
+  try {
+    candidate = JSON.parse(admission.candidateJson || '');
+    response = JSON.parse(candidate.responseJson);
+  } catch {
+    throw error('native_output_files_retained_source_invalid');
+  }
+  if (
+    nativeResponseDigest(candidate) !== admission.candidateSha256 ||
+    candidate.authoritySha256 !== admission.authoritySha256 ||
+    response.id !== candidate.requestId
+  )
+    throw error('native_output_files_retained_source_invalid');
+  const sourceIdentity = { ...admission, requestId: candidate.requestId, runId: candidate.runId };
+  const source = normalizeNativeOutputFiles(response.glasshive?.output_files, sourceIdentity);
+  if (!source) return undefined;
+  const selected = new Set(references);
+  const sourceFiles: NativeOutputStoredFile[] = [];
+  const files = source.files.filter((file) => {
+    if (!selected.has(file.download_url)) return false;
+    const attachment = row.attachments?.find(
+      (item) =>
+        item.nativeOutputFile?.status === 'available' &&
+        item.nativeOutputFile.messageId === row.messageId &&
+        item.nativeOutputFile.downloadUrl === file.download_url &&
+        'file_id' in item &&
+        storedFiles.some(
+          (stored) =>
+            stored.file_id === item.file_id &&
+            nativeOutputStoredFileMatches(source, file, sourceIdentity, stored),
+        ),
+    );
+    if (!attachment || !('file_id' in attachment))
+      throw error('native_output_files_retained_source_invalid');
+    sourceFiles.push(storedFiles.find((stored) => stored.file_id === attachment.file_id)!);
+    return true;
+  });
+  if (!files.length) return undefined;
+  const capture: NativeFollowUpOutputFiles = {
+    identity: sourceIdentity,
+    envelope: { ...source, files },
+    presentationAgentId: destination.agentId,
+    publisher: publisherIdentity.parse({
+      providerId: admission.providerId,
+      originSha256: admission.originSha256,
+    }),
+  };
+  const rebound = nativeFollowUpOutputFilesForMessage(capture, {
+    ...destination,
+    sourceMessageId: row.messageId,
+  });
+  return {
+    ...rebound,
+    sourceFiles,
+    sourceMessageId: row.messageId,
+    candidateSha256: admission.candidateSha256!,
+  };
 }
 
 /** Capture before SDK concatenation; a merged stream ID is not an invocation identity. */
@@ -552,14 +863,7 @@ export async function importNativeOutputFiles(
         fingerprint,
       };
       const matches = (row: NativeOutputStoredFile) =>
-        String(row.user) === identity.userId &&
-        row.file_id === keys.fileId &&
-        row.conversationId === identity.conversationId &&
-        row.messageId === identity.responseMessageId &&
-        row.metadata?.fileIdentifier === `native_output_sha256:${fingerprint}` &&
-        row.bytes === file.bytes &&
-        row.type === file.mime_type &&
-        row.filename === file.filename;
+        nativeOutputStoredFileMatches(envelope, file, identity, row);
       let row = await options.store.find(keys.fileId);
       if (!row) {
         const bytes = await verifiedBytes(

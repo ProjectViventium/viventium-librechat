@@ -46,6 +46,7 @@ jest.mock('@librechat/agents', () => ({
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  configureOrchestrationMode: jest.fn(),
   projectTrustedNativeInteractionHeaders: jest.fn((_req, headers) => headers ?? {}),
   projectTrustedClientPresentation: jest.fn((body) => body ?? {}),
   trustedUploadedFilesFromRequestBody: jest.fn((body) => body?.files ?? []),
@@ -1371,7 +1372,7 @@ describe('initializeClient handoff capability projection', () => {
     expect(req._viventiumParticipantReconnectRecovery).toBeUndefined();
   });
 
-  test('discloses a participant reconnect once when its configured fallback answers', async () => {
+  test('does not disclose completion when participant fallback only initializes', async () => {
     const handoffAgent = {
       id: 'handoff-agent',
       provider: 'anthropic',
@@ -1420,10 +1421,7 @@ describe('initializeClient handoff capability projection', () => {
       provider: assignment.provider,
       model: assignment.model,
     });
-    expect(req._viventiumParticipantReconnectRecovery).toEqual({
-      provider: 'Anthropic',
-      model: assignment.model,
-    });
+    expect(req._viventiumParticipantReconnectRecovery).toBeUndefined();
   });
 
   test('ignores same-route and invalid handoff fallback candidates without preparing either', async () => {

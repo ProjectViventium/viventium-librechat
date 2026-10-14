@@ -219,3 +219,69 @@ it('does not claim approval from an untyped successful transport response', () =
   fireEvent.click(screen.getByText('com_ui_decline'));
   expect(mockMutate.mock.calls[1][0]).toEqual(mockMutate.mock.calls[0][0]);
 });
+
+it.each(['Which  size?', '__proto__', 'constructor'])(
+  'renders native question options and Other notes without exposing transport JSON: %s',
+  (key) => {
+    const question: PendingNativeWorkInput = {
+      ...input,
+      kind: 'question',
+      runtimeName: 'Native runtime',
+      mode: 'form',
+      runId: 'run-1',
+      attemptId: 'attempt-1',
+      sessionId: 'session-1',
+      expiresAt: '2099-01-01T00:00:00Z',
+      requestedSchema: {
+        type: 'object',
+        required: ['answers'],
+        additionalProperties: false,
+        properties: {
+          answers: {
+            type: 'object',
+            additionalProperties: false,
+            minProperties: 1,
+            maxProperties: 16,
+            properties: {
+              [key]: {
+                type: 'array',
+                title: 'Which size?',
+                uniqueItems: true,
+                minItems: 1,
+                maxItems: 1,
+                items: { type: 'string', enum: ['Small', 'Other'] },
+              },
+            },
+          },
+          annotations: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              [key]: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['notes'],
+                properties: { notes: { type: 'string', minLength: 1, maxLength: 8000 } },
+              },
+            },
+          },
+        },
+      },
+    };
+    render(<NativeWorkInput workRef="work-1" input={question} />);
+    fireEvent.click(screen.getByLabelText('Other'));
+    fireEvent.change(screen.getByLabelText('com_ui_response: Which size?'), {
+      target: { value: 'Custom  exact size' },
+    });
+    fireEvent.submit(screen.getByRole('form'));
+    expect(mockMutate.mock.calls[0][0].nativeInput.content).toEqual({
+      answers: { [key]: ['Other'] },
+      annotations: { [key]: { notes: 'Custom  exact size' } },
+    });
+    expect(screen.queryByText('answers')).not.toBeInTheDocument();
+    const options = mockMutate.mock.calls[0][1];
+    act(() => options.onSuccess({ status: 'pending', confirmationPending: true }));
+    fireEvent.submit(screen.getByRole('form'));
+    expect(mockMutate.mock.calls[1][0]).toEqual(mockMutate.mock.calls[0][0]);
+  },
+);

@@ -8,6 +8,19 @@ notes:
   - Upstream LibreChat/user-managed prompts remain view-only unless explicitly migrated.
 related_config:
   prompts:
+    main.conscious_agent:
+      - worker.conversation_output_contract
+      - worker.conversation_output_rendering
+      - worker.conversation_output_wire_projection
+      - worker.grok_output_projection
+      - worker.grok_output_authority
+    main.tools:
+      - main.native_work_input
+      - worker.conversation_output_contract
+      - worker.conversation_output_rendering
+      - worker.conversation_output_wire_projection
+      - worker.grok_output_projection
+      - worker.grok_output_authority
     worker.safety_checkpoint:
       - worker.compiled_bootstrap
       - worker.native_composition
@@ -23,6 +36,11 @@ related_config:
     worker.grok_mcp_tool_access:
       - worker.compiled_bootstrap
       - worker.native_tool_access
+      - worker.conversation_output_contract
+      - worker.conversation_output_rendering
+      - worker.conversation_output_wire_projection
+      - worker.grok_output_projection
+      - worker.grok_output_authority
     worker.conversation_file_delivery:
       - worker.compiled_bootstrap
       - worker.conversation_composition
@@ -47,6 +65,42 @@ related_config:
       - scheduling.main_agent_tools
       - scheduling.mcp_server
   refs:
+    main.native_work_input:
+      title: Native Queen Current Work Input
+      summary: The existing work-action schema exposes exact native clarification answers and offered single-operation permission choices; server input provenance and the native owner preserve request authority.
+      path: viventium_v0_4/LibreChat/packages/api/src/glasshive/conversationOrchestration.ts
+      selector: ACTIVE_WORK_ACTION_JSON_SCHEMA
+      source: native.current_work_input_contract
+    worker.conversation_output_contract:
+      title: Native Conversation Final Result Contract
+      summary: The code-owned schema describes the final host-graph envelope. Authorized native functions and MCP calls execute through their own protocol before the final result; the parser validates assistant and transfer control pairs.
+      path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/agent_builder_control.py
+      selector: conversation_output_schema
+      source: worker.compiled_prompt_contract
+    worker.conversation_output_rendering:
+      title: Native Final Contract Rendering
+      summary: One deterministic renderer turns the declared final-result schema into native authority text; streaming and final validation consume the same schema.
+      path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/agent_builder_control.py
+      selector: conversation_output_contract_instructions
+      source: worker.compiled_prompt_contract
+    worker.grok_output_projection:
+      title: Grok Final Result Schema Projection
+      summary: Both host and container adapters declare disjoint assistant and graph-transfer controls. Enabled-tool conversations carry that contract in native system authority and a minimal typed wire constraint; restricted conversations keep their original native constrained metadata. Other native adapters retain their supported schema shape.
+      path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/grok_runtime.py
+      selector: _grok_conversation_output_schema
+      source: worker.compiled_prompt_contract
+    worker.conversation_output_wire_projection:
+      title: Native Conversation Wire Constraint
+      summary: The sampler receives only the existing object fields, types, enums and required fields. The complete declared schema and parser retain graph and delivery authority; wire and declared hashes are separate.
+      path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/agent_builder_control.py
+      selector: minimal_conversation_output_schema
+      source: worker.compiled_prompt_contract
+    worker.grok_output_authority:
+      title: Grok Native Final Contract Authority
+      summary: The admitted native-tool-enabled conversation carries the code-owned final-result protocol before its pinned authority tail. Declared controls remain in streaming and final parsing; the sampler receives the minimal typed projection.
+      path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/grok_runtime.py
+      selector: grok_native_authority_instructions
+      source: worker.compiled_prompt_contract
     worker.native_tool_access:
       title: Native Profile MCP Tool Access
       summary: The registered profile fact reaches Worker rules and conversation System instructions only when the existing native MCP projection is nonempty and native tools are enabled; the exact final authority tail stays last.

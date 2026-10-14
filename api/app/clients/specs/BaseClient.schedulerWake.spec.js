@@ -1,8 +1,8 @@
 /* === VIVENTIUM START ===
  * Feature: Scheduling is Main later.
  * Purpose: A trusted scheduler wake omits scheduler transport rows, carries every visible prior
- * answer to Main under the protected-history guard, and fails typed when that source cannot be
- * carried. Interactive turns keep their existing behavior.
+ * answer to Main under the protected-history guard on every later surface, and fails typed when
+ * that visible source cannot be carried.
  * === VIVENTIUM END === */
 const { EModelEndpoint } = require('librechat-data-provider');
 const mockGetMessages = jest.fn();
@@ -17,7 +17,6 @@ const {
 const {
   captureMainContextSnapshot,
   isSchedulerTransportRow,
-  isTrustedSchedulerWake,
 } = require('~/server/services/viventium/ViventiumMainContextService');
 
 const OWNER = 'owner-scheduled';
@@ -101,7 +100,7 @@ function client(req) {
 
 /**
  * What Main actually receives: the agent message builder walks from the current input through the
- * loaded chain, omitting scheduler transport rows by type on a trusted wake (client.js).
+ * loaded chain, omitting scheduler transport rows by their retained type (client.js).
  */
 function carriedToMain(req, history, parentMessageId) {
   const current = {
@@ -113,11 +112,10 @@ function carriedToMain(req, history, parentMessageId) {
     role: 'user',
     text: PROMPT,
   };
-  const trusted = isTrustedSchedulerWake(req);
   return BaseClient.getMessagesForConversation({
     messages: [...history, current],
     parentMessageId: current.messageId,
-    skipCondition: (message) => trusted && isSchedulerTransportRow(message),
+    skipCondition: isSchedulerTransportRow,
   });
 }
 
@@ -192,7 +190,7 @@ test.each([
     'a body that only claims scheduler origin',
     { viventiumOrigin: 'scheduler', viventiumActorKind: 'system' },
   ],
-])('%s on a scheduled thread keeps its existing history and guard', async (_label, body) => {
+])('%s carries all visible scheduled answers through the protected guard', async (_label, body) => {
   mockGetMessages.mockResolvedValue(legacyScheduledThread(10));
   const req = { user: { id: OWNER }, body: { conversationId: CONVERSATION, ...body } };
   const instance = client(req);
@@ -201,7 +199,32 @@ test.each([
   const carried = carriedToMain(req, history, 'hidden-9');
 
   expect(history).toHaveLength(30);
-  expect(carried).toHaveLength(31);
+  expect(carried.map((message) => message.messageId)).toEqual([
+    ...Array.from({ length: 10 }, (_, index) => `answer-${index}`),
+    'current-prompt',
+  ]);
+  expect(instance._viventiumHistoryAncestryV1.skippedMessageIds).toHaveLength(20);
+  expect(admit(req, instance, carried).visibleMessageChain).toHaveLength(11);
+});
+
+test.each([
+  ['foreign origin', { actor_kind: 'system', origin: 'interactive' }],
+  ['foreign actor', { actor_kind: 'external_user', origin: 'scheduler' }],
+  ['untyped input', {}],
+])('an internal input with %s remains protected source', async (_label, interactionContext) => {
+  const rows = legacyScheduledThread(1);
+  rows[0].metadata.viventium.interactionContext = interactionContext;
+  mockGetMessages.mockResolvedValue(rows);
+  const req = { user: { id: OWNER }, body: { conversationId: CONVERSATION } };
+  const instance = client(req);
+  const history = await instance.loadHistory(CONVERSATION, 'hidden-0');
+  const carried = carriedToMain(req, history, 'hidden-0');
+  expect(carried.map((message) => message.messageId)).toEqual([
+    'prompt-0',
+    'answer-0',
+    'current-prompt',
+  ]);
+  expect(instance._viventiumHistoryAncestryV1.skippedMessageIds).toEqual(['hidden-0']);
   expect(() => admit(req, instance, carried)).toThrow(
     expect.objectContaining({ code: 'source_context_unavailable', status: 413 }),
   );

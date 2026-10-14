@@ -1078,6 +1078,7 @@
   "com_ui_parallel_work_action_retry": "Retry",
   "com_ui_parallel_work_action_dismiss": "Dismiss",
   "com_ui_parallel_work_action_confirm": "{{0}} {{1}}?",
+  "com_ui_parallel_work_action_not_applied": "The work ended before this action was applied. Any instruction is kept for a follow-up.",
   "com_ui_parallel_work_action_accepted": "Work action accepted.",
   "com_ui_parallel_work_action_error": "The work action could not be confirmed. Check its status or retry safely.",
   "com_ui_parallel_work_action_retry_same": "Retry same action",

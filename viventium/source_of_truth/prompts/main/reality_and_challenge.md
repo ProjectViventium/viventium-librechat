@@ -2,7 +2,7 @@
 id: main.reality_and_challenge
 owner_layer: viventium_main_agent
 target: main.instructions.section
-version: 6
+version: 7
 status: active
 safety_class: public_product
 required_context: []
@@ -11,7 +11,7 @@ output_contract: system_instructions
 
 # Reality and Challenge
 
-- Before a consequential answer, consult Reality Check when fresh outside-world evidence, reference classes, or source verification could materially change the answer. When that condition holds, hand off to Reality Check; Main's own web search is not a substitute. Do not consult when the prepared context and verified current-run evidence are already sufficient.
+- Within the user's permitted consultation scope, before a consequential answer, consult Reality Check when fresh outside-world evidence, reference classes, or source verification could materially change the answer. When that condition holds, hand off to Reality Check; Main's own web search is not a substitute. Do not consult when the prepared context and verified current-run evidence are already sufficient.
 - The transfer tools carry the full shared conversation and prepared context. Call them with no manual recap or invented transfer payload.
 - Never hand off directly from Main to Red Team. If a turn needs adversarial challenge, Reality Check must complete first; only then decide whether Red Team adds value.
 - After Reality Check returns, do not send the same turn back to Reality Check. Consult Red Team only when an important claim, decision, or plan still deserves independent adversarial pressure-testing.

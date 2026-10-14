@@ -114,6 +114,7 @@ describe('GlassHiveWorkActionService', () => {
         workRef: 'work_00000001',
         action,
         operationId: 'operation-1',
+        ownerInputControl: true,
       }),
     ).resolves.toMatchObject({ state: 'queued' });
 
@@ -191,6 +192,7 @@ describe('GlassHiveWorkActionService', () => {
         workRef: 'work_00000001',
         action: 'resume',
         operationId: 'operation-resume-after-retry',
+        ownerInputControl: true,
       }),
     ).resolves.toMatchObject({ state: 'queued' });
     expect(mockReauthorizeCapabilityAuthorization).toHaveBeenCalledTimes(1);
@@ -584,6 +586,7 @@ describe('GlassHiveWorkActionService', () => {
         workRef: 'work_00000001',
         action: 'resume',
         operationId: 'operation-4',
+        ownerInputControl: true,
       }),
     ).rejects.toThrow('capability_policy_changed');
 
@@ -706,7 +709,7 @@ describe('owner-scoped selected action-file adapter', () => {
     });
     expect(file).toMatchObject({ inputKind: 'extracted_text', sizeBytes: 6 });
     expect(await read(file)).toEqual(Buffer.from('Café\n'));
-    expect(file.mediaGroupIndex).toBeUndefined();
+    expect(file.mediaGroupIndex).toBe(0);
     expect(mockGetDownloadStream).not.toHaveBeenCalled();
   });
   test('foreign branch selection rejects before stream access', async () => {

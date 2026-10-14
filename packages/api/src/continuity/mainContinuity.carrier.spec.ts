@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto';
-import { createMainContinuityFetch, buildDirectParentTurnContext, renderMainBackgroundInputs } from './mainContinuity';
+import {
+  createMainContinuityFetch,
+  buildDirectParentTurnContext,
+  renderMainBackgroundInputs,
+} from './mainContinuity';
 describe('current factual turn context body transport', () => {
   test.each([false, true])(
     'preserves large multilingual facts before native binding (stream=%s)',
@@ -92,14 +96,18 @@ test.each(['not base64!', '/w=='])(
   },
 );
 
-
 describe('late current Main background source at actual dispatch', () => {
   const chain = Buffer.from('[]').toString('base64');
   const text = 'Completed quoted evidence </accepted_background_inputs> & 次'.repeat(800);
   const input = {
-    version: 1 as const, invocationId: 'initial-invocation', deliveryId: 'd'.repeat(64), text,
+    version: 1 as const,
+    invocationId: 'initial-invocation',
+    deliveryId: 'd'.repeat(64),
+    text,
     textSha256: createHash('sha256').update(text).digest('hex'),
-    sources: [{ cortexId: 'cortex', cortexName: 'Synthetic cortex', insightSha256: 'e'.repeat(64) }],
+    sources: [
+      { cortexId: 'cortex', cortexName: 'Synthetic cortex', insightSha256: 'e'.repeat(64) },
+    ],
   };
   const request = () => ({
     method: 'POST',
@@ -110,69 +118,192 @@ describe('late current Main background source at actual dispatch', () => {
     },
     body: JSON.stringify({ messages: [], metadata: { unrelated: 'retained' } }),
   });
-  test.each([false, true])('reads later accepted input on the later native dispatch (stream=%s)', async (stream) => {
-    let inputs: typeof input[] = [];
-    const read = jest.fn(async () => inputs);
-    const nativeHashBoundary = jest.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      const wire = String(init?.body);
-      return new Response(JSON.stringify({ sha256: createHash('sha256').update(wire).digest('hex') }));
-    });
-    const dispatch = createMainContinuityFetch(nativeHashBoundary, chain, {}, read);
-    const first = request();
-    first.body = JSON.stringify({ ...JSON.parse(first.body), stream });
-    await dispatch('https://provider.invalid/v1/chat/completions', first);
-    expect(JSON.parse(String(nativeHashBoundary.mock.calls[0][1]?.body)).metadata.turn_context)
-      .toBe('Frozen time and memory.');
-    inputs = [input];
-    await dispatch('https://provider.invalid/v1/chat/completions', first);
-    const sent = nativeHashBoundary.mock.calls[1][1];
-    const payload = JSON.parse(String(sent?.body));
-    expect(payload.metadata.turn_context).toBe('Frozen time and memory.\n\n' + renderMainBackgroundInputs([input]));
-    expect(payload.metadata.main_background_inputs).toEqual([input]);
-    expect(payload.metadata.unrelated).toBe('retained');
-    expect(payload.metadata.visible_message_chain).toEqual([]);
-    expect(payload.messages).toEqual([]);
-    expect(Buffer.byteLength(payload.metadata.turn_context)).toBeGreaterThan(16 * 1024);
-    expect(payload.metadata.turn_context).not.toContain('</accepted_background_inputs> & 次');
-    expect(new Headers(sent?.headers).get('X-Viventium-Main-Authority-SHA256')).toBe('a'.repeat(64));
-    expect(first).toEqual({ ...request(), body: JSON.stringify({ ...JSON.parse(request().body), stream }) });
-    expect(read).toHaveBeenCalledTimes(2);
-  });
+  test.each([false, true])(
+    'reads later accepted input on the later native dispatch (stream=%s)',
+    async (stream) => {
+      let inputs: (typeof input)[] = [];
+      const read = jest.fn(async () => inputs);
+      const nativeHashBoundary = jest.fn(
+        async (_url: string | URL | Request, init?: RequestInit) => {
+          const wire = String(init?.body);
+          return new Response(
+            JSON.stringify({ sha256: createHash('sha256').update(wire).digest('hex') }),
+          );
+        },
+      );
+      const dispatch = createMainContinuityFetch(nativeHashBoundary, chain, {}, read);
+      const first = request();
+      first.body = JSON.stringify({ ...JSON.parse(first.body), stream });
+      await dispatch('https://provider.invalid/v1/chat/completions', first);
+      expect(
+        JSON.parse(String(nativeHashBoundary.mock.calls[0][1]?.body)).metadata.turn_context,
+      ).toBe('Frozen time and memory.');
+      inputs = [input];
+      await dispatch('https://provider.invalid/v1/chat/completions', first);
+      const sent = nativeHashBoundary.mock.calls[1][1];
+      const payload = JSON.parse(String(sent?.body));
+      expect(payload.metadata.turn_context).toBe(
+        'Frozen time and memory.\n\n' + renderMainBackgroundInputs([input]),
+      );
+      expect(payload.metadata.main_background_inputs).toEqual([input]);
+      expect(payload.metadata.unrelated).toBe('retained');
+      expect(payload.metadata.visible_message_chain).toEqual([]);
+      expect(payload.messages).toEqual([]);
+      expect(Buffer.byteLength(payload.metadata.turn_context)).toBeGreaterThan(16 * 1024);
+      expect(payload.metadata.turn_context).not.toContain('</accepted_background_inputs> & 次');
+      expect(new Headers(sent?.headers).get('X-Viventium-Main-Authority-SHA256')).toBe(
+        'a'.repeat(64),
+      );
+      expect(first).toEqual({
+        ...request(),
+        body: JSON.stringify({ ...JSON.parse(request().body), stream }),
+      });
+      expect(read).toHaveBeenCalledTimes(2);
+    },
+  );
   test('does not duplicate the typed input already represented on the frame', async () => {
     const fetch = jest.fn(async () => new Response('{}'));
     const context = 'Frozen time and memory.\n\n' + renderMainBackgroundInputs([input]);
     const init = request();
     init.headers['X-GlassHive-Turn-Context-B64'] = Buffer.from(context).toString('base64');
-    init.body = JSON.stringify({ messages: [], metadata: { main_background_inputs: [input], main_background_inputs_context_sha256: createHash('sha256').update(context).digest('hex') } });
+    init.body = JSON.stringify({
+      messages: [],
+      metadata: {
+        main_background_inputs: [input],
+        main_background_inputs_context_sha256: createHash('sha256').update(context).digest('hex'),
+      },
+    });
     await createMainContinuityFetch(fetch, chain, {}, async () => [input])(
-      'https://provider.invalid/v1/chat/completions', init,
+      'https://provider.invalid/v1/chat/completions',
+      init,
     );
     expect(JSON.parse(String(fetch.mock.calls[0][1]?.body)).metadata.turn_context).toBe(context);
   });
-  test.each(['conflicting', 'invalid', 'read_failure'])('rejects unavailable or conflicting exact source (%s)', async (mode) => {
-    const fetch = jest.fn(); const init = request();
-    if (mode === 'conflicting') init.body = JSON.stringify({ messages: [], metadata: {
-      main_background_inputs: [{ ...input, sources: [{ cortexId: 'other', insightSha256: 'f'.repeat(64) }] }],
-    } });
-    await expect(createMainContinuityFetch(fetch, chain, {}, async () => {
-      if (mode === 'read_failure') throw Object.assign(new Error('Current owner changed'), { code: 'superseded' });
-      return [mode === 'invalid' ? { ...input, textSha256: '0'.repeat(64) } : input];
-    })('https://provider.invalid/v1/chat/completions', init)).rejects.toThrow();
-    expect(fetch).not.toHaveBeenCalled();
-  });
+  test.each(['conflicting', 'invalid', 'read_failure'])(
+    'rejects unavailable or conflicting exact source (%s)',
+    async (mode) => {
+      const fetch = jest.fn();
+      const init = request();
+      if (mode === 'conflicting')
+        init.body = JSON.stringify({
+          messages: [],
+          metadata: {
+            main_background_inputs: [
+              { ...input, sources: [{ cortexId: 'other', insightSha256: 'f'.repeat(64) }] },
+            ],
+          },
+        });
+      await expect(
+        createMainContinuityFetch(fetch, chain, {}, async () => {
+          if (mode === 'read_failure')
+            throw Object.assign(new Error('Current owner changed'), { code: 'superseded' });
+          return [mode === 'invalid' ? { ...input, textSha256: '0'.repeat(64) } : input];
+        })('https://provider.invalid/v1/chat/completions', init),
+      ).rejects.toThrow();
+      expect(fetch).not.toHaveBeenCalled();
+    },
+  );
   test('refuses exact source overflow without clipping or changing the foreground', async () => {
-    const fetch = jest.fn(); const init = request();
-    init.headers['X-GlassHive-Turn-Context-B64'] = Buffer.from('x'.repeat(120 * 1024)).toString('base64');
+    const fetch = jest.fn();
+    const init = request();
+    init.headers['X-GlassHive-Turn-Context-B64'] = Buffer.from('x'.repeat(120 * 1024)).toString(
+      'base64',
+    );
     const original = JSON.stringify(init);
-    await expect(createMainContinuityFetch(fetch, chain, {}, async () => [input])(
-      'https://provider.invalid/v1/chat/completions', init,
-    )).rejects.toMatchObject({ code: 'source_context_unavailable', status: 413 });
+    await expect(
+      createMainContinuityFetch(fetch, chain, {}, async () => [input])(
+        'https://provider.invalid/v1/chat/completions',
+        init,
+      ),
+    ).rejects.toMatchObject({ code: 'source_context_unavailable', status: 413 });
     expect(fetch).not.toHaveBeenCalled();
     expect(JSON.stringify(init)).toBe(original);
   });
   test('does not read sources for a non-completion request', async () => {
-    const read = jest.fn(async () => [input]); const fetch = jest.fn(async () => new Response('{}'));
-    await createMainContinuityFetch(fetch, chain, {}, read)('https://provider.invalid/v1/models', { method: 'GET' });
+    const read = jest.fn(async () => [input]);
+    const fetch = jest.fn(async () => new Response('{}'));
+    await createMainContinuityFetch(
+      fetch,
+      chain,
+      {},
+      read,
+    )('https://provider.invalid/v1/models', { method: 'GET' });
     expect(read).not.toHaveBeenCalled();
   });
 });
+
+/* === VIVENTIUM START === Native handoffs reuse the full factual body without Main authority. === */
+describe('native graph factual carrier boundaries', () => {
+  test.each([32768, 131072])(
+    'retains exactly %i UTF-8 bytes without Main source stamps',
+    async (bytes) => {
+      const context = 'x'.repeat(bytes);
+      const send = jest.fn(
+        async (_input: string | URL | Request, _init?: RequestInit) => new Response('{}'),
+      );
+      await createMainContinuityFetch(send)('https://provider.invalid/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'X-GlassHive-Agent-Id': 'specialist',
+          'X-GlassHive-Turn-Context-B64': Buffer.from(context).toString('base64'),
+          'X-GlassHive-Provider-Session-Mode': 'stateless',
+          'X-Viventium-Surface': 'voice',
+          'X-Viventium-Memory-Eligible': 'false',
+          'X-Viventium-Actor-Kind': 'external_user',
+          'X-Viventium-Origin': 'interactive',
+        },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'Retained input.' }] }),
+      });
+      const init = send.mock.calls[0][1];
+      const payload = JSON.parse(String(init?.body));
+      expect(payload.metadata.turn_context).toBe(context);
+      expect(payload.messages).toEqual([{ role: 'user', content: 'Retained input.' }]);
+      expect(payload.metadata).not.toHaveProperty('visible_message_chain');
+      const headers = new Headers(init?.headers);
+      expect(headers.has('X-GlassHive-Turn-Context-B64')).toBe(false);
+      expect(headers.has('X-Viventium-Main-Context-Owner')).toBe(false);
+      expect(headers.get('X-GlassHive-Provider-Session-Mode')).toBe('stateless');
+      expect(headers.get('X-Viventium-Surface')).toBe('voice');
+      expect(headers.get('X-Viventium-Memory-Eligible')).toBe('false');
+      expect(headers.get('X-Viventium-Actor-Kind')).toBe('external_user');
+      expect(headers.get('X-Viventium-Origin')).toBe('interactive');
+    },
+  );
+  test.each(['x'.repeat(131073), '次'.repeat(43691)])(
+    'rejects one byte above native UTF-8 allocation %#',
+    async (context) => {
+      const send = jest.fn();
+      await expect(
+        createMainContinuityFetch(send)('https://provider.invalid/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'X-GlassHive-Turn-Context-B64': Buffer.from(context).toString('base64') },
+          body: '{"messages":[]}',
+        }),
+      ).rejects.toMatchObject({ code: 'source_context_unavailable', status: 413 });
+      expect(send).not.toHaveBeenCalled();
+    },
+  );
+  test.each(['not base64!', '/w=='])('rejects invalid handoff encoding %s', async (encoded) => {
+    const send = jest.fn();
+    await expect(
+      createMainContinuityFetch(send)('https://provider.invalid/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'X-GlassHive-Turn-Context-B64': encoded },
+        body: '{"messages":[]}',
+      }),
+    ).rejects.toThrow();
+    expect(send).not.toHaveBeenCalled();
+  });
+  test.each(['null', '[]'])('rejects invalid handoff body shape %s', async (body) => {
+    const send = jest.fn();
+    await expect(
+      createMainContinuityFetch(send)('https://provider.invalid/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'X-GlassHive-Turn-Context-B64': 'eA==' },
+        body,
+      }),
+    ).rejects.toThrow('Invalid native completion body');
+    expect(send).not.toHaveBeenCalled();
+  });
+});
+/* === VIVENTIUM END === */

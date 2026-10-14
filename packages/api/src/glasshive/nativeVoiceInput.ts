@@ -1,18 +1,30 @@
 import { setTimeout } from 'node:timers/promises';
 import { z } from 'zod';
+import { nativeQuestionContent, nativeQuestionFormFromSchema } from './nativeWorkInput';
 
-const nativeInput = z.object({
+const nativeInputIdentity = z.object({
   requestId: z.string().min(1).max(160),
   requestFingerprint: z.string().length(64),
   runId: z.string().min(1).max(160),
   attemptId: z.string().min(1).max(160),
   expiresAt: z.string().datetime({ offset: true }),
   prompt: z.string().min(1).max(8000),
+});
+const nativePermissionInput = nativeInputIdentity.extend({
+  kind: z.literal('permission').optional(),
+  operationTitle: z.string().min(1).max(8000).optional(),
   choices: z
     .array(z.object({ value: z.string().min(1).max(160), label: z.string().min(1).max(160) }))
     .min(1)
     .max(16),
 });
+const nativeQuestionInput = nativeInputIdentity
+  .extend({
+    kind: z.literal('question'),
+    requestedSchema: z.unknown(),
+  })
+  .refine((value) => nativeQuestionFormFromSchema(value.requestedSchema) !== null);
+const nativeInput = z.union([nativePermissionInput, nativeQuestionInput]);
 const nativeState = z.object({
   version: z.literal(1),
   state: z.string(),
@@ -39,6 +51,30 @@ export function createNativeVoiceInputClient({
   const url = (key: string) =>
     `${baseURL.replace(/\/$/, '')}/requests/by-idempotency/${encodeURIComponent(key)}/native-input`;
   return {
+    async isCurrent(key: string, request: NativeVoiceInput) {
+      if (!key || Date.parse(request.expiresAt) <= Date.now()) return false;
+      const response = await fetchImpl(url(key), {
+        headers,
+        redirect: 'error',
+        signal: AbortSignal.timeout(4000),
+      });
+      if (!response.ok) return false;
+      const parsed = nativeState.safeParse(await response.json());
+      if (
+        !parsed.success ||
+        ['completed', 'failed', 'cancelled', 'unsupported'].includes(parsed.data.state)
+      )
+        return false;
+      return parsed.data.pending.some(
+        (pending) =>
+          Date.parse(pending.expiresAt) > Date.now() &&
+          ['requestId', 'requestFingerprint', 'runId', 'attemptId', 'expiresAt', 'prompt'].every(
+            (field) =>
+              pending[field as keyof NativeVoiceInput] === request[field as keyof NativeVoiceInput],
+          ) &&
+          (pending.kind || 'permission') === (request.kind || 'permission'),
+      );
+    },
     async poll({
       key,
       signal,
@@ -92,10 +128,22 @@ export function createNativeVoiceInputClient({
       }
     },
     async submit(key: string, request: NativeVoiceInput, input: string) {
-      if (
-        Date.parse(request.expiresAt) <= Date.now() ||
-        !request.choices.some((choice) => choice.value === input)
-      ) {
+      if (Date.parse(request.expiresAt) <= Date.now()) {
+        throw new Error('native_input_invalid_or_expired');
+      }
+      let nativeResponse = input;
+      if (request.kind === 'question') {
+        const form = nativeQuestionFormFromSchema(request.requestedSchema);
+        let supplied: unknown;
+        try {
+          supplied = JSON.parse(input);
+        } catch {
+          throw new Error('native_input_invalid_or_expired');
+        }
+        const content = form && nativeQuestionContent(supplied, form);
+        if (!content) throw new Error('native_input_invalid_or_expired');
+        nativeResponse = JSON.stringify(content);
+      } else if (!request.choices.some((choice) => choice.value === input)) {
         throw new Error('native_input_invalid_or_expired');
       }
       const response = await fetchImpl(url(key), {
@@ -109,7 +157,7 @@ export function createNativeVoiceInputClient({
           requestFingerprint: request.requestFingerprint,
           runId: request.runId,
           attemptId: request.attemptId,
-          input,
+          input: nativeResponse,
         }),
       });
       if (!response.ok) throw new Error('native_input_rejected');

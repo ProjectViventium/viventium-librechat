@@ -1,5 +1,6 @@
 const {
   applyMainContextAttempt,
+  mainAttemptFactsAuthorityReserveBytes,
   attachMainContextSnapshotMetadata,
   bindMainContextSnapshot,
   buildMainAttemptFactsForAgent,
@@ -653,8 +654,8 @@ describe('ViventiumMainContextService', () => {
       Array.from({ length: count }, (_, index) => ({
         messageId: `source-${String(index).padStart(3, '0')}`,
         parentMessageId: index ? `source-${String(index - 1).padStart(3, '0')}` : '',
-        role: index % 2 ? 'assistant' : 'user',
-        isCreatedByUser: index % 2 === 0,
+        role: index % 2 && index < count - 1 ? 'assistant' : 'user',
+        isCreatedByUser: index % 2 === 0 || index === count - 1,
         text: `Synthetic retained message ${index}.`,
         content: `Synthetic retained message ${index}.`,
         user: 'owner',
@@ -815,8 +816,8 @@ describe('ViventiumMainContextService', () => {
         parentMessageId: index
           ? `00000000-0000-4000-8000-${String(index - 1).padStart(12, '0')}`
           : '',
-        role: index % 2 ? 'assistant' : 'user',
-        isCreatedByUser: index % 2 === 0,
+        role: index % 2 && index < count - 1 ? 'assistant' : 'user',
+        isCreatedByUser: index % 2 === 0 || index === count - 1,
         text: `Synthetic normal accepted message ${index}.`,
         content: `Synthetic normal accepted message ${index}.`,
         user: 'owner',
@@ -2484,13 +2485,29 @@ describe('ViventiumMainContextService', () => {
     ['malformed unfinished', { unfinished: 'true' }],
     ['internal', { metadata: { viventium: { visibility: 'internal' } } }],
     ['role mismatch', { role: 'user' }],
-    ['missing prose', { content: [] }],
   ])('keeps %s rejection for failed visible context', (_case, changes) => {
     const raw = failedCallHistory();
     raw[25] = { ...raw[25], ...changes };
     expect(() => captureFailedCall(raw)).toThrow(
       expect.objectContaining({ code: 'source_context_unavailable', status: 413 }),
     );
+  });
+
+  test('rejects missing formatted failed prose after saved display-text restoration', () => {
+    const raw = failedCallHistory();
+    raw[25] = { ...raw[25], content: [] };
+    expect(() =>
+      captureFailedCall(raw, (messages) => {
+        const altered = [...messages];
+        const failed = altered[altered.length - 2];
+        // The saved display text remains source; erase every formatted prose fallback.
+        expect(failed.content).toEqual([{ type: 'text', text: 'Synthetic source 25.' }]);
+        expect(failed.text).toBe('Synthetic source 25.');
+        altered[altered.length - 2] = { ...failed, content: '', text: '' };
+        return altered;
+      }),
+    ).toThrow(expect.objectContaining({ code: 'source_context_unavailable', status: 413 }));
+    expect(raw[25].text).toBe('Synthetic source 25.');
   });
 
   test.each(['missing', 'truncated', 'reordered'])(
@@ -2677,7 +2694,6 @@ describe('ViventiumMainContextService', () => {
     ['foreign conversation', { conversationId: 'other-conversation' }],
     ['malformed unfinished answer', { unfinished: 'true' }],
     ['internal answer', { metadata: { viventium: { visibility: 'internal' } } }],
-    ['visible text missing from content', { text: 'Prior answer.', content: [] }],
   ])('refuses %s as old accepted Main evidence', (_case, altered) => {
     const prior = {
       user: 'owner-legacy',
@@ -2696,6 +2712,36 @@ describe('ViventiumMainContextService', () => {
           agent: agent(),
           visibleMessages: history,
           messages: history,
+          protectUnreconciledHistory: true,
+        },
+      ),
+    ).toThrow(expect.objectContaining({ code: 'source_context_unavailable', status: 413 }));
+  });
+
+  test('rejects separately saved assistant words missing from the final provider carrier', () => {
+    const prior = {
+      user: 'owner-legacy',
+      conversationId: 'conversation-legacy',
+      messageId: 'old-answer',
+      parentMessageId: '',
+      role: 'assistant',
+      isCreatedByUser: false,
+      text: 'Prior answer.',
+      content: [],
+    };
+    const current = {
+      messageId: 'new-user',
+      parentMessageId: 'old-answer',
+      role: 'user',
+      content: 'Continue.',
+    };
+    expect(() =>
+      captureMainContextSnapshot(
+        { user: { id: 'owner-legacy' }, body: { conversationId: 'conversation-legacy' } },
+        {
+          agent: agent(),
+          visibleMessages: [prior, current],
+          messages: [{ role: 'assistant', content: '' }, current],
           protectUnreconciledHistory: true,
         },
       ),
@@ -3109,7 +3155,7 @@ describe('interrupted authored Main history carrier', () => {
             inputMode: 'voice_call',
             actorTrust: 'verified_speaker',
             nativeResponse: { cancelled: true },
-            mainContext: { agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
+            mainContext: { agentId: 'main', stableAuthoritySha256: 'invalid-legacy-authority' },
           },
         },
       },
@@ -3433,7 +3479,7 @@ describe('completed tool and file history carrier', () => {
         metadata: {
           viventium: {
             nativeResponse: { status: 'unsupported' },
-            mainContext: { agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
+            mainContext: { agentId: 'main', stableAuthoritySha256: 'invalid-legacy-authority' },
           },
         },
       },
@@ -3949,7 +3995,7 @@ describe('completed tool and file history carrier', () => {
 
 describe('ordinary legacy wire carrier', () => {
   const { formatMessage, formatAgentMessages, formatContentStrings } = require('@librechat/agents');
-  const { filterMalformedContentParts } = require('@librechat/api');
+  const { filterMalformedContentParts, buildAgentInstructions } = require('@librechat/api');
   const {
     normalizeUserMessageContent,
     normalizeTextPartsInPayload,
@@ -4146,3 +4192,527 @@ describe('ordinary legacy wire carrier', () => {
     );
   });
 });
+
+test('the pre-snapshot authority allocation covers exact primary and fallback serializers', () => {
+  const req = { user: { id: 'synthetic-owner' }, body: {} };
+  setTrustedInteractionContext(req, {
+    actor_kind: 'system',
+    origin: 'scheduler',
+    surface: 'workbench',
+    conversation_id: 'conversation',
+    logical_turn_id: 'turn',
+    revision: 1,
+  });
+  const agent = {
+    id: 'agent',
+    provider: 'synthetic-provider',
+    model: 'synthetic-model',
+    model_parameters: { reasoning_effort: 'high' },
+    viventiumFallbackLlm: {
+      provider: 'synthetic-fallback',
+      model: 'synthetic-fallback-model',
+      model_parameters: { reasoning_effort: 'high' },
+    },
+  };
+  const reserve = mainAttemptFactsAuthorityReserveBytes(req, agent);
+  for (const selected of [agent, agent.viventiumFallbackLlm]) {
+    const facts = buildMainAttemptFactsForAgent({
+      snapshot: {
+        snapshotSha256: 'a'.repeat(64),
+        logicalTurnId: 'turn',
+        revision: 1,
+        routeFacts: { surface: 'workbench' },
+        feelingsReceipt: {
+          status: 'available',
+          enabled: true,
+          scope: 'conscious_agent',
+          version: 27,
+          snapshotSha256: 'b'.repeat(64),
+        },
+      },
+      agent: selected,
+      attemptNumber: 2,
+      isFallback: selected !== agent,
+      fallbackReason: 'provider_failed',
+    });
+    expect(Buffer.byteLength(renderMainAttemptFactsAuthorityBlock(facts))).toBeLessThanOrEqual(
+      reserve,
+    );
+  }
+});
+
+/* === VIVENTIUM START === Native whole-source courier admission. === */
+describe('native whole-source courier admission', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const vm = require('node:vm');
+  const crypto = require('node:crypto');
+  const ts = require('typescript');
+  const { ContentTypes, Tools } = require('librechat-data-provider');
+  const { formatMessage, formatAgentMessages } = require('@librechat/agents');
+  const { filterMalformedContentParts, buildAgentInstructions } = require('@librechat/api');
+  const normalizer = require('../normalizeTextContentParts');
+  const service = require('../ViventiumMainContextService');
+  const provider = require('../GlassHiveConversationProviderService');
+  const continuity = require('../ViventiumConversationContinuityService');
+  const capability = {
+    context_protocol: 'main_context_v1',
+    native_session_authority: 'stable_authority_v1',
+    time_context_delivery: 'per_turn_header',
+    usage_accounting_scope: 'visible_message_local',
+    workspace_binding: true,
+  };
+  const agent = {
+    id: 'main-agent',
+    provider: 'native-route',
+    model: 'model',
+    instructions: 'Keep all source.',
+    model_parameters: {
+      configuration: { defaultHeaders: { 'X-GlassHive-Agent-Id': 'main-agent' } },
+    },
+  };
+  const request = () => ({
+    user: { id: 'owner' },
+    body: { conversationId: 'conversation' },
+    config: { endpoints: { agents: { providerCapabilities: { 'native-route': capability } } } },
+  });
+  function caller() {
+    const file = path.resolve(__dirname, '../../../controllers/agents/client.js');
+    const ast = ts.createSourceFile(
+      file,
+      fs.readFileSync(file, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const fn = ast.statements.find(
+      (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'nativeWholeHistoryFits',
+    );
+    const strip = ast.statements.find(
+      (node) =>
+        ts.isVariableStatement(node) &&
+        node.declarationList.declarations.some(
+          (declaration) => declaration.name.getText(ast) === 'stripInternalContentParts',
+        ),
+    );
+    const scope = {
+      module: { exports: {} },
+      Buffer,
+      Set,
+      structuredClone,
+      ContentTypes,
+      Tools,
+      ...normalizer,
+      ...provider,
+      ...service,
+      formatMessage,
+      formatAgentMessages,
+      filterMalformedContentParts,
+      buildAgentInstructions,
+    };
+    vm.runInNewContext(
+      strip.getText(ast) + '\n' + fn.getText(ast) + '\nmodule.exports=nativeWholeHistoryFits;',
+      scope,
+    );
+    return scope.module.exports;
+  }
+  function rows(count = 130) {
+    return Array.from({ length: count }, (_, index) => ({
+      user: 'owner',
+      conversationId: 'conversation',
+      messageId: `message-${index}`,
+      parentMessageId: index ? `message-${index - 1}` : '',
+      role: index % 2 && index < count - 1 ? 'assistant' : 'user',
+      isCreatedByUser: index % 2 === 0 || index === count - 1,
+      text: `Exact original ${index}.`,
+      content: `Exact original ${index}.`,
+    }));
+  }
+  function capture(source, { native = true, alter } = {}) {
+    const messages = formatAgentMessages(
+      source.map((message) => ({
+        ...formatMessage({ message: normalizer.normalizeUserMessageContent(message) }),
+        messageId: message.messageId,
+      })),
+    ).messages;
+    alter?.(messages);
+    return service.captureMainContextSnapshot(request(), {
+      agent,
+      messages,
+      visibleMessages: source,
+      nativeBodyCarrier: native,
+      protectUnreconciledHistory: true,
+      historyAncestry: service.traceMainHistoryAncestry({
+        messages: source,
+        headId: source.at(-1).parentMessageId,
+        ownerId: 'owner',
+        conversationId: 'conversation',
+      }),
+    });
+  }
+  test('preserves a full over-header source with native body authority', () => {
+    const source = rows(260);
+    const snapshot = capture(source);
+    expect(snapshot.visibleMessageChain).toHaveLength(source.length);
+    expect(() => capture(source, { native: false })).toThrow();
+  });
+  test('body admission still rejects genuinely missing prior words', () => {
+    expect(() =>
+      capture(rows(), {
+        alter: (messages) => {
+          messages[1].content = 'Lost original.';
+        },
+      }),
+    ).toThrow();
+  });
+  test('body admission still rejects duplicate source identities', () => {
+    const source = rows();
+    source[1].messageId = source[0].messageId;
+    expect(() => capture(source)).toThrow();
+  });
+  test.each(Object.keys(capability))('requires typed native capability %s', (key) => {
+    const req = request();
+    req.config.endpoints.agents.providerCapabilities['native-route'] = {
+      ...capability,
+      [key]: null,
+    };
+    expect(provider.conversationProviderUsesNativeBody(req, agent)).toBe(false);
+  });
+  test('mixed, unknown, and header-only alternates retain header admission', () => {
+    expect(provider.conversationProviderUsesNativeBody(request(), agent)).toBe(true);
+    expect(
+      provider.conversationProviderUsesNativeBody(request(), agent, {
+        alternates: [{ provider: 'unknown' }],
+      }),
+    ).toBe(false);
+    expect(
+      provider.conversationProviderUsesNativeBody(
+        request(),
+        { ...agent, model_parameters: {} },
+        { requireTransport: true },
+      ),
+    ).toBe(false);
+  });
+  test('known internal saved assistant evidence keeps every original part without mutation', () => {
+    const content = [...normalizer.INTERNAL_CONTENT_TYPES].map((type) => ({
+      type,
+      evidence: 'unchanged',
+    }));
+    const source = { isCreatedByUser: false, text: 'Historical evidence.', content };
+    const before = JSON.stringify(source);
+    const projected = normalizer.normalizeUserMessageContent(source);
+    expect(projected.content[0]).toEqual({ type: ContentTypes.TEXT, text: source.text });
+    expect(projected.content.slice(1)).toEqual(content);
+    expect(JSON.stringify(source)).toBe(before);
+  });
+  test.each([
+    { type: ContentTypes.TEXT, text: 'Authored.' },
+    { type: ContentTypes.TOOL_CALL },
+    { type: 'image_url' },
+    { type: 'unknown' },
+    'saved',
+    null,
+  ])('does not inject saved display text into authored or unknown parts %#', (part) => {
+    const source = {
+      isCreatedByUser: false,
+      text: 'Display only.',
+      content: [{ type: ContentTypes.ERROR }, part],
+    };
+    expect(normalizer.normalizeUserMessageContent(source)).toBe(source);
+  });
+  test('actual caller accepts memory receipts and keeps its source byte-exact', () => {
+    const source = rows();
+    source[1].attachments = [{ type: Tools.memory, memory: { type: 'text', value: 'stored' } }];
+    const before = JSON.stringify(source);
+    expect(caller()(request(), agent, source, 20_000, {})).toBe(true);
+    expect(JSON.stringify(source)).toBe(before);
+    source[1].attachments.push({ type: 'unknown' });
+    expect(caller()(request(), agent, source, 20_000, {})).toBe(true);
+  });
+  test('actual caller costs all tool arguments and keeps adjacency and source unchanged', () => {
+    const source = rows();
+    source[1].content = [
+      { type: ContentTypes.TEXT, text: source[1].text, tool_call_ids: ['call'] },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'call',
+          name: 'declared-tool',
+          args: { value: 'x'.repeat(130_000) },
+          output: 'Original tool result.',
+        },
+      },
+    ];
+    const before = JSON.stringify(source);
+    expect(caller()(request(), agent, source, 20_000, {})).toBe(false);
+    expect(JSON.stringify(source)).toBe(before);
+    source[1].content[1].tool_call.args.value = 'small';
+    expect(caller()(request(), agent, source, 20_000, {})).toBe(true);
+    expect(source[1].content[0].tool_call_ids).toEqual(['call']);
+  });
+  test('actual native serializer respects UTF-8 allocation and mandatory reserve', () => {
+    const messages = formatAgentMessages(
+      rows(2).map((message) => ({ ...formatMessage({ message }), messageId: message.messageId })),
+    ).messages;
+    const { _convertMessagesToOpenAIParams } = require(
+      path.join(path.dirname(require.resolve('@librechat/agents')), 'llm/openai/utils/index.cjs'),
+    );
+    const wire = _convertMessagesToOpenAIParams(messages, agent.model);
+    const cost = Buffer.byteLength(
+      JSON.stringify([{ role: 'system', content: agent.instructions }, ...wire]),
+      'utf8',
+    );
+    expect(service.mainHistoryFitsNativeBody(messages, agent, 131072 - cost)).toBe(true);
+    expect(service.mainHistoryFitsNativeBody(messages, agent, 131073 - cost)).toBe(false);
+    messages[0].content = 'é'.repeat(70_000);
+    expect(service.mainHistoryFitsNativeBody(messages, agent, 0)).toBe(false);
+    expect(service.mainHistoryFitsNativeBody(messages, agent, NaN)).toBe(false);
+  });
+  function recordFor(source, through = 99) {
+    const hash = (value) => crypto.createHash('sha256').update(value).digest('hex');
+    const coveredSource = source.slice(0, through + 1).map((row) => ({
+      id: row.messageId,
+      sha256: hash(
+        JSON.stringify([
+          row.messageId,
+          row.isCreatedByUser ? 'user' : 'assistant',
+          service.messageContentText(row),
+        ]),
+      ),
+    }));
+    return {
+      ownerId: 'owner',
+      conversationId: 'conversation',
+      status: 'ready',
+      throughMessageId: source[through].messageId,
+      coveredSource,
+      coveredDigest: hash(JSON.stringify(coveredSource.map((row) => [row.id, row.sha256]))),
+      semanticCompaction: {
+        summary: 'Reviewed history.',
+        salientEvents: [],
+        unresolvedGoals: [],
+        activePlans: [],
+        importantCorrections: [],
+        pendingWork: [],
+        relevantToolPairs: [],
+        feelingsContext: [],
+        currentPosture: [],
+      },
+    };
+  }
+  async function resolve(
+    source,
+    record,
+    canCarryWholeHistory,
+    compaction = { ensureAcceptedMainCompaction: jest.fn(async () => ({ status: 'degraded' })) },
+  ) {
+    const Model = { findOne: jest.fn(() => ({ lean: async () => record })) };
+    let result, error;
+    try {
+      result = await continuity.resolveConversationContinuity({
+        req: request(),
+        agent,
+        ownerId: 'owner',
+        conversationId: 'conversation',
+        orderedMessages: source,
+        Model,
+        MessageModel: {},
+        canCarryWholeHistory,
+        compaction,
+        maxClaims: 1,
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    return { result, error, Model, compaction };
+  }
+  test('reuses valid reviewed prefix rather than expanding full source', async () => {
+    const source = rows(130);
+    const bypass = jest.fn(async () => true);
+    const { result } = await resolve(source, recordFor(source), bypass);
+    expect(result.coveredIds).toHaveLength(100);
+    expect(result.messages).toHaveLength(30);
+    expect(bypass).toHaveBeenCalledWith(result.messages, result.capsule);
+  });
+  test('valid reviewed prefix skips row-count maintenance only when its exact tail and capsule fit', async () => {
+    const source = rows(260);
+    const bypass = jest.fn(async () => true);
+    const { result, compaction } = await resolve(source, recordFor(source), bypass);
+    expect(result.coveredIds).toHaveLength(100);
+    expect(result.messages).toEqual(source.slice(100));
+    expect(bypass).toHaveBeenCalledWith(result.messages, result.capsule);
+    expect(compaction.ensureAcceptedMainCompaction).not.toHaveBeenCalled();
+  });
+  test.each([false, 'true', undefined])(
+    'valid prefix keeps reconciliation when tail capacity is unproved %#',
+    async (fit) => {
+      const source = rows(260);
+      const bypass = jest.fn(async () => fit);
+      const { compaction, error } = await resolve(source, recordFor(source), bypass);
+      expect(error).toBeUndefined();
+      expect(compaction.ensureAcceptedMainCompaction).toHaveBeenCalledTimes(1);
+      expect(bypass).toHaveBeenCalledWith(source.slice(100), expect.any(String));
+    },
+  );
+  test('stale reviewed prefix can carry full lossless source without reusing stale summary', async () => {
+    const source = rows(130);
+    const record = recordFor(source);
+    record.coveredSource[0].sha256 = 'changed';
+    const { result, compaction, Model } = await resolve(source, record, async () => true);
+    expect(result).toBeNull();
+    expect(Model.findOne).toHaveBeenCalledTimes(1);
+    expect(compaction.ensureAcceptedMainCompaction).not.toHaveBeenCalled();
+  });
+  test.each([false, 'true', undefined])(
+    'overflow or non-typed fit retains reviewed reconciliation %#',
+    async (fit) => {
+      const { compaction, error } = await resolve(rows(130), null, async () => fit);
+      expect(error).toBeUndefined();
+      expect(compaction.ensureAcceptedMainCompaction).toHaveBeenCalledTimes(1);
+    },
+  );
+  test('recognizes the current Message-owner stamp and rejects malformed authority', () => {
+    const source = rows();
+    for (const row of source.filter((row) => !row.isCreatedByUser))
+      row.metadata = {
+        viventium: { mainContext: { agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) } },
+      };
+    expect(service.hasUnreconciledMainHistory(source)).toBe(false);
+    source[1].metadata.viventium.mainContext.stableAuthoritySha256 = 'invalid';
+    expect(service.hasUnreconciledMainHistory(source)).toBe(true);
+    source[1].metadata.viventium.mainContext = {
+      agentId: ' ',
+      stableAuthoritySha256: 'a'.repeat(64),
+    };
+    expect(service.hasUnreconciledMainHistory(source)).toBe(true);
+  });
+  test('costs prepared media and file context without dropping historical metadata', () => {
+    const source = rows();
+    source[0].files = [{ file_id: 'source-image', type: 'image/png' }];
+    source[0].image_urls = [
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,' + 'a'.repeat(130_000) } },
+    ];
+    source[1].attachments = [{ type: 'text/plain', file_id: 'completed-output' }];
+    const before = JSON.stringify(source);
+    expect(caller()(request(), agent, source, 20_000, {})).toBe(false);
+    expect(JSON.stringify(source)).toBe(before);
+    source[0].image_urls[0].image_url.url = 'data:image/png;base64,a';
+    expect(caller()(request(), agent, source, 20_000, {})).toBe(true);
+    source[0].fileContext = 'é'.repeat(70_000);
+    expect(caller()(request(), agent, source, 20_000, {})).toBe(false);
+    source[0].fileContext = 'Full source text.';
+    expect(caller()(request(), agent, source, 20_000, {})).toBe(true);
+  });
+  test.each([
+    [{ attachments: Promise.resolve([]) }, {}],
+    [{ attachments: [{ file_id: 'current' }] }, {}],
+    [{ contextHandlers: {} }, {}],
+    [{}, { _telegramImages: [{ type: 'image_url' }] }],
+    [{}, { _gatewayImages: 'malformed' }],
+    [null, {}],
+  ])('pending current hydration cannot select the conservative bypass %#', (pending, changes) => {
+    expect(caller()({ ...request(), ...changes }, agent, rows(), 20_000, pending)).toBeNull();
+  });
+  test('malformed media and mixed routes do not claim a lossless capacity proof', () => {
+    const source = rows();
+    source[0].image_urls = [{ type: 'image_url', image_url: {} }];
+    expect(caller()(request(), agent, source, 20_000, {})).toBeNull();
+    delete source[0].image_urls;
+    source[0].fileContext = {};
+    expect(caller()(request(), agent, source, 20_000, {})).toBeNull();
+    delete source[0].fileContext;
+    expect(
+      caller()(
+        request(),
+        { ...agent, viventiumFallbackLlm: { provider: 'unknown' } },
+        source,
+        20_000,
+        {},
+      ),
+    ).toBeNull();
+  });
+  test('the actual buildMessages callback keeps mixed route capacity unavailable', async () => {
+    const file = path.resolve(__dirname, '../../../controllers/agents/client.js');
+    const ast = ts.createSourceFile(
+      file,
+      fs.readFileSync(file, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    let callback;
+    const visit = (node) => {
+      if (ts.isPropertyAssignment(node) && node.name.getText(ast) === 'canCarryWholeHistory')
+        callback = node.initializer;
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+    expect(callback).toBeDefined();
+    const reserve = jest.fn(async () => ({ reservedContextUtf8Bytes: 0 }));
+    const scope = {
+      module: { exports: {} },
+      req: request(),
+      conversationProviderUsesNativeBody: provider.conversationProviderUsesNativeBody,
+      resolveLegacyOutputCarrier: reserve,
+    };
+    vm.runInNewContext(
+      'module.exports=function(){return (' + callback.getText(ast) + ');};',
+      scope,
+    );
+    const check = scope.module.exports.call({
+      options: { agent: { ...agent, viventiumFallbackLlm: { provider: 'unknown' } } },
+    });
+    expect(await check(rows(), '')).toBeNull();
+    expect(reserve).not.toHaveBeenCalled();
+    const source = rows();
+    for (const row of source.filter((row) => !row.isCreatedByUser))
+      row.metadata = {
+        viventium: { mainContext: { agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) } },
+      };
+    const result = await resolve(source, null, check);
+    expect(result.error).toBeUndefined();
+    expect(result.compaction.ensureAcceptedMainCompaction).not.toHaveBeenCalled();
+  });
+
+  test.each([true, false, null])(
+    'current stamped history retains Native admission for conservative estimate %j',
+    async (fit) => {
+      const source = rows(130);
+      for (const row of source.filter((row) => !row.isCreatedByUser))
+        row.metadata = {
+          viventium: { mainContext: { agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) } },
+        };
+      source.at(-1).image_urls = [
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,' + 'a'.repeat(200_000) } },
+      ];
+      const estimate = jest.fn(async () => fit);
+      const result = await resolve(source, null, estimate);
+      expect(estimate).not.toHaveBeenCalled();
+      expect(result.compaction.ensureAcceptedMainCompaction).not.toHaveBeenCalled();
+      expect(result.error).toBeUndefined();
+    },
+  );
+  test('a pessimistic history estimate retains existing reviewed reconciliation without a new 413', async () => {
+    const source = rows(130);
+    let record = null;
+    const Model = { findOne: jest.fn(() => ({ lean: async () => record })) };
+    const compaction = {
+      ensureAcceptedMainCompaction: jest.fn(async () => {
+        record = recordFor(source, 81);
+        return { status: 'compacted' };
+      }),
+    };
+    const result = await continuity.resolveConversationContinuity({
+      req: request(),
+      agent,
+      ownerId: 'owner',
+      conversationId: 'conversation',
+      orderedMessages: source,
+      Model,
+      MessageModel: {},
+      canCarryWholeHistory: async () => false,
+      compaction,
+    });
+    expect(result.messages).toEqual(source.slice(82));
+    expect(compaction.ensureAcceptedMainCompaction).toHaveBeenCalledTimes(1);
+  });
+});
+/* === VIVENTIUM END === */

@@ -213,6 +213,21 @@ function buildService(fixture = exactFixture()) {
 }
 
 describe('CortexTelegramDeliveryDispatchService', () => {
+  test('retains source-bound native audio controls from the actual persisted presentation', async () => {
+    const fixture = exactFixture();
+    const controls = {
+      skipVoice: false,
+      sourceTextSha256: 'a'.repeat(64),
+      audioContent: [{ type: 'text', text: fixture.followup.text, deliveryDispositionRanges: [] }],
+    };
+    fixture.followup.metadata.viventium.telegramDeliveryControls = controls;
+    const dependencies = buildService(fixture);
+    const deliveries = await dependencies.service.claimPending({ limit: 1, leaseMs: 120_000 });
+    expect(deliveries[0].deliveryControls).toEqual(controls);
+    expect(deliveries[0].text).toBe(fixture.followup.text);
+    expect(deliveries[0].cortexClaim.messageId).toBe(fixture.persistedMessageId);
+  });
+
   test('claims one persisted Telegram-missing presentation with exact durable authority', async () => {
     const fixture = exactFixture();
     const dependencies = buildService(fixture);

@@ -256,6 +256,40 @@ class DispatchWorkbenchTests(unittest.TestCase):
         self.assertEqual(bundle['env']['WPR_MODEL_HOST_CODEX_CLI'], 'gpt-stale')
         self.assertEqual(bundle['env']['WPR_CODEX_CLI_REASONING_EFFORT'], 'high')
 
+    def test_claude_effort_preserves_supported_explicit_choices_without_compiled_policy(self):
+        with patch.dict(os.environ, {'WPR_CLAUDE_CODE_EFFORT': ''}):
+            for effort in ('default', 'low', 'medium', 'high', 'xhigh', 'max'):
+                with self.subTest(effort=effort):
+                    self.assertEqual(
+                        dispatch._glasshive_profile_reasoning_effort('claude-code', effort),
+                        effort,
+                    )
+            self.assertEqual(
+                dispatch._glasshive_profile_reasoning_effort('claude-code', 'unsupported'),
+                '',
+            )
+
+    def test_claude_compiled_high_owns_the_complete_scheduled_fallback_tuple(self):
+        with patch.dict(os.environ, {'WPR_CLAUDE_CODE_EFFORT': 'high'}):
+            bundle = dispatch._glasshive_bootstrap_bundle(
+                {'id': 'task-1', 'user_id': 'user-1', 'prompt': 'Synthetic prompt'},
+                {
+                    'execution_profile': 'codex-cli',
+                    'execution_model': 'gpt-stale',
+                    'reasoning_effort': 'low',
+                    'fallback_worker_profile': 'claude-code',
+                    'fallback_worker_model': 'claude-stale',
+                    'fallback_reasoning_effort': 'default',
+                },
+                'run-1', execution_mode='docker',
+            )
+        self.assertEqual(bundle['viventium_execution_authority_request']['fallback'], {
+            'worker_profile': 'claude-code',
+            'model': 'claude-managed-test',
+            'reasoning_effort': 'high',
+        })
+        self.assertEqual(bundle['env']['WPR_CLAUDE_CODE_EFFORT'], 'high')
+
     def test_glasshive_bootstrap_fails_closed_when_codex_tuple_is_absent(self):
         os.environ.pop('WPR_MODEL_HOST_CODEX_CLI', None)
         os.environ.pop('WPR_MODEL_CODEX_CLI', None)
@@ -1271,6 +1305,7 @@ class DispatchTelegramTests(unittest.TestCase):
                 task,
                 'http://localhost:3080',
                 10,
+                resolve_voice=False,
             )
             mock_post.assert_not_called()
             self.assertEqual(user_id, 'tg-1')
@@ -1864,6 +1899,25 @@ class DispatchTelegramTests(unittest.TestCase):
 
         self.assertNotIn('viventiumQaRun', seen_payloads[0])
         self.assertNotIn('viventiumQaRunId', seen_payloads[0])
+
+    def test_main_authoring_deadline_uses_the_existing_stream_timeout(self):
+        task = {'id': 'deadline-task', 'user_id': 'user_1', 'agent_id': 'agent-1',
+                'prompt': 'Synthetic check', 'channel': 'librechat', 'metadata': None}
+        seen = []
+        def post(_url, payload, _headers, _timeout):
+            seen.append(payload)
+            return {'streamId': 'deadline-stream', 'conversationId': 'deadline-conversation'}
+        before = datetime.now(timezone.utc)
+        with patch.dict(os.environ, {'SCHEDULER_STREAM_TIMEOUT_S': '600'}), patch.object(
+            dispatch, '_post_json', side_effect=post
+        ), patch.object(dispatch, '_stream_scheduler_response', return_value=('Complete.', 'answer', '')), patch.object(
+            dispatch, '_poll_scheduler_followup', return_value={'followup_text': '', 'canonical_text': ''}
+        ):
+            dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'new')
+        after = datetime.now(timezone.utc)
+        deadline = datetime.fromisoformat(seen[0]['authoringDeadlineAt'])
+        self.assertGreaterEqual((deadline - before).total_seconds(), 600)
+        self.assertLessEqual((deadline - after).total_seconds(), 600)
 
     def test_run_scheduler_generation_projects_channel_contract_and_reads_external_work(self):
         task = {
@@ -3536,6 +3590,142 @@ class DispatchBestEffortFanoutTests(unittest.TestCase):
         os.environ.pop('SCHEDULER_TELEGRAM_SECRET', None)
         os.environ.pop('SCHEDULER_TELEGRAM_BOT_TOKEN', None)
 
+    def test_automated_failure_status_is_text_only_with_voice_enabled(self):
+        task = {
+            'id': 'synthetic-status-task',
+            'channel': ['telegram'],
+            'schedule': {'type': 'once'},
+            'metadata': {},
+        }
+        for failure_class in ('provider_response_failed', 'scheduler_gateway_unavailable'):
+            with self.subTest(failure_class=failure_class), patch.object(
+                dispatch, '_resolve_telegram_identity',
+                return_value=('synthetic-user', 'synthetic-chat', {
+                    'always_voice_response': True, 'voice_responses_enabled': True,
+                }),
+            ), patch.object(dispatch, '_synthesize_tts', return_value=b'synthetic-audio') as tts, patch.object(
+                dispatch, '_send_telegram_audio', return_value='audio-1',
+            ) as audio, patch.object(dispatch, '_send_telegram_message', return_value='text-1') as text:
+                result = dispatch.scheduled_failure_result(task, failure_class, failure_retryable=True)
+
+            tts.assert_not_called()
+            audio.assert_not_called()
+            text.assert_called_once()
+            detail = result['delivery']['channels']['telegram']
+            self.assertEqual(text.call_args.args[1], detail['generated_text'])
+            self.assertEqual(detail['presentation_kind'], 'status')
+            self.assertEqual(detail['telegram_message_ids'], ['text-1'])
+            self.assertEqual(detail['reason'], 'action_required')
+            self.assertEqual(result['delivery']['outcome'], 'failed')
+            self.assertEqual(result['generation_failure']['error_class'], failure_class)
+            self.assertIn(failure_class, result['generation_failure']['transition']['reported_failure_classes'])
+
+    def test_conversational_schedule_output_keeps_tts_including_authored_status(self):
+        task = {'id': 'synthetic-conversation-task', 'channel': ['telegram'], 'metadata': {}}
+        for answer in ('Check the garden route.', 'The service is unavailable; you can retry now.'):
+            with self.subTest(answer=answer), patch.object(
+                dispatch, '_run_scheduler_generation',
+                return_value={
+                    'conversation_id': 'synthetic-conversation',
+                    'response_message_id': 'synthetic-response',
+                    'final_text': answer, 'followup_text': '',
+                },
+            ), patch.object(dispatch, '_resolve_telegram_identity', return_value=(
+                'synthetic-user', 'synthetic-chat',
+                {'always_voice_response': True, 'voice_responses_enabled': True},
+            )), patch.object(dispatch, '_synthesize_tts', return_value=b'synthetic-audio') as tts, patch.object(
+                dispatch, '_send_telegram_audio', return_value='audio-1',
+            ) as audio, patch.object(dispatch, '_send_telegram_message') as text:
+                result = dispatch.dispatch_task(task)
+
+            tts.assert_called_once_with(answer, unittest.mock.ANY, voice_route=None, diagnostics=unittest.mock.ANY)
+            audio.assert_called_once()
+            text.assert_not_called()
+            detail = result['delivery']['channels']['telegram']
+            self.assertEqual(detail['presentation_kind'], 'conversation')
+            self.assertEqual(detail['telegram_message_ids'], ['audio-1'])
+            self.assertEqual(result['delivery']['outcome'], 'sent')
+
+    def test_unconfirmed_status_notice_reuses_plain_text_receipt_after_voice_preference_change(self):
+        from scheduling_cortex.storage import ScheduleStorage, StorageConfig
+
+        task = {'id': 'synthetic-unknown-task', '_scheduled_prompt_run_id': 'synthetic-unknown-run'}
+        with tempfile.TemporaryDirectory() as directory:
+            storage = ScheduleStorage(StorageConfig(db_path=str(Path(directory) / 'schedules.db')))
+            with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+                dispatch, '_resolve_telegram_identity', side_effect=[
+                    ('synthetic-user', 'synthetic-chat', {
+                        'always_voice_response': True, 'voice_responses_enabled': True,
+                    }),
+                    ('synthetic-user', 'synthetic-chat', {'voice_responses_enabled': False}),
+                ],
+            ), patch.object(dispatch, '_synthesize_tts', return_value=b'synthetic-audio') as tts, patch.object(
+                dispatch, '_send_telegram_audio', return_value='audio-1',
+            ) as audio, patch.object(dispatch, '_send_telegram_message', return_value='text-1') as text:
+                first = dispatch.deliver_unconfirmed_delivery_notice(task, conversation_saved=True)
+                reopened = dispatch.deliver_unconfirmed_delivery_notice(task, conversation_saved=True)
+
+            tts.assert_not_called()
+            audio.assert_not_called()
+            text.assert_called_once()
+            self.assertIn('full reply is saved in its Viventium conversation.', text.call_args.args[1])
+            self.assertEqual(first['outcome'], 'sent')
+            self.assertEqual(reopened['outcome'], 'sent')
+            connection = storage._connect()
+            try:
+                rows = connection.execute(
+                    'SELECT channel, state, message_id FROM scheduled_prompt_deliveries'
+                ).fetchall()
+            finally:
+                connection.close()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['channel'], dispatch.UNCONFIRMED_DELIVERY_NOTICE_CHANNEL)
+            self.assertEqual(rows[0]['state'], 'sent')
+            self.assertEqual(rows[0]['message_id'], 'text-1')
+
+    def test_status_delivery_hash_is_distinct_and_conversation_hash_stays_compatible(self):
+        task = {'id': 'synthetic-hash-task', '_scheduled_prompt_run_id': 'synthetic-hash-run'}
+        preferences = {'always_voice_response': True, 'voice_responses_enabled': True}
+        storage = MagicMock()
+        storage.claim_scheduled_prompt_delivery.return_value = {
+            'claimed': False, 'reason': 'already_sent',
+            'delivery': {'state': 'sent', 'message_id': 'receipt-1'},
+        }
+        with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
+            dispatch, '_resolve_telegram_identity',
+            return_value=('synthetic-user', 'synthetic-chat', preferences),
+        ), patch.object(dispatch, '_send_telegram_message') as text, patch.object(
+            dispatch, '_send_telegram_voice_or_text',
+        ) as voice:
+            for kind in ('conversation', 'status'):
+                visibility = dispatch._prepare_generated_visibility(
+                    task, 'Identical authored text.', '', presentation_kind=kind,
+                )
+                dispatch._deliver_telegram_generated_text(task, 'http://localhost:3080', 10, None, visibility)
+
+        conversation_hash, status_hash = [
+            call.kwargs['payload_hash'] for call in storage.claim_scheduled_prompt_delivery.call_args_list
+        ]
+        legacy_hash = dispatch._sha256_prefix(json.dumps({
+            'chat_id': 'synthetic-chat', 'text': 'Identical authored text.',
+            'voice_preferences': preferences,
+        }, sort_keys=True, separators=(',', ':')), length=64)
+        self.assertEqual(conversation_hash, legacy_hash)
+        self.assertNotEqual(status_hash, conversation_hash)
+        text.assert_not_called()
+        voice.assert_not_called()
+
+    def test_explicit_invalid_presentation_kind_fails_before_delivery(self):
+        with self.assertRaisesRegex(ValueError, 'presentation kind'):
+            dispatch._prepare_generated_visibility({}, 'Synthetic text.', '', presentation_kind='unknown')
+        with patch.object(dispatch, '_resolve_telegram_identity') as identity:
+            with self.assertRaisesRegex(ValueError, 'presentation kind'):
+                dispatch._deliver_telegram_generated_text(
+                    {}, 'http://localhost:3080', 10, None,
+                    {'final_text': 'Synthetic text.', 'presentation_kind': 'unknown'},
+                )
+        identity.assert_not_called()
+
     def test_structured_generation_failure_notifies_telegram_and_stays_failed(self):
         task = {
             'id': 'task-provider-failure-fanout',
@@ -3899,3 +4089,411 @@ class DispatchBestEffortFanoutTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DispatchCurrentSpeechTests(unittest.TestCase):
+    def test_current_speaking_route_does_not_change_canonical_delivery_identity(self):
+        from scheduling_cortex.storage import ScheduleStorage, StorageConfig
+
+        task = {'id': 'schedule', '_scheduled_prompt_run_id': 'run'}
+        visibility = dispatch._prepare_generated_visibility(task, 'Canonical reminder.', '')
+        routes = [
+            {'voice_route': {'ttsProvider': 'xai', 'ttsVoice': 'Sal'}},
+            {'voice_route': {'ttsProvider': 'xai', 'ttsVoice': 'Eve'}},
+            {'speech_unavailable': 'voice_route_unavailable'},
+            {'voice_responses_enabled': False},
+        ]
+        hashes = []
+        for prefs in routes:
+            recorder = MagicMock()
+            recorder.claim_scheduled_prompt_delivery.return_value = {
+                'claimed': False, 'reason': 'delivery_unknown', 'delivery': {}}
+            with (patch.object(dispatch, '_scheduler_storage', return_value=recorder),
+                  patch.object(dispatch, '_get_telegram_bot_token', return_value='synthetic'),
+                  patch.object(dispatch, '_resolve_telegram_identity', return_value=('u', 'chat', prefs))):
+                detail = dispatch._deliver_telegram_generated_text(task, 'http://localhost', 5, None, visibility)
+            hashes.append(recorder.claim_scheduled_prompt_delivery.call_args.kwargs['payload_hash'])
+            if prefs.get('voice_route'):
+                self.assertEqual(detail['voice_route'], prefs['voice_route'])
+        self.assertEqual(len(set(hashes)), 1)
+
+        # Exercise the actual persistent claim/receipt state machine, including restart ambiguity.
+        for state in ('new', 'claimed', 'expired', 'sent', 'delivery_unknown'):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                storage = ScheduleStorage(StorageConfig(db_path=str(Path(directory) / 'schedules.db')))
+                now = datetime.now(timezone.utc)
+                args = dict(run_id='run', occurrence_key=None, channel='telegram', part_index=0,
+                            payload_hash=hashes[0], lease_owner='original', now=now.isoformat(), lease_seconds=60)
+                before = None
+                if state != 'new':
+                    if state == 'expired':
+                        args['now'] = '2020-01-01T00:00:00Z'
+                    first = storage.claim_scheduled_prompt_delivery(**args)
+                    if state == 'sent':
+                        storage.complete_scheduled_prompt_delivery(delivery_key=first['delivery_key'],
+                            lease_owner='original', message_id='91', now=now.isoformat())
+                    elif state == 'delivery_unknown':
+                        storage.mark_scheduled_prompt_delivery_unknown(delivery_key=first['delivery_key'],
+                            lease_owner='original', error_class='transport_response_missing', now=now.isoformat())
+                    conn = storage._connect()
+                    try:
+                        before = dict(conn.execute('SELECT * FROM scheduled_prompt_deliveries').fetchone())
+                    finally:
+                        conn.close()
+                with (patch.object(dispatch, '_scheduler_storage', return_value=storage),
+                      patch.object(dispatch, '_get_telegram_bot_token', return_value='synthetic'),
+                      patch.object(dispatch, '_resolve_telegram_identity', return_value=('u', 'chat', routes[1])),
+                      patch.object(dispatch, '_send_telegram_voice_or_text', return_value='92') as send):
+                    detail = dispatch._deliver_telegram_generated_text(task, 'http://localhost', 5, None, visibility)
+                conn = storage._connect()
+                try:
+                    after = dict(conn.execute('SELECT * FROM scheduled_prompt_deliveries').fetchone())
+                finally:
+                    conn.close()
+                self.assertNotEqual(after['error_class'], 'payload_conflict')
+                if state == 'new':
+                    send.assert_called_once()
+                    self.assertEqual(after['state'], 'sent')
+                else:
+                    send.assert_not_called()
+                    if state != 'expired':
+                        self.assertEqual(after, before)
+                        if state == 'claimed':
+                            committed = storage.complete_scheduled_prompt_delivery(
+                                delivery_key=first['delivery_key'], lease_owner='original',
+                                message_id='91', now=now.isoformat())
+                            self.assertTrue(committed['updated'])
+                    else:
+                        self.assertEqual(after['error_class'], 'send_receipt_missing_after_lease')
+                self.assertEqual(detail['voice_route'], routes[1]['voice_route'])
+
+    def test_cached_chat_refreshes_saved_route_and_voice_flags(self):
+        task={'user_id':'synthetic-owner','metadata':{'telegram_user_id':'u','telegram_chat_id':'topic',
+              'always_voice_response':False}}
+        with patch.object(dispatch,'_get_scheduler_secret',return_value='synthetic'), patch.object(
+            dispatch,'_post_json',return_value={'telegram_user_id':'u','telegram_chat_id':'u',
+                'voice_preferences':{'always_voice_response':True,'voice_responses_enabled':True},
+                'voiceRoute':{'tts':{'provider':'xai','variant':'Eve','source':'saved'}}}) as resolver:
+            user,chat,prefs=dispatch._resolve_telegram_identity(task,'http://localhost',5)
+        self.assertEqual((user,chat),('u','topic'))
+        self.assertTrue(prefs['always_voice_response'])
+        self.assertEqual(prefs['voice_route']['tts']['variant'],'Eve')
+        resolver.assert_called_once()
+        self.assertEqual(resolver.call_args.args[1],{'userId':'synthetic-owner','resolveVoice':True})
+
+    def test_uncached_linked_identity_preserves_canonical_text_when_speaking_is_unavailable(self):
+        task={'id':'synthetic-task','user_id':'synthetic-owner','metadata':{}}
+        response={'telegram_user_id':'u','telegram_chat_id':'chat','linked':True,
+                  'voice_preferences':{'always_voice_response':True,'voice_responses_enabled':True},
+                  'voiceRoute':None,'speech_unavailable':'voice_route_unavailable'}
+        with (patch.object(dispatch,'_get_scheduler_secret',return_value='synthetic'),
+              patch.object(dispatch,'_post_json',return_value=response) as resolver,
+              patch.object(dispatch,'_synthesize_tts') as tts,
+              patch.object(dispatch,'_send_telegram_message',return_value='text-91') as send):
+            detail=dispatch._deliver_telegram_generated_text(task,'http://localhost',5,None,
+                    {'final_text':'Canonical answer.','followup_text':''})
+        self.assertEqual(resolver.call_args.args[1],{'userId':'synthetic-owner','resolveVoice':True})
+        tts.assert_not_called()
+        send.assert_called_once_with('chat','Canonical answer.',unittest.mock.ANY)
+        self.assertEqual(detail['telegram_message_ids'],['text-91'])
+        self.assertEqual(detail['speech_unavailable'],'voice_route_unavailable')
+        self.assertEqual(detail['presentation_kind'],'conversation')
+
+    def test_uncached_status_delivers_plain_text_with_address_only_lookup(self):
+        task={'id':'synthetic-task','user_id':'synthetic-owner','metadata':{}}
+        response={'telegram_user_id':'u','telegram_chat_id':'chat','linked':True,
+                  'voice_preferences':{'always_voice_response':True,'voice_responses_enabled':True},
+                  'voiceRoute':None}
+        with (patch.object(dispatch,'_get_scheduler_secret',return_value='synthetic'),
+              patch.object(dispatch,'_post_json',return_value=response) as resolver,
+              patch.object(dispatch,'_synthesize_tts') as tts,
+              patch.object(dispatch,'_send_telegram_voice_or_text') as audio,
+              patch.object(dispatch,'_send_telegram_message',return_value='status-91') as send):
+            detail=dispatch._deliver_telegram_generated_text(task,'http://localhost',5,None,
+                    {'final_text':'Action is required.','followup_text':'','presentation_kind':'status'})
+        self.assertEqual(resolver.call_args.args[1],{'userId':'synthetic-owner','resolveVoice':False})
+        tts.assert_not_called();audio.assert_not_called()
+        send.assert_called_once_with('chat','Action is required.',unittest.mock.ANY)
+        self.assertEqual(detail['telegram_message_ids'],['status-91'])
+        self.assertEqual(detail['presentation_kind'],'status')
+        self.assertNotIn('speech_unavailable',detail)
+
+    def test_mapping_and_auth_failure_stay_distinct_even_with_cached_identity(self):
+        for status,code in ((404,'telegram_not_linked'),(401,'secret_mismatch'),
+                            (500,'telegram_mapping_unavailable')):
+            with self.subTest(status=status):
+                error=dispatch.HttpJsonError('synthetic-mapping-failure',status=status,method='POST',
+                                             path='/telegram/resolve',payload={'code':code})
+                with (patch.object(dispatch,'_get_scheduler_secret',return_value='synthetic'),
+                      patch.object(dispatch,'_post_json',side_effect=error)):
+                    expected=dispatch.TelegramChannelNotLinked if status==404 else dispatch.HttpJsonError
+                    with self.assertRaises(expected):
+                        dispatch._resolve_telegram_identity({'user_id':'owner','metadata':{'telegram_user_id':'u'}},
+                                                             'http://localhost',5)
+
+    def test_actual_local_mlx_wait_returns_canonical_text_before_running_work_finishes(self):
+        import concurrent.futures
+        import threading
+        import time
+        voice_root = Path(dispatch._SHARED_PATH).parent / 'voice-gateway'
+        sys.path.insert(0, str(voice_root))
+        try:
+            import mlx_chatterbox_tts as native
+        except ImportError:
+            self.skipTest('Existing optional Voice runtime dependencies are required for this consumer check')
+        engine=dispatch._telegram_tts._load('_viventium_telegram_speech_engine','tts.py')
+        release=threading.Event();entered=threading.Event();futures=[]
+        model=MagicMock()
+        def load(_model):
+            entered.set();release.wait();return model
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            def submit(function):
+                future=executor.submit(function);futures.append(future);return future
+            timer=threading.Timer(0.6,release.set);timer.start()
+            try:
+                with (patch.object(engine,'_is_local_chatterbox_supported',return_value=(True,None)),
+                      patch.object(engine,'_build_local_chatterbox_config',return_value=(native.MlxChatterboxConfig(),native.synthesize_wav_bytes)),
+                      patch.object(native,'_submit_mlx_work',side_effect=submit),
+                      patch.object(native,'_load_mlx_model',side_effect=load),
+                      patch.object(dispatch,'_send_telegram_message',return_value='canonical-text') as text,
+                      patch.object(dispatch,'_send_telegram_audio') as audio,
+                      patch.dict(os.environ,{'TTS_PROVIDER_PRIMARY':'local_chatterbox_turbo_mlx_8bit',
+                                             'TTS_PROVIDER_FALLBACK':'cartesia'},clear=True)):
+                    prefs={'always_voice_response':True,'voice_responses_enabled':True,
+                           'voice_route':{'tts':{'provider':'local_chatterbox_turbo_mlx_8bit',
+                                               'variant':'mlx-community/chatterbox-turbo-8bit'}}}
+                    started=time.monotonic()
+                    result=dispatch._send_telegram_voice_or_text('chat','Canonical answer.',0.05,prefs)
+                    elapsed=time.monotonic()-started
+                self.assertTrue(entered.is_set())
+                self.assertEqual(result,'canonical-text')
+                self.assertLess(elapsed,0.3)
+                self.assertFalse(release.is_set())
+                audio.assert_not_called();text.assert_called_once()
+                self.assertEqual(len(prefs['_speech_diagnostics']['attempts']),1)
+                release.set()
+                self.assertEqual(futures[0].result(timeout=1),b'')
+                model.generate.assert_not_called()
+            finally:
+                release.set();timer.cancel()
+
+    def test_synthesis_deadline_bounds_provider_chain_before_text_fallback(self):
+        async def stalled(*args, **kwargs):
+            await dispatch.asyncio.sleep(1)
+        diagnostics = {}
+        with patch.object(dispatch._telegram_tts, 'synthesize_speech', side_effect=stalled):
+            result = dispatch._synthesize_tts('Useful answer.', 0.01, diagnostics=diagnostics)
+        self.assertIsNone(result)
+        self.assertEqual(diagnostics['error_class'], 'TimeoutError')
+
+    def test_explicit_bot_api_rejection_falls_back_but_unproven_http_error_does_not(self):
+        from types import SimpleNamespace
+        packaged = SimpleNamespace(data=b'media', filename='Voice.mp3', content_type='audio/mpeg',
+                                   duration=2, duration_seconds=1.5)
+        for payload, status, fallback in (({'ok':False,'error_code':400},400,True),
+                                           ({},400,False),({'ok':False,'error_code':500},500,False)):
+            with self.subTest(status=status, payload=payload):
+                error=dispatch.HttpJsonError('synthetic-rejection',status=status,method='POST',path='/sendAudio',payload=payload)
+                with (patch.object(dispatch,'_get_telegram_bot_token',return_value='synthetic-token'),
+                      patch.object(dispatch,'_synthesize_tts',return_value=b'audio'),
+                      patch.object(dispatch,'package_telegram_audio',return_value=packaged),
+                      patch.object(dispatch,'_post_multipart',side_effect=error),
+                      patch.object(dispatch,'_send_telegram_message',return_value='text-receipt') as send):
+                    prefs={'always_voice_response':True,'voice_responses_enabled':True}
+                    if fallback:
+                        self.assertEqual(dispatch._send_telegram_voice_or_text('chat','Answer.',5,prefs),'text-receipt')
+                        send.assert_called_once()
+                    else:
+                        with self.assertRaises(dispatch.HttpJsonError):
+                            dispatch._send_telegram_voice_or_text('chat','Answer.',5,prefs)
+                        send.assert_not_called()
+
+    def test_unavailable_current_route_is_plain_text_before_tts(self):
+        task={'user_id':'synthetic-owner','metadata':{'telegram_user_id':'u','always_voice_response':True}}
+        with patch.object(dispatch,'_get_scheduler_secret',return_value='synthetic'), patch.object(
+            dispatch,'_post_json',side_effect=TimeoutError()):
+            _,chat,prefs=dispatch._resolve_telegram_identity(task,'http://localhost',5)
+        with patch.object(dispatch,'_synthesize_tts') as tts, patch.object(
+            dispatch,'_send_telegram_message',return_value='text-1') as send:
+            self.assertEqual(dispatch._send_telegram_voice_or_text(chat,'Useful answer.',5,prefs),'text-1')
+        tts.assert_not_called();send.assert_called_once_with('u','Useful answer.',5)
+        self.assertEqual(prefs['speech_unavailable'],'voice_route_unavailable')
+
+    def test_status_mapping_with_cached_identity_needs_no_speaking_lookup(self):
+        with patch.object(dispatch,'_post_json') as resolver:
+            user,chat,_=dispatch._resolve_telegram_identity({'metadata':{'telegram_user_id':'u'}},
+                'http://localhost',5,resolve_voice=False)
+        resolver.assert_not_called();self.assertEqual((user,chat),('u','u'))
+
+    def test_scheduler_synthesis_delegates_saved_route_to_existing_engine(self):
+        from unittest.mock import AsyncMock
+        route={'tts':{'provider':'xai','variant':'Eve','source':'saved'}}
+        with patch.object(dispatch._telegram_tts,'synthesize_speech',new_callable=AsyncMock,
+                          return_value=b'native-mp3') as engine:
+            result=dispatch._synthesize_tts('**Useful answer.**',5,voice_route=route,diagnostics={})
+        self.assertEqual(result,b'native-mp3')
+        self.assertEqual(engine.call_args.kwargs['voice_route'],route)
+        self.assertEqual(engine.call_args.args[0],'**Useful answer.**')
+
+    def test_audio_transport_uses_shared_supported_metadata(self):
+        from telegram_audio import TelegramAudio
+        with (patch.object(dispatch,'_get_telegram_bot_token',return_value='synthetic'), patch.object(
+            dispatch,'package_telegram_audio',return_value=TelegramAudio(b'mp3','Voice.mp3','audio/mpeg',2.275556)) as package,
+            patch.object(dispatch,'_post_multipart',return_value={'ok':True,'result':{'message_id':91}}) as transport):
+            self.assertEqual(dispatch._send_telegram_audio('u',b'buffered-wav',5),'91')
+        package.assert_called_once_with(b'buffered-wav',timeout_s=5)
+        self.assertEqual(transport.call_args.kwargs['filename'],'Voice.mp3')
+        self.assertEqual(transport.call_args.kwargs['file_content_type'],'audio/mpeg')
+        self.assertEqual(transport.call_args.kwargs['fields']['duration'],'3')
+
+    def test_conversion_failure_falls_back_but_ambiguous_send_never_does(self):
+        prefs={'always_voice_response':True,'voice_responses_enabled':True,
+               'voice_route':{'tts':{'provider':'xai','variant':'Eve'}}}
+        with (patch.object(dispatch,'_synthesize_tts',return_value=b'media'), patch.object(
+            dispatch,'_send_telegram_audio',side_effect=dispatch.TelegramAudioError('media_encoder_unavailable')),
+            patch.object(dispatch,'_send_telegram_message',return_value='text-1') as text):
+            self.assertEqual(dispatch._send_telegram_voice_or_text('u','Useful.',5,prefs),'text-1')
+        text.assert_called_once()
+        with (patch.object(dispatch,'_synthesize_tts',return_value=b'media'), patch.object(
+            dispatch,'_send_telegram_audio',side_effect=URLError('response missing')) as send,
+            patch.object(dispatch,'_send_telegram_message') as text):
+            with self.assertRaises(URLError): dispatch._send_telegram_voice_or_text('u','Useful.',5,prefs)
+        send.assert_called_once();text.assert_not_called()
+
+
+# === VIVENTIUM START ===
+# Purpose: Bound quiet follow-up grace using the existing exact-parent terminal state.
+class QuietTerminalFollowupTests(unittest.TestCase):
+    @staticmethod
+    def quiet_state():
+        return {
+            'messageId': 'synthetic-parent', 'conversationId': 'synthetic-conversation',
+            'canonicalText': 'Synthetic canonical reminder.', 'canonicalTextSource': 'main',
+            'canonicalTextFallbackReason': '', 'followUp': None,
+            'cortexParts': [{'type': 'cortex_insight', 'status': 'complete'}],
+            'followUpDecision': {
+                'tag': 'CortexFollowupDecision', 'schemaVersion': 1, 'result': 'skipped',
+                'parentMessageId': 'synthetic-parent', 'conversationId': 'synthetic-conversation',
+                'finalLength': 0, 'forceVisibleFollowUp': False,
+                'generationFailed': False, 'hasErrors': False,
+            },
+            'insightDeliveries': [],
+            'insightDeliverySummary': {'total': 0, 'pending': 0, 'claimed': 0, 'sent': 0, 'dropped': 0},
+        }
+
+    def poll(self, states, route='scheduler', conversation='synthetic-conversation'):
+        clock = [0.0]
+        sleeps = []
+        reads = []
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+        def read(*args):
+            index = min(len(reads), len(states) - 1)
+            reads.append(args)
+            return states[index]
+        env = {'SCHEDULER_FOLLOWUP_INTERVAL_S': '1', 'SCHEDULER_FOLLOWUP_ACTIVE_GRACE_S': '30',
+               'SCHEDULER_FOLLOWUP_TIMEOUT_S': '45', 'SCHEDULER_TELEGRAM_FOLLOWUP_INTERVAL_S': '1',
+               'SCHEDULER_TELEGRAM_FOLLOWUP_GRACE_S': '30', 'SCHEDULER_TELEGRAM_FOLLOWUP_TIMEOUT_S': '45'}
+        with patch.dict(os.environ, env, clear=True), patch.object(dispatch.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(dispatch.time, 'sleep', side_effect=sleep), patch.object(dispatch, '_get_json', side_effect=read):
+            if route == 'scheduler':
+                result = dispatch._poll_scheduler_followup(
+                    {'id': 'synthetic-task', 'channel': ['telegram']}, 'http://localhost',
+                    'synthetic-parent', 'synthetic-user', conversation, 'synthetic-secret', 1)
+            else:
+                result = dispatch._poll_telegram_followup(
+                    'http://localhost', 'synthetic-parent', 'synthetic-user', 'synthetic-chat',
+                    conversation, 'synthetic-task', 'synthetic-secret', 1)
+        return result, sleeps, reads
+
+    def test_quiet_terminal_finishes_both_actual_poll_consumers_without_grace(self):
+        for route in ('scheduler', 'telegram'):
+            with self.subTest(route=route):
+                result, sleeps, reads = self.poll([self.quiet_state()], route=route)
+                self.assertEqual(sleeps, [])
+                self.assertEqual(len(reads), 1)
+                self.assertEqual(result['canonical_text'], 'Synthetic canonical reminder.')
+                self.assertEqual(result['canonical_text_source'], 'main')
+                self.assertEqual(result['followup_text'], '')
+
+    def test_settled_suppressed_and_empty_decisions_finish_grace(self):
+        for outcome in ('suppressed', 'empty'):
+            state = self.quiet_state()
+            state['followUpDecision']['result'] = outcome
+            result, sleeps, _ = self.poll([state])
+            self.assertEqual(sleeps, [])
+            self.assertEqual(result['canonical_text_source'], 'main')
+
+    def test_settled_sent_and_dropped_insight_rows_are_terminal(self):
+        state = self.quiet_state()
+        state['insightDeliveries'] = [{'status': 'sent'}, {'status': 'dropped'}]
+        state['insightDeliverySummary'].update(total=2, sent=1, dropped=1)
+        _, sleeps, _ = self.poll([state])
+        self.assertEqual(sleeps, [])
+
+    def test_unknown_or_inflight_state_keeps_late_followup_for_both_consumers(self):
+        mutations = [
+            ('state_parent', lambda s: s.update(messageId='other-parent')),
+            ('state_conversation', lambda s: s.update(conversationId='other-conversation')),
+            ('missing_decision', lambda s: s.pop('followUpDecision')),
+            ('missing_followup', lambda s: s.pop('followUp')),
+            ('unknown_followup', lambda s: s.update(followUp={'text': '', 'status': 'pending'})),
+            ('decision_tag', lambda s: s['followUpDecision'].update(tag='unknown')),
+            ('schema', lambda s: s['followUpDecision'].update(schemaVersion=2)),
+            ('boolean_schema', lambda s: s['followUpDecision'].update(schemaVersion=True)),
+            ('decision_parent', lambda s: s['followUpDecision'].update(parentMessageId='other-parent')),
+            ('decision_conversation', lambda s: s['followUpDecision'].update(conversationId='other-conversation')),
+            ('pending', lambda s: s['followUpDecision'].update(result='pending')),
+            ('persisted', lambda s: s['followUpDecision'].update(result='persisted')),
+            ('unknown_result', lambda s: s['followUpDecision'].update(result='future-status')),
+            ('nonempty_final', lambda s: s['followUpDecision'].update(finalLength=10)),
+            ('forced_visible', lambda s: s['followUpDecision'].update(forceVisibleFollowUp=True)),
+            ('failed', lambda s: s['followUpDecision'].update(generationFailed=True)),
+            ('errors', lambda s: s['followUpDecision'].update(hasErrors=True)),
+            ('active', lambda s: s['cortexParts'][0].update(status='brewing')),
+            ('activating', lambda s: s['cortexParts'][0].update(status='activating')),
+            ('unknown_part_status', lambda s: s['cortexParts'][0].update(status='future-status')),
+            ('failed_part', lambda s: s['cortexParts'][0].update(status='failed')),
+            ('missing_parts', lambda s: s.pop('cortexParts')),
+            ('unknown_part', lambda s: s['cortexParts'][0].update(type='future-cortex-type')),
+            ('pending_delivery', lambda s: s['insightDeliverySummary'].update(pending=1)),
+            ('claimed_delivery', lambda s: s['insightDeliverySummary'].update(claimed=1)),
+            ('missing_summary', lambda s: s.pop('insightDeliverySummary')),
+            ('missing_counter', lambda s: s['insightDeliverySummary'].pop('pending')),
+            ('boolean_counter', lambda s: s['insightDeliverySummary'].update(pending=False)),
+            ('unknown_delivery', lambda s: s['insightDeliveries'].append({'status': 'future-status'})),
+            ('pending_row', lambda s: s['insightDeliveries'].append({'status': 'pending'})),
+            ('claimed_row', lambda s: s['insightDeliveries'].append({'status': 'claimed'})),
+            ('stale_summary', lambda s: s['insightDeliverySummary'].update(total=1)),
+        ]
+        for route in ('scheduler', 'telegram'):
+            for label, mutate in mutations:
+                with self.subTest(route=route, boundary=label):
+                    state = self.quiet_state()
+                    mutate(state)
+                    late = self.quiet_state()
+                    late['followUp'] = {'text': 'Useful late callback.'}
+                    result, sleeps, reads = self.poll([state, late], route=route)
+                    self.assertEqual(sleeps, [1.0])
+                    self.assertEqual(len(reads), 2)
+                    self.assertEqual(result['followup_text'], 'Useful late callback.')
+
+    def test_nonempty_followup_wins_even_when_quiet_decision_is_visible(self):
+        state = self.quiet_state()
+        state['followUp'] = {'text': 'Useful Steer response.'}
+        for route in ('scheduler', 'telegram'):
+            result, sleeps, _ = self.poll([state], route=route)
+            self.assertEqual(result['followup_text'], 'Useful Steer response.')
+            self.assertEqual(sleeps, [])
+
+    def test_unknown_conversation_and_no_terminal_decision_keep_configured_grace(self):
+        for route, conversation in [('scheduler', None), ('telegram', 'new')]:
+            result, sleeps, _ = self.poll([self.quiet_state()], route=route, conversation=conversation)
+            self.assertEqual(sum(sleeps), 30.0)
+            self.assertEqual(result['canonical_text'], 'Synthetic canonical reminder.')
+        state = self.quiet_state()
+        state.pop('followUpDecision')
+        _, sleeps, _ = self.poll([state])
+        self.assertEqual(sum(sleeps), 30.0)
+# === VIVENTIUM END ===

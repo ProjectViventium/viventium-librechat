@@ -12,8 +12,12 @@ const { resolveTelegramMappingByUserId } = require('~/server/services/TelegramLi
 const {
   buildTrustedDelegationIdentity,
   requestAccountApi,
+  invalidateActiveWorkSnapshot,
   signTrustedDelegationIdentity,
 } = require('./GlassHiveAccountService');
+const {
+  deferGlassHiveTerminalCallbackAfterCommit,
+} = require('./GlassHiveTerminalCallbackTransaction');
 const {
   deferGlassHiveWorkStateReconciliation,
   reconcileAuthoritativeGlassHiveWorkState,
@@ -47,6 +51,10 @@ const service = createGlassHiveCallbackBindingService({
   recordGlassHiveWorkDetailTrace,
   deferGlassHiveWorkStateReconciliation,
   reconcileAuthoritativeGlassHiveWorkState,
+  invalidateActiveWorkSnapshot: (input) => {
+    const invalidate = () => invalidateActiveWorkSnapshot(input);
+    if (!deferGlassHiveTerminalCallbackAfterCommit(invalidate)) invalidate();
+  },
 });
 
 module.exports = {

@@ -9,6 +9,16 @@ const {
   createAccountApiRoute,
   normalizeNativeCallbackOutputFiles,
   nativeCallbackOutputFilesForMessage,
+  nativeFollowUpOutputFilesForMessage,
+  nativeOutputFileDescriptorKey,
+  mergeVerifiedNativeOutputFileImports,
+  retainedNativeOutputFilesForMessage,
+  collectGlassHiveNativeMediaReferences,
+  selectGlassHiveNativeMediaFiles,
+  nativeMediaOutputFilesForMessage,
+  resolveGlassHiveNativeMediaMessageSelection,
+  bindGlassHiveNativeMediaAttachmentReferences,
+  fenceGlassHiveTerminalCallbackAcceptedOperation,
 } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { FileContext, mergeFileConfig, getEndpointFileConfig } = require('librechat-data-provider');
@@ -49,8 +59,8 @@ async function prepareNativeOutputFiles(req, envelope, identity, options = {}) {
   if (envelope == null) return [];
   try {
     const artifactBaseURL = process.env.GLASSHIVE_ARTIFACT_BASE_URL || '';
-    let fetchFile;
-    if (options.route || identity.providerId) {
+    let fetchFile = options.fetchFile;
+    if (!fetchFile && (options.route || identity.providerId)) {
       const route =
         options.route ||
         (await require('./nativeResponseService').resolveNativeResponseRoute(identity));
@@ -118,7 +128,15 @@ async function prepareNativeOutputFiles(req, envelope, identity, options = {}) {
     ];
   }
 }
-async function prepareMissionOutputFiles({ req, rows, message }) {
+async function prepareMissionOutputFiles({
+  req,
+  rows,
+  message,
+  nativeOutputFiles,
+  sourceMessageId,
+  selectedNativeMedia = [],
+  initialImports = [],
+}) {
   const ownerId = String(req.user?.id || '');
   const telegram = rows.some((row) =>
     row.destinations?.some((destination) => destination.surface === 'telegram'),
@@ -131,29 +149,90 @@ async function prepareMissionOutputFiles({ req, rows, message }) {
       }
     : req;
   const limits = nativeOutputFileLimits(fileRequest);
-  const route = createAccountApiRoute({ ownerId });
+  let route;
   const attachments = [];
+  const importedProofs = [];
   const seen = new Set();
   let remainingFiles = limits.maxFiles;
   let remainingBytes = limits.maxTotalBytes;
+  const appendImported = (envelope, identity, imported) => {
+    const merged = mergeVerifiedNativeOutputFileImports(envelope, identity, imported, seen);
+    attachments.push(...merged.attachments);
+    importedProofs.push({ envelope, identity, attachments: merged.attachments });
+    remainingFiles -= merged.count;
+    remainingBytes -= merged.bytes;
+  };
+  for (const imported of initialImports) {
+    appendImported(imported.envelope, imported.identity, imported.attachments);
+  }
+  if (nativeOutputFiles) {
+    try {
+      const selected = nativeFollowUpOutputFilesForMessage(nativeOutputFiles, {
+        userId: ownerId,
+        conversationId: message.conversationId,
+        sourceMessageId,
+        responseMessageId: message.messageId,
+        agentId: message.agent_id,
+      });
+      const nativeRoute = await require('./nativeResponseService').resolveNativeResponseRoute({
+        userId: ownerId,
+        agentId: message.agent_id,
+        providerId: nativeOutputFiles.publisher.providerId,
+      });
+      const imported = await prepareNativeOutputFiles(
+        fileRequest,
+        selected.envelope,
+        selected.identity,
+        {
+          route: nativeRoute,
+          limits: { ...limits, maxFiles: remainingFiles, maxTotalBytes: remainingBytes },
+        },
+      );
+      appendImported(selected.envelope, selected.identity, imported);
+    } catch {
+      attachments.push({
+        filename: 'File',
+        messageId: message.messageId,
+        nativeOutputFile: {
+          version: 1,
+          status: 'unavailable',
+          code: 'native_output_file_unavailable',
+        },
+      });
+    }
+  }
+  const retained = await prepareRetainedNativeOutputFiles(
+    fileRequest,
+    {
+      userId: ownerId,
+      conversationId: message.conversationId,
+      responseMessageId: message.messageId,
+      agentId: message.agent_id,
+    },
+    typeof message.text === 'string' ? message.text : '',
+    importedProofs,
+  );
+  for (const imported of retained.imports)
+    appendImported(imported.envelope, imported.identity, imported.attachments);
+  const mediaFiles = selectGlassHiveNativeMediaFiles(selectedNativeMedia, rows, ownerId);
   for (const row of rows) {
-    if (!row.outputFiles) continue;
-    const source = normalizeNativeCallbackOutputFiles(row.outputFiles, {
-      ownerId,
-      originRef: row.originRef,
-      workRef: row.workRef,
-      runId: row.runId,
-      attemptId: row.attemptId,
-      callbackId: row.terminalCallbackId,
-      resultRevision: row.terminalCallbackResultRevision,
-      resultDigest: row.terminalCallbackResultDigest,
-    });
-    const files = source.files.filter((file) => {
-      const key = JSON.stringify([file.filename, file.mime_type, file.bytes, file.sha256]);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    const selectedFiles = mediaFiles.get(row.terminalCallbackId) || [];
+    if (!row.outputFiles && !selectedFiles.length) continue;
+    const source =
+      row.outputFiles &&
+      normalizeNativeCallbackOutputFiles(row.outputFiles, {
+        ownerId,
+        originRef: row.originRef,
+        workRef: row.workRef,
+        runId: row.runId,
+        attemptId: row.attemptId,
+        callbackId: row.terminalCallbackId,
+        resultRevision: row.terminalCallbackResultRevision,
+        resultDigest: row.terminalCallbackResultDigest,
+      });
+    const files = [...(source?.files || []), ...selectedFiles].filter(
+      (file) => !seen.has(nativeOutputFileDescriptorKey(file)),
+    );
     const identity = {
       userId: ownerId,
       conversationId: message.conversationId,
@@ -162,25 +241,266 @@ async function prepareMissionOutputFiles({ req, rows, message }) {
       agentId: message.agent_id,
       logicalTurnId: '',
       revision: 1,
-      requestId: source.callback_id,
-      runId: source.run_id,
-      attemptId: source.attempt_id,
+      requestId: source?.callback_id || row.terminalCallbackId,
+      runId: source?.run_id || row.runId,
+      attemptId: source?.attempt_id || row.attemptId || '',
     };
-    const envelope = nativeCallbackOutputFilesForMessage({ ...source, files }, identity);
-    attachments.push(
-      ...(await prepareNativeOutputFiles(fileRequest, envelope, identity, {
-        route,
-        limits: { ...limits, maxFiles: remainingFiles, maxTotalBytes: remainingBytes },
-      })),
-    );
-    for (const file of files) {
-      if (file.bytes > limits.maxBytes || remainingFiles < 1 || file.bytes > remainingBytes)
-        continue;
-      remainingFiles -= 1;
-      remainingBytes -= file.bytes;
-    }
+    const envelope = source
+      ? nativeCallbackOutputFilesForMessage({ ...source, files }, identity)
+      : nativeMediaOutputFilesForMessage(row, files, identity);
+    route ||= createAccountApiRoute({ ownerId });
+    const imported = await prepareNativeOutputFiles(fileRequest, envelope, identity, {
+      route,
+      limits: { ...limits, maxFiles: remainingFiles, maxTotalBytes: remainingBytes },
+    });
+    appendImported(envelope, identity, imported);
   }
-  return attachments;
+  return retained.authorizePublication
+    ? { attachments, authorizePublication: retained.authorizePublication }
+    : attachments;
+}
+async function prepareRetainedNativeOutputFiles(req, identity, text, initialImports = []) {
+  const references = collectGlassHiveNativeMediaReferences(text);
+  if (!references.length) return { imports: [] };
+  const Message = require('~/db/models').Message;
+  const destination = {
+    userId: identity.userId,
+    conversationId: identity.conversationId,
+    responseMessageId: identity.responseMessageId,
+    agentId: identity.agentId,
+  };
+  const selector = {
+    user: identity.userId,
+    conversationId: identity.conversationId,
+    isCreatedByUser: false,
+    deletedAt: null,
+    'attachments.nativeOutputFile.downloadUrl': { $in: references },
+  };
+  const rows = await Message.find(selector)
+    .select(
+      'user conversationId messageId isCreatedByUser unfinished error deletedAt expiredAt attachments +nativeResponse',
+    )
+    .lean();
+  const limits = nativeOutputFileLimits(req);
+  const seen = new Set();
+  let count = 0,
+    bytes = 0;
+  for (const imported of initialImports) {
+    const merged = mergeVerifiedNativeOutputFileImports(
+      imported.envelope,
+      imported.identity,
+      imported.attachments,
+      seen,
+    );
+    count += merged.count;
+    bytes += merged.bytes;
+  }
+  const imports = [],
+    proofs = [];
+  for (const row of rows) {
+    const stored = await Promise.all(
+      (row.attachments || [])
+        .filter((item) => item.file_id)
+        .map((item) => findFileById(item.file_id)),
+    );
+    let selected;
+    try {
+      selected = retainedNativeOutputFilesForMessage(
+        row,
+        stored.filter(Boolean),
+        references,
+        destination,
+      );
+    } catch {
+      continue;
+    }
+    if (!selected) continue;
+    const byUrl = new Map(
+      selected.envelope.files.map((file, index) => [
+        file.download_url,
+        selected.sourceFiles[index],
+      ]),
+    );
+    const importEnvelope = {
+      ...selected.envelope,
+      files: selected.envelope.files.filter(
+        (file) => !seen.has(nativeOutputFileDescriptorKey(file)),
+      ),
+    };
+    if (!importEnvelope.files.length) continue;
+    const fetchFile = async (url) => {
+      const source = byUrl.get(url);
+      if (!source?.filepath) throw new Error('native_output_files_retained_source_invalid');
+      const { getDownloadStream } = getStrategyFunctions(source.source);
+      if (!getDownloadStream) throw new Error('native_output_file_storage_unavailable');
+      const stream = await getDownloadStream(req, source.filepath);
+      return new Response(stream, {
+        status: 200,
+        headers: { 'content-type': source.type, 'content-length': String(source.bytes) },
+      });
+    };
+    const attachments = await prepareNativeOutputFiles(req, importEnvelope, selected.identity, {
+      fetchFile,
+      limits: {
+        ...limits,
+        maxFiles: limits.maxFiles - count,
+        maxTotalBytes: limits.maxTotalBytes - bytes,
+      },
+    });
+    const merged = mergeVerifiedNativeOutputFileImports(
+      importEnvelope,
+      selected.identity,
+      attachments,
+      seen,
+    );
+    count += merged.count;
+    bytes += merged.bytes;
+    imports.push({
+      envelope: importEnvelope,
+      identity: selected.identity,
+      attachments: merged.attachments,
+    });
+    proofs.push({
+      sourceMessageId: selected.sourceMessageId,
+      candidateSha256: selected.candidateSha256,
+      fileIds: selected.sourceFiles.map((file) => file.file_id),
+      envelope: selected.envelope,
+      fileSources: selected.sourceFiles.map((file) => ({
+        file_id: file.file_id,
+        filepath: file.filepath,
+        source: file.source,
+      })),
+    });
+  }
+  return {
+    imports,
+    ...(proofs.length
+      ? {
+          authorizePublication: async (session) => {
+            for (const proof of proofs) {
+              const row = await Message.findOne({
+                user: identity.userId,
+                conversationId: identity.conversationId,
+                messageId: proof.sourceMessageId,
+                deletedAt: null,
+              })
+                .select(
+                  'user conversationId messageId isCreatedByUser unfinished error deletedAt expiredAt attachments +nativeResponse',
+                )
+                .session(session)
+                .lean();
+              if (!row || row.nativeResponse?.candidateSha256 !== proof.candidateSha256)
+                throw new Error('native_output_files_retained_source_invalid');
+              const stored = await Promise.all(
+                proof.fileIds.map((fileId) =>
+                  require('~/db/models')
+                    .File.findOne({
+                      file_id: fileId,
+                      user: identity.userId,
+                      conversationId: identity.conversationId,
+                      messageId: proof.sourceMessageId,
+                    })
+                    .session(session)
+                    .lean(),
+                ),
+              );
+              const rechecked = retainedNativeOutputFilesForMessage(
+                row,
+                stored.filter(Boolean),
+                references,
+                destination,
+              );
+              if (
+                !rechecked ||
+                JSON.stringify(rechecked.envelope) !== JSON.stringify(proof.envelope) ||
+                JSON.stringify(
+                  rechecked.sourceFiles.map((file) => ({
+                    file_id: file.file_id,
+                    filepath: file.filepath,
+                    source: file.source,
+                  })),
+                ) !== JSON.stringify(proof.fileSources)
+              )
+                throw new Error('native_output_files_retained_source_invalid');
+            }
+          },
+        }
+      : {}),
+  };
+}
+async function prepareNativeResponseOutputFiles(req, response, identity, text) {
+  const mongoose = require('mongoose');
+  const ResultModel = require('~/db/models').GlassHiveTerminalCallbackResult;
+  const selected = await resolveGlassHiveNativeMediaMessageSelection(
+    {
+      text,
+      ownerId: identity.userId,
+      conversationId: identity.conversationId,
+    },
+    {
+      readEvidence: (selector) =>
+        mongoose.connection
+          .collection('viventium_glasshive_mission_evidence')
+          .find(selector, {
+            projection: {
+              ownerId: 1,
+              conversationId: 1,
+              originRef: 1,
+              workRef: 1,
+              runId: 1,
+              attemptId: 1,
+              attemptNumber: 1,
+              nativeMedia: 1,
+              terminalCallbackResultKey: 1,
+              terminalCallbackAcceptedOperationId: 1,
+              terminalCallbackId: 1,
+              terminalCallbackResultRevision: 1,
+              terminalCallbackResultDigest: 1,
+              terminalCallbackEffectGeneration: 1,
+            },
+          })
+          .toArray(),
+      isAccepted: async (selector) => Boolean(await ResultModel.findOne(selector).lean()),
+      fenceAccepted: (reference, session) =>
+        fenceGlassHiveTerminalCallbackAcceptedOperation({
+          ResultModel,
+          reference,
+          session,
+        }),
+    },
+  );
+  const envelope = response.glasshive?.output_files;
+  const imported = await prepareNativeOutputFiles(req, envelope, identity);
+  const initialImports = envelope ? [{ envelope, identity, attachments: imported }] : [];
+  const preparation = await prepareMissionOutputFiles({
+    req,
+    rows: selected?.rows || [],
+    message: {
+      messageId: identity.responseMessageId,
+      conversationId: identity.conversationId,
+      streamId: identity.streamId,
+      agent_id: identity.agentId,
+      text,
+    },
+    selectedNativeMedia: selected?.selectedNativeMedia || [],
+    initialImports,
+  });
+  const attachments = Array.isArray(preparation) ? preparation : preparation.attachments;
+  const retainedGuard = Array.isArray(preparation) ? undefined : preparation.authorizePublication;
+  if (!selected && !retainedGuard) return attachments;
+  return {
+    attachments: bindGlassHiveNativeMediaAttachmentReferences(
+      text,
+      selected?.rows || [],
+      attachments,
+      identity.userId,
+      identity.responseMessageId,
+    ),
+    authorizePublication: async (session) => {
+      if (selected?.authorizePublication) await selected.authorizePublication(session);
+      if (retainedGuard) await retainedGuard(session);
+    },
+  };
 }
 async function prepareCurrentNativeOutputFiles(req, carrier, agentId, streamId) {
   const { GenerationJobManager } = require('@librechat/api');
@@ -244,6 +564,8 @@ module.exports = {
   nativeOutputFileLimit,
   nativeOutputFileLimits,
   prepareNativeOutputFiles,
+  prepareNativeResponseOutputFiles,
+  prepareRetainedNativeOutputFiles,
   prepareCurrentNativeOutputFiles,
   prepareMissionOutputFiles,
 };

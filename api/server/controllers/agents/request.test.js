@@ -15,6 +15,7 @@ const mockEnsureMorningBriefing = jest.fn(async () => undefined);
 const mockIsVoiceTaskSuppressed = jest.fn(() => false);
 const mockMessageFindOneAndDelete = jest.fn();
 const mockMessageExists = jest.fn(async () => false);
+const mockOriginalMessage = jest.fn();
 const mockConversationUpdateOne = jest.fn();
 const mockCommitAcceptedMainTurn = jest.fn(async () => ({ status: 'committed' }));
 const mockRecoverSavedNativeResponse = jest.fn();
@@ -95,6 +96,18 @@ jest.mock('~/db/models', () => ({
   ViventiumCortexInsightDelivery: {},
   Message: {
     exists: (...args) => mockMessageExists(...args),
+    findOne: (...args) => ({
+      select: () => ({
+        lean: async () => {
+          const original = await mockOriginalMessage(...args);
+          return original === undefined
+            ? (await mockMessageExists(...args))
+              ? {}
+              : null
+            : original;
+        },
+      }),
+    }),
     updateOne: jest.fn(async () => ({ matchedCount: 1, modifiedCount: 1 })),
     findOneAndDelete: (...args) => mockMessageFindOneAndDelete(...args),
   },
@@ -365,7 +378,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     'fallback_without_proof',
     'fallback_foreign_proof',
   ])(
-    'persists a closed failed snapshot only for an exact Native refusal release: %s',
+    'settled generation failure closes its snapshot without granting Native refusal authority: %s',
     async (mode) => {
       const released = mode === 'released' || mode === 'released_existing_error';
       const req = makeReq();
@@ -456,7 +469,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       expect(save[1]).toMatchObject({
         error: true,
         text: 'Known partial progress.',
-        unfinished: !released,
+        unfinished: false,
       });
       if (released)
         expect(save[1].content).toContainEqual(
@@ -466,7 +479,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
             error: 'Local AI capacity is busy. Please try again shortly.',
           }),
         );
-      else expect(save[1].content.some((part) => part.type === 'error')).toBe(false);
+      else expect(save[1].content.some((part) => part.type === 'error')).toBe(true);
       if (mode === 'released_existing_error') {
         const capacityErrors = save[1].content.filter(
           (part) => part.type === 'error' && part.error_class === 'host_capacity',
@@ -479,17 +492,8 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         });
         expect(save[1].text).not.toContain('Generation interrupted before completion.');
       }
-      if (released || mode.startsWith('fallback_')) {
-        expect(mockIsNativeCapacityRefusal).toHaveBeenCalledWith(
-          expect.objectContaining({
-            code: mode === 'fallback_other_error' ? 'upstream_unavailable' : 'host_capacity',
-          }),
-          expect.objectContaining({
-            invocationId: marker.invocationId,
-            bodySha256: marker.bodySha256,
-          }),
-        );
-      }
+      expect(mockGenerationJobManager.markMainResponseComplete).not.toHaveBeenCalled();
+      expect(mockCommitAcceptedMainTurn).not.toHaveBeenCalled();
       expect(mockGenerationJobManager.completeJob).toHaveBeenCalled();
       expect(mockGenerationJobManager.failRevokedNativeResponse).not.toHaveBeenCalled();
     },
@@ -506,7 +510,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     'new_body',
     'healthy_fallback',
   ])(
-    'persists the actual unsupported Native completion with exact refusal ownership: %s',
+    'failed unsupported host continuation closes while healthy fallback keeps its delivery owner: %s',
     async (mode) => {
       const req = makeReq();
       req.body.voiceMode = true;
@@ -575,12 +579,12 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       const save = mockSaveMessage.mock.calls.find(
         ([, , context]) =>
           context.context ===
-          (mode === 'released'
+          (mode !== 'healthy_fallback'
             ? 'api/server/controllers/agents/request.js - generation error snapshot'
             : 'native graph continuation owned by the host'),
       );
       expect(save).toBeDefined();
-      if (mode === 'released') {
+      if (mode !== 'healthy_fallback') {
         expect(save[1].unfinished).toBe(false);
         expect(save[1].error).toBe(true);
         expect(mockGenerationJobManager.markMainResponseComplete).not.toHaveBeenCalled();
@@ -670,6 +674,144 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       );
     },
   );
+  test.each(['flag_only', 'typed_error', 'authored_partial'])(
+    'an externally acknowledged unsupported host failure closes without a pending ACK (%s)',
+    async (kind) => {
+      const req = makeReq();
+      req.body.voiceMode = true;
+      req.body.viventiumVoiceTaskId = 'task-failed-host';
+      req.body.streamId = 'stream-1';
+      req.viventiumCallSession = { callSessionId: 'call-1' };
+      setTrustedInteractionContext(
+        req,
+        {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'voice',
+          conversation_id: 'conv-1',
+          revision: 1,
+          source_event_id: 'voice-failed-fallback',
+        },
+        { segment_stability: 'immediate', supersede_scope: 'response_only' },
+        { commit_authority: 'external_adapter' },
+      );
+      req._viventiumNativeResponseIdentity = { invocationId: 'unsupported-host' };
+      mockRecoverSavedNativeResponse.mockResolvedValueOnce(null);
+      mockGetNativeResponse.mockResolvedValue({ nativeResponse: { status: 'unsupported' } });
+      const client = makeClient(Promise.resolve());
+      client.admitMemoryWriter = jest.fn(async () => true);
+      const addTitle = jest.fn();
+      const part = {
+        type: 'error',
+        error_class: 'source_context_unavailable',
+        error: 'The conversation context could not be preserved. Please retry this turn.',
+      };
+      const cortex = {
+        type: 'cortex_insight',
+        cortex_id: 'supporting-evidence',
+        insight: 'Private supporting evidence.',
+      };
+      const content = [
+        cortex,
+        ...(kind === 'typed_error' ? [part] : []),
+        ...(kind === 'authored_partial' ? [{ type: 'text', text: 'Saved partial words.' }] : []),
+      ];
+      const original = client.sendMessage.getMockImplementation();
+      client.sendMessage.mockImplementation(async (...args) => ({
+        ...(await original(...args)),
+        error: true,
+        content,
+        text: kind === 'authored_partial' ? 'Saved partial words.' : '',
+      }));
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        addTitle,
+      );
+      await jest.advanceTimersByTimeAsync(120);
+      const save = mockSaveMessage.mock.calls.find(
+        ([, message, context]) =>
+          message.messageId === 'resp-msg-1' &&
+          context.context ===
+            'api/server/controllers/agents/request.js - generation error snapshot',
+      );
+      expect(save).toBeDefined();
+      expect(save[1]).toMatchObject({ error: true, unfinished: false });
+      expect(save[1].content).toContainEqual(cortex);
+      expect(save[1].content.filter((item) => item.type === 'error')).toHaveLength(1);
+      expect(save[1].text).toBe(kind === 'authored_partial' ? 'Saved partial words.' : '');
+      expect(client.admitMemoryWriter).not.toHaveBeenCalled();
+      expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+        'task-failed-host',
+        expect.objectContaining({ streamId: 'stream-1' }),
+        { error: expect.any(Error) },
+      );
+      expect(mockGenerationJobManager.emitDone).not.toHaveBeenCalled();
+      expect(mockGenerationJobManager.emitError).toHaveBeenCalledTimes(1);
+      expect(mockGenerationJobManager.completeJob).toHaveBeenCalledTimes(1);
+      expect(mockGenerationJobManager.acknowledgeStreamDelivery).not.toHaveBeenCalled();
+      expect(mockGenerationJobManager.markMainResponseComplete).not.toHaveBeenCalled();
+      expect(mockCommitAcceptedMainTurn).not.toHaveBeenCalled();
+      expect(addTitle).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each(['settled', 'user_cancelled', 'superseded'])(
+    'an error-publication failure preserves the %s presentation owner',
+    async (mode) => {
+      const req = makeReq();
+      req.body.streamId = 'stream-1';
+      const signal = { aborted: false };
+      mockGenerationJobManager.createJob.mockResolvedValue({
+        createdAt: 1,
+        abortController: { signal, abort: jest.fn() },
+        readyPromise: Promise.resolve(),
+        emitter: new EventEmitter(),
+      });
+      const client = makeClient(Promise.resolve());
+      client.contentParts = [{ type: 'text', text: 'Partial authored words.' }];
+      const original = client.sendMessage.getMockImplementation();
+      client.sendMessage.mockImplementation(async (...args) => {
+        await original(...args);
+        throw Object.assign(new Error('Public failure.'), { code: 'source_context_unavailable' });
+      });
+      mockGenerationJobManager.emitError.mockImplementationOnce(async () => {
+        if (mode === 'user_cancelled') signal.aborted = true;
+        if (mode === 'superseded') {
+          mockGenerationJobManager.getJob.mockResolvedValue({ createdAt: 1, status: 'superseded' });
+        }
+        throw Object.assign(new Error('Public failure.'), { code: 'source_context_unavailable' });
+      });
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        jest.fn(),
+      );
+      await jest.advanceTimersByTimeAsync(120);
+      const outer = mockSaveMessage.mock.calls.filter(
+        ([, , context]) =>
+          context.context ===
+          'api/server/controllers/agents/request.js - unhandled generation error snapshot',
+      );
+      if (mode === 'settled') {
+        expect(outer).toHaveLength(1);
+        expect(outer[0][1]).toMatchObject({
+          error: true,
+          unfinished: false,
+          text: 'Partial authored words.',
+        });
+        expect(outer[0][1].content.filter((item) => item.type === 'error')).toHaveLength(1);
+      } else {
+        expect(outer).toHaveLength(0);
+      }
+      expect(mockDecrementPendingRequest).toHaveBeenCalledTimes(1);
+    },
+  );
+
   test('a typed completion failure persists as failed with its original content', async () => {
     const req = makeReq();
     const client = makeClient(Promise.resolve());
@@ -694,7 +836,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     await jest.advanceTimersByTimeAsync(120);
     expect(mockSaveMessage).toHaveBeenCalledWith(
       req,
-      expect.objectContaining({ messageId: 'resp-msg-1', content, error: true }),
+      expect.objectContaining({ messageId: 'resp-msg-1', content, error: true, unfinished: false }),
       expect.any(Object),
     );
   });
@@ -726,6 +868,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         expect.objectContaining({
           messageId: 'resp-msg-1',
           error: true,
+          unfinished: false,
           ...(text ? { text } : {}),
         }),
         expect.any(Object),
@@ -1289,6 +1432,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
   });
 
   test('authors a web InteractionContext and does not trust privileged request fields', async () => {
+    const receivedAt = Date.now();
     const req = makeReq();
     req.body.messageId = 'web-source-event-1';
     req.body.interactionContext = {
@@ -1324,13 +1468,18 @@ describe('ResumableAgentController Phase B stream completion window', () => {
           conversation_id: 'conv-1',
           revision: 1,
           source_event_id: 'web-source-event-1',
+          source_received_at: receivedAt,
           source_segments: [
-            expect.objectContaining({
+            {
               ordinal: 0,
               source_event_id: 'web-source-event-1',
               source_index: 0,
+              source_message_id: '56be50c6-fe73-54f0-a4c5-0b2ed6e038eb',
+              source_parent_message_id: '00000000-0000-0000-0000-000000000000',
+              source_persisted: true,
+              source_received_at: receivedAt,
               text: 'hello',
-            }),
+            },
           ],
         },
         deliveryPolicy: { commit_authority: 'server' },
@@ -2135,6 +2284,78 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     expect(client.admitMemoryWriter).toHaveBeenCalledTimes(1);
   });
 
+  test.each(['server', 'external_adapter'])(
+    'R15 native FINAL precedes memory graph preparation and accepted admission (%s)',
+    async (authority) => {
+      const req = makeReq();
+      setTrustedInteractionContext(
+        req,
+        {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: authority === 'server' ? 'web' : 'telegram',
+          conversation_id: 'conv-1',
+          revision: 1,
+          source_event_id: 'native-memory-source',
+        },
+        { segment_stability: 'immediate', supersede_scope: 'response_and_authoring' },
+        { commit_authority: authority },
+      );
+      req._viventiumNativeResponseIdentity = { invocationId: 'native-memory' };
+      const presentation = { userId: req.user.id, responseMessageId: 'resp-msg-1' };
+      mockGenerationJobManager.acknowledgeStreamDelivery.mockResolvedValue({
+        status: 'recorded',
+        presentation,
+      });
+      let finishPreparation;
+      const graphPreparation = new Promise((resolve) => {
+        finishPreparation = resolve;
+      });
+      const client = makeClient(Promise.resolve());
+      client.prepareDeferredMemoryWriter = jest.fn(() => true);
+      client.startDeferredMemoryWriter = jest.fn(() => graphPreparation);
+      client.admitMemoryWriter = jest.fn(() => graphPreparation);
+      await AgentController(req, makeRes(), jest.fn(), async () => ({ client }), jest.fn());
+      await jest.advanceTimersByTimeAsync(120);
+      expect(mockGenerationJobManager.finishNativeResponse).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ memoryWriterScheduled: true }),
+      );
+      expect(client.prepareDeferredMemoryWriter).toHaveBeenCalledTimes(1);
+      expect(client.startDeferredMemoryWriter).not.toHaveBeenCalled();
+      if (authority === 'server') {
+        expect(mockCommitAcceptedMainTurn).toHaveBeenCalled();
+        expect(client.admitMemoryWriter).toHaveBeenCalledTimes(1);
+        expect(
+          mockGenerationJobManager.finishNativeResponse.mock.invocationCallOrder[0],
+        ).toBeLessThan(client.admitMemoryWriter.mock.invocationCallOrder[0]);
+      } else {
+        expect(client.admitMemoryWriter).not.toHaveBeenCalled();
+        client.options = null;
+        const { scheduleExternallyAcceptedMainCompaction } = require('@librechat/api');
+        expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'partial' })).toBe(
+          false,
+        );
+        expect(
+          scheduleExternallyAcceptedMainCompaction(
+            { ...presentation, userId: 'foreign' },
+            { status: 'committed' },
+          ),
+        ).toBe(false);
+        expect(
+          scheduleExternallyAcceptedMainCompaction(presentation, { status: 'committed' }),
+        ).toBe(true);
+        await Promise.resolve();
+        expect(client.admitMemoryWriter).toHaveBeenCalledTimes(1);
+        expect(
+          scheduleExternallyAcceptedMainCompaction(presentation, { status: 'already_committed' }),
+        ).toBe(false);
+      }
+      finishPreparation(true);
+      await Promise.resolve();
+    },
+  );
+
   test('durably removes an unfinished older assistant revision when the next revision starts', async () => {
     const persistedRows = [
       {
@@ -2663,6 +2884,91 @@ describe('voice task cancellation persistence barrier', () => {
 });
 
 describe('rapid input before asynchronous initialization', () => {
+  test('original Web receipt precedes awaited admission and does not use preparation completion time', async () => {
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(1000);
+    const admission = deferred();
+    mockCheckAndIncrementPendingRequest.mockImplementationOnce(() => admission.promise);
+    const req = makeReq();
+    req.body.streamId = 'stream-1';
+    mockGenerationJobManager.createJob.mockResolvedValue({
+      streamId: 'stream-1',
+      abortController: new AbortController(),
+      emitter: new EventEmitter(),
+    });
+    const request = AgentController(
+      req,
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => {
+        throw new Error('Synthetic initialization stop');
+      }),
+      jest.fn(),
+    );
+    await Promise.resolve();
+    clock.mockReturnValue(5000);
+    admission.resolve({ allowed: true, pendingRequests: 0, limit: 10 });
+    try {
+      await request;
+      const context =
+        require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(req);
+      expect(context.source_received_at).toBe(1000);
+      expect(context.source_segments[0].source_received_at).toBe(1000);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test.each([
+    ['new', null, 2000],
+    [
+      'retained',
+      {
+        metadata: {
+          viventium: { originalInputReceipt: { sourceEventId: 'source-a', receivedAt: 1000 } },
+        },
+      },
+      1000,
+    ],
+    ['legacy', {}, undefined],
+  ])(
+    'preserves server original input receipt for %s without re-admission backfill',
+    async (_name, original, expected) => {
+      const req = makeReq();
+      req.body.metadata = {
+        viventium: { originalInputReceipt: { sourceEventId: 'source-a', receivedAt: 999999 } },
+      };
+      setTrustedInteractionContext(req, {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'telegram',
+        conversation_id: 'conv-1',
+        source_event_id: 'source-a',
+        source_received_at: 2000,
+      });
+      mockOriginalMessage.mockImplementationOnce(async () => original);
+      const result = await AgentController.captureAcceptedInteractionInput(req, {
+        conversationId: 'conv-1',
+        text: 'Owner reply',
+      });
+      expect(mockOriginalMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user: req.user.id,
+          conversationId: 'conv-1',
+          isCreatedByUser: true,
+        }),
+      );
+      expect(result.source_received_at).toBe(expected);
+      expect(result.source_segments[0].source_received_at).toBe(expected);
+      if (original) expect(mockSaveMessage).not.toHaveBeenCalled();
+      else
+        expect(mockSaveMessage.mock.calls[0][1].metadata.viventium.originalInputReceipt).toEqual({
+          sourceEventId: 'source-a',
+          receivedAt: 2000,
+        });
+      mockOriginalMessage.mockReset();
+    },
+  );
+
   beforeEach(() => {
     jest.clearAllMocks();
     mockMessageExists.mockResolvedValue(false);

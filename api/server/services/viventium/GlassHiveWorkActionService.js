@@ -8,6 +8,7 @@ const {
   trustedUploadedFilesFromRequestBody,
 } = require('@librechat/api');
 const { getMessages, getFiles } = require('~/models');
+const { Message } = require('~/db/models');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { projectTrustedClientPresentation } = require('./interactionContext');
 const {
@@ -24,6 +25,18 @@ const {
 
 module.exports = createGlassHiveWorkActionService({
   GenerationJobManager,
+  getSourceAuthorJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
+  getOriginalInputReceipt: async ({ userId, conversationId, sourceMessageId }) => {
+    const message = await Message.findOne({
+      user: userId,
+      conversationId,
+      messageId: sourceMessageId,
+      isCreatedByUser: true,
+    })
+      .select('metadata.viventium.originalInputReceipt')
+      .lean();
+    return message?.metadata?.viventium?.originalInputReceipt;
+  },
   assertVoiceWorkAuthority: (...args) =>
     require('./VoiceWorkAuthorityService').assertVoiceWorkAuthority(...args),
   logger,
@@ -83,6 +96,10 @@ module.exports = createGlassHiveWorkActionService({
   },
   reauthorizeCapabilityAuthorization: (...args) =>
     require('./GlassHiveCapabilityAuthorizationService').reauthorizeCapabilityAuthorization(
+      ...args,
+    ),
+  readCapabilityReauthorizationReceiptCandidate: (...args) =>
+    require('./GlassHiveCapabilityAuthorizationService').readCapabilityReauthorizationReceiptCandidate(
       ...args,
     ),
   dismissCoreOnlyPreDispatchAttention,

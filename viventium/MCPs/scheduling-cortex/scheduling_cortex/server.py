@@ -2597,7 +2597,7 @@ def main() -> None:
     storage = ScheduleStorage(StorageConfig(db_path=db_path, mirror_db_path=mirror_path))
     # === VIVENTIUM NOTE ===
 
-    poll_interval_s = int(os.getenv("SCHEDULER_POLL_INTERVAL_S", "30"))
+    poll_interval_s = int(os.getenv("SCHEDULER_POLL_INTERVAL_S", "1"))
     misfire_grace_s = int(os.getenv("SCHEDULER_MISFIRE_GRACE_S", "900"))
     retry_delay_s = int(os.getenv("SCHEDULER_RETRY_DELAY_S", "300"))
     catch_up_max_late_s = int(os.getenv("SCHEDULER_CATCH_UP_MAX_LATE_S", "43200"))

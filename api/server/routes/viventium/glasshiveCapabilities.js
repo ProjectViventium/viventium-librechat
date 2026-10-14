@@ -9,6 +9,8 @@
  * === VIVENTIUM END === */
 
 const express = require('express');
+const { createHash } = require('node:crypto');
+const { performance } = require('node:perf_hooks');
 const { logger } = require('@librechat/data-schemas');
 const { getAppConfig } = require('~/server/services/Config');
 /* === VIVENTIUM START ===
@@ -94,6 +96,42 @@ function rpcError(id, code, message, data) {
 async function handleRpc(req, res) {
   const body = req.body || {};
   const id = body.id ?? null;
+  /* === VIVENTIUM START === Redacted broker transport measurements. === */
+  const startedAt = performance.now();
+  const method = [
+    'initialize',
+    'notifications/initialized',
+    'initialized',
+    'ping',
+    'tools/list',
+    'tools/call',
+  ].includes(body.method)
+    ? body.method
+    : 'unsupported';
+  let grantIdSha256 = null;
+  const recordResponse = (finished) => {
+    res.removeListener('finish', onFinish);
+    res.removeListener('close', onClose);
+    try {
+      logger.info(
+        JSON.stringify({
+          event: 'glasshive_broker_request',
+          method,
+          status: finished ? res.statusCode : null,
+          duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+          grant_id_sha256: grantIdSha256,
+          outcome: finished ? 'response_finished' : 'connection_closed',
+        }),
+      );
+    } catch {
+      // Diagnostic output must not change the MCP response or cancellation path.
+    }
+  };
+  const onFinish = () => recordResponse(true);
+  const onClose = () => recordResponse(false);
+  res.once('finish', onFinish);
+  res.once('close', onClose);
+  /* === VIVENTIUM END === */
   res.set('Cache-Control', 'no-store, private');
   const signal = requestLifetimeSignal(req, res);
   let grant;
@@ -106,6 +144,9 @@ async function handleRpc(req, res) {
       // rolling upgrade only; all newly minted grants are tenant-bound v2 grants.
       allowLegacyTenantless: true,
     });
+    if (typeof verifiedGrant.grant_id === 'string' && verifiedGrant.grant_id) {
+      grantIdSha256 = createHash('sha256').update(verifiedGrant.grant_id).digest('hex');
+    }
     await assertBrokerGrantActive(verifiedGrant);
     if (String(verifiedGrant?.authorization_ref || '').trim()) {
       await assertActiveCapabilityAuthorizationGrant(verifiedGrant);
@@ -207,6 +248,9 @@ async function handleRpc(req, res) {
     }
     return res.status(400).json(rpcError(id, -32601, 'Method not found'));
   } catch (error) {
+    if (error?.code === 'active_work_arguments_invalid') {
+      return res.status(400).json(rpcError(id, -32602, error.message));
+    }
     logger.error('[VIVENTIUM][glasshive-capability-broker] Broker RPC failed', {
       message: error?.message,
     });

@@ -8,7 +8,7 @@ const mockSelection = new Map<string, number>();
 jest.mock('recoil', () => ({
   useRecoilCallback: (
     factory: (arg: { snapshot: { getPromise: (key: string) => Promise<number> } }) => object,
-  ) => factory({ snapshot: { getPromise: async (key: string) => mockSelection.get(key) ?? 0 } }),
+  ) => factory({ snapshot: { getPromise: async (key: string) => mockSelection.get(key) ?? -1 } }),
 }));
 jest.mock('~/store', () => ({
   __esModule: true,
@@ -196,5 +196,28 @@ test('selected-branch export retains callback results and current answers with t
     ['new-answer', 'anchor'],
   ]);
   expect(JSON.stringify(input)).toBe(original);
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Export uses the same reload default and explicit selection as chat. === */
+test.each([
+  [-1, ['older-root', 'recent-answer']],
+  [0, ['newer-root']],
+] as const)('selected-branch export respects selection %s', async (selection, expected) => {
+  const input = [
+    {
+      ...row('older-root', true, [
+        { ...row('recent-answer'), createdAt: '2026-01-01T18:00:00.000Z' },
+      ]),
+      createdAt: '2026-01-01T10:00:00.000Z',
+    },
+    { ...row('newer-root', true), createdAt: '2026-01-01T11:00:00.000Z' },
+  ];
+  mockSelection.set('anchor', selection);
+  const { result } = renderHook(() => useBuildMessageTree());
+  const exported = await result.current({ messageId: 'anchor', message: null, messages: input });
+  expect(Array.isArray(exported) && exported.map((message) => message?.messageId)).toEqual(
+    expected,
+  );
 });
 /* === VIVENTIUM END === */

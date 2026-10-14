@@ -314,10 +314,12 @@ const audioRunFamily = atomFamily<string | null, string | number | null>({
   default: null,
 });
 
+/* === VIVENTIUM START === An unset selection follows ordinary branch activity, not root order. === */
 const messagesSiblingIdxFamily = atomFamily<number, string | null | undefined>({
   key: 'messagesSiblingIdx',
-  default: 0,
+  default: -1,
 });
+/* === VIVENTIUM END === */
 
 function useCreateConversationAtom(key: string | number) {
   const hasSetConversation = useSetConvoContext();

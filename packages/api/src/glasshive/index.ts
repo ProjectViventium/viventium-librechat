@@ -12,6 +12,7 @@ export * from './conversationOrchestration';
 export * from './workActionService';
 export * from './activeWorkTools';
 export * from './workResultService';
+export * from './workDeliveryScope';
 export * from './orchestrationTools';
 export * from './capabilityAuthorization';
 export * from './cortexToolEvidence';

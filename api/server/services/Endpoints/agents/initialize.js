@@ -1431,21 +1431,6 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       logger.warn(
         `[agentLlmFallback] Handoff provider initialization recovered through configured fallback for agent ${agentId}: ${handoffFallbackAssignment.provider}/${handoffFallbackAssignment.model}`,
       );
-      /* === VIVENTIUM START ===
-       * Feature: Participant reconnect disclosure.
-       * Purpose: When a participant answers through its configured fallback because its own
-       * connected account needs reconnect, the turn carries one actionable notice with the answer.
-       * === VIVENTIUM END === */
-      const participantPrimaryError = handoffInitialization.primaryError;
-      if (
-        participantPrimaryError?.viventiumConnectedAccountReconnectRequired === true &&
-        !req._viventiumParticipantReconnectRecovery
-      ) {
-        req._viventiumParticipantReconnectRecovery = Object.freeze({
-          provider: String(participantPrimaryError.viventiumConnectedAccountProvider || '').trim(),
-          model: handoffFallbackAssignment.model,
-        });
-      }
     }
     if (materializeInto) {
       Object.defineProperties(materializeInto, Object.getOwnPropertyDescriptors(config));

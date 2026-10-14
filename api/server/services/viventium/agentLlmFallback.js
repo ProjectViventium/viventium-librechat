@@ -322,6 +322,7 @@ function isNonRetryableFallbackErrorClass(value) {
 function isRecoverableFallbackErrorClass(value) {
   const normalized = normalizeFallbackErrorClass(value);
   return [
+    'native_mcp_unavailable',
     'provider_rate_limited',
     'provider_quota_exhausted',
     'provider_quota_or_billing',

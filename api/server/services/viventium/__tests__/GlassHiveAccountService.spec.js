@@ -252,7 +252,7 @@ describe('GlassHiveAccountService', () => {
     expect(mockUpdateUserViventiumOrchestrationPreferences).not.toHaveBeenCalled();
   });
 
-  test('keeps interactive roster paging separate from the Main cold-start budget', async () => {
+  test('keeps the full refresh transport budget separate from the Main cold caller wait', async () => {
     const timeoutSpy = jest
       .spyOn(AbortSignal, 'timeout')
       .mockImplementation(() => new AbortController().signal);
@@ -272,7 +272,7 @@ describe('GlassHiveAccountService', () => {
     expect(timeoutSpy).toHaveBeenLastCalledWith(4321);
 
     await getActiveWorkSnapshot({ ownerId: 'owner-cold', fetchImpl });
-    expect(timeoutSpy).toHaveBeenLastCalledWith(100);
+    expect(timeoutSpy).toHaveBeenLastCalledWith(4321);
 
     await getActiveWorkInteractiveSnapshot({ ownerId: 'owner-interactive-snapshot', fetchImpl });
     expect(timeoutSpy).toHaveBeenLastCalledWith(4321);
@@ -423,6 +423,7 @@ describe('GlassHiveAccountService', () => {
     } = require('../GlassHiveAccountService');
 
     const olderCold = getActiveWorkSnapshot({ ownerId: 'owner-monotonic', fetchImpl });
+    process.env.VIVENTIUM_ACTIVE_WORK_INTERACTIVE_TIMEOUT_MS = '4322';
     const newerInteractive = getActiveWorkInteractiveSnapshot({
       ownerId: 'owner-monotonic',
       fetchImpl,
@@ -474,6 +475,7 @@ describe('GlassHiveAccountService', () => {
       ownerId: 'owner-positive-dominates',
       fetchImpl,
     });
+    process.env.VIVENTIUM_ACTIVE_WORK_INTERACTIVE_TIMEOUT_MS = '4322';
     const newerEmpty = getActiveWorkSnapshot({
       ownerId: 'owner-positive-dominates',
       fetchImpl,
@@ -1001,7 +1003,7 @@ describe('GlassHiveAccountService', () => {
     } = require('../GlassHiveAccountService');
 
     const pendingOld = getActiveWorkSnapshot({ ownerId: 'owner-invalidate', fetchImpl });
-    invalidateActiveWorkSnapshot({ ownerId: 'owner-invalidate' });
+    invalidateActiveWorkSnapshot({ ownerId: 'owner-invalidate', fetchImpl });
     const newSnapshot = await getActiveWorkSnapshot({ ownerId: 'owner-invalidate', fetchImpl });
     expect(newSnapshot.work).toEqual([expect.objectContaining({ workRef: 'new-work' })]);
 
@@ -1052,7 +1054,7 @@ describe('GlassHiveAccountService', () => {
     } = require('../GlassHiveAccountService');
 
     const pendingOld = getActiveWorkSnapshot({ ownerId: 'owner-empty-race', fetchImpl });
-    invalidateActiveWorkSnapshot({ ownerId: 'owner-empty-race' });
+    invalidateActiveWorkSnapshot({ ownerId: 'owner-empty-race', fetchImpl });
     await getActiveWorkSnapshot({ ownerId: 'owner-empty-race', fetchImpl });
 
     releaseOldRefresh();
@@ -1099,7 +1101,7 @@ describe('GlassHiveAccountService', () => {
     } = require('../GlassHiveAccountService');
 
     const stalePositive = getActiveWorkSnapshot({ ownerId: 'owner-dismissed', fetchImpl });
-    invalidateActiveWorkSnapshot({ ownerId: 'owner-dismissed' });
+    invalidateActiveWorkSnapshot({ ownerId: 'owner-dismissed', fetchImpl });
     await getActiveWorkSnapshot({ ownerId: 'owner-dismissed', fetchImpl });
     releaseOldPositive();
     await stalePositive;
@@ -1129,7 +1131,12 @@ describe('GlassHiveAccountService', () => {
     } = require('../GlassHiveAccountService');
 
     const pendingOldPage = getActiveWorkPage({ ownerId: 'owner-direct-race', fetchImpl });
-    invalidateActiveWorkSnapshot({ ownerId: 'owner-direct-race' });
+    invalidateActiveWorkSnapshot({
+      ownerId: 'owner-direct-race',
+      fetchImpl: async () => {
+        throw new Error('synthetic outage');
+      },
+    });
     releaseOldPage();
     await pendingOldPage;
 

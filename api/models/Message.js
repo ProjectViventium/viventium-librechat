@@ -87,7 +87,71 @@ function sanitizePrivateMessageContent(value, ancestors = new WeakSet()) {
   }
 }
 
-function sanitizeMessageForPersistence(message) {
+/* === VIVENTIUM START ===
+ * Original human input receipts are server-owned immutable metadata. Dotted updates preserve
+ * the reserved leaf without an extra read; only the first authenticated source insert stamps it.
+ */
+const ORIGINAL_INPUT_RECEIPT_PATH = 'metadata.viventium.originalInputReceipt';
+function protectsOriginalInputReceipt(path) {
+  return (
+    path === 'metadata' ||
+    path === 'metadata.viventium' ||
+    path === ORIGINAL_INPUT_RECEIPT_PATH ||
+    path.startsWith(`${ORIGINAL_INPUT_RECEIPT_PATH}.`)
+  );
+}
+function sanitizeOriginalInputReceiptUpdate(update) {
+  const result = {};
+  const write = (target, path, value, operator) => {
+    if (
+      (path === 'metadata' || path === 'metadata.viventium') &&
+      (operator === '$set' || operator === '$setOnInsert' || !operator)
+    ) {
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        for (const [key, item] of Object.entries(value))
+          write(target, `${path}.${key}`, item, operator);
+      }
+      return;
+    }
+    if (
+      protectsOriginalInputReceipt(path) ||
+      (operator === '$rename' && protectsOriginalInputReceipt(String(value)))
+    )
+      return;
+    target[path] = value;
+  };
+  for (const [key, value] of Object.entries(update)) {
+    if (key.startsWith('$') && value && typeof value === 'object' && !Array.isArray(value)) {
+      const operands = {};
+      for (const [path, item] of Object.entries(value)) write(operands, path, item, key);
+      result[key] = operands;
+    } else write(result, key, value);
+  }
+  return result;
+}
+function originalInputReceiptForInsert(req, update) {
+  if (update.isCreatedByUser !== true) return null;
+  const context =
+    require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(req);
+  if (
+    !context ||
+    context.actor_kind !== 'external_user' ||
+    context.origin !== 'interactive' ||
+    context.conversation_id !== update.conversationId ||
+    !Number.isSafeInteger(context.source_received_at) ||
+    context.source_received_at <= 0 ||
+    !context.source_segments?.some(
+      (segment) =>
+        segment.source_event_id === context.source_event_id &&
+        segment.source_message_id === update.messageId,
+    )
+  )
+    return null;
+  return { sourceEventId: context.source_event_id, receivedAt: context.source_received_at };
+}
+/* === VIVENTIUM END === */
+
+function sanitizeMessageForPersistence(message, { purpose = 'update' } = {}) {
   if (!message || typeof message !== 'object') {
     return message;
   }
@@ -158,7 +222,30 @@ function sanitizeMessageForPersistence(message) {
       sanitizedMessage[key] = sanitizePrivateMessageContent(sanitizedMessage[key]);
     }
   }
-  return sanitizeMainContextUpdate(sanitizedMessage);
+  const protectedMessage = sanitizeMainContextUpdate(sanitizedMessage);
+  if (purpose !== 'document') return sanitizeOriginalInputReceiptUpdate(protectedMessage);
+  // Native snapshots are documents, not Mongo update operands. Keep their metadata carrier.
+  const document = { ...protectedMessage };
+  for (const key of Object.keys(document)) {
+    if (key !== 'metadata' && protectsOriginalInputReceipt(key)) delete document[key];
+  }
+  if (
+    document.metadata &&
+    typeof document.metadata === 'object' &&
+    !Array.isArray(document.metadata)
+  ) {
+    const metadata = { ...document.metadata };
+    if (
+      metadata.viventium &&
+      typeof metadata.viventium === 'object' &&
+      !Array.isArray(metadata.viventium)
+    ) {
+      metadata.viventium = { ...metadata.viventium };
+      delete metadata.viventium.originalInputReceipt;
+    }
+    document.metadata = metadata;
+  }
+  return document;
 }
 
 /* === VIVENTIUM START === Reserved Main authority is retained inside the existing write transaction. === */
@@ -460,6 +547,10 @@ async function saveMessage(req, params, metadata) {
       }).lean();
       update = mergeExistingTextIntoCortexOnlyUpdate(update, existing);
     }
+    const receipt = originalInputReceiptForInsert(req, update);
+    update = sanitizeOriginalInputReceiptUpdate(update);
+    if (receipt)
+      update.$setOnInsert = { ...update.$setOnInsert, [ORIGINAL_INPUT_RECEIPT_PATH]: receipt };
     const options = { upsert: true, new: true };
     /* === VIVENTIUM START ===
      * Feature: Deterministic timestamp preservation for imported/callback messages
@@ -1197,6 +1288,8 @@ module.exports = {
     shouldSkipConversationRecallSync,
     sanitizePrivateMessageContent,
     sanitizeMessageForPersistence,
+    sanitizeOriginalInputReceiptUpdate,
+    originalInputReceiptForInsert,
     containsPendingLegacyCortexRecovery,
     rejectsPendingLegacyRecoveryReplacement,
     buildMessageAncestorBranchPipeline,

@@ -50,6 +50,8 @@ export interface InteractionSourceSegment {
   ordinal: number;
   source_event_id: string;
   source_index: number;
+  /** First authenticated original input receipt; never re-admission time. */
+  source_received_at?: number;
   source_sequence?: number;
   source_message_id?: string;
   source_persisted?: true;
@@ -122,11 +124,20 @@ export function normalizeInteractionSourceSegments(
         ordinal: 0,
         source_event_id: sourceEventId,
         source_index: sourceIndex,
+        ...(Number.isSafeInteger(candidate.source_received_at) &&
+        Number(candidate.source_received_at) > 0
+          ? { source_received_at: Number(candidate.source_received_at) }
+          : {}),
         ...(Number.isSafeInteger(candidate.source_sequence) && Number(candidate.source_sequence) > 0
-          ? { source_sequence: Number(candidate.source_sequence) } : {}),
+          ? { source_sequence: Number(candidate.source_sequence) }
+          : {}),
         ...(candidate.source_persisted === true ? { source_persisted: true as const } : {}),
-        ...(boundedIdentifier(candidate.source_message_id) ? { source_message_id: boundedIdentifier(candidate.source_message_id) } : {}),
-        ...(boundedIdentifier(candidate.source_parent_message_id) ? { source_parent_message_id: boundedIdentifier(candidate.source_parent_message_id) } : {}),
+        ...(boundedIdentifier(candidate.source_message_id)
+          ? { source_message_id: boundedIdentifier(candidate.source_message_id) }
+          : {}),
+        ...(boundedIdentifier(candidate.source_parent_message_id)
+          ? { source_parent_message_id: boundedIdentifier(candidate.source_parent_message_id) }
+          : {}),
         text: clipped.text,
         ...(sourceFiles.length ? { source_files: sourceFiles } : {}),
         ...(replyContext ? { reply_context: replyContext } : {}),

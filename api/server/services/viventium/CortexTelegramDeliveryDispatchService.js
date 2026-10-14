@@ -319,6 +319,11 @@ function createCortexTelegramDeliveryDispatchService({
         telegramMessageThreadId: normalizeText(authority.ingress.telegramMessageThreadId),
         sourceSequence: Number(authority.ingress.sourceSequence),
         text: String(message?.text || authority.followup.text),
+        ...(message?.metadata?.viventium?.telegramDeliveryControls
+          ? { deliveryControls: message.metadata.viventium.telegramDeliveryControls }
+          : authority.followup?.metadata?.viventium?.telegramDeliveryControls
+            ? { deliveryControls: authority.followup.metadata.viventium.telegramDeliveryControls }
+            : {}),
         logicalTurnId: normalizeText(parentContext.logical_turn_id),
         logicalTurnRevision: Number(parentContext.revision),
         cortexClaim,

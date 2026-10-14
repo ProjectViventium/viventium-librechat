@@ -2079,7 +2079,13 @@ class ScheduleStorage:
             else:
                 existing = dict(row)
                 state = str(existing.get("state") or "").strip()
-                if str(existing.get("payload_hash") or "") != str(payload_hash).strip():
+                # A committed or uncertain immutable presentation cannot be replaced by
+                # fresh preferences. Return its original receipt before comparing new input.
+                if state == "sent":
+                    reason = "already_sent"
+                elif state == "delivery_unknown":
+                    reason = "delivery_unknown"
+                elif str(existing.get("payload_hash") or "") != str(payload_hash).strip():
                     conn.execute(
                         """
                         UPDATE scheduled_prompt_deliveries
@@ -2091,10 +2097,6 @@ class ScheduleStorage:
                         (now_iso, now_iso, delivery_key),
                     )
                     reason = "payload_conflict"
-                elif state == "sent":
-                    reason = "already_sent"
-                elif state == "delivery_unknown":
-                    reason = "delivery_unknown"
                 else:
                     lease_until = self._parse_utc_instant(existing.get("lease_until"))
                     if lease_until is not None and lease_until > now_dt:

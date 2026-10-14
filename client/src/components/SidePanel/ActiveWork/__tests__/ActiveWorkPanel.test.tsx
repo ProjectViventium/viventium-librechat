@@ -576,6 +576,53 @@ describe('Active work Control Panel', () => {
     expect(actionMutation.mutate.mock.calls[1][0].operationId).toBe(firstCall[0].operationId);
   });
 
+  test('keeps an unapplied instruction and reports the authoritative no-op', () => {
+    jest.requireMock('~/hooks').useAuthContext.mockReturnValue({ user: { id: 'owner-a' } });
+    setWork({
+      work: [
+        { workRef: 'work-race', title: 'Build the report', state: 'running', actions: ['steer'] },
+      ],
+    });
+    render(<ActiveWorkPanel />);
+    fireEvent.change(screen.getByLabelText('com_ui_parallel_work_instruction'), {
+      target: { value: 'Use the corrected direction.' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'com_ui_parallel_work_action_steer' }));
+    const options = actionMutation.mutate.mock.calls[0][1];
+    act(() => options.onSuccess({ controlOutcome: 'terminal_won', state: 'cancelled' }));
+    expect(screen.getByLabelText('com_ui_parallel_work_instruction')).toHaveValue(
+      'Use the corrected direction.',
+    );
+    expect(useToastContext().showToast).toHaveBeenCalledWith({
+      message: 'com_ui_parallel_work_action_not_applied',
+      status: 'error',
+    });
+    expect(
+      window.localStorage.getItem('viventium.parallel-work.action-operations.v2.owner-a'),
+    ).toBe('{}');
+  });
+
+  test('clears the instruction only after the reserved direction is accepted', () => {
+    setWork({
+      work: [
+        { workRef: 'work-race', title: 'Build the report', state: 'running', actions: ['steer'] },
+      ],
+    });
+    render(<ActiveWorkPanel />);
+    fireEvent.change(screen.getByLabelText('com_ui_parallel_work_instruction'), {
+      target: { value: 'Use the corrected direction.' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'com_ui_parallel_work_action_steer' }));
+    act(() =>
+      actionMutation.mutate.mock.calls[0][1].onSuccess({ state: 'queued', status: 'queued' }),
+    );
+    expect(screen.getByLabelText('com_ui_parallel_work_instruction')).toHaveValue('');
+    expect(useToastContext().showToast).toHaveBeenCalledWith({
+      message: 'com_ui_parallel_work_action_accepted',
+      status: 'success',
+    });
+  });
+
   test('requires an instruction before message or steer actions', () => {
     setWork({
       work: [

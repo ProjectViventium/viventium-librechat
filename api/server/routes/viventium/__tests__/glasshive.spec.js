@@ -4,8 +4,6 @@
  * === VIVENTIUM END === */
 
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
 const express = require('express');
 
 let mockSaveMessage;
@@ -27,6 +25,13 @@ let mockConversationUpdateOne;
 let mockGetCallSession;
 let mockClaimOrReplaceCallSessionConversationId;
 let mockRecordTraceDelivery;
+let mockRunCallbackTransaction;
+let mockRegisterNativeVoiceCapabilities;
+let mockRequestCurrentWork;
+
+jest.mock('~/server/services/viventium/GlassHiveAccountService', () => ({
+  requestAccountApi: (...args) => mockRequestCurrentWork(...args),
+}));
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
@@ -81,6 +86,10 @@ jest.mock('~/server/services/viventium/GlassHiveCallbackBindingService', () => (
   notifySchedulerExternalWorkSummary: (...args) => mockNotifySchedulerExternalWorkSummary(...args),
   recordGlassHiveSurfaceDeliveryOutcome: (...args) =>
     mockRecordGlassHiveSurfaceDeliveryOutcome(...args),
+  isGlassHiveNonterminalAttentionCallback: (body = {}) =>
+    require('@librechat/api')
+      .createGlassHiveCallbackBindingService({})
+      .isGlassHiveNonterminalAttentionCallback(body),
   isGlassHiveWorkTerminalCallback: (body = {}) =>
     body.work_terminal === true &&
     ['completed', 'failed', 'cancelled'].includes(String(body.work_state || '').toLowerCase()),
@@ -95,6 +104,22 @@ jest.mock('~/server/services/viventium/GlassHiveMissionAdjudicationService', () 
   enqueueGlassHiveMissionAdjudication: (...args) =>
     mockEnqueueGlassHiveMissionAdjudication(...args),
 }));
+
+jest.mock('~/server/services/viventium/GlassHiveTerminalCallbackTransaction', () => ({
+  ...jest.requireActual('~/server/services/viventium/GlassHiveTerminalCallbackTransaction'),
+  runGlassHiveTerminalCallbackTransaction: (...args) => mockRunCallbackTransaction(...args),
+}));
+
+jest.mock('~/server/services/viventium/GlassHiveVoiceTaskActionService', () => {
+  const actual = jest.requireActual('~/server/services/viventium/GlassHiveVoiceTaskActionService');
+  return {
+    ...actual,
+    registerGlassHiveVoiceTaskActionCapabilities: (...args) =>
+      mockRegisterNativeVoiceCapabilities
+        ? mockRegisterNativeVoiceCapabilities(...args)
+        : actual.registerGlassHiveVoiceTaskActionCapabilities(...args),
+  };
+});
 
 jest.mock('~/server/services/viventium/CallSessionService', () => ({
   getCallSession: (...args) => mockGetCallSession(...args),
@@ -256,6 +281,8 @@ function dispatch(app, req, res) {
 
 describe('/api/viventium/glasshive/callback', () => {
   beforeEach(() => {
+    mockRegisterNativeVoiceCapabilities = null;
+    mockRunCallbackTransaction = jest.fn((operation) => operation(null));
     mockCleanupSourceTombstoned = jest.fn().mockResolvedValue(false);
     mockSaveMessage = jest.fn().mockResolvedValue({});
     mockUpdateMessage = jest.fn().mockResolvedValue({});
@@ -332,9 +359,9 @@ describe('/api/viventium/glasshive/callback', () => {
 
   test.each([
     ['run.completed', 'internal'],
-    ['run.failed', undefined],
-    ['run.needs_input', undefined],
-    ['artifact.created', undefined],
+    ['run.failed', 'internal'],
+    ['run.needs_input', 'internal'],
+    ['artifact.created', 'internal'],
   ])('keeps %s lifecycle visibility correct at first persistence', async (event, visibility) => {
     const router = require('../glasshive');
     const app = createTestApp(router);
@@ -349,6 +376,24 @@ describe('/api/viventium/glasshive/callback', () => {
       }),
       res,
     );
+    if (body.event === 'run.needs_input' && !body.pending_native_input) {
+      expect(res.statusCode).toBe(202);
+      expect(res.body.reason).toBe('main_adjudication_pending');
+      expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            event: 'run.needs_input',
+            work_terminal: false,
+            worker_id: body.worker_id,
+            run_id: body.run_id,
+          }),
+        }),
+      );
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockUpdateMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+      return;
+    }
     expect(res.statusCode).toBe(200);
     expect(mockSaveMessage).toHaveBeenCalledTimes(1);
     const [, message] = mockSaveMessage.mock.calls[0];
@@ -356,7 +401,7 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(message.metadata.viventium.hasFullText).toBe(false);
     expect(message.metadata.viventium.event).toBe(event);
     expect(message.metadata.viventium.workRef).toBe(body.work_ref);
-    expect(message.content[0].text).toBe(message.text);
+    expect(message.content).toEqual([]);
   });
 
   test('maps signed voice worker callbacks into one monotonic run-scoped task', async () => {
@@ -1172,15 +1217,64 @@ describe('/api/viventium/glasshive/callback', () => {
     }
   });
 
-  test('keeps GlassHive placeholder text aligned with the agent fallback placeholder', () => {
-    const glasshiveSource = fs.readFileSync(path.join(__dirname, '../glasshive.js'), 'utf8');
-    const agentRequestSource = fs.readFileSync(
-      path.join(__dirname, '../../../controllers/agents/request.js'),
-      'utf8',
+  test.each([null, 17, 'not-a-clock', '2026-02-31T00:00:00Z', '2026-01-01T00:00:00+05:00'])(
+    'rejects malformed signed native callback creation clock %p',
+    async (clock) => {
+      const body = callbackBody({ event: 'run.needs_input', callback_created_at: clock });
+      const res = createMockRes();
+      await dispatch(
+        createTestApp(require('../glasshive')),
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(body) },
+          body,
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(400);
+      expect(res.body.error).toBe('invalid_callback_creation_clock');
+      expect(mockEnqueueGlassHiveMissionAdjudication).not.toHaveBeenCalled();
+    },
+  );
+  test('the immutable callback creation clock is covered by existing HMAC', async () => {
+    const body = callbackBody({
+      event: 'run.needs_input',
+      callback_created_at: '2026-01-01T00:00:00.123456+00:00',
+    });
+    const res = createMockRes();
+    await dispatch(
+      createTestApp(require('../glasshive')),
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body: { ...body, callback_created_at: '2026-01-01T00:01:00.123456+00:00' },
+      }),
+      res,
     );
-
-    expect(glasshiveSource).toContain("'generation in progress.'");
-    expect(agentRequestSource).toMatch(/fallbackText(?:\s*=|:)\s*'Generation in progress\.'/);
+    expect(res.statusCode).toBe(401);
+    expect(mockEnqueueGlassHiveMissionAdjudication).not.toHaveBeenCalled();
+  });
+  test('forwards the exact signed native outbox clock to existing Main evidence admission', async () => {
+    const body = callbackBody({
+      event: 'run.needs_input',
+      callback_created_at: '2026-01-01T00:00:00.123456+00:00',
+    });
+    const res = createMockRes();
+    await dispatch(
+      createTestApp(require('../glasshive')),
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(202);
+    expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ callback_created_at: body.callback_created_at }),
+      }),
+    );
   });
 
   test('rejects callbacks with an invalid HMAC signature', async () => {
@@ -1207,7 +1301,7 @@ describe('/api/viventium/glasshive/callback', () => {
     ['run.blocked', 'failure_code'],
     ['run.blocked', 'failure_class'],
   ])(
-    'gives an exact reconnect action for nonterminal %s callbacks with structured %s',
+    'retains structured reconnect evidence for Main without speaking a nonterminal %s status (%s)',
     async (event, failureField) => {
       const router = require('../glasshive');
       const app = createTestApp(router);
@@ -1226,24 +1320,44 @@ describe('/api/viventium/glasshive/callback', () => {
 
       await dispatch(app, req, res);
 
+      if (body.event === 'run.needs_input' && !body.pending_native_input) {
+        expect(res.statusCode).toBe(202);
+        expect(res.body.reason).toBe('main_adjudication_pending');
+        expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+          expect.objectContaining({
+            body: expect.objectContaining({
+              event: 'run.needs_input',
+              work_terminal: false,
+              worker_id: body.worker_id,
+              run_id: body.run_id,
+            }),
+          }),
+        );
+        expect(mockSaveMessage).not.toHaveBeenCalled();
+        expect(mockUpdateMessage).not.toHaveBeenCalled();
+        expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+        return;
+      }
       expect(res.statusCode).toBe(200);
       const [, message] = mockSaveMessage.mock.calls[0];
-      expect(message.text).toBe(
-        'Reconnect the required model provider account in Settings > Account > Connected Accounts, then resume this mission.',
-      );
+      expect(message.text).toBe('');
       expect(message.text).not.toContain(body.message);
     },
   );
 
-  test('appends the sanitized failure_user_message reason to the needs_input notice', async () => {
+  test('couriers the native failure_user_message without host adjudication or raw chat notice', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
       callback_id: 'cb_needs_input_failure_user_message',
+      worker_id: 'wrk_abc123def4',
+      surface: 'telegram',
+      telegram_chat_id: 'chat-test',
+      telegram_user_id: 'telegram-test',
       event: 'run.needs_input',
       message: 'Internal provider detail that must not be shown.',
       failure_code: 'provider_progress_stalled',
-      failure_user_message: `The provider stopped responding for worker wrk_abc123 while writing ${syntheticLocalPath(
+      failure_user_message: `The provider stopped responding for worker wrk_abc123def4 while writing ${syntheticLocalPath(
         'private',
         'report.md',
       )}.`,
@@ -1258,20 +1372,49 @@ describe('/api/viventium/glasshive/callback', () => {
 
     await dispatch(app, req, res);
 
+    if (body.event === 'run.needs_input' && !body.pending_native_input) {
+      expect(res.statusCode).toBe(202);
+      expect(res.body.reason).toBe('main_adjudication_pending');
+      expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            event: 'run.needs_input',
+            work_terminal: false,
+            worker_id: body.worker_id,
+            run_id: body.run_id,
+          }),
+        }),
+      );
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockUpdateMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+      return;
+    }
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe(
-      'Mission needs user input. The provider stopped responding for worker [worker id] while writing [local path].',
-    );
-    expect(message.content[0].text).toBe(message.text);
+    expect(message.text).toBe('');
+    expect(message.content).toEqual([]);
     expect(message.text).not.toContain(body.message);
-    expect(message.text).not.toContain('wrk_abc123');
+    expect(message.text).not.toContain('wrk_abc123def4');
     expect(message.text).not.toContain(syntheticLocalPath());
     expect(message.metadata.viventium.status).toEqual({
       kind: 'mission_status',
       state: 'needs_input',
       attention: 'input',
     });
+    expect(mockEnqueueGlassHiveMissionAdjudication).not.toHaveBeenCalled();
+    expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          failure_user_message: body.failure_user_message,
+          failure_recommended_recovery: body.failure_recommended_recovery,
+        }),
+        text: expect.stringContaining('The provider stopped responding'),
+      }),
+    );
+    const nativeText = mockEnqueueGlassHiveCallbackDelivery.mock.calls[0][0].text;
+    expect(nativeText).not.toContain('wrk_abc123def4');
+    expect(nativeText).not.toContain(syntheticLocalPath());
   });
 
   test.each([
@@ -1295,9 +1438,27 @@ describe('/api/viventium/glasshive/callback', () => {
 
     await dispatch(app, req, res);
 
+    if (body.event === 'run.needs_input' && !body.pending_native_input) {
+      expect(res.statusCode).toBe(202);
+      expect(res.body.reason).toBe('main_adjudication_pending');
+      expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            event: 'run.needs_input',
+            work_terminal: false,
+            worker_id: body.worker_id,
+            run_id: body.run_id,
+          }),
+        }),
+      );
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockUpdateMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+      return;
+    }
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission needs user input.');
+    expect(message.text).toBe('');
   });
 
   test('keeps the exact reconnect action ahead of a failure_user_message reason', async () => {
@@ -1319,11 +1480,27 @@ describe('/api/viventium/glasshive/callback', () => {
 
     await dispatch(app, req, res);
 
+    if (body.event === 'run.needs_input' && !body.pending_native_input) {
+      expect(res.statusCode).toBe(202);
+      expect(res.body.reason).toBe('main_adjudication_pending');
+      expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            event: 'run.needs_input',
+            work_terminal: false,
+            worker_id: body.worker_id,
+            run_id: body.run_id,
+          }),
+        }),
+      );
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockUpdateMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+      return;
+    }
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe(
-      'Reconnect the required model provider account in Settings > Account > Connected Accounts, then resume this mission.',
-    );
+    expect(message.text).toBe('');
     expect(message.text).not.toContain(body.failure_user_message);
   });
 
@@ -1347,7 +1524,7 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission needs attention.');
+    expect(message.text).toBe('');
     expect(message.text).not.toContain(body.message);
   });
 
@@ -1458,13 +1635,8 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(saveReq.user.id).toBe('user-1');
     expect(message.conversationId).toBe('conv-1');
     expect(message.parentMessageId).toBe('msg-anchor');
-    expect(message.text).toBe('Mission completed.');
-    expect(message.content).toEqual([
-      {
-        type: 'text',
-        text: 'Mission completed.',
-      },
-    ]);
+    expect(message.text).toBe('');
+    expect(message.content).toEqual([]);
     expect(message.metadata.viventium.workerId).toBe('wrk-1');
     expect(message.metadata.viventium.parentMessageId).toBe('msg-parent');
     expect(message.metadata.viventium.treeParentMessageId).toBe('msg-anchor');
@@ -1624,6 +1796,105 @@ describe('/api/viventium/glasshive/callback', () => {
     );
   });
 
+  test.each([
+    ['blank unfinished', '', true],
+    ['partial unfinished', 'Still checking the evidence', true],
+    ['blank live anchor without marker', '', false],
+    ['partial live anchor without marker', 'Still checking the evidence', false],
+  ])('never adopts a %s Main anchor for a worker callback', async (_label, text, unfinished) => {
+    mockGetMessages.mockResolvedValueOnce([
+      { messageId: 'msg-parent', isCreatedByUser: true, text: 'Start both tasks.' },
+      {
+        messageId: 'msg-anchor',
+        parentMessageId: 'msg-parent',
+        isCreatedByUser: false,
+        text,
+        unfinished,
+      },
+    ]);
+    const body = callbackBody({ event: 'run.failed', failure_code: 'context_unavailable' });
+    const res = createMockRes();
+    await dispatch(
+      createTestApp(require('../glasshive')),
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(unfinished ? 202 : 200);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    if (unfinished) {
+      expect(res.body.reason).toBe('conversation_tip_busy');
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+    } else {
+      const [, message] = mockSaveMessage.mock.calls[0];
+      expect(message.messageId).not.toBe('msg-anchor');
+      expect(message.parentMessageId).toBe('msg-anchor');
+    }
+    expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ failure_code: 'context_unavailable' }),
+      }),
+    );
+  });
+
+  test.each(['run.needs_input', 'run.blocked', 'checkpoint.ready', 'takeover.requested'])(
+    'couriers %s native input without another host Main round',
+    async (event) => {
+      const body = callbackBody({
+        event,
+        message: 'Only the user can supply the missing detail.',
+        surface: 'telegram',
+        telegram_chat_id: 'chat-test',
+        telegram_user_id: 'telegram-test',
+      });
+      const res = createMockRes();
+      await dispatch(
+        createTestApp(require('../glasshive')),
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(body) },
+          body,
+        }),
+        res,
+      );
+      if (body.event === 'run.needs_input' && !body.pending_native_input) {
+        expect(res.statusCode).toBe(202);
+        expect(res.body.reason).toBe('main_adjudication_pending');
+        expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+          expect.objectContaining({
+            body: expect.objectContaining({
+              event: 'run.needs_input',
+              work_terminal: false,
+              worker_id: body.worker_id,
+              run_id: body.run_id,
+            }),
+          }),
+        );
+        expect(mockSaveMessage).not.toHaveBeenCalled();
+        expect(mockUpdateMessage).not.toHaveBeenCalled();
+        expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+        return;
+      }
+      expect(res.statusCode).toBe(200);
+      const [, message] = mockSaveMessage.mock.calls[0];
+      expect(message.text).toBe('');
+      expect(message.content).toEqual([]);
+      expect(message.metadata.viventium.visibility).toBe('internal');
+      expect(message.metadata.viventium.status.state).toBe('needs_input');
+      expect(mockEnqueueGlassHiveMissionAdjudication).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({ event, message: body.message }),
+          text: body.message,
+        }),
+      );
+    },
+  );
+
   test('accepts failed terminal truth without overwriting an unfinished generation placeholder', async () => {
     mockGetMessages.mockResolvedValueOnce([
       {
@@ -1703,7 +1974,7 @@ describe('/api/viventium/glasshive/callback', () => {
     },
   );
 
-  test('enqueues Telegram callbacks with sanitized full report text for durable delivery', async () => {
+  test('retains Telegram full-report evidence for Main without enqueuing callback prose', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
@@ -1913,7 +2184,7 @@ describe('/api/viventium/glasshive/callback', () => {
     );
 
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission needs attention.');
+    expect(message.text).toBe('');
     expect(message.text).not.toMatch(/^I\b/);
     expect(message.metadata.viventium.status).toEqual({
       kind: 'mission_status',
@@ -2000,7 +2271,7 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(mockSaveMessage).toHaveBeenCalledTimes(1);
   });
 
-  test('enqueues evidence-failed deliverable wording for Telegram delivery parity', async () => {
+  test('retains Telegram verification evidence with no direct callback prose', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
@@ -2032,11 +2303,12 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(res.statusCode).toBe(200);
     expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledTimes(1);
     const payload = mockEnqueueGlassHiveCallbackDelivery.mock.calls[0][0];
-    expect(payload.text).toBe('Mission output needs verification.');
+    expect(payload.text).toBe('');
+    expect(payload.message.metadata.viventium.visibility).toBe('internal');
     expect(payload.body.surface).toBe('telegram');
   });
 
-  test('enqueues evidence-failed deliverable wording for voice delivery parity', async () => {
+  test('retains voice verification evidence with no direct callback prose', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
@@ -2068,11 +2340,12 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(res.statusCode).toBe(200);
     expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledTimes(1);
     const payload = mockEnqueueGlassHiveCallbackDelivery.mock.calls[0][0];
-    expect(payload.text).toBe('Mission output needs verification.');
+    expect(payload.text).toBe('');
+    expect(payload.message.metadata.viventium.visibility).toBe('internal');
     expect(payload.body.surface).toBe('voice');
   });
 
-  test('verifies and persists literal UTF-8 callback text', async () => {
+  test('verifies UTF-8 signed evidence without persisting conversational callback text', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
@@ -2090,10 +2363,10 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission completed.');
+    expect(message.text).toBe('');
   });
 
-  test('preserves readable callback paragraphs while redacting local details', async () => {
+  test('keeps callback paragraphs in Main evidence, out of conversational projection', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
@@ -2114,11 +2387,11 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission completed.');
-    expect(message.content[0].text).toBe(message.text);
+    expect(message.text).toBe('');
+    expect(message.content).toEqual([]);
   });
 
-  test('keeps long final-result callback text within the shared worker limit', async () => {
+  test('accepts long signed final evidence without repeating it in callback prose', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const longResult = `Summary:\n\n${'A'.repeat(1500)}\n\nNext step: none.`;
@@ -2137,11 +2410,11 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission completed.');
-    expect(message.content[0].text).toBe('Mission completed.');
+    expect(message.text).toBe('');
+    expect(message.content).toEqual([]);
   });
 
-  test('preserves leading indentation in callback text', async () => {
+  test('accepts signed indented evidence without emitting callback prose', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const codeBlock = 'Summary:\n\n```json\n  {  "ok":   true  }\n```';
@@ -2160,8 +2433,8 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission completed.');
-    expect(message.content[0].text).toBe(message.text);
+    expect(message.text).toBe('');
+    expect(message.content).toEqual([]);
   });
 
   test('rejects visible callbacks without an assistant anchor message id so GlassHive retries or records failure', async () => {
@@ -2215,7 +2488,180 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
-  test('updates a blank assistant anchor instead of leaving an empty status bubble', async () => {
+  test.each(['run.completed', 'run.failed', 'run.needs_input'])(
+    'keeps %s reachable after a superseded Main anchor is removed',
+    async (event) => {
+      mockGetMessages.mockResolvedValueOnce([
+        {
+          user: 'user-1',
+          conversationId: 'conv-1',
+          messageId: 'msg-parent',
+          isCreatedByUser: true,
+          text: 'Make two lessons.',
+          createdAt: '2026-04-28T14:00:00.000Z',
+        },
+        {
+          messageId: 'current-main',
+          parentMessageId: 'msg-parent',
+          isCreatedByUser: false,
+          text: 'I updated the first lesson.',
+          unfinished: false,
+          createdAt: '2026-04-28T14:00:02.000Z',
+        },
+      ]);
+      const body = callbackBody({
+        event,
+        message_id: 'removed-main',
+        ...(event === 'run.needs_input'
+          ? {
+              surface: 'telegram',
+              telegram_chat_id: 'chat-test',
+              telegram_user_id: 'telegram-test',
+            }
+          : {}),
+      });
+      const res = createMockRes();
+      await dispatch(
+        createTestApp(require('../glasshive')),
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(body) },
+          body,
+        }),
+        res,
+      );
+      if (body.event === 'run.needs_input' && !body.pending_native_input) {
+        expect(res.statusCode).toBe(202);
+        expect(res.body.reason).toBe('main_adjudication_pending');
+        expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+          expect.objectContaining({
+            body: expect.objectContaining({
+              event: 'run.needs_input',
+              work_terminal: false,
+              worker_id: body.worker_id,
+              run_id: body.run_id,
+            }),
+          }),
+        );
+        expect(mockSaveMessage).not.toHaveBeenCalled();
+        expect(mockUpdateMessage).not.toHaveBeenCalled();
+        expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+        return;
+      }
+      expect(res.statusCode).toBe(200);
+      expect(mockUpdateMessage).not.toHaveBeenCalled();
+      const [, message] = mockSaveMessage.mock.calls[0];
+      expect(message.messageId).not.toBe('removed-main');
+      expect(message.parentMessageId).toBe('current-main');
+      expect(message.metadata.viventium.anchorMessageId).toBe('removed-main');
+      expect(message.metadata.viventium.parentMessageId).toBe('msg-parent');
+      expect(message.text).toBe('');
+      expect(message.metadata.viventium.visibility).toBe('internal');
+      if (event === 'run.needs_input') {
+        expect(mockEnqueueGlassHiveMissionAdjudication).not.toHaveBeenCalled();
+        expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalled();
+      } else {
+        expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalled();
+      }
+    },
+  );
+
+  test('accounts for a result with a removed anchor without taking a current unfinished Main row', async () => {
+    mockGetMessages.mockResolvedValueOnce([
+      {
+        user: 'user-1',
+        conversationId: 'conv-1',
+        messageId: 'msg-parent',
+        isCreatedByUser: true,
+        text: 'Make the lesson.',
+        createdAt: '2026-04-28T14:00:00.000Z',
+      },
+      {
+        messageId: 'current-main',
+        parentMessageId: 'msg-parent',
+        isCreatedByUser: false,
+        text: 'Checking the correction.',
+        unfinished: true,
+        createdAt: '2026-04-28T14:00:02.000Z',
+      },
+    ]);
+    const body = callbackBody({ message_id: 'removed-main' });
+    const res = createMockRes();
+    await dispatch(
+      createTestApp(require('../glasshive')),
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(202);
+    expect(res.body.reason).toBe('conversation_tip_busy');
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalled();
+  });
+
+  test.each([
+    ['missing', null],
+    ['assistant', { isCreatedByUser: false, user: 'user-1', conversationId: 'conv-1' }],
+    ['foreign owner', { isCreatedByUser: true, user: 'other-user', conversationId: 'conv-1' }],
+    [
+      'foreign conversation',
+      { isCreatedByUser: true, user: 'user-1', conversationId: 'other-conversation' },
+    ],
+  ])('does not replace a removed anchor with a %s source', async (_label, source) => {
+    mockGetMessages.mockResolvedValueOnce(source ? [{ messageId: 'msg-parent', ...source }] : []);
+    const body = callbackBody({ message_id: 'removed-main' });
+    const res = createMockRes();
+    await dispatch(
+      createTestApp(require('../glasshive')),
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(425);
+    expect(res.body.error).toBe('callback_anchor_not_ready');
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  test('replays a result with a removed anchor without a second persisted callback', async () => {
+    const source = {
+      user: 'user-1',
+      conversationId: 'conv-1',
+      messageId: 'msg-parent',
+      isCreatedByUser: true,
+      text: 'Make the lesson.',
+      createdAt: '2026-04-28T14:00:00.000Z',
+    };
+    mockGetMessages.mockResolvedValueOnce([source]);
+    const body = callbackBody({ message_id: 'removed-main' });
+    const request = () =>
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      });
+    const app = createTestApp(require('../glasshive'));
+    const first = createMockRes();
+    await dispatch(app, request(), first);
+    expect(first.statusCode).toBe(200);
+    const [, callback] = mockSaveMessage.mock.calls[0];
+    mockGetMessages.mockResolvedValueOnce([source, callback]);
+    const replay = createMockRes();
+    await dispatch(app, request(), replay);
+    expect(replay.statusCode).toBe(200);
+    expect(replay.body.duplicate).toBe(true);
+    expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  test('gives an internal callback its own identity beside a blank Main anchor', async () => {
     mockGetMessages.mockResolvedValueOnce([
       {
         messageId: 'user-msg',
@@ -2249,18 +2695,13 @@ describe('/api/viventium/glasshive/callback', () => {
     await dispatch(app, req, res);
 
     expect(res.statusCode).toBe(200);
-    expect(mockSaveMessage).not.toHaveBeenCalled();
-    expect(mockUpdateMessage).toHaveBeenCalledTimes(1);
-    const [, message] = mockUpdateMessage.mock.calls[0];
-    expect(message.messageId).toBe('assistant-response-msg');
-    expect(message.parentMessageId).toBe('user-msg');
-    expect(message.text).toBe('Mission completed.');
-    expect(message.content).toEqual([
-      {
-        type: 'text',
-        text: 'Mission completed.',
-      },
-    ]);
+    expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    const [, message] = mockSaveMessage.mock.calls[0];
+    expect(message.messageId).not.toBe('assistant-response-msg');
+    expect(message.parentMessageId).toBe('assistant-response-msg');
+    expect(message.text).toBe('');
+    expect(message.content).toEqual([]);
     expect(message.metadata.viventium.anchorMessageId).toBe('assistant-response-msg');
     expect(new Date(message.createdAt).getTime()).toBeGreaterThan(
       Date.parse('2026-04-28T14:00:00.000Z'),
@@ -2268,10 +2709,581 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(new Date(message.updatedAt).getTime()).toBeGreaterThan(
       Date.parse('2026-04-28T14:00:00.000Z'),
     );
-    expect(mockUpdateMessage.mock.calls[0][2].overrideTimestamp).toBe(true);
   });
 
-  test('defers an exact-run callback until Main commits, then adds one separate status message', async () => {
+  test.each(['run.needs_input', 'run.blocked', 'checkpoint.ready', 'takeover.requested'])(
+    'keeps the existing transaction session for nonterminal %s external-work projection',
+    async (event) => {
+      const mongoose = require('mongoose');
+      const { AsyncLocalStorage } = require('async_hooks');
+      const storageBefore = mongoose.transactionAsyncLocalStorage;
+      const storage = new AsyncLocalStorage();
+      const session = { inTransaction: () => true };
+      mongoose.transactionAsyncLocalStorage = storage;
+      mockRunCallbackTransaction.mockImplementation((operation) =>
+        storage.run({ session, afterCommit: [], afterAbort: [] }, () => operation(session)),
+      );
+      try {
+        const body = callbackBody({ event, callback_id: `cb_session_${event}` });
+        const res = createMockRes();
+        await dispatch(
+          createTestApp(require('../glasshive')),
+          createMockReq({
+            url: '/api/viventium/glasshive/callback',
+            headers: { 'x-glasshive-signature': signature(body) },
+            body,
+          }),
+          res,
+        );
+        expect(res.statusCode).toBe(event === 'run.needs_input' ? 202 : 200);
+        expect(mockRecordGlassHiveCallbackExternalState).toHaveBeenCalledWith(
+          expect.objectContaining({ effectSession: session }),
+        );
+        expect(
+          mockRecordGlassHiveCallbackExternalState.mock.calls[0][0].effectFence,
+        ).toBeUndefined();
+        expect(mockSaveMessage).toHaveBeenCalledTimes(event === 'run.needs_input' ? 0 : 1);
+        if (event === 'run.needs_input')
+          expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+            expect.objectContaining({ effectSession: session }),
+          );
+        expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+      } finally {
+        mongoose.transactionAsyncLocalStorage = storageBefore;
+      }
+    },
+  );
+
+  test.each(['attention', 'scheduled-commit', 'scheduled-abort'])(
+    'real Mongo nonterminal callback retains its session and commit boundary (%s)',
+    async (scenario) => {
+      const mongoose = require('mongoose');
+      const { MongoMemoryReplSet } = require('mongodb-memory-server');
+      const { createGlassHiveCallbackBindingService } = require('@librechat/api');
+      const transaction = jest.requireActual(
+        '~/server/services/viventium/GlassHiveTerminalCallbackTransaction',
+      );
+      const bindingModule = require('~/server/services/viventium/GlassHiveCallbackBindingService');
+      const replica = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+      const fence = bindingModule.fenceGlassHiveCallbackRunState;
+      let collection;
+      let originalUpdate;
+      let reachedProjection = false;
+      try {
+        await mongoose.connect(replica.getUri());
+        const service = createGlassHiveCallbackBindingService({ mongoose });
+        const body = callbackBody({
+          event: 'run.needs_input',
+          callback_id: `cb_real_session_${scenario}`,
+        });
+        const binding = await mockResolveGlassHiveCallbackContext(body);
+        collection = mongoose.connection.collection('viventium_external_work');
+        await collection.insertOne({
+          _id: binding.originRef,
+          ownerId: binding.ownerId,
+          workRef: binding.workRef,
+          runId: body.run_id,
+          externalState: 'running',
+        });
+        originalUpdate = collection.findOneAndUpdate;
+        collection.findOneAndUpdate = function (filter, update, options) {
+          return originalUpdate.call(this, filter, update, { ...options, maxTimeMS: 1500 });
+        };
+        fence.mockImplementation(service.fenceGlassHiveCallbackRunState);
+        mockRecordGlassHiveCallbackExternalState.mockImplementation(async (args) => {
+          const result = await service.recordGlassHiveCallbackExternalState(args);
+          reachedProjection = true;
+          return scenario === 'attention' ? result : { state: 'needs_input' };
+        });
+        mockRunCallbackTransaction.mockImplementation((operation, options) =>
+          transaction.runGlassHiveTerminalCallbackTransaction(async (session) => {
+            const result = await operation(session);
+            if (scenario === 'scheduled-abort' && reachedProjection) {
+              throw Object.assign(new Error('Synthetic commit rejection'), { code: 13 });
+            }
+            return result;
+          }, options),
+        );
+        const res = createMockRes();
+        await dispatch(
+          createTestApp(require('../glasshive')),
+          createMockReq({
+            url: '/api/viventium/glasshive/callback',
+            headers: { 'x-glasshive-signature': signature(body) },
+            body,
+          }),
+          res,
+        );
+        expect(res.statusCode).toBe(scenario === 'scheduled-abort' ? 503 : 202);
+        const work = await collection.findOne({ _id: binding.originRef });
+        expect(work.externalState).toBe(scenario === 'scheduled-abort' ? 'running' : 'needs_input');
+        expect(mockNotifySchedulerExternalWorkSummary).toHaveBeenCalledTimes(
+          scenario === 'scheduled-commit' ? 1 : 0,
+        );
+        expect(
+          mockRecordGlassHiveCallbackExternalState.mock.calls[0][0].effectSession?.inTransaction,
+        ).toEqual(expect.any(Function));
+        expect(mockSaveMessage).not.toHaveBeenCalled();
+        expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalled();
+        expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+      } finally {
+        fence.mockReset().mockResolvedValue(undefined);
+        if (collection && originalUpdate) collection.findOneAndUpdate = originalUpdate;
+        if (mongoose.connection.readyState) await mongoose.disconnect();
+        await replica.stop({ doCleanup: true, force: true });
+      }
+    },
+    30000,
+  );
+
+  test.each(['run.needs_input', 'run.completed'])(
+    'replays only the DB admission for transient %s write conflict before one surface effect',
+    async (event) => {
+      const {
+        fenceGlassHiveCallbackRunState,
+      } = require('~/server/services/viventium/GlassHiveCallbackBindingService');
+      const conflict = Object.assign(new Error('synthetic write conflict'), { code: 112 });
+      fenceGlassHiveCallbackRunState.mockRejectedValueOnce(conflict);
+      let replayedAdmissions = 0;
+      mockRunCallbackTransaction.mockImplementation(async (operation, options) => {
+        try {
+          return await operation(null);
+        } catch (error) {
+          if (options?.retry !== 'native' || error.code !== 112) throw error;
+          replayedAdmissions += 1;
+          return operation(null);
+        }
+      });
+      const body = callbackBody({
+        event,
+        callback_id: `cb_transient_${event}`,
+        surface: 'telegram',
+        telegram_chat_id: 'chat-test',
+        telegram_user_id: 'telegram-test',
+      });
+      const res = createMockRes();
+      await dispatch(
+        createTestApp(require('../glasshive')),
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(body) },
+          body,
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(event === 'run.needs_input' ? 202 : 200);
+      expect(replayedAdmissions).toBe(1);
+      expect(fenceGlassHiveCallbackRunState.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(fenceGlassHiveCallbackRunState.mock.calls[0][0]).toEqual(
+        fenceGlassHiveCallbackRunState.mock.calls[1][0],
+      );
+      expect(mockConfirmGlassHiveCallbackContext).toHaveBeenCalledTimes(1);
+      expect(mockSaveMessage).toHaveBeenCalledTimes(event === 'run.needs_input' ? 0 : 1);
+      expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledTimes(
+        event === 'run.needs_input' ? 0 : 1,
+      );
+      if (event === 'run.needs_input')
+        expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledTimes(1);
+      expect(mockRunCallbackTransaction).toHaveBeenCalledWith(expect.any(Function), {
+        retry: 'native',
+      });
+    },
+  );
+
+  test('does not replay nontransient callback binding failure into a surface effect', async () => {
+    mockConfirmGlassHiveCallbackContext.mockRejectedValueOnce(
+      Object.assign(new Error('synthetic nontransient failure'), { code: 13 }),
+    );
+    const body = callbackBody({ event: 'run.needs_input', callback_id: 'cb_nontransient_binding' });
+    const res = createMockRes();
+    await dispatch(
+      createTestApp(require('../glasshive')),
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(503);
+    expect(mockConfirmGlassHiveCallbackContext).toHaveBeenCalledTimes(1);
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+  });
+
+  test.each(
+    ['run.needs_input', 'run.blocked', 'checkpoint.ready', 'takeover.requested'].flatMap(
+      (event) => [
+        [event, 'busy'],
+        [event, 'moved-on'],
+      ],
+    ),
+  )('keeps native %s question delivery while Main is %s', async (event, state) => {
+    const parent = {
+      messageId: 'msg-parent',
+      parentMessageId: 'previous-assistant',
+      isCreatedByUser: true,
+      text: 'Original goal.',
+      createdAt: '2026-04-28T14:00:00.000Z',
+    };
+    const anchor = {
+      messageId: 'msg-anchor',
+      parentMessageId: 'msg-parent',
+      isCreatedByUser: false,
+      text: state === 'busy' ? '' : 'Accepted.',
+      unfinished: state === 'busy',
+      createdAt: '2026-04-28T14:00:01.000Z',
+    };
+    mockGetMessages.mockResolvedValue([
+      parent,
+      anchor,
+      ...(state === 'moved-on'
+        ? [
+            {
+              messageId: 'new-input',
+              parentMessageId: 'msg-anchor',
+              isCreatedByUser: true,
+              text: 'Another independent ask.',
+              createdAt: '2026-04-28T14:00:02.000Z',
+            },
+          ]
+        : []),
+    ]);
+    const body = callbackBody({
+      event,
+      callback_id: `${event}-${state}`,
+      surface: 'telegram',
+      telegram_chat_id: 'chat-test',
+      telegram_user_id: 'telegram-test',
+      message: 'Internal evidence.',
+      failure_user_message: 'Which of the two files should I use?',
+    });
+    const app = createTestApp(require('../glasshive'));
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+    if (body.event === 'run.needs_input' && !body.pending_native_input) {
+      expect(res.statusCode).toBe(202);
+      expect(res.body.reason).toBe('main_adjudication_pending');
+      expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            event: 'run.needs_input',
+            work_terminal: false,
+            worker_id: body.worker_id,
+            run_id: body.run_id,
+          }),
+        }),
+      );
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockUpdateMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+      return;
+    }
+    expect(res.statusCode).toBe(200);
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    const [, projection] = mockSaveMessage.mock.calls[0];
+    expect(projection.messageId).not.toBe('msg-anchor');
+    expect(projection.text).toBe('');
+    expect(projection.metadata.viventium.visibility).toBe('internal');
+    expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: 'Which of the two files should I use?',
+        fullText: 'Which of the two files should I use?',
+        body: expect.objectContaining({ event, callback_id: `${event}-${state}` }),
+      }),
+    );
+    expect(mockEnqueueGlassHiveMissionAdjudication).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['question', false],
+    ['permission', false],
+    ['question', true],
+    ['permission', true],
+  ])(
+    'preserves canonical %s from the native binding-only callback with removed anchor %s',
+    async (kind, removedAnchor) => {
+      mockRegisterNativeVoiceCapabilities = jest.fn().mockResolvedValue(undefined);
+      if (removedAnchor) {
+        mockGetMessages.mockResolvedValue([
+          {
+            user: 'user-1',
+            conversationId: 'conv-1',
+            messageId: 'msg-parent',
+            isCreatedByUser: true,
+            text: 'Continue the work.',
+            createdAt: '2026-04-28T14:00:00.000Z',
+          },
+          {
+            messageId: 'current-main',
+            parentMessageId: 'msg-parent',
+            isCreatedByUser: false,
+            unfinished: true,
+            text: 'Checking.',
+            createdAt: '2026-04-28T14:00:01.000Z',
+          },
+        ]);
+      }
+      const pending = {
+        version: 1,
+        kind,
+        state: 'pending',
+        mode: 'form',
+        runtimeName: 'native-runtime',
+        requestId: 'request-current',
+        requestFingerprint: 'a'.repeat(64),
+        runId: 'run-1',
+        attemptId: 'attempt-current',
+        sessionId: 'session-current',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        message: 'Choose the current response.',
+        requestedSchema:
+          kind === 'permission'
+            ? {
+                type: 'object',
+                required: ['optionId'],
+                properties: {
+                  optionId: {
+                    type: 'string',
+                    enum: ['allow-once', 'reject-once'],
+                    enumNames: ['Yes', 'No'],
+                  },
+                },
+              }
+            : {
+                type: 'object',
+                required: ['answers'],
+                additionalProperties: false,
+                properties: {
+                  answers: {
+                    type: 'object',
+                    additionalProperties: false,
+                    minProperties: 1,
+                    maxProperties: 16,
+                    properties: {
+                      Choice: {
+                        type: 'array',
+                        uniqueItems: true,
+                        minItems: 1,
+                        maxItems: 1,
+                        items: { type: 'string', enum: ['First', 'Second', 'Other'] },
+                      },
+                    },
+                  },
+                  annotations: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      Choice: {
+                        type: 'object',
+                        additionalProperties: false,
+                        required: ['notes'],
+                        properties: { notes: { type: 'string', minLength: 1, maxLength: 8000 } },
+                      },
+                    },
+                  },
+                },
+              },
+      };
+      const callbackBinding = (request) =>
+        Object.fromEntries(
+          [
+            'version',
+            'requestId',
+            'requestFingerprint',
+            'runId',
+            'attemptId',
+            'sessionId',
+            'expiresAt',
+            'kind',
+            'state',
+            'mode',
+          ].map((key) => [key, request[key]]),
+        );
+      const body = callbackBody({
+        event: 'run.needs_input',
+        ...(removedAnchor ? { message_id: 'removed-main' } : {}),
+        surface: 'voice',
+        voice_call_session_id: 'call-native-attention',
+        voice_request_id: 'request-voice',
+        message: pending.message + '\n\nView / Steer: [Workspace](https://example.invalid/work)',
+        pending_native_input: callbackBinding(pending),
+      });
+      mockRequestCurrentWork = jest.fn().mockResolvedValue({
+        workRef: body.work_ref,
+        state: 'needs_input',
+        pendingNativeInput: pending,
+      });
+      const res = createMockRes();
+      await dispatch(
+        createTestApp(require('../glasshive')),
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(body) },
+          body,
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(200);
+      expect(mockRequestCurrentWork).toHaveBeenCalledWith({
+        ownerId: body.user_id,
+        path: `/v1/work/${encodeURIComponent(body.work_ref)}`,
+      });
+      expect(body.pending_native_input).not.toHaveProperty('message');
+      expect(body.pending_native_input).not.toHaveProperty('requestedSchema');
+      const message = mockSaveMessage.mock.calls[0][1];
+      const courier = mockEnqueueGlassHiveCallbackDelivery.mock.calls[0][0];
+      expect(message.text).toBe(courier.text);
+      expect(message.metadata.viventium.visibility).toBe('internal');
+      const api = jest.requireActual('@librechat/api');
+      expect(message.metadata.viventium.nativeInputPresentation).toEqual({
+        version: 1,
+        kind,
+        binding: api.nativeWorkInputBinding(pending, body.run_id),
+      });
+      const row = {
+        event: body.event,
+        surface: 'voice',
+        deliveryId: 'delivery-current',
+        callbackId: api.canonicalizeGlassHiveCallbackRef(body.callback_id),
+        callbackMessageId: message.messageId,
+        userId: body.user_id,
+        conversationId: body.conversation_id,
+        voiceCallSessionId: body.voice_call_session_id,
+        voiceRequestId: body.voice_request_id,
+        originRef: body.origin_ref,
+        workRef: body.work_ref,
+        workerId: body.worker_id,
+        runId: body.run_id,
+        text: courier.text,
+        fullText: courier.fullText,
+        nativeInputBinding: pending,
+        status: 'pending',
+      };
+      expect(api.nativeWorkInputPresentation(row)).not.toBeNull();
+      expect(api.nativeWorkInputQuestionText(pending, row.nativeInputBinding)).toBe(
+        pending.message,
+      );
+      expect(message.metadata.viventium).toEqual(
+        expect.objectContaining({
+          type: 'glasshive_worker_callback',
+          event: row.event,
+          originRef: row.originRef,
+          workRef: row.workRef,
+          workerId: row.workerId,
+          runId: row.runId,
+          voiceCallSessionId: row.voiceCallSessionId,
+        }),
+      );
+      const publisher = api.createNativeWorkInputPresentationService({
+        requestWork: async () => ({
+          workRef: body.work_ref,
+          state: 'needs_input',
+          pendingNativeInput: pending,
+        }),
+        readMessage: async () => message,
+        updateMessage: jest.fn().mockResolvedValue({ matchedCount: 1 }),
+        updateDelivery: jest
+          .fn()
+          .mockImplementation(async (_filter, update) => ({ ...row, ...update.$set })),
+        fence: async (operation) => operation(null),
+      });
+      expect(await publisher(row, null, true)).toEqual(
+        expect.objectContaining({
+          delivery: { ...row, text: pending.message, fullText: pending.message },
+        }),
+      );
+      expect(await publisher({ ...row, text: 'Unrelated status.' })).toBeNull();
+      const send = async (next) => {
+        const response = createMockRes();
+        await dispatch(
+          createTestApp(require('../glasshive')),
+          createMockReq({
+            url: '/api/viventium/glasshive/callback',
+            headers: { 'x-glasshive-signature': signature(next) },
+            body: next,
+          }),
+          response,
+        );
+        return response;
+      };
+      const baseMessages = await mockGetMessages();
+      mockGetMessages.mockResolvedValue([...baseMessages, message]);
+      expect((await send(body)).body.duplicate).toBe(true);
+      expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+      expect((await send({ ...body, callback_id: 'same-current-request' })).statusCode).toBe(200);
+      expect(mockUpdateMessage.mock.calls[0][1].messageId).toBe(message.messageId);
+      expect(mockSaveMessage).toHaveBeenCalledTimes(1);
+      mockUpdateMessage.mockClear();
+      const nextStatus = {
+        ...body,
+        callback_id: 'status-next',
+        event: 'artifact.created',
+        pending_native_input: undefined,
+        message: 'Private lifecycle detail.',
+      };
+      expect((await send(nextStatus)).statusCode).toBe(200);
+      expect(mockUpdateMessage).not.toHaveBeenCalled();
+      const statusMessage = mockSaveMessage.mock.calls[1][1];
+      expect(statusMessage.messageId).not.toBe(message.messageId);
+      expect(statusMessage.text).toBe('');
+      expect(statusMessage.metadata.viventium.nativeInputPresentation).toBeNull();
+      // A changed exact native request cannot overwrite the already visible offer.
+      const replacement = {
+        ...pending,
+        requestId: 'request-next',
+        requestFingerprint: 'b'.repeat(64),
+      };
+      mockRequestCurrentWork.mockResolvedValue({
+        workRef: body.work_ref,
+        state: 'needs_input',
+        pendingNativeInput: replacement,
+      });
+      const replacementBody = {
+        ...body,
+        surface: 'web',
+        callback_id: 'new-request',
+        pending_native_input: callbackBinding(replacement),
+      };
+      expect((await send(replacementBody)).statusCode).toBe(200);
+      expect(mockUpdateMessage).not.toHaveBeenCalled();
+      expect(mockSaveMessage.mock.calls[2][1].messageId).not.toBe(message.messageId);
+      expect(mockSaveMessage.mock.calls[2][1]).toMatchObject({
+        text: replacement.message,
+        metadata: {
+          viventium: {
+            nativeInputPresentation: {
+              version: 1,
+              kind,
+              binding: api.nativeWorkInputBinding(replacement, body.run_id),
+            },
+          },
+        },
+      });
+      // The same callback identity with a newer current native offer is not fresh presentation authority.
+      expect(
+        (await send({ ...body, surface: 'web', callback_id: 'stale-request' })).statusCode,
+      ).toBe(200);
+      expect(
+        mockSaveMessage.mock.calls[3][1].metadata.viventium.nativeInputPresentation,
+      ).toBeNull();
+      mockRequestCurrentWork.mockRejectedValue(new Error('Native current state unavailable'));
+      expect((await send({ ...replacementBody, callback_id: 'unknown-current' })).statusCode).toBe(
+        503,
+      );
+      expect(mockSaveMessage).toHaveBeenCalledTimes(4);
+    },
+  );
+
+  test('couriers an exact native question while Main is unfinished and preserves its message', async () => {
     const userMessage = {
       messageId: 'user-msg',
       parentMessageId: 'previous-assistant',
@@ -2309,6 +3321,9 @@ describe('/api/viventium/glasshive/callback', () => {
     const app = createTestApp(router);
     const body = callbackBody({
       callback_id: 'cb_generation_placeholder',
+      surface: 'telegram',
+      telegram_chat_id: 'chat-test',
+      telegram_user_id: 'telegram-test',
       parent_message_id: 'user-msg',
       message_id: 'generation-placeholder',
       event: 'run.needs_input',
@@ -2323,11 +3338,47 @@ describe('/api/viventium/glasshive/callback', () => {
 
     await dispatch(app, req, res);
 
-    expect(res.statusCode).toBe(425);
-    expect(res.body.error).toBe('callback_conversation_tip_not_ready');
-    expect(mockSaveMessage).not.toHaveBeenCalled();
+    if (body.event === 'run.needs_input' && !body.pending_native_input) {
+      expect(res.statusCode).toBe(202);
+      expect(res.body.reason).toBe('main_adjudication_pending');
+      expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            event: 'run.needs_input',
+            work_terminal: false,
+            worker_id: body.worker_id,
+            run_id: body.run_id,
+          }),
+        }),
+      );
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockUpdateMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+      return;
+    }
+    expect(res.statusCode).toBe(200);
+    expect(mockSaveMessage).toHaveBeenCalledTimes(1);
     expect(mockUpdateMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: body.message,
+        body: expect.objectContaining({ callback_id: body.callback_id }),
+      }),
+    );
 
+    const persistedProjection = mockSaveMessage.mock.calls[0][1];
+    mockGetMessages.mockReset();
+    mockGetMessages.mockResolvedValue([
+      userMessage,
+      {
+        messageId: 'generation-placeholder',
+        parentMessageId: 'user-msg',
+        text: 'Both missions were accepted.',
+        unfinished: false,
+        isCreatedByUser: false,
+      },
+      persistedProjection,
+    ]);
     const retryReq = createMockReq({
       url: '/api/viventium/glasshive/callback',
       headers: { 'x-glasshive-signature': signature(body) },
@@ -2343,7 +3394,7 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(message.messageId).not.toBe('generation-placeholder');
     expect(message.parentMessageId).toBe('generation-placeholder');
     // Without a structured `failure_user_message`, the notice stays bare; raw `message` never leaks.
-    expect(message.text).toBe('Mission needs user input.');
+    expect(message.text).toBe('');
     expect(message.text).not.toContain(body.message);
     expect(message.unfinished).toBe(false);
     expect(message.metadata.viventium.treeParentMessageId).toBe('generation-placeholder');
@@ -2539,13 +3590,8 @@ describe('/api/viventium/glasshive/callback', () => {
     const [, updated] = mockUpdateMessage.mock.calls[0];
     expect(updated.messageId).toBe(firstSaved.messageId);
     expect(updated.parentMessageId).toBe('assistant-response-msg');
-    expect(updated.text).toBe('Mission completed.');
-    expect(updated.content).toEqual([
-      {
-        type: 'text',
-        text: 'Mission completed.',
-      },
-    ]);
+    expect(updated.text).toBe('');
+    expect(updated.content).toEqual([]);
     expect(updated.metadata.viventium.events.map((event) => event.event)).toEqual([
       'checkpoint.ready',
       'run.completed',
@@ -2608,7 +3654,7 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(mockSaveMessage).toHaveBeenCalledTimes(1);
     const [, message] = mockSaveMessage.mock.calls[0];
     expect(message.parentMessageId).toBe('glasshive-status');
-    expect(message.text).toBe('Mission completed.');
+    expect(message.text).toBe('');
     expect(message.metadata.viventium.runId).toBe('run-2');
     expect(message.metadata.viventium.treeParentMessageId).toBe('glasshive-status');
     expect(message.metadata.viventium.events.map((event) => event.runId)).toEqual(['run-2']);
@@ -2684,7 +3730,7 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(mockSaveMessage).toHaveBeenCalledTimes(1);
     const [, message] = mockSaveMessage.mock.calls[0];
     expect(message.parentMessageId).toBe('follow-up-assistant');
-    expect(message.text).toBe('Mission completed.');
+    expect(message.text).toBe('');
     expect(message.metadata.viventium.treeParentMessageId).toBe('follow-up-assistant');
   });
 
@@ -2789,6 +3835,163 @@ describe('/api/viventium/glasshive/callback', () => {
   );
 
   test.each([
+    ['run.completed', 'completed'],
+    ['run.failed', 'failed'],
+    ['run.cancelled', 'cancelled_confirmed'],
+    ['run.interrupted', 'cancelled_confirmed'],
+  ])(
+    'settles the Voice run task for internal %s while its WorkRef stays queued',
+    async (event, state) => {
+      const {
+        createVoiceTask,
+        getVoiceTaskByStreamId,
+        snapshotEvent,
+      } = require('~/server/services/viventium/VoiceTaskService');
+      const parent = createVoiceTask({
+        callSessionId: 'call-run-terminal',
+        userId: 'user-1',
+        conversationId: 'conv-1',
+        streamId: 'voice-run-parent',
+      });
+      const app = createTestApp(require('../glasshive'));
+      const base = {
+        surface: 'voice',
+        voice_call_session_id: 'call-run-terminal',
+        voice_request_id: 'voice-run-parent',
+        run_id: 'run-terminal',
+      };
+      async function send(body) {
+        const res = createMockRes();
+        await dispatch(
+          app,
+          createMockReq({
+            url: '/api/viventium/glasshive/callback',
+            headers: { 'x-glasshive-signature': signature(body) },
+            body,
+          }),
+          res,
+        );
+        return res;
+      }
+      await send(callbackBody({ ...base, event: 'run.started', message: '' }));
+      expect(getVoiceTaskByStreamId('glasshive:run-terminal').state).toBe('running');
+      const body = callbackBody({ ...base, event, work_state: 'queued', work_terminal: false });
+      const mismatch = await send({ ...body, conversation_id: 'other-conversation' });
+      expect(mismatch.statusCode).toBe(409);
+      expect(mismatch.body.error).toBe('voice_task_session_mismatch');
+      expect(getVoiceTaskByStreamId('glasshive:run-terminal').state).toBe('running');
+      const res = await send(body);
+      expect(res.statusCode).toBe(202);
+      expect(res.body.reason).toBe('lifecycle_reconciled');
+      const task = getVoiceTaskByStreamId('glasshive:run-terminal');
+      expect(task).toMatchObject({ state, cancellable: false, parentTaskId: parent.taskId });
+      expect(snapshotEvent(task.taskId)).toMatchObject({ state, cancellable: false });
+      expect(mockRecordGlassHiveCallbackExternalState).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({ work_state: 'queued', work_terminal: false }),
+        }),
+      );
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+      const sequence = task.sequence;
+      await send(body);
+      await send(callbackBody({ ...base, event: 'run.started', message: '' }));
+      expect(getVoiceTaskByStreamId('glasshive:run-terminal')).toMatchObject({ state, sequence });
+    },
+  );
+
+  test.each(
+    [
+      ['run.completed', 'completed'],
+      ['run.failed', 'failed'],
+      ['run.cancelled', 'cancelled_confirmed'],
+      ['run.interrupted', 'cancelled_confirmed'],
+    ].flatMap(([event, state]) =>
+      ['busy', 'moved-on', 'deleted'].map((exit) => [event, state, exit]),
+    ),
+  )('settles %s Voice task before %s presentation exit', async (event, state, exit) => {
+    const {
+      createVoiceTask,
+      getVoiceTaskByStreamId,
+      observeGenerationEvent,
+      snapshotEvent,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const task = createVoiceTask({
+      callSessionId: 'call-terminal-exit',
+      userId: 'user-1',
+      conversationId: 'conv-1',
+      streamId: 'glasshive:run-terminal-exit',
+      owner: { kind: 'glasshive_run', id: 'run-terminal-exit' },
+    });
+    observeGenerationEvent(task.taskId, {
+      event: 'on_agent_update',
+      data: { message: 'Worker started' },
+    });
+    const parent = {
+      messageId: 'msg-parent',
+      parentMessageId: 'previous-assistant',
+      isCreatedByUser: true,
+      text: 'Original goal.',
+      createdAt: '2026-04-28T14:00:00.000Z',
+    };
+    const anchor = {
+      messageId: 'msg-anchor',
+      parentMessageId: 'msg-parent',
+      isCreatedByUser: false,
+      text: exit === 'busy' ? '' : 'Accepted.',
+      unfinished: exit === 'busy',
+      createdAt: '2026-04-28T14:00:01.000Z',
+    };
+    mockGetMessages.mockResolvedValue([
+      parent,
+      anchor,
+      ...(exit === 'moved-on'
+        ? [
+            {
+              messageId: 'new-input',
+              parentMessageId: 'msg-anchor',
+              isCreatedByUser: true,
+              text: 'Another ask.',
+              createdAt: '2026-04-28T14:00:02.000Z',
+            },
+          ]
+        : []),
+    ]);
+    if (exit === 'deleted') mockGetConvo.mockResolvedValue(null);
+    const body = callbackBody({
+      event,
+      surface: 'voice',
+      voice_call_session_id: 'call-terminal-exit',
+      run_id: 'run-terminal-exit',
+    });
+    const res = createMockRes();
+    await dispatch(
+      createTestApp(require('../glasshive')),
+      createMockReq({
+        url: '/api/viventium/glasshive/callback',
+        headers: { 'x-glasshive-signature': signature(body) },
+        body,
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(202);
+    expect(res.body.reason).toBe(
+      {
+        busy: 'conversation_tip_busy',
+        'moved-on': 'conversation_moved_on',
+        deleted: 'origin_conversation_deleted',
+      }[exit],
+    );
+    expect(getVoiceTaskByStreamId('glasshive:run-terminal-exit')).toMatchObject({
+      state,
+      cancellable: false,
+    });
+    expect(snapshotEvent(task.taskId)).toMatchObject({ state, cancellable: false });
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+  });
+
+  test.each([
     ['run.failed', 'Browser needs attention.', 'Mission needs attention.'],
     [
       'run.failed',
@@ -2805,8 +4008,8 @@ describe('/api/viventium/glasshive/callback', () => {
     ],
     ['run.blocked', 'A required mission capability is unavailable.', 'Mission needs attention.'],
   ])(
-    'formats visible %s callbacks in user-facing language',
-    async (event, rawMessage, expected) => {
+    'keeps %s callback status internal while Main authors useful prose',
+    async (event, rawMessage) => {
       const router = require('../glasshive');
       const app = createTestApp(router);
       const body = callbackBody({
@@ -2826,9 +4029,27 @@ describe('/api/viventium/glasshive/callback', () => {
 
       await dispatch(app, req, res);
 
+      if (body.event === 'run.needs_input' && !body.pending_native_input) {
+        expect(res.statusCode).toBe(202);
+        expect(res.body.reason).toBe('main_adjudication_pending');
+        expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+          expect.objectContaining({
+            body: expect.objectContaining({
+              event: 'run.needs_input',
+              work_terminal: false,
+              worker_id: body.worker_id,
+              run_id: body.run_id,
+            }),
+          }),
+        );
+        expect(mockSaveMessage).not.toHaveBeenCalled();
+        expect(mockUpdateMessage).not.toHaveBeenCalled();
+        expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+        return;
+      }
       expect(res.statusCode).toBe(200);
       const [, message] = mockSaveMessage.mock.calls[0];
-      expect(message.text).toBe(expected);
+      expect(message.text).toBe('');
     },
   );
 
@@ -2854,14 +4075,11 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     expect(mockSaveMessage).toHaveBeenCalledTimes(1);
-    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith({
-      originRef: 'ghi-test-origin',
-      state: 'sent',
-    });
+    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).not.toHaveBeenCalled();
     expect(mockRecordTraceDelivery).not.toHaveBeenCalled();
   });
 
-  test('describes failed evidence callbacks with deliverables as output plus verification failure', async () => {
+  test('retains structured verification state and deliverable evidence privately', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
@@ -2890,7 +4108,7 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission output needs verification.');
+    expect(message.text).toBe('');
     expect(message.text).not.toMatch(/^I\b/);
     expect(message.metadata.viventium.deliverable).toEqual(
       expect.objectContaining({
@@ -2931,7 +4149,7 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission needs attention.');
+    expect(message.text).toBe('');
   });
 
   test('does not infer capacity from prose when the structured failure code is missing', async () => {
@@ -2954,12 +4172,12 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission needs attention.');
+    expect(message.text).toBe('');
     expect(message.text).not.toContain('wrk_123');
     expect(message.metadata.viventium.status.attention).toBe('error');
   });
 
-  test('sanitizes worker plumbing from visible callback text', async () => {
+  test('keeps worker plumbing out of callback conversational text', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
@@ -2979,7 +4197,7 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission needs attention.');
+    expect(message.text).toBe('');
     expect(message.text).not.toContain('127.0.0.1:8766');
     expect(message.text).not.toContain('wrk_visual_qa');
     expect(message.text).not.toContain('run_visual_qa');
@@ -2987,7 +4205,7 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(message.text).not.toContain('~/private');
   });
 
-  test('preserves signed GlassHive action link targets while redacting raw worker plumbing', async () => {
+  test('retains signed worker evidence privately instead of publishing action links as callback prose', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
@@ -3009,13 +4227,13 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission completed.');
+    expect(message.text).toBe('');
     expect(message.text).not.toContain('wrk_raw_qa');
     expect(message.text).not.toContain('run_raw_qa');
     expect(message.text).not.toContain('prj_raw_qa');
   });
 
-  test('preserves local GlassHive action links while redacting arbitrary local links', async () => {
+  test('keeps local callback action links out of conversational projection', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
@@ -3044,14 +4262,14 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission completed.');
+    expect(message.text).toBe('');
     expect(message.text).not.toContain('127.0.0.1:8766/ui/workers');
     expect(message.text).not.toContain('127.0.0.1:9999/not-glass/watch');
     expect(message.text).not.toContain('..%2Fsecret.txt');
     expect(message.text).not.toContain('/watch/../../etc');
   });
 
-  test('preserves markdown delimiters when redacting local links and paths', async () => {
+  test('keeps raw callback markup out of conversational projection', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
@@ -3073,10 +4291,10 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission completed.');
+    expect(message.text).toBe('');
   });
 
-  test('redacts common local path forms with spaces before visible persistence', async () => {
+  test('keeps callback local paths out of conversational projection', async () => {
     const router = require('../glasshive');
     const app = createTestApp(router);
     const body = callbackBody({
@@ -3110,7 +4328,7 @@ describe('/api/viventium/glasshive/callback', () => {
 
     expect(res.statusCode).toBe(200);
     const [, message] = mockSaveMessage.mock.calls[0];
-    expect(message.text).toBe('Mission completed.');
+    expect(message.text).toBe('');
     expect(message.text).not.toContain(syntheticLocalPath());
     expect(message.text).not.toContain('My Documents');
     expect(message.text).not.toContain(['', 'private', 'var'].join('/'));

@@ -13,6 +13,8 @@ const {
   fenceGlassHiveTerminalCallbackAcceptedOperation,
   verifyVoiceWorkerCompletionPresentation,
   nativeWorkInputBinding,
+  nativeWorkInputPresentation,
+  createNativeWorkInputPresentationService,
 } = require('@librechat/api');
 const {
   acquireGlassHiveTerminalCallbackAcceptedOperationEffectLease,
@@ -115,6 +117,157 @@ function plainWorkerCompletionPresentation(row) {
   return value;
 }
 
+const exactNativeInputPresentation = createNativeWorkInputPresentationService({
+  requestWork: (ownerId, workRef) =>
+    require('./GlassHiveAccountService').requestAccountApi({
+      ownerId,
+      path: `/v1/work/${encodeURIComponent(workRef)}`,
+    }),
+  readMessage: (filter, session) => queryLean(Message.findOne(filter), session),
+  updateMessage: (filter, update, session) => Message.updateOne(filter, update, { session }),
+  updateDelivery: (filter, update, session) =>
+    ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(filter, update, {
+      new: true,
+      session,
+    }).lean(),
+  fence: (operation, row) => transactionallyFencePersistedDelivery(operation, row),
+});
+
+function isWorkerAttentionBinding(binding) {
+  return binding?.kind === 'nonterminal_attention';
+}
+
+function workerBindingPresentation(row) {
+  return (
+    plainWorkerCompletionPresentation(row) ||
+    (row?.workerCompletionBindings?.length
+      ? {
+          bindings: row.workerCompletionBindings,
+          responseMessageId: row.callbackMessageId,
+          responseDigest:
+            'sha256:' + crypto.createHash('sha256').update(normalizeText(row.text)).digest('hex'),
+          revision: 1,
+        }
+      : null)
+  );
+}
+function hasWorkerAttention(row) {
+  return workerBindingPresentation(row)?.bindings.some(isWorkerAttentionBinding) === true;
+}
+async function exactCanonicalWorkerAttentionDelivery(row, session = null, historical = false) {
+  const presentation = workerBindingPresentation(row);
+  if (!hasWorkerAttention(row) || row.event !== 'main.followup') return null;
+  const message = await queryLean(
+    Message.findOne({
+      user: row.userId,
+      conversationId: row.conversationId,
+      messageId: row.callbackMessageId,
+      isCreatedByUser: false,
+    }),
+    session,
+  );
+  if (
+    !message ||
+    normalizeText(message.text) !== normalizeText(row.text) ||
+    !normalizeText(row.text)
+  )
+    return null;
+  try {
+    await assertWorkerCompletionBindingsAccepted({
+      ownerId: row.userId,
+      presentation,
+      session,
+      retainHistoricalSent: historical,
+    });
+  } catch {
+    return null;
+  }
+  return presentation;
+}
+async function exactCanonicalWorkerDelivery(row, session = null) {
+  return plainWorkerCompletionPresentation(row)
+    ? exactCanonicalWorkerCompletionPresentation(row, session)
+    : exactCanonicalWorkerAttentionDelivery(row, session);
+}
+
+async function assertWorkerAttentionBindingCurrent(
+  ownerId,
+  binding,
+  session = null,
+  historical = false,
+  responseMessageId = '',
+) {
+  const mongoose = require('mongoose');
+  const scope = {
+    _id: binding.evidenceId,
+    ownerId,
+    originRef: binding.originRef,
+    workRef: binding.workRef,
+    workerId: binding.workerId,
+    runId: binding.runId,
+    callbackRef: binding.callbackRef,
+    event: 'run.needs_input',
+    workTerminal: false,
+    workState: 'needs_input',
+    ...(responseMessageId ? { followUpMessageId: responseMessageId } : {}),
+  };
+  const evidence = await mongoose.connection
+    .collection('viventium_glasshive_mission_evidence')
+    .findOne(scope, { session, projection: { _id: 1, callbackCreatedAt: 1 } });
+  const current =
+    historical ||
+    (await mongoose.connection.collection('viventium_external_work').findOne(
+      {
+        _id: binding.originRef,
+        ownerId,
+        workRef: binding.workRef,
+        workerId: binding.workerId,
+        runId: binding.runId,
+        externalState: 'needs_input',
+      },
+      { session, projection: { _id: 1 } },
+    ));
+  const newest = historical
+    ? evidence
+    : await mongoose.connection.collection('viventium_glasshive_mission_evidence').findOne(
+        {
+          ownerId,
+          originRef: binding.originRef,
+          workRef: binding.workRef,
+          workerId: binding.workerId,
+          runId: binding.runId,
+          event: 'run.needs_input',
+          workTerminal: false,
+          workState: 'needs_input',
+        },
+        {
+          session,
+          sort: evidence?.callbackCreatedAt
+            ? { callbackCreatedAt: -1, _id: -1 }
+            : { callbackCreatedAt: -1, createdAt: -1, _id: -1 },
+          projection: { _id: 1 },
+        },
+      );
+  if (!evidence || !current || String(newest?._id) !== binding.evidenceId)
+    throw Object.assign(new Error('voice_worker_completion_binding_superseded'), {
+      code: 'glasshive_callback_effect_fenced',
+    });
+  if (session && !historical) {
+    try {
+      await fenceGlassHiveCallbackRunState({
+        binding: { ownerId, originRef: binding.originRef, workRef: binding.workRef },
+        body: { event: binding.event, worker_id: binding.workerId, run_id: binding.runId },
+        effectSession: session,
+      });
+    } catch (error) {
+      if (error?.code !== 'glasshive_callback_notice_superseded') throw error;
+      throw Object.assign(new Error('voice_worker_completion_binding_superseded'), {
+        code: 'glasshive_callback_effect_fenced',
+      });
+    }
+  }
+}
+
 function workerCompletionReference(binding) {
   return terminalCallbackReference({
     resultKey: binding?.resultKey,
@@ -142,17 +295,23 @@ function workerCompletionLease(value) {
 }
 
 function workerCompletionEffectLeases(row) {
-  const presentation = plainWorkerCompletionPresentation(row);
+  const presentation = workerBindingPresentation(row);
   if (!presentation) return null;
   const stored = Array.isArray(row?.workerCompletionEffectLeases)
     ? row.workerCompletionEffectLeases
     : [];
-  if (stored.length !== presentation.bindings.length) return null;
+  if (
+    stored.length !==
+    presentation.bindings.filter((binding) => !isWorkerAttentionBinding(binding)).length
+  )
+    return null;
   try {
     const leases = stored.map(workerCompletionLease);
     const byResultKey = new Map(leases.map((lease) => [lease.resultKey, lease]));
     if (byResultKey.size !== leases.length) return null;
-    for (const binding of presentation.bindings) {
+    for (const binding of presentation.bindings.filter(
+      (binding) => !isWorkerAttentionBinding(binding),
+    )) {
       const reference = workerCompletionReference(binding);
       const lease = byResultKey.get(reference.resultKey);
       if (
@@ -193,7 +352,7 @@ async function queryLean(query, session = null) {
   return typeof scoped?.lean === 'function' ? scoped.lean() : scoped;
 }
 
-async function exactCanonicalWorkerCompletionPresentation(row, session = null) {
+async function exactCanonicalWorkerCompletionPresentation(row, session = null, historical = false) {
   const presentation = plainWorkerCompletionPresentation(row);
   if (!presentation || normalizeText(row?.surface) !== 'voice') return null;
   const response = await queryLean(
@@ -219,11 +378,44 @@ async function exactCanonicalWorkerCompletionPresentation(row, session = null) {
   ) {
     return null;
   }
+  try {
+    for (const binding of presentation.bindings.filter(isWorkerAttentionBinding))
+      await assertWorkerAttentionBindingCurrent(
+        authority.ownerId,
+        binding,
+        session,
+        historical,
+        presentation.responseMessageId,
+      );
+  } catch {
+    return null;
+  }
   return presentation;
 }
 
-async function workerCompletionLeasesAreCurrent(row, leases, now, session = null) {
-  if (!Array.isArray(leases) || leases.length < 1) return false;
+async function workerCompletionLeasesAreCurrent(
+  row,
+  leases,
+  now,
+  session = null,
+  historical = false,
+) {
+  if (!Array.isArray(leases)) return false;
+  const attention =
+    workerBindingPresentation(row)?.bindings?.filter(isWorkerAttentionBinding) || [];
+  if (!leases.length && !attention.length) return false;
+  try {
+    for (const binding of attention)
+      await assertWorkerAttentionBindingCurrent(
+        row.userId,
+        binding,
+        session,
+        historical,
+        workerBindingPresentation(row).responseMessageId,
+      );
+  } catch {
+    return false;
+  }
   for (const lease of leases) {
     const query = GlassHiveTerminalCallbackResult.exists({
       _id: lease.resultKey,
@@ -251,6 +443,19 @@ function dispatchPermitDuration(value) {
 }
 
 function dispatchPermitLease(row) {
+  const presentation = workerBindingPresentation(row);
+  if (hasWorkerAttention(row)) {
+    const leaseId = normalizeText(row?.dispatchPermitId);
+    const generation = Number(row?.dispatchPermitGeneration);
+    return /^[a-f0-9]{32}$/.test(leaseId) && Number.isSafeInteger(generation) && generation > 0
+      ? {
+          leaseId,
+          generation,
+          resultRevision: presentation.revision,
+          resultDigest: presentation.responseDigest,
+        }
+      : null;
+  }
   const reference = persistedTerminalCallbackReference(row);
   const leaseId = normalizeText(row?.dispatchPermitId);
   const generation = Number(row?.dispatchPermitGeneration);
@@ -282,7 +487,19 @@ function dispatchPermitLease(row) {
 }
 
 function toDispatchPermit(row) {
-  const lease = dispatchPermitLease(row);
+  const question = nativeWorkInputPresentation(row, { allowExpired: true });
+  const lease =
+    question &&
+    /^[a-f0-9]{32}$/.test(normalizeText(row?.dispatchPermitId)) &&
+    Number.isSafeInteger(row.dispatchPermitGeneration) &&
+    row.dispatchPermitGeneration > 0
+      ? {
+          leaseId: row.dispatchPermitId,
+          generation: row.dispatchPermitGeneration,
+          resultRevision: 1,
+          resultDigest: question.digest,
+        }
+      : dispatchPermitLease(row);
   const expiresAt = row?.dispatchPermitExpiresAt
     ? new Date(row.dispatchPermitExpiresAt).toISOString()
     : '';
@@ -313,14 +530,32 @@ function presentedDispatchPermitMatches(row, permit) {
   );
 }
 
-async function transactionallyFencePersistedDelivery(operation, candidate) {
+async function transactionallyFencePersistedDelivery(operation, candidate, transactionOptions) {
   const candidateReference = persistedTerminalCallbackReference(candidate);
+  const missionAttention = hasWorkerAttention(candidate);
   const attention = isGlassHiveNonterminalAttentionCallback({ event: candidate?.event });
-  if (!candidateReference && !attention) {
+  if (!candidateReference && !attention && !missionAttention) {
     return operation(null);
   }
+  const fenceMissionAttention = async (session) => {
+    if (!missionAttention) return;
+    try {
+      await assertWorkerCompletionBindingsAccepted({
+        ownerId: candidate.userId,
+        presentation: workerBindingPresentation(candidate),
+        session,
+      });
+    } catch (error) {
+      if (error?.code !== 'glasshive_callback_effect_fenced') throw error;
+      throw Object.assign(new Error('glasshive_callback_delivery_superseded'), {
+        code: 'glasshive_callback_delivery_superseded',
+        deliveryId: normalizeText(candidate.deliveryId),
+      });
+    }
+  };
   let result = null;
   await runGlassHiveTerminalCallbackTransaction(async (session) => {
+    await fenceMissionAttention(session);
     if (attention) {
       try {
         await fenceGlassHiveCallbackRunState({
@@ -341,6 +576,7 @@ async function transactionallyFencePersistedDelivery(operation, candidate) {
       }
     }
     result = await operation(session);
+    await fenceMissionAttention(session);
     const reference = persistedTerminalCallbackReference(result) || candidateReference;
     if (!reference) return;
     const current = await fenceGlassHiveTerminalCallbackAcceptedOperation({
@@ -354,7 +590,7 @@ async function transactionallyFencePersistedDelivery(operation, candidate) {
         deliveryId: normalizeText(result?.deliveryId),
       });
     }
-  });
+  }, transactionOptions);
   return result;
 }
 
@@ -379,13 +615,56 @@ async function markSupersededDelivery(deliveryId) {
   );
 }
 
-async function recordFencedDeliveryTrace(row, status, at) {
+async function recordFencedDeliveryTrace(row, status, at, transactionOptions) {
   const payload = toDispatchPayload(row);
   try {
-    await transactionallyFencePersistedDelivery(async () => {
-      await recordTraceDelivery(payload, status, traceStatusAt(payload, status, at));
-      return row;
-    }, row);
+    await transactionallyFencePersistedDelivery(
+      async (session) => {
+        if (status === 'claimed' && row.surface === 'telegram') {
+          const message = await queryLean(
+            Message.findOne({
+              user: row.userId,
+              conversationId: row.conversationId,
+              messageId: row.callbackMessageId,
+              isCreatedByUser: false,
+              $or: [
+                { 'content.deliveryDispositionRanges': { $exists: true } },
+                { 'metadata.viventium.deliveryDisposition': { $exists: true } },
+              ],
+            }),
+            session,
+          );
+          if (message) {
+            const deliveredText = String(row.fullText || row.text || '').trim();
+            const sourceText = String(message.text || '').trim();
+            const content = (Array.isArray(message.content) ? message.content : []).filter(
+              (part) => part?.type === 'text',
+            );
+            const ranged = content.some((part) =>
+              Object.prototype.hasOwnProperty.call(part, 'deliveryDispositionRanges'),
+            );
+            const disposition = message.metadata?.viventium?.deliveryDisposition;
+            if (ranged || disposition)
+              payload.deliveryControls = {
+                ...(disposition ? { deliveryDisposition: disposition } : {}),
+                ...(ranged || sourceText !== deliveredText
+                  ? {
+                      audioContent: sourceText === deliveredText ? content : [],
+                      sourceTextSha256: crypto
+                        .createHash('sha256')
+                        .update(deliveredText)
+                        .digest('hex'),
+                    }
+                  : {}),
+              };
+          }
+        }
+        await recordTraceDelivery(payload, status, traceStatusAt(payload, status, at));
+        return row;
+      },
+      row,
+      transactionOptions,
+    );
     return payload;
   } catch (error) {
     if (error?.code !== 'glasshive_callback_delivery_superseded') throw error;
@@ -418,6 +697,9 @@ function deliveryIdFor(deliveryKey) {
 }
 
 function stableDeliveryIdentity({ callbackId, callbackKey, callbackMessageId, event }) {
+  if (normalizeText(event) === 'main.followup') {
+    return `main:${normalizeText(callbackMessageId)}`;
+  }
   return (
     normalizeText(callbackId) ||
     normalizeText(callbackKey) ||
@@ -534,6 +816,9 @@ function toDispatchPayload(delivery) {
     terminalCallbackResultRevision: Number(delivery.terminalCallbackResultRevision) || 0,
     terminalCallbackEffectGeneration: Number(delivery.terminalCallbackEffectGeneration) || 0,
     workerCompletionPresentation: delivery.workerCompletionPresentation || null,
+    ...(delivery.workerCompletionBindings?.length
+      ? { workerCompletionBindings: delivery.workerCompletionBindings }
+      : {}),
   };
 }
 
@@ -543,7 +828,18 @@ function workerCompletionRepresentativeMatches({
   deliveryContext,
   traceIdentity,
 }) {
-  if (!presentation || !traceIdentity) return false;
+  if (!presentation) return false;
+  const attention = presentation.bindings.find(
+    (binding) =>
+      isWorkerAttentionBinding(binding) &&
+      binding.originRef === normalizeText(deliveryContext?.originRef || body?.origin_ref) &&
+      binding.workRef === normalizeText(deliveryContext?.workRef || body?.work_ref) &&
+      binding.workerId === normalizeText(body?.worker_id) &&
+      binding.runId === normalizeText(body?.run_id) &&
+      binding.callbackRef === callbackRef(body?.callback_id),
+  );
+  if (attention) return true;
+  if (!traceIdentity) return false;
   return presentation.bindings.some(
     (binding) =>
       binding.originRef === normalizeText(deliveryContext?.originRef || body?.origin_ref) &&
@@ -555,8 +851,25 @@ function workerCompletionRepresentativeMatches({
   );
 }
 
-async function assertWorkerCompletionBindingsAccepted({ ownerId, presentation, session = null }) {
+async function assertWorkerCompletionBindingsAccepted({
+  ownerId,
+  presentation,
+  session = null,
+  retainHistoricalSent = false,
+}) {
+  const currentBindings = [];
   for (const binding of presentation.bindings) {
+    if (isWorkerAttentionBinding(binding)) {
+      await assertWorkerAttentionBindingCurrent(
+        ownerId,
+        binding,
+        session,
+        retainHistoricalSent,
+        presentation.responseMessageId,
+      );
+      currentBindings.push(binding);
+      continue;
+    }
     const result = await queryLean(
       GlassHiveTerminalCallbackResult.findOne({
         _id: binding.resultKey,
@@ -574,12 +887,33 @@ async function assertWorkerCompletionBindingsAccepted({ ownerId, presentation, s
       }),
       session,
     );
+    if (!result && retainHistoricalSent) {
+      const newer = await queryLean(
+        GlassHiveTerminalCallbackResult.findOne({
+          _id: binding.resultKey,
+          ownerId,
+          originRef: binding.originRef,
+          workRef: binding.workRef,
+          workerId: binding.workerId,
+          runId: binding.runId,
+          attemptNumber: binding.attemptNumber,
+          $or: [
+            { resultRevision: { $gt: binding.resultRevision } },
+            { acceptedOperationGeneration: { $gt: binding.effectGeneration } },
+          ],
+        }),
+        session,
+      );
+      if (newer) continue;
+    }
     if (!result) {
       throw Object.assign(new Error('voice_worker_completion_binding_superseded'), {
         code: 'glasshive_callback_effect_fenced',
       });
     }
+    currentBindings.push(binding);
   }
+  return currentBindings;
 }
 
 async function exactWorkerCompletionPresentation({
@@ -627,7 +961,10 @@ async function publishPendingWorkerCompletionDelivery(delivery) {
   if (
     delivery?.surface !== 'voice' ||
     delivery.status !== 'pending' ||
-    !plainWorkerCompletionPresentation(delivery)
+    !(
+      plainWorkerCompletionPresentation(delivery) ||
+      nativeWorkInputPresentation(delivery, { allowExpired: true })
+    )
   )
     return;
   const publish = async () => {
@@ -654,14 +991,24 @@ async function publishPendingWorkerCompletionDelivery(delivery) {
         snapshot.source?.id === delivery.callbackId
       )
         return;
-      const current = await ViventiumGlassHiveCallbackDelivery.findOne({
+      let current = await ViventiumGlassHiveCallbackDelivery.findOne({
         deliveryId: normalizeText(delivery.deliveryId),
         userId: normalizeText(delivery.userId),
         surface: 'voice',
         status: 'pending',
         voiceCallSessionId: normalizeText(delivery.voiceCallSessionId),
       }).lean();
-      if (!current || !(await exactCanonicalWorkerCompletionPresentation(current))) return;
+      if (!current) return;
+      const question = await exactNativeInputPresentation(current, null, true);
+      if (!((await exactCanonicalWorkerCompletionPresentation(current)) || question)) {
+        if (
+          nativeWorkInputPresentation(current, { allowExpired: true }) ||
+          plainWorkerCompletionPresentation(current)?.bindings.some(isWorkerAttentionBinding)
+        )
+          await markSupersededDelivery(current.deliveryId);
+        return;
+      }
+      if (question) current = question.delivery;
       const scope = {
         userId: normalizeText(current.userId),
         callSessionId: normalizeText(current.voiceCallSessionId),
@@ -819,7 +1166,9 @@ function traceEventForDestination({ body, deliveryContext, surface, traceIdentit
   const traceSurface = normalizeText(deliveryContext?.traceSurface).toLowerCase();
   if (traceSurface && traceSurface !== surface) return '';
   const event = normalizeText(deliveryContext?.traceCallbackEvent || body.event).toLowerCase();
-  return deliveryTerminalState(event) ? event : '';
+  return deliveryTerminalState(event) || isGlassHiveNonterminalAttentionCallback({ event })
+    ? event
+    : '';
 }
 
 function externalDestinations(deliveryContext = {}) {
@@ -830,51 +1179,161 @@ function externalDestinations(deliveryContext = {}) {
 }
 
 function shouldDispatchNeutralStatus(body = {}) {
-  return [
-    'main.followup',
-    'run.failed',
-    'run.cancelled',
-    'run.interrupted',
-    'checkpoint.ready',
-    'takeover.requested',
-    'run.needs_input',
-    'run.blocked',
-  ].includes(normalizeText(body.event));
+  return (
+    normalizeText(body.event) === 'main.followup' || isGlassHiveNonterminalAttentionCallback(body)
+  );
+}
+
+function presentationEligibilityFilter() {
+  // Preserve pre-upgrade Main receipts; raw callback producers always stored a replay key.
+  return {
+    $or: [
+      { presentationKind: 'main' },
+      {
+        event: {
+          $in: ['run.needs_input', 'run.blocked', 'checkpoint.ready', 'takeover.requested'],
+        },
+      },
+      { callbackKey: '', presentationKind: { $in: ['', null] } },
+    ],
+  };
 }
 
 async function recordSurfaceOutcomeBestEffort(originRef, state, candidate = null) {
   if (!originRef) return false;
   const projectionStartedAt = nowDate();
   try {
-    await transactionallyFencePersistedDelivery(async (session) => {
-      const rows = await ViventiumGlassHiveCallbackDelivery.find(
-        { originRef },
-        { status: 1, _id: 0 },
-      ).lean();
-      const statuses = new Set((Array.isArray(rows) ? rows : []).map((row) => row?.status));
-      const aggregateState = statuses.has('delivery_unknown')
-        ? 'unknown'
-        : statuses.has('unresolved')
-          ? 'unresolved'
-          : statuses.has('failed')
-            ? 'failed'
-            : statuses.has('pending') || statuses.has('claimed')
-              ? 'enqueued'
-              : statuses.has('sent')
-                ? 'sent'
-                : statuses.has('suppressed')
-                  ? 'suppressed'
-                  : state;
+    const project = async (session) => {
+      let presentation = null;
+      if (plainWorkerCompletionPresentation(candidate)) {
+        presentation = await exactCanonicalWorkerCompletionPresentation(
+          candidate,
+          session,
+          hasWorkerAttention(candidate) && ['sent', 'delivery_unknown'].includes(candidate.status),
+        );
+        if (!presentation) throw new Error('voice_worker_completion_presentation_superseded');
+      } else if (candidate?.workerCompletionBindings?.length) {
+        const stored = await queryLean(
+          Message.findOne({
+            user: candidate.userId,
+            conversationId: candidate.conversationId,
+            messageId: candidate.callbackMessageId,
+            isCreatedByUser: { $ne: true },
+          }),
+          session,
+        );
+        presentation = {
+          bindings: candidate.workerCompletionBindings,
+          responseMessageId: candidate.callbackMessageId,
+        };
+        if (
+          !stored ||
+          normalizeText(stored.text) !== normalizeText(candidate.text) ||
+          !presentation.bindings.some(
+            (binding) =>
+              binding.originRef === originRef &&
+              binding.workRef === candidate.workRef &&
+              (isWorkerAttentionBinding(binding) ||
+                (binding.resultKey === candidate.terminalCallbackResultKey &&
+                  binding.acceptedOperationId === candidate.terminalCallbackAcceptedOperationId &&
+                  binding.terminalCallbackId === candidate.terminalCallbackId &&
+                  binding.resultDigest === candidate.terminalCallbackResultDigest &&
+                  binding.resultRevision === candidate.terminalCallbackResultRevision &&
+                  binding.effectGeneration === candidate.terminalCallbackEffectGeneration)),
+          )
+        ) {
+          throw new Error('worker_completion_presentation_superseded');
+        }
+      }
+      const currentBindings = presentation
+        ? await assertWorkerCompletionBindingsAccepted({
+            ownerId: normalizeText(candidate.userId),
+            presentation,
+            session,
+            retainHistoricalSent:
+              candidate.status === 'sent' ||
+              (hasWorkerAttention(candidate) && candidate.status === 'delivery_unknown'),
+          })
+        : null;
       const {
         recordGlassHiveSurfaceDeliveryOutcome,
       } = require('./GlassHiveCallbackBindingService');
-      await recordGlassHiveSurfaceDeliveryOutcome({
-        originRef,
-        state: aggregateState,
-        ...(session ? { effectSession: session } : {}),
-      });
+      const bindings = currentBindings || [null];
+      for (const binding of bindings) {
+        const memberOriginRef = binding?.originRef || originRef;
+        const memberScope = binding
+          ? {
+              userId: candidate.userId,
+              $or: [
+                {
+                  originRef: memberOriginRef,
+                  workRef: binding.workRef,
+                  runId: binding.runId,
+                  ...(isWorkerAttentionBinding(binding)
+                    ? {}
+                    : terminalCallbackFields(workerCompletionReference(binding))),
+                },
+                { 'workerCompletionPresentation.bindings': { $elemMatch: binding } },
+                { workerCompletionBindings: { $elemMatch: binding } },
+              ],
+            }
+          : { originRef };
+        const rows = await queryLean(
+          ViventiumGlassHiveCallbackDelivery.find(
+            binding
+              ? { $and: [memberScope, presentationEligibilityFilter()] }
+              : { ...memberScope, ...presentationEligibilityFilter() },
+            { status: 1, _id: 0 },
+          ),
+          session,
+        );
+        const statuses = new Set((Array.isArray(rows) ? rows : []).map((row) => row?.status));
+        const aggregateState = aggregateSurfaceState(statuses, state);
+        await recordGlassHiveSurfaceDeliveryOutcome({
+          originRef: memberOriginRef,
+          state: aggregateState,
+          ...(binding
+            ? {
+                workerCompletion: {
+                  ownerId: candidate.userId,
+                  responseMessageId: presentation.responseMessageId,
+                  binding,
+                },
+              }
+            : {}),
+          ...(session ? { effectSession: session } : {}),
+        });
+        if (
+          binding &&
+          !(await fenceGlassHiveTerminalCallbackAcceptedOperation({
+            ResultModel: GlassHiveTerminalCallbackResult,
+            reference: workerCompletionReference(binding),
+            session,
+          }))
+        )
+          throw Object.assign(new Error('glasshive_callback_delivery_superseded'), {
+            code: 'glasshive_callback_delivery_superseded',
+            deliveryId: candidate.deliveryId,
+          });
+      }
+      if (presentation) {
+        const applied = await ViventiumGlassHiveCallbackDelivery.updateOne(
+          {
+            deliveryId: candidate.deliveryId,
+            userId: candidate.userId,
+            status: candidate.status,
+            callbackMessageId: candidate.callbackMessageId,
+          },
+          { $set: { workerCompletionProjectionAppliedAt: projectionStartedAt } },
+          { session },
+        );
+        if (applied.matchedCount !== 1)
+          throw new Error('worker_completion_projection_snapshot_changed');
+      }
       const projectionFilter = {
-        originRef,
+        ...(presentation
+          ? { deliveryId: candidate.deliveryId, userId: candidate.userId, status: candidate.status }
+          : { originRef }),
         $or: [
           { projectionPendingAt: { $lte: projectionStartedAt } },
           { projectionPendingAt: null, projectionAppliedAt: null },
@@ -897,26 +1356,44 @@ async function recordSurfaceOutcomeBestEffort(originRef, state, candidate = null
         await ViventiumGlassHiveCallbackDelivery.updateMany(projectionFilter, projectionUpdate);
       }
       return candidate;
-    }, candidate);
+    };
+    if (
+      plainWorkerCompletionPresentation(candidate) ||
+      candidate?.workerCompletionBindings?.length
+    ) {
+      await runGlassHiveTerminalCallbackTransaction(project);
+    } else {
+      await transactionallyFencePersistedDelivery(project, candidate);
+    }
     return true;
   } catch (error) {
     if (error?.code === 'glasshive_callback_delivery_superseded') {
       await markSupersededDelivery(error.deliveryId || normalizeText(candidate?.deliveryId));
       return false;
     }
-    await ViventiumGlassHiveCallbackDelivery.updateMany(
-      { originRef },
-      {
-        $set: {
-          projectionPendingAt: candidate?.projectionPendingAt || projectionStartedAt,
-          projectionNextAttemptAt: new Date(projectionStartedAt.getTime() + PROJECTION_RETRY_MS),
-          projectionErrorCode: normalizeText(
-            error?.code || error?.name || 'projection_failed',
-          ).slice(0, 120),
+    try {
+      await ViventiumGlassHiveCallbackDelivery.updateMany(
+        plainWorkerCompletionPresentation(candidate) || candidate?.workerCompletionBindings?.length
+          ? { deliveryId: candidate.deliveryId, userId: candidate.userId }
+          : { originRef },
+        {
+          $set: {
+            projectionPendingAt: candidate?.projectionPendingAt || projectionStartedAt,
+            projectionNextAttemptAt: new Date(projectionStartedAt.getTime() + PROJECTION_RETRY_MS),
+            projectionErrorCode: normalizeText(
+              error?.code || error?.name || 'projection_failed',
+            ).slice(0, 120),
+          },
+          $inc: { projectionAttempts: 1 },
         },
-        $inc: { projectionAttempts: 1 },
-      },
-    );
+      );
+    } catch (retryError) {
+      logger.warn('[VIVENTIUM][glasshive-delivery] Core projection retry persistence deferred', {
+        code: normalizeText(
+          retryError?.code || retryError?.name || 'projection_retry_failed',
+        ).slice(0, 120),
+      });
+    }
     logger.warn('[VIVENTIUM][glasshive-delivery] Core work projection update failed', {
       state,
       code: normalizeText(error?.code || error?.name || 'projection_failed').slice(0, 120),
@@ -1290,10 +1767,11 @@ async function enqueueGlassHiveCallbackDelivery({
     unresolved: 0,
     deliveries: [],
   };
-  // Successful terminal prose is authored only by Main after the 2s account coalescing window.
-  // Do not race that synthesis with a direct worker callback delivery. Failure/input/stop statuses
-  // remain immediate, neutral, and actionable.
+  // Native questions retain their existing input/approval courier; lifecycle state stays internal.
   if (!message) return summary;
+  if (!shouldDispatchNeutralStatus(body)) {
+    return { ...summary, deferredToMain: true };
+  }
   if (destinations.length === 0) {
     const linked = await recordGlassHiveLinkedWebDelivery({
       body,
@@ -1303,9 +1781,6 @@ async function enqueueGlassHiveCallbackDelivery({
       effectSession,
     });
     return linked ? { ...summary, linkedWebCommitted: true } : summary;
-  }
-  if (!shouldDispatchNeutralStatus(body)) {
-    return { ...summary, deferredToMain: true };
   }
   const callbackMessageId = normalizeText(message.messageId);
   const userId = normalizeText(deliveryContext?.ownerId);
@@ -1321,7 +1796,8 @@ async function enqueueGlassHiveCallbackDelivery({
   const originRef = normalizeText(deliveryContext?.originRef || body.origin_ref);
   const now = nowDate();
   const pendingInputBinding =
-    event === 'run.needs_input'
+    event === 'run.needs_input' ||
+    normalizeText(deliveryContext?.traceCallbackEvent) === 'run.needs_input'
       ? nativeWorkInputBinding(body.pending_native_input, normalizeText(body.run_id))
       : null;
   const expiresAt = new Date(now.getTime() + DELIVERY_RETENTION_MS);
@@ -1379,21 +1855,24 @@ async function enqueueGlassHiveCallbackDelivery({
     });
     // Older rows used owner-scoped or surface-only keys. Never match a legacy key without the
     // authenticated owner and compatible origin: callback ids may collide across tenants.
-    const persistedIdentityFilter = {
-      $or: [
-        { deliveryKey },
-        {
-          deliveryKey: `${userId}:${originRef}:${legacyDeliveryKey}`,
-          userId,
-          originRef,
-        },
-        {
-          deliveryKey: legacyDeliveryKey,
-          userId,
-          $or: [{ originRef: { $exists: false } }, { originRef: '' }, { originRef }],
-        },
-      ],
-    };
+    const persistedIdentityFilter =
+      event === 'main.followup'
+        ? { deliveryKey }
+        : {
+            $or: [
+              { deliveryKey },
+              {
+                deliveryKey: `${userId}:${originRef}:${legacyDeliveryKey}`,
+                userId,
+                originRef,
+              },
+              {
+                deliveryKey: legacyDeliveryKey,
+                userId,
+                $or: [{ originRef: { $exists: false } }, { originRef: '' }, { originRef }],
+              },
+            ],
+          };
     const deliveryId = deliveryIdFor(deliveryKey);
     try {
       let updated = await ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
@@ -1405,6 +1884,7 @@ async function enqueueGlassHiveCallbackDelivery({
             callbackId,
             traceIdentityVerified: Boolean(traceEvent),
             callbackKey,
+            presentationKind: event === 'main.followup' ? 'main' : 'native_input',
             callbackMessageId,
             originRef,
             workRef: normalizeText(deliveryContext?.workRef || body.work_ref),
@@ -1446,8 +1926,9 @@ async function enqueueGlassHiveCallbackDelivery({
                 }
               : {}),
             ...(workerCompletionPresentation ? { workerCompletionPresentation } : {}),
-          },
-          $set: {
+            ...(deliveryContext.workerCompletionBindings
+              ? { workerCompletionBindings: deliveryContext.workerCompletionBindings }
+              : {}),
             text: preview,
             fullText: completeText && completeText !== preview ? completeText : '',
             attachments: Array.isArray(message.attachments) ? message.attachments : [],
@@ -1483,6 +1964,9 @@ async function enqueueGlassHiveCallbackDelivery({
               unresolvedReason: '',
               expiresAt,
               ...(workerCompletionPresentation ? { workerCompletionPresentation } : {}),
+              ...(deliveryContext.workerCompletionBindings
+                ? { workerCompletionBindings: deliveryContext.workerCompletionBindings }
+                : {}),
             },
           },
           { new: true },
@@ -1601,6 +2085,14 @@ function claimFilter({
                       { dispatchPermitId: '' },
                       { dispatchPermitId: null },
                     ],
+                    $and: [
+                      {
+                        $or: [
+                          { 'nativeInputBinding.version': { $ne: 1 } },
+                          { dispatchPermitGeneration: { $in: [0, null] } },
+                        ],
+                      },
+                    ],
                   }
                 : {}),
             },
@@ -1611,9 +2103,18 @@ function claimFilter({
   const filter = {
     surface,
     $and: [leaseExpired, retryable],
+    ...presentationEligibilityFilter(),
   };
   if (callbackId) {
     filter.callbackId = callbackId;
+    if (surface === 'voice') {
+      filter.$and.push({
+        $or: [
+          { 'workerCompletionPresentation.version': 1 },
+          { event: 'run.needs_input', 'nativeInputBinding.version': 1 },
+        ],
+      });
+    }
   }
   if (userId) {
     filter.userId = userId;
@@ -1667,7 +2168,12 @@ async function settleExpiredVoiceDispatch(candidate, now) {
       const leases = presentation
         ? workerCompletionEffectLeases(current)
         : [dispatchPermitLease(current)];
-      if (!Array.isArray(leases) || !leases.length || leases.some((lease) => !lease)) return;
+      if (
+        !Array.isArray(leases) ||
+        (!leases.length && !presentation?.bindings.some(isWorkerAttentionBinding)) ||
+        leases.some((lease) => !lease)
+      )
+        return;
       for (const lease of leases) {
         const currentResult = await fenceGlassHiveTerminalCallbackAcceptedOperation({
           ResultModel: GlassHiveTerminalCallbackResult,
@@ -1760,6 +2266,19 @@ async function getSettledGlassHiveVoiceCallbackDelivery({
     return null;
   try {
     const reference = persistedTerminalCallbackReference(row);
+    if (
+      !reference &&
+      (nativeWorkInputPresentation(row, { allowExpired: true }) ||
+        plainWorkerCompletionPresentation(row)?.bindings.some(isWorkerAttentionBinding))
+    ) {
+      return {
+        deliveryId: row.deliveryId,
+        callbackId: callback,
+        userId: owner,
+        voiceCallSessionId: call,
+        status: row.status,
+      };
+    }
     if (!reference) return null;
     const accepted = await queryLean(
       GlassHiveTerminalCallbackResult.findOne({
@@ -1820,6 +2339,15 @@ async function claimPendingGlassHiveCallbackDeliveries({
         surface: normalizedSurface,
         status: 'claimed',
         leaseExpiresAt: { $lte: now },
+        $nor: [
+          {
+            surface: 'voice',
+            event: 'run.needs_input',
+            'nativeInputBinding.version': 1,
+            dispatchPermitId: { $in: ['', null] },
+            dispatchPermitGeneration: { $in: [0, null] },
+          },
+        ],
         $or: [
           { terminalCallbackResultKey: { $exists: false } },
           { terminalCallbackResultKey: '' },
@@ -1834,7 +2362,7 @@ async function claimPendingGlassHiveCallbackDeliveries({
           projectionNextAttemptAt: now,
           leaseExpiresAt: null,
           nextAttemptAt: null,
-          lastError: 'telegram_delivery_status_unknown_after_claim_expiry',
+          lastError: `${normalizedSurface}_delivery_status_unknown_after_claim_expiry`,
         },
       },
     );
@@ -1881,7 +2409,7 @@ async function claimPendingGlassHiveCallbackDeliveries({
     let doc;
     try {
       doc = await transactionallyFencePersistedDelivery(
-        () =>
+        (session) =>
           ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
             { ...pendingFilter, deliveryId: candidate.deliveryId },
             {
@@ -1894,9 +2422,10 @@ async function claimPendingGlassHiveCallbackDeliveries({
                 lastError: '',
               },
             },
-            { sort: { createdAt: 1 }, new: true },
+            { sort: { createdAt: 1 }, new: true, session },
           ).lean(),
         candidate,
+        { retry: 'native' },
       );
     } catch (error) {
       if (error?.code !== 'glasshive_callback_delivery_superseded') throw error;
@@ -1907,7 +2436,16 @@ async function claimPendingGlassHiveCallbackDeliveries({
     if (!doc) {
       break;
     }
-    const payload = await recordFencedDeliveryTrace(doc, 'claimed', now);
+    if (nativeWorkInputPresentation(doc, { allowExpired: true })) {
+      const question = await exactNativeInputPresentation(doc, null, true);
+      if (!question) {
+        await markSupersededDelivery(doc.deliveryId);
+        index -= 1;
+        continue;
+      }
+      doc = question.delivery;
+    }
+    const payload = await recordFencedDeliveryTrace(doc, 'claimed', now, { retry: 'native' });
     if (!payload) {
       index -= 1;
       continue;
@@ -1973,6 +2511,20 @@ async function resolveGlassHiveVoicePresentation({
     !presentedDispatchPermitMatches(current, dispatchPermit)
   )
     return null;
+  if (nativeWorkInputPresentation(current)) {
+    const question = await exactNativeInputPresentation(current);
+    if (
+      !question ||
+      current.deliveryId !== normalizeText(presentationRef) ||
+      current.voiceRequestId !== normalizeText(turnId)
+    )
+      return null;
+    return {
+      ...toDispatchPayload(current),
+      presentationRef: current.deliveryId,
+      turnId: current.voiceRequestId,
+    };
+  }
   if (plainWorkerCompletionPresentation(current)) {
     const presentation = await exactCanonicalWorkerCompletionPresentation(current);
     const leases = workerCompletionEffectLeases(current);
@@ -2026,7 +2578,7 @@ async function resolveGlassHiveVoicePresentation({
 }
 
 async function acquireWorkerCompletionDispatch({ current, now, durationMs, session }) {
-  const presentation = await exactCanonicalWorkerCompletionPresentation(current, session);
+  const presentation = await exactCanonicalWorkerDelivery(current, session);
   if (!presentation) throw new Error('voice_worker_completion_presentation_superseded');
   await assertWorkerCompletionBindingsAccepted({
     ownerId: normalizeText(current.userId),
@@ -2034,7 +2586,9 @@ async function acquireWorkerCompletionDispatch({ current, now, durationMs, sessi
     session,
   });
   const leases = [];
-  for (const binding of presentation.bindings) {
+  for (const binding of presentation.bindings.filter(
+    (binding) => !isWorkerAttentionBinding(binding),
+  )) {
     const lease = await acquireGlassHiveTerminalCallbackAcceptedOperationEffectLease({
       ResultModel: GlassHiveTerminalCallbackResult,
       reference: workerCompletionReference(binding),
@@ -2045,7 +2599,12 @@ async function acquireWorkerCompletionDispatch({ current, now, durationMs, sessi
     if (!lease) throw new Error('glasshive_callback_delivery_dispatch_fenced');
     leases.push(lease);
   }
-  const representative = representativeWorkerCompletionLease(current, leases);
+  const representative = presentation.bindings.some(isWorkerAttentionBinding)
+    ? {
+        leaseId: crypto.randomUUID().replaceAll('-', ''),
+        generation: (current.dispatchPermitGeneration || 0) + 1,
+      }
+    : representativeWorkerCompletionLease(current, leases);
   if (!representative) throw new Error('voice_worker_completion_representative_mismatch');
   return { leases, representative };
 }
@@ -2058,7 +2617,7 @@ async function authorizeWorkerCompletionDispatch({ constraint, initial, now, dur
     const leases = workerCompletionEffectLeases(initial);
     if (
       dispatchPermitLease(initial) &&
-      (await exactCanonicalWorkerCompletionPresentation(initial)) &&
+      (await exactCanonicalWorkerDelivery(initial)) &&
       (await workerCompletionLeasesAreCurrent(initial, leases, now))
     ) {
       return toDispatchPermit(initial);
@@ -2122,7 +2681,7 @@ async function authorizeGlassHiveCallbackDeliveryDispatch({
   });
   const initial = await ViventiumGlassHiveCallbackDelivery.findOne(constraint).lean();
   if (!initial) return null;
-  if (plainWorkerCompletionPresentation(initial)) {
+  if (plainWorkerCompletionPresentation(initial) || hasWorkerAttention(initial)) {
     try {
       return await authorizeWorkerCompletionDispatch({ constraint, initial, now, durationMs });
     } catch (error) {
@@ -2147,6 +2706,42 @@ async function authorizeGlassHiveCallbackDeliveryDispatch({
       }
       throw error;
     }
+  }
+  if (nativeWorkInputPresentation(initial, { allowExpired: true })) {
+    const permitted = await transactionallyFencePersistedDelivery(async (session) => {
+      let current = await queryLean(
+        ViventiumGlassHiveCallbackDelivery.findOne(constraint),
+        session,
+      );
+      const question = current && (await exactNativeInputPresentation(current, session, true));
+      if (!question) return null;
+      current = question.delivery;
+      if (new Date(current.dispatchPermitExpiresAt).getTime() > now.getTime())
+        return toDispatchPermit(current);
+      const row = await ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
+        {
+          ...constraint,
+          dispatchPermitId: current.dispatchPermitId || '',
+          dispatchPermitGeneration: current.dispatchPermitGeneration || 0,
+        },
+        {
+          $set: {
+            dispatchPermitId: crypto.randomUUID().replaceAll('-', ''),
+            dispatchPermitGeneration: (current.dispatchPermitGeneration || 0) + 1,
+            dispatchPermitExpiresAt: new Date(
+              Math.min(
+                now.getTime() + durationMs,
+                Date.parse(current.nativeInputBinding.expiresAt),
+              ),
+            ),
+          },
+        },
+        { new: true, session },
+      ).lean();
+      return toDispatchPermit(row);
+    }, initial);
+    if (!permitted) await markSupersededDelivery(initial.deliveryId);
+    return permitted;
   }
   const existingExpiresAt = initial.dispatchPermitExpiresAt
     ? new Date(initial.dispatchPermitExpiresAt)
@@ -2264,12 +2859,32 @@ async function renewGlassHiveCallbackDeliveryDispatch({
       if (!current || !presentedDispatchPermitMatches(current, dispatchPermit)) {
         throw new Error('glasshive_callback_delivery_dispatch_permit_invalid');
       }
-      const presentation = plainWorkerCompletionPresentation(current);
-      const leases = presentation
-        ? workerCompletionEffectLeases(current)
-        : [dispatchPermitLease(current)];
+      const question = nativeWorkInputPresentation(current);
+      if (question) {
+        if (!(await exactNativeInputPresentation(current, session)))
+          throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        await fenceGlassHiveCallbackRunState({
+          binding: {
+            ownerId: current.userId,
+            originRef: current.originRef,
+            workRef: current.workRef,
+          },
+          body: { event: current.event, worker_id: current.workerId, run_id: current.runId },
+          effectSession: session,
+        });
+      }
+      const presentation =
+        plainWorkerCompletionPresentation(current) ||
+        (hasWorkerAttention(current) ? workerBindingPresentation(current) : null);
+      const leases = question
+        ? []
+        : presentation
+          ? workerCompletionEffectLeases(current)
+          : [dispatchPermitLease(current)];
       if (
-        (presentation && !(await exactCanonicalWorkerCompletionPresentation(current, session))) ||
+        (presentation &&
+          (!(await exactCanonicalWorkerDelivery(current, session)) ||
+            !(await workerCompletionLeasesAreCurrent(current, leases, now, session)))) ||
         !Array.isArray(leases) ||
         leases.some((lease) => !lease)
       ) {
@@ -2285,7 +2900,11 @@ async function renewGlassHiveCallbackDeliveryDispatch({
         });
         if (!renewed) throw new Error('glasshive_callback_delivery_dispatch_fenced');
       }
-      const expiresAt = new Date(now.getTime() + durationMs);
+      const expiresAt = new Date(
+        question
+          ? Math.min(now.getTime() + durationMs, Date.parse(question.binding.expiresAt))
+          : now.getTime() + durationMs,
+      );
       const row = await ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
         {
           ...constraint,
@@ -2332,10 +2951,14 @@ async function releaseGlassHiveCallbackDeliveryDispatch({
       .session(session)
       .lean();
     if (!current || !presentedDispatchPermitMatches(current, dispatchPermit)) return;
-    const presentation = plainWorkerCompletionPresentation(current);
-    const leases = presentation
-      ? workerCompletionEffectLeases(current)
-      : [dispatchPermitLease(current)];
+    const presentation =
+      plainWorkerCompletionPresentation(current) ||
+      (hasWorkerAttention(current) ? workerBindingPresentation(current) : null);
+    const leases = nativeWorkInputPresentation(current, { allowExpired: true })
+      ? []
+      : presentation
+        ? workerCompletionEffectLeases(current)
+        : [dispatchPermitLease(current)];
     if (!Array.isArray(leases) || leases.some((lease) => !lease)) {
       throw new Error('glasshive_callback_delivery_dispatch_fenced');
     }
@@ -2357,7 +2980,9 @@ async function releaseGlassHiveCallbackDeliveryDispatch({
       {
         $set: {
           dispatchPermitId: '',
-          dispatchPermitGeneration: 0,
+          dispatchPermitGeneration: nativeWorkInputPresentation(current, { allowExpired: true })
+            ? current.dispatchPermitGeneration
+            : 0,
           dispatchPermitExpiresAt: null,
           workerCompletionEffectLeases: [],
         },
@@ -2377,7 +3002,9 @@ function workerCompletionTraceFacts(delivery, presentation, binding) {
     runRef: binding.runId,
     callbackRef: binding.callbackRef,
     deliveryRef: normalizeText(delivery.deliveryId),
-    attemptRef: `${binding.runId}:${binding.attemptNumber}`,
+    ...(isWorkerAttentionBinding(binding)
+      ? {}
+      : { attemptRef: `${binding.runId}:${binding.attemptNumber}` }),
     responseRef: presentation.responseMessageId,
     presentationRef: presentation.presentationRef,
     surface: 'voice',
@@ -2427,7 +3054,7 @@ async function completeGlassHiveWorkerCompletionPresentation({
       })
         .session(session)
         .lean();
-      const presentation = await exactCanonicalWorkerCompletionPresentation(current, session);
+      const presentation = await exactCanonicalWorkerCompletionPresentation(current, session, true);
       const leases = workerCompletionEffectLeases(current);
       if (
         !current ||
@@ -2435,7 +3062,7 @@ async function completeGlassHiveWorkerCompletionPresentation({
         normalizeText(presentationRef) !== normalizeText(presentation.presentationRef) ||
         !presentedDispatchPermitMatches(current, dispatchPermit) ||
         !Array.isArray(leases) ||
-        !(await workerCompletionLeasesAreCurrent(current, leases, now, session))
+        !(await workerCompletionLeasesAreCurrent(current, leases, now, session, true))
       ) {
         throw new Error('voice_worker_completion_settlement_invalid');
       }
@@ -2515,6 +3142,70 @@ async function completeGlassHiveWorkerCompletionPresentation({
   return payload;
 }
 
+async function settleWorkerAttentionDelivery(current, constraint, dispatchPermit, updates, now) {
+  let settled = null;
+  await runGlassHiveTerminalCallbackTransaction(async (session) => {
+    const row = await queryLean(
+      ViventiumGlassHiveCallbackDelivery.findOne({
+        ...constraint,
+        dispatchPermitExpiresAt: { $gt: now },
+      }),
+      session,
+    );
+    if (
+      !row ||
+      !presentedDispatchPermitMatches(row, dispatchPermit) ||
+      !(await exactCanonicalWorkerAttentionDelivery(row, session, true))
+    )
+      return;
+    const leases = workerCompletionEffectLeases(row);
+    if (!(await workerCompletionLeasesAreCurrent(row, leases, now, session, true))) return;
+    for (const lease of leases)
+      if (
+        !(await fenceGlassHiveTerminalCallbackEffectTransaction({
+          ResultModel: GlassHiveTerminalCallbackResult,
+          lease,
+          session,
+          now,
+        }))
+      )
+        return;
+    settled = await ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
+      {
+        ...constraint,
+        dispatchPermitId: row.dispatchPermitId,
+        dispatchPermitGeneration: row.dispatchPermitGeneration,
+        dispatchPermitExpiresAt: { $gt: now },
+      },
+      {
+        $set: {
+          ...updates,
+          projectionPendingAt: now,
+          projectionNextAttemptAt: now,
+          leaseExpiresAt: null,
+          dispatchPermitId: '',
+          dispatchPermitGeneration: 0,
+          dispatchPermitExpiresAt: null,
+          workerCompletionEffectLeases: [],
+        },
+      },
+      { new: true, session },
+    ).lean();
+    if (!settled) return;
+    for (const lease of leases)
+      if (
+        !(await releaseGlassHiveTerminalCallbackEffectLease({
+          ResultModel: GlassHiveTerminalCallbackResult,
+          lease,
+          session,
+        }))
+      )
+        throw new Error('glasshive_callback_delivery_dispatch_fenced');
+    await recordTraceDelivery(toDispatchPayload(settled), updates.status, now);
+  });
+  return settled;
+}
+
 async function markGlassHiveCallbackDeliverySent({
   deliveryId,
   claimId,
@@ -2530,6 +3221,30 @@ async function markGlassHiveCallbackDeliverySent({
   );
   const current = currentQuery?.lean ? await currentQuery.lean() : await currentQuery;
   if (plainWorkerCompletionPresentation(current)) return null;
+  if (hasWorkerAttention(current)) {
+    const filter = deliveryConstraintFilter({ deliveryId, claimId, userId, voiceCallSessionId });
+    await recordObservedTelegramMessageIds(current, filter, dispatchPermit, normalizedMessageIds);
+    const settled = await settleWorkerAttentionDelivery(
+      current,
+      filter,
+      dispatchPermit,
+      {
+        status: 'sent',
+        sentAt: now,
+        lastError: '',
+        ...(normalizedMessageIds.length
+          ? {
+              telegramSentMessageIds: normalizedMessageIds,
+              telegramMessageId: normalizedMessageIds[normalizedMessageIds.length - 1],
+              transportReceiptVersion: 1,
+            }
+          : {}),
+      },
+      now,
+    );
+    await recordSurfaceOutcomeBestEffort(settled?.originRef, 'sent', settled);
+    return toDispatchPayload(settled);
+  }
   const terminalReference = persistedTerminalCallbackReference(current);
   if (terminalReference) {
     const lease = dispatchPermitLease(current);
@@ -2615,33 +3330,55 @@ async function markGlassHiveCallbackDeliverySent({
     );
     return payload;
   }
+  if (
+    nativeWorkInputPresentation(current, { allowExpired: true }) &&
+    (!presentedDispatchPermitMatches(current, dispatchPermit) ||
+      !(new Date(current.dispatchPermitExpiresAt).getTime() > now.getTime()) ||
+      !(await exactNativeInputPresentation(current)))
+  )
+    return null;
   let doc;
   try {
-    doc = await transactionallyFencePersistedDelivery(
-      () =>
-        ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
-          deliveryConstraintFilter({ deliveryId, claimId, userId, voiceCallSessionId }),
-          {
-            $set: {
-              status: 'sent',
-              sentAt: now,
-              projectionPendingAt: now,
-              projectionNextAttemptAt: now,
-              leaseExpiresAt: null,
-              lastError: '',
-              ...(normalizedMessageIds.length
-                ? {
-                    telegramSentMessageIds: normalizedMessageIds,
-                    telegramMessageId: normalizedMessageIds[normalizedMessageIds.length - 1],
-                    transportReceiptVersion: 1,
-                  }
-                : {}),
-            },
+    doc = await transactionallyFencePersistedDelivery(async (session) => {
+      if (
+        nativeWorkInputPresentation(current, { allowExpired: true }) &&
+        !(await exactNativeInputPresentation(current, session))
+      )
+        return null;
+      return ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
+        {
+          ...deliveryConstraintFilter({ deliveryId, claimId, userId, voiceCallSessionId }),
+          ...(nativeWorkInputPresentation(current, { allowExpired: true })
+            ? {
+                dispatchPermitId: current.dispatchPermitId,
+                dispatchPermitGeneration: current.dispatchPermitGeneration,
+                dispatchPermitExpiresAt: { $gt: now },
+              }
+            : {}),
+        },
+        {
+          $set: {
+            status: 'sent',
+            sentAt: now,
+            dispatchPermitId: '',
+            dispatchPermitGeneration: 0,
+            dispatchPermitExpiresAt: null,
+            projectionPendingAt: now,
+            projectionNextAttemptAt: now,
+            leaseExpiresAt: null,
+            lastError: '',
+            ...(normalizedMessageIds.length
+              ? {
+                  telegramSentMessageIds: normalizedMessageIds,
+                  telegramMessageId: normalizedMessageIds[normalizedMessageIds.length - 1],
+                  transportReceiptVersion: 1,
+                }
+              : {}),
           },
-          { new: true },
-        ).lean(),
-      current,
-    );
+        },
+        { new: true, session },
+      ).lean();
+    }, current);
   } catch (error) {
     if (error?.code !== 'glasshive_callback_delivery_superseded') throw error;
     await markSupersededDelivery(error.deliveryId || normalizeText(deliveryId));
@@ -2699,7 +3436,7 @@ async function settleWorkerCompletionWithoutAudio({
         !current ||
         !presentedDispatchPermitMatches(current, dispatchPermit) ||
         !Array.isArray(leases) ||
-        !(await workerCompletionLeasesAreCurrent(current, leases, now, session))
+        !(await workerCompletionLeasesAreCurrent(current, leases, now, session, true))
       ) {
         throw new Error('glasshive_callback_delivery_dispatch_permit_invalid');
       }
@@ -2816,12 +3553,18 @@ async function markGlassHiveCallbackDeliveryUnknown({
   const candidate = candidateQuery?.lean ? await candidateQuery.lean() : await candidateQuery;
   if (
     requireIssuedPermit &&
-    (!dispatchPermitLease(candidate) ||
+    (!toDispatchPermit(candidate) ||
       !presentedDispatchPermitMatches(candidate, dispatchPermit) ||
       !(new Date(candidate?.dispatchPermitExpiresAt).getTime() > now.getTime()))
   ) {
     return null;
   }
+  if (
+    nativeWorkInputPresentation(candidate, { allowExpired: true }) &&
+    candidate.dispatchPermitId &&
+    !presentedDispatchPermitMatches(candidate, dispatchPermit)
+  )
+    return null;
   await recordObservedTelegramMessageIds(candidate, filter, dispatchPermit, normalizedMessageIds);
   if (plainWorkerCompletionPresentation(candidate)) {
     return settleWorkerCompletionWithoutAudio({
@@ -2837,6 +3580,22 @@ async function markGlassHiveCallbackDeliveryUnknown({
       },
       now,
     });
+  }
+  if (hasWorkerAttention(candidate) && !plainWorkerCompletionPresentation(candidate)) {
+    const settled = await settleWorkerAttentionDelivery(
+      candidate,
+      filter,
+      dispatchPermit,
+      {
+        status: 'delivery_unknown',
+        unknownAt: now,
+        nextAttemptAt: null,
+        lastError: redactDeliveryError(reason).slice(0, MAX_LAST_ERROR_LENGTH),
+      },
+      now,
+    );
+    await recordSurfaceOutcomeBestEffort(settled?.originRef, 'unknown', settled);
+    return toDispatchPayload(settled);
   }
   const terminalReference = persistedTerminalCallbackReference(candidate);
   const activePermitExpiresAt = candidate?.dispatchPermitExpiresAt
@@ -2925,13 +3684,16 @@ async function markGlassHiveCallbackDeliveryUnknown({
   let doc;
   try {
     doc = await transactionallyFencePersistedDelivery(
-      () =>
+      (session) =>
         ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
           filter,
           {
             $set: {
               status: 'delivery_unknown',
               unknownAt: now,
+              dispatchPermitId: '',
+              dispatchPermitGeneration: 0,
+              dispatchPermitExpiresAt: null,
               projectionPendingAt: now,
               projectionNextAttemptAt: now,
               leaseExpiresAt: null,
@@ -2939,7 +3701,7 @@ async function markGlassHiveCallbackDeliveryUnknown({
               lastError: redactDeliveryError(reason).slice(0, MAX_LAST_ERROR_LENGTH),
             },
           },
-          { new: true },
+          { new: true, session },
         ).lean(),
       candidate,
     );
@@ -3177,9 +3939,29 @@ async function reconcileGlassHiveSurfaceDeliveryProjections({ limit = 25 } = {})
     status: { $in: PROJECTABLE_DELIVERY_STATES },
     $or: [
       {
+        workerCompletionProjectionAppliedAt: null,
+        status: { $in: ['sent', 'failed', 'suppressed', 'unresolved', 'delivery_unknown'] },
+        $and: [
+          {
+            $or: [
+              { workerCompletionPresentation: { $ne: null } },
+              { 'workerCompletionBindings.0': { $exists: true } },
+            ],
+          },
+          { $or: [{ projectionNextAttemptAt: null }, { projectionNextAttemptAt: { $lte: now } }] },
+        ],
+      },
+      {
         surface: 'voice',
         status: 'pending',
         workerCompletionPresentation: { $ne: null },
+        $or: [{ projectionNextAttemptAt: null }, { projectionNextAttemptAt: { $lte: now } }],
+      },
+      {
+        surface: 'voice',
+        status: 'pending',
+        event: 'run.needs_input',
+        'nativeInputBinding.version': 1,
         $or: [{ projectionNextAttemptAt: null }, { projectionNextAttemptAt: { $lte: now } }],
       },
       {
@@ -3209,7 +3991,12 @@ async function reconcileGlassHiveSurfaceDeliveryProjections({ limit = 25 } = {})
     if (
       originRef &&
       !origins.has(originRef) &&
-      (row.projectionPendingAt || !row.projectionAppliedAt || pendingNeutralVoiceDelivery(row))
+      (row.projectionPendingAt ||
+        !row.projectionAppliedAt ||
+        ((plainWorkerCompletionPresentation(row) || row.workerCompletionBindings?.length) &&
+          !row.workerCompletionProjectionAppliedAt &&
+          !['pending', 'claimed'].includes(row.status)) ||
+        pendingNeutralVoiceDelivery(row))
     ) {
       origins.set(originRef, row);
     }

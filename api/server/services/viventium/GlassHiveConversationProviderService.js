@@ -478,9 +478,27 @@ function signBootstrapBundle(encodedBundle, issuedAt) {
     .digest('hex')}`;
 }
 
-function restrictedConversationProviderBootstrapHeaders() {
+function restrictedConversationProviderBootstrapHeaders({
+  privateStructuredResponse = false,
+} = {}) {
+  if (typeof privateStructuredResponse !== 'boolean') {
+    throw new TypeError('privateStructuredResponse must be a boolean');
+  }
   const encodedBundle = Buffer.from(
-    JSON.stringify({ provider_capabilities: { native_tools: false } }),
+    JSON.stringify({
+      provider_capabilities: {
+        native_tools: false,
+        ...(privateStructuredResponse
+          ? {
+              response_contract: {
+                version: 1,
+                visibility: 'private_machine_state',
+                format: 'json_object',
+              },
+            }
+          : {}),
+      },
+    }),
     'utf8',
   ).toString('base64');
   const issuedAt = String(Math.floor(Date.now() / 1000));
@@ -576,6 +594,33 @@ function conversationProviderUsesInvocationLocalTime(req, agentOrProvider) {
   return (
     resolveConversationProviderCapability(req, agentOrProvider)?.time_context_delivery ===
     'per_turn_header'
+  );
+}
+
+/** Select the declared native body courier; header-only and mixed attempts keep legacy bounds. */
+function conversationProviderUsesNativeBody(
+  req,
+  agent,
+  { alternates = [], requireTransport = false } = {},
+) {
+  const routes = [agent, ...alternates].filter(Boolean);
+  if (
+    !routes.length ||
+    routes.some((route) => {
+      const capability = resolveConversationProviderCapability(req, route);
+      return (
+        capability?.context_protocol !== 'main_context_v1' ||
+        capability?.native_session_authority !== 'stable_authority_v1' ||
+        capability?.time_context_delivery !== 'per_turn_header' ||
+        capability?.usage_accounting_scope !== 'visible_message_local' ||
+        capability?.workspace_binding !== true
+      );
+    })
+  )
+    return false;
+  if (!requireTransport) return true;
+  return routes.every((route) =>
+    Boolean(route?.model_parameters?.configuration?.defaultHeaders?.['X-GlassHive-Agent-Id']),
   );
 }
 
@@ -1097,7 +1142,10 @@ function bindHarnessCancellation({
       });
     }
     if (!readOnlyRoute && ownsTask() && !req._viventiumNativeVoiceInputPolling) {
-      const { createNativeVoiceInputClient } = require('@librechat/api');
+      const {
+        createNativeVoiceInputClient,
+        nativeQuestionFormFromSchema,
+      } = require('@librechat/api');
       const client = createNativeVoiceInputClient({
         baseURL: cancelBaseURL,
         apiKey: cancelApiKey,
@@ -1122,6 +1170,23 @@ function bindHarnessCancellation({
               kind: owner.kind,
               preserveExisting: true,
               inputExpiresAtMs: Date.parse(request.expiresAt),
+              isNativeInputCurrent: async (metadata) => {
+                const current = listVoiceTasks({
+                  userId: cancelOwnerId,
+                  callSessionId: authority.callSessionId,
+                }).find((item) => item.taskId === taskId);
+                if (
+                  !ownsTask() ||
+                  current?.owner?.kind !== owner.kind ||
+                  current?.owner?.id !== owner.id ||
+                  !['requestId', 'requestFingerprint', 'runId', 'attemptId', 'expiresAt'].every(
+                    (field) => metadata?.[field] === request[field],
+                  ) ||
+                  metadata.kind !== (request.kind || 'permission')
+                )
+                  return false;
+                return client.isCurrent(key, request);
+              },
               provideInput: async ({ input }) => {
                 const current = listVoiceTasks({
                   userId: cancelOwnerId,
@@ -1144,8 +1209,27 @@ function bindHarnessCancellation({
               event: 'needs_input',
               data: {
                 prompt: request.prompt,
-                inputType: 'choice',
-                choices: request.choices,
+                nativeInputRequest: {
+                  version: 1,
+                  kind: request.kind === 'question' ? 'question' : 'permission',
+                  requestId: request.requestId,
+                  requestFingerprint: request.requestFingerprint,
+                  runId: request.runId,
+                  attemptId: request.attemptId,
+                  expiresAt: request.expiresAt,
+                },
+                ...(request.kind === 'question'
+                  ? {
+                      inputType: 'native_question',
+                      questionForm: nativeQuestionFormFromSchema(request.requestedSchema),
+                    }
+                  : {
+                      inputType: 'choice',
+                      choices: request.choices,
+                      ...(request.operationTitle !== undefined
+                        ? { operationTitle: request.operationTitle }
+                        : {}),
+                    }),
               },
             });
           },
@@ -1564,6 +1648,7 @@ function installConversationProviderCapabilityRefresher({
   capability,
   requestBody = req?.body || {},
   nativeTools,
+  privateStructuredResponse = false,
 } = {}) {
   const declaredProvider = resolveConversationProviderId(declaredAgent);
   const resolvedCapability =
@@ -1596,6 +1681,7 @@ function installConversationProviderCapabilityRefresher({
       capability: resolvedCapability,
       requestBody: effectiveRequestBody,
       nativeTools,
+      ...(privateStructuredResponse ? { privateStructuredResponse: true } : {}),
     });
     if (!attached) {
       // Never leave a previously valid but now expired bundle on the next provider attempt.
@@ -1772,7 +1858,14 @@ async function attachConversationProviderCapabilityBundle({
   capability,
   requestBody = req?.body || {},
   nativeTools,
+  privateStructuredResponse = false,
 } = {}) {
+  if (
+    typeof privateStructuredResponse !== 'boolean' ||
+    (privateStructuredResponse && nativeTools !== false)
+  ) {
+    throw new TypeError('Private structured response requires an explicit zero-tool capability');
+  }
   if (nativeTools !== undefined && typeof nativeTools !== 'boolean') {
     throw new TypeError('nativeTools must be a boolean');
   }
@@ -1798,13 +1891,20 @@ async function attachConversationProviderCapabilityBundle({
         throw new Error('Native zero-tool capability requires a tool-less participant');
       }
     }
-    const headers = restrictedConversationProviderBootstrapHeaders();
+    const headers = restrictedConversationProviderBootstrapHeaders({ privateStructuredResponse });
     clearConversationProviderCapabilityBundle(targetAgent);
     const modelParameters = { ...(targetAgent.model_parameters || {}) };
     const configuration = { ...(modelParameters.configuration || {}) };
     configuration.defaultHeaders = {
       ...projectTrustedNativeInteractionHeaders(req, configuration.defaultHeaders),
       ...headers,
+      ...(privateStructuredResponse
+        ? {
+            'X-Viventium-Actor-Kind': 'system',
+            'X-Viventium-Origin': 'system',
+            'X-Viventium-Audio-Eligible': 'false',
+          }
+        : {}),
     };
     targetAgent.model_parameters = { ...modelParameters, configuration };
     return true;
@@ -2057,6 +2157,7 @@ module.exports = {
   configuredConversationOrchestrationWorkerRoute,
   conversationProviderUsesLocalVisibleAccounting,
   conversationProviderUsesInvocationLocalTime,
+  conversationProviderUsesNativeBody,
   conversationProviderStableAuthorityDigest,
   buildHarnessIdempotencyKey,
   clearConversationProviderCapabilityBundle,

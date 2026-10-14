@@ -33,6 +33,7 @@ module.exports = function createViventiumConversationContinuity(db) {
       coveredSource: { type: [coveredRow], default: [] },
       coveredDigest: { type: String, default: '' },
       semanticCompaction: { type: mongoose.Schema.Types.Mixed, default: null },
+      semanticCompactionContract: { type: mongoose.Schema.Types.Mixed, default: null },
       semanticReview: { type: mongoose.Schema.Types.Mixed, default: null },
       lease: { type: mongoose.Schema.Types.Mixed, default: null },
       lastError: { type: String, default: '' },

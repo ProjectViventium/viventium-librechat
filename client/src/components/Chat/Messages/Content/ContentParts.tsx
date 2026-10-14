@@ -110,8 +110,11 @@ const ContentParts = memo(function ContentParts({
         visibleFallbackText: normalizedFallback,
       }) ?? [];
     const hasNonCortexRenderablePart = parts.some((part) => part && !cortexTypes.has(part.type));
+    /* === VIVENTIUM START === Legacy user captions may be saved beside image parts. === */
+    const hasAuthoredTextPart = parts.some((part) => part?.type === ContentTypes.TEXT);
+    /* === VIVENTIUM END === */
     if (
-      hasNonCortexRenderablePart ||
+      (hasNonCortexRenderablePart && (!isCreatedByUser || hasAuthoredTextPart)) ||
       !normalizedFallback ||
       isNoResponseOnlyText(normalizedFallback)
     ) {
@@ -119,7 +122,7 @@ const ContentParts = memo(function ContentParts({
     }
 
     return [createRenderableMessageTextPart(normalizedFallback, messageAgentId ?? ''), ...parts];
-  }, [content, cortexTypes, fallbackText, messageAgentId]);
+  }, [content, cortexTypes, fallbackText, messageAgentId, isCreatedByUser]);
 
   /**
    * Cortex parts come from a dedicated transient store during streaming

@@ -237,7 +237,7 @@ describe('exact published Cortex child', () => {
       });
     },
   );
-  test.each(['missing-child', 'worker-child'])(
+  test.each(['missing-child', 'worker-child', 'attention-child'])(
     'does not substitute another child for %s',
     async (childId) => {
       mockGetMessages.mockResolvedValueOnce([
@@ -246,6 +246,11 @@ describe('exact published Cortex child', () => {
           messageId: 'worker-child',
           text: 'Worker result.',
           metadata: { viventium: { followUpSource: 'durable_terminal_callback' } },
+        },
+        {
+          messageId: 'attention-child',
+          text: 'Main blocker.',
+          metadata: { viventium: { followUpSource: 'durable_work_callback' } },
         },
       ]);
       const { getCompletedCortexInsightsForMessage } = require('../VoiceCortexInsightsService');
@@ -348,3 +353,108 @@ describe('saved Phase B audio disposition', () => {
   });
 });
 /* === VIVENTIUM END === */
+
+describe('canonical mixed follow-up speech', () => {
+  const choice = (audio) => ({ version: 1, audio, required: true, valid: true, source: 'model' });
+  beforeEach(() => {
+    jest.resetModules();
+    mockGetMessage = jest
+      .fn()
+      .mockResolvedValue({ messageId: 'parent', conversationId: 'conversation', content: [] });
+    mockGetMessages = jest.fn();
+  });
+  test.each([
+    [
+      'mixed',
+      [
+        { start: 0, end: 7, disposition: choice('skip') },
+        { start: 7, end: 12, disposition: choice('eligible') },
+      ],
+      true,
+    ],
+    ['silent', [{ start: 0, end: 12, disposition: choice('skip') }], false],
+    ['incomplete', [{ start: 7, end: 12, disposition: choice('eligible') }], false],
+    ['invalid', [], false],
+  ])(
+    '%s choices survive late Voice fetch without speaking silent text',
+    async (_name, ranges, audible) => {
+      const content = [{ type: 'text', text: 'Silent.Heard', deliveryDispositionRanges: ranges }];
+      mockGetMessages.mockResolvedValue([
+        {
+          messageId: 'child',
+          text: 'Silent.Heard',
+          content,
+          metadata: {
+            viventium: {
+              deliveryDisposition: choice('skip'),
+              cortexInsightDeliveryIds: ['insight'],
+            },
+          },
+        },
+      ]);
+      const { getCompletedCortexInsightsForMessage } = require('../VoiceCortexInsightsService');
+      const result = await getCompletedCortexInsightsForMessage({
+        userId: 'owner',
+        messageId: 'parent',
+        conversationId: 'conversation',
+      });
+      if (audible) expect(result.followUp.content).toEqual(content);
+      else {
+        expect(result.followUp).toBeNull();
+        expect(result.insights).toEqual([]);
+      }
+    },
+  );
+});
+
+test('an uncovered text part cannot escape an accepted ranged follow-up', async () => {
+  jest.resetModules();
+  mockGetMessage = jest
+    .fn()
+    .mockResolvedValue({ messageId: 'parent', conversationId: 'conversation', content: [] });
+  mockGetMessages = jest.fn().mockResolvedValue([
+    {
+      messageId: 'child',
+      text: 'Quiet.Uncovered.',
+      content: [
+        {
+          type: 'text',
+          text: 'Quiet.',
+          deliveryDispositionRanges: [
+            {
+              start: 0,
+              end: 6,
+              disposition: {
+                version: 1,
+                audio: 'skip',
+                required: true,
+                valid: true,
+                source: 'model',
+              },
+            },
+          ],
+        },
+        { type: 'text', text: 'Uncovered.' },
+      ],
+      metadata: {
+        viventium: {
+          deliveryDisposition: {
+            version: 1,
+            audio: 'eligible',
+            required: true,
+            valid: true,
+            source: 'model',
+          },
+        },
+      },
+    },
+  ]);
+  const { getCompletedCortexInsightsForMessage } = require('../VoiceCortexInsightsService');
+  const result = await getCompletedCortexInsightsForMessage({
+    userId: 'owner',
+    messageId: 'parent',
+    conversationId: 'conversation',
+  });
+  expect(result.followUp).toBeNull();
+  expect(result.insights).toEqual([]);
+});

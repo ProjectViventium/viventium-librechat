@@ -1376,16 +1376,22 @@ function getDefaultHandlers({
         } else if (shouldEmitAgentOutput(metadata, eventAgentId)) {
           await emitEvent(res, streamId, { event, data });
         } else {
-          const agentName = metadata?.name ?? 'Agent';
-          const isToolCall = data?.stepDetails.type === StepTypes.TOOL_CALLS;
-          const action = isToolCall ? 'performing a task...' : 'thinking...';
+          /* === VIVENTIUM START ===
+           * Hidden graph steps use the shared AgentUpdate envelope and exact step identity.
+           * Runnable metadata can belong to a concurrent node; it cannot own this update.
+           */
           await emitEvent(res, streamId, {
             event: 'on_agent_update',
             data: {
-              runId: metadata?.run_id,
-              message: `${agentName} is ${action}`,
+              type: ContentTypes.AGENT_UPDATE,
+              agent_update: {
+                runId: data.runId ?? '',
+                index: data.index,
+                agentId: eventAgentId ?? '',
+              },
             },
           });
+          /* === VIVENTIUM END === */
         }
         aggregateContent({ event, data });
       },

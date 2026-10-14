@@ -861,6 +861,100 @@ describe('viventium-seed-agents', () => {
     }
   });
 
+  test.each(['USER', 'ADMIN'])(
+    'preserves the existing Main %s author without administrator inference or user creation',
+    async (role) => {
+      const ownerId = '0123456789abcdef01234567';
+      const owner = { _id: ownerId, email: 'owner@example.test', role };
+      const agents = Array.from({ length: 21 }, (_, index) => ({
+        id: `agent-owned-${index}`,
+        author: ownerId,
+      }));
+      const findById = jest.spyOn(User, 'findById').mockReturnValue({ lean: async () => owner });
+      const find = jest.spyOn(User, 'find').mockImplementation(() => {
+        throw new Error('existing Main ownership must precede administrator inference');
+      });
+      const create = jest.spyOn(User, 'create');
+      try {
+        const selected = await resolveSeedOwner({
+          existingAgentOwnerId: ownerId,
+          requestedEmail: 'viventium-system@example.com',
+        });
+        expect(selected).toEqual(owner);
+        expect(() =>
+          assertExistingAgentOwnersCompatible({ existingAgents: agents, ownerId: selected._id }),
+        ).not.toThrow();
+        expect(findById).toHaveBeenCalledWith(ownerId);
+        expect(find).not.toHaveBeenCalled();
+        expect(create).not.toHaveBeenCalled();
+        expect(agents.every((agent) => agent.author === ownerId)).toBe(true);
+        expect(selected.role).toBe(role);
+      } finally {
+        findById.mockRestore();
+        find.mockRestore();
+        create.mockRestore();
+      }
+    },
+  );
+
+  test.each(['ownerId', 'storedOwnerId'])(
+    'rejects a USER selected through protected %s without fallback or user creation',
+    async (ownerField) => {
+      const ownerId = '0123456789abcdef01234567';
+      const owner = { _id: ownerId, email: 'owner@example.test', role: 'USER' };
+      const findById = jest.spyOn(User, 'findById').mockReturnValue({ lean: async () => owner });
+      const find = jest.spyOn(User, 'find');
+      const create = jest.spyOn(User, 'create');
+      try {
+        await expect(
+          resolveSeedOwner({ [ownerField]: ownerId, existingAgentOwnerId: ownerId }),
+        ).rejects.toThrow('not an administrator');
+        expect(find).not.toHaveBeenCalled();
+        expect(create).not.toHaveBeenCalled();
+      } finally {
+        findById.mockRestore();
+        find.mockRestore();
+        create.mockRestore();
+      }
+    },
+  );
+
+  test.each([
+    ['missing', null],
+    ['placeholder', { email: 'viventium-system@example.com', role: 'ADMIN' }],
+    ['unsupported role', { email: 'owner@example.test', role: 'CUSTOM' }],
+  ])('keeps %s implicit owners behind the author-conflict guard', async (_label, user) => {
+    const existingOwnerId = '0123456789abcdef01234567';
+    const placeholderId = '222222222222222222222222';
+    const placeholder = { _id: placeholderId, email: 'viventium-system@example.com', role: 'USER' };
+    const findById = jest.spyOn(User, 'findById').mockReturnValue({ lean: async () => user });
+    const find = jest
+      .spyOn(User, 'find')
+      .mockReturnValue({ limit: () => ({ lean: async () => [] }) });
+    const findOne = jest.spyOn(User, 'findOne').mockReturnValue({ lean: async () => placeholder });
+    const create = jest.spyOn(User, 'create');
+    try {
+      const selected = await resolveSeedOwner({
+        existingAgentOwnerId: existingOwnerId,
+        requestedEmail: 'viventium-system@example.com',
+      });
+      expect(selected).toEqual(placeholder);
+      expect(() =>
+        assertExistingAgentOwnersCompatible({
+          existingAgents: [{ id: 'agent-main', author: existingOwnerId }],
+          ownerId: selected._id,
+          placeholderOwnerId: placeholderId,
+        }),
+      ).toThrow('existing non-placeholder author');
+      expect(create).not.toHaveBeenCalled();
+    } finally {
+      findById.mockRestore();
+      find.mockRestore();
+      findOne.mockRestore();
+      create.mockRestore();
+    }
+  });
+
   test('fails closed without administrator inference when the persisted owner is demoted', async () => {
     const ownerId = '0123456789abcdef01234567';
     const demotedOwner = { _id: ownerId, email: 'owner@example.test', role: 'USER' };

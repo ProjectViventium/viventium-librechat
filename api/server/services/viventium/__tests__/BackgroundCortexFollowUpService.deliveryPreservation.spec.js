@@ -584,3 +584,65 @@ test('prepares files for the actual visible follow-up before saving and skips a 
     save.mockRestore();
   }
 });
+
+/* === VIVENTIUM START === Ordinary and promoted Phase B outputs share one verified file adapter. === */
+test.each([false, true])(
+  'prepared native files reach actual destination with promotion=%s',
+  async (promoted) => {
+    const db = require('~/models');
+    const files = require('../nativeOutputFiles');
+    const { persistPreparedCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
+    const nativeOutputFiles = { syntheticPreparedCapture: true };
+    const attachments = [{ file_id: 'native_verified', filename: 'shape.svg' }];
+    const prepare = jest.spyOn(files, 'prepareMissionOutputFiles').mockResolvedValue(attachments);
+    const get = jest.spyOn(db, 'getMessage').mockResolvedValue(
+      promoted
+        ? {
+            messageId: 'parent-files',
+            parentMessageId: 'user-parent',
+            conversationId: 'conversation-files',
+            agent_id: 'main-files',
+            content: [{ type: 'cortex_insight', insight: 'Verified file.' }],
+          }
+        : null,
+    );
+    const save = jest.spyOn(db, 'saveMessage').mockResolvedValue({});
+    const update = jest.spyOn(db, 'updateMessage').mockResolvedValue({});
+    const input = {
+      req: { user: { id: 'owner-files' } },
+      conversationId: 'conversation-files',
+      parentMessageId: 'parent-files',
+      agent: { id: 'main-files' },
+      insightsData: { cortexCount: 1 },
+    };
+    try {
+      const message = await persistPreparedCortexFollowUpMessage(input, {
+        text: 'Here is your verified file.',
+        nativeOutputFiles,
+        shouldForceVisibleFollowUp: promoted,
+        finalContinuationContext: { hasMovedOn: false },
+        conversationMessages: [],
+      });
+      expect(message.attachments).toEqual(attachments);
+      expect(prepare).toHaveBeenCalledTimes(1);
+      expect(prepare).toHaveBeenCalledWith({
+        req: input.req,
+        rows: [],
+        message: expect.objectContaining({
+          messageId: message.messageId,
+          conversationId: input.conversationId,
+        }),
+        sourceMessageId: 'parent-files',
+        nativeOutputFiles,
+      });
+      expect(promoted ? update : save).toHaveBeenCalled();
+      if (promoted) expect(message.messageId).toBe('parent-files');
+      else expect(message.messageId).not.toBe('parent-files');
+    } finally {
+      prepare.mockRestore();
+      get.mockRestore();
+      save.mockRestore();
+      update.mockRestore();
+    }
+  },
+);

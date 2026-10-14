@@ -41,8 +41,13 @@ jest.mock('~/components/Chat/Messages/SiblingSwitch', () => () => null);
 jest.mock('~/components/Chat/Messages/HoverButtons', () => () => null);
 jest.mock('~/components/Chat/Messages/MessageIcon', () => () => null);
 jest.mock('~/components/Chat/Messages/Content/ContentParts', () => {
-  return ({ content, attachments }: Pick<TMessage, 'content' | 'attachments'>) => (
+  return ({
+    content,
+    attachments,
+    fallbackText,
+  }: Pick<TMessage, 'content' | 'attachments'> & { fallbackText?: string }) => (
     <div data-testid="saved-content" data-attachments={attachments?.length ?? 0}>
+      {!content?.length && <span>{fallbackText}</span>}
       {content?.map((part, index) => (
         <span key={index}>
           {part && 'text' in part && (typeof part.text === 'string' ? part.text : part.text?.value)}
@@ -50,6 +55,17 @@ jest.mock('~/components/Chat/Messages/Content/ContentParts', () => {
       ))}
     </div>
   );
+});
+
+test('the content-array message path passes saved channel text to the existing renderer', () => {
+  renderMessage('content array', {
+    ...savedAnswer,
+    isCreatedByUser: true,
+    text: 'Please create a fictional moving checklist.',
+    content: [],
+    finish_reason: undefined,
+  });
+  expect(screen.getByText('Please create a fictional moving checklist.')).toBeVisible();
 });
 
 const savedAnswer: TMessage = {

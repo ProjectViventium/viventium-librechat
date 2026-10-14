@@ -10,6 +10,7 @@ const {
   agentUpdateSchema,
   /* VIVENTIUM START: exact provider/model enforcement for Agent writes and reverts. */
   applyAgentProviderCapabilityDefaults,
+  remapDuplicatedAgentGraph,
   /* VIVENTIUM END */
   refreshListAvatars,
   mergeAgentOcrConversion,
@@ -529,6 +530,9 @@ const duplicateAgentHandler = async (req, res) => {
     const newAgentData = Object.assign(cloneData, {
       id: newAgentId,
       author: userId,
+      /* === VIVENTIUM START === Rebind typed graph self references to this copy. === */
+      ...remapDuplicatedAgentGraph(agent, id, newAgentId),
+      /* === VIVENTIUM END === */
     });
 
     const newActionsList = [];

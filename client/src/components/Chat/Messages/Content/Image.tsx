@@ -1,6 +1,8 @@
 import React, { useState, useRef, useMemo, useEffect } from 'react';
 import { Skeleton } from '@librechat/client';
-import { apiBaseUrl } from 'librechat-data-provider';
+import { useQuery } from '@tanstack/react-query';
+import { apiBaseUrl, dataService, FileSources, QueryKeys } from 'librechat-data-provider';
+import type { TFile } from 'librechat-data-provider';
 import DialogImage from './DialogImage';
 import { cn } from '~/utils';
 
@@ -31,6 +33,7 @@ const Image = ({
   args,
   width,
   height,
+  file,
 }: {
   imagePath: string;
   altText: string;
@@ -44,11 +47,54 @@ const Image = ({
   };
   width?: number;
   height?: number;
+  file?: Partial<TFile>;
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
 
+  /* === VIVENTIUM START: Durable local image uploads use the existing authenticated file API. === */
+  const localUpload =
+    file?.source === FileSources.local &&
+    file.filepath?.startsWith('/uploads/') === true &&
+    !!file.file_id &&
+    !!file.user &&
+    file.type?.startsWith('image/') === true;
+  const { data: originalImage } = useQuery({
+    queryKey: [QueryKeys.fileDownload, file?.file_id, 'image-preview', file?.user, file?.type],
+    enabled: localUpload,
+    retry: false,
+    refetchOnWindowFocus: false,
+    staleTime: Infinity,
+    queryFn: async () => {
+      if (!file?.user || !file.file_id || !file.type) {
+        throw new Error('Image file identity is unavailable');
+      }
+      const response = await dataService.getFileDownload(file.user, file.file_id);
+      const metadata = JSON.parse(response.headers['x-file-metadata']) as Pick<
+        TFile,
+        'file_id' | 'type'
+      >;
+      if (metadata.file_id !== file.file_id || metadata.type !== file.type) {
+        throw new Error('Image file metadata does not match');
+      }
+      return new Blob([response.data], { type: metadata.type });
+    },
+  });
+  const [originalImageSource, setOriginalImageSource] = useState<{ fileId: string; url: string }>();
+  useEffect(() => {
+    if (!localUpload || !originalImage) {
+      setOriginalImageSource(undefined);
+      return;
+    }
+    const url = window.URL.createObjectURL(originalImage);
+    setOriginalImageSource({ fileId: file?.file_id ?? '', url });
+    return () => window.URL.revokeObjectURL(url);
+  }, [localUpload, originalImage, file?.file_id]);
+  /* === VIVENTIUM END === */
+
   const absoluteImageUrl = useMemo(() => {
+    if (localUpload)
+      return originalImageSource?.fileId === file?.file_id ? originalImageSource?.url : undefined;
     if (!imagePath) return imagePath;
 
     if (
@@ -61,9 +107,10 @@ const Image = ({
 
     const baseURL = apiBaseUrl();
     return `${baseURL}${imagePath}`;
-  }, [imagePath]);
+  }, [imagePath, localUpload, originalImageSource, file?.file_id]);
 
   const downloadImage = async () => {
+    if (!absoluteImageUrl) return;
     try {
       const response = await fetch(absoluteImageUrl);
       if (!response.ok) {

@@ -79,6 +79,71 @@ describe('GlassHiveConversationProviderService', () => {
         nativeTools: false,
       };
     }
+    test('private machine state is signed, internal and retained by the real capability refresher', async () => {
+      const input = { ...args(), privateStructuredResponse: true };
+      expect(await attachConversationProviderCapabilityBundle(input)).toBe(true);
+      expect(installConversationProviderCapabilityRefresher(input)).toBe(true);
+      const refreshed = await input.targetAgent.viventiumConversationProviderCapabilityRefresh({
+        messageId: 'next-attempt',
+      });
+      const headers = refreshed.defaultHeaders;
+      expect(
+        JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64')),
+      ).toEqual({
+        provider_capabilities: {
+          native_tools: false,
+          response_contract: {
+            version: 1,
+            visibility: 'private_machine_state',
+            format: 'json_object',
+          },
+        },
+      });
+      expect(headers).toMatchObject({
+        'X-Viventium-Actor-Kind': 'system',
+        'X-Viventium-Origin': 'system',
+        'X-Viventium-Audio-Eligible': 'false',
+        'X-GlassHive-Access': 'read_only',
+      });
+      expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(
+        'sha256=' +
+          crypto
+            .createHmac('sha256', 'synthetic-bundle-secret')
+            .update(
+              'v1\n' +
+                headers['X-GlassHive-Bootstrap-Timestamp'] +
+                '\n' +
+                headers['X-GlassHive-Bootstrap-Bundle-B64'],
+            )
+            .digest('hex'),
+      );
+    });
+    test('private user request fields cannot opt into private machine output', async () => {
+      const input = args();
+      input.req.body.privateStructuredResponse = true;
+      input.req.body.completedResultPolicy = 'internal';
+      input.req.body.provider_capabilities = {
+        response_contract: { visibility: 'private_machine_state' },
+      };
+      await attachConversationProviderCapabilityBundle(input);
+      const headers = input.targetAgent.model_parameters.configuration.defaultHeaders;
+      expect(
+        JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64')),
+      ).toEqual({ provider_capabilities: { native_tools: false } });
+      expect(headers).not.toHaveProperty('X-Viventium-Origin', 'system');
+    });
+    test.each([undefined, true, 'false'])(
+      'private state requires zero-tool owner: %s',
+      async (nativeTools) => {
+        await expect(
+          attachConversationProviderCapabilityBundle({
+            ...args(),
+            nativeTools,
+            privateStructuredResponse: true,
+          }),
+        ).rejects.toThrow('explicit zero-tool');
+      },
+    );
     test('signs only native false and retains read-only exact session scope', async () => {
       const input = args();
       expect(await attachConversationProviderCapabilityBundle(input)).toBe(true);
@@ -197,13 +262,13 @@ describe('GlassHiveConversationProviderService', () => {
         type: 'text/plain',
         bytes: 19,
         source: 'local',
-        media_group_index: 0,
+        media_group_index: 1,
       },
     ]);
     expect(getFiles).toHaveBeenCalledWith(
       { user: 'owner-a', file_id: { $in: [fileId] } },
       null,
-      'file_id filename type bytes source context text',
+      'file_id filename type bytes source context text messageId',
     );
     expect(req.body.files).toEqual([]);
     expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(
@@ -402,7 +467,7 @@ describe('GlassHiveConversationProviderService', () => {
       expect(getFiles).toHaveBeenCalledWith(
         { user: 'owner', file_id: { $in: [historical.file_id] } },
         null,
-        'file_id filename type bytes source context text',
+        'file_id filename type bytes source context text messageId',
       );
       const encoded =
         targetAgent.model_parameters.configuration.defaultHeaders[
@@ -2521,6 +2586,88 @@ describe('native Voice input binding', () => {
       .map(([, data]) => data);
   }
 
+  test('foreground native question retains exact current request and owner acknowledgement', async () => {
+    const api = require('@librechat/api');
+    const { task, controller, req, bind } = cancellationBinding();
+    req._viventiumNativeVoiceInputPolling = null;
+    const key = 'Which colour?\nKeep exact spacing ';
+    const request = {
+      kind: 'question',
+      requestId: 'question-native',
+      requestFingerprint: 'a'.repeat(64),
+      runId: 'run-native',
+      attemptId: 'attempt-native',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+      prompt: 'Which colour?',
+      requestedSchema: {
+        type: 'object',
+        required: ['answers'],
+        additionalProperties: false,
+        properties: {
+          answers: {
+            type: 'object',
+            additionalProperties: false,
+            minProperties: 1,
+            maxProperties: 16,
+            properties: {
+              [key]: {
+                type: 'array',
+                uniqueItems: true,
+                minItems: 1,
+                maxItems: 1,
+                items: { type: 'string', enum: ['Blue', 'Other'] },
+              },
+            },
+          },
+          annotations: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              [key]: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['notes'],
+                properties: { notes: { type: 'string', minLength: 1, maxLength: 8000 } },
+              },
+            },
+          },
+        },
+      },
+    };
+    const submit = jest.fn(async () => ({ accepted: true, phase: 'running' }));
+    const poll = jest.fn(async ({ onInput }) => onInput(request, 'voice:exact'));
+    const input = jest
+      .spyOn(api, 'createNativeVoiceInputClient')
+      .mockReturnValue({ poll, submit, isCurrent: jest.fn(async () => true) });
+    const check = jest.spyOn(authorityService, 'assertVoiceWorkAuthority').mockResolvedValue({});
+    try {
+      bind(jest.fn());
+      await req._viventiumNativeVoiceInputPolling;
+      expect(tasks.snapshotEvent(task.taskId).needsInput).toMatchObject({
+        inputType: 'native_question',
+        prompt: request.prompt,
+        nativeInputRequest: {
+          version: 1,
+          kind: 'question',
+          requestId: request.requestId,
+          requestFingerprint: request.requestFingerprint,
+          runId: request.runId,
+          attemptId: request.attemptId,
+          expiresAt: request.expiresAt,
+        },
+        questionForm: { questions: [{ key, multiSelect: false }] },
+      });
+      const answer = JSON.stringify({ answers: { [key]: ['Blue'] } });
+      await tasks.submitVoiceTaskInput(task.taskId, answer, { userId: 'owner-native' });
+      expect(submit).toHaveBeenCalledWith('voice:exact', request, answer);
+      expect(check).toHaveBeenCalled();
+      controller.abort('test_complete');
+    } finally {
+      input.mockRestore();
+      check.mockRestore();
+    }
+  });
+
   function stopDecisions(logger) {
     const prefix = '[GlassHiveProvider] Voice Stop decision ';
     return logger.info.mock.calls
@@ -3251,6 +3398,7 @@ describe('native Voice input binding', () => {
         attemptId: 'attempt-native',
         expiresAt: new Date(Date.now() + 60000).toISOString(),
         prompt: 'Write the requested scratch file',
+        operationTitle: 'Create synthetic.txt in the working folder.',
         choices: [
           { value: 'allow-once', label: 'Allow once' },
           { value: 'deny', label: 'Deny' },
@@ -3287,7 +3435,11 @@ describe('native Voice input binding', () => {
       await new Promise(setImmediate);
       expect(tasks.snapshotEvent(task.taskId)).toMatchObject({
         state: 'needs_input',
-        needsInput: { choices: request.choices },
+        needsInput: {
+          choices: request.choices,
+          prompt: request.prompt,
+          operationTitle: request.operationTitle,
+        },
       });
       const result = await tasks.submitVoiceTaskInput(task.taskId, 'allow-once', {
         userId: 'owner-native',

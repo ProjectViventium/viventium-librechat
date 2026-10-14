@@ -1073,6 +1073,7 @@ router.get('/voice-route', telegramAuth, async (req, res) => {
 
 /* Observe authenticated Telegram order before any chat lock or provider wait. */
 router.post('/source-order', telegramAuth, async (req, res) => {
+  const originalReceivedAt = Date.now();
   const identity = extractTelegramIdentity(req);
   const sourceSequence = parseTelegramSourceSequence(
     req.body?.sourceSequence ?? req.body?.source_sequence ?? req.body?.telegramMessageId,
@@ -1138,6 +1139,7 @@ router.post('/source-order', telegramAuth, async (req, res) => {
           conversation_id: requestedConversationId,
           conversation_generation: input.conversationGeneration,
           source_event_id: sourceEventId,
+          received_at: originalReceivedAt,
           source_order_scope: sourceOrderScope,
           source_sequence: sourceSequence,
         }),
@@ -1173,6 +1175,10 @@ router.post('/source-order', telegramAuth, async (req, res) => {
       );
       bindCanonicalInteractionConversation(req, conversationId);
       const sourceMessageId = acceptedInteractionSourceId(req);
+      bindInteractionSourceSegments(req, input.text, [], {
+        messageId: sourceMessageId,
+        parentMessageId: resolved.parentMessageId || Constants.NO_PARENT,
+      });
       if (!(await Message.exists({ user: req.user.id, messageId: sourceMessageId }))) {
         await saveMessage(
           req,
@@ -1192,6 +1198,7 @@ router.post('/source-order', telegramAuth, async (req, res) => {
                   originalParentMessageId: resolved.parentMessageId || Constants.NO_PARENT,
                 },
                 interactionContext: getTrustedInteractionContext(req),
+                originalInputReceipt: { sourceEventId, receivedAt: originalReceivedAt },
               },
             },
           },
@@ -1214,6 +1221,7 @@ router.post('/source-order', telegramAuth, async (req, res) => {
           mediaGroupId: String(input.preparation?.message?.media_group_id || ''),
         },
         input.preparationId,
+        originalReceivedAt,
       );
       const claimed =
         record.registrationId === input.preparationId && record.leaseUntil > Date.now();
@@ -1319,6 +1327,7 @@ router.post(
   telegramAuth,
   configMiddleware,
   async (req, _res, next) => {
+    const originalReceivedAt = Date.now();
     if (effectiveOrchestrationMode(req.user, { available: true }) === 'parallel') {
       observeOrchestrationOwner(String(req.user.id));
     }
@@ -1572,6 +1581,7 @@ router.post(
         conversation_id: requestedConversationId,
         conversation_generation: conversationGeneration,
         source_event_id: sourceEventId,
+        received_at: retainedInput ? retainedInput.receivedAt : originalReceivedAt,
         ...(sourceOrderScope
           ? { source_order_scope: sourceOrderScope, source_sequence: sourceSequence }
           : {}),
@@ -2375,9 +2385,8 @@ router.post('/orchestration/work/:workRef/actions', telegramAuth, async (req, re
       instruction,
       operationId,
       sourceSurface: 'telegram',
-      ...(nativeResponse?.success
-        ? { nativeInput: nativeResponse.data, ownerInputControl: true }
-        : {}),
+      ownerInputControl: true,
+      ...(nativeResponse?.success ? { nativeInput: nativeResponse.data } : {}),
     });
     return res.status(202).json(result);
   } catch (error) {

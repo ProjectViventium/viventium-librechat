@@ -115,3 +115,47 @@ describe('ViventiumMainContinuityState model', () => {
     ).rejects.toThrow();
   });
 });
+
+test('retains the full reviewed replacement and its server-owned allocation', async () => {
+  const contract = {
+    version: 1,
+    consumer: 'accepted_core',
+    carrierMaxUtf8Bytes: 12288,
+    reservedUtf8Bytes: 1200,
+    maxJsonUtf8Bytes: 11088,
+    maxSummaryUtf8Bytes: 11088,
+    maxItemsPerArray: 32,
+    maxStringItemUtf8Bytes: 1024,
+    maxToolIdentityCharacters: 256,
+  };
+  const summary = 's'.repeat(8000) + ' Keep permission required.';
+  const document = new ContinuityState({
+    ...validState,
+    semanticCompactionContract: contract,
+    semanticCompaction: {
+      version: 1,
+      summary,
+      pendingAsks: [],
+      commitments: [],
+      corrections: [],
+      decisions: [],
+      durableIdentifiers: [],
+      recurrenceOutcomes: [],
+      toolPairs: [],
+      sourceDigest: 'b'.repeat(64),
+      generatedAt: new Date(),
+    },
+    compactionLease: {
+      leaseId: 'lease',
+      sourceDigest: 'b'.repeat(64),
+      sourceTurnIds: [],
+      claimedAt: new Date(),
+      expiresAt: new Date(Date.now() + 1000),
+      outputContract: contract,
+    },
+  });
+  await expect(document.validate()).resolves.toBeUndefined();
+  expect(document.toObject().semanticCompaction?.summary).toBe(summary);
+  expect(document.toObject().semanticCompactionContract).toEqual(contract);
+  expect(document.toObject().compactionLease?.outputContract).toEqual(contract);
+});

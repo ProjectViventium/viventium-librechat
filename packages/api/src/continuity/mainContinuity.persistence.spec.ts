@@ -14,6 +14,7 @@ import {
   createMainContinuityService,
   prepareMainCompactionCandidate,
   mainCompactionCandidateDigest,
+  mainCompactionOutputContractDigest,
 } from './mainContinuity';
 
 describe('native Main acceptance projection', () => {
@@ -198,6 +199,7 @@ describe('native Main acceptance projection', () => {
           approved: true,
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(candidate!),
+          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
         },
       }),
     ).toMatchObject({ status: 'compacted' });
@@ -358,6 +360,7 @@ describe('native Main acceptance projection', () => {
         approved: true,
         sourceDigest: claim.sourceDigest,
         candidateDigest: mainCompactionCandidateDigest(candidate!),
+        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
       },
     });
     expect(raced).toBe(true);
@@ -402,6 +405,7 @@ describe('native Main acceptance projection', () => {
           approved: true,
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(candidate!),
+          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
         },
       }),
     ).toMatchObject({ status: 'compacted' });
@@ -557,6 +561,7 @@ describe('native Main acceptance projection', () => {
             approved: true,
             sourceDigest: claim.sourceDigest,
             candidateDigest: mainCompactionCandidateDigest(candidate),
+            outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
           },
         }),
       ).toMatchObject({ status: 'compacted' });
@@ -727,6 +732,7 @@ describe('native Main acceptance projection', () => {
           approved: true,
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(candidate!),
+          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
         },
       }),
     ).toMatchObject({ status: 'compacted' });

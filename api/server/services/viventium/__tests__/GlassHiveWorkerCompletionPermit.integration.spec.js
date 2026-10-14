@@ -22,6 +22,9 @@ const mockRecordVoiceOrchestrationTrace = jest.fn().mockResolvedValue(null);
 
 jest.mock('../GlassHiveCallbackBindingService', () => ({
   ...jest.requireActual('../GlassHiveCallbackBindingService'),
+  isGlassHiveNonterminalAttentionCallback:
+    require('@librechat/api').createGlassHiveCallbackBindingService({})
+      .isGlassHiveNonterminalAttentionCallback,
   recordGlassHiveSurfaceDeliveryOutcome: (...args) =>
     mockRecordGlassHiveSurfaceDeliveryOutcome(...args),
 }));
@@ -286,7 +289,7 @@ describe('GlassHive grouped Voice completion dispatch permit', () => {
     );
   }, 15000);
 
-  test('reuses a public-base delivery row whose originRef field is absent', async () => {
+  test('reuses a public-base row without originRef and preserves unbound replay bytes', async () => {
     const ownerId = 'owner-public-base-upgrade';
     const originRef = 'origin-public-base-upgrade';
     const callbackId = 'raw-public-base-upgrade';
@@ -350,7 +353,7 @@ describe('GlassHive grouped Voice completion dispatch permit', () => {
     expect(persisted).toMatchObject({
       deliveryId: 'delivery-public-base-upgrade',
       userId: ownerId,
-      text: 'Current delivery text.',
+      text: 'Legacy delivery text.',
     });
     expect(persisted).not.toHaveProperty('originRef');
   }, 15000);

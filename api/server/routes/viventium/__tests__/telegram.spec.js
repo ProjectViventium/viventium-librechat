@@ -1071,6 +1071,26 @@ describe('/api/viventium/telegram', () => {
     expect(mockSaveInput.mock.invocationCallOrder[0]).toBeLessThan(
       mockInputService.register.mock.invocationCallOrder[0],
     );
+    const [savedReq, savedInput] = mockSaveInput.mock.calls[0];
+    const original =
+      require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(
+        savedReq,
+      );
+    expect(original.source_segments).toEqual([
+      expect.objectContaining({
+        source_event_id: row.sourceEventId,
+        source_index: 0,
+        source_message_id: 'source-message',
+        source_received_at: original.source_received_at,
+        text: 'original caption',
+      }),
+    ]);
+    expect(original.source_received_at).toEqual(expect.any(Number));
+    expect(savedInput.metadata.viventium.originalInputReceipt).toEqual({
+      sourceEventId: row.sourceEventId,
+      receivedAt: original.source_received_at,
+    });
+    expect(mockInputService.register.mock.calls[0][2]).toBe(original.source_received_at);
     expect(mockRetainAcceptedInteractionInput).not.toHaveBeenCalled();
     expect(lastAgentId).toBeNull();
   });
@@ -1125,6 +1145,7 @@ describe('/api/viventium/telegram', () => {
     expect(mockInputService.register).toHaveBeenCalledWith(
       expect.objectContaining({ conversationId: row.conversationId }),
       row.registrationId,
+      expect.any(Number),
     );
     expect(lastAgentId).toBeNull();
   });
@@ -1173,6 +1194,7 @@ describe('/api/viventium/telegram', () => {
     expect(mockInputService.register).toHaveBeenCalledWith(
       expect.objectContaining({ conversationId: row.conversationId }),
       row.registrationId,
+      expect.any(Number),
     );
     expect(mockSaveInput).toHaveBeenCalledWith(
       expect.anything(),

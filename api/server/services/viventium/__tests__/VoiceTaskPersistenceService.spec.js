@@ -25,6 +25,7 @@ describe('VoiceTask durable replay and suppression', () => {
       ViventiumVoiceTaskSuppression,
       ViventiumCallSession,
     } = require('~/db/models'));
+    await ViventiumVoiceTask.init();
   });
 
   afterAll(async () => {
@@ -184,6 +185,195 @@ describe('VoiceTask durable replay and suppression', () => {
       }
     },
   );
+
+  test('native question speech offer is durable once across concurrent claim, coalesced persistence and restart', async () => {
+    const scope = { userId: 'offer-owner', callSessionId: 'offer-call' };
+    const task = service.createVoiceTask({
+      ...scope,
+      streamId: 'offer-stream',
+      owner: { kind: 'generation_job', id: 'offer-stream' },
+    });
+    service.registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'generation_job',
+      provideInput: jest.fn(),
+      isNativeInputCurrent: jest.fn(async () => true),
+    });
+    const request = {
+      version: 1,
+      kind: 'question',
+      requestId: 'q-1',
+      requestFingerprint: 'a'.repeat(64),
+      runId: 'native-run',
+      attemptId: 'attempt-1',
+      expiresAt: '2099-01-01T00:00:00Z',
+    };
+    service.observeGenerationEvent(task.taskId, {
+      event: 'needs_input',
+      data: { prompt: 'Choose size', inputType: 'text', nativeInputRequest: request },
+    });
+    const input = {
+      ...scope,
+      streamId: 'offer-stream',
+      prompt: 'Choose size',
+      nativeInputRequest: request,
+    };
+    const outcomes = await Promise.all([
+      service.claimVoiceNativeInputSpeechOffer(task.taskId, input),
+      service.claimVoiceNativeInputSpeechOffer(task.taskId, input),
+    ]);
+    expect(outcomes.filter(Boolean)).toHaveLength(1);
+    const offer = outcomes.find(Boolean);
+    expect(offer.outcome).toBe('offered_unknown');
+    service.observeGenerationEvent(task.taskId, {
+      event: 'needs_input',
+      data: {
+        eventId: 'same-request-snapshot',
+        prompt: 'Choose size',
+        inputType: 'text',
+        nativeInputRequest: request,
+      },
+    });
+    await service.flushVoiceTaskPersistence();
+    expect(
+      (await ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean()).nativeInputSpeechOffer
+        .requestKey,
+    ).toBe(offer.requestKey);
+    service.resetVoiceTasksForTests();
+    await service.hydrateVoiceTask(task.taskId, scope);
+    service.registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'generation_job',
+      provideInput: jest.fn(),
+      isNativeInputCurrent: jest.fn(async () => true),
+    });
+    expect(await service.claimVoiceNativeInputSpeechOffer(task.taskId, input)).toBeNull();
+    const next = { ...request, requestId: 'q-2', requestFingerprint: 'b'.repeat(64) };
+    service.registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'generation_job',
+      provideInput: jest.fn(),
+      isNativeInputCurrent: jest.fn(async () => true),
+    });
+    service.observeGenerationEvent(task.taskId, {
+      event: 'needs_input',
+      data: { prompt: 'Choose size', inputType: 'text', nativeInputRequest: next },
+    });
+    expect(
+      await service.claimVoiceNativeInputSpeechOffer(task.taskId, {
+        ...input,
+        nativeInputRequest: request,
+      }),
+    ).toBeNull();
+    expect(
+      await service.claimVoiceNativeInputSpeechOffer(task.taskId, {
+        ...input,
+        userId: 'foreign',
+        nativeInputRequest: next,
+      }),
+    ).toBeNull();
+    expect(
+      await service.claimVoiceNativeInputSpeechOffer(task.taskId, {
+        ...input,
+        nativeInputRequest: next,
+      }),
+    ).toBeTruthy();
+  });
+
+  test('a remotely answered native question retained in task state cannot acquire speech authority', async () => {
+    const scope = { userId: 'offer-owner', callSessionId: 'offer-call' };
+    const task = service.createVoiceTask({
+      ...scope,
+      streamId: 'offer-stream',
+      owner: { kind: 'generation_job', id: 'offer-stream' },
+    });
+    const current = jest.fn(async () => false);
+    service.registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'generation_job',
+      provideInput: jest.fn(),
+      isNativeInputCurrent: current,
+    });
+    const request = {
+      version: 1,
+      kind: 'question',
+      requestId: 'q-answered',
+      requestFingerprint: 'c'.repeat(64),
+      runId: 'native-run',
+      attemptId: 'attempt-1',
+      expiresAt: '2099-01-01T00:00:00Z',
+    };
+    service.observeGenerationEvent(task.taskId, {
+      event: 'needs_input',
+      data: { prompt: 'Choose size', inputType: 'text', nativeInputRequest: request },
+    });
+    expect(
+      await service.claimVoiceNativeInputSpeechOffer(task.taskId, {
+        ...scope,
+        streamId: 'offer-stream',
+        prompt: 'Choose size',
+        nativeInputRequest: request,
+      }),
+    ).toBeNull();
+    expect(current).toHaveBeenCalledWith(request);
+    expect(
+      (await ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean()).nativeInputSpeechOffer
+        .outcome,
+    ).toBe('offered_unknown');
+  });
+
+  test('remote answer while durable speech CAS waits is rejected before the offer returns', async () => {
+    const scope = { userId: 'offer-owner', callSessionId: 'offer-call' };
+    const task = service.createVoiceTask({
+      ...scope,
+      streamId: 'offer-stream',
+      owner: { kind: 'generation_job', id: 'offer-stream' },
+    });
+    let pending = true;
+    service.registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'generation_job',
+      provideInput: jest.fn(),
+      isNativeInputCurrent: async () => pending,
+    });
+    const request = {
+      version: 1,
+      kind: 'question',
+      requestId: 'q-raced',
+      requestFingerprint: 'd'.repeat(64),
+      runId: 'native-run',
+      attemptId: 'attempt-1',
+      expiresAt: '2099-01-01T00:00:00Z',
+    };
+    service.observeGenerationEvent(task.taskId, {
+      event: 'needs_input',
+      data: { prompt: 'Choose size', inputType: 'text', nativeInputRequest: request },
+    });
+    const actual = ViventiumVoiceTask.findOneAndUpdate.bind(ViventiumVoiceTask);
+    const claim = jest
+      .spyOn(ViventiumVoiceTask, 'findOneAndUpdate')
+      .mockImplementation((...args) => {
+        const query = actual(...args);
+        const lean = query.lean.bind(query);
+        query.lean = async () => {
+          const row = await lean();
+          pending = false;
+          return row;
+        };
+        return query;
+      });
+    try {
+      expect(
+        await service.claimVoiceNativeInputSpeechOffer(task.taskId, {
+          ...scope,
+          streamId: 'offer-stream',
+          prompt: 'Choose size',
+          nativeInputRequest: request,
+        }),
+      ).toBeNull();
+      expect(
+        (await ViventiumVoiceTask.findOne({ taskId: task.taskId }).lean()).nativeInputSpeechOffer
+          .outcome,
+      ).toBe('offered_unknown');
+    } finally {
+      claim.mockRestore();
+    }
+  });
 
   test('commits exact native retry identity before the effect and restores the same owner operation after restart', async () => {
     const { task, scope, authority } = await prepareNativeInput();

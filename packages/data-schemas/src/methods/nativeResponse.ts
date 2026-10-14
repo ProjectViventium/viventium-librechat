@@ -1,5 +1,9 @@
 /* === VIVENTIUM START === Native final persistence shares the source's Mongo transaction. === */
 import { createHash } from 'node:crypto';
+import cloneDeep from 'lodash/cloneDeep';
+import get from 'lodash/get';
+import has from 'lodash/has';
+import set from 'lodash/set';
 import { Constants, ContentTypes } from 'librechat-data-provider';
 import {
   mainContinuityMessageEvidence,
@@ -10,11 +14,12 @@ import type {
   IMainContinuityBackgroundInput,
   IMainContinuityBackgroundInputReceipt,
 } from '../types/mainContinuityState';
-import type { Document, FilterQuery, Query, Types, UpdateResult } from 'mongoose';
+import type { ClientSession, Document, FilterQuery, Query, Types, UpdateResult } from 'mongoose';
 import type { IMessage } from '../types/message';
 import type {
   NativeResponseAdmission,
   NativeResponseCandidate,
+  NativeResponseAttachmentPreparation,
   NativeResponseCommit,
   NativeResponseIdentity,
   NativeResponseSource,
@@ -26,8 +31,15 @@ type Transaction = <T>(operation: () => Promise<T>) => Promise<T>;
 type Commit = (identity: NativeResponseIdentity, digest: string) => Promise<NativeResponseCommit>;
 type Revoke = (identity: NativeResponseIdentity) => Promise<NativeResponseCommit>;
 type NamedMembers<T> = {
-  [Key in keyof T as string extends Key ? never : number extends Key ? never :
-    symbol extends Key ? never : Key]: T[Key];
+  [
+    Key in keyof T as string extends Key
+      ? never
+      : number extends Key
+        ? never
+        : symbol extends Key
+          ? never
+          : Key
+  ]: T[Key];
 };
 type NativeResponseRow = Omit<NamedMembers<IMessage>, keyof NamedMembers<Document>> & {
   _id: Types.ObjectId;
@@ -121,7 +133,10 @@ export function nativeResponseParentSource(
   };
 }
 
-export function createNativeResponseMethods(mongoose: typeof import('mongoose')) {
+type NativeResponseMongoose = typeof import('mongoose') & {
+  transactionAsyncLocalStorage?: { getStore: () => { session?: ClientSession } | undefined };
+};
+export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
   const messages = () => mongoose.model<IMessage>('Message');
   async function ensureNativeResponseIndexes() {
     await messages().collection.createIndex(
@@ -179,9 +194,11 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
           const row = await messages().findOne(filter).select('+nativeResponse').lean();
           const admission = row?.nativeResponse;
           if (
-            !row || !admission ||
-            !(mode === 'current_main' ? ['pending', 'unsupported'] : ['pending'])
-              .includes(admission.status) ||
+            !row ||
+            !admission ||
+            !(mode === 'current_main' ? ['pending', 'unsupported'] : ['pending']).includes(
+              admission.status,
+            ) ||
             admission.recoverUntil <= Date.now()
           )
             return false;
@@ -438,7 +455,10 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
     });
   }
 
-  async function getNativeResponse(userId: string, responseMessageId: string): Promise<NativeResponseRow | null> {
+  async function getNativeResponse(
+    userId: string,
+    responseMessageId: string,
+  ): Promise<NativeResponseRow | null> {
     return messages()
       .findOne({ user: userId, messageId: responseMessageId, deletedAt: null })
       .select('+nativeResponse')
@@ -491,14 +511,18 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
       candidate: NativeResponseCandidate,
       message: NativeResponseMessageProjection,
     ) => NativeResponseMessageProjection,
-    prepareAttachments?: () => Promise<NativeResponseMessageProjection['attachments']>,
+    prepareAttachments?: () => Promise<NativeResponseAttachmentPreparation>,
   ): Promise<NativeResponseRow | null> {
     const committed = await commit(identity, digest);
     if (committed.status !== 'committed' || committed.candidateSha256 !== digest) {
       throw new Error('native_response_publication_revoked');
     }
     // Verified File I/O stays outside transaction retries and follows the publication fence.
-    const preparedAttachments = prepareAttachments ? await prepareAttachments() : undefined;
+    const preparation = prepareAttachments ? await prepareAttachments() : undefined;
+    const preparedAttachments = Array.isArray(preparation) ? preparation : preparation?.attachments;
+    const authorizePublication = Array.isArray(preparation)
+      ? undefined
+      : preparation?.authorizePublication;
     return transaction(async () => {
       const row = await messages()
         .findOne(responseFilter(identity))
@@ -509,6 +533,12 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
         throw new Error('native_response_candidate_missing');
       if (admission.status === 'completed') return row;
       await lockSource(identity, admission.historicalPermit === digest);
+      if (authorizePublication) {
+        const session = mongoose.transactionAsyncLocalStorage?.getStore()?.session;
+        if (!session?.inTransaction())
+          throw new Error('native_response_attachment_transaction_unavailable');
+        await authorizePublication(session);
+      }
       const candidate = JSON.parse(admission.candidateJson || '') as NativeResponseCandidate;
       const content: NativeResponseMessageProjection['content'] = [
         { type: 'text', text: candidate.text },
@@ -905,15 +935,35 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
       return visibleRow;
     if (mode === 'snapshot' && admission.status === 'pending' && update.unfinished !== true)
       return visibleRow;
+    // Message writes protect immutable receipts with dotted metadata operands. Reconstruct their
+    // document carrier before the existing Native canonical-field guard, without changing the row.
+    const dottedMetadata = Object.entries(update).filter(([key]) => key.startsWith('metadata.'));
+    const dottedMetadataOnly = dottedMetadata.length > 0 && update.metadata === undefined;
+    if (dottedMetadata.length) {
+      update = {
+        ...update,
+        metadata: cloneDeep({
+          ...metadataRecord(row.metadata),
+          ...metadataRecord(update.metadata),
+        }),
+      };
+      for (const [key, value] of dottedMetadata) {
+        set(update.metadata, key.slice('metadata.'.length), value);
+        delete update[key];
+      }
+    }
     const guarded = { ...update, ...(hostGraph ? {} : { unfinished: row.unfinished }) };
+    const canonicalKeys = ['backgroundInputs', 'backgroundInputReceipts'];
     if (update.metadata !== undefined) {
       const savedViventium = metadataRecord(row.metadata?.viventium);
       const incoming = metadataRecord(update.metadata);
       const viventium = { ...metadataRecord(incoming.viventium) };
-      const canonicalKeys = ['backgroundInputs', 'backgroundInputReceipts'];
       // Foreground snapshots cannot undo presentation receipts. Failed presentation also
       // survives augmentation; successful empty-parent promotion may start a new presentation.
-      if (mode === 'snapshot' || metadataRecord(savedViventium.deliveryAcknowledgement).state === 'failed')
+      if (
+        mode === 'snapshot' ||
+        metadataRecord(savedViventium.deliveryAcknowledgement).state === 'failed'
+      )
         canonicalKeys.push('deliveryAcknowledgement');
       for (const key of canonicalKeys) {
         if (Object.prototype.hasOwnProperty.call(savedViventium, key))
@@ -945,7 +995,9 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
       if (update.metadata !== undefined) {
         const savedViventium = metadataRecord(row.metadata?.viventium);
         const viventium = { ...savedViventium, ...metadataRecord(guarded.metadata?.viventium) };
-        for (const key of ['deliveryDisposition', 'nativeToolEvidence']) {
+        const terminalCanonicalKeys = ['deliveryDisposition', 'nativeToolEvidence'];
+        canonicalKeys.push(...terminalCanonicalKeys);
+        for (const key of terminalCanonicalKeys) {
           if (Object.prototype.hasOwnProperty.call(savedViventium, key)) {
             viventium[key] = savedViventium[key];
           } else {
@@ -966,6 +1018,15 @@ export function createNativeResponseMethods(mongoose: typeof import('mongoose'))
           (part) => !['text', 'error'].includes(String((part as { type?: string })?.type)),
         ),
       ];
+    }
+    if (dottedMetadataOnly) {
+      const approvedMetadata = guarded.metadata;
+      delete guarded.metadata;
+      for (const [key] of dottedMetadata) {
+        const path = key.slice('metadata.'.length);
+        if (path.startsWith('viventium.') && canonicalKeys.includes(path.split('.')[1])) continue;
+        if (has(approvedMetadata, path)) guarded[key] = get(approvedMetadata, path);
+      }
     }
     const saved = await messages().findOneAndUpdate(
       { ...responseFilter(admission), 'nativeResponse.status': admission.status },

@@ -33,6 +33,8 @@ interface AuthorizationRecord extends ValueRecord {
   currentHostStartupLeaseId?: string;
   maxExpiresAt: Date | string;
   lastNeedsInputCode?: string;
+  lastReauthorizedAt?: Date | string;
+  reauthorizationCount?: number;
 }
 
 interface IndexRecord {
@@ -1081,11 +1083,51 @@ export async function revokeCapabilityAuthorizationGrant({
   );
 }
 
+function authorizationDateMs(value: unknown): number {
+  if (typeof value === 'string') return new Date(value).getTime();
+  try {
+    return Date.prototype.getTime.call(value);
+  } catch {
+    return NaN;
+  }
+}
+
+/** Read a historical descriptor candidate; the native action digest alone owns receipt recovery. */
+export async function readCapabilityReauthorizationReceiptCandidate({
+  ownerId,
+  workRef,
+}: ReauthorizeInput = {}) {
+  const normalizedOwner = String(ownerId || '').trim();
+  const normalizedWork = String(workRef || '').trim();
+  if (!normalizedOwner || normalizedOwner.length > 192 || !SIMPLE_REF.test(normalizedWork))
+    return null;
+  const record = await authorizationCollection().findOne({
+    ownerId: normalizedOwner,
+    workRef: normalizedWork,
+    status: 'active',
+  });
+  const maximumMs = authorizationDateMs(record?.maxExpiresAt);
+  if (
+    !record ||
+    !Number.isFinite(maximumMs) ||
+    !Number.isInteger(record.reauthorizationCount) ||
+    Number(record.reauthorizationCount) < 1 ||
+    !record.authorizationRef ||
+    !record.scopeFingerprint
+  )
+    return null;
+  return {
+    version: 1,
+    authorizationRef: record.authorizationRef,
+    maxExpiresAt: new Date(maximumMs).toISOString(),
+    scopeFingerprint: record.scopeFingerprint,
+  };
+}
+
 /**
- * Reauthorize one previously horizon-expired mission after an authenticated owner action.
- * This never accepts a new scope: the persisted envelope is revalidated against current policy,
- * then only its time horizon is advanced. The action proxy carries the returned refresh metadata
- * to GlassHive over the owner-scoped service-asserted account API.
+ * Reauthorize one horizon-expired mission after an authenticated owner action.
+ * Revalidate the persisted scope, then advance its horizon or reuse a fresh prior renewal.
+ * The action proxy carries only that refresh metadata over the owner-scoped account API.
  */
 export async function reauthorizeCapabilityAuthorization({
   ownerId,
@@ -1106,7 +1148,24 @@ export async function reauthorizeCapabilityAuthorization({
     workRef: normalizedWork,
     status: 'active',
   });
-  if (!record || record.lastNeedsInputCode !== 'capability_authorization_horizon_expired') {
+  const maximumMs = authorizationDateMs(record?.maxExpiresAt);
+  const reauthorizedMs = authorizationDateMs(record?.lastReauthorizedAt);
+  const markedExpired = record?.lastNeedsInputCode === 'capability_authorization_horizon_expired';
+  const expired = Number.isFinite(maximumMs) && maximumMs <= nowMs;
+  const remainingSeconds = Math.floor((maximumMs - nowMs) / 1000);
+  const renewed =
+    Number.isFinite(reauthorizedMs) &&
+    reauthorizedMs <= nowMs &&
+    Number.isInteger(record?.reauthorizationCount) &&
+    Number(record?.reauthorizationCount) > 0;
+  const replay = !markedExpired && renewed && remainingSeconds >= 60;
+  const renewalDue = expired || (renewed && remainingSeconds < 60);
+  if (
+    !record ||
+    !Number.isFinite(nowMs) ||
+    !Number.isFinite(maximumMs) ||
+    (!markedExpired && !renewalDue && !replay)
+  ) {
     throw new CapabilityAuthorizationError(
       'capability_authorization_not_found',
       'The mission capability authorization was not found.',
@@ -1114,30 +1173,60 @@ export async function reauthorizeCapabilityAuthorization({
     );
   }
 
+  const authorizationRef = record.authorizationRef;
+  const fingerprint = record.scopeFingerprint;
+  const identity = {
+    _id: record._id,
+    authorizationRef,
+    ownerId: normalizedOwner,
+    workRef: normalizedWork,
+    status: 'active',
+    scopeFingerprint: fingerprint,
+    maxExpiresAt:
+      typeof record.maxExpiresAt === 'string' ? record.maxExpiresAt : new Date(maximumMs),
+    lastNeedsInputCode:
+      record.lastNeedsInputCode === undefined ? { $exists: false } : record.lastNeedsInputCode,
+  };
+  const priorMaximum = new Date(maximumMs);
+  const replayIdentity = {
+    ...identity,
+    lastReauthorizedAt:
+      typeof record.lastReauthorizedAt === 'string'
+        ? record.lastReauthorizedAt
+        : new Date(reauthorizedMs),
+    reauthorizationCount: record.reauthorizationCount,
+  };
   await revalidateAuthorization(record);
+  if (replay) {
+    const current = await authorizationCollection().findOne(replayIdentity);
+    if (!current) {
+      throw new CapabilityAuthorizationError(
+        'capability_authorization_not_found',
+        'The mission capability authorization was not found.',
+        { status: 404, needsInput: false },
+      );
+    }
+    return {
+      status: 'reauthorized',
+      authorizationRef,
+      workRef: normalizedWork,
+      scopeFingerprint: fingerprint,
+      maxExpiresAt: priorMaximum.toISOString(),
+    };
+  }
   const now = new Date(nowMs);
   const maxExpiresAt = new Date(nowMs + authorizationHorizonSeconds() * 1000);
   const retentionExpiresAt = new Date(nowMs + AUTHORIZATION_RETENTION_SECONDS * 1000);
-  const updated = await authorizationCollection().updateOne(
-    {
-      _id: record._id,
-      ownerId: normalizedOwner,
-      workRef: normalizedWork,
-      status: 'active',
-      scopeFingerprint: record.scopeFingerprint,
-      lastNeedsInputCode: 'capability_authorization_horizon_expired',
+  const updated = await authorizationCollection().updateOne(identity, {
+    $set: {
+      maxExpiresAt,
+      retentionExpiresAt,
+      lastNeedsInputCode: '',
+      lastReauthorizedAt: now,
+      updatedAt: now,
     },
-    {
-      $set: {
-        maxExpiresAt,
-        retentionExpiresAt,
-        lastNeedsInputCode: '',
-        lastReauthorizedAt: now,
-        updatedAt: now,
-      },
-      $inc: { reauthorizationCount: 1 },
-    },
-  );
+    $inc: { reauthorizationCount: 1 },
+  });
   if (Number(updated?.matchedCount) !== 1) {
     throw new CapabilityAuthorizationError(
       'capability_authorization_not_found',
@@ -1146,15 +1235,15 @@ export async function reauthorizeCapabilityAuthorization({
     );
   }
   logger.info('[VIVENTIUM][glasshive-capability-authorization] Mission scope reauthorized', {
-    authorizationRef: record.authorizationRef,
+    authorizationRef,
     workRef: normalizedWork,
     maxExpiresAt: maxExpiresAt.toISOString(),
   });
   return {
     status: 'reauthorized',
-    authorizationRef: record.authorizationRef,
+    authorizationRef,
     workRef: normalizedWork,
-    scopeFingerprint: record.scopeFingerprint,
+    scopeFingerprint: fingerprint,
     maxExpiresAt: maxExpiresAt.toISOString(),
   };
 }

@@ -207,6 +207,7 @@ function mintBrokerGrant({
   deferredServers = [],
   allowedHostTools = [],
   hostToolResources = {},
+  conversationRequestBody,
   requestContext = {},
   executionMode,
   authorityKind = BROKER_AUTHORITY_KINDS.MISSION_WORKER,
@@ -276,13 +277,33 @@ function mintBrokerGrant({
   );
   const normalizedHostTools = sanitizeAllowedHostTools(allowedHostTools);
   const normalizedHostResources = sanitizeHostToolResources(hostToolResources, normalizedHostTools);
+  // One signed resource owns the exact conversation body. Allowed tool descriptors reference it;
+  // hydration below resolves the reference only after the grant's resource hash and expiry checks.
+  const hasConversationRequestBody = conversationRequestBody !== undefined;
+  if (
+    hasConversationRequestBody &&
+    (normalizeBrokerAuthorityKind(authorityKind) !==
+      BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR ||
+      !conversationRequestBody ||
+      typeof conversationRequestBody !== 'object' ||
+      Array.isArray(conversationRequestBody) ||
+      normalizedHostTools.includes('conversation_request_body'))
+  ) {
+    throw new Error('GlassHive capability broker conversation resource scope is invalid');
+  }
+  const normalizedGrantResources = hasConversationRequestBody
+    ? {
+        ...normalizedHostResources,
+        conversation_request_body: JSON.parse(JSON.stringify(conversationRequestBody)),
+      }
+    : normalizedHostResources;
   const resolvedGrantId =
     normalizeGrantId(grantId) || `ghcb_${crypto.randomBytes(16).toString('hex')}`;
   const resourceRecord =
-    Object.keys(normalizedHostResources).length > 0
+    Object.keys(normalizedGrantResources).length > 0
       ? resourceRecordForGrant({
           grantId: resolvedGrantId,
-          resources: normalizedHostResources,
+          resources: normalizedGrantResources,
           expiresAt: exp,
           nowMs,
         })
@@ -339,7 +360,7 @@ function mintBrokerGrant({
     token: base64urlEncode(JSON.stringify(payload)),
     payload: {
       ...payload,
-      ...(resourceRecord ? { host_tool_resources: resourceRecord.resources } : {}),
+      ...(resourceRecord ? { host_tool_resources: normalizedHostResources } : {}),
     },
     resourceRecord,
   };
@@ -477,14 +498,35 @@ async function hydrateBrokerGrantResources(grant, { nowMs = Date.now() } = {}) {
   ) {
     throw new Error('GlassHive capability broker resource scope is unavailable');
   }
+  const hostToolResources = sanitizeHostToolResources(
+    record.resources,
+    sanitizeAllowedHostTools(grant.allowed_host_tools),
+  );
+  const conversationRequestBody = record.resources.conversation_request_body;
+  const hydratedConversationRequestBody =
+    conversationRequestBody &&
+    typeof conversationRequestBody === 'object' &&
+    !Array.isArray(conversationRequestBody)
+      ? JSON.parse(JSON.stringify(conversationRequestBody))
+      : undefined;
+  for (const resources of Object.values(hostToolResources)) {
+    if (resources.request_body_ref === undefined) {
+      continue; // Retain existing inline resources from older grants.
+    }
+    if (
+      grant.authority_kind !== BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR ||
+      resources.request_body_ref !== 'conversation_request_body' ||
+      resources.request_body !== undefined ||
+      !conversationRequestBody ||
+      typeof conversationRequestBody !== 'object' ||
+      Array.isArray(conversationRequestBody)
+    ) {
+      throw new Error('GlassHive capability broker conversation resource scope is unavailable');
+    }
+    resources.request_body = hydratedConversationRequestBody;
+  }
   rememberGrantResourcesFallback(record, nowMs);
-  return {
-    ...grant,
-    host_tool_resources: sanitizeHostToolResources(
-      record.resources,
-      sanitizeAllowedHostTools(grant.allowed_host_tools),
-    ),
-  };
+  return { ...grant, host_tool_resources: hostToolResources };
 }
 
 async function getRevocationCache() {

@@ -372,6 +372,72 @@ export interface DeliveryDispositionRange {
   disposition: DeliveryDisposition;
 }
 
+/** Project exact native public-part choices onto the accepted display text. */
+export function inspectProviderDeliveryRanges(
+  response: unknown,
+  publicText: string,
+  projectText: (text: string) => string = (text) => text,
+): DeliveryDispositionRange[] | null {
+  const envelope = isRecord(response) ? response : null;
+  const additional = recordAt(envelope, 'additional_kwargs');
+  const root =
+    recordAt(additional, '__raw_response') ?? recordAt(envelope, '__raw_response') ?? envelope;
+  const choices = root?.choices;
+  const choice = Array.isArray(choices) && choices.length === 1 ? choices[0] : null;
+  const message = recordAt(choice, 'message') ?? recordAt(choice, 'delta');
+  const carrier = recordAt(recordAt(message, 'provider_specific_fields'), 'viventium');
+  if (!carrier || !Object.prototype.hasOwnProperty.call(carrier, 'deliveryDispositionRanges'))
+    return null;
+  const source =
+    typeof carrier.delivery_range_text === 'string'
+      ? carrier.delivery_range_text
+      : message?.content;
+  const ranges = carrier.deliveryDispositionRanges;
+  if ((message?.role != null && message.role !== 'assistant') || typeof source !== 'string')
+    return [];
+  return projectDeliveryDispositionRanges(ranges, source, publicText, projectText);
+}
+
+/** Validate already accepted canonical ranges using the same native projection contract. */
+export function projectDeliveryDispositionRanges(
+  ranges: unknown,
+  source: string,
+  publicText: string = source,
+  projectText: (text: string) => string = (text) => text,
+): DeliveryDispositionRange[] {
+  if (!Array.isArray(ranges) || !ranges.length || projectText(source) !== publicText) return [];
+  const result: DeliveryDispositionRange[] = [];
+  let cursor = 0;
+  let projected = 0;
+  for (const range of ranges) {
+    if (
+      !isRecord(range) ||
+      Object.keys(range).sort().join(',') !== 'disposition,end,start' ||
+      range.start !== cursor ||
+      typeof range.end !== 'number' ||
+      !Number.isInteger(range.end) ||
+      range.end <= cursor ||
+      range.end > source.length
+    )
+      return [];
+    const disposition = validateDeliveryDisposition(range.disposition);
+    if (
+      !disposition ||
+      (range.end < source.length &&
+        source.charCodeAt(range.end) >= 0xdc00 &&
+        source.charCodeAt(range.end) <= 0xdfff)
+    )
+      return [];
+    const prefix = projectText(source.slice(0, range.end));
+    if (!publicText.startsWith(prefix) || prefix.length < projected) return [];
+    if (prefix.length > projected)
+      result.push({ start: projected, end: prefix.length, disposition });
+    cursor = range.end;
+    projected = prefix.length;
+  }
+  return cursor === source.length && projected === publicText.length ? result : [];
+}
+
 /** Accept Core's fail-closed outcomes as well as validated model choices. */
 function retainedDeliveryDisposition(value: unknown): DeliveryDisposition | null {
   const model = validateDeliveryDisposition(value);

@@ -41,7 +41,6 @@ export type InteractionSupersedeScope = 'response_and_authoring' | 'response_onl
 export type InteractionTurnScope = 'conversation' | 'source_event';
 export type InteractionCommitAuthority = 'server' | 'external_adapter';
 
-
 export interface ReadyInputContinuation {
   readonly source_message_id: string;
   readonly presentation_source_sequence: number;
@@ -52,7 +51,9 @@ export function interactionPresentationSequence(context?: {
   readonly source_sequence?: number;
   readonly ready_input_continuation?: ReadyInputContinuation;
 }): number | undefined {
-  return context?.ready_input_continuation?.presentation_source_sequence ?? context?.source_sequence;
+  return (
+    context?.ready_input_continuation?.presentation_source_sequence ?? context?.source_sequence
+  );
 }
 
 export interface TrustedInteractionContext {
@@ -63,6 +64,7 @@ export interface TrustedInteractionContext {
   readonly logical_turn_id?: string;
   readonly revision: number;
   readonly source_event_id: string;
+  readonly source_received_at?: number;
   readonly source_order_scope?: string;
   readonly source_sequence?: number;
   readonly source_conversation_generation?: string;
@@ -86,6 +88,7 @@ export interface InteractionContextInput {
   logical_turn_id?: unknown;
   revision?: unknown;
   source_event_id?: unknown;
+  source_received_at?: unknown;
   source_order_scope?: unknown;
   source_sequence?: unknown;
   source_conversation_generation?: unknown;
@@ -121,6 +124,8 @@ export interface InteractionDeliveryPolicyInput {
 }
 
 export interface InteractionFactoryInput {
+  /** Supplied only by authenticated ingress or its retained original receipt. */
+  received_at?: number;
   conversation_id?: unknown;
   source_event_id?: unknown;
 }
@@ -291,8 +296,13 @@ export function normalizeInteractionContext(
   const continuation = recordFrom(context.ready_input_continuation);
   const presentationSequence = Number(continuation.presentation_source_sequence);
   const sourceMessageId = boundedIdentifier(continuation.source_message_id);
-  if (context.ready_input_continuation != null && (!hasSourceOrder || !sourceMessageId ||
-      !Number.isSafeInteger(presentationSequence) || presentationSequence < sourceSequence)) {
+  if (
+    context.ready_input_continuation != null &&
+    (!hasSourceOrder ||
+      !sourceMessageId ||
+      !Number.isSafeInteger(presentationSequence) ||
+      presentationSequence < sourceSequence)
+  ) {
     throw new Error('Invalid prepared input presentation authority');
   }
   const normalized: TrustedInteractionContext = {
@@ -303,15 +313,23 @@ export function normalizeInteractionContext(
     ...(logicalTurnId ? { logical_turn_id: logicalTurnId } : {}),
     revision: Math.max(1, Math.floor(Number(context.revision) || 1)),
     source_event_id: boundedIdentifier(context.source_event_id),
+    ...(Number.isSafeInteger(context.source_received_at) && Number(context.source_received_at) > 0
+      ? { source_received_at: Number(context.source_received_at) }
+      : {}),
     ...(hasSourceOrder
       ? { source_order_scope: sourceOrderScope, source_sequence: sourceSequence }
       : {}),
     ...(/^[a-f0-9]{64}$/.test(String(context.source_conversation_generation || ''))
-      ? { source_conversation_generation: String(context.source_conversation_generation) } : {}),
-    ...(context.ready_input_continuation != null ? {
-      ready_input_continuation: Object.freeze({ source_message_id: sourceMessageId,
-        presentation_source_sequence: presentationSequence }),
-    } : {}),
+      ? { source_conversation_generation: String(context.source_conversation_generation) }
+      : {}),
+    ...(context.ready_input_continuation != null
+      ? {
+          ready_input_continuation: Object.freeze({
+            source_message_id: sourceMessageId,
+            presentation_source_sequence: presentationSequence,
+          }),
+        }
+      : {}),
     ...(context.turn_scope
       ? { turn_scope: enumValue(context.turn_scope, TURN_SCOPES, 'conversation') }
       : {}),
@@ -366,6 +384,7 @@ export function createWebInteractionContext(
     surface: 'web',
     conversation_id: input.conversation_id,
     source_event_id: input.source_event_id,
+    source_received_at: input.received_at,
   });
 }
 
@@ -378,11 +397,16 @@ export function createTelegramInteractionContext(
     surface: 'telegram',
     conversation_id: input.conversation_id,
     source_event_id: input.source_event_id,
+    source_received_at: input.received_at,
     source_order_scope: input.source_order_scope,
     source_sequence: input.source_sequence,
     reply_context: input.reply_context,
-    source_conversation_generation: /^[a-f0-9]{64}$/.test(String(input.conversation_generation || ''))
-      ? createHash('sha256').update(JSON.stringify([input.conversation_generation, input.conversation_id || 'new'])).digest('hex')
+    source_conversation_generation: /^[a-f0-9]{64}$/.test(
+      String(input.conversation_generation || ''),
+    )
+      ? createHash('sha256')
+          .update(JSON.stringify([input.conversation_generation, input.conversation_id || 'new']))
+          .digest('hex')
       : undefined,
   });
 }
@@ -396,6 +420,7 @@ export function createVoiceInteractionContext(
     surface: 'voice',
     conversation_id: input.conversation_id,
     source_event_id: input.source_event_id,
+    source_received_at: input.received_at,
   });
 }
 
@@ -515,18 +540,58 @@ export function projectTrustedClientPresentation(
 
 /** Bind an owner-validated prepared source before the shared logical-turn claim. */
 export function bindReadyInputContinuation(
-  request: object, sourceMessageId: string, presentationSourceSequence: number,
+  request: object,
+  sourceMessageId: string,
+  presentationSourceSequence: number,
 ): TrustedInteractionContext {
   const current = trustedContexts.get(request);
-  if (!current || current.logical_turn_id || current.actor_kind !== 'external_user' ||
-      current.origin !== 'interactive' || current.surface !== 'telegram') {
+  if (
+    !current ||
+    current.logical_turn_id ||
+    current.actor_kind !== 'external_user' ||
+    current.origin !== 'interactive' ||
+    current.surface !== 'telegram'
+  ) {
     throw new Error('Prepared input requires an unclaimed authenticated Telegram source');
   }
-  const normalized = normalizeInteractionContext({ ...current,
-    ready_input_continuation: { source_message_id: sourceMessageId,
-      presentation_source_sequence: presentationSourceSequence },
+  const normalized = normalizeInteractionContext({
+    ...current,
+    ready_input_continuation: {
+      source_message_id: sourceMessageId,
+      presentation_source_sequence: presentationSourceSequence,
+    },
   });
   trustedContexts.set(request, normalized);
+  return normalized;
+}
+
+/** Restore only the retained ORIGINAL server receipt before source registration. */
+export function bindOriginalInteractionInputReceipt(
+  request: object,
+  receivedAt?: number,
+): TrustedInteractionContext | null {
+  const req = objectKey(request);
+  const current = req ? trustedContexts.get(req) : null;
+  if (!req || !current || current.logical_turn_id) return current || null;
+  const { source_received_at: ignoredReceipt, ...context } = current;
+  const source_segments = current.source_segments?.map((segment) => {
+    if (segment.source_event_id !== current.source_event_id) return segment;
+    const { source_received_at: ignoredSegmentReceipt, ...original } = segment;
+    return {
+      ...original,
+      ...(Number.isSafeInteger(receivedAt) && Number(receivedAt) > 0
+        ? { source_received_at: receivedAt }
+        : {}),
+    };
+  });
+  const normalized = normalizeInteractionContext({
+    ...context,
+    ...(source_segments ? { source_segments } : {}),
+    ...(Number.isSafeInteger(receivedAt) && Number(receivedAt) > 0
+      ? { source_received_at: receivedAt }
+      : {}),
+  });
+  trustedContexts.set(req, normalized);
   return normalized;
 }
 
@@ -550,8 +615,15 @@ export function bindInteractionSourceSegments(
   const incoming = values.map((value, sourceIndex) => ({
     source_event_id: current.source_event_id,
     source_index: sourceIndex,
+    ...(current.source_received_at ? { source_received_at: current.source_received_at } : {}),
     ...(current.source_sequence ? { source_sequence: current.source_sequence } : {}),
-    ...(sourceMessage ? { source_message_id: sourceMessage.messageId, source_parent_message_id: sourceMessage.parentMessageId, ...(sourceMessage.persisted ? { source_persisted: true } : {}) } : {}),
+    ...(sourceMessage
+      ? {
+          source_message_id: sourceMessage.messageId,
+          source_parent_message_id: sourceMessage.parentMessageId,
+          ...(sourceMessage.persisted ? { source_persisted: true } : {}),
+        }
+      : {}),
     text: value,
     ...(sourceIndex === 0 && sourceFiles.length ? { source_files: sourceFiles } : {}),
     // The quote belongs to this source input, so a later combined turn keeps it with the input.
@@ -559,10 +631,29 @@ export function bindInteractionSourceSegments(
   }));
   const normalized = normalizeInteractionContext({
     ...current,
-    source_segments: [...(current.source_segments || []).map((segment) => {
-      const addition = incoming.find((candidate) => candidate.source_event_id === segment.source_event_id && candidate.source_index === segment.source_index);
-      return addition ? { ...segment, ...(addition.source_files ? { source_files: addition.source_files } : {}), ...(sourceMessage ? { source_message_id: sourceMessage.messageId, source_parent_message_id: sourceMessage.parentMessageId, ...(sourceMessage.persisted ? { source_persisted: true } : {}) } : {}) } : segment;
-    }), ...incoming],
+    source_segments: [
+      ...(current.source_segments || []).map((segment) => {
+        const addition = incoming.find(
+          (candidate) =>
+            candidate.source_event_id === segment.source_event_id &&
+            candidate.source_index === segment.source_index,
+        );
+        return addition
+          ? {
+              ...segment,
+              ...(addition.source_files ? { source_files: addition.source_files } : {}),
+              ...(sourceMessage
+                ? {
+                    source_message_id: sourceMessage.messageId,
+                    source_parent_message_id: sourceMessage.parentMessageId,
+                    ...(sourceMessage.persisted ? { source_persisted: true } : {}),
+                  }
+                : {}),
+            }
+          : segment;
+      }),
+      ...incoming,
+    ],
   });
   trustedContexts.set(req, normalized);
   return normalized;

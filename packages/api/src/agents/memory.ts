@@ -1144,6 +1144,9 @@ type MemoryErrorDetails = {
 };
 
 const RETRYABLE_MEMORY_POLICY_ERRORS = new Set([
+  'invalid_operation',
+  'invalid_key',
+  'noise_rejected',
   'already_exceeded',
   'would_exceed',
   'key_limit_exceeded',
@@ -1327,6 +1330,30 @@ function createMemoryRuntimeState({
   };
 }
 
+/* === VIVENTIUM START === Shared ordered memory proposal/acknowledgement state. === */
+/** One ordered state transition serves both policy preflight and acknowledged writes. */
+function advanceMemoryRuntimeState(
+  state: MemoryRuntimeState,
+  change:
+    | { action: 'set'; key: string; value: string; tokenCount: number }
+    | { action: 'delete'; key: string },
+  revision?: number,
+): void {
+  const previousTokenCount = state.tokenCounts[change.key] ?? 0;
+  if (change.action === 'set') {
+    state.tokenCounts[change.key] = change.tokenCount;
+    state.runningTotalTokens += change.tokenCount - previousTokenCount;
+    state.valueHashes[change.key] = hashMemoryAuditValue(change.value);
+  } else {
+    delete state.tokenCounts[change.key];
+    delete state.valueHashes[change.key];
+    state.runningTotalTokens = Math.max(0, state.runningTotalTokens - previousTokenCount);
+  }
+  // Deletion retains the acknowledged tombstone revision for later same-run CAS.
+  if (revision != null) state.revisions[change.key] = revision;
+}
+/* === VIVENTIUM END === */
+
 /**
  * Creates a memory tool instance with user context
  */
@@ -1408,7 +1435,6 @@ export const createMemoryTool = ({
           ];
         }
 
-        const tokenDelta = tokenCount - previousTokenCount;
         const artifact: Record<Tools.memory, MemoryArtifact> = {
           [Tools.memory]: {
             key,
@@ -1441,13 +1467,12 @@ export const createMemoryTool = ({
             attemptState.storageApplied = true;
           }
           artifact[Tools.memory].type = changed ? 'update' : 'unchanged';
-          runtimeState.tokenCounts[key] = tokenCount;
-          runtimeState.runningTotalTokens += tokenDelta;
-          runtimeState.valueHashes[key] = hashMemoryAuditValue(nextValue);
-          if (result.revision != null) {
-            runtimeState.revisions[key] = result.revision;
-            artifact[Tools.memory].revision = result.revision;
-          }
+          advanceMemoryRuntimeState(
+            runtimeState,
+            { action: 'set', key, value: nextValue, tokenCount },
+            result.revision,
+          );
+          if (result.revision != null) artifact[Tools.memory].revision = result.revision;
           logMemoryWriteAudit({
             userId,
             key,
@@ -1622,19 +1647,8 @@ const createDeleteMemoryTool = ({
             attemptState.storageApplied = true;
           }
           artifact[Tools.memory].type = changed ? 'delete' : 'unchanged';
-          const previousTokenCount = runtimeState.tokenCounts[key] ?? 0;
-          delete runtimeState.tokenCounts[key];
-          /* === VIVENTIUM START === Keep the tombstone revision for later same-run CAS writes. === */
-          if (result.revision != null) {
-            runtimeState.revisions[key] = result.revision;
-            artifact[Tools.memory].revision = result.revision;
-          }
-          /* === VIVENTIUM END === */
-          delete runtimeState.valueHashes[key];
-          runtimeState.runningTotalTokens = Math.max(
-            0,
-            runtimeState.runningTotalTokens - previousTokenCount,
-          );
+          advanceMemoryRuntimeState(runtimeState, { action: 'delete', key }, result.revision);
+          if (result.revision != null) artifact[Tools.memory].revision = result.revision;
           logMemoryWriteAudit({
             userId,
             key,
@@ -1796,6 +1810,71 @@ export const createApplyMemoryChangesTool = ({
         ];
       }
 
+      /* === VIVENTIUM START === Complete policy validation precedes durable mutations. === */
+      // Validate the whole ordered proposal before its first durable effect. Execution below
+      // retains authority/CAS/storage checks; this is policy preflight, not a DB transaction.
+      const proposalState: MemoryRuntimeState = {
+        ...runtimeState,
+        tokenCounts: { ...runtimeState.tokenCounts },
+        revisions: { ...runtimeState.revisions },
+        valueHashes: { ...runtimeState.valueHashes },
+      };
+      for (const operation of normalizedOperations) {
+        const action = operation?.action;
+        const key = operation?.key;
+        let structuralError: string | undefined;
+        if (action === 'set') {
+          if (typeof key !== 'string' || !key.trim() || typeof operation.value !== 'string') {
+            structuralError = 'Set operations require both key and value.';
+          } else {
+            const prepared = prepareMemoryValueForWrite({ key, value: operation.value, keyLimits });
+            const evaluation = evaluateMemoryWrite({
+              key,
+              value: prepared.value,
+              tokenCount: prepared.tokenCount,
+              validKeys,
+              tokenLimit,
+              keyLimits,
+              baselineTotalTokens: proposalState.runningTotalTokens,
+              previousTokenCount: proposalState.tokenCounts[key] ?? 0,
+            });
+            if (!evaluation.ok) {
+              return [
+                evaluation.message ?? `Failed to set memory for key "${key}"`,
+                buildMemoryErrorArtifact(evaluation, runtimeState.runningTotalTokens),
+              ];
+            }
+            advanceMemoryRuntimeState(proposalState, {
+              action: 'set',
+              key,
+              value: prepared.value,
+              tokenCount: prepared.tokenCount,
+            });
+          }
+        } else if (action === 'delete') {
+          if (typeof key !== 'string' || !key.trim()) {
+            structuralError = 'Delete operations require a key.';
+          } else if (validKeys?.length && !validKeys.includes(key)) {
+            structuralError = `Invalid key "${key}". Must be one of: ${validKeys.join(', ')}`;
+          } else {
+            advanceMemoryRuntimeState(proposalState, { action: 'delete', key });
+          }
+        } else if (action !== 'noop') {
+          structuralError = `Unsupported memory action "${String(action ?? '')}"`;
+        }
+        if (structuralError) {
+          return [
+            structuralError,
+            buildGenericMemoryErrorArtifact(structuralError, runtimeState.runningTotalTokens, {
+              action,
+              key,
+              errorType: 'invalid_operation',
+            }),
+          ];
+        }
+      }
+
+      /* === VIVENTIUM END === */
       const summaries: string[] = [];
       let primaryArtifact: Record<Tools.memory, MemoryArtifact> | undefined;
       let unchangedArtifact: Record<Tools.memory, MemoryArtifact> | undefined;

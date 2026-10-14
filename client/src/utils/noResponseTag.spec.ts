@@ -2,6 +2,7 @@ import { ContentTypes } from 'librechat-data-provider';
 import type { TMessage } from 'librechat-data-provider';
 import {
   getMessageBranchChoices,
+  resolveMessageSiblingIndex,
   filterNoResponseMessagesTree,
   filterTrustedInternalMessagesTree,
   selectVisibleMessageBranches,
@@ -106,6 +107,83 @@ describe('filterNoResponseMessagesTree', () => {
 });
 
 describe('filterTrustedInternalMessagesTree', () => {
+  test.each(['question', 'permission'])(
+    'keeps an attested native %s visible after persistence and expiry',
+    (kind) => {
+      const input = {
+        ...mkMessage({
+          messageId: 'native-input',
+          parentMessageId: 'main',
+          text: 'Choose First or Second.',
+          isCreatedByUser: false,
+        }),
+        metadata: {
+          viventium: {
+            type: 'glasshive_worker_callback',
+            visibility: 'internal',
+            event: 'run.needs_input',
+            runId: 'run-1',
+            workRef: 'work-1',
+            nativeInputPresentation: {
+              version: 1,
+              kind,
+              binding: {
+                version: 1,
+                requestId: 'request-1',
+                requestFingerprint: 'a'.repeat(64),
+                runId: 'run-1',
+                attemptId: 'attempt-1',
+                sessionId: 'session-1',
+                expiresAt: '2020-01-01T00:00:00Z',
+              },
+            },
+          },
+        },
+      } as TMessage;
+      expect(filterTrustedInternalMessagesTree([JSON.parse(JSON.stringify(input))])).toEqual([
+        input,
+      ]);
+    },
+  );
+
+  test.each(['user', 'status', 'wrong-run', 'missing-work', 'malformed', 'empty', 'oversized'])(
+    'keeps %s out of the native offer exception',
+    (invalid) => {
+      const input = {
+        ...mkMessage({
+          messageId: 'input',
+          parentMessageId: 'main',
+          text: invalid === 'empty' ? '' : 'Choose First.',
+        }),
+        isCreatedByUser: invalid === 'user',
+        metadata: {
+          viventium: {
+            type: 'glasshive_worker_callback',
+            visibility: 'internal',
+            event: invalid === 'status' ? 'run.completed' : 'run.needs_input',
+            runId: invalid === 'wrong-run' ? 'other' : 'run-1',
+            workRef: invalid === 'missing-work' ? null : 'work-1',
+            nativeInputPresentation: {
+              version: 1,
+              kind: 'question',
+              binding: {
+                version: 1,
+                requestId: 'request-1',
+                requestFingerprint: invalid === 'malformed' ? 'bad' : 'a'.repeat(64),
+                runId: 'run-1',
+                attemptId: 'attempt-1',
+                sessionId: 'session-1',
+                expiresAt: '2020-01-01T00:00:00Z',
+              },
+            },
+          },
+        },
+      } as TMessage;
+      if (invalid === 'oversized') input.text = 'x'.repeat(8001);
+      expect(filterTrustedInternalMessagesTree([input])).toEqual([]);
+    },
+  );
+
   test('uses trusted visibility metadata and does not hide a user-authored literal tag', () => {
     const literal = {
       ...mkMessage({
@@ -333,6 +411,76 @@ describe('late native result visibility', () => {
     expect(
       selectVisibleMessageBranches([foreign, user, unknown, old, current], current.messageId),
     ).toEqual([current]);
+  });
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Default branch activity excludes autonomous delivery timestamps. === */
+describe('resolveMessageSiblingIndex', () => {
+  const dated = (id: string, hour: number, children: TMessage[] = []): TMessage => ({
+    ...mkMessage({
+      messageId: id,
+      parentMessageId: 'anchor',
+      text: id,
+      isCreatedByUser: false,
+      children,
+    }),
+    createdAt: `2026-01-01T${String(hour).padStart(2, '0')}:00:00.000Z`,
+  });
+  test('uses latest descendant activity without changing sibling order or data', () => {
+    const choices = [
+      dated('older-root', 10, [dated('recent-answer', 18)]),
+      dated('newer-root', 11),
+    ];
+    const original = JSON.stringify(choices);
+    expect(resolveMessageSiblingIndex(choices, -1)).toBe(1);
+    expect(JSON.stringify(choices)).toBe(original);
+  });
+  test('retains the newest genuine response regeneration', () => {
+    expect(resolveMessageSiblingIndex([dated('original', 10), dated('regenerated', 11)], -1)).toBe(
+      0,
+    );
+  });
+  test.each([0, 1])('retains an explicit reverse index %s over activity defaults', (index) => {
+    expect(resolveMessageSiblingIndex([dated('old', 10), dated('new', 11)], index)).toBe(index);
+  });
+  test('late callback and its assistant descendants cannot select an older user branch', () => {
+    const late = {
+      ...dated('callback', 23, [dated('callback-answer', 23)]),
+      metadata: { viventium: { type: 'glasshive_worker_callback' } },
+    };
+    expect(
+      resolveMessageSiblingIndex(
+        [dated('old-branch', 10, [late]), dated('current-branch', 18)],
+        -1,
+      ),
+    ).toBe(0);
+  });
+  test('a new ordinary user continuation below a callback remains a real branch', () => {
+    const question = { ...dated('new-question', 23), isCreatedByUser: true };
+    const callback = {
+      ...dated('callback', 10, [question]),
+      metadata: { viventium: { type: 'glasshive_worker_callback' } },
+    };
+    expect(resolveMessageSiblingIndex([callback, dated('previous-branch', 18)], -1)).toBe(1);
+  });
+  test('missing timestamps keep the existing last-sibling convention', () => {
+    const choices = [dated('first', 10), dated('last', 11)].map((message) => ({
+      ...message,
+      createdAt: undefined,
+    }));
+    expect(resolveMessageSiblingIndex(choices, -1)).toBe(0);
+  });
+  test('invalid created time falls back to updated time', () => {
+    expect(
+      resolveMessageSiblingIndex(
+        [
+          { ...dated('updated', 10), createdAt: 'invalid', updatedAt: '2026-01-01T23:00:00.000Z' },
+          dated('other', 18),
+        ],
+        -1,
+      ),
+    ).toBe(1);
   });
 });
 /* === VIVENTIUM END === */

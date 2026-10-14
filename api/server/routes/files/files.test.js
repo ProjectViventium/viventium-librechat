@@ -169,6 +169,50 @@ describe('File Routes - Delete with Agent Access', () => {
     });
   });
 
+  describe('durable image download', () => {
+    it('returns the original SVG bytes and exact canonical identity through authenticated file access', async () => {
+      otherUserId = otherUserId.toString();
+      const raw = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="9"/>');
+      const rawId = uuidv4();
+      await createFile({
+        user: otherUserId,
+        file_id: rawId,
+        filename: 'original.svg',
+        filepath: `/uploads/${otherUserId}/original.svg`,
+        bytes: raw.length,
+        type: 'image/svg+xml',
+        source: 'local',
+      });
+      const { getStrategyFunctions } = require('~/server/services/Files/strategies');
+      const getDownloadStream = jest
+        .fn()
+        .mockImplementation(async () => require('stream').Readable.from([raw]));
+      getStrategyFunctions.mockReturnValueOnce({ getDownloadStream });
+      const response = await request(app)
+        .get(`/files/download/${otherUserId}/${rawId}`)
+        .expect(200);
+      expect(response.body).toEqual(raw);
+      expect(response.headers['content-type']).toContain('application/octet-stream');
+      expect(JSON.parse(response.headers['x-file-metadata'])).toEqual(
+        expect.objectContaining({
+          file_id: rawId,
+          type: 'image/svg+xml',
+          bytes: raw.length,
+        }),
+      );
+      expect(getDownloadStream).toHaveBeenCalledWith(
+        expect.objectContaining({ user: expect.objectContaining({ id: otherUserId }) }),
+        `/uploads/${otherUserId}/original.svg`,
+      );
+    });
+    it('does not grant another owner access through a download URL', async () => {
+      otherUserId = otherUserId.toString();
+      const { getStrategyFunctions } = require('~/server/services/Files/strategies');
+      await request(app).get(`/files/download/${authorId}/${fileId}`).expect(403);
+      expect(getStrategyFunctions).not.toHaveBeenCalled();
+    });
+  });
+
   describe('DELETE /files', () => {
     it('should allow deleting files owned by the user', async () => {
       // Create a file owned by the current user

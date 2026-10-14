@@ -8,6 +8,10 @@ const crypto = require('crypto');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const { agentSchema } = require('@librechat/data-schemas');
 const mockGetAppConfig = jest.fn();
+const mockObserveOrchestrationOwner = jest.fn();
+jest.mock('../GlassHiveOrchestrationReadinessService', () => ({
+  observeOrchestrationOwner: (...args) => mockObserveOrchestrationOwner(...args),
+}));
 jest.mock('~/server/services/Config', () => ({
   getAppConfig: (...args) => mockGetAppConfig(...args),
 }));
@@ -71,6 +75,7 @@ describe('CallSessionService', () => {
   });
 
   beforeEach(async () => {
+    mockObserveOrchestrationOwner.mockReset();
     mockGetAppConfig.mockReset().mockResolvedValue({});
     process.env.VIVENTIUM_CALL_SESSION_SECRET = 'secret';
     process.env.VIVENTIUM_WING_MODE_DEFAULT_ENABLED = 'false';
@@ -188,6 +193,7 @@ describe('CallSessionService', () => {
   });
 
   test('createCallSession persists and getCallSession returns it', async () => {
+    mockObserveOrchestrationOwner.mockReturnValue(new Promise(() => {}));
     process.env.VIVENTIUM_VOICE_GATEWAY_AGENT_NAME = 'configured-voice-gateway';
     const user = await User.create({
       name: 'Call User',
@@ -202,6 +208,7 @@ describe('CallSessionService', () => {
     });
 
     expect(created.callSessionId).toBeDefined();
+    expect(mockObserveOrchestrationOwner).toHaveBeenCalledWith(user._id.toString());
     expect(created.roomName).toBeDefined();
     expect(created.gatewayAgentName).toBe('configured-voice-gateway');
     expect(created.ownerParticipantIdentity).toMatch(/^owner-[a-f0-9-]{36}$/);
@@ -715,6 +722,7 @@ describe('CallSessionService', () => {
       status: 400,
       retryable: false,
     });
+    expect(mockObserveOrchestrationOwner).not.toHaveBeenCalled();
     await expect(ViventiumCallSession.countDocuments({})).resolves.toBe(0);
   });
 

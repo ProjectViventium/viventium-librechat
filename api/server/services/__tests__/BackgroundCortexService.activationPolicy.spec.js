@@ -133,10 +133,64 @@ describe('BackgroundCortexService activation policy helpers', () => {
       },
     );
     expect(result.error).toBeUndefined();
+    expect(result.nativeOwnership).toBe('none');
     expect(prepareCapabilityFn).toHaveBeenCalledWith(
       expect.objectContaining({ nativeTools: false }),
     );
   });
+  test.each([
+    ['internal', 'structured', true, false],
+    ['internal', 'user_facing', false, false],
+    ['deliver', 'structured', false, false],
+    ['owner_batch', 'structured', false, false],
+    ['internal', 'structured', false, undefined],
+  ])(
+    'private state capability follows actual result owner %s/%s',
+    async (completedResultPolicy, insightMode, expected, nativeTools) => {
+      const prepareCapabilityFn = jest.fn(async () => undefined);
+      const agent = {
+        id: 'synthetic-structured-actor',
+        provider: 'openai',
+        tools: [],
+        instructions: '',
+        model_parameters: { model: 'test-model' },
+      };
+      await executeCortexOnce(
+        {
+          agent,
+          messages: [],
+          runId: 'synthetic-structured-run',
+          contextMode: 'minimal',
+          mainContextBinding: 'isolated',
+          completedResultPolicy,
+          insightMode,
+          nativeTools,
+          req: {
+            user: { id: 'owner-synthetic' },
+            body: {},
+            config: {
+              endpoints: {
+                agents: {
+                  allowedProviders: ['openai'],
+                  providerCapabilities: {},
+                },
+              },
+            },
+          },
+        },
+        {
+          initializeAgentFn: jest.fn(async () => ({ ...agent })),
+          createRunFn: jest.fn(async () => ({
+            processStream: jest.fn(async () => [{ type: 'text', text: '{"approved":true}' }]),
+          })),
+          prepareCapabilityFn,
+        },
+      );
+      expect(prepareCapabilityFn).toHaveBeenCalledWith(
+        expect.objectContaining({ privateStructuredResponse: expected }),
+      );
+    },
+  );
   test('read-only text compactor carries explicit zero-tool option to attach and refresh', async () => {
     const attachBundle = jest.fn(async () => true),
       installRefresher = jest.fn();

@@ -22,6 +22,7 @@ import type {
   NativeResponseSource,
   NativeResponseCommit,
   NativeResponseCandidate,
+  NativeResponseAttachmentPreparation,
   NativeResponseDeliveryContext,
   NativeResponseMessageProjection,
   createNativeResponseMethods,
@@ -103,7 +104,7 @@ export interface NativeResponseDependencies {
     identity: NativeResponseIdentity,
     response: NonNullable<NativeResult['response']>,
     candidate: NativeResponseCandidate,
-  ) => Promise<NativeResponseMessageProjection['attachments']>;
+  ) => Promise<NativeResponseAttachmentPreparation>;
   projectMessage?: (
     identity: NativeResponseIdentity,
     response: NonNullable<NativeResult['response']>,
@@ -487,13 +488,10 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
       throw new Error('native_response_delivery_projection_unavailable');
     }
     const fileResponse = candidateForFiles ? JSON.parse(candidateForFiles.responseJson) : undefined;
-    if (
-      fileResponse?.glasshive?.output_files != null &&
-      nativeResponseDigest(candidateForFiles!) !== digest
-    )
+    if (fileResponse && nativeResponseDigest(candidateForFiles!) !== digest)
       throw new Error('native_response_candidate_mismatch');
     const prepareFiles =
-      fileResponse?.glasshive?.output_files != null && deps.prepareAttachments
+      fileResponse && deps.prepareAttachments
         ? () => deps.prepareAttachments!(identity, fileResponse, candidateForFiles!)
         : undefined;
     return visible(
@@ -722,7 +720,9 @@ export function createNativeCapacityFetch(
       init = { ...init, headers: init?.headers || input.headers, body: await input.clone().text() };
     }
     const transportSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-    const signals = [signal, transportSignal].filter((value): value is AbortSignal => Boolean(value));
+    const signals = [signal, transportSignal].filter((value): value is AbortSignal =>
+      Boolean(value),
+    );
     const dispatch = {
       ...init,
       signal: (

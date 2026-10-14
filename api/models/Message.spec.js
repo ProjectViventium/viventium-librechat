@@ -2347,3 +2347,53 @@ describe('Message Operations', () => {
     });
   });
 });
+
+/* === VIVENTIUM START === Document snapshots retain their metadata without changing update guards. === */
+test('native document sanitization retains the delivery carrier and removes reserved input receipts', () => {
+  const { sanitizeMessageForPersistence } = require('./Message').__testables;
+  const disposition = {
+    version: 1,
+    audio: 'skip',
+    required: true,
+    valid: false,
+    source: 'required_missing',
+  };
+  const input = {
+    messageId: 'snapshot',
+    text: 'Partial answer.',
+    metadata: {
+      sibling: 'kept',
+      viventium: {
+        deliveryDisposition: disposition,
+        mainContext: { agentId: 'untrusted', stableAuthoritySha256: 'a'.repeat(64) },
+        originalInputReceipt: { sourceEventId: 'private-source', receivedAt: 1 },
+      },
+    },
+    nativeResponse: { private: true },
+    acceptedMainContext: { private: true },
+    content: [
+      {
+        type: 'text',
+        text: 'Partial answer.',
+        metadata: { cortex_delivery_feeling_snapshot: 'private-feeling' },
+      },
+    ],
+  };
+  const original = JSON.stringify(input);
+  const projected = sanitizeMessageForPersistence(input, { purpose: 'document' });
+  expect(projected.metadata).toEqual({
+    sibling: 'kept',
+    viventium: { deliveryDisposition: disposition },
+  });
+  expect(Object.hasOwn(projected, 'metadata.sibling')).toBe(false);
+  expect(JSON.stringify(projected)).not.toContain('private-source');
+  expect(JSON.stringify(projected)).not.toContain('private-feeling');
+  expect(projected).not.toHaveProperty('nativeResponse');
+  expect(projected).not.toHaveProperty('acceptedMainContext');
+  expect(JSON.stringify(input)).toBe(original);
+  const updated = sanitizeMessageForPersistence(input);
+  expect(updated['metadata.sibling']).toBe('kept');
+  expect(updated['metadata.viventium.deliveryDisposition']).toEqual(disposition);
+  expect(JSON.stringify(updated)).not.toContain('private-source');
+});
+/* === VIVENTIUM END === */

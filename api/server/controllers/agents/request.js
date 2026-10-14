@@ -32,6 +32,7 @@ const {
   checkAndIncrementPendingRequest,
   retainExternalAcceptanceFollowUps,
   startAcceptedMainMemory,
+  scheduleExternallyAcceptedMainCompaction,
 } = require('@librechat/api');
 const { disposeClient, clientRegistry, requestDataMap } = require('~/server/cleanup');
 const { handleAbortError } = require('~/server/middleware');
@@ -135,6 +136,7 @@ const {
   attachInteractionContextMetadata,
   bindCanonicalInteractionConversation,
   bindInteractionSourceSegments,
+  bindOriginalInteractionInputReceipt,
   bindLogicalTurnContext,
   createWebInteractionContext,
   getTrustedInteractionContext,
@@ -222,7 +224,11 @@ async function startPersistedMainMemory(req, client, awaitExternalAcceptance) {
 async function commitAcceptedMainTurnAndScheduleCompaction({ presentation, req, client }) {
   try {
     const result = await commitAcceptedMainTurnFromPresentation(presentation);
-    scheduleAcceptedMainCompaction(req, client, result);
+    // Use the same accepted-presentation follow-ups for server and adapter delivery.
+    // The prepared writer owns its captured context after request cleanup.
+    if (!scheduleExternallyAcceptedMainCompaction(presentation, result)) {
+      scheduleAcceptedMainCompaction(req, client, result);
+    }
     return result;
   } catch (error) {
     logger.error('[VIVENTIUM][main-continuity] Accepted turn commit failed', {
@@ -287,6 +293,10 @@ function attachQaRunReceipt(req, message) {
 }
 
 const acceptedInteractionInputs = new WeakMap();
+const originalInputReceipts = new WeakMap();
+function stampOriginalInputReceipt(req) {
+  if (req?.user?.id && !originalInputReceipts.has(req)) originalInputReceipts.set(req, Date.now());
+}
 
 function acceptedInteractionSourceId(req) {
   const context = getTrustedInteractionContext(req);
@@ -351,14 +361,15 @@ async function captureAcceptedInteractionInput(
   accepted.source.parentMessageId = parentMessageId || Constants.NO_PARENT;
   context = bindInteractionSourceSegments(req, accepted.originalText, [], accepted.source);
   await GenerationJobManager.retainLogicalTurnInput(req.user.id, context);
-  if (
-    !(await Message.exists({
-      user: req.user.id,
-      conversationId,
-      messageId: accepted.source.messageId,
-      isCreatedByUser: true,
-    }))
-  ) {
+  const originalMessage = await Message.findOne({
+    user: req.user.id,
+    conversationId,
+    messageId: accepted.source.messageId,
+    isCreatedByUser: true,
+  })
+    .select('metadata.viventium.originalInputReceipt')
+    .lean();
+  if (!originalMessage) {
     await timedSaveMessage(
       req,
       {
@@ -368,9 +379,32 @@ async function captureAcceptedInteractionInput(
         text: accepted.originalText,
         sender: 'User',
         isCreatedByUser: true,
+        ...(context.source_received_at
+          ? {
+              metadata: {
+                viventium: {
+                  originalInputReceipt: {
+                    sourceEventId: context.source_event_id,
+                    receivedAt: context.source_received_at,
+                  },
+                },
+              },
+            }
+          : {}),
       },
       { context: 'accepted user source before initialization' },
       'db_save_user',
+    );
+  }
+  if (originalMessage) {
+    const receipt = originalMessage.metadata?.viventium?.originalInputReceipt;
+    context = bindOriginalInteractionInputReceipt(
+      req,
+      receipt?.sourceEventId === context.source_event_id &&
+        Number.isSafeInteger(receipt.receivedAt) &&
+        receipt.receivedAt > 0
+        ? receipt.receivedAt
+        : undefined,
     );
   }
   accepted.context = context;
@@ -406,6 +440,7 @@ async function captureRequestInteractionContext(req, { conversationId, streamId 
       createWebInteractionContext({
         conversation_id: conversationId,
         source_event_id: sourceEventId,
+        received_at: originalInputReceipts.get(req),
       }),
     );
   }
@@ -1360,6 +1395,7 @@ function captureClientPresentation(req, { isRegenerate, overrideParentMessageId 
  * Returns streamId immediately, client subscribes separately via SSE.
  */
 const ResumableAgentController = async (req, res, next, initializeClient, addTitle) => {
+  stampOriginalInputReceipt(req);
   let {
     text,
     isRegenerate,
@@ -1629,6 +1665,15 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     let userMessage;
     let userMessageSavePromise = null;
     let responseMessageId = editedResponseMessageId;
+    let terminalFailureContent;
+    const rejectTerminalResponseFailure = (response) => {
+      const failure = voiceGenerationOutcome(response).error;
+      if (response?.error !== true && !failure) return;
+      terminalFailureContent = Array.isArray(response?.content) ? response.content : undefined;
+      throw Object.assign(new Error(failure?.message || 'completion_error'), {
+        code: failure?.code || 'completion_error',
+      });
+    };
 
     const ensureUserSourceSegmentPersisted = async () => {
       if (client?.skipSaveUserMessage || !userMessage) {
@@ -2132,6 +2177,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             preCommitJob,
           );
           /* === VIVENTIUM NOTE END === */
+          if (!wasAbortedBeforeComplete && !req._viventiumNativeResponseIdentity) {
+            rejectTerminalResponseFailure(persistedResponse);
+          }
           const assistantPersistence = await timedSaveMessage(
             req,
             persistedResponse,
@@ -2201,8 +2249,14 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               ? normalizeDurableWorkReceiptResponse(response, durableWorkReceipt)
               : response;
             req._viventiumNativeResponseCompleted = true;
-            /* === VIVENTIUM START === The completed native answer is now the memory source. === */
-            if (assistantPersistenceAdmissible && (await client.startDeferredMemoryWriter?.())) {
+            /* === VIVENTIUM START ===
+             * Capture the completed native answer now; admit its existing detached writer only
+             * after presentation acceptance. Graph evidence retrieval must not delay FINAL.
+             */
+            if (
+              assistantPersistenceAdmissible &&
+              (await startPersistedMainMemory(req, client, true))
+            ) {
               responseForCommit.memoryWriteStatus = 'pending';
             }
             /* === VIVENTIUM END === */
@@ -2243,16 +2297,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               /* === VIVENTIUM END === */
               throw new Error('native_response_final_pending');
             }
-            /* === VIVENTIUM START ===
-             * Refusal follows the existing error lifecycle, never accepted Main completion.
-             */
-            if (isReleasedNativeRefusal(req, streamId, jobCreatedAt, userId, responseMessageId)) {
-              const refusal = responseForCommit.content?.find(
-                (part) => part?.type === ContentTypes.ERROR && part.error_class === 'host_capacity',
-              );
-              if (refusal)
-                throw Object.assign(new Error(refusal.error), { code: refusal.error_class });
-            }
+            /* === VIVENTIUM START === Failed host continuation has no successful delivery ACK. === */
+            if (!wasAbortedBeforeComplete) rejectTerminalResponseFailure(responseForCommit);
             /* === VIVENTIUM END === */
             const unsupportedPersistence = await timedSaveMessage(
               req,
@@ -2441,7 +2487,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
            * Fix: an external adapter accepts this turn later, through its authenticated delivery
            * acknowledgement. Register this turn's compaction schedule before FINAL reaches it.
            * === VIVENTIUM END === */
-          if (getTrustedDeliveryPolicy(req)?.commit_authority === 'external_adapter') {
+          if (
+            getTrustedDeliveryPolicy(req)?.commit_authority === 'external_adapter' ||
+            req._viventiumMemoryWriterAwaitingAcceptance === true
+          ) {
             retainAcceptedMainFollowUps(req, client, userId, response?.messageId);
           }
           /* Main is complete even while Phase B continues. Mark the job non-active immediately so
@@ -2737,32 +2786,21 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           }
           logger.error(`[ResumableAgentController] Generation error for ${streamId}:`, error);
           const failure = require('./client').createCompletionErrorContentPart(error);
-          /* === VIVENTIUM START === Exact refusal closes the failed durable snapshot. */
-          const nativeUnaccepted = isReleasedNativeRefusal(
-            req,
-            streamId,
-            jobCreatedAt,
-            userId,
-            responseMessageId,
-          );
-          /* === VIVENTIUM END === */
           try {
-            const contentParts = Array.isArray(client?.contentParts)
-              ? client.contentParts.filter(Boolean)
-              : [];
+            const contentParts = Array.isArray(terminalFailureContent)
+              ? terminalFailureContent.filter(Boolean)
+              : Array.isArray(client?.contentParts)
+                ? client.contentParts.filter(Boolean)
+                : [];
             const hasMeaningfulContent =
               contentParts.length > 0 || extractTextFromContentParts(contentParts).length > 0;
-            /* === VIVENTIUM START === Preserve one typed failure after released admission. */
-            const snapshotContent =
-              nativeUnaccepted &&
-              !contentParts.some(
-                (part) =>
-                  part.type === ContentTypes.ERROR &&
-                  part.error_class === failure.error_class &&
-                  part.error === failure.error,
-              )
-                ? [...contentParts, failure]
-                : contentParts;
+            /* === VIVENTIUM START === Preserve the returned failure and partial content once. */
+            const snapshotContent = !contentParts.some(
+              (part) =>
+                part.type === ContentTypes.ERROR && part.error_class === failure.error_class,
+            )
+              ? [...contentParts, failure]
+              : contentParts;
             /* === VIVENTIUM END === */
             const snapshot = await persistAssistantSnapshot({
               req,
@@ -2777,8 +2815,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               responseMessageId,
               sender,
               fallbackText: hasMeaningfulContent ? '' : 'Generation interrupted before completion.',
-              /* === VIVENTIUM START === Released refusal has no pending Native completion. */
-              unfinished: hasMeaningfulContent && !nativeUnaccepted,
+              /* === VIVENTIUM START === A settled failure has no pending presentation. */
+              unfinished: false,
               /* === VIVENTIUM END === */
               error: true,
               context: 'api/server/controllers/agents/request.js - generation error snapshot',
@@ -2830,22 +2868,38 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         `[ResumableAgentController] Unhandled error in background generation: ${err.message}`,
       );
       try {
-        const contentParts = Array.isArray(client?.contentParts)
-          ? client.contentParts.filter(Boolean)
-          : [];
+        const current = await GenerationJobManager.getJob(streamId);
+        const cancelled =
+          job.abortController.signal.aborted ||
+          (current?.status === 'superseded' && current.createdAt === jobCreatedAt);
+        if (cancelled) {
+          await maybeDecrement();
+          return;
+        }
+        const failure = require('./client').createCompletionErrorContentPart(err);
+        const contentParts = Array.isArray(terminalFailureContent)
+          ? terminalFailureContent.filter(Boolean)
+          : Array.isArray(client?.contentParts)
+            ? client.contentParts.filter(Boolean)
+            : [];
+        const snapshotContent = contentParts.some(
+          (part) => part.type === ContentTypes.ERROR && part.error_class === failure.error_class,
+        )
+          ? contentParts
+          : [...contentParts, failure];
         await persistAssistantSnapshot({
           req,
           streamId,
           userId,
           client,
           conversationId,
-          aggregatedContent: contentParts,
+          aggregatedContent: snapshotContent,
           userMessage,
           responseMessageId,
           sender,
           fallbackText: contentParts.length > 0 ? '' : 'Generation interrupted before completion.',
-          unfinished: contentParts.length > 0,
-          error: contentParts.length === 0,
+          unfinished: false,
+          error: true,
           context: 'api/server/controllers/agents/request.js - unhandled generation error snapshot',
         });
       } catch (snapshotError) {
@@ -2982,6 +3036,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
  * The legacy non-resumable path is kept below but no longer used by default.
  */
 const AgentController = async (req, res, next, initializeClient, addTitle) => {
+  stampOriginalInputReceipt(req);
   const timingTurnId = String(
     req?.body?.responseMessageId || req?.body?.viventiumClientResponseMessageId || '',
   ).trim();
@@ -3010,6 +3065,7 @@ const AgentController = async (req, res, next, initializeClient, addTitle) => {
  * @deprecated Use ResumableAgentController instead
  */
 const _LegacyAgentController = async (req, res, next, initializeClient, addTitle) => {
+  stampOriginalInputReceipt(req);
   const {
     text,
     isRegenerate,

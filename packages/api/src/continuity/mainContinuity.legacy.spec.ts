@@ -1,4 +1,8 @@
-import { createMainContinuityService, mainCompactionCandidateDigest } from './mainContinuity';
+import {
+  createMainContinuityService,
+  mainCompactionCandidateDigest,
+  mainCompactionOutputContractDigest,
+} from './mainContinuity';
 import type {
   AcceptedMainTurn,
   MainContinuityState,
@@ -118,6 +122,7 @@ function fixture(count: number, bytes = 1000, historicalSummary = false) {
         approved: true,
         sourceDigest: claim.sourceDigest,
         candidateDigest: mainCompactionCandidateDigest(summary),
+        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
       },
     });
   return {

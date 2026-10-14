@@ -1531,7 +1531,10 @@ async function buildConversationProviderBootstrapBundle({
     ? {
         [DELEGATION_TOOL_NAME]: {
           version: 1,
-          request_body: orchestrationRequestBody,
+          request_body_ref: 'conversation_request_body',
+          // New native grants advertise an explicit historical-file choice at tools/list.
+          // Older grants and direct server calls retain their omission/current-upload contract.
+          file_selection: { version: 1 },
           worker_memory: String(workerMemory || ''),
           worker_feelings: String(workerFeelings || ''),
           worker_feelings_enabled: workerFeelingsEnabled === true,
@@ -1570,7 +1573,7 @@ async function buildConversationProviderBootstrapBundle({
   const orchestrationResources = {
     ...delegationResources,
     ...(normalizedConversationOrchestrationTools.includes('active_work_action')
-      ? { active_work_action: { version: 1, request_body: orchestrationRequestBody } }
+      ? { active_work_action: { version: 1, request_body_ref: 'conversation_request_body' } }
       : {}),
   };
   const allProviderHostToolResources = {
@@ -1640,6 +1643,9 @@ async function buildConversationProviderBootstrapBundle({
       deferredServers,
       allowedHostTools: allProviderHostTools,
       hostToolResources: allProviderHostToolResources,
+      ...(Object.keys(orchestrationResources).length > 0
+        ? { conversationRequestBody: orchestrationRequestBody }
+        : {}),
       authorityKind:
         normalizedConversationOrchestrationTools.length > 0
           ? BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
@@ -1667,6 +1673,24 @@ async function buildConversationProviderBootstrapBundle({
       resourceLimitBytes: error?.resourceLimitBytes,
     });
     return degradedConversationCapabilityBundle('grant_unavailable');
+  }
+  // Join a created current-turn grant to broker transport observations without decoding tokens.
+  // Diagnostics carry hashes only and cannot change the grant or its delivery path.
+  try {
+    const scopeHash = (value) =>
+      typeof value === 'string' && value
+        ? crypto.createHash('sha256').update(value).digest('hex')
+        : null;
+    logger.info(
+      JSON.stringify({
+        event: 'glasshive_broker_grant_created',
+        grant_id_sha256: scopeHash(mintedGrant.payload.grant_id),
+        message_id_sha256: scopeHash(mintedGrant.payload.message_id),
+        conversation_id_sha256: scopeHash(mintedGrant.payload.conversation_id),
+      }),
+    );
+  } catch {
+    // A diagnostic failure must not turn a valid capability grant into an unavailable one.
   }
   const bundle = mergeBrokerBundle({
     existingBundle: {},

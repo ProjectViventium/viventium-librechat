@@ -962,7 +962,11 @@ async function findEligibleExistingOwner(ownerId) {
   }
   const { User } = loadOperationalDependencies();
   const user = await User.findById(ownerId).lean();
-  if (!user || user.role !== 'ADMIN' || user.email === DEFAULT_AGENT_SEED_OWNER_EMAIL) {
+  if (
+    !user ||
+    !['USER', 'ADMIN'].includes(user.role) ||
+    user.email === DEFAULT_AGENT_SEED_OWNER_EMAIL
+  ) {
     return null;
   }
   return user;

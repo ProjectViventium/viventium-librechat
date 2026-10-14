@@ -1,7 +1,11 @@
 /* === VIVENTIUM START === Native owner input form; keep uncertain responses retryable until native ACK. === VIVENTIUM END === */
 import { useRef, useState } from 'react';
 import { Button } from '@librechat/client';
-import type { NativeWorkInputResponse, PendingNativeWorkInput } from 'librechat-data-provider';
+import type {
+  NativeWorkInputResponse,
+  PendingNativeWorkInput,
+  NativeQuestionContent,
+} from 'librechat-data-provider';
 import { useWorkActionMutation } from '~/data-provider/ViventiumOrchestration';
 import { useLocalize } from '~/hooks';
 
@@ -15,11 +19,14 @@ export default function NativeWorkInput({
 }) {
   const localize = useLocalize();
   const mutation = useWorkActionMutation();
-  const [values, setValues] = useState<NonNullable<NativeWorkInputResponse['content']>>({});
+  const [values, setValues] = useState<Record<string, string | number | boolean | string[]>>({});
+  const [questionAnswers, setQuestionAnswers] = useState<NativeQuestionContent>({ answers: {} });
   const [error, setError] = useState<'invalid' | 'unconfirmed' | null>(null);
   const [acknowledged, setAcknowledged] = useState(false);
   const retained = useRef<{ operationId: string; nativeInput: NativeWorkInputResponse }>();
-  const fields = Object.entries(input.requestedSchema?.properties ?? {});
+  const fields = Object.entries(
+    input.kind === 'question' ? {} : (input.requestedSchema?.properties ?? {}),
+  );
   const required = new Set(input.requestedSchema?.required ?? []);
   let externalUrl: string | null = null;
   try {
@@ -36,7 +43,27 @@ export default function NativeWorkInput({
         requestId: input.requestId,
         requestFingerprint: input.requestFingerprint,
         action,
-        ...(action === 'accept' && input.mode === 'form' ? { content: values } : {}),
+        ...(action === 'accept' && input.mode === 'form'
+          ? {
+              content:
+                input.kind === 'question'
+                  ? {
+                      answers: questionAnswers.answers,
+                      ...(Object.values(questionAnswers.annotations || {}).some(
+                        (value) => value.notes.length > 0,
+                      )
+                        ? {
+                            annotations: Object.fromEntries(
+                              Object.entries(questionAnswers.annotations || {}).filter(
+                                ([, value]) => value.notes.length > 0,
+                              ),
+                            ),
+                          }
+                        : {}),
+                    }
+                  : values,
+            }
+          : {}),
       },
     };
     retained.current = operation;
@@ -72,13 +99,80 @@ export default function NativeWorkInput({
     >
       <p className="whitespace-pre-wrap text-sm text-text-primary">{input.message}</p>
       <p className="text-xs text-text-secondary">
-        {input.kind === 'permission' ? input.runtimeName : input.mcpServerName}
+        {input.kind === 'elicitation' ? input.mcpServerName : input.runtimeName}
       </p>
       {input.mode === 'url' && externalUrl && (
         <a href={externalUrl} target="_blank" rel="noopener noreferrer" className="underline">
           {localize('com_ui_work_input_open')}
         </a>
       )}
+      {input.kind === 'question' &&
+        Object.entries(input.requestedSchema.properties.answers.properties).map(([key, field]) => (
+          <fieldset key={key} className="space-y-2" disabled={Boolean(retained.current)}>
+            <legend>{field.title || key}</legend>
+            {field.items.enum.map((option) => (
+              <label key={option} className="flex gap-2">
+                <input
+                  type={field.maxItems === 1 ? 'radio' : 'checkbox'}
+                  name={key}
+                  checked={
+                    (Object.hasOwn(questionAnswers.answers, key)
+                      ? questionAnswers.answers[key]?.includes(option)
+                      : false) || false
+                  }
+                  onChange={(event) =>
+                    setQuestionAnswers((current) => {
+                      const before = Object.hasOwn(current.answers, key)
+                        ? current.answers[key]
+                        : [];
+                      const selected = event.target.checked
+                        ? field.maxItems === 1
+                          ? [option]
+                          : [...before, option]
+                        : before.filter((value) => value !== option);
+                      const answers = selected.length
+                        ? { ...current.answers, [key]: selected }
+                        : { ...current.answers };
+                      if (!selected.length) delete answers[key];
+                      const annotations = { ...current.annotations };
+                      if (!selected.includes('Other')) delete annotations[key];
+                      return {
+                        answers,
+                        ...(Object.keys(annotations).length ? { annotations } : {}),
+                      };
+                    })
+                  }
+                />
+                {option}
+              </label>
+            ))}
+            {Object.hasOwn(questionAnswers.answers, key) &&
+              questionAnswers.answers[key]?.includes('Other') && (
+                <label className="block">
+                  {localize('com_ui_response')}
+                  <input
+                    aria-label={`${localize('com_ui_response')}: ${field.title || key}`}
+                    maxLength={8000}
+                    value={
+                      (questionAnswers.annotations &&
+                      Object.hasOwn(questionAnswers.annotations, key)
+                        ? questionAnswers.annotations[key]?.notes
+                        : '') || ''
+                    }
+                    onChange={(event) =>
+                      setQuestionAnswers((current) => ({
+                        ...current,
+                        annotations: {
+                          ...current.annotations,
+                          [key]: { notes: event.target.value },
+                        },
+                      }))
+                    }
+                  />
+                </label>
+              )}
+          </fieldset>
+        ))}
       {input.mode === 'form' &&
         fields.map(([name, field]) => {
           const label = field.title || name;
@@ -199,6 +293,7 @@ export default function NativeWorkInput({
             mutation.isLoading ||
             acknowledged ||
             (input.mode === 'url' && !externalUrl) ||
+            (input.kind === 'question' && !Object.keys(questionAnswers.answers).length) ||
             Boolean(retained.current && retained.current.nativeInput.action !== 'accept')
           }
         >

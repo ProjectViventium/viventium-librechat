@@ -3,6 +3,7 @@ import type { OAuthTokens, OAuthClientInformation } from '@modelcontextprotocol/
 import type { TokenMethods, IToken } from '@librechat/data-schemas';
 import type { MCPOAuthTokens, ExtendedOAuthTokens, OAuthMetadata } from './types';
 import { isSystemUserId } from '~/mcp/enum';
+import { mcpConfig } from '~/mcp/mcpConfig';
 
 interface StoreTokensParams {
   userId: string;
@@ -322,9 +323,16 @@ export class MCPTokenStorage {
         identifier,
       });
 
-      /** Check if access token is missing or expired */
+      /** Use the same expiry boundary as MCPConnection.isConnected. */
       const isMissing = !accessTokenData;
-      const isExpired = accessTokenData?.expiresAt && new Date() >= accessTokenData.expiresAt;
+      /* === VIVENTIUM START ===
+       * Feature: Align persisted OAuth refresh with live connection expiry.
+       * Purpose: Never reconnect with a token the existing connection guard immediately rejects.
+       */
+      const graceMs = Math.max(mcpConfig.OAUTH_TOKEN_EXPIRE_GRACE_MS ?? 0, 0);
+      const isExpired =
+        accessTokenData?.expiresAt && Date.now() >= accessTokenData.expiresAt.getTime() - graceMs;
+      /* === VIVENTIUM END === */
 
       /* === VIVENTIUM START ===
        * If the MCP server reports auth errors (401/invalid_token) but our stored access token isn't
@@ -334,7 +342,11 @@ export class MCPTokenStorage {
       /* === VIVENTIUM END === */
 
       if (shouldRefresh) {
-        const reason = forceRefresh ? 'force refresh requested' : isMissing ? 'missing' : 'expired';
+        const reason = forceRefresh
+          ? 'force refresh requested'
+          : isMissing
+            ? 'missing'
+            : 'expired/expiring';
         logger.info(`${logPrefix} Access token ${reason}`);
 
         /** Refresh data if we have a refresh token and refresh function */
@@ -346,21 +358,21 @@ export class MCPTokenStorage {
 
         if (!refreshTokenData) {
           logger.info(
-            `${logPrefix} Access token ${isMissing ? 'missing' : 'expired'} and no refresh token available`,
+            `${logPrefix} Access token ${isMissing ? 'missing' : 'expired/expiring'} and no refresh token available`,
           );
           return null;
         }
 
         if (!refreshTokens) {
           logger.warn(
-            `${logPrefix} Access token ${isMissing ? 'missing' : 'expired'}, refresh token available but no \`refreshTokens\` provided`,
+            `${logPrefix} Access token ${isMissing ? 'missing' : 'expired/expiring'}, refresh token available but no \`refreshTokens\` provided`,
           );
           return null;
         }
 
         if (!createToken) {
           logger.warn(
-            `${logPrefix} Access token ${isMissing ? 'missing' : 'expired'}, refresh token available but no \`createToken\` function provided`,
+            `${logPrefix} Access token ${isMissing ? 'missing' : 'expired/expiring'}, refresh token available but no \`createToken\` function provided`,
           );
           return null;
         }
@@ -536,9 +548,7 @@ export class MCPTokenStorage {
   }: {
     userId: string;
     serverName: string;
-    deleteToken: (
-      filter: { userId: string; type: string; identifier: string },
-    ) => Promise<unknown>;
+    deleteToken: (filter: { userId: string; type: string; identifier: string }) => Promise<unknown>;
   }): Promise<void> {
     const identifier = `mcp:${serverName}`;
 

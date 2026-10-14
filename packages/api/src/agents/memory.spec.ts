@@ -8,6 +8,7 @@ import {
   buildSavedMemoryTurnContext,
   clearMemoryWriterHealth,
   createMemoryProcessor,
+  createApplyMemoryChangesTool,
   getMemoryWriterHealthGate,
   loadMemoryReadContext,
   loadMemorySnapshot,
@@ -1269,16 +1270,12 @@ describe('Memory snapshot loading', () => {
 
       clearMemoryReadContextCache(clearScope === 'user' ? userId : undefined);
       const freshReads = await Promise.all(
-        configs.map((config) =>
-          loadMemoryReadContext({ userId, memoryMethods: methods, config }),
-        ),
+        configs.map((config) => loadMemoryReadContext({ userId, memoryMethods: methods, config })),
       );
       pending.forEach((resolve) => resolve([{ key: 'core', value: 'Old saved fact.' }]));
       await Promise.all(oldReads);
       const nextReads = await Promise.all(
-        configs.map((config) =>
-          loadMemoryReadContext({ userId, memoryMethods: methods, config }),
-        ),
+        configs.map((config) => loadMemoryReadContext({ userId, memoryMethods: methods, config })),
       );
 
       expect(freshReads.every((context) => context.cacheHit === false)).toBe(true);
@@ -1298,7 +1295,10 @@ describe('Memory snapshot loading', () => {
       deleteMemory: jest.fn(),
       getFormattedMemories: jest.fn(),
       getAllUserMemories: jest.fn(
-        () => new Promise((resolve) => { resolveOtherRead = resolve; }),
+        () =>
+          new Promise((resolve) => {
+            resolveOtherRead = resolve;
+          }),
       ),
     };
     const request = {
@@ -2026,14 +2026,17 @@ describe('Memory policy retry contract', () => {
     },
   );
 
-  it('does not retry a failed batch after an earlier operation already applied', async () => {
+  it('does not retry a storage-conflicted batch after an earlier operation already applied', async () => {
     installMemoryRunMock([
       [
         { action: 'set', key: 'preferences', value: '123456789' },
-        { action: 'set', key: 'drafts', value: '12345678901' },
+        { action: 'set', key: 'drafts', value: '123456789' },
       ],
     ]);
-    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+    const setMemory = jest
+      .fn()
+      .mockResolvedValueOnce({ ok: true, revision: 1 })
+      .mockResolvedValueOnce({ ok: false, conflict: true });
     const writer = await createWriter({
       keyLimits: { preferences: 10, drafts: 10 },
       memoryTokenMap: { preferences: 0, drafts: 0 },
@@ -2046,9 +2049,117 @@ describe('Memory policy retry contract', () => {
     const error = JSON.parse(String(attachments?.[0]?.[Tools.memory]?.value));
 
     expect(Run.create).toHaveBeenCalledTimes(1);
-    expect(setMemory).toHaveBeenCalledTimes(1);
+    expect(setMemory).toHaveBeenCalledTimes(2);
     expect(attachments?.[0]?.[Tools.memory]?.type).toBe('error');
     expect(error).toEqual(expect.objectContaining({ partialApplied: true }));
+  });
+
+  it('preflights all three operations before the bounded correction writes each key once', async () => {
+    installMemoryRunMock([
+      [
+        { action: 'set', key: 'drafts', value: 'draft' },
+        { action: 'set', key: 'context', value: '12345678901' },
+        { action: 'set', key: 'working', value: 'task' },
+      ],
+      [
+        { action: 'set', key: 'drafts', value: 'draft' },
+        { action: 'set', key: 'context', value: 'context' },
+        { action: 'set', key: 'working', value: 'task' },
+      ],
+    ]);
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+    const writer = await createWriter({
+      keyLimits: { drafts: 10, context: 10, working: 10 },
+      memoryTokenMap: { drafts: 0, context: 9, working: 0 },
+      totalTokens: 9,
+      setMemory,
+    });
+    const { HumanMessage } = await import('@langchain/core/messages');
+    const attachments = await writer([new HumanMessage('Remember all three synthetic facts.')]);
+    expect(Run.create).toHaveBeenCalledTimes(2);
+    expect(
+      setMemory.mock.calls.map(([input]: Record<string, unknown>[]) => [
+        input.key,
+        input.value,
+        input.expectedRevision,
+      ]),
+    ).toEqual([
+      ['drafts', 'draft', 0],
+      ['context', 'context', 0],
+      ['working', 'task', 0],
+    ]);
+    expect(attachments?.[0]?.[Tools.memory]?.type).toBe('update');
+  });
+
+  it.each([
+    { errorType: 'invalid_operation', rejected: { action: 'set' as const, key: 'context' } },
+    {
+      errorType: 'invalid_key',
+      rejected: { action: 'set' as const, key: 'unknown', value: 'fact' },
+    },
+    {
+      errorType: 'noise_rejected',
+      rejected: { action: 'set' as const, key: 'context', value: '{NTA}' },
+    },
+  ])(
+    'corrects zero-effect $errorType before writing the complete batch once',
+    async ({ rejected }) => {
+      installMemoryRunMock([
+        [{ action: 'set', key: 'drafts', value: 'draft' }, rejected],
+        [
+          { action: 'set', key: 'drafts', value: 'draft' },
+          { action: 'set', key: 'context', value: 'fact' },
+        ],
+      ]);
+      const setMemory = jest.fn().mockImplementation(async () => {
+        // No first-attempt mutation may precede the correction's model run.
+        expect(Run.create).toHaveBeenCalledTimes(2);
+        return { ok: true, revision: 1 };
+      });
+      const writer = await createWriter({
+        keyLimits: { drafts: 100, context: 100 },
+        memoryTokenMap: { drafts: 0, context: 0 },
+        totalTokens: 0,
+        setMemory,
+      });
+      const { HumanMessage } = await import('@langchain/core/messages');
+      const attachments = await writer([new HumanMessage('Remember both synthetic facts.')]);
+      expect(Run.create).toHaveBeenCalledTimes(2);
+      expect(
+        setMemory.mock.calls.map(([input]: Record<string, unknown>[]) => [
+          input.key,
+          input.value,
+          input.expectedRevision,
+        ]),
+      ).toEqual([
+        ['drafts', 'draft', 0],
+        ['context', 'fact', 0],
+      ]);
+      expect(attachments?.[0]?.[Tools.memory]?.type).toBe('update');
+    },
+  );
+
+  it('stops after one structural correction if the corrected batch remains invalid', async () => {
+    installMemoryRunMock([
+      [
+        { action: 'set', key: 'drafts', value: 'draft' },
+        { action: 'set', key: 'unknown', value: 'fact' },
+      ],
+    ]);
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 1 });
+    const writer = await createWriter({
+      keyLimits: { drafts: 100 },
+      memoryTokenMap: { drafts: 0 },
+      totalTokens: 0,
+      setMemory,
+    });
+    const { HumanMessage } = await import('@langchain/core/messages');
+    const attachments = await writer([new HumanMessage('Remember both synthetic facts.')]);
+    expect(Run.create).toHaveBeenCalledTimes(2);
+    expect(setMemory).not.toHaveBeenCalled();
+    expect(JSON.parse(String(attachments?.[0]?.[Tools.memory]?.value))).toMatchObject({
+      errorType: 'invalid_key',
+    });
   });
 
   it('preserves uncertain storage failure as an error and never retries the model or a later mutation', async () => {
@@ -2150,4 +2261,96 @@ describe('current saved-memory factual snapshot', () => {
       expect(context).not.toContain('Old private memory');
     },
   );
+});
+
+describe('complete ordered memory proposal preflight', () => {
+  beforeEach(() => {
+    const { Tokenizer } = jest.requireMock('~/utils');
+    Tokenizer.getTokenCount.mockImplementation((value: string) => value.length);
+  });
+  afterEach(() => {
+    jest.requireMock('~/utils').Tokenizer.getTokenCount.mockImplementation(() => 10);
+  });
+  function fixture(tokenLimit = 20) {
+    const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 2 });
+    const deleteMemory = jest.fn().mockResolvedValue({ ok: true, revision: 2 });
+    const tool = createApplyMemoryChangesTool({
+      userId: 'synthetic-owner',
+      setMemory,
+      deleteMemory,
+      validKeys: ['drafts', 'context', 'working'],
+      keyLimits: { drafts: 10, context: 10, working: 10 },
+      tokenLimit,
+      memoryTokenMap: { context: 8 },
+      memoryRevisionMap: { context: 1 },
+      totalTokens: 8,
+    });
+    return { tool, setMemory, deleteMemory };
+  }
+  it.each([
+    [{ action: 'set', key: 'context', value: '12345678901' }, 'key_limit_exceeded'],
+    [{ action: 'set', key: 'context' }, 'invalid_operation'],
+    [{ action: 'set', value: 'x' }, 'invalid_operation'],
+    [{ action: 'delete' }, 'invalid_operation'],
+    [{ action: 'delete', key: 'invalid' }, 'invalid_operation'],
+    [{ action: 'unsupported' }, 'invalid_operation'],
+  ])(
+    'rejects late invalid operation %j with zero durable calls',
+    async (bad: { action: string; key?: string; value?: string }, errorType: string) => {
+      const { tool, setMemory, deleteMemory } = fixture();
+      const result = await tool.func({
+        operations: [
+          { action: 'set', key: 'drafts', value: 'draft' },
+          bad,
+          { action: 'set', key: 'working', value: 'task' },
+        ],
+      } as never);
+      expect(setMemory).not.toHaveBeenCalled();
+      expect(deleteMemory).not.toHaveBeenCalled();
+      const artifact = (result as unknown[])[1] as Record<string, { value: string }>;
+      expect(JSON.parse(artifact[Tools.memory].value)).toMatchObject({ errorType });
+      expect(JSON.parse(artifact[Tools.memory].value)).not.toHaveProperty('partialApplied', true);
+    },
+  );
+  it('uses ordered deltas for repeated keys and deletion before a later addition', async () => {
+    const { tool, setMemory, deleteMemory } = fixture(10);
+    await tool.func({
+      operations: [
+        { action: 'set', key: 'context', value: 'abc' },
+        { action: 'set', key: 'context', value: 'abcdefgh' },
+        { action: 'delete', key: 'context' },
+        { action: 'set', key: 'working', value: '1234567890' },
+      ],
+    });
+    expect(
+      setMemory.mock.calls.map(([input]: Record<string, unknown>[]) => [
+        input.key,
+        input.tokenCount,
+        input.expectedRevision,
+      ]),
+    ).toEqual([
+      ['context', 3, 1],
+      ['context', 8, 2],
+      ['working', 10, null],
+    ]);
+    expect(deleteMemory).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'context', expectedRevision: 2 }),
+    );
+  });
+  it('rejects a late global-budget excess without applying the earlier valid overwrite', async () => {
+    const { tool, setMemory, deleteMemory } = fixture(10);
+    const result = await tool.func({
+      operations: [
+        { action: 'set', key: 'context', value: '123456789' },
+        { action: 'set', key: 'drafts', value: 'abc' },
+      ],
+    });
+    expect(setMemory).not.toHaveBeenCalled();
+    expect(deleteMemory).not.toHaveBeenCalled();
+    expect(
+      JSON.parse(
+        ((result as unknown[])[1] as Record<string, { value: string }>)[Tools.memory].value,
+      ),
+    ).toMatchObject({ errorType: 'would_exceed' });
+  });
 });

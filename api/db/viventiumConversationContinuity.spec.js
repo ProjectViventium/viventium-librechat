@@ -228,40 +228,67 @@ describe('Conversation legacy continuity', () => {
     const plan = planConversationContinuityClaim({ record: null, orderedMessages: carried });
     const base = Date.now();
     let elapsedMs = 0;
-    const store = createConversationContinuityStore({ Model: Continuity, MessageModel: Message,
-      now: () => new Date(base + elapsedMs) });
-    const lease = await store.claim({ ownerId: OWNER, conversationId: CONVERSATION,
-      plan, leaseId: 'owned-correction-lease' });
+    const store = createConversationContinuityStore({
+      Model: Continuity,
+      MessageModel: Message,
+      now: () => new Date(base + elapsedMs),
+    });
+    const lease = await store.claim({
+      ownerId: OWNER,
+      conversationId: CONVERSATION,
+      plan,
+      leaseId: 'owned-correction-lease',
+    });
     const calls = [];
-    const renewCompaction = jest.fn(input => store.renew({ ...input,
-      ownerId: OWNER, conversationId: CONVERSATION }));
+    const renewCompaction = jest.fn((input) =>
+      store.renew({ ...input, ownerId: OWNER, conversationId: CONVERSATION }),
+    );
     const ordinary = compactor(calls);
-    const result = await require('../server/services/viventium/ViventiumMainCompactionService')
-      .ensureAcceptedMainCompaction({ ownerId: OWNER, agentId: AGENT.id,
-        stableAuthoritySha256: 'e'.repeat(64), agent: AGENT,
-        deadlineAt: new Date(base + 600000), now: () => base + elapsedMs,
-        executionBudget: { completionReserveMs: 200000 },
-        claimCompaction: async () => ({ status: 'claimed', domainEpochKey: 'owned-legacy-repair',
-          leaseId: lease.leaseId, leaseExpiresAt: lease.expiresAt,
-          sourceDigest: plan.sourceDigest, sourceBytes: plan.sourceBytes,
-          sourceTurns: plan.sourceTurns, previousSemanticCompaction: plan.previousSemanticCompaction }),
-        renewCompaction,
-        completeCompaction: input => store.complete({ ...input, ownerId: OWNER,
-          conversationId: CONVERSATION, plan, review: input.semanticReview }),
-        rejectCompaction: input => store.reject({ ...input, ownerId: OWNER,
-          conversationId: CONVERSATION }),
-        executeCompactor: async call => {
-          const duration = call.stage === 'review' ? 15590 : 145780;
-          expect(call.timeoutMs).toBeGreaterThanOrEqual(duration);
-          expect(base + elapsedMs + call.timeoutMs).toBeLessThanOrEqual(
-            call.claim.leaseExpiresAt.getTime());
-          expect(elapsedMs + call.timeoutMs).toBeLessThanOrEqual(400000);
-          elapsedMs += duration;
-          call.reportCapacityRelease(true);
-          const value = await ordinary(call);
-          return calls.length === 2 ? REVIEW_REJECTED : value;
+    const result =
+      await require('../server/services/viventium/ViventiumMainCompactionService').ensureAcceptedMainCompaction(
+        {
+          ownerId: OWNER,
+          agentId: AGENT.id,
+          stableAuthoritySha256: 'e'.repeat(64),
+          agent: AGENT,
+          deadlineAt: new Date(base + 600000),
+          now: () => base + elapsedMs,
+          executionBudget: { completionReserveMs: 200000 },
+          claimCompaction: async () => ({
+            status: 'claimed',
+            domainEpochKey: 'owned-legacy-repair',
+            leaseId: lease.leaseId,
+            leaseExpiresAt: lease.expiresAt,
+            sourceDigest: plan.sourceDigest,
+            sourceBytes: plan.sourceBytes,
+            sourceTurns: plan.sourceTurns,
+            previousSemanticCompaction: plan.previousSemanticCompaction,
+          }),
+          renewCompaction,
+          completeCompaction: (input) =>
+            store.complete({
+              ...input,
+              ownerId: OWNER,
+              conversationId: CONVERSATION,
+              plan,
+              review: input.semanticReview,
+            }),
+          rejectCompaction: (input) =>
+            store.reject({ ...input, ownerId: OWNER, conversationId: CONVERSATION }),
+          executeCompactor: async (call) => {
+            const duration = call.stage === 'review' ? 15590 : 145780;
+            expect(call.timeoutMs).toBeGreaterThanOrEqual(duration);
+            expect(base + elapsedMs + call.timeoutMs).toBeLessThanOrEqual(
+              call.claim.leaseExpiresAt.getTime(),
+            );
+            expect(elapsedMs + call.timeoutMs).toBeLessThanOrEqual(400000);
+            elapsedMs += duration;
+            call.reportCapacityRelease(true);
+            const value = await ordinary(call);
+            return calls.length === 2 ? REVIEW_REJECTED : value;
+          },
         },
-      });
+      );
     expect(result).toMatchObject({ status: 'compacted', attempts: 2 });
     expect(renewCompaction).toHaveBeenCalledTimes(1);
     expect(elapsedMs).toBe(322740);
@@ -269,44 +296,80 @@ describe('Conversation legacy continuity', () => {
     expect(record.status).toBe('ready');
     expect(record.lease).toBeNull();
     expect(record.coveredSource).toEqual(plan.coveredSource);
-    expect(record.semanticReview).toMatchObject({ approved: true, sourceDigest: plan.sourceDigest });
-    expect(await Message.countDocuments({ user: OWNER, conversationId: CONVERSATION }))
-      .toBe(rows.length);
+    expect(record.semanticReview).toMatchObject({
+      approved: true,
+      sourceDigest: plan.sourceDigest,
+    });
+    expect(await Message.countDocuments({ user: OWNER, conversationId: CONVERSATION })).toBe(
+      rows.length,
+    );
   });
 
   test('legacy renewal never revives an expired or replaced holder and prevents a competing claim', async () => {
     const rows = await seed(140);
-    const plan = planConversationContinuityClaim({ record: null, orderedMessages: carriedChain(rows) });
+    const plan = planConversationContinuityClaim({
+      record: null,
+      orderedMessages: carriedChain(rows),
+    });
     const base = Date.now();
     let elapsedMs = 0;
-    const store = createConversationContinuityStore({ Model: Continuity, MessageModel: Message,
-      now: () => new Date(base + elapsedMs) });
-    const lease = await store.claim({ ownerId: OWNER, conversationId: CONVERSATION,
-      plan, leaseId: 'live-legacy-lease' });
+    const store = createConversationContinuityStore({
+      Model: Continuity,
+      MessageModel: Message,
+      now: () => new Date(base + elapsedMs),
+    });
+    const lease = await store.claim({
+      ownerId: OWNER,
+      conversationId: CONVERSATION,
+      plan,
+      leaseId: 'live-legacy-lease',
+    });
     elapsedMs = 161370;
     expect(typeof store.renew).toBe('function');
-    const renewal = { ownerId: OWNER, conversationId: CONVERSATION,
-      leaseId: lease.leaseId, sourceDigest: plan.sourceDigest,
-      leaseExpiresAt: lease.expiresAt, expiresAt: new Date(base + 400000) };
+    const renewal = {
+      ownerId: OWNER,
+      conversationId: CONVERSATION,
+      leaseId: lease.leaseId,
+      sourceDigest: plan.sourceDigest,
+      leaseExpiresAt: lease.expiresAt,
+      expiresAt: new Date(base + 400000),
+    };
     for (const invalid of [
       { ...renewal, ownerId: 'another-owner' },
       { ...renewal, leaseId: 'replaced-holder' },
       { ...renewal, sourceDigest: 'f'.repeat(64) },
       { ...renewal, leaseExpiresAt: new Date(base + 299999) },
-    ]) expect((await store.renew(invalid)).status).toBe('stale_lease');
-    expect(await store.renew(renewal)).toEqual({ status: 'renewed',
-      leaseExpiresAt: new Date(base + 400000) });
+    ])
+      expect((await store.renew(invalid)).status).toBe('stale_lease');
+    expect(await store.renew(renewal)).toEqual({
+      status: 'renewed',
+      leaseExpiresAt: new Date(base + 400000),
+    });
     const renewed = await store.load(OWNER, CONVERSATION);
-    expect(await store.claim({ ownerId: OWNER, conversationId: CONVERSATION,
-      plan: { ...plan, recordVersion: renewed.version }, leaseId: 'competitor' })).toBeNull();
+    expect(
+      await store.claim({
+        ownerId: OWNER,
+        conversationId: CONVERSATION,
+        plan: { ...plan, recordVersion: renewed.version },
+        leaseId: 'competitor',
+      }),
+    ).toBeNull();
     expect((await store.renew(renewal)).status).toBe('stale_lease');
-    await Continuity.updateOne({ ownerId: OWNER, conversationId: CONVERSATION },
-      { $set: { 'lease.expiresAt': new Date(base - 1000) } });
+    await Continuity.updateOne(
+      { ownerId: OWNER, conversationId: CONVERSATION },
+      { $set: { 'lease.expiresAt': new Date(base - 1000) } },
+    );
     // The caller still observes a live clock; the atomic server-time predicate rejects expiry.
     elapsedMs = -2000;
-    expect((await store.renew({ ...renewal,
-      leaseExpiresAt: new Date(base - 1000), expiresAt: new Date(base + 200000) })).status)
-      .toBe('stale_lease');
+    expect(
+      (
+        await store.renew({
+          ...renewal,
+          leaseExpiresAt: new Date(base - 1000),
+          expiresAt: new Date(base + 200000),
+        })
+      ).status,
+    ).toBe('stale_lease');
     expect((await store.load(OWNER, CONVERSATION)).lease.expiresAt).toEqual(new Date(base - 1000));
   });
 
@@ -385,52 +448,93 @@ describe('Conversation legacy continuity', () => {
   });
 
   test.each([REVIEW_APPROVED, REVIEW_REJECTED])(
-    're-reviews a prior empty-array text projection before reusing its summary (%s)', async (review) => {
+    're-reviews a prior empty-array text projection before reusing its summary (%s)',
+    async (review) => {
       const rows = await seed(140);
       const savedText = 'JOB-742 needs owner approval. Keep 17 boxes and the corrected rate.';
-      await Message.updateOne({ messageId: 'answer-10' }, { $set: { text: savedText, content: [] } });
-      const stored = await Message.find({ user: OWNER, conversationId: CONVERSATION }).sort({ createdAt: 1 }).lean();
+      await Message.updateOne(
+        { messageId: 'answer-10' },
+        { $set: { text: savedText, content: [] } },
+      );
+      const stored = await Message.find({ user: OWNER, conversationId: CONVERSATION })
+        .sort({ createdAt: 1 })
+        .lean();
       const carried = carriedChain(stored);
       await resolve(schedulerRequest(), carried, []);
-      const accepted = await Continuity.findOne({ ownerId: OWNER, conversationId: CONVERSATION }).lean();
-      const hash = (value) => require('crypto').createHash('sha256').update(JSON.stringify(value)).digest('hex');
+      const accepted = await Continuity.findOne({
+        ownerId: OWNER,
+        conversationId: CONVERSATION,
+      }).lean();
+      const hash = (value) =>
+        require('crypto').createHash('sha256').update(JSON.stringify(value)).digest('hex');
       // Reproduce the previous source projection's approved digest, only in this isolated fixture.
-      const oldCovered = accepted.coveredSource.map((row) => row.id === 'answer-10'
-        ? { ...row, sha256: hash([row.id, 'assistant', '']) } : row);
-      await Continuity.updateOne({ ownerId: OWNER, conversationId: CONVERSATION }, { $set: {
-        coveredSource: oldCovered, coveredDigest: hash(oldCovered.map((row) => [row.id, row.sha256])),
-      } });
-      const previous = await Continuity.findOne({ ownerId: OWNER, conversationId: CONVERSATION }).lean();
-      expect(projectConversationContinuity(previous, carried)).toMatchObject({ stale: true, coveredIds: [] });
-      expect(planConversationContinuityClaim({ record: previous, orderedMessages: carried }))
-        .toMatchObject({ previousSemanticCompaction: null });
+      const oldCovered = accepted.coveredSource.map((row) =>
+        row.id === 'answer-10' ? { ...row, sha256: hash([row.id, 'assistant', '']) } : row,
+      );
+      await Continuity.updateOne(
+        { ownerId: OWNER, conversationId: CONVERSATION },
+        {
+          $set: {
+            coveredSource: oldCovered,
+            coveredDigest: hash(oldCovered.map((row) => [row.id, row.sha256])),
+          },
+        },
+      );
+      const previous = await Continuity.findOne({
+        ownerId: OWNER,
+        conversationId: CONVERSATION,
+      }).lean();
+      expect(projectConversationContinuity(previous, carried)).toMatchObject({
+        stale: true,
+        coveredIds: [],
+      });
+      expect(
+        planConversationContinuityClaim({ record: previous, orderedMessages: carried }),
+      ).toMatchObject({ previousSemanticCompaction: null });
       const beforeRows = await Message.find({}).sort({ messageId: 1 }).lean();
       const calls = [];
       const recovered = await resolve(schedulerRequest(), carried, calls, review);
       expect(calls.some((call) => call.stage === 'review')).toBe(true);
       const source = evidence(calls.find((call) => !call.stage || call.stage === 'compaction'));
-      expect(source.acceptedOlderTurns).toContainEqual(expect.objectContaining({
-        assistantMessageId: 'answer-10', assistantText: savedText,
-      }));
-      const current = await Continuity.findOne({ ownerId: OWNER, conversationId: CONVERSATION }).lean();
+      expect(source.acceptedOlderTurns).toContainEqual(
+        expect.objectContaining({
+          assistantMessageId: 'answer-10',
+          assistantText: savedText,
+        }),
+      );
+      const current = await Continuity.findOne({
+        ownerId: OWNER,
+        conversationId: CONVERSATION,
+      }).lean();
       expect(current.lease).toBeNull();
       if (review === REVIEW_APPROVED) {
         expect(recovered.coveredIds).toHaveLength(92);
         expect(projectConversationContinuity(current, carried)).toMatchObject({ stale: false });
-        expect(current.coveredSource.find((row) => row.id === 'answer-10').sha256)
-          .toBe(hash(['answer-10', 'assistant', savedText]));
+        expect(current.coveredSource.find((row) => row.id === 'answer-10').sha256).toBe(
+          hash(['answer-10', 'assistant', savedText]),
+        );
         const reloadedCalls = [];
-        expect((await resolve(schedulerRequest(), carried, reloadedCalls)).coveredIds).toEqual(recovered.coveredIds);
+        expect((await resolve(schedulerRequest(), carried, reloadedCalls)).coveredIds).toEqual(
+          recovered.coveredIds,
+        );
         expect(reloadedCalls).toHaveLength(0);
       } else {
         expect(recovered).toBeNull();
-        expect(current).toMatchObject({ status: 'ready', coveredSource: previous.coveredSource,
-          coveredDigest: previous.coveredDigest, semanticReview: previous.semanticReview });
+        expect(current).toMatchObject({
+          status: 'ready',
+          coveredSource: previous.coveredSource,
+          coveredDigest: previous.coveredDigest,
+          semanticReview: previous.semanticReview,
+        });
         expect(current.lastError).toBeTruthy();
-        expect(projectConversationContinuity(current, carried)).toMatchObject({ stale: true, coveredIds: [] });
+        expect(projectConversationContinuity(current, carried)).toMatchObject({
+          stale: true,
+          coveredIds: [],
+        });
       }
       expect(await Message.find({}).sort({ messageId: 1 }).lean()).toEqual(beforeRows);
-    });
+    },
+  );
 
   test('an unapproved summary is never used and the turn still fails typed', async () => {
     const rows = await seed(140);
@@ -467,14 +571,25 @@ describe('Conversation legacy continuity', () => {
     const fitting = compactor(calls);
     let generations = 0;
     const projection = await resolveConversationContinuity({
-      req: schedulerRequest(), agent: AGENT, ownerId: OWNER, conversationId: CONVERSATION,
-      orderedMessages: carried, Model: Continuity, MessageModel: Message,
+      req: schedulerRequest(),
+      agent: AGENT,
+      ownerId: OWNER,
+      conversationId: CONVERSATION,
+      orderedMessages: carried,
+      Model: Continuity,
+      MessageModel: Message,
       executeCompactor: async (call) => {
         if (call.stage !== 'review' && generations++ < 1) {
           calls.push(call);
           return JSON.stringify({
-            version: 1, summary: 's'.repeat(20000), pendingAsks: [], commitments: [],
-            corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [],
+            version: 1,
+            summary: 's'.repeat(20000),
+            pendingAsks: [],
+            commitments: [],
+            corrections: [],
+            decisions: [],
+            durableIdentifiers: [],
+            recurrenceOutcomes: [],
             toolPairs: [],
           });
         }
@@ -482,7 +597,9 @@ describe('Conversation legacy continuity', () => {
       },
     });
     expect(calls.map((call) => call.stage || 'compaction')).toEqual([
-      'compaction', 'compaction', 'review',
+      'compaction',
+      'compaction',
+      'review',
     ]);
     const first = calls[0].claim;
     const smaller = calls[1].claim;
@@ -492,48 +609,75 @@ describe('Conversation legacy continuity', () => {
     expect(projection.coveredIds.length).toBeGreaterThan(0);
     expect(projection.messages.at(-1).messageId).toBe('current-prompt');
     expect(await Message.find({}).sort({ messageId: 1 }).lean()).toEqual(before);
-    const record = await Continuity.findOne({ ownerId: OWNER, conversationId: CONVERSATION }).lean();
+    const record = await Continuity.findOne({
+      ownerId: OWNER,
+      conversationId: CONVERSATION,
+    }).lean();
     expect(record.semanticReview).toMatchObject({ approved: true });
     expect(record.lease).toBeNull();
   });
 
-  test.each(['unchanged source', 'transport failure'])('%s ends the wake without another claim', async (kind) => {
-    const rows = await seed(140);
-    const carried = carriedChain(rows);
-    const requests = [];
-    const compaction = { ensureAcceptedMainCompaction: async (input) => {
-      const claim = await input.claimCompaction({});
-      requests.push(claim);
-      await input.rejectCompaction({ leaseId: claim.leaseId, reason: 'unaccepted' });
-      return { status: 'degraded', reason: 'unaccepted',
-        ...(kind === 'unchanged source' ? { nextSourceTargetBytes: claim.sourceBytes } : {}),
+  test.each(['unchanged source', 'transport failure'])(
+    '%s ends the wake without another claim',
+    async (kind) => {
+      const rows = await seed(140);
+      const carried = carriedChain(rows);
+      const requests = [];
+      const compaction = {
+        ensureAcceptedMainCompaction: async (input) => {
+          const claim = await input.claimCompaction({});
+          requests.push(claim);
+          await input.rejectCompaction({ leaseId: claim.leaseId, reason: 'unaccepted' });
+          return {
+            status: 'degraded',
+            reason: 'unaccepted',
+            ...(kind === 'unchanged source' ? { nextSourceTargetBytes: claim.sourceBytes } : {}),
+          };
+        },
       };
-    } };
-    const record = await ensureConversationLegacyContinuity({
-      req: schedulerRequest(), agent: AGENT, ownerId: OWNER, conversationId: CONVERSATION,
-      orderedMessages: carried, Model: Continuity, MessageModel: Message, compaction,
-    });
-    expect(requests).toHaveLength(1);
-    expect(record.coveredSource).toEqual([]);
-    expect(record.lease).toBeNull();
-  });
+      const record = await ensureConversationLegacyContinuity({
+        req: schedulerRequest(),
+        agent: AGENT,
+        ownerId: OWNER,
+        conversationId: CONVERSATION,
+        orderedMessages: carried,
+        Model: Continuity,
+        MessageModel: Message,
+        compaction,
+      });
+      expect(requests).toHaveLength(1);
+      expect(record.coveredSource).toEqual([]);
+      expect(record.lease).toBeNull();
+    },
+  );
 
   test('the owning turn cancellation signal prevents a smaller follow-on claim', async () => {
     const rows = await seed(140);
     const controller = new AbortController();
     const requests = [];
-    const compaction = { ensureAcceptedMainCompaction: async (input) => {
-      expect(input.signal).toBe(controller.signal);
-      const claim = await input.claimCompaction({});
-      requests.push(claim);
-      await input.rejectCompaction({ leaseId: claim.leaseId, reason: 'unaccepted' });
-      controller.abort();
-      return { status: 'degraded', reason: 'unaccepted',
-        nextSourceTargetBytes: Math.floor(claim.sourceBytes / 2) };
-    } };
+    const compaction = {
+      ensureAcceptedMainCompaction: async (input) => {
+        expect(input.signal).toBe(controller.signal);
+        const claim = await input.claimCompaction({});
+        requests.push(claim);
+        await input.rejectCompaction({ leaseId: claim.leaseId, reason: 'unaccepted' });
+        controller.abort();
+        return {
+          status: 'degraded',
+          reason: 'unaccepted',
+          nextSourceTargetBytes: Math.floor(claim.sourceBytes / 2),
+        };
+      },
+    };
     await ensureConversationLegacyContinuity({
-      req: schedulerRequest(), agent: AGENT, ownerId: OWNER, conversationId: CONVERSATION,
-      orderedMessages: carriedChain(rows), Model: Continuity, MessageModel: Message, compaction,
+      req: schedulerRequest(),
+      agent: AGENT,
+      ownerId: OWNER,
+      conversationId: CONVERSATION,
+      orderedMessages: carriedChain(rows),
+      Model: Continuity,
+      MessageModel: Message,
+      compaction,
       signal: controller.signal,
     });
     expect(requests).toHaveLength(1);
@@ -542,16 +686,27 @@ describe('Conversation legacy continuity', () => {
   test('smaller unaccepted claims stop at the existing six-claim bound', async () => {
     const rows = await seed(1000);
     const requests = [];
-    const compaction = { ensureAcceptedMainCompaction: async (input) => {
-      const claim = await input.claimCompaction({});
-      requests.push(claim);
-      await input.rejectCompaction({ leaseId: claim.leaseId, reason: 'unaccepted' });
-      return { status: 'degraded', reason: 'unaccepted',
-        nextSourceTargetBytes: Math.floor(claim.sourceBytes / 2) };
-    } };
+    const compaction = {
+      ensureAcceptedMainCompaction: async (input) => {
+        const claim = await input.claimCompaction({});
+        requests.push(claim);
+        await input.rejectCompaction({ leaseId: claim.leaseId, reason: 'unaccepted' });
+        return {
+          status: 'degraded',
+          reason: 'unaccepted',
+          nextSourceTargetBytes: Math.floor(claim.sourceBytes / 2),
+        };
+      },
+    };
     await ensureConversationLegacyContinuity({
-      req: schedulerRequest(), agent: AGENT, ownerId: OWNER, conversationId: CONVERSATION,
-      orderedMessages: carriedChain(rows), Model: Continuity, MessageModel: Message, compaction,
+      req: schedulerRequest(),
+      agent: AGENT,
+      ownerId: OWNER,
+      conversationId: CONVERSATION,
+      orderedMessages: carriedChain(rows),
+      Model: Continuity,
+      MessageModel: Message,
+      compaction,
     });
     expect(requests).toHaveLength(6);
     for (let index = 1; index < requests.length; index += 1) {

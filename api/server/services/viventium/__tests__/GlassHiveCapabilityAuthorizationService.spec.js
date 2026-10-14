@@ -16,8 +16,10 @@ function matches(record, filter) {
       return Object.prototype.hasOwnProperty.call(record, key) === value.$exists;
     }
     if (Object.prototype.toString.call(value) === '[object Date]') {
-      return Object.prototype.toString.call(record?.[key]) === '[object Date]' &&
-        record[key].getTime() === value.getTime();
+      return (
+        Object.prototype.toString.call(record?.[key]) === '[object Date]' &&
+        record[key].getTime() === value.getTime()
+      );
     }
     return record?.[key] === value;
   });
@@ -785,27 +787,44 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
   }
 
   test('reauthorizes an expired bound scope when native preflight never recorded the Core marker', async () => {
-    const { reauthorizeCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
+    const {
+      reauthorizeCapabilityAuthorization,
+    } = require('../GlassHiveCapabilityAuthorizationService');
     const { authorization, stored } = await expiredBoundAuthorization();
     const result = await reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_086_342_000,
+      ownerId: 'owner-1',
+      workRef: 'work_00000001',
+      nowMs: 1_800_086_342_000,
     });
-    expect(result).toMatchObject({ authorizationRef: authorization.authorizationRef,
-      scopeFingerprint: authorization.scopeFingerprint, maxExpiresAt: '2027-01-17T07:59:02.000Z' });
-    expect(stored).toMatchObject({ reauthorizationCount: 1, lastNeedsInputCode: '',
-      allowedServers: ['connected'], allowedHostTools: ['file_search'] });
+    expect(result).toMatchObject({
+      authorizationRef: authorization.authorizationRef,
+      scopeFingerprint: authorization.scopeFingerprint,
+      maxExpiresAt: '2027-01-17T07:59:02.000Z',
+    });
+    expect(stored).toMatchObject({
+      reauthorizationCount: 1,
+      lastNeedsInputCode: '',
+      allowedServers: ['connected'],
+      allowedHostTools: ['file_search'],
+    });
     expect(mockMintBrokerGrant).not.toHaveBeenCalled();
   });
 
   test('reuses the exact fresh renewal after a lost native Resume request without extending it again', async () => {
-    const { reauthorizeCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
+    const {
+      reauthorizeCapabilityAuthorization,
+    } = require('../GlassHiveCapabilityAuthorizationService');
     const { stored } = await expiredBoundAuthorization();
     const first = await reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_086_342_000,
+      ownerId: 'owner-1',
+      workRef: 'work_00000001',
+      nowMs: 1_800_086_342_000,
     });
     const writes = mockAuthorizationCollection.updateOne.mock.calls.length;
     const replay = await reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_086_347_000,
+      ownerId: 'owner-1',
+      workRef: 'work_00000001',
+      nowMs: 1_800_086_347_000,
     });
     expect(replay).toEqual(first);
     expect(stored.reauthorizationCount).toBe(1);
@@ -814,114 +833,188 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
   });
 
   test('does not renew a future first grant or an expired unbound authorization', async () => {
-    const { reauthorizeCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
+    const {
+      reauthorizeCapabilityAuthorization,
+    } = require('../GlassHiveCapabilityAuthorizationService');
     const { stored } = await expiredBoundAuthorization();
-    await expect(reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_000_001_000,
-    })).rejects.toMatchObject({ code: 'capability_authorization_not_found', status: 404 });
-    await expect(reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: stored.maxExpiresAt.getTime() - 59_000,
-    })).rejects.toMatchObject({ code: 'capability_authorization_not_found', status: 404 });
+    await expect(
+      reauthorizeCapabilityAuthorization({
+        ownerId: 'owner-1',
+        workRef: 'work_00000001',
+        nowMs: 1_800_000_001_000,
+      }),
+    ).rejects.toMatchObject({ code: 'capability_authorization_not_found', status: 404 });
+    await expect(
+      reauthorizeCapabilityAuthorization({
+        ownerId: 'owner-1',
+        workRef: 'work_00000001',
+        nowMs: stored.maxExpiresAt.getTime() - 59_000,
+      }),
+    ).rejects.toMatchObject({ code: 'capability_authorization_not_found', status: 404 });
     stored.workRef = '';
-    await expect(reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_086_342_000,
-    })).rejects.toMatchObject({ code: 'capability_authorization_not_found', status: 404 });
+    await expect(
+      reauthorizeCapabilityAuthorization({
+        ownerId: 'owner-1',
+        workRef: 'work_00000001',
+        nowMs: 1_800_086_342_000,
+      }),
+    ).rejects.toMatchObject({ code: 'capability_authorization_not_found', status: 404 });
     expect(stored.reauthorizationCount).toBeUndefined();
   });
 
   test.each([new Date(NaN), 'invalid-date', null, undefined, 0, Infinity])(
-    'rejects malformed authorization deadline %# without changing scope or horizon', async (deadline) => {
-      const { reauthorizeCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
+    'rejects malformed authorization deadline %# without changing scope or horizon',
+    async (deadline) => {
+      const {
+        reauthorizeCapabilityAuthorization,
+      } = require('../GlassHiveCapabilityAuthorizationService');
       const { stored } = await expiredBoundAuthorization();
       stored.maxExpiresAt = deadline;
       stored.lastNeedsInputCode = 'capability_authorization_horizon_expired';
-      await expect(reauthorizeCapabilityAuthorization({
-        ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_086_342_000,
-      })).rejects.toMatchObject({ code: 'capability_authorization_not_found', status: 404 });
+      await expect(
+        reauthorizeCapabilityAuthorization({
+          ownerId: 'owner-1',
+          workRef: 'work_00000001',
+          nowMs: 1_800_086_342_000,
+        }),
+      ).rejects.toMatchObject({ code: 'capability_authorization_not_found', status: 404 });
       expect(stored.reauthorizationCount).toBeUndefined();
       expect(mockGetUserById).not.toHaveBeenCalled();
     },
   );
 
   test.each([
-    ['ownerId', 'foreign-owner'], ['workRef', 'work_foreign'],
-    ['scopeFingerprint', 'foreign-scope'], ['authorizationRef', 'gha_foreign'],
+    ['ownerId', 'foreign-owner'],
+    ['workRef', 'work_foreign'],
+    ['scopeFingerprint', 'foreign-scope'],
+    ['authorizationRef', 'gha_foreign'],
     ['maxExpiresAt', new Date(1_800_200_000_000)],
   ])('fences a concurrent %s change during scope revalidation', async (field, value) => {
-    const { reauthorizeCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
+    const {
+      reauthorizeCapabilityAuthorization,
+    } = require('../GlassHiveCapabilityAuthorizationService');
     const { stored } = await expiredBoundAuthorization();
     mockGetUserById.mockImplementationOnce(async () => {
       stored[field] = value;
       return { _id: 'owner-1', role: 'USER' };
     });
-    await expect(reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_086_342_000,
-    })).rejects.toMatchObject({ code: 'capability_authorization_not_found', status: 404 });
+    await expect(
+      reauthorizeCapabilityAuthorization({
+        ownerId: 'owner-1',
+        workRef: 'work_00000001',
+        nowMs: 1_800_086_342_000,
+      }),
+    ).rejects.toMatchObject({ code: 'capability_authorization_not_found', status: 404 });
     expect(stored.reauthorizationCount).toBeUndefined();
   });
 
   test('unmarked expiry cannot renew a foreign owner or changed connected scope', async () => {
-    const { reauthorizeCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
+    const {
+      reauthorizeCapabilityAuthorization,
+    } = require('../GlassHiveCapabilityAuthorizationService');
     const { stored } = await expiredBoundAuthorization();
-    await expect(reauthorizeCapabilityAuthorization({
-      ownerId: 'foreign-owner', workRef: 'work_00000001', nowMs: 1_800_086_342_000,
-    })).rejects.toMatchObject({ code: 'capability_authorization_not_found' });
+    await expect(
+      reauthorizeCapabilityAuthorization({
+        ownerId: 'foreign-owner',
+        workRef: 'work_00000001',
+        nowMs: 1_800_086_342_000,
+      }),
+    ).rejects.toMatchObject({ code: 'capability_authorization_not_found' });
     mockCollectServerProjection.mockReturnValue({ allowedEntries: [], omissions: [] });
     mockShouldGrantContentReadScope.mockReturnValue(false);
-    await expect(reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_086_342_000,
-    })).rejects.toMatchObject({ code: 'capability_policy_changed' });
+    await expect(
+      reauthorizeCapabilityAuthorization({
+        ownerId: 'owner-1',
+        workRef: 'work_00000001',
+        nowMs: 1_800_086_342_000,
+      }),
+    ).rejects.toMatchObject({ code: 'capability_policy_changed' });
     expect(stored.reauthorizationCount).toBeUndefined();
   });
 
   test('a renewed scope replay still rejects changed policy and raced expiry', async () => {
-    const { reauthorizeCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
+    const {
+      reauthorizeCapabilityAuthorization,
+    } = require('../GlassHiveCapabilityAuthorizationService');
     const { stored } = await expiredBoundAuthorization();
     await reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_086_342_000,
+      ownerId: 'owner-1',
+      workRef: 'work_00000001',
+      nowMs: 1_800_086_342_000,
     });
     const expiry = stored.maxExpiresAt;
     mockCollectServerProjection.mockReturnValueOnce({ allowedEntries: [], omissions: [] });
-    await expect(reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_086_347_000,
-    })).rejects.toMatchObject({ code: 'capability_policy_changed' });
+    await expect(
+      reauthorizeCapabilityAuthorization({
+        ownerId: 'owner-1',
+        workRef: 'work_00000001',
+        nowMs: 1_800_086_347_000,
+      }),
+    ).rejects.toMatchObject({ code: 'capability_policy_changed' });
     expect(stored.maxExpiresAt).toEqual(expiry);
     mockGetUserById.mockImplementationOnce(async () => {
       stored.maxExpiresAt = new Date(1_800_200_000_000);
       return { _id: 'owner-1', role: 'USER' };
     });
-    await expect(reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_086_347_000,
-    })).rejects.toMatchObject({ code: 'capability_authorization_not_found' });
+    await expect(
+      reauthorizeCapabilityAuthorization({
+        ownerId: 'owner-1',
+        workRef: 'work_00000001',
+        nowMs: 1_800_086_347_000,
+      }),
+    ).rejects.toMatchObject({ code: 'capability_authorization_not_found' });
     expect(stored.reauthorizationCount).toBe(1);
   });
 
   test('retains explicit renewal for the Core-marked expiry window before the deadline', async () => {
-    const { admitCapabilityAuthorization, reauthorizeCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
+    const {
+      admitCapabilityAuthorization,
+      reauthorizeCapabilityAuthorization,
+    } = require('../GlassHiveCapabilityAuthorizationService');
     const authorization = await prepare();
-    await expect(admitCapabilityAuthorization({
-      authorizationRef: authorization.authorizationRef, originRef: 'ghi_origin_0001',
-      workRef: 'work_00000001', workerId: 'worker_000001', runId: 'run_000000001',
-      containerGenerationId: 'a'.repeat(64), nowMs: 1_800_086_398_000,
-    })).rejects.toMatchObject({ code: 'capability_authorization_horizon_expired' });
-    await expect(reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_086_399_000,
-    })).resolves.toMatchObject({ status: 'reauthorized' });
+    await expect(
+      admitCapabilityAuthorization({
+        authorizationRef: authorization.authorizationRef,
+        originRef: 'ghi_origin_0001',
+        workRef: 'work_00000001',
+        workerId: 'worker_000001',
+        runId: 'run_000000001',
+        containerGenerationId: 'a'.repeat(64),
+        nowMs: 1_800_086_398_000,
+      }),
+    ).rejects.toMatchObject({ code: 'capability_authorization_horizon_expired' });
+    await expect(
+      reauthorizeCapabilityAuthorization({
+        ownerId: 'owner-1',
+        workRef: 'work_00000001',
+        nowMs: 1_800_086_399_000,
+      }),
+    ).resolves.toMatchObject({ status: 'reauthorized' });
   });
 
   test('uses the admission sixty-second boundary for a previously renewed unmarked scope', async () => {
-    const { reauthorizeCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
+    const {
+      reauthorizeCapabilityAuthorization,
+    } = require('../GlassHiveCapabilityAuthorizationService');
     const { stored } = await expiredBoundAuthorization();
     const first = await reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: 1_800_086_342_000,
+      ownerId: 'owner-1',
+      workRef: 'work_00000001',
+      nowMs: 1_800_086_342_000,
     });
     const expiry = stored.maxExpiresAt.getTime();
-    await expect(reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: expiry - 60_000,
-    })).resolves.toEqual(first);
+    await expect(
+      reauthorizeCapabilityAuthorization({
+        ownerId: 'owner-1',
+        workRef: 'work_00000001',
+        nowMs: expiry - 60_000,
+      }),
+    ).resolves.toEqual(first);
     expect(stored.reauthorizationCount).toBe(1);
     const next = await reauthorizeCapabilityAuthorization({
-      ownerId: 'owner-1', workRef: 'work_00000001', nowMs: expiry - 59_000,
+      ownerId: 'owner-1',
+      workRef: 'work_00000001',
+      nowMs: expiry - 59_000,
     });
     expect(next.maxExpiresAt).toBe(new Date(expiry - 59_000 + 86_400_000).toISOString());
     expect(stored.reauthorizationCount).toBe(2);
@@ -1005,17 +1098,38 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
 });
 
 describe('read-only capability descriptor for immutable native receipt recovery', () => {
-  beforeEach(() => { jest.clearAllMocks(); authorizations.clear(); });
-  const record = () => ({ _id: 'gha_candidate', authorizationRef: 'gha_candidate',
-    ownerId: 'owner-1', workRef: 'work_00000001', status: 'active', scopeFingerprint: 'exact-original-scope',
-    maxExpiresAt: new Date('2027-01-17T07:59:02.000Z'), reauthorizationCount: 1 });
+  beforeEach(() => {
+    jest.clearAllMocks();
+    authorizations.clear();
+  });
+  const record = () => ({
+    _id: 'gha_candidate',
+    authorizationRef: 'gha_candidate',
+    ownerId: 'owner-1',
+    workRef: 'work_00000001',
+    status: 'active',
+    scopeFingerprint: 'exact-original-scope',
+    maxExpiresAt: new Date('2027-01-17T07:59:02.000Z'),
+    reauthorizationCount: 1,
+  });
   test('returns only the exact owner/work prior descriptor without renewal or broker calls', async () => {
-    const { readCapabilityReauthorizationReceiptCandidate } = require('../GlassHiveCapabilityAuthorizationService');
-    const original = record(); authorizations.set(original._id, original);
+    const {
+      readCapabilityReauthorizationReceiptCandidate,
+    } = require('../GlassHiveCapabilityAuthorizationService');
+    const original = record();
+    authorizations.set(original._id, original);
     const frozen = structuredClone(original);
-    await expect(readCapabilityReauthorizationReceiptCandidate({ ownerId: 'owner-1', workRef: 'work_00000001' }))
-      .resolves.toEqual({ version: 1, authorizationRef: 'gha_candidate',
-        maxExpiresAt: '2027-01-17T07:59:02.000Z', scopeFingerprint: 'exact-original-scope' });
+    await expect(
+      readCapabilityReauthorizationReceiptCandidate({
+        ownerId: 'owner-1',
+        workRef: 'work_00000001',
+      }),
+    ).resolves.toEqual({
+      version: 1,
+      authorizationRef: 'gha_candidate',
+      maxExpiresAt: '2027-01-17T07:59:02.000Z',
+      scopeFingerprint: 'exact-original-scope',
+    });
     expect(original).toEqual(frozen);
     expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
     expect(mockAuthorizationCollection.insertOne).not.toHaveBeenCalled();
@@ -1023,29 +1137,47 @@ describe('read-only capability descriptor for immutable native receipt recovery'
     expect(mockGetUserById).not.toHaveBeenCalled();
   });
   test('an expired historical descriptor remains a read-only candidate, never renewed', async () => {
-    const { readCapabilityReauthorizationReceiptCandidate } = require('../GlassHiveCapabilityAuthorizationService');
+    const {
+      readCapabilityReauthorizationReceiptCandidate,
+    } = require('../GlassHiveCapabilityAuthorizationService');
     const original = record();
     original.maxExpiresAt = new Date('2000-01-01T00:00:00.000Z');
     authorizations.set(original._id, original);
     const frozen = structuredClone(original);
-    await expect(readCapabilityReauthorizationReceiptCandidate({ ownerId: 'owner-1', workRef: 'work_00000001' }))
-      .resolves.toEqual({ version: 1, authorizationRef: 'gha_candidate', maxExpiresAt: '2000-01-01T00:00:00.000Z', scopeFingerprint: 'exact-original-scope' });
+    await expect(
+      readCapabilityReauthorizationReceiptCandidate({
+        ownerId: 'owner-1',
+        workRef: 'work_00000001',
+      }),
+    ).resolves.toEqual({
+      version: 1,
+      authorizationRef: 'gha_candidate',
+      maxExpiresAt: '2000-01-01T00:00:00.000Z',
+      scopeFingerprint: 'exact-original-scope',
+    });
     expect(original).toEqual(frozen);
     expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
     expect(mockMintBrokerGrant).not.toHaveBeenCalled();
   });
-  test.each(['foreign_owner', 'foreign_work', 'unrenewed', 'revoked', 'invalid_clock'])('does not manufacture a descriptor for %s', async (kind) => {
-    const { readCapabilityReauthorizationReceiptCandidate } = require('../GlassHiveCapabilityAuthorizationService');
-    const original = record();
-    if (kind === 'unrenewed') original.reauthorizationCount = 0;
-    if (kind === 'revoked') original.status = 'revoked';
-    if (kind === 'invalid_clock') original.maxExpiresAt = 'not-a-date';
-    authorizations.set(original._id, original);
-    await expect(readCapabilityReauthorizationReceiptCandidate({
-      ownerId: kind === 'foreign_owner' ? 'foreign' : 'owner-1',
-      workRef: kind === 'foreign_work' ? 'work_foreign' : 'work_00000001',
-    })).resolves.toBeNull();
-    expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
-    expect(mockMintBrokerGrant).not.toHaveBeenCalled();
-  });
+  test.each(['foreign_owner', 'foreign_work', 'unrenewed', 'revoked', 'invalid_clock'])(
+    'does not manufacture a descriptor for %s',
+    async (kind) => {
+      const {
+        readCapabilityReauthorizationReceiptCandidate,
+      } = require('../GlassHiveCapabilityAuthorizationService');
+      const original = record();
+      if (kind === 'unrenewed') original.reauthorizationCount = 0;
+      if (kind === 'revoked') original.status = 'revoked';
+      if (kind === 'invalid_clock') original.maxExpiresAt = 'not-a-date';
+      authorizations.set(original._id, original);
+      await expect(
+        readCapabilityReauthorizationReceiptCandidate({
+          ownerId: kind === 'foreign_owner' ? 'foreign' : 'owner-1',
+          workRef: kind === 'foreign_work' ? 'work_foreign' : 'work_00000001',
+        }),
+      ).resolves.toBeNull();
+      expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
+      expect(mockMintBrokerGrant).not.toHaveBeenCalled();
+    },
+  );
 });

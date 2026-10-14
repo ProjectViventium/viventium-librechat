@@ -215,9 +215,11 @@ function buildService(fixture = exactFixture()) {
 describe('CortexTelegramDeliveryDispatchService', () => {
   test('retains source-bound native audio controls from the actual persisted presentation', async () => {
     const fixture = exactFixture();
-    const controls = { skipVoice: false, sourceTextSha256: 'a'.repeat(64), audioContent: [
-      { type: 'text', text: fixture.followup.text, deliveryDispositionRanges: [] },
-    ] };
+    const controls = {
+      skipVoice: false,
+      sourceTextSha256: 'a'.repeat(64),
+      audioContent: [{ type: 'text', text: fixture.followup.text, deliveryDispositionRanges: [] }],
+    };
     fixture.followup.metadata.viventium.telegramDeliveryControls = controls;
     const dependencies = buildService(fixture);
     const deliveries = await dependencies.service.claimPending({ limit: 1, leaseMs: 120_000 });

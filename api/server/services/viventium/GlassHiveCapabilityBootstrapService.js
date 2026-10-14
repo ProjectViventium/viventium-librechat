@@ -1677,14 +1677,18 @@ async function buildConversationProviderBootstrapBundle({
   // Join a created current-turn grant to broker transport observations without decoding tokens.
   // Diagnostics carry hashes only and cannot change the grant or its delivery path.
   try {
-    const scopeHash = (value) => typeof value === 'string' && value
-      ? crypto.createHash('sha256').update(value).digest('hex') : null;
-    logger.info(JSON.stringify({
-      event: 'glasshive_broker_grant_created',
-      grant_id_sha256: scopeHash(mintedGrant.payload.grant_id),
-      message_id_sha256: scopeHash(mintedGrant.payload.message_id),
-      conversation_id_sha256: scopeHash(mintedGrant.payload.conversation_id),
-    }));
+    const scopeHash = (value) =>
+      typeof value === 'string' && value
+        ? crypto.createHash('sha256').update(value).digest('hex')
+        : null;
+    logger.info(
+      JSON.stringify({
+        event: 'glasshive_broker_grant_created',
+        grant_id_sha256: scopeHash(mintedGrant.payload.grant_id),
+        message_id_sha256: scopeHash(mintedGrant.payload.message_id),
+        conversation_id_sha256: scopeHash(mintedGrant.payload.conversation_id),
+      }),
+    );
   } catch {
     // A diagnostic failure must not turn a valid capability grant into an unavailable one.
   }

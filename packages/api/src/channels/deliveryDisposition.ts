@@ -380,15 +380,18 @@ export function inspectProviderDeliveryRanges(
 ): DeliveryDispositionRange[] | null {
   const envelope = isRecord(response) ? response : null;
   const additional = recordAt(envelope, 'additional_kwargs');
-  const root = recordAt(additional, '__raw_response') ?? recordAt(envelope, '__raw_response') ?? envelope;
+  const root =
+    recordAt(additional, '__raw_response') ?? recordAt(envelope, '__raw_response') ?? envelope;
   const choices = root?.choices;
   const choice = Array.isArray(choices) && choices.length === 1 ? choices[0] : null;
   const message = recordAt(choice, 'message') ?? recordAt(choice, 'delta');
   const carrier = recordAt(recordAt(message, 'provider_specific_fields'), 'viventium');
   if (!carrier || !Object.prototype.hasOwnProperty.call(carrier, 'deliveryDispositionRanges'))
     return null;
-  const source = typeof carrier.delivery_range_text === 'string'
-    ? carrier.delivery_range_text : message?.content;
+  const source =
+    typeof carrier.delivery_range_text === 'string'
+      ? carrier.delivery_range_text
+      : message?.content;
   const ranges = carrier.deliveryDispositionRanges;
   if ((message?.role != null && message.role !== 'assistant') || typeof source !== 'string')
     return [];

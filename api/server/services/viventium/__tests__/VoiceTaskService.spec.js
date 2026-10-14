@@ -185,19 +185,68 @@ describe('VoiceTaskService', () => {
     expect(snapshot.detail).toBeUndefined();
   });
 
-  test('native clarification input preserves exact JSON bytes and current form during ACK retry', async()=>{
-    const key='Which  size?';const questionForm={questions:[{key,label:'Which size?',multiSelect:false,options:[{value:'Other',label:'Other'}]}]};
-    const task=createVoiceTask({callSessionId:'call-input',userId:'user-1',streamId:'mission-run',owner:{kind:'glasshive_run',id:'run-1'}});
-    const provideInput=jest.fn().mockResolvedValueOnce({accepted:false,confirmationPending:true}).mockResolvedValueOnce({accepted:true});
-    registerVoiceTaskOwnerAdapter(task.taskId,{kind:'glasshive_run',provideInput,nativeMissionInputBinding:{version:1,requestId:'question-1',requestFingerprint:'a'.repeat(64),runId:'run-1',attemptId:'attempt-1',sessionId:'session-1',expiresAt:'2099-01-01T00:00:00Z',workRef:'work-1',taskId:task.taskId,userId:'user-1',callSessionId:'call-input',inputKind:'question',questionForm}});
-    observeGenerationEvent(task.taskId,{event:'needs_input',data:{prompt:'Choose size.',inputType:'native_question',questionForm}});
-    const input=JSON.stringify({answers:{[key]:['Other']},annotations:{[key]:{notes:'Custom  exact '+ 'x'.repeat(1100)}}});
-    const first=await submitVoiceTaskInput(task.taskId,input,{userId:'user-1'});
-    expect(first.confirmationPending).toBe(true);expect(provideInput.mock.calls[0][0].input).toBe(input);
+  test('native clarification input preserves exact JSON bytes and current form during ACK retry', async () => {
+    const key = 'Which  size?';
+    const questionForm = {
+      questions: [
+        {
+          key,
+          label: 'Which size?',
+          multiSelect: false,
+          options: [{ value: 'Other', label: 'Other' }],
+        },
+      ],
+    };
+    const task = createVoiceTask({
+      callSessionId: 'call-input',
+      userId: 'user-1',
+      streamId: 'mission-run',
+      owner: { kind: 'glasshive_run', id: 'run-1' },
+    });
+    const provideInput = jest
+      .fn()
+      .mockResolvedValueOnce({ accepted: false, confirmationPending: true })
+      .mockResolvedValueOnce({ accepted: true });
+    registerVoiceTaskOwnerAdapter(task.taskId, {
+      kind: 'glasshive_run',
+      provideInput,
+      nativeMissionInputBinding: {
+        version: 1,
+        requestId: 'question-1',
+        requestFingerprint: 'a'.repeat(64),
+        runId: 'run-1',
+        attemptId: 'attempt-1',
+        sessionId: 'session-1',
+        expiresAt: '2099-01-01T00:00:00Z',
+        workRef: 'work-1',
+        taskId: task.taskId,
+        userId: 'user-1',
+        callSessionId: 'call-input',
+        inputKind: 'question',
+        questionForm,
+      },
+    });
+    observeGenerationEvent(task.taskId, {
+      event: 'needs_input',
+      data: { prompt: 'Choose size.', inputType: 'native_question', questionForm },
+    });
+    const input = JSON.stringify({
+      answers: { [key]: ['Other'] },
+      annotations: { [key]: { notes: 'Custom  exact ' + 'x'.repeat(1100) } },
+    });
+    const first = await submitVoiceTaskInput(task.taskId, input, { userId: 'user-1' });
+    expect(first.confirmationPending).toBe(true);
+    expect(provideInput.mock.calls[0][0].input).toBe(input);
     expect(snapshotEvent(task.taskId).needsInput.questionForm).toEqual(questionForm);
-    expect((await submitVoiceTaskInput(task.taskId,input+' ',{userId:'user-1'})).code).toBe('input_confirmation_pending');
-    const second=await submitVoiceTaskInput(task.taskId,input,{userId:'user-1'});expect(second.ok).toBe(true);
-    expect(provideInput.mock.calls[1][0].input).toBe(input);expect(provideInput.mock.calls[1][0].operationId).toBe(provideInput.mock.calls[0][0].operationId);
+    expect((await submitVoiceTaskInput(task.taskId, input + ' ', { userId: 'user-1' })).code).toBe(
+      'input_confirmation_pending',
+    );
+    const second = await submitVoiceTaskInput(task.taskId, input, { userId: 'user-1' });
+    expect(second.ok).toBe(true);
+    expect(provideInput.mock.calls[1][0].input).toBe(input);
+    expect(provideInput.mock.calls[1][0].operationId).toBe(
+      provideInput.mock.calls[0][0].operationId,
+    );
   });
 
   test('native pending ACK retains one operation and permits only its exact choice retry', async () => {
@@ -2564,27 +2613,72 @@ describe('Worker delivery presentation ownership', () => {
       ...overrides,
     });
   }
-  test.each(['busy', 'completed', 'moved-on'])('native question presentation survives Main %s without owning worker consent', (state) => {
-    const main = state === 'busy' ? createVoiceTask({...scope, conversationId: 'conversation-one',
-      streamId: 'main-one', owner: {kind: 'remote_generation', id: 'main-one'}}) : parent('run-one', 'main-one');
-    if (state === 'busy') createVoiceTask({...scope, conversationId: 'conversation-one',
-      streamId: 'glasshive:run-one', owner: {kind: 'glasshive_run', id: 'run-one'}, parentTaskId: main.taskId});
-    if (state === 'moved-on') parent('run-two', 'main-two');
-    const child = getVoiceTaskByStreamId('glasshive:run-one');
-    registerVoiceTaskOwnerAdapter(child.taskId, {kind: 'glasshive_run', provideInput: jest.fn()});
-    observeGenerationEvent(child.taskId, {event: 'needs_input', data: {
-      prompt: 'Permit this operation?', inputType: 'choice', choices: [{value: 'allow_once', label: 'Allow once'}]}});
-    const d = delivery({status: 'pending', claimId: '', event: 'run.needs_input', text: 'Permit this operation?',
-      callbackId: 'callback_sha256:' + 'a'.repeat(64), originRef: 'origin-one', workRef: 'work-one', workerId: 'worker-one',
-      nativeInputBinding: {version: 1, requestId: 'request-one', requestFingerprint: 'b'.repeat(64),
-        runId: 'run-one', attemptId: 'attempt-one', sessionId: 'session-one', expiresAt: '2099-01-01T00:00:00.000Z'}});
-    const question = registerVoiceTaskDeliveryPresentation(d, scope);
-    expect(question).toMatchObject({state: 'completed', owner: {kind: 'glasshive_delivery', id: d.deliveryId}});
-    expect(getVoiceTask(child.taskId).state).toBe('needs_input');
-    expect(snapshotEvent(child.taskId).needsInput.choices).toEqual([{value: 'allow_once', label: 'Allow once'}]);
-    expect(registerVoiceTaskDeliveryPresentation(d, scope).taskId).toBe(question.taskId);
-    expect(snapshotEvent(question.taskId).source.id).toBe(d.callbackId);
-  });
+  test.each(['busy', 'completed', 'moved-on'])(
+    'native question presentation survives Main %s without owning worker consent',
+    (state) => {
+      const main =
+        state === 'busy'
+          ? createVoiceTask({
+              ...scope,
+              conversationId: 'conversation-one',
+              streamId: 'main-one',
+              owner: { kind: 'remote_generation', id: 'main-one' },
+            })
+          : parent('run-one', 'main-one');
+      if (state === 'busy')
+        createVoiceTask({
+          ...scope,
+          conversationId: 'conversation-one',
+          streamId: 'glasshive:run-one',
+          owner: { kind: 'glasshive_run', id: 'run-one' },
+          parentTaskId: main.taskId,
+        });
+      if (state === 'moved-on') parent('run-two', 'main-two');
+      const child = getVoiceTaskByStreamId('glasshive:run-one');
+      registerVoiceTaskOwnerAdapter(child.taskId, {
+        kind: 'glasshive_run',
+        provideInput: jest.fn(),
+      });
+      observeGenerationEvent(child.taskId, {
+        event: 'needs_input',
+        data: {
+          prompt: 'Permit this operation?',
+          inputType: 'choice',
+          choices: [{ value: 'allow_once', label: 'Allow once' }],
+        },
+      });
+      const d = delivery({
+        status: 'pending',
+        claimId: '',
+        event: 'run.needs_input',
+        text: 'Permit this operation?',
+        callbackId: 'callback_sha256:' + 'a'.repeat(64),
+        originRef: 'origin-one',
+        workRef: 'work-one',
+        workerId: 'worker-one',
+        nativeInputBinding: {
+          version: 1,
+          requestId: 'request-one',
+          requestFingerprint: 'b'.repeat(64),
+          runId: 'run-one',
+          attemptId: 'attempt-one',
+          sessionId: 'session-one',
+          expiresAt: '2099-01-01T00:00:00.000Z',
+        },
+      });
+      const question = registerVoiceTaskDeliveryPresentation(d, scope);
+      expect(question).toMatchObject({
+        state: 'completed',
+        owner: { kind: 'glasshive_delivery', id: d.deliveryId },
+      });
+      expect(getVoiceTask(child.taskId).state).toBe('needs_input');
+      expect(snapshotEvent(child.taskId).needsInput.choices).toEqual([
+        { value: 'allow_once', label: 'Allow once' },
+      ]);
+      expect(registerVoiceTaskDeliveryPresentation(d, scope).taskId).toBe(question.taskId);
+      expect(snapshotEvent(question.taskId).source.id).toBe(d.callbackId);
+    },
+  );
   test('pending Main delivery publishes one durable typed discovery snapshot before claim', () => {
     const d = pendingDelivery();
     const events = [];
@@ -2764,20 +2858,61 @@ describe('Worker delivery presentation ownership', () => {
 
 describe('native permission operation detail', () => {
   beforeEach(() => resetVoiceTasksForTests());
-  const request={version:1,kind:'permission',requestId:'permission-detail',requestFingerprint:'a'.repeat(64),runId:'run-detail',attemptId:'attempt-detail',expiresAt:'2099-01-01T00:00:00.000Z'};
-  const offered={prompt:'May I create the requested file? Allow once or Deny.',inputType:'choice',choices:[{value:'allow',label:'Allow once'},{value:'deny',label:'Deny'}],nativeInputRequest:request,operationTitle:'Create synthetic.txt in the working folder.'};
+  const request = {
+    version: 1,
+    kind: 'permission',
+    requestId: 'permission-detail',
+    requestFingerprint: 'a'.repeat(64),
+    runId: 'run-detail',
+    attemptId: 'attempt-detail',
+    expiresAt: '2099-01-01T00:00:00.000Z',
+  };
+  const offered = {
+    prompt: 'May I create the requested file? Allow once or Deny.',
+    inputType: 'choice',
+    choices: [
+      { value: 'allow', label: 'Allow once' },
+      { value: 'deny', label: 'Deny' },
+    ],
+    nativeInputRequest: request,
+    operationTitle: 'Create synthetic.txt in the working folder.',
+  };
   test('retains current exact detail without replacing the spoken prompt or granting permission', () => {
-    const task=createVoiceTask({callSessionId:'call-detail',userId:'owner-detail',owner:{kind:'generation_job',id:'stream-detail'}});
-    registerVoiceTaskOwnerAdapter(task.taskId,{kind:'generation_job',provideInput:jest.fn()});
-    observeGenerationEvent(task.taskId,{event:'needs_input',data:offered});
+    const task = createVoiceTask({
+      callSessionId: 'call-detail',
+      userId: 'owner-detail',
+      owner: { kind: 'generation_job', id: 'stream-detail' },
+    });
+    registerVoiceTaskOwnerAdapter(task.taskId, { kind: 'generation_job', provideInput: jest.fn() });
+    observeGenerationEvent(task.taskId, { event: 'needs_input', data: offered });
     expect(snapshotEvent(task.taskId).needsInput).toEqual(offered);
-    observeGenerationEvent(task.taskId,{event:'needs_input',data:{...offered,operationTitle:'Read synthetic.txt',nativeInputRequest:{...request,requestFingerprint:'b'.repeat(64)}}});
-    expect(snapshotEvent(task.taskId).needsInput).toMatchObject({prompt:offered.prompt,operationTitle:'Read synthetic.txt',nativeInputRequest:{requestFingerprint:'b'.repeat(64)}});
+    observeGenerationEvent(task.taskId, {
+      event: 'needs_input',
+      data: {
+        ...offered,
+        operationTitle: 'Read synthetic.txt',
+        nativeInputRequest: { ...request, requestFingerprint: 'b'.repeat(64) },
+      },
+    });
+    expect(snapshotEvent(task.taskId).needsInput).toMatchObject({
+      prompt: offered.prompt,
+      operationTitle: 'Read synthetic.txt',
+      nativeInputRequest: { requestFingerprint: 'b'.repeat(64) },
+    });
   });
-  test.each([['oversized',{operationTitle:'x'.repeat(8001)}],['wrong type',{operationTitle:42}],['no native binding',{nativeInputRequest:undefined}],['question binding',{nativeInputRequest:{...request,kind:'question'}}]])('rejects %s operation detail', (_label, change) => {
-    const task=createVoiceTask({callSessionId:'call-detail',userId:'owner-detail',owner:{kind:'generation_job',id:'stream-detail'}});
-    registerVoiceTaskOwnerAdapter(task.taskId,{kind:'generation_job',provideInput:jest.fn()});
-    observeGenerationEvent(task.taskId,{event:'needs_input',data:{...offered,...change}});
+  test.each([
+    ['oversized', { operationTitle: 'x'.repeat(8001) }],
+    ['wrong type', { operationTitle: 42 }],
+    ['no native binding', { nativeInputRequest: undefined }],
+    ['question binding', { nativeInputRequest: { ...request, kind: 'question' } }],
+  ])('rejects %s operation detail', (_label, change) => {
+    const task = createVoiceTask({
+      callSessionId: 'call-detail',
+      userId: 'owner-detail',
+      owner: { kind: 'generation_job', id: 'stream-detail' },
+    });
+    registerVoiceTaskOwnerAdapter(task.taskId, { kind: 'generation_job', provideInput: jest.fn() });
+    observeGenerationEvent(task.taskId, { event: 'needs_input', data: { ...offered, ...change } });
     expect(snapshotEvent(task.taskId).needsInput).toBeUndefined();
   });
 });

@@ -11,7 +11,9 @@ let mockGetMessage;
 let mockGetMessages;
 let mockGetConvo;
 let mockResolveTelegramMappingByUserId;
-let mockResolveUserVoiceRoute = jest.fn().mockResolvedValue({ tts: {provider: 'xai', variant: 'Eve', source: 'saved'} });
+let mockResolveUserVoiceRoute = jest
+  .fn()
+  .mockResolvedValue({ tts: { provider: 'xai', variant: 'Eve', source: 'saved' } });
 let mockGetAgent;
 let mockGetJob;
 let mockGetActiveStreamIdForConversation;
@@ -539,7 +541,7 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
     expect(res.statusCode).toBe(200);
     expect(mockResolveUserVoiceRoute).toHaveBeenCalledWith('user_1', { includeSources: true });
     expect(res.body).toEqual({
-      voiceRoute: { tts: {provider: 'xai', variant: 'Eve', source: 'saved'} },
+      voiceRoute: { tts: { provider: 'xai', variant: 'Eve', source: 'saved' } },
       telegram_user_id: 'tg-1',
       telegram_chat_id: 'tg-1',
       linked: true,
@@ -554,7 +556,8 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
     mockResolveUserVoiceRoute.mockRejectedValueOnce(new Error('synthetic unavailable'));
     const schedulerRouter = require('../scheduler');
     const app = createTestApp(schedulerRouter);
-    const req = createMockReq({ url: '/api/viventium/scheduler/telegram/resolve',
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/telegram/resolve',
       headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
       body: { userId: 'user_1', voiceRoute: { tts: { provider: 'untrusted' } } },
     });
@@ -567,13 +570,17 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
     expect(res.body.telegram_user_id).toBe('tg-1');
     expect(res.body.telegram_chat_id).toBe('tg-1');
     expect(res.body.linked).toBe(true);
-    expect(res.body.voice_preferences).toEqual({ always_voice_response: false, voice_responses_enabled: true });
+    expect(res.body.voice_preferences).toEqual({
+      always_voice_response: false,
+      voice_responses_enabled: true,
+    });
   });
 
   test('address-only status resolution does not require Speaking even without a cached identity', async () => {
     const schedulerRouter = require('../scheduler');
     const app = createTestApp(schedulerRouter);
-    const req = createMockReq({ url: '/api/viventium/scheduler/telegram/resolve',
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/telegram/resolve',
       headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
       body: { userId: 'user_1', resolveVoice: false },
     });
@@ -1194,38 +1201,70 @@ describe('/api/viventium/scheduler/chat', () => {
     );
   });
 
-  test.each(['rejected', 'pending'])('retracts the exact provisional message when child release is %s', async state => {
-    if (state === 'pending') jest.useFakeTimers();
-    mockAbortJob.mockImplementationOnce(() => state === 'pending' ? new Promise(() => {}) :
-      Promise.reject(new Error('main_compaction_native_release_unconfirmed')));
-    mockGetJob.mockResolvedValueOnce({ status: 'running', metadata: { userId: 'user_1',
-      responseMessageId: 'unconfirmed-placeholder', conversationId: 'conversation-scheduled',
-      interactionContext: { actor_kind: 'system', origin: 'scheduler', surface: 'workbench' } } });
-    try {
-      const app = createTestApp(require('../scheduler')); const res = createMockRes();
-      const operation = dispatch(app, createMockReq({
-        url: '/api/viventium/scheduler/stream/stream-timeout/cancel',
-        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
-        body: { userId: 'user_1', reason: 'stream_timeout' } }), res);
-      if (state === 'pending') {
-        await jest.advanceTimersByTimeAsync(8_000);
-        expect(res.body).toMatchObject({ reason: 'release_unconfirmed' });
+  test.each(['rejected', 'pending'])(
+    'retracts the exact provisional message when child release is %s',
+    async (state) => {
+      if (state === 'pending') jest.useFakeTimers();
+      mockAbortJob.mockImplementationOnce(() =>
+        state === 'pending'
+          ? new Promise(() => {})
+          : Promise.reject(new Error('main_compaction_native_release_unconfirmed')),
+      );
+      mockGetJob.mockResolvedValueOnce({
+        status: 'running',
+        metadata: {
+          userId: 'user_1',
+          responseMessageId: 'unconfirmed-placeholder',
+          conversationId: 'conversation-scheduled',
+          interactionContext: { actor_kind: 'system', origin: 'scheduler', surface: 'workbench' },
+        },
+      });
+      try {
+        const app = createTestApp(require('../scheduler'));
+        const res = createMockRes();
+        const operation = dispatch(
+          app,
+          createMockReq({
+            url: '/api/viventium/scheduler/stream/stream-timeout/cancel',
+            headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+            body: { userId: 'user_1', reason: 'stream_timeout' },
+          }),
+          res,
+        );
+        if (state === 'pending') {
+          await jest.advanceTimersByTimeAsync(8_000);
+          expect(res.body).toMatchObject({ reason: 'release_unconfirmed' });
+        }
+        await operation;
+        expect(res.statusCode).toBe(202);
+        expect(res.body).toEqual({
+          success: false,
+          cancelled: 'stream-timeout',
+          reason: 'release_unconfirmed',
+          capacityReleased: false,
+        });
+        expect(mockAbortJob).toHaveBeenCalledWith('stream-timeout', 'user_cancelled', 'user_1');
+        expect(mockDeleteSchedulerPlaceholder).toHaveBeenCalledWith(
+          expect.objectContaining({
+            user: 'user_1',
+            messageId: 'unconfirmed-placeholder',
+            unfinished: true,
+            'metadata.viventium.interactionContext.actor_kind': 'system',
+            'metadata.viventium.interactionContext.origin': 'scheduler',
+          }),
+        );
+        expect(mockUpdateSchedulerConversation).toHaveBeenCalledWith(
+          { user: 'user_1', conversationId: 'conversation-scheduled' },
+          expect.any(Object),
+        );
+      } finally {
+        if (state === 'pending') {
+          await jest.advanceTimersByTimeAsync(2_000);
+          jest.useRealTimers();
+        }
       }
-      await operation;
-      expect(res.statusCode).toBe(202);
-      expect(res.body).toEqual({ success: false, cancelled: 'stream-timeout',
-        reason: 'release_unconfirmed', capacityReleased: false });
-      expect(mockAbortJob).toHaveBeenCalledWith('stream-timeout', 'user_cancelled', 'user_1');
-      expect(mockDeleteSchedulerPlaceholder).toHaveBeenCalledWith(expect.objectContaining({
-        user: 'user_1', messageId: 'unconfirmed-placeholder', unfinished: true,
-        'metadata.viventium.interactionContext.actor_kind': 'system',
-        'metadata.viventium.interactionContext.origin': 'scheduler' }));
-      expect(mockUpdateSchedulerConversation).toHaveBeenCalledWith(
-        { user: 'user_1', conversationId: 'conversation-scheduled' }, expect.any(Object));
-    } finally { if (state === 'pending') {
-      await jest.advanceTimersByTimeAsync(2_000); jest.useRealTimers();
-    } }
-  });
+    },
+  );
 
   test('does not let scheduler credentials cancel an interactive stream', async () => {
     mockGetJob.mockResolvedValueOnce({
@@ -1289,22 +1328,49 @@ describe('/api/viventium/scheduler/chat', () => {
     const app = createTestApp(require('../scheduler'));
     const deadline = new Date(Date.now() + 600000).toISOString();
     const res = createMockRes();
-    await dispatch(app, createMockReq({ url: '/api/viventium/scheduler/chat',
-      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
-      body: { userId: 'user_1', text: 'Synthetic scheduled check', conversationId: 'new',
-        agentId: 'agent_test', authoringDeadlineAt: deadline } }), res);
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/chat',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body: {
+          userId: 'user_1',
+          text: 'Synthetic scheduled check',
+          conversationId: 'new',
+          agentId: 'agent_test',
+          authoringDeadlineAt: deadline,
+        },
+      }),
+      res,
+    );
     expect(res.statusCode).toBe(200);
     expect(lastSchedulerRequest.viventiumSchedulerAuthoringDeadlineAt).toBe(deadline);
     expect(lastSchedulerRequest.body).not.toHaveProperty('authoringDeadlineAt');
   });
-  test.each(['invalid', new Date(0).toISOString()])('rejects an invalid or elapsed authoring deadline: %s', async deadline => {
-    const app = createTestApp(require('../scheduler')); const res = createMockRes();
-    await dispatch(app, createMockReq({ url: '/api/viventium/scheduler/chat',
-      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
-      body: { userId: 'user_1', text: 'Synthetic scheduled check', conversationId: 'new',
-        agentId: 'agent_test', authoringDeadlineAt: deadline } }), res);
-    expect(res.statusCode).toBe(400); expect(agentControllerCalls).toBe(0);
-  });
+  test.each(['invalid', new Date(0).toISOString()])(
+    'rejects an invalid or elapsed authoring deadline: %s',
+    async (deadline) => {
+      const app = createTestApp(require('../scheduler'));
+      const res = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/scheduler/chat',
+          headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+          body: {
+            userId: 'user_1',
+            text: 'Synthetic scheduled check',
+            conversationId: 'new',
+            agentId: 'agent_test',
+            authoringDeadlineAt: deadline,
+          },
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(400);
+      expect(agentControllerCalls).toBe(0);
+    },
+  );
 
   test('authors a trusted noninteractive Workbench context and ignores forged privileged fields', async () => {
     const schedulerRouter = require('../scheduler');

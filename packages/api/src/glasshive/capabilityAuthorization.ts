@@ -1094,19 +1094,34 @@ function authorizationDateMs(value: unknown): number {
 
 /** Read a historical descriptor candidate; the native action digest alone owns receipt recovery. */
 export async function readCapabilityReauthorizationReceiptCandidate({
-  ownerId, workRef,
+  ownerId,
+  workRef,
 }: ReauthorizeInput = {}) {
   const normalizedOwner = String(ownerId || '').trim();
   const normalizedWork = String(workRef || '').trim();
-  if (!normalizedOwner || normalizedOwner.length > 192 || !SIMPLE_REF.test(normalizedWork)) return null;
+  if (!normalizedOwner || normalizedOwner.length > 192 || !SIMPLE_REF.test(normalizedWork))
+    return null;
   const record = await authorizationCollection().findOne({
-    ownerId: normalizedOwner, workRef: normalizedWork, status: 'active',
+    ownerId: normalizedOwner,
+    workRef: normalizedWork,
+    status: 'active',
   });
   const maximumMs = authorizationDateMs(record?.maxExpiresAt);
-  if (!record || !Number.isFinite(maximumMs) || !Number.isInteger(record.reauthorizationCount) ||
-      Number(record.reauthorizationCount) < 1 || !record.authorizationRef || !record.scopeFingerprint) return null;
-  return { version: 1, authorizationRef: record.authorizationRef,
-    maxExpiresAt: new Date(maximumMs).toISOString(), scopeFingerprint: record.scopeFingerprint };
+  if (
+    !record ||
+    !Number.isFinite(maximumMs) ||
+    !Number.isInteger(record.reauthorizationCount) ||
+    Number(record.reauthorizationCount) < 1 ||
+    !record.authorizationRef ||
+    !record.scopeFingerprint
+  )
+    return null;
+  return {
+    version: 1,
+    authorizationRef: record.authorizationRef,
+    maxExpiresAt: new Date(maximumMs).toISOString(),
+    scopeFingerprint: record.scopeFingerprint,
+  };
 }
 
 /**

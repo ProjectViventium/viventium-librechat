@@ -2203,7 +2203,9 @@ function preservePrimaryCompletionError(error, primaryError) {
     try {
       error.originalError = primaryError;
       if (error.originalError === primaryError) return error;
-    } catch {}
+    } catch {
+      // A frozen provider error needs the new wrapper below.
+    }
   }
   return Object.assign(new Error(getCompletionErrorMessage(error), { cause: error }), {
     originalError: primaryError,

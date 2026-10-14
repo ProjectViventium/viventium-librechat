@@ -76,17 +76,15 @@ function fixture(
     graph,
     calls,
     invoke: (cfg = config()) =>
-      graph
-        .createWorkflow()
-        .invoke(
-          {
-            messages: [
-              new HumanMessage({ id: 'user', content: 'Create and verify the requested file.' }),
-            ],
-            agentMessages: [],
-          },
-          cfg,
-        ),
+      graph.createWorkflow().invoke(
+        {
+          messages: [
+            new HumanMessage({ id: 'user', content: 'Create and verify the requested file.' }),
+          ],
+          agentMessages: [],
+        },
+        cfg,
+      ),
   };
 }
 const completedResult = (messages: any[], id = 'consult') =>
@@ -120,20 +118,38 @@ test('a native provider-limited hidden consult returns one attributed failed too
   const failure = Object.assign(new Error('PRIVATE PROVIDER DETAIL'), {
     error: { type: 'rate_limit_error', code: 'rate_limit_exceeded' },
   });
-  const t = fixture([() => transfer('consult', 'specialist'), () => { throw failure; },
+  const t = fixture([
+    () => transfer('consult', 'specialist'),
+    () => {
+      throw failure;
+    },
     (messages) => {
       const result = completedResult(messages);
       expect(result.status).toBe('error');
       expect(result.tool_call_id).toBe('consult');
       expect(result.additional_kwargs.handoff_source_agent_id).toBe('main');
       expect(result.additional_kwargs.handoff_destination).toBe('specialist');
-      expect(result.additional_kwargs.handoff_failure).toEqual({ version: 1, code: 'provider_rate_limited' });
-      expect(JSON.parse(result.content)).toEqual({ status: 'failed', error: { code: 'provider_rate_limited' } });
+      expect(result.additional_kwargs.handoff_failure).toEqual({
+        version: 1,
+        code: 'provider_rate_limited',
+      });
+      expect(JSON.parse(result.content)).toEqual({
+        status: 'failed',
+        error: { code: 'provider_rate_limited' },
+      });
       expect(JSON.stringify(messages)).not.toContain('PRIVATE PROVIDER DETAIL');
-      expect(messages.filter((entry) => isToolMessage(entry) && entry.tool_call_id === 'consult')).toHaveLength(1);
-      expect(messages.some((entry) => entry.getType() === 'ai' && entry.id !== 'consult-ai')).toBe(false);
-      return terminal('main-final', 'The consult is unavailable; the authorized work can continue.');
-    }]);
+      expect(
+        messages.filter((entry) => isToolMessage(entry) && entry.tool_call_id === 'consult'),
+      ).toHaveLength(1);
+      expect(messages.some((entry) => entry.getType() === 'ai' && entry.id !== 'consult-ai')).toBe(
+        false,
+      );
+      return terminal(
+        'main-final',
+        'The consult is unavailable; the authorized work can continue.',
+      );
+    },
+  ]);
   expect((await t.invoke()).messages.at(-1).id).toBe('main-final');
   expect(t.calls).toHaveLength(3);
 });
@@ -142,37 +158,74 @@ test.each([
   ['visible child', { visible_agent_ids: ['main', 'specialist'] }, undefined],
   ['presentation disabled', { hide_sequential_outputs: false }, undefined],
   ['no return edge', {}, [{ from: 'main', to: 'specialist', edgeType: 'handoff' }]],
-  ['conditional return', {}, [{ from: 'main', to: 'specialist', edgeType: 'handoff' },
-    { from: 'specialist', to: 'main', edgeType: 'handoff', condition: () => false }]],
+  [
+    'conditional return',
+    {},
+    [
+      { from: 'main', to: 'specialist', edgeType: 'handoff' },
+      { from: 'specialist', to: 'main', edgeType: 'handoff', condition: () => false },
+    ],
+  ],
 ])('provider failure still rejects with %s', async (_name, overrides, edges) => {
   const error = Object.assign(new Error('provider failure'), { code: 'rate_limit_exceeded' });
-  const t = fixture([() => transfer('consult', 'specialist'), () => { throw error; }], edges);
+  const t = fixture(
+    [
+      () => transfer('consult', 'specialist'),
+      () => {
+        throw error;
+      },
+    ],
+    edges,
+  );
   await expect(t.invoke(config('run-one', overrides))).rejects.toBe(error);
   expect(t.calls).toHaveLength(2);
 });
 
 test.each(['tool_failure', 'provider_access_denied', 'native_input_declined', 'unknown_failure'])(
-  'does not convert %s to a provider result', async (code) => {
+  'does not convert %s to a provider result',
+  async (code) => {
     const error = Object.assign(new Error('failure'), { code });
-    const t = fixture([() => transfer('consult', 'specialist'), () => { throw error; }]);
+    const t = fixture([
+      () => transfer('consult', 'specialist'),
+      () => {
+        throw error;
+      },
+    ]);
     await expect(t.invoke()).rejects.toBe(error);
   },
 );
 
 test('a primary provider failure has no accepted consult and still rejects', async () => {
   const error = Object.assign(new Error('provider failure'), { code: 'rate_limit_exceeded' });
-  await expect(fixture([() => { throw error; }]).invoke()).rejects.toBe(error);
+  await expect(
+    fixture([
+      () => {
+        throw error;
+      },
+    ]).invoke(),
+  ).rejects.toBe(error);
 });
 
 test('a real installed tool node with provider-shaped failure still rejects', async () => {
   const error = Object.assign(new Error('tool provider failure'), { code: 'rate_limit_exceeded' });
-  const t = fixture([() => transfer('consult', 'specialist'), () => new AIMessageChunk({
-    id: 'tool-ai', content: '', tool_call_chunks: [{ id: 'read', name: 'read_file', args: '{}',
-      index: 0, type: 'tool_call_chunk' }],
-  })]);
+  const t = fixture([
+    () => transfer('consult', 'specialist'),
+    () =>
+      new AIMessageChunk({
+        id: 'tool-ai',
+        content: '',
+        tool_call_chunks: [
+          { id: 'read', name: 'read_file', args: '{}', index: 0, type: 'tool_call_chunk' },
+        ],
+      }),
+  ]);
   const initializeTools = t.graph.initializeTools.bind(t.graph);
-  t.graph.initializeTools = (options: { agentContext: unknown }) => options.agentContext === t.graph.agentContexts.get('specialist')
-    ? async () => { throw error; } : initializeTools(options);
+  t.graph.initializeTools = (options: { agentContext: unknown }) =>
+    options.agentContext === t.graph.agentContexts.get('specialist')
+      ? async () => {
+          throw error;
+        }
+      : initializeTools(options);
   await expect(t.invoke()).rejects.toBe(error);
   expect(t.calls).toHaveLength(2);
 });
@@ -180,93 +233,204 @@ test('a real installed tool node with provider-shaped failure still rejects', as
 test('an aborted provider attempt preserves cancellation instead of returning to Main', async () => {
   const controller = new AbortController();
   const error = Object.assign(new Error('provider failure'), { code: 'rate_limit_exceeded' });
-  const t = fixture([() => transfer('consult', 'specialist'), () => { controller.abort(); throw error; }]);
+  const t = fixture([
+    () => transfer('consult', 'specialist'),
+    () => {
+      controller.abort();
+      throw error;
+    },
+  ]);
   await expect(t.invoke({ ...config(), signal: controller.signal })).rejects.toThrow();
   expect(t.calls).toHaveLength(2);
 });
 
 test('input-bearing failed consult preserves the original human and exact failed pair', async () => {
-  const error = Object.assign(new Error('limited'), { error: { type: 'rate_limit_error', code: 'rate_limit_exceeded' } });
-  const t = fixture([() => transfer('consult', 'specialist', '', { instructions: 'Check the artifact.' }),
-    () => { throw error; }, (messages) => {
-      expect(completedResult(messages).status).toBe('error');
-      expect(completedResult(messages).tool_call_id).toBe('consult');
-      return terminal('main-final', 'The provider is unavailable.');
-    }], [{ from: 'main', to: 'specialist', edgeType: 'handoff', prompt: 'Check the artifact.' },
-      { from: 'specialist', to: 'main', edgeType: 'handoff' }]);
+  const error = Object.assign(new Error('limited'), {
+    error: { type: 'rate_limit_error', code: 'rate_limit_exceeded' },
+  });
+  const t = fixture(
+    [
+      () => transfer('consult', 'specialist', '', { instructions: 'Check the artifact.' }),
+      () => {
+        throw error;
+      },
+      (messages) => {
+        expect(completedResult(messages).status).toBe('error');
+        expect(completedResult(messages).tool_call_id).toBe('consult');
+        return terminal('main-final', 'The provider is unavailable.');
+      },
+    ],
+    [
+      { from: 'main', to: 'specialist', edgeType: 'handoff', prompt: 'Check the artifact.' },
+      { from: 'specialist', to: 'main', edgeType: 'handoff' },
+    ],
+  );
   expect((await t.invoke()).messages.at(-1).id).toBe('main-final');
   expect(t.calls).toHaveLength(3);
 });
 
 test('a consumed provider error object does not authorize a later tool-node failure', async () => {
   const error = Object.assign(new Error('reused'), { code: 'rate_limit_exceeded' });
-  const t = fixture([() => transfer('first-consult', 'specialist'), () => { throw error; },
-    (messages) => { expect(completedResult(messages, 'first-consult').status).toBe('error');
-      return transfer('second-consult', 'specialist'); },
-    () => new AIMessageChunk({ id: 'second-tool-ai', content: '', tool_call_chunks: [
-      { id: 'read', name: 'read_file', args: '{}', index: 0, type: 'tool_call_chunk' },
-    ] })]);
+  const t = fixture([
+    () => transfer('first-consult', 'specialist'),
+    () => {
+      throw error;
+    },
+    (messages) => {
+      expect(completedResult(messages, 'first-consult').status).toBe('error');
+      return transfer('second-consult', 'specialist');
+    },
+    () =>
+      new AIMessageChunk({
+        id: 'second-tool-ai',
+        content: '',
+        tool_call_chunks: [
+          { id: 'read', name: 'read_file', args: '{}', index: 0, type: 'tool_call_chunk' },
+        ],
+      }),
+  ]);
   const initializeTools = t.graph.initializeTools.bind(t.graph);
-  t.graph.initializeTools = (options: { agentContext: unknown }) => options.agentContext === t.graph.agentContexts.get('specialist')
-    ? async () => { throw error; } : initializeTools(options);
+  t.graph.initializeTools = (options: { agentContext: unknown }) =>
+    options.agentContext === t.graph.agentContexts.get('specialist')
+      ? async () => {
+          throw error;
+        }
+      : initializeTools(options);
   await expect(t.invoke()).rejects.toBe(error);
   expect(t.calls).toHaveLength(4);
 });
 
 test('an old failed await cannot delete a replacement consult in the same graph scope', async () => {
-  let firstEntered!: () => void; let secondEntered!: () => void;
-  const firstReady = new Promise<void>((resolve) => { firstEntered = resolve; });
-  const secondReady = new Promise<void>((resolve) => { secondEntered = resolve; });
-  let rejectFirst!: (error: Error) => void; let resolveSecond!: () => void;
-  const firstAttempt = new Promise<never>((_resolve, reject) => { rejectFirst = reject; });
-  const secondAttempt = new Promise<void>((resolve) => { resolveSecond = resolve; });
+  let firstEntered!: () => void;
+  let secondEntered!: () => void;
+  const firstReady = new Promise<void>((resolve) => {
+    firstEntered = resolve;
+  });
+  const secondReady = new Promise<void>((resolve) => {
+    secondEntered = resolve;
+  });
+  let rejectFirst!: (error: Error) => void;
+  let resolveSecond!: () => void;
+  const firstAttempt = new Promise<never>((_resolve, reject) => {
+    rejectFirst = reject;
+  });
+  const secondAttempt = new Promise<void>((resolve) => {
+    resolveSecond = resolve;
+  });
   const error = Object.assign(new Error('old provider attempt'), { code: 'rate_limit_exceeded' });
-  const t = fixture([]); let calls = 0;
-  t.graph.overrideModel = { async *stream(messages: BaseMessage[]) {
-    calls += 1;
-    if (calls === 1) { yield transfer('old-consult', 'specialist'); return; }
-    if (calls === 2) { firstEntered(); await firstAttempt; return; }
-    if (calls === 3) { yield transfer('new-consult', 'specialist'); return; }
-    if (calls === 4) { secondEntered(); await secondAttempt; yield terminal('child-final', 'New result.'); return; }
-    expect(completedResult(messages, 'new-consult').content).toBe('New result.');
-    yield terminal('main-final', 'Current result.');
-  } };
+  const t = fixture([]);
+  let calls = 0;
+  t.graph.overrideModel = {
+    async *stream(messages: BaseMessage[]) {
+      calls += 1;
+      if (calls === 1) {
+        yield transfer('old-consult', 'specialist');
+        return;
+      }
+      if (calls === 2) {
+        firstEntered();
+        await firstAttempt;
+        return;
+      }
+      if (calls === 3) {
+        yield transfer('new-consult', 'specialist');
+        return;
+      }
+      if (calls === 4) {
+        secondEntered();
+        await secondAttempt;
+        yield terminal('child-final', 'New result.');
+        return;
+      }
+      expect(completedResult(messages, 'new-consult').content).toBe('New result.');
+      yield terminal('main-final', 'Current result.');
+    },
+  };
   const workflow = t.graph.createWorkflow();
-  const input = () => ({ messages: [new HumanMessage({ id: 'user', content: 'Same scoped user.' })], agentMessages: [] });
+  const input = () => ({
+    messages: [new HumanMessage({ id: 'user', content: 'Same scoped user.' })],
+    agentMessages: [],
+  });
   const first = workflow.invoke(input(), config()).catch((failure: Error) => failure);
   await firstReady;
-  const second = workflow.invoke(input(), config()); await secondReady;
-  rejectFirst(error); expect(await first).toBe(error);
-  resolveSecond(); expect((await second).messages.at(-1).id).toBe('main-final');
+  const second = workflow.invoke(input(), config());
+  await secondReady;
+  rejectFirst(error);
+  expect(await first).toBe(error);
+  resolveSecond();
+  expect((await second).messages.at(-1).id).toBe('main-final');
   expect(calls).toBe(5);
 });
 
 test('a new user turn during a failed child await denies caller continuation', async () => {
   let childInput: { messages: BaseMessage[] };
   const error = Object.assign(new Error('limited'), { code: 'rate_limit_exceeded' });
-  const t = fixture([() => transfer('consult', 'specialist'), () => {
-    childInput.messages.push(new HumanMessage({ id: 'new-user', content: 'New objective.' }));
-    throw error;
-  }]);
+  const t = fixture([
+    () => transfer('consult', 'specialist'),
+    () => {
+      childInput.messages.push(new HumanMessage({ id: 'new-user', content: 'New objective.' }));
+      throw error;
+    },
+  ]);
   const workflow = t.graph.createWorkflow();
   const invoke = workflow.nodes.specialist.bound.invoke.bind(workflow.nodes.specialist.bound);
-  workflow.nodes.specialist.bound.invoke = (state: { messages: BaseMessage[] }, cfg: RunnableConfig) => { childInput = state; return invoke(state, cfg); };
-  await expect(workflow.invoke({ messages: [new HumanMessage({ id: 'user', content: 'Original objective.' })],
-    agentMessages: [] }, config())).rejects.toBe(error);
+  workflow.nodes.specialist.bound.invoke = (
+    state: { messages: BaseMessage[] },
+    cfg: RunnableConfig,
+  ) => {
+    childInput = state;
+    return invoke(state, cfg);
+  };
+  await expect(
+    workflow.invoke(
+      {
+        messages: [new HumanMessage({ id: 'user', content: 'Original objective.' })],
+        agentMessages: [],
+      },
+      config(),
+    ),
+  ).rejects.toBe(error);
   expect(t.calls).toHaveLength(2);
 });
 
 test('parallel consultant provider failure keeps the installed error path', async () => {
   const error = Object.assign(new Error('limited'), { code: 'rate_limit_exceeded' });
-  const t = fixture([() => new AIMessageChunk({ id: 'parallel-ai', content: '', tool_call_chunks: [
-    { id: 'call-a', name: 'lc_transfer_to_specialist', args: '{}', index: 0, type: 'tool_call_chunk' },
-    { id: 'call-b', name: 'lc_transfer_to_checker', args: '{}', index: 1, type: 'tool_call_chunk' },
-  ] }), () => { throw error; }, () => terminal('b-final', 'Second evidence.')], [
-    { from: 'main', to: 'specialist', edgeType: 'handoff' },
-    { from: 'specialist', to: 'main', edgeType: 'handoff' },
-    { from: 'main', to: 'checker', edgeType: 'handoff' },
-    { from: 'checker', to: 'main', edgeType: 'handoff' },
-  ], ['main', 'specialist', 'checker']);
+  const t = fixture(
+    [
+      () =>
+        new AIMessageChunk({
+          id: 'parallel-ai',
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call-a',
+              name: 'lc_transfer_to_specialist',
+              args: '{}',
+              index: 0,
+              type: 'tool_call_chunk',
+            },
+            {
+              id: 'call-b',
+              name: 'lc_transfer_to_checker',
+              args: '{}',
+              index: 1,
+              type: 'tool_call_chunk',
+            },
+          ],
+        }),
+      () => {
+        throw error;
+      },
+      () => terminal('b-final', 'Second evidence.'),
+    ],
+    [
+      { from: 'main', to: 'specialist', edgeType: 'handoff' },
+      { from: 'specialist', to: 'main', edgeType: 'handoff' },
+      { from: 'main', to: 'checker', edgeType: 'handoff' },
+      { from: 'checker', to: 'main', edgeType: 'handoff' },
+    ],
+    ['main', 'specialist', 'checker'],
+  );
   await expect(t.invoke()).rejects.toBe(error);
 });
 

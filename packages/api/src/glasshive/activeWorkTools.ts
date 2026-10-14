@@ -107,7 +107,13 @@ const controlSchema = z
   .object({
     workRef: workRefSchema.describe('Opaque workRef returned by active_work_list'),
     fileIds: z
-      .array(z.string().min(1).max(256).refine((id) => id.trim() === id && !!id.trim()))
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(256)
+          .refine((id) => id.trim() === id && !!id.trim()),
+      )
       .optional()
       .transform((ids) => (ids?.length ? ids : undefined)),
     action: z
@@ -118,11 +124,26 @@ const controlSchema = z
   })
   .strict()
   .superRefine((value, ctx) => {
-    if (value.nativeInput && (value.instruction || value.action !== 'resume' || value.nativeInput.action !== 'accept')) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['nativeInput'], message: 'nativeInput requires an exact pending response and Resume' });
+    if (
+      value.nativeInput &&
+      (value.instruction || value.action !== 'resume' || value.nativeInput.action !== 'accept')
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['nativeInput'],
+        message: 'nativeInput requires an exact pending response and Resume',
+      });
     }
-    if (value.fileIds && (!['steer', 'queue', 'message'].includes(value.action) || new Set(value.fileIds).size !== value.fileIds.length)) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['fileIds'], message: 'fileIds require exact unique follow-up file references' });
+    if (
+      value.fileIds &&
+      (!['steer', 'queue', 'message'].includes(value.action) ||
+        new Set(value.fileIds).size !== value.fileIds.length)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['fileIds'],
+        message: 'fileIds require exact unique follow-up file references',
+      });
     }
     if (['queue', 'message', 'steer'].includes(value.action) && !value.instruction) {
       ctx.addIssue({

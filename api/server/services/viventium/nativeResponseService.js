@@ -43,12 +43,22 @@ function projectNativeMessage(identity, response, message, purpose, candidate) {
     sanitizeVoiceSurfaceTextForDisplay,
   } = require('./voiceArtifactText');
   message = projectNativeToolEvidence(identity, response, message, candidate);
-  const projectMedia = (value) => renderGlassHiveNativeMediaAttachmentLinks(value,
-    message.attachments, { ownerId: identity.userId, messageId: identity.responseMessageId });
-  message = { ...message, text: typeof message.text === 'string' ? projectMedia(message.text) : message.text,
-    content: Array.isArray(message.content) ? message.content.map((part) =>
-      part?.type === 'text' && typeof part.text === 'string' ? { ...part, text: projectMedia(part.text) } : part)
-      : message.content };
+  const projectMedia = (value) =>
+    renderGlassHiveNativeMediaAttachmentLinks(value, message.attachments, {
+      ownerId: identity.userId,
+      messageId: identity.responseMessageId,
+    });
+  message = {
+    ...message,
+    text: typeof message.text === 'string' ? projectMedia(message.text) : message.text,
+    content: Array.isArray(message.content)
+      ? message.content.map((part) =>
+          part?.type === 'text' && typeof part.text === 'string'
+            ? { ...part, text: projectMedia(part.text) }
+            : part,
+        )
+      : message.content,
+  };
   const context = identity.deliveryContext;
   const req = {
     _viventiumDeliveryDispositionRequired:
@@ -73,17 +83,14 @@ function projectNativeMessage(identity, response, message, purpose, candidate) {
       ...value,
       content: value.content.map((part) => {
         if (part?.type !== 'text' || typeof part.text !== 'string') return part;
-        const ranges = inspectProviderDeliveryRanges(
-          response,
-          part.text,
-          (source) => {
-            const projected = projectMedia(source);
-            if (purpose !== 'transmit' && context?.surface === 'voice')
-              return sanitizeVoiceSurfaceTextForDisplay(projected);
-            return context?.surface === 'web'
-              ? sanitizeVoiceAssistantMessageForPersistence(req, { text: projected }).text : projected;
-          },
-        );
+        const ranges = inspectProviderDeliveryRanges(response, part.text, (source) => {
+          const projected = projectMedia(source);
+          if (purpose !== 'transmit' && context?.surface === 'voice')
+            return sanitizeVoiceSurfaceTextForDisplay(projected);
+          return context?.surface === 'web'
+            ? sanitizeVoiceAssistantMessageForPersistence(req, { text: projected }).text
+            : projected;
+        });
         return ranges === null ? part : { ...part, deliveryDispositionRanges: ranges };
       }),
     };
@@ -159,7 +166,11 @@ function getService() {
     db,
     projectMessage: projectNativeMessage,
     prepareAttachments: async (identity, response, candidate) => {
-      if (response.glasshive?.output_files == null && !collectGlassHiveNativeMediaReferences(candidate.text).length) return [];
+      if (
+        response.glasshive?.output_files == null &&
+        !collectGlassHiveNativeMediaReferences(candidate.text).length
+      )
+        return [];
       const user = await db.findUser({ _id: identity.userId });
       if (!user) throw new Error('native_response_owner_unavailable');
       const config = await require('~/server/services/Config').getAppConfig({ role: user.role });
@@ -551,11 +562,14 @@ async function markNativeResponseReplayStored(identity, mode) {
     // Canonical replay is committed. Wake the existing durable mission lane, including recovery.
     try {
       require('./GlassHiveMissionAdjudicationService').wakeGlassHiveMissionAdjudications({
-        ownerId: identity.userId, conversationId: identity.conversationId,
+        ownerId: identity.userId,
+        conversationId: identity.conversationId,
       });
     } catch {
       // The committed Main stays committed; existing durable reconciliation owns recovery.
-      require('@librechat/data-schemas').logger.warn('[NativeResponse] Mission wake remains pending');
+      require('@librechat/data-schemas').logger.warn(
+        '[NativeResponse] Mission wake remains pending',
+      );
     }
   }
   return settled;
@@ -639,7 +653,10 @@ async function persistNativeResponseCancellation(identity, snapshot, mode) {
       }
       if (stopped && mode !== 'augmentation') {
         return sanitizeMessageForTransmit(
-          preserveMainContextUpdate(sanitizeMessageForPersistence(row, { purpose: 'document' }), row),
+          preserveMainContextUpdate(
+            sanitizeMessageForPersistence(row, { purpose: 'document' }),
+            row,
+          ),
         );
       }
       const message = preserveMainContextUpdate(
@@ -664,7 +681,10 @@ async function persistNativeResponseCancellation(identity, snapshot, mode) {
           : await db.settleNativeResponse(identity, 'cancelled', message);
       return saved?.messageId
         ? sanitizeMessageForTransmit(
-            preserveMainContextUpdate(sanitizeMessageForPersistence(saved, { purpose: 'document' }), saved),
+            preserveMainContextUpdate(
+              sanitizeMessageForPersistence(saved, { purpose: 'document' }),
+              saved,
+            ),
           )
         : null;
     },
@@ -751,7 +771,13 @@ async function recoverNativeResponses() {
  * input courier. A native enqueue is not consumption; the mission ledger still owns synthesis.
  */
 async function offerMissionEvidenceToCurrentMain({
-  ownerId, conversationId, currentLeafMessageId, messages, mainAgentId, insights, onPending,
+  ownerId,
+  conversationId,
+  currentLeafMessageId,
+  messages,
+  mainAgentId,
+  insights,
+  onPending,
 }) {
   if (!ownerId || !conversationId || !currentLeafMessageId || !mainAgentId) return false;
   const byId = new Map((messages || []).map((message) => [message.messageId, message]));
@@ -766,22 +792,40 @@ async function offerMissionEvidenceToCurrentMain({
     const row = await require('~/models').getNativeResponse(ownerId, message.messageId);
     const identity = row?.nativeResponse;
     if (!identity || identity.agentId !== mainAgentId) continue;
-    if (row.deletedAt || row.isCreatedByUser !== false || String(row.user) !== ownerId ||
-        row.conversationId !== conversationId || row.messageId !== message.messageId ||
-        row.messageId !== identity.responseMessageId || row.parentMessageId !== identity.source?.messageId ||
-        identity.userId !== ownerId || identity.conversationId !== conversationId) return false;
-    if (!['pending', 'prepared', 'completed'].includes(identity.status) || identity.finalReplayStoredAt > 0)
+    if (
+      row.deletedAt ||
+      row.isCreatedByUser !== false ||
+      String(row.user) !== ownerId ||
+      row.conversationId !== conversationId ||
+      row.messageId !== message.messageId ||
+      row.messageId !== identity.responseMessageId ||
+      row.parentMessageId !== identity.source?.messageId ||
+      identity.userId !== ownerId ||
+      identity.conversationId !== conversationId
+    )
+      return false;
+    if (
+      !['pending', 'prepared', 'completed'].includes(identity.status) ||
+      identity.finalReplayStoredAt > 0
+    )
       return false;
     const store = GenerationJobManager.getJobStore();
     const current = async () => {
       const job = await store.getJob(identity.streamId);
-      if (!nativeJobMatches(job, identity) || job.status !== 'running' || job.generationCompleted ||
-          job.nativeResponseCancelled || !job.nativeResponse ||
-          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity) ||
-          !(await store.isCurrentLogicalTurn(identity.streamId))) return false;
+      if (
+        !nativeJobMatches(job, identity) ||
+        job.status !== 'running' ||
+        job.generationCompleted ||
+        job.nativeResponseCancelled ||
+        !job.nativeResponse ||
+        nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity) ||
+        !(await store.isCurrentLogicalTurn(identity.streamId))
+      )
+        return false;
       if (identity.sourceOrderScope && identity.sourceSequence != null) {
         const order = await GenerationJobManager.observeSourceOrder({
-          source_order_scope: identity.sourceOrderScope, source_sequence: identity.sourceSequence,
+          source_order_scope: identity.sourceOrderScope,
+          source_sequence: identity.sourceSequence,
         });
         if (order.stale || order.latest_source_sequence !== identity.sourceSequence) return false;
       }
@@ -790,27 +834,51 @@ async function offerMissionEvidenceToCurrentMain({
     if (!(await current())) return false;
     if (!(await require('~/models').nativeResponseSourceMatches(identity)))
       throw new Error('mission_current_main_source_unavailable');
-    await module.exports.deliverCompletedCortexBatchToRunningMain({
-      ownerId, conversationId, parentMessageId: identity.responseMessageId,
-      streamId: identity.streamId, insights,
-      context: JSON.stringify(insights?.some((insight) => insight.authority?.kind === 'durable_work_callback')
-        ? { accepted_work_evidence: insights } : { terminal_evidence: insights }),
-    }, current);
+    await module.exports.deliverCompletedCortexBatchToRunningMain(
+      {
+        ownerId,
+        conversationId,
+        parentMessageId: identity.responseMessageId,
+        streamId: identity.streamId,
+        insights,
+        context: JSON.stringify(
+          insights?.some((insight) => insight.authority?.kind === 'durable_work_callback')
+            ? { accepted_work_evidence: insights }
+            : { terminal_evidence: insights },
+        ),
+      },
+      current,
+    );
     // Completion can win during the native offer. Only the exact still-running author defers.
-    const refreshed = await require('~/models').getNativeResponse(ownerId, identity.responseMessageId);
-    if (!refreshed?.nativeResponse ||
-        nativeIdentityJson(refreshed.nativeResponse) !== nativeIdentityJson(identity)) return false;
-    if (['failed', 'cancelled'].includes(refreshed.nativeResponse.status) ||
-        refreshed.nativeResponse.finalReplayStoredAt > 0) return false;
+    const refreshed = await require('~/models').getNativeResponse(
+      ownerId,
+      identity.responseMessageId,
+    );
+    if (
+      !refreshed?.nativeResponse ||
+      nativeIdentityJson(refreshed.nativeResponse) !== nativeIdentityJson(identity)
+    )
+      return false;
+    if (
+      ['failed', 'cancelled'].includes(refreshed.nativeResponse.status) ||
+      refreshed.nativeResponse.finalReplayStoredAt > 0
+    )
+      return false;
     if (!(await current())) return false;
     // The replay wake may run while this mission claim is still processing. Capture a single
     // exact readiness recheck for after claim release; it does not poll or wait for Main.
     onPending?.(async () => {
-      const latest = await require('~/models').getNativeResponse(ownerId, identity.responseMessageId);
-      return !latest?.nativeResponse ||
+      const latest = await require('~/models').getNativeResponse(
+        ownerId,
+        identity.responseMessageId,
+      );
+      return (
+        !latest?.nativeResponse ||
         nativeIdentityJson(latest.nativeResponse) !== nativeIdentityJson(identity) ||
         !['pending', 'prepared', 'completed'].includes(latest.nativeResponse.status) ||
-        latest.nativeResponse.finalReplayStoredAt > 0 || !(await current());
+        latest.nativeResponse.finalReplayStoredAt > 0 ||
+        !(await current())
+      );
     });
     return true;
   }

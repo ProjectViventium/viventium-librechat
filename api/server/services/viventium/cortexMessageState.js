@@ -289,10 +289,14 @@ async function getFollowUpMessageForParent({ userId, conversationId, parentMessa
     messageId: lastFollowUp.messageId,
     text,
     ...(lastFollowUp?.metadata?.viventium?.deliveryDisposition
-      ? { deliveryDisposition: lastFollowUp.metadata.viventium.deliveryDisposition } : {}),
-    ...(Array.isArray(lastFollowUp.content) && lastFollowUp.content.some(
-      (part) => Object.prototype.hasOwnProperty.call(part || {}, 'deliveryDispositionRanges'),
-    ) ? { content: lastFollowUp.content } : {}),
+      ? { deliveryDisposition: lastFollowUp.metadata.viventium.deliveryDisposition }
+      : {}),
+    ...(Array.isArray(lastFollowUp.content) &&
+    lastFollowUp.content.some((part) =>
+      Object.prototype.hasOwnProperty.call(part || {}, 'deliveryDispositionRanges'),
+    )
+      ? { content: lastFollowUp.content }
+      : {}),
     ...(typeof lastFollowUp?.metadata?.viventium?.followUpSource === 'string'
       ? { followUpSource: lastFollowUp.metadata.viventium.followUpSource }
       : {}),

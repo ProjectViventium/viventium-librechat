@@ -720,7 +720,9 @@ export function createNativeCapacityFetch(
       init = { ...init, headers: init?.headers || input.headers, body: await input.clone().text() };
     }
     const transportSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-    const signals = [signal, transportSignal].filter((value): value is AbortSignal => Boolean(value));
+    const signals = [signal, transportSignal].filter((value): value is AbortSignal =>
+      Boolean(value),
+    );
     const dispatch = {
       ...init,
       signal: (

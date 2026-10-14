@@ -231,10 +231,14 @@ function registerGlassHiveVoiceTaskActionCapabilities({
             data: {
               eventId: body.callback_id,
               prompt: nativeInput.prompt,
-              ...(nativeInput.operationTitle !== undefined ? {operationTitle:nativeInput.operationTitle} : {}),
-              nativeInputRequest:nativeInput.nativeInputRequest,
+              ...(nativeInput.operationTitle !== undefined
+                ? { operationTitle: nativeInput.operationTitle }
+                : {}),
+              nativeInputRequest: nativeInput.nativeInputRequest,
               inputType: nativeInput.questionForm ? 'native_question' : 'choice',
-              ...(nativeInput.questionForm ? {questionForm:nativeInput.questionForm} : {choices:nativeInput.choices}),
+              ...(nativeInput.questionForm
+                ? { questionForm: nativeInput.questionForm }
+                : { choices: nativeInput.choices }),
             },
           });
         return { cancel: false, retry: false, input: true };

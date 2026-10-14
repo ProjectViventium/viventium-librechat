@@ -628,8 +628,10 @@ export async function buildGlassHiveNativeMediaContent(
   for (const insight of insights) {
     if (insight.runInput) {
       // Both accepted callback kinds carry bound input; media authority stays terminal-only below.
-      if (insight.authority?.kind !== 'durable_terminal_callback' &&
-          insight.authority?.kind !== 'durable_work_callback') {
+      if (
+        insight.authority?.kind !== 'durable_terminal_callback' &&
+        insight.authority?.kind !== 'durable_work_callback'
+      ) {
         throw mediaError('mission_input_authority_invalid');
       }
       const runInput = normalizeGlassHiveRunInput(insight.runInput, insight.authority.runId || '');

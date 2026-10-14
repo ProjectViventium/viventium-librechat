@@ -510,13 +510,27 @@ it('reads the actual merged SDK terminal range source without trusting concatena
     { start: 0, end: 6, disposition: modelDisposition('skip') },
     { start: 6, end: text.length, disposition: modelDisposition() },
   ];
-  const output = { additional_kwargs: { __raw_response: {
-    id: 'native-requestnative-request', object: 'chat.completion.chunk', choices: [{
-      delta: { provider_specific_fields: { viventium: {
-        delivery_range_text: text, deliveryDispositionRanges: ranges,
-      } } }, finish_reason: 'stop',
-    }],
-  } } };
+  const output = {
+    additional_kwargs: {
+      __raw_response: {
+        id: 'native-requestnative-request',
+        object: 'chat.completion.chunk',
+        choices: [
+          {
+            delta: {
+              provider_specific_fields: {
+                viventium: {
+                  delivery_range_text: text,
+                  deliveryDispositionRanges: ranges,
+                },
+              },
+            },
+            finish_reason: 'stop',
+          },
+        ],
+      },
+    },
+  };
   expect(inspectProviderDeliveryRanges(output, text)).toEqual(ranges);
   expect(inspectProviderDeliveryRanges(output, 'changed')).toEqual([]);
 });

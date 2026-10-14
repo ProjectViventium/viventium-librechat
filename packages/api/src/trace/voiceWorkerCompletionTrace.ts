@@ -27,8 +27,17 @@ const BINDING_KEYS = new Set([
   'resultRevision',
   'effectGeneration',
 ]);
-const ATTENTION_KEYS = new Set(['kind', 'originRef', 'workRef', 'workerId', 'runId',
-  'callbackRef', 'event', 'workTerminal', 'evidenceId']);
+const ATTENTION_KEYS = new Set([
+  'kind',
+  'originRef',
+  'workRef',
+  'workerId',
+  'runId',
+  'callbackRef',
+  'event',
+  'workTerminal',
+  'evidenceId',
+]);
 const PRESENTATION_KEYS = new Set([
   'version',
   'presentationRef',
@@ -67,7 +76,8 @@ export interface VoiceWorkerAttentionBindingV1 {
   workTerminal: false;
   evidenceId: string;
 }
-export type VoiceWorkerPresentationBindingV1 = VoiceWorkerCompletionBindingV1 | VoiceWorkerAttentionBindingV1;
+export type VoiceWorkerPresentationBindingV1 =
+  VoiceWorkerCompletionBindingV1 | VoiceWorkerAttentionBindingV1;
 
 export interface VoiceWorkerCompletionPresentationV1 {
   version: 1;
@@ -112,19 +122,30 @@ function exactKeys(value: object, keys: Set<string>): boolean {
   return actual.length === keys.size && actual.every((key) => keys.has(key));
 }
 
-function canonicalBinding(value: VoiceWorkerPresentationBindingV1): VoiceWorkerPresentationBindingV1 {
+function canonicalBinding(
+  value: VoiceWorkerPresentationBindingV1,
+): VoiceWorkerPresentationBindingV1 {
   if (value && 'kind' in value && value.kind === 'nonterminal_attention') {
-    if (!exactKeys(value, ATTENTION_KEYS) || value.event !== 'run.needs_input' ||
-        value.workTerminal !== false || !CALLBACK_REF.test(value.callbackRef) ||
-        !/^ghe_[a-f0-9]{32}$/.test(value.evidenceId)) {
+    if (
+      !exactKeys(value, ATTENTION_KEYS) ||
+      value.event !== 'run.needs_input' ||
+      value.workTerminal !== false ||
+      !CALLBACK_REF.test(value.callbackRef) ||
+      !/^ghe_[a-f0-9]{32}$/.test(value.evidenceId)
+    ) {
       throw new Error('voice_worker_completion_binding_invalid');
     }
-    return { kind: value.kind,
+    return {
+      kind: value.kind,
       originRef: requiredText(value.originRef, 'voice_worker_completion_binding_invalid'),
       workRef: requiredText(value.workRef, 'voice_worker_completion_binding_invalid'),
       workerId: requiredText(value.workerId, 'voice_worker_completion_binding_invalid'),
       runId: requiredText(value.runId, 'voice_worker_completion_binding_invalid'),
-      callbackRef: value.callbackRef, event: value.event, workTerminal: false, evidenceId: value.evidenceId };
+      callbackRef: value.callbackRef,
+      event: value.event,
+      workTerminal: false,
+      evidenceId: value.evidenceId,
+    };
   }
   const terminal = value as VoiceWorkerCompletionBindingV1;
   if (
@@ -141,7 +162,10 @@ function canonicalBinding(value: VoiceWorkerPresentationBindingV1): VoiceWorkerP
     workerId: requiredText(terminal.workerId, 'voice_worker_completion_binding_invalid'),
     runId: requiredText(terminal.runId, 'voice_worker_completion_binding_invalid'),
     callbackRef: requiredText(terminal.callbackRef, 'voice_worker_completion_binding_invalid'),
-    attemptNumber: positiveInteger(terminal.attemptNumber, 'voice_worker_completion_binding_invalid'),
+    attemptNumber: positiveInteger(
+      terminal.attemptNumber,
+      'voice_worker_completion_binding_invalid',
+    ),
     resultKey: requiredText(terminal.resultKey, 'voice_worker_completion_binding_invalid'),
     acceptedOperationId: requiredText(
       terminal.acceptedOperationId,
@@ -196,7 +220,9 @@ function canonicalBindings(
   ]);
   const unique = new Set(identities.map((identity) => JSON.stringify(identity)));
   const workRefs = new Set(bindings.map((binding) => binding.workRef));
-  const resultKeys = new Set(bindings.map((binding) => 'kind' in binding ? binding.evidenceId : binding.resultKey));
+  const resultKeys = new Set(
+    bindings.map((binding) => ('kind' in binding ? binding.evidenceId : binding.resultKey)),
+  );
   if (
     unique.size !== bindings.length ||
     workRefs.size !== bindings.length ||

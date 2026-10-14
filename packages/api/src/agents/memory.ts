@@ -1334,8 +1334,9 @@ function createMemoryRuntimeState({
 /** One ordered state transition serves both policy preflight and acknowledged writes. */
 function advanceMemoryRuntimeState(
   state: MemoryRuntimeState,
-  change: { action: 'set'; key: string; value: string; tokenCount: number } |
-    { action: 'delete'; key: string },
+  change:
+    | { action: 'set'; key: string; value: string; tokenCount: number }
+    | { action: 'delete'; key: string },
   revision?: number,
 ): void {
   const previousTokenCount = state.tokenCounts[change.key] ?? 0;
@@ -1466,8 +1467,11 @@ export const createMemoryTool = ({
             attemptState.storageApplied = true;
           }
           artifact[Tools.memory].type = changed ? 'update' : 'unchanged';
-          advanceMemoryRuntimeState(runtimeState,
-            { action: 'set', key, value: nextValue, tokenCount }, result.revision);
+          advanceMemoryRuntimeState(
+            runtimeState,
+            { action: 'set', key, value: nextValue, tokenCount },
+            result.revision,
+          );
           if (result.revision != null) artifact[Tools.memory].revision = result.revision;
           logMemoryWriteAudit({
             userId,
@@ -1825,17 +1829,27 @@ export const createApplyMemoryChangesTool = ({
           } else {
             const prepared = prepareMemoryValueForWrite({ key, value: operation.value, keyLimits });
             const evaluation = evaluateMemoryWrite({
-              key, value: prepared.value, tokenCount: prepared.tokenCount,
-              validKeys, tokenLimit, keyLimits,
+              key,
+              value: prepared.value,
+              tokenCount: prepared.tokenCount,
+              validKeys,
+              tokenLimit,
+              keyLimits,
               baselineTotalTokens: proposalState.runningTotalTokens,
               previousTokenCount: proposalState.tokenCounts[key] ?? 0,
             });
             if (!evaluation.ok) {
-              return [evaluation.message ?? `Failed to set memory for key "${key}"`,
-                buildMemoryErrorArtifact(evaluation, runtimeState.runningTotalTokens)];
+              return [
+                evaluation.message ?? `Failed to set memory for key "${key}"`,
+                buildMemoryErrorArtifact(evaluation, runtimeState.runningTotalTokens),
+              ];
             }
-            advanceMemoryRuntimeState(proposalState,
-              { action: 'set', key, value: prepared.value, tokenCount: prepared.tokenCount });
+            advanceMemoryRuntimeState(proposalState, {
+              action: 'set',
+              key,
+              value: prepared.value,
+              tokenCount: prepared.tokenCount,
+            });
           }
         } else if (action === 'delete') {
           if (typeof key !== 'string' || !key.trim()) {
@@ -1849,8 +1863,14 @@ export const createApplyMemoryChangesTool = ({
           structuralError = `Unsupported memory action "${String(action ?? '')}"`;
         }
         if (structuralError) {
-          return [structuralError, buildGenericMemoryErrorArtifact(structuralError,
-            runtimeState.runningTotalTokens, { action, key, errorType: 'invalid_operation' })];
+          return [
+            structuralError,
+            buildGenericMemoryErrorArtifact(structuralError, runtimeState.runningTotalTokens, {
+              action,
+              key,
+              errorType: 'invalid_operation',
+            }),
+          ];
         }
       }
 

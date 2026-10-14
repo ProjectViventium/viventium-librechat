@@ -431,7 +431,9 @@ const processImageFile = async ({ req, res, metadata, returnFile = false }) => {
       agent_id: metadata.agent_id,
     });
     const nativeCapabilities =
-      appConfig.endpoints?.agents?.providerCapabilities?.[resolvedAttachmentSurface.currentProvider];
+      appConfig.endpoints?.agents?.providerCapabilities?.[
+        resolvedAttachmentSurface.currentProvider
+      ];
     if (
       nativeCapabilities?.workspace_binding === true &&
       nativeCapabilities?.worker_native_tools === true

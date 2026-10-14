@@ -1,4 +1,8 @@
-import { createMainContinuityService, mainCompactionCandidateDigest, mainCompactionOutputContractDigest } from './mainContinuity';
+import {
+  createMainContinuityService,
+  mainCompactionCandidateDigest,
+  mainCompactionOutputContractDigest,
+} from './mainContinuity';
 import type {
   AcceptedMainTurn,
   MainContinuityState,

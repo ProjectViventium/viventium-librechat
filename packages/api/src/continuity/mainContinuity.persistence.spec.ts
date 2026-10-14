@@ -199,7 +199,7 @@ describe('native Main acceptance projection', () => {
           approved: true,
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(candidate!),
-        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
         },
       }),
     ).toMatchObject({ status: 'compacted' });
@@ -405,7 +405,7 @@ describe('native Main acceptance projection', () => {
           approved: true,
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(candidate!),
-        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
         },
       }),
     ).toMatchObject({ status: 'compacted' });
@@ -561,7 +561,7 @@ describe('native Main acceptance projection', () => {
             approved: true,
             sourceDigest: claim.sourceDigest,
             candidateDigest: mainCompactionCandidateDigest(candidate),
-        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+            outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
           },
         }),
       ).toMatchObject({ status: 'compacted' });
@@ -732,7 +732,7 @@ describe('native Main acceptance projection', () => {
           approved: true,
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(candidate!),
-        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
         },
       }),
     ).toMatchObject({ status: 'compacted' });

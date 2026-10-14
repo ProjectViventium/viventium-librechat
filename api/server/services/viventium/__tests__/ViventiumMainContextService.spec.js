@@ -4469,18 +4469,16 @@ describe('native whole-source courier admission', () => {
   });
   function recordFor(source, through = 99) {
     const hash = (value) => crypto.createHash('sha256').update(value).digest('hex');
-    const coveredSource = source
-      .slice(0, through + 1)
-      .map((row) => ({
-        id: row.messageId,
-        sha256: hash(
-          JSON.stringify([
-            row.messageId,
-            row.isCreatedByUser ? 'user' : 'assistant',
-            service.messageContentText(row),
-          ]),
-        ),
-      }));
+    const coveredSource = source.slice(0, through + 1).map((row) => ({
+      id: row.messageId,
+      sha256: hash(
+        JSON.stringify([
+          row.messageId,
+          row.isCreatedByUser ? 'user' : 'assistant',
+          service.messageContentText(row),
+        ]),
+      ),
+    }));
     return {
       ownerId: 'owner',
       conversationId: 'conversation',

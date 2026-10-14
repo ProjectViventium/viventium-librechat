@@ -1176,7 +1176,8 @@ router.post('/source-order', telegramAuth, async (req, res) => {
       bindCanonicalInteractionConversation(req, conversationId);
       const sourceMessageId = acceptedInteractionSourceId(req);
       bindInteractionSourceSegments(req, input.text, [], {
-        messageId:sourceMessageId,parentMessageId:resolved.parentMessageId || Constants.NO_PARENT,
+        messageId: sourceMessageId,
+        parentMessageId: resolved.parentMessageId || Constants.NO_PARENT,
       });
       if (!(await Message.exists({ user: req.user.id, messageId: sourceMessageId }))) {
         await saveMessage(
@@ -1197,7 +1198,7 @@ router.post('/source-order', telegramAuth, async (req, res) => {
                   originalParentMessageId: resolved.parentMessageId || Constants.NO_PARENT,
                 },
                 interactionContext: getTrustedInteractionContext(req),
-                originalInputReceipt: {sourceEventId,receivedAt:originalReceivedAt},
+                originalInputReceipt: { sourceEventId, receivedAt: originalReceivedAt },
               },
             },
           },
@@ -2385,9 +2386,7 @@ router.post('/orchestration/work/:workRef/actions', telegramAuth, async (req, re
       operationId,
       sourceSurface: 'telegram',
       ownerInputControl: true,
-      ...(nativeResponse?.success
-        ? { nativeInput: nativeResponse.data }
-        : {}),
+      ...(nativeResponse?.success ? { nativeInput: nativeResponse.data } : {}),
     });
     return res.status(202).json(result);
   } catch (error) {

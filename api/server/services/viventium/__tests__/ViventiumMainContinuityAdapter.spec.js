@@ -99,23 +99,32 @@ test.each(['loadPresentation', 'loadPresentations'])(
   },
 );
 
-
 test('Core lease renewal conditions its atomic write on the exact still-live holder', async () => {
   const Model = require('~/db/models').ViventiumMainContinuityState;
-  const lease = { leaseId: 'exact-holder', sourceDigest: 'd'.repeat(64),
-    expiresAt: new Date(300000) };
+  const lease = {
+    leaseId: 'exact-holder',
+    sourceDigest: 'd'.repeat(64),
+    expiresAt: new Date(300000),
+  };
   const expiresAt = new Date(400000);
   Model.updateOne.mockResolvedValue({ modifiedCount: 1 });
   expect(typeof mockDependencies.persistence.renewCompactionLease).toBe('function');
-  expect(await mockDependencies.persistence.renewCompactionLease('domain-epoch', 7, lease, expiresAt))
-    .toBe(true);
-  expect(Model.updateOne).toHaveBeenLastCalledWith({ domainEpochKey: 'domain-epoch', version: 7,
-    'compactionLease.leaseId': lease.leaseId,
-    'compactionLease.sourceDigest': lease.sourceDigest,
-    'compactionLease.expiresAt': lease.expiresAt,
-    $expr: { $gt: ['$compactionLease.expiresAt', '$$NOW'] },
-  }, { $set: { 'compactionLease.expiresAt': expiresAt }, $inc: { version: 1 } });
+  expect(
+    await mockDependencies.persistence.renewCompactionLease('domain-epoch', 7, lease, expiresAt),
+  ).toBe(true);
+  expect(Model.updateOne).toHaveBeenLastCalledWith(
+    {
+      domainEpochKey: 'domain-epoch',
+      version: 7,
+      'compactionLease.leaseId': lease.leaseId,
+      'compactionLease.sourceDigest': lease.sourceDigest,
+      'compactionLease.expiresAt': lease.expiresAt,
+      $expr: { $gt: ['$compactionLease.expiresAt', '$$NOW'] },
+    },
+    { $set: { 'compactionLease.expiresAt': expiresAt }, $inc: { version: 1 } },
+  );
   Model.updateOne.mockResolvedValue({ modifiedCount: 0 });
-  expect(await mockDependencies.persistence.renewCompactionLease('domain-epoch', 7, lease, expiresAt))
-    .toBe(false);
+  expect(
+    await mockDependencies.persistence.renewCompactionLease('domain-epoch', 7, lease, expiresAt),
+  ).toBe(false);
 });

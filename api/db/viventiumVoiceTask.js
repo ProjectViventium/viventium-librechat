@@ -15,7 +15,7 @@ module.exports = function createViventiumVoiceTask(db) {
       userId: { type: String, required: true, index: true },
       streamId: { type: String, default: null, index: true },
       sequence: { type: Number, required: true, default: 0 },
-      nativeInputSpeechOffer: {type:mongoose.Schema.Types.Mixed,default:null},
+      nativeInputSpeechOffer: { type: mongoose.Schema.Types.Mixed, default: null },
       payload: { type: mongoose.Schema.Types.Mixed, required: true },
       expiresAt: { type: Date, required: true, index: { expireAfterSeconds: 0 } },
     },

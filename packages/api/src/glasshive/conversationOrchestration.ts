@@ -64,7 +64,7 @@ export const MAIN_DELEGATION_JSON_SCHEMA = Object.freeze({
     instruction: {
       type: 'string',
       description:
-        "Work the new worker must perform. Main already owns this launch. Preserve the goal, constraints and output shape; original selected source wording is retained separately. Do not assign orchestration already performed by this call.",
+        'Work the new worker must perform. Main already owns this launch. Preserve the goal, constraints and output shape; original selected source wording is retained separately. Do not assign orchestration already performed by this call.',
       minLength: 1,
       maxLength: MAIN_DELEGATION_STRING_LIMITS.instruction,
     },
@@ -106,9 +106,13 @@ export const MAIN_DELEGATION_JSON_SCHEMA = Object.freeze({
       items: { type: 'integer', minimum: 1, maximum: 32 },
     },
     fileIds: {
-      type: 'array', minItems: 0, maxItems: 64, uniqueItems: true,
+      type: 'array',
+      minItems: 0,
+      maxItems: 64,
+      uniqueItems: true,
       items: { type: 'string', minLength: 1, maxLength: 256 },
-      description: 'Exact historical Core file IDs to attach to this mission. When choices are listed, select only mission-relevant files or [] for none. Current source uploads remain included. Original bytes and extracted text retain their declared input kind.',
+      description:
+        'Exact historical Core file IDs to attach to this mission. When choices are listed, select only mission-relevant files or [] for none. Current source uploads remain included. Original bytes and extracted text retain their declared input kind.',
     },
   },
   required: ['title', 'instruction', 'resourceClass'],
@@ -120,30 +124,44 @@ export function mainDelegationJsonSchema(
   requestBody: unknown = {},
   historicalFileChoices: { file_id: string; filename?: string }[] = [],
 ) {
-  const sources = requestBody && typeof requestBody === 'object' && !Array.isArray(requestBody)
-    ? (requestBody as Record<string, unknown>).viventiumTriggeringSourceSegments
-    : undefined;
+  const sources =
+    requestBody && typeof requestBody === 'object' && !Array.isArray(requestBody)
+      ? (requestBody as Record<string, unknown>).viventiumTriggeringSourceSegments
+      : undefined;
   const count = Array.isArray(sources) ? sources.length : 0;
   if (count <= 1 && !historicalFileChoices.length) return MAIN_DELEGATION_JSON_SCHEMA;
-  const maximum = Math.min(count, MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals.items.maximum);
+  const maximum = Math.min(
+    count,
+    MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals.items.maximum,
+  );
   return {
     ...MAIN_DELEGATION_JSON_SCHEMA,
     properties: {
       ...MAIN_DELEGATION_JSON_SCHEMA.properties,
-      ...(count > 1 ? { sourceOrdinals: {
-        ...MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals,
-        minItems: 1,
-        maxItems: maximum,
-        items: { type: 'integer', minimum: 1, maximum },
-      } } : {}),
-      ...(historicalFileChoices.length ? { fileIds: {
-        ...MAIN_DELEGATION_JSON_SCHEMA.properties.fileIds,
-        items: { type: 'string', enum: historicalFileChoices.map((file) => file.file_id) },
-      } } : {}),
+      ...(count > 1
+        ? {
+            sourceOrdinals: {
+              ...MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals,
+              minItems: 1,
+              maxItems: maximum,
+              items: { type: 'integer', minimum: 1, maximum },
+            },
+          }
+        : {}),
+      ...(historicalFileChoices.length
+        ? {
+            fileIds: {
+              ...MAIN_DELEGATION_JSON_SCHEMA.properties.fileIds,
+              items: { type: 'string', enum: historicalFileChoices.map((file) => file.file_id) },
+            },
+          }
+        : {}),
     },
-    required: [...MAIN_DELEGATION_JSON_SCHEMA.required,
+    required: [
+      ...MAIN_DELEGATION_JSON_SCHEMA.required,
       ...(count > 1 ? ['sourceOrdinals'] : []),
-      ...(historicalFileChoices.length ? ['fileIds'] : [])],
+      ...(historicalFileChoices.length ? ['fileIds'] : []),
+    ],
   };
 }
 
@@ -152,9 +170,22 @@ export const ACTIVE_WORK_LIST_DESCRIPTION =
 export const ACTIVE_WORK_LIST_JSON_SCHEMA = Object.freeze({
   type: 'object',
   properties: {
-    scope: { type: 'string', enum: ['active', 'history', 'result'], description: 'Default active and history list rosters with pagination and no runId or workRef. Result requires an exact runId or workRef and no cursor or limit.' },
-    runId: { type: 'string', pattern: '^[A-Za-z0-9._:-]{1,160}$', description: 'Exact retained run identity; only with scope result.' },
-    workRef: { type: 'string', pattern: '^[A-Za-z0-9._:-]{1,160}$', description: 'Exact work identity; only with scope result.' },
+    scope: {
+      type: 'string',
+      enum: ['active', 'history', 'result'],
+      description:
+        'Default active and history list rosters with pagination and no runId or workRef. Result requires an exact runId or workRef and no cursor or limit.',
+    },
+    runId: {
+      type: 'string',
+      pattern: '^[A-Za-z0-9._:-]{1,160}$',
+      description: 'Exact retained run identity; only with scope result.',
+    },
+    workRef: {
+      type: 'string',
+      pattern: '^[A-Za-z0-9._:-]{1,160}$',
+      description: 'Exact work identity; only with scope result.',
+    },
     cursor: { type: 'string', minLength: 1, maxLength: 2048 },
     limit: { type: 'integer', minimum: 1, maximum: 100 },
   },
@@ -181,26 +212,58 @@ export const ACTIVE_WORK_ACTION_JSON_SCHEMA = Object.freeze({
     },
     instruction: { type: 'string', minLength: 1, maxLength: 8000 },
     nativeInput: {
-      type: 'object', additionalProperties: false,
-      description: "Respond to current native input using its exact identity and form from the current pendingNativeInput context capsule or active_work_list. Requires action resume and no instruction. Clarifications use answers; permissions use an offered single-operation option only for the current owner's explicit answer.",
+      type: 'object',
+      additionalProperties: false,
+      description:
+        "Respond to current native input using its exact identity and form from the current pendingNativeInput context capsule or active_work_list. Requires action resume and no instruction. Clarifications use answers; permissions use an offered single-operation option only for the current owner's explicit answer.",
       required: ['version', 'requestId', 'requestFingerprint', 'action', 'content'],
       properties: {
         version: { type: 'integer', enum: [1] },
         requestId: { type: 'string', minLength: 1, maxLength: 512 },
         requestFingerprint: { type: 'string', pattern: '^[a-f0-9]{64}$' },
         action: { type: 'string', enum: ['accept'] },
-        content: { type: 'object', additionalProperties: false, minProperties: 1, properties: {
-          optionId: { type: 'string', minLength: 1, maxLength: 160 },
-          answers: { type: 'object', minProperties: 1, maxProperties: 16, additionalProperties: {
-            type: 'array', minItems: 1, maxItems: 17, uniqueItems: true,
-            items: { type: 'string', minLength: 1, maxLength: 160 } } },
-          annotations: { type: 'object', maxProperties: 16, additionalProperties: {
-            type: 'object', additionalProperties: false, required: ['notes'], properties: {
-              notes: { type: 'string', minLength: 1, maxLength: 8000 } } } },
-        } },
+        content: {
+          type: 'object',
+          additionalProperties: false,
+          minProperties: 1,
+          properties: {
+            optionId: { type: 'string', minLength: 1, maxLength: 160 },
+            answers: {
+              type: 'object',
+              minProperties: 1,
+              maxProperties: 16,
+              additionalProperties: {
+                type: 'array',
+                minItems: 1,
+                maxItems: 17,
+                uniqueItems: true,
+                items: { type: 'string', minLength: 1, maxLength: 160 },
+              },
+            },
+            annotations: {
+              type: 'object',
+              maxProperties: 16,
+              additionalProperties: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['notes'],
+                properties: {
+                  notes: { type: 'string', minLength: 1, maxLength: 8000 },
+                },
+              },
+            },
+          },
+        },
       },
     },
-    fileIds: { type: 'array', minItems: 0, uniqueItems: true, items: { type: 'string', minLength: 1, maxLength: 256 }, description: 'Omit or use an empty array when adding no files. For Steer, Queue, or Message only: exact authorized Core file IDs to attach to this target. Original bytes and extracted text keep their declared input kind; no files go to other work.' },
+    fileIds: {
+      type: 'array',
+      minItems: 0,
+      uniqueItems: true,
+      items: { type: 'string', minLength: 1, maxLength: 256 },
+      description:
+        'Omit or use an empty array when adding no files. For Steer, Queue, or Message only: exact authorized Core file IDs to attach to this target. Original bytes and extracted text keep their declared input kind; no files go to other work.',
+    },
   },
   required: ['workRef', 'action'],
   additionalProperties: false,
@@ -274,30 +337,50 @@ export function canonicalConversationOrchestrationArguments(
     const sourceOrdinals = canonicalSourceOrdinals(input.sourceOrdinals);
     if (sourceOrdinals.length) output.sourceOrdinals = sourceOrdinals;
     const fileIds = input.fileIds;
-    if (fileIds !== undefined && (!Array.isArray(fileIds) || fileIds.length > 64 ||
-        fileIds.some((id) => typeof id !== 'string' || !id.trim() || id.trim() !== id || id.length > 256) ||
-        new Set(fileIds).size !== fileIds.length)) {
+    if (
+      fileIds !== undefined &&
+      (!Array.isArray(fileIds) ||
+        fileIds.length > 64 ||
+        fileIds.some(
+          (id) => typeof id !== 'string' || !id.trim() || id.trim() !== id || id.length > 256,
+        ) ||
+        new Set(fileIds).size !== fileIds.length)
+    ) {
       throw new TypeError('fileIds require exact unique file references');
     }
-    if (fileIds !== undefined) output.fileIds = [...fileIds as string[]];
+    if (fileIds !== undefined) output.fileIds = [...(fileIds as string[])];
     return output;
   }
   if (toolName === 'active_work_action') {
-    if (Object.hasOwn(input,'nativeHumanInput') || Object.hasOwn(input,'ownerInputControl')) {
+    if (Object.hasOwn(input, 'nativeHumanInput') || Object.hasOwn(input, 'ownerInputControl')) {
       throw new TypeError('native owner input authority is server-owned');
     }
     const instruction = boundedString(input.instruction, 8000);
     const fileIds = input.fileIds;
-    const nativeInput = input.nativeInput === undefined ? undefined : nativeQueenInputResponseSchema.parse(input.nativeInput);
-    if (nativeInput && (instruction || input.action !== 'resume' || nativeInput.action !== 'accept')) {
-      throw Object.assign(new TypeError('nativeInput requires action resume without instruction.'), {
-        code: 'native_input_arguments_conflict',
-      });
+    const nativeInput =
+      input.nativeInput === undefined
+        ? undefined
+        : nativeQueenInputResponseSchema.parse(input.nativeInput);
+    if (
+      nativeInput &&
+      (instruction || input.action !== 'resume' || nativeInput.action !== 'accept')
+    ) {
+      throw Object.assign(
+        new TypeError('nativeInput requires action resume without instruction.'),
+        {
+          code: 'native_input_arguments_conflict',
+        },
+      );
     }
-    if (fileIds !== undefined && (!Array.isArray(fileIds) ||
-        fileIds.some((id) => typeof id !== 'string' || !id.trim() || id.trim() !== id || id.length > 256) ||
+    if (
+      fileIds !== undefined &&
+      (!Array.isArray(fileIds) ||
+        fileIds.some(
+          (id) => typeof id !== 'string' || !id.trim() || id.trim() !== id || id.length > 256,
+        ) ||
         new Set(fileIds).size !== fileIds.length ||
-        (fileIds.length > 0 && !['steer', 'queue', 'message'].includes(String(input.action))))) {
+        (fileIds.length > 0 && !['steer', 'queue', 'message'].includes(String(input.action))))
+    ) {
       throw new TypeError('fileIds require exact unique follow-up file references');
     }
     return {
@@ -305,7 +388,7 @@ export function canonicalConversationOrchestrationArguments(
       action: boundedString(input.action, 32).toLowerCase(),
       ...(instruction ? { instruction } : {}),
       ...(nativeInput ? { nativeInput } : {}),
-      ...(Array.isArray(fileIds) && fileIds.length ? { fileIds: [...fileIds as string[]] } : {}),
+      ...(Array.isArray(fileIds) && fileIds.length ? { fileIds: [...(fileIds as string[])] } : {}),
     };
   }
   if (toolName === 'active_work_list') {

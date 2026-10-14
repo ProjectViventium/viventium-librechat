@@ -102,8 +102,10 @@ export function normalizeSourceSegmentsWithOverflow(
       ordinal: 0,
       source_event_id: sourceEventId,
       source_index: sourceIndex,
-      ...(Number.isSafeInteger(candidate.source_received_at) && Number(candidate.source_received_at) > 0
-        ? { source_received_at: Number(candidate.source_received_at) } : {}),
+      ...(Number.isSafeInteger(candidate.source_received_at) &&
+      Number(candidate.source_received_at) > 0
+        ? { source_received_at: Number(candidate.source_received_at) }
+        : {}),
       ...(Number.isSafeInteger(sourceSequence) && sourceSequence > 0
         ? { source_sequence: sourceSequence }
         : {}),

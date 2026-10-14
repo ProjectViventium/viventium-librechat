@@ -31,8 +31,15 @@ type Transaction = <T>(operation: () => Promise<T>) => Promise<T>;
 type Commit = (identity: NativeResponseIdentity, digest: string) => Promise<NativeResponseCommit>;
 type Revoke = (identity: NativeResponseIdentity) => Promise<NativeResponseCommit>;
 type NamedMembers<T> = {
-  [Key in keyof T as string extends Key ? never : number extends Key ? never :
-    symbol extends Key ? never : Key]: T[Key];
+  [
+    Key in keyof T as string extends Key
+      ? never
+      : number extends Key
+        ? never
+        : symbol extends Key
+          ? never
+          : Key
+  ]: T[Key];
 };
 type NativeResponseRow = Omit<NamedMembers<IMessage>, keyof NamedMembers<Document>> & {
   _id: Types.ObjectId;
@@ -187,9 +194,11 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
           const row = await messages().findOne(filter).select('+nativeResponse').lean();
           const admission = row?.nativeResponse;
           if (
-            !row || !admission ||
-            !(mode === 'current_main' ? ['pending', 'unsupported'] : ['pending'])
-              .includes(admission.status) ||
+            !row ||
+            !admission ||
+            !(mode === 'current_main' ? ['pending', 'unsupported'] : ['pending']).includes(
+              admission.status,
+            ) ||
             admission.recoverUntil <= Date.now()
           )
             return false;
@@ -446,7 +455,10 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
     });
   }
 
-  async function getNativeResponse(userId: string, responseMessageId: string): Promise<NativeResponseRow | null> {
+  async function getNativeResponse(
+    userId: string,
+    responseMessageId: string,
+  ): Promise<NativeResponseRow | null> {
     return messages()
       .findOne({ user: userId, messageId: responseMessageId, deletedAt: null })
       .select('+nativeResponse')
@@ -928,9 +940,13 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
     const dottedMetadata = Object.entries(update).filter(([key]) => key.startsWith('metadata.'));
     const dottedMetadataOnly = dottedMetadata.length > 0 && update.metadata === undefined;
     if (dottedMetadata.length) {
-      update = { ...update, metadata: cloneDeep({
-        ...metadataRecord(row.metadata), ...metadataRecord(update.metadata),
-      }) };
+      update = {
+        ...update,
+        metadata: cloneDeep({
+          ...metadataRecord(row.metadata),
+          ...metadataRecord(update.metadata),
+        }),
+      };
       for (const [key, value] of dottedMetadata) {
         set(update.metadata, key.slice('metadata.'.length), value);
         delete update[key];
@@ -944,7 +960,10 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
       const viventium = { ...metadataRecord(incoming.viventium) };
       // Foreground snapshots cannot undo presentation receipts. Failed presentation also
       // survives augmentation; successful empty-parent promotion may start a new presentation.
-      if (mode === 'snapshot' || metadataRecord(savedViventium.deliveryAcknowledgement).state === 'failed')
+      if (
+        mode === 'snapshot' ||
+        metadataRecord(savedViventium.deliveryAcknowledgement).state === 'failed'
+      )
         canonicalKeys.push('deliveryAcknowledgement');
       for (const key of canonicalKeys) {
         if (Object.prototype.hasOwnProperty.call(savedViventium, key))

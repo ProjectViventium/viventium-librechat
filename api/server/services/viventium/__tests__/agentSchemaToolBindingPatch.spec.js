@@ -809,39 +809,58 @@ describe('agentSchemaToolBindingPatch', () => {
   );
 });
 
-
 describe('graph fallback recovery receipt invocation scope', () => {
   const key = Symbol.for('viventium.graph.fallback.recovery.invocation.v1');
   const fallbackContextKey = Symbol.for('viventium.agent.graph.fallback.runtime.context.v1');
   function fixture() {
     const options = { model: 'synthetic-fallback' };
-    Object.defineProperty(options, fallbackContextKey, { value: {
-      provider: 'synthetic-provider', model: 'synthetic-fallback' } });
+    Object.defineProperty(options, fallbackContextKey, {
+      value: {
+        provider: 'synthetic-provider',
+        model: 'synthetic-fallback',
+      },
+    });
     const proto = {
       createCallModel() {
         const graph = this;
         return async (state, config) => {
-          try { return await graph.attemptInvoke({ route: 'primary', state }, config); }
-          catch (_) {
+          try {
+            return await graph.attemptInvoke({ route: 'primary', state }, config);
+          } catch (_) {
             graph.getNewModel({ clientOptions: options });
             return graph.attemptInvoke({ route: 'fallback', state }, config);
           }
         };
       },
       async attemptInvoke({ route, state }) {
-        if (route === 'primary' && state.mode !== 'healthy') throw Object.assign(
-          new Error('synthetic quota'), { status: 429 });
+        if (route === 'primary' && state.mode !== 'healthy')
+          throw Object.assign(new Error('synthetic quota'), { status: 429 });
         if (route === 'fallback' && state.wait) await state.wait;
         return { messages: [] };
       },
-      getNewModel({ clientOptions }) { return { clientOptions }; },
+      getNewModel({ clientOptions }) {
+        return { clientOptions };
+      },
     };
     installUnifiedSchemaToolBindingPatch(proto);
-    const graph = Object.assign(Object.create(proto), { runId: 'synthetic-run',
-      defaultAgentId: 'main', contentData: [], toolCallStepIds: new Map(),
-      agentContexts: new Map([['main', { clientOptions: {} }], ['hidden', { clientOptions: {} }]]) });
-    return { graph, invoke: (agent, state = {}) => graph.createCallModel(agent)(
-      { messages: [], ...state }, { configurable: { thread_id: 'synthetic-thread' } }) };
+    const graph = Object.assign(Object.create(proto), {
+      runId: 'synthetic-run',
+      defaultAgentId: 'main',
+      contentData: [],
+      toolCallStepIds: new Map(),
+      agentContexts: new Map([
+        ['main', { clientOptions: {} }],
+        ['hidden', { clientOptions: {} }],
+      ]),
+    });
+    return {
+      graph,
+      invoke: (agent, state = {}) =>
+        graph.createCallModel(agent)(
+          { messages: [], ...state },
+          { configurable: { thread_id: 'synthetic-thread' } },
+        ),
+    };
   }
   test('hidden fallback cannot claim Main completion or overwrite its current receipt', async () => {
     const { graph, invoke } = fixture();
@@ -849,8 +868,13 @@ describe('graph fallback recovery receipt invocation scope', () => {
     expect(graph.viventiumGraphFallbackRecoveryReceipt).toBeUndefined();
     await invoke('main');
     const receipt = graph.viventiumGraphFallbackRecoveryReceipt;
-    expect(receipt).toEqual({ provider: 'synthetic-provider', model: 'synthetic-fallback',
-      agentId: 'main', runId: 'synthetic-run', threadId: 'synthetic-thread' });
+    expect(receipt).toEqual({
+      provider: 'synthetic-provider',
+      model: 'synthetic-fallback',
+      agentId: 'main',
+      runId: 'synthetic-run',
+      threadId: 'synthetic-thread',
+    });
     expect(receipt[key]).toBe(graph[key]);
     await invoke('hidden');
     expect(graph.viventiumGraphFallbackRecoveryReceipt).toBe(receipt);
@@ -865,7 +889,9 @@ describe('graph fallback recovery receipt invocation scope', () => {
   test('stale overlapping Main fallback cannot re-label the current successful Main', async () => {
     const { graph, invoke } = fixture();
     let release;
-    const wait = new Promise((resolve) => { release = resolve; });
+    const wait = new Promise((resolve) => {
+      release = resolve;
+    });
     const first = invoke('main', { wait });
     await new Promise((resolve) => setImmediate(resolve));
     await invoke('main', { mode: 'healthy' });

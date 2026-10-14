@@ -553,10 +553,15 @@ router.post(
     delete sanitizedIncoming.authoringDeadlineAt;
     if (incoming.authoringDeadlineAt != null) {
       const deadline = new Date(incoming.authoringDeadlineAt).getTime();
-      if (typeof incoming.authoringDeadlineAt !== 'string' || !Number.isFinite(deadline) ||
-          deadline <= Date.now()) {
-        return _res.status(400).json({ error: 'A future authoring deadline is required',
-          reason: 'invalid_authoring_deadline' });
+      if (
+        typeof incoming.authoringDeadlineAt !== 'string' ||
+        !Number.isFinite(deadline) ||
+        deadline <= Date.now()
+      ) {
+        return _res.status(400).json({
+          error: 'A future authoring deadline is required',
+          reason: 'invalid_authoring_deadline',
+        });
       }
       req.viventiumSchedulerAuthoringDeadlineAt = new Date(deadline).toISOString();
     }
@@ -888,8 +893,12 @@ router.post('/stream/:streamId/cancel', schedulerAuth, async (req, res) => {
   }
 
   if (releaseUnconfirmed) {
-    return res.status(202).json({ success: false, cancelled: streamId,
-      reason: 'release_unconfirmed', capacityReleased: false });
+    return res.status(202).json({
+      success: false,
+      cancelled: streamId,
+      reason: 'release_unconfirmed',
+      capacityReleased: false,
+    });
   }
   return res.json({ success: true, cancelled: streamId });
 });
@@ -923,7 +932,10 @@ router.post('/telegram/resolve', schedulerAuth, async (req, res) => {
       try {
         voiceRoute = await resolveUserVoiceRoute(userId, { includeSources: true });
       } catch (err) {
-        logger.warn('[VIVENTIUM][scheduler/telegram] Speaking route unavailable', schedulerSafeFailure(err));
+        logger.warn(
+          '[VIVENTIUM][scheduler/telegram] Speaking route unavailable',
+          schedulerSafeFailure(err),
+        );
         speechUnavailable = 'voice_route_unavailable';
       }
     }
@@ -943,7 +955,9 @@ router.post('/telegram/resolve', schedulerAuth, async (req, res) => {
       '[VIVENTIUM][scheduler/telegram] Failed to resolve mapping',
       schedulerSafeFailure(err),
     );
-    return res.status(500).json({ error: 'Failed to resolve Telegram mapping', code: 'telegram_mapping_unavailable' });
+    return res
+      .status(500)
+      .json({ error: 'Failed to resolve Telegram mapping', code: 'telegram_mapping_unavailable' });
   }
 });
 

@@ -80,7 +80,8 @@ jest.mock('mongoose', () => {
           };
         }
         if (name === 'viventium_glasshive_mission_evidence') return {};
-        if (name === 'viventium_glasshive_callback_results') return { findOne: (...args) => mockTerminalFindOne(...args) };
+        if (name === 'viventium_glasshive_callback_results')
+          return { findOne: (...args) => mockTerminalFindOne(...args) };
         throw new Error(`Unexpected collection ${name}`);
       },
     },
@@ -1264,10 +1265,21 @@ describe('GlassHiveCallbackBindingService', () => {
   });
 
   describe('verified current callback generation', () => {
-    const binding = { ownerId: 'user-1', originRef: 'origin-1', workRef: 'work-1',
-      currentRunId: 'run-new', currentRunState: 'running' };
-    const body = { worker_id: 'worker-1', run_id: 'run-new', work_ref: 'work-1',
-      event: 'run.needs_input', work_state: 'failed', work_terminal: false };
+    const binding = {
+      ownerId: 'user-1',
+      originRef: 'origin-1',
+      workRef: 'work-1',
+      currentRunId: 'run-new',
+      currentRunState: 'running',
+    };
+    const body = {
+      worker_id: 'worker-1',
+      run_id: 'run-new',
+      work_ref: 'work-1',
+      event: 'run.needs_input',
+      work_state: 'failed',
+      work_terminal: false,
+    };
     const effectSession = { inTransaction: () => true };
     test.each([
       'committed',
@@ -1322,41 +1334,80 @@ describe('GlassHiveCallbackBindingService', () => {
       }
       if (scenario === 'abort') expect(mockAfterCommit).toHaveLength(1);
     });
-    test.each(['run-old', 'run-new'])('advances inherited terminal truth before attention fence (%s)', async (storedRun) => {
-      const row = { _id: 'origin-1', ownerId: 'user-1', workRef: 'work-1', runId: storedRun,
-        externalState: 'completed', terminalCallbackRunId: 'run-old', terminalCallbackId: 'old-callback',
-        deliveryState: 'sent', adjudicationState: 'completed', attentionPending: false };
-      mockExternalFindOne.mockImplementation(async () => ({ ...row }));
-      mockExternalUpdateOne.mockImplementation(async (_filter, update) => {
-        Object.assign(row, update.$set);
-        for (const key of Object.keys(update.$unset || {})) delete row[key];
-        return { matchedCount: 1 };
-      });
-      await expect(fenceGlassHiveCallbackRunState({ binding, body, effectSession })).resolves.toBeUndefined();
-      expect(row).toMatchObject({ runId: 'run-new', externalState: 'running',
-        terminalCallbackRunId: 'run-old', terminalCallbackId: 'old-callback' });
-      expect(row).not.toHaveProperty('deliveryState');
-      expect(row).not.toHaveProperty('adjudicationState');
-      expect(mockExternalUpdateOne.mock.calls[0][0]).toEqual({ _id: 'origin-1', ownerId: 'user-1',
-        workRef: 'work-1', runId: storedRun, externalState: 'completed', terminalCallbackRunId: 'run-old' });
-      const count = mockExternalUpdateOne.mock.calls.length;
-      row.deliveryState = 'sent'; row.adjudicationState = 'completed';
-      await fenceGlassHiveCallbackRunState({ binding, body, effectSession });
-      expect(mockExternalUpdateOne.mock.calls.slice(count).every(([,update]) => !update.$unset)).toBe(true);
-      expect(row.deliveryState).toBe('sent');
-      expect(row.adjudicationState).toBe('completed');
-    });
+    test.each(['run-old', 'run-new'])(
+      'advances inherited terminal truth before attention fence (%s)',
+      async (storedRun) => {
+        const row = {
+          _id: 'origin-1',
+          ownerId: 'user-1',
+          workRef: 'work-1',
+          runId: storedRun,
+          externalState: 'completed',
+          terminalCallbackRunId: 'run-old',
+          terminalCallbackId: 'old-callback',
+          deliveryState: 'sent',
+          adjudicationState: 'completed',
+          attentionPending: false,
+        };
+        mockExternalFindOne.mockImplementation(async () => ({ ...row }));
+        mockExternalUpdateOne.mockImplementation(async (_filter, update) => {
+          Object.assign(row, update.$set);
+          for (const key of Object.keys(update.$unset || {})) delete row[key];
+          return { matchedCount: 1 };
+        });
+        await expect(
+          fenceGlassHiveCallbackRunState({ binding, body, effectSession }),
+        ).resolves.toBeUndefined();
+        expect(row).toMatchObject({
+          runId: 'run-new',
+          externalState: 'running',
+          terminalCallbackRunId: 'run-old',
+          terminalCallbackId: 'old-callback',
+        });
+        expect(row).not.toHaveProperty('deliveryState');
+        expect(row).not.toHaveProperty('adjudicationState');
+        expect(mockExternalUpdateOne.mock.calls[0][0]).toEqual({
+          _id: 'origin-1',
+          ownerId: 'user-1',
+          workRef: 'work-1',
+          runId: storedRun,
+          externalState: 'completed',
+          terminalCallbackRunId: 'run-old',
+        });
+        const count = mockExternalUpdateOne.mock.calls.length;
+        row.deliveryState = 'sent';
+        row.adjudicationState = 'completed';
+        await fenceGlassHiveCallbackRunState({ binding, body, effectSession });
+        expect(
+          mockExternalUpdateOne.mock.calls.slice(count).every(([, update]) => !update.$unset),
+        ).toBe(true);
+        expect(row.deliveryState).toBe('sent');
+        expect(row.adjudicationState).toBe('completed');
+      },
+    );
     test('same-run terminal state remains monotonic', async () => {
-      mockExternalFindOne.mockResolvedValue({ _id: 'origin-1', ownerId: 'user-1', workRef: 'work-1',
-        runId: 'run-new', externalState: 'completed', terminalCallbackRunId: 'run-new' });
+      mockExternalFindOne.mockResolvedValue({
+        _id: 'origin-1',
+        ownerId: 'user-1',
+        workRef: 'work-1',
+        runId: 'run-new',
+        externalState: 'completed',
+        terminalCallbackRunId: 'run-new',
+      });
       mockExternalUpdateOne.mockResolvedValue({ matchedCount: 0 });
-      await expect(fenceGlassHiveCallbackRunState({ binding, body, effectSession }))
-        .rejects.toMatchObject({ code: 'glasshive_callback_notice_superseded' });
-      expect(mockExternalUpdateOne.mock.calls.every(([,update]) => !update.$unset)).toBe(true);
+      await expect(
+        fenceGlassHiveCallbackRunState({ binding, body, effectSession }),
+      ).rejects.toMatchObject({ code: 'glasshive_callback_notice_superseded' });
+      expect(mockExternalUpdateOne.mock.calls.every(([, update]) => !update.$unset)).toBe(true);
     });
     test('historical attention cannot replace current truth', async () => {
-      await expect(fenceGlassHiveCallbackRunState({ binding, body: { ...body, run_id: 'run-old' }, effectSession }))
-        .rejects.toMatchObject({ code: 'glasshive_callback_notice_superseded' });
+      await expect(
+        fenceGlassHiveCallbackRunState({
+          binding,
+          body: { ...body, run_id: 'run-old' },
+          effectSession,
+        }),
+      ).rejects.toMatchObject({ code: 'glasshive_callback_notice_superseded' });
       expect(mockExternalUpdateOne).not.toHaveBeenCalled();
       await confirmGlassHiveCallbackContext({ binding, body: { ...body, run_id: 'run-old' } });
       expect(mockExternalUpdateOne.mock.calls[0][1].$set).not.toHaveProperty('runId');
@@ -1366,20 +1417,38 @@ describe('GlassHiveCallbackBindingService', () => {
       expect(mockExternalFindOneAndUpdate).not.toHaveBeenCalled();
     });
     test('missing current proof cannot reopen terminal truth', async () => {
-      const row = { _id: 'origin-1', ownerId: 'user-1', workRef: 'work-1', runId: 'run-new',
-        externalState: 'completed', terminalCallbackRunId: 'run-old' };
+      const row = {
+        _id: 'origin-1',
+        ownerId: 'user-1',
+        workRef: 'work-1',
+        runId: 'run-new',
+        externalState: 'completed',
+        terminalCallbackRunId: 'run-old',
+      };
       mockExternalFindOne.mockResolvedValue(row);
       mockExternalUpdateOne.mockResolvedValue({ matchedCount: 0 });
-      await expect(fenceGlassHiveCallbackRunState({ binding: { ...binding, currentRunId: '' }, body, effectSession }))
-        .rejects.toMatchObject({ code: 'glasshive_callback_notice_superseded' });
-      expect(mockExternalUpdateOne.mock.calls.every(([,update]) => !update.$unset)).toBe(true);
+      await expect(
+        fenceGlassHiveCallbackRunState({
+          binding: { ...binding, currentRunId: '' },
+          body,
+          effectSession,
+        }),
+      ).rejects.toMatchObject({ code: 'glasshive_callback_notice_superseded' });
+      expect(mockExternalUpdateOne.mock.calls.every(([, update]) => !update.$unset)).toBe(true);
     });
     test('a concurrent current projection change prevents a stale reset', async () => {
-      mockExternalFindOne.mockResolvedValue({ _id: 'origin-1', ownerId: 'user-1', workRef: 'work-1', runId: 'run-old',
-        externalState: 'completed', terminalCallbackRunId: 'run-old' });
+      mockExternalFindOne.mockResolvedValue({
+        _id: 'origin-1',
+        ownerId: 'user-1',
+        workRef: 'work-1',
+        runId: 'run-old',
+        externalState: 'completed',
+        terminalCallbackRunId: 'run-old',
+      });
       mockExternalUpdateOne.mockResolvedValue({ matchedCount: 0 });
-      await expect(fenceGlassHiveCallbackRunState({ binding, body, effectSession }))
-        .rejects.toMatchObject({ code: 'glasshive_callback_run_binding_not_ready' });
+      await expect(
+        fenceGlassHiveCallbackRunState({ binding, body, effectSession }),
+      ).rejects.toMatchObject({ code: 'glasshive_callback_run_binding_not_ready' });
       expect(mockExternalUpdateOne).toHaveBeenCalledTimes(1);
     });
   });

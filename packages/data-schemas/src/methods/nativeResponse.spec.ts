@@ -159,9 +159,25 @@ describe('native response source and final persistence', () => {
   it('preserves exact source after unsupported release only through explicit source preparation', async () => {
     await methods.admitNativeResponse(identity, transaction);
     await methods.settleNativeResponse(identity, 'unsupported');
-    expect(await methods.prepareNativeMainBackgroundInput(identity, backgroundInput, transaction)).toBe(false);
-    expect(await methods.prepareNativeMainBackgroundInput(identity, backgroundInput, transaction, 'current_main')).toBe(true);
-    expect(await methods.prepareNativeMainBackgroundInput(identity, backgroundInput, transaction, 'current_main')).toBe(true);
+    expect(
+      await methods.prepareNativeMainBackgroundInput(identity, backgroundInput, transaction),
+    ).toBe(false);
+    expect(
+      await methods.prepareNativeMainBackgroundInput(
+        identity,
+        backgroundInput,
+        transaction,
+        'current_main',
+      ),
+    ).toBe(true);
+    expect(
+      await methods.prepareNativeMainBackgroundInput(
+        identity,
+        backgroundInput,
+        transaction,
+        'current_main',
+      ),
+    ).toBe(true);
     const row = await methods.getNativeResponse(user, 'answer');
     expect(row?.nativeResponse?.status).toBe('unsupported');
     expect(row?.unfinished).toBe(false);
@@ -169,75 +185,147 @@ describe('native response source and final persistence', () => {
     expect(row?.metadata?.viventium).toMatchObject({
       backgroundInputs: [backgroundInput],
       backgroundInputReceipts: [
-        { version: 1, invocationId: identity.invocationId, deliveryId: backgroundInput.deliveryId,
-          textSha256: backgroundInput.textSha256, status: 'offered' },
+        {
+          version: 1,
+          invocationId: identity.invocationId,
+          deliveryId: backgroundInput.deliveryId,
+          textSha256: backgroundInput.textSha256,
+          status: 'offered',
+        },
       ],
     });
     expect(await methods.nativeResponseSourceMatches(identity)).toBe(true);
-    expect(await methods.recordNativeMainBackgroundInputReceipt(identity, {
-      deliveryId: backgroundInput.deliveryId, textSha256: backgroundInput.textSha256,
-      status: 'unavailable',
-    })).toBe(true);
+    expect(
+      await methods.recordNativeMainBackgroundInputReceipt(identity, {
+        deliveryId: backgroundInput.deliveryId,
+        textSha256: backgroundInput.textSha256,
+        status: 'unavailable',
+      }),
+    ).toBe(true);
     expect(await methods.nativeResponseSourceMatches(identity)).toBe(true);
     const afterReceipt = await methods.getNativeResponse(user, 'answer');
-    expect(afterReceipt?.metadata?.viventium).toMatchObject({ backgroundInputs: [backgroundInput] });
+    expect(afterReceipt?.metadata?.viventium).toMatchObject({
+      backgroundInputs: [backgroundInput],
+    });
     expect(afterReceipt?.nativeResponse).toEqual(row?.nativeResponse);
   });
   it.each(['prepared', 'completed', 'cancelled', 'failed', 'foreign', 'source_changed'])(
-    'does not grant source preservation for %s continuation', async (cause) => {
+    'does not grant source preservation for %s continuation',
+    async (cause) => {
       await methods.admitNativeResponse(identity, transaction);
       await methods.settleNativeResponse(identity, 'unsupported');
       if (['prepared', 'completed', 'cancelled', 'failed'].includes(cause))
-        await mongoose.models.Message.updateOne({ messageId: 'answer' }, { 'nativeResponse.status': cause });
-      if (cause === 'source_changed') await mongoose.models.Message.updateOne({ messageId: 'question' }, { text: 'Replaced source.' });
+        await mongoose.models.Message.updateOne(
+          { messageId: 'answer' },
+          { 'nativeResponse.status': cause },
+        );
+      if (cause === 'source_changed')
+        await mongoose.models.Message.updateOne(
+          { messageId: 'question' },
+          { text: 'Replaced source.' },
+        );
       const current = cause === 'foreign' ? { ...identity, streamId: 'other' } : identity;
-      if (cause === 'source_changed') await expect(
-        methods.prepareNativeMainBackgroundInput(current, backgroundInput, transaction, 'current_main'),
-      ).rejects.toThrow('native_response_source_changed');
-      else expect(await methods.prepareNativeMainBackgroundInput(current, backgroundInput, transaction, 'current_main')).toBe(false);
-      expect((await methods.getNativeResponse(user, 'answer'))?.metadata?.viventium || {}).not.toHaveProperty('backgroundInputs');
+      if (cause === 'source_changed')
+        await expect(
+          methods.prepareNativeMainBackgroundInput(
+            current,
+            backgroundInput,
+            transaction,
+            'current_main',
+          ),
+        ).rejects.toThrow('native_response_source_changed');
+      else
+        expect(
+          await methods.prepareNativeMainBackgroundInput(
+            current,
+            backgroundInput,
+            transaction,
+            'current_main',
+          ),
+        ).toBe(false);
+      expect(
+        (await methods.getNativeResponse(user, 'answer'))?.metadata?.viventium || {},
+      ).not.toHaveProperty('backgroundInputs');
     },
   );
-  it.each(['unsupported', 'cancelled'] as const)('retries source preparation when %s commits after its pending read', async (status) => {
-    await methods.admitNativeResponse(identity, transaction);
-    let release!: () => void;
-    let entered!: () => void;
-    const held = new Promise<void>((resolve) => { release = resolve; });
-    const started = new Promise<void>((resolve) => { entered = resolve; });
-    const Message = mongoose.models.Message;
-    const update = Message.updateOne.bind(Message);
-    let interceptedSource = false;
-    const intercepted = jest.spyOn(Message, 'updateOne').mockImplementation((...args) => {
-      const mutation = Array.from(args)[1];
-      if (!interceptedSource && mutation && !Array.isArray(mutation) &&
-          mutation.$addToSet && 'metadata.viventium.backgroundInputs' in mutation.$addToSet) {
-        interceptedSource = true;
-        entered();
-        return held.then(() => update(...args)) as ReturnType<typeof Message.updateOne>;
+  it.each(['unsupported', 'cancelled'] as const)(
+    'retries source preparation when %s commits after its pending read',
+    async (status) => {
+      await methods.admitNativeResponse(identity, transaction);
+      let release!: () => void;
+      let entered!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const Message = mongoose.models.Message;
+      const update = Message.updateOne.bind(Message);
+      let interceptedSource = false;
+      const intercepted = jest.spyOn(Message, 'updateOne').mockImplementation((...args) => {
+        const mutation = Array.from(args)[1];
+        if (
+          !interceptedSource &&
+          mutation &&
+          !Array.isArray(mutation) &&
+          mutation.$addToSet &&
+          'metadata.viventium.backgroundInputs' in mutation.$addToSet
+        ) {
+          interceptedSource = true;
+          entered();
+          return held.then(() => update(...args)) as ReturnType<typeof Message.updateOne>;
+        }
+        return update(...args);
+      });
+      let attempts = 0;
+      const preparing = methods.prepareNativeMainBackgroundInput(
+        identity,
+        backgroundInput,
+        (operation) =>
+          transaction(() => {
+            attempts++;
+            return operation();
+          }),
+        'current_main',
+      );
+      try {
+        await started;
+        expect(await methods.settleNativeResponse(identity, status)).toMatchObject({
+          matchedCount: 1,
+        });
+      } finally {
+        release();
       }
-      return update(...args);
-    });
-    let attempts = 0;
-    const preparing = methods.prepareNativeMainBackgroundInput(identity, backgroundInput,
-      (operation) => transaction(() => { attempts++; return operation(); }), 'current_main');
-    try {
-      await started;
-      expect(await methods.settleNativeResponse(identity, status)).toMatchObject({ matchedCount: 1 });
-    } finally { release(); }
-    try { expect(await preparing).toBe(status === 'unsupported'); }
-    finally { intercepted.mockRestore(); }
-    expect(attempts).toBeGreaterThan(1);
-    const row = await methods.getNativeResponse(user, 'answer');
-    expect(row).toMatchObject({ unfinished: false, error: status === 'unsupported', nativeResponse: { status } });
-    if (status === 'unsupported') expect(row?.metadata?.viventium).toMatchObject({
-      backgroundInputs: [backgroundInput], backgroundInputReceipts: [
-        { version: 1, invocationId: identity.invocationId, deliveryId: backgroundInput.deliveryId,
-          textSha256: backgroundInput.textSha256, status: 'offered' },
-      ],
-    });
-    else expect(row?.metadata?.viventium || {}).not.toHaveProperty('backgroundInputs');
-    expect(await methods.nativeResponseSourceMatches(identity)).toBe(true);
-  });
+      try {
+        expect(await preparing).toBe(status === 'unsupported');
+      } finally {
+        intercepted.mockRestore();
+      }
+      expect(attempts).toBeGreaterThan(1);
+      const row = await methods.getNativeResponse(user, 'answer');
+      expect(row).toMatchObject({
+        unfinished: false,
+        error: status === 'unsupported',
+        nativeResponse: { status },
+      });
+      if (status === 'unsupported')
+        expect(row?.metadata?.viventium).toMatchObject({
+          backgroundInputs: [backgroundInput],
+          backgroundInputReceipts: [
+            {
+              version: 1,
+              invocationId: identity.invocationId,
+              deliveryId: backgroundInput.deliveryId,
+              textSha256: backgroundInput.textSha256,
+              status: 'offered',
+            },
+          ],
+        });
+      else expect(row?.metadata?.viventium || {}).not.toHaveProperty('backgroundInputs');
+      expect(await methods.nativeResponseSourceMatches(identity)).toBe(true);
+    },
+  );
   it('retains prepared input through pending/prepared/completed foreground snapshots and materialization', async () => {
     await methods.admitNativeResponse(identity, transaction);
     await methods.prepareNativeMainBackgroundInput(identity, backgroundInput, transaction);
@@ -266,21 +354,34 @@ describe('native response source and final persistence', () => {
       await methods.prepareNativeMainBackgroundInput(identity, backgroundInput, transaction),
     ).toBe(false);
   });
-  it.each(['pending', 'unsupported'] as const)('does not accept background source or a receipt from ordinary %s snapshot metadata', async (status) => {
-    await methods.admitNativeResponse(identity, transaction);
-    if (status === 'unsupported') await methods.settleNativeResponse(identity, status);
-    for (const mode of ['snapshot', 'augmentation'] as const)
-      await methods.saveNativeResponseSnapshot(user, {
-        messageId: 'answer', unfinished: true,
-        metadata: { viventium: {
-          backgroundInputs: [backgroundInput],
-          backgroundInputReceipts: [{ deliveryId: backgroundInput.deliveryId, status: 'queued' }],
-        } },
-      }, identity, mode);
-    const row = await methods.getNativeResponse(user, 'answer');
-    expect(row?.metadata?.viventium?.backgroundInputs).toBeUndefined();
-    expect(row?.metadata?.viventium?.backgroundInputReceipts).toBeUndefined();
-  });
+  it.each(['pending', 'unsupported'] as const)(
+    'does not accept background source or a receipt from ordinary %s snapshot metadata',
+    async (status) => {
+      await methods.admitNativeResponse(identity, transaction);
+      if (status === 'unsupported') await methods.settleNativeResponse(identity, status);
+      for (const mode of ['snapshot', 'augmentation'] as const)
+        await methods.saveNativeResponseSnapshot(
+          user,
+          {
+            messageId: 'answer',
+            unfinished: true,
+            metadata: {
+              viventium: {
+                backgroundInputs: [backgroundInput],
+                backgroundInputReceipts: [
+                  { deliveryId: backgroundInput.deliveryId, status: 'queued' },
+                ],
+              },
+            },
+          },
+          identity,
+          mode,
+        );
+      const row = await methods.getNativeResponse(user, 'answer');
+      expect(row?.metadata?.viventium?.backgroundInputs).toBeUndefined();
+      expect(row?.metadata?.viventium?.backgroundInputReceipts).toBeUndefined();
+    },
+  );
   it('refuses prepared background input when its original user source changed', async () => {
     await methods.admitNativeResponse(identity, transaction);
     await mongoose.models.Message.updateOne({ messageId: 'question' }, { text: 'Edited request.' });
@@ -299,32 +400,51 @@ describe('native response source and final persistence', () => {
         await methods.prepareNativeMainBackgroundInput(identity, backgroundInput, transaction);
       let release!: () => void;
       let entered!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const started = new Promise<void>((resolve) => { entered = resolve; });
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
       const Message = mongoose.models.Message;
       const update = Message.findOneAndUpdate.bind(Message);
-      const intercepted = jest.spyOn(Message, 'findOneAndUpdate').mockImplementationOnce((...args) => {
-        entered();
-        return held.then(() => update(...args)) as ReturnType<typeof Message.findOneAndUpdate>;
-      });
+      const intercepted = jest
+        .spyOn(Message, 'findOneAndUpdate')
+        .mockImplementationOnce((...args) => {
+          entered();
+          return held.then(() => update(...args)) as ReturnType<typeof Message.findOneAndUpdate>;
+        });
       let attempts = 0;
       const saving = transaction(() => {
         attempts++;
-        return methods.saveNativeResponseSnapshot(user, {
-          messageId: 'answer', unfinished: true,
-          metadata: { viventium: { sibling: 'foreground' } },
-        }, identity);
+        return methods.saveNativeResponseSnapshot(
+          user,
+          {
+            messageId: 'answer',
+            unfinished: true,
+            metadata: { viventium: { sibling: 'foreground' } },
+          },
+          identity,
+        );
       });
       await started;
       const receipt = {
-        deliveryId: backgroundInput.deliveryId, textSha256: backgroundInput.textSha256,
-        status: 'queued' as const, runId: 'run', attemptId: 'attempt', messageId: 'control',
+        deliveryId: backgroundInput.deliveryId,
+        textSha256: backgroundInput.textSha256,
+        status: 'queued' as const,
+        runId: 'run',
+        attemptId: 'attempt',
+        messageId: 'control',
       };
       try {
-        expect(mutation === 'input'
-          ? await methods.prepareNativeMainBackgroundInput(identity, backgroundInput, transaction)
-          : await methods.recordNativeMainBackgroundInputReceipt(identity, receipt)).toBe(true);
-      } finally { release(); }
+        expect(
+          mutation === 'input'
+            ? await methods.prepareNativeMainBackgroundInput(identity, backgroundInput, transaction)
+            : await methods.recordNativeMainBackgroundInputReceipt(identity, receipt),
+        ).toBe(true);
+      } finally {
+        release();
+      }
       await saving;
       intercepted.mockRestore();
       expect(attempts).toBeGreaterThan(1);
@@ -332,8 +452,13 @@ describe('native response source and final persistence', () => {
       expect(row?.metadata?.viventium?.backgroundInputs).toEqual([backgroundInput]);
       expect(row?.metadata?.viventium?.backgroundInputReceipts).toEqual([
         mutation === 'input'
-          ? { version: 1, invocationId: identity.invocationId, deliveryId: backgroundInput.deliveryId,
-              textSha256: backgroundInput.textSha256, status: 'offered' }
+          ? {
+              version: 1,
+              invocationId: identity.invocationId,
+              deliveryId: backgroundInput.deliveryId,
+              textSha256: backgroundInput.textSha256,
+              status: 'offered',
+            }
           : { version: 1, invocationId: identity.invocationId, ...receipt },
       ]);
       expect(row?.metadata?.viventium?.sibling).toBe('foreground');
@@ -434,18 +559,37 @@ describe('native response source and final persistence', () => {
   it('fences original attachment evidence in the final publication transaction after File I/O', async () => {
     await methods.admitNativeResponse(identity, transaction);
     const digest = await methods.prepareNativeResponse(identity, candidate, transaction);
-    const attachments = [{ filename: 'captured.jpg', file_id: 'selected', nativeOutputFile: {
-      version: 1 as const, status: 'available' as const, messageId: 'answer', downloadUrl: 'https://artifacts.example.test/capture',
-      selectedReferences: ['artifact_sha256:' + 'a'.repeat(64)] } }];
+    const attachments = [
+      {
+        filename: 'captured.jpg',
+        file_id: 'selected',
+        nativeOutputFile: {
+          version: 1 as const,
+          status: 'available' as const,
+          messageId: 'answer',
+          downloadUrl: 'https://artifacts.example.test/capture',
+          selectedReferences: ['artifact_sha256:' + 'a'.repeat(64)],
+        },
+      },
+    ];
     const authorizePublication = jest.fn(async (session: mongoose.ClientSession) => {
       expect(session.inTransaction()).toBe(true);
     });
     const prepare = jest.fn(async () => ({ attachments, authorizePublication }));
-    const saved = await methods.materializeNativeResponse(identity, digest, commit, transaction, undefined, prepare);
+    const saved = await methods.materializeNativeResponse(
+      identity,
+      digest,
+      commit,
+      transaction,
+      undefined,
+      prepare,
+    );
     expect(saved?.attachments).toEqual([{ type: 'file', file_id: 'kept' }, ...attachments]);
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(authorizePublication).toHaveBeenCalledTimes(1);
-    expect((await methods.getNativeResponse(user, 'answer'))?.attachments).toEqual(saved?.attachments);
+    expect((await methods.getNativeResponse(user, 'answer'))?.attachments).toEqual(
+      saved?.attachments,
+    );
   });
   it('rejects superseded original evidence after import without publishing a successful attachment', async () => {
     await methods.admitNativeResponse(identity, transaction);
@@ -457,10 +601,14 @@ describe('native response source and final persistence', () => {
     });
     const prepare = jest.fn(async () => {
       accepted = false;
-      return { attachments: [{ filename: 'captured.jpg', file_id: 'selected' }], authorizePublication };
+      return {
+        attachments: [{ filename: 'captured.jpg', file_id: 'selected' }],
+        authorizePublication,
+      };
     });
-    await expect(methods.materializeNativeResponse(identity, digest, commit, transaction, undefined, prepare))
-      .rejects.toThrow('native_media_evidence_superseded');
+    await expect(
+      methods.materializeNativeResponse(identity, digest, commit, transaction, undefined, prepare),
+    ).rejects.toThrow('native_media_evidence_superseded');
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(authorizePublication).toHaveBeenCalledTimes(1);
     const row = await methods.getNativeResponse(user, 'answer');
@@ -575,10 +723,15 @@ describe('native response source and final persistence', () => {
   );
   it('preserves typed native attention through durable replay and late augmentation', async () => {
     await methods.admitNativeResponse(identity, transaction);
-    const materialize = () => methods.materializeNativeResponseTerminal(
-      identity, 'failed', async () => true, transaction, (message) => message,
-      'provider_progress_stalled',
-    );
+    const materialize = () =>
+      methods.materializeNativeResponseTerminal(
+        identity,
+        'failed',
+        async () => true,
+        transaction,
+        (message) => message,
+        'provider_progress_stalled',
+      );
     const saved = await materialize();
     const attention = {
       type: 'error',
@@ -591,10 +744,17 @@ describe('native response source and final persistence', () => {
     expect((await materialize())?.content).toEqual(saved?.content);
     expect(await methods.markNativeResponseReplayStored(identity)).toBe(true);
     const augmented = await methods.saveNativeResponseSnapshot(
-      user, { messageId: 'answer', text: 'Late', error: false, content: [] }, identity, 'augmentation',
+      user,
+      { messageId: 'answer', text: 'Late', error: false, content: [] },
+      identity,
+      'augmentation',
     );
     expect(augmented?.content).toEqual(expect.arrayContaining([attention]));
-    expect(augmented).toMatchObject({ error: true, unfinished: false, finish_reason: 'incomplete' });
+    expect(augmented).toMatchObject({
+      error: true,
+      unfinished: false,
+      finish_reason: 'incomplete',
+    });
   });
 
   it('requires current publication authority for legacy unmarked terminal rows', async () => {
@@ -1512,33 +1672,47 @@ describe('native response source and final persistence', () => {
       });
     },
   );
-  it.each([true, false])('dotted completed metadata preserves canonical field presence: %s', async (present) => {
-    await methods.admitNativeResponse(identity, transaction);
-    const digest = await methods.prepareNativeResponse(identity, candidate, transaction);
-    await methods.materializeNativeResponse(identity, digest, commit, transaction);
-    const canonical = {
-      deliveryDisposition: { version: 1, audio: 'skip', required: true, valid: true, source: 'model' },
-      nativeToolEvidence: { logicalTurnId: 'turn', revision: 1, evidence: { run_id: 'current' } },
-      backgroundInputs: [{ deliveryId: 'current' }],
-      backgroundInputReceipts: [{ deliveryId: 'current', status: 'offered' }],
-      deliveryAcknowledgement: { state: 'committed' },
-    };
-    await mongoose.models.Message.updateOne({ messageId: 'answer' }, {
-      $set: { metadata: { keep: true, viventium: { ...(present ? canonical : {}) } } },
-    });
-    await methods.saveNativeResponseSnapshot(user, {
-      messageId: 'answer',
-      'metadata.sibling': 'added',
-      'metadata.viventium.deliveryDisposition.audio': 'eligible',
-      'metadata.viventium.nativeToolEvidence': { evidence: { run_id: 'foreign' } },
-      'metadata.viventium.backgroundInputs': [{ deliveryId: 'forged' }],
-      'metadata.viventium.backgroundInputReceipts': [{ deliveryId: 'forged' }],
-      'metadata.viventium.deliveryAcknowledgement': { state: 'failed' },
-    });
-    expect((await methods.getNativeResponse(user, 'answer'))?.metadata).toEqual({
-      keep: true, sibling: 'added', viventium: { ...(present ? canonical : {}) },
-    });
-  });
+  it.each([true, false])(
+    'dotted completed metadata preserves canonical field presence: %s',
+    async (present) => {
+      await methods.admitNativeResponse(identity, transaction);
+      const digest = await methods.prepareNativeResponse(identity, candidate, transaction);
+      await methods.materializeNativeResponse(identity, digest, commit, transaction);
+      const canonical = {
+        deliveryDisposition: {
+          version: 1,
+          audio: 'skip',
+          required: true,
+          valid: true,
+          source: 'model',
+        },
+        nativeToolEvidence: { logicalTurnId: 'turn', revision: 1, evidence: { run_id: 'current' } },
+        backgroundInputs: [{ deliveryId: 'current' }],
+        backgroundInputReceipts: [{ deliveryId: 'current', status: 'offered' }],
+        deliveryAcknowledgement: { state: 'committed' },
+      };
+      await mongoose.models.Message.updateOne(
+        { messageId: 'answer' },
+        {
+          $set: { metadata: { keep: true, viventium: { ...(present ? canonical : {}) } } },
+        },
+      );
+      await methods.saveNativeResponseSnapshot(user, {
+        messageId: 'answer',
+        'metadata.sibling': 'added',
+        'metadata.viventium.deliveryDisposition.audio': 'eligible',
+        'metadata.viventium.nativeToolEvidence': { evidence: { run_id: 'foreign' } },
+        'metadata.viventium.backgroundInputs': [{ deliveryId: 'forged' }],
+        'metadata.viventium.backgroundInputReceipts': [{ deliveryId: 'forged' }],
+        'metadata.viventium.deliveryAcknowledgement': { state: 'failed' },
+      });
+      expect((await methods.getNativeResponse(user, 'answer'))?.metadata).toEqual({
+        keep: true,
+        sibling: 'added',
+        viventium: { ...(present ? canonical : {}) },
+      });
+    },
+  );
 
   it('dotted snapshot keeps unrelated metadata and receipts committed after its read', async () => {
     await methods.admitNativeResponse(identity, transaction);
@@ -1547,21 +1721,40 @@ describe('native response source and final persistence', () => {
     const Message = mongoose.models.Message;
     const canonical = { version: 1, audio: 'skip', required: true, valid: true, source: 'model' };
     const mainContext = { agentId: 'main', stableAuthoritySha256: 'f'.repeat(64) };
-    await Message.updateOne({ messageId: 'answer' }, { $set: { metadata: {
-      sibling: 'before', viventium: { mainContext, deliveryDisposition: canonical,
-        backgroundInputReceipts: [], deliveryAcknowledgement: { state: 'pending' } },
-    } } });
+    await Message.updateOne(
+      { messageId: 'answer' },
+      {
+        $set: {
+          metadata: {
+            sibling: 'before',
+            viventium: {
+              mainContext,
+              deliveryDisposition: canonical,
+              backgroundInputReceipts: [],
+              deliveryAcknowledgement: { state: 'pending' },
+            },
+          },
+        },
+      },
+    );
     let release!: () => void;
     let entered!: () => void;
-    const held = new Promise<void>((resolve) => { release = resolve; });
-    const started = new Promise<void>((resolve) => { entered = resolve; });
-    const write = Message.findOneAndUpdate.bind(Message);
-    const intercepted = jest.spyOn(Message, 'findOneAndUpdate').mockImplementationOnce((...args) => {
-      entered();
-      return held.then(() => write(...args)) as ReturnType<typeof Message.findOneAndUpdate>;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
     });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const write = Message.findOneAndUpdate.bind(Message);
+    const intercepted = jest
+      .spyOn(Message, 'findOneAndUpdate')
+      .mockImplementationOnce((...args) => {
+        entered();
+        return held.then(() => write(...args)) as ReturnType<typeof Message.findOneAndUpdate>;
+      });
     const snapshot = methods.saveNativeResponseSnapshot(user, {
-      messageId: 'answer', 'metadata.sibling': 'requested',
+      messageId: 'answer',
+      'metadata.sibling': 'requested',
       'metadata.viventium.deliveryDisposition.audio': 'eligible',
       'metadata.viventium.backgroundInputReceipts': [{ deliveryId: 'forged' }],
       'metadata.viventium.deliveryAcknowledgement': { state: 'failed' },
@@ -1570,18 +1763,34 @@ describe('native response source and final persistence', () => {
     const receipt = { deliveryId: 'accepted-later', status: 'offered' };
     const acknowledgement = { state: 'committed', presentation_ref: 'exact-answer' };
     try {
-      await Message.updateOne({ messageId: 'answer' }, {
-        $set: { 'metadata.unrelated': 'committed-later',
-          'metadata.viventium.unrelated': 'also-kept',
-          'metadata.viventium.deliveryAcknowledgement': acknowledgement },
-        $push: { 'metadata.viventium.backgroundInputReceipts': receipt },
-      });
-    } finally { release(); }
-    try { await snapshot; } finally { intercepted.mockRestore(); }
+      await Message.updateOne(
+        { messageId: 'answer' },
+        {
+          $set: {
+            'metadata.unrelated': 'committed-later',
+            'metadata.viventium.unrelated': 'also-kept',
+            'metadata.viventium.deliveryAcknowledgement': acknowledgement,
+          },
+          $push: { 'metadata.viventium.backgroundInputReceipts': receipt },
+        },
+      );
+    } finally {
+      release();
+    }
+    try {
+      await snapshot;
+    } finally {
+      intercepted.mockRestore();
+    }
     expect((await methods.getNativeResponse(user, 'answer'))?.metadata).toEqual({
-      sibling: 'requested', unrelated: 'committed-later', viventium: {
-        mainContext, deliveryDisposition: canonical, unrelated: 'also-kept',
-        backgroundInputReceipts: [receipt], deliveryAcknowledgement: acknowledgement,
+      sibling: 'requested',
+      unrelated: 'committed-later',
+      viventium: {
+        mainContext,
+        deliveryDisposition: canonical,
+        unrelated: 'also-kept',
+        backgroundInputReceipts: [receipt],
+        deliveryAcknowledgement: acknowledgement,
       },
     });
   });

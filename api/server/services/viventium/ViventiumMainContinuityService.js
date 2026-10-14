@@ -17,13 +17,17 @@ const persistence = {
     }
   },
   async renewCompactionLease(key, version, lease, expiresAt) {
-    const result = await ViventiumMainContinuityState.updateOne({
-      domainEpochKey: key, version,
-      'compactionLease.leaseId': lease.leaseId,
-      'compactionLease.sourceDigest': lease.sourceDigest,
-      'compactionLease.expiresAt': lease.expiresAt,
-      $expr: { $gt: ['$compactionLease.expiresAt', '$$NOW'] },
-    }, { $set: { 'compactionLease.expiresAt': expiresAt }, $inc: { version: 1 } });
+    const result = await ViventiumMainContinuityState.updateOne(
+      {
+        domainEpochKey: key,
+        version,
+        'compactionLease.leaseId': lease.leaseId,
+        'compactionLease.sourceDigest': lease.sourceDigest,
+        'compactionLease.expiresAt': lease.expiresAt,
+        $expr: { $gt: ['$compactionLease.expiresAt', '$$NOW'] },
+      },
+      { $set: { 'compactionLease.expiresAt': expiresAt }, $inc: { version: 1 } },
+    );
     return result.modifiedCount === 1;
   },
   async compareAndSwap(key, version, state) {

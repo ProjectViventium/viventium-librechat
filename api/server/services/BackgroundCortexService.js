@@ -4621,7 +4621,9 @@ async function runCortexAttempt(
       nativeTools,
       // Private structured state is owned by the internal result consumer, never a user reply.
       privateStructuredResponse:
-        completedResultPolicy === 'internal' && insightMode === 'structured' && nativeTools === false,
+        completedResultPolicy === 'internal' &&
+        insightMode === 'structured' &&
+        nativeTools === false,
       signal: abortController.signal,
       cancellationReq: cortexCancellationReq,
     });

@@ -66,31 +66,54 @@ describe('GlassHive active-work service', () => {
   });
 
   it('adds Core-only history on the first page without repeating it on native cursor pages', async () => {
-    const coreRows = Array.from({ length: 100 }, (_, i) => ({ workRef: `core-${i}`, state: 'failed' }));
+    const coreRows = Array.from({ length: 100 }, (_, i) => ({
+      workRef: `core-${i}`,
+      state: 'failed',
+    }));
     const nativeRows = [{ workRef: 'native-history', state: 'completed' }];
     const enrichActiveWorkSnapshot = jest.fn(async ({ snapshot, includeCoreOnlyHistory }) => ({
       ...snapshot,
       work: [...snapshot.work, ...(includeCoreOnlyHistory ? coreRows : [])],
     }));
     const service = testService({ enrichActiveWorkSnapshot });
-    const fetchImpl = jest.fn(async () => jsonResponse({
-      snapshot: 'fresh', work: nativeRows, cursor: 'signed.next-page', overflowCount: 7,
-    }));
-    const first = await service.getActiveWorkHistoryPage({ ownerId: 'owner-1', limit: 100, fetchImpl });
+    const fetchImpl = jest.fn(async () =>
+      jsonResponse({
+        snapshot: 'fresh',
+        work: nativeRows,
+        cursor: 'signed.next-page',
+        overflowCount: 7,
+      }),
+    );
+    const first = await service.getActiveWorkHistoryPage({
+      ownerId: 'owner-1',
+      limit: 100,
+      fetchImpl,
+    });
     const next = await service.getActiveWorkHistoryPage({
-      ownerId: 'owner-1', cursor: 'signed.next-page', limit: 100, fetchImpl,
+      ownerId: 'owner-1',
+      cursor: 'signed.next-page',
+      limit: 100,
+      fetchImpl,
     });
     expect(first.work).toEqual([...nativeRows, ...coreRows]);
     expect(next.work).toEqual(nativeRows);
     expect(first.cursor).toBe('signed.next-page');
     expect(next.cursor).toBe('signed.next-page');
     expect(next.overflowCount).toBe(7);
-    expect(enrichActiveWorkSnapshot).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      ownerId: 'owner-1', includeCoreOnlyHistory: true,
-    }));
-    expect(enrichActiveWorkSnapshot).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      ownerId: 'owner-1', includeCoreOnlyHistory: false,
-    }));
+    expect(enrichActiveWorkSnapshot).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        ownerId: 'owner-1',
+        includeCoreOnlyHistory: true,
+      }),
+    );
+    expect(enrichActiveWorkSnapshot).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        ownerId: 'owner-1',
+        includeCoreOnlyHistory: false,
+      }),
+    );
   });
 
   it('returns a cached stale snapshot when an explicit refresh is unavailable', async () => {

@@ -69,9 +69,20 @@ describe('GlassHive Main orchestration tools', () => {
   });
 
   test('exposes and validates source selection from the trusted construction request', () => {
-    const make = (count: number) => createGlassHiveMainDelegationTool({ userId: 'owner-1',
-      req: { body: { viventiumTriggeringSourceSegments: Array.from({ length: count }, () => ({ text: 'Source' })) } },
-    }, { executeMainDelegation, logger });
+    const make = (count: number) =>
+      createGlassHiveMainDelegationTool(
+        {
+          userId: 'owner-1',
+          req: {
+            body: {
+              viventiumTriggeringSourceSegments: Array.from({ length: count }, () => ({
+                text: 'Source',
+              })),
+            },
+          },
+        },
+        { executeMainDelegation, logger },
+      );
     const args = { title: 'Mission', instruction: 'Complete it.', resourceClass: 'standard' };
     const multi = make(3).schema;
     expect(multi.safeParse(args).success).toBe(false);
@@ -128,22 +139,38 @@ describe('GlassHive Main orchestration tools', () => {
   });
 
   test('admits and forwards exact files through the same provider-independent facade', async () => {
-    const delegation = createGlassHiveMainDelegationTool({ userId: 'owner-1' },
-      { executeMainDelegation, logger });
-    const args = { title: 'Read original', instruction: 'Compare the original attachment.',
-      resourceClass: 'standard' as const, fileIds: ['11111111-1111-4111-8111-111111111111'] };
+    const delegation = createGlassHiveMainDelegationTool(
+      { userId: 'owner-1' },
+      { executeMainDelegation, logger },
+    );
+    const args = {
+      title: 'Read original',
+      instruction: 'Compare the original attachment.',
+      resourceClass: 'standard' as const,
+      fileIds: ['11111111-1111-4111-8111-111111111111'],
+    };
     expect(delegation.schema.safeParse(args).success).toBe(true);
     expect(delegation.schema.safeParse({ ...args, fileIds: [] }).success).toBe(true);
-    for (const fileIds of [[''], [' spaced'], ['duplicate', 'duplicate'], [42],
-      ['x'.repeat(257)], Array.from({ length: 65 }, (_, i) => String(i))]) {
+    for (const fileIds of [
+      [''],
+      [' spaced'],
+      ['duplicate', 'duplicate'],
+      [42],
+      ['x'.repeat(257)],
+      Array.from({ length: 65 }, (_, i) => String(i)),
+    ]) {
       expect(delegation.schema.safeParse({ ...args, fileIds }).success).toBe(false);
     }
-    await delegation.invoke(args, { configurable: {
-      requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
-    } });
-    expect(executeMainDelegation).toHaveBeenCalledWith(expect.objectContaining({
-      args: expect.objectContaining({ fileIds: args.fileIds }),
-    }));
+    await delegation.invoke(args, {
+      configurable: {
+        requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
+      },
+    });
+    expect(executeMainDelegation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        args: expect.objectContaining({ fileIds: args.fileIds }),
+      }),
+    );
   });
 
   test('blocks execution when trusted turn identity is absent', async () => {

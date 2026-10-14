@@ -93,40 +93,61 @@ function sanitizePrivateMessageContent(value, ancestors = new WeakSet()) {
  */
 const ORIGINAL_INPUT_RECEIPT_PATH = 'metadata.viventium.originalInputReceipt';
 function protectsOriginalInputReceipt(path) {
-  return path === 'metadata' || path === 'metadata.viventium' ||
-    path === ORIGINAL_INPUT_RECEIPT_PATH || path.startsWith(`${ORIGINAL_INPUT_RECEIPT_PATH}.`);
+  return (
+    path === 'metadata' ||
+    path === 'metadata.viventium' ||
+    path === ORIGINAL_INPUT_RECEIPT_PATH ||
+    path.startsWith(`${ORIGINAL_INPUT_RECEIPT_PATH}.`)
+  );
 }
 function sanitizeOriginalInputReceiptUpdate(update) {
   const result = {};
   const write = (target, path, value, operator) => {
-    if ((path === 'metadata' || path === 'metadata.viventium') &&
-        (operator === '$set' || operator === '$setOnInsert' || !operator)) {
+    if (
+      (path === 'metadata' || path === 'metadata.viventium') &&
+      (operator === '$set' || operator === '$setOnInsert' || !operator)
+    ) {
       if (value && typeof value === 'object' && !Array.isArray(value)) {
-        for (const [key, item] of Object.entries(value)) write(target, `${path}.${key}`, item, operator);
+        for (const [key, item] of Object.entries(value))
+          write(target, `${path}.${key}`, item, operator);
       }
       return;
     }
-    if (protectsOriginalInputReceipt(path) ||
-        (operator === '$rename' && protectsOriginalInputReceipt(String(value)))) return;
+    if (
+      protectsOriginalInputReceipt(path) ||
+      (operator === '$rename' && protectsOriginalInputReceipt(String(value)))
+    )
+      return;
     target[path] = value;
   };
-  for (const [key,value] of Object.entries(update)) {
+  for (const [key, value] of Object.entries(update)) {
     if (key.startsWith('$') && value && typeof value === 'object' && !Array.isArray(value)) {
       const operands = {};
-      for (const [path,item] of Object.entries(value)) write(operands,path,item,key);
-      result[key]=operands;
-    } else write(result,key,value);
+      for (const [path, item] of Object.entries(value)) write(operands, path, item, key);
+      result[key] = operands;
+    } else write(result, key, value);
   }
   return result;
 }
 function originalInputReceiptForInsert(req, update) {
   if (update.isCreatedByUser !== true) return null;
-  const context = require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(req);
-  if (!context || context.actor_kind !== 'external_user' || context.origin !== 'interactive' ||
-      context.conversation_id !== update.conversationId || !Number.isSafeInteger(context.source_received_at) ||
-      context.source_received_at <= 0 || !context.source_segments?.some(segment =>
-        segment.source_event_id === context.source_event_id && segment.source_message_id === update.messageId)) return null;
-  return {sourceEventId:context.source_event_id,receivedAt:context.source_received_at};
+  const context =
+    require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(req);
+  if (
+    !context ||
+    context.actor_kind !== 'external_user' ||
+    context.origin !== 'interactive' ||
+    context.conversation_id !== update.conversationId ||
+    !Number.isSafeInteger(context.source_received_at) ||
+    context.source_received_at <= 0 ||
+    !context.source_segments?.some(
+      (segment) =>
+        segment.source_event_id === context.source_event_id &&
+        segment.source_message_id === update.messageId,
+    )
+  )
+    return null;
+  return { sourceEventId: context.source_event_id, receivedAt: context.source_received_at };
 }
 /* === VIVENTIUM END === */
 
@@ -208,9 +229,17 @@ function sanitizeMessageForPersistence(message, { purpose = 'update' } = {}) {
   for (const key of Object.keys(document)) {
     if (key !== 'metadata' && protectsOriginalInputReceipt(key)) delete document[key];
   }
-  if (document.metadata && typeof document.metadata === 'object' && !Array.isArray(document.metadata)) {
+  if (
+    document.metadata &&
+    typeof document.metadata === 'object' &&
+    !Array.isArray(document.metadata)
+  ) {
     const metadata = { ...document.metadata };
-    if (metadata.viventium && typeof metadata.viventium === 'object' && !Array.isArray(metadata.viventium)) {
+    if (
+      metadata.viventium &&
+      typeof metadata.viventium === 'object' &&
+      !Array.isArray(metadata.viventium)
+    ) {
       metadata.viventium = { ...metadata.viventium };
       delete metadata.viventium.originalInputReceipt;
     }
@@ -520,7 +549,8 @@ async function saveMessage(req, params, metadata) {
     }
     const receipt = originalInputReceiptForInsert(req, update);
     update = sanitizeOriginalInputReceiptUpdate(update);
-    if (receipt) update.$setOnInsert = {...update.$setOnInsert, [ORIGINAL_INPUT_RECEIPT_PATH]:receipt};
+    if (receipt)
+      update.$setOnInsert = { ...update.$setOnInsert, [ORIGINAL_INPUT_RECEIPT_PATH]: receipt };
     const options = { upsert: true, new: true };
     /* === VIVENTIUM START ===
      * Feature: Deterministic timestamp preservation for imported/callback messages

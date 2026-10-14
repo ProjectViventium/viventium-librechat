@@ -19,15 +19,12 @@ const require = createRequire(import.meta.url);
  * the shim specifiers to absolute paths via CJS require.resolve anchored to the client directory.
  */
 const NODE_POLYFILL_SHIMS: Record<string, string> = {
-  'vite-plugin-node-polyfills/shims/process': require.resolve(
-    'vite-plugin-node-polyfills/shims/process',
-  ),
-  'vite-plugin-node-polyfills/shims/buffer': require.resolve(
-    'vite-plugin-node-polyfills/shims/buffer',
-  ),
-  'vite-plugin-node-polyfills/shims/global': require.resolve(
-    'vite-plugin-node-polyfills/shims/global',
-  ),
+  'vite-plugin-node-polyfills/shims/process':
+    require.resolve('vite-plugin-node-polyfills/shims/process'),
+  'vite-plugin-node-polyfills/shims/buffer':
+    require.resolve('vite-plugin-node-polyfills/shims/buffer'),
+  'vite-plugin-node-polyfills/shims/global':
+    require.resolve('vite-plugin-node-polyfills/shims/global'),
 };
 
 /* === VIVENTIUM START ===
@@ -74,9 +71,7 @@ const USE_COMPOSED_REF_ADAPTER = path.resolve(__dirname, 'src/utils/useComposedR
  * - Preserve the IPv6/bind-all guardrails from the earlier proxy hardening.
  */
 function resolveFrontendPort(env: RuntimeEnv) {
-  return (
-    Number(env.VIVENTIUM_LC_FRONTEND_PORT || env.FRONTEND_PORT || env.VITE_PORT) || 3090
-  );
+  return Number(env.VIVENTIUM_LC_FRONTEND_PORT || env.FRONTEND_PORT || env.VITE_PORT) || 3090;
 }
 /* === VIVENTIUM END === */
 

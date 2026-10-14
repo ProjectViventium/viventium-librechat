@@ -18,10 +18,12 @@ const nativePermissionInput = nativeInputIdentity.extend({
     .min(1)
     .max(16),
 });
-const nativeQuestionInput = nativeInputIdentity.extend({
-  kind: z.literal('question'),
-  requestedSchema: z.unknown(),
-}).refine((value) => nativeQuestionFormFromSchema(value.requestedSchema) !== null);
+const nativeQuestionInput = nativeInputIdentity
+  .extend({
+    kind: z.literal('question'),
+    requestedSchema: z.unknown(),
+  })
+  .refine((value) => nativeQuestionFormFromSchema(value.requestedSchema) !== null);
 const nativeInput = z.union([nativePermissionInput, nativeQuestionInput]);
 const nativeState = z.object({
   version: z.literal(1),
@@ -51,14 +53,27 @@ export function createNativeVoiceInputClient({
   return {
     async isCurrent(key: string, request: NativeVoiceInput) {
       if (!key || Date.parse(request.expiresAt) <= Date.now()) return false;
-      const response = await fetchImpl(url(key), { headers, redirect:'error', signal:AbortSignal.timeout(4000) });
+      const response = await fetchImpl(url(key), {
+        headers,
+        redirect: 'error',
+        signal: AbortSignal.timeout(4000),
+      });
       if (!response.ok) return false;
       const parsed = nativeState.safeParse(await response.json());
-      if (!parsed.success || ['completed','failed','cancelled','unsupported'].includes(parsed.data.state)) return false;
-      return parsed.data.pending.some((pending) => Date.parse(pending.expiresAt) > Date.now() &&
-        ['requestId','requestFingerprint','runId','attemptId','expiresAt','prompt'].every((field) =>
-          pending[field as keyof NativeVoiceInput] === request[field as keyof NativeVoiceInput]) &&
-        (pending.kind || 'permission') === (request.kind || 'permission'));
+      if (
+        !parsed.success ||
+        ['completed', 'failed', 'cancelled', 'unsupported'].includes(parsed.data.state)
+      )
+        return false;
+      return parsed.data.pending.some(
+        (pending) =>
+          Date.parse(pending.expiresAt) > Date.now() &&
+          ['requestId', 'requestFingerprint', 'runId', 'attemptId', 'expiresAt', 'prompt'].every(
+            (field) =>
+              pending[field as keyof NativeVoiceInput] === request[field as keyof NativeVoiceInput],
+          ) &&
+          (pending.kind || 'permission') === (request.kind || 'permission'),
+      );
     },
     async poll({
       key,
@@ -120,7 +135,11 @@ export function createNativeVoiceInputClient({
       if (request.kind === 'question') {
         const form = nativeQuestionFormFromSchema(request.requestedSchema);
         let supplied: unknown;
-        try { supplied = JSON.parse(input); } catch { throw new Error('native_input_invalid_or_expired'); }
+        try {
+          supplied = JSON.parse(input);
+        } catch {
+          throw new Error('native_input_invalid_or_expired');
+        }
         const content = form && nativeQuestionContent(supplied, form);
         if (!content) throw new Error('native_input_invalid_or_expired');
         nativeResponse = JSON.stringify(content);

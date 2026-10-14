@@ -174,19 +174,36 @@ describe('File Routes - Delete with Agent Access', () => {
       otherUserId = otherUserId.toString();
       const raw = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="9"/>');
       const rawId = uuidv4();
-      await createFile({ user: otherUserId, file_id: rawId, filename: 'original.svg',
-        filepath: `/uploads/${otherUserId}/original.svg`, bytes: raw.length,
-        type: 'image/svg+xml', source: 'local' });
+      await createFile({
+        user: otherUserId,
+        file_id: rawId,
+        filename: 'original.svg',
+        filepath: `/uploads/${otherUserId}/original.svg`,
+        bytes: raw.length,
+        type: 'image/svg+xml',
+        source: 'local',
+      });
       const { getStrategyFunctions } = require('~/server/services/Files/strategies');
-      const getDownloadStream = jest.fn().mockImplementation(async () => require('stream').Readable.from([raw]));
+      const getDownloadStream = jest
+        .fn()
+        .mockImplementation(async () => require('stream').Readable.from([raw]));
       getStrategyFunctions.mockReturnValueOnce({ getDownloadStream });
-      const response = await request(app).get(`/files/download/${otherUserId}/${rawId}`).expect(200);
+      const response = await request(app)
+        .get(`/files/download/${otherUserId}/${rawId}`)
+        .expect(200);
       expect(response.body).toEqual(raw);
       expect(response.headers['content-type']).toContain('application/octet-stream');
-      expect(JSON.parse(response.headers['x-file-metadata'])).toEqual(expect.objectContaining({
-        file_id: rawId, type: 'image/svg+xml', bytes: raw.length,
-      }));
-      expect(getDownloadStream).toHaveBeenCalledWith(expect.objectContaining({ user: expect.objectContaining({ id: otherUserId }) }), `/uploads/${otherUserId}/original.svg`);
+      expect(JSON.parse(response.headers['x-file-metadata'])).toEqual(
+        expect.objectContaining({
+          file_id: rawId,
+          type: 'image/svg+xml',
+          bytes: raw.length,
+        }),
+      );
+      expect(getDownloadStream).toHaveBeenCalledWith(
+        expect.objectContaining({ user: expect.objectContaining({ id: otherUserId }) }),
+        `/uploads/${otherUserId}/original.svg`,
+      );
     });
     it('does not grant another owner access through a download URL', async () => {
       otherUserId = otherUserId.toString();

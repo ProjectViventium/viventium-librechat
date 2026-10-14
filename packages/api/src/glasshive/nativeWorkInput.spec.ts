@@ -587,15 +587,35 @@ it('rejects unknown reserved annotation keys without an inherited-property excep
 });
 
 it('retains the exact bounded native permission operation as display-only detail', () => {
-  const input = {...pending, requestedSchema: {...pending.requestedSchema, properties: {
-    optionId: {...pending.requestedSchema.properties.optionId, description: 'Create synthetic.txt in the working folder.'},
-  }}};
-  const {courier, executeWorkAction} = setup(undefined, input);
-  expect(courier).toMatchObject({prompt: pending.message, operationTitle: input.requestedSchema.properties.optionId.description});
+  const input = {
+    ...pending,
+    requestedSchema: {
+      ...pending.requestedSchema,
+      properties: {
+        optionId: {
+          ...pending.requestedSchema.properties.optionId,
+          description: 'Create synthetic.txt in the working folder.',
+        },
+      },
+    },
+  };
+  const { courier, executeWorkAction } = setup(undefined, input);
+  expect(courier).toMatchObject({
+    prompt: pending.message,
+    operationTitle: input.requestedSchema.properties.optionId.description,
+  });
   expect(executeWorkAction).not.toHaveBeenCalled();
-  expect(setup(undefined, {...input, requestedSchema: {...input.requestedSchema, properties: {
-    optionId: {...input.requestedSchema.properties.optionId, description: 'x'.repeat(8001)},
-  }}}).courier).toBeNull();
+  expect(
+    setup(undefined, {
+      ...input,
+      requestedSchema: {
+        ...input.requestedSchema,
+        properties: {
+          optionId: { ...input.requestedSchema.properties.optionId, description: 'x'.repeat(8001) },
+        },
+      },
+    }).courier,
+  ).toBeNull();
 });
 
 describe('native callback chat presentation', () => {

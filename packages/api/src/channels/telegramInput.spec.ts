@@ -821,11 +821,15 @@ test.each([
   },
 );
 
-test('original authenticated receipt is first-register immutable through preparation/recovery, including legacy absence',async()=>{
-  const f=fixture(); const first=await f.service.register(id(),registration,1234);
-  expect(first.receivedAt).toBe(1234); f.advance();
-  const retry=await f.service.register(id(),registration,9999);
+test('original authenticated receipt is first-register immutable through preparation/recovery, including legacy absence', async () => {
+  const f = fixture();
+  const first = await f.service.register(id(), registration, 1234);
+  expect(first.receivedAt).toBe(1234);
+  f.advance();
+  const retry = await f.service.register(id(), registration, 9999);
   expect(retry.receivedAt).toBe(1234);
-  const legacy={...first}; delete legacy.receivedAt; f.rows.set(first.sourceEventId,legacy);
-  expect((await f.service.register(id(),registration,7777)).receivedAt).toBeUndefined();
+  const legacy = { ...first };
+  delete legacy.receivedAt;
+  f.rows.set(first.sourceEventId, legacy);
+  expect((await f.service.register(id(), registration, 7777)).receivedAt).toBeUndefined();
 });

@@ -85,43 +85,87 @@ describe('Voice worker-completion presentation', () => {
   });
 });
 
-
 describe('accepted nonterminal Worker attention presentation', () => {
-  const authority = { ownerId: 'owner-1', conversationId: 'conversation-1', callSessionId: 'call-1',
-    responseMessageId: 'main-question', responseText: 'May I renew the access needed to continue?' };
-  const binding = { kind: 'nonterminal_attention' as const, originRef: 'origin-1', workRef: 'work-1',
-    workerId: 'worker-1', runId: 'run-1', callbackRef: 'callback_sha256:' + 'a'.repeat(64),
-    event: 'run.needs_input' as const, workTerminal: false as const, evidenceId: 'ghe_' + 'b'.repeat(32) };
+  const authority = {
+    ownerId: 'owner-1',
+    conversationId: 'conversation-1',
+    callSessionId: 'call-1',
+    responseMessageId: 'main-question',
+    responseText: 'May I renew the access needed to continue?',
+  };
+  const binding = {
+    kind: 'nonterminal_attention' as const,
+    originRef: 'origin-1',
+    workRef: 'work-1',
+    workerId: 'worker-1',
+    runId: 'run-1',
+    callbackRef: 'callback_sha256:' + 'a'.repeat(64),
+    event: 'run.needs_input' as const,
+    workTerminal: false as const,
+    evidenceId: 'ghe_' + 'b'.repeat(32),
+  };
   test('binds Main response without inventing an attempt, terminal result or operation', () => {
-    const presentation = buildVoiceWorkerCompletionPresentation({ ...authority, bindings: [binding] });
+    const presentation = buildVoiceWorkerCompletionPresentation({
+      ...authority,
+      bindings: [binding],
+    });
     expect(presentation.bindings).toEqual([binding]);
     expect(verifyVoiceWorkerCompletionPresentation(presentation, authority)).toBe(true);
-    expect(verifyVoiceWorkerCompletionPresentation(presentation, { ...authority, ownerId: 'foreign' })).toBe(false);
+    expect(
+      verifyVoiceWorkerCompletionPresentation(presentation, { ...authority, ownerId: 'foreign' }),
+    ).toBe(false);
   });
-  test.each([{ event: 'run.completed' }, { workTerminal: true }, { evidenceId: 'invalid' },
-    { attemptNumber: 1 }, { resultKey: 'ghtr_' + 'a'.repeat(64) }])('rejects unsupported attention structure %p', (change) => {
-    expect(() => buildVoiceWorkerCompletionPresentation({ ...authority,
-      bindings: [{ ...binding, ...change } as typeof binding] })).toThrow('voice_worker_completion_binding_invalid');
+  test.each([
+    { event: 'run.completed' },
+    { workTerminal: true },
+    { evidenceId: 'invalid' },
+    { attemptNumber: 1 },
+    { resultKey: 'ghtr_' + 'a'.repeat(64) },
+  ])('rejects unsupported attention structure %p', (change) => {
+    expect(() =>
+      buildVoiceWorkerCompletionPresentation({
+        ...authority,
+        bindings: [{ ...binding, ...change } as typeof binding],
+      }),
+    ).toThrow('voice_worker_completion_binding_invalid');
   });
   test('rejects duplicate attention for one accepted work', () => {
-    expect(() => buildVoiceWorkerCompletionPresentation({ ...authority, bindings: [binding, binding] }))
-      .toThrow('voice_worker_completion_binding_duplicate');
+    expect(() =>
+      buildVoiceWorkerCompletionPresentation({ ...authority, bindings: [binding, binding] }),
+    ).toThrow('voice_worker_completion_binding_duplicate');
   });
 });
 
-
 describe('persisted Worker presentation verification', () => {
-  const authority = { ownerId: 'owner-1', conversationId: 'conversation-1', callSessionId: 'call-1',
-    responseMessageId: 'main-follow-up', responseText: 'The requested work needs your input.' };
-  const attention = { kind: 'nonterminal_attention' as const, originRef: 'origin-c', workRef: 'work-c',
-    workerId: 'worker-c', runId: 'run-c', callbackRef: 'callback_sha256:' + 'c'.repeat(64),
-    event: 'run.needs_input' as const, workTerminal: false as const, evidenceId: 'ghe_' + 'c'.repeat(32) };
+  const authority = {
+    ownerId: 'owner-1',
+    conversationId: 'conversation-1',
+    callSessionId: 'call-1',
+    responseMessageId: 'main-follow-up',
+    responseText: 'The requested work needs your input.',
+  };
+  const attention = {
+    kind: 'nonterminal_attention' as const,
+    originRef: 'origin-c',
+    workRef: 'work-c',
+    workerId: 'worker-c',
+    runId: 'run-c',
+    callbackRef: 'callback_sha256:' + 'c'.repeat(64),
+    event: 'run.needs_input' as const,
+    workTerminal: false as const,
+    evidenceId: 'ghe_' + 'c'.repeat(32),
+  };
   const connection = mongoose.createConnection();
   const Model = require('../../../../../api/db/viventiumGlassHiveCallbackDelivery')(connection);
-  const presentation = () => buildVoiceWorkerCompletionPresentation({ ...authority,
-    bindings: [terminalBinding('a'), attention] });
-  const persisted = () => new Model({ workerCompletionPresentation: presentation() })
-    .workerCompletionPresentation.toObject() as VoiceWorkerCompletionPresentationV1;
+  const presentation = () =>
+    buildVoiceWorkerCompletionPresentation({
+      ...authority,
+      bindings: [terminalBinding('a'), attention],
+    });
+  const persisted = () =>
+    new Model({
+      workerCompletionPresentation: presentation(),
+    }).workerCompletionPresentation.toObject() as VoiceWorkerCompletionPresentationV1;
 
   test('accepts the actual Mongoose attention binding order after persistence', () => {
     const stored = persisted();
@@ -139,41 +183,80 @@ describe('persisted Worker presentation verification', () => {
   });
 
   test.each(['presentationRef', 'turnId', 'responseMessageId', 'responseDigest'] as const)(
-    'rejects changed presentation identity %s', (key) => {
+    'rejects changed presentation identity %s',
+    (key) => {
       const stored = persisted();
-      expect(verifyVoiceWorkerCompletionPresentation({ ...stored, [key]: stored[key] + '-changed' },
-        authority)).toBe(false);
-    });
+      expect(
+        verifyVoiceWorkerCompletionPresentation(
+          { ...stored, [key]: stored[key] + '-changed' },
+          authority,
+        ),
+      ).toBe(false);
+    },
+  );
 
   test.each(['originRef', 'workRef', 'workerId', 'runId', 'callbackRef', 'evidenceId'] as const)(
-    'rejects changed persisted attention identity %s', (key) => {
+    'rejects changed persisted attention identity %s',
+    (key) => {
       const stored = persisted();
       const changed = { ...stored.bindings[1], [key]: 'changed' };
-      expect(verifyVoiceWorkerCompletionPresentation({ ...stored,
-        bindings: [stored.bindings[0], changed] }, authority)).toBe(false);
-    });
+      expect(
+        verifyVoiceWorkerCompletionPresentation(
+          { ...stored, bindings: [stored.bindings[0], changed] },
+          authority,
+        ),
+      ).toBe(false);
+    },
+  );
 
   test('rejects changed persisted terminal result identity', () => {
     const stored = persisted();
-    expect(verifyVoiceWorkerCompletionPresentation({ ...stored,
-      bindings: [{ ...stored.bindings[0], resultDigest: 'sha256:' + 'd'.repeat(64) },
-        stored.bindings[1]] }, authority)).toBe(false);
+    expect(
+      verifyVoiceWorkerCompletionPresentation(
+        {
+          ...stored,
+          bindings: [
+            { ...stored.bindings[0], resultDigest: 'sha256:' + 'd'.repeat(64) },
+            stored.bindings[1],
+          ],
+        },
+        authority,
+      ),
+    ).toBe(false);
   });
 
   test('rejects unknown presentation and binding fields after persistence', () => {
     const stored = persisted();
-    expect(verifyVoiceWorkerCompletionPresentation({ ...stored, extra: true } as
-      VoiceWorkerCompletionPresentationV1, authority)).toBe(false);
-    expect(verifyVoiceWorkerCompletionPresentation({ ...stored,
-      bindings: [stored.bindings[0], { ...stored.bindings[1], extra: true }] } as
-      VoiceWorkerCompletionPresentationV1, authority)).toBe(false);
+    expect(
+      verifyVoiceWorkerCompletionPresentation(
+        { ...stored, extra: true } as VoiceWorkerCompletionPresentationV1,
+        authority,
+      ),
+    ).toBe(false);
+    expect(
+      verifyVoiceWorkerCompletionPresentation(
+        {
+          ...stored,
+          bindings: [stored.bindings[0], { ...stored.bindings[1], extra: true }],
+        } as VoiceWorkerCompletionPresentationV1,
+        authority,
+      ),
+    ).toBe(false);
   });
 
   test('rejects changed binding array order and duplicate bindings', () => {
     const stored = persisted();
-    expect(verifyVoiceWorkerCompletionPresentation({ ...stored,
-      bindings: [...stored.bindings].reverse() }, authority)).toBe(false);
-    expect(verifyVoiceWorkerCompletionPresentation({ ...stored,
-      bindings: [stored.bindings[0], stored.bindings[0]] }, authority)).toBe(false);
+    expect(
+      verifyVoiceWorkerCompletionPresentation(
+        { ...stored, bindings: [...stored.bindings].reverse() },
+        authority,
+      ),
+    ).toBe(false);
+    expect(
+      verifyVoiceWorkerCompletionPresentation(
+        { ...stored, bindings: [stored.bindings[0], stored.bindings[0]] },
+        authority,
+      ),
+    ).toBe(false);
   });
 });

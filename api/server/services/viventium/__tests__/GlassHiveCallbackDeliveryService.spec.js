@@ -3805,7 +3805,9 @@ describe('GlassHiveCallbackDeliveryService', () => {
       };
       mockFindOne.mockReturnValue(leanResult(row));
       const write = jest.fn((_filter, update, options) => {
-        expect((options.session || storage.getStore()?.session).inTransaction()).toBe(true);
+        const session = options.session || storage.getStore()?.session;
+        expect(session).toBeDefined();
+        expect(session.inTransaction()).toBe(true);
         return leanResult({ ...row, ...update.$set });
       });
       mockFindOneAndUpdate.mockImplementation(write);

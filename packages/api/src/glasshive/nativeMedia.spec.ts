@@ -76,39 +76,61 @@ test('preserves exact verified pixels and link metadata as input, with no output
 
 test('resolves only the model-selected admitted image through its verified current artifact', async () => {
   await buildGlassHiveNativeMediaContent('Request', [insight], {
-    artifactBaseUrl, fetchImage: jest.fn().mockImplementation(response),
+    artifactBaseUrl,
+    fetchImage: jest.fn().mockImplementation(response),
   });
   const output = `![Sentence close-up](${media.observations[0].artifact_ref})\n\nSources: https://docs.example.test/`;
   expect(renderGlassHiveNativeMediaLinks(output, [insight], { artifactBaseUrl })).toBe(
     `![Sentence close-up](${download})\n\nSources: https://docs.example.test/`,
   );
-  expect(renderGlassHiveNativeMediaLinks('The note is unchanged.', [insight], { artifactBaseUrl }))
-    .toBe('The note is unchanged.');
+  expect(
+    renderGlassHiveNativeMediaLinks('The note is unchanged.', [insight], { artifactBaseUrl }),
+  ).toBe('The note is unchanged.');
 });
 
 test('rejects unknown or stale selected image references and foreign authority', () => {
   const output = `![Note](${media.observations[0].artifact_ref})`;
-  expect(() => renderGlassHiveNativeMediaLinks(output, [], { artifactBaseUrl }))
-    .toThrow('native_media_selection_unavailable');
-  expect(() => renderGlassHiveNativeMediaLinks('![Unknown](artifact_sha256:invalid)', [insight], { artifactBaseUrl }))
-    .toThrow('native_media_selection_unavailable');
-  expect(() => renderGlassHiveNativeMediaLinks(output, [{ ...insight,
-    authority: { kind: 'durable_terminal_callback', runId: 'another-run' },
-  }], { artifactBaseUrl })).toThrow('native_media_identity_invalid');
-  expect(() => renderGlassHiveNativeMediaLinks(output, [{ ...insight,
-    authority: { kind: 'untrusted', runId: 'run-original' },
-  }], { artifactBaseUrl })).toThrow('native_media_authority_invalid');
+  expect(() => renderGlassHiveNativeMediaLinks(output, [], { artifactBaseUrl })).toThrow(
+    'native_media_selection_unavailable',
+  );
+  expect(() =>
+    renderGlassHiveNativeMediaLinks('![Unknown](artifact_sha256:invalid)', [insight], {
+      artifactBaseUrl,
+    }),
+  ).toThrow('native_media_selection_unavailable');
+  expect(() =>
+    renderGlassHiveNativeMediaLinks(
+      output,
+      [{ ...insight, authority: { kind: 'durable_terminal_callback', runId: 'another-run' } }],
+      { artifactBaseUrl },
+    ),
+  ).toThrow('native_media_identity_invalid');
+  expect(() =>
+    renderGlassHiveNativeMediaLinks(
+      output,
+      [{ ...insight, authority: { kind: 'untrusted', runId: 'run-original' } }],
+      { artifactBaseUrl },
+    ),
+  ).toThrow('native_media_authority_invalid');
 });
 
 test('keeps public links unchanged and does not authorize a foreign artifact URL', () => {
   const output = `![Note](${media.observations[0].artifact_ref})`;
-  const foreign = { ...insight, nativeMedia: { ...media, observations: [
-    { ...media.observations[0], download_url: 'https://foreign.example.test/image.png' },
-  ] } };
-  expect(() => renderGlassHiveNativeMediaLinks(output, [foreign], { artifactBaseUrl }))
-    .toThrow('native_media_link_invalid');
-  expect(renderGlassHiveNativeMediaLinks('![Public](https://images.example.test/a.png)', []))
-    .toBe('![Public](https://images.example.test/a.png)');
+  const foreign = {
+    ...insight,
+    nativeMedia: {
+      ...media,
+      observations: [
+        { ...media.observations[0], download_url: 'https://foreign.example.test/image.png' },
+      ],
+    },
+  };
+  expect(() => renderGlassHiveNativeMediaLinks(output, [foreign], { artifactBaseUrl })).toThrow(
+    'native_media_link_invalid',
+  );
+  expect(renderGlassHiveNativeMediaLinks('![Public](https://images.example.test/a.png)', [])).toBe(
+    '![Public](https://images.example.test/a.png)',
+  );
 });
 
 test('keeps existing text-only synthesis byte-identical and does not fetch', async () => {
@@ -130,7 +152,8 @@ test('fetches accepted screenshot grants through the existing owner-authenticate
   const network = jest.spyOn(globalThis, 'fetch').mockImplementation(async () => response());
   try {
     const content = await buildGlassHiveNativeMediaContent('Observed result.', [insight], {
-      artifactBaseUrl, ownerId: 'synthetic-owner',
+      artifactBaseUrl,
+      ownerId: 'synthetic-owner',
     });
     expect(network).toHaveBeenCalledWith(
       'http://127.0.0.1:8766/v1/link-refs/ghr_1234567890abcdef',
@@ -139,11 +162,17 @@ test('fetches accepted screenshot grants through the existing owner-authenticate
     const headers = network.mock.calls[0][1]?.headers as Headers;
     expect(headers.get('Authorization')).toBe('Bearer synthetic-token');
     const assertion = headers.get('X-Viventium-Service-Assertion') || '';
-    expect(JSON.parse(Buffer.from(assertion.split('.')[0], 'base64url').toString()).owner_id)
-      .toBe('synthetic-owner');
-    expect(content).toEqual(expect.arrayContaining([
-      { type: 'image_url', image_url: { url: `data:image/png;base64,${bytes.toString('base64')}` } },
-    ]));
+    expect(JSON.parse(Buffer.from(assertion.split('.')[0], 'base64url').toString()).owner_id).toBe(
+      'synthetic-owner',
+    );
+    expect(content).toEqual(
+      expect.arrayContaining([
+        {
+          type: 'image_url',
+          image_url: { url: `data:image/png;base64,${bytes.toString('base64')}` },
+        },
+      ]),
+    );
   } finally {
     network.mockRestore();
     process.env = priorEnv;
@@ -151,20 +180,30 @@ test('fetches accepted screenshot grants through the existing owner-authenticate
 });
 
 test('loads a bounded screenshot group concurrently and retains native observation order', async () => {
-  const second = { ...media.observations[0], content_index: 2,
-    download_url: `${artifactBaseUrl}/v1/link-refs/ghr_second1234567890` };
+  const second = {
+    ...media.observations[0],
+    content_index: 2,
+    download_url: `${artifactBaseUrl}/v1/link-refs/ghr_second1234567890`,
+  };
   let firstResolve: ((value: Response) => void) | undefined;
-  const fetchImage = jest.fn((url: string) => url === download
-    ? new Promise<Response>((resolve) => { firstResolve = resolve; })
-    : Promise.resolve(response()));
-  const pending = buildGlassHiveNativeMediaContent('Observed result.', [{ ...insight,
-    nativeMedia: { ...media, observations: [media.observations[0], second] },
-  }], { artifactBaseUrl, fetchImage });
+  const fetchImage = jest.fn((url: string) =>
+    url === download
+      ? new Promise<Response>((resolve) => {
+          firstResolve = resolve;
+        })
+      : Promise.resolve(response()),
+  );
+  const pending = buildGlassHiveNativeMediaContent(
+    'Observed result.',
+    [{ ...insight, nativeMedia: { ...media, observations: [media.observations[0], second] } }],
+    { artifactBaseUrl, fetchImage },
+  );
   expect(fetchImage.mock.calls.map(([url]) => url)).toEqual([download, second.download_url]);
   firstResolve?.(response());
   const result = await pending;
-  expect(JSON.parse((result as Array<{ text: string }>)[1].text).native_media.observations)
-    .toEqual([media.observations[0], second]);
+  expect(JSON.parse((result as Array<{ text: string }>)[1].text).native_media.observations).toEqual(
+    [media.observations[0], second],
+  );
   expect(result).toHaveLength(4);
 });
 
@@ -327,9 +366,11 @@ const acceptedRunInput = {
 test('carries accepted continuation context independently of result clipping and media', async () => {
   const runInput = { ...acceptedRunInput, instruction: 'Complete accepted request. '.repeat(1000) };
   const fetchImage = jest.fn();
-  const result = await buildGlassHiveNativeMediaContent('Clipped result text.', [
-    { authority: insight.authority, runInput },
-  ], { fetchImage });
+  const result = await buildGlassHiveNativeMediaContent(
+    'Clipped result text.',
+    [{ authority: insight.authority, runInput }],
+    { fetchImage },
+  );
   expect(result).toEqual([
     { type: 'text', text: 'Clipped result text.' },
     { type: 'text', text: JSON.stringify({ accepted_run_input: runInput }) },
@@ -338,7 +379,11 @@ test('carries accepted continuation context independently of result clipping and
 });
 
 test('keeps each accepted input bound to its own result run', async () => {
-  const other = { ...acceptedRunInput, run_id: 'run-independent', instruction: 'Explain the chart.' };
+  const other = {
+    ...acceptedRunInput,
+    run_id: 'run-independent',
+    instruction: 'Explain the chart.',
+  };
   const result = await buildGlassHiveNativeMediaContent('Two results.', [
     { authority: insight.authority, runInput: acceptedRunInput },
     { authority: { ...insight.authority, runId: other.run_id }, runInput: other },
@@ -351,47 +396,79 @@ test('keeps each accepted input bound to its own result run', async () => {
 });
 
 test('rejects untrusted or different-run accepted input before model admission', async () => {
-  await expect(buildGlassHiveNativeMediaContent('result', [{ runInput: acceptedRunInput }]))
-    .rejects.toThrow('mission_input_authority_invalid');
-  await expect(buildGlassHiveNativeMediaContent('result', [{
-    authority: { ...insight.authority, runId: 'run-different' }, runInput: acceptedRunInput,
-  }])).rejects.toThrow('mission_input_identity_invalid');
+  await expect(
+    buildGlassHiveNativeMediaContent('result', [{ runInput: acceptedRunInput }]),
+  ).rejects.toThrow('mission_input_authority_invalid');
+  await expect(
+    buildGlassHiveNativeMediaContent('result', [
+      {
+        authority: { ...insight.authority, runId: 'run-different' },
+        runInput: acceptedRunInput,
+      },
+    ]),
+  ).rejects.toThrow('mission_input_identity_invalid');
 });
 
 describe('accepted nonterminal work input before Phase B model admission', () => {
   const authority = { kind: 'durable_work_callback', runId: 'run-original' };
   test('preserves the full accepted needs-input goal and continuation without granting media', async () => {
-    const runInput = { ...acceptedRunInput, instruction: 'Update the fictional offline checklist with progress count and reset. '.repeat(100) };
+    const runInput = {
+      ...acceptedRunInput,
+      instruction: 'Update the fictional offline checklist with progress count and reset. '.repeat(
+        100,
+      ),
+    };
     const fetchImage = jest.fn();
-    await expect(buildGlassHiveNativeMediaContent('Authorization is needed before work starts.', [
-      { authority, runInput },
-    ], { fetchImage })).resolves.toEqual([
+    await expect(
+      buildGlassHiveNativeMediaContent(
+        'Authorization is needed before work starts.',
+        [{ authority, runInput }],
+        { fetchImage },
+      ),
+    ).resolves.toEqual([
       { type: 'text', text: 'Authorization is needed before work starts.' },
       { type: 'text', text: JSON.stringify({ accepted_run_input: runInput }) },
     ]);
     expect(fetchImage).not.toHaveBeenCalled();
   });
-  test.each(['missing_authority', 'unknown_kind', 'generic_cortex', 'missing_run', 'foreign_run', 'stale_run'])('%s cannot carry accepted work input', async (caseName) => {
+  test.each([
+    'missing_authority',
+    'unknown_kind',
+    'generic_cortex',
+    'missing_run',
+    'foreign_run',
+    'stale_run',
+  ])('%s cannot carry accepted work input', async (caseName) => {
     const bound = caseName === 'missing_authority' ? undefined : { ...authority };
     if (bound && caseName === 'unknown_kind') bound.kind = 'unknown';
     if (bound && caseName === 'generic_cortex') bound.kind = 'cortex_insight';
     if (bound && caseName === 'missing_run') bound.runId = '';
     if (bound && caseName === 'foreign_run') bound.runId = 'run-foreign';
-    const runInput = caseName === 'stale_run' ? { ...acceptedRunInput, run_id: 'run-stale' } : acceptedRunInput;
+    const runInput =
+      caseName === 'stale_run' ? { ...acceptedRunInput, run_id: 'run-stale' } : acceptedRunInput;
     const fetchImage = jest.fn();
-    await expect(buildGlassHiveNativeMediaContent('Goal cannot supply its own authority.', [
-      { authority: bound, runInput },
-    ], { fetchImage })).rejects.toMatchObject({
+    await expect(
+      buildGlassHiveNativeMediaContent(
+        'Goal cannot supply its own authority.',
+        [{ authority: bound, runInput }],
+        { fetchImage },
+      ),
+    ).rejects.toMatchObject({
       code: ['missing_authority', 'unknown_kind', 'generic_cortex'].includes(caseName)
-        ? 'mission_input_authority_invalid' : 'mission_input_identity_invalid',
+        ? 'mission_input_authority_invalid'
+        : 'mission_input_identity_invalid',
     });
     expect(fetchImage).not.toHaveBeenCalled();
   });
   test('nonterminal accepted input cannot authorize native output media', async () => {
     const fetchImage = jest.fn();
-    await expect(buildGlassHiveNativeMediaContent('Accepted input is contextual evidence.', [
-      { authority, runInput: acceptedRunInput, nativeMedia: media },
-    ], { fetchImage })).rejects.toMatchObject({ code: 'native_media_authority_invalid' });
+    await expect(
+      buildGlassHiveNativeMediaContent(
+        'Accepted input is contextual evidence.',
+        [{ authority, runInput: acceptedRunInput, nativeMedia: media }],
+        { fetchImage },
+      ),
+    ).rejects.toMatchObject({ code: 'native_media_authority_invalid' });
     expect(fetchImage).not.toHaveBeenCalled();
   });
 });
@@ -401,113 +478,229 @@ test('captures only explicit selected native refs with their exact run and tool 
   const output = `[Evidence](${media.observations[0].artifact_ref})\n![Preview](${media.observations[0].artifact_ref})`;
   renderGlassHiveNativeMediaLinks(output, [insight], { artifactBaseUrl, onSelection });
   expect(onSelection).toHaveBeenCalledTimes(2);
-  expect(onSelection).toHaveBeenCalledWith({ run_id: 'run-original', tool_call_id: 'call-image',
-    content_index: 1, artifact_ref: `artifact_sha256:${sha256}`, label: 'Preview' });
+  expect(onSelection).toHaveBeenCalledWith({
+    run_id: 'run-original',
+    tool_call_id: 'call-image',
+    content_index: 1,
+    artifact_ref: `artifact_sha256:${sha256}`,
+    label: 'Preview',
+  });
   onSelection.mockClear();
-  renderGlassHiveNativeMediaLinks(`Unselected: ${media.observations[0].artifact_ref}. [Public](https://example.test)`,
-    [insight], { artifactBaseUrl, onSelection });
+  renderGlassHiveNativeMediaLinks(
+    `Unselected: ${media.observations[0].artifact_ref}. [Public](https://example.test)`,
+    [insight],
+    { artifactBaseUrl, onSelection },
+  );
   expect(onSelection).not.toHaveBeenCalled();
 });
 
 test('selected references rebind only to exact current owner/run/tool/index callback evidence', () => {
   const item = media.observations[0];
-  const selection = { run_id: item.run_id, tool_call_id: item.tool_call_id,
-    content_index: item.content_index, artifact_ref: item.artifact_ref };
-  const row = { ownerId: 'owner', runId: item.run_id, terminalCallbackId: 'callback', nativeMedia: media };
+  const selection = {
+    run_id: item.run_id,
+    tool_call_id: item.tool_call_id,
+    content_index: item.content_index,
+    artifact_ref: item.artifact_ref,
+  };
+  const row = {
+    ownerId: 'owner',
+    runId: item.run_id,
+    terminalCallbackId: 'callback',
+    nativeMedia: media,
+  };
   const files = selectGlassHiveNativeMediaFiles([selection, selection], [row], 'owner');
-  expect(files.get('callback')).toEqual([{ filename: 'Evidence.png',
-    mime_type: item.mime_type, bytes: item.bytes, sha256: item.sha256, download_url: download }]);
+  expect(files.get('callback')).toEqual([
+    {
+      filename: 'Evidence.png',
+      mime_type: item.mime_type,
+      bytes: item.bytes,
+      sha256: item.sha256,
+      download_url: download,
+    },
+  ]);
   expect(selectGlassHiveNativeMediaFiles([], [row], 'owner').size).toBe(0);
-  expect(() => selectGlassHiveNativeMediaFiles([selection], [{ ...row, ownerId: 'other' }], 'owner'))
-    .toThrow('native_media_authority_invalid');
-  expect(() => selectGlassHiveNativeMediaFiles([selection], [{ ...row, runId: 'stale' }], 'owner'))
-    .toThrow('native_media_identity_invalid');
-  for (const stale of [{ ...selection, tool_call_id: 'other' }, { ...selection, content_index: 2 },
+  expect(() =>
+    selectGlassHiveNativeMediaFiles([selection], [{ ...row, ownerId: 'other' }], 'owner'),
+  ).toThrow('native_media_authority_invalid');
+  expect(() =>
+    selectGlassHiveNativeMediaFiles([selection], [{ ...row, runId: 'stale' }], 'owner'),
+  ).toThrow('native_media_identity_invalid');
+  for (const stale of [
+    { ...selection, tool_call_id: 'other' },
+    { ...selection, content_index: 2 },
     { ...selection, artifact_ref: `artifact_sha256:${'f'.repeat(64)}` },
-    { ...selection, run_id: 'other' }]) {
-    expect(() => selectGlassHiveNativeMediaFiles([stale], [row], 'owner'))
-      .toThrow('native_media_selection_unavailable');
+    { ...selection, run_id: 'other' },
+  ]) {
+    expect(() => selectGlassHiveNativeMediaFiles([stale], [row], 'owner')).toThrow(
+      'native_media_selection_unavailable',
+    );
   }
-  expect(() => selectGlassHiveNativeMediaFiles([{ ...selection, artifact_ref: 'invalid' }], [row], 'owner'))
-    .toThrow('native_media_selection_unavailable');
+  expect(() =>
+    selectGlassHiveNativeMediaFiles([{ ...selection, artifact_ref: 'invalid' }], [row], 'owner'),
+  ).toThrow('native_media_selection_unavailable');
 });
 
-test.each(['attempt-native', undefined])('selected media retains original accepted callback proof with saved attempt %s', (attemptId) => {
-  const source = { ownerId: 'owner', runId: 'run-original', attemptId, attemptNumber: 1,
-    terminalCallbackResultKey: `ghtr_${'a'.repeat(64)}`,
-    terminalCallbackAcceptedOperationId: 'b'.repeat(32),
-    terminalCallbackId: `cb_terminal_${'c'.repeat(64)}`,
-    terminalCallbackResultRevision: 2, terminalCallbackResultDigest: `sha256:${'d'.repeat(64)}`,
-    terminalCallbackEffectGeneration: 1 };
-  const identity = { userId: source.ownerId, conversationId: 'conversation', responseMessageId: 'answer',
-    streamId: 'answer', agentId: 'main', logicalTurnId: '', revision: 1,
-    requestId: source.terminalCallbackId, runId: source.runId, attemptId: attemptId || '' };
-  const files = selectGlassHiveNativeMediaFiles([{ ...media.observations[0], label: 'Readable evidence' }].map(
-    ({ run_id, tool_call_id, content_index, artifact_ref, label }) => ({ run_id, tool_call_id, content_index, artifact_ref, label })),
-    [{ ...source, nativeMedia: media }], source.ownerId).get(source.terminalCallbackId) || [];
-  expect(nativeMediaOutputFilesForMessage(source, files, identity)).toMatchObject({
-    owner_id: 'owner', message_id: 'answer', request_id: source.terminalCallbackId,
-    run_id: source.runId, attempt_id: attemptId || '', files: [{ filename: 'Readable_evidence.png' }] });
-  for (const broken of [{ ...source, attemptNumber: 0 }, { ...source, terminalCallbackAcceptedOperationId: '' },
-    { ...source, terminalCallbackResultRevision: 0 }, { ...source, terminalCallbackResultDigest: '' },
-    { ...source, terminalCallbackEffectGeneration: 0 }, { ...source, ownerId: 'other' },
-    { ...source, runId: 'other' }, { ...source, terminalCallbackId: `cb_terminal_${'e'.repeat(64)}` }]) {
-    expect(() => nativeMediaOutputFilesForMessage(broken, files, identity)).toThrow('native_media_authority_invalid');
-  }
-});
+test.each(['attempt-native', undefined])(
+  'selected media retains original accepted callback proof with saved attempt %s',
+  (attemptId) => {
+    const source = {
+      ownerId: 'owner',
+      runId: 'run-original',
+      attemptId,
+      attemptNumber: 1,
+      terminalCallbackResultKey: `ghtr_${'a'.repeat(64)}`,
+      terminalCallbackAcceptedOperationId: 'b'.repeat(32),
+      terminalCallbackId: `cb_terminal_${'c'.repeat(64)}`,
+      terminalCallbackResultRevision: 2,
+      terminalCallbackResultDigest: `sha256:${'d'.repeat(64)}`,
+      terminalCallbackEffectGeneration: 1,
+    };
+    const identity = {
+      userId: source.ownerId,
+      conversationId: 'conversation',
+      responseMessageId: 'answer',
+      streamId: 'answer',
+      agentId: 'main',
+      logicalTurnId: '',
+      revision: 1,
+      requestId: source.terminalCallbackId,
+      runId: source.runId,
+      attemptId: attemptId || '',
+    };
+    const files =
+      selectGlassHiveNativeMediaFiles(
+        [{ ...media.observations[0], label: 'Readable evidence' }].map(
+          ({ run_id, tool_call_id, content_index, artifact_ref, label }) => ({
+            run_id,
+            tool_call_id,
+            content_index,
+            artifact_ref,
+            label,
+          }),
+        ),
+        [{ ...source, nativeMedia: media }],
+        source.ownerId,
+      ).get(source.terminalCallbackId) || [];
+    expect(nativeMediaOutputFilesForMessage(source, files, identity)).toMatchObject({
+      owner_id: 'owner',
+      message_id: 'answer',
+      request_id: source.terminalCallbackId,
+      run_id: source.runId,
+      attempt_id: attemptId || '',
+      files: [{ filename: 'Readable_evidence.png' }],
+    });
+    for (const broken of [
+      { ...source, attemptNumber: 0 },
+      { ...source, terminalCallbackAcceptedOperationId: '' },
+      { ...source, terminalCallbackResultRevision: 0 },
+      { ...source, terminalCallbackResultDigest: '' },
+      { ...source, terminalCallbackEffectGeneration: 0 },
+      { ...source, ownerId: 'other' },
+      { ...source, runId: 'other' },
+      { ...source, terminalCallbackId: `cb_terminal_${'e'.repeat(64)}` },
+    ]) {
+      expect(() => nativeMediaOutputFilesForMessage(broken, files, identity)).toThrow(
+        'native_media_authority_invalid',
+      );
+    }
+  },
+);
 
 test.each(['artifact_ref', 'download_url', 'open_url'] as const)(
-  'Main exact selected %s reaches the same captured observation and canonical File grant', (field) => {
+  'Main exact selected %s reaches the same captured observation and canonical File grant',
+  (field) => {
     const onSelection = jest.fn();
     const selected = `![Readable evidence](${media.observations[0][field]})`;
-    expect(renderGlassHiveNativeMediaLinks(selected, [insight], { artifactBaseUrl, onSelection }))
-      .toBe(`![Readable evidence](${download})`);
-    expect(onSelection).toHaveBeenCalledWith({ run_id: 'run-original', tool_call_id: 'call-image',
-      content_index: 1, artifact_ref: `artifact_sha256:${sha256}`, label: 'Readable evidence' });
+    expect(
+      renderGlassHiveNativeMediaLinks(selected, [insight], { artifactBaseUrl, onSelection }),
+    ).toBe(`![Readable evidence](${download})`);
+    expect(onSelection).toHaveBeenCalledWith({
+      run_id: 'run-original',
+      tool_call_id: 'call-image',
+      content_index: 1,
+      artifact_ref: `artifact_sha256:${sha256}`,
+      label: 'Readable evidence',
+    });
   },
 );
 
 test('canonicalizes only current accepted grant spellings and retains exact receipt binding', () => {
-  const item = { ...media.observations[0], download_url: download.replace('artifacts.example.test', 'ARTIFACTS.EXAMPLE.TEST:443'),
-    open_url: media.observations[0].open_url.replace('artifacts.example.test', 'ARTIFACTS.EXAMPLE.TEST:443') };
+  const item = {
+    ...media.observations[0],
+    download_url: download.replace('artifacts.example.test', 'ARTIFACTS.EXAMPLE.TEST:443'),
+    open_url: media.observations[0].open_url.replace(
+      'artifacts.example.test',
+      'ARTIFACTS.EXAMPLE.TEST:443',
+    ),
+  };
   const current = { ...insight, nativeMedia: { ...media, observations: [item] } };
   for (const url of [item.download_url, download, item.open_url, media.observations[0].open_url]) {
     const onSelection = jest.fn();
-    expect(renderGlassHiveNativeMediaLinks(`[Evidence](${url})`, [current], { artifactBaseUrl, onSelection }))
-      .toBe(`[Evidence](${download})`);
+    expect(
+      renderGlassHiveNativeMediaLinks(`[Evidence](${url})`, [current], {
+        artifactBaseUrl,
+        onSelection,
+      }),
+    ).toBe(`[Evidence](${download})`);
     expect(onSelection).toHaveBeenCalledTimes(1);
   }
-  const selection = { run_id: item.run_id, tool_call_id: item.tool_call_id,
-    content_index: item.content_index, artifact_ref: item.artifact_ref };
-  expect(selectGlassHiveNativeMediaFiles([selection], [{ ownerId: 'owner', runId: item.run_id,
-    terminalCallbackId: 'callback', nativeMedia: current.nativeMedia }], 'owner').get('callback')?.[0].download_url)
-    .toBe(download);
+  const selection = {
+    run_id: item.run_id,
+    tool_call_id: item.tool_call_id,
+    content_index: item.content_index,
+    artifact_ref: item.artifact_ref,
+  };
+  expect(
+    selectGlassHiveNativeMediaFiles(
+      [selection],
+      [
+        {
+          ownerId: 'owner',
+          runId: item.run_id,
+          terminalCallbackId: 'callback',
+          nativeMedia: current.nativeMedia,
+        },
+      ],
+      'owner',
+    ).get('callback')?.[0].download_url,
+  ).toBe(download);
 });
 
 test.each([
   'https://artifacts.example.test/v1/link-refs/ghr_stale1234567890',
   'https://other.example.test/v1/link-refs/ghr_1234567890abcdef',
-  download + '?other=1', 'https://docs.example.test/source',
+  download + '?other=1',
+  'https://docs.example.test/source',
 ])('unselected, stale or foreign exact URL grants no selection: %s', (url) => {
   const onSelection = jest.fn();
   const authored = `![Evidence](${url})`;
-  expect(renderGlassHiveNativeMediaLinks(authored, [insight], { artifactBaseUrl, onSelection })).toBe(authored);
+  expect(
+    renderGlassHiveNativeMediaLinks(authored, [insight], { artifactBaseUrl, onSelection }),
+  ).toBe(authored);
   expect(onSelection).not.toHaveBeenCalled();
 });
 
 test.each([
-  '`![Literal](REFERENCE)`', '``[Literal](REFERENCE)``',
+  '`![Literal](REFERENCE)`',
+  '``[Literal](REFERENCE)``',
   '```markdown\n![Literal](REFERENCE)\n```',
   '~~~markdown\n[Literal](REFERENCE)\n~~~',
   '````markdown\n```\n![Literal](REFERENCE)\n````',
   '```markdown\n![Literal](REFERENCE)',
   '`Multiline\n![Literal](REFERENCE)\nexample`',
-  String.raw`!\[Literal](REFERENCE)`, String.raw`\[Literal](REFERENCE)`,
+  String.raw`!\[Literal](REFERENCE)`,
+  String.raw`\[Literal](REFERENCE)`,
 ])('code or escaped literal markup does not select an observation: %s', (template) => {
-  for (const reference of [media.observations[0].artifact_ref, download, media.observations[0].open_url]) {
+  for (const reference of [
+    media.observations[0].artifact_ref,
+    download,
+    media.observations[0].open_url,
+  ]) {
     const literal = template.replace('REFERENCE', reference);
     const onSelection = jest.fn();
-    expect(renderGlassHiveNativeMediaLinks(literal, [insight], { artifactBaseUrl, onSelection })).toBe(literal);
+    expect(
+      renderGlassHiveNativeMediaLinks(literal, [insight], { artifactBaseUrl, onSelection }),
+    ).toBe(literal);
     expect(onSelection).not.toHaveBeenCalled();
   }
 });
@@ -516,107 +709,245 @@ test('visible links after a protected code block retain model selection', () => 
   const onSelection = jest.fn();
   const literal = `\`![Literal](${download})\``;
   const visible = `[Selected](${media.observations[0].artifact_ref})`;
-  expect(renderGlassHiveNativeMediaLinks(`${literal}\n${visible}`, [insight], { artifactBaseUrl, onSelection }))
-    .toBe(`${literal}\n[Selected](${download})`);
+  expect(
+    renderGlassHiveNativeMediaLinks(`${literal}\n${visible}`, [insight], {
+      artifactBaseUrl,
+      onSelection,
+    }),
+  ).toBe(`${literal}\n[Selected](${download})`);
   expect(onSelection).toHaveBeenCalledTimes(1);
 });
 
 test('an escaped bang preserves a real authored link while escaped brackets remain literal', () => {
   const onSelection = jest.fn();
   const authored = String.raw`\![Selected](${media.observations[0].artifact_ref})`;
-  expect(renderGlassHiveNativeMediaLinks(authored, [insight], { artifactBaseUrl, onSelection }))
-    .toBe(String.raw`\![Selected](${download})`);
+  expect(
+    renderGlassHiveNativeMediaLinks(authored, [insight], { artifactBaseUrl, onSelection }),
+  ).toBe(String.raw`\![Selected](${download})`);
   expect(onSelection).toHaveBeenCalledTimes(1);
 });
 
 const retainedMediaSource = {
-  ownerId: 'owner', conversationId: 'conversation', originRef: 'origin', workRef: 'work',
-  runId: 'run-original', attemptNumber: 1, nativeMedia: media,
+  ownerId: 'owner',
+  conversationId: 'conversation',
+  originRef: 'origin',
+  workRef: 'work',
+  runId: 'run-original',
+  attemptNumber: 1,
+  nativeMedia: media,
   terminalCallbackResultKey: `ghtr_${'a'.repeat(64)}`,
   terminalCallbackAcceptedOperationId: 'b'.repeat(32),
   terminalCallbackId: `cb_terminal_${'c'.repeat(64)}`,
-  terminalCallbackResultRevision: 2, terminalCallbackResultDigest: `sha256:${'d'.repeat(64)}`,
+  terminalCallbackResultRevision: 2,
+  terminalCallbackResultDigest: `sha256:${'d'.repeat(64)}`,
   terminalCallbackEffectGeneration: 1,
 };
 function retainedStore(rows = [retainedMediaSource]) {
-  return { readEvidence: jest.fn().mockResolvedValue(rows), isAccepted: jest.fn().mockResolvedValue(true),
-    fenceAccepted: jest.fn().mockResolvedValue(true) };
+  return {
+    readEvidence: jest.fn().mockResolvedValue(rows),
+    isAccepted: jest.fn().mockResolvedValue(true),
+    fenceAccepted: jest.fn().mockResolvedValue(true),
+  };
 }
 const retainedSession = { inTransaction: () => true } as ClientSession;
-const availableMediaFile: NativeOutputDeliveryAttachment = { user: 'owner', file_id: `native_${'e'.repeat(64)}`,
-  filename: 'Capture.png', filepath: '/uploads/owner/capture.png', bytes: bytes.length, type: 'image/png',
-  source: 'local', object: 'file', nativeOutputFile: { version: 1, status: 'available',
-    messageId: 'answer', downloadUrl: download } };
+const availableMediaFile: NativeOutputDeliveryAttachment = {
+  user: 'owner',
+  file_id: `native_${'e'.repeat(64)}`,
+  filename: 'Capture.png',
+  filepath: '/uploads/owner/capture.png',
+  bytes: bytes.length,
+  type: 'image/png',
+  source: 'local',
+  object: 'file',
+  nativeOutputFile: { version: 1, status: 'available', messageId: 'answer', downloadUrl: download },
+};
 
 describe('ordinary Main retained image selections', () => {
   let priorBase: string | undefined;
-  beforeEach(() => { priorBase = process.env.GLASSHIVE_ARTIFACT_BASE_URL; process.env.GLASSHIVE_ARTIFACT_BASE_URL = artifactBaseUrl; });
-  afterEach(() => { if (priorBase === undefined) delete process.env.GLASSHIVE_ARTIFACT_BASE_URL;
-    else process.env.GLASSHIVE_ARTIFACT_BASE_URL = priorBase; });
+  beforeEach(() => {
+    priorBase = process.env.GLASSHIVE_ARTIFACT_BASE_URL;
+    process.env.GLASSHIVE_ARTIFACT_BASE_URL = artifactBaseUrl;
+  });
+  afterEach(() => {
+    if (priorBase === undefined) delete process.env.GLASSHIVE_ARTIFACT_BASE_URL;
+    else process.env.GLASSHIVE_ARTIFACT_BASE_URL = priorBase;
+  });
   test.each(['artifact_ref', 'download_url', 'open_url'] as const)(
-    'resolves selected historical %s only under current owner/conversation and original accepted winner', async (field) => {
+    'resolves selected historical %s only under current owner/conversation and original accepted winner',
+    async (field) => {
       const text = `![Capture](${media.observations[0][field]})\n[Source](https://docs.example.test)`;
       const store = retainedStore();
-      const selected = await resolveGlassHiveNativeMediaMessageSelection({ text, ownerId: 'owner', conversationId: 'conversation' }, store);
+      const selected = await resolveGlassHiveNativeMediaMessageSelection(
+        { text, ownerId: 'owner', conversationId: 'conversation' },
+        store,
+      );
       expect(selected?.rows).toEqual([retainedMediaSource]);
-      expect(selected?.selectedNativeMedia).toEqual([{ run_id: 'run-original', tool_call_id: 'call-image',
-        content_index: 1, artifact_ref: media.observations[0].artifact_ref, label: 'Capture' }]);
-      expect(store.readEvidence.mock.calls[0][0]).toMatchObject({ ownerId: 'owner', conversationId: 'conversation' });
-      expect(store.isAccepted).toHaveBeenCalledWith({ _id: retainedMediaSource.terminalCallbackResultKey,
-        ownerId: 'owner', originRef: 'origin', workRef: 'work', runId: 'run-original', attemptNumber: 1,
-        callbackId: retainedMediaSource.terminalCallbackId, resultRevision: 2,
+      expect(selected?.selectedNativeMedia).toEqual([
+        {
+          run_id: 'run-original',
+          tool_call_id: 'call-image',
+          content_index: 1,
+          artifact_ref: media.observations[0].artifact_ref,
+          label: 'Capture',
+        },
+      ]);
+      expect(store.readEvidence.mock.calls[0][0]).toMatchObject({
+        ownerId: 'owner',
+        conversationId: 'conversation',
+      });
+      expect(store.isAccepted).toHaveBeenCalledWith({
+        _id: retainedMediaSource.terminalCallbackResultKey,
+        ownerId: 'owner',
+        originRef: 'origin',
+        workRef: 'work',
+        runId: 'run-original',
+        attemptNumber: 1,
+        callbackId: retainedMediaSource.terminalCallbackId,
+        resultRevision: 2,
         resultDigest: retainedMediaSource.terminalCallbackResultDigest,
-        acceptedOperationId: retainedMediaSource.terminalCallbackAcceptedOperationId, acceptedOperationGeneration: 1 });
+        acceptedOperationId: retainedMediaSource.terminalCallbackAcceptedOperationId,
+        acceptedOperationGeneration: 1,
+      });
       await selected?.authorizePublication(retainedSession);
-      expect(store.fenceAccepted).toHaveBeenCalledWith({ resultKey: retainedMediaSource.terminalCallbackResultKey,
-        callbackId: retainedMediaSource.terminalCallbackId, resultRevision: 2,
-        resultDigest: retainedMediaSource.terminalCallbackResultDigest,
-        acceptedOperationId: retainedMediaSource.terminalCallbackAcceptedOperationId, generation: 1 }, retainedSession);
-      const bound = bindGlassHiveNativeMediaAttachmentReferences(text, selected?.rows || [],
-        [availableMediaFile], 'owner', 'answer');
-      expect(bound[0].nativeOutputFile).toMatchObject({ selectedReferences: [media.observations[0][field]] });
-      expect(renderGlassHiveNativeMediaAttachmentLinks(text, bound, { ownerId: 'owner', messageId: 'answer' }))
-        .toBe(`![Capture](${download})\n[Source](https://docs.example.test)`);
+      expect(store.fenceAccepted).toHaveBeenCalledWith(
+        {
+          resultKey: retainedMediaSource.terminalCallbackResultKey,
+          callbackId: retainedMediaSource.terminalCallbackId,
+          resultRevision: 2,
+          resultDigest: retainedMediaSource.terminalCallbackResultDigest,
+          acceptedOperationId: retainedMediaSource.terminalCallbackAcceptedOperationId,
+          generation: 1,
+        },
+        retainedSession,
+      );
+      const bound = bindGlassHiveNativeMediaAttachmentReferences(
+        text,
+        selected?.rows || [],
+        [availableMediaFile],
+        'owner',
+        'answer',
+      );
+      expect(bound[0].nativeOutputFile).toMatchObject({
+        selectedReferences: [media.observations[0][field]],
+      });
+      expect(
+        renderGlassHiveNativeMediaAttachmentLinks(text, bound, {
+          ownerId: 'owner',
+          messageId: 'answer',
+        }),
+      ).toBe(`![Capture](${download})\n[Source](https://docs.example.test)`);
     },
   );
   test('rejects original evidence superseded before import or during final publication', async () => {
     const text = `[Capture](${download})`;
-    const store = retainedStore(); store.isAccepted.mockResolvedValueOnce(false);
-    await expect(resolveGlassHiveNativeMediaMessageSelection({ text, ownerId: 'owner', conversationId: 'conversation' }, store))
-      .rejects.toThrow('native_media_evidence_superseded');
-    store.fenceAccepted.mockResolvedValueOnce(false);
-    const selected = await resolveGlassHiveNativeMediaMessageSelection({ text, ownerId: 'owner', conversationId: 'conversation' }, store);
-    await expect(selected?.authorizePublication(retainedSession)).rejects.toThrow('native_media_evidence_superseded');
-  });
-  test.each(['ownerId', 'conversationId'] as const)('rejects foreign retained source %s', async (field) => {
-    const store = retainedStore([{ ...retainedMediaSource, [field]: 'other' }]);
-    await expect(resolveGlassHiveNativeMediaMessageSelection({ text: `[Capture](${download})`, ownerId: 'owner', conversationId: 'conversation' }, store))
-      .rejects.toThrow('native_media_authority_invalid');
-    expect(store.isAccepted).not.toHaveBeenCalled();
-  });
-  test.each(['Plain answer.', '[Source](https://docs.example.test)', `\`![Literal](${download})\``,
-    `~~~\n![Literal](${download})\n~~~`])('ordinary links or protected examples cause no source/store work: %s', async (text) => {
     const store = retainedStore();
-    expect(await resolveGlassHiveNativeMediaMessageSelection({ text, ownerId: 'owner', conversationId: 'conversation' }, store)).toBeUndefined();
+    store.isAccepted.mockResolvedValueOnce(false);
+    await expect(
+      resolveGlassHiveNativeMediaMessageSelection(
+        { text, ownerId: 'owner', conversationId: 'conversation' },
+        store,
+      ),
+    ).rejects.toThrow('native_media_evidence_superseded');
+    store.fenceAccepted.mockResolvedValueOnce(false);
+    const selected = await resolveGlassHiveNativeMediaMessageSelection(
+      { text, ownerId: 'owner', conversationId: 'conversation' },
+      store,
+    );
+    await expect(selected?.authorizePublication(retainedSession)).rejects.toThrow(
+      'native_media_evidence_superseded',
+    );
+  });
+  test.each(['ownerId', 'conversationId'] as const)(
+    'rejects foreign retained source %s',
+    async (field) => {
+      const store = retainedStore([{ ...retainedMediaSource, [field]: 'other' }]);
+      await expect(
+        resolveGlassHiveNativeMediaMessageSelection(
+          { text: `[Capture](${download})`, ownerId: 'owner', conversationId: 'conversation' },
+          store,
+        ),
+      ).rejects.toThrow('native_media_authority_invalid');
+      expect(store.isAccepted).not.toHaveBeenCalled();
+    },
+  );
+  test.each([
+    'Plain answer.',
+    '[Source](https://docs.example.test)',
+    `\`![Literal](${download})\``,
+    `~~~\n![Literal](${download})\n~~~`,
+  ])('ordinary links or protected examples cause no source/store work: %s', async (text) => {
+    const store = retainedStore();
+    expect(
+      await resolveGlassHiveNativeMediaMessageSelection(
+        { text, ownerId: 'owner', conversationId: 'conversation' },
+        store,
+      ),
+    ).toBeUndefined();
     expect(store.readEvidence).not.toHaveBeenCalled();
   });
   test('unknown public grants produce no import and unknown typed references fail explicitly', async () => {
     const store = retainedStore([]);
-    expect(await resolveGlassHiveNativeMediaMessageSelection({ text: `[Other](${download})`, ownerId: 'owner', conversationId: 'conversation' }, store)).toBeUndefined();
-    await expect(resolveGlassHiveNativeMediaMessageSelection({ text: `[Other](${media.observations[0].artifact_ref})`, ownerId: 'owner', conversationId: 'conversation' }, store))
-      .rejects.toThrow('native_media_selection_unavailable');
+    expect(
+      await resolveGlassHiveNativeMediaMessageSelection(
+        { text: `[Other](${download})`, ownerId: 'owner', conversationId: 'conversation' },
+        store,
+      ),
+    ).toBeUndefined();
+    await expect(
+      resolveGlassHiveNativeMediaMessageSelection(
+        {
+          text: `[Other](${media.observations[0].artifact_ref})`,
+          ownerId: 'owner',
+          conversationId: 'conversation',
+        },
+        store,
+      ),
+    ).rejects.toThrow('native_media_selection_unavailable');
   });
   test('only actually-selected aliases on exact imported Files may canonicalize presentation', () => {
     const authored = `[Capture](${media.observations[0].open_url})\n\`[Code](${media.observations[0].artifact_ref})\``;
-    const bound = bindGlassHiveNativeMediaAttachmentReferences(authored, [retainedMediaSource],
-      [availableMediaFile], 'owner', 'answer');
-    expect(bound[0].nativeOutputFile).toMatchObject({ selectedReferences: [media.observations[0].open_url] });
-    expect(renderGlassHiveNativeMediaAttachmentLinks(authored, bound, { ownerId: 'owner', messageId: 'other' })).toBe(authored);
-    expect(renderGlassHiveNativeMediaAttachmentLinks(authored, bound, { ownerId: 'other', messageId: 'answer' })).toBe(authored);
-    for (const changed of [{ ...availableMediaFile, file_id: 'ordinary' },
-      { ...availableMediaFile, nativeOutputFile: { version: 1 as const, status: 'unavailable' as const, code: 'native_output_file_unavailable' } }]) {
-      expect(renderGlassHiveNativeMediaAttachmentLinks(authored, [changed], { ownerId: 'owner', messageId: 'answer' })).toBe(authored);
+    const bound = bindGlassHiveNativeMediaAttachmentReferences(
+      authored,
+      [retainedMediaSource],
+      [availableMediaFile],
+      'owner',
+      'answer',
+    );
+    expect(bound[0].nativeOutputFile).toMatchObject({
+      selectedReferences: [media.observations[0].open_url],
+    });
+    expect(
+      renderGlassHiveNativeMediaAttachmentLinks(authored, bound, {
+        ownerId: 'owner',
+        messageId: 'other',
+      }),
+    ).toBe(authored);
+    expect(
+      renderGlassHiveNativeMediaAttachmentLinks(authored, bound, {
+        ownerId: 'other',
+        messageId: 'answer',
+      }),
+    ).toBe(authored);
+    for (const changed of [
+      { ...availableMediaFile, file_id: 'ordinary' },
+      {
+        ...availableMediaFile,
+        nativeOutputFile: {
+          version: 1 as const,
+          status: 'unavailable' as const,
+          code: 'native_output_file_unavailable',
+        },
+      },
+    ]) {
+      expect(
+        renderGlassHiveNativeMediaAttachmentLinks(authored, [changed], {
+          ownerId: 'owner',
+          messageId: 'answer',
+        }),
+      ).toBe(authored);
     }
-    expect(collectGlassHiveNativeMediaReferences(authored)).toEqual([media.observations[0].open_url]);
+    expect(collectGlassHiveNativeMediaReferences(authored)).toEqual([
+      media.observations[0].open_url,
+    ]);
   });
 });

@@ -69,12 +69,44 @@ function pending(kind = 'permission') {
       },
     },
   };
-  if(kind==='question') {
-    const key='Which size?'; request.kind='question';request.message=key;
-    request.requestedSchema={type:'object',required:['answers'],additionalProperties:false,properties:{
-      answers:{type:'object',additionalProperties:false,minProperties:1,maxProperties:16,properties:{[key]:{type:'array',uniqueItems:true,minItems:1,maxItems:1,items:{type:'string',enum:['Small','Other']}}}},
-      annotations:{type:'object',additionalProperties:false,properties:{[key]:{type:'object',additionalProperties:false,required:['notes'],properties:{notes:{type:'string',minLength:1,maxLength:8000}}}}},
-    }};
+  if (kind === 'question') {
+    const key = 'Which size?';
+    request.kind = 'question';
+    request.message = key;
+    request.requestedSchema = {
+      type: 'object',
+      required: ['answers'],
+      additionalProperties: false,
+      properties: {
+        answers: {
+          type: 'object',
+          additionalProperties: false,
+          minProperties: 1,
+          maxProperties: 16,
+          properties: {
+            [key]: {
+              type: 'array',
+              uniqueItems: true,
+              minItems: 1,
+              maxItems: 1,
+              items: { type: 'string', enum: ['Small', 'Other'] },
+            },
+          },
+        },
+        annotations: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            [key]: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['notes'],
+              properties: { notes: { type: 'string', minLength: 1, maxLength: 8000 } },
+            },
+          },
+        },
+      },
+    };
   }
   return request;
 }
@@ -158,59 +190,62 @@ describe('pending native question Voice authority', () => {
     await mongoose.disconnect();
     await replica?.stop();
   });
-  test.each(['permission','question'])('claim, permit, exact speech trace, renewal and once-only sent preserve pending %s', async (kind) => {
-    await fixture(kind==='question' ? 'Which size?' : 'Permit this operation?',kind);
-    const row = await claimed();
-    expect(row).toBeTruthy();
-    const permit = await authorizeGlassHiveCallbackDeliveryDispatch({
-      ...scope,
-      deliveryId: row.deliveryId,
-      claimId: row.claimId,
-    });
-    expect(permit.resultDigest).toBe(nativeWorkInputPresentation(row).digest);
-    expect(
-      await authorizeGlassHiveCallbackDeliveryDispatch({
+  test.each(['permission', 'question'])(
+    'claim, permit, exact speech trace, renewal and once-only sent preserve pending %s',
+    async (kind) => {
+      await fixture(kind === 'question' ? 'Which size?' : 'Permit this operation?', kind);
+      const row = await claimed();
+      expect(row).toBeTruthy();
+      const permit = await authorizeGlassHiveCallbackDeliveryDispatch({
         ...scope,
         deliveryId: row.deliveryId,
         claimId: row.claimId,
-      }),
-    ).toEqual(permit);
-    const proof = {
-      ...scope,
-      conversationId: row.conversationId,
-      deliveryId: row.deliveryId,
-      claimId: row.claimId,
-      dispatchPermit: permit,
-      presentationRef: row.deliveryId,
-      turnId: row.voiceRequestId,
-    };
-    expect(await resolveGlassHiveVoicePresentation(proof)).toMatchObject({
-      deliveryId: row.deliveryId,
-    });
-    expect(
-      await resolveGlassHiveVoicePresentation({ ...proof, turnId: 'foreign-turn' }),
-    ).toBeNull();
-    const renewal = await renewGlassHiveCallbackDeliveryDispatch({ ...proof, leaseMs: 120000 });
-    expect(renewal.permitId).toBe(permit.permitId);
-    expect(
-      await markGlassHiveCallbackDeliverySent({ ...proof, dispatchPermit: renewal }),
-    ).toMatchObject({ status: 'sent' });
-    expect(
-      await markGlassHiveCallbackDeliverySent({ ...proof, dispatchPermit: renewal }),
-    ).toBeNull();
-    expect(await claimed()).toBeUndefined();
-    expect(
-      await getSettledGlassHiveVoiceCallbackDelivery({ ...scope, callbackId: row.callbackId }),
-    ).toMatchObject({ status: 'sent', deliveryId: row.deliveryId });
-    expect(
-      await getSettledGlassHiveVoiceCallbackDelivery({
+      });
+      expect(permit.resultDigest).toBe(nativeWorkInputPresentation(row).digest);
+      expect(
+        await authorizeGlassHiveCallbackDeliveryDispatch({
+          ...scope,
+          deliveryId: row.deliveryId,
+          claimId: row.claimId,
+        }),
+      ).toEqual(permit);
+      const proof = {
         ...scope,
-        userId: 'foreign-owner',
-        callbackId: row.callbackId,
-      }),
-    ).toBeNull();
-    expect(mockPending.state).toBe('pending');
-  });
+        conversationId: row.conversationId,
+        deliveryId: row.deliveryId,
+        claimId: row.claimId,
+        dispatchPermit: permit,
+        presentationRef: row.deliveryId,
+        turnId: row.voiceRequestId,
+      };
+      expect(await resolveGlassHiveVoicePresentation(proof)).toMatchObject({
+        deliveryId: row.deliveryId,
+      });
+      expect(
+        await resolveGlassHiveVoicePresentation({ ...proof, turnId: 'foreign-turn' }),
+      ).toBeNull();
+      const renewal = await renewGlassHiveCallbackDeliveryDispatch({ ...proof, leaseMs: 120000 });
+      expect(renewal.permitId).toBe(permit.permitId);
+      expect(
+        await markGlassHiveCallbackDeliverySent({ ...proof, dispatchPermit: renewal }),
+      ).toMatchObject({ status: 'sent' });
+      expect(
+        await markGlassHiveCallbackDeliverySent({ ...proof, dispatchPermit: renewal }),
+      ).toBeNull();
+      expect(await claimed()).toBeUndefined();
+      expect(
+        await getSettledGlassHiveVoiceCallbackDelivery({ ...scope, callbackId: row.callbackId }),
+      ).toMatchObject({ status: 'sent', deliveryId: row.deliveryId });
+      expect(
+        await getSettledGlassHiveVoiceCallbackDelivery({
+          ...scope,
+          userId: 'foreign-owner',
+          callbackId: row.callbackId,
+        }),
+      ).toBeNull();
+      expect(mockPending.state).toBe('pending');
+    },
+  );
   test('same exact legacy question is recovered in the existing message and ledger, not discarded or duplicated', async () => {
     await fixture('The native harness is waiting for your response.');
     const row = await claimed();

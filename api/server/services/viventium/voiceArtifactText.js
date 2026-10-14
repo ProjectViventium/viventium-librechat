@@ -571,11 +571,13 @@ function sanitizeVoiceAssistantMessageForPersistence(req, message) {
    * === VIVENTIUM END === */
   if ((isTelegram || isWeb) && !isVoiceMode) {
     const audioRequested =
-      isTelegram && (req?.body?.telegramAudioRequested === true ||
+      isTelegram &&
+      (req?.body?.telegramAudioRequested === true ||
         String(req?.body?.telegramAudioRequested || '').toLowerCase() === 'true');
     const cleanTelegramText = (value) => {
       const parsed = parseDeliveryControls(value);
-      if (isWeb && !parsed.skipVoiceCount && !parsed.messageBreakCount && !parsed.mergedBreakCount) return value;
+      if (isWeb && !parsed.skipVoiceCount && !parsed.messageBreakCount && !parsed.mergedBreakCount)
+        return value;
       const deliveryClean = parsed.cleanText;
       return audioRequested ? stripVoiceControlTags(deliveryClean).trim() : deliveryClean;
     };

@@ -342,7 +342,11 @@ export class MCPTokenStorage {
       /* === VIVENTIUM END === */
 
       if (shouldRefresh) {
-        const reason = forceRefresh ? 'force refresh requested' : isMissing ? 'missing' : 'expired/expiring';
+        const reason = forceRefresh
+          ? 'force refresh requested'
+          : isMissing
+            ? 'missing'
+            : 'expired/expiring';
         logger.info(`${logPrefix} Access token ${reason}`);
 
         /** Refresh data if we have a refresh token and refresh function */
@@ -544,9 +548,7 @@ export class MCPTokenStorage {
   }: {
     userId: string;
     serverName: string;
-    deleteToken: (
-      filter: { userId: string; type: string; identifier: string },
-    ) => Promise<unknown>;
+    deleteToken: (filter: { userId: string; type: string; identifier: string }) => Promise<unknown>;
   }): Promise<void> {
     const identifier = `mcp:${serverName}`;
 

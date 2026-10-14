@@ -116,10 +116,15 @@ function coerceTextToString(text) {
 /** Preserve saved plain text when the provider formatter has no authored text block. */
 function normalizeUserMessageContent(message) {
   if (
-    !(message?.isCreatedByUser === true ||
-      (message?.isCreatedByUser === false && Array.isArray(message.content) &&
-        message.content.every((part) => part != null && typeof part === 'object' &&
-          INTERNAL_CONTENT_TYPES.has(part.type)))) ||
+    !(
+      message?.isCreatedByUser === true ||
+      (message?.isCreatedByUser === false &&
+        Array.isArray(message.content) &&
+        message.content.every(
+          (part) =>
+            part != null && typeof part === 'object' && INTERNAL_CONTENT_TYPES.has(part.type),
+        ))
+    ) ||
     typeof message.text !== 'string' ||
     !message.text ||
     !Array.isArray(message.content) ||

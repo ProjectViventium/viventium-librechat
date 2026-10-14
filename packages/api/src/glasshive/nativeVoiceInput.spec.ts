@@ -27,63 +27,138 @@ const setup = () => {
 };
 
 const questionKey = 'Which colour?\nKeep exact spacing ';
-const questionInput = (): Extract<NativeVoiceInput, {kind: 'question'}> => ({
-  requestId: input.requestId, requestFingerprint: input.requestFingerprint,
-  runId: input.runId, attemptId: input.attemptId, expiresAt: input.expiresAt,
-  prompt: questionKey, kind: 'question', requestedSchema: {
-    type: 'object', required: ['answers'], additionalProperties: false,
+const questionInput = (): Extract<NativeVoiceInput, { kind: 'question' }> => ({
+  requestId: input.requestId,
+  requestFingerprint: input.requestFingerprint,
+  runId: input.runId,
+  attemptId: input.attemptId,
+  expiresAt: input.expiresAt,
+  prompt: questionKey,
+  kind: 'question',
+  requestedSchema: {
+    type: 'object',
+    required: ['answers'],
+    additionalProperties: false,
     properties: {
-      answers: {type: 'object', additionalProperties: false, minProperties: 1, maxProperties: 16,
-        properties: {[questionKey]: {type: 'array', uniqueItems: true, minItems: 1, maxItems: 1,
-          items: {type: 'string', enum: ['Blue', 'Red', 'Other']}}}},
-      annotations: {type: 'object', additionalProperties: false,
-        properties: {[questionKey]: {type: 'object', additionalProperties: false, required: ['notes'],
-          properties: {notes: {type: 'string', minLength: 1, maxLength: 8000}}}}},
+      answers: {
+        type: 'object',
+        additionalProperties: false,
+        minProperties: 1,
+        maxProperties: 16,
+        properties: {
+          [questionKey]: {
+            type: 'array',
+            uniqueItems: true,
+            minItems: 1,
+            maxItems: 1,
+            items: { type: 'string', enum: ['Blue', 'Red', 'Other'] },
+          },
+        },
+      },
+      annotations: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          [questionKey]: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['notes'],
+            properties: { notes: { type: 'string', minLength: 1, maxLength: 8000 } },
+          },
+        },
+      },
     },
   },
 });
 
 describe('Native Voice input transport', () => {
-  it.each(['answered','replaced','expired','terminal','current'])('fresh native ownership rejects stale %s snapshot speech', async (state) => {
-    const {fetchImpl,client}=setup(); const request=questionInput();
-    const pending=state==='answered' ? [] : [{...request,
-      ...(state==='replaced' ? {requestFingerprint:'b'.repeat(64)} : {}),
-      ...(state==='expired' ? {expiresAt:new Date(0).toISOString()} : {})}];
-    fetchImpl.mockResolvedValue(new Response(JSON.stringify({version:1,state:state==='terminal' ? 'completed' : 'running',pending})));
-    await expect(client.isCurrent('exact-question',request)).resolves.toBe(state==='current');
-    expect(fetchImpl.mock.calls[0][1]?.headers).toMatchObject({'X-Viventium-User-Id':'owner-a'});
-    expect(fetchImpl.mock.calls[0][1]?.method).toBeUndefined();
-  });
+  it.each(['answered', 'replaced', 'expired', 'terminal', 'current'])(
+    'fresh native ownership rejects stale %s snapshot speech',
+    async (state) => {
+      const { fetchImpl, client } = setup();
+      const request = questionInput();
+      const pending =
+        state === 'answered'
+          ? []
+          : [
+              {
+                ...request,
+                ...(state === 'replaced' ? { requestFingerprint: 'b'.repeat(64) } : {}),
+                ...(state === 'expired' ? { expiresAt: new Date(0).toISOString() } : {}),
+              },
+            ];
+      fetchImpl.mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            version: 1,
+            state: state === 'terminal' ? 'completed' : 'running',
+            pending,
+          }),
+        ),
+      );
+      await expect(client.isCurrent('exact-question', request)).resolves.toBe(state === 'current');
+      expect(fetchImpl.mock.calls[0][1]?.headers).toMatchObject({
+        'X-Viventium-User-Id': 'owner-a',
+      });
+      expect(fetchImpl.mock.calls[0][1]?.method).toBeUndefined();
+    },
+  );
   it('returns exact clarification keys and freeform notes through the existing owner endpoint', async () => {
     const { fetchImpl, client } = setup();
-    fetchImpl.mockResolvedValue(new Response(JSON.stringify({version: 1, accepted: true, requestId: input.requestId})));
-    const answer = {answers: {[questionKey]: ['Other']}, annotations: {[questionKey]: {notes: 'Green  with exact spacing'}}};
-    await expect(client.submit('response:question', questionInput(), JSON.stringify(answer))).resolves.toEqual({accepted: true, phase: 'running'});
+    fetchImpl.mockResolvedValue(
+      new Response(JSON.stringify({ version: 1, accepted: true, requestId: input.requestId })),
+    );
+    const answer = {
+      answers: { [questionKey]: ['Other'] },
+      annotations: { [questionKey]: { notes: 'Green  with exact spacing' } },
+    };
+    await expect(
+      client.submit('response:question', questionInput(), JSON.stringify(answer)),
+    ).resolves.toEqual({ accepted: true, phase: 'running' });
     const body = JSON.parse(String(fetchImpl.mock.calls[0][1]?.body));
     expect(JSON.parse(body.input)).toEqual(answer);
     expect(body.requestFingerprint).toBe(input.requestFingerprint);
-    expect(fetchImpl.mock.calls[0][1]?.headers).toMatchObject({'X-Viventium-User-Id': 'owner-a'});
+    expect(fetchImpl.mock.calls[0][1]?.headers).toMatchObject({ 'X-Viventium-User-Id': 'owner-a' });
   });
 
   it('rejects invented labels, multiple single-select answers and wrong native keys before transport', async () => {
     const { fetchImpl, client } = setup();
     for (const content of [
-      {answers: {[questionKey]: ['blue']}},
-      {answers: {[questionKey]: ['Blue', 'Red']}},
-      {answers: {'Which colour?': ['Blue']}},
-      {answers: {[questionKey]: ['Blue']}, annotations: {[questionKey]: {notes: 'not an Other answer'}}},
-    ]) await expect(client.submit('key', questionInput(), JSON.stringify(content))).rejects.toThrow('native_input_invalid_or_expired');
+      { answers: { [questionKey]: ['blue'] } },
+      { answers: { [questionKey]: ['Blue', 'Red'] } },
+      { answers: { 'Which colour?': ['Blue'] } },
+      {
+        answers: { [questionKey]: ['Blue'] },
+        annotations: { [questionKey]: { notes: 'not an Other answer' } },
+      },
+    ])
+      await expect(client.submit('key', questionInput(), JSON.stringify(content))).rejects.toThrow(
+        'native_input_invalid_or_expired',
+      );
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('polls a typed clarification once without requiring permission choices', async () => {
     const { fetchImpl, client } = setup();
-    fetchImpl.mockResolvedValueOnce(new Response(JSON.stringify({version: 1, state: 'running', pending: [questionInput()]})))
-      .mockResolvedValueOnce(new Response(JSON.stringify({version: 1, state: 'completed', pending: []})));
+    fetchImpl
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ version: 1, state: 'running', pending: [questionInput()] })),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ version: 1, state: 'completed', pending: [] })),
+      );
     const onInput = jest.fn();
-    await client.poll({key: () => 'question-key', signal: new AbortController().signal, isActive: () => true, onInput});
+    await client.poll({
+      key: () => 'question-key',
+      signal: new AbortController().signal,
+      isActive: () => true,
+      onInput,
+    });
     expect(onInput).toHaveBeenCalledTimes(1);
-    expect(onInput.mock.calls[0][0]).toMatchObject({kind: 'question', requestedSchema: questionInput().requestedSchema});
+    expect(onInput.mock.calls[0][0]).toMatchObject({
+      kind: 'question',
+      requestedSchema: questionInput().requestedSchema,
+    });
   });
   it('uses the configured provider, owner, and exact response key without putting secrets in the URL', async () => {
     const { fetchImpl, client } = setup();
@@ -185,17 +260,42 @@ test('queues simultaneous native requests without replacing an unanswered reques
 });
 
 it('retains bounded permission operation detail without changing the spoken prompt', async () => {
-  const {fetchImpl, client}=setup();
-  const request={...input,operationTitle:'Create synthetic.txt in the working folder.'};
-  fetchImpl.mockResolvedValueOnce(new Response(JSON.stringify({version:1,state:'running',pending:[request]})))
-    .mockResolvedValueOnce(new Response(JSON.stringify({version:1,state:'completed',pending:[]})));
-  const onInput=jest.fn();
-  await client.poll({key:()=> 'key',signal:new AbortController().signal,isActive:()=>true,onInput});
-  expect(onInput).toHaveBeenCalledWith(request,'key');
+  const { fetchImpl, client } = setup();
+  const request = { ...input, operationTitle: 'Create synthetic.txt in the working folder.' };
+  fetchImpl
+    .mockResolvedValueOnce(
+      new Response(JSON.stringify({ version: 1, state: 'running', pending: [request] })),
+    )
+    .mockResolvedValueOnce(
+      new Response(JSON.stringify({ version: 1, state: 'completed', pending: [] })),
+    );
+  const onInput = jest.fn();
+  await client.poll({
+    key: () => 'key',
+    signal: new AbortController().signal,
+    isActive: () => true,
+    onInput,
+  });
+  expect(onInput).toHaveBeenCalledWith(request, 'key');
 });
-it.each(['x'.repeat(8001),42])('rejects invalid permission operation detail before presentation', async (operationTitle) => {
-  const {fetchImpl,client}=setup(); const onInput=jest.fn();
-  fetchImpl.mockResolvedValue(new Response(JSON.stringify({version:1,state:'running',pending:[{...input,operationTitle}]})));
-  await expect(client.poll({key:()=> 'key',signal:new AbortController().signal,isActive:()=>true,onInput})).rejects.toThrow();
-  expect(onInput).not.toHaveBeenCalled();
-});
+it.each(['x'.repeat(8001), 42])(
+  'rejects invalid permission operation detail before presentation',
+  async (operationTitle) => {
+    const { fetchImpl, client } = setup();
+    const onInput = jest.fn();
+    fetchImpl.mockResolvedValue(
+      new Response(
+        JSON.stringify({ version: 1, state: 'running', pending: [{ ...input, operationTitle }] }),
+      ),
+    );
+    await expect(
+      client.poll({
+        key: () => 'key',
+        signal: new AbortController().signal,
+        isActive: () => true,
+        onInput,
+      }),
+    ).rejects.toThrow();
+    expect(onInput).not.toHaveBeenCalled();
+  },
+);

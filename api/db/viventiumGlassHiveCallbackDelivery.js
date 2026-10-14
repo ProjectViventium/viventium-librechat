@@ -20,16 +20,78 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
       runId: { type: String, required: true, immutable: true },
       callbackRef: { type: String, required: true, immutable: true },
       kind: { type: String, enum: ['nonterminal_attention'], immutable: true },
-      event: { type: String, enum: ['run.needs_input'], required: function () { return this.kind === 'nonterminal_attention'; }, immutable: true },
-      workTerminal: { type: Boolean, required: function () { return this.kind === 'nonterminal_attention'; }, immutable: true },
-      evidenceId: { type: String, match: /^ghe_[a-f0-9]{32}$/, required: function () { return this.kind === 'nonterminal_attention'; }, immutable: true },
-      attemptNumber: { type: Number, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
-      resultKey: { type: String, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
-      acceptedOperationId: { type: String, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
-      terminalCallbackId: { type: String, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
-      resultDigest: { type: String, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
-      resultRevision: { type: Number, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
-      effectGeneration: { type: Number, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
+      event: {
+        type: String,
+        enum: ['run.needs_input'],
+        required: function () {
+          return this.kind === 'nonterminal_attention';
+        },
+        immutable: true,
+      },
+      workTerminal: {
+        type: Boolean,
+        required: function () {
+          return this.kind === 'nonterminal_attention';
+        },
+        immutable: true,
+      },
+      evidenceId: {
+        type: String,
+        match: /^ghe_[a-f0-9]{32}$/,
+        required: function () {
+          return this.kind === 'nonterminal_attention';
+        },
+        immutable: true,
+      },
+      attemptNumber: {
+        type: Number,
+        required: function () {
+          return this.kind !== 'nonterminal_attention';
+        },
+        immutable: true,
+      },
+      resultKey: {
+        type: String,
+        required: function () {
+          return this.kind !== 'nonterminal_attention';
+        },
+        immutable: true,
+      },
+      acceptedOperationId: {
+        type: String,
+        required: function () {
+          return this.kind !== 'nonterminal_attention';
+        },
+        immutable: true,
+      },
+      terminalCallbackId: {
+        type: String,
+        required: function () {
+          return this.kind !== 'nonterminal_attention';
+        },
+        immutable: true,
+      },
+      resultDigest: {
+        type: String,
+        required: function () {
+          return this.kind !== 'nonterminal_attention';
+        },
+        immutable: true,
+      },
+      resultRevision: {
+        type: Number,
+        required: function () {
+          return this.kind !== 'nonterminal_attention';
+        },
+        immutable: true,
+      },
+      effectGeneration: {
+        type: Number,
+        required: function () {
+          return this.kind !== 'nonterminal_attention';
+        },
+        immutable: true,
+      },
     },
     { _id: false, strict: 'throw' },
   );
@@ -37,10 +99,19 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
   workerCompletionBindingSchema.pre('validate', function (next) {
     const attention = this.kind === 'nonterminal_attention';
     const forbidden = attention
-      ? ['attemptNumber', 'resultKey', 'acceptedOperationId', 'terminalCallbackId', 'resultDigest', 'resultRevision', 'effectGeneration']
+      ? [
+          'attemptNumber',
+          'resultKey',
+          'acceptedOperationId',
+          'terminalCallbackId',
+          'resultDigest',
+          'resultRevision',
+          'effectGeneration',
+        ]
       : ['event', 'workTerminal', 'evidenceId'];
-    for (const field of forbidden) if (this[field] !== undefined)
-      this.invalidate(field, 'voice_worker_presentation_binding_invalid');
+    for (const field of forbidden)
+      if (this[field] !== undefined)
+        this.invalidate(field, 'voice_worker_presentation_binding_invalid');
     if (attention && this.workTerminal !== false)
       this.invalidate('workTerminal', 'voice_worker_presentation_binding_invalid');
     next();
@@ -221,7 +292,11 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
         default: null,
         immutable: true,
       },
-      workerCompletionBindings: { type: [workerCompletionBindingSchema], default: [], immutable: true },
+      workerCompletionBindings: {
+        type: [workerCompletionBindingSchema],
+        default: [],
+        immutable: true,
+      },
       workerCompletionProjectionAppliedAt: { type: Date, default: null },
       workerCompletionEffectLeases: {
         type: [workerCompletionEffectLeaseSchema],

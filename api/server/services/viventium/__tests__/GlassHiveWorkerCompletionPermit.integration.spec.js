@@ -30,7 +30,6 @@ jest.mock('../GlassHiveCallbackBindingService', () => ({
 }));
 
 jest.mock('../VoiceOrchestrationTraceService', () => ({
-  recordVoiceOrchestrationTraceBestEffort: (...args) => mockRecordVoiceOrchestrationTrace(...args),
   recordVoiceOrchestrationTrace: (...args) => mockRecordVoiceOrchestrationTrace(...args),
   recordVoiceOrchestrationTraceBestEffort: (...args) => mockRecordVoiceOrchestrationTrace(...args),
 }));

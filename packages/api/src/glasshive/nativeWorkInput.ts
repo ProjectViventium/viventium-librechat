@@ -82,11 +82,18 @@ export const nativeWorkInputResponseSchema = z
   .strict();
 
 /** Existing Queen input channel: exact clarification or native offered choice. */
-export const nativeQueenInputResponseSchema = z.object({
-  version: z.literal(1), requestId: z.string().min(1).max(512),
-  requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/), action: z.literal('accept'),
-  content: z.union([nativeQuestionContentSchema, z.object({optionId:z.string().min(1).max(160)}).strict()]),
-}).strict();
+export const nativeQueenInputResponseSchema = z
+  .object({
+    version: z.literal(1),
+    requestId: z.string().min(1).max(512),
+    requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    action: z.literal('accept'),
+    content: z.union([
+      nativeQuestionContentSchema,
+      z.object({ optionId: z.string().min(1).max(160) }).strict(),
+    ]),
+  })
+  .strict();
 
 const nativeWorkInputBindingSchema = z.object({
   version: z.literal(1),
@@ -111,7 +118,11 @@ const permissionSchema = nativeWorkInputBindingSchema.extend({
       optionId: z.object({
         type: z.literal('string'),
         enum: z.array(z.string().min(1).max(160)).min(1).max(16),
-        enumKinds: z.array(z.enum(['allow_once','allow_always','reject_once','reject_always']).nullable()).min(1).max(16).optional(),
+        enumKinds: z
+          .array(z.enum(['allow_once', 'allow_always', 'reject_once', 'reject_always']).nullable())
+          .min(1)
+          .max(16)
+          .optional(),
         enumNames: z.array(z.string().min(1).max(160)).min(1).max(16),
         description: z.string().min(1).max(8000).optional(),
       }),

@@ -627,21 +627,34 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
   test.each([
     ['active_work_arguments_invalid', 'runId and workRef require result scope', 400, -32602],
     ['native_request_timeout', 'The operation was aborted due to timeout', 500, -32000],
-  ])('keeps typed argument and native transport failures distinct: %s', async (code, message, status, rpcCode) => {
-    const { mintBrokerGrant } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
-    const { token } = mintBrokerGrant({user:{id:'user-1',role:'USER'},
-      allowedServers:['google_workspace'],
-      requestContext:{conversation_id:'conv-1',message_id:'msg-1'}});
-    mockHandleToolCall.mockRejectedValueOnce(Object.assign(new Error(message), {code}));
-    const response = await request(appWithRoute())
-      .post('/api/viventium/glasshive/capabilities/mcp')
-      .set('Authorization', `Bearer ${token}`)
-      .send({jsonrpc:'2.0',id:31,method:'tools/call',
-        params:{name:'active_work_list',arguments:{workRef:'work-1'}}})
-      .expect(status);
-    expect(response.body.error).toEqual({code:rpcCode,
-      message:status===400 ? message : 'GlassHive capability broker request failed'});
-  });
+  ])(
+    'keeps typed argument and native transport failures distinct: %s',
+    async (code, message, status, rpcCode) => {
+      const {
+        mintBrokerGrant,
+      } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+      const { token } = mintBrokerGrant({
+        user: { id: 'user-1', role: 'USER' },
+        allowedServers: ['google_workspace'],
+        requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
+      });
+      mockHandleToolCall.mockRejectedValueOnce(Object.assign(new Error(message), { code }));
+      const response = await request(appWithRoute())
+        .post('/api/viventium/glasshive/capabilities/mcp')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          jsonrpc: '2.0',
+          id: 31,
+          method: 'tools/call',
+          params: { name: 'active_work_list', arguments: { workRef: 'work-1' } },
+        })
+        .expect(status);
+      expect(response.body.error).toEqual({
+        code: rpcCode,
+        message: status === 400 ? message : 'GlassHive capability broker request failed',
+      });
+    },
+  );
 
   test('returns structured content for tools/call', async () => {
     const {

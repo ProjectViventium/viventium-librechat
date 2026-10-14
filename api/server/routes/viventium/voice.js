@@ -3759,15 +3759,33 @@ router.post('/tasks/:taskId/cancel', voiceSessionCapabilityAuth, async (req, res
   });
 });
 
-router.post('/tasks/:taskId/native-input/speech-offer', voiceSessionCapabilityAuth, async (req,res)=>{
-  const task=await hydrateVoiceTask(req.params.taskId,{userId:req.user?.id,callSessionId:req.viventiumCallSession?.callSessionId});
-  if(!taskOwnedBySession(task,req)) return res.status(404).json({error:'Task not found'});
-  try {
-    const offer=await claimVoiceNativeInputSpeechOffer(task.taskId,{userId:req.user.id,callSessionId:req.viventiumCallSession.callSessionId,streamId:req.body?.streamId,prompt:req.body?.prompt,nativeInputRequest:req.body?.nativeInputRequest});
-    if(!offer) return res.status(409).json({error:'native_input_speech_not_admitted'});
-    return res.json(offer);
-  } catch(error) {logger.warn('[VIVENTIUM][VoiceTask] native_input_speech_offer_unavailable',{code:error?.code||'unknown'});return res.status(503).json({error:'native_input_speech_unavailable'});}
-});
+router.post(
+  '/tasks/:taskId/native-input/speech-offer',
+  voiceSessionCapabilityAuth,
+  async (req, res) => {
+    const task = await hydrateVoiceTask(req.params.taskId, {
+      userId: req.user?.id,
+      callSessionId: req.viventiumCallSession?.callSessionId,
+    });
+    if (!taskOwnedBySession(task, req)) return res.status(404).json({ error: 'Task not found' });
+    try {
+      const offer = await claimVoiceNativeInputSpeechOffer(task.taskId, {
+        userId: req.user.id,
+        callSessionId: req.viventiumCallSession.callSessionId,
+        streamId: req.body?.streamId,
+        prompt: req.body?.prompt,
+        nativeInputRequest: req.body?.nativeInputRequest,
+      });
+      if (!offer) return res.status(409).json({ error: 'native_input_speech_not_admitted' });
+      return res.json(offer);
+    } catch (error) {
+      logger.warn('[VIVENTIUM][VoiceTask] native_input_speech_offer_unavailable', {
+        code: error?.code || 'unknown',
+      });
+      return res.status(503).json({ error: 'native_input_speech_unavailable' });
+    }
+  },
+);
 
 router.post('/tasks/:taskId/input', voiceSessionCapabilityAuth, async (req, res) => {
   const task = await hydrateVoiceTask(req.params.taskId, {

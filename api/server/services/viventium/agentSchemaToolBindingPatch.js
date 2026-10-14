@@ -542,14 +542,21 @@ function beginGraphFallbackInvocation(graph, agentId, config) {
   }
   const invocation = Object.freeze({ agentId, runId, threadId });
   Object.defineProperty(graph, graphFallbackInvocationKey, {
-    value: invocation, configurable: true, enumerable: false,
+    value: invocation,
+    configurable: true,
+    enumerable: false,
   });
   return invocation;
 }
 
 function recordGraphFallbackRecovery(graph, fallbackContext, invocation, config) {
-  if (!graph || !fallbackContext || !invocation || config?.signal?.aborted === true ||
-      graph[graphFallbackInvocationKey] !== invocation) {
+  if (
+    !graph ||
+    !fallbackContext ||
+    !invocation ||
+    config?.signal?.aborted === true ||
+    graph[graphFallbackInvocationKey] !== invocation
+  ) {
     return;
   }
   const receipt = {
@@ -559,7 +566,10 @@ function recordGraphFallbackRecovery(graph, fallbackContext, invocation, config)
   };
   Object.defineProperty(receipt, graphFallbackInvocationKey, { value: invocation });
   Object.defineProperty(graph, 'viventiumGraphFallbackRecoveryReceipt', {
-    value: Object.freeze(receipt), configurable: true, enumerable: false, writable: false,
+    value: Object.freeze(receipt),
+    configurable: true,
+    enumerable: false,
+    writable: false,
   });
 }
 
@@ -747,7 +757,12 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
           throw markOpaqueProviderAttemptFailure(error);
         }
         if (attemptIndex > 0) {
-          recordGraphFallbackRecovery(this, policy?.activeFallbackContext, policy?.recoveryInvocation, config);
+          recordGraphFallbackRecovery(
+            this,
+            policy?.activeFallbackContext,
+            policy?.recoveryInvocation,
+            config,
+          );
         }
         return result;
       } catch (error) {
@@ -789,8 +804,10 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
     }
 
     return async (state, config) => {
-      const recoveryInvocation = proto[MODERN_GRAPH_FALLBACK_OWNER] === true
-        ? null : beginGraphFallbackInvocation(this, agentId, config);
+      const recoveryInvocation =
+        proto[MODERN_GRAPH_FALLBACK_OWNER] === true
+          ? null
+          : beginGraphFallbackInvocation(this, agentId, config);
       const invokeWithFallbackPolicy = () => {
         if (proto[MODERN_GRAPH_FALLBACK_OWNER] === true) {
           return originalCallModel(state, config);

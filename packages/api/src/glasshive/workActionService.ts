@@ -10,7 +10,12 @@ import { createAccountApiRoute } from './accountClient';
 import type { VoiceWorkAuthorityBinding } from '../voice/engagementAuthority';
 import type { NativeWorkInputResponse } from 'librechat-data-provider';
 import { safeErrorCode } from '../logging/safeError';
-import { nativeQuestionForm, nativeQuestionContent, nativeWorkInputQuestionText, nativeWorkInputResponseSchema } from './nativeWorkInput';
+import {
+  nativeQuestionForm,
+  nativeQuestionContent,
+  nativeWorkInputQuestionText,
+  nativeWorkInputResponseSchema,
+} from './nativeWorkInput';
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -49,7 +54,9 @@ interface LoggerAdapter {
 export interface GlassHiveWorkActionDependencies {
   GenerationJobManager: GenerationJobManagerAdapter;
   getSourceAuthorJob?: Parameters<typeof currentNativeHumanInputSource>[0]['getJob'];
-  getOriginalInputReceipt?: Parameters<typeof currentNativeHumanInputSource>[0]['getOriginalInputReceipt'];
+  getOriginalInputReceipt?: Parameters<
+    typeof currentNativeHumanInputSource
+  >[0]['getOriginalInputReceipt'];
   assertVoiceWorkAuthority(
     binding: VoiceWorkAuthorityBinding | undefined,
     ownerId: string,
@@ -124,56 +131,119 @@ export interface ActionFileSource {
 export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDependencies) {
   async function prepareFileInputs(input: GlassHiveWorkActionInput, idempotencyKey: string) {
     if (!input.fileIds?.length) return [];
-    if (!['steer', 'queue', 'message'].includes(String(input.action)) || new Set(input.fileIds).size !== input.fileIds.length || !deps.getActionFileSources) {
+    if (
+      !['steer', 'queue', 'message'].includes(String(input.action)) ||
+      new Set(input.fileIds).size !== input.fileIds.length ||
+      !deps.getActionFileSources
+    ) {
       throw new Error('active_work_file_selection_invalid');
     }
-    const detail = recordFrom(await deps.requestAccountApi({ownerId: input.ownerId,
-      path: `/v1/work/${encodeURIComponent(normalizedText(input.workRef))}?projection=actions`}));
+    const detail = recordFrom(
+      await deps.requestAccountApi({
+        ownerId: input.ownerId,
+        path: `/v1/work/${encodeURIComponent(normalizedText(input.workRef))}?projection=actions`,
+      }),
+    );
     if (!Array.isArray(detail.actions) || !detail.actions.includes(String(input.action))) {
       throw new Error('active_work_action_not_available');
     }
     const sources = await deps.getActionFileSources(input);
-    if (sources.length !== input.fileIds.length || sources.some((file, index) => file.fileId !== input.fileIds?.[index])) {
+    if (
+      sources.length !== input.fileIds.length ||
+      sources.some((file, index) => file.fileId !== input.fileIds?.[index])
+    ) {
       throw new Error('active_work_file_selection_invalid');
     }
     const result: UnknownRecord[] = [];
     for (const file of sources) {
       const hash = crypto.createHash('sha256');
       let size = 0;
-      for await (const chunk of await file.openStream()) { hash.update(chunk); size += chunk.byteLength; }
+      for await (const chunk of await file.openStream()) {
+        hash.update(chunk);
+        size += chunk.byteLength;
+      }
       if (size !== file.sizeBytes) throw new Error('active_work_file_source_changed');
       const sha256 = hash.digest('hex');
-      const uploadKey = crypto.createHash('sha256').update(JSON.stringify([idempotencyKey, file.fileId, file.filename, size, sha256, file.inputKind])).digest('hex');
-      let ready = recordFrom(await deps.requestAccountApi({ownerId: input.ownerId,
-        path: '/v1/file-uploads', method: 'POST', body: {
-          draft_id: `action-${crypto.createHash('sha256').update(idempotencyKey).digest('hex')}`,
-          name: file.filename, size_bytes: size, idempotency_key: uploadKey,
-        }}));
+      const uploadKey = crypto
+        .createHash('sha256')
+        .update(
+          JSON.stringify([
+            idempotencyKey,
+            file.fileId,
+            file.filename,
+            size,
+            sha256,
+            file.inputKind,
+          ]),
+        )
+        .digest('hex');
+      let ready = recordFrom(
+        await deps.requestAccountApi({
+          ownerId: input.ownerId,
+          path: '/v1/file-uploads',
+          method: 'POST',
+          body: {
+            draft_id: `action-${crypto.createHash('sha256').update(idempotencyKey).digest('hex')}`,
+            name: file.filename,
+            size_bytes: size,
+            idempotency_key: uploadKey,
+          },
+        }),
+      );
       const uploadId = normalizedText(ready.upload_id);
-      if (!/^fil_[A-Za-z0-9]+$/.test(uploadId)) throw new Error('active_work_upload_receipt_invalid');
+      if (!/^fil_[A-Za-z0-9]+$/.test(uploadId))
+        throw new Error('active_work_upload_receipt_invalid');
       if (ready.state !== 'ready') {
         const iterator = (await file.openStream())[Symbol.asyncIterator]();
         const body = new ReadableStream<Uint8Array>({
           async pull(controller) {
             const next = await iterator.next();
-            if (next.done) controller.close(); else controller.enqueue(next.value);
+            if (next.done) controller.close();
+            else controller.enqueue(next.value);
           },
-          async cancel() { await iterator.return?.(); },
+          async cancel() {
+            await iterator.return?.();
+          },
         });
         const route = createAccountApiRoute({ ownerId: input.ownerId });
-        const response = await (deps.fetchImpl || globalThis.fetch)(`${route.baseURL}file-uploads/${uploadId}/content`, {
-          method: 'PUT', redirect: 'error', headers: {...route.headers, 'Content-Type': 'application/octet-stream', 'Content-Length': String(size)},
-          body, signal: AbortSignal.timeout(15000), ...{duplex: 'half'},
-        });
+        const response = await (deps.fetchImpl || globalThis.fetch)(
+          `${route.baseURL}file-uploads/${uploadId}/content`,
+          {
+            method: 'PUT',
+            redirect: 'error',
+            headers: {
+              ...route.headers,
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': String(size),
+            },
+            body,
+            signal: AbortSignal.timeout(15000),
+            ...{ duplex: 'half' },
+          },
+        );
         if (!response.ok) throw new Error('active_work_upload_rejected');
         ready = recordFrom(await response.json());
       }
-      if (ready.state !== 'ready' || ready.upload_id !== uploadId || ready.sha256 !== sha256 ||
-          ready.size_bytes !== size || ready.name !== file.filename || !normalizedText(ready.revision)) {
+      if (
+        ready.state !== 'ready' ||
+        ready.upload_id !== uploadId ||
+        ready.sha256 !== sha256 ||
+        ready.size_bytes !== size ||
+        ready.name !== file.filename ||
+        !normalizedText(ready.revision)
+      ) {
         throw new Error('active_work_upload_content_unconfirmed');
       }
-      result.push({ uploadId, revision: ready.revision, sha256, sizeBytes: size, filename: file.filename,
-        sourceFileId: file.fileId, inputKind: file.inputKind, ...(file.mediaGroupIndex === undefined ? {} : {mediaGroupIndex: file.mediaGroupIndex}) });
+      result.push({
+        uploadId,
+        revision: ready.revision,
+        sha256,
+        sizeBytes: size,
+        filename: file.filename,
+        sourceFileId: file.fileId,
+        inputKind: file.inputKind,
+        ...(file.mediaGroupIndex === undefined ? {} : { mediaGroupIndex: file.mediaGroupIndex }),
+      });
     }
     return result;
   }
@@ -270,13 +340,13 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
         facts,
       });
       await deps.recordVoiceOrchestrationTraceBestEffort({
-          ownerId,
-          callSessionId,
-          turnId,
-          eventRef: operationId,
-          stage: 'control.completed',
-          facts,
-        });
+        ownerId,
+        callSessionId,
+        turnId,
+        eventRef: operationId,
+        stage: 'control.completed',
+        facts,
+      });
     } catch (error) {
       deps.logger.warn('[VIVENTIUM][voice-trace] accepted_action_context_unavailable', {
         code: safeErrorCode(error, 'context_unavailable'),
@@ -315,7 +385,9 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
         });
       }
     }
-    const refreshed = recordFrom(await deps.reauthorizeCapabilityAuthorization({ ownerId, workRef }));
+    const refreshed = recordFrom(
+      await deps.reauthorizeCapabilityAuthorization({ ownerId, workRef }),
+    );
     return {
       version: 1,
       authorizationRef: refreshed.authorizationRef,
@@ -347,32 +419,62 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
     let nativeHumanInput: Awaited<ReturnType<typeof currentNativeHumanInputSource>> | undefined;
     if (input.nativeInput && (action !== 'resume' || input.ownerInputControl !== true)) {
       const reply = nativeWorkInputResponseSchema.safeParse(input.nativeInput);
-      const denied = () => Object.assign(new Error('native_input_owner_control_required'), {
-        code: 'native_input_owner_control_required', status: 403 });
-      if (normalizedText(instruction) || action !== 'resume' || !reply.success || reply.data.action !== 'accept' ||
-          !reply.data.content) throw denied();
-      nativeDetail = await deps.requestAccountApi({ ownerId,
-        path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}` });
+      const denied = () =>
+        Object.assign(new Error('native_input_owner_control_required'), {
+          code: 'native_input_owner_control_required',
+          status: 403,
+        });
+      if (
+        normalizedText(instruction) ||
+        action !== 'resume' ||
+        !reply.success ||
+        reply.data.action !== 'accept' ||
+        !reply.data.content
+      )
+        throw denied();
+      nativeDetail = await deps.requestAccountApi({
+        ownerId,
+        path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}`,
+      });
       const detail = recordFrom(nativeDetail);
       const pending = recordFrom(detail.pendingNativeInput);
-      if (detail.workRef !== workRef || pending.requestId !== reply.data.requestId ||
-          pending.requestFingerprint !== reply.data.requestFingerprint) throw denied();
+      if (
+        detail.workRef !== workRef ||
+        pending.requestId !== reply.data.requestId ||
+        pending.requestFingerprint !== reply.data.requestFingerprint
+      )
+        throw denied();
       if (pending.kind === 'question') {
         const form = nativeQuestionForm(pending);
-        if (!form || !nativeWorkInputQuestionText(pending, pending) ||
-            !nativeQuestionContent(reply.data.content, form)) throw denied();
+        if (
+          !form ||
+          !nativeWorkInputQuestionText(pending, pending) ||
+          !nativeQuestionContent(reply.data.content, form)
+        )
+          throw denied();
       } else if (pending.kind === 'permission') {
         const content = recordFrom(reply.data.content);
-        const option = recordFrom(recordFrom(recordFrom(pending.requestedSchema).properties).optionId);
+        const option = recordFrom(
+          recordFrom(recordFrom(pending.requestedSchema).properties).optionId,
+        );
         const values = Array.isArray(option.enum) ? option.enum : [];
         const kinds = Array.isArray(option.enumKinds) ? option.enumKinds : [];
         const index = values.indexOf(content.optionId);
-        if (Object.keys(content).length !== 1 || typeof content.optionId !== 'string' || index < 0 ||
-            values.length !== kinds.length || !['allow_once', 'reject_once'].includes(String(kinds[index])) ||
-            !deps.getSourceAuthorJob) throw denied();
-        nativeHumanInput = await currentNativeHumanInputSource({userId: normalizedText(ownerId),
-          requestBody: input.requestBody || {}, getJob: deps.getSourceAuthorJob,
-          getOriginalInputReceipt:deps.getOriginalInputReceipt});
+        if (
+          Object.keys(content).length !== 1 ||
+          typeof content.optionId !== 'string' ||
+          index < 0 ||
+          values.length !== kinds.length ||
+          !['allow_once', 'reject_once'].includes(String(kinds[index])) ||
+          !deps.getSourceAuthorJob
+        )
+          throw denied();
+        nativeHumanInput = await currentNativeHumanInputSource({
+          userId: normalizedText(ownerId),
+          requestBody: input.requestBody || {},
+          getJob: deps.getSourceAuthorJob,
+          getOriginalInputReceipt: deps.getOriginalInputReceipt,
+        });
       } else throw denied();
       // The native owner revalidates the same current request before its existing mailbox ACK.
       input = { ...input, nativeInput: reply.data };
@@ -401,9 +503,16 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
         });
       }
     }
-    const capabilityReauthorization = await trustedCapabilityRefresh({
-      ownerId, workRef, action, ownerInputControl: input.ownerInputControl, requestBody: input.requestBody,
-    }, nativeDetail);
+    const capabilityReauthorization = await trustedCapabilityRefresh(
+      {
+        ownerId,
+        workRef,
+        action,
+        ownerInputControl: input.ownerInputControl,
+        requestBody: input.requestBody,
+      },
+      nativeDetail,
+    );
     const idempotencyKey = deps.buildTrustedActionIdempotencyKey({
       ownerId,
       workRef,
@@ -422,33 +531,48 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
     const fileInputs = await prepareFileInputs(input, idempotencyKey);
     await assertCurrentVoiceAuthority();
     const actionBody = {
-        action,
-        ...(instruction ? { instruction } : {}),
-        idempotencyKey,
-        ...(input.nativeInput ? { nativeInput: input.nativeInput } : {}),
-        ...(nativeHumanInput ? { nativeHumanInput } : {}),
-        ...(capabilityReauthorization ? { capabilityReauthorization } : {}),
-        ...(sourceContext ? { sourceContext } : {}),
-        ...(fileInputs.length ? { fileInputs } : {}),
-      };
+      action,
+      ...(instruction ? { instruction } : {}),
+      idempotencyKey,
+      ...(input.nativeInput ? { nativeInput: input.nativeInput } : {}),
+      ...(nativeHumanInput ? { nativeHumanInput } : {}),
+      ...(capabilityReauthorization ? { capabilityReauthorization } : {}),
+      ...(sourceContext ? { sourceContext } : {}),
+      ...(fileInputs.length ? { fileInputs } : {}),
+    };
     let result: unknown;
     try {
-      result = await deps.requestAccountApi({ ownerId,
-        path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}/actions`, method: 'POST',
-        ...(input.nativeInput ? { ownerNativeInput: input.nativeInput } : {}), body: actionBody });
+      result = await deps.requestAccountApi({
+        ownerId,
+        path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}/actions`,
+        method: 'POST',
+        ...(input.nativeInput ? { ownerNativeInput: input.nativeInput } : {}),
+        body: actionBody,
+      });
     } catch (error) {
-      if (action !== 'resume' || Number(recordFrom(error).status) !== 409 ||
-          safeErrorCode(error) !== 'active_work_idempotency_conflict' || capabilityReauthorization ||
-          !deps.readCapabilityReauthorizationReceiptCandidate) throw error;
-      const candidate = await deps.readCapabilityReauthorizationReceiptCandidate({ ownerId, workRef });
+      if (
+        action !== 'resume' ||
+        Number(recordFrom(error).status) !== 409 ||
+        safeErrorCode(error) !== 'active_work_idempotency_conflict' ||
+        capabilityReauthorization ||
+        !deps.readCapabilityReauthorizationReceiptCandidate
+      )
+        throw error;
+      const candidate = await deps.readCapabilityReauthorizationReceiptCandidate({
+        ownerId,
+        workRef,
+      });
       if (!candidate) throw error;
       await assertCurrentVoiceAuthority();
       // Receipt lookup is read-only. The native immutable owner/work/key/body digest
       // must match; it cannot reserve, take over or execute an action.
-      result = await deps.requestAccountApi({ ownerId,
-        path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}/actions/receipt`, method: 'POST',
+      result = await deps.requestAccountApi({
+        ownerId,
+        path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}/actions/receipt`,
+        method: 'POST',
         ...(input.nativeInput ? { ownerNativeInput: input.nativeInput } : {}),
-        body: { ...actionBody, capabilityReauthorization: candidate } });
+        body: { ...actionBody, capabilityReauthorization: candidate },
+      });
     }
     deps.invalidateActiveWorkSnapshot({
       ownerId,

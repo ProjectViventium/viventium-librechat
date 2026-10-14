@@ -59,7 +59,17 @@ function harness(row = terminal) {
     deferGlassHiveWorkStateReconciliation: defer,
     reconcileAuthoritativeGlassHiveWorkState: jest.fn(),
   });
-  return { service, accepted, evidence, request, update, defer, trace, projectionUpdate, collection };
+  return {
+    service,
+    accepted,
+    evidence,
+    request,
+    update,
+    defer,
+    trace,
+    projectionUpdate,
+    collection,
+  };
 }
 
 test('existing reconciliation requests only the exact accepted terminal result', async () => {
@@ -158,21 +168,33 @@ test('after the existing callback owner persists useful evidence, another scan r
   expect(h.request).toHaveBeenCalledTimes(1);
 });
 
-
 const retainedStop = {
-  ...terminal, workerId: 'worker-test', externalState: 'cancelled',
+  ...terminal,
+  workerId: 'worker-test',
+  externalState: 'cancelled',
 };
 const stopDelivery = {
-  callbackRef: 'callback_sha256:' + 'd'.repeat(64), callbackRevision: 27,
-  event: 'run.cancelled', status: 'dead_lettered', resultRevision: 0, resultDigest: null,
-  payloadSha256: 'sha256:' + 'e'.repeat(64), authoritySha256: 'sha256:' + 'f'.repeat(64),
+  callbackRef: 'callback_sha256:' + 'd'.repeat(64),
+  callbackRevision: 27,
+  event: 'run.cancelled',
+  status: 'dead_lettered',
+  resultRevision: 0,
+  resultDigest: null,
+  payloadSha256: 'sha256:' + 'e'.repeat(64),
+  authoritySha256: 'sha256:' + 'f'.repeat(64),
 };
-const stopDetail = { workRef: terminal.workRef, state: 'cancelled', callbackDeliveries: [stopDelivery] };
+const stopDetail = {
+  workRef: terminal.workRef,
+  state: 'cancelled',
+  callbackDeliveries: [stopDelivery],
+};
 
 function stopHarness() {
   const h = harness(retainedStop);
   h.accepted.mockResolvedValue(null);
-  h.request.mockImplementation(async ({ method }) => method === 'POST' ? { state: 'delivering' } : stopDetail);
+  h.request.mockImplementation(async ({ method }) =>
+    method === 'POST' ? { state: 'delivering' } : stopDetail,
+  );
   return h;
 }
 
@@ -180,16 +202,25 @@ test('existing reconciliation requests the exact verified retained Stop callback
   const h = stopHarness();
   await h.service.reconcileKnownExternalWorkHints({ limit: 10 });
   expect(h.trace).toHaveBeenCalledWith({
-    ownerId: terminal.ownerId, originRef: terminal.originRef, workRef: terminal.workRef,
-    runRef: terminal.runId, detail: stopDetail,
+    ownerId: terminal.ownerId,
+    originRef: terminal.originRef,
+    workRef: terminal.workRef,
+    runRef: terminal.runId,
+    detail: stopDetail,
   });
   expect(h.request).toHaveBeenLastCalledWith({
-    ownerId: terminal.ownerId, path: '/v1/callback-associations/recover',
-    method: 'POST', timeoutMs: 3000,
+    ownerId: terminal.ownerId,
+    path: '/v1/callback-associations/recover',
+    method: 'POST',
+    timeoutMs: 3000,
     body: {
-      originRef: terminal.originRef, workRef: terminal.workRef, runId: terminal.runId,
-      workerId: retainedStop.workerId, callbackRef: stopDelivery.callbackRef,
-      payloadSha256: stopDelivery.payloadSha256, authoritySha256: stopDelivery.authoritySha256,
+      originRef: terminal.originRef,
+      workRef: terminal.workRef,
+      runId: terminal.runId,
+      workerId: retainedStop.workerId,
+      callbackRef: stopDelivery.callbackRef,
+      payloadSha256: stopDelivery.payloadSha256,
+      authoritySha256: stopDelivery.authoritySha256,
     },
   });
   expect(h.update).toHaveBeenCalledWith(
@@ -209,7 +240,13 @@ test('unverified Stop trace cannot request recovery', async () => {
 test.each([
   { ...stopDetail, workRef: 'other-work' },
   { ...stopDetail, state: 'running' },
-  { ...stopDetail, callbackDeliveries: [stopDelivery, { ...stopDelivery, callbackRevision: 28, status: 'http_accepted' }] },
+  {
+    ...stopDetail,
+    callbackDeliveries: [
+      stopDelivery,
+      { ...stopDelivery, callbackRevision: 28, status: 'http_accepted' },
+    ],
+  },
   { ...stopDetail, callbackDeliveries: [{ ...stopDelivery, payloadSha256: '' }] },
 ])('changed or settled Stop evidence cannot be replayed: %j', async (detail) => {
   const h = stopHarness();
@@ -219,146 +256,220 @@ test.each([
   expect(h.update).not.toHaveBeenCalled();
 });
 
-
 test.each(['accepted', 'revoked', 'not-newer'])(
-  'historical delivery preserves newer aggregate only with an exact active accepted lease: %s', async (mode) => {
+  'historical delivery preserves newer aggregate only with an exact active accepted lease: %s',
+  async (mode) => {
     const h = harness();
-    const body = { run_id: receipt.runId, callback_id: receipt.callbackId,
-      result_ended_at: '2026-08-27T12:00:00Z', result_revision: receipt.resultRevision,
-      result_digest: receipt.resultDigest };
-    const fence = { resultKey: 'ghtr_' + 'e'.repeat(64), callbackId: receipt.callbackId,
-      resultDigest: receipt.resultDigest, resultRevision: 1,
-      acceptedOperationId: receipt.acceptedOperationId, leaseId: 'd'.repeat(32),
-      generation: 3, acceptedOperationGeneration: 1 };
-    const newer = { ...terminal, terminalCallbackRunId: 'corrected-run',
-      terminalCallbackResultEndedAt: new Date('2026-08-27T12:01:00Z'), deliveryState: 'pending' };
+    const body = {
+      run_id: receipt.runId,
+      callback_id: receipt.callbackId,
+      result_ended_at: '2026-08-27T12:00:00Z',
+      result_revision: receipt.resultRevision,
+      result_digest: receipt.resultDigest,
+    };
+    const fence = {
+      resultKey: 'ghtr_' + 'e'.repeat(64),
+      callbackId: receipt.callbackId,
+      resultDigest: receipt.resultDigest,
+      resultRevision: 1,
+      acceptedOperationId: receipt.acceptedOperationId,
+      leaseId: 'd'.repeat(32),
+      generation: 3,
+      acceptedOperationGeneration: 1,
+    };
+    const newer = {
+      ...terminal,
+      terminalCallbackRunId: 'corrected-run',
+      terminalCallbackResultEndedAt: new Date('2026-08-27T12:01:00Z'),
+      deliveryState: 'pending',
+    };
     const session = { inTransaction: () => true };
     h.projectionUpdate.mockResolvedValue(null);
     h.evidence.mockResolvedValue(mode === 'not-newer' ? null : newer);
     h.accepted.mockResolvedValue(mode === 'revoked' ? null : receipt);
     const operation = h.service.recordGlassHiveSurfaceDeliveryOutcome({
-      originRef: terminal.originRef, state: 'sent', body,
-      effectFence: fence, effectSession: session as never,
+      originRef: terminal.originRef,
+      state: 'sent',
+      body,
+      effectFence: fence,
+      effectSession: session as never,
     });
     if (mode === 'accepted') await expect(operation).resolves.toEqual(newer);
-    else await expect(operation).rejects.toMatchObject({ code: 'glasshive_callback_effect_fenced' });
+    else
+      await expect(operation).rejects.toMatchObject({ code: 'glasshive_callback_effect_fenced' });
     expect(h.projectionUpdate).toHaveBeenCalledTimes(1);
-    expect(h.evidence).toHaveBeenCalledWith({
-      _id: terminal.originRef,
-      terminalCallbackRunId: { $exists: true, $nin: ['', receipt.runId] },
-      terminalCallbackResultEndedAt: { $gt: new Date(body.result_ended_at) },
-    }, { session });
-    if (mode !== 'not-newer') expect(h.accepted).toHaveBeenCalledWith({
-      _id: fence.resultKey, ownerId: terminal.ownerId, originRef: terminal.originRef,
-      workRef: terminal.workRef, runId: receipt.runId,
-      acceptedOperationId: receipt.acceptedOperationId, acceptedOperationGeneration: 1,
-      callbackId: receipt.callbackId, resultDigest: receipt.resultDigest,
-      resultRevision: 1, effectLeaseId: fence.leaseId,
-      effectLeaseGeneration: 3, effectLeaseExpiresAt: { $gt: expect.any(Date) },
-    }, { session });
+    expect(h.evidence).toHaveBeenCalledWith(
+      {
+        _id: terminal.originRef,
+        terminalCallbackRunId: { $exists: true, $nin: ['', receipt.runId] },
+        terminalCallbackResultEndedAt: { $gt: new Date(body.result_ended_at) },
+      },
+      { session },
+    );
+    if (mode !== 'not-newer')
+      expect(h.accepted).toHaveBeenCalledWith(
+        {
+          _id: fence.resultKey,
+          ownerId: terminal.ownerId,
+          originRef: terminal.originRef,
+          workRef: terminal.workRef,
+          runId: receipt.runId,
+          acceptedOperationId: receipt.acceptedOperationId,
+          acceptedOperationGeneration: 1,
+          callbackId: receipt.callbackId,
+          resultDigest: receipt.resultDigest,
+          resultRevision: 1,
+          effectLeaseId: fence.leaseId,
+          effectLeaseGeneration: 3,
+          effectLeaseExpiresAt: { $gt: expect.any(Date) },
+        },
+        { session },
+      );
   },
 );
 
-
 test.each(['current-pending', 'historical-only', 'correction-advances'])(
-  'surface projection uses current result only and compare-and-sets its snapshot: %s', async (scenario) => {
+  'surface projection uses current result only and compare-and-sets its snapshot: %s',
+  async (scenario) => {
     const h = harness();
-    const current = { ...terminal, terminalCallbackRunId: 'current-run',
+    const current = {
+      ...terminal,
+      terminalCallbackRunId: 'current-run',
       terminalCallbackId: 'cb_terminal_' + '2'.repeat(64),
       terminalCallbackResultDigest: 'sha256:' + '3'.repeat(64),
-      terminalCallbackResultRevision: 2, terminalCallbackAcceptedOperationId: '4'.repeat(32),
+      terminalCallbackResultRevision: 2,
+      terminalCallbackAcceptedOperationId: '4'.repeat(32),
       terminalCallbackEffectLeaseGeneration: 2,
       terminalCallbackResultEndedAt: new Date('2026-08-28T12:01:00Z'),
-      updatedAt: new Date('2026-08-28T12:02:00Z') };
+      updatedAt: new Date('2026-08-28T12:02:00Z'),
+    };
     h.evidence.mockResolvedValue(current);
-    const historical = { originRef: terminal.originRef, userId: terminal.ownerId,
-      workRef: terminal.workRef, runId: 'older-run', status: 'sent',
-      terminalCallbackId: receipt.callbackId };
-    const latest = { originRef: terminal.originRef, userId: terminal.ownerId,
-      workRef: terminal.workRef, runId: current.terminalCallbackRunId, status: 'pending',
+    const historical = {
+      originRef: terminal.originRef,
+      userId: terminal.ownerId,
+      workRef: terminal.workRef,
+      runId: 'older-run',
+      status: 'sent',
+      terminalCallbackId: receipt.callbackId,
+    };
+    const latest = {
+      originRef: terminal.originRef,
+      userId: terminal.ownerId,
+      workRef: terminal.workRef,
+      runId: current.terminalCallbackRunId,
+      status: 'pending',
       terminalCallbackId: current.terminalCallbackId,
       terminalCallbackResultDigest: current.terminalCallbackResultDigest,
       terminalCallbackResultRevision: current.terminalCallbackResultRevision,
-      terminalCallbackAcceptedOperationId: current.terminalCallbackAcceptedOperationId };
+      terminalCallbackAcceptedOperationId: current.terminalCallbackAcceptedOperationId,
+    };
     const receipts = scenario === 'historical-only' ? [historical] : [historical, latest];
-    const find = jest.fn((filter) => ({ toArray: async () => receipts.filter(row =>
-      Object.entries(filter).every(([key, value]) => row[key as keyof typeof row] === value)) }));
+    const find = jest.fn((filter) => ({
+      toArray: async () =>
+        receipts.filter((row) =>
+          Object.entries(filter).every(([key, value]) => row[key as keyof typeof row] === value),
+        ),
+    }));
     const priorCollection = h.collection.getMockImplementation()!;
-    h.collection.mockImplementation(name => name === 'viventiumglasshivecallbackdeliveries'
-      ? { find } as never : priorCollection(name));
-    h.projectionUpdate.mockResolvedValue(scenario === 'correction-advances' ? null : { ...current, deliveryState: 'enqueued' });
-    const operation = h.service.reconcileGlassHiveSurfaceDeliveryOutcome({ originRef: terminal.originRef });
-    if (scenario === 'correction-advances') {
-      await expect(operation).rejects.toMatchObject({ code: 'glasshive_delivery_projection_snapshot_changed' });
-    } else await expect(operation).resolves.toBeTruthy();
-    expect(find).toHaveBeenCalledWith({ originRef: terminal.originRef, userId: terminal.ownerId,
-      workRef: terminal.workRef, runId: 'current-run', terminalCallbackId: current.terminalCallbackId,
-      terminalCallbackResultDigest: current.terminalCallbackResultDigest,
-      terminalCallbackResultRevision: 2, terminalCallbackAcceptedOperationId: current.terminalCallbackAcceptedOperationId,
-    }, { projection: { status: 1 } });
-    if (scenario === 'historical-only') expect(h.projectionUpdate).not.toHaveBeenCalled();
-    else expect(h.projectionUpdate).toHaveBeenCalledWith(expect.objectContaining({
-      _id: terminal.originRef, ownerId: terminal.ownerId, updatedAt: current.updatedAt,
-      terminalCallbackRunId: 'current-run', terminalCallbackId: current.terminalCallbackId,
-      terminalCallbackResultRevision: 2,
-    }), expect.objectContaining({ $set: expect.objectContaining({ deliveryState: 'enqueued' }) }),
-    { returnDocument: 'after' });
-  },
-);
-
-
-test.each(['current', 'same-result-advanced-lease', 'newer-result', 'other-owner', 'other-followup'])(
-  'aggregate delivery projection compares exact current member snapshot: %s',
-  async (scenario) => {
-    const h = harness();
-    const binding = {
+    h.collection.mockImplementation((name) =>
+      name === 'viventiumglasshivecallbackdeliveries' ? ({ find } as never) : priorCollection(name),
+    );
+    h.projectionUpdate.mockResolvedValue(
+      scenario === 'correction-advances' ? null : { ...current, deliveryState: 'enqueued' },
+    );
+    const operation = h.service.reconcileGlassHiveSurfaceDeliveryOutcome({
       originRef: terminal.originRef,
-      workRef: terminal.workRef,
-      workerId: receipt.workerId,
-      runId: terminal.runId,
-      callbackRef: 'callback_sha256:' + 'a'.repeat(64),
-      attemptNumber: 1,
-      resultKey: 'ghtr_' + 'a'.repeat(64),
-      acceptedOperationId: receipt.acceptedOperationId,
-      terminalCallbackId: receipt.callbackId,
-      resultDigest: receipt.resultDigest,
-      resultRevision: 1,
-      effectGeneration: 1,
-    };
-    const current = {
-      ...terminal,
-      terminalCallbackRunId: binding.runId,
-      terminalCallbackId: binding.terminalCallbackId,
-      terminalCallbackResultDigest: binding.resultDigest,
-      terminalCallbackResultRevision: scenario === 'newer-result' ? 2 : 1,
-      terminalCallbackAcceptedOperationId: binding.acceptedOperationId,
-      terminalCallbackEffectLeaseGeneration: scenario === 'same-result-advanced-lease' ? 2 : 1,
-      ownerId: scenario === 'other-owner' ? 'another-owner' : terminal.ownerId,
-      followUpMessageId: scenario === 'other-followup' ? 'another-reply' : 'combined-reply',
-    };
-    h.projectionUpdate.mockImplementation(async (filter) =>
-      Object.entries(filter).every(([key, value]) => current[key as keyof typeof current] === value)
-        ? { ...current, deliveryState: 'sent' }
-        : null,
-    );
-    const result = await h.service.recordGlassHiveSurfaceDeliveryOutcome({
-      originRef: binding.originRef,
-      state: 'sent',
-      workerCompletion: { ownerId: terminal.ownerId, responseMessageId: 'combined-reply', binding },
     });
-    expect(Boolean(result)).toBe(['current', 'same-result-advanced-lease'].includes(scenario));
-    expect(h.projectionUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({
-        ownerId: terminal.ownerId,
-        workRef: binding.workRef,
-        terminalCallbackRunId: binding.runId,
-        terminalCallbackResultRevision: 1,
-        terminalCallbackId: binding.terminalCallbackId,
-        terminalCallbackAcceptedOperationId: binding.acceptedOperationId,
-        followUpMessageId: 'combined-reply',
-      }),
-      expect.any(Object),
-      expect.any(Object),
+    if (scenario === 'correction-advances') {
+      await expect(operation).rejects.toMatchObject({
+        code: 'glasshive_delivery_projection_snapshot_changed',
+      });
+    } else await expect(operation).resolves.toBeTruthy();
+    expect(find).toHaveBeenCalledWith(
+      {
+        originRef: terminal.originRef,
+        userId: terminal.ownerId,
+        workRef: terminal.workRef,
+        runId: 'current-run',
+        terminalCallbackId: current.terminalCallbackId,
+        terminalCallbackResultDigest: current.terminalCallbackResultDigest,
+        terminalCallbackResultRevision: 2,
+        terminalCallbackAcceptedOperationId: current.terminalCallbackAcceptedOperationId,
+      },
+      { projection: { status: 1 } },
     );
+    if (scenario === 'historical-only') expect(h.projectionUpdate).not.toHaveBeenCalled();
+    else
+      expect(h.projectionUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          _id: terminal.originRef,
+          ownerId: terminal.ownerId,
+          updatedAt: current.updatedAt,
+          terminalCallbackRunId: 'current-run',
+          terminalCallbackId: current.terminalCallbackId,
+          terminalCallbackResultRevision: 2,
+        }),
+        expect.objectContaining({ $set: expect.objectContaining({ deliveryState: 'enqueued' }) }),
+        { returnDocument: 'after' },
+      );
   },
 );
+
+test.each([
+  'current',
+  'same-result-advanced-lease',
+  'newer-result',
+  'other-owner',
+  'other-followup',
+])('aggregate delivery projection compares exact current member snapshot: %s', async (scenario) => {
+  const h = harness();
+  const binding = {
+    originRef: terminal.originRef,
+    workRef: terminal.workRef,
+    workerId: receipt.workerId,
+    runId: terminal.runId,
+    callbackRef: 'callback_sha256:' + 'a'.repeat(64),
+    attemptNumber: 1,
+    resultKey: 'ghtr_' + 'a'.repeat(64),
+    acceptedOperationId: receipt.acceptedOperationId,
+    terminalCallbackId: receipt.callbackId,
+    resultDigest: receipt.resultDigest,
+    resultRevision: 1,
+    effectGeneration: 1,
+  };
+  const current = {
+    ...terminal,
+    terminalCallbackRunId: binding.runId,
+    terminalCallbackId: binding.terminalCallbackId,
+    terminalCallbackResultDigest: binding.resultDigest,
+    terminalCallbackResultRevision: scenario === 'newer-result' ? 2 : 1,
+    terminalCallbackAcceptedOperationId: binding.acceptedOperationId,
+    terminalCallbackEffectLeaseGeneration: scenario === 'same-result-advanced-lease' ? 2 : 1,
+    ownerId: scenario === 'other-owner' ? 'another-owner' : terminal.ownerId,
+    followUpMessageId: scenario === 'other-followup' ? 'another-reply' : 'combined-reply',
+  };
+  h.projectionUpdate.mockImplementation(async (filter) =>
+    Object.entries(filter).every(([key, value]) => current[key as keyof typeof current] === value)
+      ? { ...current, deliveryState: 'sent' }
+      : null,
+  );
+  const result = await h.service.recordGlassHiveSurfaceDeliveryOutcome({
+    originRef: binding.originRef,
+    state: 'sent',
+    workerCompletion: { ownerId: terminal.ownerId, responseMessageId: 'combined-reply', binding },
+  });
+  expect(Boolean(result)).toBe(['current', 'same-result-advanced-lease'].includes(scenario));
+  expect(h.projectionUpdate).toHaveBeenCalledWith(
+    expect.objectContaining({
+      ownerId: terminal.ownerId,
+      workRef: binding.workRef,
+      terminalCallbackRunId: binding.runId,
+      terminalCallbackResultRevision: 1,
+      terminalCallbackId: binding.terminalCallbackId,
+      terminalCallbackAcceptedOperationId: binding.acceptedOperationId,
+      followUpMessageId: 'combined-reply',
+    }),
+    expect.any(Object),
+    expect.any(Object),
+  );
+});

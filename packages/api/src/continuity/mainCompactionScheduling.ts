@@ -159,11 +159,15 @@ export function mainCompactionStageBudget(input: {
 }): { allowed: boolean; timeoutMs: number } {
   const leaseRemaining = mainCompactionLeaseRemainingMs(input.leaseExpiresAt, input.now);
   const deadline = new Date(input.deadlineAt as string | number | Date).getTime();
-  if (!Number.isFinite(deadline)) return {
-    allowed: leaseRemaining > 0, timeoutMs: Math.min(input.maxCallMs, leaseRemaining),
-  };
-  const remaining = Math.min(leaseRemaining,
-    Math.max(0, deadline - input.now - Math.max(0, input.completionReserveMs || 0)));
+  if (!Number.isFinite(deadline))
+    return {
+      allowed: leaseRemaining > 0,
+      timeoutMs: Math.min(input.maxCallMs, leaseRemaining),
+    };
+  const remaining = Math.min(
+    leaseRemaining,
+    Math.max(0, deadline - input.now - Math.max(0, input.completionReserveMs || 0)),
+  );
   // An unobserved stage has no measured estimate. A different stage's duration is not evidence
   // for it; the live lease, enclosing Main reserve and existing per-call ceiling still bound it.
   const compactionEstimate = Math.max(0, input.slowestCompactionCallMs ?? 0);
@@ -186,7 +190,8 @@ export function mainCompactionStageLeaseRenewal(
     now: input.now,
   });
   return expiresAt && mainCompactionStageBudget({ ...input, leaseExpiresAt: expiresAt }).allowed
-    ? expiresAt : null;
+    ? expiresAt
+    : null;
 }
 
 /** Compose the exact child's native release with the existing intentional generation Stop ACK. */
@@ -199,12 +204,15 @@ export function retainMainCompactionCancellationDelivery(input: {
   if (!signal) return () => {};
   const key = '_viventiumHarnessCancellationDelivery';
   const previous = Object.getOwnPropertyDescriptor(signal, key);
-  if (previous && !previous.configurable) throw new Error('main_compaction_cancellation_owner_conflict');
+  if (previous && !previous.configurable)
+    throw new Error('main_compaction_cancellation_owner_conflict');
   const getter = () => {
     const parentDelivery = previous?.get?.call(signal) ?? previous?.value;
     return Promise.all([parentDelivery, input.settled]).then(([parent]) => {
-      const delivered = input.capacityReleased() &&
-        (parentDelivery == null || (parent as { delivered?: unknown } | undefined)?.delivered === true);
+      const delivered =
+        input.capacityReleased() &&
+        (parentDelivery == null ||
+          (parent as { delivered?: unknown } | undefined)?.delivered === true);
       if (!delivered) throw new Error('main_compaction_native_release_unconfirmed');
       return { delivered: true };
     });
@@ -233,13 +241,18 @@ export function mainCompactionSizeRepairBudget(input: {
   maxCallMs: number;
 }): { allowed: boolean; timeoutMs: number } {
   if (input.slowestCompactionCallMs !== undefined || input.slowestReviewCallMs !== undefined) {
-    if (input.state?.converging !== true ||
-        input.attempts >= MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS) {
+    if (
+      input.state?.converging !== true ||
+      input.attempts >= MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS
+    ) {
       return { allowed: false, timeoutMs: 0 };
     }
     // This caller already clamps the lease to its enclosing deadline minus Main's reserve.
-    return mainCompactionStageBudget({ ...input, deadlineAt: input.leaseExpiresAt,
-      stage: 'compaction' });
+    return mainCompactionStageBudget({
+      ...input,
+      deadlineAt: input.leaseExpiresAt,
+      stage: 'compaction',
+    });
   }
   const remaining = mainCompactionLeaseRemainingMs(input.leaseExpiresAt, input.now);
   const reviewReserve = Math.max(0, input.slowestCallMs);
@@ -341,7 +354,9 @@ export function resetMainCompactionSchedulingForTests(): void {
 }
 
 /** Later legal reference growth uses the existing runner once, with the full stored source. */
-export async function recoverMainContinuityCarrierForAdmission<T extends { readonly status?: string }>(input: {
+export async function recoverMainContinuityCarrierForAdmission<
+  T extends { readonly status?: string },
+>(input: {
   request?: { _viventiumAcceptedMainCarrierRecovery?: Set<string> };
   identityKey: string;
   load: () => Promise<T>;
@@ -350,14 +365,17 @@ export async function recoverMainContinuityCarrierForAdmission<T extends { reado
   let context = await input.load();
   if (context.status !== 'context_budget') return context;
   const attempts = input.request
-    ? (input.request._viventiumAcceptedMainCarrierRecovery ||= new Set<string>()) : new Set<string>();
+    ? (input.request._viventiumAcceptedMainCarrierRecovery ||= new Set<string>())
+    : new Set<string>();
   if (!attempts.has(input.identityKey)) {
     attempts.add(input.identityKey);
     await input.ensure();
     context = await input.load();
   }
   if (context.status !== 'available')
-    throw Object.assign(new Error('Prior accepted Main history cannot be carried intact.'),
-      { code: 'source_context_unavailable', status: 413 });
+    throw Object.assign(new Error('Prior accepted Main history cannot be carried intact.'), {
+      code: 'source_context_unavailable',
+      status: 413,
+    });
   return context;
 }

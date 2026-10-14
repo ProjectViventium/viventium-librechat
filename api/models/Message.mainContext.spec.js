@@ -232,7 +232,10 @@ test.each([
   expect((await read()).metadata?.viventium?.mainContext).toEqual(stamp);
   if (update.$rename) {
     const row = await read();
-    expect(row.metadata).toEqual({ sibling: 'old', viventium: { mainContext: stamp, receipt: 'old' } });
+    expect(row.metadata).toEqual({
+      sibling: 'old',
+      viventium: { mainContext: stamp, receipt: 'old' },
+    });
     expect(row.feedback.tag).toEqual({ sibling: 'replacement' });
   }
 });
@@ -252,7 +255,10 @@ test('a parent rename cannot promote untrusted sibling data into Main authority'
   await db.updateMessage(req, { messageId: 'answer', $rename: { 'feedback.tag': 'metadata' } });
   const row = await read();
   expect(row.metadata).toBeUndefined();
-  expect(row.feedback.tag).toEqual({ sibling: 'kept', viventium: { mainContext: stamp, receipt: 'kept' } });
+  expect(row.feedback.tag).toEqual({
+    sibling: 'kept',
+    viventium: { mainContext: stamp, receipt: 'kept' },
+  });
   expect(row.metadata?.viventium?.mainContext).toBeUndefined();
 });
 
@@ -272,7 +278,10 @@ test('record and bulk metadata writes preserve each owner and message stamp', as
       metadata: { viventium: { mainContext: stamp } },
     },
   ]);
-  expect((await read()).metadata).toEqual({ sibling: 'bulk', viventium: { mainContext: stamp, receipt: 'old' } });
+  expect((await read()).metadata).toEqual({
+    sibling: 'bulk',
+    viventium: { mainContext: stamp, receipt: 'old' },
+  });
   expect(
     (await Message.findOne({ messageId: 'other' }).lean()).metadata?.viventium?.mainContext,
   ).toBeUndefined();
@@ -472,33 +481,102 @@ test.each([true, false])(
   },
 );
 
-
-test('original owner receipt is inserted once from trusted input and survives edits', async()=>{
-  const {setTrustedInteractionContext,bindInteractionSourceSegments} = require('~/server/services/viventium/interactionContext');
-  const ownerReq={user:{id:'owner'},body:{}};
-  setTrustedInteractionContext(ownerReq,{actor_kind:'external_user',origin:'interactive',surface:'web',
-    conversation_id:conversationId,source_event_id:'source',source_received_at:2000});
-  bindInteractionSourceSegments(ownerReq,'Owner answer',[],{messageId:'human',parentMessageId:'parent'});
-  await db.saveMessage(ownerReq,{messageId:'human',conversationId,isCreatedByUser:true,text:'Owner answer',
-    metadata:{viventium:{originalInputReceipt:{sourceEventId:'forged',receivedAt:9999},other:'retained'}}});
-  expect((await Message.findOne({user:'owner',messageId:'human'}).lean()).metadata.viventium.originalInputReceipt)
-    .toEqual({sourceEventId:'source',receivedAt:2000});
-  await db.updateMessage(ownerReq,{messageId:'human',metadata:{viventium:{originalInputReceipt:{sourceEventId:'forged',receivedAt:9999},other:'edited'}}});
-  await db.updateMessage(ownerReq,{messageId:'human',$unset:{metadata:1,'metadata.viventium.originalInputReceipt':1}});
-  const saved=await Message.findOne({user:'owner',messageId:'human'}).lean();
-  expect(saved.metadata.viventium.originalInputReceipt).toEqual({sourceEventId:'source',receivedAt:2000});
+test('original owner receipt is inserted once from trusted input and survives edits', async () => {
+  const {
+    setTrustedInteractionContext,
+    bindInteractionSourceSegments,
+  } = require('~/server/services/viventium/interactionContext');
+  const ownerReq = { user: { id: 'owner' }, body: {} };
+  setTrustedInteractionContext(ownerReq, {
+    actor_kind: 'external_user',
+    origin: 'interactive',
+    surface: 'web',
+    conversation_id: conversationId,
+    source_event_id: 'source',
+    source_received_at: 2000,
+  });
+  bindInteractionSourceSegments(ownerReq, 'Owner answer', [], {
+    messageId: 'human',
+    parentMessageId: 'parent',
+  });
+  await db.saveMessage(ownerReq, {
+    messageId: 'human',
+    conversationId,
+    isCreatedByUser: true,
+    text: 'Owner answer',
+    metadata: {
+      viventium: {
+        originalInputReceipt: { sourceEventId: 'forged', receivedAt: 9999 },
+        other: 'retained',
+      },
+    },
+  });
+  expect(
+    (await Message.findOne({ user: 'owner', messageId: 'human' }).lean()).metadata.viventium
+      .originalInputReceipt,
+  ).toEqual({ sourceEventId: 'source', receivedAt: 2000 });
+  await db.updateMessage(ownerReq, {
+    messageId: 'human',
+    metadata: {
+      viventium: {
+        originalInputReceipt: { sourceEventId: 'forged', receivedAt: 9999 },
+        other: 'edited',
+      },
+    },
+  });
+  await db.updateMessage(ownerReq, {
+    messageId: 'human',
+    $unset: { metadata: 1, 'metadata.viventium.originalInputReceipt': 1 },
+  });
+  const saved = await Message.findOne({ user: 'owner', messageId: 'human' }).lean();
+  expect(saved.metadata.viventium.originalInputReceipt).toEqual({
+    sourceEventId: 'source',
+    receivedAt: 2000,
+  });
   expect(saved.metadata.viventium.other).toBe('edited');
 });
-test('original owner receipt cannot be minted by ordinary writes or backfilled on legacy messages',async()=>{
-  const forged={originalInputReceipt:{sourceEventId:'forged',receivedAt:9999}};
-  const ownerReq={user:{id:'owner'},body:{}};
-  await db.saveMessage(ownerReq,{messageId:'legacy-human',conversationId,isCreatedByUser:true,text:'old',metadata:{viventium:forged}});
-  const {setTrustedInteractionContext,bindInteractionSourceSegments} = require('~/server/services/viventium/interactionContext');
-  setTrustedInteractionContext(ownerReq,{actor_kind:'external_user',origin:'interactive',surface:'web',
-    conversation_id:conversationId,source_event_id:'source',source_received_at:2000});
-  bindInteractionSourceSegments(ownerReq,'Recovered input',[],{messageId:'legacy-human',parentMessageId:'parent'});
-  await db.saveMessage(ownerReq,{messageId:'legacy-human',conversationId,isCreatedByUser:true,text:'old'});
-  await db.recordMessage({user:'owner',messageId:'untrusted-record',conversationId,text:'old',metadata:{viventium:forged}});
-  for (const messageId of ['legacy-human','untrusted-record'])
-    expect((await Message.findOne({user:'owner',messageId}).lean()).metadata?.viventium?.originalInputReceipt).toBeUndefined();
+test('original owner receipt cannot be minted by ordinary writes or backfilled on legacy messages', async () => {
+  const forged = { originalInputReceipt: { sourceEventId: 'forged', receivedAt: 9999 } };
+  const ownerReq = { user: { id: 'owner' }, body: {} };
+  await db.saveMessage(ownerReq, {
+    messageId: 'legacy-human',
+    conversationId,
+    isCreatedByUser: true,
+    text: 'old',
+    metadata: { viventium: forged },
+  });
+  const {
+    setTrustedInteractionContext,
+    bindInteractionSourceSegments,
+  } = require('~/server/services/viventium/interactionContext');
+  setTrustedInteractionContext(ownerReq, {
+    actor_kind: 'external_user',
+    origin: 'interactive',
+    surface: 'web',
+    conversation_id: conversationId,
+    source_event_id: 'source',
+    source_received_at: 2000,
+  });
+  bindInteractionSourceSegments(ownerReq, 'Recovered input', [], {
+    messageId: 'legacy-human',
+    parentMessageId: 'parent',
+  });
+  await db.saveMessage(ownerReq, {
+    messageId: 'legacy-human',
+    conversationId,
+    isCreatedByUser: true,
+    text: 'old',
+  });
+  await db.recordMessage({
+    user: 'owner',
+    messageId: 'untrusted-record',
+    conversationId,
+    text: 'old',
+    metadata: { viventium: forged },
+  });
+  for (const messageId of ['legacy-human', 'untrusted-record'])
+    expect(
+      (await Message.findOne({ user: 'owner', messageId }).lean()).metadata?.viventium
+        ?.originalInputReceipt,
+    ).toBeUndefined();
 });

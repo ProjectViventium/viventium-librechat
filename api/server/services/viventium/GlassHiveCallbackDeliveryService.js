@@ -216,42 +216,38 @@ async function assertWorkerAttentionBindingCurrent(
     .findOne(scope, { session, projection: { _id: 1, callbackCreatedAt: 1 } });
   const current =
     historical ||
-    (await mongoose.connection
-      .collection('viventium_external_work')
-      .findOne(
+    (await mongoose.connection.collection('viventium_external_work').findOne(
+      {
+        _id: binding.originRef,
+        ownerId,
+        workRef: binding.workRef,
+        workerId: binding.workerId,
+        runId: binding.runId,
+        externalState: 'needs_input',
+      },
+      { session, projection: { _id: 1 } },
+    ));
+  const newest = historical
+    ? evidence
+    : await mongoose.connection.collection('viventium_glasshive_mission_evidence').findOne(
         {
-          _id: binding.originRef,
           ownerId,
+          originRef: binding.originRef,
           workRef: binding.workRef,
           workerId: binding.workerId,
           runId: binding.runId,
-          externalState: 'needs_input',
+          event: 'run.needs_input',
+          workTerminal: false,
+          workState: 'needs_input',
         },
-        { session, projection: { _id: 1 } },
-      ));
-  const newest = historical
-    ? evidence
-    : await mongoose.connection
-        .collection('viventium_glasshive_mission_evidence')
-        .findOne(
-          {
-            ownerId,
-            originRef: binding.originRef,
-            workRef: binding.workRef,
-            workerId: binding.workerId,
-            runId: binding.runId,
-            event: 'run.needs_input',
-            workTerminal: false,
-            workState: 'needs_input',
-          },
-          {
-            session,
-            sort: evidence?.callbackCreatedAt
-              ? { callbackCreatedAt: -1, _id: -1 }
-              : { callbackCreatedAt: -1, createdAt: -1, _id: -1 },
-            projection: { _id: 1 },
-          },
-        );
+        {
+          session,
+          sort: evidence?.callbackCreatedAt
+            ? { callbackCreatedAt: -1, _id: -1 }
+            : { callbackCreatedAt: -1, createdAt: -1, _id: -1 },
+          projection: { _id: 1 },
+        },
+      );
   if (!evidence || !current || String(newest?._id) !== binding.evidenceId)
     throw Object.assign(new Error('voice_worker_completion_binding_superseded'), {
       code: 'glasshive_callback_effect_fenced',

@@ -179,7 +179,8 @@ export function preserveMainContextUpdate(
       }
     }
   }
-  if (captured && !normalizeMainContextStamp(atPath(saved, path)) && !parentContainsStamp) set(path, captured);
+  if (captured && !normalizeMainContextStamp(atPath(saved, path)) && !parentContainsStamp)
+    set(path, captured);
   if (Object.keys(additionalSets).length)
     result.$set = { ...record(result.$set), ...additionalSets };
   if (Object.keys(additionalUnsets).length)

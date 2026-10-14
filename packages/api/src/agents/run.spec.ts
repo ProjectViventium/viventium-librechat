@@ -778,12 +778,18 @@ describe('projectGraphLlmFallbacks', () => {
     graph.overrideModel = scriptedModel as never;
     await process('synthetic-fallback-reentry-thread-1', 'First turn.');
     expect(graph.viventiumGraphFallbackRecoveryReceipt).toEqual({
-      provider: Providers.OPENAI, model: 'synthetic-fallback-model', agentId: 'main',
-      runId: 'synthetic-fallback-reentry-run', threadId: 'synthetic-fallback-reentry-thread-1',
+      provider: Providers.OPENAI,
+      model: 'synthetic-fallback-model',
+      agentId: 'main',
+      runId: 'synthetic-fallback-reentry-run',
+      threadId: 'synthetic-fallback-reentry-thread-1',
     });
     const invocationKey = Symbol.for('viventium.graph.fallback.recovery.invocation.v1');
-    expect((graph.viventiumGraphFallbackRecoveryReceipt as unknown as Record<PropertyKey, unknown>)?.[invocationKey])
-      .toBe((graph as unknown as Record<PropertyKey, unknown>)[invocationKey]);
+    expect(
+      (graph.viventiumGraphFallbackRecoveryReceipt as unknown as Record<PropertyKey, unknown>)?.[
+        invocationKey
+      ],
+    ).toBe((graph as unknown as Record<PropertyKey, unknown>)[invocationKey]);
 
     graph.overrideModel = scriptedModel as never;
     await process('synthetic-fallback-reentry-thread-2', 'Second healthy turn.');
@@ -1759,7 +1765,7 @@ describe('zero-input graph handoffs', () => {
     expect(fallbackStream).not.toHaveBeenCalled();
   });
 
-it('uses a participant fallback for a structured recoverable 429', async () => {
+  it('uses a participant fallback for a structured recoverable 429', async () => {
     const graph = new MultiAgentGraph({
       runId: 'synthetic-recoverable-fallback-run',
       agents: [

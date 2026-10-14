@@ -697,8 +697,7 @@ describe('Phase B follow-up carrier', () => {
         'X-Viventium-Visible-Message-Chain-B64': Buffer.from(
           JSON.stringify([{ id: 'user-1' }, { id: 'assistant-1' }, { id: 'user-2' }]),
         ).toString('base64'),
-        'X-GlassHive-Developer-Instruction-Tail-B64':
-          Buffer.from(mainCapsule).toString('base64'),
+        'X-GlassHive-Developer-Instruction-Tail-B64': Buffer.from(mainCapsule).toString('base64'),
         'X-GlassHive-Stable-Authority-SHA256': 'd'.repeat(64),
         [turnContextHeader]: Buffer.from('Synthetic Main-only continuity. '.repeat(1200)).toString(
           'base64',
@@ -707,7 +706,12 @@ describe('Phase B follow-up carrier', () => {
       try {
         const req = {
           id: 'synthetic-phase-b-carrier',
-          _viventiumFeelingSnapshot: { enabled, agentScope: 'conscious_agent', snapshotHash: 'synthetic-followup-feeling-hash', capsule },
+          _viventiumFeelingSnapshot: {
+            enabled,
+            agentScope: 'conscious_agent',
+            snapshotHash: 'synthetic-followup-feeling-hash',
+            capsule,
+          },
           body: { conversationId: 'conv-1', messageId: 'msg-1' },
           user: { id: 'user-1' },
           config: {
@@ -773,12 +777,16 @@ describe('Phase B follow-up carrier', () => {
           'base64',
         ).toString('utf8');
         const { getViventiumUserFactGuard } = require('../feelingPromptTail');
-        expect(ownTail).toBe([getViventiumUserFactGuard(), enabled ? capsule : ''].filter(Boolean).join('\n\n'));
+        expect(ownTail).toBe(
+          [getViventiumUserFactGuard(), enabled ? capsule : ''].filter(Boolean).join('\n\n'),
+        );
         const instructions = createRun.mock.calls[0][0].graphConfig.instructions;
         expect(instructions.split(capsule).length - 1).toBe(enabled ? 1 : 0);
         expect(instructions.split('<viventium_feeling_state>').length - 1).toBe(enabled ? 1 : 0);
         expect(JSON.stringify(createRun.mock.calls[0][0])).not.toContain(mainCapsule);
-        expect(JSON.stringify(createRun.mock.calls[0][0])).not.toContain(Buffer.from(mainCapsule).toString('base64'));
+        expect(JSON.stringify(createRun.mock.calls[0][0])).not.toContain(
+          Buffer.from(mainCapsule).toString('base64'),
+        );
         expect(ownTail).not.toContain(mainCapsule);
         expect(createRun.mock.calls[0][0].graphConfig.instructions.endsWith(ownTail)).toBe(true);
         expect(headers['X-GlassHive-Agent-Id']).toBe('agent-main:phase_b:followup');

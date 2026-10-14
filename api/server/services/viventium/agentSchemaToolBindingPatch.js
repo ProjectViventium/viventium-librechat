@@ -527,18 +527,39 @@ function hasNewAuthoringEvidence(graph, before) {
   return after.runStepCount > before.runStepCount || after.toolCallCount > before.toolCallCount;
 }
 
-function recordGraphFallbackRecovery(graph, fallbackContext) {
-  if (!graph || graph.viventiumGraphFallbackRecoveryReceipt || !fallbackContext) {
+const graphFallbackInvocationKey = Symbol.for('viventium.graph.fallback.recovery.invocation.v1');
+
+function beginGraphFallbackInvocation(graph, agentId, config) {
+  if (agentId !== graph?.defaultAgentId) {
+    return null;
+  }
+  delete graph.viventiumGraphFallbackRecoveryReceipt;
+  delete graph[graphFallbackInvocationKey];
+  const runId = graph.runId;
+  const threadId = config?.configurable?.thread_id;
+  if (typeof runId !== 'string' || !runId || typeof threadId !== 'string' || !threadId) {
+    return null;
+  }
+  const invocation = Object.freeze({ agentId, runId, threadId });
+  Object.defineProperty(graph, graphFallbackInvocationKey, {
+    value: invocation, configurable: true, enumerable: false,
+  });
+  return invocation;
+}
+
+function recordGraphFallbackRecovery(graph, fallbackContext, invocation, config) {
+  if (!graph || !fallbackContext || !invocation || config?.signal?.aborted === true ||
+      graph[graphFallbackInvocationKey] !== invocation) {
     return;
   }
+  const receipt = {
+    provider: String(fallbackContext.provider || '').trim(),
+    model: String(fallbackContext.model || '').trim(),
+    ...invocation,
+  };
+  Object.defineProperty(receipt, graphFallbackInvocationKey, { value: invocation });
   Object.defineProperty(graph, 'viventiumGraphFallbackRecoveryReceipt', {
-    value: Object.freeze({
-      provider: String(fallbackContext.provider || '').trim(),
-      model: String(fallbackContext.model || '').trim(),
-    }),
-    configurable: true,
-    enumerable: false,
-    writable: false,
+    value: Object.freeze(receipt), configurable: true, enumerable: false, writable: false,
   });
 }
 
@@ -648,7 +669,7 @@ async function invokeModernFallbackPolicy({
           { ...state, messages: fallbackInput.finalMessages },
           config,
         );
-        recordGraphFallbackRecovery(graph, runtimeContext);
+        recordGraphFallbackRecovery(graph, runtimeContext, policy.recoveryInvocation, config);
         return result;
       } catch (fallbackError) {
         const fallbackAuthored = hasNewAuthoringEvidence(graph, fallbackAuthoringBefore);
@@ -690,6 +711,7 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
       if (Object.prototype.hasOwnProperty.call(this, 'viventiumGraphFallbackRecoveryReceipt')) {
         delete this.viventiumGraphFallbackRecoveryReceipt;
       }
+      delete this[graphFallbackInvocationKey];
       return originalResetValues.apply(this, args);
     };
   }
@@ -725,7 +747,7 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
           throw markOpaqueProviderAttemptFailure(error);
         }
         if (attemptIndex > 0) {
-          recordGraphFallbackRecovery(this, policy?.activeFallbackContext);
+          recordGraphFallbackRecovery(this, policy?.activeFallbackContext, policy?.recoveryInvocation, config);
         }
         return result;
       } catch (error) {
@@ -767,12 +789,15 @@ function installUnifiedSchemaToolBindingPatch(proto = StandardGraph?.prototype) 
     }
 
     return async (state, config) => {
+      const recoveryInvocation = proto[MODERN_GRAPH_FALLBACK_OWNER] === true
+        ? null : beginGraphFallbackInvocation(this, agentId, config);
       const invokeWithFallbackPolicy = () => {
         if (proto[MODERN_GRAPH_FALLBACK_OWNER] === true) {
           return originalCallModel(state, config);
         }
         const policy = {
           attemptCount: 0,
+          recoveryInvocation,
           blockedError: null,
           activeFallbackContext: null,
           activeFallbackInstructionAppend: '',

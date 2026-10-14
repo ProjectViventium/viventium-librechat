@@ -94,6 +94,21 @@ describe('promptFrameTelemetry', () => {
     });
   });
 
+  test('registers current call context without contaminating other surface readiness', () => {
+    const context = 'synthetic current call identity and delivery context';
+    const frame = buildPromptFrame({
+      promptFamily: 'main_runtime',
+      surface: 'voice',
+      layers: { current_call: context },
+    });
+    expect(normalizeLayersToContract({ current_call: context }).layers.surface_prompt).toBe(
+      context,
+    );
+    expect(frame.unknown_layer_names).toEqual([]);
+    buildPromptFrame({ promptFamily: 'main_runtime', surface: 'web', layers: { web_text: 'web' } });
+    expect(promptLayerIntegritySnapshot().unknownLayerNames).toEqual([]);
+  });
+
   test('registers saved memory writer context without contaminating later surface readiness', () => {
     const context = 'synthetic saved memory writer context';
     const normalized = normalizeLayersToContract({ saved_memory_writer: context });

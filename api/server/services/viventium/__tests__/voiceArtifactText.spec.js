@@ -191,3 +191,29 @@ describe('authored repetition artifact contract', () => {
     ).toBe(0);
   });
 });
+
+describe('declared Web assistant delivery controls', () => {
+  const req = { body: { viventiumSurface: 'web' } };
+  test('removes only structural controls from persisted assistant text and content', () => {
+    const visible = '**Selected evidence**\n![Capture](https://artifacts.example.test/capture)';
+    const raw = visible + '\n{SKIP_VOICE}';
+    const result = sanitizeVoiceAssistantMessageForPersistence(req, { text: raw,
+      content: [{ type: 'text', text: raw }, { type: 'tool_call', name: 'unmodified' }] });
+    expect(result.text).toBe(visible);
+    expect(result.content[0].text).toBe(visible);
+    expect(result.content[1]).toEqual({ type: 'tool_call', name: 'unmodified' });
+  });
+  test.each(['`{SKIP_VOICE}`', '"{SKIP_VOICE}"', '> {SKIP_VOICE}',
+    '```text\n{SKIP_VOICE}\n```', '~~~text\n{SKIP_VOICE}\n~~~',
+    'Inline example: {SKIP_VOICE}.', '  **Markdown**\n[Source](https://docs.example.test)\n'])
+  ('preserves literal examples and unchanged Markdown: %s', (text) => {
+    const message = { text, content: [{ type: 'text', text }] };
+    expect(sanitizeVoiceAssistantMessageForPersistence(req, message)).toEqual(message);
+  });
+  test('never alters authored user messages or Web voice tags', () => {
+    const user = { text: '{SKIP_VOICE}', isCreatedByUser: true };
+    expect(sanitizeVoiceAssistantMessageForPersistence(req, user)).toBe(user);
+    expect(sanitizeVoiceAssistantMessageForPersistence(req, { text: '<whisper>Literal tag</whisper>' }).text)
+      .toBe('<whisper>Literal tag</whisper>');
+  });
+});

@@ -1,4 +1,8 @@
-import { DELEGATION_TOOL_NAME, mainDelegationTurnTruth } from './conversationOrchestration';
+import {
+  DELEGATION_TOOL_NAME,
+  MAIN_DELEGATION_JSON_SCHEMA,
+  mainDelegationTurnTruth,
+} from './conversationOrchestration';
 import {
   appendGlassHiveMainOrchestrationFacade,
   availableGlassHiveMainOrchestrationTools,
@@ -37,6 +41,12 @@ describe('GlassHive Main orchestration tools', () => {
     ]);
     expect(definitions).toHaveLength(3);
     expect(definitions[0].parameters.required).toContain('resourceClass');
+    expect(definitions[0].parameters.properties.instruction).toEqual(
+      MAIN_DELEGATION_JSON_SCHEMA.properties.instruction,
+    );
+    expect(definitions[0].parameters.properties.instruction.description).toContain(
+      'original selected source wording is retained separately',
+    );
 
     const base = { name: 'google_search', description: 'Search' };
     const stale = { name: DELEGATION_TOOL_NAME, description: 'stale' };
@@ -115,6 +125,25 @@ describe('GlassHive Main orchestration tools', () => {
       }),
     );
     expect(mainDelegationTurnTruth(req)).toMatchObject({ confirmedCount: 1 });
+  });
+
+  test('admits and forwards exact files through the same provider-independent facade', async () => {
+    const delegation = createGlassHiveMainDelegationTool({ userId: 'owner-1' },
+      { executeMainDelegation, logger });
+    const args = { title: 'Read original', instruction: 'Compare the original attachment.',
+      resourceClass: 'standard' as const, fileIds: ['11111111-1111-4111-8111-111111111111'] };
+    expect(delegation.schema.safeParse(args).success).toBe(true);
+    expect(delegation.schema.safeParse({ ...args, fileIds: [] }).success).toBe(true);
+    for (const fileIds of [[''], [' spaced'], ['duplicate', 'duplicate'], [42],
+      ['x'.repeat(257)], Array.from({ length: 65 }, (_, i) => String(i))]) {
+      expect(delegation.schema.safeParse({ ...args, fileIds }).success).toBe(false);
+    }
+    await delegation.invoke(args, { configurable: {
+      requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
+    } });
+    expect(executeMainDelegation).toHaveBeenCalledWith(expect.objectContaining({
+      args: expect.objectContaining({ fileIds: args.fileIds }),
+    }));
   });
 
   test('blocks execution when trusted turn identity is absent', async () => {

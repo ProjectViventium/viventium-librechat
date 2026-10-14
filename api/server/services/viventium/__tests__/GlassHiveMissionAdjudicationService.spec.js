@@ -5,6 +5,7 @@
 let mockUpdateOne;
 let mockMessageUpdateOne;
 let mockMessageFindOne;
+let mockMessageFind;
 let mockConversationFindOne;
 let mockStoredMessages;
 let mockFindOneAndUpdate;
@@ -27,6 +28,10 @@ let mockDeferAfterCommit;
 let mockTransactionSession;
 let mockRunTransaction;
 let mockPrepareMissionOutputFiles;
+let mockExternalWorkFindOne;
+let mockNewestAttentionEvidence;
+let mockAttentionEvidenceRows;
+let mockRunStateFence;
 
 jest.mock('mongoose', () => {
   const actual = jest.requireActual('mongoose');
@@ -38,10 +43,12 @@ jest.mock('mongoose', () => {
     connection: {
       ...actual.connection,
       collection: (name) =>
-        name === 'messages'
+        name === 'viventium_external_work' ? { findOne: (...args) => mockExternalWorkFindOne(...args) }
+          : name === 'messages'
           ? {
               updateOne: (...args) => mockMessageUpdateOne(...args),
               findOne: (...args) => mockMessageFindOne(...args),
+              find: (...args) => mockMessageFind(...args),
             }
           : name === 'conversations'
             ? { findOne: (...args) => mockConversationFindOne(...args) }
@@ -78,6 +85,8 @@ jest.mock('~/models/Agent', () => ({
 
 jest.mock('~/db/models', () => ({
   GlassHiveTerminalCallbackResult: {},
+  ViventiumCortexInsightDelivery: {},
+  ViventiumCortexInsightOutbox: {},
 }));
 
 jest.mock('~/server/services/Config', () => ({
@@ -97,6 +106,7 @@ jest.mock('../CallSessionService', () => ({
 }));
 
 jest.mock('../GlassHiveCallbackBindingService', () => ({
+  fenceGlassHiveCallbackRunState: (...args) => mockRunStateFence(...args),
   recordGlassHiveAdjudicationOutcome: (...args) => mockRecordOutcome(...args),
   isGlassHiveWorkTerminalCallback: (body = {}) =>
     body.work_terminal === true &&
@@ -226,11 +236,114 @@ afterAll(() => {
 });
 
 describe('GlassHiveMissionAdjudicationService', () => {
+  test('terminal mission pending27 releases only its claim and keeps evidence until Main final', async () => {
+    const processingAt = new Date('2026-10-11T14:28:04Z');
+    const pending = row({ attempts: 0 });
+    const claimed = { ...pending, state: 'processing', attempts: 1, processingAt };
+    mockFind.mockReturnValueOnce(cursor([pending]));
+    mockFindOneAndUpdate.mockResolvedValueOnce(claimed);
+    mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({ currentMainPending: true });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({
+      claimed: 1, visible: 0, silent: 0, failed: 0,
+    });
+    expect(mockUpdateOne).toHaveBeenCalledWith(
+      { _id: 'cb-1', state: 'processing', attempts: 1, processingAt },
+      { $set: { state: 'pending', updatedAt: expect.any(Date) },
+        $unset: { processingAt: '' }, $inc: { attempts: -1 } },
+    );
+    expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+    expect(mockRecordOutcome).not.toHaveBeenCalled();
+    // The exact same retained evidence is judged after Main is ready; it may be semantically NTA.
+    mockFind.mockReturnValueOnce(cursor([pending]));
+    mockFindOneAndUpdate.mockResolvedValueOnce(claimed);
+    mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({ text: '', decision: {},
+      followUpDecisionRecord: { generationFailed: false, forceVisibleFollowUp: false,
+        llmResult: 'nta', selectedStrategy: 'no_response_suppressed' } });
+    mockCreateCortexFollowUpMessage.mockResolvedValueOnce(null);
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({ silent: 1 });
+  });
+
+  test('Main replay during synthesis27 reschedules the existing lane after claim release', async () => {
+    jest.useFakeTimers();
+    const service = require('../GlassHiveMissionAdjudicationService');
+    const pending = row({ attempts: 0 });
+    mockFind.mockReturnValueOnce(cursor([pending]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...pending, state: 'processing', attempts: 1,
+      processingAt: new Date() });
+    mockPrepareCortexFollowUpMessage.mockImplementationOnce(async () => {
+      service.wakeGlassHiveMissionAdjudications({ ownerId: 'user-1', conversationId: 'conversation-1' });
+      return { currentMainPending: true };
+    });
+    service.wakeGlassHiveMissionAdjudications({ ownerId: 'user-1', conversationId: 'conversation-1' });
+    await jest.advanceTimersByTimeAsync(2000);
+    expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(1);
+    mockFind.mockReturnValueOnce(cursor([pending]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...pending, state: 'processing', attempts: 1 });
+    await jest.advanceTimersByTimeAsync(2000);
+    expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(2);
+    jest.useRealTimers();
+  });
+
+  test('Main replay before direct claim release27 wakes retained evidence after the early wake misses', async () => {
+    jest.useFakeTimers();
+    try {
+      const service = require('../GlassHiveMissionAdjudicationService');
+      const pending = row({ attempts: 0 });
+      mockFind.mockReturnValueOnce(cursor([pending])).mockReturnValueOnce(cursor([]));
+      mockFindOneAndUpdate.mockResolvedValueOnce({ ...pending, state: 'processing', attempts: 1,
+        processingAt: new Date() });
+      const ready = jest.fn(async () => {
+        expect(mockUpdateOne).toHaveBeenCalledWith(expect.objectContaining({ state: 'processing',
+          attempts: 1 }), expect.objectContaining({ $inc: { attempts: -1 } }));
+        return true;
+      });
+      mockPrepareCortexFollowUpMessage.mockImplementationOnce(async () => {
+        // A direct flush does not occupy the scheduled lane. Replay's first wake sees the
+        // claimed row, then finishes before this direct flush releases it.
+        service.wakeGlassHiveMissionAdjudications({ ownerId: 'user-1', conversationId: 'conversation-1' });
+        await jest.advanceTimersByTimeAsync(2000);
+        expect(jest.getTimerCount()).toBe(0);
+        return { currentMainPending: true, currentMainReadyAfterRelease: ready };
+      });
+      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1', conversationId: 'conversation-1' });
+      expect(ready).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(1);
+      mockFind.mockReturnValueOnce(cursor([pending]));
+      mockFindOneAndUpdate.mockResolvedValueOnce({ ...pending, state: 'processing', attempts: 1 });
+      await jest.advanceTimersByTimeAsync(2000);
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(2);
+    } finally { jest.useRealTimers(); }
+  });
+
+  test('still-running Main27 does not poll after direct claim release', async () => {
+    jest.useFakeTimers();
+    try {
+      mockFind.mockReturnValueOnce(cursor([row({ attempts: 0 })]));
+      const ready = jest.fn().mockResolvedValue(false);
+      mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({ currentMainPending: true,
+        currentMainReadyAfterRelease: ready });
+      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      expect(ready).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    } finally { jest.useRealTimers(); }
+  });
+
   beforeEach(() => {
     clearAdjudicationTimersForTests();
     mockUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true });
     mockMessageUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true, matchedCount: 1 });
     mockStoredMessages = [];
+    const originMessages = ['conversation-1', 'conversation-a', 'conversation-b'].flatMap(
+      (conversationId) => ['assistant-anchor', 'anchor-1', 'anchor-2', 'assistant-anchor-newer'].map(
+        (messageId) => ({ user: 'user-1', conversationId, messageId, isCreatedByUser: false }),
+      ),
+    );
+    mockMessageFind = jest.fn((filter) => cursor([...originMessages, ...mockStoredMessages].filter(
+      (message) => message.user === filter.user && message.conversationId === filter.conversationId &&
+        filter.messageId.$in.includes(message.messageId),
+    )));
     mockMessageFindOne = jest.fn(
       async (filter) =>
         mockStoredMessages.find((message) =>
@@ -242,7 +355,22 @@ describe('GlassHiveMissionAdjudicationService', () => {
       state: 'processing',
     }));
     mockConversationFindOne = jest.fn().mockResolvedValue(null);
-    mockFindOne = jest.fn().mockResolvedValue(null);
+    mockNewestAttentionEvidence = { _id: 'cb-1' };
+    mockAttentionEvidenceRows = null;
+    mockFindOne = jest.fn(async (filter, options) => {
+      if (filter.event !== 'run.needs_input' || filter.workTerminal !== false) return null;
+      if (!mockAttentionEvidenceRows) return mockNewestAttentionEvidence;
+      return mockAttentionEvidenceRows.filter((row) => Object.entries(filter).every(([key, value]) => row[key] === value))
+        .sort((left, right) => {
+          for (const [key, direction] of Object.entries(options?.sort || {})) {
+            if (left[key] === right[key]) continue;
+            if (left[key] == null) return 1;
+            if (right[key] == null) return -1;
+            return (left[key] > right[key] ? 1 : -1) * direction;
+          }
+          return 0;
+        })[0] || null;
+    });
     mockFind = jest.fn().mockReturnValue(cursor([]));
     mockGetUserById = jest.fn().mockResolvedValue({ id: 'user-1', role: 'USER' });
     mockGetFeelingState = jest.fn().mockResolvedValue(null);
@@ -268,6 +396,246 @@ describe('GlassHiveMissionAdjudicationService', () => {
     mockTransactionSession = null;
     mockRunTransaction = (operation) => operation(null);
     mockPrepareMissionOutputFiles = jest.fn().mockResolvedValue([]);
+    mockExternalWorkFindOne = jest.fn().mockResolvedValue({ _id: 'ghi-origin-1' });
+    mockRunStateFence = jest.fn().mockResolvedValue(undefined);
+
+  });
+
+
+  test('accepts unbound needs_input as nonterminal Main evidence and never raw delivery', async () => {
+    const input = { binding: { originRef: 'ghi-origin-1', ownerId: 'user-1', workRef: 'gh-work-1',
+      conversationId: 'conversation-1', anchorMessageId: 'assistant-anchor', mainAgentId: 'main-agent' },
+      body: { callback_id: 'cb-attention', event: 'run.needs_input', work_state: 'needs_input',
+        work_terminal: false, worker_id: 'worker-1', run_id: 'run-1', failure_class: 'authorization_expired',
+        failure_user_message: 'The authorized scope needs renewal.',
+        callback_created_at: '2026-01-01T00:00:00.123456+00:00' } };
+    const first = await enqueueGlassHiveMissionAdjudication(input);
+    const second = await enqueueGlassHiveMissionAdjudication(input);
+    expect(first._id).toBe(second._id);
+    expect(first).toMatchObject({ workTerminal: false, workState: 'needs_input', event: 'run.needs_input',
+      evidence: input.body.failure_user_message, callbackCreatedAt: '2026-01-01T00:00:00.123456Z' });
+    expect(first).not.toHaveProperty('terminalCallbackResultKey');
+    expect(mockRunStateFence).toHaveBeenCalled();
+    expect(mockExternalWorkFindOne).toHaveBeenCalledWith(expect.objectContaining({
+      _id: input.binding.originRef, ownerId: input.binding.ownerId, workRef: input.binding.workRef,
+      workerId: 'worker-1', runId: 'run-1', externalState: 'needs_input' }), expect.any(Object));
+    expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+  });
+
+  test.each(['foreign-owner', 'foreign-work', 'superseded-run', 'already-resolved'])(
+    'rejects %s unbound attention before it becomes Main evidence', async (_case) => {
+      mockExternalWorkFindOne.mockResolvedValue(null);
+      await expect(enqueueGlassHiveMissionAdjudication({ binding: { originRef: 'ghi-origin-1',
+        ownerId: 'user-1', workRef: 'gh-work-1', conversationId: 'conversation-1',
+        anchorMessageId: 'assistant-anchor', mainAgentId: 'main-agent' },
+        body: { callback_id: 'cb-attention', event: 'run.needs_input', work_state: 'needs_input',
+          work_terminal: false, worker_id: 'worker-1', run_id: 'run-1', message: 'Input needed.' },
+      })).rejects.toMatchObject({ code: 'glasshive_mission_evidence_superseded' });
+      expect(mockUpdateOne).not.toHaveBeenCalled();
+      expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+    });
+
+  test('authors the blocker through Main and delivers authored text', async () => {
+    const attention = row({ event: 'run.needs_input', workState: 'needs_input', workTerminal: false,
+      evidence: 'The authorized scope needs renewal.', callbackRef: 'callback_sha256:' + 'b'.repeat(64),
+      evidenceId: 'ghe_' + 'a'.repeat(32) });
+    mockFind.mockReturnValueOnce(cursor([attention]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...attention, state: 'processing', attempts: 1 });
+    mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({ text: 'I need your approval to continue. May I renew this access?' });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({ visible: 1 });
+    const input = mockPrepareCortexFollowUpMessage.mock.calls[0][0];
+    expect(input.insightsData.insights[0].authority).toEqual({ kind: 'durable_work_callback',
+      runId: 'run-1', event: 'run.needs_input', workState: 'needs_input' });
+    expect(mockEnqueueDelivery.mock.calls[0][0]).toMatchObject({ body: { event: 'main.followup' },
+      text: 'Main-authored synthetic follow-up.' });
+    expect(mockRunStateFence.mock.calls.length).toBeGreaterThanOrEqual(4);
+  });
+
+  test.each([true, false])('nonterminal blocker uses the durable presentation only while Call is open (%s)', async (open) => {
+    const attention = row({ event: 'run.needs_input', workState: 'needs_input', workTerminal: false,
+      attemptNumber: undefined, evidenceId: 'ghe_' + 'a'.repeat(32), surface: 'voice',
+      destinations: [{ surface: 'voice', voiceCallSessionId: 'old-call', voiceRequestId: 'old-turn' }] });
+    mockFind.mockReturnValueOnce(cursor([attention]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...attention, state: 'processing', attempts: 1 });
+    mockGetActiveCallSessionForConversation.mockResolvedValue(open ? { callSessionId: 'current-call' } : null);
+    mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({ text: 'May I renew access to continue?' });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({ visible: 1 });
+    const delivery = mockEnqueueDelivery.mock.calls[0][0];
+    expect(delivery.message.messageId).toBe('follow-up-1');
+    if (open) {
+      expect(delivery.deliveryContext.workerCompletionPresentation.bindings).toEqual([{
+        kind: 'nonterminal_attention', originRef: attention.originRef, workRef: attention.workRef,
+        workerId: attention.workerId, runId: attention.runId, callbackRef: attention.callbackRef,
+        event: 'run.needs_input', workTerminal: false, evidenceId: attention.evidenceId,
+      }]);
+      expect(delivery.deliveryContext.destinations).toEqual([expect.objectContaining({
+        surface: 'voice', voiceCallSessionId: 'current-call',
+      })]);
+    } else {
+      expect(delivery.deliveryContext.destinations).toEqual([]);
+      expect(delivery.deliveryContext).not.toHaveProperty('workerCompletionPresentation');
+    }
+  });
+
+  test('same-run re-entry excludes stale A before Main grouping and publishes only B', async () => {
+    const older = row({ _id: 'ghe_' + 'a'.repeat(32), evidenceId: 'ghe_' + 'a'.repeat(32),
+      event: 'run.needs_input', workState: 'needs_input', workTerminal: false,
+      callbackRef: canonicalCallbackRef('callback-A'), evidence: 'Old blocker A.' });
+    const newer = { ...older, _id: 'ghe_' + 'b'.repeat(32), evidenceId: 'ghe_' + 'b'.repeat(32),
+      callbackRef: canonicalCallbackRef('callback-B'), evidence: 'Current blocker B.' };
+    mockNewestAttentionEvidence = { _id: newer._id };
+    mockFind.mockReturnValueOnce(cursor([older, newer]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...newer, state: 'processing', attempts: 1 });
+    mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({ text: 'Main asks about current B.' });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({
+      claimed: 1, visible: 1, failed: 0,
+    });
+    expect(mockUpdateOne).toHaveBeenCalledWith({ _id: older._id, state: 'pending' },
+      expect.objectContaining({ $set: expect.objectContaining({ state: 'superseded' }) }));
+    const insights = mockPrepareCortexFollowUpMessage.mock.calls[0][0].insightsData.insights;
+    expect(insights.map((insight) => insight.insight)).toEqual(['Current blocker B.']);
+    expect(mockPersistPreparedCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    expect(mockEnqueueDelivery).toHaveBeenCalledTimes(1);
+  });
+
+  test('late old native A retry cannot supersede earlier-accepted B in Main publication', async () => {
+    const older = row({ _id: 'ghe_' + 'a'.repeat(32), evidenceId: 'ghe_' + 'a'.repeat(32),
+      event: 'run.needs_input', workState: 'needs_input', workTerminal: false,
+      callbackRef: canonicalCallbackRef('callback-A'), evidence: 'Old blocker A.',
+      callbackCreatedAt: '2026-01-01T00:00:00.000001Z', createdAt: new Date('2026-01-01T00:03:00Z') });
+    const newer = { ...older, _id: 'ghe_' + 'b'.repeat(32), evidenceId: 'ghe_' + 'b'.repeat(32),
+      callbackRef: canonicalCallbackRef('callback-B'), evidence: 'Current blocker B.',
+      callbackCreatedAt: '2026-01-01T00:00:00.000002Z', createdAt: new Date('2026-01-01T00:02:00Z') };
+    mockAttentionEvidenceRows = [older, newer];
+    mockFind.mockReturnValueOnce(cursor([newer, older]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...newer, state: 'processing', attempts: 1 });
+    mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({ text: 'Main asks about current B.' });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({ claimed: 1, visible: 1 });
+    expect(mockPrepareCortexFollowUpMessage.mock.calls[0][0].insightsData.insights.map((insight) => insight.insight))
+      .toEqual(['Current blocker B.']);
+    expect(mockFindOne).toHaveBeenCalledWith(expect.objectContaining({ ownerId: 'user-1', runId: 'run-1' }),
+      expect.objectContaining({ sort: { callbackCreatedAt: -1, _id: -1 } }));
+    expect(mockEnqueueDelivery).toHaveBeenCalledTimes(1);
+  });
+
+  test('newer same-run attention during Main synthesis fences the authored row before publication', async () => {
+    const attention = row({ event: 'run.needs_input', workState: 'needs_input', workTerminal: false });
+    mockFind.mockReturnValueOnce(cursor([attention]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...attention, state: 'processing', attempts: 1 });
+    mockPrepareCortexFollowUpMessage.mockImplementationOnce(async () => {
+      mockNewestAttentionEvidence = { _id: 'newer-same-run-attention' };
+      return { text: 'An old authored question.' };
+    });
+    await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+    expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+  });
+
+  test('superseded attention after Main synthesis cannot publish a stale blocker', async () => {
+    const attention = row({ event: 'run.needs_input', workState: 'needs_input', workTerminal: false });
+    mockFind.mockReturnValueOnce(cursor([attention]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...attention, state: 'processing', attempts: 1 });
+    mockPrepareCortexFollowUpMessage.mockImplementationOnce(async () => {
+      mockExternalWorkFindOne.mockResolvedValue(null);
+      return { text: 'An authored question.' };
+    });
+    await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+    expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+  });
+
+  test.each(['question', 'permission'])('keeps an exact bound native %s in its existing courier', async (kind) => {
+    await expect(enqueueGlassHiveMissionAdjudication({ binding: { originRef: 'ghi-origin-1', ownerId: 'user-1',
+      conversationId: 'conversation-1', anchorMessageId: 'assistant-anchor', mainAgentId: 'main-agent' },
+      body: { event: 'run.needs_input', work_state: 'needs_input', run_id: 'run-1', work_terminal: false,
+        pending_native_input: { version: 1, kind, requestId: 'request-1', requestFingerprint: 'a'.repeat(64),
+          runId: 'run-1', attemptId: 'attempt-1', sessionId: 'session-1', expiresAt: '2099-01-01T00:00:00Z', state: 'pending', mode: 'form' }, message: 'Native request.' },
+    })).resolves.toBeNull();
+    expect(mockUpdateOne).not.toHaveBeenCalled();
+  });
+
+  test('carries only the trusted original user source into durable mission evidence', async () => {
+    await enqueueGlassHiveMissionAdjudication({
+      binding: { ownerId: 'user-1', conversationId: 'conversation-1', originRef: 'ghi-original',
+        workRef: 'work-original', anchorMessageId: 'removed-anchor',
+        requestedParentMessageId: 'original-user', mainAgentId: 'main-agent' },
+      body: { callback_id: 'cb-source', event: 'run.completed', work_state: 'completed',
+        work_terminal: true, worker_id: 'worker-1', run_id: 'run-1',
+        message: 'Verified result.', requested_parent_message_id: 'untrusted-user' },
+    });
+    expect(mockUpdateOne.mock.calls[0][1].$setOnInsert).toMatchObject({
+      anchorMessageId: 'removed-anchor', requestedParentMessageId: 'original-user',
+    });
+  });
+
+  test('retains the correction and latest reply context after the original Main anchor was removed', async () => {
+    const pending = row({ anchorMessageId: 'removed-anchor', requestedParentMessageId: 'original-user' });
+    const messages = [
+      { user: 'user-1', conversationId: 'conversation-1', messageId: 'original-user',
+        isCreatedByUser: true, text: 'Build both lessons.', createdAt: '2026-04-28T14:00:00.000Z' },
+      { user: 'user-1', conversationId: 'conversation-1', messageId: 'correction-user',
+        parentMessageId: 'original-user', isCreatedByUser: true, text: 'Use one quarter instead.',
+        createdAt: '2026-04-28T14:00:01.000Z' },
+      { user: 'user-1', conversationId: 'conversation-1', messageId: 'current-main',
+        parentMessageId: 'correction-user', isCreatedByUser: false,
+        text: 'I steered the probability lesson. The other lesson continues.',
+        createdAt: '2026-04-28T14:00:02.000Z' },
+    ];
+    mockMessageFind.mockReturnValue(cursor(messages));
+    mockFind.mockReturnValueOnce(cursor([pending]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...pending, state: 'processing' });
+    const real = jest.requireActual('../BackgroundCortexFollowUpService');
+    mockPrepareCortexFollowUpMessage.mockImplementationOnce(async (input) => {
+      const continuation = real.resolveFollowUpContinuationContext(messages, input.parentMessageId);
+      expect(continuation.hasMovedOn).toBe(true);
+      expect(continuation.contextText).toContain('Use one quarter instead.');
+      expect(continuation.contextText).toContain('I steered the probability lesson.');
+      expect(continuation.currentLeafMessageId).toBe('current-main');
+      return { prepared: true };
+    });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({
+      visible: 1, failed: 0,
+    });
+    expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledWith(expect.objectContaining({
+      parentMessageId: 'original-user', deliveryParentMessageId: 'original-user',
+    }));
+    expect(pending.anchorMessageId).toBe('removed-anchor');
+  });
+
+  test.each([
+    ['missing', null],
+    ['assistant', { user: 'user-1', conversationId: 'conversation-1', isCreatedByUser: false }],
+    ['foreign owner', { user: 'other-user', conversationId: 'conversation-1', isCreatedByUser: true }],
+    ['foreign conversation', { user: 'user-1', conversationId: 'other-conversation', isCreatedByUser: true }],
+  ])('rejects a removed-anchor continuation whose source is %s', async (_label, source) => {
+    const pending = row({ anchorMessageId: 'removed-anchor', requestedParentMessageId: 'original-user' });
+    mockMessageFind.mockReturnValue(cursor(source ? [{ messageId: 'original-user', ...source }] : []));
+    mockFind.mockReturnValueOnce(cursor([pending]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...pending, state: 'processing' });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({
+      visible: 0, failed: 1,
+    });
+    expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockRecordOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      errorCode: 'mission_origin_source_unavailable',
+    }));
+  });
+
+  test('preserves source cleanup authority when the old Main anchor is absent', async () => {
+    const pending = row({ anchorMessageId: 'removed-anchor', requestedParentMessageId: 'original-user' });
+    mockMessageFind.mockReturnValue(cursor([{ messageId: 'original-user', user: 'user-1',
+      conversationId: 'conversation-1', isCreatedByUser: true,
+      deletedAt: new Date('2026-04-28T14:00:00.000Z') }]));
+    mockFind.mockReturnValueOnce(cursor([pending]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...pending, state: 'processing' });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({
+      visible: 0, silent: 1, failed: 0,
+    });
+    expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockRecordOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      state: 'silent', errorCode: 'mission_origin_cleanup_tombstoned',
+    }));
   });
 
   afterEach(() => {
@@ -436,6 +804,31 @@ describe('GlassHiveMissionAdjudicationService', () => {
     expect(mockUpdateOne.mock.calls[0][1].$setOnInsert.feelingsIsolated).toBe(true);
   });
 
+  test.each(['run.cancelled', 'run.interrupted'])(
+    'retains useful %s terminal evidence for native Main without raw status delivery', async (event) => {
+      const input = {
+        binding: {
+          originRef: 'ghi-origin-1', workRef: 'gh-work-1', ownerId: 'user-1',
+          conversationId: 'conversation-1', anchorMessageId: 'assistant-anchor', mainAgentId: 'main-agent',
+          traceIdentity: { callbackRef: canonicalCallbackRef('cb-stop'), attemptNumber: 1 },
+          destinations: [{ surface: 'telegram' }],
+        },
+        body: {
+          callback_id: 'cb-stop', event, work_state: 'cancelled', work_terminal: true,
+          worker_id: 'worker-1', run_id: 'run-1', message: 'The saved draft remains available after this stop.',
+        },
+      };
+      await enqueueGlassHiveMissionAdjudication(input);
+      expect(mockUpdateOne).toHaveBeenCalledWith(expect.any(Object), {
+        $setOnInsert: expect.objectContaining({
+          event, evidence: input.body.message, state: 'pending',
+        }),
+      }, { upsert: true });
+      expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+    },
+  );
+
   test('persists exact terminal evidence idempotently before scheduling synthesis', async () => {
     await enqueueGlassHiveMissionAdjudication({
       binding: {
@@ -550,7 +943,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
         },
       ],
     };
-    await enqueueGlassHiveMissionAdjudication({
+    const callbackInput = {
       binding: { ...row(), runId: 'run-1', attemptId: 'attempt-1' },
       body: {
         callback_id: callbackId,
@@ -570,7 +963,22 @@ describe('GlassHiveMissionAdjudicationService', () => {
         resultRevision: 1,
         generation: 1,
       },
-    });
+    };
+    for (const field of ['owner_id', 'run_id', 'attempt_id', 'callback_id', 'origin_ref', 'work_ref']) {
+      await expect(enqueueGlassHiveMissionAdjudication({
+        ...callbackInput,
+        body: { ...callbackInput.body, output_files: { ...outputFiles, [field]: 'foreign' } },
+      })).rejects.toThrow('native_output_files_identity_invalid');
+    }
+    await expect(enqueueGlassHiveMissionAdjudication({
+      ...callbackInput,
+      body: { ...callbackInput.body, output_files: {
+        ...outputFiles, files: [{ ...outputFiles.files[0], sha256: 'invalid' }],
+      } },
+    })).rejects.toThrow('native_output_files_invalid');
+    expect(mockUpdateOne).not.toHaveBeenCalled();
+    expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+    await enqueueGlassHiveMissionAdjudication(callbackInput);
     const stored = mockUpdateOne.mock.calls[0][1].$setOnInsert;
     expect(stored).toMatchObject({ attemptId: 'attempt-1', outputFiles });
     mockFind.mockReturnValueOnce(cursor([stored]));
@@ -589,13 +997,17 @@ describe('GlassHiveMissionAdjudicationService', () => {
       message.attachments = await input.dependencies.prepareAttachments(message);
       return storeAuthoredMessage(input, message);
     });
-    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({
-      visible: 1,
-      failed: 0,
+    const result = await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+    expect({ ...result, errors: mockRecordOutcome.mock.calls.filter(([value]) => value.errorCode)
+      .map(([value]) => value.errorCode) }).toMatchObject({ visible: 1, failed: 0, errors: [] });
+    const insight = mockPrepareCortexFollowUpMessage.mock.calls[0][0].insightsData.insights[0].insight;
+    const published = JSON.parse(insight.slice(0, insight.indexOf('\n\n'))).output_files;
+    // The Queen can use the already published exact file, without rediscovery by filename.
+    expect(published).toEqual({ ...outputFiles, count: 1, rejected: [] });
+    expect(published.files[0]).toMatchObject({
+      sha256: 'a'.repeat(64),
+      download_url: 'https://native.example.test/v1/link-refs/ghr_1234567890abcdef',
     });
-    expect(
-      mockPrepareCortexFollowUpMessage.mock.calls[0][0].insightsData.insights[0].insight,
-    ).toContain('"files":[{"filename":"result.png","mime_type":"image/png","bytes":3}]');
     expect(mockPrepareMissionOutputFiles).toHaveBeenCalledWith(
       expect.objectContaining({
         rows: [expect.objectContaining({ outputFiles })],
@@ -648,6 +1060,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
     const input = {
       binding: {
         ownerId: 'user-1',
+        attemptId: 'verified-native-attempt',
         originRef: 'origin-1',
         conversationId: 'conversation-1',
         anchorMessageId: 'anchor-1',
@@ -665,7 +1078,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
     };
     await enqueueGlassHiveMissionAdjudication(input);
     expect(mockUpdateOne.mock.calls[0][1].$setOnInsert).toEqual(
-      expect.objectContaining({ ownerId: 'user-1', runId: 'run-1', nativeMedia }),
+      expect.objectContaining({ ownerId: 'user-1', runId: 'run-1', attemptId: 'verified-native-attempt', nativeMedia }),
     );
     expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
     const writes = mockUpdateOne.mock.calls.length;
@@ -730,7 +1143,131 @@ describe('GlassHiveMissionAdjudicationService', () => {
     scheduleTimer.mockRestore();
   });
 
-  test('serializes one owner flush and schedules one lossless follow-up flush', async () => {
+  describe('conversation delivery scheduling', () => {
+    function schedulingRows(rows) {
+      mockFind.mockImplementation((filter) => {
+        if (filter.state !== 'pending') return cursor([]);
+        return cursor(rows.filter((item) => item.state === 'pending' &&
+          item.ownerId === filter.ownerId &&
+          (filter.conversationId === undefined ||
+            (typeof filter.conversationId === 'object'
+              ? filter.conversationId.$in.includes(item.conversationId ?? null)
+              : item.conversationId === filter.conversationId))));
+      });
+      mockFindOneAndUpdate.mockImplementation(async (filter) => {
+        const item = rows.find((entry) => entry._id === filter._id && entry.state === filter.state);
+        if (!item) return null;
+        item.state = 'processing';
+        return { ...item };
+      });
+      mockUpdateOne.mockImplementation(async (filter, update) => {
+        const item = rows.find((entry) => entry._id === filter._id);
+        if (item && update.$set) Object.assign(item, update.$set);
+        return { acknowledged: true, matchedCount: 1, modifiedCount: 1 };
+      });
+      mockCreateCortexFollowUpMessage.mockImplementation(async (input) => ({
+        messageId: `follow-up-${input.conversationId}`,
+        text: 'Main-authored synthetic result.',
+      }));
+    }
+
+    function enqueueScheduled(item) {
+      return enqueueGlassHiveMissionAdjudication({
+        binding: {
+          originRef: item.originRef, workRef: item.workRef, ownerId: item.ownerId,
+          conversationId: item.conversationId, anchorMessageId: item.anchorMessageId,
+          mainAgentId: item.mainAgentId, destinations: item.destinations,
+        },
+        body: {
+          callback_id: item._id, event: item.event, work_state: item.workState,
+          work_terminal: true, worker_id: item.workerId, run_id: item.runId,
+          message: item.evidence,
+        },
+      });
+    }
+
+    test('delivers another conversation while the first conversation synthesis is blocked', async () => {
+      jest.useFakeTimers();
+      const first = row({ _id: 'cb-a', evidenceId: 'cb-a', conversationId: 'conversation-a' });
+      const second = row({ _id: 'cb-b', evidenceId: 'cb-b', conversationId: 'conversation-b',
+        originRef: 'ghi-origin-b', workRef: 'gh-work-b', runId: 'run-b' });
+      schedulingRows([first, second]);
+      let release;
+      const blocked = new Promise((resolve) => { release = resolve; });
+      mockPrepareCortexFollowUpMessage.mockImplementation((input) =>
+        input.conversationId === first.conversationId ? blocked : Promise.resolve({ prepared: true }));
+      await enqueueScheduled(first);
+      await jest.advanceTimersByTimeAsync(COALESCE_MS);
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+      await enqueueScheduled(second);
+      await jest.advanceTimersByTimeAsync(COALESCE_MS);
+      expect(mockEnqueueDelivery).toHaveBeenCalledWith(expect.objectContaining({
+        message: expect.objectContaining({ messageId: 'follow-up-conversation-b' }),
+      }));
+      expect(first.state).toBe('processing');
+      expect(second.state).toBe('completed');
+      release({ prepared: true });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(mockEnqueueDelivery).toHaveBeenCalledTimes(2);
+    });
+
+    test('reconciliation schedules another conversation while an existing lane is busy', async () => {
+      jest.useFakeTimers();
+      const first = row({ _id: 'cb-a', evidenceId: 'cb-a', conversationId: 'conversation-a' });
+      const second = row({ _id: 'cb-b', evidenceId: 'cb-b', conversationId: 'conversation-b',
+        originRef: 'ghi-origin-b', workRef: 'gh-work-b', runId: 'run-b' });
+      schedulingRows([first, second]);
+      const pendingFind = mockFind.getMockImplementation();
+      mockFind.mockImplementation((filter) => filter.$or ? cursor([second]) : pendingFind(filter));
+      let release;
+      const blocked = new Promise((resolve) => { release = resolve; });
+      mockPrepareCortexFollowUpMessage.mockImplementation((input) =>
+        input.conversationId === first.conversationId ? blocked : Promise.resolve({ prepared: true }));
+      await enqueueScheduled(first);
+      await jest.advanceTimersByTimeAsync(COALESCE_MS);
+      await expect(reconcilePendingGlassHiveMissionAdjudications()).resolves.toEqual({ rows: 1, owners: 1 });
+      await jest.advanceTimersByTimeAsync(COALESCE_MS);
+      expect(mockEnqueueDelivery).toHaveBeenCalledWith(expect.objectContaining({
+        message: expect.objectContaining({ messageId: 'follow-up-conversation-b' }),
+      }));
+      expect(first.state).toBe('processing');
+      release({ prepared: true });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(mockEnqueueDelivery).toHaveBeenCalledTimes(2);
+    });
+
+    test.each(['', null, undefined])('recovers retained blank conversation %s in the fallback lane', async (conversationId) => {
+      jest.useFakeTimers();
+      const retained = row({ conversationId });
+      schedulingRows([retained]);
+      mockFind.mockImplementation((filter) => {
+        if (filter.$or) return cursor([retained]);
+        if (filter.state !== 'pending') return cursor([]);
+        const values = filter.conversationId?.$in;
+        return cursor(values?.includes(conversationId ?? null) ? [retained] : []);
+      });
+      await expect(reconcilePendingGlassHiveMissionAdjudications()).resolves.toEqual({ rows: 1, owners: 1 });
+      await jest.advanceTimersByTimeAsync(COALESCE_MS);
+      expect(mockFind).toHaveBeenLastCalledWith({
+        ownerId: retained.ownerId, state: 'pending', conversationId: { $in: ['', null] },
+      });
+      expect(mockFindOneAndUpdate).toHaveBeenCalledWith(
+        { _id: retained._id, state: 'pending' }, expect.any(Object), expect.any(Object),
+      );
+      expect(retained.state).toBe('failed');
+      expect(retained.errorCode).toBe('mission_adjudication_preflight_failed');
+      expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+    });
+
+    test('retains an omitted conversation as the direct owner flush contract', async () => {
+      schedulingRows([row()]);
+      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      expect(mockFind).toHaveBeenCalledWith({ ownerId: 'user-1', state: 'pending' });
+      expect(mockEnqueueDelivery).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  test('serializes one conversation flush and schedules one lossless follow-up flush', async () => {
     jest.useFakeTimers();
     const firstRow = row({ _id: 'cb-a', evidenceId: 'cb-a', evidence: 'First result.' });
     const secondRow = row({
@@ -2012,70 +2549,84 @@ describe('GlassHiveMissionAdjudicationService', () => {
     expect(mockEnqueueDelivery).toHaveBeenCalledTimes(1);
   });
 
-  test('binds one coalesced Voice presentation to every exact Worker and the current call', async () => {
-    const terminalRow = (suffix) => {
-      const rawCallbackId = `cb_terminal_${suffix.repeat(64)}`;
-      return row({
-        _id: `cb-${suffix}`,
-        evidenceId: `cb-${suffix}`,
-        originRef: `origin-${suffix}`,
-        workRef: `work-${suffix}`,
-        workerId: `worker-${suffix}`,
-        runId: `run-${suffix}`,
-        callbackRef: canonicalCallbackRef(rawCallbackId),
-        attemptNumber: 1,
-        surface: 'voice',
-        destinations: [{ surface: 'voice', voiceCallSessionId: 'ended-origin-call' }],
-        terminalCallbackResultKey: `ghtr_${suffix.repeat(64)}`,
-        terminalCallbackAcceptedOperationId: suffix.repeat(32),
-        terminalCallbackId: rawCallbackId,
-        terminalCallbackResultDigest: `sha256:${suffix.repeat(64)}`,
-        terminalCallbackResultRevision: 1,
-        terminalCallbackEffectGeneration: 1,
+  test.each(['voice', 'telegram'])(
+    'binds one coalesced %s presentation to every exact Worker',
+    async (surface) => {
+      const terminalRow = (suffix) => {
+        const rawCallbackId = `cb_terminal_${suffix.repeat(64)}`;
+        return row({
+          _id: `cb-${suffix}`,
+          evidenceId: `cb-${suffix}`,
+          originRef: `origin-${suffix}`,
+          workRef: `work-${suffix}`,
+          workerId: `worker-${suffix}`,
+          runId: `run-${suffix}`,
+          callbackRef: canonicalCallbackRef(rawCallbackId),
+          attemptNumber: 1,
+          surface,
+          destinations: [{ surface, voiceCallSessionId: 'ended-origin-call' }],
+          terminalCallbackResultKey: `ghtr_${suffix.repeat(64)}`,
+          terminalCallbackAcceptedOperationId: suffix.repeat(32),
+          terminalCallbackId: rawCallbackId,
+          terminalCallbackResultDigest: `sha256:${suffix.repeat(64)}`,
+          terminalCallbackResultRevision: 1,
+          terminalCallbackEffectGeneration: 1,
+        });
+      };
+      const rows = [terminalRow('b'), terminalRow('a')];
+      mockFind.mockReturnValueOnce(cursor(rows));
+      mockFindOneAndUpdate.mockImplementation(async (filter) => ({
+        ...rows.find((item) => item._id === filter._id),
+        state: 'processing',
+      }));
+      mockGetActiveCallSessionForConversation.mockResolvedValue({
+        callSessionId: 'reconnected-call',
+        userId: 'user-1',
+        conversationId: 'conversation-1',
+        status: 'listening',
       });
-    };
-    const rows = [terminalRow('b'), terminalRow('a')];
-    mockFind.mockReturnValueOnce(cursor(rows));
-    mockFindOneAndUpdate.mockImplementation(async (filter) => ({
-      ...rows.find((item) => item._id === filter._id),
-      state: 'processing',
-    }));
-    mockGetActiveCallSessionForConversation.mockResolvedValue({
-      callSessionId: 'reconnected-call',
-      userId: 'user-1',
-      conversationId: 'conversation-1',
-      status: 'listening',
-    });
-    mockCreateCortexFollowUpMessage.mockResolvedValueOnce({
-      messageId: 'follow-up-voice-coalesced',
-      text: 'Both Workers completed.',
-    });
+      mockCreateCortexFollowUpMessage.mockResolvedValueOnce({
+        messageId: 'follow-up-voice-coalesced',
+        text: 'Both Workers completed.',
+      });
 
-    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
-      expect.objectContaining({ visible: 2, failed: 0 }),
-    );
+      await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+        expect.objectContaining({ visible: 2, failed: 0 }),
+      );
 
-    expect(mockGetActiveCallSessionForConversation).toHaveBeenCalledWith({
-      userId: 'user-1',
-      conversationId: 'conversation-1',
-    });
-    expect(mockEnqueueDelivery).toHaveBeenCalledTimes(1);
-    const input = mockEnqueueDelivery.mock.calls[0][0];
-    expect(input.deliveryContext.destinations).toEqual([
-      expect.objectContaining({ surface: 'voice', voiceCallSessionId: 'reconnected-call' }),
-    ]);
-    expect(input.deliveryContext.workerCompletionPresentation).toMatchObject({
-      version: 1,
-      callSessionId: 'reconnected-call',
-      responseMessageId: 'follow-up-voice-coalesced',
-      responseDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-      bindings: [
-        expect.objectContaining({ workRef: 'work-a', workerId: 'worker-a' }),
-        expect.objectContaining({ workRef: 'work-b', workerId: 'worker-b' }),
-      ],
-    });
-    expect(input.body.work_ref).toBe('work-a');
-  });
+      expect(mockEnqueueDelivery).toHaveBeenCalledTimes(1);
+      const input = mockEnqueueDelivery.mock.calls[0][0];
+      expect(input.deliveryContext.workerCompletionBindings).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ workRef: 'work-a', workerId: 'worker-a' }),
+          expect.objectContaining({ workRef: 'work-b', workerId: 'worker-b' }),
+        ]),
+      );
+      if (surface === 'voice') {
+        expect(mockGetActiveCallSessionForConversation).toHaveBeenCalledWith({
+          userId: 'user-1',
+          conversationId: 'conversation-1',
+        });
+        expect(input.deliveryContext.destinations).toEqual([
+          expect.objectContaining({ surface: 'voice', voiceCallSessionId: 'reconnected-call' }),
+        ]);
+        expect(input.deliveryContext.workerCompletionPresentation).toMatchObject({
+          version: 1,
+          callSessionId: 'reconnected-call',
+          responseMessageId: 'follow-up-voice-coalesced',
+          responseDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+          bindings: [
+            expect.objectContaining({ workRef: 'work-a', workerId: 'worker-a' }),
+            expect.objectContaining({ workRef: 'work-b', workerId: 'worker-b' }),
+          ],
+        });
+      } else {
+        expect(input.deliveryContext.workerCompletionPresentation).toBeUndefined();
+        expect(mockGetActiveCallSessionForConversation).not.toHaveBeenCalled();
+      }
+      expect(input.body.work_ref).toBe('work-a');
+    },
+  );
 
   describe('Worker completion Voice brain propagation', () => {
     const savedAgent = {
@@ -2281,6 +2832,38 @@ describe('GlassHiveMissionAdjudicationService', () => {
           .callSessionId,
       ).toBe('reconnected-call');
     });
+  });
+
+  test('pre-attempt cancellation cannot abort a grouped result during an active call', async () => {
+    const telegram = { surface: 'telegram', telegramChatId: 'chat-1' };
+    const terminal = (suffix, overrides = {}) => row({
+      _id: `cb-${suffix}`, evidenceId: `cb-${suffix}`, originRef: `origin-${suffix}`,
+      workRef: `work-${suffix}`, workerId: `worker-${suffix}`, runId: `run-${suffix}`,
+      callbackRef: canonicalCallbackRef(`cb_terminal_${suffix.repeat(64)}`), attemptNumber: 1,
+      surface: 'voice', destinations: [{ surface: 'voice', voiceCallSessionId: 'live-call' }, telegram],
+      terminalCallbackResultKey: `ghtr_${suffix.repeat(64)}`,
+      terminalCallbackAcceptedOperationId: suffix.repeat(32), terminalCallbackId: `cb_terminal_${suffix.repeat(64)}`,
+      terminalCallbackResultDigest: `sha256:${suffix.repeat(64)}`, terminalCallbackResultRevision: 1,
+      terminalCallbackEffectGeneration: 1, ...overrides,
+    });
+    const rows = [terminal('a', { event: 'run.cancelled', workState: 'cancelled', workTerminal: true,
+      attemptNumber: null, evidence: 'Stopped before dispatch; the draft is retained.' }), terminal('b')];
+    mockFind.mockReturnValueOnce(cursor(rows));
+    mockFindOneAndUpdate.mockImplementation(async (filter) => ({
+      ...rows.find((item) => item._id === filter._id), state: 'processing',
+    }));
+    mockGetActiveCallSessionForConversation.mockResolvedValue({
+      callSessionId: 'live-call', userId: 'user-1', conversationId: 'conversation-1', status: 'listening',
+    });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({
+      visible: 2, failed: 0,
+    });
+    expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    expect(mockEnqueueDelivery).toHaveBeenCalledTimes(1);
+    const delivered = mockEnqueueDelivery.mock.calls[0][0];
+    expect(delivered.deliveryContext.destinations).toEqual(expect.arrayContaining([telegram]));
+    expect(delivered.deliveryContext.destinations.some((item) => item.surface === 'voice')).toBe(false);
+    expect(delivered.deliveryContext.workerCompletionPresentation).toBeUndefined();
   });
 
   test('ended Call completion keeps the authored linked result and other destinations without regeneration', async () => {
@@ -2526,7 +3109,28 @@ describe('GlassHiveMissionAdjudicationService', () => {
     );
   });
 
-  test('retains an explicit semantic NTA as silent inside the accepted-result fence', async () => {
+  test('mission Main can select a retained File grant without row or new native output files', async () => {
+    const previous = process.env.GLASSHIVE_ARTIFACT_BASE_URL;
+    process.env.GLASSHIVE_ARTIFACT_BASE_URL = 'https://native.example.test';
+    const retained = '[Capture](https://native.example.test/v1/link-refs/ghr_retained1234567890)';
+    const queued = row(); mockFind.mockReturnValueOnce(cursor([queued]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...queued, state: 'processing' });
+    const attachments = [{ file_id: 'owned-file', filepath: '/uploads/capture.svg' }];
+    mockPrepareMissionOutputFiles.mockResolvedValueOnce(attachments);
+    mockPersistPreparedCortexFollowUpMessage.mockImplementationOnce(async (input) => {
+      const message = { conversationId: input.conversationId, messageId: 'actual-main-message',
+        agent_id: input.agent.id, text: retained };
+      message.attachments = await input.dependencies.prepareAttachments(message);
+      return storeAuthoredMessage(input, message);
+    });
+    try {
+      await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({ visible: 1, failed: 0 });
+      expect(mockPrepareMissionOutputFiles).toHaveBeenCalledWith(expect.objectContaining({
+        message: expect.objectContaining({ text: retained, messageId: 'actual-main-message' }) }));
+    } finally { if (previous === undefined) delete process.env.GLASSHIVE_ARTIFACT_BASE_URL;
+      else process.env.GLASSHIVE_ARTIFACT_BASE_URL = previous; }
+  });
+  test.each(['nta', 'native_silent'])('retains explicit semantic %s as silent inside the accepted-result fence', async (kind) => {
     const fenced = row({
       terminalCallbackResultKey: `ghtr_${'a'.repeat(64)}`,
       terminalCallbackAcceptedOperationId: 'b'.repeat(32),
@@ -2550,8 +3154,9 @@ describe('GlassHiveMissionAdjudicationService', () => {
       followUpDecisionRecord: {
         generationFailed: false,
         forceVisibleFollowUp: false,
-        llmResult: 'nta',
-        selectedStrategy: 'no_response_suppressed',
+        llmResult: kind,
+        ...(kind === 'native_silent' ? { nativeSilentDecision: true } : {}),
+        selectedStrategy: kind === 'nta' ? 'no_response_suppressed' : 'native_silent_suppressed',
       },
     });
     mockCreateCortexFollowUpMessage.mockResolvedValueOnce(null);

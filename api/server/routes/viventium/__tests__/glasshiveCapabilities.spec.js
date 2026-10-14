@@ -27,6 +27,7 @@ class MockCapabilityAuthorizationError extends Error {
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
+    info: jest.fn(),
     error: jest.fn(),
     warn: jest.fn(),
   },
@@ -192,6 +193,115 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
     process.env = originalEnv;
   });
 
+  function requestEvents() {
+    return require('@librechat/data-schemas').logger.info.mock.calls.map(([line]) =>
+      JSON.parse(line),
+    );
+  }
+
+  test.each([
+    ['initialize', 200],
+    ['notifications/initialized', 202],
+    ['ping', 200],
+    ['tools/list', 200],
+    ['private-unrecognized-method', 400],
+  ])('records one redacted response for %s', async (method, status) => {
+    const {
+      mintBrokerGrant,
+      verifyBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const { token } = mintBrokerGrant({
+      user: { id: 'user-observation', role: 'USER' },
+      allowedServers: ['synthetic-server'],
+      requestContext: {
+        conversation_id: 'private-conversation',
+        message_id: 'private-message',
+      },
+    });
+    mockBuildCapabilityCatalog.mockResolvedValue({ tools: [] });
+    mockToolDefinitionsForMcp.mockReturnValue([]);
+    await request(appWithRoute())
+      .post('/api/viventium/glasshive/capabilities/mcp')
+      .set('Authorization', `Bearer ${token}`)
+      .send({
+        jsonrpc: '2.0',
+        id: 1,
+        method,
+        params: { private_argument: 'private-content' },
+      })
+      .expect(status);
+    const events = requestEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      event: 'glasshive_broker_request',
+      method: method === 'private-unrecognized-method' ? 'unsupported' : method,
+      status,
+      duration_ms: expect.any(Number),
+      outcome: 'response_finished',
+      grant_id_sha256: require('node:crypto')
+        .createHash('sha256')
+        .update(verifyBrokerGrant(token).grant_id)
+        .digest('hex'),
+    });
+    expect(events[0].duration_ms).toBeGreaterThanOrEqual(0);
+    const serialized = JSON.stringify(events);
+    for (const secret of [
+      token,
+      'private-conversation',
+      'private-message',
+      'private-content',
+      'private-unrecognized-method',
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
+  });
+
+  test('records failed tool discovery without error text or extra fields', async () => {
+    const {
+      mintBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const { token } = mintBrokerGrant({
+      user: { id: 'user-observation', role: 'USER' },
+      allowedServers: [],
+      requestContext: {
+        conversation_id: 'synthetic-conversation',
+        message_id: 'synthetic-message',
+      },
+    });
+    mockBuildCapabilityCatalog.mockRejectedValueOnce(new Error('private-provider-error'));
+    await request(appWithRoute())
+      .post('/api/viventium/glasshive/capabilities/mcp')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ id: 1, method: 'tools/list' })
+      .expect(500);
+    expect(requestEvents()).toEqual([
+      expect.objectContaining({ method: 'tools/list', status: 500 }),
+    ]);
+    expect(JSON.stringify(requestEvents())).not.toContain('private-provider-error');
+  });
+
+  test('a logger failure cannot replace an initialized response', async () => {
+    const {
+      mintBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const { token } = mintBrokerGrant({
+      user: { id: 'user-observation', role: 'USER' },
+      allowedServers: [],
+      requestContext: {
+        conversation_id: 'synthetic-conversation',
+        message_id: 'synthetic-message',
+      },
+    });
+    require('@librechat/data-schemas').logger.info.mockImplementationOnce(() => {
+      throw new Error('log sink unavailable');
+    });
+    await request(appWithRoute())
+      .post('/api/viventium/glasshive/capabilities/mcp')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ id: 1, method: 'initialize' })
+      .expect(200);
+  });
+
   test('rejects missing broker grant', async () => {
     const response = await request(appWithRoute())
       .post('/api/viventium/glasshive/capabilities/mcp')
@@ -199,6 +309,9 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
       .expect(401);
 
     expect(response.body.error.message).toBe('Unauthorized GlassHive capability broker request');
+    expect(requestEvents()).toEqual([
+      expect.objectContaining({ status: 401, grant_id_sha256: null }),
+    ]);
   });
 
   test('rejects an admitted bearer after its exact authorization is inactive', async () => {
@@ -436,6 +549,8 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
 
     expect(response.body.error.message).toBe('GlassHive capability broker rate limit exceeded');
     expect(response.headers['retry-after']).toBeDefined();
+    expect(requestEvents().map((event) => event.status)).toEqual([200, 429]);
+    expect(requestEvents()[0].grant_id_sha256).toBe(requestEvents()[1].grant_id_sha256);
   });
 
   test('rejects an expired grant instead of silently extending bearer lifetime', async () => {
@@ -507,6 +622,25 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
       .expect(202);
 
     expect(response.text).toBe('');
+  });
+
+  test.each([
+    ['active_work_arguments_invalid', 'runId and workRef require result scope', 400, -32602],
+    ['native_request_timeout', 'The operation was aborted due to timeout', 500, -32000],
+  ])('keeps typed argument and native transport failures distinct: %s', async (code, message, status, rpcCode) => {
+    const { mintBrokerGrant } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const { token } = mintBrokerGrant({user:{id:'user-1',role:'USER'},
+      allowedServers:['google_workspace'],
+      requestContext:{conversation_id:'conv-1',message_id:'msg-1'}});
+    mockHandleToolCall.mockRejectedValueOnce(Object.assign(new Error(message), {code}));
+    const response = await request(appWithRoute())
+      .post('/api/viventium/glasshive/capabilities/mcp')
+      .set('Authorization', `Bearer ${token}`)
+      .send({jsonrpc:'2.0',id:31,method:'tools/call',
+        params:{name:'active_work_list',arguments:{workRef:'work-1'}}})
+      .expect(status);
+    expect(response.body.error).toEqual({code:rpcCode,
+      message:status===400 ? message : 'GlassHive capability broker request failed'});
   });
 
   test('returns structured content for tools/call', async () => {
@@ -610,6 +744,13 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
       server.closeAllConnections?.();
       await new Promise((resolve) => server.close(resolve));
     }
+    expect(requestEvents()).toEqual([
+      expect.objectContaining({
+        method: 'tools/call',
+        status: null,
+        outcome: 'connection_closed',
+      }),
+    ]);
   });
 
   test('omits structuredContent for array tool results so strict MCP clients accept them', async () => {

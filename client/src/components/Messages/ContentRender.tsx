@@ -181,6 +181,9 @@ const ContentRender = memo(function ContentRender({
               isCreatedByUser={msg.isCreatedByUser}
               conversationId={conversation?.conversationId}
               content={msg.content}
+              /* === VIVENTIUM START === Reuse saved text rendering across channel histories. === */
+              fallbackText={msg.text}
+              /* === VIVENTIUM END === */
             />
             {/* === VIVENTIUM START === Persisted Stop status remains visible after reload. === */}
             {!effectiveIsSubmitting && isIncompleteMessage(msg) && (

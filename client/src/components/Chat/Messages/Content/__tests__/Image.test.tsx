@@ -2,6 +2,8 @@ import React from 'react';
 import { render, screen, fireEvent } from '@testing-library/react';
 import Image, { _resetImageCaches } from '../Image';
 
+jest.mock('@tanstack/react-query', () => ({ useQuery: () => ({ data: undefined }) }));
+
 jest.mock('~/utils', () => ({
   cn: (...classes: (string | boolean | undefined | null)[]) =>
     classes
@@ -12,6 +14,8 @@ jest.mock('~/utils', () => ({
 
 jest.mock('librechat-data-provider', () => ({
   apiBaseUrl: () => '',
+  FileSources: { local: 'local' },
+  QueryKeys: { fileDownload: 'fileDownload' },
 }));
 
 jest.mock('@librechat/client', () => ({

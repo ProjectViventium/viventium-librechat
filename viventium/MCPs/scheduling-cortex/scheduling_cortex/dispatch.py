@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import logging
 import os
@@ -51,6 +52,8 @@ if _SHARED_PATH and str(_SHARED_PATH) not in sys.path:
     sys.path.insert(0, str(_SHARED_PATH))
 
 import scheduler_prompt_contract as _scheduler_prompt_contract
+import telegram_tts as _telegram_tts
+from telegram_audio import package_telegram_audio, TelegramAudioError
 
 CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID = (
     _scheduler_prompt_contract.CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID
@@ -1437,74 +1440,58 @@ def _coerce_bool(value: Any, default: bool) -> bool:
 
 
 def _resolve_telegram_identity(
-    task: Dict[str, Any],
-    base_url: str,
-    timeout_s: int,
-) -> Tuple[str, str, Dict[str, bool]]:
+    task: Dict[str, Any], base_url: str, timeout_s: int, *, resolve_voice: bool = True,
+) -> Tuple[str, str, Dict[str, Any]]:
     metadata = task.get("metadata") or {}
-    telegram_user_id = _coerce_id(
-        metadata.get("telegram_user_id") or metadata.get("telegramUserId")
-    )
-    telegram_chat_id = _coerce_id(
-        metadata.get("telegram_chat_id") or metadata.get("telegramChatId")
-    )
-    voice_preferences: Dict[str, bool] = {
-        "always_voice_response": _coerce_bool(
-            metadata.get("always_voice_response")
-            if isinstance(metadata, dict)
-            else None,
-            False,
-        ),
-        "voice_responses_enabled": _coerce_bool(
-            metadata.get("voice_responses_enabled")
-            if isinstance(metadata, dict)
-            else None,
-            True,
-        ),
+    telegram_user_id = _coerce_id(metadata.get("telegram_user_id") or metadata.get("telegramUserId"))
+    telegram_chat_id = _coerce_id(metadata.get("telegram_chat_id") or metadata.get("telegramChatId"))
+    voice_preferences: Dict[str, Any] = {
+        "always_voice_response": _coerce_bool(metadata.get("always_voice_response"), False),
+        "voice_responses_enabled": _coerce_bool(metadata.get("voice_responses_enabled"), True),
     }
-
-    if not telegram_user_id:
-        scheduler_secret = _get_scheduler_secret()
-        if not scheduler_secret:
-            raise RuntimeError("SCHEDULER_LIBRECHAT_SECRET is required to resolve Telegram mapping")
-        headers = {
-            "Content-Type": "application/json",
-            "X-VIVENTIUM-SCHEDULER-SECRET": scheduler_secret,
-        }
+    # Stable delivery identity is not authority for the owner's current Speaking choice.
+    if resolve_voice or not telegram_user_id:
         try:
+            secret = _get_scheduler_secret()
+            if not secret:
+                raise RuntimeError("scheduler_voice_route_auth_unavailable")
             response = _post_json(
                 f"{base_url}/api/viventium/scheduler/telegram/resolve",
-                {"userId": task.get("user_id")},
-                headers,
+                {"userId": task.get("user_id"), "resolveVoice": resolve_voice},
+                {"Content-Type": "application/json", "X-VIVENTIUM-SCHEDULER-SECRET": secret},
                 timeout_s,
             )
-        except HttpJsonError as error:
-            if error.status == 404:
-                raise TelegramChannelNotLinked("telegram_not_linked") from error
-            raise
-        telegram_user_id = _coerce_id(
-            response.get("telegram_user_id") or response.get("telegramUserId")
-        )
-        telegram_chat_id = _coerce_id(
-            response.get("telegram_chat_id") or response.get("telegramChatId")
-        )
-        response_voice_preferences = response.get("voice_preferences")
-        if isinstance(response_voice_preferences, dict):
-            voice_preferences = {
-                "always_voice_response": _coerce_bool(
-                    response_voice_preferences.get("always_voice_response"),
-                    False,
-                ),
-                "voice_responses_enabled": _coerce_bool(
-                    response_voice_preferences.get("voice_responses_enabled"),
-                    True,
-                ),
-            }
-
-    if not telegram_chat_id:
-        telegram_chat_id = telegram_user_id
-
-    return telegram_user_id, telegram_chat_id, voice_preferences
+        except Exception as error:
+            if isinstance(error, HttpJsonError):
+                if error.status == 404:
+                    raise TelegramChannelNotLinked("telegram_not_linked") from error
+                if error.status in (401, 403) or error.payload.get("code") == "telegram_mapping_unavailable":
+                    raise
+            if not telegram_user_id:
+                raise
+            voice_preferences["speech_unavailable"] = "voice_route_unavailable"
+            logger.warning("Scheduler speaking route unavailable: class=%s", type(error).__name__)
+        else:
+            telegram_user_id = telegram_user_id or _coerce_id(response.get("telegram_user_id") or response.get("telegramUserId"))
+            telegram_chat_id = telegram_chat_id or _coerce_id(response.get("telegram_chat_id") or response.get("telegramChatId"))
+            current = response.get("voice_preferences") or {}
+            voice_preferences.update(
+                always_voice_response=_coerce_bool(current.get("always_voice_response"), False),
+                voice_responses_enabled=_coerce_bool(current.get("voice_responses_enabled"), True),
+            )
+            if resolve_voice and response.get("speech_unavailable") == "voice_route_unavailable":
+                voice_preferences["speech_unavailable"] = "voice_route_unavailable"
+            elif resolve_voice:
+                route = response.get("voiceRoute")
+                tts = route.get("tts") if isinstance(route, dict) else None
+                if (isinstance(tts, dict) and isinstance(tts.get("provider"), str)
+                        and tts["provider"].strip() and tts.get("source") in ("saved", "default")):
+                    voice_preferences["voice_route"] = {"tts": {
+                        "provider": tts["provider"], "variant": tts.get("variant"), "source": tts["source"],
+                    }}
+                else:
+                    voice_preferences["speech_unavailable"] = "voice_route_invalid"
+    return telegram_user_id, telegram_chat_id or telegram_user_id, voice_preferences
 
 
 def _should_send_scheduler_voice(text: str, voice_preferences: Dict[str, bool]) -> bool:
@@ -1523,62 +1510,21 @@ def _should_send_scheduler_voice(text: str, voice_preferences: Dict[str, bool]) 
     return always_voice
 
 
-def _synthesize_tts(text: str, timeout_s: int) -> Optional[bytes]:
+def _synthesize_tts(text: str, timeout_s: int, *, voice_route=None, diagnostics=None) -> Optional[bytes]:
     if not text or not text.strip():
         return None
-
-    api_key = (os.getenv("CARTESIA_API_KEY") or "").strip()
-    voice_id = (
-        os.getenv("VIVENTIUM_CARTESIA_VOICE_ID")
-        or os.getenv("CARTESIA_VOICE_ID")
-        or ""
-    ).strip()
-    if not api_key or not voice_id:
-        return None
-
-    api_url = (
-        os.getenv("VIVENTIUM_CARTESIA_API_URL")
-        or "https://api.cartesia.ai/tts/bytes"
-    ).strip()
-    api_version = (os.getenv("VIVENTIUM_CARTESIA_API_VERSION") or "2024-06-10").strip()
-    model_id = (os.getenv("VIVENTIUM_CARTESIA_MODEL_ID") or "sonic-2").strip()
-    emotion = (os.getenv("VIVENTIUM_CARTESIA_EMOTION") or "neutral").strip()
-    sample_rate = int(os.getenv("VIVENTIUM_CARTESIA_SAMPLE_RATE", "24000") or "24000")
-    speed = float(os.getenv("VIVENTIUM_CARTESIA_SPEED", "0.9") or "0.9")
-    volume = float(os.getenv("VIVENTIUM_CARTESIA_VOLUME", "0.15") or "0.15")
-
-    payload = {
-        "model_id": model_id,
-        "transcript": text,
-        "voice": {"mode": "id", "id": voice_id},
-        "output_format": {
-            "container": "wav",
-            "encoding": "pcm_s16le",
-            "sample_rate": sample_rate,
-        },
-        "language": "en",
-        "speed": "normal",
-        "generation_config": {
-            "speed": speed,
-            "volume": volume,
-            "emotion": emotion,
-        },
-    }
-    headers = {
-        "Cartesia-Version": api_version,
-        "X-API-Key": api_key,
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    async def bounded_synthesis():
+        return await asyncio.wait_for(_telegram_tts.synthesize_speech(
+            text, "scheduler", timeout=timeout_s, voice_route=voice_route,
+            environment=os.environ, diagnostics=diagnostics, deadline=deadline,
+        ), timeout=max(0.0, deadline - time.monotonic()))
     try:
-        return _post_bytes(
-            api_url,
-            json.dumps(payload).encode("utf-8"),
-            headers,
-            timeout_s,
-        )
-    except Exception as exc:
-        logger.warning("Scheduler Cartesia TTS failed: %s", exc)
+        return asyncio.run(bounded_synthesis())
+    except Exception as error:
+        if diagnostics is not None:
+            diagnostics["error_class"] = type(error).__name__
+        logger.warning("Scheduler TTS unavailable: class=%s", type(error).__name__)
         return None
 
 
@@ -1788,6 +1734,58 @@ def _scheduler_followup_poll_config(task: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _has_settled_quiet_followup(
+    state: Dict[str, Any], message_id: str, conversation_id: str
+) -> bool:
+    """Trust only the owning parent's completed, non-visible schema-1 decision."""
+    if not message_id or not conversation_id:
+        return False
+    if state.get("messageId") != message_id or state.get("conversationId") != conversation_id:
+        return False
+    if "followUp" not in state or state["followUp"] is not None:
+        return False
+    decision = state.get("followUpDecision")
+    if not isinstance(decision, dict) or (
+        decision.get("tag") != "CortexFollowupDecision"
+        or type(decision.get("schemaVersion")) is not int
+        or decision["schemaVersion"] != 1
+        or decision.get("parentMessageId") != message_id
+        or decision.get("conversationId") != conversation_id
+        or decision.get("result") not in {"skipped", "suppressed", "empty"}
+        or type(decision.get("finalLength")) is not int
+        or decision["finalLength"] != 0
+        or decision.get("forceVisibleFollowUp") is not False
+        or decision.get("generationFailed") is not False
+        or decision.get("hasErrors") is not False
+    ):
+        return False
+    parts = state.get("cortexParts")
+    if not isinstance(parts, list) or any(
+        not isinstance(part, dict)
+        or part.get("type") not in _CORTEX_PART_TYPES
+        or part.get("status") != "complete"
+        for part in parts
+    ):
+        return False
+    summary = state.get("insightDeliverySummary")
+    deliveries = state.get("insightDeliveries")
+    if not isinstance(summary, dict) or not isinstance(deliveries, list):
+        return False
+    if any(type(summary.get(key)) is not int or summary[key] < 0
+           for key in ("total", "pending", "claimed", "sent", "dropped")):
+        return False
+    if summary["pending"] != 0 or summary["claimed"] != 0:
+        return False
+    if any(not isinstance(item, dict) or item.get("status") not in {"sent", "dropped"}
+           for item in deliveries):
+        return False
+    return (
+        summary["total"] == len(deliveries)
+        and summary["sent"] == sum(item["status"] == "sent" for item in deliveries)
+        and summary["dropped"] == sum(item["status"] == "dropped" for item in deliveries)
+    )
+
+
 def _poll_followup_state(
     *,
     url: str,
@@ -1798,6 +1796,8 @@ def _poll_followup_state(
     timeout_s: float,
     allow_insight_fallback: bool,
     warning_prefix: str,
+    expected_message_id: str = "",
+    expected_conversation_id: str = "",
 ) -> Dict[str, str]:
     deadline = time.monotonic() + timeout_s
     grace_start = time.monotonic()
@@ -1843,6 +1843,8 @@ def _poll_followup_state(
             if _has_active_cortex(parts):
                 grace_start = time.monotonic()
 
+        if _has_settled_quiet_followup(state, expected_message_id, expected_conversation_id):
+            break
         if time.monotonic() - grace_start >= grace_s:
             break
 
@@ -2169,6 +2171,8 @@ def _poll_scheduler_followup(
         timeout_s=poll_config["timeout_s"],
         allow_insight_fallback=poll_config["allow_insight_fallback"],
         warning_prefix="Scheduler",
+        expected_message_id=message_id,
+        expected_conversation_id=conversation_id or "",
     )
 
 
@@ -2242,6 +2246,12 @@ def _run_scheduler_generation(
         "clientTimestamp": run_context.get("run_started_at_utc"),
         "scheduledDueAt": run_context.get("scheduled_due_at_utc"),
         "schedulerRunContext": run_context,
+        # Carry the existing enclosing stream wait into Core's synchronous continuity stages.
+        # This does not extend the scheduler deadline or its durable run lease.
+        "authoringDeadlineAt": (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=int(os.getenv("SCHEDULER_STREAM_TIMEOUT_S", "600")))
+        ).isoformat(),
         "deliveryChannels": _normalize_dispatch_channels(task.get("channel")),
         **({"recurrenceState": bounded_recurrence_state} if bounded_recurrence_state else {}),
     }
@@ -2527,6 +2537,8 @@ def _poll_telegram_followup(
         timeout_s=timeout_s,
         allow_insight_fallback=allow_insight_fallback,
         warning_prefix="Telegram",
+        expected_message_id=message_id,
+        expected_conversation_id=conversation_id if conversation_id and conversation_id != "new" else "",
     )
 # === VIVENTIUM NOTE ===
 
@@ -2602,19 +2614,28 @@ def _send_telegram_audio(chat_id: str, audio_bytes: bytes, timeout_s: int) -> Op
     if not audio_bytes:
         raise RuntimeError("Audio payload is empty")
     url = f"https://api.telegram.org/bot{token}/sendAudio"
+    media = package_telegram_audio(audio_bytes, timeout_s=timeout_s)
     fields = {
-        "chat_id": str(chat_id),
-        "title": "Voice",
+        "chat_id": str(chat_id), "title": "Voice", "duration": str(media.duration),
     }
-    response = _post_multipart(
-        url,
-        fields=fields,
-        file_field="audio",
-        filename="voice.wav",
-        file_bytes=audio_bytes,
-        file_content_type="audio/wav",
-        timeout_s=timeout_s,
-    )
+    logger.info("Telegram media: format=%s duration_s=%.6f bytes=%s",
+                media.content_type, media.duration_seconds, len(media.data))
+    try:
+        response = _post_multipart(
+            url,
+            fields=fields,
+            file_field="audio",
+            filename=media.filename,
+            file_bytes=media.data,
+            file_content_type=media.content_type,
+            timeout_s=timeout_s,
+        )
+    except HttpJsonError as error:
+        payload = error.payload if isinstance(error.payload, dict) else {}
+        code = payload.get("error_code")
+        if payload.get("ok") is False and type(code) is int and 400 <= code < 500:
+            raise TelegramDefiniteRejection("telegram_audio_rejected") from error
+        raise
     if isinstance(response, dict) and response.get("ok") is False:
         description = str(response.get("description") or "")
         raise TelegramDefiniteRejection(description or "Telegram sendAudio failed")
@@ -2636,12 +2657,19 @@ def _send_telegram_voice_or_text(
     if not _should_send_scheduler_voice(text, voice_preferences):
         return _send_telegram_message(chat_id, text, timeout_s)
 
-    audio_bytes = _synthesize_tts(text, timeout_s)
+    if voice_preferences.get("speech_unavailable"):
+        logger.warning("Telegram conversational speech unavailable: %s", voice_preferences["speech_unavailable"])
+        return _send_telegram_message(chat_id, text, timeout_s)
+    diagnostics = voice_preferences.setdefault("_speech_diagnostics", {})
+    audio_bytes = _synthesize_tts(text, timeout_s, voice_route=voice_preferences.get("voice_route"),
+                                  diagnostics=diagnostics)
+    logger.info("Scheduler speech route: %s", json.dumps(diagnostics, sort_keys=True))
     if audio_bytes:
         try:
             return _send_telegram_audio(chat_id, audio_bytes, timeout_s)
-        except TelegramDefiniteRejection as exc:
-            logger.warning("Telegram sendAudio failed, falling back to text: %s", exc)
+        except (TelegramDefiniteRejection, TelegramAudioError) as exc:
+            diagnostics["presentation_fallback"] = type(exc).__name__
+            logger.warning("Telegram speech failed before send or was rejected: class=%s", type(exc).__name__)
 
     return _send_telegram_message(chat_id, text, timeout_s)
 
@@ -3080,6 +3108,8 @@ def _glasshive_workspace_schedule_metadata(task: Dict[str, Any]) -> Dict[str, An
 
 
 _CODEX_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+# Keep the native Claude Code effort contract, including configured Opus High.
+_CLAUDE_REASONING_EFFORTS = {"default", "low", "medium", "high", "xhigh", "max"}
 
 
 def _workbench_codex_reasoning_effort(value: Any = None) -> str:
@@ -3395,10 +3425,10 @@ def _glasshive_profile_reasoning_effort(profile: str, value: Any = None) -> str:
         return _workbench_codex_reasoning_effort(value)
     if clean_profile == "claude-code":
         configured = str(os.getenv("WPR_CLAUDE_CODE_EFFORT") or "").strip().lower()
-        if configured in {"default", "max"}:
+        if configured in _CLAUDE_REASONING_EFFORTS:
             return configured
         requested = str(value or "").strip().lower()
-        return requested if requested in {"default", "max"} else ""
+        return requested if requested in _CLAUDE_REASONING_EFFORTS else ""
     return str(value or "").strip().lower()
 
 
@@ -4374,6 +4404,12 @@ def _dispatch_glasshive_workspace_task(task: Dict[str, Any]) -> Dict[str, Any]:
 # === VIVENTIUM END ===
 
 
+def _scheduler_presentation_kind(value: Any = "conversation") -> str:
+    if value not in ("conversation", "status"):
+        raise ValueError("Unsupported scheduler presentation kind")
+    return value
+
+
 def _prepare_generated_visibility(
     task: Dict[str, Any],
     final_text: str,
@@ -4384,7 +4420,9 @@ def _prepare_generated_visibility(
     followup_text_fallback_reason: str = "",
     suppressed_fallback_reason: str = "",
     date_guard: Optional[Dict[str, Any]] = None,
+    presentation_kind: str = "conversation",
 ) -> Dict[str, Any]:
+    presentation_kind = _scheduler_presentation_kind(presentation_kind)
     raw_final_text = final_text.strip() if isinstance(final_text, str) else ""
     raw_followup_text = followup_text.strip() if isinstance(followup_text, str) else ""
 
@@ -4440,6 +4478,7 @@ def _prepare_generated_visibility(
         fallback_reason = _fallback_reason(final_text_fallback_reason or followup_text_fallback_reason)
 
     return {
+        "presentation_kind": presentation_kind,
         "raw_final_text": raw_final_text,
         "raw_followup_text": raw_followup_text,
         "final_text": final_visible_text,
@@ -4594,6 +4633,9 @@ def _deliver_telegram_generated_text(
     visibility: Dict[str, Any],
     ledger_channel: str = "telegram",
 ) -> Dict[str, Any]:
+    presentation_kind = _scheduler_presentation_kind(
+        visibility.get("presentation_kind", "conversation")
+    )
     final_text = visibility.get("final_text") or ""
     followup_text = visibility.get("followup_text") or ""
     send_timeout_s = int(os.getenv("SCHEDULER_TELEGRAM_SEND_TIMEOUT_S", "15"))
@@ -4609,11 +4651,17 @@ def _deliver_telegram_generated_text(
             task,
             base_url,
             timeout_s,
+            resolve_voice=presentation_kind == "conversation",
         )
         if not telegram_user_id:
             raise RuntimeError("telegram_user_id is required for Telegram dispatch")
         if not telegram_chat_id:
             raise RuntimeError("telegram_chat_id is required for Telegram dispatch")
+        logger.info(
+            "[scheduling-cortex] Telegram presentation: kind=%s route=%s",
+            presentation_kind,
+            "text" if presentation_kind == "status" else "voice_preference",
+        )
 
     parts = _split_telegram_message(final_text) + _split_telegram_message(followup_text)
     run_id = str(task.get("_scheduled_prompt_run_id") or "").strip()
@@ -4632,7 +4680,10 @@ def _deliver_telegram_generated_text(
                     {
                         "chat_id": str(telegram_chat_id),
                         "text": part,
-                        "voice_preferences": voice_preferences,
+                        **(
+                            {"presentation_kind": presentation_kind}
+                            if presentation_kind != "conversation" else {}
+                        ),
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -4647,7 +4698,7 @@ def _deliver_telegram_generated_text(
                 payload_hash=payload_hash,
                 lease_owner=delivery_lease_owner,
                 now=to_utc_iso(datetime.now(timezone.utc)),
-                lease_seconds=max(30, send_timeout_s + 15),
+                lease_seconds=max(30, 4 * send_timeout_s + 15),
             )
             delivery_key = str(claim.get("delivery_key") or "")
             if not claim.get("claimed"):
@@ -4661,12 +4712,17 @@ def _deliver_telegram_generated_text(
                 delivery_unknown_reason = str(claim.get("reason") or "delivery_unknown")
                 break
         try:
-            sent_message_id = _send_telegram_voice_or_text(
-                str(telegram_chat_id),
-                part,
-                send_timeout_s,
-                voice_preferences,
-            )
+            if presentation_kind == "status":
+                sent_message_id = _send_telegram_message(
+                    str(telegram_chat_id), part, send_timeout_s
+                )
+            else:
+                sent_message_id = _send_telegram_voice_or_text(
+                    str(telegram_chat_id),
+                    part,
+                    send_timeout_s,
+                    voice_preferences,
+                )
         except Exception as exc:
             if delivery_storage is not None and delivery_key:
                 delivery_storage.mark_scheduled_prompt_delivery_unknown(
@@ -4750,6 +4806,7 @@ def _deliver_telegram_generated_text(
 
     detail = {
         "channel": "telegram",
+        "presentation_kind": presentation_kind,
         "outcome": outcome,
         "reason": reason,
         "generated_text": visibility.get("generated_text"),
@@ -4765,6 +4822,12 @@ def _deliver_telegram_generated_text(
         "fallback_delivered": bool(visibility.get("fallback_delivered")),
         "delivery_receipt_state": delivery_receipt_state,
     }
+    if voice_preferences.get("_speech_diagnostics"):
+        detail["speech"] = voice_preferences["_speech_diagnostics"]
+    if voice_preferences.get("voice_route"):
+        detail["voice_route"] = voice_preferences["voice_route"]
+    if voice_preferences.get("speech_unavailable"):
+        detail["speech_unavailable"] = voice_preferences["speech_unavailable"]
     if delivery_unknown_reason:
         detail["delivery_unknown_reason"] = delivery_unknown_reason
     if telegram_chat_id:
@@ -4808,7 +4871,8 @@ def deliver_unconfirmed_delivery_notice(
     ).rstrip("/")
     timeout_s = int(os.getenv("SCHEDULER_HTTP_TIMEOUT_S", "15"))
     visibility = _prepare_generated_visibility(
-        task, _unconfirmed_delivery_notice_text(conversation_saved), ""
+        task, _unconfirmed_delivery_notice_text(conversation_saved), "",
+        presentation_kind="status",
     )
     try:
         detail = _deliver_telegram_generated_text(
@@ -4825,6 +4889,7 @@ def deliver_unconfirmed_delivery_notice(
         return {"outcome": "failed", "reason": type(exc).__name__}
     return {
         "outcome": str(detail.get("outcome") or "failed"),
+        "presentation_kind": "status",
         "reason": str(detail.get("delivery_unknown_reason") or detail.get("reason") or ""),
     }
 # === VIVENTIUM END ===
@@ -4873,7 +4938,9 @@ def scheduled_failure_result(
             }
         else:
             try:
-                visibility = _prepare_generated_visibility(task, notice, "")
+                visibility = _prepare_generated_visibility(
+                    task, notice, "", presentation_kind="status"
+                )
                 telegram_detail = _deliver_telegram_generated_text(
                     task,
                     base_url,

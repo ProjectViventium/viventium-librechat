@@ -3773,6 +3773,7 @@ async function prepareCortexConversationProviderCapability({
   capability,
   requestBody,
   nativeTools,
+  privateStructuredResponse = false,
   signal = null,
   cancellationReq = req,
   attachBundle = attachConversationProviderCapabilityBundle,
@@ -3811,6 +3812,7 @@ async function prepareCortexConversationProviderCapability({
     capability,
     requestBody,
     ...(nativeTools !== undefined ? { nativeTools } : {}),
+    ...(privateStructuredResponse ? { privateStructuredResponse: true } : {}),
   };
   const attached = await attachBundle(args);
   const idempotencyKey = String(requestBody?.viventiumGlassHiveIdempotencyKey || '').trim();
@@ -3972,7 +3974,8 @@ async function executeCortexOnce(params, dependencies) {
   } else {
     result = await invoke();
   }
-  return nativeOwnership.state !== 'none' && result && typeof result === 'object'
+  // Return the owning resolved state even when no native request was admitted.
+  return result && typeof result === 'object'
     ? { ...result, nativeOwnership: nativeOwnership.state }
     : result;
 }
@@ -4616,6 +4619,9 @@ async function runCortexAttempt(
       capability: cortexCapability,
       requestBody: cortexRequestBody,
       nativeTools,
+      // Private structured state is owned by the internal result consumer, never a user reply.
+      privateStructuredResponse:
+        completedResultPolicy === 'internal' && insightMode === 'structured' && nativeTools === false,
       signal: abortController.signal,
       cancellationReq: cortexCancellationReq,
     });

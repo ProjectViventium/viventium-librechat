@@ -5,6 +5,7 @@
  * === VIVENTIUM END === */
 
 import { createHash } from 'crypto';
+import { isDeepStrictEqual } from 'util';
 
 const CALLBACK_REF = /^callback_sha256:[a-f0-9]{64}$/;
 const RESULT_KEY = /^ghtr_[a-f0-9]{64}$/;
@@ -26,6 +27,8 @@ const BINDING_KEYS = new Set([
   'resultRevision',
   'effectGeneration',
 ]);
+const ATTENTION_KEYS = new Set(['kind', 'originRef', 'workRef', 'workerId', 'runId',
+  'callbackRef', 'event', 'workTerminal', 'evidenceId']);
 const PRESENTATION_KEYS = new Set([
   'version',
   'presentationRef',
@@ -52,6 +55,20 @@ export interface VoiceWorkerCompletionBindingV1 {
   effectGeneration: number;
 }
 
+/** Accepted nonterminal evidence; does not grant a Worker result or operation effect. */
+export interface VoiceWorkerAttentionBindingV1 {
+  kind: 'nonterminal_attention';
+  originRef: string;
+  workRef: string;
+  workerId: string;
+  runId: string;
+  callbackRef: string;
+  event: 'run.needs_input';
+  workTerminal: false;
+  evidenceId: string;
+}
+export type VoiceWorkerPresentationBindingV1 = VoiceWorkerCompletionBindingV1 | VoiceWorkerAttentionBindingV1;
+
 export interface VoiceWorkerCompletionPresentationV1 {
   version: 1;
   presentationRef: string;
@@ -60,7 +77,7 @@ export interface VoiceWorkerCompletionPresentationV1 {
   revision: 1;
   responseMessageId: string;
   responseDigest: string;
-  bindings: ReadonlyArray<Readonly<VoiceWorkerCompletionBindingV1>>;
+  bindings: ReadonlyArray<Readonly<VoiceWorkerPresentationBindingV1>>;
 }
 
 export interface VoiceWorkerCompletionPresentationAuthority {
@@ -72,7 +89,7 @@ export interface VoiceWorkerCompletionPresentationAuthority {
 }
 
 export interface BuildVoiceWorkerCompletionPresentationInput extends VoiceWorkerCompletionPresentationAuthority {
-  bindings: ReadonlyArray<VoiceWorkerCompletionBindingV1>;
+  bindings: ReadonlyArray<VoiceWorkerPresentationBindingV1>;
 }
 
 function requiredText(value: string, code: string): string {
@@ -95,7 +112,21 @@ function exactKeys(value: object, keys: Set<string>): boolean {
   return actual.length === keys.size && actual.every((key) => keys.has(key));
 }
 
-function canonicalBinding(value: VoiceWorkerCompletionBindingV1): VoiceWorkerCompletionBindingV1 {
+function canonicalBinding(value: VoiceWorkerPresentationBindingV1): VoiceWorkerPresentationBindingV1 {
+  if (value && 'kind' in value && value.kind === 'nonterminal_attention') {
+    if (!exactKeys(value, ATTENTION_KEYS) || value.event !== 'run.needs_input' ||
+        value.workTerminal !== false || !CALLBACK_REF.test(value.callbackRef) ||
+        !/^ghe_[a-f0-9]{32}$/.test(value.evidenceId)) {
+      throw new Error('voice_worker_completion_binding_invalid');
+    }
+    return { kind: value.kind,
+      originRef: requiredText(value.originRef, 'voice_worker_completion_binding_invalid'),
+      workRef: requiredText(value.workRef, 'voice_worker_completion_binding_invalid'),
+      workerId: requiredText(value.workerId, 'voice_worker_completion_binding_invalid'),
+      runId: requiredText(value.runId, 'voice_worker_completion_binding_invalid'),
+      callbackRef: value.callbackRef, event: value.event, workTerminal: false, evidenceId: value.evidenceId };
+  }
+  const terminal = value as VoiceWorkerCompletionBindingV1;
   if (
     !value ||
     typeof value !== 'object' ||
@@ -105,28 +136,28 @@ function canonicalBinding(value: VoiceWorkerCompletionBindingV1): VoiceWorkerCom
     throw new Error('voice_worker_completion_binding_invalid');
   }
   const binding = {
-    originRef: requiredText(value.originRef, 'voice_worker_completion_binding_invalid'),
-    workRef: requiredText(value.workRef, 'voice_worker_completion_binding_invalid'),
-    workerId: requiredText(value.workerId, 'voice_worker_completion_binding_invalid'),
-    runId: requiredText(value.runId, 'voice_worker_completion_binding_invalid'),
-    callbackRef: requiredText(value.callbackRef, 'voice_worker_completion_binding_invalid'),
-    attemptNumber: positiveInteger(value.attemptNumber, 'voice_worker_completion_binding_invalid'),
-    resultKey: requiredText(value.resultKey, 'voice_worker_completion_binding_invalid'),
+    originRef: requiredText(terminal.originRef, 'voice_worker_completion_binding_invalid'),
+    workRef: requiredText(terminal.workRef, 'voice_worker_completion_binding_invalid'),
+    workerId: requiredText(terminal.workerId, 'voice_worker_completion_binding_invalid'),
+    runId: requiredText(terminal.runId, 'voice_worker_completion_binding_invalid'),
+    callbackRef: requiredText(terminal.callbackRef, 'voice_worker_completion_binding_invalid'),
+    attemptNumber: positiveInteger(terminal.attemptNumber, 'voice_worker_completion_binding_invalid'),
+    resultKey: requiredText(terminal.resultKey, 'voice_worker_completion_binding_invalid'),
     acceptedOperationId: requiredText(
-      value.acceptedOperationId,
+      terminal.acceptedOperationId,
       'voice_worker_completion_binding_invalid',
     ),
     terminalCallbackId: requiredText(
-      value.terminalCallbackId,
+      terminal.terminalCallbackId,
       'voice_worker_completion_binding_invalid',
     ),
-    resultDigest: requiredText(value.resultDigest, 'voice_worker_completion_binding_invalid'),
+    resultDigest: requiredText(terminal.resultDigest, 'voice_worker_completion_binding_invalid'),
     resultRevision: positiveInteger(
-      value.resultRevision,
+      terminal.resultRevision,
       'voice_worker_completion_binding_invalid',
     ),
     effectGeneration: positiveInteger(
-      value.effectGeneration,
+      terminal.effectGeneration,
       'voice_worker_completion_binding_invalid',
     ),
   };
@@ -143,8 +174,8 @@ function canonicalBinding(value: VoiceWorkerCompletionBindingV1): VoiceWorkerCom
 }
 
 function canonicalBindings(
-  values: ReadonlyArray<VoiceWorkerCompletionBindingV1>,
-): VoiceWorkerCompletionBindingV1[] {
+  values: ReadonlyArray<VoiceWorkerPresentationBindingV1>,
+): VoiceWorkerPresentationBindingV1[] {
   if (!Array.isArray(values) || values.length < 1 || values.length > MAX_BINDINGS) {
     throw new Error('voice_worker_completion_bindings_invalid');
   }
@@ -161,11 +192,11 @@ function canonicalBindings(
     binding.workerId,
     binding.runId,
     binding.callbackRef,
-    binding.resultKey,
+    'kind' in binding ? binding.evidenceId : binding.resultKey,
   ]);
   const unique = new Set(identities.map((identity) => JSON.stringify(identity)));
   const workRefs = new Set(bindings.map((binding) => binding.workRef));
-  const resultKeys = new Set(bindings.map((binding) => binding.resultKey));
+  const resultKeys = new Set(bindings.map((binding) => 'kind' in binding ? binding.evidenceId : binding.resultKey));
   if (
     unique.size !== bindings.length ||
     workRefs.size !== bindings.length ||
@@ -179,7 +210,7 @@ function canonicalBindings(
 function presentationIdentity(
   authority: VoiceWorkerCompletionPresentationAuthority,
   responseDigest: string,
-  bindings: ReadonlyArray<VoiceWorkerCompletionBindingV1>,
+  bindings: ReadonlyArray<VoiceWorkerPresentationBindingV1>,
 ): string {
   return JSON.stringify({
     version: 1,
@@ -245,7 +276,7 @@ export function verifyVoiceWorkerCompletionPresentation(
       ...authority,
       bindings: [...value.bindings],
     });
-    return JSON.stringify(value) === JSON.stringify(expected);
+    return isDeepStrictEqual(value, expected);
   } catch {
     return false;
   }

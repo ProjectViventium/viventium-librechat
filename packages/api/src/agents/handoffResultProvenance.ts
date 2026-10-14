@@ -18,6 +18,7 @@ interface HandoffContext {
 interface HandoffPrototype {
   agentContexts?: Map<string, { name?: string }>;
   handoffEdges?: GraphEdge[];
+  createCallModel?(agentId?: string): (state: GraphState, config?: RunnableConfig) => Promise<unknown>;
   createWorkflow?(): { nodes: { [agentId: string]: { bound: Runnable<GraphState, GraphState | Command> } } };
   createHandoffToolsForEdge(
     edge: AgentGraphEdge, sourceAgentId: string, sourceAgentName: string,
@@ -34,11 +35,68 @@ interface PendingConsult {
   call: AIMessage;
   transfer: ToolMessage;
   resultId?: string;
-  result?: AIMessage;
+  result?: AIMessage | ToolMessage;
   scope: string;
   key: string;
   receiverScope?: string;
   resultUserMessageId?: string;
+}
+
+// These are typed public native-provider codes, not exception text or HTTP tool errors.
+const consultProviderCodes = new Map([
+  ['rate_limit_error', 'provider_rate_limited'],
+  ['rate_limit_exceeded', 'provider_rate_limited'],
+  ['provider_rate_limited', 'provider_rate_limited'],
+  ['provider_quota_exhausted', 'provider_quota_exhausted'],
+  ['provider_temporarily_unavailable', 'provider_temporarily_unavailable'],
+  ['provider_response_failed', 'provider_response_failed'],
+]);
+
+export function nativeConsultProviderFailure(error: unknown): string | null {
+  const queue: unknown[] = [error];
+  const seen = new Set<object>();
+  let code: string | null = null;
+  for (let index = 0; index < queue.length && index < 16; index++) {
+    const value = queue[index];
+    if (!value || typeof value !== 'object' || seen.has(value)) continue;
+    seen.add(value);
+    const item = value as Record<string, unknown>;
+    if (item.name === 'AbortError' || item.code === 'ABORT_ERR') return null;
+    for (const field of ['errorClass', 'error_class', 'errorCode', 'error_code', 'code', 'type']) {
+      if (item[field] == null) continue;
+      if (typeof item[field] !== 'string') return null;
+      const projected = consultProviderCodes.get(item[field] as string);
+      if (!projected || (code && projected !== code)) return null;
+      code = projected;
+    }
+    queue.push(item.cause, item.error);
+    if (item.response && typeof item.response === 'object') {
+      const response = item.response as Record<string, unknown>;
+      queue.push(response.data);
+    }
+  }
+  return queue.length > 16 ? null : code;
+}
+
+function consultScope(config?: RunnableConfig): string | null {
+  const runId = config?.configurable?.run_id;
+  const threadId = config?.configurable?.thread_id;
+  return typeof runId === 'string' && runId && typeof threadId === 'string' && threadId
+    ? JSON.stringify([threadId, runId]) : null;
+}
+
+function declaredHiddenReturn(graph: HandoffPrototype, active: PendingConsult,
+  config?: RunnableConfig): boolean {
+  const presentation = config?.configurable;
+  const visible = presentation?.visible_agent_ids;
+  return presentation?.hide_sequential_outputs === true && Array.isArray(visible) &&
+    !visible.includes(active.childId) && visible.includes(presentation.main_agent_id) &&
+    graph.agentContexts?.has(active.callerId) === true &&
+    graph.handoffEdges?.some((edge) => {
+      const from = typeof edge.from === 'string' ? [edge.from] : edge.from ?? [];
+      const to = typeof edge.to === 'string' ? [edge.to] : edge.to ?? [];
+      return edge.condition == null && from.includes(active.childId) && to.includes(active.callerId);
+    }) === true;
 }
 
 function currentUserId(messages: BaseMessage[]): string | undefined {
@@ -92,6 +150,7 @@ function completedConsultContext(
       part != null && typeof part === 'object' && part.type === 'text') as JsonValue);
   const result = new ToolMessage({ ...consult.transfer, content,
     response_metadata: consult.result.response_metadata,
+    ...(isToolMessage(consult.result) ? { status: consult.result.status } : {}),
     additional_kwargs: { ...consult.result.additional_kwargs, ...consult.transfer.additional_kwargs } });
   filteredMessages.splice(callIndex, 1, consult.call, result);
   return { filteredMessages, instructions: null, sourceAgentName, parallelSiblings: [] };
@@ -215,6 +274,27 @@ export function installLibreChatAgentsHandoffResultPatch(module: HandoffModule):
     const restored = restoreCompletedHandoffPair(messages, result.filteredMessages, receiverId);
     return restored ? { ...result, filteredMessages: restored } : result;
   };
+  // Only the final model-attempt boundary establishes provider origin. A tool may throw
+  // the same API code; catching it at the whole subgraph boundary would hide a tool failure.
+  const providerFailures = new WeakMap<object, { graph: object; childId: string; scope: string; code: string; active: PendingConsult }>();
+  const createCallModel = prototype.createCallModel;
+  if (typeof createCallModel === 'function') {
+    prototype.createCallModel = function (childId = 'default') {
+      const invoke = createCallModel.call(this, childId);
+      return async (state, config) => {
+        const scope = consultScope(config);
+        const active = scope ? consults.get(this)?.get(JSON.stringify([scope, childId])) : undefined;
+        try { return await invoke(state, config); }
+        catch (error) {
+          const code = nativeConsultProviderFailure(error);
+          if (error && typeof error === 'object' && scope && code && active && !config?.signal?.aborted &&
+              state.messages.some((message) => message.getType() === 'human' && message.id === active.userMessageId))
+            providerFailures.set(error, { graph: this, childId, scope, code, active });
+          throw error;
+        }
+      };
+    };
+  }
   const createWorkflow = prototype.createWorkflow;
   if (typeof createWorkflow === 'function') {
     prototype.createWorkflow = function () {
@@ -249,12 +329,30 @@ export function installLibreChatAgentsHandoffResultPatch(module: HandoffModule):
           const userAtStart = currentUserId(state.messages);
           let result: GraphState | Command;
           try { result = await invoke(state, config); }
-          catch (error) { current.delete(key); throw error; }
-          if (config?.signal?.aborted) { current.delete(key); return result; }
+          catch (error) {
+            const failure = error && typeof error === 'object' ? providerFailures.get(error) : null;
+            if (error && typeof error === 'object') providerFailures.delete(error);
+            if (!failure || failure.graph !== this || failure.childId !== childId ||
+                failure.scope !== scope || !active || failure.active !== active || current.get(key) !== active ||
+                config?.signal?.aborted || currentUserId(state.messages) !== userAtStart ||
+                userAtStart !== active.userMessageId || !declaredHiddenReturn(this, active, config)) {
+              if (current.get(key) === active) current.delete(key);
+              throw error;
+            }
+            const failed = new ToolMessage({ ...active.transfer, status: 'error',
+              content: JSON.stringify({ status: 'failed', error: { code: failure.code } }),
+              additional_kwargs: { ...active.transfer.additional_kwargs,
+                handoff_failure: { version: 1, code: failure.code } } });
+            active.resultId = failed.id;
+            active.result = failed;
+            active.resultUserMessageId = userAtStart;
+            return new Command({ goto: active.callerId, update: { ...state,
+              messages: [...state.messages.filter((message) => message.id !== failed.id), failed] } });
+          }
+          if (config?.signal?.aborted) { if (current.get(key) === active) current.delete(key); return result; }
           if (isCommand(result)) return result;
           const terminal = result.messages?.at(-1);
           const presentation = config?.configurable;
-          const visible = presentation?.visible_agent_ids;
           if (childId === presentation?.main_agent_id && terminal && isAIMessage(terminal) &&
               !terminal.tool_calls?.length) {
             for (const [id, entry] of current) if (entry.scope === scope) current.delete(id);
@@ -264,14 +362,7 @@ export function installLibreChatAgentsHandoffResultPatch(module: HandoffModule):
               !terminal || !isAIMessage(terminal) || terminal.tool_calls?.length || !terminal.id ||
               terminal.id === active.call.id || terminal.id === active.transfer.id ||
               !result.messages.some((message) => message.getType() === 'human' && message.id === active.userMessageId) ||
-              presentation?.hide_sequential_outputs !== true || !Array.isArray(visible) ||
-              visible.includes(childId) || !visible.includes(presentation.main_agent_id) ||
-              !this.agentContexts?.has(active.callerId) ||
-              !this.handoffEdges?.some((edge) => {
-                const from = typeof edge.from === 'string' ? [edge.from] : edge.from ?? [];
-                const to = typeof edge.to === 'string' ? [edge.to] : edge.to ?? [];
-                return edge.condition == null && from.includes(childId) && to.includes(active.callerId); 
-              })) return result;
+              !declaredHiddenReturn(this, active, config)) return result;
           active.resultId = terminal.id;
           active.result = terminal;
           active.resultUserMessageId = currentUserId(result.messages);

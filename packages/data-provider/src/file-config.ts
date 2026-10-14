@@ -207,7 +207,9 @@ export const documentParserMimeTypes = [
   /^application\/vnd\.oasis\.opendocument\.spreadsheet$/,
 ];
 
-export const defaultTextMimeTypes = [/^[\w.-]+\/[\w.-]+$/];
+/* === VIVENTIUM START: Admit standard structured MIME suffixes; extraction owns format safety. === */
+export const defaultTextMimeTypes = [/^[\w.+-]+\/[\w.+-]+$/];
+/* === VIVENTIUM END === */
 
 export const defaultSTTMimeTypes = [audioMimeTypes];
 

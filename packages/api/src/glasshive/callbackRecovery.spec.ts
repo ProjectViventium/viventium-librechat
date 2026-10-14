@@ -305,3 +305,60 @@ test.each(['current-pending', 'historical-only', 'correction-advances'])(
     { returnDocument: 'after' });
   },
 );
+
+
+test.each(['current', 'same-result-advanced-lease', 'newer-result', 'other-owner', 'other-followup'])(
+  'aggregate delivery projection compares exact current member snapshot: %s',
+  async (scenario) => {
+    const h = harness();
+    const binding = {
+      originRef: terminal.originRef,
+      workRef: terminal.workRef,
+      workerId: receipt.workerId,
+      runId: terminal.runId,
+      callbackRef: 'callback_sha256:' + 'a'.repeat(64),
+      attemptNumber: 1,
+      resultKey: 'ghtr_' + 'a'.repeat(64),
+      acceptedOperationId: receipt.acceptedOperationId,
+      terminalCallbackId: receipt.callbackId,
+      resultDigest: receipt.resultDigest,
+      resultRevision: 1,
+      effectGeneration: 1,
+    };
+    const current = {
+      ...terminal,
+      terminalCallbackRunId: binding.runId,
+      terminalCallbackId: binding.terminalCallbackId,
+      terminalCallbackResultDigest: binding.resultDigest,
+      terminalCallbackResultRevision: scenario === 'newer-result' ? 2 : 1,
+      terminalCallbackAcceptedOperationId: binding.acceptedOperationId,
+      terminalCallbackEffectLeaseGeneration: scenario === 'same-result-advanced-lease' ? 2 : 1,
+      ownerId: scenario === 'other-owner' ? 'another-owner' : terminal.ownerId,
+      followUpMessageId: scenario === 'other-followup' ? 'another-reply' : 'combined-reply',
+    };
+    h.projectionUpdate.mockImplementation(async (filter) =>
+      Object.entries(filter).every(([key, value]) => current[key as keyof typeof current] === value)
+        ? { ...current, deliveryState: 'sent' }
+        : null,
+    );
+    const result = await h.service.recordGlassHiveSurfaceDeliveryOutcome({
+      originRef: binding.originRef,
+      state: 'sent',
+      workerCompletion: { ownerId: terminal.ownerId, responseMessageId: 'combined-reply', binding },
+    });
+    expect(Boolean(result)).toBe(['current', 'same-result-advanced-lease'].includes(scenario));
+    expect(h.projectionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerId: terminal.ownerId,
+        workRef: binding.workRef,
+        terminalCallbackRunId: binding.runId,
+        terminalCallbackResultRevision: 1,
+        terminalCallbackId: binding.terminalCallbackId,
+        terminalCallbackAcceptedOperationId: binding.acceptedOperationId,
+        followUpMessageId: 'combined-reply',
+      }),
+      expect.any(Object),
+      expect.any(Object),
+    );
+  },
+);

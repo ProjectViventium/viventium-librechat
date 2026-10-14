@@ -352,7 +352,7 @@ export function createOrchestrationHttpHandlers(dependencies: OrchestrationHttpD
         workRef: workRef.data,
         operationId,
         ...safeAction,
-        ...(safeAction.nativeInput ? { ownerInputControl: true } : {}),
+        ownerInputControl: true,
       });
       return res.status(202).json(result);
     } catch (error) {
@@ -361,11 +361,13 @@ export function createOrchestrationHttpHandlers(dependencies: OrchestrationHttpD
       const responseStatus =
         Number.isInteger(status) && status >= 400 && status < 600 ? status : 502;
       const code = safeErrorCode(error, 'ACTIVE_WORK_ACTION_FAILED');
-      dependencies.logger.warn('[VIVENTIUM][orchestration] Active work action rejected', {
-        action: action.data.action,
-        status: responseStatus,
-        code,
-      });
+      dependencies.logger.warn(
+        `[VIVENTIUM][orchestration] Active work action rejected ${JSON.stringify({
+          action: action.data.action,
+          status: responseStatus,
+          code,
+        })}`,
+      );
       const userMessage =
         typeof value.userMessage === 'string' && value.userMessage.length <= 240
           ? value.userMessage

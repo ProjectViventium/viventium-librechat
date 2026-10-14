@@ -2,6 +2,8 @@ import React, { memo, useMemo, useRef, useEffect } from 'react';
 import { useRecoilValue } from 'recoil';
 import { useToastContext } from '@librechat/client';
 import { PermissionTypes, Permissions, apiBaseUrl } from 'librechat-data-provider';
+import type { TAttachment } from 'librechat-data-provider';
+import Image from './Image';
 import MermaidErrorBoundary from '~/components/Messages/Content/MermaidErrorBoundary';
 import CodeBlock from '~/components/Messages/Content/CodeBlock';
 import Mermaid from '~/components/Messages/Content/Mermaid';
@@ -92,6 +94,30 @@ export const codeNoExecution: React.ElementType = memo(function MarkdownCodeNoEx
 });
 codeNoExecution.displayName = 'MarkdownCodeNoExecution';
 
+/* === VIVENTIUM START === Authenticated File identity is shared by authored links and images. === */
+function importedFileForGrant(
+  attachments: TAttachment[] | undefined,
+  href: string | undefined,
+  ownerId: string | undefined,
+  messageId: string | undefined,
+) {
+  return attachments?.find(
+    (item) =>
+      item.nativeOutputFile?.version === 1 &&
+      item.nativeOutputFile.status === 'available' &&
+      item.nativeOutputFile.messageId === messageId &&
+      item.nativeOutputFile.downloadUrl === href &&
+      'user' in item &&
+      item.user === ownerId &&
+      'file_id' in item &&
+      typeof item.file_id === 'string' &&
+      item.file_id.startsWith('native_') &&
+      !!item.filename &&
+      !!item.filepath,
+  );
+}
+/* === VIVENTIUM END === */
+
 type TAnchorProps = {
   href: string;
   children: React.ReactNode;
@@ -117,19 +143,11 @@ export const a: React.ElementType = memo(function MarkdownAnchor({ href, childre
     filepath,
   } = useMemo(() => {
     /* === VIVENTIUM START === Present only the exact verified grant through the owner File API. === */
-    const imported = messageContext?.viventiumFileAttachments?.find(
-      (item) =>
-        item.nativeOutputFile?.version === 1 &&
-        item.nativeOutputFile.status === 'available' &&
-        item.nativeOutputFile.messageId === messageContext.messageId &&
-        item.nativeOutputFile.downloadUrl === href &&
-        'user' in item &&
-        item.user === user?.id &&
-        'file_id' in item &&
-        typeof item.file_id === 'string' &&
-        item.file_id.startsWith('native_') &&
-        !!item.filename &&
-        !!item.filepath,
+    const imported = importedFileForGrant(
+      messageContext?.viventiumFileAttachments,
+      href,
+      user?.id,
+      messageContext?.messageId,
     );
     if (imported && 'file_id' in imported && typeof imported.file_id === 'string') {
       return {
@@ -238,7 +256,16 @@ export const img: React.ElementType = memo(function MarkdownImage({
   className,
   style,
 }: TImageProps) {
-  // Get the base URL from the API endpoints
+  /* === VIVENTIUM START === Selected verified image grants use the existing File image viewer. === */
+  const user = useRecoilValue(store.user);
+  const messageContext = useMessageContext();
+  const imported = importedFileForGrant(
+    messageContext?.viventiumFileAttachments,
+    src,
+    user?.id,
+    messageContext?.messageId,
+  );
+  /* === VIVENTIUM END === */
   const baseURL = apiBaseUrl();
 
   // If src starts with /images/, prepend the base URL
@@ -254,6 +281,23 @@ export const img: React.ElementType = memo(function MarkdownImage({
     return `${baseURL}${src}`;
   }, [src, baseURL]);
 
+  /* === VIVENTIUM START === Owner-bound imports retain normal image open/download behavior. === */
+  if (
+    imported &&
+    'type' in imported &&
+    imported.type?.startsWith('image/') &&
+    'file_id' in imported
+  ) {
+    return (
+      <Image
+        imagePath={imported.filepath ?? ''}
+        altText={alt ?? imported.filename ?? ''}
+        className={className}
+        file={imported}
+      />
+    );
+  }
+  /* === VIVENTIUM END === */
   return <img src={fixedSrc} alt={alt} title={title} className={className} style={style} />;
 });
 img.displayName = 'MarkdownImage';

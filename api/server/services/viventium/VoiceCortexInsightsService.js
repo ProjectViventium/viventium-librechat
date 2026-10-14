@@ -16,6 +16,7 @@
  * === VIVENTIUM END === */
 
 const { ContentTypes } = require('librechat-data-provider');
+const { projectDeliveryDispositionRanges } = require('@librechat/api');
 const { getMessage, getMessages } = require('~/models');
 
 /**
@@ -65,7 +66,9 @@ async function getFollowUpMessageForParent({
 
   const cortexFollowUps = followUps.filter(
     (message) =>
-      message?.metadata?.viventium?.followUpSource !== 'durable_terminal_callback' &&
+      !['durable_terminal_callback', 'durable_work_callback'].includes(
+        message?.metadata?.viventium?.followUpSource,
+      ) &&
       (!followupMessageId || message.messageId === followupMessageId),
   );
   const followUp = cortexFollowUps[cortexFollowUps.length - 1];
@@ -74,12 +77,43 @@ async function getFollowUpMessageForParent({
     return null;
   }
 
+  const defaultSkipped =
+    followUp.metadata?.viventium?.deliveryDisposition?.version === 1 &&
+    followUp.metadata.viventium.deliveryDisposition.audio === 'skip';
+  const hasRanges =
+    Array.isArray(followUp.content) &&
+    followUp.content.some(
+      (part) =>
+        part?.type === 'text' &&
+        Object.prototype.hasOwnProperty.call(part, 'deliveryDispositionRanges'),
+    );
+  const content = hasRanges
+    ? followUp.content
+        .filter((part) => part?.type === 'text')
+        .map((part) => {
+          if (!Object.prototype.hasOwnProperty.call(part, 'deliveryDispositionRanges'))
+            return { ...part, deliveryDispositionRanges: [] };
+          return {
+            ...part,
+            deliveryDispositionRanges: projectDeliveryDispositionRanges(
+              part.deliveryDispositionRanges,
+              typeof part.text === 'string' ? part.text : '',
+            ),
+          };
+        })
+    : undefined;
+  const audible =
+    hasRanges &&
+    content.some((part) =>
+      Object.prototype.hasOwnProperty.call(part, 'deliveryDispositionRanges')
+        ? part.deliveryDispositionRanges.some((range) => range.disposition.audio === 'eligible')
+        : !defaultSkipped && typeof part.text === 'string' && part.text.length > 0,
+    );
   return {
     messageId: followUp.messageId,
     text,
-    audioSuppressed:
-      followUp.metadata?.viventium?.deliveryDisposition?.version === 1 &&
-      followUp.metadata.viventium.deliveryDisposition.audio === 'skip',
+    ...(hasRanges ? { content } : {}),
+    audioSuppressed: hasRanges ? !audible : defaultSkipped,
     presentationRequired:
       Array.isArray(followUp.metadata?.viventium?.cortexInsightDeliveryIds) &&
       followUp.metadata.viventium.cortexInsightDeliveryIds.length > 0,
@@ -141,7 +175,11 @@ async function getCompletedCortexInsightsForMessage({
     insights: followUp?.audioSuppressed ? [] : insights,
     followUp:
       followUp && !followUp.audioSuppressed
-        ? { messageId: followUp.messageId, text: followUp.text }
+        ? {
+            messageId: followUp.messageId,
+            text: followUp.text,
+            ...(followUp.content ? { content: followUp.content } : {}),
+          }
         : null,
     presentationRequired: !followUp?.audioSuppressed && followUp?.presentationRequired === true,
     followUpDecision: followUp?.audioSuppressed

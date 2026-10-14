@@ -267,6 +267,9 @@ async function getFollowUpMessageForParent({ userId, conversationId, parentMessa
     conversationId,
     'metadata.viventium.parentMessageId': parentMessageId,
     'metadata.viventium.type': 'cortex_followup',
+    'metadata.viventium.followUpSource': {
+      $nin: ['durable_terminal_callback', 'durable_work_callback'],
+    },
   });
 
   if (!Array.isArray(followUps) || followUps.length === 0) {
@@ -285,6 +288,14 @@ async function getFollowUpMessageForParent({ userId, conversationId, parentMessa
   return {
     messageId: lastFollowUp.messageId,
     text,
+    ...(lastFollowUp?.metadata?.viventium?.deliveryDisposition
+      ? { deliveryDisposition: lastFollowUp.metadata.viventium.deliveryDisposition } : {}),
+    ...(Array.isArray(lastFollowUp.content) && lastFollowUp.content.some(
+      (part) => Object.prototype.hasOwnProperty.call(part || {}, 'deliveryDispositionRanges'),
+    ) ? { content: lastFollowUp.content } : {}),
+    ...(typeof lastFollowUp?.metadata?.viventium?.followUpSource === 'string'
+      ? { followUpSource: lastFollowUp.metadata.viventium.followUpSource }
+      : {}),
     deliveryControls:
       lastFollowUp?.metadata?.viventium?.telegramDeliveryControls &&
       typeof lastFollowUp.metadata.viventium.telegramDeliveryControls === 'object'

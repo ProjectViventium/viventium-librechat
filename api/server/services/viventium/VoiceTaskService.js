@@ -12,6 +12,11 @@ const {
   retainedVoiceInputOperation,
   voiceTaskCommittedPresentationKey,
   verifyVoiceWorkerCompletionPresentation,
+  nativeWorkInputPresentation,
+  nativeQuestionFormSchema,
+  nativeQuestionContent,
+  nativeInputRequestSchema,
+  nativeInputSpeechOffer,
 } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const {
@@ -986,7 +991,7 @@ function sanitizeNeedsInput(data) {
     return null;
   }
   const requestedType = safeText(data?.inputType || data?.type, 40);
-  const inputType = new Set(['text', 'choice', 'confirm']).has(requestedType)
+  const inputType = new Set(['text', 'choice', 'confirm', 'native_question']).has(requestedType)
     ? requestedType
     : 'text';
   const choices =
@@ -1003,7 +1008,30 @@ function sanitizeNeedsInput(data) {
           )
           .map(({ value, label }) => ({ value, label }))
       : [];
-  return { prompt, inputType, ...(choices.length ? { choices } : {}) };
+  const nativeInputRequest = nativeInputRequestSchema.safeParse(data?.nativeInputRequest);
+  const questionForm = nativeQuestionFormSchema.safeParse(data?.questionForm);
+  if (inputType === 'native_question' && !questionForm.success) return null;
+  const operationTitle = data?.operationTitle;
+  if (
+    operationTitle !== undefined &&
+    (inputType !== 'choice' ||
+      !nativeInputRequest.success ||
+      nativeInputRequest.data.kind !== 'permission' ||
+      typeof operationTitle !== 'string' ||
+      operationTitle.length === 0 ||
+      operationTitle.length > 8000)
+  )
+    return null;
+  return {
+    prompt,
+    inputType,
+    ...(operationTitle !== undefined ? { operationTitle } : {}),
+    ...(choices.length ? { choices } : {}),
+    ...(nativeInputRequest.success ? { nativeInputRequest: nativeInputRequest.data } : {}),
+    ...(inputType === 'native_question' && questionForm.success
+      ? { questionForm: questionForm.data }
+      : {}),
+  };
 }
 
 function sanitizeProgress(data) {
@@ -1357,6 +1385,7 @@ function registerVoiceTaskOwnerAdapter(
   {
     kind,
     provideInput,
+    isNativeInputCurrent,
     retry,
     cancel,
     cancelFailedProviderAttention,
@@ -1381,6 +1410,7 @@ function registerVoiceTaskOwnerAdapter(
     ...(preserveExisting ? getOwnerAdapter(task) : {}),
     kind: normalizedKind,
     ...(typeof provideInput === 'function' ? { provideInput } : {}),
+    ...(typeof isNativeInputCurrent === 'function' ? { isNativeInputCurrent } : {}),
     ...(typeof retry === 'function' ? { retry } : {}),
     ...(typeof cancel === 'function' ? { cancel } : {}),
     ...(typeof cancelFailedProviderAttention === 'boolean'
@@ -1434,12 +1464,44 @@ async function submitVoiceTaskInput(taskId, input, { userId, voiceAuthorityConte
   if (!adapter?.provideInput) {
     return operationFailure(task, 'input_unsupported', 'This task owner does not accept input.');
   }
-  const normalizedInput = safeText(input, 1000);
+  const questionBinding =
+    task.nativeMissionInputBinding?.inputKind === 'question'
+      ? nativeMissionVoiceBinding(task.nativeMissionInputBinding, task)
+      : null;
+  const questionForm =
+    questionBinding?.questionForm ||
+    (task.current?.needsInput?.inputType === 'native_question'
+      ? task.current.needsInput.questionForm
+      : null);
+  const normalizedInput = questionForm
+    ? typeof input === 'string' && Buffer.byteLength(input, 'utf8') <= 65536
+      ? input
+      : ''
+    : safeText(input, 1000);
+  if (questionForm) {
+    let content;
+    try {
+      content = JSON.parse(normalizedInput);
+    } catch {
+      return operationFailure(
+        task,
+        'input_invalid_choice',
+        'Choose an answer to the current question.',
+      );
+    }
+    if (!nativeQuestionContent(content, questionForm))
+      return operationFailure(
+        task,
+        'input_invalid_choice',
+        'Choose an answer to the current question.',
+      );
+  }
   if (!normalizedInput) {
     return operationFailure(task, 'input_required', 'Input is required.');
   }
   if (
     task.nativeMissionInputBinding &&
+    !questionBinding &&
     !task.current?.needsInput?.choices?.some((choice) => choice.value === normalizedInput)
   )
     return operationFailure(task, 'input_invalid_choice', 'Choose one of the offered options.');
@@ -1477,6 +1539,9 @@ async function submitVoiceTaskInput(taskId, input, { userId, voiceAuthorityConte
     task.inputOperation?.hash === inputHash ? task.inputOperation.operationId : crypto.randomUUID();
   const operation = {
     hash: inputHash,
+    ...(task.current?.needsInput?.nativeInputRequest
+      ? { nativeRequestFingerprint: task.current.needsInput.nativeInputRequest.requestFingerprint }
+      : {}),
     operationId,
     promise: null,
     result: null,
@@ -2739,13 +2804,14 @@ function registerVoiceTaskDeliveryPresentation(delivery, { userId, callSessionId
   const pendingPublication =
     delivery?.status === 'pending' &&
     /^callback_sha256:[a-f0-9]{64}$/.test(callbackRef) &&
-    verifyVoiceWorkerCompletionPresentation(delivery.workerCompletionPresentation, {
-      ownerId: userId,
-      conversationId,
-      callSessionId,
-      responseMessageId: resultMessageId,
-      responseText: delivery.text,
-    });
+    (nativeWorkInputPresentation(delivery) ||
+      verifyVoiceWorkerCompletionPresentation(delivery.workerCompletionPresentation, {
+        ownerId: userId,
+        conversationId,
+        callSessionId,
+        responseMessageId: resultMessageId,
+        responseText: delivery.text,
+      }));
   if (
     !deliveryId ||
     !turnId ||
@@ -2846,6 +2912,74 @@ function recordVoiceTaskDeliveryPresentation(taskId, input) {
   return recordTaskSpeechPresentation(task, input);
 }
 /* === VIVENTIUM END === */
+
+async function claimVoiceNativeInputSpeechOffer(taskId, input) {
+  const task = tasks.get(String(taskId || ''));
+  const offer = nativeInputSpeechOffer(task, { ...input, taskId });
+  const answeredOrAnswering = () =>
+    task.inputOperation?.nativeRequestFingerprint ===
+      offer?.nativeInputRequest.requestFingerprint &&
+    (task.inputOperation.promise || task.inputOperation.result?.ok);
+  if (!offer || answeredOrAnswering() || !persistenceAvailable(ViventiumVoiceTask)) return null;
+  // Persist current task first. The offer is separate from coalesced payload writes.
+  await withPersistenceDeadline(persistVoiceTaskBatch([taskPersistenceEntry(task)]));
+  const adapter = getOwnerAdapter(task);
+  if (
+    answeredOrAnswering() ||
+    !nativeInputSpeechOffer(task, { ...input, taskId }) ||
+    typeof adapter?.isNativeInputCurrent !== 'function'
+  )
+    return null;
+  const row = await withPersistenceDeadline(
+    ViventiumVoiceTask.findOneAndUpdate(
+      {
+        taskId,
+        userId: offer.userId,
+        callSessionId: offer.callSessionId,
+        streamId: offer.streamId,
+        sequence: task.sequence,
+        'payload.state': 'needs_input',
+        'payload.suppressed': { $ne: true },
+        'payload.owner.kind': task.owner.kind,
+        'payload.owner.id': offer.streamId,
+        'payload.current.needsInput.prompt': offer.prompt,
+        ...Object.fromEntries(
+          Object.entries(offer.nativeInputRequest).map(([key, value]) => [
+            'payload.current.needsInput.nativeInputRequest.' + key,
+            value,
+          ]),
+        ),
+        'nativeInputSpeechOffer.requestKey': { $ne: offer.requestKey },
+      },
+      {
+        $set: {
+          nativeInputSpeechOffer: {
+            requestKey: offer.requestKey,
+            promptDigest: offer.promptDigest,
+            claimedAtMs: Date.now(),
+            outcome: 'offered_unknown',
+          },
+        },
+      },
+      { new: true },
+    ).lean(),
+  );
+  if (!row || answeredOrAnswering() || !nativeInputSpeechOffer(task, { ...input, taskId }))
+    return null;
+  // The native owner is authoritative even when another surface answered without changing this snapshot.
+  if (
+    !(await adapter.isNativeInputCurrent(offer.nativeInputRequest)) ||
+    answeredOrAnswering() ||
+    !nativeInputSpeechOffer(task, { ...input, taskId })
+  )
+    return null;
+  return {
+    version: 1,
+    requestKey: offer.requestKey,
+    outcome: 'offered_unknown',
+    nativeInputRequest: offer.nativeInputRequest,
+  };
+}
 
 function recordVoiceTaskPresentation(taskId, input) {
   const task = tasks.get(String(taskId || ''));
@@ -3577,6 +3711,7 @@ module.exports = {
   settleVoiceTaskGeneration,
   refreshVoiceTaskCommittedPresentation,
   recordVoiceTaskPresentation,
+  claimVoiceNativeInputSpeechOffer,
   registerVoiceTaskDeliveryPresentation,
   recordVoiceTaskDeliveryPresentation,
   confirmVoiceTaskOwnerCancellation,

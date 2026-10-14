@@ -47,7 +47,6 @@ const {
 /* === VIVENTIUM START === Preserve raw Mongo ancestry before legacy traversal can shorten it. === */
 const {
   isSchedulerTransportRow,
-  isTrustedSchedulerWake,
   traceMainHistoryAncestry,
   recoverRetainedTelegramHistory,
 } = require('~/server/services/viventium/ViventiumMainContextService');
@@ -985,12 +984,12 @@ class BaseClient {
     }
     /* === VIVENTIUM END === */
     /* === VIVENTIUM START ===
-     * A trusted scheduler wake omits scheduler transport rows only. They stay in the returned chain
+     * Every Agents turn omits typed scheduler transport rows. They stay in the returned chain
      * so the agent's own parent walk can pass through them to the visible answers; the ancestry
      * proof accounts them as skipped, and the agent message builder omits them by the same type.
      * === VIVENTIUM END === */
     const skipHistoryRow =
-      this.clientName === EModelEndpoint.agents && isTrustedSchedulerWake(this.options?.req)
+      this.clientName === EModelEndpoint.agents
         ? (message) => isPassiveVoiceTranscriptMessage(message) || isSchedulerTransportRow(message)
         : isPassiveVoiceTranscriptMessage;
     /* === VIVENTIUM START === A missing or cyclic ancestor must remain visible to Main V1 admission. === */

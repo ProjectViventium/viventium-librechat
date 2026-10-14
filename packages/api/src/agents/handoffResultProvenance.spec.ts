@@ -1,7 +1,7 @@
 import { Command } from '@langchain/langgraph';
 import type { AgentGraphEdge } from './sourceComponentStarts';
 import { AIMessage, AIMessageChunk, HumanMessage, ToolMessage } from '@langchain/core/messages';
-import { installLibreChatAgentsHandoffResultPatch, restoreCompletedHandoffPair } from './handoffResultProvenance';
+import { installLibreChatAgentsHandoffResultPatch, restoreCompletedHandoffPair, nativeConsultProviderFailure } from './handoffResultProvenance';
 
 const transfer = (id: string, from: string, to: string, content = '') => [
   new AIMessage({ id: `${id}-ai`, content, tool_calls: [{ id, name: `lc_transfer_to_${to}`, args: {} }] }),
@@ -121,4 +121,41 @@ it('preserves the upstream projection when a return has no visible text', () => 
   ];
   const messages = [request, ...transfer('consult', 'main', 'specialist'), ...returned];
   expect(restoreCompletedHandoffPair(messages, [request, returned[0]], 'main')).toBeNull();
+});
+
+it.each([
+  [{ error: { type: 'rate_limit_error', code: 'rate_limit_exceeded' } }, 'provider_rate_limited'],
+  [{ code: 'provider_quota_exhausted' }, 'provider_quota_exhausted'],
+  [{ cause: { code: 'provider_temporarily_unavailable' } }, 'provider_temporarily_unavailable'],
+  [{ code: 'provider_response_failed' }, 'provider_response_failed'],
+  [{ status: 429 }, null],
+  [new Error('rate_limit_exceeded'), null],
+  [{ code: 'tool_failure', cause: { code: 'rate_limit_exceeded' } }, null],
+  [{ code: 'provider_access_denied', cause: { code: 'rate_limit_exceeded' } }, null],
+  [{ code: 'native_input_declined' }, null],
+  [{ name: 'AbortError', cause: { code: 'rate_limit_exceeded' } }, null],
+  [{ code: 'provider_quota_exhausted', cause: { code: 'rate_limit_exceeded' } }, null],
+  [{ code: 429, error: { code: 'rate_limit_exceeded' } }, null],
+])('projects only exact public native provider codes: %p', (error, expected) => {
+  expect(nativeConsultProviderFailure(error)).toBe(expected);
+});
+
+it('bounds native error cause traversal and accepts a cycle without repeated work', () => {
+  const error: Record<string, unknown> = { code: 'rate_limit_exceeded' }; error.cause = error;
+  expect(nativeConsultProviderFailure(error)).toBe('provider_rate_limited');
+  let deep: unknown = { code: 'rate_limit_exceeded' };
+  for (let index = 0; index < 20; index++) deep = { cause: deep };
+  expect(nativeConsultProviderFailure(deep)).toBeNull();
+});
+
+it('the accepted return-pair consumer retains failure status and attributed error metadata', () => {
+  const consult = transfer('consult', 'main', 'specialist');
+  (consult[1] as ToolMessage).status = 'error';
+  consult[1].additional_kwargs.handoff_failure = { version: 1, code: 'provider_rate_limited' };
+  const returned = transfer('return', 'specialist', 'main', 'The provider was unavailable.');
+  const messages = [request, ...consult, ...returned];
+  const result = restoreCompletedHandoffPair(messages, [request, returned[0]], 'main');
+  expect((result?.at(-1) as ToolMessage).status).toBe('error');
+  expect(result?.at(-1)?.additional_kwargs.handoff_failure).toEqual({ version: 1, code: 'provider_rate_limited' });
+  expect((result?.at(-1) as ToolMessage).tool_call_id).toBe('consult');
 });

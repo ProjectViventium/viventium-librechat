@@ -314,6 +314,48 @@ describe('useStepHandler', () => {
   });
 
   describe('on_agent_update event', () => {
+    it('rejects a legacy flat update without breaking the next valid update', () => {
+      const consoleSpy = jest.spyOn(console, 'warn').mockImplementation();
+      mockGetMessages.mockReturnValue([createResponseMessage()]);
+      const { result } = renderHook(() => useStepHandler(createHookParams()));
+      const submission = createSubmission();
+      act(() =>
+        result.current.stepHandler({ event: 'on_run_step', data: createRunStep() }, submission),
+      );
+      mockSetMessages.mockClear();
+      expect(() =>
+        act(() =>
+          result.current.stepHandler(
+            {
+              event: 'on_agent_update',
+              data: { runId: 'response-msg-1', message: 'Agent is thinking...' },
+            },
+            submission,
+          ),
+        ),
+      ).not.toThrow();
+      expect(mockSetMessages).not.toHaveBeenCalled();
+      act(() =>
+        result.current.stepHandler(
+          {
+            event: 'on_agent_update',
+            data: {
+              type: ContentTypes.AGENT_UPDATE,
+              agent_update: { runId: 'response-msg-1', index: 0, agentId: 'agent-consultant' },
+            },
+          },
+          submission,
+        ),
+      );
+      expect(mockSetMessages.mock.calls.at(-1)?.[0][0].content[0]).toEqual({
+        type: ContentTypes.AGENT_UPDATE,
+        agent_update: { runId: 'response-msg-1', index: 0, agentId: 'agent-consultant' },
+        agentId: 'agent-consultant',
+        groupId: 1,
+      });
+      consoleSpy.mockRestore();
+    });
+
     it('should update message with agent update content', () => {
       const responseMessage = createResponseMessage();
       mockGetMessages.mockReturnValue([responseMessage]);

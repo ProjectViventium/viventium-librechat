@@ -49,6 +49,8 @@ describe('GlassHiveActiveWorkProjectionService', () => {
       toArray: jest.fn().mockResolvedValue([
         {
           workRef: 'work-delivered',
+          conversationId: 'prior-chat',
+          configuredDestinations: ['telegram', 'librechat'],
           deliveryState: 'sent',
           adjudicationState: 'completed',
           attentionPending: false,
@@ -151,8 +153,16 @@ describe('GlassHiveActiveWorkProjectionService', () => {
 
     expect(mockFind).toHaveBeenCalledWith(
       { ownerId: 'owner-1', workRef: { $in: expect.arrayContaining(['work-delivered']) } },
-      expect.objectContaining({ projection: expect.any(Object) }),
+      expect.objectContaining({
+        projection: expect.objectContaining({ conversationId: 1, configuredDestinations: 1 }),
+      }),
     );
+    expect(snapshot.work.find((item) => item.workRef === 'work-delivered').deliveryScope).toEqual({
+      originConversationId: 'prior-chat',
+      destinations: ['telegram', 'librechat'],
+      resultRunId: null,
+      resultRevision: null,
+    });
     expect(mockCreateIndex).toHaveBeenCalledWith(
       { ownerId: 1, workRef: 1 },
       expect.objectContaining({ name: 'owner_work_ref' }),

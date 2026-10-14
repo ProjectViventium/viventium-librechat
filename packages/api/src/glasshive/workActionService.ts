@@ -5,10 +5,12 @@
  * === VIVENTIUM END === */
 
 import crypto from 'node:crypto';
+import { currentNativeHumanInputSource } from './sourceAuthor';
 import { createAccountApiRoute } from './accountClient';
 import type { VoiceWorkAuthorityBinding } from '../voice/engagementAuthority';
 import type { NativeWorkInputResponse } from 'librechat-data-provider';
 import { safeErrorCode } from '../logging/safeError';
+import { nativeQuestionForm, nativeQuestionContent, nativeWorkInputQuestionText, nativeWorkInputResponseSchema } from './nativeWorkInput';
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -46,6 +48,8 @@ interface LoggerAdapter {
 
 export interface GlassHiveWorkActionDependencies {
   GenerationJobManager: GenerationJobManagerAdapter;
+  getSourceAuthorJob?: Parameters<typeof currentNativeHumanInputSource>[0]['getJob'];
+  getOriginalInputReceipt?: Parameters<typeof currentNativeHumanInputSource>[0]['getOriginalInputReceipt'];
   assertVoiceWorkAuthority(
     binding: VoiceWorkAuthorityBinding | undefined,
     ownerId: string,
@@ -58,6 +62,7 @@ export interface GlassHiveWorkActionDependencies {
   getActionFileSources?(input: GlassHiveWorkActionInput): Promise<ActionFileSource[]>;
   fetchImpl?: typeof globalThis.fetch;
   reauthorizeCapabilityAuthorization(input: UnknownRecord): Promise<unknown>;
+  readCapabilityReauthorizationReceiptCandidate?(input: UnknownRecord): Promise<unknown>;
   dismissCoreOnlyPreDispatchAttention(input: UnknownRecord): Promise<unknown>;
   getCoreWorkDelivery(input: UnknownRecord): Promise<unknown>;
   getCoreWorkOriginRef(input: UnknownRecord): Promise<unknown>;
@@ -279,20 +284,38 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
     }
   }
 
-  async function trustedCapabilityRefresh({
-    ownerId,
-    workRef,
-    action,
-  }: GlassHiveWorkActionInput): Promise<UnknownRecord | null> {
+  async function trustedCapabilityRefresh(
+    { ownerId, workRef, action, ownerInputControl, requestBody }: GlassHiveWorkActionInput,
+    currentDetail?: unknown,
+  ): Promise<UnknownRecord | null> {
     if (!REAUTH_ACTIONS.has(normalizedText(action).toLowerCase())) return null;
-    const detail = await deps.requestAccountApi({
-      ownerId,
-      path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}`,
-    });
+    const detail =
+      currentDetail ??
+      (await deps.requestAccountApi({
+        ownerId,
+        path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}`,
+      }));
     if (!needsCapabilityReauthorization(detail)) return null;
-    const refreshed = recordFrom(
-      await deps.reauthorizeCapabilityAuthorization({ ownerId, workRef }),
-    );
+    if (ownerInputControl !== true) {
+      try {
+        if (!deps.getSourceAuthorJob) throw new Error('owner_input_unavailable');
+        await currentNativeHumanInputSource({
+          userId: normalizedText(ownerId),
+          requestBody: requestBody || {},
+          getJob: deps.getSourceAuthorJob,
+          getOriginalInputReceipt: deps.getOriginalInputReceipt,
+        });
+      } catch {
+        throw Object.assign(new Error('capability_authorization_horizon_expired'), {
+          code: 'capability_authorization_horizon_expired',
+          status: 409,
+          needsInput: true,
+          userMessage:
+            'This work needs your authorization to renew connected capabilities. Use Resume in Active Work.',
+        });
+      }
+    }
+    const refreshed = recordFrom(await deps.reauthorizeCapabilityAuthorization({ ownerId, workRef }));
     return {
       version: 1,
       authorizationRef: refreshed.authorizationRef,
@@ -320,11 +343,39 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
       await deps.assertVoiceWorkAuthority(context.binding, normalizedText(ownerId));
     };
     await assertCurrentVoiceAuthority();
+    let nativeDetail: unknown;
+    let nativeHumanInput: Awaited<ReturnType<typeof currentNativeHumanInputSource>> | undefined;
     if (input.nativeInput && (action !== 'resume' || input.ownerInputControl !== true)) {
-      throw Object.assign(new Error('native_input_owner_control_required'), {
-        code: 'native_input_owner_control_required',
-        status: 403,
-      });
+      const reply = nativeWorkInputResponseSchema.safeParse(input.nativeInput);
+      const denied = () => Object.assign(new Error('native_input_owner_control_required'), {
+        code: 'native_input_owner_control_required', status: 403 });
+      if (normalizedText(instruction) || action !== 'resume' || !reply.success || reply.data.action !== 'accept' ||
+          !reply.data.content) throw denied();
+      nativeDetail = await deps.requestAccountApi({ ownerId,
+        path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}` });
+      const detail = recordFrom(nativeDetail);
+      const pending = recordFrom(detail.pendingNativeInput);
+      if (detail.workRef !== workRef || pending.requestId !== reply.data.requestId ||
+          pending.requestFingerprint !== reply.data.requestFingerprint) throw denied();
+      if (pending.kind === 'question') {
+        const form = nativeQuestionForm(pending);
+        if (!form || !nativeWorkInputQuestionText(pending, pending) ||
+            !nativeQuestionContent(reply.data.content, form)) throw denied();
+      } else if (pending.kind === 'permission') {
+        const content = recordFrom(reply.data.content);
+        const option = recordFrom(recordFrom(recordFrom(pending.requestedSchema).properties).optionId);
+        const values = Array.isArray(option.enum) ? option.enum : [];
+        const kinds = Array.isArray(option.enumKinds) ? option.enumKinds : [];
+        const index = values.indexOf(content.optionId);
+        if (Object.keys(content).length !== 1 || typeof content.optionId !== 'string' || index < 0 ||
+            values.length !== kinds.length || !['allow_once', 'reject_once'].includes(String(kinds[index])) ||
+            !deps.getSourceAuthorJob) throw denied();
+        nativeHumanInput = await currentNativeHumanInputSource({userId: normalizedText(ownerId),
+          requestBody: input.requestBody || {}, getJob: deps.getSourceAuthorJob,
+          getOriginalInputReceipt:deps.getOriginalInputReceipt});
+      } else throw denied();
+      // The native owner revalidates the same current request before its existing mailbox ACK.
+      input = { ...input, nativeInput: reply.data };
     }
     if (action === 'dismiss') {
       const coreOnlyReceipt = await deps.dismissCoreOnlyPreDispatchAttention({
@@ -333,7 +384,10 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
         operationId,
       });
       if (coreOnlyReceipt) {
-        deps.invalidateActiveWorkSnapshot({ ownerId });
+        deps.invalidateActiveWorkSnapshot({
+          ownerId,
+          ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+        });
         await deps.getActiveWorkSnapshot({ ownerId, forceRefresh: true });
         await traceAcceptedVoiceAction({ ...input, action });
         return coreOnlyReceipt;
@@ -347,7 +401,9 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
         });
       }
     }
-    const capabilityReauthorization = await trustedCapabilityRefresh({ ownerId, workRef, action });
+    const capabilityReauthorization = await trustedCapabilityRefresh({
+      ownerId, workRef, action, ownerInputControl: input.ownerInputControl, requestBody: input.requestBody,
+    }, nativeDetail);
     const idempotencyKey = deps.buildTrustedActionIdempotencyKey({
       ownerId,
       workRef,
@@ -365,22 +421,39 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
     await assertCurrentVoiceAuthority();
     const fileInputs = await prepareFileInputs(input, idempotencyKey);
     await assertCurrentVoiceAuthority();
-    const result = await deps.requestAccountApi({
-      ownerId,
-      path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}/actions`,
-      method: 'POST',
-      ...(input.nativeInput ? { ownerNativeInput: input.nativeInput } : {}),
-      body: {
+    const actionBody = {
         action,
         ...(instruction ? { instruction } : {}),
         idempotencyKey,
         ...(input.nativeInput ? { nativeInput: input.nativeInput } : {}),
+        ...(nativeHumanInput ? { nativeHumanInput } : {}),
         ...(capabilityReauthorization ? { capabilityReauthorization } : {}),
         ...(sourceContext ? { sourceContext } : {}),
         ...(fileInputs.length ? { fileInputs } : {}),
-      },
+      };
+    let result: unknown;
+    try {
+      result = await deps.requestAccountApi({ ownerId,
+        path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}/actions`, method: 'POST',
+        ...(input.nativeInput ? { ownerNativeInput: input.nativeInput } : {}), body: actionBody });
+    } catch (error) {
+      if (action !== 'resume' || Number(recordFrom(error).status) !== 409 ||
+          safeErrorCode(error) !== 'active_work_idempotency_conflict' || capabilityReauthorization ||
+          !deps.readCapabilityReauthorizationReceiptCandidate) throw error;
+      const candidate = await deps.readCapabilityReauthorizationReceiptCandidate({ ownerId, workRef });
+      if (!candidate) throw error;
+      await assertCurrentVoiceAuthority();
+      // Receipt lookup is read-only. The native immutable owner/work/key/body digest
+      // must match; it cannot reserve, take over or execute an action.
+      result = await deps.requestAccountApi({ ownerId,
+        path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}/actions/receipt`, method: 'POST',
+        ...(input.nativeInput ? { ownerNativeInput: input.nativeInput } : {}),
+        body: { ...actionBody, capabilityReauthorization: candidate } });
+    }
+    deps.invalidateActiveWorkSnapshot({
+      ownerId,
+      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
     });
-    deps.invalidateActiveWorkSnapshot({ ownerId });
     if (action === 'dismiss') {
       await deps.getActiveWorkSnapshot({ ownerId, forceRefresh: true });
     }

@@ -71,6 +71,8 @@ const delegationSchema = z
     longMission: z.boolean().optional(),
     requiresHostAccess: z.boolean().optional(),
     sourceOrdinals: z.array(z.number().int().min(1).max(32)).max(32).optional(),
+    fileIds: z.array(z.string().min(1).max(256).refine((id) => id.trim() === id && !!id.trim()))
+      .max(64).refine((ids) => new Set(ids).size === ids.length).optional(),
   })
   .strict();
 

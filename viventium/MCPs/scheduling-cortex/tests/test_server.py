@@ -3,6 +3,7 @@
 # === VIVENTIUM END ===
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -71,3 +72,22 @@ class ScheduledCapabilityAuthoringTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# === VIVENTIUM START ===
+# Purpose: Execute the standalone entrypoint with no runtime or network effects.
+class SchedulerPollEntrypointTests(unittest.TestCase):
+    def test_standalone_poll_default_and_explicit_override(self):
+        for configured, expected in [(None, 1), ('17', 17)]:
+            with self.subTest(configured=configured):
+                env = {} if configured is None else {'SCHEDULER_POLL_INTERVAL_S': configured}
+                with patch.dict(server.os.environ, env, clear=True), \
+                     patch.object(sys, 'argv', ['scheduling-cortex']), \
+                     patch.object(server, 'ScheduleStorage') as storage, \
+                     patch.object(server, 'SchedulerEngine') as engine, \
+                     patch.object(server, 'build_server') as build:
+                    server.main()
+                self.assertEqual(engine.call_args.args[1], expected)
+                engine.return_value.start.assert_called_once_with()
+                build.return_value.run.assert_called_once_with(transport='streamable-http', host='127.0.0.1', port=server.DEFAULT_PORT)
+# === VIVENTIUM END ===

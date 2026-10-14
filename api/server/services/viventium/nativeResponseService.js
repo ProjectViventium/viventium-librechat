@@ -10,6 +10,8 @@ const {
   nativeJobMatches,
   interactionPresentationSequence,
   projectNativeToolEvidence,
+  collectGlassHiveNativeMediaReferences,
+  renderGlassHiveNativeMediaAttachmentLinks,
   isAudioDeliveryRequested,
   supportsMessagingDeliveryDisposition,
   prepareNativeSourceRecovery,
@@ -35,8 +37,18 @@ function projectNativeMessage(identity, response, message, purpose, candidate) {
     attachEffectiveDeliveryDisposition,
     inspectProviderDeliveryDisposition,
   } = require('./deliveryDisposition');
-  const { sanitizeVoiceAssistantMessageForPersistence } = require('./voiceArtifactText');
+  const { inspectProviderDeliveryRanges } = require('@librechat/api');
+  const {
+    sanitizeVoiceAssistantMessageForPersistence,
+    sanitizeVoiceSurfaceTextForDisplay,
+  } = require('./voiceArtifactText');
   message = projectNativeToolEvidence(identity, response, message, candidate);
+  const projectMedia = (value) => renderGlassHiveNativeMediaAttachmentLinks(value,
+    message.attachments, { ownerId: identity.userId, messageId: identity.responseMessageId });
+  message = { ...message, text: typeof message.text === 'string' ? projectMedia(message.text) : message.text,
+    content: Array.isArray(message.content) ? message.content.map((part) =>
+      part?.type === 'text' && typeof part.text === 'string' ? { ...part, text: projectMedia(part.text) } : part)
+      : message.content };
   const context = identity.deliveryContext;
   const req = {
     _viventiumDeliveryDispositionRequired:
@@ -55,6 +67,27 @@ function projectNativeMessage(identity, response, message, purpose, candidate) {
     { ...message, metadata },
     inspectProviderDeliveryDisposition(response),
   );
+  const projectRanges = (value) => {
+    if (!Array.isArray(value.content)) return value;
+    return {
+      ...value,
+      content: value.content.map((part) => {
+        if (part?.type !== 'text' || typeof part.text !== 'string') return part;
+        const ranges = inspectProviderDeliveryRanges(
+          response,
+          part.text,
+          (source) => {
+            const projected = projectMedia(source);
+            if (purpose !== 'transmit' && context?.surface === 'voice')
+              return sanitizeVoiceSurfaceTextForDisplay(projected);
+            return context?.surface === 'web'
+              ? sanitizeVoiceAssistantMessageForPersistence(req, { text: projected }).text : projected;
+          },
+        );
+        return ranges === null ? part : { ...part, deliveryDispositionRanges: ranges };
+      }),
+    };
+  };
   if (
     purpose === 'transmit' &&
     context?.authenticated === true &&
@@ -69,9 +102,9 @@ function projectNativeMessage(identity, response, message, purpose, candidate) {
       };
     }
     // The authenticated bridge consumes original structural controls; Mongo stays clean.
-    return message;
+    return projectRanges(message);
   }
-  return sanitizeVoiceAssistantMessageForPersistence(req, message);
+  return projectRanges(sanitizeVoiceAssistantMessageForPersistence(req, message));
 }
 
 async function resolveNativeResponseRoute(identity) {
@@ -126,24 +159,26 @@ function getService() {
     db,
     projectMessage: projectNativeMessage,
     prepareAttachments: async (identity, response, candidate) => {
+      if (response.glasshive?.output_files == null && !collectGlassHiveNativeMediaReferences(candidate.text).length) return [];
       const user = await db.findUser({ _id: identity.userId });
       if (!user) throw new Error('native_response_owner_unavailable');
       const config = await require('~/server/services/Config').getAppConfig({ role: user.role });
       const context = identity.deliveryContext;
-      return require('./nativeOutputFiles').prepareNativeOutputFiles(
+      return require('./nativeOutputFiles').prepareNativeResponseOutputFiles(
         {
           user: { ...user, id: identity.userId },
           config,
           _viventiumTelegram: context?.surface === 'telegram' && context.authenticated === true,
           body: { endpoint: 'agents', viventiumSurface: context?.surface },
         },
-        response.glasshive.output_files,
+        response,
         {
           ...identity,
           requestId: candidate.requestId,
           runId: candidate.runId,
           invocationId: identity.invocationId,
         },
+        candidate.text,
       );
     },
     transaction: runNativeResponseTransaction,
@@ -421,7 +456,6 @@ function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
  * primary graph dispatches read the immutable accepted data from that exact parent, while
  * foreground instructions and history remain request-pinned. This read never changes receipts. */
 async function readCurrentMainBackgroundInputs(req, primaryAgentId) {
-  if (!/^[a-f0-9]{64}$/.test(process.env.WPR_GROK_REVIEWED_BINARY_SHA256 || '')) return [];
   const identity = req._viventiumNativeResponseIdentity;
   if (!identity) return [];
   const source = req._viventiumNativeResponseSource;
@@ -512,7 +546,19 @@ async function recoverSavedNativeResponse(identity, onTerminal) {
 async function markNativeResponseReplayStored(identity, mode) {
   const marked = await require('~/models').markNativeResponseReplayStored(identity);
   if (!marked) return false;
-  return GenerationJobManager.settleNativeResponse(identity, mode);
+  const settled = await GenerationJobManager.settleNativeResponse(identity, mode);
+  if (settled) {
+    // Canonical replay is committed. Wake the existing durable mission lane, including recovery.
+    try {
+      require('./GlassHiveMissionAdjudicationService').wakeGlassHiveMissionAdjudications({
+        ownerId: identity.userId, conversationId: identity.conversationId,
+      });
+    } catch {
+      // The committed Main stays committed; existing durable reconciliation owns recovery.
+      require('@librechat/data-schemas').logger.warn('[NativeResponse] Mission wake remains pending');
+    }
+  }
+  return settled;
 }
 
 async function recoverNativeResponse(identity) {
@@ -593,7 +639,7 @@ async function persistNativeResponseCancellation(identity, snapshot, mode) {
       }
       if (stopped && mode !== 'augmentation') {
         return sanitizeMessageForTransmit(
-          preserveMainContextUpdate(sanitizeMessageForPersistence(row), row),
+          preserveMainContextUpdate(sanitizeMessageForPersistence(row, { purpose: 'document' }), row),
         );
       }
       const message = preserveMainContextUpdate(
@@ -608,6 +654,7 @@ async function persistNativeResponseCancellation(identity, snapshot, mode) {
             },
             'persist',
           ),
+          { purpose: 'document' },
         ),
         row,
       );
@@ -617,7 +664,7 @@ async function persistNativeResponseCancellation(identity, snapshot, mode) {
           : await db.settleNativeResponse(identity, 'cancelled', message);
       return saved?.messageId
         ? sanitizeMessageForTransmit(
-            preserveMainContextUpdate(sanitizeMessageForPersistence(saved), saved),
+            preserveMainContextUpdate(sanitizeMessageForPersistence(saved, { purpose: 'document' }), saved),
           )
         : null;
     },
@@ -699,6 +746,78 @@ async function recoverNativeResponses() {
   });
 }
 
+/* === VIVENTIUM START ===
+ * Terminal evidence joins the exact currently running Native Main, using its existing background
+ * input courier. A native enqueue is not consumption; the mission ledger still owns synthesis.
+ */
+async function offerMissionEvidenceToCurrentMain({
+  ownerId, conversationId, currentLeafMessageId, messages, mainAgentId, insights, onPending,
+}) {
+  if (!ownerId || !conversationId || !currentLeafMessageId || !mainAgentId) return false;
+  const byId = new Map((messages || []).map((message) => [message.messageId, message]));
+  const seen = new Set();
+  let cursor = currentLeafMessageId;
+  while (cursor && !seen.has(cursor)) {
+    seen.add(cursor);
+    const message = byId.get(cursor);
+    if (!message) return false;
+    cursor = message.parentMessageId;
+    if (message.isCreatedByUser === true) return false;
+    const row = await require('~/models').getNativeResponse(ownerId, message.messageId);
+    const identity = row?.nativeResponse;
+    if (!identity || identity.agentId !== mainAgentId) continue;
+    if (row.deletedAt || row.isCreatedByUser !== false || String(row.user) !== ownerId ||
+        row.conversationId !== conversationId || row.messageId !== message.messageId ||
+        row.messageId !== identity.responseMessageId || row.parentMessageId !== identity.source?.messageId ||
+        identity.userId !== ownerId || identity.conversationId !== conversationId) return false;
+    if (!['pending', 'prepared', 'completed'].includes(identity.status) || identity.finalReplayStoredAt > 0)
+      return false;
+    const store = GenerationJobManager.getJobStore();
+    const current = async () => {
+      const job = await store.getJob(identity.streamId);
+      if (!nativeJobMatches(job, identity) || job.status !== 'running' || job.generationCompleted ||
+          job.nativeResponseCancelled || !job.nativeResponse ||
+          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity) ||
+          !(await store.isCurrentLogicalTurn(identity.streamId))) return false;
+      if (identity.sourceOrderScope && identity.sourceSequence != null) {
+        const order = await GenerationJobManager.observeSourceOrder({
+          source_order_scope: identity.sourceOrderScope, source_sequence: identity.sourceSequence,
+        });
+        if (order.stale || order.latest_source_sequence !== identity.sourceSequence) return false;
+      }
+      return true;
+    };
+    if (!(await current())) return false;
+    if (!(await require('~/models').nativeResponseSourceMatches(identity)))
+      throw new Error('mission_current_main_source_unavailable');
+    await module.exports.deliverCompletedCortexBatchToRunningMain({
+      ownerId, conversationId, parentMessageId: identity.responseMessageId,
+      streamId: identity.streamId, insights,
+      context: JSON.stringify(insights?.some((insight) => insight.authority?.kind === 'durable_work_callback')
+        ? { accepted_work_evidence: insights } : { terminal_evidence: insights }),
+    }, current);
+    // Completion can win during the native offer. Only the exact still-running author defers.
+    const refreshed = await require('~/models').getNativeResponse(ownerId, identity.responseMessageId);
+    if (!refreshed?.nativeResponse ||
+        nativeIdentityJson(refreshed.nativeResponse) !== nativeIdentityJson(identity)) return false;
+    if (['failed', 'cancelled'].includes(refreshed.nativeResponse.status) ||
+        refreshed.nativeResponse.finalReplayStoredAt > 0) return false;
+    if (!(await current())) return false;
+    // The replay wake may run while this mission claim is still processing. Capture a single
+    // exact readiness recheck for after claim release; it does not poll or wait for Main.
+    onPending?.(async () => {
+      const latest = await require('~/models').getNativeResponse(ownerId, identity.responseMessageId);
+      return !latest?.nativeResponse ||
+        nativeIdentityJson(latest.nativeResponse) !== nativeIdentityJson(identity) ||
+        !['pending', 'prepared', 'completed'].includes(latest.nativeResponse.status) ||
+        latest.nativeResponse.finalReplayStoredAt > 0 || !(await current());
+    });
+    return true;
+  }
+  return false;
+}
+/* === VIVENTIUM END === */
+
 const mutateNativeResponseSources = (filter, operation, kind = 'edit') =>
   runNativeResponseTransaction(() =>
     require('~/models').mutateAcceptedMainContinuitySources(filter, () =>
@@ -714,10 +833,11 @@ const mutateNativeResponseSources = (filter, operation, kind = 'edit') =>
   );
 
 module.exports = {
+  offerMissionEvidenceToCurrentMain,
   deliverCompletedCortexBatchToRunningMain: (input, isEligible) =>
     deliverCortexBatchToRunningMain(input, {
-      // Canonical opt-in only; the producer still verifies the exact active artifact/capability.
-      liveContextEnabled: /^[a-f0-9]{64}$/.test(process.env.WPR_GROK_REVIEWED_BINARY_SHA256 || ''),
+      // The native runtime owns exact artifact and interjection capability validation.
+      liveContextEnabled: true,
       getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
       readAdmission: async (ownerId, messageId) =>
         (await require('~/models').getNativeResponse(ownerId, messageId))?.nativeResponse || null,

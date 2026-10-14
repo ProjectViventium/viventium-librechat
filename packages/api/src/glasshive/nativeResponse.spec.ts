@@ -389,6 +389,23 @@ describe('native response binding and recovery', () => {
     expect(saved?.attachments).toEqual(attachments);
     expect(prepareAttachments).toHaveBeenCalledWith(identity, response, candidate);
   });
+  it('allows ordinary Main selected retained attachments without a provider output_files envelope', async () => {
+    const d = deps();
+    const candidate = { text: 'Canonical answer.', authoritySha256: result.authority_sha256,
+      requestId: result.request_id, runId: result.run_id, responseJson: JSON.stringify(result.response) };
+    d.db.prepareNativeResponse.mockResolvedValue(nativeResponseDigest(candidate));
+    const prepared = { attachments: [{ file_id: 'selected' }], authorizePublication: jest.fn() };
+    const prepareAttachments = jest.fn(async () => prepared);
+    d.db.materializeNativeResponse.mockImplementationOnce(async (...args) => {
+      expect(prepareAttachments).not.toHaveBeenCalled();
+      const files = await args[5]();
+      expect(files).toBe(prepared);
+      return { text: candidate.text, attachments: files.attachments };
+    });
+    const saved = await createNativeResponseRecoveryService({ ...d, prepareAttachments }).recover(identity);
+    expect(saved?.attachments).toEqual(prepared.attachments);
+    expect(prepareAttachments).toHaveBeenCalledWith(identity, result.response, candidate);
+  });
   it('preserves canonical attachments on completed transmit/reload without fetching again', async () => {
     const d = deps();
     const candidate = {
@@ -1604,6 +1621,7 @@ describe('native response binding and recovery', () => {
   });
   it('reads exact authenticated result and materializes its canonical answer without private fields', async () => {
     const d = deps();
+    d.db.prepareNativeResponse.mockImplementationOnce(async (_identity, candidate) => nativeResponseDigest(candidate));
     const service = createNativeResponseRecoveryService(d);
     expect(await service.recover(identity)).toEqual({ text: 'Canonical answer.' });
     const [url, options] = d.fetch.mock.calls[0];

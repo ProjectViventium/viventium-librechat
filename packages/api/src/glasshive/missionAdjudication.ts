@@ -3,26 +3,30 @@
  * Purpose:
  * - Keep worker callbacks as neutral lifecycle/status events.
  * - Persist terminal worker evidence before acknowledgement.
- * - Coalesce terminal evidence for two seconds per account, then feed it into the existing
+ * - Coalesce terminal evidence for two seconds per owner/conversation, then feed it into the existing
  *   configured Main/Phase-B follow-up machinery. Semantic {NTA}/redundancy may stay silent, but a
  *   useful mission result is not discarded merely because presentation moved to a newer turn.
  * - Leave a restart-safe pending/failed ledger that can be reconciled without replaying prose.
  * === VIVENTIUM END === */
 
 import * as crypto from 'crypto';
+import { canonicalizeGlassHiveCallbackRef } from '../trace/orchestrationTraceHooks';
 import {
   GLASSHIVE_NATIVE_MEDIA_MAX_BYTES,
   GLASSHIVE_NATIVE_MEDIA_MAX_IMAGES,
   normalizeGlassHiveNativeMedia,
+  collectGlassHiveNativeMediaReferences,
 } from './nativeMedia';
-import type { GlassHiveNativeMedia } from './nativeMedia';
+import type { GlassHiveNativeMedia, GlassHiveNativeMediaSelection } from './nativeMedia';
 import { normalizeGlassHiveRunInput } from './missionInput';
+import { nativeWorkInputBinding } from './nativeWorkInput';
 import type { GlassHiveRunInput } from './missionInput';
 import { evidenceId, legacyEvidenceId } from './missionEvidenceIdentity';
 import { normalizeNativeCallbackOutputFiles } from './nativeOutputFiles';
-import type { NativeCallbackOutputFiles, NativeOutputDeliveryAttachment } from './nativeOutputFiles';
+import type { NativeCallbackOutputFiles, NativeOutputDeliveryAttachment, NativeFollowUpOutputFiles } from './nativeOutputFiles';
 import { loadFeelingsReadContext } from '../feelings/service';
 
+import type { TerminalCallbackTransactionOptions } from './terminalCallbackTransaction';
 import type { Logger } from 'winston';
 import type { ClientSession, Model } from 'mongoose';
 import type { Document } from 'mongodb';
@@ -74,6 +78,7 @@ export interface GlassHiveMissionBinding {
   ownerId?: string;
   conversationId?: string;
   anchorMessageId?: string;
+  requestedParentMessageId?: string;
   workRef?: string;
   mainAgentId?: string;
   runId?: string;
@@ -92,6 +97,7 @@ export interface GlassHiveMissionCallbackBody {
   output_files?: unknown;
   event?: string;
   callback_ts?: string;
+  callback_created_at?: string;
   work_state?: string;
   work_terminal?: boolean;
   native_media?: unknown;
@@ -100,6 +106,8 @@ export interface GlassHiveMissionCallbackBody {
   message?: string;
   failure_code?: string;
   failure_class?: string;
+  failure_user_message?: string;
+  pending_native_input?: unknown;
   error_code?: string;
   error?: { code?: string };
 }
@@ -136,6 +144,7 @@ export interface GlassHiveMissionEvidence {
   ownerId: string;
   conversationId: string;
   anchorMessageId: string;
+  requestedParentMessageId?: string;
   mainAgentId: string;
   surface: string;
   destinations: GlassHiveMissionDestination[];
@@ -145,12 +154,14 @@ export interface GlassHiveMissionEvidence {
   outputFiles?: NativeCallbackOutputFiles;
   state: string;
   attempts: number;
+  callbackCreatedAt?: string;
   createdAt: Date;
   updatedAt: Date;
 }
 
 export interface GlassHiveMissionLimitInput {
   ownerId?: string;
+  conversationId?: string;
   limit?: number;
 }
 
@@ -176,6 +187,7 @@ export interface GlassHiveMissionReconciliationSummary {
 
 export interface GlassHiveMissionAdjudicationService {
   COALESCE_MS: number;
+  wakeGlassHiveMissionAdjudications: (input: GlassHiveMissionLimitInput) => void;
   clearAdjudicationTimersForTests: () => void;
   enqueueGlassHiveMissionAdjudication: (
     input?: GlassHiveMissionAdjudicationInput,
@@ -230,6 +242,11 @@ export interface GlassHiveMissionAdjudicationDependencies {
     reference: GlassHiveTerminalCallbackAcceptedOperationReference;
     session: ClientSession;
   }) => Promise<boolean>;
+  fenceGlassHiveCallbackRunState: (input: {
+    binding: { ownerId: string; originRef: string; workRef: string };
+    body: { event: string; worker_id: string; run_id: string };
+    effectSession: ClientSession;
+  }) => Promise<void>;
   getConvo: (
     ownerId: string,
     conversationId: string,
@@ -260,7 +277,11 @@ export interface GlassHiveMissionAdjudicationDependencies {
     req: RuntimeRecord;
     rows: RuntimeRecord[];
     message: RuntimeRecord;
-  }) => Promise<NativeOutputDeliveryAttachment[]>;
+    nativeOutputFiles?: NativeFollowUpOutputFiles;
+    selectedNativeMedia?: GlassHiveNativeMediaSelection[];
+    sourceMessageId?: string;
+  }) => Promise<NativeOutputDeliveryAttachment[] | { attachments: NativeOutputDeliveryAttachment[];
+    authorizePublication: (session: ClientSession) => Promise<void> }>;
   isGlassHiveWorkTerminalCallback: (body: GlassHiveMissionCallbackBody) => boolean;
   recordGlassHiveAdjudicationOutcome: (input: object) => Promise<object | null>;
   recordOrchestrationTraceDelivery: (input: object) => Promise<object | null>;
@@ -272,9 +293,30 @@ export interface GlassHiveMissionAdjudicationDependencies {
   deferGlassHiveTerminalCallbackAfterCommit: (operation: () => void) => boolean;
   runGlassHiveTerminalCallbackTransaction: <T>(
     operation: (session: ClientSession) => T | Promise<T>,
+    options?: TerminalCallbackTransactionOptions,
   ) => Promise<T>;
   enqueueGlassHiveCallbackDelivery: (input: object) => Promise<CallbackDeliverySummary>;
   getTerminalCallbackResultModel: () => Model<IGlassHiveTerminalCallbackResult>;
+}
+
+/** Immutable signed native outbox clock, with microsecond precision retained. */
+export function normalizeGlassHiveCallbackCreatedAt(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const parts = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(?:Z|\+00:00)$/.exec(value);
+  if (!parts) return null;
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 19) !== parts[1]) return null;
+  return `${parts[1]}.${(parts[2] || '').padEnd(6, '0')}Z`;
+}
+
+export function shouldAdjudicateGlassHiveNeedsInput(body: GlassHiveMissionCallbackBody = {}): boolean {
+  const pending = body.pending_native_input as RuntimeRecord | undefined;
+  const bound = nativeWorkInputBinding(pending, String(body.run_id || ''));
+  const nativeRequest = bound && ['question', 'permission'].includes(pending?.kind) &&
+    pending?.state === 'pending' && pending?.mode === 'form';
+  return body.event === 'run.needs_input' && body.work_terminal !== true &&
+    body.work_state === 'needs_input' &&
+    !nativeRequest;
 }
 
 export async function isGlassHiveCleanupSourceTombstoned({
@@ -312,6 +354,7 @@ export function createGlassHiveMissionAdjudicationService(
     logger,
     buildVoiceWorkerCompletionPresentation,
     fenceGlassHiveTerminalCallbackAcceptedOperation,
+    fenceGlassHiveCallbackRunState,
     getConvo,
     getUserById,
     getFeelingState,
@@ -339,9 +382,9 @@ const MAX_EVIDENCE_CHARS = 64_000;
 const MAX_ADJUDICATION_ATTEMPTS = 10;
 const LEGACY_DELIVERY_PARENT_REDRIVE_VERSION = 1;
 const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
-const ownerTimers = new Map<string, ReturnType<typeof setTimeout>>();
-const ownerFlushes = new Map<string, Promise<RuntimeRecord>>();
-const ownerReschedules = new Set<string>();
+const conversationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const conversationFlushes = new Map<string, Promise<RuntimeRecord>>();
+const conversationReschedules = new Set<string>();
 
 function terminalCallbackResultModel(): Model<IGlassHiveTerminalCallbackResult> {
   return getTerminalCallbackResultModel();
@@ -380,8 +423,14 @@ function timestamp(value: unknown): number | null {
 }
 
 function terminalEvidence(body: GlassHiveMissionCallbackBody = {}): string {
+  if (shouldAdjudicateGlassHiveNeedsInput(body)) {
+    return sanitizeGlassHiveCallbackText(
+      body.failure_user_message || body.full_message || body.message,
+      { maxLength: MAX_EVIDENCE_CHARS, ownerResult: true },
+    );
+  }
   const event = safeText(body.event, 64);
-  if (!['run.completed', 'run.failed'].includes(event)) return '';
+  if (!['run.completed', 'run.failed', 'run.cancelled', 'run.interrupted'].includes(event)) return '';
   if (!isGlassHiveWorkTerminalCallback(body)) return '';
   const full = sanitizeGlassHiveCallbackText(body.full_message, {
     maxLength: MAX_EVIDENCE_CHARS,
@@ -400,6 +449,7 @@ function terminalEvidence(body: GlassHiveMissionCallbackBody = {}): string {
     );
     return code ? `Mission failed with structured code ${code}.` : 'Mission failed.';
   }
+  if (['run.cancelled', 'run.interrupted'].includes(event)) return `Mission ${event.slice(4)}.`;
   return 'Mission completed without additional textual evidence.';
 }
 
@@ -486,9 +536,36 @@ function persistedTerminalCallbackReference(
   });
 }
 
-async function fenceMissionReferences(rows: RuntimeRecord[], session: ClientSession): Promise<void> {
+async function latestAttentionEvidenceMatches(row: RuntimeRecord, session?: ClientSession): Promise<boolean> {
+  const latest = await collection().findOne({ ownerId: row.ownerId, originRef: row.originRef,
+    workRef: row.workRef, workerId: row.workerId, runId: row.runId,
+    event: 'run.needs_input', workTerminal: false, workState: 'needs_input' },
+  { ...(session ? { session } : {}), sort: row.callbackCreatedAt
+      ? { callbackCreatedAt: -1, _id: -1 }
+      : { callbackCreatedAt: -1, createdAt: -1, _id: -1 }, projection: { _id: 1 } });
+  return safeText(latest?._id, 160) === safeText(row._id, 160);
+}
+
+async function fenceMissionReferences(
+  rows: RuntimeRecord[], session: ClientSession, requireNewestAttention = true,
+): Promise<void> {
   const references = new Map<string, PersistedTerminalCallbackReference>();
   for (const row of rows) {
+    if (row.event === 'run.needs_input' && row.workTerminal !== true && row.workState === 'needs_input') {
+      const current = await mongoose.connection.collection('viventium_external_work').findOne({
+        _id: row.originRef, ownerId: row.ownerId, workRef: row.workRef,
+        workerId: row.workerId, runId: row.runId, externalState: 'needs_input',
+      }, { session, projection: { _id: 1 } });
+      if (!current || (requireNewestAttention && !(await latestAttentionEvidenceMatches(row, session))))
+        throw Object.assign(new Error('glasshive_mission_evidence_superseded'), {
+        code: 'glasshive_mission_evidence_superseded',
+      });
+      await fenceGlassHiveCallbackRunState({
+        binding: { ownerId: row.ownerId, originRef: row.originRef, workRef: row.workRef },
+        body: { event: row.event, worker_id: row.workerId, run_id: row.runId },
+        effectSession: session,
+      });
+    }
     const current = persistedTerminalCallbackReference(row);
     if (current) references.set(current.resultKey, current);
   }
@@ -509,13 +586,18 @@ async function fenceMissionReferences(rows: RuntimeRecord[], session: ClientSess
 async function runFencedMissionTransaction<T>(
   rows: RuntimeRecord[],
   operation: RuntimeOperation<T>,
+  options: TerminalCallbackTransactionOptions = {},
+  requireNewestAttention = true,
 ): Promise<T> {
-  if (!rows.some((row) => persistedTerminalCallbackReference(row))) return operation();
+  const attention = rows.filter((row) => row.event === 'run.needs_input' &&
+    row.workTerminal !== true && row.workState === 'needs_input');
+  if (!attention.length && !rows.some((row) => persistedTerminalCallbackReference(row))) return operation();
   let result: T | undefined;
   await runGlassHiveTerminalCallbackTransaction(async (session: ClientSession) => {
+    if (attention.length) await fenceMissionReferences(attention, session, requireNewestAttention);
     result = await operation();
-    await fenceMissionReferences(rows, session);
-  });
+    await fenceMissionReferences(rows, session, requireNewestAttention);
+  }, options);
   return result as T;
 }
 
@@ -530,6 +612,7 @@ async function persistGlassHiveMissionEvidence({
   const ownerId = safeText(binding?.ownerId, 160);
   const conversationId = safeText(binding?.conversationId, 160);
   const anchorMessageId = safeText(binding?.anchorMessageId, 160);
+  const requestedParentMessageId = safeText(binding?.requestedParentMessageId, 160);
   if (!evidence || !originRef || !ownerId || !conversationId || !anchorMessageId) return null;
   const now = new Date();
   const id = evidenceId({ ownerId, originRef, body });
@@ -563,14 +646,21 @@ async function persistGlassHiveMissionEvidence({
     workRef: safeText(binding?.workRef || body.work_ref, 160),
     workerId: safeText(body.worker_id, 160),
     runId: safeText(body.run_id, 160),
+    ...(safeText(binding?.attemptId, 160) ? { attemptId: safeText(binding?.attemptId, 160) } : {}),
     ...(outputFiles ? { attemptId: outputFiles.attempt_id, outputFiles } : {}),
     event: safeText(body.event, 64),
     workState: safeText(body.work_state, 32),
     workTerminal: body.work_terminal === true,
     ...(traceIdentity || {}),
+    ...(shouldAdjudicateGlassHiveNeedsInput(body)
+      ? { callbackRef: canonicalizeGlassHiveCallbackRef(String(body.callback_id || '')),
+          ...(normalizeGlassHiveCallbackCreatedAt(body.callback_created_at)
+            ? { callbackCreatedAt: normalizeGlassHiveCallbackCreatedAt(body.callback_created_at)! } : {}) }
+      : {}),
     ownerId,
     conversationId,
     anchorMessageId,
+    ...(requestedParentMessageId ? { requestedParentMessageId } : {}),
     mainAgentId: safeText(binding?.mainAgentId, 160),
     ...(binding?.feelingsIsolated === true ? { feelingsIsolated: true } : {}),
     surface: normalizedSurface(binding),
@@ -593,7 +683,7 @@ async function persistGlassHiveMissionEvidence({
         }
       : {}),
   };
-  await collection().updateOne(
+  const persist = () => collection().updateOne(
     {
       $or: [
         { _id: id },
@@ -605,37 +695,47 @@ async function persistGlassHiveMissionEvidence({
     { $setOnInsert: row },
     { upsert: true, ...(effectSession ? { session: effectSession } : {}) },
   );
+  if (shouldAdjudicateGlassHiveNeedsInput(body)) {
+    if (effectSession) {
+      await fenceMissionReferences([row], effectSession, false);
+      await persist();
+    } else await runFencedMissionTransaction([row], persist, {}, false);
+  } else await persist();
   return row;
 }
 
-function scheduleOwnerAdjudication(ownerId: unknown): void {
-  const key = safeText(ownerId, 160);
-  if (!key) return;
-  if (ownerFlushes.has(key)) {
-    ownerReschedules.add(key);
+function scheduleConversationAdjudication(ownerId: unknown, conversationId: unknown): void {
+  const owner = safeText(ownerId, 160);
+  if (!owner) return;
+  const conversation = safeText(conversationId, 160);
+  // All surfaces and groups sharing Main history retain one lane. Unbound legacy rows share
+  // the owner's fallback lane; another conversation must not wait behind its provider retry.
+  const key = JSON.stringify([owner, conversation]);
+  if (conversationFlushes.has(key)) {
+    conversationReschedules.add(key);
     return;
   }
-  if (ownerTimers.has(key)) return;
+  if (conversationTimers.has(key)) return;
   const timer = setTimeout(() => {
-    ownerTimers.delete(key);
+    conversationTimers.delete(key);
     const flush = Promise.resolve().then(() =>
-      flushGlassHiveMissionAdjudications({ ownerId: key }),
+      flushGlassHiveMissionAdjudications({ ownerId: owner, conversationId: conversation }),
     );
-    ownerFlushes.set(key, flush);
+    conversationFlushes.set(key, flush);
     flush
       .catch((error: RuntimeError) => {
-        logger.warn('[VIVENTIUM][glasshive-adjudication] Account flush failed', {
+        logger.warn('[VIVENTIUM][glasshive-adjudication] Conversation flush failed', {
           code: safeText(error?.code || error?.name || 'flush_failed', 120),
         });
       })
       .finally(() => {
-        if (ownerFlushes.get(key) !== flush) return;
-        ownerFlushes.delete(key);
-        if (ownerReschedules.delete(key)) scheduleOwnerAdjudication(key);
+        if (conversationFlushes.get(key) !== flush) return;
+        conversationFlushes.delete(key);
+        if (conversationReschedules.delete(key)) scheduleConversationAdjudication(owner, conversation);
       });
   }, COALESCE_MS);
   timer.unref?.();
-  ownerTimers.set(key, timer);
+  conversationTimers.set(key, timer);
 }
 
 async function enqueueGlassHiveMissionAdjudication({
@@ -651,7 +751,7 @@ async function enqueueGlassHiveMissionAdjudication({
     effectSession,
   });
   if (row) {
-    const schedule = () => scheduleOwnerAdjudication(row.ownerId);
+    const schedule = () => scheduleConversationAdjudication(row.ownerId, row.conversationId);
     if (!deferGlassHiveTerminalCallbackAfterCommit(schedule)) schedule();
   }
   return row;
@@ -963,7 +1063,18 @@ async function findPriorScopedAdjudication(
 }
 
 async function eligibleAdjudicationGroups(pending: RuntimeRecord[]): Promise<RuntimeRecord[]> {
-  const groups = await pinPendingAdjudicationGroups(pending);
+  const current = [];
+  for (const row of pending) {
+    if (row.event === 'run.needs_input' && row.workTerminal === false &&
+        row.workState === 'needs_input' && !(await latestAttentionEvidenceMatches(row))) {
+      await collection().updateOne({ _id: row._id, state: 'pending' }, { $set: {
+        state: 'superseded', updatedAt: new Date(), errorCode: 'glasshive_mission_evidence_superseded',
+      } });
+      continue;
+    }
+    current.push(row);
+  }
+  const groups = await pinPendingAdjudicationGroups(current);
   const eligible = [];
   for (const group of groups) {
     if (!group.complete) continue;
@@ -1121,16 +1232,44 @@ async function resolveMissionContinuationTarget(rows: RuntimeRecord[]): Promise<
       code: 'mission_origin_cleanup_tombstoned',
     });
   }
-  const originConversation = await getConvo(first.ownerId, first.conversationId, 'conversationId');
+  const sourceMessageId = safeText(first.requestedParentMessageId, 160);
+  const [originConversation, originMessages] = await Promise.all([
+    getConvo(first.ownerId, first.conversationId, 'conversationId'),
+    mongoose.connection.collection('messages').find({
+      user: first.ownerId,
+      conversationId: first.conversationId,
+      messageId: { $in: [...new Set([first.anchorMessageId, sourceMessageId].filter(Boolean))] },
+    }, { projection: { user: 1, conversationId: 1, messageId: 1, isCreatedByUser: 1,
+      deletedAt: 1, cleanupTombstone: 1 } }).toArray(),
+  ]);
   if (originConversation) {
+    const anchorPresent = originMessages.some((message) => message.messageId === first.anchorMessageId);
+    const source = originMessages.find((message) => message.messageId === sourceMessageId);
+    const sourcePresent = source?.isCreatedByUser === true &&
+      String(source.user || '') === String(first.ownerId) &&
+      String(source.conversationId || '') === String(first.conversationId) &&
+      !source.deletedAt && !source.cleanupTombstone?.tombstonedAt;
+    if (!anchorPresent && source && (source.deletedAt || source.cleanupTombstone?.tombstonedAt)) {
+      throw Object.assign(new Error('mission_origin_cleanup_tombstoned'), {
+        code: 'mission_origin_cleanup_tombstoned',
+      });
+    }
+    if (!anchorPresent && !sourcePresent) {
+      throw Object.assign(new Error('mission_origin_source_unavailable'), {
+        code: 'mission_origin_source_unavailable',
+      });
+    }
+    // The removed anchor remains attribution/tombstone identity. Context walks from the durable
+    // owned source so later corrections and Main replies remain visible to this same continuation.
+    const logicalParentMessageId = anchorPresent ? first.anchorMessageId : sourceMessageId;
     const deliveryParentMessageId = await pinMissionDeliveryParent(
       rows,
-      first.anchorMessageId,
+      logicalParentMessageId,
       prior,
     );
     return {
       conversationId: first.conversationId,
-      parentMessageId: first.anchorMessageId,
+      parentMessageId: logicalParentMessageId,
       deliveryParentMessageId,
       accountContinuation: false,
     };
@@ -1264,7 +1403,7 @@ function groupFollowUpInput(
   rows: RuntimeRecord[],
   { target, authorContext }: RuntimeRecord,
 ): RuntimeRecord {
-  // The owner-wide timer opens one coalescing window. Keep conversation/surface boundaries safe,
+  // The conversation timer opens one coalescing window. Keep existing surface boundaries safe,
   // and anchor the combined continuation to the latest mission turn within that destination.
   const { req, agent } = authorContext;
   return {
@@ -1279,10 +1418,8 @@ function groupFollowUpInput(
         cortexName: 'Mission evidence',
         insight: row.outputFiles ? `${JSON.stringify({
           output_files: {
+            ...row.outputFiles,
             count: row.outputFiles.files.length,
-            files: row.outputFiles.files.map((file: NativeCallbackOutputFiles['files'][number]) => ({
-              filename: file.filename, mime_type: file.mime_type, bytes: file.bytes,
-            })),
             rejected: row.outputFiles.rejected || [],
           },
         })}\n\n${row.evidence}` : row.evidence,
@@ -1290,7 +1427,7 @@ function groupFollowUpInput(
         ...(row.runInput ? { runInput: row.runInput } : {}),
         maxPromptChars: 12_000,
         authority: {
-          kind: 'durable_terminal_callback',
+          kind: row.workTerminal === true ? 'durable_terminal_callback' : 'durable_work_callback',
           runId: safeText(row.runId, 160),
           event: safeText(row.event, 64),
           workState: safeText(
@@ -1325,9 +1462,18 @@ async function persistPreparedGroupSynthesis(
       ...groupFollowUpInput(rows, context),
       dependencies: {
         prepareAttachments: async (message: RuntimeRecord) => {
-          if (!rows.some((row) => row.outputFiles)) return [];
+          if (!rows.some((row) => row.outputFiles) && !prepared.nativeOutputFiles &&
+              !prepared.selectedNativeMedia?.length &&
+              !collectGlassHiveNativeMediaReferences(String(message.text || '')).length) return [];
           if (!prepareMissionOutputFiles) throw new Error('native_output_file_storage_unavailable');
-          return prepareMissionOutputFiles({ req: context.authorContext.req, rows, message });
+          return prepareMissionOutputFiles({
+            req: context.authorContext.req, rows, message,
+            selectedNativeMedia: prepared.selectedNativeMedia,
+            ...(prepared.nativeOutputFiles ? {
+              nativeOutputFiles: prepared.nativeOutputFiles,
+              sourceMessageId: context.target.parentMessageId,
+            } : {}),
+          });
         },
       },
     },
@@ -1386,32 +1532,30 @@ async function finishRows(
   }: RuntimeRecord,
 ): Promise<void> {
   const now = new Date();
-  await Promise.all(
-    rows.map(async (row) => {
-      await collection().updateOne(
-        { _id: row._id, state: 'processing' },
-        {
-          $set: {
-            state,
-            ...(preserveFollowUpMessageIds ? {} : { followUpMessageId }),
-            errorCode,
-            updatedAt: now,
-            ...(['failed', 'delivery_pending'].includes(state)
-              ? { nextAttemptAt: new Date(Date.now() + 30_000) }
-              : {}),
-          },
+  for (const row of rows) {
+    await collection().updateOne(
+      { _id: row._id, state: 'processing' },
+      {
+        $set: {
+          state,
+          ...(preserveFollowUpMessageIds ? {} : { followUpMessageId }),
+          errorCode,
+          updatedAt: now,
+          ...(['failed', 'delivery_pending'].includes(state)
+            ? { nextAttemptAt: new Date(Date.now() + 30_000) }
+            : {}),
         },
-      );
-      await recordGlassHiveAdjudicationOutcome({
-        originRef: row.originRef,
-        state: ['delivery_pending', 'deadletter'].includes(state) ? 'failed' : state,
-        followUpMessageId: preserveFollowUpMessageIds
-          ? safeText(row.followUpMessageId, 160)
-          : followUpMessageId,
-        errorCode,
-      });
-    }),
-  );
+      },
+    );
+    await recordGlassHiveAdjudicationOutcome({
+      originRef: row.originRef,
+      state: ['delivery_pending', 'deadletter'].includes(state) ? 'failed' : state,
+      followUpMessageId: preserveFollowUpMessageIds
+        ? safeText(row.followUpMessageId, 160)
+        : followUpMessageId,
+      errorCode,
+    });
+  }
 }
 
 function groupFollowUpConflict(): RuntimeError {
@@ -1616,7 +1760,7 @@ async function enqueueMainAuthoredFollowUpDelivery({
     timestamp(row.webPresentedAt) != null;
   const summary = await enqueueGlassHiveCallbackDelivery({
     body: {
-      callback_id: traceIdentity?.callbackRef || `main:${row.originRef}:${followUp.messageId}`,
+      callback_id: traceIdentity?.callbackRef || row.callbackRef || `main:${row.originRef}:${followUp.messageId}`,
       ...(traceIdentity ? { attempt_number: traceIdentity.attemptNumber } : {}),
       event: 'main.followup',
       origin_ref: row.originRef,
@@ -1644,6 +1788,8 @@ async function enqueueMainAuthoredFollowUpDelivery({
       destinations: hasCommittedWebPresentation && !destinations.some(
         (destination: RuntimeRecord) => ['librechat', 'workbench'].includes(safeText(destination.surface, 32)),
       ) ? [...destinations, { surface: 'librechat' }] : destinations,
+      ...(deliveryContext.workerCompletionBindings
+        ? { workerCompletionBindings: deliveryContext.workerCompletionBindings } : {}),
       ...(deliveryContext.workerCompletionPresentation
         ? { workerCompletionPresentation: deliveryContext.workerCompletionPresentation }
         : {}),
@@ -1670,6 +1816,11 @@ async function enqueueMainAuthoredFollowUpDelivery({
 }
 
 function voiceWorkerCompletionBinding(row: RuntimeRecord): RuntimeRecord {
+  if (row.event === 'run.needs_input' && row.workTerminal === false && row.workState === 'needs_input') {
+    return { kind: 'nonterminal_attention', originRef: row.originRef, workRef: row.workRef,
+      workerId: row.workerId, runId: row.runId, callbackRef: row.callbackRef,
+      event: 'run.needs_input', workTerminal: false, evidenceId: row.evidenceId };
+  }
   const traceIdentity = exactTraceIdentity(row);
   const reference = persistedTerminalCallbackReference(row);
   if (!traceIdentity || !reference) {
@@ -1699,6 +1850,13 @@ async function mainFollowUpDeliveryContext({
   target,
 }: RuntimeRecord): Promise<RuntimeRecord> {
   const representative = rows[rows.length - 1];
+  const workerCompletionBindings = rows.every(
+    (row: RuntimeRecord) =>
+      (row.event === 'run.needs_input' && row.workTerminal === false && row.workState === 'needs_input') ||
+      (persistedTerminalCallbackReference(row) && Number(exactTraceIdentity(row)?.attemptNumber) > 0),
+  )
+    ? rows.map(voiceWorkerCompletionBinding)
+    : null;
   const destinations = Array.isArray(representative.destinations)
     ? representative.destinations
     : [];
@@ -1707,18 +1865,24 @@ async function mainFollowUpDeliveryContext({
       (destination: RuntimeRecord) => safeText(destination?.surface, 32) === 'voice',
     )
   ) {
-    return { destinations };
+    return { destinations, workerCompletionBindings };
   }
   const activeCall = await getActiveCallSessionForConversation({
     userId: safeText(representative.ownerId, 160),
     conversationId: safeText(target?.conversationId || representative.conversationId, 160),
   });
-  if (!activeCall?.callSessionId) {
+  // No runtime attempt means there is no Worker speech-attempt authority to bind.
+  // Preserve the authored group on the existing linked-text path instead of aborting all surfaces.
+  if (
+    !activeCall?.callSessionId ||
+    !workerCompletionBindings
+  ) {
     return {
       destinations: destinations.filter(
         (destination: RuntimeRecord) => safeText(destination?.surface, 32) !== 'voice',
       ),
       linkedTextFallback: true,
+      workerCompletionBindings,
     };
   }
   const responseText = safeText(followUp?.text, MAX_EVIDENCE_CHARS);
@@ -1728,7 +1892,7 @@ async function mainFollowUpDeliveryContext({
     callSessionId: safeText(activeCall.callSessionId, 160),
     responseMessageId: safeText(followUp?.messageId, 160),
     responseText,
-    bindings: rows.map(voiceWorkerCompletionBinding),
+    bindings: workerCompletionBindings,
   });
   return {
     destinations: destinations.map((destination: RuntimeRecord) =>
@@ -1741,17 +1905,25 @@ async function mainFollowUpDeliveryContext({
         : destination,
     ),
     workerCompletionPresentation,
+    workerCompletionBindings,
   };
 }
 
 async function flushGlassHiveMissionAdjudications({
   ownerId,
+  conversationId,
   limit = 50,
 }: GlassHiveMissionLimitInput = {}): Promise<GlassHiveMissionFlushSummary> {
   const key = safeText(ownerId, 160);
   if (!key) return { claimed: 0, groups: 0, visible: 0, silent: 0, failed: 0 };
   const cursor = collection()
-    .find({ ownerId: key, state: 'pending' })
+    .find({
+      ownerId: key,
+      state: 'pending',
+      ...(conversationId === undefined ? {} : {
+        conversationId: safeText(conversationId, 160) || { $in: ['', null] },
+      }),
+    })
     .sort({ createdAt: 1 })
     .limit(Math.max(1, Math.min(Number(limit) || 50, 100)));
   const pending = await cursor.toArray();
@@ -1792,6 +1964,31 @@ async function flushGlassHiveMissionAdjudications({
         );
         stage = 'prepare_synthesis';
         preparedFollowUp = await prepareGroupSynthesis(rows, { target, authorContext });
+        if (preparedFollowUp?.currentMainPending === true) {
+          // An enqueue is not consumption. Release only this exact claim, preserving evidence,
+          // group membership and delivery history until the existing Main replay event wakes it.
+          await runFencedMissionTransaction(rows, async () => {
+            for (const row of rows) await collection().updateOne(
+              { _id: row._id, state: 'processing', attempts: row.attempts,
+                processingAt: row.processingAt },
+              { $set: { state: 'pending', updatedAt: new Date() },
+                $unset: { processingAt: '' }, $inc: { attempts: -1 } },
+            );
+          });
+          // A replay wake can precede release (including direct reconciliation flushes).
+          // Recheck once after release and reuse the same lane only if Main is now ready.
+          if (typeof preparedFollowUp.currentMainReadyAfterRelease === 'function') {
+            try {
+              if (await preparedFollowUp.currentMainReadyAfterRelease()) {
+                scheduleConversationAdjudication(rows[0].ownerId,
+                  (target as RuntimeRecord | null)?.conversationId);
+              }
+            } catch {
+              dependencies.logger?.warn?.('[MissionAdjudication] Main readiness remains pending');
+            }
+          }
+          continue;
+        }
         if (preparedFollowUp?.followUpDecisionRecord?.generationFailed === true) {
           throw Object.assign(new Error('mission_synthesis_generation_failed'), {
             code: 'mission_synthesis_generation_failed',
@@ -1821,13 +2018,16 @@ async function flushGlassHiveMissionAdjudications({
           if (
             decision?.generationFailed === false &&
             decision?.forceVisibleFollowUp === false &&
-            decision?.llmResult === 'nta' &&
-            decision?.selectedStrategy === 'no_response_suppressed'
+            ((decision?.llmResult === 'nta' &&
+              decision?.selectedStrategy === 'no_response_suppressed') ||
+             (decision?.nativeSilentDecision === true &&
+              decision?.llmResult === 'native_silent' &&
+              decision?.selectedStrategy === 'native_silent_suppressed'))
           ) {
             // Preserve Main's explicit semantic decision through the same
             // accepted-result fence; absent or failed generation stays retryable.
             stage = 'settle_silent_callback_presentation';
-            await Promise.all(rows.map(markSettledCallbackStatusInternal));
+            for (const row of rows) await markSettledCallbackStatusInternal(row);
             stage = 'finish_silent';
             await finishRows(rows, { state: 'silent' });
             return 'silent';
@@ -1856,33 +2056,38 @@ async function flushGlassHiveMissionAdjudications({
       // Both phases retain the same accepted callback fence; delivery reuses the committed ID.
       authoredCommitted = true;
       const completedState = await runFencedMissionTransaction(rows, async () => {
+        // Each native transaction attempt starts from the same committed row snapshot.
+        // Presentation helpers mutate these copies; an aborted attempt cannot seed its replay.
+        const deliveryRows = rows.map((row) => ({ ...row }));
         if (!followUp?.messageId) {
           throw Object.assign(new Error('mission_authored_message_unavailable'), {
             code: 'mission_authored_message_unavailable',
           });
         }
         stage = 'settle_callback_presentation';
-        await Promise.all(rows.map(markSettledCallbackStatusInternal));
+        for (const row of deliveryRows) await markSettledCallbackStatusInternal(row);
         stage = 'resolve_surface_delivery';
-        const deliveryContext = await mainFollowUpDeliveryContext({ rows, followUp, target });
+        const deliveryContext = await mainFollowUpDeliveryContext({ rows: deliveryRows, followUp, target });
         stage = 'record_web_presentation';
-        await Promise.all(rows.map((row) => recordMainWebPresentationDelivery({
-          row, followUp, linkedTextFallback: deliveryContext.linkedTextFallback === true,
-        })));
+        for (const row of deliveryRows) {
+          await recordMainWebPresentationDelivery({
+            row, followUp, linkedTextFallback: deliveryContext.linkedTextFallback === true,
+          });
+        }
         stage = 'enqueue_surface_delivery';
         await enqueueMainAuthoredFollowUpDelivery({
-          row: rows[rows.length - 1],
+          row: deliveryRows[deliveryRows.length - 1],
           followUp,
           target,
           deliveryContext,
         });
         stage = 'finish';
-        await finishRows(rows, {
+        await finishRows(deliveryRows, {
           state: 'completed',
           followUpMessageId: safeText(followUp.messageId, 160),
         });
         return 'completed';
-      });
+      }, { retry: 'native' });
       summary[completedState === 'completed' ? 'visible' : 'silent'] += rows.length;
     } catch (error) {
       const runtimeError = error as RuntimeError;
@@ -1913,7 +2118,7 @@ async function flushGlassHiveMissionAdjudications({
         rawErrorCode && rawErrorCode !== 'Error'
           ? rawErrorCode
           : `mission_adjudication_${stage}_failed`;
-      logger.warn('[VIVENTIUM][glasshive-adjudication] Mission evidence retry failed', {
+      logger.warn(`[VIVENTIUM][glasshive-adjudication] Mission evidence retry failed ${JSON.stringify({ stage, code: errorCode })}`, {
         stage,
         code: errorCode,
       });
@@ -2038,7 +2243,7 @@ async function redriveLegacyDeletedOriginMissionAdjudications({
         summary.skipped += 1;
         continue;
       }
-      scheduleOwnerAdjudication(row.ownerId);
+      scheduleConversationAdjudication(row.ownerId, row.conversationId);
       summary.redriven += 1;
     } catch (error) {
       const runtimeError = error as RuntimeError;
@@ -2122,20 +2327,22 @@ async function reconcilePendingGlassHiveMissionAdjudications({
         { $set: { state: 'pending', updatedAt: new Date() } },
       );
     }
-    scheduleOwnerAdjudication(ownerId);
+    scheduleConversationAdjudication(ownerId, row.conversationId);
   }
   return { rows: rows.length, owners: owners.size };
 }
 
 function clearAdjudicationTimersForTests(): void {
-  for (const timer of ownerTimers.values()) clearTimeout(timer);
-  ownerTimers.clear();
-  ownerFlushes.clear();
-  ownerReschedules.clear();
+  for (const timer of conversationTimers.values()) clearTimeout(timer);
+  conversationTimers.clear();
+  conversationFlushes.clear();
+  conversationReschedules.clear();
 }
 
 return {
   COALESCE_MS,
+  wakeGlassHiveMissionAdjudications: ({ ownerId, conversationId }: GlassHiveMissionLimitInput) =>
+    scheduleConversationAdjudication(ownerId, conversationId),
   clearAdjudicationTimersForTests,
   enqueueGlassHiveMissionAdjudication,
   flushGlassHiveMissionAdjudications,

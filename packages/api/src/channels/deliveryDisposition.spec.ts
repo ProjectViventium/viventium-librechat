@@ -1,6 +1,7 @@
 import { ChatModelStreamHandler } from '@librechat/agents';
 import {
   inspectProviderDeliveryDisposition,
+  inspectProviderDeliveryRanges,
   resolveEffectiveDeliveryDisposition,
   supportsMessagingDeliveryDisposition,
   isAudioDeliveryRequested,
@@ -129,7 +130,6 @@ describe('messaging delivery disposition', () => {
   });
 });
 
-
 describe('stream disposition ordering', () => {
   const graph = {} as NonNullable<Parameters<ChatModelStreamHandler['handle']>[3]>;
   afterEach(() => jest.restoreAllMocks());
@@ -138,64 +138,100 @@ describe('stream disposition ordering', () => {
     const order: string[] = [];
     const metadata = { agentId: 'main' };
     const disposition = modelDisposition(audio);
-    jest.spyOn(ChatModelStreamHandler.prototype, 'handle').mockImplementation(
-      async (_event, _data, carrier) => {
+    jest
+      .spyOn(ChatModelStreamHandler.prototype, 'handle')
+      .mockImplementation(async (_event, _data, carrier) => {
         order.push('dispatch');
         expect(carrier).not.toBe(metadata);
         expect(getStreamDeliveryDisposition(carrier)).toEqual(disposition);
         expect(carrier?.agentId).toBe('main');
-      },
-    );
+      });
     const handler = createDeliveryDispositionStreamHandler({
       required: () => true,
-      beforeHandle: async () => { order.push('chunk'); },
+      beforeHandle: async () => {
+        order.push('chunk');
+      },
     });
     expect(handler).toBeInstanceOf(ChatModelStreamHandler);
-    await handler.handle('on_chat_model_stream', { chunk: {
-      content: 'Report ready.',
-      additional_kwargs: {
-        provider_specific_fields: { viventium: { delivery_disposition: disposition } },
+    await handler.handle(
+      'on_chat_model_stream',
+      {
+        chunk: {
+          content: 'Report ready.',
+          additional_kwargs: {
+            provider_specific_fields: { viventium: { delivery_disposition: disposition } },
+          },
+        },
       },
-    } }, metadata, graph);
+      metadata,
+      graph,
+    );
     expect(order).toEqual(['chunk', 'dispatch']);
     expect(getStreamDeliveryDisposition(metadata)).toBeNull();
   });
 
   it('fails unknown required control closed without copying earlier or adjacent controls', async () => {
     const observed: ReturnType<typeof getStreamDeliveryDisposition>[] = [];
-    jest.spyOn(ChatModelStreamHandler.prototype, 'handle').mockImplementation(
-      async (_event, _data, metadata) => { observed.push(getStreamDeliveryDisposition(metadata)); },
-    );
+    jest
+      .spyOn(ChatModelStreamHandler.prototype, 'handle')
+      .mockImplementation(async (_event, _data, metadata) => {
+        observed.push(getStreamDeliveryDisposition(metadata));
+      });
     const handler = createDeliveryDispositionStreamHandler({
-      required: () => true, beforeHandle: async () => undefined,
+      required: () => true,
+      beforeHandle: async () => undefined,
     });
     const metadata = { agentId: 'main' };
-    await handler.handle('', { chunk: { content: 'First.', additional_kwargs: {
-      provider_specific_fields: { viventium: { delivery_disposition: modelDisposition() } },
-    } } }, metadata, graph);
+    await handler.handle(
+      '',
+      {
+        chunk: {
+          content: 'First.',
+          additional_kwargs: {
+            provider_specific_fields: { viventium: { delivery_disposition: modelDisposition() } },
+          },
+        },
+      },
+      metadata,
+      graph,
+    );
     await handler.handle('', { chunk: { content: 'Unknown.' } }, metadata, graph);
-    await handler.handle('', { chunk: { content: 'Malformed.', additional_kwargs: {
-      provider_specific_fields: { viventium: { delivery_disposition: { audio: 'eligible' } } },
-    } } }, { agentId: 'adjacent' }, graph);
+    await handler.handle(
+      '',
+      {
+        chunk: {
+          content: 'Malformed.',
+          additional_kwargs: {
+            provider_specific_fields: {
+              viventium: { delivery_disposition: { audio: 'eligible' } },
+            },
+          },
+        },
+      },
+      { agentId: 'adjacent' },
+      graph,
+    );
     expect(observed.map((entry) => [entry?.audio, entry?.source])).toEqual([
-      ['eligible', 'model'], ['skip', 'required_missing'], ['skip', 'required_malformed'],
+      ['eligible', 'model'],
+      ['skip', 'required_missing'],
+      ['skip', 'required_malformed'],
     ]);
   });
 
   it('preserves legacy and ordinary text metadata unchanged', async () => {
     const metadata = { agentId: 'legacy' };
-    jest.spyOn(ChatModelStreamHandler.prototype, 'handle').mockImplementation(
-      async (_event, _data, carrier) => {
+    jest
+      .spyOn(ChatModelStreamHandler.prototype, 'handle')
+      .mockImplementation(async (_event, _data, carrier) => {
         expect(carrier).toBe(metadata);
         expect(getStreamDeliveryDisposition(carrier)).toBeNull();
-      },
-    );
+      });
     await createDeliveryDispositionStreamHandler({
-      required: () => false, beforeHandle: async () => undefined,
+      required: () => false,
+      beforeHandle: async () => undefined,
     }).handle('', { chunk: { content: 'Legacy.' } }, metadata, graph);
   });
 });
-
 
 /* === VIVENTIUM START === Public completion is bound, ordered, and separate from text. === */
 describe('public part completion carrier', () => {
@@ -398,3 +434,89 @@ describe('released Main public-part canonical source', () => {
   });
 });
 /* === VIVENTIUM END === */
+
+describe('native final public-part audio ranges', () => {
+  const response = (text: string, ranges: object[]) => ({
+    choices: [
+      {
+        message: {
+          role: 'assistant',
+          content: text,
+          provider_specific_fields: {
+            viventium: { deliveryDispositionRanges: ranges },
+          },
+        },
+      },
+    ],
+  });
+  it('keeps mixed text-only and spoken Unicode parts without speaking skipped text', () => {
+    const text = 'Private 🟢.\n\nPublic.';
+    const boundary = 'Private 🟢.'.length;
+    const ranges = [
+      { start: 0, end: boundary, disposition: modelDisposition('skip') },
+      { start: boundary, end: text.length, disposition: modelDisposition('eligible') },
+    ];
+    expect(inspectProviderDeliveryRanges(response(text, ranges), text)).toEqual(ranges);
+  });
+  it('maps native ranges through exact public text sanitation', () => {
+    const source = '<emphasis>Quiet.</emphasis>\n\nSpoken.';
+    const boundary = '<emphasis>Quiet.</emphasis>'.length;
+    const strip = (text: string) => text.replace(/<\/?emphasis>/g, '').trim();
+    const actual = inspectProviderDeliveryRanges(
+      response(source, [
+        { start: 0, end: boundary, disposition: modelDisposition('skip') },
+        { start: boundary, end: source.length, disposition: modelDisposition() },
+      ]),
+      strip(source),
+      strip,
+    );
+    expect(actual).toEqual([
+      { start: 0, end: 'Quiet.'.length, disposition: modelDisposition('skip') },
+      { start: 'Quiet.'.length, end: strip(source).length, disposition: modelDisposition() },
+    ]);
+  });
+  it.each([
+    [{ start: 1, end: 3, disposition: modelDisposition() }],
+    [{ start: 0, end: 2, disposition: modelDisposition() }],
+    [{ start: 0, end: 3, disposition: { ...modelDisposition(), valid: false } }],
+    [{ start: 0, end: 3, disposition: modelDisposition(), extra: true }],
+  ])('fails closed for incomplete or malformed native ranges', (ranges) => {
+    expect(inspectProviderDeliveryRanges(response('abc', ranges), 'abc')).toEqual([]);
+  });
+  it('rejects ranges which split a Unicode surrogate pair or change public text', () => {
+    const text = '🟢a';
+    expect(
+      inspectProviderDeliveryRanges(
+        response(text, [
+          { start: 0, end: 1, disposition: modelDisposition() },
+          { start: 1, end: 3, disposition: modelDisposition() },
+        ]),
+        text,
+      ),
+    ).toEqual([]);
+    expect(
+      inspectProviderDeliveryRanges(
+        response('abc', [{ start: 0, end: 3, disposition: modelDisposition() }]),
+        'changed',
+      ),
+    ).toEqual([]);
+    expect(inspectProviderDeliveryRanges({}, 'plain')).toBeNull();
+  });
+});
+
+it('reads the actual merged SDK terminal range source without trusting concatenated request ids', () => {
+  const text = 'Quiet.\n\nSpoken.';
+  const ranges = [
+    { start: 0, end: 6, disposition: modelDisposition('skip') },
+    { start: 6, end: text.length, disposition: modelDisposition() },
+  ];
+  const output = { additional_kwargs: { __raw_response: {
+    id: 'native-requestnative-request', object: 'chat.completion.chunk', choices: [{
+      delta: { provider_specific_fields: { viventium: {
+        delivery_range_text: text, deliveryDispositionRanges: ranges,
+      } } }, finish_reason: 'stop',
+    }],
+  } } };
+  expect(inspectProviderDeliveryRanges(output, text)).toEqual(ranges);
+  expect(inspectProviderDeliveryRanges(output, 'changed')).toEqual([]);
+});

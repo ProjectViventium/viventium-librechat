@@ -1,5 +1,82 @@
 import type { GraphEdge } from 'librechat-data-provider';
-import { getEdgeKey, getEdgeParticipants, filterOrphanedEdges, createEdgeCollector } from './edges';
+import {
+  getEdgeKey,
+  getEdgeParticipants,
+  filterOrphanedEdges,
+  createEdgeCollector,
+  remapDuplicatedAgentGraph,
+} from './edges';
+
+describe('remapDuplicatedAgentGraph', () => {
+  it('keeps a bidirectional consultant graph rooted at the copied primary', () => {
+    const source = {
+      edges: [
+        { from: 'primary', to: 'consultant', edgeType: 'handoff' as const },
+        { from: 'consultant', to: 'primary', edgeType: 'handoff' as const },
+        { from: 'consultant', to: 'peer', edgeType: 'direct' as const },
+      ],
+    };
+    const before = JSON.stringify(source);
+    expect(remapDuplicatedAgentGraph(source, 'primary', 'copy')).toEqual({
+      edges: [
+        { from: 'copy', to: 'consultant', edgeType: 'handoff' },
+        { from: 'consultant', to: 'copy', edgeType: 'handoff' },
+        { from: 'consultant', to: 'peer', edgeType: 'direct' },
+      ],
+    });
+    expect(JSON.stringify(source)).toBe(before);
+  });
+
+  it('remaps every exact self endpoint in arrays while preserving order and metadata', () => {
+    const condition: GraphEdge['condition'] = () => 'primary';
+    const edge: GraphEdge = {
+      from: ['peer', 'primary'],
+      to: ['primary', 'primary-long'],
+      edgeType: 'direct',
+      description: 'primary',
+      prompt: 'primary',
+      promptKey: 'primary',
+      excludeResults: true,
+      condition,
+    };
+    const copy = remapDuplicatedAgentGraph({ edges: [edge] }, 'primary', 'copy');
+    expect(copy.edges?.[0]).toEqual({
+      ...edge,
+      from: ['peer', 'copy'],
+      to: ['copy', 'primary-long'],
+    });
+    expect(copy.edges?.[0].condition).toBe(condition);
+    expect(edge.from).toEqual(['peer', 'primary']);
+    expect(edge.to).toEqual(['primary', 'primary-long']);
+  });
+
+  it('remaps self loops and deprecated typed participant references', () => {
+    expect(
+      remapDuplicatedAgentGraph(
+        {
+          edges: [{ from: 'primary', to: 'primary' }],
+          agent_ids: ['peer', 'primary'],
+        },
+        'primary',
+        'copy',
+      ),
+    ).toEqual({
+      edges: [{ from: 'copy', to: 'copy' }],
+      agent_ids: ['peer', 'copy'],
+    });
+  });
+
+  it('preserves absent graph settings rather than inventing empty fields', () => {
+    expect(remapDuplicatedAgentGraph({}, 'primary', 'copy')).toEqual({});
+  });
+
+  it('preserves explicitly empty graph settings', () => {
+    expect(remapDuplicatedAgentGraph({ edges: [], agent_ids: [] }, 'primary', 'copy')).toEqual({
+      edges: [],
+      agent_ids: [],
+    });
+  });
+});
 
 describe('edges utilities', () => {
   describe('getEdgeKey', () => {

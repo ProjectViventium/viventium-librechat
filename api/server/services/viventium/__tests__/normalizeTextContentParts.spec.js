@@ -498,7 +498,15 @@ describe('normalizeUserMessageContent', () => {
     ).not.toThrow();
   });
   test.each([
-    { isCreatedByUser: false, text: 'Assistant display summary', content: [] },
+    { isCreatedByUser: false, text: 'Assistant display summary', content: [{ type: 'text', text: 'Authored answer' }] },
+    { isCreatedByUser: false, text: 'Assistant display summary', content: [{ type: 'tool_call', name: 'existing_tool', args: {} }] },
+    { isCreatedByUser: false, text: 'Assistant display summary', content: [{ type: 'cortex_insight', text: '' }] },
+    { isCreatedByUser: false, text: 'Assistant display summary', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,eHl6' } }] },
+    { isCreatedByUser: false, text: 'Assistant display summary', content: [{ type: 'unknown', text: '' }] },
+    { isCreatedByUser: false, text: 'Assistant display summary', content: [null] },
+    { isCreatedByUser: false, text: '', content: [] },
+    { isCreatedByUser: false, text: 'Existing text', content: '' },
+    { text: 'Unknown provenance', content: [] },
     { isCreatedByUser: true, text: 'Old text', content: [{ type: 'text', text: 'Edited text' }] },
     {
       isCreatedByUser: true,
@@ -513,3 +521,67 @@ describe('normalizeUserMessageContent', () => {
   });
 });
 /* VIVENTIUM END */
+
+/* === VIVENTIUM START === Saved assistant plain text uses the same source and provider projection. === */
+describe('saved assistant text with an explicitly empty content array', () => {
+  const { messageContentText, captureMainContextSnapshot, traceMainHistoryAncestry } =
+    require('../ViventiumMainContextService');
+  function fixture(flags = {}) {
+    const base = { user: 'owner', conversationId: 'conversation' };
+    return [
+      { ...base, messageId: 'prior-user', parentMessageId: '', sender: 'User',
+        isCreatedByUser: true, text: 'Keep the existing plan.', content: 'Keep the existing plan.' },
+      { ...base, messageId: 'prior-answer', parentMessageId: 'prior-user', sender: 'AI',
+        isCreatedByUser: false, text: 'JOB-742 is pending owner approval. Keep 17 boxes. Correction: use 23, not 21. é界',
+        content: [], ...flags },
+      { ...base, messageId: 'current', parentMessageId: 'prior-answer', sender: 'User',
+        isCreatedByUser: true, text: 'Continue from the saved evidence.', content: 'Continue from the saved evidence.' },
+    ];
+  }
+  function formatted(rows) {
+    return formatAgentMessages(rows.map((row) => ({
+      ...formatMessage({ message: normalizeMediaTextForFormatter(normalizeUserMessageContent(row)) }),
+      messageId: row.messageId,
+    }))).messages;
+  }
+  function capture(rows, messages = formatted(rows)) {
+    return captureMainContextSnapshot(
+      { user: { id: 'owner' }, body: { conversationId: 'conversation' } },
+      { agent: { id: 'main' }, visibleMessages: rows, messages,
+        historyAncestry: traceMainHistoryAncestry({ messages: rows.slice(0, -1),
+          headId: rows.at(-1).parentMessageId, ownerId: 'owner', conversationId: 'conversation' }),
+        protectUnreconciledHistory: true });
+  }
+  test.each([{}, { error: true }, { unfinished: true }])(
+    'carries complete saved text and retains terminal semantics %j', (flags) => {
+      const rows = fixture(flags), before = JSON.stringify(rows);
+      const normalized = normalizeUserMessageContent(rows[1]);
+      expect(normalized.content).toEqual([{ type: 'text', text: rows[1].text }]);
+      expect(normalized).toMatchObject(flags);
+      expect(messageContentText(rows[1])).toBe(rows[1].text);
+      const messages = formatted(rows);
+      expect(messages.map((message) => message.id)).toEqual(['prior-user', 'prior-answer', 'current']);
+      expect(messageContentText(messages[1])).toBe(rows[1].text);
+      const snapshot = capture(rows, messages);
+      expect(snapshot.visibleMessageChain[1]).toMatchObject({ id: 'prior-answer',
+        bytes: Buffer.byteLength(rows[1].text, 'utf8'), accepted_source: !flags.error && !flags.unfinished });
+      expect(JSON.stringify(rows)).toBe(before);
+    });
+  test.each(['missing', 'changed'])('still rejects %s prior words in the final carrier', (kind) => {
+    const rows = fixture(), messages = formatted(rows);
+    if (kind === 'missing') messages.splice(1, 1);
+    else messages[1].content = 'Incomplete or changed history.';
+    expect(() => capture(rows, messages)).toThrow(expect.objectContaining({ code: 'source_context_unavailable' }));
+  });
+  test.each([
+    { metadata: { viventium: { visibility: 'internal' } } },
+    { user: 'foreign-owner' },
+    { conversationId: 'foreign-conversation' },
+    { deletedAt: new Date('2026-01-01T00:00:00Z') },
+    { unfinished: 'invalid' },
+  ])('preserves the protected source fence %j', (flags) => {
+    const rows = fixture(flags);
+    expect(() => capture(rows)).toThrow(expect.objectContaining({ code: 'source_context_unavailable' }));
+  });
+});
+/* === VIVENTIUM END === */

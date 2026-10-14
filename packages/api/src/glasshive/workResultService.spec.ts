@@ -120,4 +120,70 @@ describe('retained work result read', () => {
     ).rejects.toMatchObject({ code: 'retained_work_result_not_found' });
     expect(missionEvidence.findOne).not.toHaveBeenCalled();
   });
+  it('preserves exact retained HTML files and their original delivery scope without rebinding', async () => {
+    const outputFiles = {
+      version: 1 as const,
+      owner_id: 'owner-a',
+      run_id: 'run-a',
+      attempt_id: 'attempt-a',
+      callback_id: 'callback-a',
+      origin_ref: 'origin-a',
+      work_ref: 'work-a',
+      result_revision: 3,
+      result_digest: `sha256:${'b'.repeat(64)}`,
+      files: [
+        {
+          filename: 'checklist.html',
+          mime_type: 'text/html',
+          bytes: 42,
+          sha256: 'a'.repeat(64),
+          download_url: 'https://example.test/files/checklist',
+        },
+      ],
+    };
+    missionEvidence.findOne.mockResolvedValue({
+      ...row,
+      conversationId: 'old-chat',
+      destinations: [{ surface: 'telegram' }, { surface: 'librechat' }],
+      originRef: 'origin-a',
+      attemptId: 'attempt-a',
+      terminalCallbackId: 'callback-a',
+      terminalCallbackResultDigest: outputFiles.result_digest,
+      outputFiles,
+    });
+    const result = await service.getGlassHiveWorkResult({ ownerId: 'owner-a', runId: 'run-a' });
+    expect(result.outputFiles).toEqual(outputFiles);
+    expect(result.deliveryScope).toEqual({
+      originConversationId: 'old-chat',
+      destinations: ['telegram', 'librechat'],
+      resultRunId: 'run-a',
+      resultRevision: 3,
+    });
+    expect(result.currentRunMatch).toBe('unverified');
+    expect(result).not.toHaveProperty('currentConversationDelivered');
+  });
+  it('rejects foreign file authority even when retained text belongs to the owner', async () => {
+    missionEvidence.findOne.mockResolvedValue({
+      ...row,
+      originRef: 'origin-a',
+      attemptId: 'attempt-a',
+      terminalCallbackId: 'callback-a',
+      terminalCallbackResultDigest: `sha256:${'b'.repeat(64)}`,
+      outputFiles: {
+        version: 1,
+        owner_id: 'owner-b',
+        run_id: 'run-a',
+        attempt_id: 'attempt-a',
+        callback_id: 'callback-a',
+        origin_ref: 'origin-a',
+        work_ref: 'work-a',
+        result_revision: 3,
+        result_digest: `sha256:${'b'.repeat(64)}`,
+        files: [],
+      },
+    });
+    await expect(
+      service.getGlassHiveWorkResult({ ownerId: 'owner-a', runId: 'run-a' }),
+    ).rejects.toMatchObject({ code: 'native_output_files_identity_invalid' });
+  });
 });

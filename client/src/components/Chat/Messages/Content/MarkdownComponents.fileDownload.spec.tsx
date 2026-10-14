@@ -1,10 +1,12 @@
 /* === VIVENTIUM START === Imported File links keep the authorized owner and original filename. === */
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { a as MarkdownAnchor } from './MarkdownComponents';
+import { a as MarkdownAnchor, img as MarkdownImage } from './MarkdownComponents';
 import { MessageContext } from '~/Providers/MessageContext';
 import type { TAttachment } from 'librechat-data-provider';
 const mockDownload = jest.fn(async () => ({ data: 'blob:synthetic-owned-file' }));
 const mockFileDownload = jest.fn((..._args: string[]) => ({ refetch: mockDownload }));
+jest.mock('./Image', () => ({ __esModule: true, default: (props: { imagePath: string; altText: string; file: TAttachment }) =>
+  <img alt={props.altText} src={`owned:${props.file.file_id}`} data-path={props.imagePath} /> }));
 jest.mock('recoil', () => ({ useRecoilValue: () => ({ id: 'owner' }) }));
 jest.mock('~/store', () => ({ __esModule: true, default: { user: 'synthetic-user-atom' } }));
 jest.mock('@librechat/client', () => ({ useToastContext: () => ({ showToast: jest.fn() }) }));
@@ -136,3 +138,16 @@ test.each([
   },
 );
 /* === VIVENTIUM END === */
+
+test('selected image grant opens through the exact owner/message File viewer', () => {
+  const image = { ...owned, type: 'image/png', filename: 'evidence.png' } as TAttachment;
+  render(<MessageContext.Provider value={{ messageId: 'answer', isExpanded: true,
+    viventiumFileAttachments: [image] }}><MarkdownImage src={grant} alt="Selected evidence" /></MessageContext.Provider>);
+  expect(screen.getByRole('img', { name: 'Selected evidence' })).toHaveAttribute('src', `owned:${owned.file_id}`);
+});
+test('foreign image grant cannot borrow a File viewer binding', () => {
+  const image = { ...owned, type: 'image/png', filename: 'evidence.png', user: 'other' } as TAttachment;
+  render(<MessageContext.Provider value={{ messageId: 'answer', isExpanded: true,
+    viventiumFileAttachments: [image] }}><MarkdownImage src={grant} alt="Foreign" /></MessageContext.Provider>);
+  expect(screen.getByRole('img', { name: 'Foreign' })).toHaveAttribute('src', grant);
+});

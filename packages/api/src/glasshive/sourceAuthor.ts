@@ -79,3 +79,34 @@ export async function assertCurrentGlassHiveSourceAuthor({
   }
 }
 /* === VIVENTIUM END === */
+
+/** Attest the original current human source; native owns offered-option and chronology checks. */
+export async function currentNativeHumanInputSource(options: Parameters<typeof assertCurrentGlassHiveSourceAuthor>[0] & {
+  getOriginalInputReceipt?: (input:{userId:string;conversationId:string;sourceMessageId:string}) => Promise<unknown>;
+}) {
+  let job: SourceAuthorJob | null | undefined;
+  await assertCurrentGlassHiveSourceAuthor({...options, getJob:async (streamId) => {
+    job = await options.getJob(streamId); return job;
+  }});
+  const context = job?.interactionContext;
+  const denied = () => authorityError('native_input_human_source_unavailable');
+  if (!context || context.actor_kind !== 'external_user' || context.origin !== 'interactive' ||
+      !context.logical_turn_id || context.source_segments_overflow_count) throw denied();
+  const sources = (context.source_segments || []).filter((segment) =>
+    segment.source_event_id === context.source_event_id && segment.authoring_revision === context.revision);
+  if (sources.length !== 1) throw denied();
+  const source = sources[0];
+  if (source.truncated || source.source_persisted !== true || !source.source_message_id ||
+      !source.text.trim() || !Number.isSafeInteger(source.source_received_at) ||
+      Number(source.source_received_at) <= 0 || !options.getOriginalInputReceipt) throw denied();
+  const receipt = await options.getOriginalInputReceipt({userId:options.userId,
+    conversationId:context.conversation_id,sourceMessageId:source.source_message_id});
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt) ||
+      (receipt as {sourceEventId?:unknown}).sourceEventId !== source.source_event_id ||
+      (receipt as {receivedAt?:unknown}).receivedAt !== source.source_received_at) throw denied();
+  return { version: 1 as const, actorKind: 'external_user' as const, origin: 'interactive' as const,
+    sourceEventId: source.source_event_id, sourceIndex: source.source_index,
+    sourceMessageId: source.source_message_id, authoringRevision: context.revision,
+    logicalTurnId: context.logical_turn_id, conversationId: context.conversation_id,
+    receivedAt: Number(source.source_received_at) };
+}

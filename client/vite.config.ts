@@ -105,6 +105,12 @@ export default defineConfig(({ command, mode }) => {
           target: backendURL,
           changeOrigin: true,
         },
+        /* === VIVENTIUM START: Saved image links use the existing backend image route. === */
+        '/images': {
+          target: backendURL,
+          changeOrigin: true,
+        },
+        /* === VIVENTIUM END === */
       },
     },
     // Set the directory where environment variables are loaded from and restrict prefixes

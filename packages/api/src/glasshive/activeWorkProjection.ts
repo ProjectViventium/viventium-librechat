@@ -5,6 +5,7 @@
  * === VIVENTIUM END === */
 
 import { evidenceId } from './missionEvidenceIdentity';
+import { normalizeWorkDeliveryScope } from './workDeliveryScope';
 
 const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled']);
 const DISMISS_SAFE_DELIVERY_STATES = new Set(['delivered', 'acknowledged', 'silent']);
@@ -24,6 +25,8 @@ const CURRENT_RESULT_PROJECTION = {
   _id: 1,
   originRef: 1,
   workRef: 1,
+  conversationId: 1,
+  configuredDestinations: 1,
   terminalCallbackId: 1,
   terminalCallbackRunId: 1,
   terminalCallbackResultDigest: 1,
@@ -630,9 +633,18 @@ export function createGlassHiveActiveWorkProjectionService(
       const actions = Array.isArray(item.actions) ? item.actions : [];
       const coreUpdatedAt = isoDate(row?.updatedAt);
       const executionUpdatedAt = isoDate(item.updatedAt);
+      const deliveryScope = row
+        ? normalizeWorkDeliveryScope({
+            originConversationId: row.conversationId,
+            destinations: row.configuredDestinations,
+            resultRunId: row.terminalCallbackRunId,
+            resultRevision: row.terminalCallbackResultRevision,
+          })
+        : null;
       return {
         ...item,
         ...(row ? { delivery } : {}),
+        ...(deliveryScope ? { deliveryScope } : {}),
         ...(coreUpdatedAt && (!executionUpdatedAt || coreUpdatedAt > executionUpdatedAt)
           ? { updatedAt: coreUpdatedAt }
           : {}),

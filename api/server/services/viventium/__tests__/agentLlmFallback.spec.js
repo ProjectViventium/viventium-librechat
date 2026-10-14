@@ -756,3 +756,15 @@ test('host capacity rejection does not start another provider before any harness
     }),
   ).toBe(false);
 });
+
+
+test('native MCP startup failure is recoverable but a failed MCP tool is not', () => {
+  const part = { type: ContentTypes.ERROR, error: 'Synthetic private detail', error_class: 'native_mcp_unavailable' };
+  expect(shouldRetryWithFallback([part])).toBe(true);
+  expect(isRecoverableProviderFallbackError({ code: 'native_mcp_unavailable' })).toBe(true);
+  expect(shouldRetryBackgroundCortexWithFallback({ insight: null, errorClass: 'native_mcp_unavailable' })).toBe(true);
+  expect(shouldRetryWithFallback([{ ...part, error_class: 'mcp_tool_failure' }])).toBe(false);
+  expect(isRecoverableProviderFallbackError({ code: 'mcp_tool_failure', status: 503 })).toBe(false);
+  expect(isRecoverableProviderFallbackError({ name: 'AbortError', code: 'native_mcp_unavailable' })).toBe(false);
+  expect(shouldRetryWithFallback([part, { type: ContentTypes.TEXT, text: 'Already visible.' }])).toBe(false);
+});

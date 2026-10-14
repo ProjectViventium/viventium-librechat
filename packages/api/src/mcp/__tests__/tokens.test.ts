@@ -2,6 +2,7 @@ import { Types } from 'mongoose';
 import { decryptV2 } from '@librechat/data-schemas';
 import type { TokenMethods, IToken } from '@librechat/data-schemas';
 import { MCPTokenStorage } from '~/mcp/oauth/tokens';
+import { mcpConfig } from '~/mcp/mcpConfig';
 
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
@@ -36,6 +37,90 @@ describe('MCPTokenStorage', () => {
       mockCreateToken = jest.fn().mockResolvedValue(undefined);
       mockUpdateToken = jest.fn().mockResolvedValue(undefined);
       mockDeleteToken = jest.fn().mockResolvedValue(undefined);
+    });
+
+    it.each([-1, 0, 1])(
+      'uses the live connection grace boundary at expiry offset %d ms',
+      async (offset) => {
+        const clock = jest.spyOn(Date, 'now').mockReturnValue(2000000000000);
+        const grace = Math.max(mcpConfig.OAUTH_TOKEN_EXPIRE_GRACE_MS ?? 0, 0);
+        const access = {
+          userId: new Types.ObjectId(userId),
+          type: 'mcp_oauth',
+          identifier,
+          token: 'enc-access',
+          createdAt: new Date(Date.now() - 1000),
+          expiresAt: new Date(Date.now() + grace + offset),
+        } as unknown as IToken;
+        const refresh = {
+          ...access,
+          type: 'mcp_oauth_refresh',
+          identifier: identifier + ':refresh',
+          token: 'enc-refresh',
+        } as unknown as IToken;
+        mockFindToken.mockImplementation(async ({ type }) =>
+          type === 'mcp_oauth' ? access : type === 'mcp_oauth_refresh' ? refresh : null,
+        );
+        mockDecryptV2.mockImplementation(async (ciphertext) =>
+          ciphertext === 'enc-refresh' ? 'refresh-token' : 'old-access-token',
+        );
+        const fresh = {
+          access_token: 'fresh-access-token',
+          token_type: 'Bearer',
+          obtained_at: Date.now(),
+          expires_at: Date.now() + 3600000,
+        };
+        const refreshTokens = jest.fn().mockResolvedValue(fresh);
+        const store = jest.spyOn(MCPTokenStorage, 'storeTokens').mockResolvedValue(undefined);
+        try {
+          const result = await MCPTokenStorage.getTokens({
+            userId,
+            serverName,
+            findToken: mockFindToken,
+            createToken: mockCreateToken,
+            refreshTokens,
+          });
+          expect(refreshTokens).toHaveBeenCalledTimes(offset <= 0 ? 1 : 0);
+          expect(result?.access_token).toBe(
+            offset <= 0 ? 'fresh-access-token' : 'old-access-token',
+          );
+          expect(store).toHaveBeenCalledTimes(offset <= 0 ? 1 : 0);
+        } finally {
+          store.mockRestore();
+          clock.mockRestore();
+        }
+      },
+    );
+
+    it('retains exact-expiry behavior when the configured grace is zero', async () => {
+      const original = mcpConfig.OAUTH_TOKEN_EXPIRE_GRACE_MS;
+      const clock = jest.spyOn(Date, 'now').mockReturnValue(2000000000000);
+      mcpConfig.OAUTH_TOKEN_EXPIRE_GRACE_MS = 0;
+      const access = {
+        token: 'enc-access',
+        createdAt: new Date(Date.now() - 1000),
+        expiresAt: new Date(Date.now() + 1),
+      } as IToken;
+      mockFindToken.mockImplementation(async ({ type }) => (type === 'mcp_oauth' ? access : null));
+      mockDecryptV2.mockResolvedValue('old-access-token');
+      const refreshTokens = jest.fn();
+      try {
+        expect(
+          (
+            await MCPTokenStorage.getTokens({
+              userId,
+              serverName,
+              findToken: mockFindToken,
+              createToken: mockCreateToken,
+              refreshTokens,
+            })
+          )?.access_token,
+        ).toBe('old-access-token');
+        expect(refreshTokens).not.toHaveBeenCalled();
+      } finally {
+        mcpConfig.OAUTH_TOKEN_EXPIRE_GRACE_MS = original;
+        clock.mockRestore();
+      }
     });
 
     it('should force refresh tokens even when access token is not expired', async () => {
@@ -189,11 +274,13 @@ describe('MCPTokenStorage', () => {
         return '';
       });
 
-      const refreshTokens = jest.fn().mockRejectedValue(
-        new Error(
-          'Token refresh failed: 400 Bad Request - {"error":"invalid_grant","error_description":"expired or revoked"}',
-        ),
-      );
+      const refreshTokens = jest
+        .fn()
+        .mockRejectedValue(
+          new Error(
+            'Token refresh failed: 400 Bad Request - {"error":"invalid_grant","error_description":"expired or revoked"}',
+          ),
+        );
 
       const result = await MCPTokenStorage.getTokens({
         userId,

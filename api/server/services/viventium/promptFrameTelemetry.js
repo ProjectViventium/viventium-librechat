@@ -98,6 +98,7 @@ const PROMPT_FRAME_LAYER_ALIASES = Object.freeze({
   voice_mode: 'surface_prompt',
   voice_note_input: 'surface_prompt',
   voice_call_input: 'surface_prompt',
+  current_call: 'surface_prompt',
   wing_mode: 'surface_prompt',
   telegram_text: 'surface_prompt',
   telegram_audio_output: 'surface_prompt',

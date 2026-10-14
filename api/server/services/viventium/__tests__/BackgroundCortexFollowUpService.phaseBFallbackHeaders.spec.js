@@ -56,7 +56,10 @@ jest.mock('../CortexInsightDeliveryService', () => ({
 }));
 
 jest.mock('../nativeResponseService', () => ({
-  getService: () => ({ readToolEvidence: jest.fn().mockResolvedValue([]) }),
+  getService: () => ({
+    readToolEvidence: jest.fn().mockResolvedValue([]),
+    readToolEvidenceForPresentation: jest.fn().mockResolvedValue([]),
+  }),
 }));
 jest.mock('../VoiceTaskService', () => ({
   ...jest.requireActual('../VoiceTaskService'),
@@ -136,6 +139,7 @@ describe('owned occupied-session recovery producer', () => {
       hydrateVoiceTask: jest.fn(async () => ({
         taskId: 'task-a',
         callSessionId: 'call-a',
+        userId: 'owner-a',
         conversationId: 'conversation-a',
       })),
       getVoiceTaskOwnerBinding: jest.fn(() => ({
@@ -167,6 +171,7 @@ describe('owned occupied-session recovery producer', () => {
       hydrateVoiceTask: jest.fn(async () => ({
         taskId: 'task-a',
         callSessionId: 'foreign',
+        userId: 'owner-a',
         conversationId: 'conversation-a',
       })),
       getVoiceTaskOwnerBinding: jest.fn(() => ({
@@ -256,6 +261,7 @@ describe('owned occupied-session recovery producer', () => {
       expect(headers['X-GlassHive-Idempotency-Key']).toBe(
         'phase_b:synthetic-main:synthetic-parent',
       );
+      expect(headers['X-Viventium-Stream-Id']).toBe('phase_b:synthetic-main:synthetic-parent');
       expect(run.mock.calls[0][0].graphConfig.llmConfig.modelKwargs.reasoning_effort).toBe('high');
       expect(req.body.viventiumActorTrust).toBeUndefined();
       expect(req.body.viventiumCanAuthorizeSideEffects).toBeUndefined();
@@ -538,120 +544,143 @@ describe('Phase B follow-up serial fallback arming', () => {
 });
 
 describe('verified mission image input', () => {
-  test('passes distinct observed images to Main and returns only its selected image link', async () => {
-    const bytes = Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
-      'base64',
-    );
-    const sha256 = require('crypto').createHash('sha256').update(bytes).digest('hex');
-    const base = 'https://artifacts.example.test';
-    const makeMedia = (runId, suffix) => ({
-      observations: [
-        {
-          kind: 'image',
-          source: 'native_tool_result',
-          artifact_ref: `artifact_sha256:${sha256}`,
-          run_id: runId,
-          tool_call_id: 'native-call',
-          content_index: 0,
-          mime_type: 'image/png',
-          bytes: bytes.length,
-          sha256,
-          download_url: `${base}/v1/link-refs/ghr_1234567890abcdef${suffix}`,
-          open_url: `${base}/v1/link-refs/ghr_fedcba0987654321${suffix}`,
-        },
-      ],
-      omitted_count: 0,
-    });
-    const first = makeMedia('run-a', 'a');
-    const second = makeMedia('run-b', 'b');
-    const selected = `![Readable result](${second.observations[0].download_url})`;
-    const processStream = jest.fn().mockResolvedValue(selected);
-    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
-    const fetchImage = jest
-      .spyOn(global, 'fetch')
-      .mockImplementation(
-        async () => new Response(bytes, { headers: { 'content-type': 'image/png' } }),
+  test.each(['artifact_ref', 'download_url', 'open_url'])(
+    'passes observed images to Main and delivers only its selected %s',
+    async (selectionField) => {
+      const bytes = Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+        'base64',
       );
-    const originalBase = process.env.GLASSHIVE_ARTIFACT_BASE_URL;
-    process.env.GLASSHIVE_ARTIFACT_BASE_URL = base;
-    try {
-      const req = {
-        body: { conversationId: 'conv-1', messageId: 'msg-1' },
-        user: { id: 'user-1' },
-        config: {
-          endpoints: {
-            agents: {
-              providerCapabilities: {
-                'glasshive-harness': {
-                  workspace_binding: true,
-                  default_access: 'workspace',
-                  phase_b_followup: true,
-                  responses_api: false,
+      const sha256 = require('crypto').createHash('sha256').update(bytes).digest('hex');
+      const base = 'https://artifacts.example.test';
+      const makeMedia = (runId, suffix) => ({
+        observations: [
+          {
+            kind: 'image',
+            source: 'native_tool_result',
+            artifact_ref: `artifact_sha256:${sha256}`,
+            run_id: runId,
+            tool_call_id: 'native-call',
+            content_index: 0,
+            mime_type: 'image/png',
+            bytes: bytes.length,
+            sha256,
+            download_url: `${base}/v1/link-refs/ghr_1234567890abcdef${suffix}`,
+            open_url: `${base}/v1/link-refs/ghr_fedcba0987654321${suffix}`,
+          },
+        ],
+        omitted_count: 0,
+      });
+      const first = makeMedia('run-a', 'a');
+      const second = makeMedia('run-b', 'b');
+      const selected = `![Readable result](${second.observations[0].download_url})`;
+      const processStream = jest
+        .fn()
+        .mockResolvedValue(`![Readable result](${second.observations[0][selectionField]})`);
+      const onNativeMediaSelection = jest.fn();
+      const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+      const fetchImage = jest
+        .spyOn(global, 'fetch')
+        .mockImplementation(
+          async () => new Response(bytes, { headers: { 'content-type': 'image/png' } }),
+        );
+      const originalEnv = { ...process.env };
+      process.env.GLASSHIVE_ARTIFACT_BASE_URL = base;
+      process.env.GLASSHIVE_PROVIDER_BASE_URL = 'http://127.0.0.1:8766/v1';
+      process.env.WPR_API_TOKEN = 'synthetic-token';
+      process.env.VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET = 'synthetic-secret';
+      process.env.VIVENTIUM_TENANT_ID = 'synthetic-tenant';
+      try {
+        const req = {
+          body: { conversationId: 'conv-1', messageId: 'msg-1' },
+          user: { id: 'user-1' },
+          config: {
+            endpoints: {
+              agents: {
+                providerCapabilities: {
+                  'glasshive-harness': {
+                    workspace_binding: true,
+                    default_access: 'workspace',
+                    phase_b_followup: true,
+                    conversation_session: true,
+                    responses_api: false,
+                  },
                 },
               },
             },
           },
-        },
-      };
-      setTrustedInteractionContext(req, {
-        actor_kind: 'worker',
-        origin: 'callback',
-        surface: 'web',
-        conversation_id: 'conv-1',
-        source_event_id: 'root-event',
-      });
-      const output = await generateFollowUpText({
-        req,
-        agent: {
-          id: 'agent-main',
-          provider: 'glasshive-harness',
-          endpoint: 'glasshive-harness',
-          model: 'codex-cli:gpt-5.6-sol',
-          model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'medium' },
-          glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
-        },
-        insightsData: {
-          insights: [first, second].map((nativeMedia) => ({
-            cortexName: 'Mission evidence',
-            insight: 'The requested local application observation is complete.',
-            nativeMedia,
-            authority: {
-              kind: 'durable_terminal_callback',
-              runId: nativeMedia.observations[0].run_id,
-            },
-          })),
-        },
-        recentResponse: 'The work is running.',
-        runId: 'image-followup',
-        conversationId: 'conv-1',
-        parentMessageId: 'msg-1',
-      });
-      const messages = processStream.mock.calls[0][0].messages;
-      expect(messages[0].content.filter((part) => part.type === 'image_url')).toHaveLength(2);
-      expect(
-        messages[0].content
-          .filter((part) => part.type === 'text')
-          .map((part) => part.text)
-          .join('\n'),
-      ).toContain(first.observations[0].download_url);
-      expect(fetchImage).toHaveBeenCalledTimes(2);
-      expect(createRun.mock.calls[0][0].graphConfig.tools).toEqual([]);
-      expect(output).toBe(selected);
-      expect(output).not.toContain(first.observations[0].download_url);
-    } finally {
-      if (originalBase === undefined) delete process.env.GLASSHIVE_ARTIFACT_BASE_URL;
-      else process.env.GLASSHIVE_ARTIFACT_BASE_URL = originalBase;
-      fetchImage.mockRestore();
-      createRun.mockRestore();
-    }
-  });
+        };
+        setTrustedInteractionContext(req, {
+          actor_kind: 'worker',
+          origin: 'callback',
+          surface: 'web',
+          conversation_id: 'conv-1',
+          source_event_id: 'root-event',
+        });
+        const output = await generateFollowUpText({
+          req,
+          agent: {
+            id: 'agent-main',
+            provider: 'glasshive-harness',
+            endpoint: 'glasshive-harness',
+            model: 'codex-cli:gpt-5.6-sol',
+            model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'medium' },
+            glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
+          },
+          insightsData: {
+            insights: [first, second].map((nativeMedia) => ({
+              cortexName: 'Mission evidence',
+              insight: 'The requested local application observation is complete.',
+              nativeMedia,
+              authority: {
+                kind: 'durable_terminal_callback',
+                runId: nativeMedia.observations[0].run_id,
+              },
+            })),
+          },
+          recentResponse: 'The work is running.',
+          runId: 'image-followup',
+          onNativeMediaSelection,
+          conversationId: 'conv-1',
+          parentMessageId: 'msg-1',
+        });
+        const messages = processStream.mock.calls[0][0].messages;
+        expect(messages[0].content.filter((part) => part.type === 'image_url')).toHaveLength(2);
+        expect(
+          messages[0].content
+            .filter((part) => part.type === 'text')
+            .map((part) => part.text)
+            .join('\n'),
+        ).toContain(first.observations[0].download_url);
+        expect(fetchImage).toHaveBeenCalledTimes(2);
+        expect(createRun.mock.calls[0][0].graphConfig.tools).toEqual([]);
+        expect(output).toBe(selected);
+        expect(onNativeMediaSelection).toHaveBeenCalledWith({
+          run_id: 'run-b',
+          tool_call_id: 'native-call',
+          content_index: 0,
+          artifact_ref: second.observations[0].artifact_ref,
+          label: 'Readable result',
+        });
+        expect(output).not.toContain(first.observations[0].download_url);
+      } finally {
+        process.env = originalEnv;
+        fetchImage.mockRestore();
+        createRun.mockRestore();
+      }
+    },
+  );
 });
 
 describe('Phase B follow-up carrier', () => {
-  test.each([true, false])(
-    'isolates the follow-up authority and carries one enabled Feeling capsule (enabled=%s)',
-    async (enabled) => {
+  test.each([
+    [true, 'X-GlassHive-Turn-Context-B64'],
+    [false, 'X-GlassHive-Turn-Context-B64'],
+    [true, 'x-glasshive-turn-context-b64'],
+    [false, 'x-glasshive-turn-context-b64'],
+  ])(
+    'isolates follow-up authority and Feeling state (enabled=%s, header=%s)',
+    async (enabled, turnContextHeader) => {
       const capsule = '<viventium_feeling_state>follow-up-state-c</viventium_feeling_state>';
       const mainCapsule = '<viventium_feeling_state>main-only-state-m</viventium_feeling_state>';
       const processStream = jest.fn().mockResolvedValue('The reading list card is ready.');
@@ -668,18 +697,17 @@ describe('Phase B follow-up carrier', () => {
         'X-Viventium-Visible-Message-Chain-B64': Buffer.from(
           JSON.stringify([{ id: 'user-1' }, { id: 'assistant-1' }, { id: 'user-2' }]),
         ).toString('base64'),
-        'X-GlassHive-Developer-Instruction-Tail-B64': Buffer.from(mainCapsule).toString('base64'),
+        'X-GlassHive-Developer-Instruction-Tail-B64':
+          Buffer.from(mainCapsule).toString('base64'),
         'X-GlassHive-Stable-Authority-SHA256': 'd'.repeat(64),
+        [turnContextHeader]: Buffer.from('Synthetic Main-only continuity. '.repeat(1200)).toString(
+          'base64',
+        ),
       };
       try {
         const req = {
           id: 'synthetic-phase-b-carrier',
-          _viventiumFeelingSnapshot: {
-            enabled,
-            agentScope: 'conscious_agent',
-            snapshotHash: 'synthetic-followup-feeling-hash',
-            capsule,
-          },
+          _viventiumFeelingSnapshot: { enabled, agentScope: 'conscious_agent', snapshotHash: 'synthetic-followup-feeling-hash', capsule },
           body: { conversationId: 'conv-1', messageId: 'msg-1' },
           user: { id: 'user-1' },
           config: {
@@ -711,13 +739,18 @@ describe('Phase B follow-up carrier', () => {
             id: 'agent-main',
             provider: 'glasshive-harness',
             endpoint: 'glasshive-harness',
-            model: 'codex-cli:gpt-5.6-sol',
+            model: 'codex-cli:gpt-6.1-sol',
             model_parameters: {
-              model: 'codex-cli:gpt-5.6-sol',
-              reasoning_effort: 'medium',
+              model: 'codex-cli:gpt-6.1-sol',
+              reasoning_effort: 'high',
               configuration: { defaultHeaders: mainTurnBinding },
             },
-            glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
+            glasshive_options: {
+              workspace: { mode: 'life' },
+              access: 'full',
+              fallback_model: 'claude-code:claude-opus-5-5',
+              fallback_reasoning_effort: 'high',
+            },
           },
           insightsData: {
             insights: [{ cortexName: 'Worker', insight: 'The reading list card is complete.' }],
@@ -740,28 +773,168 @@ describe('Phase B follow-up carrier', () => {
           'base64',
         ).toString('utf8');
         const { getViventiumUserFactGuard } = require('../feelingPromptTail');
-        expect(ownTail).toBe(
-          [getViventiumUserFactGuard(), enabled ? capsule : ''].filter(Boolean).join('\n\n'),
-        );
+        expect(ownTail).toBe([getViventiumUserFactGuard(), enabled ? capsule : ''].filter(Boolean).join('\n\n'));
         const instructions = createRun.mock.calls[0][0].graphConfig.instructions;
         expect(instructions.split(capsule).length - 1).toBe(enabled ? 1 : 0);
         expect(instructions.split('<viventium_feeling_state>').length - 1).toBe(enabled ? 1 : 0);
         expect(JSON.stringify(createRun.mock.calls[0][0])).not.toContain(mainCapsule);
-        expect(JSON.stringify(createRun.mock.calls[0][0])).not.toContain(
-          Buffer.from(mainCapsule).toString('base64'),
-        );
+        expect(JSON.stringify(createRun.mock.calls[0][0])).not.toContain(Buffer.from(mainCapsule).toString('base64'));
         expect(ownTail).not.toContain(mainCapsule);
         expect(createRun.mock.calls[0][0].graphConfig.instructions.endsWith(ownTail)).toBe(true);
         expect(headers['X-GlassHive-Agent-Id']).toBe('agent-main:phase_b:followup');
         expect(headers['X-Viventium-Origin']).toBe('interactive');
         expect(headers['X-Synthetic-Endpoint']).toBe('keep-endpoint-header');
         expect(headers['X-GlassHive-Agent-Id']).toContain('agent-main');
+        expect(headers['X-GlassHive-Fallback-Model']).toBe('claude-code:claude-opus-5-5');
+        expect(headers['X-GlassHive-Fallback-Reasoning-Effort']).toBe('high');
+        expect(createRun.mock.calls[0][0].graphConfig.llmConfig.modelKwargs.model).toBe(
+          'codex-cli:gpt-6.1-sol',
+        );
+        expect(createRun.mock.calls[0][0].graphConfig.llmConfig.modelKwargs.reasoning_effort).toBe(
+          'high',
+        );
       } finally {
         createRun.mockRestore();
       }
     },
   );
 });
+
+/* === VIVENTIUM START === Phase B waits for the exact persisted native parent. === */
+describe('Phase B native parent readiness', () => {
+  function input(authority) {
+    const req = {
+      user: { id: 'owner-readiness' },
+      body: { conversationId: 'conversation-readiness', messageId: 'parent-readiness' },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              'glasshive-harness': {
+                workspace_binding: true,
+                default_access: 'workspace',
+                phase_b_followup: true,
+                responses_api: false,
+              },
+            },
+          },
+        },
+      },
+    };
+    setTrustedInteractionContext(
+      req,
+      {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'web',
+        conversation_id: 'conversation-readiness',
+        source_event_id: 'event-readiness',
+      },
+      undefined,
+      { commit_authority: authority },
+    );
+    return {
+      req,
+      agent: {
+        id: 'main-readiness',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-6.1-sol',
+        model_parameters: {
+          model: 'codex-cli:gpt-6.1-sol',
+          reasoning_effort: 'high',
+        },
+      },
+      runId: 'parent-readiness',
+      conversationId: 'conversation-readiness',
+      parentMessageId: 'parent-readiness',
+      recentResponse: 'The Main answer is complete.',
+      insightsData: {
+        insights: [{ cortexId: 'cortex-readiness', insight: 'A useful calculation.' }],
+      },
+    };
+  }
+
+  test.each(['server', 'external_adapter'])(
+    '%s publication readiness precedes the first Phase B provider invocation',
+    async (authority) => {
+      let release;
+      let enter;
+      const ready = new Promise((resolve) => {
+        release = resolve;
+      });
+      const entered = new Promise((resolve) => {
+        enter = resolve;
+      });
+      const unavailable = Object.assign(new Error('Exact parent is still publishing'), {
+        code: 'native_graph_tool_evidence_parent_unfinished',
+      });
+      const oneShot = jest.fn(async () => {
+        enter();
+        throw unavailable;
+      });
+      const publication = jest.fn(async () => {
+        enter();
+        await ready;
+        return [];
+      });
+      const service = jest
+        .spyOn(require('../nativeResponseService'), 'getService')
+        .mockReturnValue({
+          readToolEvidence: oneShot,
+          readToolEvidenceForPresentation: publication,
+        });
+      const processStream = jest.fn().mockResolvedValue('{NTA}');
+      const run = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+      let generation;
+      try {
+        generation = generateFollowUpText(input(authority));
+        generation.catch(() => {});
+        await entered;
+        expect(publication).toHaveBeenCalledWith(
+          'owner-readiness',
+          'conversation-readiness',
+          'parent-readiness',
+          expect.any(Number),
+        );
+        expect(oneShot).not.toHaveBeenCalled();
+        expect(processStream).not.toHaveBeenCalled();
+        release();
+        await expect(generation).resolves.toBe('{NTA}');
+        expect(processStream).toHaveBeenCalledTimes(1);
+      } finally {
+        release();
+        await generation?.catch(() => {});
+        run.mockRestore();
+        service.mockRestore();
+      }
+    },
+  );
+
+  test.each([
+    ['server', 'native_graph_tool_evidence_source_changed'],
+    ['external_adapter', 'native_graph_tool_evidence_source_changed'],
+    ['server', 'native_graph_tool_evidence_parent_unfinished'],
+    ['external_adapter', 'native_graph_tool_evidence_parent_unfinished'],
+  ])('%s preserves the existing readiness rejection %s', async (authority, code) => {
+    const error = Object.assign(new Error('Exact publication authority rejected'), { code });
+    const oneShot = jest.fn().mockResolvedValue([]);
+    const publication = jest.fn().mockRejectedValue(error);
+    const service = jest
+      .spyOn(require('../nativeResponseService'), 'getService')
+      .mockReturnValue({ readToolEvidence: oneShot, readToolEvidenceForPresentation: publication });
+    const processStream = jest.fn().mockResolvedValue('Must not author');
+    const run = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    try {
+      await expect(generateFollowUpText(input(authority))).rejects.toMatchObject({ code });
+      expect(oneShot).not.toHaveBeenCalled();
+      expect(processStream).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+      service.mockRestore();
+    }
+  });
+});
+/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START === Canonical Worker synthesis inherits the saved call brain. === */
 describe('Worker completion Voice brain consumption', () => {
@@ -795,7 +968,9 @@ describe('Worker completion Voice brain consumption', () => {
               voiceMode: true,
               viventiumInputMode: 'voice_call',
               viventiumCallSessionId: 'live-call',
+              viventiumStreamId: 'unrelated-foreground-stream',
             },
+            _resumableStreamId: 'unrelated-foreground-stream',
             config: {
               endpoints: {
                 agents: {
@@ -844,6 +1019,9 @@ describe('Worker completion Voice brain consumption', () => {
           'high',
         );
         expect(config.configuration.defaultHeaders['X-GlassHive-Access']).toBe('full');
+        expect(config.configuration.defaultHeaders['X-Viventium-Stream-Id']).toBe(
+          'phase_b:agent-main:mission-synthesis',
+        );
         expect(JSON.stringify(agent)).toBe(before);
       } finally {
         createRun.mockRestore();
@@ -1067,6 +1245,7 @@ describe('Phase B declared audio output contract', () => {
       };
     });
     const onDeliveryDisposition = jest.fn();
+    const onNativeSilentDecision = jest.fn();
     const req = {
       user: { id: 'synthetic-owner' },
       body: { voiceMode: true, viventiumSurface: 'voice', viventiumCallSessionId: 'caller-label' },
@@ -1104,13 +1283,54 @@ describe('Phase B declared audio output contract', () => {
         insightsData: { insights: [{ cortexName: 'Synthetic', insight: 'A verified file.' }] },
         recentResponse: 'The worker is preparing it.',
         runId: 'synthetic-phase-b',
+        conversationId: 'synthetic-conversation',
+        parentMessageId: 'synthetic-parent',
         onDeliveryDisposition,
+        onNativeSilentDecision,
       });
-      return { result, runOptions, onDeliveryDisposition };
+      return { result, runOptions, onDeliveryDisposition, onNativeSilentDecision };
     } finally {
       createRun.mockRestore();
     }
   }
+  test.each([
+    ['strict native silence', '', '', 'skip', true, false, true],
+    ['missing controls', '', '', null, true, false, false],
+    ['eligible empty output', '', '', 'eligible', true, false, false],
+    ['no declared native controls', '', '', 'skip', false, false, false],
+    ['native transfer', '', '', 'skip', true, true, false],
+    ['lost authored text', '', 'A useful answer.', 'skip', true, false, false],
+    ['useful authored answer', 'A useful answer.', 'A useful answer.', 'skip', true, false, false],
+  ])(
+    'keeps explicit completed native silence distinct from %s',
+    async (_label, text, content, audio, capability, transfer, expected) => {
+      const output = {
+        additional_kwargs: {
+          __raw_response: {
+            choices: [
+              {
+                message: {
+                  role: 'assistant',
+                  content,
+                  ...(transfer ? { tool_calls: [{ id: 'transfer', type: 'function' }] } : {}),
+                  ...(audio
+                    ? {
+                        provider_specific_fields: {
+                          viventium: { delivery_disposition: modelDisposition(audio) },
+                        },
+                      }
+                    : {}),
+                },
+              },
+            ],
+          },
+        },
+      };
+      const result = await runFollowUp({ text, output, capability });
+      expect(result.onNativeSilentDecision).toHaveBeenCalledWith(expected);
+      expect(result.result).toBe(text);
+    },
+  );
   test.each(['eligible', 'skip'])(
     'retains Native %s metadata with authored content',
     async (audio) => {
@@ -1220,3 +1440,219 @@ describe('Phase B declared audio output contract', () => {
   });
 });
 /* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Typed terminal publication failures cannot reconnect. === */
+describe('Phase B typed terminal result failure', () => {
+  test.each([
+    ['native_output_files_identity_unavailable', 409, true],
+    ['native_output_files_identity_unavailable', 502, true],
+    ['ECONNRESET', null, false],
+    ['server_error', 502, false],
+  ])('%s/%s retains its terminal or transport meaning', async (code, status, terminal) => {
+    const failure = Object.assign(new Error('Synthetic result failure'), {
+      code,
+      ...(status == null ? {} : { status }),
+    });
+    const processStream = jest
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue('A verified result.');
+    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    try {
+      const operation = generateFollowUpText({
+        req: {
+          user: { id: 'synthetic-owner' },
+          body: {},
+          config: {
+            endpoints: {
+              agents: {
+                providerCapabilities: {
+                  'glasshive-harness': {
+                    workspace_binding: true,
+                    conversation_session: true,
+                    activity_stream: true,
+                    responses_api: false,
+                  },
+                },
+              },
+            },
+          },
+        },
+        agent: {
+          id: 'synthetic-main',
+          provider: 'glasshive-harness',
+          model: 'codex-cli:gpt-6.1-sol',
+          model_parameters: { model: 'codex-cli:gpt-6.1-sol' },
+        },
+        runId: 'synthetic-terminal-followup',
+        conversationId: 'synthetic-conversation',
+        parentMessageId: 'synthetic-parent',
+        recentResponse: 'Working.',
+        insightsData: { insights: [{ cortexName: 'Worker', insight: 'The result is ready.' }] },
+      });
+      if (terminal) await expect(operation).rejects.toBe(failure);
+      else await expect(operation).resolves.toBe('A verified result.');
+      expect(processStream).toHaveBeenCalledTimes(terminal ? 1 : 2);
+    } finally {
+      createRun.mockRestore();
+    }
+  });
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Installed caller respects exact result conflicts. === */
+describe('installed Phase B model caller result status', () => {
+  test.each([
+    [409, 1],
+    [502, 2],
+  ])('status %s makes exactly %s attempts', async (status, attempts) => {
+    const { AsyncCaller } = require('@langchain/core/utils/async_caller');
+    const caller = new AsyncCaller({ maxRetries: 1 });
+    const failure = Object.assign(new Error('Synthetic native publication response'), {
+      status,
+      code: status === 409 ? 'native_output_files_identity_unavailable' : 'server_error',
+    });
+    const invoke = jest
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue('Recovered transport.');
+    const operation = caller.call(invoke);
+    if (status === 409) await expect(operation).rejects.toBe(failure);
+    else await expect(operation).resolves.toBe('Recovered transport.');
+    expect(invoke).toHaveBeenCalledTimes(attempts);
+  });
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Phase B selected files survive pre-merge streams without requiring audio. === */
+describe('Phase B native file carrier transport', () => {
+  test.each(['stream', 'terminal', 'replaced', 'foreign'])(
+    '%s keeps only the actual emitting source before SDK concatenation',
+    async (mode) => {
+      const onNativeOutputFiles = jest.fn();
+      let expectedSource;
+      const createRun = jest.spyOn(Run, 'create').mockImplementation(async (options) => ({
+        processStream: async () => {
+          const headers = options.graphConfig.llmConfig.configuration.defaultHeaders;
+          expectedSource = {
+            owner_id: headers['X-Viventium-User-Id'],
+            conversation_id: headers['X-Viventium-Conversation-Id'],
+            message_id: headers['X-Viventium-Message-Id'],
+            stream_id: headers['X-Viventium-Stream-Id'],
+            agent_id: headers['X-GlassHive-Agent-Id'],
+          };
+          const envelope = {
+            version: 1,
+            ...expectedSource,
+            logical_turn_id: '',
+            logical_turn_revision: 1,
+            request_id: 'native-request',
+            run_id: 'native-run',
+            attempt_id: 'native-attempt',
+            invocation_id: '',
+            files: [
+              {
+                filename: 'shape.svg',
+                mime_type: 'image/svg+xml',
+                bytes: 138,
+                sha256: 'a'.repeat(64),
+                download_url:
+                  'https://artifacts.example.test/v1/link-refs/ghr_main1234567890abcdef',
+              },
+            ],
+          };
+          if (mode === 'foreign') envelope.owner_id = 'foreign';
+          const chunk = {
+            additional_kwargs: {
+              __raw_response: {
+                id: 'native-request',
+                object: mode === 'terminal' ? 'chat.completion' : 'chat.completion.chunk',
+                glasshive: { output_files: envelope },
+              },
+            },
+          };
+          const handlers = options.customHandlers;
+          expect(handlers.on_chat_model_stream).toBeDefined();
+          expect(options.graphConfig.llmConfig.__includeRawResponse).toBe(true);
+          handlers.on_chat_model_start.handle('on_chat_model_start', {});
+          if (mode !== 'terminal')
+            handlers.on_chat_model_stream.handle('on_chat_model_stream', { chunk });
+          if (mode === 'replaced') handlers.on_chat_model_start.handle('on_chat_model_start', {});
+          handlers.on_chat_model_end.handle('on_chat_model_end', {
+            output:
+              mode === 'terminal'
+                ? chunk
+                : {
+                    additional_kwargs: {
+                      __raw_response: {
+                        id: 'native-requestnative-request',
+                        object: 'chat.completion.chunk',
+                        glasshive: { output_files: envelope },
+                      },
+                    },
+                  },
+          });
+          return 'Here is your file.';
+        },
+      }));
+      try {
+        await generateFollowUpText({
+          req: {
+            id: 'synthetic-files',
+            user: { id: 'owner' },
+            body: {
+              conversationId: 'conversation',
+              messageId: 'accepted-parent',
+              viventiumSurface: 'web',
+            },
+            config: {
+              endpoints: {
+                agents: {
+                  providerCapabilities: {
+                    'glasshive-harness': {
+                      workspace_binding: true,
+                      conversation_session: true,
+                      responses_api: false,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          agent: {
+            id: 'main',
+            provider: 'glasshive-harness',
+            model: 'grok-build:grok-4.7-build-fast',
+            model_parameters: { model: 'grok-build:grok-4.7-build-fast', reasoning_effort: 'high' },
+          },
+          insightsData: {
+            insights: [{ cortexName: 'Worker', insight: 'The verified shape is ready.' }],
+          },
+          recentResponse: 'Preparing your file.',
+          runId: 'stable-synthesis',
+          conversationId: 'conversation',
+          parentMessageId: 'accepted-parent',
+          onNativeOutputFiles,
+        });
+        expect(onNativeOutputFiles).toHaveBeenCalledTimes(1);
+        const capture = onNativeOutputFiles.mock.calls[0][0];
+        if (mode === 'replaced' || mode === 'foreign') expect(capture).toEqual({ error: true });
+        else {
+          expect(capture.envelope).toMatchObject(expectedSource);
+          expect(capture.identity).toMatchObject({
+            userId: 'owner',
+            conversationId: 'conversation',
+            responseMessageId: 'accepted-parent',
+            requestId: 'native-request',
+            runId: 'native-run',
+            attemptId: 'native-attempt',
+          });
+          expect(capture.presentationAgentId).toBe('main');
+          expect(JSON.stringify(capture)).not.toContain('synthetic-harness-key');
+        }
+      } finally {
+        createRun.mockRestore();
+      }
+    },
+  );
+});

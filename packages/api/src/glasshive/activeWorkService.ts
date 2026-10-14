@@ -12,6 +12,10 @@ const DEFAULT_CACHE_MS = 2000;
 const DEFAULT_COLD_TIMEOUT_MS = 100;
 const DEFAULT_INTERACTIVE_TIMEOUT_MS = 5000;
 
+class ActiveWorkSnapshotWaitTimeout extends Error {
+  name = 'TimeoutError';
+}
+
 type UnknownRecord = Record<string, unknown>;
 
 interface CacheEntry {
@@ -83,6 +87,13 @@ function positiveIntEnv(name: string, fallback: number): number {
 
 export function activeWorkColdTimeoutMs(): number {
   return positiveIntEnv('VIVENTIUM_ACTIVE_WORK_COLD_TIMEOUT_MS', DEFAULT_COLD_TIMEOUT_MS);
+}
+
+function activeWorkInteractiveTimeoutMs(): number {
+  return positiveIntEnv(
+    'VIVENTIUM_ACTIVE_WORK_INTERACTIVE_TIMEOUT_MS',
+    DEFAULT_INTERACTIVE_TIMEOUT_MS,
+  );
 }
 
 function configuredTenantId(): string {
@@ -322,10 +333,7 @@ export function createGlassHiveActiveWorkService(dependencies: ActiveWorkService
     cursor = '',
     limit = 50,
     fetchImpl = globalThis.fetch,
-    timeoutMs = positiveIntEnv(
-      'VIVENTIUM_ACTIVE_WORK_INTERACTIVE_TIMEOUT_MS',
-      DEFAULT_INTERACTIVE_TIMEOUT_MS,
-    ),
+    timeoutMs = activeWorkInteractiveTimeoutMs(),
     rosterObservation,
     shouldPersistKnownWork = () => true,
   }: ActiveWorkPageOptions & {
@@ -373,10 +381,7 @@ export function createGlassHiveActiveWorkService(dependencies: ActiveWorkService
     cursor = '',
     limit = 50,
     fetchImpl = globalThis.fetch,
-    timeoutMs = positiveIntEnv(
-      'VIVENTIUM_ACTIVE_WORK_INTERACTIVE_TIMEOUT_MS',
-      DEFAULT_INTERACTIVE_TIMEOUT_MS,
-    ),
+    timeoutMs = activeWorkInteractiveTimeoutMs(),
   }: ActiveWorkPageOptions): Promise<UnknownRecord> {
     const normalizedOwnerId = String(ownerId || '').trim();
     if (!normalizedOwnerId) {
@@ -396,8 +401,91 @@ export function createGlassHiveActiveWorkService(dependencies: ActiveWorkService
     return dependencies.enrichActiveWorkSnapshot({
       ownerId: normalizedOwnerId,
       snapshot: normalizedSnapshot(response),
-      includeCoreOnlyHistory: true,
+      includeCoreOnlyHistory: !pageCursor,
     });
+  }
+
+  function refreshActiveWorkSnapshot(
+    normalizedOwnerId: string,
+    fetchImpl: AccountFetch,
+  ): Promise<UnknownRecord> {
+    const key = ownerCacheKey(normalizedOwnerId);
+    const timeoutMs = activeWorkInteractiveTimeoutMs();
+    let ownerRefreshes = activeWorkRefreshes.get(key);
+    if (!ownerRefreshes) {
+      ownerRefreshes = new Map();
+      activeWorkRefreshes.set(key, ownerRefreshes);
+    }
+    const refreshRegistry = ownerRefreshes;
+    const deadlineKey = String(timeoutMs);
+    const existing = refreshRegistry.get(deadlineKey);
+    if (existing) {
+      return existing;
+    }
+    const generation = activeWorkCacheGeneration;
+    const keyVersion = activeWorkCacheVersions.get(key) || 0;
+    const observation = beginActiveWorkObservation(key);
+    const pending = getActiveWorkPage({
+      ownerId: normalizedOwnerId,
+      fetchImpl,
+      timeoutMs,
+      rosterObservation: observation,
+      shouldPersistKnownWork: () =>
+        generation === activeWorkCacheGeneration &&
+        keyVersion === (activeWorkCacheVersions.get(key) || 0),
+    })
+      .then((value) => {
+        if (
+          generation === activeWorkCacheGeneration &&
+          keyVersion === (activeWorkCacheVersions.get(key) || 0) &&
+          activeWorkObservationIsCurrent(observation)
+        ) {
+          activeWorkCache.set(key, { value, fetchedAt: Date.now() });
+          return value;
+        }
+        const current = activeWorkCache.get(key);
+        if (current) {
+          return {
+            ...current.value,
+            snapshot:
+              Date.now() - current.fetchedAt <=
+              positiveIntEnv('VIVENTIUM_ACTIVE_WORK_CACHE_MS', DEFAULT_CACHE_MS)
+                ? 'fresh'
+                : 'stale',
+          };
+        }
+        throw new Error('glasshive_active_work_snapshot_superseded');
+      })
+      .finally(() => {
+        if (refreshRegistry.get(deadlineKey) === pending) {
+          refreshRegistry.delete(deadlineKey);
+          if (refreshRegistry.size === 0 && activeWorkRefreshes.get(key) === refreshRegistry) {
+            activeWorkRefreshes.delete(key);
+          }
+        }
+      });
+    refreshRegistry.set(deadlineKey, pending);
+    return pending;
+  }
+
+  async function waitForActiveWorkSnapshot(
+    pending: Promise<UnknownRecord>,
+    timeoutMs: number,
+  ): Promise<UnknownRecord> {
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        pending,
+        new Promise<never>((_resolve, reject) => {
+          deadline = setTimeout(
+            () => reject(new ActiveWorkSnapshotWaitTimeout('Active work caller deadline')),
+            Number.isInteger(timeoutMs) && timeoutMs > 0 ? timeoutMs : activeWorkColdTimeoutMs(),
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(deadline);
+    }
   }
 
   async function getActiveWorkSnapshot({
@@ -418,67 +506,32 @@ export function createGlassHiveActiveWorkService(dependencies: ActiveWorkService
       return { ...cached.value, snapshot: 'fresh' };
     }
 
-    const refresh = (): Promise<UnknownRecord> => {
-      let ownerRefreshes = activeWorkRefreshes.get(key);
-      if (!ownerRefreshes) {
-        ownerRefreshes = new Map();
-        activeWorkRefreshes.set(key, ownerRefreshes);
-      }
-      const refreshRegistry = ownerRefreshes;
-      const deadlineKey = String(timeoutMs);
-      const existing = refreshRegistry.get(deadlineKey);
-      if (existing) {
-        return existing;
-      }
-      const generation = activeWorkCacheGeneration;
-      const keyVersion = activeWorkCacheVersions.get(key) || 0;
-      const observation = beginActiveWorkObservation(key);
-      const pending = getActiveWorkPage({
-        ownerId: normalizedOwnerId,
-        fetchImpl,
-        timeoutMs,
-        rosterObservation: observation,
-        shouldPersistKnownWork: () =>
-          generation === activeWorkCacheGeneration &&
-          keyVersion === (activeWorkCacheVersions.get(key) || 0),
-      })
-        .then((value) => {
-          if (
-            generation === activeWorkCacheGeneration &&
-            keyVersion === (activeWorkCacheVersions.get(key) || 0) &&
-            activeWorkObservationIsCurrent(observation)
-          ) {
-            activeWorkCache.set(key, { value, fetchedAt: Date.now() });
-          }
-          return value;
-        })
-        .finally(() => {
-          if (refreshRegistry.get(deadlineKey) === pending) {
-            refreshRegistry.delete(deadlineKey);
-            if (refreshRegistry.size === 0 && activeWorkRefreshes.get(key) === refreshRegistry) {
-              activeWorkRefreshes.delete(key);
-            }
-          }
-        });
-      refreshRegistry.set(deadlineKey, pending);
-      return pending;
-    };
-
     if (!forceRefresh && cached) {
-      void refresh().catch(() => undefined);
+      void refreshActiveWorkSnapshot(normalizedOwnerId, fetchImpl).catch(() => undefined);
       return { ...cached.value, snapshot: 'stale' };
     }
     try {
-      return await refresh();
+      return await waitForActiveWorkSnapshot(
+        refreshActiveWorkSnapshot(normalizedOwnerId, fetchImpl),
+        timeoutMs,
+      );
     } catch (error) {
-      logger.warn('[VIVENTIUM][active-work] Snapshot refresh failed', {
-        stage: forceRefresh ? 'interactive_refresh' : 'snapshot_refresh',
-        errorClass:
-          error instanceof Error || error instanceof DOMException ? error.name : 'unknown_error',
-        elapsedMs: Date.now() - now,
-      });
-      if (cached) {
-        return { ...cached.value, snapshot: 'stale' };
+      const callerWaitExpired = error instanceof ActiveWorkSnapshotWaitTimeout;
+      const refreshStage = forceRefresh ? 'interactive_refresh' : 'snapshot_refresh';
+      logger.warn(
+        callerWaitExpired
+          ? '[VIVENTIUM][active-work] Snapshot wait expired'
+          : '[VIVENTIUM][active-work] Snapshot refresh failed',
+        {
+          stage: callerWaitExpired ? 'snapshot_wait' : refreshStage,
+          errorClass:
+            error instanceof Error || error instanceof DOMException ? error.name : 'unknown_error',
+          elapsedMs: Date.now() - now,
+        },
+      );
+      const current = activeWorkCache.get(key);
+      if (current) {
+        return { ...current.value, snapshot: 'stale' };
       }
       const unavailable: UnknownRecord = {
         snapshot: 'unavailable',
@@ -503,14 +556,17 @@ export function createGlassHiveActiveWorkService(dependencies: ActiveWorkService
     return getActiveWorkSnapshot({
       ...options,
       forceRefresh: true,
-      timeoutMs: positiveIntEnv(
-        'VIVENTIUM_ACTIVE_WORK_INTERACTIVE_TIMEOUT_MS',
-        DEFAULT_INTERACTIVE_TIMEOUT_MS,
-      ),
+      timeoutMs: activeWorkInteractiveTimeoutMs(),
     });
   }
 
-  function invalidateActiveWorkSnapshot({ ownerId }: { ownerId?: unknown }): void {
+  function invalidateActiveWorkSnapshot({
+    ownerId,
+    fetchImpl = globalThis.fetch,
+  }: {
+    ownerId?: unknown;
+    fetchImpl?: AccountFetch;
+  }): void {
     const normalizedOwnerId = String(ownerId || '').trim();
     if (!normalizedOwnerId) {
       throw new Error('glasshive_owner_required');
@@ -524,6 +580,7 @@ export function createGlassHiveActiveWorkService(dependencies: ActiveWorkService
     state.positiveGroups.clear();
     activeWorkCache.delete(key);
     activeWorkRefreshes.delete(key);
+    void refreshActiveWorkSnapshot(normalizedOwnerId, fetchImpl).catch(() => undefined);
   }
 
   function clearActiveWorkCacheForTests(): void {

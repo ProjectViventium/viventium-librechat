@@ -1209,3 +1209,20 @@ describe('getEndpointFileConfig', () => {
     });
   });
 });
+
+describe('context MIME suffix grammar', () => {
+  it.each(['image/svg+xml', 'application/ld+json'])(
+    'admits the standard structured suffix in %s',
+    (type) => {
+      const config = mergeFileConfig(undefined);
+      expect(baseFileConfig.checkType(type, config.text?.supportedMimeTypes)).toBe(true);
+    },
+  );
+  it.each(['image/svg+xml;script=x', 'image/svg+xml/extra', ' image/svg+xml'])(
+    'rejects malformed MIME values %s',
+    (type) => {
+      const config = mergeFileConfig(undefined);
+      expect(baseFileConfig.checkType(type, config.text?.supportedMimeTypes)).toBe(false);
+    },
+  );
+});

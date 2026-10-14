@@ -7,6 +7,8 @@ const {
   backgroundWorkerResources,
   resolveBackgroundWorkerRoute,
   mainDelegationJsonSchema,
+  resolveSelectedDelegationAttachments,
+  resolveSelectedHistoryAttachments,
 } = require('@librechat/api');
 /* === VIVENTIUM START ===
  * Feature: GlassHive capability broker service
@@ -29,7 +31,7 @@ const {
   transcribeAttachedAudio,
   transcriptionAttachmentReferences,
 } = require('@librechat/api');
-const { getFiles } = require('~/models');
+const { getFiles, getMessages } = require('~/models');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { CacheKeys } = require('librechat-data-provider');
 const { getMCPManager, getMCPServersRegistry, getFlowStateManager } = require('~/config');
@@ -464,7 +466,13 @@ function omissionReasonForDiscovery(discovered) {
   return '';
 }
 
-async function buildCapabilityCatalog({ grant, signal, requestedServerNames, appConfig } = {}) {
+async function buildCapabilityCatalog({
+  grant,
+  signal,
+  requestedServerNames,
+  requestedHostToolName,
+  appConfig,
+} = {}) {
   const user = await userForGrant(grant);
   const registry = getMCPServersRegistry();
   const tools = [];
@@ -475,6 +483,9 @@ async function buildCapabilityCatalog({ grant, signal, requestedServerNames, app
   const claimedLegacyBrokerToolNames = new Map();
 
   for (const toolName of grant?.allowed_host_tools || []) {
+    if (requestedHostToolName !== undefined && toolName !== requestedHostToolName) {
+      continue;
+    }
     if (
       isConversationOrchestrationTool(toolName) &&
       grant?.authority_kind !== BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
@@ -483,14 +494,44 @@ async function buildCapabilityCatalog({ grant, signal, requestedServerNames, app
       continue;
     }
     const memoryBinding = activeMemoryWriterTool(grant);
-    const resources = grant?.host_tool_resources?.[toolName];
+    let resources = grant?.host_tool_resources?.[toolName];
+    if (toolName === DELEGATION_TOOL_NAME && resources?.file_selection?.version === 1) {
+      const body = resources.request_body || {};
+      const currentIds = new Set(
+        trustedUploadedFilesFromRequestBody(body).map((file) => file.file_id),
+      );
+      let history;
+      try {
+        history = await resolveSelectedHistoryAttachments(
+          {
+            userId: String(user.id),
+            conversationId: body.conversationId,
+            parentMessageId: body.parentMessageId,
+          },
+          { getMessages, getFiles },
+        );
+      } catch {
+        omissions.push({ reason: 'delegation_file_choices_unavailable', tool: toolName });
+        continue;
+      }
+      const choices = history
+        .filter((file) => !currentIds.has(file.file_id))
+        .map(({ file_id, filename }) => ({ file_id, filename }));
+      resources = { ...resources, file_selection: { version: 1, choices } };
+    }
     const declaredDefinition =
       memoryBinding?.definition.name === toolName
         ? memoryBinding.definition
         : HOST_TOOL_DEFINITIONS[toolName];
     const baseDefinition =
       toolName === DELEGATION_TOOL_NAME && declaredDefinition
-        ? { ...declaredDefinition, inputSchema: mainDelegationJsonSchema(resources?.request_body) }
+        ? {
+            ...declaredDefinition,
+            inputSchema: mainDelegationJsonSchema(
+              resources?.request_body,
+              resources?.file_selection?.choices,
+            ),
+          }
         : declaredDefinition;
     const definition =
       baseDefinition &&
@@ -809,7 +850,7 @@ function validActiveWorkActionArgs(args = {}) {
   } catch {
     return null;
   }
-  const { workRef, action, instruction = '', fileIds } = canonical;
+  const { workRef, action, instruction = '', fileIds, nativeInput } = canonical;
   if (!WORK_REF_PATTERN.test(workRef) || !ACTIVE_WORK_ACTIONS.has(action)) return null;
   if (['queue', 'message', 'steer'].includes(action) && !instruction) return null;
   return {
@@ -817,6 +858,7 @@ function validActiveWorkActionArgs(args = {}) {
     action,
     ...(instruction ? { instruction } : {}),
     ...(fileIds ? { fileIds } : {}),
+    ...(nativeInput ? { nativeInput } : {}),
   };
 }
 
@@ -887,6 +929,30 @@ async function invokeConversationDelegation({
     };
   }
   const resources = hostTool.resources || {};
+  const fileChoices =
+    resources.file_selection?.version === 1 ? resources.file_selection.choices : undefined;
+  if (Array.isArray(fileChoices) && fileChoices.length && canonicalArgs.fileIds === undefined) {
+    return {
+      status: 'blocked',
+      reason: 'file_selection_required',
+      tool: hostTool.toolName,
+      retryable: false,
+      needsInput: false,
+    };
+  }
+  if (
+    Array.isArray(fileChoices) &&
+    fileChoices.length &&
+    canonicalArgs.fileIds?.some((id) => !fileChoices.some((file) => file.file_id === id))
+  ) {
+    return {
+      status: 'blocked',
+      reason: 'delegation_file_selection_unauthorized',
+      tool: hostTool.toolName,
+      retryable: false,
+      needsInput: false,
+    };
+  }
   const { args: routedArgs, authority: workerRouteAuthority } = resolveBackgroundWorkerRoute(
     canonicalArgs,
     resources,
@@ -907,7 +973,21 @@ async function invokeConversationDelegation({
     return { status: 'blocked', reason: selection.error, tool: hostTool.toolName };
   }
   const requestBody = selection.requestBody;
-  const trustedUploadedFiles = trustedUploadedFilesFromRequestBody(requestBody);
+  const fileSelection = await resolveSelectedDelegationAttachments(
+    {
+      userId: String(catalog.user.id),
+      conversationId: baseRequestBody.conversationId,
+      parentMessageId: baseRequestBody.parentMessageId,
+    },
+    trustedUploadedFilesFromRequestBody(requestBody),
+    routedArgs.fileIds,
+    { getMessages, getFiles },
+    trustedUploadedFilesFromRequestBody(baseRequestBody),
+  );
+  if (fileSelection.error) {
+    return { status: 'blocked', reason: fileSelection.error, tool: hostTool.toolName };
+  }
+  const trustedUploadedFiles = trustedUploadedFilesFromRequestBody({ files: fileSelection.files });
   if (trustedUploadedFiles.length > 0) {
     toolArguments.uploaded_files = trustedUploadedFiles;
   }
@@ -1246,6 +1326,7 @@ async function invokeConversationOrchestrationTool({
           const result = await executeGlassHiveWorkAction({
             ownerId: catalog.user.id,
             ...input,
+            ...(input.nativeInput || input.action === 'resume' ? { requestBody } : {}),
             operationId: stableInvocationId,
             ...(isManagedSourceMutation(requestBody)
               ? {
@@ -1715,6 +1796,7 @@ async function handleToolCall({
       signal,
       appConfig,
       requestedServerNames: requested.server ? [requested.server] : undefined,
+      requestedHostToolName: requested.tool ? '' : undefined,
     });
     if (requested.tool) {
       const native =
@@ -1737,6 +1819,7 @@ async function handleToolCall({
       signal,
       appConfig,
       requestedServerNames: args.server ? [args.server] : [],
+      requestedHostToolName: '',
     });
     const native = findNativeToolByServerTool(catalog, args.server, args.tool);
     if (!native) {
@@ -1757,7 +1840,27 @@ async function handleToolCall({
       signal,
     });
   }
-  const catalog = await buildCapabilityCatalog({ grant, signal, appConfig });
+  const catalog = await buildCapabilityCatalog({
+    grant,
+    signal,
+    appConfig,
+    requestedHostToolName: toolName,
+  });
+  if (
+    toolName === DELEGATION_TOOL_NAME &&
+    catalog.omissions.some(
+      (omission) =>
+        omission.tool === toolName && omission.reason === 'delegation_file_choices_unavailable',
+    )
+  ) {
+    return {
+      status: 'blocked',
+      reason: 'delegation_file_choices_unavailable',
+      tool: toolName,
+      retryable: true,
+      needsInput: false,
+    };
+  }
   const hostTool = findHostTool(catalog, toolName);
   if (hostTool) {
     let effectiveArgs = args;
@@ -1769,13 +1872,16 @@ async function handleToolCall({
       let canonicalMutationArgs;
       try {
         canonicalMutationArgs = canonicalConversationOrchestrationArguments(toolName, args);
-      } catch {
+      } catch (error) {
         return {
           status: 'blocked',
           reason: 'invalid_arguments',
           tool: toolName,
           retryable: false,
           needsInput: false,
+          ...(error?.code === 'native_input_arguments_conflict'
+            ? { argumentError: { code: error.code, message: error.message } }
+            : {}),
         };
       }
       try {

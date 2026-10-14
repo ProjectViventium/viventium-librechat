@@ -118,6 +118,52 @@ beforeEach(() => {
   Object.defineProperty(window.URL, 'revokeObjectURL', { value: jest.fn(), configurable: true });
 });
 
+test.each([
+  { content: [] },
+  { content: [{ type: ContentTypes.IMAGE_URL, image_url: { url: '/uploads/owner/photo.png' } }] },
+])('saved user text remains visible with absent text parts', ({ content }) => {
+  render(
+    <ContentParts
+      content={content as TMessageContentParts[]}
+      fallbackText="Use this fictional photo as a reference."
+      messageId="question"
+      isCreatedByUser={true}
+      isLast={true}
+      isSubmitting={false}
+    />,
+  );
+  expect(screen.getByText('Use this fictional photo as a reference.')).toBeVisible();
+});
+
+test('structured user text is authoritative over a stale plain-text field', () => {
+  render(
+    <ContentParts
+      content={[text]}
+      fallbackText="Old caption."
+      messageId="question"
+      isCreatedByUser={true}
+      isLast={true}
+      isSubmitting={false}
+    />,
+  );
+  expect(screen.getAllByText('Useful answer.')).toHaveLength(1);
+  expect(screen.queryByText('Old caption.')).not.toBeInTheDocument();
+});
+
+test('assistant tool content does not expose a stale plain-text field', () => {
+  render(
+    <ContentParts
+      content={[tool]}
+      fallbackText="Old answer."
+      messageId="answer"
+      isCreatedByUser={false}
+      isLast={true}
+      isSubmitting={false}
+    />,
+  );
+  expect(screen.queryByText('Old answer.')).not.toBeInTheDocument();
+});
+
 test('an imported message file is visible and downloads through its authenticated File identity', async () => {
   const click = jest.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
   const attachments = [file()];

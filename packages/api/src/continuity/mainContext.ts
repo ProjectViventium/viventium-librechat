@@ -36,7 +36,7 @@ export function isContextOnlyMainHistory(value: unknown): boolean {
   );
 }
 
-function stampFrom(value: unknown): MainContextStamp | undefined {
+export function normalizeMainContextStamp(value: unknown): MainContextStamp | undefined {
   const stamp = record(value);
   return typeof stamp.agentId === 'string' &&
     stamp.agentId.trim() &&
@@ -66,7 +66,7 @@ export function capturedMainContextStamp(
     message.isCreatedByUser !== false
   )
     return undefined;
-  return stampFrom(identity);
+  return normalizeMainContextStamp(identity);
 }
 
 function parentValue(key: string, value: unknown, stamp?: MainContextStamp): unknown {
@@ -129,7 +129,7 @@ export function preserveMainContextUpdate(
   captured?: MainContextStamp,
 ): Document {
   const saved = record(previous);
-  const stamp = stampFrom(atPath(saved, path)) || captured;
+  const stamp = normalizeMainContextStamp(atPath(saved, path)) || captured;
   const result = sanitizeMainContextUpdate(update);
   let parentContainsStamp = false;
   const additionalSets: Document = {};
@@ -179,7 +179,7 @@ export function preserveMainContextUpdate(
       }
     }
   }
-  if (captured && !stampFrom(atPath(saved, path)) && !parentContainsStamp) set(path, captured);
+  if (captured && !normalizeMainContextStamp(atPath(saved, path)) && !parentContainsStamp) set(path, captured);
   if (Object.keys(additionalSets).length)
     result.$set = { ...record(result.$set), ...additionalSets };
   if (Object.keys(additionalUnsets).length)

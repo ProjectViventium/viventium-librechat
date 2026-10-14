@@ -1,4 +1,31 @@
-import type { GraphEdge } from 'librechat-data-provider';
+import type { Agent, GraphEdge } from 'librechat-data-provider';
+
+/* === VIVENTIUM START ===
+ * Feature: Agent duplication preserves the copied agent's graph role.
+ * Purpose: Rebind only typed self references, keeping consultant and other graph links intact.
+ */
+export function remapDuplicatedAgentGraph(
+  agent: Pick<Agent, 'edges' | 'agent_ids'>,
+  sourceId: string,
+  duplicateId: string,
+): Pick<Agent, 'edges' | 'agent_ids'> {
+  const remapId = (id: string): string => (id === sourceId ? duplicateId : id);
+  const remapEndpoint = (endpoint: GraphEdge['from']): GraphEdge['from'] =>
+    Array.isArray(endpoint) ? endpoint.map(remapId) : remapId(endpoint);
+  return {
+    ...(agent.edges !== undefined
+      ? {
+          edges: agent.edges.map((edge) => ({
+            ...edge,
+            from: remapEndpoint(edge.from),
+            to: remapEndpoint(edge.to),
+          })),
+        }
+      : {}),
+    ...(agent.agent_ids !== undefined ? { agent_ids: agent.agent_ids.map(remapId) } : {}),
+  };
+}
+/* === VIVENTIUM END === */
 
 /**
  * Creates a stable key for edge deduplication.

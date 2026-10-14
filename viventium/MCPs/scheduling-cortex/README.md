@@ -31,7 +31,7 @@ uv run --group test pytest -q
 ## Environment
 
 - `SCHEDULING_DB_PATH` (default: `~/Library/Application Support/Viventium/state/runtime/isolated/scheduling/schedules.db`)
-- `SCHEDULER_POLL_INTERVAL_S` (default: `30`)
+- `SCHEDULER_POLL_INTERVAL_S` (default: `1`; an explicit environment value is retained)
 - `SCHEDULER_MISFIRE_GRACE_S` (default: `900`)
 - `SCHEDULER_RETRY_DELAY_S` (default: `300`)
 - `SCHEDULING_OCCURRENCE_CLAIM_SECONDS` (default: `300`, bounded to `30`–`900`; durable

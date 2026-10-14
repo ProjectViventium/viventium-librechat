@@ -37,6 +37,7 @@ const {
   getProviderConfig,
   memoryInstructions,
   applyContextToAgent,
+  buildAgentInstructions,
   buildSavedMemoryTurnContext,
   GenerationJobManager,
   getTransactionsConfig,
@@ -55,6 +56,8 @@ const {
   loadFeelingsReadContext,
   isFeelingsReadIsolated,
   NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
+  conversationContinuityContextReserveBytes,
+  mainContinuityOutputCarrier,
   getCurrentCallContext,
 } = require('@librechat/api');
 const {
@@ -138,6 +141,7 @@ const {
   applyHostEvidenceBoundaryInstructions,
   configuredBrokerHostTools,
   conversationProviderUsesInvocationLocalTime,
+  conversationProviderUsesNativeBody,
   conversationProviderUsesLocalVisibleAccounting,
   resolveHostToolCapabilityState,
   resolveConversationProviderId,
@@ -171,13 +175,14 @@ const {
 } = require('~/server/services/viventium/ViventiumTurnReplyContext');
 const {
   applyMainContextAttempt,
+  mainHistoryFitsNativeBody,
   bindMainContextSnapshot,
   buildMainAttemptFactsForAgent,
   captureMainContextSnapshot,
   hasUnreconciledMainHistory,
   isSchedulerTransportRow,
-  isTrustedSchedulerWake,
   mainRouteTargetForAgent,
+  mainAttemptFactsAuthorityReserveBytes,
   renderMainAttemptFactsAuthorityBlock,
   stableAuthorityDigest,
   withReconciledHistoryAncestry,
@@ -185,6 +190,9 @@ const {
 const {
   resolveConversationContinuity,
 } = require('~/server/services/viventium/ViventiumConversationContinuityService');
+const {
+  loadAcceptedMainContextForAdmission,
+} = require('~/server/services/viventium/ViventiumMainCompactionService');
 const {
   loadAcceptedMainContext,
 } = require('~/server/services/viventium/ViventiumMainContinuityService');
@@ -245,6 +253,18 @@ function activeWorkUnavailableFallback(req) {
  * === VIVENTIUM END === */
 const MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES = 16 * 1024;
 const TURN_CONTEXT_SEPARATOR_BYTES = Buffer.byteLength('\n\n', 'utf8');
+
+function mainContinuityCarrierPeerParts({
+  currentCallContext = '',
+  conversationContinuityContext = '',
+  optionalContexts = [],
+  carrierMaxUtf8Bytes = MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES,
+}) {
+  const mandatory = [currentCallContext, conversationContinuityContext];
+  return carrierMaxUtf8Bytes === MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES
+    ? mandatory
+    : [...mandatory, ...optionalContexts];
+}
 
 function activeWorkTurnContextByteBudgetForComponents(
   timeContext,
@@ -323,6 +343,92 @@ async function resolveActiveWorkTurnContext(req) {
     ]);
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+function nativeWholeHistoryFits(req, agent, rows, reservedContextUtf8Bytes, pendingHydration) {
+  const alternates = [
+    agent?.viventiumFallbackLlm || agent?.viventiumFallbackLlmAssignment,
+    ...(agent?.viventiumGraphLlmFallbacks || []),
+  ].filter(Boolean);
+  if (!conversationProviderUsesNativeBody(req, agent, { alternates })) return null;
+  // BaseClient.loadHistory has already awaited historical attachment hydration.
+  // The current upload, gateway images or RAG context can still enlarge this invocation.
+  // Only their owning caller can prove that no such preparation remains.
+  const empty = (value) => value == null || (Array.isArray(value) && value.length === 0);
+  if (
+    !pendingHydration ||
+    typeof pendingHydration !== 'object' ||
+    !empty(pendingHydration.attachments) ||
+    !empty(req?._telegramImages) ||
+    !empty(req?._gatewayImages) ||
+    pendingHydration.contextHandlers ||
+    !Array.isArray(rows) ||
+    rows.some(
+      (row) =>
+        !row ||
+        typeof row !== 'object' ||
+        ['files', 'image_urls', 'documents', 'audios', 'videos', 'attachments'].some(
+          (key) => row[key] != null && !Array.isArray(row[key]),
+        ) ||
+        (row.fileContext != null && typeof row.fileContext !== 'string') ||
+        ['image_urls', 'documents', 'audios', 'videos'].some((key) =>
+          row[key]?.some(
+            (part) =>
+              !part ||
+              typeof part !== 'object' ||
+              typeof part.type !== 'string' ||
+              (part.type === 'image_url' &&
+                !(typeof part.image_url === 'string'
+                  ? part.image_url.trim()
+                  : typeof part.image_url?.url === 'string' && part.image_url.url.trim())),
+          ),
+        ),
+    )
+  )
+    return null;
+  try {
+    const isolatedRows = structuredClone(rows);
+    const payload = isolatedRows.map((message) => ({
+      ...formatMessage({
+        message: normalizeMediaTextForFormatter(normalizeUserMessageContent(message)),
+        userName: pendingHydration.userName,
+        assistantName: pendingHydration.assistantName,
+      }),
+      messageId: message.messageId,
+    }));
+    const clean = normalizeTextPartsInPayload(stripInternalContentParts(payload)).map((message) => {
+      if (!Array.isArray(message?.content)) return message;
+      const content = filterMalformedContentParts(message.content);
+      if (content.length !== message.content.length) throw new Error('history_media_not_prepared');
+      return { ...message, content };
+    });
+    const messages = sanitizeProviderFormattedMessages(
+      agent?.provider,
+      formatAgentMessages(clean, undefined, undefined).messages,
+    );
+    // buildMessages carries every derived file context in this exact shared instruction order.
+    // Cost it through the same Native serializer, including JSON escaping and separators.
+    const fileContext = isolatedRows
+      .map((row) => row.fileContext)
+      .filter(Boolean)
+      .join('\n\n');
+    const preparedAgent = fileContext
+      ? {
+          ...agent,
+          instructions: buildAgentInstructions({
+            sharedRunContext: fileContext,
+            baseInstructions: [agent?.instructions, agent?.additional_instructions]
+              .filter(Boolean)
+              .join('\n')
+              .trim(),
+          }),
+          additional_instructions: '',
+        }
+      : agent;
+    return mainHistoryFitsNativeBody(messages, preparedAgent, reservedContextUtf8Bytes);
+  } catch {
+    return null;
   }
 }
 
@@ -2073,6 +2179,39 @@ function getCompletionErrorChain(err, maxNodes = 8) {
   return chain;
 }
 
+/* === VIVENTIUM START === Preserve primary failure across a failed fallback. === */
+function preservePrimaryCompletionError(error, primaryError) {
+  if (
+    !primaryError ||
+    !error ||
+    typeof error !== 'object' ||
+    getCompletionErrorChain(error).some(
+      (item) =>
+        item?.name === 'AbortError' ||
+        item?.code === 'ABORT_ERR' ||
+        [
+          'native_turn_cancelled',
+          'native_input_cancelled',
+          'native_input_declined',
+          'native_input_expired',
+        ].includes(item?.code || item?.error_class),
+    )
+  ) {
+    return error;
+  }
+  if (!error.originalError) {
+    try {
+      error.originalError = primaryError;
+      if (error.originalError === primaryError) return error;
+    } catch {}
+  }
+  return Object.assign(new Error(getCompletionErrorMessage(error), { cause: error }), {
+    originalError: primaryError,
+  });
+}
+
+/* === VIVENTIUM END === */
+
 function classifyCompletionErrorForLog(err) {
   const errorChain = getCompletionErrorChain(err);
   const message = errorChain
@@ -2126,6 +2265,20 @@ function classifyCompletionErrorForLog(err) {
   }
   if (isLocalRetrievalTimeoutError(err)) {
     return 'local_retrieval_timeout';
+  }
+  if (
+    codes.includes('native_mcp_unavailable') &&
+    !errorChain.some((item) => item?.name === 'AbortError' || item?.code === 'ABORT_ERR') &&
+    !codes.some((code) =>
+      [
+        'native_turn_cancelled',
+        'native_input_cancelled',
+        'native_input_declined',
+        'native_input_expired',
+      ].includes(code),
+    )
+  ) {
+    return 'native_mcp_unavailable';
   }
   if (errorChain.some((candidate) => isConnectedAccountReconnectError(candidate))) {
     return 'provider_connected_account_reconnect_required';
@@ -2324,6 +2477,7 @@ function contentPartsContainRecoverableProviderFailure(contentParts) {
       return false;
     }
     return [
+      'native_mcp_unavailable',
       'provider_rate_limited',
       'provider_quota_exhausted',
       'provider_response_failed',
@@ -2598,6 +2752,7 @@ function shouldSuppressCompletionErrorContentPart(contentParts, err) {
 function createCompletionErrorContentPart(err) {
   const errorClass = classifyCompletionErrorForLog(err);
   const publicMessageByClass = {
+    native_mcp_unavailable: 'Connected tools did not start in time. Please try again.',
     native_input_declined: 'You declined that action. It was stopped.',
     native_input_expired: 'The approval request expired, so that action was stopped. Please retry.',
     native_input_cancelled: 'That action was cancelled.',
@@ -4655,6 +4810,9 @@ class AgentClient extends BaseClient {
       {
         provider: this.options.agent.provider,
         endpoint: this.options.endpoint,
+        /* === VIVENTIUM START: Retain the resolved native endpoint after transport normalization. === */
+        capabilityEndpoint: this.options.agent.endpoint,
+        /* === VIVENTIUM END === */
       },
       VisionModes.agents,
     );
@@ -4671,8 +4829,7 @@ class AgentClient extends BaseClient {
       logDeepTiming(req, 'build_messages_start', null, `count=${messages?.length ?? 0}`);
     }
     /** Always pass mapMethod; getMessagesForConversation applies it only to messages with addedConvo flag */
-    /* === VIVENTIUM START === A trusted scheduler wake omits scheduler transport rows by type. === */
-    const trustedSchedulerWake = isTrustedSchedulerWake(req);
+    /* === VIVENTIUM START === Every Agents turn omits retained scheduler transport rows by type. === */
     /* === VIVENTIUM END === */
     let orderedMessages = this.constructor.getMessagesForConversation({
       messages,
@@ -4683,7 +4840,7 @@ class AgentClient extends BaseClient {
       skipCondition: (message) =>
         isListenOnlyTranscriptMessage(message) ||
         isRuntimeOnlyAssistantMessage(message) ||
-        (trustedSchedulerWake && isSchedulerTransportRow(message)),
+        isSchedulerTransportRow(message),
     });
     /* === VIVENTIUM START ===
      * Feature: Conversation legacy continuity.
@@ -4692,12 +4849,97 @@ class AgentClient extends BaseClient {
      * === VIVENTIUM END === */
     this._viventiumConversationContinuityCapsule = '';
     // The compactor runs isolated on a background response, never on this turn's live stream.
+    let legacyOutputCarrier;
+    const resolveLegacyOutputCarrier = async () => {
+      if (legacyOutputCarrier) return legacyOutputCarrier;
+      const agent = this.options.agent;
+      const activeWork = await resolveActiveWorkTurnContext(req);
+      // Pin the already bounded projection for this invocation so a later cold-cache completion
+      // cannot enlarge the reserved section after this claim was reviewed.
+      req._viventiumContinuityActiveWorkContext = activeWork;
+      const authorityReserve = mainAttemptFactsAuthorityReserveBytes(req, agent);
+      const carrierMaxUtf8Bytes = conversationProviderUsesInvocationLocalTime(req, agent)
+        ? NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
+        : MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES;
+      const parts = mainContinuityCarrierPeerParts({
+        currentCallContext: getCurrentCallContext(req),
+        optionalContexts: [
+          buildTurnReplyContextCapsules(
+            getTrustedInteractionContext(req),
+            getTrustedAdapterCapabilities(req),
+          ),
+          buildSavedMemoryWriterTurnContext(true),
+          buildRecurrenceStateCapsule(req, req?.body?.recurrenceState),
+          buildTimeContextInstructions(req),
+          activeWork,
+          sourceSelectionTurnContext(req),
+        ],
+        carrierMaxUtf8Bytes,
+      });
+      const identity = req._viventiumAcceptedMainCompactionIdentityV1 || {
+        ownerId: String(req?.user?.id || ''),
+        agentId: String(agent?.id || ''),
+        stableAuthoritySha256: stableAuthorityDigest(agent),
+      };
+      const context = await loadAcceptedMainContext({
+        ...identity,
+        outputCarrier: mainContinuityOutputCarrier(parts, authorityReserve, carrierMaxUtf8Bytes),
+      });
+      req._viventiumAcceptedMainCarrierContextV1 = Object.freeze({
+        identity: Object.freeze(identity),
+        context: Object.freeze(context),
+      });
+      if (context.status === 'context_budget')
+        throw Object.assign(new Error('Accepted Core cannot fit the selected carrier'), {
+          code: 'source_context_unavailable',
+          status: 413,
+        });
+      const reservedContextUtf8Bytes = conversationContinuityContextReserveBytes(
+        parts,
+        authorityReserve,
+        Buffer.byteLength(String(context.capsule || ''), 'utf8'),
+      );
+      return (legacyOutputCarrier = {
+        carrierMaxUtf8Bytes,
+        reservedContextUtf8Bytes,
+      });
+    };
     const conversationContinuity = await resolveConversationContinuity({
       req,
       agent: this.options.agent,
       ownerId: String(req?.user?.id || '').trim(),
       conversationId: String(this.conversationId || req?.body?.conversationId || '').trim(),
       orderedMessages,
+      signal: opts?.abortController?.signal,
+      resolveOutputCarrier: resolveLegacyOutputCarrier,
+      canCarryWholeHistory: async (rows, capsule = '') => {
+        if (
+          !conversationProviderUsesNativeBody(req, this.options.agent, {
+            alternates: [
+              this.options.agent?.viventiumFallbackLlm ||
+                this.options.agent?.viventiumFallbackLlmAssignment,
+              ...(this.options.agent?.viventiumGraphLlmFallbacks || []),
+            ].filter(Boolean),
+          })
+        )
+          return null;
+        const carrier = await resolveLegacyOutputCarrier();
+        return nativeWholeHistoryFits(
+          req,
+          this.options.agent,
+          rows,
+          carrier.reservedContextUtf8Bytes +
+            (capsule
+              ? Buffer.byteLength(JSON.stringify(capsule), 'utf8') + TURN_CONTEXT_SEPARATOR_BYTES
+              : 0),
+          {
+            attachments: this.options.attachments,
+            contextHandlers: this.contextHandlers || !isAgentsEndpoint(this.options.endpoint),
+            userName: this.options.name,
+            assistantName: this.options.modelLabel,
+          },
+        );
+      },
     }).catch((error) => {
       logger.warn('[AgentClient] Conversation legacy continuity unavailable', {
         code: String(error?.code || error?.name || 'conversation_continuity_failed').slice(0, 120),
@@ -6435,6 +6677,10 @@ class AgentClient extends BaseClient {
         primaryError,
         this.contentParts,
       );
+      const primaryErrorPart = this.contentParts.find((part) => part?.type === ContentTypes.ERROR);
+      const primaryFailure = primaryError
+        ? preservePrimaryCompletionError(primaryError, primaryErrorPart)
+        : primaryErrorPart;
       const visibleAssistantText = hasVisibleAssistantText(this.contentParts);
       const shouldRetryPrimaryErrorWithFallback =
         !fallbackAborted &&
@@ -6469,7 +6715,13 @@ class AgentClient extends BaseClient {
         if (this.options.req) delete this.options.req._viventiumNativeResponseUnaccepted;
         /* === VIVENTIUM END === */
         if (!fallbackAgent && typeof fallbackInitializer === 'function') {
-          fallbackAgent = await fallbackInitializer();
+          try {
+            fallbackAgent = await fallbackInitializer();
+          } catch (error) {
+            throw hasVisibleAssistantText(this.contentParts)
+              ? error
+              : preservePrimaryCompletionError(error, primaryFailure);
+          }
         }
         if (opts.abortController?.signal?.aborted === true) {
           const fallbackAbortError = new Error('operation was aborted');
@@ -6501,7 +6753,11 @@ class AgentClient extends BaseClient {
             for (const part of preservedCortexParts) {
               upsertCortexContentPart(this.contentParts, part);
             }
-            this.contentParts.push(createCompletionErrorContentPart(terminalFallbackError));
+            this.contentParts.push(
+              createCompletionErrorContentPart(
+                preservePrimaryCompletionError(terminalFallbackError, primaryFailure),
+              ),
+            );
           }
           if (primaryError && !terminalFallbackError) {
             throw primaryError;
@@ -6691,7 +6947,25 @@ class AgentClient extends BaseClient {
                   sanitizeCompletionErrorForLog(fallbackError),
                 )}`,
               );
-              throw fallbackError;
+              throw hasVisibleAssistantText(this.contentParts) ||
+                opts.abortController?.signal?.aborted
+                ? fallbackError
+                : preservePrimaryCompletionError(fallbackError, primaryFailure);
+            }
+            if (
+              !hasVisibleAssistantText(this.contentParts) &&
+              !opts.abortController?.signal?.aborted
+            ) {
+              for (let index = 0; index < this.contentParts.length; index += 1) {
+                const part = this.contentParts[index];
+                if (part?.type !== ContentTypes.ERROR) continue;
+                logger.error(
+                  `[AgentClient] Fallback completion failed ${JSON.stringify(sanitizeCompletionErrorForLog(part))}`,
+                );
+                this.contentParts[index] = createCompletionErrorContentPart(
+                  preservePrimaryCompletionError(part, primaryFailure),
+                );
+              }
             }
             if (hasVisibleAssistantText(this.contentParts)) {
               providerTraceFallbackCompletion = {
@@ -6727,16 +7001,23 @@ class AgentClient extends BaseClient {
     if (fallbackRecoveryModel && hasVisibleAssistantText(this.contentParts)) {
       insertFallbackRecoveryNotice(this.contentParts, fallbackRecoveryModel);
     }
-    const graphFallbackRecoveryReceipt = this.run?.Graph?.viventiumGraphFallbackRecoveryReceipt;
+    const fallbackGraph = this.run?.Graph;
+    const candidateGraphFallbackReceipt = fallbackGraph?.viventiumGraphFallbackRecoveryReceipt;
+    const fallbackInvocationKey = Symbol.for('viventium.graph.fallback.recovery.invocation.v1');
+    const currentFallbackInvocation = fallbackGraph?.[fallbackInvocationKey];
+    const graphFallbackRecoveryReceipt =
+      candidateGraphFallbackReceipt &&
+      currentFallbackInvocation &&
+      candidateGraphFallbackReceipt[fallbackInvocationKey] === currentFallbackInvocation &&
+      candidateGraphFallbackReceipt.agentId === providerTracePrimaryAgent?.id &&
+      candidateGraphFallbackReceipt.agentId === fallbackGraph.defaultAgentId &&
+      candidateGraphFallbackReceipt.runId === fallbackGraph.runId &&
+      candidateGraphFallbackReceipt.runId === this.responseMessageId &&
+      candidateGraphFallbackReceipt.threadId === this.conversationId
+        ? candidateGraphFallbackReceipt
+        : null;
     if (graphFallbackRecoveryReceipt && hasVisibleAssistantText(this.contentParts)) {
       insertFallbackRecoveryNotice(this.contentParts, graphFallbackRecoveryReceipt);
-    }
-    const participantReconnectRecovery = this.options.req?._viventiumParticipantReconnectRecovery;
-    if (participantReconnectRecovery && hasVisibleAssistantText(this.contentParts)) {
-      insertFallbackRecoveryNotice(this.contentParts, {
-        ...participantReconnectRecovery,
-        reconnectRequired: true,
-      });
     }
     if (hasVisibleAssistantText(this.contentParts)) {
       if (providerTraceFallbackCompletion) {
@@ -7953,7 +8234,8 @@ class AgentClient extends BaseClient {
         : buildTimeContextInstructions(this.options.req);
       const activeWorkContextInstructions = replaysPinnedMainContext
         ? ''
-        : await resolveActiveWorkTurnContext(this.options.req);
+        : (this.options.req._viventiumContinuityActiveWorkContext ??
+          (await resolveActiveWorkTurnContext(this.options.req)));
       const sourceSelectionContextInstructions = sourceSelectionTurnContext(
         this.options.req,
         replaysPinnedMainContext,
@@ -7979,10 +8261,6 @@ class AgentClient extends BaseClient {
           value: Object.freeze({ ...acceptedMainIdentity }),
         });
       }
-      const acceptedMainContext = replaysPinnedMainContext
-        ? { status: 'pinned_replay', capsule: '', turns: [] }
-        : await loadAcceptedMainContext(acceptedMainIdentity);
-      const acceptedMainContextInstructions = acceptedMainContext.capsule || '';
       const recurrenceStateInstructions = replaysPinnedMainContext
         ? ''
         : buildRecurrenceStateCapsule(this.options.req, this.options.req?.body?.recurrenceState);
@@ -8000,6 +8278,43 @@ class AgentClient extends BaseClient {
         ? ''
         : getCurrentCallContext(this.options.req);
       /* === VIVENTIUM END === */
+      const selectedCarrierBytes = conversationProviderUsesInvocationLocalTime(
+        req,
+        this.options.agent,
+      )
+        ? NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
+        : MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES;
+      const authorityReserveBytes = mainAttemptFactsAuthorityReserveBytes(req, this.options.agent);
+      const coreOutputCarrier = mainContinuityOutputCarrier(
+        mainContinuityCarrierPeerParts({
+          currentCallContext: currentCallContextInstructions,
+          conversationContinuityContext: replaysPinnedMainContext
+            ? ''
+            : this._viventiumConversationContinuityCapsule || '',
+          optionalContexts: [
+            telegramReplyContext,
+            savedMemoryWriterTurnContext,
+            recurrenceStateInstructions,
+            timeContextInstructions,
+            activeWorkContextInstructions,
+            sourceSelectionContextInstructions,
+          ],
+          carrierMaxUtf8Bytes: selectedCarrierBytes,
+        }),
+        authorityReserveBytes,
+        selectedCarrierBytes,
+      );
+      req._viventiumAcceptedMainOutputCarrierV1 = Object.freeze(coreOutputCarrier);
+      const acceptedMainContext = replaysPinnedMainContext
+        ? { status: 'pinned_replay', capsule: '', turns: [] }
+        : await loadAcceptedMainContextForAdmission({
+            ...acceptedMainIdentity,
+            req,
+            agent: this.options.agent,
+            outputCarrier: coreOutputCarrier,
+            signal: abortController?.signal,
+          });
+      const acceptedMainContextInstructions = acceptedMainContext.capsule || '';
       const turnContextInstructions = combineTurnContextInstructions(
         timeContextInstructions,
         activeWorkContextInstructions,
@@ -8009,9 +8324,9 @@ class AgentClient extends BaseClient {
         recurrenceStateInstructions,
         savedMemoryWriterTurnContext,
         replaysPinnedMainContext ? '' : this._viventiumConversationContinuityCapsule || '',
-        conversationProviderUsesInvocationLocalTime(req, this.options.agent)
-          ? NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
-          : undefined,
+        selectedCarrierBytes === MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES
+          ? selectedCarrierBytes - authorityReserveBytes
+          : selectedCarrierBytes,
         currentCallContextInstructions,
       );
       if (turnContextInstructions) {
@@ -9100,6 +9415,12 @@ class AgentClient extends BaseClient {
             messages,
             visibleMessages: this._viventiumVisibleMessagesV1,
             historyAncestry: this._viventiumHistoryAncestryV1,
+            nativeBodyCarrier: conversationProviderUsesNativeBody(req, agents[0], {
+              alternates: [
+                configuredFallback,
+                ...(agents[0]?.viventiumGraphLlmFallbacks || []),
+              ].filter(Boolean),
+            }),
             protectUnreconciledHistory:
               (acceptedMainContext.status === 'empty' &&
                 this._viventiumVisibleMessagesV1
@@ -9153,8 +9474,12 @@ class AgentClient extends BaseClient {
               ),
               turnContextText: String(turnContextInstructions || ''),
               activeWorkProjection:
-                req?._viventiumActiveWorkTurnProjectionsV1?.get(activeWorkContextInstructions) ||
-                null,
+                activeWorkContextInstructions &&
+                turnContextInstructions.includes(activeWorkContextInstructions)
+                  ? req?._viventiumActiveWorkTurnProjectionsV1?.get(
+                      activeWorkContextInstructions,
+                    ) || null
+                  : null,
               turnContextComponents: [
                 { kind: 'currentCall', text: currentCallContextInstructions },
                 { kind: 'reply', text: telegramReplyContext },
@@ -11006,6 +11331,7 @@ module.exports.isCancelledVoiceTask = isCancelledVoiceTask;
 module.exports.startActiveWorkTurnContext = startActiveWorkTurnContext;
 module.exports.resolveActiveWorkTurnContext = resolveActiveWorkTurnContext;
 module.exports.combineTurnContextInstructions = combineTurnContextInstructions;
+module.exports.mainContinuityCarrierPeerParts = mainContinuityCarrierPeerParts;
 module.exports.activeWorkTurnContextByteBudget = activeWorkTurnContextByteBudget;
 module.exports.activeWorkTurnContextByteBudgetForComponents =
   activeWorkTurnContextByteBudgetForComponents;
@@ -11019,3 +11345,10 @@ module.exports.resolvePersistencePresentation = resolvePersistencePresentation;
 module.exports.logSavedCortexFollowUp = logSavedCortexFollowUp;
 
 /* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Shared typed legacy carrier allocation. === */
+module.exports.conversationContinuityContextReserveBytes =
+  conversationContinuityContextReserveBytes;
+/* === VIVENTIUM END === */
+
+module.exports.nativeWholeHistoryFits = nativeWholeHistoryFits;

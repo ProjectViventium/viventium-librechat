@@ -1,8 +1,11 @@
 /* === VIVENTIUM START === Owner-scoped, read-only retained mission results. === */
 import { normalizeGlassHiveRunInput } from './missionInput';
 import { normalizeGlassHiveNativeMedia } from './nativeMedia';
+import { normalizeNativeCallbackOutputFiles } from './nativeOutputFiles';
+import { normalizeWorkDeliveryScope } from './workDeliveryScope';
 import type { GlassHiveRunInput } from './missionInput';
 import type { GlassHiveNativeMedia } from './nativeMedia';
+import type { NativeCallbackOutputFiles } from './nativeOutputFiles';
 
 interface ResultIdentity {
   ownerId: string;
@@ -18,6 +21,13 @@ interface RetainedResult {
   evidence?: string;
   runInput?: GlassHiveRunInput;
   nativeMedia?: GlassHiveNativeMedia;
+  conversationId?: string;
+  destinations?: { surface: string }[];
+  outputFiles?: NativeCallbackOutputFiles;
+  originRef?: string;
+  attemptId?: string;
+  terminalCallbackId?: string;
+  terminalCallbackResultDigest?: string;
   terminalCallbackResultRevision?: number;
 }
 interface WorkPointer {
@@ -72,6 +82,19 @@ export function createGlassHiveWorkResultService(
     )
       throw failure('retained_work_result_not_found');
     if (typeof row.evidence !== 'string') throw failure('retained_work_result_unavailable');
+    const outputFiles =
+      row.outputFiles == null
+        ? null
+        : normalizeNativeCallbackOutputFiles(row.outputFiles, {
+            ownerId,
+            runId: row.runId,
+            workRef: row.workRef,
+            originRef: row.originRef || '',
+            attemptId: row.attemptId || '',
+            callbackId: row.terminalCallbackId || '',
+            resultRevision: row.terminalCallbackResultRevision || 0,
+            resultDigest: row.terminalCallbackResultDigest || '',
+          });
     return {
       workRef: row.workRef,
       runId: row.runId,
@@ -82,6 +105,13 @@ export function createGlassHiveWorkResultService(
       runInput: normalizeGlassHiveRunInput(row.runInput, row.runId) || null,
       outputText: row.evidence,
       nativeMedia: normalizeGlassHiveNativeMedia(row.nativeMedia, row.runId) || null,
+      outputFiles,
+      deliveryScope: normalizeWorkDeliveryScope({
+        originConversationId: row.conversationId,
+        destinations: row.destinations?.map((destination) => destination.surface),
+        resultRunId: row.runId,
+        resultRevision: row.terminalCallbackResultRevision,
+      }),
       resultRevision: row.terminalCallbackResultRevision ?? null,
     };
   }

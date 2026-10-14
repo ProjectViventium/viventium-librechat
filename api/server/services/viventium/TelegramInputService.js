@@ -22,6 +22,7 @@ const fields = {
   failureCode: 'inputFailureCode',
   preparedDigest: 'inputPreparedDigest',
   registrationId: 'inputRegistrationId',
+  receivedAt: 'inputReceivedAt',
   failures: 'inputFailures',
   primarySourceEventId: 'inputPrimarySourceEventId',
   relatedSourceEventIds: 'inputRelatedSourceEventIds',

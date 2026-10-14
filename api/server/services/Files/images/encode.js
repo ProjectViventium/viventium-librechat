@@ -11,6 +11,9 @@ const {
   getEndpointFileConfig,
 } = require('librechat-data-provider');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
+/* === VIVENTIUM START: Use the existing bounded encoder for native vision transport only. === */
+const { resizeImageBuffer } = require('./resize');
+/* === VIVENTIUM END === */
 
 /**
  * Converts a readable stream to a base64 encoded string.
@@ -89,11 +92,12 @@ const blobStorageSources = new Set([FileSources.azure_blob, FileSources.s3, File
  * @param {object} params - Object containing provider/endpoint information
  * @param {Providers | EModelEndpoint | string} [params.provider] - The provider for the image
  * @param {string} [params.endpoint] - Optional: The endpoint for the image
+ * @param {string} [params.capabilityEndpoint] - The resolved Agent endpoint before transport normalization.
  * @param {string} [mode] - Optional: The endpoint mode for the image.
  * @returns {Promise<{ files: MongoFile[]; image_urls: MessageContentImageUrl[] }>} - A promise that resolves to the result object containing the encoded images and file details.
  */
 async function encodeAndFormat(req, files, params, mode) {
-  const { provider, endpoint } = params;
+  const { provider, endpoint, capabilityEndpoint } = params;
   const effectiveEndpoint = endpoint ?? provider;
   const promises = [];
   /** @type {Record<FileSources, Pick<ReturnType<typeof getStrategyFunctions>, 'prepareImagePayload' | 'getDownloadStream'>>} */
@@ -165,7 +169,9 @@ async function encodeAndFormat(req, files, params, mode) {
     configuredFileSizeLimit = endpointConfig?.fileSizeLimit;
   }
 
-  for (const [file, imageContent] of formattedImages) {
+  for (const [file, preparedImageContent] of formattedImages) {
+    let imageContent = preparedImageContent;
+    let imageMimeType = file.type;
     const fileMetadata = {
       type: file.type,
       file_id: file.file_id,
@@ -184,6 +190,29 @@ async function encodeAndFormat(req, files, params, mode) {
       result.files.push(fileMetadata);
       continue;
     }
+
+    /* === VIVENTIUM START: Keep canonical image bytes while sending a supported bounded vision frame. === */
+    const providerCapabilities = req.config?.endpoints?.agents?.providerCapabilities;
+    const nativeCapabilities =
+      providerCapabilities?.[provider] || providerCapabilities?.[capabilityEndpoint];
+    if (
+      nativeCapabilities?.workspace_binding === true &&
+      nativeCapabilities?.worker_native_tools === true &&
+      file.type?.startsWith('image/') === true
+    ) {
+      const originalContent = imageContent.startsWith('http')
+        ? await fetchImageToBase64(imageContent)
+        : imageContent;
+      const { buffer } = await resizeImageBuffer(
+        Buffer.from(originalContent, 'base64'),
+        'high',
+        effectiveEndpoint,
+        'png',
+      );
+      imageContent = buffer.toString('base64');
+      imageMimeType = 'image/png';
+    }
+    /* === VIVENTIUM END === */
 
     /** Validate image buffer against size limits */
     if (file.height && file.width) {
@@ -210,7 +239,7 @@ async function encodeAndFormat(req, files, params, mode) {
       image_url: {
         url: imageContent.startsWith('http')
           ? imageContent
-          : `data:${file.type};base64,${imageContent}`,
+          : `data:${imageMimeType};base64,${imageContent}`,
         detail,
       },
     };
@@ -228,7 +257,7 @@ async function encodeAndFormat(req, files, params, mode) {
     ) {
       delete imagePart.image_url;
       imagePart.inlineData = {
-        mimeType: file.type,
+        mimeType: imageMimeType,
         data: imageContent,
       };
     } else if (effectiveEndpoint && effectiveEndpoint === EModelEndpoint.google) {
@@ -237,7 +266,7 @@ async function encodeAndFormat(req, files, params, mode) {
       imagePart.type = 'image';
       imagePart.source = {
         type: 'base64',
-        media_type: file.type,
+        media_type: imageMimeType,
         data: imageContent,
       };
       delete imagePart.image_url;

@@ -5,6 +5,7 @@
  * === VIVENTIUM END === */
 
 import crypto from 'node:crypto';
+import { nativeQueenInputResponseSchema } from './nativeWorkInput';
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -62,6 +63,8 @@ export const MAIN_DELEGATION_JSON_SCHEMA = Object.freeze({
     title: { type: 'string', minLength: 1, maxLength: MAIN_DELEGATION_STRING_LIMITS.title },
     instruction: {
       type: 'string',
+      description:
+        "Work the new worker must perform. Main already owns this launch. Preserve the goal, constraints and output shape; original selected source wording is retained separately. Do not assign orchestration already performed by this call.",
       minLength: 1,
       maxLength: MAIN_DELEGATION_STRING_LIMITS.instruction,
     },
@@ -102,31 +105,45 @@ export const MAIN_DELEGATION_JSON_SCHEMA = Object.freeze({
         'Required when trusted turn context lists S1/S2/etc. Select exactly which rapid user inputs this mission owns.',
       items: { type: 'integer', minimum: 1, maximum: 32 },
     },
+    fileIds: {
+      type: 'array', minItems: 0, maxItems: 64, uniqueItems: true,
+      items: { type: 'string', minLength: 1, maxLength: 256 },
+      description: 'Exact historical Core file IDs to attach to this mission. When choices are listed, select only mission-relevant files or [] for none. Current source uploads remain included. Original bytes and extracted text retain their declared input kind.',
+    },
   },
   required: ['title', 'instruction', 'resourceClass'],
   additionalProperties: false,
 });
 
-/** Match the schema to the trusted source ledger that owns launch admission. */
-export function mainDelegationJsonSchema(requestBody: unknown = {}) {
+/** Match choices to the server-owned source and attachment ledgers. */
+export function mainDelegationJsonSchema(
+  requestBody: unknown = {},
+  historicalFileChoices: { file_id: string; filename?: string }[] = [],
+) {
   const sources = requestBody && typeof requestBody === 'object' && !Array.isArray(requestBody)
     ? (requestBody as Record<string, unknown>).viventiumTriggeringSourceSegments
     : undefined;
   const count = Array.isArray(sources) ? sources.length : 0;
-  if (count <= 1) return MAIN_DELEGATION_JSON_SCHEMA;
+  if (count <= 1 && !historicalFileChoices.length) return MAIN_DELEGATION_JSON_SCHEMA;
   const maximum = Math.min(count, MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals.items.maximum);
   return {
     ...MAIN_DELEGATION_JSON_SCHEMA,
     properties: {
       ...MAIN_DELEGATION_JSON_SCHEMA.properties,
-      sourceOrdinals: {
+      ...(count > 1 ? { sourceOrdinals: {
         ...MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals,
         minItems: 1,
         maxItems: maximum,
         items: { type: 'integer', minimum: 1, maximum },
-      },
+      } } : {}),
+      ...(historicalFileChoices.length ? { fileIds: {
+        ...MAIN_DELEGATION_JSON_SCHEMA.properties.fileIds,
+        items: { type: 'string', enum: historicalFileChoices.map((file) => file.file_id) },
+      } } : {}),
     },
-    required: [...MAIN_DELEGATION_JSON_SCHEMA.required, 'sourceOrdinals'],
+    required: [...MAIN_DELEGATION_JSON_SCHEMA.required,
+      ...(count > 1 ? ['sourceOrdinals'] : []),
+      ...(historicalFileChoices.length ? ['fileIds'] : [])],
   };
 }
 
@@ -135,16 +152,16 @@ export const ACTIVE_WORK_LIST_DESCRIPTION =
 export const ACTIVE_WORK_LIST_JSON_SCHEMA = Object.freeze({
   type: 'object',
   properties: {
-    scope: { type: 'string', enum: ['active', 'history', 'result'] },
-    runId: { type: 'string', pattern: '^[A-Za-z0-9._:-]{1,160}$' },
-    workRef: { type: 'string', pattern: '^[A-Za-z0-9._:-]{1,160}$' },
+    scope: { type: 'string', enum: ['active', 'history', 'result'], description: 'Default active and history list rosters with pagination and no runId or workRef. Result requires an exact runId or workRef and no cursor or limit.' },
+    runId: { type: 'string', pattern: '^[A-Za-z0-9._:-]{1,160}$', description: 'Exact retained run identity; only with scope result.' },
+    workRef: { type: 'string', pattern: '^[A-Za-z0-9._:-]{1,160}$', description: 'Exact work identity; only with scope result.' },
     cursor: { type: 'string', minLength: 1, maxLength: 2048 },
     limit: { type: 'integer', minimum: 1, maximum: 100 },
   },
   additionalProperties: false,
 });
 export const ACTIVE_WORK_ACTION_SEMANTICS =
-  "Use only the target work item's current actions: its owner-scoped actions list is authoritative, and the global action enum never makes an unlisted action available. Use active_work_list when that current action mask is unknown or stale. " +
+  "For ordinary work controls, use only the target work item's current actions: its owner-scoped actions list is authoritative, and the global action enum never makes an unlisted ordinary action available. Use active_work_list when that current action mask is unknown or stale. Responding to a current pending native question or permission is separate: use action resume with its exact nativeInput, even when resume is absent from ordinary actions. The native input owner revalidates the current request and explicit owner answer. " +
   'Queue persists a follow-up behind the current objective without interrupting it. ' +
   'Message delivers noninterrupting guidance or continuation within the same mission. Message can continue completed work when its actions list allows it. ' +
   'Steer interrupts and redirects the exact active run. Pause and Resume preserve the objective. ' +
@@ -163,7 +180,27 @@ export const ACTIVE_WORK_ACTION_JSON_SCHEMA = Object.freeze({
       description: ACTIVE_WORK_ACTION_SEMANTICS,
     },
     instruction: { type: 'string', minLength: 1, maxLength: 8000 },
-    fileIds: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1, maxLength: 256 }, description: 'For Steer, Queue, or Message only: exact authorized Core file IDs to attach to this target. Original bytes and extracted text keep their declared input kind; no files go to other work.' },
+    nativeInput: {
+      type: 'object', additionalProperties: false,
+      description: "Respond to current native input using its exact identity and form from the current pendingNativeInput context capsule or active_work_list. Requires action resume and no instruction. Clarifications use answers; permissions use an offered single-operation option only for the current owner's explicit answer.",
+      required: ['version', 'requestId', 'requestFingerprint', 'action', 'content'],
+      properties: {
+        version: { type: 'integer', enum: [1] },
+        requestId: { type: 'string', minLength: 1, maxLength: 512 },
+        requestFingerprint: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+        action: { type: 'string', enum: ['accept'] },
+        content: { type: 'object', additionalProperties: false, minProperties: 1, properties: {
+          optionId: { type: 'string', minLength: 1, maxLength: 160 },
+          answers: { type: 'object', minProperties: 1, maxProperties: 16, additionalProperties: {
+            type: 'array', minItems: 1, maxItems: 17, uniqueItems: true,
+            items: { type: 'string', minLength: 1, maxLength: 160 } } },
+          annotations: { type: 'object', maxProperties: 16, additionalProperties: {
+            type: 'object', additionalProperties: false, required: ['notes'], properties: {
+              notes: { type: 'string', minLength: 1, maxLength: 8000 } } } },
+        } },
+      },
+    },
+    fileIds: { type: 'array', minItems: 0, uniqueItems: true, items: { type: 'string', minLength: 1, maxLength: 256 }, description: 'Omit or use an empty array when adding no files. For Steer, Queue, or Message only: exact authorized Core file IDs to attach to this target. Original bytes and extracted text keep their declared input kind; no files go to other work.' },
   },
   required: ['workRef', 'action'],
   additionalProperties: false,
@@ -236,21 +273,39 @@ export function canonicalConversationOrchestrationArguments(
     output.resourceClass = input.resourceClass;
     const sourceOrdinals = canonicalSourceOrdinals(input.sourceOrdinals);
     if (sourceOrdinals.length) output.sourceOrdinals = sourceOrdinals;
+    const fileIds = input.fileIds;
+    if (fileIds !== undefined && (!Array.isArray(fileIds) || fileIds.length > 64 ||
+        fileIds.some((id) => typeof id !== 'string' || !id.trim() || id.trim() !== id || id.length > 256) ||
+        new Set(fileIds).size !== fileIds.length)) {
+      throw new TypeError('fileIds require exact unique file references');
+    }
+    if (fileIds !== undefined) output.fileIds = [...fileIds as string[]];
     return output;
   }
   if (toolName === 'active_work_action') {
+    if (Object.hasOwn(input,'nativeHumanInput') || Object.hasOwn(input,'ownerInputControl')) {
+      throw new TypeError('native owner input authority is server-owned');
+    }
     const instruction = boundedString(input.instruction, 8000);
     const fileIds = input.fileIds;
-    if (fileIds !== undefined && (!Array.isArray(fileIds) || !fileIds.length ||
-        fileIds.some((id) => typeof id !== 'string' || !id.trim() || id.length > 256) ||
-        new Set(fileIds).size !== fileIds.length || !['steer', 'queue', 'message'].includes(String(input.action)))) {
+    const nativeInput = input.nativeInput === undefined ? undefined : nativeQueenInputResponseSchema.parse(input.nativeInput);
+    if (nativeInput && (instruction || input.action !== 'resume' || nativeInput.action !== 'accept')) {
+      throw Object.assign(new TypeError('nativeInput requires action resume without instruction.'), {
+        code: 'native_input_arguments_conflict',
+      });
+    }
+    if (fileIds !== undefined && (!Array.isArray(fileIds) ||
+        fileIds.some((id) => typeof id !== 'string' || !id.trim() || id.trim() !== id || id.length > 256) ||
+        new Set(fileIds).size !== fileIds.length ||
+        (fileIds.length > 0 && !['steer', 'queue', 'message'].includes(String(input.action))))) {
       throw new TypeError('fileIds require exact unique follow-up file references');
     }
     return {
       workRef: boundedString(input.workRef, 160),
       action: boundedString(input.action, 32).toLowerCase(),
       ...(instruction ? { instruction } : {}),
-      ...(fileIds ? { fileIds: [...fileIds as string[]] } : {}),
+      ...(nativeInput ? { nativeInput } : {}),
+      ...(Array.isArray(fileIds) && fileIds.length ? { fileIds: [...fileIds as string[]] } : {}),
     };
   }
   if (toolName === 'active_work_list') {

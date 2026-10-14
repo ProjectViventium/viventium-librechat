@@ -2409,3 +2409,28 @@ class StorageScheduledPromptLifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StorageImmutablePresentationTests(unittest.TestCase):
+    def test_terminal_receipt_is_immutable_when_speaking_route_changes(self):
+        for terminal in ('sent','delivery_unknown'):
+            with self.subTest(terminal=terminal), tempfile.TemporaryDirectory() as directory:
+                storage=ScheduleStorage(StorageConfig(db_path=str(Path(directory)/'schedules.db')))
+                args=dict(run_id='run',occurrence_key='occurrence',channel='telegram',part_index=0,
+                          payload_hash='original-saved-voice',lease_owner='sender',now='2026-08-20T12:00:00Z',lease_seconds=30)
+                first=storage.claim_scheduled_prompt_delivery(**args)
+                if terminal=='sent':
+                    storage.complete_scheduled_prompt_delivery(delivery_key=first['delivery_key'],
+                        lease_owner='sender',message_id='91',now='2026-08-20T12:00:01Z')
+                else:
+                    storage.mark_scheduled_prompt_delivery_unknown(delivery_key=first['delivery_key'],
+                        lease_owner='sender',error_class='transport_response_missing',now='2026-08-20T12:00:01Z')
+                conn = storage._connect()
+                try:
+                    before=dict(conn.execute('SELECT * FROM scheduled_prompt_deliveries').fetchone())
+                finally:
+                    conn.close()
+                replay=storage.claim_scheduled_prompt_delivery(**{**args,'payload_hash':'new-saved-voice','lease_owner':'other'})
+                self.assertFalse(replay['claimed'])
+                self.assertEqual(replay['reason'],'already_sent' if terminal=='sent' else 'delivery_unknown')
+                self.assertEqual(replay['delivery'],before)

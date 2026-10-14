@@ -11,6 +11,7 @@ authors = [{ name = "Viventium" }]
 requires-python = ">=3.10"
 dependencies = [
   "fastmcp>=2.12.5",
+  "httpx>=0.28,<1.0",
   "pydantic>=2.7",
   "croniter>=2.0",
   "python-dateutil>=2.9",

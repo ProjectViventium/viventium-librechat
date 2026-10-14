@@ -183,3 +183,36 @@ test('Stable Diffusion markdown is a public image URL independent of the storage
   ).toBe('![generated image](/images/owner/result.png)');
 });
 /* === VIVENTIUM END === */
+
+test('raw uploaded SVG is preserved by durable storage, model read and download stream', async () => {
+  const raw = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="9"><rect width="12" height="9" fill="blue"/></svg>');
+  const temporary = path.join(root, 'original.svg');
+  fs.writeFileSync(temporary, raw);
+  const uploaded = await crud.uploadLocalFile({ req,
+    file: { path: temporary, mimetype: 'image/svg+xml' }, file_id: 'original-svg' });
+  expect(uploaded.filepath).toBe('/uploads/owner/original-svg__original.svg');
+  expect(uploaded.bytes).toBe(raw.length);
+  expect(fs.readFileSync(path.join(paths.uploads, 'owner/original-svg__original.svg'))).toEqual(raw);
+  const [, encoded] = await images.prepareImagesLocal(req, { file_id: 'original-svg', filepath: uploaded.filepath });
+  expect(Buffer.from(encoded, 'base64')).toEqual(raw);
+  const stream = await crud.getLocalFileStream(req, uploaded.filepath);
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  expect(Buffer.concat(chunks)).toEqual(raw);
+});
+
+test.each(['svg', 'png'])('native %s source keeps original dimensions without a discarded resize', async (format) => {
+  const raw = format === 'svg'
+    ? Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="4000" height="3000"/>')
+    : await sharp({ create: { width: 4000, height: 3000, channels: 3, background: 'blue' } }).png().toBuffer();
+  const temporary = path.join(root, `original.${format}`);
+  fs.writeFileSync(temporary, raw);
+  const resize = jest.requireMock('~/server/services/Files/images/resize').resizeImageBuffer;
+  resize.mockClear();
+  const uploaded = await crud.uploadLocalFile({ req, nativeOriginalImage: true,
+    file: { path: temporary, mimetype: format === 'svg' ? 'image/svg+xml' : 'image/png' }, file_id: 'native-original' });
+  expect(uploaded.width).toBe(4000);
+  expect(uploaded.height).toBe(3000);
+  expect(resize).not.toHaveBeenCalled();
+  expect(fs.readFileSync(path.join(paths.uploads, 'owner', `native-original__original.${format}`))).toEqual(raw);
+});

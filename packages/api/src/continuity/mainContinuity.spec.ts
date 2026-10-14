@@ -12,7 +12,13 @@ import {
   inspectMainCompactionCandidate,
   mainCompactionOutputConstraints,
   mainCompactionCandidateDigest,
+  mainCompactionOutputContractDigest,
+  createMainCompactionOutputContract,
+  inspectMainCompactionCarrier,
+  conversationMainCompactionOutputContract,
+  renderConversationMainContinuityCapsule,
   buildAcceptedMainContextCapsule,
+  acceptedMainCompactionOutputContract,
   canDeferAcceptedMainCompaction,
   renderMainBackgroundInputs,
 } from './mainContinuity';
@@ -153,9 +159,7 @@ describe('accepted Main background source', () => {
         },
       ],
     };
-    const capsule = buildAcceptedMainContextCapsule({ turns: [largeTurn] });
-    expect(capsule).toContain(largeText);
-    expect(Buffer.byteLength(capsule, 'utf8')).toBeGreaterThan(12 * 1024);
+    expect(() => buildAcceptedMainContextCapsule({ turns: [largeTurn] })).toThrow('context budget');
     expect(canDeferAcceptedMainCompaction({ pendingCompactionTurns: [largeTurn] })).toBe(false);
     const projected = projectAcceptedMainMessages(
       [{ messageId: 'new-user', role: 'user', content: 'Current request.' }],
@@ -563,6 +567,17 @@ function fixture(sourceRecords?: Map<string, Record<string, unknown>>) {
         states.set(state.domainEpochKey, state);
         return true;
       },
+      async renewCompactionLease(key, version, lease, expiresAt) {
+        const current = states.get(key);
+        if (!current || current.version !== version ||
+            current.compactionLease?.leaseId !== lease.leaseId ||
+            current.compactionLease.sourceDigest !== lease.sourceDigest ||
+            new Date(current.compactionLease.expiresAt).getTime() !== new Date(lease.expiresAt).getTime() ||
+            new Date(lease.expiresAt).getTime() <= Date.now()) return false;
+        states.set(key, { ...current, version: version + 1,
+          compactionLease: { ...lease, expiresAt } });
+        return true;
+      },
       async compareAndSwap(key, version, state) {
         if (states.get(key)?.version !== version) return false;
         states.set(key, { ...state, version: version + 1 });
@@ -734,13 +749,14 @@ function reviewFor(claim: Record<string, unknown>, candidate: typeof inverse) {
   const prepared = prepareMainCompactionCandidate(candidate, {
     previousSemanticCompaction: null,
     sourceTurns: claim.sourceTurns as AcceptedMainTurn[],
-  });
+  }, claim.outputContract);
   if (!prepared) throw new Error('invalid test candidate');
   return {
     version: 1,
     approved: true,
     sourceDigest: claim.sourceDigest,
-    candidateDigest: mainCompactionCandidateDigest(prepared),
+    outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+          candidateDigest: mainCompactionCandidateDigest(prepared),
   };
 }
 
@@ -787,22 +803,16 @@ test('rejects an oversized summary instead of truncating away its final restrict
     await service.completeAcceptedMainCompaction({
       ...identity,
       ...claim,
-      semanticCompaction: { ...inverse, summary: 'Context '.repeat(1000) + 'Do not publish.' },
+      semanticCompaction: { ...inverse, summary: 'Context '.repeat(2000) + 'Do not publish.' },
     }),
   ).toMatchObject({ status: 'invalid_summary', reason: 'schema_invalid' });
   expect((await service.loadAcceptedMainContext(identity)).semanticCompaction).toBeNull();
 });
 
 test('never byte-slices a reviewed summary into a different delivered meaning', () => {
-  const summary =
-    'A <quoted> draft remains pending. '.repeat(150) + 'Written approval is still required.';
-  const capsule = buildAcceptedMainContextCapsule({ semanticCompaction: { ...faithful, summary } });
-  if (capsule.includes('<semantic_compaction version=')) {
-    expect(capsule).toContain('Written approval is still required.');
-    expect(capsule).not.toContain('...');
-  } else {
-    expect(capsule).toContain('<semantic_compaction_unavailable reason="context_budget" />');
-  }
+  const summary = '"'.repeat(2000) + 'Written approval is still required.';
+  expect(() => buildAcceptedMainContextCapsule({ semanticCompaction: { ...faithful, summary } }))
+    .toThrow('context budget');
 });
 
 describe('automatic compaction pressure', () => {
@@ -895,7 +905,7 @@ describe('automatic compaction pressure', () => {
     for (let index = 0; index < 10; index += 1) {
       await service.commitAcceptedMainTurn({
         ...identity,
-        ...turn(index, `Request ${index}: ${'x'.repeat(14 * 1024)}`),
+        ...turn(index, index < 7 ? `Request ${index}: ${'x'.repeat(14 * 1024)}` : `Recent request ${index}.`),
       });
     }
     const first = await service.claimAcceptedMainCompaction(identity);
@@ -948,6 +958,7 @@ describe('automatic compaction pressure', () => {
           version: 1,
           approved: true,
           sourceDigest: claim.sourceDigest,
+          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
           candidateDigest: mainCompactionCandidateDigest(proposed),
         },
       });
@@ -955,7 +966,7 @@ describe('automatic compaction pressure', () => {
     }
     expect(compactions).toBe(3);
   });
-  test('uses the protected Message carrier for a large pending source without adding a model call', async () => {
+  test('retains full source and blocks admission when recent source alone exceeds the actual carrier', async () => {
     const { service, identity, accepted } = fixture();
     for (let index = 0; index < 4; index++)
       await service.commitAcceptedMainTurn({
@@ -964,17 +975,17 @@ describe('automatic compaction pressure', () => {
       });
     expect(
       await service.claimAcceptedMainCompaction({ ...identity, trigger: 'accepted_turn' }),
-    ).toMatchObject({ status: 'deferred', attempts: 0 });
+    ).toMatchObject({ status: 'degraded', reason: 'context_budget' });
     const context = await service.loadAcceptedMainContext(identity);
+    expect(context).toMatchObject({ status: 'context_budget', capsule: '', messageCapsule: '' });
     expect(context.sourceTurns).toHaveLength(4);
-    expect(context.messageCapsule).not.toContain('pending_compaction_unavailable');
     expect((context.sourceTurns as AcceptedMainTurn[])[0].userText).toBe(
       accepted.get('pending-0')?.userText,
     );
   });
 });
 
-test('promotes a faithful older summary while a large recent turn stays whole in protected Messages', async () => {
+test('rejects promotion when full recent source cannot fit the actual capsule', async () => {
   const { service, identity, seed, accepted } = fixture();
   const claim = await seed();
   const recent = accepted.get('turn-3')!;
@@ -987,11 +998,11 @@ test('promotes a faithful older summary while a large recent turn stays whole in
       semanticCompaction: faithful,
       semanticReview: reviewFor(claim, faithful),
     }),
-  ).toMatchObject({ status: 'compacted' });
+  ).toMatchObject({ status: 'invalid_summary', reason: 'context_budget' });
   const context = await service.loadAcceptedMainContext(identity);
-  expect(context.semanticCompaction).toMatchObject({ summary: faithful.summary });
+  expect(context).toMatchObject({ status: 'context_budget', semanticCompaction: null });
   expect((context.sourceTurns as AcceptedMainTurn[]).at(-1)?.userText).toBe(longSource);
-  expect(context.messageCapsule).toContain(faithful.summary);
+  expect(context.capsule).toBe('');
 });
 
 test('keeps source if an approved candidate cannot fit whole in the delivered context', async () => {
@@ -1014,7 +1025,8 @@ test('keeps source if an approved candidate cannot fit whole in the delivered co
       version: 1,
       approved: true,
       sourceDigest: claim.sourceDigest,
-      candidateDigest: mainCompactionCandidateDigest(candidate),
+      outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+          candidateDigest: mainCompactionCandidateDigest(candidate),
     },
   });
   expect(result).toMatchObject({ status: 'invalid_summary', reason: 'context_budget' });
@@ -1044,14 +1056,15 @@ test('a changed source timestamp invalidates the review just like changed source
       version: 1,
       approved: true,
       sourceDigest: claim.sourceDigest,
-      candidateDigest: mainCompactionCandidateDigest(candidate),
+      outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+          candidateDigest: mainCompactionCandidateDigest(candidate),
     },
   });
   expect(result.status).toBe('stale_source');
 });
 
 describe('original accepted source retention', () => {
-  test('keeps the whole accepted instruction and reply past the old 5 KiB boundary', async () => {
+  test('keeps the whole accepted instruction and reply past the actual carrier budget for guarded admission', async () => {
     const { service, identity } = fixture();
     const userText = 'Context '.repeat(1200) + ' Approval is required before publishing.';
     const assistantText = 'Details '.repeat(1200) + ' I will wait for your approval.';
@@ -1065,8 +1078,8 @@ describe('original accepted source retention', () => {
     });
     const loaded = await service.loadAcceptedMainContext(identity);
     expect((loaded.turns as AcceptedMainTurn[])[0]).toMatchObject({ userText, assistantText });
-    expect(loaded.capsule).toContain('Approval is required before publishing.');
-    expect(loaded.capsule).toContain('I will wait for your approval.');
+    expect(loaded).toMatchObject({ status: 'context_budget', capsule: '' });
+    expect((loaded.sourceTurns as AcceptedMainTurn[])[0]).toMatchObject({ userText, assistantText });
   });
 
   test('keeps over 64 pending turns through outage and claims only a whole oldest-first batch', async () => {
@@ -1102,7 +1115,8 @@ describe('original accepted source retention', () => {
         version: 1,
         approved: true,
         sourceDigest: claim.sourceDigest,
-        candidateDigest: mainCompactionCandidateDigest(candidate),
+        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+          candidateDigest: mainCompactionCandidateDigest(candidate),
       },
     });
     const next = Array.from(states.values())[0];
@@ -1874,5 +1888,238 @@ describe('stored message delivery provenance', () => {
       assistantText: 'Exact saved evidence.', toolPairs: [], committedAt: new Date(), delivery };
     const result = projectAcceptedMainMessages([{ messageId: 'next', role: 'user', content: 'Inspect it.' }], [turn]);
     expect(result.messages.find(value => value.messageId === 'answer')).toMatchObject({ content: turn.assistantText, delivery });
+  });
+});
+
+
+describe('carrier-owned compaction output', () => {
+  test('actual full-text Main consumer recovers instead of silently losing a reviewed summary', async () => {
+    const { service, identity, seed, accepted, states } = fixture();
+    const claim = await seed();
+    const candidate = { ...faithful, summary: 's'.repeat(3199) };
+    for (const [key, turn] of accepted) if ((turn.acceptedPosition || 0) > 1)
+      accepted.set(key, { ...turn, userText: `user-${key} ` + 'u'.repeat(1600),
+        assistantText: `assistant-${key} ` + 'a'.repeat(1600) });
+    const recent = [...accepted.values()].slice(-3);
+    const contextContract = acceptedMainCompactionOutputContract(recent)!;
+    const promotion = await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: candidate, semanticReview: reviewFor(claim, candidate) });
+
+    // An older retained allocation can be wider than the current full-source carrier.
+    const cache = [...states.values()][0];
+    states.set(cache.domainEpochKey, { ...cache, semanticCompaction: candidate,
+      semanticCompactionContract: claim.outputContract, summarizedThrough: 1, compactionLease: null });
+    const overflow = await service.loadAcceptedMainContext(identity);
+    expect(overflow).toMatchObject({ status: 'context_budget', semanticCompaction: candidate,
+      capsule: '', messageCapsule: '' });
+    expect(inspectMainCompactionCarrier(candidate, contextContract).ok).toBe(false);
+    expect(promotion).toMatchObject({ status: 'invalid_summary', reason: 'context_budget' });
+    expect(overflow.sourceTurns).toEqual(recent);
+    expect(buildAcceptedMainContextCapsule({ sourceDelivery: 'messages', acceptedTurns: recent,
+      semanticCompaction: candidate, semanticCompactionContract: claim.outputContract }))
+      .toContain(candidate.summary);
+
+    const recovery = await service.claimAcceptedMainCompaction({ ...identity, reallocateOutputCarrier: true });
+    expect(recovery).toMatchObject({ status: 'claimed', sourceTurns: [], previousSemanticCompaction: candidate });
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...recovery,
+      semanticCompaction: faithful, semanticReview: reviewFor(recovery, faithful) }))
+      .toMatchObject({ status: 'compacted' });
+    const loaded = await service.loadAcceptedMainContext(identity);
+    expect(loaded.status).toBe('available');
+    expect(loaded.capsule).toContain(faithful.summary);
+    expect(loaded.capsule).not.toContain('semantic_compaction_unavailable');
+    for (const turn of recent) {
+      expect(loaded.capsule).toContain(turn.userText);
+      expect(loaded.capsule).toContain(turn.assistantText);
+    }
+    expect(Buffer.byteLength(String(loaded.capsule))).toBeLessThanOrEqual(12 * 1024);
+    expect([...accepted.values()].slice(-3)).toEqual(recent);
+  });
+
+  test('ordinary recent growth keeps the reviewed summary whole inside the actual selected native carrier', async () => {
+    const { service, identity, seed, accepted } = fixture();
+    const claim = await seed();
+    const candidate = { ...faithful, summary: 's'.repeat(6135) + ' Keep written approval required.' };
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: candidate, semanticReview: reviewFor(claim, candidate) }))
+      .toMatchObject({ status: 'compacted' });
+    for (const [key, turn] of accepted) if ((turn.acceptedPosition || 0) > 1)
+      accepted.set(key, { ...turn, userText: 'u'.repeat(2048), assistantText: 'a'.repeat(2048) });
+    const outputCarrier = { carrierMaxUtf8Bytes: 128 * 1024, reservedContextUtf8Bytes: 15000 };
+    const loaded = await service.loadAcceptedMainContext({ ...identity, outputCarrier });
+    expect(loaded.status).toBe('available');
+    expect(loaded.capsule).toContain(candidate.summary);
+    expect(loaded.capsule).not.toContain('semantic_compaction_unavailable');
+    for (const turn of [...accepted.values()].slice(-3)) {
+      expect(loaded.capsule).toContain(turn.userText);
+      expect(loaded.capsule).toContain(turn.assistantText);
+    }
+    expect(Buffer.byteLength(String(loaded.capsule))).toBeGreaterThan(12 * 1024);
+    expect(Buffer.byteLength(String(loaded.capsule)) + outputCarrier.reservedContextUtf8Bytes)
+      .toBeLessThanOrEqual(outputCarrier.carrierMaxUtf8Bytes);
+    const foreground = await service.claimAcceptedMainCompaction({ ...identity, outputCarrier, reallocateOutputCarrier: true });
+    expect(foreground.status).toBe('empty');
+  });
+
+  test.each([16 * 1024, 128 * 1024])('three ordinary recent turns fit selected carrier %s without a summary call', maximum => {
+    const recent = [1, 2, 3].map(index => ({ logicalTurnId: `recent-${index}`, revision: 1,
+      conversationId: 'conversation', userMessageId: `user-${index}`, assistantMessageId: `assistant-${index}`,
+      origin: 'interactive', userText: 'u'.repeat(2048), assistantText: 'a'.repeat(2048),
+      toolPairs: [], committedAt: new Date() }));
+    const outputCarrier = { carrierMaxUtf8Bytes: maximum, reservedContextUtf8Bytes: 1000 };
+    const contract = acceptedMainCompactionOutputContract(recent, outputCarrier);
+    expect(contract).not.toBeNull();
+    const capsule = buildAcceptedMainContextCapsule({ acceptedTurns: recent, outputCarrier });
+    expect(Buffer.byteLength(capsule) + 1000).toBeLessThanOrEqual(maximum);
+    expect(canDeferAcceptedMainCompaction({ acceptedTurns: recent, outputCarrier })).toBe(true);
+  });
+
+  test('unused reference-view overflow does not reject the actual full-text capsule', async () => {
+    const { service, identity, seed, accepted } = fixture();
+    const claim = await seed();
+    const candidate = { ...faithful, summary: 's'.repeat(6500) };
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: candidate, semanticReview: reviewFor(claim, candidate) }))
+      .toMatchObject({ status: 'compacted' });
+    for (let index = 4; index < 7; index++) await service.commitAcceptedMainTurn({ ...identity,
+      logicalTurnId: `turn-${index}`, revision: 1, conversationId: 'c'.repeat(256),
+      userMessageId: `u-${index}${'u'.repeat(250)}`, assistantMessageId: `a-${index}${'a'.repeat(250)}`,
+      origin: 'interactive', userText: 'Pending.', assistantText: 'Approval required.' });
+    for (const [key, turn] of accepted) accepted.set(key, { ...turn, conversationId: 'c'.repeat(256),
+      userMessageId: `${key}${'u'.repeat(245)}`, assistantMessageId: `${key}${'a'.repeat(245)}` });
+    const loaded = await service.loadAcceptedMainContext(identity);
+    expect(loaded.status).toBe('available');
+    expect(loaded.capsule).toContain(candidate.summary);
+    expect(loaded.messageCapsule).toBe('');
+  });
+
+  test('reserves full recent source and preserves later legal growth for guarded recovery', async () => {
+    const { service, identity, seed, accepted } = fixture(); const claim = await seed();
+    let low = 1, high = Number((claim.outputContract as { maxSummaryUtf8Bytes: number }).maxSummaryUtf8Bytes);
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2); const proposal = { ...faithful, version: 1 as const, summary: 's'.repeat(middle) };
+      if (inspectMainCompactionCandidate(proposal, claim.outputContract).ok &&
+          inspectMainCompactionCarrier(proposal, claim.outputContract).ok) low = middle;
+      else high = middle - 1;
+    }
+    const candidate = { ...faithful, summary: 's'.repeat(low) };
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: candidate, semanticReview: reviewFor(claim, candidate) }))
+      .toMatchObject({ status: 'compacted' });
+    const afterPromotion = await service.loadAcceptedMainContext(identity);
+    const references = [...accepted.values()].slice(-3);
+    const stored = afterPromotion.semanticCompaction;
+    expect(() => buildAcceptedMainContextCapsule({ acceptedTurns: references,
+      semanticCompaction: stored, semanticCompactionContract: claim.outputContract })).not.toThrow();
+    // Legal source may grow after the snapshot; the full source stays in the owning ledger.
+    for (let index = 0; index < 3; index++) await service.commitAcceptedMainTurn({ ...identity,
+      logicalTurnId: `growth-${index}-${'l'.repeat(140)}`, revision: 1,
+      conversationId: 'c'.repeat(200), userMessageId: `u${index}${'u'.repeat(200)}`,
+      assistantMessageId: `a${index}${'a'.repeat(200)}`, origin: 'interactive',
+      userText: 'Keep the pending permission.', assistantText: 'It remains pending.' });
+    const overflow = await service.loadAcceptedMainContext(identity);
+    expect(overflow).toMatchObject({ status: 'context_budget', semanticCompaction: candidate });
+    expect((overflow.sourceTurns as AcceptedMainTurn[]).length).toBeGreaterThan(0);
+    expect(overflow.capsule).toBe('');
+    const recovery = await service.claimAcceptedMainCompaction({ ...identity, reallocateOutputCarrier: true });
+    expect(recovery).toMatchObject({ status: 'claimed', previousSemanticCompaction: candidate });
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...recovery,
+      semanticCompaction: faithful, semanticReview: reviewFor(recovery, faithful) }))
+      .toMatchObject({ status: 'compacted' });
+    expect(await service.loadAcceptedMainContext(identity)).toMatchObject({ status: 'available' });
+    expect(accepted.size).toBe(7);
+  });
+
+  test('reclaims a full prior summary with no pending source when recent source growth overflows', async () => {
+    const { service, identity, seed, states, accepted } = fixture(); const claim = await seed();
+    const candidate = { ...faithful, summary: 's'.repeat(8700) };
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: candidate, semanticReview: reviewFor(claim, candidate) })).toMatchObject({ status: 'compacted' });
+    // Rehydration keeps the full current source even when it outgrows the prior allocation.
+    for (const [key, turn] of accepted) if ((turn.acceptedPosition || 0) > 1) accepted.set(key, { ...turn,
+      conversationId: 'c'.repeat(256), userMessageId: 'u'.repeat(256), assistantMessageId: 'a'.repeat(256),
+      logicalTurnId: 'l'.repeat(159) + key.slice(-1), userText: 'u'.repeat(1000) });
+    const cache = [...states.values()][0];
+    expect(cache.summarizedThrough).toBe(1);
+    expect(await service.loadAcceptedMainContext(identity)).toMatchObject({ status: 'context_budget' });
+    const recovery = await service.claimAcceptedMainCompaction({ ...identity, reallocateOutputCarrier: true });
+    expect(recovery).toMatchObject({ status: 'claimed', sourceTurns: [], previousSemanticCompaction: candidate });
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...recovery,
+      semanticCompaction: faithful, semanticReview: reviewFor(recovery, faithful) })).toMatchObject({ status: 'compacted' });
+    expect(accepted.size).toBe(4);
+  });
+
+
+  test('accepts a full replacement above the old six KiB only inside the actual carrier', () => {
+    const contract = createMainCompactionOutputContract({ consumer: 'conversation_legacy',
+      carrierMaxUtf8Bytes: 128 * 1024, reservedUtf8Bytes: 1000 })!;
+    const candidate = { ...faithful, version: 1 as const, summary: 'Material pending work. '.repeat(350) + 'Permission remains required.' };
+    expect(inspectMainCompactionCandidate(candidate).ok).toBe(false);
+    expect(inspectMainCompactionCandidate(candidate, contract).ok).toBe(true);
+    expect(inspectMainCompactionCarrier(candidate, contract)).toEqual({ ok: true });
+    expect(candidate.summary.endsWith('Permission remains required.')).toBe(true);
+  });
+  test('accounts for exact escaping and framing before accepting a valid raw proposal', () => {
+    const contract = conversationMainCompactionOutputContract({ coveredRows: 12,
+      carrierMaxUtf8Bytes: 16 * 1024, reservedContextUtf8Bytes: 14000 })!;
+    const candidate = { ...faithful, version: 1 as const, summary: '<'.repeat(450) };
+    expect(inspectMainCompactionCandidate(candidate, contract).ok).toBe(true);
+    expect(inspectMainCompactionCarrier(candidate, contract).ok).toBe(false);
+    expect(14000 + Buffer.byteLength(renderConversationMainContinuityCapsule(candidate, 12)))
+      .toBeGreaterThan(16 * 1024);
+  });
+  test('persists and reloads a larger reviewed Core summary without clipping its tail', async () => {
+    const { service, identity, seed } = fixture(); const claim = await seed();
+    const candidate = { ...faithful, summary: 's'.repeat(6500) + ' Keep approval required.' };
+    expect(inspectMainCompactionCandidate(candidate, claim.outputContract).ok).toBe(true);
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: candidate, semanticReview: reviewFor(claim, candidate) }))
+      .toMatchObject({ status: 'compacted' });
+    const loaded = await service.loadAcceptedMainContext(identity);
+    expect((loaded.semanticCompaction as { summary?: string })?.summary).toBe(candidate.summary);
+    expect(loaded.capsule).toContain('Keep approval required.');
+    expect(Buffer.byteLength(String(loaded.capsule))).toBeLessThanOrEqual(12 * 1024);
+    expect(loaded.semanticCompactionContract).toEqual(claim.outputContract);
+  });
+  test('rejects approval against another allocation while preserving the original source', async () => {
+    const { service, identity, seed, sourceText } = fixture(); const claim = await seed();
+    const review = { ...reviewFor(claim, faithful), outputContractDigest: 'f'.repeat(64) };
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: faithful, semanticReview: review }))
+      .toMatchObject({ status: 'invalid_summary', reason: 'semantic_review_required' });
+    expect((await service.loadAcceptedMainContext(identity)).capsule).toContain(sourceText);
+  });
+});
+
+
+describe('live compaction lease renewal', () => {
+  test('renews only the exact live Core claim without changing source or summary state', async () => {
+    const { service, identity, seed, states } = fixture();
+    const claim = await seed();
+    const checkedAt = new Date(claim.leaseExpiresAt as Date).getTime() - 138630;
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(checkedAt);
+    try {
+      const before = structuredClone(states.get(String(claim.domainEpochKey))!);
+      const input = { ...identity, leaseId: claim.leaseId, sourceDigest: claim.sourceDigest,
+        leaseExpiresAt: claim.leaseExpiresAt, expiresAt: new Date(checkedAt + 238630) };
+      expect(typeof service.renewAcceptedMainCompaction).toBe('function');
+      for (const invalid of [
+        { ...input, leaseId: 'replaced-holder' },
+        { ...input, sourceDigest: 'f'.repeat(64) },
+        { ...input, leaseExpiresAt: new Date(checkedAt + 1) },
+      ]) expect((await service.renewAcceptedMainCompaction(invalid)).status).toBe('stale_lease');
+      const renewed = await service.renewAcceptedMainCompaction(input);
+      expect(renewed).toEqual({ status: 'renewed', leaseExpiresAt: input.expiresAt });
+      const after = states.get(String(claim.domainEpochKey))!;
+      expect(after).toEqual({ ...before, version: before.version + 1,
+        compactionLease: { ...before.compactionLease, expiresAt: input.expiresAt } });
+      expect((await service.claimAcceptedMainCompaction(identity)).status).toBe('busy');
+      expect((await service.renewAcceptedMainCompaction(input)).status).toBe('stale_lease');
+      clock.mockReturnValue(input.expiresAt.getTime());
+      expect((await service.renewAcceptedMainCompaction({ ...input,
+        leaseExpiresAt: input.expiresAt, expiresAt: new Date(checkedAt + 300000) })).status)
+        .toBe('stale_lease');
+      expect(states.get(String(claim.domainEpochKey))).toEqual(after);
+    } finally { clock.mockRestore(); }
   });
 });

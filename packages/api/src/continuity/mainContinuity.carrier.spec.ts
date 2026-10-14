@@ -176,3 +176,79 @@ describe('late current Main background source at actual dispatch', () => {
     expect(read).not.toHaveBeenCalled();
   });
 });
+
+/* === VIVENTIUM START === Native handoffs reuse the full factual body without Main authority. === */
+describe('native graph factual carrier boundaries', () => {
+  test.each([32768, 131072])(
+    'retains exactly %i UTF-8 bytes without Main source stamps',
+    async (bytes) => {
+      const context = 'x'.repeat(bytes);
+      const send = jest.fn(
+        async (_input: string | URL | Request, _init?: RequestInit) => new Response('{}'),
+      );
+      await createMainContinuityFetch(send)('https://provider.invalid/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'X-GlassHive-Agent-Id': 'specialist',
+          'X-GlassHive-Turn-Context-B64': Buffer.from(context).toString('base64'),
+          'X-GlassHive-Provider-Session-Mode': 'stateless',
+          'X-Viventium-Surface': 'voice',
+          'X-Viventium-Memory-Eligible': 'false',
+          'X-Viventium-Actor-Kind': 'external_user',
+          'X-Viventium-Origin': 'interactive',
+        },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'Retained input.' }] }),
+      });
+      const init = send.mock.calls[0][1];
+      const payload = JSON.parse(String(init?.body));
+      expect(payload.metadata.turn_context).toBe(context);
+      expect(payload.messages).toEqual([{ role: 'user', content: 'Retained input.' }]);
+      expect(payload.metadata).not.toHaveProperty('visible_message_chain');
+      const headers = new Headers(init?.headers);
+      expect(headers.has('X-GlassHive-Turn-Context-B64')).toBe(false);
+      expect(headers.has('X-Viventium-Main-Context-Owner')).toBe(false);
+      expect(headers.get('X-GlassHive-Provider-Session-Mode')).toBe('stateless');
+      expect(headers.get('X-Viventium-Surface')).toBe('voice');
+      expect(headers.get('X-Viventium-Memory-Eligible')).toBe('false');
+      expect(headers.get('X-Viventium-Actor-Kind')).toBe('external_user');
+      expect(headers.get('X-Viventium-Origin')).toBe('interactive');
+    },
+  );
+  test.each(['x'.repeat(131073), '次'.repeat(43691)])(
+    'rejects one byte above native UTF-8 allocation %#',
+    async (context) => {
+      const send = jest.fn();
+      await expect(
+        createMainContinuityFetch(send)('https://provider.invalid/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'X-GlassHive-Turn-Context-B64': Buffer.from(context).toString('base64') },
+          body: '{"messages":[]}',
+        }),
+      ).rejects.toMatchObject({ code: 'source_context_unavailable', status: 413 });
+      expect(send).not.toHaveBeenCalled();
+    },
+  );
+  test.each(['not base64!', '/w=='])('rejects invalid handoff encoding %s', async (encoded) => {
+    const send = jest.fn();
+    await expect(
+      createMainContinuityFetch(send)('https://provider.invalid/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'X-GlassHive-Turn-Context-B64': encoded },
+        body: '{"messages":[]}',
+      }),
+    ).rejects.toThrow();
+    expect(send).not.toHaveBeenCalled();
+  });
+  test.each(['null', '[]'])('rejects invalid handoff body shape %s', async (body) => {
+    const send = jest.fn();
+    await expect(
+      createMainContinuityFetch(send)('https://provider.invalid/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'X-GlassHive-Turn-Context-B64': 'eA==' },
+        body,
+      }),
+    ).rejects.toThrow('Invalid native completion body');
+    expect(send).not.toHaveBeenCalled();
+  });
+});
+/* === VIVENTIUM END === */

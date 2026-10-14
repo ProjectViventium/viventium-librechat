@@ -778,9 +778,12 @@ describe('projectGraphLlmFallbacks', () => {
     graph.overrideModel = scriptedModel as never;
     await process('synthetic-fallback-reentry-thread-1', 'First turn.');
     expect(graph.viventiumGraphFallbackRecoveryReceipt).toEqual({
-      provider: Providers.OPENAI,
-      model: 'synthetic-fallback-model',
+      provider: Providers.OPENAI, model: 'synthetic-fallback-model', agentId: 'main',
+      runId: 'synthetic-fallback-reentry-run', threadId: 'synthetic-fallback-reentry-thread-1',
     });
+    const invocationKey = Symbol.for('viventium.graph.fallback.recovery.invocation.v1');
+    expect((graph.viventiumGraphFallbackRecoveryReceipt as unknown as Record<PropertyKey, unknown>)?.[invocationKey])
+      .toBe((graph as unknown as Record<PropertyKey, unknown>)[invocationKey]);
 
     graph.overrideModel = scriptedModel as never;
     await process('synthetic-fallback-reentry-thread-2', 'Second healthy turn.');
@@ -1461,10 +1464,7 @@ describe('zero-input graph handoffs', () => {
       }),
       expect.any(Object),
     );
-    expect(graph.viventiumGraphFallbackRecoveryReceipt).toEqual({
-      provider: Providers.OPENAI,
-      model: 'synthetic-glasshive-worker',
-    });
+    expect(graph.viventiumGraphFallbackRecoveryReceipt).toBeUndefined();
     expect(result.messages.at(-1)?.content).toBe('Main final after route-correct Red challenge.');
     expect(capabilityRefreshes).toEqual([
       { route: 'main-primary', atMs: startedAtMs },
@@ -1481,6 +1481,7 @@ describe('zero-input graph handoffs', () => {
     { status: 429 },
     { status: 500 },
     { code: 'provider_auth_missing', state: 'needs_input' },
+    { code: 'native_mcp_unavailable' },
   ])('uses a participant fallback for a structured recoverable %j', async (failure) => {
     const graph = new MultiAgentGraph({
       runId: 'synthetic-recoverable-fallback-run',
@@ -2703,3 +2704,76 @@ it('does not read current Main data for another native graph participant or ordi
     createSpy.mockRestore();
   }
 });
+
+/* === VIVENTIUM START === Actual lazy handoff/fallback serialization before provider dispatch. === */
+it('carries complete native lazy handoff and fallback facts without Main source authority', async () => {
+  const createSpy = jest.spyOn(Run, 'create').mockResolvedValue({ run: 'synthetic' } as never);
+  const context = '次'.repeat(12000);
+  const encoded = Buffer.from(context).toString('base64');
+  expect(encoded.length).toBeGreaterThan(32 * 1024);
+  const send = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    if ((headers.get('X-GlassHive-Turn-Context-B64') || '').length > 32 * 1024)
+      throw new Error('GlassHive turn context is too large');
+    const payload = JSON.parse(String(init?.body));
+    expect(payload.metadata.turn_context).toBe(context);
+    expect(payload.metadata).not.toHaveProperty('visible_message_chain');
+    expect(headers.has('X-Viventium-Main-Context-Owner')).toBe(false);
+    expect(headers.get('X-GlassHive-Provider-Session-Mode')).toBe('stateless');
+    expect(headers.get('X-Viventium-Surface')).toBe('voice');
+    expect(headers.get('X-Viventium-Memory-Eligible')).toBe('false');
+    return new Response('{}');
+  });
+  const route = (id: string, model: string) => ({
+    id,
+    provider: Providers.OPENAI,
+    tools: [],
+    model_parameters: {
+      model,
+      reasoning_effort: 'high',
+      configuration: {
+        fetch: send,
+        defaultHeaders: {
+          'X-GlassHive-Agent-Id': id,
+          'X-GlassHive-Turn-Context-B64': encoded,
+          'X-GlassHive-Provider-Session-Mode': 'stateless',
+          'X-Viventium-Surface': 'voice',
+          'X-Viventium-Memory-Eligible': 'false',
+        },
+      },
+    },
+  });
+  const main = route('main', 'synthetic-main');
+  const handoff = route('specialist', 'synthetic-specialist');
+  const fallback = route('specialist', 'synthetic-fallback');
+  const initialized = { ...handoff, viventiumGraphLlmFallbacks: [fallback] };
+  const initialize = jest.fn(async () => initialized);
+  try {
+    await createRun({
+      agents: [main, { ...handoff, viventiumConnectedAgentInitializer: initialize }],
+      signal: new AbortController().signal,
+    } as never);
+    const shell = createSpy.mock.calls[0][0].graphConfig.agents[1].clientOptions;
+    const hydrate = Reflect.get(shell!, Symbol.for('viventium.agent.connected.initializer.v1'));
+    expect(typeof hydrate).toBe('function');
+    const hydrated = await hydrate();
+    const primary = hydrated.clientOptions;
+    const configuredFallback = primary.fallbacks[0].clientOptions;
+    expect(primary.model).toBe('synthetic-specialist');
+    expect(configuredFallback.model).toBe('synthetic-fallback');
+    expect(primary.reasoning_effort).toBe('high');
+    expect(configuredFallback.reasoning_effort).toBe('high');
+    for (const options of [primary, configuredFallback]) {
+      await options.configuration.fetch('https://provider.invalid/v1/chat/completions', {
+        method: 'POST',
+        headers: options.configuration.defaultHeaders,
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'Current user input.' }] }),
+      });
+    }
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(initialize).toHaveBeenCalledTimes(1);
+  } finally {
+    createSpy.mockRestore();
+  }
+});
+/* === VIVENTIUM END === */

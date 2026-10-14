@@ -1,4 +1,4 @@
-import { Fragment, useEffect } from 'react';
+import { Fragment, useRef, useEffect } from 'react';
 import { useRecoilState } from 'recoil';
 import type { TMessage } from 'librechat-data-provider';
 import type { TMessageProps } from '~/common';
@@ -7,6 +7,7 @@ import Message from './Message';
 /* === VIVENTIUM START === Match the chat's additive system-result projection. === */
 import {
   getMessageBranchChoices,
+  resolveMessageSiblingIndex,
   isTrustedSystemMessageGroup,
   selectVisibleMessageBranches,
 } from '~/utils/noResponseTag';
@@ -23,28 +24,30 @@ export default function MultiMessage({
 }: TMessageProps) {
   const [siblingIdx, setSiblingIdx] = useRecoilState(store.messagesSiblingIdxFamily(messageId));
   const choices = getMessageBranchChoices(messagesTree ?? []);
+  const previousChoiceCount = useRef(choices.length);
+  const selectedSiblingIdx =
+    previousChoiceCount.current === choices.length
+      ? resolveMessageSiblingIndex(choices, siblingIdx)
+      : 0;
 
   const setSiblingIdxRev = (value: number) => {
     setSiblingIdx(choices.length - value - 1);
   };
 
+  /* === VIVENTIUM START === Preserve an existing manual choice on mount and data refresh. === */
   useEffect(() => {
-    // reset siblingIdx when the tree changes, mostly when a new message is submitting.
-    setSiblingIdx(0);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [choices.length]);
-
-  useEffect(() => {
-    if (siblingIdx >= choices.length) {
+    if (previousChoiceCount.current !== choices.length) {
+      previousChoiceCount.current = choices.length;
       setSiblingIdx(0);
     }
-  }, [siblingIdx, choices.length, setSiblingIdx]);
+  }, [choices.length, setSiblingIdx]);
+  /* === VIVENTIUM END === */
 
   if (!(messagesTree && choices.length)) {
     return null;
   }
 
-  const selectedMessage = choices[choices.length - siblingIdx - 1] as TMessage | null;
+  const selectedMessage = choices[choices.length - selectedSiblingIdx - 1] as TMessage | null;
   if (!selectedMessage) {
     return null;
   }
@@ -57,7 +60,7 @@ export default function MultiMessage({
           <Fragment key={visibleMessage.messageId}>
             {visibleMessage.messageId === selectedMessage.messageId && (
               <SiblingSwitch
-                siblingIdx={choices.length - siblingIdx - 1}
+                siblingIdx={choices.length - selectedSiblingIdx - 1}
                 siblingCount={choices.length}
                 setSiblingIdx={setSiblingIdxRev}
               />
@@ -79,7 +82,7 @@ export default function MultiMessage({
           message={message}
           currentEditId={currentEditId}
           setCurrentEditId={setCurrentEditId}
-          siblingIdx={isSelected ? choices.length - siblingIdx - 1 : 0}
+          siblingIdx={isSelected ? choices.length - selectedSiblingIdx - 1 : 0}
           siblingCount={isSelected ? choices.length : 1}
           setSiblingIdx={setSiblingIdxRev}
         />

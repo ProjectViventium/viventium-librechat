@@ -1,4 +1,6 @@
 /* === VIVENTIUM START === Private native response admission on the existing Message. === */
+import type { ClientSession } from 'mongoose';
+
 export interface NativeResponseSource {
   id: string;
   messageId: string;
@@ -44,6 +46,13 @@ export type NativeResponseMessageProjection = Pick<
   import('./message').IMessage,
   'text' | 'content' | 'metadata' | 'attachments'
 >;
+
+export interface NativeResponsePreparedAttachments {
+  attachments: NativeResponseMessageProjection['attachments'];
+  authorizePublication?: (session: ClientSession) => Promise<void>;
+}
+export type NativeResponseAttachmentPreparation =
+  NativeResponseMessageProjection['attachments'] | NativeResponsePreparedAttachments;
 
 export interface NativeResponseAdmission extends NativeResponseIdentity {
   status: 'pending' | 'prepared' | 'completed' | 'cancelled' | 'failed' | 'unsupported';

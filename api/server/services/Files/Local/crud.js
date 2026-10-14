@@ -1,5 +1,8 @@
 const fs = require('fs');
 const path = require('path');
+/* === VIVENTIUM START: Native originals need metadata, not a discarded image render. === */
+const sharp = require('sharp');
+/* === VIVENTIUM END === */
 const axios = require('axios');
 const { deleteRagFile } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
@@ -282,7 +285,7 @@ const deleteLocalFile = async (req, file) => {
  *            - filepath: The path where the file is saved.
  *            - bytes: The size of the file in bytes.
  */
-async function uploadLocalFile({ req, file, file_id }) {
+async function uploadLocalFile({ req, file, file_id, nativeOriginalImage = false }) {
   const appConfig = req.config;
   const inputFilePath = file.path;
   const inputBuffer = await fs.promises.readFile(inputFilePath);
@@ -304,7 +307,12 @@ async function uploadLocalFile({ req, file, file_id }) {
   let height, width;
   if (file.mimetype && file.mimetype.startsWith('image/')) {
     try {
-      const { width: imgWidth, height: imgHeight } = await resizeImageBuffer(inputBuffer, 'high');
+      /* === VIVENTIUM START: Preserve native source dimensions without rendering its bytes again. === */
+      const { width: imgWidth, height: imgHeight } =
+        nativeOriginalImage === true
+          ? await sharp(inputBuffer).metadata()
+          : await resizeImageBuffer(inputBuffer, 'high');
+      /* === VIVENTIUM END === */
       height = imgHeight;
       width = imgWidth;
     } catch (error) {

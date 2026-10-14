@@ -106,6 +106,61 @@ describe('cortexMessageState insight delivery projection', () => {
     });
   });
 
+  test('projects persisted native ranges and exact callback controls without changing text', async () => {
+    const text = 'Read-first 🧠.\nUseful spoken result.';
+    const content = [{ type: 'text', text, deliveryDispositionRanges: [
+      { start: 0, end: text.length, disposition: {
+        version: 1, audio: 'eligible', required: true, valid: true, source: 'model',
+      } },
+    ] }];
+    const controls = { audioContent: content, sourceTextSha256: 'a'.repeat(64) };
+    mockGetMessages.mockResolvedValue([{ messageId: 'followup-native', text, content,
+      metadata: { viventium: { telegramDeliveryControls: controls } } }]);
+    const state = await getCortexMessageState({ userId: 'owner-1', messageId: 'parent-1' });
+    expect(state.followUp).toEqual(expect.objectContaining({ text, content, deliveryControls: controls }));
+  });
+
+  test.each(['durable_terminal_callback', 'durable_work_callback'])(
+    'leaves %s Main presentation to its native delivery owner, preserving ordinary Cortex follow-ups',
+    async (followUpSource) => {
+      const ordinary = {
+        messageId: 'cortex-follow-up', text: 'A useful independent Cortex clarification.',
+        metadata: { viventium: { followUpSource: 'cortex_aggregation' } },
+      };
+      const native = {
+        messageId: 'worker-main-follow-up', text: 'The Main-authored worker result.',
+        metadata: { viventium: { followUpSource } },
+      };
+      mockGetMessages.mockImplementation(async (filter) => [ordinary, native].filter(
+        (message) => !filter['metadata.viventium.followUpSource']?.$nin?.includes(
+          message.metadata.viventium.followUpSource,
+        ),
+      ));
+      const state = await getCortexMessageState({ userId: 'owner-1', messageId: 'parent-1' });
+      expect(state.followUp).toMatchObject({
+        messageId: ordinary.messageId, text: ordinary.text, followUpSource: 'cortex_aggregation',
+      });
+      expect(mockGetMessages).toHaveBeenCalledWith(expect.objectContaining({
+        user: 'owner-1', conversationId: 'conversation-1',
+        'metadata.viventium.parentMessageId': 'parent-1',
+        'metadata.viventium.followUpSource': { $nin: ['durable_terminal_callback', 'durable_work_callback'] },
+      }));
+    },
+  );
+
+  test.each(['durable_terminal_callback', 'durable_work_callback'])(
+    'never offers %s as a fallback when no ordinary follow-up exists', async (followUpSource) => {
+      mockGetMessages.mockImplementation(async (filter) =>
+        filter['metadata.viventium.followUpSource']?.$nin?.includes(followUpSource)
+          ? [] : [{ messageId: 'worker-main', text: 'Worker result.', metadata: { viventium: { followUpSource } } }],
+      );
+      const state = await getCortexMessageState({ userId: 'owner-1', messageId: 'parent-1' });
+      expect(state.followUp).toBeNull();
+      expect(state.canonicalText).toBe('Main answer.');
+      expect(state.canonicalTextSource).toBe('message');
+    },
+  );
+
   test('does not query another owner when the requested conversation does not match', async () => {
     const state = await getCortexMessageState({
       userId: 'owner-1',

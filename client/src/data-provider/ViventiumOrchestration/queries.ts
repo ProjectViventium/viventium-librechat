@@ -70,6 +70,13 @@ export type ActiveWorkSnapshot = {
 export type WorkAction =
   'queue' | 'message' | 'steer' | 'pause' | 'resume' | 'stop' | 'retry' | 'dismiss';
 
+export type WorkActionResult = {
+  status?: string;
+  state?: WorkState;
+  confirmationPending?: boolean;
+  controlOutcome?: 'terminal_won';
+};
+
 export type WorkActionVariables = {
   workRef: string;
   action: WorkAction;
@@ -223,7 +230,7 @@ export const useUpdateOrchestrationMutation = () => {
 
 export const useWorkActionMutation = () => {
   const queryClient = useQueryClient();
-  return useMutation<unknown, Error, WorkActionVariables>(
+  return useMutation<WorkActionResult, Error, WorkActionVariables>(
     ({ workRef, action, operationId, instruction, nativeInput }) =>
       request.post(
         `${apiBaseUrl()}/api/viventium/orchestration/work/${encodeURIComponent(workRef)}/actions`,

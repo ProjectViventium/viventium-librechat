@@ -11,10 +11,12 @@
 import * as crypto from 'crypto';
 import { isFeelingsReadIsolated } from '../feelings/service';
 
+import type { VoiceWorkerCompletionBindingV1 } from '../trace/voiceWorkerCompletionTrace';
 import type { Logger } from 'winston';
 import type { ClientSession } from 'mongoose';
 import type { Document } from 'mongodb';
 import type {
+  AccountFetch,
   TrustedDelegationIdentityInput,
   TrustedDelegationInput,
 } from './accountClient';
@@ -77,6 +79,8 @@ interface GlassHiveAccountApiInput {
 
 interface GlassHiveAccountApiResult {
   attemptId?: string;
+  currentRunId?: string;
+  currentRunState?: string;
   valid?: boolean;
   originRef?: string;
   workRef?: string;
@@ -244,6 +248,8 @@ export interface GlassHiveCallbackContext {
   mainAgentId: string;
   runId?: string;
   attemptId?: string;
+  currentRunId?: string;
+  currentRunState?: string;
   traceIdentity?: { callbackRef: string; attemptNumber: number | null };
   destinations: GlassHiveDestination[];
 }
@@ -303,7 +309,7 @@ export interface GlassHiveCallbackBindingService {
   ) => Promise<GlassHiveCallbackContext | null>;
   isGlassHiveNonterminalAttentionCallback: (body?: GlassHiveCallbackBody) => boolean;
   fenceGlassHiveCallbackRunState: (input: {
-    binding: Pick<GlassHiveCallbackContext, 'ownerId' | 'originRef' | 'workRef'>;
+    binding: Pick<GlassHiveCallbackContext, 'ownerId' | 'originRef' | 'workRef' | 'currentRunId' | 'currentRunState'>;
     body: GlassHiveCallbackBody;
     effectSession: ClientSession;
   }) => Promise<void>;
@@ -362,6 +368,7 @@ export interface GlassHiveCallbackBindingService {
     body?: GlassHiveCallbackBody;
     effectFence?: GlassHiveCallbackEffectFence;
     effectSession?: ClientSession;
+    workerCompletion?: { ownerId: string; responseMessageId: string; binding: VoiceWorkerCompletionBindingV1 };
   }) => Promise<object | null>;
   recordGlassHiveCallbackExternalState: (
     input?: GlassHiveCallbackMutationInput,
@@ -420,6 +427,7 @@ export interface GlassHiveCallbackBindingDependencies {
   reconcileAuthoritativeGlassHiveWorkState: (
     input: WorkStateReconciliationInput,
   ) => Promise<object | null>;
+  invalidateActiveWorkSnapshot?: (input: { ownerId: string; fetchImpl?: AccountFetch }) => void;
   fetchImpl?: typeof fetch;
 }
 
@@ -445,6 +453,7 @@ export function createGlassHiveCallbackBindingService(
     recordGlassHiveWorkDetailTrace,
     deferGlassHiveWorkStateReconciliation,
     reconcileAuthoritativeGlassHiveWorkState,
+    invalidateActiveWorkSnapshot,
     fetchImpl = (...args: Parameters<typeof fetch>) => fetch(...args),
   } = dependencies;
 
@@ -1109,37 +1118,27 @@ function packetSourceSegments(context: RuntimeRecord = {}): RuntimeRecord[] {
   }));
 }
 
-function selectedFileName(value: unknown): string {
-  const record = value && typeof value === 'object' ? (value as RuntimeRecord) : {};
-  const candidate =
-    typeof value === 'string'
-      ? value
-      : record.filename || record.name || record.relative_path || record.path || '';
-  return normalizedPacketText(candidate, 512).split(/[\\/]/).filter(Boolean).pop() || '';
-}
-
-function packetSelectedFiles(args: RuntimeRecord = {}): RuntimeRecord[] {
-  const candidates = [
-    ...(Array.isArray(args.uploaded_files) ? args.uploaded_files : []),
-    ...(Array.isArray(args.files) ? args.files : []),
-  ];
-  return candidates.reduce<RuntimeRecord[]>((selected, candidate) => {
-    const name = selectedFileName(candidate);
-    const ref = normalizedPacketText(
-      typeof candidate === 'object' && candidate
-        ? candidate.file_id || candidate.fileId || candidate.id
-        : '',
-      512,
-    );
-    if (!name && !ref) return selected;
-    selected.push({
-      ordinal: selected.length,
-      ...(name ? { name } : {}),
-      ...(!name && ref ? { ref } : {}),
-    });
-    return selected;
-  }, []);
-}
+  function packetSelectedFiles(args: RuntimeRecord = {}): RuntimeRecord[] {
+    const candidates = [
+      ...(Array.isArray(args.uploaded_files) ? args.uploaded_files : []),
+      ...(Array.isArray(args.files) ? args.files : []),
+    ];
+    return candidates.reduce<RuntimeRecord[]>((selected, candidate) => {
+      const ref = normalizedPacketText(
+        typeof candidate === 'object' && candidate
+          ? candidate.file_id || candidate.fileId || candidate.id
+          : '',
+        512,
+      );
+      if (!ref) {
+        throw Object.assign(new Error('glasshive_selected_file_ref_unavailable'), {
+          code: 'glasshive_selected_file_ref_unavailable',
+        });
+      }
+      selected.push({ ordinal: selected.length, ref });
+      return selected;
+    }, []);
+  }
 
 function packetExplicitConstraints(args: RuntimeRecord = {}): RuntimeRecord[] {
   return DELEGATION_CONSTRAINT_FIELDS.reduce<RuntimeRecord[]>((constraints, kind) => {
@@ -1754,8 +1753,42 @@ async function markGlassHiveLaunchDispatchRejected(
 function isGlassHiveNonterminalAttentionCallback(body: GlassHiveCallbackBody = {}): boolean {
   return (
     body.work_terminal !== true &&
-    ['run.needs_input', 'run.blocked'].includes(normalizeText(body.event, 64))
+    ['run.needs_input', 'run.blocked', 'checkpoint.ready', 'takeover.requested'].includes(
+      normalizeText(body.event, 64),
+    )
   );
+}
+
+/** Advance the current projection only from the existing owner-verified generation snapshot. */
+async function projectVerifiedGlassHiveCallbackGeneration({
+  binding, body, effectSession,
+}: RuntimeRecord): Promise<void> {
+  const runId = normalizeText(body.run_id, 160);
+  const currentRunId = normalizeText(binding?.currentRunId, 160);
+  const state = canonicalGlassHiveWorkState({ work_state: binding?.currentRunState });
+  if (!runId || currentRunId !== runId || !state) return;
+  const scope = { _id: normalizeText(binding.originRef, 160),
+    ownerId: normalizeText(binding.ownerId), workRef: normalizeText(binding.workRef, 160) };
+  if (!scope._id || !scope.ownerId || !scope.workRef) return;
+  const collection = externalWorkCollection();
+  const options = effectSession ? { session: effectSession } : undefined;
+  const work = await collection.findOne(scope, options);
+  if (!work || work.terminalCallbackRunId === runId) return;
+  const inheritedTerminal = TERMINAL_STATES.includes(normalizeText(work.externalState, 32)) &&
+    Boolean(normalizeText(work.terminalCallbackRunId, 160)) && work.terminalCallbackRunId !== runId;
+  if (work.runId === runId && !inheritedTerminal) return;
+  const exact = (key: string) => work[key] === undefined ? { $exists: false } : work[key];
+  const written = await collection.updateOne({ ...scope,
+    runId: exact('runId'), externalState: exact('externalState'),
+    terminalCallbackRunId: exact('terminalCallbackRunId'),
+  }, {
+    $set: { runId, externalState: state,
+      workerId: normalizeText(body.worker_id, 160), launchState: 'callback_confirmed',
+      attentionPending: state === 'needs_input' || TERMINAL_STATES.includes(state), updatedAt: new Date() },
+    $unset: { terminalAt: 1, deliveryState: 1, adjudicationState: 1,
+      adjudicationErrorCode: 1, adjudicatedAt: 1 },
+  }, options);
+  if (Number(written.matchedCount) !== 1) throw callbackEffectFenceError('glasshive_callback_run_binding_not_ready');
 }
 
 async function fenceGlassHiveCallbackRunState({
@@ -1763,7 +1796,7 @@ async function fenceGlassHiveCallbackRunState({
   body,
   effectSession,
 }: {
-  binding: Pick<GlassHiveCallbackContext, 'ownerId' | 'originRef' | 'workRef'>;
+  binding: Pick<GlassHiveCallbackContext, 'ownerId' | 'originRef' | 'workRef' | 'currentRunId' | 'currentRunState'>;
   body: GlassHiveCallbackBody;
   effectSession: ClientSession;
 }): Promise<void> {
@@ -1776,6 +1809,11 @@ async function fenceGlassHiveCallbackRunState({
     throw callbackEffectFenceError('glasshive_callback_run_binding_not_ready');
   }
   const attention = isGlassHiveNonterminalAttentionCallback(body);
+  const currentRunId = normalizeText(binding.currentRunId, 160);
+  if (attention && currentRunId && currentRunId !== runId) {
+    throw callbackEffectFenceError('glasshive_callback_notice_superseded');
+  }
+  await projectVerifiedGlassHiveCallbackGeneration({ binding, body, effectSession });
   if (attention) {
     const terminal = await mongoose.connection.collection('viventium_glasshive_callback_results')
       .findOne(
@@ -1821,6 +1859,9 @@ async function confirmGlassHiveCallbackContext({
   const workerId = normalizeText(body.worker_id, 160);
   const runId = normalizeText(body.run_id, 160);
   if (!ownerId || !originRef || !workRef || !workerId || !runId) return null;
+  await projectVerifiedGlassHiveCallbackGeneration({ binding, body, effectSession });
+  const currentRunId = normalizeText(binding.currentRunId, 160);
+  const projectsCurrentRun = !currentRunId || currentRunId === runId;
   const fence = terminalCallbackEffectFence(body, effectFence);
   const now = new Date();
   const bindFilter = { _id: originRef, $or: [{ workRef: '' }, { workRef }] };
@@ -1831,7 +1872,7 @@ async function confirmGlassHiveCallbackContext({
           $set: {
             workRef,
             workerId,
-            runId,
+            ...(projectsCurrentRun ? { runId } : {}),
             launchState: 'callback_confirmed',
             updatedAt: now,
             ...terminalCallbackDestinationFields(fence),
@@ -1844,7 +1885,7 @@ async function confirmGlassHiveCallbackContext({
         $set: {
           workRef,
           workerId,
-          runId,
+          ...(projectsCurrentRun ? { runId } : {}),
           launchState: 'callback_confirmed',
           updatedAt: now,
           ...terminalCallbackDestinationFields(fence),
@@ -1970,8 +2011,13 @@ async function resolveGlassHiveCallbackContext(
     scheduleOccurrenceKey: normalizeText(binding.scheduleOccurrenceKey),
     scheduleId: normalizeText(binding.scheduleId),
     mainAgentId: normalizeText(binding.mainAgentId, 160),
+    currentRunId: normalizeText(association?.currentRunId, 160),
+    currentRunState: normalizeText(association?.currentRunState, 32),
     ...(binding.feelingsIsolated === true ? { feelingsIsolated: true } : {}),
-    ...(body.output_files != null ? { runId, attemptId: normalizeText(association?.attemptId, 160) } : {}),
+    ...((body.output_files != null || body.native_media != null) &&
+        normalizeText(association?.runId, 160) === runId &&
+        normalizeText(association?.attemptId, 160)
+      ? { runId, attemptId: normalizeText(association?.attemptId, 160) } : {}),
     ...(traceIdentity ? { traceIdentity } : {}),
     destinations,
   };
@@ -2581,6 +2627,8 @@ async function recordGlassHiveCallbackExternalState({
       });
     }
   }
+  if (binding.currentRunId && binding.currentRunId !== runId) return null;
+  await projectVerifiedGlassHiveCallbackGeneration({ binding, body, effectSession });
   const collection = externalWorkCollection();
   const work = originRef
     ? await collection.findOne(
@@ -2625,13 +2673,27 @@ async function recordGlassHiveCallbackExternalState({
       delete update.$set.deliveryState;
       delete update.$set.attentionPending;
     }
-    requireFencedDestinationDocument(
-      await collection.findOneAndUpdate(terminalCallbackDestinationFilter(filter, fence), update, {
-        returnDocument: 'after',
-        ...(effectSession ? { session: effectSession } : {}),
-      }),
-      fence,
-    );
+      const written = await collection.findOneAndUpdate(
+        terminalCallbackDestinationFilter(filter, fence),
+        update,
+        {
+          returnDocument: 'after',
+          ...(effectSession ? { session: effectSession } : {}),
+        },
+      );
+      const committed = requireFencedDestinationDocument(written, fence);
+      if (
+        committed &&
+        binding.currentRunId === runId &&
+        committed.ownerId === binding.ownerId &&
+        committed.workRef === workRef &&
+        committed.runId === runId &&
+        committed.externalState === state &&
+        update.$set.externalState &&
+        work.externalState !== state
+      ) {
+        invalidateActiveWorkSnapshot?.({ ownerId: normalizeText(committed.ownerId), fetchImpl });
+      }
   } else if (fence) {
     throw callbackEffectFenceError();
   }
@@ -2755,6 +2817,7 @@ async function recordGlassHiveSurfaceDeliveryOutcome({
   body = {},
   effectFence,
   effectSession,
+  workerCompletion,
 }: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
   const ref = normalizeText(originRef, 160);
   const deliveryState = normalizeText(state, 32);
@@ -2768,6 +2831,18 @@ async function recordGlassHiveSurfaceDeliveryOutcome({
   const fence = terminalCallbackEffectFence(body, effectFence);
   const projectionFilter = {
     _id: ref,
+    ...(workerCompletion
+      ? {
+          ownerId: workerCompletion.ownerId,
+          workRef: workerCompletion.binding.workRef,
+          terminalCallbackRunId: workerCompletion.binding.runId,
+          terminalCallbackId: workerCompletion.binding.terminalCallbackId,
+          terminalCallbackResultDigest: workerCompletion.binding.resultDigest,
+          terminalCallbackResultRevision: workerCompletion.binding.resultRevision,
+          terminalCallbackAcceptedOperationId: workerCompletion.binding.acceptedOperationId,
+          followUpMessageId: workerCompletion.responseMessageId,
+        }
+      : {}),
     ...(deliveryState === 'enqueued' ? { deliveryState: { $nin: PROTECTED_DELIVERY_STATES } } : {}),
   };
   const updated = await externalWorkCollection().findOneAndUpdate(

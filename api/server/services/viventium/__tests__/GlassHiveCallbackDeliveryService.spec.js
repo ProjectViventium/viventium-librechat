@@ -75,9 +75,9 @@ jest.mock('~/db/models', () => ({
 jest.mock('../GlassHiveTerminalCallbackTransaction', () => ({
   currentGlassHiveTerminalCallbackTransaction: () =>
     mockTerminalTransactionService?.currentGlassHiveTerminalCallbackTransaction() ?? null,
-  runGlassHiveTerminalCallbackTransaction: (operation) =>
+  runGlassHiveTerminalCallbackTransaction: (operation, options) =>
     mockTerminalTransactionService
-      ? mockTerminalTransactionService.runGlassHiveTerminalCallbackTransaction(operation)
+      ? mockTerminalTransactionService.runGlassHiveTerminalCallbackTransaction(operation, options)
       : operation({ inTransaction: () => true }),
   deferGlassHiveTerminalCallbackAfterCommit: (operation) =>
     mockTerminalTransactionService?.deferGlassHiveTerminalCallbackAfterCommit(operation) ?? false,
@@ -186,6 +186,7 @@ function workerCompletionFixture() {
     userId: 'owner-coalesced',
     conversationId: 'conversation-coalesced',
     event: 'main.followup',
+    callbackKey: '',
     surface: 'voice',
     status: 'claimed',
     text: 'Both Workers completed.',
@@ -428,6 +429,513 @@ describe('GlassHiveCallbackDeliveryService', () => {
     mockRenewEffectLease = jest.fn().mockResolvedValue(true);
   });
 
+  describe('Main-authored nonterminal attention Voice authority', () => {
+    let collectionSpy;
+    let currentWork;
+    let evidence;
+    let evidenceRows;
+    let fixture;
+    beforeEach(() => {
+      const binding = {
+        kind: 'nonterminal_attention',
+        originRef: 'origin-attention',
+        workRef: 'work-attention',
+        workerId: 'worker-attention',
+        runId: 'run-attention',
+        callbackRef: canonicalCallbackRef('cb-attention'),
+        event: 'run.needs_input',
+        workTerminal: false,
+        evidenceId: 'ghe_' + 'a'.repeat(32),
+      };
+      const { buildVoiceWorkerCompletionPresentation } = require('@librechat/api');
+      const presentation = buildVoiceWorkerCompletionPresentation({
+        ownerId: 'owner-attention',
+        conversationId: 'conversation-attention',
+        callSessionId: 'call-attention',
+        responseMessageId: 'authored-attention',
+        responseText: 'May I renew access to continue?',
+        bindings: [binding],
+      });
+      const row = {
+        deliveryId: 'delivery-attention',
+        claimId: 'claim-attention',
+        surface: 'voice',
+        status: 'claimed',
+        userId: 'owner-attention',
+        conversationId: 'conversation-attention',
+        originRef: binding.originRef,
+        workRef: binding.workRef,
+        workerId: binding.workerId,
+        runId: binding.runId,
+        callbackId: binding.callbackRef,
+        callbackMessageId: presentation.responseMessageId,
+        voiceCallSessionId: presentation.callSessionId,
+        voiceRequestId: presentation.turnId,
+        event: 'main.followup',
+        text: 'May I renew access to continue?',
+        workerCompletionPresentation: presentation,
+        workerCompletionEffectLeases: [],
+        dispatchPermitId: '',
+        dispatchPermitGeneration: 0,
+        dispatchPermitExpiresAt: null,
+      };
+      fixture = { row, presentation };
+      evidence = {
+        _id: binding.evidenceId,
+        ownerId: row.userId,
+        originRef: binding.originRef,
+        workRef: binding.workRef,
+        workerId: binding.workerId,
+        runId: binding.runId,
+        callbackRef: binding.callbackRef,
+        event: binding.event,
+        workTerminal: false,
+        workState: 'needs_input',
+        followUpMessageId: row.callbackMessageId,
+        createdAt: new Date('2026-01-01T00:00:00Z'),
+      };
+      evidenceRows = [evidence];
+      currentWork = {
+        _id: binding.originRef,
+        ownerId: row.userId,
+        workRef: binding.workRef,
+        workerId: binding.workerId,
+        runId: binding.runId,
+        externalState: 'needs_input',
+      };
+      collectionSpy = jest
+        .spyOn(require('mongoose').connection, 'collection')
+        .mockImplementation((name) => ({
+          findOne: jest.fn(async (filter, options) => {
+            const candidates =
+              name === 'viventium_glasshive_mission_evidence' ? evidenceRows : [currentWork];
+            return (
+              candidates
+                .filter(
+                  (candidate) =>
+                    candidate &&
+                    Object.entries(filter).every(([key, value]) => candidate[key] === value),
+                )
+                .sort((left, right) => {
+                  for (const [key, direction] of Object.entries(options?.sort || {})) {
+                    const a = left[key],
+                      b = right[key];
+                    if (a === b) continue;
+                    if (a == null) return 1;
+                    if (b == null) return -1;
+                    return (a > b ? 1 : -1) * direction;
+                  }
+                  return 0;
+                })[0] || null
+            );
+          }),
+        }));
+      mockFindOne.mockImplementation(() => leanResult(fixture.row));
+      mockMessageFindOne.mockImplementation(() =>
+        leanResult({ messageId: fixture.row.callbackMessageId, text: fixture.row.text }),
+      );
+      mockFindOneAndUpdate.mockImplementation((_filter, update) => {
+        fixture.row = { ...fixture.row, ...update.$set };
+        return leanResult(fixture.row);
+      });
+    });
+    afterEach(() => collectionSpy.mockRestore());
+    const authorize = () =>
+      authorizeGlassHiveCallbackDeliveryDispatch({
+        deliveryId: fixture.row.deliveryId,
+        claimId: fixture.row.claimId,
+        userId: fixture.row.userId,
+        voiceCallSessionId: fixture.row.voiceCallSessionId,
+      });
+    test('strict persistence retains the attention union and rejects terminal fields on it', async () => {
+      const mongoose = require('mongoose');
+      const connection = mongoose.createConnection();
+      const Model = require('../../../../db/viventiumGlassHiveCallbackDelivery')(connection);
+      const valid = new Model({ workerCompletionPresentation: fixture.presentation });
+      expect(valid.workerCompletionPresentation.toObject().bindings).toEqual(
+        fixture.presentation.bindings,
+      );
+      await expect(
+        valid.workerCompletionPresentation.bindings[0].validate(),
+      ).resolves.toBeUndefined();
+      const invalid = new Model({
+        workerCompletionPresentation: {
+          ...fixture.presentation,
+          bindings: [{ ...fixture.presentation.bindings[0], attemptNumber: 1 }],
+        },
+      });
+      await expect(invalid.workerCompletionPresentation.bindings[0].validate()).rejects.toThrow(
+        'binding_invalid',
+      );
+    });
+    test('mints and completes one response permit without any terminal operation lease', async () => {
+      const permit = await authorize();
+      expect(permit).toMatchObject({
+        resultRevision: 1,
+        resultDigest: fixture.presentation.responseDigest,
+      });
+      expect(mockAcquireEffectLease).not.toHaveBeenCalled();
+      expect(
+        await resolveGlassHiveVoicePresentation({
+          deliveryId: fixture.row.deliveryId,
+          claimId: fixture.row.claimId,
+          userId: fixture.row.userId,
+          voiceCallSessionId: fixture.row.voiceCallSessionId,
+          conversationId: fixture.row.conversationId,
+          dispatchPermit: permit,
+          presentationRef: fixture.presentation.presentationRef,
+          turnId: fixture.presentation.turnId,
+        }),
+      ).not.toBeNull();
+      const input = {
+        deliveryId: fixture.row.deliveryId,
+        claimId: fixture.row.claimId,
+        userId: fixture.row.userId,
+        voiceCallSessionId: fixture.row.voiceCallSessionId,
+        dispatchPermit: permit,
+        presentationRef: fixture.presentation.presentationRef,
+      };
+      expect(await completeGlassHiveWorkerCompletionPresentation(input)).toMatchObject({
+        status: 'sent',
+      });
+      mockFindOne.mockReturnValue(leanResult(null));
+      expect(await completeGlassHiveWorkerCompletionPresentation(input)).toBeNull();
+      expect(mockFenceEffectTransaction).not.toHaveBeenCalled();
+      expect(mockReleaseEffectLease).not.toHaveBeenCalled();
+    });
+    test('authorizes and settles the exact persisted attention presentation once', async () => {
+      const mongoose = require('mongoose');
+      const connection = mongoose.createConnection();
+      const Model = require('../../../../db/viventiumGlassHiveCallbackDelivery')(connection);
+      const persisted = new Model({
+        workerCompletionPresentation: fixture.presentation,
+      }).workerCompletionPresentation.toObject();
+      expect(Object.keys(persisted.bindings[0])).not.toEqual(
+        Object.keys(fixture.presentation.bindings[0]),
+      );
+      fixture.row.workerCompletionPresentation = persisted;
+      const permit = await authorize();
+      expect(permit).toMatchObject({ resultRevision: 1, resultDigest: persisted.responseDigest });
+      expect(
+        await resolveGlassHiveVoicePresentation({
+          deliveryId: fixture.row.deliveryId,
+          claimId: fixture.row.claimId,
+          userId: fixture.row.userId,
+          voiceCallSessionId: fixture.row.voiceCallSessionId,
+          conversationId: fixture.row.conversationId,
+          dispatchPermit: permit,
+          presentationRef: persisted.presentationRef,
+          turnId: persisted.turnId,
+        }),
+      ).not.toBeNull();
+      const input = {
+        deliveryId: fixture.row.deliveryId,
+        claimId: fixture.row.claimId,
+        userId: fixture.row.userId,
+        voiceCallSessionId: fixture.row.voiceCallSessionId,
+        dispatchPermit: permit,
+        presentationRef: persisted.presentationRef,
+      };
+      expect(await completeGlassHiveWorkerCompletionPresentation(input)).toMatchObject({
+        status: 'sent',
+      });
+      expect(mockAcquireEffectLease).not.toHaveBeenCalled();
+      expect(mockFenceEffectTransaction).not.toHaveBeenCalled();
+      expect(mockReleaseEffectLease).not.toHaveBeenCalled();
+    });
+    test.each([
+      { ownerId: 'foreign' },
+      { workRef: 'foreign-work' },
+      { runId: 'newer-run' },
+      { externalState: 'running' },
+      { externalState: 'cancelled' },
+    ])('rejects stale or foreign current work %p before permit', async (change) => {
+      currentWork = { ...currentWork, ...change };
+      expect(await authorize()).toBeNull();
+      expect(mockAcquireEffectLease).not.toHaveBeenCalled();
+    });
+    test('superseded attention cannot claim the durable delivery task', async () => {
+      fixture.row.status = 'pending';
+      currentWork.runId = 'superseding-run';
+      mockFindOne.mockReturnValueOnce(leanResult(fixture.row)).mockReturnValue(leanResult(null));
+      expect(
+        await claimPendingGlassHiveCallbackDeliveries({
+          surface: 'voice',
+          callbackId: fixture.row.callbackId,
+          userId: fixture.row.userId,
+          voiceCallSessionId: fixture.row.voiceCallSessionId,
+          limit: 1,
+        }),
+      ).toEqual([]);
+      expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+      expect(mockUpdateOne).toHaveBeenCalledWith(
+        expect.objectContaining({ deliveryId: fixture.row.deliveryId }),
+        expect.objectContaining({ $set: expect.objectContaining({ status: 'superseded' }) }),
+      );
+    });
+    test('rejects a foreign authored message association', async () => {
+      evidence.followUpMessageId = 'other-response';
+      expect(await authorize()).toBeNull();
+    });
+    test('Telegram uses the same authored evidence permit and settles returned text/audio receipts once', async () => {
+      fixture.row = {
+        ...fixture.row,
+        surface: 'telegram',
+        telegramChatId: 'chat-attention',
+        workerCompletionBindings: fixture.presentation.bindings,
+        workerCompletionPresentation: null,
+      };
+      const permit = await authorize();
+      expect(permit).toMatchObject({
+        surface: 'telegram',
+        resultDigest: fixture.presentation.responseDigest,
+      });
+      const renewed = await renewGlassHiveCallbackDeliveryDispatch({
+        deliveryId: fixture.row.deliveryId,
+        claimId: fixture.row.claimId,
+        userId: fixture.row.userId,
+        dispatchPermit: permit,
+      });
+      expect(renewed).not.toBeNull();
+      const input = {
+        deliveryId: fixture.row.deliveryId,
+        claimId: fixture.row.claimId,
+        userId: fixture.row.userId,
+        dispatchPermit: renewed,
+        telegramMessageIds: ['101', '102'],
+      };
+      expect(await markGlassHiveCallbackDeliverySent(input)).toMatchObject({
+        status: 'sent',
+        telegramSentMessageIds: ['101', '102'],
+      });
+      mockFindOne.mockReturnValue(leanResult(null));
+      mockFindOneAndUpdate.mockReturnValue(leanResult(null));
+      expect(await markGlassHiveCallbackDeliverySent(input)).toBeNull();
+      expect(mockAcquireEffectLease).not.toHaveBeenCalled();
+    });
+    test('same-run A then Resume then B allows only the newest blocker to claim or receive a permit', async () => {
+      const first = { ...fixture.row };
+      currentWork.externalState = 'running';
+      currentWork.externalState = 'needs_input';
+      const newest = {
+        ...evidence,
+        _id: 'ghe_' + 'b'.repeat(32),
+        callbackRef: canonicalCallbackRef('cb-B'),
+        followUpMessageId: 'authored-B',
+        createdAt: new Date('2026-01-01T00:01:00Z'),
+      };
+      evidenceRows.push(newest);
+      expect(await authorize()).toBeNull();
+      mockFindOne.mockReturnValueOnce(leanResult(first)).mockReturnValueOnce(leanResult(null));
+      expect(
+        await claimPendingGlassHiveCallbackDeliveries({
+          surface: 'voice',
+          callbackId: first.callbackId,
+          userId: first.userId,
+          voiceCallSessionId: first.voiceCallSessionId,
+          limit: 1,
+        }),
+      ).toEqual([]);
+      const binding = {
+        ...fixture.presentation.bindings[0],
+        evidenceId: newest._id,
+        callbackRef: newest.callbackRef,
+      };
+      const presentation = require('@librechat/api').buildVoiceWorkerCompletionPresentation({
+        ownerId: first.userId,
+        conversationId: first.conversationId,
+        callSessionId: first.voiceCallSessionId,
+        responseMessageId: newest.followUpMessageId,
+        responseText: first.text,
+        bindings: [binding],
+      });
+      fixture.presentation = presentation;
+      fixture.row = {
+        ...first,
+        deliveryId: 'delivery-B',
+        claimId: 'claim-B',
+        callbackId: newest.callbackRef,
+        callbackMessageId: newest.followUpMessageId,
+        voiceRequestId: presentation.turnId,
+        workerCompletionPresentation: presentation,
+      };
+      mockFindOne.mockImplementation(() => leanResult(fixture.row));
+      expect(await authorize()).not.toBeNull();
+    });
+
+    test('older native A retry accepted after B cannot displace B or gain a permit', async () => {
+      evidence.callbackCreatedAt = '2026-01-01T00:00:00.000001Z';
+      evidence.createdAt = new Date('2026-01-01T00:03:00Z'); // A arrives late after a failed send.
+      const newer = {
+        ...evidence,
+        _id: 'ghe_' + 'b'.repeat(32),
+        callbackRef: canonicalCallbackRef('cb-B'),
+        followUpMessageId: 'authored-B',
+        callbackCreatedAt: '2026-01-01T00:00:00.000002Z',
+        createdAt: new Date('2026-01-01T00:02:00Z'),
+      };
+      evidenceRows.push(newer);
+      expect(await authorize()).toBeNull();
+      const presentation = require('@librechat/api').buildVoiceWorkerCompletionPresentation({
+        ownerId: fixture.row.userId,
+        conversationId: fixture.row.conversationId,
+        callSessionId: fixture.row.voiceCallSessionId,
+        responseMessageId: newer.followUpMessageId,
+        responseText: fixture.row.text,
+        bindings: [
+          {
+            ...fixture.presentation.bindings[0],
+            evidenceId: newer._id,
+            callbackRef: newer.callbackRef,
+          },
+        ],
+      });
+      fixture.presentation = presentation;
+      fixture.row = {
+        ...fixture.row,
+        deliveryId: 'delivery-B',
+        claimId: 'claim-B',
+        callbackId: newer.callbackRef,
+        callbackMessageId: newer.followUpMessageId,
+        voiceRequestId: presentation.turnId,
+        workerCompletionPresentation: presentation,
+      };
+      expect(await authorize()).not.toBeNull();
+    });
+    test('equal native creation clocks use stable evidence identity rather than retry arrival time', async () => {
+      evidence.callbackCreatedAt = '2026-01-01T00:00:00.123456Z';
+      evidence.createdAt = new Date('2026-01-01T00:03:00Z');
+      evidenceRows.push({
+        ...evidence,
+        _id: 'ghe_' + 'b'.repeat(32),
+        createdAt: new Date('2026-01-01T00:02:00Z'),
+      });
+      expect(await authorize()).toBeNull();
+    });
+
+    test('an unclocked legacy callback cannot displace accepted native-clock evidence', async () => {
+      evidence.createdAt = new Date('2026-01-01T00:03:00Z');
+      evidenceRows.push({
+        ...evidence,
+        _id: 'ghe_' + 'b'.repeat(32),
+        callbackCreatedAt: '2026-01-01T00:00:00.000002Z',
+        createdAt: new Date('2026-01-01T00:02:00Z'),
+      });
+      expect(await authorize()).toBeNull();
+    });
+
+    test('Resume and a newer blocker before Voice ACK preserve only the original exact issued receipt', async () => {
+      const permit = await authorize();
+      currentWork.externalState = 'running';
+      evidenceRows.push({
+        ...evidence,
+        _id: 'ghe_' + 'b'.repeat(32),
+        callbackRef: canonicalCallbackRef('cb-B'),
+        createdAt: new Date('2026-01-01T00:01:00Z'),
+      });
+      const input = {
+        deliveryId: fixture.row.deliveryId,
+        claimId: fixture.row.claimId,
+        userId: fixture.row.userId,
+        voiceCallSessionId: fixture.row.voiceCallSessionId,
+        dispatchPermit: permit,
+        presentationRef: fixture.presentation.presentationRef,
+      };
+      expect(
+        await completeGlassHiveWorkerCompletionPresentation({
+          ...input,
+          dispatchPermit: { ...permit, permitId: 'f'.repeat(32) },
+        }),
+      ).toBeNull();
+      expect(await completeGlassHiveWorkerCompletionPresentation(input)).toMatchObject({
+        status: 'sent',
+      });
+      mockFindOne.mockReturnValue(leanResult(null));
+      expect(await completeGlassHiveWorkerCompletionPresentation(input)).toBeNull();
+      expect(mockAcquireEffectLease).not.toHaveBeenCalled();
+    });
+
+    test.each(['sent', 'delivery_unknown'])(
+      'Resume before Telegram %s ACK settles the original permit once',
+      async (status) => {
+        fixture.row = {
+          ...fixture.row,
+          surface: 'telegram',
+          telegramChatId: 'chat-attention',
+          workerCompletionBindings: fixture.presentation.bindings,
+          workerCompletionPresentation: null,
+        };
+        const permit = await authorize();
+        currentWork.externalState = 'running';
+        const input = {
+          deliveryId: fixture.row.deliveryId,
+          claimId: fixture.row.claimId,
+          userId: fixture.row.userId,
+          dispatchPermit: permit,
+          telegramMessageIds: ['101', '102'],
+        };
+        const settle =
+          status === 'sent'
+            ? markGlassHiveCallbackDeliverySent
+            : markGlassHiveCallbackDeliveryUnknown;
+        expect(
+          await settle({ ...input, dispatchPermit: { ...permit, permitId: 'f'.repeat(32) } }),
+        ).toBeNull();
+        expect(await settle(input)).toMatchObject({ status });
+        expect(mockUpdateOne).toHaveBeenCalledWith(
+          expect.objectContaining({ dispatchPermitId: permit.permitId }),
+          expect.objectContaining({
+            $addToSet: { telegramSentMessageIds: { $each: ['101', '102'] } },
+          }),
+        );
+        mockFindOne.mockReturnValue(leanResult(null));
+        mockFindOneAndUpdate.mockReturnValue(leanResult(null));
+        expect(await settle(input)).toBeNull();
+        expect(mockAcquireEffectLease).not.toHaveBeenCalled();
+      },
+    );
+
+    test('a resumed work invalidates the existing permit at resolution and renewal', async () => {
+      const permit = await authorize();
+      currentWork.externalState = 'running';
+      expect(
+        await resolveGlassHiveVoicePresentation({
+          deliveryId: fixture.row.deliveryId,
+          claimId: fixture.row.claimId,
+          userId: fixture.row.userId,
+          voiceCallSessionId: fixture.row.voiceCallSessionId,
+          conversationId: fixture.row.conversationId,
+          dispatchPermit: permit,
+          presentationRef: fixture.presentation.presentationRef,
+          turnId: fixture.presentation.turnId,
+        }),
+      ).toBeNull();
+      expect(
+        await renewGlassHiveCallbackDeliveryDispatch({
+          deliveryId: fixture.row.deliveryId,
+          claimId: fixture.row.claimId,
+          dispatchPermit: permit,
+          userId: fixture.row.userId,
+          voiceCallSessionId: fixture.row.voiceCallSessionId,
+        }),
+      ).toBeNull();
+    });
+    test('ended Call settles the exact issued response without claiming audio completed', async () => {
+      const permit = await authorize();
+      expect(
+        await markGlassHiveCallbackDeliveryUnknown({
+          deliveryId: fixture.row.deliveryId,
+          claimId: fixture.row.claimId,
+          dispatchPermit: permit,
+          userId: fixture.row.userId,
+          voiceCallSessionId: fixture.row.voiceCallSessionId,
+          reason: 'call_ended',
+        }),
+      ).not.toBeNull();
+      expect(fixture.row.workerCompletionAudioCompletedAt).toBeUndefined();
+    });
+  });
+
   test('successful terminal evidence waits for Main adjudication instead of direct surface delivery', async () => {
     mockFindOneAndUpdate.mockImplementation((_query, update) =>
       leanResult({
@@ -531,45 +1039,69 @@ describe('GlassHiveCallbackDeliveryService', () => {
       },
       text: 'Here is the result.',
     });
-    expect(mockFindOneAndUpdate.mock.calls[0][1].$set.attachments).toEqual(attachments);
+    expect(mockFindOneAndUpdate.mock.calls[0][1].$setOnInsert.attachments).toEqual(attachments);
     expect(result.deliveries[0].attachments).toEqual(attachments);
     expect(result.deliveries[0].text).toBe('Here is the result.');
   });
 
-  test('immediate neutral attention status never falls back to raw callback full_message text', async () => {
-    mockFindOneAndUpdate.mockImplementation((_query, update) =>
-      leanResult({ ...update.$setOnInsert, ...update.$set }),
-    );
-    await enqueueGlassHiveCallbackDelivery({
-      body: {
-        callback_id: 'cb_failed',
-        event: 'run.failed',
-        full_message: `Created ${syntheticLocalPath('private', 'report.md')}`,
-      },
-      deliveryContext: {
-        ownerId: 'user_1',
-        conversationId: 'conv_1',
-        anchorMessageId: 'msg_anchor',
-        destinations: [
-          { surface: 'telegram', telegramChatId: 'chat_1', telegramUserId: 'telegram_user_1' },
-        ],
-      },
-      message: {
-        messageId: 'msg_callback',
-        text: 'Mission needs attention.',
-        metadata: { viventium: { callbackKey: 'safe_key' } },
-      },
-      text: 'Mission needs attention.',
-      fullText: '',
-    });
+  test.each(['run.completed', 'run.failed', 'run.cancelled', 'run.interrupted'])(
+    'keeps raw %s lifecycle prose out of conversation delivery',
+    async (event) => {
+      const result = await enqueueGlassHiveCallbackDelivery({
+        body: { callback_id: 'callback-state', event, full_message: 'Internal evidence.' },
+        deliveryContext: {
+          ownerId: 'owner',
+          conversationId: 'conversation',
+          destinations: [{ surface: 'telegram', telegramChatId: 'chat' }],
+        },
+        message: { messageId: 'callback-message', text: 'Internal status.' },
+        text: 'Internal status.',
+      });
+      expect(result).toMatchObject({ enqueued: 0, deferredToMain: true });
+      expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+    },
+  );
 
-    const update = mockFindOneAndUpdate.mock.calls[0][1];
-    expect(update.$set.fullText).toBe('');
-    expect(update.$setOnInsert.telegramChatId).toBe('chat_1');
-    expect(JSON.stringify(update)).not.toContain(syntheticLocalPath());
+  test('Main presentation identity excludes raw callback rows and cannot rewrite a sent receipt', async () => {
+    const rows = new Map();
+    const rawKey = `owner:origin:telegram:${canonicalCallbackRef('same-callback')}`;
+    rows.set(rawKey, { deliveryKey: rawKey, status: 'sent', text: 'Internal state.' });
+    mockFindOneAndUpdate.mockImplementation((filter, update) => {
+      expect(filter).toEqual({ deliveryKey: expect.any(String) });
+      const key = filter.deliveryKey;
+      if (!rows.has(key)) rows.set(key, { ...update.$setOnInsert });
+      return leanResult({ ...rows.get(key) });
+    });
+    const input = {
+      body: { callback_id: 'same-callback', event: 'main.followup' },
+      deliveryContext: {
+        ownerId: 'owner',
+        originRef: 'origin',
+        conversationId: 'conversation',
+        destinations: [{ surface: 'telegram', telegramChatId: 'chat' }],
+      },
+      message: { messageId: 'main-one', text: 'Useful result.' },
+      text: 'Useful result.',
+    };
+    const first = await enqueueGlassHiveCallbackDelivery(input);
+    const firstRow = rows.get(mockFindOneAndUpdate.mock.calls[0][0].deliveryKey);
+    firstRow.status = 'sent';
+    const replay = await enqueueGlassHiveCallbackDelivery({
+      ...input,
+      text: 'Changed replay prose.',
+    });
+    expect(replay.deliveries[0]).toMatchObject({ status: 'sent', text: 'Useful result.' });
+    const later = await enqueueGlassHiveCallbackDelivery({
+      ...input,
+      message: { messageId: 'main-two', text: 'Another useful result.' },
+      text: 'Another useful result.',
+    });
+    expect(later.deliveries[0].deliveryId).not.toBe(first.deliveries[0].deliveryId);
+    expect(rows.get(rawKey)).toMatchObject({ status: 'sent', text: 'Internal state.' });
+    expect(rows.size).toBe(3);
   });
 
-  test.each(['run.needs_input', 'run.blocked'])(
+  test.each(['run.needs_input', 'run.blocked', 'checkpoint.ready', 'takeover.requested'])(
     'delivers %s immediately to the trusted Telegram destination',
     async (event) => {
       mockFindOneAndUpdate.mockImplementation((_query, update) =>
@@ -824,7 +1356,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
       text: 'Mission completed.',
     });
 
-    expect(result).toEqual({ configured: 0, enqueued: 0, unresolved: 0, deliveries: [] });
+    expect(result).toMatchObject({ configured: 0, enqueued: 0, unresolved: 0, deliveries: [] });
     expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
   });
 
@@ -967,37 +1499,13 @@ describe('GlassHiveCallbackDeliveryService', () => {
 
     const firstFilter = mockFindOneAndUpdate.mock.calls[0][0];
     const secondFilter = mockFindOneAndUpdate.mock.calls[1][0];
-    const firstKey = firstFilter.$or[0].deliveryKey;
-    const secondKey = secondFilter.$or[0].deliveryKey;
-    expect(firstKey).not.toBe(secondKey);
-    expect(firstKey).toContain(
-      `owner_a:ghi_owner_a_origin:telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
-    );
-    expect(secondKey).toContain(
-      `owner_b:ghi_owner_b_origin:telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
-    );
-    expect(firstFilter.$or[1]).toEqual({
-      deliveryKey: `owner_a:ghi_owner_a_origin:telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
-      userId: 'owner_a',
-      originRef: 'ghi_owner_a_origin',
+    expect(firstFilter).toEqual({
+      deliveryKey: 'owner_a:ghi_owner_a_origin:telegram:main:msg_main_followup',
     });
-    expect(secondFilter.$or[1]).toEqual({
-      deliveryKey: `owner_b:ghi_owner_b_origin:telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
-      userId: 'owner_b',
-      originRef: 'ghi_owner_b_origin',
+    expect(secondFilter).toEqual({
+      deliveryKey: 'owner_b:ghi_owner_b_origin:telegram:main:msg_main_followup',
     });
-    expect(firstFilter.$or[2]).toEqual(
-      expect.objectContaining({
-        deliveryKey: `telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
-        userId: 'owner_a',
-      }),
-    );
-    expect(secondFilter.$or[2]).toEqual(
-      expect.objectContaining({
-        deliveryKey: `telegram:${canonicalCallbackRef('cb_shared_vendor_id')}`,
-        userId: 'owner_b',
-      }),
-    );
+    expect(firstFilter.deliveryKey).not.toBe(secondFilter.deliveryKey);
   });
 
   test('carries one canonical callback ref and exact attempt from enqueue through trace evidence', async () => {
@@ -1010,7 +1518,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
       body: {
         callback_id: 'raw-failed-callback',
         attempt_number: 3,
-        event: 'run.failed',
+        event: 'main.followup',
         run_id: 'run-exact',
         work_ref: 'work-exact',
       },
@@ -1020,6 +1528,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
         workRef: 'work-exact',
         conversationId: 'conversation-exact',
         traceIdentity: { callbackRef, attemptNumber: 3 },
+        traceCallbackEvent: 'run.failed',
         destinations: [{ surface: 'telegram', telegramChatId: 'chat-exact' }],
       },
       message: { messageId: 'message-exact', text: 'Mission failed.' },
@@ -1054,7 +1563,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
       body: {
         callback_id: 'raw-upgrade-callback',
         attempt_number: 4,
-        event: 'run.failed',
+        event: 'run.blocked',
         origin_ref: 'origin-upgrade',
         work_ref: 'work-upgrade',
       },
@@ -1094,7 +1603,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
       body: {
         callback_id: 'raw-pre-runtime-stop',
         attempt_number: null,
-        event: 'run.cancelled',
+        event: 'main.followup',
         run_id: 'run-pre-runtime-stop',
         work_ref: 'work-pre-runtime-stop',
       },
@@ -1104,6 +1613,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
         workRef: 'work-pre-runtime-stop',
         conversationId: 'conversation-pre-runtime-stop',
         traceIdentity: { callbackRef, attemptNumber: null },
+        traceCallbackEvent: 'run.cancelled',
         destinations: [{ surface: 'telegram', telegramChatId: 'chat-pre-runtime-stop' }],
       },
       message: { messageId: 'message-pre-runtime-stop', text: 'Mission stopped.' },
@@ -1983,6 +2493,69 @@ describe('GlassHiveCallbackDeliveryService', () => {
     expect(update.$set.leaseExpiresAt.getTime()).toBeGreaterThan(Date.now() + 9 * 60 * 1000);
   });
 
+  test.each([false, true])(
+    'Telegram claim carries the same saved native source, text mismatch=%s',
+    async (changed) => {
+      const text = 'Read-first 🧠.\nUseful spoken result.';
+      const disposition = {
+        version: 1,
+        audio: 'eligible',
+        required: true,
+        valid: true,
+        source: 'model',
+      };
+      const content = [
+        {
+          type: 'text',
+          text,
+          deliveryDispositionRanges: [{ start: 0, end: text.length, disposition }],
+        },
+      ];
+      const row = {
+        deliveryId: 'ghcd_source',
+        callbackId: 'cb_source',
+        callbackMessageId: 'msg-source',
+        userId: 'owner-source',
+        conversationId: 'conv-source',
+        event: 'run.completed',
+        surface: 'telegram',
+        status: 'pending',
+        text: changed ? 'Changed presentation.' : text,
+        claimId: 'claim-source',
+      };
+      mockFindOne.mockReturnValueOnce(leanResult(row));
+      mockFindOneAndUpdate.mockReturnValueOnce(leanResult({ ...row, status: 'claimed' }));
+      mockMessageFindOne.mockReturnValueOnce(
+        leanResult({
+          text,
+          content,
+          metadata: { viventium: { deliveryDisposition: disposition } },
+        }),
+      );
+      const claimed = await claimPendingGlassHiveCallbackDeliveries({
+        surface: 'telegram',
+        limit: 1,
+      });
+      expect(claimed[0].deliveryControls).toEqual({
+        deliveryDisposition: disposition,
+        audioContent: changed ? [] : content,
+        sourceTextSha256: require('node:crypto')
+          .createHash('sha256')
+          .update(row.text)
+          .digest('hex'),
+      });
+      expect(claimed[0].text).toBe(row.text);
+      expect(mockMessageFindOne).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user: 'owner-source',
+          conversationId: 'conv-source',
+          messageId: 'msg-source',
+          isCreatedByUser: false,
+        }),
+      );
+    },
+  );
+
   test('claim projects the exact retained native attention identity and signed topic without private form data', async () => {
     const binding = {
       version: 1,
@@ -2388,6 +2961,240 @@ describe('GlassHiveCallbackDeliveryService', () => {
       expect(mockRegisterDeliveryPresentation).not.toHaveBeenCalled();
     },
   );
+  test.each([
+    ['sent', 'sent'],
+    ['delivery_unknown', 'unknown'],
+    ['failed', 'failed'],
+    ['suppressed', 'suppressed'],
+  ])('recovers every signed aggregate member from legacy %s projection', async (status, state) => {
+    const { row, bindings } = workerCompletionFixture();
+    row.status = status;
+    row.projectionAppliedAt = new Date();
+    row.projectionPendingAt = null;
+    row.workerCompletionEffectLeases = [];
+    mockFindDeliveries
+      .mockReturnValueOnce(leanResult([row]))
+      .mockReturnValue(leanResult([{ status }]));
+    mockMessageFindOne.mockReturnValue(
+      leanResult({ messageId: row.callbackMessageId, text: row.text }),
+    );
+    mockFindTerminalCallbackResult.mockImplementation((query) => leanResult({ _id: query._id }));
+    expect(await reconcileGlassHiveSurfaceDeliveryProjections()).toMatchObject({ projected: 1 });
+    expect(mockFindDeliveries.mock.calls[0][0].$or).toContainEqual(
+      expect.objectContaining({
+        workerCompletionProjectionAppliedAt: null,
+      }),
+    );
+    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledTimes(2);
+    for (const binding of bindings) {
+      expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith(
+        expect.objectContaining({
+          originRef: binding.originRef,
+          state,
+          workerCompletion: {
+            ownerId: row.userId,
+            responseMessageId: row.callbackMessageId,
+            binding,
+          },
+          effectSession: expect.any(Object),
+        }),
+      );
+      expect(mockTerminalCallbackResultUpdateOne).toHaveBeenCalledWith(
+        expect.objectContaining({
+          _id: binding.resultKey,
+          acceptedOperationId: binding.acceptedOperationId,
+        }),
+        expect.any(Object),
+        expect.any(Object),
+      );
+    }
+    expect(mockUpdateOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deliveryId: row.deliveryId,
+        status,
+      }),
+      { $set: { workerCompletionProjectionAppliedAt: expect.any(Date) } },
+      expect.any(Object),
+    );
+    expect(mockRegisterDeliveryPresentation).not.toHaveBeenCalled();
+    expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  test.each(['changed-response', 'superseded-member'])(
+    'aggregate recovery rejects %s without projecting either member',
+    async (fault) => {
+      const { row, bindings } = workerCompletionFixture();
+      row.status = 'sent';
+      row.projectionPendingAt = new Date();
+      mockFindDeliveries.mockReturnValueOnce(leanResult([row]));
+      mockMessageFindOne.mockReturnValue(
+        leanResult({
+          messageId: row.callbackMessageId,
+          text: fault === 'changed-response' ? 'Changed.' : row.text,
+        }),
+      );
+      mockFindTerminalCallbackResult.mockImplementation((query) =>
+        leanResult(query._id === bindings[1].resultKey ? null : { _id: query._id }),
+      );
+      expect(await reconcileGlassHiveSurfaceDeliveryProjections()).toMatchObject({ pending: 1 });
+      expect(mockRecordGlassHiveSurfaceDeliveryOutcome).not.toHaveBeenCalled();
+      expect(mockUpdateOne).not.toHaveBeenCalledWith(
+        expect.anything(),
+        { $set: { workerCompletionProjectionAppliedAt: expect.any(Date) } },
+        expect.anything(),
+      );
+    },
+  );
+
+  test('retains a historical sent member after its exact accepted result advances', async () => {
+    const { row, bindings } = workerCompletionFixture();
+    row.status = 'sent';
+    row.projectionAppliedAt = new Date();
+    mockFindDeliveries
+      .mockReturnValueOnce(leanResult([row]))
+      .mockReturnValue(leanResult([{ status: 'sent' }]));
+    mockMessageFindOne.mockReturnValue(
+      leanResult({ messageId: row.callbackMessageId, text: row.text }),
+    );
+    mockFindTerminalCallbackResult.mockImplementation((query) =>
+      leanResult(query._id === bindings[1].resultKey && !query.$or ? null : { _id: query._id }),
+    );
+    expect(await reconcileGlassHiveSurfaceDeliveryProjections()).toMatchObject({
+      projected: 1,
+      pending: 0,
+    });
+    expect(
+      mockRecordGlassHiveSurfaceDeliveryOutcome.mock.calls.map(([input]) => input.originRef),
+    ).toEqual([bindings[0].originRef]);
+    expect(mockUpdateOne).toHaveBeenCalledWith(
+      expect.objectContaining({ deliveryId: row.deliveryId }),
+      { $set: { workerCompletionProjectionAppliedAt: expect.any(Date) } },
+      expect.any(Object),
+    );
+    expect(mockRegisterDeliveryPresentation).not.toHaveBeenCalled();
+  });
+
+  test('a member accepted-operation race aborts all aggregate projection effects', async () => {
+    const diagnostics = completionDiagnosticFixture('healthy');
+    const { row, bindings } = workerCompletionFixture();
+    row.status = 'sent';
+    row.projectionPendingAt = new Date();
+    mockFindDeliveries
+      .mockReturnValueOnce(leanResult([row]))
+      .mockReturnValue(leanResult([{ status: 'sent' }]));
+    mockMessageFindOne.mockReturnValue(
+      leanResult({ messageId: row.callbackMessageId, text: row.text }),
+    );
+    mockFindTerminalCallbackResult.mockImplementation((query) => leanResult({ _id: query._id }));
+    mockTerminalCallbackResultUpdateOne.mockImplementation((query) => ({
+      exec: async () => ({ matchedCount: query._id === bindings[1].resultKey ? 0 : 1 }),
+    }));
+    expect(await reconcileGlassHiveSurfaceDeliveryProjections()).toMatchObject({ pending: 1 });
+    expect(diagnostics.session.abortTransaction).toHaveBeenCalledTimes(1);
+    expect(diagnostics.session.commitTransaction).not.toHaveBeenCalled();
+    expect(mockUpdateOne).not.toHaveBeenCalledWith(
+      expect.anything(),
+      { $set: { workerCompletionProjectionAppliedAt: expect.any(Date) } },
+      expect.anything(),
+    );
+    expect(mockRegisterDeliveryPresentation).not.toHaveBeenCalled();
+  });
+
+  test('retains the exact generic aggregate bindings in one Telegram delivery', async () => {
+    const { row, bindings } = workerCompletionFixture();
+    const representative = bindings[0];
+    mockFindTerminalCallbackResult.mockImplementation((query) => {
+      const binding = bindings.find((item) => item.resultKey === query._id) || representative;
+      return leanResult({
+        _id: binding.resultKey,
+        callbackId: binding.terminalCallbackId,
+        resultDigest: binding.resultDigest,
+        resultRevision: binding.resultRevision,
+        acceptedOperationId: binding.acceptedOperationId,
+        acceptedOperationGeneration: binding.effectGeneration,
+        resultState: 'completed',
+      });
+    });
+    mockMessageFindOne.mockReturnValue(
+      leanResult({ messageId: row.callbackMessageId, text: row.text }),
+    );
+    mockFindOneAndUpdate.mockImplementation((_filter, update) => leanResult(update.$setOnInsert));
+    const summary = await enqueueGlassHiveCallbackDelivery({
+      body: {
+        event: 'main.followup',
+        callback_id: representative.terminalCallbackId,
+        attempt_number: 1,
+        worker_id: representative.workerId,
+        run_id: representative.runId,
+      },
+      deliveryContext: {
+        ownerId: row.userId,
+        conversationId: row.conversationId,
+        originRef: representative.originRef,
+        workRef: representative.workRef,
+        traceIdentity: { callbackRef: representative.callbackRef, attemptNumber: 1 },
+        traceCallbackEvent: 'run.completed',
+        workerCompletionBindings: bindings,
+        destinations: [{ surface: 'telegram', telegramChatId: 'synthetic-chat' }],
+      },
+      message: { messageId: row.callbackMessageId, text: row.text },
+    });
+    expect(summary.enqueued).toBe(1);
+    expect(mockFindOneAndUpdate).toHaveBeenCalledTimes(1);
+    const persisted = mockFindOneAndUpdate.mock.calls[0][1].$setOnInsert;
+    expect(persisted.workerCompletionBindings).toEqual(bindings);
+    mockFindDeliveries.mockReturnValueOnce(leanResult([persisted]));
+    await reconcileGlassHiveSurfaceDeliveryProjections();
+    expect(
+      mockRecordGlassHiveSurfaceDeliveryOutcome.mock.calls.map(([input]) => input.originRef),
+    ).toEqual(bindings.map((binding) => binding.originRef));
+  });
+
+  test.each(['telegram', 'librechat'])(
+    'projects exact authored aggregate members on %s',
+    async (surface) => {
+      const { row, bindings } = workerCompletionFixture();
+      row.surface = surface;
+      row.status = 'sent';
+      row.projectionPendingAt = new Date();
+      row.workerCompletionBindings = bindings;
+      delete row.workerCompletionPresentation;
+      mockFindDeliveries
+        .mockReturnValueOnce(leanResult([row]))
+        .mockReturnValue(leanResult([{ status: 'sent' }]));
+      mockMessageFindOne.mockReturnValue(
+        leanResult({ messageId: row.callbackMessageId, text: row.text }),
+      );
+      mockFindTerminalCallbackResult.mockImplementation((query) => leanResult({ _id: query._id }));
+      expect(await reconcileGlassHiveSurfaceDeliveryProjections()).toMatchObject({ projected: 1 });
+      expect(
+        mockRecordGlassHiveSurfaceDeliveryOutcome.mock.calls.map(([input]) => input.originRef),
+      ).toEqual(bindings.map((binding) => binding.originRef));
+      expect(mockRegisterDeliveryPresentation).not.toHaveBeenCalled();
+    },
+  );
+
+  test('aggregate member projection retains unresolved sibling surface precedence', async () => {
+    const { row, bindings } = workerCompletionFixture();
+    row.status = 'sent';
+    row.projectionPendingAt = new Date();
+    mockFindDeliveries
+      .mockReturnValueOnce(leanResult([row]))
+      .mockReturnValueOnce(leanResult([{ status: 'sent' }]))
+      .mockReturnValueOnce(leanResult([{ status: 'sent' }, { status: 'unresolved' }]));
+    mockMessageFindOne.mockReturnValue(
+      leanResult({ messageId: row.callbackMessageId, text: row.text }),
+    );
+    mockFindTerminalCallbackResult.mockImplementation((query) => leanResult({ _id: query._id }));
+    await reconcileGlassHiveSurfaceDeliveryProjections();
+    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        originRef: bindings[1].originRef,
+        state: 'unresolved',
+      }),
+    );
+  });
+
   test('retries a durable Core projection without requiring a GlassHive callback replay', async () => {
     const pendingProjection = {
       deliveryId: 'ghcd_projection_retry',
@@ -2509,6 +3316,87 @@ describe('GlassHiveCallbackDeliveryService', () => {
     expect(JSON.stringify(failedUpdate)).not.toContain('raw-token');
     expect(JSON.stringify(suppressedUpdate)).not.toContain('raw-token');
   });
+
+  test('claim query retires pre-upgrade lifecycle prose but preserves Main and native input', async () => {
+    const { MongoMemoryServer } = require('mongodb-memory-server');
+    const { MongoClient } = require('mongodb');
+    const server = await MongoMemoryServer.create();
+    const client = new MongoClient(server.getUri());
+    try {
+      await client.connect();
+      const collection = client.db('delivery_claim_contract').collection('deliveries');
+      const common = {
+        surface: 'telegram',
+        status: 'pending',
+        leaseExpiresAt: null,
+        originRef: 'shared-origin',
+      };
+      await collection.insertMany([
+        {
+          ...common,
+          deliveryId: 'raw-completed',
+          event: 'run.completed',
+          callbackKey: 'raw-replay-a',
+        },
+        { ...common, deliveryId: 'raw-failed', event: 'run.failed', callbackKey: 'raw-replay-b' },
+        {
+          ...common,
+          deliveryId: 'main-new',
+          event: 'run.completed',
+          callbackKey: 'source-replay',
+          presentationKind: 'main',
+        },
+        { ...common, deliveryId: 'main-legacy', event: 'run.completed', callbackKey: '' },
+        {
+          ...common,
+          deliveryId: 'native-input',
+          event: 'run.needs_input',
+          callbackKey: 'raw-replay-c',
+        },
+        {
+          ...common,
+          deliveryId: 'other-surface',
+          surface: 'voice',
+          event: 'run.completed',
+          callbackKey: '',
+          presentationKind: 'main',
+        },
+      ]);
+      mockFindOne.mockReturnValueOnce(leanResult(null));
+      await claimPendingGlassHiveCallbackDeliveries({ surface: 'telegram', limit: 1 });
+      const filter = mockFindOne.mock.calls[0][0];
+      const rows = await collection.find(filter).toArray();
+      expect(rows.map((row) => row.deliveryId).sort()).toEqual([
+        'main-legacy',
+        'main-new',
+        'native-input',
+      ]);
+      await collection.updateMany(
+        { deliveryId: { $in: ['main-legacy', 'main-new', 'native-input', 'other-surface'] } },
+        { $set: { status: 'sent' } },
+      );
+      mockFindOneAndUpdate.mockReturnValueOnce(
+        leanResult({
+          deliveryId: 'main-new',
+          originRef: 'shared-origin',
+          surface: 'telegram',
+          event: 'main.followup',
+          presentationKind: 'main',
+          status: 'sent',
+        }),
+      );
+      mockFindDeliveries.mockImplementation((query) => ({
+        lean: () => collection.find(query).toArray(),
+      }));
+      await markGlassHiveCallbackDeliverySent({ deliveryId: 'main-new', claimId: 'claim-main' });
+      expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenLastCalledWith(
+        expect.objectContaining({ originRef: 'shared-origin', state: 'sent' }),
+      );
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  }, 30000);
 
   test('voice delivery claim and mark can be scoped to user and call session', async () => {
     mockFindOne.mockReturnValueOnce(
@@ -2772,6 +3660,10 @@ describe('GlassHiveCallbackDeliveryService', () => {
         Object.assign(row, update.$set || {});
         return leanResult({ ...row });
       });
+      mockMessageFindOne.mockReturnValue(
+        leanResult({ messageId: row.callbackMessageId, text: row.text }),
+      );
+      mockFindTerminalCallbackResult.mockImplementation((query) => leanResult({ _id: query._id }));
       return { f, row };
     }
     test('failed interrupted receipt followed by expiry quarantines issued aggregate without another permit', async () => {
@@ -2849,5 +3741,160 @@ describe('GlassHiveCallbackDeliveryService', () => {
         expect(mockReleaseEffectLease).not.toHaveBeenCalled();
       },
     );
+  });
+
+  describe('replayable persisted claims retain exact delivery fences', () => {
+    const fence = require('../GlassHiveCallbackBindingService').fenceGlassHiveCallbackRunState;
+    beforeEach(() => fence.mockReset().mockResolvedValue(null));
+    afterEach(() => fence.mockReset().mockResolvedValue(null));
+    function fixture(surface = 'voice') {
+      const { AsyncLocalStorage } = require('async_hooks');
+      const { createGlassHiveTerminalCallbackTransactionService } = require('@librechat/api');
+      const storage = new AsyncLocalStorage();
+      const sessions = [];
+      mockTerminalTransactionService = createGlassHiveTerminalCallbackTransactionService({
+        transactionAsyncLocalStorage: storage,
+        set: jest.fn(),
+        startSession: async () => {
+          let active = false;
+          const session = {
+            inTransaction: () => active,
+            startTransaction: jest.fn(() => {
+              active = true;
+            }),
+            commitTransaction: jest.fn(async () => {
+              active = false;
+            }),
+            abortTransaction: jest.fn(async () => {
+              active = false;
+            }),
+            endSession: jest.fn(async () => {}),
+            withTransaction: jest.fn(async (operation) => {
+              for (let attempt = 0; attempt < 2; attempt++) {
+                active = true;
+                try {
+                  const result = await operation();
+                  active = false;
+                  return result;
+                } catch (error) {
+                  active = false;
+                  if (attempt || !error?.hasErrorLabel?.('TransientTransactionError')) throw error;
+                }
+              }
+            }),
+          };
+          sessions.push(session);
+          return session;
+        },
+      });
+      const row = {
+        deliveryId: 'delivery-causal',
+        callbackId: 'callback-causal',
+        userId: 'owner-causal',
+        conversationId: 'conversation-causal',
+        voiceCallSessionId: surface === 'voice' ? 'call-causal' : '',
+        surface,
+        event: 'run.needs_input',
+        originRef: 'origin-causal',
+        workRef: 'work-causal',
+        workerId: 'worker-causal',
+        runId: 'run-causal',
+        status: 'pending',
+        text: 'Which shape?',
+        claimId: '',
+      };
+      mockFindOne.mockReturnValue(leanResult(row));
+      const write = jest.fn((_filter, update, options) => {
+        expect((options.session || storage.getStore()?.session).inTransaction()).toBe(true);
+        return leanResult({ ...row, ...update.$set });
+      });
+      mockFindOneAndUpdate.mockImplementation(write);
+      return {
+        row,
+        write,
+        sessions,
+        scope: {
+          surface,
+          limit: 1,
+          callbackId: row.callbackId,
+          userId: row.userId,
+          voiceCallSessionId: row.voiceCallSessionId,
+        },
+      };
+    }
+    function conflict() {
+      return Object.assign(new Error('synthetic write conflict'), {
+        code: 112,
+        hasErrorLabel: (label) => label === 'TransientTransactionError',
+      });
+    }
+    test.each(['voice', 'telegram'])(
+      '%s claim retries transient DB conflict with the same scope and claim',
+      async (surface) => {
+        const f = fixture(surface);
+        mockFindOneAndUpdate.mockImplementationOnce(() => ({
+          lean: async () => {
+            throw conflict();
+          },
+        }));
+        const claimed = await claimPendingGlassHiveCallbackDeliveries(f.scope);
+        expect(claimed).toHaveLength(1);
+        const calls = mockFindOneAndUpdate.mock.calls;
+        expect(calls).toHaveLength(2);
+        expect(calls[0][0]).toEqual(calls[1][0]);
+        expect(calls[0][1]).toEqual(calls[1][1]);
+        expect(calls[0][2].session).toBeTruthy();
+        expect(calls[0][2].session).toBe(calls[1][2].session);
+        expect(fence).toHaveBeenCalledTimes(3); // two claim attempts, then claimed trace.
+        expect(mockRecordTraceDelivery).not.toHaveBeenCalled();
+        expect(mockRecordGlassHiveSurfaceDeliveryOutcome).not.toHaveBeenCalled();
+      },
+    );
+    test('claimed trace conflict replays only the trace DB transaction, not the successful claim', async () => {
+      const f = fixture();
+      fence
+        .mockResolvedValueOnce(null)
+        .mockRejectedValueOnce(conflict())
+        .mockResolvedValueOnce(null);
+      expect(await claimPendingGlassHiveCallbackDeliveries(f.scope)).toHaveLength(1);
+      expect(mockFindOneAndUpdate).toHaveBeenCalledTimes(1);
+      expect(mockRecordTraceDelivery).not.toHaveBeenCalled();
+      expect(fence).toHaveBeenCalledTimes(3);
+      expect(mockRecordGlassHiveSurfaceDeliveryOutcome).not.toHaveBeenCalled();
+    });
+    test('supersession after conflict fences the replay before another claim write', async () => {
+      const f = fixture();
+      mockFindOneAndUpdate.mockImplementationOnce(() => ({
+        lean: async () => {
+          throw conflict();
+        },
+      }));
+      fence.mockResolvedValueOnce(null).mockRejectedValueOnce(
+        Object.assign(new Error('superseded'), {
+          code: 'glasshive_callback_notice_superseded',
+        }),
+      );
+      mockFindOne.mockReturnValueOnce(leanResult(f.row)).mockReturnValue(leanResult(null));
+      expect(await claimPendingGlassHiveCallbackDeliveries(f.scope)).toEqual([]);
+      expect(mockFindOneAndUpdate).toHaveBeenCalledTimes(1);
+      expect(mockRecordTraceDelivery).not.toHaveBeenCalled();
+      expect(mockUpdateOne).toHaveBeenCalledWith(
+        expect.objectContaining({ deliveryId: f.row.deliveryId }),
+        expect.any(Object),
+      );
+    });
+    test('nontransient claim errors propagate without replay or presentation', async () => {
+      const f = fixture();
+      const failure = new Error('synthetic nontransient failure');
+      mockFindOneAndUpdate.mockImplementationOnce(() => ({
+        lean: async () => {
+          throw failure;
+        },
+      }));
+      await expect(claimPendingGlassHiveCallbackDeliveries(f.scope)).rejects.toBe(failure);
+      expect(mockFindOneAndUpdate).toHaveBeenCalledTimes(1);
+      expect(mockRecordTraceDelivery).not.toHaveBeenCalled();
+      expect(mockRecordGlassHiveSurfaceDeliveryOutcome).not.toHaveBeenCalled();
+    });
   });
 });

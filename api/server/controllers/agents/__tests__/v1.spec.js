@@ -99,6 +99,54 @@ describe('duplicateAgent', () => {
     });
   });
 
+  it('rebinds a copied primary graph without changing consultants, models or tools', async () => {
+    const original = {
+      id: 'agent_123',
+      name: 'Synthetic Queen',
+      provider: 'glasshive-harness',
+      model: 'codex-cli:gpt-6.1-sol',
+      model_parameters: { reasoning_effort: 'high' },
+      voice_llm_provider: 'glasshive-harness',
+      voice_llm_model: 'grok-build:grok-4.7-build-fast',
+      voice_llm_model_parameters: { reasoning_effort: 'high' },
+      presentation_policy: 'primary_final',
+      tools: ['synthetic_tool'],
+      edges: [
+        { from: 'agent_123', to: 'consultant', edgeType: 'handoff', description: 'Consult' },
+        { from: 'consultant', to: 'agent_123', edgeType: 'handoff', description: 'Return' },
+        { from: 'consultant', to: 'peer', edgeType: 'direct' },
+      ],
+      agent_ids: ['consultant'],
+    };
+    const before = JSON.stringify(original);
+    getAgent.mockResolvedValue(original);
+    getActions.mockResolvedValue([]);
+    nanoid.mockReturnValue('new_123');
+    createAgent.mockImplementation(async (value) => value);
+
+    await duplicateAgent(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(201);
+    expect(createAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'agent_new_123',
+        presentation_policy: 'primary_final',
+        model: original.model,
+        model_parameters: original.model_parameters,
+        voice_llm_model: original.voice_llm_model,
+        voice_llm_model_parameters: original.voice_llm_model_parameters,
+        tools: original.tools,
+        agent_ids: ['consultant'],
+        edges: [
+          { ...original.edges[0], from: 'agent_new_123' },
+          { ...original.edges[1], to: 'agent_new_123' },
+          original.edges[2],
+        ],
+      }),
+    );
+    expect(JSON.stringify(original)).toBe(before);
+  });
+
   it('should ensure duplicated agent has clean versions array without nested fields', async () => {
     const mockAgent = {
       id: 'agent_123',

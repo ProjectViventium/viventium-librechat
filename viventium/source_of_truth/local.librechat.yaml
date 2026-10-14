@@ -373,7 +373,7 @@ fileConfig:
     - image/png
     - image/gif
     - image/webp
-    - image/svg+xml
+    - ^image/svg\+xml$
     - image/bmp
     - image/tiff
   endpoints:
@@ -427,7 +427,7 @@ fileConfig:
         - image/png
         - image/gif
         - image/webp
-        - image/svg+xml
+        - ^image/svg\+xml$
         - image/bmp
         - image/tiff
         - ^audio/
@@ -482,7 +482,7 @@ fileConfig:
         - image/png
         - image/gif
         - image/webp
-        - image/svg+xml
+        - ^image/svg\+xml$
         - image/bmp
         - image/tiff
         - ^audio/
@@ -537,7 +537,7 @@ fileConfig:
         - image/png
         - image/gif
         - image/webp
-        - image/svg+xml
+        - ^image/svg\+xml$
         - image/bmp
         - image/tiff
         - ^audio/
@@ -592,7 +592,7 @@ fileConfig:
         - image/png
         - image/gif
         - image/webp
-        - image/svg+xml
+        - ^image/svg\+xml$
         - image/bmp
         - image/tiff
         - ^audio/
@@ -646,7 +646,7 @@ fileConfig:
         - image/png
         - image/gif
         - image/webp
-        - image/svg+xml
+        - ^image/svg\+xml$
         - image/bmp
         - image/tiff
         - ^audio/

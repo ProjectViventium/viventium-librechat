@@ -426,8 +426,10 @@ export default function useStepHandler({
           }
         }
       } else if (event === 'on_agent_update') {
-        const { agent_update } = data as Agents.AgentUpdate;
-        let responseMessageId = agent_update.runId || '';
+        /* === VIVENTIUM START === Legacy malformed updates use the existing no-id rejection. */
+        const agent_update = (data as Agents.AgentUpdate)?.agent_update;
+        let responseMessageId = agent_update?.runId || '';
+        /* === VIVENTIUM END === */
         if (responseMessageId === Constants.USE_PRELIM_RESPONSE_MESSAGE_ID) {
           responseMessageId = submission?.initialResponse?.messageId ?? '';
           parentMessageId = submission?.initialResponse?.parentMessageId ?? '';

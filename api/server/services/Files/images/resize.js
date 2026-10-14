@@ -10,10 +10,11 @@ const { EModelEndpoint } = require('librechat-data-provider');
  *                                      'high' for a maximum of 768x2000 resolution,
  *                                      or a custom object with percentage or px values.
  * @param {EModelEndpoint} endpoint - Identifier for specific endpoint handling
+ * @param {string} [outputFormat] - Optional explicit transport format; original format remains the default.
  * @returns {Promise<{buffer: Buffer, width: number, height: number}>} An object containing the resized image buffer and its dimensions.
  * @throws Will throw an error if the resolution parameter is invalid.
  */
-async function resizeImageBuffer(inputBuffer, resolution, endpoint) {
+async function resizeImageBuffer(inputBuffer, resolution, endpoint, outputFormat) {
   const maxLowRes = 512;
   const maxShortSideHighRes = 768;
   const maxLongSideHighRes = endpoint === EModelEndpoint.anthropic ? 1568 : 2000;
@@ -78,7 +79,12 @@ async function resizeImageBuffer(inputBuffer, resolution, endpoint) {
     throw new Error('Invalid resolution parameter');
   }
 
-  const resizedBuffer = await sharp(inputBuffer).rotate().resize(resizeOptions).toBuffer();
+  /* === VIVENTIUM START: Native vision can select a supported format without replacing its raw file. === */
+  const resizedImage = sharp(inputBuffer).rotate().resize(resizeOptions);
+  const resizedBuffer = await (
+    outputFormat ? resizedImage.toFormat(outputFormat) : resizedImage
+  ).toBuffer();
+  /* === VIVENTIUM END === */
 
   const resizedMetadata = await sharp(resizedBuffer).metadata();
   return {

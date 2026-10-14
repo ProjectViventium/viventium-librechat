@@ -63,6 +63,7 @@ export interface TrustedInteractionContext {
   readonly logical_turn_id?: string;
   readonly revision: number;
   readonly source_event_id: string;
+  readonly source_received_at?: number;
   readonly source_order_scope?: string;
   readonly source_sequence?: number;
   readonly source_conversation_generation?: string;
@@ -86,6 +87,7 @@ export interface InteractionContextInput {
   logical_turn_id?: unknown;
   revision?: unknown;
   source_event_id?: unknown;
+  source_received_at?: unknown;
   source_order_scope?: unknown;
   source_sequence?: unknown;
   source_conversation_generation?: unknown;
@@ -121,6 +123,8 @@ export interface InteractionDeliveryPolicyInput {
 }
 
 export interface InteractionFactoryInput {
+  /** Supplied only by authenticated ingress or its retained original receipt. */
+  received_at?: number;
   conversation_id?: unknown;
   source_event_id?: unknown;
 }
@@ -303,6 +307,8 @@ export function normalizeInteractionContext(
     ...(logicalTurnId ? { logical_turn_id: logicalTurnId } : {}),
     revision: Math.max(1, Math.floor(Number(context.revision) || 1)),
     source_event_id: boundedIdentifier(context.source_event_id),
+    ...(Number.isSafeInteger(context.source_received_at) && Number(context.source_received_at) > 0
+      ? { source_received_at: Number(context.source_received_at) } : {}),
     ...(hasSourceOrder
       ? { source_order_scope: sourceOrderScope, source_sequence: sourceSequence }
       : {}),
@@ -366,6 +372,7 @@ export function createWebInteractionContext(
     surface: 'web',
     conversation_id: input.conversation_id,
     source_event_id: input.source_event_id,
+    source_received_at: input.received_at,
   });
 }
 
@@ -378,6 +385,7 @@ export function createTelegramInteractionContext(
     surface: 'telegram',
     conversation_id: input.conversation_id,
     source_event_id: input.source_event_id,
+    source_received_at: input.received_at,
     source_order_scope: input.source_order_scope,
     source_sequence: input.source_sequence,
     reply_context: input.reply_context,
@@ -396,6 +404,7 @@ export function createVoiceInteractionContext(
     surface: 'voice',
     conversation_id: input.conversation_id,
     source_event_id: input.source_event_id,
+    source_received_at: input.received_at,
   });
 }
 
@@ -530,6 +539,24 @@ export function bindReadyInputContinuation(
   return normalized;
 }
 
+/** Restore only the retained ORIGINAL server receipt before source registration. */
+export function bindOriginalInteractionInputReceipt(request: object, receivedAt?: number): TrustedInteractionContext | null {
+  const req = objectKey(request);
+  const current = req ? trustedContexts.get(req) : null;
+  if (!req || !current || current.logical_turn_id) return current || null;
+  const {source_received_at: ignoredReceipt, ...context} = current;
+  const source_segments = current.source_segments?.map((segment) => {
+    if (segment.source_event_id !== current.source_event_id) return segment;
+    const {source_received_at: ignoredSegmentReceipt, ...original} = segment;
+    return {...original, ...(Number.isSafeInteger(receivedAt) && Number(receivedAt) > 0
+      ? {source_received_at:receivedAt} : {})};
+  });
+  const normalized = normalizeInteractionContext({...context, ...(source_segments ? {source_segments} : {}),
+    ...(Number.isSafeInteger(receivedAt) && Number(receivedAt) > 0 ? {source_received_at:receivedAt} : {})});
+  trustedContexts.set(req, normalized);
+  return normalized;
+}
+
 export function bindInteractionSourceSegments(
   request: object | null | undefined,
   text: unknown,
@@ -550,6 +577,7 @@ export function bindInteractionSourceSegments(
   const incoming = values.map((value, sourceIndex) => ({
     source_event_id: current.source_event_id,
     source_index: sourceIndex,
+    ...(current.source_received_at ? { source_received_at: current.source_received_at } : {}),
     ...(current.source_sequence ? { source_sequence: current.source_sequence } : {}),
     ...(sourceMessage ? { source_message_id: sourceMessage.messageId, source_parent_message_id: sourceMessage.parentMessageId, ...(sourceMessage.persisted ? { source_persisted: true } : {}) } : {}),
     text: value,

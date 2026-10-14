@@ -15,6 +15,7 @@ const { Constants } = require('librechat-data-provider');
 const {
   buildMainContinuityHeaders,
   isContextOnlyMainHistory,
+  normalizeMainContextStamp,
   ownedInteractionSources,
   prepareMainContinuityCarrier,
   NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
@@ -284,6 +285,50 @@ function renderMainAttemptFactsAuthorityBlock(facts) {
   ].join('\n');
 }
 
+/** Reserve the existing primary/fallback authority serializer before the final snapshot exists. */
+function mainAttemptFactsAuthorityReserveBytes(req, agent) {
+  const interaction = getTrustedInteractionContext(req) || {};
+  const fallback = agent?.viventiumFallbackLlm || agent?.viventiumFallbackLlmAssignment;
+  const snapshot = {
+    snapshotSha256: '0'.repeat(64),
+    logicalTurnId: String(interaction.logical_turn_id || ''),
+    revision: Number(interaction.revision || 1),
+    routeFacts: {
+      surface: interaction.surface || 'web',
+      primary: mainRouteTargetForAgent(agent),
+      fallback: mainRouteTargetForAgent(fallback),
+    },
+  };
+  const receipts = [
+    {
+      status: 'available',
+      enabled: false,
+      scope: 'conscious_agent',
+      version: Number.MAX_SAFE_INTEGER,
+      snapshotSha256: '0'.repeat(64),
+    },
+    { status: 'unavailable', reason: 'x'.repeat(ROUTE_TOKEN_MAX_LENGTH) },
+  ];
+  return Math.max(
+    ...[agent, fallback || agent].flatMap((route) =>
+      receipts.map((feelingsReceipt) =>
+        Buffer.byteLength(
+          renderMainAttemptFactsAuthorityBlock(
+            buildMainAttemptFactsForAgent({
+              snapshot: { ...snapshot, feelingsReceipt },
+              agent: route,
+              attemptNumber: Number.MAX_SAFE_INTEGER,
+              isFallback: true,
+              fallbackReason: 'x'.repeat(ROUTE_TOKEN_MAX_LENGTH),
+            }),
+          ),
+          'utf8',
+        ),
+      ),
+    ),
+  );
+}
+
 function contentText(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return String(content || '');
@@ -528,15 +573,9 @@ function isSchedulerTransportRow(message) {
 }
 
 function hasCoreMainContextStamp(message) {
-  const stamp = message?.metadata?.viventium?.mainContext;
-  return (
-    stamp?.version === 1 &&
-    ['continuityDomainId', 'contextEpoch', 'stableAuthoritySha256', 'snapshotSha256'].every((key) =>
-      /^[a-f0-9]{64}$/.test(String(stamp?.[key] || '')),
-    ) &&
-    typeof stamp.agentId === 'string' &&
-    Boolean(stamp.agentId)
-  );
+  // The Message owner now stores the captured authored identity rather than a duplicate
+  // snapshot. Reuse that owner's validator; older complete stamps retain the same identity.
+  return normalizeMainContextStamp(message?.metadata?.viventium?.mainContext) !== undefined;
 }
 
 function recoverRetainedTelegramHistory(messages, ownerId, conversationId) {
@@ -735,7 +774,8 @@ function hasUnreconciledMainHistory(messages) {
   return candidates.some((message) => !hasCoreMainContextStamp(message));
 }
 
-function boundVisibleMessageChain(chain, protectUnreconciledHistory) {
+function boundVisibleMessageChain(chain, protectUnreconciledHistory, nativeBodyCarrier = false) {
+  if (nativeBodyCarrier) return chain;
   while (
     chain.length > 1 &&
     Buffer.byteLength(Buffer.from(JSON.stringify(chain), 'utf8').toString('base64'), 'utf8') >
@@ -765,6 +805,7 @@ function visibleMessageChain(
   messages = [],
   protectUnreconciledHistory = false,
   toolCarriers = new Map(),
+  nativeBodyCarrier = false,
 ) {
   const source = (Array.isArray(messages) ? messages : [])
     .filter((message) => {
@@ -799,7 +840,7 @@ function visibleMessageChain(
     .map((message) => String(message.messageId));
   if (
     protectUnreconciledHistory &&
-    (source.length > 128 ||
+    ((!nativeBodyCarrier && source.length > 128) ||
       (source.length > 1 && source.at(-1)?.role !== 'user') ||
       originalIds.some((id) => id.length > 160) ||
       (Array.isArray(messages) ? messages : []).some(
@@ -809,7 +850,11 @@ function visibleMessageChain(
   ) {
     throw unreconciledSourceError();
   }
-  return boundVisibleMessageChain(source.slice(-128), protectUnreconciledHistory);
+  return boundVisibleMessageChain(
+    nativeBodyCarrier ? source : source.slice(-128),
+    protectUnreconciledHistory,
+    nativeBodyCarrier,
+  );
 }
 
 function assertUnreconciledHistoryCarrier(
@@ -958,6 +1003,39 @@ function stableAuthorityDigest(agent) {
       });
 }
 
+/** Conservative positive-only shortcut; false is not a Native rejection or a whole-history size limit. */
+function mainHistoryFitsNativeBody(messages, agent, reservedContextUtf8Bytes = 0) {
+  if (
+    !Array.isArray(messages) ||
+    !Number.isFinite(reservedContextUtf8Bytes) ||
+    reservedContextUtf8Bytes < 0
+  )
+    return false;
+  try {
+    const path = require('node:path');
+    const { _convertMessagesToOpenAIParams } = require(
+      path.join(path.dirname(require.resolve('@librechat/agents')), 'llm/openai/utils/index.cjs'),
+    );
+    if (typeof _convertMessagesToOpenAIParams !== 'function') return false;
+    const selected = prepareMainContinuityCarrier(messages, agent?.useLegacyContent === true);
+    const wire = _convertMessagesToOpenAIParams(selected, String(agent?.model || ''));
+    const instruction = {
+      role: 'system',
+      content: [agent?.instructions, agent?.additional_instructions]
+        .filter(Boolean)
+        .join('\n')
+        .trim(),
+    };
+    return (
+      Buffer.byteLength(JSON.stringify([instruction, ...wire]), 'utf8') +
+        reservedContextUtf8Bytes <=
+      NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
+    );
+  } catch {
+    return false;
+  }
+}
+
 function captureMainContextSnapshot(
   req,
   {
@@ -969,11 +1047,15 @@ function captureMainContextSnapshot(
     routeFacts = {},
     feelingsReceipt,
     protectUnreconciledHistory = false,
+    nativeBodyCarrier = false,
     historyAncestry,
   } = {},
 ) {
   if (!req || typeof req !== 'object') return null;
   if (req[SNAPSHOT_SLOT]) return req[SNAPSHOT_SLOT];
+  nativeBodyCarrier =
+    nativeBodyCarrier === true &&
+    Boolean(agent?.model_parameters?.configuration?.defaultHeaders?.['X-GlassHive-Agent-Id']);
   const interaction = getTrustedInteractionContext(req) || {};
   const ownerId = String(req.user?.id || '');
   const agentId = String(agent?.id || '');
@@ -1000,7 +1082,12 @@ function captureMainContextSnapshot(
     ? formattedToolHistoryCarriers(visibleMessages || [], agent)
     : new Map();
   const conversationId = String(interaction.conversation_id || req.body?.conversationId || '');
-  let chain = visibleMessageChain(visibleMessages, protectUnreconciledHistory, toolCarriers);
+  let chain = visibleMessageChain(
+    visibleMessages,
+    protectUnreconciledHistory,
+    toolCarriers,
+    nativeBodyCarrier,
+  );
   const omittedBlankIds = new Set(
     (visibleMessages || [])
       .filter(
@@ -1044,7 +1131,7 @@ function captureMainContextSnapshot(
           : messageContentText(projected[0]);
         toolCarriers.set(carrier.sourceMessage, { ...carrier.source, text });
       }
-      chain = visibleMessageChain(visibleMessages, true, toolCarriers);
+      chain = visibleMessageChain(visibleMessages, true, toolCarriers, nativeBodyCarrier);
     }
     // Omitted empty text retains its ancestry and attachment authority. The native digest
     // manifest contains only rows carried by the selected provider formatter.
@@ -1104,7 +1191,7 @@ function captureMainContextSnapshot(
   });
   // Current-input digests and flags are added after the first budget check. Bound that final
   // ordinary manifest again; the complete model payload and required source rows stay intact.
-  chain = boundVisibleMessageChain(chain, protectUnreconciledHistory);
+  chain = boundVisibleMessageChain(chain, protectUnreconciledHistory, nativeBodyCarrier);
   const body = {
     version: 1,
     ownerId,
@@ -1570,6 +1657,7 @@ function getMainContextAttemptState(req) {
 
 module.exports = {
   applyMainContextAttempt,
+  mainHistoryFitsNativeBody,
   attachMainContextSnapshotMetadata,
   bindMainContextSnapshot,
   buildMainAttemptFactsForAgent,
@@ -1587,6 +1675,7 @@ module.exports = {
   traceMainHistoryAncestry,
   recoverRetainedTelegramHistory,
   renderMainAttemptFactsAuthorityBlock,
+  mainAttemptFactsAuthorityReserveBytes,
   mainRouteTargetForAgent,
   stableAuthorityDigest,
 };

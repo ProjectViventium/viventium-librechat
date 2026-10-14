@@ -18,6 +18,7 @@ const {
 } = require('./BackgroundCortexFollowUpService');
 const {
   isGlassHiveWorkTerminalCallback,
+  fenceGlassHiveCallbackRunState,
   recordGlassHiveAdjudicationOutcome,
 } = require('./GlassHiveCallbackBindingService');
 const { enqueueGlassHiveCallbackDelivery } = require('./GlassHiveCallbackDeliveryService');
@@ -44,6 +45,7 @@ module.exports = createGlassHiveMissionAdjudicationService({
   persistPreparedCortexFollowUpMessage,
   prepareMissionOutputFiles,
   isGlassHiveWorkTerminalCallback,
+  fenceGlassHiveCallbackRunState,
   recordGlassHiveAdjudicationOutcome,
   recordOrchestrationTraceDelivery,
   getActiveCallSessionForConversation,

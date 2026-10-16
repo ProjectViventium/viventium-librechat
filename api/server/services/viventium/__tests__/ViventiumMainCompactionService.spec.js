@@ -2318,6 +2318,242 @@ describe('ViventiumMainCompactionService', () => {
       }
     });
 
+    test('the finite maintenance budget reaches native metadata and leaves time for independent review', async () => {
+      jest.useFakeTimers();
+      jest.setSystemTime(1000);
+      const args = input(voiceRequest());
+      args.trigger = 'accepted_turn';
+      args.foreground = false;
+      args.req.viventiumCallSession = null;
+      args.deadlineAt = new Date(1201000).toISOString();
+      args.executionBudget = { completionReserveMs: 0 };
+      args.req.config.endpoints = {
+        agents: {
+          providerCapabilities: {
+            'synthetic-native': { workspace_binding: true, conversation_session: true },
+          },
+        },
+      };
+      args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+        status: 'renewed',
+        leaseExpiresAt: expiresAt.toISOString(),
+      }));
+      let admitted;
+      const started = new Promise((resolve) => {
+        admitted = resolve;
+      });
+      const calls = [];
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async (params) => {
+        const review = params.agent.id.endsWith('-review');
+        calls.push(params);
+        expect(params.executionTimeoutMs).toBeLessThanOrEqual(240000);
+        const deadline = params.nativeResponseDeadlineAt;
+        expect(Number.isFinite(deadline)).toBe(true);
+        if (!review) {
+          expect(deadline).toBe(946000); //20min minus existing240s review guard and15s grace.
+          expect(
+            await params.onNativeAdmission({
+              requestId: 'producer',
+              responseDeadlineAt: new Date(deadline).toISOString(),
+            }),
+          ).toBe(true);
+          admitted();
+          await new Promise((resolve) => setTimeout(resolve, 700000));
+        } else {
+          expect(deadline).toBe(1186000);
+          expect(
+            await params.onNativeAdmission({
+              requestId: 'reviewer',
+              responseDeadlineAt: new Date(deadline).toISOString(),
+            }),
+          ).toBe(true);
+          await new Promise((resolve) => setTimeout(resolve, 20000));
+        }
+        return { insight: review ? reviewApproved : structured, nativeOwnership: 'ended' };
+      });
+      try {
+        const result = ensureAcceptedMainCompaction(args);
+        await Promise.race([
+          started,
+          result.then(() => {
+            throw new Error('No native producer');
+          }),
+        ]);
+        await jest.advanceTimersByTimeAsync(720000);
+        expect(await result).toMatchObject({ status: 'compacted' });
+        expect(calls).toHaveLength(2);
+        expect(Date.now()).toBeLessThan(1201000);
+        expect(args.completeCompaction).toHaveBeenCalledTimes(1);
+      } finally {
+        execute.mockRestore();
+        jest.useRealTimers();
+      }
+    });
+
+    test.each(['producer', 'producer-clock-race', 'review', 'review-clock-race'])(
+      'exhausted Native %s keeps the acknowledged pre-dispatch repair boundary',
+      async (stage) => {
+        jest.useFakeTimers();
+        jest.setSystemTime(1000);
+        let clock = 1000;
+        const setClock = (value) => {
+          clock = value;
+          jest.setSystemTime(value);
+        };
+        const api = require('@librechat/api');
+        const { logger } = require('@librechat/data-schemas');
+        const args = input(voiceRequest());
+        const outputContract = api.createMainCompactionOutputContract({
+          consumer: 'accepted_core',
+          carrierMaxUtf8Bytes: 131072,
+          reservedUtf8Bytes: 55221,
+        });
+        const draft = { ...JSON.parse(structured), summary: '&'.repeat(16000) };
+        const priorDraft = { ...draft, summary: '&'.repeat(17000) };
+        const issue = api.inspectMainCompactionCarrier(draft, outputContract).issue;
+        const priorIssue = api.inspectMainCompactionCarrier(priorDraft, outputContract).issue;
+        const sizeRepair = api.recordMainCompactionRejection(
+          api.recordMainCompactionRejection(null, priorIssue, 1, priorDraft),
+          issue,
+          2,
+          draft,
+        );
+        const pending = {
+          version: 1,
+          sourceDigest: 'a'.repeat(64),
+          outputContract,
+          contractKey: JSON.stringify({
+            constraints: outputContract,
+            provider: args.agent.provider,
+            model: args.agent.model,
+            effort: 'high',
+          }),
+          semanticAttempts: 2,
+          fidelityRepairAttempts: 0,
+          transportRetries: 1,
+          correction: { code: 'schema_invalid', issue, candidate: JSON.stringify(draft) },
+          sizeRepair,
+        };
+        expect(api.normalizeMainCompactionSizeRepair(pending, outputContract)).not.toBeNull();
+        args.now = () => clock;
+        args.deadlineAt = new Date(301000).toISOString();
+        args.executionBudget = { completionReserveMs: 0 };
+        args.req.viventiumCallSession = null;
+        args.req.config.endpoints = {
+          agents: {
+            providerCapabilities: {
+              'synthetic-native': { workspace_binding: true, conversation_session: true },
+            },
+          },
+        };
+        const originalClaim = args.claimCompaction;
+        args.claimCompaction = jest.fn(async () => {
+          const claim = await originalClaim();
+          if (stage === 'producer') setClock(60000);
+          return {
+            ...claim,
+            outputContract,
+            pendingCompactionRepair: pending,
+            leaseExpiresAt: new Date(301000).toISOString(),
+          };
+        });
+        args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+          status: 'renewed',
+          leaseExpiresAt: expiresAt.toISOString(),
+        }));
+        args.rejectCompaction = jest.fn(async (input) => ({
+          status: 'rejected',
+          repairPending: !!input.pendingCompactionRepair,
+        }));
+        args.inspectCandidateCarrier = jest.fn(() => {
+          if (stage === 'review') setClock(294000);
+          return { ok: true };
+        });
+        const log = jest.spyOn(logger, 'debug').mockImplementation((message, details) => {
+          if (
+            String(message).includes('Stage call issued') &&
+            stage === `${details.stage === 'review' ? 'review' : 'producer'}-clock-race`
+          )
+            setClock(details.stage === 'review' ? 294000 : 60000);
+        });
+        const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async () => ({
+          insight: structured,
+          nativeOwnership: 'ended',
+        }));
+        api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(1000000);
+        try {
+          const result = await ensureAcceptedMainCompaction(args);
+          expect(result).toMatchObject({
+            status: 'degraded',
+            reason:
+              stage === 'review-clock-race'
+                ? 'review_compaction_enclosing_deadline'
+                : 'compaction_enclosing_deadline',
+          });
+          expect(execute).toHaveBeenCalledTimes(stage.startsWith('producer') ? 0 : 1);
+          expect(args.completeCompaction).not.toHaveBeenCalled();
+          const rejected = args.rejectCompaction.mock.calls[0][0];
+          expect(rejected.capacityReleaseAcknowledged).toBe(true);
+          if (stage.startsWith('producer')) {
+            expect(result.repairPending).toBe(true);
+            expect(rejected.pendingCompactionRepair).toMatchObject({
+              semanticAttempts: 2,
+              fidelityRepairAttempts: 0,
+              transportRetries: 1,
+              correction: { candidate: JSON.stringify(draft) },
+              sizeRepair,
+            });
+          } else {
+            // No new fidelity-regeneration allowance or review-only checkpoint is invented.
+            expect(rejected.pendingCompactionRepair).toBeUndefined();
+            expect(rejected).toMatchObject({
+              semanticAttempts: 3,
+              fidelityRepairAttempts: 0,
+              transportRetries: 1,
+            });
+          }
+        } finally {
+          execute.mockRestore();
+          log.mockRestore();
+          api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(null);
+          jest.useRealTimers();
+        }
+      },
+    );
+
+    test('exhausted maintenance allowance never dispatches a native producer', async () => {
+      jest.useFakeTimers();
+      jest.setSystemTime(1000);
+      const args = input(voiceRequest());
+      args.req.viventiumCallSession = null;
+      args.foreground = false;
+      args.deadlineAt = new Date(200000).toISOString();
+      args.executionBudget = { completionReserveMs: 0 };
+      args.req.config.endpoints = {
+        agents: {
+          providerCapabilities: {
+            'synthetic-native': { workspace_binding: true, conversation_session: true },
+          },
+        },
+      };
+      args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+        status: 'renewed',
+        leaseExpiresAt: expiresAt.toISOString(),
+      }));
+      const execute = jest.spyOn(background, 'executeCortex');
+      try {
+        await expect(ensureAcceptedMainCompaction(args)).resolves.toMatchObject({
+          status: 'degraded',
+          reason: 'compaction_enclosing_deadline',
+        });
+        expect(execute).not.toHaveBeenCalled();
+        expect(args.completeCompaction).not.toHaveBeenCalled();
+      } finally {
+        execute.mockRestore();
+        jest.useRealTimers();
+      }
+    });
+
     test('a finite idle batch admits a fitting native deadline and still reaches reviewed promotion', async () => {
       jest.useFakeTimers();
       jest.setSystemTime(1000);
@@ -2430,7 +2666,9 @@ describe('ViventiumMainCompactionService', () => {
             const review = params.agent.id.endsWith('-review');
             const accepted = await params.onNativeAdmission({
               requestId: params.agent.id,
-              responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+              responseDeadlineAt: new Date(
+                Math.min(Date.now() + 660000, params.nativeResponseDeadlineAt ?? Infinity),
+              ).toISOString(),
             });
             if (!review) {
               expect(accepted).toBe(true);
@@ -2455,7 +2693,10 @@ describe('ViventiumMainCompactionService', () => {
           expect(args.executionBudget.slowestCompactionCallMs).toBe(producerMs);
           expect(args.executionBudget.slowestReviewCallMs).toBe(reviewMs);
           expect(args.executionBudget.nativeCompactionAdmissionWindowMs).toBe(
-            660000 + background.getCortexExecutionGuardGraceMs(),
+            Math.min(
+              660000,
+              batchMs - completionReserveMs - 240000 - background.getCortexExecutionGuardGraceMs(),
+            ) + background.getCortexExecutionGuardGraceMs(),
           );
           expect(final).toMatchObject(
             claims >= 2
@@ -2502,7 +2743,11 @@ describe('ViventiumMainCompactionService', () => {
               await params.onNativeAdmission({
                 requestId: params.agent.id,
                 responseDeadlineAt: new Date(
-                  Date.parse(args.deadlineAt) - grace - 10000 + delta,
+                  Date.parse(args.deadlineAt) -
+                    grace -
+                    10000 -
+                    (params.agent.id.endsWith('-review') ? 0 : 240000) +
+                    delta,
                 ).toISOString(),
               }),
             ).toBe(delta <= 0);
@@ -2631,6 +2876,7 @@ describe('ViventiumMainCompactionService', () => {
           .spyOn(background, 'executeCortex')
           .mockImplementation(async (params) => {
             expect(params.onNativeAdmission).toBeUndefined();
+            expect(params.nativeResponseDeadlineAt).toBeUndefined();
             expect(params.executionTimeoutMs).toBeLessThanOrEqual(240000);
             return {
               insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
@@ -4717,7 +4963,9 @@ describe('durable shrinking size continuation through the existing idle owner', 
           expect(
             await call.onNativeAdmission({
               requestId: `size-native-${calls.length}`,
-              responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+              responseDeadlineAt: new Date(
+                Math.min(Date.now() + 660000, call.nativeResponseDeadlineAt ?? Infinity),
+              ).toISOString(),
             }),
           ).toBe(true);
           const duration = calls.length <= 2 ? 451000 : call.stage === 'review' ? 10000 : 45000;

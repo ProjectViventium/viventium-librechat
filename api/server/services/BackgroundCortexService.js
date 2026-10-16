@@ -4017,6 +4017,7 @@ async function runCortexAttempt(
     resultEvidencePolicy = null,
     onHarnessCancellationOutcome = null,
     onNativeAdmission = null,
+    nativeResponseDeadlineAt,
   },
   {
     initializeAgentFn = initializeAgent,
@@ -4674,6 +4675,11 @@ async function runCortexAttempt(
             cortexCapability?.conversation_session === true &&
             typeof onNativeAdmission === 'function'
               ? {
+                  ...(nativeResponseDeadlineAt !== undefined
+                    ? {
+                        responseDeadlineAt: nativeResponseDeadlineAt,
+                      }
+                    : {}),
                   onAdmitted: async (receipt) => {
                     const accepted =
                       !abortController.signal.aborted &&

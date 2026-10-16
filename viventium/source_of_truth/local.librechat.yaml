@@ -725,6 +725,9 @@ endpoints:
           - max
           recommendedEffort: high
           contextLimit: 1050000
+          serviceTierChoices:
+          - default
+          - priority
         - id: claude-code:claude-opus-5-5
           label: Anthropic / Opus 5.5
           harnessProfile: claude-code
@@ -751,6 +754,50 @@ endpoints:
         - id: grok-build:grok-4.7-build-fast
           label: Grok / Grok 4.7 Fast
           harnessProfile: grok-build
+          effortChoices:
+          - default
+          - low
+          - medium
+          - high
+          - xhigh
+          recommendedEffort: high
+          contextLimit: 500000
+        - id: direct-openai:gpt-6.1-sol
+          label: Direct OpenAI / GPT-6.1 Sol
+          harnessProfile: direct-openai
+          executionBackend: direct-api
+          workerNativeTools: false
+          effortChoices:
+          - default
+          - low
+          - medium
+          - high
+          - xhigh
+          - max
+          recommendedEffort: high
+          contextLimit: 1050000
+          serviceTierChoices:
+          - default
+          - priority
+          - ultrafast
+        - id: direct-anthropic:claude-opus-5-5
+          label: Direct Anthropic / Opus 5.5
+          harnessProfile: direct-anthropic
+          executionBackend: direct-api
+          workerNativeTools: false
+          effortChoices:
+          - default
+          - low
+          - medium
+          - high
+          - max
+          recommendedEffort: high
+          contextLimit: 1000000
+        - id: direct-xai:grok-4.7
+          label: Direct xAI / Grok 4.7
+          harnessProfile: direct-xai
+          executionBackend: direct-api
+          workerNativeTools: false
           effortChoices:
           - default
           - low
@@ -869,6 +916,9 @@ endpoints:
           - claude-code:claude-opus-5-5
           - grok-build:grok-4.7
           - grok-build:grok-4.7-build-fast
+          - direct-openai:gpt-6.1-sol
+          - direct-anthropic:claude-opus-5-5
+          - direct-xai:grok-4.7
           - codex-cli:gpt-6-astra
           - claude-code:claude-opus-5
           - codex-cli:gpt-5.6-sol

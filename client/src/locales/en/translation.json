@@ -1,4 +1,8 @@
 {
+  "com_ui_background_grok_native_access": "Background Grok native access",
+  "com_ui_background_native_access_ask": "Ask before native actions",
+  "com_ui_background_native_access_unused": "No Grok background route is selected. Choose Ask to clear this unused full-access setting.",
+  "com_ui_background_native_access_help": "Grok keeps native action approvals. Connected tools keep their own access rules.",
   "com_ui_background_worker_preference": "Preferred background GlassHive worker",
   "com_ui_background_worker_preference_help": "These choices apply to new background work. Main keeps its own model and effort.",
   "com_ui_background_worker_model": "Background model",
@@ -1468,6 +1472,8 @@
   "com_ui_glasshive_full_access": "Full access",
   "com_ui_glasshive_full_access_warning": "Full access disables harness sandbox and approval gates. Use it only for a trusted local agent.",
   "com_ui_glasshive_harness": "GlassHive harness",
+  "com_ui_glasshive_connection_configured": "Connection configured",
+  "com_ui_glasshive_direct_description": "Uses configured API tools. Computer and native harness work runs through workers.",
   "com_ui_glasshive_harness_description": "Runs in the selected server-side folder with native harness tools.",
   "com_ui_glasshive_native_tools_description": "This provider executes compatible declared MCP tools inside GlassHive. LibreChat built-in Web Search, File Search, and Code Interpreter are not executed locally.",
   "com_ui_glasshive_path_description": "This path is resolved on the computer running GlassHive.",
@@ -2274,5 +2280,10 @@
   "com_ui_work_input_open": "Open approval page",
   "com_ui_work_input_choose": "Choose an answer",
   "com_ui_work_input_retry": "Response not confirmed. Retry the same choice.",
-  "com_ui_work_input_invalid": "Check your answer and try again."
+  "com_ui_work_input_invalid": "Check your answer and try again.",
+  "com_ui_model_speed": "Speed",
+  "com_ui_model_speed_current_default": "Use current default",
+  "com_ui_model_speed_fast": "Fast",
+  "com_ui_model_speed_standard": "Standard",
+  "com_ui_model_speed_description": "Fast can use more allowance or credits. Availability depends on the connected account."
 }

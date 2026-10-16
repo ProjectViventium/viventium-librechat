@@ -2601,6 +2601,13 @@ describe('viventium-memory-hardening', () => {
       fs.writeFileSync(path.join(tempDir, '.transcript_state.json'), '{"hidden":true}', 'utf8');
       fs.writeFileSync(path.join(tempDir, 'state', 'index.json'), '{"downloaded":true}', 'utf8');
       fs.writeFileSync(path.join(tempDir, 'download.log'), 'downloader sidecar', 'utf8');
+      for (const suffix of ['body', 'staged', 'bak.123']) {
+        fs.writeFileSync(
+          path.join(tempDir, `download.log.${suffix}`),
+          'rotated downloader sidecar',
+          'utf8',
+        );
+      }
 
       const result = scanTranscriptDirectory({
         user: { _id: '507f1f77bcf86cd799439011', name: 'Test User' },
@@ -2616,8 +2623,8 @@ describe('viventium-memory-hardening', () => {
 
       expect(result.transcripts).toHaveLength(1);
       expect(result.transcripts[0].filename).toBe('meeting.txt');
-      expect(result.telemetry.files_seen).toBe(5);
-      expect(result.telemetry.files_ignored_by_config).toBe(4);
+      expect(result.telemetry.files_seen).toBe(8);
+      expect(result.telemetry.files_ignored_by_config).toBe(7);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
       fs.rmSync(stateDir, { recursive: true, force: true });

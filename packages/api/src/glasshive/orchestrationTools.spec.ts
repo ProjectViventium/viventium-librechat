@@ -19,6 +19,38 @@ describe('GlassHive Main orchestration tools', () => {
     executeMainDelegation.mockResolvedValue({ status: 'ok', workRef: 'work-a' });
   });
 
+  test.each(['direct-openai', 'direct-anthropic', 'direct-xai'])(
+    'validates and forwards exact registered Direct worker profile %s',
+    async (profile) => {
+      const delegation = createGlassHiveMainDelegationTool(
+        { userId: 'owner-1' },
+        { executeMainDelegation, logger },
+      );
+      const args = {
+        title: 'Synthetic mission',
+        instruction: 'Complete it.',
+        resourceClass: 'standard',
+        profile,
+        effort: 'low',
+      };
+      expect(delegation.schema.safeParse(args).success).toBe(true);
+      expect(
+        delegation.schema.safeParse({ ...args, profile: 'unregistered-runtime' }).success,
+      ).toBe(false);
+      await delegation.invoke(args, {
+        configurable: {
+          requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
+        },
+      });
+      expect(executeMainDelegation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user: expect.objectContaining({ id: 'owner-1' }),
+          args: expect.objectContaining({ profile, effort: 'low' }),
+        }),
+      );
+    },
+  );
+
   test('exposes launch only with turn authority and keeps known-work controls available', () => {
     const main = { glasshive_options: { orchestration: { parallel_available: true } } };
     const requested = [DELEGATION_TOOL_NAME, 'active_work_list', 'active_work_action'];
@@ -40,6 +72,11 @@ describe('GlassHive Main orchestration tools', () => {
       'active_work_action',
     ]);
     expect(definitions).toHaveLength(3);
+    expect(definitions.map((definition) => definition.toolType)).toEqual([
+      'builtin',
+      'builtin',
+      'builtin',
+    ]);
     expect(definitions[0].parameters.required).toContain('resourceClass');
     expect(definitions[0].parameters.properties.instruction).toEqual(
       MAIN_DELEGATION_JSON_SCHEMA.properties.instruction,

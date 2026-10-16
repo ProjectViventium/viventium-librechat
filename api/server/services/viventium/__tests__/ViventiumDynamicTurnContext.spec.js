@@ -357,6 +357,88 @@ describe('Core current native form consumer', () => {
     },
   );
 
+  test.each([false, true])(
+    'keeps each current decision before older roster detail (voice=%s)',
+    (voice) => {
+      const pending = {
+        ...currentNativeQuestion(),
+        kind: 'permission',
+        message: 'Write the drawing?',
+        requestedSchema: {
+          type: 'object',
+          required: ['optionId'],
+          properties: {
+            optionId: {
+              type: 'string',
+              enum: ['once', 'always', 'deny'],
+              enumNames: ['Allow once', 'Always allow', 'Reject once'],
+              enumKinds: ['allow_once', 'allow_always', 'reject_once'],
+              description: 'Write drawing.svg',
+            },
+          },
+        },
+      };
+      const work = [
+        {
+          workRef: 'triangle-new',
+          title: 'Triangle badge',
+          state: 'needs_input',
+          updatedAt: '2026-01-02T00:00:00Z',
+          pendingNativeInput: pending,
+          actions: ['resume', 'stop'],
+        },
+        {
+          workRef: 'triangle-old',
+          title: 'Triangle badge in another conversation',
+          state: 'needs_input',
+          updatedAt: '2026-01-01T00:00:00Z',
+          pendingNativeInput: {
+            ...pending,
+            requestId: 'request-2',
+            runId: 'run-2',
+            requestFingerprint: 'b'.repeat(64),
+          },
+          actions: ['resume', 'stop'],
+        },
+        ...Array.from({ length: 24 }, (_, index) => ({
+          workRef: `older-${index}`,
+          title: 'Older work '.repeat(20),
+          state: 'failed',
+          statusSummary: 'Past result '.repeat(30),
+          provider: 'native',
+          delivery: { state: 'delivered' },
+          actions: ['retry', 'stop'],
+        })),
+      ];
+      const snapshot = { snapshot: 'fresh', overflowCount: 0, work };
+      const capsule = buildActiveWorkCapsule({ mode: 'parallel', snapshot, voice });
+      const roster = decodeUntrustedRoster(capsule);
+      expect(Buffer.byteLength(capsule)).toBeLessThanOrEqual(16 * 1024);
+      expect(roster.work.slice(0, 2).map((item) => item.workRef)).toEqual([
+        'triangle-new',
+        'triangle-old',
+      ]);
+      for (const [index, item] of roster.work.slice(0, 2).entries()) {
+        expect(item.pendingNativeInput).toMatchObject({
+          kind: 'permission',
+          requestFingerprint: index ? 'b'.repeat(64) : pending.requestFingerprint,
+          runId: index ? 'run-2' : pending.runId,
+          operationTitle: 'Write drawing.svg',
+          choices: [
+            { value: 'once', label: 'Allow once', kind: 'allow_once' },
+            { value: 'always', label: 'Always allow', kind: 'allow_always' },
+            { value: 'deny', label: 'Reject once', kind: 'reject_once' },
+          ],
+        });
+        expect(item).not.toHaveProperty('nativeInputOmitted');
+      }
+      expect(roster.omittedVisibleWork).toBeGreaterThanOrEqual(3);
+      expect(roster.work.length + roster.omittedVisibleWork).toBe(work.length);
+      expect(roster.fullRosterTool).toBe('active_work_list');
+      expect(buildActiveWorkCapsule({ mode: 'parallel', snapshot, voice: !voice })).toBe(capsule);
+    },
+  );
+
   test('keeps a whole oversized native form omitted without losing common rows', () => {
     const capsule = buildActiveWorkCapsule({
       mode: 'parallel',
@@ -1150,7 +1232,6 @@ describe('ViventiumDynamicTurnContext', () => {
     ]);
     expect(getActiveWorkSnapshotImpl).toHaveBeenCalledTimes(1);
   });
-
   test('honors the caller-owned shared turn-context byte budget without splitting roster data', () => {
     const capsule = buildActiveWorkCapsule({
       mode: 'parallel',
@@ -1174,11 +1255,14 @@ describe('ViventiumDynamicTurnContext', () => {
       expect.objectContaining({ workRef: 'work-99', state: 'needs_input' }),
     );
     expect(capsule).toContain('</viventium_untrusted_active_work_data>');
-    expect(capsule).toContain('Roster truncated');
+    const roster = decodeUntrustedRoster(capsule);
+    expect(roster.omittedVisibleWork).toBeGreaterThan(0);
+    expect(roster.work.length + roster.omittedVisibleWork).toBe(100);
+    expect(roster.fullRosterTool).toBe('active_work_list');
   });
 
   test('voice retains the complete same owner-scoped roster and worker action context', () => {
-    const capsule = buildActiveWorkCapsule({
+    const options = {
       mode: 'parallel',
       voice: true,
       snapshot: {
@@ -1195,10 +1279,10 @@ describe('ViventiumDynamicTurnContext', () => {
           { workRef: 'work-2', title: 'Another mission', state: 'running', actions: ['stop'] },
         ],
       },
-    });
-
-    expect(decodeUntrustedRoster(capsule).work).toHaveLength(2);
-    expect(capsule).not.toContain('Reconnect the account');
+    };
+    const capsule = buildActiveWorkCapsule(options);
+    const roster = decodeUntrustedRoster(capsule);
+    expect(roster.work).toHaveLength(2);
     expect(decodeUntrustedRoster(capsule).work).toEqual([
       expect.objectContaining({
         workRef: 'work-1',
@@ -1207,10 +1291,10 @@ describe('ViventiumDynamicTurnContext', () => {
       }),
       expect.objectContaining({ workRef: 'work-2', state: 'running', actions: ['stop'] }),
     ]);
-    expect(capsule).toContain('active_work_list');
-    expect(capsule).toContain('Queue persists a follow-up behind the current objective');
-    expect(capsule).toContain('Message delivers noninterrupting guidance');
-    expect(capsule).not.toContain('Long private title');
+    expect(roster.fullRosterTool).toBe('active_work_list');
+    expect(roster.omittedVisibleWork).toBe(0);
+    expect(roster.work[0].title).toBe(options.snapshot.work[0].title);
+    expect(buildActiveWorkCapsule({ ...options, voice: false })).toBe(capsule);
   });
 });
 

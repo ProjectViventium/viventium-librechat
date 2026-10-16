@@ -230,7 +230,19 @@ async function prepareMissionOutputFiles({
         resultRevision: row.terminalCallbackResultRevision,
         resultDigest: row.terminalCallbackResultDigest,
       });
-    const files = [...(source?.files || []), ...selectedFiles].filter(
+    const canonicalFiles = source?.files || [];
+    // A media link label is an alias of this callback's exact published file, not a second filename.
+    const mediaOnlyFiles = selectedFiles.filter(
+      (file) =>
+        !canonicalFiles.some(
+          (canonical) =>
+            canonical.download_url === file.download_url &&
+            canonical.sha256 === file.sha256 &&
+            canonical.bytes === file.bytes &&
+            canonical.mime_type === file.mime_type,
+        ),
+    );
+    const files = [...canonicalFiles, ...mediaOnlyFiles].filter(
       (file) => !seen.has(nativeOutputFileDescriptorKey(file)),
     );
     const identity = {
@@ -259,6 +271,112 @@ async function prepareMissionOutputFiles({
     ? { attachments, authorizePublication: retained.authorizePublication }
     : attachments;
 }
+async function retainedCallbackOutputSource(row, references, destination, session) {
+  if (row.nativeResponse) return undefined;
+  const mongoose = require('mongoose');
+  const ResultModel = require('~/db/models').GlassHiveTerminalCallbackResult;
+  const sources = await mongoose.connection
+    .collection('viventium_glasshive_mission_evidence')
+    .find(
+      {
+        ownerId: destination.userId,
+        conversationId: destination.conversationId,
+        followUpMessageId: row.messageId,
+        'outputFiles.files.download_url': { $in: references },
+      },
+      {
+        ...(session ? { session } : {}),
+        projection: {
+          ownerId: 1,
+          conversationId: 1,
+          followUpMessageId: 1,
+          mainAgentId: 1,
+          originRef: 1,
+          workRef: 1,
+          runId: 1,
+          attemptId: 1,
+          attemptNumber: 1,
+          outputFiles: 1,
+          terminalCallbackResultKey: 1,
+          terminalCallbackAcceptedOperationId: 1,
+          terminalCallbackId: 1,
+          terminalCallbackResultRevision: 1,
+          terminalCallbackResultDigest: 1,
+          terminalCallbackEffectGeneration: 1,
+        },
+      },
+    )
+    .toArray();
+  for (const source of sources) {
+    if (
+      source.ownerId !== destination.userId ||
+      source.conversationId !== row.conversationId ||
+      source.followUpMessageId !== row.messageId ||
+      !source.mainAgentId ||
+      (row.agent_id && source.mainAgentId !== row.agent_id)
+    )
+      continue;
+    try {
+      const files = normalizeNativeCallbackOutputFiles(source.outputFiles, {
+        ownerId: source.ownerId,
+        originRef: source.originRef,
+        workRef: source.workRef,
+        runId: source.runId,
+        attemptId: source.attemptId,
+        callbackId: source.terminalCallbackId,
+        resultRevision: source.terminalCallbackResultRevision,
+        resultDigest: source.terminalCallbackResultDigest,
+      });
+      if (!files) continue;
+      const identity = {
+        userId: destination.userId,
+        conversationId: row.conversationId,
+        responseMessageId: row.messageId,
+        streamId: row.streamId || row.messageId,
+        agentId: source.mainAgentId,
+        logicalTurnId: '',
+        revision: 1,
+        requestId: source.terminalCallbackId,
+        runId: source.runId,
+        attemptId: source.attemptId,
+      };
+      // The existing callback projection validates the same accepted-operation proof used by media.
+      const envelope = nativeMediaOutputFilesForMessage(source, files.files, identity);
+      const selector = {
+        _id: source.terminalCallbackResultKey,
+        ownerId: destination.userId,
+        originRef: source.originRef,
+        workRef: source.workRef,
+        runId: source.runId,
+        attemptNumber: source.attemptNumber,
+        callbackId: source.terminalCallbackId,
+        resultRevision: source.terminalCallbackResultRevision,
+        resultDigest: source.terminalCallbackResultDigest,
+        acceptedOperationId: source.terminalCallbackAcceptedOperationId,
+        acceptedOperationGeneration: source.terminalCallbackEffectGeneration,
+      };
+      let accepted = ResultModel.findOne(selector);
+      if (session) accepted = accepted.session(session);
+      if (!(await accepted.lean())) continue;
+      return {
+        envelope,
+        identity,
+        sourceDigest: createHash('sha256').update(JSON.stringify(source)).digest('hex'),
+        reference: {
+          resultKey: source.terminalCallbackResultKey,
+          callbackId: source.terminalCallbackId,
+          acceptedOperationId: source.terminalCallbackAcceptedOperationId,
+          generation: source.terminalCallbackEffectGeneration,
+          resultRevision: source.terminalCallbackResultRevision,
+          resultDigest: source.terminalCallbackResultDigest,
+        },
+      };
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
 async function prepareRetainedNativeOutputFiles(req, identity, text, initialImports = []) {
   const references = collectGlassHiveNativeMediaReferences(text);
   if (!references.length) return { imports: [] };
@@ -278,7 +396,7 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
   };
   const rows = await Message.find(selector)
     .select(
-      'user conversationId messageId isCreatedByUser unfinished error deletedAt expiredAt attachments +nativeResponse',
+      'user conversationId messageId streamId agent_id isCreatedByUser unfinished error deletedAt expiredAt attachments +nativeResponse',
     )
     .lean();
   const limits = nativeOutputFileLimits(req);
@@ -304,12 +422,15 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
         .map((item) => findFileById(item.file_id)),
     );
     let selected;
+    let callback;
     try {
+      callback = await retainedCallbackOutputSource(row, references, destination);
       selected = retainedNativeOutputFilesForMessage(
         row,
         stored.filter(Boolean),
         references,
         destination,
+        callback,
       );
     } catch {
       continue;
@@ -363,6 +484,7 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
     proofs.push({
       sourceMessageId: selected.sourceMessageId,
       candidateSha256: selected.candidateSha256,
+      ...(callback ? { callbackReference: callback.reference } : {}),
       fileIds: selected.sourceFiles.map((file) => file.file_id),
       envelope: selected.envelope,
       fileSources: selected.sourceFiles.map((file) => ({
@@ -385,11 +507,30 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
                 deletedAt: null,
               })
                 .select(
-                  'user conversationId messageId isCreatedByUser unfinished error deletedAt expiredAt attachments +nativeResponse',
+                  'user conversationId messageId streamId agent_id isCreatedByUser unfinished error deletedAt expiredAt attachments +nativeResponse',
                 )
                 .session(session)
                 .lean();
-              if (!row || row.nativeResponse?.candidateSha256 !== proof.candidateSha256)
+              if (
+                !row ||
+                (!proof.callbackReference &&
+                  row.nativeResponse?.candidateSha256 !== proof.candidateSha256)
+              )
+                throw new Error('native_output_files_retained_source_invalid');
+              const callback = proof.callbackReference
+                ? await retainedCallbackOutputSource(row, references, destination, session)
+                : undefined;
+              if (
+                proof.callbackReference &&
+                (!callback ||
+                  callback.sourceDigest !== proof.candidateSha256 ||
+                  JSON.stringify(callback.reference) !== JSON.stringify(proof.callbackReference) ||
+                  !(await fenceGlassHiveTerminalCallbackAcceptedOperation({
+                    ResultModel: require('~/db/models').GlassHiveTerminalCallbackResult,
+                    reference: callback.reference,
+                    session,
+                  })))
+              )
                 throw new Error('native_output_files_retained_source_invalid');
               const stored = await Promise.all(
                 proof.fileIds.map((fileId) =>
@@ -409,6 +550,7 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
                 stored.filter(Boolean),
                 references,
                 destination,
+                callback,
               );
               if (
                 !rechecked ||

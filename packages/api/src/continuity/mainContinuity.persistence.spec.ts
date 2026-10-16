@@ -13,6 +13,8 @@ import { createGlassHiveTerminalCallbackTransactionService } from '../glasshive/
 import {
   createMainContinuityService,
   prepareMainCompactionCandidate,
+  inspectMainCompactionCandidate,
+  normalizeMainCompactionSizeRepair,
   mainCompactionCandidateDigest,
   mainCompactionOutputContractDigest,
 } from './mainContinuity';
@@ -199,7 +201,7 @@ describe('native Main acceptance projection', () => {
           approved: true,
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(candidate!),
-          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
         },
       }),
     ).toMatchObject({ status: 'compacted' });
@@ -233,6 +235,98 @@ describe('native Main acceptance projection', () => {
     });
     return turn;
   }
+
+  it('holds Mongo source on an invented reviewed identity then promotes a valid candidate on the same lease', async () => {
+    const runtime = service();
+    for (let n = 0; n < 4; n++) await runtime.commitAcceptedMainTurn(await presentation(`typed-${n}`));
+    const claim = await runtime.claimAcceptedMainCompaction(identity);
+    expect(claim.status).toBe('claimed');
+    const valid = { version: 1 as const, summary: 'The valid synthetic requests were accepted.',
+      pendingAsks: [], commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+      recurrenceOutcomes: [], toolPairs: [] };
+    const invented = { ...valid, toolPairs: [{ callId: 'call_invented', toolName: 'read_record', outcome: 'Invented result.' }] };
+    const approve = (candidate: typeof valid | typeof invented) => ({ version: 1, approved: true,
+      sourceDigest: claim.sourceDigest, candidateDigest: mainCompactionCandidateDigest(candidate),
+      outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract) });
+    expect(await runtime.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: invented, semanticReview: approve(invented) }))
+      .toMatchObject({ status: 'invalid_summary', reason: 'schema_invalid' });
+    expect((await history()).count).toBe(4);
+    const held = await states().findOne({ domainEpochKey: claim.domainEpochKey }).lean();
+    expect(held?.semanticCompaction).toBeNull();
+    expect(held?.compactionLease?.leaseId).toBe(claim.leaseId);
+    expect(await runtime.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: valid, semanticReview: approve(valid) })).toMatchObject({ status: 'compacted' });
+    const promoted = await states().findOne({ domainEpochKey: claim.domainEpochKey }).lean();
+    expect(promoted?.summarizedThrough).toBeGreaterThan(0);
+    expect(promoted?.semanticCompaction?.summary).toBe(valid.summary);
+    expect((await history()).count).toBe(4);
+  });
+
+  it('round-trips numeric size progress through Mongo without publishing or dropping accepted source', async () => {
+    const runtime = service();
+    for (let n = 0; n < 4; n++) await runtime.commitAcceptedMainTurn(await presentation(`size-${n}`));
+    const claim = await runtime.claimAcceptedMainCompaction(identity);
+    const contract = claim.outputContract as { maxJsonUtf8Bytes: number };
+    const candidate = { version: 1, summary: 'x'.repeat(contract.maxJsonUtf8Bytes + 1000),
+      pendingAsks: [], commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+      recurrenceOutcomes: [], toolPairs: [] };
+    const inspected = inspectMainCompactionCandidate(candidate, contract);
+    if (inspected.ok) throw new Error('Expected synthetic size rejection');
+    const proposalBytes = Buffer.byteLength(JSON.stringify(candidate));
+    const repair = { version: 1, sourceDigest: claim.sourceDigest,
+      contractKey: JSON.stringify({ provider: 'native', model: 'synthetic', effort: 'high', constraints: contract }),
+      semanticAttempts: 2, fidelityRepairAttempts: 1, transportRetries: 0,
+      correction: { code: 'schema_invalid', issue: inspected.issue },
+      sizeRepair: { proposalBytes, previousProposalBytes: proposalBytes + 3000, converging: true } };
+    expect(await runtime.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
+    const retained = await states().findOne({ domainEpochKey: claim.domainEpochKey }).lean();
+    expect(retained?.semanticCompaction).toBeNull();
+    expect(retained?.pendingCompactionRepair?.correction.candidate).toBeUndefined();
+    expect(normalizeMainCompactionSizeRepair(retained?.pendingCompactionRepair, contract)).not.toBeNull();
+    expect((await history()).count).toBe(4);
+    const next = await runtime.claimAcceptedMainCompaction(identity);
+    expect(next.sourceDigest).toBe(claim.sourceDigest);
+    expect(next.pendingCompactionRepair).toMatchObject({ semanticAttempts: 2, fidelityRepairAttempts: 1 });
+    expect((await runtime.loadAcceptedMainContext(identity)).capsule).toContain('Valid request size-0.');
+  });
+
+  it('round-trips fourth-call fidelity feedback and its one repair allowance through Mongo', async () => {
+    const runtime = service();
+    for (let n = 0; n < 4; n++) await runtime.commitAcceptedMainTurn(await presentation(`fidelity-${n}`));
+    const claim = await runtime.claimAcceptedMainCompaction(identity);
+    const candidate = { version: 1, summary: 'Valid requests remain pending.', pendingAsks: [],
+      commitments: [], corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [] };
+    const repair = { version: 1, sourceDigest: claim.sourceDigest, contractKey: 'same-contract',
+      semanticAttempts: 4, fidelityRepairAttempts: 0, transportRetries: 0,
+      correction: { code: 'semantic_fidelity', candidate: JSON.stringify(candidate), reason: 'Retain exact source references.' } };
+    expect(await runtime.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
+    const saved = await states().findOne({ domainEpochKey: claim.domainEpochKey }).lean();
+    expect(saved?.semanticCompaction).toBeNull();
+    expect(saved?.pendingCompactionRepair).toMatchObject(repair);
+    const next = await runtime.claimAcceptedMainCompaction(identity);
+    expect(next.pendingCompactionRepair).toMatchObject(repair);
+    expect(next.sourceDigest).toBe(claim.sourceDigest);
+    expect(await runtime.rejectAcceptedMainCompaction({ ...identity, leaseId: next.leaseId,
+      reason: 'compaction_cancelled', capacityReleaseAcknowledged: true,
+      sourceDigest: next.sourceDigest, contractKey: repair.contractKey,
+      semanticAttempts: 4, fidelityRepairAttempts: 0, transportRetries: 0 })).toMatchObject({ repairPending: true });
+    expect((await states().findOne({ domainEpochKey: claim.domainEpochKey }).lean())?.pendingCompactionRepair)
+      .toEqual(saved?.pendingCompactionRepair);
+    const last = await runtime.claimAcceptedMainCompaction(identity);
+    expect(await runtime.rejectAcceptedMainCompaction({ ...identity, leaseId: last.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: { ...repair, semanticAttempts: 5, fidelityRepairAttempts: 1 } }))
+      .not.toMatchObject({ repairPending: true });
+    const final = await states().findOne({ domainEpochKey: claim.domainEpochKey }).lean();
+    expect(final?.pendingCompactionRepair).toBeNull();
+    expect(final?.semanticCompaction).toBeNull();
+    expect((await history()).count).toBe(4);
+  });
 
   it('hydrates retained scheduled results from exact typed parent provenance without user authority', async () => {
     for (let index = 0; index < 4; index++) await acceptedScheduledSource(`scheduled-${index}`);
@@ -405,7 +499,7 @@ describe('native Main acceptance projection', () => {
           approved: true,
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(candidate!),
-          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
         },
       }),
     ).toMatchObject({ status: 'compacted' });
@@ -561,7 +655,7 @@ describe('native Main acceptance projection', () => {
             approved: true,
             sourceDigest: claim.sourceDigest,
             candidateDigest: mainCompactionCandidateDigest(candidate),
-            outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
           },
         }),
       ).toMatchObject({ status: 'compacted' });
@@ -732,7 +826,7 @@ describe('native Main acceptance projection', () => {
           approved: true,
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(candidate!),
-          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
         },
       }),
     ).toMatchObject({ status: 'compacted' });

@@ -6,6 +6,7 @@
  * === VIVENTIUM END === */
 
 const { performance } = require('perf_hooks');
+const crypto = require('crypto');
 
 const WALL_CLOCK_THRESHOLD_MS = 1_000_000_000_000;
 
@@ -118,7 +119,54 @@ function logVoiceLatencyNumericStage(
 }
 /* === VIVENTIUM END === */
 
+/* === VIVENTIUM START === Passive owner timing; no result or error content enters logs. === */
+function observeVoiceLatencyOperation(logger, req, source, stage, operation) {
+  if (req?.viventiumVoiceLogLatency !== true) return operation();
+  const startedAt = voiceLatencyNow();
+  const record = (outcome) => {
+    try {
+      const requestHash = crypto
+        .createHash('sha256')
+        .update(String(req.viventiumVoiceRequestId || 'unknown'))
+        .digest('hex');
+      logVoiceLatencyNumericStage(
+        logger,
+        req,
+        source,
+        `${stage}_${outcome}`,
+        startedAt,
+        requestHash,
+      );
+    } catch {
+      // Passive measurements cannot change user data, authorization, or execution outcome.
+    }
+  };
+  let result;
+  try {
+    result = operation();
+  } catch (error) {
+    record('failed');
+    throw error;
+  }
+  if (!result || typeof result.then !== 'function') {
+    record('completed');
+    return result;
+  }
+  return Promise.resolve(result).then(
+    (value) => {
+      record('completed');
+      return value;
+    },
+    (error) => {
+      record('failed');
+      throw error;
+    },
+  );
+}
+/* === VIVENTIUM END === */
+
 module.exports = {
+  observeVoiceLatencyOperation,
   calcVoiceLatencyDurationMs,
   formatVoiceLatencyDurationFields,
   formatVoiceLatencyTiming,

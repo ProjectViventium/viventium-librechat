@@ -1649,6 +1649,9 @@ describe('/api/viventium/gateway', () => {
       conversationId: 'conv-1',
       'metadata.viventium.parentMessageId': 'msg-1',
       'metadata.viventium.type': 'cortex_followup',
+      'metadata.viventium.followUpSource': {
+        $nin: ['durable_terminal_callback', 'durable_work_callback'],
+      },
     });
     expect(mockGetCortexInsightDeliveries).toHaveBeenCalledWith({
       ownerId: 'user_1',

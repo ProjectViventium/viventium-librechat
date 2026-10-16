@@ -54,6 +54,9 @@ export const MAIN_DELEGATION_PROFILES = Object.freeze([
   'claude-code',
   'grok-build',
   'openclaw-general',
+  'direct-openai',
+  'direct-anthropic',
+  'direct-xai',
 ]);
 export const MAIN_DELEGATION_RESOURCE_CLASSES = Object.freeze(['standard', 'light']);
 
@@ -194,10 +197,10 @@ export const ACTIVE_WORK_LIST_JSON_SCHEMA = Object.freeze({
 export const ACTIVE_WORK_ACTION_SEMANTICS =
   "For ordinary work controls, use only the target work item's current actions: its owner-scoped actions list is authoritative, and the global action enum never makes an unlisted ordinary action available. Use active_work_list when that current action mask is unknown or stale. Responding to a current pending native question or permission is separate: use action resume with its exact nativeInput, even when resume is absent from ordinary actions. The native input owner revalidates the current request and explicit owner answer. " +
   'Queue persists a follow-up behind the current objective without interrupting it. ' +
-  'Message delivers noninterrupting guidance or continuation within the same mission. Message can continue completed work when its actions list allows it. ' +
+  'Message delivers noninterrupting guidance or continuation within the same mission. Message can continue terminal work when its actions list allows it. ' +
   'Steer interrupts and redirects the exact active run. Pause and Resume preserve the objective. ' +
   'Stop cancels only that exact work. Retry is only for failed or otherwise retryable terminal work whose actions list includes retry. Completed work is successful and must never be retried. ' +
-  'Retry does not deliver new guidance: when retryable failed work needs both recovery and a new instruction, Retry first, then Message or Steer the same workRef after recovery is accepted; do not claim the guidance was added until that second action settles. ' +
+  'Retry can include updated recovery guidance in instruction; that guidance is included in the same continuation before execution starts. A separate Message or Steer is not required to add it. ' +
   'Dismiss removes an acknowledged terminal card without deleting history. ' +
   'When the user names an action, use that exact action and report the returned action truthfully.';
 export const ACTIVE_WORK_ACTION_DESCRIPTION = `Continue or control one existing durable mission by exact workRef instead of starting a competing mission. Each call applies one exact action; a turn may sequence distinct actions when the mission lifecycle requires it. ${ACTIVE_WORK_ACTION_SEMANTICS}`;
@@ -352,7 +355,7 @@ export function canonicalConversationOrchestrationArguments(
     return output;
   }
   if (toolName === 'active_work_action') {
-    if (Object.hasOwn(input, 'nativeHumanInput') || Object.hasOwn(input, 'ownerInputControl')) {
+    if (Object.prototype.hasOwnProperty.call(input, 'nativeHumanInput') || Object.prototype.hasOwnProperty.call(input, 'ownerInputControl')) {
       throw new TypeError('native owner input authority is server-owned');
     }
     const instruction = boundedString(input.instruction, 8000);

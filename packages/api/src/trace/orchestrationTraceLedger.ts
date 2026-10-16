@@ -108,6 +108,7 @@ export interface TraceEventFactsInput {
   fallbackProviderStatus?: string;
   configuredFallback?: boolean;
   requiredCapabilitiesPreserved?: boolean;
+  confirmationPending?: boolean;
   effectCount?: number;
 }
 
@@ -169,6 +170,7 @@ export interface RedactedTraceEventFacts {
   fallbackProviderStatus?: string;
   configuredFallback?: boolean;
   requiredCapabilitiesPreserved?: boolean;
+  confirmationPending?: boolean;
   effectCount?: number;
 }
 
@@ -468,6 +470,7 @@ const FACT_KEYS = new Set<keyof TraceEventFactsInput>([
   'fallbackProviderStatus',
   'configuredFallback',
   'requiredCapabilitiesPreserved',
+  'confirmationPending',
   'effectCount',
 ]);
 const REDACTED_FACT_KEYS = new Set<keyof RedactedTraceEventFacts>([
@@ -528,6 +531,7 @@ const REDACTED_FACT_KEYS = new Set<keyof RedactedTraceEventFacts>([
   'fallbackProviderStatus',
   'configuredFallback',
   'requiredCapabilitiesPreserved',
+  'confirmationPending',
   'effectCount',
 ]);
 const REDACTED_REFERENCE_KEYS = [
@@ -782,6 +786,7 @@ export function redactOrchestrationTraceFacts(input: TraceEventFactsInput = {}):
     facts.promptProducerScope = input.promptProducerScope;
   }
   if (unknownPromptLayerCount != null) facts.unknownPromptLayerCount = unknownPromptLayerCount;
+  if (typeof input.confirmationPending === 'boolean') facts.confirmationPending = input.confirmationPending;
   if (effectCount != null) facts.effectCount = effectCount;
   if (effectPlane) facts.effectPlane = effectPlane;
   if (outcome) facts.outcome = outcome;
@@ -1031,6 +1036,7 @@ function persistedRowValid(row: OrchestrationTraceEventRow, scope: TraceScopeQue
     )
       return false;
   }
+  if (row.facts.confirmationPending != null && typeof row.facts.confirmationPending !== 'boolean') return false;
   if (row.facts.terminal != null && typeof row.facts.terminal !== 'boolean') return false;
   if (row.facts.configuredFallback != null && typeof row.facts.configuredFallback !== 'boolean')
     return false;

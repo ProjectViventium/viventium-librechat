@@ -4,6 +4,7 @@ const {
   sanitizeVoiceAssistantMessageForPersistence,
   sanitizeVoiceSurfaceTextForDisplay,
   artifactCounts,
+  stripVoiceControlTags,
   sumForbiddenArtifacts,
   DEFAULT_VISIBLE_FORBIDDEN_ARTIFACT_KEYS,
 } = require('../voiceArtifactText');
@@ -87,11 +88,22 @@ describe('voice linked-chat formatting', () => {
     expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(text);
   });
 
-  test('continues to mask standalone email text beside a public link', () => {
-    const text = 'Email qa@example.test or open https://docs.example.test/report.';
-    expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(
-      'Email address available or open https://docs.example.test/report.',
-    );
+  test.each([
+    'Email qa@example.test or open https://docs.example.test/report.',
+    'The verified address is qa_first.last+test@example.test.',
+    'The verified address is _first_+qa@example.test.',
+  ])('preserves requested email text in display and persisted content: %s', (text) => {
+    expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(text);
+    const message = { text, content: [{ type: 'text', text }] };
+    expect(
+      sanitizeVoiceAssistantMessageForPersistence({ body: { voiceMode: true } }, message),
+    ).toEqual(message);
+  });
+  test.each([
+    ['**qa_first+test@example.test**', 'qa_first+test@example.test'],
+    ['_qa@example.test_', 'qa@example.test'],
+  ])('cleans surrounding formatting while preserving a verified email: %s', (text, expected) => {
+    expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(expected);
   });
 
   test('preserves a lowercase Markdown label while stripping a standalone stage direction', () => {
@@ -227,5 +239,75 @@ describe('declared Web assistant delivery controls', () => {
       sanitizeVoiceAssistantMessageForPersistence(req, { text: '<whisper>Literal tag</whisper>' })
         .text,
     ).toBe('<whisper>Literal tag</whisper>');
+  });
+});
+
+describe('literal code at the shared voice-control boundary', () => {
+  test.each([
+    '```text\n[draft]  <soft>literal</soft>\n\n\n```',
+    '~~~text\n[draft]  <soft>literal</soft>\n~~~',
+    '```text\n[draft]  <soft>literal</soft>',
+    '`<soft>[draft]</soft>`',
+  ])('preserves code bytes while removing adjacent controls: %s', (literal) => {
+    const raw = `<soft>Ready.</soft> [laughter]\n${literal}`;
+    const expected = `Ready. \n${literal}`;
+    expect(stripVoiceControlTags(raw)).toBe(expected);
+    const req = { body: { viventiumSurface: 'telegram', telegramAudioRequested: true } };
+    const message = {
+      text: raw,
+      content: [
+        { type: 'text', text: raw },
+        { type: 'text', text: { value: raw, annotations: [] } },
+        { type: 'text', text: { text: raw } },
+      ],
+    };
+    const result = sanitizeVoiceAssistantMessageForPersistence(req, message);
+    expect(result.text).toBe(expected);
+    expect(
+      result.content.map((part) =>
+        typeof part.text === 'string' ? part.text : (part.text.value ?? part.text.text),
+      ),
+    ).toEqual([expected, expected, expected]);
+    expect(message.text).toBe(raw);
+  });
+
+  test.each(['soft', 'spell', 'emotion'])(
+    'removes %s wrappers across an inline code boundary',
+    (tag) => {
+      const literal = '`<soft>[draft]</soft>`';
+      const opening = tag === 'emotion' ? '<emotion value="happy">' : `<${tag}>`;
+      expect(stripVoiceControlTags(`${opening}Keep ${literal} here.</${tag}>`)).toBe(
+        `Keep ${literal} here.`,
+      );
+    },
+  );
+
+  test('does not protect prose after an unmatched single backtick', () => {
+    const raw = 'A stray ` stays literal [laughter]';
+    expect(stripVoiceControlTags(raw)).toBe('A stray ` stays literal ');
+    const result = sanitizeVoiceAssistantMessageForPersistence(
+      { body: { viventiumSurface: 'telegram', telegramAudioRequested: true } },
+      { text: raw },
+    );
+    expect(result.text).toBe('A stray ` stays literal');
+    expect(sanitizeVoiceSurfaceTextForDisplay(raw + ' [12] turn0search0')).toBe(
+      'A stray ` stays literal',
+    );
+    expect(artifactCounts('A stray ` leaves **emphasis** in prose.').markdownEmphasis).toBe(1);
+  });
+
+  test('preserves unchanged code parts and their exact native delivery ranges', () => {
+    const text = '```text\n[draft]\n```';
+    const part = {
+      type: 'text',
+      text,
+      deliveryDispositionRanges: [{ start: 0, end: text.length, disposition: { audio: 'skip' } }],
+    };
+    const result = sanitizeVoiceAssistantMessageForPersistence(
+      { body: { viventiumSurface: 'telegram', telegramAudioRequested: true } },
+      { text, content: [part] },
+    );
+    expect(result.text).toBe(text);
+    expect(result.content[0]).toBe(part);
   });
 });

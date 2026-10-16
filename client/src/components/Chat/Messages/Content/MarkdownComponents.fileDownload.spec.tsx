@@ -38,6 +38,8 @@ jest.mock('~/components/Messages/Content/Mermaid', () => ({
   default: () => null,
 }));
 
+const downloadLabel = 'Download';
+
 test.each([
   ['copy%20%5Bfinal%5D.md', 'copy [final].md'],
   ['literal%2520.md', 'literal%20.md'],
@@ -53,10 +55,10 @@ test.each([
   try {
     render(
       <MarkdownAnchor href={`/files/owner/native_imported/${segment}`}>
-        {'Download'}
+        {downloadLabel}
       </MarkdownAnchor>,
     );
-    fireEvent.click(screen.getByRole('link', { name: 'Download' }));
+    fireEvent.click(screen.getByRole('button', { name: downloadLabel }));
     await waitFor(() => expect(downloads).toEqual([expected]));
     expect(mockFileDownload).toHaveBeenCalledWith('owner', 'native_imported');
   } finally {
@@ -81,7 +83,7 @@ function renderGrant(attachments: TAttachment[] = [owned], href = grant, message
     <MessageContext.Provider
       value={{ messageId, isExpanded: true, viventiumFileAttachments: attachments }}
     >
-      <MarkdownAnchor href={href}>{'Download'}</MarkdownAnchor>
+      <MarkdownAnchor href={href}>{downloadLabel}</MarkdownAnchor>
     </MessageContext.Provider>,
   );
 }
@@ -95,10 +97,8 @@ test('exact verified native grant uses normal File download without changing aut
   window.URL.revokeObjectURL = jest.fn();
   try {
     renderGrant();
-    const anchor = screen.getByRole('link', { name: 'Download' });
-    expect(anchor.getAttribute('href')).toContain(
-      `/api/files/owner/${'native_' + 'a'.repeat(64)}/copy%20%5Bfinal%5D.md`,
-    );
+    const anchor = screen.getByRole('button', { name: downloadLabel });
+    expect(anchor).not.toHaveAttribute('href');
     fireEvent.click(anchor);
     await waitFor(() => expect(downloads).toEqual(['copy [final].md']));
     expect(mockFileDownload).toHaveBeenCalledWith('owner', owned.file_id);
@@ -137,7 +137,7 @@ test.each([
   'keeps %s external; it gains no File download binding',
   (_label, attachments, href, messageId) => {
     renderGrant(attachments as TAttachment[], href as string, messageId as string);
-    expect(screen.getByRole('link', { name: 'Download' })).toHaveAttribute('href', href);
+    expect(screen.getByRole('link', { name: downloadLabel })).toHaveAttribute('href', href);
     expect(mockFileDownload).toHaveBeenCalledWith('owner', '');
   },
 );

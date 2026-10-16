@@ -780,3 +780,49 @@ test('native MCP startup failure is recoverable but a failed MCP tool is not', (
     shouldRetryWithFallback([part, { type: ContentTypes.TEXT, text: 'Already visible.' }]),
   ).toBe(false);
 });
+
+/* === VIVENTIUM START === A failed consult must not turn HTTP400 into a retryable Main call. */
+test('a final model request-rejection phase preserves outer HTTP400 no-retry semantics', () => {
+  const original = Object.assign(new Error('Synthetic API request rejection'), { status: 400 });
+  const rejected = Object.assign(new Error('Synthetic API request rejection'), {
+    status: 400,
+    viventiumCompletionPhase: 'provider_request_rejected',
+  });
+  expect(isRecoverableProviderFallbackError(original)).toBe(false);
+  expect(isRecoverableProviderFallbackError(rejected)).toBe(false);
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Direct refusal keeps the existing typed no-fallback policy. === */
+test('typed Direct HTTP403 request refusal does not retry through another provider', () => {
+  const refused = { status: 403, code: 'provider_request_rejected' };
+  expect(isRecoverableProviderFallbackError(refused)).toBe(false);
+  expect(
+    isRecoverableProviderFallbackError({
+      status: 502,
+      error: { type: 'glasshive_runtime_error', code: refused.code },
+    }),
+  ).toBe(false);
+  expect(
+    shouldRetryWithFallback([
+      {
+        type: ContentTypes.ERROR,
+        error: 'The selected API declined this request or its model access.',
+        error_class: refused.code,
+      },
+    ]),
+  ).toBe(false);
+  expect(
+    shouldRetryBackgroundCortexWithFallback({
+      insight: null,
+      errorStatus: refused.status,
+      errorCode: refused.code,
+      errorClass: refused.code,
+      harnessInvocationStarted: true,
+    }),
+  ).toBe(false);
+  expect(isRecoverableProviderFallbackError({ status: 401, code: 'provider_auth_missing' })).toBe(
+    true,
+  );
+});
+/* === VIVENTIUM END === */

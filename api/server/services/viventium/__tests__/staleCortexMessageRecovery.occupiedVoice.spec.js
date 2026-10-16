@@ -62,7 +62,7 @@ function authority(changes = {}) {
     ...changes,
   };
 }
-describe('owned typed-occupancy Voice recovery', () => {
+describe('owned Voice recovery authority', () => {
   const resolve = (changes = {}, state = parentState(), recoveryContext = context) =>
     resolveOwnedVoiceCortexRecovery({
       ...parent,
@@ -245,8 +245,8 @@ function fixture({ state = 'live', persisted = false, skip = false } = {}) {
   };
   return { service, options };
 }
-describe('existing durable occupancy consumer', () => {
-  test('immutable per-row occupancy survives overwritten parent decisions', async () => {
+describe('existing durable Voice recovery consumer', () => {
+  test('retained Voice source survives overwritten parent decisions', async () => {
     const { service, options } = fixture();
     const overwritten = parentState();
     overwritten.metadata.viventium.cortexFollowUpDecision = { generationFailed: true };
@@ -259,40 +259,79 @@ describe('existing durable occupancy consumer', () => {
     expect(options.createMessage).toHaveBeenCalledTimes(1);
     expect(service.markDropped).not.toHaveBeenCalled();
   });
-  test('parent marker cannot widen an unrelated row without ledger occupancy evidence', async () => {
+  test.each([
+    'generation_failed_without_fallback',
+    'presentation_failed',
+    'delivery_runtime_restarted',
+  ])(
+    '%s retries through exact Voice authority without requiring a native-occupancy cause',
+    async (reason) => {
+      const { service, options } = fixture();
+      service.listEvents.mockResolvedValue([
+        { deliveryId: 'delivery-a', transition: 'failure', reason },
+      ]);
+      expect(await recoverPendingCortexInsightDeliveries(options)).toMatchObject({
+        persisted: 1,
+        pending: 1,
+        dropped: 0,
+        sent: 0,
+      });
+      expect(options.resolveVoiceRecovery).toHaveBeenCalled();
+      expect(options.createMessage).toHaveBeenCalledTimes(1);
+      expect(service.markDropped).not.toHaveBeenCalled();
+      expect(options.presentSurface).not.toHaveBeenCalled();
+    },
+  );
+  test('different failure causes retain the complete sibling batch and one author', async () => {
     const { service, options } = fixture();
-    service.listEvents.mockResolvedValue([
-      { deliveryId: 'delivery-a', transition: 'failure', reason: 'presentation_failed' },
-    ]);
-    await recoverPendingCortexInsightDeliveries(options);
-    expect(options.resolveVoiceRecovery).not.toHaveBeenCalled();
-    expect(options.createMessage).not.toHaveBeenCalled();
-    expect(service.markDropped).toHaveBeenCalledWith(
-      expect.objectContaining({ dropReason: 'unsupported_surface' }),
-    );
-  });
-  test('mixed per-row cause preserves typed contribution without widening or slicing its complete batch', async () => {
-    const { service, options } = fixture();
-    const original = (await service.listByParent())[0];
-    service.listByParent.mockResolvedValue([
-      original,
-      { ...original, deliveryId: 'delivery-unrelated' },
-    ]);
+    const batch = await service.claimPendingByParent();
+    const claims = [...batch.claimed, { ...batch.claimed[0], deliveryId: 'delivery-b' }];
+    service.listByParent.mockResolvedValue(claims);
     service.listEvents.mockResolvedValue([
       { deliveryId: 'delivery-a', transition: 'failure', reason: 'native_session_occupied' },
-      { deliveryId: 'delivery-unrelated', transition: 'failure', reason: 'presentation_failed' },
+      { deliveryId: 'delivery-b', transition: 'failure', reason: 'presentation_failed' },
     ]);
+    service.claimPendingByParent.mockClear().mockResolvedValue({
+      ...batch,
+      claimed: claims,
+      deliveries: claims,
+      insights: [
+        ...batch.insights,
+        { cortexId: 'cortex-b', insight: 'Another useful insight.', status: 'completed' },
+      ],
+    });
+    service.markPersisted.mockResolvedValue(claims);
     expect(await recoverPendingCortexInsightDeliveries(options)).toMatchObject({
+      persisted: 2,
       pending: 2,
       dropped: 0,
     });
-    expect(service.claimPendingByParent).not.toHaveBeenCalled();
+    expect(service.claimPendingByParent).toHaveBeenCalledTimes(1);
+    expect(options.createMessage).toHaveBeenCalledTimes(1);
+    expect(options.createMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deliveryBatch: expect.objectContaining({ claimed: claims }),
+        insights: expect.arrayContaining([
+          expect.objectContaining({ cortexId: 'cortex-a' }),
+          expect.objectContaining({ cortexId: 'cortex-b' }),
+        ]),
+      }),
+    );
     expect(service.markDropped).not.toHaveBeenCalled();
-    expect(options.createMessage).not.toHaveBeenCalled();
-    expect(service.deferRecoverableParent).toHaveBeenCalledTimes(1);
   });
-  test('saved live child re-wakes and backs off without reclaiming presentation', async () => {
+  test('a batch refused by the existing envelope claim cannot author or present', async () => {
+    const { service, options } = fixture();
+    service.claimPendingByParent.mockResolvedValue({ claimed: [] });
+    await recoverPendingCortexInsightDeliveries(options);
+    expect(options.createMessage).not.toHaveBeenCalled();
+    expect(options.presentSurface).not.toHaveBeenCalled();
+    expect(service.markPersisted).not.toHaveBeenCalled();
+  });
+  test('saved child after runtime interruption re-wakes without reclaiming presentation', async () => {
     const { service, options } = fixture({ persisted: true });
+    service.listEvents.mockResolvedValue([
+      { deliveryId: 'delivery-a', transition: 'failure', reason: 'delivery_runtime_restarted' },
+    ]);
     await recoverPendingCortexInsightDeliveries(options);
     expect(options.wakeVoiceFollowUp).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -465,15 +504,40 @@ describe('existing durable occupancy consumer', () => {
     });
     expect(service.markFailed).not.toHaveBeenCalled();
   });
-  test('untyped Voice failure keeps its existing unsupported contract', async () => {
+  test('missing original Voice authority fails closed regardless of the previous error', async () => {
     const { service, options } = fixture();
     options.loadParentState.mockResolvedValue({ messageId: 'parent-a', unfinished: false });
-    service.listEvents.mockResolvedValue([]);
-    await recoverPendingCortexInsightDeliveries(options);
-    expect(service.markDropped).toHaveBeenCalledWith(
-      expect.objectContaining({ dropReason: 'unsupported_surface' }),
+    options.resolveVoiceRecovery.mockImplementation((input) =>
+      resolveOwnedVoiceCortexRecovery({
+        ...input,
+        dependencies: authority(),
+      }),
     );
+    service.listEvents.mockResolvedValue([]);
+    expect(await recoverPendingCortexInsightDeliveries(options)).toMatchObject({
+      pending: 1,
+      persisted: 0,
+      sent: 0,
+    });
+    expect(options.createMessage).not.toHaveBeenCalled();
+    expect(options.presentSurface).not.toHaveBeenCalled();
+    expect(service.markDropped).not.toHaveBeenCalled();
+    expect(service.markFailed).toHaveBeenCalledTimes(1);
+  });
+  test('a terminal historical row is never reclaimed, authored, or replayed', async () => {
+    const { service, options } = fixture();
+    const claim = (await service.listByParent())[0];
+    service.listByParent.mockResolvedValue([
+      { ...claim, status: 'dropped', dropReason: 'unsupported_surface' },
+    ]);
+    expect(await recoverPendingCortexInsightDeliveries(options)).toMatchObject({
+      claimed: 0,
+      persisted: 0,
+      sent: 0,
+    });
+    expect(service.claimPendingByParent).not.toHaveBeenCalled();
     expect(options.resolveVoiceRecovery).not.toHaveBeenCalled();
     expect(options.createMessage).not.toHaveBeenCalled();
+    expect(options.wakeVoiceFollowUp).not.toHaveBeenCalled();
   });
 });

@@ -7,7 +7,6 @@ status: active
 safety_class: public_product
 output_contract: worker_instructions
 ---
-
 Conversation file delivery:
 
 - For turn-local child agents, wait for their terminal results before your final answer or handoff. Use their results and report any failure truthfully.

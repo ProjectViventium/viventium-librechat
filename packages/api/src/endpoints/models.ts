@@ -1,7 +1,8 @@
 import axios from 'axios';
+import { createHash } from 'crypto';
 import { logger } from '@librechat/data-schemas';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { CacheKeys, KnownEndpoints, EModelEndpoint, defaultModels } from 'librechat-data-provider';
+import { CacheKeys, KnownEndpoints, EModelEndpoint, defaultModels, extractEnvVariable, normalizeEndpointName } from 'librechat-data-provider';
 import type { IUser } from '@librechat/data-schemas';
 import {
   processModelData,
@@ -13,6 +14,120 @@ import {
   inputSchema,
 } from '~/utils';
 import { standardCache } from '~/cache';
+import { trustedUploadedFilesFromRequestBody } from '~/glasshive/sourceSelection';
+import { GLASSHIVE_NATIVE_MEDIA_MAX_IMAGES, GLASSHIVE_NATIVE_MEDIA_MAX_BYTES,
+  GLASSHIVE_NATIVE_MEDIA_MAX_IMAGE_BYTES } from '~/glasshive/nativeMedia';
+
+/** Authenticated discovery metadata only; reads never fetch or delay a conversation turn. */
+const nativeHistoryModelCache = standardCache(CacheKeys.CONFIG_STORE);
+const nativeHistoryKey = (baseURL: string) =>
+  `native-history-admission:${createHash('sha256').update(baseURL.replace(/\/+$/, '')).digest('hex')}`;
+
+export async function getNativeConversationReplayBudget(name: string, baseURL: string, model: string) {
+  if (!name || !baseURL || !model) return null;
+  const catalog = await nativeHistoryModelCache.get(nativeHistoryKey(baseURL));
+  const value = catalog?.[model];
+  return Number.isSafeInteger(value) && value > 0 ? Number(value) : null;
+}
+
+export async function getNativeConversationReplayBudgetForRoutes(
+  routes: Array<{ endpoint?: string; provider?: string; model?: string }>,
+  endpoints: Array<{ name?: string; baseURL?: string }> | undefined,
+) {
+  if (!routes.length || !Array.isArray(endpoints)) return null;
+  const values = await Promise.all(routes.map(async route => {
+    const name = String(route.endpoint || route.provider || '');
+    const endpoint = endpoints.find(item => normalizeEndpointName(String(item.name || '')) === normalizeEndpointName(name));
+    const baseURL = extractEnvVariable(String(endpoint?.baseURL || ''));
+    if (!baseURL || isUserProvided(baseURL) || baseURL.includes('${')) return null;
+    return getNativeConversationReplayBudget(name, baseURL, String(route.model || ''));
+  }));
+  return values.some(value => value === null) ? null : Math.min(...values as number[]);
+}
+
+/** Bound the existing public upload ledger plus its duplicated native workspace paths. */
+export function nativeHistoryAttachmentContextBytes(files: Array<Record<string, unknown>>) {
+  const selected = trustedUploadedFilesFromRequestBody({ files });
+  const ledger = selected.map((file, index) => ({
+    file_id: file.file_id,
+    // Native sanitization can shorten a name or substitute this fallback. Concatenation bounds
+    // both without duplicating that sanitizer or selecting a different workspace filename.
+    filename: `${String(file.filename || file.file_id || '')}upload-${index + 1}`,
+    source: file.source, type: file.type, bytes: file.bytes, media_group_index: file.media_group_index,
+    inputKind: file.source === 'text' ? 'extracted_text' : 'original',
+  }));
+  return selected.length ? 2 * Buffer.byteLength(JSON.stringify({ selected_uploads: ledger }), 'utf8') +
+    Buffer.byteLength(ledger.map((_, index) => `\n${index + 1}. uploads/-${selected.length}`).join(''), 'utf8') : 0;
+}
+
+/** Upper bound for replay text, excluding static native system configuration. */
+export function nativeConversationContextBudget(
+  messages: Array<Record<string, unknown>>, budgetBytes: number, sourceMetadataBytes = 0,
+): number | null {
+  if (![budgetBytes, sourceMetadataBytes].every(Number.isSafeInteger) ||
+      budgetBytes <= 0 || sourceMetadataBytes < 0) return null;
+  try {
+    let inlineImageCount = 0;
+    let inlineImageBytes = 0;
+    const visible = messages.filter(message => !['system', 'developer'].includes(String(message.role)))
+      .map(({ role, content, tool_call_id, call_id, name }) => ({ role,
+        // The native reader renders these declared content kinds. Other typed display/tool
+        // blocks stay unchanged in the actual courier and their existing evidence owners.
+        content: Array.isArray(content) ? content.filter(part => part && typeof part === 'object' &&
+          ['text', 'input_text', 'output_text', 'image_url', 'input_image', 'file', 'input_file'].includes(String(part.type)))
+          .map(part => {
+            if (['text', 'input_text', 'output_text'].includes(String(part.type))) return part;
+            // _message_text renders a media label; the existing native media/file owner carries
+            // its complete original bytes separately. Do not charge inline base64 as replay text.
+            if (['image_url', 'input_image'].includes(String(part.type))) {
+              const url = typeof part.image_url === 'object' && part.image_url !== null
+                ? part.image_url.url : part.image_url;
+              if (typeof url === 'string' && url.startsWith('data:')) {
+                // Match the existing native inline-image ingress before claiming replay fits.
+                // Duplicate images are conservatively counted; the native owner may deduplicate.
+                if (url.length > Math.ceil(GLASSHIVE_NATIVE_MEDIA_MAX_IMAGE_BYTES / 3) * 4 + 64)
+                  throw new TypeError('native_media_capacity');
+                const data = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/]*={0,2})$/.exec(url);
+                if (!data) throw new TypeError('native_media_unknown');
+                const bytes = Buffer.from(data[2], 'base64');
+                const signatures: Record<string, boolean> = {
+                  'image/png': bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex')),
+                  'image/jpeg': bytes.subarray(0, 3).equals(Buffer.from('ffd8ff', 'hex')) &&
+                    bytes.subarray(-2).equals(Buffer.from('ffd9', 'hex')),
+                  'image/gif': ['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString('ascii')),
+                  'image/webp': bytes.subarray(0, 4).toString('ascii') === 'RIFF' &&
+                    bytes.subarray(8, 12).toString('ascii') === 'WEBP',
+                };
+                inlineImageCount += 1;
+                inlineImageBytes += bytes.length;
+                if (!bytes.length || bytes.length > GLASSHIVE_NATIVE_MEDIA_MAX_IMAGE_BYTES ||
+                    bytes.toString('base64') !== data[2] || !signatures[data[1]] ||
+                    inlineImageCount > GLASSHIVE_NATIVE_MEDIA_MAX_IMAGES ||
+                    inlineImageBytes > GLASSHIVE_NATIVE_MEDIA_MAX_BYTES)
+                  throw new TypeError('native_media_capacity');
+              }
+            }
+            const label = part.name || part.filename || part.type;
+            if (typeof label !== 'string') throw new TypeError('native_media_label_unknown');
+            return { type: 'text', text: `[Attached ${label}]` };
+          }) : content,
+        tool_call_id, call_id, name }));
+    // JSON bounds the original text, media labels and tool descriptor values. The additional
+    // per-row allowance bounds message headings; source metadata bounds delivery/source labels.
+    const bytes = Buffer.byteLength(JSON.stringify(visible), 'utf8') +
+      visible.length * 128 + 4096 + sourceMetadataBytes;
+    return budgetBytes - bytes;
+  } catch { return null; }
+}
+
+export function nativeConversationHistoryFits(
+  messages: Array<Record<string, unknown>>, budgetBytes: number,
+  reservedContextBytes: number, sourceMetadataBytes = 0,
+) {
+  if (!Number.isSafeInteger(reservedContextBytes) || reservedContextBytes < 0) return false;
+  const remaining = nativeConversationContextBudget(messages, budgetBytes, sourceMetadataBytes);
+  return remaining !== null && remaining >= reservedContextBytes;
+}
 
 export interface FetchModelsParams {
   /** User ID for API requests */
@@ -162,6 +277,15 @@ export async function fetchModels({
     const res = await axios.get(url.toString(), options);
 
     const input = res.data;
+    const nativeBudgets: Record<string, number> = {};
+    for (const item of Array.isArray(input?.data) ? input.data : []) {
+      const floor = item?.native_history_admission_v1?.replay_budget_floor_bytes;
+      if (typeof item?.id === 'string' && Number.isSafeInteger(floor) && floor > 0)
+        nativeBudgets[item.id] = floor;
+    }
+    // Replace the whole discovery projection: a removed or invalid declaration cannot retain
+    // an older optimistic floor. Credentials and provider response prose never enter this cache.
+    await nativeHistoryModelCache.set(nativeHistoryKey(baseURL ?? ''), nativeBudgets);
 
     const validationResult = inputSchema.safeParse(input);
     if (validationResult.success && createTokenConfig) {

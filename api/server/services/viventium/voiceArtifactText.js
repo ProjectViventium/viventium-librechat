@@ -8,7 +8,7 @@
  *   voice-facing display, persistence, or TTS surfaces.
  * - Preserve semantic text while stripping transport/formatting syntax such as Markdown
  *   emphasis markers, citation markers, provider voice-control tags and code fences.
- * - Preserve public links in display and persistence; speech owns URL removal.
+ * - Preserve public links and email addresses in display and persistence; speech owns reference cleanup.
  * - Preserve authored repetition; only typed stream identity can prove a repeated transport part.
  * - Let QA import the same detector/forbidden-key contract that runtime uses.
  *
@@ -156,7 +156,7 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function collectProtectedTextRanges(text) {
+function collectProtectedTextRanges(text, { codeOnly = false } = {}) {
   const value = String(text || '');
   const ranges = [];
   const addRegexRanges = (regex) => {
@@ -166,12 +166,13 @@ function collectProtectedTextRanges(text) {
     }
   };
 
-  addRegexRanges(/```[\s\S]*?```/g);
-  addRegexRanges(/`[^`\n]+`/g);
-  addRegexRanges(/"(?:\\.|[^"\\])*"/g);
-  addRegexRanges(/“[^”]*”/g);
-  addRegexRanges(/‘[^’]*’/g);
-  addRegexRanges(/(^|\n)[ \t]*>[^\n]*/g);
+  addRegexRanges(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`/g);
+  if (!codeOnly) {
+    addRegexRanges(/"(?:\\.|[^"\\])*"/g);
+    addRegexRanges(/“[^”]*”/g);
+    addRegexRanges(/‘[^’]*’/g);
+    addRegexRanges(/(^|\n)[ \t]*>[^\n]*/g);
+  }
 
   return ranges
     .filter(([start, end]) => end > start)
@@ -221,7 +222,7 @@ const MARKDOWN_EMPHASIS_STRIP_RE =
 const MARKDOWN_MARKER_ONLY_LINE_RE = /(^|\n)\s*(?:[*_~]\s*)+\s*(?=\n|$)/g;
 const MARKDOWN_LINK_TARGET_RE = /(!?\[[^\]]*\]\()((?:https?:\/\/|www\.)[^)\s]+)(\))/gi;
 const MARKDOWN_URL_EMPHASIS_RE =
-  /(^|[^\w])(\*{1,3}|_{1,3}|~~)(?=\S)([^\n]*?(?:https?:\/\/|www\.)[^\n]*?\S)\2(?!\w)/gi;
+  /(^|[^\w])(\*{1,3}|_{1,3}|~~)(?=\S)([^\n]*?(?:https?:\/\/|www\.|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})[^\n]*?\S)\2(?!\w)/gi;
 const CODE_BLOCK_RE = /```[\s\S]*?```/g;
 const INLINE_CODE_RE = /`([^`\n]+)`/g;
 const EMAIL_RE = /\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/g;
@@ -367,7 +368,19 @@ function stripMarkdownEmphasisSyntax(text) {
 }
 
 function stripVoiceControlTags(text) {
-  let cleaned = String(text || '');
+  const value = String(text || '');
+  let cleaned = '';
+  let offset = 0;
+  for (const [start, end] of collectProtectedTextRanges(value, { codeOnly: true })) {
+    cleaned += stripVoiceControlTagsFromProse(value.slice(offset, start));
+    cleaned += value.slice(start, end);
+    offset = end;
+  }
+  return cleaned + stripVoiceControlTagsFromProse(value.slice(offset));
+}
+
+function stripVoiceControlTagsFromProse(text) {
+  let cleaned = text;
   const angleNames = VOICE_CONTROL_NAMES.map(escapeRegExp).join('|');
   const angleTagRe = new RegExp(`</?(?:${angleNames})(?:\\s+[^<>]*)?\\/?>`, 'gi');
   const bracketTagRe = new RegExp(`\\[\\s*/?\\s*(?:${angleNames})\\s*\\]`, 'gi');
@@ -450,10 +463,10 @@ function sanitizeVoiceSurfaceTextForDisplay(text) {
   cleaned = cleaned.replace(
     MARKDOWN_URL_EMPHASIS_RE,
     (_match, prefix, marker, inner) =>
-      `${prefix}${marker}${inner.replace(URL_RE, protectUrl)}${marker}`,
+      `${prefix}${marker}${inner.replace(URL_RE, protectUrl).replace(EMAIL_RE, protectUrl)}${marker}`,
   );
   cleaned = cleaned.replace(URL_RE, protectUrl);
-  cleaned = cleaned.replace(EMAIL_RE, 'address available');
+  cleaned = cleaned.replace(EMAIL_RE, protectUrl);
   cleaned = stripMarkdownEmphasisSyntax(cleaned);
   cleaned = normalizeVoiceSurfaceWhitespace(cleaned);
   const linkTokenRe = new RegExp(`${escapeRegExp(linkTokenPrefix)}(\\d+)\u0000`, 'g');

@@ -883,6 +883,8 @@ async function updateMessage(req, message, metadata) {
       options.overwriteImmutable = true;
     }
     const operationKind = metadata?.operationKind || 'edit';
+    // Keep one presentation identity across the transaction owner's automatic retries.
+    const presentationGuard = {};
     const persist = async () => {
       const protectedUpdate = await preserveMessageMainContext(
         { messageId, user: req.user.id },
@@ -899,6 +901,7 @@ async function updateMessage(req, message, metadata) {
           { messageId, ...protectedUpdate },
           req._viventiumNativeResponseIdentity,
           'augmentation',
+          presentationGuard,
         );
         if (guarded !== undefined) return guarded;
       }

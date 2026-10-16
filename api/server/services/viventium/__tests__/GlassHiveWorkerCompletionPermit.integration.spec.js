@@ -22,16 +22,13 @@ const mockRecordVoiceOrchestrationTrace = jest.fn().mockResolvedValue(null);
 
 jest.mock('../GlassHiveCallbackBindingService', () => ({
   ...jest.requireActual('../GlassHiveCallbackBindingService'),
-  isGlassHiveNonterminalAttentionCallback:
-    require('@librechat/api').createGlassHiveCallbackBindingService({})
-      .isGlassHiveNonterminalAttentionCallback,
   recordGlassHiveSurfaceDeliveryOutcome: (...args) =>
     mockRecordGlassHiveSurfaceDeliveryOutcome(...args),
 }));
 
 jest.mock('../VoiceOrchestrationTraceService', () => ({
-  recordVoiceOrchestrationTrace: (...args) => mockRecordVoiceOrchestrationTrace(...args),
   recordVoiceOrchestrationTraceBestEffort: (...args) => mockRecordVoiceOrchestrationTrace(...args),
+  recordVoiceOrchestrationTrace: (...args) => mockRecordVoiceOrchestrationTrace(...args),
 }));
 
 const {
@@ -289,72 +286,86 @@ describe('GlassHive grouped Voice completion dispatch permit', () => {
     );
   }, 15000);
 
-  test('reuses a public-base row without originRef and preserves unbound replay bytes', async () => {
-    const ownerId = 'owner-public-base-upgrade';
-    const originRef = 'origin-public-base-upgrade';
-    const callbackId = 'raw-public-base-upgrade';
-    const callbackRef = canonicalizeGlassHiveCallbackRef(callbackId);
-    const legacyDeliveryKey = `telegram:${callbackRef}`;
-    const now = new Date();
-    await ViventiumGlassHiveCallbackDelivery.collection.insertOne({
-      deliveryKey: legacyDeliveryKey,
-      deliveryId: 'delivery-public-base-upgrade',
-      callbackId: callbackRef,
-      traceIdentityVerified: false,
-      callbackKey: '',
-      callbackMessageId: 'message-public-base-upgrade',
-      userId: ownerId,
-      conversationId: 'conversation-public-base-upgrade',
-      surface: 'telegram',
-      event: 'run.needs_input',
-      status: 'pending',
-      text: 'Legacy delivery text.',
-      retryCount: 0,
-      nextAttemptAt: now,
-      expiresAt: new Date(now.getTime() + 60_000),
-      createdAt: now,
-      updatedAt: now,
-    });
+  test.each([
+    ['run.blocked', true],
+    ['run.needs_input', false],
+  ])(
+    'preserves public-base replay bytes for %s with dispatch eligibility %s',
+    async (event, eligible) => {
+      const ownerId = 'owner-public-base-upgrade';
+      const originRef = 'origin-public-base-upgrade';
+      const callbackId = 'raw-public-base-upgrade';
+      const callbackRef = canonicalizeGlassHiveCallbackRef(callbackId);
+      const legacyDeliveryKey = `telegram:${callbackRef}`;
+      const now = new Date();
+      await ViventiumGlassHiveCallbackDelivery.collection.insertOne({
+        deliveryKey: legacyDeliveryKey,
+        deliveryId: 'delivery-public-base-upgrade',
+        callbackId: callbackRef,
+        traceIdentityVerified: false,
+        callbackKey: '',
+        callbackMessageId: 'message-public-base-upgrade',
+        userId: ownerId,
+        conversationId: 'conversation-public-base-upgrade',
+        surface: 'telegram',
+        event,
+        status: 'pending',
+        text: 'Legacy delivery text.',
+        retryCount: 0,
+        nextAttemptAt: now,
+        expiresAt: new Date(now.getTime() + 60_000),
+        createdAt: now,
+        updatedAt: now,
+      });
 
-    await expect(
-      enqueueGlassHiveCallbackDelivery({
-        body: {
-          callback_id: callbackId,
-          attempt_number: 4,
-          event: 'run.needs_input',
-          origin_ref: originRef,
-          work_ref: 'work-public-base-upgrade',
-        },
-        deliveryContext: {
-          ownerId,
-          originRef,
-          workRef: 'work-public-base-upgrade',
-          conversationId: 'conversation-public-base-upgrade',
-          traceIdentity: { callbackRef, attemptNumber: 4 },
-          destinations: [{ surface: 'telegram', telegramChatId: 'chat-public-base-upgrade' }],
-        },
-        message: {
-          messageId: 'message-public-base-upgrade',
+      await expect(
+        enqueueGlassHiveCallbackDelivery({
+          body: {
+            callback_id: callbackId,
+            attempt_number: 4,
+            event,
+            origin_ref: originRef,
+            work_ref: 'work-public-base-upgrade',
+          },
+          deliveryContext: {
+            ownerId,
+            originRef,
+            workRef: 'work-public-base-upgrade',
+            conversationId: 'conversation-public-base-upgrade',
+            traceIdentity: { callbackRef, attemptNumber: 4 },
+            destinations: [{ surface: 'telegram', telegramChatId: 'chat-public-base-upgrade' }],
+          },
+          message: {
+            messageId: 'message-public-base-upgrade',
+            text: 'Current delivery text.',
+          },
           text: 'Current delivery text.',
-        },
-        text: 'Current delivery text.',
-      }),
-    ).resolves.toMatchObject({
-      configured: 1,
-      enqueued: 1,
-      deliveries: [
-        expect.objectContaining({ deliveryId: 'delivery-public-base-upgrade', status: 'pending' }),
-      ],
-    });
-    await expect(ViventiumGlassHiveCallbackDelivery.countDocuments({})).resolves.toBe(1);
-    const persisted = await ViventiumGlassHiveCallbackDelivery.collection.findOne({
-      deliveryKey: legacyDeliveryKey,
-    });
-    expect(persisted).toMatchObject({
-      deliveryId: 'delivery-public-base-upgrade',
-      userId: ownerId,
-      text: 'Legacy delivery text.',
-    });
-    expect(persisted).not.toHaveProperty('originRef');
-  }, 15000);
+        }),
+      ).resolves.toMatchObject(
+        eligible
+          ? {
+              configured: 1,
+              enqueued: 1,
+              deliveries: [
+                expect.objectContaining({
+                  deliveryId: 'delivery-public-base-upgrade',
+                  status: 'pending',
+                }),
+              ],
+            }
+          : { configured: 1, enqueued: 0, deliveries: [], deferredToMain: true },
+      );
+      await expect(ViventiumGlassHiveCallbackDelivery.countDocuments({})).resolves.toBe(1);
+      const persisted = await ViventiumGlassHiveCallbackDelivery.collection.findOne({
+        deliveryKey: legacyDeliveryKey,
+      });
+      expect(persisted).toMatchObject({
+        deliveryId: 'delivery-public-base-upgrade',
+        userId: ownerId,
+        text: 'Legacy delivery text.',
+      });
+      expect(persisted).not.toHaveProperty('originRef');
+    },
+    15000,
+  );
 });

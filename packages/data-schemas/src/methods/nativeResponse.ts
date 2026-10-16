@@ -910,6 +910,7 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
     update: Partial<IMessage>,
     expected?: NativeResponseIdentity,
     mode: 'snapshot' | 'augmentation' = 'snapshot',
+    presentationGuard?: { source?: string },
   ): Promise<NativeResponseRow | undefined> {
     const row = await getNativeResponse(userId, String(update.messageId || ''));
     if (expected?.responseMessageId === update.messageId && !row) {
@@ -939,6 +940,52 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
     // document carrier before the existing Native canonical-field guard, without changing the row.
     const dottedMetadata = Object.entries(update).filter(([key]) => key.startsWith('metadata.'));
     const dottedMetadataOnly = dottedMetadata.length > 0 && update.metadata === undefined;
+    const savedViventium = metadataRecord(row.metadata?.viventium);
+    const savedAcknowledgement = savedViventium.deliveryAcknowledgement;
+    const acknowledgement = metadataRecord(savedAcknowledgement);
+    const presentationSource = sortedJson({
+      status: admission.status,
+      acknowledgement: savedAcknowledgement,
+      messageRevision: savedViventium.messageRevision,
+    });
+    const presentationChanged = () =>
+      Object.assign(new Error('native_response_presentation_changed'), {
+        code: 'native_response_presentation_changed',
+      });
+    // Mongo may retry a conflicting write. Re-reading the winner cannot authorize replacing it.
+    if (presentationGuard?.source && presentationGuard.source !== presentationSource)
+      throw presentationChanged();
+    const requestedRevision = Number(
+      update['metadata.viventium.messageRevision'] ??
+        metadataRecord(update.metadata?.viventium).messageRevision,
+    );
+    const suppliesAcknowledgement =
+      Object.prototype.hasOwnProperty.call(
+        metadataRecord(update.metadata?.viventium),
+        'deliveryAcknowledgement',
+      ) ||
+      dottedMetadata.some(
+        ([key]) =>
+          key === 'metadata.viventium.deliveryAcknowledgement' ||
+          key.startsWith('metadata.viventium.deliveryAcknowledgement.'),
+      );
+    // A new successful host presentation retires its older receipt, including when the Message
+    // owner's immutable-input guard converted a metadata replacement to dotted leaves.
+    const bindsPresentation =
+      hostGraph &&
+      mode === 'augmentation' &&
+      update.unfinished === false &&
+      update.error === false &&
+      !suppliesAcknowledgement &&
+      Number.isSafeInteger(requestedRevision) &&
+      requestedRevision >
+        Math.max(
+          Number(savedViventium.messageRevision) || 1,
+          Number(acknowledgement.revision) || 1,
+        );
+    if (bindsPresentation && presentationGuard) presentationGuard.source = presentationSource;
+    const clearsPriorAcknowledgement =
+      bindsPresentation && savedAcknowledgement !== undefined && acknowledgement.state !== 'failed';
     if (dottedMetadata.length) {
       update = {
         ...update,
@@ -958,13 +1005,9 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
       const savedViventium = metadataRecord(row.metadata?.viventium);
       const incoming = metadataRecord(update.metadata);
       const viventium = { ...metadataRecord(incoming.viventium) };
-      // Foreground snapshots cannot undo presentation receipts. Failed presentation also
-      // survives augmentation; successful empty-parent promotion may start a new presentation.
-      if (
-        mode === 'snapshot' ||
-        metadataRecord(savedViventium.deliveryAcknowledgement).state === 'failed'
-      )
-        canonicalKeys.push('deliveryAcknowledgement');
+      // Only an explicit newer successful host revision can retire an older presentation.
+      if (!clearsPriorAcknowledgement) canonicalKeys.push('deliveryAcknowledgement');
+      else delete viventium.deliveryAcknowledgement;
       for (const key of canonicalKeys) {
         if (Object.prototype.hasOwnProperty.call(savedViventium, key))
           viventium[key] = savedViventium[key];
@@ -1029,11 +1072,34 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
       }
     }
     const saved = await messages().findOneAndUpdate(
-      { ...responseFilter(admission), 'nativeResponse.status': admission.status },
-      { $set: guarded },
+      {
+        ...responseFilter(admission),
+        'nativeResponse.status': admission.status,
+        ...(bindsPresentation
+          ? {
+              'metadata.viventium.deliveryAcknowledgement':
+                savedAcknowledgement === undefined ? { $exists: false } : savedAcknowledgement,
+              'metadata.viventium.messageRevision': Object.prototype.hasOwnProperty.call(
+                savedViventium,
+                'messageRevision',
+              )
+                ? savedViventium.messageRevision
+                : { $exists: false },
+            }
+          : {}),
+      },
+      {
+        $set: guarded,
+        ...(clearsPriorAcknowledgement && dottedMetadataOnly
+          ? { $unset: { 'metadata.viventium.deliveryAcknowledgement': 1 } }
+          : {}),
+      },
       { new: true },
     );
     if (saved) return saved.toObject();
+    // The caller must retain the winning presentation and use its existing separate-child path.
+    // Returning that unchanged winner as a successful promotion would misreport persistence.
+    if (bindsPresentation) throw presentationChanged();
     const winner = await getNativeResponse(userId, String(update.messageId));
     if (!winner) throw new Error('native_response_message_deleted');
     const visibleWinner = { ...winner };

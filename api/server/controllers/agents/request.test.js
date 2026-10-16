@@ -164,6 +164,137 @@ const {
 } = require('~/server/services/viventium/interactionContext');
 
 describe('accepted source ledger before logical claim', () => {
+  test('binds a first trusted scheduler source to the admitted conversation before its ledger claim', async () => {
+    const req = makeReq();
+    req.body.conversationId = 'new';
+    req.body.text = 'Gather synthetic context.';
+    setTrustedInteractionContext(
+      req,
+      createSchedulerInteractionContext({
+        conversation_id: 'new',
+        source_event_id: 'prep-synthetic-source',
+      }),
+    );
+    const context = await AgentController.__testables.captureRequestInteractionContext(req, {
+      conversationId: 'canonical-synthetic-conversation',
+      streamId: 'prep-synthetic-stream',
+    });
+    expect(context).toMatchObject({
+      actor_kind: 'system',
+      origin: 'scheduler',
+      conversation_id: 'canonical-synthetic-conversation',
+      source_event_id: 'prep-synthetic-source',
+    });
+    expect(mockGenerationJobManager.retainLogicalTurnInput).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({ conversation_id: 'canonical-synthetic-conversation' }),
+    );
+    expect(context.source_segments).toEqual([
+      expect.objectContaining({ text: 'Gather synthetic context.' }),
+    ]);
+    expect(mockSaveMessage).not.toHaveBeenCalled(); // No invented external-user input permission.
+    const { captureMainContextSnapshot, traceMainHistoryAncestry } = jest.requireActual(
+      '~/server/services/viventium/ViventiumMainContextService',
+    );
+    const snapshot = captureMainContextSnapshot(req, {
+      agent: { id: 'synthetic-main' },
+      visibleMessages: [
+        {
+          messageId: 'synthetic-current-input',
+          role: 'user',
+          isCreatedByUser: true,
+          text: req.body.text,
+        },
+      ],
+      messages: [{ role: 'user', content: req.body.text }],
+      historyAncestry: traceMainHistoryAncestry({
+        ownerId: 'user-1',
+        conversationId: 'canonical-synthetic-conversation',
+        messages: [],
+        headId: null,
+      }),
+    });
+    expect(snapshot).toMatchObject({
+      conversationId: 'canonical-synthetic-conversation',
+      actorKind: 'system',
+      origin: 'scheduler',
+      memoryEligible: false,
+    });
+  });
+
+  test.each(['canonical-synthetic-conversation', 'foreign-synthetic-conversation'])(
+    'preserves concrete scheduler binding %s for the existing ancestry guard',
+    async (boundConversation) => {
+      const req = makeReq();
+      req.body.text = 'Gather synthetic context.';
+      setTrustedInteractionContext(
+        req,
+        createSchedulerInteractionContext({
+          conversation_id: boundConversation,
+          source_event_id: 'prep-synthetic-source',
+        }),
+      );
+      const context = await AgentController.__testables.captureRequestInteractionContext(req, {
+        conversationId: 'canonical-synthetic-conversation',
+        streamId: 'prep-synthetic-stream',
+      });
+      expect(context.conversation_id).toBe(boundConversation);
+      const { captureMainContextSnapshot, traceMainHistoryAncestry } = jest.requireActual(
+        '~/server/services/viventium/ViventiumMainContextService',
+      );
+      const visible = [
+        {
+          messageId: 'synthetic-current-input',
+          role: 'user',
+          isCreatedByUser: true,
+          text: 'Gather synthetic context.',
+        },
+      ];
+      const capture = () =>
+        captureMainContextSnapshot(req, {
+          agent: { id: 'synthetic-main' },
+          visibleMessages: visible,
+          messages: [{ role: 'user', content: 'Gather synthetic context.' }],
+          historyAncestry: traceMainHistoryAncestry({
+            ownerId: 'user-1',
+            conversationId: 'canonical-synthetic-conversation',
+            messages: [],
+            headId: null,
+          }),
+        });
+      if (boundConversation === 'foreign-synthetic-conversation')
+        expect(capture).toThrow(expect.objectContaining({ code: 'source_context_unavailable' }));
+      else expect(capture).not.toThrow();
+    },
+  );
+
+  test('canonical fresh-source binding cannot remap an already claimed logical turn', async () => {
+    const req = makeReq();
+    setTrustedInteractionContext(
+      req,
+      createSchedulerInteractionContext({
+        conversation_id: 'original-synthetic-conversation',
+        source_event_id: 'prep-synthetic-source',
+      }),
+    );
+    const original = getTrustedInteractionContext(req);
+    bindLogicalTurnContext(req, {
+      ...original,
+      logical_turn_id: 'claimed-synthetic-turn',
+      revision: 1,
+    });
+    const context = await AgentController.__testables.captureRequestInteractionContext(req, {
+      conversationId: 'different-synthetic-conversation',
+      streamId: 'prep-synthetic-stream',
+    });
+    expect(context).toMatchObject({
+      conversation_id: 'original-synthetic-conversation',
+      logical_turn_id: 'claimed-synthetic-turn',
+      actor_kind: 'system',
+      origin: 'scheduler',
+    });
+  });
+
   test('captures the accepted text and owner-scoped files without trusting body/header source claims', async () => {
     const req = makeReq();
     req.body.messageId = 'accepted-message';
@@ -1574,6 +1705,61 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     );
   });
 
+  test.each(['telegram', 'voice'])(
+    'an accepted effect cannot authorize obsolete assistant persistence on %s',
+    async (surface) => {
+      const req = makeReq();
+      req._resumableStreamId = 'old-stream';
+      const context = {
+        actor_kind: 'human',
+        origin: 'interactive',
+        surface,
+        conversation_id: 'conv-1',
+        source_event_id: 'source-old',
+        logical_turn_id: 'turn-old',
+        revision: 1,
+      };
+      setTrustedInteractionContext(
+        req,
+        context,
+        { segment_stability: 'provisional', supersede_scope: 'response_only' },
+        { commit_authority: 'external_adapter' },
+      );
+      const receipt = {
+        effect_kind: 'durable_work_accepted',
+        effect_ref: 'work-old',
+        source_event_id: 'source-old',
+        response_message_id: 'answer-old',
+        committed_at: 1,
+      };
+      mockGenerationJobManager.getJob.mockResolvedValue({
+        status: 'superseded',
+        interactionContext: context,
+        responseMessageId: 'answer-old',
+        adapterCapabilities: { supersede_scope: 'response_only' },
+        deliveryPolicy: { commit_authority: 'external_adapter' },
+        durableEffectReceipt: receipt,
+      });
+      const result = await AgentController.__testables.timedSaveMessage(
+        req,
+        {
+          messageId: 'answer-old',
+          conversationId: 'conv-1',
+          isCreatedByUser: false,
+          text: 'Accepted operation.',
+        },
+        {},
+        'db_save_test',
+      );
+      expect(result).toEqual({ suppressed: true, reason: 'superseded' });
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockMessageFindOneAndDelete).toHaveBeenCalledWith(
+        expect.objectContaining({ messageId: 'answer-old', unfinished: true }),
+      );
+      expect((await mockGenerationJobManager.getJob()).durableEffectReceipt).toEqual(receipt);
+    },
+  );
+
   test('keeps scheduler-only silence archived and unarchives the first deliverable result', async () => {
     const req = makeReq();
     setTrustedInteractionContext(
@@ -1951,7 +2137,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     [false, 'running', true],
     [true, 'superseded', false],
   ])(
-    'retains only an exact committed effect receipt during supersession (exact=%s, status=%s, signal=%s)',
+    'suppresses obsolete assistant output while retaining effect receipts separately (exact=%s, status=%s, signal=%s)',
     async (exact, status, signalAborted) => {
       const req = makeReq();
       req.viventiumCallSession = { callSessionId: 'call-1' };
@@ -2013,20 +2199,10 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         expect(mockGenerationJobManager.markMainResponseComplete).not.toHaveBeenCalled();
         expect(mockCommitAcceptedMainTurn).not.toHaveBeenCalled();
       }
-      if (exact) {
-        expect(mockMessageFindOneAndDelete).not.toHaveBeenCalled();
-        expect(mockGenerationJobManager.emitDone).toHaveBeenCalledWith(
-          'stream-1',
-          expect.objectContaining({
-            responseMessage: expect.objectContaining({ messageId: 'resp-msg-1' }),
-          }),
-        );
-      } else {
-        expect(mockMessageFindOneAndDelete).toHaveBeenCalledWith(
-          expect.objectContaining({ messageId: 'resp-msg-1', user: 'user-1' }),
-        );
-        expect(mockGenerationJobManager.emitDone).not.toHaveBeenCalled();
-      }
+      expect(mockMessageFindOneAndDelete).toHaveBeenCalledWith(
+        expect.objectContaining({ messageId: 'resp-msg-1', user: 'user-1' }),
+      );
+      expect(mockGenerationJobManager.emitDone).not.toHaveBeenCalled();
     },
   );
 

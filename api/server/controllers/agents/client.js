@@ -1,3 +1,4 @@
+const { collectCortexCitationAttachments } = require('@librechat/api');
 /* === VIVENTIUM START ===
  * File: api/server/controllers/agents/client.js
  *
@@ -56,9 +57,12 @@ const {
   loadFeelingsReadContext,
   isFeelingsReadIsolated,
   NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
+  NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
   conversationContinuityContextReserveBytes,
   mainContinuityOutputCarrier,
   getCurrentCallContext,
+  getNativeConversationReplayBudgetForRoutes,
+  nativeHistoryAttachmentContextBytes,
 } = require('@librechat/api');
 const {
   Callback,
@@ -142,6 +146,7 @@ const {
   configuredBrokerHostTools,
   conversationProviderUsesInvocationLocalTime,
   conversationProviderUsesNativeBody,
+  resolveConversationProviderHistoryAttachments,
   conversationProviderUsesLocalVisibleAccounting,
   resolveHostToolCapabilityState,
   resolveConversationProviderId,
@@ -346,7 +351,14 @@ async function resolveActiveWorkTurnContext(req) {
   }
 }
 
-function nativeWholeHistoryFits(req, agent, rows, reservedContextUtf8Bytes, pendingHydration) {
+function nativeWholeHistoryFits(
+  req,
+  agent,
+  rows,
+  reservedContextUtf8Bytes,
+  pendingHydration,
+  nativeReplayBudget = null,
+) {
   const alternates = [
     agent?.viventiumFallbackLlm || agent?.viventiumFallbackLlmAssignment,
     ...(agent?.viventiumGraphLlmFallbacks || []),
@@ -426,7 +438,33 @@ function nativeWholeHistoryFits(req, agent, rows, reservedContextUtf8Bytes, pend
           additional_instructions: '',
         }
       : agent;
-    return mainHistoryFitsNativeBody(messages, preparedAgent, reservedContextUtf8Bytes);
+    if (nativeReplayBudget !== null && !Array.isArray(pendingHydration.nativeHistoryUploads))
+      return null;
+    const attachmentBoundBytes =
+      nativeReplayBudget === null
+        ? 0
+        : nativeHistoryAttachmentContextBytes(pendingHydration.nativeHistoryUploads);
+    if (pendingHydration.sizingReceipt)
+      pendingHydration.sizingReceipt.attachmentBoundBytes = attachmentBoundBytes;
+    const sourceMetadataBytes =
+      nativeReplayBudget === null
+        ? 0
+        : attachmentBoundBytes +
+          Buffer.byteLength(
+            JSON.stringify({
+              interaction: getTrustedInteractionContext(req),
+              delivery: rows.map((row) => mainMessageDelivery(row, String(req?.user?.id || ''))),
+            }),
+            'utf8',
+          );
+    return mainHistoryFitsNativeBody(
+      messages,
+      preparedAgent,
+      reservedContextUtf8Bytes,
+      nativeReplayBudget,
+      sourceMetadataBytes,
+      pendingHydration.sizingReceipt,
+    );
   } catch {
     return null;
   }
@@ -1538,6 +1576,7 @@ const {
   calcVoiceLatencyDurationMs,
   formatVoiceLatencyTiming,
   logVoiceLatencyNumericStage,
+  observeVoiceLatencyOperation,
   voiceLatencyNow,
 } = require('~/server/services/viventium/voiceLatencyTiming');
 /* === VIVENTIUM NOTE END === */
@@ -2204,7 +2243,7 @@ function preservePrimaryCompletionError(error, primaryError) {
       error.originalError = primaryError;
       if (error.originalError === primaryError) return error;
     } catch {
-      // A frozen provider error needs the new wrapper below.
+      // Immutable errors retain the primary failure through the wrapper below.
     }
   }
   return Object.assign(new Error(getCompletionErrorMessage(error), { cause: error }), {
@@ -4906,6 +4945,22 @@ class AgentClient extends BaseClient {
         reservedContextUtf8Bytes,
       });
     };
+    const nativeHistoryRoutes = [
+      this.options.agent,
+      this.options.agent?.viventiumFallbackLlm ||
+        this.options.agent?.viventiumFallbackLlmAssignment,
+      ...(this.options.agent?.viventiumGraphLlmFallbacks || []),
+    ].filter(Boolean);
+    const nativeReplayBudget =
+      conversationProviderUsesNativeBody(req, this.options.agent, { requireTransport: true }) &&
+      conversationProviderUsesNativeBody(req, this.options.agent, {
+        alternates: nativeHistoryRoutes.slice(1),
+      })
+        ? await getNativeConversationReplayBudgetForRoutes(
+            nativeHistoryRoutes,
+            req?.config?.endpoints?.custom,
+          ).catch(() => null)
+        : null;
     const conversationContinuity = await resolveConversationContinuity({
       req,
       agent: this.options.agent,
@@ -4913,6 +4968,16 @@ class AgentClient extends BaseClient {
       conversationId: String(this.conversationId || req?.body?.conversationId || '').trim(),
       orderedMessages,
       signal: opts?.abortController?.signal,
+      nativeBodyCarrier:
+        conversationProviderUsesNativeBody(req, this.options.agent, { requireTransport: true }) &&
+        conversationProviderUsesNativeBody(req, this.options.agent, {
+          alternates: [
+            this.options.agent?.viventiumFallbackLlm ||
+              this.options.agent?.viventiumFallbackLlmAssignment,
+            ...(this.options.agent?.viventiumGraphLlmFallbacks || []),
+          ].filter(Boolean),
+        }),
+      nativeReplayBudgetKnown: nativeReplayBudget !== null,
       resolveOutputCarrier: resolveLegacyOutputCarrier,
       canCarryWholeHistory: async (rows, capsule = '') => {
         if (
@@ -4926,21 +4991,47 @@ class AgentClient extends BaseClient {
         )
           return null;
         const carrier = await resolveLegacyOutputCarrier();
-        return nativeWholeHistoryFits(
+        const nativeHistoryUploads =
+          nativeReplayBudget === null
+            ? undefined
+            : await resolveConversationProviderHistoryAttachments(req).catch(() => null);
+        // The final native producer enforces this whole turn_context cap, including every
+        // summary and later dynamic section; a forecast cannot under-reserve later growth.
+        const turnContextReserveBytes =
+          nativeReplayBudget !== null
+            ? NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
+            : carrier.reservedContextUtf8Bytes +
+              (capsule
+                ? Buffer.byteLength(JSON.stringify(capsule), 'utf8') + TURN_CONTEXT_SEPARATOR_BYTES
+                : 0);
+        const sizingReceipt = {};
+        const fit = nativeWholeHistoryFits(
           req,
           this.options.agent,
           rows,
-          carrier.reservedContextUtf8Bytes +
-            (capsule
-              ? Buffer.byteLength(JSON.stringify(capsule), 'utf8') + TURN_CONTEXT_SEPARATOR_BYTES
-              : 0),
+          turnContextReserveBytes,
           {
             attachments: this.options.attachments,
+            nativeHistoryUploads,
+            sizingReceipt,
             contextHandlers: this.contextHandlers || !isAgentsEndpoint(this.options.endpoint),
             userName: this.options.name,
             assistantName: this.options.modelLabel,
           },
+          nativeReplayBudget,
         );
+        logger.info(
+          '[VIVENTIUM][native-history-fit] ' +
+            JSON.stringify({
+              nativeBudgetKnown: nativeReplayBudget !== null,
+              fitOutcome: fit === null ? 'unknown' : fit ? 'fit' : 'over_bound',
+              selectedHistoryCount: rows.length,
+              nativeBudgetBytes: nativeReplayBudget,
+              authorizedAttachmentBoundBytes: sizingReceipt.attachmentBoundBytes ?? null,
+              turnContextReserveBytes,
+            }),
+        );
+        return fit;
       },
     }).catch((error) => {
       logger.warn('[AgentClient] Conversation legacy continuity unavailable', {
@@ -4952,7 +5043,7 @@ class AgentClient extends BaseClient {
       try {
         logVoiceLatencyStage(req, 'build_messages_continuity_done', voiceBuildStartedAt);
       } catch {
-        // Timing telemetry must not fail message preparation.
+        // Optional timing must not interrupt conversation continuity.
       }
     }
     if (conversationContinuity) {
@@ -5069,15 +5160,22 @@ class AgentClient extends BaseClient {
         const readTimeoutMs = feelingsReadTimeoutMs();
         let feelingReadTimer;
         try {
-          feelingSnapshot = await Promise.race([
-            req._viventiumFeelingSnapshotPromise,
-            new Promise((_, reject) => {
-              feelingReadTimer = setTimeout(
-                () => reject(new Error('feelings_read_timeout')),
-                readTimeoutMs,
-              );
-            }),
-          ]);
+          feelingSnapshot = await observeVoiceLatencyOperation(
+            logger,
+            req,
+            'client',
+            'feeling_snapshot_wait',
+            () =>
+              Promise.race([
+                req._viventiumFeelingSnapshotPromise,
+                new Promise((_, reject) => {
+                  feelingReadTimer = setTimeout(
+                    () => reject(new Error('feelings_read_timeout')),
+                    readTimeoutMs,
+                  );
+                }),
+              ]),
+          );
         } finally {
           if (feelingReadTimer) clearTimeout(feelingReadTimer);
         }
@@ -5276,7 +5374,7 @@ class AgentClient extends BaseClient {
       try {
         logVoiceLatencyStage(req, 'build_messages_format_tokens_done', voiceFormatStartedAt);
       } catch {
-        // Timing telemetry must not fail message preparation.
+        // Optional timing must not interrupt message preparation.
       }
     }
     const memoryRecallStart = startDeepTiming(req);
@@ -5421,35 +5519,37 @@ class AgentClient extends BaseClient {
     const applyStart = startDeepTiming(req);
     const ephemeralAgent = this.options.req?.body?.ephemeralAgent;
     const mcpManager = getMCPManager();
-    await Promise.all(
-      allAgents.map(({ agent, agentId }) =>
-        applyContextToAgent({
-          agent,
-          agentId,
-          logger,
-          mcpManager,
-          sharedRunContext:
-            memoryUsesTurnContext && agentId === this.options.agent.id
-              ? sharedRunContextParts.join('\n\n')
-              : sharedRunContext,
-          dynamicTailContext: buildViventiumDynamicTail({
-            capsule: feelingTailForAgent({
-              snapshot: feelingSnapshot,
-              agentId,
-              primaryAgentId: this.options.agent.id,
+    await observeVoiceLatencyOperation(logger, req, 'client', 'agent_context_apply', () =>
+      Promise.all(
+        allAgents.map(({ agent, agentId }) =>
+          applyContextToAgent({
+            agent,
+            agentId,
+            logger,
+            mcpManager,
+            sharedRunContext:
+              memoryUsesTurnContext && agentId === this.options.agent.id
+                ? sharedRunContextParts.join('\n\n')
+                : sharedRunContext,
+            dynamicTailContext: buildViventiumDynamicTail({
+              capsule: feelingTailForAgent({
+                snapshot: feelingSnapshot,
+                agentId,
+                primaryAgentId: this.options.agent.id,
+              }),
             }),
+            /* === VIVENTIUM START ===
+             * Feature: Authenticated trusted MCP instruction fetch.
+             * Purpose: Reuse the authenticated request projection instead of probing GlassHive
+             * instructions through an anonymous app-level connection.
+             * === VIVENTIUM END === */
+            requestContext: {
+              user: this.options.req?.user,
+              body: this.options.req?.body,
+            },
+            ephemeralAgent: agentId === this.options.agent.id ? ephemeralAgent : undefined,
           }),
-          /* === VIVENTIUM START ===
-           * Feature: Authenticated trusted MCP instruction fetch.
-           * Purpose: Reuse the authenticated request projection instead of probing GlassHive
-           * instructions through an anonymous app-level connection.
-           * === VIVENTIUM END === */
-          requestContext: {
-            user: this.options.req?.user,
-            body: this.options.req?.body,
-          },
-          ephemeralAgent: agentId === this.options.agent.id ? ephemeralAgent : undefined,
-        }),
+        ),
       ),
     );
     const feelingsInjectedAgentCount = feelingSnapshot?.enabled
@@ -5481,32 +5581,34 @@ class AgentClient extends BaseClient {
         .map(({ agent }) => agent?.instructions || '')
         .join('\n\n');
     }
-    logPromptFrame(
-      logger,
-      promptFrameTelemetry.buildPromptFrame({
-        promptFamily: 'main_assembly',
-        surface: resolveViventiumSurface(req),
-        ...promptFrameExecutionLineage(req, this.options.agent),
-        provider: resolveConversationProviderId(this.options.agent),
-        model: this.options.agent?.model_parameters?.model || this.options.agent?.model,
-        agentId: this.options.agent?.id,
-        requestIdentity: {
-          ownerId: req?.user?.id || req?.user?._id,
-          interactionContext: getTrustedInteractionContext(req),
-        },
-        authClass: 'user_runtime',
-        layers: promptFrameLayers,
-        promptSourceFiles: {
-          agent_client: __filename,
-        },
-        flags: {
-          voice_mode: req?.body?.voiceMode === true,
-          listen_only: req?.body?.viventiumListenOnly === true,
-          ephemeral_agent: !!ephemeralAgent,
-          agent_count: allAgents.length,
-        },
-        mcpInstructionSources: this.options.agent?.viventiumMCPInstructionSources || {},
-      }),
+    observeVoiceLatencyOperation(logger, req, 'client', 'main_assembly_frame', () =>
+      logPromptFrame(
+        logger,
+        promptFrameTelemetry.buildPromptFrame({
+          promptFamily: 'main_assembly',
+          surface: resolveViventiumSurface(req),
+          ...promptFrameExecutionLineage(req, this.options.agent),
+          provider: resolveConversationProviderId(this.options.agent),
+          model: this.options.agent?.model_parameters?.model || this.options.agent?.model,
+          agentId: this.options.agent?.id,
+          requestIdentity: {
+            ownerId: req?.user?.id || req?.user?._id,
+            interactionContext: getTrustedInteractionContext(req),
+          },
+          authClass: 'user_runtime',
+          layers: promptFrameLayers,
+          promptSourceFiles: {
+            agent_client: __filename,
+          },
+          flags: {
+            voice_mode: req?.body?.voiceMode === true,
+            listen_only: req?.body?.viventiumListenOnly === true,
+            ephemeral_agent: !!ephemeralAgent,
+            agent_count: allAgents.length,
+          },
+          mcpInstructionSources: this.options.agent?.viventiumMCPInstructionSources || {},
+        }),
+      ),
     );
     if (isDeepTimingEnabled(req)) {
       logDeepTiming(req, 'build_messages_apply_context', applyStart, `agents=${allAgents.length}`);
@@ -5662,11 +5764,13 @@ class AgentClient extends BaseClient {
     };
 
     try {
-      const readContext = await loadMemoryReadContext({
-        userId,
-        memoryMethods,
-        config: memoryPolicyConfig,
-      });
+      const readContext = await observeVoiceLatencyOperation(
+        logger,
+        this.options.req,
+        'client',
+        'saved_memory_snapshot_load',
+        () => loadMemoryReadContext({ userId, memoryMethods, config: memoryPolicyConfig }),
+      );
       this.memoryReadContext = readContext;
       this.memoryReadAvailability = readContext.text ? 'available' : 'empty';
       void recordMemoryContinuityHealth({
@@ -8280,12 +8384,74 @@ class AgentClient extends BaseClient {
         ? ''
         : getCurrentCallContext(this.options.req);
       /* === VIVENTIUM END === */
-      const selectedCarrierBytes = conversationProviderUsesInvocationLocalTime(
+      let selectedCarrierBytes = conversationProviderUsesInvocationLocalTime(
         req,
         this.options.agent,
       )
         ? NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
         : MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES;
+      // Reuse the native whole-source estimator after history and attachments are prepared.
+      // The final consumer owns one aggregate body budget, not a fixed 128 KiB context partition.
+      // Unknown/mixed routes retain the existing bound and recovery owner.
+      const nativeContextRoutes = [
+        this.options.agent,
+        this.options.agent?.viventiumFallbackLlm ||
+          this.options.agent?.viventiumFallbackLlmAssignment,
+        ...(this.options.agent?.viventiumGraphLlmFallbacks || []),
+      ].filter(Boolean);
+      if (
+        !replaysPinnedMainContext &&
+        conversationProviderUsesNativeBody(req, this.options.agent, { requireTransport: true }) &&
+        conversationProviderUsesNativeBody(req, this.options.agent, {
+          alternates: nativeContextRoutes.slice(1),
+        })
+      ) {
+        const replayBudget = await getNativeConversationReplayBudgetForRoutes(
+          nativeContextRoutes,
+          req?.config?.endpoints?.custom,
+        ).catch(() => null);
+        if (replayBudget !== null) {
+          const nativeHistoryUploads = await resolveConversationProviderHistoryAttachments(
+            req,
+          ).catch(() => null);
+          const sizingReceipt = {};
+          const fits = nativeWholeHistoryFits(
+            req,
+            this.options.agent,
+            this._viventiumVisibleMessagesV1,
+            0,
+            {
+              attachments: this.options.attachments,
+              nativeHistoryUploads,
+              sizingReceipt,
+              contextHandlers: this.contextHandlers || !isAgentsEndpoint(this.options.endpoint),
+              userName: this.options.name,
+              assistantName: this.options.modelLabel,
+            },
+            replayBudget,
+          );
+          if (
+            fits === true &&
+            Number.isSafeInteger(sizingReceipt.contextBudgetBytes) &&
+            sizingReceipt.contextBudgetBytes > selectedCarrierBytes
+          ) {
+            selectedCarrierBytes = Math.min(
+              sizingReceipt.contextBudgetBytes,
+              NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
+            );
+          }
+          logger.info(
+            '[VIVENTIUM][main-context-allocation] ' +
+              JSON.stringify({
+                nativeBudgetBytes: replayBudget,
+                contextCapacityBytes: sizingReceipt.contextBudgetBytes ?? null,
+                authorizedAttachmentBoundBytes: sizingReceipt.attachmentBoundBytes ?? null,
+                selectedCarrierBytes,
+                fitOutcome: fits === null ? 'unknown' : fits ? 'fit' : 'over_bound',
+              }),
+          );
+        }
+      }
       const authorityReserveBytes = mainAttemptFactsAuthorityReserveBytes(req, this.options.agent);
       const coreOutputCarrier = mainContinuityOutputCarrier(
         mainContinuityCarrierPeerParts({
@@ -8601,10 +8767,17 @@ class AgentClient extends BaseClient {
               cortex_name: sanitizeCortexDisplayName(cortexData.cortex_name),
             };
           }
+          const citationAttachments = collectCortexCitationAttachments([cortexData], {
+            messageId: canonicalResponseMessageId,
+            conversationId,
+          });
+          if (Array.isArray(this.artifactPromises))
+            this.artifactPromises.push(...citationAttachments);
           // Persist cortex parts onto the main message so they survive refresh/reload.
           // We upsert by cortex_id to keep a single row per cortex.
+          const { attachments: _citationArtifacts, ...displayCortexData } = cortexData;
           upsertCortexContentPart(pendingCortexParts, cortexData);
-          upsertCortexContentPart(this.contentParts, cortexData);
+          upsertCortexContentPart(this.contentParts, displayCortexData);
           void cortexPersistenceCoordinator.enqueue(pendingCortexParts);
 
           const streamId = req?._resumableStreamId;
@@ -8635,10 +8808,21 @@ class AgentClient extends BaseClient {
               runId: uiMessageId,
               canonicalMessageId: canonicalResponseMessageId,
               userMessageId: canonicalUserMessageId,
-              ...cortexData,
+              ...displayCortexData,
             },
           };
 
+          // Reuse ordinary attachment events; late persistence below owns reload and replay.
+          for (const attachment of citationAttachments) {
+            if (streamId) {
+              void GenerationJobManager.emitChunk(streamId, {
+                event: 'attachment',
+                data: attachment,
+              });
+            } else if (streamOpen) {
+              stream.write(`event: attachment\ndata: ${JSON.stringify(attachment)}\n\n`);
+            }
+          }
           // Use GenerationJobManager for reliable event delivery (works even after stream closes)
           if (streamId) {
             const emitPromise = GenerationJobManager.emitChunk(streamId, eventPayload);
@@ -9467,6 +9651,7 @@ class AgentClient extends BaseClient {
               instructionsByAgentId: Object.fromEntries(
                 agents.map((agent) => [String(agent?.id || ''), String(agent?.instructions || '')]),
               ),
+              turnContextMaximumBytes: selectedCarrierBytes,
               turnContextHeaderPresent: Object.prototype.hasOwnProperty.call(
                 config.configurable.requestBody || {},
                 'viventiumGlassHiveTurnContextB64',

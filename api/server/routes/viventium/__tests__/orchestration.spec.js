@@ -331,6 +331,7 @@ describe('/api/viventium/orchestration', () => {
       workRef: 'work-1',
       action: 'stop',
       operationId: '018f47d3-8965-7f6a-a826-7c06afedc001',
+      ownerInputControl: true,
     });
     expect(response.body).toMatchObject({ workRef: 'work-1', state: 'stopping' });
   });

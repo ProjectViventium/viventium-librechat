@@ -10,11 +10,27 @@ const crypto = require('crypto');
 const { HumanMessage } = require('@langchain/core/messages');
 const {
   inspectMainCompactionCandidate,
+  canContinueMainCompactionRepair,
+  normalizeMainCompactionSizeRepair,
+  normalizeMainCompactionOutputContract,
+  mainCompactionRenderedBytes,
+  compatibleMainCompactionSizeContract,
+  compareMainCompactionToolIdentities,
+  createMainCompactionStageLease,
+  resolveMainCompactionAgent,
+  deferAcceptedMainCompactionForCall,
+  deferAcceptedMainCompactionForIdle,
+  discardDeferredMainCompaction,
+  flushEndedCallMainCompactions,
   inspectMainCompactionCarrier,
   mainCompactionOutputConstraints,
   mainCompactionCandidateDigest,
   mainCompactionOutputContractDigest,
   MAIN_COMPACTION_SOURCE_TARGET_BYTES,
+  MAIN_COMPACTION_MAX_ATTEMPTS,
+  MAIN_COMPACTION_MAX_TRANSPORT_RETRIES,
+  MAIN_COMPACTION_LEASE_MS,
+  boundedMainCompactionLeaseRenewal,
   MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS,
   forgetFailedMainCompaction,
   mainCompactionLeaseRemainingMs,
@@ -30,6 +46,7 @@ const {
   retainMainCompactionCancellationDelivery,
   recoverMainContinuityCarrierForAdmission,
   renderAcceptedMainContextForCarrier,
+  runMainCompactionIdleBatch,
 } = require('@librechat/api');
 const { getRequiredPromptText } = require('./promptRegistry');
 const { getTrustedInteractionContext } = require('./interactionContext');
@@ -42,9 +59,9 @@ const {
   renewAcceptedMainCompaction,
 } = require('./ViventiumMainContinuityService');
 
-const MAX_ATTEMPTS = 2;
+const MAX_ATTEMPTS = MAIN_COMPACTION_MAX_ATTEMPTS;
 const COMPACTOR_TIMEOUT_MS = 240 * 1000;
-const MAX_TRANSPORT_RETRIES = 1;
+const MAX_TRANSPORT_RETRIES = MAIN_COMPACTION_MAX_TRANSPORT_RETRIES;
 const TRANSIENT_RETRY_DELAY_MS = 5 * 1000;
 const MAX_TRANSIENT_RETRY_DELAY_MS = 30 * 1000;
 const INTERACTIVE_YIELD_WAIT_MS = 6 * 1000;
@@ -177,6 +194,20 @@ function compactionContractKey(agent, contract) {
 }
 
 function buildCompactionPrompt(claim, correctionReason = '', candidate = null) {
+  if (correctionReason?.code === 'semantic_fidelity') {
+    const { carrierHeadroomUtf8Bytes: _staleHeadroom, ...feedback } = correctionReason;
+    const contract = normalizeMainCompactionOutputContract(claim.outputContract);
+    const priorCandidate = parseSemanticCompactionOutput(feedback.candidate);
+    correctionReason = {
+      ...feedback,
+      ...(contract && priorCandidate
+        ? {
+            carrierHeadroomUtf8Bytes:
+              contract.carrierMaxUtf8Bytes - mainCompactionRenderedBytes(priorCandidate, contract),
+          }
+        : {}),
+    };
+  }
   const payload = JSON.stringify({
     version: 1,
     sourceDigest: claim.sourceDigest,
@@ -184,7 +215,19 @@ function buildCompactionPrompt(claim, correctionReason = '', candidate = null) {
     acceptedOlderTurns: claim.sourceTurns || [],
     outputConstraints: claim.outputContract || mainCompactionOutputConstraints,
     ...(claim.legacyInputs?.length ? { legacyInputs: claim.legacyInputs } : {}),
-    ...(candidate ? { candidate } : {}),
+    ...(candidate
+      ? {
+          candidate,
+          typedToolIdentityComparison: compareMainCompactionToolIdentities(
+            {
+              previousSemanticCompaction: claim.previousSemanticCompaction || null,
+              sourceTurns: claim.sourceTurns || [],
+              legacyInputs: claim.legacyInputs,
+            },
+            candidate,
+          ),
+        }
+      : {}),
     ...(correctionReason ? { priorRejection: correctionReason } : {}),
   });
   // Claims batch whole turns. A single larger turn remains indivisible and goes through the
@@ -248,6 +291,33 @@ function compactorAgent(agent, domainEpochKey, stage = 'compaction') {
   };
 }
 
+// Both an in-claim draft and a resumed bounded draft use ordinary native admission sizing.
+// The full source, isolation instructions and all configured fallback routes remain included.
+async function sizeCorrectionWithinNativeAdmission(input, claim, correction) {
+  const { candidate, ...numeric } = correction;
+  if (candidate === undefined) return numeric;
+  const isolated = compactorAgent(input.agent, claim.domainEpochKey);
+  const routes = [
+    { ...isolated, model: isolated.model_parameters?.model || isolated.model },
+    isolated.viventiumFallbackLlm || isolated.viventiumFallbackLlmAssignment,
+    ...(isolated.viventiumGraphLlmFallbacks || []),
+    ...require('./agentLlmFallback').resolveFallbackCandidates(isolated),
+  ].filter(Boolean);
+  const floor = await require('@librechat/api')
+    .getNativeConversationReplayBudgetForRoutes(routes, input.req?.config?.endpoints?.custom)
+    .catch(() => null);
+  return Number.isSafeInteger(floor) &&
+    floor > 0 &&
+    require('./ViventiumMainContextService').mainHistoryFitsNativeBody(
+      [new HumanMessage(buildCompactionPrompt(claim, correction))],
+      isolated,
+      0,
+      floor,
+    )
+    ? correction
+    : numeric;
+}
+
 async function defaultExecuteCompactor({
   claim,
   prompt,
@@ -258,6 +328,7 @@ async function defaultExecuteCompactor({
   reportCapacityRelease,
   stage = 'compaction',
   timeoutMs,
+  onNativeAdmission,
 }) {
   if (!req || !agent) throw new Error('main_compaction_runtime_unavailable');
   const { createBackgroundRes, executeCortex } = require('../BackgroundCortexService');
@@ -303,6 +374,7 @@ async function defaultExecuteCompactor({
           ? Math.min(timeoutMs, COMPACTOR_TIMEOUT_MS)
           : COMPACTOR_TIMEOUT_MS,
       signal,
+      onNativeAdmission,
       onHarnessCancellationOutcome: (outcome) => {
         capacityReleaseReported = true;
         reportCapacityRelease?.(outcome?.acknowledged === true);
@@ -343,9 +415,112 @@ async function defaultExecuteCompactor({
   return result.insight;
 }
 
-async function ensureAcceptedMainCompaction(input = {}) {
+function ensureAcceptedMainCompaction(input = {}) {
+  const domainKey = compactionEpochKey(input);
+  if (input.foreground === true) discardDeferredMainCompaction(domainKey);
+  if (
+    input.trigger === 'accepted_turn' &&
+    input.foreground !== true &&
+    deferAcceptedMainCompactionForCall({
+      ownerId: String(input.ownerId || '').trim(),
+      domainKey,
+      call: input.req?.viventiumCallSession,
+      schedule: () => runBackgroundMainCompaction(input),
+    })
+  ) {
+    logger.info('[VIVENTIUM][main-continuity] Accepted compaction deferred until Call End', {
+      reason: 'active_call',
+      domainHash: crypto.createHash('sha256').update(domainKey).digest('hex').slice(0, 16),
+    });
+    return Promise.resolve({ status: 'deferred', reason: 'active_call', attempts: 0 });
+  }
+  return ['accepted_turn', 'conversation_legacy'].includes(input.trigger) &&
+    input.foreground !== true
+    ? runBackgroundMainCompaction(input)
+    : runAcceptedMainCompaction(input);
+}
+
+/** Thin binding to the existing bounded per-domain idle owner and foreground fence. */
+function scheduleMainContinuityMaintenance(input = {}) {
+  if (typeof input.schedule !== 'function') return false;
+  const ownerId = String(input.ownerId || '').trim();
+  return deferAcceptedMainCompactionForIdle({
+    ownerId,
+    domainKey: compactionEpochKey(input),
+    schedule: input.schedule,
+    shouldYield: () => (interactiveAdmissionFencesByOwnerId.get(ownerId)?.size || 0) > 0,
+    onError: (error) =>
+      logger.warn('[VIVENTIUM][main-continuity] Deferred maintenance unavailable', {
+        errorClass: String(error?.name || 'PersistenceError').slice(0, 80),
+      }),
+  });
+}
+
+async function runBackgroundMainCompaction(input) {
+  const ownerId = String(input.ownerId || '').trim();
+  const domainKey = compactionEpochKey(input);
+  discardDeferredMainCompaction(domainKey);
+  const executionBudget = input.executionBudget || { completionReserveMs: 0 };
+  const shouldYield = () => (interactiveAdmissionFencesByOwnerId.get(ownerId)?.size || 0) > 0;
+  const result = await runMainCompactionIdleBatch({
+    run: async (deadlineAt, previousSourceClaim) => {
+      let call;
+      try {
+        call = await require('./CallSessionService').getActiveCallSessionForMainMaintenance({
+          userId: ownerId,
+          agentId: input.agentId,
+        });
+      } catch {
+        return { status: 'deferred', reason: 'call_liveness_unavailable', attempts: 0 };
+      }
+      if (
+        deferAcceptedMainCompactionForCall({
+          ownerId,
+          domainKey,
+          call,
+          schedule: () => runBackgroundMainCompaction({ ...input, executionBudget }),
+        })
+      )
+        return { status: 'deferred', reason: 'active_call', attempts: 0 };
+      return runAcceptedMainCompaction({
+        ...input,
+        deadlineAt,
+        executionBudget,
+        previousSourceClaim,
+      });
+    },
+    shouldYield: () => input.signal?.aborted || shouldYield(),
+    deadlineAt: input.deadlineAt,
+    now: input.now,
+  });
+  if (
+    !input.deadlineAt &&
+    ((result.status === 'compacted' &&
+      result.continuationPending === true &&
+      result.reason === 'idle_budget_exhausted') ||
+      (result.status === 'degraded' &&
+        result.reason === 'compaction_enclosing_deadline' &&
+        result.repairPending === true))
+  ) {
+    deferAcceptedMainCompactionForIdle({
+      ownerId,
+      domainKey,
+      signal: input.signal,
+      shouldYield,
+      schedule: () => runBackgroundMainCompaction({ ...input, executionBudget }),
+      onError: (error) =>
+        logger.warn('[VIVENTIUM][main-continuity] Idle continuation unavailable', {
+          errorClass: String(error?.name || 'PersistenceError').slice(0, 80),
+        }),
+    });
+  }
+  return result;
+}
+
+async function runAcceptedMainCompaction(input = {}) {
   input = {
     ...input,
+    agent: resolveMainCompactionAgent(input.req, input.agent),
     outputCarrier: input.outputCarrier || input.req?._viventiumAcceptedMainOutputCarrierV1,
   };
   const ownerId = String(input.ownerId || '').trim();
@@ -387,9 +562,11 @@ async function ensureAcceptedMainCompaction(input = {}) {
     ? Math.min(MAX_TRANSIENT_RETRY_DELAY_MS, Math.max(0, configuredRetryDelayMs))
     : TRANSIENT_RETRY_DELAY_MS;
   let semanticAttempts = 0;
+  let fidelityRepairAttempts = 0;
   let transportRetries = 0;
   let correctionReason = '';
   let terminalReason = '';
+  let canReduceRejectedSizeSource = false;
   const now = typeof input.now === 'function' ? input.now : Date.now;
   // A shrinking whole-proposal overflow may be repaired again within the store-owned claim lease.
   let sizeRepair = null;
@@ -406,6 +583,17 @@ async function ensureAcceptedMainCompaction(input = {}) {
   let slowestCallMs = executionBudget.slowestCallMs || 0;
   let slowestCompactionCallMs = executionBudget.slowestCompactionCallMs || 0;
   let slowestReviewCallMs = executionBudget.slowestReviewCallMs || 0;
+  const providerId = input.agent?.endpoint || input.agent?.provider;
+  const capability = input.req?.config?.endpoints?.agents?.providerCapabilities?.[providerId];
+  const nativeStageDeadline =
+    input.foreground !== true &&
+    typeof renewCompaction === 'function' &&
+    capability?.workspace_binding === true &&
+    capability?.conversation_session === true;
+  const nativeAdmissionWindow = (stage) =>
+    stage === 'review'
+      ? executionBudget.nativeReviewAdmissionWindowMs || 0
+      : executionBudget.nativeCompactionAdmissionWindowMs || 0;
   try {
     releaseCancellationDelivery = retainMainCompactionCancellationDelivery({
       signal: inputSignal,
@@ -428,6 +616,8 @@ async function ensureAcceptedMainCompaction(input = {}) {
         slowestReviewCallMs,
         maxCallMs: COMPACTOR_TIMEOUT_MS,
         stage: 'compaction',
+        nativeDeadlineAdmission: nativeStageDeadline,
+        nativeAdmittedWindowMs: nativeAdmissionWindow('compaction'),
       }).allowed
     )
       return { status: 'degraded', attempts: 0, reason: 'compaction_enclosing_deadline' };
@@ -440,7 +630,70 @@ async function ensureAcceptedMainCompaction(input = {}) {
         : {}),
     });
     if (claim.status !== 'claimed') return claim;
+    const previousSourceClaim = input.previousSourceClaim;
+    if (
+      previousSourceClaim &&
+      (!Number.isSafeInteger(previousSourceClaim.sourceBytes) ||
+        previousSourceClaim.sourceBytes <= 0 ||
+        typeof previousSourceClaim.sourceDigest !== 'string' ||
+        !previousSourceClaim.sourceDigest ||
+        typeof previousSourceClaim.domainEpochKey !== 'string' ||
+        !previousSourceClaim.domainEpochKey ||
+        claim.domainEpochKey !== previousSourceClaim.domainEpochKey ||
+        typeof claim.sourceDigest !== 'string' ||
+        !claim.sourceDigest ||
+        claim.sourceDigest === previousSourceClaim.sourceDigest ||
+        !Number.isSafeInteger(claim.sourceBytes) ||
+        claim.sourceBytes <= 0 ||
+        claim.sourceBytes >= previousSourceClaim.sourceBytes ||
+        !Number.isSafeInteger(previousSourceClaim.nextSourceTargetBytes) ||
+        previousSourceClaim.nextSourceTargetBytes <= 0 ||
+        previousSourceClaim.nextSourceTargetBytes >= previousSourceClaim.sourceBytes)
+    ) {
+      // Release only this store-owned claim. No provider runs and no reviewed cursor advances;
+      // keep the original oversize feedback for the same domain's indivisible source.
+      await rejectCompaction({
+        ...input,
+        leaseId: claim.leaseId,
+        reason:
+          claim.domainEpochKey === previousSourceClaim.domainEpochKey
+            ? 'schema_invalid'
+            : 'source_reduction_unavailable',
+      });
+      return { status: 'degraded', attempts: 0, reason: 'source_reduction_unavailable' };
+    }
     const contractKey = compactionContractKey(input.agent, claim.outputContract);
+    const pendingRepair = claim.pendingCompactionRepair;
+    const pendingSize = normalizeMainCompactionSizeRepair(
+      pendingRepair,
+      pendingRepair?.outputContract,
+      claim.outputContract,
+    );
+    if (
+      pendingRepair?.version === 1 &&
+      pendingRepair.sourceDigest === claim.sourceDigest &&
+      (pendingRepair.contractKey === contractKey ||
+        ((pendingSize || pendingRepair.correction?.code === 'semantic_fidelity') &&
+          compatibleMainCompactionSizeContract(pendingRepair.contractKey, contractKey))) &&
+      canContinueMainCompactionRepair(pendingRepair, pendingSize ? 'size' : 'fidelity') &&
+      Number.isSafeInteger(pendingRepair.transportRetries) &&
+      pendingRepair.transportRetries >= 0 &&
+      pendingRepair.transportRetries <= MAX_TRANSPORT_RETRIES &&
+      (pendingRepair.correction?.code === 'semantic_fidelity' || pendingSize)
+    ) {
+      semanticAttempts = pendingRepair.semanticAttempts;
+      fidelityRepairAttempts = pendingRepair.fidelityRepairAttempts ?? 0;
+      transportRetries = pendingRepair.transportRetries;
+      correctionReason = pendingSize?.correction || pendingRepair.correction;
+      if (pendingSize) {
+        sizeRepair = pendingSize.sizeRepair;
+        correctionReason = await sizeCorrectionWithinNativeAdmission(
+          input,
+          claim,
+          correctionReason,
+        );
+      }
+    }
     const effectiveLeaseExpiry = () =>
       Number.isFinite(deadlineMs)
         ? new Date(
@@ -467,7 +720,10 @@ async function ensureAcceptedMainCompaction(input = {}) {
     // renewal run once inside the stage's error owner, after prompt preparation.
     const mayRepairSize = () =>
       sizeRepair?.converging === true &&
-      semanticAttempts < MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS;
+      canContinueMainCompactionRepair({ semanticAttempts, fidelityRepairAttempts }, 'size');
+    const mayRepairFidelity = () =>
+      correctionReason?.code === 'semantic_fidelity' &&
+      canContinueMainCompactionRepair({ semanticAttempts, fidelityRepairAttempts }, 'fidelity');
     // Every native call and retry wait ends within the store-owned claim lease.
     const leaseRemainingMs = () => mainCompactionLeaseRemainingMs(effectiveLeaseExpiry(), now());
     let pendingLeaseRenewalDisposition = 'not_required';
@@ -513,6 +769,64 @@ async function ensureAcceptedMainCompaction(input = {}) {
         ...(runHash ? { runHash } : {}),
       });
     };
+    const nativeGraceMs = require('../BackgroundCortexService').getCortexExecutionGuardGraceMs();
+    const nativeDeadlineLimit = Number.isFinite(deadlineMs)
+      ? deadlineMs - Math.max(0, executionBudget.completionReserveMs || 0)
+      : Infinity;
+    const executeStage = async (params) => {
+      const lease = nativeStageDeadline
+        ? createMainCompactionStageLease({
+            signal: controller.signal,
+            graceMs: nativeGraceMs,
+            leaseExpiresAt: () => claim.leaseExpiresAt,
+            renew: async (expiresAt) => {
+              const result = await renewCompaction({
+                ...input,
+                leaseId: claim.leaseId,
+                sourceDigest: claim.sourceDigest,
+                leaseExpiresAt: claim.leaseExpiresAt,
+                expiresAt,
+              });
+              if (result.status === 'renewed' && !controller.signal.aborted)
+                claim.leaseExpiresAt = result.leaseExpiresAt;
+              return result;
+            },
+            onLost: () => controller.abort('compaction_lease_lost'),
+          })
+        : null;
+      try {
+        return await executeCompactor({
+          ...params,
+          ...(lease
+            ? {
+                onNativeAdmission: (receipt) => {
+                  // Native admission may extend the short stage guard, never the enclosing idle batch.
+                  const receiptDeadline = Date.parse(receipt.responseDeadlineAt);
+                  const reviewReserveMs = params.stage === 'review' ? 0 : slowestReviewCallMs;
+                  if (receiptDeadline + nativeGraceMs + reviewReserveMs > nativeDeadlineLimit)
+                    return false;
+                  const admittedAt = now();
+                  return lease.admit(receipt).then((accepted) => {
+                    if (accepted) {
+                      const key =
+                        params.stage === 'review'
+                          ? 'nativeReviewAdmissionWindowMs'
+                          : 'nativeCompactionAdmissionWindowMs';
+                      executionBudget[key] = Math.max(
+                        executionBudget[key] || 0,
+                        receiptDeadline + nativeGraceMs - admittedAt,
+                      );
+                    }
+                    return accepted;
+                  });
+                },
+              }
+            : {}),
+        });
+      } finally {
+        await lease?.settle();
+      }
+    };
     const stageBudget = async (stage) => {
       const budgetInput = {
         leaseExpiresAt: claim.leaseExpiresAt,
@@ -524,11 +838,19 @@ async function ensureAcceptedMainCompaction(input = {}) {
         slowestReviewCallMs,
         maxCallMs: COMPACTOR_TIMEOUT_MS,
         stage,
+        nativeDeadlineAdmission: nativeStageDeadline,
+        nativeAdmittedWindowMs: nativeAdmissionWindow(stage),
       };
       const expiresAt =
         !controller.signal.aborted &&
         renewCompaction &&
-        mainCompactionStageLeaseRenewal(budgetInput);
+        (nativeStageDeadline
+          ? boundedMainCompactionLeaseRenewal({
+              leaseExpiresAt: claim.leaseExpiresAt,
+              requestedExpiresAt: Math.min(now() + MAIN_COMPACTION_LEASE_MS, nativeDeadlineLimit),
+              now: now(),
+            })
+          : mainCompactionStageLeaseRenewal(budgetInput));
       if (expiresAt) {
         const renewed = await renewCompaction({
           ...input,
@@ -539,6 +861,8 @@ async function ensureAcceptedMainCompaction(input = {}) {
         });
         pendingLeaseRenewalDisposition = renewed.status;
         if (renewed.status === 'renewed') claim.leaseExpiresAt = renewed.leaseExpiresAt;
+        else if (nativeStageDeadline && renewed.status !== 'busy')
+          controller.abort('compaction_lease_lost');
       }
       return mainCompactionStageBudget({
         ...budgetInput,
@@ -549,7 +873,10 @@ async function ensureAcceptedMainCompaction(input = {}) {
     if (yieldToInteractive()) {
       terminalReason = 'interactive_priority';
     }
-    while (!terminalReason && (semanticAttempts < MAX_ATTEMPTS || mayRepairSize())) {
+    while (
+      !terminalReason &&
+      (semanticAttempts < MAX_ATTEMPTS || mayRepairSize() || mayRepairFidelity())
+    ) {
       if (controller.signal.aborted) {
         terminalReason =
           controller.signal.reason === 'maintenance_yield'
@@ -558,6 +885,7 @@ async function ensureAcceptedMainCompaction(input = {}) {
         break;
       }
       const attempt = semanticAttempts + 1;
+      const repairingFidelity = correctionReason?.code === 'semantic_fidelity';
       let raw;
       let callStartedMs;
       try {
@@ -577,7 +905,7 @@ async function ensureAcceptedMainCompaction(input = {}) {
         // Use the current lease after the final admission/renewal await. A timeout saved
         // before prompt preparation can otherwise cap a newly admitted whole-source repair.
         const sizeBudget =
-          attempt > MAX_ATTEMPTS
+          attempt > MAX_ATTEMPTS && !nativeStageDeadline && !repairingFidelity
             ? mainCompactionSizeRepairBudget({
                 state: sizeRepair,
                 attempts: semanticAttempts,
@@ -598,7 +926,7 @@ async function ensureAcceptedMainCompaction(input = {}) {
         }
         active.capacityReleaseAcknowledged = null;
         callStartedMs = observeStageStart('compaction', callTimeoutMs);
-        raw = await executeCompactor({
+        raw = await executeStage({
           claim,
           prompt,
           attempt,
@@ -648,11 +976,21 @@ async function ensureAcceptedMainCompaction(input = {}) {
           continue;
         }
         terminalReason = errorClass;
+        // A rejected complete packet can exceed native replay capacity even when its proposed
+        // output contract fits. Reuse the store's proven smaller whole-source claim; keep all
+        // remaining source pending and require the same independent fidelity review.
+        canReduceRejectedSizeSource = errorStatus === 413 && claim.canReduceSource === true;
+        if (canReduceRejectedSizeSource) terminalReason = 'source_packet_budget';
         break;
       }
       semanticAttempts += 1;
+      if (repairingFidelity) fidelityRepairAttempts += 1;
       const proposal = parseSemanticCompactionOutput(raw);
-      let prepared = inspectMainCompactionCandidate(proposal, claim.outputContract);
+      let prepared = inspectMainCompactionCandidate(proposal, claim.outputContract, {
+        previousSemanticCompaction: claim.previousSemanticCompaction || null,
+        sourceTurns: claim.sourceTurns || [],
+        legacyInputs: claim.legacyInputs,
+      });
       if (prepared.ok && claim.outputContract) {
         const fit =
           typeof input.inspectCandidateCarrier === 'function'
@@ -667,15 +1005,26 @@ async function ensureAcceptedMainCompaction(input = {}) {
           semanticAttempts,
           proposal,
         );
-        correctionReason = { code: 'schema_invalid', issue: prepared.issue, candidate: raw };
+        const proposalSizeRejected =
+          prepared.issue?.constraint === 'max_bytes' &&
+          ['', 'summary', '$carrier'].includes(prepared.issue.path);
+        correctionReason = {
+          code: 'schema_invalid',
+          issue: prepared.issue,
+          ...(proposalSizeRejected ? {} : { candidate: raw }),
+        };
         // The source owner proves an actual smaller whole prefix. Do not spend serial size
         // correction calls on this same source when that existing planner can reduce it now.
-        if (
-          prepared.issue?.constraint === 'max_bytes' &&
-          ['', 'summary', '$carrier'].includes(prepared.issue.path) &&
-          claim.canReduceSource === true
-        )
+        if (proposalSizeRejected && claim.canReduceSource === true) {
+          canReduceRejectedSizeSource = true;
           break;
+        }
+        if (proposalSizeRejected) {
+          correctionReason = await sizeCorrectionWithinNativeAdmission(input, claim, {
+            ...correctionReason,
+            candidate: proposal,
+          });
+        }
         continue;
       }
       sizeRepair = null;
@@ -703,7 +1052,7 @@ async function ensureAcceptedMainCompaction(input = {}) {
         active.capacityReleaseAcknowledged = null;
         reviewStartedMs = observeStageStart('review', reviewTimeoutMs);
         review = parseSemanticCompactionOutput(
-          await executeCompactor({
+          await executeStage({
             claim,
             prompt: reviewPrompt,
             attempt,
@@ -730,6 +1079,11 @@ async function ensureAcceptedMainCompaction(input = {}) {
           controller.signal.aborted ? 'cancelled' : providerErrorReason(error),
         );
         terminalReason = `review_${providerErrorReason(error)}`;
+        canReduceRejectedSizeSource =
+          providerErrorStatus(error) === 413 &&
+          claim.canReduceSource === true &&
+          !controller.signal.aborted;
+        if (canReduceRejectedSizeSource) terminalReason = 'source_packet_budget';
         if (controller.signal.aborted) {
           terminalReason =
             controller.signal.reason === 'maintenance_yield'
@@ -799,7 +1153,7 @@ async function ensureAcceptedMainCompaction(input = {}) {
           : correctionReason.code) ||
       'quality_gate';
     let nextSourceTargetBytes;
-    if (!terminalReason) {
+    if (!terminalReason || canReduceRejectedSizeSource) {
       // Return the existing learned target so a bounded caller can try a smaller whole claim now.
       nextSourceTargetBytes = recordUnacceptedMainCompactionClaim({
         key: epochKey,
@@ -810,18 +1164,79 @@ async function ensureAcceptedMainCompaction(input = {}) {
         sourceDigest: claim.sourceDigest,
         contractKey,
         reason: finalReason,
+        sizeExhausted:
+          correctionReason?.code === 'schema_invalid' &&
+          correctionReason.issue?.constraint === 'max_bytes' &&
+          ['', 'summary', '$carrier'].includes(correctionReason.issue.path) &&
+          (sizeRepair?.converging === false ||
+            semanticAttempts >= MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS),
       });
     }
-    await rejectCompaction({
+    const pendingSizeFeedback = normalizeMainCompactionSizeRepair(
+      {
+        // The shared owner retains only structurally valid, JSON-bounded drafts. Whole-JSON
+        // overflow stays numeric; resumed drafts still pass current native admission sizing.
+        correction: correctionReason,
+        sizeRepair,
+      },
+      claim.outputContract,
+    );
+    const canContinueRepair =
+      terminalReason === 'compaction_enclosing_deadline' &&
+      active.capacityReleaseAcknowledged === true &&
+      !controller.signal.aborted &&
+      canContinueMainCompactionRepair(
+        { semanticAttempts, fidelityRepairAttempts },
+        pendingSizeFeedback ? 'size' : 'fidelity',
+      ) &&
+      (correctionReason?.code === 'semantic_fidelity' || pendingSizeFeedback);
+    const rejected = await rejectCompaction({
       ...input,
       leaseId: claim.leaseId,
       reason: finalReason,
+      sourceDigest: claim.sourceDigest,
+      contractKey,
+      semanticAttempts,
+      fidelityRepairAttempts,
+      transportRetries,
+      capacityReleaseAcknowledged: active.capacityReleaseAcknowledged === true,
+      ...(canContinueRepair
+        ? {
+            pendingCompactionRepair: {
+              version: 1,
+              sourceDigest: claim.sourceDigest,
+              contractKey,
+              semanticAttempts,
+              fidelityRepairAttempts,
+              transportRetries,
+              ...(pendingSizeFeedback || {
+                correction: {
+                  ...correctionReason,
+                  candidate: JSON.stringify(
+                    parseSemanticCompactionOutput(correctionReason.candidate),
+                  ),
+                },
+              }),
+            },
+          }
+        : {}),
     });
     return {
       status: 'degraded',
       attempts: semanticAttempts,
+      ...(canContinueRepair && rejected?.repairPending === true ? { repairPending: true } : {}),
       ...(transportRetries ? { transportRetries } : {}),
       ...(nextSourceTargetBytes ? { nextSourceTargetBytes } : {}),
+      ...(canReduceRejectedSizeSource &&
+      nextSourceTargetBytes > 0 &&
+      nextSourceTargetBytes < claim.sourceBytes
+        ? {
+            canReduceSource: true,
+            sourceDigest: claim.sourceDigest,
+            sourceBytes: claim.sourceBytes,
+            domainEpochKey: claim.domainEpochKey,
+          }
+        : {}),
       reason: finalReason,
     };
   } finally {
@@ -874,7 +1289,9 @@ module.exports = {
   buildCompactionPrompt,
   compactorAgent,
   ensureAcceptedMainCompaction,
+  flushEndedCallMainCompactions,
   loadAcceptedMainContextForAdmission,
   parseSemanticCompactionOutput,
+  scheduleMainContinuityMaintenance,
   yieldAcceptedMainCompaction,
 };

@@ -18,6 +18,9 @@ let mockSourceRows = [],
   mockSourceFiles = new Map();
 const mockReadSource = jest.fn();
 const mockDownload = jest.fn();
+let mockCallbackRows = [];
+const mockCallbackAccepted = jest.fn();
+const mockCallbackFence = jest.fn();
 jest.mock('~/db/models', () => ({
   Message: {
     find: jest.fn(() => ({ select: () => ({ lean: async () => mockSourceRows }) })),
@@ -30,6 +33,14 @@ jest.mock('~/db/models', () => ({
       session: () => ({ lean: async () => mockSourceFiles.get(filter.file_id) }),
     }),
   },
+  GlassHiveTerminalCallbackResult: {
+    findOne: (filter) => ({
+      session() {
+        return this;
+      },
+      lean: async () => mockCallbackAccepted(filter),
+    }),
+  },
 }));
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
@@ -39,7 +50,11 @@ jest.mock('@librechat/api', () => ({
   nativeResponseOrigin: (...args) => mockOrigin(...args),
   nativeOutputFilePublisherForCarrier: (...args) => mockPublisher(...args),
   createAccountApiRoute: (...args) => mockAccountRoute(...args),
-  normalizeNativeCallbackOutputFiles: (value) => value,
+  normalizeNativeCallbackOutputFiles: (value, identity) =>
+    value?.origin_ref
+      ? jest.requireActual('@librechat/api').normalizeNativeCallbackOutputFiles(value, identity)
+      : value,
+  fenceGlassHiveTerminalCallbackAcceptedOperation: (...args) => mockCallbackFence(...args),
   nativeCallbackOutputFilesForMessage: (value, identity) => ({
     ...value,
     message_id: identity.responseMessageId,
@@ -76,7 +91,11 @@ const {
   prepareCurrentNativeOutputFiles,
   prepareMissionOutputFiles,
   prepareRetainedNativeOutputFiles,
+  prepareNativeResponseOutputFiles,
 } = require('../nativeOutputFiles');
+jest.spyOn(require('mongoose').connection, 'collection').mockImplementation(() => ({
+  find: () => ({ toArray: async () => mockCallbackRows }),
+}));
 // Imported File IDs are owned by the exact native envelope and verified descriptor.
 const importedFixture = (envelope, file, identity) => ({
   file_id: `native_${createHash('sha256')
@@ -122,6 +141,9 @@ const req = () => ({
 });
 beforeEach(() => {
   jest.clearAllMocks();
+  mockCallbackRows = [];
+  mockCallbackAccepted.mockResolvedValue(true);
+  mockCallbackFence.mockResolvedValue(true);
   mockRoute.mockReset();
   mockFetchFactory.mockReset();
   mockOrigin.mockReset();
@@ -763,7 +785,166 @@ test('imports only Main-selected accepted native observations through the owner 
   expect(mockImport).not.toHaveBeenCalled();
 });
 
+describe('canonical callback files and media aliases', () => {
+  const fixture = () => {
+    const item = {
+      kind: 'image',
+      source: 'native_tool_result',
+      run_id: 'run-image',
+      artifact_ref: `artifact_sha256:${'a'.repeat(64)}`,
+      tool_call_id: 'call-image',
+      content_index: 0,
+      mime_type: 'image/png',
+      bytes: 67,
+      sha256: 'a'.repeat(64),
+      download_url: 'https://artifacts.example.test/v1/link-refs/ghr_image1234567890',
+      open_url: 'https://artifacts.example.test/v1/link-refs/ghr_image1234567890',
+    };
+    const file = {
+      filename: 'screenshot.png',
+      mime_type: item.mime_type,
+      bytes: item.bytes,
+      sha256: item.sha256,
+      download_url: item.download_url,
+    };
+    const row = {
+      ownerId: 'owner',
+      runId: item.run_id,
+      attemptId: 'attempt-image',
+      terminalCallbackId: `cb_terminal_${'d'.repeat(64)}`,
+      originRef: 'origin-image',
+      workRef: 'work-image',
+      attemptNumber: 1,
+      terminalCallbackResultKey: `ghtr_${'e'.repeat(64)}`,
+      terminalCallbackAcceptedOperationId: 'f'.repeat(32),
+      terminalCallbackEffectGeneration: 1,
+      terminalCallbackResultRevision: 2,
+      terminalCallbackResultDigest: `sha256:${'b'.repeat(64)}`,
+      nativeMedia: { observations: [item], omitted_count: 0 },
+    };
+    row.outputFiles = {
+      owner_id: row.ownerId,
+      run_id: row.runId,
+      attempt_id: row.attemptId,
+      callback_id: row.terminalCallbackId,
+      files: [file],
+    };
+    return {
+      row,
+      file,
+      selectedNativeMedia: [
+        {
+          run_id: item.run_id,
+          tool_call_id: item.tool_call_id,
+          content_index: item.content_index,
+          artifact_ref: item.artifact_ref,
+          label: 'Readable screenshot',
+        },
+      ],
+      message: {
+        conversationId: 'conversation-image',
+        messageId: 'answer-image',
+        agent_id: 'main',
+      },
+    };
+  };
+  beforeEach(() => {
+    mockImport.mockImplementation(async (envelope, identity) =>
+      envelope.files.map((file) => importedFixture(envelope, file, identity)),
+    );
+  });
+  test('one selected artifact keeps its canonical filename instead of importing its link label again', async () => {
+    const value = fixture();
+    const result = await prepareMissionOutputFiles({
+      req: req(),
+      rows: [value.row],
+      message: value.message,
+      selectedNativeMedia: value.selectedNativeMedia,
+    });
+    expect(mockImport.mock.calls[0][0].files).toEqual([value.file]);
+    expect(result.map((file) => file.filename)).toEqual(['screenshot.png']);
+  });
+  test('retains every intentional canonical filename for the same grant and bytes', async () => {
+    const value = fixture();
+    value.row.outputFiles.files.push({ ...value.file, filename: 'intentional-copy.png' });
+    const result = await prepareMissionOutputFiles({
+      req: req(),
+      rows: [value.row],
+      message: value.message,
+      selectedNativeMedia: value.selectedNativeMedia,
+    });
+    expect(mockImport.mock.calls[0][0].files).toEqual(value.row.outputFiles.files);
+    expect(result.map((file) => file.filename)).toEqual(['screenshot.png', 'intentional-copy.png']);
+  });
+  test.each([
+    ['download_url', 'https://artifacts.example.test/v1/link-refs/ghr_other1234567890'],
+    ['sha256', 'c'.repeat(64)],
+    ['bytes', 68],
+    ['mime_type', 'image/jpeg'],
+  ])('keeps a media selection when canonical %s differs', async (field, different) => {
+    const value = fixture();
+    value.file[field] = different;
+    const result = await prepareMissionOutputFiles({
+      req: req(),
+      rows: [value.row],
+      message: value.message,
+      selectedNativeMedia: value.selectedNativeMedia,
+    });
+    expect(mockImport.mock.calls[0][0].files).toHaveLength(2);
+    expect(result.map((file) => file.filename)).toEqual([
+      'screenshot.png',
+      'Readable_screenshot.png',
+    ]);
+  });
+  test('does not suppress selected media using another callback origin', async () => {
+    const value = fixture();
+    const canonical = {
+      ...value.row,
+      nativeMedia: undefined,
+      runId: 'run-other',
+      terminalCallbackId: `cb_terminal_${'1'.repeat(64)}`,
+      originRef: 'origin-other',
+      workRef: 'work-other',
+      outputFiles: {
+        ...value.row.outputFiles,
+        run_id: 'run-other',
+        callback_id: `cb_terminal_${'1'.repeat(64)}`,
+      },
+    };
+    const selected = { ...value.row, outputFiles: undefined };
+    const result = await prepareMissionOutputFiles({
+      req: req(),
+      rows: [canonical, selected],
+      message: value.message,
+      selectedNativeMedia: value.selectedNativeMedia,
+    });
+    expect(mockImport.mock.calls[0][0].files).toEqual([value.file]);
+    expect(mockImport.mock.calls[1][0].files).toHaveLength(1);
+    expect(result.map((file) => file.filename)).toEqual([
+      'screenshot.png',
+      'Readable_screenshot.png',
+    ]);
+  });
+});
+
 describe('retained owned native File references', () => {
+  test('ordinary replies do not query retained files or callback evidence', async () => {
+    const result = await prepareRetainedNativeOutputFiles(
+      req(),
+      {
+        userId: 'owner',
+        conversationId: 'conversation',
+        responseMessageId: 'answer',
+        agentId: 'main',
+      },
+      'The total is 24.',
+    );
+    expect(result.imports).toHaveLength(0);
+    expect(require('~/db/models').Message.find).not.toHaveBeenCalled();
+    expect(require('mongoose').connection.collection).not.toHaveBeenCalled();
+    expect(mockCallbackAccepted).not.toHaveBeenCalled();
+    expect(mockFind).not.toHaveBeenCalled();
+  });
   function setupRetained() {
     const bytes = Buffer.from('<svg/>');
     const file = {
@@ -874,6 +1055,180 @@ describe('retained owned native File references', () => {
       },
     };
   }
+  function setupRetainedCallback() {
+    const fixture = setupRetained();
+    delete fixture.row.nativeResponse;
+    const source = {
+      _id: 'callback-evidence',
+      ownerId: 'owner',
+      conversationId: 'conversation',
+      followUpMessageId: 'old-message',
+      mainAgentId: 'main',
+      originRef: 'origin',
+      workRef: 'work',
+      runId: 'old-run',
+      attemptId: 'old-attempt',
+      attemptNumber: 1,
+      terminalCallbackResultKey: 'ghtr_' + 'c'.repeat(64),
+      terminalCallbackAcceptedOperationId: 'd'.repeat(32),
+      terminalCallbackEffectGeneration: 1,
+      terminalCallbackId: 'cb_terminal_' + 'e'.repeat(64),
+      terminalCallbackResultRevision: 1,
+      terminalCallbackResultDigest: 'sha256:' + 'f'.repeat(64),
+    };
+    source.outputFiles = {
+      version: 1,
+      owner_id: 'owner',
+      run_id: source.runId,
+      attempt_id: source.attemptId,
+      callback_id: source.terminalCallbackId,
+      origin_ref: source.originRef,
+      work_ref: source.workRef,
+      result_revision: 1,
+      result_digest: source.terminalCallbackResultDigest,
+      files: [fixture.file],
+    };
+    const originalIdentity = {
+      userId: 'owner',
+      conversationId: 'conversation',
+      responseMessageId: 'old-message',
+      streamId: 'old-message',
+      agentId: 'main',
+      logicalTurnId: '',
+      revision: 1,
+      requestId: source.terminalCallbackId,
+      runId: source.runId,
+      attemptId: source.attemptId,
+    };
+    const envelope = jest
+      .requireActual('@librechat/api')
+      .nativeCallbackOutputFilesForMessage(source.outputFiles, originalIdentity);
+    const attachment = {
+      ...importedFixture(envelope, fixture.file, originalIdentity),
+      filepath: '/uploads/old.svg',
+      source: 'local',
+    };
+    const stored = {
+      ...attachment,
+      conversationId: 'conversation',
+      messageId: 'old-message',
+      metadata: { fileIdentifier: `native_output_sha256:${attachment.file_id.slice(7)}` },
+    };
+    fixture.row.attachments = [attachment];
+    fixture.stored = stored;
+    mockSourceFiles = new Map([[stored.file_id, stored]]);
+    mockFind.mockResolvedValue(stored);
+    mockCallbackRows = [source];
+    return { ...fixture, source };
+  }
+  test('reuses accepted callback File bytes without a native response, public fetch or new worker', async () => {
+    const fixture = setupRetainedCallback();
+    const result = await prepareRetainedNativeOutputFiles(req(), fixture.identity, fixture.text);
+    expect(result.imports).toHaveLength(1);
+    expect(result.imports[0].identity).toMatchObject({
+      responseMessageId: 'new-message',
+      requestId: fixture.source.terminalCallbackId,
+      runId: 'old-run',
+    });
+    expect(result.imports[0].attachments[0].file_id).not.toBe(fixture.stored.file_id);
+    expect(mockDownload).toHaveBeenCalledWith(expect.anything(), '/uploads/old.svg');
+    expect(mockRoute).not.toHaveBeenCalled();
+    expect(mockAccountRoute).not.toHaveBeenCalled();
+    expect(mockCallbackAccepted).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _id: fixture.source.terminalCallbackResultKey,
+        ownerId: 'owner',
+        workRef: 'work',
+        resultRevision: 1,
+        resultDigest: fixture.source.terminalCallbackResultDigest,
+        acceptedOperationId: fixture.source.terminalCallbackAcceptedOperationId,
+        acceptedOperationGeneration: 1,
+      }),
+    );
+    const session = { inTransaction: () => true };
+    await expect(result.authorizePublication(session)).resolves.toBeUndefined();
+    expect(mockCallbackFence).toHaveBeenCalledWith(
+      expect.objectContaining({
+        session,
+        reference: {
+          resultKey: fixture.source.terminalCallbackResultKey,
+          callbackId: fixture.source.terminalCallbackId,
+          acceptedOperationId: fixture.source.terminalCallbackAcceptedOperationId,
+          generation: 1,
+          resultRevision: 1,
+          resultDigest: fixture.source.terminalCallbackResultDigest,
+        },
+      }),
+    );
+  });
+  test.each([
+    'foreign_owner',
+    'tampered_sha',
+    'missing_file',
+    'ordinary_upload',
+    'unaccepted',
+    'wrong_source_message',
+    'wrong_source_agent',
+  ])('rejects retained callback %s', async (kind) => {
+    const fixture = setupRetainedCallback();
+    if (kind === 'foreign_owner') fixture.source.ownerId = 'another-owner';
+    if (kind === 'tampered_sha') fixture.file.sha256 = '0'.repeat(64);
+    if (kind === 'missing_file') mockFind.mockResolvedValue(null);
+    if (kind === 'ordinary_upload') fixture.row.isCreatedByUser = true;
+    if (kind === 'unaccepted') mockCallbackAccepted.mockResolvedValue(null);
+    if (kind === 'wrong_source_message') fixture.source.followUpMessageId = 'another-message';
+    if (kind === 'wrong_source_agent') fixture.source.mainAgentId = 'another-agent';
+    const result = await prepareRetainedNativeOutputFiles(req(), fixture.identity, fixture.text);
+    expect(result.imports).toHaveLength(0);
+    expect(mockImport).not.toHaveBeenCalled();
+  });
+  test.each(['evidence_changed', 'acceptance_superseded', 'accepted_fence_lost', 'file_missing'])(
+    'revokes callback publication when %s',
+    async (kind) => {
+      const fixture = setupRetainedCallback();
+      const result = await prepareRetainedNativeOutputFiles(req(), fixture.identity, fixture.text);
+      expect(result.imports).toHaveLength(1);
+      if (kind === 'evidence_changed') fixture.source.outputFiles.files[0].sha256 = '0'.repeat(64);
+      if (kind === 'acceptance_superseded') mockCallbackAccepted.mockResolvedValue(null);
+      if (kind === 'accepted_fence_lost') mockCallbackFence.mockResolvedValue(false);
+      if (kind === 'file_missing') mockSourceFiles.clear();
+      await expect(result.authorizePublication({ inTransaction: () => true })).rejects.toThrow(
+        'native_output_files_retained_source_invalid',
+      );
+    },
+  );
+  test('the Phase B consumer reuses the same accepted callback File path', async () => {
+    const fixture = setupRetainedCallback();
+    const result = await prepareMissionOutputFiles({
+      req: req(),
+      rows: [],
+      message: {
+        messageId: 'new-message',
+        conversationId: 'conversation',
+        agent_id: 'main',
+        text: fixture.text,
+      },
+    });
+    expect(result.attachments).toHaveLength(1);
+    await expect(
+      result.authorizePublication({ inTransaction: () => true }),
+    ).resolves.toBeUndefined();
+  });
+  test('the ordinary Main native response reuses the same accepted callback File path', async () => {
+    const fixture = setupRetainedCallback();
+    const result = await prepareNativeResponseOutputFiles(
+      req(),
+      { id: 'new-request' },
+      fixture.identity,
+      fixture.text,
+    );
+    expect(result.attachments).toHaveLength(1);
+    expect(mockDownload).toHaveBeenCalledWith(expect.anything(), '/uploads/old.svg');
+    expect(mockRoute).not.toHaveBeenCalled();
+    await expect(
+      result.authorizePublication({ inTransaction: () => true }),
+    ).resolves.toBeUndefined();
+  });
   test('imports original stored bytes into current message and rechecks exact source at publication', async () => {
     const fixture = setupRetained();
     const result = await prepareRetainedNativeOutputFiles(req(), fixture.identity, fixture.text);

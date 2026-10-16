@@ -280,99 +280,120 @@ describe('GlassHiveMissionAdjudicationService', () => {
     });
   });
 
-  test('Main replay during synthesis27 reschedules the existing lane after claim release', async () => {
+  test('Main replay during synthesis resumes the same pinned group immediately after claim release', async () => {
     jest.useFakeTimers();
     const service = require('../GlassHiveMissionAdjudicationService');
-    const pending = row({ attempts: 0 });
-    mockFind.mockReturnValueOnce(cursor([pending]));
-    mockFindOneAndUpdate.mockResolvedValueOnce({
+    const pending = row({
+      adjudicationGroupId: `ghag_${'a'.repeat(32)}`,
+      adjudicationGroupMemberIds: ['cb-1'],
+      adjudicationGroupPinnedAt: new Date(),
+    });
+    mockFind.mockReturnValueOnce(cursor([pending])).mockReturnValueOnce(cursor([pending]));
+    mockFindOneAndUpdate.mockResolvedValue({
       ...pending,
       state: 'processing',
       attempts: 1,
       processingAt: new Date(),
     });
-    mockPrepareCortexFollowUpMessage.mockImplementationOnce(async () => {
-      service.wakeGlassHiveMissionAdjudications({
-        ownerId: 'user-1',
-        conversationId: 'conversation-1',
-      });
-      return { currentMainPending: true };
-    });
-    service.wakeGlassHiveMissionAdjudications({
-      ownerId: 'user-1',
-      conversationId: 'conversation-1',
-    });
-    await jest.advanceTimersByTimeAsync(2000);
-    expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
-    expect(jest.getTimerCount()).toBe(1);
-    mockFind.mockReturnValueOnce(cursor([pending]));
-    mockFindOneAndUpdate.mockResolvedValueOnce({ ...pending, state: 'processing', attempts: 1 });
-    await jest.advanceTimersByTimeAsync(2000);
-    expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(2);
-    jest.useRealTimers();
-  });
-
-  test('Main replay before direct claim release27 wakes retained evidence after the early wake misses', async () => {
-    jest.useFakeTimers();
-    try {
-      const service = require('../GlassHiveMissionAdjudicationService');
-      const pending = row({ attempts: 0 });
-      mockFind.mockReturnValueOnce(cursor([pending])).mockReturnValueOnce(cursor([]));
-      mockFindOneAndUpdate.mockResolvedValueOnce({
-        ...pending,
-        state: 'processing',
-        attempts: 1,
-        processingAt: new Date(),
-      });
-      const ready = jest.fn(async () => {
-        expect(mockUpdateOne).toHaveBeenCalledWith(
-          expect.objectContaining({ state: 'processing', attempts: 1 }),
-          expect.objectContaining({ $inc: { attempts: -1 } }),
-        );
-        return true;
-      });
-      mockPrepareCortexFollowUpMessage.mockImplementationOnce(async () => {
-        // A direct flush does not occupy the scheduled lane. Replay's first wake sees the
-        // claimed row, then finishes before this direct flush releases it.
+    mockPrepareCortexFollowUpMessage
+      .mockImplementationOnce(async () => {
         service.wakeGlassHiveMissionAdjudications({
           ownerId: 'user-1',
           conversationId: 'conversation-1',
         });
-        await jest.advanceTimersByTimeAsync(2000);
-        expect(jest.getTimerCount()).toBe(0);
-        return { currentMainPending: true, currentMainReadyAfterRelease: ready };
+        return { currentMainPending: true };
+      })
+      .mockImplementationOnce(async () => {
+        expect(mockUpdateOne).toHaveBeenCalledWith(
+          expect.objectContaining({ state: 'processing', attempts: 1 }),
+          expect.objectContaining({ $inc: { attempts: -1 } }),
+        );
+        return { prepared: true };
       });
-      await flushGlassHiveMissionAdjudications({
+    service.wakeGlassHiveMissionAdjudications({
+      ownerId: 'user-1',
+      conversationId: 'conversation-1',
+    });
+    await jest.advanceTimersByTimeAsync(0);
+    expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(2);
+    expect(mockEnqueueDelivery).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test('Main replay before direct claim release wakes retained evidence after the early wake misses', async () => {
+    jest.useFakeTimers();
+    const service = require('../GlassHiveMissionAdjudicationService');
+    const pending = row({
+      adjudicationGroupId: `ghag_${'a'.repeat(32)}`,
+      adjudicationGroupMemberIds: ['cb-1'],
+      adjudicationGroupPinnedAt: new Date(),
+    });
+    mockFind
+      .mockReturnValueOnce(cursor([pending]))
+      .mockReturnValueOnce(cursor([]))
+      .mockReturnValueOnce(cursor([pending]));
+    mockFindOneAndUpdate.mockResolvedValue({
+      ...pending,
+      state: 'processing',
+      attempts: 1,
+      processingAt: new Date(),
+    });
+    const ready = jest.fn(async () => {
+      expect(mockUpdateOne).toHaveBeenCalledWith(
+        expect.objectContaining({ state: 'processing', attempts: 1 }),
+        expect.objectContaining({ $inc: { attempts: -1 } }),
+      );
+      return true;
+    });
+    mockPrepareCortexFollowUpMessage.mockImplementationOnce(async () => {
+      // Direct reconciliation does not occupy the scheduler's lane. The early wake sees
+      // no pending row while this exact direct claim still owns it.
+      service.wakeGlassHiveMissionAdjudications({
         ownerId: 'user-1',
         conversationId: 'conversation-1',
       });
-      expect(ready).toHaveBeenCalledTimes(1);
-      expect(jest.getTimerCount()).toBe(1);
-      mockFind.mockReturnValueOnce(cursor([pending]));
-      mockFindOneAndUpdate.mockResolvedValueOnce({ ...pending, state: 'processing', attempts: 1 });
-      await jest.advanceTimersByTimeAsync(2000);
-      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(2);
-    } finally {
-      jest.useRealTimers();
-    }
+      await jest.advanceTimersByTimeAsync(0);
+      expect(mockFind).toHaveBeenCalledTimes(2);
+      return { currentMainPending: true, currentMainReadyAfterRelease: ready };
+    });
+    await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+    await jest.advanceTimersByTimeAsync(0);
+    expect(ready).toHaveBeenCalledTimes(1);
+    expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(2);
+    expect(jest.getTimerCount()).toBe(0);
   });
 
-  test('still-running Main27 does not poll after direct claim release', async () => {
-    jest.useFakeTimers();
-    try {
-      mockFind.mockReturnValueOnce(cursor([row({ attempts: 0 })]));
+  test.each(['direct', 'ready wake'])(
+    'still-running Main does not poll after %s claim release',
+    async (mode) => {
+      jest.useFakeTimers();
+      const pending = row({
+        adjudicationGroupId: `ghag_${'a'.repeat(32)}`,
+        adjudicationGroupMemberIds: ['cb-1'],
+        adjudicationGroupPinnedAt: new Date(),
+      });
+      mockFind.mockReturnValueOnce(cursor([pending]));
       const ready = jest.fn().mockResolvedValue(false);
       mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({
         currentMainPending: true,
         currentMainReadyAfterRelease: ready,
       });
-      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      if (mode === 'direct') {
+        await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      } else {
+        require('../GlassHiveMissionAdjudicationService').wakeGlassHiveMissionAdjudications({
+          ownerId: pending.ownerId,
+          conversationId: pending.conversationId,
+        });
+        await jest.advanceTimersByTimeAsync(0);
+      }
       expect(ready).toHaveBeenCalledTimes(1);
       expect(jest.getTimerCount()).toBe(0);
-    } finally {
-      jest.useRealTimers();
-    }
-  });
+      await jest.advanceTimersByTimeAsync(COALESCE_MS * 10);
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+      expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+    },
+  );
 
   beforeEach(() => {
     clearAdjudicationTimersForTests();
@@ -535,6 +556,112 @@ describe('GlassHiveMissionAdjudicationService', () => {
     },
   );
 
+  test.each([false, true])(
+    'keeps native input and output-file evidence together (files=%s)',
+    async (withFiles) => {
+      const pending = {
+        version: 1,
+        kind: 'permission',
+        requestId: 'request-1',
+        requestFingerprint: 'a'.repeat(64),
+        runId: 'run-1',
+        attemptId: 'attempt-1',
+        sessionId: 'session-1',
+        expiresAt: '2099-01-01T00:00:00Z',
+        state: 'pending',
+        mode: 'form',
+        runtimeName: 'native-runtime',
+        message: 'Write result.svg Yes; No.',
+        requestedSchema: {
+          type: 'object',
+          required: ['optionId'],
+          properties: {
+            optionId: {
+              type: 'string',
+              enum: ['allow-once', 'reject-once'],
+              enumNames: ['Yes', 'No'],
+              enumKinds: ['allow_once', 'reject_once'],
+              description: 'Write result.svg',
+            },
+          },
+        },
+        ignoredSecret: 'must-not-be-projected',
+      };
+      const evidence = await enqueueGlassHiveMissionAdjudication({
+        binding: {
+          originRef: 'ghi-origin-1',
+          ownerId: 'user-1',
+          workRef: 'gh-work-1',
+          conversationId: 'conversation-1',
+          anchorMessageId: 'assistant-anchor',
+          mainAgentId: 'main-agent',
+        },
+        body: {
+          callback_id: 'cb-native-input',
+          event: 'run.needs_input',
+          work_state: 'needs_input',
+          worker_id: 'worker-1',
+          run_id: 'run-1',
+          work_terminal: false,
+          pending_native_input: pending,
+          message: pending.message,
+        },
+      });
+      expect(evidence.nativeInputContext).toMatchObject({
+        requestId: pending.requestId,
+        requestFingerprint: pending.requestFingerprint,
+        operationTitle: 'Write result.svg',
+        choices: [
+          { value: 'allow-once', label: 'Yes', kind: 'allow_once' },
+          { value: 'reject-once', label: 'No', kind: 'reject_once' },
+        ],
+      });
+      expect(evidence.nativeInputContext).not.toHaveProperty('ignoredSecret');
+      if (withFiles)
+        evidence.outputFiles = {
+          version: 1,
+          run_id: 'run-1',
+          files: [
+            {
+              filename: 'preview.svg',
+              sha256: 'a'.repeat(64),
+              download_url: 'https://files.example.test/preview.svg',
+            },
+          ],
+        };
+      mockNewestAttentionEvidence = { _id: evidence._id };
+      mockFind.mockReturnValueOnce(cursor([evidence]));
+      mockFindOneAndUpdate.mockResolvedValueOnce({ ...evidence, state: 'processing', attempts: 1 });
+      mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({
+        text: 'May I save the badge file you requested?',
+      });
+      await expect(
+        flushGlassHiveMissionAdjudications({ ownerId: 'user-1' }),
+      ).resolves.toMatchObject({ visible: 1 });
+      const insight = mockPrepareCortexFollowUpMessage.mock.calls[0][0].insightsData.insights[0];
+      expect(insight.insight).toContain('Write result.svg');
+      expect(insight.insight).toContain('allow-once');
+      if (withFiles) {
+        const prefix = JSON.parse(insight.insight.slice(0, insight.insight.indexOf('\n\n')));
+        expect(prefix.output_files).toMatchObject({ files: evidence.outputFiles.files, count: 1 });
+        expect(prefix.nativeInput).toMatchObject({
+          requestId: pending.requestId,
+          requestFingerprint: pending.requestFingerprint,
+          choices: evidence.nativeInputContext.choices,
+        });
+      }
+      expect(insight.insight).not.toContain('must-not-be-projected');
+      expect(insight.authority).toMatchObject({
+        kind: 'durable_work_callback',
+        event: 'run.needs_input',
+      });
+      expect(mockEnqueueDelivery.mock.calls[0][0]).toMatchObject({
+        body: { event: 'main.followup' },
+        text: 'Main-authored synthetic follow-up.',
+      });
+    },
+  );
+
   test('authors the blocker through Main and delivers authored text', async () => {
     const attention = row({
       event: 'run.needs_input',
@@ -555,6 +682,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
     const input = mockPrepareCortexFollowUpMessage.mock.calls[0][0];
     expect(input.insightsData.insights[0].authority).toEqual({
       kind: 'durable_work_callback',
+      userSource: { messageId: null, conversationId: 'conversation-1' },
       runId: 'run-1',
       event: 'run.needs_input',
       workState: 'needs_input',
@@ -736,7 +864,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
   });
 
   test.each(['question', 'permission'])(
-    'keeps an exact bound native %s in its existing courier',
+    'adjudicates an exact bound native %s through Main without executing its choice',
     async (kind) => {
       await expect(
         enqueueGlassHiveMissionAdjudication({
@@ -748,6 +876,8 @@ describe('GlassHiveMissionAdjudicationService', () => {
             mainAgentId: 'main-agent',
           },
           body: {
+            callback_id: 'cb_native_attention',
+            worker_id: 'worker-1',
             event: 'run.needs_input',
             work_state: 'needs_input',
             run_id: 'run-1',
@@ -767,8 +897,19 @@ describe('GlassHiveMissionAdjudicationService', () => {
             message: 'Native request.',
           },
         }),
-      ).resolves.toBeNull();
-      expect(mockUpdateOne).not.toHaveBeenCalled();
+      ).resolves.toMatchObject({
+        event: 'run.needs_input',
+        state: 'pending',
+        evidence: 'Native request.',
+      });
+      expect(mockUpdateOne).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          $setOnInsert: expect.objectContaining({ event: 'run.needs_input', workTerminal: false }),
+        }),
+        expect.anything(),
+      );
+      expect(mockEnqueueDelivery).not.toHaveBeenCalled();
     },
   );
 
@@ -1479,6 +1620,9 @@ describe('GlassHiveMissionAdjudicationService', () => {
             (item) =>
               item.state === 'pending' &&
               item.ownerId === filter.ownerId &&
+              (!filter.adjudicationGroupId ||
+                (typeof item.adjudicationGroupId === 'string' &&
+                  item.adjudicationGroupId !== '')) &&
               (filter.conversationId === undefined ||
                 (typeof filter.conversationId === 'object'
                   ? filter.conversationId.$in.includes(item.conversationId ?? null)
@@ -1525,6 +1669,115 @@ describe('GlassHiveMissionAdjudicationService', () => {
         },
       });
     }
+
+    test('Main-ready wake immediately claims an already-pinned group without another coalescing wait', async () => {
+      jest.useFakeTimers();
+      const pending = row({
+        adjudicationGroupId: `ghag_${'a'.repeat(32)}`,
+        adjudicationGroupMemberIds: ['cb-1'],
+        adjudicationGroupPinnedAt: new Date(),
+      });
+      schedulingRows([pending]);
+      require('../GlassHiveMissionAdjudicationService').wakeGlassHiveMissionAdjudications({
+        ownerId: pending.ownerId,
+        conversationId: pending.conversationId,
+      });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+      expect(mockEnqueueDelivery).toHaveBeenCalledTimes(1);
+      expect(pending.state).toBe('completed');
+      expect(pending.adjudicationGroupMemberIds).toEqual(['cb-1']);
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    test('ready wake preserves new arrivals and their initial coalescing timer', async () => {
+      jest.useFakeTimers();
+      const pinned = row({
+        adjudicationGroupId: `ghag_${'a'.repeat(32)}`,
+        adjudicationGroupMemberIds: ['cb-1'],
+        adjudicationGroupPinnedAt: new Date(),
+      });
+      const fresh = row({
+        _id: 'cb-2',
+        evidenceId: 'cb-2',
+        originRef: 'ghi-origin-2',
+        workRef: 'gh-work-2',
+        runId: 'run-2',
+      });
+      const otherOwner = row({
+        _id: 'cb-foreign',
+        ownerId: 'other-owner',
+        adjudicationGroupId: `ghag_${'f'.repeat(32)}`,
+        adjudicationGroupMemberIds: ['cb-foreign'],
+        adjudicationGroupPinnedAt: new Date(),
+      });
+      schedulingRows([pinned, fresh, otherOwner]);
+      await enqueueScheduled(fresh);
+      require('../GlassHiveMissionAdjudicationService').wakeGlassHiveMissionAdjudications({
+        ownerId: pinned.ownerId,
+        conversationId: pinned.conversationId,
+      });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+      expect(pinned.state).toBe('completed');
+      expect(fresh.state).toBe('pending');
+      expect(fresh.adjudicationGroupId).toBeUndefined();
+      expect(otherOwner.state).toBe('pending');
+      expect(jest.getTimerCount()).toBe(1);
+      await jest.advanceTimersByTimeAsync(COALESCE_MS - 1);
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(2);
+      expect(fresh.state).toBe('completed');
+      expect(fresh.adjudicationGroupMemberIds).toEqual(['cb-2']);
+      expect(pinned.adjudicationGroupMemberIds).toEqual(['cb-1']);
+      expect(otherOwner.state).toBe('pending');
+    });
+
+    test('matured collection waits for the shared lane and is not narrowed by a ready wake', async () => {
+      jest.useFakeTimers();
+      const service = require('../GlassHiveMissionAdjudicationService');
+      const pinned = row({
+        adjudicationGroupId: `ghag_${'a'.repeat(32)}`,
+        adjudicationGroupMemberIds: ['cb-1'],
+        adjudicationGroupPinnedAt: new Date(),
+      });
+      const fresh = row({
+        _id: 'cb-2',
+        evidenceId: 'cb-2',
+        originRef: 'ghi-origin-2',
+        workRef: 'gh-work-2',
+        runId: 'run-2',
+      });
+      schedulingRows([pinned, fresh]);
+      let release;
+      const blocked = new Promise((resolve) => {
+        release = resolve;
+      });
+      mockPrepareCortexFollowUpMessage.mockReturnValueOnce(blocked);
+      service.wakeGlassHiveMissionAdjudications({
+        ownerId: pinned.ownerId,
+        conversationId: pinned.conversationId,
+      });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+      await enqueueScheduled(fresh);
+      await jest.advanceTimersByTimeAsync(COALESCE_MS);
+      service.wakeGlassHiveMissionAdjudications({
+        ownerId: pinned.ownerId,
+        conversationId: pinned.conversationId,
+      });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+      expect(fresh.adjudicationGroupId).toBeUndefined();
+      release({ prepared: true });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(2);
+      expect(fresh.state).toBe('completed');
+      expect(pinned.adjudicationGroupMemberIds).toEqual(['cb-1']);
+      expect(fresh.adjudicationGroupMemberIds).toEqual(['cb-2']);
+      expect(jest.getTimerCount()).toBe(0);
+    });
 
     test('delivers another conversation while the first conversation synthesis is blocked', async () => {
       jest.useFakeTimers();
@@ -1648,7 +1901,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
     });
   });
 
-  test('serializes one conversation flush and schedules one lossless follow-up flush', async () => {
+  test('serializes one conversation flush and resumes a matured lossless follow-up immediately', async () => {
     jest.useFakeTimers();
     const firstRow = row({ _id: 'cb-a', evidenceId: 'cb-a', evidence: 'First result.' });
     const secondRow = row({
@@ -1720,8 +1973,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
 
     releaseFirst({ messageId: 'follow-up-a', text: 'First result.' });
     await jest.advanceTimersByTimeAsync(0);
-    expect(jest.getTimerCount()).toBe(1);
-    await jest.advanceTimersByTimeAsync(COALESCE_MS);
+    expect(jest.getTimerCount()).toBe(0);
     expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(2);
     expect(mockFind).toHaveBeenCalledTimes(2);
   });
@@ -1805,13 +2057,14 @@ describe('GlassHiveMissionAdjudicationService', () => {
   test('coalesces same-account mission evidence into existing Main Phase-B synthesis', async () => {
     const media = { observations: [], omitted_count: 2 };
     const rows = [
-      row({ nativeMedia: media }),
+      row({ nativeMedia: media, requestedParentMessageId: 'original-user-a' }),
       row({
         _id: 'cb-2',
         evidenceId: 'cb-2',
         callbackRef: canonicalCallbackRef('cb-2'),
         originRef: 'ghi-origin-2',
         anchorMessageId: 'assistant-anchor-newer',
+        requestedParentMessageId: 'original-user-b',
         evidence: 'Second result.',
         runId: 'run-2',
       }),
@@ -1844,6 +2097,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
               maxPromptChars: 12_000,
               authority: {
                 kind: 'durable_terminal_callback',
+                userSource: { messageId: 'original-user-a', conversationId: 'conversation-1' },
                 runId: 'run-1',
                 event: 'run.completed',
                 workState: 'completed',
@@ -1855,6 +2109,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
               maxPromptChars: 12_000,
               authority: {
                 kind: 'durable_terminal_callback',
+                userSource: { messageId: 'original-user-b', conversationId: 'conversation-1' },
                 runId: 'run-2',
                 event: 'run.completed',
                 workState: 'completed',

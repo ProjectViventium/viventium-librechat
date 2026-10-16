@@ -1,7 +1,10 @@
+import { createHash } from 'node:crypto';
+import { logger } from '@librechat/data-schemas';
 import { ChatModelStreamHandler } from '@librechat/agents';
 import {
   inspectProviderDeliveryDisposition,
   inspectProviderDeliveryRanges,
+  projectAudioDeliveryControls,
   resolveEffectiveDeliveryDisposition,
   supportsMessagingDeliveryDisposition,
   isAudioDeliveryRequested,
@@ -533,4 +536,78 @@ it('reads the actual merged SDK terminal range source without trusting concatena
   };
   expect(inspectProviderDeliveryRanges(output, text)).toEqual(ranges);
   expect(inspectProviderDeliveryRanges(output, 'changed')).toEqual([]);
+});
+
+describe('source-bound follow-up speech projection', () => {
+  const source = 'Written 🧠. [chuckle] Spoken result.';
+  const text = 'Written 🧠. Spoken result.';
+  const split = 'Written 🧠. '.length;
+  const part = (value: string) => ({
+    type: 'text',
+    text: value,
+    deliveryDispositionRanges: [
+      { start: 0, end: split, disposition: modelDisposition('skip') },
+      { start: split, end: value.length, disposition: modelDisposition() },
+    ],
+  });
+  const canonical = [part(text)];
+  const controls = () => ({
+    sourceTextSha256: createHash('sha256').update(text).digest('hex'),
+    audioContent: [part(source)],
+  });
+  const project = (value: string) => value.replace('[chuckle] ', '');
+
+  it('reports typed binding outcomes without source text', () => {
+    const log = jest.spyOn(logger, 'info');
+    try {
+      projectAudioDeliveryControls(controls(), text, canonical, project);
+      projectAudioDeliveryControls(undefined, text, canonical, project);
+      projectAudioDeliveryControls(null, text, undefined, project);
+      projectAudioDeliveryControls(undefined, text, undefined, project);
+      expect(log.mock.calls.slice(-4)).toEqual([
+        ['[VoiceAudioBinding][core] state=%s', 'bound'],
+        ['[VoiceAudioBinding][core] state=%s', 'canonical_fallback'],
+        ['[VoiceAudioBinding][core] state=%s', 'binding_silenced'],
+        ['[VoiceAudioBinding][core] state=%s', 'legacy'],
+      ]);
+      expect(JSON.stringify(log.mock.calls)).not.toContain(source);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('keeps raw controls, Unicode offsets, skip choices and the exact clean display binding', () => {
+    expect(projectAudioDeliveryControls(controls(), text, canonical, project)).toEqual(controls());
+  });
+  it.each(['hash', 'source', 'ranges', 'choice', 'canonical'])(
+    'retains canonical range authority when optional speech has a changed %s',
+    (kind) => {
+      const input = controls();
+      const display = [part(text)];
+      if (kind === 'hash') input.sourceTextSha256 = 'f'.repeat(64);
+      if (kind === 'source') input.audioContent[0].text = source.replace('Spoken', 'Changed');
+      if (kind === 'ranges') input.audioContent[0].deliveryDispositionRanges[1].end -= 1;
+      if (kind === 'choice')
+        input.audioContent[0].deliveryDispositionRanges[0].disposition = modelDisposition();
+      if (kind === 'canonical') display[0].text += ' changed';
+      expect(projectAudioDeliveryControls(input, text, display, project)).toEqual({
+        sourceTextSha256: controls().sourceTextSha256,
+        audioContent: kind === 'canonical' ? [] : canonical,
+      });
+    },
+  );
+  it('distinguishes absent legacy data from malformed or silent data', () => {
+    expect(projectAudioDeliveryControls(undefined, text, undefined, project)).toBeUndefined();
+    expect(projectAudioDeliveryControls(undefined, text, canonical, project)?.audioContent).toEqual(
+      canonical,
+    );
+    expect(projectAudioDeliveryControls(null, text, canonical, project)?.audioContent).toEqual(
+      canonical,
+    );
+    const input = controls();
+    const display = [part(text)];
+    input.audioContent[0].deliveryDispositionRanges[1].disposition = modelDisposition('skip');
+    display[0].deliveryDispositionRanges[1].disposition = modelDisposition('skip');
+    expect(projectAudioDeliveryControls(input, text, display, project)).toEqual(input);
+  });
 });

@@ -237,6 +237,34 @@ describe('buildVoiceModeInstructions', () => {
     expect(result).toContain('Do NOT use <emotion');
   });
 
+  test.each(['fallback', 'compiled'])(
+    '%s keeps waiting foreground work conversational without forced acknowledgments',
+    (mode) => {
+      const {
+        buildPromptBundleFixture,
+      } = require('../../../../../scripts/test-support/promptBundle.cjs');
+      if (mode === 'compiled') {
+        const sourceRoot = path.resolve(
+          __dirname,
+          '../../../../../viventium/source_of_truth/prompts',
+        );
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-voice-progress-'));
+        const bundlePath = path.join(directory, 'prompts.json');
+        fs.writeFileSync(bundlePath, JSON.stringify(buildPromptBundleFixture(sourceRoot)));
+        process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundlePath;
+      } else {
+        delete process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+      }
+      resetPromptRegistryForTests();
+      const result = buildVoiceModeInstructions('xai');
+      expect(result).toContain(
+        'For foreground work that requires waiting, give a brief natural spoken progress update when useful, while honoring requests for silence or strict output; do not claim an action or result without its receipt or evidence.',
+      );
+      expect(result).toContain('never claim a result before its authoritative evidence returns');
+      expect(result).toContain('Keep {NTA} for the existing no-response cases');
+    },
+  );
+
   test('provider capability contract distinguishes inline controls from side channels', () => {
     const providers = TTS_PROVIDER_CAPABILITIES.providers;
     expect(Object.keys(providers).sort()).toEqual(
@@ -976,12 +1004,12 @@ describe('stripVoiceControlTagsForDisplay', () => {
     );
   });
 
-  test('preserves public links while cleaning citations and email for voice display persistence', () => {
+  test('preserves links and contact addresses while cleaning citations for voice display persistence', () => {
     const result = stripVoiceControlTagsForDisplay(
       'Sources: https://example.com/report Read [brief](https://example.com/brief). Email qa@example.com. Answer [12].',
     );
     expect(result).toBe(
-      'Sources: https://example.com/report Read [brief](https://example.com/brief). Email address available. Answer.',
+      'Sources: https://example.com/report Read [brief](https://example.com/brief). Email qa@example.com. Answer.',
     );
     expect(result).not.toMatch(/\b([A-Za-z][A-Za-z']{1,})\b[\s.,!?;:]+\1\b/i);
     expect(result).toContain('https://example.com/report');
@@ -1012,17 +1040,17 @@ describe('stripVoiceControlTagsForDisplay', () => {
   });
   // === VIVENTIUM END ===
 
-  test('preserves public links while stripping private contact and citation artifacts for display', () => {
+  test('preserves authored links and contact addresses while stripping citation artifacts for display', () => {
     const result = stripVoiceControlTagsForDisplay(
       'Sources: https://example.com/report Read [brief](https://example.com/brief). Email qa@example.com. Answer [12].',
     );
     expect(result).toBe(
-      'Sources: https://example.com/report Read [brief](https://example.com/brief). Email address available. Answer.',
+      'Sources: https://example.com/report Read [brief](https://example.com/brief). Email qa@example.com. Answer.',
     );
     expect(result).not.toMatch(/\b([A-Za-z][A-Za-z']{1,})\b[\s.,!?;:]+\1\b/i);
     expect(result).toContain('Sources: https://example.com/report');
     expect(result).toContain('[brief](https://example.com/brief)');
-    expect(result).not.toContain('qa@example.com');
+    expect(result).toContain('qa@example.com');
     expect(result).not.toContain('[12]');
   });
 });

@@ -8,6 +8,9 @@ const { configuredBackgroundWorkerRoute } = require('@librechat/api');
 
 const { Constants, extractEnvVariable } = require('librechat-data-provider');
 const crypto = require('crypto');
+/* === VIVENTIUM START === Passive current-attempt capability timing. === */
+const { voiceLatencyNow, logVoiceLatencyNumericStage } = require('./voiceLatencyTiming');
+/* === VIVENTIUM END === */
 const {
   transcriptionAttachmentReferences,
   resolveSelectedHistoryAttachments,
@@ -48,6 +51,7 @@ const HARNESS_CANCELLATION_ABORT_REASONS = new Set([
   'user_cancelled',
   'superseded',
   'maintenance_yield',
+  'compaction_lease_lost',
   CORTEX_ATTEMPT_DEADLINE_REASON,
 ]);
 /* === VIVENTIUM START ===
@@ -57,6 +61,7 @@ const HARNESS_CANCELLATION_ABORT_REASONS = new Set([
 const CORTEX_ATTEMPT_RELEASE_REASON = 'cortex_attempt_release';
 const HARNESS_RELEASE_REASONS = new Set([
   'maintenance_yield',
+  'compaction_lease_lost',
   CORTEX_ATTEMPT_DEADLINE_REASON,
   CORTEX_ATTEMPT_RELEASE_REASON,
 ]);
@@ -621,6 +626,21 @@ function conversationProviderUsesNativeBody(
   if (!requireTransport) return true;
   return routes.every((route) =>
     Boolean(route?.model_parameters?.configuration?.defaultHeaders?.['X-GlassHive-Agent-Id']),
+  );
+}
+
+/** Same selected-file read for early admission sizing and the signed invocation projection. */
+function resolveConversationProviderHistoryAttachments(req, requestBody = req?.body) {
+  const body = projectTrustedClientPresentation(requestBody, req);
+  return resolveSelectedHistoryAttachments(
+    {
+      userId: String(req?.user?.id || req?.user?._id || ''),
+      conversationId: body?.conversationId,
+      parentMessageId: body?.parentMessageId,
+    },
+    { getMessages, getFiles },
+    undefined,
+    req,
   );
 }
 
@@ -1672,22 +1692,50 @@ function installConversationProviderCapabilityRefresher({
     const previousInstructionAppend = String(
       targetAgent?.[CONVERSATION_PROVIDER_INSTRUCTION_APPEND] || '',
     ).trim();
-    const attached = await attachConversationProviderCapabilityBundle({
-      targetAgent,
-      declaredAgent,
-      capabilitySourceAgent,
-      mcpCapabilitySourceAgent,
-      req,
-      capability: resolvedCapability,
-      requestBody: effectiveRequestBody,
-      nativeTools,
-      ...(privateStructuredResponse ? { privateStructuredResponse: true } : {}),
-    });
-    if (!attached) {
-      // Never leave a previously valid but now expired bundle on the next provider attempt.
-      removeBootstrapBundleHeaders(targetAgent);
+    const startedAt = req?.viventiumVoiceLogLatency === true ? voiceLatencyNow() : null;
+    let outcome = 'failed';
+    try {
+      const attached = await attachConversationProviderCapabilityBundle({
+        targetAgent,
+        declaredAgent,
+        capabilitySourceAgent,
+        mcpCapabilitySourceAgent,
+        req,
+        capability: resolvedCapability,
+        requestBody: effectiveRequestBody,
+        nativeTools,
+        ...(privateStructuredResponse ? { privateStructuredResponse: true } : {}),
+      });
+      if (!attached) {
+        // Never leave a previously valid but now expired bundle on the next provider attempt.
+        removeBootstrapBundleHeaders(targetAgent);
+      }
+      outcome = 'completed';
+      return capabilityRefreshResult(targetAgent, attached, previousInstructionAppend);
+    } finally {
+      if (startedAt != null) {
+        try {
+          const requestHash = crypto
+            .createHash('sha256')
+            .update(String(req.viventiumVoiceRequestId || 'unknown'))
+            .digest('hex');
+          const participantHash = crypto
+            .createHash('sha256')
+            .update(String(targetAgent.id || 'unknown'))
+            .digest('hex');
+          logVoiceLatencyNumericStage(
+            logger,
+            req,
+            `conversation_provider:${participantHash}`,
+            `capability_refresh_${outcome}`,
+            startedAt,
+            requestHash,
+          );
+        } catch {
+          // Passive timing must never alter authorization or model execution.
+        }
+      }
     }
-    return capabilityRefreshResult(targetAgent, attached, previousInstructionAppend);
   };
   Object.defineProperty(targetAgent, CONVERSATION_PROVIDER_CAPABILITY_REFRESH, {
     value: refresh,
@@ -1834,6 +1882,7 @@ async function attachDeclaredConversationProviderCapabilityBundle({
   req,
   requestBody = req?.body || {},
   resolveAgentById,
+  deferUntilInvocation = false,
 } = {}) {
   const declaredProvider = resolveConversationProviderId(declaredAgent);
   const capability = req?.config?.endpoints?.agents?.providerCapabilities?.[declaredProvider];
@@ -1846,6 +1895,7 @@ async function attachDeclaredConversationProviderCapabilityBundle({
     capability,
     requestBody,
     resolveAgentById,
+    deferUntilInvocation,
   });
 }
 
@@ -1859,6 +1909,7 @@ async function attachConversationProviderCapabilityBundle({
   requestBody = req?.body || {},
   nativeTools,
   privateStructuredResponse = false,
+  deferUntilInvocation = false,
 } = {}) {
   if (
     typeof privateStructuredResponse !== 'boolean' ||
@@ -1921,6 +1972,18 @@ async function attachConversationProviderCapabilityBundle({
   ) {
     targetAgent.model_parameters = { ...modelParameters, configuration };
   }
+  /* === VIVENTIUM START === Defer duplicate minting to the existing invocation owner. === */
+  // Graph-owned attempts rebuild this exact capability after durable turn IDs exist.
+  // Keep structural headers above; zero-tool/private contracts remain eager. A runtime
+  // refresher is required, so direct attach callers cannot lose their signed authority.
+  if (
+    deferUntilInvocation === true &&
+    typeof targetAgent[CONVERSATION_PROVIDER_CAPABILITY_REFRESH] === 'function'
+  ) {
+    removeBootstrapBundleHeaders(targetAgent);
+    return false;
+  }
+  /* === VIVENTIUM END === */
   /* === VIVENTIUM START ===
    * Feature: Participant-owned capability parity across provider fallback routes.
    * Purpose: The fallback route declares provider identity, while the owning participant declares
@@ -1938,14 +2001,7 @@ async function attachConversationProviderCapabilityBundle({
   const currentUploads = trustedUploadedFilesFromRequestBody(trustedRequestBody);
   const historyUploads =
     capability.workspace_binding === true
-      ? await resolveSelectedHistoryAttachments(
-          {
-            userId: String(req?.user?.id || req?.user?._id || ''),
-            conversationId: trustedRequestBody.conversationId,
-            parentMessageId: trustedRequestBody.parentMessageId,
-          },
-          { getMessages, getFiles },
-        )
+      ? await resolveConversationProviderHistoryAttachments(req, trustedRequestBody)
       : [];
   // Current source records retain their text and order when persisted ancestry repeats their IDs.
   const currentUploadKeys = new Set(currentUploads.map((file) => file.file_id || file.filename));
@@ -2138,6 +2194,7 @@ function attachConversationProviderBootstrapBundle({
 }
 
 module.exports = {
+  resolveConversationProviderHistoryAttachments,
   restrictedConversationProviderBootstrapHeaders,
   attachConversationProviderBootstrapBundle,
   applyHostEvidenceBoundaryInstructions,

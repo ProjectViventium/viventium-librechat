@@ -2198,68 +2198,73 @@ describe('ViventiumMainContextService', () => {
     expect(requestBody).not.toHaveProperty('viventiumGlassHiveTurnContextB64');
   });
 
-  test('carries complete oversized continuity through the existing native body converter', async () => {
-    const { createMainContinuityFetch } = jest.requireActual('@librechat/api');
-    const continuity = `<viventium_main_continuity_v1>${'🧠'.repeat(6000)}</viventium_main_continuity_v1>`;
-    const primary = agent();
-    primary.model_parameters = {
-      configuration: {
-        defaultHeaders: {
-          'X-GlassHive-Agent-Id': 'main-agent',
-        },
-      },
-    };
-    const input = {
-      messageId: 'current-input',
-      role: 'user',
-      content: 'Current authored request.',
-    };
-    const snapshot = captureMainContextSnapshot(
-      { user: { id: 'owner-native-body' } },
-      {
-        agent: primary,
-        messages: [input],
-        visibleMessages: [
-          {
-            ...input,
-            text: input.content,
-            isCreatedByUser: true,
-            user: 'owner-native-body',
-            conversationId: '',
-            parentMessageId: '',
+  test.each([6000, 36000])(
+    'carries %i multibyte context characters through the existing native body converter',
+    async (count) => {
+      const { createMainContinuityFetch } = jest.requireActual('@librechat/api');
+      const continuity = `<viventium_main_continuity_v1>${'🧠'.repeat(count)}</viventium_main_continuity_v1>`;
+      const primary = agent();
+      primary.model_parameters = {
+        configuration: {
+          defaultHeaders: {
+            'X-GlassHive-Agent-Id': 'main-agent',
           },
-        ],
-        sections: { mainContinuity: continuity },
-        attemptState: {
-          instructionsByAgentId: { 'main-agent': primary.instructions },
-          turnContextHeaderPresent: true,
-          turnContextText: continuity,
         },
-      },
-    );
-    expect(bindMainContextSnapshot(primary, snapshot)).toBe(true);
-    const requestBody = {};
-    expect(applyMainContextAttempt({ agents: [primary], requestBody, snapshot })).toBe(true);
-    const headers = new Headers(primary.model_parameters.configuration.defaultHeaders);
-    headers.set('X-GlassHive-Turn-Context-B64', requestBody.viventiumGlassHiveTurnContextB64);
-    const transport = jest.fn(async () => new Response('{}'));
-    const wrapped = createMainContinuityFetch(
-      transport,
-      headers.get('X-Viventium-Visible-Message-Chain-B64'),
-    );
-    await wrapped('https://native.invalid/v1/chat/completions', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ messages: [{ role: input.role, content: input.content }] }),
-    });
-    expect(transport).toHaveBeenCalledTimes(1);
-    const sent = transport.mock.calls[0][1];
-    expect(new Headers(sent.headers).get('X-GlassHive-Turn-Context-B64')).toBeNull();
-    expect(JSON.parse(sent.body).metadata.turn_context).toBe(continuity);
-    expect(Buffer.byteLength(JSON.parse(sent.body).metadata.turn_context)).toBeGreaterThan(
-      16 * 1024,
-    );
-  });
+      };
+      const input = {
+        messageId: 'current-input',
+        role: 'user',
+        content: 'Current authored request.',
+      };
+      const snapshot = captureMainContextSnapshot(
+        { user: { id: 'owner-native-body' } },
+        {
+          agent: primary,
+          messages: [input],
+          visibleMessages: [
+            {
+              ...input,
+              text: input.content,
+              isCreatedByUser: true,
+              user: 'owner-native-body',
+              conversationId: '',
+              parentMessageId: '',
+            },
+          ],
+          sections: { mainContinuity: continuity },
+          attemptState: {
+            instructionsByAgentId: { 'main-agent': primary.instructions },
+            turnContextMaximumBytes: count > 6000 ? 170003 : 131072,
+            turnContextHeaderPresent: true,
+            turnContextText: continuity,
+          },
+        },
+      );
+      expect(bindMainContextSnapshot(primary, snapshot)).toBe(true);
+      const requestBody = {};
+      expect(applyMainContextAttempt({ agents: [primary], requestBody, snapshot })).toBe(true);
+      const headers = new Headers(primary.model_parameters.configuration.defaultHeaders);
+      headers.set('X-GlassHive-Turn-Context-B64', requestBody.viventiumGlassHiveTurnContextB64);
+      const transport = jest.fn(async () => new Response('{}'));
+      const wrapped = createMainContinuityFetch(
+        transport,
+        headers.get('X-Viventium-Visible-Message-Chain-B64'),
+      );
+      await wrapped('https://native.invalid/v1/chat/completions', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ messages: [{ role: input.role, content: input.content }] }),
+      });
+      expect(transport).toHaveBeenCalledTimes(1);
+      const sent = transport.mock.calls[0][1];
+      expect(new Headers(sent.headers).get('X-GlassHive-Turn-Context-B64')).toBeNull();
+      expect(new Headers(sent.headers).has('X-Viventium-Turn-Context-Max-Bytes')).toBe(false);
+      expect(JSON.parse(sent.body).metadata.turn_context).toBe(continuity);
+      expect(Buffer.byteLength(JSON.parse(sent.body).metadata.turn_context)).toBeGreaterThan(
+        16 * 1024,
+      );
+    },
+  );
 
   test('rejects oversized required continuity on a real header lane instead of omitting it', () => {
     const continuity = `<viventium_main_continuity_v1>${'x'.repeat(17 * 1024)}</viventium_main_continuity_v1>`;
@@ -4308,6 +4313,10 @@ describe('native whole-source courier admission', () => {
       formatAgentMessages,
       filterMalformedContentParts,
       buildAgentInstructions,
+      getTrustedInteractionContext: require('../interactionContext').getTrustedInteractionContext,
+      mainMessageDelivery: require('@librechat/api').mainMessageDelivery,
+      nativeHistoryAttachmentContextBytes:
+        require('@librechat/api').nativeHistoryAttachmentContextBytes,
     };
     vm.runInNewContext(
       strip.getText(ast) + '\n' + fn.getText(ast) + '\nmodule.exports=nativeWholeHistoryFits;',
@@ -4354,6 +4363,64 @@ describe('native whole-source courier admission', () => {
     const snapshot = capture(source);
     expect(snapshot.visibleMessageChain).toHaveLength(source.length);
     expect(() => capture(source, { native: false })).toThrow();
+  });
+  test('native visible history above the conservative whole-body estimate remains complete', () => {
+    const source = rows(260);
+    for (const row of source)
+      row.text = row.content = row.text + ' Retained original evidence.'.repeat(30);
+    const messages = formatAgentMessages(
+      source.map((message) => ({ ...formatMessage({ message }), messageId: message.messageId })),
+    ).messages;
+    expect(service.mainHistoryFitsNativeBody(messages, agent, 0)).toBe(false);
+    expect(capture(source).visibleMessageChain).toHaveLength(source.length);
+    expect(() =>
+      capture(source, {
+        alter: (messages) => {
+          messages[1].content = 'Lost source.';
+        },
+      }),
+    ).toThrow();
+  });
+  test('the actual maintenance binding accepts a lazy declared-native fallback but requires primary transport and every route capability', () => {
+    const file = path.resolve(__dirname, '../../../controllers/agents/client.js');
+    const ast = ts.createSourceFile(
+      file,
+      fs.readFileSync(file, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    let expression;
+    const visit = (node) => {
+      if (
+        ts.isPropertyAssignment(node) &&
+        node.name.getText(ast) === 'nativeBodyCarrier' &&
+        node.initializer.getText(ast).includes('requireTransport')
+      )
+        expression = node.initializer;
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+    expect(expression).toBeDefined();
+    const scope = {
+      module: { exports: {} },
+      conversationProviderUsesNativeBody: provider.conversationProviderUsesNativeBody,
+    };
+    vm.runInNewContext(
+      'module.exports=function(req){return (' + expression.getText(ast) + ');};',
+      scope,
+    );
+    const invoke = (selected) =>
+      scope.module.exports.call({ options: { agent: selected } }, request());
+    expect(
+      invoke({
+        ...agent,
+        viventiumFallbackLlmAssignment: { provider: 'native-route', model: 'lazy' },
+      }),
+    ).toBe(true);
+    expect(invoke({ ...agent, model_parameters: {} })).toBe(false);
+    expect(
+      invoke({ ...agent, viventiumFallbackLlmAssignment: { provider: 'unknown', model: 'lazy' } }),
+    ).toBe(false);
   });
   test('body admission still rejects genuinely missing prior words', () => {
     expect(() =>
@@ -4427,6 +4494,39 @@ describe('native whole-source courier admission', () => {
     expect(JSON.stringify(source)).toBe(before);
     source[1].attachments.push({ type: 'unknown' });
     expect(caller()(request(), agent, source, 20_000, {})).toBe(true);
+  });
+  test('actual caller uses a guaranteed native replay floor without charging static native configuration twice', () => {
+    const selected = { ...agent, instructions: 'Static native authority.'.repeat(10000) };
+    const source = rows(130);
+    expect(caller()(request(), selected, source, 94000, {})).toBe(false);
+    expect(caller()(request(), selected, source, 94000, { nativeHistoryUploads: [] }, 196608)).toBe(
+      true,
+    );
+    source[0].text = source[0].content = 'é'.repeat(130000);
+    expect(caller()(request(), selected, source, 94000, { nativeHistoryUploads: [] }, 196608)).toBe(
+      false,
+    );
+  });
+  test('actual caller exposes only proved remaining native context after exact history and attachments', () => {
+    const source = rows(58);
+    source[0].text = source[0].content = 'é🙂 retained words.'.repeat(200);
+    const sizingReceipt = {};
+    const hydration = { nativeHistoryUploads: [], sizingReceipt };
+    expect(caller()(request(), agent, source, 0, hydration, 196608)).toBe(true);
+    expect(sizingReceipt.contextBudgetBytes).toBeGreaterThan(131072);
+    expect(sizingReceipt.contextBudgetBytes).toBeLessThan(196608);
+    expect(
+      caller()(request(), agent, source, sizingReceipt.contextBudgetBytes, hydration, 196608),
+    ).toBe(true);
+    expect(
+      caller()(request(), agent, source, sizingReceipt.contextBudgetBytes + 1, hydration, 196608),
+    ).toBe(false);
+    const unknown = {};
+    caller()(request(), agent, source, 0, { sizingReceipt: unknown });
+    expect(unknown.contextBudgetBytes).toBeUndefined();
+    const unprepared = {};
+    expect(caller()(request(), agent, source, 0, { sizingReceipt: unprepared }, 196608)).toBeNull();
+    expect(unprepared.contextBudgetBytes).toBeUndefined();
   });
   test('actual caller costs all tool arguments and keeps adjacency and source unchanged', () => {
     const source = rows();
@@ -4504,6 +4604,7 @@ describe('native whole-source courier admission', () => {
     record,
     canCarryWholeHistory,
     compaction = { ensureAcceptedMainCompaction: jest.fn(async () => ({ status: 'degraded' })) },
+    nativeBodyCarrier = false,
   ) {
     const Model = { findOne: jest.fn(() => ({ lean: async () => record })) };
     let result, error;
@@ -4518,6 +4619,8 @@ describe('native whole-source courier admission', () => {
         MessageModel: {},
         canCarryWholeHistory,
         compaction,
+        nativeBodyCarrier,
+        nativeReplayBudgetKnown: nativeBodyCarrier,
         maxClaims: 1,
       });
     } catch (caught) {
@@ -4672,6 +4775,63 @@ describe('native whole-source courier admission', () => {
     expect(result.compaction.ensureAcceptedMainCompaction).not.toHaveBeenCalled();
   });
 
+  test('the actual native callback reserves the final context cap, including later dynamic growth', async () => {
+    const file = path.resolve(__dirname, '../../../controllers/agents/client.js');
+    const ast = ts.createSourceFile(
+      file,
+      fs.readFileSync(file, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    let callback;
+    const visit = (node) => {
+      if (ts.isPropertyAssignment(node) && node.name.getText(ast) === 'canCarryWholeHistory')
+        callback = node.initializer;
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+    const fits = jest.fn((...args) => {
+      args[4].sizingReceipt.attachmentBoundBytes = 123;
+      return true;
+    });
+    const logger = { info: jest.fn() };
+    const uploads = [];
+    const scope = {
+      module: { exports: {} },
+      req: request(),
+      conversationProviderUsesNativeBody: () => true,
+      resolveLegacyOutputCarrier: async () => ({ reservedContextUtf8Bytes: 1 }),
+      resolveConversationProviderHistoryAttachments: async () => uploads,
+      nativeWholeHistoryFits: fits,
+      nativeReplayBudget: 196608,
+      logger,
+      NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES: 131072,
+      isAgentsEndpoint: () => true,
+    };
+    vm.runInNewContext(
+      'module.exports=function(){return (' + callback.getText(ast) + ');};',
+      scope,
+    );
+    const check = scope.module.exports.call({ options: { agent, endpoint: 'agents' } });
+    const source = rows();
+    expect(await check(source, 'Earlier small summary')).toBe(true);
+    expect(fits.mock.calls[0][3]).toBe(131072);
+    expect(fits.mock.calls[0][4].nativeHistoryUploads).toBe(uploads);
+    expect(fits.mock.calls[0][5]).toBe(196608);
+    expect(logger.info).toHaveBeenCalledTimes(1);
+    expect(logger.info.mock.calls[0]).toHaveLength(1);
+    const persistedMessage = logger.info.mock.calls[0][0];
+    expect(persistedMessage.startsWith('[VIVENTIUM][native-history-fit] ')).toBe(true);
+    expect(JSON.parse(persistedMessage.slice('[VIVENTIUM][native-history-fit] '.length))).toEqual({
+      nativeBudgetKnown: true,
+      fitOutcome: 'fit',
+      selectedHistoryCount: source.length,
+      nativeBudgetBytes: 196608,
+      authorizedAttachmentBoundBytes: 123,
+      turnContextReserveBytes: 131072,
+    });
+  });
+
   test.each([true, false, null])(
     'current stamped history retains Native admission for conservative estimate %j',
     async (fit) => {
@@ -4690,6 +4850,94 @@ describe('native whole-source courier admission', () => {
       expect(result.error).toBeUndefined();
     },
   );
+  test.each([true])(
+    'positive native budget proof avoids stalled legacy maintenance and retains every source row (%j)',
+    async (fit) => {
+      for (const retained of [null, recordFor(rows(260))]) {
+        const source = rows(260);
+        const before = JSON.stringify(source);
+        let release;
+        const stalled = new Promise((resolve) => {
+          release = resolve;
+        });
+        const compaction = {
+          ensureAcceptedMainCompaction: jest.fn(() => stalled),
+          scheduleMainContinuityMaintenance: jest.fn(),
+        };
+        const pending = resolve(source, retained, async () => fit, compaction, true);
+        const outcome = await Promise.race([
+          pending,
+          new Promise((resolve) => setImmediate(() => resolve('blocked'))),
+        ]);
+        release({ status: 'degraded' });
+        expect(outcome).not.toBe('blocked');
+        expect(compaction.ensureAcceptedMainCompaction).not.toHaveBeenCalled();
+        expect(compaction.scheduleMainContinuityMaintenance).toHaveBeenCalledTimes(1);
+        expect(JSON.stringify(source)).toBe(before);
+        const projection = outcome.result;
+        if (retained) {
+          expect(projection.messages).toEqual(source.slice(100));
+          expect(projection.coveredIds).toEqual(source.slice(0, 100).map((row) => row.messageId));
+          expect(projection.capsule).toContain('Reviewed history.');
+          expect([
+            ...projection.coveredIds,
+            ...projection.messages.map((row) => row.messageId),
+          ]).toEqual(source.map((row) => row.messageId));
+        } else expect(projection).toBeNull();
+      }
+    },
+  );
+  test.each([false, null, undefined])(
+    'native unknown or over-budget source retains foreground reconciliation (%j)',
+    async (fit) => {
+      const compaction = {
+        ensureAcceptedMainCompaction: jest.fn(async () => ({ status: 'degraded' })),
+        scheduleMainContinuityMaintenance: jest.fn(),
+      };
+      await resolve(rows(260), null, async () => fit, compaction, true);
+      expect(compaction.ensureAcceptedMainCompaction).toHaveBeenCalledTimes(1);
+      expect(compaction.scheduleMainContinuityMaintenance).not.toHaveBeenCalled();
+    },
+  );
+
+  test('idle legacy continuation owns a fresh response and deadline instead of its finished trigger', async () => {
+    const source = rows(260);
+    const req = { ...request(), viventiumSchedulerAuthoringDeadlineAt: 1 };
+    const res = { finished: true };
+    const Model = { findOne: jest.fn(() => ({ lean: async () => null })) };
+    const compaction = {
+      scheduleMainContinuityMaintenance: jest.fn(),
+      ensureAcceptedMainCompaction: jest.fn(async () => ({ status: 'degraded' })),
+    };
+    await continuity.resolveConversationContinuity({
+      req,
+      res,
+      agent,
+      ownerId: 'owner',
+      conversationId: 'conversation',
+      orderedMessages: source,
+      Model,
+      MessageModel: {},
+      canCarryWholeHistory: async () => true,
+      nativeBodyCarrier: true,
+      nativeReplayBudgetKnown: true,
+      deadlineAt: 1,
+      signal: AbortSignal.abort(),
+      compaction,
+    });
+    await compaction.scheduleMainContinuityMaintenance.mock.calls[0][0].schedule();
+    expect(compaction.ensureAcceptedMainCompaction).toHaveBeenCalledTimes(1);
+    const background = compaction.ensureAcceptedMainCompaction.mock.calls[0][0];
+    expect(background.res).toBeUndefined();
+    expect(background.deadlineAt).toBeUndefined();
+    expect(background.signal).toBeUndefined();
+    expect(background.foreground).toBe(false);
+    expect(background.req).not.toBe(req);
+    expect(background.req.user).toBe(req.user);
+    expect(background.req.viventiumSchedulerAuthoringDeadlineAt).toBeUndefined();
+    expect(req.viventiumSchedulerAuthoringDeadlineAt).toBe(1);
+  });
+
   test('a pessimistic history estimate retains existing reviewed reconciliation without a new 413', async () => {
     const source = rows(130);
     let record = null;

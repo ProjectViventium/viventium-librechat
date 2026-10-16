@@ -2,7 +2,7 @@
 id: main.continuity_compaction_review
 owner_layer: viventium_main_continuity
 target: runtime.main_continuity.compaction_review
-version: 4
+version: 5
 status: active
 safety_class: public_product
 required_context:
@@ -21,6 +21,13 @@ outcomes. Newer accepted evidence controls corrections. A request, completed act
 and assistant promise are different facts. Omission, reversal or invented authority fails even
 when many words overlap. Concise paraphrases and removal of irrelevant repetition are valid.
 Unresolved conflicting evidence must remain unresolved. The candidate does not create permission.
+`typedToolIdentityComparison` is computed from the supplied typed source and candidate toolPairs.
+Its exactMatches prove byte-identical callId and toolName pairs at the listed source locations.
+Do not re-judge those identity characters. This proves neither the attached outcome's meaning nor
+its association with that source result: verify each outcome against its own source. A missing
+source pair still needs judgment about omission versus an evidenced correction or retirement.
+The comparison does not cover prose, links or durableIdentifiers; check those as usual.
+
 Check consequential opaque identifiers, reference values and links, including still-valid values
 from the previous summary. Losing or changing meaning-bearing characters fails fidelity, even
 when the surrounding account sounds equivalent. Newer accepted evidence can correct or retire

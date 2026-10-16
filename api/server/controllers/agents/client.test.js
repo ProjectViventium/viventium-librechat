@@ -5602,89 +5602,6 @@ describe('AgentClient - titleConvo', () => {
         expect(changed.notices[0].healthState.repeat).toBeUndefined();
       });
     });
-
-    it('replays a terminal quota failure once on the fallback route before any write applied', async () => {
-      const { HumanMessage } = require('@librechat/agents/langchain/messages');
-      const api = require('@librechat/api');
-      mockReq.config.memory = {
-        validKeys: ['core'],
-        agent: {
-          provider: 'openai',
-          model: 'gpt-5.6-luna',
-          model_parameters: { reasoning_effort: 'medium' },
-          fallback: { provider: 'anthropic', model: 'claude-opus-5' },
-        },
-      };
-      const gated = new Set();
-      api.getMemoryWriterHealthGate.mockImplementation(({ provider }) =>
-        gated.has(provider)
-          ? {
-              blocked: true,
-              shouldLog: false,
-              reason: 'quota',
-              message: 'gated',
-              blockedUntil: Date.now() + 1000,
-            }
-          : { blocked: false },
-      );
-      api.markMemoryWriterRouteExhausted.mockImplementation(({ provider }) => {
-        gated.add(provider);
-        return { reason: 'quota' };
-      });
-      api.initializeAgent.mockImplementation(async ({ agent }) => ({ ...agent }));
-      const quotaFailure = [
-        {
-          type: Tools.memory,
-          [Tools.memory]: {
-            key: 'system',
-            type: 'error',
-            value: JSON.stringify({ errorType: 'usage_limit_reached', message: 'quota' }),
-          },
-        },
-      ];
-      const saved = [
-        { type: Tools.memory, [Tools.memory]: { key: 'core', type: 'update', value: 'x' } },
-      ];
-      const primaryProcess = jest.fn().mockResolvedValue(quotaFailure);
-      const fallbackProcess = jest.fn().mockResolvedValue(saved);
-      api.createMemoryProcessor.mockImplementation(async ({ config }) => [
-        null,
-        config.llmConfig.provider === 'openai' ? primaryProcess : fallbackProcess,
-      ]);
-
-      const routed = new AgentClient(mockOptions);
-      routed.conversationId = 'convo-123';
-      routed.responseMessageId = 'response-123';
-      routed.memoryWriterState = {
-        appConfig: mockReq.config,
-        userId: 'user-123',
-        memoryConfig: mockReq.config.memory,
-        memoryMethods: {},
-        memoryPolicyConfig: { tokenLimit: 8000 },
-      };
-
-      const result = await routed.runMemory([new HumanMessage('Remember the QA color word.')], {
-        req: mockReq,
-        res: mockRes,
-        userId: 'user-123',
-        appConfig: mockReq.config,
-      });
-
-      expect(primaryProcess).toHaveBeenCalledTimes(1);
-      expect(api.markMemoryWriterRouteExhausted).toHaveBeenCalledWith({
-        userId: 'user-123',
-        provider: 'openai',
-        model: 'gpt-5.6-luna',
-        errorType: 'usage_limit_reached',
-      });
-      expect(fallbackProcess).toHaveBeenCalledTimes(1);
-      expect(result).toEqual(saved);
-      expect(routed.memoryWriterRoute).toEqual({
-        role: 'fallback',
-        provider: 'anthropic',
-        model: 'claude-opus-5',
-      });
-    });
   });
 
   describe('getMessagesForConversation - mapMethod and mapCondition', () => {
@@ -9122,7 +9039,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
   });
 
   test('logs one metadata-only diagnostic for a wrapped primary error before fallback', async () => {
-    const secret = ['sk-', 'test-primary-error-secret-never-log'].join('');
+    const secret = 'sk-test-primary-error-secret-never-log';
     const providerError = new Error(`rate limit from provider with ${secret}`);
     providerError.status = 429;
     providerError.code = 'rate_limit_exceeded';

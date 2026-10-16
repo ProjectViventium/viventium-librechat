@@ -8,6 +8,20 @@ import {
 import { filterExcludedModelParameters } from '../ModelParametersSection';
 
 describe('filterExcludedModelParameters', () => {
+  it('hides endpoint-dropped controls including provider spelling aliases', () => {
+    expect(
+      filterExcludedModelParameters(
+        [
+          { key: 'temperature' },
+          { key: 'topP' },
+          { key: 'max_tokens' },
+          { key: 'reasoning_effort' },
+        ],
+        [],
+        ['temperature', 'top_p'],
+      ).map(({ key }) => key),
+    ).toEqual(['max_tokens', 'reasoning_effort']);
+  });
   it('removes parameters owned by a dedicated control without changing the remaining order', () => {
     const parameters = [
       { key: 'temperature', component: 'slider', default: 1 },

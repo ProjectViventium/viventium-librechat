@@ -1,3 +1,6 @@
+import { Tools } from 'librechat-data-provider';
+import type { TAttachment } from 'librechat-data-provider';
+
 // VIVENTIUM: Invocation-scoped evidence, shared by direct tools and the authenticated broker.
 // Only receipt kinds declared in the agent schema are interpreted here. Models own relevance.
 type ToolResult = { name?: string; artifact?: Record<string, { sources?: unknown[] }> };
@@ -38,9 +41,11 @@ export function createCortexToolEvidence(
   };
   return {
     record,
-    verifiedReceiptCount: () => requirements.filter((required) => sources.has(required.tool)).length,
+    verifiedReceiptCount: () =>
+      requirements.filter((required) => sources.has(required.tool)).length,
     observeGrant(grantId: string) {
-      if (closed || !requirements.length || !grantId || grants.has(grantId)) return;
+      if (closed || (!requirements.length && !onHostToolResult) || !grantId || grants.has(grantId))
+        return;
       const observers = grantObservers.get(grantId) ?? new Set();
       observers.add(observe);
       grantObservers.set(grantId, observers);
@@ -60,4 +65,31 @@ export function createCortexToolEvidence(
       grants.clear();
     },
   };
+}
+
+/** Keep source artifacts on the canonical message; model text never creates a citation receipt. */
+export function collectCortexCitationAttachments(
+  parts: readonly ({ attachments?: TAttachment[] } | null | undefined)[],
+  binding: { messageId: string; conversationId: string },
+): TAttachment[] {
+  if (!binding.messageId || !binding.conversationId) return [];
+  const seen = new Set<string>();
+  return parts
+    .flatMap((part) => (Array.isArray(part?.attachments) ? part.attachments : []))
+    .filter((attachment) => {
+      const result = attachment?.[Tools.file_search];
+      const sources = result && 'sources' in result ? result.sources : undefined;
+      if (
+        attachment?.type !== Tools.file_search ||
+        attachment.messageId !== binding.messageId ||
+        attachment.conversationId !== binding.conversationId ||
+        !Array.isArray(sources) ||
+        sources.length === 0
+      )
+        return false;
+      const identity = JSON.stringify(attachment);
+      if (seen.has(identity)) return false;
+      seen.add(identity);
+      return true;
+    });
 }

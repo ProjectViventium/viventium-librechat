@@ -35,6 +35,7 @@ export function loadCustomEndpointsConfig(
         iconURL,
         modelDisplayLabel,
         customParams,
+        dropParams,
       } = endpoint;
       const name = normalizeEndpointName(configName);
 
@@ -46,6 +47,9 @@ export function loadCustomEndpointsConfig(
         userProvide: isUserProvided(resolvedApiKey),
         userProvideURL: isUserProvided(resolvedBaseURL),
         customParams,
+        /* === VIVENTIUM START === Expose declared parameter omissions to controls. === */
+        dropParams,
+        /* === VIVENTIUM END === */
         modelDisplayLabel,
         iconURL,
       };

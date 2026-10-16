@@ -2368,13 +2368,16 @@ describe('/api/viventium/telegram', () => {
           origin: 'scheduler',
           surface: 'workbench',
           source_event_id: 'forged-event',
+          source_received_at: 1,
         },
         adapterCapabilities: { segment_stability: 'provisional', supersede_scope: 'response_only' },
       },
     });
     const res = createMockRes();
 
+    const beforeDispatch = Date.now();
     await dispatch(app, req, res);
+    const afterDispatch = Date.now();
 
     expect(mockLastInteractionContext).toEqual({
       actor_kind: 'external_user',
@@ -2388,7 +2391,11 @@ describe('/api/viventium/telegram', () => {
       }),
       source_order_scope: expect.stringMatching(/^[a-f0-9]{64}$/),
       source_sequence: 12347,
+      source_received_at: expect.any(Number),
     });
+    expect(Number.isSafeInteger(mockLastInteractionContext.source_received_at)).toBe(true);
+    expect(mockLastInteractionContext.source_received_at).toBeGreaterThanOrEqual(beforeDispatch);
+    expect(mockLastInteractionContext.source_received_at).toBeLessThanOrEqual(afterDispatch);
     expect(mockLastAdapterCapabilities).toEqual({
       segment_stability: 'immediate',
       /* === VIVENTIUM START === Additive Telegram turn authoring. */
@@ -4770,6 +4777,9 @@ describe('/api/viventium/telegram', () => {
       conversationId: 'conv-1',
       'metadata.viventium.parentMessageId': 'msg-1',
       'metadata.viventium.type': 'cortex_followup',
+      'metadata.viventium.followUpSource': {
+        $nin: ['durable_terminal_callback', 'durable_work_callback'],
+      },
     });
   });
 
@@ -4886,6 +4896,48 @@ describe('/api/viventium/telegram', () => {
         claimOwner: 'test-dispatcher',
       }),
     );
+  });
+
+  test('POST glasshive claim wakes a bounded waiting request and retains exact claim ownership', async () => {
+    const app = createTestApp(require('../telegram'));
+    mockClaimGlassHiveDeliveries
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ deliveryId: 'wake-one', claimId: 'claim-one' }]);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/telegram/glasshive/deliveries/claim',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: { limit: 2, dispatcherId: 'dispatcher-wake', callbackId: 'callback-wake', waitMs: 1 },
+    });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.body).toEqual({
+      deliveries: [{ deliveryId: 'wake-one', claimId: 'claim-one' }],
+      waitSupported: true,
+    });
+    expect(res.headers['Cache-Control']).toBe('no-store, private');
+    expect(mockClaimGlassHiveDeliveries).toHaveBeenCalledTimes(2);
+    for (const [claim] of mockClaimGlassHiveDeliveries.mock.calls) {
+      expect(claim).toMatchObject({
+        surface: 'telegram',
+        limit: 2,
+        claimOwner: 'dispatcher-wake',
+        callbackId: 'callback-wake',
+      });
+    }
+  });
+
+  test('POST glasshive waiting claim requires the existing bridge secret', async () => {
+    const app = createTestApp(require('../telegram'));
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/telegram/glasshive/deliveries/claim',
+      body: { waitMs: 5000 },
+    });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.statusCode).toBe(401);
+    expect(mockClaimGlassHiveDeliveries).not.toHaveBeenCalled();
   });
 
   test('POST cortex delivery claim uses bridge secret and returns only service-authorized work', async () => {

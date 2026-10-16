@@ -1,3 +1,4 @@
+const { collectCortexCitationAttachments } = require('@librechat/api');
 /* === VIVENTIUM START ===
  * Feature: Background Cortices - Follow-up + Persistence Helpers
  * Purpose:
@@ -25,6 +26,7 @@ const {
   initializeOpenAI,
   inspectProviderDeliveryDisposition,
   inspectProviderDeliveryRanges,
+  projectAudioDeliveryControls,
   isAudioDeliveryRequested,
   nativeFollowUpOutputSource,
   renderGlassHiveNativeMediaLinks,
@@ -109,6 +111,7 @@ const {
   buildTelegramTextInstructions,
   buildTelegramAudioOutputInstructions,
   buildPlaygroundTextInstructions,
+  buildVoiceModeInstructions,
   stripVoiceControlTagsForDisplay,
 } = require('~/server/services/viventium/surfacePrompts');
 const {
@@ -162,6 +165,7 @@ const {
 } = require('~/server/services/viventium/feelingPromptTail');
 const {
   attachConversationProviderCapabilityBundle,
+  clearConversationProviderCapabilityBundle,
   buildHarnessIdempotencyKey,
   bindConversationProviderDeveloperInstructionTail,
   restrictedConversationProviderBootstrapHeaders,
@@ -176,19 +180,19 @@ const { buildNoResponseInstructions } = require('~/server/services/viventium/noR
 /* === VIVENTIUM NOTE === */
 /* === VIVENTIUM NOTE === */
 
-/* === VIVENTIUM START === Owned recovery after a refused Native admission. === */
-const occupiedCortexRecovery = Symbol('occupiedCortexRecovery');
+/* === VIVENTIUM START === Owned recovery of a retained Voice follow-up. === */
+const ownedVoiceCortexRecovery = Symbol('ownedVoiceCortexRecovery');
 const OCCUPIED_CORTEX_FAILURE = Object.freeze({
   status: 409,
   code: 'conversation_session_authority_conflict',
 });
-function bindOccupiedCortexRecovery(req, recheck) {
+function bindOwnedVoiceCortexRecovery(req, recheck) {
   if (!req || typeof recheck !== 'function')
     throw new TypeError('Cortex recovery requires its owner check');
-  Object.defineProperty(req, occupiedCortexRecovery, { value: recheck });
+  Object.defineProperty(req, ownedVoiceCortexRecovery, { value: recheck });
 }
-async function refreshOccupiedCortexRecovery(req, { allowWaiting = false } = {}) {
-  const recheck = req?.[occupiedCortexRecovery];
+async function refreshOwnedVoiceCortexRecovery(req, { allowWaiting = false } = {}) {
+  const recheck = req?.[ownedVoiceCortexRecovery];
   if (!recheck) return false;
   const authority = await recheck();
   if (authority?.state === 'suppressed') return authority.dropReason || 'voice_task_suppressed';
@@ -481,12 +485,22 @@ function applyCustomEndpointFollowUpDropParams(llmConfig, dropParams) {
 }
 /* === VIVENTIUM END === */
 
+/* === VIVENTIUM START === Native declarations remain request-local across follow-up copies. === */
+function preserveFollowUpNativeDeclarations(target, source) {
+  // Native initialization deliberately removes ordinary bound tools and keeps the declared
+  // capability names non-enumerable. Copy only that metadata, never a refresher or signed grant.
+  const declaration = source && Object.getOwnPropertyDescriptor(source, 'declaredToolNames');
+  if (declaration) Object.defineProperty(target, 'declaredToolNames', declaration);
+  return target;
+}
+
 function cloneFollowUpAgent(agent) {
   if (!agent || typeof agent !== 'object') {
     return agent || {};
   }
-  return JSON.parse(JSON.stringify(agent));
+  return preserveFollowUpNativeDeclarations(JSON.parse(JSON.stringify(agent)), agent);
 }
+/* === VIVENTIUM END === */
 
 function hasExplicitFollowUpRoute(agent, { useVoiceModel = false } = {}) {
   if (!agent || typeof agent !== 'object') {
@@ -1302,7 +1316,10 @@ function resolveFollowUpRuntimeAssignment(
    * === VIVENTIUM END === */
   const baseRuntimeAgent = hasExplicitFollowUpRoute(agent, { useVoiceModel })
     ? cloneFollowUpAgent(agent)
-    : rewriteAgentForRuntime(agent || {}, { capabilityRequiredProviders });
+    : preserveFollowUpNativeDeclarations(
+        rewriteAgentForRuntime(agent || {}, { capabilityRequiredProviders }),
+        agent,
+      );
   /* === VIVENTIUM NOTE ===
    * Voice follow-ups should respect the same machine-level fast voice override contract as the
    * main voice turn, but only at runtime. Keep the canonical built-in bundle unset by default and
@@ -1310,16 +1327,19 @@ function resolveFollowUpRuntimeAssignment(
    * === VIVENTIUM NOTE === */
   const voiceAssignment = useVoiceModel ? resolveVoiceOverrideAssignment(baseRuntimeAgent) : null;
   const runtimeAgent = voiceAssignment
-    ? {
-        ...baseRuntimeAgent,
-        voice_llm_provider: voiceAssignment.provider,
-        voice_llm_model: voiceAssignment.model,
-        model_parameters: resolveVoiceModelParameters(
-          baseRuntimeAgent,
-          voiceAssignment.model,
-          voiceAssignment.provider,
-        ),
-      }
+    ? preserveFollowUpNativeDeclarations(
+        {
+          ...baseRuntimeAgent,
+          voice_llm_provider: voiceAssignment.provider,
+          voice_llm_model: voiceAssignment.model,
+          model_parameters: resolveVoiceModelParameters(
+            baseRuntimeAgent,
+            voiceAssignment.model,
+            voiceAssignment.provider,
+          ),
+        },
+        baseRuntimeAgent,
+      )
     : baseRuntimeAgent;
   const effectiveModel = resolveGovernedFollowUpModel(runtimeAgent, { useVoiceModel });
   const effectiveProvider = resolveFollowUpProvider(runtimeAgent, { useVoiceModel });
@@ -1385,7 +1405,7 @@ function mergeFollowUpAgentRuntimeState(runtimeAgent, persistedAgent) {
     merged.model_parameters.model = merged.model;
   }
 
-  return merged;
+  return preserveFollowUpNativeDeclarations(merged, runtimeAgent);
 }
 
 async function resolveCanonicalFollowUpAgent(
@@ -1510,20 +1530,12 @@ async function sleep(ms) {
 /* === VIVENTIUM NOTE ===
  * Feature: Voice follow-up prompt rules (speech-safe output).
  */
-function buildVoiceFollowUpRules() {
+function buildVoiceFollowUpRules(voiceProvider) {
   const override = (process.env.VIVENTIUM_VOICE_FOLLOWUP_RULES || '').trim();
   if (override) {
     return override;
   }
-  return [
-    'VOICE FOLLOW-UP RULES:',
-    '- This is spoken audio. Use short sentences.',
-    '- Do not output planning steps or numbered lists.',
-    '- Do not include tool instructions or API field names.',
-    '- Do not read URLs or email addresses aloud; say you can send the details.',
-    '- Use natural language for dates/times (no raw timestamps).',
-    '- Keep it to 1-3 sentences unless the user asked for more detail.',
-  ].join('\n');
+  return buildVoiceModeInstructions(voiceProvider);
 }
 /* === VIVENTIUM NOTE === */
 
@@ -1767,6 +1779,71 @@ async function resolveUserRequestTextForAssistantParent({ req, parentMessageId, 
   }
 }
 
+async function resolveDurableMissionUserSources({ req, insightsData, conversationId, messages }) {
+  const insights = insightsData?.insights;
+  if (!Array.isArray(insights) || !insights.some(isDurableMissionInsight)) return insightsData;
+  const ownerId = String(req?.user?.id || '');
+  const requestedSources = insights
+    .filter(isDurableMissionInsight)
+    .map((insight) => insight.authority.userSource)
+    .filter((source) => source?.messageId && source?.conversationId);
+  const sourceKey = (source) => JSON.stringify([source.conversationId, source.messageId]);
+  const sources = new Map();
+  const remember = (message) => {
+    if (
+      !ownerId ||
+      message?.isCreatedByUser !== true ||
+      String(message.user || '') !== ownerId ||
+      message.deletedAt ||
+      message.cleanupTombstone?.tombstonedAt
+    )
+      return;
+    sources.set(sourceKey(message), message);
+  };
+  for (const message of messages || []) remember(message);
+  const missing = requestedSources.filter((source) => !sources.has(sourceKey(source)));
+  if (ownerId && missing.length) {
+    try {
+      const additional = await db.getMessages(
+        {
+          user: ownerId,
+          conversationId: { $in: [...new Set(missing.map((source) => source.conversationId))] },
+          messageId: { $in: [...new Set(missing.map((source) => source.messageId))] },
+        },
+        'user conversationId messageId isCreatedByUser text content deletedAt cleanupTombstone',
+      );
+      for (const message of additional || []) remember(message);
+    } catch (error) {
+      logger.warn(
+        '[BackgroundCortexFollowUpService] Failed loading durable user sources:',
+        sanitizeFollowUpErrorForLog(error),
+      );
+    }
+  }
+  return {
+    ...insightsData,
+    insights: insights.map((insight) => {
+      if (!isDurableMissionInsight(insight)) return insight;
+      const source = insight.authority.userSource;
+      const message =
+        source?.messageId && source?.conversationId ? sources.get(sourceKey(source)) : null;
+      const text = message ? extractRecentResponseTextFromMessage(message) : '';
+      return {
+        ...insight,
+        authority: {
+          ...insight.authority,
+          userSource: {
+            messageId: source?.messageId || null,
+            conversationId: source?.conversationId || conversationId || null,
+            status: text ? 'available' : 'unavailable',
+            ...(text ? { text } : {}),
+          },
+        },
+      };
+    }),
+  };
+}
+
 async function loadFollowUpContinuationContext({ req, conversationId, parentMessageId }) {
   if (!req?.user?.id || !conversationId) {
     return {
@@ -1778,7 +1855,7 @@ async function loadFollowUpContinuationContext({ req, conversationId, parentMess
   try {
     const messages = await db.getMessages(
       { user: req.user.id, conversationId },
-      'messageId parentMessageId createdAt updatedAt text content sender isCreatedByUser metadata unfinished files image_urls attachments',
+      'user conversationId messageId parentMessageId createdAt updatedAt text content sender isCreatedByUser deletedAt cleanupTombstone metadata unfinished files image_urls attachments',
     );
     return {
       messages,
@@ -1996,6 +2073,9 @@ async function resolveFollowUpLLMConfig({
         },
       },
     };
+    // A follow-up owns its capability. Never inherit Main's signed grant when the fresh
+    // builder has no eligible resources or cannot authorize this invocation.
+    clearConversationProviderCapabilityBundle(resolvedAgent);
     await attachConversationProviderCapabilityBundle({
       targetAgent: resolvedAgent,
       declaredAgent: resolvedAgent,
@@ -2048,7 +2128,7 @@ async function resolveFollowUpLLMConfig({
           'X-GlassHive-Fallback-Reasoning-Effort': String(options?.fallback_reasoning_effort ?? ''),
         };
       }
-      if (req[occupiedCortexRecovery] && followUpCapability?.workspace_binding === true) {
+      if (req[ownedVoiceCortexRecovery] && followUpCapability?.workspace_binding === true) {
         // Recovery holds source/read authority, never a reconstructed microphone action grant.
         // The existing signed zero-tool bundle overrides any inherited executable bootstrap.
         runtimeHeaders = { ...runtimeHeaders, ...restrictedConversationProviderBootstrapHeaders() };
@@ -2141,7 +2221,15 @@ async function persistCortexPartsToCanonicalMessage({
       );
       /* VIVENTIUM NOTE */
 
-      const merged = upsertCortexParts(existing.content, cortexParts, {
+      const citationAttachments = collectCortexCitationAttachments(cortexParts || [], {
+        messageId: responseMessageId,
+        conversationId: existing.conversationId,
+      });
+      const displayParts = (cortexParts || []).map((entry) => {
+        const { attachments, ...part } = entry || {};
+        return part;
+      });
+      const merged = upsertCortexParts(existing.content, displayParts, {
         visibleText: existingVisibleText,
       });
 
@@ -2168,6 +2256,18 @@ async function persistCortexPartsToCanonicalMessage({
             'viventium/services/BackgroundCortexFollowUpService.persistCortexPartsToCanonicalMessage',
         },
       );
+
+      // Keep the canonical content guard and atomic late-artifact receipt as separate owners.
+      if (citationAttachments.length) {
+        await db.updateMessage(
+          req,
+          {
+            messageId: responseMessageId,
+            $addToSet: { attachments: { $each: citationAttachments } },
+          },
+          { operationKind: 'system' },
+        );
+      }
 
       /* VIVENTIUM NOTE
        * Purpose: Confirm persisted content size after update.
@@ -2342,27 +2442,6 @@ function boundMissionInput(insight) {
     : null;
 }
 
-function acceptedMissionRequest(insights) {
-  if (
-    !Array.isArray(insights) ||
-    insights.length === 0 ||
-    !insights.every(isDurableMissionInsight)
-  ) {
-    return null;
-  }
-  // Preserve each accepted objective and its identity, not the unrelated latest
-  // chat question. JSON retains exact instruction whitespace and group order.
-  return JSON.stringify(
-    insights.map(
-      (insight) =>
-        boundMissionInput(insight) ?? {
-          run_id: insight.authority.runId || null,
-          instruction: null,
-        },
-    ),
-  );
-}
-
 function formatFollowUpPrompt({
   insights = [],
   errors = [],
@@ -2391,7 +2470,7 @@ function formatFollowUpPrompt({
         // The courier must not discard the already-admitted input, authority or
         // result. The configured model owns synthesis; normal context admission
         // owns size limits rather than an arbitrary character prefix here.
-        return `- ${name}: ${text}\n${JSON.stringify({ runInput: boundMissionInput(i), authority: i.authority })}`;
+        return `- ${name}: ${JSON.stringify({ report: text, runInput: boundMissionInput(i), authority: i.authority })}`;
       }
       const requestedMaxPromptChars = Number(i.maxPromptChars);
       const maxPromptChars =
@@ -2433,7 +2512,7 @@ function formatFollowUpPrompt({
   /* === VIVENTIUM NOTE ===
    * Feature: Voice follow-up prompt rules (speech-safe output).
    */
-  const voiceRules = voiceMode ? buildVoiceFollowUpRules() : '';
+  const voiceRules = voiceMode ? buildVoiceFollowUpRules(voiceProvider) : '';
   const telegramRules = surface === 'telegram' && !voiceMode ? buildTelegramTextInstructions() : '';
   const telegramAudioRules =
     surface === 'telegram' && !voiceMode && telegramAudioRequested
@@ -2474,18 +2553,21 @@ function formatFollowUpPrompt({
    * The selected provider's normal context admission owns capacity limits.
    */
   const recentBlock = cleanRecent || '(short acknowledgment)';
+  const durableMissionEvidence = insights.every(isDurableMissionInsight);
   const currentUserRequest =
     primaryResponseMode && cleanContinuation
-      ? [cleanUserRequest.slice(0, 2400), cleanContinuation.slice(-1800)]
+      ? [
+          durableMissionEvidence ? cleanUserRequest : cleanUserRequest.slice(0, 2400),
+          cleanContinuation.slice(-1800),
+        ]
           .filter(Boolean)
           .join('\n\n')
       : cleanUserRequest;
-  const missionRequest = acceptedMissionRequest(insights);
-  const userRequestBlock =
-    missionRequest ??
-    (currentUserRequest
-      ? currentUserRequest.slice(0, 4200)
-      : '(user request unavailable; answer only from the background evidence and state uncertainty)');
+  const userRequestBlock = currentUserRequest
+    ? durableMissionEvidence
+      ? currentUserRequest
+      : currentUserRequest.slice(0, 4200)
+    : '(user request unavailable; answer only from the background evidence and state uncertainty)';
 
   if (primaryResponseMode) {
     const fallbackPrompt = [
@@ -2750,6 +2832,7 @@ async function promoteForcedFollowUpToEmptyParent({
   telegramDeliveryControls,
   deliveryDisposition,
   nativeDeliveryContent,
+  deliveryControls,
   insightsData,
   forceVisibleFollowUp,
   scheduleId,
@@ -2841,6 +2924,7 @@ async function promoteForcedFollowUpToEmptyParent({
             }
           : {}),
         telegramDeliveryControls: telegramDeliveryControls || undefined,
+        deliveryControls,
         ...(deliveryDisposition ? { deliveryDisposition } : {}),
         recoveredPrimaryErrorClasses:
           recoveredPrimaryErrorClasses.length > 0 ? recoveredPrimaryErrorClasses : undefined,
@@ -3351,8 +3435,8 @@ async function prepareCortexFollowUpMessage({
   recentResponse,
   forceVisibleFollowUp = false,
 }) {
-  const recoverySuppression = req?.[occupiedCortexRecovery]
-    ? await refreshOccupiedCortexRecovery(req)
+  const recoverySuppression = req?.[ownedVoiceCortexRecovery]
+    ? await refreshOwnedVoiceCortexRecovery(req)
     : false;
   if (recoverySuppression) return { suppressed: true, dropReason: recoverySuppression };
   const voiceTaskId = String(req?.body?.viventiumVoiceTaskId || '').trim();
@@ -3378,6 +3462,12 @@ async function prepareCortexFollowUpMessage({
       `[BackgroundCortexFollowUpService] Follow-up conversation moved on: conversationId=${conversationId || ''} parent=${parentMessageId || ''} continuationMessages=${continuationContext.messageCount} currentLeaf=${continuationContext.currentLeafMessageId || ''}`,
     );
   }
+  insightsData = await resolveDurableMissionUserSources({
+    req,
+    insightsData,
+    conversationId,
+    messages: conversationMessages,
+  });
   /* === VIVENTIUM START: Terminal synthesis follows the current Native Main author. === */
   const durableMissionEvidence =
     hasInsights && insightsData.insights.every(isDurableMissionInsight);
@@ -3404,13 +3494,11 @@ async function prepareCortexFollowUpMessage({
     parentMessageId,
     recentResponse,
   });
-  const userRequest =
-    acceptedMissionRequest(insightsData?.insights) ??
-    (await resolveUserRequestTextForAssistantParent({
-      req,
-      parentMessageId,
-      messages: conversationMessages,
-    }));
+  const userRequest = await resolveUserRequestTextForAssistantParent({
+    req,
+    parentMessageId,
+    messages: conversationMessages,
+  });
   const followUpRecentResponse = isNoResponseOnly(recentResponseResolution.text)
     ? ''
     : recentResponseResolution.text;
@@ -3540,20 +3628,47 @@ async function prepareCortexFollowUpMessage({
     };
   }
   /* === VIVENTIUM START === Native audio choices survive Phase B text projection. === */
+  const projectNativeDeliveryText = (source) =>
+    normalizeNoResponseText(
+      sanitizeFollowUpDisplayText(
+        renderGlassHiveNativeMediaLinks(source, insightsData?.insights || []),
+      ),
+    ).trim();
   const nativeDeliveryRanges = nativeDeliveryOutput
     ? inspectProviderDeliveryRanges(nativeDeliveryOutput, text, (source) => {
-        const projected = sanitizeFollowUpDisplayText(
-          renderGlassHiveNativeMediaLinks(source, insightsData?.insights || []),
-        ).trim();
-        return surface === 'telegram' && !voiceMode
-          ? parseDeliveryControls(projected).cleanText
-          : projected;
+        const projected = projectNativeDeliveryText(source);
+        if (voiceMode) return stripVoiceControlTagsForDisplay(projected);
+        return surface === 'telegram' ? parseDeliveryControls(projected).cleanText : projected;
       })
     : null;
   const nativeDeliveryContent =
     nativeDeliveryRanges === null
       ? undefined
       : [{ type: 'text', text, deliveryDispositionRanges: nativeDeliveryRanges }];
+  const speechText =
+    voiceMode && nativeDeliveryOutput ? projectNativeDeliveryText(generatedText) : '';
+  const deliveryControls =
+    voiceMode && nativeDeliveryContent
+      ? projectAudioDeliveryControls(
+          {
+            sourceTextSha256: crypto.createHash('sha256').update(text).digest('hex'),
+            audioContent: [
+              {
+                type: 'text',
+                text: speechText,
+                deliveryDispositionRanges: inspectProviderDeliveryRanges(
+                  nativeDeliveryOutput,
+                  speechText,
+                  projectNativeDeliveryText,
+                ),
+              },
+            ],
+          },
+          text,
+          nativeDeliveryContent,
+          stripVoiceControlTagsForDisplay,
+        )
+      : undefined;
   if (nativeDeliveryContent) {
     deliveryDisposition = {
       version: 1,
@@ -3576,8 +3691,8 @@ async function prepareCortexFollowUpMessage({
 
   if (telegramDeliveryControls && deliveryDisposition)
     telegramDeliveryControls.deliveryDisposition = deliveryDisposition;
-  const lateRecoverySuppression = req?.[occupiedCortexRecovery]
-    ? await refreshOccupiedCortexRecovery(req, { allowWaiting: true })
+  const lateRecoverySuppression = req?.[ownedVoiceCortexRecovery]
+    ? await refreshOwnedVoiceCortexRecovery(req, { allowWaiting: true })
     : false;
   if (lateRecoverySuppression) return { suppressed: true, dropReason: lateRecoverySuppression };
   const followUpDecisionRecord = buildFollowUpDecisionRecord({
@@ -3595,8 +3710,8 @@ async function prepareCortexFollowUpMessage({
   });
 
   if (generationFailure) followUpDecisionRecord.generationFailure = generationFailure;
-  if (req?.[occupiedCortexRecovery])
-    followUpDecisionRecord.recoveryCause = { ...OCCUPIED_CORTEX_FAILURE };
+  if (req?.[ownedVoiceCortexRecovery])
+    followUpDecisionRecord.recoveryAuthority = 'owned_voice_source';
 
   return {
     suppressed: false,
@@ -3605,6 +3720,7 @@ async function prepareCortexFollowUpMessage({
     telegramDeliveryControls,
     deliveryDisposition,
     ...(nativeDeliveryContent ? { nativeDeliveryContent } : {}),
+    ...(deliveryControls ? { deliveryControls } : {}),
     followUpDecisionRecord,
     conversationMessages,
     finalContinuationContext,
@@ -3684,8 +3800,8 @@ async function persistPreparedCortexFollowUpMessage(
 ) {
   const recoverySuppression =
     prepared?.dropReason ||
-    (req?.[occupiedCortexRecovery]
-      ? await refreshOccupiedCortexRecovery(req, { allowWaiting: true })
+    (req?.[ownedVoiceCortexRecovery]
+      ? await refreshOwnedVoiceCortexRecovery(req, { allowWaiting: true })
       : false);
   if (!prepared || prepared.suppressed === true || recoverySuppression) {
     if (deliveryBatch?.claimed?.length) {
@@ -3766,6 +3882,7 @@ async function persistPreparedCortexFollowUpMessage(
     telegramDeliveryControls,
     deliveryDisposition,
     nativeDeliveryContent: prepared.nativeDeliveryContent,
+    deliveryControls: prepared.deliveryControls,
     insightsData,
     forceVisibleFollowUp: shouldForceVisibleFollowUp,
     scheduleId,
@@ -3841,6 +3958,7 @@ async function persistPreparedCortexFollowUpMessage(
   const metadata = {
     viventium: {
       type: 'cortex_followup',
+      ...(prepared.deliveryControls ? { deliveryControls: prepared.deliveryControls } : {}),
       ...(deliveryDisposition ? { deliveryDisposition } : {}),
       ...(durableMissionEvidence === true
         ? {
@@ -4021,7 +4139,7 @@ async function createCortexFollowUpMessage(input) {
 
 module.exports = {
   publishCortexVoiceFollowUp,
-  bindOccupiedCortexRecovery,
+  bindOwnedVoiceCortexRecovery,
   persistCortexFollowUpMessageWithLedger,
   resolveCortexInsightDropReason,
   settleSuppressedCortexInsightDeliveries,
@@ -4042,6 +4160,7 @@ module.exports = {
   formatFollowUpPrompt,
   extractRecentResponseTextFromMessage,
   resolveUserRequestTextFromMessages,
+  resolveDurableMissionUserSources,
   isPlaceholderRecentResponseText,
   getPreferredFallbackInsightText,
   resolveRecentResponseText,

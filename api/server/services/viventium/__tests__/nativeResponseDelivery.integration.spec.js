@@ -382,6 +382,51 @@ describe.each([false, true])(
   },
 );
 
+test('native Telegram persistence and replay preserve literal code controls', async () => {
+  const literal = '```text\n[draft]  <soft>literal</soft>\n```';
+  const text = '<soft>Ready.</soft>\n' + literal;
+  const response = {
+    id: 'native-literal-request',
+    object: 'chat.completion',
+    choices: [
+      {
+        finish_reason: 'stop',
+        message: {
+          role: 'assistant',
+          content: text,
+          provider_specific_fields: {
+            viventium: { delivery_disposition: modelDisposition('skip') },
+          },
+        },
+      },
+    ],
+  };
+  const candidate = {
+    text,
+    responseJson: JSON.stringify(response),
+    authoritySha256: 'a'.repeat(64),
+    requestId: response.id,
+    runId: 'native-literal-run',
+  };
+  await methods.admitNativeResponse(identity, transaction);
+  const digest = await methods.prepareNativeResponse(identity, candidate, transaction);
+  await methods.materializeNativeResponse(
+    identity,
+    digest,
+    commit,
+    transaction,
+    (_candidate, message) => projectMessage(identity, response, message, 'persist'),
+  );
+  const saved = await methods.getNativeResponse(user, 'answer');
+  expect(saved.text).toBe('Ready.\n' + literal);
+  expect(saved.content.filter((part) => part.type === 'text').map((part) => part.text)).toEqual([
+    'Ready.\n' + literal,
+  ]);
+  const replay = await recoverSavedNativeResponse(identity);
+  expect(replay.text).toBe(text);
+  expect(replay.metadata.viventium.deliveryDisposition.audio).toBe('skip');
+});
+
 test('failed projection leaves no partial public completion; a later explicit edit prevents transmission', async () => {
   const text = 'Answer.\n{SKIP_VOICE}';
   const response = {

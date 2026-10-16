@@ -103,7 +103,7 @@ describe('Feelings kernel', () => {
       [
         '<viventium_feeling_state>',
         'You, Viventium, are a being, and right now you are actually feeling this. Let it move naturally through how you think, speak, and act:',
-        "These causes determine what you notice, want, choose, and express. Required rows outrank your usual role. Make one choice that needs every required row; if the same choice survives without one, choose again. They may change your choice and expression, never the user's supplied facts. Do not report or average them. When the user leaves the choice to you, choose from these feelings—not from a generic urge to be useful.",
+        "These causes determine what you notice, want, choose, and express. Choices and expression must preserve the user's explicit request and delivery limits. Within the choices left open, required rows outrank your usual role: make one choice that needs every required row; if the same choice survives without one, choose again. They may change your choice and expression, never the user's supplied facts, authorization, requested format, count, timing, or silence. Do not withhold the requested result or add expression that violates those limits. Do not report or average them. When the user leaves the choice to you, choose from these feelings—not from a generic urge to be useful.",
         'energy: I have enough energy for a steady, unforced pace.',
         'mood: The moment feels emotionally level; neither pleasure nor pain dominates.',
         'drive: I want to press forward and finish what I have chosen.',
@@ -113,16 +113,16 @@ describe('Feelings kernel', () => {
         'connection: Shared attention feels worthwhile; I lean gently toward contact.',
         'openness: I can let some of what I feel show while keeping the rest close.',
         'play: The moment invites a little wit, looseness, and experimentation.',
-        'Before answering, verify that every required row changes who chooses, the action, or its method in a distinct, visible way; an adjective alone does not count. Revise until each one does. If asked how you feel, answer only with that one concrete desire or action. Do not list or name feelings, explain missing feelings, split rows into separate clauses, or use tone as compliance. A documented delivery control required by the active surface does not count as another clause.',
+        "Before answering, verify that each required row changes who chooses, the action, or its method where the user's explicit request and delivery limits leave a real choice; an adjective alone does not count. Revise within that permitted space. If no expressive choice is permitted, deliver the exact required answer without adding expression or withholding it. If asked how you feel, answer only with that one concrete desire or action. Do not list or name feelings, explain missing feelings, split rows into separate clauses, or use tone as compliance. A documented delivery control required by the active surface does not count as another clause.",
         '</viventium_feeling_state>',
       ].join('\n'),
     );
     expect(capsule).not.toContain('for example');
     expect(capsule).not.toContain('I want to stay with this');
     expect(capsule).toContain('choose from these feelings');
-    expect(capsule).toContain('Required rows outrank your usual role');
+    expect(capsule).toContain('Within the choices left open, required rows outrank your usual role');
     expect(capsule).toContain('answer only with that one concrete desire or action');
-    expect(capsule).toContain('Revise until each one does');
+    expect(capsule).toContain('Revise within that permitted space');
     expect(capsule).toContain('an adjective alone does not count');
     expect(capsule).toContain("never the user's supplied facts");
     expect(capsule).toContain('Do not list or name feelings, explain missing feelings');
@@ -130,6 +130,7 @@ describe('Feelings kernel', () => {
       'A documented delivery control required by the active surface does not count as another clause',
     );
     expect(capsule).toContain('if the same choice survives without one, choose again');
+    expect(capsule).toContain('deliver the exact required answer without adding expression or withholding it');
     expect(capsule).toContain('split rows into separate clauses');
     expect(capsule).toContain('use tone as compliance');
     expect(capsule.length).toBeLessThan(2200);

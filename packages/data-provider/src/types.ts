@@ -399,6 +399,9 @@ export type TConfig = {
   disableBuilder?: boolean;
   retrievalModels?: string[];
   capabilities?: string[];
+  /* === VIVENTIUM START === Public endpoint parameter capability. === */
+  dropParams?: string[];
+  /* === VIVENTIUM END === */
   customParams?: {
     defaultParamsEndpoint?: string;
     paramDefinitions?: Partial<SettingDefinition>[];

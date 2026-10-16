@@ -88,6 +88,123 @@ const exactOutboxReceipt = (batch) => ({
 });
 
 describe('BackgroundCortexService activation policy helpers', () => {
+  test.each([
+    ['internal', true],
+    ['deliver', false],
+  ])(
+    'admitted native deadline extends only the private structured actor: %s',
+    async (policy, extended) => {
+      jest.useFakeTimers();
+      jest.setSystemTime(1000);
+      let ready;
+      const started = new Promise((resolve) => {
+        ready = resolve;
+      });
+      let runSignal;
+      const onNativeAdmission = jest.fn(() => true);
+      const agent = {
+        id: 'synthetic-private-deadline',
+        provider: 'openai',
+        model: 'synthetic-model',
+        tools: [],
+        instructions: '',
+        model_parameters: { model: 'synthetic-model' },
+      };
+      const req = {
+        user: { id: 'owner-synthetic' },
+        body: {},
+        config: {
+          endpoints: {
+            agents: {
+              allowedProviders: ['openai'],
+              providerCapabilities: {
+                openai: {
+                  workspace_binding: true,
+                  conversation_session: true,
+                },
+              },
+            },
+          },
+        },
+      };
+      try {
+        const result = executeCortexOnce(
+          {
+            agent,
+            req,
+            messages: [],
+            runId: 'synthetic-deadline-run',
+            contextMode: 'minimal',
+            mainContextBinding: 'isolated',
+            completedResultPolicy: policy,
+            insightMode: 'structured',
+            nativeTools: false,
+            executionTimeoutMs: 240000,
+            onNativeAdmission,
+          },
+          {
+            initializeAgentFn: jest.fn(async () => ({
+              ...agent,
+              model_parameters: {
+                model: agent.model,
+                configuration: {
+                  fetch: jest.fn(
+                    async () =>
+                      new Response('', {
+                        headers: {
+                          'X-GlassHive-Request-Id': 'native-private-request',
+                          'X-GlassHive-Response-Deadline-At': new Date(661000).toISOString(),
+                        },
+                      }),
+                  ),
+                },
+              },
+            })),
+            prepareCapabilityFn: jest.fn(async () => undefined),
+            createRunFn: jest.fn(async ({ agents, signal }) => ({
+              processStream: async () => {
+                runSignal = signal;
+                await agents[0].model_parameters.configuration.fetch(
+                  'https://native.invalid/v1/chat/completions',
+                );
+                ready();
+                await new Promise((resolve) =>
+                  signal.addEventListener('abort', resolve, { once: true }),
+                );
+                return [{ type: 'text', text: '{}' }];
+              },
+            })),
+          },
+        );
+        await Promise.race([
+          started,
+          result.then(() => {
+            throw new Error('Cortex ended before native admission');
+          }),
+        ]);
+        await jest.advanceTimersByTimeAsync(240000);
+        expect(runSignal.aborted).toBe(!extended);
+        if (extended) {
+          expect(onNativeAdmission).toHaveBeenCalledTimes(1);
+          const log = logger.info.mock.calls
+            .map(([line]) => String(line))
+            .find(
+              (line) =>
+                line.includes('Native deadline admission') && line.includes('"accepted":true'),
+            );
+          expect(log).toBeDefined();
+          expect(log).not.toContain('native-private-request');
+          await jest.advanceTimersByTimeAsync(435000);
+          expect(runSignal.aborted).toBe(true);
+        } else expect(onNativeAdmission).not.toHaveBeenCalled();
+        const outcome = await result;
+        expect(outcome.errorClass).toBe('timeout');
+      } finally {
+        jest.useRealTimers();
+      }
+    },
+  );
+
   test('read-only text compactor preserves zero-tool option through the real cortex attempt', async () => {
     const prepareCapabilityFn = jest.fn(async () => undefined);
     const agent = {
@@ -259,7 +376,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
     };
     captureMainContextSnapshot(req, {
       agent: mainAgent,
-      messages: [{ messageId: 'c43-current-input', role: 'user', content: 'Current user input.' }],
+      messages: [{ id: 'c43-current-input', role: 'user', content: 'Current user input.' }],
       visibleMessages: [
         {
           messageId: 'c43-current-input',
@@ -937,7 +1054,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(active).toBe(0);
   });
 
-  test.each(['user_cancelled', 'maintenance_yield'])(
+  test.each(['user_cancelled', 'maintenance_yield', 'compaction_lease_lost'])(
     'a queued native owner %s is intentional cancellation, not a timeout',
     async (reason) => {
       let releaseFirst;
@@ -1877,6 +1994,37 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(attachBundle).toHaveBeenCalledWith(args);
     expect(installRefresher).toHaveBeenCalledWith(args);
   });
+
+  test.each([true, false])(
+    'defers cortex mint only after its graph refresher installs: %s',
+    async (installed) => {
+      const attachBundle = jest.fn(async () => false);
+      const installRefresher = jest.fn(() => installed);
+      const args = {
+        targetAgent: { id: 'cortex' },
+        declaredAgent: { id: 'declared' },
+        req: { user: { id: 'owner' } },
+        capability: { workspace_binding: true },
+        requestBody: { conversationId: 'conversation', messageId: 'message' },
+      };
+      await expect(
+        prepareCortexConversationProviderCapability({
+          ...args,
+          deferUntilInvocation: true,
+          attachBundle,
+          installRefresher,
+        }),
+      ).resolves.toBe(false);
+      expect(installRefresher).toHaveBeenCalledTimes(1);
+      expect(attachBundle).toHaveBeenCalledWith({
+        ...args,
+        ...(installed ? { deferUntilInvocation: true } : {}),
+      });
+      expect(installRefresher.mock.invocationCallOrder[0]).toBeLessThan(
+        attachBundle.mock.invocationCallOrder[0],
+      );
+    },
+  );
 
   test('binds exact native release using the initialized attempt configuration split', async () => {
     const {
@@ -3398,3 +3546,91 @@ describe('native structured cortex failures', () => {
   });
 });
 // VIVENTIUM END
+
+test.each([
+  ['visible', 'Verified source.', true, 1],
+  ['silent', '{NTA}', true, 0],
+  ['denied', 'Verified source.', false, 0],
+])(
+  'native cortex %s keeps authorized source artifacts on the canonical response',
+  async (_case, content, fileCitations, expected) => {
+    const api = require('@librechat/api');
+    const { Files } = require('~/models');
+    const lookup = jest.spyOn(Files, 'find').mockResolvedValue([]);
+    const params = {
+      agent: { id: 'native-source-check', provider: 'native-test', tools: [] },
+      messages: [],
+      runId: 'native-source-answer',
+      conversationId: 'native-source-conversation',
+      contextMode: 'minimal',
+      mainContextBinding: 'isolated',
+      completedResultPolicy: 'internal',
+      req: {
+        user: { id: 'native-source-owner', role: 'USER' },
+        body: {},
+        config: {
+          endpoints: {
+            agents: { providerCapabilities: { 'native-test': { workspace_binding: true } } },
+          },
+        },
+      },
+    };
+    try {
+      const result = await executeCortexOnce(params, {
+        initializeAgentFn: jest.fn(async ({ agent }) => ({
+          ...agent,
+          instructions: '',
+          tools: [],
+        })),
+        prepareCapabilityFn: jest.fn(async ({ req }) =>
+          req._viventiumCortexToolEvidence.observeGrant('native-source-grant'),
+        ),
+        createRunFn: jest.fn(async () => ({
+          processStream: jest.fn(async () => {
+            api.reportCortexHostToolResult('foreign-source-grant', {
+              status: 'ok',
+              tool: 'file_search',
+              artifact: {
+                file_search: {
+                  fileCitations: true,
+                  sources: [{ fileId: 'foreign', fileName: 'Other.txt', relevance: 1 }],
+                },
+              },
+            });
+            api.reportCortexHostToolResult('native-source-grant', {
+              status: 'ok',
+              tool: 'file_search',
+              artifact: {
+                file_search: {
+                  fileCitations,
+                  sources: [
+                    {
+                      fileId: 'owned-file',
+                      fileName: 'Meeting.txt',
+                      relevance: 1,
+                      content: 'Original source evidence.',
+                    },
+                  ],
+                },
+              },
+            });
+            return content;
+          }),
+        })),
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.attachments || []).toHaveLength(expected);
+      if (expected) {
+        expect(result.attachments[0]).toMatchObject({
+          type: 'file_search',
+          messageId: params.runId,
+          conversationId: params.conversationId,
+          file_search: { sources: [{ fileId: 'owned-file', fileName: 'Meeting.txt' }] },
+        });
+        expect(JSON.stringify(result.attachments)).not.toContain('Other.txt');
+      }
+    } finally {
+      lookup.mockRestore();
+    }
+  },
+);

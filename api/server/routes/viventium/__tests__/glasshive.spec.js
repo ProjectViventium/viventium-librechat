@@ -3004,14 +3004,16 @@ describe('/api/viventium/glasshive/callback', () => {
   });
 
   test.each([
-    ['question', false],
-    ['permission', false],
-    ['question', true],
-    ['permission', true],
+    ...['voice', 'telegram', 'web'].flatMap((surface) =>
+      ['question', 'permission'].flatMap((kind) =>
+        [false, true, 'deleted'].map((removed) => [kind, removed, surface]),
+      ),
+    ),
   ])(
-    'preserves canonical %s from the native binding-only callback with removed anchor %s',
-    async (kind, removedAnchor) => {
+    'asks Main to author native %s with removed anchor %s on %s while retaining exact controls',
+    async (kind, removedAnchor, surface) => {
       mockRegisterNativeVoiceCapabilities = jest.fn().mockResolvedValue(undefined);
+      if (removedAnchor === 'deleted') mockGetConvo.mockResolvedValue(null);
       if (removedAnchor) {
         mockGetMessages.mockResolvedValue([
           {
@@ -3055,6 +3057,7 @@ describe('/api/viventium/glasshive/callback', () => {
                     type: 'string',
                     enum: ['allow-once', 'reject-once'],
                     enumNames: ['Yes', 'No'],
+                    enumKinds: ['allow_once', 'reject_once'],
                   },
                 },
               }
@@ -3111,7 +3114,7 @@ describe('/api/viventium/glasshive/callback', () => {
       const body = callbackBody({
         event: 'run.needs_input',
         ...(removedAnchor ? { message_id: 'removed-main' } : {}),
-        surface: 'voice',
+        surface,
         voice_call_session_id: 'call-native-attention',
         voice_request_id: 'request-voice',
         message: pending.message + '\n\nView / Steer: [Workspace](https://example.invalid/work)',
@@ -3132,76 +3135,26 @@ describe('/api/viventium/glasshive/callback', () => {
         }),
         res,
       );
-      expect(res.statusCode).toBe(200);
-      expect(mockRequestCurrentWork).toHaveBeenCalledWith({
-        ownerId: body.user_id,
-        path: `/v1/work/${encodeURIComponent(body.work_ref)}`,
-      });
-      expect(body.pending_native_input).not.toHaveProperty('message');
-      expect(body.pending_native_input).not.toHaveProperty('requestedSchema');
-      const message = mockSaveMessage.mock.calls[0][1];
-      const courier = mockEnqueueGlassHiveCallbackDelivery.mock.calls[0][0];
-      expect(message.text).toBe(courier.text);
-      expect(message.metadata.viventium.visibility).toBe('internal');
-      const api = jest.requireActual('@librechat/api');
-      expect(message.metadata.viventium.nativeInputPresentation).toEqual({
-        version: 1,
-        kind,
-        binding: api.nativeWorkInputBinding(pending, body.run_id),
-      });
-      const row = {
-        event: body.event,
-        surface: 'voice',
-        deliveryId: 'delivery-current',
-        callbackId: api.canonicalizeGlassHiveCallbackRef(body.callback_id),
-        callbackMessageId: message.messageId,
-        userId: body.user_id,
-        conversationId: body.conversation_id,
-        voiceCallSessionId: body.voice_call_session_id,
-        voiceRequestId: body.voice_request_id,
-        originRef: body.origin_ref,
-        workRef: body.work_ref,
-        workerId: body.worker_id,
-        runId: body.run_id,
-        text: courier.text,
-        fullText: courier.fullText,
-        nativeInputBinding: pending,
-        status: 'pending',
-      };
-      expect(api.nativeWorkInputPresentation(row)).not.toBeNull();
-      expect(api.nativeWorkInputQuestionText(pending, row.nativeInputBinding)).toBe(
-        pending.message,
-      );
-      expect(message.metadata.viventium).toEqual(
+      expect(res.statusCode).toBe(202);
+      const acceptedReason =
+        removedAnchor === 'deleted' ? 'origin_conversation_deleted' : 'main_adjudication_pending';
+      expect(res.body.reason).toBe(acceptedReason);
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockUpdateMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
         expect.objectContaining({
-          type: 'glasshive_worker_callback',
-          event: row.event,
-          originRef: row.originRef,
-          workRef: row.workRef,
-          workerId: row.workerId,
-          runId: row.runId,
-          voiceCallSessionId: row.voiceCallSessionId,
+          body: expect.objectContaining({ pending_native_input: pending }),
         }),
       );
-      const publisher = api.createNativeWorkInputPresentationService({
-        requestWork: async () => ({
-          workRef: body.work_ref,
-          state: 'needs_input',
-          pendingNativeInput: pending,
-        }),
-        readMessage: async () => message,
-        updateMessage: jest.fn().mockResolvedValue({ matchedCount: 1 }),
-        updateDelivery: jest
-          .fn()
-          .mockImplementation(async (_filter, update) => ({ ...row, ...update.$set })),
-        fence: async (operation) => operation(null),
-      });
-      expect(await publisher(row, null, true)).toEqual(
-        expect.objectContaining({
-          delivery: { ...row, text: pending.message, fullText: pending.message },
-        }),
-      );
-      expect(await publisher({ ...row, text: 'Unrelated status.' })).toBeNull();
+      if (surface === 'voice')
+        expect(mockRegisterNativeVoiceCapabilities).toHaveBeenCalledWith(
+          expect.objectContaining({
+            body: expect.objectContaining({ pending_native_input: pending }),
+            workRef: body.work_ref,
+            ownerId: body.user_id,
+          }),
+        );
       const send = async (next) => {
         const response = createMockRes();
         await dispatch(
@@ -3215,28 +3168,7 @@ describe('/api/viventium/glasshive/callback', () => {
         );
         return response;
       };
-      const baseMessages = await mockGetMessages();
-      mockGetMessages.mockResolvedValue([...baseMessages, message]);
-      expect((await send(body)).body.duplicate).toBe(true);
-      expect(mockSaveMessage).toHaveBeenCalledTimes(1);
-      expect((await send({ ...body, callback_id: 'same-current-request' })).statusCode).toBe(200);
-      expect(mockUpdateMessage.mock.calls[0][1].messageId).toBe(message.messageId);
-      expect(mockSaveMessage).toHaveBeenCalledTimes(1);
-      mockUpdateMessage.mockClear();
-      const nextStatus = {
-        ...body,
-        callback_id: 'status-next',
-        event: 'artifact.created',
-        pending_native_input: undefined,
-        message: 'Private lifecycle detail.',
-      };
-      expect((await send(nextStatus)).statusCode).toBe(200);
-      expect(mockUpdateMessage).not.toHaveBeenCalled();
-      const statusMessage = mockSaveMessage.mock.calls[1][1];
-      expect(statusMessage.messageId).not.toBe(message.messageId);
-      expect(statusMessage.text).toBe('');
-      expect(statusMessage.metadata.viventium.nativeInputPresentation).toBeNull();
-      // A changed exact native request cannot overwrite the already visible offer.
+      // Replacement of the native offer fences the old request before Main authors a question.
       const replacement = {
         ...pending,
         requestId: 'request-next',
@@ -3247,39 +3179,57 @@ describe('/api/viventium/glasshive/callback', () => {
         state: 'needs_input',
         pendingNativeInput: replacement,
       });
+      expect((await send(body)).body).toMatchObject({
+        status: 'suppressed',
+        reason: 'native_input_request_superseded',
+      });
+      expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledTimes(1);
       const replacementBody = {
         ...body,
-        surface: 'web',
         callback_id: 'new-request',
         pending_native_input: callbackBinding(replacement),
       };
-      expect((await send(replacementBody)).statusCode).toBe(200);
-      expect(mockUpdateMessage).not.toHaveBeenCalled();
-      expect(mockSaveMessage.mock.calls[2][1].messageId).not.toBe(message.messageId);
-      expect(mockSaveMessage.mock.calls[2][1]).toMatchObject({
-        text: replacement.message,
-        metadata: {
-          viventium: {
-            nativeInputPresentation: {
-              version: 1,
-              kind,
-              binding: api.nativeWorkInputBinding(replacement, body.run_id),
-            },
-          },
-        },
+      expect((await send(replacementBody)).body.reason).toBe(acceptedReason);
+      expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledTimes(2);
+      if (surface === 'voice') {
+        const tasks = require('~/server/services/viventium/VoiceTaskService');
+        const task = tasks.getVoiceTaskByStreamId(`glasshive:${body.run_id}`);
+        await tasks.confirmVoiceTaskOwnerCancellation(task.taskId, 'The owner confirmed Stop.');
+        expect((await send(replacementBody)).body).toMatchObject({
+          status: 'suppressed',
+          reason: 'voice_task_cancelled',
+        });
+        expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledTimes(2);
+      }
+      const expired = { ...replacement, expiresAt: '2000-01-01T00:00:00Z' };
+      mockRequestCurrentWork.mockResolvedValue({
+        workRef: body.work_ref,
+        state: 'needs_input',
+        pendingNativeInput: expired,
       });
-      // The same callback identity with a newer current native offer is not fresh presentation authority.
       expect(
-        (await send({ ...body, surface: 'web', callback_id: 'stale-request' })).statusCode,
-      ).toBe(200);
-      expect(
-        mockSaveMessage.mock.calls[3][1].metadata.viventium.nativeInputPresentation,
-      ).toBeNull();
-      mockRequestCurrentWork.mockRejectedValue(new Error('Native current state unavailable'));
-      expect((await send({ ...replacementBody, callback_id: 'unknown-current' })).statusCode).toBe(
-        503,
-      );
-      expect(mockSaveMessage).toHaveBeenCalledTimes(4);
+        (await send({ ...replacementBody, pending_native_input: callbackBinding(expired) })).body,
+      ).toMatchObject({ status: 'suppressed', reason: 'native_input_request_superseded' });
+      expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledTimes(2);
+      if (surface === 'voice') {
+        mockRequestCurrentWork.mockResolvedValue({
+          workRef: body.work_ref,
+          state: 'needs_input',
+          pendingNativeInput: replacement,
+        });
+        mockGetCallSession.mockResolvedValue({
+          callSessionId: 'call-native-attention',
+          conversationId: 'conv-1',
+          userId: 'foreign-owner',
+        });
+        expect((await send(replacementBody)).statusCode).toBe(409);
+        expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledTimes(2);
+      }
+      mockRequestCurrentWork.mockRejectedValue(new Error('Current native request unavailable'));
+      expect((await send(replacementBody)).statusCode).toBe(503);
+      expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledTimes(2);
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
     },
   );
 
@@ -4353,6 +4303,92 @@ describe('/api/viventium/glasshive/callback', () => {
     expect(res.statusCode).toBe(401);
     expect(res.body.error).toBe('stale_callback');
     expect(mockSaveMessage).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['run.completed', 'completed'],
+    ['run.failed', 'failed'],
+    ['run.cancelled', 'cancelled_confirmed'],
+    ['run.interrupted', 'cancelled_confirmed'],
+  ])('repairs persisted %s replay into the same terminal Voice task', async (event, state) => {
+    const {
+      createVoiceTask,
+      getVoiceTaskByStreamId,
+      observeGenerationEvent,
+      snapshotEvent,
+    } = require('~/server/services/viventium/VoiceTaskService');
+    const task = createVoiceTask({
+      callSessionId: 'call-persisted-terminal',
+      userId: 'user-1',
+      conversationId: 'conv-1',
+      streamId: 'glasshive:run-persisted-terminal',
+      owner: { kind: 'glasshive_run', id: 'run-persisted-terminal' },
+    });
+    observeGenerationEvent(task.taskId, {
+      event: 'on_agent_update',
+      data: { message: 'Worker started' },
+    });
+    const body = callbackBody({
+      callback_id: 'cb_persisted_terminal',
+      event,
+      surface: 'voice',
+      voice_call_session_id: 'call-persisted-terminal',
+      run_id: 'run-persisted-terminal',
+    });
+    const prior = await mockGetMessages();
+    mockGetMessages.mockResolvedValue([
+      ...prior,
+      {
+        messageId: 'persisted-terminal',
+        parentMessageId: 'msg-anchor',
+        text: '',
+        metadata: {
+          viventium: {
+            type: 'glasshive_worker_callback',
+            callbackId: body.callback_id,
+            callbackKey: body.callback_id,
+            events: [{ callbackId: body.callback_id, callbackKey: body.callback_id }],
+          },
+        },
+      },
+    ]);
+    const app = createTestApp(require('../glasshive'));
+    const send = async ({ repeated = false } = {}) => {
+      const res = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/glasshive/callback',
+          headers: { 'x-glasshive-signature': signature(body) },
+          body,
+        }),
+        res,
+      );
+      const cancellationReplay = repeated && state === 'cancelled_confirmed';
+      expect(res.statusCode).toBe(cancellationReplay ? 202 : 200);
+      expect(res.body).toMatchObject(
+        cancellationReplay
+          ? { status: 'http_accepted', reason: 'cancellation_confirmed' }
+          : { status: 'http_accepted', duplicate: true },
+      );
+    };
+    await send();
+    const settled = getVoiceTaskByStreamId('glasshive:run-persisted-terminal');
+    expect(settled).toMatchObject({ taskId: task.taskId, state, cancellable: false });
+    expect(snapshotEvent(task.taskId)).toMatchObject({ state, cancellable: false });
+    const sequence = settled.sequence;
+    await send({ repeated: true });
+    expect(getVoiceTaskByStreamId('glasshive:run-persisted-terminal')).toMatchObject({
+      state,
+      sequence,
+    });
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    // Existing delivery repair may re-upsert its durable row; task repair must not create prose.
+    for (const [delivery] of mockEnqueueGlassHiveCallbackDelivery.mock.calls) {
+      expect(delivery.message.messageId).toBe('persisted-terminal');
+      expect(delivery.text).toBe('');
+    }
   });
 
   test('accepts replayed callback ids idempotently from durable callback evidence', async () => {

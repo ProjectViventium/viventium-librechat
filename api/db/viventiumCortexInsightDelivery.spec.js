@@ -3161,7 +3161,7 @@ describe('ViventiumCortexInsightDelivery persistence', () => {
       ownerId: 'owner-unsupported-surface',
       conversationId: 'conversation-unsupported-surface',
       parentMessageId: 'parent-unsupported-surface',
-      surface: 'voice',
+      surface: 'workbench',
       insights: [{ cortexName: 'Review', insight: 'This surface has no delivery adapter.' }],
     });
     const createMessage = jest.fn();

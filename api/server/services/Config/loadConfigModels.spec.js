@@ -401,3 +401,33 @@ describe('loadConfigModels', () => {
     );
   });
 });
+
+describe('native capability discovery with a fixed model menu', () => {
+  it('uses the existing authenticated catalog request while retaining configured model choices', async () => {
+    fetchModels.mockClear();
+    fetchModels.mockResolvedValue(['native-primary', 'extra-discovered']);
+    getAppConfig.mockResolvedValue({
+      endpoints: {
+        agents: { providerCapabilities: { native: { context_protocol: 'main_context_v1' } } },
+        custom: [
+          {
+            name: 'native',
+            apiKey: 'synthetic-key',
+            baseURL: 'https://native.example/v1',
+            models: { fetch: false, default: ['native-primary', { name: 'native-secondary' }] },
+          },
+        ],
+      },
+    });
+    const result = await loadConfigModels({ user: { id: 'synthetic-owner' } });
+    expect(result.native).toEqual(['native-primary', 'native-secondary']);
+    expect(fetchModels).toHaveBeenCalledTimes(1);
+    expect(fetchModels).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'native',
+        apiKey: 'synthetic-key',
+        baseURL: 'https://native.example/v1',
+      }),
+    );
+  });
+});

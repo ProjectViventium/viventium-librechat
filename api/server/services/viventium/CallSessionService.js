@@ -19,7 +19,10 @@
 
 const crypto = require('crypto');
 const mongoose = require('mongoose');
-const { createVoiceEngagementAttestationService } = require('@librechat/api');
+const {
+  createVoiceEngagementAttestationService,
+  createCallPreparationBinding,
+} = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const {
   File,
@@ -458,6 +461,7 @@ function normalizeSession(session) {
     userId: session.userId,
     agentId: session.agentId,
     conversationId: session.conversationId,
+    ...(session.contextPreparation ? { contextPreparation: session.contextPreparation } : {}),
     roomName: session.roomName,
     gatewayAgentName: session.gatewayAgentName || DEFAULT_VOICE_GATEWAY_AGENT_NAME,
     ownerParticipantIdentity: session.ownerParticipantIdentity || null,
@@ -746,6 +750,15 @@ async function createCallSession({ userId, agentId, conversationId, ttlMs }) {
     listenOnlyModeEnabled: false,
     mode: 'call',
     callStatus: 'created',
+    contextPreparation:
+      String(process.env.VIVENTIUM_VOICE_PREBUILD_CONTEXT_ENABLED || '').toLowerCase() === 'true'
+        ? createCallPreparationBinding(
+            true,
+            callSessionId,
+            process.env.VIVENTIUM_VOICE_PREBUILD_CONTEXT_PROMPT_ID || 'voice.prebuild_context',
+            Number(process.env.VIVENTIUM_VOICE_PREBUILD_CONTEXT_TIMEOUT_S || 120),
+          )
+        : undefined,
     requestedVoiceRoute: normalizedRequestedVoiceRoute,
     ...(contextualKeyterms.length ? { contextualKeyterms } : {}),
   };
@@ -771,6 +784,35 @@ async function getCallSession(callSessionId) {
     expiresAt: { $gt: now },
   }).lean();
   return normalizeSession(session);
+}
+
+/** Opportunistic Main maintenance waits for any current call on its owner/agent. */
+async function getActiveCallSessionForMainMaintenance({ userId, agentId, now = new Date() }) {
+  const ownerId = String(userId || '').trim();
+  const mainAgentId = String(agentId || '').trim();
+  const observedAt = now instanceof Date ? now : new Date(now);
+  if (!ownerId || !mainAgentId || !Number.isFinite(observedAt.getTime())) return null;
+  return normalizeSession(
+    await ViventiumCallSession.findOne({
+      userId: ownerId,
+      agentId: mainAgentId,
+      callStatus: {
+        $in: [
+          'created',
+          'connecting',
+          'listening',
+          'speaking',
+          'working',
+          'needs_input',
+          'degraded',
+        ],
+      },
+      'callFailure.fatal': { $ne: true },
+      expiresAt: { $gt: observedAt },
+    })
+      .sort({ updatedAt: -1, createdAt: -1 })
+      .lean(),
+  );
 }
 
 /* === VIVENTIUM START ===
@@ -1025,7 +1067,25 @@ async function syncCallSessionState({
         { $set: { expiresAt: new Date(session.expiresAt) } },
       );
     }
-    return normalizeSession(session);
+    const normalized = normalizeSession(session);
+    if (status === 'ended') {
+      void require('./ViventiumMainCompactionService')
+        .flushEndedCallMainCompactions(normalized)
+        .catch((error) =>
+          logger.warn('[VIVENTIUM][main-continuity] Post-call compaction unavailable', {
+            errorClass: String(error?.name || 'PersistenceError').slice(0, 80),
+          }),
+        );
+    }
+    if (
+      normalized.contextPreparation?.streamId &&
+      (status === 'ended' || normalized.mode === 'listen_only')
+    ) {
+      void require('./CallPreparationService')
+        .cancel(normalized)
+        .catch(() => undefined);
+    }
+    return normalized;
   }
   // `ended` is terminal. A delayed keepalive, mode switch, or status packet may observe the
   // terminal record but can never extend or reopen it.
@@ -1888,6 +1948,7 @@ module.exports = {
   createCallBrowserLaunch,
   exchangeCallBrowserLaunch,
   getActiveCallSessionForConversation,
+  getActiveCallSessionForMainMaintenance,
   getCallSession,
   getCallSessionVoiceSettings,
   heartbeatCallSession,

@@ -222,15 +222,23 @@ export async function requestAccountApi({
   const abortSignalConstructor = AbortSignal as typeof AbortSignal & {
     timeout?: (milliseconds: number) => AbortSignal;
   };
+  const signal = typeof abortSignalConstructor.timeout === 'function'
+    ? abortSignalConstructor.timeout(requestTimeoutMs) : undefined;
+  const transportFailure = (error: unknown): never => {
+    if (signal?.aborted) {
+      throw Object.assign(new Error('glasshive_account_request_timeout'), {
+        code: 'glasshive_account_request_timeout', status: 504, outcomeUnknown: true,
+      });
+    }
+    throw error;
+  };
   const response = await fetchImpl(url, {
     method,
     redirect: 'error',
     headers,
     ...(serializedBody != null ? { body: serializedBody } : {}),
-    ...(typeof abortSignalConstructor.timeout === 'function'
-      ? { signal: abortSignalConstructor.timeout(requestTimeoutMs) }
-      : {}),
-  });
+    ...(signal ? { signal } : {}),
+  }).catch(transportFailure);
   const contentType = String(response.headers.get('content-type') || '').toLowerCase();
   const contentLength = Number(response.headers.get('content-length'));
   if (
@@ -240,7 +248,7 @@ export async function requestAccountApi({
     throw new Error('glasshive_account_response_invalid');
   }
 
-  const raw = await response.text();
+  const raw = await response.text().catch(transportFailure);
   if (Buffer.byteLength(raw, 'utf8') > MAX_RESPONSE_BYTES) {
     throw new Error('glasshive_account_response_oversized');
   }
@@ -264,6 +272,10 @@ export async function requestAccountApi({
       code,
       status: Number(response.status) || 502,
       body: parsed,
+      ...(method.toUpperCase() === 'POST' && path.startsWith('/v1/work/') &&
+          path.endsWith('/actions/receipt') &&
+          response.headers.get('x-xperfect-action-receipt') === 'failed-v1'
+        ? { actionReceipt: 'immutable_failure' } : {}),
       userMessage: typeof structuredRecord.message === 'string' ? structuredRecord.message : '',
     });
   }

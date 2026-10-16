@@ -1,11 +1,7 @@
 import { isDeclaredConversationOrchestrator } from './conversationOrchestration';
 import { normalizeWorkDeliveryScope } from './workDeliveryScope';
 import type { WorkDeliveryScope } from './workDeliveryScope';
-import {
-  nativeQuestionForm,
-  nativeWorkInputBinding,
-  nativeWorkInputQuestionText,
-} from './nativeWorkInput';
+import { nativeQuestionForm, nativeWorkInputBinding, nativeWorkInputQuestionText } from './nativeWorkInput';
 import { sanitizeGlassHiveCallbackText } from './callbackSanitizer';
 
 const COLD_WAIT_MS = 100;
@@ -63,8 +59,7 @@ const text = (value: string | undefined, limit: number) =>
 const attention = (item: WorkItem) => item.state === 'needs_input' || item.state === 'stopping';
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {};
+    ? value as Record<string, unknown> : {};
 
 /** Informational native form only; the existing work action still reads its current authority. */
 export function projectCurrentNativeWorkInput(item: WorkItem, snapshot: string | undefined) {
@@ -84,17 +79,12 @@ export function projectCurrentNativeWorkInput(item: WorkItem, snapshot: string |
   const kinds = option.enumKinds as Array<string | null> | undefined;
   if (!kinds || kinds.length !== values.length) return null;
   return {
-    ...binding,
-    kind: 'permission' as const,
-    message,
+    ...binding, kind: 'permission' as const, message,
     choices: values.map((value, index) => ({
-      value,
-      label: sanitizeGlassHiveCallbackText(labels[index]),
-      kind: kinds[index],
+      value, label: sanitizeGlassHiveCallbackText(labels[index]), kind: kinds[index],
     })),
     ...(typeof option.description === 'string'
-      ? { operationTitle: sanitizeGlassHiveCallbackText(option.description) }
-      : {}),
+      ? { operationTitle: sanitizeGlassHiveCallbackText(option.description) } : {}),
   };
 }
 
@@ -107,34 +97,19 @@ function projectWorkRows(rows: WorkItem[], observationMetadata = true) {
       state: text(item.state, 40),
       ...(observationMetadata ? { updatedAt: text(item.updatedAt, 64) } : {}),
       actions: Array.isArray(item.actions)
-        ? item.actions.filter((action) => typeof action === 'string')
+        ? item.actions
+            .filter((action) => typeof action === 'string')
         : [],
-      ...(observationMetadata && item.delivery
-        ? { deliveryState: text(item.delivery.state, 40) }
-        : {}),
+      ...(item.delivery ? { deliveryState: text(item.delivery.state, 40) } : {}),
       ...(deliveryScope ? { deliveryScope } : {}),
-      ...(item.attention
-        ? {
-            attention: {
-              kind: text(item.attention.kind, 40),
-              ...(typeof item.attention.code === 'string'
-                ? { code: text(item.attention.code, 120) }
-                : {}),
-            },
-          }
-        : {}),
-      ...(item.state === 'needs_input' && item.pendingNativeInput != null
-        ? { nativeInputOmitted: true }
-        : {}),
+      ...(item.attention ? { attention: {
+        kind: text(item.attention.kind, 40),
+        ...(typeof item.attention.code === 'string' ? { code: text(item.attention.code, 120) } : {}),
+      } } : {}),
+      ...(item.state === 'needs_input' && item.pendingNativeInput != null ? { nativeInputOmitted: true } : {}),
     } as {
-      workRef: string;
-      title: string;
-      state: string;
-      updatedAt?: string;
-      actions: string[];
-      deliveryState?: string;
-      deliveryScope?: WorkDeliveryScope;
-      nativeInputOmitted?: boolean;
+      workRef: string; title: string; state: string; updatedAt?: string; actions: string[];
+      deliveryState?: string; deliveryScope?: WorkDeliveryScope; nativeInputOmitted?: boolean;
       attention?: { kind: string; code?: string };
       pendingNativeInput?: NonNullable<ReturnType<typeof projectCurrentNativeWorkInput>>;
     };
@@ -168,8 +143,7 @@ export function projectActiveWorkRoster(value: unknown, scope: 'active' | 'histo
     (item) => item && typeof item.workRef === 'string',
   );
   const sorted = [...rows].sort(
-    (left, right) =>
-      Number(attention(right)) - Number(attention(left)) ||
+    (left, right) => Number(attention(right)) - Number(attention(left)) ||
       text(right.updatedAt, 64).localeCompare(text(left.updatedAt, 64)),
   );
   const work = projectWorkRows(sorted, false);
@@ -187,22 +161,12 @@ export function projectActiveWorkRoster(value: unknown, scope: 'active' | 'histo
   const render = () => JSON.stringify(projected);
   projected.exceedsCompactBudget = Buffer.byteLength(render(), 'utf8') > maxBytes;
   if (!projected.exceedsCompactBudget) {
-    appendCurrentNativeInputs(
-      work,
-      sorted,
-      typeof source.snapshot === 'string' ? source.snapshot : undefined,
-      maxBytes,
-      render,
-    );
+    appendCurrentNativeInputs(work, sorted, typeof source.snapshot === 'string' ? source.snapshot : undefined,
+      maxBytes, render);
   }
   if (!projected.exceedsCompactBudget) return projected;
   const { work: retainedWork, ...metadata } = projected;
-  return {
-    ...metadata,
-    fullOutputRequired: true,
-    nativeSavedOutputRequiredIfTruncated: true,
-    work: retainedWork,
-  };
+  return { ...metadata, fullOutputRequired: true, nativeSavedOutputRequiredIfTruncated: true, work: retainedWork };
 }
 
 /** Render only current work facts; provider delivery owns placement outside durable authority. */

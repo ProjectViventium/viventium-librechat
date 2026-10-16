@@ -37,6 +37,22 @@ module.exports = function createViventiumCallSession(db) {
       agentId: { type: String, required: true },
       conversationId: { type: String, required: true },
       roomName: { type: String, required: true },
+      /* VIVENTIUM: one existing Main job dependency, not a separate call agent. */
+      contextPreparation: {
+        type: new mongoose.Schema(
+          {
+            version: { type: Number, enum: [1], required: true },
+            promptId: { type: String, maxlength: 200, required: true },
+            deadlineAt: { type: String, default: '' },
+            timeoutSeconds: { type: Number, min: 1, max: 600, required: true },
+            idempotencyKey: { type: String, maxlength: 512, required: true },
+            streamId: { type: String, maxlength: 160, default: null },
+            releasedStreamId: { type: String, maxlength: 160, default: null },
+          },
+          { _id: false },
+        ),
+        default: undefined,
+      },
       /* === VIVENTIUM START ===
        * Feature: server-owned LiveKit launch identity
        * Purpose: Persist the immutable gateway and owner participant identity so refresh/rejoin

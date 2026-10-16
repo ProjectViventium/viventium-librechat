@@ -1,6 +1,11 @@
 const mongoose = require('mongoose');
 const crypto = require('node:crypto');
-const { logger } = require('@librechat/data-schemas');
+const {
+  logger,
+  agentVersionCount,
+  isAgentBsonOverflow,
+  createAgentVersionMethods,
+} = require('@librechat/data-schemas');
 const { getCustomEndpointConfig } = require('@librechat/api');
 const {
   Tools,
@@ -27,8 +32,11 @@ const {
 } = require('./Project');
 const { removeAllPermissions } = require('~/server/services/PermissionService');
 const { getMCPServerTools } = require('~/server/services/Config');
-const { Agent, AclEntry, User } = require('~/db/models');
+const { Agent, AgentVersion, AclEntry, User } = require('~/db/models');
 const { getActions } = require('./Action');
+/* === VIVENTIUM START === Preserve complete Agent history outside BSON capacity when needed. === */
+const agentHistory = createAgentVersionMethods(Agent, AgentVersion);
+/* === VIVENTIUM END === */
 
 function normalizeAgentModelFields(agentLike, options = {}) {
   if (!agentLike || typeof agentLike !== 'object') {
@@ -351,6 +359,7 @@ const _clearAgentCache = async (agentId) => {
  */
 const createAgent = async (agentData) => {
   const normalizedAgentData = normalizeAllAgentModelFields(agentData);
+  delete normalizedAgentData.version_count;
   const { author: _author, ...versionData } = normalizedAgentData;
   const timestamp = new Date();
   const initialAgentData = {
@@ -390,7 +399,15 @@ const createAgent = async (agentData) => {
  * Purpose: Cache `Agent.findOne({ id })` results in the config store with TTL to reduce DB round-trips.
  * Added: 2026-02-07
  */
-const getAgent = async (searchParameter) => await _getAgentWithCache(searchParameter);
+const getAgent = async (searchParameter, { includeVersions = false } = {}) => {
+  const agent = await _getAgentWithCache(searchParameter);
+  if (!agent || !includeVersions || agent.version_count == null) return agent;
+  return { ...agent, versions: await agentHistory.getVersions(agent) };
+};
+const getAgentVersion = async (searchParameter, index) => {
+  const agent = await getAgent(searchParameter);
+  return agent ? agentHistory.getVersion(agent, index) : null;
+};
 
 const _getAgentWithCache = async (searchParameter) => {
   if (!_isCacheableAgentSearch(searchParameter)) {
@@ -555,7 +572,7 @@ const loadAgent = async ({ req, spec, agent_id, endpoint, model_parameters }) =>
   }
 
   const normalizedAgent = normalizeAllAgentModelFields(agent);
-  normalizedAgent.version = normalizedAgent.versions ? normalizedAgent.versions.length : 0;
+  normalizedAgent.version = agentVersionCount(normalizedAgent);
   return normalizedAgent;
 };
 
@@ -583,6 +600,7 @@ const isDuplicateVersion = (updateData, currentData, versions, actionsHash = nul
     'updated_at',
     '__v',
     'versions',
+    'version_count',
     'actionsHash', // Exclude actionsHash from direct comparison
   ];
 
@@ -738,16 +756,20 @@ const isDuplicateVersion = (updateData, currentData, versions, actionsHash = nul
  * @throws {Error} If the update would create a duplicate version
  */
 const updateAgent = async (searchParameter, updateData, options = {}) => {
+  updateData = { ...updateData };
+  delete updateData.version_count;
   const { updatingUserId = null, forceVersion = false, skipVersioning = false } = options;
   const mongoOptions = { new: true, upsert: false };
 
   const currentAgent = await Agent.findOne(searchParameter);
+  let pendingVersion = null;
   if (currentAgent) {
     const {
       __v,
       _id,
       id: __id,
       versions,
+      version_count: _version_count,
       author: _author,
       ...versionData
     } = currentAgent.toObject();
@@ -804,18 +826,33 @@ const updateAgent = async (searchParameter, updateData, options = {}) => {
     });
 
     if (shouldCreateVersion) {
-      const duplicateVersion = isDuplicateVersion(updateData, versionData, versions, actionsHash);
+      const comparisonVersions =
+        _version_count == null
+          ? versions
+          : [await agentHistory.getVersion(currentAgent, _version_count - 1)].filter(Boolean);
+      const duplicateVersion = isDuplicateVersion(
+        updateData,
+        versionData,
+        comparisonVersions,
+        actionsHash,
+      );
       if (duplicateVersion && !forceVersion) {
         if (hasDirectUpdateDrift && !$push && !$pull && !$addToSet) {
           const repaired = normalizeAllAgentModelFields(
-            await Agent.findOneAndUpdate(searchParameter, directUpdates, mongoOptions).lean(),
+            currentAgent.version_count != null
+              ? await agentHistory.saveArchivedUpdate(
+                  currentAgent.toObject(),
+                  normalizeAtomicUpdateDocument(directUpdates),
+                  null,
+                )
+              : await Agent.findOneAndUpdate(searchParameter, directUpdates, mongoOptions).lean(),
           );
           await _cacheAgent(repaired);
           return repaired;
         }
         // No changes detected, return the current agent without creating a new version
         const agentObj = normalizeAllAgentModelFields(currentAgent.toObject());
-        agentObj.version = versions.length;
+        agentObj.version = agentVersionCount(agentObj);
         /* === VIVENTIUM START ===
          * Feature: Keep agent cache warm on no-op updates
          * Purpose: Ensure cached agent stays fresh even when updateAgent returns early.
@@ -844,6 +881,7 @@ const updateAgent = async (searchParameter, updateData, options = {}) => {
     }
 
     if (shouldCreateVersion) {
+      pendingVersion = versionEntry;
       updateData.$push = {
         ...($push || {}),
         versions: versionEntry,
@@ -857,9 +895,26 @@ const updateAgent = async (searchParameter, updateData, options = {}) => {
    * Added: 2026-02-07
    */
   updateData = normalizeAtomicUpdateDocument(normalizeAllAgentModelFields(updateData));
-  const updated = normalizeAllAgentModelFields(
-    await Agent.findOneAndUpdate(searchParameter, updateData, mongoOptions).lean(),
-  );
+  let saved;
+  if (currentAgent?.version_count != null) {
+    saved = await agentHistory.saveArchivedUpdate(
+      currentAgent.toObject(),
+      updateData,
+      pendingVersion,
+    );
+  } else {
+    try {
+      saved = await Agent.findOneAndUpdate(searchParameter, updateData, mongoOptions).lean();
+    } catch (error) {
+      if (!currentAgent || !isAgentBsonOverflow(error)) throw error;
+      saved = await agentHistory.saveArchivedUpdate(
+        currentAgent.toObject(),
+        updateData,
+        pendingVersion,
+      );
+    }
+  }
+  const updated = normalizeAllAgentModelFields(saved);
   await _cacheAgent(updated);
   return updated;
   /* === VIVENTIUM END === */
@@ -972,6 +1027,7 @@ const removeAgentResourceFiles = async ({ agent_id, files }) => {
 const deleteAgent = async (searchParameter) => {
   const agent = await Agent.findOneAndDelete(searchParameter);
   if (agent) {
+    await AgentVersion.deleteMany({ agentObjectId: agent._id });
     await removeAgentFromAllProjects(agent.id);
     await Promise.all([
       removeAllPermissions({
@@ -1042,6 +1098,7 @@ const deleteUserAgents = async (userId) => {
     }
 
     await Agent.deleteMany({ author: userId });
+    await AgentVersion.deleteMany({ agentObjectId: { $in: agentObjectIds } });
     /* === VIVENTIUM START ===
      * Feature: Clear cached agents after user delete
      * Purpose: Prevent stale reads for agents that were deleted in bulk.
@@ -1233,11 +1290,10 @@ const revertAgentVersion = async (searchParameter, versionIndex, validatedVersio
     throw new Error('Agent not found');
   }
 
-  if (!agent.versions || !agent.versions[versionIndex]) {
+  const revertToVersion = await agentHistory.getVersion(agent, versionIndex);
+  if (!revertToVersion) {
     throw new Error(`Version ${versionIndex} not found`);
   }
-
-  const revertToVersion = agent.versions[versionIndex];
 
   const updateData = {
     ...(validatedVersion || revertToVersion),
@@ -1247,12 +1303,11 @@ const revertAgentVersion = async (searchParameter, versionIndex, validatedVersio
   delete updateData._id;
   delete updateData.id;
   delete updateData.versions;
+  delete updateData.version_count;
   delete updateData.author;
   delete updateData.updatedBy;
 
-  return normalizeAllAgentModelFields(
-    await Agent.findOneAndUpdate(searchParameter, updateData, { new: true }).lean(),
-  );
+  return updateAgent(searchParameter, updateData, { skipVersioning: true });
 };
 
 /**
@@ -1322,6 +1377,7 @@ const countPromotedAgents = async () => {
 
 module.exports = {
   getAgent,
+  getAgentVersion,
   getAgents,
   loadAgent,
   createAgent,

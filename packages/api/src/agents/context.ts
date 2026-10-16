@@ -25,6 +25,14 @@ export type AgentWithTools = Pick<Agent, 'id'> &
     viventiumMCPInstructionSources?: Record<string, string>;
   };
 
+/* === VIVENTIUM START === Respect existing source ownership before legacy ID parsing. === */
+function canOwnMCPInstructions(tool: unknown): boolean {
+  const source = tool as { toolType?: string; metadata?: { toolType?: string } };
+  const toolType = source?.toolType ?? source?.metadata?.toolType;
+  return toolType === undefined || toolType === 'mcp';
+}
+/* === VIVENTIUM END === */
+
 /**
  * Extracts unique MCP server names from an agent's tools or tool definitions.
  * Supports both full tool instances (tools) and serializable definitions (toolDefinitions).
@@ -37,7 +45,11 @@ export function extractMCPServers(agent: AgentWithTools): string[] {
   /** Check tool instances (non-event-driven mode) */
   if (agent?.tools?.length) {
     for (const tool of agent.tools) {
-      if (tool instanceof DynamicStructuredTool && tool.name.includes(Constants.mcp_delimiter)) {
+      if (
+        tool instanceof DynamicStructuredTool &&
+        canOwnMCPInstructions(tool) &&
+        tool.name.includes(Constants.mcp_delimiter)
+      ) {
         const serverName = tool.name.split(Constants.mcp_delimiter).pop();
         if (serverName) {
           mcpServers.add(serverName);
@@ -49,7 +61,7 @@ export function extractMCPServers(agent: AgentWithTools): string[] {
   /** Check tool definitions (event-driven mode) */
   if (agent?.toolDefinitions?.length) {
     for (const toolDef of agent.toolDefinitions) {
-      if (toolDef.name?.includes(Constants.mcp_delimiter)) {
+      if (canOwnMCPInstructions(toolDef) && toolDef.name?.includes(Constants.mcp_delimiter)) {
         const serverName = toolDef.name.split(Constants.mcp_delimiter).pop();
         if (serverName) {
           mcpServers.add(serverName);
@@ -113,12 +125,7 @@ async function getMCPInstructionsWithSourcesForServers(
   ).formatInstructionsForContextWithMetadata;
 
   if (typeof maybeMetadataFormatter !== 'function') {
-    const text = await getMCPInstructionsForServers(
-      mcpServers,
-      mcpManager,
-      logger,
-      requestContext,
-    );
+    const text = await getMCPInstructionsForServers(mcpServers, mcpManager, logger, requestContext);
     return { text, sources: {} };
   }
 
@@ -214,12 +221,7 @@ export async function applyContextToAgent({
   try {
     const mcpServers = ephemeralAgent?.mcp?.length ? ephemeralAgent.mcp : extractMCPServers(agent);
     const { text: mcpInstructions, sources: mcpInstructionSources } =
-      await getMCPInstructionsWithSourcesForServers(
-        mcpServers,
-        mcpManager,
-        logger,
-        requestContext,
-      );
+      await getMCPInstructionsWithSourcesForServers(mcpServers, mcpManager, logger, requestContext);
     agent.viventiumMCPInstructionSources = mcpInstructionSources;
 
     agent.instructions = buildAgentInstructions({

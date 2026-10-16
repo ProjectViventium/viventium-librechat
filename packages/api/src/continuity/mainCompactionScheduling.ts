@@ -9,11 +9,173 @@
  * === VIVENTIUM END === */
 import {
   MAIN_COMPACTION_SOURCE_TARGET_BYTES,
+  MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS,
+  compatibleMainCompactionSizeContract,
+  MAIN_COMPACTION_LEASE_MS,
   boundedMainCompactionSourceTarget,
   mainCompactionProposalBytes,
   boundedMainCompactionLeaseRenewal,
 } from './mainContinuity';
 import type { MainCompactionStructuralIssue } from './mainContinuity';
+
+type CompactionRouteAgent = { id?: unknown; [key: string]: unknown };
+type CompactionRouteRequest = { user?: { id?: unknown } };
+const retainedMainCompactionRoutes = new WeakMap<object, {
+  ownerId: string; agentId: string; route: Record<string, unknown>;
+}>();
+const mainCompactionRouteFields = [
+  'provider', 'endpoint', 'model', 'model_parameters',
+  'fallback_llm_provider', 'fallback_llm_model', 'fallback_llm_model_parameters',
+  'viventiumFallbackLlmAssignment',
+] as const;
+
+/** Preserve the authorized Main tuple before a request-local surface override mutates it. */
+export function retainMainCompactionRoute(
+  req: CompactionRouteRequest | null | undefined,
+  agent: CompactionRouteAgent,
+): boolean {
+  const ownerId = String(req?.user?.id || '').trim();
+  const agentId = String(agent?.id || '').trim();
+  if (!req || !ownerId || !agentId) return false;
+  const retained = retainedMainCompactionRoutes.get(req);
+  if (retained) {
+    if (retained.ownerId !== ownerId || retained.agentId !== agentId)
+      throw new Error('main_compaction_route_owner_mismatch');
+    return true;
+  }
+  const route: Record<string, unknown> = {};
+  for (const field of mainCompactionRouteFields) {
+    const value = agent[field];
+    if (field === 'model_parameters' || field === 'fallback_llm_model_parameters') {
+      const parameters: Record<string, unknown> = {
+        ...(value && typeof value === 'object' ? value as Record<string, unknown> : {}),
+      };
+      delete parameters.configuration;
+      route[field] = structuredClone(parameters);
+    } else route[field] = structuredClone(value);
+  }
+  route.endpoint = agent.endpoint || agent.provider;
+  retainedMainCompactionRoutes.set(req, { ownerId, agentId, route });
+  return true;
+}
+
+/** A background actor uses its request's Main selection, never the Voice surface selection. */
+export function resolveMainCompactionAgent<T extends CompactionRouteAgent>(
+  req: CompactionRouteRequest | null | undefined,
+  agent: T,
+): T {
+  const retained = req && retainedMainCompactionRoutes.get(req);
+  if (!retained) return agent;
+  if (retained.ownerId !== String(req?.user?.id || '').trim() ||
+      retained.agentId !== String(agent?.id || '').trim())
+    throw new Error('main_compaction_route_owner_mismatch');
+  return { ...agent, ...structuredClone(retained.route),
+    viventiumFallbackLlm: undefined, viventiumFallbackLlmInitializationError: undefined };
+}
+
+/** Keep one admitted private stage's exact store lease live; a dead holder still expires normally. */
+export function createMainCompactionStageLease(input: {
+  signal: AbortSignal;
+  graceMs: number;
+  leaseExpiresAt: () => unknown;
+  renew: (expiresAt: Date) => Promise<{ status?: unknown }>;
+  onLost: () => void;
+}) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let pending: Promise<void> | undefined;
+  let closed = false;
+  let lost = false;
+  let accepted = false;
+  let contention = false;
+  let requestedExpiry = 0;
+  let admitted: { requestId: string; deadlineMs: number } | undefined;
+  const expiryMs = () => new Date(input.leaseExpiresAt() as string | number | Date).getTime();
+  const stop = () => { if (timer) clearTimeout(timer); timer = undefined; };
+  const lose = () => { lost = true; stop(); if (!input.signal.aborted) input.onLost(); };
+  const schedule = () => {
+    stop();
+    if (closed || lost || !accepted || input.signal.aborted) return;
+    const remaining = expiryMs() - Date.now();
+    if (!Number.isFinite(remaining) || remaining <= 0) { lose(); return; }
+    timer = setTimeout(tick, Math.min(MAIN_COMPACTION_LEASE_MS / 2, remaining));
+    timer.unref?.();
+  };
+  const tick = () => {
+    timer = undefined;
+    if (closed || !admitted || input.signal.aborted) return;
+    const now = Date.now();
+    const expiry = expiryMs();
+    if (!Number.isFinite(expiry) || expiry <= now) { lose(); return; }
+    if (pending) { schedule(); return; }
+    const target = Math.min(admitted.deadlineMs + input.graceMs, now + MAIN_COMPACTION_LEASE_MS);
+    if (target <= now) return;
+    if (expiry >= target) { schedule(); return; }
+    contention = false;
+    requestedExpiry = target;
+    pending = Promise.resolve().then(() => input.renew(new Date(target))).then(
+      (outcome) => {
+        if (outcome.status === 'busy') contention = true;
+        else if (outcome.status !== 'renewed') lose();
+      },
+      () => lose(),
+    ).finally(() => { pending = undefined; schedule(); });
+    schedule();
+  };
+  const awaitPending = async () => {
+    const operation = pending;
+    if (!operation || input.signal.aborted) return;
+    await new Promise<void>(resolve => {
+      let done = false;
+      let expiryTimer: ReturnType<typeof setTimeout> | undefined;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (expiryTimer && timer === expiryTimer) stop();
+        input.signal.removeEventListener('abort', finish);
+        resolve();
+      };
+      input.signal.addEventListener('abort', finish, { once: true });
+      if (!timer) {
+        const remaining = expiryMs() - Date.now();
+        if (!Number.isFinite(remaining) || remaining <= 0) { lose(); finish(); return; }
+        expiryTimer = timer = setTimeout(() => { lose(); finish(); }, remaining);
+        expiryTimer.unref?.();
+      }
+      void operation.then(finish, finish);
+    });
+  };
+  return {
+    async admit(receipt: { requestId: string; responseDeadlineAt: string }): Promise<boolean> {
+      const deadlineMs = Date.parse(receipt.responseDeadlineAt);
+      if (closed || input.signal.aborted || !receipt.requestId ||
+          !Number.isFinite(deadlineMs) || deadlineMs <= Date.now() ||
+          deadlineMs + input.graceMs - Date.now() > 2_147_483_647) return false;
+      if (admitted) {
+        await awaitPending();
+        return accepted && !closed && !lost && !input.signal.aborted &&
+          admitted.requestId === receipt.requestId && admitted.deadlineMs === deadlineMs;
+      }
+      admitted = { requestId: receipt.requestId, deadlineMs };
+      tick();
+      await awaitPending();
+      if (closed || lost || input.signal.aborted || (contention && expiryMs() < requestedExpiry)) {
+        admitted = undefined;
+        return false;
+      }
+      accepted = true;
+      schedule();
+      input.signal.addEventListener('abort', stop, { once: true });
+      return true;
+    },
+    async settle(): Promise<void> {
+      closed = true;
+      stop();
+      input.signal.removeEventListener('abort', stop);
+      await awaitPending();
+      stop();
+    },
+  };
+}
 
 type AcceptanceCommitResult = { readonly status?: unknown } | null | undefined;
 type AcceptanceSchedule = (commitResult: AcceptanceCommitResult) => boolean;
@@ -61,6 +223,107 @@ export const mainCompactionAcceptanceRetention = Object.freeze({
 });
 
 const retainedSchedules = new Map<string, { schedule: AcceptanceSchedule; expiresAt: number }>();
+
+type CompactionCall = {
+  readonly callSessionId?: unknown;
+  readonly userId?: unknown;
+  readonly status?: unknown;
+  readonly expiresAtMs?: unknown;
+};
+const deferredCallCompactions = new Map<string, {
+  ownerId: string; callSessionId: string; expiresAt: number; schedule: () => Promise<unknown>;
+  timer?: ReturnType<typeof setTimeout>;
+}>();
+const endedCompactionCalls = new Map<string, number>();
+
+function pruneCallCompactionSchedules(now: number): void {
+  for (const [key, value] of deferredCallCompactions)
+    if (value.expiresAt <= now) discardDeferredMainCompaction(key);
+  for (const [key, expiresAt] of endedCompactionCalls)
+    if (expiresAt <= now) endedCompactionCalls.delete(key);
+  while (deferredCallCompactions.size > mainCompactionAcceptanceRetention.maxRetained)
+    discardDeferredMainCompaction(deferredCallCompactions.keys().next().value as string);
+  while (endedCompactionCalls.size > mainCompactionAcceptanceRetention.maxRetained)
+    endedCompactionCalls.delete(endedCompactionCalls.keys().next().value as string);
+}
+
+/** Only opportunistic maintenance waits for a verified live Call; source debt stays in its store. */
+export function deferAcceptedMainCompactionForCall(input: {
+  ownerId: string; domainKey: string; call?: CompactionCall | null;
+  schedule: () => Promise<unknown>; now?: number;
+}): boolean {
+  const now = input.now ?? Date.now(), call = input.call;
+  pruneCallCompactionSchedules(now);
+  const callSessionId = String(call?.callSessionId ?? '').trim();
+  const expiresAt = Number(call?.expiresAtMs);
+  if (!input.ownerId || !input.domainKey || !callSessionId ||
+      String(call?.userId ?? '') !== input.ownerId || !(expiresAt > now) ||
+      !['created', 'connecting', 'listening', 'speaking', 'working', 'needs_input', 'degraded'].includes(String(call?.status)) ||
+      endedCompactionCalls.has(`${input.ownerId}\n${callSessionId}`)) return false;
+  discardDeferredMainCompaction(input.domainKey);
+  deferredCallCompactions.set(input.domainKey, {
+    ownerId: input.ownerId, callSessionId, expiresAt, schedule: input.schedule,
+  });
+  pruneCallCompactionSchedules(now);
+  return true;
+}
+
+/** Foreground pressure recovery replaces an opportunistic schedule for this same exact domain. */
+export function discardDeferredMainCompaction(domainKey: string): void {
+  const entry = deferredCallCompactions.get(domainKey);
+  if (entry?.timer) clearTimeout(entry.timer);
+  deferredCallCompactions.delete(domainKey);
+}
+
+/** Re-arm reviewed legacy progress in the existing per-domain deferral scheduler. */
+export function deferAcceptedMainCompactionForIdle(input: {
+  ownerId: string; domainKey: string; schedule: () => Promise<unknown>;
+  shouldYield: () => boolean; onError: (error: unknown) => void; signal?: AbortSignal;
+}): boolean {
+  if (!input.ownerId || !input.domainKey || input.signal?.aborted) return false;
+  const delayMs = 30000;
+  pruneCallCompactionSchedules(Date.now());
+  discardDeferredMainCompaction(input.domainKey);
+  const entry = { ownerId: input.ownerId, callSessionId: '',
+    expiresAt: Date.now() + mainCompactionAcceptanceRetention.ttlMs,
+    schedule: input.schedule, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+  const tick = () => {
+    if (deferredCallCompactions.get(input.domainKey) !== entry) return;
+    if (input.signal?.aborted) { discardDeferredMainCompaction(input.domainKey); return; }
+    if (input.shouldYield()) {
+      entry.expiresAt = Date.now() + mainCompactionAcceptanceRetention.ttlMs;
+      arm(); return;
+    }
+    if (entry.expiresAt <= Date.now()) { discardDeferredMainCompaction(input.domainKey); return; }
+    discardDeferredMainCompaction(input.domainKey);
+    void Promise.resolve().then(entry.schedule).catch(input.onError);
+  };
+  const arm = () => { entry.timer = setTimeout(tick, delayMs); entry.timer.unref?.(); };
+  deferredCallCompactions.set(input.domainKey, entry);
+  arm();
+  pruneCallCompactionSchedules(Date.now());
+  return true;
+}
+
+/** The existing terminal Call transition releases each retained domain once, including late acceptance. */
+export async function flushEndedCallMainCompactions(call: CompactionCall, now = Date.now()): Promise<number> {
+  pruneCallCompactionSchedules(now);
+  const ownerId = String(call.userId ?? '').trim(), callSessionId = String(call.callSessionId ?? '').trim();
+  if (!ownerId || !callSessionId || call.status !== 'ended') return 0;
+  const expiresAt = Number(call.expiresAtMs);
+  endedCompactionCalls.set(`${ownerId}\n${callSessionId}`,
+    Math.max(Number.isFinite(expiresAt) ? expiresAt : now, now + mainCompactionAcceptanceRetention.ttlMs));
+  const schedules: Array<() => Promise<unknown>> = [];
+  for (const [key, entry] of deferredCallCompactions) {
+    if (entry.ownerId !== ownerId || entry.callSessionId !== callSessionId) continue;
+    deferredCallCompactions.delete(key);
+    schedules.push(entry.schedule);
+  }
+  pruneCallCompactionSchedules(now);
+  await Promise.all(schedules.map((schedule) => schedule()));
+  return schedules.length;
+}
+
 
 function retentionKey(userId: unknown, responseMessageId: unknown): string {
   const owner = String(userId ?? '').trim();
@@ -112,11 +375,12 @@ export function scheduleExternallyAcceptedMainCompaction(
   return entry.schedule(commitResult) === true;
 }
 
-export const MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS = 4;
+export { MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS } from './mainContinuity';
 
 export interface MainCompactionSizeRepairState {
   readonly proposalBytes: number | null;
   readonly converging: boolean;
+  readonly previousProposalBytes?: number;
 }
 
 /**
@@ -136,7 +400,7 @@ export function recordMainCompactionRejection(
     proposalBytes !== null &&
     (attempt === 1 ||
       (state?.converging === true && previous !== null && proposalBytes < previous));
-  return { proposalBytes, converging };
+  return { proposalBytes, converging, ...(previous !== null ? { previousProposalBytes: previous } : {}) };
 }
 
 /** Milliseconds left on the store-owned claim lease, never negative. */
@@ -156,24 +420,34 @@ export function mainCompactionStageBudget(input: {
   slowestReviewCallMs?: number;
   maxCallMs: number;
   stage: 'compaction' | 'review';
+  /** Only the existing Native receipt owner may extend the initial short guard. */
+  nativeDeadlineAdmission?: boolean;
+  nativeAdmittedWindowMs?: number;
 }): { allowed: boolean; timeoutMs: number } {
   const leaseRemaining = mainCompactionLeaseRemainingMs(input.leaseExpiresAt, input.now);
   const deadline = new Date(input.deadlineAt as string | number | Date).getTime();
-  if (!Number.isFinite(deadline))
-    return {
-      allowed: leaseRemaining > 0,
-      timeoutMs: Math.min(input.maxCallMs, leaseRemaining),
-    };
-  const remaining = Math.min(
-    leaseRemaining,
-    Math.max(0, deadline - input.now - Math.max(0, input.completionReserveMs || 0)),
-  );
+  if (!Number.isFinite(deadline)) return {
+    allowed: leaseRemaining > 0, timeoutMs: Math.min(input.maxCallMs, leaseRemaining),
+  };
+  const remaining = Math.min(leaseRemaining,
+    Math.max(0, deadline - input.now - Math.max(0, input.completionReserveMs || 0)));
   // An unobserved stage has no measured estimate. A different stage's duration is not evidence
   // for it; the live lease, enclosing Main reserve and existing per-call ceiling still bound it.
   const compactionEstimate = Math.max(0, input.slowestCompactionCallMs ?? 0);
   const reviewEstimate = Math.max(0, input.slowestReviewCallMs ?? 0);
   const estimate = input.stage === 'compaction' ? compactionEstimate : reviewEstimate;
   const reserve = input.stage === 'compaction' ? reviewEstimate : 0;
+  if (input.nativeDeadlineAdmission === true) {
+    const enclosingRemaining = Math.max(0,
+      deadline - input.now - Math.max(0, input.completionReserveMs || 0));
+    // A measured long Native stage needs its previously accepted receipt window to fit too.
+    // The returned guard still ends inside the live lease until a new receipt is accepted.
+    const plannedStageMs = estimate > input.maxCallMs
+      ? Math.max(estimate, input.nativeAdmittedWindowMs || 0) : estimate;
+    const timeoutMs = Math.min(input.maxCallMs, leaseRemaining,
+      Math.max(0, enclosingRemaining - reserve));
+    return { allowed: timeoutMs > 0 && enclosingRemaining >= plannedStageMs + reserve, timeoutMs };
+  }
   const timeoutMs = Math.min(input.maxCallMs, Math.max(0, remaining - reserve));
   return { allowed: timeoutMs > 0 && timeoutMs >= estimate, timeoutMs };
 }
@@ -190,8 +464,7 @@ export function mainCompactionStageLeaseRenewal(
     now: input.now,
   });
   return expiresAt && mainCompactionStageBudget({ ...input, leaseExpiresAt: expiresAt }).allowed
-    ? expiresAt
-    : null;
+    ? expiresAt : null;
 }
 
 /** Compose the exact child's native release with the existing intentional generation Stop ACK. */
@@ -204,15 +477,12 @@ export function retainMainCompactionCancellationDelivery(input: {
   if (!signal) return () => {};
   const key = '_viventiumHarnessCancellationDelivery';
   const previous = Object.getOwnPropertyDescriptor(signal, key);
-  if (previous && !previous.configurable)
-    throw new Error('main_compaction_cancellation_owner_conflict');
+  if (previous && !previous.configurable) throw new Error('main_compaction_cancellation_owner_conflict');
   const getter = () => {
     const parentDelivery = previous?.get?.call(signal) ?? previous?.value;
     return Promise.all([parentDelivery, input.settled]).then(([parent]) => {
-      const delivered =
-        input.capacityReleased() &&
-        (parentDelivery == null ||
-          (parent as { delivered?: unknown } | undefined)?.delivered === true);
+      const delivered = input.capacityReleased() &&
+        (parentDelivery == null || (parent as { delivered?: unknown } | undefined)?.delivered === true);
       if (!delivered) throw new Error('main_compaction_native_release_unconfirmed');
       return { delivered: true };
     });
@@ -241,18 +511,13 @@ export function mainCompactionSizeRepairBudget(input: {
   maxCallMs: number;
 }): { allowed: boolean; timeoutMs: number } {
   if (input.slowestCompactionCallMs !== undefined || input.slowestReviewCallMs !== undefined) {
-    if (
-      input.state?.converging !== true ||
-      input.attempts >= MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS
-    ) {
+    if (input.state?.converging !== true ||
+        input.attempts >= MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS) {
       return { allowed: false, timeoutMs: 0 };
     }
     // This caller already clamps the lease to its enclosing deadline minus Main's reserve.
-    return mainCompactionStageBudget({
-      ...input,
-      deadlineAt: input.leaseExpiresAt,
-      stage: 'compaction',
-    });
+    return mainCompactionStageBudget({ ...input, deadlineAt: input.leaseExpiresAt,
+      stage: 'compaction' });
   }
   const remaining = mainCompactionLeaseRemainingMs(input.leaseExpiresAt, input.now);
   const reviewReserve = Math.max(0, input.slowestCallMs);
@@ -274,7 +539,8 @@ export function mainCompactionSizeRepairBudget(input: {
  * === VIVENTIUM END === */
 const failedCompactions = new Map<
   string,
-  { readonly sourceDigest: string; readonly contractKey: string; readonly reason: string }
+  { readonly sourceDigest: string; readonly contractKey: string; readonly reason: string;
+    readonly sizeExhausted?: boolean }
 >();
 
 export function rememberFailedMainCompaction(input: {
@@ -282,13 +548,15 @@ export function rememberFailedMainCompaction(input: {
   sourceDigest: unknown;
   contractKey: unknown;
   reason: unknown;
+  sizeExhausted?: boolean;
 }): boolean {
   const domainEpochKey = String(input.domainEpochKey ?? '').trim();
   const sourceDigest = String(input.sourceDigest ?? '').trim();
   const contractKey = String(input.contractKey ?? '').trim();
   const reason = String(input.reason ?? '').trim();
   if (!domainEpochKey || !sourceDigest || !contractKey || !reason) return false;
-  failedCompactions.set(domainEpochKey, { sourceDigest, contractKey, reason });
+  failedCompactions.set(domainEpochKey, { sourceDigest, contractKey, reason,
+    ...(input.sizeExhausted === true ? { sizeExhausted: true } : {}) });
   return true;
 }
 
@@ -301,7 +569,8 @@ export function repeatedFailedMainCompaction(input: {
   const failed = failedCompactions.get(String(input.domainEpochKey ?? '').trim());
   if (!failed) return null;
   return failed.sourceDigest === String(input.sourceDigest ?? '').trim() &&
-    failed.contractKey === String(input.contractKey ?? '').trim()
+    (failed.contractKey === String(input.contractKey ?? '').trim() ||
+      (failed.sizeExhausted === true && compatibleMainCompactionSizeContract(failed.contractKey, input.contractKey)))
     ? failed.reason
     : null;
 }
@@ -349,14 +618,14 @@ export function recordAcceptedMainCompactionClaim(key: unknown): void {
 /** Test isolation: clear process-local compaction scheduling state. */
 export function resetMainCompactionSchedulingForTests(): void {
   retainedSchedules.clear();
+  for (const key of deferredCallCompactions.keys()) discardDeferredMainCompaction(key);
+  endedCompactionCalls.clear();
   failedCompactions.clear();
   sourceTargets.clear();
 }
 
 /** Later legal reference growth uses the existing runner once, with the full stored source. */
-export async function recoverMainContinuityCarrierForAdmission<
-  T extends { readonly status?: string },
->(input: {
+export async function recoverMainContinuityCarrierForAdmission<T extends { readonly status?: string }>(input: {
   request?: { _viventiumAcceptedMainCarrierRecovery?: Set<string> };
   identityKey: string;
   load: () => Promise<T>;
@@ -365,17 +634,80 @@ export async function recoverMainContinuityCarrierForAdmission<
   let context = await input.load();
   if (context.status !== 'context_budget') return context;
   const attempts = input.request
-    ? (input.request._viventiumAcceptedMainCarrierRecovery ||= new Set<string>())
-    : new Set<string>();
+    ? (input.request._viventiumAcceptedMainCarrierRecovery ||= new Set<string>()) : new Set<string>();
   if (!attempts.has(input.identityKey)) {
     attempts.add(input.identityKey);
     await input.ensure();
     context = await input.load();
   }
   if (context.status !== 'available')
-    throw Object.assign(new Error('Prior accepted Main history cannot be carried intact.'), {
-      code: 'source_context_unavailable',
-      status: 413,
-    });
+    throw Object.assign(new Error('Prior accepted Main history cannot be carried intact.'),
+      { code: 'source_context_unavailable', status: 413 });
   return context;
+}
+
+
+type MainCompactionIdleResult = {
+  status: string;
+  continuationPending?: boolean;
+  reason?: string;
+  canReduceSource?: boolean;
+  sourceDigest?: string;
+  sourceBytes?: number;
+  domainEpochKey?: string;
+  nextSourceTargetBytes?: number;
+};
+
+type MainCompactionPreviousSourceClaim = {
+  sourceDigest: string;
+  sourceBytes: number;
+  domainEpochKey: string;
+  nextSourceTargetBytes: number;
+};
+
+/** Continue reviewed progress or a proven smaller source; never extend the finite batch. */
+export async function runMainCompactionIdleBatch<Result extends MainCompactionIdleResult>(input: {
+  run: (deadlineAt: string, previousSourceClaim?: MainCompactionPreviousSourceClaim) => Promise<Result>;
+  shouldYield: () => boolean;
+  now?: () => number;
+  yieldIdle?: () => Promise<void>;
+  deadlineAt?: string;
+}): Promise<Result | MainCompactionIdleResult> {
+  const now = input.now || Date.now;
+  const inheritedDeadline = input.deadlineAt ? new Date(input.deadlineAt).getTime() : Infinity;
+  const deadline = Math.min(now() + 20 * 60 * 1000,
+    Number.isFinite(inheritedDeadline) ? inheritedDeadline : Infinity);
+  const yieldIdle = input.yieldIdle || (() => new Promise<void>(resolve => setImmediate(resolve)));
+  let result: Result | MainCompactionIdleResult = { status: 'deferred', reason: 'interactive_priority' };
+  let previousSourceClaim: MainCompactionPreviousSourceClaim | undefined;
+  for (let claims = 0; claims < 4; claims++) {
+    if (input.shouldYield()) return result;
+    if (now() >= deadline) return { ...result, reason: 'idle_budget_exhausted' };
+    const next = previousSourceClaim
+      ? await input.run(new Date(deadline).toISOString(), previousSourceClaim)
+      : await input.run(new Date(deadline).toISOString());
+    if (next.status === 'degraded' && next.reason === 'compaction_enclosing_deadline' &&
+        result.status === 'compacted' && result.continuationPending === true)
+      return { ...result, reason: 'idle_budget_exhausted' };
+    result = next;
+    if (next.status === 'degraded' && ['schema_invalid', 'source_packet_budget'].includes(String(next.reason)) && next.canReduceSource === true &&
+        typeof next.sourceDigest === 'string' && next.sourceDigest &&
+        typeof next.domainEpochKey === 'string' && next.domainEpochKey &&
+        Number.isSafeInteger(next.sourceBytes) && Number(next.sourceBytes) > 0 &&
+        Number.isSafeInteger(next.nextSourceTargetBytes) && Number(next.nextSourceTargetBytes) > 0 &&
+        Number(next.nextSourceTargetBytes) < Number(next.sourceBytes) &&
+        (!previousSourceClaim || (next.domainEpochKey === previousSourceClaim.domainEpochKey &&
+          next.sourceDigest !== previousSourceClaim.sourceDigest &&
+          Number(next.sourceBytes) < previousSourceClaim.sourceBytes &&
+          Number(next.nextSourceTargetBytes) < previousSourceClaim.nextSourceTargetBytes))) {
+      previousSourceClaim = { sourceDigest: next.sourceDigest, sourceBytes: Number(next.sourceBytes),
+        domainEpochKey: next.domainEpochKey, nextSourceTargetBytes: Number(next.nextSourceTargetBytes) };
+      await yieldIdle();
+      continue;
+    }
+    previousSourceClaim = undefined;
+    if (result.status !== 'compacted' || result.continuationPending !== true) return result;
+    await yieldIdle();
+  }
+  return { ...result, reason: 'idle_budget_exhausted' };
 }

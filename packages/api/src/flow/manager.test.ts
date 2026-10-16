@@ -1052,3 +1052,187 @@ describe('FlowStateManager', () => {
     });
   });
 });
+
+/* === VIVENTIUM START === Retained flow checks must not wait for a timer tick. === */
+describe('FlowStateManager immediate retained-state observation', () => {
+  const flowId = 'synthetic-retained-flow';
+  const type = 'mcp_get_tokens';
+  const key = `${type}:${flowId}`;
+  let store: MockKeyv;
+  let manager: FlowStateManager<string>;
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    store = new MockKeyv();
+    manager = new FlowStateManager(store as unknown as Keyv, { ttl: 6000, ci: true });
+  });
+
+  afterEach(() => {
+    expect(jest.getTimerCount()).toBe(0);
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  it.each(['synthetic-result', ''])(
+    'returns an already completed result without advancing time: %s',
+    async (result) => {
+      await store.set(key, {
+        type,
+        status: 'COMPLETED',
+        metadata: {},
+        createdAt: Date.now(),
+        result,
+      });
+      const handler = jest.fn();
+      await expect(manager.createFlowWithHandler(flowId, type, handler)).resolves.toBe(result);
+      expect(handler).not.toHaveBeenCalled();
+    },
+  );
+
+  it('returns an already completed null result without advancing time', async () => {
+    const nullStore = new MockKeyv<null>();
+    const nullManager = new FlowStateManager<null>(nullStore as unknown as Keyv, {
+      ttl: 6000,
+      ci: true,
+    });
+    await nullStore.set(key, {
+      type,
+      status: 'COMPLETED',
+      metadata: {},
+      createdAt: Date.now(),
+      result: null,
+    });
+    const handler = jest.fn();
+    await expect(nullManager.createFlowWithHandler(flowId, type, handler)).resolves.toBeNull();
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('rejects and removes an invalid terminal flow without leaving a waiter', async () => {
+    await store.set(key, { type, status: 'COMPLETED', metadata: {}, createdAt: Date.now() });
+    await expect(manager.createFlowWithHandler(flowId, type, jest.fn())).rejects.toThrow(
+      'invalid terminal state',
+    );
+    expect(await store.get(key)).toBeUndefined();
+  });
+
+  it.each(['COMPLETED', 'PENDING'] as const)(
+    'serves two retained waiters consistently: %s',
+    async (status) => {
+      await store.set(key, {
+        type,
+        status,
+        metadata: {},
+        createdAt: Date.now(),
+        ...(status === 'COMPLETED' ? { result: 'synthetic-result' } : {}),
+      });
+      const handler = jest.fn();
+      const results = Promise.all([
+        manager.createFlowWithHandler(flowId, type, handler),
+        manager.createFlowWithHandler(flowId, type, handler),
+      ]);
+      await jest.advanceTimersByTimeAsync(0);
+      if (status === 'PENDING') {
+        await manager.completeFlow(flowId, type, 'synthetic-result');
+        await jest.advanceTimersByTimeAsync(2000);
+      }
+      await expect(results).resolves.toEqual(['synthetic-result', 'synthetic-result']);
+      expect(handler).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects an already aborted retained lookup before exposing its result', async () => {
+    await store.set(key, {
+      type,
+      status: 'COMPLETED',
+      metadata: {},
+      createdAt: Date.now(),
+      result: 'synthetic-result',
+    });
+    const controller = new AbortController();
+    controller.abort();
+    const handler = jest.fn();
+    await expect(
+      manager.createFlowWithHandler(flowId, type, handler, controller.signal),
+    ).rejects.toThrow('flow aborted');
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('rejects and deletes an already failed flow without advancing time', async () => {
+    await store.set(key, {
+      type,
+      status: 'FAILED',
+      metadata: {},
+      createdAt: Date.now(),
+      error: 'Synthetic failure',
+    });
+    await expect(manager.createFlowWithHandler(flowId, type, jest.fn())).rejects.toThrow(
+      'Synthetic failure',
+    );
+    expect(await store.get(key)).toBeUndefined();
+  });
+
+  it('keeps the existing polling cadence for a pending flow', async () => {
+    await manager.initFlow(flowId, type);
+    let settled = false;
+    const result = manager.createFlowWithHandler(flowId, type, jest.fn()).then((value) => {
+      settled = true;
+      return value;
+    });
+    await jest.advanceTimersByTimeAsync(0);
+    await manager.completeFlow(flowId, type, 'synthetic-result');
+    await jest.advanceTimersByTimeAsync(1999);
+    expect(settled).toBe(false);
+    await jest.advanceTimersByTimeAsync(1);
+    await expect(result).resolves.toBe('synthetic-result');
+  });
+
+  it('cancels a pending flow immediately and removes its polling timer', async () => {
+    await manager.initFlow(flowId, type);
+    const controller = new AbortController();
+    const result = manager.createFlowWithHandler(flowId, type, jest.fn(), controller.signal);
+    const rejected = expect(result).rejects.toThrow('flow aborted');
+    await jest.advanceTimersByTimeAsync(0);
+    controller.abort();
+    await rejected;
+    expect(await store.get(key)).toBeUndefined();
+  });
+
+  it('does not advance the pending TTL during its immediate observation', async () => {
+    await manager.initFlow(flowId, type);
+    const result = manager.createFlowWithHandler(flowId, type, jest.fn());
+    const rejected = expect(result).rejects.toThrow('flow timed out');
+    await jest.advanceTimersByTimeAsync(5999);
+    expect(jest.getTimerCount()).toBe(1);
+    await jest.advanceTimersByTimeAsync(1);
+    await rejected;
+  });
+
+  it('does not resolve a delayed completed-state read after abort', async () => {
+    const state: FlowState<string> = {
+      type,
+      status: 'COMPLETED',
+      metadata: {},
+      createdAt: Date.now(),
+      result: 'synthetic-result',
+    };
+    await store.set(key, state);
+    let finishRead: (value: FlowState<string>) => void = () => {};
+    jest
+      .spyOn(store, 'get')
+      .mockResolvedValueOnce(state)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishRead = resolve;
+          }),
+      );
+    const controller = new AbortController();
+    const result = manager.createFlowWithHandler(flowId, type, jest.fn(), controller.signal);
+    const rejected = expect(result).rejects.toThrow('flow aborted');
+    await jest.advanceTimersByTimeAsync(0);
+    controller.abort();
+    finishRead(state);
+    await rejected;
+  });
+});
+/* === VIVENTIUM END === */

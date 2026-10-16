@@ -10,8 +10,13 @@ import {
   withMainContinuityCallbacks,
   prepareMainCompactionCandidate,
   inspectMainCompactionCandidate,
+  normalizeMainCompactionSizeRepair,
+  canContinueMainCompactionRepair,
+  compatibleMainCompactionSizeContract,
+  compareMainCompactionToolIdentities,
   mainCompactionOutputConstraints,
   mainCompactionCandidateDigest,
+  mainCompactionRenderedBytes,
   mainCompactionOutputContractDigest,
   createMainCompactionOutputContract,
   inspectMainCompactionCarrier,
@@ -21,6 +26,8 @@ import {
   acceptedMainCompactionOutputContract,
   canDeferAcceptedMainCompaction,
   renderMainBackgroundInputs,
+  renderAcceptedMainContextForCarrier,
+  MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER,
 } from './mainContinuity';
 import type { AcceptedMainTurn, MainContinuityState } from './mainContinuity';
 import { isContextOnlyMainHistory } from './mainContext';
@@ -110,6 +117,29 @@ describe('accepted Main background source', () => {
       );
     },
   );
+  test.each([0, -1])('late background append obeys the exact pinned byte allocation (offset %i)', async offset => {
+    const base = 'Pinned current context.';
+    const full = `${base}\n\n${renderMainBackgroundInputs([input])}`;
+    const capacity = Buffer.byteLength(full) + offset;
+    const transport = jest.fn(async () => new Response('{}'));
+    const wrapped = createMainContinuityFetch(transport, undefined, {}, async () => [input]);
+    const body = JSON.stringify({ messages: [{ role: 'user', content: 'Current request.' }] });
+    const operation = wrapped('https://native.invalid/v1/chat/completions', {
+      method: 'POST', body, headers: {
+        'X-GlassHive-Turn-Context-B64': Buffer.from(base).toString('base64'),
+        [MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER]: String(capacity),
+      },
+    });
+    if (offset < 0) {
+      await expect(operation).rejects.toMatchObject({ status: 413, code: 'source_context_unavailable' });
+      expect(transport).not.toHaveBeenCalled();
+    } else {
+      await operation;
+      const sent = transport.mock.calls[0][1] as RequestInit;
+      expect(JSON.parse(String(sent.body)).metadata.turn_context).toBe(full);
+      expect(new Headers(sent.headers).has(MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER)).toBe(false);
+    }
+  });
   test('the normal accepted capsule retains exact input as historical data without changing user or tool source', () => {
     const capsule = buildAcceptedMainContextCapsule({ turns: [turn] });
     expect(capsule).toContain('<accepted_background_inputs>');
@@ -569,21 +599,13 @@ function fixture(sourceRecords?: Map<string, Record<string, unknown>>) {
       },
       async renewCompactionLease(key, version, lease, expiresAt) {
         const current = states.get(key);
-        if (
-          !current ||
-          current.version !== version ||
-          current.compactionLease?.leaseId !== lease.leaseId ||
-          current.compactionLease.sourceDigest !== lease.sourceDigest ||
-          new Date(current.compactionLease.expiresAt).getTime() !==
-            new Date(lease.expiresAt).getTime() ||
-          new Date(lease.expiresAt).getTime() <= Date.now()
-        )
-          return false;
-        states.set(key, {
-          ...current,
-          version: version + 1,
-          compactionLease: { ...lease, expiresAt },
-        });
+        if (!current || current.version !== version ||
+            current.compactionLease?.leaseId !== lease.leaseId ||
+            current.compactionLease.sourceDigest !== lease.sourceDigest ||
+            new Date(current.compactionLease.expiresAt).getTime() !== new Date(lease.expiresAt).getTime() ||
+            new Date(lease.expiresAt).getTime() <= Date.now()) return false;
+        states.set(key, { ...current, version: version + 1,
+          compactionLease: { ...lease, expiresAt } });
         return true;
       },
       async compareAndSwap(key, version, state) {
@@ -754,21 +776,17 @@ describe('model-owned reference materiality and structural feedback', () => {
 });
 
 function reviewFor(claim: Record<string, unknown>, candidate: typeof inverse) {
-  const prepared = prepareMainCompactionCandidate(
-    candidate,
-    {
-      previousSemanticCompaction: null,
-      sourceTurns: claim.sourceTurns as AcceptedMainTurn[],
-    },
-    claim.outputContract,
-  );
+  const prepared = prepareMainCompactionCandidate(candidate, {
+    previousSemanticCompaction: null,
+    sourceTurns: claim.sourceTurns as AcceptedMainTurn[],
+  }, claim.outputContract);
   if (!prepared) throw new Error('invalid test candidate');
   return {
     version: 1,
     approved: true,
     sourceDigest: claim.sourceDigest,
     outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
-    candidateDigest: mainCompactionCandidateDigest(prepared),
+          candidateDigest: mainCompactionCandidateDigest(prepared),
   };
 }
 
@@ -808,6 +826,20 @@ test.each(['candidate', 'source'])(
   },
 );
 
+test('fenced completion rejects invented typed identities even with an approved candidate digest', async () => {
+  const { service, identity, seed } = fixture();
+  const claim = await seed();
+  const candidate = { ...faithful, toolPairs: [{ callId: 'call_invented', toolName: 'read_record', outcome: 'Claimed value.' }] };
+  const result = await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+    semanticCompaction: candidate, semanticReview: { version: 1, approved: true,
+      sourceDigest: claim.sourceDigest, candidateDigest: mainCompactionCandidateDigest(candidate),
+      outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract) } });
+  expect(result).toMatchObject({ status: 'invalid_summary', reason: 'schema_invalid' });
+  const retained = await service.loadAcceptedMainContext(identity);
+  expect(retained.semanticCompaction).toBeNull();
+  expect(retained.pendingCompactionTurns.length).toBeGreaterThan(0);
+});
+
 test('rejects an oversized summary instead of truncating away its final restriction', async () => {
   const { service, identity, seed } = fixture();
   const claim = await seed();
@@ -823,9 +855,8 @@ test('rejects an oversized summary instead of truncating away its final restrict
 
 test('never byte-slices a reviewed summary into a different delivered meaning', () => {
   const summary = '"'.repeat(2000) + 'Written approval is still required.';
-  expect(() =>
-    buildAcceptedMainContextCapsule({ semanticCompaction: { ...faithful, summary } }),
-  ).toThrow('context budget');
+  expect(() => buildAcceptedMainContextCapsule({ semanticCompaction: { ...faithful, summary } }))
+    .toThrow('context budget');
 });
 
 describe('automatic compaction pressure', () => {
@@ -918,10 +949,7 @@ describe('automatic compaction pressure', () => {
     for (let index = 0; index < 10; index += 1) {
       await service.commitAcceptedMainTurn({
         ...identity,
-        ...turn(
-          index,
-          index < 7 ? `Request ${index}: ${'x'.repeat(14 * 1024)}` : `Recent request ${index}.`,
-        ),
+        ...turn(index, index < 7 ? `Request ${index}: ${'x'.repeat(14 * 1024)}` : `Recent request ${index}.`),
       });
     }
     const first = await service.claimAcceptedMainCompaction(identity);
@@ -1042,7 +1070,7 @@ test('keeps source if an approved candidate cannot fit whole in the delivered co
       approved: true,
       sourceDigest: claim.sourceDigest,
       outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
-      candidateDigest: mainCompactionCandidateDigest(candidate),
+          candidateDigest: mainCompactionCandidateDigest(candidate),
     },
   });
   expect(result).toMatchObject({ status: 'invalid_summary', reason: 'context_budget' });
@@ -1073,7 +1101,7 @@ test('a changed source timestamp invalidates the review just like changed source
       approved: true,
       sourceDigest: claim.sourceDigest,
       outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
-      candidateDigest: mainCompactionCandidateDigest(candidate),
+          candidateDigest: mainCompactionCandidateDigest(candidate),
     },
   });
   expect(result.status).toBe('stale_source');
@@ -1095,10 +1123,7 @@ describe('original accepted source retention', () => {
     const loaded = await service.loadAcceptedMainContext(identity);
     expect((loaded.turns as AcceptedMainTurn[])[0]).toMatchObject({ userText, assistantText });
     expect(loaded).toMatchObject({ status: 'context_budget', capsule: '' });
-    expect((loaded.sourceTurns as AcceptedMainTurn[])[0]).toMatchObject({
-      userText,
-      assistantText,
-    });
+    expect((loaded.sourceTurns as AcceptedMainTurn[])[0]).toMatchObject({ userText, assistantText });
   });
 
   test('keeps over 64 pending turns through outage and claims only a whole oldest-first batch', async () => {
@@ -1135,7 +1160,7 @@ describe('original accepted source retention', () => {
         approved: true,
         sourceDigest: claim.sourceDigest,
         outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
-        candidateDigest: mainCompactionCandidateDigest(candidate),
+          candidateDigest: mainCompactionCandidateDigest(candidate),
       },
     });
     const next = Array.from(states.values())[0];
@@ -1288,32 +1313,20 @@ describe('accepted source message delivery', () => {
   });
 
   test('selected current input excludes its prior sibling answer during accepted-source hydration', () => {
-    const current = {
-      messageId: source.userMessageId,
-      role: 'user',
-      content: 'Retry the original task.',
-    };
-    const earlier = { ...source, userMessageId: 'older-user', assistantMessageId: 'older-answer' };
+    const current = {messageId: source.userMessageId, role: 'user', content: 'Retry the original task.'};
+    const earlier = {...source, userMessageId: 'older-user', assistantMessageId: 'older-answer'};
     const result = projectAcceptedMainMessages([current], [earlier, source]);
     expect(result.messages.map((message) => message.messageId)).toEqual([
-      'older-user',
-      'older-answer',
-      source.userMessageId,
+      'older-user', 'older-answer', source.userMessageId,
     ]);
     expect(result.messages.at(-1)).toBe(current);
     expect(result.sourceMessageIds).toEqual(['older-user', 'older-answer']);
     const headers = buildMainContinuityHeaders({
-      context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
-      messages: result.messages,
-      sourceMessageIds: result.sourceMessageIds,
-      logicalTurnId: 'retry',
+      context: {ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64)},
+      messages: result.messages, sourceMessageIds: result.sourceMessageIds, logicalTurnId: 'retry',
     });
-    expect(() =>
-      assertMainContinuityCarrier(
-        result.messages,
-        headers['X-Viventium-Visible-Message-Chain-B64'],
-      ),
-    ).not.toThrow();
+    expect(() => assertMainContinuityCarrier(result.messages,
+      headers['X-Viventium-Visible-Message-Chain-B64'])).not.toThrow();
   });
 
   test('small runtime capsule refers to whole message sources without duplicating them', () => {
@@ -1375,70 +1388,38 @@ describe('accepted source message delivery', () => {
   ])('keeps the Core authored-text source hash through $type serialization', (media) => {
     const caption = 'Describe the source and keep its caption.';
     const message = {
-      messageId: 'retained-media',
-      role: 'user',
+      messageId: 'retained-media', role: 'user',
       content: [{ type: 'text', text: caption }, media],
     };
     // Core's original source has authored prose beside owner-scoped media, not an invented label.
-    const original = Buffer.from(
-      JSON.stringify([
-        {
-          id: message.messageId,
-          role: 'user',
-          accepted_source: true,
-          sha256: createHash('sha256').update(caption).digest('hex'),
-        },
-      ]),
-    ).toString('base64');
+    const original = Buffer.from(JSON.stringify([{
+      id: message.messageId, role: 'user', accepted_source: true,
+      sha256: createHash('sha256').update(caption).digest('hex'),
+    }])).toString('base64');
     expect(() => assertMainContinuityCarrier([message], original)).not.toThrow();
-    expect(() =>
-      assertMainContinuityCarrier(
-        [{ ...message, content: [{ type: 'text', text: 'Changed caption.' }, media] }],
-        original,
-      ),
-    ).toThrow('removed or changed');
+    expect(() => assertMainContinuityCarrier([{ ...message,
+      content: [{ type: 'text', text: 'Changed caption.' }, media],
+    }], original)).toThrow('removed or changed');
     expect(() => assertMainContinuityCarrier([], original)).toThrow('removed or changed');
 
     const bound = buildMainContinuityHeaders({
       context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
-      messages: [message],
-      sourceMessageIds: [message.messageId],
-      logicalTurnId: 'turn',
+      messages: [message], sourceMessageIds: [message.messageId], logicalTurnId: 'turn',
     })['X-Viventium-Visible-Message-Chain-B64'];
     expect(() => assertMainContinuityCarrier([message], bound, true)).not.toThrow();
-    expect(() =>
-      assertMainContinuityCarrier(
-        [
-          {
-            ...message,
-            content: [
-              { type: 'text', text: caption },
-              { ...media, changed: true },
-            ],
-          },
-        ],
-        bound,
-        true,
-      ),
-    ).toThrow('removed or changed');
+    expect(() => assertMainContinuityCarrier([{ ...message,
+      content: [{ type: 'text', text: caption }, { ...media, changed: true }],
+    }], bound, true)).toThrow('removed or changed');
   });
 
   test.each(['Original prose.', { type: 'output_text', output_text: 'Original prose.' }])(
-    'keeps supported authored prose shapes through the serialized text guard',
-    (part) => {
-      const original = Buffer.from(
-        JSON.stringify([
-          {
-            id: 'source',
-            role: 'user',
-            accepted_source: true,
-            sha256: createHash('sha256').update('Original prose.').digest('hex'),
-          },
-        ]),
-      ).toString('base64');
-      expect(() =>
-        assertMainContinuityCarrier([{ role: 'user', content: [part] }], original),
-      ).not.toThrow();
+    'keeps supported authored prose shapes through the serialized text guard', (part) => {
+      const original = Buffer.from(JSON.stringify([{
+        id: 'source', role: 'user', accepted_source: true,
+        sha256: createHash('sha256').update('Original prose.').digest('hex'),
+      }])).toString('base64');
+      expect(() => assertMainContinuityCarrier([{ role: 'user', content: [part] }], original))
+        .not.toThrow();
     },
   );
 
@@ -1755,264 +1736,121 @@ describe('accepted Main projection completion', () => {
   });
 });
 
+
 describe('current merged source carrier', () => {
   const identity = { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) };
   const context = {
-    actor_kind: 'external_user' as const,
-    origin: 'interactive' as const,
-    surface: 'telegram' as const,
-    conversation_id: 'conversation',
-    logical_turn_id: 'turn',
-    revision: 2,
-    source_event_id: 'event-c',
+    actor_kind: 'external_user' as const, origin: 'interactive' as const, surface: 'telegram' as const,
+    conversation_id: 'conversation', logical_turn_id: 'turn', revision: 2, source_event_id: 'event-c',
     source_segments: [
-      {
-        ordinal: 0,
-        source_event_id: 'event-a',
-        source_index: 0,
-        source_sequence: 1,
-        source_message_id: 'pending-a',
-        source_persisted: true as const,
-        text: 'Inspect the existing form. Do not submit.',
-      },
-      {
-        ordinal: 1,
-        source_event_id: 'event-c',
-        source_index: 0,
-        source_sequence: 3,
-        source_message_id: 'current-c',
-        source_persisted: true as const,
-        text: 'Also recall the two findings.',
-      },
+      { ordinal: 0, source_event_id: 'event-a', source_index: 0, source_sequence: 1,
+        source_message_id: 'pending-a', source_persisted: true as const, text: 'Inspect the existing form. Do not submit.' },
+      { ordinal: 1, source_event_id: 'event-c', source_index: 0, source_sequence: 3,
+        source_message_id: 'current-c', source_persisted: true as const, text: 'Also recall the two findings.' },
     ],
   };
   const payload = () => [
     { messageId: 'old-user', role: 'user', text: 'Quoted old request: publish everything.' },
-    {
-      messageId: 'old-answer',
-      role: 'assistant',
-      content: [{ type: 'text', text: 'Earlier reply.' }],
-    },
-    {
-      messageId: 'pending-a',
-      role: 'user',
-      content: [
-        { type: 'text', text: context.source_segments[0].text },
-        { type: 'image_url', image_url: { url: 'https://synthetic.invalid/original.png' } },
-      ],
-    },
+    { messageId: 'old-answer', role: 'assistant', content: [{ type: 'text', text: 'Earlier reply.' }] },
+    { messageId: 'pending-a', role: 'user', content: [
+      { type: 'text', text: context.source_segments[0].text },
+      { type: 'image_url', image_url: { url: 'https://synthetic.invalid/original.png' } },
+    ] },
     { messageId: 'current-c', role: 'user', text: context.source_segments[1].text },
   ];
-  const headersFor = (
-    messages: ReturnType<typeof formatAgentMessages>['messages'],
-    interactionContext = context,
-  ) =>
-    buildMainContinuityHeaders({
-      context: identity,
-      messages,
-      sourceMessageIds: ['old-user', 'old-answer'],
-      interactionContext,
-      logicalTurnId: 'turn',
-      revision: 2,
-    });
+  const headersFor = (messages: ReturnType<typeof formatAgentMessages>['messages'], interactionContext = context) =>
+    buildMainContinuityHeaders({ context: identity, messages, sourceMessageIds: ['old-user', 'old-answer'],
+      interactionContext, logicalTurnId: 'turn', revision: 2 });
 
   test('retains each segment ordinal when several segments share one source message', () => {
     const messages = formatAgentMessages(payload()).messages;
-    const duplicate = {
-      ...context,
-      source_segments: [
-        context.source_segments[0],
-        { ...context.source_segments[0], ordinal: 1, source_index: 1 },
-        { ...context.source_segments[1], ordinal: 2 },
-      ],
-    };
+    const duplicate = { ...context, source_segments: [context.source_segments[0],
+      { ...context.source_segments[0], ordinal: 1, source_index: 1 },
+      { ...context.source_segments[1], ordinal: 2 }] };
     const before = messages.map((message) => message.toDict());
     const headers = headersFor(messages, duplicate);
-    const chain = JSON.parse(
-      Buffer.from(headers['X-Viventium-Visible-Message-Chain-B64'], 'base64').toString(),
-    );
-    expect(
-      chain
-        .filter((item: { current_input?: boolean }) => item.current_input)
-        .map((item: { id: string; source_ordinals: number[] }) => [item.id, item.source_ordinals]),
-    ).toEqual([
-      ['pending-a', [1, 2]],
-      ['current-c', [3]],
-    ]);
+    const chain = JSON.parse(Buffer.from(headers['X-Viventium-Visible-Message-Chain-B64'], 'base64').toString());
+    expect(chain.filter((item: { current_input?: boolean }) => item.current_input)
+      .map((item: { id: string; source_ordinals: number[] }) => [item.id, item.source_ordinals]))
+      .toEqual([['pending-a', [1, 2]], ['current-c', [3]]]);
     expect(messages.map((message) => message.toDict())).toEqual(before);
   });
 
-  test.each([false, true])(
-    'keeps both original sources through actual SDK dispatch (native=%s)',
-    async (native) => {
-      const messages = formatAgentMessages(payload()).messages;
-      const before = messages.map((message) => message.toDict());
-      const headers = headersFor(messages);
-      const chainKey = 'X-Viventium-Visible-Message-Chain-B64';
-      const chain = JSON.parse(Buffer.from(headers[chainKey], 'base64').toString());
-      expect(
-        chain
-          .filter((item: { current_input?: boolean }) => item.current_input)
-          .map((item: { id: string }) => item.id),
-      ).toEqual(['pending-a', 'current-c']);
-      expect(
-        chain.filter((item: { accepted_source: boolean }) => item.accepted_source),
-      ).toHaveLength(4);
-      expect(
-        chain
-          .filter((item: { current_input?: boolean }) => item.current_input)
-          .map((item: { source_ordinals: number[] }) => item.source_ordinals),
-      ).toEqual([[1], [2]]);
-      const transport = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-        const body = JSON.parse(String(init?.body));
-        expect(body.messages).toHaveLength(4);
-        expect(body.messages[2].content).toEqual(messages[2].content);
-        expect(body.messages[3].content).toEqual(context.source_segments[1].text);
-        if (native)
-          expect(
-            body.metadata.visible_message_chain
-              .filter((item: { current_input?: boolean }) => item.current_input)
-              .map((item: { id: string }) => item.id),
-          ).toEqual(['pending-a', 'current-c']);
-        if (native)
-          expect(
-            body.metadata.visible_message_chain
-              .filter((item: { current_input?: boolean }) => item.current_input)
-              .map((item: { source_ordinals: number[] }) => item.source_ordinals),
-          ).toEqual([[1], [2]]);
-        return new Response(
-          JSON.stringify({
-            id: 'synthetic',
-            object: 'chat.completion',
-            model: 'synthetic',
-            choices: [
-              { index: 0, message: { role: 'assistant', content: 'Kept.' }, finish_reason: 'stop' },
-            ],
-          }),
-          { headers: { 'content-type': 'application/json' } },
-        );
-      });
-      const model = new ChatOpenAI({
-        model: 'synthetic',
-        apiKey: 'synthetic',
-        maxRetries: 0,
-        callbacks: withMainContinuityCallbacks(undefined, headers[chainKey], native),
-        configuration: {
-          baseURL: 'https://provider.invalid/v1',
-          fetch: native ? createMainContinuityFetch(transport, headers[chainKey]) : transport,
-        },
-      });
-      await model.invoke(messages);
-      expect(transport).toHaveBeenCalledTimes(1);
-      expect(messages.map((message) => message.toDict())).toEqual(before);
-      for (const changed of [
-        messages.slice(1),
-        messages.filter((message) => message.id !== 'pending-a'),
-        [messages[0], messages[1], messages[3], messages[2]],
-        [
-          messages[0],
-          messages[1],
-          new HumanMessage({ id: 'pending-a', content: 'Changed request.' }),
-          messages[3],
-        ],
-      ]) {
-        await expect(model.invoke(changed)).rejects.toThrow(
-          'A protected original source was removed or changed',
-        );
-      }
-      expect(transport).toHaveBeenCalledTimes(1);
-    },
-  );
+  test.each([false, true])('keeps both original sources through actual SDK dispatch (native=%s)', async (native) => {
+    const messages = formatAgentMessages(payload()).messages;
+    const before = messages.map((message) => message.toDict());
+    const headers = headersFor(messages);
+    const chainKey = 'X-Viventium-Visible-Message-Chain-B64';
+    const chain = JSON.parse(Buffer.from(headers[chainKey], 'base64').toString());
+    expect(chain.filter((item: { current_input?: boolean }) => item.current_input).map((item: { id: string }) => item.id))
+      .toEqual(['pending-a', 'current-c']);
+    expect(chain.filter((item: { accepted_source: boolean }) => item.accepted_source)).toHaveLength(4);
+    expect(chain.filter((item: { current_input?: boolean }) => item.current_input)
+      .map((item: { source_ordinals: number[] }) => item.source_ordinals)).toEqual([[1], [2]]);
+    const transport = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.messages).toHaveLength(4);
+      expect(body.messages[2].content).toEqual(messages[2].content);
+      expect(body.messages[3].content).toEqual(context.source_segments[1].text);
+      if (native) expect(body.metadata.visible_message_chain.filter((item: { current_input?: boolean }) => item.current_input)
+        .map((item: { id: string }) => item.id)).toEqual(['pending-a', 'current-c']);
+      if (native) expect(body.metadata.visible_message_chain.filter((item: { current_input?: boolean }) => item.current_input)
+        .map((item: { source_ordinals: number[] }) => item.source_ordinals)).toEqual([[1], [2]]);
+      return new Response(JSON.stringify({ id: 'synthetic', object: 'chat.completion', model: 'synthetic',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'Kept.' }, finish_reason: 'stop' }] }),
+        { headers: { 'content-type': 'application/json' } });
+    });
+    const model = new ChatOpenAI({ model: 'synthetic', apiKey: 'synthetic', maxRetries: 0,
+      callbacks: withMainContinuityCallbacks(undefined, headers[chainKey], native),
+      configuration: { baseURL: 'https://provider.invalid/v1',
+        fetch: native ? createMainContinuityFetch(transport, headers[chainKey]) : transport } });
+    await model.invoke(messages);
+    expect(transport).toHaveBeenCalledTimes(1);
+    expect(messages.map((message) => message.toDict())).toEqual(before);
+    for (const changed of [messages.slice(1), messages.filter((message) => message.id !== 'pending-a'),
+      [messages[0], messages[1], messages[3], messages[2]],
+      [messages[0], messages[1], new HumanMessage({id: 'pending-a', content: 'Changed request.'}), messages[3]]]) {
+      await expect(model.invoke(changed)).rejects.toThrow('A protected original source was removed or changed');
+    }
+    expect(transport).toHaveBeenCalledTimes(1);
+  });
 
   test('rejects a stale logical revision and missing or non-user current source', () => {
     const messages = formatAgentMessages(payload()).messages;
-    expect(() => headersFor(messages, { ...context, revision: 1 })).toThrow(
-      'same accepted logical turn and revision',
-    );
-    expect(() => headersFor([messages[0], messages[1], messages[3], messages[2]])).toThrow(
-      'cannot carry every protected original source',
-    );
-    for (const id of ['absent', 'old-answer'])
-      expect(() =>
-        headersFor(messages, {
-          ...context,
-          source_segments: [{ ...context.source_segments[0], source_message_id: id }],
-        }),
-      ).toThrow('cannot carry every protected original source');
+    expect(() => headersFor(messages, { ...context, revision: 1 })).toThrow('same accepted logical turn and revision');
+    expect(() => headersFor([messages[0], messages[1], messages[3], messages[2]])).toThrow('cannot carry every protected original source');
+    for (const id of ['absent', 'old-answer']) expect(() => headersFor(messages,
+      { ...context, source_segments: [{ ...context.source_segments[0], source_message_id: id }] }))
+      .toThrow('cannot carry every protected original source');
   });
 });
 
+
 describe('stored message delivery provenance', () => {
   const message = (surface = 'telegram') => ({
-    user: 'owner',
-    messageId: 'answer',
-    conversationId: 'conversation',
-    parentMessageId: 'question',
-    isCreatedByUser: false,
-    text: 'Exact saved evidence.',
-    metadata: {
-      viventium: {
-        interactionContext: {
-          surface,
-          conversation_id: 'conversation',
-          logical_turn_id: 'turn',
-          revision: 2,
-        },
-        deliveryAcknowledgement: { state: 'committed', logical_turn_id: 'turn', revision: 2 },
-      },
-    },
+    user: 'owner', messageId: 'answer', conversationId: 'conversation', parentMessageId: 'question',
+    isCreatedByUser: false, text: 'Exact saved evidence.',
+    metadata: { viventium: { interactionContext: {
+      surface, conversation_id: 'conversation', logical_turn_id: 'turn', revision: 2,
+    }, deliveryAcknowledgement: { state: 'committed', logical_turn_id: 'turn', revision: 2 } } },
   });
-  test.each(['web', 'telegram', 'voice', 'workbench'])(
-    'keeps actual %s receipt and missing receipt distinct',
-    (surface) => {
-      const source = message(surface);
-      expect(mainMessageDelivery(source, 'owner')).toEqual({
-        version: 1,
-        surface,
-        acknowledgement: 'committed',
-      });
-      delete (source.metadata.viventium as Record<string, unknown>).deliveryAcknowledgement;
-      expect(mainMessageDelivery(source, 'owner')).toEqual({
-        version: 1,
-        surface,
-        acknowledgement: 'unconfirmed',
-      });
-    },
-  );
-  test.each(['committed_effect', 'partial_removed', 'failed'])(
-    'keeps typed %s outcome without assuming display',
-    (state) => {
-      const source = message();
-      source.metadata.viventium.deliveryAcknowledgement.state = state;
-      expect(mainMessageDelivery(source, 'owner')?.acknowledgement).toBe(state);
-    },
-  );
+  test.each(['web', 'telegram', 'voice', 'workbench'])('keeps actual %s receipt and missing receipt distinct', (surface) => {
+    const source = message(surface);
+    expect(mainMessageDelivery(source, 'owner')).toEqual({ version: 1, surface, acknowledgement: 'committed' });
+    delete (source.metadata.viventium as Record<string, unknown>).deliveryAcknowledgement;
+    expect(mainMessageDelivery(source, 'owner')).toEqual({ version: 1, surface, acknowledgement: 'unconfirmed' });
+  });
+  test.each(['committed_effect', 'partial_removed', 'failed'])('keeps typed %s outcome without assuming display', (state) => {
+    const source = message(); source.metadata.viventium.deliveryAcknowledgement.state = state;
+    expect(mainMessageDelivery(source, 'owner')?.acknowledgement).toBe(state);
+  });
   test('keeps legacy and cortex evidence with truthful unknown/unconfirmed delivery', () => {
-    const source = message();
-    (source as any).metadata = {};
-    expect(mainMessageDelivery(source, 'owner')).toEqual({
-      version: 1,
-      surface: 'unknown',
-      acknowledgement: 'unconfirmed',
-    });
-    (source as any).metadata = {
-      viventium: {
-        type: 'cortex_followup',
-        parentMessageId: 'question',
-        cortexFollowUpDecision: {
-          tag: 'CortexFollowupDecision',
-          schemaVersion: 1,
-          conversationId: 'conversation',
-          parentMessageId: 'question',
-          surface: 'telegram',
-        },
-      },
-    };
-    expect(mainMessageDelivery(source, 'owner')).toEqual({
-      version: 1,
-      surface: 'telegram',
-      acknowledgement: 'unconfirmed',
-    });
+    const source = message(); (source as any).metadata = {};
+    expect(mainMessageDelivery(source, 'owner')).toEqual({ version: 1, surface: 'unknown', acknowledgement: 'unconfirmed' });
+    (source as any).metadata = { viventium: { type: 'cortex_followup', parentMessageId: 'question',
+      cortexFollowUpDecision: { tag: 'CortexFollowupDecision', schemaVersion: 1,
+        conversationId: 'conversation', parentMessageId: 'question', surface: 'telegram' } } };
+    expect(mainMessageDelivery(source, 'owner')).toEqual({ version: 1, surface: 'telegram', acknowledgement: 'unconfirmed' });
     (source as any).metadata.viventium.cortexFollowUpDecision.conversationId = 'other-conversation';
     expect(mainMessageDelivery(source, 'owner')?.surface).toBe('unknown');
   });
@@ -2028,236 +1866,108 @@ describe('stored message delivery provenance', () => {
   });
   test('carries source delivery across real SDK formatting without changing message bodies', () => {
     const source = message();
-    const messages = formatAgentMessages([
-      { messageId: source.messageId, role: 'assistant', content: source.text },
-      { messageId: 'next-question', role: 'user', content: 'Inspect this saved evidence.' },
-    ]).messages;
-    const before = messages.map((value) => value.toDict());
-    const input = {
-      context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
-      messages,
-      sourceMessageIds: ['answer'],
-      logicalTurnId: 'next-turn',
-    };
+    const messages = formatAgentMessages([{ messageId: source.messageId, role: 'assistant', content: source.text },
+      { messageId: 'next-question', role: 'user', content: 'Inspect this saved evidence.' }]).messages;
+    const before = messages.map(value => value.toDict());
+    const input = { context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
+      messages, sourceMessageIds: ['answer'], logicalTurnId: 'next-turn' };
     const without = buildMainContinuityHeaders(input);
-    const withDelivery = buildMainContinuityHeaders({
-      ...input,
-      deliverySources: [
-        {
-          messageId: source.messageId,
-          delivery: { version: 1, surface: 'telegram', acknowledgement: 'committed' },
-        },
-      ],
-    });
-    const decode = (headers: Record<string, string>) =>
-      JSON.parse(
-        Buffer.from(headers['X-Viventium-Visible-Message-Chain-B64'], 'base64').toString(),
-      );
-    expect(decode(withDelivery)[0].delivery).toEqual({
-      version: 1,
-      surface: 'telegram',
-      acknowledgement: 'committed',
-    });
+    const withDelivery = buildMainContinuityHeaders({ ...input,
+      deliverySources: [{ messageId: source.messageId, delivery: { version: 1, surface: 'telegram', acknowledgement: 'committed' } }] });
+    const decode = (headers: Record<string, string>) => JSON.parse(Buffer.from(headers['X-Viventium-Visible-Message-Chain-B64'], 'base64').toString());
+    expect(decode(withDelivery)[0].delivery).toEqual({ version: 1, surface: 'telegram', acknowledgement: 'committed' });
     expect(decode(withDelivery)[0].sha256).toBe(decode(without)[0].sha256);
     expect(decode(withDelivery)[0].content_sha256).toBe(decode(without)[0].content_sha256);
-    expect(withDelivery['X-Viventium-Main-Context-Snapshot-SHA256']).not.toBe(
-      without['X-Viventium-Main-Context-Snapshot-SHA256'],
-    );
-    expect(messages.map((value) => value.toDict())).toEqual(before);
-    assertMainContinuityCarrier(
-      messages,
-      withDelivery['X-Viventium-Visible-Message-Chain-B64'],
-      true,
-    );
+    expect(withDelivery['X-Viventium-Main-Context-Snapshot-SHA256']).not.toBe(without['X-Viventium-Main-Context-Snapshot-SHA256']);
+    expect(messages.map(value => value.toDict())).toEqual(before);
+    assertMainContinuityCarrier(messages, withDelivery['X-Viventium-Visible-Message-Chain-B64'], true);
   });
-  test.each([false, true])(
-    'preserves delivery at actual SDK dispatch (stream=%s)',
-    async (streaming) => {
-      const sources = ['committed', 'unconfirmed', 'failed'].map((state, index) => {
-        const source = message(index === 1 ? 'web' : 'telegram');
-        source.messageId = `answer-${index}`;
-        if (state === 'unconfirmed')
-          delete (source.metadata.viventium as Record<string, unknown>).deliveryAcknowledgement;
-        else source.metadata.viventium.deliveryAcknowledgement.state = state;
-        return { ...source, delivery: mainMessageDelivery(source, 'owner') };
-      });
-      const original = [
-        ...sources.map((source) => new AIMessage({ id: source.messageId, content: source.text })),
-        new AIMessage({ id: 'unprotected', content: 'Original unprotected text.' }),
-        new HumanMessage({ id: 'current', content: 'Use the evidence.' }),
-      ];
-      const headers = buildMainContinuityHeaders({
-        context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
-        messages: original,
-        sourceMessageIds: sources.map((source) => source.messageId),
-        logicalTurnId: 'next-turn',
-        deliverySources: [...sources, { messageId: 'unprotected', delivery: sources[0].delivery }],
-      });
-      const key = 'X-Viventium-Visible-Message-Chain-B64';
-      const before = JSON.parse(Buffer.from(headers[key], 'base64').toString());
-      const messages = [
-        ...original.slice(0, 3),
-        new AIMessage({ id: 'unprotected', content: 'Changed unprotected text.' }),
-        new AIMessage({ id: 'other-id', content: sources[0].text }),
-        original[4],
-      ];
-      const contentBefore = messages.map((value) => value.toDict());
-      const baseFetch = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-        const body = JSON.parse(String(init?.body));
-        const chain = body.metadata.visible_message_chain;
-        expect(chain.slice(0, 3).map((item: { delivery: unknown }) => item.delivery)).toEqual(
-          sources.map((source) => source.delivery),
-        );
-        expect(
-          chain
-            .slice(0, 3)
-            .map((item: { sha256: string; content_sha256: string }) => [
-              item.sha256,
-              item.content_sha256,
-            ]),
-        ).toEqual(
-          before
-            .slice(0, 3)
-            .map((item: { sha256: string; content_sha256: string }) => [
-              item.sha256,
-              item.content_sha256,
-            ]),
-        );
-        expect(
-          chain.slice(3).every((item: { delivery?: unknown }) => item.delivery === undefined),
-        ).toBe(true);
-        expect(body.messages.map((value: { content: string }) => value.content)).toEqual(
-          messages.map((value) => value.content),
-        );
-        if (streaming)
-          return new Response(
-            'data: {"id":"synthetic","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Kept."},"finish_reason":null}]}\n\ndata: {"id":"synthetic","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
-            { headers: { 'content-type': 'text/event-stream' } },
-          );
-        return new Response(
-          JSON.stringify({
-            id: 'synthetic',
-            object: 'chat.completion',
-            model: 'synthetic',
-            choices: [
-              { index: 0, message: { role: 'assistant', content: 'Kept.' }, finish_reason: 'stop' },
-            ],
-          }),
-          { headers: { 'content-type': 'application/json' } },
-        );
-      });
-      const model = new ChatOpenAI({
-        model: 'synthetic',
-        apiKey: 'synthetic',
-        maxRetries: 0,
-        streaming,
-        callbacks: withMainContinuityCallbacks(undefined, headers[key], true),
-        configuration: {
-          baseURL: 'https://provider.invalid/v1',
-          fetch: createMainContinuityFetch(baseFetch, headers[key]),
-        },
-      });
-      if (streaming)
-        for await (const _chunk of await model.stream(messages)) {
-          /* consume */
-        }
-      else await model.invoke(messages);
-      expect(baseFetch).toHaveBeenCalledTimes(1);
-      expect(messages.map((value) => value.toDict())).toEqual(contentBefore);
-    },
-  );
+  test.each([false, true])('preserves delivery at actual SDK dispatch (stream=%s)', async (streaming) => {
+    const sources = ['committed', 'unconfirmed', 'failed'].map((state, index) => {
+      const source = message(index === 1 ? 'web' : 'telegram');
+      source.messageId = `answer-${index}`;
+      if (state === 'unconfirmed') delete (source.metadata.viventium as Record<string, unknown>).deliveryAcknowledgement;
+      else source.metadata.viventium.deliveryAcknowledgement.state = state;
+      return { ...source, delivery: mainMessageDelivery(source, 'owner') };
+    });
+    const original = [...sources.map((source) => new AIMessage({ id: source.messageId, content: source.text })),
+      new AIMessage({ id: 'unprotected', content: 'Original unprotected text.' }),
+      new HumanMessage({ id: 'current', content: 'Use the evidence.' })];
+    const headers = buildMainContinuityHeaders({
+      context: { ownerId: 'owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) },
+      messages: original, sourceMessageIds: sources.map((source) => source.messageId), logicalTurnId: 'next-turn',
+      deliverySources: [...sources, { messageId: 'unprotected', delivery: sources[0].delivery }],
+    });
+    const key = 'X-Viventium-Visible-Message-Chain-B64';
+    const before = JSON.parse(Buffer.from(headers[key], 'base64').toString());
+    const messages = [...original.slice(0, 3), new AIMessage({ id: 'unprotected', content: 'Changed unprotected text.' }),
+      new AIMessage({ id: 'other-id', content: sources[0].text }), original[4]];
+    const contentBefore = messages.map((value) => value.toDict());
+    const baseFetch = jest.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      const chain = body.metadata.visible_message_chain;
+      expect(chain.slice(0, 3).map((item: { delivery: unknown }) => item.delivery))
+        .toEqual(sources.map((source) => source.delivery));
+      expect(chain.slice(0, 3).map((item: { sha256: string; content_sha256: string }) => [item.sha256, item.content_sha256]))
+        .toEqual(before.slice(0, 3).map((item: { sha256: string; content_sha256: string }) => [item.sha256, item.content_sha256]));
+      expect(chain.slice(3).every((item: { delivery?: unknown }) => item.delivery === undefined)).toBe(true);
+      expect(body.messages.map((value: { content: string }) => value.content)).toEqual(messages.map((value) => value.content));
+      if (streaming) return new Response('data: {"id":"synthetic","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Kept."},"finish_reason":null}]}\n\ndata: {"id":"synthetic","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+      return new Response(JSON.stringify({ id: 'synthetic', object: 'chat.completion', model: 'synthetic',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'Kept.' }, finish_reason: 'stop' }] }),
+        { headers: { 'content-type': 'application/json' } });
+    });
+    const model = new ChatOpenAI({ model: 'synthetic', apiKey: 'synthetic', maxRetries: 0, streaming,
+      callbacks: withMainContinuityCallbacks(undefined, headers[key], true),
+      configuration: { baseURL: 'https://provider.invalid/v1', fetch: createMainContinuityFetch(baseFetch, headers[key]) } });
+    if (streaming) for await (const _chunk of await model.stream(messages)) { /* consume */ }
+    else await model.invoke(messages);
+    expect(baseFetch).toHaveBeenCalledTimes(1);
+    expect(messages.map((value) => value.toDict())).toEqual(contentBefore);
+  });
   test('hydrated accepted message injection preserves its current delivery data', () => {
     const delivery = mainMessageDelivery(message(), 'owner');
-    const turn: AcceptedMainTurn = {
-      logicalTurnId: 'turn',
-      revision: 2,
-      conversationId: 'conversation',
-      userMessageId: 'question',
-      assistantMessageId: 'answer',
-      origin: 'interactive',
-      userText: 'Question',
-      assistantText: 'Exact saved evidence.',
-      toolPairs: [],
-      committedAt: new Date(),
-      delivery,
-    };
-    const result = projectAcceptedMainMessages(
-      [{ messageId: 'next', role: 'user', content: 'Inspect it.' }],
-      [turn],
-    );
-    expect(result.messages.find((value) => value.messageId === 'answer')).toMatchObject({
-      content: turn.assistantText,
-      delivery,
-    });
+    const turn: AcceptedMainTurn = { logicalTurnId: 'turn', revision: 2, conversationId: 'conversation',
+      userMessageId: 'question', assistantMessageId: 'answer', origin: 'interactive', userText: 'Question',
+      assistantText: 'Exact saved evidence.', toolPairs: [], committedAt: new Date(), delivery };
+    const result = projectAcceptedMainMessages([{ messageId: 'next', role: 'user', content: 'Inspect it.' }], [turn]);
+    expect(result.messages.find(value => value.messageId === 'answer')).toMatchObject({ content: turn.assistantText, delivery });
   });
 });
+
 
 describe('carrier-owned compaction output', () => {
   test('actual full-text Main consumer recovers instead of silently losing a reviewed summary', async () => {
     const { service, identity, seed, accepted, states } = fixture();
     const claim = await seed();
     const candidate = { ...faithful, summary: 's'.repeat(3199) };
-    for (const [key, turn] of accepted)
-      if ((turn.acceptedPosition || 0) > 1)
-        accepted.set(key, {
-          ...turn,
-          userText: `user-${key} ` + 'u'.repeat(1600),
-          assistantText: `assistant-${key} ` + 'a'.repeat(1600),
-        });
+    for (const [key, turn] of accepted) if ((turn.acceptedPosition || 0) > 1)
+      accepted.set(key, { ...turn, userText: `user-${key} ` + 'u'.repeat(1600),
+        assistantText: `assistant-${key} ` + 'a'.repeat(1600) });
     const recent = [...accepted.values()].slice(-3);
     const contextContract = acceptedMainCompactionOutputContract(recent)!;
-    const promotion = await service.completeAcceptedMainCompaction({
-      ...identity,
-      ...claim,
-      semanticCompaction: candidate,
-      semanticReview: reviewFor(claim, candidate),
-    });
+    const promotion = await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: candidate, semanticReview: reviewFor(claim, candidate) });
 
     // An older retained allocation can be wider than the current full-source carrier.
     const cache = [...states.values()][0];
-    states.set(cache.domainEpochKey, {
-      ...cache,
-      semanticCompaction: candidate,
-      semanticCompactionContract: claim.outputContract,
-      summarizedThrough: 1,
-      compactionLease: null,
-    });
+    states.set(cache.domainEpochKey, { ...cache, semanticCompaction: candidate,
+      semanticCompactionContract: claim.outputContract, summarizedThrough: 1, compactionLease: null });
     const overflow = await service.loadAcceptedMainContext(identity);
-    expect(overflow).toMatchObject({
-      status: 'context_budget',
-      semanticCompaction: candidate,
-      capsule: '',
-      messageCapsule: '',
-    });
+    expect(overflow).toMatchObject({ status: 'context_budget', semanticCompaction: candidate,
+      capsule: '', messageCapsule: '' });
     expect(inspectMainCompactionCarrier(candidate, contextContract).ok).toBe(false);
     expect(promotion).toMatchObject({ status: 'invalid_summary', reason: 'context_budget' });
     expect(overflow.sourceTurns).toEqual(recent);
-    expect(
-      buildAcceptedMainContextCapsule({
-        sourceDelivery: 'messages',
-        acceptedTurns: recent,
-        semanticCompaction: candidate,
-        semanticCompactionContract: claim.outputContract,
-      }),
-    ).toContain(candidate.summary);
+    expect(buildAcceptedMainContextCapsule({ sourceDelivery: 'messages', acceptedTurns: recent,
+      semanticCompaction: candidate, semanticCompactionContract: claim.outputContract }))
+      .toContain(candidate.summary);
 
-    const recovery = await service.claimAcceptedMainCompaction({
-      ...identity,
-      reallocateOutputCarrier: true,
-    });
-    expect(recovery).toMatchObject({
-      status: 'claimed',
-      sourceTurns: [],
-      previousSemanticCompaction: candidate,
-    });
-    expect(
-      await service.completeAcceptedMainCompaction({
-        ...identity,
-        ...recovery,
-        semanticCompaction: faithful,
-        semanticReview: reviewFor(recovery, faithful),
-      }),
-    ).toMatchObject({ status: 'compacted' });
+    const recovery = await service.claimAcceptedMainCompaction({ ...identity, reallocateOutputCarrier: true });
+    expect(recovery).toMatchObject({ status: 'claimed', sourceTurns: [], previousSemanticCompaction: candidate });
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...recovery,
+      semanticCompaction: faithful, semanticReview: reviewFor(recovery, faithful) }))
+      .toMatchObject({ status: 'compacted' });
     const loaded = await service.loadAcceptedMainContext(identity);
     expect(loaded.status).toBe('available');
     expect(loaded.capsule).toContain(faithful.summary);
@@ -2273,21 +1983,12 @@ describe('carrier-owned compaction output', () => {
   test('ordinary recent growth keeps the reviewed summary whole inside the actual selected native carrier', async () => {
     const { service, identity, seed, accepted } = fixture();
     const claim = await seed();
-    const candidate = {
-      ...faithful,
-      summary: 's'.repeat(6135) + ' Keep written approval required.',
-    };
-    expect(
-      await service.completeAcceptedMainCompaction({
-        ...identity,
-        ...claim,
-        semanticCompaction: candidate,
-        semanticReview: reviewFor(claim, candidate),
-      }),
-    ).toMatchObject({ status: 'compacted' });
-    for (const [key, turn] of accepted)
-      if ((turn.acceptedPosition || 0) > 1)
-        accepted.set(key, { ...turn, userText: 'u'.repeat(2048), assistantText: 'a'.repeat(2048) });
+    const candidate = { ...faithful, summary: 's'.repeat(6135) + ' Keep written approval required.' };
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: candidate, semanticReview: reviewFor(claim, candidate) }))
+      .toMatchObject({ status: 'compacted' });
+    for (const [key, turn] of accepted) if ((turn.acceptedPosition || 0) > 1)
+      accepted.set(key, { ...turn, userText: 'u'.repeat(2048), assistantText: 'a'.repeat(2048) });
     const outputCarrier = { carrierMaxUtf8Bytes: 128 * 1024, reservedContextUtf8Bytes: 15000 };
     const loaded = await service.loadAcceptedMainContext({ ...identity, outputCarrier });
     expect(loaded.status).toBe('available');
@@ -2298,72 +1999,38 @@ describe('carrier-owned compaction output', () => {
       expect(loaded.capsule).toContain(turn.assistantText);
     }
     expect(Buffer.byteLength(String(loaded.capsule))).toBeGreaterThan(12 * 1024);
-    expect(
-      Buffer.byteLength(String(loaded.capsule)) + outputCarrier.reservedContextUtf8Bytes,
-    ).toBeLessThanOrEqual(outputCarrier.carrierMaxUtf8Bytes);
-    const foreground = await service.claimAcceptedMainCompaction({
-      ...identity,
-      outputCarrier,
-      reallocateOutputCarrier: true,
-    });
+    expect(Buffer.byteLength(String(loaded.capsule)) + outputCarrier.reservedContextUtf8Bytes)
+      .toBeLessThanOrEqual(outputCarrier.carrierMaxUtf8Bytes);
+    const foreground = await service.claimAcceptedMainCompaction({ ...identity, outputCarrier, reallocateOutputCarrier: true });
     expect(foreground.status).toBe('empty');
   });
 
-  test.each([16 * 1024, 128 * 1024])(
-    'three ordinary recent turns fit selected carrier %s without a summary call',
-    (maximum) => {
-      const recent = [1, 2, 3].map((index) => ({
-        logicalTurnId: `recent-${index}`,
-        revision: 1,
-        conversationId: 'conversation',
-        userMessageId: `user-${index}`,
-        assistantMessageId: `assistant-${index}`,
-        origin: 'interactive',
-        userText: 'u'.repeat(2048),
-        assistantText: 'a'.repeat(2048),
-        toolPairs: [],
-        committedAt: new Date(),
-      }));
-      const outputCarrier = { carrierMaxUtf8Bytes: maximum, reservedContextUtf8Bytes: 1000 };
-      const contract = acceptedMainCompactionOutputContract(recent, outputCarrier);
-      expect(contract).not.toBeNull();
-      const capsule = buildAcceptedMainContextCapsule({ acceptedTurns: recent, outputCarrier });
-      expect(Buffer.byteLength(capsule) + 1000).toBeLessThanOrEqual(maximum);
-      expect(canDeferAcceptedMainCompaction({ acceptedTurns: recent, outputCarrier })).toBe(true);
-    },
-  );
+  test.each([16 * 1024, 128 * 1024])('three ordinary recent turns fit selected carrier %s without a summary call', maximum => {
+    const recent = [1, 2, 3].map(index => ({ logicalTurnId: `recent-${index}`, revision: 1,
+      conversationId: 'conversation', userMessageId: `user-${index}`, assistantMessageId: `assistant-${index}`,
+      origin: 'interactive', userText: 'u'.repeat(2048), assistantText: 'a'.repeat(2048),
+      toolPairs: [], committedAt: new Date() }));
+    const outputCarrier = { carrierMaxUtf8Bytes: maximum, reservedContextUtf8Bytes: 1000 };
+    const contract = acceptedMainCompactionOutputContract(recent, outputCarrier);
+    expect(contract).not.toBeNull();
+    const capsule = buildAcceptedMainContextCapsule({ acceptedTurns: recent, outputCarrier });
+    expect(Buffer.byteLength(capsule) + 1000).toBeLessThanOrEqual(maximum);
+    expect(canDeferAcceptedMainCompaction({ acceptedTurns: recent, outputCarrier })).toBe(true);
+  });
 
   test('unused reference-view overflow does not reject the actual full-text capsule', async () => {
     const { service, identity, seed, accepted } = fixture();
     const claim = await seed();
     const candidate = { ...faithful, summary: 's'.repeat(6500) };
-    expect(
-      await service.completeAcceptedMainCompaction({
-        ...identity,
-        ...claim,
-        semanticCompaction: candidate,
-        semanticReview: reviewFor(claim, candidate),
-      }),
-    ).toMatchObject({ status: 'compacted' });
-    for (let index = 4; index < 7; index++)
-      await service.commitAcceptedMainTurn({
-        ...identity,
-        logicalTurnId: `turn-${index}`,
-        revision: 1,
-        conversationId: 'c'.repeat(256),
-        userMessageId: `u-${index}${'u'.repeat(250)}`,
-        assistantMessageId: `a-${index}${'a'.repeat(250)}`,
-        origin: 'interactive',
-        userText: 'Pending.',
-        assistantText: 'Approval required.',
-      });
-    for (const [key, turn] of accepted)
-      accepted.set(key, {
-        ...turn,
-        conversationId: 'c'.repeat(256),
-        userMessageId: `${key}${'u'.repeat(245)}`,
-        assistantMessageId: `${key}${'a'.repeat(245)}`,
-      });
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: candidate, semanticReview: reviewFor(claim, candidate) }))
+      .toMatchObject({ status: 'compacted' });
+    for (let index = 4; index < 7; index++) await service.commitAcceptedMainTurn({ ...identity,
+      logicalTurnId: `turn-${index}`, revision: 1, conversationId: 'c'.repeat(256),
+      userMessageId: `u-${index}${'u'.repeat(250)}`, assistantMessageId: `a-${index}${'a'.repeat(250)}`,
+      origin: 'interactive', userText: 'Pending.', assistantText: 'Approval required.' });
+    for (const [key, turn] of accepted) accepted.set(key, { ...turn, conversationId: 'c'.repeat(256),
+      userMessageId: `${key}${'u'.repeat(245)}`, assistantMessageId: `${key}${'a'.repeat(245)}` });
     const loaded = await service.loadAcceptedMainContext(identity);
     expect(loaded.status).toBe('available');
     expect(loaded.capsule).toContain(candidate.summary);
@@ -2371,163 +2038,87 @@ describe('carrier-owned compaction output', () => {
   });
 
   test('reserves full recent source and preserves later legal growth for guarded recovery', async () => {
-    const { service, identity, seed, accepted } = fixture();
-    const claim = await seed();
-    let low = 1,
-      high = Number((claim.outputContract as { maxSummaryUtf8Bytes: number }).maxSummaryUtf8Bytes);
+    const { service, identity, seed, accepted } = fixture(); const claim = await seed();
+    let low = 1, high = Number((claim.outputContract as { maxSummaryUtf8Bytes: number }).maxSummaryUtf8Bytes);
     while (low < high) {
-      const middle = Math.ceil((low + high) / 2);
-      const proposal = { ...faithful, version: 1 as const, summary: 's'.repeat(middle) };
-      if (
-        inspectMainCompactionCandidate(proposal, claim.outputContract).ok &&
-        inspectMainCompactionCarrier(proposal, claim.outputContract).ok
-      )
-        low = middle;
+      const middle = Math.ceil((low + high) / 2); const proposal = { ...faithful, version: 1 as const, summary: 's'.repeat(middle) };
+      if (inspectMainCompactionCandidate(proposal, claim.outputContract).ok &&
+          inspectMainCompactionCarrier(proposal, claim.outputContract).ok) low = middle;
       else high = middle - 1;
     }
     const candidate = { ...faithful, summary: 's'.repeat(low) };
-    expect(
-      await service.completeAcceptedMainCompaction({
-        ...identity,
-        ...claim,
-        semanticCompaction: candidate,
-        semanticReview: reviewFor(claim, candidate),
-      }),
-    ).toMatchObject({ status: 'compacted' });
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: candidate, semanticReview: reviewFor(claim, candidate) }))
+      .toMatchObject({ status: 'compacted' });
     const afterPromotion = await service.loadAcceptedMainContext(identity);
     const references = [...accepted.values()].slice(-3);
     const stored = afterPromotion.semanticCompaction;
-    expect(() =>
-      buildAcceptedMainContextCapsule({
-        acceptedTurns: references,
-        semanticCompaction: stored,
-        semanticCompactionContract: claim.outputContract,
-      }),
-    ).not.toThrow();
+    expect(() => buildAcceptedMainContextCapsule({ acceptedTurns: references,
+      semanticCompaction: stored, semanticCompactionContract: claim.outputContract })).not.toThrow();
     // Legal source may grow after the snapshot; the full source stays in the owning ledger.
-    for (let index = 0; index < 3; index++)
-      await service.commitAcceptedMainTurn({
-        ...identity,
-        logicalTurnId: `growth-${index}-${'l'.repeat(140)}`,
-        revision: 1,
-        conversationId: 'c'.repeat(200),
-        userMessageId: `u${index}${'u'.repeat(200)}`,
-        assistantMessageId: `a${index}${'a'.repeat(200)}`,
-        origin: 'interactive',
-        userText: 'Keep the pending permission.',
-        assistantText: 'It remains pending.',
-      });
+    for (let index = 0; index < 3; index++) await service.commitAcceptedMainTurn({ ...identity,
+      logicalTurnId: `growth-${index}-${'l'.repeat(140)}`, revision: 1,
+      conversationId: 'c'.repeat(200), userMessageId: `u${index}${'u'.repeat(200)}`,
+      assistantMessageId: `a${index}${'a'.repeat(200)}`, origin: 'interactive',
+      userText: 'Keep the pending permission.', assistantText: 'It remains pending.' });
     const overflow = await service.loadAcceptedMainContext(identity);
     expect(overflow).toMatchObject({ status: 'context_budget', semanticCompaction: candidate });
     expect((overflow.sourceTurns as AcceptedMainTurn[]).length).toBeGreaterThan(0);
     expect(overflow.capsule).toBe('');
-    const recovery = await service.claimAcceptedMainCompaction({
-      ...identity,
-      reallocateOutputCarrier: true,
-    });
+    const recovery = await service.claimAcceptedMainCompaction({ ...identity, reallocateOutputCarrier: true });
     expect(recovery).toMatchObject({ status: 'claimed', previousSemanticCompaction: candidate });
-    expect(
-      await service.completeAcceptedMainCompaction({
-        ...identity,
-        ...recovery,
-        semanticCompaction: faithful,
-        semanticReview: reviewFor(recovery, faithful),
-      }),
-    ).toMatchObject({ status: 'compacted' });
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...recovery,
+      semanticCompaction: faithful, semanticReview: reviewFor(recovery, faithful) }))
+      .toMatchObject({ status: 'compacted' });
     expect(await service.loadAcceptedMainContext(identity)).toMatchObject({ status: 'available' });
     expect(accepted.size).toBe(7);
   });
 
   test('reclaims a full prior summary with no pending source when recent source growth overflows', async () => {
-    const { service, identity, seed, states, accepted } = fixture();
-    const claim = await seed();
+    const { service, identity, seed, states, accepted } = fixture(); const claim = await seed();
     const candidate = { ...faithful, summary: 's'.repeat(8700) };
-    expect(
-      await service.completeAcceptedMainCompaction({
-        ...identity,
-        ...claim,
-        semanticCompaction: candidate,
-        semanticReview: reviewFor(claim, candidate),
-      }),
-    ).toMatchObject({ status: 'compacted' });
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: candidate, semanticReview: reviewFor(claim, candidate) })).toMatchObject({ status: 'compacted' });
     // Rehydration keeps the full current source even when it outgrows the prior allocation.
-    for (const [key, turn] of accepted)
-      if ((turn.acceptedPosition || 0) > 1)
-        accepted.set(key, {
-          ...turn,
-          conversationId: 'c'.repeat(256),
-          userMessageId: 'u'.repeat(256),
-          assistantMessageId: 'a'.repeat(256),
-          logicalTurnId: 'l'.repeat(159) + key.slice(-1),
-          userText: 'u'.repeat(1000),
-        });
+    for (const [key, turn] of accepted) if ((turn.acceptedPosition || 0) > 1) accepted.set(key, { ...turn,
+      conversationId: 'c'.repeat(256), userMessageId: 'u'.repeat(256), assistantMessageId: 'a'.repeat(256),
+      logicalTurnId: 'l'.repeat(159) + key.slice(-1), userText: 'u'.repeat(1000) });
     const cache = [...states.values()][0];
     expect(cache.summarizedThrough).toBe(1);
-    expect(await service.loadAcceptedMainContext(identity)).toMatchObject({
-      status: 'context_budget',
-    });
-    const recovery = await service.claimAcceptedMainCompaction({
-      ...identity,
-      reallocateOutputCarrier: true,
-    });
-    expect(recovery).toMatchObject({
-      status: 'claimed',
-      sourceTurns: [],
-      previousSemanticCompaction: candidate,
-    });
-    expect(
-      await service.completeAcceptedMainCompaction({
-        ...identity,
-        ...recovery,
-        semanticCompaction: faithful,
-        semanticReview: reviewFor(recovery, faithful),
-      }),
-    ).toMatchObject({ status: 'compacted' });
+    expect(await service.loadAcceptedMainContext(identity)).toMatchObject({ status: 'context_budget' });
+    const recovery = await service.claimAcceptedMainCompaction({ ...identity, reallocateOutputCarrier: true });
+    expect(recovery).toMatchObject({ status: 'claimed', sourceTurns: [], previousSemanticCompaction: candidate });
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...recovery,
+      semanticCompaction: faithful, semanticReview: reviewFor(recovery, faithful) })).toMatchObject({ status: 'compacted' });
     expect(accepted.size).toBe(4);
   });
 
+
   test('accepts a full replacement above the old six KiB only inside the actual carrier', () => {
-    const contract = createMainCompactionOutputContract({
-      consumer: 'conversation_legacy',
-      carrierMaxUtf8Bytes: 128 * 1024,
-      reservedUtf8Bytes: 1000,
-    })!;
-    const candidate = {
-      ...faithful,
-      version: 1 as const,
-      summary: 'Material pending work. '.repeat(350) + 'Permission remains required.',
-    };
+    const contract = createMainCompactionOutputContract({ consumer: 'conversation_legacy',
+      carrierMaxUtf8Bytes: 128 * 1024, reservedUtf8Bytes: 1000 })!;
+    const candidate = { ...faithful, version: 1 as const, summary: 'Material pending work. '.repeat(350) + 'Permission remains required.' };
     expect(inspectMainCompactionCandidate(candidate).ok).toBe(false);
     expect(inspectMainCompactionCandidate(candidate, contract).ok).toBe(true);
     expect(inspectMainCompactionCarrier(candidate, contract)).toEqual({ ok: true });
     expect(candidate.summary.endsWith('Permission remains required.')).toBe(true);
   });
   test('accounts for exact escaping and framing before accepting a valid raw proposal', () => {
-    const contract = conversationMainCompactionOutputContract({
-      coveredRows: 12,
-      carrierMaxUtf8Bytes: 16 * 1024,
-      reservedContextUtf8Bytes: 14000,
-    })!;
+    const contract = conversationMainCompactionOutputContract({ coveredRows: 12,
+      carrierMaxUtf8Bytes: 16 * 1024, reservedContextUtf8Bytes: 14000 })!;
     const candidate = { ...faithful, version: 1 as const, summary: '<'.repeat(450) };
     expect(inspectMainCompactionCandidate(candidate, contract).ok).toBe(true);
     expect(inspectMainCompactionCarrier(candidate, contract).ok).toBe(false);
-    expect(
-      14000 + Buffer.byteLength(renderConversationMainContinuityCapsule(candidate, 12)),
-    ).toBeGreaterThan(16 * 1024);
+    expect(14000 + Buffer.byteLength(renderConversationMainContinuityCapsule(candidate, 12)))
+      .toBeGreaterThan(16 * 1024);
   });
   test('persists and reloads a larger reviewed Core summary without clipping its tail', async () => {
-    const { service, identity, seed } = fixture();
-    const claim = await seed();
+    const { service, identity, seed } = fixture(); const claim = await seed();
     const candidate = { ...faithful, summary: 's'.repeat(6500) + ' Keep approval required.' };
     expect(inspectMainCompactionCandidate(candidate, claim.outputContract).ok).toBe(true);
-    expect(
-      await service.completeAcceptedMainCompaction({
-        ...identity,
-        ...claim,
-        semanticCompaction: candidate,
-        semanticReview: reviewFor(claim, candidate),
-      }),
-    ).toMatchObject({ status: 'compacted' });
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: candidate, semanticReview: reviewFor(claim, candidate) }))
+      .toMatchObject({ status: 'compacted' });
     const loaded = await service.loadAcceptedMainContext(identity);
     expect((loaded.semanticCompaction as { summary?: string })?.summary).toBe(candidate.summary);
     expect(loaded.capsule).toContain('Keep approval required.');
@@ -2535,20 +2126,15 @@ describe('carrier-owned compaction output', () => {
     expect(loaded.semanticCompactionContract).toEqual(claim.outputContract);
   });
   test('rejects approval against another allocation while preserving the original source', async () => {
-    const { service, identity, seed, sourceText } = fixture();
-    const claim = await seed();
+    const { service, identity, seed, sourceText } = fixture(); const claim = await seed();
     const review = { ...reviewFor(claim, faithful), outputContractDigest: 'f'.repeat(64) };
-    expect(
-      await service.completeAcceptedMainCompaction({
-        ...identity,
-        ...claim,
-        semanticCompaction: faithful,
-        semanticReview: review,
-      }),
-    ).toMatchObject({ status: 'invalid_summary', reason: 'semantic_review_required' });
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: faithful, semanticReview: review }))
+      .toMatchObject({ status: 'invalid_summary', reason: 'semantic_review_required' });
     expect((await service.loadAcceptedMainContext(identity)).capsule).toContain(sourceText);
   });
 });
+
 
 describe('live compaction lease renewal', () => {
   test('renews only the exact live Core claim without changing source or summary state', async () => {
@@ -2558,43 +2144,531 @@ describe('live compaction lease renewal', () => {
     const clock = jest.spyOn(Date, 'now').mockReturnValue(checkedAt);
     try {
       const before = structuredClone(states.get(String(claim.domainEpochKey))!);
-      const input = {
-        ...identity,
-        leaseId: claim.leaseId,
-        sourceDigest: claim.sourceDigest,
-        leaseExpiresAt: claim.leaseExpiresAt,
-        expiresAt: new Date(checkedAt + 238630),
-      };
+      const input = { ...identity, leaseId: claim.leaseId, sourceDigest: claim.sourceDigest,
+        leaseExpiresAt: claim.leaseExpiresAt, expiresAt: new Date(checkedAt + 238630) };
       expect(typeof service.renewAcceptedMainCompaction).toBe('function');
       for (const invalid of [
         { ...input, leaseId: 'replaced-holder' },
         { ...input, sourceDigest: 'f'.repeat(64) },
         { ...input, leaseExpiresAt: new Date(checkedAt + 1) },
-      ])
-        expect((await service.renewAcceptedMainCompaction(invalid)).status).toBe('stale_lease');
+      ]) expect((await service.renewAcceptedMainCompaction(invalid)).status).toBe('stale_lease');
       const renewed = await service.renewAcceptedMainCompaction(input);
       expect(renewed).toEqual({ status: 'renewed', leaseExpiresAt: input.expiresAt });
       const after = states.get(String(claim.domainEpochKey))!;
-      expect(after).toEqual({
-        ...before,
-        version: before.version + 1,
-        compactionLease: { ...before.compactionLease, expiresAt: input.expiresAt },
-      });
+      expect(after).toEqual({ ...before, version: before.version + 1,
+        compactionLease: { ...before.compactionLease, expiresAt: input.expiresAt } });
       expect((await service.claimAcceptedMainCompaction(identity)).status).toBe('busy');
       expect((await service.renewAcceptedMainCompaction(input)).status).toBe('stale_lease');
       clock.mockReturnValue(input.expiresAt.getTime());
-      expect(
-        (
-          await service.renewAcceptedMainCompaction({
-            ...input,
-            leaseExpiresAt: input.expiresAt,
-            expiresAt: new Date(checkedAt + 300000),
-          })
-        ).status,
-      ).toBe('stale_lease');
+      expect((await service.renewAcceptedMainCompaction({ ...input,
+        leaseExpiresAt: input.expiresAt, expiresAt: new Date(checkedAt + 300000) })).status)
+        .toBe('stale_lease');
       expect(states.get(String(claim.domainEpochKey))).toEqual(after);
-    } finally {
-      clock.mockRestore();
-    }
+    } finally { clock.mockRestore(); }
+  });
+});
+
+
+describe('typed Main compaction tool identity evidence', () => {
+  const pair = { callId: 'call_opaque_001', toolName: 'read_record', outcome: 'Record value is 7.' };
+  const source = { previousSemanticCompaction: null, sourceTurns: [{ toolPairs: [pair] }] as AcceptedMainTurn[] };
+  const candidate = { version: 1 as const, summary: 'Record value is 7.', pendingAsks: [],
+    commitments: [], corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [pair] };
+  test('compares exact typed identities across all existing source carriers without parsing prose', () => {
+    const comparison = compareMainCompactionToolIdentities({ ...source,
+      previousSemanticCompaction: candidate,
+      legacyInputs: [{ semanticCompaction: candidate, sourceTurns: [{ toolPairs: [pair] }] }] }, candidate);
+    expect(comparison).toEqual({ version: 1, exactMatches: [{ callId: pair.callId,
+      toolName: pair.toolName, sourceLocations: ['previousSemanticCompaction.toolPairs.0',
+        'sourceTurns.0.toolPairs.0', 'legacyInputs.0.semanticCompaction.toolPairs.0',
+        'legacyInputs.0.sourceTurns.0.toolPairs.0'] }], missingSourcePairs: [], candidateOnlyPairs: [] });
+    expect(compareMainCompactionToolIdentities({ previousSemanticCompaction: null,
+      sourceTurns: [{ userText: pair.callId, toolPairs: [] }] as unknown as AcceptedMainTurn[] }, candidate)
+      .candidateOnlyPairs).toEqual([{ callId: pair.callId, toolName: pair.toolName }]);
+  });
+  test.each([
+    { ...pair, callId: 'call_opaque_00I' }, { ...pair, toolName: 'write_record' },
+  ])('rejects an invented typed identity through the single structural owner', changed => {
+    const result = inspectMainCompactionCandidate({ ...candidate, toolPairs: [changed] }, undefined, source);
+    expect(result).toEqual({ ok: false, issue: { path: 'toolPairs.0', constraint: 'source_identity' } });
+    expect(prepareMainCompactionCandidate({ ...candidate, toolPairs: [changed] }, source)).toBeNull();
+  });
+  test('leaves missing reference retirement and outcome meaning to independent semantic review', () => {
+    const missing = { ...candidate, toolPairs: [] };
+    expect(inspectMainCompactionCandidate(missing, undefined, source).ok).toBe(true);
+    expect(compareMainCompactionToolIdentities(source, missing).missingSourcePairs).toHaveLength(1);
+    const alteredMeaning = { ...candidate, toolPairs: [{ ...pair, outcome: 'Record value is 9.' }] };
+    expect(inspectMainCompactionCandidate(alteredMeaning, undefined, source).ok).toBe(true);
+    expect(compareMainCompactionToolIdentities(source, alteredMeaning).exactMatches).toHaveLength(1);
+  });
+});
+
+/* === VIVENTIUM START === Preserve accepted and conversation summaries in the native body. === */
+test('an actual native allocation carries unchanged summaries that overflow the old fixed partition', () => {
+  const contract = createMainCompactionOutputContract({ consumer: 'accepted_core',
+    carrierMaxUtf8Bytes: 128 * 1024, reservedUtf8Bytes: 21034 })!;
+  const summary = { version: 1, summary: 'Exact quoted state. '.repeat(4200).trim(), pendingAsks: [],
+    commitments: [], corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [] };
+  const context = { status: 'available', turns: [], pendingCompactionTurns: [],
+    semanticCompaction: summary, semanticCompactionContract: contract };
+  const peers = 54000;
+  const before = JSON.stringify(context);
+  expect(renderAcceptedMainContextForCarrier(context,
+    { carrierMaxUtf8Bytes: 128 * 1024, reservedContextUtf8Bytes: peers }).status).toBe('context_budget');
+  const admitted = renderAcceptedMainContextForCarrier(context,
+    { carrierMaxUtf8Bytes: 170003, reservedContextUtf8Bytes: peers });
+  expect(admitted.status).toBe('available');
+  expect(admitted.capsule).toContain(summary.summary);
+  expect(Buffer.byteLength(String(admitted.capsule)) + peers).toBeLessThanOrEqual(170003);
+  expect(JSON.stringify(context)).toBe(before);
+  expect(createMainCompactionOutputContract({ consumer: 'accepted_core',
+    carrierMaxUtf8Bytes: 512 * 1024 + 1, reservedUtf8Bytes: 0 })).toBeNull();
+  expect(createMainCompactionOutputContract({ consumer: 'accepted_core',
+    carrierMaxUtf8Bytes: 196608, reservedUtf8Bytes: 1000 })).toMatchObject({
+      carrierMaxUtf8Bytes: 128 * 1024, maxSummaryUtf8Bytes: 128 * 1024 - 1000 });
+});
+/* === VIVENTIUM END === */
+
+test.each(['accepted_core', 'conversation_legacy'] as const)(
+  '%s compaction output stays stable when a turn has more native spare capacity', consumer => {
+    const contract = createMainCompactionOutputContract({ consumer,
+      carrierMaxUtf8Bytes: 170003, reservedUtf8Bytes: 21034 });
+    expect(contract).toMatchObject({ carrierMaxUtf8Bytes: 131072,
+      maxJsonUtf8Bytes: 110038, maxSummaryUtf8Bytes: 110038 });
+    expect(createMainCompactionOutputContract({ consumer,
+      carrierMaxUtf8Bytes: 170003, reservedUtf8Bytes: 140000 })).toBeNull();
+  });
+
+
+describe('durable same-source fidelity continuation', () => {
+  const pending = (claim: Record<string, unknown>) => ({ version: 1,
+    sourceDigest: claim.sourceDigest, contractKey: 'exact-route-and-output-contract',
+    semanticAttempts: 1, transportRetries: 1,
+    correction: { code: 'semantic_fidelity', candidate: JSON.stringify(inverse),
+      reason: 'The draft must stay private until written approval.' } });
+  test('retains only the unaccepted repair, reclaims it exactly, and clears it on reviewed promotion', async () => {
+    const { service, identity, seed, states, sourceText } = fixture();
+    const claim = await seed(), repair = pending(claim);
+    const rejected = await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: repair });
+    expect(rejected).toMatchObject({ status: 'rejected', repairPending: true });
+    expect(states.get(String(claim.domainEpochKey))?.pendingCompactionRepair).toMatchObject(repair);
+    const context = await service.loadAcceptedMainContext(identity);
+    expect(context.semanticCompaction).toBeNull();
+    expect(context.capsule).toContain(sourceText);
+    expect(context.capsule).not.toContain(inverse.summary);
+    const next = await service.claimAcceptedMainCompaction({ ...identity, trigger: 'accepted_turn' });
+    expect(next).toMatchObject({ status: 'claimed', sourceDigest: claim.sourceDigest,
+      pendingCompactionRepair: repair });
+    expect(next.leaseId).not.toBe(claim.leaseId);
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...next,
+      semanticCompaction: faithful, semanticReview: { version: 1, approved: true,
+        sourceDigest: next.sourceDigest, candidateDigest: mainCompactionCandidateDigest(faithful),
+        outputContractDigest: mainCompactionOutputContractDigest(next.outputContract) } }))
+      .toMatchObject({ status: 'compacted' });
+    expect(states.get(String(claim.domainEpochKey))?.pendingCompactionRepair).toBeNull();
+  });
+  test.each(['source', 'attempts', 'transport', 'release', 'oversize', 'schema', 'expired', 'owner', 'lease'])(
+    'does not persist an unsafe continuation (%s)', async mode => {
+      const { service, identity, seed, states } = fixture();
+      const claim = await seed(), repair = pending(claim);
+      if (mode === 'source') repair.sourceDigest = 'e'.repeat(64);
+      if (mode === 'attempts') repair.semanticAttempts = 2;
+      if (mode === 'transport') repair.transportRetries = 2;
+      if (mode === 'schema') repair.correction.code = 'schema_invalid';
+      if (mode === 'oversize') repair.correction.candidate = JSON.stringify({ ...inverse, summary: 'x'.repeat(200000) });
+      if (mode === 'expired') {
+        const state = states.get(String(claim.domainEpochKey))!;
+        states.set(String(claim.domainEpochKey), { ...state,
+          compactionLease: { ...state.compactionLease!, expiresAt: new Date(Date.now() - 1) } });
+      }
+      const result = await service.rejectAcceptedMainCompaction({ ...identity,
+        ...(mode === 'owner' ? { ownerId: 'different-owner' } : {}),
+        leaseId: mode === 'lease' ? 'different-lease' : claim.leaseId,
+        reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: mode !== 'release',
+        pendingCompactionRepair: repair });
+      expect(result.repairPending).toBeUndefined();
+      expect(states.get(String(claim.domainEpochKey))?.pendingCompactionRepair).toBeNull();
+    });
+  test('a revised source cannot inherit a previous rejected draft', async () => {
+    const { service, identity, seed, states, accepted } = fixture();
+    const claim = await seed();
+    await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: pending(claim) });
+    await service.commitAcceptedMainTurn({ ...identity, ...accepted.get('turn-0'), revision: 2,
+      userText: 'Different authorized source.' });
+    const next = await service.claimAcceptedMainCompaction(identity);
+    expect(next.status).toBe('claimed');
+    expect(next.sourceDigest).not.toBe(claim.sourceDigest);
+    expect(next.pendingCompactionRepair).toBeUndefined();
+    expect(states.get(String(claim.domainEpochKey))?.pendingCompactionRepair).toBeNull();
+  });
+});
+
+
+test('new acceptance preserves the released claim prefix and leaves new turns pending', async () => {
+  const { service, identity, seed, states } = fixture();
+  const claim = await seed();
+  await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+    reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+    pendingCompactionRepair: { version: 1, sourceDigest: claim.sourceDigest,
+      contractKey: 'original-contract', semanticAttempts: 1, transportRetries: 0,
+      correction: { code: 'semantic_fidelity', candidate: JSON.stringify(inverse), reason: 'Keep approval required.' } } });
+  await service.commitAcceptedMainTurn({ ...identity, logicalTurnId: 'new-turn', revision: 1,
+    conversationId: 'synthetic-conversation', userMessageId: 'new-user', assistantMessageId: 'new-answer',
+    userText: 'An unrelated new request.', assistantText: 'New answer.', origin: 'interactive' });
+  const next = await service.claimAcceptedMainCompaction(identity);
+  expect(next.status).toBe('claimed');
+  expect(next.sourceTurns).toEqual(claim.sourceTurns);
+  expect(next.sourceDigest).toBe(claim.sourceDigest);
+  expect((next.outputContract as Record<string, number>).maxJsonUtf8Bytes)
+    .toBeLessThan((claim.outputContract as Record<string, number>).maxJsonUtf8Bytes);
+  expect(next.pendingCompactionRepair).toMatchObject({ semanticAttempts: 1 });
+  expect(await service.completeAcceptedMainCompaction({ ...identity, ...next,
+    semanticCompaction: faithful, semanticReview: reviewFor(next, faithful) }))
+    .toMatchObject({ status: 'compacted' });
+  expect(states.get(String(claim.domainEpochKey))?.summarizedThrough).toBe(1);
+  expect((await service.loadAcceptedMainContext(identity)).pendingCompactionTurns).toHaveLength(1);
+});
+
+test('a resumed contract still checks newly accepted context before promotion', async () => {
+  const { service, identity, seed } = fixture();
+  const claim = await seed();
+  await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+    reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+    pendingCompactionRepair: { version: 1, sourceDigest: claim.sourceDigest,
+      contractKey: 'original-contract', semanticAttempts: 1, transportRetries: 0,
+      correction: { code: 'semantic_fidelity', candidate: JSON.stringify(inverse), reason: 'Keep approval required.' } } });
+  const next = await service.claimAcceptedMainCompaction(identity);
+  await service.commitAcceptedMainTurn({ ...identity, logicalTurnId: 'long-new-turn', revision: 1,
+    conversationId: 'synthetic-conversation', userMessageId: 'new-user', assistantMessageId: 'new-answer',
+    userText: 'New accepted source. ' + 'x'.repeat(6000), assistantText: 'New answer.', origin: 'interactive' });
+  expect(next.sourceDigest).toBe(claim.sourceDigest);
+  expect(next.outputContract).toEqual(claim.outputContract);
+  const candidate = { ...faithful, summary: 's'.repeat(6500) };
+  expect(inspectMainCompactionCarrier(candidate, claim.outputContract).ok).toBe(true);
+  expect(await service.completeAcceptedMainCompaction({ ...identity, ...next,
+    semanticCompaction: candidate, semanticReview: reviewFor(next, candidate) }))
+    .toMatchObject({ status: 'invalid_summary', reason: 'context_budget' });
+  expect((await service.loadAcceptedMainContext(identity)).semanticCompaction).toBeNull();
+});
+
+
+describe('foreground pre-emption of an existing fidelity repair', () => {
+  test.each(['yield', 'cancel', 'no-release', 'exhausted', 'transport-used', 'provider', 'source', 'contract', 'new-rejection'])(
+    'preserves only the unchanged completed-review checkpoint (%s)', async mode => {
+      const { service, identity, seed, states } = fixture();
+      const first = await seed();
+      await service.rejectAcceptedMainCompaction({ ...identity, leaseId: first.leaseId,
+        reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+        pendingCompactionRepair: { version: 1, sourceDigest: first.sourceDigest,
+          contractKey: 'same-contract', semanticAttempts: 1, transportRetries: 0,
+          correction: { code: 'semantic_fidelity', candidate: JSON.stringify(inverse), reason: 'Keep approval required.' } } });
+      const checkpoint = states.get(String(first.domainEpochKey))!.pendingCompactionRepair;
+      const resumed = await service.claimAcceptedMainCompaction(identity);
+      const reason = mode === 'cancel' ? 'compaction_cancelled'
+        : mode === 'provider' ? 'provider_http_503'
+        : mode === 'new-rejection' ? 'semantic_fidelity: still wrong' : 'interactive_priority';
+      const rejected = await service.rejectAcceptedMainCompaction({ ...identity, leaseId: resumed.leaseId,
+        reason, capacityReleaseAcknowledged: mode !== 'no-release',
+        sourceDigest: mode === 'source' ? 'e'.repeat(64) : resumed.sourceDigest,
+        contractKey: mode === 'contract' ? 'changed-contract' : 'same-contract',
+        semanticAttempts: mode === 'exhausted' ? 2 : 1,
+        transportRetries: mode === 'transport-used' ? 1 : 0 });
+      const preserves = ['yield', 'cancel'].includes(mode);
+      expect(rejected.repairPending).toBe(preserves ? true : undefined);
+      expect(states.get(String(first.domainEpochKey))!.pendingCompactionRepair)
+        .toEqual(preserves ? checkpoint : null);
+      if (preserves) {
+        const next = await service.claimAcceptedMainCompaction(identity);
+        expect(next.sourceDigest).toBe(first.sourceDigest);
+        expect(next.pendingCompactionRepair).toEqual(checkpoint);
+        expect((next.pendingCompactionRepair as { semanticAttempts: number }).semanticAttempts).toBe(1);
+      }
+    });
+});
+
+
+describe('durable numeric size feedback', () => {
+  const routeKey = (constraints: unknown) => JSON.stringify({ provider: 'native', model: 'synthetic',
+    effort: 'high', constraints });
+  const sizeFeedback = (contract: Record<string, unknown>) => {
+    const candidate = { ...faithful, summary: 's'.repeat(Number(contract.maxJsonUtf8Bytes) + 1000) };
+    const result = inspectMainCompactionCandidate(candidate, contract);
+    if (result.ok) throw new Error('Expected synthetic size rejection');
+    const bytes = Buffer.byteLength(JSON.stringify(candidate));
+    return { correction: { code: 'schema_invalid', issue: result.issue },
+      sizeRepair: { proposalBytes: bytes, previousProposalBytes: bytes + 3000, converging: true } };
+  };
+  test('retains numeric progress only, targets the current smaller carrier, then promotes after review', async () => {
+    const { service, identity, seed, states } = fixture();
+    const claim = await seed(), contract = claim.outputContract as Record<string, unknown>;
+    const repair = { version: 1, sourceDigest: claim.sourceDigest, contractKey: routeKey(contract),
+      semanticAttempts: 2, transportRetries: 0, ...sizeFeedback(contract) };
+    expect(await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
+    const saved = states.get(String(claim.domainEpochKey))!.pendingCompactionRepair!;
+    expect(saved).toMatchObject(repair);
+    expect(saved.correction.candidate).toBeUndefined();
+    const next = await service.claimAcceptedMainCompaction({ ...identity,
+      outputCarrier: { carrierMaxUtf8Bytes: contract.carrierMaxUtf8Bytes, reservedContextUtf8Bytes: 100 } });
+    const nextContract = next.outputContract as Record<string, number>;
+    expect(next.sourceDigest).toBe(claim.sourceDigest);
+    expect(nextContract.maxJsonUtf8Bytes).toBeLessThan(Number(contract.maxJsonUtf8Bytes));
+    const feedback = normalizeMainCompactionSizeRepair(saved, saved.outputContract, nextContract)!;
+    expect(feedback).not.toBeNull();
+    expect(feedback.correction).toMatchObject({ issue: { limit: nextContract.maxSummaryUtf8Bytes } });
+    expect(compatibleMainCompactionSizeContract(saved.contractKey, routeKey(nextContract))).toBe(true);
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...next,
+      semanticCompaction: faithful, semanticReview: { version: 1, approved: true,
+        sourceDigest: next.sourceDigest, candidateDigest: mainCompactionCandidateDigest(faithful),
+        outputContractDigest: mainCompactionOutputContractDigest(nextContract) } }))
+      .toMatchObject({ status: 'compacted' });
+    expect(states.get(String(claim.domainEpochKey))?.pendingCompactionRepair).toBeNull();
+  });
+  test.each(['same', 'tighter', 'no-longer-bounded'])(
+    'retains exact bounded carrier repair across the existing checkpoint (%s)', async mode => {
+      const { service, identity, seed, states } = fixture();
+      const claim = await seed(), contract = claim.outputContract as Record<string, number>;
+      const candidate = { ...faithful, summary: '&'.repeat(Math.floor(contract.maxJsonUtf8Bytes / 2)) };
+      expect(inspectMainCompactionCandidate(candidate, contract).ok).toBe(true);
+      const result = inspectMainCompactionCarrier(candidate, contract);
+      if (result.ok) throw new Error('Expected escaped carrier rejection');
+      const serialized = JSON.stringify(candidate), bytes = Buffer.byteLength(serialized);
+      const repair = { version: 1, sourceDigest: claim.sourceDigest, contractKey: routeKey(contract),
+        semanticAttempts: 2, fidelityRepairAttempts: 0, transportRetries: 0,
+        correction: { code: 'schema_invalid', issue: result.issue, candidate: serialized },
+        sizeRepair: { proposalBytes: bytes, previousProposalBytes: bytes + 3000, converging: true } };
+      expect(await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+        reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+        pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
+      const saved = states.get(String(claim.domainEpochKey))!.pendingCompactionRepair!;
+      expect(saved.correction.candidate).toBe(serialized);
+      const extra = mode === 'same' ? 0 : mode === 'tighter' ? 100 : contract.maxJsonUtf8Bytes - bytes + 1;
+      const next = await service.claimAcceptedMainCompaction({ ...identity,
+        outputCarrier: { carrierMaxUtf8Bytes: contract.carrierMaxUtf8Bytes,
+          reservedContextUtf8Bytes: contract.reservedUtf8Bytes + extra } });
+      expect(next.sourceDigest).toBe(claim.sourceDigest);
+      expect(next.pendingCompactionRepair).toMatchObject({ semanticAttempts: 2,
+        fidelityRepairAttempts: 0, transportRetries: 0 });
+      const feedback = normalizeMainCompactionSizeRepair(saved, saved.outputContract, next.outputContract)!;
+      expect(feedback).not.toBeNull();
+      expect(feedback.correction.candidate).toBe(mode === 'no-longer-bounded' ? undefined : serialized);
+      expect(feedback.correction.issue).toMatchObject({ path: '$carrier',
+        actual: mainCompactionRenderedBytes(candidate, next.outputContract as never),
+        excessBytes: mainCompactionRenderedBytes(candidate, next.outputContract as never) - contract.carrierMaxUtf8Bytes });
+      expect(states.get(String(claim.domainEpochKey))!.pendingCompactionRepair!.correction.candidate)
+        .toBe(serialized);
+    });
+
+  test('does not retain whole-JSON overflow even when supplied as an in-claim candidate', () => {
+    const contract = createMainCompactionOutputContract({ consumer: 'accepted_core',
+      carrierMaxUtf8Bytes: 131072, reservedUtf8Bytes: 55221 })!;
+    const candidate = { ...faithful, summary: 's'.repeat(contract.maxJsonUtf8Bytes + 1000) };
+    const value = sizeFeedback(contract as unknown as Record<string, unknown>);
+    Object.assign(value.correction, { candidate });
+    const normalized = normalizeMainCompactionSizeRepair(value, contract)!;
+    expect(normalized).not.toBeNull();
+    expect(normalized.correction.candidate).toBeUndefined();
+    expect(normalized.sizeRepair).toEqual(value.sizeRepair);
+  });
+
+  test.each(['source', 'attempts', 'release', 'not-shrinking', 'candidate', 'field-total', 'actual',
+    'limit', 'item', 'transport', 'lease'])(
+    'rejects unsafe numeric size feedback (%s)', async mode => {
+      const { service, identity, seed, states } = fixture();
+      const claim = await seed(), contract = claim.outputContract as Record<string, unknown>;
+      const repair = { version: 1, sourceDigest: claim.sourceDigest, contractKey: routeKey(contract),
+        semanticAttempts: 2, transportRetries: 0, ...sizeFeedback(contract) };
+      if (mode === 'source') repair.sourceDigest = 'e'.repeat(64);
+      if (mode === 'attempts') repair.semanticAttempts = 4;
+      if (mode === 'not-shrinking') repair.sizeRepair.previousProposalBytes = repair.sizeRepair.proposalBytes;
+      if (mode === 'candidate') Object.assign(repair.correction, { candidate: 'unaccepted' });
+      if (mode === 'field-total') repair.correction.issue.fieldBytes = { summary: 1 };
+      if (mode === 'actual') repair.correction.issue.actual = repair.correction.issue.limit;
+      if (mode === 'limit') repair.correction.issue.limit = 1;
+      if (mode === 'item') repair.correction.issue.path = 'pendingAsks.0';
+      if (mode === 'transport') repair.transportRetries = 2;
+      const result = await service.rejectAcceptedMainCompaction({ ...identity,
+        leaseId: mode === 'lease' ? 'wrong' : claim.leaseId, reason: 'compaction_enclosing_deadline',
+        capacityReleaseAcknowledged: mode !== 'release', pendingCompactionRepair: repair });
+      expect(result.repairPending).toBeUndefined();
+      expect(states.get(String(claim.domainEpochKey))?.pendingCompactionRepair).toBeNull();
+    });
+  test.each([true, false])('foreground pre-emption preserves size progress only after release=%s', async released => {
+    const { service, identity, seed, states } = fixture();
+    const claim = await seed(), contract = claim.outputContract as Record<string, unknown>;
+    const repair = { version: 1, sourceDigest: claim.sourceDigest, contractKey: routeKey(contract),
+      semanticAttempts: 2, transportRetries: 0, ...sizeFeedback(contract) };
+    await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true, pendingCompactionRepair: repair });
+    const before = states.get(String(claim.domainEpochKey))!.pendingCompactionRepair;
+    const next = await service.claimAcceptedMainCompaction({ ...identity,
+      outputCarrier: { carrierMaxUtf8Bytes: contract.carrierMaxUtf8Bytes, reservedContextUtf8Bytes: 100 } });
+    const result = await service.rejectAcceptedMainCompaction({ ...identity, leaseId: next.leaseId,
+      reason: 'interactive_priority', capacityReleaseAcknowledged: released,
+      sourceDigest: next.sourceDigest, contractKey: routeKey(next.outputContract),
+      semanticAttempts: 2, transportRetries: 0 });
+    expect(result.repairPending).toBe(released ? true : undefined);
+    expect(states.get(String(claim.domainEpochKey))!.pendingCompactionRepair).toEqual(released ? before : null);
+  });
+  test('distinguishes carrier bytes from proposal bytes without retaining a rejected body', () => {
+    const contract = createMainCompactionOutputContract({ consumer: 'accepted_core',
+      carrierMaxUtf8Bytes: 131072, reservedUtf8Bytes: 55221 })!;
+    const value = { correction: { code: 'schema_invalid', issue: { path: '$carrier',
+      constraint: 'max_bytes', unit: 'utf8_bytes', actual: 135000, limit: 131072,
+      proposalBytes: 74000, excessBytes: 3928 } },
+      sizeRepair: { proposalBytes: 74000, previousProposalBytes: 75000, converging: true } };
+    expect(normalizeMainCompactionSizeRepair(value, contract)?.correction).toEqual(value.correction);
+    expect(normalizeMainCompactionSizeRepair(value, { ...contract, consumer: 'conversation_legacy' }, contract)).toBeNull();
+    expect(normalizeMainCompactionSizeRepair(value, contract, { ...contract,
+      maxJsonUtf8Bytes: contract.maxJsonUtf8Bytes + 1 })).toBeNull();
+  });
+});
+
+
+describe('independent bounded fidelity repair accounting', () => {
+  test.each([
+    [1, undefined, 'fidelity', true], [2, undefined, 'fidelity', false],
+    [1, 0, 'fidelity', true], [2, 0, 'fidelity', true], [4, 0, 'fidelity', true],
+    [5, 0, 'fidelity', false], [1, 1, 'fidelity', false], [4, 1, 'fidelity', false],
+    [2, undefined, 'size', true], [3, 1, 'size', true], [4, 0, 'size', false],
+    [1, 0, 'size', false], [0, 0, 'fidelity', false], [2.5, 0, 'fidelity', false],
+    [2, null, 'fidelity', false], [2, '0', 'fidelity', false], [2, false, 'fidelity', false],
+    [2, -1, 'fidelity', false], [2, 0.5, 'fidelity', false], [2, 2, 'fidelity', false],
+    [2, null, 'size', false], [2, '0', 'size', false], [2, 2, 'size', false],
+  ])('total=%s fidelity=%s kind=%s eligible=%s', (total, fidelity, kind, expected) => {
+    expect(canContinueMainCompactionRepair({ semanticAttempts: total, fidelityRepairAttempts: fidelity },
+      kind as 'size' | 'fidelity')).toBe(expected);
+  });
+
+  test.each(['yield', 'cancel', 'used', 'missing', 'null', 'no-release', 'source', 'contract'])(
+    'four completed size calls preserve exactly one fidelity allowance (%s)', async mode => {
+      const { service, identity, seed, states } = fixture();
+      const first = await seed();
+      const repair = { version: 1, sourceDigest: first.sourceDigest, contractKey: 'same-contract',
+        semanticAttempts: 4, fidelityRepairAttempts: 0, transportRetries: 0,
+        correction: { code: 'semantic_fidelity', candidate: JSON.stringify(inverse), reason: 'Keep approval required.' } };
+      expect(await service.rejectAcceptedMainCompaction({ ...identity, leaseId: first.leaseId,
+        reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+        pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
+      const checkpoint = states.get(String(first.domainEpochKey))!.pendingCompactionRepair!;
+      const resumed = await service.claimAcceptedMainCompaction(identity);
+      expect(resumed.pendingCompactionRepair).toEqual(checkpoint);
+      const result = await service.rejectAcceptedMainCompaction({ ...identity, leaseId: resumed.leaseId,
+        reason: mode === 'cancel' ? 'compaction_cancelled' : 'interactive_priority',
+        capacityReleaseAcknowledged: mode !== 'no-release',
+        sourceDigest: mode === 'source' ? 'e'.repeat(64) : resumed.sourceDigest,
+        contractKey: mode === 'contract' ? 'changed-contract' : 'same-contract',
+        semanticAttempts: 4,
+        ...(mode === 'missing' ? {} : { fidelityRepairAttempts: mode === 'used' ? 1 : mode === 'null' ? null : 0 }),
+        transportRetries: 0 });
+      const preserves = ['yield', 'cancel', 'missing'].includes(mode);
+      expect(result.repairPending).toBe(preserves ? true : undefined);
+      expect(states.get(String(first.domainEpochKey))!.pendingCompactionRepair).toEqual(preserves ? checkpoint : null);
+      if (preserves) expect((await service.claimAcceptedMainCompaction(identity)).pendingCompactionRepair)
+        .toMatchObject({ semanticAttempts: 4, fidelityRepairAttempts: 0, correction: repair.correction });
+    });
+
+  test.each([undefined, null, '0', -1, 0.5, 1, 2])(
+    'does not create a fourth-call fidelity checkpoint with an absent, spent or invalid counter %s', async fidelity => {
+      const { service, identity, seed, states } = fixture();
+      const claim = await seed();
+      const result = await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+        reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+        pendingCompactionRepair: { version: 1, sourceDigest: claim.sourceDigest, contractKey: 'same-contract',
+          semanticAttempts: 4, fidelityRepairAttempts: fidelity, transportRetries: 0,
+          correction: { code: 'semantic_fidelity', candidate: JSON.stringify(inverse), reason: 'Keep approval required.' } } });
+      expect(result.repairPending).toBeUndefined();
+      expect(states.get(String(claim.domainEpochKey))!.pendingCompactionRepair).toBeNull();
+    });
+
+  test('numeric size checkpoint retains a used fidelity allowance and cannot reset it on cancellation', async () => {
+    const { service, identity, seed, states } = fixture();
+    const claim = await seed(), contract = claim.outputContract as Record<string, unknown>;
+    const candidate = { ...faithful, summary: 's'.repeat(Number(contract.maxJsonUtf8Bytes) + 1000) };
+    const inspected = inspectMainCompactionCandidate(candidate, contract);
+    if (inspected.ok) throw new Error('Expected synthetic size rejection');
+    const bytes = Buffer.byteLength(JSON.stringify(candidate));
+    const repair = { version: 1, sourceDigest: claim.sourceDigest,
+      contractKey: JSON.stringify({ provider: 'native', model: 'synthetic', effort: 'high', constraints: contract }),
+      semanticAttempts: 2, fidelityRepairAttempts: 1, transportRetries: 0,
+      correction: { code: 'schema_invalid', issue: inspected.issue },
+      sizeRepair: { proposalBytes: bytes, previousProposalBytes: bytes + 3000, converging: true } };
+    expect(await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
+    const next = await service.claimAcceptedMainCompaction(identity);
+    expect(next.pendingCompactionRepair).toMatchObject({ semanticAttempts: 2, fidelityRepairAttempts: 1 });
+    expect(await service.rejectAcceptedMainCompaction({ ...identity, leaseId: next.leaseId,
+      reason: 'compaction_cancelled', capacityReleaseAcknowledged: true,
+      sourceDigest: next.sourceDigest, contractKey: repair.contractKey,
+      semanticAttempts: 2, fidelityRepairAttempts: 0, transportRetries: 0 }))
+      .not.toMatchObject({ repairPending: true });
+    expect(states.get(String(claim.domainEpochKey))!.pendingCompactionRepair).toBeNull();
+  });
+});
+
+describe('fidelity continuation uses the current carrier without losing its owned draft', () => {
+  const routeKey = (constraints: unknown) => JSON.stringify({ provider: 'native', model: 'synthetic',
+    effort: 'high', constraints });
+  test.each(['deadline', 'cancel', 'yield', 'new-candidate', 'reason', 'source', 'generation', 'route',
+    'attempts', 'transport', 'used', 'release', 'expired'])(
+    'retains only the prior bounded byte-identical draft after a tighter allocation (%s)', async mode => {
+      const { service, identity, seed, states } = fixture();
+      const first = await seed(), before = first.outputContract as Record<string, number>;
+      const prior = { ...faithful, summary: 'x'.repeat(before.maxJsonUtf8Bytes - 1000) };
+      expect(inspectMainCompactionCandidate(prior, before).ok).toBe(true);
+      expect(inspectMainCompactionCarrier(prior, before).ok).toBe(true);
+      const repair = { version: 1, sourceDigest: first.sourceDigest, contractKey: routeKey(before),
+        semanticAttempts: 4, fidelityRepairAttempts: 0, transportRetries: 0,
+        correction: { code: 'semantic_fidelity', candidate: JSON.stringify(prior), reason: 'Restore the exact reference.' } };
+      await service.rejectAcceptedMainCompaction({ ...identity, leaseId: first.leaseId,
+        reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true, pendingCompactionRepair: repair });
+      const saved = states.get(String(first.domainEpochKey))!.pendingCompactionRepair!;
+      const resumed = await service.claimAcceptedMainCompaction({ ...identity,
+        outputCarrier: { carrierMaxUtf8Bytes: before.carrierMaxUtf8Bytes, reservedContextUtf8Bytes: 2000 } });
+      const after = resumed.outputContract as Record<string, number>;
+      expect(after.maxJsonUtf8Bytes).toBeLessThan(before.maxJsonUtf8Bytes);
+      expect(inspectMainCompactionCandidate(prior, after).ok).toBe(false);
+      expect(resumed.sourceDigest).toBe(first.sourceDigest);
+      const next = { ...repair, contractKey: routeKey(after), correction: { ...repair.correction } };
+      if (mode === 'new-candidate') next.correction.candidate = JSON.stringify({ ...prior, summary: prior.summary + 'x' });
+      if (mode === 'reason') next.correction.reason = 'A different review.';
+      if (mode === 'source') next.sourceDigest = 'e'.repeat(64);
+      if (mode === 'route') next.contractKey = routeKey({ ...after, consumer: 'conversation_legacy' });
+      if (mode === 'attempts') next.semanticAttempts = 3;
+      if (mode === 'transport') next.transportRetries = 1;
+      if (mode === 'used') next.fidelityRepairAttempts = 1;
+      if (mode === 'generation') saved.sourceGeneration++;
+      if (mode === 'expired') states.get(String(first.domainEpochKey))!.compactionLease!.expiresAt = new Date(0);
+      const result = await service.rejectAcceptedMainCompaction({ ...identity, leaseId: resumed.leaseId,
+        reason: mode === 'cancel' ? 'compaction_cancelled' : mode === 'yield' ? 'interactive_priority' : 'compaction_enclosing_deadline',
+        capacityReleaseAcknowledged: mode !== 'release', sourceDigest: resumed.sourceDigest,
+        contractKey: next.contractKey, semanticAttempts: next.semanticAttempts,
+        fidelityRepairAttempts: next.fidelityRepairAttempts, transportRetries: next.transportRetries,
+        pendingCompactionRepair: next });
+      const preserve = ['deadline', 'cancel', 'yield'].includes(mode);
+      expect(result.repairPending).toBe(preserve ? true : undefined);
+      expect(states.get(String(first.domainEpochKey))!.pendingCompactionRepair).toEqual(preserve ? saved : null);
+      expect((await service.loadAcceptedMainContext(identity)).semanticCompaction).toBeNull();
+    });
+  test('does not increase the retained fidelity ceiling when current capacity becomes larger', async () => {
+    const { service, identity, seed } = fixture();
+    const initial = await seed();
+    await service.rejectAcceptedMainCompaction({ ...identity, leaseId: initial.leaseId, reason: 'provider_unavailable' });
+    const first = await service.claimAcceptedMainCompaction({ ...identity,
+      outputCarrier: { carrierMaxUtf8Bytes: (initial.outputContract as Record<string, number>).carrierMaxUtf8Bytes,
+        reservedContextUtf8Bytes: 100 } });
+    await service.rejectAcceptedMainCompaction({ ...identity, leaseId: first.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: { version: 1, sourceDigest: first.sourceDigest, contractKey: routeKey(first.outputContract),
+        semanticAttempts: 4, fidelityRepairAttempts: 0, transportRetries: 0,
+        correction: { code: 'semantic_fidelity', candidate: JSON.stringify(faithful), reason: 'Keep approval required.' } } });
+    const resumed = await service.claimAcceptedMainCompaction(identity);
+    expect(resumed.outputContract).toEqual(first.outputContract);
   });
 });

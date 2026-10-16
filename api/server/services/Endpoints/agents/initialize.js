@@ -37,6 +37,7 @@ const {
   createSequentialChainEdges,
   applyAgentProviderCapabilityDefaults,
   retainAggregatedDeliveryDisposition,
+  retainMainCompactionRoute,
 } = require('@librechat/api');
 const {
   EModelEndpoint,
@@ -628,6 +629,7 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * Apply voice model swap BEFORE validateAgentModel so the voice model gets validated.
    * Added: 2026-02-24
    */
+  retainMainCompactionRoute(req, primaryAgent);
   applyVoiceModelOverride(primaryAgent, req, modelsConfig);
   Object.assign(
     primaryAgent,
@@ -894,19 +896,19 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     delete req._viventiumFallbackRouteNotice;
   }
   if (!sideEffectsRestricted) {
-    await attachConversationProviderCapabilityBundle({
+    const capabilityArgs = {
       targetAgent: primaryConfig,
       declaredAgent: effectivePrimaryAgent,
       req,
       capability: effectivePrimaryCapability,
+    };
+    const invocationRefreshInstalled =
+      installConversationProviderCapabilityRefresher(capabilityArgs);
+    await attachConversationProviderCapabilityBundle({
+      ...capabilityArgs,
+      deferUntilInvocation: invocationRefreshInstalled === true,
     });
     bindConversationProviderStableAuthorityDigest(primaryConfig, primaryStableAuthoritySha256);
-    installConversationProviderCapabilityRefresher({
-      targetAgent: primaryConfig,
-      declaredAgent: effectivePrimaryAgent,
-      req,
-      capability: effectivePrimaryCapability,
-    });
   }
   if (primaryInitializationFallbackUsed) {
     logger.warn(
@@ -1029,24 +1031,23 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
           }
           inheritResolvedAgentGraph(fallbackConfig, primaryConfig);
           if (!sideEffectsRestricted) {
-            await attachDeclaredConversationProviderCapabilityBundle({
+            const capabilityArgs = {
               targetAgent: fallbackConfig,
               declaredAgent: fallbackAgent,
               capabilitySourceAgent: primaryConfig,
               mcpCapabilitySourceAgent: effectivePrimaryAgent,
               req,
+            };
+            const invocationRefreshInstalled =
+              installConversationProviderCapabilityRefresher(capabilityArgs);
+            await attachDeclaredConversationProviderCapabilityBundle({
+              ...capabilityArgs,
+              deferUntilInvocation: invocationRefreshInstalled === true,
             });
             bindConversationProviderStableAuthorityDigest(
               fallbackConfig,
               primaryStableAuthoritySha256,
             );
-            installConversationProviderCapabilityRefresher({
-              targetAgent: fallbackConfig,
-              declaredAgent: fallbackAgent,
-              capabilitySourceAgent: primaryConfig,
-              mcpCapabilitySourceAgent: effectivePrimaryAgent,
-              req,
-            });
             let fallbackEndpointConfig = appConfig.endpoints?.[fallbackConfig.endpoint];
             if (!isAgentsEndpoint(fallbackConfig.endpoint) && !fallbackEndpointConfig) {
               try {
@@ -1355,17 +1356,18 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
      * the existing capability-unavailable instruction instead of inventing handoff-specific policy.
      * === VIVENTIUM END === */
     if (!sideEffectsRestricted) {
-      await attachDeclaredConversationProviderCapabilityBundle({
+      const capabilityArgs = {
         targetAgent: config,
         declaredAgent: effectiveAgent,
         req,
+      };
+      const invocationRefreshInstalled =
+        installConversationProviderCapabilityRefresher(capabilityArgs);
+      await attachDeclaredConversationProviderCapabilityBundle({
+        ...capabilityArgs,
+        deferUntilInvocation: invocationRefreshInstalled === true,
       });
       bindConversationProviderStableAuthorityDigest(config, handoffStableAuthoritySha256);
-      installConversationProviderCapabilityRefresher({
-        targetAgent: config,
-        declaredAgent: effectiveAgent,
-        req,
-      });
     }
     /* === VIVENTIUM START ===
      * Feature: GlassHive handoff cancellation parity.
@@ -1393,24 +1395,23 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         if (sideEffectsRestricted) {
           graphFallbackConfig = sanitizeAgentForRestrictedVoiceTurn(graphFallbackConfig);
         } else {
-          await attachDeclaredConversationProviderCapabilityBundle({
+          const capabilityArgs = {
             targetAgent: graphFallbackConfig,
             declaredAgent: handoffFallbackAgent,
             capabilitySourceAgent: config,
             mcpCapabilitySourceAgent: effectiveAgent,
             req,
+          };
+          const invocationRefreshInstalled =
+            installConversationProviderCapabilityRefresher(capabilityArgs);
+          await attachDeclaredConversationProviderCapabilityBundle({
+            ...capabilityArgs,
+            deferUntilInvocation: invocationRefreshInstalled === true,
           });
           bindConversationProviderStableAuthorityDigest(
             graphFallbackConfig,
             handoffStableAuthoritySha256,
           );
-          installConversationProviderCapabilityRefresher({
-            targetAgent: graphFallbackConfig,
-            declaredAgent: handoffFallbackAgent,
-            capabilitySourceAgent: config,
-            mcpCapabilitySourceAgent: effectiveAgent,
-            req,
-          });
           attachHarnessCancellationConfig(graphFallbackConfig, 'processAgentFallback');
         }
         Object.defineProperty(config, 'viventiumGraphLlmFallbacks', {

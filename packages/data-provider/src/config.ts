@@ -293,8 +293,11 @@ export const agentProviderModelCapabilitySchema = z.object({
   id: z.string(),
   label: z.string(),
   harnessProfile: z.string().optional(),
+  executionBackend: z.enum(['native-harness', 'direct-api']).optional(),
+  workerNativeTools: z.boolean().optional(),
   effortChoices: z.array(z.string()).default([]),
   recommendedEffort: z.string().optional(),
+  serviceTierChoices: z.array(z.string()).optional(),
   contextLimit: z.number().int().positive().optional(),
 });
 

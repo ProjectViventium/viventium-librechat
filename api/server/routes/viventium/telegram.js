@@ -29,6 +29,7 @@ const {
   bindInteractionSourceSegments,
   bindCanonicalInteractionConversation,
   nativeWorkInputResponseSchema,
+  claimTelegramDeliveriesWhenReady,
 } = require('@librechat/api');
 const { EnvVar } = require('@librechat/agents');
 const { logger } = require('@librechat/data-schemas');
@@ -2710,18 +2711,32 @@ router.get('/glasshive/:messageId', telegramAuth, async (req, res) => {
  * Added: 2026-05-06
  * === VIVENTIUM END === */
 router.post('/glasshive/deliveries/claim', telegramBridgeAuth, async (req, res) => {
+  const controller = new AbortController();
+  const disconnected = () => controller.abort();
+  res.once('close', disconnected);
+  if (req.aborted) controller.abort();
   try {
-    const deliveries = await claimPendingGlassHiveCallbackDeliveries({
-      surface: 'telegram',
-      limit: req.body?.limit,
-      leaseMs: req.body?.leaseMs,
-      claimOwner: req.body?.dispatcherId || 'telegram-bridge',
-      callbackId: req.body?.callbackId || '',
-    });
-    return res.json({ deliveries });
+    const deliveries = await claimTelegramDeliveriesWhenReady(
+      () =>
+        claimPendingGlassHiveCallbackDeliveries({
+          surface: 'telegram',
+          limit: req.body?.limit,
+          leaseMs: req.body?.leaseMs,
+          claimOwner: req.body?.dispatcherId || 'telegram-bridge',
+          callbackId: req.body?.callbackId || '',
+        }),
+      Number(req.body?.waitMs) || 0,
+      controller.signal,
+    );
+    if (res.destroyed) return;
+    res.setHeader('Cache-Control', 'no-store, private');
+    return res.json({ deliveries, waitSupported: true });
   } catch (err) {
     logger.error('[VIVENTIUM][telegram/glasshive-delivery] Claim failed:', err);
+    if (res.destroyed) return;
     return res.status(500).json({ error: 'Failed to claim GlassHive deliveries' });
+  } finally {
+    res.removeListener('close', disconnected);
   }
 });
 

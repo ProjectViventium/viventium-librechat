@@ -140,12 +140,13 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
     process.env = ORIGINAL_ENV;
   });
 
-  async function prepare(nowMs = 1_800_000_000_000, executionMode = 'docker') {
+  async function prepare(nowMs = 1_800_000_000_000, executionMode = 'docker', discovery = {}) {
     const { createCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
     return createCapabilityAuthorization({
       user: { id: 'owner-1', role: 'USER' },
       originRef: 'ghi_origin_0001',
       allowedServers: ['connected'],
+      ...discovery,
       allowedHostTools: ['file_search'],
       hostToolResources: { file_search: { files: [{ file_id: 'file-1' }] } },
       contentReadScope: true,
@@ -159,6 +160,72 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
       nowMs,
     });
   }
+
+  test.each([false, true])(
+    'preserves discovery scope through idempotent preparation and Resume: legacy=%s',
+    async (legacy) => {
+      const {
+        admitCapabilityAuthorization,
+        reauthorizeCapabilityAuthorization,
+      } = require('../GlassHiveCapabilityAuthorizationService');
+      const partition = { eagerServers: [], deferredServers: ['connected'] };
+      const authorization = await prepare(1_799_999_900_000, 'host', legacy ? {} : partition);
+      const repeated = await prepare(1_799_999_900_000, 'host', partition);
+      expect(repeated.authorizationRef).toBe(authorization.authorizationRef);
+      expect(repeated.scopeFingerprint).toBe(authorization.scopeFingerprint);
+      const stored = authorizations.get(authorization.authorizationRef);
+      if (legacy) {
+        expect(stored).not.toHaveProperty('eagerServers');
+        expect(stored).not.toHaveProperty('deferredServers');
+      } else {
+        expect(stored).toMatchObject(partition);
+        await expect(
+          prepare(1_799_999_900_000, 'host', {
+            eagerServers: ['connected'],
+            deferredServers: [],
+          }),
+        ).rejects.toMatchObject({ code: 'capability_authorization_conflict' });
+      }
+      Object.assign(stored, { workRef: 'work_00000001', workerId: 'worker_000001' });
+      await reauthorizeCapabilityAuthorization({
+        ownerId: 'owner-1',
+        workRef: stored.workRef,
+        nowMs: 1_800_086_342_000,
+      });
+      const admitted = await admitCapabilityAuthorization({
+        authorizationRef: stored.authorizationRef,
+        originRef: stored.originRef,
+        workRef: stored.workRef,
+        workerId: stored.workerId,
+        runId: 'run_000000002',
+        hostStartupLeaseId: 'b'.repeat(64),
+        nowMs: 1_800_086_343_000,
+      });
+      const mint = mockMintBrokerGrant.mock.calls.at(-1)[0];
+      expect(admitted.scopeFingerprint).toBe(authorization.scopeFingerprint);
+      if (legacy) {
+        expect(mint).not.toHaveProperty('eagerServers');
+        expect(admitted.grant).not.toHaveProperty('deferredServers');
+      } else {
+        expect(mint).toMatchObject(partition);
+        expect(admitted.grant).toMatchObject(partition);
+      }
+    },
+  );
+
+  test.each([
+    { eagerServers: [] },
+    { eagerServers: [], deferredServers: ['not-authorized'] },
+    { eagerServers: ['connected'], deferredServers: ['connected'] },
+    { eagerServers: [], deferredServers: [] },
+    { eagerServers: null, deferredServers: ['connected'] },
+  ])('rejects an invalid discovery partition: %p', async (partition) => {
+    await expect(prepare(1_800_000_000_000, 'host', partition)).rejects.toMatchObject({
+      code: 'capability_discovery_partition_invalid',
+    });
+    expect(authorizations.size).toBe(0);
+    expect(mockMintBrokerGrant).not.toHaveBeenCalled();
+  });
 
   test('binds host admission to its exact startup lease and revokes only that lease', async () => {
     const {

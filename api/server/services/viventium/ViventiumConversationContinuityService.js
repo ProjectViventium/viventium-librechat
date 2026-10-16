@@ -3,13 +3,14 @@
 /* === VIVENTIUM START ===
  * Feature: Conversation legacy continuity.
  * Purpose: A conversation whose visible history holds answers without a Core Main context stamp
- * must carry that history intact (protected-history guard), and a long one cannot fit the
- * protected carrier. Its oldest whole-turn prefix is reconciled into a reviewed semantic summary
- * by the existing Main compaction runner (owning Workbench generation and review prompts on the
- * exact configured Main route), bound to the exact covered rows. Main then receives that summary
- * as a required turn-context section plus the intact newer rows. Stored history is never
- * rewritten, truncated or reset, the carrier bound is unchanged, and any change to a covered row
- * invalidates the summary and restores full protection.
+ * must carry that history intact through the protected source guard. Native body routes defer
+ * opportunistic prefix migration to the existing idle runner only after a positive fit against
+ * discovered native replay floors; unknown, over-budget and header-only routes reconcile first
+ * when required. The existing Main compaction runner reviews each oldest whole-turn prefix on the
+ * configured Main route and binds it to the exact covered rows. Main receives only that accepted
+ * summary plus every newer row, or all original rows until review completes. Stored history is
+ * never rewritten, truncated or reset. Carrier bounds remain unchanged; covered source changes
+ * invalidate the summary and restore full protection.
  * === VIVENTIUM END === */
 
 const crypto = require('crypto');
@@ -420,6 +421,7 @@ async function ensureConversationLegacyContinuity({
   resolveOutputCarrier,
   deadlineAt = req?.viventiumSchedulerAuthoringDeadlineAt,
   maxClaims = MAX_CLAIMS_PER_TURN,
+  foreground = true,
 } = {}) {
   const store = createConversationContinuityStore({ Model, MessageModel });
   let record = await store.load(ownerId, conversationId);
@@ -441,7 +443,7 @@ async function ensureConversationLegacyContinuity({
     let plan = null;
     const result = await compaction.ensureAcceptedMainCompaction({
       trigger: 'conversation_legacy',
-      foreground: true,
+      foreground,
       ownerId,
       agentId: String(agent?.id || ''),
       // Keeps this conversation's learned claim size separate from the Main domain's.
@@ -454,6 +456,7 @@ async function ensureConversationLegacyContinuity({
       executionBudget,
       ...(executeCompactor ? { executeCompactor } : {}),
       claimCompaction: async (input) => {
+        record = await store.load(ownerId, conversationId);
         plan = planConversationContinuityClaim({
           record,
           orderedMessages,
@@ -498,8 +501,8 @@ async function ensureConversationLegacyContinuity({
         const currentContract = await contractFor(plan);
         return inspectMainCompactionCarrier(candidate, currentContract);
       },
-      completeCompaction: (input) =>
-        store.complete({
+      completeCompaction: async (input) => {
+        const result = await store.complete({
           ownerId,
           conversationId,
           plan,
@@ -508,11 +511,24 @@ async function ensureConversationLegacyContinuity({
           review: input.semanticReview,
           inspectCandidateCarrier: async ({ candidate }) =>
             inspectMainCompactionCarrier(candidate, await contractFor(plan)),
-        }),
+        });
+        if (foreground || result.status !== 'compacted') return result;
+        record = await store.load(ownerId, conversationId);
+        return {
+          ...result,
+          continuationPending: Boolean(
+            planConversationContinuityClaim({
+              record,
+              orderedMessages,
+            }),
+          ),
+        };
+      },
       rejectCompaction: (input) =>
         store.reject({ ownerId, conversationId, leaseId: input.leaseId, reason: input.reason }),
     });
     record = await store.load(ownerId, conversationId);
+    if (!foreground) break;
     if (result?.status !== 'compacted') {
       logger.warn('[VIVENTIUM][conversation-continuity] Legacy history not reconciled', {
         status: String(result?.status || 'unknown').slice(0, 80),
@@ -545,7 +561,7 @@ async function ensureConversationLegacyContinuity({
 
 /**
  * Resolve this turn's carried history: an exact reviewed prefix summary plus intact newer rows,
- * reconciling first when the unsummarized legacy history cannot be carried.
+ * deferring migration while the existing Native admission guard carries all unreconciled rows.
  */
 async function resolveConversationContinuity({
   req,
@@ -556,6 +572,8 @@ async function resolveConversationContinuity({
   orderedMessages,
   Model = require('~/db/models').ViventiumConversationContinuity,
   MessageModel = require('~/db/models').Message,
+  nativeBodyCarrier = false,
+  nativeReplayBudgetKnown = false,
   ...options
 } = {}) {
   const rows = Array.isArray(orderedMessages) ? orderedMessages : [];
@@ -567,27 +585,56 @@ async function resolveConversationContinuity({
   // A positive conservative fit permits reuse of an exact reviewed prefix and intact tail.
   // False or unavailable estimates retain the existing reconciliation/admission owners;
   // this estimate is not the Native rendered-source limit and cannot reject a turn.
-  if (
+  const fits =
     typeof options.canCarryWholeHistory === 'function' &&
     (await options.canCarryWholeHistory(
       existing.record ? existing.messages : rows,
       existing.record ? existing.capsule : '',
-    )) === true
-  ) {
+    )) === true;
+  if (fits && !(nativeBodyCarrier === true && nativeReplayBudgetKnown === true)) {
     return existing.record ? existing : null;
   }
   if (planConversationContinuityClaim({ record, orderedMessages: rows })) {
-    record = await ensureConversationLegacyContinuity({
-      req,
-      res,
-      agent,
-      ownerId,
-      conversationId,
-      orderedMessages: rows,
-      Model,
-      MessageModel,
-      ...options,
-    });
+    if (nativeBodyCarrier === true && nativeReplayBudgetKnown === true && fits) {
+      const compaction = options.compaction || require('./ViventiumMainCompactionService');
+      compaction.scheduleMainContinuityMaintenance({
+        ownerId,
+        agentId: String(agent.id),
+        stableAuthoritySha256: `conversation-continuity:${sha256(conversationId)}`,
+        schedule: () => {
+          // The idle owner has its own response and budget, independent of the finished request.
+          const backgroundReq = Object.create(req || null);
+          backgroundReq.viventiumSchedulerAuthoringDeadlineAt = undefined;
+          return ensureConversationLegacyContinuity({
+            ...options,
+            req: backgroundReq,
+            res: undefined,
+            agent,
+            ownerId,
+            conversationId,
+            orderedMessages: rows,
+            Model,
+            MessageModel,
+            compaction,
+            foreground: false,
+            signal: undefined,
+            deadlineAt: undefined,
+          });
+        },
+      });
+    } else {
+      record = await ensureConversationLegacyContinuity({
+        req,
+        res,
+        agent,
+        ownerId,
+        conversationId,
+        orderedMessages: rows,
+        Model,
+        MessageModel,
+        ...options,
+      });
+    }
   }
   const projection = projectConversationContinuity(record, rows);
   return projection.coveredIds.length > 0 ? projection : null;

@@ -77,6 +77,36 @@ export interface IMainCompactionOutputContract {
   maxToolIdentityCharacters: number;
 }
 
+export interface IMainContinuitySizeFeedback {
+  path: '' | 'summary' | '$carrier';
+  constraint: 'max_bytes';
+  actual: number;
+  limit: number;
+  unit: 'utf8_bytes';
+  proposalBytes: number;
+  excessBytes?: number;
+  fieldBytes?: Record<string, number>;
+}
+
+/** Unaccepted repair retained by the existing epoch/lease owner, never delivered context. */
+export interface IMainContinuityCompactionRepair {
+  version: 1;
+  sourceDigest: string;
+  contractKey: string;
+  semanticAttempts: number;
+  /** Completed producer calls that repaired typed fidelity feedback; never reset on resume. */
+  fidelityRepairAttempts?: 0 | 1;
+  transportRetries: number;
+  sourceGeneration: number;
+  sourceTurnKeys: string[];
+  legacySourceRange?: IMainContinuityLegacySourceRange;
+  outputContract?: IMainCompactionOutputContract;
+  sizeRepair?: { proposalBytes: number; previousProposalBytes: number; converging: true };
+  correction:
+    | { code: 'semantic_fidelity'; candidate: string; reason?: string }
+    | { code: 'schema_invalid'; issue: IMainContinuitySizeFeedback; candidate?: string; reason?: never };
+}
+
 export interface IMainContinuityCompactionLease {
   leaseId: string;
   sourceDigest: string;
@@ -126,6 +156,7 @@ export interface IViventiumMainContinuityState {
   semanticCompactionContract?: IMainCompactionOutputContract;
   compactionStatus: MainContinuityCompactionStatus;
   compactionLease: IMainContinuityCompactionLease | null;
+  pendingCompactionRepair?: IMainContinuityCompactionRepair | null;
   lastCompactionError: string;
   createdAt: Date;
   updatedAt: Date;

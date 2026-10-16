@@ -454,7 +454,9 @@ export function createGlassHiveActiveWorkService(dependencies: ActiveWorkService
                 : 'stale',
           };
         }
-        throw new Error('glasshive_active_work_snapshot_superseded');
+        throw Object.assign(new Error('glasshive_active_work_snapshot_superseded'), {
+          code: 'glasshive_active_work_snapshot_superseded',
+        });
       })
       .finally(() => {
         if (refreshRegistry.get(deadlineKey) === pending) {
@@ -518,17 +520,21 @@ export function createGlassHiveActiveWorkService(dependencies: ActiveWorkService
     } catch (error) {
       const callerWaitExpired = error instanceof ActiveWorkSnapshotWaitTimeout;
       const refreshStage = forceRefresh ? 'interactive_refresh' : 'snapshot_refresh';
-      logger.warn(
-        callerWaitExpired
-          ? '[VIVENTIUM][active-work] Snapshot wait expired'
-          : '[VIVENTIUM][active-work] Snapshot refresh failed',
-        {
+      const errorRecord = recordFrom(error);
+      const errorClass = error instanceof Error || error instanceof DOMException ? error.name : '';
+      const code = callerWaitExpired ? 'glasshive_active_work_wait_timeout' : errorRecord.code;
+      const httpStatus = errorRecord.status;
+      const diagnostic = {
           stage: callerWaitExpired ? 'snapshot_wait' : refreshStage,
-          errorClass:
-            error instanceof Error || error instanceof DOMException ? error.name : 'unknown_error',
+          errorClass: /^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(errorClass) ? errorClass : 'unknown_error',
+          code: typeof code === 'string' && /^[a-zA-Z0-9_.-]{1,64}$/.test(code) ? code : null,
+          httpStatus: typeof httpStatus === 'number' && Number.isInteger(httpStatus) &&
+            httpStatus >= 100 && httpStatus <= 599 ? httpStatus : null,
           elapsedMs: Date.now() - now,
-        },
-      );
+      };
+      // Runtime warning transports keep the message but discard extra metadata.
+      const label = callerWaitExpired ? 'Snapshot wait expired' : 'Snapshot refresh failed';
+      logger.warn(`[VIVENTIUM][active-work] ${label} ${JSON.stringify(diagnostic)}`);
       const current = activeWorkCache.get(key);
       if (current) {
         return { ...current.value, snapshot: 'stale' };

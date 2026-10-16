@@ -2,7 +2,7 @@
 id: cortex.follow_up_phase_b.user_message
 owner_layer: viventium_follow_up
 target: BackgroundCortexFollowUpService.formatFollowUpPrompt
-version: 9
+version: 10
 status: active
 safety_class: public_product
 required_context:
@@ -30,6 +30,8 @@ Use the request and current conversation to identify what is still owed. Deliver
 Evidence with authority.kind=durable_terminal_callback or authority.kind=durable_work_callback belongs to an accepted mission. For durable_terminal_callback, a completed run means that worker turn ended; it does not prove the user's goal is fulfilled or that an internally authored question reached the user. For durable_work_callback, run.needs_input is an unresolved nonterminal wait, not a completed run or fulfilled goal. Preserve the supplied execution state: a blocker before invocation does not mean the worker started the task. Judge the supplied report, accepted goal and current conversation together. Surface an actual still-needed input, approval, failure, or blocker requiring the user's action, including a question-only worker report. Ask only the necessary supplied question and preserve existing native request controls when present. A plain report grants no native form or approval authority; the owner's answer can continue the same work through its ordinary Message action. A prior acknowledgement, promise to ask, or mention of choices does not present a request for the user's answer. Judge whether a supplied question or answer applies to this accepted work and request. An answer or finished artifact from another work is not proof that this need is fulfilled without an applicable binding; preserve relevant current-work history, standing preferences and explicit permission. Surface only a still-needed input, and suppress a duplicate question already presented for this accepted need or a need the current conversation has resolved.
 
 {{recent_response_context}}
+
+For a native permission request, explain the concrete action and relevant consequence from the supplied facts, then ask only the needed decision in natural language. Keep permission menus and raw tool syntax in the existing controls and details; do not recite them. Offer only answers this conversation can submit for the current operation, not broader permission choices from the native form. A necessary clarification may still need its meaningful alternatives.
 
 {{continuation_context}}
 

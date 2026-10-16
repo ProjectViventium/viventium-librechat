@@ -222,6 +222,56 @@ describe('Conversation legacy continuity', () => {
     });
   }
 
+  test('background native migration reloads each committed prefix and preserves original rows', async () => {
+    const rows = legacyThread(200);
+    for (const row of rows)
+      if (!row.isCreatedByUser) row.text += ' Exact retained source.'.repeat(120);
+    await Message.insertMany(rows);
+    const carried = carriedChain(rows);
+    const before = JSON.stringify(carried);
+    const calls = [];
+    const callLiveness = jest
+      .spyOn(
+        require('../server/services/viventium/CallSessionService'),
+        'getActiveCallSessionForMainMaintenance',
+      )
+      .mockResolvedValue(null);
+    try {
+      const record = await ensureConversationLegacyContinuity({
+        req: schedulerRequest(),
+        agent: AGENT,
+        ownerId: OWNER,
+        conversationId: CONVERSATION,
+        orderedMessages: carried,
+        Model: Continuity,
+        MessageModel: Message,
+        foreground: false,
+        executeCompactor: compactor(calls),
+      });
+      const generation = calls.filter((call) => call.stage !== 'review');
+      expect(generation.length).toBeGreaterThan(1);
+      expect(generation.length).toBeLessThanOrEqual(4);
+      expect(generation[1].claim.previousSemanticCompaction).toEqual(
+        expect.objectContaining({ summary: expect.any(String) }),
+      );
+      const sources = generation.map((call) =>
+        call.claim.sourceTurns.map((turn) => turn.assistantMessageId),
+      );
+      expect(new Set(sources.flat()).size).toBe(sources.flat().length);
+      expect(record.status).toBe('ready');
+      const projected = projectConversationContinuity(record, carried);
+      expect([...projected.coveredIds, ...projected.messages.map((row) => row.messageId)]).toEqual(
+        carried.map((row) => row.messageId),
+      );
+      expect(JSON.stringify(carried)).toBe(before);
+      expect(await Message.countDocuments({ user: OWNER, conversationId: CONVERSATION })).toBe(
+        rows.length,
+      );
+    } finally {
+      callLiveness.mockRestore();
+    }
+  });
+
   test('the actual legacy store renews the measured same-source correction inside the enclosing budget', async () => {
     const rows = await seed(140);
     const carried = carriedChain(rows);

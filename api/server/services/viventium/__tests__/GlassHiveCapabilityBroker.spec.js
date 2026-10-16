@@ -1,3 +1,5 @@
+const mockCitationAccess = jest.fn(async () => true);
+jest.mock('~/models/Role', () => ({ getRoleByName: jest.fn() }));
 const mockPrepareDurableEffect = jest.fn();
 const mockCommitDurableEffect = jest.fn();
 const mockSettleDurableEffectFailure = jest.fn();
@@ -126,6 +128,7 @@ jest.mock('~/server/services/Tools/mcp', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  checkAccess: (...args) => mockCitationAccess(...args),
   assertCurrentGlassHiveSourceAuthor: (...args) => mockAssertCurrentGlassHiveSourceAuthor(...args),
   GenerationJobManager: {
     getJobStore: jest.fn(),
@@ -343,12 +346,15 @@ describe('GlassHive capability broker', () => {
     });
     mockMarkGlassHiveLaunchDispatchReady.mockResolvedValue({ launchState: 'dispatch_ready' });
     mockMarkGlassHiveLaunchPreDispatchFailed.mockResolvedValue({ launchState: 'not_dispatched' });
-    mockCreateCapabilityAuthorization.mockResolvedValue({
+    mockCreateCapabilityAuthorization.mockImplementation(async (input) => ({
+      ...(Array.isArray(input.eagerServers)
+        ? { eagerServers: input.eagerServers, deferredServers: input.deferredServers }
+        : {}),
       authorizationRef: 'gha-synthetic-authorization',
       originRef: 'ghi-synthetic',
       scopeFingerprint: 'synthetic-scope-fingerprint',
       maxExpiresAt: new Date('2026-09-03T00:00:00.000Z'),
-    });
+    }));
   });
 
   afterAll(() => {
@@ -606,6 +612,7 @@ describe('GlassHive capability broker', () => {
         'active_work_action',
       ],
       workerProfile: 'codex-cli',
+      workerAccess: 'full',
       fallbackWorkerProfile: 'claude-code',
     });
     const grant = await hydrateBrokerGrantResources(
@@ -628,11 +635,19 @@ describe('GlassHive capability broker', () => {
         file_selection: { version: 1 },
         request_body: { conversationId: 'conv-1', messageId: 'msg-1' },
         worker_profile: 'codex-cli',
+        worker_access: 'full',
         fallback_worker_profile: 'claude-code',
         mission_host_tools: [],
       },
     });
     expect(bundle.glasshive_capability_broker.allowed_host_tools).toEqual(grant.allowed_host_tools);
+    for (const brief of [bundle.agents_md, bundle.claude_md, bundle.codex_md]) {
+      expect(brief).toContain('This list is the scope of this invocation only');
+      expect(brief).toContain(
+        'Absence means the host did not resolve or authorize them for this invocation',
+      );
+      expect(brief).not.toContain('same resolved host capabilities available to the main Agent');
+    }
   });
 
   test('joins a created broker grant to its signed current scope with hashes only', async () => {
@@ -1252,6 +1267,7 @@ describe('GlassHive capability broker', () => {
 
   test.each([
     [{ status: 503, retryable: false }, false],
+    [{ status: 503, retryable: false, code: 'work_action_outcome_unconfirmed' }, false],
     [{ status: 429 }, true],
     [{ status: 408 }, true],
     [{ status: 429, failureRetryable: false }, false],
@@ -1287,7 +1303,7 @@ describe('GlassHive capability broker', () => {
       });
       expect(result).toMatchObject({
         status: 'blocked',
-        reason: 'work_action_rejected',
+        reason: failure.code || 'work_action_rejected',
         retryable,
       });
       expect(mockExecuteGlassHiveWorkAction).toHaveBeenCalledTimes(1);
@@ -1728,6 +1744,92 @@ describe('GlassHive capability broker', () => {
       });
       expect(mockRegisterGlassHiveLaunchContext).not.toHaveBeenCalled();
       expect(callTool).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each([false, true])(
+    'mission_worker cannot import model-authored native full authority (connected=%s)',
+    async (connected) => {
+      mockGetMCPServersRegistry.mockReturnValue({
+        getAllServerConfigs: jest.fn().mockResolvedValue(
+          connected
+            ? {
+                'ms-365': {
+                  source: 'config',
+                  viventiumGlassHive: {
+                    version: 1,
+                    permitsAutonomousWorker: true,
+                    hostAllowed: true,
+                    sandboxAllowed: true,
+                    defaultToolAccess: 'content_read',
+                    contentReadPolicy: 'require_broker_grant',
+                  },
+                },
+              }
+            : {},
+        ),
+      });
+      const {
+        maybeInjectGlassHiveCapabilityBroker,
+      } = require('../GlassHiveCapabilityBootstrapService');
+      const result = await maybeInjectGlassHiveCapabilityBroker({
+        serverName: 'glasshive-workers-projects',
+        toolName: 'worker_delegate_once',
+        toolArguments: {
+          instruction: 'Synthetic ordinary worker task.',
+          execution_mode: 'host',
+          bootstrap_bundle_json: {
+            access_mode: 'full',
+            viventium_launch_authority: {
+              version: 1,
+              kind: 'conversation_orchestrator',
+              execution_mode: 'host',
+              worker_access: 'full',
+            },
+          },
+        },
+        config: {
+          configurable: {
+            user: { id: 'user-1', role: 'USER' },
+            requestBody: { conversationId: 'conv-1', messageId: 'msg-1' },
+            glasshive_launch_authority_kind: 'mission_worker',
+          },
+        },
+      });
+      expect(result.bootstrap_bundle_json.viventium_launch_authority).toBeUndefined();
+    },
+  );
+
+  test.each([undefined, 'ask', 'full'])(
+    'carries only owner background native access %s through normal Main delegation transport',
+    async (workerAccess) => {
+      const callTool = jest.fn().mockResolvedValue({
+        structuredContent: { status: 'accepted', work_ref: 'work-native-1' },
+      });
+      mockGetMCPManager.mockReturnValue({ callTool });
+      mockGetMCPServersRegistry.mockReturnValue({
+        getAllServerConfigs: jest.fn().mockResolvedValue({}),
+      });
+      mockReconcileGlassHiveLaunchResult.mockResolvedValue({ workRef: 'work-native-1' });
+      const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
+      const result = await executeMainDelegation({
+        user: { id: 'user-1' },
+        requestBody: { conversationId: 'conversation-1', messageId: 'message-1' },
+        workerAccess,
+        args: {
+          title: 'Synthetic task',
+          instruction: 'Complete the synthetic local task.',
+          resourceClass: 'standard',
+          worker_access: 'full',
+          access_mode: 'full',
+        },
+        invocationId: 'native-access-configured',
+      });
+      expect(result).toMatchObject({ status: 'ok', workRef: 'work-native-1' });
+      const authority =
+        callTool.mock.calls[0][0].toolArguments.bootstrap_bundle_json.viventium_launch_authority;
+      expect(authority.worker_access).toBe(workerAccess);
+      expect(callTool.mock.calls[0][0].toolArguments.access_mode).toBeUndefined();
     },
   );
 
@@ -2628,14 +2730,16 @@ describe('GlassHive capability broker', () => {
       status: 'ok',
       tool: 'file_search',
       content: 'Synthetic source-backed recall result.',
-      artifact: { file_search: { sources: [{ fileId: recallFile.file_id }] } },
+      artifact: { file_search: { sources: [{ fileId: recallFile.file_id }], fileCitations: true } },
     });
     expect(require('@librechat/api').reportCortexHostToolResult).toHaveBeenCalledWith(
       grant.grant_id,
       expect.objectContaining({
         status: 'ok',
         tool: 'file_search',
-        artifact: { file_search: { sources: [{ fileId: recallFile.file_id }] } },
+        artifact: {
+          file_search: { sources: [{ fileId: recallFile.file_id }], fileCitations: true },
+        },
       }),
     );
     expect(mockCreateFileSearchTool).toHaveBeenCalledWith({
@@ -2646,6 +2750,20 @@ describe('GlassHive capability broker', () => {
       activeMessageId: 'msg-1',
       fileCitations: false,
     });
+
+    for (const displayAccess of [false, 'unavailable']) {
+      if (displayAccess === 'unavailable')
+        mockCitationAccess.mockRejectedValueOnce(new Error('access unavailable'));
+      else mockCitationAccess.mockResolvedValueOnce(false);
+      const denied = await handleToolCall({
+        grant,
+        toolName: 'file_search',
+        args: { query: 'synthetic fact' },
+      });
+      expect(denied.status).toBe('ok');
+      expect(denied.artifact.file_search.fileCitations).toBe(false);
+      expect(denied.content).toBe('Synthetic source-backed recall result.');
+    }
   });
 
   test('exposes and invokes canonical web_search through the signed host-tool broker', async () => {
@@ -2857,6 +2975,85 @@ describe('GlassHive capability broker', () => {
     expect(result.glasshive_capability_broker.allowed_servers).not.toContain('future-reviewed');
   });
 
+  test.each(['missing_auth', 'unreadable_credential'])(
+    'keeps a mission catalog dormant and rechecks cached credentials: %s',
+    async (credentialStatus) => {
+      const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+      const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+      const policy = {
+        source: 'config',
+        requiresOAuth: true,
+        viventiumGlassHive: {
+          version: 1,
+          permitsAutonomousWorker: true,
+          hostAllowed: true,
+          defaultToolAccess: 'content_read',
+          contentReadPolicy: 'require_broker_grant',
+        },
+      };
+      const getServerConfig = jest.fn().mockResolvedValue(policy);
+      mockGetMCPServersRegistry.mockReturnValue({ getServerConfig });
+      mockReinitMCPServer.mockResolvedValue({
+        success: true,
+        oauthRequired: false,
+        tools: [{ name: 'read_item', inputSchema: { type: 'object' } }],
+      });
+      const callTool = jest.fn().mockResolvedValue({ value: 'synthetic' });
+      mockGetMCPManager.mockReturnValue({ callTool });
+      const grant = mintBrokerGrant({
+        user: { id: 'user-1', role: 'USER' },
+        allowedServers: ['selected', 'unrelated'],
+        eagerServers: [],
+        deferredServers: ['selected', 'unrelated'],
+        allowDynamicPolicyServers: false,
+        requestContext: SYNTHETIC_TURN_SCOPE,
+        scopes: { content_read: true },
+      }).payload;
+      expect(await handleToolCall({ grant, toolName: 'capabilities_list' })).toMatchObject({
+        servers: [],
+        deferredServers: ['selected', 'unrelated'],
+      });
+      expect(mockReinitMCPServer).not.toHaveBeenCalled();
+      await handleToolCall({
+        grant,
+        toolName: 'capability_describe',
+        args: { server: 'selected' },
+      });
+      expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+      await expect(
+        handleToolCall({
+          grant,
+          toolName: 'capability_invoke',
+          args: { server: 'selected', tool: 'read_item', arguments: {} },
+        }),
+      ).resolves.toEqual({ value: 'synthetic' });
+      expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+      expect(mockReinitMCPServer).not.toHaveBeenCalledWith(
+        expect.objectContaining({ serverName: 'unrelated' }),
+      );
+      mockInspectStoredOAuthCredentialState.mockResolvedValue({ status: credentialStatus });
+      await expect(
+        handleToolCall({
+          grant,
+          toolName: 'capability_invoke',
+          args: { server: 'selected', tool: 'read_item', arguments: {} },
+        }),
+      ).resolves.toMatchObject({ status: 'blocked', reason: credentialStatus });
+      expect(callTool).toHaveBeenCalledTimes(1);
+      expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+      getServerConfig.mockResolvedValue(null);
+      await expect(
+        handleToolCall({
+          grant,
+          toolName: 'capability_invoke',
+          args: { server: 'selected', tool: 'read_item', arguments: {} },
+        }),
+      ).resolves.toMatchObject({ status: 'not_found' });
+      expect(callTool).toHaveBeenCalledTimes(1);
+      expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+    },
+  );
+
   test('keeps deferred MS365 dormant until an explicit describe or invoke', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
@@ -2920,7 +3117,7 @@ describe('GlassHive capability broker', () => {
         args: { server: 'ms-365', tool: 'ms-365_search', arguments: { query: 'synthetic' } },
       }),
     ).resolves.toEqual({ ok: true });
-    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+    expect(mockReinitMCPServer).not.toHaveBeenCalled();
     expect(callTool).toHaveBeenCalledWith(
       expect.objectContaining({ serverName: 'ms-365', toolName: 'ms-365_search' }),
     );
@@ -3457,36 +3654,60 @@ describe('GlassHive capability broker', () => {
     );
   });
 
-  test('managed work action reserves and commits one authoritative operation result', async () => {
-    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
-    const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
-    mockGetMCPServersRegistry.mockReturnValue({
-      getAllServerConfigs: jest.fn().mockResolvedValue({}),
-    });
-    mockExecuteGlassHiveWorkAction.mockResolvedValueOnce({ state: 'paused', workRef: 'work-1' });
-    const grant = mintBrokerGrant({
-      user: { id: 'user-1', role: 'USER' },
-      requestContext: SYNTHETIC_TURN_SCOPE,
-      authorityKind: 'conversation_orchestrator',
-      allowedHostTools: ['active_work_action'],
-      hostToolResources: { active_work_action: { version: 1, request_body: managedAuthorBody } },
-    }).payload;
-    const result = await handleToolCall({
-      grant,
-      toolName: 'active_work_action',
-      args: { action: 'pause', workRef: 'work-1', invocation_id: 'action-1' },
-    });
-    expect(result).toMatchObject({ status: 'ok', result: { state: 'paused' } });
-    expect(mockPrepareDurableEffect).toHaveBeenCalledWith(
-      expect.objectContaining({ adapterId: 'glasshive.work_action.v1', operation: 'pause' }),
-    );
-    expect(mockPrepareDurableEffect.mock.invocationCallOrder[0]).toBeLessThan(
-      mockExecuteGlassHiveWorkAction.mock.invocationCallOrder[0],
-    );
-    expect(mockCommitDurableEffect).toHaveBeenCalledWith(
-      expect.objectContaining({ replayResult: result }),
-    );
-  });
+  test.each([false, true])(
+    'managed work action preserves confirmed pending=%s receipt',
+    async (pending) => {
+      const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+      const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+      mockGetMCPServersRegistry.mockReturnValue({
+        getAllServerConfigs: jest.fn().mockResolvedValue({}),
+      });
+      const receipt = {
+        state: pending ? 'running' : 'paused',
+        workRef: 'work-1',
+        status: pending ? 'pending' : 'accepted',
+        confirmationPending: pending,
+      };
+      mockExecuteGlassHiveWorkAction.mockResolvedValueOnce(receipt);
+      mockCommitDurableEffect.mockImplementationOnce(async (input) => ({
+        ownerId: 'user-1',
+        sourceEventId: 'source-1',
+        responseMessageId: 'msg-1',
+        effectKind: 'durable_work_action_accepted',
+        providerReceiptRef: input.providerReceiptRef,
+        replayResult: input.replayResult,
+      }));
+      const grant = mintBrokerGrant({
+        user: { id: 'user-1', role: 'USER' },
+        requestContext: SYNTHETIC_TURN_SCOPE,
+        authorityKind: 'conversation_orchestrator',
+        allowedHostTools: ['active_work_action'],
+        hostToolResources: { active_work_action: { version: 1, request_body: managedAuthorBody } },
+      }).payload;
+      const result = await handleToolCall({
+        grant,
+        toolName: 'active_work_action',
+        args: { action: 'pause', workRef: 'work-1', invocation_id: 'action-1' },
+      });
+      expect(result).toMatchObject({ status: 'ok', result: receipt });
+      expect(mockMarkDurableEffectReceipt).toHaveBeenCalledWith(
+        expect.objectContaining(pending ? { confirmationPending: true } : {}),
+      );
+      if (!pending)
+        expect(mockMarkDurableEffectReceipt.mock.calls[0][0]).not.toHaveProperty(
+          'confirmationPending',
+        );
+      expect(mockPrepareDurableEffect).toHaveBeenCalledWith(
+        expect.objectContaining({ adapterId: 'glasshive.work_action.v1', operation: 'pause' }),
+      );
+      expect(mockPrepareDurableEffect.mock.invocationCallOrder[0]).toBeLessThan(
+        mockExecuteGlassHiveWorkAction.mock.invocationCallOrder[0],
+      );
+      expect(mockCommitDurableEffect).toHaveBeenCalledWith(
+        expect.objectContaining({ replayResult: result }),
+      );
+    },
+  );
 
   test('managed connected writes persist an exact returned outcome without claiming provider idempotency', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
@@ -3623,6 +3844,20 @@ describe('GlassHive capability broker', () => {
       'ms-365',
     ]);
     expect(result.bootstrap_bundle_json.glasshive_capability_broker.scopes.content_read).toBe(true);
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker.eager_servers).toEqual([]);
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker.deferred_servers).toEqual([
+      'ms-365',
+    ]);
+    for (const content of [
+      result.context,
+      result.bootstrap_bundle_json.agents_md,
+      result.bootstrap_bundle_json.codex_md,
+      result.bootstrap_bundle_json.claude_md,
+    ]) {
+      expect(content).toContain(
+        'Deferred capability servers (discover only when the task needs them): ms-365',
+      );
+    }
     expect(result.bootstrap_bundle_json.glasshive_capability_broker.status).toBe(
       'pending_admission',
     );
@@ -3665,6 +3900,8 @@ describe('GlassHive capability broker', () => {
       expect.objectContaining({
         originRef: 'ghi-synthetic',
         allowedServers: ['ms-365'],
+        eagerServers: [],
+        deferredServers: ['ms-365'],
         contentReadScope: true,
         requestContext: expect.objectContaining({
           conversation_id: 'conv-1',
@@ -3705,6 +3942,18 @@ describe('GlassHive capability broker', () => {
     });
 
     expect(result.instruction).toContain('Authorized host tools for this run: file_search');
+    for (const brief of [
+      result.instruction,
+      result.bootstrap_bundle_json.agents_md,
+      result.bootstrap_bundle_json.claude_md,
+      result.bootstrap_bundle_json.codex_md,
+    ]) {
+      expect(brief).toContain('This list is the scope of this invocation only');
+      expect(brief).toContain(
+        'does not describe other agents’ or workers’ capabilities or results',
+      );
+      expect(brief).not.toContain('same resolved host capabilities available to the main Agent');
+    }
     expect(result.instruction).toContain(
       'Host-tool resources are virtual service evidence, not workspace paths',
     );

@@ -64,7 +64,18 @@ test.each([
     conversationId: 'conversation-wake',
     parentMessageId: 'parent-wake',
     agent: { id: 'main-wake' },
-    insightsData: { cortexCount: 1 },
+    insightsData: {
+      cortexCount: 1,
+      insights: [
+        {
+          cortexId: 'synthetic-worker',
+          insight: 'Verified synthetic worker result.',
+          ...(mode === 'durable_worker'
+            ? { authority: { kind: 'durable_terminal_callback' } }
+            : {}),
+        },
+      ],
+    },
   };
   const prepared = {
     voiceTaskId: task.taskId,
@@ -91,6 +102,11 @@ test.each([
       expect(JSON.stringify(events[0])).not.toContain('Main authored synthetic result');
       expect(hydrate).toHaveBeenCalledTimes(1);
     } else expect(events).toHaveLength(0);
+    if (mode === 'durable_worker') {
+      expect(saved).toHaveLength(1);
+      expect(saved[0].metadata.viventium.followUpSource).toBe('durable_terminal_callback');
+      expect(hydrate).not.toHaveBeenCalled();
+    }
   } finally {
     save.mockRestore();
     hydrate.mockRestore();

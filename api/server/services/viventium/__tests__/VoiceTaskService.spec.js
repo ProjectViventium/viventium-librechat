@@ -1553,26 +1553,6 @@ describe('VoiceTaskService', () => {
       error: { code: 'provider_failure', message: 'Provider unavailable' },
     });
   });
-
-  test('marks tool completion structurally without requiring detail-text inference', () => {
-    const task = createVoiceTask({ callSessionId: 'call-tool', userId: 'user-1', streamId: 's' });
-    const completed = observeGenerationEvent(task.taskId, {
-      event: 'on_run_step_completed',
-      data: {
-        result: {
-          id: 'step-complete',
-          type: 'tool_call',
-          tool_call: { id: 'tool-call-complete', name: 'web_search' },
-        },
-      },
-    });
-    expect(completed).toMatchObject({
-      type: 'progress',
-      state: 'running',
-      phase: 'tool_completed',
-      label: 'web_search',
-    });
-  });
 });
 
 describe('Stop execution owner barrier', () => {

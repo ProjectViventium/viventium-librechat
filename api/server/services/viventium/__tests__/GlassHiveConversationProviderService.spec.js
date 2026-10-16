@@ -81,8 +81,10 @@ describe('GlassHiveConversationProviderService', () => {
     }
     test('private machine state is signed, internal and retained by the real capability refresher', async () => {
       const input = { ...args(), privateStructuredResponse: true };
-      expect(await attachConversationProviderCapabilityBundle(input)).toBe(true);
       expect(installConversationProviderCapabilityRefresher(input)).toBe(true);
+      expect(
+        await attachConversationProviderCapabilityBundle({ ...input, deferUntilInvocation: true }),
+      ).toBe(true);
       const refreshed = await input.targetAgent.viventiumConversationProviderCapabilityRefresh({
         messageId: 'next-attempt',
       });
@@ -226,6 +228,146 @@ describe('GlassHiveConversationProviderService', () => {
     getMessages.mockResolvedValue([]);
     getFiles.mockResolvedValue([]);
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-bundle-secret';
+  });
+
+  test('defers only graph-owned minting and preserves the exact invocation-fresh capability', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1700000000000);
+    try {
+      buildConversationProviderBootstrapBundle.mockResolvedValue({
+        glasshive_capability_broker: {
+          grant_token: 'synthetic-fresh-grant',
+          grant_id: 'synthetic-grant',
+        },
+        conversation_provider_instructions: 'Use only the freshly authorized capability.',
+      });
+      const make = () => {
+        const targetAgent = {
+          id: 'participant',
+          instructions: 'Stable instructions.',
+          tools: [`lookup${Constants.mcp_delimiter}declared`],
+          model_parameters: {
+            configuration: {
+              defaultHeaders: {
+                'X-GlassHive-Agent-Id': 'participant',
+                'X-GlassHive-Access': 'read_only',
+                'X-GlassHive-Bootstrap-Signature': 'stale',
+                'X-Existing': 'keep',
+              },
+            },
+          },
+        };
+        const req = { user: { id: 'owner' }, body: { conversationId: 'new' } };
+        setTrustedInteractionContext(req, {
+          actor_kind: 'system',
+          origin: 'scheduler',
+          surface: 'workbench',
+          source_event_id: 'occurrence',
+        });
+        return { targetAgent, req, capability: { workspace_binding: true } };
+      };
+      const deferred = make();
+      expect(installConversationProviderCapabilityRefresher(deferred)).toBe(true);
+      expect(
+        await attachConversationProviderCapabilityBundle({
+          ...deferred,
+          deferUntilInvocation: true,
+        }),
+      ).toBe(false);
+      expect(buildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
+      expect(getMessages).not.toHaveBeenCalled();
+      expect(primeFiles).not.toHaveBeenCalled();
+      expect(deferred.targetAgent.model_parameters.configuration.defaultHeaders).toEqual({
+        'X-GlassHive-Agent-Id': 'participant',
+        'X-GlassHive-Access': 'read_only',
+        'X-Existing': 'keep',
+        'X-Viventium-Actor-Kind': 'system',
+        'X-Viventium-Origin': 'scheduler',
+      });
+      const finalized = { conversationId: 'final-conversation', messageId: 'final-message' };
+      const fresh =
+        await deferred.targetAgent.viventiumConversationProviderCapabilityRefresh(finalized);
+      const eager = make();
+      await attachConversationProviderCapabilityBundle({ ...eager, requestBody: finalized });
+      expect(fresh.attached).toBe(true);
+      expect(fresh.defaultHeaders).toEqual(
+        eager.targetAgent.model_parameters.configuration.defaultHeaders,
+      );
+      expect(deferred.targetAgent.instructions).toBe(eager.targetAgent.instructions);
+      expect(buildConversationProviderBootstrapBundle).toHaveBeenCalledTimes(2);
+      expect(buildConversationProviderBootstrapBundle.mock.calls[0][0]).toEqual(
+        buildConversationProviderBootstrapBundle.mock.calls[1][0],
+      );
+      expect(buildConversationProviderBootstrapBundle.mock.calls[0][0].requestBody).toEqual(
+        finalized,
+      );
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  test('does not defer a direct caller without an installed invocation refresher', async () => {
+    buildConversationProviderBootstrapBundle.mockResolvedValue({
+      codex_config_append: 'synthetic-authority',
+    });
+    const targetAgent = {
+      tools: [`lookup${Constants.mcp_delimiter}declared`],
+      model_parameters: {},
+    };
+    expect(
+      await attachConversationProviderCapabilityBundle({
+        targetAgent,
+        req: { user: { id: 'owner' }, body: {} },
+        capability: { workspace_binding: true },
+        deferUntilInvocation: true,
+      }),
+    ).toBe(true);
+    expect(buildConversationProviderBootstrapBundle).toHaveBeenCalledTimes(1);
+    expect(
+      targetAgent.model_parameters.configuration.defaultHeaders['X-GlassHive-Bootstrap-Signature'],
+    ).toMatch(/^sha256=/);
+  });
+
+  test('deferred graph refresh retains unavailable authority and passive failure-safe timing', async () => {
+    const { logger } = require('@librechat/data-schemas');
+    const input = {
+      targetAgent: {
+        id: 'participant',
+        instructions: 'Stable rules.',
+        tools: [`lookup${Constants.mcp_delimiter}declared`],
+        model_parameters: {},
+      },
+      req: {
+        user: { id: 'owner' },
+        body: {},
+        viventiumVoiceLogLatency: true,
+        viventiumVoiceRequestId: 'synthetic-request',
+      },
+      capability: { workspace_binding: true },
+    };
+    installConversationProviderCapabilityRefresher(input);
+    await attachConversationProviderCapabilityBundle({ ...input, deferUntilInvocation: true });
+    buildConversationProviderBootstrapBundle.mockRejectedValue(new Error('synthetic denied'));
+    const result = await input.targetAgent.viventiumConversationProviderCapabilityRefresh({
+      messageId: 'final',
+    });
+    expect(result.attached).toBe(false);
+    expect(result.defaultHeaders).not.toHaveProperty('X-GlassHive-Bootstrap-Signature');
+    expect(result.instructionAppend).toContain('host capability broker is unavailable');
+    expect(logger.debug).toHaveBeenCalledWith(
+      '[VoiceLatency][LC][Timing]',
+      expect.objectContaining({
+        stage: 'capability_refresh_completed',
+        source: expect.stringMatching(/^conversation_provider:[a-f0-9]{64}$/),
+        request_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        stage_ms_f: expect.any(Number),
+      }),
+    );
+    logger.debug.mockImplementationOnce(() => {
+      throw new Error('diagnostic failure');
+    });
+    await expect(
+      input.targetAgent.viventiumConversationProviderCapabilityRefresh({ messageId: 'next' }),
+    ).resolves.toMatchObject({ attached: false });
   });
 
   test('signs selected prior native outputs using current owner File metadata', async () => {
@@ -1055,34 +1197,37 @@ describe('GlassHiveConversationProviderService', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
-  test('delivers a maintenance yield to release the exact native compactor request', async () => {
-    const abortController = new AbortController();
-    const fetchImpl = jest.fn().mockResolvedValue({
-      ok: true,
-      json: jest.fn().mockResolvedValue({ capacityReleased: true }),
-    });
-    const req = {
-      _viventiumHarnessExecutionEnabled: true,
-      _viventiumHarnessIdempotencyKey: 'cortex:compaction-run:compactor-agent',
-      body: {},
-      user: { id: 'user-synthetic' },
-    };
+  test.each(['maintenance_yield', 'compaction_lease_lost'])(
+    'delivers %s to release the exact native compactor request',
+    async (reason) => {
+      const abortController = new AbortController();
+      const fetchImpl = jest.fn().mockResolvedValue({
+        ok: true,
+        json: jest.fn().mockResolvedValue({ capacityReleased: true }),
+      });
+      const req = {
+        _viventiumHarnessExecutionEnabled: true,
+        _viventiumHarnessIdempotencyKey: 'cortex:compaction-run:compactor-agent',
+        body: {},
+        user: { id: 'user-synthetic' },
+      };
 
-    bindHarnessCancellation({
-      req,
-      signal: abortController.signal,
-      endpointConfig: { baseURL: 'http://glasshive.local/v1', apiKey: 'synthetic-key' },
-      fetchImpl,
-    });
-    abortController.abort('maintenance_yield');
-    await req._viventiumHarnessCancellationDeliveryPromise;
+      bindHarnessCancellation({
+        req,
+        signal: abortController.signal,
+        endpointConfig: { baseURL: 'http://glasshive.local/v1', apiKey: 'synthetic-key' },
+        fetchImpl,
+      });
+      abortController.abort(reason);
+      await req._viventiumHarnessCancellationDeliveryPromise;
 
-    expect(fetchImpl).toHaveBeenCalledWith(
-      'http://glasshive.local/v1/requests/by-idempotency/cortex%3Acompaction-run%3Acompactor-agent/cancel',
-      expect.objectContaining({ method: 'POST' }),
-    );
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-  });
+      expect(fetchImpl).toHaveBeenCalledWith(
+        'http://glasshive.local/v1/requests/by-idempotency/cortex%3Acompaction-run%3Acompactor-agent/cancel',
+        expect.objectContaining({ method: 'POST' }),
+      );
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    },
+  );
 
   test('delivers an already-requested maintenance yield when direct binding finishes late', async () => {
     const abortController = new AbortController();

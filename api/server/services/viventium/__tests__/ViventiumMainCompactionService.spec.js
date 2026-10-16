@@ -1,10 +1,18 @@
 'use strict';
+jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
+  getNativeConversationReplayBudgetForRoutes: jest.fn(async () => null),
+}));
 jest.mock('../ViventiumMainContinuityService', () => require('./fixtures/mainContinuity')());
+jest.mock('../CallSessionService', () => ({
+  getActiveCallSessionForMainMaintenance: jest.fn(async () => null),
+}));
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const yaml = require('js-yaml');
 const { resetPromptRegistryForTests } = require('../promptRegistry');
+const { mainCompactionRenderedBytes } = require('@librechat/api');
 const reviewApproved = JSON.stringify({ approved: true, reason: 'Faithful test fixture.' });
 let promptDirectory;
 let previousBundle;
@@ -46,6 +54,7 @@ const {
   buildCompactionPrompt,
   compactorAgent,
   ensureAcceptedMainCompaction,
+  flushEndedCallMainCompactions,
   loadAcceptedMainContextForAdmission,
   parseSemanticCompactionOutput,
   yieldAcceptedMainCompaction,
@@ -446,6 +455,61 @@ describe('ViventiumMainCompactionService', () => {
     ).toMatchObject({ version: 1, summary: 'Earlier state.' });
     expect(parseSemanticCompactionOutput('Here is the summary: {"version":1}')).toBeNull();
   });
+  test('repairs candidate-only tool identities before spending an independent review call', async () => {
+    const pair = {
+      callId: 'call_opaque_001',
+      toolName: 'read_record',
+      outcome: 'Record value is 7.',
+    };
+    const candidate = {
+      version: 1,
+      summary: 'Record value is 7.',
+      pendingAsks: [],
+      commitments: [],
+      corrections: [],
+      decisions: [],
+      durableIdentifiers: [],
+      recurrenceOutcomes: [],
+      toolPairs: [pair],
+    };
+    const claim = {
+      status: 'claimed',
+      leaseId: 'typed-identity-repair',
+      domainEpochKey: 'typed-identity-domain',
+      sourceDigest: 'b'.repeat(64),
+      sourceBytes: 500,
+      previousSemanticCompaction: null,
+      sourceTurns: [{ toolPairs: [pair] }],
+      leaseExpiresAt: new Date(Date.now() + 300000),
+    };
+    const stages = [],
+      prompts = [];
+    let generated = 0;
+    const result = await ensureAcceptedMainCompaction({
+      ...identity,
+      claimCompaction: async () => claim,
+      completeCompaction: async () => ({ status: 'compacted' }),
+      rejectCompaction: async () => ({ status: 'degraded' }),
+      executeCompactor: async (call) => {
+        stages.push(call.stage || 'compaction');
+        prompts.push(call.prompt);
+        call.reportCapacityRelease(true);
+        if (call.stage === 'review') return reviewApproved;
+        generated += 1;
+        return JSON.stringify(
+          generated === 1
+            ? { ...candidate, toolPairs: [{ ...pair, callId: 'call_opaque_00I' }] }
+            : candidate,
+        );
+      },
+    });
+    expect(result).toMatchObject({ status: 'compacted', attempts: 2 });
+    expect(stages).toEqual(['compaction', 'compaction', 'review']);
+    expect(prompts[1]).toContain('"constraint":"source_identity"');
+    expect(prompts[2]).toContain('"typedToolIdentityComparison":{"version":1,"exactMatches":');
+    expect(prompts[2]).toContain('"sourceLocations":["sourceTurns.0.toolPairs.0"]');
+  });
+
   test('renders the same legacy provenance and retirement evidence into generation and review', () => {
     const legacyInputs = [
       {
@@ -540,7 +604,7 @@ describe('ViventiumMainCompactionService', () => {
   });
 
   test.each(['max_bytes', 'shape'])(
-    'repairs the exact rejected candidate after %s without replacing accepted source',
+    'repairs %s without replacing accepted source or echoing an oversized draft',
     async (constraint) => {
       const { mainCompactionOutputConstraints } = require('@librechat/api');
       for (let index = 1; index <= 4; index += 1) {
@@ -595,9 +659,10 @@ describe('ViventiumMainCompactionService', () => {
       );
       expect(payloads[1].priorRejection).toMatchObject({
         code: 'schema_invalid',
-        candidate: rejected,
         issue: { constraint },
       });
+      if (constraint === 'max_bytes') expect(payloads[1].priorRejection.candidate).toBeUndefined();
+      else expect(payloads[1].priorRejection.candidate).toBe(rejected);
       if (constraint === 'max_bytes') {
         // The whole-proposal overflow names where its bytes are, so the repair can target them.
         const proposal = JSON.parse(rejected);
@@ -628,6 +693,117 @@ describe('ViventiumMainCompactionService', () => {
       expect(payloads[2].candidate).toEqual(valid);
     },
   );
+
+  test('an indivisible source fits a size correction without duplicating its rejected draft', async () => {
+    const valid = {
+      version: 1,
+      summary: 'Permission and the pending task remain unresolved.',
+      pendingAsks: [],
+      commitments: [],
+      corrections: [],
+      decisions: [],
+      durableIdentifiers: [],
+      recurrenceOutcomes: [],
+      toolPairs: [],
+    };
+    const previousSemanticCompaction = { ...valid, summary: 's'.repeat(80000) };
+    const legacyInputs = [
+      {
+        kind: 'legacy_state',
+        id: 'legacy-artifact',
+        semanticCompaction: { ...valid, summary: 'l'.repeat(39000) },
+        sourceTurns: [
+          {
+            logicalTurnId: 'whole-turn',
+            revision: 1,
+            userText: 'Keep permission required.',
+            assistantText: 'The task is still pending.',
+            toolPairs: [],
+          },
+        ],
+        sourceRange: { artifactId: 'legacy-artifact', start: 0, end: 1, total: 3 },
+      },
+    ];
+    const rejected = JSON.stringify({ ...valid, summary: 'd'.repeat(90000) });
+    const outputContract = {
+      version: 1,
+      consumer: 'accepted_core',
+      carrierMaxUtf8Bytes: 131072,
+      reservedUtf8Bytes: 57388,
+      maxJsonUtf8Bytes: 73684,
+      maxSummaryUtf8Bytes: 73684,
+      maxItemsPerArray: 32,
+      maxStringItemUtf8Bytes: 1024,
+      maxToolIdentityCharacters: 256,
+    };
+    const claim = {
+      status: 'claimed',
+      leaseId: 'indivisible-size',
+      domainEpochKey: 'size-domain',
+      sourceDigest: '9'.repeat(64),
+      sourceBytes: 121050,
+      sourceTurns: [],
+      legacyInputs,
+      previousSemanticCompaction,
+      outputContract,
+      canReduceSource: false,
+      leaseExpiresAt: new Date(Date.now() + 300000),
+    };
+    const original = structuredClone(claim);
+    const completeCompaction = jest.fn(async () => ({ status: 'compacted' }));
+    const rejectCompaction = jest.fn();
+    const calls = [];
+    const result = await ensureAcceptedMainCompaction({
+      ...identity,
+      claimCompaction: async () => claim,
+      completeCompaction,
+      rejectCompaction,
+      executeCompactor: async (call) => {
+        calls.push(call);
+        if (Buffer.byteLength(call.prompt) > 196608)
+          throw Object.assign(new Error('Request exceeds native byte budget'), {
+            errorStatus: 413,
+          });
+        return calls.length === 1
+          ? rejected
+          : call.stage === 'review'
+            ? reviewApproved
+            : JSON.stringify(valid);
+      },
+    });
+    expect(result).toMatchObject({ status: 'compacted', attempts: 2 });
+    expect(calls).toHaveLength(3);
+    const payloads = calls.map(({ prompt }) =>
+      JSON.parse(
+        prompt.match(
+          /<untrusted_(?:conversation_data|compaction_evidence)_v1>\s*([\s\S]*?)\s*<\/untrusted_(?:conversation_data|compaction_evidence)_v1>/,
+        )[1],
+      ),
+    );
+    const correction = payloads[1];
+    expect(correction.priorRejection).toMatchObject({
+      code: 'schema_invalid',
+      issue: { constraint: 'max_bytes', limit: 73684 },
+    });
+    expect(correction.priorRejection.candidate).toBeUndefined();
+    const oldCorrection = {
+      ...correction,
+      priorRejection: { ...correction.priorRejection, candidate: rejected },
+    };
+    expect(Buffer.byteLength(JSON.stringify(oldCorrection))).toBeGreaterThan(196608);
+    for (const payload of payloads) {
+      expect(payload.previousSemanticCompaction).toEqual(original.previousSemanticCompaction);
+      expect(payload.legacyInputs).toEqual(original.legacyInputs);
+      expect(payload.acceptedOlderTurns).toEqual(original.sourceTurns);
+      expect(payload.sourceDigest).toBe(original.sourceDigest);
+      expect(payload.outputConstraints).toEqual(original.outputContract);
+    }
+    expect(calls[2].stage).toBe('review');
+    expect(payloads[2].candidate).toEqual(valid);
+    expect(completeCompaction).toHaveBeenCalledTimes(1);
+    expect(completeCompaction.mock.calls[0][0].semanticReview.approved).toBe(true);
+    expect(rejectCompaction).not.toHaveBeenCalled();
+  });
 
   test('repairs an item byte limit on the same source even when a smaller whole claim exists', async () => {
     const valid = {
@@ -1309,7 +1485,12 @@ describe('ViventiumMainCompactionService', () => {
 
   test('shares measured enclosing reserve across smaller claims and leaves Main completion time', async () => {
     const now = 100000;
-    const executionBudget = { completionReserveMs: 200000, slowestCallMs: 100000 };
+    const executionBudget = {
+      completionReserveMs: 200000,
+      slowestCallMs: 100000,
+      slowestCompactionCallMs: 100000,
+      slowestReviewCallMs: 100000,
+    };
     const claim = jest.fn();
     const executeCompactor = jest.fn();
     const result = await ensureAcceptedMainCompaction({
@@ -1574,13 +1755,17 @@ describe('ViventiumMainCompactionService', () => {
       expect(calls.map((call) => call.stage)).toEqual(['compaction', 'compaction']);
     });
 
-    test('stop when the store lease cannot hold another repair and its review', async () => {
+    test('stop when the store lease cannot hold the measured next repair stage', async () => {
       await commitTurns('lease');
       const { result, calls } = await run(
         [oversized(17), oversized(16), oversized(15), JSON.stringify(fitting)],
-        100 * 1000,
+        110 * 1000,
       );
-      expect(result).toMatchObject({ status: 'degraded', attempts: 2, reason: 'schema_invalid' });
+      expect(result).toMatchObject({
+        status: 'degraded',
+        attempts: 2,
+        reason: 'compaction_lease_expired',
+      });
       expect(calls.map((call) => call.stage)).toEqual(['compaction', 'compaction']);
     });
   });
@@ -1653,6 +1838,9 @@ describe('ViventiumMainCompactionService', () => {
         code: 'semantic_fidelity',
         candidate: rejected,
         reason,
+        carrierHeadroomUtf8Bytes:
+          payloads[2].outputConstraints.carrierMaxUtf8Bytes -
+          mainCompactionRenderedBytes(JSON.parse(rejected), payloads[2].outputConstraints),
       });
       for (const payload of payloads.slice(1)) {
         expect(payload.sourceDigest).toBe(payloads[0].sourceDigest);
@@ -2074,6 +2262,440 @@ describe('ViventiumMainCompactionService', () => {
         }
       },
     );
+
+    test('a long detached native producer reaches review with a renewed live claim and its own deadline', async () => {
+      jest.useFakeTimers();
+      jest.setSystemTime(1000);
+      const args = input(voiceRequest());
+      args.req.config.endpoints = {
+        agents: {
+          providerCapabilities: {
+            'synthetic-native': { workspace_binding: true, conversation_session: true },
+          },
+        },
+      };
+      args.renewCompaction = jest.fn(async ({ leaseExpiresAt, expiresAt }) => {
+        expect(new Date(leaseExpiresAt).getTime()).toBeGreaterThan(Date.now());
+        return { status: 'renewed', leaseExpiresAt: expiresAt.toISOString() };
+      });
+      let started;
+      const admitted = new Promise((resolve) => {
+        started = resolve;
+      });
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async (params) => {
+        expect(typeof params.onNativeAdmission).toBe('function');
+        expect(
+          await params.onNativeAdmission({
+            requestId: params.agent.id,
+            responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+          }),
+        ).toBe(true);
+        if (!params.agent.id.endsWith('-review')) {
+          started();
+          await new Promise((resolve) => setTimeout(resolve, 660000));
+          return { insight: structured, nativeOwnership: 'ended' };
+        }
+        // Fresh stage admission replenishes the short lease left by the long producer.
+        expect(params.executionTimeoutMs).toBe(240000);
+        return { insight: reviewApproved, nativeOwnership: 'ended' };
+      });
+      try {
+        const result = ensureAcceptedMainCompaction(args);
+        await Promise.race([
+          admitted,
+          result.then(() => {
+            throw new Error('Producer not admitted');
+          }),
+        ]);
+        await jest.advanceTimersByTimeAsync(660000);
+        expect(await result).toMatchObject({ status: 'compacted' });
+        expect(execute).toHaveBeenCalledTimes(2);
+        expect(args.renewCompaction.mock.calls.length).toBeGreaterThanOrEqual(4);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        execute.mockRestore();
+        jest.useRealTimers();
+      }
+    });
+
+    test('a finite idle batch admits a fitting native deadline and still reaches reviewed promotion', async () => {
+      jest.useFakeTimers();
+      jest.setSystemTime(1000);
+      const args = input(voiceRequest());
+      args.trigger = 'accepted_turn';
+      args.foreground = false;
+      args.req.viventiumCallSession = null;
+      args.req.config.endpoints = {
+        agents: {
+          providerCapabilities: {
+            'synthetic-native': { workspace_binding: true, conversation_session: true },
+          },
+        },
+      };
+      args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+        status: 'renewed',
+        leaseExpiresAt: expiresAt.toISOString(),
+      }));
+      let started;
+      const admitted = new Promise((resolve) => {
+        started = resolve;
+      });
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async (params) => {
+        expect(typeof params.onNativeAdmission).toBe('function');
+        const accepted = await params.onNativeAdmission({
+          requestId: params.agent.id,
+          responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+        });
+        if (!params.agent.id.endsWith('-review')) {
+          expect(accepted).toBe(true);
+          started();
+          await new Promise((resolve) => setTimeout(resolve, 660000));
+          return { insight: structured, nativeOwnership: 'ended' };
+        }
+        // Another complete native deadline would exceed the same twenty-minute batch.
+        expect(accepted).toBe(false);
+        return { insight: reviewApproved, nativeOwnership: 'ended' };
+      });
+      try {
+        const result = ensureAcceptedMainCompaction(args);
+        await Promise.race([
+          admitted,
+          result.then(() => {
+            throw new Error('Finite producer not admitted');
+          }),
+        ]);
+        await jest.advanceTimersByTimeAsync(660000);
+        expect(await result).toMatchObject({ status: 'compacted' });
+        expect(execute).toHaveBeenCalledTimes(2);
+        expect(args.renewCompaction.mock.calls.length).toBeGreaterThanOrEqual(4);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        execute.mockRestore();
+        jest.useRealTimers();
+      }
+    });
+
+    test.each([
+      { batchMs: 1200000, claims: 2 },
+      { batchMs: 800000, claims: 1 },
+      { batchMs: 1200000, claims: 3, rearm: true },
+      {
+        batchMs: 1200000,
+        claims: 1,
+        completionReserveMs: 240000,
+        producerMs: 330000,
+        reviewMs: 30000,
+      },
+    ])(
+      'long Native stages retain bounded continuation: %p',
+      async ({
+        batchMs,
+        claims,
+        rearm = false,
+        completionReserveMs = 0,
+        producerMs = 400000,
+        reviewMs = 20000,
+      }) => {
+        jest.useFakeTimers();
+        jest.setSystemTime(1000);
+        const args = input(voiceRequest());
+        args.trigger = 'accepted_turn';
+        args.req.viventiumCallSession = null;
+        if (!rearm) args.deadlineAt = new Date(Date.now() + batchMs).toISOString();
+        args.executionBudget = { completionReserveMs };
+        args.req.config.endpoints = {
+          agents: {
+            providerCapabilities: {
+              'synthetic-native': { workspace_binding: true, conversation_session: true },
+            },
+          },
+        };
+        args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+          status: 'renewed',
+          leaseExpiresAt: expiresAt.toISOString(),
+        }));
+        let completed = 0;
+        args.completeCompaction = jest.fn(async () => ({
+          status: 'compacted',
+          continuationPending: ++completed < (rearm ? 3 : 2),
+        }));
+        let started;
+        const admitted = new Promise((resolve) => {
+          started = resolve;
+        });
+        const execute = jest
+          .spyOn(background, 'executeCortex')
+          .mockImplementation(async (params) => {
+            expect(params.executionTimeoutMs).toBeLessThanOrEqual(240000);
+            const review = params.agent.id.endsWith('-review');
+            const accepted = await params.onNativeAdmission({
+              requestId: params.agent.id,
+              responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+            });
+            if (!review) {
+              expect(accepted).toBe(true);
+              started();
+            }
+            await new Promise((resolve) => setTimeout(resolve, review ? reviewMs : producerMs));
+            return { insight: review ? reviewApproved : structured, nativeOwnership: 'ended' };
+          });
+        try {
+          const result = ensureAcceptedMainCompaction(args);
+          await Promise.race([
+            admitted,
+            result.then(() => {
+              throw new Error('First producer not admitted');
+            }),
+          ]);
+          await jest.runAllTimersAsync();
+          const final = await result;
+          expect(completed).toBe(claims);
+          expect(args.claimCompaction).toHaveBeenCalledTimes(claims);
+          expect(execute).toHaveBeenCalledTimes(claims * 2);
+          expect(args.executionBudget.slowestCompactionCallMs).toBe(producerMs);
+          expect(args.executionBudget.slowestReviewCallMs).toBe(reviewMs);
+          expect(args.executionBudget.nativeCompactionAdmissionWindowMs).toBe(
+            660000 + background.getCortexExecutionGuardGraceMs(),
+          );
+          expect(final).toMatchObject(
+            claims >= 2
+              ? { status: 'compacted' }
+              : { status: 'compacted', continuationPending: true, reason: 'idle_budget_exhausted' },
+          );
+          expect(jest.getTimerCount()).toBe(0);
+        } finally {
+          execute.mockRestore();
+          jest.useRealTimers();
+        }
+      },
+    );
+
+    test.each([-1, 0, 1])(
+      'native deadline plus grace/reserve respects the finite boundary (%j)',
+      async (delta) => {
+        jest.useFakeTimers();
+        jest.setSystemTime(1000);
+        const args = input(voiceRequest());
+        args.deadlineAt = new Date(Date.now() + 1200000).toISOString();
+        args.executionBudget = { completionReserveMs: 10000 };
+        args.req.config.endpoints = {
+          agents: {
+            providerCapabilities: {
+              'synthetic-native': { workspace_binding: true, conversation_session: true },
+            },
+          },
+        };
+        args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+          status: 'renewed',
+          leaseExpiresAt: expiresAt.toISOString(),
+        }));
+        const grace = background.getCortexExecutionGuardGraceMs();
+        args.renewCompaction.mockImplementation(async ({ expiresAt }) => {
+          expect(expiresAt.getTime()).toBeLessThanOrEqual(Date.parse(args.deadlineAt) - 10000);
+          return { status: 'renewed', leaseExpiresAt: expiresAt.toISOString() };
+        });
+        const execute = jest
+          .spyOn(background, 'executeCortex')
+          .mockImplementation(async (params) => {
+            expect(typeof params.onNativeAdmission).toBe('function');
+            expect(
+              await params.onNativeAdmission({
+                requestId: params.agent.id,
+                responseDeadlineAt: new Date(
+                  Date.parse(args.deadlineAt) - grace - 10000 + delta,
+                ).toISOString(),
+              }),
+            ).toBe(delta <= 0);
+            return {
+              insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
+              nativeOwnership: 'ended',
+            };
+          });
+        try {
+          expect(await ensureAcceptedMainCompaction(args)).toMatchObject({ status: 'compacted' });
+          if (delta > 0) {
+            expect(args.executionBudget.nativeCompactionAdmissionWindowMs).toBeUndefined();
+            expect(args.executionBudget.nativeReviewAdmissionWindowMs).toBeUndefined();
+          }
+        } finally {
+          execute.mockRestore();
+          jest.useRealTimers();
+        }
+      },
+    );
+
+    test('foreground admission still cancels an admitted finite native compaction', async () => {
+      const args = input(voiceRequest());
+      args.deadlineAt = new Date(Date.now() + 1200000).toISOString();
+      args.executionBudget = { completionReserveMs: 0 };
+      args.req.config.endpoints = {
+        agents: {
+          providerCapabilities: {
+            'synthetic-native': { workspace_binding: true, conversation_session: true },
+          },
+        },
+      };
+      args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+        status: 'renewed',
+        leaseExpiresAt: expiresAt.toISOString(),
+      }));
+      let started;
+      const admitted = new Promise((resolve) => {
+        started = resolve;
+      });
+      let observedSignal;
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async (params) => {
+        expect(
+          await params.onNativeAdmission({
+            requestId: params.agent.id,
+            responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+          }),
+        ).toBe(true);
+        observedSignal = params.signal;
+        started();
+        await new Promise((resolve) =>
+          params.signal.addEventListener('abort', resolve, { once: true }),
+        );
+        params.reportCapacityRelease(true);
+        return { error: 'cancelled', nativeOwnership: 'ended' };
+      });
+      let release;
+      try {
+        const result = ensureAcceptedMainCompaction(args);
+        await Promise.race([
+          admitted,
+          result.then(() => {
+            throw new Error('Finite producer not admitted');
+          }),
+        ]);
+        release = acquireInteractiveMainAdmissionFence(identity.ownerId);
+        await yieldAcceptedMainCompaction(identity.ownerId);
+        expect(observedSignal.aborted).toBe(true);
+        expect(await result).toMatchObject({ status: 'degraded', reason: 'interactive_priority' });
+        expect(args.completeCompaction).not.toHaveBeenCalled();
+      } finally {
+        release?.();
+        execute.mockRestore();
+      }
+    });
+
+    test('prestage CAS contention keeps the original bounded guard without cancelling valid work', async () => {
+      const args = input(voiceRequest());
+      args.req.config.endpoints = {
+        agents: {
+          providerCapabilities: {
+            'synthetic-native': { workspace_binding: true, conversation_session: true },
+          },
+        },
+      };
+      args.renewCompaction = jest.fn(async () => ({ status: 'busy' }));
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async (params) => {
+        expect(params.signal.aborted).toBe(false);
+        expect(params.executionTimeoutMs).toBeLessThanOrEqual(240000);
+        expect(
+          await params.onNativeAdmission({
+            requestId: params.agent.id,
+            responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+          }),
+        ).toBe(false);
+        expect(params.signal.aborted).toBe(false);
+        return {
+          insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
+          nativeOwnership: 'ended',
+        };
+      });
+      try {
+        expect(await ensureAcceptedMainCompaction(args)).toMatchObject({ status: 'compacted' });
+        expect(execute).toHaveBeenCalledTimes(2);
+      } finally {
+        execute.mockRestore();
+      }
+    });
+
+    test.each(['foreground', 'non-native', 'no-renewal'])(
+      'keeps the legacy native deadline policy for %s',
+      async (mode) => {
+        const args = input(voiceRequest());
+        args.req.config.endpoints = {
+          agents: {
+            providerCapabilities: {
+              'synthetic-native': { workspace_binding: true, conversation_session: true },
+            },
+          },
+        };
+        if (mode !== 'no-renewal')
+          args.renewCompaction = jest.fn(async () => ({ status: 'stale_lease' }));
+        if (mode === 'foreground') args.foreground = true;
+        if (mode === 'non-native') args.req.config.endpoints.agents.providerCapabilities = {};
+        const execute = jest
+          .spyOn(background, 'executeCortex')
+          .mockImplementation(async (params) => {
+            expect(params.onNativeAdmission).toBeUndefined();
+            expect(params.executionTimeoutMs).toBeLessThanOrEqual(240000);
+            return {
+              insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
+              nativeOwnership: 'ended',
+            };
+          });
+        try {
+          expect(await ensureAcceptedMainCompaction(args)).toMatchObject({ status: 'compacted' });
+        } finally {
+          execute.mockRestore();
+        }
+      },
+    );
+
+    test('uses canonical Main primary and fallback for producer and reviewer after a Voice override', async () => {
+      const args = input(voiceRequest());
+      const { retainMainCompactionRoute } = require('@librechat/api');
+      retainMainCompactionRoute(args.req, {
+        ...args.agent,
+        provider: 'selected-main',
+        model: 'selected-main-model',
+        model_parameters: { reasoning_effort: 'high' },
+        fallback_llm_provider: 'selected-fallback',
+        fallback_llm_model: 'selected-fallback-model',
+        fallback_llm_model_parameters: { reasoning_effort: 'high' },
+      });
+      args.agent = {
+        ...args.agent,
+        provider: 'selected-voice',
+        endpoint: 'selected-voice',
+        model: 'selected-voice-model',
+        model_parameters: { reasoning_effort: 'low' },
+        viventiumFallbackLlmAssignment: {
+          provider: 'voice-only-fallback',
+          model: 'voice-only-model',
+        },
+      };
+      const execute = jest
+        .spyOn(background, 'executeCortex')
+        .mockImplementation(async (params) => ({
+          insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
+          nativeOwnership: 'ended',
+        }));
+      try {
+        expect(await ensureAcceptedMainCompaction(args)).toMatchObject({ status: 'compacted' });
+        expect(execute).toHaveBeenCalledTimes(2);
+        for (const [params] of execute.mock.calls) {
+          expect(params.agent).toMatchObject({
+            provider: 'selected-main',
+            endpoint: 'selected-main',
+            model: 'selected-main-model',
+            model_parameters: { reasoning_effort: 'high' },
+            fallback_llm_provider: 'selected-fallback',
+            fallback_llm_model: 'selected-fallback-model',
+            fallback_llm_model_parameters: { reasoning_effort: 'high' },
+          });
+          expect(params.agent.viventiumFallbackLlmAssignment).toBeUndefined();
+          expect(params.nativeTools).toBe(false);
+          expect(params.req.viventiumCallSession).toBeNull();
+        }
+        expect(args.agent.model).toBe('selected-voice-model');
+      } finally {
+        execute.mockRestore();
+      }
+    });
 
     test('signs zero tools and binds cancellation for both default voice claim and fidelity review', async () => {
       const outer = voiceRequest();
@@ -3030,4 +3652,1838 @@ describe('source-bound independent fidelity review', () => {
       resetPromptRegistryForTests();
     }
   });
+});
+
+describe('active Call compaction scheduling owner', () => {
+  const identity = {
+    ownerId: 'call-owner',
+    agentId: 'call-main',
+    stableAuthoritySha256: 'f'.repeat(64),
+  };
+  const call = () => ({
+    userId: identity.ownerId,
+    callSessionId: 'active-call',
+    status: 'listening',
+    expiresAtMs: Date.now() + 60000,
+  });
+  beforeEach(() => require('@librechat/api').resetMainCompactionSchedulingForTests());
+  test('two accepted Voice turns start no model and End enters the existing runner once with the latest input', async () => {
+    const claim = jest.fn(async () => ({ status: 'empty' })),
+      execute = jest.fn();
+    const session = call();
+    for (const marker of ['first', 'latest']) {
+      expect(
+        await ensureAcceptedMainCompaction({
+          ...identity,
+          trigger: 'accepted_turn',
+          req: { viventiumCallSession: session },
+          marker,
+          claimCompaction: claim,
+          executeCompactor: execute,
+        }),
+      ).toMatchObject({ status: 'deferred', reason: 'active_call' });
+    }
+    expect(claim).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(await flushEndedCallMainCompactions({ ...session, status: 'ended' })).toBe(1);
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(claim.mock.calls[0][0].marker).toBe('latest');
+    expect(await flushEndedCallMainCompactions({ ...session, status: 'ended' })).toBe(0);
+  });
+  test('required foreground recovery during a call executes and removes its deferred duplicate', async () => {
+    const session = call(),
+      claim = jest.fn(async () => ({ status: 'empty' }));
+    const input = { ...identity, req: { viventiumCallSession: session }, claimCompaction: claim };
+    await ensureAcceptedMainCompaction({ ...input, trigger: 'accepted_turn' });
+    expect(
+      await ensureAcceptedMainCompaction({
+        ...input,
+        trigger: 'context_carrier',
+        foreground: true,
+      }),
+    ).toMatchObject({ status: 'empty' });
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(await flushEndedCallMainCompactions({ ...session, status: 'ended' })).toBe(0);
+  });
+  test('ordinary accepted scheduling and late acceptance after End use the existing runner', async () => {
+    const session = call(),
+      claim = jest.fn(async () => ({ status: 'empty' }));
+    await ensureAcceptedMainCompaction({
+      ...identity,
+      trigger: 'accepted_turn',
+      claimCompaction: claim,
+    });
+    await flushEndedCallMainCompactions({ ...session, status: 'ended' });
+    await ensureAcceptedMainCompaction({
+      ...identity,
+      trigger: 'accepted_turn',
+      req: { viventiumCallSession: session },
+      claimCompaction: claim,
+    });
+    expect(claim).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('accepted-turn idle continuation binding', () => {
+  const identity = {
+    ownerId: 'idle-owner',
+    agentId: 'idle-main',
+    stableAuthoritySha256: 'c'.repeat(64),
+  };
+  const candidate = JSON.stringify({
+    version: 1,
+    summary: 'Keep the exact pending request.',
+    pendingAsks: [],
+    commitments: [],
+    corrections: [],
+    decisions: [],
+    durableIdentifiers: [],
+    recurrenceOutcomes: [],
+    toolPairs: [],
+  });
+  beforeEach(() => require('@librechat/api').resetMainCompactionSchedulingForTests());
+
+  test.each(['accepted_turn', 'conversation_legacy'])(
+    '%s background trigger advances successive reviewed claims through the same runner',
+    async (trigger) => {
+      let completed = 0;
+      const claimCompaction = jest.fn(async () => ({
+        status: 'claimed',
+        leaseId: `idle-${completed}`,
+        domainEpochKey: 'idle-domain',
+        sourceDigest: String(completed + 1).repeat(64),
+        sourceBytes: 100,
+        sourceTurns: [],
+        leaseExpiresAt: new Date(Date.now() + 300000),
+      }));
+      const result = await ensureAcceptedMainCompaction({
+        ...identity,
+        trigger,
+        foreground: false,
+        claimCompaction,
+        executeCompactor: async (call) => (call.stage === 'review' ? reviewApproved : candidate),
+        completeCompaction: async () => ({
+          status: 'compacted',
+          continuationPending: ++completed < 3,
+        }),
+        rejectCompaction: jest.fn(),
+      });
+      expect(result).toMatchObject({ status: 'compacted', continuationPending: false });
+      expect(claimCompaction).toHaveBeenCalledTimes(3);
+    },
+  );
+
+  test('a foreground fence between reviewed claims stops idle continuation', async () => {
+    let release;
+    const claimCompaction = jest.fn(async () => ({
+      status: 'claimed',
+      leaseId: 'yield-idle',
+      domainEpochKey: 'idle-yield-domain',
+      sourceDigest: 'd'.repeat(64),
+      sourceBytes: 100,
+      sourceTurns: [],
+      leaseExpiresAt: new Date(Date.now() + 300000),
+    }));
+    try {
+      const result = await ensureAcceptedMainCompaction({
+        ...identity,
+        trigger: 'accepted_turn',
+        claimCompaction,
+        executeCompactor: async (call) => (call.stage === 'review' ? reviewApproved : candidate),
+        completeCompaction: async () => {
+          release = acquireInteractiveMainAdmissionFence(identity.ownerId);
+          return { status: 'compacted', continuationPending: true };
+        },
+        rejectCompaction: jest.fn(),
+      });
+      expect(result).toMatchObject({ status: 'compacted', continuationPending: true });
+      expect(claimCompaction).toHaveBeenCalledTimes(1);
+    } finally {
+      release?.();
+    }
+  });
+});
+
+describe('idle continuation after the finite batch cap', () => {
+  test.each(['accepted_turn', 'conversation_legacy'])(
+    '%s finishes a fifth reviewed claim after idle without another user acceptance',
+    async (trigger) => {
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      let completed = 0;
+      const identity = {
+        ownerId: 'idle-resume-owner',
+        agentId: 'main',
+        stableAuthoritySha256: 'b'.repeat(64),
+      };
+      const candidate = JSON.stringify({
+        version: 1,
+        summary: 'The source remains intact.',
+        pendingAsks: [],
+        commitments: [],
+        corrections: [],
+        decisions: [],
+        durableIdentifiers: [],
+        recurrenceOutcomes: [],
+        toolPairs: [],
+      });
+      const claimCompaction = jest.fn(async () => ({
+        status: 'claimed',
+        leaseId: `continuation-${completed}`,
+        domainEpochKey: 'idle-resume-domain',
+        sourceDigest: String(completed + 1).repeat(64),
+        sourceBytes: 100,
+        sourceTurns: [],
+        leaseExpiresAt: new Date(Date.now() + 300000),
+      }));
+      try {
+        require('@librechat/api').resetMainCompactionSchedulingForTests();
+        const first = await ensureAcceptedMainCompaction({
+          ...identity,
+          trigger,
+          foreground: false,
+          claimCompaction,
+          executeCompactor: async (call) => (call.stage === 'review' ? reviewApproved : candidate),
+          completeCompaction: async () => ({
+            status: 'compacted',
+            continuationPending: ++completed < 5,
+          }),
+          rejectCompaction: jest.fn(),
+        });
+        expect(first).toMatchObject({ continuationPending: true, reason: 'idle_budget_exhausted' });
+        expect(completed).toBe(4);
+        await jest.advanceTimersByTimeAsync(30000);
+        for (let i = 0; i < 10 && completed < 5; i++)
+          await new Promise((resolve) => setImmediate(resolve));
+        expect(completed).toBe(5);
+        expect(claimCompaction).toHaveBeenCalledTimes(5);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        require('@librechat/api').resetMainCompactionSchedulingForTests();
+        jest.useRealTimers();
+      }
+    },
+  );
+});
+
+describe('fresh call liveness before historical idle claims', () => {
+  const lookup = require('../CallSessionService').getActiveCallSessionForMainMaintenance;
+  const identity = {
+    ownerId: 'call-idle-owner',
+    agentId: 'main',
+    stableAuthoritySha256: 'a'.repeat(64),
+  };
+  const candidate = JSON.stringify({
+    version: 1,
+    summary: 'Retain the reviewed historical source.',
+    pendingAsks: [],
+    commitments: [],
+    corrections: [],
+    decisions: [],
+    durableIdentifiers: [],
+    recurrenceOutcomes: [],
+    toolPairs: [],
+  });
+  beforeEach(() => {
+    lookup.mockReset().mockResolvedValue(null);
+    require('@librechat/api').resetMainCompactionSchedulingForTests();
+  });
+  afterEach(() => {
+    lookup.mockReset().mockResolvedValue(null);
+    require('@librechat/api').resetMainCompactionSchedulingForTests();
+  });
+  const inputFor = (complete) => ({
+    ...identity,
+    trigger: 'accepted_turn',
+    claimCompaction: jest.fn(async () => ({
+      status: 'claimed',
+      leaseId: 'call-idle-lease',
+      domainEpochKey: 'call-idle-domain',
+      sourceDigest: 'e'.repeat(64),
+      sourceBytes: 100,
+      sourceTurns: [],
+      leaseExpiresAt: new Date(Date.now() + 300000),
+    })),
+    executeCompactor: async (call) => (call.stage === 'review' ? reviewApproved : candidate),
+    completeCompaction: complete,
+    rejectCompaction: jest.fn(),
+  });
+  const liveCall = () => ({
+    userId: identity.ownerId,
+    agentId: identity.agentId,
+    callSessionId: 'new-live-call',
+    status: 'listening',
+    expiresAtMs: Date.now() + 120000,
+  });
+
+  test('a call starting between claims defers the next claim until the existing End flush', async () => {
+    let completed = 0;
+    const call = liveCall();
+    lookup.mockResolvedValue(call).mockResolvedValueOnce(null);
+    const input = inputFor(async () => ({
+      status: 'compacted',
+      continuationPending: ++completed < 2,
+    }));
+    expect(await ensureAcceptedMainCompaction(input)).toMatchObject({
+      status: 'deferred',
+      reason: 'active_call',
+    });
+    expect(completed).toBe(1);
+    lookup.mockResolvedValue(null);
+    expect(await flushEndedCallMainCompactions({ ...call, status: 'ended' })).toBe(1);
+    expect(completed).toBe(2);
+    expect(input.claimCompaction).toHaveBeenCalledTimes(2);
+  });
+
+  test('a new call after the timer was armed prevents an idle claim until End', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    let completed = 0;
+    const input = inputFor(async () => ({
+      status: 'compacted',
+      continuationPending: ++completed < 5,
+    }));
+    try {
+      await ensureAcceptedMainCompaction(input);
+      expect(completed).toBe(4);
+      const call = liveCall();
+      lookup.mockResolvedValue(call);
+      await jest.advanceTimersByTimeAsync(30000);
+      expect(completed).toBe(4);
+      expect(input.claimCompaction).toHaveBeenCalledTimes(4);
+      lookup.mockResolvedValue(null);
+      expect(await flushEndedCallMainCompactions({ ...call, status: 'ended' })).toBe(1);
+      expect(completed).toBe(5);
+      expect(input.claimCompaction).toHaveBeenCalledTimes(5);
+    } finally {
+      require('@librechat/api').resetMainCompactionSchedulingForTests();
+      jest.useRealTimers();
+    }
+  });
+
+  test('unavailable call liveness starts no maintenance provider claim', async () => {
+    lookup.mockRejectedValue(new Error('synthetic persistence unavailable'));
+    const input = inputFor(jest.fn());
+    expect(await ensureAcceptedMainCompaction(input)).toMatchObject({
+      status: 'deferred',
+      reason: 'call_liveness_unavailable',
+    });
+    expect(input.claimCompaction).not.toHaveBeenCalled();
+  });
+});
+
+describe('legacy conversation maintenance uses the existing idle and call owners', () => {
+  beforeEach(() => require('@librechat/api').resetMainCompactionSchedulingForTests());
+  test('the idle binding waits for the foreground fence without invoking a provider', async () => {
+    jest.useFakeTimers();
+    const run = jest.fn(async () => {});
+    const release = acquireInteractiveMainAdmissionFence('legacy-idle-owner');
+    try {
+      const { scheduleMainContinuityMaintenance } = require('../ViventiumMainCompactionService');
+      expect(
+        scheduleMainContinuityMaintenance({
+          ownerId: 'legacy-idle-owner',
+          agentId: 'main',
+          stableAuthoritySha256: 'legacy-conversation',
+          schedule: run,
+        }),
+      ).toBe(true);
+      await jest.advanceTimersByTimeAsync(60000);
+      expect(run).not.toHaveBeenCalled();
+      release();
+      await jest.advanceTimersByTimeAsync(30000);
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      release();
+      require('@librechat/api').resetMainCompactionSchedulingForTests();
+      jest.useRealTimers();
+    }
+  });
+  test('background legacy claims wait for a fresh live call and resume once after End', async () => {
+    const call = {
+      userId: 'legacy-call-owner',
+      callSessionId: 'legacy-call',
+      status: 'listening',
+      expiresAtMs: Date.now() + 60000,
+    };
+    const calls = require('../CallSessionService').getActiveCallSessionForMainMaintenance;
+    calls.mockResolvedValueOnce(call).mockResolvedValueOnce(null);
+    const claim = jest.fn(async () => ({ status: 'empty' }));
+    const input = {
+      ownerId: call.userId,
+      agentId: 'main',
+      stableAuthoritySha256: 'legacy-conversation',
+      trigger: 'conversation_legacy',
+      foreground: false,
+      claimCompaction: claim,
+      executeCompactor: jest.fn(),
+    };
+    expect(await ensureAcceptedMainCompaction(input)).toMatchObject({
+      status: 'deferred',
+      reason: 'active_call',
+    });
+    expect(claim).not.toHaveBeenCalled();
+    expect(await flushEndedCallMainCompactions({ ...call, status: 'ended' })).toBe(1);
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(input.executeCompactor).not.toHaveBeenCalled();
+  });
+});
+
+describe('idle size recovery uses the actual next claim', () => {
+  const identity = {
+    ownerId: 'size-idle-owner',
+    agentId: 'size-main',
+    stableAuthoritySha256: '8'.repeat(64),
+  };
+  const fitting = {
+    version: 1,
+    summary: 'Keep the original permission and pending work.',
+    pendingAsks: [],
+    commitments: [],
+    corrections: [],
+    decisions: [],
+    durableIdentifiers: [],
+    recurrenceOutcomes: [],
+    toolPairs: [],
+  };
+  beforeEach(() => {
+    setMainContinuityPersistenceForTests(inMemoryPersistence());
+    require('@librechat/api').resetMainCompactionSchedulingForTests();
+  });
+  afterEach(() => setMainContinuityPersistenceForTests(null));
+
+  test('real history owner claims less whole source, reviews it, then promotes without dropping the rest', async () => {
+    for (let index = 0; index < 8; index++)
+      await commitAcceptedMainTurn({
+        ...identity,
+        logicalTurnId: `size-turn-${index}`,
+        revision: 1,
+        conversationId: 'size-conversation',
+        userMessageId: `size-user-${index}`,
+        assistantMessageId: `size-answer-${index}`,
+        origin: 'interactive',
+        userText: `Keep permission required ${index}. ` + 'u'.repeat(1000),
+        assistantText: `Pending ${index}. ` + 'a'.repeat(500),
+      });
+    const before = await loadAcceptedMainContext(identity);
+    const calls = [];
+    const result = await ensureAcceptedMainCompaction({
+      ...identity,
+      trigger: 'accepted_turn',
+      executeCompactor: async (call) => {
+        calls.push(call);
+        if (call.stage === 'review') return reviewApproved;
+        return JSON.stringify({
+          ...fitting,
+          summary: calls.length === 1 ? 'x'.repeat(16 * 1024) : fitting.summary,
+        });
+      },
+    });
+    expect(result).toMatchObject({ status: 'compacted', attempts: 1 });
+    expect(calls).toHaveLength(3);
+    expect(calls[2].stage).toBe('review');
+    const payload = (call) =>
+      JSON.parse(
+        call.prompt.match(
+          /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/,
+        )[1],
+      );
+    const first = payload(calls[0]),
+      second = payload(calls[1]);
+    expect(second.sourceDigest).not.toBe(first.sourceDigest);
+    expect(second.acceptedOlderTurns.length).toBeLessThan(first.acceptedOlderTurns.length);
+    const after = await loadAcceptedMainContext(identity);
+    expect(after.semanticCompaction.summary).toBe(fitting.summary);
+    expect(after.turns.map((t) => t.logicalTurnId)).toEqual(
+      before.turns.map((t) => t.logicalTurnId),
+    );
+    expect(after.pendingCompactionTurns.length).toBeGreaterThan(0);
+    expect(after.pendingCompactionTurns.length).toBeLessThan(before.pendingCompactionTurns.length);
+  });
+
+  test.each(['producer', 'review'])(
+    'a %s packet rejected as too large uses the same smaller whole-source owner',
+    async (stage) => {
+      for (let index = 0; index < 8; index++)
+        await commitAcceptedMainTurn({
+          ...identity,
+          logicalTurnId: `packet-turn-${index}`,
+          revision: 1,
+          conversationId: 'packet-conversation',
+          userMessageId: `packet-user-${index}`,
+          assistantMessageId: `packet-answer-${index}`,
+          origin: 'interactive',
+          userText: `Keep required permission ${index}. ` + 'u'.repeat(1000),
+          assistantText: `Pending ${index}. ` + 'a'.repeat(500),
+        });
+      const before = await loadAcceptedMainContext(identity);
+      const calls = [];
+      let rejected = false;
+      const result = await ensureAcceptedMainCompaction({
+        ...identity,
+        trigger: 'accepted_turn',
+        executeCompactor: async (call) => {
+          calls.push(call);
+          if (!rejected && (stage === 'review') === (call.stage === 'review')) {
+            rejected = true;
+            throw Object.assign(new Error('Packet too large'), {
+              status: 413,
+              code: 'invalid_request',
+            });
+          }
+          return call.stage === 'review' ? reviewApproved : JSON.stringify(fitting);
+        },
+      });
+      expect(result.reason).toBeUndefined();
+      expect(result).toMatchObject({ status: 'compacted' });
+      const producers = calls.filter((call) => call.stage !== 'review');
+      expect(producers).toHaveLength(2);
+      const payload = (call) =>
+        JSON.parse(
+          call.prompt.match(
+            /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/,
+          )[1],
+        );
+      expect(payload(producers[1]).acceptedOlderTurns.length).toBeLessThan(
+        payload(producers[0]).acceptedOlderTurns.length,
+      );
+      expect(payload(producers[1]).sourceDigest).not.toBe(payload(producers[0]).sourceDigest);
+      expect(calls.at(-1).stage).toBe('review');
+      const after = await loadAcceptedMainContext(identity);
+      expect(after.semanticCompaction.summary).toBe(fitting.summary);
+      expect(after.turns).toEqual(before.turns);
+      expect(after.pendingCompactionTurns.length).toBeGreaterThan(0);
+    },
+  );
+
+  test.each([
+    ['same digest', { sourceDigest: 'a'.repeat(64) }],
+    ['same bytes', { sourceBytes: 8000 }],
+    ['larger bytes', { sourceBytes: 9000 }],
+    ['foreign domain', { domainEpochKey: 'foreign-domain' }],
+    ['missing bytes', { sourceBytes: undefined }],
+  ])('releases a %s next claim before any provider or review', async (_name, change) => {
+    let claimCount = 0;
+    const claim = {
+      status: 'claimed',
+      leaseId: 'size-lease',
+      domainEpochKey: 'size-domain',
+      sourceDigest: 'a'.repeat(64),
+      sourceBytes: 8000,
+      previousSemanticCompaction: null,
+      sourceTurns: [],
+      canReduceSource: true,
+      leaseExpiresAt: new Date(Date.now() + 300000),
+    };
+    const reject = jest.fn(async () => ({ status: 'rejected' }));
+    const complete = jest.fn();
+    const execute = jest.fn(async () => JSON.stringify({ ...fitting, summary: 'x'.repeat(7000) }));
+    const result = await ensureAcceptedMainCompaction({
+      ...identity,
+      trigger: 'accepted_turn',
+      claimCompaction: async () =>
+        ++claimCount === 1
+          ? claim
+          : {
+              ...claim,
+              leaseId: 'size-second',
+              sourceDigest: 'b'.repeat(64),
+              sourceBytes: 3000,
+              ...change,
+            },
+      rejectCompaction: reject,
+      completeCompaction: complete,
+      executeCompactor: execute,
+    });
+    expect(result).toMatchObject({
+      status: 'degraded',
+      reason: 'source_reduction_unavailable',
+      attempts: 0,
+    });
+    expect(claimCount).toBe(2);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(complete).not.toHaveBeenCalled();
+    expect(reject).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        leaseId: 'size-second',
+        reason: change.domainEpochKey ? 'source_reduction_unavailable' : 'schema_invalid',
+      }),
+    );
+  });
+
+  test.each(['provider', 'review', 'cancel'])(
+    'a %s failure after source reduction stops without further claims',
+    async (failure) => {
+      let claims = 0,
+        producers = 0;
+      const controller = new AbortController();
+      const complete = jest.fn();
+      const execute = jest.fn(async (call) => {
+        if (call.stage === 'review')
+          throw Object.assign(new Error('unavailable'), { code: 'provider_unavailable' });
+        if (++producers === 1) {
+          if (failure === 'cancel') controller.abort('owner_stop');
+          return JSON.stringify({ ...fitting, summary: 'x'.repeat(7000) });
+        }
+        if (failure === 'provider') throw Object.assign(new Error('rejected'), { status: 400 });
+        return JSON.stringify(fitting);
+      });
+      const result = await ensureAcceptedMainCompaction({
+        ...identity,
+        trigger: 'accepted_turn',
+        signal: controller.signal,
+        claimCompaction: async () => ({
+          status: 'claimed',
+          leaseId: `failure-lease-${++claims}`,
+          domainEpochKey: 'failure-domain',
+          sourceDigest: String(claims).repeat(64),
+          sourceBytes: claims === 1 ? 8000 : 3000,
+          sourceTurns: [],
+          canReduceSource: true,
+          leaseExpiresAt: new Date(Date.now() + 300000),
+        }),
+        rejectCompaction: jest.fn(),
+        completeCompaction: complete,
+        executeCompactor: execute,
+      });
+      expect(result.status).toBe('degraded');
+      expect(claims).toBe(failure === 'cancel' ? 1 : 2);
+      expect(execute).toHaveBeenCalledTimes(
+        failure === 'cancel' ? 1 : failure === 'provider' ? 2 : 3,
+      );
+      expect(complete).not.toHaveBeenCalled();
+    },
+  );
+
+  test('an indivisible source keeps bounded same-source repair and does not start another claim', async () => {
+    const claim = jest.fn(async () => ({
+      status: 'claimed',
+      leaseId: 'single-lease',
+      domainEpochKey: 'single-domain',
+      sourceDigest: 'a'.repeat(64),
+      sourceBytes: 8000,
+      sourceTurns: [],
+      canReduceSource: false,
+      leaseExpiresAt: new Date(Date.now() + 300000),
+    }));
+    const execute = jest.fn(async () => JSON.stringify({ ...fitting, summary: 'x'.repeat(7000) }));
+    const result = await ensureAcceptedMainCompaction({
+      ...identity,
+      trigger: 'accepted_turn',
+      claimCompaction: claim,
+      executeCompactor: execute,
+      rejectCompaction: jest.fn(),
+    });
+    expect(result).toMatchObject({ status: 'degraded', reason: 'schema_invalid', attempts: 2 });
+    expect(result.canReduceSource).toBeUndefined();
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('durable fidelity continuation through the existing idle owner', () => {
+  test.each([
+    'promote',
+    'source',
+    'contract',
+    'exhausted',
+    'release',
+    'store',
+    'explicit-deadline',
+  ])('keeps the same repair bound and authority (%s)', async (mode) => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    jest.setSystemTime(1000000);
+    const scheduling = require('@librechat/api');
+    scheduling.resetMainCompactionSchedulingForTests();
+    const candidate = JSON.stringify({
+      version: 1,
+      summary: 'Pending evidence needs review.',
+      pendingAsks: [],
+      commitments: [],
+      corrections: [],
+      decisions: [],
+      durableIdentifiers: [],
+      recurrenceOutcomes: [],
+      toolPairs: [],
+    });
+    let pending = null,
+      claims = 0;
+    const calls = [];
+    const completeCompaction = jest.fn(async () => {
+      pending = null;
+      return { status: 'compacted' };
+    });
+    const rejectCompaction = jest.fn(async (input) => {
+      pending = input.pendingCompactionRepair || null;
+      return {
+        status: 'rejected',
+        ...(pending && mode !== 'store' ? { repairPending: true } : {}),
+      };
+    });
+    const args = {
+      ownerId: 'fidelity-idle-owner',
+      agentId: 'main',
+      stableAuthoritySha256: 'f'.repeat(64),
+      trigger: 'accepted_turn',
+      agent: {
+        provider: 'native',
+        model_parameters: { model: 'synthetic', reasoning_effort: 'high' },
+      },
+      req: {
+        config: {
+          endpoints: {
+            agents: {
+              providerCapabilities: {
+                native: {
+                  workspace_binding: true,
+                  conversation_session: true,
+                },
+              },
+            },
+          },
+        },
+      },
+      executionBudget: { completionReserveMs: 0 },
+      ...(mode === 'explicit-deadline'
+        ? { deadlineAt: new Date(Date.now() + 1200000).toISOString() }
+        : {}),
+      claimCompaction: async () => {
+        claims++;
+        return {
+          status: 'claimed',
+          leaseId: `repair-lease-${claims}`,
+          domainEpochKey: 'repair-domain',
+          sourceDigest: claims > 1 && mode === 'source' ? 'e'.repeat(64) : 'd'.repeat(64),
+          sourceBytes: 1000,
+          sourceTurns: [],
+          leaseExpiresAt: new Date(Date.now() + 300000),
+          ...(pending
+            ? {
+                pendingCompactionRepair: {
+                  ...pending,
+                  ...(mode === 'contract' ? { contractKey: 'different-contract' } : {}),
+                },
+              }
+            : {}),
+        };
+      },
+      renewCompaction: async ({ expiresAt }) => ({ status: 'renewed', leaseExpiresAt: expiresAt }),
+      completeCompaction,
+      rejectCompaction,
+      executeCompactor: async (call) => {
+        calls.push(call);
+        expect(
+          await call.onNativeAdmission({
+            requestId: `native-${calls.length}`,
+            responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+          }),
+        ).toBe(true);
+        await new Promise((resolve) =>
+          setTimeout(resolve, call.stage === 'review' ? 38000 : 451000),
+        );
+        call.reportCapacityRelease(mode !== 'release');
+        return call.stage === 'review'
+          ? calls.length === 2 || mode === 'exhausted'
+            ? JSON.stringify({
+                approved: false,
+                reason: 'Retain the exact pending evidence reference.',
+              })
+            : reviewApproved
+          : candidate;
+      },
+    };
+    try {
+      const running = ensureAcceptedMainCompaction(args);
+      await jest.advanceTimersByTimeAsync(489000);
+      const result = await running;
+      const resumes = !['release', 'store', 'explicit-deadline'].includes(mode);
+      expect(result).toMatchObject({
+        status: 'degraded',
+        reason: 'compaction_enclosing_deadline',
+        attempts: 1,
+      });
+      expect(calls).toHaveLength(2);
+      expect(completeCompaction).not.toHaveBeenCalled();
+      expect(jest.getTimerCount()).toBe(resumes ? 1 : 0);
+      if (!resumes) return;
+      expect(pending).toMatchObject({
+        semanticAttempts: 1,
+        transportRetries: 0,
+        correction: {
+          code: 'semantic_fidelity',
+          candidate,
+          reason: 'Retain the exact pending evidence reference.',
+        },
+      });
+      await jest.advanceTimersByTimeAsync(30000 + 489000);
+      for (let i = 0; i < 12 && calls.length < 4; i++)
+        await new Promise((resolve) => setImmediate(resolve));
+      expect(calls).toHaveLength(4);
+      const payload = JSON.parse(
+        calls[2].prompt.match(
+          /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/,
+        )[1],
+      );
+      const same = !['source', 'contract'].includes(mode);
+      expect(calls[2].attempt).toBe(same ? 2 : 1);
+      if (same)
+        expect(payload.priorRejection).toEqual({
+          code: 'semantic_fidelity',
+          candidate,
+          reason: 'Retain the exact pending evidence reference.',
+        });
+      else expect(payload.priorRejection).toBeUndefined();
+      if (mode === 'exhausted') {
+        expect(completeCompaction).not.toHaveBeenCalled();
+        expect(rejectCompaction).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            reason: 'semantic_fidelity: Retain the exact pending evidence reference.',
+          }),
+        );
+      } else expect(completeCompaction).toHaveBeenCalledTimes(1);
+      expect(pending).toBeNull();
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      scheduling.resetMainCompactionSchedulingForTests();
+      jest.useRealTimers();
+    }
+  });
+});
+
+describe('resumed fidelity checkpoint during foreground cancellation', () => {
+  test.each([
+    [true, 1],
+    [false, 1],
+    [true, 4],
+    [false, 4],
+  ])(
+    'keeps the earlier completed review only after native release=%s (completed=%i)',
+    async (released, completed) => {
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      const persistence = inMemoryPersistence();
+      setMainContinuityPersistenceForTests(persistence);
+      const scheduling = require('@librechat/api');
+      scheduling.resetMainCompactionSchedulingForTests();
+      const continuity = require('../ViventiumMainContinuityService');
+      const identity = {
+        ownerId: 'repair-yield-owner',
+        agentId: 'main',
+        stableAuthoritySha256: 'b'.repeat(64),
+      };
+      const agent = {
+        provider: 'synthetic',
+        model_parameters: { model: 'same-model', reasoning_effort: 'high' },
+      };
+      const candidate = JSON.stringify({
+        version: 1,
+        summary: 'Keep the draft private until approval.',
+        pendingAsks: [],
+        commitments: [],
+        corrections: [],
+        decisions: [],
+        durableIdentifiers: [],
+        recurrenceOutcomes: [],
+        toolPairs: [],
+      });
+      try {
+        for (let i = 0; i < 4; i++)
+          await commitAcceptedMainTurn({
+            ...identity,
+            logicalTurnId: `yield-source-${i}`,
+            revision: 1,
+            conversationId: 'yield-conversation',
+            userMessageId: `u-${i}`,
+            assistantMessageId: `a-${i}`,
+            userText: 'Keep the draft private until approval.',
+            assistantText: 'Approval remains pending.',
+            origin: 'interactive',
+          });
+        const first = await continuity.claimAcceptedMainCompaction(identity);
+        const contractKey = JSON.stringify({
+          constraints: first.outputContract,
+          provider: 'synthetic',
+          model: 'same-model',
+          effort: 'high',
+        });
+        await continuity.rejectAcceptedMainCompaction({
+          ...identity,
+          leaseId: first.leaseId,
+          reason: 'compaction_enclosing_deadline',
+          capacityReleaseAcknowledged: true,
+          pendingCompactionRepair: {
+            version: 1,
+            sourceDigest: first.sourceDigest,
+            contractKey,
+            semanticAttempts: completed,
+            ...(completed === 4 ? { fidelityRepairAttempts: 0 } : {}),
+            transportRetries: 0,
+            correction: {
+              code: 'semantic_fidelity',
+              candidate,
+              reason: 'Keep the original approval boundary.',
+            },
+          },
+        });
+        const checkpoint = (await persistence.read(first.domainEpochKey)).pendingCompactionRepair;
+        let start;
+        const started = new Promise((resolve) => {
+          start = resolve;
+        });
+        const input = { ...identity, agent, trigger: 'accepted_turn' };
+        const running = ensureAcceptedMainCompaction({
+          ...input,
+          executeCompactor: (call) => {
+            expect(call.attempt).toBe(completed + 1);
+            start();
+            return new Promise((resolve, reject) =>
+              call.signal.addEventListener(
+                'abort',
+                () => {
+                  call.reportCapacityRelease(released);
+                  reject(new Error('Cancelled by the foreground owner.'));
+                },
+                { once: true },
+              ),
+            );
+          },
+        });
+        await started;
+        expect(await yieldAcceptedMainCompaction(identity.ownerId)).toMatchObject({
+          status: released ? 'yielded' : 'yield_unconfirmed',
+          capacityReleaseAcknowledged: released,
+        });
+        expect(await running).toMatchObject({
+          status: 'degraded',
+          reason: 'interactive_priority',
+          attempts: completed,
+        });
+        expect((await running).repairPending).toBeUndefined();
+        expect(jest.getTimerCount()).toBe(0);
+        expect((await persistence.read(first.domainEpochKey)).pendingCompactionRepair).toEqual(
+          released ? checkpoint : null,
+        );
+        if (!released) return;
+        const calls = [];
+        const next = await ensureAcceptedMainCompaction({
+          ...input,
+          executeCompactor: async (call) => {
+            calls.push(call);
+            call.reportCapacityRelease(true);
+            return call.stage === 'review' ? reviewApproved : candidate;
+          },
+        });
+        expect(next).toMatchObject({ status: 'compacted', attempts: completed + 1 });
+        expect(calls).toHaveLength(2);
+        const payload = JSON.parse(
+          calls[0].prompt.match(
+            /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/,
+          )[1],
+        );
+        expect(payload.priorRejection).toEqual({
+          ...checkpoint.correction,
+          carrierHeadroomUtf8Bytes:
+            payload.outputConstraints.carrierMaxUtf8Bytes -
+            mainCompactionRenderedBytes(JSON.parse(candidate), payload.outputConstraints),
+        });
+        expect(payload.sourceDigest).toBe(first.sourceDigest);
+        expect((await persistence.read(first.domainEpochKey)).pendingCompactionRepair).toBeNull();
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        scheduling.resetMainCompactionSchedulingForTests();
+        setMainContinuityPersistenceForTests(null);
+        jest.useRealTimers();
+      }
+    },
+  );
+});
+
+describe('durable shrinking size continuation through the existing idle owner', () => {
+  test.each(['oversized', 'bounded', 'bounded-unknown-floor'])(
+    'retains size progress across a bounded batch before review and promotion (%s)',
+    async (mode) => {
+      require('@librechat/api').getNativeConversationReplayBudgetForRoutes.mockResolvedValue(
+        524288,
+      );
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      jest.setSystemTime(1000000);
+      const scheduling = require('@librechat/api');
+      scheduling.resetMainCompactionSchedulingForTests();
+      const valid = {
+        version: 1,
+        summary: 'The task and its permission constraint remain pending.',
+        pendingAsks: [],
+        commitments: [],
+        corrections: [],
+        decisions: [],
+        durableIdentifiers: [],
+        recurrenceOutcomes: [],
+        toolPairs: [],
+      };
+      const outputContract = {
+        version: 1,
+        consumer: 'accepted_core',
+        carrierMaxUtf8Bytes: 131072,
+        reservedUtf8Bytes: 55221,
+        maxJsonUtf8Bytes: 75851,
+        maxSummaryUtf8Bytes: 75851,
+        maxItemsPerArray: 32,
+        maxStringItemUtf8Bytes: 1024,
+        maxToolIdentityCharacters: 256,
+      };
+      const source = {
+        previousSemanticCompaction: {
+          ...valid,
+          summary: 'Retain the accepted permission constraint.',
+        },
+        sourceTurns: [],
+        legacyInputs: [
+          {
+            kind: 'legacy_state',
+            id: 'size-legacy-artifact',
+            sourceTurns: [
+              {
+                logicalTurnId: 'size-whole-turn',
+                revision: 1,
+                userText: 'Keep the task pending until permission is given.',
+                assistantText: 'Permission is still required.',
+                toolPairs: [],
+              },
+            ],
+            sourceRange: { artifactId: 'size-legacy-artifact', start: 5, end: 6, total: 42 },
+          },
+        ],
+      };
+      let pending = null;
+      let claims = 0;
+      const calls = [];
+      const completeCompaction = jest.fn(async () => {
+        pending = null;
+        return { status: 'compacted' };
+      });
+      const rejectCompaction = jest.fn(async (input) => {
+        pending = input.pendingCompactionRepair
+          ? { ...input.pendingCompactionRepair, outputContract }
+          : null;
+        return { status: 'rejected', ...(pending ? { repairPending: true } : {}) };
+      });
+      const args = {
+        ownerId: 'size-idle-owner',
+        agentId: 'main',
+        stableAuthoritySha256: 'a'.repeat(64),
+        trigger: 'accepted_turn',
+        executionBudget: { completionReserveMs: 0 },
+        agent: {
+          provider: 'native',
+          model_parameters: { model: 'synthetic', reasoning_effort: 'high' },
+        },
+        req: {
+          config: {
+            endpoints: {
+              agents: {
+                providerCapabilities: {
+                  native: { workspace_binding: true, conversation_session: true },
+                },
+              },
+            },
+          },
+        },
+        claimCompaction: async () => ({
+          status: 'claimed',
+          leaseId: `size-idle-lease-${++claims}`,
+          domainEpochKey: 'size-idle-domain',
+          sourceDigest: 'd'.repeat(64),
+          sourceBytes: 120000,
+          canReduceSource: false,
+          ...structuredClone(source),
+          outputContract:
+            claims > 1
+              ? {
+                  ...outputContract,
+                  reservedUtf8Bytes: 55567,
+                  maxJsonUtf8Bytes: 75505,
+                  maxSummaryUtf8Bytes: 75505,
+                }
+              : outputContract,
+          leaseExpiresAt: new Date(Date.now() + 300000),
+          ...(pending ? { pendingCompactionRepair: structuredClone(pending) } : {}),
+        }),
+        renewCompaction: async ({ expiresAt }) => ({
+          status: 'renewed',
+          leaseExpiresAt: expiresAt,
+        }),
+        completeCompaction,
+        rejectCompaction,
+        executeCompactor: async (call) => {
+          calls.push(call);
+          expect(
+            await call.onNativeAdmission({
+              requestId: `size-native-${calls.length}`,
+              responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+            }),
+          ).toBe(true);
+          const duration = calls.length <= 2 ? 451000 : call.stage === 'review' ? 10000 : 45000;
+          await new Promise((resolve) => setTimeout(resolve, duration));
+          call.reportCapacityRelease(true);
+          if (call.stage === 'review') return reviewApproved;
+          return JSON.stringify(
+            calls.length <= 2
+              ? {
+                  ...valid,
+                  summary:
+                    calls.length === 1
+                      ? 's'.repeat(96000)
+                      : mode === 'oversized'
+                        ? 's'.repeat(93000)
+                        : '&'.repeat(16000),
+                }
+              : valid,
+          );
+        },
+      };
+      try {
+        const running = ensureAcceptedMainCompaction(args);
+        await jest.advanceTimersByTimeAsync(902000);
+        expect(await running).toMatchObject({
+          status: 'degraded',
+          reason: 'compaction_enclosing_deadline',
+          attempts: 2,
+          repairPending: true,
+        });
+        expect(calls).toHaveLength(2);
+        expect(
+          JSON.parse(
+            calls[1].prompt
+              .split('<untrusted_conversation_data_v1>')[1]
+              .split('</untrusted_conversation_data_v1>')[0],
+          ).priorRejection.candidate.summary,
+        ).toHaveLength(96000);
+        expect(completeCompaction).not.toHaveBeenCalled();
+        expect(pending).toMatchObject({
+          semanticAttempts: 2,
+          transportRetries: 0,
+          correction: {
+            code: 'schema_invalid',
+            issue: { constraint: 'max_bytes', limit: mode === 'oversized' ? 75851 : 131072 },
+          },
+        });
+        const retainedDraft =
+          mode === 'oversized'
+            ? undefined
+            : JSON.stringify({ ...valid, summary: '&'.repeat(16000) });
+        expect(pending.correction.candidate).toBe(retainedDraft);
+        if (mode === 'bounded-unknown-floor')
+          scheduling.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(null);
+        expect(jest.getTimerCount()).toBe(1);
+        await jest.advanceTimersByTimeAsync(30000 + 55000);
+        for (let index = 0; index < 12 && calls.length < 4; index++)
+          await new Promise((resolve) => setImmediate(resolve));
+        expect(calls.map((call) => call.stage || 'compaction')).toEqual([
+          'compaction',
+          'compaction',
+          'compaction',
+          'review',
+        ]);
+        expect(calls[2].attempt).toBe(3);
+        const payload = JSON.parse(
+          calls[2].prompt.match(
+            /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/,
+          )[1],
+        );
+        expect(payload.priorRejection).toMatchObject({
+          code: 'schema_invalid',
+          issue: { constraint: 'max_bytes', limit: mode === 'oversized' ? 75505 : 131072 },
+        });
+        expect(payload.outputConstraints.maxJsonUtf8Bytes).toBe(75505);
+        expect(payload.priorRejection.candidate).toBe(
+          mode === 'bounded' ? retainedDraft : undefined,
+        );
+        if (mode !== 'oversized') {
+          expect(payload.priorRejection.issue.actual).toBe(
+            scheduling.mainCompactionRenderedBytes(
+              JSON.parse(retainedDraft),
+              payload.outputConstraints,
+            ),
+          );
+        }
+        expect(payload.previousSemanticCompaction).toEqual(source.previousSemanticCompaction);
+        expect(payload.legacyInputs).toEqual(source.legacyInputs);
+        expect(completeCompaction).toHaveBeenCalledTimes(1);
+        expect(pending).toBeNull();
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        require('@librechat/api').getNativeConversationReplayBudgetForRoutes.mockResolvedValue(
+          null,
+        );
+        scheduling.resetMainCompactionSchedulingForTests();
+        jest.useRealTimers();
+      }
+    },
+  );
+});
+
+describe('terminal size failure consumer', () => {
+  test.each(['nonconverging', 'exhausted'])(
+    'does not rerun the same source under a smaller allocation after %s size repair',
+    async (mode) => {
+      const scheduling = require('@librechat/api');
+      scheduling.resetMainCompactionSchedulingForTests();
+      const valid = {
+        version: 1,
+        summary: 'Permission remains required.',
+        pendingAsks: [],
+        commitments: [],
+        corrections: [],
+        decisions: [],
+        durableIdentifiers: [],
+        recurrenceOutcomes: [],
+        toolPairs: [],
+      };
+      let reserved = 55221;
+      const execute = jest.fn(async () =>
+        JSON.stringify({
+          ...valid,
+          summary: 's'.repeat(
+            mode === 'nonconverging' ? 96000 : 98000 - execute.mock.calls.length * 1000,
+          ),
+        }),
+      );
+      const complete = jest.fn();
+      const args = {
+        ownerId: `size-terminal-${mode}`,
+        agentId: 'main',
+        stableAuthoritySha256: 'f'.repeat(64),
+        agent: {
+          provider: 'native',
+          model_parameters: { model: 'synthetic', reasoning_effort: 'high' },
+        },
+        claimCompaction: async () => ({
+          status: 'claimed',
+          leaseId: 'terminal-size-lease',
+          domainEpochKey: `terminal-size-${mode}`,
+          sourceDigest: 'd'.repeat(64),
+          sourceBytes: 120000,
+          sourceTurns: [],
+          canReduceSource: false,
+          leaseExpiresAt: new Date(Date.now() + 300000),
+          outputContract: {
+            version: 1,
+            consumer: 'accepted_core',
+            carrierMaxUtf8Bytes: 131072,
+            reservedUtf8Bytes: reserved,
+            maxJsonUtf8Bytes: 131072 - reserved,
+            maxSummaryUtf8Bytes: 131072 - reserved,
+            maxItemsPerArray: 32,
+            maxStringItemUtf8Bytes: 1024,
+            maxToolIdentityCharacters: 256,
+          },
+        }),
+        executeCompactor: execute,
+        completeCompaction: complete,
+        rejectCompaction: jest.fn(async () => ({ status: 'rejected' })),
+      };
+      try {
+        expect(await ensureAcceptedMainCompaction(args)).toMatchObject({
+          status: 'degraded',
+          reason: 'schema_invalid',
+          attempts: mode === 'nonconverging' ? 2 : 4,
+        });
+        const calls = execute.mock.calls.length;
+        reserved += 100;
+        expect(await ensureAcceptedMainCompaction(args)).toMatchObject({
+          status: 'degraded',
+          reason: 'schema_invalid',
+          attempts: 0,
+        });
+        expect(execute).toHaveBeenCalledTimes(calls);
+        expect(complete).not.toHaveBeenCalled();
+      } finally {
+        scheduling.resetMainCompactionSchedulingForTests();
+      }
+    },
+  );
+});
+
+describe('in-claim size repair uses the existing native admission floor', () => {
+  const api = require('@librechat/api');
+  const fitting = {
+    version: 1,
+    summary: 'Approval is still required.',
+    pendingAsks: [],
+    commitments: [],
+    corrections: [],
+    decisions: [],
+    durableIdentifiers: [],
+    recurrenceOutcomes: [],
+    toolPairs: [],
+  };
+  const contract = {
+    version: 1,
+    consumer: 'accepted_core',
+    carrierMaxUtf8Bytes: 131072,
+    reservedUtf8Bytes: 130372,
+    maxJsonUtf8Bytes: 700,
+    maxSummaryUtf8Bytes: 700,
+    maxItemsPerArray: 32,
+    maxStringItemUtf8Bytes: 1024,
+    maxToolIdentityCharacters: 256,
+  };
+  const claim = {
+    status: 'claimed',
+    leaseId: 'size-candidate-lease',
+    domainEpochKey: 'size-candidate-domain',
+    sourceDigest: 'c'.repeat(64),
+    sourceBytes: 1000,
+    canReduceSource: false,
+    previousSemanticCompaction: { ...fitting, summary: 'Keep the signed approval boundary.' },
+    sourceTurns: [{ logicalTurnId: 'source-1', revision: 1, userText: 'Wait for approval.' }],
+    legacyInputs: [
+      { kind: 'legacy_state', id: 'source-legacy', sourceRange: { start: 1, end: 2, total: 3 } },
+    ],
+  };
+  const agent = {
+    endpoint: 'Native',
+    provider: 'openAI',
+    model: 'stale-model',
+    model_parameters: { model: 'native-model', reasoning_effort: 'high' },
+    fallback_llm_provider: 'Backup',
+    fallback_llm_model: 'explicit-backup-model',
+    fallback_llm_model_parameters: { model: 'parameter-backup-model' },
+  };
+  const req = {
+    config: {
+      endpoints: {
+        custom: [
+          { name: 'Native', baseURL: 'https://native.example.invalid/v1' },
+          { name: 'Backup', baseURL: 'https://backup.example.invalid/v1' },
+        ],
+      },
+    },
+  };
+  const payload = (prompt) =>
+    JSON.parse(
+      prompt
+        .split('<untrusted_conversation_data_v1>')[1]
+        .split('</untrusted_conversation_data_v1>')[0],
+    );
+  beforeEach(() => {
+    api.resetMainCompactionSchedulingForTests();
+    api.getNativeConversationReplayBudgetForRoutes.mockReset().mockResolvedValue(524288);
+  });
+  afterEach(() =>
+    api.getNativeConversationReplayBudgetForRoutes.mockReset().mockResolvedValue(null),
+  );
+
+  async function run(rejected, options = {}) {
+    const calls = [];
+    const result = await ensureAcceptedMainCompaction({
+      ownerId: 'size-candidate-owner',
+      agentId: 'main',
+      stableAuthoritySha256: 'a'.repeat(64),
+      agent,
+      req,
+      foreground: true,
+      claimCompaction: async () => ({
+        ...claim,
+        outputContract: contract,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+      }),
+      completeCompaction: async () => ({ status: 'compacted' }),
+      rejectCompaction: async () => ({ status: 'rejected' }),
+      executeCompactor: async (call) => {
+        calls.push(call);
+        call.reportCapacityRelease(true);
+        if (call.stage === 'review') return reviewApproved;
+        return calls.length === 1 ? JSON.stringify(rejected) : JSON.stringify(fitting);
+      },
+      ...options,
+    });
+    return { calls, result };
+  }
+
+  test.each(['', 'summary', '$carrier'])(
+    'retains the parsed draft for %s max_bytes with full source',
+    async (path) => {
+      const rejected = {
+        ...fitting,
+        summary: path === 'summary' ? 's'.repeat(800) : 'é"'.repeat(200),
+      };
+      const options =
+        path === '$carrier'
+          ? {
+              claimCompaction: async () => ({
+                ...claim,
+                outputContract: {
+                  ...contract,
+                  reservedUtf8Bytes: 126072,
+                  maxJsonUtf8Bytes: 5000,
+                  maxSummaryUtf8Bytes: 5000,
+                },
+                leaseExpiresAt: new Date(Date.now() + 300000),
+              }),
+              inspectCandidateCarrier: async ({ candidate }) =>
+                candidate.summary === fitting.summary
+                  ? { ok: true, candidate }
+                  : {
+                      ok: false,
+                      issue: {
+                        path: '$carrier',
+                        constraint: 'max_bytes',
+                        unit: 'utf8_bytes',
+                        actual: 131073,
+                        limit: 131072,
+                        proposalBytes: Buffer.byteLength(JSON.stringify(candidate)),
+                      },
+                    },
+            }
+          : {};
+      const { calls, result } = await run(rejected, options);
+      expect(result).toMatchObject({ status: 'compacted', attempts: 2 });
+      const sent = payload(calls[1].prompt);
+      expect(sent.priorRejection).toMatchObject({
+        code: 'schema_invalid',
+        issue: { path, constraint: 'max_bytes' },
+        candidate: rejected,
+      });
+      expect(sent.acceptedOlderTurns).toEqual(claim.sourceTurns);
+      expect(sent.previousSemanticCompaction).toEqual(claim.previousSemanticCompaction);
+      expect(sent.legacyInputs).toEqual(claim.legacyInputs);
+      const [routes, endpoints] = api.getNativeConversationReplayBudgetForRoutes.mock.calls[0];
+      expect(routes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ endpoint: 'Native', model: 'native-model' }),
+          expect.objectContaining({ provider: 'Backup', model: 'explicit-backup-model' }),
+        ]),
+      );
+      expect(endpoints).toBe(req.config.endpoints.custom);
+    },
+  );
+
+  test.each([null, 0, -1, 1, 1.5, '524288', NaN])(
+    'keeps numeric feedback for unknown/insufficient floor %s',
+    async (floor) => {
+      api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(floor);
+      const { calls, result } = await run({ ...fitting, summary: 's'.repeat(800) });
+      expect(result.status).toBe('compacted');
+      expect(payload(calls[1].prompt).priorRejection.candidate).toBeUndefined();
+    },
+  );
+
+  test.each([
+    ['explicit-backup-model', 'parameter-backup-model', 'explicit-backup-model'],
+    ['', 'parameter-backup-model', 'parameter-backup-model'],
+  ])(
+    'sizes the same fallback selected by its existing owner (%s)',
+    async (explicit, parameter, expected) => {
+      const selected = {
+        ...agent,
+        fallback_llm_model: explicit,
+        fallback_llm_model_parameters: { model: parameter },
+        voice_fallback_llm_provider: 'VoiceOnly',
+        voice_fallback_llm_model: 'voice-model',
+      };
+      await run({ ...fitting, summary: 's'.repeat(800) }, { agent: selected });
+      const [routes] = api.getNativeConversationReplayBudgetForRoutes.mock.calls[0];
+      const actualFallback = require('../agentLlmFallback').resolveFallbackCandidates(selected);
+      expect(actualFallback).toEqual([
+        expect.objectContaining({ provider: 'Backup', model: expected }),
+      ]);
+      expect(routes.slice(1).map(({ provider, model }) => ({ provider, model }))).toEqual(
+        actualFallback.map(({ provider, model }) => ({ provider, model })),
+      );
+    },
+  );
+
+  test('uses the entire serialized repair request at the exact conservative byte boundary', async () => {
+    const rejected = { ...fitting, summary: 'é"'.repeat(200) };
+    const first = await run(rejected);
+    const repairPrompt = first.calls[1].prompt;
+    const path = require('node:path');
+    const { _convertMessagesToOpenAIParams } = require(
+      path.join(path.dirname(require.resolve('@librechat/agents')), 'llm/openai/utils/index.cjs'),
+    );
+    const messages = _convertMessagesToOpenAIParams(
+      [new (require('@langchain/core/messages').HumanMessage)(repairPrompt)],
+      'native-model',
+    );
+    const projectedBytes = -api.nativeConversationContextBudget(messages, 1) + 1;
+    expect(projectedBytes).toBeGreaterThan(Buffer.byteLength(repairPrompt, 'utf8'));
+    api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(projectedBytes);
+    expect(payload((await run(rejected)).calls[1].prompt).priorRejection.candidate).toEqual(
+      rejected,
+    );
+    api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(projectedBytes - 1);
+    expect(payload((await run(rejected)).calls[1].prompt).priorRejection.candidate).toBeUndefined();
+  });
+
+  test('cache failure retains numeric feedback without a provider discovery call', async () => {
+    api.getNativeConversationReplayBudgetForRoutes.mockRejectedValue(
+      new Error('cache unavailable'),
+    );
+    const { calls, result } = await run({ ...fitting, summary: 's'.repeat(800) });
+    expect(result.status).toBe('compacted');
+    expect(payload(calls[1].prompt).priorRejection.candidate).toBeUndefined();
+  });
+
+  test('non-size shape repair retains its exact raw candidate without consulting admission', async () => {
+    const rejected = { ...fitting, pendingAsks: ['x'.repeat(1100)] };
+    const { calls, result } = await run(rejected);
+    expect(result.status).toBe('compacted');
+    expect(payload(calls[1].prompt).priorRejection.candidate).toBe(JSON.stringify(rejected));
+    expect(api.getNativeConversationReplayBudgetForRoutes).not.toHaveBeenCalled();
+  });
+});
+
+describe('one fidelity repair after bounded structural size work', () => {
+  const fitting = {
+    version: 1,
+    summary: 'Exact pending reference remains unverified.',
+    pendingAsks: [],
+    commitments: [],
+    corrections: [],
+    decisions: [],
+    durableIdentifiers: ['EVIDENCE-EXACT-41'],
+    recurrenceOutcomes: [],
+    toolPairs: [],
+  };
+  const reason = 'Retain EVIDENCE-EXACT-41 and its unverified status.';
+  beforeEach(() => require('@librechat/api').resetMainCompactionSchedulingForTests());
+
+  test.each([
+    [2, true],
+    [2, false],
+    [4, true],
+    [4, false],
+  ])('size call %i fitting leaves one fidelity repair (approved=%s)', async (fitsAt, approved) => {
+    const calls = [];
+    let producers = 0,
+      reviews = 0;
+    const complete = jest.fn(async () => ({ status: 'compacted' }));
+    const result = await ensureAcceptedMainCompaction({
+      ownerId: `size-fidelity-${fitsAt}-${approved}`,
+      agentId: 'main',
+      stableAuthoritySha256: 'f'.repeat(64),
+      claimCompaction: async () => ({
+        status: 'claimed',
+        leaseId: 'lease',
+        domainEpochKey: 'size-fidelity-domain',
+        sourceDigest: 'd'.repeat(64),
+        sourceBytes: 500,
+        sourceTurns: [],
+        canReduceSource: false,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+      }),
+      completeCompaction: complete,
+      rejectCompaction: jest.fn(async () => ({ status: 'rejected' })),
+      executeCompactor: async (call) => {
+        calls.push(call);
+        call.reportCapacityRelease(true);
+        if (call.stage === 'review')
+          return JSON.stringify({ approved: ++reviews === 2 && approved, reason });
+        return JSON.stringify(
+          ++producers < fitsAt
+            ? { ...fitting, summary: 'x'.repeat(10000 - producers * 1000) }
+            : fitting,
+        );
+      },
+    });
+    expect(producers).toBe(fitsAt + 1);
+    expect(reviews).toBe(2);
+    expect(result).toMatchObject({
+      status: approved ? 'compacted' : 'degraded',
+      attempts: fitsAt + 1,
+    });
+    expect(complete).toHaveBeenCalledTimes(approved ? 1 : 0);
+    const repair = calls.filter((call) => call.stage !== 'review').at(-1);
+    const payload = JSON.parse(
+      repair.prompt.match(
+        /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/,
+      )[1],
+    );
+    expect(payload.priorRejection).toEqual({
+      code: 'semantic_fidelity',
+      candidate: JSON.stringify(fitting),
+      reason,
+    });
+    expect(payload.sourceDigest).toBe('d'.repeat(64));
+  });
+
+  test('transport retry reuses the fifth-call fidelity prompt without spending another repair', async () => {
+    let producers = 0,
+      reviews = 0,
+      transportFailed = false;
+    const calls = [],
+      sleep = jest.fn().mockResolvedValue(undefined);
+    const result = await ensureAcceptedMainCompaction({
+      ownerId: 'size-fidelity-transport',
+      agentId: 'main',
+      stableAuthoritySha256: 'f'.repeat(64),
+      claimCompaction: async () => ({
+        status: 'claimed',
+        leaseId: 'lease',
+        domainEpochKey: 'transport-domain',
+        sourceDigest: 'd'.repeat(64),
+        sourceBytes: 500,
+        sourceTurns: [],
+        canReduceSource: false,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+      }),
+      completeCompaction: async () => ({ status: 'compacted' }),
+      rejectCompaction: jest.fn(async () => ({ status: 'rejected' })),
+      sleep,
+      retryDelayMs: 1,
+      executeCompactor: async (call) => {
+        calls.push(call);
+        call.reportCapacityRelease(true);
+        if (call.stage === 'review') return JSON.stringify({ approved: ++reviews === 2, reason });
+        if (producers === 4 && !transportFailed) {
+          transportFailed = true;
+          const error = new Error('temporary capacity');
+          Object.assign(error, {
+            code: 'main_compaction_provider_failed',
+            errorCode: 'host_capacity',
+            errorStatus: 503,
+          });
+          throw error;
+        }
+        return JSON.stringify(
+          ++producers < 4 ? { ...fitting, summary: 'x'.repeat(10000 - producers * 1000) } : fitting,
+        );
+      },
+    });
+    expect(result).toMatchObject({ status: 'compacted', attempts: 5, transportRetries: 1 });
+    const repairCalls = calls.filter((call) => call.stage !== 'review').slice(-2);
+    expect(repairCalls.map((call) => call.attempt)).toEqual([5, 5]);
+    expect(repairCalls[1].prompt).toBe(repairCalls[0].prompt);
+    expect(producers).toBe(5);
+    expect(reviews).toBe(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  test('deadline checkpoint keeps fourth-size-call fidelity feedback and consumes it once after resume', async () => {
+    let clock = Date.now(),
+      pending,
+      producers = 0,
+      reviews = 0;
+    const calls = [],
+      reject = jest.fn(async (input) => {
+        pending = input.pendingCompactionRepair;
+        return { status: 'rejected', repairPending: !!pending };
+      });
+    const complete = jest.fn(async () => ({ status: 'compacted' }));
+    const args = {
+      ownerId: 'size-fidelity-paused',
+      agentId: 'main',
+      stableAuthoritySha256: 'f'.repeat(64),
+      now: () => clock,
+      executionBudget: { completionReserveMs: 0 },
+      claimCompaction: async () => ({
+        status: 'claimed',
+        leaseId: 'lease',
+        domainEpochKey: 'paused-domain',
+        sourceDigest: 'd'.repeat(64),
+        sourceBytes: 500,
+        sourceTurns: [],
+        canReduceSource: false,
+        leaseExpiresAt: new Date(clock + 300000),
+        ...(pending ? { pendingCompactionRepair: pending } : {}),
+      }),
+      completeCompaction: complete,
+      rejectCompaction: reject,
+      executeCompactor: async (call) => {
+        calls.push(call);
+        call.reportCapacityRelease(true);
+        if (call.stage === 'review') {
+          clock += ++reviews === 1 ? 14000 : 1000;
+          return JSON.stringify({ approved: reviews === 2, reason });
+        }
+        clock += 1000;
+        return JSON.stringify(
+          ++producers < 4 ? { ...fitting, summary: 'x'.repeat(10000 - producers * 1000) } : fitting,
+        );
+      },
+    };
+    const first = await ensureAcceptedMainCompaction({
+      ...args,
+      deadlineAt: new Date(clock + 20000).toISOString(),
+    });
+    expect(first).toMatchObject({
+      status: 'degraded',
+      attempts: 4,
+      reason: 'compaction_enclosing_deadline',
+      repairPending: true,
+    });
+    expect(pending).toMatchObject({
+      semanticAttempts: 4,
+      fidelityRepairAttempts: 0,
+      correction: { code: 'semantic_fidelity', candidate: JSON.stringify(fitting), reason },
+    });
+    const second = await ensureAcceptedMainCompaction({
+      ...args,
+      deadlineAt: new Date(clock + 40000).toISOString(),
+    });
+    expect(second).toMatchObject({ status: 'compacted', attempts: 5 });
+    expect(producers).toBe(5);
+    expect(reviews).toBe(2);
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('fidelity repair carrier headroom', () => {
+  const {
+    buildCompactionPrompt,
+    ensureAcceptedMainCompaction,
+  } = require('../ViventiumMainCompactionService');
+  const {
+    createMainCompactionOutputContract,
+    mainCompactionRenderedBytes,
+  } = require('@librechat/api');
+  const candidate = {
+    version: 1,
+    summary: 'Keep "quoted" facts and approval required.',
+    pendingAsks: [],
+    commitments: [],
+    corrections: [],
+    decisions: [],
+    durableIdentifiers: [],
+    recurrenceOutcomes: [],
+    toolPairs: [],
+  };
+  const payload = (prompt) =>
+    JSON.parse(
+      prompt.match(
+        /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/,
+      )[1],
+    );
+  const contract = (reservedUtf8Bytes) =>
+    createMainCompactionOutputContract({
+      consumer: 'accepted_core',
+      carrierMaxUtf8Bytes: 131072,
+      reservedUtf8Bytes,
+    });
+  test.each([52, 0, -106])(
+    'reports exact signed rendered carrier headroom %s, ignoring stale feedback',
+    (headroom) => {
+      const encoded = mainCompactionRenderedBytes(candidate, contract(0));
+      const selected = contract(131072 - encoded - headroom);
+      const feedback = {
+        code: 'semantic_fidelity',
+        candidate: JSON.stringify(candidate),
+        reason: 'Restore the missing reference.',
+        carrierHeadroomUtf8Bytes: 999999,
+      };
+      const result = payload(
+        buildCompactionPrompt(
+          { sourceDigest: 'd'.repeat(64), sourceTurns: [], outputContract: selected },
+          feedback,
+        ),
+      );
+      expect(result.priorRejection).toEqual({ ...feedback, carrierHeadroomUtf8Bytes: headroom });
+      expect(result.outputConstraints).toEqual(selected);
+      expect(feedback.carrierHeadroomUtf8Bytes).toBe(999999);
+    },
+  );
+  test.each(['bad-candidate', 'bad-contract', 'absent-contract'])(
+    'does not invent headroom for %s',
+    (mode) => {
+      const feedback = {
+        code: 'semantic_fidelity',
+        candidate: mode === 'bad-candidate' ? 'broken' : JSON.stringify(candidate),
+        reason: 'Restore the reference.',
+        carrierHeadroomUtf8Bytes: 999999,
+      };
+      const outputContract =
+        mode === 'absent-contract'
+          ? undefined
+          : mode === 'bad-contract'
+            ? { ...contract(0), maxJsonUtf8Bytes: 1 }
+            : contract(0);
+      expect(
+        payload(buildCompactionPrompt({ sourceTurns: [], outputContract }, feedback))
+          .priorRejection,
+      ).toEqual({ code: feedback.code, candidate: feedback.candidate, reason: feedback.reason });
+    },
+  );
+  test('leaves existing size feedback unchanged', () => {
+    const feedback = {
+      code: 'schema_invalid',
+      issue: {
+        path: '$carrier',
+        constraint: 'max_bytes',
+        actual: 131178,
+        limit: 131072,
+        unit: 'utf8_bytes',
+      },
+    };
+    expect(
+      payload(buildCompactionPrompt({ sourceTurns: [], outputContract: contract(0) }, feedback))
+        .priorRejection,
+    ).toEqual(feedback);
+  });
+  test.each([false, true])(
+    'resumes exactly one fidelity repair on a tighter same-route contract, route changed=%s',
+    (changed) => {
+      const before = contract(1000),
+        after = contract(1500);
+      const route = {
+        provider: 'native',
+        model: 'synthetic',
+        model_parameters: { reasoning_effort: 'high' },
+      };
+      const routeKey = (constraints) =>
+        JSON.stringify({
+          provider: route.provider,
+          model: route.model,
+          effort: changed ? 'low' : 'high',
+          constraints,
+        });
+      const feedback = {
+        code: 'semantic_fidelity',
+        candidate: JSON.stringify(candidate),
+        reason: 'Keep approval required.',
+      };
+      const calls = [];
+      return ensureAcceptedMainCompaction({
+        ownerId: 'headroom-resume-' + changed,
+        agentId: 'main',
+        stableAuthoritySha256: 'a'.repeat(64),
+        agent: route,
+        claimCompaction: async () => ({
+          status: 'claimed',
+          leaseId: 'lease',
+          domainEpochKey: 'headroom-domain-' + changed,
+          sourceDigest: 'd'.repeat(64),
+          sourceBytes: 500,
+          sourceTurns: [],
+          outputContract: after,
+          leaseExpiresAt: new Date(Date.now() + 300000),
+          pendingCompactionRepair: {
+            version: 1,
+            sourceDigest: 'd'.repeat(64),
+            outputContract: before,
+            contractKey: routeKey(before),
+            semanticAttempts: 4,
+            fidelityRepairAttempts: 0,
+            transportRetries: 0,
+            correction: feedback,
+          },
+        }),
+        executeCompactor: async (call) => {
+          calls.push(call);
+          call.reportCapacityRelease(true);
+          return call.stage === 'review' ? reviewApproved : JSON.stringify(candidate);
+        },
+        completeCompaction: async () => ({ status: 'compacted' }),
+        rejectCompaction: async () => ({ status: 'rejected' }),
+      }).then((result) => {
+        expect(result).toMatchObject({ status: 'compacted', attempts: changed ? 1 : 5 });
+        const first = payload(calls[0].prompt);
+        if (changed) expect(first.priorRejection).toBeUndefined();
+        else
+          expect(first.priorRejection).toEqual({
+            ...feedback,
+            carrierHeadroomUtf8Bytes:
+              after.carrierMaxUtf8Bytes - mainCompactionRenderedBytes(candidate, after),
+          });
+      });
+    },
+  );
 });

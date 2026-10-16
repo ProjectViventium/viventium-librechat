@@ -5,6 +5,7 @@ jest.mock('../GlassHiveMissionAdjudicationService', () => ({
 const mockCommitProjection = jest.fn();
 const mockProjectionComplete = jest.fn();
 const mockRecover = jest.fn();
+const mockAdmit = jest.fn();
 const mockRejectUnaccepted = jest.fn();
 const mockConfig = jest.fn();
 const mockLoadAgent = jest.fn();
@@ -46,6 +47,7 @@ jest.mock('@librechat/api', () => ({
     mockNativeProjection = options.projectMessage;
     return {
       recover: mockRecover,
+      admit: mockAdmit,
       rejectUnaccepted: mockRejectUnaccepted,
       projectForTransmit: async (_identity, message) => message,
     };
@@ -1949,4 +1951,98 @@ describe('ordinary native Main selected File presentation', () => {
       { start: mappedQuiet.length, end: actual.text.length, disposition: choice('eligible') },
     ]);
   });
+});
+
+describe('passive native response phase timing', () => {
+  const { wrapNativeResponseFetch } = require('../nativeResponseService');
+  const { logger } = require('@librechat/data-schemas');
+  const route = { agentId: 'main', endpoint: 'native-provider' };
+  const request = (enabled = true) => ({
+    body: {},
+    viventiumVoiceLogLatency: enabled,
+    viventiumVoiceRequestId: 'SYNTHETIC_PRIVATE_REQUEST_ID',
+    headers: { Authorization: 'SYNTHETIC_SECRET_MUST_NOT_BE_LOGGED' },
+  });
+  const phases = (req, baseFetch) => {
+    wrapNativeResponseFetch(req, 'main', baseFetch, route);
+    const args = mockCreateNativeResponseFetch.mock.calls.at(-1);
+    return { send: args[0], admit: args[2] };
+  };
+  beforeEach(() => jest.clearAllMocks());
+
+  test.each(['admit', 'send'])(
+    '%s records only completion and numeric clocks after its real operation',
+    async (phase) => {
+      let release;
+      const result = { exactResult: true };
+      const pending = new Promise((resolve) => {
+        release = () => resolve(result);
+      });
+      const operation = jest.fn(() => pending);
+      mockAdmit.mockImplementation(operation);
+      const controls = phases(request(), operation);
+      const completion = controls[phase]('SYNTHETIC_PRIVATE_PAYLOAD');
+      expect(logger.debug).not.toHaveBeenCalled();
+      release();
+      await expect(completion).resolves.toBe(result);
+      expect(logger.debug).toHaveBeenCalledTimes(1);
+      const [message, fields] = logger.debug.mock.calls[0];
+      expect(message).toBe('[VoiceLatency][LC][Timing]');
+      expect(fields.source).toBe('native_response');
+      expect(fields.stage).toBe(
+        phase === 'admit'
+          ? 'host_native_admission_completed'
+          : 'provider_response_headers_completed',
+      );
+      expect(fields.stage_ms_f).toBeGreaterThanOrEqual(0);
+      expect(fields.request_sha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(JSON.stringify(logger.debug.mock.calls)).not.toMatch(
+        /SYNTHETIC_PRIVATE|SYNTHETIC_SECRET/,
+      );
+    },
+  );
+
+  test.each(['admit', 'send'])(
+    '%s preserves exact failure and logs failure separately',
+    async (phase) => {
+      const error = new Error('SYNTHETIC_PRIVATE_FAILURE');
+      const operation = jest.fn(async () => {
+        throw error;
+      });
+      mockAdmit.mockImplementation(operation);
+      await expect(phases(request(), operation)[phase]('private')).rejects.toBe(error);
+      expect(logger.debug.mock.calls[0][1].stage.endsWith('_failed')).toBe(true);
+      expect(JSON.stringify(logger.debug.mock.calls)).not.toContain(error.message);
+    },
+  );
+
+  test.each(['admit', 'send'])(
+    '%s does no logging or promise replacement when timing is off',
+    async (phase) => {
+      const result = Promise.resolve({ exactResult: true });
+      const operation = jest.fn(() => result);
+      mockAdmit.mockImplementation(operation);
+      expect(phases(request(false), operation)[phase]('private')).toBe(result);
+      expect(logger.debug).not.toHaveBeenCalled();
+      await result;
+    },
+  );
+
+  test.each([false, true])(
+    'logger failure never changes transport success or failure (rejected=%s)',
+    async (rejected) => {
+      const error = new Error('SYNTHETIC_PRIVATE_FAILURE');
+      const result = { exactResult: true };
+      logger.debug.mockImplementationOnce(() => {
+        throw new Error('diagnostic only');
+      });
+      const operation = jest.fn(async () => {
+        if (rejected) throw error;
+        return result;
+      });
+      const response = phases(request(), operation).send('private');
+      if (rejected) await expect(response).rejects.toBe(error);
+      else await expect(response).resolves.toBe(result);
+    },
+  );
 });

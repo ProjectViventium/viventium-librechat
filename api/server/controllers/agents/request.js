@@ -24,8 +24,6 @@ const {
   getViolationInfo,
   GenerationJobManager,
   isAcceptedMainProjectionComplete,
-  DURABLE_WORK_ACCEPTED_TEXT,
-  DURABLE_WORK_ACTION_ACCEPTED_TEXT,
   decrementPendingRequest,
   sanitizeFileForTransmit,
   sanitizeMessageForTransmit,
@@ -50,6 +48,7 @@ const {
 const {
   formatVoiceLatencyTiming,
   logVoiceLatencyNumericStage,
+  observeVoiceLatencyOperation,
   voiceLatencyNow,
 } = require('~/server/services/viventium/voiceLatencyTiming');
 const {
@@ -414,6 +413,10 @@ async function captureAcceptedInteractionInput(
 
 async function captureRequestInteractionContext(req, { conversationId, streamId } = {}) {
   const existing = getTrustedInteractionContext(req);
+  // Bind a trusted adapter's fresh-conversation placeholder before retaining its first source.
+  // Concrete or already claimed conversation authority must not be remapped here.
+  if (existing?.conversation_id === 'new')
+    bindCanonicalInteractionConversation(req, conversationId);
   const body = req?.body && typeof req.body === 'object' ? req.body : {};
   // Preserve only owner-scoped file references in the logical-turn ledger. Telegram images live
   // on the private mission-attachment slot; ordinary uploads live on body.files. The normalizer
@@ -720,10 +723,9 @@ async function removeSuppressedAssistantMessage(req, message) {
 }
 
 /* === VIVENTIUM START ===
- * Feature: Exact durable-effect presentation authority after response-only supersession.
- * Purpose: A newer interactive turn suppresses stale prose, but it must not erase the exact
- *          acknowledgement for work the older turn already committed. Only the server-authored
- *          GenerationJob receipt can grant this exception; model text and request fields cannot.
+ * Feature: Exact durable-effect metadata for a current Main answer.
+ * Purpose: Accepted work retains its receipt independently of obsolete assistant presentation.
+ *          Only a server-held receipt may accompany a current answer; model text cannot grant it.
  */
 function getExactDurableEffectReceipt(job, req, messageId, { requireSuperseded = true } = {}) {
   const trustedContext = getTrustedInteractionContext(req);
@@ -767,17 +769,11 @@ function getExactDurableEffectReceipt(job, req, messageId, { requireSuperseded =
   return rejected ? null : receipt;
 }
 
-function hasExactDurableEffectReceipt(job, req, messageId) {
-  return Boolean(getExactDurableEffectReceipt(job, req, messageId));
-}
-
-async function isSupersededRequest(req, message) {
+async function isSupersededRequest(req) {
   const streamId = req?._resumableStreamId;
   if (!streamId || !getTrustedInteractionContext(req)?.logical_turn_id) return false;
   const job = await GenerationJobManager.getJob(streamId);
-  return (
-    job?.status === 'superseded' && !hasExactDurableEffectReceipt(job, req, message?.messageId)
-  );
+  return job?.status === 'superseded';
 }
 /* === VIVENTIUM END === */
 
@@ -1120,27 +1116,6 @@ function normalizeAssistantResponseForTransmit(req, response) {
   return response;
 }
 
-/* === VIVENTIUM START ===
- * Feature: Canonical durable-work receipt prose.
- * Purpose: Once Main has committed background work, retain its structured tool audit but replace
- *          any later inline answer with the same short server-authored handoff already presented
- *          at the durable commit boundary.
- */
-function normalizeDurableWorkReceiptResponse(response, receipt) {
-  const retainedContent = Array.isArray(response?.content)
-    ? response.content.filter((part) => part?.type !== 'text')
-    : [];
-  const receiptText =
-    receipt?.effect_kind === 'durable_work_action_accepted'
-      ? DURABLE_WORK_ACTION_ACCEPTED_TEXT
-      : DURABLE_WORK_ACCEPTED_TEXT;
-  return {
-    ...response,
-    text: receiptText,
-    content: [{ type: 'text', text: { value: receiptText } }, ...retainedContent],
-  };
-}
-
 function hasCommittedExternalDelivery(job) {
   return ['committed', 'committed_effect'].includes(
     (job?.metadata ?? job)?.deliveryAcknowledgement?.state,
@@ -1446,15 +1421,23 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
    * Purpose: Telegram bridge can pass a stable streamId so resumable jobs don't collide across surfaces.
    * Added: 2026-01-31
    */
-  const { streamId, requested: reqStreamId } = await resolveRequestStreamId(
+  const { streamId, requested: reqStreamId } = await observeVoiceLatencyOperation(
+    logger,
     req,
-    userId,
-    conversationId,
+    'request',
+    'request_stream_identity',
+    () => resolveRequestStreamId(req, userId, conversationId),
   );
   req._resumableStreamId = streamId;
   let interactionContext;
   try {
-    interactionContext = await captureRequestInteractionContext(req, { conversationId, streamId });
+    interactionContext = await observeVoiceLatencyOperation(
+      logger,
+      req,
+      'request',
+      'request_interaction_capture',
+      () => captureRequestInteractionContext(req, { conversationId, streamId }),
+    );
   } catch (error) {
     await maybeDecrement();
     if (error?.code === 'source_input_capacity')
@@ -1463,6 +1446,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         .json({ code: error.code, retryable: true, error: error.message, conversationId });
     throw error;
   }
+  let interactiveCompactionYield = null;
   let releaseInteractiveAdmissionFence = null;
   const completeInteractiveMainAdmission = () => {
     const release = releaseInteractiveAdmissionFence;
@@ -1475,7 +1459,16 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
   ) {
     releaseInteractiveAdmissionFence = acquireInteractiveMainAdmissionFence(userId);
     try {
-      await yieldAcceptedMainCompaction(userId);
+      // Request abort now; overlap cancellation cleanup with job/client preparation.
+      interactiveCompactionYield = observeVoiceLatencyOperation(
+        logger,
+        req,
+        'request',
+        'request_compaction_yield',
+        () => yieldAcceptedMainCompaction(userId),
+      );
+      // The same Promise is joined before generation; handle an early rejection meanwhile.
+      interactiveCompactionYield.catch(() => {});
     } catch (error) {
       completeInteractiveMainAdmission();
       await maybeDecrement();
@@ -1484,14 +1477,17 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
   }
   /* === VIVENTIUM NOTE END === */
   const voiceLatencyEnabled = isVoiceLatencyEnabled(req);
-  req._viventiumDeliveryDispositionRequired = await resolveDeliveryDispositionRequirement(
-    req,
-    endpointOption,
-  );
-
   let client = null;
 
   try {
+    req._viventiumDeliveryDispositionRequired = await observeVoiceLatencyOperation(
+      logger,
+      req,
+      'request',
+      'request_delivery_policy',
+      () => resolveDeliveryDispositionRequirement(req, endpointOption),
+    );
+
     logger.debug(`[ResumableAgentController] Creating job`, {
       streamId,
       conversationId,
@@ -1945,7 +1941,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                   'status=completed',
                 );
               } catch {
-                // Timing telemetry must not fail message preparation.
+                // Optional timing must not change the persistence result.
               }
               return value;
             },
@@ -1958,7 +1954,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                   'status=failed',
                 );
               } catch {
-                // Timing telemetry must not fail message preparation.
+                // Optional timing must not change the persistence result.
               }
               throw error;
             },
@@ -2136,14 +2132,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           isNewConvo &&
           !wasAbortedBeforeComplete;
         /* === VIVENTIUM END === */
-        const durableWorkReceipt = getExactDurableEffectReceipt(
-          preCommitJob,
-          req,
-          response?.messageId,
-        );
-        let responseForCommit = durableWorkReceipt
-          ? normalizeDurableWorkReceiptResponse(response, durableWorkReceipt)
-          : response;
+        let responseForCommit = response;
 
         // CRITICAL: Save response message BEFORE emitting final event.
         // This prevents race conditions where the client sends a follow-up message
@@ -2245,9 +2234,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           }
           if (saved) {
             Object.assign(response, saved);
-            responseForCommit = durableWorkReceipt
-              ? normalizeDurableWorkReceiptResponse(response, durableWorkReceipt)
-              : response;
+            responseForCommit = response;
             req._viventiumNativeResponseCompleted = true;
             /* === VIVENTIUM START ===
              * Capture the completed native answer now; admit its existing detached writer only
@@ -2365,21 +2352,17 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           { requireSuperseded: false },
         );
         /* === VIVENTIUM START ===
-         * Fix: abort can precede the durable supersession status update. Keep exact committed
-         * effect receipts for the same generation while suppressing obsolete response prose.
+         * Abort can precede the durable supersession status update. Both revoke obsolete
+         * presentation; the generation job independently retains every committed effect receipt.
          */
         const abortedBySupersession =
           job.abortController.signal.reason === 'superseded' ||
           (currentJob?.status === 'superseded' && currentJob.createdAt === jobCreatedAt);
-        const exactDurableEffectReceipt =
-          abortedBySupersession && currentJob?.createdAt === jobCreatedAt
-            ? transmittableDurableEffectReceipt
-            : getExactDurableEffectReceipt(currentJob, req, response?.messageId);
         const jobWasReplaced =
           !currentJob ||
           currentJob.createdAt !== jobCreatedAt ||
-          ((abortedBySupersession || currentJob.status === 'superseded') &&
-            !exactDurableEffectReceipt);
+          abortedBySupersession ||
+          currentJob.status === 'superseded';
 
         if (jobWasReplaced) {
           stopPartialCheckpointing();
@@ -2389,10 +2372,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             currentCreatedAt: currentJob?.createdAt,
           });
           // Still decrement pending request since we incremented at start
-          if (
-            (abortedBySupersession || currentJob?.status === 'superseded') &&
-            !exactDurableEffectReceipt
-          ) {
+          if (abortedBySupersession || currentJob?.status === 'superseded') {
             await removeSupersededAssistantMessage(req, {
               messageId,
               conversationId,
@@ -2830,7 +2810,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               snapshotError,
             );
           }
-          // Reuse the same typed failure retained in the failed snapshot.
+          // Use the same public typed failure as FINAL; raw internal diagnostics stay in logs.
           /* === VIVENTIUM START ===
            * A deleted canonical Native row has no Stop FINAL owner. Reuse the exact revoked
            * identity fence to end that stream; ordinary cancelled answers retain Stop ownership.
@@ -2860,6 +2840,12 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       }
     };
 
+    /* === VIVENTIUM START ===
+     * Join the original compaction yield before model work. The foreground fence has remained
+     * held throughout preparation; provider admission still owns actual capacity release.
+     */
+    await interactiveCompactionYield;
+    /* === VIVENTIUM END === */
     // Start generation and handle any unhandled errors
     startGeneration().catch(async (err) => {
       completeInteractiveMainAdmission();
@@ -3484,11 +3470,9 @@ module.exports.__testables = {
   sanitizePersistedAssistantText,
   normalizePersistedAssistantResponse,
   normalizeAssistantResponseForTransmit,
-  normalizeDurableWorkReceiptResponse,
   persistAssistantSnapshot,
   timedSaveMessage,
   getExactDurableEffectReceipt,
-  hasExactDurableEffectReceipt,
   isVoiceTaskOutputSuppressed: isVoiceTaskOutputSuppressedDurably,
   removeSuppressedAssistantMessage,
   removeSupersededAssistantMessage,

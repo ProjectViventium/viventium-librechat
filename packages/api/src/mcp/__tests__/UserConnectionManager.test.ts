@@ -6,6 +6,7 @@ import type { IUser } from '@librechat/data-schemas';
 import { UserConnectionManager } from '~/mcp/UserConnectionManager';
 import { mcpConfig } from '~/mcp/mcpConfig';
 import { MCPConnectionFactory } from '~/mcp/MCPConnectionFactory';
+import { MCPServerInspector } from '~/mcp/registry/MCPServerInspector';
 import type { MCPConnection } from '~/mcp/connection';
 
 const mockRegistryInstance = {
@@ -152,3 +153,146 @@ describe('UserConnectionManager idle behavior', () => {
     );
   });
 });
+
+/* === VIVENTIUM START ===
+ * Feature: Respect typed MCP authentication requirements on user connections.
+ * Purpose: Avoid no-op token flows without changing real or unknown OAuth behavior.
+ */
+describe('UserConnectionManager OAuth requirement', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it.each([
+    ['unknown authentication', {}, true],
+    ['unknown stdio', { type: 'stdio', url: undefined, command: 'node' }, true],
+    [
+      'stdio OAuth declared',
+      { type: 'stdio', url: undefined, command: 'node', requiresOAuth: true },
+      true,
+    ],
+    [
+      'stdio OAuth metadata',
+      { type: 'stdio', url: undefined, command: 'node', requiresOAuth: false, oauthMetadata: {} },
+      true,
+    ],
+    ['explicit OAuth', { requiresOAuth: true }, true],
+    ['remote false remains uncertain', { requiresOAuth: false }, true],
+    [
+      'stdio no OAuth',
+      { requiresOAuth: false, type: 'stdio', url: undefined, command: 'node' },
+      false,
+    ],
+    [
+      'remote admin key retains authentication path',
+      { requiresOAuth: false, apiKey: { source: 'admin' } },
+      true,
+    ],
+    ['OAuth metadata overrides false', { requiresOAuth: false, oauthMetadata: {} }, true],
+    ['OAuth metadata with unknown requirement', { oauthMetadata: {} }, true],
+  ])('%s preserves the required factory authentication path', async (_label, auth, expected) => {
+    const manager = new TestUserConnectionManager();
+    manager.appConnections = { has: jest.fn().mockResolvedValue(false) } as never;
+    mockRegistryInstance.getServerConfig.mockResolvedValue({
+      type: 'streamable-http',
+      url: 'https://example.com/mcp',
+      ...auth,
+    });
+    const connection = createMockConnection();
+    (MCPConnectionFactory.create as jest.Mock).mockResolvedValue(connection);
+    const signal = new AbortController().signal;
+    const tokenMethods = { findToken: jest.fn(), updateToken: jest.fn() };
+    const flowManager = {};
+
+    expect(
+      await manager.getUserConnection({
+        serverName: 'example-server',
+        user: { id: 'test-user-id' } as IUser,
+        tokenMethods,
+        flowManager,
+        signal,
+        allowOAuthInitiation: false,
+        suppressOAuthFlow: true,
+      } as never),
+    ).toBe(connection);
+    expect(MCPConnectionFactory.create).toHaveBeenCalledTimes(1);
+    expect(MCPConnectionFactory.create).toHaveBeenCalledWith(
+      expect.objectContaining({ serverConfig: expect.objectContaining(auth) }),
+      expect.objectContaining({
+        useOAuth: expected,
+        allowOAuthInitiation: false,
+        suppressOAuthFlow: true,
+      }),
+    );
+    const options = (MCPConnectionFactory.create as jest.Mock).mock.calls[0][1];
+    if (expected) {
+      expect(options).toMatchObject({ tokenMethods, flowManager, signal });
+    } else {
+      for (const key of [
+        'tokenMethods',
+        'flowManager',
+        'signal',
+        'oauthStart',
+        'oauthEnd',
+        'returnOnOAuth',
+      ]) {
+        expect(options).not.toHaveProperty(key);
+      }
+    }
+  });
+
+  it.each([
+    [
+      'deferred remote',
+      { type: 'streamable-http', url: 'https://example.com/mcp', startup: false },
+      true,
+    ],
+    ['deferred stdio', { type: 'stdio', command: 'node', startup: false }, false],
+  ])(
+    'preserves Inspector-produced %s authentication semantics',
+    async (_label, config, expected) => {
+      const parsed = await MCPServerInspector.inspect(
+        'example-server',
+        config as never,
+        undefined,
+        ['example.com'],
+      );
+      expect(parsed.requiresOAuth).toBe(false);
+      expect(MCPConnectionFactory.create).not.toHaveBeenCalled();
+      mockRegistryInstance.getServerConfig.mockResolvedValue(parsed);
+      const manager = new TestUserConnectionManager();
+      manager.appConnections = { has: jest.fn().mockResolvedValue(false) } as never;
+      (MCPConnectionFactory.create as jest.Mock).mockResolvedValue(createMockConnection());
+      await manager.getUserConnection({
+        serverName: 'example-server',
+        user: { id: 'test-user-id' } as IUser,
+        flowManager: {} as never,
+      } as never);
+      expect(MCPConnectionFactory.create).toHaveBeenCalledWith(
+        expect.objectContaining({ serverConfig: parsed }),
+        expect.objectContaining({ useOAuth: expected }),
+      );
+    },
+  );
+
+  it('propagates authentication failure without caching a failed connection', async () => {
+    const manager = new TestUserConnectionManager();
+    manager.appConnections = { has: jest.fn().mockResolvedValue(false) } as never;
+    mockRegistryInstance.getServerConfig.mockResolvedValue({
+      type: 'streamable-http',
+      url: 'https://example.com/mcp',
+      requiresOAuth: true,
+    });
+    const failure = new Error('Authentication unavailable');
+    (MCPConnectionFactory.create as jest.Mock).mockRejectedValue(failure);
+    await expect(
+      manager.getUserConnection({
+        serverName: 'example-server',
+        user: { id: 'test-user-id' } as IUser,
+        flowManager: {} as never,
+      } as never),
+    ).rejects.toBe(failure);
+    expect(manager.getUserConnectionByServer('test-user-id', 'example-server')).toBeUndefined();
+  });
+});
+/* === VIVENTIUM END === */

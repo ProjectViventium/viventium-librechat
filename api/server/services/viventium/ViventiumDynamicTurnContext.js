@@ -158,6 +158,7 @@ function buildActiveWorkCapsule({
   readiness,
   snapshot,
   maxBytes = MAX_CAPSULE_BYTES,
+  onRenderedRoster,
 }) {
   const effectiveMode = mode === 'parallel' ? 'parallel' : 'focused';
   const parsedMaxBytes = Number(maxBytes);
@@ -178,9 +179,8 @@ function buildActiveWorkCapsule({
     snapshotState !== 'unavailable' && Array.isArray(snapshot?.work) ? snapshot.work : null;
   const ordered = sortedWork(work || []);
   const includedItems = [];
-  const render = () =>
+  const renderRoster = () =>
     [
-      ...lines,
       '<viventium_untrusted_active_work_data encoding="json-v1">',
       untrustedRosterJson({
         version: 1,
@@ -193,27 +193,28 @@ function buildActiveWorkCapsule({
       }),
       '</viventium_untrusted_active_work_data>',
     ].join('\n');
+  const render = () => [...lines, renderRoster()].join('\n');
 
-  // Admit complete basic rows first, using the exact rendered envelope and metadata cost.
-  for (const item of ordered) {
-    includedItems.push(safeWorkItem(item));
+  // Keep each attention row with its complete current form before admitting older detail.
+  for (const source of ordered) {
+    const item = safeWorkItem(source);
+    includedItems.push(item);
     if (Buffer.byteLength(render(), 'utf8') > capsuleMaxBytes) {
       includedItems.pop();
       break;
     }
-  }
-  // Optional exact native forms cannot displace common work facts or be partially serialized.
-  includedItems.forEach((item, index) => {
-    const pendingNativeInput = projectCurrentNativeWorkInput(ordered[index], snapshotState);
-    if (!pendingNativeInput) return;
+    const pendingNativeInput = projectCurrentNativeWorkInput(source, snapshotState);
+    if (!pendingNativeInput) continue;
     item.pendingNativeInput = pendingNativeInput;
     delete item.nativeInputOmitted;
     if (Buffer.byteLength(render(), 'utf8') > capsuleMaxBytes) {
       delete item.pendingNativeInput;
       item.nativeInputOmitted = true;
     }
-  });
-  return render();
+  }
+  const capsule = render();
+  onRenderedRoster?.(renderRoster());
+  return capsule;
 }
 
 function pinActiveWorkTurnProjection(request, capsule, projection) {
@@ -301,8 +302,15 @@ async function loadActiveWorkTurnContext({
     readiness: request?._viventiumParallelWorkTurnReadiness,
     snapshot,
   };
-  const capsule = buildActiveWorkCapsule({ ...projection, maxBytes });
-  return pinActiveWorkTurnProjection(request, capsule, projection);
+  let rosterText = '';
+  const capsule = buildActiveWorkCapsule({
+    ...projection,
+    maxBytes,
+    onRenderedRoster: (value) => {
+      rosterText = value;
+    },
+  });
+  return pinActiveWorkTurnProjection(request, capsule, { ...projection, rosterText });
 }
 
 module.exports = { buildActiveWorkCapsule, loadActiveWorkTurnContext, pinActiveWorkTurnProjection };

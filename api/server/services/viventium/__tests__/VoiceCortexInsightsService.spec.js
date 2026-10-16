@@ -18,6 +18,54 @@ describe('VoiceCortexInsightsService', () => {
     mockGetMessages = jest.fn();
   });
 
+  test.each([false, true])(
+    'retains verified speech controls with clean display; mismatch=%s',
+    async (mismatch) => {
+      const { getCompletedCortexInsightsForMessage } = require('../VoiceCortexInsightsService');
+      const text = 'A useful update.';
+      const raw = '[chuckle] A useful update.';
+      const disposition = {
+        version: 1,
+        audio: 'eligible',
+        required: true,
+        valid: true,
+        source: 'model',
+      };
+      const part = (value) => ({
+        type: 'text',
+        text: value,
+        deliveryDispositionRanges: [{ start: 0, end: value.length, disposition }],
+      });
+      const controls = {
+        sourceTextSha256: require('node:crypto').createHash('sha256').update(text).digest('hex'),
+        audioContent: [part(raw)],
+      };
+      if (mismatch) controls.audioContent[0].text += ' changed';
+      mockGetMessage.mockResolvedValue({
+        messageId: 'parent',
+        conversationId: 'conversation',
+        content: [],
+      });
+      mockGetMessages.mockResolvedValue([
+        {
+          messageId: 'followup',
+          text,
+          content: [part(text)],
+          metadata: { viventium: { deliveryControls: controls, deliveryDisposition: disposition } },
+        },
+      ]);
+      const result = await getCompletedCortexInsightsForMessage({
+        userId: 'owner',
+        messageId: 'parent',
+      });
+      expect(result.followUp.text).toBe(text);
+      expect(result.followUp.deliveryControls.audioContent).toEqual(
+        mismatch ? [part(text)] : [part(raw)],
+      );
+      expect(result.followUp.content).toEqual([part(text)]);
+    },
+  );
+
   test('fetches follow-up by metadata.viventium.parentMessageId', async () => {
     const { getCompletedCortexInsightsForMessage } = require('../VoiceCortexInsightsService');
 

@@ -7,6 +7,7 @@ import {
   agentBaseSchema,
   applyAgentProviderCapabilityDefaults,
   cortexResultEvidencePolicySchema,
+  glassHiveOptionsSchema,
   validateAgentModel,
 } from './validation';
 
@@ -468,3 +469,20 @@ describe('validateAgentModel', () => {
     });
   });
 });
+
+// VIVENTIUM START: registered native/API workers share the model-catalog profile contract.
+describe('capability-owned background profile names', () => {
+  it.each(['grok-build', 'direct-openai', 'direct-anthropic', 'direct-xai'])(
+    'retains %s through Agent Builder persistence', (profile) => {
+      const value = { workspace: { mode: 'life' }, access: 'full',
+        orchestration: { parallel_available: true, default_mode: 'parallel',
+          worker_profile: profile, fallback_worker_profile: profile } };
+      expect(glassHiveOptionsSchema.parse(value)).toEqual(value);
+    },
+  );
+  it.each(['', ' '.repeat(2), 'x'.repeat(161)])('rejects an empty or unbounded profile', (profile) => {
+    expect(() => glassHiveOptionsSchema.parse({ workspace: { mode: 'life' }, access: 'full',
+      orchestration: { parallel_available: true, default_mode: 'parallel', worker_profile: profile } })).toThrow();
+  });
+});
+// VIVENTIUM END

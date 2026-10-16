@@ -243,7 +243,7 @@ describe('GlassHiveAccountService', () => {
     );
     expect(mockEnrichActiveWorkSnapshot).toHaveBeenCalledWith({
       ownerId: 'owner-1',
-      includeCoreOnlyHistory: true,
+      includeCoreOnlyHistory: false,
       snapshot: expect.objectContaining({
         work: [expect.objectContaining({ workRef: 'work-history', actions: [] })],
       }),

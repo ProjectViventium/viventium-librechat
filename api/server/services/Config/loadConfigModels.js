@@ -72,7 +72,16 @@ async function loadConfigModels(req) {
 
     modelsConfig[name] = [];
 
-    if (models.fetch && !isUserProvided(API_KEY) && !isUserProvided(BASE_URL)) {
+    const nativeDiscovery =
+      appConfig.endpoints?.agents?.providerCapabilities?.[name]?.context_protocol ===
+      'main_context_v1';
+    // Existing cached model loading also warms native admission capabilities. A fixed model
+    // menu does not disable provider capability discovery or alter its configured choices.
+    if (
+      (models.fetch || nativeDiscovery) &&
+      !isUserProvided(API_KEY) &&
+      !isUserProvided(BASE_URL)
+    ) {
       fetchPromisesMap[uniqueKey] =
         fetchPromisesMap[uniqueKey] ||
         fetchModels({
@@ -107,7 +116,12 @@ async function loadConfigModels(req) {
 
     for (const name of associatedNames) {
       const endpoint = endpointsMap[name];
-      modelsConfig[name] = !modelData?.length ? (endpoint.models.default ?? []) : modelData;
+      modelsConfig[name] =
+        !endpoint.models.fetch || !modelData?.length
+          ? (endpoint.models.default ?? []).map((model) =>
+              typeof model === 'string' ? model : model.name,
+            )
+          : modelData;
     }
   }
 

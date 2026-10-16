@@ -116,46 +116,88 @@ describe('ViventiumMainContinuityState model', () => {
   });
 });
 
+
 test('retains the full reviewed replacement and its server-owned allocation', async () => {
-  const contract = {
-    version: 1,
-    consumer: 'accepted_core',
-    carrierMaxUtf8Bytes: 12288,
-    reservedUtf8Bytes: 1200,
-    maxJsonUtf8Bytes: 11088,
-    maxSummaryUtf8Bytes: 11088,
-    maxItemsPerArray: 32,
-    maxStringItemUtf8Bytes: 1024,
-    maxToolIdentityCharacters: 256,
-  };
+  const contract = { version: 1, consumer: 'accepted_core', carrierMaxUtf8Bytes: 12288,
+    reservedUtf8Bytes: 1200, maxJsonUtf8Bytes: 11088, maxSummaryUtf8Bytes: 11088,
+    maxItemsPerArray: 32, maxStringItemUtf8Bytes: 1024, maxToolIdentityCharacters: 256 };
   const summary = 's'.repeat(8000) + ' Keep permission required.';
-  const document = new ContinuityState({
-    ...validState,
-    semanticCompactionContract: contract,
-    semanticCompaction: {
-      version: 1,
-      summary,
-      pendingAsks: [],
-      commitments: [],
-      corrections: [],
-      decisions: [],
-      durableIdentifiers: [],
-      recurrenceOutcomes: [],
-      toolPairs: [],
-      sourceDigest: 'b'.repeat(64),
-      generatedAt: new Date(),
-    },
-    compactionLease: {
-      leaseId: 'lease',
-      sourceDigest: 'b'.repeat(64),
-      sourceTurnIds: [],
-      claimedAt: new Date(),
-      expiresAt: new Date(Date.now() + 1000),
-      outputContract: contract,
-    },
-  });
+  const document = new ContinuityState({ ...validState, semanticCompactionContract: contract,
+    semanticCompaction: { version: 1, summary, pendingAsks: [], commitments: [], corrections: [],
+      decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [],
+      sourceDigest: 'b'.repeat(64), generatedAt: new Date() },
+    compactionLease: { leaseId: 'lease', sourceDigest: 'b'.repeat(64), sourceTurnIds: [],
+      claimedAt: new Date(), expiresAt: new Date(Date.now() + 1000), outputContract: contract } });
   await expect(document.validate()).resolves.toBeUndefined();
   expect(document.toObject().semanticCompaction?.summary).toBe(summary);
   expect(document.toObject().semanticCompactionContract).toEqual(contract);
   expect(document.toObject().compactionLease?.outputContract).toEqual(contract);
+});
+
+
+test('persists the typed pending repair separately from accepted semantic context', async () => {
+  const pendingCompactionRepair = { version: 1, sourceDigest: 'd'.repeat(64),
+    contractKey: 'exact-route-contract', semanticAttempts: 1, transportRetries: 0,
+    sourceGeneration: 2, sourceTurnKeys: ['source:1'],
+    correction: { code: 'semantic_fidelity', candidate: '{"summary":"unaccepted"}',
+      reason: 'Preserve the exact reference.' } };
+  const document = new ContinuityState({ ...validState, pendingCompactionRepair });
+  await expect(document.validate()).resolves.toBeUndefined();
+  expect(document.toObject().pendingCompactionRepair).toEqual(pendingCompactionRepair);
+  expect(document.toObject().semanticCompaction).toBeNull();
+  await expect(new ContinuityState({ ...validState, pendingCompactionRepair: {
+    ...pendingCompactionRepair, correction: { ...pendingCompactionRepair.correction, code: 'schema_invalid' },
+  } }).validate()).rejects.toThrow();
+});
+
+
+test('retains numeric size feedback without an oversized candidate or accepted summary', async () => {
+  const pendingCompactionRepair = { version: 1, sourceDigest: 'd'.repeat(64),
+    contractKey: 'exact-route-contract', semanticAttempts: 2, transportRetries: 0,
+    sourceGeneration: 2, sourceTurnKeys: ['source:1'],
+    sizeRepair: { proposalBytes: 94000, previousProposalBytes: 96000, converging: true },
+    correction: { code: 'schema_invalid', issue: { path: '', constraint: 'max_bytes',
+      actual: 94000, limit: 75000, proposalBytes: 94000, excessBytes: 19000, unit: 'utf8_bytes' } } };
+  const document = new ContinuityState({ ...validState, pendingCompactionRepair });
+  await expect(document.validate()).resolves.toBeUndefined();
+  expect(document.toObject().pendingCompactionRepair).toEqual(pendingCompactionRepair);
+  expect(document.toObject().semanticCompaction).toBeNull();
+});
+
+
+test.each([0, 1])('round-trips completed fidelity repair count %s', async fidelityRepairAttempts => {
+  const pendingCompactionRepair = { version: 1, sourceDigest: 'd'.repeat(64),
+    contractKey: 'exact-route-contract', semanticAttempts: 3, fidelityRepairAttempts, transportRetries: 0,
+    sourceGeneration: 2, sourceTurnKeys: ['source:1'],
+    correction: { code: 'semantic_fidelity', candidate: '{"summary":"unaccepted"}', reason: 'Keep approval required.' } };
+  const document = new ContinuityState({ ...validState, pendingCompactionRepair });
+  await expect(document.validate()).resolves.toBeUndefined();
+  expect(document.toObject().pendingCompactionRepair).toEqual(pendingCompactionRepair);
+  expect(document.toObject().semanticCompaction).toBeNull();
+});
+
+test.each([-1, 0.5, 2])('rejects invalid completed fidelity repair count %s', async fidelityRepairAttempts => {
+  const document = new ContinuityState({ ...validState, pendingCompactionRepair: {
+    version: 1, sourceDigest: 'd'.repeat(64), contractKey: 'exact-route-contract',
+    semanticAttempts: 3, fidelityRepairAttempts, transportRetries: 0, sourceGeneration: 2,
+    sourceTurnKeys: ['source:1'], correction: { code: 'semantic_fidelity', candidate: '{}' },
+  } });
+  await expect(document.validate()).rejects.toThrow('fidelityRepairAttempts');
+});
+
+
+test('round-trips an owner-validated bounded size draft without promoting it', async () => {
+  const candidate = JSON.stringify({ version: 1, summary: 'Keep approval required.', pendingAsks: [],
+    commitments: [], corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [] });
+  const bytes = Buffer.byteLength(candidate);
+  const pendingCompactionRepair = { version: 1, sourceDigest: 'd'.repeat(64),
+    contractKey: 'exact-route-contract', semanticAttempts: 2, fidelityRepairAttempts: 0, transportRetries: 0,
+    sourceGeneration: 2, sourceTurnKeys: ['source:1'],
+    sizeRepair: { proposalBytes: bytes, previousProposalBytes: bytes + 100, converging: true },
+    correction: { code: 'schema_invalid', candidate, issue: { path: '$carrier', constraint: 'max_bytes',
+      actual: 131080, limit: 131072, proposalBytes: bytes, excessBytes: 8, unit: 'utf8_bytes' } } };
+  const document = new ContinuityState({ ...validState, pendingCompactionRepair });
+  await expect(document.validate()).resolves.toBeUndefined();
+  expect(document.toObject().pendingCompactionRepair).toEqual(pendingCompactionRepair);
+  expect(document.toObject().semanticCompaction).toBeNull();
 });

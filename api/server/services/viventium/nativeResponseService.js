@@ -29,6 +29,46 @@ const {
   runGlassHiveTerminalCallbackTransaction,
 } = require('./GlassHiveTerminalCallbackTransaction');
 
+/* === VIVENTIUM START === Passive, content-free admission and HTTP timing. === */
+const { createHash } = require('crypto');
+const { logger } = require('@librechat/data-schemas');
+const { voiceLatencyNow, logVoiceLatencyNumericStage } = require('./voiceLatencyTiming');
+
+function observeNativeResponsePhase(req, stage, operation) {
+  if (req?.viventiumVoiceLogLatency !== true) return operation();
+  const startedAt = voiceLatencyNow();
+  let outcome = 'failed';
+  const record = () => {
+    try {
+      const requestHash = createHash('sha256')
+        .update(String(req.viventiumVoiceRequestId || 'unknown'))
+        .digest('hex');
+      logVoiceLatencyNumericStage(
+        logger,
+        req,
+        'native_response',
+        `${stage}_${outcome}`,
+        startedAt,
+        requestHash,
+      );
+    } catch {
+      // Passive diagnostics must preserve the exact admission or transport outcome.
+    }
+  };
+  try {
+    return Promise.resolve(operation())
+      .then((result) => {
+        outcome = 'completed';
+        return result;
+      })
+      .finally(record);
+  } catch (error) {
+    record();
+    throw error;
+  }
+}
+/* === VIVENTIUM END === */
+
 const runNativeResponseTransaction = (operation) =>
   runGlassHiveTerminalCallbackTransaction(operation, { retry: 'native' });
 
@@ -400,7 +440,8 @@ function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
     };
   }
   return createNativeResponseFetch(
-    baseFetch,
+    (input, init) =>
+      observeNativeResponsePhase(req, 'provider_response_headers', () => baseFetch(input, init)),
     async () => {
       /* === VIVENTIUM START === Each Main attempt owns its current admission proof. */
       delete req._viventiumNativeResponseUnaccepted;
@@ -449,7 +490,8 @@ function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
         source: source.proof,
       };
     },
-    (identity) => getService().admit(identity),
+    (identity) =>
+      observeNativeResponsePhase(req, 'host_native_admission', () => getService().admit(identity)),
     (identity) => {
       req._viventiumNativeResponseIdentity = identity;
     },

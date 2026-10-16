@@ -1649,6 +1649,7 @@ router.post('/claim', async (req, res) => {
       gatewayAgentName: claimed.gatewayAgentName,
       ownerParticipantIdentity: claimed.ownerParticipantIdentity,
       requestedVoiceRoute: claimed.requestedVoiceRoute,
+      preparationTimeoutS: Number(claimed.contextPreparation?.timeoutSeconds || 0),
       ...(Array.isArray(claimed.contextualKeyterms) && claimed.contextualKeyterms.length
         ? { contextualKeyterms: claimed.contextualKeyterms }
         : {}),
@@ -2782,7 +2783,7 @@ router.post(
   async (req, _res, next) => {
     req.viventiumVoiceIngressReceivedAtMs = Date.now();
     const session = req.viventiumCallSession;
-    const callMode = canonicalVoiceSessionMode(session);
+    let callMode = canonicalVoiceSessionMode(session);
     const incoming = req.body ?? {};
     const text = typeof incoming.text === 'string' ? incoming.text : '';
     const speakInsights = incoming.speakInsights === true;
@@ -2849,6 +2850,34 @@ router.post(
         segments: speakerPersistence.effectiveSegments,
       });
     }
+    /* VIVENTIUM: media/ingress stay live while the same Main's opt-in context turn settles. */
+    if (callMode !== 'listen_only' && session.contextPreparation) {
+      const waitingRequest = new AbortController();
+      const onWaitingClose = () => {
+        if (!_res.writableEnded && !_res.finished) waitingRequest.abort();
+      };
+      _res.once('close', onWaitingClose);
+      if (_res.destroyed || req.aborted) waitingRequest.abort();
+      try {
+        const prepared = await require('~/server/services/viventium/CallPreparationService').wait(
+          session,
+          waitingRequest.signal,
+        );
+        if (waitingRequest.signal.aborted) return;
+        Object.assign(session, prepared);
+        callMode = canonicalVoiceSessionMode(session);
+      } catch (error) {
+        if (waitingRequest.signal.aborted) return;
+        return _res.status(error.status || 409).json({
+          code: error.code || 'call_context_failed',
+          message: error.message || 'Context gathering did not finish.',
+          retryable: error.code === 'call_context_busy',
+        });
+      } finally {
+        _res.removeListener('close', onWaitingClose);
+      }
+    }
+
     const latestEffectiveSegments = new Map();
     for (const segment of speakerPersistence.effectiveSegments || []) {
       if (!segment?.segmentId) {

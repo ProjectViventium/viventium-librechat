@@ -16,7 +16,11 @@
  * === VIVENTIUM END === */
 
 const { ContentTypes } = require('librechat-data-provider');
-const { projectDeliveryDispositionRanges } = require('@librechat/api');
+const {
+  projectDeliveryDispositionRanges,
+  projectAudioDeliveryControls,
+} = require('@librechat/api');
+const { stripVoiceControlTagsForDisplay } = require('./surfacePrompts');
 const { getMessage, getMessages } = require('~/models');
 
 /**
@@ -102,6 +106,12 @@ async function getFollowUpMessageForParent({
           };
         })
     : undefined;
+  const deliveryControls = projectAudioDeliveryControls(
+    followUp.metadata?.viventium?.deliveryControls,
+    text,
+    content,
+    stripVoiceControlTagsForDisplay,
+  );
   const audible =
     hasRanges &&
     content.some((part) =>
@@ -113,6 +123,7 @@ async function getFollowUpMessageForParent({
     messageId: followUp.messageId,
     text,
     ...(hasRanges ? { content } : {}),
+    ...(deliveryControls ? { deliveryControls } : {}),
     audioSuppressed: hasRanges ? !audible : defaultSkipped,
     presentationRequired:
       Array.isArray(followUp.metadata?.viventium?.cortexInsightDeliveryIds) &&
@@ -179,6 +190,7 @@ async function getCompletedCortexInsightsForMessage({
             messageId: followUp.messageId,
             text: followUp.text,
             ...(followUp.content ? { content: followUp.content } : {}),
+            ...(followUp.deliveryControls ? { deliveryControls: followUp.deliveryControls } : {}),
           }
         : null,
     presentationRequired: !followUp?.audioSuppressed && followUp?.presentationRequired === true,

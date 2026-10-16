@@ -868,7 +868,7 @@ function brokerContextBrief(
     `- Content-read broker scope for this run is ${contentReadScope ? 'authorized by reviewed host policy' : 'not authorized'}. If a needed content read is blocked by broker policy, report that blocker instead of self-authorizing with worker-authored flags.`,
     `- Authorized capability servers for this run: ${serverList}. If a needed server is missing, report the broker omission/auth limitation rather than fabricating.`,
     `- Deferred capability servers (discover only when the task needs them): ${deferredServerList}. Use \`capability_describe\` for one deferred server before invoking its underlying tool; do not probe deferred servers during unrelated chat.`,
-    `- Authorized host tools for this run: ${hostToolList}. These are the same resolved host capabilities available to the main Agent; absence means the host did not resolve or authorize them for this turn.`,
+    `- Authorized host tools for this run: ${hostToolList}. This list is the scope of this invocation only; it does not describe other agents’ or workers’ capabilities or results. Absence means the host did not resolve or authorize them for this invocation.`,
     '- Host-tool resources are virtual service evidence, not workspace paths. Never pass their labels to shell/filesystem tools or search for copies by filename. When an authorized host tool covers the needed evidence, call it before any filesystem discovery; resource labels are not proof of mounted files.',
   ].join('\n');
 }
@@ -984,6 +984,8 @@ function mergeWorkerContextBundle({
   brokerUnavailableReason = '',
 }) {
   const bundle = { ...existingBundle };
+  // Launch authority is owned by the trusted caller configuration below, never task arguments.
+  delete bundle.viventium_launch_authority;
   const memoryBlock = workerMemoryBlock(workerMemory);
   if (memoryBlock) {
     bundle.agents_md = appendText(bundle.agents_md, memoryBlock);
@@ -1125,6 +1127,7 @@ function mergePendingBrokerAuthorizationBundle({
   executionMode = 'docker',
 }) {
   const bundle = mergeWorkerContextBundle({ existingBundle, workerMemory, workerFeelings });
+  const deferredServers = authorization.deferredServers || [];
   const tokenEnvVar = 'GLASSHIVE_CAPABILITY_BROKER_TOKEN';
   const serverConfig = {
     type: 'http',
@@ -1149,9 +1152,14 @@ function mergePendingBrokerAuthorizationBundle({
     name: 'glasshive-user-capabilities',
     url: brokerUrl,
     allowed_servers: allowedServers,
+    ...(Array.isArray(authorization.eagerServers) && Array.isArray(authorization.deferredServers)
+      ? { eager_servers: authorization.eagerServers, deferred_servers: deferredServers }
+      : {}),
     allowed_host_tools: allowedHostTools,
     scopes: { content_read: contentReadScope },
-    projection: 'all_user_enabled_policy_gated',
+    projection: deferredServers.length
+      ? 'signed_eager_and_deferred_policy_gated'
+      : 'all_user_enabled_policy_gated',
   };
   if (launchAuthorityKind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR) {
     bundle.viventium_launch_authority = {
@@ -1178,7 +1186,11 @@ function mergePendingBrokerAuthorizationBundle({
   bundle.codex_config_append = appendText(bundle.codex_config_append, codexBlock);
   bundle.env = { ...(bundle.env || {}) };
   delete bundle.env[tokenEnvVar];
-  const instruction = brokerContextBrief(allowedServers, { contentReadScope, allowedHostTools });
+  const instruction = brokerContextBrief(allowedServers, {
+    contentReadScope,
+    allowedHostTools,
+    deferredServers,
+  });
   bundle.agents_md = appendText(bundle.agents_md, instruction);
   bundle.claude_md = appendText(bundle.claude_md, instruction);
   bundle.codex_md = appendText(bundle.codex_md, instruction);
@@ -1189,9 +1201,13 @@ function applyContextBrief(
   args,
   toolName,
   allowedServers,
-  { contentReadScope = false, allowedHostTools = [] } = {},
+  { contentReadScope = false, allowedHostTools = [], deferredServers = [] } = {},
 ) {
-  const brief = brokerContextBrief(allowedServers, { contentReadScope, allowedHostTools });
+  const brief = brokerContextBrief(allowedServers, {
+    contentReadScope,
+    allowedHostTools,
+    deferredServers,
+  });
   if (toolName === 'workspace_launch' || toolName === 'workspace_schedule') {
     args.context = appendText(args.context, brief);
   } else if (toolName === 'workspace_continue') {
@@ -1417,6 +1433,11 @@ async function maybeInjectGlassHiveCapabilityBroker({
       user,
       originRef: launchContext.originRef,
       allowedServers,
+      // VIVENTIUM: Ordinary missions discover connected services on demand through the existing
+      // broker helpers. Scheduled authorizations keep their established discovery contract.
+      ...(['workspace_schedule', 'worker_schedule'].includes(toolName)
+        ? {}
+        : { eagerServers: [], deferredServers: allowedServers }),
       allowedHostTools,
       hostToolResources,
       contentReadScope,
@@ -1457,7 +1478,11 @@ async function maybeInjectGlassHiveCapabilityBroker({
       { allowedServers },
     );
   }
-  applyContextBrief(args, toolName, allowedServers, { contentReadScope, allowedHostTools });
+  applyContextBrief(args, toolName, allowedServers, {
+    contentReadScope,
+    allowedHostTools,
+    deferredServers: authorization.deferredServers || [],
+  });
   return finalizeTrustedLaunchArgs();
 }
 
@@ -1478,6 +1503,7 @@ async function buildConversationProviderBootstrapBundle({
   workerProfile = '',
   workerModel = '',
   workerReasoningEffort = '',
+  workerAccess = '',
   fallbackWorkerProfile = '',
   fallbackWorkerModel = '',
   fallbackWorkerReasoningEffort = '',
@@ -1563,6 +1589,7 @@ async function buildConversationProviderBootstrapBundle({
             workerProfile,
             workerModel,
             workerReasoningEffort,
+            workerAccess,
             fallbackWorkerProfile,
             fallbackWorkerModel,
             fallbackWorkerReasoningEffort,

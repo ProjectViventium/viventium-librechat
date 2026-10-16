@@ -442,25 +442,7 @@ async function loadPersistedCortexFollowUp({
   }).lean();
 }
 
-/* === VIVENTIUM START === Exact source authority for occupied Voice synthesis recovery. === */
-function occupiedVoiceDeliveryEvidence(parent, rows, events) {
-  if (parent.surface !== 'voice') return { occupied: false, mixed: false };
-  const retained = (Array.isArray(rows) ? rows : []).filter(
-    (row) => !['sent', 'dropped'].includes(row.status),
-  );
-  const typedIds = new Set(
-    (Array.isArray(events) ? events : [])
-      .filter(
-        (event) => event.transition === 'failure' && event.reason === 'native_session_occupied',
-      )
-      .map((event) => event.deliveryId),
-  );
-  const count = retained.filter((row) => typedIds.has(row.deliveryId)).length;
-  return {
-    occupied: retained.length > 0 && count === retained.length,
-    mixed: count > 0 && count !== retained.length,
-  };
-}
+/* === VIVENTIUM START === Exact source authority for durable Voice synthesis recovery. === */
 async function wakeRecoveredVoiceFollowUp(input) {
   return require('./BackgroundCortexFollowUpService').publishCortexVoiceFollowUp(input);
 }
@@ -594,7 +576,7 @@ async function createRecoveredCortexFollowUp({
   const { getAgent } = require('~/models/Agent');
   const {
     createCortexFollowUpMessage,
-    bindOccupiedCortexRecovery,
+    bindOwnedVoiceCortexRecovery,
   } = require('~/server/services/viventium/BackgroundCortexFollowUpService');
   const parent = await Message.findOne({
     user: ownerId,
@@ -649,13 +631,7 @@ async function createRecoveredCortexFollowUp({
       : {}),
   };
   if (surface === 'voice') {
-    const events = await cortexInsightDeliveryService.listEvents({ ownerId, parentMessageId });
-    if (!occupiedVoiceDeliveryEvidence({ surface }, deliveryBatch?.claimed, events).occupied) {
-      throw Object.assign(new Error('Cortex recovery does not own an occupied Voice source'), {
-        code: 'cortex_voice_recovery_scope_mismatch',
-      });
-    }
-    bindOccupiedCortexRecovery(req, async () =>
+    bindOwnedVoiceCortexRecovery(req, async () =>
       resolveOwnedVoiceCortexRecovery({
         ownerId,
         conversationId,
@@ -1415,29 +1391,18 @@ async function recoverPendingCortexInsightDeliveries({
       continue;
     }
     let rows = [];
-    let occupiedVoice = false;
-    if (parent.surface === 'voice') {
+    const ownedVoiceRecovery = parent.surface === 'voice';
+    if (ownedVoiceRecovery) {
       try {
-        const [retainedRows, events] = await Promise.all([
-          deliveryService.listByParent({
+        // Recovery follows the retained source envelope, not the cause of a previous failure.
+        // The existing authority check and complete-batch claim below remain mandatory.
+        rows = (
+          await deliveryService.listByParent({
             ownerId: parent.ownerId,
             parentMessageId: parent.parentMessageId,
-          }),
-          deliveryService.listEvents({
-            ownerId: parent.ownerId,
-            parentMessageId: parent.parentMessageId,
-          }),
-        ]);
-        rows = retainedRows;
-        const evidence = occupiedVoiceDeliveryEvidence(parent, rows, events);
-        if (evidence.mixed) {
-          // Admission/settlement require one complete batch. Never slice it, widen a typed
-          // failure to unrelated rows, or discard its retained typed contribution.
-          summary.pending += rows.filter((row) => !['sent', 'dropped'].includes(row.status)).length;
-          await deferParentClaim(parent, 'parent_state_unavailable');
-          continue;
-        }
-        occupiedVoice = evidence.occupied;
+          })
+        ).filter((row) => !['sent', 'dropped'].includes(row.status));
+        if (!rows.length) continue;
       } catch (error) {
         summary.failed += 1;
         summary.pending += 1;
@@ -1447,7 +1412,7 @@ async function recoverPendingCortexInsightDeliveries({
     }
     let savedVoiceSkip = false;
     let retainedScopeError = null;
-    if (occupiedVoice) {
+    if (ownedVoiceRecovery) {
       try {
         const authority = await resolveVoiceRecovery({
           ...parent,
@@ -1543,7 +1508,8 @@ async function recoverPendingCortexInsightDeliveries({
     ];
     const unsupportedSurfaces = requiredSurfaces.filter(
       (surface) =>
-        !RECOVERY_PRESENTATION_SURFACES.has(surface) && !(occupiedVoice && surface === 'voice'),
+        !RECOVERY_PRESENTATION_SURFACES.has(surface) &&
+        !(ownedVoiceRecovery && surface === 'voice'),
     );
     if (requiredSurfaces.length === 0 || unsupportedSurfaces.length > 0) {
       try {
@@ -1571,7 +1537,7 @@ async function recoverPendingCortexInsightDeliveries({
     try {
       if (retainedScopeError) throw retainedScopeError;
       let voiceRecovery = null;
-      if (occupiedVoice) {
+      if (ownedVoiceRecovery) {
         voiceRecovery = await resolveVoiceRecovery({ ...parent, parentState, recoveryContext });
         if (voiceRecovery.state === 'waiting' && !savedVoiceSkip) {
           await deferWaitingVoiceClaim(parent, batch);
@@ -1614,7 +1580,7 @@ async function recoverPendingCortexInsightDeliveries({
           recoveryContext,
         });
       }
-      if (!message?.messageId && occupiedVoice) {
+      if (!message?.messageId && ownedVoiceRecovery) {
         const rows = await deliveryService.listByParent({
           ownerId: parent.ownerId,
           parentMessageId: parent.parentMessageId,
@@ -1666,7 +1632,7 @@ async function recoverPendingCortexInsightDeliveries({
       });
       requireExactCortexInsightDeliverySettlement(batch.claimed, persisted);
       summary.persisted += persisted.length;
-      if (occupiedVoice) {
+      if (ownedVoiceRecovery) {
         // Recheck End/Stop after the existing author/persistence guards. Saving text is never
         // a receiver confirmation; an eligible live child stays owned by Voice prepare/confirm.
         voiceRecovery = await resolveVoiceRecovery({
@@ -1782,7 +1748,7 @@ async function recoverPendingCortexInsightDeliveries({
       requireExactCortexInsightDeliverySettlement(batch.claimed, finalized);
       summary.sent += finalized.filter((row) => row.status === 'sent').length;
     } catch (error) {
-      if (occupiedVoice && error?.code === 'cortex_voice_recovery_authority_pending') {
+      if (ownedVoiceRecovery && error?.code === 'cortex_voice_recovery_authority_pending') {
         await deferWaitingVoiceClaim(parent, batch);
         continue;
       }

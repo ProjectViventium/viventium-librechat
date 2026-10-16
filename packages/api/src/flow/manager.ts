@@ -187,11 +187,16 @@ export class FlowStateManager<T = unknown> {
         signal.addEventListener('abort', abortHandler, { once: true });
       }
 
-      intervalId = setInterval(async () => {
+      /* === VIVENTIUM START ===
+       * Recheck retained flow state immediately; completed credentials need no poll delay.
+       * Pending flows keep the existing cadence and TTL accounting.
+       */
+      const checkFlow = async (elapsed = checkInterval) => {
         if (isCleanedUp) return;
 
         try {
           const flowState = (await this.keyv.get(flowKey)) as FlowState<T> | undefined;
+          if (isCleanedUp) return;
 
           if (!flowState) {
             cleanup();
@@ -218,11 +223,14 @@ export class FlowStateManager<T = unknown> {
             } else if (flowState.status === 'FAILED') {
               await this.keyv.delete(flowKey);
               reject(new Error(flowState.error ?? `${type} flow failed`));
+            } else {
+              await this.keyv.delete(flowKey);
+              reject(new Error(`${type} flow has an invalid terminal state`));
             }
             return;
           }
 
-          elapsedTime += checkInterval;
+          elapsedTime += elapsed;
           if (elapsedTime >= this.ttl) {
             cleanup();
             logger.error(
@@ -237,9 +245,11 @@ export class FlowStateManager<T = unknown> {
           cleanup();
           reject(error);
         }
-      }, checkInterval);
-
+      };
+      intervalId = setInterval(checkFlow, checkInterval);
       this.intervals.add(intervalId);
+      void checkFlow(0);
+      /* === VIVENTIUM END === */
     });
   }
 

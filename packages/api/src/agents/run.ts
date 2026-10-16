@@ -903,11 +903,16 @@ function isRecoverableGraphFallbackStatus(status: number): boolean {
   return status === 401 || status === 402 || status === 403 || status === 429 || status >= 500;
 }
 
-function markOpaqueProviderAttemptFailure(error: unknown): unknown {
+function markOpaqueProviderAttemptFailure(
+  error: unknown, { httpRejectionOnly = false }: { httpRejectionOnly?: boolean } = {},
+): unknown {
   const chain = graphFallbackErrorChain(error);
   if (chain.length === 0) {
     return error;
   }
+  const knownRequestRejection = httpRejectionOnly &&
+    chain.some((item) => graphFallbackStatus(item) === 400);
+  if (httpRejectionOnly && !knownRequestRejection) return error;
   const hasStructuredDisposition =
     graphFallbackErrorClasses(error).length > 0 ||
     chain.some(
@@ -919,15 +924,17 @@ function markOpaqueProviderAttemptFailure(error: unknown): unknown {
         item.viventiumNonRetryableProviderError === true ||
         graphFallbackStatus(item) > 0,
     );
-  if (hasStructuredDisposition) {
+  if (hasStructuredDisposition && !knownRequestRejection) {
     return error;
   }
   try {
-    chain[0].viventiumCompletionPhase = 'provider_response';
+    chain[0].viventiumCompletionPhase = knownRequestRejection
+      ? 'provider_request_rejected' : 'provider_response';
     return error;
   } catch {
     return Object.assign(new Error('Model provider response failed'), {
-      viventiumCompletionPhase: 'provider_response',
+      viventiumCompletionPhase: knownRequestRejection
+        ? 'provider_request_rejected' : 'provider_response',
       cause: error,
     });
   }
@@ -980,9 +987,7 @@ const graphFallbackInvocationKey = Symbol.for('viventium.graph.fallback.recovery
 type GraphFallbackInvocation = { agentId: string; runId: string; threadId: string };
 
 function beginGraphFallbackInvocation(
-  graph: object,
-  agentId: string,
-  config?: { configurable?: { thread_id?: unknown } },
+  graph: object, agentId: string, config?: { configurable?: { thread_id?: unknown } },
 ): GraphFallbackInvocation | null {
   const owner = graph as Record<PropertyKey, unknown>;
   if (agentId !== owner.defaultAgentId) {
@@ -997,9 +1002,7 @@ function beginGraphFallbackInvocation(
   }
   const invocation = Object.freeze({ agentId, runId, threadId });
   Object.defineProperty(owner, graphFallbackInvocationKey, {
-    value: invocation,
-    configurable: true,
-    enumerable: false,
+    value: invocation, configurable: true, enumerable: false,
   });
   return invocation;
 }
@@ -1032,7 +1035,11 @@ async function invokeModernGraphFallbackPolicy(
   const hasCapabilityRefresh =
     typeof baseOptions[VIVENTIUM_MODEL_ROUTE_CAPABILITY_REFRESH] === 'function';
   if (fallbacks.length === 0 && !hasCapabilityRefresh) {
-    return originalCallModel(state, config);
+    try { return await originalCallModel(state, config); }
+    catch (error) {
+      if (graphIsAborted(graph, config)) throw error;
+      throw markOpaqueProviderAttemptFailure(error, { httpRejectionOnly: true });
+    }
   }
 
   const routes = new Map<object, ModernGraphRoute>();
@@ -1090,7 +1097,11 @@ async function invokeModernGraphFallbackPolicy(
         primaryAuthored ||
         !isRecoverableProviderFallbackError(classifiedPrimaryError)
       ) {
-        throw graphIsAborted(graph, config) ? graphAbortError() : classifiedPrimaryError;
+        if (graphIsAborted(graph, config)) throw graphAbortError();
+        // The existing policy has rejected fallback. Mark only the owned model request,
+        // so a hidden failed consult can return to its caller without retrying this request.
+        throw primaryAuthored ? classifiedPrimaryError :
+          markOpaqueProviderAttemptFailure(classifiedPrimaryError, { httpRejectionOnly: true });
       }
 
       let lastError = classifiedPrimaryError;
@@ -1139,25 +1150,15 @@ async function invokeModernGraphFallbackPolicy(
         const fallbackBefore = authoringEvidenceSnapshot(graph);
         try {
           const result = await invokeRoute(fallbackRoute, fallbackMessages);
-          if (
-            recoveryInvocation &&
-            !graphIsAborted(graph, config) &&
-            (graph as Record<PropertyKey, unknown>)[graphFallbackInvocationKey] ===
-              recoveryInvocation
-          ) {
+          if (recoveryInvocation && !graphIsAborted(graph, config) &&
+              (graph as Record<PropertyKey, unknown>)[graphFallbackInvocationKey] === recoveryInvocation) {
             const receipt = {
-              provider: String(runtimeContext.provider ?? '').trim(),
-              model: runtimeContext.model,
+              provider: String(runtimeContext.provider ?? '').trim(), model: runtimeContext.model,
               ...recoveryInvocation,
             };
-            Object.defineProperty(receipt, graphFallbackInvocationKey, {
-              value: recoveryInvocation,
-            });
+            Object.defineProperty(receipt, graphFallbackInvocationKey, { value: recoveryInvocation });
             Object.defineProperty(graph, 'viventiumGraphFallbackRecoveryReceipt', {
-              value: Object.freeze(receipt),
-              configurable: true,
-              enumerable: false,
-              writable: false,
+              value: Object.freeze(receipt), configurable: true, enumerable: false, writable: false,
             });
           }
           return result;
@@ -1173,7 +1174,9 @@ async function invokeModernGraphFallbackPolicy(
             fallbackAuthored ||
             !isRecoverableProviderFallbackError(classifiedFallbackError)
           ) {
-            throw graphIsAborted(graph, config) ? graphAbortError() : classifiedFallbackError;
+            if (graphIsAborted(graph, config)) throw graphAbortError();
+            throw fallbackAuthored ? classifiedFallbackError :
+              markOpaqueProviderAttemptFailure(classifiedFallbackError, { httpRejectionOnly: true });
           }
         }
       }
@@ -1217,10 +1220,7 @@ function installModernGraphCompatibilityPatch(): void {
     if (typeof originalCallModel !== 'function') {
       return originalCallModel;
     }
-    return async (
-      state: { messages: BaseMessage[] },
-      config?: { signal?: AbortSignal; configurable?: { thread_id?: unknown } },
-    ) => {
+    return async (state: { messages: BaseMessage[] }, config?: { signal?: AbortSignal; configurable?: { thread_id?: unknown } }) => {
       const recoveryInvocation = beginGraphFallbackInvocation(this, agentId, config);
       const agentContext = (this as { agentContexts?: Map<string, object> }).agentContexts?.get(
         agentId,
@@ -1589,8 +1589,8 @@ export async function createRun({
       streamUsage,
     });
     // Keep accepted source guards local to this run and each exact selected route.
-    const sourceChain =
-      agent === agents[0] ? mainContinuityHeaders?.[MAIN_CONTINUITY_CHAIN_HEADER] : undefined;
+    const sourceChain = agent === agents[0]
+      ? mainContinuityHeaders?.[MAIN_CONTINUITY_CHAIN_HEADER] : undefined;
     const selectedRoutes = [agent, ...(agent.viventiumGraphLlmFallbacks || [])];
     const selectedOptions = [
       llmConfig,
@@ -1628,12 +1628,9 @@ export async function createRun({
        * Main source guards, authority and invocation-fresh background inputs stay primary-owned.
        * === VIVENTIUM END === */
       configuration.fetch = createNativeBootstrapFetch(
-        createMainContinuityFetch(
-          boundFetch,
-          sourceChain,
+        createMainContinuityFetch(boundFetch, sourceChain,
           sourceChain ? mainContinuityHeaders : undefined,
-          sourceChain ? readMainBackgroundInputs : undefined,
-        ),
+          sourceChain ? readMainBackgroundInputs : undefined),
       );
     }
     if (graphFallbacks.length > 0) {

@@ -21,6 +21,7 @@ import type {
 
 export const GLASSHIVE_NATIVE_MEDIA_MAX_IMAGES = 24;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+export const GLASSHIVE_NATIVE_MEDIA_MAX_IMAGE_BYTES = MAX_IMAGE_BYTES;
 export const GLASSHIVE_NATIVE_MEDIA_MAX_BYTES = 32 * 1024 * 1024;
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
 const observationSchema = z.object({
@@ -152,14 +153,10 @@ function mapNativeMediaMarkdownReferences(
 ): string {
   const protectedRanges = markdownCodeRanges(text);
   return text.replace(
-    /(!?\[(?:\\.|[^\]\r\n])*\])\(\s*<?([^<>\s()]*)>?\s*\)/g,
-    (_match, label: string, reference: string, offset: number) => {
+    /\\.|(!?\[(?:\\.|[^\\[\]\r\n])*\])\(\s*<?([^<>\s()]*)>?\s*\)/g,
+    (_match, label: string | undefined, reference: string | undefined, offset: number) => {
+      if (label === undefined || reference === undefined) return _match;
       if (protectedRanges.some(([start, end]) => offset >= start && offset < end)) return _match;
-      let escapes = 0;
-      const bracketOffset = label.startsWith('!') ? offset + 1 : offset;
-      for (let index = bracketOffset - 1; index >= 0 && text[index] === '\\'; index -= 1)
-        escapes += 1;
-      if (escapes % 2 === 1) return _match;
       return project(
         { reference, label: label.slice(label.startsWith('!') ? 2 : 1, -1).slice(0, 200) },
         _match,
@@ -628,10 +625,8 @@ export async function buildGlassHiveNativeMediaContent(
   for (const insight of insights) {
     if (insight.runInput) {
       // Both accepted callback kinds carry bound input; media authority stays terminal-only below.
-      if (
-        insight.authority?.kind !== 'durable_terminal_callback' &&
-        insight.authority?.kind !== 'durable_work_callback'
-      ) {
+      if (insight.authority?.kind !== 'durable_terminal_callback' &&
+          insight.authority?.kind !== 'durable_work_callback') {
         throw mediaError('mission_input_authority_invalid');
       }
       const runInput = normalizeGlassHiveRunInput(insight.runInput, insight.authority.runId || '');

@@ -25,6 +25,11 @@ afterAll(() => {
   fs.rmSync(promptFixtureDirectory, { recursive: true, force: true });
 });
 
+jest.mock('~/server/services/Config/getEndpointsConfig', () => {
+  const actual = jest.requireActual('~/server/services/Config/getEndpointsConfig');
+  return { ...actual, getEndpointsConfig: jest.fn(actual.getEndpointsConfig) };
+});
+
 const { Run } = require('@librechat/agents');
 
 jest.mock('@librechat/api', () => {
@@ -198,7 +203,7 @@ describe('owned occupied-session recovery producer', () => {
   });
 
   const {
-    bindOccupiedCortexRecovery,
+    bindOwnedVoiceCortexRecovery,
     prepareCortexFollowUpMessage,
     persistPreparedCortexFollowUpMessage,
   } = require('../BackgroundCortexFollowUpService');
@@ -249,7 +254,7 @@ describe('owned occupied-session recovery producer', () => {
       .mockResolvedValue({ processStream: jest.fn(async () => 'Useful result.') });
     try {
       const req = request();
-      bindOccupiedCortexRecovery(req, async () => ({ state: 'live' }));
+      bindOwnedVoiceCortexRecovery(req, async () => ({ state: 'live' }));
       await generateFollowUpText(input(req));
       const headers = run.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders;
       expect(
@@ -301,7 +306,7 @@ describe('owned occupied-session recovery producer', () => {
   );
   test('Stop arriving after preparation suppresses before any persistence', async () => {
     const req = request();
-    bindOccupiedCortexRecovery(req, async () => ({ state: 'suppressed' }));
+    bindOwnedVoiceCortexRecovery(req, async () => ({ state: 'suppressed' }));
     const save = jest.spyOn(db, 'saveMessage').mockResolvedValue({ messageId: 'not-saved' });
     try {
       expect(
@@ -317,7 +322,7 @@ describe('owned occupied-session recovery producer', () => {
   });
   test('Stop before preparation starts no author', async () => {
     const req = request();
-    bindOccupiedCortexRecovery(req, async () => ({ state: 'suppressed' }));
+    bindOwnedVoiceCortexRecovery(req, async () => ({ state: 'suppressed' }));
     const run = jest.spyOn(Run, 'create');
     try {
       expect(await prepareCortexFollowUpMessage(input(req))).toEqual({
@@ -331,7 +336,7 @@ describe('owned occupied-session recovery producer', () => {
   });
   test('lease gap before preparation starts no author and preserves pending authority', async () => {
     const req = request();
-    bindOccupiedCortexRecovery(req, async () => ({ state: 'waiting' }));
+    bindOwnedVoiceCortexRecovery(req, async () => ({ state: 'waiting' }));
     const run = jest.spyOn(Run, 'create');
     try {
       await expect(prepareCortexFollowUpMessage(input(req))).rejects.toMatchObject({
@@ -367,13 +372,14 @@ describe('owned occupied-session recovery producer', () => {
           },
         })
         .mockResolvedValue({ ...scope, state });
-      bindOccupiedCortexRecovery(req, recheck);
+      bindOwnedVoiceCortexRecovery(req, recheck);
       req.config.endpoints.agents.providerCapabilities['glasshive-harness'].workspace_binding =
         false;
       try {
         const result = await prepareCortexFollowUpMessage(input(req));
         expect(result.text).toBe('A useful completed result.');
-        expect(result.followUpDecisionRecord.recoveryCause).toEqual(cause);
+        expect(result.followUpDecisionRecord.recoveryAuthority).toBe('owned_voice_source');
+        expect(result.followUpDecisionRecord.recoveryCause).toBeUndefined();
         expect(req.body.voiceMode).toBe(false);
         expect(req.body.viventiumInputMode).toBe('text');
         expect(req.viventiumCallSession).toBeUndefined();
@@ -388,7 +394,7 @@ describe('owned occupied-session recovery producer', () => {
   );
   test('caller body flags cannot invoke the owned recovery recheck', async () => {
     const req = request();
-    req.body.occupiedCortexRecovery = true;
+    req.body.ownedVoiceCortexRecovery = true;
     req.body._viventiumCortexOccupiedSessionRecovery = true;
     const run = jest
       .spyOn(Run, 'create')
@@ -1066,6 +1072,14 @@ describe('Phase B signed bootstrap body dispatch', () => {
         baseURL: 'https://native.example.test/v1',
         defaultHeaders: headers,
       });
+      const bootstrap = jest
+        .spyOn(
+          require('../GlassHiveCapabilityBootstrapService'),
+          'buildConversationProviderBootstrapBundle',
+        )
+        .mockResolvedValue(JSON.parse(Buffer.from(encoded, 'base64').toString('utf8')));
+      const priorSecret = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+      process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-body-dispatch-secret';
       const sent = [];
       const admitted = [];
       const context = {
@@ -1121,12 +1135,24 @@ describe('Phase B signed bootstrap body dispatch', () => {
             id: 'main',
             provider: 'glasshive-harness',
             model: 'synthetic-model',
+            tools: ['native', 'conflicting'].includes(mode)
+              ? [
+                  `lookup${require('librechat-data-provider').Constants.mcp_delimiter}synthetic-account`,
+                ]
+              : [],
             model_parameters: { model: 'synthetic-model', reasoning_effort: 'high' },
           },
           runId: 'signed-bootstrap',
           insightsData: { insights: [{ insight: 'Verified result.' }] },
         });
         const configuration = createRun.mock.calls[0][0].graphConfig.llmConfig.configuration;
+        if (['native', 'conflicting'].includes(mode)) {
+          expect(bootstrap).toHaveBeenCalledTimes(1);
+          expect(configuration.defaultHeaders['X-GlassHive-Bootstrap-Bundle-B64']).toBe(encoded);
+          expect(configuration.defaultHeaders['X-GlassHive-Bootstrap-Signature']).not.toBe(
+            'synthetic-signature',
+          );
+        } else expect(bootstrap).not.toHaveBeenCalled();
         const body = JSON.stringify({
           model: 'synthetic-model',
           messages: [{ role: 'user', content: 'Review.' }],
@@ -1166,12 +1192,18 @@ describe('Phase B signed bootstrap body dispatch', () => {
           if (mode === 'non-native') expect(configuration.fetch).toBeUndefined();
           expect(payload.metadata.retain).toBe('original');
           expect(payload.metadata.bootstrap_bundle_b64).toBeUndefined();
-          expect(wireHeaders.get('X-GlassHive-Bootstrap-Bundle-B64')).toBe(
-            mode === 'absent' ? null : encoded,
-          );
+          expect(wireHeaders.get('X-GlassHive-Bootstrap-Bundle-B64')).toBe(null);
         }
-        expect(wireHeaders.get('X-GlassHive-Bootstrap-Signature')).toBe('synthetic-signature');
-        expect(wireHeaders.get('X-GlassHive-Bootstrap-Timestamp')).toBe('123');
+        expect(wireHeaders.get('X-GlassHive-Bootstrap-Signature')).toBe(
+          mode === 'native'
+            ? configuration.defaultHeaders['X-GlassHive-Bootstrap-Signature']
+            : null,
+        );
+        expect(wireHeaders.get('X-GlassHive-Bootstrap-Timestamp')).toBe(
+          mode === 'native'
+            ? configuration.defaultHeaders['X-GlassHive-Bootstrap-Timestamp']
+            : null,
+        );
         expect(payload.messages).toEqual([{ role: 'user', content: 'Review.' }]);
         expect(admitted[0].bodySha256).toBe(
           require('crypto').createHash('sha256').update(sent[0].body).digest('hex'),
@@ -1181,6 +1213,10 @@ describe('Phase B signed bootstrap body dispatch', () => {
       } finally {
         fetchSpy.mockRestore();
         createRun.mockRestore();
+        bootstrap.mockRestore();
+        if (priorSecret === undefined)
+          delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+        else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = priorSecret;
       }
     },
   );
@@ -1664,3 +1700,196 @@ describe('Phase B native file carrier transport', () => {
     },
   );
 });
+
+/* === VIVENTIUM START === Request-local native declaration continuity. === */
+describe('Phase B invocation-fresh native declarations', () => {
+  const endpoints = require('~/server/services/Config/getEndpointsConfig');
+  beforeEach(() =>
+    endpoints.getEndpointsConfig.mockResolvedValue({ agents: { capabilities: ['web_search'] } }),
+  );
+  afterEach(() =>
+    endpoints.getEndpointsConfig.mockImplementation(
+      jest.requireActual('~/server/services/Config/getEndpointsConfig').getEndpointsConfig,
+    ),
+  );
+  test.each(
+    ['text', 'voice'].flatMap((surface) =>
+      [false, true, 'partial'].flatMap((persisted) =>
+        [
+          'declared',
+          'omitted',
+          'undefined',
+          'null',
+          'empty',
+          'denied',
+          'null_bundle',
+          'empty_bundle',
+          'workspace_unbound',
+        ].map((mode) => [surface, persisted, mode]),
+      ),
+    ),
+  )(
+    '%s preserves %s canonical rehydrate with %s declarations',
+    async (surface, persisted, mode) => {
+      const { Constants } = require('librechat-data-provider');
+      const declarations = Object.freeze([
+        `lookup${Constants.mcp_delimiter}synthetic-account`,
+        'web_search',
+      ]);
+      const agent = {
+        id: 'native-main',
+        provider: persisted === 'partial' ? '' : 'glasshive-harness',
+        model: 'synthetic-model',
+        tools: [],
+        model_parameters: {
+          reasoning_effort: 'high',
+          configuration: {
+            defaultHeaders: {
+              'x-glasshive-bootstrap-bundle-b64': 'old-main-bundle',
+              'X-GLASSHIVE-BOOTSTRAP-TIMESTAMP': 'old-main-timestamp',
+              'X-GlassHive-Bootstrap-Signature': 'old-main-signature',
+              'X-Synthetic-Existing': 'keep-structural',
+            },
+          },
+        },
+        voice_llm_provider: persisted === 'partial' ? '' : 'glasshive-harness',
+        voice_llm_model: 'synthetic-voice-model',
+        glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
+      };
+      if (mode !== 'omitted')
+        Object.defineProperty(agent, 'declaredToolNames', {
+          value: [
+            'declared',
+            'denied',
+            'null_bundle',
+            'empty_bundle',
+            'workspace_unbound',
+          ].includes(mode)
+            ? declarations
+            : mode === 'empty'
+              ? Object.freeze([])
+              : mode === 'null'
+                ? null
+                : undefined,
+          enumerable: false,
+        });
+      const beforeDeclaration = Object.getOwnPropertyDescriptor(agent, 'declaredToolNames');
+      const beforeAgent = JSON.stringify(agent);
+      const canonical = require('~/models/Agent').getAgent;
+      canonical.mockResolvedValue(
+        persisted
+          ? {
+              ...agent,
+              provider: 'glasshive-harness',
+              model_parameters: { ...agent.model_parameters, temperature: 0.37 },
+              tools: [`lookup${Constants.mcp_delimiter}stale-account`],
+            }
+          : null,
+      );
+      const bundle = {
+        glasshive_capability_broker: { grant_id: 'fresh-phase-b' },
+        conversation_provider_instructions: 'Freshly authorized capabilities.',
+      };
+      const bootstrap = jest.spyOn(
+        require('../GlassHiveCapabilityBootstrapService'),
+        'buildConversationProviderBootstrapBundle',
+      );
+      if (mode === 'denied')
+        bootstrap.mockRejectedValue(new Error('Synthetic fresh authorization denied'));
+      else
+        bootstrap.mockResolvedValue(
+          mode === 'null_bundle' ? null : mode === 'empty_bundle' ? {} : bundle,
+        );
+      const run = jest.spyOn(Run, 'create').mockResolvedValue({
+        processStream: jest.fn().mockResolvedValue('Verified result.'),
+      });
+      const priorSecret = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+      process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-phase-b-secret';
+      try {
+        await generateFollowUpText({
+          req: {
+            user: { id: 'synthetic-owner' },
+            body: {
+              viventiumSurface: surface,
+              voiceMode: surface === 'voice',
+              ...(surface === 'voice'
+                ? {
+                    viventiumActorTrust: 'owner_participant',
+                    viventiumCanAuthorizeSideEffects: true,
+                  }
+                : {}),
+              viventiumInputMode: surface === 'voice' ? 'voice_call' : 'text',
+            },
+            config: {
+              endpoints: {
+                agents: {
+                  providerCapabilities: {
+                    'glasshive-harness': {
+                      workspace_binding: mode !== 'workspace_unbound',
+                      phase_b_followup: true,
+                      responses_api: false,
+                      voice_pipeline_llm: true,
+                      native_tools: true,
+                      host_tools_transport: 'broker_mcp',
+                      host_tools: ['web_search'],
+                    },
+                  },
+                },
+              },
+            },
+          },
+          agent,
+          runId: 'worker-result',
+          conversationId: 'synthetic-conversation',
+          parentMessageId: 'synthetic-parent',
+          recentResponse: 'Working.',
+          insightsData: { insights: [{ cortexName: 'Worker', insight: 'Verified result.' }] },
+        });
+        expect(canonical).toHaveBeenCalledTimes(persisted === 'partial' ? 2 : 1);
+        expect(canonical).toHaveBeenCalledWith({ id: 'native-main' });
+        expect(bootstrap).toHaveBeenCalledTimes(
+          ['declared', 'denied', 'null_bundle', 'empty_bundle'].includes(mode) ? 1 : 0,
+        );
+        const config = run.mock.calls[0][0].graphConfig.llmConfig;
+        if (persisted) expect(config.temperature).toBe(0.37);
+        const headers = config.configuration.defaultHeaders;
+        expect(headers['X-Synthetic-Existing']).toBe('keep-structural');
+        for (const stale of ['old-main-bundle', 'old-main-timestamp', 'old-main-signature']) {
+          expect(Object.values(headers)).not.toContain(stale);
+        }
+        if (mode !== 'declared') {
+          expect(headers).not.toHaveProperty('X-GlassHive-Bootstrap-Bundle-B64');
+          return;
+        }
+        expect(bootstrap.mock.calls[0][0]).toMatchObject({
+          allowedServerNames: ['synthetic-account'],
+          allowedHostTools: ['web_search'],
+          requestBody: {
+            conversationId: 'synthetic-conversation',
+            parentMessageId: 'synthetic-parent',
+            messageId: 'synthetic-parent',
+            viventiumGlassHiveIdempotencyKey: 'phase_b:native-main:worker-result',
+            viventiumStreamId: 'phase_b:native-main:worker-result',
+          },
+        });
+        expect(
+          JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64')),
+        ).toEqual(bundle);
+        expect(headers['X-GlassHive-Bootstrap-Signature']).toMatch(/^sha256=/);
+        expect(JSON.stringify(agent)).toBe(beforeAgent);
+      } finally {
+        expect(JSON.stringify(agent)).toBe(beforeAgent);
+        expect(Object.getOwnPropertyDescriptor(agent, 'declaredToolNames')).toEqual(
+          beforeDeclaration,
+        );
+        bootstrap.mockRestore();
+        run.mockRestore();
+        canonical.mockResolvedValue(null);
+        if (priorSecret === undefined)
+          delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+        else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = priorSecret;
+      }
+    },
+  );
+});
+/* === VIVENTIUM END === */

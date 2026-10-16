@@ -14,11 +14,14 @@ const { sanitizeVoiceAssistantMessageForPersistence } = require('./voiceArtifact
 const { Constants } = require('librechat-data-provider');
 const {
   buildMainContinuityHeaders,
+  encodeMainContextStateBlock,
   isContextOnlyMainHistory,
   normalizeMainContextStamp,
   ownedInteractionSources,
   prepareMainContinuityCarrier,
   NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
+  NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
+  MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER,
   visibleMessageChain: buildMainContinuityMessageChain,
 } = require('@librechat/api');
 const {
@@ -1004,7 +1007,14 @@ function stableAuthorityDigest(agent) {
 }
 
 /** Conservative positive-only shortcut; false is not a Native rejection or a whole-history size limit. */
-function mainHistoryFitsNativeBody(messages, agent, reservedContextUtf8Bytes = 0) {
+function mainHistoryFitsNativeBody(
+  messages,
+  agent,
+  reservedContextUtf8Bytes = 0,
+  nativeReplayBudget = null,
+  sourceMetadataBytes = 0,
+  sizingReceipt = null,
+) {
   if (
     !Array.isArray(messages) ||
     !Number.isFinite(reservedContextUtf8Bytes) ||
@@ -1019,6 +1029,20 @@ function mainHistoryFitsNativeBody(messages, agent, reservedContextUtf8Bytes = 0
     if (typeof _convertMessagesToOpenAIParams !== 'function') return false;
     const selected = prepareMainContinuityCarrier(messages, agent?.useLegacyContent === true);
     const wire = _convertMessagesToOpenAIParams(selected, String(agent?.model || ''));
+    if (nativeReplayBudget !== null) {
+      const remaining = require('@librechat/api').nativeConversationContextBudget(
+        wire,
+        nativeReplayBudget,
+        sourceMetadataBytes,
+      );
+      if (sizingReceipt && remaining !== null) sizingReceipt.contextBudgetBytes = remaining;
+      return require('@librechat/api').nativeConversationHistoryFits(
+        wire,
+        nativeReplayBudget,
+        reservedContextUtf8Bytes,
+        sourceMetadataBytes,
+      );
+    }
     const instruction = {
       role: 'system',
       content: [agent?.instructions, agent?.additional_instructions]
@@ -1402,9 +1426,10 @@ function projectMainActiveWorkTurnContext(turnContextText, maximumBytes, snapsho
   const local = snapshot?.[LOCAL_ATTEMPT_STATE];
   const projection = local?.activeWorkProjection;
   const components = local?.turnContextComponents;
-  if (!projection || !Array.isArray(components)) return turnContextText;
+  if (!projection || !Array.isArray(components)) return { text: turnContextText, rosterText: '' };
   const active = components.find((component) => component.kind === 'activeWork');
-  if (typeof active?.text !== 'string' || !active.text.trim()) return turnContextText;
+  if (typeof active?.text !== 'string' || !active.text.trim())
+    return { text: turnContextText, rosterText: '' };
   const present = components.filter(
     (component) => typeof component.text === 'string' && component.text.trim(),
   );
@@ -1413,7 +1438,7 @@ function projectMainActiveWorkTurnContext(turnContextText, maximumBytes, snapsho
     .join(TURN_CONTEXT_SEPARATOR)
     .trim();
   if (Buffer.byteLength(full, 'utf8') <= maximumBytes && turnContextText.includes(active.text))
-    return turnContextText;
+    return { text: turnContextText, rosterText: projection.rosterText || '' };
   const fixed = present.filter((component) => component.kind !== 'activeWork');
   const fixedText = fixed.map((component) => component.text).join(TURN_CONTEXT_SEPARATOR);
   const minimumRoster = buildActiveWorkCapsule({ ...projection, maxBytes: 1024 });
@@ -1438,7 +1463,14 @@ function projectMainActiveWorkTurnContext(turnContextText, maximumBytes, snapsho
     maximumBytes -
     Buffer.byteLength(fixedContext, 'utf8') -
     (fixedContext ? Buffer.byteLength(TURN_CONTEXT_SEPARATOR, 'utf8') : 0);
-  const projected = buildActiveWorkCapsule({ ...projection, maxBytes: availableBytes });
+  let rosterText = '';
+  const projected = buildActiveWorkCapsule({
+    ...projection,
+    maxBytes: availableBytes,
+    onRenderedRoster: (value) => {
+      rosterText = value;
+    },
+  });
   const bounded = [fixedContext, projected].filter(Boolean).join(TURN_CONTEXT_SEPARATOR);
   if (Buffer.byteLength(bounded, 'utf8') > maximumBytes) {
     throw mainContextTurnContextError('main_context_turn_context_required_section_too_large');
@@ -1455,7 +1487,7 @@ function projectMainActiveWorkTurnContext(turnContextText, maximumBytes, snapsho
       ],
     });
   }
-  return bounded;
+  return { text: bounded, rosterText };
 }
 
 function encodeMainTurnContext({
@@ -1463,6 +1495,7 @@ function encodeMainTurnContext({
   trustedAttemptAuthority,
   snapshot,
   maximumBytes = TURN_CONTEXT_MAX_DECODED_BYTES,
+  onStateBlocks,
 }) {
   const authorityBytes = Buffer.byteLength(trustedAttemptAuthority, 'utf8');
   if (authorityBytes > maximumBytes) {
@@ -1479,11 +1512,12 @@ function encodeMainTurnContext({
     contextBudget,
     snapshot,
   );
-  const context = compactMainTurnContext(projectedContext, contextBudget, snapshot);
+  const context = compactMainTurnContext(projectedContext.text, contextBudget, snapshot);
   const decoded = [context, trustedAttemptAuthority].filter(Boolean).join(TURN_CONTEXT_SEPARATOR);
   if (Buffer.byteLength(decoded, 'utf8') > maximumBytes) {
     throw mainContextTurnContextError('main_context_turn_context_too_large');
   }
+  onStateBlocks?.(encodeMainContextStateBlock(decoded, projectedContext.rosterText));
   const encoded = Buffer.from(decoded, 'utf8').toString('base64');
   const maximumEncodedBytes =
     maximumBytes === TURN_CONTEXT_MAX_DECODED_BYTES
@@ -1530,14 +1564,24 @@ function applyMainContextAttempt({
     primaryHeaders?.['X-GlassHive-Agent-Id'] &&
     primaryHeaders?.['X-Viventium-Visible-Message-Chain-B64'],
   );
+  let stateBlocks = '';
   const encodedTurnContext = usesPerTurnHeader
     ? encodeMainTurnContext({
         turnContextText,
         trustedAttemptAuthority,
         snapshot,
         maximumBytes: usesNativeBody
-          ? NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
+          ? Math.min(
+              NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
+              Number.isSafeInteger(local.turnContextMaximumBytes) &&
+                local.turnContextMaximumBytes > 0
+                ? local.turnContextMaximumBytes
+                : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
+            )
           : TURN_CONTEXT_MAX_DECODED_BYTES,
+        onStateBlocks: (value) => {
+          stateBlocks = value;
+        },
       })
     : '';
   for (const [index, agent] of admittedAgents.entries()) {
@@ -1559,7 +1603,7 @@ function applyMainContextAttempt({
       }
       agent.instructions = [exact, ...directAdditions].filter(Boolean).join('\n\n');
     }
-    if (!bindMainContextSnapshot(agent, snapshot)) return false;
+    if (!bindMainContextSnapshot(agent, snapshot, stateBlocks)) return false;
   }
   if (requestBody && typeof requestBody === 'object') {
     if (usesPerTurnHeader) {
@@ -1571,7 +1615,7 @@ function applyMainContextAttempt({
   return true;
 }
 
-function bindMainContextSnapshot(targetAgent, snapshot) {
+function bindMainContextSnapshot(targetAgent, snapshot, stateBlocks = '') {
   if (!snapshot || !targetAgent || typeof targetAgent !== 'object') return false;
   const modelParameters =
     targetAgent.model_parameters && typeof targetAgent.model_parameters === 'object'
@@ -1585,13 +1629,38 @@ function bindMainContextSnapshot(targetAgent, snapshot) {
     configuration.defaultHeaders && typeof configuration.defaultHeaders === 'object'
       ? configuration.defaultHeaders
       : {};
+  /* === VIVENTIUM START === Current compiler descriptor replaces any case variant. === */
+  const currentHeaders = Object.fromEntries(
+    Object.entries(headers).filter(
+      ([key]) =>
+        ![
+          'x-viventium-main-context-state-blocks-b64',
+          MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER.toLowerCase(),
+        ].includes(key.toLowerCase()),
+    ),
+  );
+  /* === VIVENTIUM END === */
   targetAgent.model_parameters = {
     ...modelParameters,
     configuration: {
       ...configuration,
       defaultHeaders: {
-        ...headers,
+        ...currentHeaders,
+        ...(headers['X-GlassHive-Agent-Id']
+          ? {
+              [MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER]: String(
+                Math.min(
+                  NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
+                  Number.isSafeInteger(snapshot[LOCAL_ATTEMPT_STATE]?.turnContextMaximumBytes) &&
+                    snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes > 0
+                    ? snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes
+                    : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
+                ),
+              ),
+            }
+          : {}),
         'X-Viventium-Main-Context-Protocol': 'main_context_v1',
+        'X-Viventium-Main-Context-State-Blocks-B64': stateBlocks,
         'X-Viventium-Main-Context-Owner': 'core',
         'X-GlassHive-Stable-Authority-SHA256': snapshot.stableAuthoritySha256,
         'X-Viventium-Main-Context-Snapshot-SHA256': snapshot.snapshotSha256,

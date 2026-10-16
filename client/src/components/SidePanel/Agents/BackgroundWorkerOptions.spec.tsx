@@ -37,7 +37,15 @@ jest.mock('~/hooks', () => ({
 }));
 
 const capability = {
+  allow_full_access: true,
   models: [
+    {
+      id: 'model-grok',
+      label: 'Grok',
+      harnessProfile: 'grok-build',
+      effortChoices: ['high'],
+      recommendedEffort: 'high',
+    },
     {
       id: 'model-primary',
       label: 'Primary',
@@ -54,7 +62,17 @@ const capability = {
     },
   ],
 } as TAgentProviderCapability;
-function Harness({ snapshot, unknown = false }: { snapshot: jest.Mock; unknown?: boolean }) {
+function Harness({
+  snapshot,
+  unknown = false,
+  restricted = false,
+  nativeAccess,
+}: {
+  snapshot: jest.Mock;
+  unknown?: boolean;
+  restricted?: boolean;
+  nativeAccess?: 'ask' | 'full';
+}) {
   const methods = useForm<AgentForm>({
     defaultValues: {
       model: 'main-model',
@@ -65,6 +83,7 @@ function Harness({ snapshot, unknown = false }: { snapshot: jest.Mock; unknown?:
         orchestration: {
           parallel_available: true,
           default_mode: 'parallel',
+          worker_access: nativeAccess,
           worker_profile: 'codex-cli',
           worker_model: unknown ? 'unavailable-model' : 'model-primary',
           worker_reasoning_effort: 'medium',
@@ -76,7 +95,9 @@ function Harness({ snapshot, unknown = false }: { snapshot: jest.Mock; unknown?:
   });
   return (
     <FormProvider {...methods}>
-      <BackgroundWorkerOptions providerCapability={capability} />
+      <BackgroundWorkerOptions
+        providerCapability={restricted ? { ...capability, allow_full_access: false } : capability}
+      />
       <button onClick={() => snapshot(methods.getValues())}>{'Save snapshot'}</button>
     </FormProvider>
   );
@@ -155,4 +176,88 @@ it('groups provider models and retains older supported efforts', () => {
   expect(screen.getByLabelText('Background model')).toHaveValue('model-fallback');
   fireEvent.change(screen.getByLabelText('Background model effort'), { target: { value: 'low' } });
   expect(screen.getByLabelText('Background model effort')).toHaveValue('low');
+});
+
+it('keeps Grok native access explicit and independent of foreground full access', () => {
+  const snapshot = jest.fn();
+  render(<Harness snapshot={snapshot} />);
+  expect(screen.queryByLabelText('Background Grok native access')).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText('Background provider'), {
+    target: { value: 'grok-build' },
+  });
+  expect(screen.getByLabelText('Background Grok native access')).toHaveValue('ask');
+  fireEvent.change(screen.getByLabelText('Background Grok native access'), {
+    target: { value: 'full' },
+  });
+  fireEvent.click(screen.getByText('Save snapshot'));
+  expect(snapshot.mock.calls[0][0].glasshive_options).toMatchObject({
+    access: 'full',
+    orchestration: { worker_access: 'full', worker_model: 'model-grok' },
+  });
+});
+
+it('does not offer full background native access when the existing provider policy forbids it', () => {
+  render(<Harness snapshot={jest.fn()} restricted />);
+  fireEvent.change(screen.getByLabelText('Background provider'), {
+    target: { value: 'grok-build' },
+  });
+  expect(
+    screen.getByLabelText('Background Grok native access').querySelector('option[value="full"]'),
+  ).toBeNull();
+});
+
+it('clears the unused full setting when the final Grok route is changed', () => {
+  const snapshot = jest.fn();
+  render(<Harness snapshot={snapshot} />);
+  fireEvent.change(screen.getByLabelText('Background provider'), {
+    target: { value: 'grok-build' },
+  });
+  fireEvent.change(screen.getByLabelText('Background Grok native access'), {
+    target: { value: 'full' },
+  });
+  fireEvent.change(screen.getByLabelText('Background provider'), {
+    target: { value: 'codex-cli' },
+  });
+  expect(screen.queryByLabelText('Background Grok native access')).not.toBeInTheDocument();
+  fireEvent.click(screen.getByText('Save snapshot'));
+  expect(snapshot.mock.calls[0][0].glasshive_options.orchestration.worker_access).toBe('ask');
+});
+it('shows a retained unused full setting so the owner can clear it', () => {
+  render(<Harness snapshot={jest.fn()} nativeAccess="full" />);
+  expect(screen.getByLabelText('Background Grok native access')).toHaveValue('full');
+  expect(screen.getByText(/No Grok background route is selected/)).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText('Background Grok native access'), {
+    target: { value: 'ask' },
+  });
+  expect(screen.queryByLabelText('Background Grok native access')).not.toBeInTheDocument();
+});
+
+it('retains disallowed saved full access visibly until the owner clears it', () => {
+  render(<Harness snapshot={jest.fn()} nativeAccess="full" restricted />);
+  const field = screen.getByLabelText('Background Grok native access');
+  expect(field).toHaveValue('full');
+  expect(field.querySelector('option[value="full"]')).toBeDisabled();
+  fireEvent.change(field, { target: { value: 'ask' } });
+  expect(screen.queryByLabelText('Background Grok native access')).not.toBeInTheDocument();
+});
+
+it('keeps explicit full access while the fallback still declares Grok', () => {
+  render(<Harness snapshot={jest.fn()} />);
+  fireEvent.change(screen.getByLabelText('Background provider'), {
+    target: { value: 'grok-build' },
+  });
+  fireEvent.change(screen.getByLabelText('Background fallback provider'), {
+    target: { value: 'grok-build' },
+  });
+  fireEvent.change(screen.getByLabelText('Background Grok native access'), {
+    target: { value: 'full' },
+  });
+  fireEvent.change(screen.getByLabelText('Background provider'), {
+    target: { value: 'codex-cli' },
+  });
+  expect(screen.getByLabelText('Background Grok native access')).toHaveValue('full');
+  fireEvent.change(screen.getByLabelText('Background fallback provider'), {
+    target: { value: 'claude-code' },
+  });
+  expect(screen.queryByLabelText('Background Grok native access')).not.toBeInTheDocument();
 });

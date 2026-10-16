@@ -24,6 +24,7 @@ const {
   exchangeCallBrowserLaunch,
   getCallSession,
   getActiveCallSessionForConversation,
+  getActiveCallSessionForMainMaintenance,
   getCallSessionVoiceSettings,
   heartbeatCallSession,
   markVoiceSessionReady,
@@ -96,6 +97,109 @@ describe('CallSessionService', () => {
     await File.deleteMany({});
     await Message.deleteMany({});
     await Agent.deleteMany({});
+  });
+
+  test('normal End flushes latest deferred compaction without waiting for the model', async () => {
+    const {
+      deferAcceptedMainCompactionForCall,
+      resetMainCompactionSchedulingForTests,
+    } = require('@librechat/api');
+    resetMainCompactionSchedulingForTests();
+    const user = await User.create({
+      name: 'Call User',
+      email: 'maintenance@example.com',
+      provider: 'local',
+    });
+    const session = await createCallSession({
+      userId: String(user._id),
+      agentId: 'agent_1',
+      conversationId: 'maintenance-conversation',
+    });
+    let release;
+    const first = jest.fn(async () => 'old');
+    const latest = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    for (const schedule of [first, latest]) {
+      expect(
+        deferAcceptedMainCompactionForCall({
+          ownerId: String(user._id),
+          domainKey: 'maintenance-domain',
+          call: session,
+          schedule,
+        }),
+      ).toBe(true);
+    }
+    try {
+      const ended = await syncCallSessionState({
+        callSessionId: session.callSessionId,
+        touch: false,
+        status: 'ended',
+      });
+      expect(ended.status).toBe('ended');
+      expect(first).not.toHaveBeenCalled();
+      expect(latest).toHaveBeenCalledTimes(1);
+      await syncCallSessionState({
+        callSessionId: session.callSessionId,
+        touch: false,
+        status: 'ended',
+      });
+      expect(latest).toHaveBeenCalledTimes(1);
+    } finally {
+      release?.('completed');
+      resetMainCompactionSchedulingForTests();
+    }
+  });
+
+  test('Main maintenance lookup uses owner, agent, status, expiry and fatal guards across conversations', async () => {
+    const user = await User.create({
+      name: 'Maintenance User',
+      email: 'maintenance@example.com',
+      provider: 'local',
+    });
+    const ownerId = String(user._id);
+    const call = await createCallSession({
+      userId: ownerId,
+      agentId: 'main-agent',
+      conversationId: 'a-different-conversation',
+    });
+    expect(
+      (await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'main-agent' }))
+        .callSessionId,
+    ).toBe(call.callSessionId);
+    expect(
+      await getActiveCallSessionForMainMaintenance({
+        userId: 'other-owner',
+        agentId: 'main-agent',
+      }),
+    ).toBeNull();
+    expect(
+      await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'other-agent' }),
+    ).toBeNull();
+    await ViventiumCallSession.updateOne(
+      { callSessionId: call.callSessionId },
+      { $set: { callStatus: 'ended' } },
+    );
+    expect(
+      await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'main-agent' }),
+    ).toBeNull();
+    await ViventiumCallSession.updateOne(
+      { callSessionId: call.callSessionId },
+      { $set: { callStatus: 'listening', callFailure: { fatal: true } } },
+    );
+    expect(
+      await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'main-agent' }),
+    ).toBeNull();
+    await ViventiumCallSession.updateOne(
+      { callSessionId: call.callSessionId },
+      { $set: { callFailure: null, expiresAt: new Date(0) } },
+    );
+    expect(
+      await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'main-agent' }),
+    ).toBeNull();
   });
 
   test('completion lookup returns the actual exported same-owner live Call', async () => {

@@ -291,3 +291,26 @@ describe('saved completed Cortex acceptance', () => {
     expect(JSON.stringify(result)).not.toContain('Must not survive the persistence failure.');
   });
 });
+
+test('only a visible completed cortex carries citation artifacts to the existing completion owner', () => {
+  const attachment = {
+    type: 'file_search',
+    messageId: 'citation-answer',
+    conversationId: 'citation-conversation',
+    file_search: { sources: [{ fileId: 'owned-file' }] },
+  };
+  const result = {
+    agentId: 'retrieval',
+    agentName: 'Retrieval',
+    insight: 'Verified source.',
+    attachments: [attachment],
+  };
+  expect(buildCortexCompletionPayload(result).attachments).toEqual([attachment]);
+  for (const terminal of [
+    { ...result, insight: '' },
+    { ...result, insight: '{NTA}' },
+    { ...result, cancelled: true },
+    { ...result, error: 'provider unavailable' },
+  ])
+    expect(buildCortexCompletionPayload(terminal)).not.toHaveProperty('attachments');
+});

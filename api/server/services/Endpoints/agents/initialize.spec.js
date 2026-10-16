@@ -23,6 +23,7 @@ const mockPrimeFiles = jest.fn(async () => ({ files: [], toolContext: '' }));
 const mockLoadAgentTools = jest.fn(async () => ({ toolDefinitions: [] }));
 const mockStartParallelWorkTurnAuthority = jest.fn();
 const mockApplyVoiceModelOverride = jest.fn();
+const mockRetainMainCompactionRoute = jest.fn();
 const mockObserveOrchestrationOwner = jest.fn();
 const mockEffectiveOrchestrationMode = jest.fn(() => 'parallel');
 
@@ -47,6 +48,7 @@ jest.mock('@librechat/agents', () => ({
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   configureOrchestrationMode: jest.fn(),
+  retainMainCompactionRoute: (...args) => mockRetainMainCompactionRoute(...args),
   projectTrustedNativeInteractionHeaders: jest.fn((_req, headers) => headers ?? {}),
   projectTrustedClientPresentation: jest.fn((body) => body ?? {}),
   trustedUploadedFilesFromRequestBody: jest.fn((body) => body?.files ?? []),
@@ -327,6 +329,7 @@ describe('initializeClient handoff capability projection', () => {
     mockLoadAgentTools.mockResolvedValue({ toolDefinitions: [] });
     mockStartParallelWorkTurnAuthority.mockResolvedValue(false);
     mockApplyVoiceModelOverride.mockReset();
+    mockRetainMainCompactionRoute.mockReset();
   });
 
   afterAll(() => {
@@ -459,7 +462,14 @@ describe('initializeClient handoff capability projection', () => {
     const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
     expect(mockBuildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
     await initializedHandoff.viventiumConnectedAgentInitializer();
-    const headers = initializedHandoff.model_parameters.configuration.defaultHeaders;
+    expect(
+      initializedHandoff.model_parameters.configuration.defaultHeaders[
+        'X-GlassHive-Bootstrap-Signature'
+      ],
+    ).toBeUndefined();
+    expect(mockBuildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
+    const refreshed = await initializedHandoff.viventiumConversationProviderCapabilityRefresh();
+    const headers = refreshed.defaultHeaders;
 
     expect(headers['X-Existing']).toBe('kept');
     expect(headers['X-GlassHive-Bootstrap-Bundle-B64']).toBeDefined();
@@ -999,6 +1009,47 @@ describe('initializeClient handoff capability projection', () => {
     expect(req._viventiumFallbackRouteNotice).toEqual({ model: 'claude-code:opus' });
   });
 
+  test('retains the authorized primary route before the Voice model is initialized', async () => {
+    const req = makeRequest();
+    let retained;
+    mockRetainMainCompactionRoute.mockImplementation((_req, agent) => {
+      retained = structuredClone(agent);
+    });
+    const main = {
+      ...primaryAgent,
+      edges: [],
+      model_parameters: { reasoning_effort: 'high' },
+      fallback_llm_provider: 'backup-route',
+      fallback_llm_model: 'backup-model',
+      fallback_llm_model_parameters: { reasoning_effort: 'high' },
+    };
+    mockApplyVoiceModelOverride.mockImplementation((agent) => {
+      agent.provider = 'voice-route';
+      agent.model = 'voice-model';
+      agent.model_parameters = { reasoning_effort: 'low' };
+    });
+    mockInitializeAgent.mockImplementation(async ({ agent }) => makeInitializedConfig(agent));
+    const { client } = await initializeClient({
+      req,
+      res: {},
+      signal: null,
+      endpointOption: { agent: Promise.resolve(main), model_parameters: { model: main.model } },
+    });
+    expect(client.options.agent.model).toBe('voice-model');
+    expect(mockRetainMainCompactionRoute).toHaveBeenCalledWith(req, main);
+    expect(mockRetainMainCompactionRoute.mock.invocationCallOrder[0]).toBeLessThan(
+      mockApplyVoiceModelOverride.mock.invocationCallOrder[0],
+    );
+    expect(retained).toMatchObject({
+      provider: primaryAgent.provider,
+      model: primaryAgent.model,
+      model_parameters: { reasoning_effort: 'high' },
+      fallback_llm_provider: 'backup-route',
+      fallback_llm_model: 'backup-model',
+      fallback_llm_model_parameters: { reasoning_effort: 'high' },
+    });
+  });
+
   test('preserves only the Main orchestration declaration when a voice override loads tool definitions', async () => {
     const voiceMain = {
       ...primaryAgent,
@@ -1120,9 +1171,10 @@ describe('initializeClient handoff capability projection', () => {
     const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
     expect(mockBuildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
     await initializedHandoff.viventiumConnectedAgentInitializer();
-    const headers = initializedHandoff.model_parameters.configuration.defaultHeaders;
+    const refreshed = await initializedHandoff.viventiumConversationProviderCapabilityRefresh();
+    const headers = refreshed.defaultHeaders;
 
-    expect(initializedHandoff.instructions).toContain('host capability broker is unavailable');
+    expect(refreshed.instructionAppend).toContain('host capability broker is unavailable');
     expect(headers['X-GlassHive-Bootstrap-Bundle-B64']).toBeUndefined();
     expect(headers['X-GlassHive-Bootstrap-Signature']).toBeUndefined();
   });
@@ -1163,6 +1215,12 @@ describe('initializeClient handoff capability projection', () => {
       provider: assignment.provider,
       model: assignment.model,
     });
+    expect(
+      fallbackRoutes[0].model_parameters.configuration.defaultHeaders[
+        'X-GlassHive-Bootstrap-Signature'
+      ],
+    ).toBeUndefined();
+    await fallbackRoutes[0].viventiumConversationProviderCapabilityRefresh();
     expect(fallbackRoutes[0].model_parameters.configuration.defaultHeaders).toEqual(
       expect.objectContaining({
         'X-GlassHive-Bootstrap-Bundle-B64': expect.any(String),
@@ -1248,6 +1306,7 @@ describe('initializeClient handoff capability projection', () => {
     const initializedHandoff = client.options.agentConfigs.get(handoffAgent.id);
     await initializedHandoff.viventiumConnectedAgentInitializer();
     const [fallbackRoute] = initializedHandoff.viventiumGraphLlmFallbacks;
+    await fallbackRoute.viventiumConversationProviderCapabilityRefresh();
     const encodedBundle =
       fallbackRoute.model_parameters.configuration.defaultHeaders[
         'X-GlassHive-Bootstrap-Bundle-B64'

@@ -1191,6 +1191,7 @@ async function runVoiceTaskTerminalCallbackMutation(taskId, operation) {
 }
 
 function createVoiceTask({
+  label,
   callSessionId,
   userId,
   conversationId,
@@ -1239,7 +1240,7 @@ function createVoiceTask({
   }
   nextEvent(task, { type: 'state', phase: 'queued', label: 'Queued' });
   task.state = 'running';
-  nextEvent(task, { type: 'state', phase: 'starting', label: 'Starting' });
+  nextEvent(task, { type: 'state', phase: 'starting', label: safeText(label, 160) || 'Starting' });
   logger.info('[VIVENTIUM][VoiceTask] task_started', {
     taskId: task.taskId,
     callSessionId: task.callSessionId,

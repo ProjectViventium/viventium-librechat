@@ -391,13 +391,8 @@ describe('native response binding and recovery', () => {
   });
   it('allows ordinary Main selected retained attachments without a provider output_files envelope', async () => {
     const d = deps();
-    const candidate = {
-      text: 'Canonical answer.',
-      authoritySha256: result.authority_sha256,
-      requestId: result.request_id,
-      runId: result.run_id,
-      responseJson: JSON.stringify(result.response),
-    };
+    const candidate = { text: 'Canonical answer.', authoritySha256: result.authority_sha256,
+      requestId: result.request_id, runId: result.run_id, responseJson: JSON.stringify(result.response) };
     d.db.prepareNativeResponse.mockResolvedValue(nativeResponseDigest(candidate));
     const prepared = { attachments: [{ file_id: 'selected' }], authorizePublication: jest.fn() };
     const prepareAttachments = jest.fn(async () => prepared);
@@ -407,9 +402,7 @@ describe('native response binding and recovery', () => {
       expect(files).toBe(prepared);
       return { text: candidate.text, attachments: files.attachments };
     });
-    const saved = await createNativeResponseRecoveryService({ ...d, prepareAttachments }).recover(
-      identity,
-    );
+    const saved = await createNativeResponseRecoveryService({ ...d, prepareAttachments }).recover(identity);
     expect(saved?.attachments).toEqual(prepared.attachments);
     expect(prepareAttachments).toHaveBeenCalledWith(identity, result.response, candidate);
   });
@@ -542,6 +535,37 @@ describe('native response binding and recovery', () => {
       await expect(reading).rejects.toThrow('native_graph_tool_evidence_parent_changed');
     }
   });
+  it.each(['legacy-to-canonical', 'canonical-to-legacy', 'tool-result-changed', 'activity-changed'])(
+    'keeps exact answer evidence while normalizing harness presentation: %s', async (mode) => {
+      const d = deps();
+      const legacy = { type: 'think', think: 'The harness started working.\n', agentId: 'main' };
+      const canonical = { type: 'harness_activity', harness_activity: {
+        event: 'reasoning-summary', summary: 'The harness started working.\n',
+      } };
+      const tool = { type: 'tool_call', tool_call: { id: 'observed-call',
+        name: 'read_state', output: 'State is green.' } };
+      const row = {
+        user: 'owner', conversationId: 'conversation', messageId: 'answer', text: '72',
+        unfinished: false, error: false, nativeResponse: { ...identity, status: 'completed' },
+        content: [{ type: 'text', text: '72' }, mode === 'legacy-to-canonical' ? legacy : canonical, tool],
+      };
+      const current = {
+        ...row, content: [{ type: 'text', text: '72' },
+          mode === 'canonical-to-legacy' ? legacy : mode === 'activity-changed'
+            ? { ...canonical, harness_activity: { ...canonical.harness_activity, summary: 'A different activity.' } }
+            : canonical,
+          mode === 'tool-result-changed' ? { ...tool, tool_call: { ...tool.tool_call, output: 'State is red.' } } : tool,
+          { type: 'cortex_insight', cortex_id: 'parietal', status: 'brewing' }],
+      };
+      const original = JSON.stringify(row);
+      d.db.getNativeResponse.mockResolvedValueOnce(row as never).mockResolvedValueOnce(current as never);
+      const reading = createNativeResponseRecoveryService(d).readToolEvidence('owner', 'conversation', 'answer');
+      if (mode.endsWith('-changed')) await expect(reading).rejects.toThrow('native_graph_tool_evidence_parent_changed');
+      else await expect(reading).resolves.toEqual(expect.any(Array));
+      expect(JSON.stringify(row)).toBe(original);
+      expect(d.db.materializeNativeResponse).not.toHaveBeenCalled();
+    },
+  );
   it('reports a typed unavailable-parent error without reading or accepting its evidence', async () => {
     const d = deps();
     d.db.getNativeResponse.mockResolvedValue({
@@ -1628,9 +1652,7 @@ describe('native response binding and recovery', () => {
   });
   it('reads exact authenticated result and materializes its canonical answer without private fields', async () => {
     const d = deps();
-    d.db.prepareNativeResponse.mockImplementationOnce(async (_identity, candidate) =>
-      nativeResponseDigest(candidate),
-    );
+    d.db.prepareNativeResponse.mockImplementationOnce(async (_identity, candidate) => nativeResponseDigest(candidate));
     const service = createNativeResponseRecoveryService(d);
     expect(await service.recover(identity)).toEqual({ text: 'Canonical answer.' });
     const [url, options] = d.fetch.mock.calls[0];
@@ -1714,156 +1736,76 @@ describe('native response binding and recovery', () => {
       d.transaction,
       expect.any(Function),
     );
-  });
-  it.each([
-    'valid',
-    'accepted',
-    'unknown',
-    'wrong_invocation',
-    'wrong_body',
-    'wrong_stream',
-    'wrong_message',
-    'wrong_version',
-    'other_error',
-    'success',
-  ])('releases only the final exact definitive capacity refusal: %s', async (mode) => {
-    let bound = identity;
-    const reject = jest.fn(async () => undefined);
-    const send = jest.fn(async () => {
-      const proof = {
-        version: 1,
-        accepted: false,
-        invocation_id: bound.invocationId,
-        body_sha256: bound.bodySha256,
-        stream_id: bound.streamId,
-        message_id: bound.responseMessageId,
-      };
-      if (mode === 'accepted') proof.accepted = true;
-      if (mode === 'wrong_version') proof.version = 2;
-      if (mode === 'wrong_invocation') proof.invocation_id = 'foreign';
-      if (mode === 'wrong_body') proof.body_sha256 = 'foreign';
-      if (mode === 'wrong_stream') proof.stream_id = 'foreign';
-      if (mode === 'wrong_message') proof.message_id = 'foreign';
-      return new Response(
-        JSON.stringify({
-          error: {
-            code: mode === 'other_error' ? 'upstream_unavailable' : 'host_capacity',
-            ...(mode === 'unknown' ? {} : { native_admission: proof }),
-          },
-        }),
-        { status: mode === 'success' ? 200 : 503, headers: { 'Retry-After': '60' } },
-      );
-    });
-    const wrapped = createNativeResponseFetch(
-      send,
-      async () => context,
-      async () => true,
-      (value) => {
-        bound = value;
-      },
-      undefined,
-      reject,
-    );
-    expect((await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).status).toBe(
-      mode === 'success' ? 200 : 503,
-    );
-    expect(send).toHaveBeenCalledTimes(1);
-    if (mode === 'valid') expect(reject).toHaveBeenCalledWith(bound);
-    else expect(reject).not.toHaveBeenCalled();
-  });
+  });  it.each(['valid', 'accepted', 'unknown', 'wrong_invocation', 'wrong_body', 'wrong_stream', 'wrong_message', 'wrong_version', 'other_error', 'success'])(
+    'releases only the final exact definitive capacity refusal: %s', async (mode) => {
+      let bound = identity;
+      const reject = jest.fn(async () => undefined);
+      const send = jest.fn(async () => {
+        const proof = { version: 1, accepted: false, invocation_id: bound.invocationId,
+          body_sha256: bound.bodySha256, stream_id: bound.streamId, message_id: bound.responseMessageId };
+        if (mode === 'accepted') proof.accepted = true;
+        if (mode === 'wrong_version') proof.version = 2;
+        if (mode === 'wrong_invocation') proof.invocation_id = 'foreign';
+        if (mode === 'wrong_body') proof.body_sha256 = 'foreign';
+        if (mode === 'wrong_stream') proof.stream_id = 'foreign';
+        if (mode === 'wrong_message') proof.message_id = 'foreign';
+        return new Response(JSON.stringify({ error: { code: mode === 'other_error' ? 'upstream_unavailable' : 'host_capacity',
+          ...(mode === 'unknown' ? {} : { native_admission: proof }) } }),
+          { status: mode === 'success' ? 200 : 503, headers: { 'Retry-After': '60' } });
+      });
+      const wrapped = createNativeResponseFetch(send, async () => context, async () => true,
+        (value) => { bound = value; }, undefined, reject);
+      expect((await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).status)
+        .toBe(mode === 'success' ? 200 : 503);
+      expect(send).toHaveBeenCalledTimes(1);
+      if (mode === 'valid') expect(reject).toHaveBeenCalledWith(bound);
+      else expect(reject).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(['valid', 'accepted', 'unknown', 'foreign', 'other_error'])(
-    'validates refusal metadata preserved by the actual OpenAI SDK error: %s',
-    (mode) => {
-      const proof = {
-        version: 1,
-        accepted: mode === 'accepted',
-        invocation_id: identity.invocationId,
-        body_sha256: identity.bodySha256,
-        stream_id: identity.streamId,
-        message_id: identity.responseMessageId,
-      };
+    'validates refusal metadata preserved by the actual OpenAI SDK error: %s', (mode) => {
+      const proof = { version: 1, accepted: mode === 'accepted', invocation_id: identity.invocationId,
+        body_sha256: identity.bodySha256, stream_id: identity.streamId, message_id: identity.responseMessageId };
       if (mode === 'foreign') proof.invocation_id = 'foreign';
-      const failure = {
-        code: mode === 'other_error' ? 'upstream_unavailable' : 'host_capacity',
-        ...(mode === 'unknown' ? {} : { native_admission: proof }),
-      };
+      const failure = { code: mode === 'other_error' ? 'upstream_unavailable' : 'host_capacity',
+        ...(mode === 'unknown' ? {} : { native_admission: proof }) };
       const sdkError = APIError.generate(503, { error: failure }, 'Unavailable.', new Headers());
       expect(sdkError.error).toBe(failure);
-      expect(isNativeCapacityRefusal(sdkError.error as typeof failure, identity)).toBe(
-        mode === 'valid',
-      );
+      expect(isNativeCapacityRefusal(sdkError.error as typeof failure, identity)).toBe(mode === 'valid');
     },
   );
 
   it.each(['queued_after_retry', 'transport_after_retry'])(
-    'keeps recovery fenced when an early refusal becomes %s',
-    async (mode) => {
+    'keeps recovery fenced when an early refusal becomes %s', async (mode) => {
       let bound = identity;
       const reject = jest.fn(async () => undefined);
-      const send = jest
-        .fn()
-        .mockImplementationOnce(
-          async () =>
-            new Response(
-              JSON.stringify({
-                error: {
-                  code: 'host_capacity',
-                  native_admission: {
-                    version: 1,
-                    accepted: false,
-                    invocation_id: bound.invocationId,
-                    body_sha256: bound.bodySha256,
-                    stream_id: bound.streamId,
-                    message_id: bound.responseMessageId,
-                  },
-                },
-              }),
-              { status: 503, headers: { 'Retry-After': '0.001' } },
-            ),
-        )
+      const send = jest.fn().mockImplementationOnce(async () => new Response(JSON.stringify({ error: {
+        code: 'host_capacity', native_admission: { version: 1, accepted: false,
+          invocation_id: bound.invocationId, body_sha256: bound.bodySha256,
+          stream_id: bound.streamId, message_id: bound.responseMessageId },
+      } }), { status: 503, headers: { 'Retry-After': '0.001' } }))
         .mockImplementationOnce(async () => {
           if (mode === 'transport_after_retry') throw new Error('transport unavailable');
-          return new Response(JSON.stringify({ error: { code: 'host_capacity' } }), {
-            status: 503,
-            headers: { 'Retry-After': '60' },
-          });
+          return new Response(JSON.stringify({ error: { code: 'host_capacity' } }),
+            { status: 503, headers: { 'Retry-After': '60' } });
         });
-      const wrapped = createNativeResponseFetch(
-        send,
-        async () => context,
-        async () => true,
-        (value) => {
-          bound = value;
-        },
-        undefined,
-        reject,
-      );
+      const wrapped = createNativeResponseFetch(send, async () => context, async () => true,
+        (value) => { bound = value; }, undefined, reject);
       if (mode === 'transport_after_retry')
-        await expect(
-          wrapped('http://native.test/v1/chat/completions', { body: '{}' }),
-        ).rejects.toThrow('transport unavailable');
-      else
-        expect(
-          (await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).status,
-        ).toBe(503);
+        await expect(wrapped('http://native.test/v1/chat/completions', { body: '{}' })).rejects.toThrow('transport unavailable');
+      else expect((await wrapped('http://native.test/v1/chat/completions', { body: '{}' })).status).toBe(503);
       expect(send).toHaveBeenCalledTimes(2);
       expect(reject).not.toHaveBeenCalled();
     },
   );
 
   it.each(['pending', 'prepared', 'completed', 'cancelled', 'foreign', 'stale', 'revoke_refused'])(
-    'uses the existing exact release fences for unaccepted %s',
-    async (mode) => {
+    'uses the existing exact release fences for unaccepted %s', async (mode) => {
       const d = deps();
-      d.db.getNativeResponse.mockResolvedValue({
-        nativeResponse: {
-          ...identity,
-          status:
-            mode === 'foreign' || mode === 'stale' || mode === 'revoke_refused' ? 'pending' : mode,
-          ...(mode === 'foreign' ? { invocationId: 'other' } : {}),
-        },
-      });
+      d.db.getNativeResponse.mockResolvedValue({ nativeResponse: { ...identity,
+        status: mode === 'foreign' || mode === 'stale' || mode === 'revoke_refused' ? 'pending' : mode,
+        ...(mode === 'foreign' ? { invocationId: 'other' } : {}) } });
       if (mode === 'stale') d.isCurrent.mockResolvedValue(false);
       if (mode === 'revoke_refused') d.revoke.mockResolvedValue({ status: 'committed' });
       const service = createNativeResponseRecoveryService(d);
@@ -1880,6 +1822,7 @@ describe('native response binding and recovery', () => {
       expect(d.fetch).not.toHaveBeenCalled();
     },
   );
+
 });
 
 describe('native identity across BSON optional-field representation', () => {
@@ -1957,5 +1900,38 @@ describe('native identity across BSON optional-field representation', () => {
     expect(nativeJobMatches(job, { ...identity, sourceSequence: 0 })).toBe(false);
     expect(nativeJobMatches(job, { ...identity, userId: 'another' })).toBe(false);
   });
+
 });
 /* === VIVENTIUM END === */
+
+
+describe('native admission deadline carrier', () => {
+  test('forwards only exact successful admission headers without consuming the stream', async () => {
+    const receipt = { requestId: 'native-request', responseDeadlineAt: new Date(Date.now() + 660000).toISOString() };
+    const response = new Response('unconsumed-body', { headers: {
+      'X-GlassHive-Request-Id': receipt.requestId,
+      'X-GlassHive-Response-Deadline-At': receipt.responseDeadlineAt } });
+    const onAdmitted = jest.fn();
+    const fetch = createNativeCapacityFetch(jest.fn(async () => response), { onAdmitted });
+    expect(await fetch('https://native.invalid/v1/chat/completions')).toBe(response);
+    expect(onAdmitted).toHaveBeenCalledWith(receipt);
+    expect(await response.text()).toBe('unconsumed-body');
+  });
+  test.each(['missing', 'invalid', 'past', 'no-zone', 'failure'])(
+    'does not extend through %s admission metadata', async mode => {
+      const headers: Record<string, string> = { 'X-GlassHive-Request-Id': 'native-request' };
+      if (mode !== 'missing') headers['X-GlassHive-Response-Deadline-At'] =
+        mode === 'invalid' ? 'invalid' : mode === 'past' ? new Date(0).toISOString() :
+          mode === 'no-zone' ? '2099-01-01T00:00:00' : new Date(Date.now() + 660000).toISOString();
+      const onAdmitted = jest.fn(); const info = jest.spyOn(logger, 'info').mockImplementation(() => logger);
+      try {
+        const fetch = createNativeCapacityFetch(jest.fn(async () => new Response('', {
+          status: mode === 'failure' ? 500 : 200, headers })), { onAdmitted });
+        await fetch('https://native.invalid/v1/chat/completions'); expect(onAdmitted).not.toHaveBeenCalled();
+        const logged = info.mock.calls.map(([line]) => String(line)).find(line => line.includes('Native deadline admission'));
+        expect(logged).toContain('"accepted":false'); expect(logged).not.toContain('native-request');
+        expect(logged).not.toContain('unconsumed-body');
+        expect(logged).toContain('"reason":');
+      } finally { info.mockRestore(); }
+    });
+});

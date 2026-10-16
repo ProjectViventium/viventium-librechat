@@ -1,8 +1,4 @@
-import {
-  createMainContinuityService,
-  mainCompactionCandidateDigest,
-  mainCompactionOutputContractDigest,
-} from './mainContinuity';
+import { createMainContinuityService, mainCompactionCandidateDigest, mainCompactionOutputContractDigest } from './mainContinuity';
 import type {
   AcceptedMainTurn,
   MainContinuityState,
@@ -257,4 +253,39 @@ test('deletion or edited source after claim rejects promotion without advancing 
   f.changeGeneration();
   expect(await f.complete(s, claim)).toMatchObject({ status: 'stale_source' });
   expect([...f.states.values()][0].legacyStateCursor).toBe('');
+});
+
+test('reviewed partial legacy promotion requests idle continuation from the persisted cursor', async () => {
+  const f = fixture(70, 5000);
+  const service = f.create();
+  const first = await service.claimAcceptedMainCompaction(identity);
+  const result = await f.complete(service, first);
+  expect(result).toMatchObject({ status: 'compacted', continuationPending: true });
+  const stored = Array.from(f.states.values())[0];
+  expect(stored.legacyComplete).toBe(false);
+  const next = await f.create().claimAcceptedMainCompaction(identity);
+  const prior = (first.legacyInputs as Array<{ sourceTurns: AcceptedMainTurn[] }>)[0].sourceTurns;
+  const following = (next.legacyInputs as Array<{ sourceTurns: AcceptedMainTurn[] }>)[0].sourceTurns;
+  expect(following[0].logicalTurnId).toBe(`old-${prior.length}`);
+});
+
+
+test('fidelity continuation reclaims the exact leased legacy range across a service reload', async () => {
+  const setup = fixture(8, 5000);
+  const service = setup.create();
+  const first = await service.claimAcceptedMainCompaction({ ...identity, sourceTargetBytes: 12000 });
+  expect(first.status).toBe('claimed');
+  const range = (first.legacyInputs as { sourceRange: unknown }[])[0].sourceRange;
+  expect(await service.rejectAcceptedMainCompaction({ ...identity, leaseId: first.leaseId,
+    reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+    pendingCompactionRepair: { version: 1, sourceDigest: first.sourceDigest,
+      contractKey: 'same-route-contract', semanticAttempts: 1, transportRetries: 0,
+      correction: { code: 'semantic_fidelity', candidate: JSON.stringify(summary), reason: 'Keep exact references.' } } }))
+    .toMatchObject({ status: 'rejected', repairPending: true });
+  // The default target is wider. A fresh service must still resume the previous exact slice.
+  const next = await setup.create().claimAcceptedMainCompaction(identity);
+  expect(next.sourceDigest).toBe(first.sourceDigest);
+  expect(next.legacyInputs).toEqual(first.legacyInputs);
+  expect(next.pendingCompactionRepair).toMatchObject({ legacySourceRange: range, semanticAttempts: 1 });
+  expect(next.leaseId).not.toBe(first.leaseId);
 });

@@ -18,7 +18,8 @@ const {
  * === VIVENTIUM END === */
 
 const { logger } = require('@librechat/data-schemas');
-const { loadWebSearchAuth, reportCortexHostToolResult } = require('@librechat/api');
+const { loadWebSearchAuth, reportCortexHostToolResult, checkAccess } = require('@librechat/api');
+const { getRoleByName } = require('~/models/Role');
 const {
   assertCurrentGlassHiveSourceAuthor,
   GenerationJobManager,
@@ -33,7 +34,7 @@ const {
 } = require('@librechat/api');
 const { getFiles, getMessages } = require('~/models');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
-const { CacheKeys } = require('librechat-data-provider');
+const { CacheKeys, PermissionTypes, Permissions } = require('librechat-data-provider');
 const { getMCPManager, getMCPServersRegistry, getFlowStateManager } = require('~/config');
 const { findToken, createToken, updateToken, deleteToken, getUserById } = require('~/models');
 const { getLogStores } = require('~/cache');
@@ -116,6 +117,10 @@ async function recordManagedDurableReceipt(row, streamId) {
       responseMessageId: row.responseMessageId,
       effectKind: row.effectKind,
       effectRef: row.providerReceiptRef,
+      ...(row.effectKind === 'durable_work_action_accepted' &&
+      row.replayResult?.result?.confirmationPending === true
+        ? { confirmationPending: true }
+        : {}),
     });
   } catch (error) {
     logger.warn(
@@ -371,7 +376,7 @@ async function requestedServersFromGrant(grant, user, registry, requestedServerN
   /* === VIVENTIUM END === */
 }
 
-async function discoverServerTools({ user, serverName, serverConfig, signal } = {}) {
+async function oauthDiscoveryBlocker({ user, serverName, serverConfig } = {}) {
   const requiresOAuth = Boolean(serverConfig?.requiresOAuth || serverConfig?.oauthMetadata);
   if (requiresOAuth) {
     let credentialState = null;
@@ -399,6 +404,12 @@ async function discoverServerTools({ user, serverName, serverConfig, signal } = 
       };
     }
   }
+  return null;
+}
+
+async function discoverServerTools({ user, serverName, serverConfig, signal } = {}) {
+  const blocker = await oauthDiscoveryBlocker({ user, serverName, serverConfig });
+  if (blocker) return blocker;
   const discoverOnce = () =>
     reinitMCPServer({
       user,
@@ -602,20 +613,22 @@ async function buildCapabilityCatalog({
       omissions.push(logOmission('policy_not_authorized', serverName));
       continue;
     }
-    const explicitDeferredRequest = Array.isArray(requestedServerNames);
-    let discovered = explicitDeferredRequest ? null : cachedServerDiscovery(grant, serverName);
+    let discovered = cachedServerDiscovery(grant, serverName);
     if (discovered) {
-      logger.info('[VIVENTIUM][glasshive-capability-broker] Reused grant-scoped discovery', {
-        grantId: grant.grant_id,
-        serverName,
-        toolCount: discovered.tools.length,
-      });
+      const blocker = await oauthDiscoveryBlocker({ user, serverName, serverConfig });
+      if (blocker) {
+        discovered = blocker;
+      } else {
+        logger.info('[VIVENTIUM][glasshive-capability-broker] Reused grant-scoped discovery', {
+          grantId: grant.grant_id,
+          serverName,
+          toolCount: discovered.tools.length,
+        });
+      }
     } else {
       try {
         discovered = await discoverServerTools({ user, serverName, serverConfig, signal });
-        if (!explicitDeferredRequest) {
-          rememberServerDiscovery(grant, serverName, discovered);
-        }
+        rememberServerDiscovery(grant, serverName, discovered);
       } catch (error) {
         omissions.push(logOmission('discovery_failed', serverName, { message: error?.message }));
         continue;
@@ -1210,6 +1223,7 @@ async function executeMainDelegation({
   workerProfile = '',
   workerModel = '',
   workerReasoningEffort = '',
+  workerAccess = '',
   fallbackWorkerProfile = '',
   fallbackWorkerModel = '',
   fallbackWorkerReasoningEffort = '',
@@ -1246,6 +1260,7 @@ async function executeMainDelegation({
           workerProfile,
           workerModel,
           workerReasoningEffort,
+          workerAccess,
           fallbackWorkerProfile,
           fallbackWorkerModel,
           fallbackWorkerReasoningEffort,
@@ -1427,6 +1442,21 @@ async function invokeHostTool({ grant, catalog, hostTool, args = {}, invocationI
         fileCitations: false,
       });
       [content, artifact] = await fileSearchTool.func({ query });
+      // Native formatting omits model anchor instructions; source display still obeys role access.
+      if (artifact?.file_search) {
+        let fileCitations = false;
+        try {
+          fileCitations = await checkAccess({
+            user: catalog.user,
+            permissionType: PermissionTypes.FILE_CITATIONS,
+            permissions: [Permissions.USE],
+            getRoleByName,
+          });
+        } catch (error) {
+          logger.warn('[VIVENTIUM][glasshive-capability-broker] Citation access unavailable');
+        }
+        artifact = { ...artifact, file_search: { ...artifact.file_search, fileCitations } };
+      }
       resourceCount = hostTool.resources.files.length;
     } else if (hostTool.toolName === 'web_search') {
       const auth = await loadWebSearchAuth({

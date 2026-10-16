@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { Constants } from 'librechat-data-provider';
+import { DELEGATION_TOOL_NAME } from '~/glasshive/conversationOrchestration';
 import { DynamicStructuredTool } from '@librechat/agents/langchain/tools';
 import type { Logger } from 'winston';
 import type { MCPManager } from '~/mcp/MCPManager';
@@ -10,11 +11,85 @@ import {
   applyContextToAgent,
 } from './context';
 
+import {
+  glassHiveMainOrchestrationDefinitions,
+  createGlassHiveMainDelegationTool,
+} from '~/glasshive/orchestrationTools';
+
 // Test schema for DynamicStructuredTool
 const testSchema = z.object({});
 
 describe('Agent Context Utilities', () => {
   describe('extractMCPServers', () => {
+    /* === VIVENTIUM START === Local facades do not grant the source MCP server tools. === */
+    it('does not fetch worker-server instructions for the Core delegation facade', () => {
+      expect(
+        extractMCPServers({
+          id: 'main',
+          toolDefinitions: glassHiveMainOrchestrationDefinitions([DELEGATION_TOOL_NAME]) as never,
+        }),
+      ).toEqual([]);
+    });
+
+    it('does not infer a server from a callable Core facade instance', () => {
+      const facade = createGlassHiveMainDelegationTool(
+        { userId: 'synthetic-owner' },
+        {
+          executeMainDelegation: jest.fn(),
+          logger: { info: jest.fn() },
+        },
+      );
+      expect(extractMCPServers({ id: 'main', tools: [facade] })).toEqual([]);
+    });
+
+    it('retains original MCP tools with the exact same compatibility ID', () => {
+      const genuine = new DynamicStructuredTool({
+        name: DELEGATION_TOOL_NAME,
+        description: 'Original MCP server tool',
+        schema: testSchema,
+        func: async () => 'accepted',
+      });
+      expect(
+        extractMCPServers({
+          id: 'native-client',
+          tools: [genuine],
+          toolDefinitions: [
+            {
+              name: DELEGATION_TOOL_NAME,
+              description: 'Original MCP tool',
+              parameters: {},
+            } as never,
+          ],
+        }),
+      ).toEqual(['glasshive-workers-projects']);
+    });
+
+    it('keeps genuine MCP server instructions beside a facade from the same named server', () => {
+      const genuine = new DynamicStructuredTool({
+        name: `workspace_launch${Constants.mcp_delimiter}glasshive-workers-projects`,
+        description: 'Real server tool',
+        schema: testSchema,
+        func: async () => 'accepted',
+      });
+      const definitions = [
+        {
+          name: DELEGATION_TOOL_NAME,
+          description: 'Core-owned facade',
+          toolType: 'builtin',
+          parameters: {},
+        },
+        {
+          name: `workspace_launch${Constants.mcp_delimiter}glasshive-workers-projects`,
+          description: 'Real server tool',
+          parameters: {},
+        },
+      ] as never;
+      expect(
+        extractMCPServers({ id: 'native-client', tools: [genuine], toolDefinitions: definitions }),
+      ).toEqual(['glasshive-workers-projects']);
+    });
+    /* === VIVENTIUM END === */
+
     it('should return empty array when agent has no tools', () => {
       const agent = { id: 'test-agent' };
       expect(extractMCPServers(agent)).toEqual([]);
@@ -309,6 +384,29 @@ describe('Agent Context Utilities', () => {
         error: jest.fn(),
       } as unknown as Logger;
     });
+
+    /* === VIVENTIUM START === Prevent unsupported source-server authority in Main. === */
+    it('composes only owned Main authority for the Core facade without fetching full worker instructions', async () => {
+      const agent = {
+        id: 'main',
+        instructions: 'Use the declared local delegation facade.',
+        toolDefinitions: glassHiveMainOrchestrationDefinitions([DELEGATION_TOOL_NAME]) as never,
+      };
+      mockMCPManager.formatInstructionsForContext.mockResolvedValue(
+        'For fresh work use workspace_launch.',
+      );
+      await applyContextToAgent({
+        agent,
+        sharedRunContext: 'Accepted current input.',
+        dynamicTailContext: 'Exact final tail',
+        mcpManager: mockMCPManager,
+      });
+      expect(mockMCPManager.formatInstructionsForContext).not.toHaveBeenCalled();
+      expect(agent.instructions).toBe(
+        'Accepted current input.\n\nUse the declared local delegation facade.\n\nExact final tail',
+      );
+    });
+    /* === VIVENTIUM END === */
 
     it('should apply context successfully with all components', async () => {
       const agent = {

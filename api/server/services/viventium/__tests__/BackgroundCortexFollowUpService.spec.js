@@ -49,6 +49,7 @@ const {
   shouldForceVisibleFollowUpForEmptyPrimary,
   extractRecentResponseTextFromMessage,
   resolveUserRequestTextFromMessages,
+  resolveDurableMissionUserSources,
   isPlaceholderRecentResponseText,
   mergeVisibleTextIntoMessageContent,
   upsertCortexParts,
@@ -628,6 +629,120 @@ describe('Phase B prepare/persist boundary', () => {
     },
   );
 
+  test.each([
+    ['eligible', false, undefined, undefined, undefined, undefined],
+    ['skip', false, undefined, undefined, undefined, undefined],
+    ['eligible', true, undefined, undefined, undefined, undefined],
+    ['eligible', false, '[laugh] Spoken result.', 'Spoken result.', undefined, undefined],
+    ['eligible', false, 'Written only. [laugh] Spoken.', 'Written only. Spoken.', 14, 13],
+    ['eligible', false, 'Written only.[laugh] Spoken.', 'Written only. Spoken.', 20, 13],
+    ['eligible', false, '  [laugh] Spoken result.  ', 'Spoken result.', undefined, undefined],
+  ])(
+    'projects voice display tags without losing native audio=%s, invalid=%s',
+    async (audio, invalid, customSource, visible, split, publicSplit) => {
+      const source =
+        customSource ||
+        'The page is ready. [laugh] https://www.example.org/; demo@example.org.\n\n![Page](https://files.example.org/image.jpg)';
+      const disposition = { version: 1, required: true, valid: true, source: 'model', audio };
+      const ranges = split
+        ? [
+            { start: 0, end: split, disposition: { ...disposition, audio: 'skip' } },
+            { start: split, end: source.length, disposition },
+          ]
+        : [{ start: 0, end: source.length - (invalid ? 1 : 0), disposition }];
+      const output = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: source,
+              provider_specific_fields: {
+                viventium: {
+                  deliveryDispositionRanges: ranges,
+                  delivery_disposition: disposition,
+                },
+              },
+            },
+          },
+        ],
+      };
+      const createRun = jest.spyOn(Run, 'create').mockImplementation(async (options) => ({
+        processStream: async () => {
+          options.customHandlers.on_chat_model_start.handle();
+          options.customHandlers.on_chat_model_end.handle('on_chat_model_end', { output });
+          return source;
+        },
+      }));
+      const saveMessage = jest.spyOn(db, 'saveMessage').mockResolvedValue({});
+      const previous = process.env.XAI_API_KEY;
+      try {
+        process.env.XAI_API_KEY = 'synthetic-xai-key';
+        const input = {
+          req: {
+            id: 'synthetic-voice-ranges',
+            viventiumCallSession: { callSessionId: 'synthetic-owned-call' },
+            body: { voiceMode: true, viventiumSurface: 'voice' },
+            config: {
+              endpoints: {
+                agents: {
+                  providerCapabilities: {
+                    xai: {
+                      messaging_delivery_disposition: true,
+                      messaging_delivery_disposition_version: 1,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          conversationId: 'synthetic-conversation',
+          parentMessageId: 'synthetic-parent',
+          runId: 'synthetic-run',
+          agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
+          insightsData: {
+            cortexCount: 1,
+            insights: [{ cortexName: 'Synthetic specialist', insight: 'A useful result.' }],
+          },
+          recentResponse: 'The initial answer is visible.',
+        };
+        const prepared = await prepareCortexFollowUpMessage(input);
+        expect(prepared.text).toBe(visible || source.replace('[laugh] ', ''));
+        expect(prepared.nativeDeliveryContent[0].text).toBe(prepared.text);
+        expect(prepared.deliveryControls.sourceTextSha256).toBe(
+          require('node:crypto').createHash('sha256').update(prepared.text).digest('hex'),
+        );
+        expect(prepared.deliveryControls.audioContent).toEqual(
+          invalid ? [] : [expect.objectContaining({ type: 'text', text: source.trim() })],
+        );
+        expect(prepared.deliveryDisposition).toEqual({
+          ...disposition,
+          audio: invalid ? 'skip' : audio,
+          valid: !invalid,
+          source: invalid ? 'required_malformed' : 'model',
+        });
+        expect(prepared.nativeDeliveryContent[0].deliveryDispositionRanges).toEqual(
+          invalid
+            ? []
+            : split
+              ? [
+                  { start: 0, end: publicSplit, disposition: { ...disposition, audio: 'skip' } },
+                  { start: publicSplit, end: prepared.text.length, disposition },
+                ]
+              : [{ start: 0, end: prepared.text.length, disposition }],
+        );
+        const persisted = await persistPreparedCortexFollowUpMessage(input, prepared);
+        expect(persisted.metadata.viventium.deliveryControls).toEqual(prepared.deliveryControls);
+        expect(persisted.text).toBe(prepared.text);
+        expect(createRun).toHaveBeenCalledTimes(1);
+      } finally {
+        if (previous === undefined) delete process.env.XAI_API_KEY;
+        else process.env.XAI_API_KEY = previous;
+        createRun.mockRestore();
+        saveMessage.mockRestore();
+      }
+    },
+  );
+
   test.each([false, true])(
     'prepares before persistence and retains declared audio=%s without calling the provider again',
     async (audioEligible) => {
@@ -739,79 +854,6 @@ describe('Phase B prepare/persist boundary', () => {
       }
     },
   );
-
-  test('prepares with the provider before persistence and persists without calling it again', async () => {
-    const processStream = jest.fn().mockResolvedValue('A grounded follow-up.');
-    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
-    const saveMessage = jest.spyOn(db, 'saveMessage').mockResolvedValue({});
-    const originalXaiApiKey = process.env.XAI_API_KEY;
-    const input = {
-      req: {
-        id: 'synthetic-split-request',
-        body: {},
-      },
-      conversationId: 'synthetic-conversation',
-      parentMessageId: 'synthetic-parent',
-      runId: 'synthetic-run',
-      agent: {
-        provider: 'xai',
-        model: 'synthetic-model',
-        model_parameters: {},
-      },
-      insightsData: {
-        cortexCount: 1,
-        insights: [{ cortexName: 'Synthetic specialist', insight: 'A new grounded fact.' }],
-      },
-      recentResponse: 'The initial answer is already visible.',
-    };
-
-    try {
-      process.env.XAI_API_KEY = 'synthetic-xai-key';
-
-      const prepared = await prepareCortexFollowUpMessage(input);
-
-      expect(processStream).toHaveBeenCalledTimes(1);
-      expect(saveMessage).not.toHaveBeenCalled();
-      expect(prepared).toEqual(
-        expect.objectContaining({
-          suppressed: false,
-          text: 'A grounded follow-up.',
-        }),
-      );
-
-      const persisted = await persistPreparedCortexFollowUpMessage(input, prepared);
-
-      expect(processStream).toHaveBeenCalledTimes(1);
-      expect(saveMessage).toHaveBeenCalledTimes(1);
-      expect(saveMessage).toHaveBeenCalledWith(
-        input.req,
-        expect.objectContaining({
-          conversationId: input.conversationId,
-          parentMessageId: input.parentMessageId,
-          text: 'A grounded follow-up.',
-        }),
-        expect.objectContaining({
-          operationKind: 'system',
-          context: 'viventium/services/BackgroundCortexFollowUpService.createCortexFollowUpMessage',
-        }),
-      );
-      expect(persisted).toEqual(
-        expect.objectContaining({
-          conversationId: input.conversationId,
-          parentMessageId: input.parentMessageId,
-          text: 'A grounded follow-up.',
-        }),
-      );
-    } finally {
-      if (originalXaiApiKey == null) {
-        delete process.env.XAI_API_KEY;
-      } else {
-        process.env.XAI_API_KEY = originalXaiApiKey;
-      }
-      createRun.mockRestore();
-      saveMessage.mockRestore();
-    }
-  });
 });
 
 describe('forced follow-up onto an empty primary answer', () => {
@@ -950,6 +992,11 @@ describe('forced follow-up onto an empty primary answer', () => {
 });
 
 describe('formatFollowUpPrompt', () => {
+  const missionReports = (prompt) =>
+    prompt
+      .split('\n')
+      .filter((line) => line.startsWith('- Mission evidence: {'))
+      .map((line) => JSON.parse(line.slice('- Mission evidence: '.length)));
   const missionInsight = (runId, instruction, insight) => ({
     cortexName: 'Mission evidence',
     insight,
@@ -962,7 +1009,25 @@ describe('formatFollowUpPrompt', () => {
     },
   });
 
-  test('restores exact accepted mission input instead of an unrelated quick request', () => {
+  test.each(['17', '  Exact result\nwith "quoted" source.  '])(
+    'binds a complete report to its accepted goal and authority without an ambiguous bare value (%s)',
+    (report) => {
+      const evidence = missionInsight('run-report', 'Return the requested result.', report);
+      const prompt = formatFollowUpPrompt({
+        insights: [evidence],
+        userRequest: 'Do the accepted task, and answer a separate quick question.',
+        recentResponse: '42. The task was accepted.',
+        surface: 'voice',
+      });
+      expect(missionReports(prompt)).toEqual([
+        { report, runInput: evidence.runInput, authority: evidence.authority },
+      ]);
+      expect(prompt).not.toContain('- Mission evidence: ' + report + '\n');
+      expect(prompt.split(JSON.stringify(report))).toHaveLength(2);
+    },
+  );
+
+  test('keeps the public user request separate from worker execution instructions', () => {
     const instruction = '  Compare two storage designs.\n Keep the source links.  ';
     const evidence = missionInsight('run-a', instruction, '  Full result\nwith sources.  ');
     const prompt = formatFollowUpPrompt({
@@ -973,8 +1038,12 @@ describe('formatFollowUpPrompt', () => {
     });
     expect(prompt).toContain(JSON.stringify(evidence.runInput));
     expect(prompt).toContain(JSON.stringify(evidence.authority));
-    expect(prompt).toContain(evidence.insight);
-    expect(prompt).not.toContain('What is 17 times 23?');
+    expect(missionReports(prompt).map((item) => item.report)).toContain(evidence.insight);
+    expect(prompt).toContain('What is 17 times 23?');
+    const publicRequest = prompt.split('Original user request for interpreting')[1].split('---')[1];
+    expect(publicRequest).toContain('What is 17 times 23?');
+    expect(publicRequest).not.toContain(instruction);
+    expect(prompt.split(JSON.stringify(evidence.runInput))).toHaveLength(2);
     expect(prompt).toContain('391. The comparison was accepted separately.');
   });
 
@@ -992,8 +1061,8 @@ describe('formatFollowUpPrompt', () => {
     });
     expect(prompt).toContain(JSON.stringify(a.runInput));
     expect(prompt).toContain(JSON.stringify(b.runInput));
-    expect(prompt).toContain(a.insight);
-    expect(prompt).toContain(b.insight);
+    expect(missionReports(prompt).map((item) => item.report)).toContain(a.insight);
+    expect(missionReports(prompt).map((item) => item.report)).toContain(b.insight);
     expect(prompt.indexOf(JSON.stringify(a.runInput))).toBeLessThan(
       prompt.indexOf(JSON.stringify(b.runInput)),
     );
@@ -1010,7 +1079,7 @@ describe('formatFollowUpPrompt', () => {
   });
 
   test.each([false, true])(
-    'retains terminal evidence with missing input without borrowing the quick question (mixed=%s)',
+    'retains terminal evidence with missing worker input without replacing the public user request (mixed=%s)',
     (mixed) => {
       const missing = {
         cortexName: 'Mission evidence',
@@ -1030,13 +1099,38 @@ describe('formatFollowUpPrompt', () => {
         userRequest: 'Unrelated quick question',
         surface: 'web',
       });
-      expect(prompt).not.toContain('Unrelated quick question');
-      expect(prompt).toContain(missing.insight);
+      expect(prompt).toContain('Unrelated quick question');
+      expect(missionReports(prompt).map((item) => item.report)).toContain(missing.insight);
       expect(prompt).toContain(JSON.stringify(missing.authority));
       expect(prompt).toContain('"runInput":null');
       if (mixed) expect(prompt).toContain(JSON.stringify(known.runInput));
     },
   );
+
+  test('retains complete durable user constraints without a worker return-format substitution', () => {
+    const ownerRequest = 'Keep the public answer natural. ' + 'x'.repeat(5000) + ' END OWNER';
+    const workerInstruction = 'Inspect the result and return only an internal JSON field.';
+    const evidence = missionInsight('run-a', workerInstruction, 'Verified outcome.');
+    const prompt = formatFollowUpPrompt({
+      insights: [evidence],
+      userRequest: ownerRequest,
+      surface: 'voice',
+    });
+    const publicRequest = prompt.split('Original user request for interpreting')[1].split('---')[1];
+    expect(publicRequest.trim()).toBe(ownerRequest);
+    expect(publicRequest).not.toContain(workerInstruction);
+    expect(prompt).toContain(JSON.stringify(evidence.runInput));
+  });
+
+  test('keeps missing public source explicit while retaining the accepted worker goal', () => {
+    const instruction = 'Return only the internal result field.';
+    const evidence = missionInsight('run-a', instruction, 'Verified outcome.');
+    const prompt = formatFollowUpPrompt({ insights: [evidence], userRequest: '', surface: 'web' });
+    const publicRequest = prompt.split('Original user request for interpreting')[1].split('---')[1];
+    expect(publicRequest).toContain('user request unavailable');
+    expect(publicRequest).not.toContain(instruction);
+    expect(prompt).toContain(JSON.stringify(evidence.runInput));
+  });
 
   test('ordinary insights cannot substitute an unbound run input for the current request', () => {
     const ordinary = {
@@ -1275,6 +1369,62 @@ describe('formatFollowUpPrompt', () => {
     expect(prompt).toContain(artifactUrl);
     expect(prompt).toContain('User: Change the marker to ALPHA-STEERED.');
   });
+});
+
+test('durable preparation uses its owned original user source rather than the generated worker brief', async () => {
+  const native = require('../nativeResponseService');
+  const offer = jest.spyOn(native, 'offerMissionEvidenceToCurrentMain').mockResolvedValue(false);
+  const ownerRequest = 'Calculate a result in the background and tell me when it arrives.';
+  const getMessages = jest.spyOn(db, 'getMessages').mockResolvedValue([
+    { messageId: 'owned-user', sender: 'User', isCreatedByUser: true, text: ownerRequest },
+    {
+      messageId: 'owned-main',
+      parentMessageId: 'owned-user',
+      sender: 'Viventium',
+      isCreatedByUser: false,
+      text: 'Your work was accepted.',
+    },
+  ]);
+  try {
+    const prepared = await prepareCortexFollowUpMessage({
+      req: { user: { id: 'synthetic-owner' }, body: {} },
+      conversationId: 'synthetic-conversation',
+      parentMessageId: 'owned-main',
+      recentResponse: 'Your work was accepted.',
+      agent: null,
+      insightsData: {
+        cortexCount: 1,
+        insights: [
+          {
+            cortexName: 'Mission evidence',
+            insight: 'The result is ready.',
+            runInput: {
+              version: 1,
+              run_id: 'owned-run',
+              instruction: 'Return only internal JSON.',
+            },
+            authority: {
+              kind: 'durable_terminal_callback',
+              runId: 'owned-run',
+              workState: 'completed',
+            },
+          },
+        ],
+      },
+    });
+    expect(prepared.durableMissionEvidence).toBe(true);
+    expect(prepared.followUpDecisionRecord).toMatchObject({
+      userRequestLength: ownerRequest.length,
+      userRequestHash: require('node:crypto')
+        .createHash('sha256')
+        .update(ownerRequest)
+        .digest('hex')
+        .slice(0, 12),
+    });
+  } finally {
+    getMessages.mockRestore();
+    offer.mockRestore();
+  }
 });
 
 describe('resolveUserRequestTextFromMessages', () => {
@@ -2781,4 +2931,201 @@ describe('Phase B retained File publication', () => {
       }
     },
   );
+});
+
+describe('durable per-result user provenance', () => {
+  const req = { user: { id: 'owner-a' } };
+  const insight = (runId, messageId, conversationId = 'conversation-a') => ({
+    cortexName: 'Mission evidence',
+    insight: `Result ${runId}`,
+    runInput: { version: 1, run_id: runId, instruction: 'Worker-private execution format.' },
+    authority: {
+      kind: 'durable_terminal_callback',
+      runId,
+      userSource: { messageId, conversationId },
+    },
+  });
+  test('keeps distinct source constraints and full text paired with their exact results without another read', async () => {
+    const getMessages = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
+    const longText = `Original task A. ${'Full source. '.repeat(500)} Return only its count.`;
+    try {
+      const insights = [insight('run-a', 'source-a'), insight('run-b', 'source-b')];
+      const result = await resolveDurableMissionUserSources({
+        req,
+        conversationId: 'conversation-a',
+        insightsData: { insights },
+        messages: [
+          {
+            user: 'owner-a',
+            conversationId: 'conversation-a',
+            messageId: 'source-a',
+            isCreatedByUser: true,
+            text: longText,
+          },
+          {
+            user: 'owner-a',
+            conversationId: 'conversation-a',
+            messageId: 'source-b',
+            isCreatedByUser: true,
+            text: 'Task B: explain the finding.',
+          },
+        ],
+      });
+      expect(getMessages).not.toHaveBeenCalled();
+      expect(result.insights[0].authority.userSource).toEqual({
+        messageId: 'source-a',
+        conversationId: 'conversation-a',
+        status: 'available',
+        text: longText,
+      });
+      expect(result.insights[1].authority.userSource.text).toBe('Task B: explain the finding.');
+      expect(result.insights.map((item) => item.runInput)).toEqual(
+        insights.map((item) => item.runInput),
+      );
+      const prompt = formatFollowUpPrompt({
+        insights: result.insights,
+        userRequest: 'Current source B.',
+        recentResponse: 'The tasks continue.',
+      });
+      expect(prompt).toContain(JSON.stringify(result.insights[0].authority));
+      expect(prompt).toContain(JSON.stringify(result.insights[1].authority));
+    } finally {
+      getMessages.mockRestore();
+    }
+  });
+  test('loads absent IDs in one scoped batch and rejects foreign, assistant and deleted sources', async () => {
+    const getMessages = jest.spyOn(db, 'getMessages').mockResolvedValue([
+      {
+        user: 'owner-a',
+        conversationId: 'conversation-a',
+        messageId: 'valid',
+        isCreatedByUser: true,
+        text: 'Actual owner limit.',
+      },
+      {
+        user: 'other-owner',
+        conversationId: 'conversation-a',
+        messageId: 'foreign-owner',
+        isCreatedByUser: true,
+        text: 'Foreign owner.',
+      },
+      {
+        user: 'owner-a',
+        conversationId: 'other-conversation',
+        messageId: 'foreign-conversation',
+        isCreatedByUser: true,
+        text: 'Foreign conversation.',
+      },
+      {
+        user: 'owner-a',
+        conversationId: 'conversation-a',
+        messageId: 'assistant',
+        isCreatedByUser: false,
+        sender: 'User',
+        text: 'Not an owner message.',
+      },
+      {
+        user: 'owner-a',
+        conversationId: 'conversation-a',
+        messageId: 'deleted',
+        isCreatedByUser: true,
+        deletedAt: new Date(),
+        text: 'Deleted source.',
+      },
+      {
+        user: 'owner-a',
+        conversationId: 'conversation-a',
+        messageId: 'tombstoned',
+        isCreatedByUser: true,
+        cleanupTombstone: { tombstonedAt: new Date() },
+        text: 'Removed source.',
+      },
+    ]);
+    try {
+      const ids = [
+        'valid',
+        'foreign-owner',
+        'foreign-conversation',
+        'assistant',
+        'deleted',
+        'tombstoned',
+        'missing',
+      ];
+      const result = await resolveDurableMissionUserSources({
+        req,
+        conversationId: 'conversation-a',
+        messages: [],
+        insightsData: { insights: ids.map((id) => insight(`run-${id}`, id)) },
+      });
+      expect(getMessages).toHaveBeenCalledTimes(1);
+      expect(getMessages).toHaveBeenCalledWith(
+        { user: 'owner-a', conversationId: { $in: ['conversation-a'] }, messageId: { $in: ids } },
+        expect.any(String),
+      );
+      expect(result.insights[0].authority.userSource.text).toBe('Actual owner limit.');
+      for (const item of result.insights.slice(1)) {
+        expect(item.authority.userSource).toMatchObject({ status: 'unavailable' });
+        expect(item.authority.userSource).not.toHaveProperty('text');
+      }
+    } finally {
+      getMessages.mockRestore();
+    }
+  });
+  test('keeps absent or failed source explicit without substituting the worker brief', async () => {
+    const getMessages = jest
+      .spyOn(db, 'getMessages')
+      .mockRejectedValue(new Error('source_store_unavailable'));
+    try {
+      const result = await resolveDurableMissionUserSources({
+        req,
+        conversationId: 'conversation-a',
+        messages: [],
+        insightsData: { insights: [insight('run-a', null), insight('run-b', 'missing')] },
+      });
+      expect(
+        result.insights.every((item) => item.authority.userSource.status === 'unavailable'),
+      ).toBe(true);
+      expect(result.insights.every((item) => !('text' in item.authority.userSource))).toBe(true);
+      expect(result.insights[0].runInput.instruction).toBe('Worker-private execution format.');
+    } finally {
+      getMessages.mockRestore();
+    }
+  });
+});
+
+describe('canonical written details in Voice follow-up', () => {
+  const input = {
+    insights: [
+      {
+        cortexName: 'Verified result',
+        insight: 'Example reference page: https://docs.example.test/guide',
+      },
+    ],
+    userRequest: 'Give me the verified page title and address.',
+    voiceMode: true,
+    surface: 'voice',
+    voiceProvider: 'xai',
+  };
+  test('uses the same canonical Voice contract instead of offering the requested details again', () => {
+    const rules = require('../surfacePrompts').buildVoiceModeInstructions('xai');
+    const rendered = formatFollowUpPrompt(input);
+    expect(rendered).toContain(rules);
+    expect(rendered).toContain(
+      'Include requested URLs and email addresses in the written reply without asking again.',
+    );
+    expect(rendered).not.toContain('say you can send the details');
+    expect(rendered).toContain('{NTA}');
+  });
+  test('retains the explicit follow-up override as its sole voice rule owner', () => {
+    const previous = process.env.VIVENTIUM_VOICE_FOLLOWUP_RULES;
+    try {
+      process.env.VIVENTIUM_VOICE_FOLLOWUP_RULES = 'EXPLICIT FOLLOW-UP RULE';
+      const rendered = formatFollowUpPrompt(input);
+      expect(rendered).toContain('EXPLICIT FOLLOW-UP RULE');
+      expect(rendered).not.toContain('Include requested URLs and email addresses');
+    } finally {
+      if (previous === undefined) delete process.env.VIVENTIUM_VOICE_FOLLOWUP_RULES;
+      else process.env.VIVENTIUM_VOICE_FOLLOWUP_RULES = previous;
+    }
+  });
 });

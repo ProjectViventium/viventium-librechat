@@ -89,11 +89,12 @@ const exactOutboxReceipt = (batch) => ({
 
 describe('BackgroundCortexService activation policy helpers', () => {
   test.each([
-    ['internal', true],
-    ['deliver', false],
+    ['internal', true, true],
+    ['deliver', false, true],
+    ['internal', false, false],
   ])(
-    'admitted native deadline extends only the private structured actor: %s',
-    async (policy, extended) => {
+    'admitted native deadline extends only the private structured actor: %s / lease owner %s',
+    async (policy, extended, leaseOwned) => {
       jest.useFakeTimers();
       jest.setSystemTime(1000);
       let ready;
@@ -101,6 +102,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
         ready = resolve;
       });
       let runSignal;
+      const wireBodies = [];
       const onNativeAdmission = jest.fn(() => true);
       const agent = {
         id: 'synthetic-private-deadline',
@@ -140,7 +142,8 @@ describe('BackgroundCortexService activation policy helpers', () => {
             insightMode: 'structured',
             nativeTools: false,
             executionTimeoutMs: 240000,
-            onNativeAdmission,
+            ...(leaseOwned ? { onNativeAdmission } : {}),
+            nativeResponseDeadlineAt: 946000,
           },
           {
             initializeAgentFn: jest.fn(async () => ({
@@ -148,15 +151,15 @@ describe('BackgroundCortexService activation policy helpers', () => {
               model_parameters: {
                 model: agent.model,
                 configuration: {
-                  fetch: jest.fn(
-                    async () =>
-                      new Response('', {
-                        headers: {
-                          'X-GlassHive-Request-Id': 'native-private-request',
-                          'X-GlassHive-Response-Deadline-At': new Date(661000).toISOString(),
-                        },
-                      }),
-                  ),
+                  fetch: jest.fn(async (_input, init) => {
+                    wireBodies.push(init?.body);
+                    return new Response('', {
+                      headers: {
+                        'X-GlassHive-Request-Id': 'native-private-request',
+                        'X-GlassHive-Response-Deadline-At': new Date(661000).toISOString(),
+                      },
+                    });
+                  }),
                 },
               },
             })),
@@ -166,6 +169,7 @@ describe('BackgroundCortexService activation policy helpers', () => {
                 runSignal = signal;
                 await agents[0].model_parameters.configuration.fetch(
                   'https://native.invalid/v1/chat/completions',
+                  { method: 'POST', body: '{}' },
                 );
                 ready();
                 await new Promise((resolve) =>
@@ -182,6 +186,13 @@ describe('BackgroundCortexService activation policy helpers', () => {
             throw new Error('Cortex ended before native admission');
           }),
         ]);
+        const metadata = JSON.parse(wireBodies[0]).metadata;
+        if (extended)
+          expect(metadata).toEqual({
+            response_timeout_s: 945,
+            response_started_at: new Date(1000).toISOString(),
+          });
+        else expect(metadata).toBeUndefined();
         await jest.advanceTimersByTimeAsync(240000);
         expect(runSignal.aborted).toBe(!extended);
         if (extended) {

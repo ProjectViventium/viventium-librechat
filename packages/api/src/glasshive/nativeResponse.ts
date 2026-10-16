@@ -707,13 +707,19 @@ export function createNativeCapacityFetch(
     role,
     waitForOccupiedSession,
     onAdmitted,
+    responseDeadlineAt: requestedResponseDeadlineAt,
   }: {
     signal?: AbortSignal;
     deadlineAt?: number;
     streamId?: string;
     role?: 'main' | 'cortex';
     waitForOccupiedSession?: boolean;
-    onAdmitted?: (receipt: { requestId: string; responseDeadlineAt: string }) => void | Promise<void>;
+    /** Absolute budget supplied only by the finite, lease-owned internal maintenance stage. */
+    responseDeadlineAt?: number;
+    onAdmitted?: (receipt: {
+      requestId: string;
+      responseDeadlineAt: string;
+    }) => void | Promise<void>;
   },
 ): MainContinuityFetch {
   return async (input, init) => {
@@ -724,7 +730,9 @@ export function createNativeCapacityFetch(
       init = { ...init, headers: init?.headers || input.headers, body: await input.clone().text() };
     }
     const transportSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-    const signals = [signal, transportSignal].filter((value): value is AbortSignal => Boolean(value));
+    const signals = [signal, transportSignal].filter((value): value is AbortSignal =>
+      Boolean(value),
+    );
     const dispatch = {
       ...init,
       signal: (
@@ -732,31 +740,111 @@ export function createNativeCapacityFetch(
       ).any(signals),
     };
     const startedAt = Date.now();
-    const response = await recoverNativeCapacityResponse(
-      await baseFetch(input, dispatch),
-      () => baseFetch(input, dispatch),
-      {
-        signal: dispatch.signal,
-        startedAt,
-        waitUntil: Math.min(startedAt + NATIVE_CAPACITY_WAIT_MS, deadlineAt ?? Infinity),
-        streamId,
-        role,
-        waitForOccupiedSession,
-      },
-    );
+    let dispatchDeadlineAt = Infinity;
+    if (requestedResponseDeadlineAt !== undefined) {
+      if (
+        role !== 'cortex' ||
+        !Number.isFinite(requestedResponseDeadlineAt) ||
+        requestedResponseDeadlineAt <= startedAt
+      )
+        throw Object.assign(new Error('Native response budget is unavailable'), {
+          code: 'provider_response_deadline_exceeded',
+        });
+      if (typeof dispatch.body !== 'string')
+        throw new Error('native_response_serialized_body_required');
+      const payload = JSON.parse(dispatch.body);
+      if (
+        !payload ||
+        typeof payload !== 'object' ||
+        Array.isArray(payload) ||
+        (payload.metadata != null &&
+          (typeof payload.metadata !== 'object' || Array.isArray(payload.metadata)))
+      )
+        throw new Error('Invalid native completion body');
+      const metadata = payload.metadata || {};
+      const declaredStart =
+        typeof metadata.response_started_at === 'string'
+          ? Date.parse(metadata.response_started_at)
+          : NaN;
+      const anchoredStart = Number.isFinite(declaredStart)
+        ? Math.min(startedAt, declaredStart)
+        : startedAt;
+      const remainingSeconds = (requestedResponseDeadlineAt - anchoredStart) / 1000;
+      const declaredTimeout = metadata.response_timeout_s;
+      if (
+        declaredTimeout != null &&
+        (typeof declaredTimeout !== 'number' ||
+          !Number.isFinite(declaredTimeout) ||
+          declaredTimeout <= 0)
+      )
+        throw new Error('Invalid native response timeout');
+      const timeoutSeconds =
+        declaredTimeout == null ? remainingSeconds : Math.min(declaredTimeout, remainingSeconds);
+      dispatchDeadlineAt = anchoredStart + timeoutSeconds * 1000;
+      if (dispatchDeadlineAt <= startedAt)
+        throw Object.assign(new Error('Native response budget is exhausted'), {
+          code: 'provider_response_deadline_exceeded',
+        });
+      payload.metadata = {
+        ...metadata,
+        response_started_at: new Date(anchoredStart).toISOString(),
+        response_timeout_s: timeoutSeconds,
+      };
+      dispatch.body = JSON.stringify(payload);
+      const headers = new Headers(dispatch.headers);
+      headers.delete('content-length');
+      dispatch.headers = headers;
+    }
+    const send = () => {
+      if (Date.now() >= dispatchDeadlineAt)
+        throw Object.assign(new Error('Native response budget is exhausted'), {
+          code: 'provider_response_deadline_exceeded',
+        });
+      return baseFetch(input, dispatch);
+    };
+    const response = await recoverNativeCapacityResponse(await send(), send, {
+      signal: dispatch.signal,
+      startedAt,
+      waitUntil: Math.min(
+        startedAt + NATIVE_CAPACITY_WAIT_MS,
+        deadlineAt ?? Infinity,
+        dispatchDeadlineAt,
+      ),
+      streamId,
+      role,
+      waitForOccupiedSession,
+    });
     const requestId = response.headers.get('X-GlassHive-Request-Id')?.trim();
     const responseDeadlineAt = response.headers.get('X-GlassHive-Response-Deadline-At')?.trim();
     if (onAdmitted) {
       const deadlineMs = Date.parse(responseDeadlineAt || '');
-      const reason = !response.ok ? 'not_admitted' : !requestId || !responseDeadlineAt ? 'missing' :
-        requestId.length > 256 || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(responseDeadlineAt) ||
-        !Number.isFinite(deadlineMs) ? 'invalid' : deadlineMs <= Date.now() ? 'late' : null;
-      if (!reason) await onAdmitted({ requestId: requestId!, responseDeadlineAt: responseDeadlineAt! });
-      else logger.info(`[VIVENTIUM][main-continuity] Native deadline admission ${JSON.stringify({
-        requestHash: requestId && requestId.length <= 256 ? nativeResponseSha256(requestId).slice(0, 16) : null,
-        admittedDeadline: Number.isFinite(deadlineMs) ? new Date(deadlineMs).toISOString() : null,
-        accepted: false, reason,
-      })}`);
+      const reason = !response.ok
+        ? 'not_admitted'
+        : !requestId || !responseDeadlineAt
+          ? 'missing'
+          : requestId.length > 256 ||
+              !/(?:Z|[+-]\d{2}:\d{2})$/i.test(responseDeadlineAt) ||
+              !Number.isFinite(deadlineMs)
+            ? 'invalid'
+            : deadlineMs <= Date.now()
+              ? 'late'
+              : null;
+      if (!reason)
+        await onAdmitted({ requestId: requestId!, responseDeadlineAt: responseDeadlineAt! });
+      else
+        logger.info(
+          `[VIVENTIUM][main-continuity] Native deadline admission ${JSON.stringify({
+            requestHash:
+              requestId && requestId.length <= 256
+                ? nativeResponseSha256(requestId).slice(0, 16)
+                : null,
+            admittedDeadline: Number.isFinite(deadlineMs)
+              ? new Date(deadlineMs).toISOString()
+              : null,
+            accepted: false,
+            reason,
+          })}`,
+        );
     }
     return response;
   };

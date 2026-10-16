@@ -329,6 +329,7 @@ async function defaultExecuteCompactor({
   stage = 'compaction',
   timeoutMs,
   onNativeAdmission,
+  nativeResponseDeadlineAt,
 }) {
   if (!req || !agent) throw new Error('main_compaction_runtime_unavailable');
   const { createBackgroundRes, executeCortex } = require('../BackgroundCortexService');
@@ -375,6 +376,7 @@ async function defaultExecuteCompactor({
           : COMPACTOR_TIMEOUT_MS,
       signal,
       onNativeAdmission,
+      ...(nativeResponseDeadlineAt !== undefined ? { nativeResponseDeadlineAt } : {}),
       onHarnessCancellationOutcome: (outcome) => {
         capacityReleaseReported = true;
         reportCapacityRelease?.(outcome?.acknowledged === true);
@@ -773,6 +775,16 @@ async function runAcceptedMainCompaction(input = {}) {
     const nativeDeadlineLimit = Number.isFinite(deadlineMs)
       ? deadlineMs - Math.max(0, executionBudget.completionReserveMs || 0)
       : Infinity;
+    const nativeResponseDeadlineForStage = (stage) =>
+      nativeStageDeadline && Number.isFinite(deadlineMs)
+        ? nativeDeadlineLimit -
+          nativeGraceMs -
+          (stage === 'review' ? 0 : Math.max(slowestReviewCallMs, COMPACTOR_TIMEOUT_MS))
+        : undefined;
+    const nativeAllowanceAvailable = (stage) => {
+      const deadline = nativeResponseDeadlineForStage(stage);
+      return deadline === undefined || deadline > now();
+    };
     const executeStage = async (params) => {
       const lease = nativeStageDeadline
         ? createMainCompactionStageLease({
@@ -795,15 +807,34 @@ async function runAcceptedMainCompaction(input = {}) {
           })
         : null;
       try {
+        const reviewReserveMs =
+          params.stage === 'review' ? 0 : Math.max(slowestReviewCallMs, COMPACTOR_TIMEOUT_MS);
+        const nativeResponseDeadlineAt = nativeResponseDeadlineForStage(params.stage);
+        if (nativeResponseDeadlineAt !== undefined && nativeResponseDeadlineAt <= now())
+          throw Object.assign(new Error('Compaction enclosing deadline exhausted'), {
+            code: 'compaction_enclosing_deadline',
+          });
+        // No child owns capacity until the final budget check passes. A clock race here
+        // must retain the previous stage's confirmed release and resumable repair state.
+        active.capacityReleaseAcknowledged = null;
         return await executeCompactor({
           ...params,
+          ...(nativeResponseDeadlineAt !== undefined ? { nativeResponseDeadlineAt } : {}),
           ...(lease
             ? {
                 onNativeAdmission: (receipt) => {
                   // Native admission may extend the short stage guard, never the enclosing idle batch.
                   const receiptDeadline = Date.parse(receipt.responseDeadlineAt);
-                  const reviewReserveMs = params.stage === 'review' ? 0 : slowestReviewCallMs;
-                  if (receiptDeadline + nativeGraceMs + reviewReserveMs > nativeDeadlineLimit)
+                  const receiptReviewReserveMs =
+                    params.stage === 'review'
+                      ? 0
+                      : Number.isFinite(deadlineMs)
+                        ? reviewReserveMs
+                        : slowestReviewCallMs;
+                  if (
+                    receiptDeadline + nativeGraceMs + receiptReviewReserveMs >
+                    nativeDeadlineLimit
+                  )
                     return false;
                   const admittedAt = now();
                   return lease.admit(receipt).then((accepted) => {
@@ -918,13 +949,17 @@ async function runAcceptedMainCompaction(input = {}) {
               })
             : { allowed: true, timeoutMs: COMPACTOR_TIMEOUT_MS };
         const callTimeoutMs = Math.min(budget.timeoutMs, sizeBudget.timeoutMs);
-        if (!budget.allowed || !sizeBudget.allowed || callTimeoutMs <= 0) {
+        if (
+          !budget.allowed ||
+          !sizeBudget.allowed ||
+          callTimeoutMs <= 0 ||
+          !nativeAllowanceAvailable('compaction')
+        ) {
           terminalReason = Number.isFinite(deadlineMs)
             ? 'compaction_enclosing_deadline'
             : 'compaction_lease_expired';
           break;
         }
-        active.capacityReleaseAcknowledged = null;
         callStartedMs = observeStageStart('compaction', callTimeoutMs);
         raw = await executeStage({
           claim,
@@ -1043,13 +1078,12 @@ async function runAcceptedMainCompaction(input = {}) {
           break;
         }
         const reviewTimeoutMs = reviewBudget.timeoutMs;
-        if (!reviewBudget.allowed || reviewTimeoutMs <= 0) {
+        if (!reviewBudget.allowed || reviewTimeoutMs <= 0 || !nativeAllowanceAvailable('review')) {
           terminalReason = Number.isFinite(deadlineMs)
             ? 'compaction_enclosing_deadline'
             : 'compaction_lease_expired';
           break;
         }
-        active.capacityReleaseAcknowledged = null;
         reviewStartedMs = observeStageStart('review', reviewTimeoutMs);
         review = parseSemanticCompactionOutput(
           await executeStage({

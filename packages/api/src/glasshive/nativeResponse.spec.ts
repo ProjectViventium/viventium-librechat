@@ -1905,6 +1905,147 @@ describe('native identity across BSON optional-field representation', () => {
 /* === VIVENTIUM END === */
 
 
+describe('finite maintenance response budget', () => {
+  const startedAt = 1_000;
+  let clock: jest.SpyInstance;
+  beforeEach(() => {
+    clock = jest.spyOn(Date, 'now').mockReturnValue(startedAt);
+  });
+  afterEach(() => {
+    clock.mockRestore();
+  });
+
+  it('uses the existing absolute deadline without replacing signed metadata or input', async () => {
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockResolvedValue(new Response('{}'));
+    const fetch = createNativeCapacityFetch(send, { role: 'cortex', responseDeadlineAt: 946_000 });
+    const body = {
+      messages: [{ role: 'user', content: 'Exact complete source.' }],
+      metadata: { bootstrap_bundle_b64: 'synthetic-signed-carrier', actor_kind: 'system' },
+    };
+    await fetch('https://native.invalid/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Length': '1' },
+      body: JSON.stringify(body),
+    });
+    const sent = JSON.parse(send.mock.calls[0][1]!.body as string);
+    expect(sent.messages).toEqual(body.messages);
+    expect(sent.metadata).toEqual({
+      ...body.metadata,
+      response_timeout_s: 945,
+      response_started_at: new Date(startedAt).toISOString(),
+    });
+    expect(new Headers(send.mock.calls[0][1]!.headers).has('Content-Length')).toBe(false);
+  });
+
+  it('does not renew the absolute response budget across occupied-capacity retries', async () => {
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { code: 'conversation_session_authority_conflict' } }),
+          { status: 409 },
+        ),
+      )
+      .mockResolvedValue(new Response('{}'));
+    const fetch = createNativeCapacityFetch(send, {
+      role: 'cortex',
+      waitForOccupiedSession: true,
+      responseDeadlineAt: 946_000,
+    });
+    await fetch('https://native.invalid/v1/chat/completions', { method: 'POST', body: '{}' });
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[0][1]!.body).toBe(send.mock.calls[1][1]!.body);
+  });
+
+  it('does not spend a shorter response allowance on a capacity retry', async () => {
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ error: { code: 'host_capacity' } }), {
+          status: 503,
+          headers: { 'Retry-After': '1' },
+        }),
+      );
+    const fetch = createNativeCapacityFetch(send, { role: 'cortex', responseDeadlineAt: 1_500 });
+    expect((await fetch('https://native.invalid/v1/chat/completions', { body: '{}' })).status).toBe(
+      503,
+    );
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves a tighter caller budget and its earlier start', async () => {
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockResolvedValue(new Response('{}'));
+    const fetch = createNativeCapacityFetch(send, { role: 'cortex', responseDeadlineAt: 946_000 });
+    await fetch('https://native.invalid/v1/chat/completions', {
+      body: JSON.stringify({
+        metadata: { response_timeout_s: 30, response_started_at: new Date(500).toISOString() },
+      }),
+    });
+    expect(JSON.parse(send.mock.calls[0][1]!.body as string).metadata).toMatchObject({
+      response_timeout_s: 30,
+      response_started_at: new Date(500).toISOString(),
+    });
+  });
+
+  it('does not restart an expired tighter caller budget', async () => {
+    const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>();
+    const fetch = createNativeCapacityFetch(send, { role: 'cortex', responseDeadlineAt: 946_000 });
+    await expect(
+      fetch('https://native.invalid/v1/chat/completions', {
+        body: JSON.stringify({
+          metadata: { response_timeout_s: 0.5, response_started_at: new Date(500).toISOString() },
+        }),
+      }),
+    ).rejects.toMatchObject({ code: 'provider_response_deadline_exceeded' });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each([NaN, Infinity, -1, 0, startedAt, startedAt - 1])(
+    'never dispatches invalid or exhausted allowance %s',
+    async (responseDeadlineAt) => {
+      const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>();
+      const fetch = createNativeCapacityFetch(send, { role: 'cortex', responseDeadlineAt });
+      await expect(
+        fetch('https://native.invalid/v1/chat/completions', { body: '{}' }),
+      ).rejects.toMatchObject({ code: 'provider_response_deadline_exceeded' });
+      expect(send).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not grant a maintenance response budget to Main', async () => {
+    const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>();
+    await expect(
+      createNativeCapacityFetch(send, { role: 'main', responseDeadlineAt: 946_000 })(
+        'https://native.invalid/v1/chat/completions',
+        { body: '{}' },
+      ),
+    ).rejects.toMatchObject({ code: 'provider_response_deadline_exceeded' });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('does not change ordinary requests or unrelated paths', async () => {
+    const send = jest
+      .fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>()
+      .mockResolvedValue(new Response('{}'));
+    const body = '{"metadata":{"actor_kind":"external_user"}}';
+    await createNativeCapacityFetch(send, { role: 'main' })(
+      'https://native.invalid/v1/chat/completions',
+      { body },
+    );
+    expect(send.mock.calls[0][1]!.body).toBe(body);
+    const init = { body };
+    await createNativeCapacityFetch(send, { role: 'cortex', responseDeadlineAt: 946_000 })(
+      'https://native.invalid/v1/models',
+      init,
+    );
+    expect(send.mock.calls[1][1]).toBe(init);
+  });
+});
+
 describe('native admission deadline carrier', () => {
   test('forwards only exact successful admission headers without consuming the stream', async () => {
     const receipt = { requestId: 'native-request', responseDeadlineAt: new Date(Date.now() + 660000).toISOString() };

@@ -37,6 +37,7 @@ afterAll(() => {
 
 const { logger } = require('@librechat/data-schemas');
 const { Run } = require('@librechat/agents');
+const { bindCurrentCallContext, getCurrentCallContext } = require('@librechat/api');
 const db = require('~/models');
 const {
   formatFollowUpPrompt,
@@ -3127,7 +3128,6 @@ describe('canonical written details in Voice follow-up', () => {
         requestedVoiceRoute: { tts: { provider: 'xai', variant: 'synthetic-voice' } },
       },
     };
-    const { bindCurrentCallContext, getCurrentCallContext } = require('@librechat/api');
     expect(bindCurrentCallContext(req)).toBe(true);
     const currentCallContext = getCurrentCallContext(req);
     const rendered = formatFollowUpPrompt({ ...input, currentCallContext });
@@ -3150,7 +3150,6 @@ describe('canonical written details in Voice follow-up', () => {
         requestedVoiceRoute: { tts: { provider: 'xai', variant: 'synthetic-voice' } },
       },
     };
-    const { bindCurrentCallContext, getCurrentCallContext } = require('@librechat/api');
     expect(bindCurrentCallContext(req)).toBe(true);
     const capsule = getCurrentCallContext(req);
     const processStream = jest.fn().mockResolvedValue('The verified result is ready.');

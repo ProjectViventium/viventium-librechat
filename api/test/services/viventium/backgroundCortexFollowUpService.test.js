@@ -1796,7 +1796,8 @@ describe('BackgroundCortexFollowUpService', () => {
     const runInstance = await runPromise;
     const callArgs = runInstance.processStream.mock.calls[0][0];
     const prompt = callArgs.messages[0].content;
-    expect(prompt).toContain('VOICE FOLLOW-UP RULES');
+    expect(prompt).toContain('For spoken audio, use short sentences');
+    expect(prompt).toContain('Include requested URLs and email addresses in the written reply');
   });
   // === VIVENTIUM NOTE ===
 

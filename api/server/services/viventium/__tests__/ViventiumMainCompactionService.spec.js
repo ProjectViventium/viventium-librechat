@@ -3913,30 +3913,83 @@ describe('active Call compaction scheduling owner', () => {
     expiresAtMs: Date.now() + 60000,
   });
   beforeEach(() => require('@librechat/api').resetMainCompactionSchedulingForTests());
-  test('two accepted Voice turns start no model and End enters the existing runner once with the latest input', async () => {
-    const claim = jest.fn(async () => ({ status: 'empty' })),
+  test.each(['accepted_turn', 'conversation_legacy'])(
+    '%s maintains reviewed memory during an active Call without waiting for End',
+    async (trigger) => {
+      const session = call();
+      const lookup = require('../CallSessionService').getActiveCallSessionForMainMaintenance;
+      lookup.mockResolvedValue(session);
+      const claim = jest.fn(async () => ({
+        status: 'claimed',
+        leaseId: 'live-call-memory',
+        domainEpochKey: 'live-call-memory-domain',
+        sourceDigest: 'd'.repeat(64),
+        sourceBytes: 100,
+        sourceTurns: [],
+        leaseExpiresAt: new Date(Date.now() + 300000),
+      }));
+      const candidate = JSON.stringify({
+        version: 1,
+        summary: 'Keep the original request and reviewed source.',
+        pendingAsks: [],
+        commitments: [],
+        corrections: [],
+        decisions: [],
+        durableIdentifiers: [],
+        recurrenceOutcomes: [],
+        toolPairs: [],
+      });
+      const execute = jest.fn(async ({ stage }) =>
+        stage === 'review' ? reviewApproved : candidate,
+      );
+      const promote = jest.fn(async () => ({ status: 'compacted', continuationPending: false }));
+      try {
+        expect(
+          await ensureAcceptedMainCompaction({
+            ...identity,
+            trigger,
+            foreground: false,
+            req: { viventiumCallSession: session },
+            claimCompaction: claim,
+            executeCompactor: execute,
+            completeCompaction: promote,
+            rejectCompaction: jest.fn(),
+          }),
+        ).toMatchObject({ status: 'compacted' });
+        expect(claim).toHaveBeenCalledTimes(1);
+        expect(execute.mock.calls.map(([input]) => input.stage || 'compaction')).toEqual([
+          'compaction',
+          'review',
+        ]);
+        expect(promote).toHaveBeenCalledTimes(1);
+        expect(await flushEndedCallMainCompactions({ ...session, status: 'ended' })).toBe(0);
+      } finally {
+        lookup.mockReset().mockResolvedValue(null);
+      }
+    },
+  );
+  test('an actual foreground fence still wins during an active Call before a memory claim', async () => {
+    const claim = jest.fn(),
       execute = jest.fn();
-    const session = call();
-    for (const marker of ['first', 'latest']) {
+    const release = acquireInteractiveMainAdmissionFence(identity.ownerId);
+    try {
       expect(
         await ensureAcceptedMainCompaction({
           ...identity,
           trigger: 'accepted_turn',
-          req: { viventiumCallSession: session },
-          marker,
+          foreground: false,
+          req: { viventiumCallSession: call() },
           claimCompaction: claim,
           executeCompactor: execute,
         }),
-      ).toMatchObject({ status: 'deferred', reason: 'active_call' });
+      ).toMatchObject({ status: 'deferred', reason: 'interactive_priority' });
+      expect(claim).not.toHaveBeenCalled();
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      release();
     }
-    expect(claim).not.toHaveBeenCalled();
-    expect(execute).not.toHaveBeenCalled();
-    expect(await flushEndedCallMainCompactions({ ...session, status: 'ended' })).toBe(1);
-    expect(claim).toHaveBeenCalledTimes(1);
-    expect(claim.mock.calls[0][0].marker).toBe('latest');
-    expect(await flushEndedCallMainCompactions({ ...session, status: 'ended' })).toBe(0);
   });
-  test('required foreground recovery during a call executes and removes its deferred duplicate', async () => {
+  test('required foreground recovery during a call remains immediate with no deferred duplicate', async () => {
     const session = call(),
       claim = jest.fn(async () => ({ status: 'empty' }));
     const input = { ...identity, req: { viventiumCallSession: session }, claimCompaction: claim };
@@ -3948,7 +4001,7 @@ describe('active Call compaction scheduling owner', () => {
         foreground: true,
       }),
     ).toMatchObject({ status: 'empty' });
-    expect(claim).toHaveBeenCalledTimes(1);
+    expect(claim).toHaveBeenCalledTimes(2);
     expect(await flushEndedCallMainCompactions({ ...session, status: 'ended' })).toBe(0);
   });
   test('ordinary accepted scheduling and late acceptance after End use the existing runner', async () => {
@@ -4111,7 +4164,7 @@ describe('idle continuation after the finite batch cap', () => {
   );
 });
 
-describe('fresh call liveness before historical idle claims', () => {
+describe('historical idle claims during a live Call', () => {
   const lookup = require('../CallSessionService').getActiveCallSessionForMainMaintenance;
   const identity = {
     ownerId: 'call-idle-owner',
@@ -4161,7 +4214,7 @@ describe('fresh call liveness before historical idle claims', () => {
     expiresAtMs: Date.now() + 120000,
   });
 
-  test('a call starting between claims defers the next claim until the existing End flush', async () => {
+  test('a call starting between claims does not hold reviewed continuation', async () => {
     let completed = 0;
     const call = liveCall();
     lookup.mockResolvedValue(call).mockResolvedValueOnce(null);
@@ -4169,18 +4222,14 @@ describe('fresh call liveness before historical idle claims', () => {
       status: 'compacted',
       continuationPending: ++completed < 2,
     }));
-    expect(await ensureAcceptedMainCompaction(input)).toMatchObject({
-      status: 'deferred',
-      reason: 'active_call',
-    });
-    expect(completed).toBe(1);
-    lookup.mockResolvedValue(null);
-    expect(await flushEndedCallMainCompactions({ ...call, status: 'ended' })).toBe(1);
+    expect(await ensureAcceptedMainCompaction(input)).toMatchObject({ status: 'compacted' });
     expect(completed).toBe(2);
     expect(input.claimCompaction).toHaveBeenCalledTimes(2);
+    expect(lookup).not.toHaveBeenCalled();
+    expect(await flushEndedCallMainCompactions({ ...call, status: 'ended' })).toBe(0);
   });
 
-  test('a new call after the timer was armed prevents an idle claim until End', async () => {
+  test('a new call after the timer was armed does not hold the next idle claim', async () => {
     jest.useFakeTimers({ doNotFake: ['setImmediate'] });
     let completed = 0;
     const input = inputFor(async () => ({
@@ -4193,26 +4242,22 @@ describe('fresh call liveness before historical idle claims', () => {
       const call = liveCall();
       lookup.mockResolvedValue(call);
       await jest.advanceTimersByTimeAsync(30000);
-      expect(completed).toBe(4);
-      expect(input.claimCompaction).toHaveBeenCalledTimes(4);
-      lookup.mockResolvedValue(null);
-      expect(await flushEndedCallMainCompactions({ ...call, status: 'ended' })).toBe(1);
       expect(completed).toBe(5);
       expect(input.claimCompaction).toHaveBeenCalledTimes(5);
+      expect(lookup).not.toHaveBeenCalled();
+      expect(await flushEndedCallMainCompactions({ ...call, status: 'ended' })).toBe(0);
     } finally {
       require('@librechat/api').resetMainCompactionSchedulingForTests();
       jest.useRealTimers();
     }
   });
 
-  test('unavailable call liveness starts no maintenance provider claim', async () => {
+  test('unavailable call liveness does not block independently fenced maintenance', async () => {
     lookup.mockRejectedValue(new Error('synthetic persistence unavailable'));
-    const input = inputFor(jest.fn());
-    expect(await ensureAcceptedMainCompaction(input)).toMatchObject({
-      status: 'deferred',
-      reason: 'call_liveness_unavailable',
-    });
-    expect(input.claimCompaction).not.toHaveBeenCalled();
+    const input = inputFor(async () => ({ status: 'compacted', continuationPending: false }));
+    expect(await ensureAcceptedMainCompaction(input)).toMatchObject({ status: 'compacted' });
+    expect(input.claimCompaction).toHaveBeenCalledTimes(1);
+    expect(lookup).not.toHaveBeenCalled();
   });
 });
 
@@ -4244,7 +4289,7 @@ describe('legacy conversation maintenance uses the existing idle and call owners
       jest.useRealTimers();
     }
   });
-  test('background legacy claims wait for a fresh live call and resume once after End', async () => {
+  test('background legacy claims remain eligible during a live call without an End replay', async () => {
     const call = {
       userId: 'legacy-call-owner',
       callSessionId: 'legacy-call',
@@ -4263,13 +4308,10 @@ describe('legacy conversation maintenance uses the existing idle and call owners
       claimCompaction: claim,
       executeCompactor: jest.fn(),
     };
-    expect(await ensureAcceptedMainCompaction(input)).toMatchObject({
-      status: 'deferred',
-      reason: 'active_call',
-    });
-    expect(claim).not.toHaveBeenCalled();
-    expect(await flushEndedCallMainCompactions({ ...call, status: 'ended' })).toBe(1);
+    expect(await ensureAcceptedMainCompaction(input)).toMatchObject({ status: 'empty' });
     expect(claim).toHaveBeenCalledTimes(1);
+    expect(await flushEndedCallMainCompactions({ ...call, status: 'ended' })).toBe(0);
+    expect(calls).not.toHaveBeenCalled();
     expect(input.executeCompactor).not.toHaveBeenCalled();
   });
 });
@@ -4836,6 +4878,169 @@ describe('resumed fidelity checkpoint during foreground cancellation', () => {
       } finally {
         scheduling.resetMainCompactionSchedulingForTests();
         setMainContinuityPersistenceForTests(null);
+        jest.useRealTimers();
+      }
+    },
+  );
+});
+
+describe('first numeric size feedback through the existing idle owner', () => {
+  test.each(['promote', 'equal', 'larger', 'unknown-floor', 'small-floor', 'changed-floor'])(
+    'first size rejection pauses, resumes attempt two, and requires shrinking (%s)',
+    async (outcome) => {
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      jest.setSystemTime(1000000);
+      const api = require('@librechat/api');
+      api.resetMainCompactionSchedulingForTests();
+      const hasEcho = !['unknown-floor', 'small-floor'].includes(outcome);
+      let floor = 524288;
+      if (outcome === 'unknown-floor') floor = null;
+      else if (outcome === 'small-floor') floor = 1;
+      api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(floor);
+      const valid = {
+        version: 1,
+        summary: 'Keep permission pending.',
+        pendingAsks: [],
+        commitments: [],
+        corrections: [],
+        decisions: [],
+        durableIdentifiers: [],
+        recurrenceOutcomes: [],
+        toolPairs: [],
+      };
+      const contract = api.createMainCompactionOutputContract({
+        consumer: 'accepted_core',
+        carrierMaxUtf8Bytes: 131072,
+        reservedUtf8Bytes: 29577,
+      });
+      const oversized = {
+        ...valid,
+        summary: 's'.repeat(contract.maxJsonUtf8Bytes - 1000),
+        pendingAsks: Array.from({ length: 4 }, () => 'p'.repeat(900)),
+      };
+      const source = {
+        previousSemanticCompaction: valid,
+        sourceTurns: [],
+        legacyInputs: [
+          {
+            kind: 'legacy_state',
+            id: 'first-size-artifact',
+            sourceTurns: [],
+            sourceRange: { artifactId: 'first-size-artifact', start: 23, end: 24, total: 42 },
+          },
+        ],
+      };
+      let pending = null,
+        claims = 0;
+      const calls = [],
+        complete = jest.fn(async () => {
+          pending = null;
+          return { status: 'compacted', continuationPending: false };
+        });
+      const input = {
+        ownerId: 'first-size-owner',
+        agentId: 'main',
+        stableAuthoritySha256: 'e'.repeat(64),
+        trigger: 'accepted_turn',
+        executionBudget: { completionReserveMs: 0 },
+        agent: {
+          provider: 'native',
+          model_parameters: { model: 'synthetic', reasoning_effort: 'high' },
+        },
+        req: {
+          config: {
+            endpoints: {
+              agents: {
+                providerCapabilities: {
+                  native: { workspace_binding: true, conversation_session: true },
+                },
+              },
+            },
+          },
+        },
+        claimCompaction: async () => ({
+          status: 'claimed',
+          leaseId: `first-size-${++claims}`,
+          domainEpochKey: 'first-size-domain',
+          sourceDigest: 'f'.repeat(64),
+          sourceBytes: 120000,
+          ...structuredClone(source),
+          outputContract: contract,
+          leaseExpiresAt: new Date(Date.now() + 300000),
+          ...(pending ? { pendingCompactionRepair: structuredClone(pending) } : {}),
+        }),
+        renewCompaction: async ({ expiresAt }) => ({
+          status: 'renewed',
+          leaseExpiresAt: expiresAt,
+        }),
+        completeCompaction: complete,
+        rejectCompaction: async (claim) => {
+          pending = claim.pendingCompactionRepair
+            ? { ...claim.pendingCompactionRepair, outputContract: contract }
+            : null;
+          return { status: 'rejected', ...(pending ? { repairPending: true } : {}) };
+        },
+        executeCompactor: async (call) => {
+          calls.push(call);
+          expect(
+            await call.onNativeAdmission({
+              requestId: `first-size-native-${calls.length}`,
+              responseDeadlineAt: new Date(call.nativeResponseDeadlineAt).toISOString(),
+            }),
+          ).toBe(true);
+          await new Promise((resolve) => setTimeout(resolve, calls.length === 1 ? 373471 : 1000));
+          call.reportCapacityRelease(true);
+          if (call.stage === 'review') return reviewApproved;
+          let draft = valid;
+          if (calls.length === 1 || outcome === 'equal') draft = oversized;
+          else if (outcome === 'larger') draft = { ...oversized, summary: oversized.summary + 'x' };
+          return JSON.stringify(draft);
+        },
+      };
+      try {
+        const first = ensureAcceptedMainCompaction(input);
+        await jest.advanceTimersByTimeAsync(373471);
+        expect(await first).toMatchObject({
+          status: 'degraded',
+          attempts: 1,
+          reason: 'compaction_enclosing_deadline',
+          repairPending: true,
+        });
+        expect(pending).toMatchObject({
+          semanticAttempts: 1,
+          fidelityRepairAttempts: 0,
+          correction: { code: 'schema_invalid', issue: { constraint: 'max_bytes' } },
+          sizeRepair: {
+            proposalBytes: Buffer.byteLength(JSON.stringify(oversized)),
+            converging: true,
+          },
+        });
+        expect(pending.sizeRepair.previousProposalBytes).toBeUndefined();
+        expect(pending.correction.candidate).toBe(hasEcho ? JSON.stringify(oversized) : undefined);
+        expect(complete).not.toHaveBeenCalled();
+        if (outcome === 'changed-floor')
+          api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(null);
+        await jest.advanceTimersByTimeAsync(32000);
+        for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+        expect(calls[1].attempt).toBe(2);
+        const payload = JSON.parse(
+          calls[1].prompt
+            .split('<untrusted_conversation_data_v1>')[1]
+            .split('</untrusted_conversation_data_v1>')[0],
+        );
+        expect(payload.priorRejection.issue.constraint).toBe('max_bytes');
+        expect(payload.priorRejection.candidate).toBe(
+          hasEcho && outcome !== 'changed-floor' ? JSON.stringify(oversized) : undefined,
+        );
+        expect(payload.previousSemanticCompaction).toEqual(source.previousSemanticCompaction);
+        expect(payload.legacyInputs).toEqual(source.legacyInputs);
+        expect(complete).toHaveBeenCalledTimes(['equal', 'larger'].includes(outcome) ? 0 : 1);
+        expect(calls).toHaveLength(['equal', 'larger'].includes(outcome) ? 2 : 3);
+        expect(pending).toBeNull();
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        api.resetMainCompactionSchedulingForTests();
+        api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(null);
         jest.useRealTimers();
       }
     },

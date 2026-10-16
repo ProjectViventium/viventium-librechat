@@ -263,7 +263,7 @@ describe('native Main acceptance projection', () => {
     expect((await history()).count).toBe(4);
   });
 
-  it('round-trips numeric size progress through Mongo without publishing or dropping accepted source', async () => {
+  it.each([1, 2])('round-trips numeric size progress after %s producer(s) through Mongo without dropping source', async count => {
     const runtime = service();
     for (let n = 0; n < 4; n++) await runtime.commitAcceptedMainTurn(await presentation(`size-${n}`));
     const claim = await runtime.claimAcceptedMainCompaction(identity);
@@ -276,9 +276,9 @@ describe('native Main acceptance projection', () => {
     const proposalBytes = Buffer.byteLength(JSON.stringify(candidate));
     const repair = { version: 1, sourceDigest: claim.sourceDigest,
       contractKey: JSON.stringify({ provider: 'native', model: 'synthetic', effort: 'high', constraints: contract }),
-      semanticAttempts: 2, fidelityRepairAttempts: 1, transportRetries: 0,
+      semanticAttempts: count, fidelityRepairAttempts: 0, transportRetries: 0,
       correction: { code: 'schema_invalid', issue: inspected.issue },
-      sizeRepair: { proposalBytes, previousProposalBytes: proposalBytes + 3000, converging: true } };
+      sizeRepair: { proposalBytes, ...(count > 1 ? { previousProposalBytes: proposalBytes + 3000 } : {}), converging: true } };
     expect(await runtime.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
       reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
       pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
@@ -289,7 +289,7 @@ describe('native Main acceptance projection', () => {
     expect((await history()).count).toBe(4);
     const next = await runtime.claimAcceptedMainCompaction(identity);
     expect(next.sourceDigest).toBe(claim.sourceDigest);
-    expect(next.pendingCompactionRepair).toMatchObject({ semanticAttempts: 2, fidelityRepairAttempts: 1 });
+    expect(next.pendingCompactionRepair).toMatchObject({ semanticAttempts: count, fidelityRepairAttempts: 0 });
     expect((await runtime.loadAcceptedMainContext(identity)).capsule).toContain('Valid request size-0.');
   });
 

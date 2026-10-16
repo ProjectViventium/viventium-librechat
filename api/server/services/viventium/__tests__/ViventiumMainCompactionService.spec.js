@@ -4576,3 +4576,263 @@ describe('resumed fidelity checkpoint during foreground cancellation', () => {
     },
   );
 });
+
+describe('durable shrinking size continuation through the existing idle owner', () => {
+  test('retains two completed size corrections across a bounded batch before review and promotion', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    jest.setSystemTime(1000000);
+    const scheduling = require('@librechat/api');
+    scheduling.resetMainCompactionSchedulingForTests();
+    const valid = {
+      version: 1,
+      summary: 'The task and its permission constraint remain pending.',
+      pendingAsks: [],
+      commitments: [],
+      corrections: [],
+      decisions: [],
+      durableIdentifiers: [],
+      recurrenceOutcomes: [],
+      toolPairs: [],
+    };
+    const outputContract = {
+      version: 1,
+      consumer: 'accepted_core',
+      carrierMaxUtf8Bytes: 131072,
+      reservedUtf8Bytes: 55221,
+      maxJsonUtf8Bytes: 75851,
+      maxSummaryUtf8Bytes: 75851,
+      maxItemsPerArray: 32,
+      maxStringItemUtf8Bytes: 1024,
+      maxToolIdentityCharacters: 256,
+    };
+    const source = {
+      previousSemanticCompaction: {
+        ...valid,
+        summary: 'Retain the accepted permission constraint.',
+      },
+      sourceTurns: [],
+      legacyInputs: [
+        {
+          kind: 'legacy_state',
+          id: 'size-legacy-artifact',
+          sourceTurns: [
+            {
+              logicalTurnId: 'size-whole-turn',
+              revision: 1,
+              userText: 'Keep the task pending until permission is given.',
+              assistantText: 'Permission is still required.',
+              toolPairs: [],
+            },
+          ],
+          sourceRange: { artifactId: 'size-legacy-artifact', start: 5, end: 6, total: 42 },
+        },
+      ],
+    };
+    let pending = null;
+    let claims = 0;
+    const calls = [];
+    const completeCompaction = jest.fn(async () => {
+      pending = null;
+      return { status: 'compacted' };
+    });
+    const rejectCompaction = jest.fn(async (input) => {
+      pending = input.pendingCompactionRepair
+        ? { ...input.pendingCompactionRepair, outputContract }
+        : null;
+      return { status: 'rejected', ...(pending ? { repairPending: true } : {}) };
+    });
+    const args = {
+      ownerId: 'size-idle-owner',
+      agentId: 'main',
+      stableAuthoritySha256: 'a'.repeat(64),
+      trigger: 'accepted_turn',
+      executionBudget: { completionReserveMs: 0 },
+      agent: {
+        provider: 'native',
+        model_parameters: { model: 'synthetic', reasoning_effort: 'high' },
+      },
+      req: {
+        config: {
+          endpoints: {
+            agents: {
+              providerCapabilities: {
+                native: { workspace_binding: true, conversation_session: true },
+              },
+            },
+          },
+        },
+      },
+      claimCompaction: async () => ({
+        status: 'claimed',
+        leaseId: `size-idle-lease-${++claims}`,
+        domainEpochKey: 'size-idle-domain',
+        sourceDigest: 'd'.repeat(64),
+        sourceBytes: 120000,
+        canReduceSource: false,
+        ...structuredClone(source),
+        outputContract:
+          claims > 1
+            ? {
+                ...outputContract,
+                reservedUtf8Bytes: 55567,
+                maxJsonUtf8Bytes: 75505,
+                maxSummaryUtf8Bytes: 75505,
+              }
+            : outputContract,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+        ...(pending ? { pendingCompactionRepair: structuredClone(pending) } : {}),
+      }),
+      renewCompaction: async ({ expiresAt }) => ({ status: 'renewed', leaseExpiresAt: expiresAt }),
+      completeCompaction,
+      rejectCompaction,
+      executeCompactor: async (call) => {
+        calls.push(call);
+        expect(
+          await call.onNativeAdmission({
+            requestId: `size-native-${calls.length}`,
+            responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+          }),
+        ).toBe(true);
+        const duration = calls.length <= 2 ? 451000 : call.stage === 'review' ? 10000 : 45000;
+        await new Promise((resolve) => setTimeout(resolve, duration));
+        call.reportCapacityRelease(true);
+        if (call.stage === 'review') return reviewApproved;
+        return JSON.stringify(
+          calls.length <= 2
+            ? { ...valid, summary: 's'.repeat(calls.length === 1 ? 96000 : 93000) }
+            : valid,
+        );
+      },
+    };
+    try {
+      const running = ensureAcceptedMainCompaction(args);
+      await jest.advanceTimersByTimeAsync(902000);
+      expect(await running).toMatchObject({
+        status: 'degraded',
+        reason: 'compaction_enclosing_deadline',
+        attempts: 2,
+        repairPending: true,
+      });
+      expect(calls).toHaveLength(2);
+      expect(completeCompaction).not.toHaveBeenCalled();
+      expect(pending).toMatchObject({
+        semanticAttempts: 2,
+        transportRetries: 0,
+        correction: { code: 'schema_invalid', issue: { constraint: 'max_bytes', limit: 75851 } },
+      });
+      expect(pending.correction.candidate).toBeUndefined();
+      expect(jest.getTimerCount()).toBe(1);
+      await jest.advanceTimersByTimeAsync(30000 + 55000);
+      for (let index = 0; index < 12 && calls.length < 4; index++)
+        await new Promise((resolve) => setImmediate(resolve));
+      expect(calls.map((call) => call.stage || 'compaction')).toEqual([
+        'compaction',
+        'compaction',
+        'compaction',
+        'review',
+      ]);
+      expect(calls[2].attempt).toBe(3);
+      const payload = JSON.parse(
+        calls[2].prompt.match(
+          /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/,
+        )[1],
+      );
+      expect(payload.priorRejection).toMatchObject({
+        code: 'schema_invalid',
+        issue: { constraint: 'max_bytes', limit: 75505 },
+      });
+      expect(payload.outputConstraints.maxJsonUtf8Bytes).toBe(75505);
+      expect(payload.priorRejection.candidate).toBeUndefined();
+      expect(payload.previousSemanticCompaction).toEqual(source.previousSemanticCompaction);
+      expect(payload.legacyInputs).toEqual(source.legacyInputs);
+      expect(completeCompaction).toHaveBeenCalledTimes(1);
+      expect(pending).toBeNull();
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      scheduling.resetMainCompactionSchedulingForTests();
+      jest.useRealTimers();
+    }
+  });
+});
+
+describe('terminal size failure consumer', () => {
+  test.each(['nonconverging', 'exhausted'])(
+    'does not rerun the same source under a smaller allocation after %s size repair',
+    async (mode) => {
+      const scheduling = require('@librechat/api');
+      scheduling.resetMainCompactionSchedulingForTests();
+      const valid = {
+        version: 1,
+        summary: 'Permission remains required.',
+        pendingAsks: [],
+        commitments: [],
+        corrections: [],
+        decisions: [],
+        durableIdentifiers: [],
+        recurrenceOutcomes: [],
+        toolPairs: [],
+      };
+      let reserved = 55221;
+      const execute = jest.fn(async () =>
+        JSON.stringify({
+          ...valid,
+          summary: 's'.repeat(
+            mode === 'nonconverging' ? 96000 : 98000 - execute.mock.calls.length * 1000,
+          ),
+        }),
+      );
+      const complete = jest.fn();
+      const args = {
+        ownerId: `size-terminal-${mode}`,
+        agentId: 'main',
+        stableAuthoritySha256: 'f'.repeat(64),
+        agent: {
+          provider: 'native',
+          model_parameters: { model: 'synthetic', reasoning_effort: 'high' },
+        },
+        claimCompaction: async () => ({
+          status: 'claimed',
+          leaseId: 'terminal-size-lease',
+          domainEpochKey: `terminal-size-${mode}`,
+          sourceDigest: 'd'.repeat(64),
+          sourceBytes: 120000,
+          sourceTurns: [],
+          canReduceSource: false,
+          leaseExpiresAt: new Date(Date.now() + 300000),
+          outputContract: {
+            version: 1,
+            consumer: 'accepted_core',
+            carrierMaxUtf8Bytes: 131072,
+            reservedUtf8Bytes: reserved,
+            maxJsonUtf8Bytes: 131072 - reserved,
+            maxSummaryUtf8Bytes: 131072 - reserved,
+            maxItemsPerArray: 32,
+            maxStringItemUtf8Bytes: 1024,
+            maxToolIdentityCharacters: 256,
+          },
+        }),
+        executeCompactor: execute,
+        completeCompaction: complete,
+        rejectCompaction: jest.fn(async () => ({ status: 'rejected' })),
+      };
+      try {
+        expect(await ensureAcceptedMainCompaction(args)).toMatchObject({
+          status: 'degraded',
+          reason: 'schema_invalid',
+          attempts: mode === 'nonconverging' ? 2 : 4,
+        });
+        const calls = execute.mock.calls.length;
+        reserved += 100;
+        expect(await ensureAcceptedMainCompaction(args)).toMatchObject({
+          status: 'degraded',
+          reason: 'schema_invalid',
+          attempts: 0,
+        });
+        expect(execute).toHaveBeenCalledTimes(calls);
+        expect(complete).not.toHaveBeenCalled();
+      } finally {
+        scheduling.resetMainCompactionSchedulingForTests();
+      }
+    },
+  );
+});

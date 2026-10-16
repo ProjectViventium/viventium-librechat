@@ -163,10 +163,25 @@ const compactionRepairSchema = new Schema<IMainContinuityCompactionRepair>(
     sourceTurnKeys: { type: [String], required: true },
     legacySourceRange: { type: legacySourceRangeSchema, default: undefined },
     outputContract: { type: outputContractSchema, default: undefined },
+    sizeRepair: { type: new Schema({
+      proposalBytes: { type: Number, required: true, min: 1 },
+      previousProposalBytes: { type: Number, required: true, min: 1 },
+      converging: { type: Boolean, required: true, enum: [true] },
+    }, { _id: false }), required: function () { return this.correction?.code === 'schema_invalid'; } },
     correction: {
       type: new Schema({
-        code: { type: String, required: true, enum: ['semantic_fidelity'] },
-        candidate: { type: String, required: true },
+        code: { type: String, required: true, enum: ['semantic_fidelity', 'schema_invalid'] },
+        candidate: { type: String, required: function () { return this.code === 'semantic_fidelity'; } },
+        issue: { type: new Schema({
+          path: { type: String, enum: ['', 'summary', '$carrier'], default: '' },
+          constraint: { type: String, required: true, enum: ['max_bytes'] },
+          actual: { type: Number, required: true, min: 1 },
+          limit: { type: Number, required: true, min: 1 },
+          unit: { type: String, required: true, enum: ['utf8_bytes'] },
+          proposalBytes: { type: Number, required: true, min: 1 },
+          excessBytes: { type: Number, min: 1 },
+          fieldBytes: { type: Map, of: Number },
+        }, { _id: false }), required: function () { return this.code === 'schema_invalid'; } },
         reason: { type: String, maxlength: 2000 },
       }, { _id: false }),
       required: true,

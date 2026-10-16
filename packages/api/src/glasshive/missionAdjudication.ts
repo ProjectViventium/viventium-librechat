@@ -380,7 +380,7 @@ const LEGACY_DELIVERY_PARENT_REDRIVE_VERSION = 1;
 const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
 const conversationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const conversationFlushes = new Map<string, Promise<RuntimeRecord>>();
-const conversationReschedules = new Set<string>();
+const conversationReschedules = new Map<string, boolean>();
 
 function terminalCallbackResultModel(): Model<IGlassHiveTerminalCallbackResult> {
   return getTerminalCallbackResultModel();
@@ -704,38 +704,56 @@ async function persistGlassHiveMissionEvidence({
   return row;
 }
 
+function flushConversationAdjudication(
+  owner: string,
+  conversation: string,
+  pinnedOnly: boolean,
+): void {
+  const key = JSON.stringify([owner, conversation]);
+  if (conversationFlushes.has(key)) {
+    // A matured collection window includes new rows; a ready wake cannot narrow that pass.
+    conversationReschedules.set(key, (conversationReschedules.get(key) ?? true) && pinnedOnly);
+    return;
+  }
+  const flush = Promise.resolve().then(() =>
+    flushGlassHiveMissionAdjudications({ ownerId: owner, conversationId: conversation }, pinnedOnly),
+  );
+  conversationFlushes.set(key, flush);
+  flush
+    .catch((error: RuntimeError) => {
+      logger.warn('[VIVENTIUM][glasshive-adjudication] Conversation flush failed', {
+        code: safeText(error?.code || error?.name || 'flush_failed', 120),
+      });
+    })
+    .finally(() => {
+      if (conversationFlushes.get(key) !== flush) return;
+      conversationFlushes.delete(key);
+      const next = conversationReschedules.get(key);
+      conversationReschedules.delete(key);
+      if (next !== undefined) flushConversationAdjudication(owner, conversation, next);
+    });
+}
+
 function scheduleConversationAdjudication(ownerId: unknown, conversationId: unknown): void {
   const owner = safeText(ownerId, 160);
   if (!owner) return;
   const conversation = safeText(conversationId, 160);
-  // All surfaces and groups sharing Main history retain one lane. Unbound legacy rows share
-  // the owner's fallback lane; another conversation must not wait behind its provider retry.
+  // Initial collection keeps its own timer, including while a ready group uses the same lane.
   const key = JSON.stringify([owner, conversation]);
-  if (conversationFlushes.has(key)) {
-    conversationReschedules.add(key);
-    return;
-  }
   if (conversationTimers.has(key)) return;
   const timer = setTimeout(() => {
     conversationTimers.delete(key);
-    const flush = Promise.resolve().then(() =>
-      flushGlassHiveMissionAdjudications({ ownerId: owner, conversationId: conversation }),
-    );
-    conversationFlushes.set(key, flush);
-    flush
-      .catch((error: RuntimeError) => {
-        logger.warn('[VIVENTIUM][glasshive-adjudication] Conversation flush failed', {
-          code: safeText(error?.code || error?.name || 'flush_failed', 120),
-        });
-      })
-      .finally(() => {
-        if (conversationFlushes.get(key) !== flush) return;
-        conversationFlushes.delete(key);
-        if (conversationReschedules.delete(key)) scheduleConversationAdjudication(owner, conversation);
-      });
+    flushConversationAdjudication(owner, conversation, false);
   }, COALESCE_MS);
   timer.unref?.();
   conversationTimers.set(key, timer);
+}
+
+function wakeGlassHiveMissionAdjudications({ ownerId, conversationId }: GlassHiveMissionLimitInput): void {
+  const owner = safeText(ownerId, 160);
+  if (!owner) return;
+  // Main readiness does not reopen an already pinned group's collection window.
+  flushConversationAdjudication(owner, safeText(conversationId, 160), true);
 }
 
 async function enqueueGlassHiveMissionAdjudication({
@@ -1918,13 +1936,14 @@ async function flushGlassHiveMissionAdjudications({
   ownerId,
   conversationId,
   limit = 50,
-}: GlassHiveMissionLimitInput = {}): Promise<GlassHiveMissionFlushSummary> {
+}: GlassHiveMissionLimitInput = {}, pinnedOnly = false): Promise<GlassHiveMissionFlushSummary> {
   const key = safeText(ownerId, 160);
   if (!key) return { claimed: 0, groups: 0, visible: 0, silent: 0, failed: 0 };
   const cursor = collection()
     .find({
       ownerId: key,
       state: 'pending',
+      ...(pinnedOnly ? { adjudicationGroupId: { $type: 'string', $ne: '' } } : {}),
       ...(conversationId === undefined ? {} : {
         conversationId: safeText(conversationId, 160) || { $in: ['', null] },
       }),
@@ -1985,8 +2004,10 @@ async function flushGlassHiveMissionAdjudications({
           if (typeof preparedFollowUp.currentMainReadyAfterRelease === 'function') {
             try {
               if (await preparedFollowUp.currentMainReadyAfterRelease()) {
-                scheduleConversationAdjudication(rows[0].ownerId,
-                  (target as RuntimeRecord | null)?.conversationId);
+                wakeGlassHiveMissionAdjudications({
+                  ownerId: rows[0].ownerId,
+                  conversationId: (target as RuntimeRecord | null)?.conversationId,
+                });
               }
             } catch {
               dependencies.logger?.warn?.('[MissionAdjudication] Main readiness remains pending');
@@ -2346,8 +2367,7 @@ function clearAdjudicationTimersForTests(): void {
 
 return {
   COALESCE_MS,
-  wakeGlassHiveMissionAdjudications: ({ ownerId, conversationId }: GlassHiveMissionLimitInput) =>
-    scheduleConversationAdjudication(ownerId, conversationId),
+  wakeGlassHiveMissionAdjudications,
   clearAdjudicationTimersForTests,
   enqueueGlassHiveMissionAdjudication,
   flushGlassHiveMissionAdjudications,

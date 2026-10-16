@@ -4777,6 +4777,9 @@ describe('/api/viventium/telegram', () => {
       conversationId: 'conv-1',
       'metadata.viventium.parentMessageId': 'msg-1',
       'metadata.viventium.type': 'cortex_followup',
+      'metadata.viventium.followUpSource': {
+        $nin: ['durable_terminal_callback', 'durable_work_callback'],
+      },
     });
   });
 

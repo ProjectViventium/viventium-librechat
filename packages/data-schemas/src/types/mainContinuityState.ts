@@ -77,7 +77,18 @@ export interface IMainCompactionOutputContract {
   maxToolIdentityCharacters: number;
 }
 
-/** Unaccepted fidelity repair retained by the existing epoch/lease owner, never delivered context. */
+export interface IMainContinuitySizeFeedback {
+  path: '' | 'summary' | '$carrier';
+  constraint: 'max_bytes';
+  actual: number;
+  limit: number;
+  unit: 'utf8_bytes';
+  proposalBytes: number;
+  excessBytes?: number;
+  fieldBytes?: Record<string, number>;
+}
+
+/** Unaccepted repair retained by the existing epoch/lease owner, never delivered context. */
 export interface IMainContinuityCompactionRepair {
   version: 1;
   sourceDigest: string;
@@ -88,7 +99,10 @@ export interface IMainContinuityCompactionRepair {
   sourceTurnKeys: string[];
   legacySourceRange?: IMainContinuityLegacySourceRange;
   outputContract?: IMainCompactionOutputContract;
-  correction: { code: 'semantic_fidelity'; candidate: string; reason?: string };
+  sizeRepair?: { proposalBytes: number; previousProposalBytes: number; converging: true };
+  correction:
+    | { code: 'semantic_fidelity'; candidate: string; reason?: string }
+    | { code: 'schema_invalid'; issue: IMainContinuitySizeFeedback; candidate?: never; reason?: never };
 }
 
 export interface IMainContinuityCompactionLease {

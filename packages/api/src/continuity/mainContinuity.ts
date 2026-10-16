@@ -25,6 +25,7 @@ import type {
   IMainContinuityBackgroundInput,
   IMainCompactionOutputContract,
   IMainContinuityCompactionRepair,
+  IMainContinuitySizeFeedback,
 } from '@librechat/data-schemas';
 
 export type MainCompactionOutputContract = IMainCompactionOutputContract;
@@ -280,6 +281,7 @@ const COMPACTION_SOURCE_BATCH_BYTES = 80 * 1024;
 /** Default whole-turn source target of one compaction claim. */
 export const MAIN_COMPACTION_SOURCE_TARGET_BYTES = COMPACTION_SOURCE_BATCH_BYTES;
 export const MAIN_COMPACTION_MAX_ATTEMPTS = 2;
+export const MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS = 4;
 export const MAIN_COMPACTION_MAX_TRANSPORT_RETRIES = 1;
 
 /**
@@ -363,6 +365,76 @@ function compactionLimits(value?: unknown) {
   return normalizeMainCompactionOutputContract(value) || {
     ...mainCompactionOutputConstraints, maxSummaryUtf8Bytes: MAX_SUMMARY_BYTES,
   };
+}
+
+/** Same native route and carrier, with no additional capacity for a failed size proposal. */
+export function compatibleMainCompactionSizeContract(previousKey: unknown, currentKey: unknown): boolean {
+  try {
+    const previous = JSON.parse(String(previousKey)), current = JSON.parse(String(currentKey));
+    if (!isRecord(previous) || !isRecord(current) ||
+        !['provider', 'model', 'effort'].every(key => typeof previous[key] === 'string' &&
+          previous[key] === current[key])) return false;
+    const before = normalizeMainCompactionOutputContract(previous.constraints);
+    const after = normalizeMainCompactionOutputContract(current.constraints);
+    return !!before && !!after && compatibleMainCompactionSizeAllocation(before, after);
+  } catch { return false; }
+}
+
+function compatibleMainCompactionSizeAllocation(before: MainCompactionOutputContract,
+  after: MainCompactionOutputContract): boolean {
+  return before.consumer === after.consumer && before.carrierMaxUtf8Bytes === after.carrierMaxUtf8Bytes &&
+    before.maxItemsPerArray === after.maxItemsPerArray &&
+    before.maxStringItemUtf8Bytes === after.maxStringItemUtf8Bytes &&
+    before.maxToolIdentityCharacters === after.maxToolIdentityCharacters &&
+    after.maxJsonUtf8Bytes <= before.maxJsonUtf8Bytes &&
+    after.maxSummaryUtf8Bytes <= before.maxSummaryUtf8Bytes;
+}
+
+/** Validate bounded size feedback without persisting or replaying an oversized draft. */
+export function normalizeMainCompactionSizeRepair(value: unknown, previousContract: unknown,
+  currentContract: unknown = previousContract): Pick<IMainContinuityCompactionRepair, 'correction' | 'sizeRepair'> | null {
+  if (!isRecord(value) || !isRecord(value.correction) || value.correction.code !== 'schema_invalid' ||
+      value.correction.candidate !== undefined || !isRecord(value.correction.issue) ||
+      !isRecord(value.sizeRepair)) return null;
+  const before = normalizeMainCompactionOutputContract(previousContract);
+  const after = normalizeMainCompactionOutputContract(currentContract);
+  if (!before || !after || !compatibleMainCompactionSizeAllocation(before, after)) return null;
+  const issue = value.correction.issue, state = value.sizeRepair;
+  const positive = (item: unknown): item is number => Number.isSafeInteger(item) && Number(item) > 0;
+  if (!positive(state.proposalBytes) || !positive(state.previousProposalBytes) ||
+      state.previousProposalBytes <= state.proposalBytes || state.converging !== true ||
+      issue.constraint !== 'max_bytes' || issue.unit !== 'utf8_bytes' ||
+      !['', 'summary', '$carrier'].includes(String(issue.path)) ||
+      !positive(issue.actual) || !positive(issue.limit) || issue.actual <= issue.limit ||
+      (issue.proposalBytes !== undefined && issue.proposalBytes !== state.proposalBytes)) return null;
+  const path = issue.path as IMainContinuitySizeFeedback['path'];
+  const priorLimit = path === '' ? before.maxJsonUtf8Bytes :
+    path === 'summary' ? before.maxSummaryUtf8Bytes : before.carrierMaxUtf8Bytes;
+  const priorExcess = path === 'summary' && state.proposalBytes > before.maxJsonUtf8Bytes
+    ? state.proposalBytes - before.maxJsonUtf8Bytes : issue.actual - issue.limit;
+  if ((issue.excessBytes !== undefined && issue.excessBytes !== priorExcess) || issue.limit !== priorLimit ||
+      (path === '' && issue.actual !== state.proposalBytes) ||
+      (path === 'summary' && issue.actual >= state.proposalBytes) ||
+      (path === '$carrier' && issue.actual < state.proposalBytes)) return null;
+  let fieldBytes: Record<string, number> | undefined;
+  if (issue.fieldBytes !== undefined) {
+    if (!isRecord(issue.fieldBytes) || Object.keys(issue.fieldBytes).length !== MAIN_COMPACTION_FIELDS.length ||
+        !MAIN_COMPACTION_FIELDS.every(key => positive((issue.fieldBytes as UnknownRecord)[key]))) return null;
+    fieldBytes = issue.fieldBytes as Record<string, number>;
+    const calculated = MAIN_COMPACTION_FIELDS.reduce((total, key) => total + fieldBytes![key] +
+      Buffer.byteLength(JSON.stringify(key)) + 1, 2 + MAIN_COMPACTION_FIELDS.length - 1);
+    if (calculated !== state.proposalBytes) return null;
+  }
+  const limit = path === '' ? after.maxJsonUtf8Bytes :
+    path === 'summary' ? after.maxSummaryUtf8Bytes : after.carrierMaxUtf8Bytes;
+  const feedback: IMainContinuitySizeFeedback = { path, constraint: 'max_bytes', actual: issue.actual,
+    limit, unit: 'utf8_bytes', proposalBytes: state.proposalBytes,
+    excessBytes: path === 'summary' && state.proposalBytes > after.maxJsonUtf8Bytes
+      ? state.proposalBytes - after.maxJsonUtf8Bytes : issue.actual - limit,
+    ...(fieldBytes ? { fieldBytes } : {}) };
+  return { correction: { code: 'schema_invalid', issue: feedback },
+    sizeRepair: { proposalBytes: state.proposalBytes, previousProposalBytes: state.previousProposalBytes,
+      converging: true } };
 }
 
 /** Exact escaping cost, including Core's stored server provenance. */
@@ -2198,6 +2270,7 @@ export function createMainContinuityService(
       const outputContract = repairSource?.sourceDigest === sourceDigest && repairContract &&
         repairContract.consumer === currentOutputContract.consumer &&
         repairContract.carrierMaxUtf8Bytes === currentOutputContract.carrierMaxUtf8Bytes
+        && repairSource?.correction.code !== 'schema_invalid'
         ? repairContract : currentOutputContract;
       const smallerTarget = Math.max(1, Math.floor(bytes / 2));
       const smallerLegacy = await legacySource(identity, cache, undefined, smallerTarget);
@@ -2390,57 +2463,68 @@ export function createMainContinuityService(
       // Only a completed, released fidelity attempt can cross an idle-batch boundary. The
       // existing epoch CAS owns this unaccepted draft; it is never part of delivered context.
       const previousRepair = current.pendingCompactionRepair;
+      const preservedSize = previousRepair && normalizeMainCompactionSizeRepair(previousRepair,
+        previousRepair.outputContract, current.compactionLease.outputContract);
+      const sizeContractMatches = !!preservedSize &&
+        compatibleMainCompactionSizeContract(previousRepair?.contractKey, input.contractKey);
       const preserveRepair = ['interactive_priority', 'compaction_cancelled'].includes(String(input.reason)) &&
         input.capacityReleaseAcknowledged === true && previousRepair?.version === 1 &&
         input.sourceDigest === current.compactionLease.sourceDigest &&
         previousRepair.sourceDigest === current.compactionLease.sourceDigest &&
-        input.contractKey === previousRepair.contractKey &&
+        (input.contractKey === previousRepair.contractKey || sizeContractMatches) &&
         previousRepair.sourceGeneration === current.compactionLease.sourceGeneration &&
         contentDigest(previousRepair.sourceTurnKeys) === contentDigest(current.compactionLease.sourceTurnKeys) &&
         contentDigest(previousRepair.legacySourceRange || null) ===
           contentDigest(current.compactionLease.legacySourceRange || null) &&
-        mainCompactionOutputContractDigest(previousRepair.outputContract) ===
-          mainCompactionOutputContractDigest(current.compactionLease.outputContract) &&
+        (mainCompactionOutputContractDigest(previousRepair.outputContract) ===
+          mainCompactionOutputContractDigest(current.compactionLease.outputContract) || sizeContractMatches) &&
         input.semanticAttempts === previousRepair.semanticAttempts &&
         input.transportRetries === previousRepair.transportRetries &&
-        previousRepair.semanticAttempts > 0 && previousRepair.semanticAttempts < MAIN_COMPACTION_MAX_ATTEMPTS;
+        previousRepair.semanticAttempts > 0 && previousRepair.semanticAttempts <
+          (preservedSize ? MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS : MAIN_COMPACTION_MAX_ATTEMPTS);
       // Foreground pre-emption can stop a resumed attempt before it produces another candidate.
       // Keep the earlier completed review unchanged; this does not schedule cancelled work again.
       let pendingCompactionRepair: IMainContinuityCompactionRepair | null =
         preserveRepair ? previousRepair : null;
       const repair = recordFrom(input.pendingCompactionRepair);
       const correction = recordFrom(repair.correction);
+      const sizeFeedback = normalizeMainCompactionSizeRepair(repair, current.compactionLease.outputContract);
+      const fidelityFeedback = correction.code === 'semantic_fidelity' &&
+        typeof correction.candidate === 'string' && (correction.reason === undefined ||
+          (typeof correction.reason === 'string' && correction.reason.length <= 2000));
       if (input.reason === 'compaction_enclosing_deadline' &&
           input.capacityReleaseAcknowledged === true &&
           new Date(current.compactionLease.expiresAt).getTime() > Date.now() &&
           repair.version === 1 && repair.sourceDigest === current.compactionLease.sourceDigest &&
           typeof repair.contractKey === 'string' && repair.contractKey.length > 0 &&
           repair.contractKey.length <= 4096 &&
-          Number.isSafeInteger(repair.semanticAttempts) && Number(repair.semanticAttempts) > 0 &&
-          Number(repair.semanticAttempts) < MAIN_COMPACTION_MAX_ATTEMPTS &&
+          Number.isSafeInteger(repair.semanticAttempts) && Number(repair.semanticAttempts) >= (sizeFeedback ? 2 : 1) &&
+          Number(repair.semanticAttempts) < (sizeFeedback ? MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS : MAIN_COMPACTION_MAX_ATTEMPTS) &&
           Number.isSafeInteger(repair.transportRetries) && Number(repair.transportRetries) >= 0 &&
           Number(repair.transportRetries) <= MAIN_COMPACTION_MAX_TRANSPORT_RETRIES &&
-          correction.code === 'semantic_fidelity' && typeof correction.candidate === 'string' &&
-          (correction.reason === undefined || (typeof correction.reason === 'string' &&
-            correction.reason.length <= 2000))) {
-        try {
-          const prepared = inspectMainCompactionCandidate(JSON.parse(correction.candidate),
-            current.compactionLease.outputContract);
-          if (prepared.ok && Buffer.byteLength(correction.candidate, 'utf8') <=
-              (current.compactionLease.outputContract || mainCompactionOutputConstraints).maxJsonUtf8Bytes)
-            pendingCompactionRepair = {
-              version: 1, sourceDigest: String(repair.sourceDigest), contractKey: repair.contractKey,
-              semanticAttempts: Number(repair.semanticAttempts), transportRetries: Number(repair.transportRetries),
-              sourceGeneration: current.compactionLease.sourceGeneration || 0,
-              sourceTurnKeys: [...current.compactionLease.sourceTurnKeys],
-              ...(current.compactionLease.legacySourceRange
-                ? { legacySourceRange: current.compactionLease.legacySourceRange } : {}),
-              ...(current.compactionLease.outputContract
-                ? { outputContract: current.compactionLease.outputContract } : {}),
-              correction: { code: 'semantic_fidelity', candidate: correction.candidate,
-                ...(typeof correction.reason === 'string' ? { reason: correction.reason } : {}) },
-            };
-        } catch { /* Malformed or oversized drafts are not retained for replay. */ }
+          (sizeFeedback || fidelityFeedback)) {
+        const retained = {
+          version: 1 as const, sourceDigest: String(repair.sourceDigest), contractKey: repair.contractKey,
+          semanticAttempts: Number(repair.semanticAttempts), transportRetries: Number(repair.transportRetries),
+          sourceGeneration: current.compactionLease.sourceGeneration || 0,
+          sourceTurnKeys: [...current.compactionLease.sourceTurnKeys],
+          ...(current.compactionLease.legacySourceRange
+            ? { legacySourceRange: current.compactionLease.legacySourceRange } : {}),
+          ...(current.compactionLease.outputContract
+            ? { outputContract: current.compactionLease.outputContract } : {}),
+        };
+        if (sizeFeedback) pendingCompactionRepair = { ...retained, ...sizeFeedback };
+        else {
+          try {
+            const candidate = String(correction.candidate);
+            const prepared = inspectMainCompactionCandidate(JSON.parse(candidate), current.compactionLease.outputContract);
+            if (prepared.ok && Buffer.byteLength(candidate, 'utf8') <=
+                (current.compactionLease.outputContract || mainCompactionOutputConstraints).maxJsonUtf8Bytes)
+              pendingCompactionRepair = { ...retained,
+                correction: { code: 'semantic_fidelity', candidate,
+                  ...(typeof correction.reason === 'string' ? { reason: correction.reason } : {}) } };
+          } catch { /* Malformed or oversized drafts are not retained for replay. */ }
+        }
       }
       if (
         await persistence().compareAndSwap(identity.domainEpochKey, current.version, {

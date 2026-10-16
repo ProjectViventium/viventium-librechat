@@ -13,6 +13,8 @@ import { createGlassHiveTerminalCallbackTransactionService } from '../glasshive/
 import {
   createMainContinuityService,
   prepareMainCompactionCandidate,
+  inspectMainCompactionCandidate,
+  normalizeMainCompactionSizeRepair,
   mainCompactionCandidateDigest,
   mainCompactionOutputContractDigest,
 } from './mainContinuity';
@@ -259,6 +261,36 @@ describe('native Main acceptance projection', () => {
     expect(promoted?.summarizedThrough).toBeGreaterThan(0);
     expect(promoted?.semanticCompaction?.summary).toBe(valid.summary);
     expect((await history()).count).toBe(4);
+  });
+
+  it('round-trips numeric size progress through Mongo without publishing or dropping accepted source', async () => {
+    const runtime = service();
+    for (let n = 0; n < 4; n++) await runtime.commitAcceptedMainTurn(await presentation(`size-${n}`));
+    const claim = await runtime.claimAcceptedMainCompaction(identity);
+    const contract = claim.outputContract as { maxJsonUtf8Bytes: number };
+    const candidate = { version: 1, summary: 'x'.repeat(contract.maxJsonUtf8Bytes + 1000),
+      pendingAsks: [], commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+      recurrenceOutcomes: [], toolPairs: [] };
+    const inspected = inspectMainCompactionCandidate(candidate, contract);
+    if (inspected.ok) throw new Error('Expected synthetic size rejection');
+    const proposalBytes = Buffer.byteLength(JSON.stringify(candidate));
+    const repair = { version: 1, sourceDigest: claim.sourceDigest,
+      contractKey: JSON.stringify({ provider: 'native', model: 'synthetic', effort: 'high', constraints: contract }),
+      semanticAttempts: 2, transportRetries: 0,
+      correction: { code: 'schema_invalid', issue: inspected.issue },
+      sizeRepair: { proposalBytes, previousProposalBytes: proposalBytes + 3000, converging: true } };
+    expect(await runtime.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
+    const retained = await states().findOne({ domainEpochKey: claim.domainEpochKey }).lean();
+    expect(retained?.semanticCompaction).toBeNull();
+    expect(retained?.pendingCompactionRepair?.correction.candidate).toBeUndefined();
+    expect(normalizeMainCompactionSizeRepair(retained?.pendingCompactionRepair, contract)).not.toBeNull();
+    expect((await history()).count).toBe(4);
+    const next = await runtime.claimAcceptedMainCompaction(identity);
+    expect(next.sourceDigest).toBe(claim.sourceDigest);
+    expect(next.pendingCompactionRepair).toMatchObject({ semanticAttempts: 2 });
+    expect((await runtime.loadAcceptedMainContext(identity)).capsule).toContain('Valid request size-0.');
   });
 
   it('hydrates retained scheduled results from exact typed parent provenance without user authority', async () => {

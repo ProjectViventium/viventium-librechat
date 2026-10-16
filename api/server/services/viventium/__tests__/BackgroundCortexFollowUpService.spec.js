@@ -2978,3 +2978,40 @@ describe('durable per-result user provenance', () => {
     }
   });
 });
+
+describe('canonical written details in Voice follow-up', () => {
+  const input = {
+    insights: [
+      {
+        cortexName: 'Verified result',
+        insight: 'Example reference page: https://docs.example.test/guide',
+      },
+    ],
+    userRequest: 'Give me the verified page title and address.',
+    voiceMode: true,
+    surface: 'voice',
+    voiceProvider: 'xai',
+  };
+  test('uses the same canonical Voice contract instead of offering the requested details again', () => {
+    const rules = require('../surfacePrompts').buildVoiceModeInstructions('xai');
+    const rendered = formatFollowUpPrompt(input);
+    expect(rendered).toContain(rules);
+    expect(rendered).toContain(
+      'Include requested URLs and email addresses in the written reply without asking again.',
+    );
+    expect(rendered).not.toContain('say you can send the details');
+    expect(rendered).toContain('{NTA}');
+  });
+  test('retains the explicit follow-up override as its sole voice rule owner', () => {
+    const previous = process.env.VIVENTIUM_VOICE_FOLLOWUP_RULES;
+    try {
+      process.env.VIVENTIUM_VOICE_FOLLOWUP_RULES = 'EXPLICIT FOLLOW-UP RULE';
+      const rendered = formatFollowUpPrompt(input);
+      expect(rendered).toContain('EXPLICIT FOLLOW-UP RULE');
+      expect(rendered).not.toContain('Include requested URLs and email addresses');
+    } finally {
+      if (previous === undefined) delete process.env.VIVENTIUM_VOICE_FOLLOWUP_RULES;
+      else process.env.VIVENTIUM_VOICE_FOLLOWUP_RULES = previous;
+    }
+  });
+});

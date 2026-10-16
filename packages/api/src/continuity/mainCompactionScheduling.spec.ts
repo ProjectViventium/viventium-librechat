@@ -23,7 +23,7 @@ import {
   retainExternalAcceptanceCompaction,
   scheduleExternallyAcceptedMainCompaction,
 } from './mainCompactionScheduling';
-import { MAIN_COMPACTION_SOURCE_TARGET_BYTES } from './mainContinuity';
+import { MAIN_COMPACTION_SOURCE_TARGET_BYTES, createMainCompactionOutputContract } from './mainContinuity';
 import type { MainCompactionStructuralIssue } from './mainContinuity';
 
 describe('Main compaction after external acceptance', () => {
@@ -796,5 +796,28 @@ describe('bounded idle whole-source size recovery', () => {
         else now = 2000;
       } });
     expect(run).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('terminal size exhaustion under monotone allocation', () => {
+  const key = (reserved: number, model = 'synthetic', consumer: 'accepted_core' | 'conversation_legacy' = 'accepted_core') =>
+    JSON.stringify({ provider: 'native', model, effort: 'high', constraints:
+      createMainCompactionOutputContract({ consumer, carrierMaxUtf8Bytes: 131072, reservedUtf8Bytes: reserved }) });
+  test('suppresses only compatible equal or tighter allocations after true size exhaustion', () => {
+    const failure = { domainEpochKey: 'size-exhausted', sourceDigest: 'same-source',
+      contractKey: key(55000), reason: 'schema_invalid', sizeExhausted: true };
+    expect(rememberFailedMainCompaction(failure)).toBe(true);
+    expect(repeatedFailedMainCompaction({ ...failure, contractKey: key(55000) })).toBe('schema_invalid');
+    expect(repeatedFailedMainCompaction({ ...failure, contractKey: key(56000) })).toBe('schema_invalid');
+    expect(repeatedFailedMainCompaction({ ...failure, contractKey: key(54000) })).toBeNull();
+    expect(repeatedFailedMainCompaction({ ...failure, contractKey: key(56000, 'different') })).toBeNull();
+    expect(repeatedFailedMainCompaction({ ...failure, contractKey: key(56000, 'synthetic', 'conversation_legacy') })).toBeNull();
+    expect(repeatedFailedMainCompaction({ ...failure, sourceDigest: 'changed-source', contractKey: key(56000) })).toBeNull();
+    forgetFailedMainCompaction(failure.domainEpochKey);
+    expect(rememberFailedMainCompaction({ ...failure, sizeExhausted: false,
+      reason: 'compaction_enclosing_deadline' })).toBe(true);
+    expect(repeatedFailedMainCompaction({ ...failure, contractKey: key(56000) })).toBeNull();
+    forgetFailedMainCompaction(failure.domainEpochKey);
   });
 });

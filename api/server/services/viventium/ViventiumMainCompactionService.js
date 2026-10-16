@@ -10,6 +10,8 @@ const crypto = require('crypto');
 const { HumanMessage } = require('@langchain/core/messages');
 const {
   inspectMainCompactionCandidate,
+  normalizeMainCompactionSizeRepair,
+  compatibleMainCompactionSizeContract,
   compareMainCompactionToolIdentities,
   createMainCompactionStageLease,
   resolveMainCompactionAgent,
@@ -617,21 +619,30 @@ async function runAcceptedMainCompaction(input = {}) {
     }
     const contractKey = compactionContractKey(input.agent, claim.outputContract);
     const pendingRepair = claim.pendingCompactionRepair;
+    const pendingSize = normalizeMainCompactionSizeRepair(
+      pendingRepair,
+      pendingRepair?.outputContract,
+      claim.outputContract,
+    );
     if (
       pendingRepair?.version === 1 &&
       pendingRepair.sourceDigest === claim.sourceDigest &&
-      pendingRepair.contractKey === contractKey &&
+      (pendingRepair.contractKey === contractKey ||
+        (pendingSize &&
+          compatibleMainCompactionSizeContract(pendingRepair.contractKey, contractKey))) &&
       Number.isSafeInteger(pendingRepair.semanticAttempts) &&
       pendingRepair.semanticAttempts > 0 &&
-      pendingRepair.semanticAttempts < MAX_ATTEMPTS &&
+      pendingRepair.semanticAttempts <
+        (pendingSize ? MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS : MAX_ATTEMPTS) &&
       Number.isSafeInteger(pendingRepair.transportRetries) &&
       pendingRepair.transportRetries >= 0 &&
       pendingRepair.transportRetries <= MAX_TRANSPORT_RETRIES &&
-      pendingRepair.correction?.code === 'semantic_fidelity'
+      (pendingRepair.correction?.code === 'semantic_fidelity' || pendingSize)
     ) {
       semanticAttempts = pendingRepair.semanticAttempts;
       transportRetries = pendingRepair.transportRetries;
-      correctionReason = pendingRepair.correction;
+      correctionReason = pendingSize?.correction || pendingRepair.correction;
+      if (pendingSize) sizeRepair = pendingSize.sizeRepair;
     }
     const effectiveLeaseExpiry = () =>
       Number.isFinite(deadlineMs)
@@ -1091,15 +1102,29 @@ async function runAcceptedMainCompaction(input = {}) {
         sourceDigest: claim.sourceDigest,
         contractKey,
         reason: finalReason,
+        sizeExhausted:
+          correctionReason?.code === 'schema_invalid' &&
+          correctionReason.issue?.constraint === 'max_bytes' &&
+          ['', 'summary', '$carrier'].includes(correctionReason.issue.path) &&
+          (sizeRepair?.converging === false ||
+            semanticAttempts >= MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS),
       });
     }
+    const pendingSizeFeedback = normalizeMainCompactionSizeRepair(
+      {
+        correction: correctionReason,
+        sizeRepair,
+      },
+      claim.outputContract,
+    );
     const canContinueRepair =
       terminalReason === 'compaction_enclosing_deadline' &&
       active.capacityReleaseAcknowledged === true &&
       !controller.signal.aborted &&
-      semanticAttempts > 0 &&
-      semanticAttempts < MAX_ATTEMPTS &&
-      correctionReason?.code === 'semantic_fidelity';
+      semanticAttempts >= (pendingSizeFeedback ? 2 : 1) &&
+      semanticAttempts <
+        (pendingSizeFeedback ? MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS : MAX_ATTEMPTS) &&
+      (correctionReason?.code === 'semantic_fidelity' || pendingSizeFeedback);
     const rejected = await rejectCompaction({
       ...input,
       leaseId: claim.leaseId,
@@ -1117,12 +1142,14 @@ async function runAcceptedMainCompaction(input = {}) {
               contractKey,
               semanticAttempts,
               transportRetries,
-              correction: {
-                ...correctionReason,
-                candidate: JSON.stringify(
-                  parseSemanticCompactionOutput(correctionReason.candidate),
-                ),
-              },
+              ...(pendingSizeFeedback || {
+                correction: {
+                  ...correctionReason,
+                  candidate: JSON.stringify(
+                    parseSemanticCompactionOutput(correctionReason.candidate),
+                  ),
+                },
+              }),
             },
           }
         : {}),

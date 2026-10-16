@@ -149,3 +149,17 @@ test('persists the typed pending repair separately from accepted semantic contex
     ...pendingCompactionRepair, correction: { ...pendingCompactionRepair.correction, code: 'schema_invalid' },
   } }).validate()).rejects.toThrow();
 });
+
+
+test('retains numeric size feedback without an oversized candidate or accepted summary', async () => {
+  const pendingCompactionRepair = { version: 1, sourceDigest: 'd'.repeat(64),
+    contractKey: 'exact-route-contract', semanticAttempts: 2, transportRetries: 0,
+    sourceGeneration: 2, sourceTurnKeys: ['source:1'],
+    sizeRepair: { proposalBytes: 94000, previousProposalBytes: 96000, converging: true },
+    correction: { code: 'schema_invalid', issue: { path: '', constraint: 'max_bytes',
+      actual: 94000, limit: 75000, proposalBytes: 94000, excessBytes: 19000, unit: 'utf8_bytes' } } };
+  const document = new ContinuityState({ ...validState, pendingCompactionRepair });
+  await expect(document.validate()).resolves.toBeUndefined();
+  expect(document.toObject().pendingCompactionRepair).toEqual(pendingCompactionRepair);
+  expect(document.toObject().semanticCompaction).toBeNull();
+});

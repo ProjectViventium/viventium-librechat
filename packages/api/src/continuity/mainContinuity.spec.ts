@@ -10,6 +10,8 @@ import {
   withMainContinuityCallbacks,
   prepareMainCompactionCandidate,
   inspectMainCompactionCandidate,
+  normalizeMainCompactionSizeRepair,
+  compatibleMainCompactionSizeContract,
   compareMainCompactionToolIdentities,
   mainCompactionOutputConstraints,
   mainCompactionCandidateDigest,
@@ -2383,4 +2385,96 @@ describe('foreground pre-emption of an existing fidelity repair', () => {
         expect((next.pendingCompactionRepair as { semanticAttempts: number }).semanticAttempts).toBe(1);
       }
     });
+});
+
+
+describe('durable numeric size feedback', () => {
+  const routeKey = (constraints: unknown) => JSON.stringify({ provider: 'native', model: 'synthetic',
+    effort: 'high', constraints });
+  const sizeFeedback = (contract: Record<string, unknown>) => {
+    const candidate = { ...faithful, summary: 's'.repeat(Number(contract.maxJsonUtf8Bytes) + 1000) };
+    const result = inspectMainCompactionCandidate(candidate, contract);
+    if (result.ok) throw new Error('Expected synthetic size rejection');
+    const bytes = Buffer.byteLength(JSON.stringify(candidate));
+    return { correction: { code: 'schema_invalid', issue: result.issue },
+      sizeRepair: { proposalBytes: bytes, previousProposalBytes: bytes + 3000, converging: true } };
+  };
+  test('retains numeric progress only, targets the current smaller carrier, then promotes after review', async () => {
+    const { service, identity, seed, states } = fixture();
+    const claim = await seed(), contract = claim.outputContract as Record<string, unknown>;
+    const repair = { version: 1, sourceDigest: claim.sourceDigest, contractKey: routeKey(contract),
+      semanticAttempts: 2, transportRetries: 0, ...sizeFeedback(contract) };
+    expect(await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
+    const saved = states.get(String(claim.domainEpochKey))!.pendingCompactionRepair!;
+    expect(saved).toMatchObject(repair);
+    expect(saved.correction.candidate).toBeUndefined();
+    const next = await service.claimAcceptedMainCompaction({ ...identity,
+      outputCarrier: { carrierMaxUtf8Bytes: contract.carrierMaxUtf8Bytes, reservedContextUtf8Bytes: 100 } });
+    const nextContract = next.outputContract as Record<string, number>;
+    expect(next.sourceDigest).toBe(claim.sourceDigest);
+    expect(nextContract.maxJsonUtf8Bytes).toBeLessThan(Number(contract.maxJsonUtf8Bytes));
+    const feedback = normalizeMainCompactionSizeRepair(saved, saved.outputContract, nextContract)!;
+    expect(feedback).not.toBeNull();
+    expect(feedback.correction).toMatchObject({ issue: { limit: nextContract.maxSummaryUtf8Bytes } });
+    expect(compatibleMainCompactionSizeContract(saved.contractKey, routeKey(nextContract))).toBe(true);
+    expect(await service.completeAcceptedMainCompaction({ ...identity, ...next,
+      semanticCompaction: faithful, semanticReview: { version: 1, approved: true,
+        sourceDigest: next.sourceDigest, candidateDigest: mainCompactionCandidateDigest(faithful),
+        outputContractDigest: mainCompactionOutputContractDigest(nextContract) } }))
+      .toMatchObject({ status: 'compacted' });
+    expect(states.get(String(claim.domainEpochKey))?.pendingCompactionRepair).toBeNull();
+  });
+  test.each(['source', 'attempts', 'release', 'not-shrinking', 'candidate', 'field-total', 'actual',
+    'limit', 'item', 'transport', 'lease'])(
+    'rejects unsafe numeric size feedback (%s)', async mode => {
+      const { service, identity, seed, states } = fixture();
+      const claim = await seed(), contract = claim.outputContract as Record<string, unknown>;
+      const repair = { version: 1, sourceDigest: claim.sourceDigest, contractKey: routeKey(contract),
+        semanticAttempts: 2, transportRetries: 0, ...sizeFeedback(contract) };
+      if (mode === 'source') repair.sourceDigest = 'e'.repeat(64);
+      if (mode === 'attempts') repair.semanticAttempts = 4;
+      if (mode === 'not-shrinking') repair.sizeRepair.previousProposalBytes = repair.sizeRepair.proposalBytes;
+      if (mode === 'candidate') Object.assign(repair.correction, { candidate: 'unaccepted' });
+      if (mode === 'field-total') repair.correction.issue.fieldBytes = { summary: 1 };
+      if (mode === 'actual') repair.correction.issue.actual = repair.correction.issue.limit;
+      if (mode === 'limit') repair.correction.issue.limit = 1;
+      if (mode === 'item') repair.correction.issue.path = 'pendingAsks.0';
+      if (mode === 'transport') repair.transportRetries = 2;
+      const result = await service.rejectAcceptedMainCompaction({ ...identity,
+        leaseId: mode === 'lease' ? 'wrong' : claim.leaseId, reason: 'compaction_enclosing_deadline',
+        capacityReleaseAcknowledged: mode !== 'release', pendingCompactionRepair: repair });
+      expect(result.repairPending).toBeUndefined();
+      expect(states.get(String(claim.domainEpochKey))?.pendingCompactionRepair).toBeNull();
+    });
+  test.each([true, false])('foreground pre-emption preserves size progress only after release=%s', async released => {
+    const { service, identity, seed, states } = fixture();
+    const claim = await seed(), contract = claim.outputContract as Record<string, unknown>;
+    const repair = { version: 1, sourceDigest: claim.sourceDigest, contractKey: routeKey(contract),
+      semanticAttempts: 2, transportRetries: 0, ...sizeFeedback(contract) };
+    await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true, pendingCompactionRepair: repair });
+    const before = states.get(String(claim.domainEpochKey))!.pendingCompactionRepair;
+    const next = await service.claimAcceptedMainCompaction({ ...identity,
+      outputCarrier: { carrierMaxUtf8Bytes: contract.carrierMaxUtf8Bytes, reservedContextUtf8Bytes: 100 } });
+    const result = await service.rejectAcceptedMainCompaction({ ...identity, leaseId: next.leaseId,
+      reason: 'interactive_priority', capacityReleaseAcknowledged: released,
+      sourceDigest: next.sourceDigest, contractKey: routeKey(next.outputContract),
+      semanticAttempts: 2, transportRetries: 0 });
+    expect(result.repairPending).toBe(released ? true : undefined);
+    expect(states.get(String(claim.domainEpochKey))!.pendingCompactionRepair).toEqual(released ? before : null);
+  });
+  test('distinguishes carrier bytes from proposal bytes without retaining a rejected body', () => {
+    const contract = createMainCompactionOutputContract({ consumer: 'accepted_core',
+      carrierMaxUtf8Bytes: 131072, reservedUtf8Bytes: 55221 })!;
+    const value = { correction: { code: 'schema_invalid', issue: { path: '$carrier',
+      constraint: 'max_bytes', unit: 'utf8_bytes', actual: 135000, limit: 131072,
+      proposalBytes: 74000, excessBytes: 3928 } },
+      sizeRepair: { proposalBytes: 74000, previousProposalBytes: 75000, converging: true } };
+    expect(normalizeMainCompactionSizeRepair(value, contract)?.correction).toEqual(value.correction);
+    expect(normalizeMainCompactionSizeRepair(value, { ...contract, consumer: 'conversation_legacy' }, contract)).toBeNull();
+    expect(normalizeMainCompactionSizeRepair(value, contract, { ...contract,
+      maxJsonUtf8Bytes: contract.maxJsonUtf8Bytes + 1 })).toBeNull();
+  });
 });

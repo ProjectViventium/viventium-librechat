@@ -109,6 +109,7 @@ const {
   buildTelegramTextInstructions,
   buildTelegramAudioOutputInstructions,
   buildPlaygroundTextInstructions,
+  buildVoiceModeInstructions,
   stripVoiceControlTagsForDisplay,
 } = require('~/server/services/viventium/surfacePrompts');
 const {
@@ -1527,20 +1528,12 @@ async function sleep(ms) {
 /* === VIVENTIUM NOTE ===
  * Feature: Voice follow-up prompt rules (speech-safe output).
  */
-function buildVoiceFollowUpRules() {
+function buildVoiceFollowUpRules(voiceProvider) {
   const override = (process.env.VIVENTIUM_VOICE_FOLLOWUP_RULES || '').trim();
   if (override) {
     return override;
   }
-  return [
-    'VOICE FOLLOW-UP RULES:',
-    '- This is spoken audio. Use short sentences.',
-    '- Do not output planning steps or numbered lists.',
-    '- Do not include tool instructions or API field names.',
-    '- Do not read URLs or email addresses aloud; say you can send the details.',
-    '- Use natural language for dates/times (no raw timestamps).',
-    '- Keep it to 1-3 sentences unless the user asked for more detail.',
-  ].join('\n');
+  return buildVoiceModeInstructions(voiceProvider);
 }
 /* === VIVENTIUM NOTE === */
 
@@ -2497,7 +2490,7 @@ function formatFollowUpPrompt({
   /* === VIVENTIUM NOTE ===
    * Feature: Voice follow-up prompt rules (speech-safe output).
    */
-  const voiceRules = voiceMode ? buildVoiceFollowUpRules() : '';
+  const voiceRules = voiceMode ? buildVoiceFollowUpRules(voiceProvider) : '';
   const telegramRules = surface === 'telegram' && !voiceMode ? buildTelegramTextInstructions() : '';
   const telegramAudioRules =
     surface === 'telegram' && !voiceMode && telegramAudioRequested

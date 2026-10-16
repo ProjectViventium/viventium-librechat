@@ -9,6 +9,8 @@
  * === VIVENTIUM END === */
 import {
   MAIN_COMPACTION_SOURCE_TARGET_BYTES,
+  MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS,
+  compatibleMainCompactionSizeContract,
   MAIN_COMPACTION_LEASE_MS,
   boundedMainCompactionSourceTarget,
   mainCompactionProposalBytes,
@@ -373,11 +375,12 @@ export function scheduleExternallyAcceptedMainCompaction(
   return entry.schedule(commitResult) === true;
 }
 
-export const MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS = 4;
+export { MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS } from './mainContinuity';
 
 export interface MainCompactionSizeRepairState {
   readonly proposalBytes: number | null;
   readonly converging: boolean;
+  readonly previousProposalBytes?: number;
 }
 
 /**
@@ -397,7 +400,7 @@ export function recordMainCompactionRejection(
     proposalBytes !== null &&
     (attempt === 1 ||
       (state?.converging === true && previous !== null && proposalBytes < previous));
-  return { proposalBytes, converging };
+  return { proposalBytes, converging, ...(previous !== null ? { previousProposalBytes: previous } : {}) };
 }
 
 /** Milliseconds left on the store-owned claim lease, never negative. */
@@ -536,7 +539,8 @@ export function mainCompactionSizeRepairBudget(input: {
  * === VIVENTIUM END === */
 const failedCompactions = new Map<
   string,
-  { readonly sourceDigest: string; readonly contractKey: string; readonly reason: string }
+  { readonly sourceDigest: string; readonly contractKey: string; readonly reason: string;
+    readonly sizeExhausted?: boolean }
 >();
 
 export function rememberFailedMainCompaction(input: {
@@ -544,13 +548,15 @@ export function rememberFailedMainCompaction(input: {
   sourceDigest: unknown;
   contractKey: unknown;
   reason: unknown;
+  sizeExhausted?: boolean;
 }): boolean {
   const domainEpochKey = String(input.domainEpochKey ?? '').trim();
   const sourceDigest = String(input.sourceDigest ?? '').trim();
   const contractKey = String(input.contractKey ?? '').trim();
   const reason = String(input.reason ?? '').trim();
   if (!domainEpochKey || !sourceDigest || !contractKey || !reason) return false;
-  failedCompactions.set(domainEpochKey, { sourceDigest, contractKey, reason });
+  failedCompactions.set(domainEpochKey, { sourceDigest, contractKey, reason,
+    ...(input.sizeExhausted === true ? { sizeExhausted: true } : {}) });
   return true;
 }
 
@@ -563,7 +569,8 @@ export function repeatedFailedMainCompaction(input: {
   const failed = failedCompactions.get(String(input.domainEpochKey ?? '').trim());
   if (!failed) return null;
   return failed.sourceDigest === String(input.sourceDigest ?? '').trim() &&
-    failed.contractKey === String(input.contractKey ?? '').trim()
+    (failed.contractKey === String(input.contractKey ?? '').trim() ||
+      (failed.sizeExhausted === true && compatibleMainCompactionSizeContract(failed.contractKey, input.contractKey)))
     ? failed.reason
     : null;
 }

@@ -87,11 +87,22 @@ describe('voice linked-chat formatting', () => {
     expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(text);
   });
 
-  test('continues to mask standalone email text beside a public link', () => {
-    const text = 'Email qa@example.test or open https://docs.example.test/report.';
-    expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(
-      'Email address available or open https://docs.example.test/report.',
-    );
+  test.each([
+    'Email qa@example.test or open https://docs.example.test/report.',
+    'The verified address is qa_first.last+test@example.test.',
+    'The verified address is _first_+qa@example.test.',
+  ])('preserves requested email text in display and persisted content: %s', (text) => {
+    expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(text);
+    const message = { text, content: [{ type: 'text', text }] };
+    expect(
+      sanitizeVoiceAssistantMessageForPersistence({ body: { voiceMode: true } }, message),
+    ).toEqual(message);
+  });
+  test.each([
+    ['**qa_first+test@example.test**', 'qa_first+test@example.test'],
+    ['_qa@example.test_', 'qa@example.test'],
+  ])('cleans surrounding formatting while preserving a verified email: %s', (text, expected) => {
+    expect(sanitizeVoiceSurfaceTextForDisplay(text)).toBe(expected);
   });
 
   test('preserves a lowercase Markdown label while stripping a standalone stage direction', () => {

@@ -4,7 +4,10 @@ import { request } from 'librechat-data-provider';
 import { useToastContext } from '@librechat/client';
 import WhoopConnection from '../WhoopConnection';
 
-jest.mock('axios', () => ({ post: jest.fn() }));
+jest.mock('axios', () => ({
+  ...jest.requireActual('axios'),
+  post: jest.fn(),
+}));
 jest.mock('librechat-data-provider', () => ({
   apiBaseUrl: jest.fn(() => ''),
   request: { get: jest.fn(), post: jest.fn() },
@@ -91,6 +94,7 @@ describe('WHOOP connection card', () => {
   });
 
   test('shows an honest loading state before the first WHOOP status is known', async () => {
+    expect(() => jest.requireActual('librechat-data-provider')).not.toThrow();
     let resolveStatus: ((value: typeof connectedStatus) => void) | undefined;
     mockGet.mockReturnValueOnce(
       new Promise<typeof connectedStatus>((resolve) => {

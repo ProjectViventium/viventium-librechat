@@ -401,6 +401,7 @@ interface LaneNativeAuthor {
   route?: { baseURL: string; headers: Record<string, string> };
   fetch?: MainContinuityFetch;
   current: () => Promise<boolean>;
+  canInterject: () => Promise<boolean>;
   wrapFetch: (baseFetch: MainContinuityFetch, providerId: string) => MainContinuityFetch;
   finish: () => void;
 }
@@ -418,7 +419,7 @@ function authorScope(row: RuntimeRecord): string {
 
 async function offerEvidenceToLaneAuthor(row: RuntimeRecord): Promise<void> {
   const author = conversationAuthors.get(authorScope(row));
-  if (!author?.identity || !author.route || !author.fetch || !(await author.current())) return;
+  if (!author?.identity || !author.route || !author.fetch || !(await author.canInterject())) return;
   const identity = author.identity;
   const route = author.route;
   const transport = author.fetch;
@@ -426,7 +427,7 @@ async function offerEvidenceToLaneAuthor(row: RuntimeRecord): Promise<void> {
     Boolean(
       author.identity &&
       nativeIdentityJson(author.identity) === nativeIdentityJson(identity) &&
-      (await author.current()),
+      (await author.canInterject()),
     );
   const insights = missionInsights([row]);
   const context = JSON.stringify({ accepted_work_evidence: insights });
@@ -538,18 +539,19 @@ function laneNativeAuthor(rows: RuntimeRecord[], context: RuntimeRecord): LaneNa
       } catch {
         return false;
       }
+      return !author.closed && !author.final && !author.signal?.aborted;
+    },
+    canInterject: async () => {
+      if (!(await author.current())) return false;
       if (row.surface === 'voice') {
         const call = await getActiveCallSessionForConversation({
           userId: row.ownerId,
           conversationId: context.target.conversationId,
         });
-        if (
-          !call?.callSessionId ||
-          call.callSessionId !== context.authorContext.req.body.viventiumCallSessionId
-        )
-          return false;
+        if (!call?.callSessionId ||
+            call.callSessionId !== context.authorContext.req.body.viventiumCallSessionId) return false;
       }
-      return !author.closed && !author.final && !author.signal?.aborted;
+      return author.current();
     },
     wrapFetch: (baseFetch, providerId) => {
       const bound = createNativeResponseFetch(

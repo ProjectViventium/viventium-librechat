@@ -1655,6 +1655,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
           anchorMessageId: item.anchorMessageId,
           mainAgentId: item.mainAgentId,
           destinations: item.destinations,
+          ...(item.traceIdentity ? { traceIdentity: item.traceIdentity } : {}),
         },
         body: {
           callback_id: item._id,
@@ -1677,11 +1678,17 @@ describe('GlassHiveMissionAdjudicationService', () => {
       'stale_claim',
       'surface',
       'feelings',
+      'ended_call',
+      'active_call',
     ])(
       'offers committed sibling evidence to the exact active PhaseB author: %s',
       async (boundary) => {
         jest.useFakeTimers();
-        const first = row();
+        const first = row(
+          ['ended_call', 'active_call'].includes(boundary)
+            ? { surface: 'voice', destinations: [{ surface: 'voice' }] }
+            : {},
+        );
         const fresh = row({
           _id: 'cb-2',
           evidenceId: 'cb-2',
@@ -1689,6 +1696,19 @@ describe('GlassHiveMissionAdjudicationService', () => {
           workRef: 'gh-work-2',
           runId: 'run-2',
         });
+        if (['ended_call', 'active_call'].includes(boundary)) {
+          fresh.surface = 'voice';
+          fresh.destinations = [{ surface: 'voice' }];
+          first.traceIdentity = { callbackRef: first.callbackRef, attemptNumber: 1 };
+          fresh.traceIdentity = { callbackRef: canonicalCallbackRef('cb-2'), attemptNumber: 1 };
+          if (boundary === 'active_call')
+            mockGetActiveCallSessionForConversation.mockResolvedValue({
+              callSessionId: 'owned-call',
+              userId: first.ownerId,
+              agentId: first.mainAgentId,
+              mode: 'call',
+            });
+        }
         const rows = [first];
         schedulingRows(rows);
         mockFindOne.mockImplementation(
@@ -1873,7 +1893,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
         });
         await jest.advanceTimersByTimeAsync(0);
         expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
-        if (['queued', 'lost_ack', 'slow_ack'].includes(boundary)) {
+        if (['queued', 'lost_ack', 'slow_ack', 'active_call'].includes(boundary)) {
           expect(offers).toHaveLength(1);
           expect(offers[0]).toEqual(
             expect.objectContaining({
@@ -1885,7 +1905,11 @@ describe('GlassHiveMissionAdjudicationService', () => {
           const sibling = rows.find((item) => item.runId === fresh.runId);
           expect(sibling.state).toBe('pending');
           expect(sibling.currentAuthorInput.status).toBe(
-            boundary === 'queued' ? 'queued' : boundary === 'slow_ack' ? 'offered' : 'unavailable',
+            ['queued', 'active_call'].includes(boundary)
+              ? 'queued'
+              : boundary === 'slow_ack'
+                ? 'offered'
+                : 'unavailable',
           );
           expect(mockEnqueueDelivery).not.toHaveBeenCalled();
         } else expect(offers).toHaveLength(0);
@@ -1893,6 +1917,21 @@ describe('GlassHiveMissionAdjudicationService', () => {
         await jest.advanceTimersByTimeAsync(0);
         expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(2);
         expect(rows.find((item) => item.runId === fresh.runId).state).toBe('completed');
+        if (boundary === 'ended_call') {
+          expect(mockEnqueueDelivery).toHaveBeenCalled();
+          for (const [delivery] of mockEnqueueDelivery.mock.calls) {
+            expect(
+              delivery.deliveryContext.destinations.some(
+                (destination) => destination.surface === 'voice',
+              ),
+            ).toBe(false);
+            expect(
+              delivery.deliveryContext.destinations.some(
+                (destination) => destination.surface === 'librechat',
+              ),
+            ).toBe(true);
+          }
+        }
         releaseAck();
         await jest.advanceTimersByTimeAsync(0);
       },

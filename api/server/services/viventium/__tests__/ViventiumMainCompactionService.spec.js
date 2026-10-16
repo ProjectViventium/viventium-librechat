@@ -4963,7 +4963,9 @@ describe('durable shrinking size continuation through the existing idle owner', 
           expect(
             await call.onNativeAdmission({
               requestId: `size-native-${calls.length}`,
-              responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+              responseDeadlineAt: new Date(
+                Math.min(Date.now() + 660000, call.nativeResponseDeadlineAt ?? Infinity),
+              ).toISOString(),
             }),
           ).toBe(true);
           const duration = calls.length <= 2 ? 451000 : call.stage === 'review' ? 10000 : 45000;

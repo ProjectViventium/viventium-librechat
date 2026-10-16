@@ -3,13 +3,18 @@
  * Purpose:
  * - Keep worker callbacks as neutral lifecycle/status events.
  * - Persist terminal worker evidence before acknowledgement.
- * - Coalesce terminal evidence for two seconds per owner/conversation, then feed it into the existing
+ * - Offer committed terminal evidence immediately through the existing scoped lane and
  *   configured Main/Phase-B follow-up machinery. Semantic {NTA}/redundancy may stay silent, but a
  *   useful mission result is not discarded merely because presentation moved to a newer turn.
  * - Leave a restart-safe pending/failed ledger that can be reconciled without replaying prose.
  * === VIVENTIUM END === */
 
 import * as crypto from 'crypto';
+import { createNativeResponseFetch } from './nativeResponse';
+import { nativeIdentityJson } from '../stream/implementations/nativeResponse';
+import { deliverCortexBatchToRunningMain } from '../cortex/liveMainContext';
+import type { MainContinuityFetch } from '../continuity/mainContinuity';
+import type { NativeResponseIdentity } from '@librechat/data-schemas';
 import { canonicalizeGlassHiveCallbackRef } from '../trace/orchestrationTraceHooks';
 import {
   GLASSHIVE_NATIVE_MEDIA_MAX_BYTES,
@@ -188,7 +193,6 @@ export interface GlassHiveMissionReconciliationSummary {
 }
 
 export interface GlassHiveMissionAdjudicationService {
-  COALESCE_MS: number;
   wakeGlassHiveMissionAdjudications: (input: GlassHiveMissionLimitInput) => void;
   clearAdjudicationTimersForTests: () => void;
   enqueueGlassHiveMissionAdjudication: (
@@ -380,14 +384,254 @@ export function createGlassHiveMissionAdjudicationService(
   } = dependencies;
 
 const COLLECTION = 'viventium_glasshive_mission_evidence';
-const COALESCE_MS = 2000;
 const MAX_EVIDENCE_CHARS = 64_000;
 const MAX_ADJUDICATION_ATTEMPTS = 10;
 const LEGACY_DELIVERY_PARENT_REDRIVE_VERSION = 1;
 const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
-const conversationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const conversationFlushes = new Map<string, Promise<RuntimeRecord>>();
 const conversationReschedules = new Map<string, boolean>();
+interface LaneNativeAuthor {
+  messageId: string;
+  scope: string;
+  closed: boolean;
+  final: boolean;
+  signal?: AbortSignal | null;
+  identity?: NativeResponseIdentity;
+  streamId?: string;
+  route?: { baseURL: string; headers: Record<string, string> };
+  fetch?: MainContinuityFetch;
+  current: () => Promise<boolean>;
+  canInterject: () => Promise<boolean>;
+  wrapFetch: (baseFetch: MainContinuityFetch, providerId: string) => MainContinuityFetch;
+  finish: () => void;
+}
+const conversationAuthors = new Map<string, LaneNativeAuthor>();
+
+function authorScope(row: RuntimeRecord): string {
+  return JSON.stringify([
+    row.ownerId,
+    row.conversationId,
+    row.mainAgentId,
+    row.feelingsIsolated === true,
+    row.surface,
+  ]);
+}
+
+async function offerEvidenceToLaneAuthor(row: RuntimeRecord): Promise<void> {
+  const author = conversationAuthors.get(authorScope(row));
+  if (!author?.identity || !author.route || !author.fetch || !(await author.canInterject())) return;
+  const identity = author.identity;
+  const route = author.route;
+  const transport = author.fetch;
+  const current = async () =>
+    Boolean(
+      author.identity &&
+      nativeIdentityJson(author.identity) === nativeIdentityJson(identity) &&
+      (await author.canInterject()),
+    );
+  const insights = missionInsights([row]);
+  const context = JSON.stringify({ accepted_work_evidence: insights });
+  const sameInput = (value: { invocationId: string; deliveryId: string; textSha256: string }) => ({
+    invocationId: value.invocationId,
+    deliveryId: value.deliveryId,
+    textSha256: value.textSha256,
+  });
+  await deliverCortexBatchToRunningMain(
+    {
+      ownerId: row.ownerId,
+      conversationId: row.conversationId,
+      parentMessageId: identity.responseMessageId,
+      streamId: identity.streamId,
+      insights,
+      context,
+    },
+    {
+      liveContextEnabled: true,
+      readCurrentAuthor: async () =>
+        (await current()) ? { ...identity, status: 'pending' } : null,
+      getJob: async () => null,
+      readAdmission: async () => null,
+      isCurrentLogicalTurn: async () => false,
+      observeSourceOrder: async () => ({
+        stale: true,
+        latest_source_sequence: 0,
+        observed_at: Date.now(),
+      }),
+      resolveRoute: async () => route,
+      isEligible: async () => authorScope(row) === author.scope && (await current()),
+      prepareInput: async (_identity, input) =>
+        runFencedMissionTransaction([row], async () => {
+          const updated = await collection().updateOne(
+            { _id: row._id, state: 'pending' },
+            {
+              $set: { currentAuthorInput: { ...sameInput(input), status: 'offered' } },
+            },
+          );
+          return updated.matchedCount === 1;
+        }),
+      recordInputReceipt: async (_identity, receipt) =>
+        runFencedMissionTransaction([row], async () => {
+          const updated = await collection().updateOne(
+            {
+              _id: row._id,
+              state: 'pending',
+              'currentAuthorInput.invocationId': identity.invocationId,
+              'currentAuthorInput.deliveryId': receipt.deliveryId,
+              'currentAuthorInput.textSha256': receipt.textSha256,
+            },
+            {
+              $set: {
+                currentAuthorInput: {
+                  ...sameInput({ ...receipt, invocationId: identity.invocationId }),
+                  status: receipt.status,
+                  ...(receipt.runId
+                    ? {
+                        runId: receipt.runId,
+                        attemptId: receipt.attemptId,
+                        messageId: receipt.messageId,
+                      }
+                    : {}),
+                },
+              },
+            },
+          );
+          return updated.matchedCount === 1;
+        }),
+      fetch: transport,
+    },
+  );
+}
+
+function laneNativeAuthor(rows: RuntimeRecord[], context: RuntimeRecord): LaneNativeAuthor {
+  const row = rows[rows.length - 1];
+  const scope = authorScope(row);
+  const groupId = adjudicationGroupId(rows);
+  const hash = crypto.createHash('sha256').update(groupId).digest('hex');
+  const messageId = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-5${hash.slice(13, 16)}-a${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
+  const createdAt = Date.now();
+  const author: LaneNativeAuthor = {
+    messageId,
+    scope,
+    closed: false,
+    final: false,
+    current: async () => {
+      if (
+        author.closed ||
+        author.final ||
+        author.signal?.aborted ||
+        conversationAuthors.get(scope) !== author
+      )
+        return false;
+      try {
+        const held = await runFencedMissionTransaction(rows, async () => {
+          for (const claimed of rows) {
+            const current = await collection().findOne({
+              _id: claimed._id,
+              state: 'processing',
+              attempts: claimed.attempts,
+              processingAt: claimed.processingAt,
+            });
+            if (!current) return false;
+          }
+          return true;
+        });
+        if (!held) return false;
+      } catch {
+        return false;
+      }
+      return !author.closed && !author.final && !author.signal?.aborted;
+    },
+    canInterject: async () => {
+      if (!(await author.current())) return false;
+      if (row.surface === 'voice') {
+        const call = await getActiveCallSessionForConversation({
+          userId: row.ownerId,
+          conversationId: context.target.conversationId,
+        });
+        if (!call?.callSessionId ||
+            call.callSessionId !== context.authorContext.req.body.viventiumCallSessionId) return false;
+      }
+      return author.current();
+    },
+    wrapFetch: (baseFetch, providerId) => {
+      const bound = createNativeResponseFetch(
+        baseFetch,
+        async () => {
+          if (!(await author.current())) throw new Error('mission_native_author_superseded');
+          return {
+            userId: row.ownerId,
+            conversationId: context.target.conversationId,
+            responseMessageId: messageId,
+            streamId: author.streamId || '',
+            jobCreatedAt: createdAt,
+            logicalTurnId: groupId,
+            revision: Math.max(1, Number(row.attempts) || 1),
+            providerId,
+            agentId: `${row.mainAgentId}:phase_b:followup`,
+            source: {
+              id: groupId,
+              messageId: context.target.parentMessageId,
+              digest: crypto
+                .createHash('sha256')
+                .update(
+                  JSON.stringify(
+                    rows.map((item) => [item._id, item.evidence, item.runId, item.traceIdentity]),
+                  ),
+                )
+                .digest('hex'),
+            },
+          };
+        },
+        async (identity) => {
+          if (!(await author.current())) throw new Error('mission_native_author_superseded');
+          author.identity = identity;
+          return true;
+        },
+        () => {},
+      );
+      return async (input, init) => {
+        const url = new URL(
+          typeof input === 'string' || input instanceof URL ? String(input) : input.url,
+        );
+        if (!url.pathname.endsWith('/chat/completions')) return baseFetch(input, init);
+        const headers = new Headers(
+          init?.headers || (input instanceof Request ? input.headers : undefined),
+        );
+        if (
+          headers.get('X-Viventium-User-Id') !== row.ownerId ||
+          headers.get('X-Viventium-Conversation-Id') !== context.target.conversationId ||
+          headers.get('X-Viventium-Message-Id') !== messageId ||
+          headers.get('X-GlassHive-Agent-Id') !== `${row.mainAgentId}:phase_b:followup`
+        ) {
+          throw new Error('mission_native_author_scope_mismatch');
+        }
+        const streamId = headers.get('X-Viventium-Stream-Id') || '';
+        if (!streamId || headers.get('X-GlassHive-Idempotency-Key') !== streamId)
+          throw new Error('mission_native_author_stream_mismatch');
+        if (author.identity && author.identity.streamId !== streamId)
+          throw new Error('mission_native_author_stream_changed');
+        author.signal = init?.signal;
+        const origin = new URL(url.href);
+        origin.pathname = origin.pathname.slice(0, -'/chat/completions'.length);
+        author.route = {
+          baseURL: origin.href,
+          headers: {
+            Authorization: headers.get('Authorization') || '',
+            'X-Viventium-User-Id': row.ownerId,
+          },
+        };
+        author.fetch = baseFetch;
+        // The actual stream header belongs to this dispatch, before an identity exists.
+        author.streamId = streamId;
+        return bound(input, init);
+      };
+    },
+    finish: () => {
+      author.final = true;
+    },
+  };
+  return author;
+}
 
 function terminalCallbackResultModel(): Model<IGlassHiveTerminalCallbackResult> {
   return getTerminalCallbackResultModel();
@@ -718,7 +962,7 @@ function flushConversationAdjudication(
 ): void {
   const key = JSON.stringify([owner, conversation]);
   if (conversationFlushes.has(key)) {
-    // A matured collection window includes new rows; a ready wake cannot narrow that pass.
+    // A pending full pass includes new rows; a ready wake cannot narrow that pass.
     conversationReschedules.set(key, (conversationReschedules.get(key) ?? true) && pinnedOnly);
     return;
   }
@@ -745,15 +989,7 @@ function scheduleConversationAdjudication(ownerId: unknown, conversationId: unkn
   const owner = safeText(ownerId, 160);
   if (!owner) return;
   const conversation = safeText(conversationId, 160);
-  // Initial collection keeps its own timer, including while a ready group uses the same lane.
-  const key = JSON.stringify([owner, conversation]);
-  if (conversationTimers.has(key)) return;
-  const timer = setTimeout(() => {
-    conversationTimers.delete(key);
-    flushConversationAdjudication(owner, conversation, false);
-  }, COALESCE_MS);
-  timer.unref?.();
-  conversationTimers.set(key, timer);
+  flushConversationAdjudication(owner, conversation, false);
 }
 
 function wakeGlassHiveMissionAdjudications({ ownerId, conversationId }: GlassHiveMissionLimitInput): void {
@@ -776,7 +1012,12 @@ async function enqueueGlassHiveMissionAdjudication({
     effectSession,
   });
   if (row) {
-    const schedule = () => scheduleConversationAdjudication(row.ownerId, row.conversationId);
+    const schedule = () => {
+      void offerEvidenceToLaneAuthor(row).catch(() => {
+        logger.warn('[VIVENTIUM][glasshive-adjudication] Current author input unavailable');
+      });
+      scheduleConversationAdjudication(row.ownerId, row.conversationId);
+    };
     if (!deferGlassHiveTerminalCallbackAfterCommit(schedule)) schedule();
   }
   return row;
@@ -1436,22 +1677,9 @@ async function pinMissionDeliveryParent(
   return deliveryParentMessageId;
 }
 
-function groupFollowUpInput(
-  rows: RuntimeRecord[],
-  { target, authorContext }: RuntimeRecord,
-): RuntimeRecord {
-  // The conversation timer opens one coalescing window. Keep existing surface boundaries safe,
-  // and anchor the combined continuation to the latest mission turn within that destination.
-  const { req, agent } = authorContext;
-  return {
-    req,
-    conversationId: target.conversationId,
-    parentMessageId: target.parentMessageId,
-    deliveryParentMessageId: target.deliveryParentMessageId,
-    runId: adjudicationGroupId(rows),
-    agent,
-    insightsData: {
-      insights: rows.map((row) => ({
+function missionInsights(rows: RuntimeRecord[]): RuntimeRecord[] {
+  return rows.map((row) => ({
+        cortexId: safeText(row.evidenceId || row._id, 256),
         cortexName: 'Mission evidence',
         insight: row.outputFiles || row.nativeInputContext ? `${JSON.stringify({
           ...(row.outputFiles ? { output_files: {
@@ -1477,7 +1705,25 @@ function groupFollowUpInput(
             32,
           ),
         },
-      })),
+      }));
+}
+
+function groupFollowUpInput(
+  rows: RuntimeRecord[],
+  { target, authorContext }: RuntimeRecord,
+): RuntimeRecord {
+  // Opportunistic groups retain their existing surface and accepted membership boundaries,
+  // and anchor the combined continuation to the latest mission turn within that destination.
+  const { req, agent } = authorContext;
+  return {
+    req,
+    conversationId: target.conversationId,
+    parentMessageId: target.parentMessageId,
+    deliveryParentMessageId: target.deliveryParentMessageId,
+    runId: adjudicationGroupId(rows),
+    agent,
+    insightsData: {
+      insights: missionInsights(rows),
       errors: [],
       cortexCount: rows.length,
     },
@@ -1491,7 +1737,14 @@ async function prepareGroupSynthesis(
   rows: RuntimeRecord[],
   context: RuntimeRecord,
 ): Promise<RuntimeRecord> {
-  return prepareCortexFollowUpMessage(groupFollowUpInput(rows, context));
+  const author = laneNativeAuthor(rows, context);
+  conversationAuthors.set(author.scope, author);
+  try {
+    return await prepareCortexFollowUpMessage({ ...groupFollowUpInput(rows, context), nativeAuthor: author });
+  } finally {
+    author.closed = true;
+    if (conversationAuthors.get(author.scope) === author) conversationAuthors.delete(author.scope);
+  }
 }
 
 async function persistPreparedGroupSynthesis(
@@ -1513,13 +1766,13 @@ async function persistPreparedGroupSynthesis(
             selectedNativeMedia: prepared.selectedNativeMedia,
             ...(prepared.nativeOutputFiles ? {
               nativeOutputFiles: prepared.nativeOutputFiles,
-              sourceMessageId: context.target.parentMessageId,
+              sourceMessageId: prepared.nativeSourceMessageId || context.target.parentMessageId,
             } : {}),
           });
         },
       },
     },
-    prepared,
+    { ...prepared, ...(rows.some((row) => row.outputFiles?.files?.length > 0) ? { attachmentsRequired: true } : {}) },
   );
   if (followUp?.messageId) {
     const session = mongoose.transactionAsyncLocalStorage?.getStore()?.session;
@@ -1622,8 +1875,18 @@ async function reconcilePersistedGroupFollowUp(
   const persistedAuthoredAt = persistedRows
     .map((row) => timestamp(row.authoredAt))
     .find((value) => value != null);
+  const representative = persistedRows[persistedRows.length - 1];
+  const session = mongoose.transactionAsyncLocalStorage?.getStore()?.session;
+  const persistedMessage = await mongoose.connection.collection('messages').findOne({
+    user: safeText(representative.ownerId, 160),
+    conversationId: safeText(
+      representative.accountContinuationConversationId || representative.conversationId, 160,
+    ),
+    messageId,
+    isCreatedByUser: false,
+  }, session ? { session } : undefined);
   // An ID left by an aborted message transaction is not a committed authored result.
-  if (!text || persistedAuthoredAt == null) {
+  if (persistedAuthoredAt == null || (!text && !persistedMessage?.attachments?.length)) {
     await Promise.all(rows.map((row) => collection().updateOne(
       { _id: row._id, state: 'processing', followUpMessageId: messageId },
       { $unset: { followUpMessageId: '', followUpText: '', authoredAt: '' } },
@@ -1636,16 +1899,6 @@ async function reconcilePersistedGroupFollowUp(
     return null;
   }
   const authoredAt = new Date(persistedAuthoredAt);
-  const representative = persistedRows[persistedRows.length - 1];
-  const session = mongoose.transactionAsyncLocalStorage?.getStore()?.session;
-  const persistedMessage = await mongoose.connection.collection('messages').findOne({
-    user: safeText(representative.ownerId, 160),
-    conversationId: safeText(
-      representative.accountContinuationConversationId || representative.conversationId, 160,
-    ),
-    messageId,
-    isCreatedByUser: false,
-  }, session ? { session } : undefined);
   if (!persistedMessage || safeText(persistedMessage.text, MAX_EVIDENCE_CHARS) !== text) {
     throw Object.assign(new Error('mission_authored_message_unavailable'), {
       code: 'mission_authored_message_unavailable',
@@ -1928,6 +2181,10 @@ async function mainFollowUpDeliveryContext({
     };
   }
   const responseText = safeText(followUp?.text, MAX_EVIDENCE_CHARS);
+  if (!responseText && followUp?.attachments?.length) return {
+    destinations: destinations.filter((destination: RuntimeRecord) => destination.surface !== 'voice'),
+    linkedTextFallback: true, workerCompletionBindings,
+  };
   const workerCompletionPresentation = buildVoiceWorkerCompletionPresentation({
     ownerId: safeText(representative.ownerId, 160),
     conversationId: safeText(target?.conversationId || representative.conversationId, 160),
@@ -2378,14 +2635,13 @@ async function reconcilePendingGlassHiveMissionAdjudications({
 }
 
 function clearAdjudicationTimersForTests(): void {
-  for (const timer of conversationTimers.values()) clearTimeout(timer);
-  conversationTimers.clear();
   conversationFlushes.clear();
   conversationReschedules.clear();
+  for (const author of conversationAuthors.values()) author.closed = true;
+  conversationAuthors.clear();
 }
 
 return {
-  COALESCE_MS,
   wakeGlassHiveMissionAdjudications,
   clearAdjudicationTimersForTests,
   enqueueGlassHiveMissionAdjudication,

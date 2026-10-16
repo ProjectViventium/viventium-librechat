@@ -101,7 +101,7 @@ export interface IMainContinuityCompactionRepair {
   sourceTurnKeys: string[];
   legacySourceRange?: IMainContinuityLegacySourceRange;
   outputContract?: IMainCompactionOutputContract;
-  sizeRepair?: { proposalBytes: number; previousProposalBytes: number; converging: true };
+  sizeRepair?: { proposalBytes: number; previousProposalBytes?: number; converging: true };
   correction:
     | { code: 'semantic_fidelity'; candidate: string; reason?: string }
     | { code: 'schema_invalid'; issue: IMainContinuitySizeFeedback; candidate?: string; reason?: never };

@@ -166,7 +166,8 @@ const compactionRepairSchema = new Schema<IMainContinuityCompactionRepair>(
     outputContract: { type: outputContractSchema, default: undefined },
     sizeRepair: { type: new Schema({
       proposalBytes: { type: Number, required: true, min: 1 },
-      previousProposalBytes: { type: Number, required: true, min: 1 },
+      previousProposalBytes: { type: Number, min: 1,
+        required: function () { return this.parent().semanticAttempts !== 1; } },
       converging: { type: Boolean, required: true, enum: [true] },
     }, { _id: false }), required: function () { return this.correction?.code === 'schema_invalid'; } },
     correction: {

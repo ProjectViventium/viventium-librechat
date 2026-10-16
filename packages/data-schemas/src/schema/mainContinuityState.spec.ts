@@ -151,11 +151,11 @@ test('persists the typed pending repair separately from accepted semantic contex
 });
 
 
-test('retains numeric size feedback without an oversized candidate or accepted summary', async () => {
+test.each([1, 2])('retains numeric size feedback after %s producer(s) without a candidate or accepted summary', async count => {
   const pendingCompactionRepair = { version: 1, sourceDigest: 'd'.repeat(64),
-    contractKey: 'exact-route-contract', semanticAttempts: 2, transportRetries: 0,
+    contractKey: 'exact-route-contract', semanticAttempts: count, transportRetries: 0,
     sourceGeneration: 2, sourceTurnKeys: ['source:1'],
-    sizeRepair: { proposalBytes: 94000, previousProposalBytes: 96000, converging: true },
+    sizeRepair: { proposalBytes: 94000, ...(count > 1 ? { previousProposalBytes: 96000 } : {}), converging: true },
     correction: { code: 'schema_invalid', issue: { path: '', constraint: 'max_bytes',
       actual: 94000, limit: 75000, proposalBytes: 94000, excessBytes: 19000, unit: 'utf8_bytes' } } };
   const document = new ContinuityState({ ...validState, pendingCompactionRepair });

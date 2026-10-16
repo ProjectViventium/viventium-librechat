@@ -18,7 +18,6 @@ const {
   compareMainCompactionToolIdentities,
   createMainCompactionStageLease,
   resolveMainCompactionAgent,
-  deferAcceptedMainCompactionForCall,
   deferAcceptedMainCompactionForIdle,
   discardDeferredMainCompaction,
   flushEndedCallMainCompactions,
@@ -420,22 +419,6 @@ async function defaultExecuteCompactor({
 function ensureAcceptedMainCompaction(input = {}) {
   const domainKey = compactionEpochKey(input);
   if (input.foreground === true) discardDeferredMainCompaction(domainKey);
-  if (
-    input.trigger === 'accepted_turn' &&
-    input.foreground !== true &&
-    deferAcceptedMainCompactionForCall({
-      ownerId: String(input.ownerId || '').trim(),
-      domainKey,
-      call: input.req?.viventiumCallSession,
-      schedule: () => runBackgroundMainCompaction(input),
-    })
-  ) {
-    logger.info('[VIVENTIUM][main-continuity] Accepted compaction deferred until Call End', {
-      reason: 'active_call',
-      domainHash: crypto.createHash('sha256').update(domainKey).digest('hex').slice(0, 16),
-    });
-    return Promise.resolve({ status: 'deferred', reason: 'active_call', attempts: 0 });
-  }
   return ['accepted_turn', 'conversation_legacy'].includes(input.trigger) &&
     input.foreground !== true
     ? runBackgroundMainCompaction(input)
@@ -465,32 +448,13 @@ async function runBackgroundMainCompaction(input) {
   const executionBudget = input.executionBudget || { completionReserveMs: 0 };
   const shouldYield = () => (interactiveAdmissionFencesByOwnerId.get(ownerId)?.size || 0) > 0;
   const result = await runMainCompactionIdleBatch({
-    run: async (deadlineAt, previousSourceClaim) => {
-      let call;
-      try {
-        call = await require('./CallSessionService').getActiveCallSessionForMainMaintenance({
-          userId: ownerId,
-          agentId: input.agentId,
-        });
-      } catch {
-        return { status: 'deferred', reason: 'call_liveness_unavailable', attempts: 0 };
-      }
-      if (
-        deferAcceptedMainCompactionForCall({
-          ownerId,
-          domainKey,
-          call,
-          schedule: () => runBackgroundMainCompaction({ ...input, executionBudget }),
-        })
-      )
-        return { status: 'deferred', reason: 'active_call', attempts: 0 };
-      return runAcceptedMainCompaction({
+    run: (deadlineAt, previousSourceClaim) =>
+      runAcceptedMainCompaction({
         ...input,
         deadlineAt,
         executionBudget,
         previousSourceClaim,
-      });
-    },
+      }),
     shouldYield: () => input.signal?.aborted || shouldYield(),
     deadlineAt: input.deadlineAt,
     now: input.now,
@@ -1208,13 +1172,21 @@ async function runAcceptedMainCompaction(input = {}) {
     }
     const pendingSizeFeedback = normalizeMainCompactionSizeRepair(
       {
-        // The shared owner retains only structurally valid, JSON-bounded drafts. Whole-JSON
-        // overflow stays numeric; resumed drafts still pass current native admission sizing.
+        // The pure owner bounds correction storage; the service also checks the complete
+        // request against native admission capacity before retention and again on resume.
         correction: correctionReason,
+        semanticAttempts,
+        fidelityRepairAttempts,
         sizeRepair,
       },
       claim.outputContract,
     );
+    if (pendingSizeFeedback?.correction?.candidate !== undefined)
+      pendingSizeFeedback.correction = await sizeCorrectionWithinNativeAdmission(
+        input,
+        claim,
+        pendingSizeFeedback.correction,
+      );
     const canContinueRepair =
       terminalReason === 'compaction_enclosing_deadline' &&
       active.capacityReleaseAcknowledged === true &&

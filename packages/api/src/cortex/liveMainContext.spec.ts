@@ -421,3 +421,49 @@ describe('completed cohort native Main context courier', () => {
     }
   });
 });
+
+describe('lane-owned native callback author context courier', () => {
+  it('uses the actual bound background author without a foreground job or admission row', async () => {
+    const { input, deps, send } = setup();
+    const author = { ...identity, status: 'pending' as const };
+    const result = await deliverCortexBatchToRunningMain(input, {
+      ...deps,
+      readCurrentAuthor: async () => author,
+    });
+    expect(result.status).toBe('queued');
+    expect(deps.getJob).not.toHaveBeenCalled();
+    expect(deps.readAdmission).not.toHaveBeenCalled();
+    expect(deps.isCurrentLogicalTurn).not.toHaveBeenCalled();
+    expect(deps.prepareInput).toHaveBeenCalledTimes(1);
+    expect(deps.recordInputReceipt).toHaveBeenCalledWith(
+      expect.objectContaining(identity),
+      expect.objectContaining({ status: 'queued' }),
+    );
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['owner', 'conversation', 'stream', 'message', 'final', 'abort', 'replacement'])(
+    'retains ordinary delivery when the callback author changes: %s',
+    async (boundary) => {
+      const { input, deps, send } = setup();
+      const author = { ...identity, status: 'pending' as const };
+      const changed = { ...author };
+      if (boundary === 'owner') changed.userId = 'other';
+      if (boundary === 'conversation') changed.conversationId = 'other';
+      if (boundary === 'stream') changed.streamId = 'other';
+      if (boundary === 'message') changed.responseMessageId = 'other';
+      if (boundary === 'replacement') changed.invocationId = 'other';
+      let reads = 0;
+      const result = await deliverCortexBatchToRunningMain(input, {
+        ...deps,
+        readCurrentAuthor: async () => {
+          reads += 1;
+          if (['final', 'abort'].includes(boundary) && reads > 1) return null;
+          return reads > 1 || boundary !== 'replacement' ? changed : author;
+        },
+      });
+      expect(result.status).toBe('not_running');
+      expect(send).not.toHaveBeenCalled();
+    },
+  );
+});

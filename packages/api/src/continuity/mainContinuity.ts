@@ -294,7 +294,7 @@ export function canContinueMainCompactionRepair(
   if (!Number.isSafeInteger(total) || Number(total) < 1 ||
       !Number.isSafeInteger(fidelity) || Number(fidelity) < 0 || Number(fidelity) > 1 ||
       Number(fidelity) > Number(total)) return false;
-  if (kind === 'size') return Number(total) >= 2 && Number(total) < MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS;
+  if (kind === 'size') return Number(total) >= 1 && Number(total) < MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS;
   // Old checkpoints never stored fidelity feedback after two producers. Do not infer a new
   // unused allowance from an impossible legacy record; new records carry the explicit counter.
   return fidelity === 0 && Number(total) <= MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS &&
@@ -407,7 +407,7 @@ function compatibleMainCompactionSizeAllocation(before: MainCompactionOutputCont
     after.maxSummaryUtf8Bytes <= before.maxSummaryUtf8Bytes;
 }
 
-/** Keep a structurally valid, JSON-bounded draft as repair input; oversized drafts stay numeric. */
+/** Bound unaccepted correction input independently; promotion still uses the exact output contract. */
 export function normalizeMainCompactionSizeRepair(value: unknown, previousContract: unknown,
   currentContract: unknown = previousContract): Pick<IMainContinuityCompactionRepair, 'correction' | 'sizeRepair'> | null {
   if (!isRecord(value) || !isRecord(value.correction) || value.correction.code !== 'schema_invalid' ||
@@ -417,8 +417,11 @@ export function normalizeMainCompactionSizeRepair(value: unknown, previousContra
   if (!before || !after || !compatibleMainCompactionSizeAllocation(before, after)) return null;
   const issue = value.correction.issue, state = value.sizeRepair;
   const positive = (item: unknown): item is number => Number.isSafeInteger(item) && Number(item) > 0;
-  if (!positive(state.proposalBytes) || !positive(state.previousProposalBytes) ||
-      state.previousProposalBytes <= state.proposalBytes || state.converging !== true ||
+  const firstRejection = state.previousProposalBytes === undefined && value.semanticAttempts === 1 &&
+    (value.fidelityRepairAttempts === undefined || value.fidelityRepairAttempts === 0);
+  const shrinking = positive(state.previousProposalBytes) &&
+    positive(state.proposalBytes) && state.previousProposalBytes > state.proposalBytes;
+  if (!positive(state.proposalBytes) || (!firstRejection && !shrinking) || state.converging !== true ||
       issue.constraint !== 'max_bytes' || issue.unit !== 'utf8_bytes' ||
       !['', 'summary', '$carrier'].includes(String(issue.path)) ||
       !positive(issue.actual) || !positive(issue.limit) || issue.actual <= issue.limit ||
@@ -454,8 +457,12 @@ export function normalizeMainCompactionSizeRepair(value: unknown, previousContra
           !['', 'summary'].includes(prepared.issue.path))) return null;
       if (path === '$carrier' && (!prepared.ok ||
           mainCompactionRenderedBytes(prepared.candidate, before) !== issue.actual)) return null;
-      if (path !== '' && prepared.ok && Buffer.byteLength(serialized, 'utf8') <= after.maxJsonUtf8Bytes &&
-          inspectMainCompactionCandidate(draft, after).ok) candidate = serialized;
+      const boundedWholeJsonDraft = path === '' && !prepared.ok &&
+        prepared.issue.constraint === 'max_bytes' && prepared.issue.path === '' &&
+        Buffer.byteLength(serialized, 'utf8') <= Math.min(before.carrierMaxUtf8Bytes, after.carrierMaxUtf8Bytes);
+      if (boundedWholeJsonDraft || (path !== '' && prepared.ok &&
+          Buffer.byteLength(serialized, 'utf8') <= after.maxJsonUtf8Bytes &&
+          inspectMainCompactionCandidate(draft, after).ok)) candidate = serialized;
     } catch { return null; }
   }
   const limit = path === '' ? after.maxJsonUtf8Bytes :
@@ -468,7 +475,8 @@ export function normalizeMainCompactionSizeRepair(value: unknown, previousContra
       ? state.proposalBytes - after.maxJsonUtf8Bytes : actual - limit,
     ...(fieldBytes ? { fieldBytes } : {}) };
   return { correction: { code: 'schema_invalid', issue: feedback, ...(candidate ? { candidate } : {}) },
-    sizeRepair: { proposalBytes: state.proposalBytes, previousProposalBytes: state.previousProposalBytes,
+    sizeRepair: { proposalBytes: state.proposalBytes,
+      ...(firstRejection ? {} : { previousProposalBytes: state.previousProposalBytes as number }),
       converging: true } };
 }
 

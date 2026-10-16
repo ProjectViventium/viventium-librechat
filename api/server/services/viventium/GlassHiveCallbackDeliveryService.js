@@ -8,6 +8,7 @@
  * === VIVENTIUM END === */
 
 const crypto = require('crypto');
+const isEqual = require('lodash/isEqual');
 const {
   canonicalizeGlassHiveCallbackRef,
   fenceGlassHiveTerminalCallbackAcceptedOperation,
@@ -1633,7 +1634,26 @@ async function recordGlassHiveLinkedWebDelivery({
     }),
     effectSession,
   );
-  if (!accepted || !stored || !normalizeText(stored.text) || stored.text !== message?.text) {
+  const attachments = Array.isArray(stored?.attachments) ? stored.attachments : [];
+  // Publication already verified these imports under the accepted callback fence. Only the exact
+  // persisted owner/message attachment set can settle a presentation with no authored text.
+  const hasOwnedFiles =
+    attachments.length > 0 &&
+    isEqual(attachments, message?.attachments) &&
+    attachments.every(
+      (attachment) =>
+        normalizeText(attachment.user) === ownerId &&
+        normalizeText(attachment.file_id) &&
+        attachment.nativeOutputFile?.version === 1 &&
+        attachment.nativeOutputFile.status === 'available' &&
+        attachment.nativeOutputFile.messageId === stored.messageId,
+    );
+  if (
+    !accepted ||
+    !stored ||
+    (!normalizeText(stored.text) && !hasOwnedFiles) ||
+    stored.text !== message?.text
+  ) {
     throw new Error('glasshive_linked_presentation_message_unavailable');
   }
   const event = normalizeText(body.event);
@@ -1672,6 +1692,7 @@ async function recordGlassHiveLinkedWebDelivery({
           status: 'sent',
           sentAt: now,
           text: stored.text,
+          attachments,
           projectionPendingAt: now,
           projectionNextAttemptAt: now,
           expiresAt: new Date(now.getTime() + DELIVERY_RETENTION_MS),

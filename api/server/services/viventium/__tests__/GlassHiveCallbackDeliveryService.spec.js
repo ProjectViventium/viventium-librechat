@@ -1774,6 +1774,156 @@ describe('GlassHiveCallbackDeliveryService', () => {
     expect(transaction.session.abortTransaction).not.toHaveBeenCalled();
   });
 
+  describe('canonical linked Web file-only delivery', () => {
+    function fixture() {
+      const { bindings, leases } = workerCompletionFixture();
+      const binding = bindings[0];
+      const message = {
+        messageId: 'follow-up-file-only',
+        text: '',
+        attachments: [
+          {
+            user: 'owner-coalesced',
+            file_id: 'native_' + 'f'.repeat(64),
+            filename: 'result.txt',
+            bytes: 12,
+            type: 'text/plain',
+            nativeOutputFile: {
+              version: 1,
+              status: 'available',
+              messageId: 'follow-up-file-only',
+              downloadUrl: 'https://files.example.test/v1/link-refs/result',
+            },
+          },
+        ],
+      };
+      const input = {
+        body: {
+          callback_id: binding.terminalCallbackId,
+          attempt_number: binding.attemptNumber,
+          event: 'main.followup',
+          worker_id: binding.workerId,
+          run_id: binding.runId,
+        },
+        message,
+        deliveryContext: {
+          ownerId: 'owner-coalesced',
+          conversationId: 'conversation-coalesced',
+          originRef: binding.originRef,
+          workRef: binding.workRef,
+          traceIdentity: { callbackRef: binding.callbackRef, attemptNumber: binding.attemptNumber },
+          traceCallbackEvent: 'run.completed',
+          destinations: [{ surface: 'librechat' }],
+        },
+        effectFence: leases[0],
+        effectSession: { inTransaction: () => true },
+      };
+      const accepted = {
+        resultEndedAt: new Date(),
+        resultDigest: binding.resultDigest,
+        resultRevision: binding.resultRevision,
+      };
+      mockFindTerminalCallbackResult.mockReturnValue(leanResult(accepted));
+      mockMessageFindOne.mockReturnValue(leanResult(structuredClone(message)));
+      const ledger = new Map();
+      mockFindOneAndUpdate.mockImplementation((query, update) => {
+        if (!ledger.has(query.deliveryKey)) ledger.set(query.deliveryKey, update.$setOnInsert);
+        return leanResult(ledger.get(query.deliveryKey));
+      });
+      mockFindDeliveries.mockImplementation(() => leanResult([...ledger.values()]));
+      return { input, ledger, binding };
+    }
+
+    test.each(['librechat', 'workbench'])(
+      'settles exact owned file-only %s once without Voice or replacement text',
+      async (surface) => {
+        const { input, ledger, binding } = fixture();
+        input.deliveryContext.destinations = [{ surface }];
+        for (let attempt = 0; attempt < 2; attempt++) {
+          await expect(enqueueGlassHiveCallbackDelivery(input)).resolves.toMatchObject({
+            configured: 0,
+            enqueued: 0,
+            linkedWebCommitted: true,
+          });
+        }
+        expect(ledger.size).toBe(1);
+        expect([...ledger.values()][0]).toMatchObject({
+          surface: 'librechat',
+          status: 'sent',
+          text: '',
+          attachments: input.message.attachments,
+          callbackMessageId: input.message.messageId,
+          terminalCallbackResultKey: binding.resultKey,
+          terminalCallbackAcceptedOperationId: binding.acceptedOperationId,
+          terminalCallbackEffectGeneration: binding.effectGeneration,
+        });
+        expect(mockMessageFindOne).toHaveBeenCalledWith({
+          user: 'owner-coalesced',
+          conversationId: 'conversation-coalesced',
+          messageId: input.message.messageId,
+          isCreatedByUser: false,
+        });
+        expect(mockFindTerminalCallbackResult).toHaveBeenCalledWith(
+          expect.objectContaining({
+            ownerId: 'owner-coalesced',
+            originRef: binding.originRef,
+            workRef: binding.workRef,
+            runId: binding.runId,
+            acceptedOperationId: binding.acceptedOperationId,
+            acceptedOperationGeneration: binding.effectGeneration,
+            resultDigest: binding.resultDigest,
+            resultRevision: binding.resultRevision,
+            effectLeaseId: input.effectFence.leaseId,
+          }),
+        );
+        expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith(
+          expect.objectContaining({
+            state: 'sent',
+            effectSession: input.effectSession,
+            effectFence: input.effectFence,
+          }),
+        );
+        expect(mockRegisterDeliveryPresentation).not.toHaveBeenCalled();
+      },
+    );
+
+    test.each([
+      'empty',
+      'mismatch',
+      'foreign-owner',
+      'foreign-message',
+      'unavailable',
+      'missing-message',
+      'superseded-result',
+    ])('refuses file-only linked delivery with %s authority', async (fault) => {
+      const { input, ledger } = fixture();
+      const stored = structuredClone(input.message);
+      if (fault === 'empty') stored.attachments = input.message.attachments = [];
+      if (fault === 'mismatch') input.message.attachments[0].file_id = 'another-file';
+      if (fault === 'foreign-owner') {
+        stored.attachments[0].user = 'foreign-owner';
+        input.message.attachments = structuredClone(stored.attachments);
+      }
+      if (fault === 'foreign-message') {
+        stored.attachments[0].nativeOutputFile.messageId = 'foreign-message';
+        input.message.attachments = structuredClone(stored.attachments);
+      }
+      if (fault === 'unavailable') {
+        stored.attachments[0].nativeOutputFile.status = 'unavailable';
+        input.message.attachments = structuredClone(stored.attachments);
+      }
+      mockMessageFindOne.mockReturnValue(leanResult(fault === 'missing-message' ? null : stored));
+      if (fault === 'superseded-result')
+        mockFindTerminalCallbackResult.mockReturnValue(leanResult(null));
+      await expect(enqueueGlassHiveCallbackDelivery(input)).rejects.toThrow(
+        'glasshive_linked_presentation_message_unavailable',
+      );
+      expect(ledger.size).toBe(0);
+      expect(mockRecordGlassHiveSurfaceDeliveryOutcome).not.toHaveBeenCalled();
+      expect(mockRegisterDeliveryPresentation).not.toHaveBeenCalled();
+    });
+  });
+
   test.each([
     'completed-without-attempt',
     'missing-trace',

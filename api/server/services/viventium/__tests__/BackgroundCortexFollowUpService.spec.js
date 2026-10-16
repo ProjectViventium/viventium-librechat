@@ -531,6 +531,76 @@ describe('Phase B session-backed Feelings', () => {
   });
 });
 
+describe('Phase B actual native author binding', () => {
+  test('passes its planned message through dispatch, file capture and final callback without changing the history parent', async () => {
+    const nativeAuthor = {
+      messageId: 'planned-message',
+      wrapFetch: jest.fn((transport) => transport),
+      finish: jest.fn(),
+      identity: { invocationId: 'bound-by-owner' },
+    };
+    const native = require('../nativeResponseService');
+    const service = jest
+      .spyOn(native, 'getService')
+      .mockReturnValue({ readToolEvidenceForPresentation: async () => [] });
+    const getMessage = jest.spyOn(db, 'getMessage').mockResolvedValue(null);
+    const getMessages = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
+    const createRun = jest.spyOn(Run, 'create').mockImplementation(async (options) => ({
+      processStream: async () => {
+        options.customHandlers.on_chat_model_start.handle();
+        options.customHandlers.on_chat_model_end.handle('on_chat_model_end', {
+          output: { content: 'The result is ready.' },
+        });
+        return 'The result is ready.';
+      },
+    }));
+    const previous = process.env.XAI_API_KEY;
+    try {
+      process.env.XAI_API_KEY = 'synthetic-key';
+      const prepared = await prepareCortexFollowUpMessage({
+        req: {
+          user: { id: 'owner' },
+          body: {},
+          config: {
+            endpoints: {
+              agents: {
+                providerCapabilities: {
+                  xai: { workspace_binding: true, conversation_session: true },
+                },
+              },
+            },
+          },
+        },
+        conversationId: 'conversation',
+        parentMessageId: 'actual-history-parent',
+        runId: 'group',
+        agent: { id: 'main', provider: 'xai', model: 'synthetic', model_parameters: {} },
+        insightsData: {
+          insights: [{ cortexId: 'evidence', cortexName: 'Evidence', insight: 'Ready.' }],
+        },
+        nativeAuthor,
+      });
+      expect(nativeAuthor.wrapFetch).toHaveBeenCalledWith(expect.any(Function), 'xai');
+      expect(nativeAuthor.finish).toHaveBeenCalledTimes(1);
+      expect(createRun.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders).toEqual(
+        expect.objectContaining({
+          'X-Viventium-Message-Id': 'planned-message',
+          'X-Viventium-Conversation-Id': 'conversation',
+        }),
+      );
+      expect(prepared.plannedMessageId).toBe('planned-message');
+      expect(prepared.nativeSourceMessageId).toBe('planned-message');
+    } finally {
+      if (previous === undefined) delete process.env.XAI_API_KEY;
+      else process.env.XAI_API_KEY = previous;
+      service.mockRestore();
+      getMessage.mockRestore();
+      getMessages.mockRestore();
+      createRun.mockRestore();
+    }
+  });
+});
+
 describe('Phase B prepare/persist boundary', () => {
   test.each([false, true])(
     'retains native public ranges through saved Phase B and callback metadata, invalid=%s',
@@ -2839,6 +2909,71 @@ describe('native silence persistence decision', () => {
 /* === VIVENTIUM END === */
 
 describe('Phase B retained File publication', () => {
+  test.each([
+    [true, true, false],
+    [true, true, true],
+    [true, false, false],
+    [false, true, false],
+  ])(
+    'silent declared files publish once without speech, owed=%s available=%s revoked=%s',
+    async (owed, available, revoked) => {
+      const transaction = require('../GlassHiveTerminalCallbackTransaction');
+      const getMessage = jest.spyOn(db, 'getMessage').mockResolvedValue(null);
+      const session = { inTransaction: () => true };
+      const runTransaction = jest
+        .spyOn(transaction, 'runGlassHiveTerminalCallbackTransaction')
+        .mockImplementation(async (operation) => operation(session));
+      const save = jest
+        .spyOn(db, 'saveMessage')
+        .mockImplementation(async (_req, message) => message);
+      const guard = jest.fn(async () => {
+        if (revoked) throw new Error('source_revoked');
+      });
+      const prepareAttachments = jest.fn(async () => ({
+        attachments: available
+          ? [{ file_id: 'owned-file', filename: 'result.txt', bytes: 11 }]
+          : [],
+        authorizePublication: guard,
+      }));
+      try {
+        const operation = persistPreparedCortexFollowUpMessage(
+          {
+            req: { user: { id: 'owner' }, body: {} },
+            conversationId: 'conversation',
+            parentMessageId: 'parent',
+            agent: { id: 'main' },
+            insightsData: { insights: [] },
+            dependencies: { prepareAttachments },
+          },
+          {
+            text: '',
+            plannedMessageId: 'planned-callback',
+            attachmentsRequired: owed,
+            shouldForceVisibleFollowUp: false,
+            conversationMessages: [],
+            finalContinuationContext: { currentLeafMessageId: 'parent' },
+            followUpDecisionRecord: {},
+          },
+        );
+        if (owed && available && revoked) await expect(operation).rejects.toThrow('source_revoked');
+        else if (owed && available)
+          await expect(operation).resolves.toMatchObject({
+            messageId: 'planned-callback',
+            text: '',
+            attachments: [{ file_id: 'owned-file' }],
+            metadata: { viventium: { deliveryDisposition: { audio: 'skip' } } },
+          });
+        else await expect(operation).resolves.toBeNull();
+        expect(save).toHaveBeenCalledTimes(owed && available && !revoked ? 1 : 0);
+        expect(prepareAttachments).toHaveBeenCalledTimes(owed ? 1 : 0);
+      } finally {
+        runTransaction.mockRestore();
+        save.mockRestore();
+        getMessage.mockRestore();
+      }
+    },
+  );
+
   test.each([
     [false, false],
     [false, true],

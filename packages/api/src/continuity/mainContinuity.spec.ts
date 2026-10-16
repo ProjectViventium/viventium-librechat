@@ -2402,11 +2402,14 @@ describe('durable numeric size feedback', () => {
     return { correction: { code: 'schema_invalid', issue: result.issue },
       sizeRepair: { proposalBytes: bytes, previousProposalBytes: bytes + 3000, converging: true } };
   };
-  test('retains numeric progress only, targets the current smaller carrier, then promotes after review', async () => {
+  test.each([1, 2])('retains numeric progress after %s producer(s), targets the current carrier, then promotes after review', async count => {
     const { service, identity, seed, states } = fixture();
     const claim = await seed(), contract = claim.outputContract as Record<string, unknown>;
+    const initialFeedback = sizeFeedback(contract);
     const repair = { version: 1, sourceDigest: claim.sourceDigest, contractKey: routeKey(contract),
-      semanticAttempts: 2, transportRetries: 0, ...sizeFeedback(contract) };
+      semanticAttempts: count, fidelityRepairAttempts: 0, transportRetries: 0, ...initialFeedback,
+      sizeRepair: count === 1 ? { proposalBytes: initialFeedback.sizeRepair.proposalBytes, converging: true }
+        : initialFeedback.sizeRepair };
     expect(await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
       reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
       pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
@@ -2476,13 +2479,48 @@ describe('durable numeric size feedback', () => {
     expect(normalized.sizeRepair).toEqual(value.sizeRepair);
   });
 
-  test.each(['source', 'attempts', 'release', 'not-shrinking', 'candidate', 'field-total', 'actual',
-    'limit', 'item', 'transport', 'lease'])(
-    'rejects unsafe numeric size feedback (%s)', async mode => {
+  test.each(['bounded', 'over-carrier', 'mismatch-bytes', 'bad-shape'])(
+    'bounds an exact whole-JSON correction draft independently of provider admission (%s)', mode => {
+      const contract = createMainCompactionOutputContract({ consumer: 'accepted_core',
+        carrierMaxUtf8Bytes: 131072, reservedUtf8Bytes: 29577 })!;
+      const candidate = { ...faithful, summary: 's'.repeat(contract.maxJsonUtf8Bytes - 1000),
+        pendingAsks: Array.from({ length: mode === 'over-carrier' ? 32 : 4 }, () => 'p'.repeat(900)),
+        commitments: mode === 'over-carrier' ? Array.from({ length: 32 }, () => 'c'.repeat(900)) : [] };
+      const inspected = inspectMainCompactionCandidate(candidate, contract);
+      if (inspected.ok) throw new Error('Expected whole-JSON overflow');
+      expect(inspected.issue.path).toBe('');
+      const serialized = JSON.stringify(candidate), bytes = Buffer.byteLength(serialized);
+      const value = { semanticAttempts: 1, fidelityRepairAttempts: 0,
+        correction: { code: 'schema_invalid', issue: inspected.issue,
+          candidate: mode === 'mismatch-bytes' ? JSON.stringify({ ...candidate, summary: candidate.summary + 'x' })
+            : mode === 'bad-shape' ? JSON.stringify({ ...candidate, version: 9 }) : serialized },
+        sizeRepair: { proposalBytes: bytes, converging: true } };
+      const normalized = normalizeMainCompactionSizeRepair(value, contract);
+      if (['mismatch-bytes', 'bad-shape'].includes(mode)) expect(normalized).toBeNull();
+      else {
+        expect(normalized).not.toBeNull();
+        expect(normalized!.correction.candidate).toBe(mode === 'bounded' ? serialized : undefined);
+      }
+    });
+
+  test.each([0, 2, 3, 4, undefined])('does not mistake a missing prior size for a first attempt (%s)', count => {
+    const contract = createMainCompactionOutputContract({ consumer: 'accepted_core',
+      carrierMaxUtf8Bytes: 131072, reservedUtf8Bytes: 55221 })!;
+    const feedback = sizeFeedback(contract as unknown as Record<string, unknown>);
+    expect(normalizeMainCompactionSizeRepair({ ...feedback, semanticAttempts: count,
+      sizeRepair: { proposalBytes: feedback.sizeRepair.proposalBytes, converging: true } }, contract))
+      .toBeNull();
+  });
+
+  test.each([1, 2].flatMap(count => ['source', 'attempts', 'release', 'not-shrinking', 'candidate',
+    'field-total', 'actual', 'limit', 'item', 'transport', 'lease'].map(mode => [count, mode] as const)))(
+    'rejects unsafe numeric size feedback after %s producer(s) (%s)', async (count, mode) => {
       const { service, identity, seed, states } = fixture();
       const claim = await seed(), contract = claim.outputContract as Record<string, unknown>;
+      const feedback = sizeFeedback(contract);
       const repair = { version: 1, sourceDigest: claim.sourceDigest, contractKey: routeKey(contract),
-        semanticAttempts: 2, transportRetries: 0, ...sizeFeedback(contract) };
+        semanticAttempts: count, transportRetries: 0, ...feedback,
+        sizeRepair: { ...feedback.sizeRepair, ...(count === 1 ? { previousProposalBytes: undefined } : {}) } };
       if (mode === 'source') repair.sourceDigest = 'e'.repeat(64);
       if (mode === 'attempts') repair.semanticAttempts = 4;
       if (mode === 'not-shrinking') repair.sizeRepair.previousProposalBytes = repair.sizeRepair.proposalBytes;
@@ -2536,7 +2574,7 @@ describe('independent bounded fidelity repair accounting', () => {
     [1, 0, 'fidelity', true], [2, 0, 'fidelity', true], [4, 0, 'fidelity', true],
     [5, 0, 'fidelity', false], [1, 1, 'fidelity', false], [4, 1, 'fidelity', false],
     [2, undefined, 'size', true], [3, 1, 'size', true], [4, 0, 'size', false],
-    [1, 0, 'size', false], [0, 0, 'fidelity', false], [2.5, 0, 'fidelity', false],
+    [1, 0, 'size', true], [0, 0, 'fidelity', false], [2.5, 0, 'fidelity', false],
     [2, null, 'fidelity', false], [2, '0', 'fidelity', false], [2, false, 'fidelity', false],
     [2, -1, 'fidelity', false], [2, 0.5, 'fidelity', false], [2, 2, 'fidelity', false],
     [2, null, 'size', false], [2, '0', 'size', false], [2, 2, 'size', false],

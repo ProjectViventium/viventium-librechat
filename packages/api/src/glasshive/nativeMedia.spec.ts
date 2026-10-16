@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { runInNewContext } from 'node:vm';
 import {
   buildGlassHiveNativeMediaContent,
   normalizeGlassHiveNativeMedia,
@@ -726,6 +727,40 @@ test('an escaped bang preserves a real authored link while escaped brackets rema
   ).toBe(String.raw`\![Selected](${download})`);
   expect(onSelection).toHaveBeenCalledTimes(1);
 });
+
+test.each([
+  '[' + '\\'.repeat(1000) + 'unterminated',
+  '['.repeat(20000),
+  '\\['.repeat(20000),
+  JSON.stringify({ content: JSON.stringify({ decisions: ['literal ' + '\\'.repeat(80)] }) }),
+])('malformed or nested escaped text cannot block attachment rendering (%#)', (text) => {
+  expect(
+    runInNewContext(
+      'render(text, insights, options)',
+      {
+        render: renderGlassHiveNativeMediaLinks,
+        text,
+        insights: [insight],
+        options: { artifactBaseUrl },
+      },
+      { timeout: 1000 },
+    ),
+  ).toBe(text);
+});
+
+test.each([String.raw`[Selected\] label]`, String.raw`\\[Selected]`])(
+  'retains selected links with escaped labels or an even escape prefix: %s',
+  (label) => {
+    const onSelection = jest.fn();
+    expect(
+      renderGlassHiveNativeMediaLinks(`${label}(${media.observations[0].artifact_ref})`, [insight], {
+        artifactBaseUrl,
+        onSelection,
+      }),
+    ).toBe(`${label}(${download})`);
+    expect(onSelection).toHaveBeenCalledTimes(1);
+  },
+);
 
 const retainedMediaSource = {
   ownerId: 'owner',

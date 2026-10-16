@@ -153,14 +153,10 @@ function mapNativeMediaMarkdownReferences(
 ): string {
   const protectedRanges = markdownCodeRanges(text);
   return text.replace(
-    /(!?\[(?:\\.|[^\]\r\n])*\])\(\s*<?([^<>\s()]*)>?\s*\)/g,
-    (_match, label: string, reference: string, offset: number) => {
+    /\\.|(!?\[(?:\\.|[^\\[\]\r\n])*\])\(\s*<?([^<>\s()]*)>?\s*\)/g,
+    (_match, label: string | undefined, reference: string | undefined, offset: number) => {
+      if (label === undefined || reference === undefined) return _match;
       if (protectedRanges.some(([start, end]) => offset >= start && offset < end)) return _match;
-      let escapes = 0;
-      const bracketOffset = label.startsWith('!') ? offset + 1 : offset;
-      for (let index = bracketOffset - 1; index >= 0 && text[index] === '\\'; index -= 1)
-        escapes += 1;
-      if (escapes % 2 === 1) return _match;
       return project(
         { reference, label: label.slice(label.startsWith('!') ? 2 : 1, -1).slice(0, 200) },
         _match,
